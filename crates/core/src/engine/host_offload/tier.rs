@@ -2808,6 +2808,167 @@ pub(crate) mod tests {
         assert_eq!(tier.transfer_deadline(second_load), Some(now + 2.0));
     }
 
+    #[derive(Debug, PartialEq)]
+    enum ObservedLoadEvent {
+        Queued { at_ms: f64, completes_at_ms: f64 },
+        Completed { at_ms: f64 },
+        Cancelled { at_ms: f64 },
+    }
+
+    #[derive(Default)]
+    struct LoadObserver(Mutex<Vec<ObservedLoadEvent>>);
+
+    impl HostOffloadObserver for LoadObserver {
+        fn record(&self, observation: HostOffloadObservation<'_>) {
+            let event = match observation.event {
+                HostOffloadObservationData::LoadQueued {
+                    at_ms,
+                    completes_at_ms,
+                    ..
+                } => ObservedLoadEvent::Queued {
+                    at_ms,
+                    completes_at_ms,
+                },
+                HostOffloadObservationData::LoadCompleted { at_ms, .. } => {
+                    ObservedLoadEvent::Completed { at_ms }
+                }
+                HostOffloadObservationData::LoadCancelled { at_ms, .. } => {
+                    ObservedLoadEvent::Cancelled { at_ms }
+                }
+                _ => return,
+            };
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    /// One MB at 0.1 GB/s: queued at 10 ms, due at 20 ms, not yet observed.
+    fn deferred_load() -> (HostTier, TransferId, Arc<LoadObserver>) {
+        let mut tier = per_rank(1, 0.0, 0.1);
+        make_resident(&mut tier, &[key(1)], 0.0);
+        let observer = Arc::new(LoadObserver::default());
+        tier.set_observer(observer.clone());
+        tier.retime_loads(C);
+        let LoadOutcome::Queued(load) = tier.schedule_load(C, request_id(), &[key(1)], 10.0, 10.0)
+        else {
+            panic!("resident block should load")
+        };
+        assert_eq!(tier.transfer_deadline(load), Some(20.0));
+        assert!(observer.0.lock().unwrap().is_empty());
+        (tier, load, observer)
+    }
+
+    #[test]
+    fn deferred_load_retime_clamps_deadlines_and_observes_queue_once() {
+        for (requested, expected) in [
+            (0.0, 12.0),
+            (12.0, 12.0),
+            (15.0, 15.0),
+            (20.0, 20.0),
+            (30.0, 20.0),
+        ] {
+            let (mut tier, load, observer) = deferred_load();
+            assert!(tier.tick(C, 12.0).0.is_empty());
+            assert!(observer.0.lock().unwrap().is_empty());
+            // Both the per-transfer deadline and the ordered deadline set
+            // must move, with no stale entry at the original lane deadline.
+            assert_eq!(tier.retime_load(load, requested), expected);
+            assert_eq!(tier.transfer_deadline(load), Some(expected));
+            assert_eq!(tier.next_deadline(C), Some(expected));
+            assert_eq!(tier.deadline_count(), 1);
+            assert_eq!(
+                *observer.0.lock().unwrap(),
+                [ObservedLoadEvent::Queued {
+                    at_ms: 10.0,
+                    completes_at_ms: expected,
+                }]
+            );
+            assert_eq!(tier.retime_load(load, requested), expected);
+            if expected > 12.0 {
+                assert!(tier.tick(C, expected - 0.5).0.is_empty());
+            }
+            assert_eq!(
+                tier.tick(C, expected).0,
+                [CompletedTransfer::Load {
+                    request_id: request_id(),
+                    transfer_id: load,
+                    blocks: vec![key(1)],
+                }]
+            );
+            assert_eq!(tier.deadline_count(), 0);
+            assert_eq!(tier.next_deadline(C), None);
+            assert_eq!(tier.pins(key(1)), 0);
+            assert!(tier.tick(C, 30.0).0.is_empty());
+            assert_eq!(
+                *observer.0.lock().unwrap(),
+                [
+                    ObservedLoadEvent::Queued {
+                        at_ms: 10.0,
+                        completes_at_ms: expected,
+                    },
+                    ObservedLoadEvent::Completed { at_ms: expected },
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_load_queue_is_observed_once_before_cancellation() {
+        // Cancel both before the owner retimes the load and after retiming
+        // shortens the deadline or leaves it clamped to the lane deadline.
+        for (requested, expected) in [(None, 20.0), (Some(15.0), 15.0), (Some(30.0), 20.0)] {
+            let (mut tier, load, observer) = deferred_load();
+            if let Some(requested) = requested {
+                assert_eq!(tier.retime_load(load, requested), expected);
+            }
+            assert!(tier.cancel_load(C, load, 12.0, 13.0));
+            assert!(!tier.cancel_load(C, load, 12.0, 13.0));
+            assert_eq!(tier.transfer_deadline(load), None);
+            assert_eq!(tier.deadline_count(), 0);
+            assert_eq!(tier.next_deadline(C), None);
+            assert_eq!(tier.pins(key(1)), 0);
+            assert!(tier.tick(C, 30.0).0.is_empty());
+            assert_eq!(
+                *observer.0.lock().unwrap(),
+                [
+                    ObservedLoadEvent::Queued {
+                        at_ms: 10.0,
+                        completes_at_ms: expected,
+                    },
+                    ObservedLoadEvent::Cancelled { at_ms: 13.0 },
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_load_queue_is_observed_once_before_completion_without_retime() {
+        let (mut tier, load, observer) = deferred_load();
+        assert!(tier.tick(C, 19.0).0.is_empty());
+        assert!(observer.0.lock().unwrap().is_empty());
+        assert_eq!(
+            tier.tick(C, 25.0).0,
+            [CompletedTransfer::Load {
+                request_id: request_id(),
+                transfer_id: load,
+                blocks: vec![key(1)],
+            }]
+        );
+        assert_eq!(tier.next_deadline(C), None);
+        assert_eq!(tier.pins(key(1)), 0);
+        assert!(tier.tick(C, 30.0).0.is_empty());
+        assert!(!tier.cancel_load(C, load, 30.0, 30.0));
+        assert_eq!(
+            *observer.0.lock().unwrap(),
+            [
+                ObservedLoadEvent::Queued {
+                    at_ms: 10.0,
+                    completes_at_ms: 20.0,
+                },
+                ObservedLoadEvent::Completed { at_ms: 20.0 },
+            ]
+        );
+    }
+
     #[test]
     fn cancelling_a_load_removes_its_exact_deadline_without_reflowing_the_lane() {
         let mut tier = tier(2);
