@@ -202,3 +202,34 @@ def test_configuration_id_still_selects_one_entry(two_families, tmp_path):
 def test_unpublished_version_has_no_fallback(two_families, tmp_path):
     with pytest.raises(MissingDataError):
         ensure_data({**CONFIG, "backend_version": "9.9"}, _pin(two_families, tmp_path))
+
+
+def test_a_dataset_republished_in_place_does_not_serve_the_old_root(tree, tmp_path):  # noqa: F811
+    published = tmp_path / "published"
+    _build(tree, published)
+    first = ensure_data(dict(CONFIG), _pin(published, tmp_path)).config["systems_paths"][0]
+    gemm = Path(first) / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet"
+    assert pq.read_table(gemm).num_rows == 3
+    # Corrected measurements: same identity (same configuration IDs), different table content, same directory.
+    pq.write_table(_table(5), tree / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet")
+    shutil.rmtree(published)
+    _build(tree, published)
+    second = ensure_data(dict(CONFIG), _pin(published, tmp_path)).config["systems_paths"][0]
+    assert second != first
+    assert pq.read_table(Path(second) / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet").num_rows == 5
+    again = ensure_data(dict(CONFIG), _pin(published, tmp_path)).config["systems_paths"][0]
+    assert again == second  # unchanged content still reuses its root
+
+
+def test_a_changed_packaged_system_spec_does_not_serve_the_old_root(two_families, tmp_path, monkeypatch):
+    from aisim_core.data import ensure as mod
+
+    specs = tmp_path / "packaged"
+    specs.mkdir()
+    (specs / "h200_sxm.yaml").write_text("name: h200_sxm\n")
+    monkeypatch.setattr(mod, "PACKAGED_SYSTEMS_DIR", specs)
+    first = ensure_data(dict(CONFIG), _pin(two_families, tmp_path)).config["systems_paths"][0]
+    assert (Path(first) / "h200_sxm.yaml").read_text() == "name: h200_sxm\n"
+    (specs / "h200_sxm.yaml").write_text("name: h200_sxm_v2\n")
+    second = ensure_data(dict(CONFIG), _pin(two_families, tmp_path)).config["systems_paths"][0]
+    assert second != first and (Path(second) / "h200_sxm.yaml").read_text() == "name: h200_sxm_v2\n"

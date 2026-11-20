@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pyarrow.parquet as pq
 
-from aisim_core.data import CategoryIndex, DatasetIndex, Entry, _file, _verify
+from aisim_core.data import CategoryIndex, DatasetIndex, Entry, Manifest, _file, _verify
 from aisim_core.data.fetch import DATASET_INDEX_PATH
 from aisim_core.data.loaders import LoaderError, OpLatencyLoader
 from aisim_core.data.op_schema import DATA_PREFIX, QUERY_VERSIONS_NAME, REUSE_MANIFEST_NAME
@@ -127,6 +127,37 @@ def load_op_latency_tree(
     return OpTreeLoad(
         destination, len(entries), files, size, lookups, frozenset(runtime), time.perf_counter() - started
     )
+
+
+def op_latency_inputs_digest(
+    tree: Path, manifests: Iterable[Manifest], packaged_systems: Path | None = PACKAGED_SYSTEMS_DIR
+) -> str:
+    """SHA-256 of every input :func:`load_op_latency_tree` turns into a root.
+
+    A composed root can be reused only while this digest is unchanged: it covers each manifest's identity and
+    runtime-artifact digests, the lookup tables the YAML files are rebuilt from, and the packaged spec files
+    copied beside the tables. Configuration IDs alone name an identity, not its content, so a republished
+    dataset or a newer package would otherwise keep serving a stale root.
+    """
+    digest = hashlib.sha256()
+    for manifest in sorted(manifests, key=lambda m: m.configuration_id):
+        digest.update(f"manifest\0{manifest.configuration_id}\n".encode())
+        for artifact in sorted(
+            (a for a in manifest.artifacts if a.runtime_path is not None), key=lambda a: a.runtime_path
+        ):
+            digest.update(f"{artifact.runtime_path}\0{artifact.sha256}\0{artifact.bytes}\n".encode())
+    for name in (REUSE_MANIFEST_NAME, QUERY_VERSIONS_NAME):
+        path = Path(tree) / DATA_PREFIX / f"{name}.parquet"
+        if path.is_file() and not path.is_symlink():
+            digest.update(f"lookup\0{name}\0{hashlib.sha256(path.read_bytes()).hexdigest()}\n".encode())
+    if packaged_systems is not None:
+        packaged = Path(packaged_systems)
+        for source in sorted(p for p in packaged.rglob("*") if p.is_file()):
+            relative = source.relative_to(packaged)
+            if relative.parts[0] != _DATA_DIR:
+                content = hashlib.sha256(source.read_bytes()).hexdigest()
+                digest.update(f"packaged\0{relative.as_posix()}\0{content}\n".encode())
+    return digest.hexdigest()
 
 
 def _write_lookup_yaml(tree: Path, destination: Path) -> tuple[str, ...]:

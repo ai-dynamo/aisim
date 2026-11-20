@@ -66,8 +66,9 @@ from aisim_core.data.fetch import (
     fetch,
 )
 from aisim_core.data.loaders import LOADERS, FpmData, LoaderError
-from aisim_core.data.op_tree import OpTreeLoad, load_op_latency_tree
+from aisim_core.data.op_tree import OpTreeLoad, load_op_latency_tree, op_latency_inputs_digest
 from aisim_core.data.repos import resolve_ref
+from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR
 
 DEFAULT_MAX_BYTES = 256 * 1024 * 1024
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -418,19 +419,20 @@ def _load_op_latency(
 ) -> tuple[OpTreeLoad, list[str]]:
     """Compose every selected family and the system specs into one verified ``systems/`` root."""
     ids = [e.configuration_id for e in entries]
-    digest = hashlib.sha256("\n".join(ids).encode()).hexdigest()[:16]
-    output_dir = cache.root / "materialized" / source_key / f"op-latency-{digest}"
     try:
         loader = LOADERS["op-latency"]()
-        for entry in entries:  # verifies every artifact in the fetched tree, also when the composed root is reused
-            loader.read_manifest(root, entry.manifest.path, config)
+        # Verifies every artifact in the fetched tree, also when the composed root is reused.
+        manifests = [loader.read_manifest(root, entry.manifest.path, config) for entry in entries]
+        # Keyed by content, not identity: a dataset republished in place (or a newer package) gets a new root.
+        digest = op_latency_inputs_digest(root, manifests, PACKAGED_SYSTEMS_DIR)[:16]
+        output_dir = cache.root / "materialized" / source_key / f"op-latency-{digest}"
         if (output_dir / "systems").is_dir():
             return OpTreeLoad(output_dir / "systems", len(entries), 0, 0, (), frozenset(), 0.0), ids
         output_dir.parent.mkdir(parents=True, exist_ok=True)
         # Build next to the destination and rename, so a concurrent worker never sees a half-written root.
         staging = output_dir.with_name(f"{output_dir.name}.{os.getpid()}.tmp")
         shutil.rmtree(staging, ignore_errors=True)
-        load_op_latency_tree(root, staging / "systems", entries=entries)
+        load_op_latency_tree(root, staging / "systems", entries=entries, packaged_systems=PACKAGED_SYSTEMS_DIR)
         try:
             staging.rename(output_dir)
         except OSError:
