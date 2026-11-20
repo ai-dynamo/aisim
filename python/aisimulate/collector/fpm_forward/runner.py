@@ -18,6 +18,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -2144,7 +2145,9 @@ def _run_collection_impl(
         root /= "smoke"
     root.mkdir(parents=True, exist_ok=True)
     _atomic_json(root / "collection-plan.json", plan.to_dict())
-    _atomic_json(root / "generator-overrides.json", archive_generator_overrides(generator_overrides))
+    archived_overrides = archive_generator_overrides(generator_overrides)
+    _atomic_json(root / "generator-overrides.json", archived_overrides)
+    private_delivery = any("value_from_env" in item for item in archived_overrides["K8sConfig"]["extra_env"])
     checkpoint_name = "fpm_forward_smoke.json" if smoke else "fpm_forward.json"
     checkpoint_path = Path(checkpoint_dir).expanduser().resolve() / checkpoint_name
     checkpoint = _load_checkpoint(checkpoint_path, plan, resume)
@@ -2417,26 +2420,33 @@ def _run_collection_impl(
         checkpoint["cells"][cell.cell_id] = base_record
         _atomic_json(checkpoint_path, checkpoint)
         resource = None
+        delivery_directory = None
         try:
             base_record.update(_configured_sampling_metadata(plan, cell, smoke=smoke, bundle=instrumentation))
             _atomic_json(checkpoint_path, checkpoint)
-            _render_cell(
-                plan,
-                cell,
-                cell_dir,
-                generator_overrides,
-                smoke=smoke,
-            )
-            manifest = cell_dir / FPM_MANIFEST_FILENAME
-            run_script = cell_dir / FPM_RUN_SCRIPT_FILENAME
-            env_script = cell_dir / FPM_ENV_FILENAME
-            runtime_env = cell_dir / RUNTIME_ENV_FILENAME
+            worker_dir = cell_dir
+            if private_delivery:
+                _render_cell(plan, cell, cell_dir, generator_overrides, smoke=smoke, resolve_environment=False)
+                # Retain only digest references. Pyxis staging must share the
+                # campaign filesystem, while the directory remains private.
+                delivery_directory = tempfile.TemporaryDirectory(
+                    prefix="aisimulate-collection-delivery-",
+                    dir=root if getattr(plan.options, "executor", "kubernetes") == "slurm" else None,
+                )
+                worker_dir = Path(delivery_directory.name)
+            _render_cell(plan, cell, worker_dir, generator_overrides, smoke=smoke)
+            manifest = worker_dir / FPM_MANIFEST_FILENAME
+            run_script = worker_dir / FPM_RUN_SCRIPT_FILENAME
+            env_script = worker_dir / FPM_ENV_FILENAME
+            runtime_env = worker_dir / RUNTIME_ENV_FILENAME
             if not manifest.exists() or not run_script.exists() or not env_script.exists() or not runtime_env.exists():
                 raise RuntimeError(
                     f"Generator FPM target did not emit {FPM_MANIFEST_FILENAME}, "
                     f"{FPM_ENV_FILENAME}, {FPM_RUN_SCRIPT_FILENAME}, and {RUNTIME_ENV_FILENAME}"
                 )
             resource = _cell_runner(plan, cell, manifest, cell_dir)
+            if private_delivery and getattr(plan.options, "executor", "kubernetes") == "slurm":
+                resource.runtime_dir = worker_dir / "slurm-runtime"
             # A prior invocation may have left the same-named workload alive
             # (cleanup timeout, killed collector host) even when THIS
             # checkpoint has no record of the cell: workload names derive
@@ -2462,6 +2472,8 @@ def _run_collection_impl(
                 context["collector_attempt_id"] = attempt_id
                 context["cell_id"] = cell.cell_id
                 instrumentation_files = stage_runtime_instrumentation(instrumentation, cell_dir, context)
+                if private_delivery:
+                    instrumentation_files = stage_runtime_instrumentation(instrumentation, worker_dir, context)
             resource.stage(
                 pods,
                 [
@@ -2582,6 +2594,8 @@ def _run_collection_impl(
                             "classification": "resource_cleanup_failed",
                         }
                     )
+            if delivery_directory is not None:
+                delivery_directory.cleanup()
             record = checkpoint["cells"][cell.cell_id]
             record["collector_phase_seconds"] = dict(phase_marks)
             record["completed_at"] = _utc_now()

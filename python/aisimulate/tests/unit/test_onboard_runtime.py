@@ -1968,9 +1968,16 @@ def test_pending_probe_preview_then_execute_reuses_output_directory(tmp_path, mo
     state = _load(checkpoint)
     draft = copy.deepcopy(state.configurations["tp2"].draft_request)
     draft["identity"]["framework_version"] = label
+    token = 'synthetic-private-"detection"-$746'
+    environment = [{"name": "HF_TOKEN", "value": token}, {"name": "HF_HOME", "value": "/runtime/hf-cache"}]
+    monkeypatch.setenv("HF_TOKEN", token)
+    monkeypatch.setenv("HF_HOME", "/runtime/hf-cache")
     save_checkpoint(
         checkpoint,
-        patch={"configurations": {"tp2": {"draft_request": draft}}},
+        patch={
+            "inputs": {"collection_deployment": {"extra_env": environment}},
+            "configurations": {"tp2": {"draft_request": draft}},
+        },
         expected_revision=state.revision,
         accept=[],
     )
@@ -1991,7 +1998,18 @@ def test_pending_probe_preview_then_execute_reuses_output_directory(tmp_path, mo
     preview = _load(checkpoint).configurations["tp2"].history[-1]
     assert preview["result"]["status"] == "pending_runtime_version"
     assert "report" not in preview
-    monkeypatch.setattr(versioning, "detect_runtime_versions", lambda *_: {"backend_version": "0.27.0"})
+    monkeypatch.delenv("HF_TOKEN")
+    assert cli.main(command) == 1
+    assert not output.exists()
+    assert _load(checkpoint).configurations["tp2"].history[-1]["result"]["status"] == "pending_runtime_version"
+    monkeypatch.setenv("HF_TOKEN", token)
+
+    def detect(deployment):
+        for entry in environment:
+            assert entry in deployment.extra_env
+        return {"backend_version": "0.27.0"}
+
+    monkeypatch.setattr(versioning, "detect_runtime_versions", detect)
     executions = []
     monkeypatch.setattr(runner, "_cell_runner", lambda p, c, _m, d: _SyntheticExecutor(p, c, d, executions))
 
@@ -2002,6 +2020,54 @@ def test_pending_probe_preview_then_execute_reuses_output_directory(tmp_path, mo
     assert observed["launch"]["identity"]["framework_version"] == (label or "0.27.0")
     assert cli.main([*command, "--execute", "--resume"]) == 0
     assert len(executions) == 2
+    for path in output.rglob("*"):
+        if path.is_file():
+            assert token.encode() not in path.read_bytes(), path
+            assert json.dumps(token)[1:-1].encode() not in path.read_bytes(), path
+
+
+@pytest.mark.parametrize("value", [None, "changed"])
+def test_pending_probe_version_detection_reports_unresolved_environment(tmp_path, monkeypatch, capsys, value):
+    from aisimulate.support import versioning
+
+    checkpoint, _, _ = _campaign(tmp_path)
+    state = _load(checkpoint)
+    draft = copy.deepcopy(state.configurations["tp2"].draft_request)
+    draft["identity"]["framework_version"] = None
+    save_checkpoint(
+        checkpoint,
+        patch={
+            "inputs": {"collection_deployment": {"extra_env": [{"name": "HF_TOKEN", "value": "original"}]}},
+            "configurations": {"tp2": {"draft_request": draft}},
+        },
+        expected_revision=state.revision,
+        accept=[],
+    )
+    if value is None:
+        monkeypatch.delenv("HF_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("HF_TOKEN", value)
+    monkeypatch.setattr(versioning, "detect_runtime_versions", lambda *_: pytest.fail("unresolved environment"))
+    output = tmp_path / "unresolved"
+    assert (
+        cli.main(
+            [
+                "onboard",
+                "probe-runtime",
+                "--checkpoint",
+                str(checkpoint),
+                "--configuration",
+                "tp2",
+                "--output-dir",
+                str(output),
+                "--execute",
+            ]
+        )
+        == 1
+    )
+    result = json.loads(capsys.readouterr().out)
+    assert "archived environment HF_TOKEN requires the original value" in str(result)
+    assert not (output / "probe-plan.json").exists()
 
 
 def test_mixed_known_and_pending_probe_preview_records_every_configuration(tmp_path, monkeypatch):

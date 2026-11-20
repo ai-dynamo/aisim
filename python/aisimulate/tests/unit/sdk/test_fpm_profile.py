@@ -2576,6 +2576,15 @@ def test_registered_profile_without_sol_keeps_op_level_candidate(
         assert model.diagnostics()["provenance"]["selected_estimation_mode"] == "fpm_regression"
         model.close()
     request["estimator_config"]["fpm_interpolation"]["method"] = "sol"
+    resolved = _normalize(request)
+    assert resolved["estimator_config"]["fpm_interpolation"]["method"] == "sol"
+    assert _normalize(json.loads(json.dumps(resolved))) == resolved
+    attempts.clear()
+    message = "synthetic op database unavailable" if mode == "op_level" else "SOL interpolation requires"
+    with pytest.raises(ValueError, match=message):
+        RustForwardPassPerfModel.best_available(request)
+    assert attempts == ["op_level"]
+    request["estimation_mode"] = "fpm_interpolation"
     with pytest.raises(ValueError, match="SOL interpolation requires"):
         _normalize(request)
 
@@ -2651,6 +2660,44 @@ def test_kda_auto_state_requires_runtime_identity_not_profile_version(profile_di
     assert _normalize(request)["estimator_config"]["fpm_interpolation"]["method"] == (
         "sol" if identity == "audited" else "direct"
     )
+
+
+@pytest.mark.parametrize("mode", ["op_level", "auto", "fpm_interpolation"])
+def test_explicit_sol_with_unsupported_convolution_only_restricts_fpm(
+    profile_dict, checkpoint_configs, monkeypatch, mode
+):
+    profile_dict["architecture"] = "KimiK31ForConditionalGeneration"
+    checkpoint_configs[profile_dict["model"]] = {"architectures": [profile_dict["architecture"]]}
+    resources = profile_dict["deployments"][0]["resources"]
+    for key in ("weights_bytes", "activations_bytes", "runtime_overhead_bytes", "comm_overhead_bytes"):
+        resources.pop(key)
+    resources["runtime_memory"] = {
+        "kv_cache_bytes": 1024,
+        "gpu_memory_utilization": 0.8,
+        "max_model_len": 4096,
+        "provenance": json.dumps(
+            {"runtime_settings": {"cache_config": {"mamba_cache_dtype": "float32", "mamba_ssm_cache_dtype": "float32"}}}
+        ),
+    }
+    request = _request(profile_dict, "sol", estimation_mode=mode)
+    if mode == "fpm_interpolation":
+        with pytest.raises(ValueError, match="K3.1 SOL does not support FP32 convolution state"):
+            _normalize(request)
+        return
+    resolved = _normalize(request)
+    assert resolved["estimator_config"]["fpm_interpolation"]["method"] == "sol"
+    assert _normalize(json.loads(json.dumps(resolved))) == resolved
+    attempts = []
+
+    def unavailable(*args, **kwargs):
+        attempts.append(kwargs["forward_model"])
+        raise RuntimeError("synthetic op database unavailable")
+
+    monkeypatch.setattr(engine, "compile_engine", unavailable)
+    message = "synthetic op database unavailable" if mode == "op_level" else "FP32 convolution state"
+    with pytest.raises(ValueError, match=message):
+        RustForwardPassPerfModel.best_available(request)
+    assert attempts == ["op_level"]
 
 
 def test_op_level_sol_database_does_not_validate_unused_auto_direct(profile_dict, checkpoint_configs, monkeypatch):

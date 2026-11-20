@@ -220,7 +220,28 @@ def checkpoint_launch(
         **_object(inputs.get("collection_deployment", {}), "inputs.collection_deployment"),
         **(deployment_overrides or {}),
     }
+    environment = deployment.get("extra_env")
+    references = None
+    if isinstance(environment, list) and any(
+        isinstance(item, dict) and "value_from_env" in item for item in environment
+    ):
+        from collector.fpm_forward.config import archive_generator_overrides
+
+        # Saved probe inputs contain digest references. Validate that archive
+        # contract without requiring credentials for offline previews; the
+        # public deployment schema still validates literal entries and policy.
+        archived = archive_generator_overrides({"K8sConfig": {"extra_env": environment}})["K8sConfig"]["extra_env"]
+        names = {item["name"] for item in environment}
+        references = [item for item in archived if item["name"] in names]
+        deployment["extra_env"] = [
+            {"name": item["name"], "value": "/__aisimulate_environment_reference__/" + item["value_sha256"]}
+            if "value_from_env" in item
+            else item
+            for item in references
+        ]
     deployment = FPMDeployment.model_validate(deployment).model_dump(mode="json", exclude_none=True)
+    if references is not None:
+        deployment["extra_env"] = references
     if resume_output_dir is not None:
         from collector.fpm_forward.runtime_probe import resolve_probe_cpu_policy
 
@@ -1003,9 +1024,15 @@ def run_runtime_command(args: argparse.Namespace) -> int:
                 resume_output_dir=output if args.resume else None,
             )
             if args.execute and launches[name]["identity"].get("runtime_framework_version") is None:
+                from collector.fpm_forward.config import resolve_archived_generator_overrides
+
                 from .versioning import detect_runtime_versions
 
-                observed = detect_runtime_versions(FPMDeployment.model_validate(launches[name]["deployment"]))
+                deployment = dict(launches[name]["deployment"])
+                deployment["extra_env"] = resolve_archived_generator_overrides(
+                    {"K8sConfig": {"extra_env": deployment.get("extra_env", [])}}
+                )["K8sConfig"]["extra_env"]
+                observed = detect_runtime_versions(FPMDeployment.model_validate(deployment))
                 actual = observed["backend_version"]
                 # Preserve old numeric launch identities when observation agrees.
                 # Custom labels carry a separate runtime pin into instrumentation.

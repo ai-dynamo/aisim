@@ -72,7 +72,7 @@ def test_k31_native_attention_names_match_explicit_policy(policy, native, hybrid
     # This isolates identity validation and does not qualify hybrid cache memory.
     names = ["KIMI_K3_KDA", "DEEPSEEK_V32_INDEXER", native] if hybrid else native
     config = {
-        "model_config": {"architectures": ["KimiK31ForConditionalGeneration"]},
+        "model_config": {"architectures": ["KimiK31ForConditionalGeneration"], "dtype": "torch.bfloat16"},
         "attention_config": {"backend": native, "indexer_kv_dtype": "fp8"},
     }
     launch = {"precision": {"attention_backend": policy}}

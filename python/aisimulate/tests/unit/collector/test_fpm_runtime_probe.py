@@ -1556,8 +1556,23 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
     plan, overrides = entry.resolve_inputs(args, cases)
     executions = []
     rejected = set()
+    delivery_directories = []
 
     class NativeExecutor(_SyntheticExecutor):
+        def stage(self, pods, files):
+            super().stage(pods, files)
+            delivery = self.files["run.sh"].parent
+            assert delivery != self.cell_dir
+            assert delivery.stat().st_mode & 0o777 == 0o700
+            assert runner.shlex.quote(token) in self.files["run.sh"].read_text()
+            from collector.fpm_forward.slurm import SlurmCellRunner
+
+            SlurmCellRunner.stage(self, pods, files)
+            assert self.runtime_dir.parent == delivery
+            assert delivery.parent == self.cell_dir.parent.parent
+            assert runner.shlex.quote(token) in (self.runtime_dir / "run.sh").read_text()
+            delivery_directories.append(delivery)
+
         def execute(self, pods):
             super().execute(pods)
             raw = self.cell_dir / "raw" / pods[0]
@@ -1621,7 +1636,15 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
         publish_database=False,
     )
     assert token not in json.dumps(plan.to_dict())
+
+    def assert_private_artifacts():
+        assert delivery_directories and all(not directory.exists() for directory in delivery_directories)
+        for retained in artifact_root.rglob("*"):
+            if retained.is_file():
+                assert token.encode() not in retained.read_bytes(), retained
+
     errors = runner.run_collection(plan, **kwargs)
+    assert_private_artifacts()
     checkpoint_path = checkpoint_dir / "fpm_forward.json"
     first = json.loads(checkpoint_path.read_text())
     prefill = next(c for c in plan.cells if c.workload_kind == "prefill")
@@ -1657,12 +1680,14 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
 
         monkeypatch.setattr(runner, "_render_cell", fail_render)
         assert runner.run_collection(plan, **{**kwargs, "resume": True, "retry_failed": True})
+        assert_private_artifacts()
         failed = json.loads(checkpoint_path.read_text())["cells"][prefill.cell_id]
         assert failed["status"] == "failed" and "observation_error" not in failed
         assert "synthetic render failure before staging" in failed["error"]
         assert not (cell_dir / runtime_probe.CONTEXT_FILENAME).exists()
         monkeypatch.setattr(runner, "_render_cell", render)
     assert runner.run_collection(plan, **{**kwargs, "resume": True, "retry_failed": True}) == []
+    assert_private_artifacts()
     final = json.loads(checkpoint_path.read_text())
     assert all(item["status"] == "passed" for item in final["cells"].values())
     assert final["cells"][prefill.cell_id]["attempt_id"] != original_id
@@ -1672,9 +1697,7 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
     ]["attempts"][-1]["phase_attempts"]["prefill"]
     assert any(item["collector_attempt_id"] == original_id for item in history)
     assert executions == [("tp4", "prefill"), ("tp4", "decode"), ("tp4", "prefill")]
-    for retained in root.rglob("*.json"):
-        assert token not in retained.read_text(), retained
-    assert runner.shlex.quote(token) in (cell_dir / "run.sh").read_text()
+    assert "/__aisimulate_environment_reference__/HF_TOKEN/" in (cell_dir / "run.sh").read_text()
 
 
 @pytest.mark.parametrize("transport", ["slurm", "kubernetes"])
@@ -1688,7 +1711,11 @@ def test_probe_keeps_credentials_out_of_launch_evidence_and_delivers_to_runtime(
     if transport == "kubernetes":
         launch["deployment"] = {"executor": "kubernetes", "image": launch["deployment"]["image"]}
     token = 'synthetic-"private"-$746'
-    environment = [{"name": "HF_TOKEN", "value": token}, {"name": "VLLM_SSM_CONV_STATE_LAYOUT", "value": "DS"}]
+    environment = [
+        {"name": "HF_TOKEN", "value": token},
+        {"name": "VLLM_SSM_CONV_STATE_LAYOUT", "value": "DS"},
+        {"name": "FPM_READINESS_TIMEOUT_SECONDS", "value": "1200"},
+    ]
     launch["deployment"]["extra_env"] = environment
     delivered = []
     staging = []
@@ -1755,6 +1782,18 @@ def test_probe_keeps_credentials_out_of_launch_evidence_and_delivers_to_runtime(
     )
     assert offline["status"] == "preview"
     assert_archived(offline)
+
+    def assert_files_archived():
+        for path in output.rglob("*"):
+            if path.is_file():
+                contents = path.read_bytes()
+                assert token.encode() not in contents, path
+                assert json.dumps(token)[1:-1].encode() not in contents, path
+                assert runner.shlex.quote(token).encode() not in contents, path
+                if path.suffix == ".json":
+                    assert_archived(json.loads(contents))
+
+    assert_files_archived()
     for execute in (False, True):
         report = runtime_probe.probe_runtime(
             {"tp4": launch}, instrumentation=manifest, output_dir=output, execute=execute
@@ -1762,20 +1801,13 @@ def test_probe_keeps_credentials_out_of_launch_evidence_and_delivers_to_runtime(
         expected = "failed" if fail_runtime else "completed"
         assert report["status"] == (expected if execute else "preview"), report
         assert_archived(report)
+        assert_files_archived()
     assert delivered == ["prefill", "decode"]
     assert len(staging) == (2 if transport == "slurm" else 0)
     assert all(not directory.exists() for directory in staging)
     assert not list(output.glob("aisimulate-probe-delivery-*"))
     assert not list(node_local.iterdir())
 
-    for path in output.rglob("*"):
-        if path.is_file():
-            contents = path.read_bytes()
-            assert token.encode() not in contents, path
-            assert json.dumps(token)[1:-1].encode() not in contents, path
-            assert runner.shlex.quote(token).encode() not in contents, path
-            if path.suffix == ".json":
-                assert_archived(json.loads(contents))
     saved = json.loads((output / "probe-plan.json").read_text())
     frozen = saved["configurations"]["tp4"]
     assert (
@@ -1818,7 +1850,6 @@ def test_k31_probe_rejects_unaudited_bundle_before_generic_precision_checks(tmp_
     launch, _, marker = _k31_native_probe_inputs(tmp_path)
     (tmp_path / "unaudited").mkdir()
     _, unaudited_manifest, _ = _inputs(tmp_path / "unaudited")
-    launch["precision"]["moe_quant_mode"] = "w4a16_mxfp4"
     with pytest.raises(ValueError, match="requires an audited instrumentation bundle"):
         runtime_probe.build_runtime_probe_plan("k31", launch, load_instrumentation(unaudited_manifest))
     assert not marker.exists()

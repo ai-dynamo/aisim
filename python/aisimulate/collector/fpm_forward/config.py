@@ -148,7 +148,7 @@ def archive_generator_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
             if set(item) != {"name", "value"} or not isinstance(item["value"], str):
                 raise ValueError("archived environment requires literal string values")
             public = item["name"] in {*FPM_KV_WARMUP_DEFAULTS, "VLLM_SSM_CONV_STATE_LAYOUT"}
-            if item["name"] == "FPM_FINALIZATION_TIMEOUT_SECONDS":
+            if item["name"] in {"FPM_READINESS_TIMEOUT_SECONDS", "FPM_FINALIZATION_TIMEOUT_SECONDS"}:
                 value = item["value"]
                 public = bool(re.fullmatch(r"[1-9][0-9]*", value)) and len(value) <= 4 and int(value) <= 3600
             if not public:

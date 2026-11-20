@@ -2340,6 +2340,15 @@ def test_pinned_hub_processor_sidecar_and_inline_fallback(monkeypatch, sidecar):
     assert reads == ["config.json", "hf_quant_config.json", "preprocessor_config.json"]
 
 
+@pytest.mark.parametrize("sidecar", [{"shortest_edge": 3136}, {"shortest_edge": 3136, "longest_edge": 1003520}])
+def test_qwen_processor_sidecar_preserves_unspecified_inline_size_endpoint(tmp_path, sidecar):
+    raw = {**_QWEN3VL_HF_CONFIG, "preprocessor_config": {"size": {"shortest_edge": 131072, "longest_edge": 1048576}}}
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    (tmp_path / "preprocessor_config.json").write_text(json.dumps({"size": sidecar}))
+    parsed = get_model_config_from_model_path(str(tmp_path))["extra_params"]
+    assert (parsed.min_pixels, parsed.max_pixels) == (3136, sidecar.get("longest_edge", 1048576))
+
+
 def test_local_checkpoint_tilde_reads_config_and_processor(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     checkpoint = tmp_path / "checkpoint"

@@ -2168,6 +2168,8 @@ def _get_model_config_from_resolved_path(model_path: str, *, model_revision: str
                         for legacy, native in (("min_pixels", "shortest_edge"), ("max_pixels", "longest_edge")):
                             if native in data["size"]:
                                 processor.pop(legacy, None)
+                        if isinstance(processor.get("size"), dict):
+                            data = {**data, "size": {**processor["size"], **data["size"]}}
                     processor.update(data)
                 else:
                     processor[key] = data

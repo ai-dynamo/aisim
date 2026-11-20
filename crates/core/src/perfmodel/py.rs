@@ -1749,6 +1749,21 @@ pub(crate) fn compile_forward_pass_model_to_engine(
             "a native estimator mode must be selected before compilation".into(),
         )
     })?;
+    if forward_model == "fpm"
+        && config.fpm_profile.is_some()
+        && config.estimator_config.fpm_interpolation.method
+            == crate::perfmodel::fpm::FpmInterpolationMethod::Sol
+    {
+        let facts = validate_forward_pass_profile(config)?;
+        if let Some(reason) = facts.unsupported_sol_reason {
+            return Err(AicError::InvalidEngineConfig(reason));
+        }
+        config
+            .estimator_config
+            .fpm_interpolation
+            .method
+            .resolve(Some(facts.supports_sol))?;
+    }
     compile_engine_from_request(EngineBuildRequest {
         model_path: config.model.clone(),
         system: config.system.clone(),

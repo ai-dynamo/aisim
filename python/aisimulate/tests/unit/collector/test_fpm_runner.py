@@ -3788,7 +3788,7 @@ def test_collection_checks_deployment_identity_before_writing_or_scheduling(tmp_
     with pytest.raises(ValueError, match="differ from the frozen collection plan"):
         run_collection(
             plan,
-            generator_overrides=changed,
+            generator_overrides=archive_generator_overrides(changed) if archived else changed,
             checkpoint_dir=str(tmp_path / "checkpoint"),
             artifact_root=str(tmp_path / "artifacts"),
             resume=False,

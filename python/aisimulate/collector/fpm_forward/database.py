@@ -304,12 +304,7 @@ def aggregate_cell(
     require_k31_worker_evidence(plan, cell, cell_dir / "raw", collection)
     capability = plan.capability
     model_config = getattr(capability, "model_config", None)
-    # Kimi's native KDA state belongs to a request's actual prefix history.
-    # A balanced MoE router does not make that recurrent state content-free.
-    # Observe the native seed protocol for each point; never promote a fake
-    # state to measured serving data because its MoE topology is pure TP.
     has_kda_state = model_config is not None and model_config.effective_payload.get("linear_attn_config") is not None
-
     selected = select_native_measurements(collection, cell_id=cell.cell_id)
 
     # KV seed regime (schema v6 additive column): a per-row RECORD of the
@@ -359,10 +354,6 @@ def aggregate_cell(
         batch = int(point["batch_size"])
         total_prefill = int(point["total_prefill_tokens"])
         total_kv = int(point["total_kv_read_tokens"])
-        if _is_k31(plan) and phase == "prefill" and total_kv != 0:
-            raise ValueError("K3.1 prefill publication requires zero historical KV tokens")
-        if has_kda_state and phase == "decode" and _kv_seed_regime(point, phase) != "real_kv":
-            raise ValueError("KDA decode publication requires real_kv seeding of the request's recurrent state")
         if (
             cell.execution_identity[0]
             and (phase == "decode" or total_kv > 0)

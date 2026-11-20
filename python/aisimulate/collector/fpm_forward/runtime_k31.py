@@ -324,6 +324,10 @@ def _validate_cache_inventory(cache, model_config):
     if kda and config["linear_attn_config"].get("use_full_rank_gate") is not True:
         raise ValueError("K3.1 native KDA requires checkpoint use_full_rank_gate=true")
     dsa_config = config.get("dsa_config")
+    # vLLM 266e88c05 models/kimi_k3/nvidia/dsa.py::KimiK3DSAAttention
+    # rejects index sharing; each initialized DSA layer owns its indexer.
+    if isinstance(dsa_config, dict) and dsa_config.get("index_topk_freq", 1) not in (None, 1):
+        raise ValueError("K3.1 native DSA requires index_topk_freq=1 (no index sharing)")
     dsa_field = "layers" if isinstance(dsa_config, dict) and "dsa_layers" not in dsa_config else "dsa_layers"
     indexer = layer_indices(dsa_config, dsa_field) - kda
     mla_class = "vllm.model_executor.layers.attention.mla_attention.MLAAttention"
@@ -397,6 +401,8 @@ def _validate_mla_payload(spec, config, model_config):
         # tensor bytes cannot qualify geometry the serving backend rejects.
         if latent + rope not in (512, 576):
             raise ValueError("K3.1 FlashInfer MLA head size must be 512 or 576")
+        if rope and (latent, rope) != (512, 64):
+            raise ValueError("K3.1 FlashInfer MLA with RoPE requires latent/RoPE dimensions 512/64")
         # Pinned FlashInferMLASparseBackend.supports_combination with RoPE enabled.
         if rope and decoder.get("qk_nope_head_dim") not in (128, 192):
             raise ValueError("K3.1 FlashInfer MLA with RoPE requires qk_nope_head_dim 128 or 192")

@@ -1296,15 +1296,27 @@ def test_import_rejects_self_consistent_undersized_mla_payload(tmp_path, monkeyp
         group = cache["groups"][0]
         for name, spec in group.get("layer_specs", dict.fromkeys(group["layer_names"], group)).items():
             if name.endswith(".self_attn.attn"):
-                spec["unpadded_page_size_bytes"] = 512 * spec["block_size_tokens"]
+                spec["unpadded_page_size_bytes"] = 528 * spec["block_size_tokens"]
                 if record["kind"] == "worker":
                     view = cache["layer_components"][name][0]
-                    view["shape"][2] = 512
-                    view["stride_bytes"][1] = 512
+                    view["shape"][2] = 528
+                    view["stride_bytes"][1] = 528
 
     # Matching views and scheduler data still do not prove the checkpoint's
     # 512 latent + 64 RoPE FP8 payload; leave all padding/allocation unchanged.
     _mutate(path, corrupt)
+    index = json.loads(path.read_text())
+    references = index["configurations"]["tp2"]["attempts"][0]["phases"]["decode"]["artifacts"]
+    records = [json.loads((path.parent / ref["path"]).read_text()) for ref in references]
+    worker = next(record for record in records if record["kind"] == "worker")
+    scheduler = next(record for record in records if record["kind"] == "scheduler")
+    _physical_views(
+        worker["cache"],
+        scheduler["cache"],
+        "fp8",
+        context=4096,
+        sequences=launches["tp2"]["collection"]["max_num_seqs"],
+    )
     result = validate_observations(path, launches)["tp2"]
     assert result["status"] == "incomplete" and result["resources"] is None
     assert "MLA payload differs from the checkpoint and backend geometry" in str(result["diagnostics"])
@@ -1973,6 +1985,23 @@ def test_cache_inventory_attests_only_checkpoint_sparse_mla_layers(kda, dsa, mla
             runtime_k31._validate_cache_inventory(cache, config)
 
 
+@pytest.mark.parametrize("frequency", [None, 1, 2])
+def test_import_binds_dsa_index_sharing_to_checkpoint(tmp_path, monkeypatch, frequency):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+    model = Path(launches["tp2"]["model_config"]["path"])
+    config = json.loads(model.read_text())
+    config["text_config"]["dsa_config"]["index_topk_freq"] = frequency
+    model.write_text(json.dumps(config))
+    digest = hashlib.sha256(model.read_bytes()).hexdigest()
+    launches["tp2"]["model_config"]["sha256"] = digest
+    _replace_launch(path, launches)
+    _mutate(path, lambda record: record.update(model_config_sha256=digest))
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == ("incomplete" if frequency == 2 else "complete"), result["diagnostics"]
+    if frequency == 2:
+        assert "index_topk_freq=1 (no index sharing)" in str(result["diagnostics"])
+
+
 def test_import_rejects_dense_mla_mislabeled_as_sparse(tmp_path, monkeypatch):
     path, launches = _complete_fixture(tmp_path, monkeypatch, separate_attention=True)
     model = Path(launches["tp2"]["model_config"]["path"])
@@ -2021,9 +2050,11 @@ def test_k31_sparse_attention_requires_compatible_observed_gpu(tmp_path, monkeyp
 def test_import_checks_backend_head_size_even_when_payload_and_views_match(tmp_path, monkeypatch, latent):
     path, launches = _complete_fixture(tmp_path, monkeypatch, mla_latent=latent)
     result = validate_observations(path, launches)["tp2"]
-    assert result["status"] == ("incomplete" if latent == 384 else "complete"), result["diagnostics"]
+    assert result["status"] == ("complete" if latent == 512 else "incomplete"), result["diagnostics"]
     if latent == 384:
         assert "FlashInfer MLA head size must be 512 or 576" in str(result["diagnostics"])
+    elif latent == 448:
+        assert "with RoPE requires latent/RoPE dimensions 512/64" in str(result["diagnostics"])
 
 
 @pytest.mark.parametrize("nope", [64, 128, 192])

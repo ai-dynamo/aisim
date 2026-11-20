@@ -628,8 +628,9 @@ impl ForwardPassPerfModelConfig {
             #[cfg(feature = "python")]
             {
                 let facts = crate::py::validate_forward_pass_profile(&self)?;
-                if self.estimator_config.fpm_interpolation.method
-                    == super::FpmInterpolationMethod::Sol
+                if self.estimation_mode == EstimationMode::FpmInterpolation
+                    && self.estimator_config.fpm_interpolation.method
+                        == super::FpmInterpolationMethod::Sol
                 {
                     if let Some(reason) = facts.unsupported_sol_reason {
                         return Err(invalid_config(&reason));
@@ -659,11 +660,19 @@ impl ForwardPassPerfModelConfig {
         } else {
             (None, None)
         };
-        self.estimator_config.fpm_interpolation.method = self
-            .estimator_config
-            .fpm_interpolation
-            .method
-            .resolve(supports_sol)?;
+        self.estimator_config.fpm_interpolation.method =
+            self.estimator_config.fpm_interpolation.method.resolve(
+                if self.estimation_mode != EstimationMode::FpmInterpolation
+                    && self.estimator_config.fpm_interpolation.method
+                        == super::FpmInterpolationMethod::Sol
+                {
+                    // The op-level candidate does not use this roofline.
+                    // Auto validates it if selection reaches FPM compilation.
+                    None
+                } else {
+                    supports_sol
+                },
+            )?;
         // An unused inner method cannot restrict op-level timing, including
         // after normalized configuration round trips. Automatic selection
         // checks this again at the direct compiler boundary if it attempts FPM.
