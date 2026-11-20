@@ -124,8 +124,14 @@ The credentialed part of the campaign is a default-branch job, not a PR workflow
   `e2e-accuracy-private` (nightly and manual main runs) or `e2e-accuracy-preview`
   (previews). The token stays read-only. A repository administrator protects the
   private environment (deployment branch `main`, required reviewers as policy
-  decides) and may give the preview environment its own, lower-privilege token under
-  the same secret name; an environment secret overrides the repository secret.
+  decides). An environment secret overrides the repository secret, and encrypted
+  artifacts are keyed by that token: the `shards` and `agentx` jobs run in the
+  wheel-storage environment (`automated-release`, or `pr-wheel-staging` for
+  previews) while the jobs that seal or open the same artifacts run in the accuracy
+  environment. Every environment in one run must therefore resolve the same
+  `HF_READ_AISIM_INFX_CACHE` value; give the preview accuracy environment its own
+  token only if `pr-wheel-staging` carries that same token. A mismatch fails the
+  consuming job with an authentication error naming this secret.
 - **Code that sees the token.** Every step with the token runs `main`'s scripts,
   checked out to `trusted/`, with a virtualenv (`trusted-venv`) built only from the
   hash-pinned requirements. The evaluated checkout, the exact wheel and its build
