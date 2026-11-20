@@ -306,7 +306,8 @@ def _validate_record(
             # worker's model-tree enumeration. All downstream consumers
             # revalidate this record before admitting its precision evidence.
             source = _model_config_bytes(launch["model_config"])["model-config.json"]
-            moe_precision(record.get("initialized_moe"), model_config=json.loads(source))
+            checkpoint_config = json.loads(source)
+            moe_precision(record.get("initialized_moe"), model_config=checkpoint_config)
     if launch["identity"]["model_kind"] == "moe":
         parallel = config["parallel_config"]
         enabled = parallel["enable_expert_parallel"]
@@ -378,7 +379,7 @@ def _validate_record(
     if native_layout and kind == "worker":
         from .runtime_k31 import validate_attention_assignments
 
-        validate_attention_assignments(record)
+        validate_attention_assignments(record, model_config=checkpoint_config)
     return config
 
 

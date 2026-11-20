@@ -721,6 +721,24 @@ def test_execution_reports_malformed_initialized_weight_shapes(native_execution,
     assert any("initialized expert weights are incomplete" in reason for reason in result["failures"])
 
 
+@pytest.mark.parametrize("inputs", ["explicit-moe"], indirect=True)
+@pytest.mark.parametrize("kernel", [["invalid"], "invalid", 1, None, {"moe_backend": "flashinfer_trtllm"}])
+@pytest.mark.usefixtures("inputs")
+def test_explicit_moe_pin_reports_malformed_native_kernel_config(native_execution, kernel):
+    plan, cell, raw, collection, index_path = native_execution
+    assert cell.backend_policy.aic_fields["moe_backend"] == "flashinfer_trtllm"
+
+    def corrupt(record):
+        if record["kind"] == "worker":
+            record["resolved_config"]["kernel_config"] = kernel
+
+    _mutate(index_path, corrupt)
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    assert result["status"] == ("qualified" if isinstance(kernel, dict) else "failed"), result
+    if not isinstance(kernel, dict):
+        assert any("kernel_config object" in reason for reason in result["failures"])
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -755,7 +773,7 @@ def test_execution_reports_malformed_native_objects_as_failed(native_execution, 
                 elif mutation == "null_group":
                     record["cache"]["groups"][0] = None
                 elif mutation == "null_component":
-                    record["cache"]["layer_components"]["mla.0"] = [None]
+                    record["cache"]["layer_components"][record["cache"]["groups"][0]["layer_names"][0]] = [None]
                 else:
                     record["cache"]["tensor_allocations"][0] = None
             elif record["kind"] == "scheduler" and mutation == "null_scheduler_group":

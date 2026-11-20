@@ -361,7 +361,13 @@ def verify_collection_runtime_bindings(request: SupportRequest, bindings: list[d
             ):
                 raise ValueError("runtime phase does not match the successful native cell attempt")
             result = validate_observation_phase(
-                index, plan.runtime_configuration, plan.runtime_launch, phase=phase, attempt_id=binding["attempt_id"]
+                index,
+                plan.runtime_configuration,
+                plan.runtime_launch,
+                phase=phase,
+                attempt_id=binding["attempt_id"],
+                expected_cell_id=cell.cell_id,
+                expected_collector_attempt_id=binding["collector_attempt_id"],
             )
             if result["provenance"]["bundle_sha256"] != bundle.sha256:
                 raise ValueError("runtime observation bundle differs from the frozen plan")

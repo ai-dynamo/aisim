@@ -377,6 +377,26 @@ def test_native_indexer_kernel_view_charges_only_actual_shared_allocation(monkey
     assert cache["layer_components"]["indexer.0"][0]["shape"][0] == 146
 
 
+@pytest.mark.parametrize("payload,padded", [(1920, 2048), (2048, 4096)])
+def test_strided_indexer_views_cover_unpadded_payload_and_keep_pool_padding(monkeypatch, payload, padded):
+    cache, scheduled = _kernel_view_fixture(monkeypatch)
+    # Each indexer addresses 128 * 16 = 2048 bytes. Its padded footprint
+    # may include padding before the next layer in this pool.
+    group = cache["groups"][0]
+    for name in ("indexer.0", "indexer.1"):
+        group["layer_specs"][name].update(spec_page_size_bytes=padded, unpadded_page_size_bytes=payload)
+    group["spec_page_size_bytes"] = sum(child["spec_page_size_bytes"] for child in group["layer_specs"].values())
+    cache["tensor_allocations"][1]["layer_stride"] = padded
+    cache["layer_components"]["indexer.1"][0]["storage_offset_bytes"] = 8192 + padded
+    if payload == 2048:
+        _, accounting = _physical_views(cache, scheduled, "fp8", context=4096, sequences=8)
+        assert accounting["page_size_bytes"] == 16384
+        assert cache["allocated_cache_bytes"] == 10 * 16384
+    else:
+        with pytest.raises(ValueError, match="layer page coverage"):
+            _physical_views(cache, scheduled, "fp8", context=4096, sequences=8)
+
+
 def test_native_kernel_table_width_includes_context_alignment(monkeypatch):
     cache, scheduled = _kernel_view_fixture(monkeypatch)
     for record in (cache, scheduled):
@@ -574,6 +594,22 @@ def _moe(*, indices=(1,)):
     return evidence
 
 
+def _decoder_cache_names(value):
+    """Give synthetic native views the decoder ownership in our four-layer config."""
+    names = {
+        **{f"kda.{i}": f"model.layers.{i}.self_attn" for i in range(2)},
+        **{f"mla.{i}": f"model.layers.{i + 2}.self_attn.attn" for i in range(2)},
+        **{f"indexer.{i}": f"model.layers.{i + 2}.self_attn.indexer.k_cache" for i in range(2)},
+    }
+    if isinstance(value, str):
+        return names.get(value, value)
+    if isinstance(value, list):
+        return [_decoder_cache_names(item) for item in value]
+    if isinstance(value, dict):
+        return {_decoder_cache_names(key): _decoder_cache_names(item) for key, item in value.items()}
+    return value
+
+
 @pytest.mark.parametrize("wrapped", [False, True])
 def test_initialized_moe_coverage_matches_independent_config_inventory(wrapped):
     config = {"num_hidden_layers": 7, "num_experts": 8, "first_k_dense_replace": 2, "moe_layer_freq": 2}
@@ -592,6 +628,22 @@ def test_initialized_moe_inventory_uses_native_config_defaults():
     assert runtime_k31.moe_precision(_moe(indices=(0, 1, 2)), model_config=config) == "w4a8_mxfp4_mxfp8_trtllm"
     with pytest.raises(ValueError, match="model configuration inventory"):
         runtime_k31.moe_precision(_moe(indices=(1, 2)), model_config=config)
+
+
+@pytest.mark.parametrize("first,frequency,indices", [(0, 3, (0, 3, 6)), (2, 3, (3, 6)), (6, 3, (6,))])
+def test_moe_inventory_count_includes_only_eligible_decoder_indices(first, frequency, indices):
+    config = {"num_hidden_layers": 7, "num_experts": 8, "first_k_dense_replace": first, "moe_layer_freq": frequency}
+    assert runtime_k31.moe_precision(_moe(indices=indices), model_config=config) == "w4a8_mxfp4_mxfp8_trtllm"
+
+
+def test_moe_inventory_rejects_huge_declared_layer_count_without_enumeration(monkeypatch):
+    def forbidden_range(*args):
+        raise AssertionError("inventory validation enumerated the declared decoder range")
+
+    monkeypatch.setattr(runtime_k31, "range", forbidden_range, raising=False)
+    config = {"num_hidden_layers": 2**53, "num_experts": 8}
+    with pytest.raises(ValueError, match="model configuration inventory"):
+        runtime_k31.moe_precision(_moe(), model_config=config)
 
 
 def test_initialized_expert_arithmetic_selects_exact_mode_and_rejects_metadata_guess():
@@ -733,7 +785,17 @@ def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode", packed_i
         json.dumps(
             {
                 "architectures": ["KimiK31ForConditionalGeneration"],
-                "text_config": {"num_hidden_layers": 4, "num_experts": 8, "first_k_dense_replace": 1},
+                "text_config": {
+                    "num_hidden_layers": 4,
+                    "num_experts": 8,
+                    "first_k_dense_replace": 1,
+                    "linear_attn_config": {
+                        "kda_layers": [1, 2],
+                        "full_attn_layers": [3, 4],
+                        "use_full_rank_gate": True,
+                    },
+                    "dsa_config": {"dsa_layers": [3, 4]},
+                },
             }
         )
     )
@@ -801,6 +863,7 @@ def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode", packed_i
                 {"group_id": 0, "backend": "DEEPSEEK_V32_INDEXER", "layer_names": ["indexer.0", "indexer.1"]},
                 {"group_id": 1, "backend": "KIMI_K3_KDA", "layer_names": ["kda.0", "kda.1"]},
             ]
+        record = _decoder_cache_names(record)
         record_path.write_text(json.dumps(record))
         ref["sha256"] = hashlib.sha256(record_path.read_bytes()).hexdigest()
     path.write_text(json.dumps(index))
@@ -828,10 +891,58 @@ def test_import_rejects_worker_with_self_consistent_but_missing_configured_moe_l
         validate_observation_phase(path, "tp2", launch, phase="decode", attempt_id="attempt-001")
 
 
+def test_import_rejects_matching_worker_scheduler_omission_of_one_kda_group(tmp_path, monkeypatch):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+
+    def split_kda_groups(record):
+        cache = record["cache"]
+        state = cache["groups"].pop()
+        for name in state["layer_names"]:
+            group = copy.deepcopy(state)
+            group.update(
+                layer_names=[name],
+                representative_layer=name,
+                layer_specs={name: state["layer_specs"][name]},
+                spec_page_size_bytes=state["layer_specs"][name]["spec_page_size_bytes"],
+            )
+            if record["kind"] == "worker":
+                group["layer_classes"] = {name: state["layer_classes"][name]}
+            cache["groups"].append(group)
+        if record["kind"] == "worker":
+            original = record["attention_groups"].pop()
+            record["attention_groups"].extend(
+                {**original, "group_id": gid, "layer_names": group["layer_names"]}
+                for gid, group in enumerate(cache["groups"][1:], start=1)
+            )
+        else:
+            cache["group_pool_ids"] = [cache["pool_id"]] * len(cache["groups"])
+
+    _mutate(path, split_kda_groups)
+    assert validate_observations(path, launches)["tp2"]["status"] == "complete"
+
+    def omit_group(record):
+        cache = record["cache"]
+        omitted = set(cache["groups"].pop()["layer_names"])
+        assert len(cache["groups"]) == 2  # Another KDA group remains.
+        if record["kind"] == "worker":
+            record["attention_groups"].pop()
+            for name in omitted:
+                cache["layer_components"].pop(name)
+            for allocation in cache["tensor_allocations"]:
+                allocation["layers"] = [name for name in allocation["layers"] if name not in omitted]
+        else:
+            cache["group_pool_ids"].pop()
+
+    _mutate(path, omit_group)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete" and result["resources"] is None
+    assert "cache layers differ from the checkpoint decoder inventory" in str(result["diagnostics"])
+
+
 @pytest.mark.parametrize("rows", [1, 63, 64, 65])
 def test_import_checks_kernel_table_sequence_capacity(tmp_path, monkeypatch, rows):
     path, launches = _complete_fixture(tmp_path, monkeypatch, packed_indexer=True)
-    cache, _ = _kernel_view_fixture(monkeypatch)
+    cache, _ = [_decoder_cache_names(value) for value in _kernel_view_fixture(monkeypatch)]
     for mapping in cache["kernel_block_views"].values():
         mapping["kernel_block_table_shape"][1] = rows
 
@@ -854,7 +965,7 @@ def test_import_checks_kernel_table_sequence_capacity(tmp_path, monkeypatch, row
 @pytest.mark.parametrize("width", [32, 62, 64, 66])
 def test_import_checks_kernel_table_width_against_reviewed_context(tmp_path, monkeypatch, width):
     path, launches = _complete_fixture(tmp_path, monkeypatch, packed_indexer=True)
-    cache, _ = _kernel_view_fixture(monkeypatch)
+    cache, _ = [_decoder_cache_names(value) for value in _kernel_view_fixture(monkeypatch)]
     for mapping in cache["kernel_block_views"].values():
         mapping["kernel_block_table_shape"] = [1, 64, width]
 
@@ -956,7 +1067,7 @@ def test_complete_rank_import_preserves_native_grouping_state_and_precision(
         group = record["cache"]["groups"][0]
         if "layer_specs" in group:
             for name, spec in group["layer_specs"].items():
-                if name.startswith("mla."):
+                if name.endswith(".self_attn.attn"):
                     spec["cache_dtype_str"] = cache_dtype
         else:
             group["cache_dtype_str"] = cache_dtype
@@ -982,7 +1093,7 @@ def test_import_rejects_e4m3_spelling_for_indexer_even_with_matching_scheduler(t
         group = record["cache"]["groups"][0]
         if "layer_specs" in group:
             for name, spec in group["layer_specs"].items():
-                if name.startswith("indexer."):
+                if name.endswith(".self_attn.indexer.k_cache"):
                     spec["cache_dtype_str"] = "fp8_e4m3"
 
     _mutate(path, corrupt)
@@ -1021,7 +1132,7 @@ def test_import_requires_initialized_indexed_mla_despite_consistent_cache_maps(t
     def remove_layers(record):
         cache = record["cache"]
         group = cache["groups"][0]
-        omitted = {name for name in group["layer_names"] if name.startswith(omit + ".")}
+        omitted = {name for name in group["layer_names"] if name in _decoder_cache_names([f"{omit}.0", f"{omit}.1"])}
         group["layer_names"] = [name for name in group["layer_names"] if name not in omitted]
         for field in ("layer_specs", "layer_classes"):
             if field in group:
@@ -1056,6 +1167,7 @@ def test_import_requires_initialized_indexed_mla_despite_consistent_cache_maps(t
 
 @pytest.mark.parametrize("layer,dtype", [("mla.0", "nvfp4"), ("mla.0", "fp8_ds_mla"), ("indexer.0", "fp8_ds_mla")])
 def test_native_spec_dtype_must_match_each_resolved_cache_layout(tmp_path, monkeypatch, layer, dtype):
+    layer = _decoder_cache_names(layer)
     path, launches = _complete_fixture(tmp_path, monkeypatch)
 
     def corrupt(record):
@@ -1064,7 +1176,7 @@ def test_native_spec_dtype_must_match_each_resolved_cache_layout(tmp_path, monke
         # Update the scheduler projection too: equality alone is insufficient.
         if "layer_specs" in group:
             group["layer_specs"][layer]["cache_dtype_str"] = dtype
-        elif layer.startswith("mla."):
+        elif layer.endswith(".self_attn.attn"):
             group["cache_dtype_str"] = dtype
 
     _mutate(path, corrupt)

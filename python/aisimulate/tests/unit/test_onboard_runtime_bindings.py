@@ -550,6 +550,23 @@ def _change_records(binding, change):
     _change_index(binding, apply)
 
 
+@pytest.mark.parametrize("identity", ["cell_id", "collector_attempt_id"])
+def test_onboarding_rejects_worker_from_another_native_retry(split_collection, identity):
+    request, bindings = split_collection
+    _review(request, bindings)
+    # The phase and launch manifest still name successful retry B. The saved,
+    # digest-matching worker evidence below belongs to A under the same parent.
+    assert runtime.verify_collection_runtime_bindings(request, bindings)["status"] == "complete"
+
+    def stale_worker(record):
+        if record["kind"] == "worker":
+            record[identity] = "previous-native-attempt-A"
+
+    _change_records(bindings[0], stale_worker)
+    with pytest.raises(ValueError, match=identity + " mismatch"):
+        runtime.verify_collection_runtime_bindings(request, bindings)
+
+
 @pytest.mark.parametrize(
     "change",
     [

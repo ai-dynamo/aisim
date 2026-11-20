@@ -470,11 +470,12 @@ def _validate_config(
     if parallel.get("enable_eplb", False) is not False:
         raise ValueError("runtime memory with expert load balancing is unsupported")
     expected_backend = cell.backend_policy.aic_fields.get("moe_backend")
-    if (
-        expected_backend not in (None, "auto")
-        and (config.get("kernel_config") or {}).get("moe_backend") != expected_backend
-    ):
-        raise ValueError("runtime memory MoE backend differs from the planned identity")
+    if expected_backend not in (None, "auto"):
+        kernel = config.get("kernel_config")
+        if not isinstance(kernel, dict):
+            raise ValueError("runtime memory evidence lacks a kernel_config object")
+        if kernel.get("moe_backend") != expected_backend:
+            raise ValueError("runtime memory MoE backend differs from the planned identity")
     if _resolved_cache_dtype(config, cell) != cell.kv_cache_dtype:
         raise ValueError("runtime memory KV precision differs from the planned identity")
     from .runtime_k31 import is_audited_runtime

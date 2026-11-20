@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 from collector.fpm_forward import planner, runtime_probe
 from collector.fpm_forward.capabilities import resolve_model_capability
+from collector.fpm_forward.config import _freeze_benchmark_points
 from collector.fpm_forward.runtime_instrumentation import load_instrumentation, runtime_binding
 from collector.fpm_forward.runtime_observations import expected_ranks, validate_observations
 from collector.fpm_forward.types import ParallelTopology
@@ -22,7 +23,7 @@ from aisimulate_core.sdk.fpm_profile import load_fpm_profile
 
 from .test_fpm_forward import _kimi_k31_config
 from .test_fpm_profile_collection import no_models_or_timing_data  # noqa: F401
-from .test_k31_runtime_observations import _complete_fixture, _kernel_view_fixture, _moe
+from .test_k31_runtime_observations import _complete_fixture, _decoder_cache_names, _kernel_view_fixture, _moe
 from .test_runtime_observations import _replace_launch, _write
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_models_or_timing_data")]
@@ -30,10 +31,24 @@ pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_models_or_timing_dat
 
 @pytest.fixture
 def inputs(tmp_path, monkeypatch, request):
-    index_path, launches = _complete_fixture(tmp_path, monkeypatch)
-    config_path, text = _kimi_k31_config(tmp_path)
-    launch = launches["tp2"]
     settings = getattr(request, "param", "trtllm_mla")
+    workload_kind = "prefill" if settings == "prefill" else "decode"
+    index_path, launches = _complete_fixture(tmp_path, monkeypatch, workload_kind=workload_kind)
+    config_path, text = _kimi_k31_config(tmp_path)
+    # Keep the independent checkpoint layout small and consistent with the
+    # synthetic native views, including two distinct KDA decoder branches.
+    text["num_hidden_layers"] = 4
+    text["linear_attn_config"].update(kda_layers=[1, 2], full_attn_layers=[3, 4])
+    text["dsa_config"]["dsa_layers"] = [3, 4]
+    config = json.loads(config_path.read_text())
+    config["text_config"] = text
+    config_path.write_text(json.dumps(config))
+    launch = launches["tp2"]
+    if workload_kind == "prefill":
+        settings = "trtllm_mla"
+    if settings == "explicit-moe":
+        launch["precision"]["moe_backend"] = "flashinfer_trtllm"
+        settings = "trtllm_mla"
     attention_backend, packed_indexer = (settings, False) if isinstance(settings, str) else settings
     launch["precision"]["attention_backend"] = attention_backend
     launch["model_config"] = {"path": str(config_path), "sha256": hashlib.sha256(config_path.read_bytes()).hexdigest()}
@@ -44,13 +59,13 @@ def inputs(tmp_path, monkeypatch, request):
     index = json.loads(index_path.read_text())
     attempt = index["configurations"]["tp2"]["attempts"][0]
     bundle = load_instrumentation(tmp_path / attempt["bundle"]["manifest"])
-    phase = attempt["phases"]["decode"]
+    phase = attempt["phases"][workload_kind]
     context_path = tmp_path / phase["launch_manifest"]["path"]
     context = json.loads(context_path.read_text())
     context.update(expected_ranks=expected_ranks(launch["topology"]), instrumentation_binding=runtime_binding())
     phase["launch_manifest"]["sha256"] = _write(context_path, context)["sha256"]
     if packed_indexer:
-        cache, scheduled = _kernel_view_fixture(monkeypatch)
+        cache, scheduled = [_decoder_cache_names(value) for value in _kernel_view_fixture(monkeypatch)]
         for mapping in cache["kernel_block_views"].values():
             mapping["kernel_block_table_shape"][1] = launch["collection"]["max_num_seqs"]
     retained = []
@@ -65,6 +80,7 @@ def inputs(tmp_path, monkeypatch, request):
         record["resolved_config"]["parallel_config"].update(
             data_parallel_size=1, data_parallel_size_local=1, enable_expert_parallel=False
         )
+        record["resolved_config"]["kernel_config"]["moe_backend"] = launch["precision"]["moe_backend"]
         if packed_indexer:
             record["cache"] = copy.deepcopy(cache if record["kind"] == "worker" else scheduled)
         if attention_backend == "flashmla":
@@ -74,7 +90,7 @@ def inputs(tmp_path, monkeypatch, request):
             for group in record["cache"]["groups"]:
                 specs = group.get("layer_specs", dict.fromkeys(group["layer_names"], group))
                 for name, spec in specs.items():
-                    if name.startswith("mla."):
+                    if name.endswith(".self_attn.attn"):
                         spec["cache_dtype_str"] = "fp8_ds_mla"
             if record["kind"] == "worker":
                 record["attention_backend"][0] = "FLASHMLA_SPARSE"
@@ -105,6 +121,19 @@ def inputs(tmp_path, monkeypatch, request):
     result = validate_observations(index_path, launches)["tp2"]
     assert result["status"] == "complete", result["diagnostics"]
     probe = runtime_probe.build_runtime_probe_plan("tp2", launch, bundle)
+    options = probe.options
+    if workload_kind == "prefill":
+        points_path = tmp_path / "prefill-points.json"
+        _write(
+            points_path,
+            {
+                "schema_version": 1,
+                "prefill": [{"batch_size": 1, "total_prefill_tokens": 128, "total_kv_read_tokens": 0}],
+                "decode": [],
+            },
+        )
+        payload, digest = _freeze_benchmark_points(str(points_path))
+        options = replace(options, benchmark_points_json=payload, benchmark_points_sha256=digest)
     capability = resolve_model_capability(
         backend="vllm",
         model_architecture=None,
@@ -134,7 +163,7 @@ def inputs(tmp_path, monkeypatch, request):
                 **launch["topology"],
                 **{key: value for key, value in launch["precision"].items() if key != "kvcache_quant_mode"},
                 "kv_cache_dtype": launch["precision"]["kvcache_quant_mode"],
-                "worker_type": "decode",
+                "worker_type": workload_kind,
                 "resources": result["resources"],
             }
         ],
@@ -146,7 +175,7 @@ def inputs(tmp_path, monkeypatch, request):
         "model_path": profile["model"],
         "system": "gb300",
         "backend": "vllm",
-        "options": probe.options,
+        "options": options,
         "runtime_instrumentation": bundle,
         "runtime_launch": launch,
     }
@@ -191,8 +220,8 @@ def test_inline_proof_rejects_non_object_instrumentation(inputs, instrumentation
 
 @pytest.mark.parametrize(
     "inputs",
-    [("trtllm_mla", False), ("trtllm_mla", True), ("flashmla", True)],
-    ids=["manager-blocks", "packed-indexer-trtllm", "packed-indexer-flashmla"],
+    [("trtllm_mla", False), ("trtllm_mla", True), ("flashmla", True), "prefill"],
+    ids=["manager-blocks", "packed-indexer-trtllm", "packed-indexer-flashmla", "zero-history-prefill"],
     indirect=True,
 )
 @pytest.mark.parametrize("onboarding", [False, True], ids=["inline-proof", "onboarding-proof"])
@@ -207,7 +236,7 @@ def test_formal_plan_uses_observed_precision_and_keeps_final_launch_validation(i
         return validate(*args, **kwargs)
 
     monkeypatch.setattr(runtime_probe, "validate_collection_probe_launch", record)
-    plan = planner.build_collection_plan(
+    plan_args = dict(
         backend=inputs["backend"],
         model_path=inputs["model_path"],
         system=inputs["system"],
@@ -220,9 +249,21 @@ def test_formal_plan_uses_observed_precision_and_keeps_final_launch_validation(i
         runtime_launch=inputs["runtime_launch"],
         generator_overrides=runtime_probe.probe_generator_overrides(inputs["runtime_launch"]),
     )
+    plan = planner.build_collection_plan(**plan_args)
     assert calls == [True]
     assert plan.cells and {cell.moe_quant_mode for cell in plan.cells} == {"w4a8_mxfp4_mxfp8_trtllm"}
     assert plan.runtime_instrumentation.sha256 == inputs["runtime_instrumentation"].sha256
+    if inputs["runtime_launch"]["worker_type"] == "prefill":
+        from collector.fpm_forward import runner
+
+        assert {cell.workload_kind for cell in plan.cells} == {"prefill"}
+        assert {p["total_kv_read_tokens"] for p in json.loads(plan.options.benchmark_points_json)["prefill"]} == {0}
+        for cell in plan.cells:
+            generated = runner._cell_generator_overrides(plan, cell, plan_args["generator_overrides"])
+            assert "--no-enable-prefix-caching" in generated["params"]["agg"]["extra_cli_args"]
+    plan_args["options"] = replace(inputs["options"], warmup_iterations=inputs["options"].warmup_iterations + 1)
+    with pytest.raises(ValueError, match="warmup_iterations"):
+        planner.build_collection_plan(**plan_args)
 
 
 def test_formal_plan_freezes_the_bundle_used_for_precision_validation(inputs, monkeypatch):
@@ -254,6 +295,13 @@ def test_formal_plan_freezes_the_bundle_used_for_precision_validation(inputs, mo
     assert calls == [True]
     monkeypatch.setattr(runtime_instrumentation, "load_instrumentation", load)
     assert plan.runtime_instrumentation.sha256 == bundle.sha256
+    root = bundle.root / "collection"
+    frozen = root / "runtime-observations/parent-attempt/instrumentation"
+    source = bundle.root / next(iter(bundle.files))
+    source.write_bytes(source.read_bytes() + b"\n# changed after planning\n")
+    with pytest.raises(ValueError, match="instrumentation.*changed"):
+        runtime_probe.prepare_collection_observations(plan, root, "parent-attempt")
+    assert not frozen.exists()
 
 
 @pytest.mark.parametrize("different_device", [False, True])
@@ -529,8 +577,19 @@ def test_onboarding_wrapper_rejects_changed_source_even_if_inline_claim_is_valid
 
 
 def test_onboarding_wrapper_does_not_bypass_native_validator(inputs):
+    memory = inputs["profile"]["deployments"][0]["resources"]["runtime_memory"]
+    proof = json.loads(memory["provenance"])
+    index_path = Path(proof["observations_index"]["path"])
+    index = json.loads(index_path.read_text())
+    phase = index["configurations"]["tp2"]["attempts"][0]["phases"]["decode"]
+    for ref in phase["artifacts"]:
+        path = index_path.parent / ref["path"]
+        worker = json.loads(path.read_text())
+        if worker["kind"] == "worker":
+            worker["lifecycle"]["warmup_completed"] = False
+            ref["sha256"] = _write(path, worker)["sha256"]
+            break
+    index_path.write_text(json.dumps(index))
     onboarding_wrapper(inputs)
-    inputs["runtime_launch"] = copy.deepcopy(inputs["runtime_launch"])
-    inputs["runtime_launch"]["collection"]["warmup_iterations"] += 1
-    with pytest.raises(ValueError, match="native evidence is incomplete"):
+    with pytest.raises(ValueError, match="worker warmup and graph capture completion evidence is missing"):
         bind(inputs)

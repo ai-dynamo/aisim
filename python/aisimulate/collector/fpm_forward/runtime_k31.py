@@ -89,10 +89,18 @@ def moe_precision(evidence, *, model_config=None):
         _positive(config.get("num_experts"), "configured expert count")
         first = _nonnegative(config.get("first_k_dense_replace", 0), "dense layer prefix")
         frequency = _positive(config.get("moe_layer_freq", 1), "MoE layer frequency")
-        inventory = {index for index in range(first, count) if index % frequency == 0}
+        # Count multiples in [first, count) without enumerating an untrusted
+        # decoder size. Work and retained memory scale with observed layers.
+        eligible = max(0, (count - 1) // frequency - (first + frequency - 1) // frequency + 1)
+        if len(names) != eligible:
+            raise ValueError("K3.1 initialized MoE layer coverage differs from the model configuration inventory")
         matches = [re.search(r"(?:^|\.)layers\.(\d+)\.", name) for name in names]
         indices = [int(match[1]) for match in matches if match is not None]
-        if len(indices) != len(names) or len(set(indices)) != len(names) or set(indices) != inventory:
+        if (
+            len(indices) != len(names)
+            or len(set(indices)) != len(names)
+            or any(not first <= index < count or index % frequency for index in indices)
+        ):
             raise ValueError("K3.1 initialized MoE layer coverage differs from the model configuration inventory")
     modes = set()
     for layer in layers:
@@ -296,7 +304,52 @@ def _validate_state_dtypes(spec, config):
         raise ValueError("K3.1 native state dtypes differ from the resolved cache configuration")
 
 
-def validate_attention_assignments(worker):
+def _validate_cache_inventory(cache, model_config):
+    """Check PP1 cache ownership against the independently hash-bound decoder."""
+    config = model_config.get("text_config", model_config)
+    if not isinstance(config, dict):
+        raise ValueError("K3.1 decoder configuration must be an object")
+    count = _positive(config.get("num_hidden_layers"), "decoder layer count")
+
+    def layer_indices(section, field):
+        if section is None:
+            return set()
+        if not isinstance(section, dict) or not isinstance(section.get(field), list):
+            raise ValueError("K3.1 checkpoint cache layer inventory is malformed")
+        values = section[field]
+        if any(type(value) is not int or not 1 <= value <= count for value in values):
+            raise ValueError("K3.1 checkpoint cache layer indices must be one-based decoder indices")
+        return {value - 1 for value in values}
+
+    # Pinned KimiLinearConfig.is_kda_layer/is_dsa_layer use one-based lists;
+    # KimiDecoderLayer selects KDA first, then MLA with an optional DSA indexer.
+    kda = layer_indices(config.get("linear_attn_config"), "kda_layers")
+    dsa_config = config.get("dsa_config")
+    dsa_field = "layers" if isinstance(dsa_config, dict) and "dsa_layers" not in dsa_config else "dsa_layers"
+    indexer = layer_indices(dsa_config, dsa_field) - kda
+    mla_class = "vllm.model_executor.layers.attention.mla_attention.MLAAttention"
+    indexer_class = "vllm.models.kimi_k3.common.dsa_cache.KimiK3IndexerCache"
+    observed = {cls: set() for cls in (KDA, mla_class, indexer_class)}
+    for group in cache["groups"]:
+        for name in group["layer_names"]:
+            cls = group["layer_classes"].get(name)
+            match = re.search(r"(?:^|\.)layers\.(\d+)\.", name)
+            if cls not in observed or match is None:
+                raise ValueError("K3.1 cache layers differ from the checkpoint decoder inventory")
+            index = int(match[1])
+            if index in observed[cls] or not 0 <= index < count:
+                raise ValueError("K3.1 cache layers differ from the checkpoint decoder inventory")
+            observed[cls].add(index)
+    if (
+        observed[KDA] != kda
+        or observed[indexer_class] != indexer
+        or len(observed[mla_class]) != count - len(kda)
+        or observed[mla_class].intersection(kda)
+    ):
+        raise ValueError("K3.1 cache layers differ from the checkpoint decoder inventory")
+
+
+def validate_attention_assignments(worker, *, model_config=None):
     """Reconcile initialized layer backends and dtypes with resolved policy."""
     cache = worker["cache"]
     config = worker["resolved_config"]
@@ -345,6 +398,8 @@ def validate_attention_assignments(worker):
         raise ValueError("K3.1 native attention assignments omit initialized layers")
     if not {selected, "DEEPSEEK_V32_INDEXER"}.issubset(observed.values()):
         raise ValueError("K3.1 native attention requires initialized MLA and DSA indexer layers")
+    if model_config is not None:
+        _validate_cache_inventory(cache, model_config)
     return observed
 
 
@@ -401,7 +456,7 @@ def _kernel_view_geometry(mapping, group, view, count, page, width, *, context=N
     if (
         strides[0] != kernel_bytes
         or stride * kernel_bytes != page
-        or subdivisions * kernel_bytes != width
+        or subdivisions * kernel_bytes != group["unpadded_page_size_bytes"]
         or shape[0] != (count - 1) * stride + subdivisions
     ):
         raise ValueError("K3.1 kernel-block view contradicts native pool stride or layer page coverage")
