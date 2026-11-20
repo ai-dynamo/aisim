@@ -170,7 +170,7 @@ jobs:
           python-version: "3.12"
       - name: Install HF input tooling
         run: |
-          python -m venv "${RUNNER_TEMP}/trusted-venv"
+          python -I -m venv "${RUNNER_TEMP}/trusted-venv"
           "${RUNNER_TEMP}/trusted-venv/bin/pip" install --require-hashes -r trusted/scripts/e2e_accuracy/requirements.txt
       - name: Resolve the reviewed HF revision and snapshot once for all branches
         env:
