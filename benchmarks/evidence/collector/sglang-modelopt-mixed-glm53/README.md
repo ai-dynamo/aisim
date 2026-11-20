@@ -38,10 +38,10 @@ The runs use SGLang 0.5.21 and SGLang 0.5.23 on one SM100 GPU. Each SGLang versi
 - The loader builds two layers (`SGLANG_TEST_NUM_LAYERS`, default 2). The model has `first_k_dense_replace` 3, so both layers have a dense MLP. No NVFP4 expert module is built, and the runs say nothing about the NVFP4 MoE path. The DSA module rows do not time the MoE.
 - The loader uses dummy weights (`SGLANG_LOAD_FORMAT`, default `dummy`). The runs do not load real checkpoint tensors or scales, and they say nothing about accuracy.
 - The runs use SM100 only. They say nothing about SM103, SM110 or SM120. On SM90 the plan holds no case for this checkpoint (`plan-diff.md`), because the collector collects no Marlin-backed NVFP4.
-- The collector run covers 24 points of one batch size. It is not a full collection, and it does not compare the timings with serving.
+- The collector run covers points of one batch size: 24 points at 0.5.21 and 42 points in tree B. It is not a full collection, and it does not compare the timings with serving.
 - The probe sizes the KV pool from all 12 points of its plan row. `run_mla_module` first refuses the points over the prefill chunk, so its pool can be smaller. The pool size changes no quantization method and no KV dtype.
 - The runs exercise no other checkpoint. The one reader change in the packaged models (`nvidia/Kimi-K2.5-NVFP4`) is not a checkpoint of this collector.
-- The SGLang 0.5.23 runs use tree B, a throwaway merge of this branch onto pull request #777. They do not test a merged state of the repository.
+- The SGLang 0.5.23 runs use tree B, a throwaway merge of the branch of the pull request that added this directory onto pull request #777. They do not test a merged state of the repository.
 
 ## SGLang source table
 
@@ -96,10 +96,10 @@ The SGLang MLA and DSA module collector declares 18 checkpoints (`collector.case
 
 | SGLang | Image | Tree |
 |---|---|---|
-| 0.5.21 | `lmsysorg/sglang:v0.5.21@sha256:b1259f3ea3275f66237c498ea388919729018bc9f01c3d638391e06e2cf3f469` | Tree A: this branch |
-| 0.5.23 | `lmsysorg/sglang:v0.5.23@sha256:f832b5c39559c9caa900b22ad37c76fcce66470676855c42052102c537812f1f` | Tree B: this branch merged onto the head of pull request #777 |
+| 0.5.21 | `lmsysorg/sglang:v0.5.21@sha256:b1259f3ea3275f66237c498ea388919729018bc9f01c3d638391e06e2cf3f469` | Tree A: the branch of the pull request that added this directory |
+| 0.5.23 | `lmsysorg/sglang:v0.5.23@sha256:f832b5c39559c9caa900b22ad37c76fcce66470676855c42052102c537812f1f` | Tree B: the branch of the pull request that added this directory, merged onto the head of pull request #777 |
 
-The 0.5.21 image is the pin of `python/aisim/collector/framework_manifest.yaml` on this branch:
+The 0.5.21 image is the pin of `python/aisim/collector/framework_manifest.yaml` on the branch of the pull request that added this directory:
 
 ```yaml
     default:
@@ -108,7 +108,7 @@ The 0.5.21 image is the pin of `python/aisim/collector/framework_manifest.yaml` 
         default: "lmsysorg/sglang:v0.5.21@sha256:b1259f3ea3275f66237c498ea388919729018bc9f01c3d638391e06e2cf3f469"
 ```
 
-Only the open pull request #777 (branch `feat/ops-upgrade-202611`, not merged) names the 0.5.23 image in its manifest. `collect.py` refuses any SGLang version other than its pin, so the 0.5.23 runs need tree B. Make tree B in a throwaway directory. Check out the head of pull request #777 there, and merge this branch into it. Record the two commits in the run record. Do not push tree B.
+Only the open pull request #777 (branch `feat/ops-upgrade-202611`, not merged) names the 0.5.23 image in its manifest. `collect.py` refuses any SGLang version other than its pin, so the 0.5.23 runs need tree B. Make tree B in a throwaway directory. Check out the head of pull request #777 there, and merge the branch of the pull request that added this directory into it. Record the two commits in the run record. Do not push tree B.
 
 ### Steps per SGLang version
 
@@ -170,6 +170,7 @@ The probe writes the JSON and then exits with code 1 in each of these cases:
 - An attention projection has a method other than `UnquantizedLinearMethod`, or a weight dtype other than `bfloat16`.
 - A `LinearBase` module has no `quant_method` attribute.
 - The KV pool dtype does not correspond to `--kv-cache-dtype` through the collector's `SGLANG_KV_DTYPE` (`fp8` gives `float8_e4m3fn`, `bfloat16` gives `bfloat16`).
+- The collector's KV dtype has no known torch dtype name. The probe maps the `SGLANG_KV_DTYPE` value for `--kv-cache-dtype` to a torch dtype name, and the map has no entry for it.
 
 The docstring of the probe gives the module tree that it reads, and the SGLang source that makes that tree. It also gives the source that proves an indexer in both loaded layers. The load format is recorded, not asserted.
 
@@ -177,7 +178,7 @@ The probe does not set the environment that `collect.py` sets for SGLang before 
 
 ### What the narrow collection selects
 
-A CPU plan of the head commit with `COLLECTOR_MODEL_PATH=nvidia/GLM-5.3-NVFP4` on SM100 gives 90 `dsa_context_module` rows with 4900 points. The filter `"[0, 256, 64, "` keeps 2 rows with 24 points:
+A CPU plan of commit `2df535ed`, the last change of collector code, with `COLLECTOR_MODEL_PATH=nvidia/GLM-5.3-NVFP4` on SM100 gives 90 `dsa_context_module` rows with 4900 points. The filter `"[0, 256, 64, "` keeps 2 rows with 24 points:
 
 | Row | `kv_cache_dtype` | Compute dtype | `gemm_type` | Pinned DSA backend | Points |
 |---|---|---|---|---|---|
@@ -187,6 +188,8 @@ A CPU plan of the head commit with `COLLECTOR_MODEL_PATH=nvidia/GLM-5.3-NVFP4` o
 Both rows have 64 heads and target TP 1. Their points are batch size 256, sequence lengths 16, 32 and 64, and prefix lengths 0, 512, 1024 and 2048. So a complete run writes 24 rows, 12 with KV dtype `fp8` and 12 with `bfloat16`. When the device refuses a point, the point becomes a `FIXME(kernel-limit)` failure record instead of a row. `--plan-only` does not apply `--case-filter`, so these numbers come from the plan rows that the getter returns.
 
 ## Run records
+
+Tree A is commit `5df15da0` of the branch of the pull request that added this directory. Later commits of that branch change no executable line under `python/aisim/collector/`. They change only comments and docstrings there. The plan hashes of `plan-diff.md` hold at the final content.
 
 Each SGLang version has one record. The six result files are in this directory.
 
@@ -216,7 +219,7 @@ Each SGLang version has one record. The six result files are in this directory.
 | GPU and node type | One NVIDIA B200, compute capability 10.0 (SM100), 183359 MiB, driver 580.82.07, on a Slurm node with 8 GPUs |
 | Image digest seen in the container | The job imported the image by its digest (`sha256:f832b5c39559c9caa900b22ad37c76fcce66470676855c42052102c537812f1f`). The container reports `sglang` 0.5.23 and `torch` 2.14.1+cu130. |
 | Tree B: head commit of pull request #777 | `6f3ac1b073a011c38eed05dd7572184e4157055c` |
-| Tree B: commit of this branch that was merged | `5df15da09bb69a6396e830d182907f1931f8f84f` (the merge had no conflict) |
+| Tree B: merged commit of the branch of the pull request that added this directory | `5df15da09bb69a6396e830d182907f1931f8f84f` (the merge had no conflict) |
 | `probe-0.5.23-fp8.json` exit code | 0 |
 | `probe-0.5.23-fp8.json`: `resolved_quantization`, `kv_cache_dtype`, attention projections | `modelopt_mixed`, `float8_e4m3fn` (stored as `uint8`), 12 projections (4 of the indexer), all `UnquantizedLinearMethod` with `bfloat16` weights |
 | `probe-0.5.23-bfloat16.json` exit code | 0 |

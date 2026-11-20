@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Plan diff: base 51607c9c against branch head 2df535ed
+# Plan diff: base 51607c9c against commit 2df535ed, the last change of collector code
 
 The branch changes how `_model_native_gemm_quant` reads the checkpoint quantization. This diff shows that the change leaves every SGLang MLA and DSA module plan unchanged.
 
@@ -11,7 +11,7 @@ Result: no difference. For each SM, op and plan, the `plans` block of `--plan-on
 
 ## Method
 
-The base side is a `git worktree` of `51607c9c`. The head side is the branch at `2df535ed`. Each side runs from an empty directory outside the repository, with the repository virtual environment and `PYTHONPATH=<tree>/python/aisim`. No run needs a GPU.
+The base side is a `git worktree` of `51607c9c`. The head side is commit `2df535ed`, the last change of collector code. Each side runs from an empty directory outside the repository, with the repository virtual environment and `PYTHONPATH=<tree>/python/aisim`. No run needs a GPU.
 
 ```bash
 PYTHONPATH=<tree>/python/aisim python <tree>/python/aisim/collector/collect.py \
