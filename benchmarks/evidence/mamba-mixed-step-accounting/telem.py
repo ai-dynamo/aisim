@@ -17,8 +17,10 @@ real = nh.ops.Mamba2Kernel
 
 
 def wrapped(name, scale, kernel, phase, *args, **kw):
-    kw.setdefault("state_dtype", "bfloat16")
-    kw.setdefault("token_width", (NEXTN + 1) if phase == "generation" else 1)
+    # Keep this historical BF16 diagnostic independent of the checkpoint's
+    # resolved FP32 state, now passed by the canonical MTP constructor.
+    kw["state_dtype"] = "bfloat16"
+    kw["token_width"] = (NEXTN + 1) if phase == "generation" else 1
     return real(name, scale, kernel, phase, *args, **kw)
 
 

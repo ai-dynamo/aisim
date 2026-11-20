@@ -1,0 +1,1836 @@
+{
+ "config": {
+  "traffic": {
+   "source": {
+    "type": "synthetic",
+    "input_tokens": 2048,
+    "cached_prefix_tokens": 512,
+    "output_tokens": 32
+   },
+   "load": {
+    "type": "concurrency",
+    "concurrency": 64
+   },
+   "stop": {
+    "requests": 1000
+   }
+  },
+  "engine": {
+   "mode": "aggregated",
+   "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+   "hardware": "b200_sxm",
+   "backend": "trtllm",
+   "backend_version": "1.3.0rc20",
+   "context_length": 8192,
+   "ais_perf_model": {
+    "estimation_mode": "op_level",
+    "fallback_policy": "deny",
+    "database_mode": "HYBRID"
+   },
+   "workers": {
+    "aggregated": {
+     "parallelism": {
+      "replicas": 1,
+      "tensor": 1,
+      "pipeline": 1,
+      "attention_data": 1,
+      "moe_tensor": 1,
+      "moe_expert": 1
+     },
+     "scheduler": {
+      "max_batched_tokens": 4096,
+      "max_sequences": 64
+     },
+     "kv_cache": {
+      "block_size": 64,
+      "prefix_caching": true,
+      "capacity": {
+       "type": "fixed",
+       "blocks": 8192
+      }
+     }
+    }
+   }
+  }
+ },
+ "qualification": "canonical MTP3, checkpoint-declared FP32 state; control has no MTP",
+ "rounds": [
+  {
+   "order": [
+    "baseline",
+    "candidate"
+   ],
+   "results": {
+    "baseline": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 444.293219733,
+      "mean_tpot_ms": 9.070313617322585,
+      "duration_ms": 11527.582345,
+      "wall_time_ms": 80.986529,
+      "cli_seconds": 2.894966724998085,
+      "peak_rss_bytes": 318730240,
+      "build": {
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 95.046573,
+      "cli_seconds": 2.8276647650018276,
+      "peak_rss_bytes": 288227328,
+      "build": {
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     }
+    },
+    "candidate": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 463.764468423,
+      "mean_tpot_ms": 9.47266338158065,
+      "duration_ms": 12034.808389999997,
+      "wall_time_ms": 82.222789,
+      "cli_seconds": 2.960663891000877,
+      "peak_rss_bytes": 329424896,
+      "build": {
+       "constructor_sha256": "187a7c4c3bee1494ec90d9177ee1810af525e0ee45ca3574bd770e538ba9cfcc",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 87.35717899999999,
+      "cli_seconds": 2.8315923980007938,
+      "peak_rss_bytes": 278806528,
+      "build": {
+       "constructor_sha256": "187a7c4c3bee1494ec90d9177ee1810af525e0ee45ca3574bd770e538ba9cfcc",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     }
+    }
+   }
+  },
+  {
+   "order": [
+    "candidate",
+    "baseline"
+   ],
+   "results": {
+    "candidate": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 463.764468423,
+      "mean_tpot_ms": 9.47266338158065,
+      "duration_ms": 12034.808389999997,
+      "wall_time_ms": 80.86488299999999,
+      "cli_seconds": 2.909636676999071,
+      "peak_rss_bytes": 330629120,
+      "build": {
+       "constructor_sha256": "187a7c4c3bee1494ec90d9177ee1810af525e0ee45ca3574bd770e538ba9cfcc",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 89.373037,
+      "cli_seconds": 2.7533097119994636,
+      "peak_rss_bytes": 262451200,
+      "build": {
+       "constructor_sha256": "187a7c4c3bee1494ec90d9177ee1810af525e0ee45ca3574bd770e538ba9cfcc",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     }
+    },
+    "baseline": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 444.293219733,
+      "mean_tpot_ms": 9.070313617322585,
+      "duration_ms": 11527.582345,
+      "wall_time_ms": 79.77398,
+      "cli_seconds": 2.9636515909987793,
+      "peak_rss_bytes": 305778688,
+      "build": {
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 91.95511,
+      "cli_seconds": 2.798962766999466,
+      "peak_rss_bytes": 263004160,
+      "build": {
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     }
+    }
+   }
+  },
+  {
+   "order": [
+    "baseline",
+    "candidate"
+   ],
+   "results": {
+    "baseline": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 444.293219733,
+      "mean_tpot_ms": 9.070313617322585,
+      "duration_ms": 11527.582345,
+      "wall_time_ms": 80.73398,
+      "cli_seconds": 2.9677301270021417,
+      "peak_rss_bytes": 306311168,
+      "build": {
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 86.390033,
+      "cli_seconds": 2.751637080000364,
+      "peak_rss_bytes": 284401664,
+      "build": {
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     }
+    },
+    "candidate": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 463.764468423,
+      "mean_tpot_ms": 9.47266338158065,
+      "duration_ms": 12034.808389999997,
+      "wall_time_ms": 82.833046,
+      "cli_seconds": 3.0027551220009627,
+      "peak_rss_bytes": 315936768,
+      "build": {
+       "constructor_sha256": "187a7c4c3bee1494ec90d9177ee1810af525e0ee45ca3574bd770e538ba9cfcc",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 90.115212,
+      "cli_seconds": 2.7068680679985846,
+      "peak_rss_bytes": 278773760,
+      "build": {
+       "constructor_sha256": "187a7c4c3bee1494ec90d9177ee1810af525e0ee45ca3574bd770e538ba9cfcc",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     }
+    }
+   }
+  },
+  {
+   "order": [
+    "candidate",
+    "baseline"
+   ],
+   "results": {
+    "candidate": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 463.764468423,
+      "mean_tpot_ms": 9.47266338158065,
+      "duration_ms": 12034.808389999997,
+      "wall_time_ms": 80.090392,
+      "cli_seconds": 2.8976642390007328,
+      "peak_rss_bytes": 305729536,
+      "build": {
+       "constructor_sha256": "187a7c4c3bee1494ec90d9177ee1810af525e0ee45ca3574bd770e538ba9cfcc",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 90.360483,
+      "cli_seconds": 2.706999239002471,
+      "peak_rss_bytes": 263106560,
+      "build": {
+       "constructor_sha256": "187a7c4c3bee1494ec90d9177ee1810af525e0ee45ca3574bd770e538ba9cfcc",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     }
+    },
+    "baseline": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 444.293219733,
+      "mean_tpot_ms": 9.070313617322585,
+      "duration_ms": 11527.582345,
+      "wall_time_ms": 78.86167900000001,
+      "cli_seconds": 2.893147296999814,
+      "peak_rss_bytes": 306036736,
+      "build": {
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 87.820866,
+      "cli_seconds": 2.8023529180027253,
+      "peak_rss_bytes": 280276992,
+      "build": {
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     }
+    }
+   }
+  },
+  {
+   "order": [
+    "baseline",
+    "candidate"
+   ],
+   "results": {
+    "baseline": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 444.293219733,
+      "mean_tpot_ms": 9.070313617322585,
+      "duration_ms": 11527.582345,
+      "wall_time_ms": 80.636446,
+      "cli_seconds": 2.949732042998221,
+      "peak_rss_bytes": 305524736,
+      "build": {
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 99.02297,
+      "cli_seconds": 2.7463960499990208,
+      "peak_rss_bytes": 262000640,
+      "build": {
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     }
+    },
+    "candidate": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 463.764468423,
+      "mean_tpot_ms": 9.47266338158065,
+      "duration_ms": 12034.808389999997,
+      "wall_time_ms": 80.42936,
+      "cli_seconds": 2.915502160998585,
+      "peak_rss_bytes": 304885760,
+      "build": {
+       "constructor_sha256": "187a7c4c3bee1494ec90d9177ee1810af525e0ee45ca3574bd770e538ba9cfcc",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 87.587965,
+      "cli_seconds": 2.7140417600021465,
+      "peak_rss_bytes": 261885952,
+      "build": {
+       "constructor_sha256": "187a7c4c3bee1494ec90d9177ee1810af525e0ee45ca3574bd770e538ba9cfcc",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     }
+    }
+   }
+  },
+  {
+   "order": [
+    "candidate",
+    "baseline"
+   ],
+   "results": {
+    "candidate": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 463.764468423,
+      "mean_tpot_ms": 9.47266338158065,
+      "duration_ms": 12034.808389999997,
+      "wall_time_ms": 82.237461,
+      "cli_seconds": 2.9495002379990183,
+      "peak_rss_bytes": 305225728,
+      "build": {
+       "constructor_sha256": "187a7c4c3bee1494ec90d9177ee1810af525e0ee45ca3574bd770e538ba9cfcc",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 91.800811,
+      "cli_seconds": 2.738774312001624,
+      "peak_rss_bytes": 261799936,
+      "build": {
+       "constructor_sha256": "187a7c4c3bee1494ec90d9177ee1810af525e0ee45ca3574bd770e538ba9cfcc",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     }
+    },
+    "baseline": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 444.293219733,
+      "mean_tpot_ms": 9.070313617322585,
+      "duration_ms": 11527.582345,
+      "wall_time_ms": 80.786735,
+      "cli_seconds": 2.9104900839993206,
+      "peak_rss_bytes": 305266688,
+      "build": {
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 91.601317,
+      "cli_seconds": 2.6854753930019797,
+      "peak_rss_bytes": 262692864,
+      "build": {
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937",
+       "native_sources_sha256": "5a13ea963dce539d8620da7d129510ea46df94998d524ab68eddbfba6fb18533"
+      }
+     }
+    }
+   }
+  }
+ ],
+ "driver_sha256": "656f93da0a7ca53b6cfc367e5580ff60643b4ce855d6392807be548902684acb"
+}

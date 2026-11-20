@@ -74,6 +74,14 @@ Native op-level Replay packs every decode request at the configured width,
 `nextn + 1`. If its scheduler verifies fewer tokens for a request, the
 estimate counts more tokens than that request verifies.
 
+Built-in Nemotron-H MTP graphs record the resolved `mamba_ssm_cache_dtype`
+and `nextn + 1` decode width during normal construction through
+`RustForwardPassPerfModel.best_available`. Both `nextn` and explicit
+`speculation.kind: mtp` use this path. Context operations retain width one.
+Non-MTP built-in graphs retain legacy accounting, including schemes that
+assign their verification width and wrap draft operations after construction;
+this MTP integration does not qualify those graphs.
+
 A qualified Mamba2 operation cannot use the name `context_attention` or
 `context_attention (scaled)`. The SDK reports those names as context
 attention that is amortized over prefill chunks, but a qualified Mamba2 row is

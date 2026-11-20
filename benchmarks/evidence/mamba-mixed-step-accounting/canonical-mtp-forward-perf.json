@@ -1,0 +1,2356 @@
+{
+ "rounds": [
+  {
+   "order": [
+    "baseline",
+    "candidate"
+   ],
+   "results": {
+    "baseline": {
+     "config": {
+      "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+      "system": "b200_sxm",
+      "backend": "trtllm",
+      "backend_version": "1.3.0rc20",
+      "estimation_mode": "op_level",
+      "nextn": 3,
+      "tp": 1,
+      "moe_tp_size": 1,
+      "moe_ep_size": 1,
+      "fallback_policy": "deny",
+      "worker_type": "aggregated",
+      "database_mode": "HYBRID"
+     },
+     "cases": {
+      "decode": {
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "mixed_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 17,
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "prefill_uniform": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4096
+      },
+      "prefill_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4097
+      }
+     },
+     "builds": {
+      "nano": {
+       "config": {
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 3,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 400.65437800149084,
+       "queries": {
+        "decode": {
+         "predicted_ms": 9.001463918943989,
+         "first_query_us": 11914.434,
+         "warm": {
+          "call_mean_us": 2.6079399999999997,
+          "call_median_us": 2.283,
+          "call_p50_us": 2.283,
+          "call_p90_us": 2.6197,
+          "call_p99_us": 3.7457300000001306,
+          "call_min_us": 2.133,
+          "call_max_us": 28.964,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 9.361657890223285,
+         "first_query_us": 43.737,
+         "warm": {
+          "call_mean_us": 2.72134,
+          "call_median_us": 2.7015000000000002,
+          "call_p50_us": 2.7015000000000002,
+          "call_p90_us": 2.8244999999999996,
+          "call_p99_us": 3.058760000000001,
+          "call_min_us": 2.544,
+          "call_max_us": 3.233,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 29.006851206143878,
+         "first_query_us": 27.79,
+         "warm": {
+          "call_mean_us": 2.2591300000000003,
+          "call_median_us": 2.237,
+          "call_p50_us": 2.237,
+          "call_p90_us": 2.3842,
+          "call_p99_us": 2.4492000000000007,
+          "call_min_us": 2.122,
+          "call_max_us": 2.568,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 29.006851206143878,
+         "first_query_us": 4.91,
+         "warm": {
+          "call_mean_us": 2.78604,
+          "call_median_us": 2.2895,
+          "call_p50_us": 2.2895,
+          "call_p90_us": 3.704,
+          "call_p99_us": 13.727340000000014,
+          "call_min_us": 2.116,
+          "call_max_us": 16.434,
+          "iterations": 100.0
+         }
+        }
+       }
+      },
+      "control": {
+       "config": {
+        "model": "Qwen/Qwen3-0.6B",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 0,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 7.816549001290696,
+       "queries": {
+        "decode": {
+         "predicted_ms": 2.411101200445115,
+         "first_query_us": 13.322,
+         "warm": {
+          "call_mean_us": 2.4433000000000002,
+          "call_median_us": 2.2634999999999996,
+          "call_p50_us": 2.2634999999999996,
+          "call_p90_us": 2.4614999999999996,
+          "call_p99_us": 4.19662000000006,
+          "call_min_us": 2.153,
+          "call_max_us": 15.742,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 3.55248833993278,
+         "first_query_us": 9.982,
+         "warm": {
+          "call_mean_us": 2.6728899999999998,
+          "call_median_us": 2.654,
+          "call_p50_us": 2.654,
+          "call_p90_us": 2.761,
+          "call_p99_us": 2.92041,
+          "call_min_us": 2.559,
+          "call_max_us": 2.961,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 8.997,
+         "warm": {
+          "call_mean_us": 2.24472,
+          "call_median_us": 2.2270000000000003,
+          "call_p50_us": 2.2270000000000003,
+          "call_p90_us": 2.3101,
+          "call_p99_us": 2.4505900000000005,
+          "call_min_us": 2.141,
+          "call_max_us": 2.509,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 3.529,
+         "warm": {
+          "call_mean_us": 2.2510999999999997,
+          "call_median_us": 2.25,
+          "call_p50_us": 2.25,
+          "call_p90_us": 2.3200999999999996,
+          "call_p99_us": 2.4035400000000005,
+          "call_min_us": 2.151,
+          "call_max_us": 2.457,
+          "iterations": 100.0
+         }
+        }
+       }
+      }
+     },
+     "identity": {
+      "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+      "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937"
+     }
+    },
+    "candidate": {
+     "config": {
+      "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+      "system": "b200_sxm",
+      "backend": "trtllm",
+      "backend_version": "1.3.0rc20",
+      "estimation_mode": "op_level",
+      "nextn": 3,
+      "tp": 1,
+      "moe_tp_size": 1,
+      "moe_ep_size": 1,
+      "fallback_policy": "deny",
+      "worker_type": "aggregated",
+      "database_mode": "HYBRID"
+     },
+     "cases": {
+      "decode": {
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "mixed_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 17,
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "prefill_uniform": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4096
+      },
+      "prefill_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4097
+      }
+     },
+     "builds": {
+      "nano": {
+       "config": {
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 3,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 370.1206049991015,
+       "queries": {
+        "decode": {
+         "predicted_ms": 9.166281207089607,
+         "first_query_us": 12161.008,
+         "warm": {
+          "call_mean_us": 2.3325,
+          "call_median_us": 2.2325,
+          "call_p50_us": 2.2325,
+          "call_p90_us": 2.5157,
+          "call_p99_us": 3.451570000000011,
+          "call_min_us": 2.076,
+          "call_max_us": 5.488,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 9.823777631303589,
+         "first_query_us": 41.643,
+         "warm": {
+          "call_mean_us": 2.5923399999999996,
+          "call_median_us": 2.58,
+          "call_p50_us": 2.58,
+          "call_p90_us": 2.7172,
+          "call_p99_us": 2.82742,
+          "call_min_us": 2.437,
+          "call_max_us": 2.869,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 29.03190808718284,
+         "first_query_us": 26.447,
+         "warm": {
+          "call_mean_us": 2.30341,
+          "call_median_us": 2.173,
+          "call_p50_us": 2.173,
+          "call_p90_us": 2.3132,
+          "call_p99_us": 4.252860000000031,
+          "call_min_us": 2.032,
+          "call_max_us": 10.278,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 29.193090655744165,
+         "first_query_us": 4.94,
+         "warm": {
+          "call_mean_us": 2.17339,
+          "call_median_us": 2.1595,
+          "call_p50_us": 2.1595,
+          "call_p90_us": 2.2424,
+          "call_p99_us": 2.429250000000003,
+          "call_min_us": 2.058,
+          "call_max_us": 2.949,
+          "iterations": 100.0
+         }
+        }
+       }
+      },
+      "control": {
+       "config": {
+        "model": "Qwen/Qwen3-0.6B",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 0,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 7.847901997592999,
+       "queries": {
+        "decode": {
+         "predicted_ms": 2.411101200445115,
+         "first_query_us": 14.236,
+         "warm": {
+          "call_mean_us": 2.24925,
+          "call_median_us": 2.2199999999999998,
+          "call_p50_us": 2.2199999999999998,
+          "call_p90_us": 2.42,
+          "call_p99_us": 2.8025700000000024,
+          "call_min_us": 2.052,
+          "call_max_us": 3.255,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 3.55248833993278,
+         "first_query_us": 8.957,
+         "warm": {
+          "call_mean_us": 2.54561,
+          "call_median_us": 2.5309999999999997,
+          "call_p50_us": 2.5309999999999997,
+          "call_p90_us": 2.6327,
+          "call_p99_us": 2.7491900000000005,
+          "call_min_us": 2.437,
+          "call_max_us": 2.768,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 8.199,
+         "warm": {
+          "call_mean_us": 2.14236,
+          "call_median_us": 2.1334999999999997,
+          "call_p50_us": 2.1334999999999997,
+          "call_p90_us": 2.2115,
+          "call_p99_us": 2.3833900000000003,
+          "call_min_us": 2.04,
+          "call_max_us": 2.422,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 3.37,
+         "warm": {
+          "call_mean_us": 2.12264,
+          "call_median_us": 2.1105,
+          "call_p50_us": 2.1105,
+          "call_p90_us": 2.1892,
+          "call_p99_us": 2.3945400000000006,
+          "call_min_us": 2.012,
+          "call_max_us": 2.448,
+          "iterations": 100.0
+         }
+        }
+       }
+      }
+     },
+     "identity": {
+      "constructor_sha256": "187a7c4c3bee1494ec90d9177ee1810af525e0ee45ca3574bd770e538ba9cfcc",
+      "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937"
+     }
+    }
+   }
+  },
+  {
+   "order": [
+    "candidate",
+    "baseline"
+   ],
+   "results": {
+    "candidate": {
+     "config": {
+      "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+      "system": "b200_sxm",
+      "backend": "trtllm",
+      "backend_version": "1.3.0rc20",
+      "estimation_mode": "op_level",
+      "nextn": 3,
+      "tp": 1,
+      "moe_tp_size": 1,
+      "moe_ep_size": 1,
+      "fallback_policy": "deny",
+      "worker_type": "aggregated",
+      "database_mode": "HYBRID"
+     },
+     "cases": {
+      "decode": {
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "mixed_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 17,
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "prefill_uniform": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4096
+      },
+      "prefill_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4097
+      }
+     },
+     "builds": {
+      "nano": {
+       "config": {
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 3,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 385.6915059986932,
+       "queries": {
+        "decode": {
+         "predicted_ms": 9.166281207089607,
+         "first_query_us": 12224.847,
+         "warm": {
+          "call_mean_us": 2.3082599999999998,
+          "call_median_us": 2.2535,
+          "call_p50_us": 2.2535,
+          "call_p90_us": 2.4526000000000003,
+          "call_p99_us": 3.110990000000001,
+          "call_min_us": 2.131,
+          "call_max_us": 3.308,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 9.823777631303589,
+         "first_query_us": 42.047,
+         "warm": {
+          "call_mean_us": 2.82654,
+          "call_median_us": 2.6639999999999997,
+          "call_p50_us": 2.6639999999999997,
+          "call_p90_us": 2.7986,
+          "call_p99_us": 4.215560000000054,
+          "call_min_us": 2.547,
+          "call_max_us": 14.864,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 29.03190808718284,
+         "first_query_us": 27.303,
+         "warm": {
+          "call_mean_us": 2.2937600000000002,
+          "call_median_us": 2.254,
+          "call_p50_us": 2.254,
+          "call_p90_us": 2.3582,
+          "call_p99_us": 2.778120000000011,
+          "call_min_us": 2.154,
+          "call_max_us": 4.869,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 29.193090655744165,
+         "first_query_us": 5.071,
+         "warm": {
+          "call_mean_us": 2.27007,
+          "call_median_us": 2.2539999999999996,
+          "call_p50_us": 2.2539999999999996,
+          "call_p90_us": 2.344,
+          "call_p99_us": 2.446660000000005,
+          "call_min_us": 2.162,
+          "call_max_us": 3.304,
+          "iterations": 100.0
+         }
+        }
+       }
+      },
+      "control": {
+       "config": {
+        "model": "Qwen/Qwen3-0.6B",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 0,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 8.472743000311311,
+       "queries": {
+        "decode": {
+         "predicted_ms": 2.411101200445115,
+         "first_query_us": 14.019,
+         "warm": {
+          "call_mean_us": 2.26578,
+          "call_median_us": 2.2525,
+          "call_p50_us": 2.2525,
+          "call_p90_us": 2.3225,
+          "call_p99_us": 2.4897900000000015,
+          "call_min_us": 2.137,
+          "call_max_us": 2.766,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 3.55248833993278,
+         "first_query_us": 9.683,
+         "warm": {
+          "call_mean_us": 2.69263,
+          "call_median_us": 2.6710000000000003,
+          "call_p50_us": 2.6710000000000003,
+          "call_p90_us": 2.803,
+          "call_p99_us": 2.9187500000000006,
+          "call_min_us": 2.528,
+          "call_max_us": 2.993,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 8.806,
+         "warm": {
+          "call_mean_us": 2.43697,
+          "call_median_us": 2.25,
+          "call_p50_us": 2.25,
+          "call_p90_us": 2.3526,
+          "call_p99_us": 3.2715400000000807,
+          "call_min_us": 2.15,
+          "call_max_us": 18.967,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 3.996,
+         "warm": {
+          "call_mean_us": 2.59987,
+          "call_median_us": 2.2415000000000003,
+          "call_p50_us": 2.2415000000000003,
+          "call_p90_us": 2.3412999999999995,
+          "call_p99_us": 5.224460000000144,
+          "call_min_us": 2.12,
+          "call_max_us": 33.287,
+          "iterations": 100.0
+         }
+        }
+       }
+      }
+     },
+     "identity": {
+      "constructor_sha256": "187a7c4c3bee1494ec90d9177ee1810af525e0ee45ca3574bd770e538ba9cfcc",
+      "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937"
+     }
+    },
+    "baseline": {
+     "config": {
+      "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+      "system": "b200_sxm",
+      "backend": "trtllm",
+      "backend_version": "1.3.0rc20",
+      "estimation_mode": "op_level",
+      "nextn": 3,
+      "tp": 1,
+      "moe_tp_size": 1,
+      "moe_ep_size": 1,
+      "fallback_policy": "deny",
+      "worker_type": "aggregated",
+      "database_mode": "HYBRID"
+     },
+     "cases": {
+      "decode": {
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "mixed_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 17,
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "prefill_uniform": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4096
+      },
+      "prefill_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4097
+      }
+     },
+     "builds": {
+      "nano": {
+       "config": {
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 3,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 392.17085700147436,
+       "queries": {
+        "decode": {
+         "predicted_ms": 9.001463918943989,
+         "first_query_us": 12498.961,
+         "warm": {
+          "call_mean_us": 2.3845,
+          "call_median_us": 2.224,
+          "call_p50_us": 2.224,
+          "call_p90_us": 2.5847999999999995,
+          "call_p99_us": 4.222750000000033,
+          "call_min_us": 2.139,
+          "call_max_us": 10.633,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 9.361657890223285,
+         "first_query_us": 40.187,
+         "warm": {
+          "call_mean_us": 2.80695,
+          "call_median_us": 2.649,
+          "call_p50_us": 2.649,
+          "call_p90_us": 2.8261,
+          "call_p99_us": 5.336340000000032,
+          "call_min_us": 2.531,
+          "call_max_us": 11.409,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 29.006851206143878,
+         "first_query_us": 27.806,
+         "warm": {
+          "call_mean_us": 2.21928,
+          "call_median_us": 2.186,
+          "call_p50_us": 2.186,
+          "call_p90_us": 2.3407999999999998,
+          "call_p99_us": 2.6961700000000004,
+          "call_min_us": 2.097,
+          "call_max_us": 2.713,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 29.006851206143878,
+         "first_query_us": 5.493,
+         "warm": {
+          "call_mean_us": 2.36664,
+          "call_median_us": 2.2515,
+          "call_p50_us": 2.2515,
+          "call_p90_us": 2.3681,
+          "call_p99_us": 3.5346700000000384,
+          "call_min_us": 2.156,
+          "call_max_us": 11.026,
+          "iterations": 100.0
+         }
+        }
+       }
+      },
+      "control": {
+       "config": {
+        "model": "Qwen/Qwen3-0.6B",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 0,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 8.017334999749437,
+       "queries": {
+        "decode": {
+         "predicted_ms": 2.411101200445115,
+         "first_query_us": 15.844,
+         "warm": {
+          "call_mean_us": 2.28674,
+          "call_median_us": 2.2565,
+          "call_p50_us": 2.2565,
+          "call_p90_us": 2.4343000000000004,
+          "call_p99_us": 2.6599700000000004,
+          "call_min_us": 2.145,
+          "call_max_us": 2.756,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 3.55248833993278,
+         "first_query_us": 10.58,
+         "warm": {
+          "call_mean_us": 2.68956,
+          "call_median_us": 2.683,
+          "call_p50_us": 2.683,
+          "call_p90_us": 2.7531999999999996,
+          "call_p99_us": 2.8907000000000003,
+          "call_min_us": 2.595,
+          "call_max_us": 2.96,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 8.298,
+         "warm": {
+          "call_mean_us": 2.2940799999999997,
+          "call_median_us": 2.274,
+          "call_p50_us": 2.274,
+          "call_p90_us": 2.398,
+          "call_p99_us": 2.5307400000000007,
+          "call_min_us": 2.181,
+          "call_max_us": 2.703,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 3.506,
+         "warm": {
+          "call_mean_us": 2.45086,
+          "call_median_us": 2.2735000000000003,
+          "call_p50_us": 2.2735000000000003,
+          "call_p90_us": 2.4106,
+          "call_p99_us": 3.677720000000067,
+          "call_min_us": 2.142,
+          "call_max_us": 16.619,
+          "iterations": 100.0
+         }
+        }
+       }
+      }
+     },
+     "identity": {
+      "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+      "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937"
+     }
+    }
+   }
+  },
+  {
+   "order": [
+    "baseline",
+    "candidate"
+   ],
+   "results": {
+    "baseline": {
+     "config": {
+      "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+      "system": "b200_sxm",
+      "backend": "trtllm",
+      "backend_version": "1.3.0rc20",
+      "estimation_mode": "op_level",
+      "nextn": 3,
+      "tp": 1,
+      "moe_tp_size": 1,
+      "moe_ep_size": 1,
+      "fallback_policy": "deny",
+      "worker_type": "aggregated",
+      "database_mode": "HYBRID"
+     },
+     "cases": {
+      "decode": {
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "mixed_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 17,
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "prefill_uniform": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4096
+      },
+      "prefill_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4097
+      }
+     },
+     "builds": {
+      "nano": {
+       "config": {
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 3,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 388.5294399988197,
+       "queries": {
+        "decode": {
+         "predicted_ms": 9.001463918943989,
+         "first_query_us": 12540.733,
+         "warm": {
+          "call_mean_us": 2.26398,
+          "call_median_us": 2.225,
+          "call_p50_us": 2.225,
+          "call_p90_us": 2.4042,
+          "call_p99_us": 3.060600000000001,
+          "call_min_us": 2.127,
+          "call_max_us": 3.219,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 9.361657890223285,
+         "first_query_us": 40.571,
+         "warm": {
+          "call_mean_us": 2.65392,
+          "call_median_us": 2.649,
+          "call_p50_us": 2.649,
+          "call_p90_us": 2.7212,
+          "call_p99_us": 2.84314,
+          "call_min_us": 2.531,
+          "call_max_us": 2.857,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 29.006851206143878,
+         "first_query_us": 27.644,
+         "warm": {
+          "call_mean_us": 2.2228399999999997,
+          "call_median_us": 2.204,
+          "call_p50_us": 2.204,
+          "call_p90_us": 2.2991,
+          "call_p99_us": 2.45021,
+          "call_min_us": 2.118,
+          "call_max_us": 2.471,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 29.006851206143878,
+         "first_query_us": 5.158,
+         "warm": {
+          "call_mean_us": 2.21257,
+          "call_median_us": 2.206,
+          "call_p50_us": 2.206,
+          "call_p90_us": 2.289,
+          "call_p99_us": 2.39232,
+          "call_min_us": 2.11,
+          "call_max_us": 2.424,
+          "iterations": 100.0
+         }
+        }
+       }
+      },
+      "control": {
+       "config": {
+        "model": "Qwen/Qwen3-0.6B",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 0,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 9.16006700208527,
+       "queries": {
+        "decode": {
+         "predicted_ms": 2.411101200445115,
+         "first_query_us": 15.357,
+         "warm": {
+          "call_mean_us": 2.28503,
+          "call_median_us": 2.2655000000000003,
+          "call_p50_us": 2.2655000000000003,
+          "call_p90_us": 2.4002,
+          "call_p99_us": 2.6619500000000014,
+          "call_min_us": 2.123,
+          "call_max_us": 2.954,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 3.55248833993278,
+         "first_query_us": 10.513,
+         "warm": {
+          "call_mean_us": 2.73933,
+          "call_median_us": 2.6585,
+          "call_p50_us": 2.6585,
+          "call_p90_us": 2.8481,
+          "call_p99_us": 3.7249800000000146,
+          "call_min_us": 2.56,
+          "call_max_us": 6.495,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 9.362,
+         "warm": {
+          "call_mean_us": 2.2233,
+          "call_median_us": 2.205,
+          "call_p50_us": 2.205,
+          "call_p90_us": 2.2997,
+          "call_p99_us": 2.4838200000000006,
+          "call_min_us": 2.124,
+          "call_max_us": 2.565,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 3.612,
+         "warm": {
+          "call_mean_us": 2.20281,
+          "call_median_us": 2.1870000000000003,
+          "call_p50_us": 2.1870000000000003,
+          "call_p90_us": 2.2525999999999997,
+          "call_p99_us": 2.389590000000001,
+          "call_min_us": 2.13,
+          "call_max_us": 2.547,
+          "iterations": 100.0
+         }
+        }
+       }
+      }
+     },
+     "identity": {
+      "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+      "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937"
+     }
+    },
+    "candidate": {
+     "config": {
+      "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+      "system": "b200_sxm",
+      "backend": "trtllm",
+      "backend_version": "1.3.0rc20",
+      "estimation_mode": "op_level",
+      "nextn": 3,
+      "tp": 1,
+      "moe_tp_size": 1,
+      "moe_ep_size": 1,
+      "fallback_policy": "deny",
+      "worker_type": "aggregated",
+      "database_mode": "HYBRID"
+     },
+     "cases": {
+      "decode": {
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "mixed_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 17,
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "prefill_uniform": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4096
+      },
+      "prefill_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4097
+      }
+     },
+     "builds": {
+      "nano": {
+       "config": {
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 3,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 375.88927000251715,
+       "queries": {
+        "decode": {
+         "predicted_ms": 9.166281207089607,
+         "first_query_us": 12722.718,
+         "warm": {
+          "call_mean_us": 2.31185,
+          "call_median_us": 2.2714999999999996,
+          "call_p50_us": 2.2714999999999996,
+          "call_p90_us": 2.4501000000000004,
+          "call_p99_us": 2.9283000000000015,
+          "call_min_us": 2.117,
+          "call_max_us": 3.255,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 9.823777631303589,
+         "first_query_us": 40.608,
+         "warm": {
+          "call_mean_us": 2.66846,
+          "call_median_us": 2.646,
+          "call_p50_us": 2.646,
+          "call_p90_us": 2.8051999999999997,
+          "call_p99_us": 2.947040000000001,
+          "call_min_us": 2.524,
+          "call_max_us": 3.149,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 29.03190808718284,
+         "first_query_us": 28.144,
+         "warm": {
+          "call_mean_us": 2.45903,
+          "call_median_us": 2.2939999999999996,
+          "call_p50_us": 2.2939999999999996,
+          "call_p90_us": 2.3987,
+          "call_p99_us": 4.30363000000006,
+          "call_min_us": 2.172,
+          "call_max_us": 15.85,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 29.193090655744165,
+         "first_query_us": 5.67,
+         "warm": {
+          "call_mean_us": 2.31309,
+          "call_median_us": 2.294,
+          "call_p50_us": 2.294,
+          "call_p90_us": 2.4063,
+          "call_p99_us": 2.543890000000004,
+          "call_min_us": 2.166,
+          "call_max_us": 3.325,
+          "iterations": 100.0
+         }
+        }
+       }
+      },
+      "control": {
+       "config": {
+        "model": "Qwen/Qwen3-0.6B",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 0,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 8.222762000514194,
+       "queries": {
+        "decode": {
+         "predicted_ms": 2.411101200445115,
+         "first_query_us": 14.879,
+         "warm": {
+          "call_mean_us": 2.28158,
+          "call_median_us": 2.267,
+          "call_p50_us": 2.267,
+          "call_p90_us": 2.3763,
+          "call_p99_us": 2.643600000000001,
+          "call_min_us": 2.133,
+          "call_max_us": 2.901,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 3.55248833993278,
+         "first_query_us": 10.076,
+         "warm": {
+          "call_mean_us": 2.8355200000000003,
+          "call_median_us": 2.6915,
+          "call_p50_us": 2.6915,
+          "call_p90_us": 2.8564999999999996,
+          "call_p99_us": 5.135500000000035,
+          "call_min_us": 2.525,
+          "call_max_us": 12.016,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 9.885,
+         "warm": {
+          "call_mean_us": 2.2457499999999997,
+          "call_median_us": 2.2295,
+          "call_p50_us": 2.2295,
+          "call_p90_us": 2.3441,
+          "call_p99_us": 2.45536,
+          "call_min_us": 2.131,
+          "call_max_us": 2.491,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 3.368,
+         "warm": {
+          "call_mean_us": 2.24094,
+          "call_median_us": 2.223,
+          "call_p50_us": 2.223,
+          "call_p90_us": 2.3222,
+          "call_p99_us": 2.512540000000001,
+          "call_min_us": 2.107,
+          "call_max_us": 2.764,
+          "iterations": 100.0
+         }
+        }
+       }
+      }
+     },
+     "identity": {
+      "constructor_sha256": "187a7c4c3bee1494ec90d9177ee1810af525e0ee45ca3574bd770e538ba9cfcc",
+      "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937"
+     }
+    }
+   }
+  },
+  {
+   "order": [
+    "candidate",
+    "baseline"
+   ],
+   "results": {
+    "candidate": {
+     "config": {
+      "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+      "system": "b200_sxm",
+      "backend": "trtllm",
+      "backend_version": "1.3.0rc20",
+      "estimation_mode": "op_level",
+      "nextn": 3,
+      "tp": 1,
+      "moe_tp_size": 1,
+      "moe_ep_size": 1,
+      "fallback_policy": "deny",
+      "worker_type": "aggregated",
+      "database_mode": "HYBRID"
+     },
+     "cases": {
+      "decode": {
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "mixed_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 17,
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "prefill_uniform": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4096
+      },
+      "prefill_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4097
+      }
+     },
+     "builds": {
+      "nano": {
+       "config": {
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 3,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 373.97790199975134,
+       "queries": {
+        "decode": {
+         "predicted_ms": 9.166281207089607,
+         "first_query_us": 12248.055,
+         "warm": {
+          "call_mean_us": 2.39235,
+          "call_median_us": 2.26,
+          "call_p50_us": 2.26,
+          "call_p90_us": 2.4297,
+          "call_p99_us": 4.841000000000019,
+          "call_min_us": 2.125,
+          "call_max_us": 8.603,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 9.823777631303589,
+         "first_query_us": 55.161,
+         "warm": {
+          "call_mean_us": 2.6727,
+          "call_median_us": 2.6399999999999997,
+          "call_p50_us": 2.6399999999999997,
+          "call_p90_us": 2.7727,
+          "call_p99_us": 2.878520000000008,
+          "call_min_us": 2.519,
+          "call_max_us": 4.415,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 29.03190808718284,
+         "first_query_us": 27.619,
+         "warm": {
+          "call_mean_us": 2.32981,
+          "call_median_us": 2.24,
+          "call_p50_us": 2.24,
+          "call_p90_us": 2.3813999999999997,
+          "call_p99_us": 3.6420299999999997,
+          "call_min_us": 2.14,
+          "call_max_us": 3.645,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 29.193090655744165,
+         "first_query_us": 4.8,
+         "warm": {
+          "call_mean_us": 2.27787,
+          "call_median_us": 2.2695,
+          "call_p50_us": 2.2695,
+          "call_p90_us": 2.342,
+          "call_p99_us": 2.4427400000000046,
+          "call_min_us": 2.151,
+          "call_max_us": 3.308,
+          "iterations": 100.0
+         }
+        }
+       }
+      },
+      "control": {
+       "config": {
+        "model": "Qwen/Qwen3-0.6B",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 0,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 8.257661000243388,
+       "queries": {
+        "decode": {
+         "predicted_ms": 2.411101200445115,
+         "first_query_us": 15.26,
+         "warm": {
+          "call_mean_us": 2.29018,
+          "call_median_us": 2.2744999999999997,
+          "call_p50_us": 2.2744999999999997,
+          "call_p90_us": 2.3915,
+          "call_p99_us": 2.67755,
+          "call_min_us": 2.137,
+          "call_max_us": 2.732,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 3.55248833993278,
+         "first_query_us": 10.424,
+         "warm": {
+          "call_mean_us": 3.1050400000000002,
+          "call_median_us": 2.678,
+          "call_p50_us": 2.678,
+          "call_p90_us": 2.864,
+          "call_p99_us": 5.901870000000168,
+          "call_min_us": 2.546,
+          "call_max_us": 38.262,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 9.589,
+         "warm": {
+          "call_mean_us": 2.25911,
+          "call_median_us": 2.2435,
+          "call_p50_us": 2.2435,
+          "call_p90_us": 2.3359,
+          "call_p99_us": 2.6111600000000004,
+          "call_min_us": 2.155,
+          "call_max_us": 2.627,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 3.517,
+         "warm": {
+          "call_mean_us": 2.25287,
+          "call_median_us": 2.2385,
+          "call_p50_us": 2.2385,
+          "call_p90_us": 2.3286,
+          "call_p99_us": 2.4862900000000003,
+          "call_min_us": 2.138,
+          "call_max_us": 2.614,
+          "iterations": 100.0
+         }
+        }
+       }
+      }
+     },
+     "identity": {
+      "constructor_sha256": "187a7c4c3bee1494ec90d9177ee1810af525e0ee45ca3574bd770e538ba9cfcc",
+      "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937"
+     }
+    },
+    "baseline": {
+     "config": {
+      "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+      "system": "b200_sxm",
+      "backend": "trtllm",
+      "backend_version": "1.3.0rc20",
+      "estimation_mode": "op_level",
+      "nextn": 3,
+      "tp": 1,
+      "moe_tp_size": 1,
+      "moe_ep_size": 1,
+      "fallback_policy": "deny",
+      "worker_type": "aggregated",
+      "database_mode": "HYBRID"
+     },
+     "cases": {
+      "decode": {
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "mixed_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 17,
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "prefill_uniform": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4096
+      },
+      "prefill_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4097
+      }
+     },
+     "builds": {
+      "nano": {
+       "config": {
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 3,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 382.6989089975541,
+       "queries": {
+        "decode": {
+         "predicted_ms": 9.001463918943989,
+         "first_query_us": 12105.238,
+         "warm": {
+          "call_mean_us": 2.28964,
+          "call_median_us": 2.2424999999999997,
+          "call_p50_us": 2.2424999999999997,
+          "call_p90_us": 2.3785,
+          "call_p99_us": 3.259110000000001,
+          "call_min_us": 2.132,
+          "call_max_us": 3.468,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 9.361657890223285,
+         "first_query_us": 39.302,
+         "warm": {
+          "call_mean_us": 2.68166,
+          "call_median_us": 2.6585,
+          "call_p50_us": 2.6585,
+          "call_p90_us": 2.7620999999999998,
+          "call_p99_us": 2.9955800000000004,
+          "call_min_us": 2.584,
+          "call_max_us": 3.053,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 29.006851206143878,
+         "first_query_us": 25.788,
+         "warm": {
+          "call_mean_us": 2.27643,
+          "call_median_us": 2.266,
+          "call_p50_us": 2.266,
+          "call_p90_us": 2.4046,
+          "call_p99_us": 2.50607,
+          "call_min_us": 2.154,
+          "call_max_us": 2.513,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 29.006851206143878,
+         "first_query_us": 5.078,
+         "warm": {
+          "call_mean_us": 2.40477,
+          "call_median_us": 2.2569999999999997,
+          "call_p50_us": 2.2569999999999997,
+          "call_p90_us": 2.4092,
+          "call_p99_us": 4.190670000000045,
+          "call_min_us": 2.15,
+          "call_max_us": 13.068,
+          "iterations": 100.0
+         }
+        }
+       }
+      },
+      "control": {
+       "config": {
+        "model": "Qwen/Qwen3-0.6B",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 0,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 7.924588000605581,
+       "queries": {
+        "decode": {
+         "predicted_ms": 2.411101200445115,
+         "first_query_us": 14.44,
+         "warm": {
+          "call_mean_us": 2.7017399999999996,
+          "call_median_us": 2.256,
+          "call_p50_us": 2.256,
+          "call_p90_us": 2.4799999999999995,
+          "call_p99_us": 5.876630000000171,
+          "call_min_us": 2.139,
+          "call_max_us": 39.005,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 3.55248833993278,
+         "first_query_us": 11.873,
+         "warm": {
+          "call_mean_us": 2.69848,
+          "call_median_us": 2.6875,
+          "call_p50_us": 2.6875,
+          "call_p90_us": 2.7752,
+          "call_p99_us": 2.8635100000000007,
+          "call_min_us": 2.588,
+          "call_max_us": 3.013,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 9.509,
+         "warm": {
+          "call_mean_us": 2.26168,
+          "call_median_us": 2.2495000000000003,
+          "call_p50_us": 2.2495000000000003,
+          "call_p90_us": 2.3225,
+          "call_p99_us": 2.513160000000001,
+          "call_min_us": 2.156,
+          "call_max_us": 2.628,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 3.536,
+         "warm": {
+          "call_mean_us": 2.29039,
+          "call_median_us": 2.2855,
+          "call_p50_us": 2.2855,
+          "call_p90_us": 2.3757,
+          "call_p99_us": 2.4793800000000004,
+          "call_min_us": 2.154,
+          "call_max_us": 2.517,
+          "iterations": 100.0
+         }
+        }
+       }
+      }
+     },
+     "identity": {
+      "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+      "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937"
+     }
+    }
+   }
+  },
+  {
+   "order": [
+    "baseline",
+    "candidate"
+   ],
+   "results": {
+    "baseline": {
+     "config": {
+      "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+      "system": "b200_sxm",
+      "backend": "trtllm",
+      "backend_version": "1.3.0rc20",
+      "estimation_mode": "op_level",
+      "nextn": 3,
+      "tp": 1,
+      "moe_tp_size": 1,
+      "moe_ep_size": 1,
+      "fallback_policy": "deny",
+      "worker_type": "aggregated",
+      "database_mode": "HYBRID"
+     },
+     "cases": {
+      "decode": {
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "mixed_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 17,
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "prefill_uniform": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4096
+      },
+      "prefill_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4097
+      }
+     },
+     "builds": {
+      "nano": {
+       "config": {
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 3,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 387.6948520010046,
+       "queries": {
+        "decode": {
+         "predicted_ms": 9.001463918943989,
+         "first_query_us": 12211.645,
+         "warm": {
+          "call_mean_us": 3.47381,
+          "call_median_us": 3.7925,
+          "call_p50_us": 3.7925,
+          "call_p90_us": 3.9684,
+          "call_p99_us": 4.26042,
+          "call_min_us": 2.194,
+          "call_max_us": 4.302,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 9.361657890223285,
+         "first_query_us": 73.031,
+         "warm": {
+          "call_mean_us": 5.00026,
+          "call_median_us": 4.8995,
+          "call_p50_us": 4.8995,
+          "call_p90_us": 5.1571,
+          "call_p99_us": 7.526650000000031,
+          "call_min_us": 3.951,
+          "call_max_us": 13.531,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 29.006851206143878,
+         "first_query_us": 60.683,
+         "warm": {
+          "call_mean_us": 4.37005,
+          "call_median_us": 4.0465,
+          "call_p50_us": 4.0465,
+          "call_p90_us": 4.3642,
+          "call_p99_us": 8.97374000000011,
+          "call_min_us": 3.438,
+          "call_max_us": 30.332,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 29.006851206143878,
+         "first_query_us": 15.423,
+         "warm": {
+          "call_mean_us": 4.07107,
+          "call_median_us": 3.8895,
+          "call_p50_us": 3.8895,
+          "call_p90_us": 4.219099999999999,
+          "call_p99_us": 6.177960000000045,
+          "call_min_us": 3.468,
+          "call_max_us": 14.886,
+          "iterations": 100.0
+         }
+        }
+       }
+      },
+      "control": {
+       "config": {
+        "model": "Qwen/Qwen3-0.6B",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 0,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 13.045745999988867,
+       "queries": {
+        "decode": {
+         "predicted_ms": 2.411101200445115,
+         "first_query_us": 22.269,
+         "warm": {
+          "call_mean_us": 4.04998,
+          "call_median_us": 3.995,
+          "call_p50_us": 3.995,
+          "call_p90_us": 4.3163,
+          "call_p99_us": 5.32995,
+          "call_min_us": 3.418,
+          "call_max_us": 5.424,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 3.55248833993278,
+         "first_query_us": 21.338,
+         "warm": {
+          "call_mean_us": 5.42404,
+          "call_median_us": 5.0024999999999995,
+          "call_p50_us": 5.0024999999999995,
+          "call_p90_us": 5.203099999999999,
+          "call_p99_us": 12.065380000000136,
+          "call_min_us": 4.178,
+          "call_max_us": 38.239,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 20.951,
+         "warm": {
+          "call_mean_us": 4.0090699999999995,
+          "call_median_us": 4.0105,
+          "call_p50_us": 4.0105,
+          "call_p90_us": 4.280200000000001,
+          "call_p99_us": 4.889200000000001,
+          "call_min_us": 3.438,
+          "call_max_us": 4.909,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 9.396,
+         "warm": {
+          "call_mean_us": 3.4793000000000003,
+          "call_median_us": 3.6769999999999996,
+          "call_p50_us": 3.6769999999999996,
+          "call_p90_us": 3.9497,
+          "call_p99_us": 5.024860000000001,
+          "call_min_us": 2.188,
+          "call_max_us": 5.11,
+          "iterations": 100.0
+         }
+        }
+       }
+      }
+     },
+     "identity": {
+      "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+      "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937"
+     }
+    },
+    "candidate": {
+     "config": {
+      "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+      "system": "b200_sxm",
+      "backend": "trtllm",
+      "backend_version": "1.3.0rc20",
+      "estimation_mode": "op_level",
+      "nextn": 3,
+      "tp": 1,
+      "moe_tp_size": 1,
+      "moe_ep_size": 1,
+      "fallback_policy": "deny",
+      "worker_type": "aggregated",
+      "database_mode": "HYBRID"
+     },
+     "cases": {
+      "decode": {
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "mixed_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 17,
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "prefill_uniform": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4096
+      },
+      "prefill_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4097
+      }
+     },
+     "builds": {
+      "nano": {
+       "config": {
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 3,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 393.5003250007867,
+       "queries": {
+        "decode": {
+         "predicted_ms": 9.166281207089607,
+         "first_query_us": 13057.435,
+         "warm": {
+          "call_mean_us": 2.55069,
+          "call_median_us": 2.285,
+          "call_p50_us": 2.285,
+          "call_p90_us": 2.502,
+          "call_p99_us": 3.946420000000095,
+          "call_min_us": 2.144,
+          "call_max_us": 22.402,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 9.823777631303589,
+         "first_query_us": 46.82,
+         "warm": {
+          "call_mean_us": 2.8250900000000003,
+          "call_median_us": 2.701,
+          "call_p50_us": 2.701,
+          "call_p90_us": 2.858,
+          "call_p99_us": 5.080660000000026,
+          "call_min_us": 2.589,
+          "call_max_us": 10.096,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 29.03190808718284,
+         "first_query_us": 31.265,
+         "warm": {
+          "call_mean_us": 2.3004,
+          "call_median_us": 2.2675,
+          "call_p50_us": 2.2675,
+          "call_p90_us": 2.4012,
+          "call_p99_us": 2.718320000000001,
+          "call_min_us": 2.163,
+          "call_max_us": 2.849,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 29.193090655744165,
+         "first_query_us": 5.062,
+         "warm": {
+          "call_mean_us": 2.39799,
+          "call_median_us": 2.275,
+          "call_p50_us": 2.275,
+          "call_p90_us": 2.3922,
+          "call_p99_us": 4.593060000000024,
+          "call_min_us": 2.187,
+          "call_max_us": 9.252,
+          "iterations": 100.0
+         }
+        }
+       }
+      },
+      "control": {
+       "config": {
+        "model": "Qwen/Qwen3-0.6B",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 0,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 8.668599999509752,
+       "queries": {
+        "decode": {
+         "predicted_ms": 2.411101200445115,
+         "first_query_us": 17.041,
+         "warm": {
+          "call_mean_us": 2.49682,
+          "call_median_us": 2.322,
+          "call_p50_us": 2.322,
+          "call_p90_us": 2.5702,
+          "call_p99_us": 5.817830000000039,
+          "call_min_us": 2.166,
+          "call_max_us": 13.226,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 3.55248833993278,
+         "first_query_us": 11.848,
+         "warm": {
+          "call_mean_us": 2.9545299999999997,
+          "call_median_us": 2.7195,
+          "call_p50_us": 2.7195,
+          "call_p90_us": 2.8903,
+          "call_p99_us": 10.912820000000021,
+          "call_min_us": 2.597,
+          "call_max_us": 14.954,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 10.236,
+         "warm": {
+          "call_mean_us": 2.3169999999999997,
+          "call_median_us": 2.2965,
+          "call_p50_us": 2.2965,
+          "call_p90_us": 2.4300999999999995,
+          "call_p99_us": 2.6692500000000003,
+          "call_min_us": 2.169,
+          "call_max_us": 2.694,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 3.755,
+         "warm": {
+          "call_mean_us": 3.02396,
+          "call_median_us": 2.2880000000000003,
+          "call_p50_us": 2.2880000000000003,
+          "call_p90_us": 2.698299999999999,
+          "call_p99_us": 15.340430000000126,
+          "call_min_us": 2.167,
+          "call_max_us": 39.341,
+          "iterations": 100.0
+         }
+        }
+       }
+      }
+     },
+     "identity": {
+      "constructor_sha256": "187a7c4c3bee1494ec90d9177ee1810af525e0ee45ca3574bd770e538ba9cfcc",
+      "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937"
+     }
+    }
+   }
+  },
+  {
+   "order": [
+    "candidate",
+    "baseline"
+   ],
+   "results": {
+    "candidate": {
+     "config": {
+      "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+      "system": "b200_sxm",
+      "backend": "trtllm",
+      "backend_version": "1.3.0rc20",
+      "estimation_mode": "op_level",
+      "nextn": 3,
+      "tp": 1,
+      "moe_tp_size": 1,
+      "moe_ep_size": 1,
+      "fallback_policy": "deny",
+      "worker_type": "aggregated",
+      "database_mode": "HYBRID"
+     },
+     "cases": {
+      "decode": {
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "mixed_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 17,
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "prefill_uniform": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4096
+      },
+      "prefill_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4097
+      }
+     },
+     "builds": {
+      "nano": {
+       "config": {
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 3,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 371.83057099900907,
+       "queries": {
+        "decode": {
+         "predicted_ms": 9.166281207089607,
+         "first_query_us": 13287.903,
+         "warm": {
+          "call_mean_us": 2.26343,
+          "call_median_us": 2.2279999999999998,
+          "call_p50_us": 2.2279999999999998,
+          "call_p90_us": 2.3772999999999995,
+          "call_p99_us": 3.039090000000001,
+          "call_min_us": 2.117,
+          "call_max_us": 3.246,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 9.823777631303589,
+         "first_query_us": 40.221,
+         "warm": {
+          "call_mean_us": 2.80109,
+          "call_median_us": 2.6494999999999997,
+          "call_p50_us": 2.6494999999999997,
+          "call_p90_us": 2.7222,
+          "call_p99_us": 4.345140000000061,
+          "call_min_us": 2.519,
+          "call_max_us": 16.14,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 29.03190808718284,
+         "first_query_us": 28.736,
+         "warm": {
+          "call_mean_us": 2.25523,
+          "call_median_us": 2.239,
+          "call_p50_us": 2.239,
+          "call_p90_us": 2.3619999999999997,
+          "call_p99_us": 2.47933,
+          "call_min_us": 2.139,
+          "call_max_us": 2.512,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 29.193090655744165,
+         "first_query_us": 5.028,
+         "warm": {
+          "call_mean_us": 2.25435,
+          "call_median_us": 2.234,
+          "call_p50_us": 2.234,
+          "call_p90_us": 2.3181,
+          "call_p99_us": 2.4420900000000043,
+          "call_min_us": 2.152,
+          "call_max_us": 3.342,
+          "iterations": 100.0
+         }
+        }
+       }
+      },
+      "control": {
+       "config": {
+        "model": "Qwen/Qwen3-0.6B",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 0,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 8.247206002124585,
+       "queries": {
+        "decode": {
+         "predicted_ms": 2.411101200445115,
+         "first_query_us": 15.715,
+         "warm": {
+          "call_mean_us": 2.45966,
+          "call_median_us": 2.2744999999999997,
+          "call_p50_us": 2.2744999999999997,
+          "call_p90_us": 2.4644999999999997,
+          "call_p99_us": 5.571640000000046,
+          "call_min_us": 2.14,
+          "call_max_us": 14.545,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 3.55248833993278,
+         "first_query_us": 10.345,
+         "warm": {
+          "call_mean_us": 2.75125,
+          "call_median_us": 2.6985,
+          "call_p50_us": 2.6985,
+          "call_p90_us": 2.8143000000000002,
+          "call_p99_us": 4.038990000000002,
+          "call_min_us": 2.593,
+          "call_max_us": 4.434,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 9.775,
+         "warm": {
+          "call_mean_us": 2.35988,
+          "call_median_us": 2.317,
+          "call_p50_us": 2.317,
+          "call_p90_us": 2.4200999999999997,
+          "call_p99_us": 3.88584,
+          "call_min_us": 2.219,
+          "call_max_us": 3.969,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 3.766,
+         "warm": {
+          "call_mean_us": 2.3484800000000003,
+          "call_median_us": 2.3305,
+          "call_p50_us": 2.3305,
+          "call_p90_us": 2.4330999999999996,
+          "call_p99_us": 2.625280000000003,
+          "call_min_us": 2.207,
+          "call_max_us": 3.247,
+          "iterations": 100.0
+         }
+        }
+       }
+      }
+     },
+     "identity": {
+      "constructor_sha256": "187a7c4c3bee1494ec90d9177ee1810af525e0ee45ca3574bd770e538ba9cfcc",
+      "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937"
+     }
+    },
+    "baseline": {
+     "config": {
+      "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+      "system": "b200_sxm",
+      "backend": "trtllm",
+      "backend_version": "1.3.0rc20",
+      "estimation_mode": "op_level",
+      "nextn": 3,
+      "tp": 1,
+      "moe_tp_size": 1,
+      "moe_ep_size": 1,
+      "fallback_policy": "deny",
+      "worker_type": "aggregated",
+      "database_mode": "HYBRID"
+     },
+     "cases": {
+      "decode": {
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "mixed_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 17,
+       "num_decode_requests": 32,
+       "sum_decode_kv_tokens": 32800
+      },
+      "prefill_uniform": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4096
+      },
+      "prefill_ragged": {
+       "num_prefill_requests": 2,
+       "sum_prefill_tokens": 4097
+      }
+     },
+     "builds": {
+      "nano": {
+       "config": {
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 3,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 382.4710330009111,
+       "queries": {
+        "decode": {
+         "predicted_ms": 9.001463918943989,
+         "first_query_us": 12688.1,
+         "warm": {
+          "call_mean_us": 2.32842,
+          "call_median_us": 2.2965,
+          "call_p50_us": 2.2965,
+          "call_p90_us": 2.4521,
+          "call_p99_us": 3.134750000000001,
+          "call_min_us": 2.138,
+          "call_max_us": 3.308,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 9.361657890223285,
+         "first_query_us": 39.78,
+         "warm": {
+          "call_mean_us": 2.95964,
+          "call_median_us": 2.657,
+          "call_p50_us": 2.657,
+          "call_p90_us": 2.8864,
+          "call_p99_us": 12.734380000000009,
+          "call_min_us": 2.545,
+          "call_max_us": 14.257,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 29.006851206143878,
+         "first_query_us": 28.934,
+         "warm": {
+          "call_mean_us": 2.27348,
+          "call_median_us": 2.26,
+          "call_p50_us": 2.26,
+          "call_p90_us": 2.3634999999999997,
+          "call_p99_us": 2.511690000000001,
+          "call_min_us": 2.147,
+          "call_max_us": 2.778,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 29.006851206143878,
+         "first_query_us": 5.059,
+         "warm": {
+          "call_mean_us": 2.28041,
+          "call_median_us": 2.2634999999999996,
+          "call_p50_us": 2.2634999999999996,
+          "call_p90_us": 2.3630999999999998,
+          "call_p99_us": 2.579860000000002,
+          "call_min_us": 2.147,
+          "call_max_us": 2.962,
+          "iterations": 100.0
+         }
+        }
+       }
+      },
+      "control": {
+       "config": {
+        "model": "Qwen/Qwen3-0.6B",
+        "system": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "estimation_mode": "op_level",
+        "nextn": 0,
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID"
+       },
+       "setup_ms": 8.112032999633811,
+       "queries": {
+        "decode": {
+         "predicted_ms": 2.411101200445115,
+         "first_query_us": 14.613,
+         "warm": {
+          "call_mean_us": 2.29531,
+          "call_median_us": 2.2735,
+          "call_p50_us": 2.2735,
+          "call_p90_us": 2.4061,
+          "call_p99_us": 2.550860000000002,
+          "call_min_us": 2.172,
+          "call_max_us": 2.834,
+          "iterations": 100.0
+         }
+        },
+        "mixed_ragged": {
+         "predicted_ms": 3.55248833993278,
+         "first_query_us": 9.977,
+         "warm": {
+          "call_mean_us": 2.67748,
+          "call_median_us": 2.6615,
+          "call_p50_us": 2.6615,
+          "call_p90_us": 2.7897,
+          "call_p99_us": 2.8940200000000003,
+          "call_min_us": 2.572,
+          "call_max_us": 2.896,
+          "iterations": 100.0
+         }
+        },
+        "prefill_uniform": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 8.535,
+         "warm": {
+          "call_mean_us": 2.74817,
+          "call_median_us": 2.2915,
+          "call_p50_us": 2.2915,
+          "call_p90_us": 2.4896999999999996,
+          "call_p99_us": 13.142740000000085,
+          "call_min_us": 2.178,
+          "call_max_us": 29.551,
+          "iterations": 100.0
+         }
+        },
+        "prefill_ragged": {
+         "predicted_ms": 6.622650986312895,
+         "first_query_us": 4.372,
+         "warm": {
+          "call_mean_us": 2.26295,
+          "call_median_us": 2.241,
+          "call_p50_us": 2.241,
+          "call_p90_us": 2.3411,
+          "call_p99_us": 2.5100899999999995,
+          "call_min_us": 2.15,
+          "call_max_us": 2.519,
+          "iterations": 100.0
+         }
+        }
+       }
+      }
+     },
+     "identity": {
+      "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+      "native_sha256": "d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937"
+     }
+    }
+   }
+  }
+ ]
+}

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import pickle
 
 import pytest
@@ -13,6 +14,72 @@ import pytest
 import aisim.sdk.operations as ops
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.mark.parametrize(
+    "mtp",
+    [
+        {"nextn": 1},
+        {"nextn": 3},
+        {"speculation": {"kind": "mtp", "params": {"depth": 3}}},
+    ],
+)
+@pytest.mark.parametrize(("backend", "version"), [("vllm", "0.24.0"), ("trtllm", "1.3.0rc20")])
+def test_canonical_mtp_prices_resolved_mamba_state_and_width(tmp_path, mtp, backend, version):
+    from aisim_core.sdk.rust_engine_step import RustForwardPassPerfModel
+
+    config = {
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "system": "b200_sxm",
+        "backend": backend,
+        "backend_version": version,
+        "estimation_mode": "op_level",
+        "fallback_policy": "deny",
+        "worker_type": "aggregated",
+        "database_mode": "HYBRID",
+        "tp": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        **mtp,
+    }
+    model = RustForwardPassPerfModel.best_available(config)
+    nextn = mtp.get("nextn", 3)
+    width = nextn + 1
+    scheduled = {"num_decode_requests": 8 * width, "sum_decode_kv_tokens": 8 * width * 1025}
+    # Nano's bundled config has 23 Mamba layers, 52 total layers, 64 heads
+    # of dimension 64, 8 groups and state dimension 128. The declared FP32
+    # recurrent state is 2 MiB/request. A scan transfers 20,608 activation
+    # bytes/token; prefill reads+writes one state, decode reads once and
+    # writes each of its `width` checkpoints. B200 bandwidth is 7.7e12 B/s.
+    state_bytes = 2_097_152
+    prefill_bytes = 17 * 20_608 + 2 * 2 * state_bytes
+    decode_bytes = 8 * width * 20_608 + 8 * (1 + width) * state_bytes
+    expected_decode = decode_bytes * 23 * (52 + nextn) / 52 / 7.7e12 * 1000
+    # The convolution's 6,144 channels transfer 73,728 activation bytes per
+    # token for its width-four window; it has no recurrent-state term.
+    expected_conv = 8 * width * 73_728 * 23 * (52 + nextn) / 52 / 7.7e12 * 1000
+    expected_prefill = prefill_bytes * 23 / 7.7e12 * 1000
+    payloads = []
+    for prefill in ({}, {"num_prefill_requests": 2, "sum_prefill_tokens": 17}):
+        payload = [{"scheduled_requests": {**prefill, **scheduled}}]
+        detail = model.estimate_forward_pass_detailed(payload)
+        detail = json.loads(detail) if isinstance(detail, str) else detail
+        rows = {op["name"]: op for op in detail["ranks"][0]["operations"]}
+        assert rows["generation_mamba_ssm"]["latency_ms"] == pytest.approx(expected_decode, rel=1e-9)
+        assert rows["generation_mamba_ssm"]["source"] == "sol"
+        assert rows["generation_mamba_conv1d"]["latency_ms"] == pytest.approx(expected_conv, rel=1e-9)
+        assert rows["generation_mamba_conv1d"]["source"] == "sol"
+        if prefill:
+            assert rows["context_mamba_ssm"]["latency_ms"] == pytest.approx(expected_prefill, rel=1e-9)
+            assert rows["context_mamba_ssm"]["source"] == "sol"
+        payloads.append(payload)
+
+    # Restoring the saved canonical configuration must rebuild the qualified
+    # graph without constructor patches or an external execution profile.
+    pinned = model.save_state_snapshot(tmp_path / "snapshot")
+    restored = RustForwardPassPerfModel.best_available(json.loads(json.dumps(pinned)))
+    for payload in payloads:
+        assert restored.estimate_forward_pass_time_ms(payload) == model.estimate_forward_pass_time_ms(payload)
 
 
 @pytest.mark.parametrize(

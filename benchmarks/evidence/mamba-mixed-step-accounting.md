@@ -73,8 +73,8 @@ git hash-object crates/core/src/perfmodel/engine/runtime.rs  # 28d8d759
          let err = engine
 ```
 
-No built-in model sets `state_dtype` or `token_width` yet. The original
-Baseline-to-Candidate runs (`agg.py`, `phases.py` and the historical telemetry
+Before the canonical MTP integration below, built-in models did not set
+`state_dtype` or `token_width`. The original Baseline-to-Candidate runs (`agg.py`, `phases.py` and the historical telemetry
 table) applied this `float16` wrapper (`qual_patch.py`) before they built the
 model:
 
@@ -1117,8 +1117,8 @@ budget and 64 request slots. Full configurations and raw rounds are in
 [`repair-replay-70f971d4.json`](mamba-mixed-step-accounting/repair-replay-70f971d4.json).
 Nano uses a test-only BF16 width-one constructor shim, as `telem.py` does;
 the driver asserts that the child actually constructed qualified operations.
-This does not activate qualification in built-in production defaults. Qwen3-0.6B
-is the control. The fixed capacity, TP/DP/MoE parallelism, backend/version and
+That comparison did not activate qualification in built-in production defaults.
+Qwen3-0.6B is the control. The fixed capacity, TP/DP/MoE parallelism, backend/version and
 all workload inputs are shared between builds.
 
 | Case | Full CLI median (baseline to candidate) | Native `wall_time_ms` median | Peak RSS median |
@@ -1168,3 +1168,145 @@ state; target and unqualified draft operations keep their existing queries.
 Hybrid FPM graphs remain rejected by native Replay's rank dispatch, so this
 correction changes aggregate mixed-step prediction rather than scheduler
 execution or Replay accounting.
+
+
+## Canonical MTP construction
+
+The scoped constructor repair exposes qualified Mamba accounting through
+`RustForwardPassPerfModel.best_available` for built-in Nemotron-H MTP graphs.
+Legacy `nextn` and explicit `speculation.kind: mtp` both resolve the width
+before construction. Context kernels receive width one and generation kernels
+receive `nextn + 1`; both receive the checkpoint's resolved
+`mamba_ssm_cache_dtype`. No execution-profile override or constructor shim is
+needed. Non-MTP graphs keep their existing legacy construction, including
+schemes that assign widths and materialize draft wrappers after construction.
+Their qualification is outside this MTP repair.
+
+The regression `test_canonical_mtp_prices_resolved_mamba_state_and_width`
+checks both TensorRT-LLM 1.3.0rc20 and vLLM 0.24.0 at MTP1, MTP3 and explicit
+MTP3, including canonical saved-state restoration. Nano declares an FP32
+state: 64 heads x 64 elements x 128 state elements x 4 bytes = 2 MiB per
+request. A scan moves 20,608 activation bytes per token. Two prefills totaling
+17 tokens therefore move 8,738,944 bytes, including two state read/write
+pairs. Eight width-four decodes move 84,545,536 bytes, including one state
+read and four checkpoint writes per request. Multiply by 23 Mamba layers,
+by `55/52` for generation's existing MTP layer scale, and divide by B200's
+7.7e12 B/s. The expected context scan is 0.026103339221 ms and generation
+scan is 0.267108149451 ms. The generation convolution moves 73,728 bytes per
+verified token with no recurrent-state term, giving 0.007453819780 ms.
+These independent byte oracles explain the new accounting; they do not
+qualify silicon accuracy. The pinned constructor returned only
+0.002083446154 ms for the generation scan. Its unknown state dtype omitted
+state traffic. Its width-one convolution could also use a measured one-token
+row for a batch of packed slots; the qualified MTP convolution uses SOL.
+
+All six new regression cases failed on the exact pinned constructor from
+`22a3fec3c24613fd68cf056a83ede789bd74cf8d` and pass with the repair. The full
+Mamba, Nemotron, MTP, speculation and single-oracle subset passed 374 tests;
+the two native parity suites passed 390 with unchanged goldens. The optimized
+native source inventory matched all 269 recorded checkout files. The
+historical `telem.py` BF16 diagnostic explicitly overrides the newly supplied
+FP32 dtype, and still reproduces every case in `telem-70f971d4.json` exactly.
+Its packed KV values are unchanged.
+
+### Matched host measurements
+
+Baseline is `22a3fec3c24613fd68cf056a83ede789bd74cf8d`. Candidate is identified
+by the constructor SHA-256
+`187a7c4c3bee1494ec90d9177ee1810af525e0ee45ca3574bd770e538ba9cfcc`;
+the baseline constructor hash is
+`233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2`.
+Only Python construction changes, so both variants use the same optimized
+native binary, SHA-256
+`d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937`.
+The baseline SDK was copied with its constructor restored byte-for-byte from
+the pinned commit; all other SDK files, native code, dependencies and packaged
+performance data are identical. Both wheels were built with
+`maturin build --release --locked --auditwheel skip`, Rust 1.91.1, the repository's
+release profile (thin LTO, one codegen unit) and `CARGO_BUILD_JOBS=2`.
+Host: Linux x86_64, Intel i9-14900K, Python 3.12.12, 5 GiB container memory limit.
+
+The forward driver uses the existing forward gate's `measure_cold_and_warm`:
+after construction and one 64-token prefill prime, it measures the first
+unseen query, then 100 repeats after 10 warmups. Each of six alternating
+baseline/candidate rounds uses a fresh process. This separates construction,
+first-use data loading and warm query caching. Raw rounds and full inputs are
+in [canonical-mtp-forward-perf.json](mamba-mixed-step-accounting/canonical-mtp-forward-perf.json).
+Run [canonical_mtp_forward.py](mamba-mixed-step-accounting/canonical_mtp_forward.py)
+with the corresponding installed SDK; `PYTHONPATH=BASE_SDK` selects the pinned
+baseline, and an unset `PYTHONPATH` selects the candidate:
+
+```bash
+AIC_ALLOW_UNLISTED_VERSIONS=1 python canonical_mtp_forward.py OUT.json
+```
+
+Nano model construction medians were 388.1 / 374.9 ms (baseline / candidate).
+Its first decode query, including lazy data loading, was 12.355 / 12.485 ms.
+Warm query medians across the six rounds were:
+
+| Nano MTP3 query | Baseline us | Candidate us |
+| --- | --- | --- |
+| Pure decode | 2.263 | 2.257 |
+| Mixed, two prefills totaling 17 tokens | 2.658 | 2.648 |
+| Two prefills totaling 4096 tokens | 2.249 | 2.247 |
+| Two prefills totaling 4097 tokens | 2.260 | 2.262 |
+
+The per-round median ranges for mixed Nano were 2.649–4.900 / 2.580–2.701 us;
+for the Qwen control they were 2.654–5.003 / 2.531–2.720 us. All control
+predictions were identical. The repair supplies two qualification kwargs on each of four kernels
+and activates existing qualified walks. It adds no cache or retained per-request
+state; ragged prefills use the existing two-group queries required to retain
+both token and state counts.
+
+The native replay driver
+[canonical_mtp_perf.py](mamba-mixed-step-accounting/canonical_mtp_perf.py)
+uses no constructor shim. Run:
+
+```bash
+python canonical_mtp_perf.py PYTHON BASE_SDK 6 OUT.json
+```
+
+It runs `PYTHON -m aisim predict --stack engine` in six balanced build-order
+rounds. Nano uses canonical `nextn: 3`, `nextn_accepted: 2.2`, FP32 state;
+Qwen3-0.6B without MTP is the control. Each case completes 1000 requests,
+2,048,000 input tokens and 32,000 output tokens. Configuration, build hashes
+and all rounds are in
+[canonical-mtp-perf.json](mamba-mixed-step-accounting/canonical-mtp-perf.json).
+
+| Case | Full CLI median seconds | Native `wall_time_ms` median | Peak RSS median MiB |
+| --- | --- | --- | --- |
+| Nano MTP3 | 2.930 / 2.933 | 80.685 / 81.544 | 291.7 / 296.4 |
+| Qwen control | 2.775 / 2.726 | 91.778 / 89.744 | 259.1 / 250.6 |
+
+Nano CLI ranges were 2.893–2.968 / 2.898–3.003 seconds. Native time ranges
+were 78.862–80.987 / 80.090–82.833 ms. Full CLI timing includes startup,
+construction and output serialization. Native time covers the interval in
+`Replayer::run_inner` through collector finalization and excludes model
+construction and final aggregation. Predicted Nano mean TTFT changes from
+444.293 to 463.764 ms and TPOT from 9.070 to 9.473 ms as state and checkpoint
+accounting becomes reachable. Every control serving metric is unchanged.
+These bounded host timings show no material avoidable overhead in this
+constructor integration; they are not serving-accuracy measurements.
+
+### Outstanding scoped evidence requests
+
+`PRRT_kwDOT0t9uc646BMF`: the historical 5.860174 / 5.853910 ms observations
+still lack their original full vLLM configuration, KV payload and command.
+The original inputs were not retained, as recorded in the request-count
+section. The new canonical tests and reports do not reconstruct those
+observations. Their author must supply the original artifacts, or a
+maintainer must decide whether to withdraw those numerical claims. No input
+has been guessed to reproduce them.
+
+`PRRT_kwDOT0t9uc648T5i`: changing `telem.py` to 32768 would change its
+op-level context to 1024. In the current real consumer,
+`operation_rank_latency_ms` divides the packed sum by the row count and
+`generation_op_runtime` passes that value directly as `s`; neither adds one.
+Both pure and mixed telemetry with 32800 match a direct native attention
+query at 1025: 0.083305473875 ms. Native queries at 1024 and 1026 give
+0.083297342865 and 0.083315422792 ms respectively. This verifies the existing
+packed convention independently of Mamba's context-insensitive scan. The
+past-only convention belongs to whole-model FPM. A maintainer must withdraw
+the past-only request for this diagnostic or authorize a separate migration
+of the packed contract and all callers. The requested subtraction is left
+unapplied.
