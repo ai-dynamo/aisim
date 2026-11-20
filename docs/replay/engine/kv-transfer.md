@@ -80,30 +80,39 @@ full-attention groups. With `destination_missing`, a decode worker that already
 caches a prefix of the prompt does not receive the full-attention blocks of
 that prefix again. If a full-attention group is not prefix-cacheable, the
 decode worker receives every full-attention block, as one transfer unit holds
-a block of each full-attention group. No full-attention spec of vLLM 0.31.0 or
-0.32.0 opts out of prefix caching. Only a profile that describes no deployment
-of these versions has such a group. The state moves with every transfer that
-moves at least one token.
+a block of each full-attention group. No full-attention spec of vLLM 0.31.0,
+0.32.0 or 0.33.0 opts out of prefix caching. Only a profile that describes no
+deployment of these versions has such a group. The state moves with every
+transfer that moves at least one token.
 A request of zero input tokens owns no block on the prefill worker and moves
 no state block; vLLM refuses an empty prompt, see vLLM v0.31.0
-[`input_processor.py:516-517`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/engine/input_processor.py#L516-L517)
-and vLLM v0.32.0
-[`input_processor.py:565-566`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/input_processor.py#L565-L566).
+[`input_processor.py:516-517`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/engine/input_processor.py#L516-L517),
+vLLM v0.32.0
+[`input_processor.py:565-566`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/input_processor.py#L565-L566)
+and vLLM v0.33.0
+[`input_processor.py:565-566`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/engine/input_processor.py#L565-L566).
 `transfer_bytes_per_block` is the bytes that vLLM's NIXL connector
-reads for one block of the group on one TP rank, on vLLM 0.31.0 or vLLM
-0.32.0. So the result is the bytes that the connector reads for the request on
+reads for one block of the group on one TP rank, on vLLM 0.31.0, 0.32.0 or
+0.33.0. So the result is the bytes that the connector reads for the request on
 one rank. A live run of GLM-5.3-Flash measured the bytes of whole transfers on
-both versions. They give the value of the full-attention group and the sum of
-the other groups. The values of the ring and the four KDA state groups in the
-GLM-5.3-Flash test profiles are a reading, not a measurement of each group:
-they come from the regions that the connector logged at start and a reading of
-the connector code, checked against that sum and the descriptor counts.
-The evidence folder
+vLLM 0.31.0 and 0.32.0. They give the value of the full-attention group and
+the sum of the other groups. The values of the ring and the four KDA state
+groups in the GLM-5.3-Flash test profiles of these two versions are a reading,
+not a measurement of each group: they come from the regions that the connector
+logged at start and a reading of the connector code, checked against that sum
+and the descriptor counts. The evidence folder
 [`nixl-pd-transfer-bytes-20261115`](../../../benchmarks/evidence/nixl-pd-transfer-bytes-20261115/README.md)
 holds the numbers and the reading.
+A later run on vLLM 0.33.0 measured the bytes of each group with a log of the
+connector. They equal the values of vLLM 0.32.0. The evidence folder
+[`nixl-pd-transfer-bytes-20261117`](../../../benchmarks/evidence/nixl-pd-transfer-bytes-20261117/README.md)
+holds the numbers and the region table of the connector. The import of a vLLM
+0.33.0 runtime probe record computes the field with the region rule of the
+connector. It writes the field only from a probe phase with prefix caching and
+only for the measured cache shape.
 [Memory accounting](../../perf-model/memory.md#fpm-profile-cache-groups-and-byte-budgets)
-tells what a measurement gives for a profile and when a group's value stays
-unset.
+gives that rule and its conditions. It also tells what a measurement gives for
+a profile and when a group's value stays unset.
 
 Replay differs from vLLM in these known ways for a grouped profile:
 
@@ -117,7 +126,7 @@ Replay differs from vLLM in these known ways for a grouped profile:
   smaller than the full-attention block, vLLM also loads nothing when the first
   `N - 1` tokens end on a hash block boundary and are all cached, while replay
   rounds its hit down to the full-attention block and moves one attention block
-  and `fixed_bytes`. The live run did not measure either case.
+  and `fixed_bytes`. Neither live run measured these cases.
 - `fixed_bytes` charges every block of a sliding-window group inside the
   window, whatever the decode worker caches. vLLM moves only the window blocks
   that the decode worker does not cache. GLM-5.3-Flash has no sliding-window
@@ -125,11 +134,11 @@ Replay differs from vLLM in these known ways for a grouped profile:
 - When one full-attention group is prefix-cacheable and another is not, replay
   moves every full-attention block of both groups. vLLM moves only the blocks
   that the decode worker does not hold, so it does not move the cached hit
-  blocks of the prefix-cacheable group. No full-attention spec of vLLM 0.31.0
-  or 0.32.0 opts out of prefix caching. So no deployment of these versions has
-  this shape. Only a profile that describes no such deployment reaches it.
-  GLM-5.3-Flash has one full-attention group. The live run did not measure
-  this case.
+  blocks of the prefix-cacheable group. No full-attention spec of vLLM 0.31.0,
+  0.32.0 or 0.33.0 opts out of prefix caching. So no deployment of these
+  versions has this shape. Only a profile that describes no such deployment
+  reaches it. GLM-5.3-Flash has one full-attention group. Neither live run
+  measured this case.
 
 The decode-side differences under
 [grouped caches](kv-cache.md#other-cache-modes) can also change the

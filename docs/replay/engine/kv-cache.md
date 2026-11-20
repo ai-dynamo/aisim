@@ -1343,16 +1343,26 @@ sub-block matching without an explicit full-state scratch count.
 
   In `mode: disaggregated`, the prefill and decode deployments need equal
   tensor parallelism and identical cache groups. `engine.backend_version` must
-  be `0.31.0` or `0.32.0`. Grouped P/D is refused for `0.33.0`, with prefix
-  caching on or off, because replay has no transfer rules for that version.
+  be `0.31.0`, `0.32.0` or `0.33.0`. On `0.33.0`, a prefill or decode rank
+  refuses a `scheduler.prefill_schedule_interval` above 1, with prefix caching
+  on or off, also with `attention_data` above 1. See
+  [vLLM prefill schedule interval](workers.md#vllm-prefill-schedule-interval).
   Every group must declare `prefix_cacheable` and
   `transfer_bytes_per_block`. When the runtime memory records
   `runtime_framework_version`, that version equals the `backend_version`, as
-  for prefix caching. The runtime probe import writes no
-  `transfer_bytes_per_block` and records vLLM 0.33.0 as the version of its
-  evidence, so a profile from the runtime probe cannot run P/D. P/D needs a
-  hand-made profile of vLLM 0.31.0 or 0.32.0 that sets both fields on each
-  group. Set `transfer_bytes_per_block` only from evidence that identifies the
+  for prefix caching. The import of a vLLM 0.33.0 runtime probe record writes
+  `transfer_bytes_per_block` only from a probe phase with prefix caching and
+  only for the measured cache shape: Mamba groups, a ring and MLA attention
+  layers in one storage of whole block rows.
+  [Memory accounting](../../perf-model/memory.md#fpm-profile-cache-groups-and-byte-budgets)
+  gives all of its conditions. A profile from such a record can run P/D under
+  the label `0.33.0`. Both roles of the pair need the value, so the profile of
+  each role must come from a probe with a phase with prefix caching. For every
+  other record the import gives no value. The writer never makes an import
+  incomplete, and the result of a complete import names the reason in
+  `transfer_bytes_reason`. A profile without the value, and a profile of vLLM
+  0.31.0 or 0.32.0, needs a hand-made value on each group.
+  Set `transfer_bytes_per_block` only from evidence that identifies the
   bytes of that group for that vLLM version, as
   [memory accounting](../../perf-model/memory.md#fpm-profile-cache-groups-and-byte-budgets)
   describes. So a model with several state groups can run P/D only with such
@@ -1361,10 +1371,11 @@ sub-block matching without an explicit full-state scratch count.
   groups also share one `block_size_tokens`, and native replay refuses the rank
   otherwise. Grouped P/D refuses a bounded replay window, an attention group
   with a `sliding_window` and `prefix_cacheable: false`, with prefix caching
-  on or off. Replay does not model its transfer: vLLM 0.32.0 also stops the
-  prefill one token short for it, and vLLM 0.31.0 computes its window again
-  after the load. A ring must be a `state` group with `blocks_per_request: 1`
-  and `prefix_cacheable: false`. For a native pair, replay checks that the prefill and decode
+  on or off. Replay does not model its transfer: vLLM 0.32.0 and 0.33.0 also
+  stop the prefill one token short for it, and vLLM 0.31.0 computes its window
+  again after the load. A ring must be a `state` group with
+  `blocks_per_request: 1` and `prefix_cacheable: false`. For a native pair,
+  replay checks that the prefill and decode
   roles have identical `kv_cache_groups` and the same `vllm_version`, and
   it runs the gate of each rank. It does not check equal tensor
   parallelism, or the version that the profile records. P/D moves whole blocks of
@@ -1372,9 +1383,11 @@ sub-block matching without an explicit full-state scratch count.
   each state group.
   A request of zero input tokens owns no block on the prefill worker and moves
   no state block; vLLM refuses an empty prompt, see vLLM v0.31.0
-  [`input_processor.py:516-517`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/engine/input_processor.py#L516-L517)
-  and vLLM v0.32.0
-  [`input_processor.py:565-566`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/input_processor.py#L565-L566).
+  [`input_processor.py:516-517`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/engine/input_processor.py#L516-L517),
+  vLLM v0.32.0
+  [`input_processor.py:565-566`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/input_processor.py#L565-L566)
+  and vLLM v0.33.0
+  [`input_processor.py:565-566`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/engine/input_processor.py#L565-L566).
   The prefill of a model with recurrent state layers stops
   one token short, and the decode worker recomputes that token. The prefill
   of a one-token prompt computes that token, and the decode worker computes
@@ -1482,11 +1495,16 @@ sub-block matching without an explicit full-state scratch count.
     [`:773-775`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/sched/scheduler.py#L773-L775)
     and
     [`:2694-2710`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/sched/scheduler.py#L2694-L2710),
-    and vLLM v0.32.0
+    vLLM v0.32.0
     [`scheduler.py:186-192`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L186-L192),
     [`:804-806`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L804-L806)
     and
-    [`:2759-2775`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L2759-L2775).
+    [`:2759-2775`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L2759-L2775),
+    and vLLM v0.33.0
+    [`scheduler.py:189-195`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L189-L195),
+    [`:940-942`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L940-L942)
+    and
+    [`:3077-3093`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L3077-L3093).
     Replay does not model this rule on a grouped decode worker. It can
     preempt such a request, and it frees a cancelled request at once. A
     request that ends at its output limit is not run by a later step, so
@@ -1495,15 +1513,19 @@ sub-block matching without an explicit full-state scratch count.
     it processes the outputs of the step that took the copy. Replay releases
     them at the end of the scheduling pass on a decode worker too. See vLLM
     v0.31.0
-    [`scheduler.py:2712-2721`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/sched/scheduler.py#L2712-L2721)
-    and vLLM v0.32.0
-    [`scheduler.py:2777-2786`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L2777-L2786).
+    [`scheduler.py:2712-2721`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/sched/scheduler.py#L2712-L2721),
+    vLLM v0.32.0
+    [`scheduler.py:2777-2786`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L2777-L2786)
+    and vLLM v0.33.0
+    [`scheduler.py:3095-3104`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L3095-L3104).
     vLLM applies the same rule to a prefill worker whose connector runs in
     the role `kv_both`. vLLM counts `kv_both` as a consumer role. See vLLM
     v0.31.0
-    [`kv_transfer.py:11-12`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/config/kv_transfer.py#L11-L12)
-    and vLLM v0.32.0
-    [`kv_transfer.py:11-12`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/kv_transfer.py#L11-L12).
+    [`kv_transfer.py:11-12`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/config/kv_transfer.py#L11-L12),
+    vLLM v0.32.0
+    [`kv_transfer.py:11-12`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/kv_transfer.py#L11-L12)
+    and vLLM v0.33.0
+    [`kv_transfer.py:11-12`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/config/kv_transfer.py#L11-L12).
     Replay does not model the rule on a grouped prefill worker either, and it
     releases the copy sources there at the end of the scheduling pass too.
   - Replay tests a waiting transferred request again between two passes: at
@@ -1517,11 +1539,16 @@ sub-block matching without an explicit full-state scratch count.
     [`:873`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/sched/scheduler.py#L873)
     and
     [`kv_cache_manager.py:552-556`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_manager.py#L552-L556),
-    and vLLM v0.32.0
+    vLLM v0.32.0
     [`scheduler.py:657-659`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L657-L659),
     [`:900`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L900)
     and
-    [`kv_cache_manager.py:555-559`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_manager.py#L555-L559).
+    [`kv_cache_manager.py:555-559`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_manager.py#L555-L559),
+    and vLLM v0.33.0
+    [`scheduler.py:793-795`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L793-L795),
+    [`:1050`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L1050)
+    and
+    [`kv_cache_manager.py:564-568`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_manager.py#L564-L568).
     So room that a running request frees inside a pass serves the waiting
     request one forward pass later than vLLM reserves it. Such room includes,
     among other blocks, the previous state block, a checkpoint block and the
@@ -1535,13 +1562,20 @@ sub-block matching without an explicit full-state scratch count.
     [`:83-90`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/worker/kv_connector_model_runner_mixin.py#L83-L90)
     and
     [`pull_worker.py:47-51`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py#L47-L51),
-    and vLLM v0.32.0
+    vLLM v0.32.0
     [`core.py:725`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core.py#L725),
     [`:768-783`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core.py#L768-L783),
     [`kv_connector_model_runner_mixin.py:77`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/kv_connector_model_runner_mixin.py#L77),
     [`:83-90`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/kv_connector_model_runner_mixin.py#L83-L90)
     and
-    [`pull_worker.py:47-51`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py#L47-L51).
+    [`pull_worker.py:47-51`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py#L47-L51),
+    and vLLM v0.33.0
+    [`core.py:735`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/engine/core.py#L735),
+    [`:778-793`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/engine/core.py#L778-L793),
+    [`kv_connector_model_runner_mixin.py:77`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/worker/kv_connector_model_runner_mixin.py#L77),
+    [`:83-90`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/worker/kv_connector_model_runner_mixin.py#L83-L90)
+    and
+    [`pull_worker.py:49-53`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py#L49-L53).
     The difference also goes the other way. Replay tests the waiting request
     before the running requests of the next pass take their new blocks, and
     vLLM tests it after them. Replay can then reserve the load one pass before

@@ -263,7 +263,9 @@ for the transfer bytes of each of these groups.
   larger than `page_size_bytes`, because the connector reads a block in regions
   that layers of other groups can share. A hand-made profile may state it only
   for a group whose transfer size has been measured or identified by other
-  evidence for that group.
+  evidence for that group. The import of a vLLM 0.33.0 probe record writes it
+  only from a probe phase with prefix caching and only for the measured cache
+  shape, which the paragraphs below describe.
 
   To measure the full-attention value and the combined transfer size of the
   other groups, send two prompts of different length through a P/D pair, one at
@@ -277,37 +279,105 @@ for the transfer bytes of each of these groups.
   each of them moves one block, as a state group does. With multiple state
   groups, this determines only their combined transfer size.
 
-  Per-group values for models with several state groups are not supported by
-  this procedure or the current runtime probe. Leave `transfer_bytes_per_block`
-  unset for those groups until per-group transfer measurements, additional
-  runtime-observer evidence or another source, such as the regions that the
-  connector logs at start, read with the connector code, identifies the bytes
-  read for each group on one TP rank. Do not split the combined size evenly or
-  use the page sizes as substitutes.
+  This procedure does not give the value of each group for a model with
+  several state groups. For a cache outside the measured shape, for a record of
+  that shape from a probe phase without prefix caching, and for a profile of
+  vLLM 0.31.0 or 0.32.0 without evidence for each group, leave
+  `transfer_bytes_per_block` unset for those groups until per-group transfer
+  measurements, additional runtime-observer evidence or another source, such
+  as the regions that the connector logs at start, read with the connector
+  code, identifies the bytes read for each group on one TP rank. Do not split
+  the combined size evenly or use the page sizes as substitutes.
 
-  The probe import of a vLLM 0.33.0 record writes it for no group, because what
-  the P/D connector of vLLM 0.33.0 reads for a block depends on
-  facts that the record does not hold. The connector registers one
-  region per layer address and lets layers of different groups share a region.
-  In a model with Mamba layers, it reads a block of an attention group, other
-  than the ring, in every region. The length of a region of a layer that is not
-  a Mamba layer depends on the layout: the padded page divided by a
-  kernel-block ratio that the connector chooses at start, or the whole storage
-  row of a block. A Mamba layer moves its state without padding, and a
-  `tp_replicated` Mamba layer moves its whole page. The record holds neither the
-  ratio nor `tp_replicated`. See vLLM v0.33.0
-  [`base_worker.py:1744-1756`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1744-L1756),
-  [`:194-249`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L194-L249),
-  [`:1598-1603`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1598-L1603),
-  [`:1693-1719`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1693-L1719),
-  [`:1063-1082`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1063-L1082),
-  [`:2013-2033`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L2013-L2033)
+  The probe import computes the field from the worker records of a vLLM 0.33.0
+  probe, with the region rule of the connector. In the measured shape, the
+  connector registers one region for each distinct page address of a layer, in
+  the order of the allocation plan, and the length of a region is the page of
+  its layer. Layers of different groups can share a region, and an MLA layer
+  then sets its length.
+  For one block, the MLA attention group reads every region. A ring group
+  reads the regions of its own layers. A Mamba group reads its state bytes
+  without padding in every region of a Mamba layer. See vLLM v0.33.0
+  [`base_worker.py:1744-1766`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1744-L1766),
+  [`:1774-1786`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1774-L1786),
+  [`:237-278`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L237-L278)
   and
-  [`:1774-1779`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1774-L1779).
-  A P/D model of a grouped profile for vLLM 0.33.0 needs these facts from the
-  runtime observer first. A claim in `resource_overrides.cache_groups` that
-  states this field is refused, because the probe evidence holds no value to
-  compare it with.
+  [`ssm_conv_transfer_utils.py:155-156`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/ssm_conv_transfer_utils.py#L155-L156).
+
+  The import writes the field only for a record that meets all of these
+  conditions. They describe the structure of the cache. They do not name the
+  TP size, the GPU type or the KV cache data type.
+
+  1. It is a vLLM 0.33.0 record with hybrid evidence.
+  2. One storage holds every block row, and every allocation uses the same
+     block stride.
+  3. The groups hold one or more Mamba groups and one or more ring groups.
+  4. The cache holds one or more MLA attention layers, every layer outside the
+     Mamba groups and the ring groups is such a layer, and no group holds a
+     sliding window.
+  5. Every Mamba group holds two or more layers, and all Mamba layers hold the
+     same two state tensors.
+  6. The record comes from a probe phase with prefix caching on.
+
+  A probe can hold two phases and several TP ranks. The import computes the
+  value from each worker record of each phase with prefix caching on. It
+  writes the value only when every such record meets the conditions and all of
+  them give the same value. For every other record it writes no value. The
+  writer never makes an import incomplete, and the result of a complete import
+  names the reason in `transfer_bytes_reason`. The reason is the first
+  condition that the record does not meet, a field of the rule that the record
+  lacks or holds in a form that the import does not know, or worker records
+  that give different values.
+
+  The record does not hold four facts that the connector reads. A reading of
+  the vLLM source shows that the value does not depend on them inside the
+  conditions:
+
+  - The ratio between the manager block and the kernel block of the
+    connector. Storage of whole block rows starts only with a ratio of 1. vLLM
+    never splits the block of a group whose layers share block rows.
+  - The `tp_replicated` flag of a Mamba layer. A ring model accepts a
+    `tp_replicated` state only in a group of one layer. Every Mamba group of
+    the conditions holds two or more layers.
+  - The layout that the connector asks for, which follows `use_mla`. The
+    connector asks for another layout only for a model without MLA.
+  - The `mamba_type` of a Mamba layer. The connector starts only for Mamba1,
+    Mamba2 and GDN layers. For each of them it reads the two state tensors
+    whole. For Mamba2 this holds because vLLM makes the TP size divide the
+    group columns; see vLLM v0.33.0
+    [`mamba_mixer2.py:320-341`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/model_executor/layers/mamba/mamba_mixer2.py#L320-L341)
+    and
+    [`mamba_utils.py:197-205`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/model_executor/layers/mamba/mamba_utils.py#L197-L205).
+
+  The connector orders the regions of a ring model by the manager views. vLLM
+  builds these views in the order of the allocation plan, which the record
+  holds. See vLLM v0.33.0
+  [`base_worker.py:1611-1615`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1611-L1615),
+  [`:1670-1672`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1670-L1672),
+  [`:1720-1730`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1720-L1730),
+  [`:680-697`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L680-L697),
+  [`:1573-1580`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1573-L1580),
+  [`utils.py:598-627`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/worker/utils.py#L598-L627),
+  [`:663-675`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/worker/utils.py#L663-L675),
+  [`connector.py:148-166`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py#L148-L166),
+  [`ssm_conv_transfer_utils.py:127-136`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/ssm_conv_transfer_utils.py#L127-L136)
+  and
+  [`:155-208`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/ssm_conv_transfer_utils.py#L155-L208).
+
+  A live run measured the values of GLM-5.3-Flash at TP 4 with an fp8 KV cache
+  on GB300: 21,978,496 bytes for the attention group, 92,288 for the ring and
+  9,768,960 for each KDA state group. The import of a probe record of the same
+  model, TP size, data type and GPU type gives these values. Its region table
+  equals the table that the connector logged. See
+  [`nixl-pd-transfer-bytes-20261117`](../../benchmarks/evidence/nixl-pd-transfer-bytes-20261117/README.md).
+  For another TP size or KV cache data type of the same cache shape, the
+  import computes the value from that record by the same rule. No run
+  measured such a value. The value describes the probe launch with the
+  connector added and no other change.
+
+  A claim in `resource_overrides.cache_groups` that states this field must
+  state the value of the import. If the probe evidence holds no value, the
+  claim is refused, because it has no value to compare with.
 
 Use `RustForwardPassPerfModel.estimate_cache_budget(config, budget)` with the
 same canonical `ForwardPassPerfModelConfig` used for timing. Rust exposes
@@ -372,13 +442,14 @@ only from a vLLM 0.33.0 record and records that version, so the plan of a
 profile from the runtime probe with the label `0.33.0` replays with prefix
 caching when it meets the conditions. [Replay KV cache](../replay/engine/kv-cache.md#other-cache-modes)
 gives the case of a profile imported before the version was recorded.
-Grouped P/D follows the transfer rules of vLLM 0.31.0 and 0.32.0 only, so it
-refuses a profile of vLLM 0.33.0. It needs a profile deployment of one of
-these versions whose groups all state
+Grouped P/D follows the transfer rules of vLLM 0.31.0, 0.32.0 and 0.33.0. It
+needs a profile deployment of one of these versions whose groups all state
 `prefix_cacheable` and `transfer_bytes_per_block`, and a prefill and a decode
 deployment with equal tensor parallelism and identical cache groups. The probe
-import writes no `transfer_bytes_per_block` and records vLLM 0.33.0, so P/D
-needs a hand-made profile.
+import records vLLM 0.33.0 and writes `transfer_bytes_per_block` only from a
+probe phase with prefix caching and only for the measured cache shape. A
+profile from such a probe runs P/D under the label `0.33.0`. Every other
+profile needs a hand-made value on each group.
 [Replay KV cache](../replay/engine/kv-cache.md#other-cache-modes) lists the conditions. Host/G3
 offload and fixed scalar cache capacity are rejected. With
 prefix caching off, allocation is atomic across all groups against one shared

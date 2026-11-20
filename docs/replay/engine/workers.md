@@ -307,9 +307,13 @@ keeps decode steps balanced across DP ranks. It has an effect only when
 data parallelism, and it gives a dense DP rank its own cadence; see vLLM
 v0.33.0 [`scheduler.py:396-425`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L396-L425)
 and [`:780-791`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L780-L791).
-Replay does not model that. A grouped FPM cache with prefix caching on vLLM
-0.33.0 refuses an interval above 1. Where replay accepts the interval, it
-applies it only for `attention_data` above 1.
+Replay does not model that. A grouped FPM cache on vLLM 0.33.0 refuses an
+interval above 1 with prefix caching. A grouped prefill or decode rank on vLLM
+0.33.0 refuses it with prefix caching on or off. Both refusals also apply with
+`attention_data` above 1, where vLLM 0.33.0 leaves the cadence of a MoE model
+to its DP engine core, as replay models it. The validation of a rank does not
+see the attention DP size. Where replay accepts the interval, it applies it
+only for `attention_data` above 1.
 
 ```yaml
 engine:

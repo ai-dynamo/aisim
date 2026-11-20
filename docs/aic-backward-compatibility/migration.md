@@ -676,9 +676,9 @@ explains the retained workload routing and feature mathematics.
   Serialized groups that omit these fields still deserialize, and `None` is
   not serialized.
 - A vLLM 0.33.0 runtime probe import now writes `prefix_cacheable` for each
-  cache group, except a group that holds a `SlidingWindowMLASpec` layer. It
-  writes `transfer_bytes_per_block` for no group. An onboarding session whose
-  probe was imported before this change keeps working without the new field,
+  cache group, except a group that holds a `SlidingWindowMLASpec` layer. An
+  onboarding session whose probe was imported before this change keeps
+  working without the new field,
   also for a memory revision:
   - Before the formal collection, its accepted draft still verifies and stays
     accepted. Plan and collect as before.
@@ -712,6 +712,22 @@ explains the retained workload routing and feature mathematics.
   replay do not read the field, so such a session does not need it. A new
   import of the same observations, as for `prefix_cacheable` above, also
   writes it.
+- A vLLM 0.33.0 runtime probe import now also writes
+  `transfer_bytes_per_block` for each cache group, only from a probe phase
+  with prefix caching and only for the measured cache shape, which
+  [memory accounting](../perf-model/memory.md#fpm-profile-cache-groups-and-byte-budgets)
+  describes. For every other record it gives no value. The writer never makes
+  an import incomplete, and the result of a complete import names the reason
+  in `transfer_bytes_reason`. A session whose probe was imported
+  before this change keeps working without the field, in the same steps as for
+  `prefix_cacheable` above: its draft verifies, the existing collection
+  finalizes, and the finalized profile has no `transfer_bytes_per_block`. A
+  saved record that states the field must state the value of a fresh import.
+  The check of the formal collection compares the field over the whole role
+  with the accepted probe. The check of one bound phase does not compare it.
+  Sizing and aggregated replay do not read the field. Grouped P/D reads it, so
+  such a session needs a new import of the same observations, as for
+  `prefix_cacheable` above, to run P/D.
 - Replay now holds grouped prefix-caching rules for vLLM 0.33.0. A new plan
   of a profile from the runtime probe with the label `0.33.0` sets
   `prefix_caching: true` when the profile meets the conditions of
