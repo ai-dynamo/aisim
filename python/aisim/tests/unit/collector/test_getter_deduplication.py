@@ -288,10 +288,11 @@ def test_vllm_sm90_repository_moe_getter_excludes_unconsumable_dsv4_cases(monkey
     }
 
     # Every row plans its checkpoint's quant modes on every backend; vLLM
-    # leaves out tp>1 with ep>1 (collector/skips.py). The count moves only
-    # with the model rows or the shared grid.
-    assert len(cases) == 2346
-    assert sum(len(case[1]) for case in cases) == 68034
+    # leaves out tp>1 with ep>1 and Ultra's outer-width rows (collector/skips.py).
+    # BF16/FP8 outer-width removal subtracts 2 artifacts * 14 TP/EP layouts *
+    # 3 distributions = 84 cases, each with 29 token counts, from 2346/68034.
+    assert len(cases) == 2262
+    assert sum(len(case[1]) for case in cases) == 65598
     # MiniMax-M3's declared MoE geometry must be present as its own rows —
     # a generator defect could drop it while unrelated cases preserve the
     # aggregate counts above. (case[:8] = moe_type, num_tokens, hidden,
@@ -347,22 +348,20 @@ def test_vllm_sm100_repository_moe_getter_expands_native_dsv4_w4a8_cases(monkeyp
 
 
 @pytest.mark.parametrize(
-    ("model_path", "moe_type", "hidden_sizes"),
+    ("model_path", "moe_type", "latent_width", "hidden_sizes"),
     [
-        ("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8", "fp8", {1024}),
-        ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16", "bfloat16", {2048, 8192}),
-        ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8", "fp8", {2048, 8192}),
+        ("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8", "fp8", 1024, {1024}),
+        ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16", "bfloat16", 2048, {2048, 8192}),
+        ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8", "fp8", 2048, {2048, 8192}),
     ],
 )
-def test_nemotron_moe_plans_the_vllm_latent_and_the_outer_width_everywhere(
-    monkeypatch, model_path, moe_type, hidden_sizes
-):
+def test_nemotron_moe_plans_backend_expert_widths(monkeypatch, model_path, moe_type, latent_width, hidden_sizes):
     from collector.op_plans import plan
 
     monkeypatch.setenv("COLLECTOR_MODEL_PATH", model_path)
     for backend in ("trtllm", "vllm"):
         cases = plan("moe", backend, 90).cases
-        assert {case.hidden_size for case in cases} == hidden_sizes
+        assert {case.hidden_size for case in cases} == ({latent_width} if backend == "vllm" else hidden_sizes)
         assert {case.moe_type for case in cases} == {moe_type}
     # SGLang has no per-tensor fp8 path (collector/skips.py).
     sglang = plan("moe", "sglang", 90).cases

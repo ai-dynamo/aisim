@@ -121,13 +121,16 @@ SKIPS: list[dict] = [
     # vLLM's NemotronHMoE constructs routed experts at moe_latent_size when set
     # (vllm/model_executor/models/nemotron_h.py, NemotronHMoE.__init__ @0.31.0).
     # The outer-width Super/Ultra rows serve SGLang/TRT-LLM only; timing them
-    # through vLLM's native ModelOpt method would record a geometry it never serves.
+    # through vLLM's FusedMoE would record a geometry it never serves, regardless
+    # of quant mode.
     {
         "backend": "vllm",
         "op": "moe",
         "model_name": [
             "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
             "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
+            "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16",
+            "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8",
         ],
         "hidden_size": [4096, 8192],
     },
