@@ -1093,7 +1093,12 @@ def probe_runtime(
                     if execute:
                         # Concrete credentials exist only in private, temporary
                         # worker staging. Retained renders contain references.
-                        delivery_directory = tempfile.TemporaryDirectory(prefix="aisimulate-probe-delivery-")
+                        # Pyxis bind mounts need the campaign's shared storage;
+                        # the login node's default temporary directory may be local.
+                        delivery_directory = tempfile.TemporaryDirectory(
+                            prefix="aisimulate-probe-delivery-",
+                            dir=root if plan.options.executor == "slurm" else None,
+                        )
                         worker_dir = Path(delivery_directory.name)
                         runner._render_cell(plan, cell, worker_dir, probe_generator_overrides(delivery))
                         worker_extras = stage_runtime_instrumentation(frozen, worker_dir, context)

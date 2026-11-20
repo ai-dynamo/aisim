@@ -1678,7 +1678,10 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
 
 
 @pytest.mark.parametrize("transport", ["slurm", "kubernetes"])
-def test_probe_keeps_credentials_out_of_launch_evidence_and_delivers_to_runtime(tmp_path, monkeypatch, transport):
+@pytest.mark.parametrize("fail_runtime", [False, True])
+def test_probe_keeps_credentials_out_of_launch_evidence_and_delivers_to_runtime(
+    tmp_path, monkeypatch, transport, fail_runtime
+):
     from collector.fpm_forward import runner, runtime_probe
 
     launch, manifest, _ = _inputs(tmp_path)
@@ -1689,6 +1692,9 @@ def test_probe_keeps_credentials_out_of_launch_evidence_and_delivers_to_runtime(
     launch["deployment"]["extra_env"] = environment
     delivered = []
     staging = []
+    node_local = tmp_path / "node-local-tmp"
+    node_local.mkdir()
+    monkeypatch.setattr(runtime_probe.tempfile, "tempdir", str(node_local))
 
     class Executor(_SyntheticExecutor):
         def stage(self, pods, files):
@@ -1697,7 +1703,10 @@ def test_probe_keeps_credentials_out_of_launch_evidence_and_delivers_to_runtime(
 
                 SlurmCellRunner.stage(self, pods, files)
                 staging.append(self.runtime_dir)
-                assert not self.runtime_dir.is_relative_to(output)
+                # Pyxis bind mounts must remain on the campaign's shared
+                # filesystem even when the login node's default tmp is local.
+                assert self.runtime_dir.parent.parent == output
+                assert self.runtime_dir.parent.stat().st_mode & 0o777 == 0o700
                 assert runner.shlex.quote(token) in (self.runtime_dir / "run.sh").read_text()
             self.staged_scripts = {path.name: path.read_text() for path in files if path.suffix == ".sh"}
             super().stage(pods, files)
@@ -1714,6 +1723,8 @@ def test_probe_keeps_credentials_out_of_launch_evidence_and_delivers_to_runtime(
             assert runner.shlex.quote(token) in script
             delivered.append(self.cell.workload_kind)
             super().execute(pods)
+            if fail_runtime:
+                raise RuntimeError("synthetic worker failure after staging")
 
     monkeypatch.setattr(runner, "_cell_runner", lambda p, c, m, d: Executor(p, c, d, []))
     output = tmp_path / "probe"
@@ -1748,10 +1759,14 @@ def test_probe_keeps_credentials_out_of_launch_evidence_and_delivers_to_runtime(
         report = runtime_probe.probe_runtime(
             {"tp4": launch}, instrumentation=manifest, output_dir=output, execute=execute
         )
-        assert report["status"] == ("completed" if execute else "preview")
+        expected = "failed" if fail_runtime else "completed"
+        assert report["status"] == (expected if execute else "preview"), report
         assert_archived(report)
     assert delivered == ["prefill", "decode"]
+    assert len(staging) == (2 if transport == "slurm" else 0)
     assert all(not directory.exists() for directory in staging)
+    assert not list(output.glob("aisimulate-probe-delivery-*"))
+    assert not list(node_local.iterdir())
 
     for path in output.rglob("*"):
         if path.is_file():
