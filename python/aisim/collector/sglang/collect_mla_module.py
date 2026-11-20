@@ -630,8 +630,9 @@ def _model_native_gemm_quant(model_id: str) -> str | None:
     # ModelConfig._parse_quant_hf_config): ``quantization_config`` in config.json, then
     # ``compression_config``, then the ``hf_quant_config.json`` sidecar, which it reads only when both
     # are absent. A ``quantization_config`` is ModelOpt when it has no ``quant_method`` or the value
-    # ``modelopt``. The same gate applies to the sidecar here, because ModelOpt writes no other
-    # ``quant_method`` into that file.
+    # ``modelopt``. SGLang parses the sidecar as ModelOpt without that gate, and this helper reads a pure
+    # sidecar algorithm the same way. For a sidecar ``MIXED_PRECISION`` export the helper keeps the gate:
+    # ModelOpt writes no other ``quant_method`` into that file, so the gate changes no real export.
     #
     # A ModelOpt section with ``quant_algo`` exactly ``MIXED_PRECISION`` names one lane per module in
     # ``quantized_layers`` (ModelConfig._parse_modelopt_quant_config):
@@ -708,7 +709,7 @@ def _model_native_gemm_quant(model_id: str) -> str | None:
             f"{model_id} is a ModelOpt MIXED_PRECISION export with no NVFP4 lane in its {section}: "
             "SGLang resolves such an export to w4afp8, which this collector has no path for"
         )
-    # A pure ModelOpt algorithm. A sidecar algorithm is read with any ``quant_method``.
+    # A pure algorithm of a ModelOpt section. The sidecar counts as ModelOpt here (see the gate note above).
     if is_modelopt or section == "hf_quant_config.json quantization":
         algo = str(quant_cfg.get("quant_algo") or "").upper()
         if "FP4" in algo:
