@@ -84,9 +84,11 @@ def validate_local(path: str | Path) -> dict[str, Any]:
     name_findings, name_errors = check_names(path, root)
     for item in name_findings:
         findings.append(_finding("names", item.path, f"{item.finding.value!r} is not canonical", **_name_fields(item)))
+    reported = {f["path"] for f in findings if f["check"] == "manifest"}
     for message in name_errors:
         manifest_path, _, detail = message.partition(": ")
-        findings.append(_finding("manifest", manifest_path, detail))
+        if manifest_path not in reported:  # one finding per manifest, not one per check that could not read it
+            findings.append(_finding("manifest", manifest_path, detail))
     return {
         "ok": not findings,
         "source": {"path": str(path)},
