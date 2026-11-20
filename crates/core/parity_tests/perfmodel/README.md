@@ -216,6 +216,91 @@ using `pin_goldens.py --refresh`. Each refreshed record retains its source
 commit in `post_freeze_pins`; test matrices and tolerances are unchanged.
 These are prediction-regression baselines, not whole-model silicon validation.
 
+### MoE-family prefill logits GEMM
+
+`MOEModel` (Mixtral, GPT-OSS, Qwen2/Qwen3-MoE, MiniMax-M2) now emits
+`context_logits_gemm`, the prefill LM-head projection every other family
+already had. The original selective refresh from
+`fdd84a8e9377dab2547e171f9ff126769fd51b1f` covers 21 engine-step records and
+six per-op cases. No compiled-engine reference moved outside its tolerance.
+
+Each per-op case gains exactly one `context_logits_gemm` entry of 0.0265 to
+0.0275 ms. All other per-op latencies, energies, and source labels are
+unchanged. The engine-step records are the Qwen3-235B-A22B and MiniMax-M2.5
+hybrid, empirical, and SOL cases, which use a 1e-4 relative tolerance. Their
+prefill-bearing metrics increase by 0.020 to 0.084 ms. Decode-only metrics are
+unchanged. MoE records compared at the 1% tolerance still pass and were not
+refreshed. The refreshed records are exactly the `post_freeze_pins` entries
+that name the commit above, each passed to `pin_goldens.py --refresh`.
+
+After merging main at `44447963d93cca0709d670b6d501a9a987922bb1`, the same
+21 engine-step and six per-op records were regenerated from
+`57c934b78553af6c489eb7d29938bfd7ad4ed7a0` with `pin_goldens.py --refresh`.
+Their keys are identified by that revision in `post_freeze_pins`. This retains
+main's newer tables, hybrid transfer behavior, and all unrelated golden records.
+The new per-op heads cost 0.026997 to 0.028902 ms; every other per-op field,
+including all generation entries, is unchanged. Updated prefill-bearing
+engine metrics increase by 0.020000 to 0.085876 ms. For example:
+
+| Case | Main static context (ms) | With head (ms) | Static generation (ms), unchanged |
+| --- | ---: | ---: | ---: |
+| MiniMax-M2.5, B200 empirical | 22.201 | 22.227 | 8.172 |
+| MiniMax-M2.5 NVFP4, H200 cross-profile | 72.467 | 72.508 | 8.661 |
+| Qwen3-235B, B200 cross-profile | 24.310 | 24.337 | 280.612 |
+| Qwen3-235B, B200 cross-quant | 91.047 | 91.074 | 13.457 |
+
+The causal control uses the same release wheel and data, wrapping
+`MOEModel.__init__` to remove only `context_logits_gemm` from `context_ops`
+after construction. All 27 control records reproduce main's goldens within
+1e-10 relative tolerance. Restoring the head produces the narrow diff above;
+static generation and disaggregated TPOT remain unchanged. These comparisons
+are numerical regression evidence, not measured serving accuracy.
+
+Main also replaced the Python AFD session and partition API with native AFD
+pool composition. The migrated regressions check that the head occurs once in
+the A-pool suffix, never in the F pool or repeated layer templates, and compare
+native context/decode evaluation with independent per-request GEMM shapes.
+Native AFD already supplied a missing prefill head from decode, so pure AFD
+records remain unchanged. Two AFD-decode cases have an ordinary MoE prefill
+companion and therefore also need the missing projection:
+
+| Fixture case | Main TTFT (ms) | With head (ms) | Main duration (ms) | With head (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| `afd_e2e`: `qwen3-30b-a3b-h200-sglang-pd-decode` | 62.926544 | 62.948496 | 4118.221288 | 4118.309096 |
+| `afd_execution_plan`: `qwen_tp2_pd_decode` | 36.3799505 | 36.4020465 | 106.298492 | 106.320588 |
+
+The same control described above reproduces every prior expected field in
+these two records within 1e-10 relative tolerance. Restoring the ordinary head
+adds 0.021952 ms per wave in the first case, hence 4 * 0.021952 = 0.087808 ms
+over four waves. The second case adds 0.022096 ms. Decode timing, exact
+request/token/GPU accounting, memory, and every existing per-operation power
+diagnostic are unchanged; the prefill diagnostics gain only the missing head.
+Only these two cases were regenerated using `scripts/afd_parity.py refresh-e2e`
+and `refresh-layouts` with a verified source/binary build snapshot. All other
+AFD cases and tolerances are retained.
+
+Host work adds one existing GEMM query per ordinary context pass; it is not
+multiplied by the layer count and introduces no cache or additional preparation
+pass.
+
+The scheduled-iteration telemetry path (`get_mix_step_ops`, reached through
+`estimate_forward_pass_time_ms` / `estimate_forward_pass_detailed`) also prices
+the shared logits head with one row per scheduled prefill **and** decode
+request. Three prefills of 1024 new tokens and two decodes require five LM-head
+rows, rather than the prior one row or the shared transformer's 3074 rows.
+The decode pass queries only attention, so it must not charge a second head.
+The Rust regression uses synthetic measurements of 1, 5 and 9 ms at those
+row counts, with constant 100 W power, and checks cold and cached results.
+Public-consumer regressions cover MoE, dense Qwen3 and DeepSeek heads, a single
+prefill, cached prefixes, and decode-only agreement with static diagnostics.
+
+This correction also applies to existing dense-family context heads. The
+frozen mixed-step records in the engine-step and compiled-engine suites use
+the separate SDK `mixed_step_latency` composition, not `get_mix_step_ops`;
+their values and tolerances remain unchanged. The correction adds one integer
+sum per logits query with no new queries, allocations, preparation, or retained
+state.
+
 ### B200 SGLang dense-prefix correction in PR #303
 
 Four existing B200 cases change because `deepseek_v32._dense_mlp_groups` now honors `first_k_dense_replace=3` and the checkpoint's packed-linear quantization exclusions. Previously those three dense layers were counted as MoE layers. DeepSeek-V3.2 now has 58 MoE plus three FP8-block dense layers (61 total); both GLM-5 cases have 75 MoE plus three BF16 dense layers (78 total). GLM-5.2 also has 75 MoE plus three dense layers, with its excluded packed gate/up and down projections using BF16 instead of inheriting the global NVFP4 GEMM mode.
