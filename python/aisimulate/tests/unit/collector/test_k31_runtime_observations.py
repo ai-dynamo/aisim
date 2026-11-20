@@ -91,7 +91,14 @@ class _Tensor:
 
 
 def _native_fixture(
-    monkeypatch, *, uniform=False, scheduler_projection=True, attention_block=64, payload_scale=1, mla_width=None
+    monkeypatch,
+    *,
+    uniform=False,
+    scheduler_projection=True,
+    attention_block=64,
+    payload_scale=1,
+    mla_width=None,
+    mla_page_rows=1,
 ):
     adapter = _adapter(monkeypatch)
     scale = attention_block // 64 * payload_scale
@@ -101,7 +108,7 @@ def _native_fixture(
     if mla_width is not None and attention_block > 64:
         # Native sparse kernels flatten complete token rows across block
         # gaps; packed fixtures must satisfy both MLA and indexer alignment.
-        quantum = math.lcm(quantum, mla_width)
+        quantum = math.lcm(quantum, mla_width * mla_page_rows)
     pool_page = (pool_page + quantum - 1) // quantum * quantum
     storage = _Storage(1234, 10 * pool_page)
     layers, groups, placements = {}, [], []
@@ -378,7 +385,7 @@ def test_scheduler_projection_retains_exact_native_geometry_checks(monkeypatch, 
         _physical_views(cache, scheduled, "fp8", context=4096)
 
 
-def _kernel_view_fixture(monkeypatch, *, indexer_width=16, mla_width=None):
+def _kernel_view_fixture(monkeypatch, *, indexer_width=16, mla_width=None, mla_page_rows=1):
     cache, scheduled, _ = _native_fixture(
         monkeypatch,
         uniform=True,
@@ -386,6 +393,7 @@ def _kernel_view_fixture(monkeypatch, *, indexer_width=16, mla_width=None):
         attention_block=128,
         payload_scale=indexer_width,
         mla_width=mla_width,
+        mla_page_rows=mla_page_rows,
     )
     cache["kernel_block_views"] = {}
     stride = cache["tensor_allocations"][0]["block_stride"] // (64 * indexer_width)
@@ -1807,9 +1815,9 @@ def test_import_uses_only_hash_bound_frozen_phase_config(tmp_path, monkeypatch, 
     assert result["status"] == ("complete" if damage is None else "incomplete"), result["diagnostics"]
 
 
-@pytest.mark.parametrize("padding", [0, 4, 656])
+@pytest.mark.parametrize("padding", [0, 4, 656, 64 * 656])
 @pytest.mark.parametrize("block", [64, 128])
-def test_flashmla_direct_pages_require_row_aligned_pool_stride(tmp_path, monkeypatch, padding, block):
+def test_flashmla_direct_pages_require_page_aligned_pool_stride(tmp_path, monkeypatch, padding, block):
     path, launches = _complete_fixture(tmp_path, monkeypatch, separate_attention=True)
     launches["tp2"]["precision"]["attention_backend"] = "flashmla"
     _replace_launch(path, launches)
@@ -1830,9 +1838,10 @@ def test_flashmla_direct_pages_require_row_aligned_pool_stride(tmp_path, monkeyp
         record["attention_backend"][0] = "FLASHMLA_SPARSE"
         record["attention_groups"][0]["backend"] = "FLASHMLA_SPARSE"
         # Keep all pool intervals and storage coverage valid. Only the slot's
-        # divisibility by FlashMLA's 656-byte rows varies.
+        # divisibility by FlashMLA's 64-row pages varies.
         old = cache["tensor_allocations"][0]["block_stride"]
-        new = ((max(old, 2 * mla["spec_page_size_bytes"]) + 655) // 656) * 656 + padding
+        page_bytes = 64 * 656
+        new = ((max(old, 2 * mla["spec_page_size_bytes"]) + page_bytes - 1) // page_bytes) * page_bytes + padding
         delta = new - old
         count = cache["num_blocks"]
         cache["allocated_cache_bytes"] += count * delta
@@ -1856,10 +1865,69 @@ def test_flashmla_direct_pages_require_row_aligned_pool_stride(tmp_path, monkeyp
 
     _mutate(path, flashmla)
     result = validate_observations(path, launches)["tp2"]
-    valid = block == 64 or padding % 656 == 0
+    valid = block == 64 or padding % (64 * 656) == 0
     assert result["status"] == ("complete" if valid else "incomplete"), result["diagnostics"]
     if not valid:
         assert "sparse MLA block stride must contain whole cache rows" in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize(
+    "kda,dsa,mla,indexer,valid",
+    [
+        ([1, 2], [3, 4], [3, 4], [3, 4], True),
+        ([], [1, 2, 3, 4], [1, 2, 3, 4], [1, 2, 3, 4], True),
+        ([1, 2], [3], [3, 4], [3], False),
+        ([1, 2], [3], [3], [3], False),
+        ([1, 2], [3, 4], [2, 3], [3, 4], False),
+    ],
+)
+def test_cache_inventory_attests_only_checkpoint_sparse_mla_layers(kda, dsa, mla, indexer, valid):
+    config = {
+        "num_hidden_layers": 4,
+        "linear_attn_config": {"kda_layers": kda, "use_full_rank_gate": True},
+        "dsa_config": {"dsa_layers": dsa},
+    }
+    classes = {
+        "kda": (runtime_k31.KDA, kda),
+        "mla": ("vllm.model_executor.layers.attention.mla_attention.MLAAttention", mla),
+        "indexer": ("vllm.models.kimi_k3.common.dsa_cache.KimiK3IndexerCache", indexer),
+    }
+    layer_classes = {
+        f"model.layers.{index - 1}.{stem}": cls for stem, (cls, indices) in classes.items() for index in indices
+    }
+    cache = {"groups": [{"layer_names": list(layer_classes), "layer_classes": layer_classes}]}
+    if valid:
+        runtime_k31._validate_cache_inventory(cache, config)
+    else:
+        with pytest.raises(ValueError, match="cache layers differ from the checkpoint decoder inventory"):
+            runtime_k31._validate_cache_inventory(cache, config)
+
+
+def test_import_rejects_dense_mla_mislabeled_as_sparse(tmp_path, monkeypatch):
+    path, launches = _complete_fixture(tmp_path, monkeypatch, separate_attention=True)
+    model = Path(launches["tp2"]["model_config"]["path"])
+    config = json.loads(model.read_text())
+    config["text_config"]["dsa_config"]["dsa_layers"] = [3]
+    model.write_text(json.dumps(config))
+    launches["tp2"]["model_config"]["sha256"] = hashlib.sha256(model.read_bytes()).hexdigest()
+    _replace_launch(path, launches)
+
+    def remove_dense_layer_indexer(record):
+        record["model_config_sha256"] = launches["tp2"]["model_config"]["sha256"]
+        cache = record["cache"]
+        indexer = cache["groups"][1]
+        removed = indexer["layer_names"].pop()
+        for field in ("layer_classes", "layer_specs"):
+            indexer.get(field, {}).pop(removed, None)
+        if record["kind"] == "worker":
+            cache["layer_components"].pop(removed)
+            cache["tensor_allocations"][1]["layers"].remove(removed)
+            record["attention_groups"][1]["layer_names"].remove(removed)
+
+    _mutate(path, remove_dense_layer_indexer)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete" and result["resources"] is None
+    assert "cache layers differ from the checkpoint decoder inventory" in str(result["diagnostics"])
 
 
 @pytest.mark.parametrize("sm,gpu", [(90, "h100_sxm"), (100, "b200_sxm"), (103, "gb300")])

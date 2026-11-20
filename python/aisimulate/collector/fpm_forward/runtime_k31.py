@@ -342,8 +342,10 @@ def _validate_cache_inventory(cache, model_config):
     if (
         observed[KDA] != kda
         or observed[indexer_class] != indexer
-        or len(observed[mla_class]) != count - len(kda)
-        or observed[mla_class].intersection(kda)
+        or observed[mla_class] != indexer
+        # The pinned decoder uses dense MultiHeadLatentAttention outside
+        # KDA/DSA; the sparse adapter cannot attest those layers.
+        or len(kda) + len(indexer) != count
     ):
         raise ValueError("K3.1 cache layers differ from the checkpoint decoder inventory")
 
@@ -696,11 +698,16 @@ def validate_views(cache, precision, count, page, *, context=None, sequences=Non
                         group.get("cache_dtype_str") == "fp8"
                         or (group.get("cache_dtype_str") == "fp8_ds_mla" and component_block > 64)
                     )
-                    and strides[0] % shape[2]
+                    and strides[0] % (shape[2] * (64 if group.get("cache_dtype_str") == "fp8_ds_mla" else 1))
                 ):
                     # Pinned sparse_utils.flat_kv_row_view addresses complete
                     # latent/RoPE rows, including gaps between native blocks.
-                    raise ValueError("K3.1 sparse MLA block stride must contain whole cache rows")
+                    # flashmla_sparse._fp8_kv_pages reshapes the
+                    # subdivided path into 64-row pages; gaps must align too.
+                    raise ValueError(
+                        "K3.1 sparse MLA block stride must contain whole cache rows "
+                        "(64-row pages for subdivided FlashMLA)"
+                    )
                 span = size
                 for stride, dimension in sorted(zip(strides[1:], shape[1:], strict=True)):
                     if dimension > 1:

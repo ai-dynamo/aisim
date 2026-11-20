@@ -80,7 +80,10 @@ def inputs(tmp_path, monkeypatch, request):
         cache, scheduled = [
             _decoder_cache_names(value)
             for value in _kernel_view_fixture(
-                monkeypatch, indexer_width=132, mla_width=656 if attention_backend == "flashmla" else 576
+                monkeypatch,
+                indexer_width=132,
+                mla_width=656 if attention_backend == "flashmla" else 576,
+                mla_page_rows=64 if attention_backend == "flashmla" else 1,
             )
         ]
         for mapping in cache["kernel_block_views"].values():

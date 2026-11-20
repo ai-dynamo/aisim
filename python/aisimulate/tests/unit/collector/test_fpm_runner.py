@@ -569,8 +569,11 @@ def test_prepare_attempt_clears_results_and_writes_runtime_provenance(tmp_path):
     )
 
     assert calls[0][1][:2] == ["find", "/results"]
-    assert calls[1][1][:2] == ["python3", "-c"]
-    payload = json.loads(calls[1][1][3])
+    assert calls[1][1][:2] == ["bash", "-c"]
+    assert "source /tmp/fpm-bench/collector-runtime-env.sh" in calls[1][1][2]
+    command = calls[1][1][4:]
+    assert command[:2] == ["python3", "-c"]
+    payload = json.loads(command[3])
     assert payload == {
         "schema_name": "aic_fpm_collector_provenance",
         "schema_version": 1,
@@ -578,7 +581,76 @@ def test_prepare_attempt_clears_results_and_writes_runtime_provenance(tmp_path):
         "plan_sha256": "plan-sha",
         "attempt_id": "attempt-1",
     }
-    assert calls[1][1][4] == "collector-provenance.json"
+    assert command[4] == "collector-provenance.json"
+
+
+@pytest.mark.parametrize("overlay", [False, True])
+def test_kubernetes_detection_and_preparation_use_same_runtime_environment(tmp_path, monkeypatch, overlay):
+    from aisimulate.support import versioning
+    from aisimulate.support.schema import FPMDeployment
+
+    image_site, overlay_site = tmp_path / "image-site", tmp_path / "overlay site"
+    for site, version in ((image_site, "0.28.0+image"), (overlay_site, "0.28.0+overlay")):
+        metadata = site / f"vllm-{version}.dist-info" / "METADATA"
+        metadata.parent.mkdir(parents=True)
+        metadata.write_text(f"Name: vllm\nVersion: {version}\n")
+    deployment = FPMDeployment(
+        image="synthetic:image",
+        extra_env=[{"name": "PYTHONPATH", "value": str(overlay_site)}] if overlay else None,
+    )
+    image_env = {**os.environ, "PYTHONPATH": str(image_site)}
+    probe_output = ""
+
+    def probe_transport(command, *, payload=None, sensitive_values=()):
+        nonlocal probe_output
+        if payload is not None:
+            container = json.loads(payload)["spec"]["containers"][0]
+            env = {**image_env, **{item["name"]: item["value"] for item in container.get("env", [])}}
+            probe_output = subprocess.run(
+                container["command"], env=env, capture_output=True, text=True, check=True
+            ).stdout
+        if "logs" in command:
+            return probe_output
+        if "get" in command:
+            return json.dumps({"status": {"containerStatuses": [{"state": {"terminated": {"exitCode": 0}}}]}})
+        return ""
+
+    monkeypatch.setattr(versioning, "_run", probe_transport)
+    detected = versioning.detect_runtime_versions(deployment)
+    expected = "0.28.0+overlay" if overlay else "0.28.0+image"
+    assert detected["backend_version"] == expected
+
+    cell_dir, results = tmp_path / "cell", tmp_path / "results"
+    cell_dir.mkdir()
+    results.mkdir()
+    cell = _cell()
+    _render_cell(
+        _plan(cell),
+        cell,
+        cell_dir,
+        {"K8sConfig": {"k8s_image": deployment.image, "extra_env": deployment.extra_env or []}},
+    )
+    workload = fpm_runner._workload_document(fpm_runner._manifest_documents(cell_dir / "k8s_deploy.yaml"))
+    assert workload["kind"] == "Pod"
+    assert "env" not in workload["spec"]["containers"][0]
+
+    monkeypatch.setattr(fpm_runner, "REMOTE_WORKDIR", str(cell_dir))
+    monkeypatch.setattr(fpm_runner, "FPM_RESULTS_DIR", str(results))
+    runner = _runner(cell_dir)
+
+    def exec_transport(_pod, command, *, timeout):
+        return subprocess.run(command, env=image_env, capture_output=True, text=True, check=True, timeout=timeout)
+
+    runner._exec_checked = exec_transport
+    runner.prepare_attempt(
+        ["pod-0"],
+        cell_id=cell.cell_id,
+        plan_sha256="plan-sha",
+        attempt_id="attempt-1",
+        runtime_backend_version=detected["backend_version"],
+    )
+    provenance = json.loads((results / "collector-provenance.json").read_text())
+    assert provenance["runtime"]["backend_version"] == expected
 
 
 def test_passed_checkpoint_requires_attempt_identity():

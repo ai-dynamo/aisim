@@ -756,6 +756,16 @@ class KubernetesCellRunner:
             expected_backend_version=expected_backend_version,
             runtime_backend_version=runtime_backend_version,
         )
+        # The keepalive Pod has no engine environment. Apply the staged
+        # startup inputs before Python observes metadata, as fpm_exec.sh does.
+        runtime_env = shlex.quote(f"{REMOTE_WORKDIR}/{RUNTIME_ENV_FILENAME}")
+        command = [
+            "bash",
+            "-c",
+            f'set -e; if [[ -f {runtime_env} ]]; then source {runtime_env}; fi; exec "$@"',
+            "fpm-attempt-provenance",
+            *command,
+        ]
         for pod in pods:
             self._exec_checked(
                 pod,
