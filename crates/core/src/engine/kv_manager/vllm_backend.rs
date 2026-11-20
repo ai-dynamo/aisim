@@ -711,7 +711,11 @@ impl VllmKvManager {
             // asks for num_gpu_blocks + 1, so the request waits.
             return AllocationRequirement::Blocks(self.pool.capacity() + 1);
         }
-        let checkpoint_blocks = self.admission_checkpoint_blocks(cost.cached_tokens, known_tokens);
+        let checkpoint_blocks = self.admission_checkpoint_blocks(
+            cost.cached_tokens,
+            known_tokens,
+            prefill_token_budget,
+        );
         if let Some(state) = &self.state_cache {
             // Align mode rotates working allocations across physical blocks.
             // The previous state remains an input until the next pass, so a
@@ -773,10 +777,14 @@ impl VllmKvManager {
         )
     }
 
-    /// vLLM's full-ISL admission counts the checkpoint block of the prefill
-    /// that resumes at the hit (vLLM 43b4aaea MambaManager's
-    /// `get_num_blocks_to_allocate` with `apply_admission_cap`).
-    fn admission_checkpoint_blocks(&self, cached_tokens: usize, known_tokens: usize) -> usize {
+    /// Count an internal checkpoint only when the final budgeted prefill
+    /// chunk can export it. Earlier chunks stop short of prefill_end.
+    fn admission_checkpoint_blocks(
+        &self,
+        cached_tokens: usize,
+        known_tokens: usize,
+        prefill_token_budget: usize,
+    ) -> usize {
         let Some(manager) = &self.state_cache else {
             return 0;
         };
@@ -786,9 +794,24 @@ impl VllmKvManager {
         else {
             return 0;
         };
-        // The gate's query runs to the full sequence, which reaches prefill_end.
+        // Checkpoint mode requires unit == block_size, so hits and non-final
+        // chunks end on full blocks. A budget below one block cannot span the
+        // two state columns required to export an internal checkpoint.
+        let chunk_tokens = prefill_token_budget / block_size * block_size;
+        if chunk_tokens == 0 {
+            return 0;
+        }
+        // Skip directly to the first chunk that can reach the prompt end.
+        // Its full budget can include a partial final block, unlike the
+        // block-floored non-final chunks. This stays constant-time even for
+        // long prompts with small budgets.
+        let chunks_before_final = known_tokens
+            .saturating_sub(cached_tokens)
+            .saturating_sub(prefill_token_budget)
+            .div_ceil(chunk_tokens);
+        let query_start = cached_tokens + chunks_before_final * chunk_tokens;
         mamba_prefill_checkpoint(
-            cached_tokens,
+            query_start,
             known_tokens,
             known_tokens,
             known_tokens,

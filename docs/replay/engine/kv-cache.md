@@ -755,6 +755,10 @@ previous and new working state when prefill stops at a retained boundary or
 the scheduler's token budget splits it across physical blocks, as well as
 any speculative scratch states and internal prefill checkpoint. A checkpoint
 replaces the second working state only when the cold prefill fits in one pass.
+The internal checkpoint is charged only if the final budgeted prefill chunk
+exports one. For a 193-token prompt with 64-token blocks and two-block states,
+a 64-token budget exports no internal checkpoint and fits in eight blocks;
+a 128-token budget needs ten blocks, while a one-pass prefill needs eight.
 For
 example, a 65-token prompt with 64-token blocks, 16 KV bytes per token and a
 1,500-byte state needs two token blocks and two two-block states: six blocks.

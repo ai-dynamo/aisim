@@ -251,9 +251,17 @@ fn cold_budget_split_within_one_state_slot_does_not_rotate() {
 #[test]
 fn cold_prefill_checkpoint_only_replaces_rotation_in_one_pass() {
     // 193 tokens occupy four blocks. A one-pass prefill uses a two-block
-    // working state and checkpoint (8 total); a split also holds the previous
-    // working state while allocating the checkpoint (10 total).
-    for (budget, capacity, admitted) in [(128, 8, false), (1024, 8, true), (128, 10, true)] {
+    // working state and checkpoint (8 total). A 128-token budget also holds
+    // the previous working state while exporting the checkpoint (10 total).
+    // A 64-token budget exports no internal checkpoint, so two working states
+    // suffice (8 total), with chunks ending at 64, 128, 192 and 193.
+    for (budget, capacity, admitted) in [
+        (64, 8, true),
+        (128, 8, false),
+        (1024, 8, true),
+        (128, 10, true),
+        (192, 8, true),
+    ] {
         let mut config = args(true, false);
         config.block_size = 64;
         config.prefix_match_unit = Some(64);
@@ -265,8 +273,16 @@ fn cold_prefill_checkpoint_only_replaces_rotation_in_one_pass() {
         let first = step(&mut core);
         if admitted {
             assert_eq!(first.admissions.len(), 1);
-            if budget == 128 {
-                assert_eq!(core.state.requests[&id].num_computed_tokens, 128);
+            if budget < 193 {
+                assert_eq!(core.state.requests[&id].num_computed_tokens, budget);
+                if budget == 64 {
+                    for (expected_end, active_blocks) in [(128, 6), (192, 7)] {
+                        let pass = step(&mut core);
+                        assert!(pass.output_signals.is_empty());
+                        assert_eq!(core.state.requests[&id].num_computed_tokens, expected_end);
+                        assert_eq!(core.kv_manager.num_active_blocks(), active_blocks);
+                    }
+                }
                 let last = step(&mut core);
                 assert!(
                     last.output_signals.iter().any(|signal| {
