@@ -1571,6 +1571,70 @@ def test_retrying_an_applied_plan_keeps_the_earlier_ledger_on_failure(tmp_path, 
     assert (target / directory / "manifest.json").is_file()
 
 
+def _two_step_promotion(tmp_path):
+    """A target already holding one configuration, and an approved plan that adds a second to its catalog."""
+    root, manifests = _mirror(tmp_path, dev=("synthetic/model-a", "synthetic/model-b"))
+    directories = [str(Path(m).parent) for m in manifests]
+    _public(root, *directories)
+    plans = []
+    for directory in directories:
+        draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+        plans.append(plan_promotion(root, _request(root, [directory], draft), _reviewers()))
+    target = _target(tmp_path)
+    apply_promotion(plans[0], root, target)
+    snapshot = {p.relative_to(target): p.read_bytes() for p in target.rglob("*") if p.is_file()}
+    return root, directories, plans[1], target, snapshot
+
+
+def test_rollback_restores_only_changed_catalog_files_when_dataset_json_is_read_only(tmp_path, monkeypatch):
+    root, directories, plan, target, before = _two_step_promotion(tmp_path)
+    dataset = target / "catalog/dataset.json"
+    dataset.chmod(0o444)  # readable, so planning works; the category index is rewritten, then this write fails
+    restored = []
+    real = Path.write_bytes
+
+    def record(path, data):
+        restored.append(path)
+        return real(path, data)
+
+    monkeypatch.setattr(Path, "write_bytes", record)
+    try:
+        with pytest.raises(PermissionError):
+            apply_promotion(plan, root, target)
+    finally:
+        dataset.chmod(0o644)
+    assert target / "catalog/e2e.json" in restored and dataset not in restored  # the untouched file is left alone
+    assert not (target / directories[1]).exists()  # the copied payload is gone
+    assert before == {p.relative_to(target): p.read_bytes() for p in target.rglob("*") if p.is_file()}
+
+
+def test_rollback_attempts_every_restore_and_names_those_it_could_not_do(tmp_path, monkeypatch):
+    root, directories, plan, target, before = _two_step_promotion(tmp_path)
+    index = target / "catalog/e2e.json"
+    dataset = target / "catalog/dataset.json"
+    real = Path.write_bytes
+
+    def refuse(path, data):
+        if path == index:
+            raise PermissionError("index is not writable")
+        return real(path, data)
+
+    real_write_text = Path.write_text
+
+    def fail_dataset(path, *args, **kwargs):  # the registration that precedes the rollback
+        if path == dataset:
+            raise OSError("cannot write the dataset index")
+        return real_write_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_dataset)
+    monkeypatch.setattr(Path, "write_bytes", refuse)
+    with pytest.raises(PromotionError, match="could not restore: catalog/e2e.json") as raised:
+        apply_promotion(plan, root, target)
+    assert isinstance(raised.value.__cause__, OSError)  # the original failure stays attached
+    monkeypatch.undo()
+    assert not (target / directories[1]).exists()  # the other cleanup still ran
+
+
 def test_failed_copy_and_failed_ledger_restore_the_target(tmp_path, monkeypatch):
     root, directory, plan = _approved(tmp_path)
     target = _target(tmp_path)
