@@ -2935,6 +2935,43 @@ def test_a_source_definition_edited_in_place_gets_its_own_staging(root, profile,
     assert Path(again.config["systems_paths"][0]) == staged_second
 
 
+def test_a_corrected_pair_under_new_file_names_gets_its_own_staging(root, profile, tmp_path):
+    from aisim_core.data.ensure import DataPin, ensure_data
+
+    make_entry(root, profile, resources=RESOURCES)
+    _write_entry_catalog(root)
+    pin = DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache")
+    first = ensure_data(user_config(profile), pin)
+    # Publish a corrected pair beside the old files and re-point the manifest and index; the ID does not change.
+    parquet, sidecar = _stage_args(root)
+    rows = pq.read_table(parquet).to_pylist()
+    for row in rows:
+        if row["workload_kind"] == "decode":
+            row["latency_ms"] = 7.0
+    corrected = parquet.with_name("fpm_forward_perf_v2.parquet")
+    pq.write_table(pa.Table.from_pylist(rows), corrected)
+    metadata = json.loads(sidecar.read_text())
+    metadata["parquet_sha256"] = _sha(corrected.read_bytes())
+    sidecar.with_name("fpm_forward_perf_v2.metadata.json").write_text(json.dumps(metadata))
+    document = json.loads((root / MANIFEST).read_text())
+    for artifact in document["artifacts"][:2]:
+        artifact["path"] = artifact["path"].replace("fpm_forward_perf.", "fpm_forward_perf_v2.")
+    (root / MANIFEST).write_text(json.dumps(document))
+    _refresh_prediction_manifest(root)
+    _write_entry_catalog(root)
+    second = ensure_data(user_config(profile), pin)
+    assert Path(first.config["systems_paths"][0]) != Path(second.config["systems_paths"][0])
+    query = [{"scheduled_requests": {"num_decode_requests": 1, "sum_decode_kv_tokens": 1}}]
+    model_a = RustForwardPassPerfModel.best_available(first.config)
+    model_b = RustForwardPassPerfModel.best_available(second.config)
+    try:
+        assert model_a.estimate_forward_pass_time_ms(query) == pytest.approx(3.0)  # still the pair it was built from
+        assert model_b.estimate_forward_pass_time_ms(query) == pytest.approx(7.0)
+    finally:
+        model_a.close()
+        model_b.close()
+
+
 def test_the_key_and_the_staging_read_the_same_active_roots(root, profile, tmp_path, monkeypatch):
     from aisim_core.data.ensure import DataPin, ensure_data
     from aisim_core.sdk import perf_database

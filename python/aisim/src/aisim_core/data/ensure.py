@@ -72,7 +72,7 @@ from aisim_core.data.fetch import (
     fetch_support,
     resolve_revision,
 )
-from aisim_core.data.fpm_library import STAGED_MARKER, _stageable_roots, staged_inputs_digest
+from aisim_core.data.fpm_library import PREDICTION_ROLES, STAGED_MARKER, _stageable_roots, staged_inputs_digest
 from aisim_core.data.loaders import LOADERS, FpmData, LoaderError
 from aisim_core.data.op_schema import DATA_PREFIX, QUERY_VERSIONS_NAME
 from aisim_core.data.op_tree import (
@@ -721,7 +721,14 @@ def _load(
             )
             # The key covers the ordered roots and the contents the staging copies, so a definition edited in place
             # gets its own directory rather than replacing the one an earlier configuration still points at.
-            inputs = {"roots": roots, "copied": staged_inputs_digest(entry.identity.hardware, roots)}
+            # It also covers the verified library pair, so a corrected pair published under the same configuration ID
+            # (even under new file names) is staged beside the earlier one rather than over it.
+            pair = sorted((a.role, a.path, a.sha256, a.bytes) for a in peek.artifacts if a.role in PREDICTION_ROLES)
+            inputs = {
+                "roots": roots,
+                "copied": staged_inputs_digest(entry.identity.hardware, roots),
+                "pair": pair,
+            }
             roots_key = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
             output_dir = output_dir.with_name(f"{output_dir.name}-{roots_key}")
             output_dir.parent.mkdir(parents=True, exist_ok=True)
