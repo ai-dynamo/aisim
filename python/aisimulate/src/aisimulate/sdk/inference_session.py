@@ -1132,13 +1132,16 @@ class AFDInferenceSession:
         preserves that order 1:1) and evaluates them through the thin op-list
         FFI with ``_sum_latency``'s exact query shape: uniform ``x`` (no
         logits-GEMM exception) and the runtime ``prefix`` threaded into BOTH
-        phases. Falls back (returns ``None``) for ops outside the model lists
-        and for op graphs the spec cannot express.
+        phases. Native leaves extracted from composites are evaluated through
+        the ad-hoc op-list FFI on the same cached engine. Falls back (returns
+        ``None``) for op graphs the spec cannot express.
         """
+        from aisimulate.sdk.engine import OpConversionError, build_ops_json
         from aisimulate.sdk.rust_engine_step import (
             RustEngineUnsupportedError,
             evaluate_context_ops_with_rust,
             evaluate_generation_ops_with_rust,
+            evaluate_ops_json_with_rust,
             note_python_step_fallback,
             should_use_rust_engine_step,
         )
@@ -1163,14 +1166,30 @@ class AFDInferenceSession:
         try:
             indices = [index_by_id[id(op)] for op in ops]
         except KeyError:
-            # An op outside the compiled phase list (the synthetic comm ops
-            # never come through here, so this is unexpected) — let the
-            # Python loop own it.
-            return None
+            # Composite getters reconstruct native leaf wrappers that have no
+            # top-level index or Python _engine_query shim. Serialize the
+            # requested leaves rather than evaluating the enclosing group.
+            indices = None
 
         prefix = int(runtime_config.prefix or 0)
         try:
-            if is_context:
+            if indices is None:
+                entries = evaluate_ops_json_with_rust(
+                    model,
+                    self._database,
+                    ops_json=build_ops_json(ops),
+                    is_context=is_context,
+                    batch_size=batch_size,
+                    s=seq_len,
+                    prefix=prefix,
+                    imbalance_correction_scale=(
+                        runtime_config.seq_imbalance_correction_scale
+                        if is_context
+                        else runtime_config.gen_seq_imbalance_correction_scale
+                    ),
+                    x=x,
+                )
+            elif is_context:
                 entries = evaluate_context_ops_with_rust(
                     model,
                     self._database,
@@ -1192,7 +1211,7 @@ class AFDInferenceSession:
                     prefix=prefix,
                     x=x,
                 )
-        except RustEngineUnsupportedError as exc:
+        except (OpConversionError, RustEngineUnsupportedError) as exc:
             note_python_step_fallback("unsupported_op_graph:afd", str(exc))
             return None
 

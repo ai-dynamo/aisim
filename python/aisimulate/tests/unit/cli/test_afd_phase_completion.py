@@ -603,6 +603,52 @@ def test_afd_measures_local_router_once_outside_decode_integration(monkeypatch, 
     assert metrics["t_a_router_layer"] == pytest.approx(local_batch / 1000)
 
 
+@pytest.mark.parametrize("is_context", [False, True])
+def test_afd_nested_router_query_preserves_native_shape(monkeypatch, is_context):
+    from aisimulate.sdk import common, operations, rust_engine_step
+    from aisimulate.sdk.engine import build_ops_json
+
+    router = operations.GEMM("router_gemm", 4, 128, 4096, common.GEMMQuantMode.bfloat16)
+    overlap = operations.OverlapOp("moe_overlap", group_a=[], group_b=[router, router])
+    model = SimpleNamespace(context_ops=[overlap], generation_ops=[overlap])
+    leaves = list(AFDInferenceSession._router_ops([overlap]))
+    assert all(not hasattr(op, "_engine_query") for op in leaves)
+    captured = {}
+
+    def evaluate_ops(model_arg, database, **kwargs):
+        assert model_arg is model
+        captured.update(kwargs)
+        # Synthetic FFI output tests name folding, not an estimation oracle.
+        return [("router_gemm", 0.25, 0.0, "sol"), ("router_gemm", 0.5, 0.0, "sol")]
+
+    monkeypatch.setattr(rust_engine_step, "should_use_rust_engine_step", lambda *_a: True)
+    monkeypatch.setattr(rust_engine_step, "evaluate_ops_json_with_rust", evaluate_ops)
+    session = object.__new__(AFDInferenceSession)
+    session._database = object()
+    runtime = RuntimeConfig(prefix=7, seq_imbalance_correction_scale=1.25, gen_seq_imbalance_correction_scale=1.5)
+
+    total, per_op = session._sum_latency(
+        leaves,
+        batch_size=65,
+        seq_len=1025,
+        model=model,
+        runtime_config=runtime,
+        is_context=is_context,
+    )
+
+    assert captured == {
+        "ops_json": build_ops_json(leaves),
+        "is_context": is_context,
+        "batch_size": 65,
+        "s": 1025,
+        "prefix": 7,
+        "imbalance_correction_scale": 1.25 if is_context else 1.5,
+        "x": 65 * 1025 if is_context else 65,
+    }
+    assert total == 0.75
+    assert per_op == {"router_gemm": 0.75}
+
+
 def test_afd_summary_concurrency_reflects_total_in_flight_batch(monkeypatch):
     """``concurrency`` in the AFD summary equals the configured total batch.
 

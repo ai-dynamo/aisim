@@ -212,6 +212,52 @@ def test_builtin_provider_recomputes_the_fastafd_router_on_a(tmp_path, monkeypat
     assert measurement.attention_ms < components["attention_compute_ms"] + components["router_ms"]
 
 
+@pytest.mark.parametrize("nextn", [0, 1])
+def test_ordinary_afd_evaluates_nested_native_routers(monkeypatch, nextn):
+    """Shared-expert decode graphs must work without a FastAFD profile."""
+    local_queries = []
+    sum_latency = AFDInferenceSession._sum_latency
+
+    def trace_router_query(self, ops, **kwargs):
+        ops = list(ops)
+        result = sum_latency(self, ops, **kwargs)
+        if ops and all("router" in op._name for op in ops):
+            # Overlap getters reconstruct native leaves without Python shims.
+            assert all(not hasattr(op, "_engine_query") for op in ops)
+            local_queries.append((kwargs["batch_size"], result))
+        return result
+
+    monkeypatch.setattr(AFDInferenceSession, "_sum_latency", trace_router_query)
+    result = cli_estimate(
+        "deepseek-ai/DeepSeek-V3",
+        "b200_sxm",
+        mode="afd",
+        backend_name="vllm",
+        backend_version="current",
+        database_mode="SOL",
+        n_a_nodes=2,
+        n_f_nodes=1,
+        a_batch_size=129,
+        num_microbatches=2,
+        f_moe_ep_size=8,
+        afd_combined_with_pd=False,
+        isl=1024,
+        osl=128,
+        max_seq_len=2048,
+        nextn=nextn,
+        nextn_accepted=0.0 if nextn else None,
+    )
+
+    assert len(local_queries) == 1
+    batch, (total_ms, per_op) = local_queries[0]
+    assert batch == 65 * (nextn + 1)  # ceil(129 / 2), widened for MTP
+    assert set(per_op) == {"generation_router_gemm"}
+    assert all(ms > 0.0 for ms in per_op.values())
+    assert total_ms == pytest.approx(sum(per_op.values()))
+    layer_times = result.raw["afd_layer_measurements"]["decode"]
+    assert layer_times["components"]["a_router_ms"] == pytest.approx(total_ms / layer_times["num_layers"])
+
+
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
