@@ -39,7 +39,7 @@ from scripts.e2e_accuracy.build_e2e_accuracy_overview import (
 from scripts.e2e_accuracy.fetch_accuracy_measurements import MTP_POLICY, RESOLVED_POLICY, digest, validate_manifest
 from scripts.e2e_accuracy.hf_measurements import MTP_POLICY as HF_MTP_POLICY
 from scripts.e2e_accuracy.hf_measurements import POLICY as HF_POLICY
-from scripts.e2e_accuracy.hf_measurements import read_dataset
+from scripts.e2e_accuracy.hf_measurements import check_pinned_dataset, read_dataset
 from scripts.e2e_accuracy.source.cohort import select_points as select_resolved_points
 from scripts.e2e_accuracy.source.recipes.runtime_evidence import prepare_runtime_evidence
 from scripts.pages.build_pages_site import _accuracy_summary
@@ -771,8 +771,7 @@ def campaign(args) -> None:
     if shard_count > 1 and args.output.exists() and any(args.output.iterdir()):
         raise ValueError("shard output directory must be empty")
     dataset = read_dataset(args.tables)
-    if dataset is not None and dataset["snapshot_id"] != manifest.get("snapshot_id", dataset["snapshot_id"]):
-        raise ValueError("measurements do not come from the pinned dataset snapshot")
+    check_pinned_dataset(dataset, manifest)
     metadata = {
         "manifest": manifest,
         "identity": identity,

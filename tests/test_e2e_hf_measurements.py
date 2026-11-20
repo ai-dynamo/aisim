@@ -360,6 +360,39 @@ def _fetch(manifest, tmp_path, files, name="out", **kwargs):
     return hf.fetch(manifest, output, transport, Cache(tmp_path / (name + "-cache")), **kwargs), transport
 
 
+def test_a_fetched_sidecar_matches_its_manifest_even_without_a_pinned_snapshot(producer, manifest, record, tmp_path):
+    output, _ = _fetch(manifest, tmp_path, _legacy_files(record))
+    dataset = hf.read_dataset(output)
+    assert "snapshot_id" not in manifest  # the committed format omits it
+    hf.check_pinned_dataset(dataset, manifest)  # a normal fetch-produced pair matches
+    hf.check_pinned_dataset(None, manifest)  # no sidecar: older inputs stay supported
+    hf.check_pinned_dataset(dataset, manifest | dict(snapshot_id=dataset["snapshot_id"]))
+
+
+@pytest.mark.parametrize(
+    "field,other",
+    [
+        ("revision", "b" * 40),  # a cached pair from revision B under a revision-A manifest
+        ("repo_id", "someone/else"),
+        ("layout", hf.UNIFIED_LAYOUT),
+    ],
+)
+def test_a_cached_sidecar_from_another_dataset_is_rejected_without_a_snapshot_id(manifest, field, other):
+    sidecar = dict(repo_id=hf.REPO_ID, revision="a" * 40, snapshot_id="test", layout=hf.LEGACY_LAYOUT)
+    hf.check_pinned_dataset(sidecar, manifest)
+    with pytest.raises(ValueError, match="repository, revision and layout"):
+        hf.check_pinned_dataset(sidecar | {field: other}, manifest)
+
+
+def test_an_omitted_layout_means_legacy_on_both_sides(manifest):
+    sidecar = dict(repo_id=hf.REPO_ID, revision="a" * 40, snapshot_id="test")  # written before layouts existed
+    hf.check_pinned_dataset(sidecar, manifest)
+    with pytest.raises(ValueError, match="repository, revision and layout"):
+        hf.check_pinned_dataset(sidecar, manifest | dict(layout=hf.UNIFIED_LAYOUT))
+    with pytest.raises(ValueError, match="pinned dataset snapshot"):
+        hf.check_pinned_dataset(sidecar, manifest | dict(snapshot_id="other"))
+
+
 def test_fetch_only_verified_observations_at_exact_commit(producer, manifest, record, tmp_path):
     files = _legacy_files(record)
     output, transport = _fetch(manifest, tmp_path, files)
