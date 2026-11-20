@@ -19,7 +19,7 @@ use crate::engine::{
 use crate::memo::{Memo, OnThread};
 use crate::perfmodel::afd::model::{AfdForwardPassPerfModel, AfdTimingConfig};
 use crate::perfmodel::engine::runtime::{
-    IterationDispatch, MixedPass, PerOpSlotValue, RankDetail, RankPricing,
+    FpmRankTerms, IterationDispatch, MixedPass, PerOpSlotValue, RankDetail, RankPricing,
 };
 use crate::perfmodel::engine::{Engine as PerfEngine, RuntimeConfig};
 use crate::replay::{
@@ -1598,11 +1598,12 @@ impl AicTimingModel {
     }
 
     /// Price one iteration with the canonical model: the plain estimate of
-    /// whole-model FPM, its detailed estimate while diagnostics are captured,
-    /// and for operation graphs the estimate with each rank's operations,
-    /// which are the power evidence, as values or, while diagnostics are
-    /// captured, diagnostics. Corrections are the model's own: the heaviest
-    /// rank's workload correction applied to the rank maximum.
+    /// whole-model FPM, with each rank's phase terms when its table carries
+    /// power, its detailed estimate while diagnostics are captured, and for
+    /// operation graphs the estimate with each rank's operations, which are
+    /// the power evidence, as values or, while diagnostics are captured,
+    /// diagnostics. Corrections are the model's own: the heaviest rank's
+    /// workload correction applied to the rank maximum.
     fn price_iteration(
         &self,
         pricing: &IterationPricing,
@@ -1629,14 +1630,21 @@ impl AicTimingModel {
         } else {
             RankDetail::Values
         };
-        if !whole_model
+        // Whole-model diagnostics are the detailed estimate's direct lookups.
+        if !(whole_model && capture)
             && let Some(iteration) = model
                 .estimate_native_iteration(&metrics, detail)
                 .context("AIC iteration prediction failed")?
         {
+            let evidence = if whole_model {
+                let ranks = iteration.ranks.iter().map(|rank| rank.fpm_terms);
+                fpm_terms_evidence(iteration.correction_factor, ranks)?
+            } else {
+                self.native_rank_evidence(pricing, &iteration, queries, capture)?
+            };
             return Ok(PricedIteration {
                 total_ms: iteration.latency_ms,
-                evidence: self.native_rank_evidence(pricing, &iteration, queries, capture)?,
+                evidence,
                 estimate: None,
             });
         }
@@ -2020,10 +2028,19 @@ fn rank_estimate(
     }
 }
 
-/// Fold active rank evidence once when pricing, so a cached iteration
-/// records at most two components regardless of its attention-DP width.
+/// [`fpm_terms_evidence`] of a detailed whole-model FPM estimate.
 fn fpm_rank_evidence(
     estimate: &crate::ForwardPassEstimate,
+) -> Result<Vec<(Arc<ValidatedTimingPhase>, bool)>> {
+    let ranks = estimate.ranks.iter().map(crate::FpmRankEstimate::terms);
+    fpm_terms_evidence(estimate.correction_factor.unwrap_or(1.0), ranks)
+}
+
+/// Fold active rank evidence once when pricing, so a cached iteration
+/// records at most two components regardless of its attention-DP width.
+fn fpm_terms_evidence(
+    correction: f64,
+    ranks: impl IntoIterator<Item = FpmRankTerms>,
 ) -> Result<Vec<(Arc<ValidatedTimingPhase>, bool)>> {
     #[derive(Default)]
     struct Totals {
@@ -2032,16 +2049,8 @@ fn fpm_rank_evidence(
         energy_wms: f64,
     }
 
-    let correction = estimate.correction_factor.unwrap_or(1.0);
     let mut phases = [Totals::default(), Totals::default()];
-    for rank in &estimate.ranks {
-        let components = [
-            (rank.prefill_ms, rank.prefill_energy_wms),
-            (
-                rank.marginal_decode_ms.or(rank.decode_ms),
-                rank.decode_energy_wms,
-            ),
-        ];
+    for components in ranks {
         for (phase, (latency, energy)) in phases.iter_mut().zip(components) {
             if let Some(latency_ms) = latency.filter(|&ms| ms > 0.0) {
                 let latency_ms = latency_ms * correction;
