@@ -311,7 +311,8 @@ def ensure_data(
         if "op-latency" in pin.categories:
             _resolve_backend_version(out, pin, transport)
         owner = _configuration_owner(pin, transport)
-        for category in pin.categories:
+        # Operation data first: an FPM library staged after it must take operation tables from the pinned root alone.
+        for category in sorted(pin.categories, key=lambda name: name != "op-latency"):
             # A configuration ID names one entry of one category: it constrains only that category.
             category_pin = pin if owner in (None, category) else replace(pin, configuration_id=None)
             _ensure_category(out, category, category_pin, transport)
@@ -347,7 +348,7 @@ def _compose_pinned_roots(out: EnsuredData) -> None:
                 f"fpm entry {fpm} and op-latency entries {op} provide different content for the same operation "
                 f"table(s) {clashes[:3]}; pin one of them (AISIM_DATA_CATEGORIES) or republish the bundle"
             )
-    out.config["systems_paths"] = [*map(str, fpm_roots), str(op_root)]
+    out.config["systems_paths"] = list(dict.fromkeys([*map(str, fpm_roots), str(op_root)]))
 
 
 def _configuration_owner(pin: DataPin, transport: Transport | None) -> str | None:
@@ -544,7 +545,9 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
     cache = Cache(pin.cache_dir)
     output_dir = cache.root / "materialized" / source_key / entry.configuration_id
     try:
-        loaded = _load(loader, category, root, entry, out.config, output_dir)
+        loaded = _load(
+            loader, category, root, entry, out.config, output_dir, isolate_roots="op-latency" in out.datasets
+        )
     except (LoaderError, ValueError) as exc:
         raise MissingDataError(
             f"{category} data {entry.configuration_id} in {where} failed verification: {exc}",
@@ -656,7 +659,40 @@ def _drop_generated_library_path(config: Mapping[str, Any], materialized: Path) 
     return out
 
 
-def _load(loader, category: str, root: Path, entry: Entry, config: Mapping[str, Any], output_dir: Path):
+_GENERATED_ROOT_NAME = re.compile(r".+-[0-9a-f]{64}")
+
+
+def _is_generated_root(path: str | Path, materialized: Path) -> bool:
+    """True for a staged library root that an earlier ensure call wrote under ``materialized``, for any pin."""
+    resolved = Path(path).expanduser().resolve()
+    return (
+        resolved.parent.parent == materialized.resolve() and _GENERATED_ROOT_NAME.fullmatch(resolved.name) is not None
+    )
+
+
+def _drop_generated_roots(config: Mapping[str, Any], materialized: Path) -> Mapping[str, Any]:
+    """``config`` without the staged roots of earlier ensure calls in ``systems_paths``.
+
+    A returned configuration lists its own staging root. Keeping it as an explicit root when the configuration is
+    repinned would let that stale copy of the system definition and linked data shadow the roots a fresh load uses.
+    """
+    paths = config.get("systems_paths")
+    if not paths:
+        return config
+    kept = [p for p in paths if not _is_generated_root(p, materialized)]
+    return config if len(kept) == len(paths) else {**config, "systems_paths": kept}
+
+
+def _load(
+    loader,
+    category: str,
+    root: Path,
+    entry: Entry,
+    config: Mapping[str, Any],
+    output_dir: Path,
+    *,
+    isolate_roots: bool = False,
+):
     manifest_path = entry.manifest.path
     if category == "fpm":
         # The catalog's pinned digest, identity and purpose first (a partly refreshed local dataset must be refused);
@@ -666,18 +702,26 @@ def _load(loader, category: str, root: Path, entry: Entry, config: Mapping[str, 
             # Roots change the copied system definition and linked op data. Keep each ordered effective root
             # set in its own materialization so later calls cannot replace an earlier configuration's inputs.
             # A configuration returned by an earlier call lists that call's own staging root; it is derived from
-            # the same inputs, not a different user root, so it must not change this materialization's key.
-            config = _drop_generated_library_path(config, output_dir.parent.parent)
-            owned = f"{output_dir.name}-"
+            # the same inputs, not a different user root, so it must not key this materialization or shadow it.
+            # With an op-latency pin the pinned root is the only source: no active root may fill a missing family.
+            materialized = output_dir.parent.parent
+            config = _drop_generated_roots(_drop_generated_library_path(config, materialized), materialized)
             roots = tuple(
                 str(p)
-                for p in _stageable_roots(config.get("systems_paths"), output_dir)
-                if not (p.parent == output_dir.parent.resolve() and p.name.startswith(owned))
+                for p in _stageable_roots(config.get("systems_paths"), output_dir, include_active=not isolate_roots)
+                if not _is_generated_root(p, materialized)
             )
             roots_key = hashlib.sha256(json.dumps(roots).encode()).hexdigest()
             output_dir = output_dir.with_name(f"{output_dir.name}-{roots_key}")
             output_dir.parent.mkdir(parents=True, exist_ok=True)
-            return loader.load(root, manifest_path, output_dir=output_dir, config=config, systems_paths=roots)
+            return loader.load(
+                root,
+                manifest_path,
+                output_dir=output_dir,
+                config=config,
+                systems_paths=roots,
+                isolate_systems_roots=isolate_roots,
+            )
         manifest = read_entry_manifest(root, entry, config, loader)  # then verifies every declared artifact
         # Keyed by content: a configuration ID names an identity, so a dataset republished in place with corrected
         # measurements must not be served from the preparation of the old ones.

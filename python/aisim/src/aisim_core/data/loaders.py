@@ -291,17 +291,21 @@ class FpmLoader(Loader):
         config: Mapping[str, Any] | None = None,
         require_resources: bool = False,
         systems_paths: tuple[str, ...] | None = None,
+        isolate_systems_roots: bool = False,
     ) -> FpmData:
         """Verify and stage an entry; ``output_dir`` receives the staged ``systems`` root (library kind).
 
         ``require_resources`` raises :class:`FpmResourcesPendingError` when neither the user's ``fpm_profile`` nor the
         sidecar supplies resources, naming the fields to supply. Without it, a library without resources still loads
-        for timing queries.
+        for timing queries. ``isolate_systems_roots`` stages from ``systems_paths`` alone, without the active systems
+        roots as fallbacks.
         """
         root = Path(root)
         peek = Manifest.model_validate_json(_file(root, manifest_path).read_bytes())
         if any(a.role == ROLE_LIBRARY for a in peek.artifacts):
-            return self._load_library(root, manifest_path, output_dir, config, require_resources, systems_paths)
+            return self._load_library(
+                root, manifest_path, output_dir, config, require_resources, systems_paths, isolate_systems_roots
+            )
         manifest = self.read_manifest(root, manifest_path, config)
         profiles = [a for a in manifest.artifacts if a.role == "fpm-profile"]
         if profiles:
@@ -320,6 +324,7 @@ class FpmLoader(Loader):
         config: Mapping[str, Any] | None,
         require_resources: bool,
         systems_paths: tuple[str, ...] | None,
+        isolate_systems_roots: bool = False,
     ) -> FpmData:
         user_profile = (config or {}).get("fpm_profile")
         if user_profile is not None and not isinstance(user_profile, Mapping):
@@ -348,7 +353,7 @@ class FpmLoader(Loader):
 
         try:
             declared = read_library_metadata(sidecar_file)
-            check_library_model(declared, library_file, identity.model)
+            models = check_library_model(declared, library_file, identity.model)
         except FpmContractError as exc:
             raise LoaderError(str(exc)) from exc
         if output_dir is not None:
@@ -361,6 +366,7 @@ class FpmLoader(Loader):
                 require_resources,
                 config is not None,
                 foreign,
+                models,
             )
         try:
             staged = stage_fpm_library(
@@ -374,6 +380,7 @@ class FpmLoader(Loader):
                 parquet_sha256=library.sha256,
                 metadata_sha256=sidecar.sha256,
                 artifact_id=library.artifact_id,
+                include_active_roots=not isolate_systems_roots,
             )
         except FpmContractError as exc:
             raise LoaderError(str(exc)) from exc
@@ -393,7 +400,7 @@ class FpmLoader(Loader):
                 }
             with_estimator_path(out, staged.parquet_path)
             resources, sources, profile, resources_by_deployment = _resolve_library_resources(
-                out, user_profile, identity, staged.metadata, require_resources, config is not None, foreign
+                out, user_profile, identity, staged.metadata, require_resources, config is not None, foreign, models
             )
         except FpmContractError:
             staged.close()
@@ -420,10 +427,15 @@ def _resolve_library_resources(
     require_resources: bool,
     has_config: bool,
     foreign: bool,
+    models: frozenset[str] = frozenset(),
 ):
     """Resolve resources for a library load; sets ``out["fpm_profile"]`` when the user supplied one."""
     if foreign:
         metadata = {}
+    elif len(models) > 1 and not (metadata.get("configuration_selector") or {}).get("model_path"):
+        # A shared library's resources were measured for one model: without a selector naming it, the sidecar
+        # does not say which model its block describes, so no model inherits it.
+        metadata = {name: value for name, value in metadata.items() if name != "resources"}
     sources: tuple[str, ...] | list[str] = ()
     profile = None
     if user_profile is not None:
@@ -466,7 +478,16 @@ def _resolve_library_resources(
                 "kv_cache_dtype": normalized.get("kvcache_quant_mode"),
             }
             deployment = {name: value for name, value in deployment.items() if value is not None}
-            metadata = resource_metadata_for_deployment(normalized, deployment, metadata)
+            metadata = resource_metadata_for_deployment(
+                normalized,
+                deployment,
+                metadata,
+                {
+                    "system": identity.hardware,
+                    "backend": identity.framework,
+                    "backend_version": identity.framework_version,
+                },
+            )
     resources = resolve_resources(None, metadata, required=require_resources)
     return resources, (), None, (resources,)
 

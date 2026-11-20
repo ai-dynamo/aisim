@@ -448,11 +448,13 @@ def stage_fpm_library(
     parquet_sha256: str | None = None,
     metadata_sha256: str | None = None,
     artifact_id: str | None = None,
+    include_active_roots: bool = True,
 ) -> StagedFpmLibrary:
     """Stage a library and its sidecar into a ``systems/`` root for ``best_available``.
 
     The system definition and the other data of the selected backend version are linked from ``systems_paths``
-    (the active systems roots follow as a fallback), so operation data stays reachable while the FPM
+    (the active systems roots follow as a fallback unless ``include_active_roots`` is false, which keeps a pinned
+    operation-data root from falling back to other tables), so operation data stays reachable while the FPM
     directory is isolated.
     Sources outside the destination are linked, never modified; a schema-6 sidecar that needs recovery is
     rewritten in the staged copy. A recovered sidecar inside the destination is copied before replacement;
@@ -467,7 +469,7 @@ def stage_fpm_library(
     destination = Path(output_dir).expanduser().resolve() if output_dir is not None else None
     if destination is not None and parquet.is_relative_to(destination):
         raise FpmContractError("FPM parquet input must resolve outside output_dir")
-    systems_paths = _stageable_roots(systems_paths, output_dir)
+    systems_paths = _stageable_roots(systems_paths, output_dir, include_active=include_active_roots)
     if not parquet.is_file() or not sidecar.is_file():
         raise FpmContractError(f"FPM library {artifact_id or parquet} is not materialized locally")
     metadata = read_library_metadata(sidecar)
@@ -549,14 +551,19 @@ def stage_fpm_library(
 STAGED_MARKER = ".staged.json"
 
 
-def _stageable_roots(systems_paths: Sequence[str | Path] | None, output_dir: str | Path | None) -> list[Path]:
-    """Ordered effective roots, including active defaults, canonicalized and excluding the destination."""
+def _stageable_roots(
+    systems_paths: Sequence[str | Path] | None, output_dir: str | Path | None, *, include_active: bool = True
+) -> list[Path]:
+    """Ordered effective roots, canonicalized and excluding the destination.
+
+    The active default roots follow ``systems_paths`` as fallbacks unless ``include_active`` is false.
+    """
     from aisim_core.sdk.perf_database import _normalize_systems_paths, get_systems_paths
 
     destination = Path(output_dir).expanduser().absolute().resolve() if output_dir is not None else None
     roots = [
         Path(r).expanduser().resolve()
-        for p in [*(systems_paths or ()), *get_systems_paths()]
+        for p in [*(systems_paths or ()), *(get_systems_paths() if include_active else ())]
         for r in _normalize_systems_paths([os.fspath(p)])
     ]
     return list(dict.fromkeys(r for r in roots if r != destination))
@@ -604,12 +611,12 @@ def _check_sidecar_describes_library(metadata: Mapping[str, Any], parquet: Path,
         raise FpmContractError(f"FPM sidecar row_count {metadata.get('row_count')} differs from the library ({rows})")
 
 
-def check_library_model(metadata: Mapping[str, Any], parquet: Path, model: str | None) -> None:
+def check_library_model(metadata: Mapping[str, Any], parquet: Path, model: str | None) -> frozenset[str]:
     """Bind an entry's model to a possibly multi-model library and its optional model inventory.
 
     Collectors publish ``model_paths`` for aggregate tables. Historical sidecars without that inventory remain
     usable: the verified table's model_path column is authoritative. Scan only that column with bounded batches;
-    native admission still checks the remaining cell identity and estimator support.
+    native admission still checks the remaining cell identity and estimator support. Returns the library's models.
     """
     import pyarrow.parquet as pq
 
@@ -633,6 +640,7 @@ def check_library_model(metadata: Mapping[str, Any], parquet: Path, model: str |
         raise FpmContractError(
             f"FPM library does not cover manifest model {model!r}; available models: {sorted(models)}"
         )
+    return frozenset(models)
 
 
 def _staged_marker(root: Path) -> dict[str, Any] | None:
@@ -899,6 +907,9 @@ def resource_metadata_for_deployment(
 
 def _resource_metadata_matches(profile, deployment, metadata, identity) -> bool:
     selector = (metadata or {}).get("configuration_selector") or {}
+    # The verified library identity and the selector must agree; a contradicting selector names another runtime.
+    if any(name in selector and selector[name] != value for name, value in (identity or {}).items()):
+        return False
     applies = all(deployment.get(name, 1) == selector[name] for name in _TOPOLOGY if name in selector)
     wanted = {**{k: selector[k] for k in _IDENTITY_KEYS if k in selector}, **(identity or {})}
     applies = applies and all(
@@ -1002,7 +1013,13 @@ def complete_fpm_profile(
 
 
 def with_estimator_path(config: dict[str, Any], parquet_path: Path) -> None:
-    """Point the interpolation estimator at the staged library unless the user chose a path."""
+    """Point the interpolation estimator at the staged library unless the user chose a path.
+
+    An explicitly selected estimator other than interpolation never reads the library, and the compiler rejects a
+    library path for it, so the path is only recorded for automatic search and for interpolation.
+    """
+    if config.get("estimation_mode") not in (None, "auto", "fpm_interpolation"):
+        return
     estimator = config.get("estimator_config")
     if estimator is None:
         estimator = {}
