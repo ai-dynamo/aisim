@@ -143,6 +143,9 @@ def _profile_files(entry: dict) -> list[dict]:
         targets.add(target)
         if not isinstance(item["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"]):
             raise ValueError(f"invalid SHA256 for {target}")
+    for target in targets:
+        if any(str(ancestor) in targets for ancestor in PurePosixPath(target).parents):
+            raise ValueError(f"FPM target {target} is inside another file target")
     packaged_system = entry.get("packaged_system")
     if packaged_system is not None:
         if not isinstance(packaged_system, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", packaged_system):
