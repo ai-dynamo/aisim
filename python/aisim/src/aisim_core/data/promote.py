@@ -46,7 +46,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from aisim_core.data import Artifact, CategoryIndex, DatasetIndex, Entry, Manifest, _verify
+from aisim_core.data import Artifact, CategoryIndex, CategoryReference, DatasetIndex, Entry, Manifest, _verify
 from aisim_core.data.catalog import CATALOG_DIR, build_catalog
 from aisim_core.data.e2e import read_snapshot
 from aisim_core.data.eval import load_record, record_paths
@@ -513,10 +513,11 @@ def register_manifests(
         (target / index_rel).write_text(_dump(index), encoding="utf-8")
         ref = _artifact(target, index_rel, "aisim-category-index/v1")
         root = categories[category].root if category in categories else f"data/{category}"  # type: ignore[index]
-        categories[category] = {"root": root, "index": ref, "layout": "category"}  # type: ignore[index,assignment]
+        # A typed reference on every iteration: the next new category reads ``.index`` from this mapping.
+        categories[category] = CategoryReference(root=root, index=ref, layout="category")  # type: ignore[index,assignment]
     updated = DatasetIndex.model_validate(
         {**dataset.model_dump(mode="json", by_alias=True), "categories": {
-            k: (v if isinstance(v, dict) else v.model_dump(mode="json", by_alias=True)) for k, v in categories.items()
+            k: v.model_dump(mode="json", by_alias=True) for k, v in categories.items()
         }}
     )  # fmt: skip
     index_path.parent.mkdir(parents=True, exist_ok=True)

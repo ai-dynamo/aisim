@@ -237,9 +237,13 @@ def scan_value(value: Any, policy: RedactionPolicy, path: str, where: str, *, _k
     def flag(code: str, detail: str) -> None:
         out.append(Finding(code, f"{where}: {detail}", path))
 
+    scanned: set[tuple[str, str]] = set()
     for key, text in _walk(value, _key):
         if text == REDACTED or not text:
             continue
+        if (key, text) in scanned:
+            continue  # an aliased or repeated scalar in the same field context has the same findings
+        scanned.add((key, text))
         if _CREDENTIAL_KEY.search(key):
             flag("secret", "credential field must be removed or [REDACTED]")
         try:

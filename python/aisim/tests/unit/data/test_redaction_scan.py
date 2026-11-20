@@ -44,3 +44,20 @@ def test_field_names_are_scanned_without_rows_or_values(tmp_path, nested):
     clean = pa.table({"col": pa.array([], type=pa.string())})
     pq.write_table(clean, path)
     assert not _check_table_text(clean, "t.parquet", DEFAULT_POLICY, "column", path=path)
+
+
+@pytest.mark.parametrize("context", ["note", "image"])
+def test_aliased_scalars_are_scanned_once_per_field_context(monkeypatch, context):
+    from aisim_core.data import redaction
+    from aisim_core.data.hygiene import yaml_sidecar_value
+
+    parsed = []
+    real = redaction._json_text
+    monkeypatch.setattr(redaction, "_json_text", lambda text: parsed.append(text) or real(text))
+    scalar = '{"payload": [' + ",".join(['"private-worker:v1"'] * 1000) + "]}"
+    # Every list item is one scalar object (an alias); only the field context differs between the two runs.
+    document = f"scalar: &big '{scalar}'\n{context}: [{', '.join(['*big'] * 200)}]\n"
+    findings = scan_value(yaml_sidecar_value(document.encode()), DEFAULT_POLICY, "p", "w")
+    assert len(parsed) == 2  # once under the anchor's own key, once for the aliases' shared context
+    # An alias under ``image`` still gets the image-field check; the same scalar under another field does not.
+    assert ("image-name" in {f.code for f in findings}) is (context == "image")
