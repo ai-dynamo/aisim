@@ -83,8 +83,13 @@ decode worker receives every full-attention block, as one transfer unit holds
 a block of each full-attention group. No full-attention spec of vLLM 0.31.0 or
 0.32.0 opts out of prefix caching. Only a profile that describes no deployment
 of these versions has such a group. The state moves with every transfer that
-moves at least one token. `transfer_bytes_per_block` is the bytes that
-vLLM's NIXL connector
+moves at least one token.
+A request of zero input tokens owns no block on the prefill worker and moves
+no state block; vLLM refuses an empty prompt, see vLLM v0.31.0
+[`input_processor.py:516-517`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/engine/input_processor.py#L516-L517)
+and vLLM v0.32.0
+[`input_processor.py:565-566`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/input_processor.py#L565-L566).
+`transfer_bytes_per_block` is the bytes that vLLM's NIXL connector
 reads for one block of the group on one TP rank, on vLLM 0.31.0 or vLLM
 0.32.0. So the result is the bytes that the connector reads for the request on
 one rank. A live run of GLM-5.3-Flash measured the bytes of whole transfers on
