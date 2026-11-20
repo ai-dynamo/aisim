@@ -22,6 +22,7 @@ from aisim_core.data.names import NameFinding, name_findings
 
 MANIFEST_NAMES = ("manifest.json", "aisim-manifest.json")
 MANIFEST_SCHEMA = "aisim-artifact-manifest/v1"
+_MANIFEST_SCHEMA_FAMILY = MANIFEST_SCHEMA.rpartition("/")[0] + "/"  # every envelope version, supported or not
 
 
 @dataclass(frozen=True)
@@ -38,8 +39,9 @@ def discover_manifests(root: Path) -> tuple[list[Path], list[str]]:
     """``(manifests, errors)`` under ``root``; a file is checked on its own.
 
     A file with a manifest name that cannot be read or parsed is an error, never silently dropped: a truncated
-    manifest in a directory must fail the check as it does when the file is checked directly. A readable JSON
-    document with another schema is simply not ours.
+    manifest in a directory must fail the check as it does when the file is checked directly. A file of another
+    AISim envelope version is returned too, so the schema check reports it as unsupported. A readable JSON
+    document of an unrelated format is simply not ours.
     """
     root = Path(root)
     if root.is_file():
@@ -53,7 +55,8 @@ def discover_manifests(root: Path) -> tuple[list[Path], list[str]]:
             except (OSError, ValueError) as exc:
                 errors.append(f"{path.relative_to(root).as_posix()}: {type(exc).__name__}: {exc}")
                 continue
-            if isinstance(head, dict) and head.get("schema_version") == MANIFEST_SCHEMA:
+            version = head.get("schema_version") if isinstance(head, dict) else None
+            if isinstance(version, str) and version.startswith(_MANIFEST_SCHEMA_FAMILY):
                 found.append(path)
     return found, errors
 

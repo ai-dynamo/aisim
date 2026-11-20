@@ -544,6 +544,25 @@ def test_validate_directory_reports_malformed_manifest(run, tmp_path):
     assert any(f["check"] == "manifest" and f["path"].endswith("broken/manifest.json") for f in report["findings"])
 
 
+@pytest.mark.parametrize("scope", ["root", "category-directory"])
+def test_validate_directory_reports_an_unsupported_envelope_version(run, tmp_path, scope):
+    root = tmp_path / "ds"
+    _write_dataset(root, run.files)
+    doc = json.loads((root / "data/op-latency/h200_sxm/manifest.json").read_text())
+    doc["schema_version"] = "aisim-artifact-manifest/v2"
+    future = root / "data/op-latency/future/manifest.json"
+    future.parent.mkdir(parents=True)
+    future.write_text(json.dumps(doc))
+    other = root / "data/op-latency/provenance/manifest.json"  # an unrelated format is still ignored
+    other.parent.mkdir(parents=True)
+    other.write_text(json.dumps({"schema_version": "someone-elses-manifest/v1", "x": 1}))
+    status, out, _ = run("data", "validate", str(root if scope == "root" else root / "data/op-latency"))
+    report = json.loads(out)
+    paths = [f["path"] for f in report["findings"] if f["check"] == "manifest"]
+    assert status == 1 and paths == ["data/op-latency/future/manifest.json"]
+    assert run("data", "validate", str(future))[0] == 1  # the same manifest checked on its own
+
+
 @pytest.mark.parametrize("body", ["[]", "null"])
 def test_validate_non_object_manifest_is_a_finding(run, tmp_path, body):
     manifest = tmp_path / "manifest.json"
