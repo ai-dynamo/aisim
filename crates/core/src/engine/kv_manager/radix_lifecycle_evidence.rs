@@ -102,7 +102,8 @@ fn radix_lifecycle_matches_recorded_behavior() {
     mgr.finish(&b, initial_b);
     let (reused_prefix, active) = admit(&mut mgr, &[1, 2, 3, 4, 99]);
     assert_eq!(reused_prefix, 4);
-    assert_eq!(mgr.cache.protected_size(), 4);
+    assert_eq!(active.cached_tokens(), 4);
+    assert_eq!(mgr.cache.node(active.last_node()).lock_ref, 1);
     let first_event = sink.0.lock().unwrap().len();
     let available = mgr.cache.available_tokens();
     mgr.evict(4);

@@ -3169,11 +3169,8 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     ) -> Result<EvictionStepResult<V>, TreeCoreRuntimeError> {
         let node_id = self.arena.resolve(node_id)?;
         let mut result = EvictionStepResult::default();
-        // Deferred work must recheck both load-back pins and locks acquired
-        // after backup was scheduled, before touching values or size ledgers.
-        if self.arena.node(node_id).is_load_back_pending()
-            || self.arena.node(node_id).is_device_locked()
-        {
+        // A pending load-back owns the device residency transition.
+        if self.arena.node(node_id).is_load_back_pending() {
             return Ok(result);
         }
         {
@@ -3184,6 +3181,12 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                     evicted: node.evicted(),
                     backuped: node.backuped(),
                 });
+            }
+            // Deferred work must recheck locks acquired after backup was
+            // scheduled before touching values or size ledgers. Keep invalid
+            // demotion-state errors above, even when that node is locked.
+            if node.is_device_locked() {
+                return Ok(result);
             }
         }
         self.demote_(

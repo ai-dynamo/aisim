@@ -1,0 +1,286 @@
+{
+  "schema_version": 1,
+  "probe": "lifecycle",
+  "probe_sha256": "e1d8066d9b7f54872317ea31d907ed1b7c04d5a5b6c596bd8a11e12233bc42e4",
+  "rustc": "rustc 1.91.1 (ed61e7d7e 2025-11-07)",
+  "profile": "test",
+  "features": [],
+  "baseline": {
+    "commit": "8288046ac88fccaee124714cd60e62b2ad4e184d",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "aisimulate-core",
+      "--locked",
+      "--lib",
+      "radix_lifecycle_matches_recorded_behavior"
+    ],
+    "exit_code": 0,
+    "scenarios": [
+      {
+        "capacity_tokens": 24,
+        "freed_tokens": 4,
+        "page_size": 4,
+        "prompt": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8
+        ],
+        "removed_block_hashes": [
+          4945711292740353085
+        ],
+        "repeat_reused_tokens": 4,
+        "requested_tokens": 4,
+        "scenario": "two_page_leaf"
+      },
+      {
+        "capacity_tokens": 24,
+        "freed_tokens": 4,
+        "page_size": 4,
+        "prompt": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "removed_block_hashes": [
+          14643705804678351452
+        ],
+        "repeat_reused_tokens": 0,
+        "requested_tokens": 4,
+        "scenario": "complete_without_new_page"
+      },
+      {
+        "active_prompt": [
+          1,
+          2,
+          3,
+          4,
+          99
+        ],
+        "active_reused_tokens": 4,
+        "capacity_tokens": 24,
+        "freed_tokens": 4,
+        "page_size": 4,
+        "prompt_a": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9
+        ],
+        "prompt_b": [
+          10,
+          11,
+          12,
+          13,
+          14
+        ],
+        "removed_block_hashes": [
+          4945711292740353085
+        ],
+        "repeat_a_reused_tokens": 4,
+        "repeat_b_reused_tokens": 4,
+        "requested_tokens": 4,
+        "scenario": "match_and_lock_compressed_prefix"
+      }
+    ]
+  },
+  "candidate": {
+    "commit": "a59c6d0641ceb9b775dc6740786cbdeba8f935cc",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "aisimulate-core",
+      "--locked",
+      "--lib",
+      "radix_lifecycle_matches_recorded_behavior"
+    ],
+    "exit_code": 0,
+    "scenarios": [
+      {
+        "capacity_tokens": 24,
+        "freed_tokens": 8,
+        "page_size": 4,
+        "prompt": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8
+        ],
+        "removed_block_hashes": [
+          14643705804678351452,
+          4945711292740353085
+        ],
+        "repeat_reused_tokens": 0,
+        "requested_tokens": 4,
+        "scenario": "two_page_leaf"
+      },
+      {
+        "capacity_tokens": 24,
+        "freed_tokens": 4,
+        "page_size": 4,
+        "prompt": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "removed_block_hashes": [
+          483935686894639516
+        ],
+        "repeat_reused_tokens": 4,
+        "requested_tokens": 4,
+        "scenario": "complete_without_new_page"
+      },
+      {
+        "active_prompt": [
+          1,
+          2,
+          3,
+          4,
+          99
+        ],
+        "active_reused_tokens": 4,
+        "capacity_tokens": 24,
+        "freed_tokens": 4,
+        "page_size": 4,
+        "prompt_a": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9
+        ],
+        "prompt_b": [
+          10,
+          11,
+          12,
+          13,
+          14
+        ],
+        "removed_block_hashes": [
+          8906183847324352865
+        ],
+        "repeat_a_reused_tokens": 8,
+        "repeat_b_reused_tokens": 0,
+        "requested_tokens": 4,
+        "scenario": "match_and_lock_compressed_prefix"
+      }
+    ]
+  },
+  "published_starting_head": {
+    "commit": "54be42ae1d8dd1392e76860bed2810f801433b77",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "aisimulate-core",
+      "--locked",
+      "--lib",
+      "radix_lifecycle_matches_recorded_behavior"
+    ],
+    "exit_code": 0,
+    "scenarios": [
+      {
+        "capacity_tokens": 24,
+        "freed_tokens": 8,
+        "page_size": 4,
+        "prompt": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8
+        ],
+        "removed_block_hashes": [
+          14643705804678351452,
+          4945711292740353085
+        ],
+        "repeat_reused_tokens": 0,
+        "requested_tokens": 4,
+        "scenario": "two_page_leaf"
+      },
+      {
+        "capacity_tokens": 24,
+        "freed_tokens": 4,
+        "page_size": 4,
+        "prompt": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "removed_block_hashes": [
+          483935686894639516
+        ],
+        "repeat_reused_tokens": 4,
+        "requested_tokens": 4,
+        "scenario": "complete_without_new_page"
+      },
+      {
+        "active_prompt": [
+          1,
+          2,
+          3,
+          4,
+          99
+        ],
+        "active_reused_tokens": 4,
+        "capacity_tokens": 24,
+        "freed_tokens": 4,
+        "page_size": 4,
+        "prompt_a": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9
+        ],
+        "prompt_b": [
+          10,
+          11,
+          12,
+          13,
+          14
+        ],
+        "removed_block_hashes": [
+          8906183847324352865
+        ],
+        "repeat_a_reused_tokens": 8,
+        "repeat_b_reused_tokens": 0,
+        "requested_tokens": 4,
+        "scenario": "match_and_lock_compressed_prefix"
+      }
+    ]
+  }
+}

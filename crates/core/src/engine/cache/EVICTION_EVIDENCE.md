@@ -148,3 +148,68 @@ and technical reapproval before merge.
 
 Current corrective validation, lifecycle events, and growth measurements are in
 [the scoped repair evidence](RADIX_REPAIR_EVIDENCE.md).
+
+## Matching and locking a compressed prefix
+
+The additional `match_and_lock_compressed_prefix` lifecycle probe caches two
+pages A1/A2, then one unrelated page B. It admits a request reusing A1, leaving
+that prefix locked, and evicts exactly one page before repeating A and B.
+The capacity is 24 tokens, with four tokens per page. Actual manager admission,
+physical page allocation, lock receipts, and `Removed` events are exercised;
+the final drain returns all 24 tokens to the pool.
+
+[The recorded comparison](radix-matched-prefix-comparison.json) runs the same
+probe against main `8288046ac88fccaee124714cd60e62b2ad4e184d` and the corrective
+source commit `a59c6d0641ceb9b775dc6740786cbdeba8f935cc`. It records the
+probe checksum, Rust 1.91.1 toolchain, ordinary test profile, empty feature list,
+commands, revision IDs, and observations from all three lifecycle scenarios.
+The published starting head `54be42ae1d8dd1392e76860bed2810f801433b77`
+was also archived and tested separately with its original lockfile and an
+isolated target directory. Its complete observations match the corrective
+source commit, as recorded under `published_starting_head`. Thus this ordering
+predates these local corrections. Replacing `--candidate` below with that
+starting SHA reproduces the published-head comparison.
+
+| Observation after one-page pressure | Main | Native adapter |
+| --- | --- | --- |
+| Removed page | A2 | B |
+| Removed block hash | `4945711292740353085` | `8906183847324352865` |
+| Freed tokens | 4 | 4 |
+| Repeat A reused tokens | 4 | 8 |
+| Repeat B reused tokens | 4 | 0 |
+
+Main preserves the unmatched suffix's old timestamp when splitting. The pinned
+SGLang core stamps that suffix with a new access counter, making A2 newer than B
+for the adapter's LRU ordering. A1 remains locked throughout the eviction.
+This is an intentional native-policy difference that changes subsequent reuse;
+it is independent of whole-leaf overshoot. The repair preserves that policy.
+These synthetic observations establish cache lifecycle behavior, not serving
+accuracy, timing-model parity, or simulator throughput.
+
+Reproduce using a fresh scratch directory outside the checkout:
+
+```bash
+python3 scripts/compare_radix_eviction.py --probe lifecycle \
+  --baseline 8288046ac88fccaee124714cd60e62b2ad4e184d \
+  --candidate a59c6d0641ceb9b775dc6740786cbdeba8f935cc \
+  --work-dir "$TMPDIR/radix-matched-prefix"
+cargo test --workspace --locked --lib radix_lifecycle_matches_recorded_behavior
+```
+
+The first comparison attempt did not compile on main because it used the new
+`protected_size()` method where main exposes a field. The successful probe
+instead asserts the reused lease length and its node's lock reference through
+interfaces shared by both revisions. The before/after comparison above comes
+only from that successful rerun, using separate snapshot source and target
+directories. Neither production revision's sources or lockfile were rewritten.
+
+The local native corrections have separate regressions in
+`sglang_radix_regressions.rs`; all ten original regressions fail on the unpatched
+bundle. During fixture qualification, backup tests initially omitted the
+acknowledgement that registers host coexistence; the final fixtures execute
+`mark_write_through_pending` and `finish_write_through`. A proposed Mamba-only
+lock fixture violated Full/Mamba lock ordering and was replaced with valid
+Full-only and Full+Mamba receipts. Sanity assertions remain enabled. Initial
+Python line-length and patch-context whitespace check failures were corrected
+before publication. Failed-attempt logs and successful reruns remain in the
+repair run's scratch directory; none is represented as a final passing test.

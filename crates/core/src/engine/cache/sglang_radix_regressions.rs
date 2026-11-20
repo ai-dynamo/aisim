@@ -269,6 +269,25 @@ fn deferred_demote_waits_for_device_locks_then_completes() {
 }
 
 #[test]
+fn demote_preserves_invalid_state_errors_when_locked() {
+    let mut tree = Core::new(CacheInitParams::default(), vec![FULL]);
+    let root = tree.root_node_handle(None);
+    assert!(matches!(
+        tree.demote(root),
+        Err(TreeCoreRuntimeError::InvalidDemoteState { .. })
+    ));
+    let leaf = insert(&mut tree, vec![10, 20], &[1, 2]);
+    let lock = tree.inc_lock_ref(leaf, ComponentSet::EMPTY).unwrap();
+    assert!(matches!(
+        tree.demote(leaf),
+        Err(TreeCoreRuntimeError::InvalidDemoteState { .. })
+    ));
+    tree.dec_lock_ref(leaf, &lock.to_dec_params(), false)
+        .unwrap();
+    tree.try_sanity_check(&[], &[]).unwrap();
+}
+
+#[test]
 fn swa_attach_rejects_host_only_full_before_splitting() {
     let mut tree = Core::new(
         CacheInitParams {
