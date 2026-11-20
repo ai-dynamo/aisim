@@ -227,6 +227,57 @@ def test_cli_duplicate_comparison_identity_cannot_publish_partial_results(case, 
     assert not comparison.exists()
 
 
+@pytest.mark.parametrize(
+    "extra,error",
+    [
+        (["--configuration", CONFIGURATION_PATH], None),  # filters after loading, as it always did
+        (["--configuration", "fixture/unknown"], "unknown smoke configuration"),
+        (["--model", "Org/Model"], "--model and --hardware need the unified dataset layout"),
+        (["--hardware", "h100_sxm"], "--model and --hardware need the unified dataset layout"),
+    ],
+)
+def test_cli_selects_from_a_legacy_local_snapshot_after_loading(tmp_path, monkeypatch, extra, error):
+    from scripts.fpm_accuracy import run_fpm_accuracy as cli
+
+    legacy = tmp_path / "legacy"
+    content = "\n".join(json.dumps(_fpm_payload(counter=index, wall_time=0.01)) for index in range(12)).encode()
+    _build_dataset(legacy, protocol_id="forward-pass-measurement-v1", files=[("truth", "traffic.jsonl", content)])
+    wheel = tmp_path / "fixture.whl"
+    wheel.write_bytes(b"synthetic wheel identity for legacy selection test")
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    monkeypatch.setattr(cli, "runtime_module", lambda _: SimpleNamespace(RustForwardPassPerfModel=object()))
+    monkeypatch.setattr(
+        cli,
+        "installed_distribution",
+        lambda: SimpleNamespace(read_text=lambda _: json.dumps({"archive_info": {"hashes": {"sha256": digest}}})),
+    )
+    evaluated = []
+
+    class Stop(Exception):
+        pass
+
+    def evaluate(case, *_):
+        evaluated.append(case.configuration.configuration_path)
+        raise Stop
+
+    monkeypatch.setattr(cli, "evaluate_isolated", evaluate)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_fpm_accuracy", "--branch", "main", "--commit", "a" * 40, "--evaluator-sha", "a" * 40]
+        + ["--hf-revision", "a" * 40, "--wheel", str(wheel), "--run-id", "1", "--run-attempt", "1"]
+        + ["--output", str(tmp_path / "public"), "--local-dataset", str(legacy), *extra],
+    )
+    if error is None:
+        with pytest.raises(Stop):
+            cli.main()
+        assert evaluated == [CONFIGURATION_PATH]
+    else:
+        with pytest.raises(ValueError, match=error):
+            cli.main()
+        assert not evaluated
+
+
 @pytest.mark.parametrize("namespace", ["aisim_core", "aisimulate_core"])
 def test_fpm_predictor_reaches_current_and_historical_runtime_namespaces(tmp_path, namespace):
     package = tmp_path / namespace
