@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 // Derived from sgl-project/sglang at f0fda25fc95c357368b714f90a13a69c1b67f50a.
-// See README.md for original paths, license, and mechanical modifications.
+// See README.md for original paths, license, and documented modifications.
 
 //! Mamba (SSM state) component driver: overrides the methods Mamba customizes
 //! and inherits the rest from the `TreeComponent` defaults.
@@ -45,6 +45,10 @@ impl MambaComponent {
         let mamba_cache_chunk_size = params
             .mamba_cache_chunk_size
             .expect("the Mamba component requires mamba_cache_chunk_size");
+        assert!(
+            mamba_cache_chunk_size > 0,
+            "mamba_cache_chunk_size must be positive"
+        );
         MambaComponent {
             // A donated checkpoint must land on both the model's chunk grid and
             // a radix-node boundary. `params.page_size` is already widened by DCP.
@@ -184,14 +188,14 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for MambaComponent {
         if is_new_leaf {
             tree_core
                 .arena
-                .set_device_value(node_id, MAMBA, mamba_value.shallow_clone());
+                .set_device_value(node_id, MAMBA, mamba_value.copy_for_adoption());
             tree_core.device_lru_list_mut(MAMBA).insert_mru(node_id);
             tree_core.inc_evictable_size(MAMBA, slot_len);
             self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);
             return;
         }
         if !tree_core.arena.has_device_value(node_id, MAMBA) {
-            tree_core.set_component_device_value_(node_id, MAMBA, mamba_value.shallow_clone());
+            tree_core.set_component_device_value_(node_id, MAMBA, mamba_value.copy_for_adoption());
             let tick = tree_core.arena.get_and_bump_access_counter();
             tree_core.arena.node_mut(node_id).last_access_counter = tick;
             self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);

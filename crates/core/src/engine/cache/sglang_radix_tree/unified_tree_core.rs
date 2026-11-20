@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 // Derived from sgl-project/sglang at f0fda25fc95c357368b714f90a13a69c1b67f50a.
-// See README.md for original paths, license, and mechanical modifications.
+// See README.md for original paths, license, and documented modifications.
 
 //! The radix prefix tree of cached KV.
 #![allow(unused_variables)]
@@ -1261,7 +1261,9 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         let Some(swa) = self.try_component_by_type_(SWA) else {
             return Ok(());
         };
-        swa.release_window_lock(self, node_idx, params, device_frees, host_frees);
+        if !params.skipped_lock_components.contains(SWA) {
+            swa.release_window_lock(self, node_idx, params, device_frees, host_frees);
+        }
 
         // Drop strictly-lower-priority locks co-located on the node, skipping
         // any the paired inc never took.
@@ -1809,14 +1811,23 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             return Err(TreeCoreRuntimeError::InsertAnchorNotDeviceResident { node_id: anchor.id });
         }
 
+        // Validate length and content in one ancestor walk, without a path buffer.
+        // A NodeId alone does not bind the anchor to the supplied key.
+        let key = params.key.as_ref();
         let mut cursor = prefix_node_idx;
         let mut node_prefix_len = 0;
+        let mut key_matches = true;
         loop {
             let node = self.arena.node(cursor);
             if node.is_root() {
                 break;
             }
+            let end_offset = node_prefix_len;
             node_prefix_len += node.key.atom_len();
+            if node_prefix_len <= prefix_len {
+                key_matches &= key[prefix_len - node_prefix_len..prefix_len - end_offset]
+                    == node.key.as_ref()[..];
+            }
             cursor = node.parent();
         }
         if node_prefix_len != prefix_len {
@@ -1826,28 +1837,8 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 prefix_len,
             });
         }
-
-        // Release builds trust the retained match handle and avoid rereading the
-        // complete prefix. Debug builds verify that the handle is on this key's
-        // path, walking upward from the anchor so no path buffer is needed.
-        #[cfg(debug_assertions)]
-        {
-            let key = params.key.as_ref();
-            let mut end = prefix_len;
-            let mut cursor = prefix_node_idx;
-            loop {
-                let node = self.arena.node(cursor);
-                if node.is_root() {
-                    break;
-                }
-                let start = end - node.key.atom_len();
-                debug_assert!(
-                    key[start..end] == node.key.as_ref()[..],
-                    "insert continuation anchor is not on the supplied key path"
-                );
-                end = start;
-                cursor = node.parent();
-            }
+        if !key_matches {
+            return Err(TreeCoreRuntimeError::InsertAnchorKeyMismatch { node_id: anchor.id });
         }
         Ok(())
     }
@@ -1944,7 +1935,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         if aligned_key_len == prefix_len {
             // An empty suffix still visited its retained boundary above.
             return Ok(InsertStepResult {
-                actions: Vec::new(),
+                actions: prefix_actions,
                 result: Some(InsertResult {
                     prefix_len,
                     total_len: aligned_key_len,
@@ -1957,7 +1948,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                     mamba_exist: true,
                     swa_branch_inserted: false,
                     adopted_ranges: params.track_adopted_ranges.then(HashMap::new),
-                    cache_actions: prefix_actions,
+                    cache_actions: Vec::new(),
                 }),
             });
         }
@@ -3178,8 +3169,11 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     ) -> Result<EvictionStepResult<V>, TreeCoreRuntimeError> {
         let node_id = self.arena.resolve(node_id)?;
         let mut result = EvictionStepResult::default();
-        // Skip a deferred demote when a load-back now pins the device indices.
-        if self.arena.node(node_id).is_load_back_pending() {
+        // Deferred work must recheck both load-back pins and locks acquired
+        // after backup was scheduled, before touching values or size ledgers.
+        if self.arena.node(node_id).is_load_back_pending()
+            || self.arena.node(node_id).is_device_locked()
+        {
             return Ok(result);
         }
         {
@@ -4829,6 +4823,11 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         for &(child_id, pos, prefix_len) in &spans {
             if pos + prefix_len <= window_start {
                 continue;
+            }
+            if !self.arena.has_device_value(child_id, FULL) {
+                return Err(
+                    "attach_swa_window requires device Full KV throughout the window".into(),
+                );
             }
             if self.arena.has_device_value(child_id, SWA) {
                 return Err(format!(

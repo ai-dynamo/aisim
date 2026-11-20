@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 // Derived from sgl-project/sglang at f0fda25fc95c357368b714f90a13a69c1b67f50a.
-// See README.md for original paths, license, and mechanical modifications.
+// See README.md for original paths, license, and documented modifications.
 
 //! A radix-tree node, owned by the `NodeArena` and referenced by `NodeIdx_`.
 
@@ -495,7 +495,10 @@ impl<K: ChildKeyType, V: RadixValue> Node<K, V> {
     /// parent link; panics on a broken parent<->child link (an internal invariant).
     pub(crate) fn detach_from_parent(&mut self, parent: &mut Node<K, V>, page_size: usize) {
         // A live child is always registered under its namespaced page key.
-        match parent.children.remove(&self.edge_key(page_size)) {
+        match parent.children.remove(&ChildEdgeRef::<K> {
+            namespace: self.namespace.as_ref(),
+            page: &self.key.as_ref()[..page_size],
+        }) {
             Some(idx) if idx == self.idx => self.parent = None,
             found => panic!(
                 "detach_from_parent: parent {} has no child {} under key {:?} (found {:?})",
@@ -804,6 +807,9 @@ pub enum TreeCoreRuntimeError {
         node_prefix_len: usize,
         prefix_len: usize,
     },
+    /// The retained anchor must represent the supplied key's prefix.
+    #[error("insert continuation anchor {node_id} is not on the supplied key path")]
+    InsertAnchorKeyMismatch { node_id: NodeId },
     /// A non-root continuation stays inside the anchor's namespace.
     #[error("insert continuation namespace does not match non-root anchor {node_id}")]
     InsertContinuationNamespaceMismatch { node_id: NodeId },

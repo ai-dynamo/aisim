@@ -90,6 +90,64 @@ fn radix_lifecycle_matches_recorded_behavior() {
         mgr.evict(24);
         assert_eq!(mgr.cache.available_tokens(), 24);
     }
+    // Cache A1/A2, then B; admitting A1 splits and locks only the first page.
+    // Keep the active lease alive while applying one page of eviction pressure.
+    let sink = Arc::new(Sink::default());
+    let mut mgr = SglangKvManager::new(24, 4, KvEventPublishers::new(Some(sink.clone())), 0);
+    let a = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+    let b = [10, 11, 12, 13, 14];
+    let (_, initial_a) = admit(&mut mgr, &a);
+    mgr.finish(&a, initial_a);
+    let (_, initial_b) = admit(&mut mgr, &b);
+    mgr.finish(&b, initial_b);
+    let (reused_prefix, active) = admit(&mut mgr, &[1, 2, 3, 4, 99]);
+    assert_eq!(reused_prefix, 4);
+    assert_eq!(mgr.cache.protected_size(), 4);
+    let first_event = sink.0.lock().unwrap().len();
+    let available = mgr.cache.available_tokens();
+    mgr.evict(4);
+    let freed_tokens = mgr.cache.available_tokens() - available;
+    let removed: Vec<_> = sink.0.lock().unwrap()[first_event..]
+        .iter()
+        .flat_map(|event| match &event.data {
+            KvEventData::Removed { block_hashes } => block_hashes.clone(),
+            _ => panic!("eviction must publish only removals"),
+        })
+        .collect();
+    let (repeat_a, repeat) = admit(&mut mgr, &a);
+    mgr.abort(repeat);
+    let (repeat_b, repeat) = admit(&mut mgr, &b);
+    mgr.abort(repeat);
+    let a_hashes = compute_seq_hash_for_block(&compute_block_hash_for_seq(&a, 4));
+    let b_hashes = compute_seq_hash_for_block(&compute_block_hash_for_seq(&b, 4));
+    assert_eq!(
+        removed,
+        if baseline {
+            vec![a_hashes[1]]
+        } else {
+            b_hashes
+        }
+    );
+    assert_eq!(freed_tokens, 4);
+    assert_eq!(repeat_a, if baseline { 4 } else { 8 });
+    assert_eq!(repeat_b, if baseline { 4 } else { 0 });
+    observations.push(json!({
+        "scenario": "match_and_lock_compressed_prefix",
+        "page_size": 4,
+        "capacity_tokens": 24,
+        "prompt_a": a,
+        "prompt_b": b,
+        "active_prompt": [1, 2, 3, 4, 99],
+        "active_reused_tokens": reused_prefix,
+        "requested_tokens": 4,
+        "freed_tokens": freed_tokens,
+        "removed_block_hashes": removed,
+        "repeat_a_reused_tokens": repeat_a,
+        "repeat_b_reused_tokens": repeat_b,
+    }));
+    mgr.abort(active);
+    mgr.evict(24);
+    assert_eq!(mgr.cache.available_tokens(), 24);
     if let Ok(path) = std::env::var("AISIM_EVICTION_EVIDENCE_OUTPUT") {
         std::fs::write(
             path,

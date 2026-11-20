@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 // Derived from sgl-project/sglang at f0fda25fc95c357368b714f90a13a69c1b67f50a.
-// See README.md for original paths, license, and mechanical modifications.
+// See README.md for original paths, license, and documented modifications.
 
 //! Self-contained LRU order over `NodeIdx_`s: MRU at the head side, LRU at the
 //! tail side. Node semantics stay with callers through predicates; the reset

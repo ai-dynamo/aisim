@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 // Derived from sgl-project/sglang at f0fda25fc95c357368b714f90a13a69c1b67f50a.
-// See README.md for original paths, license, and mechanical modifications.
+// See README.md for original paths, license, and documented modifications.
 
 //! Opaque values stored on radix-tree nodes.
 
@@ -88,6 +88,17 @@ impl<T> PageValue<T> {
         }
     }
 
+    /// Copy only the visible values directly into their compact shared allocation.
+    pub fn from_slice(values: &[T]) -> Self
+    where
+        T: Copy,
+    {
+        Self {
+            storage: Arc::from(values),
+            range: 0..values.len(),
+        }
+    }
+
     pub fn as_slice(&self) -> &[T] {
         &self.storage[self.range.clone()]
     }
@@ -121,7 +132,7 @@ where
     }
 
     fn copy_for_adoption(&self) -> Self {
-        Self::from_vec(self.as_slice().to_vec())
+        Self::from_slice(self.as_slice())
     }
 
     fn slice(&self, start: usize, len: usize) -> Self {

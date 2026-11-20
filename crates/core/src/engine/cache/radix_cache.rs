@@ -309,7 +309,10 @@ impl RadixValue for CacheValue {
     }
 
     fn copy_for_adoption(&self) -> Self {
-        Self::from_vec(self.as_slice().to_vec())
+        Self {
+            backing_len: self.len(),
+            pages: PageValue::from_slice(self.as_slice()),
+        }
     }
 
     fn slice(&self, start: usize, len: usize) -> Self {
@@ -1207,14 +1210,44 @@ mod tests {
     #[test]
     fn match_insert_and_read_only_score_use_sglang_core() {
         let mut cache = RadixCache::new(64, 4);
-        cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &[0, 1, 2, 3, 4, 5, 6, 7]);
-        cache.insert(&[1, 2, 3, 4, 9, 10, 11, 12], &[0, 1, 2, 3, 8, 9, 10, 11]);
-
-        assert_eq!(cache.prefix_match_len(&[1, 2, 3, 4, 13, 14, 15, 16]), 4);
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        let pages = cache.page_pool.allocate(8).unwrap();
+        let leaf = cache.insert(&tokens, &pages);
         let nodes_before = cache.num_nodes();
-        assert_eq!(cache.prefix_match_len(&[1, 2, 3, 4, 13, 14, 15, 16]), 4);
+        let access_before = cache.node(leaf).last_access_counter;
+        // The query ends inside one compressed two-page edge. A mutating match
+        // would split it and refresh its access counter.
+        assert_eq!(cache.prefix_match_len(&tokens[..4]), 4);
         assert_eq!(cache.num_nodes(), nodes_before);
-        assert_eq!(cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7, 8]).0, 8);
+        assert_eq!(cache.node(leaf).last_access_counter, access_before);
+        assert_eq!(cache.match_prefix(&tokens[..4]).0, 4);
+        assert_eq!(cache.num_nodes(), nodes_before + 1);
+        assert!(cache.node(leaf).last_access_counter > access_before);
+        assert_eq!(cache.match_prefix(&tokens).0, 8);
+    }
+
+    #[test]
+    fn leaf_eviction_borrows_the_child_edge_key() {
+        let mut cache = RadixCache::new(64, 4);
+        let pages = cache.page_pool.allocate(8).unwrap();
+        cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &pages);
+        PageKey::take_owned_key_atoms();
+        assert_eq!(cache.evict(4).0, 8);
+        assert_eq!(PageKey::take_owned_key_atoms(), 0);
+        assert_eq!(cache.available_tokens(), 64);
+    }
+
+    #[test]
+    fn cache_value_adoption_copies_only_the_visible_pages() {
+        let original = CacheValue::from_vec((0..100).map(KvPageId).collect());
+        let view = original.slice(50, 2);
+        let adopted = view.copy_for_adoption();
+        assert_eq!(adopted.as_slice(), &[KvPageId(50), KvPageId(51)]);
+        assert_eq!(adopted.backing_len, 2);
+        assert_ne!(adopted.as_slice().as_ptr(), view.as_slice().as_ptr());
+        drop(original);
+        drop(view);
+        assert_eq!(adopted.as_slice(), &[KvPageId(50), KvPageId(51)]);
     }
 
     #[test]

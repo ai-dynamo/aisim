@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 // Derived from sgl-project/sglang at f0fda25fc95c357368b714f90a13a69c1b67f50a.
-// See README.md for original paths, license, and mechanical modifications.
+// See README.md for original paths, license, and documented modifications.
 
 //! SWA (sliding-window attention) component driver: overrides the methods SWA
 //! customizes and inherits the rest from the `TreeComponent` defaults.
@@ -608,7 +608,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
         cache_actions: &mut Vec<CacheAction<V>>,
     ) {
         if let Some(branching_seqlen) = params.swa_branching_seqlen {
-            result.swa_branch_inserted = params.key.atom_len() >= branching_seqlen;
+            result.swa_branch_inserted = result.total_len >= branching_seqlen;
         }
 
         if !is_new_leaf {

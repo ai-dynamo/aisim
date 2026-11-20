@@ -5,7 +5,8 @@
 """Reproduce the bundled native core from an immutable, local SGLang checkout.
 
 No network access or upstream working-tree changes are required. The source
-mapping and mechanical adaptations are documented alongside the bundled files.
+mapping, mechanical adaptations, and local corrections are documented alongside
+the bundled files.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DESTINATION = ROOT / "crates/core/src/engine/cache/sglang_radix_tree"
 REVISION = "f0fda25fc95c357368b714f90a13a69c1b67f50a"
 UPSTREAM = "rust/sglang-radix-tree"
+LOCAL_PATCH = Path(__file__).with_name("sglang_radix_core_fixes.patch")
 SOURCES = {
     "mod.rs": "src/lib.rs",
     "node.rs": "src/node.rs",
@@ -36,7 +38,7 @@ HEADER = f"""// SPDX-FileCopyrightText: SGLang contributors
 // SPDX-FileCopyrightText: Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 // Derived from sgl-project/sglang at {REVISION}.
-// See README.md for original paths, license, and mechanical modifications.
+// See README.md for original paths, license, and documented modifications.
 
 """
 
@@ -76,7 +78,7 @@ def native_source(original: str, source: str) -> str:
 
 def synchronize(checkout: Path, *, check: bool) -> None:
     def upstream(path: str) -> bytes:
-        return subprocess.check_output(["git", "show", f"{REVISION}:{path}"], cwd=checkout)
+        return subprocess.check_output(["git", "--no-replace-objects", "show", f"{REVISION}:{path}"], cwd=checkout)
 
     with tempfile.TemporaryDirectory(prefix="aisimulate-radix-source-") as directory:
         generated = Path(directory)
@@ -86,9 +88,10 @@ def synchronize(checkout: Path, *, check: bool) -> None:
             path.write_text(native_source(upstream(f"{UPSTREAM}/{source}").decode(), source))
         (generated / "LICENSE").write_bytes(upstream("LICENSE"))
         subprocess.run(["rustfmt", "--edition", "2024", str(generated / "mod.rs")], check=True)
+        apply_local_fixes(generated)
         expected = {*SOURCES, "LICENSE"}
         actual = {str(path.relative_to(DESTINATION)) for path in DESTINATION.rglob("*.rs")} | {"LICENSE"}
-        if actual != expected:
+        if actual - expected or (check and expected - actual):
             raise SystemExit(f"unexpected bundled source paths: {actual ^ expected}")
         for name in sorted(expected):
             destination = DESTINATION / name
@@ -99,6 +102,11 @@ def synchronize(checkout: Path, *, check: bool) -> None:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(generated / name, destination)
     print(f"{'Verified' if check else 'Updated'} bundled native core from SGLang {REVISION}")
+
+
+def apply_local_fixes(generated: Path) -> None:
+    """Apply the reviewed corrections after the mechanical source adaptation."""
+    subprocess.run(["git", "apply", str(LOCAL_PATCH)], cwd=generated, check=True)
 
 
 def main() -> None:

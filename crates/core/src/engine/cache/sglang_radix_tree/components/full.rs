@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 // Derived from sgl-project/sglang at f0fda25fc95c357368b714f90a13a69c1b67f50a.
-// See README.md for original paths, license, and mechanical modifications.
+// See README.md for original paths, license, and documented modifications.
 
 //! FULL attention component driver: overrides the methods FULL customizes and inherits
 //! the rest from the `TreeComponent` defaults.
@@ -185,8 +185,17 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for FullComponent {
         if tracker[&ct] >= tree_core.component_state(FULL).evict_device_request_cnt {
             return None;
         }
-        while let Some(Reverse((_, x))) = tree_core.full_evict_device_heap.pop() {
+        while let Some(Reverse((priority, x))) = tree_core.full_evict_device_heap.pop() {
             if !tree_core.evictable_device_leaves.contains(x) {
+                continue;
+            }
+            let current_priority = tree_core
+                .eviction_strategy
+                .get_priority(tree_core.arena.node(x));
+            if priority != current_priority {
+                tree_core
+                    .full_evict_device_heap
+                    .push(Reverse((current_priority, x)));
                 continue;
             }
             let last_node_parent = tree_core.arena.node(x).try_parent();
@@ -291,6 +300,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for FullComponent {
             let node = tree_core.arena.node_mut(node_id);
             // write_back mode: the anchor may be device-only (no host_value); pin it anyway.
             if !node.has_host_value(FULL) && !tree_core.is_write_back {
+                result.skipped_lock_components.insert(FULL);
                 return result;
             }
             node.inc_host_lock_ref(FULL);

@@ -143,7 +143,8 @@ that Dynamo is owned by an unaffiliated third party.
 
 ## Bundled SGLang native radix core
 
-The files under `crates/core/src/engine/cache/sglang_radix_tree/` derive from
+The files under repository-root `crates/core/src/engine/cache/sglang_radix_tree/`
+and the repository-root `scripts/sglang_radix_core_fixes.patch` derive from
 [`sgl-project/sglang`](https://github.com/sgl-project/sglang) at immutable commit
 `f0fda25fc95c357368b714f90a13a69c1b67f50a`, originally
 `rust/sglang-radix-tree/src/{lib.rs,node.rs,unified_lru_list.rs,unified_tree_core.rs,value.rs,components/*.rs}`
@@ -152,10 +153,11 @@ contributors. Licensed under the Apache License, Version 2.0. The upstream
 repository's `LICENSE` is preserved alongside the bundled sources; there is no
 upstream root NOTICE file.
 
-These files are modified only for module paths, a dependency alias, native-only
-build/test wiring, attribution headers, and Rustfmt. Tree algorithms and native
-test assertions are unchanged. The adjacent README maps each original path and
-documents the modifications. The bundled source is part of the existing
+These files are modified for module paths, a dependency alias, native-only
+build/test wiring, attribution headers, Rustfmt, and the local correctness and
+allocation corrections recorded in the patch. The bundled README maps each
+original path and documents every local correction; upstream native test
+assertions are unchanged. The bundled source is part of the existing
 `aisimulate-core` crate and the `aisimulate` wheel, not an additional artifact.
 
 Source: https://github.com/sgl-project/sglang/tree/f0fda25fc95c357368b714f90a13a69c1b67f50a/rust/sglang-radix-tree

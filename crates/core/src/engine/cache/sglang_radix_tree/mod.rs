@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 // Derived from sgl-project/sglang at f0fda25fc95c357368b714f90a13a69c1b67f50a.
-// See README.md for original paths, license, and mechanical modifications.
+// See README.md for original paths, license, and documented modifications.
 
 //! Reusable Rust radix-tree core for SGLang's KV cache, with an optional
 //! Tensor/PyO3 production backend.
@@ -45,3 +45,7 @@ pub use value::{PageValue, RadixValue};
 
 #[cfg(test)]
 mod page_value_core;
+
+#[cfg(test)]
+#[path = "../sglang_radix_regressions.rs"]
+mod repair_regressions;

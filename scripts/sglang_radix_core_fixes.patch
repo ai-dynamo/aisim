@@ -1,0 +1,253 @@
+SPDX-FileCopyrightText: SGLang contributors
+SPDX-FileCopyrightText: Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+Derived from https://github.com/sgl-project/sglang at f0fda25fc95c357368b714f90a13a69c1b67f50a,
+original paths rust/sglang-radix-tree/src/{lib.rs,node.rs,value.rs,unified_tree_core.rs,components/{full,mamba,swa}.rs}.
+Modified after mechanical module adaptation. See crates/core/src/engine/cache/sglang_radix_tree/README.md
+and its LICENSE for provenance, the preserved license, and each local correction.
+
+--- a/components/full.rs
++++ b/components/full.rs
+@@ -185,8 +185,17 @@
+         if tracker[&ct] >= tree_core.component_state(FULL).evict_device_request_cnt {
+             return None;
+         }
+-        while let Some(Reverse((_, x))) = tree_core.full_evict_device_heap.pop() {
++        while let Some(Reverse((priority, x))) = tree_core.full_evict_device_heap.pop() {
+             if !tree_core.evictable_device_leaves.contains(x) {
++                continue;
++            }
++            let current_priority = tree_core
++                .eviction_strategy
++                .get_priority(tree_core.arena.node(x));
++            if priority != current_priority {
++                tree_core
++                    .full_evict_device_heap
++                    .push(Reverse((current_priority, x)));
+                 continue;
+             }
+             let last_node_parent = tree_core.arena.node(x).try_parent();
+@@ -291,6 +300,7 @@
+             let node = tree_core.arena.node_mut(node_id);
+             // write_back mode: the anchor may be device-only (no host_value); pin it anyway.
+             if !node.has_host_value(FULL) && !tree_core.is_write_back {
++                result.skipped_lock_components.insert(FULL);
+                 return result;
+             }
+             node.inc_host_lock_ref(FULL);
+--- a/components/mamba.rs
++++ b/components/mamba.rs
+@@ -45,6 +45,10 @@
+         let mamba_cache_chunk_size = params
+             .mamba_cache_chunk_size
+             .expect("the Mamba component requires mamba_cache_chunk_size");
++        assert!(
++            mamba_cache_chunk_size > 0,
++            "mamba_cache_chunk_size must be positive"
++        );
+         MambaComponent {
+             // A donated checkpoint must land on both the model's chunk grid and
+             // a radix-node boundary. `params.page_size` is already widened by DCP.
+@@ -184,14 +188,14 @@
+         if is_new_leaf {
+             tree_core
+                 .arena
+-                .set_device_value(node_id, MAMBA, mamba_value.shallow_clone());
++                .set_device_value(node_id, MAMBA, mamba_value.copy_for_adoption());
+             tree_core.device_lru_list_mut(MAMBA).insert_mru(node_id);
+             tree_core.inc_evictable_size(MAMBA, slot_len);
+             self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);
+             return;
+         }
+         if !tree_core.arena.has_device_value(node_id, MAMBA) {
+-            tree_core.set_component_device_value_(node_id, MAMBA, mamba_value.shallow_clone());
++            tree_core.set_component_device_value_(node_id, MAMBA, mamba_value.copy_for_adoption());
+             let tick = tree_core.arena.get_and_bump_access_counter();
+             tree_core.arena.node_mut(node_id).last_access_counter = tick;
+             self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);
+--- a/components/swa.rs
++++ b/components/swa.rs
+@@ -608,7 +608,7 @@
+         cache_actions: &mut Vec<CacheAction<V>>,
+     ) {
+         if let Some(branching_seqlen) = params.swa_branching_seqlen {
+-            result.swa_branch_inserted = params.key.atom_len() >= branching_seqlen;
++            result.swa_branch_inserted = result.total_len >= branching_seqlen;
+         }
+
+         if !is_new_leaf {
+--- a/mod.rs
++++ b/mod.rs
+@@ -45,3 +45,7 @@
+
+ #[cfg(test)]
+ mod page_value_core;
++
++#[cfg(test)]
++#[path = "../sglang_radix_regressions.rs"]
++mod repair_regressions;
+--- a/node.rs
++++ b/node.rs
+@@ -495,7 +495,10 @@
+     /// parent link; panics on a broken parent<->child link (an internal invariant).
+     pub(crate) fn detach_from_parent(&mut self, parent: &mut Node<K, V>, page_size: usize) {
+         // A live child is always registered under its namespaced page key.
+-        match parent.children.remove(&self.edge_key(page_size)) {
++        match parent.children.remove(&ChildEdgeRef::<K> {
++            namespace: self.namespace.as_ref(),
++            page: &self.key.as_ref()[..page_size],
++        }) {
+             Some(idx) if idx == self.idx => self.parent = None,
+             found => panic!(
+                 "detach_from_parent: parent {} has no child {} under key {:?} (found {:?})",
+@@ -804,6 +807,9 @@
+         node_prefix_len: usize,
+         prefix_len: usize,
+     },
++    /// The retained anchor must represent the supplied key's prefix.
++    #[error("insert continuation anchor {node_id} is not on the supplied key path")]
++    InsertAnchorKeyMismatch { node_id: NodeId },
+     /// A non-root continuation stays inside the anchor's namespace.
+     #[error("insert continuation namespace does not match non-root anchor {node_id}")]
+     InsertContinuationNamespaceMismatch { node_id: NodeId },
+--- a/unified_tree_core.rs
++++ b/unified_tree_core.rs
+@@ -1261,7 +1261,9 @@
+         let Some(swa) = self.try_component_by_type_(SWA) else {
+             return Ok(());
+         };
+-        swa.release_window_lock(self, node_idx, params, device_frees, host_frees);
++        if !params.skipped_lock_components.contains(SWA) {
++            swa.release_window_lock(self, node_idx, params, device_frees, host_frees);
++        }
+
+         // Drop strictly-lower-priority locks co-located on the node, skipping
+         // any the paired inc never took.
+@@ -1809,14 +1811,23 @@
+             return Err(TreeCoreRuntimeError::InsertAnchorNotDeviceResident { node_id: anchor.id });
+         }
+
++        // Validate length and content in one ancestor walk, without a path buffer.
++        // A NodeId alone does not bind the anchor to the supplied key.
++        let key = params.key.as_ref();
+         let mut cursor = prefix_node_idx;
+         let mut node_prefix_len = 0;
++        let mut key_matches = true;
+         loop {
+             let node = self.arena.node(cursor);
+             if node.is_root() {
+                 break;
+             }
++            let end_offset = node_prefix_len;
+             node_prefix_len += node.key.atom_len();
++            if node_prefix_len <= prefix_len {
++                key_matches &= key[prefix_len - node_prefix_len..prefix_len - end_offset]
++                    == node.key.as_ref()[..];
++            }
+             cursor = node.parent();
+         }
+         if node_prefix_len != prefix_len {
+@@ -1826,28 +1837,8 @@
+                 prefix_len,
+             });
+         }
+-
+-        // Release builds trust the retained match handle and avoid rereading the
+-        // complete prefix. Debug builds verify that the handle is on this key's
+-        // path, walking upward from the anchor so no path buffer is needed.
+-        #[cfg(debug_assertions)]
+-        {
+-            let key = params.key.as_ref();
+-            let mut end = prefix_len;
+-            let mut cursor = prefix_node_idx;
+-            loop {
+-                let node = self.arena.node(cursor);
+-                if node.is_root() {
+-                    break;
+-                }
+-                let start = end - node.key.atom_len();
+-                debug_assert!(
+-                    key[start..end] == node.key.as_ref()[..],
+-                    "insert continuation anchor is not on the supplied key path"
+-                );
+-                end = start;
+-                cursor = node.parent();
+-            }
++        if !key_matches {
++            return Err(TreeCoreRuntimeError::InsertAnchorKeyMismatch { node_id: anchor.id });
+         }
+         Ok(())
+     }
+@@ -1944,7 +1935,7 @@
+         if aligned_key_len == prefix_len {
+             // An empty suffix still visited its retained boundary above.
+             return Ok(InsertStepResult {
+-                actions: Vec::new(),
++                actions: prefix_actions,
+                 result: Some(InsertResult {
+                     prefix_len,
+                     total_len: aligned_key_len,
+@@ -1957,7 +1948,7 @@
+                     mamba_exist: true,
+                     swa_branch_inserted: false,
+                     adopted_ranges: params.track_adopted_ranges.then(HashMap::new),
+-                    cache_actions: prefix_actions,
++                    cache_actions: Vec::new(),
+                 }),
+             });
+         }
+@@ -3178,8 +3169,11 @@
+     ) -> Result<EvictionStepResult<V>, TreeCoreRuntimeError> {
+         let node_id = self.arena.resolve(node_id)?;
+         let mut result = EvictionStepResult::default();
+-        // Skip a deferred demote when a load-back now pins the device indices.
+-        if self.arena.node(node_id).is_load_back_pending() {
++        // Deferred work must recheck both load-back pins and locks acquired
++        // after backup was scheduled, before touching values or size ledgers.
++        if self.arena.node(node_id).is_load_back_pending()
++            || self.arena.node(node_id).is_device_locked()
++        {
+             return Ok(result);
+         }
+         {
+@@ -4829,6 +4823,11 @@
+         for &(child_id, pos, prefix_len) in &spans {
+             if pos + prefix_len <= window_start {
+                 continue;
++            }
++            if !self.arena.has_device_value(child_id, FULL) {
++                return Err(
++                    "attach_swa_window requires device Full KV throughout the window".into(),
++                );
+             }
+             if self.arena.has_device_value(child_id, SWA) {
+                 return Err(format!(
+--- a/value.rs
++++ b/value.rs
+@@ -88,6 +88,17 @@
+         }
+     }
+
++    /// Copy only the visible values directly into their compact shared allocation.
++    pub fn from_slice(values: &[T]) -> Self
++    where
++        T: Copy,
++    {
++        Self {
++            storage: Arc::from(values),
++            range: 0..values.len(),
++        }
++    }
++
+     pub fn as_slice(&self) -> &[T] {
+         &self.storage[self.range.clone()]
+     }
+@@ -121,7 +132,7 @@
+     }
+
+     fn copy_for_adoption(&self) -> Self {
+-        Self::from_vec(self.as_slice().to_vec())
++        Self::from_slice(self.as_slice())
+     }
+
+     fn slice(&self, start: usize, len: usize) -> Self {

@@ -43,15 +43,34 @@ The mechanical modifications are:
   It remains absent from production builds and available to adapter tests.
 - Allow unused upstream exports within the private module and apply Rustfmt.
 
-No tree algorithms, data representations, runtime checks, or test assertions
-are changed. This packaging adaptation adds no work to cache operations.
+After those adaptations, `scripts/sglang_radix_core_fixes.patch` applies the
+following local corrections to this pinned revision:
+
+- Recheck popped Full eviction priorities and preserve skipped Full host and
+  SWA early-release lock receipts.
+- Reject zero Mamba chunk sizes, copy donated Mamba slots for adoption, and
+  compare SWA continuation boundaries against the complete insert length.
+- Validate continuation key content in release builds during the existing
+  ancestor walk, and return retained-prefix backup actions for empty suffixes.
+- Defer demotion while device locks are held and reject SWA attachment over
+  host-only Full spans before any mutation.
+- Borrow child edge keys during removal and copy visible page slices directly
+  into compact shared storage during adoption.
+
+These are local deviations from upstream, covered by the AISimulate-authored
+`../sglang_radix_regressions.rs` and adapter tests. The pinned eviction policies,
+including split recency and whole-leaf LRU eviction, remain in use. Upstream's
+native assertions are unchanged. Adoption removes an intermediate allocation;
+removal avoids a key allocation. Continuation validation compares the retained
+key atoms without allocating a path or adding another ancestor walk.
 
 ## Updating
 
 Start from a verified immutable upstream checkout, preserve its license and
 notices, and use `scripts/sync_sglang_radix_core.py` to reproduce the documented
-mechanical adaptations. The script reads committed source at the pinned revision
-without changing the upstream checkout. Verify an existing copy with:
+adaptations and the local patch. The script reads committed source at the pinned
+revision with replacement refs disabled, without changing the upstream checkout.
+Verify an existing copy with:
 
 ```bash
 python3 scripts/sync_sglang_radix_core.py --source-checkout /path/to/sglang --check
@@ -59,6 +78,13 @@ python3 scripts/sync_sglang_radix_core.py --source-checkout /path/to/sglang --ch
 
 For a deliberate version update, update the script's revision, regenerate without
 `--check`, and update this revision and both canonical notice copies together.
+Reconcile the local patch against the new revision; remove corrections once
+they are included upstream. After updating either notice copy, run:
+
+```bash
+python3 scripts/check_packaged_legal_files.py
+```
+
 Keep the native tests, AISimulate cache/manager/scheduler regressions, and
 `cargo package --manifest-path crates/core/Cargo.toml --locked` passing.
 Changes to upstream behavior require separate behavioral qualification.
