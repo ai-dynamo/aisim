@@ -46,7 +46,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from aisim_core.data import Artifact, CategoryIndex, DatasetIndex, Entry, Manifest
+from aisim_core.data import Artifact, CategoryIndex, DatasetIndex, Entry, Manifest, _verify
 from aisim_core.data.catalog import CATALOG_DIR, build_catalog
 from aisim_core.data.e2e import read_snapshot
 from aisim_core.data.eval import load_record, record_paths
@@ -241,6 +241,32 @@ def _check_selected_files(source: Path, commit: str, files: Iterable[str]) -> No
         raise PromotionError("source must be a readable Git checkout") from exc
 
 
+def _category_support(source: Path, categories: Iterable[str]) -> dict[str, list[Artifact]]:
+    """The digest-pinned ``support`` files of the categories' source indexes.
+
+    Every selection of a category needs them (op-latency: the lookup tables), so a promotion carries them
+    with its manifests and registers them in the target's category index.
+    """
+    wanted = sorted(set(categories))
+    if not wanted:
+        return {}
+    try:
+        dataset = DatasetIndex.model_validate_json(bounded_json_bytes(source / CATALOG_DIR / "dataset.json"))
+        out: dict[str, list[Artifact]] = {}
+        for category in wanted:
+            reference = dataset.categories.get(category)
+            if reference is None:
+                continue
+            index = CategoryIndex.model_validate_json(_verify(source, reference.index).read_bytes())
+            for artifact in index.support:
+                _verify(source, artifact)
+            if index.support:
+                out[category] = list(index.support)
+        return out
+    except (OSError, ValueError, ValidationError) as exc:  # a pinned support file that fails its digest
+        raise PromotionError(f"category support is invalid: {str(exc).splitlines()[0]}") from exc
+
+
 def _select(source: Path, directories: list[str], plan: PromotionPlan) -> None:
     for raw in directories:
         d = raw.rstrip("/")
@@ -352,6 +378,18 @@ def plan_promotion(
     _select(source, request.directories, plan)
     if not plan.files:
         plan.findings.append(Finding("selection-empty", "selection contains no files"))
+    try:  # the category's lookup tables travel with its manifests and pass every gate the selection passes
+        categories = {shared.manifests[rel].category for rel in plan.files if rel in shared.manifests}
+        for artifacts in _category_support(source, categories).values():
+            for artifact in artifacts:
+                if not artifact.path.startswith(PROMOTABLE_ROOTS):
+                    plan.findings.append(
+                        Finding("selection-root", f"only {list(PROMOTABLE_ROOTS)} files are promoted", artifact.path)
+                    )
+                else:
+                    plan.files[artifact.path] = _sha(source / artifact.path)
+    except (PromotionError, OSError) as exc:
+        plan.findings.append(Finding("support-invalid", str(exc)))
     try:
         _check_selected_files(source, request.source_commit, plan.files)
     except PromotionError as exc:
@@ -421,8 +459,16 @@ def _dump(model: BaseModel) -> str:
     return json.dumps(model.model_dump(mode="json", by_alias=True), indent=2, sort_keys=True, allow_nan=False) + "\n"
 
 
-def register_manifests(target: Path, manifest_paths: list[str], dataset_id: str) -> None:
-    """Add manifests to ``catalog/dataset.json`` and their category indexes (idempotent)."""
+def register_manifests(
+    target: Path,
+    manifest_paths: list[str],
+    dataset_id: str,
+    support: Mapping[str, Iterable[Artifact]] | None = None,
+) -> None:
+    """Add manifests to ``catalog/dataset.json`` and their category indexes (idempotent).
+
+    An existing category index keeps its ``support`` files; ``support`` adds the promoted categories' own.
+    """
     index_path = target / CATALOG_DIR / "dataset.json"
     dataset = (
         DatasetIndex.model_validate_json(index_path.read_bytes())
@@ -442,14 +488,14 @@ def register_manifests(target: Path, manifest_paths: list[str], dataset_id: str)
             index_rel = f"{CATALOG_DIR}/{category}.json"
             if index_rel in reserved:  # another category already owns this path; never reuse it
                 index_rel = f"{CATALOG_DIR}/{category}-index.json"
-        existing = (
-            {
-                e.configuration_id: e
-                for e in CategoryIndex.model_validate_json((target / index_rel).read_bytes()).entries
-            }
+        current = (
+            CategoryIndex.model_validate_json((target / index_rel).read_bytes())
             if (target / index_rel).is_file()
-            else {}
+            else None
         )
+        existing = {e.configuration_id: e for e in current.entries} if current else {}
+        pinned = {a.path: a for a in (current.support if current else [])}
+        pinned.update({a.path: a for a in (support or {}).get(category, [])})
         for rel, manifest in items:
             existing[manifest.configuration_id] = Entry(
                 configuration_id=manifest.configuration_id,
@@ -461,6 +507,7 @@ def register_manifests(target: Path, manifest_paths: list[str], dataset_id: str)
             schema_version="aisim-category-index/v1",
             category=category,  # type: ignore[arg-type]
             entries=[existing[k] for k in sorted(existing)],
+            support=[pinned[k] for k in sorted(pinned)],
         )
         (target / index_rel).parent.mkdir(parents=True, exist_ok=True)
         (target / index_rel).write_text(_dump(index), encoding="utf-8")
@@ -537,6 +584,12 @@ def _apply_promotion(
         if (target / rel).exists() and _sha(target / rel) != digest:
             raise PromotionError(f"target already has different content at {rel}; promotion never overwrites")
     _check_selected_files(source, plan.request.source_commit, plan.files)  # and the bytes of the recorded commit
+    promoted = {Manifest.model_validate_json((source / rel).read_bytes()).category for rel in plan.manifests}
+    support = _category_support(source, promoted)
+    for artifacts in support.values():
+        for artifact in artifacts:
+            if artifact.path not in plan.files:
+                raise PromotionError(f"category support is outside the approved file selection: {artifact.path}")
     index_path = target / CATALOG_DIR / "dataset.json"
     _check_contained(target, list(plan.files) + [f"{CATALOG_DIR}/dataset.json"])
     categories = DatasetIndex.model_validate_json(index_path.read_bytes()).categories if index_path.is_file() else {}
@@ -570,7 +623,7 @@ def _apply_promotion(
         for rel, digest in plan.files.items():
             if _sha(target / rel) != digest:
                 raise PromotionError(f"copied bytes differ from the reviewed bytes: {rel}")
-        register_manifests(target, plan.manifests, plan.request.target_repo)
+        register_manifests(target, plan.manifests, plan.request.target_repo, support)
         build_catalog(target)
         report = validate_tree(target, repo=plan.request.target_repo, profile="public")
         if not report.ok:

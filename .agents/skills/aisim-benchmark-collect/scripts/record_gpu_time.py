@@ -55,9 +55,10 @@ def main(argv=None) -> int:
                 if not any(o.get("kind") == "Job" and o.get("uid") == uid for o in owners):
                     raise KubeParseError("Pod owner does not match the Job UID")
                 # The parser counts only a container's final execution: the GPU time of earlier restarted
-                # attempts would silently disappear, so a restarted Succeeded Pod is not turned into a number.
+                # attempts would silently disappear, whether the Pod succeeded or failed (a failed Pod's final
+                # execution is reported as a failed attempt), so a restarted finished Pod is not turned into a number.
                 status = pod.get("status") or {}
-                if status.get("phase") == "Succeeded":
+                if status.get("phase") in ("Succeeded", "Failed"):
                     for entry in (
                         *(status.get("initContainerStatuses") or []),
                         *(status.get("containerStatuses") or []),

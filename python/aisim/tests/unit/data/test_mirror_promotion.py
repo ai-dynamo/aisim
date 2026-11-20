@@ -1927,6 +1927,74 @@ def test_operation_publisher_yaml_sidecars_can_be_promoted(tmp_path, op_source):
         assert (target / path.relative_to(root)).read_bytes() == path.read_bytes()
 
 
+def _publisher_tree_as_mirror(tmp_path, op_source):  # noqa: F811
+    """The canonical publisher output, owned by the internal mirror (a hardware note it does not accept removed)."""
+    root = tmp_path / "mirror"
+    build_op_fixture(op_source, root)
+    (root / "data/op-latency/h200_sxm/README.md").unlink()
+    dataset = root / "catalog/dataset.json"
+    dataset.write_text(json.dumps({**json.loads(dataset.read_bytes()), "dataset_id": INTERNAL_REPO}))
+    return root
+
+
+def test_category_support_travels_with_a_promoted_operation_configuration(tmp_path, op_source):  # noqa: F811
+    from aisim_core.data import CategoryIndex
+    from aisim_core.data.op_tree import load_op_latency_tree
+
+    root = _publisher_tree_as_mirror(tmp_path, op_source)
+    build_catalog(root)
+    support = {"data/op-latency/perf_data_reuse_manifest.parquet", "data/op-latency/query_versions.parquet"}
+    assert {
+        a.path for a in CategoryIndex.model_validate_json((root / "catalog/op-latency.json").read_bytes()).support
+    } == support
+    directory = "data/op-latency/h200_sxm/gemm/vllm/1.0"  # the lookup tables sit above the selected directory
+    _public(root, "data/op-latency")
+    assert validate_tree(root).ok
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    assert draft.content_ok, draft.findings
+    approved = plan_promotion(root, _request(root, [directory], draft), _reviewers())
+    assert approved.ok and support <= set(approved.files), approved.findings
+    target = _target(tmp_path)
+    apply_promotion(approved, root, target)
+    index = CategoryIndex.model_validate_json((target / "catalog/op-latency.json").read_bytes())
+    assert {a.path for a in index.support} == support
+    assert validate_tree(target, repo=PUBLIC, profile="public").ok
+    load_op_latency_tree(target, tmp_path / "composed")  # fails without the lookups the pinned fetch needs
+
+
+def test_category_support_is_scanned_like_any_published_file(tmp_path, op_source):  # noqa: F811
+    import pyarrow.parquet as pq
+
+    root = _publisher_tree_as_mirror(tmp_path, op_source)
+    path = root / "data/op-latency/query_versions.parquet"
+    table = pq.read_table(path)
+    metadata = {k.decode(): v.decode() for k, v in (table.schema.metadata or {}).items() if k != b"aisim.schema"}
+    write_parquet(
+        table,
+        path,
+        "aisim-op-query-versions/v1",
+        extra_metadata={**metadata, "origin": "https://node7.corp.nvidia.com/v1"},
+    )
+    index = root / "catalog/op-latency.json"
+    document = json.loads(index.read_bytes())
+    for artifact in document["support"]:
+        if artifact["path"] == "data/op-latency/query_versions.parquet":
+            artifact["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+            artifact["bytes"] = path.stat().st_size
+    index.write_text(json.dumps(document))
+    dataset = root / "catalog/dataset.json"
+    dataset_doc = json.loads(dataset.read_bytes())
+    dataset_doc["categories"]["op-latency"]["index"].update(
+        sha256=hashlib.sha256(index.read_bytes()).hexdigest(), bytes=index.stat().st_size
+    )
+    dataset.write_text(json.dumps(dataset_doc))
+    build_catalog(root)
+    _public(root, "data/op-latency")
+    directory = "data/op-latency/h200_sxm/gemm/vllm/1.0"
+    plan = plan_promotion(root, _request(root, [directory]), _reviewers())
+    assert "internal-host" in {f.code for f in plan.findings}
+
+
 def _manifest_sidecar(root, manifest_rel, name, payload, fmt, role, schema):
     manifest_path = root / manifest_rel
     manifest = Manifest.model_validate_json(manifest_path.read_bytes())
@@ -2283,7 +2351,21 @@ def _refresh_artifact(root, directory, relative, **updates):
     build_catalog(root)
 
 
-@pytest.mark.parametrize("location", ["file", "field", "binary"])
+def _set_column_chunk_file_path(path, value):
+    """Rewrite the footer so every column chunk carries ``file_path`` (the data pages are untouched)."""
+    import pyarrow.parquet as pq
+
+    raw = path.read_bytes()
+    footer_size = int.from_bytes(raw[-8:-4], "little")
+    footer = pq.read_metadata(path)
+    footer.set_file_path(value)
+    sink = pa.BufferOutputStream()
+    footer.write_metadata_file(sink)
+    written = sink.getvalue().to_pybytes()[4:-8]
+    path.write_bytes(raw[: len(raw) - 8 - footer_size] + written + len(written).to_bytes(4, "little") + b"PAR1")
+
+
+@pytest.mark.parametrize("location", ["file", "field", "binary", "chunk-path"])
 @pytest.mark.parametrize("value,blocked", [("https://node7.corp.nvidia.com/v1", True), ("public-benchmark", False)])
 def test_parquet_metadata_and_binary_values_reach_both_publication_gates(tmp_path, location, value, blocked):
     import pyarrow.parquet as pq
@@ -2295,9 +2377,13 @@ def test_parquet_metadata_and_binary_values_reach_both_publication_gates(tmp_pat
         table = table.append_column("diagnostic", pa.array([None, value.encode()], type=pa.binary()))
     elif location == "field":
         table = table.set_column(0, table.schema.field(0).with_metadata({b"origin": value.encode()}), table.column(0))
+    elif location == "chunk-path":
+        pass
     else:
         metadata = {"origin": value}
     write_parquet(table, root / relative, OP_TABLE_SCHEMA_ID, extra_metadata=metadata)
+    if location == "chunk-path":
+        _set_column_chunk_file_path(root / relative, value)
     _refresh_artifact(root, directory, relative)
     assert validate_tree(root).ok
     plan = plan_promotion(root, _request(root, [directory]), _reviewers())
@@ -3287,6 +3373,19 @@ def test_snapshot_tables_must_be_dataset_payloads(tmp_path, monkeypatch, which, 
     assert ("snapshot-invalid" in {f.code for f in report.errors}) is hidden
     # A noncanonical table path inside the payload inventory stays supported.
     assert hidden or report.ok, report.errors
+
+
+@pytest.mark.parametrize("value", ["plain-synthetic-value", "[REDACTED]"])
+def test_dataset_card_front_matter_ends_at_an_unindented_delimiter(tmp_path, value):
+    root, _ = _mirror(tmp_path)
+    # An indented --- is block-scalar text in YAML; the Hub only closes the card at an unindented one.
+    card = f'\n---\ndescription: |\n  first\n  ---\n  second\npassword: "{value}"\n---\n# Synthetic dataset\n'
+    (root / "README.md").write_text(card)
+    shutil.rmtree(root / "mirror", ignore_errors=True)
+    report = validate_tree(root, profile="public")
+    secrets = [f for f in report.errors if f.code == "secret" and f.path == "README.md"]
+    assert bool(secrets) == (value != "[REDACTED]")
+    assert report.ok == (value == "[REDACTED]"), report.errors
 
 
 @pytest.mark.parametrize("profile", ["mirror", "public"])

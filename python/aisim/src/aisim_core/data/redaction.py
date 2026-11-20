@@ -39,7 +39,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from aisim_core.data import CategoryIndex, DatasetIndex, Manifest, _verify
+from aisim_core.data import Artifact, CategoryIndex, DatasetIndex, Manifest, _verify
 from aisim_core.data.catalog import CATALOG_DIR, COVERAGE_FILE, catalog_files, read_catalog_coverage
 from aisim_core.data.e2e import (
     OBSERVATIONS_SCHEMA,
@@ -360,6 +360,23 @@ def _check_manifest(
     return out
 
 
+def _check_support(root: Path, artifact: Artifact, policy: RedactionPolicy) -> list[Finding]:
+    """Scan a category-level support file (op-latency lookup tables) like a manifest's declared artifact."""
+    suffixes = {"parquet": ".parquet", "json": ".json", "yaml": ".yaml"}
+    if artifact.format not in suffixes or Path(artifact.path).suffix.lower() != suffixes[artifact.format]:
+        return [
+            Finding("artifact-format", f"unsupported or mismatched support format: {artifact.format}", artifact.path)
+        ]
+    if artifact.format == "parquet":
+        path = root / artifact.path
+        return _check_table_text(
+            read_parquet(path, artifact.artifact_schema), artifact.path, policy, "support column", path=path
+        )
+    if artifact.format == "json":
+        return scan_json_file(checked_path(root, artifact.path), policy, artifact.path, "support JSON")
+    return scan_yaml(checked_path(root, artifact.path).read_bytes(), policy, artifact.path, "support YAML")
+
+
 def _check_observations(path: Path, rel: str, policy: RedactionPolicy) -> list[Finding]:
     table: pa.Table = read_parquet(path, OBSERVATIONS_SCHEMA)
     out: list[Finding] = []
@@ -382,7 +399,15 @@ def _check_requests(path: Path, rel: str, policy: RedactionPolicy) -> list[Findi
 
 def _check_table_text(table: pa.Table, rel: str, policy: RedactionPolicy, where: str, *, path: Path) -> list[Finding]:
     """Scan metadata and text, including UTF-8 binary cells; undecodable bytes are invalid."""
-    out = scan_value(pq.ParquetFile(path).metadata.created_by, policy, rel, "Parquet producer")
+    footer = pq.ParquetFile(path).metadata
+    out = scan_value(footer.created_by, policy, rel, "Parquet producer")
+    # The footer's column-chunk ``file_path`` is readable text that the Arrow schema metadata does not carry.
+    chunk_paths = {
+        footer.row_group(group).column(column).file_path
+        for group in range(footer.num_row_groups)
+        for column in range(footer.num_columns)
+    }
+    out.extend(scan_value(sorted(p for p in chunk_paths if p), policy, rel, "Parquet column chunk file path"))
     metadata = [table.schema.metadata or {}]
     field_names: dict[str, None] = {}
 
@@ -587,6 +612,9 @@ def check_publishable(
             for rel, index in indexes.items():
                 if rel in chosen_set:
                     findings.extend(scan_value(index.model_dump(mode="json", by_alias=True), policy, rel, "index"))
+                for artifact in getattr(index, "support", ()):  # lookup tables no manifest declares
+                    if artifact.path in chosen_set:
+                        findings.extend(_check_support(root, artifact, policy))
         except (OSError, ValueError, RecursionError) as exc:
             findings.append(Finding("document-invalid", str(exc).splitlines()[0], index_rel))
     catalog_shards = {p.relative_to(root).as_posix() for p in catalog_files(root)}
