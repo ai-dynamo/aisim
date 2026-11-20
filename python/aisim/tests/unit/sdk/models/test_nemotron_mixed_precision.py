@@ -324,7 +324,10 @@ def test_packed_qkv_declaration_precedes_split_entries():
     assert _projection_modes(raw, "*", NVFP4)["qkv_gemm"] == {FP8: 1}
 
 
-@pytest.mark.parametrize("target", ["*.qkv_proj", r"re:.*\.qkv_proj$"])
+@pytest.mark.parametrize(
+    "target",
+    ["*.qkv_proj", r"re:.*\.qkv_proj$", r"re:.*\.(qkv_proj|q_proj)$", r"re:.*\.(qkv_proj|q_proj|k_proj|v_proj)$"],
+)
 def test_packed_qkv_pattern_target_precedes_split_names(target):
     raw = {"quantization_config": {"config_groups": _groups(qkv=(4, [target]), mamba=(8, ["*.in_proj"]))}}
     # The global mode inferred from in_proj is FP8; QKV keeps its packed NVFP4 target.
@@ -360,6 +363,30 @@ def test_packed_qkv_precision_reaches_native_pricing(monkeypatch, tmp_path, proj
     for prefill in (True, False):
         expected = (7 * uniform[BF16][prefill]["qkv_gemm"] + uniform[FP8][prefill]["qkv_gemm"]) / 8
         assert mixed[prefill]["qkv_gemm"] == pytest.approx(expected, rel=1e-9)
+
+
+def test_overlapping_packed_qkv_target_reaches_native_pricing(monkeypatch, tmp_path):
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
+
+    def packed_attention(section, _e_layers):
+        section.clear()
+        section.update(
+            quant_method="modelopt_mixed",
+            quant_algo="MIXED_PRECISION",
+            config_groups=_groups(
+                qkv=(4, [r"re:.*\.(qkv_proj|q_proj)$"]), mamba=(8, ["*.in_proj"]), experts=(4, ["*.experts.*"])
+            ),
+        )
+
+    path = _write_super(tmp_path, packed_attention)
+    model = get_model(path, ModelConfig(moe_tp_size=1, system="gb200"), backend_name="vllm")
+    assert model.config.gemm_quant_mode == FP8
+    assert _buckets(model.context_ops)["qkv_gemm"] == {NVFP4: 8}
+    mixed = _latencies(path)
+    uniform = _latencies(path, gemm_quant_mode=NVFP4)
+    # All eight packed QKV projections target NVFP4, despite the inferred FP8 default.
+    for prefill in (True, False):
+        assert mixed[prefill]["qkv_gemm"] == pytest.approx(uniform[prefill]["qkv_gemm"], rel=1e-9)
 
 
 @pytest.mark.parametrize(

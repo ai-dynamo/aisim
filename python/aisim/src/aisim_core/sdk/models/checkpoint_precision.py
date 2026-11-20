@@ -97,7 +97,7 @@ class CheckpointPrecision:
                 patterns.append((target, algo))
             elif self.exact.setdefault(target, algo) != algo:
                 self.conflicts.setdefault(target, {self.exact[target]}).add(algo)
-        self.patterns = [(_target_regex([target]), algo) for target, algo in patterns]
+        self.patterns = [(_target_regex([target]), algo, target == "Linear") for target, algo in patterns]
         # ModelOpt also resolves a module from a listed descendant, such as ``<module>.weight``
         # or ``<experts>.0.up_proj`` (ModelOptMixedPrecisionConfig._resolve_quant_algo, prefix
         # lookup, vLLM v0.31.0). Index every ancestor of a literal listed key once so a module
@@ -127,7 +127,7 @@ class CheckpointPrecision:
         if not algos:
             # An exact listing wins; otherwise a listed descendant declares the module's precision.
             algos.update(algo for path in paths for algo in self.descendants.get(path, ()))
-        algos.update(algo for regex, algo in self.patterns if any(regex.fullmatch(path) for path in paths))
+        algos.update(algo for regex, algo, _ in self.patterns if any(regex.fullmatch(path) for path in paths))
         return False, algos
 
     def _excluded(self, path: str) -> bool:
@@ -159,16 +159,16 @@ class CheckpointPrecision:
                 packed = packed_modules.get(key) if packed_modules else None
                 if packed:
                     paths = layer_paths(layer, packed)
-                    split = [path for module in modules for path in layer_paths(layer, module)]
                     # Serving resolves an explicitly declared packed module before its split
-                    # checkpoint names. A pattern that also matches a split name (``Linear``) is
-                    # no packed declaration: it would bypass the split exclusions.
+                    # checkpoint names, even when its path pattern also matches a split name.
+                    # A ``Linear`` class target is no packed declaration: it would bypass
+                    # the split exclusions.
                     if any(
                         self._excluded(path) or path in self.exact or path in self.conflicts or path in self.descendants
                         for path in paths
                     ) or any(
-                        any(map(regex.fullmatch, paths)) and not any(map(regex.fullmatch, split))
-                        for regex, _ in self.patterns
+                        not is_class_target and any(map(regex.fullmatch, paths))
+                        for regex, _, is_class_target in self.patterns
                     ):
                         modules = (packed,)
                 entries = [(module, *self.module(layer_paths(layer, module))) for module in modules]
@@ -194,7 +194,7 @@ class CheckpointPrecision:
     @cached_property
     def algos(self) -> set[str]:
         """Every algorithm the checkpoint lists or targets."""
-        return {*self.exact.values(), *(algo for _, algo in self.patterns)}
+        return {*self.exact.values(), *(algo for _, algo, _ in self.patterns)}
 
     @cached_property
     def targets_only(self) -> bool:
