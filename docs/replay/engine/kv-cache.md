@@ -713,8 +713,10 @@ Guard ownership and custom policies are not modeled.
 ### KVCR-owned disk
 
 With `kvcr.g3`, each rank also has a disk cache that KVCR owns: a block that
-KVCR-owned memory evicts is written there instead of dropped, and a lookup
-that misses G2 and that memory reads it back into G2. With `g3`, the
+KVCR-owned memory evicts is written there when a disk slot is available and
+the write finishes before its deadline. If every disk slot is held by a read,
+or the write misses its deadline, the memory block is dropped without a disk
+copy. A lookup that misses G2 and that memory reads a saved block back into G2. With `g3`, the
 `local_g2.policy` values `lru` and `fifo` stand for KVCR's `g3_lru` and
 `g3_fifo`.
 
@@ -757,8 +759,9 @@ With `g3` the `kvcr` summary gains a `g3` section of block counts:
 then includes the blocks written to disk, `dropped_blocks` the blocks that
 waited too long and `loaded_blocks` the blocks read from disk.
 
-`kvcr.g3` is rejected with an adapter stack such as `--stack dynamo`, whose
-own AISim core does not know the `disk` tier yet.
+`kvcr.g3` requires `--stack engine` without configured adapters. It is rejected
+with an adapter stack such as `--stack dynamo`, whose own AISim core does not
+know the `disk` tier yet, and with adapters configured on the engine stack.
 
 ### Supported
 

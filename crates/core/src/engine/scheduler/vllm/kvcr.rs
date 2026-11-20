@@ -311,10 +311,16 @@ impl LocalG2 {
                     }
                     continue;
                 } else {
-                    // Nothing can make room: KVCR drops the block.
-                    deposit.waiting.pop_front();
-                    registry.local_g2_stats().dropped_blocks += 1;
-                    !deposit.waiting.is_empty()
+                    // Nothing can make room for this store. Rejecting a
+                    // waiter changes neither the tier nor its protected set,
+                    // so one failed victim scan settles every remaining miss.
+                    registry.local_g2_stats().dropped_blocks += deposit
+                        .waiting
+                        .drain(..)
+                        .filter(|key| tier.lookup(*key) == Lookup::Miss)
+                        .count()
+                        as u64;
+                    false
                 };
                 if more {
                     continue;
@@ -426,10 +432,10 @@ impl VllmKvcrAdapter {
             };
             tier.register(LOCAL_G2_CLIENT, link)?;
             let tier = HostTierHandle::new(tier);
-            registry.set_local_g2(self.rank, tier.clone());
             let g3 = (registry.g3_config())
                 .map(|g3| G3::new(g3, lru, block_bytes * gpus_per_rank))
                 .transpose()?;
+            registry.set_local_g2(self.rank, tier.clone());
             self.local = Some(LocalG2 {
                 tier,
                 lru,
@@ -468,11 +474,9 @@ impl VllmKvcrAdapter {
             .is_some_and(|ends| *ends > now)
     }
 
-    /// Restore the leading blocks of `prompt` after the `g1_blocks` G1 holds
-    /// that G2 lacks too: first the run this rank's KVCR-owned memory holds,
-    /// then the run the hinted `source` holds. `meta` describes the blocks
-    /// after `g1_blocks`. Returns true only when a pending transfer will wake
-    /// the lookup.
+    /// Plan the restorable prefix in prompt order across this rank's memory,
+    /// disk and hinted peer before partitioning it into a promotion and pull.
+    /// Neither transfer evicts a block of the prompt G1 still needs.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn stage(
         &mut self,
@@ -492,273 +496,204 @@ impl VllmKvcrAdapter {
             self.attempted.clear();
         }
         let keys = &prompt[g1_blocks..];
-        let prefix = (prompt, g1_blocks);
-        let (promoting, promoted) =
-            self.promote(tier, client, owner, held, shared, prefix, meta, now);
-        let (pulling, pulled) = match source {
-            Some(source) if source != self.rank => {
-                self.pull(tier, client, owner, source, keys, meta, now)
-            }
-            _ => (false, None),
-        };
-        if let (Some(promotion), Some(pull)) = (promoted, pulled) {
-            let local = self.local.as_mut().expect("a promotion has KVCR memory");
-            let mut latest = local.promotions.iter_mut().rev();
-            let promotion = latest.find(|copy| copy.reservation == promotion);
-            promotion.expect("it was just staged").pull = Some(pull);
-            self.stages.get_mut(&pull).expect("just staged").joined = true;
+        let room = tier.room_epoch(now);
+        let (held_len, mut deferred) = held.refresh(tier, keys);
+        let mut registry = self.registry.lock().unwrap();
+        let peer = source
+            .filter(|source| *source != self.rank)
+            .and_then(|source| registry.source(source).map(|tiers| (source, tiers)));
+        let mut peer_g2 = peer.as_ref().map(|(_, (g2, _))| g2.lock());
+        let mut peer_local = peer
+            .as_ref()
+            .and_then(|(_, (_, local))| local.as_ref())
+            .map(HostTierHandle::lock);
+        let mut own = self.local.as_ref().map(|local| local.tier.lock());
+        let disk = self.local.as_ref().and_then(|local| local.g3.as_ref());
+        let at = (
+            room,
+            own.as_ref().map_or(0, |tier| tier.lookup_epoch()) + disk.map_or(0, |g3| g3.changes),
+            keys.len(),
+        );
+        if let Some(wait) = self
+            .local
+            .as_ref()
+            .and_then(|local| local.no_room.get(&owner))
+            .filter(|wait| wait.at == at)
+        {
+            tier.note_external_capacity_retry(owner, wait.key, now);
+            return wait.deferred;
         }
-        if (promoted.is_some() || pulled.is_some()) && restore.record_round(self.rank_progress) {
-            self.registry.lock().unwrap().note_bypassed();
+        let (mut plan, mut no_room) = (None::<ExternalPlan>, None);
+        let (mut promoted, mut read, mut end) = (Vec::new(), Vec::new(), 0);
+        let (mut g2_keys, mut local_keys) = (Vec::new(), Vec::new());
+        let (mut partial, mut asks_absent) = (false, false);
+        for (index, key) in keys.iter().copied().enumerate().skip(held_len) {
+            match tier.planned_lookup(plan.as_ref(), key) {
+                Lookup::Hit => {}
+                Lookup::Pending { .. } => deferred = true,
+                Lookup::Miss => {
+                    if self.attempted.contains(&(owner, key)) {
+                        partial = true;
+                        break;
+                    }
+                    let own_lookup = own.as_ref().map_or(Lookup::Miss, |tier| tier.lookup(key));
+                    // An in-flight deposit belongs to this rank; do not
+                    // duplicate it by fetching a peer copy.
+                    if matches!(own_lookup, Lookup::Pending { .. }) {
+                        break;
+                    }
+                    let in_memory = own_lookup == Lookup::Hit;
+                    let on_disk = disk.is_some_and(|g3| g3.on_disk(key));
+                    let in_peer_memory = !(in_memory || on_disk)
+                        && peer_local
+                            .as_ref()
+                            .is_some_and(|tier| tier.lookup(key) == Lookup::Hit);
+                    let in_peer_g2 = !(in_memory || on_disk || in_peer_memory)
+                        && peer_g2
+                            .as_ref()
+                            .is_some_and(|tier| tier.lookup(key) == Lookup::Hit);
+                    if !(in_memory || on_disk || in_peer_memory || in_peer_g2) {
+                        partial = true;
+                        // An unrequestable suffix must not turn an otherwise
+                        // memory-only peer read into a source-pass wait.
+                        asks_absent = peer.is_some()
+                            && plan.as_ref().is_some_and(|plan| tier.plan_has_room(plan));
+                        break;
+                    }
+                    let plan = plan.get_or_insert_with(|| tier.plan_external(keys, now));
+                    if !tier.plan_reserve(plan, key) {
+                        partial = true;
+                        no_room = Some(key);
+                        break;
+                    }
+                    if in_memory || on_disk {
+                        (if in_memory { &mut promoted } else { &mut read }).push(key);
+                        end = g1_blocks + index + 1;
+                    } else {
+                        (if in_peer_memory {
+                            &mut local_keys
+                        } else {
+                            &mut g2_keys
+                        })
+                        .push(key);
+                    }
+                }
+            }
+        }
+        if let Some(key) = no_room {
+            tier.note_external_capacity_retry(owner, key, now);
+        }
+        // Validate a queued disk deadline before committing either G2 reservation.
+        if let Some(g3) = disk.filter(|_| !read.is_empty()) {
+            g3.read_end(read.len(), now);
+        }
+        let Some(plan) = plan.filter(|plan| !plan.reserved().is_empty()) else {
+            drop(own);
+            if let Some(local) = &mut self.local {
+                local.no_room.remove(&owner);
+                if let Some(key) = no_room {
+                    local.no_room.insert(owner, NoRoom { at, key, deferred });
+                }
+            }
+            return deferred;
+        };
+        let (promotion, pull) = plan.partition(|key| {
+            own.as_ref()
+                .is_some_and(|tier| tier.lookup(*key) == Lookup::Hit)
+                || disk.is_some_and(|g3| g3.on_disk(*key))
+        });
+        let promotion = (!promotion.reserved().is_empty()).then(|| {
+            self.attempted
+                .extend(promotion.reserved().iter().map(|key| (owner, *key)));
+            let meta = meta.map(|meta| planned_meta(keys, meta, promotion.reserved()));
+            tier.reserve_planned(client, owner, promotion, meta, now)
+        });
+        let pull = (!pull.reserved().is_empty()).then(|| {
+            if registry.lands_at_submit() {
+                self.attempted
+                    .extend(pull.reserved().iter().map(|key| (owner, *key)));
+            }
+            let meta = meta.map(|meta| planned_meta(keys, meta, pull.reserved()));
+            tier.reserve_planned(client, owner, pull, meta, now)
+        });
+        let pull = pull.map(|reservation| {
+            let (source, _) = peer.as_ref().expect("a pull has a peer");
+            peer_g2.as_mut().unwrap().pin_external(&g2_keys);
+            let reads = g2_keys.is_empty() && !asks_absent;
+            if let Some(local) = peer_local.as_mut().filter(|_| !reads) {
+                local.pin_external(&local_keys);
+            } else {
+                registry.read_local(*source, &local_keys);
+            }
+            let id = registry.submit(
+                self.rank,
+                *source,
+                g2_keys.len() + local_keys.len(),
+                partial,
+                now,
+            );
+            if reads {
+                registry.skip_source_wait(id);
+            }
+            *self.pulling.entry(owner).or_default() += 1;
+            self.stages.insert(
+                id,
+                Stage {
+                    owner: Some(owner),
+                    source: *source,
+                    reservation,
+                    keys: g2_keys,
+                    local_keys,
+                    reads,
+                    joined: promotion.is_some(),
+                },
+            );
+            id
+        });
+        if promotion.is_some() {
+            own.as_mut().unwrap().pin_external(&promoted);
+        }
+        drop(own);
+        if let Some(local) = &mut self.local {
+            local.no_room.remove(&owner);
+            if let Some(reservation) = promotion {
+                let mut ends = now;
+                if !promoted.is_empty() {
+                    ends = local.copy_end(local.promotion_tail, promoted.len(), now);
+                    local.promotion_tail = Some(ends);
+                }
+                if let Some(g3) = local.g3.as_mut().filter(|_| !read.is_empty()) {
+                    ends = ends.max(g3.read(reservation, read, now));
+                }
+                local.promotion_ends.insert(owner, ends);
+                let rerank = local.lru.then(|| {
+                    let shared = shared.get_or_insert_with(Default::default);
+                    shared.lock().unwrap().extend(&prompt[..end]);
+                    (shared.clone(), end)
+                });
+                let index = local.promotions.partition_point(|copy| copy.ends <= ends);
+                local.promotions.insert(
+                    index,
+                    Promotion {
+                        ends,
+                        reservation,
+                        keys: promoted,
+                        rerank,
+                        pull,
+                    },
+                );
+            }
+        }
+        self.epoch += 1;
+        if restore.record_round(self.rank_progress) {
+            registry.note_bypassed();
             tracing::warn!(
                 %owner,
                 "KVCR made no progress in {MAX_RESTORE_ROUNDS_WITHOUT_PROGRESS} rounds; \
                  continuing without further KVCR restores"
             );
         }
-        promoting || pulling
-    }
-
-    /// Reserve G2 slots for the run of blocks, after the ones G1 or G2
-    /// holds, that KVCR-owned memory or, failing that, its disk holds; KVCR
-    /// delivers both as one job. Like a pull, the reservation evicts none of
-    /// the request's blocks: a prefix larger than G2 would otherwise keep
-    /// evicting itself, one timed copy after another. Returns whether a
-    /// pending G2 entry will wake the lookup and the reservation this call
-    /// staged.
-    #[allow(clippy::too_many_arguments)]
-    fn promote(
-        &mut self,
-        tier: &mut HostTier,
-        client: u64,
-        owner: Uuid,
-        held: &mut HeldPrefix,
-        shared: &mut Option<SharedStorePrefix>,
-        (prompt, g1_blocks): (&[HostBlockKey], usize),
-        meta: Option<&[HostBlockMeta]>,
-        now: f64,
-    ) -> (bool, Option<TransferId>) {
-        let Some(local) = &mut self.local else {
-            return (false, None);
-        };
-        let keys = &prompt[g1_blocks..];
-        // Settles the transfers due by `now`, as planning would.
-        let room = tier.room_epoch(now);
-        let (held_len, mut deferred) = held.refresh(tier, keys);
-        let mut source = local.tier.lock();
-        // With disk, what KVCR holds also changes when a write starts or ends.
-        let disk = local.g3.as_ref().map_or(0, |g3| g3.changes);
-        let at = (room, source.lookup_epoch() + disk, keys.len());
-        if let Some(wait) = local.no_room.get(&owner).filter(|wait| wait.at == at) {
-            tier.note_external_capacity_retry(owner, wait.key, now);
-            return (wait.deferred, None);
-        }
-        local.no_room.remove(&owner);
-        let (mut plan, mut no_room) = (None::<ExternalPlan>, None);
-        // The reserved blocks KVCR copies from its memory and reads from its
-        // disk, and one past the last of them, as a prompt position.
-        let (mut promoted, mut read, mut end) = (Vec::new(), Vec::new(), 0);
-        for (index, key) in keys.iter().copied().enumerate().skip(held_len) {
-            match tier.planned_lookup(plan.as_ref(), key) {
-                Lookup::Hit => {}
-                Lookup::Pending { .. } => deferred = true,
-                Lookup::Miss => {
-                    // G2 keeps a block pinned while it is copied into KVCR
-                    // memory, so a block this memory is filling is a G2 hit.
-                    // A block memory lacks may be on disk; one being written
-                    // is still in memory.
-                    let in_memory = source.lookup(key) == Lookup::Hit;
-                    let held = in_memory || local.g3.as_ref().is_some_and(|g3| g3.on_disk(key));
-                    if self.attempted.contains(&(owner, key)) || !held {
-                        break;
-                    }
-                    let plan = plan.get_or_insert_with(|| tier.plan_external(keys, now));
-                    if !tier.plan_reserve(plan, key) {
-                        no_room = Some(key);
-                        break;
-                    }
-                    (if in_memory { &mut promoted } else { &mut read }).push(key);
-                    end = g1_blocks + index + 1;
-                }
-            }
-        }
-        if let Some(key) = no_room {
-            tier.note_external_capacity_retry(owner, key, now);
-        }
-        let Some(plan) = plan.filter(|plan| !plan.reserved().is_empty()) else {
-            if let Some(key) = no_room {
-                let wait = NoRoom { at, key, deferred };
-                local.no_room.insert(owner, wait);
-            }
-            return (deferred, None);
-        };
-        let meta = meta.map(|meta| planned_meta(keys, meta, plan.reserved()));
-        // The copy can land, and be evicted again, at this same instant.
-        self.attempted
-            .extend(plan.reserved().iter().map(|key| (owner, *key)));
-        let reservation = tier.reserve_planned(client, owner, plan, meta, now);
-        source.pin_external(&promoted);
-        drop(source);
-        // The job ends when its copy from memory and its read from disk have.
-        let mut ends = now;
-        if !promoted.is_empty() {
-            ends = local.copy_end(local.promotion_tail, promoted.len(), now);
-            local.promotion_tail = Some(ends);
-        }
-        if let Some(g3) = local.g3.as_mut().filter(|_| !read.is_empty()) {
-            ends = ends.max(g3.read(reservation, read, now));
-        }
-        local.promotion_ends.insert(owner, ends);
-        let rerank = local.lru.then(|| {
-            let shared = shared.get_or_insert_with(Default::default);
-            shared.lock().unwrap().extend(&prompt[..end]);
-            (shared.clone(), end)
-        });
-        let promotion = Promotion {
-            ends,
-            reservation,
-            keys: promoted,
-            rerank,
-            pull: None,
-        };
-        let index = local.promotions.partition_point(|copy| copy.ends <= ends);
-        local.promotions.insert(index, promotion);
-        self.epoch += 1;
-        (true, Some(reservation))
-    }
-
-    /// Reserve and pull, as one transfer, the leading `keys` this rank lacks
-    /// and `source` holds in its G2 or its KVCR-owned memory. The reservation
-    /// evicts none of `keys`, local G2 hits included. Returns whether a
-    /// pending transfer will wake the lookup and the pull this call staged.
-    #[allow(clippy::too_many_arguments)]
-    fn pull(
-        &mut self,
-        tier: &mut HostTier,
-        client: u64,
-        owner: Uuid,
-        source: KvHintSource,
-        keys: &[HostBlockKey],
-        meta: Option<&[HostBlockMeta]>,
-        now: f64,
-    ) -> (bool, Option<u64>) {
-        let mut registry = self.registry.lock().unwrap();
-        let Some((source_g2, source_local)) = registry.source(source) else {
-            return (false, None);
-        };
-        let mut src = source_g2.lock();
-        let src_local = source_local.as_ref().map(HostTierHandle::lock);
-        let own_local = self.local.as_ref().map(|local| local.tier.lock());
-        let own_g3 = self.local.as_ref().and_then(|local| local.g3.as_ref());
-        let (mut deferred, mut partial) = (false, false);
-        let (mut plan, mut no_room) = (None, None);
-        // The rank asks the source for a block the source lacks.
-        let mut asks_absent = false;
-        // Per reserved key, if the source has KVCR-owned memory: whether that
-        // memory serves it.
-        let mut from_local = Vec::new();
-        for key in keys.iter().copied() {
-            match tier.lookup(key) {
-                Lookup::Hit => {}
-                Lookup::Pending { .. } => deferred = true,
-                Lookup::Miss => {
-                    // KVCR prefers its own memory and disk to a peer; a block
-                    // it holds or is storing, or that G2 had no room for, is
-                    // not pulled either.
-                    if own_local
-                        .as_ref()
-                        .is_some_and(|local| local.lookup(key) != Lookup::Miss)
-                        || own_g3.is_some_and(|g3| g3.on_disk(key))
-                    {
-                        break;
-                    }
-                    let in_local = src_local
-                        .as_ref()
-                        .is_some_and(|local| local.lookup(key) == Lookup::Hit);
-                    if self.attempted.contains(&(owner, key)) {
-                        partial = true;
-                        break;
-                    }
-                    if !(in_local || matches!(src.lookup(key), Lookup::Hit)) {
-                        (partial, asks_absent) = (true, true);
-                        break;
-                    }
-                    // Protect every key G1 lacks, local G2 hits included.
-                    let plan = plan.get_or_insert_with(|| tier.plan_external(keys, now));
-                    if !tier.plan_reserve(plan, key) {
-                        (partial, no_room) = (true, Some(key));
-                        break;
-                    }
-                    if src_local.is_some() {
-                        from_local.push(in_local);
-                    }
-                }
-            }
-        }
-        drop(own_local);
-        let plan = plan.filter(|plan| !plan.reserved().is_empty());
-        let pulled = plan
-            .as_ref()
-            .map(|plan| plan.reserved().to_vec())
-            .unwrap_or_default();
-        let reservation = plan.map(|plan| {
-            let meta = meta.map(|meta| planned_meta(keys, meta, &pulled));
-            tier.reserve_planned(client, owner, plan, meta, now)
-        });
-        if let Some(key) = no_room {
-            tier.note_external_capacity_retry(owner, key, now);
-        }
-        let Some(reservation) = reservation else {
-            return (deferred, None);
-        };
-        let blocks = pulled.len();
-        if registry.lands_at_submit() {
-            self.attempted
-                .extend(pulled.iter().map(|key| (owner, *key)));
-        }
-        // The source serves each block from its KVCR-owned memory if it can.
-        let (g2_keys, local_keys) = if from_local.is_empty() {
-            (pulled, Vec::new())
-        } else {
-            let mut from_local = from_local.into_iter();
-            pulled
-                .into_iter()
-                .partition(|_| !from_local.next().unwrap())
-        };
-        src.pin_external(&g2_keys);
-        // KVCR serves a request whose blocks are all in its own memory with
-        // readers, from its own thread; they keep their blocks' places in
-        // the FIFO queue. One requested block that memory lacks, whether the
-        // source's G2 holds it or nothing does, sends the request through
-        // vLLM's pin callback, which the source runs when its step ends, and
-        // makes KVCR claim its blocks, like a promotion (`acquire_readers`
-        // without `allow_missing`).
-        let reads = g2_keys.is_empty() && !asks_absent;
-        match src_local {
-            Some(mut src_local) if !reads => src_local.pin_external(&local_keys),
-            _ => registry.read_local(source, &local_keys),
-        }
-        drop(src);
-        let id = registry.submit(self.rank, source, blocks, partial, now);
-        if reads {
-            registry.skip_source_wait(id);
-        }
-        drop(registry);
-        *self.pulling.entry(owner).or_default() += 1;
-        self.stages.insert(
-            id,
-            Stage {
-                owner: Some(owner),
-                source,
-                reservation,
-                keys: g2_keys,
-                local_keys,
-                reads,
-                joined: false,
-            },
-        );
-        self.epoch += 1;
-        (true, Some(id))
+        true
     }
 
     /// Land finished copies and pulls: make their reservations resident and
@@ -930,6 +865,12 @@ impl VllmKvcrAdapter {
         let Some(local) = &mut self.local else {
             return Vec::new();
         };
+        if let Some(g3) = &local.g3 {
+            assert!(
+                (now + g3.timeout_ms).is_finite(),
+                "kvcr.g3 deposit deadline overflow"
+            );
+        }
         let rerank = local.store_prefixes.remove(&store);
         let mut registry = self.registry.lock().unwrap();
         let mut tier = local.tier.lock();
@@ -1044,7 +985,9 @@ impl VllmKvcrAdapter {
         };
         let mut registry = self.registry.lock().unwrap();
         if let Some(g3) = &mut local.g3 {
-            g3.read_by_peer(registry.take_peer_reads(self.rank));
+            for batch in registry.take_peer_reads(self.rank) {
+                g3.read_by_peer(batch);
+            }
         }
         local.advance_spill(g2, &mut registry, self.rank, now);
     }
@@ -1892,6 +1835,103 @@ mod tests {
     }
 
     #[test]
+    fn mixed_source_prefixes_share_one_restore_round_in_prompt_order() {
+        for order in [&[0, 1][..], &[1, 0], &[0, 1, 2, 3]] {
+            // Even keys are peer-only; odd keys are local-memory-only.
+            for slots in 1..=order.len() {
+                let f = Fixture::with_local_g2(8, KvcrLocalG2Policy::Lru, 1.0, slots, &[0, 2], &[]);
+                let (mut adapter, mut restore) = (f.adapter(), RestoreRounds::default());
+                let keys = f.keys(order);
+                let mut target = f.target.lock();
+                adapter.store_local(&target, f.owner, TransferId::new(0), &f.keys(&[1, 3]), 0.0);
+                adapter.advance(&mut target, 2.0);
+                assert!(adapter.stage_at(&mut target, f.owner, f.source, &mut restore, &keys, 2.0));
+                for key in &keys[..slots] {
+                    assert!(
+                        matches!(target.lookup(*key), Lookup::Pending { .. }),
+                        "{order:?}, slots={slots}"
+                    );
+                }
+                for key in &keys[slots..] {
+                    assert_eq!(target.lookup(*key), Lookup::Miss);
+                }
+                // Both sources remain reserved until the slower leg lands.
+                let peers = order[..slots].iter().filter(|key| **key % 2 == 0).count();
+                let locals = slots - peers;
+                let ends =
+                    2.0 + (locals as f64).max(if peers == 0 { 0.0 } else { 1.0 + peers as f64 });
+                if peers > 0 && locals > 0 {
+                    assert!(!adapter.advance(&mut target, 3.0));
+                    assert!(
+                        keys[..slots]
+                            .iter()
+                            .all(|key| matches!(target.lookup(*key), Lookup::Pending { .. }))
+                    );
+                }
+                assert!(adapter.advance(&mut target, ends));
+                assert!(
+                    keys[..slots]
+                        .iter()
+                        .all(|key| target.lookup(*key) == Lookup::Hit)
+                );
+                assert_eq!(target.take_kvcr_origin(&keys), [peers, locals]);
+                assert!(!adapter.has_work());
+                assert_eq!(
+                    f.stats().pulls.success + f.stats().pulls.partial,
+                    u64::from(peers > 0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_reservable_absent_suffix_waits_for_the_peer_pass() {
+        for slots in [1, 2] {
+            let f = Fixture::with_local_g2(2, KvcrLocalG2Policy::Fifo, 0.0, slots, &[], &[]);
+            let (mut source, mut target) = (f.adapter_of(f.source), f.adapter());
+            let keys = f.keys(&[0, 1]);
+            source.store_local(
+                &f.source_g2.lock(),
+                f.owner,
+                TransferId::new(0),
+                &keys[..1],
+                0.0,
+            );
+            f.registry.lock().unwrap().note_pass(0, 10.0);
+            let mut g2 = f.target.lock();
+            assert!(target.stage_at(
+                &mut g2,
+                f.owner,
+                f.source,
+                &mut RestoreRounds::default(),
+                &keys,
+                0.0
+            ));
+            let stage = target.stages.values().next().unwrap();
+            assert_eq!(stage.reads, slots == 1);
+            assert_eq!(
+                target.next_deadline(),
+                Some(if slots == 1 { 1.0 } else { 11.0 })
+            );
+            assert!(!target.advance(&mut g2, 1.0));
+            assert_eq!(
+                target.next_deadline(),
+                Some(if slots == 1 { 2.0 } else { 11.0 })
+            );
+            assert_eq!(target.advance(&mut g2, 2.0), slots == 1);
+            assert_eq!(g2.lookup(keys[0]) == Lookup::Hit, slots == 1);
+            if slots == 2 {
+                assert!(!target.advance(&mut g2, 11.0));
+                assert_eq!(target.next_deadline(), Some(12.0));
+                assert!(target.advance(&mut g2, 12.0));
+            }
+            assert_eq!(g2.lookup(keys[1]), Lookup::Miss);
+            assert!(!target.has_work());
+            assert_eq!(source.local.as_ref().unwrap().tier.lock().pins(keys[0]), 0);
+        }
+    }
+
+    #[test]
     fn a_promotion_re_ranks_the_requests_blocks_up_to_its_last_one() {
         // LRU memory of six blocks holds request A's a0..a3, then B's b0 b1;
         // G2 still holds a0 a1.
@@ -2375,5 +2415,100 @@ mod tests {
         assert!(target.stage_at(&mut g2, f.owner, f.source, &mut restore, &asked, 3.0));
         let stage = target.stages.values().next().unwrap();
         assert_eq!((&stage.local_keys[..], stage.reads), (&asked[..1], false));
+    }
+
+    #[test]
+    fn separate_peer_completions_keep_their_order_in_disk_lru() {
+        let g3 = KvcrG3Config {
+            latency_to_first_byte_ms: 0.0,
+            write_bandwidth_gbps: 0.0,
+            ..KvcrG3Config::new(2)
+        };
+        let f = Fixture::with_g3(2, KvcrLocalG2Policy::Lru, 0.0, g3);
+        let (mut source, mut target) = (f.adapter_of(f.source), f.adapter());
+        // One prefix gives A and B the same use, with B earlier to evict.
+        store((&mut source, &f.source_g2.lock()), &[0, 1], &[0, 1], 0.0);
+        let mut g2 = f.target.lock();
+        for (key, started) in [(0, 0.0), (1, 2.0)] {
+            let keys = f.keys(&[key]);
+            assert!(target.stage_at(
+                &mut g2,
+                f.owner,
+                f.source,
+                &mut RestoreRounds::default(),
+                &keys,
+                started
+            ));
+            assert!(target.advance(&mut g2, started + 2.0));
+        }
+        // The source was idle through both completions. B's later read must
+        // beat its prefix position when disk eventually chooses a victim.
+        source.advance_g3(&f.source_g2.lock(), 4.0);
+        {
+            let disk = source.local.as_ref().unwrap().g3.as_ref().unwrap();
+            assert!(disk.last_use(f.keys(&[0])[0]) < disk.last_use(f.keys(&[1])[0]));
+        }
+        for key in 2..5 {
+            store((&mut source, &f.source_g2.lock()), &[key], &[key], 4.0);
+        }
+        assert_eq!(
+            [0, 1, 2].map(|key| kvcr_holds(&source, key).1),
+            [false, true, true]
+        );
+    }
+
+    #[test]
+    fn an_oversized_deposit_settles_all_misses_without_dropping_duplicates() {
+        let g3 = KvcrG3Config {
+            latency_to_first_byte_ms: 0.0,
+            write_bandwidth_gbps: 0.0,
+            ..KvcrG3Config::new(2)
+        };
+        let f = Fixture::with_g3(4096, KvcrLocalG2Policy::Lru, 0.0, g3);
+        let mut adapter = f.adapter();
+        let mut keys: Vec<_> = (0..8192).collect();
+        keys.extend(0..4096); // Already present keys must never count as drops.
+        store((&mut adapter, &f.target.lock()), &keys, &keys, 0.0);
+        let stats = f.stats();
+        let local = stats.local_g2.unwrap();
+        assert_eq!(local.stored_blocks, 4096);
+        assert_eq!(local.dropped_blocks, 4096);
+        assert_eq!(stats.g3.unwrap().stored_blocks, 0);
+        let g3 = adapter.local.as_ref().unwrap().g3.as_ref().unwrap();
+        assert!(g3.spill.is_none() && g3.deposits.is_empty());
+        assert!(!adapter.has_work());
+    }
+
+    #[test]
+    fn a_spill_drops_its_memory_victim_when_every_disk_slot_is_read() {
+        let g3 = KvcrG3Config {
+            latency_to_first_byte_ms: 1.0,
+            write_bandwidth_gbps: 0.0,
+            read_bandwidth_gbps: 1.0,
+            ..KvcrG3Config::new(1)
+        };
+        let f = Fixture::with_g3(1, KvcrLocalG2Policy::Lru, 0.0, g3);
+        let mut adapter = f.adapter();
+        let mut g2 = f.target.lock();
+        store((&mut adapter, &g2), &[0], &[0], 0.0);
+        store((&mut adapter, &g2), &[1], &[1], 0.0);
+        adapter.advance_g3(&g2, 1.0);
+        assert!(adapter.stage_at(
+            &mut g2,
+            f.owner,
+            f.target_rank,
+            &mut RestoreRounds::default(),
+            &f.keys(&[0]),
+            1.0
+        ));
+        // Disk's only block is held until 3 ms. The next spill cannot save
+        // its victim, but still frees memory for the waiting store.
+        store((&mut adapter, &g2), &[2], &[2], 1.0);
+        assert_eq!(kvcr_holds(&adapter, 1), (Lookup::Miss, false));
+        assert_eq!(kvcr_holds(&adapter, 2), (Lookup::Hit, false));
+        assert_eq!(f.stats().g3.unwrap().stored_blocks, 1);
+        assert!(adapter.advance(&mut g2, 3.0));
+        assert_eq!(g2.lookup(f.keys(&[0])[0]), Lookup::Hit);
+        assert!(!adapter.has_work());
     }
 }

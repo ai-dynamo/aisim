@@ -169,6 +169,28 @@ pub(crate) struct ExternalPlan {
 }
 
 impl ExternalPlan {
+    /// Partition an already finished plan into two transfers without changing
+    /// its combined capacity or victim selection. Commit both nonempty parts
+    /// before any further planning; the first nonempty part evicts the victims.
+    pub(crate) fn partition(mut self, own: impl FnMut(&HostBlockKey) -> bool) -> (Self, Self) {
+        let (first, second) = std::mem::take(&mut self.reserved)
+            .into_iter()
+            .partition(own);
+        self.reserved = first;
+        let mut other = Self {
+            free: 0,
+            protected: FxHashSet::default(),
+            cursor: None,
+            victims: Vec::new(),
+            evicted: FxHashSet::default(),
+            reserved: second,
+        };
+        if self.reserved.is_empty() {
+            other.victims = std::mem::take(&mut self.victims);
+        }
+        (self, other)
+    }
+
     /// The planned keys, in plan order.
     pub(crate) fn reserved(&self) -> &[HostBlockKey] {
         &self.reserved
@@ -925,6 +947,17 @@ impl HostTier {
     /// leaving `plan` unchanged, when neither a free slot nor a victim is left.
     pub(crate) fn plan_reserve(&self, plan: &mut ExternalPlan, key: HostBlockKey) -> bool {
         self.plan_reserve_unless(plan, key, |_| false)
+    }
+
+    /// Whether another absent key can fit, respecting this plan's protected
+    /// prefix and victim cursor without adding a reservation.
+    pub(crate) fn plan_has_room(&self, plan: &ExternalPlan) -> bool {
+        plan.free > 0
+            || (self.config.eviction != HostEviction::Caller
+                && self
+                    .lru
+                    .oldest_after(plan.cursor)
+                    .any(|(_, key)| !plan.protected.contains(&key)))
     }
 
     /// [`Self::plan_reserve`] that also never evicts a block `in_use`.

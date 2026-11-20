@@ -24,7 +24,7 @@ use serde::Serialize;
 
 use crate::engine::g3_offload::is_zero;
 use crate::engine::host_offload::{HostBlockKey, HostTierHandle};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use crate::engine::offload_transfer::{self, ClientEvent, Direction, FairTransfers, Link};
 use crate::engine::{KvHintSource, KvcrConfig, KvcrG3Config, KvcrLocalG2Config};
@@ -119,6 +119,14 @@ struct Pull {
     waits_for_source: bool,
 }
 
+/// Last completed peer-read batch for each key. Keeping only its last use
+/// bounds queued completion state by resident memory, even for an idle source.
+#[derive(Default)]
+struct PeerReads {
+    batch: u64,
+    keys: FxHashMap<HostBlockKey, u64>,
+}
+
 pub(crate) struct KvcrRegistry {
     config: KvcrConfig,
     ranks: BTreeMap<KvHintSource, Rank>,
@@ -130,9 +138,8 @@ pub(crate) struct KvcrRegistry {
     /// (`acquire_readers`).
     local_readers: BTreeMap<KvHintSource, FxHashMap<HostBlockKey, u32>>,
     /// With `kvcr.g3`: the blocks peers read from each rank's KVCR-owned
-    /// memory since the rank last took them. A rank's memory does not change
-    /// while it does not look, so the set stays within its capacity.
-    peer_reads: BTreeMap<KvHintSource, FxHashSet<HostBlockKey>>,
+    /// memory since the rank last took them, preserving completion batches.
+    peer_reads: BTreeMap<KvHintSource, PeerReads>,
     next_client: u64,
     busy_until_ms: BTreeMap<u64, f64>,
     pulls: BTreeMap<u64, Pull>,
@@ -241,15 +248,32 @@ impl KvcrRegistry {
     /// source next looks (`_drain_source_completions`).
     pub(crate) fn note_peer_read(&mut self, source: KvHintSource, keys: &[HostBlockKey]) {
         if self.config.g3.is_some() {
-            self.peer_reads.entry(source).or_default().extend(keys);
+            let reads = self.peer_reads.entry(source).or_default();
+            reads.batch += 1;
+            for key in keys {
+                reads.keys.insert(*key, reads.batch);
+            }
         }
     }
 
-    /// The blocks of `rank`'s memory that peers read since it last asked.
-    pub(crate) fn take_peer_reads(&mut self, rank: KvHintSource) -> FxHashSet<HostBlockKey> {
-        (self.peer_reads.get_mut(&rank))
-            .map(std::mem::take)
-            .unwrap_or_default()
+    /// Completed reads in order, retaining only each key's latest use. Blocks
+    /// in one batch retain their prefix-position tie-break in the disk tier.
+    pub(crate) fn take_peer_reads(&mut self, rank: KvHintSource) -> Vec<Vec<HostBlockKey>> {
+        let Some(reads) = self.peer_reads.remove(&rank) else {
+            return Vec::new();
+        };
+        let mut keys: Vec<_> = reads.keys.into_iter().collect();
+        keys.sort_unstable_by_key(|(_, batch)| *batch);
+        let mut batches = Vec::new();
+        let mut previous = None;
+        for (key, batch) in keys {
+            if previous != Some(batch) {
+                batches.push(Vec::new());
+                previous = Some(batch);
+            }
+            batches.last_mut().unwrap().push(key);
+        }
+        batches
     }
 
     /// Counters of the pool's KVCR-owned memory.

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -26,7 +27,7 @@ from aisim.recommend import _candidate_prediction, recommendation_to_sweeper
 from aisim.runner import EngineReplayRunnerFactory
 from aisim.sweeper.deploy import build_backend_deployment
 from aisim.sweeper.parallel_enum import ParallelShape, ReplicaParallelConfig
-from aisim.sweeper.replay import ReplayOutputRequirements, ReplaySpec
+from aisim.sweeper.replay import ReplayOutputRequirements, ReplaySpec, RunnerCapabilities
 from aisim.sweeper.sample import unroll_sample
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -782,6 +783,109 @@ def test_kvcr_g3_reaches_the_native_rank_and_is_rejected_outside_the_engine_stac
     for stack, adapters in (("dynamo", None), ("engine", {"router": {}})):
         with pytest.raises(ValueError, match="kvcr.g3 requires the engine stack without adapters"):
             run_prediction(config, adapter_configs=adapters, stack=stack, runner_factory=None)
+
+
+@pytest.mark.parametrize("role", ["aggregated", "prefill", "decode"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_kvcr_g3_requires_an_explicit_runner_capability(role, nested) -> None:
+    engine = _prediction_engine()
+    engine["workers"]["aggregated"]["kv_cache"].update(
+        bytes_per_token=256,
+        host_offload=_host_offload(),
+        kvcr={"local_g2": {"num_blocks": 4}, "g3": {"num_blocks": 8}},
+    )
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate({"engine": engine}))
+    args = spec.backend_deployment.agg_engine_args
+    spec = replace(
+        spec,
+        backend_deployment=replace(
+            spec.backend_deployment,
+            **{
+                "agg_engine_args": None,
+                f"{'agg' if role == 'aggregated' else role}_engine_args": {"rank": args} if nested else args,
+            },
+        ),
+    )
+    assert RunnerCapabilities().supports_kvcr_g3 is False
+    capabilities = EngineReplayRunnerFactory().capabilities()
+    capabilities.require_compatible(spec)
+    with pytest.raises(ValueError, match="runner does not support kvcr.g3"):
+        replace(capabilities, supports_kvcr_g3=False).require_compatible(spec)
+
+
+def test_kvcr_g3_injected_runner_is_rejected_before_creation() -> None:
+    engine = _prediction_engine()
+    engine["workers"]["aggregated"]["kv_cache"].update(
+        bytes_per_token=256,
+        host_offload=_host_offload(),
+        kvcr={"local_g2": {"num_blocks": 4}, "g3": {"num_blocks": 8}},
+    )
+
+    class UnsupportedFactory:
+        def capabilities(self):
+            return replace(EngineReplayRunnerFactory().capabilities(), supports_kvcr_g3=False)
+
+        def create(self, _seed):
+            pytest.fail("unsupported runner must be rejected before creation")
+
+    with pytest.raises(ValueError, match="runner does not support kvcr.g3"):
+        run_prediction(
+            CorePredictionConfig.model_validate({"engine": engine}),
+            stack="engine",
+            runner_factory=UnsupportedFactory(),
+        )
+
+
+def test_predict_cli_spills_to_kvcr_g3_through_the_real_runtime(tmp_path, capsys) -> None:
+    engine = _prediction_engine()
+    engine["model"] = str(ROOT / "tests/e2e/configs/unified_cli/fixtures/tiny-model")
+    engine["workers"]["aggregated"]["kv_cache"].update(
+        bytes_per_token=256,
+        host_offload={"num_host_blocks": 8, "d2h_bandwidth_gbps": 0},
+        kvcr={
+            "local_g2": {"num_blocks": 1, "copy_bandwidth_gbps": 0},
+            "g3": {"num_blocks": 8, "latency_to_first_byte_ms": 0, "write_bandwidth_gbps": 0},
+        },
+    )
+    # Distinct prompts make the second completed store evict the first from
+    # KVCR memory. Each request leaves enough generation time for its G2 store.
+    trace = tmp_path / "requests.jsonl"
+    trace.write_text(
+        "\n".join(
+            json.dumps({"timestamp": i, "input_length": 33, "output_length": 4, "hash_ids": [i + 1, i + 2, i + 3]})
+            for i in (0, 10)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = {
+        "engine": engine,
+        "traffic": {
+            "source": {"type": "trace", "paths": [str(trace)], "format": "mooncake", "block_size": 16},
+            "load": {"type": "trace_timestamps"},
+        },
+    }
+    path = tmp_path / "g3.yaml"
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    assert (
+        cli.main(
+            [
+                "predict",
+                "--stack",
+                "engine",
+                "--config",
+                str(path),
+                "--format",
+                "json",
+                "--output-dir",
+                str(tmp_path / "g3"),
+            ]
+        )
+        == 0
+    )
+    report = json.loads(capsys.readouterr().out)
+    assert report["completed_requests"] == 2
+    assert report["kvcr"]["g3"]["stored_blocks"] > 0
 
 
 def test_kvcr_supports_the_prefill_role_and_rejects_the_decode_role() -> None:

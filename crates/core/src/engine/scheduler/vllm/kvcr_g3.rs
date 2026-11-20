@@ -135,7 +135,9 @@ impl G3 {
             per_block(config.write_bandwidth_gbps),
         );
         anyhow::ensure!(
-            (config.num_blocks as f64 * read_ms_per_block.max(write_ms_per_block)).is_finite(),
+            (config.latency_to_first_byte_ms
+                + config.num_blocks as f64 * read_ms_per_block.max(write_ms_per_block))
+            .is_finite(),
             "kvcr.g3 transfer duration overflow"
         );
         Ok(Self {
@@ -216,6 +218,8 @@ impl G3 {
     /// when the write ends and whether it dropped a block, or `None`, without
     /// a write, when every block on disk is in use.
     pub(super) fn write(&mut self, victim: HostBlockKey, now: f64) -> Option<(f64, bool)> {
+        let ends = now + (self.latency_ms + self.write_ms_per_block);
+        assert!(ends.is_finite(), "kvcr.g3 write deadline overflow");
         let dropped = self.on_disk == self.capacity;
         if dropped {
             let (_, oldest) = self.evictable.pop_first()?;
@@ -236,7 +240,7 @@ impl G3 {
             .get_mut(&victim)
             .expect("KVCR ranks its blocks")
             .disk = Disk::Writing;
-        Some((now + self.latency_ms + self.write_ms_per_block, dropped))
+        Some((ends, dropped))
     }
 
     /// The write of `victim` ended: in time, the block is on disk;
@@ -261,6 +265,14 @@ impl G3 {
         self.evictable.insert((rank, victim));
     }
 
+    /// Check the absolute deadline before a caller commits a G2 reservation.
+    pub(super) fn read_end(&self, blocks: usize, now: f64) -> f64 {
+        let duration = self.latency_ms + blocks as f64 * self.read_ms_per_block;
+        let ends = self.read_tail.max(now) + duration;
+        assert!(ends.is_finite(), "kvcr.g3 read deadline overflow");
+        ends
+    }
+
     /// Hold `keys` on disk for a read into the G2 `reservation`, queued at
     /// `now` behind the reads in flight. Returns when it ends.
     pub(super) fn read(
@@ -269,6 +281,7 @@ impl G3 {
         keys: Vec<HostBlockKey>,
         now: f64,
     ) -> f64 {
+        let ends = self.read_end(keys.len(), now);
         for key in &keys {
             let held = self.held.get_mut(key).expect("a read block is on disk");
             held.readers += 1;
@@ -276,8 +289,7 @@ impl G3 {
                 self.evictable.remove(&(rank, *key));
             }
         }
-        let read_ms = self.latency_ms + keys.len() as f64 * self.read_ms_per_block;
-        self.read_tail = self.read_tail.max(now) + read_ms;
+        self.read_tail = ends;
         self.reads.insert(reservation, keys);
         self.read_tail
     }
@@ -357,5 +369,74 @@ impl G3 {
     #[cfg(test)]
     pub(super) fn last_use(&self, key: HostBlockKey) -> u64 {
         self.held[&key].rank.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn combined_disk_durations_must_be_finite_even_when_each_term_is_finite() {
+        for read in [true, false] {
+            let config = KvcrG3Config {
+                latency_to_first_byte_ms: 1e308,
+                read_bandwidth_gbps: if read { 1e-308 } else { 0.0 },
+                write_bandwidth_gbps: if read { 0.0 } else { 1e-308 },
+                ..KvcrG3Config::new(1)
+            };
+            let error = G3::new(&config, true, 1_000_000).err().unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("kvcr.g3 transfer duration overflow")
+            );
+        }
+        let unlimited = KvcrG3Config {
+            read_bandwidth_gbps: 0.0,
+            write_bandwidth_gbps: 0.0,
+            latency_to_first_byte_ms: 0.0,
+            ..KvcrG3Config::new(1)
+        };
+        let mut g3 = G3::new(&unlimited, true, 1_000_000).unwrap();
+        let key = HostBlockKey::new(0);
+        g3.enter_memory(key, None);
+        assert_eq!(g3.write(key, 2.0), Some((2.0, false)));
+        g3.finish_write(key, true);
+        assert_eq!(g3.read(TransferId::new(0), vec![key], 2.0), 2.0);
+    }
+
+    #[test]
+    fn absolute_disk_deadlines_fail_before_capacity_or_read_claims_change() {
+        let config = KvcrG3Config {
+            read_bandwidth_gbps: 0.0,
+            write_bandwidth_gbps: 0.0,
+            latency_to_first_byte_ms: 1e308,
+            ..KvcrG3Config::new(1)
+        };
+        let mut g3 = G3::new(&config, true, 1_000_000).unwrap();
+        let key = HostBlockKey::new(0);
+        g3.enter_memory(key, None);
+        assert!(catch_unwind(AssertUnwindSafe(|| g3.write(key, 1e308))).is_err());
+        assert_eq!(g3.on_disk, 0);
+        assert_eq!(g3.held[&key].disk, Disk::No);
+        assert_eq!(g3.changes, 0);
+        assert!(g3.write(key, 0.0).is_some());
+        g3.finish_write(key, true);
+        assert_eq!(g3.read(TransferId::new(0), vec![key], 0.0), 1e308);
+        let evictable = g3.evictable.clone();
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| g3.read(
+                TransferId::new(1),
+                vec![key],
+                0.0
+            )))
+            .is_err()
+        );
+        assert_eq!(g3.held[&key].readers, 1);
+        assert_eq!(g3.reads.len(), 1);
+        assert_eq!(g3.read_tail, 1e308);
+        assert_eq!(g3.evictable, evictable);
     }
 }
