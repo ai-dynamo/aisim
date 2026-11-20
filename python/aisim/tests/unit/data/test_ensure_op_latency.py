@@ -167,6 +167,12 @@ def test_auto_selected_op_level_model_with_a_library_path_saves_and_restores(nat
     assert provenance["selected_estimation_mode"] == "op_level"
     # The search keeps the library pin in the canonical configuration; the op-level engine never reads it.
     assert provenance["config"]["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"] == str(library)
+    # The saved canonical configuration rebuilds the same model without losing the library pin.
+    rebuilt = res.RustForwardPassPerfModel.best_available(provenance["config"])
+    assert rebuilt.predict_prefill_latency(1, 4) == model.predict_prefill_latency(1, 4)
+    assert rebuilt.diagnostics()["provenance"]["config"]["estimator_config"]["fpm_interpolation"][
+        "fpm_parquet_path"
+    ] == str(library)
     pinned = model.save_state_snapshot(tmp_path / "snap")
     assert "fpm_parquet_path" not in pinned["estimator_config"].get("fpm_interpolation", {})
     restored = res.RustForwardPassPerfModel.best_available(state_snapshot=tmp_path / "snap")
