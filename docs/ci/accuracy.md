@@ -16,7 +16,7 @@ publication, and notifications behind those views.
 
 ## Public PR validation
 
-[`pr-validation.yml`](../../.github/workflows/pr-validation.yml) lets a maintainer validate a
+`.github/workflows/pr-validation.yml` lets a maintainer validate a
 PR that relies on a public Hugging Face candidate. The contributor publishes the candidate as
 an HF PR revision and adds a request file (`aisim-pr-validation/v1`, default path
 `.aisim/pr-validation.json`) to the PR. It names the dataset repository, the full candidate
@@ -658,7 +658,7 @@ and their identity paths, snapshots, generated schema snapshots, catalog drift a
 file rules (paths, suffixes, symlinks, magic bytes). `--repo` defaults to
 `ai-dynamo/aisim-data-internal` and must equal `dataset_id` in `catalog/dataset.json`.
 The `public` profile adds the publication rules below. The mirror CI definition is
-[`.github/mirror/aisim-data-internal-validate.yml`](../../.github/mirror/aisim-data-internal-validate.yml),
+`.github/mirror/aisim-data-internal-validate.yml`,
 a template to copy into the mirror repository. It checks out this repository at a
 pinned SHA (`AISIM_VALIDATOR_REF`), the same SHA the public dataset CI pins, uses no
 secrets, and prints the validator fingerprint.
