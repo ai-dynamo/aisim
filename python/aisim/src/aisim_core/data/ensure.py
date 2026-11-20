@@ -81,7 +81,7 @@ from aisim_core.data.op_tree import (
     read_entry_manifest,
 )
 from aisim_core.data.repos import resolve_ref
-from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR
+from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR, packaged_system_specs
 
 DEFAULT_MAX_BYTES = 256 * 1024 * 1024
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -166,6 +166,7 @@ class EnsuredData:
 
     config: dict[str, Any]
     datasets: dict[str, dict[str, Any]] = field(default_factory=dict)  # category -> provenance
+    roots: dict[str, list[str]] = field(default_factory=dict)  # category -> systems roots it contributed
 
     def to_dict(self) -> dict[str, Any]:
         return {"datasets": self.datasets}
@@ -291,7 +292,39 @@ def ensure_data(
             _resolve_backend_version(out, pin, transport)
         for category in pin.categories:
             _ensure_category(out, category, pin, transport)
+        if "op-latency" in out.roots and "fpm" in out.roots:
+            _compose_pinned_roots(out)
     return out
+
+
+def _table_digests(root: Path) -> dict[str, str]:
+    """``{relative path: sha256}`` of the operation tables under ``root/data``."""
+    base = Path(root) / "data"
+    return {
+        p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in sorted(base.rglob("*.parquet"))
+        if p.is_file()
+    }
+
+
+def _compose_pinned_roots(out: EnsuredData) -> None:
+    """Order the roots of an FPM and an op-latency pin the same way whatever order the pin names them.
+
+    The roots are the FPM bundle's retained inputs, then the op-latency root. A table both provide with different
+    content has no category-order-free answer, so it is a conflict naming both entries.
+    """
+    fpm_roots, op_root = [Path(p) for p in out.roots["fpm"]], Path(out.roots["op-latency"][0])
+    op_tables = _table_digests(op_root)
+    for root in fpm_roots:
+        clashes = sorted(path for path, digest in _table_digests(root).items() if op_tables.get(path, digest) != digest)
+        if clashes:
+            fpm = out.datasets["fpm"].get("configuration_id")
+            op = ", ".join(out.datasets["op-latency"].get("configuration_ids", ()))
+            raise DataConflictError(
+                f"fpm entry {fpm} and op-latency entries {op} provide different content for the same operation "
+                f"table(s) {clashes[:3]}; pin one of them (AISIM_DATA_CATEGORIES) or republish the bundle"
+            )
+    out.config["systems_paths"] = [*map(str, fpm_roots), str(op_root)]
 
 
 _SLOT_ALIASES = ("current", "previous", "next")
@@ -357,7 +390,9 @@ def _slot_version(system: str, backend: str, requested: str | None, versions, do
     if not entry or not entry.get("current"):
         if requested is None:  # no authored policy: the latest version the dataset holds
             return max(held, key=_version_sort_tuple)
-        raise MissingDataError(f"no queryable versions are defined for {backend} on {system}; cannot resolve {requested!r}")
+        raise MissingDataError(
+            f"no queryable versions are defined for {backend} on {system}; cannot resolve {requested!r}"
+        )
     slots = {"current": str(entry["current"])}
     if entry.get("previous"):
         slots["previous"] = str(entry["previous"])
@@ -367,7 +402,9 @@ def _slot_version(system: str, backend: str, requested: str | None, versions, do
             hw for hw, per_backend in (document.get("overrides") or {}).items() if (per_backend or {}).get(backend)
         }
         current_key = _version_sort_tuple(slots["current"])
-        newer = {v for hw, fw, v in versions if fw == backend and hw not in frozen and _version_sort_tuple(v) > current_key}
+        newer = {
+            v for hw, fw, v in versions if fw == backend and hw not in frozen and _version_sort_tuple(v) > current_key
+        }
         slots["next"] = max(newer, key=_version_sort_tuple) if newer else slots["current"]
     resolved = slots.get(requested or "current")
     if resolved is None:
@@ -416,6 +453,7 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
             fetch_donors=None if pin.local_root is not None else lambda wanted: _fetch_pinned(wanted, pin, transport),
         )
         _wire(out.config, category, loaded, None)
+        out.roots[category] = [str(loaded.root)]
         out.datasets[category] = {
             "repo": pin.repo,
             "revision": revision,
@@ -442,6 +480,7 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
             source=where,
         ) from exc
     _wire(out.config, category, loaded, entry)
+    out.roots[category] = [str(p) for p in loaded.config.get("systems_paths") or ()]
     out.datasets[category] = {
         "repo": pin.repo,
         "revision": revision,
@@ -486,9 +525,16 @@ def _fetch_pinned(selection: Selection, pin: DataPin, transport: Transport | Non
 def _load(loader, category: str, root: Path, entry: Entry, config: Mapping[str, Any], output_dir: Path):
     manifest_path = entry.manifest.path
     if category == "fpm":
+        manifest = loader.read_manifest(root, manifest_path, config)  # verifies every declared artifact
+        # Keyed by content: a configuration ID names an identity, so a dataset republished in place with corrected
+        # measurements must not be served from the preparation of the old ones.
+        content = hashlib.sha256()
+        for artifact in sorted(manifest.artifacts, key=lambda a: a.path):
+            content.update(f"{artifact.path}\0{artifact.sha256}\0{artifact.bytes}\n".encode())
+        output_dir = output_dir.with_name(f"{output_dir.name}-{content.hexdigest()[:16]}")
         cached = output_dir / "config.json"
         if cached.is_file():  # materialized by an earlier verified load; config.json is written last
-            return FpmData(loader.read_manifest(root, manifest_path, config), config=json.loads(cached.read_text()))
+            return FpmData(manifest, config=json.loads(cached.read_text()))
         output_dir.parent.mkdir(parents=True, exist_ok=True)
         data = loader.load(root, manifest_path, output_dir=output_dir, config=config)
         if data.config is None:
@@ -557,6 +603,49 @@ def _declared_donors(
     return donors
 
 
+def _collective_dependencies(
+    root: Path,
+    entries: list[Entry],
+    config: Mapping[str, Any],
+    selection: Selection,
+    fetch_entries: Callable[[Selection], Any] | None,
+) -> list[Entry]:
+    """Entries of the collective libraries (``misc.nccl_version``, ``misc.oneccl_version``) the system spec names.
+
+    The native communication readers resolve ``comm/nccl/<version>`` and ``comm/oneccl/<version>`` from the system
+    spec, independently of the serving backend, so a root without them cannot answer collective queries even
+    though the dataset publishes the tables. A library or version the dataset does not publish is skipped; the
+    native query then reports the absent table.
+    """
+    spec_path = packaged_system_specs(PACKAGED_SYSTEMS_DIR).get(str(config.get("system")))
+    if spec_path is None:
+        return []
+    misc = (yaml.safe_load(spec_path.read_text(encoding="utf-8")) or {}).get("misc") or {}
+    chosen = {e.configuration_id for e in entries}
+    found_entries: list[Entry] = []
+    for library in ("nccl", "oneccl"):
+        version = misc.get(f"{library}_version")
+        if version is None:
+            continue
+        wanted = replace(
+            selection,
+            configuration_ids=(),
+            framework=library,
+            framework_version=str(version),
+            operation_family=None,
+        )
+        found = [e for e in _matching_entries(root, wanted) if e.configuration_id not in chosen]
+        if len(found) > 1:
+            ids = ", ".join(sorted(e.configuration_id for e in found))
+            raise DataConflictError(f"{len(found)} op-latency entries match {library} {version} ({ids})")
+        if found:
+            if fetch_entries is not None:
+                fetch_entries(wanted)
+            chosen.add(found[0].configuration_id)
+            found_entries.append(found[0])
+    return found_entries
+
+
 def _donor_versions(document: Any) -> list[str]:
     """Sorted distinct ``from_version`` values of a parsed ``reuse.yaml``."""
     reuse = document.get("reuse") if isinstance(document, dict) else None
@@ -583,7 +672,9 @@ def _load_op_latency(
         # Verifies every artifact in the fetched tree, also when the composed root is reused.
         manifests = [read_entry_manifest(root, entry, config) for entry in entries]
         donors = _declared_donors(root, entries, manifests, selection, fetch_donors)
-        # A donor is another version of the same system and backend, so the version check of ``config`` is not its own.
+        donors += _collective_dependencies(root, entries + donors, config, selection, fetch_donors)
+        # Donors and collective libraries are other versions or libraries of the same system, so the version check
+        # of ``config`` is not theirs.
         manifests += [read_entry_manifest(root, donor) for donor in donors]
         entries = [*entries, *donors]
         ids = [e.configuration_id for e in entries]
@@ -597,9 +688,7 @@ def _load_op_latency(
         # concurrent worker never sees a half-written root and never deletes another worker's staging.
         staging = Path(tempfile.mkdtemp(prefix=f"{output_dir.name}.", suffix=".tmp", dir=output_dir.parent))
         try:
-            load_op_latency_tree(
-                root, staging / "systems", entries=entries, packaged_systems=PACKAGED_SYSTEMS_DIR
-            )
+            load_op_latency_tree(root, staging / "systems", entries=entries, packaged_systems=PACKAGED_SYSTEMS_DIR)
             try:
                 staging.rename(output_dir)
             except OSError:

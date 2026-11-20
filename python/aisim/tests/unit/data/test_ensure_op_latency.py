@@ -435,3 +435,46 @@ def test_the_hf_pin_resolves_an_omitted_version_from_the_fetched_policy(tree, tm
     out = ensure_data(config, pin, transport=FakeTransport(_tree_files(published)))
     assert out.config["backend_version"] == "2.0"
     assert (Path(out.config["systems_paths"][0]) / "data/h200_sxm/gemm/vllm/2.0").is_dir()
+
+
+# ---------------------------------------------------------------- collective dependencies
+
+
+@pytest.fixture
+def with_nccl(tree):  # noqa: F811
+    """The serving tables plus the NCCL table the h200_sxm spec declares (misc.nccl_version 2.26.2)."""
+    nccl = tree / "data/h200_sxm/comm/nccl/2.26.2"
+    other = tree / "data/h200_sxm/comm/nccl/2.99"
+    for directory in (nccl, other):
+        directory.mkdir(parents=True)
+        pq.write_table(_table(2), directory / "nccl_perf.parquet")
+        shutil.copyfile(tree / "data/h200_sxm/gemm/vllm/1.0/collection_meta.yaml", directory / "collection_meta.yaml")
+    return tree
+
+
+def test_the_spec_declared_collective_tables_arrive_beside_the_serving_tables(with_nccl, tmp_path):
+    published = tmp_path / "published"
+    _build(with_nccl, published)
+    out = ensure_data(dict(CONFIG), _pin(published, tmp_path))
+    root = Path(out.config["systems_paths"][0])
+    assert (root / "data/h200_sxm/comm/nccl/2.26.2/nccl_perf.parquet").is_file()
+    assert not (root / "data/h200_sxm/comm/nccl/2.99").exists()  # only the version the system spec declares
+    assert len(out.datasets["op-latency"]["configuration_ids"]) == 2
+
+
+def test_the_hf_pin_fetches_the_collective_entries(with_nccl, tmp_path):
+    from .test_fetch import FakeTransport
+
+    published = tmp_path / "published"
+    _build(with_nccl, published)
+    transport = FakeTransport(_tree_files(published))
+    pin = DataPin(repo="org/dataset", revision="a" * 40, categories=("op-latency",), cache_dir=tmp_path / "cache")
+    out = ensure_data(dict(CONFIG), pin, transport=transport)
+    assert any(p.endswith("comm/nccl/2.26.2/nccl_perf.parquet") for p in transport.opened)
+    assert (Path(out.config["systems_paths"][0]) / "data/h200_sxm/comm/nccl/2.26.2/nccl_perf.parquet").is_file()
+    assert not any("nccl/2.99" in p and p.endswith(".parquet") for p in transport.opened)
+
+
+def test_a_dataset_without_the_declared_collective_library_is_not_an_error_here(two_families, tmp_path):
+    out = ensure_data(dict(CONFIG), _pin(two_families, tmp_path))
+    assert len(out.datasets["op-latency"]["configuration_ids"]) == 2

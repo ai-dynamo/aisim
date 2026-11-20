@@ -3,6 +3,7 @@
 
 """ensure_data with fake transports: cold cache, warm offline, threshold, precise errors."""
 
+import hashlib
 import json
 
 import pytest
@@ -173,3 +174,71 @@ def test_the_over_budget_command_keeps_the_pinned_configuration_id(tmp_path, fil
     with pytest.raises(DataTooLargeError) as e:
         ensure_data(CONFIG, pin(tmp_path, max_bytes=1, configuration_id=ids[0]), transport=FakeTransport(files))
     assert f"--configuration {ids[0]}" in str(e.value) and ids[1] not in str(e.value)
+
+
+def test_an_fpm_dataset_republished_in_place_is_not_served_from_the_old_preparation(tmp_path):
+    import pyarrow as pa
+
+    from aisim_core.data.parquet import write_parquet
+    from tests.unit.data.test_fetch import _repin
+
+    files = build_repo(tmp_path)
+    root = tmp_path / "local"
+
+    def publish(files):
+        for path, data in files.items():
+            (root / path).parent.mkdir(parents=True, exist_ok=True)
+            (root / path).write_bytes(data)
+
+    publish(files)
+    local = DataPin(local_root=root, cache_dir=tmp_path / "cache")
+    first = ensure_data(CONFIG, local).config["systems_paths"][0]
+    assert ensure_data(CONFIG, local).config["systems_paths"][0] == first  # unchanged content is reused
+    # Corrected measurements: same identity and configuration ID, different table bytes and manifest digests.
+    table = write_parquet(pa.table({"x": [7, 8, 9, 10]}), tmp_path / "new.parquet", "aisim.test/v1").read_bytes()
+    files["fpm/m1/data.parquet"] = table
+    manifest = json.loads(files["fpm/m1/manifest.json"])
+    manifest["artifacts"][0].update(sha256=hashlib.sha256(table).hexdigest(), bytes=len(table), rows=4)
+    files["fpm/m1/manifest.json"] = json.dumps(manifest).encode()
+    _repin(files, "fpm/m1/manifest.json")
+    publish(files)
+    assert ensure_data(CONFIG, local).config["systems_paths"][0] != first
+
+
+def _roots(tmp_path, fpm_bytes, op_bytes):
+    fpm, op = tmp_path / "fpm-root", tmp_path / "op-root"
+    for root, data in ((fpm, fpm_bytes), (op, op_bytes)):
+        table = root / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet"
+        table.parent.mkdir(parents=True)
+        table.write_bytes(data)
+    return fpm, op
+
+
+@pytest.mark.parametrize("categories", [("fpm", "op-latency"), ("op-latency", "fpm")])
+def test_overlapping_fpm_and_op_tables_conflict_whatever_the_category_order(tmp_path, monkeypatch, categories):
+    fpm, op = _roots(tmp_path, b"fpm copy", b"op copy")
+
+    def fake_ensure_category(out, category, pin, transport):
+        roots = {"fpm": [str(fpm)], "op-latency": [str(op)]}
+        out.config["systems_paths"] = roots[category] if category == "op-latency" else [*roots[category], "user"]
+        out.roots[category] = roots[category]
+        out.datasets[category] = {"configuration_id": "cfg-fpm", "configuration_ids": ["cfg-op-1", "cfg-op-2"]}
+
+    monkeypatch.setattr(ensure_mod, "_ensure_category", fake_ensure_category)
+    with pytest.raises(DataConflictError, match=r"cfg-fpm.*cfg-op-1, cfg-op-2.*gemm_perf"):
+        ensure_data(CONFIG, DataPin(local_root=tmp_path, categories=categories))
+
+
+@pytest.mark.parametrize("categories", [("fpm", "op-latency"), ("op-latency", "fpm")])
+def test_identical_overlap_gives_the_same_roots_in_either_order(tmp_path, monkeypatch, categories):
+    fpm, op = _roots(tmp_path, b"same", b"same")
+
+    def fake_ensure_category(out, category, pin, transport):
+        roots = {"fpm": [str(fpm)], "op-latency": [str(op)]}
+        out.config["systems_paths"] = roots[category] if category == "op-latency" else [*roots[category], "user"]
+        out.roots[category] = roots[category]
+        out.datasets[category] = {"configuration_id": "cfg-fpm", "configuration_ids": ["cfg-op"]}
+
+    monkeypatch.setattr(ensure_mod, "_ensure_category", fake_ensure_category)
+    out = ensure_data(CONFIG, DataPin(local_root=tmp_path, categories=categories))
+    assert out.config["systems_paths"] == [str(fpm), str(op)]
