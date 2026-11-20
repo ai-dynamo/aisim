@@ -160,7 +160,9 @@ Full CI uploads `license-artifacts` for trusted PR copies and post-merge pushes
 to `main` and `release/*`. It contains `deps.csv` (Python and Rust dependency
 versions and licenses), `deps-diff.csv`, and `evidence.json` with the source and
 comparison commit identities. PR evidence compares with the validated PR base;
-post-merge evidence compares with the push's previous commit. Missing baseline
+`release/*` evidence and superseded `main` commits compare with the push's
+previous commit. Other `main` evidence compares with the last main commit whose
+Full CI ran the full suite ([batched main validation](README.md#batched-main-validation)). Missing baseline
 inputs fail CI. Python inventories resolve runtime requirements at collection
 time on amd64/Python 3.12; they are not a wheel payload or a frozen PyPI lock.
 An unchanged Python manifest reuses the same resolution for both commits.

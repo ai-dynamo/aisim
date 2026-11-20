@@ -297,7 +297,9 @@ of a trusted PR copy, classifying both paths of a rename. The independent
 [selection cases](../../.github/full-ci-selection-cases.yml) document expected
 components and their consumer rationale; Fast CI checks this contract.
 
-- **Main, release, and manual runs:** every Full CI component.
+- **Release and manual runs:** every Full CI component.
+- **Main pushes:** every Full CI component for the newest commit of a burst of
+  merges; see [batched main validation](#batched-main-validation).
 - **Trusted PR copies:** components affected by the change. Documentation and
   review-policy-only changes can mark every expensive component N/A.
 - **Unknown paths, shared dependency/test configuration, or CI execution
@@ -308,6 +310,44 @@ components and their consumer rationale; Fast CI checks this contract.
 selection outputs, missing dependencies, failures, cancellations, and unexpected
 skips. A skipped component is acceptable only when the selector explicitly
 marked it N/A.
+
+### Batched main validation
+
+Merges often land minutes apart. After a push to `main`, **Select Full CI Scope**
+waits ten minutes (`MAIN_DEBOUNCE_SECONDS` in the selector), then reads `main`
+with the job's read-only token:
+
+| `main` after the wait | Scope | Comparison base |
+| --- | --- | --- |
+| Still this commit | Every component | Last main commit whose Full CI selected the full scope |
+| A newer commit that contains this one | Superseded: build, verify, and stage this commit's wheel | Previous main commit, used only by license evidence |
+| Unreadable, or a commit that does not contain this one | Every component | Last main commit whose Full CI selected the full scope |
+
+A superseded run builds the application test wheel, verifies and smoke-tests it in
+**Application Wheel**, collects license evidence, and stages the wheel through
+`automated-release`. Its application test legs and every other component are
+explicit N/A, and `Full CI Success` reports the commit as superseded.
+**Its staged wheel was built and verified, but its full test suite ran only with a
+later main commit that contains it.** A failure in that later run can come from
+any commit in the batch. Its **Select Full CI Scope** summary lists the commits it
+covers. Manual Full CI runs only branch heads, so check an individual deferred
+commit locally or through a PR.
+
+The newest run compares old and new revisions from the last main commit whose
+Full CI selected the full scope, not from its parent. Prediction-regression and
+license comparisons therefore cover every deferred commit. Earlier scopes come
+from the Actions API: the **Defer the test suite to the newer main commit** step
+succeeds in a superseded run and is skipped in a full-scope run. Selections that
+are still running, failed, or superseded are passed over; runs from before
+batching count as full scope. If none of the last 30 main pushes selected the full
+scope, or that commit is not an ancestor, the run compares with its parent and
+adds a warning to its summary. If `main` cannot be read, the run selects the full
+scope. If earlier runs cannot be read, **Select Full CI Scope** fails.
+
+Release branches, trusted PR copies, and manual runs are not batched. Every main
+run starts its expensive jobs ten minutes later. Main runs keep unique
+concurrency groups: batching narrows a superseded run's scope and never cancels
+the run.
 
 ### Validation components
 
@@ -337,7 +377,7 @@ explicit exception and its workflow contract test.
 | Rust workspace and public API | Workspace tests and external Rust consumer tests on amd64 and arm64 |
 | Rust feature modes | Supported feature builds/tests, including embedded Python and replay benchmarks |
 | Cargo Deny | Workspace dependency license and banned-package policy on both architectures |
-| Application wheels and tests | One prebuilt test wheel per architecture, installed into the application shards below; wheel verification and release-artifact contracts reuse it |
+| Application wheels and tests | One prebuilt test wheel per architecture (its own `application_test_wheel` component), installed into the application shards below; wheel verification and release-artifact contracts reuse it |
 | Python compatibility | Cross-package contracts and dependency checks on Python 3.11 and 3.13; application shards use Python 3.12 |
 | Engine Golden Regression | Engine-step and compiled-engine parity suites, plus frozen native numerical checks |
 | Platform Wheels | Build, repair, install, and exercise Linux x86-64/ARM64 and macOS ARM64 wheels |
@@ -492,6 +532,7 @@ timeout behavior. Local editable installs do not replace installed-wheel CI.
 | **Require Fast CI** failed or timed out | Open the linked/latest standalone Fast run for the same branch and SHA; resolve its failure or dispatch Fast CI first, then rerun Full CI |
 | `Fast CI Success` failed with missing or skipped substantive jobs | Inspect the required job results and cancellation history; draft status and labels do not skip Fast CI |
 | Full CI job skipped | Read **Select Full CI Scope** and the aggregate summary; only explicit N/A is acceptable |
+| Main run green with only wheel jobs executed | A newer main commit superseded it; the newer commit's run carries the full suite ([batched main validation](#batched-main-validation)) |
 | Full CI canceled after another PR run starts | A newer run replaced validation in the same PR/branch concurrency group; inspect the replacement run's SHA and results |
 | `Full CI Success` green, workflow still `waiting` | Validation finished; main/release wheel staging may be waiting for `automated-release` approval |
 | New nightly pending, earlier nightly waiting | Nightly's single concurrency group includes protected staging; an unapproved run can hold later validation behind it |
@@ -592,7 +633,8 @@ latency target. A manual FPE run does not publish nightly release artifacts.
 
 The Full CI target is **ten minutes from workflow creation to `Full CI Success`**,
 including runner queues, the standalone Fast prerequisite, and cold setup. Release-approval waits and FPE
-qualification are outside that target. Compare exact run SHAs and selected
+qualification are outside that target, as is the ten-minute wait before a main
+push selects its scope. Compare exact run SHAs and selected
 components; a documentation-only run and a complete matrix measure different
 workloads. Use job timestamps rather than the overall workflow completion time
 when staging is waiting.

@@ -1,15 +1,26 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Select the expensive Full CI components required by changed paths."""
+"""Select the expensive Full CI components required by changed paths.
+
+Pushes to main are batched: after a bounded wait, a commit that main has
+already moved past builds, verifies, and stages its wheel only, and the newest
+commit runs every component against the last main commit whose Full CI ran the
+full suite.
+"""
 
 from __future__ import annotations
 
 import argparse
 import base64
 import json
-from collections.abc import Iterable
+import os
+import re
+import subprocess
+import time
+from collections.abc import Callable, Iterable
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlencode
 
 COMPONENTS = (
     "readme_commands",
@@ -20,12 +31,37 @@ COMPONENTS = (
     "rust",
     "rust_feature_modes",
     "public_api_rust",
+    "application_test_wheel",
     "application_wheel",
     "application_tests",
     "python_compatibility",
     "engine_golden_regression",
     "release_artifact_contract",
 )
+
+# Components whose jobs download the per-architecture application test wheel;
+# selecting any of them also selects the wheel build.
+APPLICATION_TEST_WHEEL_CONSUMERS = {
+    "application_wheel",
+    "application_tests",
+    "release_artifact_contract",
+}
+# A main commit that a newer main commit has superseded still builds, verifies,
+# and stages its own wheel. Its test suite runs with the newer commit.
+SUPERSEDED_MAIN_COMPONENTS = {
+    "application_test_wheel",
+    "application_wheel",
+}
+
+# Main batching. Every name below must match .github/workflows/ci.yml: later
+# main runs read the recorded scope of earlier runs through the Actions API.
+MAIN_DEBOUNCE_SECONDS = 600
+MAIN_LOOKBACK_RUNS = 30
+WORKFLOW_PATH = ".github/workflows/ci.yml"
+SCOPE_JOB = "Select Full CI Scope"
+PLAN_STEP = "Plan required Full CI components"
+SUPERSEDED_STEP = "Defer the test suite to the newer main commit"
+FULL_SHA = re.compile(r"[0-9a-f]{40}")
 
 PYTHON_PACKAGE_COMPONENTS = {
     "readme_commands",
@@ -174,10 +210,26 @@ def _all(reason: str, paths: list[str]) -> dict[str, object]:
     }
 
 
-def select_components(paths: Iterable[str], *, force_all: bool = False) -> dict[str, object]:
-    """Return a fail-closed Full CI plan for repository-relative paths."""
+def select_components(
+    paths: Iterable[str],
+    *,
+    force_all: bool = False,
+    superseded: bool = False,
+) -> dict[str, object]:
+    """Return a fail-closed Full CI plan for repository-relative paths.
+
+    ``superseded`` is only set for a push to main that main has already moved
+    past; it replaces the forced full scope with the wheel build and staging.
+    """
 
     changed = _normalize(paths)
+    if superseded:
+        return {
+            "run_all": False,
+            "reason": "main moved past this commit; build, verify, and stage its wheel only",
+            "paths": changed,
+            "components": {component: component in SUPERSEDED_MAIN_COMPONENTS for component in COMPONENTS},
+        }
     if force_all:
         return _all("full matrix required by workflow event", changed)
     if not changed:
@@ -258,6 +310,8 @@ def select_components(paths: Iterable[str], *, force_all: bool = False) -> dict[
     if unknown:
         return _all(f"unclassified path: {unknown[0]!r}", changed)
 
+    if selected & APPLICATION_TEST_WHEEL_CONSUMERS:
+        selected.add("application_test_wheel")
     reason = ", ".join(sorted(reasons)) if reasons else "documentation-only change"
     return {
         "run_all": False,
@@ -267,16 +321,188 @@ def select_components(paths: Iterable[str], *, force_all: bool = False) -> dict[
     }
 
 
-def _write_github_output(path: Path, plan: dict[str, object]) -> None:
+class GitHubError(RuntimeError):
+    """GitHub metadata needed for main batching could not be read."""
+
+
+def github_api(endpoint: str) -> dict:
+    """Read one GitHub API response with the job's read-only token."""
+    try:
+        result = subprocess.run(
+            ["gh", "api", "-X", "GET", endpoint],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        response = json.loads(result.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        raise GitHubError(f"GitHub API request failed for {endpoint}") from error
+    if not isinstance(response, dict):
+        raise GitHubError(f"GitHub API returned an unexpected response for {endpoint}")
+    return response
+
+
+def main_scope_decision(jobs_page: dict) -> str:
+    """Classify the scope an earlier main push recorded: full, superseded, or undecided."""
+    scope_jobs = [job for job in jobs_page.get("jobs") or [] if job.get("name") == SCOPE_JOB]
+    if len(scope_jobs) != 1 or (scope_jobs[0].get("status"), scope_jobs[0].get("conclusion")) != (
+        "completed",
+        "success",
+    ):
+        # Still waiting, failed, or missing: it has not run the full suite.
+        return "undecided"
+    steps = scope_jobs[0].get("steps") or []
+    plans = [step for step in steps if step.get("name") == PLAN_STEP]
+    markers = [step for step in steps if step.get("name") == SUPERSEDED_STEP]
+    if len(plans) != 1 or plans[0].get("conclusion") != "success":
+        return "undecided"
+    if not markers:
+        # Runs created before main batching always selected the full scope.
+        return "full"
+    if len(markers) == 1 and markers[0].get("status") == "completed":
+        return {"skipped": "full", "success": "superseded"}.get(markers[0].get("conclusion"), "undecided")
+    return "undecided"
+
+
+def last_full_scope_commit(
+    repository: str,
+    sha: str,
+    run_id: int,
+    parent: str,
+    *,
+    api: Callable[[str], dict] = github_api,
+) -> tuple[str, list[tuple[str, str]]]:
+    """Return the newest earlier main commit whose Full CI selected the full scope.
+
+    Superseded and still-undecided runs are skipped, so the comparison covers
+    every commit whose test suite was deferred to this run. Without a full-scope
+    run in the bounded window, compare with the previous main commit instead.
+    """
+    query = urlencode({"branch": "main", "event": "push", "per_page": MAIN_LOOKBACK_RUNS})
+    runs = api(f"repos/{repository}/actions/workflows/ci.yml/runs?{query}").get("workflow_runs")
+    if not isinstance(runs, list):
+        raise GitHubError("GitHub API returned no main Full CI run list")
+    earlier = [
+        run
+        for run in runs
+        if type(run.get("id")) is int
+        and run["id"] < run_id
+        and run.get("path") == WORKFLOW_PATH
+        and run.get("event") == "push"
+        and run.get("head_branch") == "main"
+        and FULL_SHA.fullmatch(str(run.get("head_sha", "")))
+        and run["head_sha"] != sha
+    ]
+    deferred = []
+    for run in sorted(earlier, key=lambda run: run["id"], reverse=True):
+        decision = main_scope_decision(
+            api(f"repos/{repository}/actions/runs/{run['id']}/jobs?filter=latest&per_page=100")
+        )
+        if decision != "full":
+            deferred.append(f"`{run['head_sha']}` ({decision}, run {run['id']})")
+            continue
+        base = run["head_sha"]
+        status = api(f"repos/{repository}/compare/{base}...{sha}?per_page=1").get("status")
+        if status != "ahead":
+            return parent, [
+                (
+                    "warning",
+                    f"Full-scope main commit `{base}` is not an ancestor of this commit "
+                    f"(compare status {status!r}); comparing with the previous main commit `{parent}`.",
+                )
+            ]
+        notes = [
+            (
+                "notice",
+                f"Comparison base `{base}`: the last main commit whose Full CI selected the full scope "
+                f"(run {run['id']}).",
+            )
+        ]
+        if deferred:
+            notes.append(
+                ("notice", "This run also validates the main commits deferred to it: " + ", ".join(deferred) + ".")
+            )
+        return base, notes
+    return parent, [
+        (
+            "warning",
+            f"No full-scope Full CI run among the last {MAIN_LOOKBACK_RUNS} main pushes; "
+            f"comparing with the previous main commit `{parent}`.",
+        )
+    ]
+
+
+def resolve_main_push(
+    repository: str,
+    sha: str,
+    run_id: int,
+    parent: str,
+    *,
+    api: Callable[[str], dict] = github_api,
+    sleep: Callable[[float], None] = time.sleep,
+    debounce: float = MAIN_DEBOUNCE_SECONDS,
+) -> dict[str, object]:
+    """Wait for newer merges, then choose a superseded or full scope for a main push."""
+    if (
+        not re.fullmatch(r"[\w.-]+/[\w.-]+", repository)
+        or not FULL_SHA.fullmatch(sha)
+        or not FULL_SHA.fullmatch(parent)
+        or run_id <= 0
+    ):
+        raise ValueError("Main batching requires owner/name, a run ID, and full commit SHAs")
+    sleep(debounce)
+    notes: list[tuple[str, str]] = []
+    main_sha = ""
+    try:
+        main_sha = api(f"repos/{repository}/commits/main").get("sha", "")
+        if not isinstance(main_sha, str) or not FULL_SHA.fullmatch(main_sha):
+            raise GitHubError("main did not resolve to a full commit SHA")
+        status = (
+            "identical"
+            if main_sha == sha
+            else api(f"repos/{repository}/compare/{sha}...{main_sha}?per_page=1").get("status")
+        )
+    except GitHubError as error:
+        status = "unavailable"
+        notes.append(("warning", f"Could not compare this commit with main ({error}); running the full scope."))
+    if status == "ahead":
+        return {
+            "superseded": True,
+            "main_sha": main_sha,
+            "comparison_base": parent,
+            "notes": [
+                (
+                    "notice",
+                    f"main moved to `{main_sha}`, which contains this commit. This run builds, verifies, "
+                    "and stages this commit's wheel; its full test suite runs with the newer main commit.",
+                )
+            ],
+        }
+    if status not in {"identical", "unavailable"}:
+        notes.append(
+            (
+                "warning",
+                f"main is at `{main_sha}`, which does not contain this commit "
+                f"(compare status {status!r}); running the full scope.",
+            )
+        )
+    base, base_notes = last_full_scope_commit(repository, sha, run_id, parent, api=api)
+    return {"superseded": False, "main_sha": main_sha, "comparison_base": base, "notes": notes + base_notes}
+
+
+def _write_github_output(path: Path, plan: dict[str, object], *, superseded: bool, comparison_base: str) -> None:
     components = plan["components"]
     assert isinstance(components, dict)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(f"run_all={str(plan['run_all']).lower()}\n")
         for component in COMPONENTS:
             handle.write(f"{component}={str(components[component]).lower()}\n")
+        handle.write(f"superseded={str(superseded).lower()}\n")
+        handle.write(f"comparison_base={comparison_base}\n")
 
 
-def _write_summary(path: Path, plan: dict[str, object]) -> None:
+def _write_summary(path: Path, plan: dict[str, object], batch: dict[str, object] | None) -> None:
     components = plan["components"]
     assert isinstance(components, dict)
     selected = [name for name in COMPONENTS if components[name]]
@@ -286,12 +512,23 @@ def _write_summary(path: Path, plan: dict[str, object]) -> None:
         handle.write(f"Reason: {plan['reason']}\n\n")
         handle.write(f"Selected: {', '.join(selected) if selected else 'none'}\n\n")
         handle.write(f"Explicitly N/A: {', '.join(skipped) if skipped else 'none'}\n")
+        if batch is not None:
+            handle.write(
+                f"\n### Main batching\n\nWaited {MAIN_DEBOUNCE_SECONDS // 60} minutes for newer main merges.\n\n"
+            )
+            for _, note in batch["notes"]:
+                handle.write(f"- {note}\n")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base64-paths-file", type=Path)
     parser.add_argument("--force-all", action="store_true")
+    parser.add_argument("--comparison-base", default="", help="Comparison commit from exact-target verification")
+    parser.add_argument("--main-push", action="store_true", help="Batch post-merge test suites for a push to main")
+    parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", ""))
+    parser.add_argument("--sha", default=os.environ.get("GITHUB_SHA", ""))
+    parser.add_argument("--run-id", type=int, default=int(os.environ.get("GITHUB_RUN_ID") or 0))
     parser.add_argument("--github-output", type=Path)
     parser.add_argument("--summary", type=Path)
     args = parser.parse_args()
@@ -300,12 +537,28 @@ def main() -> None:
     if args.base64_paths_file:
         encoded_paths = args.base64_paths_file.read_text(encoding="ascii").splitlines()
         paths = [base64.b64decode(encoded, validate=True).decode("utf-8") for encoded in encoded_paths]
-    plan = select_components(paths, force_all=args.force_all)
-    print(json.dumps(plan, indent=2, sort_keys=True))
+    batch = None
+    if args.main_push:
+        try:
+            batch = resolve_main_push(
+                args.repository, args.sha, args.run_id, args.comparison_base, api=github_api, sleep=time.sleep
+            )
+        except (GitHubError, ValueError) as error:
+            raise SystemExit(f"::error::{error}") from error
+        for level, note in batch["notes"]:
+            print(f"::{level}::{note}")
+    comparison_base = str(batch["comparison_base"]) if batch else args.comparison_base
+    # Downstream checkouts treat an empty ref as the target itself, so the
+    # workflow output must always name an exact comparison commit.
+    if (args.github_output or comparison_base) and not FULL_SHA.fullmatch(comparison_base):
+        raise SystemExit("::error::comparison base must be a full commit SHA")
+    superseded = bool(batch and batch["superseded"])
+    plan = select_components(paths, force_all=args.force_all, superseded=superseded)
+    print(json.dumps({**plan, "superseded": superseded, "comparison_base": comparison_base}, indent=2, sort_keys=True))
     if args.github_output:
-        _write_github_output(args.github_output, plan)
+        _write_github_output(args.github_output, plan, superseded=superseded, comparison_base=comparison_base)
     if args.summary:
-        _write_summary(args.summary, plan)
+        _write_summary(args.summary, plan, batch)
 
 
 if __name__ == "__main__":

@@ -124,9 +124,17 @@ jobs:
     name: Select Full CI Scope
     needs: verify-target
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    # Main pushes first wait MAIN_DEBOUNCE_SECONDS (ten minutes) for newer merges.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+      # Main batching reads the scope recorded by earlier main Full CI runs.
+      actions: read
     outputs:
       pr-number: ${{ needs.verify-target.outputs.pr-number }}
+      comparison-base: ${{ steps.plan.outputs.comparison_base }}
+      superseded: ${{ steps.plan.outputs.superseded }}
       run_all: ${{ steps.plan.outputs.run_all }}
       readme_commands: ${{ steps.plan.outputs.readme_commands }}
       platform_wheels: ${{ steps.plan.outputs.platform_wheels }}
@@ -136,6 +144,7 @@ jobs:
       rust: ${{ steps.plan.outputs.rust }}
       rust_feature_modes: ${{ steps.plan.outputs.rust_feature_modes }}
       public_api_rust: ${{ steps.plan.outputs.public_api_rust }}
+      application_test_wheel: ${{ steps.plan.outputs.application_test_wheel }}
       application_wheel: ${{ steps.plan.outputs.application_wheel }}
       application_tests: ${{ steps.plan.outputs.application_tests }}
       python_compatibility: ${{ steps.plan.outputs.python_compatibility }}
@@ -207,17 +216,35 @@ jobs:
         env:
           FORCE_ALL: ${{ steps.scope.outputs.force_all }}
           PATHS_FILE: ${{ steps.scope.outputs.paths }}
+          COMPARISON_BASE: ${{ needs.verify-target.outputs.comparison-base }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           args=(
             --base64-paths-file "${PATHS_FILE}"
+            --comparison-base "${COMPARISON_BASE}"
             --github-output "${GITHUB_OUTPUT}"
             --summary "${GITHUB_STEP_SUMMARY}"
           )
           if [[ "${FORCE_ALL}" == "true" ]]; then
             args+=(--force-all)
           fi
+          # Only pushes to main are batched; release, PR-copy, and manual runs
+          # keep their scope and comparison base.
+          if [[ "${GITHUB_EVENT_NAME}:${GITHUB_REF}" == "push:refs/heads/main" ]]; then
+            args+=(--main-push --repository "${REPOSITORY}" --sha "${GITHUB_SHA}" --run-id "${GITHUB_RUN_ID}")
+          fi
           python scripts/ci/select_full_ci.py "${args[@]}"
+      - name: Defer the test suite to the newer main commit
+        # Later main runs read this step's conclusion (success or skipped) to
+        # find the last commit that ran the full suite. Keep the name equal to
+        # SUPERSEDED_STEP in scripts/ci/select_full_ci.py.
+        if: steps.plan.outputs.superseded == 'true'
+        shell: bash
+        run: >-
+          echo "::notice title=Superseded main commit::This run builds, verifies, and stages
+          the wheel only; the full test suite runs with a newer main commit."
 
   fast-ci:
     name: Require Fast CI
@@ -263,7 +290,7 @@ jobs:
     uses: ./.github/workflows/prediction-regression-gate.yml
     with:
       expected_sha: ${{ github.sha }}
-      old-ref: ${{ needs.verify-target.outputs.comparison-base }}
+      old-ref: ${{ needs.select-full-ci.outputs.comparison-base }}
 
   cargo-deny:
     name: Cargo Deny (workspace, ${{ matrix.arch }})
@@ -610,7 +637,7 @@ jobs:
     environment: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && 'automated-release' || 'pr-wheel-staging' }}
     name: Application Test Wheel (${{ matrix.arch }})
     needs: [fast-ci, select-full-ci]
-    if: ${{ needs.select-full-ci.outputs.application_tests == 'true' }}
+    if: ${{ needs.select-full-ci.outputs.application_test_wheel == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -830,7 +857,7 @@ jobs:
           python-version: "3.12"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ needs.verify-target.outputs.comparison-base }}
+          ref: ${{ needs.select-full-ci.outputs.comparison-base }}
           path: license-baseline-source
           persist-credentials: false
       - name: Check Python dependency licenses
@@ -875,7 +902,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ needs.verify-target.outputs.comparison-base }}
+          ref: ${{ needs.select-full-ci.outputs.comparison-base }}
           path: license-baseline-source
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -897,7 +924,7 @@ jobs:
 
   license-evidence:
     name: License compliance evidence
-    needs: [fast-ci, verify-target, python-compliance, license-crate-inventory]
+    needs: [fast-ci, select-full-ci, verify-target, python-compliance, license-crate-inventory]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -916,7 +943,7 @@ jobs:
       - name: Generate license compliance evidence
         env:
           SOURCE_SHA: ${{ github.sha }}
-          BASE_SHA: ${{ needs.verify-target.outputs.comparison-base }}
+          BASE_SHA: ${{ needs.select-full-ci.outputs.comparison-base }}
         run: |
           python scripts/ci/generate_license_evidence.py "${RUNNER_TEMP}/license-inventories/head" \
             --base-dir "${RUNNER_TEMP}/license-inventories/base" \
@@ -1130,7 +1157,7 @@ jobs:
               "rust-feature-modes": "rust_feature_modes",
               "public-api-rust": "public_api_rust",
               "application-wheel": "application_wheel",
-              "application-test-wheel": "application_tests",
+              "application-test-wheel": "application_test_wheel",
               "application-tests": "application_tests",
               "python-compatibility": "python_compatibility",
               "engine-golden-regression": "engine_golden_regression",
@@ -1169,6 +1196,12 @@ jobs:
               summary.append(f"| {name} | {outcome} (`{result}`, expected `{wanted}`) |")
               if result != wanted:
                   failures.append(f"{name}={result}, expected {wanted}")
+          if plan.get("superseded") == "true":
+              summary += [
+                  "",
+                  "Superseded main commit: its wheel was built, verified, and staged;"
+                  " its full test suite runs with a newer main commit.",
+              ]
           if summary_path := os.environ.get("GITHUB_STEP_SUMMARY"):
               with open(summary_path, "a", encoding="utf-8") as handle:
                   handle.write("\n".join(summary) + "\n")
