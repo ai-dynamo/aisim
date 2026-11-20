@@ -264,7 +264,7 @@ def test_the_hf_pin_fetches_the_declared_donor_selection(tree, tmp_path, monkeyp
     _build(tree, published)
     requested = []
 
-    def fake_fetch(selection, pin, transport):
+    def fake_fetch(selection, pin, transport, out=None):
         requested.append((selection.framework_version, selection.operation_family, selection.configuration_ids))
         return SimpleNamespace(root=published, downloaded_bytes=0, plan=SimpleNamespace(revision="a" * 40))
 

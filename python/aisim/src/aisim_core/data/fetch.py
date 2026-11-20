@@ -475,6 +475,7 @@ class _Planner:
             if received > limit:
                 raise IntegrityError(ref.path, f"metadata transfer exceeds {limit} bytes")
             if self.budget is not None and plan.metadata_bytes + received > self.budget:
+                plan.metadata_bytes += received  # what had arrived when the allowance ran out
                 raise BudgetExceededError(plan, self.budget)
             chunks.append(chunk)
         plan.metadata_bytes += received

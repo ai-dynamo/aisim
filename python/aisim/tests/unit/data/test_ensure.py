@@ -17,7 +17,7 @@ from aisim_core.data.ensure import (
     ensure_data,
     pin_from_environment,
 )
-from aisim_core.data.fetch import Cache
+from aisim_core.data.fetch import Cache, Selection
 from aisim_core.data.loaders import FpmData, FpmLoader
 from tests.unit.data.test_fetch import REPO, SHA, FakeTransport, build_repo
 
@@ -36,7 +36,9 @@ def stub_prepare(monkeypatch):
         output_dir.mkdir(parents=True)
         prepared = {
             "systems_paths": [str(output_dir / "systems")],
-            "estimator_config": {"op_level": {"execution_profile": PROFILE}},
+            "estimation_mode": "op_level",
+            "enable_shared_layer": False,
+            "estimator_config": {"op_level": {"execution_profile": PROFILE}, "correction": {"enabled": False}},
         }
         (output_dir / "config.json").write_text(json.dumps(prepared))
         return FpmData(manifest, config=prepared)
@@ -242,3 +244,104 @@ def test_identical_overlap_gives_the_same_roots_in_either_order(tmp_path, monkey
     monkeypatch.setattr(ensure_mod, "_ensure_category", fake_ensure_category)
     out = ensure_data(CONFIG, DataPin(local_root=tmp_path, categories=categories))
     assert out.config["systems_paths"] == [str(fpm), str(op)]
+
+
+# ---------------------------------------------------------------- review regressions: pin validation and fetch budget
+
+
+@pytest.mark.parametrize("value", [" , ", ",", " "])
+def test_a_pin_without_categories_is_refused(monkeypatch, value):
+    env = {"AISIM_DATASET": f"{REPO}@{SHA}", "AISIM_DATA_CATEGORIES": value}
+    with pytest.raises(ValueError, match="at least one category"):
+        pin_from_environment(env)
+    with pytest.raises(ValueError, match="at least one category"):
+        DataPin(repo=REPO, revision=SHA, categories=())
+
+
+def test_the_revision_is_resolved_once_and_every_fetch_uses_that_commit(tmp_path, files):
+    moved = "b" * 40
+
+    class Moving(FakeTransport):
+        def __init__(self, files):
+            super().__init__(files, refs={"main": SHA})
+            self.shas = set()
+
+        def resolve_revision(self, repo, revision):
+            self.resolves += 1
+            return SHA if self.resolves == 1 else moved  # the branch moves after the first resolution
+
+        def open_file(self, repo, sha, path):
+            self.shas.add(sha)
+            return super().open_file(repo, sha, path)
+
+    transport = Moving(files)
+    ensure_data(CONFIG, DataPin(repo=REPO, revision="main", cache_dir=tmp_path / "cache"), transport=transport)
+    assert transport.resolves == 1 and transport.shas == {SHA}
+
+
+def test_the_size_allowance_covers_the_whole_pin(tmp_path, files, monkeypatch):
+    """A second fetch of one pin gets only what the first left, and the error says what was already cached."""
+    first = {}
+    real_fetch = ensure_mod.fetch
+
+    def recording_fetch(selection, **kwargs):
+        first.setdefault("limits", []).append(kwargs.get("max_bytes"))
+        return real_fetch(selection, **kwargs)
+
+    monkeypatch.setattr(ensure_mod, "fetch", recording_fetch)
+    out = ensure_mod.EnsuredData(config=dict(CONFIG))
+    p = pin(tmp_path, max_bytes=1_000_000)
+    transport = FakeTransport(files)
+    ensure_mod._fetch_pinned(Selection(category="fpm", model="m1", hardware="h200"), p, transport, out)
+    assert out.downloaded_bytes > 0
+    spent = out.downloaded_bytes
+    with pytest.raises(DataTooLargeError, match=f"{spent} bytes of this pin were already downloaded") as err:
+        ensure_mod._fetch_pinned(
+            Selection(category="fpm", model="m2", hardware="h200"), pin(tmp_path, max_bytes=spent + 1), transport, out
+        )
+    assert err.value.uncached_bytes > spent + 1
+
+
+def test_the_fpm_preparation_key_covers_the_runtime_destination(tmp_path):
+    from tests.unit.data.test_fetch import _repin
+
+    files = build_repo(tmp_path)
+    root = tmp_path / "local"
+
+    def publish():
+        for path, data in files.items():
+            (root / path).parent.mkdir(parents=True, exist_ok=True)
+            (root / path).write_bytes(data)
+
+    publish()
+    local = DataPin(local_root=root, cache_dir=tmp_path / "cache")
+    first = ensure_data(CONFIG, local).config["systems_paths"][0]
+    # Same source path, size and digest; only where the artifact lands in the runtime tree changes.
+    manifest = json.loads(files["fpm/m1/manifest.json"])
+    manifest["artifacts"][0]["runtime_path"] = "data/h200/other/vllm/0.1/table.parquet"
+    files["fpm/m1/manifest.json"] = json.dumps(manifest).encode()
+    _repin(files, "fpm/m1/manifest.json")
+    publish()
+    assert ensure_data(CONFIG, local).config["systems_paths"][0] != first
+
+
+def test_the_prepared_profile_settings_fill_unspecified_caller_fields(tmp_path, files):
+    # The defaults a typed configuration carries: estimation_mode "auto", shared layer unspecified, no correction.
+    config = {**CONFIG, "estimation_mode": "auto", "enable_shared_layer": None, "estimator_config": {}}
+    out = ensure_data(config, pin(tmp_path), transport=FakeTransport(files)).config
+    assert out["estimation_mode"] == "op_level" and out["enable_shared_layer"] is False
+    assert out["estimator_config"]["correction"] == {"enabled": False}
+    assert out["estimator_config"]["op_level"]["execution_profile"] == PROFILE
+
+
+@pytest.mark.parametrize(
+    "change,message",
+    [
+        ({"estimation_mode": "fpm_regression"}, "estimation_mode='fpm_regression'.*requires 'op_level'"),
+        ({"enable_shared_layer": True}, "enable_shared_layer=True.*requires False"),
+        ({"estimator_config": {"correction": {"enabled": True}}}, "enables output correction"),
+    ],
+)
+def test_an_explicit_choice_that_conflicts_with_the_prepared_profile_is_reported(tmp_path, files, change, message):
+    with pytest.raises(DataConflictError, match=message):
+        ensure_data({**CONFIG, **change}, pin(tmp_path), transport=FakeTransport(files))

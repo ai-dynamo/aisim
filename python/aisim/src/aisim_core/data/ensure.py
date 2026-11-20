@@ -69,6 +69,7 @@ from aisim_core.data.fetch import (
     Transport,
     fetch,
     fetch_support,
+    resolve_revision,
 )
 from aisim_core.data.loaders import LOADERS, FpmData, LoaderError
 from aisim_core.data.op_schema import DATA_PREFIX, QUERY_VERSIONS_NAME
@@ -115,10 +116,15 @@ class DataTooLargeError(DataFetchError):
 
     code = "data-too-large"
 
-    def __init__(self, uncached_bytes: int, max_bytes: int, command: str):
+    def __init__(self, uncached_bytes: int, max_bytes: int, command: str, already_downloaded: int = 0):
+        done = (
+            f"{already_downloaded} bytes of this pin were already downloaded and cached; this selection is the rest. "
+            if already_downloaded
+            else "Nothing was downloaded. "
+        )
         super().__init__(
             f"dataset needs {uncached_bytes} uncached bytes, above the auto-download threshold of {max_bytes} "
-            f"bytes (AISIM_DATA_MAX_BYTES). Nothing was downloaded. To proceed, run: {command}"
+            f"bytes (AISIM_DATA_MAX_BYTES). {done}To proceed, run: {command}"
         )
         self.uncached_bytes, self.max_bytes, self.command = uncached_bytes, max_bytes, command
 
@@ -156,6 +162,8 @@ class DataPin:
     def __post_init__(self) -> None:
         if self.local_root is None and not (self.repo and self.revision):
             raise ValueError("a data pin needs local_root or both repo and revision")
+        if not self.categories:
+            raise ValueError("a data pin needs at least one category; AISIM_DATA_CATEGORIES must name one or more")
         unknown = [c for c in self.categories if c not in LOADERS or c == "e2e"]
         if unknown:
             raise ValueError(f"categories not loadable into a predictor: {unknown}")
@@ -168,6 +176,7 @@ class EnsuredData:
     config: dict[str, Any]
     datasets: dict[str, dict[str, Any]] = field(default_factory=dict)  # category -> provenance
     roots: dict[str, list[str]] = field(default_factory=dict)  # category -> systems roots it contributed
+    downloaded_bytes: int = 0  # everything this call fetched, charged against the pin's one size allowance
 
     def to_dict(self) -> dict[str, Any]:
         return {"datasets": self.datasets}
@@ -288,6 +297,13 @@ def ensure_data(
         from aisim_core.data.fetch import HfTransport
 
         transport = HfTransport()
+    if pin.local_root is None:
+        # One commit for the whole call: policy, primary and dependency fetches must read the same revision even if
+        # a branch moves meanwhile. A full SHA needs no network.
+        try:
+            pin = replace(pin, revision=resolve_revision(transport, pin.repo, pin.revision, offline=pin.offline))
+        except RevisionError as exc:
+            raise MissingDataError(f"cannot resolve {pin.repo}@{pin.revision} to a commit: {exc}") from exc
     with _guard():
         if "op-latency" in pin.categories:
             _resolve_backend_version(out, pin, transport)
@@ -427,7 +443,7 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
         source, revision, downloaded = "local", f"local:{root}", 0
         source_key = "local-" + hashlib.sha256(str(root).encode()).hexdigest()[:16]
     else:
-        result = _fetch_pinned(selection, pin, transport)
+        result = _fetch_pinned(selection, pin, transport, out)
         root = result.root
         source = "hf-download" if result.downloaded_bytes else "hf-cache"
         revision, downloaded = result.plan.revision, result.downloaded_bytes
@@ -451,7 +467,9 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
             source_key,
             selection,
             where,
-            fetch_donors=None if pin.local_root is not None else lambda wanted: _fetch_pinned(wanted, pin, transport),
+            fetch_donors=None
+            if pin.local_root is not None
+            else lambda wanted: _fetch_pinned(wanted, pin, transport, out),
         )
         _wire(out.config, category, loaded, None)
         out.roots[category] = [str(loaded.root)]
@@ -491,7 +509,11 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
     }
 
 
-def _fetch_pinned(selection: Selection, pin: DataPin, transport: Transport | None) -> FetchResult:
+def _fetch_pinned(
+    selection: Selection, pin: DataPin, transport: Transport | None, out: EnsuredData | None = None
+) -> FetchResult:
+    """Fetch one selection of the pin; ``out`` carries what earlier fetches of this call already downloaded."""
+    spent = 0 if out is None else out.downloaded_bytes
     cache = Cache(pin.cache_dir)
     common = {"repo": pin.repo, "revision": pin.revision, "cache": cache}
     where = f"{pin.repo}@{pin.revision}"
@@ -516,10 +538,18 @@ def _fetch_pinned(selection: Selection, pin: DataPin, transport: Transport | Non
         # Cached catalog exists but matches nothing: the answer is final for this revision.
         raise MissingDataError(f"{exc} ({_describe(selection)} in {where})", selection=selection, source=where) from exc
     try:
-        return fetch(selection, transport=transport, max_bytes=pin.max_bytes, **common)
+        # The auto-download allowance belongs to the whole pin: a donor fetched after the primary selection gets only
+        # what the earlier fetches left.
+        result = fetch(selection, transport=transport, max_bytes=max(pin.max_bytes - spent, 0), **common)
+        if out is not None:
+            out.downloaded_bytes += result.downloaded_bytes + result.plan.metadata_bytes
+        return result
     except BudgetExceededError as exc:
         raise DataTooLargeError(
-            exc.plan.uncached_bytes + exc.plan.metadata_bytes, pin.max_bytes, _command(pin, selection)
+            spent + exc.plan.uncached_bytes + exc.plan.metadata_bytes,
+            pin.max_bytes,
+            _command(pin, selection),
+            already_downloaded=spent,
         ) from exc
     except SelectionError as exc:
         raise MissingDataError(f"{exc} ({_describe(selection)} in {where})", selection=selection, source=where) from exc
@@ -533,7 +563,9 @@ def _load(loader, category: str, root: Path, entry: Entry, config: Mapping[str, 
         # measurements must not be served from the preparation of the old ones.
         content = hashlib.sha256()
         for artifact in sorted(manifest.artifacts, key=lambda a: a.path):
-            content.update(f"{artifact.path}\0{artifact.sha256}\0{artifact.bytes}\n".encode())
+            content.update(
+                f"{artifact.path}\0{artifact.runtime_path}\0{artifact.role}\0{artifact.sha256}\0{artifact.bytes}\n".encode()
+            )
         output_dir = output_dir.with_name(f"{output_dir.name}-{content.hexdigest()[:16]}")
         cached = output_dir / "config.json"
         if cached.is_file():  # materialized by an earlier verified load; config.json is written last
@@ -707,6 +739,42 @@ def _load_op_latency(
         ) from exc
 
 
+# Scalar settings an installed execution profile requires; the value that means "caller did not choose" per field.
+_PROFILE_SCALARS = (
+    ("estimation_mode", ("auto", None)),
+    ("enable_shared_layer", (None,)),
+    ("fallback_policy", (None,)),
+    ("database_mode", (None,)),
+)
+
+
+def _adopt_prepared_settings(config: dict[str, Any], prepared: Mapping[str, Any], entry: Entry | None) -> None:
+    """Carry the settings the validated prepared configuration requires into the caller's unspecified fields.
+
+    Native construction rejects an execution profile under ``auto`` estimation, shared-layer reuse or the default
+    correction. The prepared configuration passed those checks, so its choices fill what the caller left at the
+    default, and an explicit incompatible choice is reported here, naming the entry, instead of failing later.
+    """
+    where = f"dataset entry {entry.configuration_id}" if entry is not None else "the dataset entry"
+    for name, unspecified in _PROFILE_SCALARS:
+        wanted = prepared.get(name)
+        if wanted is None:
+            continue
+        have = config.get(name)
+        if have in unspecified:
+            config[name] = wanted
+        elif have != wanted:
+            raise DataConflictError(f"configuration sets {name}={have!r} but {where} requires {wanted!r}")
+    wanted_correction = (prepared.get("estimator_config") or {}).get("correction")
+    if wanted_correction is not None:
+        estimator = config.setdefault("estimator_config", {})
+        have_correction = estimator.get("correction")
+        if have_correction is None:
+            estimator["correction"] = copy.deepcopy(wanted_correction)
+        elif bool(have_correction.get("enabled")) != bool(wanted_correction.get("enabled")):
+            raise DataConflictError(f"configuration enables output correction but {where} requires it disabled")
+
+
 def _wire(config: dict[str, Any], category: str, loaded: Any, entry: Entry | None) -> None:
     """Merge loaded inputs into ``config``, preserving explicit user choices."""
     if category == "op-latency":
@@ -718,6 +786,7 @@ def _wire(config: dict[str, Any], category: str, loaded: Any, entry: Entry | Non
     paths = [*(loaded_config.get("systems_paths") or ()), *(config.get("systems_paths") or ())]
     config["systems_paths"] = list(dict.fromkeys(str(p) for p in paths))
     wanted = loaded_config["estimator_config"]["op_level"]["execution_profile"]
+    _adopt_prepared_settings(config, loaded_config, entry)
     estimator = config.setdefault("estimator_config", {})
     op_level = estimator.setdefault("op_level", {})
     user = op_level.get("execution_profile")
