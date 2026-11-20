@@ -76,6 +76,17 @@ def detect_runtime_versions(deployment: FPMDeployment) -> dict[str, str]:
         }
         if deployment.extra_env:
             manifest["spec"]["containers"][0]["env"] = deployment.extra_env
+        if deployment.model_cache:
+            # Collection mounts the entire PVC; the optional third component
+            # selects the model directory within it, not a volume subPath.
+            parts = deployment.model_cache.split(":")
+            manifest["spec"]["volumes"] = [{"name": "model-cache", "persistentVolumeClaim": {"claimName": parts[0]}}]
+            manifest["spec"]["containers"][0]["volumeMounts"] = [
+                {
+                    "name": "model-cache",
+                    "mountPath": parts[1] if len(parts) > 1 and parts[1] else "/workspace/model_cache",
+                }
+            ]
         if deployment.image_pull_secret:
             manifest["spec"]["imagePullSecrets"] = [{"name": deployment.image_pull_secret}]
         prefix = ["kubectl", "--namespace", namespace]

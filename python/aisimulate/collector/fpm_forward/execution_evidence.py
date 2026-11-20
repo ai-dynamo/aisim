@@ -479,6 +479,11 @@ def _inspect_config(payload, cell, plan, flags, missing, failures, native_worker
         failures.append("worker graph_config contradicts its resolved_config.compilation_config")
     if native_worker is not None:
         native_config = native_worker["resolved_config"]
+        kernel = config.get("kernel_config")
+        if not isinstance(kernel, dict) or kernel.get("moe_backend") != native_config.get("kernel_config", {}).get(
+            "moe_backend"
+        ):
+            failures.append("runtime kernel_config.moe_backend differs from the validated initialized worker")
         native_parallel = native_config["parallel_config"]
         for name in _CONFIG_TYPES["parallel_config"]:
             if name in parallel and (

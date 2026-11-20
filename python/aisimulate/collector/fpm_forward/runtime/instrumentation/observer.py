@@ -91,6 +91,10 @@ def _resolved(owner: Any) -> dict:
     for key in ("mamba_cache_mode", "mamba_cache_dtype", "mamba_ssm_cache_dtype", "mamba_block_size"):
         if hasattr(config.cache_config, key):
             value["cache_config"][key] = _json(getattr(config.cache_config, key))
+    # The pinned V2 runner creates one metadata builder per effective ubatch.
+    for key in ("use_ubatching", "num_ubatches"):
+        if hasattr(config.parallel_config, key):
+            value["parallel_config"][key] = _json(getattr(config.parallel_config, key))
     return value
 
 

@@ -2471,3 +2471,32 @@ def test_profile_rejects_unsupported_fpm_options_at_canonical_and_compile_bounda
             fpm_interpolation="direct",
             fpm_options=options,
         )
+
+
+@pytest.mark.parametrize("architecture", ["NemotronHForCausalLM", "NemotronH_Omni_Reasoning_V3"])
+@pytest.mark.parametrize("text_only", [False, True])
+def test_nemotron_mamba_graph_uses_direct_interpolation_and_rejects_sol(
+    profile_dict, checkpoint_configs, monkeypatch, tmp_path, architecture, text_only
+):
+    profile_dict["architecture"] = architecture
+    profile_dict["deployments"][0]["system"] = "h200_sxm"
+    checkpoint_configs[profile_dict["model"]] = {"architectures": [architecture]}
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
+    monkeypatch.setattr(engine, "get_model", _fail_graph)
+    parquet = _write_external_profile_pair(profile_dict, tmp_path)
+    request = _request(profile_dict)
+    controls = request["estimator_config"]["fpm_interpolation"]
+    controls.update(text_only=text_only, fpm_parquet_path=str(parquet))
+    model = RustForwardPassPerfModel.best_available(request)
+    try:
+        resolved = model.diagnostics()["provenance"]["config"]
+        assert resolved["estimator_config"]["fpm_interpolation"]["method"] == "direct"
+        assert model.estimate_forward_pass_time_ms(
+            [{"scheduled_requests": {"num_decode_requests": 1, "sum_decode_kv_tokens": 32}}]
+        ) == pytest.approx(3.0)
+    finally:
+        model.close()
+    controls["method"] = "sol"
+    for entry_point in (RustForwardPassPerfModel.normalize_config, RustForwardPassPerfModel.best_available):
+        with pytest.raises(ValueError, match="SOL interpolation requires a registered analytical model class"):
+            entry_point(request)

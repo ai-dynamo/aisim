@@ -38,7 +38,9 @@ def inputs(tmp_path, monkeypatch, request):
     # Keep the independent checkpoint layout small and consistent with the
     # synthetic native views, including two distinct KDA decoder branches.
     text["num_hidden_layers"] = 4
-    text["linear_attn_config"].update(kda_layers=[1, 2], full_attn_layers=[3, 4])
+    text["linear_attn_config"].update(
+        kda_layers=[1, 2], full_attn_layers=[3, 4], num_heads=2, head_dim=2, short_conv_kernel_size=2
+    )
     text["dsa_config"]["dsa_layers"] = [3, 4]
     config = json.loads(config_path.read_text())
     config["text_config"] = text
@@ -453,6 +455,19 @@ def test_inline_and_imported_dp_proofs_require_matching_full_settings(inputs, ma
                 data_parallel_size_local=1 if difference == "settings" and not matching and dp == 1 else 2,
                 enable_expert_parallel=True,
             )
+            # TP1 owns twice the KDA heads of the original TP2 fixture.
+            state = observed["cache"]["groups"][-1]
+            for spec in state.get("layer_specs", {"representative": state}).values():
+                spec.update(state_shapes=[[1, 12], [2, 2, 2]], state_content_size_bytes=56)
+            if observed["kind"] == "worker":
+                for name in state["layer_names"]:
+                    convolution, recurrent = observed["cache"]["layer_components"][name]
+                    convolution.update(shape=[10, 1, 12], stride_bytes=[512, 24, 2])
+                    recurrent.update(
+                        shape=[10, 2, 2, 2],
+                        stride_bytes=[512, 16, 8, 4],
+                        storage_offset_bytes=convolution["storage_offset_bytes"] + 24,
+                    )
             if difference == "geometry" and not matching and dp == 1:
                 observed["cache"]["groups"][-1]["layer_names"].reverse()
             if difference == "geometry":
@@ -547,6 +562,64 @@ def test_canonical_onboarding_wrapper_revalidates_native_evidence(inputs):
     expected = bind(inputs)
     onboarding_wrapper(inputs)
     assert bind(inputs) == expected
+
+
+@pytest.mark.parametrize("registered", [False, True])
+def test_onboarding_capacity_override_preserves_measured_minimum(inputs, registered):
+    expected = bind(inputs)
+    wrapper = onboarding_wrapper(inputs)
+    memory = inputs["profile"]["deployments"][0]["resources"]["runtime_memory"]
+    observed = memory["kv_cache_bytes"]
+    page = inputs["profile"]["deployments"][0]["resources"]["cache_groups"][0]["page_size_bytes"]
+    memory["kv_cache_bytes"] -= page
+    if registered:
+        wrapper["user_overrides"] = {
+            "runtime_memory.kv_cache_bytes": {
+                "observed": observed,
+                "value": memory["kv_cache_bytes"],
+                "source": "user override; assumption, not a runtime measurement",
+            }
+        }
+    memory["provenance"] = json.dumps(wrapper)
+    if registered:
+        assert bind(inputs) == expected
+        plan = planner.build_collection_plan(
+            backend=inputs["backend"],
+            model_path=inputs["model_path"],
+            system=inputs["system"],
+            selected_ops=set(),
+            options=inputs["options"],
+            has_model_cases=False,
+            model_config_path=inputs["runtime_launch"]["model_config"]["path"],
+            fpm_profile=inputs["profile"],
+            runtime_instrumentation=inputs["runtime_instrumentation"],
+            runtime_launch=inputs["runtime_launch"],
+            generator_overrides=runtime_probe.probe_generator_overrides(inputs["runtime_launch"]),
+        )
+        assert plan.fpm_profile.deployments[0].resources.runtime_memory.kv_cache_bytes == observed - page
+    else:
+        with pytest.raises(ValueError, match="registered user override"):
+            bind(inputs)
+
+
+def test_inline_capacity_difference_still_requires_registered_wrapper(inputs):
+    inputs["profile"]["deployments"][0]["resources"]["runtime_memory"]["kv_cache_bytes"] -= 512
+    with pytest.raises(ValueError, match="capacity differs from the imported rank minimum"):
+        bind(inputs)
+
+
+def test_onboarding_manifest_must_include_each_consumed_worker(inputs):
+    wrapper = onboarding_wrapper(inputs)
+    worker = next(
+        ref
+        for ref in wrapper["source_artifacts"]
+        if ref["path"].endswith(".json") and json.loads(Path(ref["path"]).read_text()).get("kind") == "worker"
+    )
+    wrapper["source_artifacts"].remove(worker)
+    memory = inputs["profile"]["deployments"][0]["resources"]["runtime_memory"]
+    memory["provenance"] = json.dumps(wrapper)
+    with pytest.raises(ValueError, match="missing immutable source artifact"):
+        bind(inputs)
 
 
 @pytest.mark.parametrize(

@@ -54,7 +54,11 @@ is redistributed by this adapter.
   `models/kimi_k3/nvidia/kda.py`: initialized `kv_cache` is a tuple of convolution
   and recurrent tensors. The observer records each actual shape, dtype, byte
   stride and offset; the importer independently checks both components against
-  the native spec. BF16/FP32 state is never relabeled as FP8 KV.
+  the native spec and the hash-bound checkpoint's `linear_attn_config` heads,
+  head dimension, convolution size and TP size. Convolution orientation follows
+  the reviewed `VLLM_SSM_CONV_STATE_LAYOUT` environment (default `SD`), as in
+  `model_executor/layers/mamba/mamba_utils.py::MambaStateShapeCalculator`.
+  BF16/FP32 state is never relabeled as FP8 KV.
 * `config/vllm.py::validate_mamba_block_size`, `MambaSpec`, and
   `v1/core/single_type_kv_cache_manager.py::MambaManager`: with prefix caching
   disabled, no speculation and mode `none`, the state block covers maximum
@@ -73,6 +77,11 @@ is redistributed by this adapter.
   maximum context: at CP1, round up to manager blocks, align their capacity to
   128 tokens (`v1/worker/block_table.py::get_block_table_width`), then multiply
   by the number of kernel blocks per manager block. For a packed indexer,
+  a manager block larger than 64 tokens requires the observed subdivision map.
+  The table's leading dimension equals the effective metadata-builder count
+  used by `gpu/attn_utils.py::init_attn_backend`: one with microbatching disabled,
+  otherwise the resolved `parallel_config.num_ubatches`. Both microbatching
+  settings are recorded alongside the initialized cache evidence. For this map,
   kernel page `j` of manager block
   `b` is `b * kernel_block_stride + j`; import verifies that each addressed page
   lies in the layer's native allocation interval. The tensor spans intervening
@@ -106,9 +115,10 @@ is redistributed by this adapter.
 
 Use this explicit example bundle with a fresh campaign and the normal
 `aisimulate onboard probe-runtime` workflow. Default release bundles are unchanged.
-The first supported candidate is decode-only, no speculation, prefix caching
-off, Mamba `none`. Dynamo's `native_exact_context` decode path must be qualified
-on the intended runtime. Its nonzero-context prefill seeding uses prefix-cache
-lookup and is not qualified by this baseline; successful decode does not qualify
-aggregated/prefill serving. No timing data is produced by source inspection or
-unit-test fakes. Rank-complete native probe evidence is required before import.
+The baseline supports independent decode and zero-history prefill workers, with
+no speculation, prefix caching off and Mamba `none`. Each role's Dynamo
+`native_exact_context` path must be qualified on the intended runtime. Historical-KV
+prefill seeding uses prefix-cache lookup and is not qualified by this baseline;
+aggregated serving also remains outside it. No timing data is produced by source
+inspection or unit-test fakes. Rank-complete native probe evidence is required
+for each role before import.

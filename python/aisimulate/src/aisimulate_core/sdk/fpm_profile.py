@@ -191,10 +191,10 @@ def _validate_forward_pass_profile(config_json: str) -> str:
     from aisimulate_core.sdk.models.base import _MODEL_REGISTRY
 
     family = common.ARCHITECTURE_TO_MODEL_FAMILY.get(analytical_architecture, analytical_architecture)
-    # Qwen3.5's wrapper graph emits GDN, which has no FPM SOL roofline. Do not
-    # select SOL for either a wrapper or a promoted decoder profile. Auto can
-    # use direct interpolation; explicit SOL must fail during validation.
-    unsupported_sol_graph = family == "QWEN35"
+    # Qwen3.5 emits GDN and NemotronH emits Mamba2, neither of which has an
+    # FPM SOL roofline. This applies to wrapper and decoder profiles alike.
+    # Auto can use direct interpolation; explicit SOL fails during validation.
+    unsupported_sol_graph = family in {"QWEN35", "NEMOTRONH"}
     return json.dumps(
         {
             "profile": profile.model_dump(mode="json"),

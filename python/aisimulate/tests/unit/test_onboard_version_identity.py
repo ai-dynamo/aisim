@@ -346,7 +346,7 @@ def test_supplied_profile_version_is_preserved_or_requires_explicit_selection(
         None,
         [],
         [
-            {"name": "PYTHONPATH", "value": "/mounted packages/vllm"},
+            {"name": "PYTHONPATH", "value": "/runtime/deps"},
             {"name": "LITERAL", "value": "a b;$HOME`echo no`\nnext"},
         ],
     ],
@@ -359,7 +359,11 @@ def test_metadata_probe_targets_selected_container_without_gpu_requests(tmp_path
         image="registry.example.invalid/benchmark:fixture",
         extra_env=environment,
         **(
-            {"namespace": "synthetic-probe", "image_pull_secret": "synthetic-secret"}
+            {
+                "namespace": "synthetic-probe",
+                "image_pull_secret": "synthetic-secret",
+                "model_cache": "runtime:/runtime:checkpoint",
+            }
             if executor == "kubernetes"
             else {}
         ),
@@ -392,6 +396,10 @@ def test_metadata_probe_targets_selected_container_without_gpu_requests(tmp_path
         container = manifest["spec"]["containers"][0]
         assert container["image"] == deployment.image
         assert container.get("env", []) == (environment or [])
+        assert manifest["spec"]["volumes"] == [
+            {"name": "model-cache", "persistentVolumeClaim": {"claimName": "runtime"}}
+        ]
+        assert container["volumeMounts"] == [{"name": "model-cache", "mountPath": "/runtime"}]
         assert "nvidia.com/gpu" not in container["resources"].get("requests", {})
         assert any("delete" in command for command, _ in calls)
 
@@ -899,3 +907,37 @@ def test_metadata_probe_reports_pod_startup_failure_before_cleanup(monkeypatch, 
     assert diagnostic in str(failure.value)
     assert any("get" in command for command in calls)
     assert "delete" in calls[-1]
+
+
+@pytest.mark.parametrize(
+    "model_cache,mount", [(None, None), ("cache", "/workspace/model_cache"), ("cache::model", "/workspace/model_cache")]
+)
+def test_runtime_version_probe_mounts_whole_model_pvc(monkeypatch, model_cache, mount):
+    from aisimulate.support import versioning
+
+    manifests = []
+
+    def run(command, *, payload=None):
+        if payload:
+            manifests.append(json.loads(payload))
+        if "logs" in command:
+            return 'AISIMULATE_RUNTIME_VERSION={"backend_version": "0.28.0+overlay"}\n'
+        if "get" in command:
+            return json.dumps({"status": {"containerStatuses": [{"state": {"terminated": {"exitCode": 0}}}]}})
+        return ""
+
+    monkeypatch.setattr(versioning, "_run", run)
+    result = versioning.detect_runtime_versions(
+        FPMDeployment(
+            image="synthetic:image",
+            model_cache=model_cache,
+            extra_env=[{"name": "PYTHONPATH", "value": "/workspace/model_cache/deps"}],
+        )
+    )
+    assert result["backend_version"] == "0.28.0+overlay"
+    spec = manifests[0]["spec"]
+    if mount:
+        assert spec["volumes"][0]["persistentVolumeClaim"]["claimName"] == "cache"
+        assert spec["containers"][0]["volumeMounts"] == [{"name": "model-cache", "mountPath": mount}]
+    else:
+        assert "volumes" not in spec and "volumeMounts" not in spec["containers"][0]

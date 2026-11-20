@@ -211,6 +211,12 @@ def _matches_model_path(observed: Any, launch: dict[str, Any]) -> bool:
     )
 
 
+def _checkpoint_config(launch: dict[str, Any]) -> dict[str, Any]:
+    from .runtime_probe import _model_config_bytes
+
+    return json.loads(_model_config_bytes(launch["model_config"])["model-config.json"])
+
+
 def _validate_record(
     record: dict[str, Any],
     *,
@@ -218,6 +224,7 @@ def _validate_record(
     bundle: InstrumentationBundle,
     binding: dict[str, str],
     cell: FPMCell,
+    checkpoint_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if record.get("schema_version") != OBSERVATION_SCHEMA:
         raise ValueError("unsupported runtime observation schema")
@@ -300,13 +307,12 @@ def _validate_record(
             raise ValueError("K3.1 initialization requires native mamba none and prefix caching disabled")
         if kind == "worker":
             from .runtime_k31 import moe_precision
-            from .runtime_probe import _model_config_bytes
 
             # Use the hash-bound checkpoint config, independently of the
             # worker's model-tree enumeration. All downstream consumers
             # revalidate this record before admitting its precision evidence.
-            source = _model_config_bytes(launch["model_config"])["model-config.json"]
-            checkpoint_config = json.loads(source)
+            if checkpoint_config is None:
+                checkpoint_config = _checkpoint_config(launch)
             moe_precision(record.get("initialized_moe"), model_config=checkpoint_config)
     if launch["identity"]["model_kind"] == "moe":
         parallel = config["parallel_config"]
@@ -379,7 +385,12 @@ def _validate_record(
     if native_layout and kind == "worker":
         from .runtime_k31 import validate_attention_assignments
 
-        validate_attention_assignments(record, model_config=checkpoint_config)
+        environment = {item["name"]: item["value"] for item in launch["deployment"].get("extra_env") or ()}
+        validate_attention_assignments(
+            record,
+            model_config=checkpoint_config,
+            conv_state_layout=environment.get("VLLM_SSM_CONV_STATE_LAYOUT", "SD"),
+        )
     return config
 
 
@@ -523,6 +534,7 @@ def _physical_views(
     *,
     context: int | None = None,
     sequences: int | None = None,
+    metadata_builders: int = 1,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     from .runtime_k31 import LAYOUT
 
@@ -546,6 +558,8 @@ def _physical_views(
     from .runtime_k31 import LAYOUT, validate_views
 
     if cache.get("allocation_layout") == LAYOUT:
+        if reserved != [scheduled["null_block_id"]]:
+            raise ValueError("K3.1 native scheduler permits only the singleton null-block reservation")
         for group in cache["groups"]:
             if (
                 group.get("pool_id") != pool
@@ -553,7 +567,9 @@ def _physical_views(
                 or group.get("attention_chunk_size") is not None
             ):
                 raise ValueError("K3.1 cache group pool or retention is unsupported")
-        validate_views(cache, precision, count, page, context=context, sequences=sequences)
+        validate_views(
+            cache, precision, count, page, context=context, sequences=sequences, metadata_builders=metadata_builders
+        )
         return groups, accounting
     layer_groups = {}
     for group_id, group in enumerate(cache["groups"]):
@@ -738,6 +754,7 @@ def _configuration(
     canonical_settings, canonical_geometry, canonical_hardware, normalized = None, None, None, None
     capacities, artifacts, launch_artifacts, runtime_artifacts, import_bindings = [], [], [], [], []
     used_paths: set[str] = set()
+    checkpoint_config = None
     for phase in required_phases:
         result = phases[phase]
         binding = {"attempt_id": active, "configuration": label, "phase": phase, "bundle_sha256": bundle.sha256}
@@ -767,8 +784,22 @@ def _configuration(
                 runtime_artifacts.append(copy.deepcopy(reference))
                 continue
             record = read_json(path, expected_sha256=digest)
+            from .runtime_k31 import LAYOUT
+
+            if (
+                checkpoint_config is None
+                and record.get("kind") == "worker"
+                and isinstance(record.get("cache"), dict)
+                and record["cache"].get("allocation_layout") == LAYOUT
+            ):
+                checkpoint_config = _checkpoint_config(launch)
             config = _validate_record(
-                record, launch=launch, bundle=bundle, binding={**binding, **(collector_binding or {})}, cell=cell
+                record,
+                launch=launch,
+                bundle=bundle,
+                binding={**binding, **(collector_binding or {})},
+                cell=cell,
+                checkpoint_config=checkpoint_config,
             )
             if import_binding is not None:
                 _validate_import_binding(record, import_binding, bundle)
@@ -813,6 +844,8 @@ def _configuration(
         }:
             raise ValueError(f"{phase} worker/scheduler rank evidence is incomplete")
         for (dp, tp), worker in sorted(workers.items()):
+            from .runtime_k31 import metadata_builder_count
+
             scheduler = schedulers[dp]
             runtime_memory._validate_scheduler_config(worker, scheduler)
             groups, accounting = _physical_views(
@@ -821,6 +854,9 @@ def _configuration(
                 runtime_memory._resolved_cache_dtype(worker["resolved_config"], cell),
                 context=launch["collection"]["max_model_len"],
                 sequences=launch["collection"]["max_num_seqs"],
+                metadata_builders=metadata_builder_count(worker["resolved_config"])
+                if worker["cache"].get("kernel_block_views")
+                else 1,
             )
             geometry = [
                 {key: value for key, value in group.items() if key != "pool_id"} for group in worker["cache"]["groups"]

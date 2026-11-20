@@ -9,6 +9,7 @@ import copy
 import hashlib
 import importlib
 import json
+import math
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -72,7 +73,7 @@ class _Tensor:
         return (self.block_stride // self.size, *reversed(result))
 
 
-def _native_fixture(monkeypatch, *, uniform=False, scheduler_projection=False, attention_block=4):
+def _native_fixture(monkeypatch, *, uniform=False, scheduler_projection=True, attention_block=4):
     adapter = _adapter(monkeypatch)
     scale = attention_block // 4
     pool_page = 512 * scale
@@ -82,8 +83,8 @@ def _native_fixture(monkeypatch, *, uniform=False, scheduler_projection=False, a
         spec = _typed("vllm.v1.kv_cache_interface", "MambaSpec" if stem == "kda" else "MLAAttentionSpec")
         spec.block_size, spec.page_size_bytes = (4096 if stem == "kda" else attention_block), page
         if stem == "kda":
-            spec.shapes, spec.dtypes = ((2, 4), (2, 4)), ("torch.bfloat16", "torch.float32")
-            spec.state_content_size_bytes, spec.page_size_padded = 48, 64
+            spec.shapes, spec.dtypes = ((1, 6), (1, 2, 2)), ("torch.bfloat16", "torch.float32")
+            spec.state_content_size_bytes, spec.page_size_padded = 28, 64
             spec.mamba_cache_mode, spec.num_speculative_blocks = "none", 0
             spec.num_prefill_checkpoint_blocks, spec.prefill_checkpoint_alignment = 1, 64
             spec.max_num_blocks_per_req = lambda *_: 1
@@ -111,8 +112,8 @@ def _native_fixture(monkeypatch, *, uniform=False, scheduler_projection=False, a
             layer = _typed(module, class_name)
             layer.kv_cache = (
                 (
-                    _Tensor(storage, i * page, (10, 2, 4), "torch.bfloat16", 2, pool_page),
-                    _Tensor(storage, i * page + 16, (10, 2, 4), "torch.float32", 4, pool_page),
+                    _Tensor(storage, i * page, (10, 1, 6), "torch.bfloat16", 2, pool_page),
+                    _Tensor(storage, i * page + 12, (10, 1, 2, 2), "torch.float32", 4, pool_page),
                 )
                 if stem == "kda"
                 else _Tensor(storage, i * page, (10, attention_block, width), "torch.uint8", 1, pool_page)
@@ -163,7 +164,7 @@ def _native_fixture(monkeypatch, *, uniform=False, scheduler_projection=False, a
         ),
     )
     scheduler_config = copy.deepcopy(config)
-    if scheduler_projection:
+    if uniform and scheduler_projection:
         for group in scheduler_config.kv_cache_groups:
             group.kv_cache_spec = next(iter(group.kv_cache_spec.kv_cache_specs.values()))
     cache, scheduled = adapter.worker_memory(worker), adapter.scheduler_memory(scheduler, scheduler_config)
@@ -185,7 +186,7 @@ def test_native_mixed_state_and_overlaid_groups_charge_actual_padded_pool(monkey
     assert groups[-1]["page_size_bytes"] == 512
     assert [v["dtype"] for v in cache["layer_components"]["kda.0"]] == ["torch.bfloat16", "torch.float32"]
     assert cache["allocated_cache_bytes"] == 5120
-    assert cache["groups"][-1]["state_content_size_bytes"] == 48
+    assert cache["groups"][-1]["state_content_size_bytes"] == 28
     assert cache["groups"][-1]["spec_page_size_bytes"] == 64
 
 
@@ -221,7 +222,7 @@ def test_mixed_state_component_offsets_must_be_element_aligned(monkeypatch, elem
     for record in (cache, scheduled):
         state = record["groups"][-1]
         state["state_shapes"][0] = [elements]
-        state["state_content_size_bytes"] = elements * 2 + 32
+        state["state_content_size_bytes"] = elements * 2 + 16
     for name in cache["groups"][-1]["layer_names"]:
         convolution, recurrence = cache["layer_components"][name]
         convolution.update(shape=[10, elements], stride_bytes=[512, 2])
@@ -285,7 +286,7 @@ def test_raw_uniform_wrapper_reads_children_without_abstract_scalar_property(mon
     assert children["mla.0"]["page_size_bytes"] == 128
     assert children["indexer.0"]["page_size_bytes"] == 64
     state = raw["groups"][1]["kv_cache_specs"]["kda.0"]
-    assert state["state_content_size_bytes"] == 48
+    assert state["state_content_size_bytes"] == 28
     assert state["dtypes"] == ["torch.bfloat16", "torch.float32"]
     assert raw["tensor_allocations"][1]["offset"] == 256
     child = config.kv_cache_groups[1].kv_cache_spec.kv_cache_specs["kda.0"]
@@ -452,8 +453,7 @@ def test_kernel_view_mapping_cannot_hide_pool_or_layer_corruption(monkeypatch, m
 )
 def test_native_uniform_wrapper_requires_exact_child_geometry(monkeypatch, mutation, match):
     cache, scheduled, _ = _native_fixture(monkeypatch, uniform=True)
-    for record in (cache, scheduled):
-        mutation(record["groups"][0])
+    mutation(cache["groups"][0])
     with pytest.raises(ValueError, match=match):
         _physical_views(cache, scheduled, "fp8", context=4096)
 
@@ -484,7 +484,6 @@ def test_uniform_attention_child_cannot_override_parent_kind_with_state_componen
     cache, scheduled, _ = _native_fixture(monkeypatch, uniform=True)
     child = cache["groups"][0]["layer_specs"]["mla.0"]
     child.update(kind="state", state_shapes=[[4, 8], [4, 4]], state_dtypes=["torch.bfloat16", "torch.float32"])
-    scheduled["groups"][0]["layer_specs"]["mla.0"].update(copy.deepcopy(child))
     component = cache["layer_components"]["mla.0"][0]
     convolution = {
         **component,
@@ -793,6 +792,9 @@ def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode", packed_i
                         "kda_layers": [1, 2],
                         "full_attn_layers": [3, 4],
                         "use_full_rank_gate": True,
+                        "num_heads": 2,
+                        "head_dim": 2,
+                        "short_conv_kernel_size": 2,
                     },
                     "dsa_config": {"dsa_layers": [3, 4]},
                 },
@@ -840,7 +842,11 @@ def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode", packed_i
         record["runtime"] = {**pinned, "image": launch["deployment"]["image"]}
         config = record["resolved_config"]
         config["parallel_config"].update(
-            data_parallel_size_local=launch["topology"]["dp"], data_parallel_external_lb=False, enable_eplb=False
+            data_parallel_size_local=launch["topology"]["dp"],
+            data_parallel_external_lb=False,
+            enable_eplb=False,
+            use_ubatching=False,
+            num_ubatches=2,
         )
         config["model_config"].update(
             dtype="bfloat16", quantization="mxfp4", architectures=["KimiK31ForConditionalGeneration"]
@@ -899,13 +905,13 @@ def test_import_rejects_matching_worker_scheduler_omission_of_one_kda_group(tmp_
         state = cache["groups"].pop()
         for name in state["layer_names"]:
             group = copy.deepcopy(state)
-            group.update(
-                layer_names=[name],
-                representative_layer=name,
-                layer_specs={name: state["layer_specs"][name]},
-                spec_page_size_bytes=state["layer_specs"][name]["spec_page_size_bytes"],
-            )
+            group["layer_names"] = [name]
             if record["kind"] == "worker":
+                group.update(
+                    representative_layer=name,
+                    layer_specs={name: state["layer_specs"][name]},
+                    spec_page_size_bytes=state["layer_specs"][name]["spec_page_size_bytes"],
+                )
                 group["layer_classes"] = {name: state["layer_classes"][name]}
             cache["groups"].append(group)
         if record["kind"] == "worker":
@@ -1028,10 +1034,12 @@ def test_import_binds_native_state_dtypes_to_resolved_cache_settings(
         )
         state = record["cache"]["groups"][-1]
         sizes = [2 if dtype == "bfloat16" else 4 for dtype in (observed_convolution, observed)]
-        for spec in state["layer_specs"].values():
+        for spec in state.get("layer_specs", {"representative": state}).values():
             spec.update(
                 state_dtypes=[f"torch.{observed_convolution}", f"torch.{observed}"],
-                state_content_size_bytes=8 * sum(sizes),
+                state_content_size_bytes=sum(
+                    math.prod(shape) * size for shape, size in zip(spec["state_shapes"], sizes, strict=True)
+                ),
             )
         if record["kind"] == "worker":
             for name in state["layer_names"]:
@@ -1041,10 +1049,13 @@ def test_import_binds_native_state_dtypes_to_resolved_cache_settings(
                     component.update(
                         dtype=f"torch.{dtype}",
                         element_size_bytes=size,
-                        stride_bytes=[512, 4 * size, size],
+                        stride_bytes=[
+                            512,
+                            *[math.prod(component["shape"][i + 1 :]) * size for i in range(1, len(component["shape"]))],
+                        ],
                         storage_offset_bytes=offset,
                     )
-                    offset += 8 * size
+                    offset += math.prod(component["shape"][1:]) * size
 
     _mutate(path, change_state)
     result = validate_observations(path, launches)["tp2"]
@@ -1137,9 +1148,9 @@ def test_import_requires_initialized_indexed_mla_despite_consistent_cache_maps(t
         for field in ("layer_specs", "layer_classes"):
             if field in group:
                 group[field] = {name: value for name, value in group[field].items() if name not in omitted}
-        group["representative_layer"] = group["layer_names"][0]
-        group["spec_page_size_bytes"] = sum(spec["spec_page_size_bytes"] for spec in group["layer_specs"].values())
         if record["kind"] == "worker":
+            group["representative_layer"] = group["layer_names"][0]
+            group["spec_page_size_bytes"] = sum(spec["spec_page_size_bytes"] for spec in group["layer_specs"].values())
             cache["layer_components"] = {
                 name: value for name, value in cache["layer_components"].items() if name not in omitted
             }
@@ -1151,6 +1162,9 @@ def test_import_requires_initialized_indexed_mla_despite_consistent_cache_maps(t
             ]
             # Keep the summary unchanged: only per-layer evidence establishes
             # that the indexed MLA path was actually initialized.
+        elif omit == "mla":
+            # The indexer is now the scheduler's first-child projection.
+            group.update(spec_page_size_bytes=64, unpadded_page_size_bytes=64)
 
     _mutate(path, remove_layers)
     index = json.loads(path.read_text())
@@ -1260,10 +1274,164 @@ def test_import_rejects_state_context_shorter_than_reviewed_launch(tmp_path, mon
     def shorter_context(record):
         state = record["cache"]["groups"][-1]
         state["block_size_tokens"] = 32
-        for child in state["layer_specs"].values():
+        for child in state.get("layer_specs", {"representative": state}).values():
             child.update(block_size_tokens=32, max_model_len=32)
 
     _mutate(path, shorter_context)
     result = validate_observations(path, launches)["tp2"]
     assert result["status"] == "incomplete" and result["resources"] is None
     assert "one non-speculative state page" in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("retain_wrapper", [False, True])
+def test_import_requires_projected_scheduler_specs(tmp_path, monkeypatch, retain_wrapper):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+    if retain_wrapper:
+        cache, _, _ = _native_fixture(monkeypatch, uniform=True, scheduler_projection=False)
+        wrapped = [{k: v for k, v in group.items() if k not in {"kind", "layer_classes"}} for group in cache["groups"]]
+        wrapped = _decoder_cache_names({"groups": wrapped})["groups"]
+        _mutate(path, lambda r: r["cache"].update(groups=copy.deepcopy(wrapped)) if r["kind"] == "scheduler" else None)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == ("incomplete" if retain_wrapper else "complete"), result["diagnostics"]
+    if retain_wrapper:
+        assert "scheduler cache group geometry disagrees" in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("reserved", [[0], [0, 1]])
+def test_import_native_reservations_are_only_the_null_block(tmp_path, monkeypatch, reserved):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+
+    def reserve(record):
+        if record["kind"] == "scheduler":
+            record["cache"].update(
+                permanent_reserved_block_ids=reserved,
+                reserved_blocks=len(reserved),
+                initial_free_blocks=10 - len(reserved),
+            )
+
+    _mutate(path, reserve)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == ("complete" if reserved == [0] else "incomplete"), result["diagnostics"]
+    if len(reserved) > 1:
+        assert "singleton null-block reservation" in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("enabled,planes", [(False, 1), (False, 2), (True, 2), (True, 1)])
+def test_import_kernel_table_planes_follow_effective_microbatching(tmp_path, monkeypatch, enabled, planes):
+    path, launches = _complete_fixture(tmp_path, monkeypatch, packed_indexer=True)
+
+    def set_planes(record):
+        record["resolved_config"]["parallel_config"].update(use_ubatching=enabled, num_ubatches=2)
+        for mapping in record["cache"].get("kernel_block_views", {}).values():
+            mapping["kernel_block_table_shape"][0] = planes
+
+    _mutate(path, set_planes)
+    result = validate_observations(path, launches)["tp2"]
+    valid = planes == (2 if enabled else 1)
+    assert result["status"] == ("complete" if valid else "incomplete"), result["diagnostics"]
+    if not valid:
+        assert "kernel-block table shape" in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_import_state_shapes_are_bound_to_checkpoint_not_just_matching_views(tmp_path, monkeypatch, valid):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+    if not valid:
+
+        def shrink(record):
+            state = record["cache"]["groups"][-1]
+            specs = list(state.get("layer_specs", {}).values()) if record["kind"] == "worker" else [state]
+            for spec in specs:
+                spec.update(state_shapes=[[2], [1]], state_content_size_bytes=8)
+            if record["kind"] == "worker":
+                for name in state["layer_names"]:
+                    conv, recurrent = record["cache"]["layer_components"][name]
+                    conv.update(shape=[10, 2], stride_bytes=[512, 2])
+                    recurrent.update(
+                        shape=[10, 1], stride_bytes=[512, 4], storage_offset_bytes=conv["storage_offset_bytes"] + 4
+                    )
+
+        _mutate(path, shrink)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == ("complete" if valid else "incomplete"), result["diagnostics"]
+    if not valid:
+        assert "state shapes differ from the checkpoint and TP size" in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("block,mapped", [(64, False), (128, True), (128, False)])
+def test_import_indexer_subdivision_requires_observed_mapping(tmp_path, monkeypatch, block, mapped):
+    path, launches = _complete_fixture(tmp_path, monkeypatch, packed_indexer=block == 128)
+
+    def direct_view(record):
+        cache = record["cache"]
+        group = cache["groups"][0]
+        if block == 64:
+            group["block_size_tokens"] = block
+            specs = list(group.get("layer_specs", {}).values()) if record["kind"] == "worker" else [group]
+            for spec in specs:
+                spec["block_size_tokens"] = block
+            if record["kind"] == "worker":
+                for name in group["layer_names"]:
+                    view = cache["layer_components"][name][0]
+                    width = view["shape"][1] * view["shape"][2] // block
+                    view.update(shape=[10, block, width], stride_bytes=[512, width, 1])
+        elif not mapped and record["kind"] == "worker":
+            for name in cache.pop("kernel_block_views"):
+                cache["layer_components"][name][0].update(shape=[10, 128, 16], stride_bytes=[16384, 16, 1])
+
+    _mutate(path, direct_view)
+    result = validate_observations(path, launches)["tp2"]
+    valid = block == 64 or mapped
+    assert result["status"] == ("complete" if valid else "incomplete"), result["diagnostics"]
+    if not valid:
+        assert "requires native kernel-block mapping coverage" in str(result["diagnostics"])
+
+
+def test_configuration_reads_hash_bound_checkpoint_once_for_all_native_ranks(tmp_path, monkeypatch):
+    from collector.fpm_forward import runtime_probe
+
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+    original, reads = runtime_probe._model_config_bytes, []
+
+    def read(model):
+        reads.append(model["sha256"])
+        return original(model)
+
+    monkeypatch.setattr(runtime_probe, "_model_config_bytes", read)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+    assert len(result["provenance"]["rank_capacities"]) == 4
+    assert reads == [launches["tp2"]["model_config"]["sha256"]]
+
+
+def test_generic_import_does_not_load_k31_checkpoint_snapshot(tmp_path, monkeypatch):
+    from collector.fpm_forward import runtime_probe
+
+    path, launches = observation_fixture(tmp_path)
+    monkeypatch.setattr(
+        runtime_probe, "_model_config_bytes", lambda *_: pytest.fail("generic import loaded K3.1 config")
+    )
+    assert validate_observations(path, launches)["tp2"]["status"] == "complete"
+
+
+@pytest.mark.parametrize("observed_layout", ["SD", "DS"])
+def test_import_kda_convolution_shape_follows_reviewed_layout(tmp_path, monkeypatch, observed_layout):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+    launches["tp2"]["deployment"]["extra_env"] = [{"name": "VLLM_SSM_CONV_STATE_LAYOUT", "value": "DS"}]
+    _replace_launch(path, launches)
+
+    def orient(record):
+        if observed_layout == "SD":
+            return
+        state = record["cache"]["groups"][-1]
+        for spec in state.get("layer_specs", {"representative": state}).values():
+            spec["state_shapes"][0] = [6, 1]
+        if record["kind"] == "worker":
+            for name in state["layer_names"]:
+                record["cache"]["layer_components"][name][0].update(shape=[10, 6, 1], stride_bytes=[512, 2, 2])
+
+    _mutate(path, orient)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == ("complete" if observed_layout == "DS" else "incomplete"), result["diagnostics"]
+    if observed_layout == "SD":
+        assert "state shapes differ from the checkpoint and TP size" in str(result["diagnostics"])

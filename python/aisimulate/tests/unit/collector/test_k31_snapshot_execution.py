@@ -868,3 +868,18 @@ def test_each_initialized_record_is_bound_to_selected_collector_attempt(snapshot
     _mutate(index_path, unbind)
     with pytest.raises(ValueError, match=field):
         execution_evidence._runtime_worker_evidence(plan, cell, raw, collection)
+
+
+@pytest.mark.parametrize("inputs", ["explicit-moe"], indirect=True)
+@pytest.mark.parametrize("backend", ["flashinfer_trtllm", "auto"])
+@pytest.mark.usefixtures("inputs")
+def test_execution_moe_backend_matches_each_bound_native_worker(native_execution, backend):
+    plan, cell, raw, collection, _ = native_execution
+    path = sorted(raw.glob("**/fpm-execution-worker-*.json"))[-1]
+    payload = json.loads(path.read_text())
+    payload["resolved_config"]["kernel_config"]["moe_backend"] = backend
+    path.write_text(json.dumps(payload))
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    assert result["status"] == ("qualified" if backend == "flashinfer_trtllm" else "failed"), result
+    if backend == "auto":
+        assert any("kernel_config.moe_backend differs" in reason for reason in result["failures"])

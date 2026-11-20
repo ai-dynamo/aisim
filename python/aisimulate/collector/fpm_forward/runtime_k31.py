@@ -160,10 +160,7 @@ def normalize_groups(cache, scheduled, page_bytes, *, context):
                 if set(child) - _NATIVE_SPEC_FIELDS:
                     raise ValueError("K3.1 child spec contains non-native spec fields or group metadata")
         expected = {key: value for key, value in group.items() if key not in {"kind", "layer_classes"}}
-        if (
-            group.get("spec_type") == SPEC + "UniformTypeKVCacheSpecs"
-            and scheduler.get("spec_type") != SPEC + "UniformTypeKVCacheSpecs"
-        ):
+        if group.get("spec_type") == SPEC + "UniformTypeKVCacheSpecs":
             # Pinned kv_cache_utils.generate_scheduler_kv_cache_config selects
             # the first native child; JSON serialization may reorder its keys.
             children = expected.pop("layer_specs", None)
@@ -349,7 +346,38 @@ def _validate_cache_inventory(cache, model_config):
         raise ValueError("K3.1 cache layers differ from the checkpoint decoder inventory")
 
 
-def validate_attention_assignments(worker, *, model_config=None):
+def _validate_state_shapes(spec, config, model_config, conv_state_layout):
+    # vLLM 266e88c05 KimiK3DeltaAttention.get_state_shape delegates to
+    # MambaStateShapeCalculator.kda_state_shape. No speculation is admitted.
+    decoder = model_config.get("text_config", model_config)
+    kda = decoder.get("linear_attn_config")
+    if not isinstance(kda, dict):
+        raise ValueError("K3.1 checkpoint KDA state configuration is missing")
+    heads = _positive(kda.get("num_heads"), "KDA heads")
+    dim = _positive(kda.get("head_dim"), "KDA head dimension")
+    conv = _positive(kda.get("short_conv_kernel_size"), "KDA convolution size")
+    tp = _positive(config["parallel_config"].get("tensor_parallel_size"), "KDA TP size")
+    if heads % tp or conv < 2 or conv_state_layout not in {"SD", "DS"}:
+        raise ValueError("K3.1 checkpoint KDA state geometry is unsupported")
+    local_heads = heads // tp
+    convolution = [conv - 1, 3 * local_heads * dim]
+    if conv_state_layout == "DS":
+        convolution.reverse()
+    if spec.get("state_shapes") != [convolution, [local_heads, dim, dim]]:
+        raise ValueError("K3.1 native state shapes differ from the checkpoint and TP size")
+
+
+def metadata_builder_count(config):
+    # Pinned gpu/attn_utils.py::init_attn_backend calls
+    # ubatch_utils.get_num_ubatches: one plane when use_ubatching is false.
+    parallel = config["parallel_config"]
+    enabled = parallel.get("use_ubatching")
+    if type(enabled) is not bool:
+        raise ValueError("K3.1 kernel-block table requires the resolved microbatching configuration")
+    return _positive(parallel.get("num_ubatches"), "metadata builder count") if enabled else 1
+
+
+def validate_attention_assignments(worker, *, model_config=None, conv_state_layout="SD"):
     """Reconcile initialized layer backends and dtypes with resolved policy."""
     cache = worker["cache"]
     config = worker["resolved_config"]
@@ -375,6 +403,8 @@ def validate_attention_assignments(worker, *, model_config=None):
                 raise ValueError("K3.1 native cache spec must be an object")
             if cls == KDA:
                 _validate_state_dtypes(spec, config)
+                if model_config is not None:
+                    _validate_state_shapes(spec, config, model_config, conv_state_layout)
             if cls in ATTENTION_CLASSES:
                 dtype = "fp8" if cls.endswith("KimiK3IndexerCache") else config["cache_config"]["cache_dtype"]
                 if spec.get("cache_dtype_str") != dtype:
@@ -403,7 +433,9 @@ def validate_attention_assignments(worker, *, model_config=None):
     return observed
 
 
-def _kernel_view_geometry(mapping, group, view, count, page, width, *, context=None, sequences=None):
+def _kernel_view_geometry(
+    mapping, group, view, count, page, width, *, context=None, sequences=None, metadata_builders=1
+):
     """Check the observed AttentionGroup's manager-to-kernel address mapping."""
     if (
         not isinstance(mapping, dict)
@@ -442,6 +474,7 @@ def _kernel_view_geometry(mapping, group, view, count, page, width, *, context=N
         or not isinstance(table, list)
         or len(table) != 3
         or any(type(value) is not int or value < 1 for value in table)
+        or table[0] != metadata_builders
         or table[1] != _positive(sequences, "reviewed maximum sequences")
         or table[-1] != expected_width
     ):
@@ -463,7 +496,7 @@ def _kernel_view_geometry(mapping, group, view, count, page, width, *, context=N
     return kernel
 
 
-def validate_views(cache, precision, count, page, *, context=None, sequences=None):
+def validate_views(cache, precision, count, page, *, context=None, sequences=None, metadata_builders=1):
     """Verify block-outer native placements, including safe cross-group overlays.
 
     A block ID belongs to exactly one cache group. Different groups may overlap
@@ -535,6 +568,12 @@ def validate_views(cache, precision, count, page, *, context=None, sequences=Non
                 state or group["layer_classes"].get(name) != "vllm.models.kimi_k3.common.dsa_cache.KimiK3IndexerCache"
             ):
                 raise ValueError("K3.1 kernel-block mapping is not an observed native indexer cache")
+            if (
+                group["layer_classes"].get(name) == "vllm.models.kimi_k3.common.dsa_cache.KimiK3IndexerCache"
+                and group["block_size_tokens"] > 64
+                and name not in kernel_views
+            ):
+                raise ValueError("K3.1 subdivided indexer requires native kernel-block mapping coverage")
             if not isinstance(components, list) or len(components) != (2 if state else 1):
                 raise ValueError("K3.1 layer component count contradicts native spec")
             component_offset = offset
@@ -561,7 +600,15 @@ def validate_views(cache, precision, count, page, *, context=None, sequences=Non
                 component_block = group["block_size_tokens"]
                 if name in kernel_views:
                     component_block = _kernel_view_geometry(
-                        mapping, group, view, count, page, width, context=context, sequences=sequences
+                        mapping,
+                        group,
+                        view,
+                        count,
+                        page,
+                        width,
+                        context=context,
+                        sequences=sequences,
+                        metadata_builders=metadata_builders,
                     )
                 elif shape[0] != count or strides[0] != page:
                     raise ValueError("K3.1 component block coverage, offsets or storage disagrees")

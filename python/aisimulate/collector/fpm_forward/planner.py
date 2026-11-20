@@ -731,7 +731,7 @@ def _require_real_prefix_seeding(
             )
 
 
-def _k31_runtime_proof(proof: Any, launch: dict[str, Any], profile: FpmModelProfile) -> Any:
+def _k31_runtime_proof(proof: Any, launch: dict[str, Any], profile: FpmModelProfile, *, reviewed_capacity: int) -> Any:
     """Resolve the canonical onboarding wrapper back to immutable native evidence.
 
     The onboarding importer replaces inline memory provenance with this source
@@ -759,7 +759,7 @@ def _k31_runtime_proof(proof: Any, launch: dict[str, Any], profile: FpmModelProf
         key: getattr(profile, key) for key in ("architecture", "context_length", "num_experts")
     }:
         raise ValueError("K3.1 onboarding model metadata differs from the imported profile")
-    covered = set()
+    covered = {}
     for ref in refs:
         if not isinstance(ref, dict) or not isinstance(ref.get("path"), str):
             raise ValueError("K3.1 onboarding provenance has an invalid source artifact")
@@ -767,20 +767,57 @@ def _k31_runtime_proof(proof: Any, launch: dict[str, Any], profile: FpmModelProf
         digest = validate_sha256(ref.get("sha256"), "K3.1 onboarding source artifact")
         if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
             raise ValueError(f"K3.1 onboarding source artifact changed: {path}")
-        if str(path) in covered:
+        key = str(path.resolve())
+        if key in covered:
             raise ValueError("K3.1 onboarding source artifacts are duplicated")
-        covered.add(str(path))
+        covered[key] = digest
     index = Path(location)
-    if {str(index), str(index.parent / "launch.json"), str(index.parent / "model-config.json")} - covered:
+    if {
+        str(path.resolve()) for path in (index, index.parent / "launch.json", index.parent / "model-config.json")
+    } - covered.keys():
         raise ValueError("K3.1 onboarding provenance is missing immutable source artifacts")
     result = validate_observations(index, {name: launch})[name]
     if result["status"] != "complete":
         raise ValueError("K3.1 onboarding native evidence is incomplete: " + "; ".join(result["diagnostics"]))
+    native = result["provenance"]
+    # The index binds these files, but the onboarding wrapper must also retain
+    # every source consumed by revalidation, including each worker rank.
+    consumed = [*native["artifacts"], *native["launch_artifacts"], *native["runtime_artifacts"]]
+    instrumentation = native["instrumentation"]
+    manifest = index.parent / instrumentation["manifest"]
+    consumed.append({"path": str(manifest), "sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()})
+    consumed.extend(
+        {"path": str(manifest.parent / name), "sha256": digest} for name, digest in instrumentation["files"].items()
+    )
+    model = launch["model_config"]
+    consumed.append(model)
+    consumed.extend(
+        {"path": str(Path(model["path"]).parent / name), "sha256": digest}
+        for name, digest in model.get("source_files", {}).items()
+    )
+    for artifact in consumed:
+        path = (index.parent / artifact["path"]).resolve()
+        if covered.get(str(path)) != artifact["sha256"]:
+            raise ValueError(f"K3.1 onboarding provenance is missing immutable source artifact: {path}")
     resources = json.loads(json.dumps(result["resources"]))
     resources.pop("provenance", None)
     resources.get("runtime_memory", {}).pop("provenance", None)
     if proof.get("observed_resources") != resources:
         raise ValueError("K3.1 onboarding observed resources differ from immutable native evidence")
+    observed_capacity = resources["runtime_memory"]["kv_cache_bytes"]
+    overrides = (
+        {}
+        if reviewed_capacity == observed_capacity
+        else {
+            "runtime_memory.kv_cache_bytes": {
+                "observed": observed_capacity,
+                "value": reviewed_capacity,
+                "source": "user override; assumption, not a runtime measurement",
+            }
+        }
+    )
+    if proof["user_overrides"] != overrides:
+        raise ValueError("K3.1 onboarding capacity edits require a registered user override")
     return result["provenance"]
 
 
@@ -875,7 +912,13 @@ def _observed_k31_capability(
             proof = json.loads(memory.provenance)
         except (TypeError, ValueError) as error:
             raise ValueError("K3.1 observed MoE precision requires JSON runtime provenance") from error
-        proof = _k31_runtime_proof(proof, launch, profile)
+        saved_proof = proof
+        proof = _k31_runtime_proof(proof, launch, profile, reviewed_capacity=memory.kv_cache_bytes)
+        observed_capacity = (
+            saved_proof["observed_resources"]["runtime_memory"]["kv_cache_bytes"]
+            if saved_proof is not proof
+            else memory.kv_cache_bytes
+        )
         if (
             not isinstance(proof, dict)
             or proof.get("source") != "runtime_observations"
@@ -964,6 +1007,8 @@ def _observed_k31_capability(
             raise ValueError("K3.1 observed MoE rank capacity coverage is incomplete")
         canonical_groups, canonical_geometry = None, None
         for key, worker in workers.items():
+            from .runtime_k31 import metadata_builder_count
+
             scheduler = schedulers[key[:2]]
             observations.runtime_memory._validate_scheduler_config(worker, scheduler)
             groups, accounting = observations._physical_views(
@@ -972,6 +1017,9 @@ def _observed_k31_capability(
                 deployment.kv_cache_dtype,
                 context=launch["collection"]["max_model_len"],
                 sequences=launch["collection"]["max_num_seqs"],
+                metadata_builders=metadata_builder_count(worker["resolved_config"])
+                if worker["cache"].get("kernel_block_views")
+                else 1,
             )
             geometry = [
                 {name: value for name, value in group.items() if name != "pool_id"}
@@ -996,7 +1044,7 @@ def _observed_k31_capability(
             or [group.model_dump(mode="json") for group in resources.cache_groups] != canonical_groups
         ):
             raise ValueError("K3.1 observed MoE profile cache groups differ from native allocation evidence")
-        if memory.kv_cache_bytes != min(capacity["kv_cache_bytes"] for capacity in capacities):
+        if observed_capacity != min(capacity["kv_cache_bytes"] for capacity in capacities):
             raise ValueError("K3.1 observed MoE profile capacity differs from the imported rank minimum")
     if len(modes) != 1 or any(deployment.moe_quant_mode not in modes for deployment in deployments):
         raise ValueError("K3.1 observed MoE precision differs across workers or from the selected profile")
