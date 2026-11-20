@@ -44,12 +44,15 @@ from aisim_core.data.e2e import (
     _sha,
     make_metric,
     missing_required_metrics,
+    producer_run_id,
 )
 from aisim_core.data.names import normalize
 
 BUNDLE_SCHEMA = "aisimulate.agentx.benchmark.v1"
 EXT_NAMESPACE = "agentx/1"
 LATENCY_STATISTICS = ("mean", "median", "p90")
+# Gaps that belong to one bundle's observation; they are kept per observation when bundles are merged.
+_PER_OBSERVATION_GAPS = frozenset({"requests.lineage", "device_count"})
 _SETTING_SECTIONS = ("cache_config", "scheduler", "compilation", "model", "parallelism")
 
 
@@ -341,12 +344,18 @@ def agentx_bundle_to_configuration(bundle: Path | str) -> E2eConfigurationData:
         body.evidence_gaps.append(
             {
                 "field": "requests.lineage",
+                "observation_id": observation_id,
                 "reason": "the bundle's reference rows carry no observation key; conversation, trace and agent "
                 "depth are not joined to the request rows",
             }
         )
     requests = _requests(observation_id, rows, reference)
-    profile = [r for r in rows if r["phase"] == "profile"]
+    # Profile selection, counts and metrics use the same canonical phase and status as the stored request rows.
+    profile = [
+        dict(row, status=request.status)
+        for row, request in zip(rows, requests, strict=True)
+        if request.phase == "profile"
+    ]
     variant = workload.get("variant", {})
     silicon_provenance = ((workload.get("silicon_reference") or {}).get("silicon") or {}).get("provenance", {})
     attrs = {
@@ -365,6 +374,7 @@ def agentx_bundle_to_configuration(bundle: Path | str) -> E2eConfigurationData:
         body.evidence_gaps.append(
             {
                 "field": "device_count",
+                "observation_id": observation_id,
                 "reason": "the bundle records no observed parallelism, so the GPU count is unknown; "
                 "per-device throughput cannot be derived",
             }
@@ -377,7 +387,7 @@ def agentx_bundle_to_configuration(bundle: Path | str) -> E2eConfigurationData:
         source_kind="agentx",
         source_observation_id=manifest["id"],
         producer_kind="github-actions" if manifest.get("source_run_url") else None,
-        producer_id=manifest.get("source_run_url"),
+        producer_id=producer_run_id(manifest.get("source_run_url")),
         benchmark_tool="aiperf",
         benchmark_tool_version=silicon_provenance.get("aiperf_version"),
         benchmark_type="agentic_trace",
@@ -425,6 +435,11 @@ def agentx_bundles_to_configurations(bundles: Iterable[Path | str]) -> list[E2eC
                     "reason": f"merged points differ in runtime settings {differing}; kept those of the first point",
                 }
             )
+        for gap in data.body.evidence_gaps:
+            if gap.get("field") in _PER_OBSERVATION_GAPS:
+                first.body.evidence_gaps.append(gap)  # already labeled with its observation
+            elif gap not in first.body.evidence_gaps:
+                first.body.evidence_gaps.append(gap)
         first.observations.extend(data.observations)
         first.metrics.extend(data.metrics)
         first.requests.extend(data.requests)

@@ -327,6 +327,21 @@ def public_release_problems(body: E2eManifestBody) -> list[str]:
 # --------------------------------------------------------------------------- row models
 
 
+_GITHUB_RUN = re.compile(
+    r"^https://github\.com/(?P<repo>[\w.-]+/[\w.-]+)/actions/runs/(?P<run>\d+)(?:/attempts/\d+)?/?$"
+)
+
+
+def producer_run_id(run_url: str | None) -> str | None:
+    """``owner/repo#run`` for a GitHub Actions run URL, else ``None``.
+
+    Run URLs stay out of stored rows (dataset rule: no run URLs); the run identity is enough to tell producers
+    apart, and the attempt has its own ``producer_attempt`` column.
+    """
+    found = _GITHUB_RUN.match(run_url or "")
+    return None if found is None else f"{found['repo']}#{found['run']}"
+
+
 class ObservationRow(_Record):
     observation_id: str = Field(min_length=1)
     configuration_id: str = Field(pattern=r"^cfg-[0-9a-f]{64}$")
@@ -1413,7 +1428,7 @@ def inferencex_to_configurations(
                     source_observation_id=str(raw["id"]),
                     source_config_id="hf:" + source_config,
                     producer_kind="github-actions" if raw.get("run_url") else None,
-                    producer_id=raw.get("run_url"),
+                    producer_id=producer_run_id(raw.get("run_url")),
                     producer_attempt=run.get("run_attempt"),
                     producer_revision=run.get("head_sha"),
                     benchmark_tool="inferencex",

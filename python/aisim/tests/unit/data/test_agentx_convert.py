@@ -219,3 +219,43 @@ def test_unobserved_degrees_are_not_declared_complete(tmp_path):
     partial_path = _bundle(tmp_path, "partial")
     _set_effective_parallelism(partial_path, tensor_parallel_size=8)
     assert agentx_bundle_to_configuration(partial_path).body.parallelism_complete is False
+
+
+def test_alias_spellings_give_the_same_profile_counts_and_metrics(tmp_path):
+    canonical = agentx_bundle_to_configuration(_bundle(tmp_path, "canonical"))
+    aliased_path = _bundle(tmp_path, "aliased")
+    rows = json.loads((aliased_path / "observations.json").read_text())
+    for row in rows:
+        row["phase"] = {"profile": "profiling"}.get(row["phase"], row["phase"])
+        row["status"] = {"completed": "success"}.get(row["status"], row["status"])
+    (aliased_path / "observations.json").write_text(json.dumps(rows))
+    aliased = agentx_bundle_to_configuration(aliased_path)
+    summary = lambda d: (  # noqa: E731
+        (d.observations[0].requests_total, d.observations[0].requests_completed, d.observations[0].requests_failed),
+        [(m.metric, m.statistic, m.value) for m in d.metrics],
+        [(r.phase, r.status) for r in d.requests],
+    )
+    assert summary(aliased) == summary(canonical)
+    assert canonical.observations[0].requests_total == 3 and canonical.observations[0].requests_completed == 2
+
+
+def test_a_run_url_is_not_stored_in_the_producer_identity(tmp_path):
+    path = _bundle(tmp_path, "run")
+    manifest = json.loads((path / "manifest.json").read_text())
+    manifest["source_run_url"] = "https://github.com/org/repo/actions/runs/123/attempts/2"
+    (path / "manifest.json").write_text(json.dumps(manifest))
+    obs = agentx_bundle_to_configuration(path).observations[0]
+    assert (obs.producer_kind, obs.producer_id) == ("github-actions", "org/repo#123")
+    manifest["source_run_url"] = "https://ci.internal.example/job/9"
+    (path / "manifest.json").write_text(json.dumps(manifest))
+    assert agentx_bundle_to_configuration(path).observations[0].producer_id is None
+
+
+def test_merged_bundles_keep_each_bundles_lineage_gap_with_its_observation(tmp_path):
+    keyed = _bundle(tmp_path, "keyed", lanes=1)
+    unkeyed = _bundle(tmp_path, "unkeyed", lanes=4, with_keys=False)
+    (merged,) = agentx_bundles_to_configurations([keyed, unkeyed])
+    gaps = [g for g in merged.body.evidence_gaps if g["field"] == "requests.lineage"]
+    assert [g["observation_id"] for g in gaps] == ["unkeyed"]
+    (merged,) = agentx_bundles_to_configurations([unkeyed, keyed])
+    assert [g["observation_id"] for g in merged.body.evidence_gaps if g["field"] == "requests.lineage"] == ["unkeyed"]
