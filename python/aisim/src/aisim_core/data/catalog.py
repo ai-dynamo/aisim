@@ -62,7 +62,7 @@ CATEGORY_LAYER = {v: k for k, v in LAYER_CATEGORY.items()}
 
 Status = Literal["have", "missing", "stale"]
 
-# Budgets proposed by AISIM-2315 (soft: warn; hard: plan refused without opt-in).
+# Proposed storage budgets (soft: warn; hard: plan refused without opt-in).
 MIB = 1024 * 1024
 KIB = 1024
 
@@ -403,7 +403,7 @@ class Catalog:
 
 @dataclass(frozen=True)
 class CatalogBudget:
-    """Configurable limits in bytes. Defaults are the AISIM-2315 proposal."""
+    """Configurable limits in bytes. Defaults are the proposed storage budgets."""
 
     soft_total: int = 1 * MIB
     hard_total: int = 2 * MIB

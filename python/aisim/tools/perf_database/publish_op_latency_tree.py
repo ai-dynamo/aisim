@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Build and audit the local ``data/op-latency/`` publish tree from the packaged op data (AISIM-2340).
+"""Build and audit the local ``data/op-latency/`` publish tree from the packaged op data.
 
 Local only: never uploads. Build then audit::
 

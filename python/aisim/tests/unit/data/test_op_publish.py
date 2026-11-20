@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Op-latency publish tree: faithful conversion, hash audit, resolvable reuse (AISIM-2340)."""
+"""Op-latency publish tree: faithful conversion, hash audit, resolvable reuse."""
 
 import hashlib
 import importlib.util

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Public dataset repository names and the alias rule for the retired FPM repository (AISIM-2339).
+"""Public dataset repository names and the alias rule for the retired FPM repository.
 
 ``ai-dynamo/aisim-data`` is the public unified dataset. ``nvidia/aisimulate-fpm-dataset`` held the
 FPM files before the move and is being retired; the move was byte-identical, so the same bytes live

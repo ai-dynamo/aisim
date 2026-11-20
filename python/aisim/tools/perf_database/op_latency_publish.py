@@ -3,7 +3,7 @@
 
 """Convert collector/packaged operation tables into the ``data/op-latency/`` dataset layout.
 
-This is a supported publish step, not library code: it stays until AISIM-2373 makes the collector emit the
+This is a supported publish step, not library code: it stays until the collector emits the
 layout directly. The permanent contract (row models, schema IDs, layout paths, content hashes) lives in
 :mod:`aisim_core.data.op_schema`; this module only builds and audits a local publish tree.
 

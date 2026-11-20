@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Load the whole op-latency tree (Hugging Face layout) into one ``systems/`` root (AISIM-2063).
+"""Load the whole op-latency tree (Hugging Face layout) into one ``systems/`` root.
 
 :class:`~aisim_core.data.loaders.OpLatencyLoader` materializes one catalog entry (one
 ``system/family/backend/version``). A predictor needs many entries at once, so this module walks the

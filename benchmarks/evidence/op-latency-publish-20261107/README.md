@@ -1,4 +1,4 @@
-# Op-latency publish tree audit (AISIM-2340)
+# Op-latency publish tree audit
 
 Local build only; nothing was uploaded. Source: packaged op data at commit
 `52d2c6136d781d97c398035601b502e53679daec` (`simonec/unified-data`), builder

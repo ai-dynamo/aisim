@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Logical-to-physical path rule for FPM files after the move to ``data/fpm/`` (AISIM-2338).
+"""Logical-to-physical path rule for FPM files after the move to ``data/fpm/``.
 
 The move was byte-identical, so 202 text files (every leaf ``manifest.json``, FPM
 metadata, import records) still embed the legacy ``data/<model>/...`` spelling.
