@@ -147,7 +147,7 @@ export AISIM_DATASET=OWNER/NAME@<40-hex-sha> AISIM_DATA_CACHE=./aisim-cache AISI
 `aisim data fetch ... --offline --dry-run` (an empty `missing` list) only shows that the files of the one selected
 version are cached. The runtime closure also holds donor versions, collective libraries and shared-layer sources
 that `ensure_data` (or `materialize_systems_root`, below) fetches for the real configuration, so run it connected
-before moving the cache. `AISIM_DATA_CATEGORIES` defaults to `fpm`; name `op-latency` for operation tables.
+before moving the cache. `AISIM_DATA_CATEGORIES` defaults to `op-latency`; name `fpm` (or `op-latency,fpm`) for FPM data.
 
 `AISIM_DATASET` (with `AISIM_DATA_CACHE` and `AISIM_DATA_OFFLINE`) pins model construction through
 `RustForwardPassPerfModel.best_available`: the data a configuration needs is taken from the cached revision,
