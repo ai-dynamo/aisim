@@ -263,14 +263,22 @@ def test_fpm_predictor_reaches_current_and_historical_runtime_namespaces(tmp_pat
 
 
 @pytest.mark.parametrize("method", ["warmup", "learned"])
-@pytest.mark.parametrize("failure", ["missing_export", "initialization_error"])
+@pytest.mark.parametrize("failure", ["missing_export", "initialization_error", "late_import_error"])
 def test_predictor_export_absence_preserves_scoring_classification(case, monkeypatch, method, failure):
     from scripts.fpm_accuracy.evaluate import score
     from scripts.fpm_accuracy.models import learned_predictor
 
+    calls = []
+
     def load_runtime(name):
+        calls.append(name)
         if failure == "initialization_error":
             raise AttributeError("unrelated module initialization failure")
+        if failure == "late_import_error" and len(calls) > 1:
+            # The SDK imports once, then a later lazy import cannot load its native runtime.
+            raise ModuleNotFoundError("import of aisim._runtime halted")
+        if failure == "late_import_error":
+            return SimpleNamespace(RustForwardPassPerfModel=SimpleNamespace(), ForwardPassPerfModelConfig=None)
         return SimpleNamespace()
 
     adapter = aic_predictors if method == "warmup" else learned_predictor
