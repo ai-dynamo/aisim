@@ -237,11 +237,22 @@ def test_init_all_downloads_everything_then_saves(run):
 
 
 def test_init_download_saves_the_source_it_used(run):
-    status, _, _ = run("init", "--all")  # no flag, no saved source: the shipped default is downloaded
+    status, _, _ = run("init", "--all")  # no flag, no saved source: the shipped default (a branch here) is downloaded
     assert status == 0
-    assert load_config() == InitConfig(mode="all", repo=shipped_pin()[0], revision=shipped_pin()[1])
+    # The branch resolved to a commit; the saved source names that commit, not the moving branch.
+    assert load_config() == InitConfig(mode="all", repo=shipped_pin()[0], revision=SHA)
     pin = pin_from_environment({"AISIM_DATA_CACHE": str(run.cache)})
-    assert (pin.repo, pin.revision) == shipped_pin()  # the downloaded data is what predictors select
+    assert (pin.repo, pin.revision) == (shipped_pin()[0], SHA)  # the downloaded data is what predictors select
+
+
+def test_init_from_a_branch_saves_its_commit_and_fetches_offline(run, monkeypatch):
+    status, _, _ = run("init", "--all", "--revision", "main")
+    assert status == 0 and load_config().revision == SHA
+    run.transport.refs["main"] = "b" * 40  # the branch moves; the saved source must not follow it
+    monkeypatch.setattr(data_cli, "make_transport", lambda: NoNetwork())
+    status, out, _ = run("fetch", "--offline")  # no flag: the saved commit is cached and needs no lookup
+    payload = json.loads(out)
+    assert status == 0 and payload["downloaded_bytes"] == 0 and payload["plan"]["revision"] == SHA
 
 
 def test_init_hardware_downloads_one_platform(run):
@@ -459,6 +470,17 @@ def test_validate_non_object_manifest_is_a_finding(run, tmp_path, body):
     manifest = tmp_path / "manifest.json"
     manifest.write_text(body)
     status, out, _ = run("data", "validate", str(manifest))
+    report = json.loads(out)
+    assert status == 1 and any(f["check"] == "manifest" for f in report["findings"])
+
+
+@pytest.mark.parametrize("artifact_path", [7, None, ["a"]])
+def test_validate_non_string_artifact_path_is_a_finding(run, tmp_path, artifact_path):
+    doc = json.loads(run.files["data/op-latency/h200_sxm/manifest.json"])
+    doc["artifacts"][0]["path"] = artifact_path
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps(doc))
+    status, out, _ = run("data", "validate", str(manifest))  # not a TypeError while locating the dataset root
     report = json.loads(out)
     assert status == 1 and any(f["check"] == "manifest" for f in report["findings"])
 
