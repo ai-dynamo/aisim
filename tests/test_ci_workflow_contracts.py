@@ -2680,6 +2680,12 @@ def test_full_ci_selector_matches_the_independent_mapping_oracle() -> None:
 MAIN_TARGET = "a" * 40
 MAIN_PARENT = "b" * 40
 MAIN_NEWER = "e" * 40
+MAIN_COMPARISON_JOBS = (
+    "Prediction Regression / Prediction Regression Gate",
+    "Python Dependency Licenses",
+    "Cargo Dependency Inventories",
+    "License compliance evidence",
+)
 
 
 def _main_run(run_id: int, sha: str, **overrides: object) -> dict:
@@ -2707,6 +2713,7 @@ def _scope_jobs(marker: str | None = "skipped", *, conclusion: str | None = "suc
                 "conclusion": conclusion,
                 "steps": steps,
             },
+            *[{"name": name, "status": "completed", "conclusion": "success"} for name in MAIN_COMPARISON_JOBS],
         ]
     }
 
@@ -2716,7 +2723,7 @@ def _main_batch_api(
     *,
     compare: dict[str, str] | None = None,
     runs: tuple[dict, ...] = (),
-    jobs: dict[int, dict] | None = None,
+    jobs: dict[int, dict | list[dict]] | None = None,
     failing: tuple[str, ...] = (),
 ) -> tuple[object, list]:
     calls: list = []
@@ -2739,8 +2746,14 @@ def _main_batch_api(
             }
             return {"workflow_runs": list(runs)}
         if path.endswith("/jobs"):
-            assert parse_qs(urlsplit(endpoint).query) == {"filter": ["latest"], "per_page": ["100"]}
-            return (jobs or {})[int(path.split("/")[-2])]
+            query = parse_qs(urlsplit(endpoint).query)
+            page = int(query.pop("page", ["1"])[0])
+            assert query == {"filter": ["latest"], "per_page": ["100"]}
+            response = (jobs or {})[int(path.split("/")[-2])]
+            if isinstance(response, list):
+                return response[page - 1]
+            assert page == 1
+            return response
         raise AssertionError(endpoint)
 
     return api, calls
@@ -2801,11 +2814,20 @@ def test_main_push_keeps_full_scope_and_compares_with_the_last_full_scope_commit
 
 
 @pytest.mark.parametrize("marker", ["skipped", None])
-def test_main_comparison_base_is_the_parent_after_a_full_scope_parent(marker: str | None) -> None:
+@pytest.mark.parametrize("run_status", ["in_progress", "failure", "success"])
+def test_main_comparison_base_is_the_parent_after_successful_comparisons(marker: str | None, run_status: str) -> None:
     api, _ = _main_batch_api(
         MAIN_TARGET,
         compare={f"{MAIN_PARENT}...{MAIN_TARGET}": "ahead"},
-        runs=(_main_run(199, MAIN_PARENT), _main_run(198, "c" * 40)),
+        runs=(
+            _main_run(
+                199,
+                MAIN_PARENT,
+                status="in_progress" if run_status == "in_progress" else "completed",
+                conclusion=None if run_status == "in_progress" else run_status,
+            ),
+            _main_run(198, "c" * 40),
+        ),
         jobs={199: _scope_jobs(marker)},
     )
 
@@ -2815,9 +2837,96 @@ def test_main_comparison_base_is_the_parent_after_a_full_scope_parent(marker: st
     assert notes == [
         (
             "notice",
-            f"Comparison base `{MAIN_PARENT}`: the last main commit whose Full CI selected the full scope (run 199).",
+            f"Comparison base `{MAIN_PARENT}`: the last full-scope main commit with successful comparisons (run 199).",
         )
     ]
+
+
+@pytest.mark.parametrize("marker", ["skipped", None])
+@pytest.mark.parametrize("job_name", MAIN_COMPARISON_JOBS)
+@pytest.mark.parametrize("result", ["missing", "queued", "in_progress", "cancelled", "failure", "skipped", "duplicate"])
+def test_main_comparison_base_skips_unfinished_or_unsuccessful_comparisons(
+    marker: str | None, job_name: str, result: str
+) -> None:
+    validated = "d" * 40
+    incomplete = _scope_jobs(marker)
+    job = next(job for job in incomplete["jobs"] if job["name"] == job_name)
+    if result == "missing":
+        incomplete["jobs"].remove(job)
+    elif result == "duplicate":
+        incomplete["jobs"].append(dict(job))
+    else:
+        job.update(
+            status=result if result in {"queued", "in_progress"} else "completed",
+            conclusion=None if result in {"queued", "in_progress"} else result,
+        )
+    api, _ = _main_batch_api(
+        MAIN_TARGET,
+        compare={f"{MAIN_PARENT}...{MAIN_TARGET}": "ahead", f"{validated}...{MAIN_TARGET}": "ahead"},
+        runs=(_main_run(199, MAIN_PARENT), _main_run(198, validated)),
+        jobs={199: incomplete, 198: _scope_jobs()},
+    )
+
+    base, _ = full_ci_selector.last_full_scope_commit("ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, api=api)
+
+    assert base == validated
+
+
+@pytest.mark.parametrize("comparison_result", ["success", "failure", "missing"])
+def test_main_comparison_base_reads_all_job_pages(comparison_result: str) -> None:
+    validated = "d" * 40
+    scope_jobs = _scope_jobs()["jobs"]
+    # Scope selection is on the first page; comparison evidence is on the next.
+    first_page = scope_jobs[:2] + [{"name": f"other job {number}"} for number in range(98)]
+    comparisons = scope_jobs[2:]
+    if comparison_result == "missing":
+        comparisons.pop()
+    else:
+        comparisons[-1]["conclusion"] = comparison_result
+    api, calls = _main_batch_api(
+        MAIN_TARGET,
+        compare={f"{MAIN_PARENT}...{MAIN_TARGET}": "ahead", f"{validated}...{MAIN_TARGET}": "ahead"},
+        runs=(_main_run(199, MAIN_PARENT), _main_run(198, validated)),
+        jobs={199: [{"jobs": first_page}, {"jobs": comparisons}], 198: _scope_jobs()},
+    )
+
+    base, _ = full_ci_selector.last_full_scope_commit("ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, api=api)
+
+    assert base == (MAIN_PARENT if comparison_result == "success" else validated)
+    assert "repos/ai-dynamo/aisim/actions/runs/199/jobs?filter=latest&per_page=100&page=2" in calls
+
+
+def test_main_comparison_base_requires_readable_job_pages() -> None:
+    api, _ = _main_batch_api(
+        MAIN_TARGET,
+        runs=(_main_run(199, MAIN_PARENT),),
+        jobs={199: {}},
+    )
+
+    with pytest.raises(full_ci_selector.GitHubError, match="no Full CI jobs"):
+        full_ci_selector.last_full_scope_commit("ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, api=api)
+
+
+def test_main_push_retry_keeps_full_scope_when_main_advances_between_attempts() -> None:
+    history = {
+        "compare": {f"{MAIN_PARENT}...{MAIN_TARGET}": "ahead", f"{MAIN_TARGET}...{MAIN_NEWER}": "ahead"},
+        "runs": (_main_run(199, MAIN_PARENT),),
+        "jobs": {199: _scope_jobs()},
+    }
+    initial_api, _ = _main_batch_api(MAIN_TARGET, **history)
+    retry_api, _ = _main_batch_api(MAIN_NEWER, **history)
+
+    for attempt, api in ((1, initial_api), (2, retry_api)):
+        batch = full_ci_selector.resolve_main_push(
+            "ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, run_attempt=attempt, api=api, sleep=lambda _: None
+        )
+        plan = select_components([], force_all=True, superseded=batch["superseded"])
+        # A failed application test must still be selected on the retry of this
+        # same run and SHA, even though main now contains a newer commit.
+        assert batch["superseded"] is False
+        assert plan["run_all"] is True
+        assert plan["components"]["application_tests"] is True
+        assert all(plan["components"].values())
 
 
 @pytest.mark.parametrize(
@@ -2856,7 +2965,10 @@ def test_main_comparison_base_falls_back_to_the_parent_with_a_warning() -> None:
     )
     assert base == MAIN_PARENT
     assert [level for level, _ in notes] == ["warning"]
-    assert f"No full-scope Full CI run among the last {full_ci_selector.MAIN_LOOKBACK_RUNS}" in notes[0][1]
+    assert (
+        f"No full-scope Full CI run with successful comparisons among the last {full_ci_selector.MAIN_LOOKBACK_RUNS}"
+        in notes[0][1]
+    )
 
     rewritten, _ = _main_batch_api(
         MAIN_TARGET,
@@ -2907,21 +3019,41 @@ def test_main_batching_fails_closed_to_full_scope_or_an_error() -> None:
     ):
         with pytest.raises(ValueError):
             full_ci_selector.resolve_main_push(repository, sha, run_id, parent, api=no_history, sleep=lambda _: None)
+    for attempt in (0, -1):
+        with pytest.raises(ValueError):
+            full_ci_selector.resolve_main_push(
+                "ai-dynamo/aisim",
+                MAIN_TARGET,
+                200,
+                MAIN_PARENT,
+                run_attempt=attempt,
+                api=no_history,
+                sleep=lambda _: None,
+            )
 
 
-@pytest.mark.parametrize("superseded", [True, False])
+@pytest.mark.parametrize(
+    ("main_advanced", "run_attempt", "superseded"),
+    [(True, 1, True), (False, 1, False), (True, 2, False), (True, 3, False)],
+)
 def test_main_batching_cli_writes_scope_and_comparison_outputs(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], superseded: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    main_advanced: bool,
+    run_attempt: int,
+    superseded: bool,
 ) -> None:
     validated = "d" * 40
     api, calls = _main_batch_api(
-        MAIN_NEWER if superseded else MAIN_TARGET,
+        MAIN_NEWER if main_advanced else MAIN_TARGET,
         compare={f"{MAIN_TARGET}...{MAIN_NEWER}": "ahead", f"{validated}...{MAIN_TARGET}": "ahead"},
         runs=(_main_run(199, MAIN_PARENT), _main_run(198, validated)),
         jobs={199: _scope_jobs("success"), 198: _scope_jobs("skipped")},
     )
     monkeypatch.setattr(full_ci_selector, "github_api", api)
     monkeypatch.setattr(full_ci_selector.time, "sleep", calls.append)
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", str(run_attempt))
     output, summary = tmp_path / "github-output", tmp_path / "summary.md"
     monkeypatch.setattr(
         sys,
@@ -3005,6 +3137,17 @@ def test_main_batching_is_wired_only_into_main_pushes(tmp_path: Path) -> None:
     assert "continue-on-error" not in marker
     assert selector["outputs"]["superseded"] == "${{ steps.plan.outputs.superseded }}"
     assert full_ci_selector.WORKFLOW_PATH == ".github/workflows/ci.yml"
+    prediction_jobs = _workflow("prediction-regression-gate.yml")["jobs"]
+    assert (
+        full_ci_selector.COMPARISON_JOBS
+        == set(MAIN_COMPARISON_JOBS)
+        == {
+            f"{jobs['prediction-regression']['name']} / {prediction_jobs['report']['name']}",
+            jobs["python-compliance"]["name"],
+            jobs["license-crate-inventory"]["name"],
+            jobs["license-evidence"]["name"],
+        }
+    )
 
     # Only the selector reads the exact-target base; every comparison uses the selected base.
     workflow_text = (WORKFLOW_ROOT / "ci.yml").read_text(encoding="utf-8")
@@ -3029,11 +3172,12 @@ def test_main_batching_is_wired_only_into_main_pushes(tmp_path: Path) -> None:
     fake_python.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "${ARGS_FILE}"\n', encoding="utf-8")
     fake_python.chmod(0o755)
     args_file = tmp_path / "args"
-    for event, ref, batched in (
-        ("push", "refs/heads/main", True),
-        ("push", "refs/heads/release/0.12.0", False),
-        ("push", "refs/heads/pull-request/136", False),
-        ("workflow_dispatch", "refs/heads/main", False),
+    for event, ref, attempt, batched in (
+        ("push", "refs/heads/main", "1", True),
+        ("push", "refs/heads/main", "2", True),
+        ("push", "refs/heads/release/0.12.0", "1", False),
+        ("push", "refs/heads/pull-request/136", "1", False),
+        ("workflow_dispatch", "refs/heads/main", "1", False),
     ):
         result = _run_workflow_script(
             plan_step["run"],
@@ -3042,6 +3186,7 @@ def test_main_batching_is_wired_only_into_main_pushes(tmp_path: Path) -> None:
                 "GITHUB_REF": ref,
                 "GITHUB_SHA": MAIN_TARGET,
                 "GITHUB_RUN_ID": "200",
+                "GITHUB_RUN_ATTEMPT": attempt,
                 "GITHUB_OUTPUT": str(tmp_path / "github-output"),
                 "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"),
                 "FORCE_ALL": "true",
@@ -3066,6 +3211,8 @@ def test_main_batching_is_wired_only_into_main_pushes(tmp_path: Path) -> None:
                 MAIN_TARGET,
                 "--run-id",
                 "200",
+                "--run-attempt",
+                attempt,
             ]
         else:
             assert "--main-push" not in args

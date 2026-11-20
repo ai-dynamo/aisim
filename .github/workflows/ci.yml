@@ -233,13 +233,14 @@ jobs:
           # Only pushes to main are batched; release, PR-copy, and manual runs
           # keep their scope and comparison base.
           if [[ "${GITHUB_EVENT_NAME}:${GITHUB_REF}" == "push:refs/heads/main" ]]; then
-            args+=(--main-push --repository "${REPOSITORY}" --sha "${GITHUB_SHA}" --run-id "${GITHUB_RUN_ID}")
+            args+=(--main-push --repository "${REPOSITORY}" --sha "${GITHUB_SHA}"
+              --run-id "${GITHUB_RUN_ID}" --run-attempt "${GITHUB_RUN_ATTEMPT}")
           fi
           python scripts/ci/select_full_ci.py "${args[@]}"
       - name: Defer the test suite to the newer main commit
         # Later main runs read this step's conclusion (success or skipped) to
-        # find the last commit that ran the full suite. Keep the name equal to
-        # SUPERSEDED_STEP in scripts/ci/select_full_ci.py.
+        # identify full-scope candidates, then require successful comparisons.
+        # Keep the name equal to SUPERSEDED_STEP in scripts/ci/select_full_ci.py.
         if: steps.plan.outputs.superseded == 'true'
         shell: bash
         run: >-

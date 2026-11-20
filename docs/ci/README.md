@@ -319,9 +319,13 @@ with the job's read-only token:
 
 | `main` after the wait | Scope | Comparison base |
 | --- | --- | --- |
-| Still this commit | Every component | Last main commit whose Full CI selected the full scope |
+| Still this commit | Every component | Last full-scope main commit with successful comparisons |
 | A newer commit that contains this one | Superseded: build, verify, and stage this commit's wheel | Previous main commit, used only by license evidence |
-| Unreadable, or a commit that does not contain this one | Every component | Last main commit whose Full CI selected the full scope |
+| Unreadable, or a commit that does not contain this one | Every component | Last full-scope main commit with successful comparisons |
+
+Reruns (`github.run_attempt > 1`) always select every component, even if `main`
+advanced after the first attempt. Retrying a failed full-scope run therefore
+cannot turn its failed tests into explicit N/A components.
 
 A superseded run builds the application test wheel, verifies and smoke-tests it in
 **Application Wheel**, collects license evidence, and stages the wheel through
@@ -333,16 +337,23 @@ any commit in the batch. Its **Select Full CI Scope** summary lists the commits 
 covers. Manual Full CI runs only branch heads, so check an individual deferred
 commit locally or through a PR.
 
-The newest run compares old and new revisions from the last main commit whose
-Full CI selected the full scope, not from its parent. Prediction-regression and
-license comparisons therefore cover every deferred commit. Earlier scopes come
-from the Actions API: the **Defer the test suite to the newer main commit** step
+The newest run compares old and new revisions from the last full-scope main
+commit whose prediction-regression gate, Python dependency licenses, Cargo
+dependency inventories, and license compliance evidence jobs all completed
+successfully. Selection alone does not advance the baseline: a canceled or
+unfinished comparison must still be covered by a later run. Other full-suite
+jobs may still be running or may have failed without disqualifying that baseline.
+Earlier scopes come from the Actions API: the
+**Defer the test suite to the newer main commit** step
 succeeds in a superseded run and is skipped in a full-scope run. Selections that
-are still running, failed, or superseded are passed over; runs from before
-batching count as full scope. If none of the last 30 main pushes selected the full
-scope, or that commit is not an ancestor, the run compares with its parent and
-adds a warning to its summary. If `main` cannot be read, the run selects the full
-scope. If earlier runs cannot be read, **Select Full CI Scope** fails.
+are still running, failed, or superseded are passed over, as are full-scope runs
+with missing, unfinished, or unsuccessful comparison jobs. Runs from before
+batching count as full scope but require the same comparison evidence.
+If none of the last 30 main pushes has that evidence, or the selected commit is
+not an ancestor, the run compares with its parent and adds a warning to its
+summary. That fallback comparison excludes deferred changes already in the
+parent. If `main` cannot be read, the run selects the full scope. If earlier runs
+cannot be read, **Select Full CI Scope** fails.
 
 Release branches, trusted PR copies, and manual runs are not batched. Every main
 run starts its expensive jobs ten minutes later. Main runs keep unique

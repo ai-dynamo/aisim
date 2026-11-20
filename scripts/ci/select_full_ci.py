@@ -5,8 +5,8 @@
 
 Pushes to main are batched: after a bounded wait, a commit that main has
 already moved past builds, verifies, and stages its wheel only, and the newest
-commit runs every component against the last main commit whose Full CI ran the
-full suite.
+commit runs every component against the last full-scope main commit whose
+comparison jobs completed successfully. Reruns always keep the full scope.
 """
 
 from __future__ import annotations
@@ -61,6 +61,14 @@ WORKFLOW_PATH = ".github/workflows/ci.yml"
 SCOPE_JOB = "Select Full CI Scope"
 PLAN_STEP = "Plan required Full CI components"
 SUPERSEDED_STEP = "Defer the test suite to the newer main commit"
+# The reusable prediction workflow exposes its final comparison as a nested
+# job name. License evidence also requires both baseline inventory producers.
+COMPARISON_JOBS = {
+    "Prediction Regression / Prediction Regression Gate",
+    "Python Dependency Licenses",
+    "Cargo Dependency Inventories",
+    "License compliance evidence",
+}
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
 
 PYTHON_PACKAGE_COMPONENTS = {
@@ -365,6 +373,32 @@ def main_scope_decision(jobs_page: dict) -> str:
     return "undecided"
 
 
+def _main_run_jobs(repository: str, run_id: int, *, api: Callable[[str], dict]) -> dict:
+    """Read all latest-attempt job results, including nested comparison jobs."""
+    endpoint = f"repos/{repository}/actions/runs/{run_id}/jobs?filter=latest&per_page=100"
+    jobs = []
+    page = 1
+    while True:
+        results = api(endpoint if page == 1 else f"{endpoint}&page={page}").get("jobs")
+        if not isinstance(results, list):
+            raise GitHubError(f"GitHub API returned no Full CI jobs for run {run_id}")
+        jobs.extend(results)
+        if len(results) < 100:
+            return {"jobs": jobs}
+        page += 1
+
+
+def _main_comparisons_succeeded(jobs_page: dict) -> bool:
+    for name in COMPARISON_JOBS:
+        matches = [job for job in jobs_page["jobs"] if job.get("name") == name]
+        if len(matches) != 1 or (matches[0].get("status"), matches[0].get("conclusion")) != (
+            "completed",
+            "success",
+        ):
+            return False
+    return True
+
+
 def last_full_scope_commit(
     repository: str,
     sha: str,
@@ -373,11 +407,11 @@ def last_full_scope_commit(
     *,
     api: Callable[[str], dict] = github_api,
 ) -> tuple[str, list[tuple[str, str]]]:
-    """Return the newest earlier main commit whose Full CI selected the full scope.
+    """Return the newest earlier full-scope main commit with successful comparisons.
 
-    Superseded and still-undecided runs are skipped, so the comparison covers
-    every commit whose test suite was deferred to this run. Without a full-scope
-    run in the bounded window, compare with the previous main commit instead.
+    Superseded, still-undecided, and unvalidated comparison runs are skipped.
+    Without a validated full-scope run in the bounded window, compare with the
+    previous main commit instead.
     """
     query = urlencode({"branch": "main", "event": "push", "per_page": MAIN_LOOKBACK_RUNS})
     runs = api(f"repos/{repository}/actions/workflows/ci.yml/runs?{query}").get("workflow_runs")
@@ -396,9 +430,10 @@ def last_full_scope_commit(
     ]
     deferred = []
     for run in sorted(earlier, key=lambda run: run["id"], reverse=True):
-        decision = main_scope_decision(
-            api(f"repos/{repository}/actions/runs/{run['id']}/jobs?filter=latest&per_page=100")
-        )
+        jobs_page = _main_run_jobs(repository, run["id"], api=api)
+        decision = main_scope_decision(jobs_page)
+        if decision == "full" and not _main_comparisons_succeeded(jobs_page):
+            decision = "comparisons not successful"
         if decision != "full":
             deferred.append(f"`{run['head_sha']}` ({decision}, run {run['id']})")
             continue
@@ -415,7 +450,7 @@ def last_full_scope_commit(
         notes = [
             (
                 "notice",
-                f"Comparison base `{base}`: the last main commit whose Full CI selected the full scope "
+                f"Comparison base `{base}`: the last full-scope main commit with successful comparisons "
                 f"(run {run['id']}).",
             )
         ]
@@ -427,7 +462,7 @@ def last_full_scope_commit(
     return parent, [
         (
             "warning",
-            f"No full-scope Full CI run among the last {MAIN_LOOKBACK_RUNS} main pushes; "
+            f"No full-scope Full CI run with successful comparisons among the last {MAIN_LOOKBACK_RUNS} main pushes; "
             f"comparing with the previous main commit `{parent}`.",
         )
     ]
@@ -439,18 +474,20 @@ def resolve_main_push(
     run_id: int,
     parent: str,
     *,
+    run_attempt: int = 1,
     api: Callable[[str], dict] = github_api,
     sleep: Callable[[float], None] = time.sleep,
     debounce: float = MAIN_DEBOUNCE_SECONDS,
 ) -> dict[str, object]:
-    """Wait for newer merges, then choose a superseded or full scope for a main push."""
+    """Wait for newer merges; only first attempts may defer their full scope."""
     if (
         not re.fullmatch(r"[\w.-]+/[\w.-]+", repository)
         or not FULL_SHA.fullmatch(sha)
         or not FULL_SHA.fullmatch(parent)
         or run_id <= 0
+        or run_attempt <= 0
     ):
-        raise ValueError("Main batching requires owner/name, a run ID, and full commit SHAs")
+        raise ValueError("Main batching requires owner/name, a positive run ID/attempt, and full commit SHAs")
     sleep(debounce)
     notes: list[tuple[str, str]] = []
     main_sha = ""
@@ -466,7 +503,7 @@ def resolve_main_push(
     except GitHubError as error:
         status = "unavailable"
         notes.append(("warning", f"Could not compare this commit with main ({error}); running the full scope."))
-    if status == "ahead":
+    if status == "ahead" and run_attempt == 1:
         return {
             "superseded": True,
             "main_sha": main_sha,
@@ -479,7 +516,9 @@ def resolve_main_push(
                 )
             ],
         }
-    if status not in {"identical", "unavailable"}:
+    if run_attempt > 1:
+        notes.append(("notice", f"Run attempt {run_attempt} keeps the full scope to retry every required component."))
+    if status not in {"ahead", "identical", "unavailable"}:
         notes.append(
             (
                 "warning",
@@ -529,6 +568,7 @@ def main() -> None:
     parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", ""))
     parser.add_argument("--sha", default=os.environ.get("GITHUB_SHA", ""))
     parser.add_argument("--run-id", type=int, default=int(os.environ.get("GITHUB_RUN_ID") or 0))
+    parser.add_argument("--run-attempt", type=int, default=int(os.environ.get("GITHUB_RUN_ATTEMPT") or 1))
     parser.add_argument("--github-output", type=Path)
     parser.add_argument("--summary", type=Path)
     args = parser.parse_args()
@@ -541,7 +581,13 @@ def main() -> None:
     if args.main_push:
         try:
             batch = resolve_main_push(
-                args.repository, args.sha, args.run_id, args.comparison_base, api=github_api, sleep=time.sleep
+                args.repository,
+                args.sha,
+                args.run_id,
+                args.comparison_base,
+                run_attempt=args.run_attempt,
+                api=github_api,
+                sleep=time.sleep,
             )
         except (GitHubError, ValueError) as error:
             raise SystemExit(f"::error::{error}") from error
