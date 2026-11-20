@@ -1778,8 +1778,9 @@ mod tests {
                 .unwrap();
             }
         }
-        // A transfer size above the page of the group is valid: the field
-        // allows bytes beyond the page.
+        // The measured bytes that vLLM 0.32.0 reads for one attention block of
+        // GLM-5.3-Flash at TP 4, against the page of 13,045,120 bytes of the
+        // hand-made vLLM 0.31.0 profile (benchmarks/evidence/nixl-pd-transfer-bytes-20261115/).
         FpmCacheGroup {
             page_size_bytes: 13_045_120,
             transfer_bytes_per_block: Some(21_978_496),

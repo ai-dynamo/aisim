@@ -259,7 +259,8 @@ read `transfer_bytes_per_block`.
   version of the deployment. It is positive and at most 2^53, and it can be
   larger than `page_size_bytes`, because the connector reads a block in regions
   that layers of other groups can share. A hand-made profile may state it only
-  for a group whose transfer size has been measured.
+  for a group whose transfer size has been measured or identified by other
+  evidence for that group.
 
   To measure the full-attention value and the combined transfer size of the
   other groups, send two prompts of different length through a P/D pair, one at
@@ -275,10 +276,11 @@ read `transfer_bytes_per_block`.
 
   Per-group values for models with several state groups are not supported by
   this procedure or the current runtime probe. Leave `transfer_bytes_per_block`
-  unset for those groups until per-group transfer measurements or additional
-  runtime-observer evidence identifies the bytes read for each group on one TP
-  rank. Do not split the combined size evenly or use the page sizes as
-  substitutes.
+  unset for those groups until per-group transfer measurements, additional
+  runtime-observer evidence or another source, such as the regions that the
+  connector logs at start, read with the connector code, identifies the bytes
+  read for each group on one TP rank. Do not split the combined size evenly or
+  use the page sizes as substitutes.
 
   The probe import of a vLLM 0.33.0 record writes it for no group, because what
   the P/D connector of vLLM 0.33.0 reads for a block depends on
