@@ -13,7 +13,7 @@ import pytest
 import yaml
 
 from aisim.config.common import ResourceConfig
-from aisim.resources import GB, MIB
+from aisim.resources import GB, MIB, HostResources
 from aisim.supervision import run_process
 
 
@@ -32,6 +32,218 @@ def _run_script(tmp_path, source, *, policy=None, timeout=5):
     script = tmp_path / "worker.py"
     script.write_text(source)
     return run_process([sys.executable, str(script)], policy=policy or _policy(), timeout=timeout)
+
+
+def test_large_calibration_checkpoint_survives_supervised_export(tmp_path):
+    output = tmp_path / "events.jsonl"
+    script = tmp_path / "worker.py"
+    script.write_text(
+        "from aisim.supervision import checkpoint\n"
+        "checkpoint('candidate_completed', {'calibration': 'x' * (2 * 1024 * 1024)})\n"
+    )
+    report = run_process(
+        [sys.executable, str(script)], policy=_policy(extra_mib=160), timeout=10, events_output=str(output)
+    )
+    assert report["status"] == "completed"
+    records = [json.loads(line) for line in output.read_text().splitlines()]
+    assert records == [{"event": "candidate_completed", "value": {"calibration": "x" * (2 * 1024 * 1024)}}]
+
+
+def test_calibration_checkpoint_keeps_record_and_total_bounds(tmp_path, monkeypatch):
+    from aisim import supervision
+    from aisim.resources import ResourceLimitError
+
+    path = tmp_path / "events.jsonl"
+    monkeypatch.setattr(supervision, "runtime_budget", lambda: {"events_path": str(path)})
+    with pytest.raises(ResourceLimitError, match="checkpoint budget"):
+        supervision.checkpoint("candidate_completed", {"calibration": "x" * supervision._CHECKPOINT_RECORD_BYTES})
+    assert not path.exists()
+
+    # The complete JSONL record, including its envelope and newline, fits exactly.
+    envelope = len(json.dumps({"event": "candidate_completed", "value": {"calibration": ""}})) + 1
+    value = {"calibration": "x" * (supervision._CHECKPOINT_RECORD_BYTES - envelope)}
+    count = supervision._CHECKPOINT_TOTAL_BYTES // supervision._CHECKPOINT_RECORD_BYTES
+    for index in range(count):
+        supervision.checkpoint("candidate_completed", value)
+        assert path.stat().st_size == (index + 1) * supervision._CHECKPOINT_RECORD_BYTES
+    with path.open(encoding="utf-8") as source:
+        for _ in range(count):
+            assert json.loads(source.readline()) == {"event": "candidate_completed", "value": value}
+        assert source.read() == ""
+    with pytest.raises(ResourceLimitError, match="checkpoint budget"):
+        supervision.checkpoint("candidate_completed", {"score": 1})
+    assert path.stat().st_size == supervision._CHECKPOINT_TOTAL_BYTES
+
+
+@pytest.mark.parametrize("full_budget", [False, True], ids=["2mib-event", "64mib-log"])
+def test_resource_limited_recommendation_retains_large_partial_events(tmp_path, monkeypatch, full_budget):
+    from aisim import supervision
+    from aisim.config import CoreRecommendationConfig
+    from aisim.resources import ResourceLimitError
+
+    envelope = len(json.dumps({"event": "candidate_completed", "value": {"calibration": ""}})) + 1
+    payload_size = supervision._CHECKPOINT_RECORD_BYTES - envelope if full_budget else 2 * MIB
+    count = supervision._CHECKPOINT_TOTAL_BYTES // supervision._CHECKPOINT_RECORD_BYTES if full_budget else 1
+    script = tmp_path / "checkpoint_worker.py"
+    script.write_text(
+        "from aisim.supervision import checkpoint\n"
+        f"for _ in range({count}):\n"
+        f"    checkpoint('candidate_completed', {{'calibration': 'x' * {payload_size}}})\n"
+        "raise SystemExit(3)\n"
+    )
+
+    def run_checkpoint_worker(command, *, policy, events_output):
+        # Replace only the workload; use the real writer, supervisor and exporter.
+        assert command[1:4] == ["-m", "aisim.resource_worker", "recommend"]
+        report = run_process([sys.executable, str(script)], policy=policy, timeout=10, events_output=events_output)
+        assert Path(events_output).stat().st_size == count * (payload_size + envelope)
+        # Model ample transfer headroom after the real worker has stopped,
+        # without requiring the test host to have a multi-GiB execution budget.
+        report["budget"] = {**report["budget"], "memory_limit_bytes": 8 * GB}
+        monkeypatch.setattr(supervision, "discover_host", lambda: HostResources(16 * GB, 8 * GB, 4))
+        return report
+
+    monkeypatch.setattr(supervision, "run_process", run_checkpoint_worker)
+    raw = yaml.safe_load(_small_cli_config(tmp_path, "recommend").read_text())
+    raw["execution"] = {"resources": _policy(extra_mib=256).model_dump()}
+    config = CoreRecommendationConfig.model_validate(raw)
+    with pytest.raises(ResourceLimitError) as caught:
+        supervision.supervised_recommendation(config, {})
+
+    report = caught.value.plan
+    assert report["status"] == "resource_limited"
+    assert report["exit_code"] == 3
+    assert report["termination_complete"] is True
+    assert "partial_evidence_truncated" not in report
+    assert len(report["partial_events"]) == count
+    expected = {"event": "candidate_completed", "value": {"calibration": "x" * payload_size}}
+    assert all(event == expected for event in report["partial_events"])
+
+
+def _recover_partial_events(tmp_path, monkeypatch, lines, *, host, budget):
+    from aisim import supervision
+    from aisim.config import CoreRecommendationConfig
+    from aisim.resources import ResourceLimitError
+
+    def limited_worker(command, *, policy, events_output):
+        assert command[1:4] == ["-m", "aisim.resource_worker", "recommend"]
+        with Path(events_output).open("w", encoding="utf-8") as target:
+            target.writelines(lines)
+        return {"status": "resource_limited", "reason": "worker memory limit", "budget": budget}
+
+    monkeypatch.setattr(supervision, "run_process", limited_worker)
+    monkeypatch.setattr(supervision, "discover_host", lambda: host)
+    config = CoreRecommendationConfig.model_validate(
+        yaml.safe_load(_small_cli_config(tmp_path, "recommend").read_text())
+    )
+    with pytest.raises(ResourceLimitError, match="worker memory limit") as caught:
+        supervision.supervised_recommendation(config, {})
+    assert caught.value.plan["status"] == "resource_limited"
+    return caught.value.plan
+
+
+@pytest.mark.parametrize("tail", ["oversized", "incomplete", "total-budget"])
+def test_partial_event_reader_excludes_invalid_tail(tmp_path, monkeypatch, tail):
+    from aisim import supervision
+
+    prefix = {"event": "candidate_completed", "value": {"score": 1}}
+    prefix_line = json.dumps(prefix) + "\n"
+    if tail == "total-budget":
+        envelope = len(json.dumps({"event": "candidate_completed", "value": {"calibration": ""}})) + 1
+        prefix = {
+            "event": "candidate_completed",
+            "value": {"calibration": "x" * (supervision._CHECKPOINT_RECORD_BYTES - envelope)},
+        }
+        prefix_line = json.dumps(prefix) + "\n"
+        count = supervision._CHECKPOINT_TOTAL_BYTES // len(prefix_line)
+        assert len(prefix_line) == supervision._CHECKPOINT_RECORD_BYTES
+        assert count * len(prefix_line) == supervision._CHECKPOINT_TOTAL_BYTES
+        invalid_tail = json.dumps({"event": "candidate_completed", "value": {"score": 2}}) + "\n"
+    else:
+        count = 1
+        # Both tails are valid JSON; only their framing/size makes them unsafe.
+        invalid_tail = json.dumps({"event": "candidate_completed", "value": {"score": 2}})
+        if tail == "oversized":
+            invalid_tail += " " * (supervision._CHECKPOINT_RECORD_BYTES - len(invalid_tail)) + "\n"
+            assert len(invalid_tail) == supervision._CHECKPOINT_RECORD_BYTES + 1
+
+    report = _recover_partial_events(
+        tmp_path,
+        monkeypatch,
+        [prefix_line] * count + [invalid_tail],
+        host=HostResources(16 * GB, 8 * GB, 4, process_memory_bytes=32 * MIB),
+        budget={"reserved_host_memory_bytes": GB, "memory_limit_bytes": 8 * GB},
+    )
+    assert report["partial_events"] == [prefix] * count
+    assert report["partial_evidence_truncated"] is True
+
+
+@pytest.mark.parametrize(
+    "constraint,retained",
+    [("host", 2), ("parent", 2), ("host-exhausted", 0), ("parent-exhausted", 0), ("exact", 3)],
+)
+def test_partial_event_reader_respects_parent_transfer_allowance(tmp_path, monkeypatch, constraint, retained):
+    # Numeric arrays exercise JSON object expansion as well as serialized size.
+    event = {"event": "candidate_completed", "value": {"calibration": [0] * 4096}}
+    line = json.dumps(event) + "\n"
+    reserve = 16 * MIB
+    parent_rss = 32 * MIB
+    available = memory_limit = GB
+    partial_headroom = (2 * len(line) + len(line) // 2) * 64
+    if constraint == "host":
+        available = reserve + partial_headroom
+    elif constraint == "parent":
+        memory_limit = parent_rss + partial_headroom
+    elif constraint == "host-exhausted":
+        available = reserve - 1
+    elif constraint == "parent-exhausted":
+        memory_limit = parent_rss - 1
+    else:
+        available = reserve + 3 * len(line) * 64
+        memory_limit = parent_rss + 3 * len(line) * 64
+
+    report = _recover_partial_events(
+        tmp_path,
+        monkeypatch,
+        [line] * 3,
+        host=HostResources(16 * GB, available, 4, process_memory_bytes=parent_rss),
+        budget={"reserved_host_memory_bytes": reserve, "memory_limit_bytes": memory_limit},
+    )
+    assert report["partial_events"] == [event] * retained
+    if retained < 3:
+        assert report["partial_evidence_truncated"] is True
+    else:
+        assert "partial_evidence_truncated" not in report
+
+
+def test_partial_event_recovery_preserves_report_when_host_discovery_fails(tmp_path, monkeypatch):
+    from aisim import supervision
+    from aisim.config import CoreRecommendationConfig
+    from aisim.resources import ResourceLimitError
+
+    original = {
+        "status": "resource_limited",
+        "reason": "worker memory limit",
+        "termination_complete": True,
+        "budget": {"reserved_host_memory_bytes": GB, "memory_limit_bytes": 8 * GB},
+    }
+
+    def limited_worker(command, *, policy, events_output):
+        Path(events_output).write_text(json.dumps({"event": "candidate_completed"}) + "\n", encoding="utf-8")
+        return original.copy()
+
+    def discovery_fails():
+        raise ResourceLimitError("cannot discover execution-host resources")
+
+    monkeypatch.setattr(supervision, "run_process", limited_worker)
+    monkeypatch.setattr(supervision, "discover_host", discovery_fails)
+    config = CoreRecommendationConfig.model_validate(
+        yaml.safe_load(_small_cli_config(tmp_path, "recommend").read_text())
+    )
+    with pytest.raises(ResourceLimitError, match="worker memory limit") as caught:
+        supervision.supervised_recommendation(config, {})
+
+    assert caught.value.plan == {**original, "partial_events": [], "partial_evidence_truncated": True}
 
 
 def test_watchdog_stops_small_allocation_and_reaps_child(tmp_path):
