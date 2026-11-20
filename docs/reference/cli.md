@@ -109,8 +109,12 @@ An `op-latency` pin composes all matching operation families with the packaged s
 files into one systems root. That root replaces `systems_paths` for construction: a missing operation
 table fails instead of falling through to packaged or user-supplied operation tables. Packaged
 operation tables are never copied into the pinned root. The root also holds the other versions that a selected
-entry's `reuse.yaml` declares as donors, so reused measurements stay available; a donor the dataset does not
-publish is skipped. The root is rebuilt whenever the entries' artifact digests or the packaged specs change.
+entry's `reuse.yaml` declares as donors, the `nccl`/`oneccl` entries the system spec names, and, unless
+`enable_shared_layer` is false, the sources the native shared-layer resolver may read: earlier versions of the
+same backend and the other backends the pinned `perf_data_reuse_manifest` allows. A donor or source the dataset
+does not publish is skipped. The root is rebuilt whenever the entries' artifact digests or the packaged specs
+change. An omitted `backend_version` or a slot alias (`current`, `previous`, `next`) is resolved from the pinned
+dataset's `query_versions` lookup, and the whole pin shares one `AISIM_DATA_MAX_BYTES` allowance.
 
 <a id="non-python-consumers"></a>
 

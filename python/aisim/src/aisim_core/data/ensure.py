@@ -681,6 +681,73 @@ def _collective_dependencies(
     return found_entries
 
 
+def _shared_layer_sources(
+    root: Path,
+    entries: list[Entry],
+    config: Mapping[str, Any],
+    selection: Selection,
+    fetch_entries: Callable[[Selection], Any] | None,
+) -> list[Entry]:
+    """Entries the native shared-layer resolver may read besides the requested version.
+
+    With shared-layer reuse on (anything but an explicit ``enable_shared_layer: false``) the resolver fills
+    missing tables from the same backend's strictly earlier versions (every family, including ones the requested
+    version lacks) and from other backends the pinned ``perf_data_reuse_manifest`` allows this backend to consume.
+    A root without them silently loses measured coverage the dataset holds, so they join it, fetched by the
+    same pin. This is a superset of what one query reads; ``enable_shared_layer: false`` opts out.
+    """
+    version, system, backend = selection.framework_version, selection.hardware, selection.framework
+    if config.get("enable_shared_layer") is False or not (version and system and backend):
+        return []
+    from aisim_core.sdk.perf_database import _version_sort_tuple
+
+    catalog = _op_latency_index(root).entries
+    allowed = _cross_backend_frameworks(root, system, backend)
+    chosen = {e.configuration_id for e in entries}
+    wanted: dict[tuple[str, str], list[Entry]] = {}
+    for entry in catalog:
+        identity = entry.identity
+        if entry.configuration_id in chosen or identity.hardware != system:
+            continue
+        earlier = identity.framework == backend and _version_sort_tuple(
+            identity.framework_version
+        ) < _version_sort_tuple(version)
+        cross = identity.framework in allowed and identity.operation_family != "comm"
+        if earlier or cross:
+            wanted.setdefault((identity.framework, identity.framework_version), []).append(entry)
+    found: list[Entry] = []
+    for (framework, source_version), group in sorted(wanted.items()):
+        if fetch_entries is not None:
+            fetch_entries(
+                replace(
+                    selection,
+                    configuration_ids=(),
+                    framework=framework,
+                    framework_version=source_version,
+                    operation_family=None,
+                )
+            )
+        found.extend(group)
+    return found
+
+
+def _cross_backend_frameworks(root: Path, system: str, backend: str) -> set[str]:
+    """Frameworks whose rows the pinned reuse manifest lets ``backend`` inherit on ``system``."""
+    from aisim_core.data.op_schema import REUSE_MANIFEST_NAME
+
+    path = Path(root) / DATA_PREFIX / f"{REUSE_MANIFEST_NAME}.parquet"
+    if not path.is_file():
+        return set()
+    document = yaml.safe_load(lookup_yaml(path)) or {}
+    allowed: set[str] = set()
+    for group in document.get("groups") or []:
+        if group.get("tier") in ("shared", "shared_fallback") and system in (group.get("systems") or ()):
+            frameworks = set(group.get("frameworks") or ())
+            if backend in frameworks:
+                allowed |= frameworks
+    return allowed - {backend, "nccl", "oneccl"}
+
+
 def _donor_versions(document: Any) -> list[str]:
     """Sorted distinct ``from_version`` values of a parsed ``reuse.yaml``."""
     reuse = document.get("reuse") if isinstance(document, dict) else None
@@ -709,6 +776,7 @@ def _load_op_latency(
         manifests = [read_entry_manifest(root, entry, config) for entry in entries]
         donors = _declared_donors(root, entries, manifests, selection, fetch_donors)
         donors += _collective_dependencies(root, entries + donors, config, selection, fetch_donors)
+        donors += _shared_layer_sources(root, entries + donors, config, selection, fetch_donors)
         # Donors and collective libraries are other versions or libraries of the same system, so the version check
         # of ``config`` is not theirs.
         manifests += [read_entry_manifest(root, donor) for donor in donors]

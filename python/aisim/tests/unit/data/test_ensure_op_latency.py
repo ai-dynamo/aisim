@@ -515,3 +515,128 @@ def test_a_reused_root_still_verifies_the_indexed_lookup_digests(tree, tmp_path)
     dataset_path.write_text(json.dumps(dataset))
     with pytest.raises(MissingDataError, match="integrity mismatch"):
         ensure_data(dict(CONFIG), _pin(published, tmp_path))
+
+
+# ---------------------------------------------------------------- native shared-layer sources
+
+
+@pytest.fixture
+def shared_layer_tree(tree):  # noqa: F811
+    """vllm 1.0 plus what the native resolver may borrow: vllm 0.9 (earlier), trtllm 1.0 (the manifest allows it)."""
+    meta = tree / "data/h200_sxm/gemm/vllm/1.0/collection_meta.yaml"
+    for relative in (
+        "data/h200_sxm/gemm/vllm/0.9",
+        "data/h200_sxm/attention/vllm/0.9",
+        "data/h200_sxm/gemm/trtllm/1.0",
+        "data/h200_sxm/gemm/sglang/1.0",  # sglang is not in the reuse manifest group: never a source for vllm
+    ):
+        directory = tree / relative
+        directory.mkdir(parents=True)
+        pq.write_table(_table(2), directory / "gemm_perf.parquet")
+        shutil.copyfile(meta, directory / "collection_meta.yaml")
+    return tree
+
+
+def _systems_files(root):
+    return {p.relative_to(root).as_posix() for p in (root / "data").rglob("*.parquet")}
+
+
+def test_earlier_versions_and_allowed_cross_backend_sources_join_the_root(shared_layer_tree, tmp_path):
+    published = tmp_path / "published"
+    _build(shared_layer_tree, published)
+    out = ensure_data(dict(CONFIG), _pin(published, tmp_path))
+    files = _systems_files(Path(out.config["systems_paths"][0]))
+    assert "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet" in files  # requested
+    assert "data/h200_sxm/gemm/vllm/0.9/gemm_perf.parquet" in files  # earlier version of the same backend
+    assert "data/h200_sxm/attention/vllm/0.9/gemm_perf.parquet" in files  # a family the requested version lacks
+    assert "data/h200_sxm/gemm/trtllm/1.0/gemm_perf.parquet" in files  # allowed by perf_data_reuse_manifest
+    assert not any("/sglang/" in f for f in files)  # not allowed by the manifest
+    assert not any("/vllm/2.0/" in f for f in files)  # newer versions are only reachable through reuse.yaml
+
+
+def test_explicitly_disabling_shared_layer_keeps_the_root_to_the_requested_version(shared_layer_tree, tmp_path):
+    published = tmp_path / "published"
+    _build(shared_layer_tree, published)
+    out = ensure_data({**CONFIG, "enable_shared_layer": False}, _pin(published, tmp_path))
+    files = _systems_files(Path(out.config["systems_paths"][0]))
+    assert not any("/0.9/" in f or "/trtllm/" in f for f in files)
+
+
+def test_the_hf_pin_fetches_the_shared_layer_sources(shared_layer_tree, tmp_path):
+    from .test_fetch import FakeTransport
+
+    published = tmp_path / "published"
+    _build(shared_layer_tree, published)
+    transport = FakeTransport(_tree_files(published))
+    pin = DataPin(repo="org/dataset", revision="a" * 40, categories=("op-latency",), cache_dir=tmp_path / "cache")
+    out = ensure_data(dict(CONFIG), pin, transport=transport)
+    assert any(p.endswith("gemm/vllm/0.9/gemm_perf.parquet") for p in transport.opened)
+    assert any(p.endswith("gemm/trtllm/1.0/gemm_perf.parquet") for p in transport.opened)
+    assert not any(p.endswith("gemm/sglang/1.0/gemm_perf.parquet") for p in transport.opened)
+    assert "data/h200_sxm/gemm/vllm/0.9/gemm_perf.parquet" in _systems_files(Path(out.config["systems_paths"][0]))
+
+
+def test_partial_shape_coverage_predicts_like_the_complete_source_through_best_available(tmp_path, monkeypatch):
+    """vllm 1.0 holds one GEMM shape, 0.9 the rest: the pinned root must predict like the producer's complete tree."""
+    from aisim_core.sdk import utils
+
+    monkeypatch.setattr(utils, "_download_hf_json", lambda *a, **k: pytest.fail("no model download"))
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "max_position_embeddings": 128,
+                "vocab_size": 16,
+                "torch_dtype": "bfloat16",
+            }
+        )
+    )
+
+    def producer(name, shapes_by_version):
+        systems = tmp_path / name
+        for version, ns in shapes_by_version.items():
+            directory = systems / f"data/h200_sxm/gemm/vllm/{version}"
+            directory.mkdir(parents=True)
+            rows = [
+                {"gemm_dtype": "bfloat16", "m": 4, "n": n, "k": k, "latency": float(n)} for n in ns for k in (8, 16)
+            ]
+            pq.write_table(pa.Table.from_pylist(rows), directory / "gemm_perf.parquet")
+        attention = systems / "data/h200_sxm/attention/vllm/1.0"
+        attention.mkdir(parents=True)
+        row = dict(
+            batch_size=1, isl=4, num_heads=2, num_key_value_heads=2, head_dim=4,
+            attn_dtype="bfloat16", kv_cache_dtype="bfloat16", latency=7.0,
+        )  # fmt: skip
+        pq.write_table(pa.Table.from_pylist([row]), attention / "context_attention_perf.parquet")
+        shutil.copyfile(PACKAGED_SYSTEMS_DIR / "h200_sxm.yaml", systems / "h200_sxm.yaml")
+        (systems / "perf_data_reuse_manifest.yaml").write_text("groups: []\n")
+        (systems / "query_versions.yaml").write_text(
+            'schema_version: 1\ndefaults: {vllm: {current: "1.0", previous: null}}\noverrides: {}\n'
+        )
+        return systems
+
+    complete = producer("complete", {"1.0": (8,), "0.9": (16, 24, 32)})
+    only_current = producer("only-current", {"1.0": (8,)})
+    published = tmp_path / "published"
+    _build(complete, published)
+
+    def config(**extra):
+        return ForwardPassPerfModelConfig(
+            model=str(model), system="h200_sxm", backend="vllm", backend_version="1.0", worker_type="prefill",
+            estimation_mode="op_level", estimator_config={"correction": {"enabled": False}}, **extra,
+        )  # fmt: skip
+
+    reference = res.RustForwardPassPerfModel.best_available(config(systems_paths=(str(complete),)))
+    degraded = res.RustForwardPassPerfModel.best_available(config(systems_paths=(str(only_current),)))
+    pinned = res.RustForwardPassPerfModel.best_available(config(), dataset=_pin(published, tmp_path))
+    expected = reference.predict_prefill_latency(1, 4)
+    assert pinned.predict_prefill_latency(1, 4) == expected
+    assert degraded.predict_prefill_latency(1, 4) != expected, "the fixture must make the older rows matter"
