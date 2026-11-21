@@ -1335,19 +1335,23 @@ def test_run_agg_single_request_counts_every_prefill_chunk(
     # 10 W-ms launch + 0.2 W-ms/new token. Decode is one 3 ms, 90 W-ms step.
     # The last partial chunk pays its own launch and only its remaining tokens.
     calls = []
+    raw_steps = []
 
     def prefill(_model, _database, runtime, step):
         calls.append((runtime.isl, runtime.prefix))
         tokens = runtime.isl - runtime.prefix
         latency, energy = 1 + tokens * 0.01, 10 + tokens * 0.2
-        return StepEstimate(
+        estimate = StepEstimate(
             latency_ms=latency,
             energy_wms=energy,
             covered_latency_ms=latency,
             per_op_latency_ms={"prefill": latency},
             per_op_energy_wms={"prefill": energy},
             per_op_source={"prefill": "silicon"},
+            context_tokens=step.context_tokens,
         )
+        raw_steps.append(estimate)
+        return estimate
 
     monkeypatch.setattr(backend, "run_mixed", prefill)
     monkeypatch.setattr(
@@ -1373,6 +1377,16 @@ def test_run_agg_single_request_counts_every_prefill_chunk(
     assert groups["mix_step"].latency_ms == pytest.approx(prefill_ms)
     assert groups["mix_step"].energy_wms == pytest.approx(prefill_energy)
     assert groups["mix_step"].covered_latency_ms == pytest.approx(prefill_ms)
+    evidence = summary.get_step_estimates()
+    assert evidence["scheduling"]["mix_step_latency_ms"] == pytest.approx(prefill_ms / count)
+    assert evidence["scheduling"]["mix_step_energy_wms"] == pytest.approx(prefill_energy / count)
+    if count > 1:
+        assert "mixed" not in evidence
+        assert groups["mix_step"].context_tokens == 0
+        assert [step.context_tokens for step in raw_steps] == [isl for isl, _ in expected_chunks]
+    else:
+        assert evidence["mixed"] is raw_steps[0]
+        assert evidence["mixed"].context_tokens == 4096
     assert result["power_w"] == pytest.approx((prefill_energy + 90) / (prefill_ms + 3))
 
 

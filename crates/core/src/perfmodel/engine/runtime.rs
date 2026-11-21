@@ -1201,6 +1201,17 @@ impl Engine {
             true,
             &mut seen,
         )?;
+        if let Some(vision) = &spec.vision {
+            // Vision queries use context coordinates. Validate independently
+            // of the text phases, whose mixed-step qualification must agree.
+            for ops in [
+                &vision.patch_ops,
+                &vision.transformer_ops,
+                &vision.output_ops,
+            ] {
+                Self::validate_mamba_ops(ops, None, true, &mut [false; 2])?;
+            }
+        }
         if seen == [true, true] {
             return Err(AicError::InvalidEngineConfig(
                 "Mamba ops must all record a state_dtype or all leave it unrecorded: mixed \
@@ -4860,6 +4871,45 @@ pub(crate) mod tests {
         assert_eq!(names, ["vit_norm", "merger"]);
         assert!(tp.evaluate_vision(&[]).unwrap().is_empty());
         assert!(vision_ms(&tp, 0, 16) == 0.0);
+    }
+
+    #[test]
+    fn vision_mamba_lists_require_context_phase() {
+        let db = build_engine(None).db;
+        for list in ["patch", "transformer", "output"] {
+            for prefill in [false, true] {
+                let mut spec = EngineSpec::new(
+                    fixture_engine_config(Some(3)),
+                    context_ops(),
+                    generation_ops(),
+                );
+                let mut vision = VisionSpec {
+                    encoder_parallel: EncoderParallel::Tp,
+                    patch_ops: vec![],
+                    transformer_ops: vec![],
+                    output_ops: vec![],
+                };
+                let ops = match list {
+                    "patch" => &mut vision.patch_ops,
+                    "transformer" => &mut vision.transformer_ops,
+                    "output" => &mut vision.output_ops,
+                    _ => unreachable!(),
+                };
+                ops.push(qualified_mamba(prefill, if prefill { 1 } else { 4 }));
+                spec.vision = Some(vision);
+                let result = Engine::build(spec, Arc::clone(&db));
+                if prefill {
+                    // Accepted context scans must reach the vision consumer.
+                    assert!(vision_ms(&result.unwrap(), 1, 16) > 0.0, "{list}");
+                } else {
+                    assert!(
+                        matches!(&result, Err(AicError::InvalidEngineConfig(message))
+                            if message.contains("does not match its context list")),
+                        "{list}: {result:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// Build an `Engine` from the hand-built op lists over the real fixture DB.

@@ -2134,7 +2134,8 @@ class BaseBackend:
         # Text chunks have exact sequential shapes. Visual context retains the
         # existing mean-field step, with every prefill iteration counted below;
         # its image fields stay intact so run_mixed adds them exactly once.
-        if b == 1 and num_mix_steps > 1 and img_ctx_tokens == 0:
+        averages_text_chunks = b == 1 and num_mix_steps > 1 and img_ctx_tokens == 0
+        if averages_text_chunks:
             # Fold each exact chunk immediately: retain O(operations) evidence,
             # rather than O(chunks * operations) complete StepEstimate objects.
             scalar_totals = dict.fromkeys(("latency_ms", "energy_wms", "covered_latency_ms"), 0.0)
@@ -2167,9 +2168,9 @@ class BaseBackend:
                 for name, source in chunk.per_op_source.items():
                     sources[name] = source if name not in sources or sources[name] == source else "mixed"
                 fallbacks = merge_moe_comm_fallbacks(fallbacks, chunk.moe_comm_fallbacks)
-            # The summary API weights a mean step by its iteration count.
-            mix_step_estimate = dataclasses.replace(
-                chunk,
+            # The summary API weights this aggregate mean by its iteration
+            # count. It has no individual iteration's workload coordinates.
+            mix_step_estimate = StepEstimate(
                 **{field: total / num_mix_steps for field, total in scalar_totals.items()},
                 **{
                     field: {name: value / num_mix_steps for name, value in totals.items()}
@@ -2500,7 +2501,9 @@ class BaseBackend:
                 # Raw run_mixed output (pre-mix_efficiency); the authoritative
                 # scheduled latency is scheduling["mix_step_latency_ms"], which
                 # already includes the mix_efficiency scale.
-                "mixed": mix_step_estimate,
+                # Chunk means are exposed in scheduling and weighted in the
+                # aggregate breakdown, rather than labeled as a raw iteration.
+                **({} if averages_text_chunks else {"mixed": mix_step_estimate}),
                 "scheduling": dict(per_ops_data["scheduling"]),
             }
         )

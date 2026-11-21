@@ -571,7 +571,12 @@ class InferenceSummary:
         self._step_estimates = step_estimates
 
     def get_step_estimates(self) -> dict | None:
-        """Get raw aggregate step estimates and scheduling metadata."""
+        """Get raw per-iteration estimates and aggregate scheduling metadata.
+
+        ``mixed`` is absent when scheduling averages multiple exact text
+        chunks. Their mean is in ``scheduling`` and their totals are in
+        :meth:`get_aggregate_energy_breakdown`.
+        """
         return self._step_estimates
 
     def set_encoder_source_dict(self, encoder_source_dict: dict) -> None:
