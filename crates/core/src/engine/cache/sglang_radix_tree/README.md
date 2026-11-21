@@ -54,7 +54,11 @@ following local corrections to this pinned revision:
 - Reject zero Mamba chunk sizes, copy donated Mamba slots for adoption, and
   compare SWA continuation boundaries against the complete insert length.
 - Validate continuation key content in release builds during the existing
-  ancestor walk, and return retained-prefix backup actions for empty suffixes.
+  ancestor walk, return retained-prefix backup actions for empty suffixes, and
+  report reached SWA branch boundaries for those empty continuations.
+- Keep stable cursor and commit-target handles for suspended insert walks.
+  Reject resumption before mutation if eviction deleted either node, including
+  when another node has reused its arena slot.
 - Defer demotion while device locks are held or device children have appeared,
   and reject SWA attachment over host-only Full spans before any mutation.
 - Count only evicted Full rows as host hits. Finalize Full first and pass the
@@ -64,6 +68,7 @@ following local corrections to this pinned revision:
   cached SWA rows.
 - Reject Full load-back plans whose per-node row counts changed after a split,
   or whose row totals do not match the device allocation, before any adoption.
+  Refresh each restored node's parent eligibility before another eviction.
   Publish CPU store events only for the matching write-through acknowledgement.
 - Keep borrowed namespace fields private so their cached hash stays consistent.
 - Describe the bundled module as native-only.

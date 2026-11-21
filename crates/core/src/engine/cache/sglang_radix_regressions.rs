@@ -155,6 +155,35 @@ fn swa_continuation_reports_the_full_branch_boundary() {
 }
 
 #[test]
+fn scoped_review_empty_swa_continuation_reports_reached_boundaries() {
+    for boundary in [None, Some(56), Some(64), Some(72)] {
+        let mut tree = Core::new(
+            CacheInitParams {
+                swa_sliding_window_size: Some(8),
+                ..Default::default()
+            },
+            vec![FULL, SWA],
+        );
+        let key = (0..64).collect();
+        let anchor = insert(&mut tree, key, &(0..64).collect::<Vec<_>>());
+        let key = (0..64).collect();
+        let mut p = params(&key, &[]);
+        p.prev_prefix_len = 64;
+        p.swa_branching_seqlen = boundary;
+        let result = tree.insert_suffix_from_node(anchor, 64, &p);
+        assert_eq!(result.total_len, 64);
+        assert_eq!(result.prefix_len, 64);
+        assert_eq!(result.last_device_node_id, Some(anchor));
+        assert_eq!(
+            result.swa_branch_inserted,
+            boundary.is_some_and(|length| length <= 64),
+            "boundary {boundary:?}"
+        );
+        tree.try_sanity_check(&[], &[]).unwrap();
+    }
+}
+
+#[test]
 fn early_swa_release_honors_skip_and_releases_acquired_mamba() {
     let mut tree = Core::new(
         CacheInitParams {
@@ -790,6 +819,125 @@ fn load_back_rejects_incomplete_and_excess_device_allocations() {
                 .is_err()
         );
         assert!(tree.is_full_device_evicted(leaf).unwrap());
+        tree.try_sanity_check(&[], &[]).unwrap();
+    }
+}
+
+#[test]
+fn scoped_review_load_back_refreshes_every_restored_parent_before_eviction() {
+    for write_back in [false, true] {
+        let mut tree = Core::new(
+            CacheInitParams {
+                enable_hicache: true,
+                is_write_back: write_back,
+                ..Default::default()
+            },
+            vec![FULL],
+        );
+        let parent = insert(&mut tree, vec![10, 20], &[1, 2]);
+        complete_backup(&mut tree, parent);
+        let middle = insert(&mut tree, vec![10, 20, 30, 40], &[1, 2, 3, 4]);
+        complete_backup(&mut tree, middle);
+        let leaf = insert(&mut tree, vec![10, 20, 30, 40, 50, 60], &[1, 2, 3, 4, 5, 6]);
+        complete_backup(&mut tree, leaf);
+        tree.demote(leaf).unwrap();
+        tree.demote(middle).unwrap();
+        tree.try_sanity_check(&[], &[]).unwrap();
+
+        let (full, auxiliary) = tree.build_load_back_spec(leaf, None).unwrap();
+        assert_eq!(full.node_row_counts.as_deref(), Some(&[2, 2][..]));
+        tree.commit_load_back(
+            leaf,
+            PageValue::from_vec(vec![31, 32, 41, 42]),
+            full,
+            auxiliary,
+        )
+        .unwrap();
+        tree.finish_load_back(leaf).unwrap();
+        assert_eq!(
+            tree.full_device_eviction_candidates()
+                .map(|candidate| candidate.node_id)
+                .collect::<Vec<_>>(),
+            vec![leaf]
+        );
+        tree.try_sanity_check(&[], &[]).unwrap();
+
+        for (expected, pages) in [(leaf, [41, 42]), (middle, [31, 32]), (parent, [1, 2])] {
+            tree.evict_device_start(FULL, 1);
+            let (victim, _) = tree.evict_device_next_node(FULL, &HashMap::new());
+            assert_eq!(victim, Some(expected));
+            let (backup, step) = tree.evict_device_leaf(expected, write_back).unwrap();
+            assert!(backup.is_none());
+            assert_eq!(step.device_frees[&FULL][0].as_slice(), &pages);
+            tree.evict_device_end(FULL);
+            tree.try_sanity_check(&[], &[]).unwrap();
+        }
+        assert_eq!(tree.full_evictable_size(), 0);
+    }
+}
+
+#[test]
+fn scoped_review_suspended_insert_rejects_evicted_and_reused_cursor() {
+    for reuse_slot in [false, true] {
+        let mut tree = Core::new(
+            CacheInitParams {
+                enable_hicache: true,
+                write_through_threshold: 2,
+                ..Default::default()
+            },
+            vec![FULL],
+        );
+        let leaf = insert(&mut tree, vec![10, 20], &[1, 2]);
+        let other = insert(&mut tree, vec![30, 40], &[3, 4]);
+        let saved_slot = tree.arena.resolve(leaf).unwrap();
+        let key = vec![10, 20, 50];
+        let step = tree.try_begin_insert(&params(&key, &[5, 6, 7])).unwrap();
+        assert!(step.result.is_none());
+        assert!(step.actions.iter().any(
+            |action| matches!(action, CacheAction::BackupKV(backup) if backup.node_ids == vec![leaf])
+        ));
+        assert!(tree.has_ongoing_insert());
+
+        // Keep the other branch newer, so the ordinary walk selects the saved cursor.
+        tree.match_prefix(&MatchPrefixParams {
+            key: &vec![30, 40],
+            namespace: Default::default(),
+        });
+        tree.evict_device_start(FULL, 1);
+        assert_eq!(
+            tree.evict_device_next_node(FULL, &HashMap::new()).0,
+            Some(leaf)
+        );
+        let (backup, step) = tree.evict_device_leaf(leaf, false).unwrap();
+        assert!(backup.is_none());
+        assert_eq!(step.device_frees[&FULL][0].as_slice(), &[1, 2]);
+        tree.evict_device_end(FULL);
+        if reuse_slot {
+            // A normal partial match allocates a split prefix into the freed slot.
+            let split = tree
+                .match_prefix(&MatchPrefixParams {
+                    key: &vec![30],
+                    namespace: Default::default(),
+                })
+                .best_match_node_id;
+            assert_eq!(tree.arena.resolve(split).unwrap(), saved_slot);
+            assert_ne!(split, leaf);
+        }
+        let tick = tree.inspect_get_node_access_counter(other).unwrap();
+        assert!(matches!(
+            tree.try_resume_insert(),
+            Err(TreeCoreRuntimeError::NodeAccess(NodeAccessError { node_id })) if node_id == leaf
+        ));
+        assert_eq!(tree.inspect_get_node_access_counter(other).unwrap(), tick);
+        assert_eq!(tree.full_kv_prefix_len(&key, Default::default()), 0);
+        assert_eq!(
+            tree.full_kv_prefix_len(&vec![30, 40, 50], Default::default()),
+            2
+        );
+        tree.end_insert();
+        let result = tree.try_insert(&params(&key, &[5, 6, 7])).unwrap();
+        assert_eq!(result.total_len, 3);
+        assert_eq!(tree.full_kv_prefix_len(&key, Default::default()), 3);
         tree.try_sanity_check(&[], &[]).unwrap();
     }
 }

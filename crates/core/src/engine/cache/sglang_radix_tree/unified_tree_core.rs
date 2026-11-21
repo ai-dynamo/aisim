@@ -260,6 +260,8 @@ pub enum InsertPhase {
 pub struct InsertWalkState<K: ChildKeyType, V: RadixValue> {
     phase: InsertPhase,
     node_id: NodeIdx_,
+    /// Stable identity checked before reusing the cursor after a barrier.
+    node_handle: NodeId,
     /// Page-aligned key suffix beginning at `key_offset`.
     key: K,
     /// Absolute atom offset represented by `key[0]` and `value[0]`.
@@ -281,6 +283,7 @@ pub struct InsertWalkState<K: ChildKeyType, V: RadixValue> {
     total_prefix_length: usize,
     is_new_leaf: bool,
     target_node_id: Option<NodeIdx_>,
+    target_node_handle: Option<NodeId>,
     result: Option<InsertResult<V>>,
     /// Emitted actions awaiting the next barrier flush (or the final step).
     pending_actions: Vec<CacheAction<V>>,
@@ -1964,7 +1967,9 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                     // Nothing was inserted, so a donated Mamba slot was not
                     // adopted and the caller keeps (and frees) it.
                     mamba_exist: true,
-                    swa_branch_inserted: false,
+                    swa_branch_inserted: params
+                        .swa_branching_seqlen
+                        .is_some_and(|boundary| aligned_key_len >= boundary),
                     adopted_ranges: params.track_adopted_ranges.then(HashMap::new),
                     cache_actions: Vec::new(),
                 }),
@@ -1975,6 +1980,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         self.ongoing_insert_walk_state = Some(InsertWalkState {
             phase: InsertPhase::Walk,
             node_id: prefix_node_idx,
+            node_handle: self.arena.node(prefix_node_idx).id,
             key: K::from(params.key.as_ref()[prefix_len..aligned_key_len].to_vec()),
             key_offset: prefix_len,
             aligned_key_len,
@@ -1992,6 +1998,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             total_prefix_length: prefix_len,
             is_new_leaf: false,
             target_node_id: None,
+            target_node_handle: None,
             result: Some(InsertResult {
                 total_len: aligned_key_len,
                 adopted_ranges: params.track_adopted_ranges.then(HashMap::new),
@@ -2099,10 +2106,22 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     }
 
     /// Fallible variant of [`Self::resume_insert`].
+    /// If eviction deleted a saved node, return its stale-handle error before
+    /// resuming any mutation. The caller can discard the walk with `end_insert`.
     pub fn try_resume_insert(&mut self) -> Result<InsertStepResult<V>, TreeCoreRuntimeError> {
-        if self.ongoing_insert_walk_state.is_none() {
-            return Err(TreeCoreRuntimeError::NoInFlightInsert);
-        }
+        let state = self
+            .ongoing_insert_walk_state
+            .as_mut()
+            .ok_or(TreeCoreRuntimeError::NoInFlightInsert)?;
+        // Arena slots can be freed and reused while barrier actions execute.
+        // Validate both handles before updating either cached arena index.
+        let node_id = self.arena.resolve(state.node_handle)?;
+        let target_node_id = state
+            .target_node_handle
+            .map(|handle| self.arena.resolve(handle))
+            .transpose()?;
+        state.node_id = node_id;
+        state.target_node_id = target_node_id;
         Ok(self.advance_insert_())
     }
 
@@ -2194,6 +2213,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         {
             let node = self.arena.node_mut(node_id);
             node.priority = node.priority.max(state.priority);
+            state.node_handle = node.id;
         }
 
         let params = InsertParams {
@@ -2335,6 +2355,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             state.node_id
         };
         state.target_node_id = Some(target_node_id);
+        state.target_node_handle = Some(self.arena.node(target_node_id).id);
 
         // Finalize: let each component attach its data to the target node.
         // e.g. Mamba attaches mamba_value to the leaf node
@@ -2345,7 +2366,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             .as_mut()
             .expect("insert result exists during commit");
         result.prefix_len = state.total_prefix_length;
-        result.last_device_node_id = Some(self.arena.node(target_node_id).id);
+        result.last_device_node_id = state.target_node_handle;
         let params = InsertParams {
             rotation_base: state.rotation_base,
             key: &state.key,

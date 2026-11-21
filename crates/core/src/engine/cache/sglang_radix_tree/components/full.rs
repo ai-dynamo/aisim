@@ -538,6 +538,9 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for FullComponent {
                             tree_core.inc_evictable_size(FULL, n_len);
                         }
                         tree_core.update_evictable_leaf_sets_(loaded_idx);
+                        if let Some(parent) = tree_core.arena.node(loaded_idx).try_parent() {
+                            tree_core.update_evictable_leaf_sets_(parent);
+                        }
                     }
                 }
                 tree_core.update_evictable_leaf_sets_(node_id);

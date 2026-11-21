@@ -467,6 +467,9 @@ impl RadixCache {
             0,
             "attach Belady before populating the cache"
         );
+        // The cursor and candidate priorities belong to the previous forecast,
+        // even when its cache has since been drained.
+        self.candidates = EvictionIndex::default();
         self.belady = Some(BeladyPages {
             oracle,
             page_hashes: vec![None; self.page_pool.total_pages],
@@ -1110,6 +1113,36 @@ mod tests {
         oracle.retire_requests([Uuid::from_u128(1)]);
         assert_eq!(cache.evict(1).1, vec![KvPageId(0)]);
         assert_eq!(cache.prefix_match_len(&[2]), 1);
+    }
+
+    #[test]
+    fn scoped_review_belady_replacement_after_retirement_and_drain() {
+        let oracle = oracle_for_prompts(&[&[1], &[2]]);
+        let mut cache = RadixCache::new(2, 1);
+        cache.set_belady_oracle(oracle.clone());
+        let pages = cache.page_pool.allocate(2).unwrap();
+        cache.insert(&[1, 2], &pages);
+        oracle.retire_requests([Uuid::from_u128(1)]);
+        assert_eq!(cache.evict(2).0, 2);
+        assert!(cache.candidates.forecast_cursor > 0);
+        assert_eq!(cache.available_tokens(), 2);
+
+        let replacement = oracle_for_prompts(&[&[1], &[2]]);
+        cache.set_belady_oracle(replacement.clone());
+        let a = cache.page_pool.allocate(1).unwrap();
+        cache.insert(&[1], &a);
+        let b = cache.page_pool.allocate(1).unwrap();
+        cache.insert(&[2], &b);
+        // The new oracle has no changes yet; a cursor from the old one is invalid.
+        assert_eq!(cache.evict(1).1, vec![KvPageId(b[0])]);
+        assert_eq!(cache.prefix_match_len(&[1]), 1);
+        let reused = cache.page_pool.allocate(1).unwrap();
+        cache.insert(&[2], &reused);
+        replacement.retire_requests([Uuid::from_u128(1)]);
+        assert_eq!(cache.evict(1).1, vec![KvPageId(a[0])]);
+        assert_eq!(cache.prefix_match_len(&[2]), 1);
+        assert_eq!(cache.evict(2).0, 1);
+        assert_eq!(cache.available_tokens(), 2);
     }
 
     #[test]
