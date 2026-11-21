@@ -2376,7 +2376,9 @@ impl VllmCore {
     /// empty batch: a pending load is seen when its copy ends and is
     /// schedulable then.
     fn settle_loads_in_empty_steps(&mut self, now_ms: f64) {
-        let idle = self.state.running_members.is_empty() && self.state.waiting_members.is_empty();
+        // An activated restore can still be in connector_waiting when a
+        // running prefill consumed the previous pass's entire token budget.
+        let idle = !self.has_schedulable_requests();
         if !self.load_poll() || !(idle || self.last_pass_empty) {
             return;
         }
