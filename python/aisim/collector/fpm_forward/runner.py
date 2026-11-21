@@ -75,6 +75,8 @@ READINESS_TIMEOUT_ENV = "FPM_READINESS_TIMEOUT_SECONDS"
 # that makes runtime/preflight.py require a power-capable self-benchmark.
 POWER_WINDOW_ENV = "DYN_BENCHMARK_POWER_WINDOW_S"
 POWER_WINDOW_REQUIRED_ENV = "FPM_POWER_WINDOW_REQUIRED"
+# vLLM's batch-invariant mode, which a runtime probe launch refuses.
+BATCH_INVARIANT_ENV = "VLLM_BATCH_INVARIANT"
 DEFAULT_READINESS_TIMEOUT_SECONDS = 900
 # KV warm-up dominates a decode cell's wall clock (~80 min for a tep4 decode
 # sweep on MiniMax M2.7); one hour would kill the engine mid-warm-up. 10800
@@ -1583,6 +1585,24 @@ def _cell_generator_overrides(
     # DYN_BENCHMARK_POWER_WINDOW_S as the flag.
     if {POWER_WINDOW_ENV, POWER_WINDOW_REQUIRED_ENV} & set(resolved_env):
         raise ValueError("the power window must be supplied through --fpm-measure-power")
+    # vLLM reads VLLM_BATCH_INVARIANT as bool(int(value)) (vllm/envs.py:638). When it is on, an attention layer of
+    # the TRITON_MLA or FLASHINFER backend turns prefix caching off in its worker process only
+    # (model_executor/layers/attention/mla_attention.py:550-563, attention.py:373-388), so a runtime probe would
+    # record a worker and a scheduler that disagree. A value that int() reads as 0 is off. A value that the image sets,
+    # or that a Slurm step inherits from the environment of the collector, is not visible here; the import refuses
+    # such records.
+    if getattr(plan, "probe_sampling", None) is not None and BATCH_INVARIANT_ENV in resolved_env:
+        value = resolved_env[BATCH_INVARIANT_ENV].get("value")
+        try:
+            off = isinstance(value, str) and int(value) == 0
+        except ValueError:
+            off = False
+        if not off:
+            raise ValueError(
+                f"{BATCH_INVARIANT_ENV} cannot be set for a runtime probe: with it, vLLM turns prefix caching off in "
+                "a worker of the TRITON_MLA or FLASHINFER backend while its scheduler keeps it on, and the import "
+                "refuses such records; remove it from K8sConfig.extra_env"
+            )
     # The V4.1 real-KV and GLM-5.3-Flash prefix-seed adapters run their pinned
     # pre-power Dynamo overlay, which has no power window (AISIM-1973 P2).
     pinned_adapter = any(

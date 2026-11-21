@@ -3858,6 +3858,54 @@ def test_power_window_cannot_be_set_through_the_environment(name, source):
         _cell_generator_overrides(_plan(cell), cell, base)
 
 
+@pytest.mark.parametrize("source", ["deployment", "policy"])
+@pytest.mark.parametrize(
+    "value,refused",
+    # vLLM reads the variable as bool(int(value)) (vllm/envs.py:638): "00" and " 0" read as off, "-1" as on, and a
+    # value that int() cannot read stops vLLM. None stands for an entry whose value the launch cannot show.
+    [
+        ("1", True),
+        ("2", True),
+        ("-1", True),
+        ("true", True),
+        ("", True),
+        (None, True),
+        ("0", False),
+        ("00", False),
+        (" 0", False),
+    ],
+)
+def test_probe_launch_refuses_vllm_batch_invariant_in_the_environment(tmp_path, source, value, refused):
+    entry = {"name": "VLLM_BATCH_INVARIANT", "value": value}
+    if value is None:
+        entry = {"name": "VLLM_BATCH_INVARIANT", "valueFrom": {"configMapKeyRef": {"name": "engine", "key": "mode"}}}
+    collection, probe = _glm53flash_probe_and_collection(tmp_path / "plan", 4)
+
+    def build(plan):
+        cell, base = plan.cells[0], {}
+        if source == "deployment":
+            base = {"K8sConfig": {"extra_env": [dict(entry)]}}
+        else:
+            policy = cell.backend_policy
+            overrides = policy.generator_overrides
+            overrides.setdefault("K8sConfig", {}).setdefault("extra_env", []).append(dict(entry))
+            cell = dataclasses.replace(
+                cell,
+                backend_policy=BackendPolicy(
+                    policy.policy_id, overrides, policy.expected_markers, policy.aic_fields, policy.admission_reason
+                ),
+            )
+        return _cell_generator_overrides(plan, cell, base)
+
+    if refused:
+        with pytest.raises(ValueError, match="VLLM_BATCH_INVARIANT cannot be set for a runtime probe"):
+            build(probe)
+    else:
+        assert entry in build(probe)["K8sConfig"]["extra_env"]
+    # A collection launch is outside this rule: it is built as before, with the entry in its environment.
+    assert entry in build(collection)["K8sConfig"]["extra_env"]
+
+
 def test_historical_plans_without_measure_power_render_no_power_window():
     cell = _cell()
     args = _cell_generator_overrides(_plan(cell), cell, {})["params"]["agg"]["extra_cli_args"]

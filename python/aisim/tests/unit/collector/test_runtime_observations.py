@@ -2268,6 +2268,62 @@ def test_prefix_caching_evidence_must_be_modeled_and_agree_across_ranks(tmp_path
     assert diagnostic in " ".join(result["diagnostics"])
 
 
+@pytest.mark.parametrize("workers", ["every_worker", "one_worker"])
+@pytest.mark.parametrize("mode", ["align", "none"])
+@pytest.mark.parametrize("layout", ["kernel_view", "mamba_hybrid"])
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_v033_worker_that_turned_prefix_caching_off_names_batch_invariance(tmp_path, layout, phase, mode, workers):
+    path, launches = observation_fixture(tmp_path, layout=layout)
+
+    def edit(record):
+        if record["phase"] != phase:
+            return
+        if mode == "none":
+            # A model without Mamba layers records the mode none with prefix caching on.
+            record["cache"]["prefix_caching"]["mamba_cache_mode"] = "none"
+            record["resolved_config"]["cache_config"]["mamba_cache_mode"] = "none"
+        # The worker process changed its own cache configuration, and the engine core kept prefix caching on.
+        if record["kind"] == "worker" and (
+            workers == "every_worker" or (record["dp_rank"], record["tp_rank"]) == (1, 1)
+        ):
+            record["cache"]["prefix_caching"]["enable_prefix_caching"] = False
+            record["resolved_config"]["cache_config"]["enable_prefix_caching"] = False
+
+    _mutate(path, edit)
+    result = validate_observations(path, launches)["tp2"]
+    assert (result["status"], result["diagnostics"]) == (
+        "incomplete",
+        [
+            f"tp2: {phase} worker turned prefix caching off while its scheduler keeps it on; vLLM does this under "
+            "VLLM_BATCH_INVARIANT with the TRITON_MLA or FLASHINFER backend; run the probe without that variable"
+        ],
+    )
+
+
+@pytest.mark.parametrize("shape", ["integer", "null", "missing", "not_a_mapping"])
+def test_v033_malformed_worker_prefix_caching_evidence_does_not_name_batch_invariance(tmp_path, shape):
+    path, launches = observation_fixture(tmp_path, layout="mamba_hybrid")
+
+    def edit(record):
+        # Only the worker evidence is malformed; every scheduler records prefix caching on.
+        if record["kind"] != "worker":
+            return
+        evidence = record["cache"]["prefix_caching"]
+        if shape == "integer":
+            evidence["enable_prefix_caching"] = 0
+        elif shape == "null":
+            evidence["enable_prefix_caching"] = None
+        elif shape == "missing":
+            evidence.pop("enable_prefix_caching")
+        else:
+            record["cache"]["prefix_caching"] = sorted(evidence)
+
+    _mutate(path, edit)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete"
+    assert result["diagnostics"] == ["tp2: runtime observation requires complete prefix-caching evidence"]
+
+
 @pytest.mark.parametrize("change", ["speculative", "checkpoint"])
 def test_speculative_or_checkpoint_mamba_groups_are_incomplete(tmp_path, change):
     path, launches = observation_fixture(tmp_path, layout="mamba_hybrid")
