@@ -1216,7 +1216,10 @@ def _scheduler_hash_block_sizes(record: dict[str, Any]) -> list[Any]:
     kv_transfer_config. Otherwise several groups hash in prefix_match_unit tokens, or in the GCD of the block sizes of
     the groups that take part in prefix caching, or of every group when none does. Each of these cases gives one size.
     Each SlidingWindowMLASpec group takes part unless its spec replays a bounded window (kv_cache_interface.py:1015,
-    :1027-1029), which no record holds. With such groups, each choice of the groups that take part gives one size.
+    :1027-1029). The record does not hold which groups replay. The groups that replay share one window, their
+    sliding_window (core/sched/scheduler.py:302-313, kv_cache_interface.py:1031-1033), so the groups that stay out have
+    one sliding_window, and each such choice gives one size. A group whose record holds no positive integer window may
+    stay out with any window.
     """
     groups, settings = record["cache"]["groups"], record["resolved_config"]["cache_config"]
     blocks = [_positive(group["block_size_tokens"], "cache block size") for group in groups]
@@ -1236,13 +1239,24 @@ def _scheduler_hash_block_sizes(record: dict[str, Any]) -> list[Any]:
         for block, group in zip(blocks, groups, strict=True)
         if group["spec_type"] not in {*runtime_memory._NO_PREFIX_CACHING_SPECS, unknown}
     ]
-    # Start from the GCD of the blocks of the groups that surely take part, which is 0 without such a group. Each
-    # SlidingWindowMLASpec group may add its block to every GCD so far, so the set holds the GCD of every choice of
-    # those groups, and it never holds more values than there are distinct GCDs.
-    hashes = {math.gcd(*caching)}
-    for block, group in zip(blocks, groups, strict=True):
-        if group["spec_type"] == unknown:
-            hashes |= {math.gcd(value, block) for value in hashes}
+    # Each SlidingWindowMLASpec block with its window, None when the record holds no positive integer window.
+    sliding = [
+        (block, group.get("sliding_window"))
+        for block, group in zip(blocks, groups, strict=True)
+        if group["spec_type"] == unknown
+    ]
+    sliding = [(block, window if type(window) is int and window > 0 else None) for block, window in sliding]
+    hashes = set()
+    for out in {window for _, window in sliding if window is not None} or {None}:
+        # Start from the GCD of the blocks of the groups that surely take part, with the groups of another window,
+        # which is 0 without such a group. Each group that may stay out with window `out` may add its block to every
+        # GCD so far, so the set holds the GCD of every choice of those groups, and it never holds more values than
+        # there are distinct GCDs.
+        choices = {math.gcd(*caching, *(block for block, window in sliding if window not in (None, out)))}
+        for block, window in sliding:
+            if window in (None, out):
+                choices |= {math.gcd(value, block) for value in choices}
+        hashes |= choices
     # Without a group in prefix caching, vLLM hashes in the GCD of every block.
     return sorted({math.gcd(*blocks) if value == 0 else value for value in hashes})
 
@@ -1259,12 +1273,15 @@ def _scheduler_hash_block_size_fits(record: dict[str, Any]) -> bool:
     block size when a Mamba group has a larger block, else the scheduler block size. The scheduler record holds the
     groups that vLLM reads, in which a uniform group keeps only its first inner spec (:1110-1116).
 
-    A SlidingWindowMLASpec group may or may not take part, so one choice of the groups that take part must give the
-    recorded hash block size and meet both rules. With that hash block size, the alignment no longer depends on the
-    choice. So every group that takes part must pass the same test: the hash block size divides its block, and the
-    alignment is a multiple of its tokens per state. A SlidingWindowMLASpec group that passes it may take part whatever
-    the other groups do. Every such group keeps the GCD a multiple of the hash block size, so the choice with all of
-    them gives the smallest GCD.
+    A SlidingWindowMLASpec group takes part unless it replays a bounded window, which the record does not hold. The
+    groups that replay share one window, their sliding_window (core/sched/scheduler.py:302-313,
+    kv_cache_interface.py:1031-1033). So for one sliding_window, every such group with another window takes part, and
+    one choice of the groups with that window must give the recorded hash block size and meet both rules. A group
+    whose record holds no positive integer window may stay out with any window. With that hash block size, the
+    alignment no longer depends on the choice. So every group that takes part must pass the same test: the hash block
+    size divides its block, and the alignment is a multiple of its tokens per state. A group of that window that passes
+    it may take part whatever the other groups do. Every such group keeps the GCD a multiple of the hash block size, so
+    the choice with all of them gives the smallest GCD.
 
     With one group, vLLM raises when prefix_match_unit is neither None nor the block size times the decode context
     parallel size, a factor of 1 unless the spec is dcp_sharded (v1/core/kv_cache_utils.py:841-842), and prefix
@@ -1295,22 +1312,31 @@ def _scheduler_hash_block_size_fits(record: dict[str, Any]) -> bool:
         )
 
     unknown = _SPEC_MODULE + "SlidingWindowMLASpec"
-    caching = [
-        group for group in groups if group["spec_type"] not in {*runtime_memory._NO_PREFIX_CACHING_SPECS, unknown}
-    ]
-    sliding = [group["block_size_tokens"] for group in groups if group["spec_type"] == unknown and can_take_part(group)]
+    # Each SlidingWindowMLASpec group with its window, None when the record holds no positive integer window.
+    windows = [(group, group.get("sliding_window")) for group in groups if group["spec_type"] == unknown]
+    windows = [(group, window if type(window) is int and window > 0 else None) for group, window in windows]
     unit = settings.get("prefix_match_unit") is not None
-    if caching:
-        # The groups that surely take part meet both rules under every choice or under none. A unit is the hash block
-        # size of every choice. Without one, the smallest GCD must be the hash block size.
-        return all(can_take_part(group) for group in caching) and (
-            unit or math.gcd(*(group["block_size_tokens"] for group in caching), *sliding) == hash_block
-        )
-    # Otherwise some of those SlidingWindowMLASpec groups take part, or no group does and vLLM hashes every block.
     blocks = [group["block_size_tokens"] for group in groups]
-    if unit:
-        return bool(sliding) or all(block % hash_block == 0 for block in blocks)
-    return math.gcd(*sliding) == hash_block or math.gcd(*blocks) == hash_block
+
+    def fits(out: int | None) -> bool:
+        caching = [
+            group for group in groups if group["spec_type"] not in {*runtime_memory._NO_PREFIX_CACHING_SPECS, unknown}
+        ] + [group for group, window in windows if window not in (None, out)]
+        sliding = [
+            group["block_size_tokens"] for group, window in windows if window in (None, out) and can_take_part(group)
+        ]
+        if caching:
+            # The groups that surely take part meet both rules under every choice or under none. A unit is the hash
+            # block size of every choice. Without one, the smallest GCD must be the hash block size.
+            return all(can_take_part(group) for group in caching) and (
+                unit or math.gcd(*(group["block_size_tokens"] for group in caching), *sliding) == hash_block
+            )
+        # Otherwise some of the groups that may stay out take part, or no group does and vLLM hashes every block.
+        if unit:
+            return bool(sliding) or all(block % hash_block == 0 for block in blocks)
+        return math.gcd(*sliding) == hash_block or math.gcd(*blocks) == hash_block
+
+    return any(fits(out) for out in {window for _, window in windows if window is not None} or {None})
 
 
 def _phase_prefix_caching(

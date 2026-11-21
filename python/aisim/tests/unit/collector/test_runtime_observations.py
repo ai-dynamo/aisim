@@ -4638,6 +4638,110 @@ def test_v033_scheduler_hash_block_size_fits_its_cache_groups(specs, unit, expec
     assert runtime_observations._scheduler_hash_block_size_fits(record) is expected
 
 
+@pytest.mark.parametrize(
+    "windows,sizes,fits_with_a_unit",
+    [
+        # Two replay windows: the two groups cannot both stay out. 64 tokens, which needs that, is no hash block size.
+        ((64, 128), [16, 32], False),
+        # One window, and records without the field: today's result.
+        ((64, 64), [16, 32, 64], True),
+        ((None, None), [16, 32, 64], True),
+        # A group without a positive integer window may stay out with any window: today's result.
+        ((None, 64), [16, 32, 64], True),
+        (("64", 64), [16, 32, 64], True),
+        ((True, 64), [16, 32, 64], True),
+        ((-64, 64), [16, 32, 64], True),
+    ],
+)
+def test_v033_replay_windows_of_sliding_mla_groups_must_agree(windows, sizes, fits_with_a_unit):
+    def record(unit):
+        groups = [
+            {
+                "spec_type": _V033_SPEC + spec,
+                "block_size_tokens": block,
+                "layer_specs": {"layer": {"tokens_per_state": 1}},
+            }
+            | ({} if window is None else {"sliding_window": window})
+            for spec, block, window in (
+                ("SlidingWindowMLASpec", 96, windows[0]),
+                ("FullAttentionSpec", 64, None),
+                ("SlidingWindowMLASpec", 80, windows[1]),
+            )
+        ]
+        return {
+            "cache": {"groups": groups, "block_size": 960, "hash_block_size": 64},
+            "resolved_config": {"cache_config": {"enable_prefix_caching": True, "prefix_match_unit": unit}},
+        }
+
+    assert runtime_observations._scheduler_hash_block_sizes(record(None)) == sizes
+    # With a unit of 64 tokens, only the fit test can refuse: neither window group has a block that 64 divides, so
+    # both must stay out.
+    assert runtime_observations._scheduler_hash_block_sizes(record(64)) == [64]
+    assert runtime_observations._scheduler_hash_block_size_fits(record(64)) is fits_with_a_unit
+
+
+@pytest.mark.parametrize(
+    "specs,unit,hash_block,sizes,fits",
+    [
+        # Each window gives a hash block size that the other does not: 96 tokens when the 64-token group stays out,
+        # 64 tokens when the 96-token group does, and 32 tokens when both take part. Both cannot stay out, so 192
+        # tokens is none.
+        (
+            [("FullAttentionSpec", 192, None), ("SlidingWindowMLASpec", 64, 1), ("SlidingWindowMLASpec", 96, 2)],
+            None,
+            32,
+            [32, 64, 96],
+            True,
+        ),
+        (
+            [("FullAttentionSpec", 192, None), ("SlidingWindowMLASpec", 64, 1), ("SlidingWindowMLASpec", 96, 2)],
+            None,
+            192,
+            [32, 64, 96],
+            False,
+        ),
+        # A 64-token unit fits when the 96-token group stays out and the 128-token group takes part.
+        (
+            [("FullAttentionSpec", 64, None), ("SlidingWindowMLASpec", 96, 1), ("SlidingWindowMLASpec", 128, 2)],
+            64,
+            64,
+            [32, 64],
+            True,
+        ),
+        # The group without a window may stay out or take part with the group of window 64. When it takes part, vLLM
+        # hashes in 32 tokens.
+        (
+            [("FullAttentionSpec", 64, None), ("SlidingWindowMLASpec", 96, None), ("SlidingWindowMLASpec", 128, 64)],
+            None,
+            32,
+            [32, 64],
+            True,
+        ),
+    ],
+    ids=["two_windows_gcd", "two_windows_none_out", "two_windows_unit", "group_without_a_window"],
+)
+def test_v033_groups_of_one_replay_window_stay_out(specs, unit, hash_block, sizes, fits):
+    groups = [
+        {"spec_type": _V033_SPEC + spec, "block_size_tokens": block, "layer_specs": {"layer": {"tokens_per_state": 1}}}
+        | ({} if window is None else {"sliding_window": window})
+        for spec, block, window in specs
+    ]
+    cache = {"groups": groups, "block_size": math.lcm(*(block for _, block, _ in specs)), "hash_block_size": hash_block}
+    settings = {"enable_prefix_caching": True}
+    assert (
+        runtime_observations._scheduler_hash_block_sizes(
+            {"cache": cache, "resolved_config": {"cache_config": {**settings, "prefix_match_unit": None}}}
+        )
+        == sizes
+    )
+    assert (
+        runtime_observations._scheduler_hash_block_size_fits(
+            {"cache": cache, "resolved_config": {"cache_config": {**settings, "prefix_match_unit": unit}}}
+        )
+        is fits
+    )
+
+
 @pytest.mark.parametrize("spec", ["MLAAttentionSpec", "MambaSpec"])
 def test_legacy_records_refuse_classes_outside_the_legacy_allow_list(tmp_path, spec):
     path, launches = observation_fixture(tmp_path)
