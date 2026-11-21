@@ -42,7 +42,11 @@ prices chunks of 512, 512 and 72 new tokens, with prefixes 3000, 3512 and 4024.
 Each chunk retains the mixed step's concurrent decoders. Qualified Mamba
 therefore pays three recurrent-state charges and processes 1096 new prefill
 tokens, rather than scaling one chunk eight times. Per-request dispatch is
-added once. Uncached requests retain the existing XPU scaling heuristic.
+added once. Batched cold text requests use the same exact chunk pricing when
+their context graph contains qualified Mamba operations, so a short final chunk
+pays a full recurrent-state charge. Unqualified batched cold graphs retain the
+existing XPU scaling heuristic. For a single text request, `run_agg` already
+sums its actual chunk prices and XPU TTFT uses that total directly.
 The aggregate scheduler reserves decode slots from the full token capacity
 before capping prefill by the batch's demand. Whole-model FPM demand counts
 uncached tokens; op-level demand uses full prompt coordinates. The fitted XPU

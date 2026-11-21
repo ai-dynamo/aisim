@@ -534,6 +534,36 @@ def test_cached_fpm_burst_keeps_prompt_length_calibration(monkeypatch, prefix):
     assert ttft == pytest.approx(expected[prefix])
 
 
+def test_batched_cold_unqualified_mamba_keeps_calibrated_scaling(monkeypatch):
+    from aisim_core.sdk.operations import Mamba2Kernel
+
+    model = SimpleNamespace(
+        forward_model="op_level",
+        _num_layers=1,
+        context_ops=[
+            Mamba2Kernel("context_mamba_ssm", 1, "mamba_chunk_scan_combined", "context", 4096, 64, 64, 128, 4, 8, 128)
+        ],
+    )
+    backend = VLLMXPUBackend()
+    calls = []
+
+    def mixed(*_):
+        calls.append(1)
+        return StepEstimate(latency_ms=40, energy_wms=0, context_tokens=1000)
+
+    monkeypatch.setattr(backend, "run_mixed", mixed)
+    monkeypatch.setattr(backend, "_mix_step_gen_tokens", lambda *_: 2)
+    monkeypatch.setattr(backend, "_effective_decode_bs", lambda *_: 4)
+    monkeypatch.setattr(backend, "_get_genonly_step_latency", lambda *_: (1, 0, {}, {}, ()))
+    runtime = SimpleNamespace(isl=4096, osl=64, prefix=0, batch_size=4)
+    ttft = backend._compute_ttft(model, None, runtime, 4, 4096, 64, 1002, 0, **_ttft_kwargs())
+    # Legacy fit: linearly scale the 40 ms query by 4096/1000, dispatch
+    # once, then apply the unchanged burst factor with unit decode growth.
+    factor = 1 + BURST_A * math.log2(4) ** BURST_BS_EXP * (1002 / 4096) ** BURST_CTX_EXP
+    assert ttft == pytest.approx((40 * 4.096 + 0.3) * factor)
+    assert calls == [1]
+
+
 @pytest.mark.parametrize("regime", ["burst", "admission"])
 @pytest.mark.parametrize(
     "prefix,budget,chunks",
@@ -544,12 +574,12 @@ def test_cached_fpm_burst_keeps_prompt_length_calibration(monkeypatch, prefix):
         (3000, 2050, [(4096, 3000)]),
         # One complete packed request is already the exact native query.
         (3000, 4098, []),
-        # The uncached path retains its calibrated linear scaling: eight
-        # complete 512-token chunks, including their decode interference.
-        (0, 514, None),
+        # Even chunks remain a control; a short cold tail pays a full state.
+        (0, 514, [(past + 512, past) for past in range(0, 4096, 512)]),
+        (0, 1002, [(1000, 0), (2000, 1000), (3000, 2000), (4000, 3000), (4096, 4000)]),
     ],
 )
-def test_batched_cached_ttft_prices_native_uncached_chunks(monkeypatch, regime, prefix, budget, chunks):
+def test_batched_ttft_prices_native_uncached_chunks(monkeypatch, regime, prefix, budget, chunks):
     from aisim_core.sdk import operations as ops
     from aisim_core.sdk.config import ModelConfig, RuntimeConfig
     from aisim_core.sdk.models import get_model
@@ -625,7 +655,7 @@ def test_batched_cached_ttft_prices_native_uncached_chunks(monkeypatch, regime, 
     # For prefix 3000 / budget 514: 1096 new tokens, three prefill states,
     # six decode tokens/states, at B200's 7.7e12 B/s. The final 72 tokens
     # pay a full state charge. Dispatch is 0.3 ms once for the whole request.
-    count = max(1, len(chunks)) if chunks is not None else 8
+    count = max(1, len(chunks))
     activation_bytes = (4096 - prefix) * 20_608
     state_bytes = count * 2 * 1_048_576
     decode_scan_ms = (2 * 20_608 + 2 * 2 * 1_048_576) / 7.7e12 * 1000
@@ -642,5 +672,5 @@ def test_batched_cached_ttft_prices_native_uncached_chunks(monkeypatch, regime, 
         expected = own_ms + (4 - 2) / 2 * (own_ms + 64 * 1.5)
     assert ttft == pytest.approx(expected, rel=1e-9)
     assert calls[0] == (4096, prefix, budget - 2, 2)
-    assert calls[1:] == ([] if chunks is None else [(isl, past, isl, 2) for isl, past in chunks])
+    assert calls[1:] == [(isl, past, isl, 2) for isl, past in chunks]
     assert (runtime.isl, runtime.prefix, runtime.batch_size) == (4096, prefix, 4)

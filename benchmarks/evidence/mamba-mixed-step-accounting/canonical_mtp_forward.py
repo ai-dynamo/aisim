@@ -62,6 +62,8 @@ for label, model_id, nextn in [("nano", config["model"], 3), ("control", "Qwen/Q
         record["queries"][name] = {"predicted_ms": value, "first_query_us": cold_us, "warm": warm}
     result["builds"][label] = record
 result["identity"] = {
+    "constructor_path": str(Path(nemotron_h.__file__).resolve()),
+    "native_path": str(Path(_runtime.__file__).resolve()),
     "constructor_sha256": hashlib.sha256(Path(nemotron_h.__file__).read_bytes()).hexdigest(),
     "native_sha256": hashlib.sha256(Path(_runtime.__file__).read_bytes()).hexdigest(),
 }

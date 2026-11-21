@@ -14,6 +14,7 @@ from dataclasses import replace
 from aisim_core.sdk.backends.vllm_backend import VLLMBackend
 from aisim_core.sdk.config import RuntimeConfig
 from aisim_core.sdk.models import BaseModel
+from aisim_core.sdk.operations import Mamba2Kernel
 from aisim_core.sdk.perf_database import PerfDatabase
 from aisim_core.sdk.step_estimate import MixedStepInput, StepEstimate
 
@@ -76,7 +77,20 @@ class VLLMXPUBackend(VLLMBackend):
             runtime_config,
             MixedStepInput(context_tokens=ctx_tokens if b > 1 else prefill_ctx, num_decode_requests=d),
         )
-        if b > 1 and prefix > 0 and not is_fpm and isl == runtime_config.isl:
+        exact_text_prefill = (
+            b > 1
+            and not is_fpm
+            and isl == runtime_config.isl
+            and (
+                prefix > 0
+                or any(
+                    isinstance(op, Mamba2Kernel)
+                    and op.__getnewargs_ex__()[1].get("state_dtype", "unrecorded") != "unrecorded"
+                    for op in getattr(model, "context_ops", ())
+                )
+            )
+        )
+        if exact_text_prefill:
             # A packed prompt budget is not a multiplier for already-priced
             # uncached work, especially Mamba's per-chunk recurrent-state cost.
             own_prefill_ms = self._own_cached_prefill_ms(step, model, database, runtime_config, isl, prefix)

@@ -1240,6 +1240,22 @@ baseline, and an unset `PYTHONPATH` selects the candidate:
 AIC_ALLOW_UNLISTED_VERSIONS=1 python canonical_mtp_forward.py OUT.json
 ```
 
+The committed [round launcher](mamba-mixed-step-accounting/canonical_mtp_forward_rounds.py)
+reconstructs the six-round schedule and writes the same `rounds` / `order` /
+`results` envelope. Round 1 runs baseline then candidate, round 2 candidate then
+baseline, repeated three times. Each of the twelve invocations starts a new
+interpreter with `PYTHONPATH` set to that SDK's package directory. It rejects a
+constructor or native extension imported from outside the selected directory.
+New records include both loaded paths alongside the existing source hashes;
+the historical JSON above is retained as measured, without invented provenance.
+Run from the repository root with the common dependency environment's Python:
+
+```bash
+python benchmarks/evidence/mamba-mixed-step-accounting/canonical_mtp_forward_rounds.py \
+  /absolute/path/to/baseline/site-packages /absolute/path/to/candidate/site-packages \
+  /absolute/path/to/new-forward-rounds.json
+```
+
 Nano model construction medians were 388.1 / 374.9 ms (baseline / candidate).
 Its first decode query, including lazy data loading, was 12.355 / 12.485 ms.
 Warm query medians across the six rounds were:
@@ -1426,3 +1442,36 @@ on an aggregate-cache miss. Visual queries still make one mixed-step call,
 with unchanged preparation, native binary and retained memory. Cache hits
 return before the branch. This is a source-level cost bound, not a timing
 benchmark or a serving-accuracy qualification.
+
+### Cold qualified-Mamba XPU chunks
+
+`test_batched_ttft_prices_native_uncached_chunks` also covers cold text
+prompts in both burst and admission regimes. At batch 4, ISL 4096, prefix 0
+and capacity 1002, two admitted decoders leave 1000 prefill tokens per step.
+The qualified scan needs chunks of 1000, 1000, 1000, 1000 and 96 tokens.
+Previously XPU multiplied the first scan by 4.096, charging only 4.096 state
+pairs. Exact native chunk queries now charge five state pairs and retain the
+two concurrent decoders on every chunk. With the fixture's 1 MiB FP16 state,
+the prefill scan alone increases by
+`(5 - 4.096) * 2 * 1048576 / 7.7e12 * 1000 = 0.000246211092` ms before the
+unchanged burst or admission factor. This is an accounting oracle, not a
+silicon measurement. The divisible 512-token case remains a control.
+`test_batched_cold_unqualified_mamba_keeps_calibrated_scaling` preserves the
+legacy unqualified graph's linear fit, including a short final chunk.
+
+The change reuses the existing cached-text chunk walker. On a batched cold
+aggregate cache miss, qualification detection visits at most the context-op
+list once and constructs kwargs only for Mamba ops. Besides the existing mixed
+query, qualified graphs make one native query per actual chunk unless the
+initial query already prices one complete request. The walker retains constant
+runtime state; other cold graphs keep one native mixed-step query. Aggregate
+cache hits return before this work. Chunk prices still come only from Rust. This bound identifies
+the necessary added query cost; it is not a host-timing or replay qualification.
+
+The XPU comparison driver now rejects an imported backend whose source differs
+from the checkout before running either comparison. It hashes the verified
+imported bytes, including for a byte-identical installed wheel copy.
+`test_fingerprint_binds_imported_source` exercises distinct installed/checkout
+versions and the accepted identical-copy case. The new round-launcher tests
+exercise twelve fresh interpreters, alternating SDK selection despite an
+ambient `PYTHONPATH`, and rejection of a result imported from the wrong SDK.
