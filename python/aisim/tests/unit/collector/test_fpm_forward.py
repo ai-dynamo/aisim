@@ -1335,11 +1335,10 @@ def test_detected_layout_reads_the_layer_count_as_intake_does(tmp_path, layer_co
 
 
 def test_detected_layout_reads_every_layer_count_field_of_intake(tmp_path):
-    from aisim.support.config_profile import _INT_ALIASES
+    from aisim.fpm_cache_layout import LAYER_COUNT_FIELDS
     from aisim.support.config_profile import load_model_config as load_intake_config
 
-    # The collector copies intake's list of layer count fields; a field that intake adds must count here too.
-    for field in _INT_ALIASES["num_hidden_layers"]:
+    for field in LAYER_COUNT_FIELDS:
         directory = tmp_path / field
         directory.mkdir()
         path = _layer_config(directory, _GDN_LAYERS, {field: 3})

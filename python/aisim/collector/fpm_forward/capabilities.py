@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from aisim.fpm_cache_layout import cache_layout_markers
+from aisim.fpm_cache_layout import cache_layout_markers, check_marker_layout_declarations
 from aisim.sdk import common
 from aisim.sdk.models.helpers import _infer_quant_modes_from_raw_config
 from aisim.sdk.perf_database import (
@@ -23,11 +23,6 @@ from .model_capability import ResolvedModelConfig, load_model_config, resolve_at
 TEMPLATE_VERSION = 1
 # A cache layout that config.json cannot describe gets no FPM attention template; the native runtime measures it.
 GENERIC_RUNTIME_TEMPLATE_ID = "generic:native_runtime"
-# Config intake's window and layer count fields, in its order (_cache_window and _INT_ALIASES in
-# aisim/support/config_profile.py). The collector does not import the onboarding package, so tests pin these
-# copies to intake.
-_WINDOW_FIELDS = ("sliding_window", "sliding_window_size")
-_LAYER_COUNT_FIELDS = ("num_hidden_layers", "n_layer", "num_layers")
 
 
 def _enum_name(value: object) -> str:
@@ -46,50 +41,23 @@ def _is_moe(config: dict[str, object]) -> bool:
     return any(int(config.get(key) or 0) > 1 for key in ("n_routed_experts", "num_local_experts", "num_experts"))
 
 
-def _intake_integer(value: object, field: str, minimum: int) -> int:
-    """Config intake's integer check (_integer in aisim/support/config_profile.py), with its message."""
-    if type(value) is not int or value < minimum:
-        raise ValueError(f"{field} must be an integer >={minimum}, not a boolean, float or numeric string")
-    return value
+def _check_layer_declarations(config: dict[str, object]) -> None:
+    """The layer structure checks of a config without cache layout markers.
 
-
-def _check_layer_declarations(config: dict[str, object], *, marker_layout: bool = False) -> None:
-    """Config intake's layer structure checks. A cache layout marker never excuses a malformed declaration.
-
-    For a marker layout, the checks are those of intake's runtime-layout block, in its order and with its messages:
-    the window fields sliding_window and sliding_window_size, the layer count from every field that intake reads,
-    layer_types and attn_type_list. A config without markers keeps main's checks, which read only num_hidden_layers
-    and checked neither the window fields nor attn_type_list.
+    They are main's checks, which read only num_hidden_layers and checked neither the window fields nor
+    attn_type_list. A config with markers, other than DeepSeek-V4.1, runs check_marker_layout_declarations of
+    aisim.fpm_cache_layout instead, the checks that config intake runs.
     """
     layer_types = config.get("layer_types")
-    if marker_layout:
-        # Intake's rules: each window field that is present and not null is an integer of at least 0, each layer
-        # count field present is an integer of at least 1, and the fields of each kind agree.
-        windows = {
-            field: _intake_integer(config[field], field, 0) for field in _WINDOW_FIELDS if config.get(field) is not None
-        }
-        if len(set(windows.values())) > 1:
-            raise ValueError(f"conflicting sliding-window fields: {windows}")
-        counts = {field: _intake_integer(config[field], field, 1) for field in _LAYER_COUNT_FIELDS if field in config}
-        if len(set(counts.values())) > 1:
-            raise ValueError(f"conflicting num_hidden_layers fields: {counts}")
-        layers = next(iter(counts.values()), None)
-    else:
-        layers = config.get("num_hidden_layers")
-        if "num_hidden_layers" in config and (type(layers) is not int or layers < 1):
-            raise ValueError("num_hidden_layers must be a positive integer")
+    layers = config.get("num_hidden_layers")
+    if "num_hidden_layers" in config and (type(layers) is not int or layers < 1):
+        raise ValueError("num_hidden_layers must be a positive integer")
     if "layer_types" in config and (
         not isinstance(layer_types, list) or (layers is not None and len(layer_types) != layers)
     ):
         raise ValueError("layer_types must have one entry per num_hidden_layers")
     if isinstance(layer_types, list) and any(not isinstance(value, str) or not value.strip() for value in layer_types):
         raise ValueError("layer_types entries must be nonempty strings")
-    attn_types = config.get("attn_type_list")
-    if marker_layout and "attn_type_list" in config:
-        if not isinstance(attn_types, list) or (layers is not None and len(attn_types) != layers):
-            raise ValueError("attn_type_list must have one entry per num_hidden_layers")
-        if any(type(value) is not int for value in attn_types):
-            raise ValueError("attn_type_list entries must be integers")
 
 
 def _attention_template(
@@ -294,7 +262,7 @@ def resolve_model_capability(
     layout_markers = () if model_family == "DEEPSEEKV41" else cache_layout_markers(config, architecture)
     if layout_markers:
         # No FPM attention template represents this cache, at any support level.
-        _check_layer_declarations(config, marker_layout=True)
+        check_marker_layout_declarations(config)
         reasons = ", ".join(layout_markers)
         if not checkpoint_native_dtypes:
             raise ValueError(

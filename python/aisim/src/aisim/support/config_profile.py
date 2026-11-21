@@ -36,7 +36,16 @@ from typing import Any
 import yaml
 
 from aisim import quantization
-from aisim.fpm_cache_layout import cache_layout_markers, recognized_layer_types
+from aisim.fpm_cache_layout import (
+    LAYER_COUNT_FIELDS,
+    attn_type_list,
+    cache_layout_markers,
+    cache_window,
+    check_marker_layout_declarations,
+    layer_types,
+    layout_integer,
+    recognized_layer_types,
+)
 from aisim.fpm_profile import FpmCacheGroup, FpmModelProfile
 
 from .schema import SupportRequest
@@ -137,7 +146,7 @@ _EXPERT_ALIASES = ("num_local_experts", "n_routed_experts", "num_experts")
 _INT_ALIASES = {
     "hidden_size": ("hidden_size", "n_embd", "d_model"),
     "intermediate_size": ("intermediate_size",),
-    "num_hidden_layers": ("num_hidden_layers", "n_layer", "num_layers"),
+    "num_hidden_layers": LAYER_COUNT_FIELDS,
     "num_attention_heads": ("num_attention_heads", "n_head"),
     "num_key_value_heads": ("num_key_value_heads", "num_kv_heads"),
     "head_dim": ("head_dim",),
@@ -226,11 +235,7 @@ class _UnderivableWindowLayout(ValueError):
     """
 
 
-def _integer(value: Any, field: str, *, minimum: int = 1, maximum: int | None = None) -> int:
-    if type(value) is not int or value < minimum or (maximum is not None and value > maximum):
-        bound = f"{minimum}..{maximum}" if maximum is not None else f">={minimum}"
-        raise ValueError(f"{field} must be an integer {bound}, not a boolean, float or numeric string")
-    return value
+_integer = layout_integer
 
 
 def _text(value: Any, field: str) -> str:
@@ -356,33 +361,9 @@ def _validate_quantization(raw: Mapping[str, Any]) -> None:
         raise ValueError("quantization_config.kv_cache_scheme.dynamic must be a boolean")
 
 
-def _cache_window(raw: Mapping[str, Any]) -> int | None:
-    supplied = {
-        key: _integer(raw[key], key, minimum=0)
-        for key in ("sliding_window", "sliding_window_size")
-        if raw.get(key) is not None
-    }
-    if len(set(supplied.values())) > 1:
-        raise ValueError(f"conflicting sliding-window fields: {supplied}")
-    return next(iter(supplied.values()), None)
-
-
-def _layer_types(raw: Mapping[str, Any], layers: int | None) -> list[str]:
-    types = raw["layer_types"]
-    if not isinstance(types, list) or (layers is not None and len(types) != layers):
-        raise ValueError("layer_types must have one entry per num_hidden_layers")
-    if any(not isinstance(value, str) or not value.strip() for value in types):
-        raise ValueError("layer_types entries must be nonempty strings")
-    return types
-
-
-def _attn_type_list(raw: Mapping[str, Any], layers: int | None) -> list[int]:
-    values = raw["attn_type_list"]
-    if not isinstance(values, list) or (layers is not None and len(values) != layers):
-        raise ValueError("attn_type_list must have one entry per num_hidden_layers")
-    if any(type(value) is not int for value in values):
-        raise ValueError("attn_type_list entries must be integers")
-    return values
+_cache_window = cache_window
+_layer_types = layer_types
+_attn_type_list = attn_type_list
 
 
 def _runtime_layout(raw: Mapping[str, Any], architecture: str | None, named: str | None) -> tuple[str, ...]:
@@ -524,12 +505,7 @@ def _validate_layout(
     runtime = _runtime_layout(raw, architecture, named)
     if runtime:
         # The runtime probe measures this layout's cache geometry; intake only checks the config is well formed.
-        _cache_window(raw)
-        layers = _aliased_int(raw, "num_hidden_layers")
-        if "layer_types" in raw:
-            _layer_types(raw, layers)
-        if "attn_type_list" in raw:
-            _attn_type_list(raw, layers)
+        check_marker_layout_declarations(raw)
         return runtime
     sliding = _cache_layer_ids(raw, architecture, inkling=inkling)
     layers = _aliased_int(raw, "num_hidden_layers")
