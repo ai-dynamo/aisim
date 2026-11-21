@@ -274,6 +274,54 @@ def test_fp8_projection_lane_follows_quant_dynamic_not_the_global_default(dynami
     assert _projection_modes(raw, "MM", block)["mamba_in_proj_gemm"] == {block: 1, fp8: 1}
 
 
+@pytest.mark.parametrize("quant_method", ["compressed-tensors", "modelopt"])
+@pytest.mark.parametrize(
+    "scaling,gemm,moe",
+    [
+        ({"strategy": "block"}, common.GEMMQuantMode.fp8_block, MOE.fp8_block),
+        ({"strategy": "tensor", "block_structure": [128, 128]}, common.GEMMQuantMode.fp8_block, MOE.fp8_block),
+        ({"strategy": "tensor"}, common.GEMMQuantMode.fp8, MOE.fp8),
+    ],
+    ids=["block-strategy", "block-structure", "per-tensor-control"],
+)
+def test_fp8_config_group_scaling_reaches_native_pricing(monkeypatch, tmp_path, scaling, gemm, moe, quant_method):
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
+
+    def compressed_fp8(section, _e_layers):
+        section.clear()
+        section.update(
+            quant_method=quant_method,
+            config_groups={
+                "all": {
+                    "weights": {"num_bits": 8, "type": "float", **scaling},
+                    "input_activations": {"num_bits": 8, "type": "float", "dynamic": True},
+                    "targets": ["Linear", "*.experts.*"],
+                }
+            },
+        )
+        if quant_method == "modelopt":
+            section["quant_algo"] = "MIXED_PRECISION"
+
+    path = _write_super(tmp_path, compressed_fp8)
+    (tmp_path / "hf_quant_config.json").unlink()  # config.json is self-contained
+    for model in (
+        get_model(path, ModelConfig(moe_tp_size=1, system="gb200"), "vllm"),
+        _task_model(_task(path), path),
+    ):
+        assert model.config.gemm_quant_mode == gemm
+        assert model.config.moe_quant_mode == moe
+        for pipeline in (model.context_ops, model.generation_ops):
+            assert all(set(modes) == {gemm} for modes in _buckets(pipeline).values())
+            assert set(_buckets(pipeline, ("moe",))["moe"]) == {moe}
+
+    inferred = _latencies(path)
+    explicit = _latencies(path, gemm_quant_mode=gemm, moe_quant_mode=moe)
+    # Every Linear target declares the same weight scaling, so inferred native
+    # pricing must equal the explicit kernel family in both serving phases.
+    for prefill in (True, False):
+        assert inferred[prefill] == pytest.approx(explicit[prefill], rel=1e-9)
+
+
 def test_config_loader_keeps_quoted_infinity_markers(tmp_path):
     path = tmp_path / "config.json"
     path.write_text('{"bare": [0.0, Infinity, -Infinity, NaN], "marker": {"__float__": "Infinity"}}')
