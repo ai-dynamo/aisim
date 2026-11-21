@@ -12,9 +12,9 @@ The YAML's numeric content traces to the Ascend 950
 architecture white paper and on-device observation: official per-chip
 figures (4TB/s HBM bandwidth, 1 PFLOPS FP8, 2TB/s
 interconnect) and the observed 96GiB capacity tier with
-8 chips per node. The unofficial/placeholder entries are deliberately NOT
-pinned here — the on-device campaign replaces them with measurements — but they
-must stay positive so the strict ``*_tc_flops`` resolver can run.
+8 chips per node. Unverified FP32 and INT8 peaks and the tier-dependent BF16
+peak remain absent so queries requiring them fail until the hardware evidence
+is available.
 """
 
 from __future__ import annotations
@@ -22,6 +22,8 @@ from __future__ import annotations
 import pytest
 
 from aisimulate.sdk import common
+from aisimulate_core.sdk.common import GEMMQuantMode, get_quant_tc_flops
+from aisimulate_core.sdk.errors import MissingSystemFlopsError
 from aisimulate_core.sdk.perf_database import get_supported_databases, load_system_spec
 from aisimulate_core.sdk.system_spec import SystemSpec
 
@@ -47,9 +49,6 @@ class TestAscend950dtSystemSpec:
         assert gpu["mem_capacity"] == 96 * 1024**3
         assert gpu["mem_bw"] == 4e12  # official 4TB/s
         assert gpu["fp8_tc_flops"] == 1e15  # official 1 PFLOPS FP8/MXFP8/HiF8
-        # Official BF16/FP16 peak of the top 36-Cube-Core tier (white paper
-        # table 3-1); which of the 547/486/425 tiers this node is is an on-device check.
-        assert gpu["bfloat16_tc_flops"] == 547e12
         assert node["num_gpus_per_node"] == 8
         # Per-NPU single direction, derived from the same white paper §4.6 figure
         # as the yaml comment: 2016 GB/s bidirectional = 72 lane x 112 Gbps x 2 / 8,
@@ -62,11 +61,14 @@ class TestAscend950dtSystemSpec:
         assert spec["gpu"]["vendor"] == "ascend"
         assert "sm_version" not in spec["gpu"]
 
-    def test_unofficial_flops_entries_are_positive_placeholders(self, spec: SystemSpec) -> None:
-        """Strict per-dtype resolution rejects missing or non-positive entries."""
+    def test_unverified_flops_entries_are_unavailable(self, spec: SystemSpec) -> None:
+        """An unverified peak must not enable compute estimates."""
         gpu = spec["gpu"]
-        for key in ("int8_tc_flops", "fp32_flops"):
-            assert gpu[key] > 0, f"{key} must stay positive until on-device measurement replaces it"
+        for key in ("int8_tc_flops", "fp32_flops", "bfloat16_tc_flops"):
+            assert key not in gpu
+        for mode, key in ((GEMMQuantMode.sq, "int8_tc_flops"), (GEMMQuantMode.bfloat16, "bfloat16_tc_flops")):
+            with pytest.raises(MissingSystemFlopsError, match=key):
+                get_quant_tc_flops(spec, mode)
 
     def test_spec_satisfies_the_rust_system_spec_contract(self, spec: SystemSpec) -> None:
         """Fields the compiled FPE (crates/core .. common/system_spec.rs) requires.

@@ -277,6 +277,27 @@ mod tests {
     }
 
     #[test]
+    fn ascend_950dt_rejects_unverified_int8_throughput() {
+        let spec = SystemSpec::load(&systems_root().join("ascend_950dt.yaml")).unwrap();
+        let error = quant_tc_flops(&spec, crate::common::enums::GemmQuantMode::Sq.mapping())
+            .expect_err("unverified INT8 throughput must not enable estimates");
+        assert!(matches!(error, AicError::MissingSystemFlops(_)), "{error}");
+        assert!(error.to_string().contains("int8_tc_flops"), "{error}");
+    }
+
+    #[test]
+    fn ascend_950dt_rejects_unverified_bfloat16_tier() {
+        let spec = SystemSpec::load(&systems_root().join("ascend_950dt.yaml")).unwrap();
+        let error = quant_tc_flops(
+            &spec,
+            crate::common::enums::GemmQuantMode::Bfloat16.mapping(),
+        )
+        .expect_err("an unconfirmed Cube-Core tier must not enable BF16 estimates");
+        assert!(matches!(error, AicError::MissingSystemFlops(_)), "{error}");
+        assert!(error.to_string().contains("bfloat16_tc_flops"), "{error}");
+    }
+
+    #[test]
     fn parse_b200_sxm() {
         let spec = SystemSpec::load(&systems_root().join("b200_sxm.yaml"))
             .expect("b200_sxm.yaml parse must succeed");

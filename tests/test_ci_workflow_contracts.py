@@ -128,6 +128,25 @@ def test_forward_perf_selects_before_allocating_the_benchmark_runner():
     assert "${BASE_SRC}/python/aisimulate/tools/forward_perf_gate/run.py" in _run_commands(compare)
 
 
+@pytest.mark.parametrize("image_cargo_home", [None, "", "/opt/image-cargo"])
+def test_forward_perf_cargo_home_is_isolated_before_rust_setup(tmp_path, image_cargo_home):
+    steps = _workflow("performance.yml")["jobs"]["compare"]["steps"]
+    bootstrap = next(step for step in steps if step.get("name") == "Set Cargo home outside the checkout")
+    rust = next(step for step in steps if step.get("uses", "").startswith("dtolnay/rust-toolchain@"))
+    assert steps.index(bootstrap) < steps.index(rust)
+    runner_temp = tmp_path / "runner-temp"
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    env_file = tmp_path / "github-env"
+    env = {**os.environ, "RUNNER_TEMP": str(runner_temp), "GITHUB_ENV": str(env_file)}
+    env.pop("CARGO_HOME", None)
+    if image_cargo_home is not None:
+        env["CARGO_HOME"] = image_cargo_home
+    subprocess.run(["bash", "-euc", bootstrap["run"]], cwd=checkout, env=env, check=True, timeout=10)
+    expected = image_cargo_home or str(runner_temp / "cargo")
+    assert env_file.read_text() == f"CARGO_HOME={expected}\n"
+
+
 def test_forward_perf_validates_the_pr_controller_without_replacing_the_base_comparison():
     steps = _workflow("performance.yml")["jobs"]["compare"]["steps"]
     revisions = next(step for step in steps if step.get("id") == "revisions")
