@@ -8,6 +8,7 @@ The import runs them after every older check of a phase, so an older refusal kee
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from typing import Any
 
@@ -35,14 +36,21 @@ def validate_phase(
 
 # vLLM stores both capacity values in one call (vLLM 0.33.0 v1/core/kv_cache_utils.py:1136-1142), which the engine
 # core makes once, before it builds the scheduler (v1/engine/core.py:352). The token capacity is the integer part of
-# the concurrency times max_model_len (kv_cache_utils.py:1120-1128). The import has checked the concurrency before.
+# the concurrency times max_model_len (kv_cache_utils.py:1120-1128). The concurrency is the pool blocks over the
+# blocks of one request, a positive float for every layout with a cache group (:1076-1093, engine/core.py:337-352).
+# The startup concurrency check skips a layout with a sliding-window group, so this check refuses a concurrency that
+# is no positive finite number itself, with the text of that check.
 def _check_size_tokens(record: dict[str, Any]) -> None:
     cache = record["cache"]
+    label = f"{record['phase']} scheduler of DP rank {record['dp_rank']}"
+    concurrency = cache.get("kv_cache_max_concurrency")
+    if isinstance(concurrency, bool) or not isinstance(concurrency, (int, float)) or not 0 < concurrency < math.inf:
+        raise ValueError(f"{label} lacks a positive kv_cache_max_concurrency")
     value = cache.get("kv_cache_size_tokens")
-    expected = int(cache["kv_cache_max_concurrency"] * record["resolved_config"]["model_config"]["max_model_len"])
+    expected = int(concurrency * record["resolved_config"]["model_config"]["max_model_len"])
     if type(value) is not int or value != expected:
         raise ValueError(
-            f"{record['phase']} scheduler of DP rank {record['dp_rank']} records kv_cache_size_tokens {value!r}, "
+            f"{label} records kv_cache_size_tokens {value!r}, "
             f"but its kv_cache_max_concurrency and max_model_len give {expected}"
         )
 

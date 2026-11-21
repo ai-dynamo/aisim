@@ -3435,6 +3435,72 @@ def test_v033_scheduler_size_tokens_truncate_the_capacity_product(tmp_path, phas
     ]
 
 
+def _window_attention(record):
+    # The attention group of the mamba_hybrid layout as a sliding-window group. The startup concurrency check does not
+    # model the blocks that vLLM reserves for a window group, so it skips this layout.
+    for group in record["cache"]["groups"]:
+        if group["spec_type"] == _V033_SPEC + "FullAttentionSpec":
+            group.update(spec_type=_V033_SPEC + "SlidingWindowSpec", sliding_window=32)
+            for spec in group["layer_specs"].values():
+                spec["spec_type"] = _V033_SPEC + "SlidingWindowSpec"
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+@pytest.mark.parametrize("dp", [0, 1])
+@pytest.mark.parametrize(
+    "concurrency,tokens,diagnostic",
+    [
+        # The fixture value: 10 pool blocks over 68 blocks of one request, int(10 / 68 * 4,096) = 602.
+        ("keep", 602, None),
+        ("keep", 603, "tokens 603 602"),
+        # A pool that holds exactly two requests, written as a JSON integer: int(2 * 4,096) = 8,192.
+        (2, 8_192, None),
+        (2, 8_193, "tokens 8193 8192"),
+        # int(1 / 4,096 * 4,096) = 1, which a boolean equals.
+        (1 / 4096, 1, None),
+        (1 / 4096, True, "tokens True 1"),
+        ("absent", 602, "concurrency"),
+        (None, 602, "concurrency"),
+        (True, 602, "concurrency"),
+        ("0.147", 602, "concurrency"),
+        (0, 0, "concurrency"),
+        (-0.5, 602, "concurrency"),
+    ],
+)
+def test_v033_scheduler_size_tokens_follow_the_concurrency_of_a_window_layout(
+    tmp_path, phase, dp, concurrency, tokens, diagnostic
+):
+    path, launches = observation_fixture(tmp_path, layout="mamba_hybrid")
+
+    def edit(record):
+        _window_attention(record)
+        if (record["kind"], record["phase"], record["dp_rank"]) == ("scheduler", phase, dp):
+            cache = record["cache"]
+            if concurrency == "absent":
+                del cache["kv_cache_max_concurrency"]
+            elif concurrency != "keep":
+                cache["kv_cache_max_concurrency"] = concurrency
+            cache["kv_cache_size_tokens"] = tokens
+
+    _mutate(path, edit)
+    records = []
+    _mutate(path, records.append)
+    assert all(record["cache"]["groups"][0]["spec_type"] == _V033_SPEC + "SlidingWindowSpec" for record in records)
+    result = validate_observations(path, launches)["tp2"]
+    if diagnostic is None:
+        assert (result["status"], result["diagnostics"]) == ("complete", [])
+        return
+    if diagnostic == "concurrency":
+        expected = f"tp2: {phase} scheduler of DP rank {dp} lacks a positive kv_cache_max_concurrency"
+    else:
+        _, value, rule = diagnostic.split()
+        expected = (
+            f"tp2: {phase} scheduler of DP rank {dp} records kv_cache_size_tokens {value}, "
+            f"but its kv_cache_max_concurrency and max_model_len give {rule}"
+        )
+    assert result["diagnostics"] == [expected]
+
+
 def _legacy_blocks(record):
     # A real record of vLLM 0.27.0 or 0.28.0 holds both blocks too (observer.observe). These contradict the cache
     # record and name a backend file that the bundle does not hold, so an evidence check that read them would refuse
@@ -3460,6 +3526,28 @@ def test_legacy_records_get_no_new_evidence_check(tmp_path, version, blocks):
     assert worker["available_cache_bytes"] // 128 == worker["num_blocks"] + 2
     assert all("kv_cache_size_tokens" not in record["cache"] for record in records)
     assert all(("raw_cache_config" in record) == blocks for record in records)
+    result = validate_observations(path, launches)["tp2"]
+    assert (result["status"], result["diagnostics"]) == ("complete", [])
+    assert "prefix_caching" not in result["provenance"]
+
+
+def test_vllm_032_records_get_no_block_count_check(tmp_path):
+    path, launches = _strided_fixture(tmp_path)
+
+    def edit(record):
+        # One more 512-byte pool block fits in the budget of every worker.
+        if record["kind"] == "worker":
+            record["cache"]["available_cache_bytes"] += 512
+
+    _mutate(path, edit)
+    records = []
+    _mutate(path, records.append)
+    workers = [record["cache"] for record in records if record["kind"] == "worker"]
+    assert all(
+        cache["available_cache_bytes"] // (cache["allocated_cache_bytes"] // cache["num_blocks"])
+        == cache["num_blocks"] + 1
+        for cache in workers
+    )
     result = validate_observations(path, launches)["tp2"]
     assert (result["status"], result["diagnostics"]) == ("complete", [])
     assert "prefix_caching" not in result["provenance"]
