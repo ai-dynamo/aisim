@@ -93,6 +93,7 @@ def evaluate_waves(specs, *, factory, initializer, evaluate, workers: int, timeo
                 break
         if not wave:
             continue
+        share = plan.get("profile_worker_rss_limit_bytes")
         checkpoint("wave_admitted", plan)
         pending = pending[len(wave) :]
         for index in wave:
@@ -168,8 +169,8 @@ def evaluate_waves(specs, *, factory, initializer, evaluate, workers: int, timeo
                 if not active:
                     break
                 pressure = factory.live_pressure()
-                if not pressure and (share := plan.get("profile_worker_rss_limit_bytes")) is not None:
-                    pressure = profile_worker_pressure(pool._processes, share)
+                if share is not None:
+                    pressure = profile_worker_pressure(pool._processes, share) or pressure
                 if pressure:
                     interrupted = InterruptedEvaluation("live memory pressure", True, pressure)
                     break
@@ -187,7 +188,7 @@ def evaluate_waves(specs, *, factory, initializer, evaluate, workers: int, timeo
                         retry.append(index)
                     else:
                         yield index, interrupted
-                if "worker_rss_limit_bytes" in interrupted.metadata:
+                if share is not None and interrupted.resource_limited:
                     capacity = 1
                 checkpoint(
                     "wave_interrupted",

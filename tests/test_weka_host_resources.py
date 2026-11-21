@@ -408,6 +408,7 @@ def test_profile_wave_admission_partitions_headroom(tmp_path, monkeypatch, input
     baseline = 512 * MIB + estimate["lower_bound_bytes"]
     assert (initial > baseline) == (input_tokens == 32_000_000)
     floor = max(initial, baseline)
+    assert wave["candidates"][0]["profile_worker_min_bytes"] == floor
     assert wave["reserved_bytes"] == [floor, floor]
     assert wave["profile_worker_rss_limit_bytes"] == wave["available_bytes"] // 2
     assert factory.observed_peak(spec) is None
@@ -416,10 +417,20 @@ def test_profile_wave_admission_partitions_headroom(tmp_path, monkeypatch, input
     with pytest.raises(ResourceLimitError) as caught:
         factory.admit_wave([spec, spec])
     assert caught.value.plan["profile_worker_rss_limit_bytes"] == floor - 1
-    assert "profile_worker_rss_limit_bytes" not in factory.admit_wave([spec])
+    single = factory.admit_wave([spec])
+    assert "profile_worker_rss_limit_bytes" not in single
+    assert single["reserved_bytes"] == [baseline]
     custom = resources.GuardedRunnerFactory(object(), "engine", ResourceConfig())
     with pytest.raises(resources._SerialAdmissionRequired):
         custom.admit_wave([spec, spec])
+    if initial > baseline:
+        budget["memory_limit_bytes"] = budget["coordinator_memory_bytes"] + initial - 1
+        with pytest.raises(ResourceLimitError, match="candidate exceeds the host memory budget") as caught:
+            factory.admit_wave([spec])
+        assert (
+            caught.value.plan["estimate"]["reason"]
+            == "initial profile trace materialization estimate exceeds live headroom"
+        )
 
 
 def test_weka_budget_limited_scans_are_not_cached(tmp_path, weka_parses):

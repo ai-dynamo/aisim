@@ -122,14 +122,20 @@ returns `aisim.resources.ResourceEstimate` with `api_version=1`:
 - `request_count`: concrete count, or null when unresolved;
 - `input_token_bytes` and `lower_bound_bytes`: nonnegative integer bytes;
 - `estimated_peak_bytes`: positive integer bytes, or null when unqualified;
+- `materialization_peak_bytes`: estimated peak for initial trace materialization,
+  present only in native Weka profile estimates with a known initial peak and unknown total peak;
 - `reason`: explanation of unresolved dimensions.
 
 Qualified peaks reserve `estimated_peak_bytes` as returned. For an unknown peak,
 the built-in estimates reserve the 512 MiB worker baseline plus `lower_bound_bytes`;
 their lower bound covers arrays separately from process memory. External adapter
 v1 estimates retain the previous `max(512 MiB, lower_bound_bytes)` reservation,
-since their bounds may already include process memory. Initial and wave admission
-use the same reservation rule; wave admission also deducts live child RSS.
+since their bounds may already include process memory. Wave admission also deducts
+live child RSS. For a supervised native Weka profile, the worker count uses the
+larger of the materialization peak and the baseline plus the lower bound. The plan
+records this floor as `profile_worker_min_bytes`. A parallel wave reserves it per worker. A single candidate reserves the
+baseline plus the lower bound. If materialization alone exceeds headroom, admission
+reports `candidate exceeds the host memory budget`. The estimate gives the reason.
 
 For synthetic workloads, the built-in native-engine planning model,
 `engine-session-metadata-v2`, charges every turn 4,096 bytes plus 32 bytes per
@@ -174,8 +180,9 @@ equally among the workers in each parallel wave. Each share must fit the initial
 trace materialization estimate and the 512 MiB worker baseline plus the array
 lower bound. The total peak stays unknown because replacement plays retain
 records. The scheduler samples each worker and its descendants during replay.
-If a worker exceeds its share, the scheduler keeps completed results and retries
-unfinished candidates one at a time under the whole-run memory guard. Allocations
+If a worker exceeds its share or the host reports memory pressure, the scheduler
+keeps completed results and retries unfinished candidates one at a time under
+the whole-run memory guard. Allocations
 can outpace sampling. Other continuous trace profiles still run one at a time.
 A streaming parser still holds individual
 scalar strings; large values can exceed headroom before an array bound is
@@ -369,7 +376,7 @@ each request is dispatched. Warmup
 adds 32 KiB of evidence allowance per selected request and per warmup request
 (ten per lane); its prompt buffers do not overlap profile buffers across the
 quiescent preparation barrier. Continuing profiles retain lifecycle evidence
-beyond the finite corpus. The plan reports the initial estimate as
+beyond the finite corpus. The estimate reports the initial peak as
 `materialization_peak_bytes` and leaves the total peak unknown. Each admitted
 parallel wave records its per-worker share as `profile_worker_rss_limit_bytes`.
 
