@@ -68,6 +68,8 @@ def build_profile(
         elif current != source:
             raise ValueError(f"{path.name}: mixed benchmark, commit, or boundary in {results_dir}")
         workload = payload["workload"]
+        if not isinstance(payload["stable"], bool):
+            raise ValueError(f"{path.name}: stable must be a boolean")
         if workload["routing"] != routing:
             summary["skipped_routing"] += 1
             continue

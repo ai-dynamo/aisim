@@ -103,6 +103,22 @@ def test_builds_colocated_profile_and_skips_unqualified_results(tmp_path):
     assert entry["validation"] == {"stable": True, "correctness": None}
 
 
+@pytest.mark.parametrize("stable", ["true", "false", 0, 1, None, [], {}])
+@pytest.mark.parametrize("suffix", ["json", "parquet"])
+def test_malformed_stability_among_valid_results_prevents_publication(tmp_path, stable, suffix):
+    results = tmp_path / "results"
+    _write(results, "a-valid.json", _colocated(48))
+    _write(results, "b-malformed.json", _colocated(96, stable=stable))
+    output = tmp_path / f"profile.{suffix}"
+    original = b"existing profile"
+    output.write_bytes(original)
+
+    with pytest.raises(ValueError, match="b-malformed.json: stable must be a boolean"):
+        main([str(results), "--repository", _REPOSITORY, "--output", str(output)])
+
+    assert output.read_bytes() == original
+
+
 @pytest.mark.parametrize("suffix", ["json", "parquet"])
 def test_builds_split_profile_through_the_command_line(tmp_path, suffix):
     results = tmp_path / "split"

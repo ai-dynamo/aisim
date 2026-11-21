@@ -183,6 +183,25 @@ def test_stage_latency_is_spread_over_layer_microbatch_units(tmp_path):
     assert set(provenance["composition"]) == {"attention_ms", "ffn_ms", "a_to_f_ms", "f_to_a_ms"}
 
 
+@pytest.mark.parametrize("response", ["extra-prefill", "extra-invalid", "prefill", "invalid", "empty", "duplicate"])
+def test_attention_provider_response_must_be_exactly_one_decode_measurement(tmp_path, response):
+    request = _request(_topology())
+    (decode,) = _Attention().measure(request)
+    prefill = replace(decode, phase="prefill")
+    measurements = {
+        "extra-prefill": (decode, prefill),
+        "extra-invalid": (decode, object()),
+        "prefill": (prefill,),
+        "invalid": (object(),),
+        "empty": (),
+        "duplicate": (decode, decode),
+    }[response]
+    attention = SimpleNamespace(measure=lambda _: measurements)
+
+    with pytest.raises(AFDInfeasible, match="must return exactly one decode AFDLayerTimes"):
+        _provider(tmp_path, attention).measure(request)
+
+
 @pytest.mark.parametrize("factor", [0.5, 2.0, 100.0, 1.0000000001])
 def test_non_unit_communication_calibration_fails_before_measurement(tmp_path, factor):
     attention = _Attention()

@@ -20,6 +20,7 @@ _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _AFD_TOPOLOGY = re.compile(r"[1-9][0-9]*A[1-9][0-9]*F\Z")
 _AGG_TOPOLOGY = re.compile(r"ep[1-9][0-9]*\Z")
+_U32_MAX = 2**32 - 1
 _COUNT_FIELDS = {"logical_batch_per_source_rank", "mtp_nextn", "microbatches", "moe_layers", "routed_topk"}
 _KEY_FIELDS = {
     "model_path",
@@ -133,7 +134,9 @@ class FastAFDMoEStageProfile:
     def load(cls, path: str | Path) -> FastAFDMoEStageProfile:
         resolved = Path(path).expanduser().resolve()
         raw = resolved.read_bytes()
-        if resolved.suffix == ".parquet":
+        # A symlink's canonical target may have no suffix. Identify Parquet
+        # from the captured bytes so saved canonical paths remain loadable.
+        if raw.startswith(b"PAR1") or resolved.suffix == ".parquet":
             import pyarrow as pa
             import pyarrow.parquet as pq
 
@@ -267,6 +270,13 @@ def _integer(value: Any, name: str, *, minimum: int = 1) -> int:
     return value
 
 
+def _key_integer(value: Any, name: str, *, minimum: int = 1) -> int:
+    value = _integer(value, name, minimum=minimum)
+    if value > _U32_MAX:
+        raise ValueError(f"{name} must be an integer <= {_U32_MAX}")
+    return value
+
+
 def _number(value: Any, name: str, *, minimum: float, exclusive: bool) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise ValueError(f"{name} must be a finite number")
@@ -290,13 +300,13 @@ def _entry(value: Any, source: FastAFDProfileSource, index: int) -> FastAFDMoESt
         system=_text(fields["system"], f"{label}.key.system"),
         stage=stage,
         topology=topology,
-        logical_batch_per_source_rank=_integer(
+        logical_batch_per_source_rank=_key_integer(
             fields["logical_batch_per_source_rank"], f"{label}.key.logical_batch_per_source_rank"
         ),
-        mtp_nextn=_integer(fields["mtp_nextn"], f"{label}.key.mtp_nextn", minimum=0),
-        microbatches=_integer(fields["microbatches"], f"{label}.key.microbatches"),
-        moe_layers=_integer(fields["moe_layers"], f"{label}.key.moe_layers"),
-        routed_topk=_integer(fields["routed_topk"], f"{label}.key.routed_topk"),
+        mtp_nextn=_key_integer(fields["mtp_nextn"], f"{label}.key.mtp_nextn", minimum=0),
+        microbatches=_key_integer(fields["microbatches"], f"{label}.key.microbatches"),
+        moe_layers=_key_integer(fields["moe_layers"], f"{label}.key.moe_layers"),
+        routed_topk=_key_integer(fields["routed_topk"], f"{label}.key.routed_topk"),
         moe_precision=_text(fields["moe_precision"], f"{label}.key.moe_precision"),
         moe_backend=_text(fields["moe_backend"], f"{label}.key.moe_backend"),
     )

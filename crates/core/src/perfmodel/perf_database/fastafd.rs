@@ -391,7 +391,11 @@ impl FastAfdTable {
             .as_ref()
             .unwrap()
             .profile_path;
-        let mut document: Document = if path.extension().is_some_and(|x| x == "parquet") {
+        // Canonical paths may lose the .parquet suffix when resolving a symlink.
+        // Inspect the same snapshot used for parsing and provenance hashing.
+        let is_parquet =
+            raw.starts_with(b"PAR1") || path.extension().is_some_and(|x| x == "parquet");
+        let mut document: Document = if is_parquet {
             let reader = PerfReader::from_bytes(path, raw.clone())?;
             let key_names = [
                 "model_path",

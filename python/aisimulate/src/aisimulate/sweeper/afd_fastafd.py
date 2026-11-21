@@ -102,10 +102,13 @@ class FastAFDMoEStagePerformanceModel:
 
     def _attention(self, request: AFDMeasurementRequest) -> AFDLayerTimes:
         measurements = tuple(self.attention_model.measure(request))
-        decode = [item for item in measurements if isinstance(item, AFDLayerTimes) and item.phase is AFDPhase.DECODE]
-        if len(decode) != 1:
+        if (
+            len(measurements) != 1
+            or not isinstance(measurements[0], AFDLayerTimes)
+            or measurements[0].phase is not AFDPhase.DECODE
+        ):
             raise _infeasible("the attention provider must return exactly one decode AFDLayerTimes")
-        return decode[0]
+        return measurements[0]
 
     @staticmethod
     def _components(attention: AFDLayerTimes) -> dict[str, float]:

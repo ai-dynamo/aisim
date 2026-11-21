@@ -149,6 +149,48 @@ def test_rejects_other_schemas_and_duplicate_json_fields(tmp_path):
         FastAFDMoEStageProfile.load(path)
 
 
+@pytest.mark.parametrize(
+    "field", ["logical_batch_per_source_rank", "mtp_nextn", "microbatches", "moe_layers", "routed_topk"]
+)
+@pytest.mark.parametrize("value", [2**32 - 1, 2**32])
+@pytest.mark.parametrize("suffix", ["json", "parquet"])
+def test_key_counts_respect_native_u32_bounds(tmp_path, field, value, suffix):
+    payload = _payload()
+    payload["entries"][0]["key"][field] = value
+    if suffix == "json":
+        path = _write(tmp_path, payload)
+    else:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload()))
+        path = tmp_path / "profile.parquet"
+        profile.write_parquet(path)
+        table = pq.read_table(path)
+        index = table.schema.get_field_index(field)
+        table = table.set_column(index, field, pa.array([value], type=pa.int64()))
+        pq.write_table(table, path)
+
+    if value == 2**32:
+        with pytest.raises(ValueError, match=rf"key\.{field}.*4294967295"):
+            FastAFDMoEStageProfile.load(path)
+    else:
+        profile = FastAFDMoEStageProfile.load(path)
+        key = FastAFDMoEStageKey(**payload["entries"][0]["key"])
+        assert profile.require(key).key == key
+
+
+def test_measurement_sample_count_is_not_limited_to_u32(tmp_path):
+    payload = _payload()
+    payload["entries"][0]["measurement"]["sample_count"] = 2**32
+
+    profile = FastAFDMoEStageProfile.load(_write(tmp_path, payload))
+    path = tmp_path / "profile.parquet"
+    profile.write_parquet(path)
+
+    assert FastAFDMoEStageProfile.load(path).entries[0].sample_count == 2**32
+
+
 def test_parquet_entries_and_digest_use_the_same_snapshot(tmp_path, monkeypatch):
     profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload()))
     path = tmp_path / "stage.parquet"
@@ -194,7 +236,8 @@ def test_rejects_non_int64_parquet_counts(tmp_path, column, encoding):
         FastAFDMoEStageProfile.load(path)
 
 
-def test_int64_parquet_counts_load_through_canonical_model(tmp_path):
+@pytest.mark.parametrize("location", ["direct", "symlink", "extensionless"])
+def test_int64_parquet_counts_load_through_canonical_model(tmp_path, location):
     from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     payload = _payload()
@@ -205,6 +248,12 @@ def test_int64_parquet_counts_load_through_canonical_model(tmp_path):
     profile = FastAFDMoEStageProfile.load(_write(tmp_path, payload))
     path = tmp_path / "stage.parquet"
     profile.write_parquet(path)
+    if location != "direct":
+        target = path.with_suffix("")
+        path.rename(target)
+        path.symlink_to(target)
+        if location == "extensionless":
+            path = target
     assert FastAFDMoEStageProfile.load(path).entries == profile.entries
     config = ForwardPassPerfModelConfig(
         model=_entry()["key"]["model_path"],
@@ -228,3 +277,7 @@ def test_int64_parquet_counts_load_through_canonical_model(tmp_path):
     )
     model = RustForwardPassPerfModel.best_available(config)
     assert model.estimate_fastafd_stage(48)["ffn_ms"] == 2.0
+    saved = model.diagnostics()["provenance"]["config"]
+    assert saved["estimator_config"]["fastafd_stage"]["profile_path"] == str(path.resolve())
+    restored = RustForwardPassPerfModel.best_available(saved)
+    assert restored.estimate_fastafd_stage(48) == model.estimate_fastafd_stage(48)
