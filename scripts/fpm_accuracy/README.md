@@ -79,8 +79,10 @@ Daily campaigns load only current configuration snapshots, including all their
 eligible FPM variants and hash-verified measurement evidence. Unrelated archived
 snapshots do not gate the current overview. Explicit history reads still require
 the recorded manifest hashes and validate all historical snapshots; their cache
-is separate from current campaign membership. Optional override files retain
-full-catalog selector validation, including historical bindings.
+is separate from current campaign membership. Optional override selectors are
+validated against current snapshots first, so current-only overrides do not
+require archived files. Selectors absent from the current snapshots still require
+full-catalog validation, including the local files for historical bindings.
 
 Schema v7 FPM pairs retain hash, row-count, base-configuration, and internal
 sidecar/Parquet consistency validation. Selector flags must be booleans, the

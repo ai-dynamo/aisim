@@ -359,13 +359,7 @@ class HfDataset:
             identities = [snapshot.configuration_id for snapshot in snapshots]
             if len(identities) != len(set(identities)):
                 raise DataError("HF catalog contains duplicate configuration/snapshot identities")
-            # Overrides may explicitly bind historical snapshots; validate their
-            # selectors against the full catalog only when overrides are supplied.
-            self._validate_override_selectors(
-                self.configurations(include_history=True)
-                if self._overrides.overrides and not include_history
-                else snapshots
-            )
+            self._validate_override_selectors(snapshots, include_history=include_history)
             self._configuration_cache[include_history] = tuple(
                 sorted(snapshots, key=lambda item: (item.configuration_path, item.snapshot_id))
             )
@@ -525,7 +519,9 @@ class HfDataset:
             raise DataError(f"HF catalog field {key!r} contains duplicate paths")
         return tuple(values)
 
-    def _validate_override_selectors(self, snapshots: Sequence[ConfigurationSnapshot]) -> None:
+    def _validate_override_selectors(
+        self, snapshots: Sequence[ConfigurationSnapshot], *, include_history: bool
+    ) -> None:
         identities = {(item.configuration_path, item.snapshot_id) for item in snapshots}
         paths = {item.configuration_path for item in snapshots}
         for override in self._overrides.overrides:
@@ -534,6 +530,11 @@ class HfDataset:
             else:
                 known = (override.configuration_path, override.snapshot_id) in identities
             if not known:
+                if not include_history:
+                    # Only unmatched selectors need the full catalog. Current-only
+                    # overrides must work when a Hub selection has not fetched history.
+                    self.configurations(include_history=True)
+                    return
                 selector = override.configuration_path
                 if override.snapshot_id is not None:
                     selector = f"{selector}@{override.snapshot_id}"
