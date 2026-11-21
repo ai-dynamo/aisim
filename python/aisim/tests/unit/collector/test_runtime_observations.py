@@ -2359,6 +2359,7 @@ def test_import_refuses_a_dp_rank_that_disagrees_on_the_checkpoint_count(tmp_pat
         if record["kind"] == "scheduler":
             reserved = round(cache["num_blocks"] / cache["kv_cache_max_concurrency"]) + len(mamba)
             cache["kv_cache_max_concurrency"] = cache["num_blocks"] / reserved
+            cache["kv_cache_size_tokens"] = int(cache["kv_cache_max_concurrency"] * 1_048_576)
 
     _mutate(path, edit)
     result = validate_observations(path, launches)["tp2"]
@@ -3344,6 +3345,126 @@ def test_v033_layer_specs_must_hold_tokens_per_state_and_the_mla_role(tmp_path, 
     assert result["diagnostics"] == [f"tp2: {_LAYER_SPEC_EVIDENCE}"]
 
 
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+@pytest.mark.parametrize("dp", [0, 1])
+def test_v033_worker_block_count_must_follow_the_cache_budget(tmp_path, phase, dp):
+    path, launches = observation_fixture(tmp_path, layout="mamba_hybrid")
+
+    def edit(record, ranks):
+        # One more 16,384-byte pool block fits in the budget of these workers.
+        if (record["kind"], record["phase"], record["dp_rank"]) == ("worker", phase, dp) and record["tp_rank"] in ranks:
+            record["cache"]["available_cache_bytes"] += 16_384
+
+    _mutate(path, lambda record: edit(record, (1,)))
+    # The smallest count of the DP rank decides, and TP rank 0 still fits 10 blocks.
+    assert validate_observations(path, launches)["tp2"]["status"] == "complete"
+    _mutate(path, lambda record: edit(record, (0,)))
+    result = validate_observations(path, launches)["tp2"]
+    assert result["diagnostics"] == [
+        f"tp2: {phase} worker block count of DP rank {dp} contradicts the profiled cache budgets: "
+        "10 blocks recorded, 11 fit"
+    ]
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+@pytest.mark.parametrize("dp", [0, 1])
+def test_v033_worker_block_count_follows_the_smallest_budget_of_its_dp_rank(tmp_path, phase, dp):
+    path, launches = observation_fixture(tmp_path, layout="mamba_hybrid")
+
+    def edit(record):
+        # One more 16,384-byte pool block fits in the budget of TP rank 0 only. TP rank 1 still fits 10 blocks.
+        if (record["kind"], record["phase"], record["dp_rank"], record["tp_rank"]) == ("worker", phase, dp, 0):
+            record["cache"]["available_cache_bytes"] += 16_384
+
+    _mutate(path, edit)
+    result = validate_observations(path, launches)["tp2"]
+    assert (result["status"], result["diagnostics"]) == ("complete", [])
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+@pytest.mark.parametrize("dp", [0, 1])
+@pytest.mark.parametrize(
+    "value,expected",
+    [(29_802_496, False), (None, False), (29_014_839.0, False), (True, False), (29_014_839, True)],
+)
+def test_v033_scheduler_size_tokens_must_follow_its_concurrency(tmp_path, phase, dp, value, expected):
+    path, launches = observation_fixture(tmp_path, layout="glm_tp4")
+
+    def edit(record):
+        if (record["kind"], record["phase"], record["dp_rank"]) == ("scheduler", phase, dp):
+            record["cache"]["kv_cache_size_tokens"] = value
+
+    _mutate(path, edit)
+    result = validate_observations(path, launches)["tp2"]
+    if expected:
+        assert (result["status"], result["diagnostics"]) == ("complete", [])
+        return
+    # 29,802,496 is 13,696 usable blocks of 2,176 tokens, which is not vLLM's rule.
+    assert result["diagnostics"] == [
+        f"tp2: {phase} scheduler of DP rank {dp} records kv_cache_size_tokens {value!r}, "
+        "but its kv_cache_max_concurrency and max_model_len give 29014839"
+    ]
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+@pytest.mark.parametrize("dp", [0, 1])
+@pytest.mark.parametrize("value,expected", [(29_251_212, True), (29_251_213, False), ("absent", False)])
+def test_v033_scheduler_size_tokens_truncate_the_capacity_product(tmp_path, phase, dp, value, expected):
+    # Without a checkpoint block, each of the four Mamba groups reserves 2 blocks in align mode, the MLA group
+    # cdiv(1,048,576, 2,176) = 482 and the ring 1: 491 blocks for one request. The concurrency is 13,697 / 491 =
+    # 27.896130..., and the product with 1,048,576 tokens is 29,251,212.774. vLLM keeps the integer part, 29,251,212,
+    # where rounding would give 29,251,213.
+    path, launches = observation_fixture(tmp_path, layout="glm_tp4", checkpoint=(0, None))
+
+    def edit(record):
+        if (record["kind"], record["phase"], record["dp_rank"]) == ("scheduler", phase, dp):
+            if value == "absent":
+                del record["cache"]["kv_cache_size_tokens"]
+            else:
+                record["cache"]["kv_cache_size_tokens"] = value
+
+    _mutate(path, edit)
+    result = validate_observations(path, launches)["tp2"]
+    if expected:
+        assert (result["status"], result["diagnostics"]) == ("complete", [])
+        return
+    recorded = None if value == "absent" else value
+    assert result["diagnostics"] == [
+        f"tp2: {phase} scheduler of DP rank {dp} records kv_cache_size_tokens {recorded!r}, "
+        "but its kv_cache_max_concurrency and max_model_len give 29251212"
+    ]
+
+
+def _legacy_blocks(record):
+    # A real record of vLLM 0.27.0 or 0.28.0 holds both blocks too (observer.observe). These contradict the cache
+    # record and name a backend file that the bundle does not hold, so an evidence check that read them would refuse
+    # the record.
+    record["raw_cache_config"] = {"num_blocks": 0, "groups": [], "tensor_allocations": []}
+    if record["kind"] == "worker":
+        record["attention_groups"] = [
+            {"kv_cache_group_id": 0, "backend_class": "vllm.unaudited.Backend", "layer_names": []}
+        ]
+
+
+@pytest.mark.parametrize("version", ["0.27.0", "0.28.0"])
+@pytest.mark.parametrize("blocks", [False, True])
+def test_legacy_records_get_no_new_evidence_check(tmp_path, version, blocks):
+    path, launches = observation_fixture(tmp_path, version=version)
+    if blocks:
+        _mutate(path, _legacy_blocks)
+    records = []
+    _mutate(path, records.append)
+    worker = next(record for record in records if record["kind"] == "worker")["cache"]
+    # The record breaks the vLLM 0.33.0 relations: its budget fits two more 128-byte blocks, and it holds no capacity
+    # tokens.
+    assert worker["available_cache_bytes"] // 128 == worker["num_blocks"] + 2
+    assert all("kv_cache_size_tokens" not in record["cache"] for record in records)
+    assert all(("raw_cache_config" in record) == blocks for record in records)
+    result = validate_observations(path, launches)["tp2"]
+    assert (result["status"], result["diagnostics"]) == ("complete", [])
+    assert "prefix_caching" not in result["provenance"]
+
+
 @pytest.mark.parametrize(
     "unit,prefix_caching,diagnostic",
     [
@@ -3872,6 +3993,7 @@ def _make_layer_strided(record):
             "class": "vllm.v1.worker.gpu_model_runner.GPUModelRunner",
             "kernel_block_sizes": [16] * len(cache["groups"]),
         }
+        cache["available_cache_bytes"] = cache["allocated_cache_bytes"] + 100
     else:
         sizes = {"block_size": 16, "hash_block_size": 16}
         cache.update(
@@ -3881,6 +4003,7 @@ def _make_layer_strided(record):
             mamba_cache_mode="none",
             # For one request at 4,096 tokens, vLLM counts 256 blocks of each of the two 16-token groups.
             kv_cache_max_concurrency=cache["num_blocks"] / 512,
+            kv_cache_size_tokens=int(cache["num_blocks"] / 512 * 4096),
             **sizes,
         )
         evidence.update(sizes)

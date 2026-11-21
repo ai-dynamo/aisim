@@ -614,7 +614,7 @@ def _fake_campaign(
     config.model_config.max_model_len = context
     storage = _Storage(1024, blocks * page * (2 if packed else 1))
     # The profiled allowance of the live GLM record.
-    available = 185_140_872_090 if layout == "glm_tp4" else storage.size + page
+    available = 185_140_872_090 if layout == "glm_tp4" else storage.size + page - 1
 
     class Tensor:
         def __init__(self, offset=0):

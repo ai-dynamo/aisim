@@ -177,6 +177,7 @@ def _campaign(
                         # A vLLM 0.33.0 scheduler divides its pool blocks by the blocks of one request
                         # (kv_cache_utils.py:1076-1087), so its concurrency grows with the pool.
                         cache["kv_cache_max_concurrency"] *= capacity_multiplier
+                        cache["kv_cache_size_tokens"] = int(cache["kv_cache_max_concurrency"] * context_length)
                 if block_tokens != (16, 16):
                     # The fixture gives both cache groups 16-token blocks, one kernel block per pool block.
                     for group, tokens in zip(cache["groups"], block_tokens, strict=True):
@@ -3259,6 +3260,9 @@ def _shrink_formal_record(record, num=9, den=10):
     else:
         cache["initial_free_blocks"] = cache["num_blocks"] - cache["reserved_blocks"]
         cache["kv_cache_max_concurrency"] = cache["kv_cache_max_concurrency"] * num / den
+        cache["kv_cache_size_tokens"] = int(
+            cache["kv_cache_max_concurrency"] * record["resolved_config"]["model_config"]["max_model_len"]
+        )
 
 
 def _old_session_revision(tmp_path, capsys, monkeypatch):
