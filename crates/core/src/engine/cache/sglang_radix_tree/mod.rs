@@ -4,8 +4,9 @@
 // Derived from sgl-project/sglang at f0fda25fc95c357368b714f90a13a69c1b67f50a.
 // See README.md for original paths, license, and documented modifications.
 
-//! Reusable Rust radix-tree core for SGLang's KV cache, with an optional
-//! Tensor/PyO3 production backend.
+//! Native-only Rust radix-tree core for SGLang's KV cache.
+//! The bundle omits Tensor implementations and Torch/PyO3 modules; enabling
+//! AISimulate's Python feature does not provide those backends.
 // TODO(Jialin): Replace recoverable panics with explicit Rust errors and map
 // them to PyErr at the Python boundary.
 #![allow(
@@ -37,9 +38,10 @@ pub use node::{
 pub use unified_tree_core::{
     BackupKV, BufferBackupSnapshot, BufferBackupState, CacheAction, CacheInitParams,
     CacheTransferPhase, DecLockRefParams, DecLockRefResult, EvictLayer, EvictionStepResult,
-    FullDeviceEvictionCandidate, IncLockRefResult, InsertParams, InsertResult, InsertStepResult,
-    KvCacheEvent, KvCanaryWalkResult, MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName,
-    PoolTransfer, PoolTransferResult, Req, StorageBackupSpec, StorageMedium, UnifiedTreeCore,
+    FullDeviceEvictionCandidate, FullInsertContinuation, IncLockRefResult, InsertParams,
+    InsertResult, InsertStepResult, KvCacheEvent, KvCanaryWalkResult, MatchPrefixParams,
+    MatchResult, PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, Req, StorageBackupSpec,
+    StorageMedium, UnifiedTreeCore,
 };
 pub use value::{PageValue, RadixValue};
 

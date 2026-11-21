@@ -47,7 +47,8 @@ The mechanical modifications are:
 After those adaptations, `scripts/sglang_radix_core_fixes.patch` applies the
 following local corrections to this pinned revision:
 
-- Recheck popped Full eviction priorities and preserve skipped Full host and
+- Rebuild Full eviction candidates after accesses, including buried MRU
+  priority improvements, and recheck popped priorities. Preserve skipped Full host and
   SWA early-release lock receipts. Revalidate saved Mamba/SWA device cursors
   against newly acquired component locks before taking values.
 - Reject zero Mamba chunk sizes, copy donated Mamba slots for adoption, and
@@ -61,6 +62,15 @@ following local corrections to this pinned revision:
   Compute that depth during the existing recency walk, without another walk
   or path allocation. Skip paged SWA load-back for ring boundaries without
   cached SWA rows.
+- Reject Full load-back plans whose per-node row counts changed after a split,
+  or whose row totals do not match the device allocation, before any adoption.
+  Publish CPU store events only for the matching write-through acknowledgement.
+- Keep borrowed namespace fields private so their cached hash stays consistent.
+- Bind a Full-only device lease to its validated prefix once; append only new
+  suffix atoms and extend its existing pin over the canonical suffix. Splits
+  preserve endpoint bindings; reset invalidates them. General and HiCache
+  insert APIs continue validating complete keys on each call.
+- Describe the bundled module as native-only.
 - Borrow child edge keys during removal and copy visible page slices directly
   into compact shared storage during adoption.
 
@@ -68,8 +78,10 @@ These are local deviations from upstream, covered by the AISimulate-authored
 `../sglang_radix_regressions.rs` and adapter tests. The pinned eviction policies,
 including split recency and whole-leaf LRU eviction, remain in use. Upstream's
 native assertions are unchanged. Adoption removes an intermediate allocation;
-removal avoids a key allocation. Continuation validation compares the retained
-key atoms without allocating a path or adding another ancestor walk.
+removal avoids a key allocation. General continuation validation compares retained key atoms without a path
+allocation. The bound Full-only append API validates those atoms once, then
+processes only new suffixes; it retains neither the query buffer nor extra
+per-node path metadata.
 
 ## Updating
 

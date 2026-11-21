@@ -212,3 +212,53 @@ fn radix_growth_measurement() {
     }
     println!("{output}");
 }
+
+#[test]
+#[ignore = "explicit optimized cache-management measurement"]
+fn radix_append_scaling_measurement() {
+    let mut observations = Vec::new();
+    for growth_pages in [2, 128, 1024] {
+        for overlap in [false, true] {
+            let repetitions = 20;
+            let mut elapsed_ns = 0u64;
+            for run in 0..repetitions {
+                let mut mgr = SglangKvManager::new(65536, 32, KvEventPublishers::default(), 0);
+                let mut tokens: Vec<u32> = (0..64).map(|n| n + run * 65536).collect();
+                let mut alloc = mgr.allocate_for_request(&tokens).unwrap();
+                alloc.lease.reserve_page_hashes(2 + growth_pages);
+                mgr.extend_cached_prefix(&tokens, &mut alloc.lease);
+                for page in 0..growth_pages {
+                    let start = tokens.len() as u32 + run * 65536;
+                    tokens.extend(start..start + 32);
+                    mgr.extend_allocation(&tokens, &mut alloc.lease).unwrap();
+                    let canonical = if overlap && page == growth_pages / 2 {
+                        let other = mgr.allocate_for_request(&tokens).unwrap();
+                        let pages = other.lease.pages().to_vec();
+                        mgr.finish(&tokens, other.lease);
+                        Some(pages)
+                    } else {
+                        None
+                    };
+                    let started = std::time::Instant::now();
+                    mgr.extend_cached_prefix(&tokens, &mut alloc.lease);
+                    elapsed_ns += started.elapsed().as_nanos() as u64;
+                    if let Some(pages) = canonical {
+                        assert_eq!(alloc.lease.pages(), pages);
+                    }
+                }
+                assert_eq!(alloc.lease.cached_tokens(), tokens.len());
+                mgr.finish(&tokens, alloc.lease);
+                assert_eq!(mgr.cache().prefix_match_len(&tokens), tokens.len());
+                mgr.evict(65536);
+                assert_eq!(mgr.cache().available_tokens(), 65536);
+            }
+            observations.push(json!({"prompt_tokens": 64, "growth_pages": growth_pages,
+                "page_size": 32, "overlap": overlap, "repetitions": repetitions, "elapsed_ns": elapsed_ns}));
+        }
+    }
+    let output = serde_json::to_string_pretty(&observations).unwrap() + "\n";
+    if let Ok(path) = std::env::var("AISIM_EVICTION_EVIDENCE_OUTPUT") {
+        std::fs::write(path, &output).unwrap();
+    }
+    println!("{output}");
+}

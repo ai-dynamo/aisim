@@ -146,6 +146,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for FullComponent {
 
     fn evict_device_start(&self, tree_core: &mut UnifiedTreeCore<K, V>, request_cnt: usize) {
         tree_core.set_evict_device_start(FULL, request_cnt);
+        tree_core.full_evict_device_heap_dirty = false;
         tree_core.full_evict_device_heap.clear();
         let arena = &tree_core.arena;
         let strategy = &tree_core.eviction_strategy;
@@ -169,6 +170,23 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for FullComponent {
             tree_core.component_state(FULL).is_evict_device_ongoing,
             "Full device eviction not started"
         );
+        if tree_core.full_evict_device_heap_dirty {
+            // Refresh buried improvements as well as stale keys at the top.
+            tree_core.full_evict_device_heap = tree_core
+                .evictable_device_leaves
+                .iter()
+                .map(|id| {
+                    Reverse((
+                        tree_core
+                            .eviction_strategy
+                            .get_priority(tree_core.arena.node(id)),
+                        id,
+                    ))
+                })
+                .collect();
+            tree_core.full_evict_device_heap_dirty = false;
+            tree_core.component_state_mut(FULL).evict_device_cursor = None;
+        }
         // Re-admit the previously returned leaf's parent once it became a
         // D-leaf; the parent id was captured at return time because the leaf
         // itself may have been freed by the eviction in between.
@@ -426,14 +444,17 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for FullComponent {
                 // so once we hit a device-on node, everything above is also device-on.
                 let mut backed_up: Vec<V> = Vec::new();
                 let mut nodes_to_load: Vec<NodeId> = Vec::new();
+                let mut node_row_counts = Vec::new();
                 let mut cur = tree_core.arena.node(node_id);
                 while cur.evicted() {
                     backed_up.push(cur.host_value(FULL).shallow_clone());
                     nodes_to_load.push(cur.id);
+                    node_row_counts.push(cur.host_value_len(FULL));
                     cur = tree_core.arena.node(cur.parent());
                 }
                 backed_up.reverse();
                 nodes_to_load.reverse();
+                node_row_counts.reverse();
                 let host_indices = if backed_up.is_empty() {
                     V::empty()
                 } else {
@@ -443,6 +464,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for FullComponent {
                     name: PoolName::Kv,
                     host_indices: Some(host_indices),
                     nodes_to_load: Some(nodes_to_load),
+                    node_row_counts: Some(node_row_counts),
                     ..Default::default()
                 }])
             }

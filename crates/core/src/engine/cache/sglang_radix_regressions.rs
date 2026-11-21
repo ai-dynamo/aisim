@@ -624,3 +624,246 @@ fn deferred_demote_rechecks_leaf_eligibility_after_an_insert() {
         tree.try_sanity_check(&[], &[]).unwrap();
     }
 }
+
+#[test]
+fn mru_walk_refreshes_buried_improvements_before_selecting() {
+    for touch_a in [false, true] {
+        let mut tree = Core::new(
+            CacheInitParams {
+                eviction_policy: "mru".into(),
+                ..Default::default()
+            },
+            vec![FULL],
+        );
+        let a = insert(&mut tree, vec![10, 20], &[1, 2]);
+        let b = insert(&mut tree, vec![30, 40], &[3, 4]);
+        tree.evict_device_start(FULL, 1);
+        if touch_a {
+            tree.match_prefix(&MatchPrefixParams {
+                key: &vec![10, 20],
+                namespace: Default::default(),
+            });
+        }
+        let (victim, _) = tree.evict_device_next_node(FULL, &HashMap::new());
+        assert_eq!(victim, Some(if touch_a { a } else { b }));
+        tree.evict_device_end(FULL);
+        tree.try_sanity_check(&[], &[]).unwrap();
+    }
+}
+
+#[test]
+fn namespaces_round_trip_without_changing_child_lookup_hashes() {
+    use std::hash::{Hash, Hasher};
+    for extra_key in [None, Some("tenant"), Some("")] {
+        for cache_salt in [None, Some("salt"), Some("")] {
+            let namespace = KeyNamespaceRef::new(extra_key, cache_salt);
+            assert_eq!(namespace.extra_key(), extra_key);
+            assert_eq!(namespace.cache_salt(), cache_salt.filter(|s| !s.is_empty()));
+            let owned = namespace.to_owned();
+            let borrowed = owned.as_ref();
+            assert_eq!(namespace, borrowed);
+            let hash = |value: KeyNamespaceRef<'_>| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                value.hash(&mut h);
+                h.finish()
+            };
+            assert_eq!(hash(namespace), hash(borrowed));
+            let mut tree = Core::new(CacheInitParams::default(), vec![FULL]);
+            let key = vec![10, 20];
+            let mut p = params(&key, &[1, 2]);
+            p.namespace = namespace;
+            tree.insert(&p);
+            assert_eq!(
+                tree.match_prefix(&MatchPrefixParams {
+                    key: &key,
+                    namespace: borrowed
+                })
+                .device_indices
+                .as_slice(),
+                &[1, 2]
+            );
+        }
+    }
+}
+
+#[test]
+fn write_through_publishes_only_the_matching_ack_once() {
+    let mut tree = Core::new(
+        CacheInitParams {
+            enable_hicache: true,
+            enable_kv_cache_events: true,
+            ..Default::default()
+        },
+        vec![FULL],
+    );
+    let leaf = insert(&mut tree, vec![10, 20], &[1, 2]);
+    tree.take_events();
+    tree.commit_backup(leaf, PageValue::from_vec(vec![101, 102]), HashMap::new())
+        .unwrap();
+    let nodes = tree.mark_write_through_pending(vec![leaf], 7).unwrap();
+    tree.finish_write_through(nodes.clone(), 6).unwrap();
+    assert!(tree.take_events().is_empty());
+    let idx = tree.arena.resolve(leaf).unwrap();
+    assert_eq!(tree.arena.node(idx).write_through_pending_id, Some(7));
+    tree.finish_write_through(nodes.clone(), 7).unwrap();
+    let events = tree.take_events();
+    assert_eq!(events.len(), 1);
+    assert!(
+        matches!(&events[0], KvCacheEvent::BlockStored { medium: StorageMedium::Cpu, block_hashes, .. } if block_hashes.len() == 2)
+    );
+    tree.finish_write_through(nodes, 7).unwrap();
+    assert!(tree.take_events().is_empty());
+    tree.try_sanity_check(&[], &[]).unwrap();
+}
+
+#[test]
+fn load_back_rejects_a_split_plan_before_adopting_any_rows() {
+    let mut tree = Core::new(
+        CacheInitParams {
+            enable_hicache: true,
+            is_write_back: true,
+            ..Default::default()
+        },
+        vec![FULL],
+    );
+    let leaf = insert(&mut tree, vec![10, 20], &[1, 2]);
+    complete_backup(&mut tree, leaf);
+    tree.demote(leaf).unwrap();
+    let lock = tree.inc_lock_ref(leaf, Default::default()).unwrap();
+    let (plan, aux) = tree.build_load_back_spec(leaf, None).unwrap();
+    assert_eq!(plan.node_row_counts.as_deref(), Some(&[2][..]));
+    let prefix = tree
+        .match_prefix(&MatchPrefixParams {
+            key: &vec![10],
+            namespace: Default::default(),
+        })
+        .best_match_node_id;
+    assert!(matches!(
+        tree.commit_load_back(leaf, PageValue::from_vec(vec![3, 4]), plan, aux),
+        Err(TreeCoreRuntimeError::InvalidLoadBackSpec { .. })
+    ));
+    for id in [prefix, leaf] {
+        let node = tree.arena.node(tree.arena.resolve(id).unwrap());
+        assert!(!node.has_device_value(FULL));
+        assert_eq!(node.load_back_pending_id, None);
+    }
+    // Rebuild after the split: all transferred rows must reach the right fragment.
+    let (plan, aux) = tree.build_load_back_spec(leaf, None).unwrap();
+    tree.commit_load_back(leaf, PageValue::from_vec(vec![3, 4]), plan, aux)
+        .unwrap();
+    tree.finish_load_back(leaf).unwrap();
+    assert_eq!(
+        tree.arena
+            .node(tree.arena.resolve(prefix).unwrap())
+            .device_value(FULL)
+            .as_slice(),
+        &[3]
+    );
+    assert_eq!(
+        tree.arena
+            .node(tree.arena.resolve(leaf).unwrap())
+            .device_value(FULL)
+            .as_slice(),
+        &[4]
+    );
+    tree.dec_lock_ref(leaf, &lock.to_dec_params(), false)
+        .unwrap();
+    tree.try_sanity_check(&[], &[]).unwrap();
+}
+
+#[test]
+fn load_back_rejects_incomplete_and_excess_device_allocations() {
+    for rows in [1, 3] {
+        let mut tree = Core::new(
+            CacheInitParams {
+                enable_hicache: true,
+                ..Default::default()
+            },
+            vec![FULL],
+        );
+        let leaf = insert(&mut tree, vec![10, 20], &[1, 2]);
+        complete_backup(&mut tree, leaf);
+        tree.demote(leaf).unwrap();
+        let (plan, aux) = tree.build_load_back_spec(leaf, None).unwrap();
+        assert!(
+            tree.commit_load_back(leaf, PageValue::from_vec(vec![3; rows]), plan, aux)
+                .is_err()
+        );
+        assert!(tree.is_full_device_evicted(leaf).unwrap());
+        tree.try_sanity_check(&[], &[]).unwrap();
+    }
+}
+
+#[test]
+fn bound_full_continuation_preserves_splits_overlap_and_pin_ownership() {
+    let mut tree = Core::new(CacheInitParams::default(), vec![FULL]);
+    let key = vec![10, 20];
+    let anchor = insert(&mut tree, key.clone(), &[1, 2]);
+    let lock = tree.inc_lock_ref(anchor, Default::default()).unwrap();
+    assert!(
+        tree.bind_full_insert_continuation(anchor, &vec![99, 20], 2)
+            .is_err()
+    );
+    let mut binding = tree.bind_full_insert_continuation(anchor, &key, 2).unwrap();
+    // Another request splits the retained node and installs a canonical suffix.
+    tree.match_prefix(&MatchPrefixParams {
+        key: &vec![10],
+        namespace: Default::default(),
+    });
+    insert(&mut tree, vec![10, 20, 30], &[1, 2, 3]);
+    let result = tree
+        .append_full_insert_continuation(
+            &mut binding,
+            &vec![30, 40],
+            PageValue::from_vec(vec![99, 4]),
+        )
+        .unwrap();
+    assert_eq!(binding.prefix_len(), 4);
+    assert_eq!(
+        tree.collect_full_device_indices(binding.node_id(), tree.root_node_handle(None))
+            .unwrap()
+            .as_slice(),
+        &[1, 2, 3, 4]
+    );
+    assert!(result.cache_actions.iter().any(|action| matches!(action, CacheAction::FreeDeviceKV(values) if values.iter().any(|v| v.as_slice() == [99]))));
+    // The transferred pin must release precisely once across both old fragments
+    // and the reconciled suffix. No lock handoff or root-path reacquire is needed.
+    tree.dec_lock_ref(
+        binding.node_id(),
+        &DecLockRefParams {
+            node_id: Some(binding.node_id()),
+            ..lock.to_dec_params()
+        },
+        false,
+    )
+    .unwrap();
+    tree.try_sanity_check(&[], &[]).unwrap();
+    let node = tree
+        .arena
+        .node(tree.arena.resolve(binding.node_id()).unwrap());
+    assert_eq!(node.device_lock_ref(FULL), 0);
+    assert!(
+        tree.append_full_insert_continuation(&mut binding, &vec![50], PageValue::from_vec(vec![5]))
+            .is_err()
+    );
+}
+
+#[test]
+fn bound_full_continuation_rejects_reset_and_other_trees() {
+    let mut tree = Core::new(CacheInitParams::default(), vec![FULL]);
+    let key = vec![10];
+    let anchor = insert(&mut tree, key.clone(), &[1]);
+    tree.inc_lock_ref(anchor, Default::default()).unwrap();
+    let mut binding = tree.bind_full_insert_continuation(anchor, &key, 1).unwrap();
+    let mut unrelated = Core::new(CacheInitParams::default(), vec![FULL]);
+    assert!(
+        unrelated
+            .append_full_insert_continuation(&mut binding, &vec![20], PageValue::from_vec(vec![2]))
+            .is_err()
+    );
+    tree.reset();
+    assert!(
+        tree.append_full_insert_continuation(&mut binding, &vec![20], PageValue::from_vec(vec![2]))
+            .is_err()
+    );
+}

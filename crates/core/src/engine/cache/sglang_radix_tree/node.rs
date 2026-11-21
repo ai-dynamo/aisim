@@ -42,8 +42,8 @@ pub struct KeyNamespace(Option<Arc<KeyNamespaceData>>);
 /// Borrowed namespace used by match/insert lookups without allocating.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KeyNamespaceRef<'a> {
-    pub extra_key: Option<&'a str>,
-    pub cache_salt: Option<&'a str>,
+    extra_key: Option<&'a str>,
+    cache_salt: Option<&'a str>,
     hash: u64,
 }
 
@@ -65,6 +65,14 @@ impl<'a> KeyNamespaceRef<'a> {
             cache_salt,
             hash: key_namespace_hash(extra_key, cache_salt),
         }
+    }
+
+    pub fn extra_key(self) -> Option<&'a str> {
+        self.extra_key
+    }
+
+    pub fn cache_salt(self) -> Option<&'a str> {
+        self.cache_salt
     }
 
     pub fn to_owned(self) -> KeyNamespace {
@@ -742,6 +750,11 @@ pub struct NodeAccessError {
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, thiserror::Error)]
 pub enum TreeCoreRuntimeError {
+    #[error("invalid or unsupported Full insert continuation")]
+    InvalidFullContinuation,
+    /// Full load-back no longer describes the planned host-to-device mapping.
+    #[error("stale or malformed Full load-back spec for node {node_id}")]
+    InvalidLoadBackSpec { node_id: NodeId },
     /// A public NodeId no longer names a live arena node.
     #[error(transparent)]
     NodeAccess(#[from] NodeAccessError),

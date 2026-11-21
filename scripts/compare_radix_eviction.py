@@ -25,6 +25,7 @@ BASELINE = "8288046ac88fccaee124714cd60e62b2ad4e184d"
 PROBE = Path("crates/core/src/engine/cache/eviction_evidence.rs")
 SCENARIOS = PROBE.with_name("eviction-selection-scenarios.json")
 COMPARISON = SCENARIOS.with_name("eviction-selection-comparison.json")
+LIFECYCLE_RECORD = SCENARIOS.with_name("radix-lifecycle-comparison.json")
 TEST = "eviction_selection_matches_recorded_evidence"
 MODULE = '\n#[cfg(test)]\n#[path = "eviction_evidence.rs"]\nmod eviction_evidence;\n'
 
@@ -55,7 +56,7 @@ def main() -> None:
     # Refuse reuse: artifacts must belong to exactly the recorded revisions.
     work.mkdir(parents=True, exist_ok=False)
     # Hash and install the same captured bytes even if sources change mid-build.
-    overlay_paths = (probe,) if lifecycle else (probe, SCENARIOS, COMPARISON)
+    overlay_paths = (probe, LIFECYCLE_RECORD) if lifecycle else (probe, SCENARIOS, COMPARISON)
     overlays = {relative: (ROOT / relative).read_bytes() for relative in overlay_paths}
     report = {
         "schema_version": 1,
@@ -65,6 +66,8 @@ def main() -> None:
         "profile": "test",
         "features": [],
     }
+    if lifecycle:
+        report["record_sha256"] = hashlib.sha256(overlays[LIFECYCLE_RECORD]).hexdigest()
     if not lifecycle:
         report["scenarios_sha256"] = hashlib.sha256(overlays[SCENARIOS]).hexdigest()
     for side in ("baseline", "candidate"):
@@ -123,7 +126,26 @@ def main() -> None:
         (work / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
         if result.returncode:
             raise SystemExit(f"{side} failed: inspect {work / (side + '.log')}")
-        print(f"{side} {revision}: recorded eviction outputs match", flush=True)
+        if lifecycle:
+            expected = json.loads(overlays[LIFECYCLE_RECORD])[side]["scenarios"]
+            observed_scenarios = report[side]["scenarios"] or []
+            observed_by_name = {item["scenario"]: item for item in observed_scenarios}
+            matches = (
+                bool(expected)
+                and len(observed_by_name) == len(observed_scenarios)
+                and all(observed_by_name.get(item["scenario"]) == item for item in expected)
+            )
+            report[side]["recorded_scenarios_match"] = matches
+            (work / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
+            if not matches:
+                raise SystemExit(f"{side} lifecycle observations differ from the committed record: {observed}")
+            print(
+                f"{side} {revision}: {len(expected)} recorded lifecycle scenarios match "
+                f"({len(observed_scenarios)} observed)",
+                flush=True,
+            )
+        else:
+            print(f"{side} {revision}: recorded eviction outputs match", flush=True)
 
 
 if __name__ == "__main__":

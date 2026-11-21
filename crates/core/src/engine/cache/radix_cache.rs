@@ -181,6 +181,8 @@ pub(crate) struct InsertPageResult {
     pub(crate) unretained_pages: Vec<KvPageId>,
 }
 
+pub(crate) use super::sglang_radix_tree::FullInsertContinuation;
+
 /// Shared immutable keys keep admission checkpoints proportional to node metadata.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PageKey {
@@ -824,6 +826,53 @@ impl RadixCache {
         self.refresh_candidate(prefix_node);
         self.refresh_candidate(last_node);
 
+        InsertPageResult {
+            last_node,
+            canonical_suffix,
+            unretained_pages: collect_unretained_pages(result.cache_actions),
+        }
+    }
+
+    pub(crate) fn bind_insert_continuation(
+        &self,
+        node: NodeId,
+        prefix_tokens: usize,
+        key: &PageKey,
+    ) -> FullInsertContinuation {
+        self.tree
+            .bind_full_insert_continuation(node, key, prefix_tokens / self.page_size)
+            .expect("lease key must match its retained radix anchor")
+    }
+
+    /// The lease owns the validated prefix; only new suffix identities cross
+    /// this boundary. The core preserves its existing pin through reconciliation.
+    pub(crate) fn append_insert_continuation(
+        &mut self,
+        continuation: &mut FullInsertContinuation,
+        suffix: &[LocalBlockHash],
+        pages: &[KvPageId],
+    ) -> InsertPageResult {
+        let old_node = continuation.node_id();
+        self.record_belady_pages(old_node, suffix, pages);
+        let key: PageKey = suffix.to_vec().into();
+        let result = self
+            .tree
+            .append_full_insert_continuation(
+                continuation,
+                &key,
+                CacheValue::from_vec(pages.to_vec()),
+            )
+            .expect("valid append-only lease continuation");
+        let last_node = continuation.node_id();
+        let canonical_suffix = self
+            .tree
+            .collect_full_device_indices(last_node, old_node)
+            .expect("live continuation suffix")
+            .as_slice()
+            .to_vec();
+        assert_eq!(canonical_suffix.len(), suffix.len());
+        self.refresh_candidate(old_node);
+        self.refresh_candidate(last_node);
         InsertPageResult {
             last_node,
             canonical_suffix,

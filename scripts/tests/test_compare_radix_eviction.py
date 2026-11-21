@@ -20,7 +20,7 @@ SPEC.loader.exec_module(compare)
 
 
 class CompareRadixTests(unittest.TestCase):
-    def check_frozen_overlays(self, mode):
+    def check_frozen_overlays(self, mode, *, corrupt_record=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             checkout = root / "checkout"
@@ -31,6 +31,12 @@ class CompareRadixTests(unittest.TestCase):
                 Path("crates/core/src/engine/kv_manager/radix_lifecycle_evidence.rs") if lifecycle else compare.PROBE
             )
             overlays = {probe: b"// original probe\n"}
+            observations = [{"scenario": "example", "removed_block_hashes": [101]}] if lifecycle else []
+            if lifecycle:
+                recorded = [{"scenario": "example", "removed_block_hashes": [999]}] if corrupt_record else observations
+                overlays[compare.LIFECYCLE_RECORD] = json.dumps(
+                    {side: {"scenarios": recorded} for side in ("baseline", "candidate")}
+                ).encode()
             if not lifecycle:
                 overlays.update({compare.SCENARIOS: b"[]\n", compare.COMPARISON: b"{}\n"})
             module = probe.with_name("sglang_backend.rs" if lifecycle else "radix_cache.rs")
@@ -76,7 +82,7 @@ class CompareRadixTests(unittest.TestCase):
                     self.assertEqual((kwargs["cwd"] / relative).read_bytes(), contents, f"{side}: {relative}")
                     # A deterministic edit during each simulated Cargo build.
                     (checkout / relative).write_bytes(f"edited during {side}\n".encode())
-                Path(kwargs["env"]["AISIM_EVICTION_EVIDENCE_OUTPUT"]).write_text("[]\n")
+                Path(kwargs["env"]["AISIM_EVICTION_EVIDENCE_OUTPUT"]).write_text(json.dumps(observations))
                 return subprocess.CompletedProcess(command, 0)
 
             argv = [
@@ -95,6 +101,13 @@ class CompareRadixTests(unittest.TestCase):
                 patch("sys.argv", argv),
                 patch.object(compare.subprocess, "run", side_effect=run_with_source_edits),
             ):
+                if corrupt_record:
+                    with self.assertRaisesRegex(SystemExit, "lifecycle observations differ"):
+                        compare.main()
+                    report = json.loads((work / "comparison.json").read_text())
+                    self.assertFalse(report["baseline"]["recorded_scenarios_match"])
+                    self.assertEqual(builds, ["baseline"])
+                    return
                 compare.main()
 
             self.assertEqual(builds, ["baseline", "candidate"])
@@ -109,6 +122,9 @@ class CompareRadixTests(unittest.TestCase):
 
     def test_selection_overlays_stay_frozen_during_builds(self):
         self.check_frozen_overlays("selection")
+
+    def test_lifecycle_rejects_a_changed_recorded_removal_hash(self):
+        self.check_frozen_overlays("lifecycle", corrupt_record=True)
 
     def test_lifecycle_overlay_stays_frozen_during_builds(self):
         self.check_frozen_overlays("lifecycle")

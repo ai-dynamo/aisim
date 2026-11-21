@@ -362,6 +362,8 @@ pub struct PoolTransfer<V: RadixValue> {
     pub hit_policy: PoolHitPolicy,
     /// The nodes a load-back restores, ancestors first (external handles).
     pub nodes_to_load: Option<Vec<NodeId>>,
+    /// Full host-row counts at planning time, in `nodes_to_load` order.
+    pub node_row_counts: Option<Vec<usize>>,
 }
 
 impl<V: RadixValue> Default for PoolTransfer<V> {
@@ -373,6 +375,7 @@ impl<V: RadixValue> Default for PoolTransfer<V> {
             keys: None,
             hit_policy: PoolHitPolicy::default(),
             nodes_to_load: None,
+            node_row_counts: None,
         }
     }
 }
@@ -630,11 +633,32 @@ impl<V: RadixValue> Default for EvictionStepResult<V> {
     }
 }
 
+/// Binding established by validating a retained key once. Appends accept only
+/// new suffix atoms, so callers cannot substitute an unrelated retained prefix.
+/// Splits preserve the original handle's logical endpoint. Reset invalidates it;
+/// snapshots share the lineage so admission rollback preserves existing bindings.
+#[derive(Clone, Debug)]
+pub struct FullInsertContinuation {
+    lineage: Arc<()>,
+    node_id: NodeId,
+    prefix_len: usize,
+}
+
+impl FullInsertContinuation {
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+    pub fn prefix_len(&self) -> usize {
+        self.prefix_len
+    }
+}
+
 /// The radix tree mechanism: owns the tree structure, per-node values, the
 /// per-component LRUs, the size/leaf bookkeeping, and the component drivers,
 /// plus `reset()`.
 pub struct UnifiedTreeCore<K: ChildKeyType, V: RadixValue> {
     pub(crate) arena: NodeArena<K, V>,
+    continuation_lineage: Arc<()>,
     /// Ordered component registry; each driver reports its own type.
     components: Vec<Arc<dyn TreeComponent<K, V> + Send + Sync>>,
     /// Prebuilt per-type driver lookup, indexed by `ComponentType::idx`.
@@ -654,6 +678,8 @@ pub struct UnifiedTreeCore<K: ChildKeyType, V: RadixValue> {
     pub(crate) lru_lists: [UnifiedLRUList; NUM_VALUE_SLOTS],
     /// Device-eviction candidates; the lowest priority is popped first.
     pub(crate) full_evict_device_heap: BinaryHeap<Reverse<(PriorityKey, NodeIdx_)>>,
+    /// Access can improve a buried MRU key; a popped-key check is insufficient.
+    pub(crate) full_evict_device_heap_dirty: bool,
     /// Eviction-priority strategy; lower priority evicts first.
     pub(crate) eviction_strategy: Arc<dyn EvictionStrategy<K, V> + Send + Sync>,
     /// Keep path depths and branch high-water marks only for T-LRU.
@@ -717,6 +743,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         );
         Self {
             arena: self.arena.clone(),
+            continuation_lineage: Arc::clone(&self.continuation_lineage),
             components: self.components.clone(),
             components_by_type: self.components_by_type.clone(),
             component_states: self.component_states.clone(),
@@ -727,6 +754,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             tracked_unbacked_tokens: None,
             lru_lists: self.lru_lists.clone(),
             full_evict_device_heap: self.full_evict_device_heap.clone(),
+            full_evict_device_heap_dirty: self.full_evict_device_heap_dirty,
             eviction_strategy: Arc::clone(&self.eviction_strategy),
             tlru_bookkeeping: self.tlru_bookkeeping,
             page_size: self.page_size,
@@ -1001,7 +1029,9 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             tracked_unbacked_tokens: None,
             // Disabled components keep harmless empty lists, like component_states.
             lru_lists: Self::new_lru_lists(),
+            continuation_lineage: Arc::new(()),
             full_evict_device_heap: BinaryHeap::new(),
+            full_evict_device_heap_dirty: false,
             eviction_strategy: get_eviction_strategy(
                 &params.eviction_policy,
                 params.slru_protected_threshold,
@@ -1039,6 +1069,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     /// match result.
     pub fn reset(&mut self) {
         self.arena.reset();
+        self.continuation_lineage = Arc::new(());
         self.component_states = Default::default();
         self.evictable_device_leaves = NodeSet::new();
         self.evictable_host_leaves = NodeSet::new();
@@ -1601,6 +1632,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             component.refresh_lru(self, LRURefreshPhase::MatchEnd, best_match_node_id);
         }
 
+        self.full_evict_device_heap_dirty = true;
         // Re-stamp the matched path with fresh ticks, newest leaf-ward.
         let mut path = Vec::new();
         let mut best_match_len = 0;
@@ -1717,6 +1749,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
 
     /// Refresh a node's access tick and component LRU positions.
     pub(crate) fn touch_node_(&mut self, node_id: NodeIdx_) {
+        self.full_evict_device_heap_dirty = true;
         let tick = self.arena.get_and_bump_access_counter();
         let node = self.arena.node_mut(node_id);
         node.last_access_counter = tick;
@@ -1802,6 +1835,142 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     ) -> Result<InsertResult<V>, TreeCoreRuntimeError> {
         let prefix_node_idx = self.arena.resolve(prefix_node_id)?;
         self.try_insert_at_(prefix_node_idx, prefix_len, params)
+    }
+
+    /// Validate a Full-only device continuation once at its full-key boundary.
+    /// The adapter's append-only lease owns subsequent suffixes. HiCache,
+    /// auxiliary components, event generation and T-LRU keep the general API.
+    pub fn bind_full_insert_continuation(
+        &self,
+        node_id: NodeId,
+        key: &K,
+        prefix_len: usize,
+    ) -> Result<FullInsertContinuation, TreeCoreRuntimeError> {
+        if self.components.len() != 1
+            || self.enable_hicache
+            || self.enable_kv_cache_events
+            || self.enable_storage
+            || self.enable_external_cache_linker
+            || self.tlru_bookkeeping
+            || !prefix_len.is_multiple_of(self.page_size)
+            || prefix_len > key.atom_len()
+        {
+            return Err(TreeCoreRuntimeError::InvalidFullContinuation);
+        }
+        let idx = self.arena.resolve(node_id)?;
+        let params = InsertParams {
+            key,
+            namespace: KeyNamespaceRef::default(),
+            value: V::empty(),
+            rotation_base: None,
+            session_id: None,
+            swa_branching_seqlen: None,
+            prev_prefix_len: prefix_len,
+            swa_evicted_seqlen: 0,
+            mamba_value: None,
+            chunked: true,
+            priority: 0,
+            track_adopted_ranges: false,
+        };
+        self.validate_insert_anchor_(idx, prefix_len, &params)?;
+        if !self.arena.node(idx).is_root() && self.arena.node(idx).device_lock_ref(FULL) == 0 {
+            return Err(TreeCoreRuntimeError::InvalidFullContinuation);
+        }
+        Ok(FullInsertContinuation {
+            lineage: Arc::clone(&self.continuation_lineage),
+            node_id,
+            prefix_len,
+        })
+    }
+
+    /// Append new key atoms to an established lease and extend its existing pin
+    /// only over the canonical suffix. No retained key or root lock walk occurs.
+    pub fn append_full_insert_continuation(
+        &mut self,
+        continuation: &mut FullInsertContinuation,
+        suffix: &K,
+        value: V,
+    ) -> Result<InsertResult<V>, TreeCoreRuntimeError> {
+        if !Arc::ptr_eq(&continuation.lineage, &self.continuation_lineage)
+            || self.components.len() != 1
+            || self.enable_hicache
+            || self.enable_kv_cache_events
+            || self.enable_storage
+            || self.enable_external_cache_linker
+            || self.tlru_bookkeeping
+            || self.ongoing_insert_walk_state.is_some()
+            || suffix.atom_len() == 0
+            || !suffix.atom_len().is_multiple_of(self.page_size)
+            || value.len() != suffix.atom_len()
+        {
+            return Err(TreeCoreRuntimeError::InvalidFullContinuation);
+        }
+        let anchor = self.arena.resolve(continuation.node_id)?;
+        let node = self.arena.node(anchor);
+        if !node.is_root() && (!node.has_device_value(FULL) || node.device_lock_ref(FULL) == 0) {
+            return Err(TreeCoreRuntimeError::InvalidFullContinuation);
+        }
+        let prefix_len = continuation.prefix_len;
+        let total_len = prefix_len
+            .checked_add(suffix.atom_len())
+            .ok_or(TreeCoreRuntimeError::InvalidFullContinuation)?;
+        let params = InsertParams {
+            key: suffix,
+            namespace: KeyNamespaceRef::default(),
+            value,
+            rotation_base: None,
+            session_id: None,
+            swa_branching_seqlen: None,
+            prev_prefix_len: prefix_len,
+            swa_evicted_seqlen: 0,
+            mamba_value: None,
+            chunked: true,
+            priority: 0,
+            track_adopted_ranges: false,
+        };
+        let mut actions = Vec::new();
+        self.visit_retained_prefix_(anchor, &params, &mut actions);
+        let mut step = self.begin_insert_suffix_(
+            anchor,
+            prefix_len,
+            total_len,
+            &params,
+            suffix.as_ref(),
+            actions,
+        )?;
+        let mut actions = Vec::new();
+        let mut result = loop {
+            actions.append(&mut step.actions);
+            if let Some(result) = step.result {
+                break result;
+            }
+            step = self.try_resume_insert()?;
+        };
+        result.cache_actions = actions;
+        let last_node = result
+            .last_device_node_id
+            .expect("Full append has a device endpoint");
+        let mut cursor = self.arena.resolve(last_node)?;
+        // The insert above creates or reconciles only descendants of the live
+        // anchor. Keep its existing root-path pin and acquire just this segment.
+        while cursor != anchor {
+            let node = self.arena.node_mut(cursor);
+            assert!(node.has_device_value(FULL));
+            let parent = node.parent();
+            let len = node.device_value_len(FULL);
+            let newly_locked = node.device_lock_ref(FULL) == 0;
+            node.inc_device_lock_ref(FULL);
+            if newly_locked {
+                self.dec_evictable_size(FULL, len);
+                self.inc_protected_size(FULL, len);
+            }
+            self.update_evictable_leaf_sets_(cursor);
+            cursor = parent;
+        }
+        self.update_evictable_leaf_sets_(anchor);
+        continuation.node_id = last_node;
+        continuation.prefix_len = total_len;
+        Ok(result)
     }
 
     fn validate_insert_anchor_(
@@ -1961,12 +2130,32 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 }),
             });
         }
+        self.begin_insert_suffix_(
+            prefix_node_idx,
+            prefix_len,
+            aligned_key_len,
+            params,
+            &params.key.as_ref()[prefix_len..aligned_key_len],
+            prefix_actions,
+        )
+    }
+
+    fn begin_insert_suffix_(
+        &mut self,
+        prefix_node_idx: NodeIdx_,
+        prefix_len: usize,
+        aligned_key_len: usize,
+        params: &InsertParams<'_, K, V>,
+        suffix: &[K::Atom],
+        prefix_actions: Vec<CacheAction<V>>,
+    ) -> Result<InsertStepResult<V>, TreeCoreRuntimeError> {
+        let value_len = aligned_key_len - prefix_len;
         // The walk owns only [prefix_len, aligned_key_len); the ragged tail and
         // retained prefix never enter the resumable state.
         self.ongoing_insert_walk_state = Some(InsertWalkState {
             phase: InsertPhase::Walk,
             node_id: prefix_node_idx,
-            key: K::from(params.key.as_ref()[prefix_len..aligned_key_len].to_vec()),
+            key: K::from(suffix.to_vec()),
             key_offset: prefix_len,
             aligned_key_len,
             value: params.value.slice(0, value_len),
@@ -4475,7 +4664,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         device_indices: V,
         mut kv_xfer: PoolTransfer<V>,
         comp_xfers: HashMap<ComponentType, Vec<PoolTransfer<V>>>,
-    ) -> Result<Vec<CacheAction<V>>, NodeAccessError> {
+    ) -> Result<Vec<CacheAction<V>>, TreeCoreRuntimeError> {
         let anchor_id = node_id;
         let node_id = self.arena.resolve(node_id)?;
         let loaded_node_indices = kv_xfer
@@ -4485,6 +4674,30 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             .map(|&loaded_id| self.arena.resolve(loaded_id))
             .collect::<Result<Vec<_>, _>>()?;
         self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
+        // Validate the entire plan before pinning nodes or adopting any rows.
+        // A live handle can still name a shorter suffix after a node split.
+        let invalid = || TreeCoreRuntimeError::InvalidLoadBackSpec { node_id: anchor_id };
+        let counts = kv_xfer.node_row_counts.as_deref().ok_or_else(invalid)?;
+        if counts.len() != loaded_node_indices.len() {
+            return Err(invalid());
+        }
+        let mut total = 0usize;
+        let mut seen = std::collections::HashSet::new();
+        for (&idx, &count) in loaded_node_indices.iter().zip(counts) {
+            let node = self.arena.node(idx);
+            if !seen.insert(idx)
+                || count == 0
+                || node.has_device_value(FULL)
+                || node.host_value_len(FULL) != count
+            {
+                return Err(invalid());
+            }
+            total = total.checked_add(count).ok_or_else(invalid)?;
+        }
+        if total != device_indices.len() || total != kv_xfer.host_indices.as_ref().map_or(0, V::len)
+        {
+            return Err(invalid());
+        }
         let mut cache_actions: Vec<CacheAction<V>> = Vec::new();
         kv_xfer.device_indices = Some(device_indices);
         let nodes_to_load = kv_xfer.nodes_to_load.clone();
@@ -4715,8 +4928,12 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             if node.write_through_pending_id == Some(ack_id) {
                 node.write_through_pending_id = None;
                 self.update_full_coexisting_host_tracking_(node_idx);
+                self.record_store_event_(
+                    node_idx,
+                    StorageMedium::Cpu,
+                    /* session_id = */ None,
+                );
             }
-            self.record_store_event_(node_idx, StorageMedium::Cpu, /* session_id = */ None);
         }
         Ok(())
     }
