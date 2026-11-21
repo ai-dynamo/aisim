@@ -3766,6 +3766,14 @@ def test_v033_import_requires_audited_runner_and_backends(tmp_path, phase, layou
 
 
 _RAW = "raw cache configuration contradicts the cache record: "
+
+
+def _raw_refusal(phase, kind, dp, what):
+    """The refusal of the raw cache check for the first record of a phase that breaks it: a worker is TP rank 0."""
+    record = f"{phase} {kind} of DP rank {dp}" + (" and TP rank 0" if kind == "worker" else "")
+    return f"tp2: {record}: {_RAW}{what}"
+
+
 _MAMBA = _V033_SPEC + "MambaSpec"
 
 
@@ -3844,7 +3852,7 @@ def test_v033_raw_cache_config_must_match_the_cache_record(tmp_path, phase, kind
     _mutate(path, edit, derive=False)
     result = validate_observations(path, launches)["tp2"]
     expected = "missing" if what == "not an object" else what
-    assert (result["status"], result["diagnostics"]) == ("incomplete", [f"tp2: {_RAW}{expected}"])
+    assert (result["status"], result["diagnostics"]) == ("incomplete", [_raw_refusal(phase, kind, 0, expected)])
 
 
 @pytest.mark.parametrize(
@@ -3852,6 +3860,26 @@ def test_v033_raw_cache_config_must_match_the_cache_record(tmp_path, phase, kind
     [
         # A value of another JSON type that Python compares equal, a missing key and an empty value of each type.
         ("glm_tp4", "scheduler", "num_blocks_float", "num_blocks"),
+        # A number written as a string, for each kind of compared number.
+        ("glm_tp4", "scheduler", "num_blocks_string", "num_blocks"),
+        ("glm_tp4", "worker", "block_size_string", "group 4 block_size"),
+        ("glm_tp4", "worker", "page_size_string", "group 0 page_size_bytes"),
+        ("glm_tp4", "scheduler", "tokens_per_state_string", "group 4 tokens_per_state"),
+        ("glm_tp4", "scheduler", "speculative_string", "group 0 num_speculative_blocks"),
+        ("glm_tp4", "scheduler", "checkpoint_string", "group 0 num_prefill_checkpoint_blocks"),
+        ("glm_tp4", "scheduler", "alignment_string", "group 0 prefill_checkpoint_alignment"),
+        ("glm_tp4", "scheduler", "shape_string", "group 0 shapes"),
+        ("glm_tp4", "worker", "allocation_offset_string", "tensor_allocations"),
+        ("glm_tp4", "scheduler", "allocation_size_string", "tensor_allocations"),
+        ("mamba_hybrid", "worker", "attention_sliding_window_none_string", "group 0 sliding_window"),
+        # An allocation number of another JSON type that Python compares equal.
+        ("glm_tp4", "worker", "allocation_size_float", "tensor_allocations"),
+        ("glm_tp4", "scheduler", "allocation_size_float", "tensor_allocations"),
+        ("glm_tp4", "worker", "allocation_offset_false", "tensor_allocations"),
+        ("glm_tp4", "scheduler", "allocation_offset_false", "tensor_allocations"),
+        ("glm_tp4", "scheduler", "allocation_stride_float", "tensor_allocations"),
+        # More raw groups than cache groups.
+        ("glm_tp4", "worker", "group_extra", "group count"),
         ("glm_tp4", "worker", "num_blocks_missing", "num_blocks"),
         ("glm_tp4", "worker", "groups_missing", "group count"),
         ("glm_tp4", "worker", "groups_object", "group count"),
@@ -3892,8 +3920,43 @@ def test_v033_raw_cache_config_refuses_each_malformed_value(tmp_path, layout, ki
             return
         raw = record["raw_cache_config"]
         groups = raw["groups"]
+        allocation = raw["tensor_allocations"][0] if isinstance(raw.get("tensor_allocations"), list) else None
         if case == "num_blocks_float":
             raw["num_blocks"] = float(raw["num_blocks"])
+        elif case == "num_blocks_string":
+            raw["num_blocks"] = str(raw["num_blocks"])
+        elif case == "block_size_string":
+            groups[4]["block_size"] = str(groups[4]["block_size"])
+        elif case == "page_size_string":
+            groups[0]["page_size_bytes"] = str(groups[0]["page_size_bytes"])
+        elif case == "tokens_per_state_string":
+            assert groups[4]["tokens_per_state"] == 4
+            groups[4]["tokens_per_state"] = "4"
+        elif case == "speculative_string":
+            groups[0]["num_speculative_blocks"] = str(groups[0]["num_speculative_blocks"])
+        elif case == "checkpoint_string":
+            groups[0]["num_prefill_checkpoint_blocks"] = str(groups[0]["num_prefill_checkpoint_blocks"])
+        elif case == "alignment_string":
+            assert groups[0]["prefill_checkpoint_alignment"] == 16
+            groups[0]["prefill_checkpoint_alignment"] = "16"
+        elif case == "shape_string":
+            groups[0]["shapes"][0][0] = str(groups[0]["shapes"][0][0])
+        elif case == "allocation_offset_string":
+            allocation["offset"] = str(allocation["offset"])
+        elif case == "allocation_size_string":
+            allocation["size"] = str(allocation["size"])
+        elif case == "attention_sliding_window_none_string":
+            assert groups[0]["sliding_window"] is None
+            groups[0]["sliding_window"] = "None"
+        elif case == "allocation_size_float":
+            allocation["size"] = float(allocation["size"])
+        elif case == "allocation_offset_false":
+            assert allocation["offset"] == 0
+            allocation["offset"] = False
+        elif case == "allocation_stride_float":
+            allocation["block_stride"] = float(allocation["block_stride"])
+        elif case == "group_extra":
+            groups.append(copy.deepcopy(groups[-1]))
         elif case == "num_blocks_missing":
             del raw["num_blocks"]
         elif case == "groups_missing":
@@ -3954,7 +4017,81 @@ def test_v033_raw_cache_config_refuses_each_malformed_value(tmp_path, layout, ki
 
     _mutate(path, edit, derive=False)
     result = validate_observations(path, launches)["tp2"]
-    assert (result["status"], result["diagnostics"]) == ("incomplete", [f"tp2: {_RAW}{what}"])
+    assert (result["status"], result["diagnostics"]) == ("incomplete", [_raw_refusal("decode", kind, 1, what)])
+
+
+@pytest.mark.parametrize("kind", ["worker", "scheduler"])
+@pytest.mark.parametrize("value", [1, True])
+def test_v033_raw_tensor_allocation_number_one_is_no_boolean(tmp_path, kind, value):
+    # Group 3 of glm_tp4 lies one byte further in every worker, so its allocation offset is 1.
+    path, launches = observation_fixture(tmp_path, layout="glm_tp4")
+
+    def move(record):
+        if record["kind"] == "worker":
+            cache = record["cache"]
+            (allocation,) = [
+                item for item in cache["tensor_allocations"] if item["layers"] == cache["groups"][3]["layer_names"]
+            ]
+            allocation["offset"] += 1
+            for name in allocation["layers"]:
+                for view in cache["layer_tensors"][name]:
+                    view["storage_offset_bytes"] += 1
+
+    _mutate(path, move)
+
+    def edit(record):
+        if (record["kind"], record["phase"], record["dp_rank"]) == (kind, "decode", 1):
+            (allocation,) = [item for item in record["raw_cache_config"]["tensor_allocations"] if item["offset"] == 1]
+            allocation["offset"] = value
+
+    _mutate(path, edit, derive=False)
+    result = validate_observations(path, launches)["tp2"]
+    if value is True:
+        assert result["diagnostics"] == [_raw_refusal("decode", kind, 1, "tensor_allocations")]
+    else:
+        assert (result["status"], result["diagnostics"]) == ("complete", [])
+
+
+@pytest.mark.parametrize(
+    "kind,case,complete",
+    [
+        ("worker", "unchanged", True),
+        ("scheduler", "unchanged", True),
+        ("worker", "window_64", False),
+        ("scheduler", "window_missing", False),
+        ("worker", "window_float", False),
+        ("scheduler", "window_string", False),
+    ],
+)
+def test_v033_raw_window_must_be_the_window_of_the_cache_record(tmp_path, kind, case, complete):
+    # The attention group of mamba_hybrid as a sliding-window group of 32 tokens. Its raw group takes the form that
+    # vLLM writes for SlidingWindowSpec, which has extra_retained_tokens and no attention_chunk_size
+    # (vLLM 0.33.0 v1/kv_cache_interface.py:901-908).
+    path, launches = observation_fixture(tmp_path, layout="mamba_hybrid")
+    _mutate(path, _window_attention)
+
+    def edit(record):
+        group = record["raw_cache_config"]["groups"][0]
+        assert (group["spec_type"], group["sliding_window"]) == (_V033_SPEC + "SlidingWindowSpec", 32)
+        del group["attention_chunk_size"]
+        group["extra_retained_tokens"] = 0
+        if (record["kind"], record["phase"], record["dp_rank"]) != (kind, "decode", 1):
+            return
+        if case == "window_64":
+            group["sliding_window"] = 64
+        elif case == "window_missing":
+            del group["sliding_window"]
+        elif case == "window_float":
+            group["sliding_window"] = 32.0
+        elif case == "window_string":
+            group["sliding_window"] = "32"
+
+    _mutate(path, edit, derive=False)
+    result = validate_observations(path, launches)["tp2"]
+    if complete:
+        assert (result["status"], result["diagnostics"]) == ("complete", [])
+    else:
+        assert result["diagnostics"] == [_raw_refusal("decode", kind, 1, "group 0 sliding_window")]
 
 
 def _reorder_allocations(record):
@@ -4002,7 +4139,11 @@ def test_v033_raw_cache_config_of_a_scheduler_must_match_each_worker_of_its_rank
 
     _mutate(path, edit)
     result = validate_observations(path, launches)["tp2"]
-    assert (result["status"], result["diagnostics"]) == ("incomplete", [f"tp2: {_RAW}tensor_allocations"])
+    phase, dp = ("prefill", 0) if change == "moved" else ("decode", 1)
+    assert (result["status"], result["diagnostics"]) == (
+        "incomplete",
+        [_raw_refusal(phase, "scheduler", dp, "tensor_allocations")],
+    )
 
 
 @pytest.mark.parametrize("kind", ["worker", "scheduler"])
@@ -5447,9 +5588,10 @@ def test_import_of_a_record_outside_the_conditions_is_complete_and_gives_the_rea
 @pytest.mark.parametrize("moved", ["dp_rank_1", "decode_phase"])
 def test_import_of_ranks_that_give_different_values_is_complete_and_gives_the_reason(tmp_path, moved):
     # One Mamba group lies 4,096 bytes further in its block row in the worker records of DP rank 1, or in those of the
-    # decode phase, which runs with prefix caching too, so the ranks or the phases give different values. Only another
-    # engine core can differ: the TP workers of one get the same tensors (vLLM 0.33.0 v1/core/kv_cache_planning.py:
-    # 1505-1508, :1583-1595, :1620-1628).
+    # decode phase, which runs with prefix caching too, so the ranks or the phases give different values. The import
+    # compares the allocations inside one engine core only: the TP workers of one get the same tensors
+    # (vLLM 0.33.0 v1/core/kv_cache_planning.py:1505-1508, :1583-1595, :1620-1628). The DP row is a built difference
+    # between two engine cores that tests how the writer handles values that differ, not a record of one launch.
     path, launches = observation_fixture(tmp_path, layout="glm_tp4")
     if moved == "dp_rank_1":
         move = _shift_group(3)

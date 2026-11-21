@@ -170,14 +170,20 @@ _MAMBA_STATE_FIELDS = (
 # _layer_strided_allocations and _json_value). A raw group holds a spec field only when the spec has it: a ring holds
 # no sliding_window, attention_chunk_size or cache_role, which the cache record gives as None. The raw block of a
 # scheduler holds the tensor allocations, which its cache record does not: vLLM builds the scheduler configuration as
-# a deep copy of the first worker's (vLLM 0.33.0 v1/core/kv_cache_utils.py:1109-1117), and every worker of an engine
-# core is planned from the groups of the whole model with the smallest block count (v1/core/kv_cache_planning.py:
-# 1505-1508, :1583-1595), one spec for each layer in all workers (:1620-1628). The raw fields that the cache record
-# does not hold (kv_cache_layout; head_size, num_kv_heads, kv_quant_mode; the padded page of a group that is no
-# MambaSpec) are not compared.
+# a deep copy of the first worker's (vLLM 0.33.0 v1/core/kv_cache_utils.py:1109-1117), and with one pipeline stage,
+# the only one that the import accepts, every worker of an engine core is planned from the groups of the whole model
+# with the smallest block count (v1/core/kv_cache_planning.py:1436-1437, :1505-1508, :1583-1595), one spec for each
+# layer in all workers (:1620-1628). The raw fields that the cache record does not hold (kv_cache_layout; head_size,
+# num_kv_heads, kv_quant_mode; the padded page of a group that is no MambaSpec) are not compared, and neither is
+# extra_retained_tokens: the cache record gives 0 for a class without the field, whose raw group holds no key, and the
+# older retention check requires 0.
 def _check_raw_cache_config(record: dict[str, Any], workers: Sequence[dict[str, Any]]) -> None:
     def refuse(what: str) -> ValueError:
-        return ValueError(f"raw cache configuration contradicts the cache record: {what}")
+        return ValueError(f"{label}: raw cache configuration contradicts the cache record: {what}")
+
+    label = f"{record['phase']} {record['kind']} of DP rank {record['dp_rank']}"
+    if record["kind"] == "worker":
+        label += f" and TP rank {record['tp_rank']}"
 
     raw, cache = record.get("raw_cache_config"), record["cache"]
     if not isinstance(raw, dict):
@@ -233,13 +239,15 @@ def _check_raw_cache_config(record: dict[str, Any], workers: Sequence[dict[str, 
 
 # MambaSpec.page_size_bytes is page_size_padded when it is set, else the bytes of the state tensors (vLLM 0.33.0
 # v1/kv_cache_interface.py:1116-1129); the padded size comes from the cache configuration
-# (model_executor/layers/mamba/abstract.py:75-80). A uniform group holds a Mamba layer only beside specs that the first
+# (model_executor/layers/mamba/abstract.py:75-80) or from the grouping (v1/core/kv_cache_planning.py:380-389,
+# :1105-1108). A uniform group holds a Mamba layer only beside specs that the first
 # MambaSpec accepts, each with its page (kv_cache_interface.py:1155-1166, :1347-1361), and the import refuses a group
 # that mixes a MambaSpec with another class. _check_raw_cache_config has passed the raw groups.
 def _check_mamba_pages(record: dict[str, Any]) -> None:
     for group, entry in zip(record["cache"]["groups"], record["raw_cache_config"]["groups"], strict=True):
         if group["spec_type"] == _MAMBA_SPEC:
-            padded = entry.get("page_size_padded", entry)
+            # A raw group without the key gives no page.
+            padded = entry.get("page_size_padded") if "page_size_padded" in entry else "absent"
             state = group.get("state")
             page = state.get("real_page_size_bytes") if padded is None and isinstance(state, dict) else padded
             if type(page) is not int or page != group["spec_page_size_bytes"]:
