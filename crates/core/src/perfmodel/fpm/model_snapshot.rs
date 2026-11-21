@@ -1161,7 +1161,7 @@ fn restore_verified(
         // The data matched before this model loaded and only verified tables
         // stayed shared, so later restores of untouched data may share these.
         if let (Some(root), Some(stamp)) = (&native_root, data_stamp) {
-            perf_db::verified(root, &base.system, parquet, engine.database(), stamp);
+            perf_db::verified(root, &base.system, parquet, engine.database(), stamp)?;
         }
     }
     model.install_state(state.state)?;
