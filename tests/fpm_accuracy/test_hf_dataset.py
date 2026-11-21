@@ -292,7 +292,12 @@ def test_history_cache_does_not_expand_current_campaign_membership(tmp_path, wit
             "    snapshot_id: older\n    worker_role: decode\n"
         )
     dataset = HfDataset.from_local(tmp_path, revision=REVISION, overrides_path=override)
+    assert [item.snapshot_id for item in dataset.configurations()] == [SNAPSHOT_ID]
     assert dataset.measurement_case(CONFIGURATION_PATH, snapshot_id="older").configuration.snapshot_id == "older"
+    if with_override:
+        case = dataset.measurement_case(CONFIGURATION_PATH, snapshot_id="older")
+        assert case.override_applied
+        assert case.worker_role == "decode"
     assert len(dataset.configurations(include_history=True)) == 2
     assert [item.snapshot_id for item in dataset.configurations()] == [SNAPSHOT_ID]
 

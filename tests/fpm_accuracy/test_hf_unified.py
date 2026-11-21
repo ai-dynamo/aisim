@@ -20,7 +20,7 @@ from scripts.fpm_accuracy.exceptions import ConfigurationError, DataError
 from scripts.fpm_accuracy.hf import HfDataset
 from scripts.fpm_accuracy.hf import dataset as dataset_module
 from tests.fpm_accuracy import legacy_migration as fpm_migration
-from tests.fpm_accuracy.test_hf_dataset import CONFIGURATION_PATH, REVISION, _build_dataset, _fpm_payload
+from tests.fpm_accuracy.test_hf_dataset import CONFIGURATION_PATH, REVISION, SNAPSHOT_ID, _build_dataset, _fpm_payload
 
 REPO = "ai-dynamo/aisim-data"
 
@@ -268,6 +268,51 @@ class _FakeTransport:
     def open_file(self, repo: str, sha: str, path: str) -> Iterator[bytes]:
         self.opened.append(path)
         yield (type(self).root / path).read_bytes()
+
+
+@pytest.mark.parametrize("source", ["local", "hub"])
+@pytest.mark.parametrize("selector", ["none", "configuration", "snapshot"])
+def test_current_overrides_do_not_require_unfetched_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str, selector: str
+) -> None:
+    history_path = "data/history/retired/manifest.json"
+
+    def edit(legacy: Path) -> None:
+        leaf_path = legacy / CONFIGURATION_PATH / "manifest.json"
+        leaf = json.loads(leaf_path.read_text())
+        leaf["history"] = [{"manifest_path": history_path, "manifest_sha256": "b" * 64}]
+        leaf_path.write_text(json.dumps(leaf))
+
+    _, unified_root = _legacy_and_unified(tmp_path, edit)
+    override = None
+    if selector != "none":
+        override = tmp_path / "overrides.yaml"
+        snapshot = f"    snapshot_id: {SNAPSHOT_ID}\n" if selector == "snapshot" else ""
+        override.write_text(
+            f"version: 1\noverrides:\n  - configuration_path: {CONFIGURATION_PATH}\n"
+            f"{snapshot}    worker_role: prefill\n"
+        )
+    if source == "local":
+        dataset = HfDataset.from_local(unified_root, revision=REVISION, repo_id=REPO, overrides_path=override)
+    else:
+        _FakeTransport.root, _FakeTransport.opened = unified_root, []
+        monkeypatch.setattr(dataset_module, "HfTransport", _FakeTransport)
+        dataset = HfDataset.from_hub(
+            REPO, revision="main", cache_dir=tmp_path / "cache", models=["Org/Model"], overrides_path=override
+        )
+        assert not any("/history/" in path for path in _FakeTransport.opened)
+
+    assert not (dataset.root / fpm_migration.target_path(history_path)).exists()
+    configurations = dataset.configurations()
+    assert [item.snapshot_id for item in configurations] == [SNAPSHOT_ID]
+    case = dataset.measurement_case(CONFIGURATION_PATH)
+    assert len(case.observations) == 1
+    assert case.override_applied is (override is not None)
+    assert case.worker_role == ("prefill" if override is not None else "decode")
+    # Current-only caching must not let an explicit history request skip verification.
+    with pytest.raises(DataError, match="HF dataset file is missing: data/history/retired/manifest.json"):
+        dataset.configurations(include_history=True)
+    assert dataset.configurations() == configurations
 
 
 def test_from_hub_selects_before_downloading_and_skips_excluded_roles(
