@@ -71,6 +71,91 @@ def _write(path, payload):
 
 
 _V033_SPEC = "vllm.v1.kv_cache_interface."
+_V033_BACKEND = "vllm.v1.attention.backends.flash_attn.FlashAttentionBackend"
+# The runner and backend sources of the vLLM 0.33.0 test records, beside the block pool of every manifest.
+_V033_SOURCE_FILES = {
+    "vllm/v1/worker/gpu/model_runner.py": "c" * 64,
+    "vllm/v1/attention/backends/flash_attn.py": "d" * 64,
+}
+
+
+def _raw_cache_config(record: dict) -> dict:
+    """The raw cache block that the observer writes beside ``record["cache"]`` (observer._raw_cache).
+
+    Each group holds the fields of its vLLM spec that the cache record determines. A UniformTypeKVCacheSpecs group
+    holds only its names, type, block and page, as in the live worker records.
+    """
+    cache = record["cache"]
+    groups = []
+    for group in cache["groups"]:
+        spec_type = group["spec_type"]
+        entry = {
+            "layer_names": group["layer_names"],
+            "spec_type": spec_type,
+            "block_size": group["block_size_tokens"],
+            "page_size_bytes": group["spec_page_size_bytes"],
+        }
+        if spec_type != _V033_SPEC + "UniformTypeKVCacheSpecs":
+            first = group["layer_specs"][group["layer_names"][0]]
+            entry["tokens_per_state"] = first["tokens_per_state"]
+            if spec_type == _V033_SPEC + "MambaSpec":
+                state = group["state"]
+                for key in (
+                    "mamba_cache_mode",
+                    "num_speculative_blocks",
+                    "num_prefill_checkpoint_blocks",
+                    "prefill_checkpoint_alignment",
+                    "shapes",
+                    "dtypes",
+                ):
+                    entry[key] = state[key]
+                page = group["spec_page_size_bytes"]
+                entry["page_size_padded"] = page if page != state["real_page_size_bytes"] else None
+            else:
+                entry.update(dtype=group["dtype"], page_size_padded=None)
+                if spec_type != _V033_SPEC + "CircularBufferSpec":
+                    entry["sliding_window"] = group["sliding_window"]
+                if spec_type == _V033_SPEC + "MLAAttentionSpec":
+                    entry["cache_role"] = first["cache_role"]
+        groups.append(entry)
+    raw = {"num_blocks": cache["num_blocks"], "groups": groups}
+    if record["kind"] == "worker":
+        raw["tensor_allocations"] = [
+            {key: value for key, value in item.items() if key != "storage_id"} for item in cache["tensor_allocations"]
+        ]
+    return raw
+
+
+def _attention_groups(cache: dict) -> list[dict]:
+    """The attention groups that the observer writes for a worker, one for each cache group (observer.py)."""
+    return [
+        {
+            "kv_cache_group_id": index,
+            "backend_class": _V033_BACKEND,
+            "layer_names": list(group["layer_names"]),
+            "kernel_block_size": None,
+            "kernel_block_stride": 0,
+        }
+        for index, group in enumerate(cache["groups"])
+    ]
+
+
+def _derive_observer_copies(record: dict) -> None:
+    """Write the raw cache block, and for a worker the attention groups, into a vLLM 0.33.0 record.
+
+    A record without layer specs is left as it is. So is a cache that an edit made malformed: an older check refuses
+    it first.
+    """
+    if not runtime_memory._hybrid_evidence(record.get("cache")):
+        return
+    try:
+        raw = _raw_cache_config(record)
+        attention = _attention_groups(record["cache"]) if record["kind"] == "worker" else None
+    except (KeyError, TypeError, AttributeError, IndexError):
+        return
+    record["raw_cache_config"] = raw
+    if attention is not None:
+        record["attention_groups"] = attention
 
 
 def _v033_records(layout, *, prefix_caching, dp, max_model_len=4096, checkpoint=None):
@@ -295,7 +380,8 @@ def _v033_records(layout, *, prefix_caching, dp, max_model_len=4096, checkpoint=
         # Generic block-outer layout: one tensor per (group, spec), every group from byte 0, the
         # layer stride is the spec page and the block stride the largest group's bytes per block
         # (kv_cache_planning.py:574-605, :685-732). G0 packs two specs; G2 is the short last group.
-        # A block-outer view cannot split kernel blocks (kv_cache_interface.py:438-452).
+        # A block-outer view cannot split kernel blocks (kv_cache_interface.py:438-452). vLLM builds a block-outer
+        # layout only on its packed path, where every group is uniform (kv_cache_planning.py:1159).
         blocks, free, page, block, hash_block = 10, 9, 10_240, 64, 64
         mamba_block = block if prefix_caching else max_model_len
         wide = spec("FullAttentionSpec", 4096, "torch.bfloat16", 1)
@@ -316,9 +402,9 @@ def _v033_records(layout, *, prefix_caching, dp, max_model_len=4096, checkpoint=
             *(
                 group(
                     names,
-                    "MambaSpec",
+                    "UniformTypeKVCacheSpecs",
                     mamba_block,
-                    5120,
+                    len(names) * 5120,
                     dict.fromkeys(names, spec("MambaSpec", 5120, None, -1)),
                     "state",
                     None,
@@ -336,7 +422,7 @@ def _v033_records(layout, *, prefix_caching, dp, max_model_len=4096, checkpoint=
                 dtype="torch.bfloat16",
                 layer_specs=dict.fromkeys(attention, wide),
             ),
-            *(scheduled(item) for item in groups[1:]),
+            *(scheduled(item, spec_type=_V033_SPEC + "MambaSpec", spec_page_size_bytes=5120) for item in groups[1:]),
         ]
         for names, offset, layer_stride, shape, strides in (
             (["attn.0", "attn.1"], 0, 4096, [10, 1, 64, 32], [10_240, 4096, 64, 2]),
@@ -518,6 +604,11 @@ def observation_fixture(
     path, manifest = _manifest(root)
     manifest["runtime"]["version"] = version
     manifest["runtime"]["source_files"] = {"vllm/v1/core/block_pool.py": "b" * 64}
+    if version == "0.33.0":
+        manifest["runtime"]["source_files"].update(_V033_SOURCE_FILES)
+        if layout == "attention":
+            # The layer-strided control of the attention layout records the runner of gpu_model_runner.py.
+            manifest["runtime"]["source_files"]["vllm/v1/worker/gpu_model_runner.py"] = "e" * 64
     path.write_text(json.dumps(manifest))
     bundle = load_instrumentation(path)
     model = root / "model.json"
@@ -738,6 +829,7 @@ def observation_fixture(
             }
             record["resolved_config"]["parallel_config"]["enable_expert_parallel"] = not dense
             record["resolved_config"]["parallel_config"]["tensor_parallel_size"] = tp
+            _derive_observer_copies(record)
             ref = _write(
                 root / phase / (f"worker-{dp}-{rank['tp_rank']}.json" if worker else f"scheduler-{dp}.json"), record
             )
@@ -772,7 +864,7 @@ def stage_model_config(index_path):
     index_path.write_text(json.dumps(index))
 
 
-def _mutate(index_path, edit):
+def _mutate(index_path, edit, *, derive=True):
     index = json.loads(index_path.read_text())
     attempt = index["configurations"]["tp2"]["attempts"][0]
     for phase in attempt["phases"].values():
@@ -782,6 +874,8 @@ def _mutate(index_path, edit):
             path = index_path.parent / artifact["path"]
             record = json.loads(path.read_text())
             edit(record)
+            if derive:
+                _derive_observer_copies(record)
             path.write_text(json.dumps(record))
             artifact["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
     index_path.write_text(json.dumps(index))
@@ -3705,6 +3799,83 @@ def test_import_accepts_the_live_glm53flash_record_of_vllm_0330(tmp_path):
     assert result["provenance"]["launch"]["precision"]["kvcache_quant_mode"] == "fp8"
     references = json.loads(path.read_text())["configurations"][label]["attempts"][0]["phases"]["prefill"]["artifacts"]
     assert runtime_observations._staged_checkpoint_fmha(path.parent, references, launch, "fp8") == "fp8"
+
+
+def _live_records():
+    root = FIXTURES / "glm53flash_vllm_0330_probe"
+    return [json.loads(path.read_text()) for path in sorted(root.rglob("runtime-observation-*.json"))]
+
+
+def test_observer_copies_agree_with_the_live_records():
+    records = _live_records()
+    assert [record["kind"] for record in records] == ["scheduler", "worker", "worker", "worker", "worker"]
+    for record in records:
+        derived, recorded = _raw_cache_config(record), record["raw_cache_config"]
+        assert derived["num_blocks"] == recorded["num_blocks"]
+        assert len(derived["groups"]) == len(recorded["groups"])
+        for mine, theirs in zip(derived["groups"], recorded["groups"], strict=True):
+            # The helper writes no field that the live record does not hold, and every value is the live value.
+            assert {key: theirs.get(key, "absent") for key in mine} == mine
+        if record["kind"] == "worker":
+            assert derived["tensor_allocations"] == recorded["tensor_allocations"]
+            assert {frozenset(entry) for entry in _attention_groups(record["cache"])} == {
+                frozenset(entry) for entry in record["attention_groups"]
+            }
+        else:
+            assert "tensor_allocations" not in derived
+
+
+@pytest.mark.parametrize("layout", ["glm_tp4", "kernel_view", "mamba_hybrid", "layer_outer_short", "block_outer_short"])
+def test_synthetic_v033_records_hold_the_observer_copies(tmp_path, layout):
+    path, launches = observation_fixture(tmp_path, layout=layout)
+    kinds = set()
+    _mutate(
+        path,
+        lambda record: kinds.add(
+            (
+                record["kind"],
+                record["raw_cache_config"] == _raw_cache_config(record),
+                record["kind"] != "worker" or record["attention_groups"] == _attention_groups(record["cache"]),
+            )
+        ),
+        derive=False,
+    )
+    assert kinds == {("worker", True, True), ("scheduler", True, True)}
+    files = json.loads((tmp_path / "manifest.yaml").read_text())["runtime"]["source_files"]
+    assert _V033_SOURCE_FILES.items() <= files.items()
+    assert validate_observations(path, launches)["tp2"]["status"] == "complete"
+
+
+def test_legacy_fixture_records_hold_no_observer_copies(tmp_path):
+    path, _ = observation_fixture(tmp_path)
+    seen = []
+    _mutate(path, lambda record: seen.append({"raw_cache_config", "attention_groups"} & record.keys()))
+    assert seen and not any(seen)
+    files = json.loads((tmp_path / "manifest.yaml").read_text())["runtime"]["source_files"]
+    assert files == {"vllm/v1/core/block_pool.py": "b" * 64}
+
+
+def test_mutate_derives_the_observer_copies_again(tmp_path):
+    path, _ = observation_fixture(tmp_path, layout="mamba_hybrid")
+    _mutate(path, lambda record: record["cache"].update(num_blocks=11))
+    _mutate(path, lambda record: record.update(seen=record["raw_cache_config"]["num_blocks"]), derive=False)
+    values = []
+    _mutate(path, lambda record: values.append(record["seen"]), derive=False)
+    assert set(values) == {11}
+    # derive=False keeps a copy that an edit changed.
+    _mutate(path, lambda record: record["raw_cache_config"].update(num_blocks=12), derive=False)
+    _mutate(path, lambda record: values.append(record["raw_cache_config"]["num_blocks"]), derive=False)
+    assert values[-1] == 12
+
+
+def test_block_outer_layout_holds_uniform_mamba_groups():
+    worker, scheduler, _, _ = _v033_records("block_outer_short", prefix_caching=True, dp=2)
+    uniform, mamba = _V033_SPEC + "UniformTypeKVCacheSpecs", _V033_SPEC + "MambaSpec"
+    assert [group["spec_type"] for group in worker["groups"]] == [uniform] * 3
+    assert [group["spec_page_size_bytes"] for group in worker["groups"]] == [10_240, 10_240, 5120]
+    assert [(group["spec_type"], group["spec_page_size_bytes"]) for group in scheduler["groups"][1:]] == [
+        (mamba, 5120)
+    ] * 2
 
 
 def test_import_refuses_the_live_glm53flash_record_declared_with_bfloat16_attention(tmp_path):

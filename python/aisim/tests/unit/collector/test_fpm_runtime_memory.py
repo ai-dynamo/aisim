@@ -267,9 +267,33 @@ def test_physical_grouped_capacity_deduplicates_aliases_and_charges_padding(pack
 
 
 def _spec(name, **fields):
-    spec = _typed("vllm.v1.kv_cache_interface", name)
+    if name == "UniformTypeKVCacheSpecs":
+        # UniformTypeKVCacheSpecs (kv_cache_interface.py:1290-1390) overrides none of the three
+        # abstract KVCacheSpec properties at :246-256, which raise NotImplementedError.
+        def abstract(_self):
+            raise NotImplementedError
+
+        properties = dict.fromkeys(("num_heads", "tokens_per_state", "state_content_size_bytes"), property(abstract))
+        spec = type(name, (), {"__module__": "vllm.v1.kv_cache_interface", **properties})()
+    else:
+        spec = _typed("vllm.v1.kv_cache_interface", name)
+        # The vLLM 0.33.0 defaults (kv_cache_interface.py:569, :737, :1104). Explicit fields win.
+        defaults = {"tokens_per_state": -1 if name == "MambaSpec" else 1}
+        if name == "MLAAttentionSpec":
+            defaults["cache_role"] = "SPARSE"
+        fields = {**defaults, **fields}
     vars(spec).update(fields)
     return spec
+
+
+def test_uniform_spec_fake_raises_as_the_vllm_class_does():
+    uniform = _spec("UniformTypeKVCacheSpecs", block_size=16, page_size_bytes=64, kv_cache_specs={})
+    for name in ("num_heads", "tokens_per_state", "state_content_size_bytes"):
+        with pytest.raises(NotImplementedError):
+            getattr(uniform, name)
+    assert _spec("MLAAttentionSpec").cache_role == "SPARSE"
+    assert (_spec("FullAttentionSpec").tokens_per_state, _spec("CircularBufferSpec").tokens_per_state) == (1, 1)
+    assert _mamba().tokens_per_state == -1
 
 
 def _group(names, spec):
@@ -329,7 +353,7 @@ def test_cache_groups_map_specs_by_class_and_record_state_evidence():
             "spec_type": "vllm.v1.kv_cache_interface.FullAttentionSpec",
             "page_size_bytes": 8192,
             "dtype": "torch.bfloat16",
-            "tokens_per_state": None,
+            "tokens_per_state": 1,
             "cache_role": None,
         }
     }
