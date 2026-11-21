@@ -167,6 +167,8 @@ own `systems_paths` in any mode (`auto` reads FPM tables from them as a fallback
 `set_systems_paths` or `AICONFIGURATOR_SYSTEMS_PATH` count as your own too; only the packaged roots, which the
 Sweeper fills in when you set none, do not. Name the source with
 `AISIM_DATASET` or a pin to apply it to the configurations that keep their data.
+`AICONFIGURATOR_SYSTEMS_PATH` also supplies the root when `systems_paths` contains only `default` or its
+expanded packaged path. Explicit custom `systems_paths` retain their precedence over the environment variable.
 
 An `op-latency` pin composes all matching operation families with the packaged system specs and support
 files into one systems root. That root replaces `systems_paths` for construction: a missing operation

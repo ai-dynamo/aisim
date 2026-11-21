@@ -5,6 +5,7 @@
 
 import os
 import shutil
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -181,6 +182,48 @@ def test_configured_roots_outrank_the_saved_source_whether_or_not_the_request_na
     perf_database.set_systems_paths(None)
     _, request = _sweeper_request(config.model, mode=mode)
     assert res._ensure_dataset(request, None) is not None
+
+
+@pytest.mark.parametrize("mode", ["op_level", "auto"])
+@pytest.mark.parametrize("as_mapping", [False, True])
+@pytest.mark.parametrize("roots", ["default", "expanded", "unset"])
+def test_environment_root_reaches_prediction_for_packaged_only_paths(
+    native_dataset,  # noqa: F811
+    monkeypatch,
+    mode,
+    as_mapping,
+    roots,
+):
+    published, systems, config = native_dataset
+    transport = FakeTransport(_tree(published))
+    monkeypatch.setattr("aisim_core.data.fetch.HfTransport", lambda: transport)
+    assert main(["init", "--on-demand", "--repo", REPO, "--revision", SHA]) == 0
+    perf_database.set_systems_paths(None)
+    entries = {"default": ("default",), "expanded": tuple(perf_database.get_systems_paths()), "unset": ()}[roots]
+    monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", str(systems))
+    config = replace(config, estimation_mode=mode, systems_paths=entries)
+    request = asdict(config) if as_mapping else config
+
+    assert res._ensure_dataset(request, None) is None
+    model = res.RustForwardPassPerfModel.best_available(request)
+    assert model.dataset_revisions == {}
+    assert Path(model.diagnostics()["provenance"]["selected_systems_root"]) == systems
+    assert model.predict_prefill_latency(1, 4) >= 7.0  # the fixture's 7 ms attention measurement is consumed
+    assert not transport.opened
+
+
+def test_an_environment_choice_of_packaged_roots_outranks_the_saved_source(
+    native_dataset,  # noqa: F811
+    monkeypatch,
+):
+    published, _, config = native_dataset
+    transport = FakeTransport(_tree(published))
+    monkeypatch.setattr("aisim_core.data.fetch.HfTransport", lambda: transport)
+    assert main(["init", "--on-demand", "--repo", REPO, "--revision", SHA]) == 0
+    perf_database.set_systems_paths(None)
+    monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", perf_database.get_systems_paths()[0])
+    assert res._ensure_dataset(replace(config, systems_paths=("default",)), None) is None
+    assert not transport.opened
 
 
 @pytest.mark.parametrize("override", ["saved", "environment-repo", "environment-local", "explicit-pin"])
