@@ -79,18 +79,30 @@ _V033_SOURCE_FILES = {
 }
 
 
-def _raw_cache_config(record: dict) -> dict:
+def _raw_allocations(cache: dict) -> list[dict]:
+    """The tensor allocations of a worker cache as a raw cache block holds them: without the storage id."""
+    return [
+        {key: copy.deepcopy(value) for key, value in item.items() if key != "storage_id"}
+        for item in cache["tensor_allocations"]
+    ]
+
+
+def _raw_cache_config(record: dict, allocations: list[dict] | None = None) -> dict:
     """The raw cache block that the observer writes beside ``record["cache"]`` (observer._raw_cache).
 
     Each group holds the fields of its vLLM spec that the cache record determines. A UniformTypeKVCacheSpecs group
-    holds only its names, type, block and page, as in the live worker records.
+    holds only its names, type, block and page, as in the live worker records. A worker holds its own tensor
+    allocations. A scheduler holds ``allocations``, the list of the first worker of its DP rank, because vLLM builds
+    the scheduler configuration as a deep copy of that worker's (kv_cache_utils.py:1109). A live block also holds
+    kv_cache_layout and, in each attention group, head_size, num_kv_heads and kv_quant_mode: the cache record does not
+    determine them, and no import check reads them.
     """
     cache = record["cache"]
     groups = []
     for group in cache["groups"]:
         spec_type = group["spec_type"]
         entry = {
-            "layer_names": group["layer_names"],
+            "layer_names": list(group["layer_names"]),
             "spec_type": spec_type,
             "block_size": group["block_size_tokens"],
             "page_size_bytes": group["spec_page_size_bytes"],
@@ -108,49 +120,77 @@ def _raw_cache_config(record: dict) -> dict:
                     "shapes",
                     "dtypes",
                 ):
-                    entry[key] = state[key]
+                    entry[key] = copy.deepcopy(state[key])
                 page = group["spec_page_size_bytes"]
                 entry["page_size_padded"] = page if page != state["real_page_size_bytes"] else None
             else:
                 entry.update(dtype=group["dtype"], page_size_padded=None)
                 if spec_type != _V033_SPEC + "CircularBufferSpec":
-                    entry["sliding_window"] = group["sliding_window"]
+                    entry.update(
+                        sliding_window=group["sliding_window"], attention_chunk_size=group["attention_chunk_size"]
+                    )
                 if spec_type == _V033_SPEC + "MLAAttentionSpec":
                     entry["cache_role"] = first["cache_role"]
         groups.append(entry)
-    raw = {"num_blocks": cache["num_blocks"], "groups": groups}
     if record["kind"] == "worker":
-        raw["tensor_allocations"] = [
-            {key: value for key, value in item.items() if key != "storage_id"} for item in cache["tensor_allocations"]
-        ]
-    return raw
+        allocations = _raw_allocations(cache)
+    return {"num_blocks": cache["num_blocks"], "groups": groups, "tensor_allocations": allocations}
 
 
 def _attention_groups(cache: dict) -> list[dict]:
-    """The attention groups that the observer writes for a worker, one for each cache group (observer.py)."""
-    return [
-        {
-            "kv_cache_group_id": index,
-            "backend_class": _V033_BACKEND,
-            "layer_names": list(group["layer_names"]),
-            "kernel_block_size": None,
-            "kernel_block_stride": 0,
-        }
-        for index, group in enumerate(cache["groups"])
-    ]
+    """The attention groups that the observer writes for a worker (observer._layer_views).
+
+    vLLM 0.33.0 builds one attention group for each backend, layer spec and Q-head count of a cache group, in the
+    order of their first layers (v1/worker/gpu/attn_utils.py:233-265). The test records name one backend and no head
+    count, so the layers of a cache group split by their layer spec and by the kernel blocks of their views. An
+    attention group holds a kernel block size only when it differs from the block size of its spec
+    (v1/worker/utils.py:292-299), and the stride of its kernel-block view, which is 0 when vLLM binds the view
+    unchanged (:402-403, :419-423). A Mamba view keeps the group block (:677-679).
+    """
+    entries = []
+    for index, group in enumerate(cache["groups"]):
+        parts: dict[tuple, dict] = {}
+        for name in group["layer_names"]:
+            view = cache["layer_tensors"][name][0]
+            kernel, stride = view["kernel_block_size_tokens"], view["kernel_block_stride"]
+            if kernel == group["block_size_tokens"]:
+                kernel = None
+            key = (json.dumps(group["layer_specs"][name], sort_keys=True), kernel, stride)
+            if key not in parts:
+                parts[key] = {
+                    "kv_cache_group_id": index,
+                    "backend_class": _V033_BACKEND,
+                    "layer_names": [],
+                    "kernel_block_size": kernel,
+                    "kernel_block_stride": stride,
+                }
+            parts[key]["layer_names"].append(name)
+        entries.extend(parts.values())
+    return entries
 
 
-def _derive_observer_copies(record: dict) -> None:
+def _derive_observer_copies(record: dict, first_workers: dict) -> None:
     """Write the raw cache block, and for a worker the attention groups, into a vLLM 0.33.0 record.
 
+    ``first_workers`` maps a phase and a DP rank to the raw tensor allocations of the first worker that the caller
+    derived with it. A scheduler takes that list, so derive the workers of a phase before its schedulers, as the
+    fixture writes them. A scheduler whose workers were not derived keeps the list of its own raw block.
     A record without layer specs is left as it is. So is a cache that an edit made malformed: an older check refuses
     it first.
     """
     if not runtime_memory._hybrid_evidence(record.get("cache")):
         return
+    key = (record.get("phase"), record.get("dp_rank"))
     try:
-        raw = _raw_cache_config(record)
-        attention = _attention_groups(record["cache"]) if record["kind"] == "worker" else None
+        if record["kind"] == "worker":
+            raw, attention = _raw_cache_config(record), _attention_groups(record["cache"])
+            if key not in first_workers:
+                first_workers[key] = copy.deepcopy(raw["tensor_allocations"])
+        else:
+            allocations = first_workers.get(key)
+            if allocations is None:
+                allocations = record["raw_cache_config"]["tensor_allocations"]
+            raw, attention = _raw_cache_config(record, copy.deepcopy(allocations)), None
     except (KeyError, TypeError, AttributeError, IndexError):
         return
     record["raw_cache_config"] = raw
@@ -380,8 +420,9 @@ def _v033_records(layout, *, prefix_caching, dp, max_model_len=4096, checkpoint=
         # Generic block-outer layout: one tensor per (group, spec), every group from byte 0, the
         # layer stride is the spec page and the block stride the largest group's bytes per block
         # (kv_cache_planning.py:574-605, :685-732). G0 packs two specs; G2 is the short last group.
-        # A block-outer view cannot split kernel blocks (kv_cache_interface.py:438-452). vLLM builds a block-outer
-        # layout only on its packed path, where every group is uniform (kv_cache_planning.py:1159).
+        # A block-outer view cannot split kernel blocks (kv_cache_interface.py:438-452). With layer pages of more
+        # than one size, as here, vLLM builds the groups of a block-outer layout on its packed path, where each bucket
+        # becomes a uniform group (kv_cache_planning.py:929-932, :1159).
         blocks, free, page, block, hash_block = 10, 9, 10_240, 64, 64
         mamba_block = block if prefix_caching else max_model_len
         wide = spec("FullAttentionSpec", 4096, "torch.bfloat16", 1)
@@ -672,6 +713,7 @@ def observation_fixture(
         "schema_version": "aisimulate-runtime-observations/v1",
         "configurations": {"tp2": {"launch": launch, "active_attempt_id": "attempt-001", "attempts": [attempt]}},
     }
+    first_workers: dict = {}
     for phase in ("prefill", "decode"):
         expected = {
             "workers": [
@@ -829,7 +871,7 @@ def observation_fixture(
             }
             record["resolved_config"]["parallel_config"]["enable_expert_parallel"] = not dense
             record["resolved_config"]["parallel_config"]["tensor_parallel_size"] = tp
-            _derive_observer_copies(record)
+            _derive_observer_copies(record, first_workers)
             ref = _write(
                 root / phase / (f"worker-{dp}-{rank['tp_rank']}.json" if worker else f"scheduler-{dp}.json"), record
             )
@@ -867,6 +909,7 @@ def stage_model_config(index_path):
 def _mutate(index_path, edit, *, derive=True):
     index = json.loads(index_path.read_text())
     attempt = index["configurations"]["tp2"]["attempts"][0]
+    first_workers: dict = {}
     for phase in attempt["phases"].values():
         for artifact in phase["artifacts"]:
             if artifact.get("kind") != "observation":
@@ -875,7 +918,7 @@ def _mutate(index_path, edit, *, derive=True):
             record = json.loads(path.read_text())
             edit(record)
             if derive:
-                _derive_observer_copies(record)
+                _derive_observer_copies(record, first_workers)
             path.write_text(json.dumps(record))
             artifact["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
     index_path.write_text(json.dumps(index))
@@ -3807,46 +3850,104 @@ def _live_records():
 
 
 def test_observer_copies_agree_with_the_live_records():
-    records = _live_records()
-    assert [record["kind"] for record in records] == ["scheduler", "worker", "worker", "worker", "worker"]
-    for record in records:
-        derived, recorded = _raw_cache_config(record), record["raw_cache_config"]
-        assert derived["num_blocks"] == recorded["num_blocks"]
-        assert len(derived["groups"]) == len(recorded["groups"])
-        for mine, theirs in zip(derived["groups"], recorded["groups"], strict=True):
-            # The helper writes no field that the live record does not hold, and every value is the live value.
-            assert {key: theirs.get(key, "absent") for key in mine} == mine
-        if record["kind"] == "worker":
-            assert derived["tensor_allocations"] == recorded["tensor_allocations"]
-            assert {frozenset(entry) for entry in _attention_groups(record["cache"])} == {
-                frozenset(entry) for entry in record["attention_groups"]
-            }
+    live = _live_records()
+    assert [record["kind"] for record in live] == ["scheduler", "worker", "worker", "worker", "worker"]
+    first_workers: dict = {}
+    # The workers come first, as in the fixture: the scheduler block holds the tensor allocations of the first one.
+    for recorded in [*live[1:], live[0]]:
+        record = {
+            key: value
+            for key, value in copy.deepcopy(recorded).items()
+            if key not in ("raw_cache_config", "attention_groups")
+        }
+        _derive_observer_copies(record, first_workers)
+        derived, raw = record["raw_cache_config"], recorded["raw_cache_config"]
+        # The derived block holds every key of the live block but the layout name, with the live value.
+        assert derived.keys() == raw.keys() - {"kv_cache_layout"}
+        assert (derived["num_blocks"], derived["tensor_allocations"]) == (raw["num_blocks"], raw["tensor_allocations"])
+        assert len(derived["groups"]) == len(raw["groups"])
+        for mine, theirs in zip(derived["groups"], raw["groups"], strict=True):
+            # A derived group holds every key of the live group but the three that the cache record does not
+            # determine, with the live value.
+            assert mine.keys() == theirs.keys() - {"head_size", "num_kv_heads", "kv_quant_mode"}
+            assert mine == {key: theirs[key] for key in mine}
+        if recorded["kind"] == "worker":
+            # Entry by entry: the cache group, the layers and the kernel fields of the live record. The test records
+            # name one backend class.
+            assert record["attention_groups"] == [
+                {**entry, "backend_class": _V033_BACKEND} for entry in recorded["attention_groups"]
+            ]
+            assert all(type(entry["backend_class"]) is str for entry in recorded["attention_groups"])
         else:
-            assert "tensor_allocations" not in derived
+            assert "attention_groups" not in record
+        # The copies share no list with the cache record.
+        for group in derived["groups"]:
+            group["layer_names"].append("extra")
+            for shape in group.get("shapes", []):
+                shape.append(0)
+        for item in derived["tensor_allocations"]:
+            item["layers"].append("extra")
+        for entry in record.get("attention_groups", []):
+            entry["layer_names"].append("extra")
+        assert record["cache"] == recorded["cache"]
 
 
-@pytest.mark.parametrize("layout", ["glm_tp4", "kernel_view", "mamba_hybrid", "layer_outer_short", "block_outer_short"])
-def test_synthetic_v033_records_hold_the_observer_copies(tmp_path, layout):
+@pytest.mark.parametrize(
+    "layout,kernels",
+    [
+        # The indexers of the MLA group read kernel blocks of 128 tokens, 3,200 apart, as in the live record.
+        ("glm_tp4", [(None, 0)] * 4 + [(128, 3200), (None, 0), (None, 0)]),
+        ("kernel_view", [(None, 0), (32, 32)]),
+        # The attention group of 64-token blocks reads kernel blocks of 16 tokens in place.
+        ("mamba_hybrid", [(16, 0), (None, 0), (None, 0)]),
+        ("layer_outer_short", [(16, 0), (None, 0), (None, 0)]),
+        # The attention group holds two layer specs, so it has two attention groups.
+        ("block_outer_short", [(None, 0)] * 4),
+    ],
+)
+def test_synthetic_v033_records_hold_the_observer_copies(tmp_path, layout, kernels):
     path, launches = observation_fixture(tmp_path, layout=layout)
-    kinds = set()
-    _mutate(
-        path,
-        lambda record: kinds.add(
-            (
-                record["kind"],
-                record["raw_cache_config"] == _raw_cache_config(record),
-                record["kind"] != "worker" or record["attention_groups"] == _attention_groups(record["cache"]),
-            )
-        ),
-        derive=False,
-    )
-    assert kinds == {("worker", True, True), ("scheduler", True, True)}
+    records = []
+    _mutate(path, records.append, derive=False)
+    assert {record["kind"] for record in records} == {"worker", "scheduler"}
+    for record in records:
+        raw, cache = record["raw_cache_config"], record["cache"]
+        assert raw.keys() == {"num_blocks", "groups", "tensor_allocations"}
+        assert (raw["num_blocks"], len(raw["groups"])) == (cache["num_blocks"], len(cache["groups"]))
+        # Every process of a DP rank holds the tensor allocations of its workers.
+        rank = [
+            item["cache"]
+            for item in records
+            if (item["kind"], item["phase"], item["dp_rank"]) == ("worker", record["phase"], record["dp_rank"])
+        ]
+        assert rank and all(raw["tensor_allocations"] == _raw_allocations(item) for item in rank)
+        if record["kind"] == "scheduler":
+            assert "attention_groups" not in record
+            continue
+        entries = record["attention_groups"]
+        assert [(entry["kernel_block_size"], entry["kernel_block_stride"]) for entry in entries] == kernels
+        for index, group in enumerate(cache["groups"]):
+            names = [name for entry in entries if entry["kv_cache_group_id"] == index for name in entry["layer_names"]]
+            assert sorted(names) == sorted(group["layer_names"])
+        for entry in entries:
+            group = cache["groups"][entry["kv_cache_group_id"]]
+            assert entry["backend_class"] == _V033_BACKEND
+            # An entry holds one layer spec, and every view of its layers reads the kernel blocks that it names.
+            assert len({json.dumps(group["layer_specs"][name], sort_keys=True) for name in entry["layer_names"]}) == 1
+            kernel = group["block_size_tokens"] if entry["kernel_block_size"] is None else entry["kernel_block_size"]
+            for name in entry["layer_names"]:
+                assert {
+                    (view["kernel_block_size_tokens"], view["kernel_block_stride"])
+                    for view in cache["layer_tensors"][name]
+                } == {(kernel, entry["kernel_block_stride"])}
     files = json.loads((tmp_path / "manifest.yaml").read_text())["runtime"]["source_files"]
     assert _V033_SOURCE_FILES.items() <= files.items()
     assert validate_observations(path, launches)["tp2"]["status"] == "complete"
 
 
 def test_legacy_fixture_records_hold_no_observer_copies(tmp_path):
+    # A real record of vLLM 0.27.0 or 0.28.0 holds both blocks too, in the shape of its version (observer.observe).
+    # The fixture writes none: no import check reads the blocks of a record without layer specs.
     path, _ = observation_fixture(tmp_path)
     seen = []
     _mutate(path, lambda record: seen.append({"raw_cache_config", "attention_groups"} & record.keys()))
@@ -3857,15 +3958,27 @@ def test_legacy_fixture_records_hold_no_observer_copies(tmp_path):
 
 def test_mutate_derives_the_observer_copies_again(tmp_path):
     path, _ = observation_fixture(tmp_path, layout="mamba_hybrid")
-    _mutate(path, lambda record: record["cache"].update(num_blocks=11))
-    _mutate(path, lambda record: record.update(seen=record["raw_cache_config"]["num_blocks"]), derive=False)
-    values = []
-    _mutate(path, lambda record: values.append(record["seen"]), derive=False)
-    assert set(values) == {11}
+
+    def edit(record):
+        record["cache"].update(num_blocks=11)
+        if (record["kind"], record["tp_rank"]) == ("worker", 0):
+            record["cache"]["tensor_allocations"][0]["offset"] = 4096
+
+    _mutate(path, edit)
+    records = []
+    _mutate(path, records.append, derive=False)
+    assert {record["raw_cache_config"]["num_blocks"] for record in records} == {11}
+    # The scheduler block follows the first worker of its DP rank, and each worker block its own cache record.
+    offsets = {
+        (record["kind"], record["tp_rank"]): record["raw_cache_config"]["tensor_allocations"][0]["offset"]
+        for record in records
+    }
+    assert offsets == {("worker", 0): 4096, ("worker", 1): 0, ("scheduler", None): 4096}
     # derive=False keeps a copy that an edit changed.
     _mutate(path, lambda record: record["raw_cache_config"].update(num_blocks=12), derive=False)
+    values = []
     _mutate(path, lambda record: values.append(record["raw_cache_config"]["num_blocks"]), derive=False)
-    assert values[-1] == 12
+    assert set(values) == {12}
 
 
 def test_block_outer_layout_holds_uniform_mamba_groups():

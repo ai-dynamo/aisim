@@ -266,6 +266,27 @@ def test_physical_grouped_capacity_deduplicates_aliases_and_charges_padding(pack
     assert [group["sliding_window"] for group in observed["groups"]] == [None, 32, 4]
 
 
+# The AttentionSpec subclasses of vLLM 0.33.0 (kv_cache_interface.py:619, :729, :809, :816, :861, :901, :968, :1008,
+# :1214, :1221, :1232).
+_ATTENTION_SPECS = frozenset(
+    {
+        "FullAttentionSpec",
+        "MLAAttentionSpec",
+        "HiddenStateCacheSpec",
+        "RSWASpec",
+        "ChunkedLocalAttentionSpec",
+        "SlidingWindowSpec",
+        "CircularBufferSpec",
+        "SlidingWindowMLASpec",
+        "EncoderOnlyAttentionSpec",
+        "CrossAttentionSpec",
+        "SinkFullAttentionSpec",
+    }
+)
+# SparseCacheRole of vLLM 0.33.0 (kv_cache_interface.py:196-198).
+_CACHE_ROLE = Enum("SparseCacheRole", {"SPARSE": "sparse", "INDEXER": "indexer"}, type=str)
+
+
 def _spec(name, **fields):
     if name == "UniformTypeKVCacheSpecs":
         # UniformTypeKVCacheSpecs (kv_cache_interface.py:1290-1390) overrides none of the three
@@ -277,10 +298,17 @@ def _spec(name, **fields):
         spec = type(name, (), {"__module__": "vllm.v1.kv_cache_interface", **properties})()
     else:
         spec = _typed("vllm.v1.kv_cache_interface", name)
-        # The vLLM 0.33.0 defaults (kv_cache_interface.py:569, :737, :1104). Explicit fields win.
-        defaults = {"tokens_per_state": -1 if name == "MambaSpec" else 1}
-        if name == "MLAAttentionSpec":
-            defaults["cache_role"] = "SPARSE"
+        # The vLLM 0.33.0 defaults. An AttentionSpec holds tokens_per_state 1 (kv_cache_interface.py:569) and a
+        # MambaSpec -1 (:1104). An MLAAttentionSpec, and so a HiddenStateCacheSpec, holds the role SPARSE (:737,
+        # :809). A class that derives from KVCacheSpec directly, such as HiSparseHotSpec (:486), holds neither.
+        # Explicit fields win.
+        defaults = {}
+        if name in _ATTENTION_SPECS:
+            defaults["tokens_per_state"] = 1
+        elif name == "MambaSpec":
+            defaults["tokens_per_state"] = -1
+        if name in ("MLAAttentionSpec", "HiddenStateCacheSpec"):
+            defaults["cache_role"] = _CACHE_ROLE.SPARSE
         fields = {**defaults, **fields}
     vars(spec).update(fields)
     return spec
@@ -291,9 +319,14 @@ def test_uniform_spec_fake_raises_as_the_vllm_class_does():
     for name in ("num_heads", "tokens_per_state", "state_content_size_bytes"):
         with pytest.raises(NotImplementedError):
             getattr(uniform, name)
-    assert _spec("MLAAttentionSpec").cache_role == "SPARSE"
+    role = _spec("MLAAttentionSpec").cache_role
+    # vLLM holds the role as an enum member, which the observer records by its name.
+    assert isinstance(role, Enum) and (role.name, role.value) == ("SPARSE", "sparse")
+    assert _spec("HiddenStateCacheSpec").cache_role is role
     assert (_spec("FullAttentionSpec").tokens_per_state, _spec("CircularBufferSpec").tokens_per_state) == (1, 1)
     assert _mamba().tokens_per_state == -1
+    # HiSparseHotSpec derives from KVCacheSpec directly (kv_cache_interface.py:486): no token state and no role.
+    assert vars(_spec("HiSparseHotSpec")) == {}
 
 
 def _group(names, spec):
@@ -534,7 +567,7 @@ def test_import_leaves_the_prefix_marker_of_a_sliding_window_mla_group_out():
 
 
 def test_uniform_type_groups_record_their_inner_specs():
-    role = Enum("SparseCacheRole", {"SPARSE": "sparse", "INDEXER": "indexer"}, type=str)
+    role = _CACHE_ROLE
     latent, indexer = (
         _spec(
             "MLAAttentionSpec",
