@@ -3169,31 +3169,54 @@ def _prefill(edit):
     return lambda record: edit(record) if record["phase"] == "prefill" else None
 
 
-@pytest.mark.parametrize("case", ["tokens_per_state", "group_dtype"])
-def test_v033_plain_group_layer_specs_must_equal_the_group_spec(tmp_path, case):
+@pytest.mark.parametrize(
+    "case,diagnostic",
+    [
+        ("tokens_per_state", _PLAIN_SPECS),
+        ("group_dtype", _PLAIN_SPECS),
+        ("mamba_tokens_per_state", "cache group layer specs contradict its group spec: ['mamba.0', 'mamba.2']"),
+    ],
+    ids=["tokens_per_state", "group_dtype", "mamba_tokens_per_state"],
+)
+def test_v033_plain_group_layer_specs_must_equal_the_group_spec(tmp_path, case, diagnostic):
     path, launches = observation_fixture(tmp_path, layout="mamba_hybrid")
 
+    # Every record of every phase holds the edit, so the phases keep one cache geometry and only this relation breaks.
     def edit(record):
-        group = record["cache"]["groups"][0]  # the FullAttentionSpec group of attn.0 and attn.1
+        groups = record["cache"]["groups"]
         if case == "tokens_per_state":
+            group = groups[0]  # the FullAttentionSpec group of attn.0 and attn.1
             group["layer_specs"]["attn.1"] = {**group["layer_specs"]["attn.1"], "tokens_per_state": 2}
+        elif case == "group_dtype":
+            groups[0]["dtype"] = "torch.float16"
         else:
-            group["dtype"] = "torch.float16"
+            group = groups[1]  # the MambaSpec group of mamba.0 and mamba.2
+            group["layer_specs"]["mamba.2"] = {**group["layer_specs"]["mamba.2"], "tokens_per_state": 1}
 
-    _mutate(path, _prefill(edit))
+    _mutate(path, edit)
     result = validate_observations(path, launches)["tp2"]
-    assert (result["status"], result["diagnostics"]) == ("incomplete", [f"tp2: {_PLAIN_SPECS}"])
+    assert (result["status"], result["diagnostics"]) == ("incomplete", [f"tp2: {diagnostic}"])
 
 
 @pytest.mark.parametrize(
-    "kinds,complete", [(("worker",), False), (("scheduler",), False), (("worker", "scheduler"), True)]
+    "kinds,ranks,complete",
+    [
+        (("worker",), (0, 1), False),
+        (("scheduler",), (0, 1), False),
+        (("worker", "scheduler"), (0, 1), True),
+        # Each DP rank runs its own engine core with its own scheduler (v1/engine/core.py:150, :180), so a worker
+        # holds the unit of the scheduler of its DP rank and not of another rank.
+        (("scheduler",), (1,), False),
+        (("worker", "scheduler"), (1,), True),
+    ],
+    ids=["workers", "schedulers", "both", "scheduler_of_rank_1", "rank_1"],
 )
-def test_v033_prefix_match_unit_must_agree_between_worker_and_scheduler(tmp_path, kinds, complete):
+def test_v033_prefix_match_unit_must_agree_between_worker_and_scheduler(tmp_path, kinds, ranks, complete):
     path, launches = observation_fixture(tmp_path, layout="mamba_hybrid")
 
     def edit(record):
         # 64 tokens is the hash block size that the scheduler records, so the unit changes no block size.
-        if record["kind"] in kinds:
+        if record["kind"] in kinds and record["dp_rank"] in ranks:
             record["resolved_config"]["cache_config"]["prefix_match_unit"] = 64
 
     _mutate(path, _prefill(edit))
@@ -3205,24 +3228,61 @@ def test_v033_prefix_match_unit_must_agree_between_worker_and_scheduler(tmp_path
     assert result["diagnostics"] == ["tp2: runtime prefix-match unit differs between scheduler and worker"]
 
 
-@pytest.mark.parametrize("case,complete", [("width", False), ("unknown_dtype", True), ("malformed_dtype", False)])
-def test_v033_indexer_view_width_must_match_its_spec_dtype(tmp_path, case, complete):
+# The indexer view of the kernel_view layout in elements of 1, 2 or 4 bytes: the same 128-byte kernel page of 8
+# states in each kernel block.
+_INDEXER_VIEWS = {
+    width: {"element_size_bytes": width, "shape": [226, 8, 16 // width], "stride_bytes": [128, 16, width]}
+    for width in (1, 2, 4)
+}
+
+
+@pytest.mark.parametrize(
+    "dtype,width,complete",
+    [
+        # vLLM's element sizes of these dtypes (torch_utils.py:347-349). The indexer caches of vLLM 0.33.0 store
+        # uint8 (models/deepseek_v2.py:733), float8_e4m3fn or bfloat16 (models/minimax_m3/common/indexer.py:118-121).
+        *[
+            (dtype, width, True)
+            for dtype, width in [
+                ("torch.uint8", 1),
+                ("torch.int8", 1),
+                ("torch.float8_e4m3fn", 1),
+                ("torch.float8_e5m2", 1),
+                ("torch.float16", 2),
+                ("torch.bfloat16", 2),
+                ("torch.float32", 4),
+            ]
+        ],
+        *[
+            (dtype, width, False)
+            for dtype, width in [
+                ("torch.uint8", 2),
+                ("torch.int8", 4),
+                ("torch.float8_e4m3fn", 2),
+                ("torch.float8_e5m2", 4),
+                ("torch.float16", 1),
+                ("torch.bfloat16", 1),
+                ("torch.bfloat16", 4),
+                ("torch.float32", 2),
+            ]
+        ],
+        # A dtype outside the table gets no check.
+        ("torch.qint8", 1, True),
+        # The observer records a dtype by its name, so a dtype that is not a string is no dtype.
+        (["torch.uint8"], 1, False),
+    ],
+)
+def test_v033_indexer_view_width_must_match_its_spec_dtype(tmp_path, dtype, width, complete):
     path, launches = observation_fixture(tmp_path, layout="kernel_view")
 
     def edit(record):
         if record["kind"] != "worker":
             return
-        cache = record["cache"]
-        if case == "width":
-            # Two-byte elements in the same 256-byte page: 8 states of 8 elements in each kernel block.
-            cache["layer_tensors"]["indexer.0"][0].update(
-                element_size_bytes=2, shape=[226, 8, 8], stride_bytes=[128, 16, 2]
-            )
-        elif case == "unknown_dtype":
-            cache["groups"][0]["layer_specs"]["indexer.0"]["dtype"] = "torch.qint8"
-        else:
-            # The observer records a dtype by its name, so a dtype that is not a string is no dtype.
-            cache["groups"][0]["layer_specs"]["indexer.0"]["dtype"] = ["torch.uint8"]
+        cache, group = record["cache"], record["cache"]["groups"][0]
+        cache["layer_tensors"]["indexer.0"][0].update(copy.deepcopy(_INDEXER_VIEWS[width]))
+        group["layer_specs"]["indexer.0"]["dtype"] = dtype
+        # The group holds the dtype of its layers when they share one (runtime/fpm_memory_observer.py, cache_groups).
+        group["dtype"] = dtype if dtype == group["layer_specs"]["latent.0"]["dtype"] else None
 
     _mutate(path, edit)
     result = validate_observations(path, launches)["tp2"]
@@ -3249,6 +3309,13 @@ _SPEC_OF = {
         ("mamba_hybrid", "mamba", None, False),
         ("kernel_view", "latent", "no_role", False),
         ("kernel_view", "latent", "null_role", False),
+        # The two members of SparseCacheRole (kv_cache_interface.py:196-198), which the observer records by name.
+        ("kernel_view", "latent", "DEFAULT", False),
+        ("kernel_view", "latent", "sparse", False),
+        # A spec inside a uniform group (kv_cache_interface.py:1291-1298).
+        ("kernel_view", "latent", None, False),
+        ("glm_tp4", "mamba", None, False),
+        ("kernel_view", "latent", 1, True),
         ("mamba_hybrid", "attention", "1/4", True),
     ],
 )
@@ -3264,6 +3331,8 @@ def test_v033_layer_specs_must_hold_tokens_per_state_and_the_mla_role(tmp_path, 
                     spec.pop("cache_role")
                 elif change == "null_role":
                     spec["cache_role"] = None
+                elif change in ("DEFAULT", "sparse"):
+                    spec["cache_role"] = change
                 else:
                     spec["tokens_per_state"] = change
 

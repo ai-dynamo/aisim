@@ -606,6 +606,8 @@ _STATE_DTYPE_BYTES = {"torch.float32": 4, "torch.float16": 2, "torch.bfloat16": 
 # The element bytes of the dtypes that an indexer spec may hold. vLLM views each layer in the dtype of its spec
 # (kv_cache_interface.py:467, :479-480), and both indexer caches only drop the head axis when they bind the view
 # (models/deepseek_v2.py:653-656, models/minimax_m3/common/indexer.py:141-143). A dtype outside the table gets no check.
+# The observer records the dtype of such a spec by its name (runtime/fpm_memory_observer.py, _spec_dtype), so a value
+# that is not a string is refused.
 _INDEXER_DTYPE_BYTES = {
     "torch.uint8": 1,
     "torch.int8": 1,
