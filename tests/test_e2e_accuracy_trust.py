@@ -264,6 +264,53 @@ def test_a_checkout_local_venv_module_never_runs_in_the_trusted_bootstrap(tmp_pa
     assert (tmp_path / "runner/trusted-venv/bin/python").exists()
 
 
+@pytest.mark.parametrize("job_id", ["measurements", "shards", "campaign", "agentx", "qualify-agentx"])
+def test_trusted_pip_ignores_checkout_configuration(tmp_path, job_id):
+    workspace = tmp_path / "workspace"
+    config = workspace / ".pip/pip.conf"
+    config.parent.mkdir(parents=True)
+    interpreter = workspace / "config-python"
+    interpreter.write_text('#!/bin/sh\n: > "$HOME/PIP_CONFIG_EXECUTED"\nexit 86\n')
+    interpreter.chmod(0o755)
+    config.write_text(f"[global]\npython = {interpreter}\n")
+    requirements = workspace / "trusted/scripts/e2e_accuracy/requirements.txt"
+    requirements.parent.mkdir(parents=True)
+    requirements.write_text("")
+    runner_temp = tmp_path / "runner"
+    subprocess.run([sys.executable, "-I", "-m", "venv", str(runner_temp / "trusted-venv")], check=True)
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PIP_") and key != "_PIP_RUNNING_IN_SUBPROCESS"
+    } | {
+        "HOME": str(workspace),
+        "XDG_CONFIG_HOME": str(workspace / ".config"),
+        "RUNNER_TEMP": str(runner_temp),
+        "PIP_NO_INDEX": "1",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    }
+    command = next(
+        line.strip()
+        for step in load("e2e-accuracy-branch.yml")["jobs"][job_id]["steps"]
+        for line in step.get("run", "").splitlines()
+        if 'trusted-venv/bin/pip" install' in line
+    )
+
+    def run(text):
+        return subprocess.run(
+            ["bash", "-e", "-c", text], cwd=workspace, env=environment, capture_output=True, text=True
+        )
+
+    # Control: even hash-required installs execute the configured interpreter before checking requirements.
+    marker = workspace / "PIP_CONFIG_EXECUTED"
+    control = run(command.replace("PIP_CONFIG_FILE=/dev/null ", "", 1))
+    assert control.returncode == 86 and marker.exists(), control.stderr
+    marker.unlink()
+    result = run(command)
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists(), "the trusted pip install executed the checkout-configured interpreter"
+
+
 @pytest.mark.parametrize("module", ["json", "re"])
 def test_a_checkout_local_module_never_runs_in_the_revision_resolver(tmp_path, module):
     workspace, environment = _poisoned_workspace(tmp_path, module)
