@@ -287,7 +287,8 @@ Optional scheduled-work detail for qualified Mamba operations:
 
 | Field | Default | Behavior |
 | --- | --- | --- |
-| `scheduled_requests.prefill_chunks` | absent | Exact prefill groups as `[request_count, new_tokens_per_request, prefix_tokens_per_request]`. Counts and new-token lengths must be positive; weighted request, new-token and prefix totals must match the three prefill counters. |
+| `scheduled_requests.prefill_chunks` | absent | Exact prompt groups as `[request_count, new_tokens_per_request, prefix_tokens_per_request]`. Counts and new-token lengths must be positive; weighted request and prefix totals must match the counters. Weighted new tokens plus explicit query padding must equal `sum_prefill_tokens`. |
+| `scheduled_requests.sum_prefill_padding_tokens` | `0` | Query positions beyond the actual prompt chunks, included in `sum_prefill_tokens`. Requires exact `prefill_chunks`; cannot exceed the scheduled prefill total. |
 
 Native op-level Replay supplies these groups from its observed chunks. Qualified
 Mamba operations use each group's actual length and cached prefix, preserving
@@ -297,6 +298,10 @@ the reported prefill requests and treats all chunks as cached when any prefill
 prefix is present. The groups are part of the pricing cache identity. For example,
 `[[1, 1000, 0], [1, 500, 64]]` represents two prefills with 1500 new tokens
 and 64 cached tokens. Whole-model FPM and regression keep their existing inputs.
+For a 17-token prompt with a 16-token cache hit, vLLM MTP3 can schedule
+four query positions. Replay retains `prefill_chunks: [[1, 1, 16]]`,
+`sum_prefill_tokens: 4` and `sum_prefill_padding_tokens: 3`: Mamba processes
+one prompt token while shared token-major operations retain four query positions.
 
 The canonical constructor currently supports explicit speculative schemes with
 OP/SOL timing. FPM interpolation and regression are unsupported candidates for

@@ -530,6 +530,77 @@ def test_mixed_step_breakdown_bridge_shapes_missing_attention_passes(monkeypatch
     assert components["energy_wms"] == 38.0
 
 
+@pytest.mark.parametrize(
+    "native,public",
+    [("context_attention", "context_attention (scaled)"), ("fpm_forward_decode", "generation_attention")],
+)
+def test_mixed_display_alias_preserves_literal_rows(monkeypatch, native, public):
+    class Handle:
+        def _mixed_step_breakdown_per_op_with_metadata(self, *args, **kwargs):
+            return (
+                [(public, 3.0, 30.0, "estimated"), (f"{public} (operation)", 5.0, 50.0, "silicon")],
+                [(native, 2.0, 20.0, "silicon")],
+                [],
+                10.0,
+            )
+
+        def last_provenance(self):
+            return None
+
+    monkeypatch.setattr(rust_engine_step, "_cached_engine_handle", lambda *_: Handle())
+    result = rust_engine_step.estimate_mixed_step_breakdown_with_rust(
+        None,
+        None,
+        ctx_tokens=16,
+        gen_tokens=0,
+        isl=16,
+        osl=1,
+        prefix=0,
+    )
+    assert result["per_op_latency_ms"][public] == 2.0
+    assert result["per_op_latency_ms"][f"{public} (operation)"] == 5.0
+    assert result["per_op_latency_ms"][f"{public} (operation) (operation)"] == 3.0
+    assert sum(result["per_op_latency_ms"].values()) == result["latency_ms"] == 10.0
+    assert sum(result["per_op_energy_wms"].values()) == result["energy_wms"] == 100.0
+
+
+def test_mixed_display_alias_matches_native_total(monkeypatch):
+    from collections import OrderedDict
+
+    from aisim_core.sdk import operations
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+
+    monkeypatch.setattr(rust_engine_step, "_ENGINE_HANDLE_CACHE", OrderedDict())
+    model = get_model("Qwen/Qwen3-32B", ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1), "vllm")
+    model.context_ops.append(operations.GEMM("context_attention (scaled)", 1, 64, 64, common.GEMMQuantMode.bfloat16))
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL", allow_unlisted_version=True)
+    args = dict(ctx_tokens=128, gen_tokens=1, isl=128, osl=2, prefix=0)
+    result = rust_engine_step.estimate_mixed_step_breakdown_with_rust(model, database, **args)
+    native = rust_engine_step.estimate_mixed_step_latency_with_rust(model, database, **args)
+    assert result["per_op_latency_ms"]["context_attention (scaled)"] > 0
+    assert result["per_op_latency_ms"]["context_attention (scaled) (operation)"] > 0
+    assert sum(result["per_op_latency_ms"].values()) == pytest.approx(native)
+    assert sum(result["per_op_energy_wms"].values()) == pytest.approx(result["energy_wms"])
+
+
+@pytest.mark.parametrize("model_name", ["stepfun-ai/Step-3.7-Flash", "XiaomiMiMo/MiMo-V2-Flash"])
+def test_non_mamba_hybrid_rebuild_refreshes_engine_identity(model_name):
+    from dataclasses import replace
+
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+
+    model = get_model(model_name, ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1), "trtllm")
+    database = get_database_view("b200_sxm", "trtllm", "1.3.0rc20", database_mode="SOL", allow_unlisted_version=True)
+    original = model._hybrid_config
+    key = rust_engine_step.engine_identity(model, database)
+    model.set_hybrid_config(replace(original, sliding_window_size=original.sliding_window_size + 16))
+    assert rust_engine_step.engine_identity(model, database) != key
+    model.set_hybrid_config(original)
+    assert rust_engine_step.engine_identity(model, database) == key
+
+
 def test_decode_step_breakdown_folds_per_op_entries(monkeypatch) -> None:
     """The decode bridge returns latency, energy, per-op data, and executed
     fallback provenance from ``EngineHandle.decode_step_per_op``."""

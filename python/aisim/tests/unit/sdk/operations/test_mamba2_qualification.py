@@ -622,16 +622,53 @@ def test_run_agg_reuse_keeps_a_renamed_neighbor_rejection():
             _agg_ttft(warm, clash, database)
 
 
-def test_mixed_power_coverage_counts_each_mamba_query():
+def test_mixed_power_coverage_counts_each_mamba_query(tmp_path):
     # The qualified convolution prices a powered measured row and the scan
     # prices unpowered SOL. Under one name their rows fold, so coverage must
     # come from each query, not from the folded row's energy.
     import json
 
+    # Synthetic row: exactly 2 ms at 500 W for the convolution. There is no
+    # scan row, so its qualified FP16 query uses unpowered SOL independently
+    # of any installed performance data.
+    from pathlib import Path
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
     import aisim_core
     from aisim_core.sdk import rust_engine_step
+    from aisim_core.sdk.perf_database import PerfDatabase
 
-    database = _hybrid_trtllm_database()
+    systems = tmp_path / "systems"
+    systems.mkdir()
+    source = Path(aisim_core.__file__).parent / "systems" / "b200_sxm.yaml"
+    (systems / source.name).write_text(source.read_text())
+    data = systems / "data/b200_sxm/linear_attention/trtllm/1.3.0rc20"
+    data.mkdir(parents=True)
+    pq.write_table(
+        pa.table(
+            {
+                "kernel_source": ["causal_conv1d_fn"],
+                "phase": ["context"],
+                "batch_size": [1],
+                "seq_len": [2048],
+                "d_model": [2688],
+                "d_state": [128],
+                "d_conv": [4],
+                "nheads": [64],
+                "head_dim": [64],
+                "n_groups": [8],
+                "chunk_size": [128],
+                "latency": [2.0],
+                "power": [500.0],
+            }
+        ),
+        data / "mamba2_perf.parquet",
+    )
+    database = PerfDatabase(
+        "b200_sxm", "trtllm", "1.3.0rc20", str(systems), database_mode="HYBRID", strict_provenance=False
+    )
 
     def step(model):
         return rust_engine_step.estimate_mixed_step_breakdown_with_rust(
@@ -640,6 +677,11 @@ def test_mixed_power_coverage_counts_each_mamba_query():
 
     apart = _nano_with_state_dtypes(conv1d="bfloat16", ssm="float16")
     shared = _nano_with_state_dtypes(conv1d="bfloat16", ssm="float16")
+    for model in (apart, shared):
+        model.context_ops = [
+            op for op in model.context_ops if op._name in ("context_mamba_conv1d", "context_mamba_ssm")
+        ]
+        model.generation_ops = []
     index = next(i for i, op in enumerate(shared.context_ops) if op._name == "context_mamba_ssm")
     scan = json.loads(shared.context_ops[index]._spec_json())
     scan["Mamba2"]["name"] = "context_mamba_conv1d"
@@ -649,10 +691,39 @@ def test_mixed_power_coverage_counts_each_mamba_query():
     assert energy["context_mamba_conv1d"] > 0 and energy["context_mamba_ssm"] == 0
     # Coverage counts the whole powered convolution and none of the scan.
     covered = one["covered_latency_ms"]
-    assert latency["context_mamba_conv1d"] <= covered <= sum(latency.values()) - latency["context_mamba_ssm"]
+    assert latency["context_mamba_conv1d"] == pytest.approx(46.0)  # 23 layers * 2 ms
+    assert covered == pytest.approx(46.0)
     folded = two["per_op_latency_ms"]["context_mamba_conv1d"]
     assert folded == pytest.approx(latency["context_mamba_conv1d"] + latency["context_mamba_ssm"], rel=1e-12)
     assert two["covered_latency_ms"] == pytest.approx(one["covered_latency_ms"], rel=1e-12)
+
+
+def test_hybrid_rebuild_invalidates_warm_engine_and_aggregate_caches():
+    from dataclasses import replace
+
+    from aisim_core.sdk import config, rust_engine_step
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.models import get_model
+
+    database = _hybrid_trtllm_database()
+    model = get_model(
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        config.ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1, nextn=3),
+        "trtllm",
+    )
+    backend = get_backend("trtllm", "b200_sxm")
+    first = _agg_ttft(backend, model, database)
+    identity = rust_engine_step.engine_identity(model, database)
+    handle = rust_engine_step._cached_engine_handle(model, database)
+    assert rust_engine_step._cached_engine_handle(model, database) is handle
+    model.set_hybrid_config(replace(model._hybrid_config, mamba_ssm_cache_dtype="float16"))
+    assert rust_engine_step.engine_identity(model, database) != identity
+    assert rust_engine_step._cached_engine_handle(model, database) is not handle
+    rebuilt = _agg_ttft(backend, model, database)
+    fresh = get_model(model.model_path, copy.deepcopy(model.config), "trtllm")
+    fresh.set_hybrid_config(copy.deepcopy(model._hybrid_config))
+    assert rebuilt == _agg_ttft(get_backend("trtllm", "b200_sxm"), fresh, database)
+    assert rebuilt != first
 
 
 @pytest.mark.parametrize("reserved", ["context_attention", "context_attention (scaled)"])

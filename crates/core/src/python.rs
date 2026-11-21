@@ -1583,11 +1583,22 @@ impl AicTimingModel {
                     .get(index)
                     .filter(|groups| !groups.is_empty())
                 {
+                    let prompt_tokens = groups
+                        .iter()
+                        .try_fold(0_u32, |total, &[count, new, _]| {
+                            count
+                                .checked_mul(new)
+                                .and_then(|tokens| total.checked_add(tokens))
+                        })
+                        .context("prefill chunk token total overflow")?;
+                    metrics.scheduled_requests.sum_prefill_padding_tokens = query[1]
+                        .checked_sub(prompt_tokens)
+                        .context("prefill prompt chunks exceed scheduled query tokens")?;
                     metrics.scheduled_requests.prefill_chunks = Some(groups.clone());
                 }
-                metrics
+                Ok(metrics)
             })
-            .collect();
+            .collect::<Result<_>>()?;
         let whole_model = matches!(dispatch, IterationDispatch::WholeModel { .. });
         if whole_model && !capture {
             let total_ms = model
@@ -10338,6 +10349,113 @@ mod tests {
                 find(&evidence.prefill, "context_ssm").unwrap(),
                 ms(prefill_bytes)
             ));
+        }
+    }
+
+    #[test]
+    fn op_level_replay_keeps_mtp_padding_separate_from_prompt_chunks() {
+        use crate::engine::{DirectRequest, MockEngineArgs, VllmCore};
+        use crate::perfmodel::fpm::ForwardPassPerfOptions;
+        pyo3::prepare_freethreaded_python();
+        let (native, _root) = crate::perfmodel::engine::runtime::tests::measured_mamba_engine();
+        let native = Arc::new(native);
+        let model = Arc::new(ForwardPassPerfModel::from_engine(
+            Arc::clone(&native),
+            ForwardPassPerfOptions::default(),
+        ));
+        let engine = Python::with_gil(|py| {
+            Py::new(
+                py,
+                crate::AicEngine::from_shared_engine(Arc::clone(&native)),
+            )
+            .unwrap()
+            .into_any()
+        });
+        let mut timing = with_iteration_pricing(python_timing_model(engine, false), &model);
+        for capture in [false, true] {
+            timing.diagnostic_model = capture.then(|| Arc::clone(&model));
+            for running_decode in [false, true] {
+                let mut core = VllmCore::new(
+                    MockEngineArgs::builder()
+                        .block_size(16)
+                        .num_gpu_blocks(64)
+                        .max_num_batched_tokens(Some(64))
+                        .max_num_seqs(Some(4))
+                        .enable_chunked_prefill(true)
+                        .enable_prefix_caching(true)
+                        // Native MTP's documented prefix-cache mode keeps the
+                        // last full block, allowing the 16-token cache hit.
+                        .disable_eagle_block_drop(true)
+                        .speedup_ratio(1.0)
+                        .aic_nextn(Some(3))
+                        .aic_nextn_accept_rates(Some("1,1,1".into()))
+                        .build()
+                        .unwrap(),
+                );
+                let seed_output = if running_decode { 16 } else { 1 };
+                core.receive(DirectRequest {
+                    tokens: (0..17).collect(),
+                    max_output_tokens: seed_output,
+                    uuid: Some(uuid::Uuid::from_u128(1)),
+                    ..Default::default()
+                });
+                let first = core.schedule_pass(None, 0.0).unwrap();
+                let price = timing.predict_iteration_ms(&[first]).unwrap().unwrap();
+                let first = core.resolve_pass(Some(&price)).unwrap();
+                // A no-logits prefill is the unpadded control; requesting
+                // output makes this same cached suffix pay MTP query padding.
+                let follower_output = if running_decode { 8 } else { 0 };
+                core.receive(DirectRequest {
+                    tokens: (0..17).collect(),
+                    max_output_tokens: follower_output,
+                    uuid: Some(uuid::Uuid::from_u128(2)),
+                    ..Default::default()
+                });
+                let rank = core.schedule_pass(None, first.end_ms).unwrap();
+                let prefill = rank.prefill.as_ref().unwrap();
+                assert_eq!(prefill.requests, vec![(1, 16, 17)]);
+                assert_eq!(
+                    prefill.totals.new_tokens,
+                    if running_decode { 4 } else { 1 }
+                );
+                let (latency, evidence) = priced_with_evidence(&timing, |timing| {
+                    iteration_ms(timing, std::slice::from_ref(&rank))
+                });
+                // One actual token (18,560 activation bytes), one 1 MiB
+                // recurrent-state read and write, at B200's 7.7 TB/s.
+                let expected = 2_115_712.0 / 7.7e12 * 1000.0;
+                assert!((evidence.prefill.latency_ms - expected).abs() < 1e-9);
+                let pass = core
+                    .resolve_pass(Some(&IterationMs { total_ms: latency }))
+                    .unwrap();
+                let mut now = pass.end_ms;
+                let mut outputs = first
+                    .output_signals
+                    .iter()
+                    .chain(&pass.output_signals)
+                    .filter(|signal| signal.token_id.is_some())
+                    .count();
+                let mut completed = first.completed_requests + pass.completed_requests;
+                for _ in 0..32 {
+                    if core.is_empty() {
+                        break;
+                    }
+                    let rank = core.schedule_pass(None, now).unwrap();
+                    let price = timing.predict_iteration_ms(&[rank]).unwrap().unwrap();
+                    let pass = core.resolve_pass(Some(&price)).unwrap();
+                    assert!(pass.output_signals.iter().all(|signal| !signal.rejected));
+                    now = pass.end_ms;
+                    outputs += pass
+                        .output_signals
+                        .iter()
+                        .filter(|signal| signal.token_id.is_some())
+                        .count();
+                    completed += pass.completed_requests;
+                }
+                assert!(core.is_drained());
+                assert_eq!(completed, 2);
+                assert_eq!(outputs, seed_output + follower_output);
+            }
         }
     }
 

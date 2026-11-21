@@ -29,7 +29,6 @@ class _Shim:
         return wrapped if n == "Mamba2Kernel" else getattr(real_ops, n)
 
 
-nh.ops = _Shim()
 from aisim_core.sdk import common, config
 from aisim_core.sdk.backends.factory import get_backend
 from aisim_core.sdk.models import get_model
@@ -44,20 +43,33 @@ def step(qualified, ctx):
     qualify = qualified
     db = get_database("b200_sxm", "trtllm", "1.3.0rc20")
     db.set_default_database_mode(common.DatabaseMode.HYBRID)
-    model = get_model(MODEL, config.ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1), "trtllm")
+    nh.ops = _Shim()
+    try:
+        model = get_model(MODEL, config.ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1), "trtllm")
+    finally:
+        nh.ops = real_ops
     runtime = config.RuntimeConfig(batch_size=16, isl=4096, osl=64, prefix=1024)
     step = MixedStepInput(context_tokens=ctx, num_decode_requests=13)
     return get_backend("trtllm", "b200_sxm").run_mixed(model, db, runtime, step).per_op_latency_ms
 
 
-qualified, legacy_6144, legacy_7104 = step(True, 8128), step(False, 8192), step(False, 8128)
-for name, ms in qualified.items():
-    if name not in legacy_6144:
-        print(f"{name:28s} {ms:.6f}  (qualified graph only)")
-        continue
-    match = "own geometry"
-    if ms == legacy_6144[name]:
-        match = "= legacy 6144"
-    elif ms == legacy_7104[name]:
-        match = "= legacy 7104"
-    print(f"{name:28s} {ms:.6f}  legacy 6144 {legacy_6144[name]:.6f}  legacy 7104 {legacy_7104[name]:.6f}  {match}")
+def main():
+    qualified, legacy_6144, legacy_7104 = step(True, 8128), step(False, 8192), step(False, 8128)
+    for name, ms in qualified.items():
+        if name not in legacy_6144:
+            print(f"{name:28s} {ms:.6f}  (qualified graph only)")
+            continue
+        match = "own geometry"
+        if ms == legacy_6144[name]:
+            match = "= legacy 6144"
+        elif ms == legacy_7104[name]:
+            match = "= legacy 7104"
+        print(f"{name:28s} {ms:.6f}  legacy 6144 {legacy_6144[name]:.6f}  legacy 7104 {legacy_7104[name]:.6f}  {match}")
+
+    for name in ("context_mamba_in_proj_gemm", "context_moe"):
+        assert qualified[name] == legacy_6144[name], f"{name}: expected the 6144-token query"
+        assert qualified[name] != legacy_7104[name], f"{name}: control does not distinguish token counts"
+
+
+if __name__ == "__main__":
+    main()

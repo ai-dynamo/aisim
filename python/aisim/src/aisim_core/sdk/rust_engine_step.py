@@ -786,8 +786,9 @@ class RustForwardPassPerfModel:
         ``scheduled_requests.prefill_chunks`` groups of
         ``[requests, new_tokens_per_request, prefix_tokens_per_request]``.
         Each group's request and new-token counts must be positive; its prefix
-        may be zero. Weighted totals must match ``num_prefill_requests``,
-        ``sum_prefill_tokens`` and ``sum_prefill_kv_tokens``. Native Replay
+        may be zero. Weighted request and prefix totals must match the counters;
+        weighted new tokens plus ``sum_prefill_padding_tokens`` must match
+        ``sum_prefill_tokens``. Native Replay
         supplies observed groups; callers without groups retain balanced
         aggregate pricing.
 
@@ -1488,10 +1489,14 @@ def estimate_mixed_step_breakdown_with_rust(
         "fpm_forward_decode": "generation_attention",
     }
     native_names = {entry[0] for group in (shared_ops, ctx_attn_ops, decode_attn_ops) for entry in group}
-    for native, public in public_names.items():
-        # Folding two distinct operations under one reported name would hide one's values.
+    for native, public in tuple(public_names.items()):
+        # Keep attention's legacy display alias and preserve a literal-name
+        # neighbor under a unique key, including when that key also exists.
         if native in native_names and public in native_names:
-            raise ValueError(f"operation {public!r} collides with the reported name of {native!r}")
+            distinct = f"{public} (operation)"
+            while distinct in native_names or distinct in public_names.values():
+                distinct += " (operation)"
+            public_names[public] = distinct
     per_op_latency_ms, per_op_energy_wms, per_op_source, fallbacks = _fold_per_op(
         (public_names.get(entry[0], entry[0]), *entry[1:])
         for group in (shared_ops, ctx_attn_ops, decode_attn_ops)
@@ -1864,9 +1869,11 @@ def _mamba_qualification_identity(model: Any) -> list[list[Any]]:
                 # and cache this identity; non-Mamba graphs keep their old key.
                 spec = json.dumps({"unsupported_op": [type(op).__module__, type(op).__qualname__, id(op)]})
             entries.append([ops_name, index, spec])
-    # Build validation of a Mamba graph also reads its other ops (names, stages), so a
-    # Mamba graph keys on every compiled op; other graphs keep the config-only key.
-    return entries if any('"Mamba2"' in entry[2] for entry in entries) else []
+    # Hybrid setters can rebuild the graph without changing ModelConfig.
+    # Build validation of a Mamba graph also reads its neighbors' names/stages.
+    if getattr(model, "_hybrid_config", None) is not None or any('"Mamba2"' in entry[2] for entry in entries):
+        return entries
+    return []
 
 
 def _cached_engine_handle(model: Any, database: Any) -> Any:

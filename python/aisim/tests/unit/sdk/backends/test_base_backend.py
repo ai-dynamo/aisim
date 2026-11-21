@@ -1499,10 +1499,15 @@ def test_run_agg_visual_fallback_preserves_whole_prefill_attention(
 
 
 @pytest.mark.parametrize("prefix,budget", [(2048, 1024), (2816, 512)])
-def test_run_agg_visual_fallback_retains_native_attention(backend, prefix, budget):
+def test_run_agg_visual_fallback_retains_native_attention(backend, prefix, budget, monkeypatch):
+    from collections import OrderedDict
+
+    from aisim_core.sdk import rust_engine_step
     from aisim_core.sdk.models import get_model
     from aisim_core.sdk.perf_database import get_database_view
     from aisim_core.sdk.rust_engine_step import estimate_static_latency_breakdown_with_rust
+
+    monkeypatch.setattr(rust_engine_step, "_ENGINE_HANDLE_CACHE", OrderedDict())
 
     # Isolate real native attention from a bundled graph; no weights or
     # measured data are needed. Its static whole-prefill query is the

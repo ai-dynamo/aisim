@@ -153,6 +153,26 @@ class BaseModel:
         self.spec_scheme = NullScheme() if self._nextn == 0 else MTPScheme(depth=self._nextn)
 
     @property
+    def context_ops(self):
+        return self.__dict__["context_ops"]
+
+    @context_ops.setter
+    def context_ops(self, value):
+        self.__dict__.pop("_aic_engine_identity_memo", None)
+        self.__dict__["context_ops"] = value
+
+    @property
+    def generation_ops(self):
+        return self.__dict__["generation_ops"]
+
+    @generation_ops.setter
+    def generation_ops(self, value):
+        # All hybrid setters replace these lists before rebuilding them.
+        # Invalidate once at construction time, keeping warm queries cheap.
+        self.__dict__.pop("_aic_engine_identity_memo", None)
+        self.__dict__["generation_ops"] = value
+
+    @property
     def verify_width(self) -> int:
         """Tokens verified per request per decode step (the engine's
         decode-batch multiplier). 1 = plain autoregressive decode."""
