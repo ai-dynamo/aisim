@@ -40,6 +40,7 @@ mod grouped_prefix;
 pub(crate) mod sglang_backend;
 mod state_cache_manager;
 mod vllm_backend;
+pub(crate) use vllm_backend::PrefixHashes;
 #[cfg(test)]
 mod vllm_firewall_tests;
 

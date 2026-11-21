@@ -247,29 +247,14 @@ impl SchedulerRank {
         };
         map_metrics(metrics)
     }
-}
 
-impl RankEngine for SchedulerRank {
-    type Config = EngineConfig;
-    type Command = Command;
-    type CommandEffects = CommandEffects;
-    type PassStartEffects = PassStartEffects;
-    type PendingPass = PendingPass;
-    type PassCompletionEffects = PassCompletionEffects;
-    type InternalEffects = PassStartEffects;
-
-    fn new(identity: RankIdentity, config: &Self::Config) -> Result<Self> {
-        let timing = config.built_in_timing_model()?;
-        let seed_offset = engine_seed_offset(identity)?;
-        Self::new_with_timing_model(identity, config, timing, seed_offset)
-    }
-
-    fn apply_command_effects(
+    pub(crate) fn apply_command_with_prompt(
         &mut self,
-        command: Self::Command,
+        mut command: Command,
+        prompt: Option<crate::engine::TracePrompt>,
         context: CommandContext,
-        pending_pass: Option<&mut Self::PendingPass>,
-    ) -> Result<Self::CommandEffects> {
+        pending_pass: Option<&mut PendingPass>,
+    ) -> Result<CommandEffects> {
         if let Command::Submit(request)
         | Command::SubmitHandoffPrefill { request, .. }
         | Command::ReserveDestination { request, .. } = &command
@@ -280,11 +265,20 @@ impl RankEngine for SchedulerRank {
                 "cache_salt is supported only for backend=sglang"
             );
         }
+        let prompt = if matches!(self.core, EngineCore::Sglang(_)) {
+            if let (Some(trace), Command::Submit(request)) = (prompt, &mut command) {
+                request.tokens = trace.tokens_from(0);
+            }
+            None
+        } else {
+            prompt
+        };
         let pending_suppression = pending_output_suppression(&command, &self.handoff_requests);
         let handoff_update = handoff_tracking_update(&command);
         let core_command = Self::core_command(command);
         let mut effects = self.core.apply_command_effects_at(
             core_command,
+            prompt,
             context.allow_immediate_admission(),
             context.now_ms,
         )?;
@@ -358,6 +352,31 @@ impl RankEngine for SchedulerRank {
                 .retain(|_, tracked_request| tracked_request != request_id);
         }
         map_command_effects(effects, self.metrics(), suppressed_pending_output)
+    }
+}
+
+impl RankEngine for SchedulerRank {
+    type Config = EngineConfig;
+    type Command = Command;
+    type CommandEffects = CommandEffects;
+    type PassStartEffects = PassStartEffects;
+    type PendingPass = PendingPass;
+    type PassCompletionEffects = PassCompletionEffects;
+    type InternalEffects = PassStartEffects;
+
+    fn new(identity: RankIdentity, config: &Self::Config) -> Result<Self> {
+        let timing = config.built_in_timing_model()?;
+        let seed_offset = engine_seed_offset(identity)?;
+        Self::new_with_timing_model(identity, config, timing, seed_offset)
+    }
+
+    fn apply_command_effects(
+        &mut self,
+        command: Self::Command,
+        context: CommandContext,
+        pending_pass: Option<&mut Self::PendingPass>,
+    ) -> Result<Self::CommandEffects> {
+        self.apply_command_with_prompt(command, None, context, pending_pass)
     }
 
     fn is_ready(&self) -> bool {

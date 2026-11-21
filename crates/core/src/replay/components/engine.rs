@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::marker::PhantomData;
 use std::sync::{Arc, OnceLock};
 
-use crate::engine::generalized::{PassId, SameTimestampRetry, SchedulerCommand};
+use crate::engine::generalized::{PassId, SameTimestampRetry};
 use crate::engine::{
     Command, CommandResult, Engine, ForwardPassMetrics, HostOffloadObserver, KvHintSource, Metrics,
     PassCompletionEffects, Request,
@@ -26,6 +26,7 @@ use super::{
 };
 use crate::replay::TraceCollector;
 use crate::replay::engine::ReplayRoleFactory;
+use crate::replay::loadgen::ReplayRequestPayload;
 use crate::replay::protocol::{DirectRequest, ForwardPassSnapshot, OutputSignal};
 use crate::replay::telemetry::{ReplaySchedulerIntervalMetrics, ReplaySchedulerMetricsSnapshot};
 
@@ -838,18 +839,34 @@ where
     pub(crate) fn dispatch(
         &mut self,
         scheduler_id: usize,
-        request: DirectRequest,
+        request: impl Into<ReplayRequestPayload>,
         kv_hint: Option<KvHintSource>,
         now_ms: f64,
     ) -> Result<()> {
-        let expected = request
-            .uuid
-            .context("offline replay request must have a UUID before dispatch")?;
-        let effects = self.apply_command(
-            scheduler_id,
-            Command::Submit(native_request(request, kv_hint)?),
-            now_ms,
-        )?;
+        let (request, prompt) = match request.into() {
+            ReplayRequestPayload::Deferred {
+                request_metadata,
+                input_length,
+                hash_ids,
+                trace_block_size,
+            } if trace_block_size > 0
+                && input_length.div_ceil(trace_block_size) <= hash_ids.len() =>
+            {
+                (
+                    request_metadata,
+                    Some(crate::engine::TracePrompt {
+                        len: input_length,
+                        ids: hash_ids,
+                        block_size: trace_block_size,
+                    }),
+                )
+            }
+            request => (request.into_direct_request(), None),
+        };
+        let request = native_request(request, kv_hint)?;
+        let expected = request.request_id;
+        let effects =
+            self.apply_command_with_prompt(scheduler_id, Command::Submit(request), prompt, now_ms)?;
         if !matches!(effects.result, CommandResult::Submitted(id) if id == expected) {
             bail!("native engine returned an unexpected submit result");
         }
@@ -862,11 +879,23 @@ where
         command: Command,
         now_ms: f64,
     ) -> Result<ObservedCommandEffects<Observation::Batch>> {
+        self.apply_command_with_prompt(scheduler_id, command, None, now_ms)
+    }
+
+    fn apply_command_with_prompt(
+        &mut self,
+        scheduler_id: usize,
+        command: Command,
+        prompt: Option<crate::engine::TracePrompt>,
+        now_ms: f64,
+    ) -> Result<ObservedCommandEffects<Observation::Batch>> {
         let owner = self.scheduler_owner(scheduler_id)?;
         let effects = self
             .required_worker_mut(owner.worker_id)?
             .engine
-            .apply_command_effects(SchedulerCommand::new(owner.dp_rank, command), now_ms)
+            .apply_rank_command(owner.dp_rank, now_ms, |rank, context, pending| {
+                rank.apply_command_with_prompt(command, prompt, context, pending)
+            })
             .map_err(crate::replay::error::engine_boundary)?
             .into_by_rank()
             .into_iter()

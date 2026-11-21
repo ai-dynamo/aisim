@@ -121,10 +121,24 @@ impl<C: RankEngine> GeneralizedMockerEngine<C> {
         command: SchedulerCommand<C::Command>,
         now_ms: f64,
     ) -> Result<EngineEffects<C::CommandEffects>> {
+        self.apply_rank_command(command.dp_rank, now_ms, |rank, context, pending| {
+            rank.apply_command_effects(command.command, context, pending)
+        })
+    }
+
+    pub(crate) fn apply_rank_command(
+        &mut self,
+        dp_rank: u32,
+        now_ms: f64,
+        apply: impl FnOnce(
+            &mut C,
+            CommandContext,
+            Option<&mut C::PendingPass>,
+        ) -> Result<C::CommandEffects>,
+    ) -> Result<EngineEffects<C::CommandEffects>> {
         self.ensure_healthy()?;
         validate_time(now_ms, "command time")?;
         let pass_in_flight = self.pending_pass.is_some();
-        let dp_rank = command.dp_rank;
         ensure!(
             (dp_rank as usize) < self.ranks.len(),
             "attention-DP rank {dp_rank} is out of range for dp_size {}",
@@ -147,8 +161,8 @@ impl<C: RankEngine> GeneralizedMockerEngine<C> {
                     .find(|pending| pending.dp_rank == dp_rank)
                     .map(|pending| &mut pending.pending)
             });
-            rank.apply_command_effects(
-                command.command,
+            apply(
+                rank,
                 CommandContext {
                     now_ms,
                     pass_in_flight,

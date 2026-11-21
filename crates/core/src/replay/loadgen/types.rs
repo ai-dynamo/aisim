@@ -12,8 +12,7 @@ use uuid::Uuid;
 
 use super::trace::synthesize_validated_trace_tokens;
 use crate::engine::{
-    ImageSpec, block_hashes_with_salt, cache_salt_seed, compute_block_hash_for_tokens,
-    compute_next_sequence_hash,
+    ImageSpec, block_hashes_with_salt, compute_next_sequence_hash, trace_block_hashes,
 };
 use crate::replay::protocol::DirectRequest;
 
@@ -543,39 +542,14 @@ impl ReplayRequestHashes {
             return Self::from_tokens_with_cache_salt(&tokens, engine_block_size, cache_salt);
         }
 
-        let seed = cache_salt_seed(cache_salt);
-        let mut block = vec![0_u32; block_size];
-        // Consecutive engine blocks inside one trace block are identical.
-        let mut previous_run: Option<(u32, u64)> = None;
-        let local_block_hashes = (0..input_length / block_size)
-            .map(|index| {
-                let start = index * block_size;
-                let end = start + block_size;
-                let first_trace_block = start / trace_block_size;
-                if first_trace_block == (end - 1) / trace_block_size {
-                    let token = hash_ids[first_trace_block];
-                    if let Some((prior, hash)) = previous_run
-                        && prior == token
-                    {
-                        return hash;
-                    }
-                    block.fill(token);
-                    let hash = compute_block_hash_for_tokens(&block, seed);
-                    previous_run = Some((token, hash));
-                    return hash;
-                }
-
-                let mut position = start;
-                while position < end {
-                    let trace_block = position / trace_block_size;
-                    let run_end = ((trace_block + 1) * trace_block_size).min(end);
-                    block[position - start..run_end - start].fill(hash_ids[trace_block]);
-                    position = run_end;
-                }
-                previous_run = None;
-                compute_block_hash_for_tokens(&block, seed)
-            })
-            .collect();
+        let local_block_hashes = trace_block_hashes(
+            input_length,
+            hash_ids,
+            trace_block_size,
+            block_size,
+            cache_salt,
+        )
+        .collect();
         Self::from_local_block_hashes(local_block_hashes)
     }
 
@@ -630,6 +604,12 @@ pub enum ReplayRequestPayload {
         hash_ids: Vec<u32>,
         trace_block_size: usize,
     },
+}
+
+impl From<DirectRequest> for ReplayRequestPayload {
+    fn from(request: DirectRequest) -> Self {
+        Self::Materialized(request)
+    }
 }
 
 impl ReplayRequestPayload {

@@ -32,9 +32,9 @@ use crate::engine::cache::vllm_block_pool::{
     BlockCopyId, BlockReservation, CacheKey, ReserveOutcome, VllmBlockPool,
 };
 pub(crate) use crate::engine::cache::vllm_block_pool::{SourceReleaseOrder, SourceReuseDependency};
-use crate::engine::common::hashing::{
-    BlockHash, SequenceHash, block_hashes, compute_next_sequence_hash,
-};
+use crate::engine::common::hashing::{BlockHash, SequenceHash};
+#[cfg(test)]
+use crate::engine::common::hashing::{block_hashes, compute_next_sequence_hash};
 use crate::engine::common::kv_cache_trace;
 use crate::engine::common::protocols::{KvEventPublishers, PrefillCost, SchedulingPolicy};
 use crate::engine::common::sequence::{BlockIdentity, RequestSequence};
@@ -203,6 +203,12 @@ struct StateMiss {
     overlap_blocks: usize,
 }
 
+#[derive(Debug)]
+pub(crate) enum PrefixHashes {
+    Identities,
+    Separate(Vec<SequenceHash>),
+}
+
 /// Move-only native-G1 ownership token attached to one scheduler request.
 #[derive(Debug)]
 #[must_use = "a native block lease must be finished, aborted, retracted, or moved into a hold"]
@@ -212,7 +218,7 @@ pub(crate) struct BlockRequestLease {
     allocated_tokens: usize,
     /// Anonymous request-owned slots, retained across draft rejection.
     opaque_copies: Vec<BlockCopyId>,
-    prefix_hashes: Option<(usize, Vec<SequenceHash>)>,
+    prefix_hashes: Option<(usize, PrefixHashes)>,
     /// The prompt length behind `prefix_hashes`.
     prompt_tokens: usize,
     /// Present only while newly acquired capacity awaits a scheduler-installed
@@ -282,8 +288,8 @@ impl BlockRequestLease {
         self.junction = junction;
     }
 
+    #[cfg(test)]
     pub(crate) fn configure_prefix_hashes(&mut self, tokens: &[u32], unit: usize) {
-        self.prompt_tokens = tokens.len();
         let mut parent = None;
         let hashes = block_hashes(tokens, unit)
             .map(|local| {
@@ -294,6 +300,16 @@ impl BlockRequestLease {
                 hash
             })
             .collect();
+        self.set_prefix_hashes(tokens.len(), unit, PrefixHashes::Separate(hashes));
+    }
+
+    pub(crate) fn set_prefix_hashes(
+        &mut self,
+        prompt_len: usize,
+        unit: usize,
+        hashes: PrefixHashes,
+    ) {
+        self.prompt_tokens = prompt_len;
         self.prefix_hashes = Some((unit, hashes));
         // The hashes are an input of the grouped search.
         if let Some(stored) = &mut self.grouped_hit {
@@ -317,14 +333,14 @@ impl BlockRequestLease {
     /// prefix hashes.
     pub(crate) fn prefix_hash_at(&self, tokens: usize) -> Option<SequenceHash> {
         let (unit, hashes) = self.prefix_hashes.as_ref()?;
-        if !tokens.is_multiple_of(*unit) {
+        if tokens > self.prompt_tokens || !tokens.is_multiple_of(*unit) {
             return None;
         }
-        tokens
-            .checked_div(*unit)?
-            .checked_sub(1)
-            .and_then(|i| hashes.get(i))
-            .copied()
+        let i = (tokens / unit).checked_sub(1)?;
+        match hashes {
+            PrefixHashes::Identities => self.entries.get(i)?.identity.sequence_hash,
+            PrefixHashes::Separate(hashes) => hashes.get(i).copied(),
+        }
     }
 
     pub(crate) fn owner(&self) -> Uuid {
