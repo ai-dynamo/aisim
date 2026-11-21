@@ -35,7 +35,7 @@ use crate::engine::common::utils::{
 use crate::engine::host_offload::{G2Binding, HostTierHandle};
 use crate::engine::kv_manager::AllocationRequirement;
 use crate::engine::kv_manager::{
-    AdmissionLimits, G1Manager, GroupedKvPool, GroupedPrefixRules, VllmRuleVersion,
+    AdmissionLimits, G1Manager, GroupedKvPool, GroupedPrefixRules, PrefixHashMemo, VllmRuleVersion,
 };
 use crate::engine::kv_manager::{DestinationReservation, G1Acquire, NativeAllocation};
 use crate::engine::kv_manager::{mamba_prefill_checkpoint, state_boundaries};
@@ -708,6 +708,9 @@ pub(crate) struct VllmCore {
     g1_prefix_cache_lookup: Option<crate::engine::PrefixCacheLookupCounts>,
     retain_local_hashes: bool,
     emit_token_ids: bool,
+    /// The `prefix_match_unit` hashes of the prompt spans this engine has
+    /// hashed twice, under prefix caching.
+    prefix_hash_memo: Option<PrefixHashMemo>,
     native_host_offload: Option<VllmHostOffloadAdapter>,
     /// A host transfer completed while destinations were deferred.
     destination_retry_ready: bool,
@@ -974,6 +977,11 @@ impl VllmCore {
                 .as_ref()
                 .is_some_and(|host| host.scope == G2Scope::ClusterShared);
         let emit_token_ids = args.emit_kv_token_ids;
+        // Without prefix caching a block identity is random and names no prefix.
+        let prefix_hash_memo = args
+            .prefix_match_unit
+            .filter(|_| args.enable_prefix_caching)
+            .and_then(|unit| PrefixHashMemo::new(unit, args.block_size));
         let eagle_block_drop = args.aic_nextn.is_some() && !args.disable_eagle_block_drop;
         let speculative_sampler = args.aic_nextn.map(|nextn| {
             let rates =
@@ -1101,6 +1109,7 @@ impl VllmCore {
             g1_prefix_cache_lookup: None,
             retain_local_hashes,
             emit_token_ids,
+            prefix_hash_memo,
             native_host_offload,
             destination_retry_ready: false,
             wave_step: 0,
@@ -1624,7 +1633,7 @@ impl VllmCore {
     }
 
     fn make_request_state(
-        &self,
+        &mut self,
         request: DirectRequest,
         status: RequestStatus,
         waiting_order: u64,
@@ -1679,7 +1688,12 @@ impl VllmCore {
         );
         sequence.lease.session_id = request.session_id;
         if let (Some(unit), Some(tokens)) = (self.args.prefix_match_unit, prefix_tokens) {
-            sequence.lease.configure_prefix_hashes(&tokens, unit);
+            match &mut self.prefix_hash_memo {
+                Some(memo) => sequence
+                    .lease
+                    .configure_prefix_hashes_memoized(&tokens, memo),
+                None => sequence.lease.configure_prefix_hashes(&tokens, unit),
+            }
         }
         let host_offload = self.native_host_offload.as_ref().map(|adapter| {
             Box::new(VllmHostRequestState::new(
