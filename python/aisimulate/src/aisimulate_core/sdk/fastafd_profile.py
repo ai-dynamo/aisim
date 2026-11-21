@@ -20,6 +20,7 @@ _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _AFD_TOPOLOGY = re.compile(r"[1-9][0-9]*A[1-9][0-9]*F\Z")
 _AGG_TOPOLOGY = re.compile(r"ep[1-9][0-9]*\Z")
+_COUNT_FIELDS = {"logical_batch_per_source_rank", "mtp_nextn", "microbatches", "moe_layers", "routed_topk"}
 _KEY_FIELDS = {
     "model_path",
     "system",
@@ -133,9 +134,14 @@ class FastAFDMoEStageProfile:
         resolved = Path(path).expanduser().resolve()
         raw = resolved.read_bytes()
         if resolved.suffix == ".parquet":
+            import pyarrow as pa
             import pyarrow.parquet as pq
 
-            rows = pq.read_table(resolved).to_pylist()
+            table = pq.read_table(pa.BufferReader(raw))
+            for name in sorted(_COUNT_FIELDS):
+                if table.schema.field(name).type != pa.int64():
+                    raise ValueError(f"FastAFD count column {name!r} must be signed INT64")
+            rows = table.to_pylist()
             if not rows:
                 raise ValueError("FastAFD profile entries must be a non-empty list")
             sources = {row["source_json"] for row in rows}
@@ -160,6 +166,14 @@ class FastAFDMoEStageProfile:
             }
         else:
             payload = json.loads(raw, object_pairs_hook=_unique_object)
+        source, entries = cls._validate_document(payload)
+        return cls(entries, source=source, path=resolved, profile_sha256=hashlib.sha256(raw).hexdigest())
+
+    @staticmethod
+    def _validate_document(
+        payload: dict[str, Any],
+    ) -> tuple[FastAFDProfileSource, tuple[FastAFDMoEStageMeasurement, ...]]:
+        """Validate an assembled document with the same rules as file imports."""
         root = _object(payload, {"schema", "source", "lookup_policy", "entries"}, "profile")
         if root["schema"] != FASTAFD_PROFILE_SCHEMA:
             raise ValueError(f"unsupported FastAFD profile schema: {root['schema']!r}")
@@ -175,7 +189,9 @@ class FastAFDMoEStageProfile:
         if not isinstance(root["entries"], list) or not root["entries"]:
             raise ValueError("FastAFD profile entries must be a non-empty list")
         entries = tuple(_entry(value, source, index) for index, value in enumerate(root["entries"]))
-        return cls(entries, source=source, path=resolved, profile_sha256=hashlib.sha256(raw).hexdigest())
+        if len({entry.key for entry in entries}) != len(entries):
+            raise ValueError("duplicate FastAFD MoE stage key")
+        return source, entries
 
     def write_parquet(self, path: str | Path) -> None:
         """Serialize validated raw measurements; no estimation or selection."""

@@ -38,6 +38,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "blake3",
+ "bytes",
  "ddsketchy",
  "derive_builder",
  "fixedbitset",

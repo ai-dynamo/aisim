@@ -23,7 +23,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::file::reader::{ChunkReader, FileReader, SerializedFileReader};
 use parquet::record::{Row, RowAccessor};
 
 use crate::common::error::AicError;
@@ -32,8 +32,8 @@ const LFS_POINTER_PREFIX: &[u8] = b"version https://git-lfs";
 
 /// Opens a parquet file and pre-caches column names so each loader resolves
 /// `col("name") -> position` once before the row loop.
-pub struct PerfReader {
-    file_reader: SerializedFileReader<File>,
+pub struct PerfReader<R: ChunkReader = File> {
+    file_reader: SerializedFileReader<R>,
     path: PathBuf,
     column_names: Vec<String>,
 }
@@ -65,7 +65,14 @@ impl PerfReader {
             path: path.to_path_buf(),
             source,
         })?;
-        let file_reader = SerializedFileReader::new(file).map_err(|source| AicError::Parquet {
+        Self::from_reader(path, file)
+    }
+}
+
+impl<R: ChunkReader + 'static> PerfReader<R> {
+    /// Read a supplied immutable snapshot while retaining path context in errors.
+    fn from_reader(path: &Path, input: R) -> Result<Self, AicError> {
+        let file_reader = SerializedFileReader::new(input).map_err(|source| AicError::Parquet {
             path: path.to_path_buf(),
             source,
         })?;
@@ -131,6 +138,18 @@ impl PerfReader {
                 source,
             })
         }))
+    }
+}
+
+impl PerfReader<bytes::Bytes> {
+    pub(crate) fn from_bytes(path: &Path, raw: bytes::Bytes) -> Result<Self, AicError> {
+        if raw.starts_with(LFS_POINTER_PREFIX) {
+            return Err(AicError::PerfDatabase(format!(
+                "perf file is an unresolved git-lfs pointer: {}; run `git lfs pull`",
+                path.display()
+            )));
+        }
+        Self::from_reader(path, raw)
     }
 }
 

@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -145,3 +147,84 @@ def test_rejects_other_schemas_and_duplicate_json_fields(tmp_path):
     path.write_text(path.read_text().replace('"stable": true', '"stable": true, "stable": false'))
     with pytest.raises(ValueError, match="duplicate JSON object key"):
         FastAFDMoEStageProfile.load(path)
+
+
+def test_parquet_entries_and_digest_use_the_same_snapshot(tmp_path, monkeypatch):
+    profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload()))
+    path = tmp_path / "stage.parquet"
+    profile.write_parquet(path)
+    original = path.read_bytes()
+    replacement = _payload()
+    replacement["entries"][0]["latency_ms"] = 24.0
+    replacement_path = tmp_path / "replacement.parquet"
+    FastAFDMoEStageProfile.load(_write(tmp_path, replacement)).write_parquet(replacement_path)
+    read_bytes = Path.read_bytes
+
+    def replace_after_read(self):
+        raw = read_bytes(self)
+        if self == path:
+            replacement_path.replace(path)
+        return raw
+
+    monkeypatch.setattr(Path, "read_bytes", replace_after_read)
+    loaded = FastAFDMoEStageProfile.load(path)
+
+    assert loaded.entries == profile.entries
+    assert loaded.profile_sha256 == hashlib.sha256(original).hexdigest()
+    assert read_bytes(path) != original
+
+
+@pytest.mark.parametrize(
+    "column", ["logical_batch_per_source_rank", "mtp_nextn", "microbatches", "moe_layers", "routed_topk"]
+)
+@pytest.mark.parametrize("encoding", ["int32", "uint32"])
+def test_rejects_non_int64_parquet_counts(tmp_path, column, encoding):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload()))
+    path = tmp_path / "stage.parquet"
+    profile.write_parquet(path)
+    table = pq.read_table(path)
+    index = table.schema.get_field_index(column)
+    table = table.set_column(index, column, table[column].cast(getattr(pa, encoding)()))
+    pq.write_table(table, path)
+
+    with pytest.raises(ValueError, match=f"count column '{column}' must be signed INT64"):
+        FastAFDMoEStageProfile.load(path)
+
+
+def test_int64_parquet_counts_load_through_canonical_model(tmp_path):
+    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+
+    payload = _payload()
+    # Synthetic complete stage: 12 ms for 3 layers and 2 microbatches,
+    # or 2 ms per pipeline unit.
+    payload["entries"][0]["key"]["moe_layers"] = 3
+    payload["entries"][0]["latency_ms"] = 12.0
+    profile = FastAFDMoEStageProfile.load(_write(tmp_path, payload))
+    path = tmp_path / "stage.parquet"
+    profile.write_parquet(path)
+    assert FastAFDMoEStageProfile.load(path).entries == profile.entries
+    config = ForwardPassPerfModelConfig(
+        model=_entry()["key"]["model_path"],
+        system="gb200",
+        backend="sglang",
+        backend_version="0.5.14",
+        worker_type="decode",
+        estimation_mode="fastafd_stage",
+        moe_backend="megamoe",
+        afd={
+            "logical_batch_per_source_rank": 48,
+            "attention_gpus": 16,
+            "ffn_gpus": 8,
+            "f_moe_ep_size": 8,
+            "microbatches": 2,
+            "moe_layers": 3,
+            "routed_topk": 6,
+            "boundary_on_attn": True,
+        },
+        estimator_config={"fastafd_stage": {"profile_path": str(path)}},
+    )
+    model = RustForwardPassPerfModel.best_available(config)
+    assert model.estimate_fastafd_stage(48)["ffn_ms"] == 2.0

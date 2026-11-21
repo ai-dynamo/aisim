@@ -10,12 +10,16 @@ missing measurement is an error, not an estimate.
 ## Native parquet table
 
 The Rust table loader reads the eleven `key` fields below as individual columns:
-identity strings as UTF-8 and counts as integers, plus a floating-point
+identity strings as UTF-8 and count columns (`logical_batch_per_source_rank`,
+`mtp_nextn`, `microbatches`, `moe_layers`, `routed_topk`) as signed INT64, plus a floating-point
 `latency_ms`. `source_json` contains the source object; `capture_json` contains
 exactly `model_profile`, `measurement`, and `validation` from the JSON entry.
 The source must be identical for all rows. These JSON columns preserve raw
 capture metadata; selection and latency normalization run in Rust through the
 [canonical estimator](../configuration.md#measured-fastafd-stage).
+Both Python inspection and native loading reject other count encodings, including
+INT32 and UINT32. Counts must fit in an unsigned 32-bit value; only `mtp_nextn`
+may be zero.
 
 `FastAFDMoEStageProfile.load(path).write_parquet(output)` converts a validated
 legacy document without changing its measured values. JSON remains supported

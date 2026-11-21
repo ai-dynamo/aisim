@@ -41,6 +41,17 @@ WORKFLOW_ROOT = REPOSITORY_ROOT / ".github" / "workflows"
 ACTION_ROOT = REPOSITORY_ROOT / ".github" / "actions"
 
 
+def test_runner_canary_home_reaches_commands_on_both_architectures():
+    job = _workflow("runner-canary.yml")["jobs"]["canary"]
+    assert {entry["machine"] for entry in job["strategy"]["matrix"]["include"]} == {"x86_64", "aarch64"}
+    # The runner replaces container.env.HOME; commands need a job env override.
+    assert job["env"]["HOME"] == "/__w/aisim/aisim"
+    commands = _run_commands(job)
+    assert 'test "${HOME}" = /__w/aisim/aisim' in commands
+    assert 'test -w "${HOME}"' in commands
+    assert 'mktemp "${HOME}/.runner-canary.XXXXXX"' in commands
+
+
 def test_stable_release_migrations_require_reviewed_clearance(tmp_path):
     from scripts.release.check_release_migrations import GATES, require_completed_migrations
 

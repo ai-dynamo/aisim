@@ -108,12 +108,14 @@ def build_profile(
         summary["accepted"] += 1
     if not entries:
         raise ValueError(f"no qualified {routing} measurements in {results_dir}")
-    return {
+    document = {
         "schema": FASTAFD_PROFILE_SCHEMA,
         "lookup_policy": "exact-only",
         "source": source,
         "entries": entries,
-    }, summary
+    }
+    FastAFDMoEStageProfile._validate_document(document)
+    return document, summary
 
 
 def _key(stage: str, payload: dict[str, Any]) -> dict[str, Any]:

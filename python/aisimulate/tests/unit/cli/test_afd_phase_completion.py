@@ -42,6 +42,7 @@ def _fake_phase_metrics(
     comm_hidden: bool = True,
     t_a_combine_layer: float = 0.0,
     t_a_router_layer: float = 0.0,
+    t_f_router_layer: float = 0.0,
     t_f_collective_layer: float = 0.0,
     f_per_op: dict | None = None,
 ) -> dict:
@@ -63,6 +64,7 @@ def _fake_phase_metrics(
         "f_per_op": dict(f_per_op or {}),
         "t_a_combine_layer": t_a_combine_layer,
         "t_a_router_layer": t_a_router_layer,
+        "t_f_router_layer": t_f_router_layer,
         "t_f_collective_layer": t_f_collective_layer,
         "a_memory": {"total": 1.0, "weights": 1.0, "activations": 0.0, "kvcache": 0.0, "nccl": 0.0, "others": 0.0},
         "f_memory": {"total": 1.0, "weights": 1.0, "activations": 0.0, "kvcache": 0.0, "nccl": 0.0, "others": 0.0},
@@ -526,7 +528,8 @@ def test_afd_decode_mtp_widens_compute_and_communication_queries(monkeypatch, ca
 @pytest.mark.parametrize("nextn", [0, 1])
 @pytest.mark.parametrize("a_batch_size", [128, 129])
 @pytest.mark.parametrize("nested", [False, True])
-def test_afd_measures_local_router_once_outside_decode_integration(monkeypatch, nextn, a_batch_size, nested):
+@pytest.mark.parametrize("f_nested", [False, True])
+def test_afd_measures_local_router_once_outside_decode_integration(monkeypatch, nextn, a_batch_size, nested, f_nested):
     """64 A ranks must not reuse the F router's combined 4096-token query."""
     from aisimulate.sdk import common, operations
     from aisimulate.sdk.inference_session import _AFDCommOps
@@ -537,14 +540,18 @@ def test_afd_measures_local_router_once_outside_decode_integration(monkeypatch, 
     if nested:
         a_ops = [operations.OverlapOp("generation_moe_overlap", group_a=a_ops, group_b=[])]
     a_model = SimpleNamespace(_num_layers=4, generation_ops=a_ops)
-    f_model = SimpleNamespace(_num_layers=4, generation_ops=[f_router])
+    f_ops = [f_router]
+    if f_nested:
+        f_ops = [operations.OverlapOp("generation_moe_overlap", group_a=f_ops, group_b=[])]
+    f_model = SimpleNamespace(_num_layers=4, generation_ops=f_ops)
     queries = []
 
     def fake_sum_latency(self, ops, *, model, batch_size, **_kwargs):
-        queries.append((list(ops), model, batch_size))
+        ops = list(ops)
+        queries.append((ops, model, batch_size))
         # Synthetic shape-sensitive engine result, in full-model units:
         # each queried router contributes batch_size / 1000 ms per layer.
-        return 4 * batch_size / 1000, {"generation_router_gemm": 4 * batch_size / 1000}
+        return 4 * batch_size / 1000, {op._name: 4 * batch_size / 1000 for op in ops}
 
     def fake_memory_summary(self, _memory, runtime_config, _fraction):
         summary = InferenceSummary(runtime_config)
@@ -601,6 +608,12 @@ def test_afd_measures_local_router_once_outside_decode_integration(monkeypatch, 
     assert len(f_queries) > 1  # multiple decode strides, but one local router query
     assert {q[2] for q in f_queries} == {64 * local_batch}
     assert metrics["t_a_router_layer"] == pytest.approx(local_batch / 1000)
+    assert metrics["t_f_router_layer"] == pytest.approx(64 * local_batch / 1000)
+    # The extra diagnostic query must not increase the pipeline's F time.
+    assert metrics["t_f_layer"] == pytest.approx(64 * local_batch / 1000)
+    if f_nested:
+        leaf_queries = [q for q in f_queries if [op._name for op in q[0]] == ["generation_router_gemm"]]
+        assert len(leaf_queries) == 1
 
 
 @pytest.mark.parametrize("is_context", [False, True])
@@ -891,6 +904,7 @@ def test_result_dict_splits_afd_layer_boundary_components(monkeypatch):
         balance_ratio=1.33,
         t_a_combine_layer=0.05,
         t_a_router_layer=0.003,
+        t_f_router_layer=0.2,
         t_f_collective_layer=0.1,
         f_per_op={"generation_router_gemm": 0.8, "generation_moe": 2.4},
     )

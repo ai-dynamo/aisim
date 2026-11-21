@@ -155,6 +155,23 @@ def test_rejects_duplicate_raw_json_members(tmp_path):
         build_profile(results, repository=_REPOSITORY)
 
 
+@pytest.mark.parametrize("p50", [-1.0, 0.0, float("nan"), float("inf")])
+def test_build_profile_rejects_invalid_latency_directly(tmp_path, p50):
+    _write(tmp_path, "a.json", _colocated(48, p50=p50))
+
+    with pytest.raises(ValueError, match="latency_ms must be"):
+        build_profile(tmp_path, repository=_REPOSITORY)
+
+
+def test_build_profile_accepts_positive_latency_directly(tmp_path):
+    _write(tmp_path, "a.json", _colocated(48, p50=12.0))
+
+    profile, summary = build_profile(tmp_path, repository=_REPOSITORY)
+
+    assert profile["entries"][0]["latency_ms"] == 12.0
+    assert summary == {"accepted": 1}
+
+
 @pytest.mark.parametrize("microbatches", [0, False, None, ""])
 @pytest.mark.parametrize("suffix", ["json", "parquet"])
 def test_rejects_explicit_invalid_colocated_microbatches_before_publication(tmp_path, microbatches, suffix):

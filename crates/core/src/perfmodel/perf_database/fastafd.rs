@@ -378,8 +378,21 @@ impl FastAfdTable {
             path: path.clone(),
             source,
         })?;
+        Self::from_snapshot(config, raw.into())
+    }
+
+    fn from_snapshot(
+        config: &ForwardPassPerfModelConfig,
+        raw: bytes::Bytes,
+    ) -> Result<Self, AicError> {
+        let path = &config
+            .estimator_config
+            .fastafd_stage
+            .as_ref()
+            .unwrap()
+            .profile_path;
         let mut document: Document = if path.extension().is_some_and(|x| x == "parquet") {
-            let reader = PerfReader::open(path)?;
+            let reader = PerfReader::from_bytes(path, raw.clone())?;
             let key_names = [
                 "model_path",
                 "system",
@@ -585,6 +598,135 @@ mod tests {
         assert!(model.estimate_fastafd_stage(127).is_err());
         assert!(model.estimate_fastafd_stage(0).is_err());
         assert!(model.tune_with_fpms(&[Vec::new()]).is_err());
+    }
+
+    fn parquet_snapshot(document: &Value) -> bytes::Bytes {
+        use parquet::data_type::{ByteArray, ByteArrayType, DoubleType, Int64Type};
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::parser::parse_message_type;
+        use std::sync::Arc;
+
+        let entry = &document["entries"][0];
+        let mut fields = entry["key"].as_object().unwrap().clone();
+        let mut capture = entry.as_object().unwrap().clone();
+        capture.remove("key");
+        capture.remove("latency_ms");
+        fields.insert("latency_ms".into(), entry["latency_ms"].clone());
+        fields.insert(
+            "capture_json".into(),
+            json!(Value::Object(capture).to_string()),
+        );
+        fields.insert("source_json".into(), json!(document["source"].to_string()));
+        let columns = fields
+            .iter()
+            .map(|(name, value)| {
+                let data_type = if name == "latency_ms" {
+                    "DOUBLE"
+                } else if value.is_number() {
+                    "INT64"
+                } else {
+                    "BINARY"
+                };
+                let logical_type = if value.is_string() { " (UTF8)" } else { "" };
+                format!("REQUIRED {data_type} {name}{logical_type};")
+            })
+            .collect::<String>();
+        let schema = Arc::new(parse_message_type(&format!("message stage {{{columns}}}")).unwrap());
+        let mut writer = SerializedFileWriter::new(
+            Vec::new(),
+            schema,
+            Arc::new(WriterProperties::builder().build()),
+        )
+        .unwrap();
+        let mut group = writer.next_row_group().unwrap();
+        for (name, value) in fields {
+            let mut column = group.next_column().unwrap().unwrap();
+            if name == "latency_ms" {
+                column
+                    .typed::<DoubleType>()
+                    .write_batch(&[value.as_f64().unwrap()], None, None)
+                    .unwrap();
+            } else if let Some(value) = value.as_i64() {
+                column
+                    .typed::<Int64Type>()
+                    .write_batch(&[value], None, None)
+                    .unwrap();
+            } else {
+                column
+                    .typed::<ByteArrayType>()
+                    .write_batch(&[ByteArray::from(value.as_str().unwrap())], None, None)
+                    .unwrap();
+            }
+            column.close().unwrap();
+        }
+        group.close().unwrap();
+        writer.into_inner().unwrap().into()
+    }
+
+    #[test]
+    fn parquet_replacement_keeps_snapshot_latency_and_digest_together() {
+        let (json_file, mut config) = fixture();
+        let mut document: Value = serde_json::from_reader(json_file.reopen().unwrap()).unwrap();
+        let file = tempfile::Builder::new()
+            .suffix(".parquet")
+            .tempfile()
+            .unwrap();
+        config
+            .estimator_config
+            .fastafd_stage
+            .as_mut()
+            .unwrap()
+            .profile_path = file.path().into();
+        let original = parquet_snapshot(&document);
+        std::fs::write(file.path(), &original).unwrap();
+        let snapshot = std::fs::read(file.path()).unwrap().into();
+        // Replace the path after the loader has captured its immutable input.
+        document["entries"][0]["latency_ms"] = json!(24.0);
+        let replacement = parquet_snapshot(&document);
+        let replacement_file =
+            tempfile::NamedTempFile::new_in(file.path().parent().unwrap()).unwrap();
+        std::fs::write(replacement_file.path(), &replacement).unwrap();
+        replacement_file.persist(file.path()).unwrap();
+
+        let captured = FastAfdTable::from_snapshot(&config, snapshot)
+            .unwrap()
+            .estimate(128)
+            .unwrap();
+        assert_eq!(captured.ffn_ms, 2.0); // 12 ms / six pipeline units
+        assert_eq!(captured.stage["latency_ms"], 12.0);
+        assert_eq!(
+            captured.stage["profile_sha256"],
+            format!("{:x}", Sha256::digest(&original))
+        );
+        let refreshed = ForwardPassPerfModel::best_available(config)
+            .unwrap()
+            .estimate_fastafd_stage(128)
+            .unwrap();
+        assert_eq!(refreshed.ffn_ms, 4.0); // 24 ms / six pipeline units
+        assert_eq!(
+            refreshed.stage["profile_sha256"],
+            format!("{:x}", Sha256::digest(&replacement))
+        );
+    }
+
+    #[test]
+    fn snapshot_reader_preserves_lfs_and_path_diagnostics() {
+        let path = std::path::Path::new("unresolved-stage.parquet");
+        let error = PerfReader::from_bytes(
+            path,
+            bytes::Bytes::from_static(b"version https://git-lfs/spec/v1\n"),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("unresolved git-lfs pointer"));
+        assert!(error.contains("unresolved-stage.parquet"));
+        let error = PerfReader::from_bytes(path, bytes::Bytes::from_static(b"not parquet"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("unresolved-stage.parquet"));
     }
 
     #[test]

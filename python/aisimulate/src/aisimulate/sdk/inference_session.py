@@ -1832,6 +1832,25 @@ class AFDInferenceSession:
                 is_context=phase == "prefill",
             )
 
+        # Top-level router timings are already available. Overlap groups report
+        # only their aggregate, so measure their router leaves separately at
+        # the F query shape. This diagnostic never enters the pipeline totals.
+        t_f_router = sum(float(ms) for name, ms in f_per_op.items() if "router" in name.lower())
+        nested_f_routers = []
+        for op in f_partition.ffn_ops:
+            children = list(getattr(op, "_group_a", [])) + list(getattr(op, "_group_b", []))
+            nested_f_routers.extend(self._router_ops(children))
+        if nested_f_routers:
+            nested_router_ms, _ = self._sum_latency(
+                nested_f_routers,
+                batch_size=b_micro_total * (self._nextn + 1) if phase == "decode" else b_micro_total,
+                seq_len=isl + 1 if phase == "decode" else effective_prefill_len,
+                model=f_model,
+                runtime_config=runtime_config,
+                is_context=phase == "prefill",
+            )
+            t_f_router += nested_router_ms
+
         # Per-op dicts are tracked in *per-step* units (matching
         # ``_sum_latency`` output), so amortize per-layer values up by
         # ``num_layers`` before recording.
@@ -1889,6 +1908,7 @@ class AFDInferenceSession:
             "num_layers": num_layers,
             "t_a_combine_layer": brk_t_a_per_layer,
             "t_a_router_layer": t_a_router / num_layers,
+            "t_f_router_layer": t_f_router / num_layers,
             "t_f_collective_layer": brk_t_f_per_layer,
             "a_partition": a_partition,
             "f_partition": f_partition,
@@ -2130,10 +2150,6 @@ class AFDInferenceSession:
                 num_layers = int(metrics["num_layers"])
                 a_combine_ms = float(metrics["t_a_combine_layer"])
                 f_collective_ms = float(metrics["t_f_collective_layer"])
-                # The router is an F-side op here; per-op values are per step.
-                router_ms = (
-                    sum(float(ms) for name, ms in metrics["f_per_op"].items() if "router" in name.lower()) / num_layers
-                )
                 afd_layer_measurements[measurement_phase] = {
                     "attention_ms": float(metrics["t_a_layer"]),
                     "ffn_ms": float(metrics["t_f_layer"]),
@@ -2145,7 +2161,7 @@ class AFDInferenceSession:
                     "components": {
                         "attention_compute_ms": float(metrics["t_a_layer"]) - a_combine_ms,
                         "a_combine_ms": a_combine_ms,
-                        "router_ms": router_ms,
+                        "router_ms": float(metrics["t_f_router_layer"]),
                         "a_router_ms": float(metrics["t_a_router_layer"]),
                         "ffn_compute_ms": float(metrics["t_f_layer"]) - f_collective_ms,
                         "f_collective_ms": f_collective_ms,

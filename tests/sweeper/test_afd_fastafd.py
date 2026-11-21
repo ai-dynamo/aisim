@@ -218,7 +218,7 @@ def test_builtin_provider_recomputes_the_fastafd_router_on_a(tmp_path, monkeypat
 @pytest.mark.parametrize("nextn", [0, 1])
 def test_ordinary_afd_evaluates_nested_native_routers(monkeypatch, nextn):
     """Shared-expert decode graphs must work without a FastAFD profile."""
-    local_queries = []
+    router_queries = []
     sum_latency = AFDInferenceSession._sum_latency
 
     def trace_router_query(self, ops, **kwargs):
@@ -227,7 +227,7 @@ def test_ordinary_afd_evaluates_nested_native_routers(monkeypatch, nextn):
         if ops and all("router" in op._name for op in ops):
             # Overlap getters reconstruct native leaves without Python shims.
             assert all(not hasattr(op, "_engine_query") for op in ops)
-            local_queries.append((kwargs["batch_size"], result))
+            router_queries.append((kwargs["batch_size"], result))
         return result
 
     monkeypatch.setattr(AFDInferenceSession, "_sum_latency", trace_router_query)
@@ -251,14 +251,18 @@ def test_ordinary_afd_evaluates_nested_native_routers(monkeypatch, nextn):
         nextn_accepted=0.0 if nextn else None,
     )
 
-    assert len(local_queries) == 1
-    batch, (total_ms, per_op) = local_queries[0]
+    assert len(router_queries) == 2
+    batch, (total_ms, per_op) = router_queries[0]
     assert batch == 65 * (nextn + 1)  # ceil(129 / 2), widened for MTP
     assert set(per_op) == {"generation_router_gemm"}
     assert all(ms > 0.0 for ms in per_op.values())
     assert total_ms == pytest.approx(sum(per_op.values()))
     layer_times = result.raw["afd_layer_measurements"]["decode"]
     assert layer_times["components"]["a_router_ms"] == pytest.approx(total_ms / layer_times["num_layers"])
+    f_batch, (f_total_ms, _) = router_queries[1]
+    assert f_batch == 16 * 65 * (nextn + 1)
+    assert layer_times["components"]["router_ms"] == pytest.approx(f_total_ms / layer_times["num_layers"])
+    assert layer_times["components"]["router_ms"] > layer_times["components"]["a_router_ms"] > 0
 
 
 @pytest.mark.parametrize(
