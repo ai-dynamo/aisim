@@ -32,6 +32,59 @@ def validate_phase(
         _check_worker_block_count(phase, dp, [worker for (rank, _), worker in sorted(workers.items()) if rank == dp])
     for _, record in (*sorted(schedulers.items()), *sorted(workers.items())):
         _check_layer_specs(record)
+    for _, worker in sorted(workers.items()):
+        _check_audited_sources(worker, source_files)
+
+
+# hf_overrides is a launch argument with the default {} (vLLM 0.33.0 config/model.py:348, engine/arg_utils.py:1035),
+# which vLLM applies on top of the loaded config.json (config/model.py:616-630). The reviewed launch sets none, and
+# the config.json hash does not cover another value. The observer records a callable as a string
+# (runtime/instrumentation/observer.py, _resolved).
+def _check_hf_overrides(record: dict[str, Any]) -> None:
+    value = record["resolved_config"]["model_config"].get("hf_overrides")
+    if value is not None and value != {}:
+        raise ValueError(f"loaded model configuration overrides require another source mapping: hf_overrides={value!r}")
+
+
+# The observer refuses a runner or a backend whose source file the bundle does not hash, a layer in two attention
+# groups, and attention groups that do not cover every cache layer (runtime/instrumentation/observer.py,
+# _layer_views). vLLM builds the attention groups of a cache group from that group's layers, one for each backend and
+# layer spec (vLLM 0.33.0 v1/worker/gpu/attn_utils.py:217-265, v1/worker/gpu_model_runner.py:6692-6713).
+def _check_audited_sources(record: dict[str, Any], source_files: Mapping[str, str]) -> None:
+    views = "attention backend views do not cover every physical cache layer"
+    entries = record.get("attention_groups")
+    if not isinstance(entries, list) or not entries or any(not isinstance(entry, dict) for entry in entries):
+        raise ValueError(views)
+    for entry in entries:
+        _check_audited_class(entry.get("backend_class"), source_files, "backend")
+    _check_audited_class(record["cache"]["model_runner"]["class"], source_files, "model runner")
+    groups = record["cache"]["groups"]
+    seen: set[str] = set()
+    for entry in entries:
+        index, names = entry.get("kv_cache_group_id"), entry.get("layer_names")
+        if (
+            type(index) is not int
+            or not 0 <= index < len(groups)
+            or not isinstance(names, list)
+            or any(not isinstance(name, str) for name in names)
+            or not set(names) <= set(groups[index]["layer_names"])
+        ):
+            raise ValueError(f"attention group layers lie outside their cache group: {names}")
+        for name in names:
+            if name in seen:
+                raise ValueError(f"duplicate attention group layer: {name}")
+            seen.add(name)
+    if seen != {name for group in groups for name in group["layer_names"]}:
+        raise ValueError(views)
+
+
+# The observer records a class as f"{module}.{qualname}", and a qualified name can hold a dot, so any dotted prefix
+# of the string can be its module.
+def _check_audited_class(name: Any, source_files: Mapping[str, str], role: str) -> None:
+    parts = name.split(".") if isinstance(name, str) else []
+    if not any(".".join(parts[:end]).replace(".", "/") + ".py" in source_files for end in range(len(parts) - 1, 0, -1)):
+        path = "/".join(parts[:-1]) + ".py" if len(parts) > 1 else repr(name)
+        raise ValueError(f"selected {role} source has not been audited: {path}")
 
 
 # vLLM stores both capacity values in one call (vLLM 0.33.0 v1/core/kv_cache_utils.py:1136-1142), which the engine

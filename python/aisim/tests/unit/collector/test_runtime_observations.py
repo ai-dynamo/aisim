@@ -3518,6 +3518,10 @@ def test_legacy_records_get_no_new_evidence_check(tmp_path, version, blocks):
     path, launches = observation_fixture(tmp_path, version=version)
     if blocks:
         _mutate(path, _legacy_blocks)
+    # Every process of the launch also holds configuration overrides, which a vLLM 0.33.0 worker may not hold.
+    _mutate(
+        path, lambda record: record["resolved_config"]["model_config"].update(hf_overrides={"num_hidden_layers": 2})
+    )
     records = []
     _mutate(path, records.append)
     worker = next(record for record in records if record["kind"] == "worker")["cache"]
@@ -3551,6 +3555,151 @@ def test_vllm_032_records_get_no_block_count_check(tmp_path):
     result = validate_observations(path, launches)["tp2"]
     assert (result["status"], result["diagnostics"]) == ("complete", [])
     assert "prefix_caching" not in result["provenance"]
+
+
+@pytest.mark.parametrize(
+    "value,complete",
+    [({"num_hidden_layers": 2}, False), ("<function overrides>", False), ({}, True), (None, True), ("absent", True)],
+)
+def test_v033_import_refuses_hf_overrides(tmp_path, value, complete):
+    path, launches = observation_fixture(tmp_path, layout="mamba_hybrid")
+
+    def edit(record):
+        # Every process of the launch holds the setting, as vLLM copies one configuration to each.
+        model = record["resolved_config"]["model_config"]
+        model.pop("hf_overrides", None) if value == "absent" else model.update(hf_overrides=value)
+
+    _mutate(path, edit)
+    result = validate_observations(path, launches)["tp2"]
+    if complete:
+        assert (result["status"], result["diagnostics"]) == ("complete", [])
+        return
+    assert result["diagnostics"] == [
+        f"tp2: loaded model configuration overrides require another source mapping: hf_overrides={value!r}"
+    ]
+
+
+def test_v033_import_refuses_hf_overrides_of_a_worker_before_the_scheduler_comparison(tmp_path):
+    path, launches = observation_fixture(tmp_path, layout="mamba_hybrid")
+
+    def edit(record):
+        if record["kind"] == "worker":
+            record["resolved_config"]["model_config"]["hf_overrides"] = {"num_hidden_layers": 2}
+
+    _mutate(path, edit)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["diagnostics"] == [
+        "tp2: loaded model configuration overrides require another source mapping: "
+        "hf_overrides={'num_hidden_layers': 2}"
+    ]
+
+
+_VIEWS = "attention backend views do not cover every physical cache layer"
+_UNAUDITED = "selected backend source has not been audited: vllm/v1/attention/backends/unknown.py"
+_UNAUDITED_RUNNER = "selected model runner source has not been audited: vllm/v1/worker/gpu_model_runner.py"
+_OUTSIDE = "attention group layers lie outside their cache group: ['attn.0', 'attn.1']"
+
+
+@pytest.mark.parametrize(
+    "layout,case,diagnostic",
+    [
+        ("mamba_hybrid", "backend", _UNAUDITED),
+        ("mamba_hybrid", "runner", _UNAUDITED_RUNNER),
+        ("mamba_hybrid", "other_group", _OUTSIDE),
+        ("mamba_hybrid", "group_index", _OUTSIDE),
+        ("mamba_hybrid", "layer_missing", _VIEWS),
+        ("mamba_hybrid", "no_groups", _VIEWS),
+        ("mamba_hybrid", "empty", _VIEWS),
+        ("mamba_hybrid", "not_a_list", _VIEWS),
+        ("mamba_hybrid", "entry_not_an_object", _VIEWS),
+        ("mamba_hybrid", "nested_class", None),
+        # The one cache group of kernel_view has two attention groups, latent.0 and indexer.0, as the MLA cache group
+        # of the live record has.
+        ("kernel_view", "second_backend", _UNAUDITED),
+        ("kernel_view", "second_entry_missing", _VIEWS),
+        ("kernel_view", "layer_twice", "duplicate attention group layer: latent.0"),
+        ("kernel_view", "nested_class", None),
+        # Only the last worker of the second DP rank names the backend.
+        ("mamba_hybrid", "one_rank_backend", _UNAUDITED),
+        # A module path alone is no class of that module.
+        ("mamba_hybrid", "module_only", "selected backend source has not been audited: vllm/v1/attention/backends.py"),
+        ("mamba_hybrid", "missing_backend", "selected backend source has not been audited: None"),
+        ("mamba_hybrid", "missing_group_id", _OUTSIDE),
+        (
+            "mamba_hybrid",
+            "bool_group_id",
+            "attention group layers lie outside their cache group: ['mamba.0', 'mamba.2']",
+        ),
+        (
+            "mamba_hybrid",
+            "negative_group_id",
+            "attention group layers lie outside their cache group: ['mamba.1', 'mamba.3']",
+        ),
+        ("mamba_hybrid", "missing_layer_names", "attention group layers lie outside their cache group: None"),
+        (
+            "mamba_hybrid",
+            "layer_name_not_a_string",
+            "attention group layers lie outside their cache group: [['attn.0'], 'attn.1']",
+        ),
+    ],
+)
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_v033_import_requires_audited_runner_and_backends(tmp_path, phase, layout, case, diagnostic):
+    path, launches = observation_fixture(tmp_path, layout=layout)
+
+    def edit(record):
+        if (record["kind"], record["phase"]) != ("worker", phase):
+            return
+        groups = record["attention_groups"]
+        if case == "one_rank_backend":
+            if (record["dp_rank"], record["tp_rank"]) == (1, 1):
+                groups[0]["backend_class"] = "vllm.v1.attention.backends.unknown.Backend"
+        elif case == "module_only":
+            groups[0]["backend_class"] = "vllm.v1.attention.backends.flash_attn"
+        elif case.startswith("missing_"):
+            del groups[0][{"backend": "backend_class", "group_id": "kv_cache_group_id"}.get(case[8:], case[8:])]
+        elif case == "bool_group_id":
+            # True indexes the second cache group in Python.
+            groups[1]["kv_cache_group_id"] = True
+        elif case == "negative_group_id":
+            # -1 indexes the last cache group in Python.
+            groups[2]["kv_cache_group_id"] = -1
+        elif case == "layer_name_not_a_string":
+            groups[0]["layer_names"][0] = ["attn.0"]
+        elif case == "backend":
+            groups[0]["backend_class"] = "vllm.v1.attention.backends.unknown.Backend"
+        elif case == "second_backend":
+            groups[1]["backend_class"] = "vllm.v1.attention.backends.unknown.Backend"
+        elif case == "runner":
+            # The other audited runner class, whose file the manifest of this fixture does not name.
+            record["cache"]["model_runner"]["class"] = "vllm.v1.worker.gpu_model_runner.GPUModelRunner"
+        elif case == "other_group":
+            groups[0]["kv_cache_group_id"] = 1
+        elif case == "group_index":
+            groups[0]["kv_cache_group_id"] = 7
+        elif case == "layer_missing":
+            groups[1]["layer_names"] = groups[1]["layer_names"][:1]
+        elif case == "second_entry_missing":
+            del groups[1]
+        elif case == "layer_twice":
+            groups[1]["layer_names"] = ["latent.0", "indexer.0"]
+        elif case == "no_groups":
+            del record["attention_groups"]
+        elif case == "empty":
+            record["attention_groups"] = []
+        elif case == "not_a_list":
+            record["attention_groups"] = {"0": groups[0]}
+        elif case == "entry_not_an_object":
+            groups[0] = "attn.0"
+        else:
+            groups[0]["backend_class"] = _V033_BACKEND + ".Inner"
+
+    _mutate(path, edit, derive=False)
+    result = validate_observations(path, launches)["tp2"]
+    if diagnostic is None:
+        assert (result["status"], result["diagnostics"]) == ("complete", [])
+        return
+    assert (result["status"], result["diagnostics"]) == ("incomplete", [f"tp2: {diagnostic}"])
 
 
 @pytest.mark.parametrize(

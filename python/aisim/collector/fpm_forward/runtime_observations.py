@@ -384,6 +384,8 @@ def _validate_record(
         and model.get("config_format", "auto") not in ("auto", "hf")
     ):
         raise ValueError(f"loaded config format requires another source mapping: {model['config_format']}")
+    if kind == "worker" and runtime_memory._hybrid_evidence(record["cache"]):
+        runtime_evidence._check_hf_overrides(record)
     if not _matches_model_path(model.get("model"), launch):
         raise ValueError("observed model path differs from the selected deployment")
     revision = launch["identity"]["model_revision"]
