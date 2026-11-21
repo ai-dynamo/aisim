@@ -884,24 +884,28 @@ def _load(
                 f"{artifact.path}\0{artifact.runtime_path}\0{artifact.role}\0{artifact.sha256}\0{artifact.bytes}\n".encode()
             )
         output_dir = output_dir.with_name(f"{output_dir.name}-{content.hexdigest()[:16]}")
-        cached = output_dir / "config.json"
-        if cached.is_file():  # materialized by an earlier load; config.json is written last
-            try:
-                cached_config = json.loads(cached.read_text())
-                if _materialization_is_intact(output_dir / "systems", manifest) and _cached_pin_is_valid(
-                    output_dir, manifest, cached_config
-                ):
-                    cached_config["systems_paths"] = [str(output_dir / "systems")]
-                    return FpmData(manifest, config=cached_config)
-            except ValueError:
-                pass
-        if output_dir.exists():  # partial, stale or edited: rebuild, never serve or trip over it
-            shutil.rmtree(output_dir)
+        output_dir = output_dir.absolute()
         output_dir.parent.mkdir(parents=True, exist_ok=True)
-        data = loader.load(root, manifest_path, output_dir=output_dir, config=config)
-        if data.config is None:
-            raise LoaderError("an fpm-profile artifact cannot be built into a best_available configuration")
-        return data
+        # The lock covers the check, the rebuild of a stale directory and the build itself: a second caller must not
+        # remove a directory the first is still writing (config.json is written last).
+        with _cache_lock(output_dir):
+            cached = output_dir / "config.json"
+            if cached.is_file():  # materialized by an earlier load; config.json is written last
+                try:
+                    cached_config = json.loads(cached.read_text())
+                    if _materialization_is_intact(output_dir / "systems", manifest) and _cached_pin_is_valid(
+                        output_dir, manifest, cached_config
+                    ):
+                        cached_config["systems_paths"] = [str(output_dir / "systems")]
+                        return FpmData(manifest, config=cached_config)
+                except ValueError:
+                    pass
+            if output_dir.exists():  # partial, stale or edited: rebuild, never serve or trip over it
+                shutil.rmtree(output_dir)
+            data = loader.load(root, manifest_path, output_dir=output_dir, config=config)
+            if data.config is None:
+                raise LoaderError("an fpm-profile artifact cannot be built into a best_available configuration")
+            return data
     raise ValueError(f"no loader for category {category!r}")
 
 

@@ -336,8 +336,17 @@ def check_dataset(root: Path, *, unchecked_categories: tuple[str, ...] = ()) -> 
             seen.add(entry.configuration_id)
             # Parse the bytes that passed the integrity check, then run the category's checks on that manifest.
             manifest = Manifest.model_validate_json(_verified_bytes(root, entry.manifest))
-            check = _check_envelope if category in unchecked_categories else _check_manifest
-            manifest = check(root, manifest)
+            if category in unchecked_categories:
+                manifest = _check_envelope(root, manifest)
+            elif category == "e2e":
+                # Import lazily: the E2E protocol builds on this shared envelope module.
+                from aisim_core.data.e2e import load_e2e
+
+                loaded = load_e2e(root, entry.manifest.path).manifest
+                if loaded.model_dump_json() != manifest.model_dump_json():
+                    raise ValueError("manifest changed during dataset validation")
+            else:
+                manifest = _check_manifest(root, manifest)
             if (manifest.category, manifest.configuration_id, manifest.identity, manifest.purpose) != (
                 category,
                 entry.configuration_id,

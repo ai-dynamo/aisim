@@ -3,6 +3,7 @@
 
 """Whole-tree op-latency loading."""
 
+import hashlib
 import json
 
 import pyarrow as pa
@@ -95,3 +96,68 @@ def test_legacy_local_layout_explicitly_omits_the_support_field(published, tmp_p
     _write_op_index(out, index)
     loaded = load_op_latency_tree(out, tmp_path / "root", packaged_systems=None)
     assert set(loaded.lookup_files) == {"query_versions.yaml", "perf_data_reuse_manifest.yaml"}
+
+
+def _support_declaration(root, change):
+    dataset_path = root / "catalog/dataset.json"
+    dataset = json.loads(dataset_path.read_bytes())
+    reference = dataset["categories"]["op-latency"]["index"]
+    path = root / reference["path"]
+    index = json.loads(path.read_bytes())
+    change(index)
+    path.write_text(json.dumps(index))
+    reference.update(sha256=hashlib.sha256(path.read_bytes()).hexdigest(), bytes=path.stat().st_size)
+    dataset_path.write_text(json.dumps(dataset))
+
+
+@pytest.mark.parametrize("name", ["perf_data_reuse_manifest", "query_versions"])
+@pytest.mark.parametrize("declaration", ["empty", "partial"])
+def test_declared_support_rejects_unpinned_lookups_in_validation_and_materialization(
+    published, tmp_path, name, declaration
+):
+    from aisim_core.data.ensure import MissingDataError, _load_op_latency
+    from aisim_core.data.fetch import Cache, Selection
+
+    _, root = published
+    relative = f"data/op-latency/{name}.parquet"
+
+    def unpin(index):
+        index["support"] = [] if declaration == "empty" else [a for a in index["support"] if a["path"] != relative]
+
+    _support_declaration(root, unpin)
+    with pytest.raises(LoaderError, match="required lookup support"):
+        verify_op_latency_support(root)
+    with pytest.raises(LoaderError, match="required lookup support"):
+        load_op_latency_tree(root, tmp_path / "untrusted", packaged_systems=None)
+    assert not (tmp_path / "untrusted").exists()
+    with pytest.raises(MissingDataError, match="required lookup support"):
+        _load_op_latency(
+            root,
+            op_latency_entries(root),
+            {},
+            Cache(tmp_path / "cache"),
+            "local",
+            Selection(category="op-latency"),
+            str(root),
+        )
+
+
+def test_legacy_index_without_support_keeps_local_lookup_compatibility(published, tmp_path):
+    systems, root = published
+    _support_declaration(root, lambda index: index.pop("support"))
+    verify_op_latency_support(root)
+    loaded = load_op_latency_tree(root, tmp_path / "legacy", packaged_systems=None)
+    for name in loaded.lookup_files:
+        assert (loaded.root / name).read_bytes() == (systems / name).read_bytes()
+
+
+@pytest.mark.parametrize("name", ["perf_data_reuse_manifest", "query_versions"])
+def test_pinned_lookup_digest_is_still_required(published, tmp_path, name):
+    _, root = published
+    path = root / f"data/op-latency/{name}.parquet"
+    path.write_bytes(path.read_bytes() + b"changed")
+    with pytest.raises(ValueError, match="integrity mismatch"):
+        verify_op_latency_support(root)
+    with pytest.raises(ValueError, match="integrity mismatch"):
+        load_op_latency_tree(root, tmp_path / "tampered", packaged_systems=None)
+    assert not (tmp_path / "tampered").exists()

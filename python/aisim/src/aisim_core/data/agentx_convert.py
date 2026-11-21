@@ -195,6 +195,12 @@ def _body(
     implementation = dict(configuration.get("implementation_identity") or {})
     if effective:
         implementation["ranks_observed"] = len(effective)
+    observed_tp = observed.get("tp")
+    if observed_tp is not None and observed_tp != manifest["tensor_parallel"]:
+        raise AgentxBundleError(
+            f"{manifest['id']}: manifest tensor_parallel={manifest['tensor_parallel']!r} "
+            f"conflicts with observed tensor_parallel_size={observed_tp!r}"
+        )
     return E2eManifestBody(
         origin=normalize("origin", manifest["category"]),
         model_id=normalize("model", manifest["model"]),
@@ -391,6 +397,8 @@ def agentx_bundle_to_configuration(bundle: Path | str) -> E2eConfigurationData:
             "repeat": variant.get("repeat"),
             "measured_requests": manifest.get("measured_requests"),
             "benchmark_url": manifest.get("benchmark_url"),
+            # Workload facts are per observation; merged configurations retain only shared facts in the body.
+            "workload": body.workload.model_dump(mode="json", exclude_none=True),
         }.items()
         if v is not None
     }
