@@ -367,7 +367,8 @@ class BaseBackend:
         with a different queue model override this whole computation."""
         qf = self._ttft_queuing_factor(b, steps_to_finish_ctx)
         logger.debug(f"ttft: prefill_step={prefill_step_ms:.2f}ms qf={qf:.2f}")
-        prefill_tokens = isl - prefix if b == 1 else isl
+        visual_mean_field = self._visual_context_tokens(model, runtime_config) > 0 and not _is_fpm_model(model)
+        prefill_tokens = isl - prefix if b == 1 and not visual_mean_field else isl
         prefill_ms = (
             prefill_total_ms if prefill_total_ms is not None else prefill_step_ms * np.ceil(prefill_tokens / ctx_tokens)
         )
@@ -1971,6 +1972,32 @@ class BaseBackend:
         embed_tokens = total_visuals * workload.output_tokens_per_image
         return self._get_encoder_component_memory(model, num_tokens, embed_tokens)
 
+    @staticmethod
+    def _fpm_aggregate_prefill_tokens(budget: int, isl: int, prefix: int, prefill_requests: int) -> int:
+        """Translate a prompt-token scheduler budget to scheduled fresh tokens.
+
+        Each complete prompt and the capped trailing chunk schedules its own
+        uncached suffix. Preserve a positive budget for fully cached prompts
+        so the native engine still rejects their invalid prefill geometry.
+        """
+        full, remainder = divmod(min(budget, prefill_requests * isl), isl)
+        new_tokens = max(0, isl - prefix)
+        return max(1, full * new_tokens + min(remainder, new_tokens))
+
+    def _run_agg_mixed_step(self, model, database, runtime_config, step: MixedStepInput) -> StepEstimate:
+        if runtime_config.batch_size > 1 and _is_fpm_model(model):
+            isl = runtime_config.isl + self._visual_context_tokens(model, runtime_config)
+            step = dataclasses.replace(
+                step,
+                context_tokens=self._fpm_aggregate_prefill_tokens(
+                    step.context_tokens,
+                    isl,
+                    runtime_config.prefix,
+                    max(1, runtime_config.batch_size - step.num_decode_requests),
+                ),
+            )
+        return self.run_mixed(model, database, runtime_config, step)
+
     def run_agg(
         self, model: BaseModel, database: PerfDatabase, runtime_config: RuntimeConfig, **kwargs
     ) -> InferenceSummary:
@@ -2152,7 +2179,7 @@ class BaseBackend:
                 moe_comm_fallbacks=fallbacks,
             )
         else:
-            mix_step_estimate = self.run_mixed(
+            mix_step_estimate = self._run_agg_mixed_step(
                 model, database, runtime_config, MixedStepInput(num_mix_ctx_tokens, num_mix_gen_tokens)
             )
         mix_step_latency_ms = mix_step_estimate.latency_ms
@@ -2200,7 +2227,11 @@ class BaseBackend:
             encoder_latency_ms=encoder_latency_ms,
             steps_to_finish_ctx=ttft_steps_to_finish_ctx,
             decode_iterations=decode_iterations,
-            **({"prefill_total_ms": _prefill_step_ms * num_mix_steps} if b == 1 and num_mix_steps > 1 else {}),
+            **(
+                {"prefill_total_ms": _prefill_step_ms * num_mix_steps}
+                if b == 1 and num_mix_steps > 1 and img_ctx_tokens == 0
+                else {}
+            ),
         )
 
         # Guard against osl == 1 (no-decode), which makes both denominators zero.

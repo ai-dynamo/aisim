@@ -1521,6 +1521,72 @@ def test_run_agg_visual_fallback_retains_native_attention(backend, prefix, budge
     assert summary.get_aggregate_energy_breakdown()["mix_step"].latency_ms == pytest.approx(attention_ms)
 
 
+@pytest.mark.parametrize("visual_tokens", [0, 1000])
+def test_xpu_aggregate_exact_ttft_total_is_text_only(monkeypatch, visual_tokens):
+    from aisim.sdk.backends import base_backend as base_backend_module
+    from aisim_core.sdk.backends.vllm_backend_xpu import VLLMXPUBackend
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+
+    backend = VLLMXPUBackend()
+    model = get_model("Qwen/Qwen3-0.6B", ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1), "vllm")
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL", allow_unlisted_version=True)
+    assert database is not None
+    model._num_layers = 0
+    model.encoder_config = _vision_encoder_config()
+    model.visual_context_ops = []
+    monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+    monkeypatch.setattr(backend, "_max_kv_slots", lambda *a, **k: 2)
+    monkeypatch.setattr(
+        backend,
+        "_run_encoder_phase",
+        lambda *_: ({"encoder": 3.0}, {"encoder": 0.0}, {"encoder": "estimated"}, visual_tokens),
+    )
+    monkeypatch.setattr(backend, "_get_encoder_component_memory_for_runtime", lambda *_: {})
+    monkeypatch.setattr(backend, "_get_genonly_step_estimate", lambda *_: StepEstimate(0.0, 0.0))
+
+    def native_breakdown(_model, _database, **kwargs):
+        scale = -(-kwargs["isl"] // kwargs["ctx_tokens"])
+        return {
+            "latency_ms": 2.0 + 12.0 / scale,
+            "energy_wms": 0.0,
+            "component_latency_ms": {"shared_non_attention": 2.0, "context_attention": 12.0 / scale},
+            "component_energy_wms": {},
+            "per_op_latency_ms": {"shared": 2.0, "context_attention (scaled)": 12.0 / scale},
+            "per_op_source": {},
+            "moe_comm_fallbacks": (),
+        }
+
+    monkeypatch.setattr(base_backend_module, "estimate_mixed_step_breakdown_with_rust", native_breakdown)
+    totals = []
+    compute_ttft = backend._compute_ttft
+
+    def record_ttft(*args, **kwargs):
+        totals.append(kwargs.get("prefill_total_ms"))
+        return compute_ttft(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "_compute_ttft", record_ttft)
+    summary = backend.run_agg(
+        model,
+        database,
+        RuntimeConfig(
+            batch_size=1,
+            isl=3000 - visual_tokens,
+            osl=1,
+            num_images_per_request=int(visual_tokens > 0),
+            num_image_tokens=visual_tokens,
+        ),
+        ctx_tokens=2048,
+    )
+    # Invented attention price = 12 ms per query, shared work = 2 ms per
+    # step, encoder = 3 ms. Visual mean-field attention undoes the /2 and
+    # shared work scales by 3000/2048. Exact text pays two 14 ms queries,
+    # including the short final chunk, without applying that scaling.
+    prefill_ms = 12.0 + 2.0 * 3000 / 2048 if visual_tokens else 28.0
+    assert summary.get_result_dict()["ttft"] == pytest.approx(3.0 + prefill_ms, abs=1e-3)
+    assert totals == ([None] if visual_tokens else [prefill_ms])
+
+
 def test_run_agg_visual_fpm_keeps_uncached_step_count(backend, model, database, monkeypatch):
     # Whole-model FPM already averages its actual uncached chunks. Its 5 ms
     # step must be counted twice, independently of the op-level fallback.

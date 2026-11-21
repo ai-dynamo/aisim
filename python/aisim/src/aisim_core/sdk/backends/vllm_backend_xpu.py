@@ -340,6 +340,11 @@ class VLLMXPUBackend(VLLMBackend):
 
     # ==================== MIX-STEP LATENCY (shared) ====================
 
+    def _run_agg_mixed_step(self, model, database, runtime_config, step: MixedStepInput) -> StepEstimate:
+        # XPU consumes a total scheduler budget: reserve decode slots before
+        # translating the remaining prompt budget to FPM fresh tokens.
+        return self.run_mixed(model, database, runtime_config, step)
+
     def run_mixed(
         self,
         model: BaseModel,
@@ -370,5 +375,13 @@ class VLLMXPUBackend(VLLMBackend):
         if getattr(model, "forward_model", "op_level") == "fpm":
             request_tokens = max(1, isl - int(runtime_config.prefix or 0))
         demand = max(1, int(getattr(runtime_config, "batch_size", 1) or 1)) * request_tokens
-        step = replace(step, context_tokens=max(1, min(demand, step.context_tokens - step.num_decode_requests)))
+        budget = max(1, step.context_tokens - step.num_decode_requests)
+        if getattr(model, "forward_model", "op_level") == "fpm" and runtime_config.batch_size > 1:
+            budget = self._fpm_aggregate_prefill_tokens(
+                budget,
+                isl,
+                int(runtime_config.prefix or 0),
+                max(1, runtime_config.batch_size - step.num_decode_requests),
+            )
+        step = replace(step, context_tokens=max(1, min(demand, budget)))
         return super().run_mixed(model, database, runtime_config, step)

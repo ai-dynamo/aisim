@@ -493,9 +493,11 @@ def test_compute_ttft_single_request_counts_a_short_final_fpm_chunk(monkeypatch,
 
 @pytest.mark.parametrize(
     "forward_model,prefix,budget,expected",
-    [("fpm", 4088, 4096, 128), ("fpm", 3000, 2048, 2033), ("op_level", 0, 100000, 65536)],
+    [("fpm", 4088, 4096, 8), ("fpm", 3000, 2048, 1096), ("op_level", 0, 100000, 65536)],
 )
 def test_batched_ttft_caps_prefill_after_reserving_decode(monkeypatch, forward_model, prefix, budget, expected):
+    # Fifteen decoders leave one physical prefill slot. Its uncached suffix
+    # has 8 or 1096 tokens, even when the token budget could hold more suffixes.
     backend = VLLMXPUBackend()
     backend._in_agg = True
     runtime = SimpleNamespace(isl=4096, osl=128, prefix=prefix, batch_size=16)

@@ -23,6 +23,14 @@ timing and graph remain available during migration. Pure operation-level
 speculative decoding remains supported. Ordinary autoregressive FPM and n-gram
 FPM verification without a draft network are outside this deprecation.
 
+The aggregate scheduler translates its prompt-token budget to scheduled fresh
+prefill tokens before querying the target FPM and any draft operations. A batch
+of two requests with `isl=4096`, `prefix=3000` and a 4096-token budget schedules
+one decoder and one prefill of 1096 fresh tokens, so a qualified draft scan pays
+one recurrent-state read/write pair. XPU reserves decode slots before this
+translation. Direct mixed-step calls still consume the caller's fresh-token
+count; 4096 explicitly scheduled fresh tokens represent four such prefills.
+
 Choose the replacement according to the evidence and caller you have:
 
 | Route | Migration use | Current readiness |

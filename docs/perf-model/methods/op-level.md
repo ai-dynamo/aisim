@@ -53,8 +53,11 @@ Single-request op-level aggregates with visual tokens retain mean-field pricing
 when the uncached prompt exceeds the prefill budget. Native context attention
 and the visual-mask overlay amortize a whole-prefill query over
 `ceil(effective_isl / ctx_tokens)` steps, where `effective_isl` includes visual
-tokens. Aggregate TTFT, throughput and energy use that same weight to retain
-the full contribution. The queuing factor still uses the uncached step count.
+tokens. Base-backend TTFT, throughput and energy use that same weight to retain
+the full contribution. XPU TTFT restores whole-prefill attention but scales
+shared work by `effective_isl / ctx_tokens`, retaining its calibrated heuristic;
+it receives exact chunk totals only for text requests. The queuing factor still
+uses the uncached step count.
 This fallback does not model the exact placement of visual tokens in chunks;
 shared operations retain the existing mean-field approximation. Whole-model
 FPM instead retains its average over uncached chunks.

@@ -8,8 +8,9 @@ Each BUILD is a directory under ROOT that holds the build's checkout in `src` an
 environment in `venv`. `HOST_PERF_MODELS` selects model-id prefixes (comma-separated) and
 `HOST_PERF_MODES` database modes (default `SILICON`). Round r runs the builds rotated by
 r, so with ROUNDS a multiple of the build count each build runs in each position equally
-often. OUT.json holds each round's order
-and maps build -> case -> per-round cold and warm medians (us).
+often. OUT.json holds each round's order, complete worker requests/responses,
+and maps build -> case -> per-round cold and warm medians (us). Worker success
+does not qualify output equivalence; that status is recorded separately.
 """
 
 import json
@@ -39,6 +40,7 @@ def selected(model_id):
 cases = [c for c in expand_cases() if selected(c["model_id"]) and c["database_mode"] in modes]
 res = {b: {} for b in builds}
 orders = []
+worker_runs = []
 for r in range(rounds):
     order = builds[r % len(builds) :] + builds[: r % len(builds)]
     orders.append(order)
@@ -53,13 +55,27 @@ for r in range(rounds):
             text=True,
             check=True,
         )
-        for c in json.loads(proc.stdout)["results"]:
+        response = json.loads(proc.stdout)
+        worker_runs.append({"round": r, "build": b, "request": request, "response": response})
+        for c in response["results"]:
             if c.get("status") != "OK":
                 sys.exit(f"{b} {c['case_id']}: {c.get('status')} {json.dumps(c.get('error', {}))[:200]}")
             row = res[b].setdefault(c["case_id"], {"cold": [], "warm": []})
             row["cold"].append(c["cold_us"])
             row["warm"].append(c["warm"]["call_median_us"])
 with open(out, "w") as f:
-    json.dump({"orders": orders, "results": res}, f, indent=1)
+    json.dump(
+        {
+            "orders": orders,
+            "results": res,
+            "worker_runs": worker_runs,
+            "output_equivalence": {
+                "status": "not_checked",
+                "reason": "Worker OK records execution success; separate correctness qualification is required.",
+            },
+        },
+        f,
+        indent=1,
+    )
 for case in sorted(res[builds[0]]):
     print(case, *(f"{statistics.median(res[b][case]['warm']):.2f}" for b in builds))

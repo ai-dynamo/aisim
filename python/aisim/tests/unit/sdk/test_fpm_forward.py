@@ -963,6 +963,69 @@ def fpm_session(tmp_path):
 
 
 class TestFPMStaticAndMixed:
+    @pytest.mark.parametrize("xpu", [False, True])
+    @pytest.mark.parametrize("prefix", [0, 3000])
+    def test_cached_aggregate_schedules_fpm_target_and_draft_requests(self, tmp_path, xpu, prefix, monkeypatch):
+        from aisim.sdk.inference_session import InferenceSession
+        from aisim_core.sdk.backends.vllm_backend_xpu import VLLMXPUBackend
+        from aisim_core.sdk.operations import Mamba2Kernel
+        from aisim_core.sdk.step_estimate import MixedStepInput
+
+        model = models.get_model("Qwen/Qwen3-0.6B", _model_config(forward_model="fpm"), BACKEND)
+        model.context_ops.append(
+            Mamba2Kernel(
+                "draft_scan",
+                1,
+                "mamba_chunk_scan_combined",
+                "context",
+                4096,
+                64,
+                64,
+                128,
+                4,
+                4,
+                128,
+                state_dtype="bfloat16",
+                token_width=1,
+            )
+        )
+        identity = dict(zip(_CELL_MATCH_COLUMNS, model.context_ops[0]._match_identity, strict=True))
+        # Invented exact anchors distinguish one scheduled suffix + one decoder
+        # from a native caller scheduling 4096 genuinely new tokens (4 prefills).
+        rows = [
+            _row("prefill", 1, 1097, 3000, 12.0, model_path=model.model_path, identity=identity),
+            _row("prefill", 4, 4097, 12000, 33.0, model_path=model.model_path, identity=identity),
+            _row("prefill", 1, 4097, 0, 22.0, model_path=model.model_path, identity=identity),
+            _row("prefill", 1, 4096, 0, 21.0, model_path=model.model_path, identity=identity),
+        ] + [
+            _row("decode", b, 0, kv, ms, model_path=model.model_path, identity=identity)
+            for b, kv, ms in [(1, 4098, 3.0), (2, 8196, 5.0), (1, 0, 2.0), (2, 0, 4.0)]
+        ]
+        shutil.copy(Path(_CORE_SYSTEMS) / f"{SYSTEM}.yaml", tmp_path / f"{SYSTEM}.yaml")
+        _write_pair(str(tmp_path / "data" / SYSTEM / BACKEND / VERSION), rows)
+        database = PerfDatabase(SYSTEM, BACKEND, VERSION, systems_root=str(tmp_path))
+        backend = VLLMXPUBackend() if xpu else get_backend(BACKEND)
+        if xpu:
+            monkeypatch.setattr(backend, "_max_kv_slots", lambda *a, **k: 2)
+        runtime = sdk_config.RuntimeConfig(batch_size=2, isl=4096, osl=2, prefix=prefix)
+        # XPU reserves one token for decode before pricing the cold 4096-token
+        # control; the cached case uses the exact reported 4096-token budget.
+        budget = 4096 + int(xpu and not prefix)
+        summary = InferenceSession(model, database, backend).run_agg(runtime, ctx_tokens=budget)
+        ops = summary.get_per_ops_data()["mix_step"]
+        assert ops["fpm_forward_prefill"] == pytest.approx(12.0 if prefix else 22.0)
+        # Independent SOL traffic for this scan: 18,560 bytes/new token,
+        # plus a read and write of the 1 MiB state for each physical request.
+        new_tokens = 1096 if prefix else 4096
+        expected_ms = (new_tokens * 18_560 + 2_097_152) / database.system_spec["gpu"]["mem_bw"] * 1000
+        assert ops["draft_scan"] == pytest.approx(expected_ms, rel=1e-9)
+        if prefix:
+            # Public run_mixed keeps its fresh-token convention, even after agg.
+            direct = InferenceSession(model, database, backend).run_mixed(runtime, MixedStepInput(4096, 1))
+            assert direct.per_op_latency_ms["fpm_forward_prefill"] == pytest.approx(33.0)
+            expected_direct = (4096 * 18_560 + 4 * 2_097_152) / database.system_spec["gpu"]["mem_bw"] * 1000
+            assert direct.per_op_latency_ms["draft_scan"] == pytest.approx(expected_direct, rel=1e-9)
+
     @pytest.mark.parametrize("ctx_tokens", [256, 512])
     @pytest.mark.parametrize("gen_requests", [0, 2])
     def test_public_mixed_hybrid_keeps_native_component_sources(self, fpm_session, ctx_tokens, gen_requests):
