@@ -1089,6 +1089,7 @@ def _score_prepared(
     sample_metrics = {
         OptimizationTarget.E2E_LATENCY: "num_e2e_latency_samples",
         OptimizationTarget.TTFT: "num_ttft_samples",
+        OptimizationTarget.THROUGHPUT_PER_USER: "num_tpot_samples",
     }
     for target in effective_targets:
         sample_metric = sample_metrics.get(target)
