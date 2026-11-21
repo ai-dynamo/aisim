@@ -835,6 +835,8 @@ def _trace_files(workload: Mapping[str, Any], format_name: str) -> list[Path] | 
     files = []
     for raw_path in workload.get("trace_paths") or [workload["trace_path"]]:
         source = Path(raw_path)
+        if source.is_symlink():
+            return None
         for path in source.rglob("*") if source.is_dir() else (source,):
             if path.is_symlink():
                 return None

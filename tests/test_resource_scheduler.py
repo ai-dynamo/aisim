@@ -655,6 +655,41 @@ def test_reuse_requires_same_native_weka_workload_and_width(monkeypatch, tmp_pat
         state.close()
 
 
+@pytest.mark.parametrize(
+    "case", ["external", "runtime", "cache-off", "non-weka", "no-path", "symlink", "directory-symlink", "stat-error"]
+)
+def test_ineligible_weka_workloads_have_no_pool_reuse_key(tmp_path, monkeypatch, case):
+    from aisim import resources
+    from aisim.runner import EngineReplayRunnerFactory
+
+    trace = tmp_path / "trace.jsonl"
+    trace.touch()
+    runner = EngineReplayRunnerFactory(
+        trace_graph_cache=case != "cache-off", runtime=object() if case == "runtime" else None
+    )
+    factory = GuardedRunnerFactory(object() if case == "external" else runner, "engine", ResourceConfig())
+    workload = {"trace_format": "mooncake" if case == "non-weka" else "weka"}
+    if case in {"symlink", "directory-symlink"}:
+        link = tmp_path / "link"
+        target = trace
+        if case == "directory-symlink":
+            target = tmp_path / "source"
+            target.mkdir()
+            trace.rename(target / trace.name)
+        link.symlink_to(target)
+        trace = link
+    if case != "no-path":
+        workload["trace_paths"] = [str(trace)]
+    if case == "stat-error":
+
+        def disappeared(files):
+            raise FileNotFoundError(trace)
+
+        monkeypatch.setattr(resources, "_trace_scan_identity", disappeared)
+
+    assert factory.wave_reuse_key([SimpleNamespace(workload=workload)]) is None
+
+
 @pytest.mark.parametrize("pressure", [True, False], ids=["memory", "timeout"])
 def test_interrupted_reused_pool_keeps_completed_sibling(monkeypatch, pressure):
     from concurrent.futures import Future

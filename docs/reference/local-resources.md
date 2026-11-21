@@ -86,8 +86,10 @@ are limited to one thread per worker. During recommendation evaluation, memory
 pressure triggers worker cleanup and retries unfinished candidates at lower
 parallelism, at most twice. The scheduler retains completed candidates and reaps
 interrupted workers before retrying. A native Weka sweep can keep healthy workers
-across waves when the workload, trace files, and worker count match. The scheduler
-admits each wave against live memory. If idle workers prevent admission, it reaps
+across waves when the workload, trace files, and worker count match. Reuse requires
+the native engine runner with `trace_graph_cache=True`. The `recommend` CLI enables
+this cache. Direct `Sweeper` callers can enable it on `EngineReplayRunnerFactory`.
+The scheduler admits each wave against live memory. If idle workers prevent admission, it reaps
 them and retries at the same width. Persistent pressure produces an explicit
 `resource_limited` candidate and the sweep continues with other candidates.
 A sudden jump past the supervisor limit stops the entire execution tree.
