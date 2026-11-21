@@ -143,15 +143,17 @@ def _predict_generated_config(command: list[str]) -> int:
 
 
 def run_validation(args: argparse.Namespace) -> int:
-    request = SupportRequest.from_yaml(args.config)
+    config_path = Path(args.config)
+    request = SupportRequest.from_yaml(config_path)
+    trace_path = Path(args.trace).expanduser()
     plan = Path(args.output_dir).expanduser().resolve()
-    trace = Path(args.trace).expanduser().resolve()
+    trace = trace_path.resolve()
     output = Path(args.validation_output_dir).expanduser().resolve()
     if not trace.is_file() or trace.suffix.lower() not in {".json", ".jsonl"}:
         raise ValueError("--trace must be a local Weka JSON or JSONL file")
     if output == plan or plan in output.parents or output in plan.parents:
         raise ValueError("validation output must be separate from the collection plan directory")
-    for source in (Path(args.config).expanduser().resolve(), trace):
+    for source in (config_path.resolve(), trace):
         if source == output or output in source.parents:
             raise ValueError(f"validation output must not contain the input file {source}")
     with plan_lock(plan):
@@ -163,8 +165,9 @@ def run_validation(args: argparse.Namespace) -> int:
     for relative in ("predict.yaml", "validation.json", "prediction"):
         if (output / relative).is_symlink():
             raise ValueError(f"refusing symlinked validation output {output / relative}")
-    prepare_output_directory(output, overwrite=args.overwrite)
-    prepare_output_directory(output / "prediction", overwrite=args.overwrite)
+    input_paths = (config_path, trace_path)
+    prepare_output_directory(output, overwrite=args.overwrite, input_paths=input_paths)
+    prepare_output_directory(output / "prediction", overwrite=args.overwrite, input_paths=input_paths)
     prediction_path = output / "predict.yaml"
     prediction_path.write_text(yaml.safe_dump(prediction, sort_keys=False), encoding="utf-8")
     report_path = output / "validation.json"

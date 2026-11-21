@@ -6,13 +6,14 @@
 from __future__ import annotations
 
 import contextvars
+import errno
 import fcntl
 import json
 import os
 import re
 import stat
 import sys
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
@@ -139,12 +140,13 @@ def _unfinished_run_leftovers(root: Path) -> dict[str, _Fingerprint] | None:
     return leftovers
 
 
-def _clear_unfinished_run(root: Path, leftovers: dict[str, _Fingerprint]) -> None:
+def _clear_unfinished_run(root: Path, leftovers: dict[str, _Fingerprint], input_paths: tuple[str | Path, ...]) -> None:
     """Remove the fingerprinted leftovers, stopping at the first file that changed.
 
     Runs under the output-directory lock. Each file is still checked again just
-    before it is removed, and the runtime report goes last, so a process that
-    writes without the lock (an older AISim, or anything else) keeps its evidence.
+    before it is removed, including aliases from the original input paths. The
+    runtime report goes last, so a process that writes without the lock (an
+    older AISim, or anything else) keeps its evidence.
     """
 
     for name in sorted(leftovers, key=lambda item: item == _RUNTIME_REPORT):
@@ -158,12 +160,73 @@ def _clear_unfinished_run(root: Path, leftovers: dict[str, _Fingerprint]) -> Non
                 f"output directory {root} changed while AISim was preparing it ({name}); "
                 "nothing else was removed. Choose a new --output-dir"
             )
+        _check_input_collisions((target,), input_paths)
         if leftovers[name][4]:
             target.rmdir()
         else:
             target.unlink()
     if any(root.iterdir()):
         raise ValueError(f"output directory {root} changed while AISim was preparing it; choose a new --output-dir")
+
+
+def _resolve_input_path(path: Path) -> Path:
+    """Allow not-yet-created inputs, but reject unresolved symbolic-link loops."""
+
+    try:
+        try:
+            # Non-strict resolution no longer reports symlink loops on Python 3.13.
+            return path.resolve(strict=True)
+        except FileNotFoundError:
+            return path.resolve()
+    except (OSError, RuntimeError) as exc:
+        if isinstance(exc, OSError) and exc.errno != errno.ELOOP:
+            raise
+        raise ValueError(f"output cleanup cannot resolve input path {path}; refusing to replace outputs") from exc
+
+
+def _input_path_entries(sources: Iterable[Path]) -> set[Path]:
+    """Keep every directory entry needed to reopen the original input paths."""
+
+    entries: set[Path] = set()
+    pending = list(sources)
+    while pending:
+        source = pending.pop()
+        for path in (source, *source.parents):
+            # Resolve only the parent: the final entry may itself be a symlink
+            # that cleanup would unlink, even when its destination is safe.
+            entry = _resolve_input_path(path.parent) / path.name
+            if entry in entries:
+                continue
+            entries.add(entry)
+            if entry.is_symlink():
+                target = entry.readlink()
+                pending.append(target if target.is_absolute() else entry.parent / target)
+    return entries
+
+
+def _check_input_collisions(targets: Iterable[Path], input_paths: Iterable[str | Path]) -> None:
+    """Reject output replacements that would remove an input or its path entries."""
+
+    sources = [Path(input_path).absolute() for input_path in input_paths]
+    inputs = {_resolve_input_path(source) for source in sources}
+    input_entries = _input_path_entries(sources)
+    input_directories = [source for source in inputs if source.is_dir()]
+    for target in targets:
+        try:
+            resolved = target.resolve()
+        except RuntimeError:
+            # Python 3.11/3.12 cannot resolve a stale symlink loop, but
+            # removing that directory entry still requires no traversal.
+            resolved = target.absolute()
+        entry = target.parent.resolve() / target.name
+        if (
+            entry in input_entries
+            or resolved in inputs
+            or any(
+                resolved.is_relative_to(directory) or entry.is_relative_to(directory) for directory in input_directories
+            )
+        ):
+            raise ValueError(f"output cleanup would remove input file {target}; choose a different output directory")
 
 
 # One AISim run owns an output directory at a time. The lock is an advisory
@@ -307,7 +370,7 @@ class OutputDirectoryOwnership:
             os.close(descriptor)
 
 
-def prepare_output_directory(path: str | Path, *, overwrite: bool) -> Path:
+def prepare_output_directory(path: str | Path, *, overwrite: bool, input_paths: Iterable[str | Path] = ()) -> Path:
     """Create an output directory without deleting unrelated user files.
 
     A directory that holds only the diagnostics of a failed AISim run (a runtime
@@ -328,7 +391,7 @@ def prepare_output_directory(path: str | Path, *, overwrite: bool) -> Path:
     else:
         descriptor = _lock(root)
     try:
-        _prepare_locked(root, overwrite=overwrite)
+        _prepare_locked(root, overwrite=overwrite, input_paths=input_paths)
     except BaseException:
         if descriptor is not None:
             os.close(descriptor)
@@ -341,23 +404,28 @@ def prepare_output_directory(path: str | Path, *, overwrite: bool) -> Path:
     return root
 
 
-def _prepare_locked(root: Path, *, overwrite: bool) -> None:
+def _prepare_locked(root: Path, *, overwrite: bool, input_paths: Iterable[str | Path]) -> None:
+    input_paths = tuple(input_paths)
     if any(root.iterdir()) and not overwrite:
         leftovers = _unfinished_run_leftovers(root)
         if leftovers is None:
             raise ValueError(_non_empty_message(root))
-        _clear_unfinished_run(root, leftovers)
+        _check_input_collisions((root / name for name in leftovers), input_paths)
+        _clear_unfinished_run(root, leftovers, input_paths)
         sys.stderr.write(f"aisim: reusing {root}: removed diagnostics left by a failed run\n")
     if overwrite:
-        for name in sorted(_KNOWN_FILES):
-            target = root / name
-            if target.is_file() or target.is_symlink():
-                target.unlink()
+        targets = [root / name for name in sorted(_KNOWN_FILES)]
         recommendations = root / "recommendations"
         if recommendations.is_dir():
-            for target in recommendations.iterdir():
-                if _RECOMMENDATION_NAME.fullmatch(target.name) and (target.is_file() or target.is_symlink()):
-                    target.unlink()
+            targets.extend(
+                target for target in recommendations.iterdir() if _RECOMMENDATION_NAME.fullmatch(target.name)
+            )
+        targets = [target for target in targets if target.is_file() or target.is_symlink()]
+        _check_input_collisions(targets, input_paths)
+        for target in targets:
+            # An earlier directory symlink may make a snapshotted child unreachable.
+            if target.is_file() or target.is_symlink():
+                target.unlink(missing_ok=True)
 
 
 def _non_empty_message(root: Path) -> str:

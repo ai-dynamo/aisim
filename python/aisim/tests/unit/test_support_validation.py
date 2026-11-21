@@ -294,6 +294,27 @@ def test_validation_overwrite_preserves_inputs_in_output_directory(validation_ca
     assert input_path.read_bytes() == before
 
 
+@pytest.mark.parametrize("flag", ["--trace", "--config"])
+@pytest.mark.parametrize("cleanup_subdir", [".", "prediction"])
+def test_validation_overwrite_preserves_input_symlinks(validation_case, flag, cleanup_subdir, capsys):
+    args, _request, _plan, _trace, output = validation_case
+    source = Path(args[args.index(flag) + 1])
+    before = source.read_bytes()
+    cleanup_dir = output / cleanup_subdir
+    cleanup_dir.mkdir(parents=True)
+    input_path = cleanup_dir / "resource-plan.json"
+    input_path.symlink_to(source)
+    args[args.index(flag) + 1] = str(input_path)
+
+    with pytest.raises(SystemExit) as error:
+        cli.main([*args, "--overwrite"])
+
+    assert error.value.code == 2
+    assert "output cleanup would remove input file" in capsys.readouterr().err
+    assert input_path.readlink() == source
+    assert input_path.read_bytes() == before
+
+
 @pytest.mark.parametrize("failure", ["failed_request", "incomplete_play", "truncated_output", "zero_queries"])
 def test_validation_never_accepts_partial_replay(validation_case, monkeypatch, failure):
     args, _request, _plan, _trace, output = validation_case
