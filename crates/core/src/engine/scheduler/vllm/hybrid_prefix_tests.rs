@@ -374,6 +374,52 @@ fn warm_junction_checkpoint_admission_accounts_for_the_final_chunk() {
 }
 
 #[test]
+fn warm_junction_budget_split_does_not_charge_an_unexported_checkpoint() {
+    // The attention-only junction changes the chunks from 128 + 65 to
+    // 64 + 128 + 1. None exports an internal checkpoint, so four token
+    // blocks plus two two-block working states fit in eight blocks.
+    let mut config = args(true, true);
+    config.block_size = 64;
+    config.prefix_match_unit = Some(64);
+    config.max_num_batched_tokens = Some(128);
+    config.num_gpu_blocks = 8;
+    config.state_cache.as_mut().unwrap().bytes_per_request = 1500;
+    let mut core = VllmCore::new(config);
+
+    let parent = submit(&mut core, 912, (0..64).collect(), 1);
+    let warmup = step(&mut core);
+    assert!(
+        warmup
+            .output_signals
+            .iter()
+            .any(|signal| signal.uuid == parent && signal.completed && !signal.rejected)
+    );
+    assert!(core.state.requests.is_empty());
+    assert_eq!(core.kv_manager.num_active_blocks(), 0);
+
+    let id = submit(&mut core, 913, (0..193).collect(), 1);
+    for expected_end in [64, 192] {
+        let pass = step(&mut core);
+        assert!(pass.output_signals.is_empty());
+        if expected_end == 64 {
+            assert_eq!(reused(&pass, id), 0);
+        }
+        let request = &core.state.requests[&id];
+        assert_eq!(request.sequence.lease.junction(), Some(64));
+        assert_eq!(request.num_computed_tokens, expected_end);
+    }
+    let last = step(&mut core);
+    assert!(
+        last.output_signals
+            .iter()
+            .any(|signal| signal.uuid == id && signal.completed && !signal.rejected)
+    );
+    assert!(core.state.requests.is_empty());
+    assert_eq!(core.kv_manager.num_active_blocks(), 0);
+    assert_eq!(core.state.preemptions_total, 0);
+}
+
+#[test]
 fn prefill_checkpoint_finishes_the_prompt_in_one_pass() {
     // The final chunk runs to the prompt end and exports the state at
     // (P - 1) // B * B = 12 from inside its forward, in one extra state
