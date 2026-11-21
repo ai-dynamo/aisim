@@ -17,8 +17,9 @@
 //!   must return the typed rejection, not a regression estimator.
 //! * [`dense_gemma4_capacity_rejects_instead_of_estimating_naively`] calls the
 //!   KV-cache capacity entry point with `allow_naive_fallback: true`: it must
-//!   return an error carrying the dense diagnostic rather than a naive estimate
-//!   built from the same checkpoint metadata.
+//!   return `KvCacheEstimateError::BadConfig` carrying the dense diagnostic,
+//!   never a fallback-eligible `Unsupported` or a naive estimate built from the
+//!   same checkpoint metadata.
 //! * [`dense_gemma4_num_gpu_blocks_rejects_instead_of_returning_a_count`] calls
 //!   the `aisim_core.sdk.memory.estimate_num_gpu_blocks` entry point that
 //!   `python.rs::estimate_aic_num_gpu_blocks` invokes, and must raise the dense
@@ -63,7 +64,7 @@ use std::collections::BTreeMap;
 
 use aisim_core::perfmodel::{
     AicError, BackendKind, ENGINE_CONFIG_SCHEMA_VERSION, EngineConfig, ForwardPassFallbackPolicy,
-    ForwardPassPerfModel, ForwardPassPerfModelConfig, ForwardPassWorkerType,
+    ForwardPassPerfModel, ForwardPassPerfModelConfig, ForwardPassWorkerType, KvCacheEstimateError,
     KvCacheEstimateOptions, KvCacheEstimateRequest, KvCacheMemoryFraction, ParallelMapping,
     QuantizationConfig, estimate_kv_cache,
 };
@@ -214,12 +215,40 @@ fn dense_gemma4_capacity_rejects_instead_of_estimating_naively() {
     let error = estimate_kv_cache(kv_request(DENSE_MODEL, 2))
         .err()
         .expect("dense Gemma 4 with moe_ep_size=2 must not produce a capacity estimate");
+    assert!(
+        matches!(&error, KvCacheEstimateError::BadConfig { field, .. } if field == "engine"),
+        "the SDK's InvalidEngineConfigurationError must map to non-fallback BadConfig, got {error:?}"
+    );
     // `estimate_kv_cache:` is the `memory.rs` bridge context; the dense message
     // proves the naive fallback did not re-estimate the same metadata.
     let message = error.to_string();
     assert!(
         message.contains("estimate_kv_cache:") && message.contains(DENSE_REJECTION),
         "capacity must report the dense diagnostic, not a generic fallback, got {message}"
+    );
+}
+
+#[test]
+fn unsupported_capacity_keeps_the_fallback_eligible_variant() {
+    if !sdk_available_or_skip() {
+        return;
+    }
+
+    // Valid dense metadata and parallelism, but no perf database for this
+    // system. This is a coverage miss rather than a configuration rejection.
+    let mut request = kv_request(DENSE_MODEL, 1);
+    request.engine.system_name = "unavailable_gemma4_bridge_system".into();
+    request.options.allow_naive_fallback = false;
+    let error = estimate_kv_cache(request)
+        .err()
+        .expect("an unavailable system must not produce a native estimate");
+    assert!(
+        matches!(&error, KvCacheEstimateError::Unsupported { model, backend, gpu_sku, reason }
+            if model == DENSE_MODEL && *backend == BackendKind::Vllm
+                && gpu_sku == "unavailable_gemma4_bridge_system"
+                && reason.contains("estimate_kv_cache:")
+                && reason.contains("unsupported model/backend/GPU")),
+        "ordinary unsupported requests must retain their identity and diagnostic, got {error:?}"
     );
 }
 
