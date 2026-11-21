@@ -222,6 +222,15 @@ class AICAFDPerformanceModel:
                 )
             components = item.get("components")
             try:
+                if isinstance(components, Mapping):
+                    for name, value in components.items():
+                        if (
+                            isinstance(value, bool)
+                            or not isinstance(value, (int, float))
+                            or not math.isfinite(value)
+                            or value < 0.0
+                        ):
+                            raise ValueError(f"{name} must be a finite non-negative number, got {value!r}")
                 measurements.append(
                     AFDLayerTimes(
                         phase=phase,

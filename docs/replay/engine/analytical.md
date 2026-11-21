@@ -93,6 +93,10 @@ these per-layer components; the built-in estimator does. Its `a_router_ms` is
 evaluated at the local A microbatch, widened by `nextn + 1` for MTP, using the A
 model. It is distinct from `router_ms`, the F-side router contribution measured
 at the combined F batch. Only `a_router_ms` is added to FastAFD attention time.
+This widening describes the lower-level provider. Public AFD configuration
+rejects nonzero `engine.nextn`, including `nextn: 1` with `nextn_accepted: 1`,
+before profile lookup. MTP profiles therefore cannot be selected through
+`engine.afd`; that path currently requires profile entries with `mtp_nextn: 0`.
 Consumed components must be finite and non-negative, and attention compute plus
 combine must reconcile
 with the provider's attention total (relative tolerance `1e-9`, absolute tolerance

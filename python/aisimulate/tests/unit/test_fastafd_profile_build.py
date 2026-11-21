@@ -144,3 +144,56 @@ def test_rejects_mixed_directories_and_repeated_measurements(tmp_path):
 
     with pytest.raises(ValueError, match="no qualified hotset"):
         build_profile(repeated, repository=_REPOSITORY, routing="hotset")
+
+
+def test_rejects_duplicate_raw_json_members(tmp_path):
+    results = tmp_path / "results"
+    raw = _write(results, "a.json", _colocated(48))
+    raw.write_text(raw.read_text().replace('"p50_ms": 12.0', '"p50_ms": 12.0, "p50_ms": 1.0'))
+
+    with pytest.raises(ValueError, match="duplicate JSON object key: 'p50_ms'"):
+        build_profile(results, repository=_REPOSITORY)
+
+
+@pytest.mark.parametrize("microbatches", [0, False, None, ""])
+@pytest.mark.parametrize("suffix", ["json", "parquet"])
+def test_rejects_explicit_invalid_colocated_microbatches_before_publication(tmp_path, microbatches, suffix):
+    results = tmp_path / "results"
+    payload = _colocated(48)
+    payload["workload"]["microbatches"] = microbatches
+    _write(results, "a.json", payload)
+    output = tmp_path / f"profile.{suffix}"
+
+    with pytest.raises(ValueError, match="microbatches must be an integer >= 1"):
+        main([str(results), "--repository", _REPOSITORY, "--output", str(output)])
+
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("suffix", ["json", "parquet"])
+def test_omitted_colocated_microbatches_default_to_one(tmp_path, suffix):
+    results = tmp_path / "results"
+    _write(results, "a.json", _colocated(48))
+    output = tmp_path / f"profile.{suffix}"
+
+    assert main([str(results), "--repository", _REPOSITORY, "--output", str(output)]) == 0
+
+    assert FastAFDMoEStageProfile.load(output).entries[0].key.microbatches == 1
+
+
+@pytest.mark.parametrize("suffix", ["json", "parquet"])
+def test_invalid_timing_preserves_existing_profile(tmp_path, suffix):
+    results = tmp_path / "results"
+    _write(results, "a.json", _colocated(48))
+    output = tmp_path / f"profile.{suffix}"
+    args = [str(results), "--repository", _REPOSITORY, "--output", str(output)]
+    assert main(args) == 0
+    original = output.read_bytes()
+    _write(results, "a.json", _colocated(48, p50=-1.0))
+
+    with pytest.raises(ValueError, match="latency_ms must be > 0"):
+        main(args)
+
+    assert output.read_bytes() == original
+    assert FastAFDMoEStageProfile.load(output).entries[0].latency_ms == 12.0
+    assert sorted(path.name for path in tmp_path.iterdir()) == [output.name, "results"]

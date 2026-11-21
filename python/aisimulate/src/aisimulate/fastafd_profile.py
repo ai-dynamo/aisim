@@ -20,6 +20,7 @@ from aisimulate_core.sdk.fastafd_profile import (
     FastAFDMoEStageMeasurement,
     FastAFDMoEStageProfile,
     FastAFDProfileSource,
+    _unique_object,
 )
 
 # Raw result schemas written by FastAFD's MegaMoE model benchmarks, and the stage each one measures.
@@ -52,7 +53,7 @@ def build_profile(
     seen: dict[tuple[Any, ...], str] = {}
     for path in files:
         raw = path.read_bytes()
-        payload = json.loads(raw)
+        payload = json.loads(raw, object_pairs_hook=_unique_object)
         stage = _BENCHMARK_STAGES.get(payload.get("schema"))
         if stage is None:
             raise ValueError(f"{path.name}: unsupported benchmark schema {payload.get('schema')!r}")
@@ -122,7 +123,7 @@ def _key(stage: str, payload: dict[str, Any]) -> dict[str, Any]:
     if stage == "agg":
         shape = f"ep{topology['ep_size']}"
         batch = workload["logical_tokens_per_rank"]
-        microbatches = workload.get("microbatches") or 1
+        microbatches = workload.get("microbatches", 1)
         backend = _BACKENDS[payload["primary_backend"]]
     else:
         shape = f"{topology['ag_size']}A{topology['eg_size']}F"
@@ -158,14 +159,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     profile, summary = build_profile(args.results_dir, repository=args.repository, routing=args.routing)
     output = Path(args.output)
-    if output.suffix == ".parquet":
-        with tempfile.TemporaryDirectory() as temporary:
-            raw = Path(temporary) / "profile.json"
-            raw.write_text(json.dumps(profile), encoding="utf-8")
-            FastAFDMoEStageProfile.load(raw).write_parquet(output)
-    else:
-        output.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
-    FastAFDMoEStageProfile.load(output)
+    # Stage beside the destination so publication is an atomic replacement on
+    # the same filesystem. Failed validation must preserve an existing profile.
+    with tempfile.TemporaryDirectory(prefix=f".{output.name}.", dir=output.parent) as temporary:
+        staged = Path(temporary) / "profile.json"
+        staged.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
+        validated = FastAFDMoEStageProfile.load(staged)
+        if output.suffix == ".parquet":
+            staged = Path(temporary) / "profile.parquet"
+            validated.write_parquet(staged)
+            FastAFDMoEStageProfile.load(staged)
+        staged.replace(output)
     print(f"wrote {output}: {summary['accepted']} entries", file=sys.stderr)
     for reason in ("skipped_routing", "skipped_unstable", "skipped_correctness"):
         if summary[reason]:

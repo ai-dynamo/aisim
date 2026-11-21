@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -15,8 +16,10 @@ from pydantic import ValidationError
 from aisimulate.compiler import prediction_to_replay_spec
 from aisimulate.config import CorePredictionConfig
 from aisimulate.legacy_cli.api import cli_estimate
+from aisimulate.runner import _afd_layer_measurements, _afd_topology
 from aisimulate.sdk.inference_session import AFDInferenceSession
 from aisimulate.sweeper import afd_fastafd
+from aisimulate.sweeper.afd_engine import evaluate_afd_phase
 from aisimulate.sweeper.afd_fastafd import FastAFDMoEStagePerformanceModel
 from aisimulate.sweeper.afd_parallel import AFDInfeasible, AFDTopology
 from aisimulate.sweeper.afd_perfmodel import AFDLayerTimes, AFDMeasurementRequest, AICAFDPerformanceModel
@@ -363,6 +366,29 @@ def test_invalid_attention_components_fail_closed(tmp_path, name, value):
         _provider(tmp_path, _Attention(components={**COMPONENTS, name: value})).measure(_request(_topology()))
 
 
+@pytest.mark.parametrize("name", list(COMPONENTS))
+@pytest.mark.parametrize("value", [True, "0.002", None, float("nan"), float("inf"), -0.001])
+def test_aic_adapter_rejects_malformed_components_before_fastafd(tmp_path, name, value):
+    def estimator(*args, **kwargs):
+        return SimpleNamespace(
+            raw={
+                "afd_layer_measurements": {
+                    "decode": {
+                        "attention_ms": 0.096,
+                        "ffn_ms": 0.636,
+                        "a_to_f_ms": 0.0106,
+                        "f_to_a_ms": 0.0106,
+                        "num_layers": LAYERS,
+                        "components": {**COMPONENTS, name: value},
+                    }
+                }
+            }
+        )
+
+    with pytest.raises(AFDInfeasible, match=f"{name} must be a finite non-negative number"):
+        _provider(tmp_path, AICAFDPerformanceModel(estimator)).measure(_request(_topology()))
+
+
 @pytest.mark.parametrize("name", ["attention_compute_ms", "a_combine_ms"])
 def test_attention_components_must_reconcile_with_the_headline(tmp_path, name):
     # The provider still reports 0.096 ms, but its components now sum to 0.106 ms.
@@ -432,6 +458,26 @@ def test_prediction_config_attaches_the_profile_stage(tmp_path):
     assert attention.requests[0].topology.ffn_gpus == 8
 
 
+def test_serial_decode_evaluates_the_replayed_profile_stage(tmp_path):
+    raw = _prediction(_profile(tmp_path))
+    raw["engine"]["afd"]["pipeline_model"] = "serial"
+    config = CorePredictionConfig.model_validate(raw)
+    spec = prediction_to_replay_spec(config, afd_performance_model=_Attention())
+
+    # Exercise the runner's reconstruction of the serialized measurement and
+    # topology before evaluating the complete decode step.
+    (measurement,) = _afd_layer_measurements(spec.backend_deployment)
+    evaluation = evaluate_afd_phase(
+        _afd_topology(spec.backend_deployment),
+        measurement,
+        input_length=1024,
+        output_length=128,
+    )
+
+    # 94 layers * 2 microbatches * 0.092 ms of A + 11.213456 ms of F.
+    assert evaluation.step_latency_ms == pytest.approx(28.509456)
+
+
 @pytest.mark.parametrize("precision", ["w4a8_mxfp4_mxfp8", "fp8"])
 @pytest.mark.parametrize("companion_timing", ["default", "fixed"])
 def test_prediction_config_selects_profile_precision(tmp_path, precision, companion_timing):
@@ -479,6 +525,7 @@ def test_afd_precision_control_still_requires_a_profile(tmp_path):
         {"gemm_quant_mode": "fp8"},
         {"enable_eplb": True},
         {"nextn": 1, "nextn_accepted": 0.5},
+        {"nextn": 1, "nextn_accepted": 1},
     ],
 )
 def test_profile_precision_does_not_enable_other_afd_model_controls(tmp_path, controls):
