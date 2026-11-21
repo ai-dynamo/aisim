@@ -959,6 +959,7 @@ impl G2Connector {
                 reranks_at_finish: false,
                 preemption_waits_for_all: false,
                 admits_kv_holders_first: false,
+                polled_load_start: None,
             },
             Self::OffloadingV032 => ConnectorRules {
                 policy: HostPolicy::Ranked,
@@ -974,6 +975,7 @@ impl G2Connector {
                 reranks_at_finish: true,
                 preemption_waits_for_all: false,
                 admits_kv_holders_first: true,
+                polled_load_start: Some(LoadCopyStart::PassEnd),
             },
             Self::SimpleCpuV032 => ConnectorRules {
                 policy: HostPolicy::FreeQueue,
@@ -989,6 +991,7 @@ impl G2Connector {
                 reranks_at_finish: false,
                 preemption_waits_for_all: true,
                 admits_kv_holders_first: true,
+                polled_load_start: Some(LoadCopyStart::LaunchEnd),
             },
         }
     }
@@ -1036,6 +1039,23 @@ pub(crate) struct ConnectorRules {
     /// before every other waiter (`kv_holding_waiting`). Otherwise skipped
     /// requests keep the order of their first skip (`skipped_waiting`).
     pub(crate) admits_kv_holders_first: bool,
+    /// Under `launch`, a finished load waits for a later pass to poll the
+    /// connector, and its copy starts at this point of the pass that issued
+    /// it. `None`: the load is seen when its copy ends.
+    pub(crate) polled_load_start: Option<LoadCopyStart>,
+}
+
+/// When a load's copy starts, relative to the pass that issued it. The
+/// connector submits it after the pass's launch, in vLLM's post-forward, and
+/// runs copies one at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LoadCopyStart {
+    /// When the launch ends: a copy thread copies the pass's loads as one
+    /// batch, without waiting for compute, and reports them together.
+    LaunchEnd,
+    /// When the pass's GPU work ends: each load is its own copy on a stream
+    /// that waits for compute.
+    PassEnd,
 }
 
 const DEFAULT_SHARED_HOST_OFFLOAD_BANDWIDTH_GBPS: f64 = 80.0;

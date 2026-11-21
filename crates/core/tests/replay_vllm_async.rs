@@ -5,7 +5,9 @@
 
 use std::collections::VecDeque;
 
-use aisim_core::engine::{EngineConfig, PassLaunchConfig, TimingModelConfig};
+use aisim_core::engine::{
+    EngineConfig, G2Connector, NativeHostOffloadConfig, PassLaunchConfig, TimingModelConfig,
+};
 use aisim_core::replay::{
     CURRENT_REPLAY_SPEC_VERSION, DirectRequest, PerRequestRecord, ReplayEngineConfig,
     ReplayEngineFactory, ReplayReport, ReplayRuntimeInput, ReplaySpec, ReplayTopology, Replayer,
@@ -300,4 +302,220 @@ fn launch_needs_a_one_gpu_engine() {
         .run()
         .unwrap_err();
     assert!(error.to_string().contains("uniprocess executor"), "{error}");
+}
+
+/// `launch` with prefix caching and a rank-local `offloading_v0_32` CPU tier
+/// of 64 blocks: stores copy at once, and loads copy 16 B per token at
+/// `h2d_gbps`.
+fn polled_cpu_tier(num_gpu_blocks: usize, h2d_gbps: f64) -> EngineConfig {
+    let mut config = launch(engine(num_gpu_blocks), [2.0, 20.0, 50.0], 0.0);
+    config.enable_prefix_caching = true;
+    config.kv_cache_bytes_per_token = Some(16);
+    config.native_host_offload = Some(
+        NativeHostOffloadConfig::new(64)
+            .with_bandwidths(0.0, h2d_gbps)
+            .with_connector(G2Connector::OffloadingV032),
+    );
+    config
+}
+
+/// A request with `(id, tokens, outputs, arrival)`.
+fn tokens_request(id: u128, tokens: Vec<u32>, outputs: usize, arrival_ms: f64) -> DirectRequest {
+    DirectRequest {
+        tokens,
+        max_output_tokens: outputs,
+        uuid: Some(Uuid::from_u128(id)),
+        arrival_timestamp_ms: Some(arrival_ms),
+        ..Default::default()
+    }
+}
+
+fn run_tokens(engine: EngineConfig, requests: Vec<DirectRequest>) -> ReplayReport {
+    replay_requests(
+        ReplayEngineConfig {
+            rank: engine,
+            ..Default::default()
+        },
+        requests.into(),
+    )
+    .run()
+    .unwrap()
+}
+
+#[test]
+fn a_load_awaiting_vllms_poll_does_not_stall_an_engine_with_only_a_blocked_waiter() {
+    // Request 1 stores its five prompt blocks in the CPU tier, and request 2
+    // fills G1 and evicts them. R (request 3) prefills from 600 and decodes
+    // until 750. A (request 4) arrives at 605, joins R's first decode pass,
+    // which vLLM decides at 620 and replay forms at 700, and loads request 1's
+    // prefix: the copy waits for that pass's GPU work, until 710, and takes
+    // 300 ms, so it ends at 1010. B (request 5, 24 tokens) does not fit beside
+    // A's reservation in the 10-block G1. Once R finishes nothing runs, and
+    // vLLM takes empty steps that poll the connector: it sees A's copy at 1010
+    // and admits A then. A finishes at 1120, and B is admitted.
+    let five_blocks_in_300_ms = 320.0 / (300.0 * 1e6);
+    let report = run_tokens(
+        polled_cpu_tier(10, five_blocks_in_300_ms),
+        vec![
+            tokens_request(1, (0..20).collect(), 1, 0.0),
+            tokens_request(2, (500..536).collect(), 1, 300.0),
+            tokens_request(3, (900..904).collect(), 6, 600.0),
+            tokens_request(4, (0..24).collect(), 2, 605.0),
+            tokens_request(5, (2000..2024).collect(), 2, 606.0),
+        ],
+    );
+    let a = record(&report, 4);
+    assert_eq!(
+        (a.first_admit_ms, a.first_admission_host_reused_input_tokens),
+        (Some(1010.0), Some(20))
+    );
+    assert_eq!(record(&report, 5).first_admit_ms, Some(1120.0));
+}
+
+#[test]
+fn a_request_sharing_a_load_waits_for_it_until_vllm_has_seen_the_copy() {
+    // As above with a 20-block G1, and five blocks copying in 50 ms: A
+    // (request 4) loads request 1's prefix from the pass formed at 700, and
+    // the copy runs from 710 to 760. C (request 5) shares that prefix and waits
+    // for A's load. R's decode passes start every 10 ms, and each polls 8 ms
+    // before it starts: it is decided at the previous pass's start and
+    // launched in 2 ms. The pass starting at 770 polls at 762, the first poll
+    // after the copy, so A is schedulable two decisions later, at 790. C waits
+    // until then too and reuses A's blocks from G1 instead of copying the
+    // prefix again.
+    let five_blocks_in_50_ms = 320.0 / (50.0 * 1e6);
+    let report = run_tokens(
+        polled_cpu_tier(20, five_blocks_in_50_ms),
+        vec![
+            tokens_request(1, (0..20).collect(), 1, 0.0),
+            tokens_request(2, (500..576).collect(), 1, 300.0),
+            tokens_request(3, (900..904).collect(), 12, 600.0),
+            tokens_request(4, (0..24).collect(), 2, 605.0),
+            tokens_request(5, (0..20).chain(3000..3008).collect(), 2, 606.0),
+        ],
+    );
+    let [a, c] = [4, 5].map(|id| record(&report, id));
+    assert_eq!(
+        (a.first_admit_ms, a.first_admission_host_reused_input_tokens),
+        (Some(790.0), Some(20))
+    );
+    assert_eq!(
+        (
+            c.first_admit_ms,
+            c.first_admission_reused_input_tokens,
+            c.first_admission_host_reused_input_tokens
+        ),
+        (Some(790.0), 20, Some(0))
+    );
+}
+
+#[test]
+fn work_that_starts_before_an_idle_engine_sees_a_load_runs_before_it() {
+    // The sharing run's G1 with five blocks copying in 8 ms, and R (request
+    // 3) decoding only three tokens: its last decode runs from 710 to 720. A
+    // (request 4) loads request 1's prefix from the pass formed at 700, and
+    // the copy runs from 710 to 718. While R's last decode runs, vLLM takes
+    // an empty step that polls at 710, before the copy ends, then waits for
+    // R. With nothing else to run, it then steps empty and sees the copy:
+    // replay admits A at 720. If N (request 6) arrives at 715, vLLM schedules
+    // N at 720 instead; N's prefill launch polls at 740 and sees the copy, so
+    // A is schedulable two decisions later, at 820, and its pass starts at
+    // 830.
+    let five_blocks_in_8_ms = 320.0 / (8.0 * 1e6);
+    let run = |new_work: bool| {
+        let mut requests = vec![
+            tokens_request(1, (0..20).collect(), 1, 0.0),
+            tokens_request(2, (500..576).collect(), 1, 300.0),
+            tokens_request(3, (900..904).collect(), 3, 600.0),
+            tokens_request(4, (0..24).collect(), 2, 605.0),
+        ];
+        if new_work {
+            requests.push(tokens_request(6, (3000..3024).collect(), 2, 715.0));
+        }
+        let report = run_tokens(polled_cpu_tier(20, five_blocks_in_8_ms), requests);
+        let admitted = |id| record(&report, id).first_admit_ms;
+        (admitted(4), new_work.then(|| admitted(6)).flatten())
+    };
+    assert_eq!(run(false), (Some(720.0), None));
+    assert_eq!(run(true), (Some(830.0), Some(720.0)));
+}
+
+#[test]
+fn an_arrival_during_a_loads_idle_to_busy_launch_joins_the_next_pass() {
+    // As above, A's copy ends at 718, after the empty step's poll at 710.
+    // The engine sees it only after R finishes at 720. A's prefill must be
+    // decided then, so its 20 ms launch ends at 740 and the next decision
+    // includes N, which arrives at 735. A prefills from 720 to 820, and N
+    // joins its next pass at 820. Inheriting the old 710 decision instead
+    // closes the arrival window at 730 and delays N until 830.
+    let five_blocks_in_8_ms = 320.0 / (8.0 * 1e6);
+    let report = run_tokens(
+        polled_cpu_tier(20, five_blocks_in_8_ms),
+        vec![
+            tokens_request(1, (0..20).collect(), 1, 0.0),
+            tokens_request(2, (500..576).collect(), 1, 300.0),
+            tokens_request(3, (900..904).collect(), 3, 600.0),
+            tokens_request(4, (0..24).collect(), 4, 605.0),
+            tokens_request(6, (3000..3012).collect(), 2, 735.0),
+        ],
+    );
+    let restored = record(&report, 4);
+    assert_eq!(restored.first_admit_ms, Some(720.0));
+    assert_eq!(restored.first_admission_host_reused_input_tokens, Some(20));
+    assert_eq!(record(&report, 6).first_admit_ms, Some(820.0));
+    assert_eq!(report.per_request.len(), 5);
+    assert!(
+        report
+            .per_request
+            .iter()
+            .all(|request| request.output_length == request.requested_output_length)
+    );
+}
+
+#[test]
+fn a_restore_blocked_by_the_prefill_budget_keeps_other_loads_on_the_poll_path() {
+    // Requests 1 and 2 store 5 and 20 blocks; request 3 evicts them from G1.
+    // R (4) prefills at 1600 and issues A's (5) and B's (6) loads with its
+    // final decode at 1700. The serial copies start after the decode ends at
+    // 1710: A copies until 1760 and B until 1960.
+    // P (7) prefills in three 64-token chunks from 1710 to 2010. Its first
+    // launch polls at 1760 and sees A, making A runnable two decisions later,
+    // at 1910. P consumes the whole token budget then, so A stays in
+    // connector_waiting. That pass polls at 1860, before B's copy ends.
+    // When P finishes, A keeps the engine busy: B must still wait for A's
+    // prefill poll at 2030 and two more decisions, until 2120. Ignoring A in
+    // the idle check would let B join A's prefill at 2010.
+    let five_blocks_in_50_ms = 320.0 / (50.0 * 1e6);
+    let mut config = polled_cpu_tier(128, five_blocks_in_50_ms);
+    config.native_host_offload.as_mut().unwrap().num_host_blocks = 512;
+    let report = run_tokens(
+        config,
+        vec![
+            tokens_request(1, (0..20).collect(), 1, 0.0),
+            tokens_request(2, (100..180).collect(), 1, 300.0),
+            tokens_request(3, (500..1008).collect(), 1, 600.0),
+            tokens_request(4, (2000..2004).collect(), 2, 1600.0),
+            tokens_request(5, (0..24).collect(), 2, 1605.0),
+            tokens_request(6, (100..184).collect(), 2, 1606.0),
+            tokens_request(7, (3000..3192).collect(), 1, 1705.0),
+        ],
+    );
+    assert_eq!(record(&report, 7).first_admit_ms, Some(1710.0));
+    assert_eq!(record(&report, 5).first_admit_ms, Some(2010.0));
+    assert_eq!(record(&report, 6).first_admit_ms, Some(2120.0));
+    assert_eq!(
+        record(&report, 5).first_admission_host_reused_input_tokens,
+        Some(20)
+    );
+    assert_eq!(
+        record(&report, 6).first_admission_host_reused_input_tokens,
+        Some(80)
+    );
+    assert_eq!(report.per_request.len(), 7);
+    assert!(
+        report
+            .per_request
+            .iter()
+            .all(|request| request.output_length == request.requested_output_length)
+    );
 }
