@@ -1045,6 +1045,52 @@ def test_failed_run_retry_preserves_input_before_starting_worker(tmp_path, monke
     assert _output_bytes(output) == before
 
 
+@pytest.mark.parametrize("input_kind", ["file_alias", "directory_alias"])
+@pytest.mark.parametrize("input_collection", [list, iter], ids=["list", "iterator"])
+def test_failed_run_retry_preserves_alias_published_during_cleanup(
+    tmp_path, monkeypatch, capsys, input_kind, input_collection
+):
+    from aisim import output as output_module
+
+    output = tmp_path / "output"
+    output.mkdir()
+    events = output / "execution-events.jsonl"
+    fixture = Path(__file__).parent / "e2e/configs/unified_cli/fixtures/traces/mooncake.jsonl"
+    events.write_bytes(fixture.read_bytes())
+    runtime = output / "resource-runtime.json"
+    runtime.write_text(json.dumps({"schema_version": 1, "status": "failed"}))
+    before = _output_bytes(output)
+    events_stat = events.stat()
+    alias = tmp_path / "trace-alias"
+    trace = alias / events.name if input_kind == "directory_alias" else alias
+    fingerprint = output_module._fingerprint
+    inspected_events = False
+
+    def fingerprint_then_publish(path):
+        nonlocal inspected_events
+        result = fingerprint(path)
+        if path == events:
+            if inspected_events:
+                # Publish after preflight, without changing the cleanup target's fingerprint.
+                alias.symlink_to(
+                    output if input_kind == "directory_alias" else events,
+                    target_is_directory=input_kind == "directory_alias",
+                )
+            inspected_events = True
+        return result
+
+    monkeypatch.setattr(output_module, "_fingerprint", fingerprint_then_publish)
+    with pytest.raises(ValueError, match="output cleanup would remove input file"):
+        output_module.prepare_output_directory(output, overwrite=False, input_paths=input_collection([trace]))
+
+    assert alias.is_symlink()
+    assert trace.read_bytes() == before[events.name]
+    assert events.stat().st_ino == events_stat.st_ino
+    assert events.stat().st_mtime_ns == events_stat.st_mtime_ns
+    assert runtime.read_bytes() == before[runtime.name]
+    assert "removed diagnostics left by a failed run" not in capsys.readouterr().err
+
+
 def test_overwrite_preserves_inputs_that_are_not_known_output_files(tmp_path):
     from aisimulate.output import prepare_output_directory
 
@@ -1489,6 +1535,64 @@ def test_resource_plan_cleanup_preserves_trace_input(tmp_path, monkeypatch, caps
     assert previous.read_text() == "previous prediction"
     assert plan.read_text() == "previous plan"
     assert "would remove input file" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", ["predict", "recommend"])
+@pytest.mark.parametrize("overwrite", [False, True])
+@pytest.mark.parametrize("input_kind", ["absent", "file", "file_alias"])
+def test_resource_plan_write_handles_trace_created_after_preparation(
+    tmp_path, monkeypatch, capsys, command, overwrite, input_kind
+):
+    from aisim import main as cli
+    from aisim.resources import ResourceLimitError
+
+    config = _small_cli_config(tmp_path, command)
+    output = tmp_path / "output"
+    trace = output / "resource-plan.json"
+    fixture = Path(__file__).parent / "e2e/configs/unified_cli/fixtures/traces/mooncake.jsonl"
+    trace_bytes = fixture.read_bytes()
+    source_trace = tmp_path / "source-trace.jsonl"
+    source_trace.write_bytes(trace_bytes)
+    raw = yaml.safe_load(config.read_text())
+    raw["traffic"] = {
+        "source": {"type": "trace", "format": "mooncake", "paths": [str(trace)]},
+        "load": {"type": "trace_timestamps"},
+    }
+    config.write_text(yaml.safe_dump(raw))
+    prepare = cli.prepare_output_directory
+    plan = {"schema_version": 1, "admitted": False}
+
+    def reject_admission(*args):
+        raise ResourceLimitError("test admission rejection", plan=plan)
+
+    def prepare_then_publish(*args, **kwargs):
+        root = prepare(*args, **kwargs)
+        assert not trace.exists()
+        if input_kind == "file":
+            trace.write_bytes(trace_bytes)
+        elif input_kind == "file_alias":
+            trace.symlink_to(source_trace)
+        return root
+
+    monkeypatch.setattr(cli, f"_{command}", reject_admission)
+    monkeypatch.setattr(cli, "prepare_output_directory", prepare_then_publish)
+    result = cli.main(
+        [command, "--config", str(config), "--output-dir", str(output), *(["--overwrite"] if overwrite else [])]
+    )
+    captured = capsys.readouterr()
+    assert result == 3
+    assert "test admission rejection" in captured.err
+    if input_kind == "absent":
+        assert json.loads(trace.read_text()) == plan
+        assert json.loads(captured.out) == plan
+        assert "could not save resource plan" not in captured.err
+    else:
+        assert trace.is_symlink() == (input_kind == "file_alias")
+        assert trace.read_bytes() == trace_bytes
+        assert source_trace.read_bytes() == trace_bytes
+        assert "could not save resource plan" in captured.err
+        assert trace.name in captured.err
+        assert not captured.out
 
 
 @pytest.mark.parametrize("command", ["predict", "recommend"])

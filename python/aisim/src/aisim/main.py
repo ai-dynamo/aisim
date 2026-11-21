@@ -414,7 +414,8 @@ def _write_resource_plan(args, plan: dict[str, Any], raw: dict[str, Any]) -> Non
     root = prepare_output_directory(
         args.output_dir, overwrite=args.overwrite, input_paths=_cleanup_input_paths(args.config, raw)
     )
-    (root / "resource-plan.json").write_text(json.dumps(plan, indent=2, allow_nan=False) + "\n")
+    with (root / "resource-plan.json").open("x", encoding="utf-8") as target:
+        target.write(json.dumps(plan, indent=2, allow_nan=False) + "\n")
     sys.stdout.write(json.dumps(plan, indent=2, allow_nan=False) + "\n")
 
 

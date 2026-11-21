@@ -2388,9 +2388,9 @@ def test_result_appearing_after_cleanup_is_refused(tmp_path, monkeypatch) -> Non
     _runtime_report(root, "failed")
     clear = output_module._clear_unfinished_run
 
-    def clear_then_publish(directory, leftovers):
+    def clear_then_publish(directory, leftovers, input_paths):
         (directory / "prediction.json").write_text("someone else's result")
-        clear(directory, leftovers)
+        clear(directory, leftovers, input_paths)
 
     monkeypatch.setattr(output_module, "_clear_unfinished_run", clear_then_publish)
 

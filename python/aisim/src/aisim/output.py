@@ -140,12 +140,13 @@ def _unfinished_run_leftovers(root: Path) -> dict[str, _Fingerprint] | None:
     return leftovers
 
 
-def _clear_unfinished_run(root: Path, leftovers: dict[str, _Fingerprint]) -> None:
+def _clear_unfinished_run(root: Path, leftovers: dict[str, _Fingerprint], input_paths: tuple[str | Path, ...]) -> None:
     """Remove the fingerprinted leftovers, stopping at the first file that changed.
 
     Runs under the output-directory lock. Each file is still checked again just
-    before it is removed, and the runtime report goes last, so a process that
-    writes without the lock (an older AISim, or anything else) keeps its evidence.
+    before it is removed, including aliases from the original input paths. The
+    runtime report goes last, so a process that writes without the lock (an
+    older AISim, or anything else) keeps its evidence.
     """
 
     for name in sorted(leftovers, key=lambda item: item == _RUNTIME_REPORT):
@@ -159,6 +160,7 @@ def _clear_unfinished_run(root: Path, leftovers: dict[str, _Fingerprint]) -> Non
                 f"output directory {root} changed while AISim was preparing it ({name}); "
                 "nothing else was removed. Choose a new --output-dir"
             )
+        _check_input_collisions((target,), input_paths)
         if leftovers[name][4]:
             target.rmdir()
         else:
@@ -403,12 +405,13 @@ def prepare_output_directory(path: str | Path, *, overwrite: bool, input_paths: 
 
 
 def _prepare_locked(root: Path, *, overwrite: bool, input_paths: Iterable[str | Path]) -> None:
+    input_paths = tuple(input_paths)
     if any(root.iterdir()) and not overwrite:
         leftovers = _unfinished_run_leftovers(root)
         if leftovers is None:
             raise ValueError(_non_empty_message(root))
         _check_input_collisions((root / name for name in leftovers), input_paths)
-        _clear_unfinished_run(root, leftovers)
+        _clear_unfinished_run(root, leftovers, input_paths)
         sys.stderr.write(f"aisim: reusing {root}: removed diagnostics left by a failed run\n")
     if overwrite:
         targets = [root / name for name in sorted(_KNOWN_FILES)]
