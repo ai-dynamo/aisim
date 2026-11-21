@@ -49,6 +49,12 @@ class FastAFDMoEStagePerformanceModel:
         import aisimulate_core
 
         topology = request.topology
+        if topology.comm_overhead_factor != 1.0:
+            raise _infeasible(
+                "FastAFD requires comm_overhead_factor=1; communication is included "
+                "in the measured MoE stage and cannot be calibrated separately",
+                comm_overhead_factor=topology.comm_overhead_factor,
+            )
         try:
             # Reject unsupported pools before invoking an expensive attention
             # provider, using the canonical model's same Rust validation.

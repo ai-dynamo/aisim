@@ -46,7 +46,7 @@ engine:
 | `engine.afd.f_moe_ep_size` | `1` | Model-derived domain | Positive; recommend also accepts `n_f_nodes` or `ffn_tp`. Dense models require `1`. |
 | `engine.afd.num_microbatches` | `3` | `{choices: [2, 3, 4]}` | Positive. |
 | `engine.afd.pipeline_model` | `optimistic` | `{choices: [optimistic, conservative]}` | `optimistic`, `conservative` or `serial`. |
-| `engine.afd.comm_overhead_factor` | `1.0` | fixed | Positive factor on A/F communication. |
+| `engine.afd.comm_overhead_factor` | `1.0` | fixed | Positive factor on A/F communication. Must be `1.0` with `fastafd_profile_path`. |
 | `engine.afd.boundary_on_attn` | `true` | fixed | A/F boundary convention. |
 | `engine.afd.fastafd_profile_path` | `null` | Prediction only | Measured FastAFD split MoE stage; see [below](#measured-fastafd-moe-stage). Requires `phase: decode`, `tp_a: 1`, `f_moe_ep_size` equal to the F GPU count, and `boundary_on_attn: true`. |
 | `engine.afd.fastafd_moe_backend` | `null` | Prediction only | Required with `fastafd_profile_path`; `megamoe` or `deepep_deepgemm`. |
@@ -86,7 +86,11 @@ top-k exactly; nothing is interpolated or projected. Top-k comes from normalized
 model metadata (`topk`); an unknown or invalid width is infeasible. Its stage latency
 covers dispatch, experts, return and the A-side combine for every MoE layer of one
 decode step, so it is spread evenly over `moe_layers × num_microbatches` pipeline
-units as F, and A→F and F→A are zero. A keeps the attention provider's
+units as F, and A→F and F→A are zero. With a FastAFD profile,
+`comm_overhead_factor` must be `1.0`: communication is included in the measured
+stage and cannot be calibrated separately. Non-unit factors are rejected by
+both prediction configuration validation and the direct provider API.
+A keeps the attention provider's
 A-side compute without its own combine term and adds the router, which FastAFD
 runs on the A side outside the measured stage. The attention provider must report
 these per-layer components; the built-in estimator does. Its `a_router_ms` is

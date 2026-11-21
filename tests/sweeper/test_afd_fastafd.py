@@ -183,6 +183,16 @@ def test_stage_latency_is_spread_over_layer_microbatch_units(tmp_path):
     assert set(provenance["composition"]) == {"attention_ms", "ffn_ms", "a_to_f_ms", "f_to_a_ms"}
 
 
+@pytest.mark.parametrize("factor", [0.5, 2.0, 100.0, 1.0000000001])
+def test_non_unit_communication_calibration_fails_before_measurement(tmp_path, factor):
+    attention = _Attention()
+    provider = _provider(tmp_path, attention, profile_path=tmp_path / "missing-profile.json")
+    with pytest.raises(AFDInfeasible, match="FastAFD requires comm_overhead_factor=1") as error:
+        provider.measure(_request(_topology(comm_overhead_factor=factor)))
+    assert error.value.provenance["comm_overhead_factor"] == factor
+    assert attention.requests == []
+
+
 @pytest.mark.parametrize("nextn", [0, 1])
 def test_builtin_provider_recomputes_the_fastafd_router_on_a(tmp_path, monkeypatch, nextn):
     """Native SOL evidence with the synthetic 64A8F stage fixture, not serving accuracy."""
@@ -562,6 +572,33 @@ def test_profile_controls_are_validated(tmp_path, afd_overrides, match):
         raw["engine"].pop("workers")
     with pytest.raises(ValidationError, match=match):
         CorePredictionConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize("factor", [0.5, 2.0, 100.0, 1.0000000001])
+def test_prediction_config_rejects_non_unit_fastafd_communication_calibration(tmp_path, factor):
+    raw = _prediction(_profile(tmp_path))
+    raw["engine"]["afd"]["comm_overhead_factor"] = factor
+    with pytest.raises(ValidationError, match="fastafd_profile_path requires comm_overhead_factor=1"):
+        CorePredictionConfig.model_validate(raw)
+
+
+def test_modeled_afd_still_accepts_communication_calibration(tmp_path):
+    raw = _prediction(_profile(tmp_path))
+    raw["engine"]["afd"].update(fastafd_profile_path=None, fastafd_moe_backend=None, comm_overhead_factor=2.0)
+    config = CorePredictionConfig.model_validate(raw)
+    assert config.engine.afd.comm_overhead_factor == 2.0
+
+
+def test_unit_fastafd_communication_calibration_survives_config_round_trip(tmp_path):
+    raw = _prediction(_profile(tmp_path))
+    raw["engine"]["afd"]["comm_overhead_factor"] = 1.0
+    config = CorePredictionConfig.model_validate(raw)
+    restored = CorePredictionConfig.model_validate_json(config.model_dump_json())
+    attention = _Attention()
+    spec = prediction_to_replay_spec(restored, afd_performance_model=attention)
+    assert attention.requests[0].topology.comm_overhead_factor == 1.0
+    (measurement,) = spec.backend_deployment.performance_model_metadata["afd"]["measurements"]
+    assert measurement["ffn_ms"] == pytest.approx(STAGE_MS / (LAYERS * 2))
 
 
 def test_canonical_stage_api_parquet_json_and_saved_config(tmp_path, monkeypatch):

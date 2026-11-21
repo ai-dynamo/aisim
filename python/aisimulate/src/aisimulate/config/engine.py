@@ -72,6 +72,11 @@ class AFDTopologyPredictionConfig(StrictModel):
                 raise ValueError("fastafd_profile_path cannot be empty")
             if self.phase != "decode":
                 raise ValueError("fastafd_profile_path requires phase='decode'; the profiles measure decode only")
+            if self.comm_overhead_factor != 1.0:
+                raise ValueError(
+                    "fastafd_profile_path requires comm_overhead_factor=1; communication is included "
+                    "in the measured MoE stage and cannot be calibrated separately"
+                )
         return self
 
 
