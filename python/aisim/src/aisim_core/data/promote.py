@@ -757,11 +757,11 @@ def _check_catalog_unlinked(target: Path) -> None:
 
 
 def _check_contained(target: Path, rels: list[str]) -> None:
-    """Refuse a destination whose existing ancestors are symlinks or resolve outside ``target``."""
+    """Refuse symlinks at the destination or its ancestors, including dangling links."""
     root = target.resolve()
     for rel in rels:
         current = target
-        for part in Path(rel).parts[:-1]:
+        for part in Path(rel).parts:
             current = current / part
             if current.is_symlink() or (current.exists() and not current.resolve().is_relative_to(root)):
                 raise PromotionError(f"target path escapes the target root through a symlink: {rel}")

@@ -1501,6 +1501,62 @@ def test_symlinked_target_directory_is_refused_without_writing_outside(tmp_path)
     assert list(outside.iterdir()) == []
 
 
+@pytest.mark.parametrize("payload", ["manifest", "artifact"])
+def test_dangling_payload_symlink_is_refused_before_any_write(tmp_path, payload):
+    root, _, plan = _approved(tmp_path)
+    assert plan.ok, plan.findings
+    target = _target(tmp_path)
+    rel = plan.manifests[0] if payload == "manifest" else next(p for p in plan.files if p not in plan.manifests)
+    dest = target / rel
+    dest.parent.mkdir(parents=True)
+    outside = tmp_path / "outside.json"
+    dest.symlink_to(outside)
+    before = set(target.rglob("*"))
+
+    with pytest.raises(PromotionError, match="symlink"):
+        apply_promotion(plan, root, target)
+
+    assert not outside.exists()
+    assert dest.is_symlink() and dest.readlink() == outside
+    assert set(target.rglob("*")) == before
+
+
+def test_dangling_custom_category_index_symlink_is_refused_before_any_write(tmp_path):
+    from aisim_core.data import DatasetIndex
+
+    root, _, plan = _approved(tmp_path)
+    assert plan.ok, plan.findings
+    prior = tmp_path / "prior"
+    prior.mkdir()
+    target, _ = _mirror(prior, repo=PUBLIC, dev=("synthetic/prior-model",))
+    dest = target / "data/indexes/existing.json"
+    dest.parent.mkdir()
+    (target / "catalog/e2e.json").rename(dest)
+    path = target / "catalog/dataset.json"
+    dataset = DatasetIndex.model_validate_json(path.read_bytes())
+    ref = dataset.categories["e2e"]
+    artifact = ref.index.model_copy(update={"path": dest.relative_to(target).as_posix()})
+    path.write_text(
+        dataset.model_copy(update={"categories": {"e2e": ref.model_copy(update={"index": artifact})}}).model_dump_json(
+            by_alias=True
+        )
+    )
+    assert validate_tree(target, profile="public").ok
+    dest.unlink()
+    outside = tmp_path / "outside-index.json"
+    dest.symlink_to(outside)
+    before_paths = set(target.rglob("*"))
+    before_bytes = {p: p.read_bytes() for p in before_paths if p.is_file()}
+
+    with pytest.raises(PromotionError, match="symlink"):
+        apply_promotion(plan, root, target)
+
+    assert not outside.exists()
+    assert dest.is_symlink() and dest.readlink() == outside
+    assert set(target.rglob("*")) == before_paths
+    assert {p: p.read_bytes() for p in before_paths if p.is_file()} == before_bytes
+
+
 @pytest.mark.parametrize("linked", ["catalog/e2e", "catalog/e2e/h100_sxm.parquet"])
 def test_symlinked_catalog_destination_is_refused_before_any_write(tmp_path, linked):
     root, directory, plan = _approved(tmp_path)
