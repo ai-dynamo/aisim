@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -3858,52 +3860,56 @@ def test_power_window_cannot_be_set_through_the_environment(name, source):
         _cell_generator_overrides(_plan(cell), cell, base)
 
 
-@pytest.mark.parametrize("source", ["deployment", "policy"])
 @pytest.mark.parametrize(
-    "value,refused",
+    "launch,value,refused",
     # vLLM reads the variable as bool(int(value)) (vllm/envs.py:638): "00" and " 0" read as off, "-1" as on, and a
-    # value that int() cannot read stops vLLM. None stands for an entry whose value the launch cannot show.
+    # value that int() cannot read ("", "true", "0.0") stops vLLM. None leaves the variable unset.
     [
-        ("1", True),
-        ("2", True),
-        ("-1", True),
-        ("true", True),
-        ("", True),
-        (None, True),
-        ("0", False),
-        ("00", False),
-        (" 0", False),
+        *[("slurm_probe", value, True) for value in ("1", "2", "-1", "true", "", "0.0")],
+        *[("slurm_probe", value, False) for value in (None, "0", "00", " 0")],
+        ("kubernetes_probe", "1", False),
+        ("slurm_collection", "1", False),
     ],
 )
-def test_probe_launch_refuses_vllm_batch_invariant_in_the_environment(tmp_path, source, value, refused):
-    entry = {"name": "VLLM_BATCH_INVARIANT", "value": value}
-    if value is None:
-        entry = {"name": "VLLM_BATCH_INVARIANT", "valueFrom": {"configMapKeyRef": {"name": "engine", "key": "mode"}}}
-    collection, probe = _glm53flash_probe_and_collection(tmp_path / "plan", 4)
+def test_slurm_probe_refuses_vllm_batch_invariant_in_the_collector_environment(
+    tmp_path, monkeypatch, launch, value, refused
+):
+    from collector.fpm_forward.runtime_probe import build_runtime_probe_plan, probe_generator_overrides
 
-    def build(plan):
-        cell, base = plan.cells[0], {}
-        if source == "deployment":
-            base = {"K8sConfig": {"extra_env": [dict(entry)]}}
-        else:
-            policy = cell.backend_policy
-            overrides = policy.generator_overrides
-            overrides.setdefault("K8sConfig", {}).setdefault("extra_env", []).append(dict(entry))
-            cell = dataclasses.replace(
-                cell,
-                backend_policy=BackendPolicy(
-                    policy.policy_id, overrides, policy.expected_markers, policy.aic_fields, policy.admission_reason
-                ),
-            )
-        return _cell_generator_overrides(plan, cell, base)
+    collection, probe = _glm53flash_probe_and_collection(tmp_path / "plan", 4)
+    facts = copy.deepcopy(probe.launch)
+    facts["deployment"]["executor"] = "slurm"
+    plan = {
+        "slurm_probe": build_runtime_probe_plan("gb300-tp4", facts, probe.runtime_instrumentation),
+        "kubernetes_probe": probe,
+        "slurm_collection": dataclasses.replace(
+            collection,
+            options=dataclasses.replace(
+                collection.options, executor="slurm", slurm_container_image=facts["deployment"]["image"]
+            ),
+        ),
+    }[launch]
+    # A probe hands every cell the request of its launch facts (runtime_probe.py), which declares no environment.
+    base = probe_generator_overrides(plan.launch) if launch != "slurm_collection" else {}
+    monkeypatch.delenv("VLLM_BATCH_INVARIANT", raising=False)
+    without = [_cell_generator_overrides(plan, cell, base) for cell in plan.cells]
+    if value is not None:
+        monkeypatch.setenv("VLLM_BATCH_INVARIANT", value)
 
     if refused:
-        with pytest.raises(ValueError, match="VLLM_BATCH_INVARIANT cannot be set for a runtime probe"):
-            build(probe)
-    else:
-        assert entry in build(probe)["K8sConfig"]["extra_env"]
-    # A collection launch is outside this rule: it is built as before, with the entry in its environment.
-    assert entry in build(collection)["K8sConfig"]["extra_env"]
+        text = (
+            f"VLLM_BATCH_INVARIANT is set to {value!r} in the environment of the collector, and srun can pass it to "
+            "vLLM in the step of a runtime probe; when vLLM reads it as on, it turns prefix caching off in a worker of "
+            "the TRITON_MLA or FLASHINFER backend while its scheduler keeps it on, and the import refuses such "
+            "records; unset it"
+        )
+        for cell in plan.cells:
+            with pytest.raises(ValueError, match=f"^{re.escape(text)}$"):
+                _cell_generator_overrides(plan, cell, base)
+        return
+    # A Kubernetes probe does not get the environment of the collector, and a collection launch is outside this rule:
+    # both are built as without the variable.
+    assert [_cell_generator_overrides(plan, cell, base) for cell in plan.cells] == without
 
 
 def test_historical_plans_without_measure_power_render_no_power_window():

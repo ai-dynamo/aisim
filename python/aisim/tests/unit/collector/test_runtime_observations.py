@@ -2300,8 +2300,27 @@ def test_v033_worker_that_turned_prefix_caching_off_names_batch_invariance(tmp_p
     )
 
 
-@pytest.mark.parametrize("shape", ["integer", "null", "missing", "not_a_mapping"])
-def test_v033_malformed_worker_prefix_caching_evidence_does_not_name_batch_invariance(tmp_path, shape):
+_INCOMPLETE_PREFIX_CACHING = "runtime observation requires complete prefix-caching evidence"
+
+
+@pytest.mark.parametrize(
+    "shape,diagnostic",
+    [
+        ("integer", _INCOMPLETE_PREFIX_CACHING),
+        ("null", _INCOMPLETE_PREFIX_CACHING),
+        ("missing", _INCOMPLETE_PREFIX_CACHING),
+        ("not_a_mapping", _INCOMPLETE_PREFIX_CACHING),
+        # The worker block holds false, but it is not the block that one vLLM process writes.
+        ("false_with_extra_key", _INCOMPLETE_PREFIX_CACHING),
+        ("false_without_mode", _INCOMPLETE_PREFIX_CACHING),
+        ("false_with_unknown_mode", _INCOMPLETE_PREFIX_CACHING),
+        (
+            "false_with_mode_all",
+            "mamba_cache_mode all is not modeled; run the probe with prefix caching off (none) or on (align)",
+        ),
+    ],
+)
+def test_v033_worker_prefix_caching_evidence_that_is_not_well_formed_keeps_its_text(tmp_path, shape, diagnostic):
     path, launches = observation_fixture(tmp_path, layout="mamba_hybrid")
 
     def edit(record):
@@ -2315,13 +2334,42 @@ def test_v033_malformed_worker_prefix_caching_evidence_does_not_name_batch_invar
             evidence["enable_prefix_caching"] = None
         elif shape == "missing":
             evidence.pop("enable_prefix_caching")
-        else:
+        elif shape == "not_a_mapping":
             record["cache"]["prefix_caching"] = sorted(evidence)
+        else:
+            evidence["enable_prefix_caching"] = False
+            if shape == "false_with_extra_key":
+                evidence["block_size"] = 64
+            elif shape == "false_without_mode":
+                evidence.pop("mamba_cache_mode")
+            elif shape == "false_with_unknown_mode":
+                evidence["mamba_cache_mode"] = "auto"
+            else:
+                evidence["mamba_cache_mode"] = "all"
 
     _mutate(path, edit)
     result = validate_observations(path, launches)["tp2"]
     assert result["status"] == "incomplete"
-    assert result["diagnostics"] == ["tp2: runtime observation requires complete prefix-caching evidence"]
+    assert result["diagnostics"] == [f"tp2: {diagnostic}"]
+
+
+@pytest.mark.parametrize("layout", ["kernel_view", "mamba_hybrid"])
+def test_v033_worker_on_under_a_scheduler_off_keeps_the_mismatch_text(tmp_path, layout):
+    # The engine core can turn prefix caching off in its own process only (v1/engine/core.py:266-280), so the decode
+    # scheduler records it off and its workers on. That is not the record of VLLM_BATCH_INVARIANT.
+    path, launches = observation_fixture(tmp_path, layout=layout, decode_prefix_caching=False)
+
+    def edit(record):
+        if (record["kind"], record["phase"]) == ("worker", "decode"):
+            record["cache"]["prefix_caching"]["enable_prefix_caching"] = True
+            record["resolved_config"]["cache_config"]["enable_prefix_caching"] = True
+
+    _mutate(path, edit)
+    result = validate_observations(path, launches)["tp2"]
+    assert (result["status"], result["diagnostics"]) == (
+        "incomplete",
+        ["tp2: runtime observation decode prefix-caching settings across ranks mismatch"],
+    )
 
 
 @pytest.mark.parametrize("change", ["speculative", "checkpoint"])

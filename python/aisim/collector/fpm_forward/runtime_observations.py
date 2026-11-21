@@ -1339,11 +1339,16 @@ def _phase_prefix_caching(
     if scheduled is not None and scheduled["enable_prefix_caching"]:
         # Under VLLM_BATCH_INVARIANT, an attention layer of the TRITON_MLA or FLASHINFER backend turns prefix caching
         # off in the cache config of its own worker process (layers/attention/mla_attention.py:550-563,
-        # layers/attention/attention.py:373-388), and the engine core keeps it on. Every other shape of the worker
-        # evidence is left to _prefix_caching_settings.
+        # layers/attention/attention.py:373-388), and the engine core keeps it on. Only a well-formed worker block gets
+        # this text; every other shape of the worker evidence is left to _prefix_caching_settings.
         for _, record in sorted(workers.items()):
             value = record["cache"]["prefix_caching"]
-            if isinstance(value, dict) and value.get("enable_prefix_caching") is False:
+            if (
+                isinstance(value, dict)
+                and set(value) == {"enable_prefix_caching", "mamba_cache_mode"}
+                and value["enable_prefix_caching"] is False
+                and value["mamba_cache_mode"] in ("none", "align")
+            ):
                 raise ValueError(
                     f"{phase} worker turned prefix caching off while its scheduler keeps it on; vLLM does this under "
                     "VLLM_BATCH_INVARIANT with the TRITON_MLA or FLASHINFER backend; run the probe without that "
