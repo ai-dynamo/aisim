@@ -471,3 +471,51 @@ fn an_arrival_during_a_loads_idle_to_busy_launch_joins_the_next_pass() {
             .all(|request| request.output_length == request.requested_output_length)
     );
 }
+
+#[test]
+fn a_restore_blocked_by_the_prefill_budget_keeps_other_loads_on_the_poll_path() {
+    // Requests 1 and 2 store 5 and 20 blocks; request 3 evicts them from G1.
+    // R (4) prefills at 1600 and issues A's (5) and B's (6) loads with its
+    // final decode at 1700. The serial copies start after the decode ends at
+    // 1710: A copies until 1760 and B until 1960.
+    // P (7) prefills in three 64-token chunks from 1710 to 2010. Its first
+    // launch polls at 1760 and sees A, making A runnable two decisions later,
+    // at 1910. P consumes the whole token budget then, so A stays in
+    // connector_waiting. That pass polls at 1860, before B's copy ends.
+    // When P finishes, A keeps the engine busy: B must still wait for A's
+    // prefill poll at 2030 and two more decisions, until 2120. Ignoring A in
+    // the idle check would let B join A's prefill at 2010.
+    let five_blocks_in_50_ms = 320.0 / (50.0 * 1e6);
+    let mut config = polled_cpu_tier(128, five_blocks_in_50_ms);
+    config.native_host_offload.as_mut().unwrap().num_host_blocks = 512;
+    let report = run_tokens(
+        config,
+        vec![
+            tokens_request(1, (0..20).collect(), 1, 0.0),
+            tokens_request(2, (100..180).collect(), 1, 300.0),
+            tokens_request(3, (500..1008).collect(), 1, 600.0),
+            tokens_request(4, (2000..2004).collect(), 2, 1600.0),
+            tokens_request(5, (0..24).collect(), 2, 1605.0),
+            tokens_request(6, (100..184).collect(), 2, 1606.0),
+            tokens_request(7, (3000..3192).collect(), 1, 1705.0),
+        ],
+    );
+    assert_eq!(record(&report, 7).first_admit_ms, Some(1710.0));
+    assert_eq!(record(&report, 5).first_admit_ms, Some(2010.0));
+    assert_eq!(record(&report, 6).first_admit_ms, Some(2120.0));
+    assert_eq!(
+        record(&report, 5).first_admission_host_reused_input_tokens,
+        Some(20)
+    );
+    assert_eq!(
+        record(&report, 6).first_admission_host_reused_input_tokens,
+        Some(80)
+    );
+    assert_eq!(report.per_request.len(), 7);
+    assert!(
+        report
+            .per_request
+            .iter()
+            .all(|request| request.output_length == request.requested_output_length)
+    );
+}
