@@ -36,7 +36,9 @@ use super::{
 use crate::engine::{Command, KvHintSource, LifecycleEvent};
 use crate::replay::engine::ReplayRoleFactory;
 use crate::replay::loadgen::{AgenticPreparationTransition, ReplayRequestPayload};
-use crate::replay::protocol::{DirectRequest, ForwardPassSnapshot, OutputSignal};
+#[cfg(test)]
+use crate::replay::protocol::DirectRequest;
+use crate::replay::protocol::{ForwardPassSnapshot, OutputSignal};
 use crate::replay::{ReplayCaptureOptions, ReplayRequestPool};
 use crate::replay::{ReplayTerminalStatus, TraceCollector};
 use anyhow::{Context, bail};
@@ -57,7 +59,7 @@ pub(crate) struct AggRuntimeStats {
 }
 
 /// A placed request waiting for tokenization: request, id, worker and resolved KV hint.
-type TokenizingDispatch = (DirectRequest, Uuid, usize, Option<KvHintSource>);
+type TokenizingDispatch = (ReplayRequestPayload, Uuid, usize, Option<KvHintSource>);
 
 pub(crate) struct AggRuntimeImpl<PlacementPolicyImpl, Observation, Metadata>
 where
@@ -326,7 +328,7 @@ where
     /// Deliver a request to a worker and update the runtime's bookkeeping for that assignment.
     fn dispatch_to_worker(
         &mut self,
-        request: DirectRequest,
+        request: ReplayRequestPayload,
         uuid: Uuid,
         worker_idx: usize,
         kv_hint: Option<KvHintSource>,
@@ -338,7 +340,7 @@ where
                         "offline replay placement references unknown scheduler {worker_idx}"
                     )
                 })?;
-            let input_tokens = request.tokens.len();
+            let input_tokens = request.input_length();
             tokenization.enter(
                 self.now_ms,
                 logical_worker_id,
@@ -359,7 +361,7 @@ where
 
     fn submit_to_engine(
         &mut self,
-        request: DirectRequest,
+        request: ReplayRequestPayload,
         uuid: Uuid,
         worker_idx: usize,
         kv_hint: Option<KvHintSource>,
@@ -485,12 +487,7 @@ where
                         placement.scheduler_id,
                     ),
                 );
-                self.dispatch_to_worker(
-                    request.into_direct_request(),
-                    uuid,
-                    placement.scheduler_id,
-                    kv_hint,
-                )?;
+                self.dispatch_to_worker(request, uuid, placement.scheduler_id, kv_hint)?;
             }
             PlacementDecision::Queued => {
                 self.collector

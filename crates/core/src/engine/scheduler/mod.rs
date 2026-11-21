@@ -500,13 +500,17 @@ impl EngineCore {
     pub(crate) fn apply_command_effects_at(
         &mut self,
         command: SchedulerCommand,
+        prompt: Option<crate::engine::TracePrompt>,
         allow_destination_admission: bool,
         now_ms: f64,
     ) -> anyhow::Result<SchedulerCommandEffects> {
         match self {
-            Self::Vllm(core) => {
-                core.apply_command_effects_at(command, allow_destination_admission, Some(now_ms))
-            }
+            Self::Vllm(core) => core.apply_command_with_prompt(
+                command,
+                allow_destination_admission,
+                Some(now_ms),
+                prompt,
+            ),
             Self::Sglang(core) => {
                 core.apply_command_effects_at(command, allow_destination_admission, Some(now_ms))
             }

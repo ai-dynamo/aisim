@@ -1183,14 +1183,25 @@ impl VllmCore {
         command: SchedulerCommand,
         allow_destination_admission: bool,
     ) -> anyhow::Result<SchedulerCommandEffects> {
-        self.apply_command_effects_at(command, allow_destination_admission, None)
+        self.apply_command_with_prompt(command, allow_destination_admission, None, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn apply_command_effects_at(
         &mut self,
         command: SchedulerCommand,
         allow_destination_admission: bool,
         command_now_ms: Option<f64>,
+    ) -> anyhow::Result<SchedulerCommandEffects> {
+        self.apply_command_with_prompt(command, allow_destination_admission, command_now_ms, None)
+    }
+
+    pub(crate) fn apply_command_with_prompt(
+        &mut self,
+        command: SchedulerCommand,
+        allow_destination_admission: bool,
+        command_now_ms: Option<f64>,
+        prompt: Option<crate::engine::TracePrompt>,
     ) -> anyhow::Result<SchedulerCommandEffects> {
         // Commands and deadline settlement are separate generalized-engine
         // boundaries. Settling here would mutate host residency before a
@@ -1227,6 +1238,7 @@ impl VllmCore {
                 Ok(SchedulerCommandEffects::new(
                     SchedulerCommandResult::Submitted(self.submit(
                         request,
+                        prompt,
                         admissible_from_pass,
                         command_now_ms.unwrap_or_default(),
                     )?),
@@ -1264,6 +1276,7 @@ impl VllmCore {
                 let submitted = self
                     .submit(
                         request,
+                        None,
                         admissible_from_pass,
                         command_now_ms.unwrap_or_default(),
                     )
@@ -1319,6 +1332,7 @@ impl VllmCore {
                 let waiting_order = self.allocate_waiting_order();
                 let request = self.make_request_state(
                     request,
+                    None,
                     RequestStatus::WaitingForRemoteKv,
                     waiting_order,
                 );
@@ -1604,6 +1618,7 @@ impl VllmCore {
     fn submit(
         &mut self,
         mut request: DirectRequest,
+        prompt: Option<crate::engine::TracePrompt>,
         admissible_from_pass: u64,
         arrival_ms: f64,
     ) -> anyhow::Result<Uuid> {
@@ -1613,7 +1628,8 @@ impl VllmCore {
             anyhow::bail!("request {uuid} is already active");
         }
         let waiting_order = self.allocate_waiting_order();
-        let mut request = self.make_request_state(request, RequestStatus::Waiting, waiting_order);
+        let mut request =
+            self.make_request_state(request, prompt, RequestStatus::Waiting, waiting_order);
         request.admissible_from_pass = admissible_from_pass;
         request.arrival_ms = arrival_ms;
         self.state.insert_waiting(uuid, request);
@@ -1626,11 +1642,14 @@ impl VllmCore {
     fn make_request_state(
         &self,
         request: DirectRequest,
+        trace: Option<crate::engine::TracePrompt>,
         status: RequestStatus,
         waiting_order: u64,
     ) -> VllmRequestState {
         let uuid = request.uuid.unwrap_or_else(Uuid::new_v4);
-        let prompt_len = request.tokens.len();
+        let prompt_len = trace
+            .as_ref()
+            .map_or(request.tokens.len(), |trace| trace.len);
         let requested_max_output_tokens = request.max_output_tokens;
         let mut max_output_tokens = request.effective_max_output_tokens();
         let planned_output_ids = request.output_token_ids;
@@ -1665,10 +1684,14 @@ impl VllmCore {
         // unchanged here. The waiting-admission policy owns terminal rejection
         // because that path can emit the lifecycle signal.
         let output_capacity_hint = self.output_capacity_hint(prompt_len, max_output_tokens);
-        let prefix_tokens = self.args.prefix_match_unit.map(|_| request.tokens.clone());
-        let mut sequence = RequestKvState::native(
+        use crate::engine::common::sequence::PromptTokens;
+        let prompt = match trace {
+            Some(trace) => PromptTokens::Trace(trace),
+            None => PromptTokens::Dense(request.tokens),
+        };
+        let mut sequence = RequestKvState::from_prompt(
             uuid,
-            request.tokens,
+            prompt,
             max_output_tokens,
             output_capacity_hint,
             self.args.block_size,
@@ -1676,11 +1699,9 @@ impl VllmCore {
             self.retain_local_hashes,
             self.emit_token_ids,
             planned_output_ids,
+            self.args.prefix_match_unit,
         );
         sequence.lease.session_id = request.session_id;
-        if let (Some(unit), Some(tokens)) = (self.args.prefix_match_unit, prefix_tokens) {
-            sequence.lease.configure_prefix_hashes(&tokens, unit);
-        }
         let host_offload = self.native_host_offload.as_ref().map(|adapter| {
             Box::new(VllmHostRequestState::new(
                 &sequence.sequence,

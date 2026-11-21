@@ -3,7 +3,7 @@
 
 use crate::engine::common::hashing::{
     BlockHash, SequenceHash, XXH3_SEED, block_hashes, compute_block_hash_for_tokens,
-    compute_next_sequence_hash,
+    compute_next_sequence_hash, trace_block_hashes,
 };
 use rand::random;
 use uuid::Uuid;
@@ -23,6 +23,57 @@ pub(crate) fn synthetic_output_token(request_id: Uuid, output_ordinal: usize) ->
     xxh3_64(&bytes) as u32
 }
 
+/// Pre-tokenized trace prompt. Each ID repeats for one trace block.
+#[derive(Debug)]
+pub(crate) struct TracePrompt {
+    pub(crate) len: usize,
+    pub(crate) ids: Vec<u32>,
+    pub(crate) block_size: usize,
+}
+
+pub(crate) enum PromptTokens {
+    Dense(Vec<u32>),
+    Trace(TracePrompt),
+}
+
+impl PromptTokens {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Dense(tokens) => tokens.len(),
+            Self::Trace(trace) => trace.len,
+        }
+    }
+
+    pub(crate) fn visit_blocks(&self, size: usize, mut visit: impl FnMut(BlockHash, SequenceHash)) {
+        let mut parent = None;
+        let chain = |local| {
+            let hash = parent.map_or(local, |p| compute_next_sequence_hash(p, local));
+            parent = Some(hash);
+            visit(local, hash);
+        };
+        match self {
+            Self::Dense(tokens) => block_hashes(tokens, size).for_each(chain),
+            Self::Trace(trace) => {
+                trace_block_hashes(trace.len, &trace.ids, trace.block_size, size, None)
+                    .for_each(chain)
+            }
+        }
+    }
+}
+
+impl TracePrompt {
+    pub(crate) fn tokens_from(&self, start: usize) -> Vec<u32> {
+        let mut tokens = Vec::with_capacity(self.len - start);
+        let mut pos = start;
+        while pos < self.len {
+            let count = (self.block_size - pos % self.block_size).min(self.len - pos);
+            tokens.extend(std::iter::repeat_n(self.ids[pos / self.block_size], count));
+            pos += count;
+        }
+        tokens
+    }
+}
+
 #[derive(Debug)]
 struct FlatTokens {
     retained: Vec<u32>,
@@ -31,12 +82,16 @@ struct FlatTokens {
 
 impl FlatTokens {
     fn new(
-        mut tokens: Vec<u32>,
+        prompt: PromptTokens,
         output_capacity_hint: usize,
         block_size: usize,
         retain_history: bool,
     ) -> Self {
         if retain_history {
+            let mut tokens = match prompt {
+                PromptTokens::Dense(tokens) => tokens,
+                PromptTokens::Trace(trace) => trace.tokens_from(0),
+            };
             tokens.reserve_exact(output_capacity_hint);
             return Self {
                 retained: tokens,
@@ -44,7 +99,7 @@ impl FlatTokens {
             };
         }
 
-        let retained_start = tokens.len() - (tokens.len() % block_size);
+        let retained_start = prompt.len() - (prompt.len() % block_size);
         // Lazy promotion runs after the next block's first token is pushed, so
         // the retained window must hold one complete block plus that token.
         let mut retained = Vec::with_capacity(
@@ -52,7 +107,11 @@ impl FlatTokens {
                 .checked_add(1)
                 .expect("flat token tail capacity overflow"),
         );
-        retained.extend_from_slice(&tokens[retained_start..]);
+        match prompt {
+            PromptTokens::Dense(tokens) => retained.extend_from_slice(&tokens[retained_start..]),
+            PromptTokens::Trace(trace) => retained
+                .extend((retained_start..trace.len).map(|p| trace.ids[p / trace.block_size])),
+        }
         Self {
             retained,
             retained_start,
@@ -145,6 +204,31 @@ impl RequestSequence {
         emit_token_ids: bool,
         planned_output_ids: Option<Vec<u32>>,
     ) -> (Self, Vec<BlockIdentity>) {
+        Self::from_prompt(
+            request_id,
+            PromptTokens::Dense(tokens),
+            max_output_tokens,
+            output_capacity_hint,
+            block_size,
+            enable_prefix_caching,
+            retain_local_hashes,
+            emit_token_ids,
+            planned_output_ids,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_prompt(
+        request_id: Uuid,
+        tokens: PromptTokens,
+        max_output_tokens: usize,
+        output_capacity_hint: usize,
+        block_size: usize,
+        enable_prefix_caching: bool,
+        retain_local_hashes: bool,
+        emit_token_ids: bool,
+        planned_output_ids: Option<Vec<u32>>,
+    ) -> (Self, Vec<BlockIdentity>) {
         assert!(block_size >= 2, "block_size must be at least two");
         let num_input_tokens = tokens.len();
         let output_capacity_hint = output_capacity_hint.min(max_output_tokens);
@@ -157,17 +241,12 @@ impl RequestSequence {
 
         let mut identities = Vec::with_capacity(completion_blocks);
         if enable_prefix_caching {
-            let mut parent_hash = None;
-            for local_hash in block_hashes(&tokens, block_size) {
-                let sequence_hash = parent_hash
-                    .map(|parent| compute_next_sequence_hash(parent, local_hash))
-                    .unwrap_or(local_hash);
+            tokens.visit_blocks(block_size, |local_hash, sequence_hash| {
                 identities.push(BlockIdentity {
                     sequence_hash: Some(sequence_hash),
                     local_hash: retain_local_hashes.then_some(local_hash),
                 });
-                parent_hash = Some(sequence_hash);
-            }
+            });
         } else {
             identities.extend((0..num_input_tokens / block_size).map(|_| BlockIdentity {
                 sequence_hash: Some(random::<u64>()),
