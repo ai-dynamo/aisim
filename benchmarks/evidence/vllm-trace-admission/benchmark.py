@@ -5,7 +5,9 @@
 import argparse
 import hashlib
 import json
+import subprocess
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 
@@ -36,14 +38,16 @@ def run(args):
     from aisim.config.cli import CorePredictionConfig
     from aisim.runner import _materialize_engine_execution_spec
 
-    hybrid = args.model == "hybrid"
-    tp = 4 if hybrid else 8
-    cache = {"block_size": 16, "prefix_caching": True, "capacity": {"type": "fixed", "blocks": 98304}}
-    if hybrid:
-        # TP4: 16 full-attention layers, 48 Gated DeltaNet layers. BF16 convolution and FP32 recurrent state.
-        cache.update(bytes_per_token=16384, prefix_match_unit=16, state_cache={"bytes_per_request": 38486016})
+    # At TP16 the K3 state spans 384-token physical pages. Both hash units divide the page.
+    cache = {
+        "block_size": 384,
+        "prefix_match_unit": args.prefix_unit,
+        "prefix_caching": True,
+        "capacity": {"type": "fixed", "blocks": 4096},
+        "state_cache": {},
+    }
     worker = {
-        "parallelism": {"replicas": 1, "tensor": tp, "moe_tensor": tp, "moe_expert": 1},
+        "parallelism": {"replicas": 1, "tensor": 16, "moe_tensor": 16, "moe_expert": 1},
         "scheduler": {"max_batched_tokens": 8192, "max_sequences": 128},
         "kv_cache": cache,
         "timing": {"type": "default", "database_mode": "SOL", "estimation_mode": "op_level", "fallback_policy": "deny"},
@@ -51,7 +55,7 @@ def run(args):
     config = CorePredictionConfig.model_validate(
         {
             "engine": {
-                "model": "Qwen/Qwen3.5-27B" if hybrid else "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+                "model": "moonshotai/Kimi-K3",
                 "backend": "vllm",
                 "backend_version": "0.24.0",
                 "hardware": "gb200",
@@ -90,6 +94,8 @@ def run(args):
     spec["traffic"]["trace_graph_cache"] = True
     payload = json.dumps(spec)
     for iteration in range(args.repeats + 1):
+        if args.step:
+            input()
         cpu, start = time.process_time(), time.perf_counter()
         raw = _runtime.run_replay_json(payload)
         cpu, wall = time.process_time() - cpu, time.perf_counter() - start
@@ -118,20 +124,75 @@ def run(args):
         )
 
 
+def compare(args):
+    """Alternate warm runs on two native builds and reject any difference in the simulated report."""
+    command = [
+        str(Path(__file__).resolve()),
+        "run",
+        str(args.trace),
+        "--step",
+        "--lanes",
+        str(args.lanes),
+        "--prefix-unit",
+        str(args.prefix_unit),
+        "--seconds",
+        str(args.seconds),
+        "--repeats",
+        str(args.repeats),
+    ]
+    with ExitStack() as stack:
+        workers = {}
+        for label, python in (("baseline", args.baseline_python), ("candidate", args.candidate_python)):
+            worker = stack.enter_context(
+                subprocess.Popen(
+                    [str(python), *command],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    text=True,
+                )
+            )
+            stack.callback(worker.terminate)
+            workers[label] = worker
+        for iteration in range(args.repeats + 1):
+            order = ("candidate", "baseline") if iteration % 2 == 0 else ("baseline", "candidate")
+            results = {}
+            for label in order:
+                worker = workers[label]
+                worker.stdin.write("\n")
+                worker.stdin.flush()
+                line = worker.stdout.readline()
+                if not line:
+                    raise RuntimeError(f"{label} exited with status {worker.wait()}")
+                results[label] = json.loads(line)
+            if results["baseline"]["report_sha256"] != results["candidate"]["report_sha256"]:
+                raise ValueError(f"replay reports differ at iteration {iteration}")
+            print(json.dumps(results), flush=True)
+        for label, worker in workers.items():
+            if worker.wait():
+                raise RuntimeError(f"{label} failed after the final replay")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     select = commands.add_parser("select")
     select.add_argument("source", type=Path)
     select.add_argument("target", type=Path)
-    bench = commands.add_parser("run")
+    bench = argparse.ArgumentParser(add_help=False)
     bench.add_argument("trace", type=Path)
-    bench.add_argument("--model", choices=["coder", "hybrid"], required=True)
+    bench.add_argument("--prefix-unit", type=int, choices=[64, 384], default=384)
     bench.add_argument("--lanes", type=int, required=True)
-    bench.add_argument("--seconds", type=int, default=180)
+    bench.add_argument("--seconds", type=int, default=120)
     bench.add_argument("--repeats", type=int, default=3)
+    single = commands.add_parser("run", parents=[bench])
+    single.add_argument("--step", action="store_true", help=argparse.SUPPRESS)
+    paired = commands.add_parser("compare", parents=[bench])
+    paired.add_argument("--baseline-python", type=Path, required=True)
+    paired.add_argument("--candidate-python", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "select":
         select_plays(args.source, args.target)
+    elif args.command == "compare":
+        compare(args)
     else:
         run(args)

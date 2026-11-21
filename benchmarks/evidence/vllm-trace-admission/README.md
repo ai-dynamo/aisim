@@ -1,23 +1,38 @@
-# AgentX replay on Qwen
+# Kimi K3 admission CPU benchmark
 
-This benchmark measures CPU time for one warm native replay call. It includes request admission, scheduling, model timing, and report generation.
+This benchmark measures the CPU time that AISim spends replaying AgentX on `moonshotai/Kimi-K3`. It compares two release builds and checks the simulated report after every pair.
 
-Use the first 32 complete plays that fit the 262,144-token context limit, including all child requests. The sample contains 2,065 requests. Each run replays a 120-second window with seed 42. The number of completed requests depends on the model and lane count.
+## Workload
 
-Download the pinned [AgentX trace](https://huggingface.co/datasets/semianalysisai/cc-traces-weka-062126/blob/23f152f6f0f9399a85901b89a6458def0ef16729/traces.jsonl). Use the same sample and CPU affinity for both builds.
+Use the first 32 complete plays whose requests fit 262,144 tokens, including child requests. The resulting graph contains 2,065 requests. The benchmark keeps that context limit and uses 120-second windows, seed 42, and the recorded token counts.
+
+Download the pinned [AgentX trace](https://huggingface.co/datasets/semianalysisai/cc-traces-weka-062126/blob/23f152f6f0f9399a85901b89a6458def0ef16729/traces.jsonl). Generate the sample once and use the same file for both builds.
 
 ```sh
 python benchmark.py select traces.jsonl agentx-32.jsonl
 sha256sum agentx-32.jsonl
 # 32f48684cd46688f082b4379d22b28b29cfdc2718536b680bcae70a72a0ac60b
-export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 RAYON_NUM_THREADS=1
-python benchmark.py run agentx-32.jsonl --model coder --lanes 1 --seconds 120
-python benchmark.py run agentx-32.jsonl --model coder --lanes 16 --seconds 120
-python benchmark.py run agentx-32.jsonl --model hybrid --lanes 16 --seconds 120
 ```
 
-Run the commands with each checkout's release build of AISim. Use baseline, candidate, candidate, baseline order. Each process loads the graph on its first run and measures three warm runs. Compare medians across the six warm runs per revision.
+## Replay configuration
 
-The WEKA trace uses 64-token blocks. Both models use 16-token KV blocks, the vLLM scheduler, and analytical op-level timing on modeled GB200 GPUs. Qwen3-Coder-480B-A35B-Instruct uses TP8. Qwen3.5-27B uses TP4 and a 16-token prefix match unit. Its 16 attention layers use 16,384 KV bytes per token per rank. Its 48 recurrent layers use 38,486,016 state bytes per request per rank. These sizes follow the [Qwen3.5 checkpoint](https://huggingface.co/Qwen/Qwen3.5-27B/blob/main/config.json) and [vLLM's state layout](https://github.com/vllm-project/vllm/blob/ee0da84ab9e04ac7610e28580af62c365e898389/vllm/model_executor/layers/mamba/mamba_utils.py#L213).
+AISim uses its packaged Kimi K3 checkpoint configuration, the vLLM scheduler, and analytical op-level GB200 timing. Tensor parallelism spans 16 GPUs. The replay models text generation with one replica, no speculative decoding, and a fixed pool of 4,096 physical KV blocks per rank.
 
-Each output line includes a SHA-256 digest of the replay report. Compare digests between builds for each case. The digest includes request records, cache reuse, simulated times, and AgentX lifecycle events. It excludes host wall time and the two rates that use host wall time.
+The K3 cache model resolves 27,648 token-KV bytes per token per rank. One padded KDA (Kimi Delta Attention) recurrent state occupies 30,523,392 bytes per request per rank. A physical KV block holds 384 tokens. The 384-token prefix unit reuses its physical block hash. With a 64-token prefix unit, the engine computes a separate hash chain. The source trace uses 64-token blocks in both cases. [K3 cache sizing](../../../python/aisim/src/aisim_core/sdk/memory/kimi_k3.py)
+
+## Reproduction
+
+Build both revisions in release mode with the same compiler flags. Set `BASE_PYTHON` and `PR_PYTHON` to the respective Python executables. Choose one logical CPU available to both processes.
+
+```sh
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 RAYON_NUM_THREADS=1
+for case in 1-384 16-384 16-64; do
+    taskset -c "$CPU" python benchmark.py compare agentx-32.jsonl \
+        --baseline-python "$BASE_PYTHON" --candidate-python "$PR_PYTHON" \
+        --lanes "${case%-*}" --prefix-unit "${case#*-}" --seconds 120 --repeats 12
+done
+```
+
+The comparison keeps each revision in a separate process. Each process warms its trace graph once. Each subsequent pair runs sequentially on the selected CPU. The first revision alternates between pairs. Timing covers the native replay call, including report generation.
+
+Every pair must match a SHA-256 digest of the replay report. The digest includes per-request records, cache hits, simulated timestamps, and AgentX lifecycle events. It excludes host wall time and the two rates that use host wall time.
