@@ -231,6 +231,30 @@ def _mixed_precision_layer_algo(metadata: object) -> str | None:
     return _normalize_mixed_precision_layer_algo(metadata)
 
 
+def _modelopt_targets_only_layer_maps(raw_config: dict) -> tuple[dict, ...]:
+    """Listing sources in a targets-only export, without merging module algorithms.
+
+    Scope detection must not reject a conflict on a module that exclusions keep
+    unquantized. Consumers validate the algorithms of the modules they use.
+    """
+    hf_section = _hf_quant_section(raw_config)
+    quant_config = _language_quant_config(raw_config)
+    algo = _normalize_quant_algo(
+        hf_section.get("quant_algo")
+        or hf_section.get("quantization_algo")
+        or quant_config.get("quant_algo")
+        or quant_config.get("quantization_algo")
+    )
+    quant_method = _normalize_quant_algo(quant_config.get("quant_method"))
+    if algo != "mixed_precision" or quant_method not in (None, "modelopt", "modelopt_mixed", "mixed_precision"):
+        return ()
+    return tuple(
+        layers
+        for source in (hf_section, quant_config)
+        if isinstance(layers := source.get("quantized_layers"), dict) and layers
+    )
+
+
 def modelopt_mixed_precision_targets(raw_config: dict) -> dict[str, str | None] | None:
     """``{module_path: algo}`` of a targets-only ModelOpt MIXED_PRECISION export.
 
@@ -251,23 +275,8 @@ def modelopt_mixed_precision_targets(raw_config: dict) -> dict[str, str | None] 
     (see ``_MODELOPT_ATTENTION_PACKED_MODULES``). Returns ``None`` otherwise,
     and callers keep their exclusion-glob semantics unchanged.
     """
-    hf_section = _hf_quant_section(raw_config)
-    quant_config = _language_quant_config(raw_config)
-    algo = _normalize_quant_algo(
-        hf_section.get("quant_algo")
-        or hf_section.get("quantization_algo")
-        or quant_config.get("quant_algo")
-        or quant_config.get("quantization_algo")
-    )
-    if algo != "mixed_precision":
-        return None
-    quant_method = _normalize_quant_algo(quant_config.get("quant_method"))
-    if quant_method not in (None, "modelopt", "modelopt_mixed", "mixed_precision"):
-        return None
     targets: dict[str, str | None] = {}
-    for layer_map in (hf_section.get("quantized_layers"), quant_config.get("quantized_layers")):
-        if not isinstance(layer_map, dict):
-            continue
+    for layer_map in _modelopt_targets_only_layer_maps(raw_config):
         for module, metadata in layer_map.items():
             module = str(module)
             layer_algo = _mixed_precision_layer_algo(metadata)
@@ -739,7 +748,7 @@ def _normalize_mixed_precision_layer_algo(value: object) -> str | None:
 
 
 def _infer_mixed_precision_group_algo(group: dict) -> str | None:
-    """Infer the layer algorithm from a ModelOpt config_groups entry."""
+    """Infer the layer algorithm from a checkpoint config_groups entry."""
     weights = group.get("weights")
     if not isinstance(weights, dict):
         return None
@@ -764,6 +773,10 @@ def _infer_mixed_precision_group_algo(group: dict) -> str | None:
         # guard for config_groups-style exports.
         if weights.get("group_size") == 32:
             return "mxfp8"
+        # Compressed-tensors block scaling must keep the same lane as
+        # parse_compressed_tensors_quant, including for per-layer targets.
+        if str(weights.get("strategy", "")).lower() == "block" or weights.get("block_structure"):
+            return "fp8_block"
         return "fp8"
     if num_bits == 4 and "float" in weight_type:
         return "nvfp4"
@@ -778,58 +791,47 @@ def _is_routing_expert_target(target: object) -> bool:
     return ".experts." in target_name or target_name.endswith(".experts") or "routing_expert" in target_name
 
 
+def _iter_mixed_precision_layer_algos(raw_config: dict):
+    """Yield target, normalized algorithm, and whether the target is a listed layer."""
+    quant = _get_language_quantization_config(raw_config) or {}
+    hf_config = raw_config.get("hf_quant_config")
+    hf_quant = hf_config.get("quantization", {}) if isinstance(hf_config, dict) else {}
+    for source in (hf_quant, quant):
+        if not isinstance(source, dict):
+            continue
+        layers = source.get("quantized_layers")
+        if not isinstance(layers, dict):
+            continue
+        for target, metadata in layers.items():
+            yield target, _mixed_precision_layer_algo(metadata), True
+    groups = quant.get("config_groups") if isinstance(quant, dict) else None
+    if isinstance(groups, dict):
+        for group in groups.values():
+            if isinstance(group, dict):
+                algo = _infer_mixed_precision_group_algo(group)
+                for target in group.get("targets") or []:
+                    yield target, algo, False
+
+
 def _collect_mixed_precision_layer_algos(raw_config: dict) -> tuple[set[str], set[str]]:
     """Collect ModelOpt mixed precision algorithms by SDK GEMM/MoE category."""
     gemm_algos: set[str] = set()
     moe_algos: set[str] = set()
-
-    def add_target(target: object, algo_value: object) -> None:
-        algo = _normalize_mixed_precision_layer_algo(algo_value)
-        if algo is None:
-            return
-        if _is_routing_expert_target(target):
-            moe_algos.add(algo)
-        else:
-            gemm_algos.add(algo)
-
-    def add_quantized_layers(quantized_layers: object) -> None:
-        if not isinstance(quantized_layers, dict):
-            return
-        for target, metadata in quantized_layers.items():
-            add_target(target, _mixed_precision_layer_algo(metadata))
-
-    hf_quant_config = raw_config.get("hf_quant_config")
-    if isinstance(hf_quant_config, dict):
-        hf_quant_section = hf_quant_config.get("quantization")
-        if isinstance(hf_quant_section, dict):
-            add_quantized_layers(hf_quant_section.get("quantized_layers"))
-
-    quant_cfg = _get_language_quantization_config(raw_config)
-    if isinstance(quant_cfg, dict):
-        add_quantized_layers(quant_cfg.get("quantized_layers"))
-        config_groups = quant_cfg.get("config_groups")
-        if isinstance(config_groups, dict):
-            for group in config_groups.values():
-                if not isinstance(group, dict):
-                    continue
-                algo = _infer_mixed_precision_group_algo(group)
-                if algo is None:
-                    continue
-                for target in group.get("targets") or []:
-                    add_target(target, algo)
-
+    for target, algo, _ in _iter_mixed_precision_layer_algos(raw_config):
+        if algo is not None:
+            (moe_algos if _is_routing_expert_target(target) else gemm_algos).add(algo)
     return gemm_algos, moe_algos
 
 
 # Coarse GEMM-lane priority over the non-expert algorithms a mixed-precision
 # checkpoint lists (rationale at the use site in
 # _infer_mixed_precision_quant_modes).
-_MIXED_PRECISION_GEMM_ALGO_PRIORITY = ("mxfp8", "fp8", "w4a16_nvfp4", "nvfp4")
+_MIXED_PRECISION_GEMM_ALGO_PRIORITY = ("mxfp8", "fp8_block", "fp8", "w4a16_nvfp4", "nvfp4")
 
 
 def _mixed_precision_algo_gemm_mode(algo: str | None, quant_dynamic: bool | None) -> common.GEMMQuantMode | None:
     """SDK GEMM mode of one normalized non-expert mixed-precision algorithm."""
-    if algo == "mxfp8":
+    if algo in ("mxfp8", "fp8_block"):
         return common.GEMMQuantMode.fp8_block
     if algo == "fp8":
         return common.GEMMQuantMode.fp8 if quant_dynamic is True else common.GEMMQuantMode.fp8_static
@@ -859,7 +861,7 @@ def _infer_mixed_precision_quant_modes(raw_config: dict, quant_dynamic: bool | N
             common.GEMMQuantMode.fp8 if quant_dynamic is True else common.GEMMQuantMode.fp8_static
         )
     # Otherwise the listed non-expert algorithms pick the lane in
-    # _MIXED_PRECISION_GEMM_ALGO_PRIORITY order (mxfp8, fp8, w4a16_nvfp4, nvfp4).
+    # _MIXED_PRECISION_GEMM_ALGO_PRIORITY order (mxfp8, fp8_block, fp8, w4a16_nvfp4, nvfp4).
     # MXFP8 -> fp8_block approximation (owner decision 2026-08-09): MXFP8 is
     # 32-element block-scaled FP8, i.e. the same 1 B/elem weights and the same
     # FP8 tensor-core throughput class as fp8_block; only the scale
@@ -879,13 +881,13 @@ def _infer_mixed_precision_quant_modes(raw_config: dict, quant_dynamic: bool | N
                 break
 
     # nvfp4-class stays first: routed experts are the artifact's headline
-    # dtype when mixed with fp8-class expert layers. mxfp8 takes the same
-    # fp8_block approximation as the GEMM side, ahead of per-tensor fp8.
+    # dtype when mixed with fp8-class expert layers. Native block FP8 and
+    # the MXFP8 approximation take fp8_block ahead of per-tensor fp8.
     if "w4a16_nvfp4" in moe_algos:
         overrides["moe_quant_mode"] = common.MoEQuantMode.w4a16_nvfp4
     elif "nvfp4" in moe_algos:
         overrides["moe_quant_mode"] = common.MoEQuantMode.nvfp4
-    elif "mxfp8" in moe_algos:
+    elif "mxfp8" in moe_algos or "fp8_block" in moe_algos:
         overrides["moe_quant_mode"] = common.MoEQuantMode.fp8_block
     elif "fp8" in moe_algos:
         overrides["moe_quant_mode"] = common.MoEQuantMode.fp8
@@ -1040,6 +1042,7 @@ def _apply_model_quant_defaults(
     original_config = dataclasses.replace(model_config)
     fmha_was_unset = model_config.fmha_quant_mode is None
     moe_was_unset = model_config.moe_quant_mode is None
+    unset_kinds = [kind for kind in ("gemm", "moe") if getattr(model_config, f"{kind}_quant_mode") is None]
 
     inferred = _infer_quant_modes_from_raw_config(raw_config, architecture)
     applied: list[str] = []
@@ -1094,6 +1097,9 @@ def _apply_model_quant_defaults(
         model_config.moe_quant_mode = resolve_vllm_moe_execution_mode(
             model_config.moe_quant_mode, backend_name, architecture
         )
+
+    # The fills above are assignments; keep the modes this call inferred marked inferred.
+    record_inferred_quant_modes(model_config, unset_kinds)
 
     # Only log if model_config was modified
     if original_config != model_config:
@@ -1216,6 +1222,26 @@ def resolve_dsv4_moe_arch(
         model_config.moe_quant_mode = mode
 
 
+def _inferred_quant_kinds(model_config: config.ModelConfig) -> list[str]:
+    # A replace() override keeps the copied False flag; the value tells it apart.
+    return [
+        k
+        for k in ("gemm", "moe")
+        if getattr(model_config, f"_{k}_quant_mode_is_explicit", None) is False
+        and not model_config._quant_mode_is_explicit(k)
+    ]
+
+
+def record_inferred_quant_modes(model_config: config.ModelConfig, kinds: list[str] | None = None) -> None:
+    """Remember the GEMM/MoE modes a resolver filled for inferred fields, so get_model can tell a later override.
+
+    ``kinds``: the inferred kinds captured before the resolver assigned them (an assignment marks a
+    mode explicit); by default the kinds currently flagged inferred.
+    """
+    for kind in _inferred_quant_kinds(model_config) if kinds is None else kinds:
+        model_config._mark_quant_mode_inferred(kind)
+
+
 def resolve_nvfp4_for_system(
     model_config: config.ModelConfig,
     system_name: str | None,
@@ -1238,8 +1264,18 @@ def resolve_nvfp4_for_system(
     """
     from aisim_core.sdk.perf_database import is_blackwell_system
 
+    # Per-layer checkpoint precision (Nemotron-H) resolves its own NVFP4 lanes from this.
+    model_config.system = system_name
     if is_blackwell_system(system_name):
         return  # native FP4 TC — nvfp4 stays as-is
+
+    # Record caller intent before the fallback fills inferred modes, so get_model
+    # still resolves per-layer checkpoint precision for the inferred ones.
+    if getattr(model_config, "_gemm_quant_mode_is_explicit", None) is None:
+        model_config._gemm_quant_mode_is_explicit = model_config.gemm_quant_mode is not None
+    if getattr(model_config, "_moe_quant_mode_is_explicit", None) is None:
+        model_config._moe_quant_mode_is_explicit = model_config.moe_quant_mode is not None
+    inferred_kinds = _inferred_quant_kinds(model_config)
 
     gemm_q = model_config.gemm_quant_mode
     moe_q = model_config.moe_quant_mode
@@ -1259,6 +1295,7 @@ def resolve_nvfp4_for_system(
         model_config.gemm_quant_mode = common.GEMMQuantMode.nvfp4_wo
     if moe_q == common.MoEQuantMode.nvfp4:
         model_config.moe_quant_mode = common.MoEQuantMode.nvfp4_wo
+    record_inferred_quant_modes(model_config, inferred_kinds)
 
 
 def resolve_sglang_mla_compute(

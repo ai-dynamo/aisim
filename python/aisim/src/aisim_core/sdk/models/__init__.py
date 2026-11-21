@@ -217,11 +217,12 @@ def get_model(
     # Preserve caller intent before checkpoint defaults fill unset modes.
     # Model-specific mixed-precision splitters use this provenance rather than
     # trying to infer explicitness by comparing enum values after mutation.
-    gemm_explicit = getattr(model_config, "_gemm_quant_mode_is_explicit", None)
-    model_info["gemm_quant_mode_is_explicit"] = (
-        model_config.gemm_quant_mode is not None if gemm_explicit is None else gemm_explicit
-    )
+    for kind in ("gemm", "moe"):
+        model_info[f"{kind}_quant_mode_is_explicit"] = model_config._quant_mode_is_explicit(kind)
     _apply_model_quant_defaults(model_config, raw_config, architecture, backend_name)
+    for kind in ("gemm", "moe"):
+        if not model_info[f"{kind}_quant_mode_is_explicit"]:
+            model_config._mark_quant_mode_inferred(kind)
     # vLLM (nvfp4_ds_mla) and TRT-LLM store FP4 MLA caches in their own layouts, which nvfp4 doesn't model.
     language = raw_config.get(common.MULTIMODAL_TEXT_CONFIG_KEY.get(architecture)) or raw_config
     if model_config.kvcache_quant_mode == common.KVCacheQuantMode.nvfp4 and (

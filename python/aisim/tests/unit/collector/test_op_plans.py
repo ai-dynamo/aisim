@@ -46,6 +46,24 @@ def _entry(**keys) -> dict:
     return next(entry for entry in skips.SKIPS if all(entry.get(key) == value for key, value in keys.items()))
 
 
+@pytest.mark.parametrize(
+    ("model_name", "latent", "outer", "backends"),
+    [
+        ("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4", 1024, 4096, BACKENDS),
+        ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4", 2048, 8192, BACKENDS),
+        ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16", 2048, 8192, BACKENDS),
+        # SGLang has no per-tensor FP8 MoE collector path (collector/skips.py).
+        ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8", 2048, 8192, ("vllm", "trtllm")),
+    ],
+)
+def test_vllm_native_latent_experts_exclude_outer_width(monkeypatch, model_name, latent, outer, backends):
+    monkeypatch.setenv("COLLECTOR_MODEL_PATH", model_name)
+    for backend in backends:
+        cases = [case for case in plan("moe", backend, 100).cases if case.model_name == model_name]
+        assert cases
+        assert {case.hidden_size for case in cases} == ({latent} if backend == "vllm" else {latent, outer})
+
+
 def _registry(backend: str) -> list:
     """The backend's registry entries, with those of its wide-EP registry."""
     return [
@@ -459,11 +477,11 @@ def test_module_skips_remove_points_per_backend():
 @pytest.mark.parametrize(
     ("sm", "dtypes"),
     [
-        (80, ["bfloat16"]),
-        (89, ["bfloat16", "fp8", "fp8_block"]),
-        (90, ["bfloat16", "fp8", "fp8_block"]),
-        (100, ["bfloat16", "fp8", "fp8_block", "nvfp4"]),
-        (120, ["bfloat16", "fp8", "fp8_block", "nvfp4"]),
+        (80, ["bfloat16", "w4a16_nvfp4"]),
+        (89, ["bfloat16", "fp8", "fp8_block", "w4a16_nvfp4"]),
+        (90, ["bfloat16", "fp8", "fp8_block", "w4a16_nvfp4"]),
+        (100, ["bfloat16", "fp8", "fp8_block", "nvfp4", "w4a16_nvfp4"]),
+        (120, ["bfloat16", "fp8", "fp8_block", "nvfp4", "w4a16_nvfp4"]),
     ],
 )
 def test_gemm_floors_remove_whole_dtypes(sm, dtypes):
@@ -489,7 +507,8 @@ def test_summary_counts_per_dtype_and_hashes_the_planned_ids():
     assert summary["by_dtype"] == {"bfloat16": shapes, "fp8": shapes, "nvfp4": shapes}
     assert summary["groups"] == len({(case.gemm_type, case.n, case.k) for case in op_plan.cases})
     assert summary["removed"] == [
-        {"region": "dtype=fp8_block", "cases": shapes, "reason": repr(_entry(backend="sglang", op="gemm"))}
+        {"region": "dtype=fp8_block", "cases": shapes, "reason": repr(_entry(backend="sglang", op="gemm"))},
+        {"region": "dtype=w4a16_nvfp4", "cases": shapes, "reason": repr(_entry(dtype="w4a16_nvfp4"))},
     ]
     assert summary["plan_hash"] == case_plan_hash([f"sglang.gemm:run_gemm:{case}" for case in op_plan.cases])
     assert "rows" not in summary
@@ -517,12 +536,13 @@ def test_plan_only_reports_op_plans_and_writes_the_table(tmp_path, monkeypatch):
     assert set(plans) == set(_registered_ops("vllm"))
     gemm = plans["gemm"]
     shapes = gemm["by_dtype"]["bfloat16"]
-    assert gemm["by_dtype"] == {"bfloat16": shapes, "fp8": shapes, "fp8_block": shapes}
+    assert gemm["by_dtype"] == {"bfloat16": shapes, "fp8": shapes, "fp8_block": shapes, "w4a16_nvfp4": shapes}
     nvfp4 = repr(_entry(dtype=["nvfp4", "w4a8_mxfp4_mxfp8"]))
     assert gemm["removed"] == [{"region": "dtype=nvfp4", "cases": shapes, "reason": nvfp4}]
     rows = (tmp_path / "vllm_sm89_gemm.csv").read_text().splitlines()
     assert rows[0] == "gemm_type,m,n,k"
     assert len(rows) == 1 + gemm["cases"]
+    assert Counter(row.split(",")[0] for row in rows[1:]) == gemm["by_dtype"]
     for op in plans:
         assert len((tmp_path / f"vllm_sm89_{op}.csv").read_text().splitlines()) == 1 + plans[op]["cases"], op
 

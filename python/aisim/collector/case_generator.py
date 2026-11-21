@@ -1070,6 +1070,7 @@ class MoeQuantizationSpec:
     requires_runtime_feature: Optional[str]
     requires_model_quantization_config: bool
     allowed_model_paths: tuple[str, ...]
+    explicit_only: bool
     module_config: dict[str, object]
 
 
@@ -1118,6 +1119,9 @@ def get_moe_quantization_specs(backend: str | None = None) -> list[MoeQuantizati
         module_config = raw_mode.get("module_config", {})
         if not isinstance(module_config, dict):
             raise TypeError(f"common_case_values.{section}.quantization_modes module_config must be a mapping")
+        explicit_only = raw_mode.get("explicit_only", False)
+        if not isinstance(explicit_only, bool):
+            raise TypeError(f"common_case_values.{section}.quantization_modes.explicit_only must be a boolean")
         specs.append(
             MoeQuantizationSpec(
                 name=str(raw_mode["name"]),
@@ -1140,6 +1144,7 @@ def get_moe_quantization_specs(backend: str | None = None) -> list[MoeQuantizati
                         field_name=f"{section}.quantization_modes.allowed_model_paths",
                     )
                 ),
+                explicit_only=explicit_only,
                 module_config=dict(module_config),
             )
         )
@@ -1151,8 +1156,8 @@ def moe_planned_modes(model_name: str, declared: Optional[tuple[str, ...]]) -> l
 
     ``declared`` is the row's ``quantization_modes`` (its checkpoint's
     quantization), or None for a row that declares none and so plans every
-    mode of the shared axis. A checkpoint-specific mode (one with
-    ``allowed_model_paths``) stays with the models that ship it.
+    inherited mode of the shared axis. An ``explicit_only`` mode requires a
+    row declaration, so checkpoint eligibility lives in the model rows.
     """
     specs = get_moe_quantization_specs()
     if declared is not None:
@@ -1161,6 +1166,8 @@ def moe_planned_modes(model_name: str, declared: Optional[tuple[str, ...]]) -> l
             raise ValueError(f"MoE row {model_name!r} declares quantization_modes {unknown} not in the shared axis")
     modes = []
     for spec in specs:
+        if declared is None and spec.explicit_only:
+            continue
         if declared is not None and spec.name not in declared:
             continue
         if spec.allowed_model_paths and model_name not in spec.allowed_model_paths:

@@ -51,7 +51,7 @@ from aisim.sdk.models import (
     resolve_vllm_moe_execution_mode,
 )
 from aisim.sdk.models.blocks.moe import LARGE_EP_READY_FAMILIES, MoEBlockShape
-from aisim.sdk.models.helpers import resolve_sglang_mla_compute, trtllm_mla_runs_fp8
+from aisim.sdk.models.helpers import record_inferred_quant_modes, resolve_sglang_mla_compute, trtllm_mla_runs_fp8
 from aisim.sdk.moe_comm_resolver import (
     a2a_covers_parallel,
     moe_compute_coverage,
@@ -205,6 +205,12 @@ _QUANT_ENUM_TABLES: dict[str, type] = {
     "comm_quant_mode": common.CommQuantMode,
 }
 
+# Task attribute holding each mode's per-role explicit flags (set by _resolve_quant_modes).
+_QUANT_EXPLICIT_BY_ROLE = {
+    "gemm_quant_mode": "_gemm_quant_mode_explicit_by_role",
+    "moe_quant_mode": "_moe_quant_mode_explicit_by_role",
+    "fmha_quant_mode": "_fmha_explicit",
+}
 _QUANT_FALLBACKS: dict[str, object] = {
     "gemm_quant_mode": common.GEMMQuantMode.bfloat16,
     "moe_quant_mode": common.MoEQuantMode.bfloat16,
@@ -645,6 +651,8 @@ class Task:
     # system / backend / MoE quant mode only, never on the candidate lists, so
     # it survives post-construction edits to those.
     _large_ep_coverage_cache: dict = field(default_factory=dict, repr=False, init=False)
+    # Snapshots distinguish generated candidates from caller assignments or in-place edits.
+    _auto_search_candidates: dict = field(default_factory=dict, repr=False, init=False)
 
     # =====================================================================
     # Construction
@@ -1008,21 +1016,10 @@ class Task:
         self._gemm_quant_mode_explicit_by_role = {
             role: self._role_attr(role, "gemm_quant_mode") is not None for role in roles
         }
+        self._moe_quant_mode_explicit_by_role = {
+            role: self._role_attr(role, "moe_quant_mode") is not None for role in roles
+        }
         base = _infer_quant_modes_from_raw_config(self._raw_config)
-
-        # GPT-OSS on Blackwell (trtllm): default MoE to w4a8_mxfp4_mxfp8 for higher
-        # tensor-core throughput, unless moe_quant_mode was set explicitly.  Applied
-        # before the resolution loop so the explicit-wins check below preserves it.
-        # (Mirrors the legacy V1 TaskConfigFactory gpt-oss-blackwell promotion; each
-        # disagg role is promoted independently based on its own system.)
-        for role in roles:
-            if (
-                self._role_attr(role, "moe_quant_mode") is None
-                and self._role_attr(role, "backend_name") == "trtllm"
-                and self._role_attr(role, "model_path") in _GPTOSS_BLACKWELL_MODELS
-                and is_blackwell_system(self._role_attr(role, "system_name"))
-            ):
-                self._set_role_attr(role, "moe_quant_mode", common.MoEQuantMode.w4a8_mxfp4_mxfp8)
 
         # Track whether fmha came from an explicit field (vs HF/fallback): the
         # data-driven fallback below must NOT fire on an EXPLICIT fp8 -- explicit
@@ -1042,32 +1039,7 @@ class Task:
                 # dedicated perf-DB quant mode. Acts at the HF-base layer so an
                 # explicit field still overrides it.
                 if key == "moe_quant_mode":
-                    arch_mode = resolve_dsv4_moe_arch_mode(
-                        self._role_attr(role, "model_path"),
-                        self._role_attr(role, "system_name"),
-                        self._role_attr(role, "backend_name"),
-                        self.moe_backend,
-                    )
-                    if arch_mode is None:
-                        arch_mode = resolve_kimi_k3_moe_arch_mode(
-                            self._role_attr(role, "model_path"),
-                            self._role_attr(role, "system_name"),
-                            self._role_attr(role, "backend_name"),
-                        )
-                    if arch_mode is not None:
-                        from_hf = arch_mode
-                    # HF-base-layer remap: vLLM executes W4A16_NVFP4-labeled
-                    # experts on the w4a4 nvfp4 lane (see the helper). Applied
-                    # to the HF-derived value only, so an explicit field still
-                    # overrides it — and validate fails fast on an explicit
-                    # w4a16_nvfp4, which vLLM has no data lane for.
-                    from_hf = resolve_vllm_moe_execution_mode(
-                        from_hf,
-                        self._role_attr(role, "backend_name"),
-                        self._raw_config.get("architectures", [None])[0]
-                        if isinstance(self._raw_config.get("architectures"), list)
-                        else self._raw_config.get("architecture"),
-                    )
+                    from_hf = self._infer_role_moe_quant_mode(role, base)
                 fallback = _QUANT_FALLBACKS[key]
 
                 if explicit is not None:
@@ -1079,7 +1051,37 @@ class Task:
         self._kvcache_explicit = kvcache_explicit
         self._fmha_from_data: dict[str, bool] = {}
 
-    def _apply_fmha_data_fallback(self) -> None:
+    def _infer_role_moe_quant_mode(self, role: str, base: dict | None = None) -> common.MoEQuantMode:
+        """Resolve an unset MoE mode identically at construction, clearing and coverage."""
+        model = self._role_attr(role, "model_path")
+        system = self._role_attr(role, "system_name")
+        backend = self._role_attr(role, "backend_name")
+        if backend == "trtllm" and model in _GPTOSS_BLACKWELL_MODELS and is_blackwell_system(system):
+            return common.MoEQuantMode.w4a8_mxfp4_mxfp8
+        mode = resolve_dsv4_moe_arch_mode(model, system, backend, self.moe_backend)
+        if mode is None:
+            mode = resolve_kimi_k3_moe_arch_mode(model, system, backend)
+        if mode is None:
+            if base is None:
+                base = _infer_quant_modes_from_raw_config(self._raw_config)
+            mode = base.get("moe_quant_mode")
+        mode = resolve_vllm_moe_execution_mode(
+            mode,
+            backend,
+            self._raw_config.get("architectures", [None])[0]
+            if isinstance(self._raw_config.get("architectures"), list)
+            else self._raw_config.get("architecture"),
+        )
+        return mode if mode is not None else _QUANT_FALLBACKS["moe_quant_mode"]
+
+    def _normalize_nvfp4_mode(self, role: str, key: str, value: Any) -> Any:
+        # Non-Blackwell runtimes dequantize NVFP4 weights before the MMA.
+        enum = _QUANT_ENUM_TABLES[key]
+        if value == enum.nvfp4 and not is_blackwell_system(self._role_attr(role, "system_name")):
+            return enum.nvfp4_wo
+        return value
+
+    def _apply_fmha_data_fallback(self, roles: list[str] | None = None) -> None:
         """Data-driven FMHA resolution (second half of quant resolution).
 
         Split out of ``_resolve_quant_modes`` because it consults the role's
@@ -1087,19 +1089,16 @@ class Task:
         tuple is large-EP -- i.e. on the search space, which is resolved in
         between (see ``__post_init__``).
         """
-        roles = ["agg"] if self.serving_mode == "agg" else ["prefill", "decode"]
+        if roles is None:
+            roles = ["agg"] if self.serving_mode == "agg" else ["prefill", "decode"]
         fmha_explicit = self._fmha_explicit
 
         # nvfp4 → nvfp4_wo on non-Blackwell: no native FP4 tensor cores, so all
         # runtimes dequantize to BF16 before the MMA. The transfer ladder models
         # the Marlin-class memory savings via the (0.5625, 1) util-level entry.
         for role in roles:
-            system = self._role_attr(role, "system_name")
-            if not is_blackwell_system(system):
-                if self._role_attr(role, "gemm_quant_mode") == common.GEMMQuantMode.nvfp4:
-                    self._set_role_attr(role, "gemm_quant_mode", common.GEMMQuantMode.nvfp4_wo)
-                if self._role_attr(role, "moe_quant_mode") == common.MoEQuantMode.nvfp4:
-                    self._set_role_attr(role, "moe_quant_mode", common.MoEQuantMode.nvfp4_wo)
+            for key in ("gemm_quant_mode", "moe_quant_mode"):
+                self._set_role_attr(role, key, self._normalize_nvfp4_mode(role, key, self._role_attr(role, key)))
 
         # TRT-LLM runs MLA attention in FP8 on an FP8 KV cache on SM90/100/103/120
         # (helpers.trtllm_mla_runs_fp8), so a bfloat16 FMHA there, explicit or not,
@@ -1294,6 +1293,12 @@ class Task:
         coverage: dict[str, dict[str, set[int]]] = {}
         if gpus_per_node and a2a_probe is not None:
             quant_mode = self._role_attr(role, "moe_quant_mode")
+            if quant_mode is None:
+                quant_mode = self._infer_role_moe_quant_mode(role)
+            if quant_mode == common.MoEQuantMode.nvfp4 and not is_blackwell_system(system_name):
+                # Probe the lane the Task runs: _apply_fmha_data_fallback, after the search
+                # space, resolves native NVFP4 to weight-only on non-Blackwell systems.
+                quant_mode = common.MoEQuantMode.nvfp4_wo
             enable_eplb = bool(self._role_attr(role, "enable_eplb"))
             if quant_mode is not None and not isinstance(quant_mode, common.MoEQuantMode):
                 # The compute table is keyed by MoEQuantMode members; any
@@ -1550,12 +1555,43 @@ class Task:
             for dim in ("num_gpu", "tp", "pp", "dp", "moe_tp", "moe_ep")
             if getattr(self, f"{role}_{dim}_candidates") is None
         }
+        if self.serving_mode == "disagg" or self.enable_epd:
+            defaulted.update(
+                name for name in ("max_gpu_per_replica", "num_gpu_per_replica") if getattr(self, name) is None
+            )
         if self.serving_mode == "agg":
             self._resolve_agg_search()
         else:
             self._resolve_disagg_search()
         self._apply_large_pipeline_parallel(defaulted)
         self._apply_total_gpus_budget()
+        object.__setattr__(
+            self, "_auto_search_candidates", {name: copy.copy(getattr(self, name)) for name in defaulted}
+        )
+
+    def _refresh_auto_search_space(self, role: str) -> None:
+        automatic = self._auto_search_candidates
+        prefix = f"{role}_"
+        affected = {
+            name
+            for name in automatic
+            if name.startswith(prefix) or name in ("max_gpu_per_replica", "num_gpu_per_replica")
+        }
+        reset = {name for name in affected if getattr(self, name) == automatic[name]}
+        if not reset:
+            return
+        # Keep the partner role and caller-edited lists. Clear tracking during internal
+        # resolution so its assignments cannot be mistaken for new caller restrictions.
+        remaining = {name: values for name, values in automatic.items() if name not in affected}
+        refreshed = copy.copy(self)
+        object.__setattr__(refreshed, "_auto_search_candidates", {})
+        for name in reset:
+            object.__setattr__(refreshed, name, None)
+        refreshed._resolve_search_space()
+        for name in reset:
+            object.__setattr__(self, name, getattr(refreshed, name))
+        object.__setattr__(self, "_large_ep_coverage_cache", refreshed._large_ep_coverage_cache)
+        object.__setattr__(self, "_auto_search_candidates", {**remaining, **refreshed._auto_search_candidates})
 
     def _large_pipeline_parallel_applies(self) -> bool:
         """v1 _large_pipeline_parallel_worker_defaults_apply: DeepSeek-V3.2/V4 MoE on
@@ -1813,7 +1849,53 @@ class Task:
         return getattr(self, name if role == "agg" else f"{role}_{name}")
 
     def _set_role_attr(self, role: str, name: str, value: Any) -> None:
-        setattr(self, name if role == "agg" else f"{role}_{name}", value)
+        # Internal resolution fills: not a caller choice, so not marked explicit.
+        object.__setattr__(self, name if role == "agg" else f"{role}_{name}", value)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # A caller assigning a GEMM, MoE or FMHA mode after resolution makes it explicit, so
+        # build_model_config, to_yaml and recommend rebuilds keep it.
+        automatic = self.__dict__.get("_auto_search_candidates", {})
+        if name in automatic:
+            object.__setattr__(self, "_auto_search_candidates", {k: v for k, v in automatic.items() if k != name})
+        role, _, key = name.partition("_") if name.startswith(("prefill_", "decode_")) else ("agg", "", name)
+        # Replace the maps instead of mutating them: a shallow copy of the Task shares them.
+        explicit_attr = _QUANT_EXPLICIT_BY_ROLE.get(key, "")
+        explicit_by_role = self.__dict__.get(explicit_attr)
+        resolved_role = explicit_by_role is not None and role in explicit_by_role
+        is_explicit = value is not None
+        if resolved_role and key == "moe_quant_mode" and value is None:
+            value = self._infer_role_moe_quant_mode(role)
+        if resolved_role and key in ("gemm_quant_mode", "moe_quant_mode"):
+            value = self._normalize_nvfp4_mode(role, key, value)
+        object.__setattr__(self, name, value)
+        if resolved_role:
+            object.__setattr__(self, explicit_attr, {**explicit_by_role, role: is_explicit})
+            if key == "fmha_quant_mode":
+                object.__setattr__(
+                    self, "_fmha_from_data", {r: v for r, v in self._fmha_from_data.items() if r != role}
+                )
+                if value is None:
+                    base = _infer_quant_modes_from_raw_config(self._raw_config)
+                    self._set_role_attr(role, key, base.get(key, _QUANT_FALLBACKS[key]))
+                    self._apply_fmha_data_fallback([role])
+        coverage_cache = self.__dict__.get("_large_ep_coverage_cache")
+        if key == "moe_quant_mode" and coverage_cache is not None:
+            # Large-EP coverage depends on the MoE mode.
+            object.__setattr__(self, "_large_ep_coverage_cache", {r: c for r, c in coverage_cache.items() if r != role})
+            if resolved_role and isinstance(value, common.MoEQuantMode):
+                self._refresh_auto_search_space(role)
+                if not self._fmha_explicit.get(role, False):
+                    # MoE coverage changes the reachable attention tables, even with
+                    # caller-pinned candidates. Resolve FMHA after refreshing them.
+                    base = _infer_quant_modes_from_raw_config(self._raw_config)
+                    self._set_role_attr(
+                        role, "fmha_quant_mode", base.get("fmha_quant_mode", _QUANT_FALLBACKS["fmha_quant_mode"])
+                    )
+                    object.__setattr__(
+                        self, "_fmha_from_data", {r: v for r, v in self._fmha_from_data.items() if r != role}
+                    )
+                    self._apply_fmha_data_fallback([role])
 
     # =====================================================================
     # Builders consumed by sweep.py
@@ -1914,6 +1996,8 @@ class Task:
         )
         model_config._gemm_quant_mode_is_explicit = self._gemm_quant_mode_explicit_by_role.get(role, False)
         model_config._fmha_quant_mode_from_data = self._fmha_from_data.get(role, False)
+        model_config._moe_quant_mode_is_explicit = self._moe_quant_mode_explicit_by_role.get(role, False)
+        record_inferred_quant_modes(model_config)
         if parallel is not None:
             required_phases = tuple(dict.fromkeys((*self._role_phases(role), *self._required_large_ep_phases(role))))
             resolve_model_config_moe_comm(
@@ -2450,20 +2534,33 @@ class Task:
             out[f.name] = value
         return out
 
+    def _inferred_quant_mode_resets(self) -> dict[str, None]:
+        """``{field: None}`` for each GEMM, MoE and FMHA mode that was inferred rather than set.
+
+        Rebuilding a task from its resolved fields would turn an inferred mode into an
+        explicit override and bypass checkpoint-specific per-layer precision; passing
+        these resets keeps it inferred.
+        """
+        return {
+            name if role == "agg" else f"{role}_{name}": None
+            for name, explicit_by_role in (
+                ("gemm_quant_mode", self._gemm_quant_mode_explicit_by_role),
+                ("moe_quant_mode", self._moe_quant_mode_explicit_by_role),
+                ("fmha_quant_mode", self._fmha_explicit),
+            )
+            for role, explicit in explicit_by_role.items()
+            if not explicit
+        }
+
     def to_yaml(self) -> str:
-        """Serialize public configuration, keeping inferred FMHA modes unset.
+        """Serialize public configuration, keeping inferred GEMM, MoE and FMHA modes unset.
 
         The result is round-trippable through :func:`from_yaml` (modulo
         None fields which are accepted by the constructor as defaults).
         """
         import yaml
 
-        values = self.to_dict()
-        for role, explicit in self._fmha_explicit.items():
-            if not explicit:
-                key = "fmha_quant_mode" if role == "agg" else f"{role}_fmha_quant_mode"
-                values[key] = None
-        return yaml.safe_dump(values, sort_keys=False)
+        return yaml.safe_dump({**self.to_dict(), **self._inferred_quant_mode_resets()}, sort_keys=False)
 
     # =====================================================================
     # sweep.py kwargs builders

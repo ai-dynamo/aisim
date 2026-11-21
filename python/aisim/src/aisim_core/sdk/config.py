@@ -89,6 +89,12 @@ class ModelConfig:
     # reachable context table has no fp8 slice; the runtime resolvers then leave it alone.
     _fmha_quant_mode_from_data: bool | None = field(default=None, repr=False, compare=False, kw_only=True)
     moe_quant_mode: common.MoEQuantMode | None = None
+    _moe_quant_mode_is_explicit: bool | None = field(default=None, repr=False, compare=False, kw_only=True)
+    # Inferred-mode provenance, carried through dataclasses.replace so topology-only replacements
+    # keep it: the mode a resolver (get_model, Task, legacy) filled. A different value is an override.
+    # Assigning a mode records it as explicit (see __setattr__).
+    _gemm_quant_mode_inferred: object = field(default=None, repr=False, compare=False, kw_only=True)
+    _moe_quant_mode_inferred: object = field(default=None, repr=False, compare=False, kw_only=True)
     kvcache_quant_mode: common.KVCacheQuantMode | None = None
     fmha_quant_mode: common.FMHAQuantMode | None = None
     comm_quant_mode: common.CommQuantMode | None = common.CommQuantMode.half
@@ -176,12 +182,41 @@ class ModelConfig:
     # Internal system identity used by phase/quantization-specific communication
     # dtype selection.  It travels with ModelConfig through sweep replacements.
     system: str | None = None
+    # Systems root that ``system`` resolves under (canonical API ``systems_paths``); None: ambient roots.
+    systems_path: str | None = field(default=None, kw_only=True)
     # DeepSeek-V4.1 text AR: use the backend-verified bounded decoder replay profile.
     decoder_replay: bool = False
     # Whole-forward database identity only; never changes arithmetic or memory.
     # Selection emits a warning with the original model mode and matched cell IDs.
     # Exact table-label matching is not independent runtime-precision proof.
     fpm_fmha_quant_mode: common.FMHAQuantMode | None = field(default=None, kw_only=True)
+
+    def __setattr__(self, name: str, value) -> None:
+        object.__setattr__(self, name, value)
+        if name in ("gemm_quant_mode", "moe_quant_mode"):
+            # An assignment states intent, even of the value a resolver filled; clearing it hands the
+            # mode back to inference. __init__ assigns the provenance fields after the modes, so
+            # construction and replace() keep their own.
+            object.__setattr__(self, f"_{name}_is_explicit", value is not None)
+            object.__setattr__(self, f"_{name}_inferred", None)
+
+    def _mark_quant_mode_inferred(self, kind: str) -> None:
+        """Record the current ``{kind}_quant_mode`` as resolver-filled (inferred), not caller-chosen."""
+        object.__setattr__(self, f"_{kind}_quant_mode_inferred", getattr(self, f"{kind}_quant_mode"))
+        object.__setattr__(self, f"_{kind}_quant_mode_is_explicit", False)
+
+    def _quant_mode_is_explicit(self, kind: str) -> bool:
+        """Whether the caller chose ``{kind}_quant_mode`` rather than a resolver filling it."""
+        mode = getattr(self, f"{kind}_quant_mode")
+        flag = getattr(self, f"_{kind}_quant_mode_is_explicit")
+        if mode is None or flag is True:
+            return mode is not None
+        inferred = getattr(self, f"_{kind}_quant_mode_inferred")
+        if inferred is not None:
+            # shortcut: a replace() setting the value already inferred reads as inferred; assign it instead.
+            return mode != inferred
+        # Legacy rule: without provenance a set mode is explicit, unless a resolver flagged it inferred.
+        return flag is not False
 
     def __post_init__(self) -> None:
         validate_parallel_size("cp_size", self.cp_size)

@@ -36,6 +36,33 @@ def _planned_moe_modes(monkeypatch, backend: str, model_path: str, sm_version: i
     return {case.moe_type for case in plan("moe", backend, sm_version).cases if case.model_name == model_path}
 
 
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None, [], {}])
+def test_moe_explicit_only_rejects_non_boolean_values(monkeypatch, value):
+    from collector import case_generator
+
+    monkeypatch.setattr(
+        case_generator,
+        "_required_base_common_case_values",
+        lambda _op: {"quantization_modes": [{"name": "bfloat16", "explicit_only": value}]},
+    )
+    with pytest.raises(TypeError, match=r"moe\.quantization_modes\.explicit_only must be a boolean"):
+        get_moe_quantization_specs()
+
+
+@pytest.mark.parametrize("field", [{}, {"explicit_only": False}, {"explicit_only": True}])
+def test_moe_explicit_only_controls_inherited_and_declared_modes(monkeypatch, field):
+    from collector import case_generator
+
+    monkeypatch.setattr(
+        case_generator,
+        "_required_base_common_case_values",
+        lambda _op: {"quantization_modes": [{"name": "bfloat16", **field}]},
+    )
+    assert get_moe_quantization_specs()[0].explicit_only is field.get("explicit_only", False)
+    assert case_generator.moe_planned_modes("test/model", None) == ([] if field.get("explicit_only") else ["bfloat16"])
+    assert case_generator.moe_planned_modes("test/model", ("bfloat16",)) == ["bfloat16"]
+
+
 def test_model_case_plan_merges_required_base_and_framework_specific_ops():
     plan = build_collection_case_plan(backend="sglang", model_path="deepseek-ai/DeepSeek-V3")
 
@@ -199,22 +226,32 @@ def test_nvfp4_quant_artifacts_have_exact_moe_profiles_and_lanes(monkeypatch, mo
 
 
 @pytest.mark.parametrize("backend", ["sglang", "trtllm", "vllm"])
-def test_qwen36_w4a16_nvfp4_moe_is_transferred_but_explicitly_deferred(monkeypatch, caplog, backend):
-    from collector.case_generator import get_common_moe_test_cases
-    from collector.op_plans import plan_cases
-
-    model_path = "nvidia/Qwen3.6-35B-A3B-NVFP4"
-    monkeypatch.setenv("COLLECTOR_MODEL_PATH", model_path)
-
+@pytest.mark.parametrize(
+    ("model_path", "modes"),
+    [
+        ("nvidia/Qwen3.6-35B-A3B-NVFP4", set()),
+        ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4", {"nvfp4"}),
+    ],
+)
+def test_w4a16_nvfp4_moe_is_collected_on_vllm_only(monkeypatch, backend, model_path, modes):
     assert "moe" in build_collection_case_plan(backend=backend, model_path=model_path).selected_ops
-    transferred_shapes = get_common_moe_test_cases()
-    assert transferred_shapes
-    assert {case.model_name for case in transferred_shapes} == {model_path}
-    assert "w4a16_nvfp4" not in {spec.name for spec in get_moe_quantization_specs()}
+    # SGLang and TRT-LLM have no w4a16_nvfp4 MoE path, and vLLM times these
+    # W4A16_NVFP4 checkpoints only on that lane (collector/skips.py).
+    expected = {"w4a16_nvfp4"} if backend == "vllm" else modes
+    assert _planned_moe_modes(monkeypatch, backend, model_path, 100) == expected
 
-    with caplog.at_level("INFO", logger="collector.op_plans"):
-        assert plan_cases("moe", backend, 100) == []
-    assert f"plan no case (quantization_modes: []): {model_path}" in caplog.text
+
+def test_w4a16_nvfp4_is_opted_into_by_the_model_row():
+    from collector.case_generator import moe_planned_modes
+
+    # A third checkpoint needs only a model-row declaration, never a second
+    # base-op allowlist entry. Undeclared rows keep their inherited modes.
+    model = "test/third-w4a16-checkpoint"
+    assert moe_planned_modes(model, ("w4a16_nvfp4",)) == ["w4a16_nvfp4"]
+    assert moe_planned_modes(model, ("fp8",)) == ["fp8"]
+    assert moe_planned_modes(model, None) == ["bfloat16", "fp8", "fp8_block", "nvfp4"]
+    with pytest.raises(ValueError, match="not in the shared axis"):
+        moe_planned_modes(model, ("unknown",))
 
 
 @pytest.mark.parametrize(
@@ -758,13 +795,14 @@ def test_gemm_common_cases_expand_from_base_op_yaml_shape_specs():
     # its other shared-expert projections overlap the existing base shapes.
     # GLM-5.3-Flash adds ten new off-grid output widths at k=4096 (its
     # declared widths minus those another model already declares) across the
-    # 74 standard / 21 XPU token counts.
-    assert len(cases) == 38258
+    # 74 standard / 21 XPU token counts. Nemotron-3.5-Lightning adds its six
+    # off-grid shared-expert shapes across the 74 standard / 21 XPU token counts.
+    assert len(cases) == 38702
     assert cases[0] == GemmCommonTestCase(x=32768, n=65536, k=51200)
     assert cases[-1] == GemmCommonTestCase(x=1, n=1, k=4096)
     assert not any(case.n == 65536 and case.k == 65536 for case in cases)
 
-    assert len(xpu_cases) == 10857
+    assert len(xpu_cases) == 10983
     assert xpu_cases[0] == GemmCommonTestCase(x=8192, n=65536, k=32768)
     assert xpu_cases[-1] == GemmCommonTestCase(x=1, n=1, k=4096)
     assert get_gemm_type_specs("vllm_xpu") == ["bfloat16", "fp8"]
@@ -773,6 +811,9 @@ def test_gemm_common_cases_expand_from_base_op_yaml_shape_specs():
         keys = {(case.x, case.n, case.k) for case in backend_cases}
         assert len(keys) == len(backend_cases)
         assert {x for x, n, k in keys if (n, k) == (7168, 384)} == {x for x, _, _ in keys}
+        # Nemotron-3.5-Lightning's six shared-expert shapes, at every token count.
+        for shape in [*((n, 2688) for n in (3712, 928, 464)), *((2688, k) for k in (3712, 928, 464))]:
+            assert {x for x, n, k in keys if (n, k) == shape} == {x for x, _, _ in keys}, shape
 
     compute_scale_cases = get_compute_scale_case_specs()
     assert len(compute_scale_cases) == 1628
@@ -1002,6 +1043,7 @@ def test_vllm_moe_quantization_metadata_is_yaml_backed():
         "fp8_block",
         "int4_wo",
         "nvfp4",
+        "w4a16_nvfp4",
         "w4a16_mxfp4",
         "w4a8_mxfp4_mxfp8",
     ]

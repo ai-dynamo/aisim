@@ -152,11 +152,18 @@ shared quant-mode axis is `common_case_values.moe.quantization_modes`; a mode
 may keep a checkpoint-specific format to the models that ship it
 (`allowed_model_paths`) and carry a `module_config`. A model row declares its
 checkpoint's modes in `quantization_modes`, the same for every backend; a row
-that declares none plans every mode. Quant-sensitive checkpoint artifacts use
+that declares none inherits the shared modes except those marked `explicit_only`.
+Such a mode (for example `w4a16_nvfp4`) is planned only when a model row lists
+it in `quantization_modes`; adding a checkpoint requires no base-op allowlist.
+Quant-sensitive checkpoint artifacts use
 separate model rows even when all geometry fields are identical.
 `framework_quantization.<backend>` holds only a backend's `module_config` (and
 vllm_xpu's own policy). A mode an SM or one backend cannot run is an entry in
 `collector/skips.py`.
+
+| Field in `common_case_values.moe.quantization_modes[]` | Meaning |
+| --- | --- |
+| `explicit_only` | Boolean, default `false`. Require an explicit model-row `quantization_modes` declaration instead of inheriting this mode. |
 
 Artifact-keyed vLLM MoE rows also require a checked-in
 `src/aisim_core/model_configs/<org>--<model>_config.json`. The collector

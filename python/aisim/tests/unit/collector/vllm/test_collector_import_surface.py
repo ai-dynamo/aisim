@@ -297,6 +297,8 @@ _GEMM_SURFACE = {
     "vllm.version": {"__version__": "0.0.0"},
     "vllm._custom_ops": {"scaled_fp4_quant": _dummy},
     "vllm.config": {"VllmConfig": _Dummy, "set_current_vllm_config": _null_context},
+    "vllm.model_executor.kernels.linear": {"init_nvfp4_linear_kernel": _dummy},
+    "vllm.model_executor.kernels.linear.nvfp4.marlin": {"MarlinNvFp4LinearKernel": _Dummy},
     "vllm.model_executor.kernels.linear.scaled_mm.flashinfer": {
         "FlashInferFp8DeepGEMMDynamicBlockScaledKernel": _Dummy
     },
@@ -305,6 +307,13 @@ _GEMM_SURFACE = {
         "CompressedTensorsConfig": _Dummy
     },
     "vllm.model_executor.layers.quantization.fp8": {"Fp8Config": _Dummy},
+    "vllm.model_executor.layers.quantization.modelopt": {"ModelOptMixedPrecisionConfig": _Dummy},
+    "vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils": {"ref_nvfp4_quant": _dummy},
+    "vllm.model_executor.layers.quantization.utils.marlin_utils": {
+        "MARLIN_MAX_BLOCKS_PER_SM": 4,
+        "USE_FP32_REDUCE_DEFAULT": True,
+        "marlin_padded_nk": _dummy,
+    },
     "vllm.utils.deep_gemm": {"per_block_cast_to_fp8": _dummy},
 }
 
@@ -327,6 +336,17 @@ class TestCollectGemmImportSurface:
     def test_imports_cleanly_against_0271_shaped_vllm(self, monkeypatch):
         _install_fake_vllm(monkeypatch, _GEMM_SURFACE)
         _import_fresh(monkeypatch, _COLLECT_GEMM_DOTTED, _COLLECT_GEMM_PATH)
+
+    @pytest.mark.parametrize("sm", [80, 90, 100])
+    def test_w4a16_nvfp4_lane_covers_the_lightning_shared_experts(self, monkeypatch, sm):
+        _install_fake_vllm(monkeypatch, _GEMM_SURFACE)
+        module = _import_fresh(monkeypatch, _COLLECT_GEMM_DOTTED, _COLLECT_GEMM_PATH)
+        monkeypatch.setattr(module, "get_sm_version", lambda: sm)
+        cases = [case for case in module.get_gemm_test_cases() if case[0] == "w4a16_nvfp4"]
+
+        sites = {(n, k) for _, _, n, k in cases}
+        assert {(3712, 2688), (2688, 3712), (928, 2688), (2688, 928), (464, 2688), (2688, 464)} <= sites
+        assert len(cases) == len({tuple(case) for case in cases})
 
 
 # ---------------------------------------------------------------------------

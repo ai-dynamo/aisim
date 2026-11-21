@@ -31,12 +31,18 @@ def _get_afd_model_info(model_path: str) -> dict:
 def _resolve_afd_execution_quantization(model_config, model_path, system_spec, *, backend_name=None):
     """Use the selected pool's hardware policy for timing and memory compilation."""
     from aisim_core._native import resolve_execution_quantization
-    from aisim_core.sdk.models.helpers import _infer_quant_modes_from_raw_config, resolve_vllm_moe_execution_mode
+    from aisim_core.sdk.models.helpers import (
+        _infer_quant_modes_from_raw_config,
+        _inferred_quant_kinds,
+        record_inferred_quant_modes,
+        resolve_vllm_moe_execution_mode,
+    )
 
     for field in ("gemm", "moe"):
         marker = f"_{field}_quant_mode_is_explicit"
         if getattr(model_config, marker, None) is None:
             setattr(model_config, marker, getattr(model_config, f"{field}_quant_mode") is not None)
+    inferred_kinds = _inferred_quant_kinds(model_config)
 
     gemm_q = model_config.gemm_quant_mode
     moe_q = model_config.moe_quant_mode
@@ -59,6 +65,7 @@ def _resolve_afd_execution_quantization(model_config, model_path, system_spec, *
         model_config.gemm_quant_mode = common.GEMMQuantMode[resolved_gemm]
     if resolved_moe is not None:
         model_config.moe_quant_mode = common.MoEQuantMode[resolved_moe]
+    record_inferred_quant_modes(model_config, inferred_kinds)
 
 
 class _OpKind(Enum):

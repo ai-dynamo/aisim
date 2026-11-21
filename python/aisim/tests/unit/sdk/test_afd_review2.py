@@ -3,6 +3,7 @@
 
 """AFD-specific policy must not change ordinary model construction."""
 
+import dataclasses
 from copy import deepcopy
 
 import pytest
@@ -48,6 +49,15 @@ def test_ordinary_and_afd_nvfp4_mapping_agree_on_supported_hardware(system, expe
     _resolve_afd_execution_quantization(afd, None, load_system_spec(system))
     assert ordinary.gemm_quant_mode.name == afd.gemm_quant_mode.name == expected
     assert ordinary.moe_quant_mode.name == afd.moe_quant_mode.name == expected
+
+
+def test_afd_keeps_a_replaced_inferred_mode_explicit():
+    inferred = ModelConfig(gemm_quant_mode=common.GEMMQuantMode.fp8, moe_quant_mode=common.MoEQuantMode.fp8)
+    inferred._mark_quant_mode_inferred("gemm")
+    override = dataclasses.replace(inferred, gemm_quant_mode=common.GEMMQuantMode.fp8_block)
+    assert override._quant_mode_is_explicit("gemm")
+    _resolve_afd_execution_quantization(override, None, load_system_spec("b200_sxm"))
+    assert override._quant_mode_is_explicit("gemm")
 
 
 def test_strict_capability_rejection_is_afd_only():

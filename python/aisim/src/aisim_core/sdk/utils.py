@@ -78,16 +78,10 @@ def _load_json_with_infinity(file_path) -> dict:
     Load JSON file with support for JavaScript-style Infinity and NaN values.
 
     Standard JSON doesn't support Infinity/NaN, but HuggingFace configs may contain them (e.g., Nemotron-H-56B)
-    This function pre-processes the file content to replace these values before parsing.
+    Bare Infinity, -Infinity and NaN tokens load as None; quoted strings stay unchanged.
     """
     with open(file_path) as f:
-        content = f.read()
-    # Replace JavaScript-style Infinity/NaN with Python-compatible values
-    # Use regex to match standalone Infinity/-Infinity/NaN (not part of a string)
-    content = re.sub(r"\bInfinity\b", "null", content)
-    content = re.sub(r"-Infinity\b", "null", content)
-    content = re.sub(r"\bNaN\b", "null", content)
-    return json.loads(content)
+        return json.load(f, parse_constant=lambda _constant: None)
 
 
 def _derive_nemotronh_hybrid_pattern(config: dict) -> str:
