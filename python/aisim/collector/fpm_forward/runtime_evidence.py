@@ -9,10 +9,10 @@ The import runs them after every older check of a phase, so an older refusal kee
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
-from .runtime.fpm_memory_observer import _UNIFORM_SPEC
+from .runtime.fpm_memory_observer import _MAMBA_SPEC, _UNIFORM_SPEC
 from .runtime_instrumentation import canonical_json
 
 
@@ -34,6 +34,15 @@ def validate_phase(
         _check_layer_specs(record)
     for _, worker in sorted(workers.items()):
         _check_audited_sources(worker, source_files)
+    for _, record in (*sorted(schedulers.items()), *sorted(workers.items())):
+        _check_raw_cache_config(
+            record,
+            [record]
+            if record["kind"] == "worker"
+            else [worker for (rank, _), worker in sorted(workers.items()) if rank == record["dp_rank"]],
+        )
+    for _, record in (*sorted(schedulers.items()), *sorted(workers.items())):
+        _check_mamba_pages(record)
 
 
 # hf_overrides is a launch argument with the default {} (vLLM 0.33.0 config/model.py:348, engine/arg_utils.py:1035),
@@ -144,3 +153,100 @@ def _check_layer_specs(record: dict[str, Any]) -> None:
             canonical_json(spec.get("dtype")) != canonical_json(group.get("dtype")) for spec in specs
         ):
             raise ValueError(f"cache group layer specs contradict its group spec: {group['layer_names']}")
+
+
+_MAMBA_STATE_FIELDS = (
+    "mamba_cache_mode",
+    "num_speculative_blocks",
+    "num_prefill_checkpoint_blocks",
+    "prefill_checkpoint_alignment",
+    "shapes",
+    "dtypes",
+)
+
+
+# The observer writes both blocks from the one KVCacheConfig of the process, in one call and with one serializer
+# (runtime/instrumentation/observer.py, observe and _raw_cache; runtime/fpm_memory_observer.py, cache_groups,
+# _layer_strided_allocations and _json_value). A raw group holds a spec field only when the spec has it: a ring holds
+# no sliding_window, attention_chunk_size or cache_role, which the cache record gives as None. The raw block of a
+# scheduler holds the tensor allocations, which its cache record does not: vLLM builds the scheduler configuration as
+# a deep copy of the first worker's (vLLM 0.33.0 v1/core/kv_cache_utils.py:1109-1117), and every worker of an engine
+# core is planned from the groups of the whole model with the smallest block count (v1/core/kv_cache_planning.py:
+# 1505-1508, :1583-1595), one spec for each layer in all workers (:1620-1628). The raw fields that the cache record
+# does not hold (kv_cache_layout; head_size, num_kv_heads, kv_quant_mode; the padded page of a group that is no
+# MambaSpec) are not compared.
+def _check_raw_cache_config(record: dict[str, Any], workers: Sequence[dict[str, Any]]) -> None:
+    def refuse(what: str) -> ValueError:
+        return ValueError(f"raw cache configuration contradicts the cache record: {what}")
+
+    raw, cache = record.get("raw_cache_config"), record["cache"]
+    if not isinstance(raw, dict):
+        raise refuse("missing")
+    if "num_blocks" not in raw or canonical_json(raw["num_blocks"]) != canonical_json(cache["num_blocks"]):
+        raise refuse("num_blocks")
+    groups = raw.get("groups")
+    if not isinstance(groups, list) or len(groups) != len(cache["groups"]):
+        raise refuse("group count")
+    for index, (entry, group) in enumerate(zip(groups, cache["groups"], strict=True)):
+        if not isinstance(entry, dict):
+            raise refuse(f"group {index} layer_names")
+        for field, value in (
+            ("layer_names", group["layer_names"]),
+            ("spec_type", group["spec_type"]),
+            ("block_size", group["block_size_tokens"]),
+            ("page_size_bytes", group["spec_page_size_bytes"]),
+        ):
+            if field not in entry or canonical_json(entry[field]) != canonical_json(value):
+                raise refuse(f"group {index} {field}")
+        if group["spec_type"] == _UNIFORM_SPEC:
+            continue
+        first = group["layer_specs"][group["layer_names"][0]]
+        expected: list[tuple[str, Any]] = [(field, first.get(field)) for field in ("tokens_per_state", "cache_role")]
+        if group["spec_type"] != _MAMBA_SPEC:
+            expected += [(field, group.get(field)) for field in ("dtype", "sliding_window", "attention_chunk_size")]
+        for field, value in expected:
+            if canonical_json(entry.get(field)) != canonical_json(value):
+                raise refuse(f"group {index} {field}")
+        if group["spec_type"] == _MAMBA_SPEC:
+            state = group.get("state")
+            for field in _MAMBA_STATE_FIELDS:
+                if (
+                    field not in entry
+                    or not isinstance(state, dict)
+                    or field not in state
+                    or canonical_json(entry[field]) != canonical_json(state[field])
+                ):
+                    raise refuse(f"group {index} {field}")
+    allocations = raw.get("tensor_allocations")
+    if not isinstance(allocations, list) or any(
+        canonical_json(allocations)
+        != canonical_json(
+            [
+                {key: value for key, value in item.items() if key != "storage_id"}
+                for item in worker["cache"]["tensor_allocations"]
+            ]
+        )
+        for worker in workers
+    ):
+        raise refuse("tensor_allocations")
+
+
+# MambaSpec.page_size_bytes is page_size_padded when it is set, else the bytes of the state tensors (vLLM 0.33.0
+# v1/kv_cache_interface.py:1116-1129); the padded size comes from the cache configuration
+# (model_executor/layers/mamba/abstract.py:75-80). A uniform group holds a Mamba layer only beside specs that the first
+# MambaSpec accepts, each with its page (kv_cache_interface.py:1155-1166, :1347-1361), and the import refuses a group
+# that mixes a MambaSpec with another class. _check_raw_cache_config has passed the raw groups.
+def _check_mamba_pages(record: dict[str, Any]) -> None:
+    for group, entry in zip(record["cache"]["groups"], record["raw_cache_config"]["groups"], strict=True):
+        if group["spec_type"] == _MAMBA_SPEC:
+            padded = entry.get("page_size_padded", entry)
+            state = group.get("state")
+            page = state.get("real_page_size_bytes") if padded is None and isinstance(state, dict) else padded
+            if type(page) is not int or page != group["spec_page_size_bytes"]:
+                raise ValueError(f"Mamba group page contradicts its padded page: {group['layer_names']}")
+        specs = list(group["layer_specs"].values())
+        if any(spec.get("spec_type") == _MAMBA_SPEC for spec in specs) and any(
+            canonical_json(spec.get("page_size_bytes")) != canonical_json(specs[0].get("page_size_bytes"))
+            for spec in specs
+        ):
+            raise ValueError(f"Mamba layers of one cache group disagree on their page: {group['layer_names']}")

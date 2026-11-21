@@ -3765,6 +3765,383 @@ def test_v033_import_requires_audited_runner_and_backends(tmp_path, phase, layou
     assert (result["status"], result["diagnostics"]) == ("incomplete", [f"tp2: {diagnostic}"])
 
 
+_RAW = "raw cache configuration contradicts the cache record: "
+_MAMBA = _V033_SPEC + "MambaSpec"
+
+
+def _raw_edit(what):
+    def edit(raw):
+        groups = raw.get("groups")
+        if what == "num_blocks":
+            raw["num_blocks"] += 1
+        elif what == "group count":
+            groups.pop()
+        elif what == "group 0 layer_names":
+            groups[0]["layer_names"] = groups[0]["layer_names"][::-1]
+        elif what == "group 5 spec_type":
+            groups[5]["spec_type"] = _MAMBA
+        elif what == "group 4 block_size":
+            groups[4]["block_size"] = 16
+        elif what == "group 4 page_size_bytes":
+            groups[4]["page_size_bytes"] += 1
+        elif what == "group 4 tokens_per_state":
+            groups[4]["tokens_per_state"] = 1
+        elif what == "group 4 cache_role":
+            groups[4]["cache_role"] = "SPARSE"
+        elif what == "group 5 dtype":
+            groups[5]["dtype"] = "torch.float16"
+        elif what == "group 4 sliding_window":
+            groups[4]["sliding_window"] = 64
+        elif what == "group 4 attention_chunk_size":
+            groups[4]["attention_chunk_size"] = 64
+        elif what == "group 0 num_prefill_checkpoint_blocks":
+            groups[0]["num_prefill_checkpoint_blocks"] = 0
+        elif what == "tensor_allocations":
+            raw["tensor_allocations"][0]["offset"] += 4096
+
+    return edit
+
+
+@pytest.mark.parametrize(
+    "kind,what",
+    [
+        ("worker", "num_blocks"),
+        ("scheduler", "num_blocks"),
+        ("worker", "group count"),
+        ("worker", "group 0 layer_names"),
+        ("worker", "group 5 spec_type"),
+        ("scheduler", "group 4 block_size"),
+        ("worker", "group 4 page_size_bytes"),
+        # The scheduler groups of glm_tp4 are plain: 0 to 3 MambaSpec, 4 the indexer spec of the MLA group, 5 the ring.
+        ("scheduler", "group 4 tokens_per_state"),
+        ("scheduler", "group 4 cache_role"),
+        ("scheduler", "group 5 dtype"),
+        ("scheduler", "group 4 sliding_window"),
+        ("scheduler", "group 4 attention_chunk_size"),
+        ("scheduler", "group 0 num_prefill_checkpoint_blocks"),
+        ("worker", "tensor_allocations"),
+        # The scheduler block holds the list of its workers, and its cache record holds none.
+        ("scheduler", "tensor_allocations"),
+        ("worker", "missing"),
+        ("scheduler", "missing"),
+        ("worker", "not an object"),
+    ],
+)
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_v033_raw_cache_config_must_match_the_cache_record(tmp_path, phase, kind, what):
+    path, launches = observation_fixture(tmp_path, layout="glm_tp4")
+
+    def edit(record):
+        if (record["kind"], record["phase"]) != (kind, phase):
+            return
+        if what == "missing":
+            del record["raw_cache_config"]
+        elif what == "not an object":
+            record["raw_cache_config"] = [record["raw_cache_config"]]
+        else:
+            _raw_edit(what)(record["raw_cache_config"])
+
+    _mutate(path, edit, derive=False)
+    result = validate_observations(path, launches)["tp2"]
+    expected = "missing" if what == "not an object" else what
+    assert (result["status"], result["diagnostics"]) == ("incomplete", [f"tp2: {_RAW}{expected}"])
+
+
+@pytest.mark.parametrize(
+    "layout,kind,case,what",
+    [
+        # A value of another JSON type that Python compares equal, a missing key and an empty value of each type.
+        ("glm_tp4", "scheduler", "num_blocks_float", "num_blocks"),
+        ("glm_tp4", "worker", "num_blocks_missing", "num_blocks"),
+        ("glm_tp4", "worker", "groups_missing", "group count"),
+        ("glm_tp4", "worker", "groups_object", "group count"),
+        ("glm_tp4", "worker", "groups_empty", "group count"),
+        ("glm_tp4", "worker", "group_not_an_object", "group 0 layer_names"),
+        ("glm_tp4", "worker", "group_empty", "group 0 layer_names"),
+        ("glm_tp4", "worker", "group_number", "group 0 layer_names"),
+        ("glm_tp4", "scheduler", "block_size_float", "group 4 block_size"),
+        ("glm_tp4", "scheduler", "ring_tokens_per_state_true", "group 5 tokens_per_state"),
+        ("glm_tp4", "scheduler", "tokens_per_state_missing", "group 4 tokens_per_state"),
+        ("glm_tp4", "scheduler", "dtype_missing", "group 4 dtype"),
+        ("glm_tp4", "scheduler", "dtypes_reversed", "group 0 dtypes"),
+        ("glm_tp4", "scheduler", "shapes_reversed", "group 0 shapes"),
+        ("glm_tp4", "scheduler", "speculative_false", "group 0 num_speculative_blocks"),
+        ("glm_tp4", "scheduler", "mode_missing", "group 0 mamba_cache_mode"),
+        ("glm_tp4", "worker", "allocations_missing", "tensor_allocations"),
+        ("glm_tp4", "worker", "allocations_object", "tensor_allocations"),
+        ("glm_tp4", "worker", "allocations_empty", "tensor_allocations"),
+        ("glm_tp4", "scheduler", "allocations_reversed", "tensor_allocations"),
+        ("glm_tp4", "worker", "allocation_storage_id", "tensor_allocations"),
+        # The groups of a mamba_hybrid worker are plain: 0 FullAttentionSpec, 1 and 2 MambaSpec without a checkpoint.
+        ("mamba_hybrid", "worker", "attention_dtype", "group 0 dtype"),
+        ("mamba_hybrid", "worker", "attention_sliding_window", "group 0 sliding_window"),
+        ("mamba_hybrid", "worker", "attention_tokens_per_state", "group 0 tokens_per_state"),
+        ("mamba_hybrid", "worker", "attention_cache_role", "group 0 cache_role"),
+        ("mamba_hybrid", "worker", "mamba_cache_role", "group 1 cache_role"),
+        # The alignment of the state is None, so the key must be there: a missing key is no None.
+        ("mamba_hybrid", "worker", "alignment_missing", "group 1 prefill_checkpoint_alignment"),
+        ("mamba_hybrid", "worker", "alignment_zero", "group 2 prefill_checkpoint_alignment"),
+        ("mamba_hybrid", "scheduler", "alignment_missing", "group 1 prefill_checkpoint_alignment"),
+    ],
+)
+def test_v033_raw_cache_config_refuses_each_malformed_value(tmp_path, layout, kind, case, what):
+    path, launches = observation_fixture(tmp_path, layout=layout)
+
+    def edit(record):
+        if (record["kind"], record["phase"], record["dp_rank"]) != (kind, "decode", 1):
+            return
+        raw = record["raw_cache_config"]
+        groups = raw["groups"]
+        if case == "num_blocks_float":
+            raw["num_blocks"] = float(raw["num_blocks"])
+        elif case == "num_blocks_missing":
+            del raw["num_blocks"]
+        elif case == "groups_missing":
+            del raw["groups"]
+        elif case == "groups_object":
+            raw["groups"] = {}
+        elif case == "groups_empty":
+            raw["groups"] = []
+        elif case == "group_not_an_object":
+            groups[0] = "group"
+        elif case == "group_empty":
+            groups[0] = {}
+        elif case == "group_number":
+            groups[0] = 7
+        elif case == "block_size_float":
+            groups[4]["block_size"] = float(groups[4]["block_size"])
+        elif case == "ring_tokens_per_state_true":
+            assert groups[5]["tokens_per_state"] == 1
+            groups[5]["tokens_per_state"] = True
+        elif case == "tokens_per_state_missing":
+            del groups[4]["tokens_per_state"]
+        elif case == "dtype_missing":
+            del groups[4]["dtype"]
+        elif case == "dtypes_reversed":
+            groups[0]["dtypes"] = groups[0]["dtypes"][::-1]
+        elif case == "shapes_reversed":
+            groups[0]["shapes"] = groups[0]["shapes"][::-1]
+        elif case == "speculative_false":
+            assert groups[0]["num_speculative_blocks"] == 0
+            groups[0]["num_speculative_blocks"] = False
+        elif case == "mode_missing":
+            del groups[0]["mamba_cache_mode"]
+        elif case == "allocations_missing":
+            del raw["tensor_allocations"]
+        elif case == "allocations_object":
+            raw["tensor_allocations"] = {}
+        elif case == "allocations_empty":
+            raw["tensor_allocations"] = []
+        elif case == "allocations_reversed":
+            raw["tensor_allocations"] = raw["tensor_allocations"][::-1]
+        elif case == "allocation_storage_id":
+            raw["tensor_allocations"][0]["storage_id"] = record["cache"]["tensor_allocations"][0]["storage_id"]
+        elif case == "attention_dtype":
+            groups[0]["dtype"] = "torch.float16"
+        elif case == "attention_sliding_window":
+            groups[0]["sliding_window"] = 64
+        elif case == "attention_tokens_per_state":
+            groups[0]["tokens_per_state"] = 2
+        elif case == "attention_cache_role":
+            groups[0]["cache_role"] = "SPARSE"
+        elif case == "mamba_cache_role":
+            groups[1]["cache_role"] = "SPARSE"
+        elif case == "alignment_missing":
+            assert groups[1]["prefill_checkpoint_alignment"] is None
+            del groups[1]["prefill_checkpoint_alignment"]
+        elif case == "alignment_zero":
+            groups[2]["prefill_checkpoint_alignment"] = 0
+
+    _mutate(path, edit, derive=False)
+    result = validate_observations(path, launches)["tp2"]
+    assert (result["status"], result["diagnostics"]) == ("incomplete", [f"tp2: {_RAW}{what}"])
+
+
+def _reorder_allocations(record):
+    """Reverse the tensor allocations of a worker cache and its views keep their bytes: no older check reads order."""
+    record["cache"]["tensor_allocations"].reverse()
+
+
+def test_v033_raw_cache_config_of_a_scheduler_follows_the_workers_of_its_own_rank_and_phase(tmp_path):
+    # Only the workers of DP rank 1 in decode hold their allocations in another order. Their scheduler takes the list
+    # of its first worker, and every other scheduler keeps the list of its own workers.
+    path, launches = observation_fixture(tmp_path, layout="glm_tp4")
+
+    def edit(record):
+        if (record["kind"], record["phase"], record["dp_rank"]) == ("worker", "decode", 1):
+            _reorder_allocations(record)
+
+    _mutate(path, edit)
+    records = []
+    _mutate(path, records.append, derive=False)
+    lists = {
+        (record["phase"], record["dp_rank"], record["kind"]): canonical
+        for record in records
+        for canonical in [json.dumps(record["raw_cache_config"]["tensor_allocations"])]
+    }
+    assert lists[("decode", 1, "scheduler")] == lists[("decode", 1, "worker")]
+    assert lists[("decode", 1, "scheduler")] != lists[("decode", 0, "scheduler")]
+    assert lists[("decode", 0, "scheduler")] == lists[("prefill", 1, "scheduler")] == lists[("prefill", 0, "worker")]
+    result = validate_observations(path, launches)["tp2"]
+    assert (result["status"], result["diagnostics"]) == ("complete", [])
+
+
+@pytest.mark.parametrize("change", ["reordered", "moved"])
+def test_v033_raw_cache_config_of_a_scheduler_must_match_each_worker_of_its_rank(tmp_path, change):
+    # The second worker of DP rank 1 holds its allocations in another order, or one Mamba group 4,096 bytes further in
+    # the second worker of every rank, and its own raw block follows it. The scheduler holds the list of the first
+    # worker, which vLLM gives every worker of an engine core.
+    path, launches = observation_fixture(tmp_path, layout="glm_tp4")
+    move = _shift_group(3, tp=1)
+
+    def edit(record):
+        if change == "moved":
+            move(record)
+        elif (record["kind"], record["phase"], record["dp_rank"], record["tp_rank"]) == ("worker", "decode", 1, 1):
+            _reorder_allocations(record)
+
+    _mutate(path, edit)
+    result = validate_observations(path, launches)["tp2"]
+    assert (result["status"], result["diagnostics"]) == ("incomplete", [f"tp2: {_RAW}tensor_allocations"])
+
+
+@pytest.mark.parametrize("kind", ["worker", "scheduler"])
+@pytest.mark.parametrize("padded", [8200, None, "absent", "8192", 8192.0, True])
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_v033_mamba_group_page_must_be_its_padded_page(tmp_path, kind, padded, phase):
+    # Group 1 of mamba_hybrid is a plain MambaSpec group: page 8,192, state tensors 8,000, so vLLM padded it to 8,192.
+    path, launches = observation_fixture(tmp_path, layout="mamba_hybrid")
+
+    def edit(record):
+        if (record["kind"], record["phase"], record["dp_rank"]) != (kind, phase, 1):
+            return
+        raw = record["raw_cache_config"]["groups"][1]
+        raw.pop("page_size_padded") if padded == "absent" else raw.update(page_size_padded=padded)
+
+    _mutate(path, edit, derive=False)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["diagnostics"] == ["tp2: Mamba group page contradicts its padded page: ['mamba.0', 'mamba.2']"]
+
+
+def _unpad_mamba_groups(record):
+    """Give every Mamba state of a mamba_hybrid record 8,192 bytes of tensors, the page of its group."""
+    cache = record["cache"]
+    for group in cache["groups"]:
+        if group["spec_type"] == _MAMBA:
+            group["state"]["shapes"][0] = [4, 124]
+            group["state"]["real_page_size_bytes"] = 8192
+            if record["kind"] == "worker":
+                for name in group["layer_names"]:
+                    first, second = cache["layer_tensors"][name]
+                    first["shape"][2] = 124
+                    first["stride_bytes"][1] = 248
+                    second["storage_offset_bytes"] += 192
+
+
+@pytest.mark.parametrize(
+    "kind,padded,complete",
+    [
+        ("scheduler", "derived", True),
+        ("scheduler", 8192, True),
+        ("worker", 8192, True),
+        ("scheduler", "absent", False),
+        ("worker", "absent", False),
+        ("scheduler", 8000, False),
+    ],
+)
+def test_v033_unpadded_mamba_group_page_is_its_state_tensors(tmp_path, kind, padded, complete):
+    # vLLM pads no Mamba page that equals the attention page (vLLM 0.33.0 platforms/interface.py:1121-1122), and then
+    # page_size_padded is None. The derived raw block writes None for these groups.
+    path, launches = observation_fixture(tmp_path, layout="mamba_hybrid")
+    _mutate(path, _unpad_mamba_groups)
+
+    def edit(record):
+        if (record["kind"], record["phase"], record["dp_rank"]) != (kind, "decode", 1):
+            return
+        raw = record["raw_cache_config"]["groups"][1]
+        assert raw["page_size_padded"] is None
+        raw.pop("page_size_padded") if padded == "absent" else raw.update(page_size_padded=padded)
+
+    if padded != "derived":
+        _mutate(path, edit, derive=False)
+    result = validate_observations(path, launches)["tp2"]
+    if complete:
+        assert (result["status"], result["diagnostics"]) == ("complete", [])
+    else:
+        assert result["diagnostics"] == ["tp2: Mamba group page contradicts its padded page: ['mamba.0', 'mamba.2']"]
+
+
+def test_v033_mamba_layers_of_one_group_must_have_one_page(tmp_path):
+    # Group 1 of block_outer_short is a uniform group of mamba.0 and mamba.2 with 5,120-byte pages.
+    path, launches = observation_fixture(tmp_path, layout="block_outer_short")
+
+    def edit(record):
+        if record["kind"] == "worker":
+            group = record["cache"]["groups"][1]
+            group["layer_specs"]["mamba.2"]["page_size_bytes"] = 5000
+            group["spec_page_size_bytes"] = 10_120
+
+    _mutate(path, edit)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["diagnostics"] == [
+        "tp2: Mamba layers of one cache group disagree on their page: ['mamba.0', 'mamba.2']"
+    ]
+
+
+def test_v033_mamba_page_below_its_state_tensors_is_refused_by_the_view_checks(tmp_path):
+    path, launches = observation_fixture(tmp_path, layout="block_outer_short")
+
+    def edit(record):
+        if record["kind"] == "worker":
+            group = record["cache"]["groups"][1]
+            # 4,800 bytes are below the 4,896 bytes of the two state tensors.
+            group["layer_specs"]["mamba.2"]["page_size_bytes"] = 4800
+            group["spec_page_size_bytes"] = 9920
+
+    _mutate(path, edit)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["diagnostics"] == ["tp2: layer view lies outside the page of its layer: mamba.2"]
+
+
+@pytest.mark.parametrize(
+    "kinds,diagnostic",
+    [
+        # vLLM adds a KV-sharing layer to the group of its target in the worker only (v1/worker/utils.py:795-805).
+        (("worker",), "worker and scheduler cache group geometry disagrees"),
+        (("worker", "scheduler"), "runtime memory cache lacks complete layer spec evidence"),
+    ],
+)
+def test_v033_import_refuses_a_layer_that_shares_the_cache_of_another(tmp_path, kinds, diagnostic):
+    path, launches = observation_fixture(tmp_path, layout="mamba_hybrid")
+    _mutate(
+        path,
+        lambda record: record["cache"]["groups"][0]["layer_names"].append("shared.0")
+        if record["kind"] in kinds
+        else None,
+    )
+    result = validate_observations(path, launches)["tp2"]
+    assert (result["status"], result["diagnostics"]) == ("incomplete", [f"tp2: {diagnostic}"])
+
+
+@pytest.mark.parametrize(
+    "layout,parameters",
+    [
+        # The scheduler record of glm_tp4 keeps the Mamba block size of configuration time.
+        ("glm_tp4", {}),
+        ("mamba_hybrid", {}),
+        ("block_outer_short", {}),
+        ("layer_outer_short", {}),
+        ("kernel_view", {}),
+        ("mamba_hybrid", {"decode_prefix_caching": False}),
+        ("mamba_hybrid", {"checkpoint": (1, 16)}),
+    ],
+)
+def test_v033_records_of_every_layout_pass_the_raw_cache_and_mamba_page_checks(tmp_path, layout, parameters):
+    path, launches = observation_fixture(tmp_path, layout=layout, **parameters)
+    result = validate_observations(path, launches)["tp2"]
+    assert (result["status"], result["diagnostics"]) == ("complete", [])
+
+
 @pytest.mark.parametrize(
     "unit,prefix_caching,diagnostic",
     [
@@ -4450,6 +4827,40 @@ def test_import_accepts_the_live_glm53flash_record_of_vllm_0330(tmp_path):
     assert runtime_observations._staged_checkpoint_fmha(path.parent, references, launch, "fp8") == "fp8"
 
 
+def test_live_glm_record_passes_every_evidence_check(tmp_path, monkeypatch):
+    from collector.fpm_forward import runtime_evidence
+
+    calls = {}
+    for name in (
+        "_check_hf_overrides",
+        "_check_size_tokens",
+        "_check_worker_block_count",
+        "_check_layer_specs",
+        "_check_audited_sources",
+        "_check_raw_cache_config",
+        "_check_mamba_pages",
+    ):
+        original = getattr(runtime_evidence, name)
+
+        def counted(*args, _name=name, _original=original, **kwargs):
+            calls[_name] = calls.get(_name, 0) + 1
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(runtime_evidence, name, counted)
+    result = _import(_campaign_from_fixture(tmp_path, FIXTURES / "glm53flash_vllm_0330_probe"))
+    assert result["status"] == "complete"
+    # One scheduler and four workers of one DP rank: no check is skipped for the live record.
+    assert calls == {
+        "_check_hf_overrides": 4,
+        "_check_size_tokens": 1,
+        "_check_worker_block_count": 1,
+        "_check_layer_specs": 5,
+        "_check_audited_sources": 4,
+        "_check_raw_cache_config": 5,
+        "_check_mamba_pages": 5,
+    }
+
+
 def _live_records():
     root = FIXTURES / "glm53flash_vllm_0330_probe"
     return [json.loads(path.read_text()) for path in sorted(root.rglob("runtime-observation-*.json"))]
@@ -5033,13 +5444,16 @@ def test_import_of_a_record_outside_the_conditions_is_complete_and_gives_the_rea
     assert "transfer_bytes" not in result["resources"]["runtime_memory"]["provenance"]
 
 
-@pytest.mark.parametrize("moved", ["tp_rank_1", "decode_phase"])
+@pytest.mark.parametrize("moved", ["dp_rank_1", "decode_phase"])
 def test_import_of_ranks_that_give_different_values_is_complete_and_gives_the_reason(tmp_path, moved):
-    # One Mamba group lies 4,096 bytes further in its block row in the worker records of TP rank 1, or in those of the
-    # decode phase, which runs with prefix caching too. The ranks or the phases then give different values.
+    # One Mamba group lies 4,096 bytes further in its block row in the worker records of DP rank 1, or in those of the
+    # decode phase, which runs with prefix caching too, so the ranks or the phases give different values. Only another
+    # engine core can differ: the TP workers of one get the same tensors (vLLM 0.33.0 v1/core/kv_cache_planning.py:
+    # 1505-1508, :1583-1595, :1620-1628).
     path, launches = observation_fixture(tmp_path, layout="glm_tp4")
-    if moved == "tp_rank_1":
-        _mutate(path, _shift_group(3, tp=1))
+    if moved == "dp_rank_1":
+        move = _shift_group(3)
+        _mutate(path, lambda record: move(record) if record["dp_rank"] == 1 else None)
     else:
         move = _shift_group(3)
         _mutate(path, lambda record: move(record) if record["phase"] == "decode" else None)

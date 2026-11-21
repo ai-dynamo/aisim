@@ -21,7 +21,7 @@ import aisim.main as cli
 from aisim.support.checkpoint import _load, report, save_checkpoint
 from aisim.support.schema import SupportRequest
 
-from .collector.test_runtime_observations import _mutate, _shift_group, observation_fixture
+from .collector.test_runtime_observations import _derive_observer_copies, _mutate, _shift_group, observation_fixture
 
 pytestmark = [
     pytest.mark.unit,
@@ -121,6 +121,7 @@ def _campaign(
         document["configurations"]["tp2"]["attempts"][0]["phases"].pop(
             "decode" if worker_type == "prefill" else "prefill"
         )
+    first_workers: dict = {}
     for phase in document["configurations"]["tp2"]["attempts"][0]["phases"].values():
         for ref in [phase["launch_manifest"], *phase["artifacts"]]:
             path = index.parent / ref["path"]
@@ -185,6 +186,7 @@ def _campaign(
                         if value["kind"] == "worker":
                             for name in group["layer_names"]:
                                 cache["layer_tensors"][name]["kernel_block_size_tokens"] = tokens
+                _derive_observer_copies(value, first_workers)
             _write(path, value)
             ref["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
     _write(index, document)
@@ -2124,6 +2126,7 @@ def _run_decode_with_prefix_caching(index):
     """
     document = json.loads(index.read_text())
     phase = document["configurations"]["tp2"]["attempts"][0]["phases"]["decode"]
+    first_workers: dict = {}
     for reference in phase["artifacts"]:
         if reference.get("kind") != "observation":
             continue
@@ -2138,6 +2141,7 @@ def _run_decode_with_prefix_caching(index):
         )
         record["cache"] = prefill["cache"]
         record["resolved_config"]["cache_config"] = prefill["resolved_config"]["cache_config"]
+        _derive_observer_copies(record, first_workers)
         _write(path, record)
         reference["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
     _write(index, document)
@@ -2440,6 +2444,7 @@ def _record_decode_state_block_size(index, tokens):
     """
     document = json.loads(index.read_text())
     phase = document["configurations"]["tp2"]["attempts"][0]["phases"]["decode"]
+    first_workers: dict = {}
     for reference in phase["artifacts"]:
         path = index.parent / reference["path"]
         record = json.loads(path.read_text())
@@ -2465,6 +2470,7 @@ def _record_decode_state_block_size(index, tokens):
             blocks = [group["block_size_tokens"] for group in groups]
             cache["block_size"] = evidence["block_size"] = math.lcm(*blocks)
             cache["hash_block_size"] = evidence["hash_block_size"] = math.gcd(*blocks)
+        _derive_observer_copies(record, first_workers)
         _write(path, record)
         reference["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
     _write(index, document)
@@ -3277,12 +3283,14 @@ def _old_session_revision(tmp_path, capsys, monkeypatch):
     collection = json.loads((root / "fpm-checkpoint/fpm_forward.json").read_text())
     index = Path(collection["runtime_observations"])
     document = json.loads(index.read_text())
+    first_workers: dict = {}
     for phase in document["configurations"]["tp2"]["attempts"][0]["phases"].values():
         for ref in phase["artifacts"]:
             if ref.get("kind") == "observation":
                 path = index.parent / ref["path"]
                 record = json.loads(path.read_text())
                 _shrink_formal_record(record)
+                _derive_observer_copies(record, first_workers)
                 _write(path, record)
                 ref["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
     _write(index, document)
