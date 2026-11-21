@@ -3,12 +3,14 @@
 
 """Whole-tree op-latency loading."""
 
+import json
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
 from aisim_core.data.loaders import LoaderError
-from aisim_core.data.op_tree import load_op_latency_tree, op_latency_entries
+from aisim_core.data.op_tree import load_op_latency_tree, op_latency_entries, verify_op_latency_support
 
 from .test_op_publish import _build, tree  # noqa: F401  (fixture reuse)
 
@@ -67,3 +69,29 @@ def test_existing_destination_and_empty_selection_are_refused(published, tmp_pat
     with pytest.raises(LoaderError, match="no op-latency entries"):
         load_op_latency_tree(out, tmp_path / "other", hardware=["l4"])
     assert not (tmp_path / "other").exists()
+
+
+@pytest.mark.parametrize("missing", ["query_versions", "perf_data_reuse_manifest", "both"])
+def test_indexed_policy_must_pin_both_lookups_before_loading(published, tmp_path, missing):
+    from .test_ensure_op_latency import _write_op_index
+
+    _, out = published
+    index = json.loads((out / "catalog/op-latency.json").read_bytes())
+    index["support"] = [a for a in index["support"] if missing != "both" and missing not in a["path"]]
+    _write_op_index(out, index)
+    with pytest.raises(LoaderError, match="required lookup support"):
+        verify_op_latency_support(out)
+    with pytest.raises(LoaderError, match="required lookup support"):
+        load_op_latency_tree(out, tmp_path / "root", packaged_systems=None)
+    assert not (tmp_path / "root").exists()
+
+
+def test_legacy_local_layout_explicitly_omits_the_support_field(published, tmp_path):
+    from .test_ensure_op_latency import _write_op_index
+
+    _, out = published
+    index = json.loads((out / "catalog/op-latency.json").read_bytes())
+    del index["support"]
+    _write_op_index(out, index)
+    loaded = load_op_latency_tree(out, tmp_path / "root", packaged_systems=None)
+    assert set(loaded.lookup_files) == {"query_versions.yaml", "perf_data_reuse_manifest.yaml"}

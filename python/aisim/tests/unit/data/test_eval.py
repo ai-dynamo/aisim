@@ -8,6 +8,7 @@ import pytest
 from aisim_core.data import Identity
 from aisim_core.data.eval import (
     EvalRecord,
+    Exclusion,
     GpuTime,
     PredictionIdentity,
     attest,
@@ -275,3 +276,38 @@ def test_outlier_truth_is_compared_with_the_truth_table(built):
     report = verify_record(lying, root, _predict, lying.prediction.fingerprint)
     assert not report.ok and any("worst_n values" in p for p in report.problems)
     assert verify_record(record, root, _predict, record.prediction.fingerprint).ok
+
+
+def test_verifier_does_not_trust_a_producers_exclusion_of_a_valid_error(built):
+    root, record = built
+    cases = [(f"s{i}", 10.0 * i, _predict({"tokens": 10 * i})) for i in range(1, 6)] + [("bad", None, 1.1)]
+    forged = record.model_copy(update={"results": compute_results(cases, [Exclusion(case_id="s4", reason="skip")])})
+    report = verify_record(forged, root, _predict, forged.prediction.fingerprint)
+    assert not report.ok
+    assert any("exclusions not justified by recomputation" in p for p in report.problems)
+    assert report.recomputed.n_scored == 5 and report.recomputed.mape_pct > forged.results.mape_pct
+    assert [e.case_id for e in report.recomputed.exclusions] == ["bad"]
+
+
+def test_attestation_cannot_reuse_another_records_successful_report(built):
+    root, record = built
+    report = verify_record(record, root, _predict, record.prediction.fingerprint)
+    assert report.ok and report.record_id == record.record_id
+    other = record.model_copy(update={"created_at": "2026-11-08T00:00:00Z"})
+    with pytest.raises(ValueError, match="different record"):
+        attest(other, report)
+    assert attest(record, report).verification.verified_record_id == record.record_id
+
+
+def test_nonfinite_truth_and_unavailable_predictions_remain_excluded():
+    results = compute_results(
+        [
+            ("infinite", float("inf"), 1.0),
+            ("nan", float("nan"), 1.0),
+            ("missing", None, 1.0),
+            ("unavailable", 1.0, None),
+            ("valid", 1.0, 2.0),
+        ]
+    )
+    assert results.n_scored == 1 and results.mape_pct == 100.0
+    assert {e.case_id for e in results.exclusions} == {"infinite", "nan", "missing", "unavailable"}

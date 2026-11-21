@@ -337,17 +337,28 @@ def _ts(value: Any, what: str) -> datetime:
 
 
 def _gpus_requested(spec: Mapping[str, Any], resource: str) -> int:
-    """GPUs a pod spec requests (requests, else limits, per container)."""
-    total = 0
-    for container in spec.get("containers") or []:
+    """Effective pod reservation, including sequential init containers and restartable sidecars."""
+
+    def requested(container):
         res = container.get("resources") or {}
         raw = (res.get("requests") or {}).get(resource, (res.get("limits") or {}).get(resource))
         if raw is not None:
             try:
-                total += int(raw)
+                return int(raw)
             except (TypeError, ValueError) as exc:
                 raise KubeParseError(f"bad {resource} quantity {raw!r}") from exc
-    return total
+        return 0
+
+    app = sum(requested(c) for c in spec.get("containers") or [])
+    sidecars = peak = 0
+    for container in spec.get("initContainers") or []:
+        count = requested(container)
+        if container.get("restartPolicy") == "Always":
+            sidecars += count  # remains running during later init containers and the app
+            peak = max(peak, sidecars)
+        else:
+            peak = max(peak, sidecars + count)
+    return max(app + sidecars, peak)
 
 
 def _terminated_window(term: Mapping[str, Any]) -> tuple[datetime, datetime] | None:

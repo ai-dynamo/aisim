@@ -61,14 +61,24 @@ import typing
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 from uuid import uuid4
 
 import pyarrow as pa
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
-from aisim_core.data import Artifact, Digest, Identity, Manifest, _file, _relative, _verify, configuration_id
+from aisim_core.data import (
+    Artifact,
+    Digest,
+    Identity,
+    Manifest,
+    _file,
+    _relative,
+    _verify,
+    configuration_id,
+    path_component,
+)
 from aisim_core.data.loaders import E2eLoader, E2eTables, LoaderError
 from aisim_core.data.names import NameFinding, canonical_name, canonical_unit, name_findings, normalize, split_framework
 from aisim_core.data.parquet import read_parquet, write_parquet
@@ -329,7 +339,7 @@ def public_release_problems(body: E2eManifestBody) -> list[str]:
 
 
 _GITHUB_RUN = re.compile(
-    r"^https://github\.com/(?P<repo>[\w.-]+/[\w.-]+)/actions/runs/(?P<run>\d+)(?:/attempts/\d+)?/?$"
+    r"^https://github\.com/(?P<repo>[\w.-]+/[\w.-]+)/actions/runs/(?P<run>\d+)(?:/attempts/(?P<attempt>\d+))?/?$"
 )
 
 
@@ -341,6 +351,46 @@ def producer_run_id(run_url: str | None) -> str | None:
     """
     found = _GITHUB_RUN.match(run_url or "")
     return None if found is None else f"{found['repo']}#{found['run']}"
+
+
+def _public_producer_run(run_url: str | None, run: Mapping[str, Any]) -> tuple[str | None, dict[str, Any]]:
+    """Only public, typed run identity and freshness facts belong in a normalized manifest."""
+    found = _GITHUB_RUN.fullmatch(run_url or "")
+    if found is None:
+        return None, {}
+    attempt = run.get("run_attempt")
+    if attempt is None and found["attempt"] is not None:
+        attempt = int(found["attempt"])
+    if attempt is not None and (type(attempt) is not int or attempt < 1):
+        raise ValueError("producer run_attempt must be a positive integer")
+    if found["attempt"] is not None and attempt != int(found["attempt"]):
+        raise ValueError("producer run attempt differs from its URL")
+    public: dict[str, Any] = {"github_run_id": found["run"]}
+    if attempt is not None:
+        public["run_attempt"] = attempt
+    if re.fullmatch(r"[0-9a-f]{40}", str(run.get("head_sha", ""))):
+        public["head_sha"] = run["head_sha"]
+    # Fixed vocabularies and timestamp syntax prevent arbitrary metadata (URLs, host names, tokens) leaking
+    # through otherwise public fields. The raw producer response remains in private acquisition evidence.
+    if re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})", str(run.get("run_started_at", ""))
+    ):
+        public["run_started_at"] = run["run_started_at"]
+    if run.get("status") in ("queued", "in_progress", "completed", "waiting", "requested", "pending"):
+        public["status"] = run["status"]
+    if run.get("conclusion") in (
+        "success",
+        "failure",
+        "cancelled",
+        "skipped",
+        "timed_out",
+        "neutral",
+        "action_required",
+        "stale",
+        "startup_failure",
+    ):
+        public["conclusion"] = run["conclusion"]
+    return f"{producer_run_id(run_url)}/attempts/{attempt if attempt is not None else 'unknown'}", public
 
 
 class ObservationRow(_Record):
@@ -718,6 +768,18 @@ def _gzip(data: bytes) -> bytes:
     return gzip.compress(data, compresslevel=6, mtime=0)  # fixed mtime keeps bytes deterministic
 
 
+def _write_path(root: Path, relative: str) -> Path:
+    """Apply the artifact path rules before any write, including through existing symlink parents."""
+    path = Path(root)
+    for part in PurePosixPath(_relative(relative)).parts:
+        path = path / part
+        if path.is_symlink():
+            raise ValueError(f"symlink in dataset path: {relative}")
+    if not path.absolute().is_relative_to(Path(root).absolute()):
+        raise ValueError(f"dataset path leaves its root: {relative}")
+    return path
+
+
 def store_provenance(root: Path, directory: str, item: ProvenanceFile) -> tuple[Artifact, ProvenanceInfo]:
     """Write one compressed provenance artifact under ``root/directory/provenance/``.
 
@@ -735,12 +797,15 @@ def store_provenance(root: Path, directory: str, item: ProvenanceFile) -> tuple[
         kept = full[:LOG_EXCERPT_BYTES] + TRUNCATION_MARKER + full[-LOG_EXCERPT_BYTES:]
         truncated = True
     full_sha = _sha(full)
-    name = item.name or f"{item.kind}-{(item.observation_id or full_sha[:12]).replace(':', '_').replace('/', '_')}"
-    relative = f"{directory}/provenance/{name}.gz"
+    name = path_component(
+        item.name or f"{item.kind}-{(item.observation_id or full_sha[:12]).replace(':', '_').replace('/', '_')}"
+    )
+    relative = f"{directory}/provenance/{item.kind}-{name}.gz"
     payload = _gzip(kept)
     path = _destination(Path(root), relative)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(payload)
+    with path.open("xb") as handle:  # duplicate destinations must never replace earlier staged bytes
+        handle.write(payload)
     artifact_id = f"{item.kind}:{name}"
     artifact = Artifact(
         artifact_id=artifact_id,
@@ -880,6 +945,7 @@ def configuration_dir(body: E2eManifestBody) -> str:
 
 
 def _write_table(root: Path, directory: str, name: str, schema_id: str, rows: Sequence[BaseModel], role: str):
+    path_component(name)
     relative = f"{directory}/{name}.parquet" if directory not in ("", ".") else f"{name}.parquet"
     path = _destination(Path(root), relative)
     write_parquet(
@@ -923,6 +989,11 @@ def _publish_staged(stage: Path, root: Path, relatives: Sequence[str]) -> None:
     is attempted, and an incomplete rollback retains the stage for recovery. Configuration and snapshot writers
     use fresh artifact paths, so only their final document switches a readable generation.
     """
+    if len(set(relatives)) != len(relatives):
+        raise ValueError("duplicate publication destination")
+    for relative in relatives:
+        _write_path(stage, relative)
+        _write_path(root, relative)
     done: list[tuple[Path, Path | None]] = []
     for relative in relatives:
         _destination(stage, relative)
@@ -1505,8 +1576,9 @@ def inferencex_to_configurations(
     fields without a canonical home (recipe fingerprint, upstream configuration
     record, unmapped metrics) are also typed observation columns. ``runs`` optionally
     maps a ``run_url`` to producer metadata (``head_sha``, ``run_attempt``,
-    ``run_started_at``, ``head_branch``, ...); it is kept verbatim under
-    ``source_fields["producer_runs"]`` because ordering and freshness decisions need it.
+    ``run_started_at``, ...). Public identity, status and freshness fields are kept under
+    ``source_fields["producer_runs"]``, keyed by normalized run ID and attempt; URLs and arbitrary metadata
+    remain outside the normalized manifest.
 
     Upstream source configurations (content hash ``hf:<sha256>``, kept per
     observation as ``source_config_id``) that differ only in run telemetry share one
@@ -1545,7 +1617,9 @@ def inferencex_to_configurations(
             extras = {k: v for k, v in (raw.get("metrics") or {}).items() if k not in mapped}
             run = runs.get(raw.get("run_url") or "", {})
             if run:
-                producer_runs[raw["run_url"]] = dict(run)
+                run_key, run = _public_producer_run(raw.get("run_url"), run)
+                if run_key is not None:
+                    producer_runs[run_key] = run
             members.append((oid, canonical))
             observations.append(
                 ObservationRow(

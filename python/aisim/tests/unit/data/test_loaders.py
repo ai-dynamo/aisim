@@ -6,6 +6,7 @@
 import hashlib
 import json
 import shutil
+from pathlib import Path
 
 import pyarrow as pa
 import pytest
@@ -31,6 +32,62 @@ CONFIG = {"system": "h200_sxm", "backend": "vllm", "backend_version": "1.0", "mo
 
 def _tree(root):
     return {str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+@pytest.mark.parametrize("damage", ["missing-table", "edited-table", "profile", "config"])
+@pytest.mark.parametrize("relative_cache", [False, True])
+def test_cached_fpm_preparation_reuses_intact_files_and_repairs_damage(
+    dataset,  # noqa: F811
+    tmp_path,
+    monkeypatch,
+    damage,
+    relative_cache,
+):
+    from aisim_core.data import Artifact, Entry, Manifest
+    from aisim_core.data.ensure import _load
+
+    root, path, doc = dataset
+    manifest = Manifest.model_validate(doc)
+    data = (root / path).read_bytes()
+    entry = Entry(
+        configuration_id=manifest.configuration_id,
+        purpose=manifest.purpose,
+        identity=manifest.identity,
+        manifest=Artifact(
+            artifact_id="manifest",
+            path=path,
+            role="manifest",
+            format="json",
+            schema=manifest.schema_version,
+            sha256=hashlib.sha256(data).hexdigest(),
+            bytes=len(data),
+        ),
+    )
+    loader = FpmLoader()
+    real_load = loader.load
+    loads = []
+
+    def counted(*args, **kwargs):
+        loads.append(True)
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(loader, "load", counted)
+    monkeypatch.chdir(tmp_path)
+    output = Path("materialized") if relative_cache else tmp_path / "materialized"
+    first = _load(loader, "fpm", root, entry, CONFIG, output)
+    systems = Path(first.config["systems_paths"][0])
+    pristine = _tree(systems.parent)
+    assert _load(loader, "fpm", root, entry, CONFIG, output).config == first.config
+    assert len(loads) == 1  # no native reconstruction for an intact cache
+    runtime = next(a.runtime_path for a in manifest.artifacts if a.runtime_path is not None)
+    if damage == "missing-table":
+        (systems / runtime).unlink()
+    else:
+        victim = systems / runtime if damage == "edited-table" else systems.parent / f"{damage}.json"
+        victim.write_bytes(b"damaged")
+    repaired = _load(loader, "fpm", root, entry, CONFIG, output)
+    assert repaired.config == first.config and _tree(systems.parent) == pristine
+    assert len(loads) == 2
 
 
 def _op_manifest(root, manifest, **identity_overrides):

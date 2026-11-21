@@ -1111,13 +1111,16 @@ def test_every_kind_continues_in_another_process_like_the_uninterrupted_model(tm
     assert _bits(cold, queries) != _bits(model, queries)
 
 
-def test_restoring_a_snapshot_ignores_an_environment_dataset_pin(tmp_path, monkeypatch):
+@pytest.mark.parametrize("malformed", [False, True])
+def test_restoring_a_snapshot_ignores_an_environment_dataset_pin(tmp_path, monkeypatch, malformed):
     model = RustForwardPassPerfModel.best_available(_regression_config())
     model.tune_with_fpms(_stream(4, 40))
     pinned = model.save_state_snapshot(tmp_path / "snap")
     queries = _queries()
     # A pin whose dataset is unavailable would raise MissingDataError if it were consulted before restoration.
     monkeypatch.setenv("AISIM_DATA_LOCAL", str(tmp_path / "no-such-dataset"))
+    if malformed:
+        monkeypatch.setenv("AISIM_DATASET", "no-revision")
     for restored in (
         RustForwardPassPerfModel.best_available(state_snapshot=tmp_path / "snap"),
         RustForwardPassPerfModel.best_available(pinned),
