@@ -1056,7 +1056,8 @@ def _names_systems_paths(config: ForwardPassPerfModelConfig | Mapping[str, Any])
     named = config.systems_paths if isinstance(config, ForwardPassPerfModelConfig) else config.get("systems_paths")
     # An unset value expands to ``set_systems_paths``, then the environment variable, then the packaged roots.
     roots = _resolve_forward_pass_systems_paths(tuple(named or ()), require_directories=False)
-    return roots != _resolve_forward_pass_systems_paths(("default",), require_directories=False)
+    packaged = os.fspath(pkg_resources.files("aisim_core") / "systems")
+    return os.environ.get("AICONFIGURATOR_SYSTEMS_PATH") is not None or roots != [packaged]
 
 
 def _forward_pass_config_json(config: ForwardPassPerfModelConfig | Mapping[str, Any]) -> str:
@@ -1108,9 +1109,13 @@ def _resolve_forward_pass_systems_paths(entries: tuple[str, ...], *, require_dir
     if not entries:
         from aisim_core.sdk.perf_database import get_systems_paths
 
-        configured = get_systems_paths()
-        env_root = os.environ.get("AICONFIGURATOR_SYSTEMS_PATH")
-        entries = tuple([env_root] if configured == [packaged] and env_root is not None else configured)
+        entries = tuple(get_systems_paths())
+    env_root = os.environ.get("AICONFIGURATOR_SYSTEMS_PATH")
+    # A packaged-only list can be a caller's expansion of the defaults; preserve the environment's choice.
+    if env_root is not None and all(
+        isinstance(entry, str) and (entry.lower() == "default" or entry == packaged) for entry in entries
+    ):
+        entries = (env_root,)
     resolved: list[str] = []
     for entry in entries:
         if not isinstance(entry, str) or not entry.strip():
