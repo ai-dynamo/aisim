@@ -513,7 +513,7 @@ def _parallelism(config: Mapping[str, Any]) -> tuple[tuple[str, int], ...] | Non
     """
     keys = {
         "tp": "tp",
-        "attention_dp": "dp",
+        "attention_dp": "attention_dp",
         "moe_tp_size": "moe_tp",
         "moe_ep_size": "ep",
         "pp": "pp",

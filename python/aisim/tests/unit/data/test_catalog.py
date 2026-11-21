@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
+import json
+import os
 import shutil
 import sys
 
@@ -21,6 +23,7 @@ from aisim_core.data.catalog import (
 from aisim_core.data.eval import EvalRecord, PredictionIdentity, write_record
 from aisim_core.data.parquet import read_parquet_schema_id
 from aisim_core.data.systems import spec_sha256
+from tests.unit.data.test_fetch import _repin
 
 pytestmark = pytest.mark.unit
 
@@ -307,6 +310,64 @@ def test_a_category_index_edited_after_indexing_is_refused(dataset):
     index = root / "catalog/e2e.json"
     index.write_text(index.read_text() + "\n")
     with pytest.raises(ValueError, match="integrity mismatch"):
+        build_catalog(root, systems_dir=systems)
+
+
+@pytest.mark.parametrize("target", ["catalog/fpm.json", "data/fpm/m0.json"])
+def test_catalog_parses_the_bytes_that_passed_verification(dataset, monkeypatch, target):
+    root, systems = dataset
+    victim = root / target
+    original = victim.read_bytes()
+    changed = json.loads(original)
+    if target.startswith("catalog/"):
+        changed["entries"] = []
+    else:
+        changed["evidence_gaps"] = []
+    replacement = json.dumps(changed, separators=(",", ":")).encode()
+    replacement += b" " * (len(original) - len(replacement))
+    assert len(replacement) == len(original)
+    real_open = type(victim).open
+    replaced = False
+
+    def swap_after_open(path, *args, **kwargs):
+        nonlocal replaced
+        stream = real_open(path, *args, **kwargs)
+        if path == victim and not replaced and kwargs.get("mode", args[0] if args else "r") == "rb":
+            replaced = True
+            temporary = victim.with_suffix(".replacement")
+            with real_open(temporary, "wb") as out:
+                out.write(replacement)
+            os.replace(temporary, victim)
+        return stream
+
+    monkeypatch.setattr(type(victim), "open", swap_after_open)
+    rows = build_catalog(root, systems_dir=systems)
+    assert replaced
+    cell = _cell(rows, "fpm", QWEN, "b200_sxm")
+    assert cell.n_configs == 1 and cell.n_evidence_gaps == 2
+
+
+@pytest.mark.parametrize(
+    "field,value", [("identity", "h200_sxm"), ("purpose", "operation-tables"), ("category", "e2e")]
+)
+def test_catalog_rejects_digest_valid_manifest_identity_mismatches(dataset, field, value):
+    root, systems = dataset
+    files = {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*.json")}
+    path = "data/fpm/m0.json"
+    document = json.loads(files[path])
+    if field == "identity":
+        document[field]["hardware"] = value
+    else:
+        document[field] = value
+    files[path] = json.dumps(document).encode()
+    # Refresh both enclosing pins: digest integrity alone cannot establish identity equality.
+    index = json.loads(files["catalog/fpm.json"])
+    index["entries"][0]["manifest"] = _artifact(path, files[path]).model_dump(by_alias=True)
+    files["catalog/fpm.json"] = json.dumps(index).encode()
+    _repin(files, "catalog/fpm.json")
+    for name, data in files.items():
+        (root / name).write_bytes(data)
+    with pytest.raises(ValueError, match="catalog and manifest identity mismatch"):
         build_catalog(root, systems_dir=systems)
 
 

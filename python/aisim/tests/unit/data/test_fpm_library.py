@@ -2016,6 +2016,54 @@ def test_loader_selects_and_loads_pipeline_parallel_entry(root, profile, tmp_pat
     assert pq.read_table(staged, columns=["pp"]).column("pp").to_pylist() == [pp] * table.num_rows
 
 
+@pytest.mark.parametrize("attention_dp", [1, 4])
+@pytest.mark.parametrize("key", ["attention_dp", "attention_dp_size"])
+def test_attention_dp_catalog_selection_fetches_and_loads(root, profile, tmp_path, attention_dp, key):
+    from tests.unit.data.test_fetch import FakeTransport
+
+    tp, moe_tp, ep = 4 // attention_dp, 4 // attention_dp, attention_dp
+    profile["deployments"][0].update(tp=tp, dp=attention_dp, moe_tp=moe_tp, moe_ep=ep)
+    make_entry(root, profile)
+    sidecar = root / ENTRY / "fpm/fpm_forward_perf.metadata.json"
+    metadata = json.loads(sidecar.read_text())
+    # The published sidecar uses dp, while the catalog uses attention_dp.
+    metadata["configuration_selector"].update(tp=tp, dp=attention_dp, moe_tp=moe_tp, moe_ep=ep)
+    sidecar.write_text(json.dumps(metadata))
+    document = json.loads((root / MANIFEST).read_text())
+    identity = Identity.model_validate(
+        {
+            **document["identity"],
+            "parallelism": {
+                "aggregated": {
+                    "tp": tp,
+                    "attention_dp": attention_dp,
+                    "moe_tp": moe_tp,
+                    "ep": ep,
+                }
+            },
+        }
+    )
+    document.update(
+        identity=identity.model_dump(), configuration_id=configuration_id("fpm", "execution-profile", identity)
+    )
+    (root / MANIFEST).write_text(json.dumps(document))
+    _refresh_prediction_manifest(root)
+    _entry_catalog(root)
+    config = {**CONFIG, "tp": tp, "moe_tp_size": moe_tp, "moe_ep_size": ep}
+    config.pop("attention_dp")
+    config[key] = attention_dp
+    selection = FpmLoader().select(config)
+    dims = dict(selection.parallelism)
+    assert "dp" not in dims and dims.get("attention_dp", 1) == attention_dp
+    files = {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    fetched = fetch(selection, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=Cache(tmp_path / "cache"))
+    loaded = FpmLoader().load(fetched.root, MANIFEST, config=config, output_dir=tmp_path / "loaded")
+    assert loaded.config[key] == attention_dp
+    staged = Path(loaded.config["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"])
+    assert set(pq.read_table(staged, columns=["dp"]).column("dp").to_pylist()) == {attention_dp}
+    assert json.loads(staged.with_suffix(".metadata.json").read_text())["configuration_selector"]["dp"] == attention_dp
+
+
 @pytest.mark.parametrize(
     "setting", [[], "", False, 0, [["fpm_interpolation", {}]], None, {}, {"fpm_interpolation": {"k": 1}}]
 )
@@ -2065,7 +2113,7 @@ def test_topology_aliases_select_like_their_canonical_names():
 
     canonical = {"tp": 4, "moe_tp_size": 4, "moe_ep_size": 1, "attention_dp": 2}
     aliased = {"tp_size": 4, "moe_tp_size": 4, "moe_ep_size": 1, "attention_dp_size": 2}
-    assert _parallelism(aliased) == _parallelism(canonical) == (("dp", 2), ("moe_tp", 4), ("tp", 4))
+    assert _parallelism(aliased) == _parallelism(canonical) == (("attention_dp", 2), ("moe_tp", 4), ("tp", 4))
 
 
 def test_sidecar_rejects_duplicate_keys_and_boolean_topology(tmp_path):

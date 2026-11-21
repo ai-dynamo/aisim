@@ -103,9 +103,19 @@ def test_drift_is_detected(tmp_path):
     assert any("differs" in p for p in problems) and any("unexpected" in p for p in problems)
     victim.unlink()
     assert any("missing" in p for p in check_snapshots(tmp_path))
-    # write_snapshots repairs drift and removes stale files.
+    # Repair owned snapshots; unknown files remain visible for their owner to remove explicitly.
     write_snapshots(tmp_path)
-    assert check_snapshots(tmp_path) == []
+    assert check_snapshots(tmp_path) == ["unexpected snapshot: stray.v9.json"]
+
+
+def test_snapshot_cli_keeps_unrelated_json(tmp_path):
+    from aisim_core.data.schemas import main
+
+    notes = tmp_path / "notes.json"
+    notes.write_text('{"notes": "keep me"}\n')
+    before = notes.read_bytes()
+    assert main(["--write", "--dir", str(tmp_path)]) == 0
+    assert notes.read_bytes() == before
 
 
 def test_check_on_missing_dir(tmp_path):

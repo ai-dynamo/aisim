@@ -413,6 +413,7 @@ def compute_results(
 class VerificationReport(BaseModel):
     ok: bool
     problems: list[str]
+    record_id: Digest | None = None  # content actually checked, including claims and predictor identity
     recomputed: Results | None = None
     # The checked truth rows: case_id -> canonical JSON of that case's inputs, from the bytes that passed the digest
     # check. Consumers that need per-case facts (required cases) use this, never a second read of the table.
@@ -440,6 +441,7 @@ def verify_record(
     that holds the truth artifacts by their ``path``.
     """
     problems: list[str] = []
+    checked_id = record.record_id
     if current_fingerprint != record.prediction.fingerprint:
         return VerificationReport(ok=False, problems=["predictor fingerprint differs from the record's"])
     table_art = next(a for a in record.truth.artifacts if a.artifact_id == record.truth.truth_table_artifact_id)
@@ -492,7 +494,9 @@ def verify_record(
         for a, b in zip(got.worst_n, claimed.worst_n, strict=True)
     ):
         problems.append("worst_n values differ from recomputation")
-    return VerificationReport(ok=not problems, problems=problems, recomputed=got, case_inputs=case_inputs)
+    return VerificationReport(
+        ok=not problems, problems=problems, record_id=checked_id, recomputed=got, case_inputs=case_inputs
+    )
 
 
 def attest(record: EvalRecord, report: VerificationReport, tier: Tier = "verified") -> EvalRecord:
@@ -502,6 +506,8 @@ def attest(record: EvalRecord, report: VerificationReport, tier: Tier = "verifie
     """
     if not report.ok:
         raise ValueError(f"cannot promote a record that failed verification: {report.problems}")
+    if report.record_id != record.record_id:
+        raise ValueError("verification report belongs to different record content")
     if tier == "submitted":
         raise ValueError("attest promotes to verified or qualified")
     if record.status != "complete":

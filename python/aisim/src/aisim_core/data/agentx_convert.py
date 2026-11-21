@@ -451,6 +451,10 @@ def agentx_bundles_to_configurations(bundles: Iterable[Path | str]) -> list[E2eC
         if first is None:
             merged[key] = data
             continue
+        if first.body.origin != data.body.origin:
+            raise AgentxBundleError(
+                f"cannot merge configuration {key} with mixed origins {first.body.origin!r} and {data.body.origin!r}"
+            )
         if first.body.settings != data.body.settings:
             differing = sorted(
                 name

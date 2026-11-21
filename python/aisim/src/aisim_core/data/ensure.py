@@ -61,6 +61,7 @@ from aisim_core.data.fetch import (
     BudgetExceededError,
     Cache,
     DataFetchError,
+    FetchPlan,
     FetchResult,
     IntegrityError,
     OfflineMissingError,
@@ -68,6 +69,7 @@ from aisim_core.data.fetch import (
     Selection,
     SelectionError,
     Transport,
+    _resolve_source,
     fetch,
     fetch_support,
     resolve_revision,
@@ -85,7 +87,6 @@ from aisim_core.data.op_tree import (
     read_entry_manifest,
     verify_op_latency_support,
 )
-from aisim_core.data.repos import resolve_ref
 from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR, packaged_system_specs
 
 DEFAULT_MAX_BYTES = 256 * 1024 * 1024
@@ -200,9 +201,7 @@ def pin_from_environment(env: Mapping[str, str] | None = None) -> DataPin | None
         repo, sep, revision = spec.partition("@")
         if not sep or not repo or not revision:
             raise ValueError("AISIM_DATASET must be <owner>/<name>@<revision>")
-        # A symbolic ref on the retired FPM repository follows its successor; a commit SHA never moves.
-        resolved = resolve_ref(repo, revision)
-        repo, revision = resolved.repo, resolved.revision
+        # Keep the requested name until transport setup: the successor's path mapping must survive resolution.
     kwargs: dict[str, Any] = {}
     if env.get("AISIM_DATA_CATEGORIES"):
         kwargs["categories"] = tuple(c.strip() for c in env["AISIM_DATA_CATEGORIES"].split(",") if c.strip())
@@ -301,6 +300,8 @@ def ensure_data(
 
         transport = HfTransport()
     if pin.local_root is None:
+        repo, revision, transport = _resolve_source(pin.repo, pin.revision, transport)
+        pin = replace(pin, repo=repo, revision=revision)
         # One commit for the whole call: policy, primary and dependency fetches must read the same revision even if
         # a branch moves meanwhile. A full SHA needs no network.
         try:
@@ -310,7 +311,7 @@ def ensure_data(
     with _guard():
         if "op-latency" in pin.categories:
             _resolve_backend_version(out, pin, transport)
-        owner = _configuration_owner(pin, transport)
+        owner = _configuration_owner(pin, transport, out)
         # Operation data first: an FPM library staged after it must take operation tables from the pinned root alone.
         for category in sorted(pin.categories, key=lambda name: name != "op-latency"):
             # A configuration ID names one entry of one category: it constrains only that category.
@@ -351,7 +352,7 @@ def _compose_pinned_roots(out: EnsuredData) -> None:
     out.config["systems_paths"] = list(dict.fromkeys([*map(str, fpm_roots), str(op_root)]))
 
 
-def _configuration_owner(pin: DataPin, transport: Transport | None) -> str | None:
+def _configuration_owner(pin: DataPin, transport: Transport | None, out: EnsuredData) -> str | None:
     """The category whose index lists ``pin.configuration_id``; ``None`` when no choice has to be made.
 
     A single-category pin keeps its plain behavior (the category reports a miss itself). With several categories
@@ -359,7 +360,7 @@ def _configuration_owner(pin: DataPin, transport: Transport | None) -> str | Non
     """
     if pin.configuration_id is None or len(pin.categories) < 2:
         return None
-    owners = [c for c in pin.categories if pin.configuration_id in _category_configuration_ids(pin, transport, c)]
+    owners = [c for c in pin.categories if pin.configuration_id in _category_configuration_ids(pin, transport, c, out)]
     if not owners:
         raise MissingDataError(
             f"configuration {pin.configuration_id} is not in any category of the pin {list(pin.categories)}"
@@ -367,7 +368,9 @@ def _configuration_owner(pin: DataPin, transport: Transport | None) -> str | Non
     return owners[0]
 
 
-def _category_configuration_ids(pin: DataPin, transport: Transport | None, category: str) -> set[str]:
+def _category_configuration_ids(
+    pin: DataPin, transport: Transport | None, category: str, out: EnsuredData | None = None
+) -> set[str]:
     """Configuration IDs listed by one category index of the pinned dataset (empty when it has no such category)."""
     from aisim_core.data.fetch import load_category_index
 
@@ -386,7 +389,7 @@ def _category_configuration_ids(pin: DataPin, transport: Transport | None, categ
             except (OfflineMissingError, RevisionError, IntegrityError) as exc:
                 if pin.offline:
                     raise MissingDataError(f"offline: the {category} catalog is not usable: {exc}") from exc
-                _, index, _ = load_category_index(category, transport=transport, **common)
+                _, index, _ = _fetch_preselection(load_category_index, category, pin, transport, out)
     except SelectionError:
         return set()
     except (ValueError, ValidationError) as exc:
@@ -410,12 +413,44 @@ def _resolve_backend_version(out: EnsuredData, pin: DataPin, transport: Transpor
     system, backend = out.config.get("system"), out.config.get("backend")
     if not system or not backend:
         return  # nothing to select; the category selection reports the missing field
-    index, query_versions = _version_policy(pin, transport)
+    index, query_versions = _version_policy(pin, transport, out)
     versions = {(e.identity.hardware, e.identity.framework, e.identity.framework_version) for e in index.entries}
     out.config["backend_version"] = _slot_version(system, backend, requested, versions, query_versions)
 
 
-def _version_policy(pin: DataPin, transport: Transport | None):
+def _fetch_preselection(fetcher, category, pin, transport, out):
+    """Charge policy and ownership reads to the same allowance as primary and dependency fetches."""
+    spent = out.downloaded_bytes if out is not None else 0
+    accounting = FetchPlan(repo=pin.repo, revision=pin.revision, requested_revision=pin.revision, offline=False)
+    try:
+        return fetcher(
+            category,
+            repo=pin.repo,
+            revision=pin.revision,
+            transport=transport,
+            cache=Cache(pin.cache_dir),
+            max_bytes=max(pin.max_bytes - spent, 0),
+            _accounting=accounting,
+        )
+    except BudgetExceededError as exc:
+        selection = Selection(
+            category=category,
+            configuration_ids=(pin.configuration_id,) if pin.configuration_id else (),
+            hardware=(out.config.get("system") if out is not None else None),
+            model=(out.config.get("model") if out is not None else None),
+        )
+        raise DataTooLargeError(
+            spent + exc.plan.uncached_bytes + exc.plan.metadata_bytes,
+            pin.max_bytes,
+            _command(pin, selection),
+            already_downloaded=spent + accounting.metadata_bytes,
+        ) from exc
+    finally:
+        if out is not None:
+            out.downloaded_bytes += accounting.metadata_bytes
+
+
+def _version_policy(pin: DataPin, transport: Transport | None, out: EnsuredData):
     """The op-latency category index of the pinned dataset and its parsed ``query_versions`` document."""
     name = f"{DATA_PREFIX}/{QUERY_VERSIONS_NAME}.parquet"
     where = str(pin.local_root) if pin.local_root is not None else f"{pin.repo}@{pin.revision}"
@@ -440,7 +475,7 @@ def _version_policy(pin: DataPin, transport: Transport | None):
             except (OfflineMissingError, RevisionError, IntegrityError) as exc:
                 if pin.offline:
                     raise MissingDataError(f"offline: the version policy of {where} is not usable: {exc}") from exc
-                _, index, paths = fetch_support("op-latency", transport=transport, **common)
+                _, index, paths = _fetch_preselection(fetch_support, "op-latency", pin, transport, out)
             path = paths.get(name)
         if path is None or not Path(path).is_file():
             raise MissingDataError(f"{where} publishes no {name}; the backend version cannot be resolved")

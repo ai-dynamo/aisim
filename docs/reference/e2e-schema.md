@@ -71,6 +71,12 @@ until the data is fixed. External contributors convert to canonical names first;
 One configuration (one `configuration_id`, hashed from identity only) holds many observations, so lanes 1, 4,
 8 of one serving setup sit side by side.
 
+Writers put tables and provenance in immutable `generations/<id>/` directories and atomically replace the
+manifest after publishing its artifacts. Snapshot membership and acquisition tables likewise use distinct
+generation paths before the snapshot document switches. Prior generations remain available to readers holding
+older documents; publication does not garbage-collect them. Output paths must stay within the dataset root,
+including existing parent components. Failed rollback retains its staging directory and reports its recovery path.
+
 ### Manifest body (`aisim-e2e-manifest/v1`)
 
 | Field | Required | Notes |
@@ -96,6 +102,15 @@ request counts, `outcome`, `valid_for_submission`, `qualification`, `observer` (
 `time_origin` (what request times count from), raw-artifact references and `attrs` (canonical JSON for scalars
 with no column yet).
 
+| Revision field | Required | Meaning |
+|---|---|---|
+| `record_sha256` | yes | Observation evidence revision, used by snapshot membership |
+| `raw_record_sha256` | no | Minor 2: digest of the raw record or summary when the evidence revision covers additional inputs; when absent, readers use `record_sha256` |
+
+The AIPerf converter binds the evidence revision to the summary, request records, observation metadata and log
+digest. Correcting a request changes snapshot membership even when the summary is unchanged. Raw-summary
+auditing uses `raw_record_sha256` separately.
+
 ### Metrics (`aisim-e2e-metrics/v1`)
 
 Long table. Required: `observation_id`, `metric`, `statistic`, `unit`, `status`. A valid row has a finite
@@ -103,6 +118,10 @@ Long table. Required: `observation_id`, `metric`, `statistic`, `unit`, `status`.
 `observer` (`client` or `server`, so client and engine TTFT never mix), `normalization`, `device_count`, and the
 source audit fields. Scoring needs `ttft`, `tpot` and `e2el` with `mean`, `median` and `p90`; absent ones are
 explicit `missing` rows.
+
+The evaluator preserves throughput normalization and statistic in its full metrics map. Its per-device summary
+uses statistic `value`, then `mean`, then the sole available statistic. Multiple normalization sources at that
+statistic are ambiguous and rejected, so row order cannot choose between reported and derived throughput.
 
 ### Requests (`aisim-e2e-requests/v1`)
 
@@ -133,3 +152,5 @@ row with value 0. Replicas of a tensor-parallel group are never summed; `source`
 
 `aisim_core.data.agentx_convert.agentx_bundles_to_configurations` converts AgentX bundles; the run-level
 statistics it writes are derived from the request rows and say so in `source_name`.
+Bundles of the same origin can merge; mixing official and self-collected bundles with one serving identity is
+rejected because a manifest has only one `origin`.

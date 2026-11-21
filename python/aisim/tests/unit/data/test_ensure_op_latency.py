@@ -11,7 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from aisim_core.data.ensure import DataConflictError, DataPin, MissingDataError, ensure_data
+from aisim_core.data.ensure import DataConflictError, DataPin, DataTooLargeError, MissingDataError, ensure_data
 from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR
 from aisim_core.sdk import ForwardPassPerfModelConfig
 from aisim_core.sdk import rust_engine_step as res
@@ -322,6 +322,41 @@ def test_malformed_reuse_declaration_is_refused(document):
 
 def _tree_files(root):
     return {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
+def test_policy_preselection_obeys_the_whole_pin_budget_and_accounts_for_downloads(two_families, tmp_path):
+    from .test_fetch import FakeTransport
+
+    files = _tree_files(two_families)
+    config = {**CONFIG, "backend_version": None}
+    kwargs = dict(repo="org/dataset", revision="a" * 40, categories=("op-latency",))
+    transport = FakeTransport(files)
+    with pytest.raises(DataTooLargeError):
+        ensure_data(config, DataPin(**kwargs, max_bytes=0, cache_dir=tmp_path / "zero"), transport=transport)
+    assert transport.opened == []
+    out = ensure_data(config, DataPin(**kwargs, cache_dir=tmp_path / "full"), transport=transport)
+    assert out.downloaded_bytes == sum(len(files[p]) for p in transport.opened)
+    assert any(p.endswith("query_versions.parquet") for p in transport.opened)
+    spent = out.downloaded_bytes
+    exact = FakeTransport(files)
+    assert (
+        ensure_data(
+            config, DataPin(**kwargs, max_bytes=spent, cache_dir=tmp_path / "exact"), transport=exact
+        ).downloaded_bytes
+        == spent
+    )
+    warm = FakeTransport(files)
+    assert (
+        ensure_data(
+            config, DataPin(**kwargs, max_bytes=0, cache_dir=tmp_path / "exact"), transport=warm
+        ).downloaded_bytes
+        == 0
+    )
+    assert warm.opened == []
+    with pytest.raises(DataTooLargeError):
+        ensure_data(
+            config, DataPin(**kwargs, max_bytes=spent - 1, cache_dir=tmp_path / "tight"), transport=FakeTransport(files)
+        )
 
 
 def test_a_cold_fetch_brings_the_pinned_lookup_tables(tree, tmp_path):  # noqa: F811

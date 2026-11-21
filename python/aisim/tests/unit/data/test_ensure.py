@@ -220,6 +220,18 @@ def test_pin_from_environment():
         pin_from_environment({"AISIM_DATASET": "no-revision"})
 
 
+def test_environment_successor_alias_keeps_mapping_through_ensure(tmp_path, files):
+    from aisim_core.data.repos import PUBLIC_REPO, RETIRED_FPM_REPO
+    from tests.unit.data.test_fetch_regressions import _successor_files
+
+    transport = FakeTransport(_successor_files(files))
+    p = pin_from_environment({"AISIM_DATASET": f"{RETIRED_FPM_REPO}@main", "AISIM_DATA_CACHE": str(tmp_path / "cache")})
+    result = ensure_data(CONFIG, p, transport=transport)
+    assert result.datasets["fpm"]["repo"] == PUBLIC_REPO
+    assert any(path.startswith("data/fpm/") for path in transport.opened)
+    assert Path(result.config["estimator_config"]["op_level"]["execution_profile"]["path"]).is_file()
+
+
 def test_ensure_guard_blocks_recursion(tmp_path, files):
     seen = []
     real = FpmLoader.load
@@ -386,6 +398,22 @@ def test_the_size_allowance_covers_the_whole_pin(tmp_path, files, monkeypatch):
     assert err.value.uncached_bytes > spent + 1
 
 
+def test_configuration_ownership_indexes_are_budgeted_and_charged(tmp_path, files):
+    p = pin(tmp_path, categories=("fpm", "op-latency"), configuration_id="cfg-" + "a" * 64, max_bytes=0)
+    transport = FakeTransport(files)
+    with pytest.raises(DataTooLargeError):
+        ensure_data(CONFIG, p, transport=transport)
+    assert transport.opened == []
+    out = ensure_mod.EnsuredData(config=dict(CONFIG))
+    p = pin(tmp_path, max_bytes=1_000_000)
+    ids = ensure_mod._category_configuration_ids(p, transport, "fpm", out)
+    assert ids and out.downloaded_bytes == sum(len(files[path]) for path in transport.opened)
+    before = out.downloaded_bytes
+    transport.opened.clear()
+    assert ensure_mod._category_configuration_ids(p, transport, "fpm", out) == ids
+    assert out.downloaded_bytes == before and transport.opened == []
+
+
 def test_the_fpm_preparation_key_covers_the_runtime_destination(tmp_path):
     from tests.unit.data.test_fetch import _repin
 
@@ -501,7 +529,7 @@ def test_an_entry_whose_manifest_belongs_to_another_model_is_refused(tmp_path):
 def test_a_configuration_id_constrains_only_the_category_that_lists_it(tmp_path, monkeypatch, categories):
     seen = {}
 
-    def fake_ids(pin_, transport, category):
+    def fake_ids(pin_, transport, category, out):
         return {"cfg-fpm": {"cfg-a", "cfg-b"}, "cfg-op": {"cfg-x"}}.get(
             {"fpm": "cfg-fpm", "op-latency": "cfg-op"}[category], set()
         )

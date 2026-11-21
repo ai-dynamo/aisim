@@ -142,6 +142,23 @@ def test_bundles_with_one_serving_identity_merge_into_one_configuration(tmp_path
     assert {o.concurrency for o in configs[0].observations} == {1, 4}
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_bundles_with_mixed_origins_cannot_share_a_manifest(tmp_path, reverse):
+    bundles = [_bundle(tmp_path, "official", category="agentx"), _bundle(tmp_path, "local")]
+    if reverse:
+        bundles.reverse()
+    with pytest.raises(AgentxBundleError, match="mixed origins"):
+        agentx_bundles_to_configurations(bundles)
+
+
+def test_same_origin_official_bundles_still_merge(tmp_path):
+    configs = agentx_bundles_to_configurations(
+        [_bundle(tmp_path, "o1", category="agentx"), _bundle(tmp_path, "o2", category="agentx")]
+    )
+    assert len(configs) == 1 and configs[0].body.origin == "official"
+    assert len(configs[0].observations) == 2
+
+
 def test_official_bundle_without_reference_keys_records_a_lineage_gap(tmp_path):
     data = agentx_bundle_to_configuration(_bundle(tmp_path, "agentx-1", category="agentx", with_keys=False))
     assert data.body.origin == "official" and data.observations[0].valid_for_submission is None

@@ -48,6 +48,31 @@ from aisim_core.data import (
     _relative,
 )
 from aisim_core.data.parquet import read_parquet_schema_id
+from aisim_core.data.repos import resolve_ref
+
+
+class _AliasTransport:
+    """Rewrite moved FPM paths only at the transport boundary; cache and identity paths stay logical."""
+
+    def __init__(self, transport, reference):
+        self.transport, self.reference = transport, reference
+
+    def resolve_revision(self, repo, revision):
+        return self.transport.resolve_revision(repo, revision)
+
+    def open_file(self, repo, sha, path):
+        return self.transport.open_file(repo, sha, self.reference.path(path))
+
+
+def _resolve_source(repo, revision, transport, category=None):
+    # An ensure call can share the aliased transport across categories. Only FPM artifacts moved under data/fpm/.
+    if isinstance(transport, _AliasTransport) and category not in (None, "fpm"):
+        transport = transport.transport
+    reference = resolve_ref(repo, revision)
+    if reference.via == "successor-alias" and transport is not None and category in (None, "fpm"):
+        transport = _AliasTransport(transport, reference)
+    return reference.repo, reference.revision, transport
+
 
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _REPO = re.compile(r"^[A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*$")
@@ -478,6 +503,9 @@ class _Planner:
         # budget stop an oversized stream before it is held in memory. A transport that finishes the whole
         # download before yielding (Hugging Face) can only be checked once its bytes arrive.
         limit = ref.bytes if ref.bytes is not None else _METADATA_CAP_BYTES
+        if self.budget is not None and plan.metadata_bytes + (ref.bytes or 1) > self.budget:
+            self._add(ref)
+            raise BudgetExceededError(plan, self.budget)
         chunks: list[bytes] = []
         received = 0
         for chunk in self.transport.open_file(plan.repo, plan.revision, ref.path):
@@ -491,7 +519,6 @@ class _Planner:
         plan.metadata_bytes += received
         if validate is not None:
             validate(b"".join(chunks))
-        self.cache.discard(plan.repo, plan.revision, ref.path)
         self.cache.store(plan.repo, plan.revision, ref.path, chunks, ref)
         self._add(ref)
         return self.cache.path_for(plan.repo, plan.revision, ref.path).read_bytes()
@@ -515,6 +542,7 @@ def plan(
     here. Offline, nothing is downloaded and absent files go in ``missing``.
     """
     selection.validate()
+    repo, revision, transport = _resolve_source(repo, revision, transport, selection.category)
     cache = cache or Cache()
     sha = _resolved or resolve_revision(transport, repo, revision, offline=offline)
     out = FetchPlan(repo=repo, revision=sha, requested_revision=revision, offline=offline)
@@ -597,6 +625,7 @@ def fetch(
     """
     if max_bytes is not None and max_bytes < 0:
         raise ValueError("max_bytes must be non-negative")
+    repo, revision, transport = _resolve_source(repo, revision, transport, selection.category)
     cache = cache or Cache()
     sha = resolve_revision(transport, repo, revision, offline=offline)
     result_plan = plan(
@@ -625,7 +654,6 @@ def fetch(
     for f in result_plan.files:
         if f.cached:
             continue
-        cache.discard(repo, sha, f.path)
         _, size = cache.store(repo, sha, f.path, transport.open_file(repo, sha, f.path), f)
         downloaded += size
         f.cached = True
@@ -641,16 +669,23 @@ def load_category_index(
     transport: Transport | None = None,
     cache: Cache | None = None,
     offline: bool = False,
+    max_bytes: int | None = None,
+    _accounting: FetchPlan | None = None,
 ) -> tuple[str, CategoryIndex, DatasetIndex]:
     """Resolve ``revision`` once and read the dataset and category indexes (a few KB).
 
     Returns ``(full_sha, category_index, dataset_index)``. Use it to choose
     configuration IDs before any artifact is planned or downloaded.
     """
+    repo, revision, transport = _resolve_source(repo, revision, transport, category)
     cache = cache or Cache()
     sha = resolve_revision(transport, repo, revision, offline=offline)
-    out = FetchPlan(repo=repo, revision=sha, requested_revision=revision, offline=offline)
-    planner = _Planner(transport, cache, out)
+    out = (
+        _accounting
+        if _accounting is not None
+        else FetchPlan(repo=repo, revision=sha, requested_revision=revision, offline=offline)
+    )
+    planner = _Planner(transport, cache, out, budget=max_bytes)
 
     def parse(model, raw: bytes | None, path: str):
         if raw is None:
@@ -685,24 +720,38 @@ def fetch_support(
     transport: Transport | None = None,
     cache: Cache | None = None,
     offline: bool = False,
+    max_bytes: int | None = None,
+    _accounting: FetchPlan | None = None,
 ) -> tuple[str, CategoryIndex, dict[str, Path]]:
     """Read a category index and fetch only its ``support`` files (a few KB), verified.
 
     Returns ``(full_sha, category_index, {dataset path: local file})``. Use it for policy a selection depends on
     (the op-latency version slots) before any entry is chosen.
     """
+    repo, revision, transport = _resolve_source(repo, revision, transport, category)
     cache = cache or Cache()
-    sha, index, _ = load_category_index(
-        category, repo=repo, revision=revision, transport=transport, cache=cache, offline=offline
+    sha = resolve_revision(transport, repo, revision, offline=offline)
+    accounting = (
+        _accounting
+        if _accounting is not None
+        else FetchPlan(repo=repo, revision=sha, requested_revision=revision, offline=offline)
     )
+    sha, index, _ = load_category_index(
+        category,
+        repo=repo,
+        revision=sha,
+        transport=transport,
+        cache=cache,
+        offline=offline,
+        max_bytes=max_bytes,
+        _accounting=accounting,
+    )
+    planner = _Planner(transport, cache, accounting, budget=max_bytes)
     paths: dict[str, Path] = {}
     for artifact in index.support:
         ref = _ref(artifact, "artifact")
-        if not cache.valid(repo, sha, ref.path, ref):
-            if offline or transport is None:
-                raise OfflineMissingError([ref.path])
-            cache.discard(repo, sha, ref.path)
-            cache.store(repo, sha, ref.path, transport.open_file(repo, sha, ref.path), ref)
+        if planner.read(ref) is None:
+            raise OfflineMissingError([ref.path])
         paths[ref.path] = cache.path_for(repo, sha, ref.path)
     return sha, index, paths
 

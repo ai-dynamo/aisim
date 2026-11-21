@@ -293,6 +293,8 @@ def run_validation(
         return failed("fail", [f"record {request.record_path!r} is not in the selected evidence"], dataset_sha=sha)
     try:
         record = load_record(local)
+        if record.status != "complete":
+            return failed("fail", [f"record status must be complete, got {record.status!r}"], dataset_sha=sha)
         table_art = next(a for a in record.truth.artifacts if a.artifact_id == record.truth.truth_table_artifact_id)
         # Truth artifact paths are dataset-root relative. The table must be part of the selected evidence; a copy
         # that is merely in the cache would make the verdict depend on cache state.

@@ -95,13 +95,14 @@ def render_all() -> dict[str, str]:
 
 
 def write_snapshots(directory: str | Path = PACKAGED_SNAPSHOT_DIR) -> list[Path]:
-    """Write every snapshot, removing stale generated ones, and return the paths."""
+    """Write every registered snapshot without deleting unrecognized files, and return the paths.
+
+    A caller-supplied directory can contain unrelated JSON. Obsolete snapshots remain visible to
+    ``check_snapshots`` so their owner can explicitly remove them.
+    """
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     rendered = render_all()
-    for stale in directory.glob("*.json"):
-        if stale.name not in rendered:
-            stale.unlink()
     paths = []
     for name, text in rendered.items():
         path = directory / name
