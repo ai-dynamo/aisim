@@ -1527,6 +1527,26 @@ mod async_scheduling_admission {
         assert_eq!(core.state.preemptions_total, 1);
         assert!(decoded.output_signals.iter().any(|signal| signal.uuid == a));
     }
+
+    #[test]
+    fn a_request_the_pass_in_flight_decodes_is_found_out_of_uuid_order() {
+        // C, B and A fill the 6 blocks and decode in pass 1 in arrival order,
+        // the reverse of their UUIDs. In pass 2 C's next token needs a block
+        // that only preempting A, the newest request, frees. Pass 1 ran A, so
+        // C waits and A is preempted in the next step.
+        let mut core = core_with_cache(2, 6, true);
+        let mut now = 0.0;
+        arrive_with_prompt(&mut core, 3, 7, 4, false);
+        arrive_with_prompt(&mut core, 2, 6, 4, false);
+        arrive_with_prompt(&mut core, 1, 6, 4, false);
+        step(&mut core, &mut now);
+        step(&mut core, &mut now);
+        let blocked = step(&mut core, &mut now);
+        assert!(blocked.output_signals.is_empty());
+        assert_eq!(core.state.preemptions_total, 0);
+        step(&mut core, &mut now);
+        assert_eq!(core.state.preemptions_total, 1);
+    }
 }
 
 mod source_holds {
