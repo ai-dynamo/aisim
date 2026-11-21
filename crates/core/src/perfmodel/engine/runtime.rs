@@ -3121,7 +3121,8 @@ impl Engine {
         mut on_op: impl FnMut(MixedPass, &Op, PerformanceResult, f64),
     ) -> Result<(PerformanceResult, PerformanceResult), AicError> {
         let mut prefill_component = PerformanceResult::zero();
-        let decode_query_tokens = gen_tokens.saturating_mul(self.nextn.saturating_add(1));
+        // Reject unrepresentable qualified counts before querying either phase.
+        let decode_query_tokens = self.packed_decode_tokens(gen_tokens)?;
         let mut price_prefill = |batch: u32, tokens: u32, prefix: u32, scheduled: u32| {
             let mut result = prefill_op.query_totals(
                 &self.db,
@@ -3239,10 +3240,9 @@ impl Engine {
             if ctx_tokens > 0 {
                 // Use the equivalent-AR query's same batch and KV coordinates
                 // so the current per-curve coverage policy chooses the same rows.
-                let baseline_batch = gen_tokens.saturating_mul(self.nextn.saturating_add(1));
                 let baseline_kv = gen_tokens as f64 * (rt.isl as f64 + 1.0);
                 let baseline_ms = decode_op
-                    .query_pass_baseline(&self.db, baseline_batch, baseline_kv)?
+                    .query_pass_baseline(&self.db, decode_query_tokens, baseline_kv)?
                     .latency_ms;
                 target.latency_ms = (target.latency_ms - baseline_ms).max(0.0);
                 // D10 (AISIM-2001): no marginal FPM energy over an uncovered
@@ -10489,11 +10489,12 @@ pub(crate) mod tests {
                 / engine.db.system_spec.gpu.mem_bw
                 * 1000.0
         };
+        // The session canonicalizes groups by increasing chunk length.
         for (scheduled, isl, prefix, groups, target_ms) in [
-            (384, 512, 256, &[(1, 256), (1, 128)][..], 12.0),
+            (384, 512, 256, &[(1, 128), (1, 256)][..], 12.0),
             (512, 512, 256, &[(2, 256)][..], 14.0),
-            (640, 512, 256, &[(2, 256), (1, 128)][..], 16.0),
-            (1500, 4096, 3000, &[(1, 1096), (1, 404)][..], 18.0),
+            (640, 512, 256, &[(1, 128), (2, 256)][..], 16.0),
+            (1500, 4096, 3000, &[(1, 404), (1, 1096)][..], 18.0),
         ] {
             let mut scans = Vec::new();
             let mut targets = Vec::new();
@@ -10552,6 +10553,36 @@ pub(crate) mod tests {
             let detailed: f64 = shared.iter().chain(&decode_rows).map(|row| row.1).sum();
             assert!((detailed - scalar).abs() < 1e-12);
         }
+
+        // 536,870,912 requests at width 8 need 2^32 packed tokens. Reject
+        // that count before querying the target prefill table or draft scans,
+        // rather than exposing a lookup error for a saturated coordinate.
+        let mut queried = false;
+        let error = engine
+            .fpm_mixed_step_components(
+                prefill,
+                decode,
+                tail,
+                384,
+                536_870_912,
+                512,
+                1,
+                256,
+                1.0,
+                1.0,
+                |_, _, _, _| queried = true,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AicError::InvalidEngineConfig(ref message)
+                    if message == "536870912 decode requests of 8 tokens overflow the u32 count \
+                                   that qualified Mamba ops divide by their token width"
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(!queried, "overflow must fail before any prefill query");
     }
 
     #[test]
