@@ -3109,12 +3109,12 @@ impl VllmCore {
                 committed_requests.push(signal.uuid);
             }
         }
-        committed_requests.sort_unstable();
-        committed_requests.dedup();
         if self.args.max_concurrent_batches > 1 {
             self.pass_ran_work = !committed_requests.is_empty();
             if self.native_host_offload.is_some() {
+                // Preemption binary-searches the pass in flight.
                 self.in_flight_requests.clone_from(&committed_requests);
+                self.in_flight_requests.sort_unstable();
             }
         }
         self.passes_executed += 1;
