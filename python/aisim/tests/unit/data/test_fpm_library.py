@@ -3188,6 +3188,7 @@ def test_restaging_changed_library_does_not_reuse_a_live_native_table(root, prof
     try:
         # Synthetic fixture cell: 3 ms before replacement, 7 ms afterwards.
         assert model_a.estimate_forward_pass_time_ms(query) == pytest.approx(3.0)
+        model_a.save_state_snapshot(tmp_path / "snapshot-a")
         other = tmp_path / "other"
         make_entry(other, profile)
         parquet, sidecar = _stage_args(other)
@@ -3206,6 +3207,19 @@ def test_restaging_changed_library_does_not_reuse_a_live_native_table(root, prof
         try:
             assert model_b.estimate_forward_pass_time_ms(query) == pytest.approx(7.0)
             assert model_a.estimate_forward_pass_time_ms(query) == pytest.approx(3.0)
+            snapshot_b = tmp_path / "snapshot-b"
+            model_b.save_state_snapshot(snapshot_b)
+            restored = RustForwardPassPerfModel.best_available(state_snapshot=snapshot_b)
+            try:
+                assert restored.estimate_forward_pass_time_ms(query) == pytest.approx(7.0)
+            finally:
+                restored.close()
+            # A new generation must not overwrite the old model's fingerprint.
+            with pytest.raises(ValueError, match="changed after this process loaded it"):
+                model_a.save_state_snapshot(tmp_path / "stale-snapshot-a")
+            assert not (tmp_path / "stale-snapshot-a").exists()
+            with pytest.raises(ValueError, match="differs from the snapshot fingerprint"):
+                RustForwardPassPerfModel.best_available(state_snapshot=tmp_path / "snapshot-a")
             inode = second._staged.parquet_path.lstat().st_ino
             again = load(other, config, tmp_path)
             assert again._staged.parquet_path.lstat().st_ino == inode

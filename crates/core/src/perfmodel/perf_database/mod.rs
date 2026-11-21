@@ -66,7 +66,7 @@ type SharedTablesMemo = Mutex<HashMap<String, (PathBuf, Weak<PerfTables>)>>;
 /// retain their existing immutable-root cache behavior. Only an absent marker
 /// means "ordinary root"; any other read error fails the load rather than
 /// silently disabling generation tracking.
-fn staged_generation(systems_root: &Path) -> Result<String, AicError> {
+pub(crate) fn staged_generation(systems_root: &Path) -> Result<String, AicError> {
     let path = systems_root.join(".staged.json");
     match std::fs::read(&path) {
         Ok(bytes) => Ok(blake3::hash(&bytes).to_hex().to_string()),
