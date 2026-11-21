@@ -182,7 +182,7 @@ jobs:
       - name: Install measurement tooling
         run: |
           python -I -m venv "${RUNNER_TEMP}/trusted-venv"
-          "${RUNNER_TEMP}/trusted-venv/bin/pip" install --require-hashes -r trusted/scripts/e2e_accuracy/requirements.txt
+          PIP_CONFIG_FILE=/dev/null "${RUNNER_TEMP}/trusted-venv/bin/pip" install --require-hashes -r trusted/scripts/e2e_accuracy/requirements.txt
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: e2e-accuracy-dataset
@@ -247,7 +247,7 @@ jobs:
       - name: Install the trusted credentialed tooling (never receives the evaluated wheel)
         run: |
           python -I -m venv "${RUNNER_TEMP}/trusted-venv"
-          "${RUNNER_TEMP}/trusted-venv/bin/pip" install --require-hashes -r trusted/scripts/e2e_accuracy/requirements.txt
+          PIP_CONFIG_FILE=/dev/null "${RUNNER_TEMP}/trusted-venv/bin/pip" install --require-hashes -r trusted/scripts/e2e_accuracy/requirements.txt
       - name: Install the CPU campaign environment
         run: |
           sudo apt-get update
@@ -386,7 +386,7 @@ jobs:
       - name: Install the trusted credentialed tooling (never receives the evaluated wheel)
         run: |
           python -I -m venv "${RUNNER_TEMP}/trusted-venv"
-          "${RUNNER_TEMP}/trusted-venv/bin/pip" install --require-hashes -r trusted/scripts/e2e_accuracy/requirements.txt
+          PIP_CONFIG_FILE=/dev/null "${RUNNER_TEMP}/trusted-venv/bin/pip" install --require-hashes -r trusted/scripts/e2e_accuracy/requirements.txt
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: e2e-accuracy-dataset
@@ -489,7 +489,7 @@ jobs:
       - name: Install the trusted credentialed tooling (never receives the evaluated wheel)
         run: |
           python -I -m venv "${RUNNER_TEMP}/trusted-venv"
-          "${RUNNER_TEMP}/trusted-venv/bin/pip" install --require-hashes -r trusted/scripts/e2e_accuracy/requirements.txt
+          PIP_CONFIG_FILE=/dev/null "${RUNNER_TEMP}/trusted-venv/bin/pip" install --require-hashes -r trusted/scripts/e2e_accuracy/requirements.txt
       - name: Install the CPU campaign environment
         run: |
           sudo apt-get update
@@ -605,7 +605,7 @@ jobs:
       - name: Install the trusted credentialed tooling (never receives the evaluated wheel)
         run: |
           python -I -m venv "${RUNNER_TEMP}/trusted-venv"
-          "${RUNNER_TEMP}/trusted-venv/bin/pip" install --require-hashes -r trusted/scripts/e2e_accuracy/requirements.txt
+          PIP_CONFIG_FILE=/dev/null "${RUNNER_TEMP}/trusted-venv/bin/pip" install --require-hashes -r trusted/scripts/e2e_accuracy/requirements.txt
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: agentx-private-${{ inputs.artifact_key }}-*
