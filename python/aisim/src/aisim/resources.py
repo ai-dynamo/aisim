@@ -1246,6 +1246,29 @@ class GuardedRunnerFactory:
     def create(self, worker_id):
         return GuardedRunner(self.factory.create(worker_id), self.stack, self.policy, self.factory)
 
+    def wave_reuse_key(self, specs):
+        """Only the native Weka runner opts into keeping a compiled trace across waves."""
+        from .runner import EngineReplayRunnerFactory
+
+        if (
+            not isinstance(self.factory, EngineReplayRunnerFactory)
+            or self.factory.runtime is not None
+            or not self.factory.trace_graph_cache
+        ):
+            return None
+        workload = specs[0].workload
+        if workload.get("trace_format") != "weka" or not (workload.get("trace_paths") or workload.get("trace_path")):
+            return None
+        if any(spec.workload != workload for spec in specs[1:]):
+            return None
+        # Profiled Weka workloads can be reused, even though they cannot supply
+        # a finite-trace memory estimate. Keep both decisions independent.
+        try:
+            files = _trace_files(workload, "weka")
+            return (len(specs), workload, _trace_scan_identity(files)) if files else None
+        except OSError:
+            return None
+
     def record_peak(self, spec: Any, peak_bytes: int) -> None:
         """Remember the largest RSS that a completed replay of this trace reached."""
         key = _trace_identity(spec.workload)

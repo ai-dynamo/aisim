@@ -84,8 +84,11 @@ budget at startup, then samples total owned RSS and live host headroom every
 50 ms, including initialization and output serialization. Runtime thread pools
 are limited to one thread per worker. During recommendation evaluation, memory
 pressure triggers worker cleanup and retries unfinished candidates at lower
-parallelism, at most twice. Completed candidates are retained. Workers must be
-reaped before another batch can start. Persistent pressure produces an explicit
+parallelism, at most twice. The scheduler retains completed candidates and reaps
+interrupted workers before retrying. A native Weka sweep can keep healthy workers
+across waves when the workload, trace files, and worker count match. The scheduler
+admits each wave against live memory. If idle workers prevent admission, it reaps
+them and retries at the same width. Persistent pressure produces an explicit
 `resource_limited` candidate and the sweep continues with other candidates.
 A sudden jump past the supervisor limit stops the entire execution tree.
 

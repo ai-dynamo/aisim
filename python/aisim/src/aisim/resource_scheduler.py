@@ -52,18 +52,46 @@ class _Measured:
 
 
 def _measured(evaluate, spec) -> _Measured:
-    # Each wave starts a fresh pool, so the high-water mark covers this
-    # worker's setup and at most this wave's evaluations.
+    # A retained worker's lifetime peak is a conservative bound for the same trace.
     return _Measured(evaluate(spec), _peak_rss_bytes())
 
 
-def evaluate_waves(specs, *, factory, initializer, evaluate, workers: int, timeout: float | None):
-    """Yield indexed results. Retry interrupted work at most twice, at fewer workers.
+class WavePool:
+    """Own one admitted pool and its initialization markers for one sweep."""
 
-    One admitted wave owns the workers at a time. Workers are reaped before
-    admission of the next wave, so retained runtime allocations cannot overlap
-    a replacement's reservation. Completed results are yielded before recovery.
-    """
+    def __init__(self):
+        self.executor = None
+        self.ready = None
+        self.key = None
+
+    def start(self, key, size, factory, initializer):
+        if self.executor is None:
+            self.ready = tempfile.TemporaryDirectory(prefix="aisim-wave-")
+            self.executor = ProcessPoolExecutor(
+                max_workers=size,
+                mp_context=mp.get_context("spawn"),
+                initializer=_initialize,
+                initargs=(factory, initializer, self.ready.name),
+            )
+            self.key = key
+        return self.executor
+
+    def close(self, *, interrupted=False):
+        try:
+            if self.executor is not None:
+                (terminate_pool if interrupted else close_pool)(self.executor)
+        finally:
+            self.executor = None
+            self.key = None
+            if self.ready is not None:
+                self.ready.cleanup()
+                self.ready = None
+
+
+def evaluate_waves(specs, *, factory, initializer, evaluate, workers: int, timeout: float | None, pool_state=None):
+    """Admit each wave, drain completed results, and retry resource interruptions at fewer workers."""
+    state = pool_state if pool_state is not None else WavePool()
+    reuse_key = getattr(factory, "wave_reuse_key", None) if pool_state is not None else None
     pending = list(range(len(specs)))
     attempts = dict.fromkeys(pending, 0)
     capacity = max(1, workers)
@@ -73,16 +101,24 @@ def evaluate_waves(specs, *, factory, initializer, evaluate, workers: int, timeo
     while pending:
         wave = pending[:capacity]
         while True:
+            candidates = [specs[index] for index in wave]
+            key = reuse_key(candidates) if reuse_key is not None else None
+            if state.executor is not None and (key is None or key != state.key):
+                state.close()
             try:
-                plan = factory.admit_wave([specs[index] for index in wave])
+                plan = factory.admit_wave(candidates)
                 break
-            except _SerialAdmissionRequired:
-                # This is a mode constraint, not transient memory pressure.
-                # Do not reparse candidates while halving an impossible wave.
-                capacity = 1
-                wave = wave[:1]
-                awaiting_observation = True
             except ResourceLimitError as exc:
+                # Idle workers count against live headroom. Retry the same wave cold
+                # before using a smaller wave or refusing a candidate.
+                if state.executor is not None:
+                    state.close()
+                    continue
+                if isinstance(exc, _SerialAdmissionRequired):
+                    capacity = 1
+                    wave = wave[:1]
+                    awaiting_observation = True
+                    continue
                 if len(wave) > 1:
                     wave = wave[: max(1, len(wave) // 2)]
                     continue
@@ -97,16 +133,11 @@ def evaluate_waves(specs, *, factory, initializer, evaluate, workers: int, timeo
         pending = pending[len(wave) :]
         for index in wave:
             attempts[index] += 1
-        ready = tempfile.TemporaryDirectory(prefix="aisim-wave-")
-        pool = ProcessPoolExecutor(
-            max_workers=len(wave),
-            mp_context=mp.get_context("spawn"),
-            initializer=_initialize,
-            initargs=(factory, initializer, ready.name),
-        )
         active = {}
         interrupted = None
+        healthy = False
         try:
+            pool = state.start(key, len(wave), factory, initializer)
             measured = partial(_measured, evaluate)
             active = {pool.submit(measured, specs[index]): index for index in wave}
             started = time.monotonic()
@@ -134,7 +165,7 @@ def evaluate_waves(specs, *, factory, initializer, evaluate, workers: int, timeo
             while active:
                 if not initialized:
                     worker_pids = {str(pid) for pid in (getattr(pool, "_processes", None) or {})}
-                    ready_pids = {path.name for path in Path(ready.name).iterdir()}
+                    ready_pids = {path.name for path in Path(state.ready.name).iterdir()}
                     initialized = bool(worker_pids) and worker_pids <= ready_pids
                     if initialized:
                         mark_execution_ready()
@@ -176,8 +207,7 @@ def evaluate_waves(specs, *, factory, initializer, evaluate, workers: int, timeo
                     break
             if interrupted:
                 unfinished = [active[future] for future in active]
-                terminate_pool(pool)
-                pool = None
+                state.close(interrupted=True)
                 capacity = max(1, len(wave) // 2)
                 retry = []
                 for index in unfinished:
@@ -191,8 +221,9 @@ def evaluate_waves(specs, *, factory, initializer, evaluate, workers: int, timeo
                 )
                 pending = retry + pending
             else:
-                close_pool(pool)
-                pool = None
+                healthy = True
+                if key is None:
+                    state.close()
                 # Unknown peaks run one at a time until a completed replay of
                 # each upcoming candidate's trace has been measured.
                 if (
@@ -204,6 +235,5 @@ def evaluate_waves(specs, *, factory, initializer, evaluate, workers: int, timeo
                     awaiting_observation = False
                     capacity = max(1, workers)
         finally:
-            if pool is not None:
-                terminate_pool(pool)
-            ready.cleanup()
+            if not healthy:
+                state.close(interrupted=True)

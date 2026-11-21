@@ -580,3 +580,141 @@ def test_multiple_siblings_finishing_across_successive_yield_pauses_are_drained(
 
     with pytest.raises(StopIteration):
         next(gen)
+
+
+def test_reuse_requires_same_native_weka_workload_and_width(monkeypatch, tmp_path):
+    from concurrent.futures import Future
+
+    from aisim import resource_scheduler as scheduler
+    from aisim.runner import EngineReplayRunnerFactory
+
+    factory = GuardedRunnerFactory(EngineReplayRunnerFactory(trace_graph_cache=True), "engine", ResourceConfig())
+    state = scheduler.WavePool()
+    made = []
+    admissions = []
+    refuse_warm = False
+    for path in ("a", "b"):
+        (tmp_path / f"{path}.jsonl").touch()
+
+    class Pool:
+        def __init__(self, **kwargs):
+            made.append(self)
+
+        def submit(self, fn, spec):
+            future = Future()
+            future.set_result(made.index(self))
+            return future
+
+    def admit(self, specs):
+        admissions.append((len(specs), state.executor is not None))
+        if refuse_warm and state.executor is not None:
+            raise ResourceLimitError("insufficient headroom with idle workers")
+        return {}
+
+    monkeypatch.setattr(scheduler, "ProcessPoolExecutor", Pool)
+    monkeypatch.setattr(scheduler, "close_pool", lambda pool: None)
+    monkeypatch.setattr(GuardedRunnerFactory, "admit_wave", admit)
+
+    def run(*paths):
+        specs = [
+            SimpleNamespace(
+                workload={
+                    "trace_format": "weka",
+                    "trace_paths": [str(tmp_path / f"{path}.jsonl")],
+                    "agentic_profile": {"duration_seconds": 120},
+                }
+            )
+            for path in paths
+        ]
+        return [
+            value
+            for _, value in evaluate_waves(
+                specs,
+                factory=factory,
+                initializer=_init,
+                evaluate=_evaluate,
+                workers=len(specs),
+                timeout=10,
+                pool_state=state,
+            )
+        ]
+
+    try:
+        assert run("a") == run("a") == [0]
+        refuse_warm = True
+        assert run("a") == [1]
+        assert admissions[-2:] == [(1, True), (1, False)]
+        refuse_warm = False
+        assert run("b") == [2]
+        assert run("b", "b") == run("b", "b") == [3, 3]
+        (tmp_path / "b.jsonl").write_text("{}")
+        assert run("b", "b") == [4, 4]
+        assert run("a", "b") == [5, 5]
+        assert state.executor is None
+    finally:
+        state.close()
+
+
+@pytest.mark.parametrize("pressure", [True, False], ids=["memory", "timeout"])
+def test_interrupted_reused_pool_keeps_completed_sibling(monkeypatch, pressure):
+    from concurrent.futures import Future
+
+    from aisim import resource_scheduler as scheduler
+
+    state = scheduler.WavePool()
+    pools = []
+    killed = []
+    submitted = []
+
+    class Factory(_BudgetFactory):
+        def wave_reuse_key(self, specs):
+            return len(specs), "a"
+
+        def live_pressure(self):
+            return {"reason": "pressure"} if pressure else None
+
+    class Pool:
+        def __init__(self, **kwargs):
+            pools.append(self)
+
+        def submit(self, fn, spec):
+            i = spec["id"]
+            submitted.append(i)
+            future = Future()
+            if i != 3 or len(pools) > 1:
+                future.set_result(i)
+            return future
+
+    factory = Factory()
+    monkeypatch.setattr(scheduler, "ProcessPoolExecutor", Pool)
+    monkeypatch.setattr(scheduler, "close_pool", lambda pool: None)
+    monkeypatch.setattr(scheduler, "terminate_pool", killed.append)
+
+    def run(ids, timeout):
+        specs = [{"id": i, "cost": 1} for i in ids]
+        return dict(
+            evaluate_waves(
+                specs,
+                factory=factory,
+                initializer=_init,
+                evaluate=_evaluate,
+                workers=2,
+                timeout=timeout,
+                pool_state=state,
+            )
+        )
+
+    try:
+        assert run((0, 1), 10) == {0: 0, 1: 1}
+        result = run((2, 3), 0.01)
+        assert result[0] == 2
+        assert killed == [pools[0]]
+        if pressure:
+            assert result[1] == 3
+            assert submitted == [0, 1, 2, 3, 3]
+        else:
+            assert isinstance(result[1], InterruptedEvaluation)
+            assert not result[1].resource_limited
+            assert submitted == [0, 1, 2, 3]
+    finally:
+        state.close()
