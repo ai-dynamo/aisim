@@ -580,3 +580,227 @@ def test_multiple_siblings_finishing_across_successive_yield_pauses_are_drained(
 
     with pytest.raises(StopIteration):
         next(gen)
+
+
+def test_reuse_requires_same_native_weka_workload_and_width(monkeypatch, tmp_path):
+    from concurrent.futures import Future
+
+    from aisim import resource_scheduler as scheduler
+    from aisim.runner import EngineReplayRunnerFactory
+
+    factory = GuardedRunnerFactory(EngineReplayRunnerFactory(trace_graph_cache=True), "engine", ResourceConfig())
+    state = scheduler.WavePool()
+    made = []
+    admissions = []
+    refuse_warm = False
+    for path in ("a", "b"):
+        (tmp_path / f"{path}.jsonl").touch()
+
+    class Pool:
+        def __init__(self, **kwargs):
+            made.append(self)
+
+        def submit(self, fn, spec):
+            future = Future()
+            future.set_result(made.index(self))
+            return future
+
+    def admit(self, specs):
+        admissions.append((len(specs), state.executor is not None))
+        if refuse_warm and state.executor is not None:
+            raise ResourceLimitError("insufficient headroom with idle workers")
+        return {}
+
+    monkeypatch.setattr(scheduler, "ProcessPoolExecutor", Pool)
+    monkeypatch.setattr(scheduler, "close_pool", lambda pool: None)
+    monkeypatch.setattr(GuardedRunnerFactory, "admit_wave", admit)
+
+    def run(*paths):
+        specs = [
+            SimpleNamespace(
+                workload={
+                    "trace_format": "weka",
+                    "trace_paths": [str(tmp_path / f"{path}.jsonl")],
+                    "agentic_profile": {"duration_seconds": 120},
+                }
+            )
+            for path in paths
+        ]
+        return [
+            value
+            for _, value in evaluate_waves(
+                specs,
+                factory=factory,
+                initializer=_init,
+                evaluate=_evaluate,
+                workers=len(specs),
+                timeout=10,
+                pool_state=state,
+            )
+        ]
+
+    try:
+        assert run("a") == run("a") == [0]
+        refuse_warm = True
+        assert run("a") == [1]
+        assert admissions[-2:] == [(1, True), (1, False)]
+        refuse_warm = False
+        assert run("b") == [2]
+        assert run("b", "b") == run("b", "b") == [3, 3]
+        (tmp_path / "b.jsonl").write_text("{}")
+        assert run("b", "b") == [4, 4]
+        assert run("a", "b") == [5, 5]
+        assert state.executor is None
+    finally:
+        state.close()
+
+
+@pytest.mark.parametrize(
+    "case", ["external", "runtime", "cache-off", "non-weka", "no-path", "symlink", "directory-symlink", "stat-error"]
+)
+def test_ineligible_weka_workloads_have_no_pool_reuse_key(tmp_path, monkeypatch, case):
+    from aisim import resources
+    from aisim.runner import EngineReplayRunnerFactory
+
+    trace = tmp_path / "trace.jsonl"
+    trace.touch()
+    runner = EngineReplayRunnerFactory(
+        trace_graph_cache=case != "cache-off", runtime=object() if case == "runtime" else None
+    )
+    factory = GuardedRunnerFactory(object() if case == "external" else runner, "engine", ResourceConfig())
+    workload = {"trace_format": "mooncake" if case == "non-weka" else "weka"}
+    if case in {"symlink", "directory-symlink"}:
+        link = tmp_path / "link"
+        target = trace
+        if case == "directory-symlink":
+            target = tmp_path / "source"
+            target.mkdir()
+            trace.rename(target / trace.name)
+        link.symlink_to(target)
+        trace = link
+    if case != "no-path":
+        workload["trace_paths"] = [str(trace)]
+    if case == "stat-error":
+
+        def disappeared(files):
+            raise FileNotFoundError(trace)
+
+        monkeypatch.setattr(resources, "_trace_scan_identity", disappeared)
+
+    assert factory.wave_reuse_key([SimpleNamespace(workload=workload)]) is None
+
+
+@pytest.mark.parametrize("pressure", [True, False], ids=["memory", "timeout"])
+def test_interrupted_reused_pool_keeps_completed_sibling(monkeypatch, pressure):
+    from concurrent.futures import Future
+
+    from aisim import resource_scheduler as scheduler
+
+    state = scheduler.WavePool()
+    pools = []
+    killed = []
+    submitted = []
+
+    class Factory(_BudgetFactory):
+        def wave_reuse_key(self, specs):
+            return len(specs), "a"
+
+        def live_pressure(self):
+            return {"reason": "pressure"} if pressure else None
+
+    class Pool:
+        def __init__(self, **kwargs):
+            pools.append(self)
+
+        def submit(self, fn, spec):
+            i = spec["id"]
+            submitted.append(i)
+            future = Future()
+            if i != 3 or len(pools) > 1:
+                future.set_result(i)
+            return future
+
+    factory = Factory()
+    monkeypatch.setattr(scheduler, "ProcessPoolExecutor", Pool)
+    monkeypatch.setattr(scheduler, "close_pool", lambda pool: None)
+    monkeypatch.setattr(scheduler, "terminate_pool", killed.append)
+
+    def run(ids, timeout):
+        specs = [{"id": i, "cost": 1} for i in ids]
+        return dict(
+            evaluate_waves(
+                specs,
+                factory=factory,
+                initializer=_init,
+                evaluate=_evaluate,
+                workers=2,
+                timeout=timeout,
+                pool_state=state,
+            )
+        )
+
+    try:
+        assert run((0, 1), 10) == {0: 0, 1: 1}
+        result = run((2, 3), 0.01)
+        assert result[0] == 2
+        assert killed == [pools[0]]
+        if pressure:
+            assert result[1] == 3
+            assert submitted == [0, 1, 2, 3, 3]
+        else:
+            assert isinstance(result[1], InterruptedEvaluation)
+            assert not result[1].resource_limited
+            assert submitted == [0, 1, 2, 3]
+    finally:
+        state.close()
+
+
+@pytest.mark.parametrize("failure", ["submit", "result", "also-cold"])
+def test_broken_retained_pool_retries_unfinished_work_once(monkeypatch, failure):
+    from concurrent.futures import Future
+    from concurrent.futures.process import BrokenProcessPool
+
+    from aisim import resource_scheduler as scheduler
+
+    submitted = []
+    pools = []
+
+    class Factory(_BudgetFactory):
+        def wave_reuse_key(self, specs):
+            return len(specs)
+
+    class Pool:
+        def __init__(self, **kwargs):
+            pools.append(self)
+
+        def submit(self, fn, spec):
+            index = spec["id"]
+            submitted.append(index)
+            future = Future()
+            if index == 3 and (self is pools[0] or failure == "also-cold"):
+                if failure == "submit":
+                    raise BrokenProcessPool("lost worker on submit")
+                future.set_exception(BrokenProcessPool("lost worker during evaluation"))
+            else:
+                future.set_result(index)
+            return future
+
+    monkeypatch.setattr(scheduler, "ProcessPoolExecutor", Pool)
+    monkeypatch.setattr(scheduler, "close_pool", lambda pool: None)
+    monkeypatch.setattr(scheduler, "terminate_pool", lambda pool: None)
+    state = scheduler.WavePool()
+    factory = Factory()
+    specs = [{"id": i, "cost": 1} for i in range(4)]
+    results = evaluate_waves(
+        specs, factory=factory, initializer=_init, evaluate=_evaluate, workers=2, timeout=10, pool_state=state
+    )
+    try:
+        if failure == "also-cold":
+            with pytest.raises(BrokenProcessPool, match="lost worker"):
+                list(results)
+        else:
+            assert dict(results) == {i: i for i in range(4)}
+        assert submitted == [0, 1, 2, 3, 3]
+        assert factory.admitted == [[0, 1], [2, 3], [3]]
+    finally:
+        state.close()

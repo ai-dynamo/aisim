@@ -720,6 +720,8 @@ class _CleanupProbeRunner(_FakeRunner):
         Path(self.directory, f"{os.getpid()}.{event}").touch()
 
     def run(self, spec):
+        if self.mode == "reuse":
+            self._mark(f"replay-{self.calls}")
         if self.mode == "timeout":
             import signal
             import time
@@ -738,6 +740,68 @@ class _CleanupProbeRunner(_FakeRunner):
             self._mark("closing")
             time.sleep(30)
         self._mark("closed")
+
+
+class _ReusableFactory(_FakeRunnerFactory):
+    def __init__(self, runner):
+        super().__init__(runner)
+        self.peaks = []
+
+    def admit_wave(self, specs):
+        return {}
+
+    def wave_reuse_key(self, specs):
+        return len(specs)
+
+    def live_pressure(self):
+        return None
+
+    def record_peak(self, spec, peak_bytes):
+        self.peaks.append(peak_bytes)
+
+
+@pytest.mark.parametrize("exit_mode", ["completed", "interrupted", "dead-worker"])
+def test_sweeper_reuses_and_reaps_admitted_workers(monkeypatch, tmp_path, exit_mode):
+    from contextlib import nullcontext
+
+    import psutil
+
+    _stub(monkeypatch, _branch(_pc()))
+    factory = _ReusableFactory(_CleanupProbeRunner(tmp_path, "reuse"))
+
+    class Sampler(_FakeSampler):
+        def suggest(self, count):
+            return super().suggest(len(self.scored) + count)[-count:]
+
+    abort = exit_mode == "interrupted"
+
+    def on_round(round_number, candidates):
+        if round_number == 1 and exit_mode == "dead-worker":
+            (first,) = tmp_path.glob("*.replay-0")
+            psutil.Process(int(first.name.split(".")[0])).kill()
+        if round_number == 2 and abort:
+            raise RuntimeError("stop after second wave")
+
+    with pytest.raises(RuntimeError, match="stop after second wave") if abort else nullcontext():
+        _run_sweep(
+            _config(max_rounds=2, candidates_per_round=1),
+            runner_factory=factory,
+            sampler_factory=Sampler,
+            show_progress=False,
+            on_round=on_round,
+        )
+
+    pids = [int(path.name.split(".")[0]) for path in tmp_path.glob("*.replay-0")]
+    assert len(factory.peaks) == 2
+    assert all(not psutil.pid_exists(pid) for pid in pids)
+    if exit_mode == "dead-worker":
+        assert len(pids) == 2
+        assert len(list(tmp_path.glob("*.closed"))) == 1
+    else:
+        (pid,) = pids
+        assert (tmp_path / f"{pid}.replay-1").exists()
+        assert 0 < factory.peaks[0] <= factory.peaks[1]
+        assert (tmp_path / f"{pid}.closed").exists() != abort
 
 
 def _reap_test_pools(pools, workers):

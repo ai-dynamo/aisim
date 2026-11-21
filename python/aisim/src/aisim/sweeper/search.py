@@ -1370,7 +1370,10 @@ class Sweeper:
 
         # Parallel across worker processes when parallel_evals > 1. Spawn keeps
         # runner runtimes isolated and lets each worker reuse one runner instance.
+        from ..resource_scheduler import WavePool
+
         resource_aware = callable(getattr(runner_factory, "admit_wave", None))
+        wave_pool = WavePool() if resource_aware else None
         use_pool = (
             resource_aware
             or (sweep.parallel_evals > 1 and per_round > 1)
@@ -1410,6 +1413,8 @@ class Sweeper:
             except BaseException:
                 # Do not wait forever for an unrelated hung replay when orchestration,
                 # scoring, observation, or cancellation aborts the sweep.
+                if wave_pool is not None:
+                    wave_pool.close(interrupted=True)
                 _terminate_pool(pool_box[0])
                 pool_box[0] = None
                 if sequential_runner is not None:
@@ -1425,6 +1430,8 @@ class Sweeper:
                 pool_box[0] = None
                 if sequential_runner is not None:
                     sequential_runner.close()
+                if wave_pool is not None:
+                    wave_pool.close()
 
         def _pool_error(detail: str) -> RuntimeError:
             return RuntimeError(
@@ -1490,6 +1497,7 @@ class Sweeper:
                     evaluate=_worker_eval,
                     workers=worker_count,
                     timeout=max_eval_seconds,
+                    pool_state=wave_pool,
                 ):
                     suggestion, prepared = todo[index]
                     if isinstance(result, InterruptedEvaluation):
