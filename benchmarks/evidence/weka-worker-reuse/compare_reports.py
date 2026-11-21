@@ -12,6 +12,8 @@ from pathlib import Path
 def report_digest(path: Path) -> str:
     report = json.loads(path.read_text())
     del report["provenance"]["created_at"], report["provenance"]["run_id"]
+    # The full configuration below includes the inputs covered by this path-dependent hash.
+    del report["provenance"]["input_fingerprint"]
     for candidate in report["candidates"]:
         for field in ("wall_time_ms", "processed_tokens_per_s", "processed_output_tokens_per_s"):
             del candidate["metrics"][field]

@@ -459,3 +459,19 @@ def test_weka_cache_is_bounded_and_directory_changes_invalidate_it(tmp_path, mon
     after = estimate_workload(_workload(tmp_path), stack="engine")
     assert after.input_token_bytes > before.input_token_bytes
     assert len(weka_parses) == 4 + 3 + 4
+
+
+@pytest.mark.parametrize("stack", ["engine", "dynamo"])
+def test_symlinked_trace_estimates_keep_their_original_admission(tmp_path, stack):
+    source = tmp_path / "source"
+    source.mkdir()
+    trace = _write_trace(source, _play())
+    link = tmp_path / "directory-link"
+    link.symlink_to(source, target_is_directory=True)
+    assert estimate_workload(_workload(link), stack=stack) == estimate_workload(_workload(source), stack=stack)
+
+    file_link = tmp_path / "file-link.jsonl"
+    file_link.symlink_to(trace)
+    estimate = estimate_workload(_workload(file_link), stack=stack)
+    assert estimate.estimated_peak_bytes is None
+    assert "symlink" in estimate.reason

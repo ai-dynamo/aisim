@@ -753,3 +753,54 @@ def test_interrupted_reused_pool_keeps_completed_sibling(monkeypatch, pressure):
             assert submitted == [0, 1, 2, 3]
     finally:
         state.close()
+
+
+@pytest.mark.parametrize("failure", ["submit", "result", "also-cold"])
+def test_broken_retained_pool_retries_unfinished_work_once(monkeypatch, failure):
+    from concurrent.futures import Future
+    from concurrent.futures.process import BrokenProcessPool
+
+    from aisim import resource_scheduler as scheduler
+
+    submitted = []
+    pools = []
+
+    class Factory(_BudgetFactory):
+        def wave_reuse_key(self, specs):
+            return len(specs)
+
+    class Pool:
+        def __init__(self, **kwargs):
+            pools.append(self)
+
+        def submit(self, fn, spec):
+            index = spec["id"]
+            submitted.append(index)
+            future = Future()
+            if index == 3 and (self is pools[0] or failure == "also-cold"):
+                if failure == "submit":
+                    raise BrokenProcessPool("lost worker on submit")
+                future.set_exception(BrokenProcessPool("lost worker during evaluation"))
+            else:
+                future.set_result(index)
+            return future
+
+    monkeypatch.setattr(scheduler, "ProcessPoolExecutor", Pool)
+    monkeypatch.setattr(scheduler, "close_pool", lambda pool: None)
+    monkeypatch.setattr(scheduler, "terminate_pool", lambda pool: None)
+    state = scheduler.WavePool()
+    factory = Factory()
+    specs = [{"id": i, "cost": 1} for i in range(4)]
+    results = evaluate_waves(
+        specs, factory=factory, initializer=_init, evaluate=_evaluate, workers=2, timeout=10, pool_state=state
+    )
+    try:
+        if failure == "also-cold":
+            with pytest.raises(BrokenProcessPool, match="lost worker"):
+                list(results)
+        else:
+            assert dict(results) == {i: i for i in range(4)}
+        assert submitted == [0, 1, 2, 3, 3]
+        assert factory.admitted == [[0, 1], [2, 3], [3]]
+    finally:
+        state.close()

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -136,10 +137,19 @@ def evaluate_waves(specs, *, factory, initializer, evaluate, workers: int, timeo
         active = {}
         interrupted = None
         healthy = False
+        retained = state.executor is not None
+        retry_cold = []
         try:
             pool = state.start(key, len(wave), factory, initializer)
             measured = partial(_measured, evaluate)
-            active = {pool.submit(measured, specs[index]): index for index in wave}
+            for offset, index in enumerate(wave):
+                try:
+                    active[pool.submit(measured, specs[index])] = index
+                except BrokenProcessPool:
+                    if not retained:
+                        raise
+                    retry_cold.extend(wave[offset:])
+                    break
             started = time.monotonic()
             initialized = False
             initialization_timeout = getattr(getattr(factory, "policy", None), "initialization_timeout_seconds", 60.0)
@@ -151,6 +161,11 @@ def evaluate_waves(specs, *, factory, initializer, evaluate, workers: int, timeo
                     index = active[future]
                     try:
                         result = future.result()
+                    except BrokenProcessPool:
+                        if not retained:
+                            raise
+                        retry_cold.append(active.pop(future))
+                        continue
                     except ResourceLimitError as exc:
                         interrupted = InterruptedEvaluation(str(exc), True, exc.plan)
                         continue
@@ -205,6 +220,11 @@ def evaluate_waves(specs, *, factory, initializer, evaluate, workers: int, timeo
                 if deadline is not None and time.monotonic() >= deadline:
                     interrupted = InterruptedEvaluation(f"exceed runtime: replay > {timeout:g}s", False, {})
                     break
+            if retry_cold:
+                # The retained pool died. Re-admit uncompleted work on a fresh pool.
+                for index in retry_cold:
+                    attempts[index] -= 1
+                pending = sorted(retry_cold) + pending
             if interrupted:
                 unfinished = [active[future] for future in active]
                 state.close(interrupted=True)
@@ -220,7 +240,7 @@ def evaluate_waves(specs, *, factory, initializer, evaluate, workers: int, timeo
                     {"reason": interrupted.reason, "retry_candidates": retry, "next_parallelism": capacity},
                 )
                 pending = retry + pending
-            else:
+            elif not retry_cold:
                 healthy = True
                 if key is None:
                     state.close()

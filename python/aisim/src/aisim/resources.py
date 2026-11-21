@@ -830,12 +830,14 @@ _TRACE_SCANNERS = {
 }
 
 
-def _trace_files(workload: Mapping[str, Any], format_name: str) -> list[Path] | None:
+def _trace_files(
+    workload: Mapping[str, Any], format_name: str, *, reject_symlink_roots: bool = False
+) -> list[Path] | None:
     """Return inspected files in scan order, or None when a symlink hides the resource identity."""
     files = []
     for raw_path in workload.get("trace_paths") or [workload["trace_path"]]:
         source = Path(raw_path)
-        if source.is_symlink():
+        if reject_symlink_roots and source.is_symlink():
             return None
         for path in source.rglob("*") if source.is_dir() else (source,):
             if path.is_symlink():
@@ -1266,7 +1268,7 @@ class GuardedRunnerFactory:
         # Profiled Weka workloads can be reused, even though they cannot supply
         # a finite-trace memory estimate. Keep both decisions independent.
         try:
-            files = _trace_files(workload, "weka")
+            files = _trace_files(workload, "weka", reject_symlink_roots=True)
             return (len(specs), workload, _trace_scan_identity(files)) if files else None
         except OSError:
             return None
