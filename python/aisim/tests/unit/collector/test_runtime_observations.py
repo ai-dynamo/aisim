@@ -3559,7 +3559,18 @@ def test_vllm_032_records_get_no_block_count_check(tmp_path):
 
 @pytest.mark.parametrize(
     "value,complete",
-    [({"num_hidden_layers": 2}, False), ("<function overrides>", False), ({}, True), (None, True), ("absent", True)],
+    [
+        ({"num_hidden_layers": 2}, False),
+        ("<function overrides>", False),
+        # Empty values of another JSON type are no empty mapping.
+        ([], False),
+        ("", False),
+        (0, False),
+        (False, False),
+        ({}, True),
+        (None, True),
+        ("absent", True),
+    ],
 )
 def test_v033_import_refuses_hf_overrides(tmp_path, value, complete):
     path, launches = observation_fixture(tmp_path, layout="mamba_hybrid")
@@ -3584,6 +3595,22 @@ def test_v033_import_refuses_hf_overrides_of_a_worker_before_the_scheduler_compa
 
     def edit(record):
         if record["kind"] == "worker":
+            record["resolved_config"]["model_config"]["hf_overrides"] = {"num_hidden_layers": 2}
+
+    _mutate(path, edit)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["diagnostics"] == [
+        "tp2: loaded model configuration overrides require another source mapping: "
+        "hf_overrides={'num_hidden_layers': 2}"
+    ]
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_v033_import_refuses_hf_overrides_of_one_phase(tmp_path, phase):
+    path, launches = observation_fixture(tmp_path, layout="mamba_hybrid")
+
+    def edit(record):
+        if record["phase"] == phase:
             record["resolved_config"]["model_config"]["hf_overrides"] = {"num_hidden_layers": 2}
 
     _mutate(path, edit)
@@ -3641,6 +3668,23 @@ _OUTSIDE = "attention group layers lie outside their cache group: ['attn.0', 'at
             "layer_name_not_a_string",
             "attention group layers lie outside their cache group: [['attn.0'], 'attn.1']",
         ),
+        # A module whose name only starts with the name of an audited module.
+        (
+            "mamba_hybrid",
+            "sibling_module",
+            "selected backend source has not been audited: vllm/v1/attention/backends/flash_attn_diffkv.py",
+        ),
+        ("mamba_hybrid", "a_number", _VIEWS),
+        ("mamba_hybrid", "true", _VIEWS),
+        # vLLM gives every cache group an attention group, a state or a ring group too (v1/worker/gpu/attn_utils.py:
+        # 217-265); only a spec without layer views gets none (:221-223), and the observer supports no such spec.
+        ("mamba_hybrid", "attention_group_without_entry", _VIEWS),
+        ("mamba_hybrid", "state_group_without_entry", _VIEWS),
+        ("glm_tp4", "ring_group_without_entry", _VIEWS),
+        # The state groups and the ring group of glm_tp4 each hold their own attention group.
+        ("glm_tp4", "unchanged", None),
+        ("mamba_hybrid", "layer_twice_in_one_entry", "duplicate attention group layer: attn.0"),
+        ("mamba_hybrid", "entry_twice", "duplicate attention group layer: attn.0"),
     ],
 )
 @pytest.mark.parametrize("phase", ["prefill", "decode"])
@@ -3664,6 +3708,25 @@ def test_v033_import_requires_audited_runner_and_backends(tmp_path, phase, layou
         elif case == "negative_group_id":
             # -1 indexes the last cache group in Python.
             groups[2]["kv_cache_group_id"] = -1
+        elif case == "sibling_module":
+            groups[0]["backend_class"] = "vllm.v1.attention.backends.flash_attn_diffkv.FlashAttentionDiffKVBackend"
+        elif case == "a_number":
+            record["attention_groups"] = 7
+        elif case == "true":
+            record["attention_groups"] = True
+        elif case == "attention_group_without_entry":
+            del groups[0]
+        elif case == "state_group_without_entry":
+            del groups[1]
+        elif case == "ring_group_without_entry":
+            assert groups[-1]["kv_cache_group_id"] == len(record["cache"]["groups"]) - 1
+            del groups[-1]
+        elif case == "unchanged":
+            pass
+        elif case == "layer_twice_in_one_entry":
+            groups[0]["layer_names"].append(groups[0]["layer_names"][0])
+        elif case == "entry_twice":
+            groups.append(copy.deepcopy(groups[0]))
         elif case == "layer_name_not_a_string":
             groups[0]["layer_names"][0] = ["attn.0"]
         elif case == "backend":

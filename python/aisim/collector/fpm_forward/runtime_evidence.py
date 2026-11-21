@@ -37,9 +37,10 @@ def validate_phase(
 
 
 # hf_overrides is a launch argument with the default {} (vLLM 0.33.0 config/model.py:348, engine/arg_utils.py:1035),
-# which vLLM applies on top of the loaded config.json (config/model.py:616-630). The reviewed launch sets none, and
-# the config.json hash does not cover another value. The observer records a callable as a string
-# (runtime/instrumentation/observer.py, _resolved).
+# which vLLM applies on top of the loaded config.json (config/model.py:616-630, :680-692,
+# transformers_utils/config.py:989-994). The reviewed launch sets none, and the config.json hash does not cover another
+# value. The observer records a callable as a string (runtime/instrumentation/observer.py, _resolved). Unlike the
+# checks of validate_phase, the import calls this one for each worker record beside its config format check.
 def _check_hf_overrides(record: dict[str, Any]) -> None:
     value = record["resolved_config"]["model_config"].get("hf_overrides")
     if value is not None and value != {}:
@@ -48,8 +49,11 @@ def _check_hf_overrides(record: dict[str, Any]) -> None:
 
 # The observer refuses a runner or a backend whose source file the bundle does not hash, a layer in two attention
 # groups, and attention groups that do not cover every cache layer (runtime/instrumentation/observer.py,
-# _layer_views). vLLM builds the attention groups of a cache group from that group's layers, one for each backend and
-# layer spec (vLLM 0.33.0 v1/worker/gpu/attn_utils.py:217-265, v1/worker/gpu_model_runner.py:6692-6713).
+# _layer_views). vLLM builds the attention groups of a cache group from that group's layers, one for each backend,
+# layer spec and Q-head count (vLLM 0.33.0 v1/worker/gpu/attn_utils.py:217-265,
+# v1/worker/gpu_model_runner.py:6648-6726). Every cache group, a Mamba or a ring group too, gets one: only a spec
+# without layer views gets none (attn_utils.py:221-223, kv_cache_interface.py:329-336, :510-512, :546-548), and the
+# observer supports no such spec.
 def _check_audited_sources(record: dict[str, Any], source_files: Mapping[str, str]) -> None:
     views = "attention backend views do not cover every physical cache layer"
     entries = record.get("attention_groups")
