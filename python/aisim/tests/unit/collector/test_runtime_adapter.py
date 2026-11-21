@@ -288,8 +288,14 @@ def _v033_runtime(storage, layout, blocks):
         )
 
     if layout == "attention":
+        # A FullAttentionSpec has one token per state by default (kv_cache_interface.py:569).
         full = spec(
-            "FullAttentionSpec", block_size=16, page_size_bytes=4096, sliding_window=None, dtype="torch.bfloat16"
+            "FullAttentionSpec",
+            block_size=16,
+            page_size_bytes=4096,
+            sliding_window=None,
+            dtype="torch.bfloat16",
+            tokens_per_state=1,
         )
         groups = [group(["layer0"], full)]
         layers = {

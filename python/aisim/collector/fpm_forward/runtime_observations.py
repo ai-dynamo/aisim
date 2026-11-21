@@ -39,7 +39,7 @@ from aisim.sdk.utils import _attach_inferred_quant_fields
 from aisim_core.fpm_profile import FpmResourceProfile
 from aisim_core.sdk.perf_database import load_system_spec
 
-from . import runtime_memory
+from . import runtime_evidence, runtime_memory
 from .capabilities import checkpoint_fmha_quant_mode, has_checkpoint_fmha
 from .config import PrefillSamplingProfile, collection_phases
 from .model_capability import load_model_config
@@ -603,6 +603,18 @@ def _check_element_size(item_size: int, precision: str) -> None:
 # The element bytes of the vLLM 0.33.0 Mamba state dtypes. MambaStateDtypeCalculator gives every state the model
 # dtype, a MambaDType choice (config/cache.py:175) or float32 (model_executor/layers/mamba/mamba_utils.py:53-150).
 _STATE_DTYPE_BYTES = {"torch.float32": 4, "torch.float16": 2, "torch.bfloat16": 2}
+# The element bytes of the dtypes that an indexer spec may hold. vLLM views each layer in the dtype of its spec
+# (kv_cache_interface.py:467, :479-480), and both indexer caches only drop the head axis when they bind the view
+# (models/deepseek_v2.py:653-656, models/minimax_m3/common/indexer.py:141-143). A dtype outside the table gets no check.
+_INDEXER_DTYPE_BYTES = {
+    "torch.uint8": 1,
+    "torch.int8": 1,
+    "torch.float8_e4m3fn": 1,
+    "torch.float8_e5m2": 1,
+    "torch.float16": 2,
+    "torch.bfloat16": 2,
+    "torch.float32": 4,
+}
 
 
 def _indexer(spec: dict[str, Any]) -> bool:
@@ -686,6 +698,10 @@ def _layer_views(
             raise ValueError(f"layer view lies outside the page of its layer: {name}")
         if group["kind"] == "attention" and not _indexer(spec):
             _check_element_size(item_size, precision)
+        elif _indexer(spec) and (
+            not isinstance(spec.get("dtype"), str) or _INDEXER_DTYPE_BYTES.get(spec["dtype"], item_size) != item_size
+        ):
+            raise ValueError("tensor element size contradicts cache dtype")
         intervals.append((start, start + within))
         dense += ratio * math.prod(shape[1:]) * item_size
         views.append((view, ratio, pages))
@@ -1360,6 +1376,14 @@ def _phase_prefix_caching(
                 [resolved.get(name) for name in names]
             ):
                 raise ValueError("runtime prefix-caching evidence contradicts the resolved cache settings")
+        # The prefix-match unit is a launch argument that vLLM only reads afterwards (config/cache.py:203,
+        # engine/arg_utils.py:2324, v1/core/kv_cache_utils.py:846, :890, mamba/abstract.py:126-127), and each process
+        # gets a copy of one configuration, so a worker holds the unit of the scheduler of its DP rank.
+        for (dp, _), record in sorted(workers.items()):
+            if canonical_json(record["resolved_config"]["cache_config"].get("prefix_match_unit")) != canonical_json(
+                schedulers[dp]["resolved_config"]["cache_config"].get("prefix_match_unit")
+            ):
+                raise ValueError("runtime prefix-match unit differs between scheduler and worker")
         # A scheduler copies its own block size and hash block size into the evidence
         # (runtime/instrumentation/observer.py, _prefix_caching).
         sizes = ("block_size", "hash_block_size")
@@ -1913,6 +1937,9 @@ def _configuration(
         if prefix_caching[phase] is not None:
             for _, scheduler in sorted(schedulers.items()):
                 _validate_startup_concurrency(scheduler)
+            # The evidence checks of a vLLM 0.33.0 phase run after every older check, so an older refusal keeps its
+            # text.
+            runtime_evidence.validate_phase(phase, workers, schedulers, bundle.manifest["runtime"]["source_files"])
     # The import of one phase writes the transfer bytes only for a phase with prefix caching. Another record gets no
     # value, and the result gives the reason in its own key, outside the provenance and the profile.
     transfer_bytes = _merged_transfer_bytes(transfer_outcomes)

@@ -41,7 +41,8 @@ _SPEC_TYPES = frozenset({*(_SPEC_MODULE + name for name in SPEC_KINDS), _UNIFORM
 _NO_PREFIX_CACHING_SPECS = frozenset({_SPEC_MODULE + "CircularBufferSpec"})
 # vLLM 0.33.0 cache settings that follow the prefix-caching mode (models/config.py:763-787), the
 # user prefix-match unit, and the block size that the engine core resolves in its own process
-# (engine/core.py:347-351). Importers record the mode per phase instead of comparing them.
+# (engine/core.py:347-351). Importers record the mode per phase instead of comparing them. Inside one phase, the
+# import compares prefix_match_unit between a worker and its scheduler (runtime_observations._phase_prefix_caching).
 _PHASE_CACHE_SETTINGS = (
     "enable_prefix_caching",
     "mamba_cache_mode",
@@ -557,6 +558,15 @@ def _spec_classes(group: dict[str, Any], names: list[str], hybrid: bool) -> list
             or type(item.get("page_size_bytes")) is not int
             or item["page_size_bytes"] <= 0
             or (not uniform and item.get("spec_type") != spec)
+            # Every attention spec has a token state, 1 by default, and a MambaSpec has -1 (kv_cache_interface.py:569,
+            # :1104). Without one the abstract property raises (:250-252). The observer records a fraction as a string.
+            or (hybrid and item.get("tokens_per_state") is None)
+            # An MLAAttentionSpec always has a role (:737, the roles at :196-198).
+            or (
+                hybrid
+                and item.get("spec_type") == _SPEC_MODULE + "MLAAttentionSpec"
+                and item.get("cache_role") not in ("SPARSE", "INDEXER")
+            )
             for item in specs.values()
         )
     ):

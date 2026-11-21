@@ -3161,6 +3161,120 @@ def test_v033_records_must_hold_what_vllm_derives_from_them(tmp_path, case, layo
     assert result["diagnostics"] == [f"tp2: {diagnostic}"]
 
 
+_PLAIN_SPECS = "cache group layer specs contradict its group spec: ['attn.0', 'attn.1']"
+_LAYER_SPEC_EVIDENCE = "runtime memory cache lacks complete layer spec evidence"
+
+
+def _prefill(edit):
+    return lambda record: edit(record) if record["phase"] == "prefill" else None
+
+
+@pytest.mark.parametrize("case", ["tokens_per_state", "group_dtype"])
+def test_v033_plain_group_layer_specs_must_equal_the_group_spec(tmp_path, case):
+    path, launches = observation_fixture(tmp_path, layout="mamba_hybrid")
+
+    def edit(record):
+        group = record["cache"]["groups"][0]  # the FullAttentionSpec group of attn.0 and attn.1
+        if case == "tokens_per_state":
+            group["layer_specs"]["attn.1"] = {**group["layer_specs"]["attn.1"], "tokens_per_state": 2}
+        else:
+            group["dtype"] = "torch.float16"
+
+    _mutate(path, _prefill(edit))
+    result = validate_observations(path, launches)["tp2"]
+    assert (result["status"], result["diagnostics"]) == ("incomplete", [f"tp2: {_PLAIN_SPECS}"])
+
+
+@pytest.mark.parametrize(
+    "kinds,complete", [(("worker",), False), (("scheduler",), False), (("worker", "scheduler"), True)]
+)
+def test_v033_prefix_match_unit_must_agree_between_worker_and_scheduler(tmp_path, kinds, complete):
+    path, launches = observation_fixture(tmp_path, layout="mamba_hybrid")
+
+    def edit(record):
+        # 64 tokens is the hash block size that the scheduler records, so the unit changes no block size.
+        if record["kind"] in kinds:
+            record["resolved_config"]["cache_config"]["prefix_match_unit"] = 64
+
+    _mutate(path, _prefill(edit))
+    result = validate_observations(path, launches)["tp2"]
+    if complete:
+        # The decode phase keeps no unit: two phases may differ.
+        assert (result["status"], result["diagnostics"]) == ("complete", [])
+        return
+    assert result["diagnostics"] == ["tp2: runtime prefix-match unit differs between scheduler and worker"]
+
+
+@pytest.mark.parametrize("case,complete", [("width", False), ("unknown_dtype", True), ("malformed_dtype", False)])
+def test_v033_indexer_view_width_must_match_its_spec_dtype(tmp_path, case, complete):
+    path, launches = observation_fixture(tmp_path, layout="kernel_view")
+
+    def edit(record):
+        if record["kind"] != "worker":
+            return
+        cache = record["cache"]
+        if case == "width":
+            # Two-byte elements in the same 256-byte page: 8 states of 8 elements in each kernel block.
+            cache["layer_tensors"]["indexer.0"][0].update(
+                element_size_bytes=2, shape=[226, 8, 8], stride_bytes=[128, 16, 2]
+            )
+        elif case == "unknown_dtype":
+            cache["groups"][0]["layer_specs"]["indexer.0"]["dtype"] = "torch.qint8"
+        else:
+            # The observer records a dtype by its name, so a dtype that is not a string is no dtype.
+            cache["groups"][0]["layer_specs"]["indexer.0"]["dtype"] = ["torch.uint8"]
+
+    _mutate(path, edit)
+    result = validate_observations(path, launches)["tp2"]
+    if complete:
+        assert (result["status"], result["diagnostics"]) == ("complete", [])
+        return
+    assert result["diagnostics"] == ["tp2: tensor element size contradicts cache dtype"]
+
+
+# The specs that a row edits, in every record. A scheduler group of a uniform worker group holds the first inner spec
+# for each layer name, so the rows select by spec and not by layer name.
+_SPEC_OF = {
+    "attention": lambda spec: spec["spec_type"].endswith(".FullAttentionSpec"),
+    "mamba": lambda spec: spec["spec_type"].endswith(".MambaSpec"),
+    "latent": lambda spec: spec["spec_type"].endswith(".MLAAttentionSpec") and spec.get("cache_role") == "SPARSE",
+}
+
+
+@pytest.mark.parametrize(
+    "layout,which,change,complete",
+    [
+        ("mamba_hybrid", "attention", "absent", False),
+        ("mamba_hybrid", "attention", None, False),
+        ("mamba_hybrid", "mamba", None, False),
+        ("kernel_view", "latent", "no_role", False),
+        ("kernel_view", "latent", "null_role", False),
+        ("mamba_hybrid", "attention", "1/4", True),
+    ],
+)
+def test_v033_layer_specs_must_hold_tokens_per_state_and_the_mla_role(tmp_path, layout, which, change, complete):
+    path, launches = observation_fixture(tmp_path, layout=layout)
+
+    def edit(record):
+        for group in record["cache"]["groups"]:
+            for spec in [item for item in group["layer_specs"].values() if _SPEC_OF[which](item)]:
+                if change == "absent":
+                    del spec["tokens_per_state"]
+                elif change == "no_role":
+                    spec.pop("cache_role")
+                elif change == "null_role":
+                    spec["cache_role"] = None
+                else:
+                    spec["tokens_per_state"] = change
+
+    _mutate(path, edit)
+    result = validate_observations(path, launches)["tp2"]
+    if complete:
+        assert (result["status"], result["diagnostics"]) == ("complete", [])
+        return
+    assert result["diagnostics"] == [f"tp2: {_LAYER_SPEC_EVIDENCE}"]
+
+
 @pytest.mark.parametrize(
     "unit,prefix_caching,diagnostic",
     [
@@ -3723,7 +3837,7 @@ def test_v033_role_phases_cannot_mix_hybrid_and_plain_records(tmp_path, hybrid, 
                     "spec_type": group["spec_type"],
                     "page_size_bytes": group["spec_page_size_bytes"],
                     "dtype": group["dtype"],
-                    "tokens_per_state": None,
+                    "tokens_per_state": 1,
                     "cache_role": None,
                 }
                 for name in group["layer_names"]
