@@ -12,6 +12,9 @@ One rule, two cases, no silent fallback:
 * **Historical pin** (retired repository + full commit SHA): resolved verbatim. A commit SHA names
   immutable content in the repository that holds it; rewriting it to another repository would turn
   a reproducible pin into a guess. The retired repository is retired, not deleted.
+  This preserves reference identity only: ``ensure_data`` requires ``catalog/dataset.json`` and cannot
+  load historical FPM revisions with only ``catalog/index.json`` and ``catalog/fpm.json``. Re-record
+  those pins against a unified-dataset commit to use the planner.
 * **Symbolic reference** (retired repository + branch, tag or empty): a name, not content, so it
   follows the successor. The repository becomes ``ai-dynamo/aisim-data`` and ``data/<rest>`` becomes
   ``data/fpm/<rest>``. The result says ``via="successor-alias"`` so callers can report it.
@@ -61,12 +64,13 @@ def resolve_ref(repo: str, revision: str | None) -> ResolvedRef:
 
 
 def retired_repo_hint(repo: str) -> str:
-    """Actionable text for a retired repository that no longer serves a pinned commit."""
+    """Actionable text for a retired-layout pin unsupported by the unified planner."""
     successor = SUCCESSORS.get(repo)
     if successor is None:
         return ""
     return (
         f"{repo} is retired; its files are byte-identical in {successor} under data/fpm/ (the retired "
         f"data/<rest> is data/fpm/<rest>). Re-record the pin against a {successor} commit; the old pin is "
-        f"never rewritten automatically."
+        f"never rewritten automatically. Historical FPM layouts without catalog/dataset.json are unsupported "
+        f"by ensure_data even when their commit and artifacts remain available."
     )

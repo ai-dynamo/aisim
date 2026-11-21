@@ -126,6 +126,11 @@ Prepare on a connected machine, then move the cache; the disconnected machine ma
 network request. Pin the dataset to a full commit SHA, because a branch or tag cannot be
 resolved offline.
 
+Historical full-SHA references to `nvidia/aisimulate-fpm-dataset` preserve their original repository and
+commit; they are never silently rewritten. Historical layouts without `catalog/dataset.json` are unsupported
+by `ensure_data` and the unified fetch planner, even when those commits and artifacts remain available.
+Re-record the pin against a commit of `ai-dynamo/aisim-data`, whose FPM files live under `data/fpm/`.
+
 ```bash
 # 1. Connected: check the size of the selected version, then prepare the whole closure of the real run.
 aisim data fetch --repo OWNER/NAME --revision <40-hex-sha> --category op-latency \
@@ -156,6 +161,9 @@ operation tables from `systems_paths` or `AICONFIGURATOR_SYSTEMS_PATH` (an expli
 `aisim predict`, `recommend` or `replay`) does not read the pin; prepare a root for it as described below. Other pin variables: `AISIM_DATA_CATEGORIES` (default `op-latency`),
 `AISIM_DATA_CONFIGURATION` (choose among several matches; with several categories it constrains only the category that lists the ID; for operation tables it resolves only that operation family's conflict and retains complementary families), `AISIM_DATA_MAX_BYTES` (auto-download
 threshold, default 256 MiB) and `AISIM_DATA_LOCAL` (a dataset-layout directory used instead of Hugging Face).
+The threshold covers discovery indexes and support files, selected artifacts, and dependency downloads together;
+verified cache hits cost zero bytes. When both `fpm` and `op-latency` are pinned, the prepared FPM settings
+apply before operation-table dependencies are planned, regardless of category order.
 Private datasets use the standard `HF_TOKEN` only while connected; the cache needs none.
 
 A pin without `AISIM_DATA_CATEGORIES` loads only `op-latency`; it used to load `fpm`. A run that needs FPM data

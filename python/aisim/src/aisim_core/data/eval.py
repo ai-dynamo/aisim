@@ -22,7 +22,9 @@ import math
 import os
 import re
 import tempfile
+import time
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
 
@@ -31,7 +33,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from aisim_core.data import Artifact, Digest, Identity
 from aisim_core.data.gpu_time import Finding, GpuTime, check_gpu_time, gpu_time_ok
-from aisim_core.data.hygiene import bounded_json_bytes
+from aisim_core.data.hygiene import CandidatePolicy, bounded_json_bytes
 from aisim_core.data.parquet import read_parquet, write_parquet
 
 EVAL_SCHEMA_ID = "aisim-eval/v1"
@@ -271,21 +273,57 @@ def record_path(root: str | Path, record: EvalRecord) -> Path:
     return record_dir(root, record.truth.identity) / f"{record.record_id}.json"
 
 
+@contextmanager
+def _record_lock(directory: Path):
+    """Serialize writers across processes and threads, without leaving files in a candidate.
+
+    After a writer crash, an operator must confirm it is gone before removing its lock.
+    """
+    lock = directory / ".records.lock"
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            break
+        except FileExistsError as exc:
+            if time.monotonic() >= deadline:
+                raise ValueError(f"another record writer holds {lock}; check for a crashed writer") from exc
+            time.sleep(0.01)
+    try:
+        yield
+    finally:
+        os.close(fd)
+        lock.unlink()
+
+
 def write_record(root: str | Path, record: EvalRecord) -> Path:
     """Write a record by content address. Never overwrites different content.
 
-    A superseding record must name an existing record in the same directory.
+    A superseding record must name an existing record in the same directory with no other successor.
     Writing identical content again is a no-op.
     """
     path = record_path(root, record)
-    if record.supersedes is not None and not (path.parent / f"{record.supersedes}.json").is_file():
-        raise ValueError(f"superseded record {record.supersedes} not found next to the new record")
     text = json.dumps(record.model_dump(by_alias=True, mode="json"), indent=2, sort_keys=True, allow_nan=False) + "\n"
+    if len(text.encode("utf-8")) > CandidatePolicy().max_json_bytes:
+        raise ValueError(f"JSON exceeds the {CandidatePolicy().max_json_bytes}-byte limit")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _record_lock(path.parent):
+        return _write_record(path, record, text)
+
+
+def _write_record(path: Path, record: EvalRecord, text: str) -> Path:
     if path.exists():
         if load_record(path) != record:
             raise FileExistsError(f"refusing to overwrite {path} with different content")
         return path
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if record.supersedes is not None:
+        predecessor = path.parent / f"{record.supersedes}.json"
+        if not predecessor.is_file():
+            raise ValueError(f"superseded record {record.supersedes} not found next to the new record")
+        load_record(predecessor)
+        for existing in _load_all(path.parent):
+            if existing.supersedes == record.supersedes:
+                raise ValueError(f"superseded record {record.supersedes} already has successor {existing.record_id}")
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -483,21 +521,31 @@ def verify_record(
     problems: list[str] = []
     checked_id = record.record_id
     if current_fingerprint != record.prediction.fingerprint:
-        return VerificationReport(ok=False, problems=["predictor fingerprint differs from the record's"])
+        return VerificationReport(
+            record_id=record.record_id, ok=False, problems=["predictor fingerprint differs from the record's"]
+        )
     table_art = next(a for a in record.truth.artifacts if a.artifact_id == record.truth.truth_table_artifact_id)
     path = Path(truth_root) / table_art.path
     if not path.is_file():
-        return VerificationReport(ok=False, problems=[f"truth table missing: {table_art.path}"])
+        return VerificationReport(
+            record_id=record.record_id, ok=False, problems=[f"truth table missing: {table_art.path}"]
+        )
     data = path.read_bytes()
     if hashlib.sha256(data).hexdigest() != table_art.sha256 or len(data) != table_art.bytes:
-        return VerificationReport(ok=False, problems=["truth table hash or size differs from record"])
+        return VerificationReport(
+            record_id=record.record_id, ok=False, problems=["truth table hash or size differs from record"]
+        )
     # Decode the bytes the digest covered, not a second read of the path (it could be replaced in between).
     table = read_parquet(pa.BufferReader(data), TRUTH_SCHEMA_ID)
     if tuple(table.column_names) != TRUTH_COLUMNS:
-        return VerificationReport(ok=False, problems=[f"truth table columns {table.column_names}"])
+        return VerificationReport(
+            record_id=record.record_id, ok=False, problems=[f"truth table columns {table.column_names}"]
+        )
     ids = table.column("case_id").to_pylist()
     if len(set(ids)) != len(ids):
-        return VerificationReport(ok=False, problems=["duplicate case_id in truth table"])
+        return VerificationReport(
+            record_id=record.record_id, ok=False, problems=["duplicate case_id in truth table"]
+        )
     truths = table.column("truth_value").to_pylist()
     cases = []
     case_inputs: dict[str, str] = {}
@@ -508,7 +556,11 @@ def verify_record(
             inputs = None
         if not isinstance(inputs, Mapping):
             # A data defect in the truth table is a failed verification, never an exception for the caller.
-            return VerificationReport(ok=False, problems=[f"truth row {case_id!r} has no valid inputs_json object"])
+            return VerificationReport(
+                record_id=record.record_id,
+                ok=False,
+                problems=[f"truth row {case_id!r} has no valid inputs_json object"],
+            )
         case_inputs[case_id] = json.dumps(inputs, sort_keys=True, separators=(",", ":"))
         cases.append((case_id, truth, predict(inputs)))
     # Derive exclusions from the checked truth and this predictor. A producer cannot remove a valid error

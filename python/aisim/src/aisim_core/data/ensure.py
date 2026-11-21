@@ -514,7 +514,43 @@ def _version_policy(pin: DataPin, transport: Transport | None, out: EnsuredData)
             raise ValueError("version policy must be a mapping")
     except (LoaderError, ValueError, SelectionError) as exc:
         raise MissingDataError(f"cannot read the version policy of {where}: {exc}") from exc
+    try:
+        _validate_version_policy(document)
+    except ValueError as exc:
+        raise MissingDataError(f"cannot read the version policy of {where}: {exc}") from exc
     return index, document
+
+
+def _validate_version_policy(document: Any) -> None:
+    """Reject malformed policies while permitting a valid mapping with no applicable entry."""
+    if not isinstance(document, dict):
+        raise ValueError("version policy must be a mapping")
+    if document.keys() - {"schema_version", "defaults", "overrides"}:
+        raise ValueError("unknown version policy fields")
+    version = document.get("schema_version", 1)
+    if type(version) is not int or version != 1:
+        raise ValueError("unsupported version policy schema_version")
+
+    def entries(mapping):
+        if not isinstance(mapping, dict):
+            raise ValueError("version policy entries must be mappings")
+        for backend, slots in mapping.items():
+            if not isinstance(backend, str) or not isinstance(slots, dict):
+                raise ValueError("version policy backend slots must be mappings")
+            if any(
+                name not in ("current", "previous") or (v is not None and (not isinstance(v, str) or not v))
+                for name, v in slots.items()
+            ):
+                raise ValueError("version policy slots must be version strings or null")
+
+    entries(document.get("defaults", {}))
+    overrides = document.get("overrides", {})
+    if not isinstance(overrides, dict):
+        raise ValueError("version policy overrides must be a mapping")
+    for system, backends in overrides.items():
+        if not isinstance(system, str):
+            raise ValueError("version policy system names must be strings")
+        entries(backends)
 
 
 def _slot_version(system: str, backend: str, requested: str | None, versions, document: Mapping[str, Any]) -> str:

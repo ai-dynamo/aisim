@@ -667,3 +667,136 @@ def test_embedded_fpm_logical_keys_resolve_to_pinned_storage_paths(tmp_path, mov
     # A warm immutable pin and a direct local loader follow exactly the same layout without transport.
     warm = fetch(SEL, repo=stored_repo, revision=SHA, offline=True, cache=cache)
     assert FpmLoader().read_manifest(warm.root, logical_manifest) == loaded
+
+
+@pytest.mark.parametrize("victim", ["catalog/fpm.json", "fpm/m1/manifest.json"])
+def test_dataset_checks_the_verified_declarations_after_replacement(files, tmp_path, monkeypatch, victim):
+    import aisim_core.data as data
+
+    root = tmp_path / "dataset"
+    for path, content in files.items():
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_bytes(content)
+    # The pinned manifest's payload is bad. A schema-valid replacement must not hide that artifact check.
+    (root / "fpm/m1/data.parquet").write_bytes(b"corrupt payload")
+    replacement = json.loads(files[victim])
+    replacement["entries" if victim.startswith("catalog/") else "artifacts"] = []
+    original_verify, original_bytes = data._verify, data._verified_bytes
+    swapped = []
+
+    def swap(artifact):
+        if artifact.path == victim and not swapped:
+            swapped.append(victim)
+            (root / victim).write_text(json.dumps(replacement))
+
+    def verify(root_, artifact):
+        path = original_verify(root_, artifact)
+        swap(artifact)
+        return path
+
+    def verified_bytes(root_, artifact):
+        raw = original_bytes(root_, artifact)
+        swap(artifact)
+        return raw
+
+    monkeypatch.setattr(data, "_verify", verify)
+    monkeypatch.setattr(data, "_verified_bytes", verified_bytes)
+    with pytest.raises(ValueError, match="integrity mismatch"):
+        data.check_dataset(root)
+    assert swapped == [victim]
+
+
+@pytest.mark.parametrize("field,value", [("rows", 100), ("schema", "aisim-wrong/v1")])
+def test_warm_cache_checks_the_current_parquet_declaration(files, tmp_path, field, value):
+    cache = Cache(tmp_path / "cache")
+    fetch(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=cache)
+    manifest = json.loads(files["fpm/m1/manifest.json"])
+    manifest["artifacts"][0][field] = value
+    files["fpm/m1/manifest.json"] = json.dumps(manifest).encode()
+    _repin(files, "fpm/m1/manifest.json")
+    # Refresh only the metadata; the artifact bytes and their digest remain cached and unchanged.
+    for path in ["catalog/dataset.json", "catalog/fpm.json", "fpm/m1/manifest.json"]:
+        cache.path_for(REPO, SHA, path).write_bytes(files[path])
+    with pytest.raises(IntegrityError, match="row count|schema ID"):
+        fetch(SEL, repo=REPO, revision=SHA, transport=NoNetwork(), cache=cache, offline=True)
+
+
+def test_declared_metadata_size_cannot_disable_the_cap(files, tmp_path):
+    from aisim_core.data import fetch as module
+
+    document = json.loads(files["catalog/dataset.json"])
+    document["categories"]["fpm"]["index"]["bytes"] = module._METADATA_CAP_BYTES + 1
+    files["catalog/dataset.json"] = json.dumps(document).encode()
+    transport = FakeTransport(files)
+    with pytest.raises(IntegrityError, match="metadata declaration exceeds"):
+        plan(SEL, repo=REPO, revision=SHA, transport=transport, cache=Cache(tmp_path / "cache"))
+    assert transport.opened == ["catalog/dataset.json"]
+
+
+@pytest.mark.parametrize("kind", ["metadata", "artifact", "support"])
+def test_an_overlapping_failed_fetch_preserves_the_installed_file(files, tmp_path, monkeypatch, kind):
+    from aisim_core.data.fetch import fetch_support
+
+    target = {"metadata": "catalog/fpm.json", "artifact": "fpm/m1/data.parquet", "support": "support.parquet"}[kind]
+    if kind == "support":
+        files[target] = files["fpm/m1/data.parquet"]
+        index = json.loads(files["catalog/fpm.json"])
+        index["support"] = [_artifact_json("support", target, files[target], rows=3)]
+        files["catalog/fpm.json"] = json.dumps(index).encode()
+        _repin(files, "catalog/fpm.json")
+    cache = Cache(tmp_path / "cache")
+    real_store = cache.store
+    installed = []
+
+    def concurrent_store(repo, sha, path, chunks, expected):
+        if path == target:
+            # The first caller completes after this caller's miss, before its eventual transfer failure.
+            if not installed:
+                installed.append(real_store(repo, sha, path, [files[path]], expected)[0])
+
+            def fail():
+                raise ConnectionError("second caller lost its connection")
+                yield
+
+            chunks = fail()
+        return real_store(repo, sha, path, chunks, expected)
+
+    monkeypatch.setattr(cache, "store", concurrent_store)
+    # A pre-install discard would delete the first caller's file before the failed store starts.
+    real_discard = cache.discard
+
+    def concurrent_discard(repo, sha, path):
+        if path == target and not installed:
+            installed.append(real_store(repo, sha, path, [files[path]], None)[0])
+        real_discard(repo, sha, path)
+
+    monkeypatch.setattr(cache, "discard", concurrent_discard)
+    operation = fetch_support if kind == "support" else fetch
+    with pytest.raises(TransferError, match="second caller lost"):
+        operation(
+            "fpm" if kind == "support" else SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=cache
+        )
+    assert installed and installed[0].read_bytes() == files[target]
+
+
+def test_support_discovery_checks_declared_cost_before_transferring(files, tmp_path):
+    from aisim_core.data.fetch import fetch_support
+
+    files["support.parquet"] = files["fpm/m1/data.parquet"]
+    index = json.loads(files["catalog/fpm.json"])
+    index["support"] = [_artifact_json("support", "support.parquet", files["support.parquet"], rows=3)]
+    files["catalog/fpm.json"] = json.dumps(index).encode()
+    _repin(files, "catalog/fpm.json")
+    cache = Cache(tmp_path / "cache")
+    load_category_index("fpm", repo=REPO, revision=SHA, transport=FakeTransport(files), cache=cache)
+    transport = FakeTransport(files)
+    with pytest.raises(BudgetExceededError):
+        fetch_support(
+            "fpm",
+            repo=REPO,
+            revision=SHA,
+            transport=transport,
+            cache=cache,
+            max_bytes=len(files["support.parquet"]) - 1,
+        )
+    assert transport.opened == []

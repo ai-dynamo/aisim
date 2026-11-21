@@ -50,7 +50,7 @@ from aisim_core.data import (
     configuration_id,
 )
 from aisim_core.data.fpm_layout import storage_path
-from aisim_core.data.parquet import read_parquet_schema_id
+from aisim_core.data.parquet import SCHEMA_METADATA_KEY
 from aisim_core.data.repos import resolve_ref
 
 
@@ -377,7 +377,10 @@ class Cache:
         if expected is None or expected.sha256 is None:
             return True
         try:
-            return _digest(target) == (expected.sha256, expected.bytes)
+            if _digest(target) != (expected.sha256, expected.bytes):
+                return False
+            _verify_parquet(target, path, expected)
+            return True
         except OSError:
             return False
 
@@ -425,10 +428,16 @@ def _verify_file(local: Path, path: str, expected: PlannedFile) -> None:
         raise IntegrityError(path, f"size {size} != declared {expected.bytes}")
     if expected.sha256 is not None and digest != expected.sha256:
         raise IntegrityError(path, "SHA-256 mismatch")
+    _verify_parquet(local, path, expected)
+
+
+def _verify_parquet(local: Path, path: str, expected: PlannedFile) -> None:
     if expected.format == "parquet":
         try:
-            schema_id = read_parquet_schema_id(local)
-            rows = pq.ParquetFile(local).metadata.num_rows
+            metadata = pq.read_metadata(local)
+            value = (metadata.metadata or {}).get(SCHEMA_METADATA_KEY)
+            schema_id = None if value is None else value.decode()
+            rows = metadata.num_rows
         except Exception as exc:
             raise IntegrityError(path, f"unreadable Parquet: {exc}") from exc
         # A file published before schema stamping (the byte-identical FPM libraries) has no embedded ID;
@@ -458,7 +467,7 @@ def _ref(artifact: Artifact, role: str, category_roots: Mapping[str, str] | None
     )
 
 
-# A metadata file without a declared size (the root catalog) is refused past this many bytes.
+# Every metadata file is refused past this many bytes, independently of its declaration.
 _METADATA_CAP_BYTES = 16 * 1024 * 1024
 
 
@@ -506,9 +515,14 @@ class _Planner:
         call replaces a cached copy that fails it, and an invalid transfer is never cached.
         """
         plan = self.plan
+        if ref.bytes is not None and ref.bytes > _METADATA_CAP_BYTES:
+            raise IntegrityError(ref.path, f"metadata declaration exceeds {_METADATA_CAP_BYTES} bytes")
         online = not plan.offline and self.transport is not None
         if self.cache.valid(plan.repo, plan.revision, ref.path, ref):
-            data = self.cache.path_for(plan.repo, plan.revision, ref.path).read_bytes()
+            with self.cache.path_for(plan.repo, plan.revision, ref.path).open("rb") as handle:
+                data = handle.read(_METADATA_CAP_BYTES + 1)
+            if len(data) > _METADATA_CAP_BYTES:
+                raise IntegrityError(ref.path, f"metadata exceeds {_METADATA_CAP_BYTES} bytes")
             try:
                 if validate is not None:
                     validate(data)

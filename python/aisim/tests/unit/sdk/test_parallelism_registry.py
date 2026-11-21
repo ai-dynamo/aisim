@@ -23,6 +23,8 @@ pytestmark = pytest.mark.unit
 
 def ctx(par, **kw):
     kw.setdefault("parallelism_complete", True)
+    if kw.get("framework") == "trtllm":
+        kw.setdefault("dwdp_size", 1)
     return Context(parallelism=par, **kw)
 
 
@@ -169,3 +171,22 @@ def test_trtllm_moe_world_reports_a_gap_for_an_unknown_cp_type():
     assert not [f for f in report.findings if f.rule_id == "F-trtllm-moe-world"]
     gap = next(g for g in report.gaps if g.rule_id == "F-trtllm-moe-world")
     assert "cp_type" in gap.missing
+
+
+@pytest.mark.parametrize(
+    "dwdp_size,has_error,has_gap", [(2, False, False), (1, True, False), (0, True, False), (None, False, True)]
+)
+def test_trtllm_moe_equality_requires_a_known_non_dwdp_layout(dwdp_size, has_error, has_gap):
+    report = evaluate(
+        ctx(
+            {"tp": 4, "moe_tp": 1, "ep": 1, "moe_cluster": 1},
+            framework="trtllm",
+            declared_world_size=4,
+            dwdp_size=dwdp_size,
+        )
+    )
+    assert bool([f for f in report.errors if f.rule_id == "F-trtllm-moe-world"]) is has_error
+    gaps = [g for g in report.gaps if g.rule_id == "F-trtllm-moe-world"]
+    assert bool(gaps) is has_gap
+    if has_gap:
+        assert "dwdp_size" in gaps[0].missing

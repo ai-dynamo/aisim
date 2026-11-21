@@ -756,3 +756,38 @@ def test_fpm_only_pin_without_categories_fails_naming_the_variable(tmp_path, fil
     assert "op-latency" in str(e.value) and e.value.source == f"{REPO}@{SHA}"
     named = pin_from_environment({**env, "AISIM_DATA_CATEGORIES": "fpm"})
     assert ensure_data(CONFIG, named, transport=FakeTransport(files)).revisions == {"fpm": SHA}
+
+
+def test_configuration_discovery_obeys_a_zero_byte_allowance(tmp_path, files):
+    index = json.loads(files["catalog/fpm.json"])
+    transport = FakeTransport(files)
+    p = pin(
+        tmp_path,
+        max_bytes=0,
+        categories=("op-latency", "fpm"),
+        configuration_id=index["entries"][0]["configuration_id"],
+    )
+    with pytest.raises(DataTooLargeError):
+        ensure_data(CONFIG, p, transport=transport)
+    assert transport.opened == []
+
+
+def test_discovery_and_selected_payload_share_one_allowance(tmp_path, files):
+    index = json.loads(files["catalog/fpm.json"])
+    options = {"categories": ("op-latency", "fpm"), "configuration_id": index["entries"][0]["configuration_id"]}
+    # Ownership discovery downloads the indexes. The payload cannot spend that allowance a second time.
+    discovery_bytes = sum(len(files[path]) for path in ("catalog/dataset.json", "catalog/fpm.json"))
+    transport = FakeTransport(files)
+    with pytest.raises(DataTooLargeError):
+        ensure_data(CONFIG, pin(tmp_path, max_bytes=discovery_bytes, **options), transport=transport)
+    assert "fpm/m1/data.parquet" not in transport.opened
+
+
+def test_retired_pin_guidance_preserves_the_available_commit():
+    from aisim_core.data.repos import PUBLIC_REPO, RETIRED_FPM_REPO, resolve_ref, retired_repo_hint
+
+    historical = resolve_ref(RETIRED_FPM_REPO, "d" * 40)
+    assert (historical.repo, historical.revision, historical.via) == (RETIRED_FPM_REPO, "d" * 40, "verbatim")
+    assert resolve_ref(RETIRED_FPM_REPO, "main").repo == PUBLIC_REPO
+    hint = retired_repo_hint(RETIRED_FPM_REPO)
+    assert "unsupported by ensure_data" in hint and "commit and artifacts remain available" in hint

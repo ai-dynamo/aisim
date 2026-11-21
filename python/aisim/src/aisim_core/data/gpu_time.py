@@ -427,6 +427,8 @@ def gpu_time_from_kubernetes(
     jstatus = job.get("status") or {}
     if not jstatus.get("succeeded"):
         raise KubeParseError(f"job {jname} has no succeeded pod; gpu_time is final only after success")
+    if not any(c.get("type") == "Complete" and c.get("status") == "True" for c in jstatus.get("conditions") or []):
+        raise KubeParseError(f"job {jname} is not Complete=True; gpu_time is final only after success")
     template_spec = ((job.get("spec") or {}).get("template") or {}).get("spec") or {}
     ok: list[tuple[Mapping[str, Any], float, int]] = []
     failed: list[tuple[float, int]] = []

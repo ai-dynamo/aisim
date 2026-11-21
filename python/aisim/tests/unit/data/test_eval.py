@@ -344,3 +344,92 @@ def test_verification_uses_a_private_record_snapshot_before_prediction(built, mu
     with pytest.raises(ValueError, match="different record content"):
         attest(record, report)
     assert attest(original, report).verification.verified_record_id == original.record_id
+
+
+def test_two_promotions_cannot_fork_the_current_record(built):
+    root, record = built
+    # Synthetic declared cost makes qualification valid without claiming a hardware measurement.
+    record = record.model_copy(update={"gpu_time": GpuTime(authority="declared", gpu_count=1, wall_seconds=1.0)})
+    write_record(root, record)
+    report = verify_record(record, root, _predict, record.prediction.fingerprint)
+    verified, qualified = attest(record, report), attest(record, report, "qualified")
+    path = write_record(root, verified)
+    assert write_record(root, verified) == path
+    with pytest.raises(ValueError, match="already has successor"):
+        write_record(root, qualified)
+    assert current_records(path.parent) == [verified]
+    next_report = verify_record(verified, root, _predict, verified.prediction.fingerprint)
+    final = attest(verified, next_report, "qualified")
+    write_record(root, final)
+    assert current_records(path.parent) == [final]
+
+
+def _concurrent_promotion(root, document, start, results):
+    record = EvalRecord.model_validate(document)
+    start.wait()
+    try:
+        write_record(root, record)
+        results.put("written")
+    except ValueError as exc:
+        results.put(str(exc))
+
+
+@pytest.mark.parametrize("identical", [False, True])
+def test_concurrent_process_promotions_are_serialized(built, identical):
+    import multiprocessing
+
+    root, record = built
+    # Synthetic declared cost makes qualification valid without claiming a hardware measurement.
+    record = record.model_copy(update={"gpu_time": GpuTime(authority="declared", gpu_count=1, wall_seconds=1.0)})
+    path = write_record(root, record)
+    report = verify_record(record, root, _predict, record.prediction.fingerprint)
+    verified = attest(record, report)
+    other = verified if identical else attest(record, report, "qualified")
+    context = multiprocessing.get_context("spawn")
+    start, results = context.Event(), context.Queue()
+    workers = [
+        context.Process(target=_concurrent_promotion, args=(root, r.model_dump(by_alias=True), start, results))
+        for r in (verified, other)
+    ]
+    for worker in workers:
+        worker.start()
+    start.set()
+    for worker in workers:
+        worker.join(20)
+        if worker.is_alive():
+            worker.terminate()
+            worker.join()
+            pytest.fail("record writer did not finish")
+        assert worker.exitcode == 0
+    outcomes = [results.get(timeout=5) for _ in workers]
+    assert outcomes.count("written") == (2 if identical else 1)
+    if not identical:
+        assert any("already has successor" in outcome for outcome in outcomes)
+    assert len(current_records(path.parent)) == 1
+    assert not list(path.parent.glob(".*lock"))
+
+
+def test_oversized_records_are_rejected_before_publication(built, monkeypatch):
+    from aisim_core.data import eval as module
+    from aisim_core.data.hygiene import CandidatePolicy
+
+    root, record = built
+    limit = 2048
+    monkeypatch.setattr(module, "CandidatePolicy", lambda: CandidatePolicy(max_json_bytes=limit))
+    document = record.model_dump(by_alias=True)
+    document["assumptions"][0]["value"] = "x" * limit
+    oversized = EvalRecord.model_validate(document)
+    for _ in range(2):
+        with pytest.raises(ValueError, match="JSON exceeds"):
+            write_record(root, oversized)
+        assert not record_path(root, oversized).exists()
+
+
+def test_a_verification_report_cannot_attest_another_record(built):
+    root, record = built
+    report = verify_record(record, root, _predict, record.prediction.fingerprint)
+    assert report.ok and report.record_id == record.record_id
+    changed = record.model_copy(update={"results": record.results.model_copy(update={"mape_pct": 99.0})})
+    with pytest.raises(ValueError, match="different record content"):
+        attest(changed, report)
+    assert attest(record, report).supersedes == record.record_id

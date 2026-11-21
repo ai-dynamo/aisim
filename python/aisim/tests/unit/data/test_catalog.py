@@ -520,3 +520,47 @@ def test_catalog_versions_preserve_v1_and_write_v2(tmp_path):
     with pytest.raises(ValidationError):
         SCHEMA_MODELS["aisim-catalog/v1"].model_validate(row.model_dump())
     assert "acc_prediction_fingerprint" not in SCHEMA_MODELS["aisim-catalog/v1"].model_fields
+
+
+@pytest.mark.parametrize("victim", ["catalog/fpm.json", "data/fpm/m0.json"])
+def test_catalog_uses_only_verified_bytes_after_a_replacement(dataset, monkeypatch, victim):
+    from collections import defaultdict
+
+    import aisim_core.data as data
+
+    root, _ = dataset
+    baseline = defaultdict(catalog_module._Cell)
+    catalog_module._read_indexed_cells(root, baseline)
+    original_bytes, original_verify = data._verified_bytes, data._verify
+    swapped = []
+
+    def swap(artifact):
+        if artifact.path != victim or swapped:
+            return
+        import json
+
+        path = root / victim
+        document = json.loads(path.read_bytes())
+        if victim.startswith("catalog/"):
+            document["entries"] = []
+        else:
+            document["evidence_gaps"] = [{"field": "unverified"}] * 7
+        path.write_text(json.dumps(document))
+        swapped.append(victim)
+
+    def verified_bytes(root_, artifact):
+        raw = original_bytes(root_, artifact)
+        swap(artifact)
+        return raw
+
+    def verify(root_, artifact):
+        path = original_verify(root_, artifact)
+        swap(artifact)
+        return path
+
+    monkeypatch.setattr(catalog_module, "_verified_bytes", verified_bytes)
+    monkeypatch.setattr(catalog_module, "_verify", verify, raising=False)
+    got = defaultdict(catalog_module._Cell)
+    catalog_module._read_indexed_cells(root, got)
+    assert swapped == [victim]
+    assert got == baseline

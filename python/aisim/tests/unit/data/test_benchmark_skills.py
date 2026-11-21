@@ -221,7 +221,12 @@ def test_record_gpu_time_kubernetes(tmp_path, capsys, container_times):
     tool = _script("aisim-benchmark-collect", "record_gpu_time.py")
     job = {
         "metadata": {"name": "j", "namespace": "ns", "uid": "job-a"},
-        "status": {"succeeded": 1, "startTime": "2025-12-31T23:00:00Z", "completionTime": "2026-01-01T00:30:00Z"},
+        "status": {
+            "succeeded": 1,
+            "conditions": [{"type": "Complete", "status": "True"}],
+            "startTime": "2025-12-31T23:00:00Z",
+            "completionTime": "2026-01-01T00:30:00Z",
+        },
         "spec": {"template": {"spec": {"containers": [{"resources": {"limits": {"nvidia.com/gpu": "4"}}}]}}},
     }
     pod = {
@@ -257,7 +262,7 @@ def test_record_gpu_time_rejects_restarted_pods(tmp_path, capsys, restarts):
     tool = _script("aisim-benchmark-collect", "record_gpu_time.py")
     job = {
         "metadata": {"name": "j", "namespace": "ns", "uid": "job-a"},
-        "status": {"succeeded": 1},
+        "status": {"succeeded": 1, "conditions": [{"type": "Complete", "status": "True"}]},
         "spec": {"template": {"spec": {"containers": [{"resources": {"limits": {"nvidia.com/gpu": "4"}}}]}}},
     }
     pod = {
@@ -291,7 +296,7 @@ def test_record_gpu_time_rejects_a_restarted_failed_pod_before_its_replacement(t
     tool = _script("aisim-benchmark-collect", "record_gpu_time.py")
     job = {
         "metadata": {"name": "j", "namespace": "ns", "uid": "job-a"},
-        "status": {"succeeded": 1},
+        "status": {"succeeded": 1, "conditions": [{"type": "Complete", "status": "True"}]},
         "spec": {"template": {"spec": {"containers": [{"resources": {"limits": {"nvidia.com/gpu": "4"}}}]}}},
     }
 
