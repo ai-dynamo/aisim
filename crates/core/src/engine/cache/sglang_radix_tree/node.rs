@@ -750,8 +750,6 @@ pub struct NodeAccessError {
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, thiserror::Error)]
 pub enum TreeCoreRuntimeError {
-    #[error("invalid or unsupported Full insert continuation")]
-    InvalidFullContinuation,
     /// Full load-back no longer describes the planned host-to-device mapping.
     #[error("stale or malformed Full load-back spec for node {node_id}")]
     InvalidLoadBackSpec { node_id: NodeId },

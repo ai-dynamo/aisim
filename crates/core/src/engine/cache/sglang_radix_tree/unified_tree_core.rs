@@ -633,32 +633,11 @@ impl<V: RadixValue> Default for EvictionStepResult<V> {
     }
 }
 
-/// Binding established by validating a retained key once. Appends accept only
-/// new suffix atoms, so callers cannot substitute an unrelated retained prefix.
-/// Splits preserve the original handle's logical endpoint. Reset invalidates it;
-/// snapshots share the lineage so admission rollback preserves existing bindings.
-#[derive(Clone, Debug)]
-pub struct FullInsertContinuation {
-    lineage: Arc<()>,
-    node_id: NodeId,
-    prefix_len: usize,
-}
-
-impl FullInsertContinuation {
-    pub fn node_id(&self) -> NodeId {
-        self.node_id
-    }
-    pub fn prefix_len(&self) -> usize {
-        self.prefix_len
-    }
-}
-
 /// The radix tree mechanism: owns the tree structure, per-node values, the
 /// per-component LRUs, the size/leaf bookkeeping, and the component drivers,
 /// plus `reset()`.
 pub struct UnifiedTreeCore<K: ChildKeyType, V: RadixValue> {
     pub(crate) arena: NodeArena<K, V>,
-    continuation_lineage: Arc<()>,
     /// Ordered component registry; each driver reports its own type.
     components: Vec<Arc<dyn TreeComponent<K, V> + Send + Sync>>,
     /// Prebuilt per-type driver lookup, indexed by `ComponentType::idx`.
@@ -743,7 +722,6 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         );
         Self {
             arena: self.arena.clone(),
-            continuation_lineage: Arc::clone(&self.continuation_lineage),
             components: self.components.clone(),
             components_by_type: self.components_by_type.clone(),
             component_states: self.component_states.clone(),
@@ -1029,7 +1007,6 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             tracked_unbacked_tokens: None,
             // Disabled components keep harmless empty lists, like component_states.
             lru_lists: Self::new_lru_lists(),
-            continuation_lineage: Arc::new(()),
             full_evict_device_heap: BinaryHeap::new(),
             full_evict_device_heap_dirty: false,
             eviction_strategy: get_eviction_strategy(
@@ -1069,7 +1046,6 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     /// match result.
     pub fn reset(&mut self) {
         self.arena.reset();
-        self.continuation_lineage = Arc::new(());
         self.component_states = Default::default();
         self.evictable_device_leaves = NodeSet::new();
         self.evictable_host_leaves = NodeSet::new();
@@ -1837,142 +1813,6 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         self.try_insert_at_(prefix_node_idx, prefix_len, params)
     }
 
-    /// Validate a Full-only device continuation once at its full-key boundary.
-    /// The adapter's append-only lease owns subsequent suffixes. HiCache,
-    /// auxiliary components, event generation and T-LRU keep the general API.
-    pub fn bind_full_insert_continuation(
-        &self,
-        node_id: NodeId,
-        key: &K,
-        prefix_len: usize,
-    ) -> Result<FullInsertContinuation, TreeCoreRuntimeError> {
-        if self.components.len() != 1
-            || self.enable_hicache
-            || self.enable_kv_cache_events
-            || self.enable_storage
-            || self.enable_external_cache_linker
-            || self.tlru_bookkeeping
-            || !prefix_len.is_multiple_of(self.page_size)
-            || prefix_len > key.atom_len()
-        {
-            return Err(TreeCoreRuntimeError::InvalidFullContinuation);
-        }
-        let idx = self.arena.resolve(node_id)?;
-        let params = InsertParams {
-            key,
-            namespace: KeyNamespaceRef::default(),
-            value: V::empty(),
-            rotation_base: None,
-            session_id: None,
-            swa_branching_seqlen: None,
-            prev_prefix_len: prefix_len,
-            swa_evicted_seqlen: 0,
-            mamba_value: None,
-            chunked: true,
-            priority: 0,
-            track_adopted_ranges: false,
-        };
-        self.validate_insert_anchor_(idx, prefix_len, &params)?;
-        if !self.arena.node(idx).is_root() && self.arena.node(idx).device_lock_ref(FULL) == 0 {
-            return Err(TreeCoreRuntimeError::InvalidFullContinuation);
-        }
-        Ok(FullInsertContinuation {
-            lineage: Arc::clone(&self.continuation_lineage),
-            node_id,
-            prefix_len,
-        })
-    }
-
-    /// Append new key atoms to an established lease and extend its existing pin
-    /// only over the canonical suffix. No retained key or root lock walk occurs.
-    pub fn append_full_insert_continuation(
-        &mut self,
-        continuation: &mut FullInsertContinuation,
-        suffix: &K,
-        value: V,
-    ) -> Result<InsertResult<V>, TreeCoreRuntimeError> {
-        if !Arc::ptr_eq(&continuation.lineage, &self.continuation_lineage)
-            || self.components.len() != 1
-            || self.enable_hicache
-            || self.enable_kv_cache_events
-            || self.enable_storage
-            || self.enable_external_cache_linker
-            || self.tlru_bookkeeping
-            || self.ongoing_insert_walk_state.is_some()
-            || suffix.atom_len() == 0
-            || !suffix.atom_len().is_multiple_of(self.page_size)
-            || value.len() != suffix.atom_len()
-        {
-            return Err(TreeCoreRuntimeError::InvalidFullContinuation);
-        }
-        let anchor = self.arena.resolve(continuation.node_id)?;
-        let node = self.arena.node(anchor);
-        if !node.is_root() && (!node.has_device_value(FULL) || node.device_lock_ref(FULL) == 0) {
-            return Err(TreeCoreRuntimeError::InvalidFullContinuation);
-        }
-        let prefix_len = continuation.prefix_len;
-        let total_len = prefix_len
-            .checked_add(suffix.atom_len())
-            .ok_or(TreeCoreRuntimeError::InvalidFullContinuation)?;
-        let params = InsertParams {
-            key: suffix,
-            namespace: KeyNamespaceRef::default(),
-            value,
-            rotation_base: None,
-            session_id: None,
-            swa_branching_seqlen: None,
-            prev_prefix_len: prefix_len,
-            swa_evicted_seqlen: 0,
-            mamba_value: None,
-            chunked: true,
-            priority: 0,
-            track_adopted_ranges: false,
-        };
-        let mut actions = Vec::new();
-        self.visit_retained_prefix_(anchor, &params, &mut actions);
-        let mut step = self.begin_insert_suffix_(
-            anchor,
-            prefix_len,
-            total_len,
-            &params,
-            suffix.as_ref(),
-            actions,
-        )?;
-        let mut actions = Vec::new();
-        let mut result = loop {
-            actions.append(&mut step.actions);
-            if let Some(result) = step.result {
-                break result;
-            }
-            step = self.try_resume_insert()?;
-        };
-        result.cache_actions = actions;
-        let last_node = result
-            .last_device_node_id
-            .expect("Full append has a device endpoint");
-        let mut cursor = self.arena.resolve(last_node)?;
-        // The insert above creates or reconciles only descendants of the live
-        // anchor. Keep its existing root-path pin and acquire just this segment.
-        while cursor != anchor {
-            let node = self.arena.node_mut(cursor);
-            assert!(node.has_device_value(FULL));
-            let parent = node.parent();
-            let len = node.device_value_len(FULL);
-            let newly_locked = node.device_lock_ref(FULL) == 0;
-            node.inc_device_lock_ref(FULL);
-            if newly_locked {
-                self.dec_evictable_size(FULL, len);
-                self.inc_protected_size(FULL, len);
-            }
-            self.update_evictable_leaf_sets_(cursor);
-            cursor = parent;
-        }
-        self.update_evictable_leaf_sets_(anchor);
-        continuation.node_id = last_node;
-        continuation.prefix_len = total_len;
-        Ok(result)
-    }
-
     fn validate_insert_anchor_(
         &self,
         prefix_node_idx: NodeIdx_,
@@ -2130,32 +1970,12 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 }),
             });
         }
-        self.begin_insert_suffix_(
-            prefix_node_idx,
-            prefix_len,
-            aligned_key_len,
-            params,
-            &params.key.as_ref()[prefix_len..aligned_key_len],
-            prefix_actions,
-        )
-    }
-
-    fn begin_insert_suffix_(
-        &mut self,
-        prefix_node_idx: NodeIdx_,
-        prefix_len: usize,
-        aligned_key_len: usize,
-        params: &InsertParams<'_, K, V>,
-        suffix: &[K::Atom],
-        prefix_actions: Vec<CacheAction<V>>,
-    ) -> Result<InsertStepResult<V>, TreeCoreRuntimeError> {
-        let value_len = aligned_key_len - prefix_len;
         // The walk owns only [prefix_len, aligned_key_len); the ragged tail and
         // retained prefix never enter the resumable state.
         self.ongoing_insert_walk_state = Some(InsertWalkState {
             phase: InsertPhase::Walk,
             node_id: prefix_node_idx,
-            key: K::from(suffix.to_vec()),
+            key: K::from(params.key.as_ref()[prefix_len..aligned_key_len].to_vec()),
             key_offset: prefix_len,
             aligned_key_len,
             value: params.value.slice(0, value_len),

@@ -69,7 +69,7 @@ are separate from vLLM's cadence; see the
 
 The SGLang simulator delegates radix matching, insertion, locking, and leaf removal to the bundled Torch-free `sglang-radix-tree` core. AISimulate owns physical pages, request leases, token accounting, KV events, and its optional Belady forecast. Tree keys are existing page hashes; one tree atom represents one physical KV page, and the adapter converts page counts to tokens.
 
-Chunked growth binds an append-only lease to its validated prefix once, inserts only suffix values, and extends its existing pin over the canonical suffix. Completed requests replay the retained prefix's access updates. LRU follows SGLang's whole-leaf eviction, so it can reclaim more pages than requested. Belady retains page-at-a-time tail eviction and reconsiders the exposed parent against the remaining leaves. Fallible admission snapshots clone tree metadata while sharing immutable key and page buffers; rollback restores the allocator, tree, leases, and buffered event state together.
+Chunked growth inserts only suffix values and acquires the extended path before releasing its previous lock. Completed requests replay the retained prefix's access updates. LRU follows SGLang's whole-leaf eviction, so it can reclaim more pages than requested. Belady retains page-at-a-time tail eviction and reconsiders the exposed parent against the remaining leaves. Fallible admission snapshots clone tree metadata while sharing immutable key and page buffers; rollback restores the allocator, tree, leases, and buffered event state together.
 
 The adapter maintains incremental LRU/Belady candidate indexes from native
 eligibility and access counters, refreshing changed forecast entries before

@@ -5,9 +5,7 @@
 //! operations and KV event publishing.
 
 use crate::engine::belady::BeladyOracle;
-use crate::engine::cache::radix_cache::{
-    FullInsertContinuation, KvPageId, NodeId, PageKey, RadixCache,
-};
+use crate::engine::cache::radix_cache::{KvPageId, NodeId, PageKey, RadixCache};
 use crate::engine::common::hashing::{
     LocalBlockHash, SequenceHash, compute_block_hash_for_seq, compute_next_seq_hash,
 };
@@ -39,7 +37,6 @@ pub(crate) struct RadixRequestLease {
     // remains the sole owner between calls. Growth can append without copying.
     page_hashes: Arc<Vec<LocalBlockHash>>,
     last_node: Option<NodeId>,
-    continuation: Option<FullInsertContinuation>,
 }
 
 /// Metadata used only with the matching KV-manager admission checkpoint.
@@ -50,7 +47,6 @@ pub(crate) struct RadixLeaseCheckpoint {
     admission_reused_tokens: usize,
     page_hashes_len: usize,
     last_node: Option<NodeId>,
-    continuation: Option<FullInsertContinuation>,
 }
 
 impl RadixRequestLease {
@@ -62,7 +58,6 @@ impl RadixRequestLease {
             admission_reused_tokens: self.admission_reused_tokens,
             page_hashes_len: self.page_hashes.len(),
             last_node: self.last_node,
-            continuation: self.continuation.clone(),
         }
     }
 
@@ -77,7 +72,6 @@ impl RadixRequestLease {
         self.admission_reused_tokens = checkpoint.admission_reused_tokens;
         Arc::make_mut(&mut self.page_hashes).truncate(checkpoint.page_hashes_len);
         self.last_node = checkpoint.last_node;
-        self.continuation = checkpoint.continuation;
     }
 
     #[cfg(test)]
@@ -156,7 +150,6 @@ impl RadixRequestLease {
             admission_reused_tokens: cached_tokens,
             page_hashes: Arc::default(),
             last_node: Some(last_node),
-            continuation: None,
         }
     }
 }
@@ -537,31 +530,15 @@ impl SglangKvManager {
         let last_node = lease.last_node();
         let complete_pages = complete_len / self.cache.page_size();
         let page_hashes = PageKey::shared(Arc::clone(&lease.page_hashes), complete_pages);
-        if lease.continuation.as_ref().is_none_or(|binding| {
-            binding.node_id() != last_node
-                || binding.prefix_len() != lease.cached_tokens / self.cache.page_size()
-        }) {
-            lease.continuation = Some(self.cache.bind_insert_continuation(
-                last_node,
-                lease.cached_tokens,
-                &page_hashes,
-            ));
-        }
-        let first_new_page = lease.cached_tokens / self.cache.page_size();
-        self.publish_stored_hashes(
-            page_hashes.as_ref(),
-            &lease.pages,
+        let pages = &mut lease.pages[..complete_pages];
+        let new_last_node = self.cache_unfinished_hashes(
+            page_hashes,
+            pages,
+            last_node,
             lease.cached_tokens,
             token_ids,
         );
-        let insert = self.cache.append_insert_continuation(
-            lease.continuation.as_mut().expect("bound lease"),
-            &page_hashes.as_ref()[first_new_page..],
-            &lease.pages[first_new_page..complete_pages],
-        );
-        lease.pages[first_new_page..complete_pages].copy_from_slice(&insert.canonical_suffix);
-        self.free_pages(&insert.unretained_pages);
-        lease.last_node = Some(insert.last_node);
+        lease.last_node = Some(new_last_node);
         lease.cached_tokens = complete_len;
     }
 
@@ -847,7 +824,6 @@ impl SglangKvManager {
         lease.pages.clear();
         lease.materialized_tokens = 0;
         lease.cached_tokens = 0;
-        lease.continuation = None;
         capacity_improved
     }
 
