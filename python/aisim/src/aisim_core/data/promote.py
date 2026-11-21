@@ -40,7 +40,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -564,7 +565,8 @@ def _apply_promotion(
 ) -> Path | None:
     """Copy the approved files, regenerate indexes and catalog, and prove the target is valid.
 
-    Raises :class:`PromotionError` (target restored) when anything fails. Returns the ledger path.
+    On failure, attempts every independent rollback step and reports any paths it cannot clean up or restore.
+    Returns the ledger path on success.
     """
     source, target = Path(source_root), Path(target_root)
     if not plan.ok:
@@ -652,28 +654,49 @@ def _apply_promotion(
                 Path(temporary).unlink(missing_ok=True)
             ledger, ledger_created = path, not existed
     except BaseException as failure:
+        cleanup_failures: list[str] = []
+
+        @contextmanager
+        def cleanup_step(path: Path) -> Iterator[None]:
+            try:
+                yield
+            except OSError as exc:
+                cleanup_failures.append(f"{path}: {exc}")
+
         if ledger is not None and ledger_created:
-            ledger.unlink(missing_ok=True)
+            with cleanup_step(ledger):
+                ledger.unlink(missing_ok=True)
         for path in added:
-            path.unlink(missing_ok=True)
+            with cleanup_step(path):
+                path.unlink(missing_ok=True)
         for directory in sorted(set(created_dirs), key=lambda d: len(d.parts), reverse=True):
-            if directory.is_dir() and not any(directory.iterdir()):  # only directories this promotion created
-                directory.rmdir()
-        for rel in {p.relative_to(target).as_posix() for p in _index_paths(target, index_paths)} - set(before):
-            (target / rel).unlink(missing_ok=True)
-        for directory in sorted((target / CATALOG_DIR).rglob("*"), reverse=True):
+            with cleanup_step(directory):
+                if directory.is_dir() and not any(directory.iterdir()):  # only directories this promotion created
+                    directory.rmdir()
+        new_indexes: set[str] = set()
+        with cleanup_step(target / CATALOG_DIR):
+            new_indexes = {p.relative_to(target).as_posix() for p in _index_paths(target, index_paths)} - set(before)
+        for rel in sorted(new_indexes):
+            with cleanup_step(target / rel):
+                (target / rel).unlink(missing_ok=True)
+        catalog_dirs: list[Path] = []
+        with cleanup_step(target / CATALOG_DIR):
+            catalog_dirs = sorted((target / CATALOG_DIR).rglob("*"), reverse=True)
+        for directory in catalog_dirs:
+            with cleanup_step(directory):
+                if (
+                    directory.is_dir()
+                    and not any(directory.iterdir())
+                    and (preexisting_catalog_dirs is None or directory not in preexisting_catalog_dirs)
+                ):
+                    directory.rmdir()
+        with cleanup_step(target / CATALOG_DIR):
             if (
-                directory.is_dir()
-                and not any(directory.iterdir())
-                and (preexisting_catalog_dirs is None or directory not in preexisting_catalog_dirs)
+                preexisting_catalog_dirs is None
+                and (target / CATALOG_DIR).is_dir()
+                and not any((target / CATALOG_DIR).iterdir())
             ):
-                directory.rmdir()
-        if (
-            preexisting_catalog_dirs is None
-            and (target / CATALOG_DIR).is_dir()
-            and not any((target / CATALOG_DIR).iterdir())
-        ):
-            (target / CATALOG_DIR).rmdir()
+                (target / CATALOG_DIR).rmdir()
         # Restore only what this attempt changed (an untouched, possibly read-only file is left alone), and keep
         # going when one restore fails: a stopped loop would leave the remaining files out of step with the payload.
         unrestored: list[str] = []
@@ -686,9 +709,14 @@ def _apply_promotion(
                 restored.write_bytes(data)
             except OSError:
                 unrestored.append(rel)
+        problems = []
+        if cleanup_failures:
+            problems.append(f"clean up: {'; '.join(cleanup_failures)}")
         if unrestored:
+            problems.append(f"restore: {', '.join(unrestored)}")
+        if problems:
             raise PromotionError(
-                f"promotion failed and rollback could not restore: {', '.join(unrestored)}"
+                "promotion failed and rollback could not " + "; could not ".join(problems)
             ) from failure
         raise
     return ledger

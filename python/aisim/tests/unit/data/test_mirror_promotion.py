@@ -1635,6 +1635,69 @@ def test_rollback_attempts_every_restore_and_names_those_it_could_not_do(tmp_pat
     assert not (target / directories[1]).exists()  # the other cleanup still ran
 
 
+@pytest.mark.parametrize(
+    "blocked_kind,restore_fails", [("payload", False), ("catalog", False), ("directory", False), ("catalog", True)]
+)
+def test_rollback_continues_after_cleanup_failure(tmp_path, monkeypatch, blocked_kind, restore_fails):
+    from aisim_core.data import promote as promotion
+    from aisim_core.data.hygiene import Finding
+    from aisim_core.data.mirror import TreeReport
+
+    root, directories, plan, target, before = _two_step_promotion(tmp_path)
+    index = target / "catalog/e2e.json"
+    shard = target / "catalog/e2e/new-shard.parquet"
+    blocked = {
+        "payload": target / sorted(plan.files)[0],
+        "catalog": shard,
+        "directory": target / directories[1],
+    }[blocked_kind]
+    cleanup_attempts = []
+    real_unlink, real_rmdir, real_write = Path.unlink, Path.rmdir, Path.write_bytes
+
+    def remove(path, *args, **kwargs):
+        cleanup_attempts.append(path)
+        if path == blocked:
+            raise PermissionError("fixture cleanup denied")
+        return real_unlink(path, *args, **kwargs)
+
+    def rmdir(path, *args, **kwargs):
+        cleanup_attempts.append(path)
+        if path == blocked:
+            raise PermissionError("fixture cleanup denied")
+        return real_rmdir(path, *args, **kwargs)
+
+    def write(path, data):
+        if restore_fails and path == index:
+            raise PermissionError("fixture restore denied")
+        return real_write(path, data)
+
+    def reject(*args, **kwargs):
+        assert index.read_bytes() != before[index.relative_to(target)]  # registration changed the live index
+        shard.write_bytes(b"new catalog shard")
+        return TreeReport(PUBLIC, "public", findings=[Finding("late-rejection", "fixture")])
+
+    monkeypatch.setattr(promotion, "validate_tree", reject)
+    monkeypatch.setattr(Path, "unlink", remove)
+    monkeypatch.setattr(Path, "rmdir", rmdir)
+    monkeypatch.setattr(Path, "write_bytes", write)
+    with pytest.raises(PromotionError, match="rollback could not") as raised:
+        apply_promotion(plan, root, target)
+    assert blocked in cleanup_attempts and blocked.exists()
+    assert blocked.relative_to(target).as_posix() in str(raised.value)
+    assert isinstance(raised.value.__cause__, PromotionError)
+    assert "late-rejection" in str(raised.value.__cause__)
+    if restore_fails:
+        assert "could not restore: catalog/e2e.json" in str(raised.value)
+        assert index.read_bytes() != before[index.relative_to(target)]
+    for rel, data in before.items():
+        if not (restore_fails and target / rel == index):
+            assert (target / rel).read_bytes() == data
+    assert all(not (target / rel).exists() for rel in plan.files if target / rel != blocked)
+    if blocked != shard:
+        assert not shard.exists()
+    assert not (target.parent / f".{target.name}.promotion.lock").exists()
+
+
 def test_failed_copy_and_failed_ledger_restore_the_target(tmp_path, monkeypatch):
     root, directory, plan = _approved(tmp_path)
     target = _target(tmp_path)
