@@ -97,6 +97,49 @@ def test_checkpoint_failure_stops_before_workers_without_reclassifying_candidate
     assert factory.admitted == [[0, 1]]
 
 
+def test_profile_worker_over_share_retries_only_unfinished_work_serially(monkeypatch):
+    from concurrent.futures import Future
+
+    from aisim import resource_scheduler as scheduler
+    from aisim import resources
+
+    submitted = []
+    terminated = []
+
+    class Factory(_BudgetFactory):
+        def admit_wave(self, specs):
+            plan = super().admit_wave(specs)
+            return plan | ({"profile_worker_rss_limit_bytes": 100} if len(specs) > 1 else {})
+
+    class Pool:
+        def __init__(self, *, max_workers, **kwargs):
+            self.width = max_workers
+            self._processes = {123: object()}
+
+        def submit(self, fn, spec):
+            index = spec["id"]
+            submitted.append((self.width, index))
+            future = Future()
+            if self.width == 1 or index == 0:
+                future.set_result(index)
+            return future
+
+    monkeypatch.setattr(scheduler, "ProcessPoolExecutor", Pool)
+    monkeypatch.setattr(scheduler, "terminate_pool", terminated.append)
+    monkeypatch.setattr(scheduler, "close_pool", lambda pool: None)
+    monkeypatch.setattr(
+        resources.psutil, "Process", lambda pid: SimpleNamespace(memory_info=lambda: SimpleNamespace(rss=80))
+    )
+    monkeypatch.setattr(resources, "_child_memory_bytes", lambda parent: 21)
+    assert resources.profile_worker_pressure([123], 101) is None
+    factory = Factory(capacity=4)
+    specs = [{"id": i, "cost": 1} for i in range(4)]
+    results = dict(evaluate_waves(specs, factory=factory, initializer=_init, evaluate=_evaluate, workers=4, timeout=10))
+    assert results == {i: i for i in range(4)}
+    assert submitted == [(4, 0), (4, 1), (4, 2), (4, 3), (1, 1), (1, 2), (1, 3)]
+    assert len(terminated) == 1
+
+
 def test_resource_retries_are_bounded_and_preserve_completed_work():
     factory = _BudgetFactory()
     specs = [{"id": 0, "cost": 1}, {"id": 1, "cost": 1, "refuse": True}]
