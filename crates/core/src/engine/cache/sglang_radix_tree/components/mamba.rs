@@ -149,8 +149,9 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for MambaComponent {
         _params: &MatchPrefixParams<'_, K>,
         _value_chunks: &[V],
         _best_value_len: usize,
+        best_match_len: usize,
     ) -> MatchResult<V> {
-        let mamba_boundary_len = result.device_indices.len() + result.host_hit_length;
+        let mamba_boundary_len = best_match_len;
 
         // Full KV may extend beyond the latest reusable Mamba state. The branching
         // point is the last checkpoint-grid-aligned position within the Full-KV hit
@@ -375,9 +376,12 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for MambaComponent {
             "finish the pending internal Mamba eviction before advancing"
         );
         let mut cursor = tree_core.component_state(MAMBA).evict_device_cursor;
-        // The cursor is re-validated (reset to LRU head) if the previous
-        // node's eviction removed it.
-        if cursor.is_some_and(|c| !tree_core.device_lru_list(MAMBA).in_list(Some(c))) {
+        // A request may lock the saved cursor between eviction steps without
+        // removing it from the LRU. Recheck before taking values or debiting sizes.
+        if cursor.is_some_and(|c| {
+            !tree_core.device_lru_list(MAMBA).in_list(Some(c))
+                || tree_core.arena.node(c).device_lock_ref(MAMBA) > 0
+        }) {
             cursor = tree_core
                 .device_lru_list(MAMBA)
                 .get_lru_no_lock(&tree_core.arena);

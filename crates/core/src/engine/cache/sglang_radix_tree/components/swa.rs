@@ -426,8 +426,9 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
         params: &MatchPrefixParams<'_, K>,
         value_chunks: &[V],
         best_value_len: usize,
+        best_match_len: usize,
     ) -> MatchResult<V> {
-        let swa_boundary_len = result.device_indices.len() + result.host_hit_length;
+        let swa_boundary_len = best_match_len;
 
         // Branch at the last page-aligned Full-KV position past the SWA boundary.
         let page_aligned_full_hit_len =
@@ -782,9 +783,12 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
             "finish the pending internal SWA eviction before advancing"
         );
         let mut cursor = tree_core.component_state(SWA).evict_device_cursor;
-        // The cursor is re-validated (reset to LRU head) if the previous
-        // node's eviction removed it.
-        if cursor.is_some_and(|c| !tree_core.device_lru_list(SWA).in_list(Some(c))) {
+        // A request may lock the saved cursor between eviction steps without
+        // removing it from the LRU. Recheck before taking values or debiting sizes.
+        if cursor.is_some_and(|c| {
+            !tree_core.device_lru_list(SWA).in_list(Some(c))
+                || tree_core.arena.node(c).device_lock_ref(SWA) > 0
+        }) {
             cursor = tree_core
                 .device_lru_list(SWA)
                 .get_lru_no_lock(&tree_core.arena);
@@ -953,6 +957,12 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
                 }])
             }
             CacheTransferPhase::LoadBack => {
+                let node = tree_core.arena.node(node_id);
+                if self.swa_req_ring && !node.has_device_value(SWA) && !node.has_host_value(SWA) {
+                    // Ring-layout matches may reuse Full KV without cached SWA
+                    // rows, as accepted by create_match_validator.
+                    return Ok(None);
+                }
                 // `node` is best_match_node; the SWA validator guarantees every
                 // ancestor within `sliding_window_size` has value or host_value.
                 let mut n_swa = 0;

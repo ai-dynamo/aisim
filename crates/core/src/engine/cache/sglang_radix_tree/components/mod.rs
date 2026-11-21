@@ -133,6 +133,7 @@ pub trait TreeComponent<K: ChildKeyType, V: RadixValue> {
     ) -> Box<dyn FnMut(&UnifiedTreeCore<K, V>, NodeIdx_) -> bool>;
 
     /// Tree-side post-processing inside the match walk (no cache access).
+    /// `best_match_len` is the logical key depth, independent of transfer sizes.
     fn finalize_match_result_in_tree_core(
         &self,
         tree_core: &UnifiedTreeCore<K, V>,
@@ -142,6 +143,7 @@ pub trait TreeComponent<K: ChildKeyType, V: RadixValue> {
         params: &MatchPrefixParams<'_, K>,
         value_chunks: &[V],
         best_value_len: usize,
+        best_match_len: usize,
     ) -> MatchResult<V> {
         result
     }

@@ -23,7 +23,7 @@ blake3 = { workspace = true }
 ddsketchy = "0.1.7"
 derive_builder = { workspace = true }
 flate2 = { workspace = true }
-hashbrown = "0.16"
+hashbrown = { version = "0.16", default-features = false, features = ["equivalent", "inline-more"] }
 indicatif = "0.18"
 log = "0.4"
 parquet = { version = "55", default-features = false, features = ["zstd", "snap"] }

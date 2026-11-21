@@ -2,13 +2,32 @@ SPDX-FileCopyrightText: SGLang contributors
 SPDX-FileCopyrightText: Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0
 Derived from https://github.com/sgl-project/sglang at f0fda25fc95c357368b714f90a13a69c1b67f50a,
-original paths rust/sglang-radix-tree/src/{lib.rs,node.rs,value.rs,unified_tree_core.rs,components/{full,mamba,swa}.rs}.
+original paths rust/sglang-radix-tree/src/{lib.rs,node.rs,value.rs,unified_tree_core.rs,components/{mod,full,mamba,swa}.rs}.
 Modified after mechanical module adaptation. See crates/core/src/engine/cache/sglang_radix_tree/README.md
 and its LICENSE for provenance, the preserved license, and each local correction.
 
 --- a/components/full.rs
 +++ b/components/full.rs
-@@ -185,8 +185,17 @@
+@@ -63,6 +63,7 @@
+         params: &MatchPrefixParams<'_, K>,
+         value_chunks: &[V],
+         best_value_len: usize,
++        _best_match_len: usize,
+     ) -> MatchResult<V> {
+         // Compute Full KV host hit length: walk from last_host_node up to
+         // last_device_node, summing host_value lengths of evicted nodes.
+@@ -77,7 +78,9 @@
+                     result.best_match_node_id, node.id, result.last_device_node_id
+                 )
+             });
+-            kv_host_hit += node.host_value_len(FULL);
++            if node.evicted() {
++                kv_host_hit += node.host_value_len(FULL);
++            }
+             node_idx = parent;
+         }
+         if kv_host_hit > 0 {
+@@ -185,8 +188,17 @@
          if tracker[&ct] >= tree_core.component_state(FULL).evict_device_request_cnt {
              return None;
          }
@@ -27,7 +46,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
                  continue;
              }
              let last_node_parent = tree_core.arena.node(x).try_parent();
-@@ -291,6 +300,7 @@
+@@ -291,6 +303,7 @@
              let node = tree_core.arena.node_mut(node_id);
              // write_back mode: the anchor may be device-only (no host_value); pin it anyway.
              if !node.has_host_value(FULL) && !tree_core.is_write_back {
@@ -48,7 +67,18 @@ and its LICENSE for provenance, the preserved license, and each local correction
          MambaComponent {
              // A donated checkpoint must land on both the model's chunk grid and
              // a radix-node boundary. `params.page_size` is already widened by DCP.
-@@ -184,14 +188,14 @@
+@@ -145,8 +149,9 @@
+         _params: &MatchPrefixParams<'_, K>,
+         _value_chunks: &[V],
+         _best_value_len: usize,
++        best_match_len: usize,
+     ) -> MatchResult<V> {
+-        let mamba_boundary_len = result.device_indices.len() + result.host_hit_length;
++        let mamba_boundary_len = best_match_len;
+
+         // Full KV may extend beyond the latest reusable Mamba state. The branching
+         // point is the last checkpoint-grid-aligned position within the Full-KV hit
+@@ -184,14 +189,14 @@
          if is_new_leaf {
              tree_core
                  .arena
@@ -65,9 +95,54 @@ and its LICENSE for provenance, the preserved license, and each local correction
              let tick = tree_core.arena.get_and_bump_access_counter();
              tree_core.arena.node_mut(node_id).last_access_counter = tick;
              self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);
+@@ -371,9 +376,12 @@
+             "finish the pending internal Mamba eviction before advancing"
+         );
+         let mut cursor = tree_core.component_state(MAMBA).evict_device_cursor;
+-        // The cursor is re-validated (reset to LRU head) if the previous
+-        // node's eviction removed it.
+-        if cursor.is_some_and(|c| !tree_core.device_lru_list(MAMBA).in_list(Some(c))) {
++        // A request may lock the saved cursor between eviction steps without
++        // removing it from the LRU. Recheck before taking values or debiting sizes.
++        if cursor.is_some_and(|c| {
++            !tree_core.device_lru_list(MAMBA).in_list(Some(c))
++                || tree_core.arena.node(c).device_lock_ref(MAMBA) > 0
++        }) {
+             cursor = tree_core
+                 .device_lru_list(MAMBA)
+                 .get_lru_no_lock(&tree_core.arena);
+--- a/components/mod.rs
++++ b/components/mod.rs
+@@ -133,6 +133,7 @@
+     ) -> Box<dyn FnMut(&UnifiedTreeCore<K, V>, NodeIdx_) -> bool>;
+
+     /// Tree-side post-processing inside the match walk (no cache access).
++    /// `best_match_len` is the logical key depth, independent of transfer sizes.
+     fn finalize_match_result_in_tree_core(
+         &self,
+         tree_core: &UnifiedTreeCore<K, V>,
+@@ -142,6 +143,7 @@
+         params: &MatchPrefixParams<'_, K>,
+         value_chunks: &[V],
+         best_value_len: usize,
++        best_match_len: usize,
+     ) -> MatchResult<V> {
+         result
+     }
 --- a/components/swa.rs
 +++ b/components/swa.rs
-@@ -608,7 +608,7 @@
+@@ -426,8 +426,9 @@
+         params: &MatchPrefixParams<'_, K>,
+         value_chunks: &[V],
+         best_value_len: usize,
++        best_match_len: usize,
+     ) -> MatchResult<V> {
+-        let swa_boundary_len = result.device_indices.len() + result.host_hit_length;
++        let swa_boundary_len = best_match_len;
+
+         // Branch at the last page-aligned Full-KV position past the SWA boundary.
+         let page_aligned_full_hit_len =
+@@ -608,7 +609,7 @@
          cache_actions: &mut Vec<CacheAction<V>>,
      ) {
          if let Some(branching_seqlen) = params.swa_branching_seqlen {
@@ -76,6 +151,35 @@ and its LICENSE for provenance, the preserved license, and each local correction
          }
 
          if !is_new_leaf {
+@@ -782,9 +783,12 @@
+             "finish the pending internal SWA eviction before advancing"
+         );
+         let mut cursor = tree_core.component_state(SWA).evict_device_cursor;
+-        // The cursor is re-validated (reset to LRU head) if the previous
+-        // node's eviction removed it.
+-        if cursor.is_some_and(|c| !tree_core.device_lru_list(SWA).in_list(Some(c))) {
++        // A request may lock the saved cursor between eviction steps without
++        // removing it from the LRU. Recheck before taking values or debiting sizes.
++        if cursor.is_some_and(|c| {
++            !tree_core.device_lru_list(SWA).in_list(Some(c))
++                || tree_core.arena.node(c).device_lock_ref(SWA) > 0
++        }) {
+             cursor = tree_core
+                 .device_lru_list(SWA)
+                 .get_lru_no_lock(&tree_core.arena);
+@@ -953,6 +957,12 @@
+                 }])
+             }
+             CacheTransferPhase::LoadBack => {
++                let node = tree_core.arena.node(node_id);
++                if self.swa_req_ring && !node.has_device_value(SWA) && !node.has_host_value(SWA) {
++                    // Ring-layout matches may reuse Full KV without cached SWA
++                    // rows, as accepted by create_match_validator.
++                    return Ok(None);
++                }
+                 // `node` is best_match_node; the SWA validator guarantees every
+                 // ancestor within `sliding_window_size` has value or host_value.
+                 let mut n_swa = 0;
 --- a/mod.rs
 +++ b/mod.rs
 @@ -45,3 +45,7 @@
@@ -123,7 +227,44 @@ and its LICENSE for provenance, the preserved license, and each local correction
 
          // Drop strictly-lower-priority locks co-located on the node, skipping
          // any the paired inc never took.
-@@ -1809,14 +1811,23 @@
+@@ -1601,9 +1603,11 @@
+
+         // Re-stamp the matched path with fresh ticks, newest leaf-ward.
+         let mut path = Vec::new();
++        let mut best_match_len = 0;
+         let mut cur = Some(best_match_node_id);
+         while let Some(id) = cur {
+             path.push(id);
++            best_match_len += self.arena.node(id).key.atom_len();
+             cur = self.arena.node(id).try_parent();
+         }
+         let newest_tick = self
+@@ -1641,8 +1645,14 @@
+             full_kv_hit_length,
+             cache_actions: Vec::new(),
+         };
+-        for i in 0..self.components.len() {
+-            let component = Arc::clone(&self.components[i]);
++        // Finalize Full first regardless of component registration order.
++        // Auxiliary boundaries use logical depth, not Full transfer volume.
++        for component in std::iter::once(self.component_by_type_(FULL)).chain(
++            self.components
++                .iter()
++                .filter(|component| component.component_type() != FULL)
++                .cloned(),
++        ) {
+             result = component.finalize_match_result_in_tree_core(
+                 self,
+                 result,
+@@ -1651,6 +1661,7 @@
+                 params,
+                 &value,
+                 best_match_device_value_len,
++                best_match_len,
+             );
+         }
+         result.cache_actions = action.into_iter().collect();
+@@ -1809,14 +1820,23 @@
              return Err(TreeCoreRuntimeError::InsertAnchorNotDeviceResident { node_id: anchor.id });
          }
 
@@ -147,7 +288,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              cursor = node.parent();
          }
          if node_prefix_len != prefix_len {
-@@ -1826,28 +1837,8 @@
+@@ -1826,28 +1846,8 @@
                  prefix_len,
              });
          }
@@ -178,7 +319,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          }
          Ok(())
      }
-@@ -1944,7 +1935,7 @@
+@@ -1944,7 +1944,7 @@
          if aligned_key_len == prefix_len {
              // An empty suffix still visited its retained boundary above.
              return Ok(InsertStepResult {
@@ -187,7 +328,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
                  result: Some(InsertResult {
                      prefix_len,
                      total_len: aligned_key_len,
-@@ -1957,7 +1948,7 @@
+@@ -1957,7 +1957,7 @@
                      mamba_exist: true,
                      swa_branch_inserted: false,
                      adopted_ranges: params.track_adopted_ranges.then(HashMap::new),
@@ -196,7 +337,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
                  }),
              });
          }
-@@ -3178,7 +3169,7 @@
+@@ -3178,7 +3178,7 @@
      ) -> Result<EvictionStepResult<V>, TreeCoreRuntimeError> {
          let node_id = self.arena.resolve(node_id)?;
          let mut result = EvictionStepResult::default();
@@ -205,20 +346,20 @@ and its LICENSE for provenance, the preserved license, and each local correction
          if self.arena.node(node_id).is_load_back_pending() {
              return Ok(result);
          }
-@@ -3190,6 +3181,12 @@
+@@ -3190,6 +3190,12 @@
                      evicted: node.evicted(),
                      backuped: node.backuped(),
                  });
 +            }
-+            // Deferred work must recheck locks acquired after backup was
-+            // scheduled before touching values or size ledgers. Keep invalid
-+            // demotion-state errors above, even when that node is locked.
-+            if node.is_device_locked() {
++            // Deferred work may now have locks or device children. Keep Full
++            // ancestors resident and let the caller select a current leaf.
++            // Preserve invalid-state errors above even when the node is locked.
++            if !self.is_evictable_device_leaf_(node) {
 +                return Ok(result);
              }
          }
          self.demote_(
-@@ -4829,6 +4826,11 @@
+@@ -4829,6 +4835,11 @@
          for &(child_id, pos, prefix_len) in &spans {
              if pos + prefix_len <= window_start {
                  continue;
@@ -230,6 +371,27 @@ and its LICENSE for provenance, the preserved license, and each local correction
              }
              if self.arena.has_device_value(child_id, SWA) {
                  return Err(format!(
+@@ -5833,6 +5844,12 @@
+         let last_device_node_idx = self.arena.resolve(result.last_device_node_id)?;
+         self.arena.resolve(result.last_host_node_id)?;
+         let best_match_node_idx = self.arena.resolve(result.best_match_node_id)?;
++        let mut best_match_len = 0;
++        let mut node = self.arena.node(best_match_node_idx);
++        while !node.is_root() {
++            best_match_len += node.key.atom_len();
++            node = self.arena.node(node.parent());
++        }
+         Ok(self
+             .component_by_type_(component_type)
+             .finalize_match_result_in_tree_core(
+@@ -5843,6 +5860,7 @@
+                 params,
+                 value_chunks,
+                 best_value_len,
++                best_match_len,
+             ))
+     }
+
 --- a/value.rs
 +++ b/value.rs
 @@ -88,6 +88,17 @@

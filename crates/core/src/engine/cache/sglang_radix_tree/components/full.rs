@@ -63,6 +63,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for FullComponent {
         params: &MatchPrefixParams<'_, K>,
         value_chunks: &[V],
         best_value_len: usize,
+        _best_match_len: usize,
     ) -> MatchResult<V> {
         // Compute Full KV host hit length: walk from last_host_node up to
         // last_device_node, summing host_value lengths of evicted nodes.
@@ -77,7 +78,9 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for FullComponent {
                     result.best_match_node_id, node.id, result.last_device_node_id
                 )
             });
-            kv_host_hit += node.host_value_len(FULL);
+            if node.evicted() {
+                kv_host_hit += node.host_value_len(FULL);
+            }
             node_idx = parent;
         }
         if kv_host_hit > 0 {

@@ -60,7 +60,7 @@ to the baseline adapter. Build both before collecting samples:
 
 ```bash
 cargo test --release --locked --lib eviction_pressure_measurement --no-run
-AISIM_PRESSURE_OUTPUT="$TMPDIR/pressure.json" \
+AISIM_PRESSURE_OUTPUT="$TMPDIR/pressure-probe.json" \
   cargo test --release --locked --lib eviction_pressure_measurement -- --ignored
 cargo test -p aisimulate-core --locked --lib engine::cache::radix_cache
 ```
@@ -80,8 +80,34 @@ python -m maturin build --release --locked --auditwheel skip --out "$TMPDIR/whee
 python -m pip install --no-deps --target "$TMPDIR/runtime" "$TMPDIR/wheels/"*.whl
 PYTHONPATH="$TMPDIR/runtime" python -c \
   'import aisimulate._runtime as n, hashlib; print(n.__file__); print(hashlib.sha256(open(n.__file__, "rb").read()).hexdigest())'
+```
+
+From the repository root, prepare the selected report configuration (use
+`control`, `pressure_1024`, or `pressure_8192`) and the local model metadata:
+
+```bash
+python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+scratch = Path(os.environ["TMPDIR"])
+report = json.loads(Path(
+    "crates/core/src/engine/cache/eviction-pressure-cli-comparison.json"
+).read_text())
+config = report["configs"]["control"]["config"]
+model = json.loads(Path(
+    "tests/e2e/configs/unified_cli/fixtures/tiny-model/config.json"
+).read_text())
+model["max_position_embeddings"] = 131072
+model_dir = scratch / "pressure-tiny-model"
+model_dir.mkdir(exist_ok=True)
+(model_dir / "config.json").write_text(json.dumps(model))
+config["engine"]["model"] = str(model_dir)
+(scratch / "pressure-config.json").write_text(json.dumps(config))
+PY
 PYTHONPATH="$TMPDIR/runtime" taskset -c 0 python -m aisimulate predict \
-  --stack engine --config "$TMPDIR/pressure.json" \
+  --stack engine --config "$TMPDIR/pressure-config.json" \
   --output-dir "$TMPDIR/prediction" --format json
 ```
 

@@ -35,6 +35,7 @@ The mechanical modifications are:
   `crate::engine::cache::sglang_radix_tree::`.
 - Alias upstream's `thiserror` 1.x as `thiserror1`, preserving the existing
   AISimulate dependency on `thiserror` 2.x. Keep upstream's `hashbrown` 0.16
+  with only its borrowed-lookup and inlining features,
   and Linux/aarch64 SHA acceleration dependencies.
 - Omit the disabled Torch/PyO3 modules, Tensor implementations, and Torch-only
   test module declarations. Compile upstream's native integration tests as a
@@ -47,13 +48,19 @@ After those adaptations, `scripts/sglang_radix_core_fixes.patch` applies the
 following local corrections to this pinned revision:
 
 - Recheck popped Full eviction priorities and preserve skipped Full host and
-  SWA early-release lock receipts.
+  SWA early-release lock receipts. Revalidate saved Mamba/SWA device cursors
+  against newly acquired component locks before taking values.
 - Reject zero Mamba chunk sizes, copy donated Mamba slots for adoption, and
   compare SWA continuation boundaries against the complete insert length.
 - Validate continuation key content in release builds during the existing
   ancestor walk, and return retained-prefix backup actions for empty suffixes.
-- Defer demotion while device locks are held and reject SWA attachment over
-  host-only Full spans before any mutation.
+- Defer demotion while device locks are held or device children have appeared,
+  and reject SWA attachment over host-only Full spans before any mutation.
+- Count only evicted Full rows as host hits. Finalize Full first and pass the
+  logical matched key depth separately to Mamba/SWA branching calculations.
+  Compute that depth during the existing recency walk, without another walk
+  or path allocation. Skip paged SWA load-back for ring boundaries without
+  cached SWA rows.
 - Borrow child edge keys during removal and copy visible page slices directly
   into compact shared storage during adoption.
 

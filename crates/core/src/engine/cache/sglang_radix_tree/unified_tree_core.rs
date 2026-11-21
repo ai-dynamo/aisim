@@ -1603,9 +1603,11 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
 
         // Re-stamp the matched path with fresh ticks, newest leaf-ward.
         let mut path = Vec::new();
+        let mut best_match_len = 0;
         let mut cur = Some(best_match_node_id);
         while let Some(id) = cur {
             path.push(id);
+            best_match_len += self.arena.node(id).key.atom_len();
             cur = self.arena.node(id).try_parent();
         }
         let newest_tick = self
@@ -1643,8 +1645,14 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             full_kv_hit_length,
             cache_actions: Vec::new(),
         };
-        for i in 0..self.components.len() {
-            let component = Arc::clone(&self.components[i]);
+        // Finalize Full first regardless of component registration order.
+        // Auxiliary boundaries use logical depth, not Full transfer volume.
+        for component in std::iter::once(self.component_by_type_(FULL)).chain(
+            self.components
+                .iter()
+                .filter(|component| component.component_type() != FULL)
+                .cloned(),
+        ) {
             result = component.finalize_match_result_in_tree_core(
                 self,
                 result,
@@ -1653,6 +1661,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 params,
                 &value,
                 best_match_device_value_len,
+                best_match_len,
             );
         }
         result.cache_actions = action.into_iter().collect();
@@ -3182,10 +3191,10 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                     backuped: node.backuped(),
                 });
             }
-            // Deferred work must recheck locks acquired after backup was
-            // scheduled before touching values or size ledgers. Keep invalid
-            // demotion-state errors above, even when that node is locked.
-            if node.is_device_locked() {
+            // Deferred work may now have locks or device children. Keep Full
+            // ancestors resident and let the caller select a current leaf.
+            // Preserve invalid-state errors above even when the node is locked.
+            if !self.is_evictable_device_leaf_(node) {
                 return Ok(result);
             }
         }
@@ -5835,6 +5844,12 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         let last_device_node_idx = self.arena.resolve(result.last_device_node_id)?;
         self.arena.resolve(result.last_host_node_id)?;
         let best_match_node_idx = self.arena.resolve(result.best_match_node_id)?;
+        let mut best_match_len = 0;
+        let mut node = self.arena.node(best_match_node_idx);
+        while !node.is_root() {
+            best_match_len += node.key.atom_len();
+            node = self.arena.node(node.parent());
+        }
         Ok(self
             .component_by_type_(component_type)
             .finalize_match_result_in_tree_core(
@@ -5845,6 +5860,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 params,
                 value_chunks,
                 best_value_len,
+                best_match_len,
             ))
     }
 

@@ -324,3 +324,303 @@ fn swa_attach_rejects_host_only_full_before_splitting() {
     assert_eq!(tree.swa_evictable_size(), 0);
     tree.try_sanity_check(&[], &[]).unwrap();
 }
+
+fn backup_components(tree: &mut Core, leaf: NodeId, auxiliary: ComponentType) {
+    let transfer = PoolTransfer {
+        name: if auxiliary == MAMBA {
+            PoolName::Mamba
+        } else {
+            PoolName::Swa
+        },
+        host_indices: Some(PageValue::from_vec(if auxiliary == MAMBA {
+            vec![201]
+        } else {
+            vec![201, 202]
+        })),
+        nodes_to_load: Some(vec![leaf]),
+        ..Default::default()
+    };
+    tree.commit_backup(
+        leaf,
+        PageValue::from_vec(vec![101, 102]),
+        [(auxiliary, vec![transfer])].into_iter().collect(),
+    )
+    .unwrap();
+    let nodes = tree.mark_write_through_pending(vec![leaf], leaf).unwrap();
+    tree.finish_write_through(nodes, leaf).unwrap();
+}
+
+fn evict_auxiliary(tree: &mut Core, leaf: NodeId, auxiliary: ComponentType) {
+    // A Full-only request lock leaves the auxiliary pool independently evictable.
+    let full_lock = tree
+        .inc_lock_ref(leaf, [auxiliary].into_iter().collect())
+        .unwrap();
+    tree.evict_device_start(auxiliary, 1);
+    let (victim, step) = tree.evict_device_next_node(auxiliary, &HashMap::new());
+    assert_eq!(victim, None);
+    assert!(!step.device_frees[&auxiliary].is_empty());
+    tree.evict_device_end(auxiliary);
+    tree.dec_lock_ref(leaf, &full_lock.to_dec_params(), false)
+        .unwrap();
+}
+
+#[test]
+fn full_host_hits_equal_load_back_rows_with_a_host_only_mamba_checkpoint() {
+    for full_host_only in [false, true] {
+        let mut tree = Core::new(
+            CacheInitParams {
+                enable_hicache: true,
+                mamba_cache_chunk_size: Some(1),
+                ..Default::default()
+            },
+            vec![FULL, MAMBA],
+        );
+        let key = vec![10, 20];
+        let mut p = params(&key, &[1, 2]);
+        p.mamba_value = Some(PageValue::from_vec(vec![11]));
+        let leaf = tree.insert(&p).last_device_node_id.unwrap();
+        backup_components(&mut tree, leaf, MAMBA);
+        evict_auxiliary(&mut tree, leaf, MAMBA);
+        if full_host_only {
+            tree.demote(leaf).unwrap();
+        }
+        let matched = tree.match_prefix(&MatchPrefixParams {
+            key: &key,
+            namespace: Default::default(),
+        });
+        assert_eq!(matched.best_match_node_id, leaf);
+        assert_eq!(matched.mamba_host_hit_length, 1);
+        let request = Req {
+            mamba_pool_idx: Some(PageValue::from_vec(vec![301])),
+        };
+        let (full_transfer, mut auxiliary) =
+            tree.build_load_back_spec(leaf, Some(&request)).unwrap();
+        let rows = full_transfer.host_indices.as_ref().unwrap().len();
+        assert_eq!(rows, if full_host_only { 2 } else { 0 });
+        assert_eq!(matched.host_hit_length, rows);
+        assert_eq!(matched.mamba_branching_seqlen, None);
+        assert_eq!(
+            auxiliary[&MAMBA][0]
+                .host_indices
+                .as_ref()
+                .unwrap()
+                .as_slice(),
+            &[201]
+        );
+        // The controller allocates a cache slot for the planned checkpoint
+        // restore, separately from the request's preallocated CoW slot.
+        auxiliary.get_mut(&MAMBA).unwrap()[0].device_indices = Some(PageValue::from_vec(vec![302]));
+        let full_values = if full_host_only { vec![3, 4] } else { vec![] };
+        tree.commit_load_back(
+            leaf,
+            PageValue::from_vec(full_values),
+            full_transfer,
+            auxiliary,
+        )
+        .unwrap();
+        tree.finish_load_back(leaf).unwrap();
+        let loaded = tree.match_prefix(&MatchPrefixParams {
+            key: &key,
+            namespace: Default::default(),
+        });
+        assert_eq!(loaded.device_indices.len(), 2);
+        assert_eq!(loaded.host_hit_length, 0);
+        assert_eq!(loaded.mamba_host_hit_length, 0);
+        tree.try_sanity_check(&[], &[]).unwrap();
+    }
+}
+
+#[test]
+fn host_match_branch_boundaries_are_independent_of_component_order() {
+    for auxiliary in [MAMBA, SWA] {
+        for components in [vec![FULL, auxiliary], vec![auxiliary, FULL]] {
+            let mut tree = Core::new(
+                CacheInitParams {
+                    enable_hicache: true,
+                    mamba_cache_chunk_size: Some(1),
+                    swa_sliding_window_size: Some(2),
+                    has_swa_host_pool: true,
+                    ..Default::default()
+                },
+                components,
+            );
+            let key = vec![10, 20];
+            let mut p = params(&key, &[1, 2]);
+            p.mamba_value = (auxiliary == MAMBA).then(|| PageValue::from_vec(vec![11]));
+            let leaf = tree.insert(&p).last_device_node_id.unwrap();
+            if auxiliary == SWA {
+                // The controller materializes SWA after the insert's rebuild action.
+                tree.attach_swa_window(
+                    &key,
+                    Default::default(),
+                    0,
+                    2,
+                    &PageValue::from_vec(vec![11, 12]),
+                )
+                .unwrap();
+            }
+            backup_components(&mut tree, leaf, auxiliary);
+            tree.demote(leaf).unwrap();
+            let matched = tree.match_prefix(&MatchPrefixParams {
+                key: &key,
+                namespace: Default::default(),
+            });
+            assert_eq!(matched.best_match_node_id, leaf);
+            assert!(matched.device_indices.is_empty());
+            assert_eq!(matched.host_hit_length, 2);
+            assert_eq!(matched.mamba_branching_seqlen, None);
+            assert_eq!(matched.swa_branching_seqlen, None);
+            let (full, auxiliary_transfers) = tree.build_load_back_spec(leaf, None).unwrap();
+            assert_eq!(full.host_indices.unwrap().len(), 2);
+            if auxiliary == SWA {
+                assert_eq!(
+                    auxiliary_transfers[&SWA][0]
+                        .host_indices
+                        .as_ref()
+                        .unwrap()
+                        .len(),
+                    2
+                );
+            }
+            tree.try_sanity_check(&[], &[]).unwrap();
+        }
+    }
+}
+
+#[test]
+fn auxiliary_eviction_cursor_rechecks_locks_acquired_after_start() {
+    for auxiliary in [MAMBA, SWA] {
+        let mut tree = Core::new(
+            CacheInitParams {
+                mamba_cache_chunk_size: Some(1),
+                swa_sliding_window_size: Some(2),
+                ..Default::default()
+            },
+            vec![FULL, auxiliary],
+        );
+        let key = vec![10, 20];
+        let mut p = params(&key, &[1, 2]);
+        p.mamba_value = (auxiliary == MAMBA).then(|| PageValue::from_vec(vec![11]));
+        let leaf = tree.insert(&p).last_device_node_id.unwrap();
+        if auxiliary == SWA {
+            tree.attach_swa_window(
+                &key,
+                Default::default(),
+                0,
+                2,
+                &PageValue::from_vec(vec![11, 12]),
+            )
+            .unwrap();
+        }
+        tree.evict_device_start(auxiliary, 1);
+        let lock = tree.inc_lock_ref(leaf, ComponentSet::EMPTY).unwrap();
+        let (victim, step) = tree.evict_device_next_node(auxiliary, &HashMap::new());
+        assert_eq!(victim, None);
+        assert!(step.device_frees.is_empty());
+        assert!(step.tracker.is_empty());
+        assert_eq!(
+            tree.component_protected_size(auxiliary),
+            if auxiliary == MAMBA { 1 } else { 2 }
+        );
+        tree.evict_device_end(auxiliary);
+        tree.dec_lock_ref(leaf, &lock.to_dec_params(), false)
+            .unwrap();
+        evict_auxiliary(&mut tree, leaf, auxiliary);
+        assert_eq!(tree.component_evictable_size(auxiliary), 0);
+        assert_eq!(tree.full_evictable_size(), 2);
+        tree.try_sanity_check(&[], &[]).unwrap();
+    }
+}
+
+#[test]
+fn ring_layout_host_match_builds_a_full_only_load_back() {
+    let mut tree = Core::new(
+        CacheInitParams {
+            enable_hicache: true,
+            swa_req_ring: true,
+            has_swa_host_pool: true,
+            swa_sliding_window_size: Some(2),
+            ..Default::default()
+        },
+        vec![FULL, SWA],
+    );
+    let key = vec![10, 20];
+    let mut p = params(&key, &[1, 2]);
+    p.swa_evicted_seqlen = 2;
+    let leaf = tree.insert(&p).last_device_node_id.unwrap();
+    complete_backup(&mut tree, leaf);
+    tree.demote(leaf).unwrap();
+    let matched = tree.match_prefix(&MatchPrefixParams {
+        key: &key,
+        namespace: Default::default(),
+    });
+    assert_eq!(matched.best_match_node_id, leaf);
+    assert_eq!(matched.host_hit_length, 2);
+    let (full, auxiliary) = tree
+        .build_load_back_spec(matched.best_match_node_id, None)
+        .unwrap();
+    assert_eq!(full.host_indices.as_ref().unwrap().as_slice(), &[101, 102]);
+    assert!(!auxiliary.contains_key(&SWA));
+    tree.commit_load_back(leaf, PageValue::from_vec(vec![3, 4]), full, auxiliary)
+        .unwrap();
+    tree.finish_load_back(leaf).unwrap();
+    let matched = tree.match_prefix(&MatchPrefixParams {
+        key: &key,
+        namespace: Default::default(),
+    });
+    assert_eq!(matched.device_indices.as_slice(), &[3, 4]);
+    tree.try_sanity_check(&[], &[]).unwrap();
+}
+
+#[test]
+fn deferred_demote_rechecks_leaf_eligibility_after_an_insert() {
+    for grows_child in [false, true] {
+        let mut tree = Core::new(
+            CacheInitParams {
+                enable_hicache: true,
+                ..Default::default()
+            },
+            vec![FULL],
+        );
+        let leaf = insert(&mut tree, vec![10, 20], &[1, 2]);
+        complete_backup(&mut tree, leaf);
+        tree.evict_device_start(FULL, 1);
+        assert_eq!(
+            tree.evict_device_next_node(FULL, &HashMap::new()).0,
+            Some(leaf)
+        );
+        tree.evict_device_end(FULL);
+        let child = grows_child.then(|| {
+            let child = insert(&mut tree, vec![10, 20, 30, 40], &[1, 2, 3, 4]);
+            let lock = tree.inc_lock_ref(child, ComponentSet::EMPTY).unwrap();
+            tree.dec_lock_ref(child, &lock.to_dec_params(), false)
+                .unwrap();
+            child
+        });
+        let step = tree.demote(leaf).unwrap();
+        if let Some(child) = child {
+            assert!(step.device_frees.is_empty());
+            assert_eq!(tree.full_evictable_size(), 4);
+            let matched = tree.match_prefix(&MatchPrefixParams {
+                key: &vec![10, 20, 30, 40],
+                namespace: Default::default(),
+            });
+            assert_eq!(matched.device_indices.as_slice(), &[1, 2, 3, 4]);
+            let lock = tree
+                .inc_lock_ref(matched.last_device_node_id, ComponentSet::EMPTY)
+                .unwrap();
+            tree.dec_lock_ref(child, &lock.to_dec_params(), false)
+                .unwrap();
+            tree.evict_device_start(FULL, 1);
+            assert_eq!(
+                tree.evict_device_next_node(FULL, &HashMap::new()).0,
+                Some(child)
+            );
+            tree.evict_device_end(FULL);
+        } else {
+            assert_eq!(step.device_frees[&FULL][0].as_slice(), &[1, 2]);
+            assert_eq!(tree.full_evictable_size(), 0);
+        }
+        tree.try_sanity_check(&[], &[]).unwrap();
+    }
+}
