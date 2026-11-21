@@ -312,6 +312,68 @@ fn cold_prefill_checkpoint_only_replaces_rotation_in_one_pass() {
 }
 
 #[test]
+fn warm_junction_checkpoint_admission_accounts_for_the_final_chunk() {
+    // Four token blocks and two two-block working states fit in eight blocks.
+    // A warm attention-only prefix forces a stop at 64, so the final chunk
+    // [64, 193) also exports checkpoint 192 and needs ten blocks. The cold
+    // budget split at 192 exports no checkpoint and still fits in eight.
+    // The junction also rotates the state when the whole prompt fits in the
+    // token budget; it is still a two-pass prefill.
+    for (warm, budget, capacity) in [
+        (false, 192, 8),
+        (true, 192, 8),
+        (true, 192, 10),
+        (true, 1024, 8),
+        (true, 1024, 10),
+    ] {
+        let mut config = args(true, true);
+        config.block_size = 64;
+        config.prefix_match_unit = Some(64);
+        config.max_num_batched_tokens = Some(budget);
+        config.num_gpu_blocks = capacity;
+        config.state_cache.as_mut().unwrap().bytes_per_request = 1500;
+        let mut core = VllmCore::new(config);
+        if warm {
+            let parent = submit(&mut core, 910, (0..64).collect(), 1);
+            let pass = step(&mut core);
+            assert!(
+                pass.output_signals.iter().any(|signal| {
+                    signal.uuid == parent && signal.completed && !signal.rejected
+                })
+            );
+            assert!(core.state.requests.is_empty());
+            assert_eq!(core.kv_manager.num_active_blocks(), 0);
+        }
+
+        let id = submit(&mut core, 911, (0..193).collect(), 1);
+        let first = step(&mut core);
+        if warm && capacity == 8 {
+            assert!(first.admissions.is_empty(), "reject before partial prefill");
+            assert!(
+                first
+                    .output_signals
+                    .iter()
+                    .any(|signal| { signal.uuid == id && signal.completed && signal.rejected })
+            );
+        } else {
+            assert_eq!(reused(&first, id), 0);
+            let request = &core.state.requests[&id];
+            assert_eq!(request.sequence.lease.junction(), warm.then_some(64));
+            assert_eq!(request.num_computed_tokens, if warm { 64 } else { 192 });
+            let last = step(&mut core);
+            assert!(
+                last.output_signals
+                    .iter()
+                    .any(|signal| { signal.uuid == id && signal.completed && !signal.rejected })
+            );
+        }
+        assert!(core.state.requests.is_empty());
+        assert_eq!(core.kv_manager.num_active_blocks(), 0);
+        assert_eq!(core.state.preemptions_total, 0);
+    }
+}
+
+#[test]
 fn prefill_checkpoint_finishes_the_prompt_in_one_pass() {
     // The final chunk runs to the prompt end and exports the state at
     // (P - 1) // B * B = 12 from inside its forward, in one extra state

@@ -756,9 +756,13 @@ the scheduler's token budget splits it across physical blocks, as well as
 any speculative scratch states and internal prefill checkpoint. A checkpoint
 replaces the second working state only when the cold prefill fits in one pass.
 The internal checkpoint is charged only if the final budgeted prefill chunk
-exports one. For a 193-token prompt with 64-token blocks and two-block states,
+exports one. For a cold 193-token prompt with 64-token blocks and two-block states,
 a 64-token budget exports no internal checkpoint and fits in eight blocks;
 a 128-token budget needs ten blocks, while a one-pass prefill needs eight.
+With both checkpoint options enabled, a recorded shared-prefix junction also
+splits prefill. A junction at token 64 with a 192-token budget instead schedules
+chunks of 64 and 129 tokens: the final chunk exports checkpoint 192, so the
+peak is four token blocks plus three two-block states, or ten blocks.
 For
 example, a 65-token prompt with 64-token blocks, 16 KV bytes per token and a
 1,500-byte state needs two token blocks and two two-block states: six blocks.

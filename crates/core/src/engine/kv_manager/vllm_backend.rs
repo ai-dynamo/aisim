@@ -711,8 +711,13 @@ impl VllmKvManager {
             // asks for num_gpu_blocks + 1, so the request waits.
             return AllocationRequirement::Blocks(self.pool.capacity() + 1);
         }
+        // The scheduler also stops at the recorded attention-only junction.
+        // Full-budget chunking restarts there, even without a restorable state.
+        let junction = lease
+            .junction()
+            .filter(|&junction| cost.cached_tokens < junction && junction < known_tokens);
         let checkpoint_blocks = self.admission_checkpoint_blocks(
-            cost.cached_tokens,
+            junction.unwrap_or(cost.cached_tokens),
             known_tokens,
             prefill_token_budget,
         );
@@ -734,25 +739,23 @@ impl VllmKvManager {
                     .into_iter()
                     .any(|stop| 0 < stop && stop < known_tokens)
             });
-            let budget_rotates = state.align_block_size.is_some_and(|block| {
+            let split_rotates = state.align_block_size.is_some_and(|block| {
                 let first_end = cost
                     .cached_tokens
                     .saturating_add(prefill_token_budget)
-                    .min(known_tokens);
+                    .min(junction.unwrap_or(known_tokens));
                 first_end < known_tokens
                     && first_end.saturating_sub(1) / block < known_tokens.saturating_sub(1) / block
             });
             // An internal prefill checkpoint already supplies the second
-            // cold state only on a one-pass prefill. A budget split also
-            // needs the previous working state while exporting a checkpoint.
-            let copies = if cost.cached_tokens > 0
-                || budget_rotates
-                || (rotates && checkpoint_blocks == 0)
-            {
-                2
-            } else {
-                1
-            };
+            // cold state only on a one-pass prefill. A budget or junction split
+            // also needs the previous state while exporting a checkpoint.
+            let copies =
+                if cost.cached_tokens > 0 || split_rotates || (rotates && checkpoint_blocks == 0) {
+                    2
+                } else {
+                    1
+                };
             let required_blocks = token_blocks
                 .saturating_add(state.blocks_per_state.saturating_mul(copies))
                 .saturating_add(state.speculative_blocks)
@@ -781,7 +784,7 @@ impl VllmKvManager {
     /// chunk can export it. Earlier chunks stop short of prefill_end.
     fn admission_checkpoint_blocks(
         &self,
-        cached_tokens: usize,
+        prefill_start: usize,
         known_tokens: usize,
         prefill_token_budget: usize,
     ) -> usize {
@@ -806,10 +809,10 @@ impl VllmKvManager {
         // block-floored non-final chunks. This stays constant-time even for
         // long prompts with small budgets.
         let chunks_before_final = known_tokens
-            .saturating_sub(cached_tokens)
+            .saturating_sub(prefill_start)
             .saturating_sub(prefill_token_budget)
             .div_ceil(chunk_tokens);
-        let query_start = cached_tokens + chunks_before_final * chunk_tokens;
+        let query_start = prefill_start + chunks_before_final * chunk_tokens;
         mamba_prefill_checkpoint(
             query_start,
             known_tokens,
