@@ -31,7 +31,7 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -49,6 +49,7 @@ from aisim_core.data import (
     _relative,
     configuration_id,
 )
+from aisim_core.data.fpm_layout import storage_path
 from aisim_core.data.parquet import read_parquet_schema_id
 from aisim_core.data.repos import resolve_ref
 
@@ -444,9 +445,9 @@ def _verify_file(local: Path, path: str, expected: PlannedFile) -> None:
 # --------------------------------------------------------------------------- plan
 
 
-def _ref(artifact: Artifact, role: str) -> PlannedFile:
+def _ref(artifact: Artifact, role: str, category_roots: Mapping[str, str] | None = None) -> PlannedFile:
     return PlannedFile(
-        path=artifact.path,
+        path=storage_path(artifact.path, category_roots or {}),
         bytes=artifact.bytes,
         sha256=artifact.sha256,
         role=role,
@@ -585,10 +586,12 @@ def plan(
     if raw is None:
         return out
     dataset = parse(DatasetIndex, raw, DATASET_INDEX_PATH)
+    category_roots = {name: ref.root for name, ref in dataset.categories.items()}
+
     reference = dataset.categories.get(selection.category)
     if reference is None:
         raise SelectionError(f"dataset has no {selection.category!r} category")
-    raw = planner.read(_ref(reference.index, "index"))
+    raw = planner.read(_ref(reference.index, "index", category_roots))
     if raw is None:
         return out
     index = parse(CategoryIndex, raw, reference.index.path)
@@ -598,9 +601,9 @@ def plan(
     if not entries:
         raise SelectionError("selection matched no catalog entries")
     for artifact in index.support:  # files every selection of the category needs, e.g. the op-latency lookups
-        planner._add(_ref(artifact, "artifact"))
+        planner._add(_ref(artifact, "artifact", category_roots))
     for entry in entries:
-        raw = planner.read(_ref(entry.manifest, "manifest"))
+        raw = planner.read(_ref(entry.manifest, "manifest", category_roots))
         if raw is None:
             continue
         manifest = parse(Manifest, raw, entry.manifest.path)
@@ -613,7 +616,7 @@ def plan(
             if artifact.role not in excluded and (
                 not prediction_only or artifact.role in ("fpm-library", "fpm-library-metadata")
             ):
-                planner._add(_ref(artifact, "artifact"))
+                planner._add(_ref(artifact, "artifact", category_roots))
     out.files.sort(key=lambda f: f.path)
     if offline:
         out.missing = sorted({*out.missing, *(f.path for f in out.files if not f.cached)})
@@ -724,7 +727,8 @@ def load_category_index(
     reference = dataset.categories.get(category)
     if reference is None:
         raise SelectionError(f"dataset has no {category!r} category")
-    index = parse(CategoryIndex, planner.read(_ref(reference.index, "index")), reference.index.path)
+    category_roots = {name: ref.root for name, ref in dataset.categories.items()}
+    index = parse(CategoryIndex, planner.read(_ref(reference.index, "index", category_roots)), reference.index.path)
     if index.category != category:
         raise IntegrityError(reference.index.path, f"category index names {index.category!r}, not {category!r}")
     return sha, index, dataset
@@ -754,7 +758,7 @@ def fetch_support(
         if _accounting is not None
         else FetchPlan(repo=repo, revision=sha, requested_revision=revision, offline=offline)
     )
-    sha, index, _ = load_category_index(
+    sha, index, dataset = load_category_index(
         category,
         repo=repo,
         revision=sha,
@@ -766,8 +770,9 @@ def fetch_support(
     )
     planner = _Planner(transport, cache, accounting, budget=max_bytes)
     paths: dict[str, Path] = {}
+    category_roots = {name: ref.root for name, ref in dataset.categories.items()}
     for artifact in index.support:
-        ref = _ref(artifact, "artifact")
+        ref = _ref(artifact, "artifact", category_roots)
         if planner.read(ref) is None:
             raise OfflineMissingError([ref.path])
         paths[ref.path] = cache.path_for(repo, sha, ref.path)

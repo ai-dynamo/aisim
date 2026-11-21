@@ -609,3 +609,53 @@ def test_a_manifest_for_other_hardware_with_a_copied_id_plans_no_artifacts(files
     ):
         plan(SEL, repo=REPO, revision=SHA, transport=transport, cache=Cache(tmp_path / "c"))
     assert "fpm/m1/data.parquet" not in transport.opened
+
+
+@pytest.mark.parametrize("moved", [False, True])
+def test_embedded_fpm_logical_keys_resolve_to_pinned_storage_paths(tmp_path, moved):
+    from aisim_core.data import _verify
+    from aisim_core.data.ensure import pin_from_environment
+    from aisim_core.data.loaders import FpmLoader
+    from aisim_core.data.repos import PUBLIC_REPO, RETIRED_FPM_REPO
+
+    files = build_repo(tmp_path, models=("m1",))
+    manifest = json.loads(files["fpm/m1/manifest.json"])
+    logical_artifact = "data/M--m/h/f/1/tp1/data.parquet"
+    logical_manifest = "data/M--m/h/f/1/tp1/manifest.json"
+    payload = files.pop("fpm/m1/data.parquet")
+    manifest["artifacts"][0]["path"] = logical_artifact
+    manifest_bytes = json.dumps(manifest).encode()
+    files.pop("fpm/m1/manifest.json")
+    physical = lambda p: p.replace("data/", "data/fpm/", 1) if moved else p
+    files[physical(logical_artifact)] = payload
+    files[physical(logical_manifest)] = manifest_bytes
+    index = json.loads(files["catalog/fpm.json"])
+    index["entries"][0]["manifest"] = _artifact_json(
+        "m", logical_manifest, manifest_bytes, format="json", schema="aisim-artifact-manifest/v1"
+    )
+    files["catalog/fpm.json"] = json.dumps(index).encode()
+    dataset = json.loads(files["catalog/dataset.json"])
+    dataset["categories"]["fpm"]["root"] = "data/fpm" if moved else "data"
+    dataset["categories"]["fpm"]["index"] = _artifact_json(
+        "i", "catalog/fpm.json", files["catalog/fpm.json"], format="json", schema="aisim-category-index/v1"
+    )
+    files["catalog/dataset.json"] = json.dumps(dataset).encode()
+    pin = pin_from_environment(
+        {"AISIM_DATASET": f"{RETIRED_FPM_REPO}@{'main' if moved else SHA}", "AISIM_DATA_CATEGORIES": "fpm"}
+    )
+    assert pin.repo == RETIRED_FPM_REPO  # the requested name is kept; the symbolic reference follows the successor
+    stored_repo = PUBLIC_REPO if moved else RETIRED_FPM_REPO
+    transport = FakeTransport(files)
+    cache = Cache(tmp_path / "cache")
+    result = fetch(SEL, repo=pin.repo, revision=pin.revision, transport=transport, cache=cache)
+    loaded = FpmLoader().read_manifest(result.root, logical_manifest)
+    assert loaded.configuration_id == manifest["configuration_id"]
+    assert loaded.artifacts[0].path == logical_artifact
+    assert _verify(result.root, loaded.artifacts[0]).read_bytes() == payload
+    assert physical(logical_artifact) in transport.opened
+    assert physical(logical_manifest) in transport.opened
+    if moved:
+        assert logical_artifact not in transport.opened and logical_manifest not in transport.opened
+    # A warm immutable pin and a direct local loader follow exactly the same layout without transport.
+    warm = fetch(SEL, repo=stored_repo, revision=SHA, offline=True, cache=cache)
+    assert FpmLoader().read_manifest(warm.root, logical_manifest) == loaded

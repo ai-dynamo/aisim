@@ -392,3 +392,53 @@ def test_catalog_parallelism_keeps_omitted_topology_distinct_from_explicit_all_o
         model="m", system="h200", backend="vllm", backend_version="1", worker_type="aggregated"
     )
     assert _parallelism(typed.to_dict()) == ()
+
+
+def test_moved_fpm_embedded_keys_reach_the_native_profile_consumer(dataset, tmp_path):  # noqa: F811
+    root, _, manifest = dataset
+    logical_dir = "data/Meta-Llama/h200/vllm/1/tp1"
+    for item in manifest["artifacts"]:
+        original = root / item["path"]
+        item["path"] = f"{logical_dir}/{original.name}"
+        destination = root / item["path"].replace("data/", "data/fpm/", 1)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        original.rename(destination)
+    logical_manifest = f"{logical_dir}/manifest.json"
+    stored_manifest = logical_manifest.replace("data/", "data/fpm/", 1)
+    write(root, stored_manifest, manifest)
+    manifest_ref = artifact(root, stored_manifest, "manifest")
+    manifest_ref["path"] = logical_manifest
+    write(
+        root,
+        "catalog/fpm.json",
+        {
+            "schema_version": "aisim-category-index/v1",
+            "category": "fpm",
+            "entries": [
+                {
+                    "configuration_id": manifest["configuration_id"],
+                    "identity": manifest["identity"],
+                    "purpose": manifest["purpose"],
+                    "manifest": manifest_ref,
+                }
+            ],
+        },
+    )
+    write(
+        root,
+        "catalog/dataset.json",
+        {
+            "schema_version": "aisim-dataset-index/v1",
+            "dataset_id": "ai-dynamo/aisim-data",
+            "categories": {
+                "fpm": {"root": "data/fpm", "layout": "category", "index": artifact(root, "catalog/fpm.json", "index")}
+            },
+        },
+    )
+    shutil.rmtree(root.parent / "producer-systems")
+    loaded = FpmLoader().load(root, logical_manifest, output_dir=tmp_path / "moved", config=CONFIG)
+    assert [a.path for a in loaded.manifest.artifacts] == [a["path"] for a in manifest["artifacts"]]
+    model = RustForwardPassPerfModel.best_available(loaded.config)
+    # Independent fixture oracle: scale factor 3 times the retained measured cells of 2 ms and 5 ms.
+    assert model.predict_prefill_latency(1, 4, 0) == 6.0
+    assert model.predict_prefill_latency(1, 8, 4) == 15.0

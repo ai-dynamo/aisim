@@ -3,7 +3,9 @@
 
 """AgentX bundles convert to aisim-e2e/v1 with canonical names and unchanged silicon statistics."""
 
+import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -345,3 +347,44 @@ def test_a_lineage_correction_changes_the_observation_revision_and_snapshot_id(t
         return snapshot_id([member], {"kind": "k"}, "p")
 
     assert snapshot(after) != snapshot(before)
+
+
+@pytest.mark.parametrize("features_present", [True, False])
+def test_bundle_hash_covers_the_bytes_parsed_once(tmp_path, monkeypatch, features_present):
+    path = _bundle(tmp_path, "read-once")
+    if not features_present:
+        (path / "features.json").unlink()
+    names = ("manifest.json", "configuration.json", "workload.json", "features.json", "observations.json")
+    original = {name: (path / name).read_bytes() for name in names if (path / name).exists()}
+    digest = hashlib.sha256()
+    for name, data in original.items():
+        digest.update(f"{name}\0{len(data)}\0".encode())
+        digest.update(data)
+    real_read = Path.read_bytes
+    reads = []
+
+    def replace_after_read(self):
+        reads.append(self.name)
+        data = real_read(self)
+        self.write_bytes(b"{}")
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", replace_after_read)
+    data = agentx_bundle_to_configuration(path)
+    assert data.body.settings["scheduler.max_num_seqs"].value == 64
+    assert data.observations[0].record_sha256 == digest.hexdigest()
+    assert reads == list(names)
+
+
+@pytest.mark.parametrize("field", ["seed", "context_limit", "boundary"])
+def test_merging_different_workload_facts_is_rejected(tmp_path, field):
+    first, second = _bundle(tmp_path, "first", lanes=1), _bundle(tmp_path, "second", lanes=8)
+    workload = json.loads((second / "workload.json").read_text())
+    if field == "boundary":
+        workload["variant"]["boundary"] = "different-boundary"
+    else:
+        params = workload["other_silicon_settings_and_observations"][0]["parameters"]
+        next(p for p in params if p["name"] == field)["value"] += 1
+    (second / "workload.json").write_text(json.dumps(workload))
+    with pytest.raises(AgentxBundleError, match="different workload"):
+        agentx_bundles_to_configurations([first, second])

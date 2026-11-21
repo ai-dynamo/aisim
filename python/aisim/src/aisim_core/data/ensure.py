@@ -510,9 +510,11 @@ def _version_policy(pin: DataPin, transport: Transport | None, out: EnsuredData)
         if path is None or not Path(path).is_file():
             raise MissingDataError(f"{where} publishes no {name}; the backend version cannot be resolved")
         document = yaml.safe_load(lookup_yaml(Path(path)))
+        if not isinstance(document, dict):
+            raise ValueError("version policy must be a mapping")
     except (LoaderError, ValueError, SelectionError) as exc:
         raise MissingDataError(f"cannot read the version policy of {where}: {exc}") from exc
-    return index, document if isinstance(document, dict) else {}
+    return index, document
 
 
 def _slot_version(system: str, backend: str, requested: str | None, versions, document: Mapping[str, Any]) -> str:

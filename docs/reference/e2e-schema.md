@@ -106,10 +106,15 @@ with no column yet).
 |---|---|---|
 | `record_sha256` | yes | Observation evidence revision, used by snapshot membership |
 | `raw_record_sha256` | no | Minor 2: digest of the raw record or summary when the evidence revision covers additional inputs; when absent, readers use `record_sha256` |
+| `observation_sha256` | no | Minor 3: version of the canonical observation fields (excluding the digest itself) and its persisted request rows in table order |
 
 The AIPerf converter binds the evidence revision to the summary, request records, observation metadata and log
 digest. Correcting a request changes snapshot membership even when the summary is unchanged. Raw-summary
 auditing uses `raw_record_sha256` separately.
+
+When present, `observation_sha256` is also part of snapshot membership (`SnapshotMember.observation_sha256`), and
+`write_snapshot` binds members whose configuration is available locally to the persisted observation. Unversioned
+legacy observations and members keep their existing behavior and snapshot IDs.
 
 ### Metrics (`aisim-e2e-metrics/v1`)
 

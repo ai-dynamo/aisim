@@ -391,7 +391,11 @@ def compute_results(
                 reason = "non-finite truth"
             excluded[case_id] = Exclusion(case_id=case_id, reason=reason)
             continue
-        errors.append((case_id, truth, predicted, (predicted - truth) / truth * 100.0))
+        residual = (predicted - truth) / truth * 100.0
+        if not math.isfinite(residual):
+            excluded[case_id] = Exclusion(case_id=case_id, reason="non-finite residual")
+            continue
+        errors.append((case_id, truth, predicted, residual))
     n_total = len(cases)
     n_scored = len(errors)
     if errors:
