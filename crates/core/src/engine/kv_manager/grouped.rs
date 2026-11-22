@@ -985,10 +985,10 @@ mod tests {
         });
         assert!(pool.block_pool_mut().unwrap().cache_alias(id, key(11), at));
         assert!(after_first > start);
-        // Derived, not run: a key that becomes visible moves the count by the
-        // same amount, whichever way it was published.
+        // A key that becomes visible moves the count by the same amount,
+        // whichever way it was published.
         assert_eq!(pool.retry_epoch() - after_first, after_first - start);
-        // Derived, not run: a key that the block holds changes nothing.
+        // A key that the block holds changes nothing.
         let after_alias = pool.retry_epoch();
         assert!(!pool.block_pool_mut().unwrap().cache_alias(id, key(11), at));
         assert!(

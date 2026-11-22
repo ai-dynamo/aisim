@@ -10,6 +10,12 @@
 // https://github.com/vllm-project/vllm/tree/5df63a7203cdb9328d824a27b682e77c7b9928be
 // Exact upstream source paths and Apache-2.0 attribution: THIRD_PARTY_NOTICES.md.
 
+// Modified grouped-block key semantics derived from vLLM v0.31.0, v0.32.0 and v0.33.0:
+// https://github.com/vllm-project/vllm/tree/db9527a46873454610df6dbedf79a36d6bf1a7f6
+// https://github.com/vllm-project/vllm/tree/5df63a7203cdb9328d824a27b682e77c7b9928be
+// https://github.com/vllm-project/vllm/tree/4ba787ec9959e566d3b587a796dff07673324da5
+// Exact upstream source paths and Apache-2.0 attribution: THIRD_PARTY_NOTICES.md.
+
 //! Physical-capacity model for vLLM's GPU block pool.
 //!
 //! A cached hash may have several physical copies. Copy identity is internal;
@@ -1047,10 +1053,19 @@ impl VllmBlockPool {
     }
 
     /// Give a cached copy that holds a grouped key one more key of its group,
-    /// with its place when it lies inside a block of the group. vLLM keeps
-    /// such a key beside the block's primary hash and skips a key that the
-    /// block holds (v0.31.0 `vllm/v1/core/block_pool.py:629-649`, v0.32.0
-    /// `:626-646`, v0.33.0 `:666-686`). Returns whether `key` became visible.
+    /// with its place when it lies inside a block of the group. Returns
+    /// whether `key` became visible. This function only adds a key, and it
+    /// changes nothing when the copy holds `key`. That is the rule of vLLM's
+    /// `_insert_block_hash` for a block that has a hash (v0.31.0
+    /// `vllm/v1/core/block_pool.py:629-649`, v0.32.0 `:626-646`, v0.33.0
+    /// `:666-686`). Before that function runs, vLLM removes every key of the
+    /// block in two cases, so that the new key becomes the only key of the
+    /// block: when the new key is the block's full key (v0.31.0 and v0.32.0
+    /// `:286-299`, v0.33.0 `:290-303`), and when it is a partial key that
+    /// covers more tokens than the block's partial primary key (v0.31.0
+    /// `:514-521`, v0.32.0 `:511-518`, v0.33.0 `:548-555`). This function
+    /// removes no key, so a caller uses it only where the block ends with the
+    /// same keys as in vLLM.
     pub(crate) fn cache_grouped_alias(
         &mut self,
         id: BlockCopyId,
@@ -3149,10 +3164,13 @@ mod tests {
 
     #[test]
     fn grouped_alias_is_one_more_key_of_a_cached_copy() {
-        // vLLM adds a partial entry to a block that has a primary hash as one
-        // more key of that block, and skips an entry that the block has
-        // (v0.31.0 block_pool.py:629-649, v0.32.0 :626-646, v0.33.0
-        // :666-686).
+        // vLLM's `_insert_block_hash` keeps a new key of a block that has a
+        // primary hash as one more key of that block, and skips a key that the
+        // block holds (v0.31.0 block_pool.py:629-649, v0.32.0 :626-646,
+        // v0.33.0 :666-686). Its callers first remove every key of the block
+        // when the new key covers more tokens than the primary hash (v0.31.0
+        // :286-299, :514-521, v0.32.0 :286-299, :511-518, v0.33.0 :290-303,
+        // :548-555). The keys of this test are the case where both keys stay.
         let mut pool = VllmBlockPool::new(2);
         let key = |hash| CacheKey::Grouped { group: 0, hash };
         let inside = Some(KeyInBlock {
@@ -3161,17 +3179,17 @@ mod tests {
         });
         let id = grouped_copy(&mut pool, 0, 18);
         let generation = pool.grouped_key_generation();
-        // Derived, not run: the map gains the key (v0.33.0 :686), so it is
-        // visible, and one key gained its first copy.
+        // The map gains the key (v0.31.0 :649, v0.32.0 :646, v0.33.0 :686),
+        // so it is visible, and one key gained its first copy.
         assert!(pool.cache_grouped_alias(id, key(17), inside));
         assert_eq!(pool.grouped_key_generation(), generation + 1);
-        // Derived, not run: two keys, and the one inside the block at its
-        // offset 12.
+        // Two keys, and the one inside the block at its offset 12.
         assert_eq!(pool.grouped_keys().0, 2);
         assert_eq!(pool.grouped_keys_in_block(0, 14).collect::<Vec<_>>(), [12]);
-        // Derived, not run: vLLM returns before it inserts when the block has
-        // the key as its primary hash (v0.33.0 :672-673) or as one more key
-        // (v0.33.0 :675-678).
+        // vLLM returns before it inserts when the block has the key as its
+        // primary hash (v0.31.0 :635-636, v0.32.0 :632-633, v0.33.0 :672-673)
+        // or as one more key (v0.31.0 :638-641, v0.32.0 :635-638, v0.33.0
+        // :675-678).
         assert!(!pool.cache_grouped_alias(id, key(17), inside));
         assert!(!pool.cache_grouped_alias(id, key(18), None));
         assert_eq!(pool.grouped_key_generation(), generation + 1);
@@ -3180,9 +3198,8 @@ mod tests {
         assert_eq!(pool.grouped_keys_in_block(0, 14).collect::<Vec<_>>(), [12]);
         pool.assert_hash_index_consistent();
 
-        // Derived, not run: either key gives the block, which its request
-        // holds (v0.31.0 block_pool.py:198-224, v0.32.0 :198-224, v0.33.0
-        // :202-228).
+        // Either key gives the block, which its request holds (v0.31.0
+        // block_pool.py:198-224, v0.32.0 :198-224, v0.33.0 :202-228).
         for hash in [17, 18] {
             assert!(pool.key_hit(key(hash)).is_some_and(|hit| hit.is_active));
         }
@@ -3231,14 +3248,14 @@ mod tests {
         pool.release(id);
 
         let pressure = reserve(&mut pool, &[], 1);
-        // Derived, not run: both keys left with the block.
+        // Both keys left with the block.
         for hash in [17, 18] {
             assert!(pool.key_hit(key(hash)).is_none());
         }
         assert!(pool.grouped_keys_in_block(0, 14).next().is_none());
         assert!(pool.grouped_index.as_ref().unwrap().aliases.is_empty());
-        // Derived, not run: each of the two keys became visible once and
-        // lost its last copy once, and the visible keys are those before.
+        // Each of the two keys became visible once and lost its last copy
+        // once, and the visible keys are those before.
         assert_eq!(pool.grouped_key_generation(), generation + 4);
         assert_eq!(pool.grouped_keys(), keys);
         pool.cancel(pressure.reservation);
@@ -3250,8 +3267,10 @@ mod tests {
     fn grouped_key_of_two_copies_stays_visible_until_its_last_copy_goes() {
         // Two blocks can hold one key, as the two blocks of two requests
         // that computed the same tokens. vLLM drops the key from its map with
-        // the last of them (v0.31.0 block_pool.py:604-610, v0.32.0 :601-607,
-        // v0.33.0 :641-647).
+        // the last of them: an eviction pops each hash of the block (v0.31.0
+        // block_pool.py:604-610, v0.32.0 :601-607, v0.33.0 :641-647), and the
+        // pop puts the other blocks of the key back (v0.31.0 and v0.32.0
+        // :101-127, v0.33.0 :102-128).
         let key = |hash| CacheKey::Grouped { group: 0, hash };
         let inside = Some(KeyInBlock {
             first: 14,
@@ -3265,8 +3284,7 @@ mod tests {
             assert!(pool.cache_private_key_at(first, key(17), inside));
             let second = grouped_copy(&mut pool, 0, 18);
             let (generation, keys) = (pool.grouped_key_generation(), pool.grouped_keys());
-            // Derived, not run: the key was visible before, so the set of
-            // visible keys stays.
+            // The key was visible before, so the set of visible keys stays.
             assert!(!pool.cache_grouped_alias(second, key(17), inside));
             assert_eq!(grouped_key_copies(&pool, 17), [first, second]);
             assert_eq!(
@@ -3282,8 +3300,8 @@ mod tests {
             pool.release(late);
 
             let pressure = reserve(&mut pool, &[], 1);
-            // Derived, not run: the other block still holds key 17 at offset
-            // 12. Key 18 leaves with the block that holds it.
+            // The other block still holds key 17 at offset 12. Key 18 leaves
+            // with the block that holds it.
             assert!(pool.key_hit(key(17)).is_some());
             assert_eq!(grouped_key_copies(&pool, 17), [late]);
             assert_eq!(pool.grouped_keys_in_block(0, 14).collect::<Vec<_>>(), [12]);
@@ -3297,8 +3315,7 @@ mod tests {
             assert!(pool.key_hit(key(17)).is_none());
             assert!(pool.key_hit(key(18)).is_none());
             assert!(pool.grouped_keys_in_block(0, 14).next().is_none());
-            // Derived, not run: keys 17 and 18 each lost their last copy
-            // once.
+            // Keys 17 and 18 each lost their last copy once.
             assert_eq!(pool.grouped_key_generation(), generation + 2);
             assert_eq!(pool.grouped_keys(), (0, 0));
             pool.cancel(pressure.reservation);
@@ -3323,5 +3340,61 @@ mod tests {
         let mut pool = VllmBlockPool::new(1);
         let id = grouped_copy(&mut pool, 0, 18);
         pool.cache_grouped_alias(id, CacheKey::Grouped { group: 1, hash: 17 }, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "a grouped copy takes grouped keys only")]
+    fn grouped_alias_refuses_a_token_key() {
+        // Every key of a block of a grouped pool carries the group of the
+        // block, so a key without a group is a wrong call.
+        let mut pool = VllmBlockPool::new(1);
+        let id = grouped_copy(&mut pool, 0, 18);
+        pool.cache_grouped_alias(id, CacheKey::Token(17), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "a grouped key is added to a copy of its group")]
+    fn grouped_alias_refuses_the_first_hash_of_a_copy_in_another_group() {
+        // vLLM joins the group to the hash of a key (v0.31.0
+        // kv_cache_utils.py:74-83, v0.32.0 :74-83, v0.33.0 :60-69), so hash 18
+        // of group 1 is not the first key, hash 18 of group 0, of the copy. It
+        // is a key of another group, which is a wrong call.
+        let mut pool = VllmBlockPool::new(1);
+        let id = grouped_copy(&mut pool, 0, 18);
+        pool.cache_grouped_alias(id, CacheKey::Grouped { group: 1, hash: 18 }, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "a grouped key is added to a copy of its group")]
+    fn grouped_alias_refuses_a_cached_copy_without_a_grouped_key() {
+        // A copy that holds a token key belongs to no group, so a grouped key
+        // for it is a wrong call, also in a pool that holds grouped keys.
+        let mut pool = VllmBlockPool::new(2);
+        grouped_copy(&mut pool, 0, 18);
+        let mut reservation = reserve(&mut pool, &[], 1).reservation;
+        let token = pool.allocate_private(&mut reservation);
+        pool.cancel(reservation);
+        pool.cache_private(token, 7);
+        pool.cache_grouped_alias(token, CacheKey::Grouped { group: 0, hash: 17 }, None);
+    }
+
+    #[test]
+    fn grouped_alias_held_with_another_place_is_skipped() {
+        // vLLM skips a key that the block holds, whatever the token count of
+        // the new entry (v0.31.0 block_pool.py:638-641, v0.32.0 :635-638,
+        // v0.33.0 :675-678). So the copy keeps the key once, at the place
+        // that it got first.
+        let mut pool = VllmBlockPool::new(1);
+        let key = |hash| CacheKey::Grouped { group: 0, hash };
+        let at = |offset| Some(KeyInBlock { first: 14, offset });
+        let id = grouped_copy(&mut pool, 0, 18);
+        assert!(pool.cache_grouped_alias(id, key(17), at(12)));
+        let generation = pool.grouped_key_generation();
+        assert!(!pool.cache_grouped_alias(id, key(17), at(8)));
+        assert!(!pool.cache_grouped_alias(id, key(17), None));
+        assert_eq!(pool.grouped_key_generation(), generation);
+        assert_eq!(grouped_key_copies(&pool, 17), [id]);
+        assert_eq!(pool.grouped_keys_in_block(0, 14).collect::<Vec<_>>(), [12]);
+        pool.assert_hash_index_consistent();
     }
 }
