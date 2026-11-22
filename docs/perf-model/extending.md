@@ -123,6 +123,7 @@ declares device classification and per-precision compute peaks:
 | `vendor` | `nvidia` \| `intel` \| `ascend` | inferred when absent | Device vendor (case-insensitive, surrounding whitespace ignored). Selects vendor-calibrated backends: `intel` routes vLLM to the B60-fitted `VLLMXPUBackend`, every other vendor uses the generic backend. |
 | `fp32_flops` | number | unset | Verified scalar FP32 peak, FLOP/s. Omit when unverified; native scalar compute queries requiring it raise `MissingSystemFlops`. |
 | `bfloat16_tc_flops` | number | unset | Verified BF16 tensor compute peak, FLOP/s, for the confirmed hardware tier. Omit when unverified; BF16 compute queries fail with the missing-throughput error. |
+| `fp8_tc_flops` | number | unset | Verified FP8 tensor compute peak, FLOP/s, for the confirmed hardware tier. Omit when unverified; FP8 compute queries raise `MissingSystemFlops` (Python: `MissingSystemFlopsError`). |
 | `int8_tc_flops` | number | unset | Verified INT8 tensor compute peak, operations/s. Omit when unverified; INT8 compute queries raise `MissingSystemFlops` (Python: `MissingSystemFlopsError`). |
 
 Declare `vendor` on any non-NVIDIA system. When the key is absent, legacy
@@ -137,11 +138,10 @@ legacy compatibility. Rust preserves an absent declaration as `None`.
 Compute peaks must come from a measured or published value for the target
 hardware. Positive placeholders pass the strict throughput checks and would
 produce unsupported estimates. The `ascend_950dt` registration therefore omits
-unverified FP32 and INT8 peaks until that evidence is available. Its BF16 peak
-is also omitted: white-paper table 3-1 lists 547/486/425 TFLOPS for the
-36/32/28-Cube-Core parts, but the node's observed 96GiB capacity does not
-identify its compute tier. Record the confirming hardware evidence before
-setting that peak. Missing peaks do not prevent loading the system or
+unverified FP32 and INT8 peaks until that evidence is available. Its BF16 and
+FP8 peaks are also omitted: the node's observed 96GiB capacity does not
+identify its Cube-Core compute tier. Record the confirming hardware evidence
+before setting those peaks. Missing peaks do not prevent loading the system or
 collecting operator timings.
 
 ## 4. Validate the intended public path

@@ -4,9 +4,10 @@
 # Huawei Ascend 950DT (Atlas A5 generation), 8-card server. npu-smi on the device node reports
 # 8 healthy chips, 98304 MB HBM each and 592 W draw under load. Official per-chip specs:
 # Huawei "Ascend 950 NPU Architecture White Paper" (2026) table 3-1 — 4 TB/s HBM on both
-# capacity tiers, 547 TFLOPS BF16/FP16 and 1 PFLOPS FP8 on the top 36-Cube-Core tier,
-# 2016 GB/s bidirectional UB IO. INT8/FP32 peaks stay unpublished and are omitted
-# until a measured or published value exists; queries requiring them fail explicitly.
+# capacity tiers and 2016 GB/s bidirectional UB IO. BF16/FP8 Cube peaks are tier-dependent
+# and omitted until this node's Cube-Core tier is confirmed. INT8/FP32 peaks stay
+# unpublished and are omitted until a measured or published value exists;
+# queries requiring any missing peak fail explicitly.
 # As a non-CUDA device, this system declares gpu.vendor explicitly and carries no sm_version.
 
 data_dir: data/ascend_950dt # relative to systems_dir
@@ -21,7 +22,8 @@ gpu:
   # White paper table 3-1 lists 547/486/425 TFLOPS for the 36/32/28-Cube-Core parts;
   # the observed 96GiB capacity alone does not identify the compute tier.
   # int8_tc_flops omitted: the unverified third-party 1034 TOPS figure is not an accepted peak.
-  fp8_tc_flops: 1000000000000000 # 1PFLOPS FP8/MXFP8/HiF8 official. MXFP4 is 2PFLOPS but fp4_tc_flops models nvfp4, left unset
+  # fp8_tc_flops omitted until this node's Cube-Core tier is confirmed.
+  # fp4_tc_flops omitted: the published MXFP4 peak does not describe nvfp4 compute.
   power: 650 # TODO: on-device campaign — Watt placeholder. npu-smi info -t power on the device node read 592W under the running vLLM service and exposes no Power Limit line on driver 25.6.rc2, so this is a headroom estimate above the measured load, not a TDP.
 
 node:

@@ -10,11 +10,10 @@ contract for the systems that already shipped.
 
 The YAML's numeric content traces to the Ascend 950
 architecture white paper and on-device observation: official per-chip
-figures (4TB/s HBM bandwidth, 1 PFLOPS FP8, 2TB/s
-interconnect) and the observed 96GiB capacity tier with
-8 chips per node. Unverified FP32 and INT8 peaks and the tier-dependent BF16
-peak remain absent so queries requiring them fail until the hardware evidence
-is available.
+figures (4TB/s HBM bandwidth, 2TB/s interconnect) and the observed 96GiB
+capacity tier with 8 chips per node. Unverified FP32 and INT8 peaks and the
+tier-dependent BF16 and FP8 peaks remain absent so queries requiring them fail
+until the hardware evidence is available.
 """
 
 from __future__ import annotations
@@ -48,7 +47,6 @@ class TestAscend950dtSystemSpec:
         # Observed on the device node: 98304 MB HBM per chip (the 96GB tier).
         assert gpu["mem_capacity"] == 96 * 1024**3
         assert gpu["mem_bw"] == 4e12  # official 4TB/s
-        assert gpu["fp8_tc_flops"] == 1e15  # official 1 PFLOPS FP8/MXFP8/HiF8
         assert node["num_gpus_per_node"] == 8
         # Per-NPU single direction, derived from the same white paper §4.6 figure
         # as the yaml comment: 2016 GB/s bidirectional = 72 lane x 112 Gbps x 2 / 8,
@@ -64,9 +62,16 @@ class TestAscend950dtSystemSpec:
     def test_unverified_flops_entries_are_unavailable(self, spec: SystemSpec) -> None:
         """An unverified peak must not enable compute estimates."""
         gpu = spec["gpu"]
-        for key in ("int8_tc_flops", "fp32_flops", "bfloat16_tc_flops"):
+        for key in ("int8_tc_flops", "fp32_flops", "bfloat16_tc_flops", "fp8_tc_flops"):
             assert key not in gpu
-        for mode, key in ((GEMMQuantMode.sq, "int8_tc_flops"), (GEMMQuantMode.bfloat16, "bfloat16_tc_flops")):
+        for mode, key in (
+            (GEMMQuantMode.sq, "int8_tc_flops"),
+            (GEMMQuantMode.bfloat16, "bfloat16_tc_flops"),
+            (GEMMQuantMode.fp8, "fp8_tc_flops"),
+            (GEMMQuantMode.fp8_static, "fp8_tc_flops"),
+            (GEMMQuantMode.fp8_block, "fp8_tc_flops"),
+            (GEMMQuantMode.fp8_ootb, "fp8_tc_flops"),
+        ):
             with pytest.raises(MissingSystemFlopsError, match=key):
                 get_quant_tc_flops(spec, mode)
 
