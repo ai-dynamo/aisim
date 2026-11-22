@@ -1081,7 +1081,8 @@ sub-block matching without an explicit full-state scratch count.
   its plan is cold and a prediction or recommendation with prefix caching is
   refused. When the marks are what the profile lacks, the reason of its cold
   plan and the refusal name them and say to import the runtime probe again. Do
-  that: run `aisim onboard import-observations` again on the same observations.
+  that: run `aisim onboard import-observations` again on the same observations,
+  into a fresh `--output-dir`.
   The new import writes the marks and the version, and the
   [migration guide](../../aic-backward-compatibility/migration.md#rust-resource-and-memory-literals)
   gives the steps and their cost. Do not set the marks of an imported profile
@@ -1133,12 +1134,15 @@ sub-block matching without an explicit full-state scratch count.
   refuses the rank when it starts, with the text of the failed check, for
   example `kv_cache_groups with vllm_version=0.33.0 require
   prefill_checkpoint_blocks on every prefix-cacheable state group; set the
-  field (0 or 1) on each such group`. In a hand-made profile, correct the field
-  that the text names. The runtime probe import writes `blocks_per_request` of
-  every state group and the prefill checkpoint fields of every Mamba state
-  group from the probe record. So when a profile from the import lacks one of
-  these fields, run `aisim onboard import-observations` again on the same
-  observations. The native rank does not hold the
+  field (0 or 1) on each such group`. In a hand-made profile, correct what the
+  text names: `blocks_per_request` or the prefill checkpoint fields of the
+  group; the `block_size_tokens` of the group or
+  `runtime_memory.hash_block_size_tokens`, which the text calls
+  `prefix_match_unit`; and for the capacity `runtime_memory.kv_cache_bytes`.
+  The runtime probe import writes `blocks_per_request` of every state group and
+  the prefill checkpoint fields of every Mamba state group from the probe
+  record. A draft from the import holds these fields, and the onboarding
+  commands refuse a draft that lacks one. The native rank does not hold the
   Mamba cache mode, so native replay does not check align mode. It does not
   hold the profile's `runtime_framework_version` either: a replay spec or a
   native rank that you write by hand states `vllm_version` itself, and native
