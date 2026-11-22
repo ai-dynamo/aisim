@@ -360,7 +360,7 @@ def _validate(tmp_path: Path, cell: FPMCell):
     )
 
 
-def _glm_plan(template_id: str = GENERIC_RUNTIME_TEMPLATE_ID) -> SimpleNamespace:
+def _glm_plan() -> SimpleNamespace:
     """The parts of a collection plan that publication reads, for the GLM-5.3-Flash checkpoint."""
     return SimpleNamespace(
         sha256=PLAN_SHA256,
@@ -370,7 +370,10 @@ def _glm_plan(template_id: str = GENERIC_RUNTIME_TEMPLATE_ID) -> SimpleNamespace
         backend="vllm",
         options=SimpleNamespace(warmup_iterations=0),
         capability=SimpleNamespace(
-            support_level="native_runtime", template_id=template_id, template_version=1, aic_database_version="0.33.0"
+            support_level="native_runtime",
+            template_id=GENERIC_RUNTIME_TEMPLATE_ID,
+            template_version=1,
+            aic_database_version="0.33.0",
         ),
     )
 
@@ -576,6 +579,24 @@ def _first_id_as_a_string(payload: dict, sidecar: Path) -> None:
 
 def _first_line_is_no_json(payload: dict, sidecar: Path) -> None:
     _rewrite_sidecar(payload, sidecar, [b"not json", *_sidecar_lines(sidecar)[1:]])
+
+
+def _first_line_is_no_object(payload: dict, sidecar: Path) -> None:
+    _rewrite_sidecar(payload, sidecar, [b"[1]", *_sidecar_lines(sidecar)[1:]])
+
+
+def _first_line_is_no_utf8(payload: dict, sidecar: Path) -> None:
+    _rewrite_sidecar(payload, sidecar, [b"\xff", *_sidecar_lines(sidecar)[1:]])
+
+
+def _first_line_id_is_a_boolean(payload: dict, sidecar: Path) -> None:
+    # The row of ID 1 carries the digest of the changed line, so only the type of the line's ID is wrong.
+    lines = _sidecar_lines(sidecar)
+    first = json.loads(lines[0])
+    first["benchmark_id"] = True
+    line = json.dumps(first, sort_keys=True, separators=(",", ":")).encode()
+    _rewrite_sidecar(payload, sidecar, [line, *lines[1:]])
+    payload["results"][0]["repetition_evidence_sha256"] = hashlib.sha256(line).hexdigest()
 
 
 REFUSALS = [
@@ -788,6 +809,21 @@ REFUSALS = [
         id="no-aligned-split",
     ),
     pytest.param(
+        "serving_config.block_size",
+        lambda p, _: p["serving_config"].update(block_size=2176.0, hash_block_size=2176.0),
+        id="blocks-are-floats",
+    ),
+    pytest.param(
+        "serving_config.block_size",
+        lambda p, _: p["serving_config"].update(hash_block_size=2176.0),
+        id="hash-block-is-a-float",
+    ),
+    pytest.param(
+        "serving_config.need_mamba_block_aligned_split",
+        lambda p, _: p["serving_config"].update(need_mamba_block_aligned_split=1),
+        id="aligned-split-is-not-a-boolean",
+    ),
+    pytest.param(
         "serving_config.enable_prefix_caching", lambda p, _: p.pop("serving_config"), id="serving-config-absent"
     ),
     pytest.param(
@@ -815,6 +851,19 @@ REFUSALS = [
     pytest.param("repetition_evidence", _repeat_the_first_id, id="sidecar-repeats-an-id"),
     pytest.param("repetition_evidence", _first_id_as_a_string, id="sidecar-id-is-a-string"),
     pytest.param("repetition_evidence", _first_line_is_no_json, id="sidecar-line-is-no-json"),
+    pytest.param("repetition_evidence", _first_line_is_no_object, id="sidecar-line-is-no-object"),
+    pytest.param("repetition_evidence", _first_line_is_no_utf8, id="sidecar-line-is-no-utf8"),
+    pytest.param("repetition_evidence", _first_line_id_is_a_boolean, id="sidecar-id-is-a-boolean"),
+    pytest.param(
+        "repetition_evidence_sha256",
+        lambda p, _: p["results"][0]["point"].update(benchmark_id=True),
+        id="row-id-is-a-boolean",
+    ),
+    pytest.param(
+        "repetition_evidence_sha256",
+        lambda p, _: p["results"][0]["point"].update(benchmark_id=[1]),
+        id="row-id-is-a-list",
+    ),
     pytest.param(
         "kv_seed_regime", lambda p, _: p["results"][0].update(kv_seed_regime="real_prefix"), id="regime-of-cold-row"
     ),
@@ -928,6 +977,205 @@ def test_fixture_holds_the_real_token_stream_record():
     assert native_artifact._glm_input_record(1) is None
 
 
+def test_seeded_input_record_cannot_be_changed_by_a_caller(tmp_path):
+    record = native_artifact._glm_input_record(seeded.GENERATOR_VERSION)
+    with pytest.raises(TypeError):
+        record["seed"] = 54
+    with pytest.raises(TypeError):
+        del record["seed"]
+    # Every later validation of the process still compares with the pinned seed.
+    cell = glm_cell("prefill")
+    payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
+    payload["input_provenance"]["seed"] = 54
+    write_glm_rank(_pod(tmp_path, cell), payload)
+    with pytest.raises(ValueError, match=r"native GLM-5\.3-Flash result lacks valid input_provenance\.seed: "):
+        _validate(tmp_path, cell)
+
+
+def _no_chunk_alignment(payload: dict, _sidecar: Path) -> None:
+    _evidence(payload).update(chunk_start_alignment=1)
+
+
+def _wall_clock_boundary(payload: dict, _sidecar: Path) -> None:
+    payload.update(timing_boundary="wall_clock")
+
+
+def _async_scheduling(payload: dict, _sidecar: Path) -> None:
+    payload["serving_config"].update(async_scheduling=True)
+
+
+def _other_warmup_repeats(payload: dict, _sidecar: Path) -> None:
+    payload["producer"].update(warmup_repeats=6)
+
+
+def _cold_row_with_a_prefix_regime(payload: dict, _sidecar: Path) -> None:
+    payload["results"][0].update(kv_seed_regime="real_prefix")
+
+
+def _second_row_without_a_digest(payload: dict, _sidecar: Path) -> None:
+    payload["results"][1].pop("repetition_evidence_sha256")
+
+
+def _float_record_count(payload: dict, _sidecar: Path) -> None:
+    _evidence(payload)["repetition_evidence_manifest"].update(records=2.0)
+
+
+def _mamba_mode_none(payload: dict, _sidecar: Path) -> None:
+    payload["serving_config"].update(mamba_cache_mode="none")
+
+
+def _small_scheduler_block(payload: dict, _sidecar: Path) -> None:
+    payload["serving_config"].update(block_size=16)
+
+
+def _no_aligned_split(payload: dict, _sidecar: Path) -> None:
+    payload["serving_config"].update(need_mamba_block_aligned_split=False)
+
+
+def _other_seed(payload: dict, _sidecar: Path) -> None:
+    _evidence(payload).update(seed=54)
+
+
+# The reader checks, in this order: the input fields, the sidecar manifest with the type of its record count, kvwarm,
+# the timing boundary, the two older serving keys, the three serving rules of the producer's points, the producer
+# record, the sidecar lines, then for each row the form of its digest, its digest against its line and its regime, and
+# last the seeded input record. An artifact with two faults is refused for the one that comes first in this order.
+ORDERED_FAULTS = [
+    pytest.param(
+        _no_chunk_alignment,
+        "input_provenance.chunk_start_alignment",
+        _float_record_count,
+        "repetition_evidence_manifest",
+        "input_provenance.chunk_start_alignment",
+        id="record-count-after-the-input-fields",
+    ),
+    pytest.param(
+        _wall_clock_boundary,
+        "timing_boundary",
+        _float_record_count,
+        "repetition_evidence_manifest",
+        "repetition_evidence_manifest",
+        id="record-count-before-the-timing-boundary",
+    ),
+    pytest.param(
+        _async_scheduling,
+        "serving_config.async_scheduling",
+        _mamba_mode_none,
+        "serving_config.mamba_cache_mode",
+        "serving_config.async_scheduling",
+        id="mamba-mode-after-the-older-serving-keys",
+    ),
+    pytest.param(
+        _other_warmup_repeats,
+        "producer.warmup_repeats",
+        _mamba_mode_none,
+        "serving_config.mamba_cache_mode",
+        "serving_config.mamba_cache_mode",
+        id="mamba-mode-before-the-producer-record",
+    ),
+    pytest.param(
+        _async_scheduling,
+        "serving_config.async_scheduling",
+        _small_scheduler_block,
+        "serving_config.block_size",
+        "serving_config.async_scheduling",
+        id="block-after-the-older-serving-keys",
+    ),
+    pytest.param(
+        _other_warmup_repeats,
+        "producer.warmup_repeats",
+        _small_scheduler_block,
+        "serving_config.block_size",
+        "serving_config.block_size",
+        id="block-before-the-producer-record",
+    ),
+    pytest.param(
+        _async_scheduling,
+        "serving_config.async_scheduling",
+        _no_aligned_split,
+        "serving_config.need_mamba_block_aligned_split",
+        "serving_config.async_scheduling",
+        id="aligned-split-after-the-older-serving-keys",
+    ),
+    pytest.param(
+        _other_warmup_repeats,
+        "producer.warmup_repeats",
+        _no_aligned_split,
+        "serving_config.need_mamba_block_aligned_split",
+        "serving_config.need_mamba_block_aligned_split",
+        id="aligned-split-before-the-producer-record",
+    ),
+    pytest.param(
+        _other_warmup_repeats,
+        "producer.warmup_repeats",
+        _first_line_is_no_json,
+        "repetition_evidence",
+        "producer.warmup_repeats",
+        id="sidecar-lines-after-the-producer-record",
+    ),
+    pytest.param(
+        _cold_row_with_a_prefix_regime,
+        "kv_seed_regime",
+        _first_line_is_no_json,
+        "repetition_evidence",
+        "repetition_evidence",
+        id="sidecar-lines-before-the-rows",
+    ),
+    pytest.param(
+        _other_warmup_repeats,
+        "producer.warmup_repeats",
+        _swap_the_row_digests,
+        "repetition_evidence_sha256",
+        "producer.warmup_repeats",
+        id="row-digests-after-the-producer-record",
+    ),
+    pytest.param(
+        _cold_row_with_a_prefix_regime,
+        "kv_seed_regime",
+        _swap_the_row_digests,
+        "repetition_evidence_sha256",
+        "repetition_evidence_sha256",
+        id="row-digest-before-the-regime-of-its-row",
+    ),
+    pytest.param(
+        _cold_row_with_a_prefix_regime,
+        "kv_seed_regime",
+        _other_seed,
+        "input_provenance.seed",
+        "kv_seed_regime",
+        id="seeded-input-after-the-row-regimes",
+    ),
+    pytest.param(
+        _second_row_without_a_digest,
+        "repetition_evidence_sha256",
+        _other_seed,
+        "input_provenance.seed",
+        "repetition_evidence_sha256",
+        id="seeded-input-after-the-row-digests",
+    ),
+]
+
+
+@pytest.mark.parametrize(("older", "older_field", "new", "new_field", "first_field"), ORDERED_FAULTS)
+def test_two_faults_are_refused_for_the_first_in_the_order_of_the_reader(
+    tmp_path, older, older_field, new, new_field, first_field
+):
+    cell = glm_cell("prefill")
+    for name, tampers, field in (
+        ("older", [older], older_field),
+        ("new", [new], new_field),
+        ("both", [older, new], first_field),
+    ):
+        pod = _pod(tmp_path / name, cell)
+        payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
+        artifact = write_glm_rank(pod, payload)
+        for tamper in tampers:
+            tamper(payload, pod / EVIDENCE_FILE)
+        artifact.write_text(json.dumps(payload))
+        with pytest.raises(ValueError, match=rf"native GLM-5\.3-Flash result lacks valid {re.escape(field)}: "):
+            _validate(tmp_path / name, cell)
+
+
 def test_sidecar_lines_in_another_order_than_the_rows_still_validate(tmp_path):
     # The producer writes the lines in the order in which the points ran, so a row is bound to its line by its
     # benchmark_id and not by its position.
@@ -965,21 +1213,21 @@ def test_malformed_sidecar_manifest_of_another_contract_is_refused_with_a_text(t
 
 
 @pytest.mark.parametrize(
-    ("high", "accepted"),
+    ("high", "drawable"),
     [(2**63 + 1, True), (2**63 + 2, False)],
     ids=["range-at-the-generator-cap", "range-above-the-generator-cap"],
 )
-def test_glm_producer_vocabulary_range_follows_the_generator_cap(tmp_path, high, accepted):
-    # The generator takes at most 2**63 ids in its range, so the validator takes the same. A lower bound of 1 puts
-    # exactly 2**63 ids in the first range and one more in the second, and both upper bounds exceed 2**63.
+def test_glm_producer_vocabulary_range_follows_the_generator_cap(tmp_path, high, drawable):
+    # The generator takes at most 2**63 ids in its range, and so does the form check of the validator. A lower bound of
+    # 1 puts exactly 2**63 ids in the first range and one more in the second, and both upper bounds exceed 2**63. Only
+    # the pinned vocabulary passes the reader, so the first range is refused after the form check and the second by it.
     low = 1
     cell = glm_cell("prefill")
     payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
     payload["input_provenance"].update(vocab_low=low, vocab_high_exclusive=high)
     write_glm_rank(_pod(tmp_path, cell), payload)
-    if accepted:
+    if drawable:
         assert len(seeded.generate(seeded.SEED, 1, low, high)) == 1
-        # The form check takes the range, and the reader then accepts only the pinned vocabulary.
         with pytest.raises(ValueError, match=r"native GLM-5\.3-Flash result lacks valid input_provenance\.vocab_low: "):
             _validate(tmp_path, cell)
     else:

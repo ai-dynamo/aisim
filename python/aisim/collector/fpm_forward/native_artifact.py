@@ -13,8 +13,10 @@ import math
 import os
 import re
 import statistics
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from aisim.fpm_contract import (
@@ -338,11 +340,13 @@ def _glm_producer_record() -> dict[str, Any]:
 
 
 @functools.cache
-def _glm_input_record(generator_version: int) -> dict[str, Any] | None:
-    """The seeded input fields that the producer of ``generator_version`` writes, or None for another version.
+def _glm_input_record(generator_version: int) -> Mapping[str, Any] | None:
+    """The seeded input fields that the producer of ``generator_version`` writes, as a read-only mapping.
 
-    The fields come in the order in which the reader compares them. The producer draws ``MAX_CONTEXT + MAX_BATCH *
-    REQUEST_STRIDE`` tokens with the generator of collector/glm53flash_attention_tokens.py, and records the digest of
+    This collector can draw the stream of one version only, ``GENERATOR_VERSION`` of
+    collector/glm53flash_attention_tokens.py, and None is returned for any other version. The fields come in the order
+    in which the reader compares them. Every caller gets the one cached mapping, which no caller can change. The
+    producer draws ``MAX_CONTEXT + MAX_BATCH * REQUEST_STRIDE`` tokens with that generator, and records the digest of
     their compact JSON list and the number of distinct tokens; this function draws the same stream once in a process.
     A later generator version must keep the function of every version that a stored campaign names, or the reader
     refuses that campaign with ``input_provenance.generator_version``.
@@ -352,7 +356,7 @@ def _glm_input_record(generator_version: int) -> dict[str, Any] | None:
         return None
     count = MAX_CONTEXT + MAX_BATCH * seeded.REQUEST_STRIDE
     tokens = seeded.generate(seeded.SEED, count, seeded.VOCAB_LOW, seeded.VOCAB_HIGH)
-    return {
+    record = {
         "generator": seeded.GENERATOR,
         "seed": seeded.SEED,
         "count": count,
@@ -362,6 +366,7 @@ def _glm_input_record(generator_version: int) -> dict[str, Any] | None:
         "token_ids_sha256": hashlib.sha256(json.dumps(tokens, separators=(",", ":")).encode()).hexdigest(),
         "unique_token_count": len(set(tokens)),
     }
+    return MappingProxyType(record)
 
 
 _PRODUCER_DIGEST_FIELDS = ("runtime_source_manifest_sha256", "overlay_sha256")
@@ -553,7 +558,9 @@ def _validate_glm_provenance(
     # prefill chunks that the scheduler splits at block boundaries.
     if not _same(serving.get("mamba_cache_mode"), "align"):
         raise lacks("serving_config.mamba_cache_mode")
-    if type(serving.get("block_size")) is not int or serving.get("block_size") != serving.get("hash_block_size"):
+    if type(serving.get("block_size")) is not int or not _same(
+        serving.get("hash_block_size"), serving.get("block_size")
+    ):
         raise lacks("serving_config.block_size")
     if serving.get("need_mamba_block_aligned_split") is not True:
         raise lacks("serving_config.need_mamba_block_aligned_split")
