@@ -583,7 +583,7 @@ def load_model_config(path: str | Path) -> ModelConfig:
     """Load local config/ModelOpt metadata with separate byte-level provenance."""
     # Imported here, not at module level: tests/unit/test_fpm_config_imports.py and the repository-root
     # tests/test_resource_supervision.py fail when aisim_core.decoder_config loads before a config is read.
-    from aisim_core.decoder_config import decoder_config_key, nested_decoder_ambiguity
+    from aisim_core.decoder_config import decoder_config_key, nested_decoder_ambiguity, wrapper_key_problem
 
     path = Path(path).expanduser().absolute()
     payload = path.read_bytes()
@@ -600,6 +600,8 @@ def load_model_config(path: str | Path) -> ModelConfig:
             "for all components actually loaded by the worker; full multimodal latency is not modeled."
         )
     }
+    if (problem := wrapper_key_problem(document)) is not None:
+        raise ValueError(f"{problem}; supply its decoder config or a complete --fpm-profile")
     decoder_key = decoder_config_key(document)
     if decoder_key is not None:
         decoder = document[decoder_key]

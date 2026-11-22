@@ -21,7 +21,7 @@ from aisim.sdk.utils import (
     _get_model_config_path,
     _parse_hf_config_json,
 )
-from aisim_core.decoder_config import decoder_config_problem
+from aisim_core.decoder_config import decoder_config_problem, wrapper_key_problem
 from aisim_core.sdk.fpm_model_metadata import (
     attach_quantization_sidecar,
     decoder_config_key,
@@ -78,6 +78,8 @@ class ResolvedModelConfig:
         """
 
         payload = self.payload
+        if (problem := wrapper_key_problem(payload)) is not None:
+            raise ValueError(f"{problem}; supply one text decoder config")
         key = decoder_config_key(payload)
         decoder = payload.get(key)
         if key is not None and (problem := decoder_config_problem(key, decoder)) is not None:

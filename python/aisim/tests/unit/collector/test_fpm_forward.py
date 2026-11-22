@@ -1781,6 +1781,39 @@ def test_malformed_llm_config_of_a_registered_wrapper_is_refused_as_config_intak
 
 
 @pytest.mark.parametrize(
+    ("wrapper", "held", "own"),
+    [
+        ("NemotronH_Omni_Reasoning_V3", "text_config", "llm_config"),
+        ("Qwen3_5MoeForConditionalGeneration", "llm_config", "text_config"),
+    ],
+    ids=["llm-wrapper", "text-wrapper"],
+)
+def test_registered_wrapper_with_only_the_other_decoder_key_is_refused_by_every_reader(tmp_path, wrapper, held, own):
+    from aisim.support.config_profile import load_model_config as load_intake_config
+    from aisim_core.sdk.fpm_profile import _validate_checkpoint_architecture
+
+    # The registry names the key of this wrapper. The op-level parser reads the wrapper root when that key is missing,
+    # so a reader of the other key would see another decoder.
+    document = {"architectures": [wrapper], held: _packaged_config(_NEMOTRON_SUPER)}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(document))
+    problem = f"{wrapper} keeps its text decoder under {own}, but this config holds {held} and no {own}"
+    with pytest.raises(ValueError) as intake:
+        load_intake_config(path)
+    assert str(intake.value) == f"{problem}; supply its decoder config or a complete --fpm-profile"
+    with pytest.raises(ValueError) as effective:
+        _ = ResolvedModelConfig(document, source_kind="explicit", source_reference="test").effective_payload
+    assert str(effective.value) == f"{problem}; supply one text decoder config"
+    profile = SimpleNamespace(model=str(tmp_path), model_revision=None, architecture=wrapper)
+    with pytest.raises(ValueError) as check:
+        _validate_checkpoint_architecture(profile)
+    identity = f"{str(tmp_path)!r} at model_revision=None"
+    assert str(check.value) == (
+        f"FPM profile checkpoint config.json for {identity} has no single text decoder: {problem}"
+    )
+
+
+@pytest.mark.parametrize(
     "extra",
     [{}, {"llm_config": None}, {"llm_config": {}}, {"llm_config": []}, {"llm_config": "decoder"}],
     ids=["flat", "null-llm-config", "empty-llm-config", "list-llm-config", "string-llm-config"],

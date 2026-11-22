@@ -97,7 +97,7 @@ def _load_pinned_checkpoint_config(model: str, revision: str) -> dict | None:
 
 def _validate_checkpoint_architecture(profile: FpmModelProfile) -> None:
     """Verify raw checkpoint metadata without loading weights or remote code."""
-    from aisim_core.decoder_config import decoder_config_key, decoder_config_problem
+    from aisim_core.decoder_config import decoder_config_key, decoder_config_problem, wrapper_key_problem
     from aisim_core.sdk.utils import HuggingFaceDownloadError, _load_local_config
 
     checkpoint = Path(profile.model).expanduser()
@@ -119,6 +119,8 @@ def _validate_checkpoint_architecture(profile: FpmModelProfile) -> None:
     # Match the collector's text-model view of checkpoint metadata. A decoder that declares no architectures,
     # absent or null, keeps the wrapper's, as the collector and config intake read it. A decoder key that does not
     # hold one text decoder is refused, as the collector and config intake refuse it.
+    if (problem := wrapper_key_problem(metadata)) is not None:
+        raise ValueError(f"FPM profile checkpoint config.json for {identity} has no single text decoder: {problem}")
     key = decoder_config_key(metadata)
     decoder = metadata.get(key)
     if key is not None and (problem := decoder_config_problem(key, decoder)) is not None:
