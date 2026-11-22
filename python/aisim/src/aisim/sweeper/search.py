@@ -45,7 +45,7 @@ from ..aiperf_metrics import AIPerfMetric, NoSamplesError, metric_value
 from ..power import POWER_FIELDS, normalize_power_summary
 from ..resources import ResourceLimitError
 from .config import Candidate, OptimizationGoal, OptimizationTarget, SmartSearchConfig
-from .deploy import build_backend_deployment
+from .deploy import InfeasibleEngineSetting, build_backend_deployment
 from .discovery import resolve_providers
 from .epd import add_encoder_choices, apply_encoder_overlay, language_replay_key, resolve_encoder_catalog
 from .forward_pass_estimator import ForwardPassEstimatorResolver
@@ -788,6 +788,16 @@ def _materialize_one(
             outcome="infeasible",
             reason=f"candidate adapter selection infeasible: {exc}",
             reason_category=ReasonCategory.ADAPTER_CONSTRAINT,
+            runner_metadata={},
+            config_snapshot=deepcopy(sample) if epd_snapshot is not None else None,
+        )
+    except InfeasibleEngineSetting as exc:
+        return None, _EvalResult(
+            candidate=None,
+            observe_metrics=None,
+            outcome="infeasible",
+            reason=f"candidate engine settings infeasible: {exc}",
+            reason_category=ReasonCategory.BACKEND_TOPOLOGY,
             runner_metadata={},
             config_snapshot=deepcopy(sample) if epd_snapshot is not None else None,
         )

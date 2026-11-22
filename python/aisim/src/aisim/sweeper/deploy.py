@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from copy import deepcopy
+from functools import cache
 from typing import Any
 
 from ..capacity import estimate_kv_bytes_per_token, materialize_aic_num_gpu_blocks
@@ -16,6 +18,10 @@ from .replay import BackendDeploymentSpec, EncoderPoolSpec, ForwardPassEstimator
 
 # `--chunked-prefill-size` when SGLang is launched without one.
 SGLANG_DEFAULT_CHUNKED_PREFILL_SIZE = 8192
+
+
+class InfeasibleEngineSetting(ValueError):
+    """An engine setting of a candidate that its FPM profile cannot run."""
 
 
 def _role_prefix(role: str) -> str:
@@ -232,13 +238,23 @@ def _engine_args_payload(
     return payload
 
 
-def _grouped_deployment(sample: dict[str, Any], role: str, *, backend_version: str):
-    """The FPM profile and the grouped deployment of a candidate's role, or None for a role with a linear cache."""
+@cache
+def _profile(fpm_profile_json: str):
+    """The loaded FPM profile of a candidate, keyed by its JSON text as the cached capacity function keys it.
+
+    The sweeper builds its candidates in one process, so it loads each profile once. Every caller only reads the
+    model and the deployment that ``select`` returns.
+    """
     from aisim_core.sdk.fpm_profile import load_fpm_profile
 
+    return load_fpm_profile(fpm_profile_json)
+
+
+def _grouped_deployment(sample: dict[str, Any], role: str, *, backend_version: str):
+    """The FPM profile and the grouped deployment of a candidate's role, or None for a role with a linear cache."""
     if sample.get("fpm_profile") is None:
         return None
-    profile = load_fpm_profile(sample["fpm_profile"])
+    profile = _profile(json.dumps(sample["fpm_profile"], sort_keys=True))
     # A profile without grouped deployments keeps its candidate path as it was.
     if all(deployment.resources.cache_layout != "grouped" for deployment in profile.deployments):
         return None
@@ -275,14 +291,17 @@ def _add_grouped_prefix_caching(
     if not payload["enable_prefix_caching"]:
         return
     # The search gate checks the largest budget of the domain. Each candidate is checked with its own, before replay.
-    payload["prefix_match_unit"] = grouped_prefix_caching_requirements(
-        deployment,
-        backend_version=backend_version,
-        architecture=profile.architecture,
-        prefix_match_unit=None,
-        max_batched_tokens=int(sample[f"{role}_max_num_batched_tokens"]),
-        field=f"{role}_enable_prefix_caching",
-    )
+    try:
+        payload["prefix_match_unit"] = grouped_prefix_caching_requirements(
+            deployment,
+            backend_version=backend_version,
+            architecture=profile.architecture,
+            prefix_match_unit=None,
+            max_batched_tokens=int(sample[f"{role}_max_num_batched_tokens"]),
+            field=f"{role}_enable_prefix_caching",
+        )
+    except ValueError as exc:
+        raise InfeasibleEngineSetting(str(exc)) from exc
     # vLLM always sizes its pool with a model length, and the Rust gate refuses a rank without one.
     payload.setdefault("max_model_len", profile.context_length)
 

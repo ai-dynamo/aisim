@@ -2224,6 +2224,119 @@ def test_grouped_sweeper_checks_each_candidate_budget_before_replay(grouped_case
         build_backend_deployment(sample, backend_version="0.31.0")
 
 
+def _grouped_agg_sample(profile, root, budget):
+    from aisim.sweeper.config import SearchSpace
+    from aisim.sweeper.parallel_enum import ParallelShape, ReplicaParallelConfig
+    from aisim.sweeper.sample import unroll_sample
+
+    search = SearchSpace.model_validate(
+        {**_prefix_search(profile, root, "0.31.0"), "agg_max_num_batched_tokens": [budget]}
+    )
+    return unroll_sample(
+        search_space=search,
+        selection={
+            "deployment_mode": "agg",
+            "backend": "vllm",
+            "agg_max_num_batched_tokens": budget,
+            "agg_max_num_seqs": 4,
+        },
+        parallel_config=ReplicaParallelConfig(ParallelShape(tp=2, dp=1, moe_tp=2, moe_ep=1), replicas=1),
+    )
+
+
+def test_grouped_sweeper_loads_the_profile_once_per_process(grouped_case):
+    from aisim.sweeper import deploy
+    from aisim.sweeper.config import SearchSpace
+    from aisim.sweeper.parallel_enum import DisaggParallelConfig, ParallelShape, ReplicaParallelConfig
+    from aisim.sweeper.sample import unroll_sample
+
+    profile, root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile))
+    deploy._profile.cache_clear()
+    first = _grouped_agg_sample(profile, root, 128)
+    second = _grouped_agg_sample(deepcopy(profile), root, 128)
+    loaded = [
+        deploy._grouped_deployment(sample, "agg", backend_version="0.31.0")[0] for sample in (first, second, first)
+    ]
+    # An equal profile in another dict gives the model that the first load built.
+    assert loaded[0] is loaded[1] is loaded[2]
+    # The order of the keys does not matter, as it does not for the loader.
+    reordered = {**first, "fpm_profile": dict(reversed(first["fpm_profile"].items()))}
+    assert deploy._grouped_deployment(reordered, "agg", backend_version="0.31.0")[0] is loaded[0]
+    deploy.build_backend_deployment(first, backend_version="0.31.0")
+    deploy.build_backend_deployment(second, backend_version="0.31.0")
+    assert deploy._profile.cache_info().misses == 1
+    changed = deepcopy(profile)
+    changed["context_length"] += 1
+    deploy._grouped_deployment(_grouped_agg_sample(changed, root, 128), "agg", backend_version="0.31.0")
+    assert deploy._profile.cache_info().misses == 2
+
+    # A disaggregated candidate reads the profile for both roles and for the transfer geometry, and loads it once.
+    pd_profile = _with_transfer_markers(profile)
+    raw = {**_pd_search(pd_profile, root), "kv_transfer_bytes_per_token": "auto", "kv_transfer_bandwidth": 1.0}
+    raw["prefill_enable_prefix_caching"] = True
+    worker = ReplicaParallelConfig(ParallelShape(tp=2, dp=1, moe_tp=2, moe_ep=1), replicas=1)
+    sample = unroll_sample(
+        search_space=SearchSpace.model_validate(raw),
+        selection={
+            "deployment_mode": "disagg",
+            "backend": "vllm",
+            "prefill_max_num_batched_tokens": 128,
+            "prefill_max_num_seqs": 4,
+            "decode_max_num_batched_tokens": 128,
+            "decode_max_num_seqs": 4,
+        },
+        parallel_config=DisaggParallelConfig(prefill=worker, decode=worker),
+    )
+    deploy._profile.cache_clear()
+    deployment = deploy.build_backend_deployment(sample, backend_version="0.31.0")
+    assert deployment.prefill_engine_args["prefix_match_unit"] == 64
+    info = deploy._profile.cache_info()
+    assert (info.misses, info.currsize) == (1, 1)
+    assert info.hits >= 3
+
+
+def test_grouped_sweeper_marks_an_off_grid_budget_infeasible_with_a_short_reason(grouped_case, caplog):
+    from aisim.runner import EngineReplayRunnerFactory
+    from aisim.sweeper import search as search_module
+    from aisim.sweeper.config import SmartSearchConfig
+    from aisim.sweeper.parallel_enum import ParallelShape, ReplicaParallelConfig
+    from aisim.sweeper.result import ReasonCategory
+
+    profile, root = grouped_case
+    profile = _with_prefix_evidence(profile, hash_block=2176)
+    profile["architecture"] = "Glm5NextForConditionalGeneration"
+    # The search gate checks the largest budget, 8192. The 8190 candidate is refused when its rank is built.
+    config = SmartSearchConfig(
+        search_space={**_prefix_search(profile, root, "0.31.0"), "agg_max_num_batched_tokens": [8190, 8192]},
+        workload=Workload(isl=1152, osl=4, concurrency=1, request_count=2),
+    )
+
+    class NoEstimators:
+        # The synthetic checkpoint names another architecture, so the exact estimator cannot be built. The candidate
+        # takes the search's backend version, as a candidate without estimators does.
+        def resolve_candidate(self, sample):
+            return {}
+
+    prepared, result = search_module._materialize_one(
+        {"deployment_mode": "agg", "backend": "vllm", "agg_max_num_batched_tokens": 8190, "agg_max_num_seqs": 4},
+        ReplicaParallelConfig(ParallelShape(tp=2, dp=1, moe_tp=2, moe_ep=1), replicas=1),
+        config=config,
+        goal=config.goal,
+        providers={},
+        provider_plans={},
+        runner_factory=EngineReplayRunnerFactory(),
+        estimator_resolver=NoEstimators(),
+    )
+    assert prepared is None
+    assert (result.outcome, result.reason_category) == ("infeasible", ReasonCategory.BACKEND_TOPOLOGY)
+    assert result.reason == (
+        "candidate engine settings infeasible: GLM-5.3-Flash prefix caching requires prefix_match_unit and "
+        "max_batched_tokens that are multiples of 4"
+    )
+    assert "Sweeper candidate build failed" not in caplog.text
+
+
 def _onboarding_plan(profile, tmp_path, capsys, version, runtime_version=None):
     """Run `aisim onboard plan` for one grouped profile and return its stderr and its files, with tmp_path removed."""
     request = SupportRequest.model_validate(
