@@ -4,6 +4,8 @@
 """Matched native CLI comparison. Usage: repair_replay_perf.py PYTHON BASE_SDK ROUNDS OUT.json
 
 PYTHON imports the candidate; BASE_SDK contains the baseline's installed packages.
+Each child's package, model constructor and native import paths are checked so
+an empty or incorrect BASE_SDK cannot silently select the candidate installation.
 Build both native extensions with identical optimized flags before running this.
 All generated configs and CLI output live below TMPDIR. Mamba qualification is a
 test-only constructor shim, as in telem.py; production defaults are not changed.
@@ -21,7 +23,12 @@ from pathlib import Path
 python, base_sdk, rounds, output = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 if rounds <= 0 or rounds % 2:
     sys.exit("ROUNDS must be a positive even number to balance build positions")
+if not base_sdk.strip():
+    sys.exit("BASE_SDK must name the baseline's installed-packages directory")
+base_sdk = Path(base_sdk).resolve()
+identity_packages = {"package_path": "aisim", "constructor_path": "aisim_core", "native_path": "aisim"}
 shim = """import atexit, hashlib, json, os, sys
+import aisim
 import aisim_core.sdk.models.nemotron_h as nh
 from aisim import _runtime
 from pathlib import Path
@@ -40,6 +47,9 @@ nh.ops = QualifiedOps()
 def record():
     identity = {
         "calls": len(calls),
+        "package_path": str(Path(aisim.__file__).resolve()),
+        "constructor_path": str(Path(nh.__file__).resolve()),
+        "native_path": str(Path(_runtime.__file__).resolve()),
         "native_sha256": hashlib.sha256(Path(_runtime.__file__).read_bytes()).hexdigest(),
         "native_sources_sha256": hashlib.sha256(_runtime._build_source_files_json().encode()).hexdigest(),
     }
@@ -104,7 +114,7 @@ with tempfile.TemporaryDirectory(prefix="mamba-repair-replay-") as temp:
                 build_record = root / "build.jsonl"
                 build_record.write_text("")
                 env = os.environ | {"AIC_ALLOW_UNLISTED_VERSIONS": "1", "REPAIR_BUILD_RECORD": str(build_record)}
-                env["PYTHONPATH"] = os.pathsep.join([str(root)] + ([base_sdk] if build == "baseline" else []))
+                env["PYTHONPATH"] = os.pathsep.join([str(root)] + ([str(base_sdk)] if build == "baseline" else []))
                 start = time.perf_counter()
                 proc = subprocess.run(
                     [
@@ -128,9 +138,17 @@ with tempfile.TemporaryDirectory(prefix="mamba-repair-replay-") as temp:
                 elapsed = time.perf_counter() - start
                 if proc.returncode:
                     sys.exit(proc.stderr)
+                identities = [json.loads(line) for line in build_record.read_text().splitlines()]
+                if not identities:
+                    sys.exit(f"{build}: no child build identity recorded")
+                if build == "baseline":
+                    for identity in identities:
+                        for key, package in identity_packages.items():
+                            loaded = identity.get(key)
+                            if not loaded or not Path(loaded).resolve().is_relative_to(base_sdk / package):
+                                sys.exit(f"baseline: {key} imported outside BASE_SDK/{package}: {loaded}")
                 report = json.loads((dest / "prediction.json").read_text())
                 resources = json.loads((dest / "resource-runtime.json").read_text())
-                identities = [json.loads(line) for line in build_record.read_text().splitlines()]
                 assert report["completed_requests"] == 1000
                 assert report["total_input_tokens"] == 2_048_000 and report["total_output_tokens"] == 32_000
                 if case == "nano":
@@ -142,6 +160,17 @@ with tempfile.TemporaryDirectory(prefix="mamba-repair-replay-") as temp:
                     "peak_rss_bytes": resources["peak_observed_rss_bytes"],
                     "build": identities,
                 }
+        for key in identity_packages:
+            paths_by_build = {
+                build: {
+                    identity[key]
+                    for case in ("nano", "control")
+                    for identity in record["results"][build][case]["build"]
+                }
+                for build in ("baseline", "candidate")
+            }
+            if paths_by_build["baseline"] & paths_by_build["candidate"]:
+                sys.exit(f"baseline: {key} resolves to the candidate installation")
         assert (
             record["results"]["baseline"]["control"]["duration_ms"]
             == record["results"]["candidate"]["control"]["duration_ms"]
