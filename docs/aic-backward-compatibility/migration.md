@@ -699,9 +699,13 @@ explains the retained workload routing and feature mathematics.
   review and accept the new draft. The new draft has a new request identity, so
   `aisim onboard finalize` refuses the existing collection directory. Plan and
   collect again into a new output directory. That costs a new formal
-  collection. Sizing and cold replay do not read the field. Grouped prefix
-  caching reads it, so such a session needs the new import to plan prefix
-  caching on. Without it the plan stays cold.
+  collection. Aggregated cold replay does not read the field. Grouped prefix caching
+  reads it, so such a session needs the new import to plan prefix caching on.
+  Without it the plan stays cold. The peak bound of the cache budget
+  (`request_peak_cache_bytes`) reads the field too. Without it each `state`
+  group counts `blocks_per_request` blocks in that bound. For a Mamba group
+  that is below vLLM's startup count in `align` mode, and with the field the
+  bound equals that count. See [memory accounting](../perf-model/memory.md#fpm-profile-cache-groups-and-byte-budgets).
 - A vLLM 0.33.0 runtime probe import now also writes
   `runtime_memory.runtime_framework_version`, the version of the runtime that
   observed the cache groups. A session whose probe was imported before this

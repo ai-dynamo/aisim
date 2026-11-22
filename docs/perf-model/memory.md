@@ -139,7 +139,9 @@ in tokens, that the runtime resolved). All three are optional, and an absent
 field is left out of the serialized record. `align` requires
 `enable_prefix_caching` to be `true`. vLLM's `all` mode is not modeled and is
 rejected. Rust exports the mode type as `FpmMambaCacheMode`. These fields are
-evidence of the probe's settings. Selection and sizing do not read them.
+evidence of the probe's settings. Selection does not read them. Sizing reads
+only `mamba_cache_mode`, and only for the peak bound of a `state` group
+(`request_peak_cache_bytes`).
 Grouped prefix caching needs `enable_prefix_caching: true` and
 `hash_block_size_tokens`, and a prefix-cacheable `state` group also needs
 `mamba_cache_mode: align`. Replay then hashes prompts in blocks of
@@ -209,11 +211,16 @@ linear-attention layers. It has no `sliding_window`, and no other kind accepts
   [`kv_cache_interface.py:1135-1141`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py#L1135-L1141)
   and
   [`single_type_kv_cache_manager.py:1640-1657`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py#L1640-L1657).
+  `request_peak_cache_bytes` counts these `2 + k + c` blocks for a
+  prefix-cacheable `state` group of a profile that records `align` mode, and
+  `request_occupancy_cache_bytes` counts `blocks_per_request`.
 
 A `state` group can also hold two optional fields from the runtime probe
 import. A profile imported before these fields existed has neither of them, and
-an absent field is left out of the serialized group. Sizing and replay with
-prefix caching off do not read them. Grouped prefix caching on vLLM 0.32.0
+an absent field is left out of the serialized group. Replay with prefix
+caching off does not read them. Sizing reads only `prefill_checkpoint_blocks`,
+and only for the peak bound of a prefix-cacheable `state` group in `align`
+mode. Grouped prefix caching on vLLM 0.32.0
 and 0.33.0 reads them for a prefix-cacheable `state` group, and on vLLM 0.31.0 it refuses
 a positive `prefill_checkpoint_blocks`. On every modeled version it refuses a
 positive `prefill_checkpoint_blocks` on a `state` group with
@@ -238,8 +245,9 @@ positive `prefill_checkpoint_blocks` on a `state` group with
 Every group can also hold two more optional fields. A profile imported before
 these fields existed has neither of them, and an absent field is left out of
 the serialized group. The [migration guide](../aic-backward-compatibility/migration.md#rust-resource-and-memory-literals)
-says how a session that was imported before them keeps working. Sizing does
-not read them, and aggregated replay with prefix caching off reads neither.
+says how a session that was imported before them keeps working. Sizing reads
+only `prefix_cacheable`, and only for the peak bound of a `state` group.
+Aggregated replay with prefix caching off reads neither.
 Grouped prefix caching reads `prefix_cacheable`. Aggregated replay does not
 read `transfer_bytes_per_block`. The grouped P/D transfer rules read both
 fields, so a prefill or decode rank refuses a group that leaves either unset.
@@ -404,13 +412,42 @@ requires the native extension; it does not require GPU access or measured data.
 
 The result includes `total_kv_size_bytes`, `memory_breakdown`,
 `resource_provenance`, `cache_layout`, `cache_groups`, and
-`request_peak_cache_bytes`. The latter is a conservative single-request bound
-including block alignment and the configured prefill chunk, not a reservation
-for every scheduler slot. A smaller context changes this peak bound, not the
-declared non-cache resource bounds. `tolerance_adjusted`, when present, provides
-the reduced byte budget. For grouped caches, `kv_size_per_token_bytes`,
+`request_peak_cache_bytes`. The latter is a single-request bound, not a
+reservation for every scheduler slot. For grouped caches it is what vLLM's
+startup check reserves for one request of the context length: every block of
+a full-attention group, the admission cap of a sliding-window or
+`convolution` group with the in-flight tokens of two batches of the
+configured prefill chunk, and the startup blocks of a `state` group (`2 + k +
+c` for a prefix-cacheable group in a profile that records `align` mode). The
+window term counts two batches for every deployment. Two is vLLM's count with
+async scheduling at pipeline parallel size 1, and grouped execution supports
+PP1 only. With `async_scheduling: false` vLLM counts one batch, so the bound
+is then high by at most `ceil(max_num_tokens / block_size_tokens)` pages per
+window group.
+For a linear layout it is the context length times the bytes per token. For
+an observed Mamba align pool it counts the pages of the context length, the
+old and the new state of each state group with its speculative states, and
+one page for a partial attention source. A smaller context changes this peak bound,
+not the declared non-cache resource bounds. `tolerance_adjusted`, when present,
+provides the reduced byte budget. For grouped caches, `kv_size_per_token_bytes`,
 `total_kv_size_tokens`, and the adjusted token capacity are null (`None` in Python).
 There is no equivalent scalar token capacity.
+
+For a `state` group the peak bound counts the `2 + k + c` blocks of vLLM's
+`align` startup count only when the group states `prefix_cacheable: true` and
+the runtime memory records `mamba_cache_mode: align`. A profile that was
+imported before the import wrote `prefix_cacheable` leaves that field unset on
+its cache groups. Its `state` groups then count `blocks_per_request` blocks
+each, because the profile does not say which `state` group is a ring. For the
+GLM-5.3-Flash profile of the vLLM 0.33.0 runtime probe on GB300 at TP 4, with
+blocks of 2,176 tokens and a context of 1,048,576 tokens, the bound is 487
+pages, where vLLM's startup check reserves 495: each of the four
+KDA groups has one checkpoint block, so vLLM counts 3 blocks for it and the
+bound counts 1. A new import of the same runtime probe writes the field, and
+the bound then equals vLLM's count. The
+[migration guide](../aic-backward-compatibility/migration.md#rust-resource-and-memory-literals)
+gives the steps of that import. The import writes the field only from a vLLM
+0.33.0 record, whatever the label of the profile.
 
 When `request_occupancy_tokens` is supplied, the result also includes
 `request_occupancy_cache_bytes`. KV-relative synthetic loads use this native
@@ -457,7 +494,10 @@ profile needs a hand-made value on each group.
 [Replay KV cache](../replay/engine/kv-cache.md#other-cache-modes) lists the conditions. Host/G3
 offload and fixed scalar cache capacity are rejected. With
 prefix caching off, allocation is atomic across all groups against one shared
-rank-local byte budget. A window
+rank-local byte budget. A waiting request is admitted only when the bytes of
+its whole sequence fit the free bytes, with the admission cap of a window
+group, as vLLM's default `scheduler_reserve_full_isl` does. A request whose
+whole sequence is larger than the pool is rejected. A window
 of `W` keeps the blocks covering the last `W - 1` computed tokens and all tokens
 scheduled for the next forward. Expired completed pages are evicted before
 subsequent forwards; temporary prefill pages remain charged through completion.

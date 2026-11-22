@@ -386,7 +386,9 @@ pub enum FpmMambaCacheMode {
 /// non-KV memory limit or a capacity that can be scaled to another setting.
 ///
 /// The three optional prefix-caching fields record the settings that the probe
-/// ran with. Selection and sizing do not read them. Grouped prefix caching
+/// ran with. Selection does not read them. Sizing reads only
+/// `mamba_cache_mode`, and only for the peak bound of a state group
+/// (`request_peak_cache_bytes`). Grouped prefix caching
 /// needs `enable_prefix_caching` true and `hash_block_size_tokens`, and replay
 /// then hashes prompts in blocks of `hash_block_size_tokens`. Replay models grouped prefix caching
 /// for vLLM 0.31.0, 0.32.0 and 0.33.0 only. For a linear profile, the simulated
