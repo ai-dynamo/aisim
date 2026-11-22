@@ -1,5 +1,6 @@
 {
   "candidate": "49ee01957177268bb5889f1bb058eeb0f867d101",
+  "reproduction_command": "python benchmarks/evidence/mamba-mixed-step-accounting/xpu_scoped_repair.py --candidate-revision 49ee01957177268bb5889f1bb058eeb0f867d101 OUT.json",
   "evidence_status": "Historical snapshot; not current-driver output. Numeric rows and original driver fingerprint are preserved.",
   "baseline": "0cfbdb5535583493e4ab073241e1f74d707acdde",
   "price_kind": "synthetic FPM caller fixture",

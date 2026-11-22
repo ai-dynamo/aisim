@@ -60,6 +60,10 @@ def main():
     exec(compile(baseline_source, f"{BASE}:{SOURCE}", "exec"), baseline.__dict__)
     result = {
         "candidate": candidate,
+        "reproduction_command": (
+            "python benchmarks/evidence/mamba-mixed-step-accounting/xpu_scoped_repair.py "
+            f"--candidate-revision {candidate} OUT.json"
+        ),
         "candidate_source_sha256": candidate_hash,
         "candidate_base_source_sha256": base_hash,
         "baseline": BASE,

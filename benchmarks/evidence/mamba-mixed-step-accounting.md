@@ -1577,3 +1577,83 @@ cache miss; it adds no model queries, cache or per-token state. Retaining the
 already-returned timing samples adds output storage outside the timed calls.
 This is a source-level cost assessment, not a new host-speed or serving-accuracy
 claim. The two outstanding evidence/contract requests above remain open.
+
+### Scoped review repair from `76921733`
+
+Backend and JSON-converter source is pinned by corrective commit
+`18f10f7bb8e7c8a71208bf3e9bdcd900c2c8ec11`. The separately recorded current
+XPU fixture is
+[xpu-scoped-repair-18f10f7b.json](mamba-mixed-step-accounting/xpu-scoped-repair-18f10f7b.json).
+With that commit's Python backends installed, reproduce from the repository root:
+
+```bash
+python benchmarks/evidence/mamba-mixed-step-accounting/xpu_scoped_repair.py \
+  --candidate-revision 18f10f7bb8e7c8a71208bf3e9bdcd900c2c8ec11 OUT.json
+```
+
+Both reports identify the candidate revision and command. The current report
+also fingerprints both imported backend files and the driver. The historical
+rows above were reproduced exactly using the historical Python backend files
+and the current driver in a separate interpreter. This synthetic seam never
+calls native pricing, so that check does not qualify a historical native wheel.
+The original snapshot's numeric rows and original driver hash remain unchanged.
+
+| Prefix / capacity | Current pricing input (prefill, decode) | Current synthetic TTFT ms |
+| --- | --- | ---: |
+| 3000 / 2048 | (1096, 15) | 40.525414 |
+| 4088 / 4096 | (8, 15) | 7.619566 |
+| 0 / 2048 control | (2033, 15) | 176.012263 |
+
+These replace neither the historical observations nor the outstanding
+uneven-prefill request. They expose the current fresh-suffix cap: each cached
+case has just one available prefill slot. The launch/token/decode fixture,
+full inputs, baseline revision and unchanged burst coefficients are the same
+as in the historical comparison.
+
+Visual FPM overlays now use the same uncached schedule as the native FPM
+query. The regression executes `run_mixed` through the aggregate summary with
+an independent synthetic 5 ms / 500 W-ms FPM mean and a 4 ms / 400 W-ms
+whole-request visual overlay. With effective ISL 4096, prefix 3000 and budget
+4096, one 1096-token query retains the whole overlay: prefill rises from the
+source-derived 6 ms to 9 ms, and TTFT from 11.4 ms to 17.1 ms. Budget 512
+needs three chunks; the folded overlay is still exactly 4 ms / 400 W-ms,
+and prefill is 19 ms. The test checks latency, energy and covered latency.
+
+Single-request op-level visual aggregates with qualified Mamba and multiple
+uncached chunks now fail before pricing. Their mean-field attention weight
+cannot price exact recurrent-state transfers; no exact visual scheduler is
+claimed. Text XPU TTFT recognizes native and SDK Mamba in either phase.
+The byte oracle now checks both representations and generation-only graphs
+in burst and admission regimes, including the cold 96-token tail and the
+unqualified control. Generation-only graphs pay five whole decode-state
+contributions for a 4096-token prompt with 1000 prefill slots, rather than
+4.096. Schema-30 JSON now raises the same recompile error at conversion as
+schema-30 bincode does at decode; current-schema JSON still round-trips.
+
+Host-cost bound: qualification detection visits the two small phase lists
+once on an affected aggregate miss, short-circuiting on the first qualified
+Mamba. It retains no new state and makes no additional pricing queries beyond
+the existing exact text chunk walker. The visual FPM correction adds scalar
+schedule arithmetic to the existing overlay call. JSON version validation is
+constant-time at conversion. Native estimation math and golden values are
+unchanged; no simulator-speed or serving-accuracy claim is made.
+
+Verification used an optimized wheel built first with `maturin build --release
+--locked --auditwheel skip`, Rust 1.91.1, Python 3.12.12,
+`CARGO_PROFILE_RELEASE_LTO=false`, `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`
+and `CARGO_BUILD_JOBS=2`. The six targeted backend/FPM/Mamba/single-oracle
+modules passed 550 cases; both engine-step parity modules passed 390 cases
+with unchanged goldens. The two driver fingerprint regressions, full Python
+lint/format, Rust formatting and documentation-link checks passed.
+The isolated optimized Rust `--lib` schema-30/Mamba round-trip regression
+also passed (one test).
+An initial new schema assertion used an unexported convenience name; the
+corrected test uses the native export. A subsequent concurrent verification
+attempt exhausted the 5 GiB host budget: two CLI tests returned
+`resource_limited`, and a redundant Rust library build was killed. The full
+550-case run passed when executed alone, with assertions and timeouts intact.
+The Rust test passed when built separately with `cargo test --release
+--locked -p aisim-core --lib
+qualified_mamba_round_trips_and_schema_30_layout_is_rejected`.
+Detailed attempt logs remain outside the checkout in the repair scratch area.
+The two outstanding evidence/contract decisions above remain open.

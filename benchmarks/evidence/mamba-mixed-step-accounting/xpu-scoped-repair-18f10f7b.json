@@ -1,0 +1,89 @@
+{
+  "candidate": "18f10f7bb8e7c8a71208bf3e9bdcd900c2c8ec11",
+  "reproduction_command": "python benchmarks/evidence/mamba-mixed-step-accounting/xpu_scoped_repair.py --candidate-revision 18f10f7bb8e7c8a71208bf3e9bdcd900c2c8ec11 OUT.json",
+  "candidate_source_sha256": "3f6c7bca13ff63da4aae4f1346c77288149c66fce1b7c6fbbbf7a50c4bf6b161",
+  "candidate_base_source_sha256": "faf5f388b7967b907c09be113479f2739990c577f296dcf7a8a8ba636f68ad8e",
+  "baseline": "0cfbdb5535583493e4ab073241e1f74d707acdde",
+  "price_kind": "synthetic FPM caller fixture",
+  "cases": [
+    {
+      "batch": 16,
+      "isl": 4096,
+      "prefix": 3000,
+      "osl": 128,
+      "budget": 2048,
+      "decode": 15,
+      "before": {
+        "pricing_shapes": [
+          [
+            2033,
+            15
+          ]
+        ],
+        "ttft_ms": 58.57407640834171
+      },
+      "after": {
+        "pricing_shapes": [
+          [
+            1096,
+            15
+          ]
+        ],
+        "ttft_ms": 40.52541399924255
+      }
+    },
+    {
+      "batch": 16,
+      "isl": 4096,
+      "prefix": 4088,
+      "osl": 128,
+      "budget": 4096,
+      "decode": 15,
+      "before": {
+        "pricing_shapes": [
+          [
+            124,
+            4
+          ]
+        ],
+        "ttft_ms": 29.390881779663935
+      },
+      "after": {
+        "pricing_shapes": [
+          [
+            8,
+            15
+          ]
+        ],
+        "ttft_ms": 7.619565767250508
+      }
+    },
+    {
+      "batch": 16,
+      "isl": 4096,
+      "prefix": 0,
+      "osl": 128,
+      "budget": 2048,
+      "decode": 15,
+      "before": {
+        "pricing_shapes": [
+          [
+            2033,
+            15
+          ]
+        ],
+        "ttft_ms": 176.01226286791314
+      },
+      "after": {
+        "pricing_shapes": [
+          [
+            2033,
+            15
+          ]
+        ],
+        "ttft_ms": 176.01226286791314
+      }
+    }
+  ],
+  "driver_sha256": "f04a68fbe672cac8867bf24defc862b2d624b4b25275a77273703ed3e3dcbc11"
+}
