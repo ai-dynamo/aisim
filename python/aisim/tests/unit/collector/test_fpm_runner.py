@@ -1851,6 +1851,123 @@ def test_formal_glm_run_stages_the_full_point_list(monkeypatch, tmp_path):
     assert index["configurations"][plan.runtime_configuration]["attempts"][0]["status"] == "captured"
 
 
+def _expected_producer_receipt(plan, cell, attempt_id: str) -> dict:
+    """The producer receipt of a passed GLM-5.3-Flash cell, with the digests of the producer files of this checkout."""
+    producer = Path(fpm_runner.__file__).parent / "runtime/glm53flash"
+    return {
+        "attempt_id": attempt_id,
+        "cell_id": cell.cell_id,
+        "plan_sha256": plan.sha256,
+        "producer": {
+            "overlay_sha256": hashlib.sha256((producer / "glm53flash_prefix_scheduler.py").read_bytes()).hexdigest(),
+            "runtime_source_manifest_sha256": hashlib.sha256(
+                (producer / "runtime-source-sha256.json").read_bytes()
+            ).hexdigest(),
+        },
+        "schema_name": "aic_fpm_producer_receipt",
+        "schema_version": 1,
+    }
+
+
+def _rerun_smoke(root: Path, plan, *, retry_failed: bool) -> list:
+    return run_collection(
+        plan,
+        generator_overrides={},
+        checkpoint_dir=str(root / "checkpoints"),
+        artifact_root=str(root / "artifacts"),
+        resume=True,
+        retry_failed=retry_failed,
+        smoke=True,
+        cell_limit=len(plan.cells),
+        publish_database=False,
+    )
+
+
+def _set_smoke_statuses(root: Path, status: str) -> None:
+    path = root / "checkpoints" / "fpm_forward_smoke.json"
+    checkpoint = json.loads(path.read_text())
+    for entry in checkpoint["cells"].values():
+        entry["status"] = status
+    path.write_text(json.dumps(checkpoint))
+
+
+def test_passed_glm_cell_keeps_a_producer_receipt(monkeypatch, tmp_path):
+    from .test_fpm_runtime_memory import _glm_plan
+
+    plan = _glm_plan(tmp_path)
+    _staged, _receipts, checkpoint = _staged_run(monkeypatch, tmp_path / "run", plan, smoke=True)
+
+    campaign = tmp_path / "run" / "artifacts" / plan.sha256[:16] / "smoke"
+    for cell in plan.cells:
+        attempt_id = checkpoint["cells"][cell.cell_id]["attempt_id"]
+        receipt = json.loads((campaign / "cells" / cell.cell_id / "producer-receipt.json").read_text())
+        assert receipt == _expected_producer_receipt(plan, cell, attempt_id)
+
+
+def test_cell_of_another_model_keeps_no_producer_receipt(monkeypatch, tmp_path):
+    # The plans and runs of test_non_glm_cells_keep_their_launch_and_staging.
+    for kind in ("default", "v41"):
+        for phase in ("prefill", "decode"):
+            cell = _cell(phase=phase)
+            if kind == "v41":
+                cell = dataclasses.replace(cell, execution_identity=("0" * 64, "full", "hbm_tp_sharded", "text"))
+            plan = _plan(cell)
+            if kind == "v41":
+                plan.capability = SimpleNamespace(architecture="DeepseekV41ForCausalLM")
+                plan.options.decoder_replay = False
+            root = tmp_path / kind / phase
+            _staged, _receipts, checkpoint = _staged_run(monkeypatch, root, plan, smoke=False)
+            assert checkpoint["cells"][cell.cell_id]["status"] == "passed"
+            assert list((root / "artifacts").rglob("producer-receipt.json")) == []
+
+
+def test_rerun_removes_the_receipt_of_the_replaced_attempt(monkeypatch, tmp_path):
+    from .test_fpm_runtime_memory import _glm_plan
+
+    plan = _glm_plan(tmp_path)
+    root = tmp_path / "run"
+    _staged, _receipts, first = _staged_run(monkeypatch, root, plan, smoke=True)
+    _set_smoke_statuses(root, "failed")
+
+    def no_artifacts(*_args, **_kwargs):
+        raise ValueError("no artifacts")
+
+    monkeypatch.setattr(fpm_runner, "_runtime_collection_summary", no_artifacts)
+    _rerun_smoke(root, plan, retry_failed=True)
+
+    checkpoint = json.loads((root / "checkpoints" / "fpm_forward_smoke.json").read_text())
+    campaign = root / "artifacts" / plan.sha256[:16] / "smoke"
+    for cell in plan.cells:
+        entry = checkpoint["cells"][cell.cell_id]
+        assert entry["status"] == "failed"
+        assert entry["attempt_id"] != first["cells"][cell.cell_id]["attempt_id"]
+        assert not (campaign / "cells" / cell.cell_id / "producer-receipt.json").exists()
+
+
+def test_recovered_glm_cell_gets_a_producer_receipt(monkeypatch, tmp_path):
+    from .test_fpm_runtime_memory import _glm_plan
+
+    plan = _glm_plan(tmp_path)
+    root = tmp_path / "run"
+    _staged, _receipts, first = _staged_run(monkeypatch, root, plan, smoke=True)
+    campaign = root / "artifacts" / plan.sha256[:16] / "smoke"
+    for cell in plan.cells:
+        (campaign / "cells" / cell.cell_id / "producer-receipt.json").unlink()
+    _set_smoke_statuses(root, "interrupted")
+    monkeypatch.setattr(
+        fpm_runner, "_render_cell", lambda *_args, **_kwargs: pytest.fail("a recovered cell was launched again")
+    )
+    _rerun_smoke(root, plan, retry_failed=False)
+
+    checkpoint = json.loads((root / "checkpoints" / "fpm_forward_smoke.json").read_text())
+    for cell in plan.cells:
+        entry = checkpoint["cells"][cell.cell_id]
+        attempt_id = first["cells"][cell.cell_id]["attempt_id"]
+        assert (entry["status"], entry["attempt_id"]) == ("passed", attempt_id)
+        receipt = json.loads((campaign / "cells" / cell.cell_id / "producer-receipt.json").read_text())
+        assert receipt == _expected_producer_receipt(plan, cell, attempt_id)
+
+
 def test_non_glm_cells_keep_their_launch_and_staging(monkeypatch, tmp_path):
     from aisim_core.sdk.deepseek_v41 import MODEL_REVISION
 

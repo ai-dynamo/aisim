@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 import statistics
 from dataclasses import dataclass
@@ -36,6 +37,9 @@ from .types import KVWARM_STRATEGIES
 logger = logging.getLogger(__name__)
 
 COLLECTOR_PROVENANCE_FILENAME = "collector-provenance.json"
+# The record, beside cell.json and raw/ of a cell folder, of the producer files that the collecting run compared the
+# rank artifacts of the cell with.
+PRODUCER_RECEIPT_FILENAME = "producer-receipt.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,13 +235,15 @@ def select_native_measurements(collection: NativeCollection, *, cell_id: str) ->
     return selected
 
 
-def _validate_execution_provenance(cell: FPMCell, payload: dict[str, Any], path: Path) -> dict[str, Any] | None:
+def _validate_execution_provenance(
+    cell: FPMCell, payload: dict[str, Any], path: Path, *, producer_digests: dict[str, str] | None = None
+) -> dict[str, Any] | None:
     """Config-bound curves require engine evidence for execution and real input.
 
     The frozen cell selects the producer contract, never the artifact. The planner computes the cell's execution
     identity from the model configuration, and the cell ID and the plan hash cover it. A DeepSeek V4.1 cell accepts
     only the ``eager`` mode of its producer and a GLM-5.3-Flash cell only ``native_graph_policy``. A mode that no
-    contract audits is refused, never read as one of them.
+    contract audits is refused, never read as one of them. ``producer_digests`` goes to the GLM-5.3-Flash check.
     """
     if not cell.execution_identity[0]:
         return None
@@ -257,7 +263,7 @@ def _validate_execution_provenance(cell: FPMCell, payload: dict[str, Any], path:
             f"native execution identity cell expects execution mode {expected_mode!r}, found {mode!r}: {path}"
         )
     if mode == "native_graph_policy":
-        return _validate_glm_provenance(cell, payload, path)
+        return _validate_glm_provenance(cell, payload, path, producer_digests=producer_digests)
     expected = dict(zip(EXECUTION_COLUMNS, cell.execution_identity, strict=True))
     if payload.get("execution_identity") != expected:
         raise ValueError(f"native execution identity differs from the frozen V4.1 cell: {path}")
@@ -300,7 +306,10 @@ def _glm_producer_record() -> dict[str, Any]:
     reader cannot import its constants. The reader keeps them here, and a test keeps them equal to the record that the
     producer writes. The vLLM version is the exact supported runtime. The two digests are those of the pin manifest and
     of the producer file that this collector ships and that a launch of this collector mounts; the producer computes
-    both the same way. A campaign of another producer revision is therefore refused.
+    both the same way. A cell folder with a producer receipt (``write_producer_receipt``) gives the two digests instead:
+    the run that collected the cell wrote them from its own files after this comparison passed. A cell without a
+    receipt is compared with the files of the reading checkout, so a campaign of another producer revision without
+    receipts is refused.
     """
     return {
         "instrumentation_revision": "54960177085413259859c88bd34ed0734d4c2ea9",
@@ -324,13 +333,87 @@ def _glm_producer_record() -> dict[str, Any]:
     }
 
 
-def _validate_glm_provenance(cell: FPMCell, payload: dict[str, Any], path: Path) -> dict[str, Any]:
+_PRODUCER_DIGEST_FIELDS = ("runtime_source_manifest_sha256", "overlay_sha256")
+_PRODUCER_RECEIPT_SCHEMA = "aic_fpm_producer_receipt"
+
+
+def _glm_contract(cell: FPMCell) -> bool:
+    """Whether the cell's execution identity selects the GLM-5.3-Flash producer contract.
+
+    The rule of ``_validate_execution_provenance``: a configuration hash, and the Engram residency ``none``.
+    """
+    if not cell.execution_identity[0]:
+        return False
+    return dict(zip(EXECUTION_COLUMNS, cell.execution_identity, strict=True))["engram_residency"] == "none"
+
+
+def write_producer_receipt(cell: FPMCell, cell_dir: Path, *, plan_sha256: str, attempt_id: str) -> Path | None:
+    """Write the producer receipt of a cell whose rank artifacts passed the strict comparison of this checkout.
+
+    The receipt binds the plan, the cell and the Collector attempt to the two digests of ``_glm_producer_record``, the
+    record that the comparison used; they are never copied from an artifact. A later read of the cell takes the two
+    digests from the receipt (``_producer_receipt``), so a later change of the producer files keeps the cell readable.
+    A cell without the GLM-5.3-Flash producer contract gets no receipt, and None is returned.
+    """
+    if not _glm_contract(cell):
+        return None
+    record = _glm_producer_record()
+    receipt = {
+        "attempt_id": attempt_id,
+        "cell_id": cell.cell_id,
+        "plan_sha256": plan_sha256,
+        "producer": {field: record[field] for field in _PRODUCER_DIGEST_FIELDS},
+        "schema_name": _PRODUCER_RECEIPT_SCHEMA,
+        "schema_version": 1,
+    }
+    path = cell_dir / PRODUCER_RECEIPT_FILENAME
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+    os.replace(temporary, path)
+    return path
+
+
+def _producer_receipt(cell: FPMCell, raw_root: Path, *, plan_sha256: str, attempt_id: str) -> dict[str, str] | None:
+    """The two producer digests of the receipt in the cell folder of ``raw_root``, or None when it holds none.
+
+    A receipt that is no regular file, is malformed, or names another plan, cell or attempt is refused.
+    """
+    path = raw_root.parent / PRODUCER_RECEIPT_FILENAME
+    if not path.exists() and not path.is_symlink():
+        return None
+    invalid = ValueError(f"invalid producer receipt: {path}")
+    if path.is_symlink() or not path.is_file():
+        raise invalid
+    try:
+        receipt = json.loads(path.read_text())
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise invalid from None
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != {"attempt_id", "cell_id", "plan_sha256", "producer", "schema_name", "schema_version"}
+        or receipt["schema_name"] != _PRODUCER_RECEIPT_SCHEMA
+        or type(receipt["schema_version"]) is not int
+        or receipt["schema_version"] != 1
+        or not isinstance(receipt["producer"], dict)
+        or set(receipt["producer"]) != set(_PRODUCER_DIGEST_FIELDS)
+        or not all(_is_hex(receipt["producer"][field], 64) for field in _PRODUCER_DIGEST_FIELDS)
+    ):
+        raise invalid
+    if (receipt["plan_sha256"], receipt["cell_id"], receipt["attempt_id"]) != (plan_sha256, cell.cell_id, attempt_id):
+        raise ValueError(f"producer receipt names another plan, cell or attempt: {path}")
+    return {field: receipt["producer"][field] for field in _PRODUCER_DIGEST_FIELDS}
+
+
+def _validate_glm_provenance(
+    cell: FPMCell, payload: dict[str, Any], path: Path, *, producer_digests: dict[str, str] | None = None
+) -> dict[str, Any]:
     """Require the evidence that the GLM-5.3-Flash vLLM producer writes beside its graph-timed measurements.
 
     The producer builds every prefix and decode state from seeded tokens through vLLM's own scheduler, repeats each
     point and keeps the evidence of the repetitions in a sidecar file next to the artifact. Its ``producer`` record
     must equal the record of the supported producer (``_glm_producer_record``). A refusal names the first item that is
-    absent or malformed. The caller has already checked that the rows are mappings with mapping points.
+    absent or malformed. ``producer_digests``, the two digests of the cell's producer receipt, replace the two digests
+    of that record. The caller has already checked that the rows are mappings with mapping points.
     """
 
     def lacks(field: str) -> ValueError:
@@ -420,7 +503,7 @@ def _validate_glm_provenance(cell: FPMCell, payload: dict[str, Any], path: Path)
         raise ValueError(
             f"native GLM-5.3-Flash result lacks valid producer: expected a mapping, found {producer!r}: {path}"
         )
-    expected_producer = _glm_producer_record()
+    expected_producer = {**_glm_producer_record(), **(producer_digests or {})}
     for key, value in expected_producer.items():
         if not _same(producer.get(key), value):
             raise ValueError(
@@ -564,7 +647,7 @@ def _validate_collector_provenance(
     *,
     expected_plan_sha256: str | None,
     expected_attempt_id: str | None,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     pod_names = set()
     for path, _payload in rank_payloads:
         relative = path.relative_to(raw_root)
@@ -620,7 +703,7 @@ def _validate_collector_provenance(
             raise ValueError(f"Collector provenance differs across pods: {path}")
 
     assert canonical is not None
-    return str(canonical["runtime"]["backend_version"]), str(canonical["attempt_id"])
+    return str(canonical["runtime"]["backend_version"]), str(canonical["attempt_id"]), str(canonical["plan_sha256"])
 
 
 def _require_int(point: dict[str, Any], key: str) -> int:
@@ -870,12 +953,17 @@ def validate_native_collection(
     rank_payloads = _rank_artifacts(raw_root)
     if not rank_payloads:
         raise ValueError(f"integrated runtime emitted no benchmark results for {cell.cell_id}")
-    backend_version, collector_attempt_id = _validate_collector_provenance(
+    backend_version, collector_attempt_id, collector_plan_sha256 = _validate_collector_provenance(
         cell,
         raw_root,
         rank_payloads,
         expected_plan_sha256=expected_plan_sha256,
         expected_attempt_id=expected_attempt_id,
+    )
+    producer_digests = (
+        _producer_receipt(cell, raw_root, plan_sha256=collector_plan_sha256, attempt_id=collector_attempt_id)
+        if _glm_contract(cell)
+        else None
     )
     expected_ranks = list(range(cell.topology.dp))
     seen_ranks: set[int] = set()
@@ -926,7 +1014,7 @@ def validate_native_collection(
             raise ValueError(f"native result is missing coverage/results/iteration_groups: {path}")
         if any(not isinstance(row, dict) or not isinstance(row.get("point"), dict) for row in rows):
             raise ValueError(f"native result has malformed result points: {path}")
-        evidence = _validate_execution_provenance(cell, payload, path)
+        evidence = _validate_execution_provenance(cell, payload, path, producer_digests=producer_digests)
         # The validation above has proven that the artifact's mode is the mode of the cell's contract.
         execution_mode = payload.get("execution_mode") if evidence is not None else None
         if execution_mode == "eager":

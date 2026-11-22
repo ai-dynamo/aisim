@@ -57,7 +57,12 @@ from .glm53flash_points import (
     glm_measured_context,
     glm_smoke_subset,
 )
-from .native_artifact import COLLECTOR_PROVENANCE_FILENAME, validate_native_collection
+from .native_artifact import (
+    COLLECTOR_PROVENANCE_FILENAME,
+    PRODUCER_RECEIPT_FILENAME,
+    validate_native_collection,
+    write_producer_receipt,
+)
 from .planner import FPMCell, FPMCollectionPlan
 from .runtime.fpm_memory_observer import (
     EXECUTION_SUPPORTED_VERSIONS,
@@ -2089,6 +2094,17 @@ def _recover_completed_attempt(
             )
             return None
 
+    try:
+        write_producer_receipt(cell, cell_dir, plan_sha256=plan.sha256, attempt_id=attempt_id)
+    except OSError as error:
+        logger.info(
+            "FPM cell %s (status=%s) is not recoverable from local artifacts: %s",
+            cell.cell_id,
+            status,
+            error,
+        )
+        return None
+
     recovered = dict(entry)
     original_error = {key: recovered.pop(key) for key in ("error_type", "error") if key in recovered}
     recovered.update(
@@ -2440,6 +2456,8 @@ def _run_collection_impl(
         for stale_dir in (cell_dir / "raw", cell_dir / "logs"):
             if stale_dir.exists():
                 shutil.rmtree(stale_dir)
+        # A producer receipt vouches only for the artifacts of the attempt that wrote it.
+        (cell_dir / PRODUCER_RECEIPT_FILENAME).unlink(missing_ok=True)
         _atomic_json(cell_dir / "cell.json", cell.to_dict())
         cell_started = time.monotonic()
         # Collector-side phase segmentation for the run manifest (R16 §3):
@@ -2568,6 +2586,7 @@ def _run_collection_impl(
                 expected_plan_sha256=plan.sha256,
                 expected_attempt_id=attempt_id,
             )
+            write_producer_receipt(cell, cell_dir, plan_sha256=plan.sha256, attempt_id=attempt_id)
             checkpoint["cells"][cell.cell_id] = {
                 **base_record,
                 "status": "passed",

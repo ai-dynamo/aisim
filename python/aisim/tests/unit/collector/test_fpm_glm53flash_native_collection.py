@@ -1158,6 +1158,231 @@ def test_glm_producer_record_digests_are_those_of_the_shipped_producer_files():
     assert record["vllm_package_version"] == "0.33.0"
 
 
+def _receipt(cell_dir: Path, cell: FPMCell, **changes) -> Path:
+    """Write a producer receipt for the test cell, with ``changes`` applied to its top-level keys."""
+    receipt = {
+        "schema_name": "aic_fpm_producer_receipt",
+        "schema_version": 1,
+        "plan_sha256": PLAN_SHA256,
+        "cell_id": cell.cell_id,
+        "attempt_id": ATTEMPT_ID,
+        "producer": {"runtime_source_manifest_sha256": "a" * 64, "overlay_sha256": "b" * 64},
+        **changes,
+    }
+    path = cell_dir / "producer-receipt.json"
+    path.write_text(json.dumps(receipt))
+    return path
+
+
+def _cell_of_another_producer_revision(tmp_path: Path) -> FPMCell:
+    """A prefill cell whose artifact names the producer digests "a" * 64 and "b" * 64, not those of this checkout."""
+    cell = glm_cell("prefill")
+    payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
+    payload["producer"].update(runtime_source_manifest_sha256="a" * 64, overlay_sha256="b" * 64)
+    write_glm_rank(_pod(tmp_path, cell), payload)
+    return cell
+
+
+def test_reader_without_a_receipt_keeps_the_rule_of_the_reading_checkout(tmp_path):
+    cell = _cell_of_another_producer_revision(tmp_path)
+    with pytest.raises(ValueError) as refusal:
+        _validate(tmp_path, cell)
+    text = str(refusal.value)
+    assert text.startswith(
+        "native GLM-5.3-Flash result lacks valid producer.runtime_source_manifest_sha256: expected '"
+    ), text
+    assert "found 'aaaa" in text
+
+
+def test_reader_takes_the_producer_digests_of_a_receipt(tmp_path):
+    cell = _cell_of_another_producer_revision(tmp_path)
+    _receipt(tmp_path, cell)
+    assert len(_validate(tmp_path, cell).points) == 2
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"plan_sha256": "0" * 64}, {"cell_id": "fpm-other"}, {"attempt_id": "a2"}],
+    ids=["plan", "cell", "attempt"],
+)
+def test_receipt_of_another_plan_cell_or_attempt_is_refused(tmp_path, change):
+    cell = _cell_of_another_producer_revision(tmp_path)
+    path = _receipt(tmp_path, cell, **change)
+    with pytest.raises(ValueError) as refusal:
+        _validate(tmp_path, cell)
+    assert str(refusal.value) == f"producer receipt names another plan, cell or attempt: {path}"
+
+
+def _write_receipt_text(text: str):
+    def write(cell_dir: Path, _cell: FPMCell) -> None:
+        (cell_dir / "producer-receipt.json").write_text(text)
+
+    return write
+
+
+def _write_receipt_without(key: str):
+    def write(cell_dir: Path, cell: FPMCell) -> None:
+        path = _receipt(cell_dir, cell)
+        receipt = json.loads(path.read_text())
+        del receipt[key]
+        path.write_text(json.dumps(receipt))
+
+    return write
+
+
+def _write_receipt_with(**changes):
+    def write(cell_dir: Path, cell: FPMCell) -> None:
+        _receipt(cell_dir, cell, **changes)
+
+    return write
+
+
+def _write_receipt_symlink(cell_dir: Path, cell: FPMCell) -> None:
+    outside = cell_dir / "outside"
+    outside.mkdir()
+    target = _receipt(outside, cell)
+    (cell_dir / "producer-receipt.json").symlink_to(target)
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        _write_receipt_text("[]"),
+        _write_receipt_text("{"),
+        _write_receipt_without("attempt_id"),
+        _write_receipt_with(note="added"),
+        _write_receipt_with(schema_version="1"),
+        _write_receipt_with(schema_version=True),
+        _write_receipt_with(schema_name="other"),
+        _write_receipt_with(producer={"runtime_source_manifest_sha256": "a" * 63, "overlay_sha256": "b" * 64}),
+        _write_receipt_with(producer={"runtime_source_manifest_sha256": "A" * 64, "overlay_sha256": "b" * 64}),
+        _write_receipt_with(
+            producer={"runtime_source_manifest_sha256": "a" * 64, "overlay_sha256": "b" * 64, "note": "added"}
+        ),
+        _write_receipt_with(producer=[]),
+        _write_receipt_symlink,
+    ],
+    ids=[
+        "list",
+        "no-json",
+        "no-attempt-id",
+        "added-key",
+        "version-string",
+        "version-bool",
+        "other-schema",
+        "short-digest",
+        "upper-case-digest",
+        "producer-added-key",
+        "producer-list",
+        "symlink",
+    ],
+)
+def test_malformed_receipt_is_refused(tmp_path, write):
+    cell = _cell_of_another_producer_revision(tmp_path)
+    write(tmp_path, cell)
+    path = tmp_path / "producer-receipt.json"
+    with pytest.raises(ValueError) as refusal:
+        _validate(tmp_path, cell)
+    assert str(refusal.value) == f"invalid producer receipt: {path}"
+
+
+def test_receipt_leaves_the_other_producer_fields_to_the_reader(tmp_path):
+    cell = glm_cell("prefill")
+    payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
+    payload["producer"].update(runtime_source_manifest_sha256="a" * 64, overlay_sha256="b" * 64, warmup_repeats=6)
+    write_glm_rank(_pod(tmp_path / "warmup", cell), payload)
+    _receipt(tmp_path / "warmup", cell)
+    with pytest.raises(ValueError) as refusal:
+        _validate(tmp_path / "warmup", cell)
+    assert "lacks valid producer.warmup_repeats: expected 5, found 6" in str(refusal.value)
+
+    payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
+    payload["producer"].update(runtime_source_manifest_sha256="c" * 64, overlay_sha256="c" * 64)
+    write_glm_rank(_pod(tmp_path / "digests", cell), payload)
+    _receipt(tmp_path / "digests", cell)
+    with pytest.raises(ValueError) as refusal:
+        _validate(tmp_path / "digests", cell)
+    assert "lacks valid producer.runtime_source_manifest_sha256: expected 'aaaa" in str(refusal.value)
+
+
+def test_receipt_is_not_read_for_a_cell_without_the_producer_contract(tmp_path):
+    # The artifact of test_v41_artifacts_keep_their_contract, with a receipt that no reader of the GLM-5.3-Flash
+    # producer contract would accept in its cell folder.
+    identity = ("c" * 64, "full", "hbm_tp_sharded", "text")
+    cell = replace(_cell(phase="prefill", strategy="pure_tp"), execution_identity=identity, input_text_sha256="a" * 64)
+    payload = _native_payload(phase="prefill", rank=0, dp=1)
+    payload.update(
+        execution_identity=dict(zip(EXECUTION_COLUMNS, identity, strict=True)),
+        execution_mode="eager",
+        input_provenance={
+            "source": "tokenizer_text",
+            "text_sha256": "a" * 64,
+            "token_ids_sha256": "b" * 64,
+            "tokenizer_revision": "pinned",
+            "token_count": 100,
+            "unique_token_count": 20,
+        },
+    )
+    (_pod(tmp_path, cell) / "benchmark.json").write_text(json.dumps(payload))
+    (tmp_path / "producer-receipt.json").write_text("[]")
+    with pytest.raises(ValueError, match="V4.1 native result lacks token-stream manifest"):
+        _validate(tmp_path, cell)
+
+
+def test_no_receipt_is_written_for_a_cell_without_the_producer_contract(tmp_path):
+    written = native_artifact.write_producer_receipt(
+        _cell(phase="prefill"), tmp_path, plan_sha256=PLAN_SHA256, attempt_id=ATTEMPT_ID
+    )
+    assert written is None
+    assert not (tmp_path / "producer-receipt.json").exists()
+
+
+def test_campaign_with_receipts_is_read_after_the_producer_files_change(tmp_path, monkeypatch):
+    shape = _glm_producer_shape(tmp_path)
+    cell = glm_cell("prefill")
+    payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
+    shape("prefill", payload)
+    write_glm_rank(_pod(tmp_path / "prefill", cell), payload)
+    receipt = native_artifact.write_producer_receipt(
+        cell, tmp_path / "prefill", plan_sha256=PLAN_SHA256, attempt_id=ATTEMPT_ID
+    )
+    assert receipt == tmp_path / "prefill" / "producer-receipt.json"
+    assert json.loads(receipt.read_text()) == {
+        "attempt_id": ATTEMPT_ID,
+        "cell_id": cell.cell_id,
+        "plan_sha256": PLAN_SHA256,
+        "producer": {
+            "overlay_sha256": hashlib.sha256(
+                (PRODUCER_DIR / "glm53flash_prefix_scheduler.py").read_bytes()
+            ).hexdigest(),
+            "runtime_source_manifest_sha256": hashlib.sha256(
+                (PRODUCER_DIR / "runtime-source-sha256.json").read_bytes()
+            ).hexdigest(),
+        },
+        "schema_name": "aic_fpm_producer_receipt",
+        "schema_version": 1,
+    }
+
+    # A later revision of the producer: one more line in the scheduler file of the reading checkout.
+    later = tmp_path / "later"
+    later.mkdir()
+    for name in ("glm53flash_prefix_scheduler.py", "runtime-source-sha256.json"):
+        shutil.copyfile(PRODUCER_DIR / name, later / name)
+    with (later / "glm53flash_prefix_scheduler.py").open("ab") as scheduler:
+        scheduler.write(b"\n# a later revision\n")
+    monkeypatch.setattr(native_artifact, "_GLM_RUNTIME", later)
+    native_artifact._glm_producer_record.cache_clear()
+    try:
+        assert len(_validate(tmp_path / "prefill", cell).points) == 2
+        rows = database.aggregate_cell(_glm_plan(), cell, tmp_path / "prefill", expected_attempt_id=ATTEMPT_ID)
+        assert len(rows) == 2
+        receipt.unlink()
+        with pytest.raises(ValueError, match=r"lacks valid producer\.overlay_sha256"):
+            _validate(tmp_path / "prefill", cell)
+    finally:
+        native_artifact._glm_producer_record.cache_clear()
+
+
 def test_glm_producer_vllm_must_be_the_collection_runtime(tmp_path):
     # The producer and the record are those of vLLM 0.33.0, and the Collector provenance binds the launch to 0.33.1.
     cell = glm_cell("prefill")
