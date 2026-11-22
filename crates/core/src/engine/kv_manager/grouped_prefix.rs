@@ -782,6 +782,50 @@ pub(crate) fn remaining_bytes(
         .fold(0, u64::saturating_add)
 }
 
+/// `GroupedPrefixCoordinator::destination_admission_blocks` in byte mode,
+/// which keeps no blocks and finds no local hit: the bytes of vLLM's
+/// whole-prompt test for a decode rank that loads `loaded` of the `tokens`
+/// prompt tokens of a request without blocks (V31 `mgr:519-536`, V32
+/// `mgr:522-539`, v0.33 `mgr:531-548`). Each group that is not a state group
+/// counts `page_size_bytes` for each block up to `cdiv(tokens, B)`. A group
+/// with a sliding window counts up to the admission cap and leaves out the
+/// whole blocks below the window of the loaded tokens, so it can count 0
+/// (V31 `single:216-251`, `:1185-1188`, V32 `single:213-248`, `:1167-1170`,
+/// v0.33 `single:214-249`, `:1180-1183`). As in `remaining_bytes`, that is a
+/// sliding-window attention group or a convolution group. The state groups
+/// count `state_bytes`, their fixed blocks, for a request with tokens.
+pub(crate) fn destination_admission_bytes(
+    groups: &[FpmCacheGroup],
+    state_bytes: u64,
+    loaded: usize,
+    tokens: usize,
+    limits: AdmissionLimits,
+) -> u64 {
+    groups
+        .iter()
+        .filter(|group| group.kind != FpmCacheKind::State)
+        .map(|group| {
+            let block = group.block_size_tokens as usize;
+            let mut required = tokens.div_ceil(block);
+            let mut skipped = 0;
+            if let Some(window) = group.sliding_window {
+                let window = window as usize;
+                required = required.min(window_admission_blocks(
+                    window,
+                    block,
+                    limits.max_in_flight_tokens,
+                    limits.max_model_len,
+                ));
+                skipped = loaded.saturating_sub(window - 1) / block;
+            }
+            (required.saturating_sub(skipped) as u64).saturating_mul(group.page_size_bytes)
+        })
+        .fold(
+            if tokens == 0 { 0 } else { state_bytes },
+            u64::saturating_add,
+        )
+}
+
 /// The first end, a multiple of `step` at most `max`, with `needed`
 /// contiguous resident blocks before it, or with every block from 0, and the
 /// run length (`single:960-1069`). `resident(i)` tells whether block `i`

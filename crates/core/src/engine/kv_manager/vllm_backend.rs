@@ -26,7 +26,7 @@ use super::AllocationRequirement;
 use super::grouped::{GroupedBlockPool, GroupedKvPool, GroupedLease};
 use super::grouped_prefix::{
     AdmissionLimits, GroupedHit, GroupedPrefixCoordinator, GroupedPrefixRules, StoredGroupedHit,
-    remaining_bytes,
+    destination_admission_bytes, remaining_bytes,
 };
 use super::grouped_transfer::GroupedTransferRules;
 use super::state_cache_manager::{StateCacheManager, StateRequest};
@@ -2386,12 +2386,19 @@ impl VllmKvManager {
             }
             None => {
                 let free = grouped.capacity_bytes() - grouped.used_bytes();
-                let (Some(prompt_bytes), Some(load_bytes)) = (
-                    grouped.required_bytes(transfer, prompt),
-                    grouped.required_bytes(transfer, transfer),
-                ) else {
+                let limits = self
+                    .grouped_limits
+                    .expect("the limits are set for every grouped rank");
+                let Some(load_bytes) = grouped.required_bytes(transfer, transfer) else {
                     return VllmAcquire::CapacityExhausted;
                 };
+                let prompt_bytes = destination_admission_bytes(
+                    grouped.groups(),
+                    grouped.fixed_request_bytes(),
+                    transfer,
+                    prompt,
+                    limits,
+                );
                 if prompt_bytes > free
                     || load_bytes
                         .saturating_add(self.grouped_inflight_need)
@@ -2408,9 +2415,6 @@ impl VllmKvManager {
                     grouped_lease.expect("a successful allocation sets the lease");
                 // The same count in bytes, where a state group holds its
                 // fixed blocks already.
-                let limits = self
-                    .grouped_limits
-                    .expect("the limits are set for every grouped rank");
                 grouped_lease.first_pass_need =
                     remaining_bytes(grouped.groups(), transfer, prompt, limits);
                 (grouped_lease, None, full_blocks)
@@ -2471,8 +2475,10 @@ impl VllmKvManager {
     /// window group needs the blocks inside the window of the first token
     /// that the decode rank computes, and a full-attention group every block
     /// of the prompt. `reserve_grouped_destination` checks the free capacity
-    /// for the same prompt, with its local hit. `None` without a grouped
-    /// cache.
+    /// for the same prompt, with its local hit, and caps a window group at
+    /// its admission blocks there. This count has no cap: it is also the
+    /// forward of the backoff tokens after the load, which the whole pool
+    /// must hold. `None` without a grouped cache.
     pub(crate) fn grouped_destination_required_bytes(&self, prompt_tokens: usize) -> Option<u64> {
         let grouped = self.grouped.as_ref()?;
         let rules = self

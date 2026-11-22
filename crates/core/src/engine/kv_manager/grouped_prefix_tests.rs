@@ -1588,6 +1588,82 @@ fn remaining_bytes_saturate_without_limits() {
 }
 
 #[test]
+fn destination_admission_bytes_equal_the_blocks_of_block_mode() {
+    // Full attention, a window of 33 tokens and a state, with 16-token blocks
+    // and one batch of 32 tokens: the window cap is cdiv(32 + 32, 16) + 1 = 5
+    // blocks (V31 `iface:859-866`, V32 `iface:878-885`, v0.33
+    // `iface:937-944`). A decode rank loads 160 of 161 prompt tokens with no
+    // local hit. vLLM's whole-prompt test counts cdiv(161, 16) = 11
+    // full-attention blocks, max(min(11, 5) - floor((160 - 32) / 16), 0) =
+    // max(5 - 8, 0) = 0 window blocks (V31 `single:216-251`, V32
+    // `single:213-248`, v0.33 `single:214-249`) and 1 state block: 12.
+    let page = 100;
+    let groups = [
+        attention("full", 16, None),
+        attention("window", 16, Some(33)),
+        state("s", 16, true, false),
+    ]
+    .map(|group| FpmCacheGroup {
+        page_size_bytes: page,
+        ..group
+    });
+    let limits = AdmissionLimits {
+        max_in_flight_tokens: 32,
+        max_model_len: 200_000,
+    };
+    let bytes = |loaded: usize, tokens: usize| {
+        // Byte mode keeps the state groups apart, as one fixed charge.
+        let pool = GroupedKvPool::new(groups.to_vec(), 64 * page);
+        destination_admission_bytes(
+            pool.groups(),
+            pool.fixed_request_bytes(),
+            loaded,
+            tokens,
+            limits,
+        )
+    };
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
+        let rules = GroupedPrefixRules::new(&groups, 16, version).unwrap();
+        let coordinator = GroupedPrefixCoordinator::new(rules, limits);
+        let mut kv = GroupedKvPool::with_prefix_cache(groups.to_vec(), 64 * page, page);
+        let pool = kv.block_pool_mut().unwrap();
+        let blocks = |loaded: usize, tokens: usize| {
+            coordinator.destination_admission_blocks(pool, &coordinator.empty_hit(), loaded, tokens)
+        };
+        // 11 + 0 + 1 blocks of 100 bytes.
+        assert_eq!(bytes(160, 161), 1_200);
+        assert_eq!(blocks(160, 161), 12);
+        // The cap binds and the window is not skipped past it: loaded 96 of 97 counts cdiv(97, 16) = 7 full-attention
+        // blocks, min(7, 5) - floor((96 - 32) / 16) = 5 - 4 = 1 window block
+        // and 1 state block: 9.
+        assert_eq!(bytes(96, 97), 900);
+        assert_eq!(blocks(96, 97), 9);
+        // Below the cap: loaded 32 of 33 counts
+        // cdiv(33, 16) = 3 full-attention blocks, min(3, 5) - 0 = 3 window
+        // blocks and 1 state block: 7.
+        assert_eq!(bytes(32, 33), 700);
+        assert_eq!(blocks(32, 33), 7);
+        // The window of the loaded tokens, not of the prompt, sets the skipped blocks: loaded 47 of 48 counts
+        // cdiv(48, 16) = 3 full-attention blocks, min(3, 5) -
+        // floor((47 - 32) / 16) = 3 - 0 = 3 window blocks and 1 state block:
+        // 7.
+        assert_eq!(bytes(47, 48), 700);
+        assert_eq!(blocks(47, 48), 7);
+    }
+    // A request of no tokens holds no block, so it counts no state bytes.
+    assert_eq!(bytes(0, 0), 0);
+    // A state group in the list counts only through its fixed bytes.
+    assert_eq!(
+        destination_admission_bytes(&groups, page, 160, 161, limits),
+        1_200
+    );
+}
+
+#[test]
 fn state_group_hits_only_at_a_kept_boundary() {
     // single:1487-1564 scans aligned ends right to left for one cached
     // state block. pool:198-224: every group of the spec group must hold

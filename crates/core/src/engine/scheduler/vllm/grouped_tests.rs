@@ -3597,6 +3597,107 @@ fn grouped_destination_caps_the_first_pass_need_of_a_window_group() {
     }
 }
 
+fn full_window_and_state_transfer_groups() -> Vec<FpmCacheGroup> {
+    let mut full = group("full", 16, 100, None);
+    full.prefix_cacheable = Some(true);
+    full.transfer_bytes_per_block = Some(100);
+    let mut window = group("window", 16, 100, Some(33));
+    window.prefix_cacheable = Some(true);
+    window.transfer_bytes_per_block = Some(100);
+    let mut recurrent = state("state", 100, 1);
+    recurrent.block_size_tokens = 16;
+    recurrent.prefix_cacheable = Some(true);
+    recurrent.transfer_bytes_per_block = Some(100);
+    vec![full, window, recurrent]
+}
+
+#[test]
+fn grouped_destination_in_byte_mode_caps_the_whole_prompt_of_a_window_group() {
+    // Full attention, a window of 33 tokens and a state, with 16-token blocks
+    // and 100-byte pages, and one batch of 32 tokens: the window cap is
+    // cdiv(32 + 32, 16) + 1 = 5 blocks (V31
+    // `vllm/v1/kv_cache_interface.py:859-866`, V32 `:878-885`, v0.33
+    // `:937-944`). A first load of 33 of 34 tokens holds 3 attention pages, 3
+    // window pages and the state page, 700 bytes, and its first pass opens no
+    // block, so 1,400 of the 2,100 bytes are free. A distinct prompt of 161
+    // tokens loads 160. Its load needs cdiv(160, 16) = 10 attention pages,
+    // the 10 - floor((160 - 32) / 16) = 2 window pages and the state page:
+    // 1,300 bytes. vLLM's whole-prompt test counts cdiv(161, 16) = 11
+    // attention pages, max(min(11, 5) - 8, 0) = 0 window pages and the state
+    // page: 1,200 bytes (V31
+    // `vllm/v1/core/single_type_kv_cache_manager.py:216-251`, V32 `:213-248`,
+    // v0.33 `:214-249`). Both fit the 1,400 free bytes, so the load is
+    // reserved. Without the cap the whole prompt would count 11 - 8 = 3
+    // window pages, 1,500 bytes, and wait.
+    let mut core = pd_core(
+        full_window_and_state_transfer_groups(),
+        2_100,
+        32,
+        WorkerType::Decode,
+        None,
+    );
+    let first = HandoffId::new(Uuid::from_u128(1791));
+    // cdiv(33, 16) = 3 missing full-attention blocks.
+    assert_eq!(
+        reserve_grouped(&mut core, first, pd_request(1790, 34, 2)),
+        Some(3)
+    );
+    assert_eq!(core.kv_manager.grouped_inflight_need(), 0);
+    assert_eq!(grouped_pool(&core).used_bytes(), 700);
+    let second = HandoffId::new(Uuid::from_u128(1793));
+    let request = DirectRequest {
+        tokens: (1_000..1_161).collect(),
+        ..pd_request(1792, 0, 2)
+    };
+    // cdiv(160, 16) = 10 missing full-attention blocks.
+    assert_eq!(reserve_grouped(&mut core, second, request), Some(10));
+    // 700 + 1,300 bytes.
+    assert_eq!(grouped_pool(&core).used_bytes(), 2_000);
+}
+
+#[test]
+fn grouped_destination_in_byte_mode_rejects_a_prompt_whose_first_pass_cannot_fit() {
+    // The profile and the prompt of 161 tokens of
+    // grouped_destination_in_byte_mode_caps_the_whole_prompt_of_a_window_group:
+    // the whole prompt counts 1,200 bytes with the window cap and the load
+    // 1,300 bytes. The first pass computes token 161 on top of the 160 loaded
+    // tokens, and its forward holds 11 attention pages, the 11 - 8 = 3 window
+    // pages and the state page: 1,500 bytes. A pool below that forward can
+    // never run the request, also where the capped whole prompt and the load
+    // fit, so it is refused. A pool that holds the forward reserves the load.
+    let reserve = |capacity: u64| {
+        let mut core = pd_core(
+            full_window_and_state_transfer_groups(),
+            capacity,
+            32,
+            WorkerType::Decode,
+            None,
+        );
+        let handoff_id = HandoffId::new(Uuid::from_u128(1795));
+        let reserved = core.apply_command_effects(
+            SchedulerCommand::ReserveDestination {
+                handoff_id,
+                request: pd_request(1794, 161, 2),
+            },
+            true,
+        );
+        reserved
+            .map(|effects| reserved_units(&effects.lifecycle_events, handoff_id))
+            .map_err(|error| error.to_string())
+    };
+    for capacity in [1_200, 1_300, 1_499] {
+        assert_eq!(
+            reserve(capacity),
+            Err("destination prompt and state exceed the grouped KV pool capacity".to_string()),
+            "{capacity}"
+        );
+    }
+    for capacity in [1_500, 1_600] {
+        // cdiv(160, 16) = 10 missing full-attention blocks.
+        assert_eq!(reserve(capacity), Ok(Some(10)), "{capacity}");
+    }
+}
+
 #[test]
 fn grouped_destination_in_byte_mode_waits_for_its_whole_prompt_with_no_load_in_flight() {
     // Six pages of 100 bytes in byte mode. The first load of 32 tokens holds
