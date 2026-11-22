@@ -2795,7 +2795,7 @@ def _plan_reason(files):
             "unmarked_group",
             "grouped FPM cache prefix caching requires every cache group to declare prefix_cacheable; "
             "set prefix_cacheable (true or false) on each cache group of a hand-made profile, or import the runtime "
-            "probe again for a profile that the import wrote",
+            "probe again for a profile that was imported before the import wrote this field",
         ),
         (
             "convolution_group",
@@ -2901,12 +2901,178 @@ def test_grouped_plan_saved_before_the_reason_field_still_verifies(grouped_case,
     assert json.loads((plan / "support-plan.json").read_text())["fpm"]["prefix_caching_reason"].startswith(_COLD)
 
 
+def _set_saved_reason(plan, value):
+    """Write a saved plan whose recorded reason is ``value``; every other byte is that of the planner."""
+    path = plan / "support-plan.json"
+    saved = json.loads(path.read_text())
+    saved["fpm"]["prefix_caching_reason"] = value
+    path.write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n")
+
+
+def _unmarked_cold_plan(grouped_case, tmp_path, capsys):
+    profile, _root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version="0.31.0")
+    for deployment in profile["deployments"]:
+        del deployment["resources"]["cache_groups"][1]["prefix_cacheable"]
+    _onboarding_plan(profile, tmp_path, capsys, "0.31.0")
+    plan = tmp_path / "collection"
+    return plan, SupportRequest.from_yaml(plan / "request.yaml")
+
+
+@reads_saved_config
+@pytest.mark.parametrize(
+    "text",
+    [
+        # The texts that earlier releases recorded for this profile, and any other text.
+        _COLD + "grouped FPM cache prefix caching requires every cache group to declare prefix_cacheable; "
+        "set prefix_cacheable (true or false) on each cache group of the profile",
+        _COLD + "grouped FPM cache prefix caching requires every cache group to declare prefix_cacheable; "
+        "set prefix_cacheable (true or false) on each cache group of a hand-made profile, or import the runtime "
+        "probe again for a profile that the import wrote",
+        "Another text.",
+        "",
+    ],
+)
+def test_grouped_cold_plan_verifies_with_the_reason_text_that_it_was_saved_with(
+    grouped_case, tmp_path, capsys, monkeypatch, text
+):
+    # The recorded reason explains why the plan is cold. The plan check compares the decision, not these words, so a
+    # later change of a requirement message does not refuse saved work.
+    from aisim.support import collection_readiness, finalization
+    from aisim.support.plan import check_plan
+
+    plan, request = _unmarked_cold_plan(grouped_case, tmp_path, capsys)
+    _set_saved_reason(plan, text)
+    before = (plan / "support-plan.json").read_bytes()
+    check_plan(request, plan)
+
+    def reached(*_args, **_kwargs):
+        raise ValueError("reached the step after the plan check")
+
+    monkeypatch.setattr(collection_readiness, "assess_readiness", reached)
+    monkeypatch.setattr(finalization, "_verify_collection", reached)
+    config = tmp_path / "request.yaml"
+    collect = ["onboard", "collect-fpm", "--config", str(config), "--output-dir", str(plan), "--check-readiness"]
+    finalize = ["onboard", "finalize", "--config", str(config), "--output-dir", str(plan)]
+    for command in (collect, [*finalize, "--resolved-output-dir", str(tmp_path / "r")]):
+        capsys.readouterr()
+        with pytest.raises(SystemExit):
+            cli.main(command)
+        assert "reached the step after the plan check" in capsys.readouterr().err
+    assert (plan / "support-plan.json").read_bytes() == before
+
+
+@reads_saved_config
+@pytest.mark.parametrize("value", [None, 0, ["text"], {"text": "text"}])
+def test_grouped_cold_plan_with_a_recorded_reason_that_is_not_a_string_is_refused(
+    grouped_case, tmp_path, capsys, value
+):
+    from aisim.support.plan import check_plan
+
+    plan, request = _unmarked_cold_plan(grouped_case, tmp_path, capsys)
+    _set_saved_reason(plan, value)
+    with pytest.raises(ValueError, match="support-plan.json was modified; choose a new output directory"):
+        check_plan(request, plan)
+
+
+def _leaves(value, path=()):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from _leaves(item, (*path, key))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from _leaves(item, (*path, index))
+    else:
+        yield path, value
+
+
+def _edited(value):
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, (int, float)):
+        return value + 1
+    if value is None:
+        return "edited"
+    return value + " edited"
+
+
+@reads_saved_config
+def test_grouped_cold_plan_with_another_reason_text_still_compares_every_other_field(grouped_case, tmp_path, capsys):
+    # Each edit of another field is refused with the same error whether the plan holds its own reason text or another.
+    from aisim.support.plan import check_plan
+
+    plan, request = _unmarked_cold_plan(grouped_case, tmp_path, capsys)
+    path = plan / "support-plan.json"
+    own = path.read_bytes()
+    check_plan(request, plan)
+    _set_saved_reason(plan, "Another text.")
+    check_plan(request, plan)
+    edits = 0
+    for location, value in _leaves(json.loads(own)):
+        if location == ("fpm", "prefix_caching_reason"):
+            continue
+        errors = []
+        for text in (None, "Another text."):
+            saved = json.loads(own)
+            if text is not None:
+                saved["fpm"]["prefix_caching_reason"] = text
+            parent = saved
+            for key in location[:-1]:
+                parent = parent[key]
+            parent[location[-1]] = _edited(value)
+            path.write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n")
+            with pytest.raises(ValueError) as error:
+                check_plan(request, plan)
+            errors.append(str(error.value))
+        assert errors[0] == errors[1], location
+        edits += 1
+    path.write_bytes(own)
+    assert edits > 30
+
+
+@reads_saved_config
+@pytest.mark.parametrize("kind", ["warm", "linear", "no_profile"])
+def test_a_recorded_reason_on_a_plan_that_records_none_is_refused(grouped_case, tmp_path, capsys, kind):
+    from aisim.support.plan import check_plan
+
+    profile, _root = grouped_case
+    if kind == "warm":
+        _onboarding_plan(
+            _with_prefix_evidence(_with_state_group(profile), version="0.31.0"), tmp_path, capsys, "0.31.0"
+        )
+    elif kind == "linear":
+        _onboarding_plan(_mixed_profile(profile), tmp_path, capsys, "0.25.1")
+    else:
+        request = SupportRequest.model_validate(
+            {
+                "identity": {
+                    "model": "fictional/no-profile-model",
+                    "model_revision": "synthetic-v1",
+                    "model_kind": "moe",
+                    "framework_version": "0.31.0",
+                    "gpu": "h200_sxm",
+                    "interconnect": "nvswitch",
+                },
+                "search": {"tensor_parallel": 2, "moe_tensor_parallel": 2, "context_length": 1024},
+                "workload": {"input_tokens": 512, "output_tokens": 4},
+            }
+        )
+        create_plan(request, tmp_path / "collection")
+    plan = tmp_path / "collection"
+    request = SupportRequest.from_yaml(plan / "request.yaml")
+    check_plan(request, plan)
+    assert "prefix_caching_reason" not in json.loads((plan / "support-plan.json").read_text())["fpm"]
+    _set_saved_reason(plan, _COLD + "Another text.")
+    with pytest.raises(ValueError, match="support-plan.json was modified; choose a new output directory"):
+        check_plan(request, plan)
+
+
 # The texts of grouped_prefix_caching_requirements for the two refusals.
 _REFUSAL_TEXT = {
     "unmarked_group": (
         "grouped FPM cache prefix caching requires every cache group to declare prefix_cacheable; "
         "set prefix_cacheable (true or false) on each cache group of a hand-made profile, or import the runtime probe "
-        "again for a profile that the import wrote"
+        "again for a profile that was imported before the import wrote this field"
     ),
     "non_cacheable_window": (
         "kv_cache_groups with enable_prefix_caching=true do not model a sliding-window attention group with "
@@ -2954,7 +3120,13 @@ def test_the_marker_and_window_refusals_hold_on_each_version(grouped_case, tmp_p
         ("decode", "unmarked_group", _REFUSAL_TEXT["unmarked_group"]),
         # A prefill or decode rank refuses the window group with prefix caching off too, so its text names no such
         # remedy.
+        ("prefill", "non_cacheable_window", _PD_REPLAY_WINDOW),
         ("decode", "non_cacheable_window", _PD_REPLAY_WINDOW),
+        # An explicit aggregated worker keeps the texts of an aggregated rank.
+        ("aggregated", "non_cacheable_window", _REFUSAL_TEXT["non_cacheable_window"]),
+        # A role of a profile that passes every requirement keeps prefix caching on.
+        ("prefill", "marked", None),
+        ("decode", "marked", None),
     ],
 )
 def test_grouped_cold_plan_of_one_role_records_and_prints_its_reason(grouped_case, tmp_path, capsys, role, case, text):
@@ -2965,11 +3137,16 @@ def test_grouped_cold_plan_of_one_role_records_and_prints_its_reason(grouped_cas
         groups = deployment["resources"]["cache_groups"]
         if case == "unmarked_group":
             del groups[1]["prefix_cacheable"]
-        else:
+        elif case == "non_cacheable_window":
             groups[1]["prefix_cacheable"] = False
     stderr, files = _onboarding_plan(profile, tmp_path, capsys, "0.31.0", worker_type=role)
+    pilot = "predict/pilot.yaml" if role == "aggregated" else "worker.yaml"
+    worker = yaml.safe_load(files[pilot])["engine"]["workers"][role]
+    if text is None:
+        assert stderr.strip() == "" and _plan_reason(files) is None
+        assert worker["kv_cache"]["prefix_caching"] is True
+        return
     assert stderr.strip() == _plan_reason(files) == _COLD + text
-    worker = yaml.safe_load(files["worker.yaml"])["engine"]["workers"][role]
     assert worker["kv_cache"]["prefix_caching"] is False
 
 

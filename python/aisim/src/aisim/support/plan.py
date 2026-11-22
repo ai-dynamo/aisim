@@ -356,7 +356,12 @@ def _commands(
 
 
 def _plan_documents(
-    request: SupportRequest, root: Path, *, legacy_cli: bool = False, grouped_cold: bool = False
+    request: SupportRequest,
+    root: Path,
+    *,
+    legacy_cli: bool = False,
+    grouped_cold: bool = False,
+    recorded_reason: str | None = None,
 ) -> tuple[dict[str, Any], dict[Path, bytes]]:
     package_spec = find_spec("aisim_core")
     if package_spec is None:
@@ -451,7 +456,8 @@ def _plan_documents(
         },
     }
     if reason is not None:
-        plan["fpm"]["prefix_caching_reason"] = reason
+        # check_plan passes the reason text of a saved plan, which this rendering keeps only when it records a reason.
+        plan["fpm"]["prefix_caching_reason"] = reason if recorded_reason is None else recorded_reason
     if "prefill_cudagraph_policy" in request.collection.model_fields_set:
         plan["fpm"]["launch"] = (
             f"{'AISimulate' if legacy_cli else 'AISim'} launches and manages benchmark workers "
@@ -762,7 +768,13 @@ def check_plan(request: SupportRequest, root: Path, *, allow_missing: bool = Fal
         raise ValueError(f"saved request in {root} was modified or cannot be read") from exc
     if request_id(saved) != prior["request_id"] or validation_id(saved) != prior.get("validation_id"):
         raise ValueError(f"saved request identity in {root} was modified or differs from the requested plan")
-    expected, documents = _plan_documents(saved, root)
+    # The recorded reason explains why a plan is cold, and the decision is compared; so its text is not compared, and a
+    # later change of a requirement message does not refuse a saved plan. Any value but a string stays compared.
+    saved_fpm = prior.get("fpm")
+    recorded_reason = saved_fpm.get("prefix_caching_reason") if isinstance(saved_fpm, dict) else None
+    if not isinstance(recorded_reason, str):
+        recorded_reason = None
+    expected, documents = _plan_documents(saved, root, recorded_reason=recorded_reason)
     if prior != expected:
         # Validate the entire original presentation, including its generated-file
         # hashes. Do not rewrite saved commands/evidence or ignore differing fields.
@@ -771,7 +783,9 @@ def check_plan(request: SupportRequest, root: Path, *, allow_missing: bool = Fal
         # The grouped_cold rendering writes no reason, so it is also a plan that
         # was saved cold before plans recorded fpm.prefix_caching_reason.
         for legacy_cli, grouped_cold in ((True, False), (False, True), (True, True)):
-            expected, documents = _plan_documents(saved, root, legacy_cli=legacy_cli, grouped_cold=grouped_cold)
+            expected, documents = _plan_documents(
+                saved, root, legacy_cli=legacy_cli, grouped_cold=grouped_cold, recorded_reason=recorded_reason
+            )
             if prior == expected:
                 break
         else:
