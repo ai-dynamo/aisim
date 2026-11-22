@@ -762,6 +762,12 @@ pub enum TreeCoreRuntimeError {
     /// `resume_insert` called without a suspended insert.
     #[error("no in-flight insert")]
     NoInFlightInsert,
+    /// Restore the missing prefix and resume the same walk; its duplicate frees
+    /// have already been handed to the controller and must not be replayed.
+    #[error(
+        "suspended insert lost device residency at node {node_id}; load it back before resuming"
+    )]
+    InsertPrefixNotDeviceResident { node_id: NodeId },
     /// An arena slot beyond the arena's bounds — never allocated. `size` is the
     /// arena's current slot count, so valid ids are `0..size`.
     #[error("node access out of bounds: id {id} not in [0, {size})")]
@@ -801,6 +807,9 @@ pub enum TreeCoreRuntimeError {
         "insert continuation prefix length {prefix_len} is not aligned to page size {page_size}"
     )]
     InsertPrefixNotPageAligned { prefix_len: usize, page_size: usize },
+    /// SWA must not split a Full leaf at a non-page boundary.
+    #[error("SWA eviction boundary {boundary} is not aligned to page size {page_size}")]
+    InsertSwaBoundaryNotPageAligned { boundary: usize, page_size: usize },
     /// The retained prefix cannot extend beyond the aligned input key.
     #[error(
         "insert continuation prefix length {prefix_len} exceeds aligned key length {aligned_key_len}"

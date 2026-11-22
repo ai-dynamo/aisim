@@ -20,7 +20,7 @@ SPEC.loader.exec_module(compare)
 
 
 class CompareRadixTests(unittest.TestCase):
-    def check_frozen_overlays(self, mode, *, corrupt_record=False):
+    def check_frozen_overlays(self, mode, *, corrupt_record=False, extra_observation=False, missing_observation=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             checkout = root / "checkout"
@@ -31,12 +31,26 @@ class CompareRadixTests(unittest.TestCase):
                 Path("crates/core/src/engine/kv_manager/radix_lifecycle_evidence.rs") if lifecycle else compare.PROBE
             )
             overlays = {probe: b"// original probe\n"}
-            observations = [{"scenario": "example", "removed_block_hashes": [101]}] if lifecycle else []
+            observations = (
+                [
+                    {"scenario": "two_page_leaf", "removed_block_hashes": [101]},
+                    {"scenario": "complete_without_new_page", "removed_block_hashes": [102]},
+                    {"scenario": "match_and_lock_compressed_prefix", "removed_block_hashes": [103]},
+                ]
+                if lifecycle
+                else []
+            )
             if lifecycle:
-                recorded = [{"scenario": "example", "removed_block_hashes": [999]}] if corrupt_record else observations
+                recorded = [dict(item) for item in observations]
+                if corrupt_record:
+                    recorded[2] = {**recorded[2], "removed_block_hashes": [999]}
                 overlays[compare.LIFECYCLE_RECORD] = json.dumps(
                     {side: {"scenarios": recorded} for side in ("baseline", "candidate")}
                 ).encode()
+                if extra_observation:
+                    observations.append({"scenario": "unrecorded", "removed_block_hashes": [104]})
+                if missing_observation:
+                    observations.pop()
             if not lifecycle:
                 overlays.update({compare.SCENARIOS: b"[]\n", compare.COMPARISON: b"{}\n"})
             module = probe.with_name("sglang_backend.rs" if lifecycle else "radix_cache.rs")
@@ -101,7 +115,7 @@ class CompareRadixTests(unittest.TestCase):
                 patch("sys.argv", argv),
                 patch.object(compare.subprocess, "run", side_effect=run_with_source_edits),
             ):
-                if corrupt_record:
+                if corrupt_record or extra_observation or missing_observation:
                     with self.assertRaisesRegex(SystemExit, "lifecycle observations differ"):
                         compare.main()
                     report = json.loads((work / "comparison.json").read_text())
@@ -128,6 +142,12 @@ class CompareRadixTests(unittest.TestCase):
 
     def test_lifecycle_overlay_stays_frozen_during_builds(self):
         self.check_frozen_overlays("lifecycle")
+
+    def test_lifecycle_rejects_an_extra_observation(self):
+        self.check_frozen_overlays("lifecycle", extra_observation=True)
+
+    def test_lifecycle_rejects_a_missing_observation(self):
+        self.check_frozen_overlays("lifecycle", missing_observation=True)
 
 
 if __name__ == "__main__":

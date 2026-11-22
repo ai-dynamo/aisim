@@ -64,6 +64,11 @@ following local corrections to this pinned revision:
 - Keep stable cursor and commit-target handles for suspended insert walks.
   Reject resumption before mutation if eviction deleted either node, including
   when another node has reused its arena slot.
+  Reject demoted retained paths as well; restore their device rows and resume
+  the same walk, preserving duplicate frees already consumed at the barrier.
+- Validate SWA eviction-boundary alignment before inserting Full KV or events.
+- Preserve integer-first T-LRU arithmetic when it fits; convert positive
+  history-plus-estimate overflow to finite floating-point arithmetic.
 - Defer demotion while device locks are held or device children have appeared,
   and reject SWA attachment over host-only Full spans before any mutation.
 - Count only evicted Full rows as host hits. Finalize Full first and pass the
@@ -74,6 +79,9 @@ following local corrections to this pinned revision:
 - Reject Full and auxiliary load-back plans whose per-node row counts changed
   after a split, or whose row totals do not match the device allocation, before
   any adoption.
+  Compare the ordered Full host source rows and anchor path before commit,
+  rejecting plans invalidated by host reclaim and replacement with equal counts.
+  Index comparisons use borrowed slices without another concatenated buffer.
   Reject auxiliary destinations filled since planning, and retain empty row
   counts on foreign-pin deferrals so they still commit as no-ops.
   Refresh each restored node's parent eligibility before another eviction.

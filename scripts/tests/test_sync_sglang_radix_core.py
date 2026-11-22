@@ -135,7 +135,7 @@ class SyncRadixTests(unittest.TestCase):
         self.source = self.checkout / sync.UPSTREAM / "src"
         self.source.mkdir(parents=True)
         (self.checkout / "LICENSE").write_text("fixture license\n")
-        (self.source / "lib.rs").write_text("// pinned source\n")
+        (self.source / "lib.rs").write_text("// pinned source\n", encoding="utf-8")
         (self.source / "new.rs").write_text("// newly mapped source\n")
         self.git("add", ".")
         self.git(
@@ -176,6 +176,25 @@ class SyncRadixTests(unittest.TestCase):
         (self.destination / "new.rs").write_text("// drift\n")
         with self.assertRaisesRegex(SystemExit, "bundled source differs"):
             sync.synchronize(self.checkout, check=True)
+
+    def test_non_ascii_source_stays_utf8_in_update_and_check_modes(self):
+        contents = "// size \u00d7 count; café; 缓存\n".encode()
+        (self.source / "lib.rs").write_bytes(contents)
+        self.git("add", ".")
+        self.git(
+            "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "unicode"
+        )
+        with patch.object(sync, "REVISION", self.git("rev-parse", "HEAD").strip()):
+            write_text = Path.write_text
+
+            def require_encoding(path, text, **kwargs):
+                self.assertEqual(kwargs.get("encoding"), "utf-8")
+                return write_text(path, text, **kwargs)
+
+            with patch.object(Path, "write_text", require_encoding):
+                sync.synchronize(self.checkout, check=False)
+                self.assertEqual((self.destination / "mod.rs").read_bytes(), contents)
+                sync.synchronize(self.checkout, check=True)
 
     def test_update_and_check_reject_unexpected_sources_without_writing(self):
         (self.destination / "unexpected.rs").write_text("// local source\n")

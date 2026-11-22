@@ -39,6 +39,220 @@ fn complete_backup(tree: &mut Core, leaf: NodeId) {
 }
 
 #[test]
+fn scoped_review_lru_and_mru_free_different_competing_pages() {
+    for (policy, expected) in [("lru", 1), ("mru", 2)] {
+        let mut tree = Core::new(
+            CacheInitParams {
+                eviction_policy: policy.into(),
+                ..Default::default()
+            },
+            vec![FULL],
+        );
+        insert(&mut tree, vec![10], &[1]);
+        insert(&mut tree, vec![20], &[2]);
+        tree.evict_device_start(FULL, 1);
+        let (victim, _) = tree.evict_device_next_node(FULL, &HashMap::new());
+        let (_, result) = tree.evict_device_leaf(victim.unwrap(), false).unwrap();
+        tree.evict_device_end(FULL);
+        assert_eq!(
+            result.device_frees[&FULL][0].as_slice(),
+            &[expected],
+            "{policy}"
+        );
+        assert_eq!(tree.full_evictable_size(), 1);
+        tree.try_sanity_check(&[], &[]).unwrap();
+    }
+}
+
+#[test]
+fn scoped_review_tlru_integer_overflow_keeps_ordinary_priority() {
+    use super::unified_lru_list::{TlruFloatConfig, TlruPromptEstimate};
+    let config = TlruFloatConfig {
+        next_prompt_estimate: TlruPromptEstimate::Integer(i128::MAX),
+        threshold: 0.0,
+    };
+    assert!(!config.is_tel_safe(1, 0));
+    // Cancellation must still happen in integer space when the sum fits.
+    let precise = TlruFloatConfig {
+        next_prompt_estimate: TlruPromptEstimate::Integer(-(1i128 << 53)),
+        threshold: 0.0,
+    };
+    assert!(!precise.is_tel_safe((1usize << 53) + 1, 0));
+    let mut tree = Core::new(
+        CacheInitParams {
+            eviction_policy: "tlru".into(),
+            tlru_float_config: Some(config),
+            ..Default::default()
+        },
+        vec![FULL],
+    );
+    let leaf = insert(&mut tree, vec![10], &[1]);
+    let node = tree.arena.node(tree.arena.resolve(leaf).unwrap());
+    assert_eq!(tree.eviction_strategy.get_priority(node).0, 0);
+    tree.evict_device_start(FULL, 1);
+    assert_eq!(
+        tree.evict_device_next_node(FULL, &HashMap::new()).0,
+        Some(leaf)
+    );
+    let (_, result) = tree.evict_device_leaf(leaf, false).unwrap();
+    tree.evict_device_end(FULL);
+    assert_eq!(result.device_frees[&FULL][0].as_slice(), &[1]);
+    tree.try_sanity_check(&[], &[]).unwrap();
+}
+
+#[test]
+fn scoped_review_swa_boundary_is_validated_before_full_insert() {
+    let mut tree = Core::new(
+        CacheInitParams {
+            page_size: 2,
+            swa_sliding_window_size: Some(2),
+            enable_kv_cache_events: true,
+            ..Default::default()
+        },
+        vec![FULL, SWA],
+    );
+    let key = vec![10, 20, 30, 40];
+    let mut p = params(&key, &[1, 2, 3, 4]);
+    p.swa_evicted_seqlen = 1;
+    let nodes = tree.inspect_get_all_node_ids();
+    assert!(matches!(
+        tree.try_begin_insert(&p),
+        Err(TreeCoreRuntimeError::InsertSwaBoundaryNotPageAligned {
+            boundary: 1,
+            page_size: 2
+        })
+    ));
+    assert_eq!(tree.inspect_get_all_node_ids(), nodes);
+    assert_eq!(tree.total_size(), (0, 0));
+    assert!(!tree.has_ongoing_insert());
+    assert!(tree.take_events().is_empty());
+    p.swa_evicted_seqlen = 2;
+    let inserted = tree.try_insert(&p).unwrap();
+    assert_eq!(inserted.total_len, 4);
+    assert_eq!(tree.full_kv_prefix_len(&key, Default::default()), 4);
+    assert!(!tree.take_events().is_empty());
+    tree.try_sanity_check(&[], &[]).unwrap();
+}
+
+#[test]
+fn scoped_review_suspended_insert_recovers_demoted_prefix_without_duplicate_frees() {
+    for demote in [false, true] {
+        let mut tree = Core::new(
+            CacheInitParams {
+                enable_hicache: true,
+                write_through_threshold: 2,
+                enable_kv_cache_events: true,
+                ..Default::default()
+            },
+            vec![FULL],
+        );
+        let leaf = insert(&mut tree, vec![10, 20], &[1, 2]);
+        let key = vec![10, 20, 30];
+        let step = tree.try_begin_insert(&params(&key, &[5, 6, 7])).unwrap();
+        assert!(step.result.is_none());
+        // The controller has already returned these incoming duplicates to its
+        // allocator when it executes the backup barrier.
+        let freed: Vec<_> = step
+            .actions
+            .iter()
+            .filter_map(|action| match action {
+                CacheAction::FreeDeviceKV(value) => Some(value.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .flat_map(|value| value.as_slice())
+            .copied()
+            .collect();
+        assert_eq!(freed, vec![5, 6]);
+        complete_backup(&mut tree, leaf);
+        if demote {
+            assert_eq!(
+                tree.demote(leaf).unwrap().device_frees[&FULL][0].as_slice(),
+                &[1, 2]
+            );
+            tree.take_events();
+            for _ in 0..2 {
+                assert!(
+                    matches!(tree.try_resume_insert(), Err(TreeCoreRuntimeError::InsertPrefixNotDeviceResident { node_id }) if node_id == leaf)
+                );
+                assert!(tree.has_ongoing_insert());
+                assert!(tree.take_events().is_empty());
+                assert_eq!(tree.inspect_get_all_node_ids().len(), 2);
+            }
+            let (full, auxiliary) = tree.build_load_back_spec(leaf, None).unwrap();
+            tree.commit_load_back(leaf, PageValue::from_vec(vec![8, 9]), full, auxiliary)
+                .unwrap();
+            tree.finish_load_back(leaf).unwrap();
+        }
+        let resumed = tree.try_resume_insert().unwrap();
+        assert!(resumed.result.is_some());
+        assert!(resumed.actions.iter().all(|action| !matches!(
+            action,
+            CacheAction::FreeDeviceKV(_) | CacheAction::FreeDeviceKVFullOnly(_)
+        )));
+        let matched = tree.match_prefix(&MatchPrefixParams {
+            key: &key,
+            namespace: Default::default(),
+        });
+        assert_eq!(
+            matched.device_indices.as_slice(),
+            if demote { &[8, 9, 7] } else { &[1, 2, 7] }
+        );
+        let lock = tree
+            .inc_lock_ref(matched.last_device_node_id, ComponentSet::EMPTY)
+            .unwrap();
+        tree.dec_lock_ref(matched.last_device_node_id, &lock.to_dec_params(), false)
+            .unwrap();
+        tree.try_sanity_check(&[], &[]).unwrap();
+    }
+}
+
+#[test]
+fn scoped_review_load_back_rejects_reclaimed_and_replaced_host_rows() {
+    let mut tree = Core::new(
+        CacheInitParams {
+            enable_hicache: true,
+            is_write_back: true,
+            enable_kv_cache_events: true,
+            ..Default::default()
+        },
+        vec![FULL],
+    );
+    let leaf = insert(&mut tree, vec![10, 20], &[1, 2]);
+    complete_backup(&mut tree, leaf);
+    tree.demote(leaf).unwrap();
+    let (stale, stale_aux) = tree.build_load_back_spec(leaf, None).unwrap();
+    let (full, auxiliary) = tree.build_load_back_spec(leaf, None).unwrap();
+    tree.commit_load_back(leaf, PageValue::from_vec(vec![3, 4]), full, auxiliary)
+        .unwrap();
+    tree.finish_load_back(leaf).unwrap();
+    let reclaim = tree.drive_host_eviction(FULL, 2);
+    assert_eq!(reclaim.host_frees[&FULL][0].as_slice(), &[101, 102]);
+    assert!(reclaim.device_frees.is_empty());
+    tree.commit_backup(leaf, PageValue::from_vec(vec![201, 202]), HashMap::new())
+        .unwrap();
+    let pending = tree.mark_write_through_pending(vec![leaf], leaf).unwrap();
+    tree.finish_write_through(pending, leaf).unwrap();
+    tree.demote(leaf).unwrap();
+    tree.take_events();
+    assert!(matches!(
+        tree.commit_load_back(leaf, PageValue::from_vec(vec![5, 6]), stale, stale_aux),
+        Err(TreeCoreRuntimeError::InvalidLoadBackSpec { .. })
+    ));
+    let node = tree.arena.node(tree.arena.resolve(leaf).unwrap());
+    assert!(!node.has_device_value(FULL));
+    assert_eq!(node.host_value(FULL).as_slice(), &[201, 202]);
+    assert_eq!(node.load_back_pending_id, None);
+    assert_eq!(tree.full_evictable_size(), 0);
+    assert!(tree.take_events().is_empty());
+    let (full, auxiliary) = tree.build_load_back_spec(leaf, None).unwrap();
+    tree.commit_load_back(leaf, PageValue::from_vec(vec![5, 6]), full, auxiliary)
+        .unwrap();
+    tree.finish_load_back(leaf).unwrap();
+    tree.try_sanity_check(&[], &[]).unwrap();
+}
+
+#[test]
 fn eviction_walk_rechecks_a_leaf_refreshed_after_start() {
     let mut tree = Core::new(CacheInitParams::default(), vec![FULL]);
     let a = insert(&mut tree, vec![10, 20], &[1, 2]);

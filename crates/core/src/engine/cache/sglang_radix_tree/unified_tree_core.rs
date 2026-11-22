@@ -1930,6 +1930,14 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 required_len: value_len,
             });
         }
+        if self.try_component_by_type_(SWA).is_some()
+            && !params.swa_evicted_seqlen.is_multiple_of(self.page_size)
+        {
+            return Err(TreeCoreRuntimeError::InsertSwaBoundaryNotPageAligned {
+                boundary: params.swa_evicted_seqlen,
+                page_size: self.page_size,
+            });
+        }
         // Empty inserts do not adopt the donation. Validate real insertions
         // before touching recency, splitting edges, or starting a resumable walk.
         if aligned_key_len > prefix_len
@@ -2119,6 +2127,10 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     /// Fallible variant of [`Self::resume_insert`].
     /// If eviction deleted a saved node, return its stale-handle error before
     /// resuming any mutation. The caller can discard the walk with `end_insert`.
+    /// If a saved prefix was demoted, load it back and retry this same walk.
+    /// Do not restart with the original input: duplicate frees from earlier
+    /// steps have already been consumed. Rejection preserves the walk and
+    /// never re-emits those actions.
     pub fn try_resume_insert(&mut self) -> Result<InsertStepResult<V>, TreeCoreRuntimeError> {
         let state = self
             .ongoing_insert_walk_state
@@ -2131,6 +2143,22 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             .target_node_handle
             .map(|handle| self.arena.resolve(handle))
             .transpose()?;
+        // A live handle can have lost residency while the controller executed
+        // a barrier's backup. Validate the entire retained path, including any
+        // ancestors split off since suspension, before touching the walk.
+        let mut cursor = target_node_id.unwrap_or(node_id);
+        loop {
+            let node = self.arena.node(cursor);
+            if node.is_root() {
+                break;
+            }
+            if !node.has_device_value(FULL) {
+                return Err(TreeCoreRuntimeError::InsertPrefixNotDeviceResident {
+                    node_id: node.id,
+                });
+            }
+            cursor = node.parent();
+        }
         state.node_id = node_id;
         state.target_node_id = target_node_id;
         Ok(self.advance_insert_())
@@ -4560,6 +4588,32 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         }
         if total != device_indices.len() || total != kv_xfer.host_indices.as_ref().map_or(0, V::len)
         {
+            return Err(invalid());
+        }
+        // Bind this plan to the anchor's current host-only suffix and exact
+        // ordered source rows. Equal counts alone survive reclaim/re-backup
+        // with different host allocations. Compare borrowed views before any
+        // pin or adoption, without constructing another concatenated buffer.
+        let mut current = node_id;
+        let mut offset = total;
+        for (&idx, &count) in loaded_node_indices.iter().zip(counts).rev() {
+            if current != idx {
+                return Err(invalid());
+            }
+            offset -= count;
+            let node = self.arena.node(idx);
+            if !node.host_value(FULL).indices_equal(
+                &kv_xfer
+                    .host_indices
+                    .as_ref()
+                    .ok_or_else(invalid)?
+                    .slice(offset, count),
+            ) {
+                return Err(invalid());
+            }
+            current = node.parent();
+        }
+        if self.arena.node(current).evicted() {
             return Err(invalid());
         }
         // Auxiliary plans can become stale independently of Full KV, including

@@ -60,6 +60,9 @@ pub trait RadixValue: Debug + Sized + 'static {
 
     /// Materialize the indices as integers for inspection and canary walks.
     fn to_i64_vec(&self) -> Vec<i64>;
+
+    /// Compare the ordered indices without materializing another value.
+    fn indices_equal(&self, other: &Self) -> bool;
 }
 
 /// Immutable, cheaply sliced list suitable for simulated KV page identifiers.
@@ -121,10 +124,14 @@ impl<T> From<Vec<T>> for PageValue<T> {
 
 impl<T> RadixValue for PageValue<T>
 where
-    T: Copy + Debug + TryInto<i64> + 'static,
+    T: Copy + Debug + PartialEq + TryInto<i64> + 'static,
 {
     fn len(&self) -> usize {
         self.range.len()
+    }
+
+    fn indices_equal(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
     }
 
     fn shallow_clone(&self) -> Self {

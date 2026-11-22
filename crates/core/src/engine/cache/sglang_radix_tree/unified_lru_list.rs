@@ -524,8 +524,7 @@ impl TlruFloatConfig {
             TlruPromptEstimate::Float(estimate) => history as f64 + estimate,
             TlruPromptEstimate::Integer(estimate) => estimate
                 .checked_add(history as i128)
-                .expect("T-LRU history + next_prompt_estimate overflowed i128")
-                as f64,
+                .map_or_else(|| estimate as f64 + history as f64, |sum| sum as f64),
         };
         let budget = next_prompt - self.threshold;
         // Match Python's max(budget, 0) and exact int >= float comparison.

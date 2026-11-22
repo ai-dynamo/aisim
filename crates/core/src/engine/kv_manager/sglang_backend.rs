@@ -401,7 +401,8 @@ impl SglangKvManager {
         if self.enable_prefix_caching {
             self.checkpoint_admission();
         }
-        let (prefix_len, last_node) = self.match_prefix_hashes_and_lock(matchable_hashes);
+        let (prefix_len, last_node, mut pages) =
+            self.match_prefix_hashes_and_lock(matchable_hashes);
         let required_pages = token_ids.len().div_ceil(page_size) - prefix_len / page_size;
         let required_tokens = required_pages * page_size;
 
@@ -421,8 +422,6 @@ impl SglangKvManager {
         if required_tokens > available {
             self.evict(required_tokens - available);
         }
-        let mut pages = self.collect_path_pages_through(last_node, prefix_len);
-
         let available_before = self.cache.available_tokens();
         let Some(mut new_pages) = self.cache.page_pool.allocate_pages(required_pages) else {
             self.cache.dec_lock_ref(last_node);
@@ -723,8 +722,7 @@ impl SglangKvManager {
         page_hashes: &[LocalBlockHash],
         token_count: usize,
     ) -> Option<SglangDestinationReservation> {
-        let (prefix_len, last_node) = self.match_prefix_hashes_and_lock(page_hashes);
-        let prefix_pages = self.collect_path_pages_through(last_node, prefix_len);
+        let (prefix_len, last_node, prefix_pages) = self.match_prefix_hashes_and_lock(page_hashes);
 
         let allocated_tokens = if token_count == 0 {
             0
@@ -846,16 +844,15 @@ impl SglangKvManager {
         capacity_improved
     }
 
-    fn match_prefix_hashes_and_lock(&mut self, page_hashes: &[LocalBlockHash]) -> (usize, NodeId) {
+    fn match_prefix_hashes_and_lock(
+        &mut self,
+        page_hashes: &[LocalBlockHash],
+    ) -> (usize, NodeId, Vec<KvPageId>) {
         if self.enable_prefix_caching {
             self.cache.match_prefix_hashes_and_lock(page_hashes)
         } else {
-            (0, self.cache.root())
+            (0, self.cache.root(), Vec::new())
         }
-    }
-
-    fn collect_path_pages_through(&self, last_node: NodeId, prefix_len: usize) -> Vec<KvPageId> {
-        self.cache.collect_path_pages_through(last_node, prefix_len)
     }
 
     /// Evict tokens from the cache, publish BlockRemoved events, and log a trace.
@@ -1046,6 +1043,35 @@ mod tests {
         let mut lease = RadixRequestLease::default();
         lease.ensure_page_hashes(tokens, page_size);
         lease
+    }
+
+    #[test]
+    fn scoped_review_warm_admission_and_destination_reuse_matched_pages_in_path_order() {
+        let mut mgr = SglangKvManager::new(32, 2, KvEventPublishers::default(), 0);
+        let prompt = [1, 2, 3, 4, 5, 6];
+        let cold = mgr.allocate_for_request(&prompt).unwrap();
+        let expected = cold.lease.pages().to_vec();
+        mgr.finish(&prompt, cold.lease);
+        // Normal matching splits the compressed path into competing branches.
+        let branch = [1, 2, 9, 10];
+        let cold = mgr.allocate_for_request(&branch).unwrap();
+        mgr.finish(&branch, cold.lease);
+        let extended = [1, 2, 3, 4, 5, 6, 7];
+        let warm = mgr.allocate_for_request(&extended).unwrap();
+        assert_eq!(warm.prefix_len, 6);
+        assert_eq!(&warm.lease.pages()[..3], expected.as_slice());
+        mgr.abort(warm.lease);
+        let hashes = compute_block_hash_for_seq(&prompt, 2);
+        let destination = mgr
+            .reserve_destination_lease(&hashes, extended.len())
+            .unwrap();
+        assert_eq!(destination.prefix_len, 6);
+        assert_eq!(destination.prefix_pages, expected);
+        assert_eq!(&destination.pages()[..3], expected.as_slice());
+        mgr.cancel_destination(destination);
+        mgr.evict(32);
+        assert_eq!(mgr.cache().available_tokens(), 32);
+        assert_eq!(mgr.cache().protected_size(), 0);
     }
 
     struct MockSink {

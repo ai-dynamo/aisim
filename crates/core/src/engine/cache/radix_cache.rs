@@ -308,6 +308,10 @@ impl CacheValue {
 }
 
 impl RadixValue for CacheValue {
+    fn indices_equal(&self, other: &Self) -> bool {
+        self.pages.indices_equal(&other.pages)
+    }
+
     fn len(&self) -> usize {
         self.pages.len()
     }
@@ -728,7 +732,7 @@ impl RadixCache {
     pub(crate) fn match_prefix_hashes_and_lock(
         &mut self,
         page_keys: &[LocalBlockHash],
-    ) -> (usize, NodeId) {
+    ) -> (usize, NodeId, Vec<KvPageId>) {
         let key: PageKey = page_keys.to_vec().into();
         let result = self.tree.match_prefix(&MatchPrefixParams {
             key: &key,
@@ -741,7 +745,11 @@ impl RadixCache {
         let last_node = result.last_device_node_id;
         let matched_tokens = result.device_indices.as_slice().len() * self.page_size;
         self.inc_lock_ref(last_node);
-        (matched_tokens, last_node)
+        (
+            matched_tokens,
+            last_node,
+            result.device_indices.as_slice().to_vec(),
+        )
     }
 
     #[cfg(test)]
@@ -891,33 +899,13 @@ impl RadixCache {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn collect_path_pages(&self, last_node: NodeId) -> Vec<KvPageId> {
         self.tree
             .collect_full_device_indices(last_node, self.root())
             .expect("live prefix path")
             .as_slice()
             .to_vec()
-    }
-
-    pub(crate) fn collect_path_pages_through(
-        &self,
-        last_node: NodeId,
-        prefix_len: usize,
-    ) -> Vec<KvPageId> {
-        assert_eq!(
-            prefix_len % self.page_size,
-            0,
-            "matched SGLang prefix must be page-aligned"
-        );
-        let expected_pages = prefix_len / self.page_size;
-        let mut pages = self.collect_path_pages(last_node);
-        assert!(
-            pages.len() >= expected_pages,
-            "SGLang radix path returned {} pages for a {expected_pages}-page prefix",
-            pages.len()
-        );
-        pages.truncate(expected_pages);
-        pages
     }
 
     pub fn inc_lock_ref(&mut self, node_id: NodeId) {
@@ -1353,7 +1341,7 @@ mod tests {
             false,
         );
 
-        let (prefix_len, prefix_node) = cache.match_prefix_hashes_and_lock(&key[..1]);
+        let (prefix_len, prefix_node, _) = cache.match_prefix_hashes_and_lock(&key[..1]);
         assert_eq!(prefix_len, 4);
         let incoming_suffix = cache.page_pool.allocate_pages(1).unwrap();
         let incoming = [existing[0], incoming_suffix[0]];
@@ -1381,7 +1369,7 @@ mod tests {
         assert_eq!(cache.available_tokens(), 52);
 
         let first_key = cache.page_hashes(&[1, 2, 3, 4, 5, 6, 7, 8]);
-        let (_, locked) = cache.match_prefix_hashes_and_lock(&first_key);
+        let (_, locked, _) = cache.match_prefix_hashes_and_lock(&first_key);
         assert_eq!(cache.protected_size(), 8);
         assert_eq!(cache.evictable_size(), 4);
 

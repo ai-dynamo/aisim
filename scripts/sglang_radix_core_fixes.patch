@@ -2,7 +2,7 @@ SPDX-FileCopyrightText: SGLang contributors
 SPDX-FileCopyrightText: Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0
 Derived from https://github.com/sgl-project/sglang at f0fda25fc95c357368b714f90a13a69c1b67f50a,
-original paths rust/sglang-radix-tree/src/{lib.rs,node.rs,value.rs,unified_tree_core.rs,components/{mod,full,mamba,swa}.rs}.
+original paths rust/sglang-radix-tree/src/{lib.rs,node.rs,value.rs,unified_lru_list.rs,unified_tree_core.rs,components/{mod,full,mamba,swa}.rs}.
 Also modifies rust/sglang-radix-tree/tests/page_value_core.rs.
 Modified after mechanical module adaptation. See crates/core/src/engine/cache/sglang_radix_tree/README.md
 and its LICENSE for provenance, the preserved license, and each local correction.
@@ -347,7 +347,30 @@ and its LICENSE for provenance, the preserved license, and each local correction
      /// A public NodeId no longer names a live arena node.
      #[error(transparent)]
      NodeAccess(#[from] NodeAccessError),
-@@ -804,6 +818,9 @@
+@@ -748,6 +762,12 @@
+     /// `resume_insert` called without a suspended insert.
+     #[error("no in-flight insert")]
+     NoInFlightInsert,
++    /// Restore the missing prefix and resume the same walk; its duplicate frees
++    /// have already been handed to the controller and must not be replayed.
++    #[error(
++        "suspended insert lost device residency at node {node_id}; load it back before resuming"
++    )]
++    InsertPrefixNotDeviceResident { node_id: NodeId },
+     /// An arena slot beyond the arena's bounds — never allocated. `size` is the
+     /// arena's current slot count, so valid ids are `0..size`.
+     #[error("node access out of bounds: id {id} not in [0, {size})")]
+@@ -787,6 +807,9 @@
+         "insert continuation prefix length {prefix_len} is not aligned to page size {page_size}"
+     )]
+     InsertPrefixNotPageAligned { prefix_len: usize, page_size: usize },
++    /// SWA must not split a Full leaf at a non-page boundary.
++    #[error("SWA eviction boundary {boundary} is not aligned to page size {page_size}")]
++    InsertSwaBoundaryNotPageAligned { boundary: usize, page_size: usize },
+     /// The retained prefix cannot extend beyond the aligned input key.
+     #[error(
+         "insert continuation prefix length {prefix_len} exceeds aligned key length {aligned_key_len}"
+@@ -804,6 +827,9 @@
          node_prefix_len: usize,
          prefix_len: usize,
      },
@@ -357,7 +380,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
      /// A non-root continuation stays inside the anchor's namespace.
      #[error("insert continuation namespace does not match non-root anchor {node_id}")]
      InsertContinuationNamespaceMismatch { node_id: NodeId },
-@@ -817,6 +834,9 @@
+@@ -817,6 +843,9 @@
          value_len: usize,
          required_len: usize,
      },
@@ -391,6 +414,18 @@ and its LICENSE for provenance, the preserved license, and each local correction
      }
      params.rotation_base = Some(7);
      let accepted = tree.insert_suffix_from_node(anchor, 2, &params);
+--- a/unified_lru_list.rs
++++ b/unified_lru_list.rs
+@@ -524,8 +524,7 @@
+             TlruPromptEstimate::Float(estimate) => history as f64 + estimate,
+             TlruPromptEstimate::Integer(estimate) => estimate
+                 .checked_add(history as i128)
+-                .expect("T-LRU history + next_prompt_estimate overflowed i128")
+-                as f64,
++                .map_or_else(|| estimate as f64 + history as f64, |sum| sum as f64),
+         };
+         let budget = next_prompt - self.threshold;
+         // Match Python's max(budget, 0) and exact int >= float comparison.
 --- a/unified_tree_core.rs
 +++ b/unified_tree_core.rs
 @@ -260,6 +260,8 @@
@@ -566,10 +601,18 @@ and its LICENSE for provenance, the preserved license, and each local correction
          }
          Ok(())
      }
-@@ -1916,6 +1928,17 @@
+@@ -1916,6 +1928,25 @@
              return Err(TreeCoreRuntimeError::InsertValueTooShort {
                  value_len: params.value.len(),
                  required_len: value_len,
++            });
++        }
++        if self.try_component_by_type_(SWA).is_some()
++            && !params.swa_evicted_seqlen.is_multiple_of(self.page_size)
++        {
++            return Err(TreeCoreRuntimeError::InsertSwaBoundaryNotPageAligned {
++                boundary: params.swa_evicted_seqlen,
++                page_size: self.page_size,
 +            });
 +        }
 +        // Empty inserts do not adopt the donation. Validate real insertions
@@ -584,7 +627,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              });
          }
          self.validate_insert_anchor_(prefix_node_idx, prefix_len, params)?;
-@@ -1944,7 +1967,7 @@
+@@ -1944,7 +1975,7 @@
          if aligned_key_len == prefix_len {
              // An empty suffix still visited its retained boundary above.
              return Ok(InsertStepResult {
@@ -593,7 +636,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
                  result: Some(InsertResult {
                      prefix_len,
                      total_len: aligned_key_len,
-@@ -1955,9 +1978,11 @@
+@@ -1955,9 +1986,11 @@
                      // Nothing was inserted, so a donated Mamba slot was not
                      // adopted and the caller keeps (and frees) it.
                      mamba_exist: true,
@@ -607,7 +650,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
                  }),
              });
          }
-@@ -1966,6 +1991,7 @@
+@@ -1966,6 +1999,7 @@
          self.ongoing_insert_walk_state = Some(InsertWalkState {
              phase: InsertPhase::Walk,
              node_id: prefix_node_idx,
@@ -615,7 +658,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              key: K::from(params.key.as_ref()[prefix_len..aligned_key_len].to_vec()),
              key_offset: prefix_len,
              aligned_key_len,
-@@ -1983,6 +2009,7 @@
+@@ -1983,6 +2017,7 @@
              total_prefix_length: prefix_len,
              is_new_leaf: false,
              target_node_id: None,
@@ -623,12 +666,16 @@ and its LICENSE for provenance, the preserved license, and each local correction
              result: Some(InsertResult {
                  total_len: aligned_key_len,
                  adopted_ranges: params.track_adopted_ranges.then(HashMap::new),
-@@ -2090,10 +2117,22 @@
+@@ -2090,10 +2125,42 @@
      }
 
      /// Fallible variant of [`Self::resume_insert`].
 +    /// If eviction deleted a saved node, return its stale-handle error before
 +    /// resuming any mutation. The caller can discard the walk with `end_insert`.
++    /// If a saved prefix was demoted, load it back and retry this same walk.
++    /// Do not restart with the original input: duplicate frees from earlier
++    /// steps have already been consumed. Rejection preserves the walk and
++    /// never re-emits those actions.
      pub fn try_resume_insert(&mut self) -> Result<InsertStepResult<V>, TreeCoreRuntimeError> {
 -        if self.ongoing_insert_walk_state.is_none() {
 -            return Err(TreeCoreRuntimeError::NoInFlightInsert);
@@ -644,12 +691,28 @@ and its LICENSE for provenance, the preserved license, and each local correction
 +            .target_node_handle
 +            .map(|handle| self.arena.resolve(handle))
 +            .transpose()?;
++        // A live handle can have lost residency while the controller executed
++        // a barrier's backup. Validate the entire retained path, including any
++        // ancestors split off since suspension, before touching the walk.
++        let mut cursor = target_node_id.unwrap_or(node_id);
++        loop {
++            let node = self.arena.node(cursor);
++            if node.is_root() {
++                break;
++            }
++            if !node.has_device_value(FULL) {
++                return Err(TreeCoreRuntimeError::InsertPrefixNotDeviceResident {
++                    node_id: node.id,
++                });
++            }
++            cursor = node.parent();
++        }
 +        state.node_id = node_id;
 +        state.target_node_id = target_node_id;
          Ok(self.advance_insert_())
      }
 
-@@ -2185,6 +2224,7 @@
+@@ -2185,6 +2252,7 @@
          {
              let node = self.arena.node_mut(node_id);
              node.priority = node.priority.max(state.priority);
@@ -657,7 +720,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          }
 
          let params = InsertParams {
-@@ -2326,6 +2366,7 @@
+@@ -2326,6 +2394,7 @@
              state.node_id
          };
          state.target_node_id = Some(target_node_id);
@@ -665,7 +728,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
 
          // Finalize: let each component attach its data to the target node.
          // e.g. Mamba attaches mamba_value to the leaf node
-@@ -2336,7 +2377,7 @@
+@@ -2336,7 +2405,7 @@
              .as_mut()
              .expect("insert result exists during commit");
          result.prefix_len = state.total_prefix_length;
@@ -674,7 +737,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let params = InsertParams {
              rotation_base: state.rotation_base,
              key: &state.key,
-@@ -2963,13 +3004,18 @@
+@@ -2963,13 +3032,18 @@
              .values()
              .copied()
              .collect();
@@ -693,7 +756,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          }
          for &desc_id in descendants.iter().rev() {
              {
-@@ -3178,7 +3224,7 @@
+@@ -3178,7 +3252,7 @@
      ) -> Result<EvictionStepResult<V>, TreeCoreRuntimeError> {
          let node_id = self.arena.resolve(node_id)?;
          let mut result = EvictionStepResult::default();
@@ -702,7 +765,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          if self.arena.node(node_id).is_load_back_pending() {
              return Ok(result);
          }
-@@ -3190,6 +3236,12 @@
+@@ -3190,6 +3264,12 @@
                      evicted: node.evicted(),
                      backuped: node.backuped(),
                  });
@@ -715,7 +778,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              }
          }
          self.demote_(
-@@ -3494,6 +3546,12 @@
+@@ -3494,6 +3574,12 @@
              return false;
          }
          if node.is_device_locked() {
@@ -728,7 +791,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              return false;
          }
          if node.is_load_back_pending() {
-@@ -4147,6 +4205,7 @@
+@@ -4147,6 +4233,7 @@
                  name: PoolName::Kv,
                  host_indices: Some(V::empty()),
                  nodes_to_load: Some(Vec::new()),
@@ -736,7 +799,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
                  ..Default::default()
              };
              return Ok((empty_kv, HashMap::new()));
-@@ -4469,7 +4528,7 @@
+@@ -4469,7 +4556,7 @@
          device_indices: V,
          mut kv_xfer: PoolTransfer<V>,
          comp_xfers: HashMap<ComponentType, Vec<PoolTransfer<V>>>,
@@ -745,7 +808,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let anchor_id = node_id;
          let node_id = self.arena.resolve(node_id)?;
          let loaded_node_indices = kv_xfer
-@@ -4479,6 +4538,72 @@
+@@ -4479,6 +4566,98 @@
              .map(|&loaded_id| self.arena.resolve(loaded_id))
              .collect::<Result<Vec<_>, _>>()?;
          self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
@@ -771,6 +834,32 @@ and its LICENSE for provenance, the preserved license, and each local correction
 +        }
 +        if total != device_indices.len() || total != kv_xfer.host_indices.as_ref().map_or(0, V::len)
 +        {
++            return Err(invalid());
++        }
++        // Bind this plan to the anchor's current host-only suffix and exact
++        // ordered source rows. Equal counts alone survive reclaim/re-backup
++        // with different host allocations. Compare borrowed views before any
++        // pin or adoption, without constructing another concatenated buffer.
++        let mut current = node_id;
++        let mut offset = total;
++        for (&idx, &count) in loaded_node_indices.iter().zip(counts).rev() {
++            if current != idx {
++                return Err(invalid());
++            }
++            offset -= count;
++            let node = self.arena.node(idx);
++            if !node.host_value(FULL).indices_equal(
++                &kv_xfer
++                    .host_indices
++                    .as_ref()
++                    .ok_or_else(invalid)?
++                    .slice(offset, count),
++            ) {
++                return Err(invalid());
++            }
++            current = node.parent();
++        }
++        if self.arena.node(current).evicted() {
 +            return Err(invalid());
 +        }
 +        // Auxiliary plans can become stale independently of Full KV, including
@@ -818,7 +907,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let mut cache_actions: Vec<CacheAction<V>> = Vec::new();
          kv_xfer.device_indices = Some(device_indices);
          let nodes_to_load = kv_xfer.nodes_to_load.clone();
-@@ -4709,8 +4834,12 @@
+@@ -4709,8 +4888,12 @@
              if node.write_through_pending_id == Some(ack_id) {
                  node.write_through_pending_id = None;
                  self.update_full_coexisting_host_tracking_(node_idx);
@@ -833,7 +922,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          }
          Ok(())
      }
-@@ -4829,6 +4958,11 @@
+@@ -4829,6 +5012,11 @@
          for &(child_id, pos, prefix_len) in &spans {
              if pos + prefix_len <= window_start {
                  continue;
@@ -845,7 +934,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              }
              if self.arena.has_device_value(child_id, SWA) {
                  return Err(format!(
-@@ -5833,6 +5967,12 @@
+@@ -5833,6 +6021,12 @@
          let last_device_node_idx = self.arena.resolve(result.last_device_node_id)?;
          self.arena.resolve(result.last_host_node_id)?;
          let best_match_node_idx = self.arena.resolve(result.best_match_node_id)?;
@@ -858,7 +947,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          Ok(self
              .component_by_type_(component_type)
              .finalize_match_result_in_tree_core(
-@@ -5843,6 +5983,7 @@
+@@ -5843,6 +6037,7 @@
                  params,
                  value_chunks,
                  best_value_len,
@@ -868,7 +957,17 @@ and its LICENSE for provenance, the preserved license, and each local correction
 
 --- a/value.rs
 +++ b/value.rs
-@@ -88,6 +88,17 @@
+@@ -60,6 +60,9 @@
+
+     /// Materialize the indices as integers for inspection and canary walks.
+     fn to_i64_vec(&self) -> Vec<i64>;
++
++    /// Compare the ordered indices without materializing another value.
++    fn indices_equal(&self, other: &Self) -> bool;
+ }
+
+ /// Immutable, cheaply sliced list suitable for simulated KV page identifiers.
+@@ -88,6 +91,17 @@
          }
      }
 
@@ -886,7 +985,23 @@ and its LICENSE for provenance, the preserved license, and each local correction
      pub fn as_slice(&self) -> &[T] {
          &self.storage[self.range.clone()]
      }
-@@ -121,7 +132,7 @@
+@@ -110,18 +124,22 @@
+
+ impl<T> RadixValue for PageValue<T>
+ where
+-    T: Copy + Debug + TryInto<i64> + 'static,
++    T: Copy + Debug + PartialEq + TryInto<i64> + 'static,
+ {
+     fn len(&self) -> usize {
+         self.range.len()
+     }
+
++    fn indices_equal(&self, other: &Self) -> bool {
++        self.as_slice() == other.as_slice()
++    }
++
+     fn shallow_clone(&self) -> Self {
+         self.clone()
      }
 
      fn copy_for_adoption(&self) -> Self {

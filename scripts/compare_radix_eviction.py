@@ -25,7 +25,7 @@ BASELINE = "8288046ac88fccaee124714cd60e62b2ad4e184d"
 PROBE = Path("crates/core/src/engine/cache/eviction_evidence.rs")
 SCENARIOS = PROBE.with_name("eviction-selection-scenarios.json")
 COMPARISON = SCENARIOS.with_name("eviction-selection-comparison.json")
-LIFECYCLE_RECORD = SCENARIOS.with_name("radix-lifecycle-comparison.json")
+LIFECYCLE_RECORD = SCENARIOS.with_name("radix-matched-prefix-comparison.json")
 TEST = "eviction_selection_matches_recorded_evidence"
 MODULE = '\n#[cfg(test)]\n#[path = "eviction_evidence.rs"]\nmod eviction_evidence;\n'
 
@@ -133,6 +133,8 @@ def main() -> None:
             matches = (
                 bool(expected)
                 and len(observed_by_name) == len(observed_scenarios)
+                and len(observed_scenarios) == len(expected)
+                and observed_by_name.keys() == {item["scenario"] for item in expected}
                 and all(observed_by_name.get(item["scenario"]) == item for item in expected)
             )
             report[side]["recorded_scenarios_match"] = matches

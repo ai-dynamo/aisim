@@ -85,7 +85,9 @@ def synchronize(checkout: Path, *, check: bool) -> None:
         for destination, source in SOURCES.items():
             path = generated / destination
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(native_source(upstream(f"{UPSTREAM}/{source}").decode(), source))
+            path.write_text(
+                native_source(upstream(f"{UPSTREAM}/{source}").decode("utf-8"), source), encoding="utf-8", newline="\n"
+            )
         (generated / "LICENSE").write_bytes(upstream("LICENSE"))
         subprocess.run(["rustfmt", "--edition", "2024", str(generated / "mod.rs")], check=True)
         apply_local_fixes(generated)
