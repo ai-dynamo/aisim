@@ -302,6 +302,7 @@ def moe_modes(
         "fp8_block": moe.fp8_block,
         "nvfp4": nvfp4,
         "w4a16_nvfp4": moe.w4a16_nvfp4,
+        "w4a16_mxfp4": moe.w4a16_mxfp4,
     }
     unlisted = moe.bfloat16 if checkpoint.targets_only else default
 

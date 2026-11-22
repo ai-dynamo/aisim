@@ -322,6 +322,60 @@ def test_fp8_config_group_scaling_reaches_native_pricing(monkeypatch, tmp_path, 
         assert inferred[prefill] == pytest.approx(explicit[prefill], rel=1e-9)
 
 
+@pytest.mark.parametrize("format_location", ["group", "checkpoint"])
+def test_mxfp4_config_group_keeps_weight_only_expert_pricing(monkeypatch, tmp_path, format_location):
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
+
+    def compressed_mxfp4(section, _e_layers):
+        section.clear()
+        group = {
+            "weights": {"num_bits": 4, "type": "float", "group_size": 32, "strategy": "group"},
+            "input_activations": None,
+            "targets": ["*.experts.*"],
+        }
+        section.update(
+            quant_method="compressed-tensors",
+            config_groups={"experts": group},
+            ignore=[
+                "*.in_proj",
+                "*.out_proj",
+                "*.q_proj",
+                "*.k_proj",
+                "*.v_proj",
+                "*.o_proj",
+                "*.shared_experts.*",
+                "*.fc1_latent_proj",
+                "*.fc2_latent_proj",
+                "lm_head",
+            ],
+        )
+        # A group can override the checkpoint's general compression format.
+        section["format"] = "float-quantized"
+        (group if format_location == "group" else section)["format"] = "mxfp4-pack-quantized"
+
+    path = _write_super(tmp_path, compressed_mxfp4)
+    (tmp_path / "hf_quant_config.json").unlink()
+    for model in (
+        get_model(path, ModelConfig(moe_tp_size=1, system="gb200"), "vllm"),
+        _task_model(_task(path), path),
+    ):
+        assert model.config.gemm_quant_mode == BF16
+        assert model.config.moe_quant_mode == MOE.w4a16_mxfp4
+        for pipeline, scale in ((model.context_ops, 1), (model.generation_ops, model._mtp_scale_factor)):
+            assert all(set(modes) == {BF16} for modes in _buckets(pipeline).values())
+            assert _buckets(pipeline, ("moe",), scale)["moe"] == {MOE.w4a16_mxfp4: 40}
+        # Two expert matrices per layer, 4-bit weights, no NVFP4 scale-byte surcharge.
+        expected_bytes = 40 * model._num_experts * 2 * model._moe_inter_size * model._hybrid_config.moe_latent_size / 2
+        assert sum(op.get_weights() for op in model.context_ops if op._name == "context_moe") == expected_bytes
+
+    inferred = _latencies(path)
+    explicit = _latencies(path, gemm_quant_mode=BF16, moe_quant_mode=MOE.w4a16_mxfp4)
+    # The checkpoint's unquantized inputs require BF16 compute, as in the explicit
+    # weight-only reference; native prefill/decode must not price NVFP4 tensor cores.
+    for prefill in (True, False):
+        assert inferred[prefill] == pytest.approx(explicit[prefill], rel=1e-9)
+
+
 def test_config_loader_keeps_quoted_infinity_markers(tmp_path):
     path = tmp_path / "config.json"
     path.write_text('{"bare": [0.0, Infinity, -Infinity, NaN], "marker": {"__float__": "Infinity"}}')

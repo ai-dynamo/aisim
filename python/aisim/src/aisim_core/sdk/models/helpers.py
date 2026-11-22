@@ -747,7 +747,7 @@ def _normalize_mixed_precision_layer_algo(value: object) -> str | None:
     return aliases.get(algo, algo)
 
 
-def _infer_mixed_precision_group_algo(group: dict) -> str | None:
+def _infer_mixed_precision_group_algo(group: dict, default_format: str | None = None) -> str | None:
     """Infer the layer algorithm from a checkpoint config_groups entry."""
     weights = group.get("weights")
     if not isinstance(weights, dict):
@@ -779,6 +779,10 @@ def _infer_mixed_precision_group_algo(group: dict) -> str | None:
             return "fp8_block"
         return "fp8"
     if num_bits == 4 and "float" in weight_type:
+        # Packed MXFP4 is weight-only, unlike NVFP4's W4A4 lane. A group
+        # may declare its format itself or inherit the checkpoint's format.
+        if str(group.get("format") or default_format).lower() == "mxfp4-pack-quantized":
+            return "w4a16_mxfp4"
         return "nvfp4"
     return None
 
@@ -808,7 +812,7 @@ def _iter_mixed_precision_layer_algos(raw_config: dict):
     if isinstance(groups, dict):
         for group in groups.values():
             if isinstance(group, dict):
-                algo = _infer_mixed_precision_group_algo(group)
+                algo = _infer_mixed_precision_group_algo(group, quant.get("format"))
                 for target in group.get("targets") or []:
                     yield target, algo, False
 
