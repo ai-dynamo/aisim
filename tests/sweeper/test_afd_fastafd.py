@@ -16,10 +16,10 @@ from pydantic import ValidationError
 from aisimulate.compiler import prediction_to_replay_spec
 from aisimulate.config import CorePredictionConfig
 from aisimulate.legacy_cli.api import cli_estimate
-from aisimulate.runner import _afd_layer_measurements, _afd_topology
+from aisimulate.runner import EngineReplayRunnerFactory, _afd_layer_measurements, _afd_topology
 from aisimulate.sdk.inference_session import AFDInferenceSession
 from aisimulate.sweeper import afd_fastafd
-from aisimulate.sweeper.afd_engine import evaluate_afd_phase
+from aisimulate.sweeper.afd_engine import AFDForegroundEngine, evaluate_afd_phase
 from aisimulate.sweeper.afd_fastafd import FastAFDMoEStagePerformanceModel
 from aisimulate.sweeper.afd_parallel import AFDInfeasible, AFDTopology
 from aisimulate.sweeper.afd_perfmodel import AFDLayerTimes, AFDMeasurementRequest, AICAFDPerformanceModel
@@ -666,6 +666,131 @@ def test_serial_decode_evaluates_the_replayed_profile_stage(tmp_path):
 
     # 94 layers * 2 microbatches * 0.092 ms of A + 11.213456 ms of F.
     assert evaluation.step_latency_ms == pytest.approx(28.509456)
+
+
+def _decode_reference(topology, samples, ffn_ms, output_length):
+    """Use the session decode integrator on the same engine-measured A trace."""
+    session = object.__new__(AFDInferenceSession)
+    session._afd_config = SimpleNamespace(num_microbatches=2, pipeline_model=topology.pipeline_model.value)
+    session._nextn = 0
+    by_seq = {1025 + 32 * i: ms for i, (ms, _) in enumerate(samples)}
+    session._sum_latency = lambda ops, **kw: (
+        (by_seq[kw["seq_len"]] if ops == "A" else ffn_ms) * LAYERS,
+        {},
+    )
+    return session._integrate_decode_phase(
+        a_partition=SimpleNamespace(attn_ops="A"),
+        f_partition=SimpleNamespace(ffn_ops="F"),
+        a_model=None,
+        f_model=None,
+        runtime_config=SimpleNamespace(),
+        isl=1024,
+        osl=output_length,
+        a_batch_size=64,
+        b_batch_size=512,
+        num_layers=LAYERS,
+        brk_t_a_per_layer=0.0,
+        brk_t_f_per_layer=0.0,
+        t_a2f_layer=0.0,
+        t_f2a_layer=0.0,
+    )[3]
+
+
+@pytest.mark.parametrize(
+    "pipeline_model,expected", [("optimistic", 23.575), ("conservative", 23.575), ("serial", 37.6)]
+)
+def test_fastafd_crossing_trace_survives_replay_serialization(tmp_path, pipeline_model, expected):
+    request = replace(_request(_topology(pipeline_model=pipeline_model)), output_length=65)
+    (attention,) = _Attention().measure(request)
+    components = {**COMPONENTS, "attention_compute_ms": 0.098}
+    attention = replace(
+        attention,
+        attention_ms=0.104,
+        provenance={
+            "components": components,
+            "decode_samples": [
+                {"repeat": 32, "components": {**components, "attention_compute_ms": ms}} for ms in (0.048, 0.148)
+            ],
+        },
+    )
+    entry = {**_entry(), "latency_ms": 18.8}  # F = 18.8 / (94 * 2) = 0.10 ms.
+    raw = _prediction(_profile(tmp_path, [entry]))
+    raw["engine"]["afd"]["pipeline_model"] = pipeline_model
+    raw["traffic"]["source"]["output_tokens"] = 65
+    # Isolate service TPOT from queueing behind other decode batches.
+    raw["traffic"]["load"]["concurrency"] = 1
+    raw["traffic"]["stop"]["requests"] = 1
+    spec = prediction_to_replay_spec(
+        CorePredictionConfig.model_validate(raw),
+        afd_performance_model=SimpleNamespace(measure=lambda _: (attention,)),
+    )
+    # JSON round trip exercises the serialized lists used in saved replay specs.
+    deployment = spec.backend_deployment
+    metadata = json.loads(json.dumps(deployment.performance_model_metadata))
+    (measurement,) = _afd_layer_measurements(replace(deployment, performance_model_metadata=metadata))
+    assert measurement.decode_attention_samples == ((0.05, 32), (0.15, 32))
+    planned = AFDForegroundEngine(request.topology, (measurement,)).execute_pass(
+        phase="decode", now_ms=0.0, input_length=1024, output_length=65
+    )
+    # For overlap, sample steps are 18.85 and 28.30 ms: mean 23.575.
+    # The averaged-input maximum would incorrectly give only 18.90 ms.
+    assert planned.end_ms == pytest.approx(expected)
+    assert planned.intervals[-1].end_ms == pytest.approx(expected)
+    assert planned.evaluation.step_latency_ms == pytest.approx(
+        _decode_reference(request.topology, measurement.decode_attention_samples, 0.1, 65)
+    )
+    report = EngineReplayRunnerFactory().create(0).run(spec)
+    assert report.metrics["mean_tpot_ms"] == pytest.approx(expected)
+    assert report.metrics["completed_requests"] == 1
+
+
+@pytest.mark.parametrize("provider_path", ["attention_only", "cli"])
+@pytest.mark.parametrize("pipeline_model", ["optimistic", "conservative", "serial"])
+def test_builtin_fastafd_integrates_native_attention_samples(
+    tmp_path, fastafd_attention_sol, provider_path, pipeline_model
+):
+    request = replace(_request(_topology(pipeline_model=pipeline_model)), output_length=66, max_seq_len=2048)
+    provider = AICAFDPerformanceModel()
+    if provider_path == "cli":
+        provider = AICAFDPerformanceModel(lambda *a, **kw: cli_estimate(*a, **kw, database_mode="SOL"))
+    path = _profile(tmp_path)
+    fastafd = _provider(tmp_path, provider, profile_path=path)
+    (initial,) = fastafd.measure(request)
+    samples = initial.decode_attention_samples
+    assert [repeat for _, repeat in samples] == [32, 32, 1]
+    lo, hi = min(ms for ms, _ in samples), max(ms for ms, _ in samples)
+    assert hi > lo  # Real Rust SOL attention increases with KV length.
+    ffn_ms = (lo + hi) / 2
+    payload = json.loads(Path(path).read_text())
+    payload["entries"][0]["latency_ms"] = ffn_ms * LAYERS * 2
+    Path(path).write_text(json.dumps(payload))
+    (measurement,) = fastafd.measure(request)
+    evaluation = evaluate_afd_phase(request.topology, measurement, input_length=1024, output_length=66)
+    assert evaluation.step_latency_ms == pytest.approx(
+        _decode_reference(request.topology, samples, ffn_ms, 66), rel=1e-12
+    )
+    if pipeline_model != "serial":
+        averaged = evaluate_afd_phase(
+            request.topology, replace(measurement, decode_attention_samples=()), input_length=1024, output_length=66
+        )
+        assert evaluation.step_latency_ms > averaged.step_latency_ms
+
+
+@pytest.mark.parametrize(
+    "trace,match",
+    [
+        ([], "non-empty sequence"),
+        ([{"repeat": 0, "components": COMPONENTS}], "repeat must be a positive integer"),
+        ([{"repeat": 1, "components": {**COMPONENTS, "attention_compute_ms": float("nan")}}], "finite"),
+        ([{"repeat": 1, "components": {**COMPONENTS, "a_router_ms": 0}}], "positive A-side router"),
+        ([{"repeat": 1, "components": {**COMPONENTS, "attention_compute_ms": 0.5}}], "does not reconcile"),
+    ],
+)
+def test_fastafd_rejects_invalid_or_inconsistent_sample_traces(tmp_path, trace, match):
+    (attention,) = _Attention().measure(_request(_topology()))
+    attention = replace(attention, provenance={**attention.provenance, "decode_samples": trace})
+    with pytest.raises(AFDInfeasible, match=match):
+        _provider(tmp_path, SimpleNamespace(measure=lambda _: (attention,))).measure(_request(_topology()))
 
 
 @pytest.mark.parametrize("precision", ["w4a8_mxfp4_mxfp8", "fp8"])

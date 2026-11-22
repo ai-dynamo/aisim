@@ -95,6 +95,7 @@ class FastAFDMoEStagePerformanceModel:
                 a_to_f_ms=0.0,
                 f_to_a_ms=0.0,
                 num_layers=estimate["num_layers"],
+                decode_attention_samples=self._decode_samples(attention),
                 provenance={
                     "provider": "fastafd",
                     "api_version": AFD_MEASUREMENT_API_VERSION,
@@ -128,6 +129,52 @@ class FastAFDMoEStagePerformanceModel:
         ):
             raise _infeasible("the attention provider must return exactly one decode AFDLayerTimes")
         return measurements[0]
+
+    @staticmethod
+    def _decode_samples(attention: AFDLayerTimes) -> tuple[tuple[float, int], ...]:
+        raw = attention.provenance.get("decode_samples")
+        if "decode_samples" not in attention.provenance:
+            # Legacy/custom providers without a trace describe constant A time.
+            return ()
+        if not isinstance(raw, (list, tuple)) or not raw:
+            raise _infeasible("the attention provider decode_samples must be a non-empty sequence")
+        samples = []
+        total_repeat = 0
+        compute_sum = combine_sum = router_sum = 0.0
+        for sample in raw:
+            if not isinstance(sample, Mapping):
+                raise _infeasible("invalid attention provider decode sample")
+            repeat = sample.get("repeat")
+            components = sample.get("components")
+            if isinstance(repeat, bool) or not isinstance(repeat, int) or repeat < 1:
+                raise _infeasible("decode sample repeat must be a positive integer")
+            if not isinstance(components, Mapping) or any(name not in components for name in _ATTENTION_COMPONENTS):
+                raise _infeasible("decode sample must expose the attention boundary components")
+            # Validate the boundary for every KV sample, including the
+            # router's presence and exact removal of the A-side combine.
+            compute = components["attention_compute_ms"]
+            combine = components["a_combine_ms"]
+            for name in _ATTENTION_COMPONENTS:
+                value = components[name]
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    or value < 0
+                ):
+                    raise _infeasible(f"decode sample {name} must be a finite non-negative number")
+            if components["a_router_ms"] <= 0:
+                raise _infeasible("decode sample must include positive A-side router time")
+            samples.append((compute + components["a_router_ms"], repeat))
+            total_repeat += repeat
+            compute_sum += compute * repeat
+            combine_sum += combine * repeat
+            router_sum += components["a_router_ms"] * repeat
+        averaged = FastAFDMoEStagePerformanceModel._components(attention)
+        for name, total in zip(_ATTENTION_COMPONENTS, (compute_sum, combine_sum, router_sum), strict=True):
+            if not math.isclose(total / total_repeat, averaged[name], rel_tol=1e-9, abs_tol=1e-12):
+                raise _infeasible(f"decode sample {name} does not reconcile with its averaged component")
+        return tuple(samples)
 
     @staticmethod
     def _components(attention: AFDLayerTimes) -> dict[str, float]:

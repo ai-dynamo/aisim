@@ -681,6 +681,7 @@ def _afd_layer_measurements(deployment) -> tuple[AFDLayerTimes, ...]:
                     f_to_a_ms=raw["f_to_a_ms"],
                     num_layers=raw["num_layers"],
                     provenance=raw.get("provenance", {}),
+                    decode_attention_samples=raw.get("decode_attention_samples", ()),
                 )
             )
         except KeyError as exc:

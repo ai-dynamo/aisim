@@ -105,6 +105,15 @@ Both pools must fit, so an oversized default-precision F model cannot reject a
 fitting low-bit stage. The resolved stage identity and both memory breakdowns
 are retained in attention provenance. Explicit external providers retain their
 own measurement and memory-qualification contracts.
+Decode providers retain the KV samples and their repeat counts in
+`provenance.decode_samples`, including each sample's attention boundary
+components. FastAFD replaces the F stage and recomposes A for every sample.
+The serialized measurement's `decode_attention_samples` contains the resulting
+`[attention_ms, repeat]` pairs; its headline A time is their weighted mean.
+The pipeline maximum is evaluated before averaging the sampled cadence, so a
+decode trace that crosses between F-bound and A-bound does not undercount TPOT.
+Foreground intervals use the mean stage durations and sampled mean cadence.
+Custom providers without a sample trace describe constant attention time.
 The canonical model returned by `RustForwardPassPerfModel.best_available` also
 exposes this composition as `estimate_fastafd_attention(isl=..., osl=...,
 max_seq_len=...)` for a selected `fastafd_stage` identity.

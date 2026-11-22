@@ -90,6 +90,25 @@ def test_communication_overhead_is_applied_and_provenanced():
     assert result.provenance["layer_times"]["f_to_a_ms"] == pytest.approx(0.5)
 
 
+@pytest.mark.parametrize("pipeline_model", ["optimistic", "conservative", "serial"])
+def test_sampled_decode_with_one_microbatch_keeps_serial_cadence(pipeline_model):
+    result = evaluate_afd_phase(
+        _topology(num_microbatches=1, pipeline_model=pipeline_model),
+        _times(
+            attention_ms=2.0,
+            ffn_ms=2.0,
+            a_to_f_ms=0.0,
+            f_to_a_ms=0.0,
+            decode_attention_samples=((1.0, 1), (3.0, 1)),
+        ),
+        input_length=128,
+        output_length=3,
+    )
+    # Two layers, each serial unit averaging A=2 and F=2 ms: 8 ms total.
+    assert result.step_latency_ms == pytest.approx(8.0)
+    assert result.effective_pipeline_model is AFDPipelineModel.SERIAL
+
+
 def test_foreground_pass_expands_every_stage_and_matches_formula_boundary():
     engine = AFDForegroundEngine(_topology(), (_times(),))
 

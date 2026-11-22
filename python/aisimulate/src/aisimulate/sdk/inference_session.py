@@ -1606,6 +1606,7 @@ class AFDInferenceSession:
         isl, osl = runtime_config.isl, runtime_config.osl
         total_ms = 0.0
         total_repeat = 0
+        decode_samples = []
         for seq_len, repeat in self._decode_samples(isl, osl):
             ms, _ = self._sum_latency(
                 a_partition.attn_ops,
@@ -1617,6 +1618,7 @@ class AFDInferenceSession:
             )
             total_ms += ms * repeat
             total_repeat += repeat
+            decode_samples.append({"seq_len": seq_len, "repeat": repeat, "attention_compute_ms": ms / num_layers})
         router_ms, _ = self._sum_latency(
             routers,
             batch_size=a_batch * (self._nextn + 1),
@@ -1651,10 +1653,17 @@ class AFDInferenceSession:
             if summary.check_oom() or summary.check_kv_cache_oom():
                 raise RuntimeError(f"OOM: FastAFD {pool} pool does not fit in GPU memory")
         compute_ms = total_ms / max(total_repeat, 1) / num_layers
+        for sample in decode_samples:
+            sample["components"] = {
+                "attention_compute_ms": sample.pop("attention_compute_ms"),
+                "a_combine_ms": 0.0,
+                "a_router_ms": router_ms / num_layers,
+            }
         return {
             "attention_ms": compute_ms,
             "num_layers": num_layers,
             "provenance": {
+                "decode_samples": decode_samples,
                 "components": {
                     "attention_compute_ms": compute_ms,
                     # The measured stage includes combine; it is never queried here.
@@ -1682,6 +1691,7 @@ class AFDInferenceSession:
         brk_t_f_per_layer: float,
         t_a2f_layer: float,
         t_f2a_layer: float,
+        attention_samples: list | None = None,
     ) -> tuple[float, float, float, float, dict, dict, bool]:
         """Integrate compute latency along the decode KV-cache length.
 
@@ -1735,6 +1745,10 @@ class AFDInferenceSession:
             )
 
             t_a_layer_i = t_a_step_i / num_layers + brk_t_a_per_layer
+            if attention_samples is not None:
+                attention_samples.append(
+                    {"seq_len": s_i, "repeat": repeat, "attention_compute_ms": t_a_step_i / num_layers}
+                )
             t_f_layer_i = t_f_step_i / num_layers + brk_t_f_per_layer
             # IMPORTANT: pipeline max is applied per-step before
             # accumulation. ``sum_i max(...)`` ≠ ``max(sum_i ...)``;
@@ -1897,6 +1911,7 @@ class AFDInferenceSession:
         # per-layer average; their absolute cost is small relative to
         # ``num_layers`` per-layer compute and AFD does not currently
         # model them as separate stages.
+        attention_samples = []
         if phase == "decode":
             (
                 t_a_layer,
@@ -1921,6 +1936,7 @@ class AFDInferenceSession:
                 brk_t_f_per_layer=brk_t_f_per_layer,
                 t_a2f_layer=t_a2f_layer,
                 t_f2a_layer=t_f2a_layer,
+                attention_samples=attention_samples,
             )
             # ``comm_hidden`` was captured during the decode integration
             # loop above — reuse it instead of re-evaluating
@@ -2022,6 +2038,12 @@ class AFDInferenceSession:
         a_memory_summary = self._check_memory_dict(a_memory, runtime_config, free_gpu_memory_fraction)
         f_memory_summary = self._check_memory_dict(f_memory, runtime_config, None)
 
+        for sample in attention_samples:
+            sample["components"] = {
+                "attention_compute_ms": sample.pop("attention_compute_ms"),
+                "a_combine_ms": brk_t_a_per_layer,
+                "a_router_ms": t_a_router / num_layers,
+            }
         return {
             "t_a_layer": t_a_layer,
             "t_f_layer": t_f_layer,
@@ -2044,6 +2066,7 @@ class AFDInferenceSession:
             "f_is_kv_cache_oom": f_memory_summary.check_kv_cache_oom(),
             "num_layers": num_layers,
             "t_a_combine_layer": brk_t_a_per_layer,
+            "decode_samples": attention_samples,
             "t_a_router_layer": t_a_router / num_layers,
             "t_f_router_layer": t_f_router / num_layers,
             "t_f_collective_layer": brk_t_f_per_layer,
@@ -2293,6 +2316,7 @@ class AFDInferenceSession:
                     "a_to_f_ms": float(metrics["t_a2f_layer"]),
                     "f_to_a_ms": float(metrics["t_f2a_layer"]),
                     "num_layers": num_layers,
+                    **({"decode_samples": metrics["decode_samples"]} if metrics.get("decode_samples") else {}),
                     # The local A router is measured separately from the F
                     # router already included in the standard AFD headline.
                     "components": {

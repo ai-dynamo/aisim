@@ -132,6 +132,33 @@ def test_measurement_boundary_rejects_trace_without_concrete_lengths():
         )
 
 
+@pytest.mark.parametrize("samples", [None, [(1.0, 0)], [(True, 1)], [(float("nan"), 1)], [(2.0, 1)], [(1.0,)]])
+def test_decode_sample_contract_rejects_invalid_or_inconsistent_saved_values(samples):
+    with pytest.raises(AFDInfeasible, match="decode attention sample"):
+        AFDLayerTimes(
+            phase="decode",
+            attention_ms=1.0,
+            ffn_ms=2.0,
+            a_to_f_ms=0.0,
+            f_to_a_ms=0.0,
+            num_layers=2,
+            decode_attention_samples=samples,
+        )
+
+
+def test_sampled_stage_requires_transfers_inside_f():
+    with pytest.raises(AFDInfeasible, match="without external transfers"):
+        AFDLayerTimes(
+            phase="decode",
+            attention_ms=1.0,
+            ffn_ms=2.0,
+            a_to_f_ms=0.1,
+            f_to_a_ms=0.0,
+            num_layers=2,
+            decode_attention_samples=((1.0, 1),),
+        )
+
+
 def test_attach_measurements_rejects_wrong_phase_coverage():
     topology = _topology(phase="both")
     sample = _sample(topology)

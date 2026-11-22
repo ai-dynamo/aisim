@@ -166,6 +166,10 @@ def evaluate_afd_phase(
         else:
             cycle = max(t_a, t_f, t_c)
             hidden = t_c <= max(t_a, t_f)
+    if times.decode_attention_samples and effective is not AFDPipelineModel.SERIAL:
+        # FastAFD includes transfers in F. Its immutable measurement prepares
+        # the weighted per-sample max(A, F) once, before repeated replay passes.
+        cycle = times._decode_overlap_ms
     fill = t_a + t_f + t_a2f + t_f2a
     step = (fill + cycle * max(topology.num_microbatches * times.num_layers - 1, 0)) * float(latency_correction)
     if step <= 0:

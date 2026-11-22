@@ -29,6 +29,12 @@ class AFDLayerTimes:
     f_to_a_ms: float
     num_layers: int
     provenance: Mapping[str, Any] = field(default_factory=dict)
+    # Optional (A milliseconds, repeat count) FastAFD decode trace. F is
+    # constant and includes transfers. Empty describes constant attention_ms.
+    decode_attention_samples: tuple[tuple[float, int], ...] = ()
+    # FastAFD includes transfers in F. Prepare its overlapped cadence once,
+    # rather than rescanning the entire decode trace on every foreground pass.
+    _decode_overlap_ms: float | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         try:
@@ -68,6 +74,47 @@ class AFDLayerTimes:
             )
         object.__setattr__(self, "phase", phase)
         object.__setattr__(self, "provenance", MappingProxyType(dict(self.provenance)))
+        if not isinstance(self.decode_attention_samples, (tuple, list)):
+            raise AFDInfeasible(AFDReasonCategory.INVALID_MEASUREMENT, "invalid decode attention samples")
+        samples = []
+        attention_sum = overlap_sum = 0.0
+        total_repeat = 0
+        for sample in self.decode_attention_samples:
+            if not isinstance(sample, (tuple, list)) or len(sample) != 2:
+                raise AFDInfeasible(AFDReasonCategory.INVALID_MEASUREMENT, "invalid decode attention sample")
+            ms, repeat = sample
+            if (
+                isinstance(ms, bool)
+                or not isinstance(ms, (int, float))
+                or not math.isfinite(ms)
+                or ms < 0
+                or isinstance(repeat, bool)
+                or not isinstance(repeat, int)
+                or repeat < 1
+            ):
+                raise AFDInfeasible(AFDReasonCategory.INVALID_MEASUREMENT, "invalid decode attention sample")
+            samples.append((float(ms), repeat))
+            attention_sum += ms * repeat
+            overlap_sum += max(ms, self.ffn_ms) * repeat
+            total_repeat += repeat
+        if samples and (
+            phase is not AFDPhase.DECODE
+            or self.a_to_f_ms != 0.0
+            or self.f_to_a_ms != 0.0
+            or not math.isclose(
+                attention_sum / total_repeat,
+                self.attention_ms,
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+        ):
+            raise AFDInfeasible(
+                AFDReasonCategory.INVALID_MEASUREMENT,
+                "decode attention samples require decode without external transfers and must average to attention_ms",
+            )
+        object.__setattr__(self, "decode_attention_samples", tuple(samples))
+        if samples:
+            object.__setattr__(self, "_decode_overlap_ms", overlap_sum / total_repeat)
 
 
 @dataclass(frozen=True)
@@ -290,6 +337,7 @@ class AICAFDPerformanceModel:
                                 if isinstance(components, Mapping)
                                 else {}
                             ),
+                            **({"decode_samples": item["decode_samples"]} if "decode_samples" in item else {}),
                         },
                     )
                 )
@@ -311,6 +359,11 @@ def _measurement_payload(measurement: AFDLayerTimes) -> dict[str, Any]:
         "f_to_a_ms": float(measurement.f_to_a_ms),
         "num_layers": measurement.num_layers,
         "provenance": dict(measurement.provenance),
+        **(
+            {"decode_attention_samples": measurement.decode_attention_samples}
+            if measurement.decode_attention_samples
+            else {}
+        ),
     }
 
 
