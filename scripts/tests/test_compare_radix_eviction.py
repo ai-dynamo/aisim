@@ -20,7 +20,15 @@ SPEC.loader.exec_module(compare)
 
 
 class CompareRadixTests(unittest.TestCase):
-    def check_frozen_overlays(self, mode, *, corrupt_record=False, extra_observation=False, missing_observation=False):
+    def check_frozen_overlays(
+        self,
+        mode,
+        *,
+        corrupt_record=False,
+        corrupt_observation=False,
+        extra_observation=False,
+        missing_observation=False,
+    ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             checkout = root / "checkout"
@@ -47,6 +55,8 @@ class CompareRadixTests(unittest.TestCase):
                 overlays[compare.LIFECYCLE_RECORD] = json.dumps(
                     {side: {"scenarios": recorded} for side in ("baseline", "candidate")}
                 ).encode()
+                if corrupt_observation:
+                    observations[2] = {**observations[2], "removed_block_hashes": [999]}
                 if extra_observation:
                     observations.append({"scenario": "unrecorded", "removed_block_hashes": [104]})
                 if missing_observation:
@@ -115,7 +125,7 @@ class CompareRadixTests(unittest.TestCase):
                 patch("sys.argv", argv),
                 patch.object(compare.subprocess, "run", side_effect=run_with_source_edits),
             ):
-                if corrupt_record or extra_observation or missing_observation:
+                if corrupt_record or corrupt_observation or extra_observation or missing_observation:
                     with self.assertRaisesRegex(SystemExit, "lifecycle observations differ"):
                         compare.main()
                     report = json.loads((work / "comparison.json").read_text())
@@ -142,6 +152,9 @@ class CompareRadixTests(unittest.TestCase):
 
     def test_lifecycle_overlay_stays_frozen_during_builds(self):
         self.check_frozen_overlays("lifecycle")
+
+    def test_lifecycle_rejects_a_changed_third_observation_removal_hash(self):
+        self.check_frozen_overlays("lifecycle", corrupt_observation=True)
 
     def test_lifecycle_rejects_an_extra_observation(self):
         self.check_frozen_overlays("lifecycle", extra_observation=True)
