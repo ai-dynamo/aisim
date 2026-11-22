@@ -29,8 +29,10 @@ from aisim.fpm_contract import (
     FPM_POWER_WINDOW_REL_TOL,
 )
 from aisim_core.sdk.fpm_identity import EXECUTION_COLUMNS
+from collector import glm53flash_attention_tokens
 from collector.glm53flash_runtime_identity import BASELINE_VERSIONS
 
+from .glm53flash_points import MAX_BATCH, MAX_CONTEXT
 from .planner import FPMCell
 from .types import KVWARM_STRATEGIES
 
@@ -327,9 +329,38 @@ def _glm_producer_record() -> dict[str, Any]:
             (_GLM_RUNTIME / "runtime-source-sha256.json").read_bytes()
         ).hexdigest(),
         "overlay_sha256": hashlib.sha256((_GLM_RUNTIME / "glm53flash_prefix_scheduler.py").read_bytes()).hexdigest(),
+        # Version 1 names the shape of the context_policy record. Its rule is a lower bound: the runtime context is at
+        # least the measured context plus the producer's headroom. No consumer reads the number.
         "context_policy_version": 1,
         "warmup_repeats": 5,
         "measurement_repeats": 10,
+    }
+
+
+@functools.cache
+def _glm_input_record(generator_version: int) -> dict[str, Any] | None:
+    """The seeded input fields that the producer of ``generator_version`` writes, or None for another version.
+
+    The fields come in the order in which the reader compares them. The producer draws ``MAX_CONTEXT + MAX_BATCH *
+    REQUEST_STRIDE`` tokens with the generator of collector/glm53flash_attention_tokens.py, and records the digest of
+    their compact JSON list and the number of distinct tokens; this function draws the same stream once in a process.
+    A later generator version must keep the function of every version that a stored campaign names, or the reader
+    refuses that campaign with ``input_provenance.generator_version``.
+    """
+    seeded = glm53flash_attention_tokens
+    if generator_version != seeded.GENERATOR_VERSION:
+        return None
+    count = MAX_CONTEXT + MAX_BATCH * seeded.REQUEST_STRIDE
+    tokens = seeded.generate(seeded.SEED, count, seeded.VOCAB_LOW, seeded.VOCAB_HIGH)
+    return {
+        "generator": seeded.GENERATOR,
+        "seed": seeded.SEED,
+        "count": count,
+        "vocab_low": seeded.VOCAB_LOW,
+        "vocab_high_exclusive": seeded.VOCAB_HIGH,
+        "tokenizer_json_sha256": seeded.TOKENIZER_JSON_SHA256,
+        "token_ids_sha256": hashlib.sha256(json.dumps(tokens, separators=(",", ":")).encode()).hexdigest(),
+        "unique_token_count": len(set(tokens)),
     }
 
 
@@ -430,7 +461,9 @@ def _validate_glm_provenance(
     point and keeps the evidence of the repetitions in a sidecar file next to the artifact. Its ``producer`` record
     must equal the record of the supported producer (``_glm_producer_record``). A refusal names the first item that is
     absent or malformed. ``producer_digests``, the two digests of the cell's producer receipt, replace the two digests
-    of that record. The caller has already checked that the rows are mappings with mapping points.
+    of that record. The digest of each row must be that of the sidecar line with its benchmark_id, and the seeded
+    input must be the record of a generator version that this collector can draw. The caller has already checked that
+    the rows are mappings with mapping points.
     """
 
     def lacks(field: str) -> ValueError:
@@ -480,7 +513,8 @@ def _validate_glm_provenance(
     if not _same(evidence.get("chunk_start_alignment"), 4):
         raise lacks("input_provenance.chunk_start_alignment")
 
-    # The sidecar is bound by its name, its digest and its record count, one record per measured point.
+    # The sidecar is bound by its name, its digest and its record count, one record per measured point, and each row by
+    # the digest of its line.
     sidecar = path.with_name(f"{path.stem}.repetitions.jsonl")
     manifest = evidence.get("repetition_evidence_manifest")
     raw = sidecar.read_bytes() if sidecar.is_file() else None
@@ -490,6 +524,7 @@ def _validate_glm_provenance(
         or not _same(manifest.get("schema_version"), 1)
         or manifest.get("file") != sidecar.name
         or manifest.get("sha256") != hashlib.sha256(raw).hexdigest()
+        or type(manifest.get("records")) is not int
         or manifest.get("records") != len(raw.splitlines())
         or manifest.get("records") != len(payload["results"])
     ):
@@ -504,8 +539,9 @@ def _validate_glm_provenance(
         ("method", "native_prefix_cache_real_seed"),
         ("state_protocol", "glm53flash_prefix_cache_real_seed_v1"),
     )
-    if any(not _same(kvwarm.get(key), value) for key, value in expected_kvwarm):
-        raise lacks("kvwarm")
+    for key, value in expected_kvwarm:
+        if not _same(kvwarm.get(key), value):
+            raise lacks(f"kvwarm.{key}")
     if not _same(payload.get("timing_boundary"), "dynamo_vllm_instrumented_scheduler_fpm_wall_time"):
         raise lacks("timing_boundary")
     serving = payload.get("serving_config")
@@ -513,6 +549,14 @@ def _validate_glm_provenance(
     for key, value in (("enable_prefix_caching", True), ("async_scheduling", False)):
         if not _same(serving.get(key), value):
             raise lacks(f"serving_config.{key}")
+    # The producer's point rules assume Mamba state in align mode, a scheduler block that is the hash block, and
+    # prefill chunks that the scheduler splits at block boundaries.
+    if not _same(serving.get("mamba_cache_mode"), "align"):
+        raise lacks("serving_config.mamba_cache_mode")
+    if type(serving.get("block_size")) is not int or serving.get("block_size") != serving.get("hash_block_size"):
+        raise lacks("serving_config.block_size")
+    if serving.get("need_mamba_block_aligned_split") is not True:
+        raise lacks("serving_config.need_mamba_block_aligned_split")
     # The producer record must be the one that the supported producer writes, field by field and with the same JSON
     # types. A field that the record lacks or adds is refused too.
     producer = payload.get("producer")
@@ -535,9 +579,24 @@ def _validate_glm_provenance(
             f"found {producer[added[0]]!r}: {path}"
         )
 
+    # The producer hashes each sidecar line without its line break and stores the digest in the row of the point with
+    # the line's benchmark_id. The lines follow the order in which the points ran.
+    line_digests: dict[int, str] = {}
+    for line in raw.splitlines():
+        try:
+            record = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise lacks("repetition_evidence") from None
+        benchmark_id = record.get("benchmark_id") if isinstance(record, dict) else None
+        if type(benchmark_id) is not int or benchmark_id in line_digests:
+            raise lacks("repetition_evidence")
+        line_digests[benchmark_id] = hashlib.sha256(line).hexdigest()
     for row in payload["results"]:
         point = row["point"]
         if not _is_hex(row.get("repetition_evidence_sha256"), 64):
+            raise lacks("repetition_evidence_sha256")
+        benchmark_id = point.get("benchmark_id")
+        if type(benchmark_id) is not int or row["repetition_evidence_sha256"] != line_digests.get(benchmark_id):
             raise lacks("repetition_evidence_sha256")
         if point.get("point_type") == "decode":
             regime = "real_kv"
@@ -547,6 +606,15 @@ def _validate_glm_provenance(
             regime = "not_applicable"
         if row.get("kv_seed_regime") != regime:
             raise lacks("kv_seed_regime")
+
+    # The seeded input must be the one that the producer of the recorded generator version draws, field by field and
+    # with the same JSON types.
+    expected_input = _glm_input_record(evidence["generator_version"])
+    if expected_input is None:
+        raise lacks("input_provenance.generator_version")
+    for key, value in expected_input.items():
+        if not _same(evidence.get(key), value):
+            raise lacks(f"input_provenance.{key}")
     return evidence
 
 
@@ -652,6 +720,9 @@ def _without_sidecar_names(evidence: dict[str, Any]) -> dict[str, Any]:
     The rest of each manifest, such as its digest and its record count, still has to agree across ranks.
     """
     sidecar_manifests = ("token_stream_manifest", "repetition_evidence_manifest")
+    for key in sidecar_manifests:
+        if key in evidence and not isinstance(evidence[key], dict):
+            raise ValueError(f"native input provenance {key} must be a mapping, found {evidence[key]!r}")
     return {
         key: {name: item for name, item in value.items() if name != "file"} if key in sidecar_manifests else value
         for key, value in evidence.items()

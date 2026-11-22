@@ -159,8 +159,9 @@ def glm_native_payload(phase: str, *, points: list[dict], rank: int = 0, dp: int
             "pinned_model": GLM_MODEL,
             "pinned_revision": MODEL_REVISIONS[GLM_MODEL],
             "checkpoint_dir": f"/hf-hub/models--zai-org--GLM-5.3-Flash/snapshots/{MODEL_REVISIONS[GLM_MODEL]}",
-            "token_ids_sha256": hashlib.sha256(b"seeded token ids").hexdigest(),
-            "unique_token_count": 100000,
+            # The digest and the distinct-token count of the real stream of seed 53, generator version 2.
+            "token_ids_sha256": "b72027be2cc23b86e212485dc13b24b62969b583eae6ee40ac0124429f7cc15e",
+            "unique_token_count": 126303,
             "sampling": "prompt = concatenated [offset, length] rotations of the seeded stream (see prompt specs)",
             "chunk_start_alignment": 4,
             "decode_contexts_sha256": None,
@@ -538,6 +539,45 @@ def _evidence(payload: dict) -> dict:
     return payload["input_provenance"]
 
 
+def _rewrite_sidecar(payload: dict, sidecar: Path, lines: list[bytes]) -> None:
+    """Write ``lines`` as the sidecar, each with a line break, and give the manifest their digest and their count."""
+    raw = b"".join(line + b"\n" for line in lines)
+    sidecar.write_bytes(raw)
+    manifest = payload["input_provenance"]["repetition_evidence_manifest"]
+    manifest.update(sha256=hashlib.sha256(raw).hexdigest(), records=len(lines))
+
+
+def _swap_the_row_digests(payload: dict, _sidecar: Path) -> None:
+    first, second = payload["results"]
+    first["repetition_evidence_sha256"], second["repetition_evidence_sha256"] = (
+        second["repetition_evidence_sha256"],
+        first["repetition_evidence_sha256"],
+    )
+
+
+def _sidecar_lines(sidecar: Path) -> list[bytes]:
+    return sidecar.read_bytes().splitlines()
+
+
+def _repeat_the_first_id(payload: dict, sidecar: Path) -> None:
+    lines = [json.loads(line) for line in _sidecar_lines(sidecar)]
+    lines[1]["benchmark_id"] = lines[0]["benchmark_id"]
+    _rewrite_sidecar(
+        payload, sidecar, [json.dumps(line, sort_keys=True, separators=(",", ":")).encode() for line in lines]
+    )
+
+
+def _first_id_as_a_string(payload: dict, sidecar: Path) -> None:
+    lines = _sidecar_lines(sidecar)
+    first = json.loads(lines[0])
+    first["benchmark_id"] = str(first["benchmark_id"])
+    _rewrite_sidecar(payload, sidecar, [json.dumps(first, sort_keys=True, separators=(",", ":")).encode(), *lines[1:]])
+
+
+def _first_line_is_no_json(payload: dict, sidecar: Path) -> None:
+    _rewrite_sidecar(payload, sidecar, [b"not json", *_sidecar_lines(sidecar)[1:]])
+
+
 REFUSALS = [
     pytest.param(
         "execution_identity",
@@ -697,20 +737,29 @@ REFUSALS = [
         lambda p, _: _evidence(p)["repetition_evidence_manifest"].update(records=3),
         id="manifest-records",
     ),
+    pytest.param(
+        "repetition_evidence_manifest",
+        lambda p, _: _evidence(p)["repetition_evidence_manifest"].update(records=2.0),
+        id="manifest-records-is-a-float",
+    ),
     pytest.param("repetition_evidence_manifest", _drop_a_line, id="sidecar-has-fewer-lines-than-records"),
     pytest.param("repetition_evidence_manifest", _add_a_line, id="sidecar-has-more-lines-than-rows"),
-    pytest.param("kvwarm", lambda p, _: p.pop("kvwarm"), id="kvwarm-absent"),
-    pytest.param("kvwarm", lambda p, _: p["kvwarm"].update(enabled=False), id="kvwarm-disabled"),
-    pytest.param("kvwarm", lambda p, _: p["kvwarm"].update(enabled=1), id="kvwarm-enabled-is-not-a-boolean"),
-    pytest.param("kvwarm", lambda p, _: p["kvwarm"].update(warm_eligible=False), id="kvwarm-not-eligible"),
-    pytest.param("kvwarm", lambda p, _: p["kvwarm"].update(skip_reason="skipped"), id="kvwarm-skip-reason"),
+    pytest.param("kvwarm.enabled", lambda p, _: p.pop("kvwarm"), id="kvwarm-absent"),
+    pytest.param("kvwarm.enabled", lambda p, _: p["kvwarm"].update(enabled=False), id="kvwarm-disabled"),
+    pytest.param("kvwarm.enabled", lambda p, _: p["kvwarm"].update(enabled=1), id="kvwarm-enabled-is-not-a-boolean"),
     pytest.param(
-        "kvwarm",
+        "kvwarm.warm_eligible", lambda p, _: p["kvwarm"].update(warm_eligible=False), id="kvwarm-not-eligible"
+    ),
+    pytest.param("kvwarm.skip_reason", lambda p, _: p["kvwarm"].update(skip_reason="skipped"), id="kvwarm-skip-reason"),
+    pytest.param(
+        "kvwarm.method",
         lambda p, _: p["kvwarm"].update(method="native_radix_cache_real_seed"),
         id="kvwarm-method",
     ),
     pytest.param(
-        "kvwarm", lambda p, _: p["kvwarm"].update(state_protocol="other_protocol"), id="kvwarm-state-protocol"
+        "kvwarm.state_protocol",
+        lambda p, _: p["kvwarm"].update(state_protocol="other_protocol"),
+        id="kvwarm-state-protocol",
     ),
     pytest.param("timing_boundary", lambda p, _: p.update(timing_boundary="wall_clock"), id="timing-boundary"),
     pytest.param(
@@ -722,6 +771,21 @@ REFUSALS = [
         "serving_config.async_scheduling",
         lambda p, _: p["serving_config"].update(async_scheduling=True),
         id="async-scheduling-on",
+    ),
+    pytest.param(
+        "serving_config.mamba_cache_mode",
+        lambda p, _: p["serving_config"].update(mamba_cache_mode="none"),
+        id="mamba-mode",
+    ),
+    pytest.param(
+        "serving_config.block_size",
+        lambda p, _: p["serving_config"].update(block_size=16),
+        id="scheduler-block-differs-from-the-hash-block",
+    ),
+    pytest.param(
+        "serving_config.need_mamba_block_aligned_split",
+        lambda p, _: p["serving_config"].update(need_mamba_block_aligned_split=False),
+        id="no-aligned-split",
     ),
     pytest.param(
         "serving_config.enable_prefix_caching", lambda p, _: p.pop("serving_config"), id="serving-config-absent"
@@ -737,6 +801,20 @@ REFUSALS = [
         lambda p, _: p["results"][1].pop("repetition_evidence_sha256"),
         id="row-digest-absent",
     ),
+    pytest.param("repetition_evidence_sha256", _swap_the_row_digests, id="row-digests-swapped"),
+    pytest.param(
+        "repetition_evidence_sha256",
+        lambda p, _: p["results"][1].update(repetition_evidence_sha256=p["results"][0]["repetition_evidence_sha256"]),
+        id="row-digest-repeated",
+    ),
+    pytest.param(
+        "repetition_evidence_sha256",
+        lambda p, _: p["results"][0].update(repetition_evidence_sha256=hashlib.sha256(b"another point").hexdigest()),
+        id="row-digest-of-no-line",
+    ),
+    pytest.param("repetition_evidence", _repeat_the_first_id, id="sidecar-repeats-an-id"),
+    pytest.param("repetition_evidence", _first_id_as_a_string, id="sidecar-id-is-a-string"),
+    pytest.param("repetition_evidence", _first_line_is_no_json, id="sidecar-line-is-no-json"),
     pytest.param(
         "kv_seed_regime", lambda p, _: p["results"][0].update(kv_seed_regime="real_prefix"), id="regime-of-cold-row"
     ),
@@ -744,6 +822,50 @@ REFUSALS = [
         "kv_seed_regime",
         lambda p, _: p["results"][1].update(kv_seed_regime="not_applicable"),
         id="regime-of-cached-row",
+    ),
+    pytest.param(
+        "input_provenance.generator",
+        lambda p, _: _evidence(p).update(generator="other"),
+        id="generator-is-not-the-pinned-one",
+    ),
+    pytest.param(
+        "input_provenance.generator_version",
+        lambda p, _: _evidence(p).update(generator_version=1),
+        id="generator-version-1",
+    ),
+    pytest.param(
+        "input_provenance.generator_version",
+        lambda p, _: _evidence(p).update(generator_version=3),
+        id="generator-version-3",
+    ),
+    pytest.param("input_provenance.seed", lambda p, _: _evidence(p).update(seed=54), id="seed-is-not-the-pinned-one"),
+    pytest.param(
+        "input_provenance.count", lambda p, _: _evidence(p).update(count=262239), id="count-is-not-the-producer-count"
+    ),
+    pytest.param(
+        "input_provenance.vocab_low",
+        lambda p, _: _evidence(p).update(vocab_low=1),
+        id="vocab-low-is-not-the-pinned-one",
+    ),
+    pytest.param(
+        "input_provenance.vocab_high_exclusive",
+        lambda p, _: _evidence(p).update(vocab_high_exclusive=154821),
+        id="vocab-high-is-not-the-pinned-one",
+    ),
+    pytest.param(
+        "input_provenance.tokenizer_json_sha256",
+        lambda p, _: _evidence(p).update(tokenizer_json_sha256="0" * 64),
+        id="tokenizer-digest-is-not-the-pinned-one",
+    ),
+    pytest.param(
+        "input_provenance.token_ids_sha256",
+        lambda p, _: _evidence(p).update(token_ids_sha256=hashlib.sha256(b"another stream").hexdigest()),
+        id="stream-digest-of-another-stream",
+    ),
+    pytest.param(
+        "input_provenance.unique_token_count",
+        lambda p, _: _evidence(p).update(unique_token_count=126302),
+        id="distinct-count-of-another-stream",
     ),
 ]
 
@@ -760,7 +882,7 @@ def test_glm_producer_artifact_refuses_each_unaudited_item(tmp_path, field, tamp
         _validate(tmp_path, cell)
 
 
-def test_glm_producer_token_evidence_passes_for_real_and_boundary_values(tmp_path, monkeypatch):
+def test_glm_producer_token_evidence_must_be_the_pinned_stream(tmp_path, monkeypatch):
     producer = load_producer(monkeypatch)
     # The producer draws its largest measured context of 131,072 tokens plus a window of 4,099 tokens for each of up
     # to 32 requests, from seed 53 over the pinned vocabulary of 154,820 ids. Its distinct-token count is that of the
@@ -769,21 +891,77 @@ def test_glm_producer_token_evidence_passes_for_real_and_boundary_values(tmp_pat
     tokens = seeded.generate(seeded.SEED, count, seeded.VOCAB_LOW, seeded.VOCAB_HIGH)
     assert (seeded.SEED, count, len(set(tokens))) == (53, 262240, 126303)
     cases = {
-        "producer": {"seed": seeded.SEED, "count": count, "unique_token_count": len(set(tokens))},
+        "producer": ({"seed": seeded.SEED, "count": count, "unique_token_count": len(set(tokens))}, None),
         # The smallest seed and a stream of one token.
-        "smallest": {"seed": 0, "count": 1, "unique_token_count": 1},
+        "smallest": ({"seed": 0, "count": 1, "unique_token_count": 1}, "input_provenance.seed"),
         # The largest seed and a stream that draws every id of the vocabulary, the most distinct tokens that it allows.
-        "largest": {"seed": 2**64 - 1, "count": count, "unique_token_count": seeded.VOCAB_HIGH - seeded.VOCAB_LOW},
+        "largest": (
+            {"seed": 2**64 - 1, "count": count, "unique_token_count": seeded.VOCAB_HIGH - seeded.VOCAB_LOW},
+            "input_provenance.seed",
+        ),
         # The ids 50 to 149 are 100 ids, because the upper bound is exclusive. They cap the distinct tokens of a longer
         # stream at 100.
-        "narrow-vocabulary": {"count": count, "unique_token_count": 100, "vocab_low": 50, "vocab_high_exclusive": 150},
+        "narrow-vocabulary": (
+            {"count": count, "unique_token_count": 100, "vocab_low": 50, "vocab_high_exclusive": 150},
+            "input_provenance.vocab_low",
+        ),
     }
-    for name, fields in cases.items():
+    for name, (fields, refused) in cases.items():
         cell = glm_cell("prefill")
         payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
         payload["input_provenance"].update(fields)
         write_glm_rank(_pod(tmp_path / name, cell), payload)
-        assert len(_validate(tmp_path / name, cell).points) == 2
+        if refused is None:
+            assert len(_validate(tmp_path / name, cell).points) == 2
+        else:
+            with pytest.raises(ValueError, match=rf"native GLM-5\.3-Flash result lacks valid {re.escape(refused)}: "):
+                _validate(tmp_path / name, cell)
+
+
+def test_fixture_holds_the_real_token_stream_record():
+    tokens = seeded.generate(seeded.SEED, 262240, seeded.VOCAB_LOW, seeded.VOCAB_HIGH)
+    digest = hashlib.sha256(json.dumps(tokens, separators=(",", ":")).encode()).hexdigest()
+    evidence = glm_native_payload("prefill", points=[PREFILL_COLD])["input_provenance"]
+    record = native_artifact._glm_input_record(seeded.GENERATOR_VERSION)
+    assert (digest, len(set(tokens))) == (evidence["token_ids_sha256"], evidence["unique_token_count"])
+    assert (digest, len(set(tokens))) == (record["token_ids_sha256"], record["unique_token_count"])
+    assert native_artifact._glm_input_record(1) is None
+
+
+def test_sidecar_lines_in_another_order_than_the_rows_still_validate(tmp_path):
+    # The producer writes the lines in the order in which the points ran, so a row is bound to its line by its
+    # benchmark_id and not by its position.
+    cell = glm_cell("prefill")
+    pod = _pod(tmp_path, cell)
+    payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
+    artifact = write_glm_rank(pod, payload)
+    _rewrite_sidecar(payload, pod / EVIDENCE_FILE, list(reversed(_sidecar_lines(pod / EVIDENCE_FILE))))
+    artifact.write_text(json.dumps(payload))
+    assert len(_validate(tmp_path, cell).points) == 2
+
+
+def test_record_count_of_one_must_be_an_integer(tmp_path):
+    # True equals 1 in Python, so only the type of the count tells it from the one record of this sidecar.
+    cell = glm_cell("prefill")
+    pod = _pod(tmp_path, cell)
+    payload = glm_native_payload("prefill", points=[PREFILL_COLD])
+    artifact = write_glm_rank(pod, payload)
+    _evidence(payload)["repetition_evidence_manifest"]["records"] = True
+    artifact.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match=r"native GLM-5\.3-Flash result lacks valid repetition_evidence_manifest: "):
+        _validate(tmp_path, cell)
+
+
+def test_malformed_sidecar_manifest_of_another_contract_is_refused_with_a_text(tmp_path):
+    # The GLM-5.3-Flash reader does not read a token-stream manifest, so the comparison of the ranks meets it first.
+    cell = glm_cell("prefill", dp=2)
+    pod = _pod(tmp_path, cell)
+    for rank in range(2):
+        payload = glm_native_payload("prefill", points=[PREFILL_COLD], rank=rank, dp=2)
+        payload["input_provenance"]["token_stream_manifest"] = "x"
+        write_glm_rank(pod, payload)
+    with pytest.raises(ValueError, match="native input provenance token_stream_manifest must be a mapping, found 'x'"):
+        _validate(tmp_path, cell)
 
 
 @pytest.mark.parametrize(
@@ -801,7 +979,9 @@ def test_glm_producer_vocabulary_range_follows_the_generator_cap(tmp_path, high,
     write_glm_rank(_pod(tmp_path, cell), payload)
     if accepted:
         assert len(seeded.generate(seeded.SEED, 1, low, high)) == 1
-        assert len(_validate(tmp_path, cell).points) == 2
+        # The form check takes the range, and the reader then accepts only the pinned vocabulary.
+        with pytest.raises(ValueError, match=r"native GLM-5\.3-Flash result lacks valid input_provenance\.vocab_low: "):
+            _validate(tmp_path, cell)
     else:
         with pytest.raises(ValueError, match="invalid token generator request"):
             seeded.generate(seeded.SEED, 1, low, high)
@@ -812,15 +992,17 @@ def test_glm_producer_vocabulary_range_follows_the_generator_cap(tmp_path, high,
 
 
 def _change_the_sidecar(payload: dict, sidecar: Path) -> None:
-    raw = b'{"benchmark_id":1,"point_type":"prefill","note":"another rank"}\n'
+    line = b'{"benchmark_id":1,"point_type":"prefill","note":"another rank"}'
+    raw = line + b"\n"
     sidecar.write_bytes(raw)
     payload["input_provenance"]["repetition_evidence_manifest"]["sha256"] = hashlib.sha256(raw).hexdigest()
+    payload["results"][0]["repetition_evidence_sha256"] = hashlib.sha256(line).hexdigest()
 
 
 @pytest.mark.parametrize(
     "tamper",
     [
-        pytest.param(lambda p, _: _evidence(p).update(seed=_evidence(p)["seed"] + 1), id="input"),
+        pytest.param(lambda p, _: _evidence(p).update(checkpoint_dir="/another/checkpoint"), id="input"),
         pytest.param(_change_the_sidecar, id="sidecar-digest"),
     ],
 )
@@ -946,28 +1128,20 @@ def test_glm_publication_refuses_an_artifact_without_the_producer_protocol(tmp_p
 
 
 @pytest.mark.parametrize(
-    ("stamps", "regime", "template_id", "published"),
+    ("stamps", "regime", "published"),
     [
         # The native row reports real_prefix, and publication labels the same prefix real_kv.
-        pytest.param(["prefill_real_seed"], "real_prefix", GENERIC_RUNTIME_TEMPLATE_ID, "real_kv", id="real-seed"),
-        pytest.param(["prefill_fake_prefix"], "fake_prefix", GENERIC_RUNTIME_TEMPLATE_ID, None, id="fake-prefix"),
-        # The DeepSeek V4.1 adapter stamps real KV on every point, cached prefill included. Its plans have their own
-        # template, and a point with this stamp keeps the label that it had before the prefix stamps counted.
-        pytest.param(["kvwarm_real_kv"], "real_kv", "deepseek_v41_text_native", "real_kv", id="real-kv"),
-        pytest.param(
-            ["prefill_real_seed", "kvwarm_real_kv"], "real_kv", "deepseek_v41_text_native", "real_kv", id="both"
-        ),
+        pytest.param(["prefill_real_seed"], "real_prefix", "real_kv", id="real-seed"),
+        pytest.param(["prefill_fake_prefix"], "fake_prefix", None, id="fake-prefix"),
     ],
 )
-def test_execution_identity_cached_prefill_accepts_real_prefix_stamp(
-    tmp_path, monkeypatch, stamps, regime, template_id, published
-):
+def test_execution_identity_cached_prefill_accepts_real_prefix_stamp(tmp_path, monkeypatch, stamps, regime, published):
     cell = glm_cell("prefill")
     write_glm_rank(_pod(tmp_path, cell), glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED]))
     valid = _validate(tmp_path, cell)
     cold, cached = valid.points
     collection = replace(valid, points=(cold, _restamp(cached, stamps, regime)))
-    plan = _glm_plan(template_id)
+    plan = _glm_plan()
     if published is None:
         with pytest.raises(ValueError) as error:
             _publish(monkeypatch, tmp_path, cell, collection, plan)
