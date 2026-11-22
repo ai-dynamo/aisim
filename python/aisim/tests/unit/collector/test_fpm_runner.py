@@ -20,16 +20,19 @@ from types import SimpleNamespace
 
 import collector.fpm_forward.runner as fpm_runner
 import pytest
-from collector.fpm_forward.config import FPMCollectionOptions, PrefillSamplingProfile
+from collector.fpm_forward.config import FPMCollectionOptions, PrefillSamplingProfile, with_kv_warmup_defaults
 from collector.fpm_forward.model_capability import ResolvedModelConfig, load_model_config
 from collector.fpm_forward.native_artifact import COLLECTOR_PROVENANCE_FILENAME
 from collector.fpm_forward.planner import BackendPolicy, FPMCell, build_collection_plan
 from collector.fpm_forward.runner import (
+    CHECKPOINT_SCHEMA,
+    GLM_ARCHITECTURE,
     POINTS_FILENAME,
     POINTS_RECEIPT_FILENAME,
     REMOTE_EXIT_MARKER,
     REMOTE_WORKDIR,
     KubernetesCellRunner,
+    _adapter_python_path,
     _cell_generator_overrides,
     _configured_sampling_metadata,
     _render_cell,
@@ -1663,8 +1666,8 @@ def test_run_collection_stages_owned_runtime_files(monkeypatch, tmp_path, pendin
     assert "database" not in checkpoint
 
 
-def _staged_run(monkeypatch, root: Path, plan, *, smoke: bool):
-    """Run every cell of ``plan`` on an in-process cluster.
+def _staged_run(monkeypatch, root: Path, plan, *, smoke: bool, every_cell: bool = True):
+    """Run the cells of ``plan`` on an in-process cluster: every cell, or the default selection of the run.
 
     Return the names that each cell stages, the point-list receipt that each cell records after execution, and the
     checkpoint. The receipt comes from the collector's own in-container check of the staged list.
@@ -1728,7 +1731,7 @@ def _staged_run(monkeypatch, root: Path, plan, *, smoke: bool):
         resume=False,
         retry_failed=False,
         smoke=smoke,
-        cell_limit=len(plan.cells),
+        cell_limit=len(plan.cells) if every_cell else None,
         publish_database=False,
     )
     assert errors == []
@@ -2249,6 +2252,95 @@ def test_recovery_whose_validation_fails_writes_no_receipt(tmp_path, monkeypatch
     for cell in plan.cells:
         assert checkpoint["cells"][cell.cell_id]["status"] == "failed"
         assert not (campaign / "cells" / cell.cell_id / "producer-receipt.json").exists()
+
+
+def test_default_smoke_runs_one_cell_of_each_collected_phase(monkeypatch, tmp_path):
+    from .test_fpm_runtime_memory import _glm_plan
+
+    plan = _glm_plan(tmp_path)
+    # A second layout of the same plan: two prefill cells, then two decode cells.
+    prefill, decode = plan.cells
+    cells = (
+        prefill,
+        dataclasses.replace(prefill, cell_id="fpm-second-prefill"),
+        decode,
+        dataclasses.replace(decode, cell_id="fpm-second-decode"),
+    )
+    staged, _, checkpoint = _staged_run(
+        monkeypatch, tmp_path / "run", dataclasses.replace(plan, cells=cells), smoke=True, every_cell=False
+    )
+    assert set(staged) == set(checkpoint["cells"]) == {prefill.cell_id, decode.cell_id}
+
+
+def test_default_smoke_of_a_prefill_role_runs_its_one_phase(monkeypatch, tmp_path):
+    from .test_fpm_runtime_memory import _glm_short_request_plan
+
+    plan = _glm_short_request_plan(tmp_path, "prefill")
+    staged, _, _ = _staged_run(monkeypatch, tmp_path / "run", plan, smoke=True, every_cell=False)
+    assert set(staged) == {plan.cells[0].cell_id}
+
+
+def test_resume_with_another_frozen_plan_writes_no_campaign_file(tmp_path):
+    from .test_fpm_runtime_memory import _glm_plan
+
+    plan = _glm_plan(tmp_path)
+    checkpoints, artifacts = tmp_path / "checkpoints", tmp_path / "artifacts"
+    checkpoints.mkdir()
+    (checkpoints / "fpm_forward.json").write_text(
+        json.dumps({"schema": CHECKPOINT_SCHEMA, "plan_sha256": "0" * 64, "cells": {}})
+    )
+    with pytest.raises(ValueError) as error:
+        run_collection(
+            plan,
+            generator_overrides={},
+            checkpoint_dir=str(checkpoints),
+            artifact_root=str(artifacts),
+            resume=True,
+            retry_failed=False,
+        )
+    assert str(error.value) == "FPM checkpoint does not match the current frozen plan"
+    assert not artifacts.exists()
+
+
+def _tree_state(root: Path) -> dict:
+    """Each path under ``root`` with its inode and, for a file, its bytes: a rewrite with equal bytes still shows."""
+    return {
+        path: (path.stat().st_ino, path.read_bytes() if path.is_file() else None) for path in sorted(root.rglob("*"))
+    }
+
+
+def test_refused_resume_leaves_an_existing_campaign_folder_as_it_was(monkeypatch, tmp_path):
+    from .test_fpm_runtime_memory import _glm_plan
+
+    plan = _glm_plan(tmp_path)
+    root = tmp_path / "run"
+    _staged_run(monkeypatch, root, plan, smoke=True)
+    path = root / "checkpoints" / "fpm_forward_smoke.json"
+    path.write_text(json.dumps({**json.loads(path.read_text()), "plan_sha256": "0" * 64}))
+    before = _tree_state(root)
+    with pytest.raises(ValueError) as error:
+        _rerun_smoke(root, plan, retry_failed=False)
+    assert str(error.value) == "FPM checkpoint does not match the current frozen plan"
+    assert _tree_state(root) == before
+
+
+def test_fresh_run_and_accepted_resume_write_the_campaign_files(monkeypatch, tmp_path):
+    from .test_fpm_runtime_memory import _glm_plan
+
+    plan = _glm_plan(tmp_path)
+    root = tmp_path / "run"
+    _staged_run(monkeypatch, root, plan, smoke=True)
+    campaign = root / "artifacts" / plan.sha256[:16] / "smoke"
+    expected = {
+        "collection-plan.json": json.loads(json.dumps(plan.to_dict())),
+        "generator-overrides.json": json.loads(json.dumps(with_kv_warmup_defaults({}))),
+    }
+    for name, payload in expected.items():
+        assert json.loads((campaign / name).read_text()) == payload
+        (campaign / name).unlink()
+    assert _rerun_smoke(root, plan, retry_failed=False) == []
+    for name, payload in expected.items():
+        assert json.loads((campaign / name).read_text()) == payload
 
 
 def test_non_glm_cells_keep_their_launch_and_staging(monkeypatch, tmp_path):
@@ -4175,6 +4267,26 @@ def test_runtime_default_path_is_adapter_owned():
     adapter = Path(fpm_runner.__file__).parent / "runtime/dsv41/runtime-paths.json"
     assert env["PYTHONPATH"] == "/tmp/fpm-bench:" + json.loads(adapter.read_text())["python_path"]
     assert env["FPM_READINESS_TIMEOUT_SECONDS"] == "900"
+
+
+@pytest.mark.parametrize(
+    ("architecture", "name"), [("DeepseekV41ForCausalLM", "V4.1"), (GLM_ARCHITECTURE, "GLM-5.3-Flash")]
+)
+@pytest.mark.parametrize("value", ["", None, "relative/overlay", "/opt/a::/opt/b", "/opt/a\n/opt/b"])
+def test_adapter_python_path_must_name_absolute_paths(architecture, name, value):
+    with pytest.raises(ValueError) as error:
+        _adapter_python_path(architecture, {"PYTHONPATH": {"name": "PYTHONPATH", "value": value}})
+    assert str(error.value) == f"{name} PYTHONPATH must name explicit absolute runtime paths"
+
+
+def test_adapter_python_path_puts_the_staged_files_first():
+    declared = {"PYTHONPATH": {"name": "PYTHONPATH", "value": "/opt/a:/opt/b"}}
+    for architecture in ("DeepseekV41ForCausalLM", GLM_ARCHITECTURE):
+        assert _adapter_python_path(architecture, declared) == {
+            "name": "PYTHONPATH",
+            "value": "/tmp/fpm-bench:/opt/a:/opt/b",
+        }
+    assert _adapter_python_path("LlamaForCausalLM", declared) is None
 
 
 @pytest.mark.parametrize(

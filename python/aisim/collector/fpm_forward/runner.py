@@ -157,6 +157,8 @@ REMOTE_WORKDIR = "/tmp/fpm-bench"
 _MEMORY_OBSERVER_FILES = ("fpm_memory_observer.py", "fpm_memory_worker.py", "fpm_memory_scheduler.py")
 # The source-pinned runtime adapters under runtime/, by model architecture.
 _ADAPTER_DIRS = {"DeepseekV41ForCausalLM": "dsv41", GLM_ARCHITECTURE: "glm53flash"}
+# The name of each adapter in messages.
+_ADAPTER_NAMES = {"dsv41": "V4.1", "glm53flash": "GLM-5.3-Flash"}
 
 
 def _observe_runtime_memory(plan: FPMCollectionPlan, cell: FPMCell) -> bool:
@@ -1270,7 +1272,7 @@ def _adapter_python_path(architecture: str | None, resolved_env: dict[str, dict[
         python_path = json.loads(paths_file.read_text())["python_path"]
     else:
         python_path = configured.get("value")
-    model = "V4.1" if adapter == "dsv41" else "GLM-5.3-Flash"
+    model = _ADAPTER_NAMES[adapter]
     if not isinstance(python_path, str) or not python_path:
         raise ValueError(f"{model} PYTHONPATH must name explicit absolute runtime paths")
     paths = python_path.split(":")
@@ -2243,12 +2245,12 @@ def _run_collection_impl(
     root = Path(artifact_root).expanduser().resolve() / plan.sha256[:16]
     if smoke:
         root /= "smoke"
-    root.mkdir(parents=True, exist_ok=True)
-    _atomic_json(root / "collection-plan.json", plan.to_dict())
-    _atomic_json(root / "generator-overrides.json", with_kv_warmup_defaults(generator_overrides))
     checkpoint_name = "fpm_forward_smoke.json" if smoke else "fpm_forward.json"
     checkpoint_path = Path(checkpoint_dir).expanduser().resolve() / checkpoint_name
     checkpoint = _load_checkpoint(checkpoint_path, plan, resume)
+    root.mkdir(parents=True, exist_ok=True)
+    _atomic_json(root / "collection-plan.json", plan.to_dict())
+    _atomic_json(root / "generator-overrides.json", with_kv_warmup_defaults(generator_overrides))
     instrumentation = getattr(plan, "runtime_instrumentation", None)
     observation_attempt_id = None
     if instrumentation is not None:
@@ -2297,7 +2299,16 @@ def _run_collection_impl(
     runtime_exec = Path(__file__).resolve().parent / "runtime" / "fpm_exec.sh"
     runtime_preflight = Path(__file__).resolve().parent / "runtime" / "preflight.py"
     adapter = _ADAPTER_DIRS.get(getattr(getattr(plan, "capability", None), "architecture", None))
-    target_cells = plan.cells[: (cell_limit or (1 if smoke else len(plan.cells)))]
+    if cell_limit is not None:
+        target_cells = plan.cells[:cell_limit]
+    elif smoke:
+        # The first cell of each phase that the plan collects.
+        first_cells: dict[str, FPMCell] = {}
+        for cell in plan.cells:
+            first_cells.setdefault(cell.workload_kind, cell)
+        target_cells = tuple(first_cells.values())
+    else:
+        target_cells = plan.cells
 
     formal_database_terminal = False
     database_entry = checkpoint.get("database")
@@ -2333,9 +2344,12 @@ def _run_collection_impl(
     checkpoint_changed = False
     # Recovery costs zero cluster time, so it runs on every resume: it only
     # acknowledges strictly validated, attempt-matched artifacts that already
-    # exist on disk, and writes no file but the producer receipt of such a
-    # cell when it has none. Rerunning (--resume-retry-failed) remains the
-    # only path that schedules cluster work.
+    # exist on disk. For such a cell it writes the producer receipt when the
+    # cell has none and, when the plan holds runtime instrumentation, archives
+    # the cell's observations (a copy of the cell folder and the index
+    # runtime-observations.json). After the loop it writes the checkpoint if
+    # it recovered a cell. Rerunning (--resume-retry-failed) remains the only
+    # path that schedules cluster work.
     if resume:
         for cell in target_cells:
             entry = checkpoint["cells"].get(cell.cell_id)
@@ -2555,8 +2569,9 @@ def _run_collection_impl(
                     ],
                     *instrumentation_files,
                     *_stage_points_file(plan, cell_dir, cell=cell, smoke=smoke),
-                    # Only V4.1 reads the shared input text. A GLM-5.3-Flash probe runs without the producer.
+                    # Only V4.1 reads the shared input text.
                     *([runtime_preflight.parent / "fpm_text.txt"] if adapter == "dsv41" else []),
+                    # A GLM-5.3-Flash probe runs without the producer, so only a collection stages its adapter files.
                     *(
                         sorted(p for p in (runtime_preflight.parent / adapter).iterdir() if p.is_file())
                         if adapter == "dsv41" or _glm_collection(plan)

@@ -213,8 +213,8 @@ def _resolve_execution(command: list[str]):
     except _INPUT_ERRORS as error:
         parser.error(str(error))
     if args.smoke and args.limit is None:
-        # Native smoke defaults to one cell. Onboarding must exercise decode
-        # and every selected backend/precision cell, regardless of ordering.
+        # A direct smoke runs one cell of each collected phase. Onboarding must
+        # exercise every selected backend/precision cell too, regardless of ordering.
         args.limit = len(resolved[0].cells)
     return args, resolved
 
