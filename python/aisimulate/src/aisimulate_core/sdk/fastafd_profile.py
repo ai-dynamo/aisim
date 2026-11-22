@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import math
 import re
@@ -134,6 +135,10 @@ class FastAFDMoEStageProfile:
     def load(cls, path: str | Path) -> FastAFDMoEStageProfile:
         resolved = Path(path).expanduser().resolve()
         raw = resolved.read_bytes()
+        return cls._from_snapshot(resolved, raw)
+
+    @classmethod
+    def _from_snapshot(cls, resolved: Path, raw: bytes) -> FastAFDMoEStageProfile:
         # A symlink's canonical target may have no suffix. Identify Parquet
         # from the captured bytes so saved canonical paths remain loadable.
         if raw.startswith(b"PAR1") or resolved.suffix == ".parquet":
@@ -196,11 +201,13 @@ class FastAFDMoEStageProfile:
             raise ValueError("duplicate FastAFD MoE stage key")
         return source, entries
 
-    def write_parquet(self, path: str | Path) -> None:
+    def write_parquet(self, path: str | Path | io.BytesIO) -> None:
         """Serialize validated raw measurements; no estimation or selection."""
         import pyarrow as pa
         import pyarrow.parquet as pq
 
+        if any(entry.source != self.source for entry in self.entries):
+            raise ValueError("mixed FastAFD source provenance")
         rows = []
         for entry in self.entries:
             capture = {
@@ -234,6 +241,23 @@ class FastAFDMoEStageProfile:
         if measurement is None:
             raise KeyError(f"no exact FastAFD MoE stage measurement for {key}")
         return measurement
+
+
+def _native_profile_snapshot(path: str) -> tuple[bytes, str]:
+    """Convert legacy JSON at the Python boundary, retaining source identity.
+
+    Native estimation consumes only Parquet. The source path and digest still
+    describe the original artifact, so saved configurations reload that source.
+    """
+    resolved = Path(path)
+    raw = resolved.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    if raw.startswith(b"PAR1") or resolved.suffix == ".parquet":
+        return raw, digest
+    profile = FastAFDMoEStageProfile._from_snapshot(resolved, raw)
+    output = io.BytesIO()
+    profile.write_parquet(output)
+    return output.getvalue(), digest
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

@@ -252,6 +252,8 @@ class AICAFDPerformanceModel:
                 )
             components = item.get("components")
             try:
+                if "components" in item and not isinstance(components, Mapping):
+                    raise ValueError("components must be a mapping when present")
                 if isinstance(components, Mapping):
                     for name, value in components.items():
                         if (

@@ -406,6 +406,21 @@ impl ForwardPassPerfModel {
     /// fallback is denied; explicit modes use the requested fallback policy.
     /// A regression model may be constructed before it has enough observations.
     pub fn best_available(config: ForwardPassPerfModelConfig) -> Result<Self, AicError> {
+        Self::best_available_with_stage_loader(
+            config,
+            crate::perf_database::fastafd::FastAfdTable::load,
+        )
+    }
+
+    // Internal loading adapter for the Python boundary's legacy JSON import.
+    // Selection, validation, identity, and estimation stay on the canonical path.
+    pub(crate) fn best_available_with_stage_loader(
+        config: ForwardPassPerfModelConfig,
+        load_stage: impl FnOnce(
+            &ForwardPassPerfModelConfig,
+        )
+            -> Result<crate::perf_database::fastafd::FastAfdTable, AicError>,
+    ) -> Result<Self, AicError> {
         let (mut config, registered) = config.resolve_with_registration()?;
         if let Some(path) = config
             .estimator_config
@@ -428,7 +443,7 @@ impl ForwardPassPerfModel {
                 path: path.clone(),
                 source,
             })?;
-            let table = crate::perf_database::fastafd::FastAfdTable::load(&config)?;
+            let table = load_stage(&config)?;
             config.moe_quant_mode = Some(table.precision().to_owned());
             return Ok(Self {
                 mode: ForwardPassPerfMode::FastafdStage(Arc::new(table)),

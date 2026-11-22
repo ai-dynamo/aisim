@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Exact measured MoE-stage table. JSON is the legacy import format; parquet
-//! uses typed key columns and preserves the original capture as provenance.
+//! Exact measured MoE-stage table. Native loading consumes Parquet typed keys
+//! and capture provenance; Python imports legacy JSON before this boundary.
 
 use super::parquet_loader::PerfReader;
 use crate::{
@@ -385,17 +385,22 @@ impl FastAfdTable {
         config: &ForwardPassPerfModelConfig,
         raw: bytes::Bytes,
     ) -> Result<Self, AicError> {
+        let digest = format!("{:x}", Sha256::digest(&raw));
+        Self::from_parquet_snapshot(config, raw, digest)
+    }
+
+    pub(crate) fn from_parquet_snapshot(
+        config: &ForwardPassPerfModelConfig,
+        raw: bytes::Bytes,
+        source_sha256: String,
+    ) -> Result<Self, AicError> {
         let path = &config
             .estimator_config
             .fastafd_stage
             .as_ref()
             .unwrap()
             .profile_path;
-        // Canonical paths may lose the .parquet suffix when resolving a symlink.
-        // Inspect the same snapshot used for parsing and provenance hashing.
-        let is_parquet =
-            raw.starts_with(b"PAR1") || path.extension().is_some_and(|x| x == "parquet");
-        let mut document: Document = if is_parquet {
+        let mut document = {
             let reader = PerfReader::from_bytes(path, raw.clone())?;
             let key_names = [
                 "model_path",
@@ -457,9 +462,6 @@ impl FastAfdTable {
                 .map_err(|e| invalid(e.to_string()))?,
                 entries,
             }
-        } else {
-            serde_json::from_slice(&raw)
-                .map_err(|e| invalid(format!("invalid FastAFD JSON import: {e}")))?
         };
         document.normalize();
         document.validate()?;
@@ -503,7 +505,7 @@ impl FastAfdTable {
             entries,
             source: document.source,
             path: path.clone(),
-            sha256: format!("{:x}", Sha256::digest(&raw)),
+            sha256: source_sha256,
         })
     }
 
@@ -544,7 +546,7 @@ mod tests {
     use crate::{BackendKind, ForwardPassPerfModel, ForwardPassPerfSource};
     use std::io::Write;
 
-    fn fixture() -> (tempfile::NamedTempFile, ForwardPassPerfModelConfig) {
+    fn fixture_document() -> Value {
         // Synthetic capture: 12 ms for three layers and two microbatches.
         // Each of the six pipeline units therefore costs exactly 2 ms.
         let document = json!({
@@ -555,8 +557,13 @@ mod tests {
                 "measurement":{"scope":"complete_moe_stage","method":"synthetic","method_version":"1","statistic":"p50","sample_count":40,"cv_percent":0.5,"routing":"balanced","source_tree_sha256":"a".repeat(64),"raw_artifact":"fixture.json","raw_sha256":"b".repeat(64)},
                 "validation":{"stable":true,"correctness":null}}]
         });
+        document
+    }
+
+    fn fixture() -> (tempfile::NamedTempFile, ForwardPassPerfModelConfig) {
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write!(file, "{document}").unwrap();
+        file.write_all(&parquet_snapshot(&fixture_document()))
+            .unwrap();
         let mut config = ForwardPassPerfModelConfig::new(
             "synthetic",
             "gb200",
@@ -580,6 +587,19 @@ mod tests {
             profile_path: file.path().into(),
         });
         (file, config)
+    }
+
+    #[test]
+    fn native_loading_rejects_legacy_json() {
+        let (mut file, config) = fixture();
+        file.as_file_mut().set_len(0).unwrap();
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(0)).unwrap();
+        write!(file, "{}", fixture_document()).unwrap();
+        let error = ForwardPassPerfModel::best_available(config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("parquet") || error.contains("Parquet"));
     }
 
     #[test]
@@ -611,18 +631,21 @@ mod tests {
         use parquet::schema::parser::parse_message_type;
         use std::sync::Arc;
 
-        let entry = &document["entries"][0];
-        let mut fields = entry["key"].as_object().unwrap().clone();
-        let mut capture = entry.as_object().unwrap().clone();
-        capture.remove("key");
-        capture.remove("latency_ms");
-        fields.insert("latency_ms".into(), entry["latency_ms"].clone());
-        fields.insert(
-            "capture_json".into(),
-            json!(Value::Object(capture).to_string()),
-        );
-        fields.insert("source_json".into(), json!(document["source"].to_string()));
-        let columns = fields
+        fn fields(document: &Value, entry: &Value) -> serde_json::Map<String, Value> {
+            let mut fields = entry["key"].as_object().unwrap().clone();
+            let mut capture = entry.as_object().unwrap().clone();
+            capture.remove("key");
+            capture.remove("latency_ms");
+            fields.insert("latency_ms".into(), entry["latency_ms"].clone());
+            fields.insert(
+                "capture_json".into(),
+                json!(Value::Object(capture).to_string()),
+            );
+            fields.insert("source_json".into(), json!(document["source"].to_string()));
+            fields
+        }
+        let first = fields(document, &document["entries"][0]);
+        let columns = first
             .iter()
             .map(|(name, value)| {
                 let data_type = if name == "latency_ms" {
@@ -643,35 +666,37 @@ mod tests {
             Arc::new(WriterProperties::builder().build()),
         )
         .unwrap();
-        let mut group = writer.next_row_group().unwrap();
-        for (name, value) in fields {
-            let mut column = group.next_column().unwrap().unwrap();
-            if name == "latency_ms" {
-                column
-                    .typed::<DoubleType>()
-                    .write_batch(&[value.as_f64().unwrap()], None, None)
-                    .unwrap();
-            } else if let Some(value) = value.as_i64() {
-                column
-                    .typed::<Int64Type>()
-                    .write_batch(&[value], None, None)
-                    .unwrap();
-            } else {
-                column
-                    .typed::<ByteArrayType>()
-                    .write_batch(&[ByteArray::from(value.as_str().unwrap())], None, None)
-                    .unwrap();
+        for entry in document["entries"].as_array().unwrap() {
+            let mut group = writer.next_row_group().unwrap();
+            for (name, value) in fields(document, entry) {
+                let mut column = group.next_column().unwrap().unwrap();
+                if name == "latency_ms" {
+                    column
+                        .typed::<DoubleType>()
+                        .write_batch(&[value.as_f64().unwrap()], None, None)
+                        .unwrap();
+                } else if let Some(value) = value.as_i64() {
+                    column
+                        .typed::<Int64Type>()
+                        .write_batch(&[value], None, None)
+                        .unwrap();
+                } else {
+                    column
+                        .typed::<ByteArrayType>()
+                        .write_batch(&[ByteArray::from(value.as_str().unwrap())], None, None)
+                        .unwrap();
+                }
+                column.close().unwrap();
             }
-            column.close().unwrap();
+            group.close().unwrap();
         }
-        group.close().unwrap();
         writer.into_inner().unwrap().into()
     }
 
     #[test]
     fn parquet_replacement_keeps_snapshot_latency_and_digest_together() {
-        let (json_file, mut config) = fixture();
-        let mut document: Value = serde_json::from_reader(json_file.reopen().unwrap()).unwrap();
+        let (_fixture, mut config) = fixture();
+        let mut document = fixture_document();
         let file = tempfile::Builder::new()
             .suffix(".parquet")
             .tempfile()
@@ -784,7 +809,7 @@ mod tests {
     #[test]
     fn unqualified_and_duplicate_native_imports_fail_loudly() {
         let (mut file, config) = fixture();
-        let original: Value = serde_json::from_reader(file.reopen().unwrap()).unwrap();
+        let original = fixture_document();
         for kind in ["duplicate", "unstable", "bad_digest", "wrong_key"] {
             let mut value = original.clone();
             match kind {
@@ -799,7 +824,7 @@ mod tests {
             file.as_file_mut().set_len(0).unwrap();
             use std::io::{Seek, SeekFrom};
             file.seek(SeekFrom::Start(0)).unwrap();
-            write!(file, "{value}").unwrap();
+            file.write_all(&parquet_snapshot(&value)).unwrap();
             assert!(
                 ForwardPassPerfModel::best_available(config.clone()).is_err(),
                 "{kind}"

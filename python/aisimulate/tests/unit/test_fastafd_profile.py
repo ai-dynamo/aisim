@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -87,6 +88,26 @@ def test_exact_lookup_preserves_source_and_method(tmp_path):
     assert provenance["method"] == "cuda_event"
     assert provenance["source_tree_sha256"] == "c" * 64
     assert provenance["correctness"] is None
+
+
+@pytest.mark.parametrize("field", ["repository", "commit", "benchmark", "boundary"])
+def test_parquet_writer_rejects_mixed_sources_before_overwriting(tmp_path, field):
+    profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload()))
+    other = replace(profile.entries[0], source=replace(profile.source, **{field: "1" * 40}))
+    mixed = FastAFDMoEStageProfile(
+        (profile.entries[0], replace(other, key=replace(other.key, microbatches=3))),
+        source=profile.source,
+        path=profile.path,
+        profile_sha256=profile.profile_sha256,
+    )
+    path = tmp_path / "profile.parquet"
+    profile.write_parquet(path)
+    original = path.read_bytes()
+    assert FastAFDMoEStageProfile.load(path).entries == profile.entries
+
+    with pytest.raises(ValueError, match="mixed FastAFD source provenance"):
+        mixed.write_parquet(path)
+    assert path.read_bytes() == original
 
 
 @pytest.mark.parametrize(
@@ -237,7 +258,8 @@ def test_rejects_non_int64_parquet_counts(tmp_path, column, encoding):
 
 
 @pytest.mark.parametrize("location", ["direct", "symlink", "extensionless"])
-def test_int64_parquet_counts_load_through_canonical_model(tmp_path, location):
+@pytest.mark.parametrize("profile_format", ["json", "parquet"])
+def test_profile_loads_through_canonical_model_preserving_source(tmp_path, location, profile_format):
     from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     payload = _payload()
@@ -245,9 +267,11 @@ def test_int64_parquet_counts_load_through_canonical_model(tmp_path, location):
     # or 2 ms per pipeline unit.
     payload["entries"][0]["key"]["moe_layers"] = 3
     payload["entries"][0]["latency_ms"] = 12.0
-    profile = FastAFDMoEStageProfile.load(_write(tmp_path, payload))
-    path = tmp_path / "stage.parquet"
-    profile.write_parquet(path)
+    path = _write(tmp_path, payload)
+    profile = FastAFDMoEStageProfile.load(path)
+    if profile_format == "parquet":
+        path = tmp_path / "stage.parquet"
+        profile.write_parquet(path)
     if location != "direct":
         target = path.with_suffix("")
         path.rename(target)
@@ -276,7 +300,10 @@ def test_int64_parquet_counts_load_through_canonical_model(tmp_path, location):
         estimator_config={"fastafd_stage": {"profile_path": str(path)}},
     )
     model = RustForwardPassPerfModel.best_available(config)
-    assert model.estimate_fastafd_stage(48)["ffn_ms"] == 2.0
+    estimate = model.estimate_fastafd_stage(48)
+    assert estimate["ffn_ms"] == 2.0
+    assert estimate["stage"]["profile_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert estimate["stage"]["profile_path"] == str(path.resolve())
     saved = model.diagnostics()["provenance"]["config"]
     assert saved["estimator_config"]["fastafd_stage"]["profile_path"] == str(path.resolve())
     restored = RustForwardPassPerfModel.best_available(saved)

@@ -22,8 +22,11 @@ INT32 and UINT32. Counts must fit in an unsigned 32-bit value; only `mtp_nextn`
 may be zero.
 
 `FastAFDMoEStageProfile.load(path).write_parquet(output)` converts a validated
-legacy document without changing its measured values. JSON remains supported
-at the native import boundary. The Python profile objects expose raw data for
+legacy document without changing its measured values. Python's canonical model
+constructor imports legacy JSON as an in-memory Parquet snapshot before native
+estimation; direct Rust callers supply Parquet. Provenance and saved
+configurations retain the original source path and SHA-256 digest. The Python
+profile objects expose raw data for
 inspection and conversion; production AFD timing does not use their lookup API.
 
 ## Document

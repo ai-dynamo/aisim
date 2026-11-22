@@ -2049,9 +2049,29 @@ impl PyForwardPassPerfModel {
 
     /// Create a model from the complete canonical request.
     #[staticmethod]
-    fn best_available(config_json: &str) -> PyResult<Self> {
+    fn best_available(py: Python<'_>, config_json: &str) -> PyResult<Self> {
         let config = parse_forward_pass_config(config_json)?;
-        let inner = crate::ForwardPassPerfModel::best_available(config).map_err(aic_to_py)?;
+        let inner =
+            crate::ForwardPassPerfModel::best_available_with_stage_loader(config, |config| {
+                let path = &config
+                    .estimator_config
+                    .fastafd_stage
+                    .as_ref()
+                    .unwrap()
+                    .profile_path;
+                let (parquet, digest): (Vec<u8>, String) = py
+                    .import("aisimulate_core.sdk.fastafd_profile")
+                    .and_then(|module| module.getattr("_native_profile_snapshot"))
+                    .and_then(|loader| loader.call1((path.to_string_lossy().as_ref(),)))
+                    .and_then(|snapshot| snapshot.extract())
+                    .map_err(|error| crate::AicError::InvalidEngineConfig(error.to_string()))?;
+                crate::perf_database::fastafd::FastAfdTable::from_parquet_snapshot(
+                    config,
+                    parquet.into(),
+                    digest,
+                )
+            })
+            .map_err(aic_to_py)?;
         Ok(Self { inner })
     }
 

@@ -108,7 +108,7 @@ it with the configured attention provider. It does not select a second estimator
 | `afd.moe_layers`, `afd.routed_topk` | Required | Positive model geometry. The AFD adapter resolves these from the attention measurement and normalized model metadata. |
 | `afd.boundary_on_attn` | Required | Must be `true`. |
 | `estimator_config.fastafd_stage` | `null` | Controls for this estimator, required together with `afd`. Other estimator controls must retain their defaults. |
-| `estimator_config.fastafd_stage.profile_path` | Required | Native parquet table or legacy profile JSON import. Rust validates both formats, rejects duplicate/unqualified captures, and pins their data at construction. |
+| `estimator_config.fastafd_stage.profile_path` | Required | Native Parquet table. Python also imports legacy profile JSON as in-memory Parquet while retaining the original source path and digest. Rust validates the Parquet snapshot, rejects duplicate/unqualified captures, and pins its data at construction. |
 
 `model`, `system`, `nextn`, `moe_backend` (`megamoe` or `deepep_deepgemm`),
 optional `moe_quant_mode`, and every `afd` dimension participate in exact

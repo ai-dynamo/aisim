@@ -42,12 +42,13 @@ def _sample(topology: AFDTopology) -> dict:
     }
 
 
-def test_aic_provider_extracts_precise_layer_measurement_without_double_calibration():
+@pytest.mark.parametrize("components", ["omitted", {}, {"router_ms": 0.01}, "invalid", [], None])
+def test_aic_provider_extracts_precise_layer_measurement_without_double_calibration(components):
     calls = []
 
     def estimator(*args, **kwargs):
         calls.append((args, kwargs))
-        return SimpleNamespace(
+        result = SimpleNamespace(
             raw={
                 "afd_layer_measurements": {
                     "decode": {
@@ -60,18 +61,30 @@ def test_aic_provider_extracts_precise_layer_measurement_without_double_calibrat
                 }
             }
         )
+        if components != "omitted":
+            result.raw["afd_layer_measurements"]["decode"]["components"] = components
+        return result
 
     request = measurement_request_from_candidate(
         _sample(_topology()),
         {"isl": 128, "osl": 32},
     )
-    (measurement,) = AICAFDPerformanceModel(estimator).measure(request)
+    provider = AICAFDPerformanceModel(estimator)
+    if components != "omitted" and not isinstance(components, dict):
+        with pytest.raises(AFDInfeasible, match="components must be a mapping when present"):
+            provider.measure(request)
+        return
+    (measurement,) = provider.measure(request)
 
     assert measurement.phase is AFDPhase.DECODE
     assert measurement.attention_ms == 1.23456
     assert measurement.a_to_f_ms == 0.12345
     assert calls[0][1]["comm_overhead_factor"] == 1.0
     assert calls[0][1]["backend_version"] == "test-version"
+    if components == "omitted":
+        assert "components" not in measurement.provenance
+    else:
+        assert measurement.provenance["components"] == components
 
 
 def test_attach_measurements_replaces_unresolved_metadata():

@@ -3,6 +3,7 @@
 
 """Unit tests for completing single-phase AFD estimates with regular static phases."""
 
+import json
 import logging
 import math
 from types import SimpleNamespace
@@ -529,10 +530,14 @@ def test_afd_decode_mtp_widens_compute_and_communication_queries(monkeypatch, ca
 @pytest.mark.parametrize("a_batch_size", [128, 129])
 @pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("f_nested", [False, True])
-def test_afd_measures_local_router_once_outside_decode_integration(monkeypatch, nextn, a_batch_size, nested, f_nested):
+@pytest.mark.parametrize("fallback", [None, "gate_disabled", "unsupported"])
+def test_afd_measures_local_router_once_outside_decode_integration(
+    monkeypatch, nextn, a_batch_size, nested, f_nested, fallback
+):
     """64 A ranks must not reuse the F router's combined 4096-token query."""
-    from aisimulate.sdk import common, operations
+    from aisimulate.sdk import common, operations, rust_engine_step
     from aisimulate.sdk.inference_session import _AFDCommOps
+    from aisimulate_core.sdk import engine
 
     a_router = operations.GEMM("generation_router_gemm", 4, 128, 4096, common.GEMMQuantMode.bfloat16)
     f_router = operations.GEMM("generation_router_gemm", 4, 128, 4096, common.GEMMQuantMode.bfloat16)
@@ -545,10 +550,31 @@ def test_afd_measures_local_router_once_outside_decode_integration(monkeypatch, 
         f_ops = [operations.OverlapOp("generation_moe_overlap", group_a=f_ops, group_b=[])]
     f_model = SimpleNamespace(_num_layers=4, generation_ops=f_ops)
     queries = []
+    sum_latency = AFDInferenceSession._sum_latency
+
+    if fallback is not None:
+        monkeypatch.setattr(rust_engine_step, "should_use_rust_engine_step", lambda *_a: fallback != "gate_disabled")
+
+        def unsupported(*_args, **_kwargs):
+            raise rust_engine_step.RustEngineUnsupportedError("synthetic unsupported op-list")
+
+        monkeypatch.setattr(rust_engine_step, "evaluate_generation_ops_with_rust", unsupported)
+        monkeypatch.setattr(rust_engine_step, "evaluate_ops_json_with_rust", unsupported)
+
+        class Handle:
+            def evaluate_ops_json(self, ops_json, **kwargs):
+                return [
+                    (next(iter(op.values()))["name"], 4 * kwargs["x"] / 1000, 0.0, "synthetic")
+                    for op in json.loads(ops_json)
+                ]
+
+        monkeypatch.setattr(engine, "_probe_handle_for", lambda *_a: Handle())
 
     def fake_sum_latency(self, ops, *, model, batch_size, **_kwargs):
         ops = list(ops)
         queries.append((ops, model, batch_size))
+        if fallback is not None:
+            return sum_latency(self, ops, model=model, batch_size=batch_size, **_kwargs)
         # Synthetic shape-sensitive engine result, in full-model units:
         # each queried router contributes batch_size / 1000 ms per layer.
         return 4 * batch_size / 1000, {op._name: 4 * batch_size / 1000 for op in ops}
@@ -660,6 +686,62 @@ def test_afd_nested_router_query_preserves_native_shape(monkeypatch, is_context)
     }
     assert total == 0.75
     assert per_op == {"router_gemm": 0.75}
+
+
+@pytest.mark.parametrize("is_context", [False, True])
+@pytest.mark.parametrize("fallback", ["gate_disabled", "unsupported", "conversion"])
+def test_afd_native_router_fallback_preserves_query_shape(monkeypatch, is_context, fallback):
+    from aisimulate.sdk import common, operations, rust_engine_step
+    from aisimulate.sdk.engine import OpConversionError, build_ops_json
+    from aisimulate_core.sdk import engine
+
+    router = operations.GEMM("router_gemm", 4, 128, 4096, common.GEMMQuantMode.bfloat16)
+    overlap = operations.OverlapOp("moe_overlap", group_a=[], group_b=[router, router])
+    model = SimpleNamespace(context_ops=[overlap], generation_ops=[overlap])
+    leaves = list(AFDInferenceSession._router_ops([overlap]))
+    captured = []
+
+    def unsupported(*_args, **_kwargs):
+        error = OpConversionError if fallback == "conversion" else rust_engine_step.RustEngineUnsupportedError
+        raise error("synthetic unsupported op-list")
+
+    class Handle:
+        def evaluate_ops_json(self, ops_json, **kwargs):
+            captured.append((ops_json, kwargs))
+            return [("router_gemm", 0.25, 0.0, "synthetic")]
+
+    monkeypatch.setattr(rust_engine_step, "should_use_rust_engine_step", lambda *_a: fallback != "gate_disabled")
+    monkeypatch.setattr(rust_engine_step, "evaluate_ops_json_with_rust", unsupported)
+    monkeypatch.setattr(engine, "_probe_handle_for", lambda *_a: Handle())
+    session = object.__new__(AFDInferenceSession)
+    session._database = object()
+    total, per_op = session._sum_latency(
+        leaves,
+        batch_size=65,
+        seq_len=1025,
+        model=model,
+        runtime_config=RuntimeConfig(
+            prefix=7, seq_imbalance_correction_scale=1.25, gen_seq_imbalance_correction_scale=1.5
+        ),
+        is_context=is_context,
+    )
+
+    assert captured == [
+        (
+            build_ops_json([leaf]),
+            {
+                "is_context": is_context,
+                "batch_size": 65,
+                "s": 1025,
+                "prefix": 7,
+                "imbalance_correction_scale": 1.25 if is_context else 1.5,
+                "x": 65 * 1025 if is_context else 65,
+            },
+        )
+        for leaf in leaves
+    ]
+    assert total == 0.5
+    assert per_op == {"router_gemm": 0.5}
 
 
 def test_afd_summary_concurrency_reflects_total_in_flight_batch(monkeypatch):

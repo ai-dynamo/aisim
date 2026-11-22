@@ -1158,9 +1158,27 @@ class AFDInferenceSession:
 
         per_op = defaultdict(float)
         for op in ops:
-            # Internal shim entry (no DeprecationWarning): same engine-backed
-            # value as the deprecated public op.query().
-            result = op._engine_query(self._database, **kwargs_common)
+            if hasattr(op, "_engine_query"):
+                result = op._engine_query(self._database, **kwargs_common)
+            else:
+                # Native leaves extracted from composites have no Python
+                # shim. Use the same single-op engine plumbing directly.
+                from aisimulate_core.sdk.engine import _evaluate_single_op
+
+                result = _evaluate_single_op(
+                    self._database,
+                    op,
+                    is_context=is_context,
+                    batch_size=batch_size,
+                    s=seq_len,
+                    prefix=int(runtime_config.prefix or 0),
+                    x=x,
+                    imbalance_correction_scale=(
+                        runtime_config.seq_imbalance_correction_scale
+                        if is_context
+                        else runtime_config.gen_seq_imbalance_correction_scale
+                    ),
+                )
             per_op[op._name] += float(result)
         return sum(per_op.values()), per_op
 
