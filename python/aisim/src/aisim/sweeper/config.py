@@ -41,6 +41,7 @@ from ..config.common import (
     requested_backend_version,
 )
 from ..config.engine import (
+    MtpDepthSearch,
     NgramSpeculationConfig,
     ReplayEstimationMode,
     grouped_prefix_caching_requirements,
@@ -653,7 +654,7 @@ class SearchSpace(BaseModel):
     kvcache_quant_mode: str | None = None
     fmha_quant_mode: str | None = None
     comm_quant_mode: str | None = None
-    speculation: NgramSpeculationConfig | None = None
+    speculation: NgramSpeculationConfig | MtpDepthSearch | None = None
     encoder: EncoderSearch | None = None
 
     # Independent A/F topology domains indexed by public language role.
@@ -791,16 +792,30 @@ class SearchSpace(BaseModel):
         if self.speculation is not None:
             if self.aic_nextn is not None:
                 raise ValueError("speculation cannot be combined with aic_nextn")
-            if self.backend != ["vllm"] or any(mode not in {"agg", "disagg"} for mode in self.deployment_mode):
-                raise ValueError("ngram speculation requires vllm aggregated/disaggregated language workers")
+            kind = self.speculation.kind
+            backends = {"vllm"} if kind == "ngram" else {"vllm", "sglang"}
+            if (
+                not set(self.backend) <= backends
+                or self.afd_roles
+                or any(mode not in {"agg", "disagg"} for mode in self.deployment_mode)
+            ):
+                supported = "/".join(sorted(backends))
+                raise ValueError(f"{kind} speculation requires {supported} aggregated/disaggregated language workers")
             if self.encoder is not None:
-                raise ValueError("ngram speculation does not support EPD")
+                raise ValueError(f"{kind} speculation does not support EPD")
             roles = []
             if "agg" in self.deployment_mode:
                 roles.append("agg")
             if "disagg" in self.deployment_mode:
                 roles.extend(("prefill", "decode"))
             for role in roles:
+                if kind == "mtp":
+                    if (
+                        getattr(self, f"{role}_num_gpu_blocks") is None
+                        or getattr(self, f"{role}_timing_model") is not None
+                    ):
+                        raise ValueError("mtp speculation requires fixed KV capacity and default timing")
+                    continue
                 if getattr(self, f"{role}_native_host_offload") is not None:
                     raise ValueError("ngram speculation does not support host_offload")
                 if getattr(self, f"{role}_forward_model") not in (None, "op_level"):

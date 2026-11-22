@@ -281,6 +281,8 @@ def branch_knob_choices(search_space, deployment_mode: str) -> dict[str, list[An
         if ("aggregated" if name.startswith("agg_") else name.split("_", 1)[0]) not in search_space.afd_roles
     )
     choices = {name: list(getattr(search_space, name)) for name in names}
+    if search_space.speculation is not None and search_space.speculation.kind == "mtp":
+        choices["mtp_depth"] = list(search_space.speculation.depth.choices)
     if deployment_mode == "agg":
         roles = ("agg",)
     elif deployment_mode == "disagg":

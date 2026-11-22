@@ -190,6 +190,10 @@ def unroll_sample(
             "kv_transfer_timing_mode",
         ):
             sample[key] = getattr(search_space, key)
-    if search_space.speculation is not None:
-        sample["speculation"] = search_space.speculation.model_dump(mode="json")
+    speculation = search_space.speculation
+    if speculation is not None and speculation.kind == "mtp":
+        sample["mtp_depth"] = int(selection["mtp_depth"])
+        speculation = speculation.at_depth(sample["mtp_depth"])
+    if speculation is not None:
+        sample["speculation"] = speculation.model_dump(mode="json", exclude_none=True)
     return sample

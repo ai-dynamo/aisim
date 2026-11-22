@@ -64,8 +64,9 @@ class SpeculationConfig:
         depth = scheme.verify_width() - 1
         if isinstance(scheme, EagleScheme) and (scheme.is_tree or depth != len(scheme.tree_shape)):
             raise ValueError("speculative replay requires an EAGLE chain with one verification token per draft")
-        if self.kind != "none" and not 1 <= depth <= 5:
-            raise ValueError("speculative replay requires 1..5 draft tokens")
+        limit = 7 if self.kind == "mtp" else 5
+        if self.kind != "none" and not 1 <= depth <= limit:
+            raise ValueError(f"speculative replay requires 1..{limit} draft tokens")
         return depth
 
     def identity_hash(self) -> str:
