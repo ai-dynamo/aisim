@@ -135,6 +135,19 @@ def test_grouped_fit_uses_windowed_native_peak_instead_of_linear_context_rate(tm
     assert windowed.default.estimated_required_bytes < windowed.hardware.memory_budget_bytes
     assert windowed.default.draft.profile.deployments[0].resources.kv_bytes_per_token is None
     assert any("Rust's window" in item for item in windowed.assumptions)
+    # The peak of the one window group at TP1: pages of 16 tokens * 2 layers * (K and V) * 2 KV heads * 4 dims *
+    # 2 bytes = 1,024 bytes, and vLLM's startup count with two batches of 256 tokens in flight,
+    # cdiv(min(127 + 2 * 256, 2048), 16) + 1 = 41 pages.
+    assert windowed.default.known_required_bytes == non_kv + 41 * 1024
+    # TP1 fits from a budget of exactly that peak above the non-KV bytes, and one byte less needs TP2.
+    for extra, gpus in [(41 * 1024 - 1, 2), (41 * 1024, 1)]:
+        _hardware(tmp_path, monkeypatch, gpu={"mem_capacity": ((non_kv + extra) * 10 + 8) // 9})
+        edge = suggest_topologies(
+            _config(tmp_path, sliding_window=128),
+            request,
+            {**runtime, "cache_block_sizes": {"sliding_attention": 16}},
+        )
+        assert edge.default.required_gpus == gpus, extra
 
 
 def test_grouped_missing_runtime_blocks_never_establish_fit(tmp_path):

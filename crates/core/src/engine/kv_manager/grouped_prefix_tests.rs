@@ -4066,5 +4066,57 @@ fn startup_blocks_equal_the_pages_of_the_profile_peak_bound() {
                 "{version:?} {checkpoint}"
             );
         }
+        // A window group in blocks of 4, with chunks of 8 tokens in two
+        // batches (v0.33 `iface:918-955`, `vllm/config/vllm.py:588-609`), on
+        // both sides. Window 8, context 64: cdiv(min(7 + 16, 64), 4) + 1 = 7.
+        // Window 9, context 64: cdiv(min(8 + 16, 64), 4) + 1 = 7, where a
+        // window without its `- 1` would give 8. Window 8, context 16:
+        // cdiv(min(7 + 16, 16), 4) + 1 = 5. Window 8, context 17, one token
+        // above a block: cdiv(min(7 + 16, 17), 4) + 1 = 6.
+        for (window, context, blocks) in [(8, 64, 7), (9, 64, 7), (8, 16, 5), (8, 17, 6)] {
+            let groups = [attention("window", 4, Some(window))];
+            assert_eq!(
+                groups[0].startup_request_bytes(context, 8, true).unwrap()
+                    / groups[0].page_size_bytes,
+                blocks,
+                "{version:?} {window} {context}"
+            );
+            assert_eq!(
+                GroupedPrefixRules::new(&groups, 4, version)
+                    .unwrap()
+                    .startup_blocks(context as usize, 2 * 8),
+                blocks as usize,
+                "{version:?} {window} {context}"
+            );
+        }
+    }
+    // The window branch refuses what the other branches refuse: a window of
+    // 0, a context of 0 and a chunk of 0.
+    let window = attention("window", 4, Some(8));
+    for (group, context, chunk, refusal) in [
+        (
+            attention("window", 4, Some(0)),
+            64,
+            8,
+            "cache group requires a name, positive layers/block/page/window",
+        ),
+        (
+            window.clone(),
+            0,
+            8,
+            "cache context and max_num_tokens must be positive",
+        ),
+        (
+            window,
+            64,
+            0,
+            "cache context and max_num_tokens must be positive",
+        ),
+    ] {
+        let error = group
+            .startup_request_bytes(context, chunk, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(refusal), "{error}");
     }
 }

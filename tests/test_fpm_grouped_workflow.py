@@ -653,8 +653,10 @@ def test_public_predict_runs_with_a_state_group(grouped_case, tmp_path, dep):
     assert groups["state"] == {**_STATE_GROUP, "sliding_window": None}
     assert all("blocks_per_request" not in group for name, group in groups.items() if name != "state")
     assert lowered["kv_cache_capacity_bytes"] == 3486
-    # 2048 full-history + 656 sliding-window + 272 convolution + 128 state bytes (2 blocks of 64).
-    assert diagnostics["request_peak_cache_bytes"] == 3104
+    # 2048 full-history + 784 sliding-window (cdiv(511 + 256, 16) + 1 = 49 pages of 16 bytes) + 528 convolution
+    # (cdiv(3 + 256, 4) + 1 = 66 pages of 8 bytes) + 128 state bytes (2 blocks of 64). Each window term counts vLLM's
+    # startup count with two batches of 128 tokens in flight.
+    assert diagnostics["request_peak_cache_bytes"] == 3488
     path = tmp_path / "predict.yaml"
     path.write_text(yaml.safe_dump(raw))
     output = tmp_path / "prediction"
@@ -988,6 +990,11 @@ def test_grouped_kv_load_sizes_each_pd_role_with_its_own_context_length(grouped_
 def test_grouped_state_group_adds_fixed_bytes_per_request(grouped_case):
     profile, root = grouped_case
     profile = _with_state_group(profile)
+    # The peak bound at the 2,048-token context is 3,488 bytes: 2,048 full-history, 784 sliding-window and 528
+    # convolution bytes with two batches of 128 tokens in flight, and 128 state bytes. Two bytes less communication
+    # overhead give a pool of floor(4096 * 0.9 - 198) = 3,488 bytes, equal to the peak, which the gate admits.
+    for deployment in profile["deployments"]:
+        deployment["resources"]["comm_overhead_bytes"] = 48
     candidates = parallel_configs_for(
         profile["model"],
         "h200_sxm",
@@ -1022,7 +1029,7 @@ def test_grouped_state_group_adds_fixed_bytes_per_request(grouped_case):
         )
         # The 1760 bytes of the other groups plus 2 state blocks of 64 bytes. The capacity does not change.
         assert result.role_request_cache_bytes == {"agg": 1888}
-        assert result.role_capacity_bytes == {"agg": 3486 * candidate.shape.dp}
+        assert result.role_capacity_bytes == {"agg": 3488 * candidate.shape.dp}
         assert result.concurrency_capacity == candidate.shape.dp
         assert result.role_capacity_tokens == {}
 
@@ -2224,14 +2231,15 @@ def test_grouped_sweeper_checks_each_candidate_budget_before_replay(grouped_case
         build_backend_deployment(sample, backend_version="0.31.0")
 
 
-@pytest.mark.parametrize("pages", [28, 29])
+@pytest.mark.parametrize("pages", [30, 31])
 def test_grouped_sweeper_admits_an_align_pool_only_from_the_startup_count(grouped_case, pages):
     from aisim.sweeper.model_hw import NoViableParallelConfig
 
-    # At the 1,024-token context and the 128-token chunk, one request needs 16 pages of the full group, 11 of the
-    # 512-token window group (min(16, cdiv(511 + 128 + 63, 64))) and 2 + c = 2 of the state group in align mode
-    # (v0.33.0 kv_cache_interface.py:1135-1141): 29 pages of 64 bytes. A pool of 28 pages admits no shape, and a pool
-    # of 29 admits both shapes of the fixture, which carry the same groups and pool.
+    # At the 1,024-token context and the 128-token chunk, one request needs 16 pages of the full group, 13 of the
+    # 512-token window group (cdiv(min(511 + 2 * 128, 1024), 64) + 1, with two batches in flight; v0.33.0
+    # kv_cache_interface.py:918-955) and 2 + c = 2 of the state group in align mode (v0.33.0
+    # kv_cache_interface.py:1135-1141): 31 pages of 64 bytes. A pool of 30 pages admits no shape, and a pool of 31
+    # admits both shapes of the fixture, which carry the same groups and pool.
     profile, root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile), version="0.33.0")
     for deployment in profile["deployments"]:
@@ -2254,7 +2262,7 @@ def test_grouped_sweeper_admits_an_align_pool_only_from_the_startup_count(groupe
         )
         return sorted({candidate.shape.strategy for candidate in candidates})
 
-    if pages == 28:
+    if pages == 30:
         with pytest.raises(NoViableParallelConfig):
             shapes()
     else:
@@ -2568,12 +2576,13 @@ def test_a_grouped_vllm_0330_plan_saved_cold_still_verifies(grouped_case, tmp_pa
 
 
 # The peak cache bound of _with_prefix_evidence(_with_state_group(profile)) at the 1,024-token context and the 128-token
-# chunk of _onboarding_plan, in pages of 64 bytes. The full group holds cdiv(1,024, 64) = 16 pages and the 512-token
-# window group min(16, cdiv(511 + 128 + 63, 64)) = 11. The planner before the bound counted vLLM's startup blocks gave
-# the state group its 1 page of blocks_per_request: 28 pages. vLLM's startup check counts 2 + c = 2 pages for the state
-# group in align mode, with c = 0 (v0.33.0 kv_cache_interface.py:1135-1141): 29 pages.
+# chunk of _onboarding_plan, in pages of 64 bytes. The full group holds cdiv(1,024, 64) = 16 pages. The planner before
+# the bound counted vLLM's startup blocks gave the 512-token window group min(16, cdiv(511 + 128 + 63, 64)) = 11 pages
+# and the state group its 1 page of blocks_per_request: 28 pages. vLLM's startup check counts the window group with two
+# batches in flight, cdiv(min(511 + 256, 1,024), 64) + 1 = 13 pages (v0.33.0 kv_cache_interface.py:918-955), and
+# 2 + c = 2 pages for the state group in align mode, with c = 0 (v0.33.0 kv_cache_interface.py:1135-1141): 31 pages.
 _EARLIER_PEAK = 28 * 64
-_STARTUP_PEAK = 29 * 64
+_STARTUP_PEAK = 31 * 64
 
 
 def _peak_like_an_earlier_planner(monkeypatch, peak=_EARLIER_PEAK):
@@ -2662,15 +2671,19 @@ def test_grouped_plan_saved_with_the_earlier_peak_bound_still_verifies(
 @pytest.mark.parametrize(
     "variant,earlier,startup",
     [
-        # A 514-token window: min(16, cdiv(513 + 128 + 63, 64)) = 11 pages, so 16 + 11 + 1 = 28 pages earlier and
-        # 16 + 11 + 2 = 29 at startup.
-        ("window_514", 28 * 64, 29 * 64),
-        # A 600-token context: the full group holds cdiv(600, 64) = 10 pages and the window group
-        # min(10, cdiv(511 + 128 + 63, 64)) = 10 pages, so 10 + 10 + 1 = 21 pages earlier and 22 at startup.
-        ("context_600", 21 * 64, 22 * 64),
+        # A 514-token window: earlier min(16, cdiv(513 + 128 + 63, 64)) = 11 pages, so 16 + 11 + 1 = 28 pages. At
+        # startup cdiv(min(513 + 256, 1,024), 64) + 1 = 14 pages, so 16 + 14 + 2 = 32.
+        ("window_514", 28 * 64, 32 * 64),
+        # A 600-token context: the full group holds cdiv(600, 64) = 10 pages. The window group holds earlier
+        # min(10, cdiv(511 + 128 + 63, 64)) = 10 pages, so 10 + 10 + 1 = 21 pages, and at startup
+        # cdiv(min(511 + 256, 600), 64) + 1 = 11 pages, so 10 + 11 + 2 = 23.
+        ("context_600", 21 * 64, 23 * 64),
         # The state group has pages of 128 bytes: 16 * 64 + 11 * 64 + 1 * 128 = 1,856 bytes earlier and
-        # 16 * 64 + 11 * 64 + 2 * 128 = 1,984 bytes at startup.
-        ("state_page_128", 1_856, 1_984),
+        # 16 * 64 + 13 * 64 + 2 * 128 = 2,112 bytes at startup.
+        ("state_page_128", 1_856, 2_112),
+        # The state group has 2 blocks per request, its running block and k = 1 more: earlier its 2 pages of
+        # blocks_per_request, so 16 + 11 + 2 = 29 pages. At startup 2 + k + c = 3 pages, so 16 + 13 + 3 = 32.
+        ("state_blocks_2", 29 * 64, 32 * 64),
     ],
 )
 def test_the_earlier_peak_of_a_saved_plan_counts_each_group_by_its_own_rule(
@@ -2686,11 +2699,37 @@ def test_the_earlier_peak_of_a_saved_plan_counts_each_group_by_its_own_rule(
                 group["sliding_window"] = 514
             if variant == "state_page_128" and group["kind"] == "state":
                 group["page_size_bytes"] = 128
+            if variant == "state_blocks_2" and group["kind"] == "state":
+                group["blocks_per_request"] = 2
     _onboarding_plan(profile, tmp_path, capsys, "0.33.0", context_length=600 if variant == "context_600" else 1024)
     plan = tmp_path / "collection"
     assert json.loads((plan / "support-plan.json").read_text())["resources"]["request_peak_cache_bytes"] == startup
     _set_saved_peak(plan, earlier)
     plan_module.check_plan(SupportRequest.from_yaml(plan / "request.yaml"), plan)
+
+
+@reads_saved_config
+def test_a_declared_window_plan_saved_with_the_earlier_peak_still_verifies(grouped_case, tmp_path, capsys):
+    from aisim.support import plan as plan_module
+
+    # The declared profile of grouped_case: declared memory, no runtime record, no state group, a window group and a
+    # convolution group. At the 1,024-token context and the 128-token chunk of _onboarding_plan the full group holds
+    # cdiv(1,024, 64) = 16 pages of 64 bytes = 1,024. The planner of the checkout counts vLLM's startup count of each
+    # window group with two batches in flight: window cdiv(min(511 + 256, 1,024), 16) + 1 = 49 pages of 16 bytes = 784,
+    # convolution cdiv(min(3 + 256, 1,024), 4) + 1 = 66 pages of 8 bytes = 528, so 2,336. The planner before it counted
+    # one chunk: window min(64, cdiv(511 + 128 + 15, 16)) = 41 pages = 656, convolution min(256, cdiv(3 + 128 + 3, 4))
+    # = 34 pages = 272, so 1,952.
+    profile, _root = grouped_case
+    _onboarding_plan(profile, tmp_path, capsys, "0.25.1")
+    plan = tmp_path / "collection"
+    assert json.loads((plan / "support-plan.json").read_text())["resources"]["request_peak_cache_bytes"] == 2_336
+    _set_saved_peak(plan, 1_952)
+    request = SupportRequest.from_yaml(plan / "request.yaml")
+    plan_module.check_plan(request, plan)
+    # One convolution page more is neither bound.
+    _set_saved_peak(plan, 1_952 + 8)
+    with pytest.raises(ValueError, match="support-plan.json was modified; choose a new output directory"):
+        plan_module.check_plan(request, plan)
 
 
 @reads_saved_config

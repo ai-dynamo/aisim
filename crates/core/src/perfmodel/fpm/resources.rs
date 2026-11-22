@@ -19,6 +19,23 @@ use crate::{AicError, BackendKind, MemoryBreakdown};
 
 const MAX_EXACT_BYTES: u64 = 1 << 53;
 
+/// The batches whose tokens a window group holds at vLLM's startup count:
+/// `max_concurrent_batches` under async scheduling at pipeline parallel size
+/// 1 (`vllm/config/vllm.py:592-613` at v0.31, `:577-598` at v0.32, `:588-609`
+/// at v0.33). Replay turns async scheduling on unless `async_scheduling` is
+/// false. vLLM turns it on when it is unset and the configuration allows it
+/// (`:1576-1635` at v0.31, `:1585-1644` at v0.32, `:1685-1719` at v0.33).
+/// With a larger pipeline parallel size the V2 model runner of vLLM keeps
+/// `pp_size + 1` batches, but an FPM profile fixes `pp` at 1, so two is vLLM's
+/// count for every FPM profile with async scheduling. With `async_scheduling:
+/// false` vLLM counts one batch, and the bound is then above vLLM's count by
+/// `cdiv(max_num_tokens, block)` pages at most. A convolution group takes the
+/// same term: it stands for the `SlidingWindowSpec` that vLLM's Inkling
+/// convolution layer returns, with the kernel size as the window
+/// (`vllm/models/inkling/nvidia/sconv_swa_attn.py:158` and `:185-193` at v0.31,
+/// v0.32 and v0.33).
+const STARTUP_IN_FLIGHT_BATCHES: u64 = 2;
+
 fn invalid(message: impl Into<String>) -> AicError {
     AicError::InvalidEngineConfig(message.into())
 }
@@ -217,7 +234,9 @@ impl FpmCacheGroup {
     /// chunks no larger than `max_num_tokens`. The extra block alignment can
     /// coexist with the entire new chunk; clipping only to the retention window
     /// would underestimate prefill memory. A state group needs only its fixed
-    /// blocks, whatever the context.
+    /// blocks, whatever the context. The steady occupancy of the cache budget
+    /// counts this one-chunk form; its peak bound counts
+    /// [`Self::startup_request_bytes`].
     pub fn peak_request_bytes(
         &self,
         context_length: u64,
@@ -251,25 +270,40 @@ impl FpmCacheGroup {
     /// align`. In that mode a prefix-cacheable state group, a Mamba spec,
     /// counts `2 + k + c` pages (`kv_cache_interface.py:1083-1094` at v0.31,
     /// `:1076-1082` at v0.32, `:1135-1141` at v0.33): `blocks_per_request`
-    /// (`1 + k`), one previous block and `c` checkpoint blocks. Every other
-    /// group gives [`Self::peak_request_bytes`].
+    /// (`1 + k`), one previous block and `c` checkpoint blocks. A group with a
+    /// `sliding_window`, in any mode, counts the admission cap of a
+    /// `SlidingWindowSpec`, `cdiv(min(window - 1 + 2 * max_num_tokens,
+    /// context_length), block) + 1` pages (`kv_cache_interface.py:840-877` at
+    /// v0.31, `:859-896` at v0.32, `:918-955` at v0.33), with the in-flight
+    /// tokens of `STARTUP_IN_FLIGHT_BATCHES` batches. Every other group gives
+    /// [`Self::peak_request_bytes`].
     pub fn startup_request_bytes(
         &self,
         context_length: u64,
         max_num_tokens: u32,
         align: bool,
     ) -> Result<u64, AicError> {
-        if !align || self.kind != FpmCacheKind::State || self.prefix_cacheable != Some(true) {
+        let align_state =
+            align && self.kind == FpmCacheKind::State && self.prefix_cacheable == Some(true);
+        if self.sliding_window.is_none() && !align_state {
             return self.peak_request_bytes(context_length, max_num_tokens);
         }
         self.validate()?;
         if context_length == 0 || max_num_tokens == 0 {
             return Err(invalid("cache context and max_num_tokens must be positive"));
         }
-        // `validate` guarantees a positive count for state groups.
-        let pages = self.blocks_per_request.map_or(0, u64::from)
-            + 1
-            + self.prefill_checkpoint_blocks.map_or(0, u64::from);
+        let pages = if let Some(window) = self.sliding_window {
+            let in_flight = STARTUP_IN_FLIGHT_BATCHES * u64::from(max_num_tokens);
+            (u64::from(window) - 1 + in_flight)
+                .min(context_length)
+                .div_ceil(u64::from(self.block_size_tokens))
+                + 1
+        } else {
+            // `validate` guarantees a positive count for state groups.
+            self.blocks_per_request.map_or(0, u64::from)
+                + 1
+                + self.prefill_checkpoint_blocks.map_or(0, u64::from)
+        };
         pages
             .checked_mul(self.page_size_bytes)
             .filter(|bytes| *bytes <= MAX_EXACT_BYTES)
@@ -596,11 +630,13 @@ pub struct FpmCacheBudget {
     pub resource_provenance: String,
     pub cache_layout: FpmCacheLayout,
     pub cache_groups: Vec<FpmCacheGroup>,
-    /// Per-request upper bound, including window block alignment and the
-    /// configured prefill chunk. This is not an aggregate token capacity. In a
-    /// profile that records `mamba_cache_mode: align`, it counts `2 + k + c`
-    /// blocks for a prefix-cacheable state group, as vLLM's startup check
-    /// does; `blocks_per_request` stays the steady count.
+    /// Per-request upper bound, as vLLM's startup check counts it. This is not
+    /// an aggregate token capacity. A window or convolution group counts the
+    /// pages of its window and of two batches of the configured prefill chunk,
+    /// at most the context, plus one page of alignment. In a profile that records
+    /// `mamba_cache_mode: align`, it counts `2 + k + c` blocks for a
+    /// prefix-cacheable state group; `blocks_per_request` stays the steady
+    /// count.
     pub request_peak_cache_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_occupancy_cache_bytes: Option<u64>,
@@ -917,10 +953,12 @@ impl FpmResourceConfig {
             .runtime_memory
             .as_ref()
             .is_some_and(|memory| memory.mamba_cache_mode == Some(FpmMambaCacheMode::Align));
-        // The peak counts vLLM's startup blocks of a state group in align
-        // mode; the steady occupancy passes `align: false` and counts
-        // `blocks_per_request`.
-        let footprint = |tokens: u64, chunk: u32, align: bool| {
+        // The peak (`startup: true`) counts vLLM's startup count of each group:
+        // the window cap with two batches in flight, and the startup blocks of
+        // a state group in align mode. The steady occupancy (`startup: false`)
+        // counts `peak_request_bytes`: one chunk for a window group and
+        // `blocks_per_request` for a state group.
+        let footprint = |tokens: u64, chunk: u32, startup: bool| {
             let bytes = if let Some(cache) = &self.mamba_cache {
                 let pages = tokens.div_ceil(u64::from(cache.block_size_tokens));
                 // Peak includes old/new state plus a partial attention source.
@@ -935,14 +973,19 @@ impl FpmResourceConfig {
                 tokens.checked_mul(self.kv_bytes_per_token.unwrap())
             } else {
                 self.cache_groups.iter().try_fold(0u64, |sum, group| {
-                    sum.checked_add(group.startup_request_bytes(tokens, chunk, align).ok()?)
+                    let bytes = if startup {
+                        group.startup_request_bytes(tokens, chunk, align)
+                    } else {
+                        group.peak_request_bytes(tokens, chunk)
+                    };
+                    sum.checked_add(bytes.ok()?)
                 })
             };
             bytes
                 .filter(|bytes| *bytes <= MAX_EXACT_BYTES)
                 .ok_or_else(|| invalid("cache request allocation exceeds 2**53 bytes"))
         };
-        let request_peak_cache_bytes = footprint(context, request.max_num_tokens, align)?;
+        let request_peak_cache_bytes = footprint(context, request.max_num_tokens, true)?;
         let request_occupancy_cache_bytes = request
             .request_occupancy_tokens
             .map(|tokens| {
@@ -1415,7 +1458,9 @@ mod tests {
         assert_eq!(grouped.total_kv_size_bytes, 600);
         assert_eq!(grouped.total_kv_size_tokens, None);
         assert_eq!(grouped.memory_breakdown, None);
-        assert_eq!(grouped.request_peak_cache_bytes, 1760);
+        // vLLM's startup count of the 32-token window with two batches of 128
+        // tokens: cdiv(min(31 + 256, 4096), 16) + 1 = 19 pages of 160 bytes.
+        assert_eq!(grouped.request_peak_cache_bytes, 3040);
 
         runtime.cache_layout = FpmCacheLayout::Linear;
         runtime.cache_groups.clear();
@@ -1446,9 +1491,10 @@ mod tests {
         q.request_occupancy_tokens = Some(1152);
         let budget = runtime.estimate_budget(&q, 4096).unwrap();
         // A 32-token retained window can straddle three 16-token pages.
-        // A 128-token prefill chunk needs eleven pages. Each page is 160 bytes.
+        // The peak counts vLLM's startup count with two batches of 128 tokens:
+        // cdiv(min(31 + 256, 4096), 16) + 1 = 19 pages. Each page is 160 bytes.
         assert_eq!(budget.request_occupancy_cache_bytes, Some(480));
-        assert_eq!(budget.request_peak_cache_bytes, 1760);
+        assert_eq!(budget.request_peak_cache_bytes, 3040);
         q.max_num_tokens = 1;
         assert!(runtime.estimate_budget(&q, 4096).is_err());
         q.max_num_tokens = 128;
@@ -1698,8 +1744,9 @@ mod tests {
             result.tolerance_adjusted.unwrap().total_kv_size_tokens,
             None
         );
-        // At most 11 aligned pages cover 31 history + 128 scheduled tokens.
-        assert_eq!(result.request_peak_cache_bytes, 1760);
+        // 31 history tokens and two batches of 128 in-flight tokens span
+        // cdiv(min(31 + 256, 4096), 16) + 1 = 19 pages of 160 bytes.
+        assert_eq!(result.request_peak_cache_bytes, 3040);
         assert_eq!(
             result.memory_breakdown.unwrap().cuda_graph_reserved_bytes,
             20

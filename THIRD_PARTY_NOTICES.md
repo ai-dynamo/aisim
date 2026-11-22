@@ -679,8 +679,10 @@ tokens, with the size of each group from `kv_cache_interface.py`, summed per
 group.
 In v0.33.0 that check is in `kv_cache_planning.py`.
 `crates/core/src/perfmodel/fpm/resources.rs` adapts, from
-`kv_cache_interface.py`, the startup size of a `MambaSpec` in align mode for the
-peak cache bound of planning.
+`kv_cache_interface.py`, the startup size of a `MambaSpec` in align mode and the
+startup size of a `SlidingWindowSpec`, which is its admission cap, and, from
+`config/vllm.py`, the bound on in-flight tokens that the cap uses, with two
+concurrent batches, for the peak cache bound of planning.
 `config.rs` also refuses
 `prefill_schedule_interval` above 1 on the v0.33.0 row, because
 `sched/scheduler.py` of v0.33.0 applies that interval without data parallelism
