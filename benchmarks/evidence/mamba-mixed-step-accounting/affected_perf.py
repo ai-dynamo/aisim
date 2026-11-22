@@ -10,7 +10,7 @@ Each BUILD is a directory under ROOT with the checkout in `src` and its environm
 process: it builds every handle, primes it with a query of another shape, then times one
 unseen query (cold) and 100 repeats after 10 warmup calls (warm median) with the forward
 perf gate's measure_cold_and_warm. OUT.json holds each round's order and maps
-build -> case -> per-round cold, warm and returned value.
+build -> case -> per-round cold, warm median, raw warm samples and returned value.
 """
 
 import json
@@ -125,8 +125,13 @@ def worker(src):
 
     out = {}
     for name, call in cases.items():
-        value, cold, _, warm = measure_cold_and_warm(call, warmup=10, iterations=100)
-        out[name] = {"value": value, "cold_us": cold, "warm_us": warm["call_median_us"]}
+        value, cold, warm_samples, warm = measure_cold_and_warm(call, warmup=10, iterations=100)
+        out[name] = {
+            "value": value,
+            "cold_us": cold,
+            "warm_us": warm["call_median_us"],
+            "warm_samples_us": warm_samples,
+        }
     shutil.rmtree(root)
     sys.stdout.write("\n" + json.dumps(out) + "\n")
 
@@ -151,9 +156,10 @@ if __name__ == "__main__":
                 check=True,
             )
             for name, row in json.loads(proc.stdout.splitlines()[-1]).items():
-                cell = res[b].setdefault(name, {"cold": [], "warm": [], "value": []})
+                cell = res[b].setdefault(name, {"cold": [], "warm": [], "warm_samples_us": [], "value": []})
                 cell["cold"].append(row["cold_us"])
                 cell["warm"].append(row["warm_us"])
+                cell["warm_samples_us"].append(row["warm_samples_us"])
                 cell["value"].append(row["value"])
     with open(out, "w") as f:
         json.dump({"orders": orders, "results": res}, f, indent=1)

@@ -2205,6 +2205,13 @@ class BaseBackend:
             mix_step_estimate = self._run_agg_mixed_step(
                 model, database, runtime_config, MixedStepInput(num_mix_ctx_tokens, num_mix_gen_tokens)
             )
+        # Native FPM may also average several uncached chunks inside one
+        # run_mixed call. Neither kind of mean is a single query coordinate.
+        averages_mixed_shapes = averages_text_chunks or (
+            _is_fpm_model(model) and 0 < mix_step_estimate.context_tokens < isl - prefix
+        )
+        if averages_mixed_shapes and mix_step_estimate.context_tokens:
+            mix_step_estimate = dataclasses.replace(mix_step_estimate, context_tokens=0)
         mix_step_latency_ms = mix_step_estimate.latency_ms
         mix_step_energy_wms = mix_step_estimate.energy_wms
         mix_per_ops = mix_step_estimate.per_op_latency_ms
@@ -2501,7 +2508,8 @@ class BaseBackend:
             "genonly_step_energy_wms": float(genonly_step_energy_wms),
             "mix_efficiency": float(mix_efficiency),
             "decode_iterations": decode_iterations,
-            "mix_context_tokens": float(num_mix_ctx_tokens),
+            "mix_context_token_budget": float(ctx_tokens),
+            **({} if averages_mixed_shapes else {"mix_context_tokens": float(mix_step_estimate.context_tokens)}),
             "mix_decode_requests": float(num_mix_gen_tokens),
             "mix_decode_query_tokens": float(mix_step_estimate.num_decode_query_tokens),
         }
@@ -2529,7 +2537,7 @@ class BaseBackend:
                 # already includes the mix_efficiency scale.
                 # Chunk means are exposed in scheduling and weighted in the
                 # aggregate breakdown, rather than labeled as a raw iteration.
-                **({} if averages_text_chunks else {"mixed": mix_step_estimate}),
+                **({} if averages_mixed_shapes else {"mixed": mix_step_estimate}),
                 "scheduling": dict(per_ops_data["scheduling"]),
             }
         )

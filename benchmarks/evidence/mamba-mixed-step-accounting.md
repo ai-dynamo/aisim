@@ -1428,8 +1428,9 @@ python -m pytest -c python/aisim/pytest.ini \
   python/aisim/tests/cross_package/test_single_oracle_contract.py
 ```
 
-The required native parity suites also pass, with 390 tests and no golden
-changes:
+That repair recorded 390 passes in the two-module parity subset below, with
+no golden changes. It did not run the AFD modules; the complete four-module
+verification is recorded in the scoped repair section below.
 
 ```bash
 python -m pytest -c python/aisim/pytest.ini \
@@ -1475,3 +1476,91 @@ imported bytes, including for a byte-identical installed wheel copy.
 versions and the accepted identical-copy case. The new round-launcher tests
 exercise twelve fresh interpreters, alternating SDK selection despite an
 ambient `PYTHONPATH`, and rejection of a result imported from the wrong SDK.
+
+### Scoped review repair from `095985d3`
+
+The pinned input is `095985d3c9e8b414165d60383027914cb261bc00`.
+The corrected `base_backend.py` has Git blob
+`5f951cd2280e32f28c5909a260298789ffc86b6e`; the corrected
+`affected_perf.py` has blob `6bbae4632ac173ca0f48efde5e9a45988bb66ff5`.
+Native sources are unchanged from the pinned input. Verification used an
+installed optimized wheel built with `maturin build --release --locked
+--auditwheel skip`, Rust 1.91.1, Python 3.12.12 and `CARGO_BUILD_JOBS=2`.
+The installed native binary matched that wheel byte-for-byte, all 269 embedded
+native source hashes matched the checkout, and the installed backend matched
+the corrected Python source.
+
+For `PRRT_kwDOT0t9uc66TbgK`, scheduling now separates the input
+`mix_context_token_budget` from `mix_context_tokens`, which comes from the
+executed `StepEstimate` for a single priced shape. Batch two, ISL 4096,
+prefix 3000 and budget 4096 therefore report budget 4096 and execution 1096.
+The 512-token budget still prices chunks of 512, 512 and 72 fresh tokens,
+with six mixed-step weights for the batch. Such means omit a single-query
+coordinate and raw `mixed` entry, including when native FPM performs the
+averaging internally. Aggregate energy evidence leaves the mean's context
+coordinate at zero. The execution flow, latency, energy and chunk weights
+are unchanged. The regressions exercise both vLLM and TRT-LLM, plus
+single-request op-level chunks and the one-step control.
+
+For `PRRT_kwDOT0t9uc66TbgG`, `affected_perf.py` retains the returned
+`warm_samples_us` in its worker response and in each build/case/round of the
+parent output. The measured calls, warmups and median fields are unchanged.
+A real two-round run covered nine cases and retained 1,800 samples; every
+100-sample median recomputed exactly. The historical
+`affected-perf-d462dab8-d6b02759.json` lacks these samples, so its warm medians
+cannot be independently recomputed. No historical samples were invented.
+The new regression also checks that rotation keeps each round's samples
+associated with its original median.
+
+On the starting wheel, the new sample-retention regression failed once and
+all five new scheduling cases failed as expected. An expanded run started
+before the corrected wheel installation completed also used the starting
+wheel (347 passed, five failed). After installing and verifying the corrected
+wheel, the following final checks passed. Logs remain in the repair scratch
+directory; the earlier failed invocations are retained there as well.
+
+Backend/FPM/single-oracle coverage: **352 passed**.
+
+```bash
+python -m pytest -c python/aisim/pytest.ini -o cache_dir="$TMPDIR/pytest-cache" \
+  python/aisim/tests/unit/sdk/backends/test_base_backend.py \
+  python/aisim/tests/unit/sdk/backends/test_vllm_xpu_backend.py \
+  python/aisim/tests/unit/sdk/test_fpm_forward.py \
+  python/aisim/tests/cross_package/test_single_oracle_contract.py
+```
+
+Complete parity coverage for `PRRT_kwDOT0t9uc66TbgE`: **426 passed**, with
+no golden changes. This includes both previously omitted AFD modules.
+
+```bash
+python -m pytest -q -n 2 -c python/aisim/pytest.ini -p no:cacheprovider \
+  crates/core/parity_tests/perfmodel/test_engine_step_parity.py \
+  crates/core/parity_tests/perfmodel/test_compile_engine_parity.py \
+  crates/core/parity_tests/perfmodel/test_afd_parity.py \
+  crates/core/parity_tests/perfmodel/test_afd_execution_plan_parity.py
+```
+
+Sample-retention regression: **1 passed**.
+
+```bash
+python -m pytest -q -o cache_dir="$TMPDIR/pytest-cache" \
+  benchmarks/evidence/mamba-mixed-step-accounting/test_affected_perf.py
+```
+
+The real worker/parent smoke run used the driver's normal directory layout:
+`affected-smoke/head/src` points to this checkout and `head/venv` to the installed
+wheel's environment, all under the repair scratch directory. Exact invocation:
+
+```bash
+python benchmarks/evidence/mamba-mixed-step-accounting/affected_perf.py \
+  "$(dirname "$TMPDIR")/affected-smoke" 2 "$TMPDIR/affected-smoke.json" head
+```
+
+Full Python lint and formatting, changed-file compilation, Rust formatting,
+copyright, packaged legal files, local documentation links and whitespace
+checks also passed. This correction adds bounded scalar metadata work and
+one shallow dataclass replacement for a native chunk mean on an aggregate
+cache miss; it adds no model queries, cache or per-token state. Retaining the
+already-returned timing samples adds output storage outside the timed calls.
+This is a source-level cost assessment, not a new host-speed or serving-accuracy
+claim. The two outstanding evidence/contract requests above remain open.

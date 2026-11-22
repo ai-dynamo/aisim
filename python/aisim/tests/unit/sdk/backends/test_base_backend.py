@@ -1378,15 +1378,18 @@ def test_run_agg_single_request_counts_every_prefill_chunk(
     assert groups["mix_step"].energy_wms == pytest.approx(prefill_energy)
     assert groups["mix_step"].covered_latency_ms == pytest.approx(prefill_ms)
     evidence = summary.get_step_estimates()
+    assert evidence["scheduling"]["mix_context_token_budget"] == budget
     assert evidence["scheduling"]["mix_step_latency_ms"] == pytest.approx(prefill_ms / count)
     assert evidence["scheduling"]["mix_step_energy_wms"] == pytest.approx(prefill_energy / count)
     if count > 1:
         assert "mixed" not in evidence
+        assert "mix_context_tokens" not in evidence["scheduling"]
         assert groups["mix_step"].context_tokens == 0
         assert [step.context_tokens for step in raw_steps] == [isl for isl, _ in expected_chunks]
     else:
         assert evidence["mixed"] is raw_steps[0]
         assert evidence["mixed"].context_tokens == 4096
+        assert evidence["scheduling"]["mix_context_tokens"] == 4096
     assert result["power_w"] == pytest.approx((prefill_energy + 90) / (prefill_ms + 3))
 
 

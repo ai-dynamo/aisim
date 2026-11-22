@@ -66,6 +66,14 @@ This fallback does not model the exact placement of visual tokens in chunks;
 shared operations retain the existing mean-field approximation. Whole-model
 FPM instead retains its average over uncached chunks.
 
+Aggregate scheduling evidence records the caller's `ctx_tokens` capacity as
+`mix_context_token_budget`. For a single priced shape, `mix_context_tokens`
+comes from the executed `StepEstimate`, after budget translation (for example,
+1096 fresh FPM tokens for ISL 4096 and prefix 3000). A mean over distinct chunks
+retains its scheduling weights and latency, but omits `mix_context_tokens` and
+the raw `mixed` step entry: the mean has no single query coordinate. Its
+aggregate energy step likewise leaves `context_tokens` at zero.
+
 ### Context-attention measurement boundaries
 
 TRT-LLM `torch_flow` context-attention rows produced by `1.3.0rc20` and

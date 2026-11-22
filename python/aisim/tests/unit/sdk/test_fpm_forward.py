@@ -998,6 +998,18 @@ class TestFPMStaticAndMixed:
             assert scheduling["mix_step_latency_ms"] == pytest.approx(step_ms)
             assert scheduling["num_genonly_steps"] == (0 if budget == 512 else 2)
             assert scheduling["mix_decode_requests"] == 1
+            assert scheduling["mix_context_token_budget"] == budget
+            evidence = summary.get_step_estimates()
+            assert evidence["scheduling"] == scheduling
+            if budget == 512:
+                # The native price averages 512, 512 and 72 fresh tokens.
+                # That mean has no single iteration's query coordinate.
+                assert "mix_context_tokens" not in scheduling
+                assert "mixed" not in evidence
+                assert summary.get_aggregate_energy_breakdown()["mix_step"].context_tokens == 0
+            else:
+                assert scheduling["mix_context_tokens"] == 1096
+                assert evidence["mixed"].context_tokens == 1096
             assert summary.get_aggregate_energy_breakdown()["mix_step"].latency_ms == pytest.approx(
                 2 * chunks * step_ms
             )
