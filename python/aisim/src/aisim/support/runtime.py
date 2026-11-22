@@ -1043,6 +1043,15 @@ def import_observations(
             reason = json.loads(request.fpm_profile.provenance).get("cache_layout_reason")
             if reason is not None:
                 results[name]["cache_layout_reason"] = reason
+            # Without a typed layout claim the profile stays grouped; name the linear form when one is exact.
+            linear = linear_runtime_resources(result["resources"])
+            if linear is not None and not {"cache_layout", "kv_bytes_per_token", "cache_groups"} & set(overrides):
+                results[name]["linear_layout_hint"] = (
+                    "a linear layout describes this measurement exactly "
+                    f"(kv_bytes_per_token={linear['kv_bytes_per_token']}); to get a linear profile, add "
+                    "cache_layout: linear to the resource_overrides of this configuration in the checkpoint and run "
+                    "onboard import-observations again"
+                )
             # Why the import wrote no transfer_bytes_per_block, which a grouped P/D rank needs.
             if "transfer_bytes_reason" in result:
                 results[name]["transfer_bytes_reason"] = result["transfer_bytes_reason"]

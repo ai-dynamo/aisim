@@ -878,6 +878,134 @@ def test_linear_layout_claim_with_a_fractional_measurement_is_imported_as_groupe
     assert json.loads((tmp_path / "drafts" / "import.json").read_text())["configurations"]["tp2"] == result
 
 
+_LINEAR_HINT = (
+    "a linear layout describes this measurement exactly (kv_bytes_per_token=16); to get a linear profile, add "
+    "cache_layout: linear to the resource_overrides of this configuration in the checkpoint and run onboard "
+    "import-observations again"
+)
+
+# The two full-attention groups that the dense probe fixture measures, as a cache_groups claim.
+_DENSE_GROUPS = [
+    {
+        "name": f"runtime_group_{index}",
+        "kind": "attention",
+        "num_layers": 1,
+        "block_size_tokens": 16,
+        "page_size_bytes": 128,
+        "sliding_window": None,
+    }
+    for index in range(2)
+]
+
+
+def test_import_names_the_linear_layout_when_no_claim_was_typed(tmp_path, capsys):
+    _, _, request, result = _imported(tmp_path, capsys)
+    assert request.profile_deployment().resources.cache_layout == "grouped"
+    assert result["linear_layout_hint"] == _LINEAR_HINT and "cache_layout_reason" not in result
+    assert json.loads((tmp_path / "drafts" / "import.json").read_text())["configurations"]["tp2"] == result
+    # The hint is no part of the profile or of the validation record, so no saved profile changes.
+    assert "linear_layout_hint" not in request.fpm_profile.provenance
+    assert "linear_layout_hint" not in Path(result["validation"]).read_text()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"resource_overrides": {"cache_layout": "linear"}},
+        {"resource_overrides": {"kv_bytes_per_token": 16}},
+        {"resource_overrides": {"cache_layout": "grouped"}},
+        {"resource_overrides": {"cache_groups": _DENSE_GROUPS}},
+        {"block_tokens": (16, 32)},  # two block sizes have no linear form
+        {"page_bytes": 100},  # 25/2 bytes per token are no whole number
+        {"layout": "mamba_hybrid"},  # state groups have no linear form
+    ],
+)
+def test_import_gives_no_linear_hint_when_it_does_not_apply(tmp_path, capsys, arguments):
+    _, _, _, result = _imported(tmp_path, capsys, **arguments)
+    assert result["status"] == "complete" and "linear_layout_hint" not in result
+
+
+def test_import_that_fails_after_its_records_pass_gives_no_linear_hint(tmp_path, capsys, monkeypatch):
+    import aisim.support.runtime as runtime
+
+    def refused(*args, **kwargs):
+        raise ValueError("draft refused")
+
+    # The records pass and hold the measured groups, but the configuration gets no draft.
+    monkeypatch.setattr(runtime, "_draft", refused)
+    checkpoint, index, _ = _campaign(tmp_path)
+    assert _import(checkpoint, index, tmp_path / "drafts", configurations=["tp2"]) == 1
+    result = json.loads(capsys.readouterr().out)["configurations"]["tp2"]
+    assert result["status"] == "incomplete" and result["diagnostics"] == ["draft refused"]
+    assert json.loads(Path(result["validation"]).read_text())["resources"]["cache_groups"]
+    assert "linear_layout_hint" not in result
+
+
+def test_following_the_linear_hint_gives_a_linear_profile(tmp_path, capsys):
+    checkpoint, index, _, result = _imported(tmp_path, capsys)
+    assert result["linear_layout_hint"] == _LINEAR_HINT
+    state = _load(checkpoint)
+    inputs = {**state.configurations["tp2"].inputs, "resource_overrides": {"cache_layout": "linear"}}
+    save_checkpoint(
+        checkpoint,
+        patch={"configurations": {"tp2": {"inputs": inputs}}},
+        expected_revision=state.revision,
+        accept=[],
+    )
+    assert _import(checkpoint, index, tmp_path / "again", configurations=["tp2"]) == 0
+    result = json.loads(capsys.readouterr().out)["configurations"]["tp2"]
+    assert "linear_layout_hint" not in result
+    resources = SupportRequest.model_validate(_load(checkpoint).configurations["tp2"].draft_request)
+    resources = resources.profile_deployment().resources
+    assert resources.cache_layout == "linear" and resources.kv_bytes_per_token == 16 and not resources.cache_groups
+
+
+def test_each_configuration_of_an_import_gets_its_own_linear_hint(tmp_path, capsys):
+    # A second configuration measures the same groups and types a claim; a third has no observations.
+    checkpoint, index, _ = _campaign(tmp_path)
+    document = json.loads(index.read_text())
+    claimed_entry = copy.deepcopy(document["configurations"]["tp2"])
+
+    def relabel(value):
+        if isinstance(value, dict):
+            return {key: "claimed" if key == "configuration" else relabel(item) for key, item in value.items()}
+        return [relabel(item) for item in value] if isinstance(value, list) else value
+
+    # The records name their configuration, so the second configuration gets relabelled copies of them.
+    for phase in claimed_entry["attempts"][0]["phases"].values():
+        for ref in [phase["launch_manifest"], *phase["artifacts"]]:
+            source = index.parent / ref["path"]
+            target = index.parent / "claimed" / ref["path"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if source.suffix == ".json":
+                _write(target, relabel(json.loads(source.read_text())))
+            else:
+                shutil.copyfile(source, target)
+            ref.update(path=str(Path("claimed") / ref["path"]), sha256=hashlib.sha256(target.read_bytes()).hexdigest())
+    document["configurations"]["claimed"] = claimed_entry
+    _write(index, document)
+    state = _load(checkpoint)
+    claimed = copy.deepcopy(state.configurations["tp2"].model_dump(mode="json"))
+    claimed["inputs"]["resource_overrides"] = {"cache_layout": "linear"}
+    save_checkpoint(
+        checkpoint,
+        patch={"configurations": {"claimed": {key: claimed[key] for key in ("draft_request", "inputs")}}},
+        expected_revision=state.revision,
+        accept=[],
+    )
+    status = _import(checkpoint, index, tmp_path / "drafts", configurations=["tp2", "claimed", "incomplete"])
+    results = json.loads(capsys.readouterr().out)["configurations"]
+    assert status == 1
+    assert [results[name]["status"] for name in ("tp2", "claimed", "incomplete")] == [
+        "complete",
+        "complete",
+        "incomplete",
+    ]
+    assert results["tp2"]["linear_layout_hint"] == _LINEAR_HINT
+    assert results["claimed"]["cache_layout_reason"].startswith("linear: ")
+    assert "linear_layout_hint" not in results["claimed"] and "linear_layout_hint" not in results["incomplete"]
+
+
 def test_grouped_layout_claim_with_kv_bytes_per_token_is_imported_as_incomplete(tmp_path, capsys):
     # The campaign writes the overrides into the checkpoint without intake, as a hand-edited checkpoint does. The
     # fixture measures 16 bytes per token, so each claim alone matches the probe.
