@@ -162,48 +162,53 @@ fn radix_lifecycle_matches_recorded_behavior() {
 #[ignore = "explicit optimized cache-management measurement"]
 fn radix_growth_measurement() {
     let mut observations = Vec::new();
-    for prompt_len in [64, 4096, 32768] {
-        for overlap in [false, true] {
-            let growth_pages = if prompt_len == 64 { 2 } else { 128 };
-            let repetitions = 50;
-            let started = std::time::Instant::now();
-            for run in 0..repetitions {
-                let mut mgr = SglangKvManager::new(131072, 32, KvEventPublishers::default(), 0);
-                let mut tokens: Vec<u32> = (0..prompt_len).map(|i| i + run * 262144).collect();
-                let mut alloc = mgr.allocate_for_request(&tokens).unwrap();
-                alloc
-                    .lease
-                    .reserve_page_hashes(prompt_len as usize / 32 + growth_pages);
-                mgr.extend_cached_prefix(&tokens, &mut alloc.lease);
-                for page in 0..growth_pages {
-                    let start = tokens.len() as u32 + run * 262144;
-                    tokens.extend(start..start + 32);
-                    mgr.extend_allocation(&tokens, &mut alloc.lease).unwrap();
-                    if overlap && page == growth_pages / 2 {
-                        let other = mgr.allocate_for_request(&tokens).unwrap();
-                        let canonical = other.lease.pages().to_vec();
-                        mgr.finish(&tokens, other.lease);
-                        mgr.extend_cached_prefix(&tokens, &mut alloc.lease);
-                        assert_eq!(alloc.lease.pages(), canonical);
-                    } else {
-                        mgr.extend_cached_prefix(&tokens, &mut alloc.lease);
+    for prompt_len in [64, 4096] {
+        for growth_pages in [2, 128, 512, 2048] {
+            for overlap in [false, true] {
+                let repetitions = 20;
+                let mut growth_elapsed = std::time::Duration::ZERO;
+                let started = std::time::Instant::now();
+                for run in 0..repetitions {
+                    let mut mgr = SglangKvManager::new(131072, 32, KvEventPublishers::default(), 0);
+                    let mut tokens: Vec<u32> = (0..prompt_len).map(|i| i + run * 262144).collect();
+                    let mut alloc = mgr.allocate_for_request(&tokens).unwrap();
+                    alloc
+                        .lease
+                        .reserve_page_hashes(prompt_len as usize / 32 + growth_pages);
+                    mgr.extend_cached_prefix(&tokens, &mut alloc.lease);
+                    let growth_started = std::time::Instant::now();
+                    for page in 0..growth_pages {
+                        let start = tokens.len() as u32 + run * 262144;
+                        tokens.extend(start..start + 32);
+                        mgr.extend_allocation(&tokens, &mut alloc.lease).unwrap();
+                        if overlap && page == growth_pages / 2 {
+                            let other = mgr.allocate_for_request(&tokens).unwrap();
+                            let canonical = other.lease.pages().to_vec();
+                            mgr.finish(&tokens, other.lease);
+                            mgr.extend_cached_prefix(&tokens, &mut alloc.lease);
+                            assert_eq!(alloc.lease.pages(), canonical);
+                        } else {
+                            mgr.extend_cached_prefix(&tokens, &mut alloc.lease);
+                        }
                     }
+                    growth_elapsed += growth_started.elapsed();
+                    assert_eq!(alloc.lease.cached_tokens(), tokens.len());
+                    mgr.finish(&tokens, alloc.lease);
+                    assert_eq!(mgr.cache().prefix_match_len(&tokens), tokens.len());
+                    mgr.evict(131072);
+                    assert_eq!(mgr.cache().available_tokens(), 131072);
+                    std::hint::black_box(mgr);
                 }
-                assert_eq!(alloc.lease.cached_tokens(), tokens.len());
-                mgr.finish(&tokens, alloc.lease);
-                assert_eq!(mgr.cache().prefix_match_len(&tokens), tokens.len());
-                mgr.evict(131072);
-                assert_eq!(mgr.cache().available_tokens(), 131072);
-                std::hint::black_box(mgr);
+                observations.push(json!({
+                    "prompt_tokens": prompt_len,
+                    "growth_pages": growth_pages,
+                    "page_size": 32,
+                    "overlap": overlap,
+                    "repetitions": repetitions,
+                    "elapsed_ns": started.elapsed().as_nanos() as u64,
+                    "growth_elapsed_ns": growth_elapsed.as_nanos() as u64,
+                }));
             }
-            observations.push(json!({
-                "prompt_tokens": prompt_len,
-                "growth_pages": growth_pages,
-                "page_size": 32,
-                "overlap": overlap,
-                "repetitions": repetitions,
-                "elapsed_ns": started.elapsed().as_nanos() as u64,
-            }));
         }
     }
     let output = serde_json::to_string_pretty(&observations).unwrap() + "\n";

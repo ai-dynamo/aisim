@@ -191,12 +191,18 @@ pub(crate) struct PageKey {
 #[cfg(test)]
 std::thread_local! {
     static OWNED_KEY_ATOMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BORROWED_KEY_ATOMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl PageKey {
     #[cfg(test)]
     pub(crate) fn take_owned_key_atoms() -> usize {
         OWNED_KEY_ATOMS.with(|atoms| atoms.replace(0))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_borrowed_key_atoms() -> usize {
+        BORROWED_KEY_ATOMS.with(|atoms| atoms.replace(0))
     }
 
     pub(crate) fn shared(hashes: Arc<Vec<LocalBlockHash>>, end: usize) -> Self {
@@ -227,6 +233,8 @@ impl From<Vec<LocalBlockHash>> for PageKey {
 }
 impl AsRef<[LocalBlockHash]> for PageKey {
     fn as_ref(&self) -> &[LocalBlockHash] {
+        #[cfg(test)]
+        BORROWED_KEY_ATOMS.with(|atoms| atoms.set(atoms.get() + self.end));
         &self.hashes[..self.end]
     }
 }
@@ -650,6 +658,11 @@ impl RadixCache {
     }
 
     #[cfg(test)]
+    pub(crate) fn assert_invariants(&self) {
+        self.tree.sanity_check(&[], &[]);
+    }
+
+    #[cfg(test)]
     pub(crate) fn node(&self, id: NodeId) -> TreeNodeSnapshot {
         TreeNodeSnapshot {
             parent: self.tree.inspect_get_parent_node_id(id).unwrap(),
@@ -756,6 +769,50 @@ impl RadixCache {
         let pages = self.page_ids(&value[..aligned_len], page_keys.len());
         self.insert_page_hashes_from_node(self.root(), 0, page_keys.into(), &pages, false)
             .last_node
+    }
+
+    /// Append to a lease's already validated, exclusively locked Full leaf.
+    ///
+    /// This API takes only the new suffix: the retained key is the anchor's
+    /// path, rather than another full query requiring validation. The manager
+    /// owns that binding in its lease and never changes its cached hashes.
+    /// Root, shared, and overlapping anchors use normal canonical insertion.
+    pub(crate) fn append_locked_leaf(
+        &mut self,
+        anchor: NodeId,
+        suffix: &[LocalBlockHash],
+        pages: &[KvPageId],
+    ) -> Option<NodeId> {
+        assert!(!suffix.is_empty() && suffix.len() == pages.len());
+        let parent = self.tree.arena.resolve(anchor).expect("live lease anchor");
+        let node = self.tree.arena.node(parent);
+        if node.is_root() || node.device_lock_ref(FULL) != 1 || !node.children.is_empty() {
+            return None;
+        }
+        assert!(node.has_device_value(FULL));
+        // RadixCache constructs only a Full, device-only LRU tree. Reuse its
+        // native leaf creation and accounting, with no component/backup hooks.
+        self.record_belady_pages(anchor, suffix, pages);
+        self.tree.touch_node_(parent);
+        let node = self.tree.arena.node_mut(parent);
+        node.priority = node.priority.max(0);
+        let namespace = node.namespace.clone();
+        let child = self.tree.add_new_node_in_namespace_(
+            parent,
+            suffix.to_vec().into(),
+            &CacheValue::from_vec(pages.to_vec()),
+            0,
+            namespace.as_ref(),
+            None,
+        );
+        // Move this lease's endpoint down one edge. The retained ancestors
+        // already carry its lock, so reacquiring/releasing them cancels out.
+        self.tree.arena.node_mut(child).inc_device_lock_ref(FULL);
+        self.tree.dec_evictable_size(FULL, pages.len());
+        self.tree.inc_protected_size(FULL, pages.len());
+        self.tree.update_evictable_leaf_sets_(child);
+        self.candidates.remove(anchor);
+        Some(self.tree.arena.node(child).id)
     }
 
     /// Insert page identities already materialized by the request lease.

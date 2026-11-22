@@ -529,6 +529,25 @@ impl SglangKvManager {
         );
         let last_node = lease.last_node();
         let complete_pages = complete_len / self.cache.page_size();
+        let first_new_page = lease.cached_tokens / self.cache.page_size();
+        // The lease binds last_node to the immutable cached hash prefix. Give
+        // exclusive growth only its new suffix, avoiding prefix validation and
+        // a full-path lock handoff. Interleaved inserts still reconcile below.
+        if let Some(new_last_node) = self.cache.append_locked_leaf(
+            last_node,
+            &lease.page_hashes[first_new_page..complete_pages],
+            &lease.pages[first_new_page..complete_pages],
+        ) {
+            self.publish_stored_hashes(
+                &lease.page_hashes[..complete_pages],
+                &lease.pages,
+                lease.cached_tokens,
+                token_ids,
+            );
+            lease.last_node = Some(new_last_node);
+            lease.cached_tokens = complete_len;
+            return;
+        }
         let page_hashes = PageKey::shared(Arc::clone(&lease.page_hashes), complete_pages);
         let pages = &mut lease.pages[..complete_pages];
         let new_last_node = self.cache_unfinished_hashes(
@@ -1356,6 +1375,116 @@ mod tests {
         assert_eq!(mgr.cache().protected_size(), 0);
         assert_eq!(mgr.cache().evictable_size(), 0);
         assert_eq!(mgr.cache().num_nodes(), 1);
+    }
+
+    #[rstest::rstest]
+    fn exclusive_growth_reads_only_suffix_and_preserves_path_locks(
+        #[values(false, true)] belady: bool,
+    ) {
+        for growth_pages in [32, 256, 1024] {
+            let mut mgr = SglangKvManager::new(8192, 4, KvEventPublishers::default(), 0);
+            if belady {
+                mgr.set_belady_oracle(BeladyOracle::new(Vec::new()).unwrap());
+            }
+            let mut tokens: Vec<u32> = (0..256).collect();
+            let mut alloc = mgr.allocate_for_request(&tokens).unwrap();
+            mgr.extend_cached_prefix(&tokens, &mut alloc.lease);
+            let original_anchor = alloc.lease.last_node();
+            alloc.lease.reserve_page_hashes(64 + growth_pages);
+            let buffer = alloc.lease.page_hashes().as_ptr();
+            for _ in 0..growth_pages {
+                let start = tokens.len() as u32;
+                tokens.extend(start..start + 4);
+                mgr.extend_allocation(&tokens, &mut alloc.lease).unwrap();
+                PageKey::take_borrowed_key_atoms();
+                mgr.extend_cached_prefix(&tokens, &mut alloc.lease);
+                // Unlike allocation counts, this includes the borrowed key
+                // atoms exposed to native anchor validation and child lookups.
+                assert!(PageKey::take_borrowed_key_atoms() < 32);
+                assert_eq!(alloc.lease.page_hashes().as_ptr(), buffer);
+                assert_eq!(mgr.cache().protected_size(), tokens.len());
+                assert_eq!(mgr.cache().evictable_size(), 0);
+            }
+            mgr.cache().assert_invariants();
+            let mut node = alloc.lease.last_node();
+            loop {
+                let snapshot = mgr.cache().node(node);
+                assert_eq!(snapshot.lock_ref, 1, "each ancestor retains one lease lock");
+                if node == original_anchor {
+                    break;
+                }
+                node = snapshot.parent.unwrap();
+            }
+            mgr.finish(&tokens, alloc.lease);
+            assert_eq!(mgr.cache().protected_size(), 0);
+            let repeat = mgr.allocate_for_request(&tokens).unwrap();
+            assert_eq!(repeat.prefix_len, tokens.len());
+            mgr.abort(repeat.lease);
+            mgr.evict(8192);
+            assert_eq!(mgr.cache().available_tokens(), 8192);
+        }
+    }
+
+    #[rstest::rstest]
+    fn exclusive_growth_reconciles_overlaps_and_shared_anchors(
+        #[values(false, true)] belady: bool,
+    ) {
+        let sink = Arc::new(MockSink::new());
+        let mut mgr = SglangKvManager::new(64, 4, KvEventPublishers::new(Some(sink.clone())), 0);
+        if belady {
+            mgr.set_belady_oracle(BeladyOracle::new(Vec::new()).unwrap());
+        }
+        let tokens: Vec<u32> = (0..24).collect();
+        let mut first = mgr.allocate_for_request(&tokens[..8]).unwrap().lease;
+        mgr.extend_cached_prefix(&tokens[..8], &mut first);
+        let anchor = first.last_node();
+        // A second active lease makes the anchor shared. Its extension must
+        // retain both locks on the prefix, acquiring only its own suffix lock.
+        let mut second = mgr.allocate_for_request(&tokens[..8]).unwrap().lease;
+        assert_eq!(mgr.cache().node(anchor).lock_ref, 2);
+        mgr.extend_allocation(&tokens[..12], &mut second).unwrap();
+        mgr.extend_cached_prefix(&tokens[..12], &mut second);
+        assert_eq!(mgr.cache().node(anchor).lock_ref, 2);
+        assert_eq!(mgr.cache().node(second.last_node()).lock_ref, 1);
+        mgr.extend_allocation(&tokens[..16], &mut first).unwrap();
+        mgr.extend_cached_prefix(&tokens[..16], &mut first);
+        assert_eq!(&first.pages()[..3], second.pages());
+        assert_eq!(mgr.cache().node(anchor).lock_ref, 2);
+        // Further exclusive extension above a shared ancestor is safe. Drop
+        // the other lease, retract, readmit, and continue from the matched leaf.
+        mgr.extend_allocation(&tokens[..20], &mut first).unwrap();
+        mgr.extend_cached_prefix(&tokens[..20], &mut first);
+        assert_eq!(mgr.cache().node(anchor).lock_ref, 2);
+        mgr.abort(second);
+        assert!(mgr.retract_in_place(&mut first));
+        assert_eq!(mgr.cache().protected_size(), 0);
+        assert_eq!(
+            mgr.allocate_for_request_lease(&tokens[..20], &mut first),
+            Some(20)
+        );
+        mgr.extend_allocation(&tokens, &mut first).unwrap();
+        mgr.extend_cached_prefix(&tokens, &mut first);
+        mgr.cache().assert_invariants();
+        mgr.finish(&tokens, first);
+        mgr.evict(64);
+        assert_eq!(mgr.cache().available_tokens(), 64);
+        assert_eq!(mgr.cache().protected_size(), 0);
+        mgr.cache().assert_invariants();
+        let mut stored = Vec::new();
+        let mut removed = Vec::new();
+        for event in sink.clone_events() {
+            match event.data {
+                KvEventData::Stored(blocks) => {
+                    stored.extend(blocks.blocks.iter().map(|block| block.block_hash));
+                }
+                KvEventData::Removed { block_hashes } => removed.extend(block_hashes),
+            }
+        }
+        let mut expected = compute_seq_hash_for_block(&compute_block_hash_for_seq(&tokens, 4));
+        assert_eq!(stored, expected);
+        removed.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(removed, expected);
     }
 
     #[test]
