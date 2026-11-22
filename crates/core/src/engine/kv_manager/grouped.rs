@@ -140,15 +140,12 @@ pub(crate) enum PreviousRelease {
     /// The block goes at the first allocation with a processed token count
     /// above this one.
     Above(usize),
-    /// The block goes at the first allocation of a step after this one.
-    AfterStep(u64),
 }
 
 impl PreviousRelease {
-    pub(crate) fn is_met(self, processed: usize, step: u64) -> bool {
+    pub(crate) fn is_met(self, processed: usize) -> bool {
         match self {
             Self::Above(tokens) => processed > tokens,
-            Self::AfterStep(after) => step > after,
         }
     }
 }
@@ -161,13 +158,11 @@ pub(crate) struct GroupStateLease {
     /// The block of a hit on a block boundary is held until an allocation
     /// whose processed token count lies past that block.
     pub(crate) hit: Option<(BlockCopyId, usize)>,
-    /// The running blocks before a boundary crossing or a producer
-    /// copy-on-write, oldest first, each with its release rule. A crossing
-    /// from `c` tokens leaves the block of index `(c - 1) / B`, which goes
-    /// once the processed count passes its end. With the step before in
-    /// flight, the blocks of two crossings can be held at once. A block kept
-    /// for a state that the request published inside it goes at the next
-    /// step of the request.
+    /// The running blocks before a boundary crossing, oldest first, each
+    /// with its release rule. A crossing from `c` tokens leaves the block of
+    /// index `(c - 1) / B`, which goes once the processed count passes its
+    /// end. With the step before in flight, the blocks of two crossings can
+    /// be held at once.
     pub(crate) previous: Vec<(BlockCopyId, PreviousRelease)>,
     /// The copy block of a partial hit, and the token count above which the
     /// processed count frees it: the end of its block.
@@ -176,7 +171,10 @@ pub(crate) struct GroupStateLease {
     /// goes once the processed count passes that position.
     pub(crate) checkpoint: Option<(BlockCopyId, usize)>,
     /// The key of a state that the request published inside its running
-    /// block. The next allocation keeps that block and takes a fresh one.
+    /// block. The next allocation that writes takes a fresh running block.
+    /// The published block then leaves the lease as a copy source of the
+    /// pass, or stays as a previous block when that allocation also crosses
+    /// a block boundary.
     pub(crate) published: Option<CacheKey>,
 }
 
@@ -1022,7 +1020,7 @@ mod tests {
                     GroupLease::State(GroupStateLease {
                         running: Some(ids[3]),
                         hit: Some((ids[4], 1)),
-                        previous: vec![(ids[5], PreviousRelease::AfterStep(2))],
+                        previous: vec![(ids[5], PreviousRelease::Above(4))],
                         copy: Some((ids[6], 8)),
                         checkpoint: Some((ids[7], 8)),
                         published: None,

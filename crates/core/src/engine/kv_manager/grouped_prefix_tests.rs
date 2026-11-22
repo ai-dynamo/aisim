@@ -234,7 +234,6 @@ fn prefill(
 ) -> Vec<usize> {
     let mut ends = Vec::new();
     let mut computed = hit.tokens;
-    let mut step = 1;
     while computed < prompt {
         coordinator.begin_step();
         let chunk = coordinator.rules().align_split(
@@ -247,12 +246,11 @@ fn prefill(
         );
         assert!(chunk > 0, "the split must make progress at {computed}");
         let target = computed + chunk;
-        assert!(coordinator.allocate(pool, lease, prompt, computed, target, computed, step));
+        assert!(coordinator.allocate(pool, lease, prompt, computed, target, computed));
         coordinator.finalize(pool, lease, request, prompt, target, hit);
         coordinator.release_copy_sources(pool);
         computed = target;
         ends.push(target);
-        step += 1;
     }
     coordinator.begin_step();
     ends
@@ -395,7 +393,7 @@ fn second_cache_step_of_a_keyed_state_block_defers_no_waiting_request_on_vllm_03
             .align_split(0, 40, 40, BUDGET, 0, BUDGET),
         32
     );
-    assert!(coordinator.allocate(pool, &mut block_lease, 40, 0, 32, 0, 1));
+    assert!(coordinator.allocate(pool, &mut block_lease, 40, 0, 32, 0));
     coordinator.finalize(pool, &mut block_lease, &producer, 40, 32, &hit);
     // In the publishing step the key at 32 is no hit.
     assert_eq!(
@@ -413,7 +411,7 @@ fn second_cache_step_of_a_keyed_state_block_defers_no_waiting_request_on_vllm_03
             .align_split(32, 40, 40, BUDGET, 0, BUDGET),
         8
     );
-    assert!(coordinator.allocate(pool, &mut block_lease, 40, 32, 40, 32, 2));
+    assert!(coordinator.allocate(pool, &mut block_lease, 40, 32, 40, 32));
     coordinator.finalize(pool, &mut block_lease, &producer, 40, 40, &hit);
     // A request that waits in step 2 gets the hit of 32 tokens in step 2.
     assert_eq!(
@@ -587,7 +585,7 @@ fn non_cacheable_full_attention_group_takes_no_part_in_the_hit() {
         assert_eq!(coordinator.admission_blocks(pool, &hit, 17), 2 + 2);
         let mut block_lease = coordinator.new_lease();
         coordinator.pin_hit(pool, &mut block_lease, &hit).unwrap();
-        assert!(coordinator.allocate(pool, &mut block_lease, 17, 16, 17, 16, 1));
+        assert!(coordinator.allocate(pool, &mut block_lease, 17, 16, 17, 16));
         assert_eq!(attention_copies(&block_lease, 0), 2);
         assert_eq!(attention_copies(&block_lease, 1), 2);
         coordinator.release_request(pool, &mut block_lease);
@@ -1493,7 +1491,7 @@ fn remaining_blocks_follow_vllm_for_every_group_kind() {
         let mut kv = kv_pool(&groups, 64);
         let pool = kv.block_pool_mut().unwrap();
         let mut lease = coordinator.new_lease();
-        assert!(coordinator.allocate(pool, &mut lease, 10_000, 0, 4_352, 0, 1));
+        assert!(coordinator.allocate(pool, &mut lease, 10_000, 0, 4_352, 0));
         assert_eq!(
             coordinator.remaining_blocks(&lease, 10_000, 4_352, 10_000),
             expected
@@ -1515,7 +1513,7 @@ fn remaining_blocks_follow_vllm_for_every_group_kind() {
         let mut kv = kv_pool(&groups, 16);
         let pool = kv.block_pool_mut().unwrap();
         let mut lease = coordinator.new_lease();
-        assert!(coordinator.allocate(pool, &mut lease, 65, 0, 64, 0, 1));
+        assert!(coordinator.allocate(pool, &mut lease, 65, 0, 64, 0));
         assert_eq!(coordinator.remaining_blocks(&lease, 65, 64, 65), expected);
     }
 }
@@ -1549,7 +1547,7 @@ fn remaining_blocks_count_the_producer_copy_that_is_still_to_come() {
             "{version:?}"
         );
         coordinator.begin_step();
-        assert!(coordinator.allocate(pool, &mut block_lease, 50, 0, 48, 0, 1));
+        assert!(coordinator.allocate(pool, &mut block_lease, 50, 0, 48, 0));
         coordinator.finalize(pool, &mut block_lease, &request, 50, 48, &hit);
         assert!(
             state_lease(&block_lease, 1).published.is_some(),
@@ -1561,7 +1559,7 @@ fn remaining_blocks_count_the_producer_copy_that_is_still_to_come() {
             "{version:?}"
         );
         coordinator.begin_step();
-        assert!(coordinator.allocate(pool, &mut block_lease, 50, 48, 50, 48, 2));
+        assert!(coordinator.allocate(pool, &mut block_lease, 50, 48, 50, 48));
         assert_eq!(pool.active_blocks(), 3, "{version:?}");
         assert_eq!(
             coordinator.remaining_blocks(&block_lease, 50, 50, 50),
@@ -1728,7 +1726,7 @@ fn ring_group_never_hits_and_holds_one_block() {
         assert_eq!(hit.tokens, 0);
         let mut block_lease = coordinator.new_lease();
         coordinator.begin_step();
-        assert!(coordinator.allocate(pool, &mut block_lease, 2500, 0, 2176, 0, 1));
+        assert!(coordinator.allocate(pool, &mut block_lease, 2500, 0, 2176, 0));
         assert_eq!(
             block_lease.groups[1],
             GroupLease::Ring {
@@ -1738,7 +1736,7 @@ fn ring_group_never_hits_and_holds_one_block() {
         coordinator.finalize(pool, &mut block_lease, &request, 2500, 2176, &hit);
         assert_eq!(pool.inactive_cached_blocks(), 0);
         coordinator.begin_step();
-        assert!(coordinator.allocate(pool, &mut block_lease, 2500, 2176, 2500, 2176, 2));
+        assert!(coordinator.allocate(pool, &mut block_lease, 2500, 2176, 2500, 2176));
         coordinator.finalize(pool, &mut block_lease, &request, 2500, 2500, &hit);
         coordinator.release_request(pool, &mut block_lease);
         coordinator.begin_step();
@@ -2099,7 +2097,7 @@ fn resumed_state_holds_cached_and_running_blocks_during_the_first_step() {
         assert_eq!(state.hit.map(|(_, index)| index), Some(1));
         assert!(state.running.is_none());
     }
-    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 4352, 6000, 4352, 1));
+    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 4352, 6000, 4352));
     let state_blocks: usize = GLM_STATES
         .iter()
         .map(|&group| {
@@ -2121,7 +2119,7 @@ fn resumed_state_holds_cached_and_running_blocks_during_the_first_step() {
     assert_eq!(pool.active_blocks(), 12);
     assert_eq!(pool.inactive_cached_blocks(), 0);
     coordinator.begin_step();
-    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 6000, 6001, 6000, 2));
+    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 6000, 6001, 6000));
     for group in GLM_STATES {
         let state = state_lease(&block_lease, usize::from(group));
         assert!(state.hit.is_none() && state.running.is_some());
@@ -2145,10 +2143,10 @@ fn boundary_crossing_keeps_the_previous_running_block_for_one_step() {
     let hit = coordinator.find_longest_hit(pool, &request, 9000);
     let mut block_lease = coordinator.new_lease();
     coordinator.begin_step();
-    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 0, 2176, 0, 1));
+    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 0, 2176, 0));
     coordinator.finalize(pool, &mut block_lease, &request, 9000, 2176, &hit);
     coordinator.begin_step();
-    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 2176, 4352, 2176, 2));
+    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 2176, 4352, 2176));
     for group in GLM_STATES {
         let state = state_lease(&block_lease, usize::from(group));
         assert!(state.running.is_some());
@@ -2162,7 +2160,7 @@ fn boundary_crossing_keeps_the_previous_running_block_for_one_step() {
     assert_eq!(state_and_ring_blocks(&block_lease), 9);
     coordinator.begin_step();
     let before = pool.active_blocks();
-    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 4352, 6528, 4352, 3));
+    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 4352, 6528, 4352));
     // Four previous blocks go, four new running blocks and one G0 block come.
     assert_eq!(pool.active_blocks(), before + 1);
     for group in GLM_STATES {
@@ -2201,7 +2199,7 @@ fn partial_hit_takes_a_copy_block_for_the_shared_block() {
     coordinator.begin_step();
     assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
     assert_eq!(pool.active_blocks(), 4);
-    assert!(coordinator.allocate(pool, &mut block_lease, 50, 36, 50, 36, 1));
+    assert!(coordinator.allocate(pool, &mut block_lease, 50, 36, 50, 36));
     // G0 holds blocks 0 to 3, with block 2 as a private copy. The target
     // 50 stays in the hit's block, so the state's copy-on-write block is
     // its running block (single:1891-1895, `_apply_cow` at
@@ -2242,7 +2240,7 @@ fn partial_hit_takes_a_copy_block_for_the_shared_block() {
     let mut block_lease = coordinator.new_lease();
     coordinator.begin_step();
     assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
-    assert!(coordinator.allocate(pool, &mut block_lease, 70, 36, 70, 36, 1));
+    assert!(coordinator.allocate(pool, &mut block_lease, 70, 36, 70, 36));
     let state = state_lease(&block_lease, 1);
     assert!(state.hit.is_none() && state.running.is_some() && state.copy.is_some());
     assert_eq!(coordinator.copy_source_count(), 2);
@@ -2254,7 +2252,7 @@ fn partial_hit_takes_a_copy_block_for_the_shared_block() {
     assert_eq!(coordinator.release_copy_sources(pool), 2);
     assert_eq!(pool.active_blocks(), 5 + 2);
     coordinator.begin_step();
-    assert!(coordinator.allocate(pool, &mut block_lease, 70, 70, 71, 70, 2));
+    assert!(coordinator.allocate(pool, &mut block_lease, 70, 70, 71, 70));
     let state = state_lease(&block_lease, 1);
     assert!(state.copy.is_none() && state.running.is_some());
     assert_eq!(pool.active_blocks(), 5 + 1);
@@ -2298,7 +2296,7 @@ fn two_previous_state_blocks_stay_while_the_step_before_is_in_flight() {
             // With one batch nothing is in flight: processed = computed.
             let processed = if batches == 2 { processed } else { c };
             coordinator.begin_step();
-            assert!(coordinator.allocate(pool, &mut block_lease, 9000, c, t, processed, step));
+            assert!(coordinator.allocate(pool, &mut block_lease, 9000, c, t, processed));
             if batches == 2 {
                 for group in GLM_STATES {
                     let rules = previous_rules(&block_lease, usize::from(group));
@@ -2356,7 +2354,7 @@ fn checkpoint_block_stays_while_its_step_is_in_flight() {
         let step = row as u64 + 1;
         coordinator.begin_step();
         cached = pool.inactive_cached_blocks();
-        assert!(coordinator.allocate(pool, &mut block_lease, 9000, c, t, processed, step));
+        assert!(coordinator.allocate(pool, &mut block_lease, 9000, c, t, processed));
         for group in GLM_STATES {
             let state = state_lease(&block_lease, usize::from(group));
             let expected: Vec<_> = previous
@@ -2403,14 +2401,14 @@ fn boundary_hit_block_stays_while_the_first_step_is_in_flight() {
     let mut block_lease = coordinator.new_lease();
     coordinator.begin_step();
     assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
-    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 4352, 6000, 4352, 1));
+    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 4352, 6000, 4352));
     // G0: 2 hits + 1 new, ring 1, states 4 x (hit + running).
     assert_eq!(pool.active_blocks(), 12);
     coordinator.finalize(pool, &mut block_lease, &request, 9000, 6000, &hit);
     // Step 1 is in flight: processed 4352, and
     // `cdiv(4352, 2176) - 1 = 1 > 1` is false.
     coordinator.begin_step();
-    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 6000, 6001, 4352, 2));
+    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 6000, 6001, 4352));
     for group in GLM_STATES {
         assert!(state_lease(&block_lease, usize::from(group)).hit.is_some());
     }
@@ -2419,7 +2417,7 @@ fn boundary_hit_block_stays_while_the_first_step_is_in_flight() {
     coordinator.finalize(pool, &mut block_lease, &request, 9000, 6001, &hit);
     // Processed 6000: `cdiv(6000, 2176) - 1 = 2 > 1`, the hits go.
     coordinator.begin_step();
-    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 6001, 6002, 6000, 3));
+    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 6001, 6002, 6000));
     for group in GLM_STATES {
         assert!(state_lease(&block_lease, usize::from(group)).hit.is_none());
     }
@@ -2448,30 +2446,32 @@ fn copy_block_stays_while_the_first_step_is_in_flight() {
     let mut block_lease = coordinator.new_lease();
     coordinator.begin_step();
     assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
-    assert!(coordinator.allocate(pool, &mut block_lease, 70, 36, 70, 36, 1));
+    assert!(coordinator.allocate(pool, &mut block_lease, 70, 36, 70, 36));
     coordinator.finalize(pool, &mut block_lease, &request, 70, 70, &hit);
     assert_eq!(coordinator.release_copy_sources(pool), 2);
     assert_eq!(pool.active_blocks(), 5 + 2);
     // Step 1 is in flight: processed 36, and 36 > 64 is false.
     coordinator.begin_step();
-    assert!(coordinator.allocate(pool, &mut block_lease, 70, 70, 71, 36, 2));
+    assert!(coordinator.allocate(pool, &mut block_lease, 70, 70, 71, 36));
     assert!(state_lease(&block_lease, 1).copy.is_some());
     assert_eq!(pool.active_blocks(), 5 + 2);
     coordinator.finalize(pool, &mut block_lease, &request, 70, 71, &hit);
     // Processed 70 > 64.
     coordinator.begin_step();
-    assert!(coordinator.allocate(pool, &mut block_lease, 70, 71, 72, 70, 3));
+    assert!(coordinator.allocate(pool, &mut block_lease, 70, 71, 72, 70));
     assert!(state_lease(&block_lease, 1).copy.is_none());
     assert_eq!(pool.active_blocks(), 5 + 1);
 }
 
 #[test]
-fn published_state_block_goes_at_the_next_allocation_with_a_step_in_flight() {
+fn published_state_block_goes_at_the_end_of_the_pass_that_writes_past_it() {
     // A write past a state that the request published inside its running
     // block keeps that block and takes a fresh one (v0.31 single:1903-1936,
-    // v0.32 single:1867-1900, v0.33 single:1884-1917). Replay frees the kept
-    // block at the next step of the request, also with a step in flight. The
-    // block of the crossing at 32 waits for processed > 32.
+    // v0.32 single:1867-1900, v0.33 single:1884-1917). The kept block holds
+    // the key and goes at the end of the pass, as vLLM frees the copy block
+    // at the end of `schedule()` (v0.31 sched:1434-1442, v0.32
+    // sched:1474-1482, v0.33 sched:1698-1706), also with a step in flight.
+    // The block of the crossing at 32 waits for processed > 32.
     let groups = [attention("full", 32, None), state("s", 32, true, false)];
     for version in [
         VllmRuleVersion::V0_31_0,
@@ -2484,36 +2484,48 @@ fn published_state_block_goes_at_the_next_allocation_with_a_step_in_flight() {
         let request = lease(50, 4);
         let hit = coordinator.find_longest_hit(pool, &request, 50);
         let mut block_lease = coordinator.new_lease();
-        // (step, c, t, processed with two batches, previous blocks, active)
-        for (step, c, t, processed, previous, active) in [
-            (1, 0, 32, 0, 0, 2),
-            (2, 32, 48, 0, 1, 4),
-            (3, 48, 50, 32, 2, 5),
-            (4, 50, 51, 48, 0, 3),
+        // (step, c, t, processed with two batches, previous blocks, active
+        // in the pass, active after the pass): the two attention blocks and,
+        // in the state group, the running block, the block of index 0 until
+        // processed > 32 and, in the pass of step 3 only, the published
+        // block. So the state group holds 1, 2, 2 and 1 blocks after the
+        // four passes, as vLLM does with async scheduling.
+        for (step, c, t, processed, previous, active, after) in [
+            (1, 0, 32, 0, 0, 2, 2),
+            (2, 32, 48, 0, 1, 4, 4),
+            (3, 48, 50, 32, 1, 5, 4),
+            (4, 50, 51, 48, 0, 3, 3),
         ] {
             coordinator.begin_step();
-            assert!(coordinator.allocate(pool, &mut block_lease, 50, c, t, processed, step));
-            let state = state_lease(&block_lease, 1);
-            assert_eq!(state.previous.len(), previous, "{version:?} step {step}");
+            assert!(coordinator.allocate(pool, &mut block_lease, 50, c, t, processed));
+            assert_eq!(
+                previous_rules(&block_lease, 1),
+                [PreviousRelease::Above(32)][..previous],
+                "{version:?} step {step}"
+            );
             assert_eq!(pool.active_blocks(), active, "{version:?} step {step}");
-            if step == 3 {
-                assert_eq!(
-                    previous_rules(&block_lease, 1),
-                    [PreviousRelease::Above(32), PreviousRelease::AfterStep(3)],
-                    "{version:?}"
-                );
-            }
             coordinator.finalize(pool, &mut block_lease, &request, 50, t, &hit);
+            // The published block is the one copy source, of step 3.
+            assert_eq!(
+                coordinator.release_copy_sources(pool),
+                usize::from(step == 3),
+                "{version:?} step {step}"
+            );
+            assert_eq!(pool.active_blocks(), after, "{version:?} step {step}");
+            // The published state is a hit from the step after its copy.
+            assert_eq!(
+                pool.inactive_cached_blocks(),
+                [0, 0, 1, 2][step - 1],
+                "{version:?} step {step}"
+            );
         }
         // The state at 32 and the published state at 48.
-        assert_eq!(pool.inactive_cached_blocks(), 2, "{version:?}");
         assert!(hit_exists(pool, 1, 4, 32) && hit_exists(pool, 1, 4, 48));
-        // Step 4 released both blocks. vLLM frees the copy block with the key
-        // at 48 at the end of the schedule of step 3 (v0.31 sched:1434-1442,
-        // v0.32 sched:1474-1482, v0.33 sched:1698-1706), and the block of
-        // index 0 with the key at 32 in step 4, whose processed count 48 lies
-        // above 32 (v0.33 single:682-720, :1608-1627). So the key at 48 is
-        // the older one in the free queue, and an eviction takes it first.
+        // The block with the key at 48 left at the end of step 3, and the
+        // block of index 0 with the key at 32 in step 4, whose processed
+        // count 48 lies above 32 (v0.33 single:682-720, :1608-1627). So the
+        // key at 48 is the older one in the free queue, and an eviction takes
+        // it first.
         // 5 blocks, 3 active and 2 cached: a reservation of 1 block evicts
         // the oldest cached block.
         let reservation = pool.reserve(&[], 1).unwrap();
@@ -2524,19 +2536,18 @@ fn published_state_block_goes_at_the_next_allocation_with_a_step_in_flight() {
 }
 
 #[test]
-fn two_keyed_previous_state_blocks_of_a_released_request_enter_the_lru_newest_first() {
-    // Two previous blocks of the state group hold keys after step 3: R0, the
-    // block of index 0 with the state at 32 (the replay boundary of the
-    // prompt, left by the crossing of step 2), and R1, the block of index 1
-    // with the state at 48 that the request published inside it (kept when
-    // step 3 wrote past it). A preemption releases the request through
-    // `release_request`. vLLM frees the copy block with the key at 48 at the
-    // end of the schedule of step 3 (v0.33 sched:1698-1706), and `free`
-    // frees each group tail first (v0.33 single:591-599): the state block of
-    // index 0 with the key at 32 comes last. So the state key at 48 is older
-    // than the state key at 32 in the free queue. Replay releases the
-    // previous blocks newest first, R1 then R0, which gives the same order
-    // of the two state keys.
+fn keyed_state_blocks_of_a_released_request_enter_the_lru_in_vllms_order() {
+    // Two blocks of the state group hold keys after step 3: R0, the block of
+    // index 0 with the state at 32 (the replay boundary of the prompt, left
+    // by the crossing of step 2), and R1, the block of index 1 with the
+    // state at 48 that the request published inside it. Step 3 wrote past
+    // that state, so R1 left at the end of its pass, as vLLM frees the copy
+    // block with the key at 48 at the end of the schedule of step 3 (v0.33
+    // sched:1698-1706). A preemption then releases the request through
+    // `release_request`, and `free` frees each group tail first (v0.33
+    // single:591-599): the state block of index 0 with the key at 32 comes
+    // last. So the state key at 48 is older than every block of the released
+    // request in the free queue.
     let groups = [attention("full", 32, None), state("s", 32, true, false)];
     for version in [
         VllmRuleVersion::V0_31_0,
@@ -2552,12 +2563,18 @@ fn two_keyed_previous_state_blocks_of_a_released_request_enter_the_lru_newest_fi
         // (step, c, t, processed with two batches)
         for (step, c, t, processed) in [(1, 0, 32, 0), (2, 32, 48, 0), (3, 48, 50, 32)] {
             coordinator.begin_step();
-            assert!(coordinator.allocate(pool, &mut block_lease, 50, c, t, processed, step));
+            assert!(coordinator.allocate(pool, &mut block_lease, 50, c, t, processed));
             coordinator.finalize(pool, &mut block_lease, &request, 50, t, &hit);
+            // R1 is the one copy source, of step 3.
+            assert_eq!(
+                coordinator.release_copy_sources(pool),
+                usize::from(step == 3),
+                "{version:?}"
+            );
         }
         assert_eq!(
             previous_rules(&block_lease, 1),
-            [PreviousRelease::Above(32), PreviousRelease::AfterStep(3)],
+            [PreviousRelease::Above(32)],
             "{version:?}"
         );
         coordinator.release_request(pool, &mut block_lease);
@@ -2565,11 +2582,18 @@ fn two_keyed_previous_state_blocks_of_a_released_request_enter_the_lru_newest_fi
         // The attention blocks with the key at 32 and the partial-tail entry
         // at 48, R1 and R0. Only the running state block has no key.
         assert_eq!(pool.inactive_cached_blocks(), 4, "{version:?}");
-        // One free block and the three oldest cached blocks.
+        // The free queue holds R1, the attention block of
+        // the tail, the attention block of 32, then R0. One free block and
+        // the oldest cached block: R1 goes alone.
+        let reservation = pool.reserve(&[], 2).unwrap();
+        pool.cancel(reservation);
+        assert!(!hit_exists(pool, 1, 4, 48), "{version:?}");
+        assert!(hit_exists(pool, 0, 4, 48) && hit_exists(pool, 0, 4, 32));
+        // The two attention blocks go next, and R0 stays.
         let reservation = pool.reserve(&[], 4).unwrap();
         pool.cancel(reservation);
+        assert!(!hit_exists(pool, 0, 4, 32), "{version:?}");
         assert!(hit_exists(pool, 1, 4, 32), "{version:?}");
-        assert!(!hit_exists(pool, 1, 4, 48), "{version:?}");
     }
 }
 
@@ -2613,7 +2637,7 @@ fn crossing_past_a_published_state_keeps_the_block_by_the_crossing_rule() {
         ];
         for (step, c, t, processed, previous, active) in rows {
             coordinator.begin_step();
-            assert!(coordinator.allocate(pool, &mut block_lease, 69, c, t, processed, step));
+            assert!(coordinator.allocate(pool, &mut block_lease, 69, c, t, processed));
             assert_eq!(
                 previous_rules(&block_lease, 1),
                 above(previous),
@@ -2655,7 +2679,7 @@ fn two_keyed_state_blocks_of_one_allocation_enter_the_lru_highest_index_first() 
             if step > 1 {
                 coordinator.begin_step();
             }
-            assert!(coordinator.allocate(pool, &mut block_lease, 6600, c, t, processed, step));
+            assert!(coordinator.allocate(pool, &mut block_lease, 6600, c, t, processed));
             coordinator.finalize(pool, &mut block_lease, &request, 6600, t, &hit);
         }
         // 4 attention, the ring and 4 running blocks; the previous and the
@@ -2803,11 +2827,11 @@ fn producer_copy_needs_a_block_that_admission_does_not_count() {
                 .rules()
                 .align_split(0, 50, 50, BUDGET, 0, BUDGET);
             assert_eq!(chunk, 48, "{version:?}");
-            assert!(coordinator.allocate(pool, &mut block_lease, 50, 0, 48, 0, 1));
+            assert!(coordinator.allocate(pool, &mut block_lease, 50, 0, 48, 0));
             coordinator.finalize(pool, &mut block_lease, &request, 50, 48, &hit);
             assert!(hit_exists(pool, 1, 4, 48));
             coordinator.begin_step();
-            let fits = coordinator.allocate(pool, &mut block_lease, 50, 48, 50, 48, 2);
+            let fits = coordinator.allocate(pool, &mut block_lease, 50, 48, 50, 48);
             assert_eq!(fits, pool_blocks == 3, "{version:?}, pool {pool_blocks}");
             if fits {
                 assert_eq!(pool.active_blocks(), 3);
@@ -2837,9 +2861,9 @@ fn producer_partial_state_keeps_separate_capacity_until_eviction() {
         let hit = coordinator.find_longest_hit(pool, &request, 50);
         let mut block_lease = coordinator.new_lease();
         let mut before = 0;
-        for (step, target) in [(1, 32), (2, 48), (3, 50)] {
+        for target in [32, 48, 50] {
             coordinator.begin_step();
-            assert!(coordinator.allocate(pool, &mut block_lease, 50, before, target, before, step));
+            assert!(coordinator.allocate(pool, &mut block_lease, 50, before, target, before));
             coordinator.finalize(pool, &mut block_lease, &request, 50, target, &hit);
             before = target;
         }
@@ -2848,18 +2872,30 @@ fn producer_partial_state_keeps_separate_capacity_until_eviction() {
         assert_eq!(pool.active_blocks(), 4, "{version:?}");
         let state = state_lease(&block_lease, 1);
         assert!(pool.is_private(state.running.unwrap()));
-        assert!(!state.previous.is_empty());
+        // The retained state is the copy of the pass, not a block of the
+        // request, and it leaves at the end of the pass (v0.31
+        // sched:1434-1442, v0.32 sched:1474-1482, v0.33 sched:1698-1706).
+        assert!(state.previous.is_empty());
         assert_eq!(pool.inactive_cached_blocks(), 1);
+        assert_eq!(coordinator.release_copy_sources(pool), 1);
+        assert_eq!(pool.active_blocks(), 3, "{version:?}");
+        assert_eq!(pool.inactive_cached_blocks(), 2);
         coordinator.release_request(pool, &mut block_lease);
         assert_eq!(pool.active_blocks(), 0);
         assert_eq!(pool.inactive_cached_blocks(), 4);
         assert!(hit_exists(pool, 1, 4, 48));
-        // One free block, then eviction of state 32 and both attention blocks;
-        // the preserved partial state is still independently resident.
-        let pressure = pool.reserve(&[], 4).unwrap();
+        // The free queue holds the state at 32 (freed in
+        // the allocation of the last step), the preserved partial state
+        // (freed at the end of that pass), then the two attention blocks of
+        // the released request. One free block and the state at 32: the
+        // preserved partial state is still independently resident. One block
+        // more takes it, before any attention block.
+        let pressure = pool.reserve(&[], 2).unwrap();
+        assert!(!hit_exists(pool, 1, 4, 32));
         assert!(hit_exists(pool, 1, 4, 48));
         let last = pool.reserve(&[], 1).unwrap();
         assert!(!hit_exists(pool, 1, 4, 48));
+        assert!(hit_exists(pool, 0, 4, 32) && hit_exists(pool, 0, 4, 48));
         pool.cancel(last);
         pool.cancel(pressure);
     }
@@ -2894,16 +2930,20 @@ fn producer_copy_is_taken_only_with_hits_inside_a_block() {
         let hit = coordinator.find_longest_hit(pool, &request, 50);
         let mut block_lease = coordinator.new_lease();
         let mut before = 0;
-        for (step, target) in [(1, 32), (2, 48), (3, 50)] {
+        for target in [32, 48, 50] {
             coordinator.begin_step();
-            assert!(coordinator.allocate(pool, &mut block_lease, 50, before, target, before, step));
+            assert!(coordinator.allocate(pool, &mut block_lease, 50, before, target, before));
             coordinator.finalize(pool, &mut block_lease, &request, 50, target, &hit);
             before = target;
         }
         let case = format!("{version:?}, checkpoint={checkpoint}");
         assert!(hit_exists(pool, 1, 4, 48), "{case}");
+        // Two attention blocks, the fresh running block and the published
+        // copy, which is in use until the end of the pass.
         assert_eq!(pool.active_blocks(), 2 + 2, "{case}");
-        assert!(!state_lease(&block_lease, 1).previous.is_empty(), "{case}");
+        assert!(state_lease(&block_lease, 1).previous.is_empty(), "{case}");
+        assert_eq!(coordinator.release_copy_sources(pool), 1, "{case}");
+        assert_eq!(pool.active_blocks(), 2 + 1, "{case}");
         coordinator.release_request(pool, &mut block_lease);
     }
     // With them off, vLLM rounds the cached length down to the scheduler
@@ -2929,7 +2969,7 @@ fn producer_copy_is_taken_only_with_hits_inside_a_block() {
         let hit = coordinator.find_longest_hit(pool, &request, prompt);
         let mut block_lease = coordinator.new_lease();
         let mut before = 0;
-        for (step, target) in [(1, 4), (2, 8), (3, 12), (4, 13)] {
+        for target in [4, 8, 12, 13] {
             if before < prompt {
                 let chunk = coordinator
                     .rules()
@@ -2937,15 +2977,7 @@ fn producer_copy_is_taken_only_with_hits_inside_a_block() {
                 assert_eq!(before + chunk, target, "{version:?}");
             }
             coordinator.begin_step();
-            assert!(coordinator.allocate(
-                pool,
-                &mut block_lease,
-                prompt,
-                before,
-                target,
-                before,
-                step
-            ));
+            assert!(coordinator.allocate(pool, &mut block_lease, prompt, before, target, before));
             if target < 13 {
                 coordinator.finalize(pool, &mut block_lease, &request, prompt, target, &hit);
             }
@@ -2958,6 +2990,7 @@ fn producer_copy_is_taken_only_with_hits_inside_a_block() {
         // window blocks and one state block.
         assert_eq!(pool.active_blocks(), 2 + 1, "{version:?}");
         assert!(state_lease(&block_lease, 1).previous.is_empty());
+        assert_eq!(coordinator.release_copy_sources(pool), 0, "{version:?}");
         coordinator.release_request(pool, &mut block_lease);
     }
 }
@@ -2968,8 +3001,8 @@ fn producer_copy_defers_hits_on_its_state_in_the_step_of_the_copy() {
     // and adds its key to the keys of the step, so a waiting request hits
     // it only from the next step on (v0.31 single:1931-1934, v0.32
     // single:1895-1898, v0.33 single:1912-1915). Replay keeps the key on
-    // the published block and hides it for the rest of the step of the
-    // copy.
+    // the published block, which is the copy of the pass, and hides it for
+    // the rest of the step of the copy.
     for version in [
         VllmRuleVersion::V0_31_0,
         VllmRuleVersion::V0_32_0,
@@ -2983,9 +3016,9 @@ fn producer_copy_defers_hits_on_its_state_in_the_step_of_the_copy() {
         let hit = coordinator.find_longest_hit(pool, &request, 50);
         let mut block_lease = coordinator.new_lease();
         let mut before = 0;
-        for (step, target) in [(1, 32), (2, 48)] {
+        for target in [32, 48] {
             coordinator.begin_step();
-            assert!(coordinator.allocate(pool, &mut block_lease, 50, before, target, before, step));
+            assert!(coordinator.allocate(pool, &mut block_lease, 50, before, target, before));
             coordinator.finalize(pool, &mut block_lease, &request, 50, target, &hit);
             before = target;
         }
@@ -2996,11 +3029,14 @@ fn producer_copy_defers_hits_on_its_state_in_the_step_of_the_copy() {
             48,
             "{version:?}"
         );
-        assert!(coordinator.allocate(pool, &mut block_lease, 50, 48, 50, 48, 3));
+        assert!(coordinator.allocate(pool, &mut block_lease, 50, 48, 50, 48));
+        assert_eq!(coordinator.copy_source_count(), 1, "{version:?}");
         assert!(
-            !state_lease(&block_lease, 1).previous.is_empty(),
+            coordinator.find_longest_hit(pool, &sibling, 60).tokens < 48,
             "{version:?}"
         );
+        // The end of the pass frees the copy and does not show its key.
+        assert_eq!(coordinator.release_copy_sources(pool), 1, "{version:?}");
         assert!(
             coordinator.find_longest_hit(pool, &sibling, 60).tokens < 48,
             "{version:?}"
@@ -3030,9 +3066,9 @@ fn the_plan_of_an_allocation_counts_the_producer_copy() {
         let hit = coordinator.find_longest_hit(pool, &request, 50);
         let mut block_lease = coordinator.new_lease();
         let mut before = 0;
-        for (step, target) in [(1, 32), (2, 48)] {
+        for target in [32, 48] {
             coordinator.begin_step();
-            assert!(coordinator.allocate(pool, &mut block_lease, 50, before, target, before, step));
+            assert!(coordinator.allocate(pool, &mut block_lease, 50, before, target, before));
             coordinator.finalize(pool, &mut block_lease, &request, 50, target, &hit);
             before = target;
         }
@@ -3047,14 +3083,13 @@ fn the_plan_of_an_allocation_counts_the_producer_copy() {
             48,
             50,
             48,
-            3,
             &mut Vec::new(),
             &mut Vec::new(),
         );
         assert_eq!(planned, 1, "{version:?}");
         let active = pool.active_blocks();
         coordinator.begin_step();
-        assert!(coordinator.allocate(pool, &mut block_lease, 50, 48, 50, 48, 3));
+        assert!(coordinator.allocate(pool, &mut block_lease, 50, 48, 50, 48));
         // The previous block of the boundary at 32 goes first.
         assert_eq!(pool.active_blocks(), active - 1 + planned, "{version:?}");
         assert!(
@@ -3075,7 +3110,6 @@ fn glm_trace(version: VllmRuleVersion, checkpoint: bool) -> Vec<Vec<usize>> {
     let mut kv = kv_pool(&groups, 64);
     let pool = kv.block_pool_mut().unwrap();
     let block = GLM_BLOCK as usize;
-    let mut step = 1;
     let mut trace = Vec::new();
     // Cold, warm on the first prompt's prefix, and a block boundary.
     for prompt in [9000, 12_000, 4 * block] {
@@ -3106,15 +3140,13 @@ fn glm_trace(version: VllmRuleVersion, checkpoint: bool) -> Vec<Vec<usize>> {
                 prompt,
                 computed,
                 target,
-                computed,
-                step
+                computed
             ));
             row.extend([target, pool.active_blocks()]);
             if target <= prompt {
                 coordinator.finalize(pool, &mut block_lease, &request, prompt, target, &hit);
             }
             computed = target;
-            step += 1;
         }
         coordinator.release_request(pool, &mut block_lease);
         row.push(pool.inactive_cached_blocks());
@@ -3402,7 +3434,7 @@ fn checkpoint_block_is_taken_in_the_final_chunk_and_published_at_the_prompt_chec
     let mut block_lease = coordinator.new_lease();
     coordinator.begin_step();
     assert_eq!(split(coordinator.rules(), 0, 9000, 9000, BUDGET, 0), 6528);
-    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 0, 6528, 0, 1));
+    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 0, 6528, 0));
     for group in GLM_STATES {
         let state = state_lease(&block_lease, usize::from(group));
         assert!(state.running.is_some());
@@ -3414,7 +3446,7 @@ fn checkpoint_block_is_taken_in_the_final_chunk_and_published_at_the_prompt_chec
         split(coordinator.rules(), 6528, 9000, 9000, BUDGET, 0),
         2472
     );
-    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 6528, 9000, 6528, 2));
+    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 6528, 9000, 6528));
     for group in GLM_STATES {
         let state = state_lease(&block_lease, usize::from(group));
         assert!(state.running.is_some() && !state.previous.is_empty());
@@ -3448,7 +3480,7 @@ fn checkpoint_block_is_taken_in_the_final_chunk_and_published_at_the_prompt_chec
     let request = lease(4500, 4);
     let mut block_lease = coordinator.new_lease();
     coordinator.begin_step();
-    assert!(coordinator.allocate(pool, &mut block_lease, 4500, 0, 4500, 0, 1));
+    assert!(coordinator.allocate(pool, &mut block_lease, 4500, 0, 4500, 0));
     coordinator.finalize(pool, &mut block_lease, &request, 4500, 4500, &hit);
     coordinator.begin_step();
     let resend = coordinator.find_longest_hit(pool, &request, 4500);
@@ -3489,15 +3521,7 @@ fn checkpoint_block_goes_at_the_next_step_and_stays_cached_until_eviction() {
     // checkpoint keys.
     for (step, target) in [(3, 9001), (4, 9002)] {
         coordinator.begin_step();
-        assert!(coordinator.allocate(
-            pool,
-            &mut block_lease,
-            9000,
-            target - 1,
-            target,
-            target - 1,
-            step
-        ));
+        assert!(coordinator.allocate(pool, &mut block_lease, 9000, target - 1, target, target - 1));
         assert_eq!(pool.active_blocks(), 5 + 1 + 4, "step {step}");
         for group in GLM_STATES {
             let state = state_lease(&block_lease, usize::from(group));
@@ -3541,7 +3565,7 @@ fn checkpoint_block_publishes_the_prompt_checkpoint_under_retention_zero() {
         let hit = coordinator.find_longest_hit(pool, &request, prompt);
         let mut block_lease = coordinator.new_lease();
         coordinator.begin_step();
-        assert!(coordinator.allocate(pool, &mut block_lease, prompt, 0, prompt, 0, 1));
+        assert!(coordinator.allocate(pool, &mut block_lease, prompt, 0, prompt, 0));
         assert_eq!(
             state_lease(&block_lease, 1).checkpoint.map(|(_, p)| p),
             Some(expected)
@@ -3579,7 +3603,7 @@ fn checkpoint_beyond_the_prompt_checkpoint_is_not_published_under_retention_zero
     let mut block_lease = coordinator.new_lease();
     coordinator.begin_step();
     coordinator.pin_hit(pool, &mut block_lease, &hit).unwrap();
-    assert!(coordinator.allocate(pool, &mut block_lease, 39, 16, 40, 16, 1));
+    assert!(coordinator.allocate(pool, &mut block_lease, 39, 16, 40, 16));
     assert_eq!(
         state_lease(&block_lease, 1).checkpoint.map(|(_, p)| p),
         Some(32)
@@ -3606,7 +3630,7 @@ fn state_key_published_in_a_step_is_not_a_hit_in_that_step() {
     let hit = coordinator.find_longest_hit(pool, &request, 2500);
     let mut block_lease = coordinator.new_lease();
     coordinator.begin_step();
-    assert!(coordinator.allocate(pool, &mut block_lease, 2500, 0, 2176, 0, 1));
+    assert!(coordinator.allocate(pool, &mut block_lease, 2500, 0, 2176, 0));
     coordinator.finalize(pool, &mut block_lease, &request, 2500, 2176, &hit);
     for group in GLM_STATES {
         assert!(hit_exists(pool, group, hash, 2176));
@@ -3630,12 +3654,12 @@ fn allocate_fails_atomically() {
     let hit = coordinator.find_longest_hit(pool, &request, 9000);
     let mut block_lease = coordinator.new_lease();
     coordinator.begin_step();
-    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 0, 2176, 0, 1));
+    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 0, 2176, 0));
     coordinator.finalize(pool, &mut block_lease, &request, 9000, 2176, &hit);
     assert_eq!(pool.active_blocks(), 6);
     coordinator.begin_step();
     let before = format!("{block_lease:?}");
-    assert!(!coordinator.allocate(pool, &mut block_lease, 9000, 2176, 4352, 2176, 2));
+    assert!(!coordinator.allocate(pool, &mut block_lease, 9000, 2176, 4352, 2176));
     assert_eq!(pool.active_blocks(), 6);
     assert_eq!(format!("{block_lease:?}"), before);
     coordinator.release_request(pool, &mut block_lease);
@@ -3750,10 +3774,10 @@ fn retired_window_blocks_are_released_tail_first() {
         assert_eq!(hit.tokens, 96, "{version:?}");
         let mut block_lease = coordinator.new_lease();
         coordinator.pin_hit(pool, &mut block_lease, &hit).unwrap();
-        assert!(coordinator.allocate(pool, &mut block_lease, 108, 96, 104, 96, 1));
+        assert!(coordinator.allocate(pool, &mut block_lease, 108, 96, 104, 96));
         coordinator.finalize(pool, &mut block_lease, &request, 108, 104, &hit);
         // The next allocation retires both hit blocks: (104 - 7) / 4 = 24.
-        assert!(coordinator.allocate(pool, &mut block_lease, 108, 104, 108, 104, 2));
+        assert!(coordinator.allocate(pool, &mut block_lease, 108, 104, 108, 104));
         assert_eq!(pool.inactive_cached_blocks(), 2, "{version:?}");
         assert_eq!(pool.active_blocks(), 3, "{version:?}");
         // Three blocks are free, so four fresh blocks evict one cached block:
@@ -3826,7 +3850,7 @@ fn retired_window_blocks_wait_for_the_step_in_flight() {
                 };
                 coordinator.begin_step();
                 assert!(
-                    coordinator.allocate(pool, &mut block_lease, 32, c, t, processed, step),
+                    coordinator.allocate(pool, &mut block_lease, 32, c, t, processed),
                     "{version:?} step {step}"
                 );
                 live.push(block_lease.groups[0].live_copies());
@@ -4001,7 +4025,6 @@ fn finalize_publishes_what_a_full_rescan_would() {
             .chain(10_000..10_000 + (1 + next(300)) as u32)
             .collect();
         let first: Vec<u32> = (0..first as u32).collect();
-        let mut step = 1;
         for tokens in [first, second] {
             let mut request = BlockRequestLease::new(Uuid::nil(), Vec::new());
             request.configure_prefix_hashes(&tokens, hash);
@@ -4022,8 +4045,7 @@ fn finalize_publishes_what_a_full_rescan_would() {
                     prompt,
                     computed,
                     target,
-                    computed,
-                    step
+                    computed
                 ));
                 coordinator.finalize(pool, &mut block_lease, &request, prompt, target, &hit);
                 assert!(
@@ -4040,7 +4062,6 @@ fn finalize_publishes_what_a_full_rescan_would() {
                     hit.tokens
                 );
                 computed = target;
-                step += 1;
             }
             coordinator.release_request(pool, &mut block_lease);
         }
@@ -4150,8 +4171,7 @@ fn first_allocation_test_counts_the_blocks_that_the_first_allocation_takes() {
                 prompt,
                 hit.tokens,
                 target,
-                hit.tokens,
-                100
+                hit.tokens
             ));
             // The copy of a shared block is taken while the hit block is
             // still held, so the peak counts both.
@@ -4218,7 +4238,7 @@ fn hit_stamp_changes_exactly_when_a_search_input_changes() {
     // A state key published in the step, then the clear of the set.
     let request = lease(9, 4);
     let mut block_lease = coordinator.new_lease();
-    assert!(coordinator.allocate(pool, &mut block_lease, 9, 0, 8, 0, 1));
+    assert!(coordinator.allocate(pool, &mut block_lease, 9, 0, 8, 0));
     let before = coordinator.hit_stamp(pool, 9);
     let no_hit = coordinator.empty_hit();
     coordinator.finalize(pool, &mut block_lease, &request, 9, 8, &no_hit);
@@ -4263,7 +4283,7 @@ fn reused_after_a_duplicate_state_publish(
     let request = lease(running_prompt, hash);
     let mut block_lease = coordinator.new_lease();
     let target = running_target;
-    assert!(coordinator.allocate(pool, &mut block_lease, running_prompt, 0, target, 0, 1));
+    assert!(coordinator.allocate(pool, &mut block_lease, running_prompt, 0, target, 0));
     let no_hit = coordinator.empty_hit();
     coordinator.finalize(
         pool,
@@ -4342,9 +4362,9 @@ fn a_moved_producer_state_key_ends_the_reuse_of_a_stored_hit() {
         let hit = coordinator.find_longest_hit(pool, &request, 50);
         let mut block_lease = coordinator.new_lease();
         let mut before = 0;
-        for (step, target) in [(1, 32), (2, 48)] {
+        for target in [32, 48] {
             coordinator.begin_step();
-            assert!(coordinator.allocate(pool, &mut block_lease, 50, before, target, before, step));
+            assert!(coordinator.allocate(pool, &mut block_lease, 50, before, target, before));
             coordinator.finalize(pool, &mut block_lease, &request, 50, target, &hit);
             before = target;
         }
@@ -4354,7 +4374,7 @@ fn a_moved_producer_state_key_ends_the_reuse_of_a_stored_hit() {
         assert_eq!(first.tokens, 48, "{version:?}");
         let stored = StoredGroupedHit::searched(first, coordinator.hit_stamp(pool, 60));
         let residency = pool.residency();
-        assert!(coordinator.allocate(pool, &mut block_lease, 50, 48, 50, 48, 3));
+        assert!(coordinator.allocate(pool, &mut block_lease, 50, 48, 50, 48));
         assert_eq!(pool.residency(), residency, "{version:?}");
         assert!(
             stored.reusable(&coordinator.hit_stamp(pool, 60)).is_none(),
@@ -4411,7 +4431,7 @@ fn consume(
     assert_eq!(hit.tokens, 3264);
     let mut block_lease = coordinator.new_lease();
     assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
-    assert!(coordinator.allocate(pool, &mut block_lease, 3800, 3264, 3800, 3264, 1));
+    assert!(coordinator.allocate(pool, &mut block_lease, 3800, 3264, 3800, 3264));
     (request, block_lease, hit)
 }
 
@@ -4590,7 +4610,7 @@ fn a_hit_on_a_block_boundary_pins_no_copy_source() {
     let mut block_lease = coordinator.new_lease();
     assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
     assert_eq!(pool.active_blocks(), 6);
-    assert!(coordinator.allocate(pool, &mut block_lease, 4700, 4352, 4700, 4352, 1));
+    assert!(coordinator.allocate(pool, &mut block_lease, 4700, 4352, 4700, 4352));
     assert_eq!(coordinator.copy_source_count(), 0);
     assert_eq!(pool.active_blocks(), 12);
     for group in GLM_STATES {
@@ -4603,7 +4623,7 @@ fn a_hit_on_a_block_boundary_pins_no_copy_source() {
     assert_eq!(pool.inactive_cached_blocks(), 0);
     assert_eq!(coordinator.release_copy_sources(pool), 0);
     coordinator.begin_step();
-    assert!(coordinator.allocate(pool, &mut block_lease, 4700, 4700, 4701, 4700, 2));
+    assert!(coordinator.allocate(pool, &mut block_lease, 4700, 4700, 4701, 4700));
     for group in GLM_STATES {
         let state = state_lease(&block_lease, usize::from(group));
         assert!(state.hit.is_none() && state.running.is_some());
@@ -4630,7 +4650,7 @@ fn a_failed_first_allocation_pins_no_copy_source() {
     assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
     assert_eq!(pool.active_blocks(), 6);
     // 6 fresh blocks are needed and 5 are left.
-    assert!(!coordinator.allocate(pool, &mut block_lease, 3800, 3264, 3800, 3264, 1));
+    assert!(!coordinator.allocate(pool, &mut block_lease, 3800, 3264, 3800, 3264));
     assert_eq!(coordinator.copy_source_count(), 0);
     assert_eq!(pool.active_blocks(), 6);
     coordinator.release_request(pool, &mut block_lease);
@@ -4696,7 +4716,7 @@ fn a_boundary_hit_block_leaves_after_the_copy_sources_of_its_pass() {
             assert_eq!(hit.tokens, 4352);
             let mut lease = coordinator.new_lease();
             assert!(coordinator.pin_hit(pool, &mut lease, &hit).is_ok());
-            assert!(coordinator.allocate(pool, &mut lease, 4700, 4352, 4700, 4352, 1));
+            assert!(coordinator.allocate(pool, &mut lease, 4700, 4352, 4700, 4352));
             coordinator.finalize(pool, &mut lease, &b_request, 4700, 4700, &hit);
             (lease, hit)
         };
@@ -4724,10 +4744,10 @@ fn a_boundary_hit_block_leaves_after_the_copy_sources_of_its_pass() {
             [false, true]
         } {
             if is_a {
-                assert!(coordinator.allocate(pool, &mut a_lease, 3800, 3800, 3801, 3800, 2));
+                assert!(coordinator.allocate(pool, &mut a_lease, 3800, 3800, 3801, 3800));
                 coordinator.finalize(pool, &mut a_lease, &a_request, 3800, 3801, &a_hit);
             } else {
-                assert!(coordinator.allocate(pool, &mut b_lease, 4700, 4700, 4701, 4700, 2));
+                assert!(coordinator.allocate(pool, &mut b_lease, 4700, 4700, 4701, 4700));
                 coordinator.finalize(pool, &mut b_lease, &b_request, 4700, 4701, &b_hit);
             }
         }
@@ -4764,7 +4784,7 @@ fn a_request_that_ends_first_frees_its_boundary_hit_block_after_its_attention_bl
     assert_eq!(hit.tokens, 4352);
     let mut block_lease = coordinator.new_lease();
     assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
-    assert!(coordinator.allocate(pool, &mut block_lease, 4700, 4352, 4700, 4352, 1));
+    assert!(coordinator.allocate(pool, &mut block_lease, 4700, 4352, 4700, 4352));
     coordinator.finalize(pool, &mut block_lease, &request, 4700, 4700, &hit);
     assert_eq!(pool.active_blocks(), 12);
     assert_eq!(coordinator.release_copy_sources(pool), 0);
@@ -4802,7 +4822,7 @@ fn a_request_with_a_copy_source_and_a_boundary_hit_releases_the_source_first() {
     let mut block_lease = coordinator.new_lease();
     coordinator.begin_step();
     assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
-    assert!(coordinator.allocate(pool, &mut block_lease, 100, 48, 100, 48, 1));
+    assert!(coordinator.allocate(pool, &mut block_lease, 100, 48, 100, 48));
     assert_eq!(coordinator.copy_source_count(), 1);
     assert!(state_lease(&block_lease, 1).hit.is_some());
     coordinator.finalize(pool, &mut block_lease, &request, 100, 100, &hit);
@@ -4826,7 +4846,7 @@ fn admit_past_a_boundary_hit(
     assert_eq!(hit.tokens, 4352);
     let mut block_lease = coordinator.new_lease();
     assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
-    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 4352, 8704, 4352, 1));
+    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 4352, 8704, 4352));
     coordinator.finalize(pool, &mut block_lease, &request, 9000, 8704, &hit);
     assert_eq!(coordinator.release_copy_sources(pool), 0);
     assert_eq!(pool.active_blocks(), 13);
@@ -4847,7 +4867,7 @@ fn a_next_allocation_can_take_the_blocks_of_its_boundary_hit() {
     produce_on_a_boundary(&mut coordinator, pool, 0);
     let mut block_lease = admit_past_a_boundary_hit(&mut coordinator, pool);
     coordinator.begin_step();
-    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 8704, 9000, 8704, 2));
+    assert!(coordinator.allocate(pool, &mut block_lease, 9000, 8704, 9000, 8704));
     // 13 - 4 hit blocks + 5 fresh blocks.
     assert_eq!(pool.active_blocks(), 14);
     for group in GLM_STATES {
@@ -4867,14 +4887,14 @@ fn a_refused_next_allocation_still_releases_the_boundary_hit_block() {
     produce_on_a_boundary(&mut coordinator, pool, 0);
     let mut block_lease = admit_past_a_boundary_hit(&mut coordinator, pool);
     coordinator.begin_step();
-    assert!(!coordinator.allocate(pool, &mut block_lease, 9000, 8704, 9000, 8704, 2));
+    assert!(!coordinator.allocate(pool, &mut block_lease, 9000, 8704, 9000, 8704));
     assert_eq!(pool.active_blocks(), 9);
     assert_eq!(pool.inactive_cached_blocks(), 4);
     for group in GLM_STATES {
         assert!(state_lease(&block_lease, usize::from(group)).hit.is_none());
     }
     // A second try changes nothing, and the request leaves cleanly.
-    assert!(!coordinator.allocate(pool, &mut block_lease, 9000, 8704, 9000, 8704, 2));
+    assert!(!coordinator.allocate(pool, &mut block_lease, 9000, 8704, 9000, 8704));
     assert_eq!(pool.active_blocks(), 9);
     coordinator.release_request(pool, &mut block_lease);
     assert_eq!(pool.active_blocks(), 0);
@@ -4899,7 +4919,7 @@ fn admit_with_a_checkpoint_block(
     let mut block_lease = coordinator.new_lease();
     coordinator.begin_step();
     assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
-    assert!(coordinator.allocate(pool, &mut block_lease, 13000, 8704, 13000, 8704, 1));
+    assert!(coordinator.allocate(pool, &mut block_lease, 13000, 8704, 13000, 8704));
     coordinator.finalize(pool, &mut block_lease, &request, 13000, 13000, &hit);
     assert_eq!(coordinator.release_copy_sources(pool), 0);
     for group in GLM_STATES {
@@ -4928,7 +4948,7 @@ fn the_checkpoint_block_leaves_before_the_boundary_hit_block_of_its_group() {
         let pool = kv.block_pool_mut().unwrap();
         let mut block_lease = admit_with_a_checkpoint_block(&mut coordinator, pool, version);
         coordinator.begin_step();
-        assert!(coordinator.allocate(pool, &mut block_lease, 13000, 13000, 13001, 13000, 2));
+        assert!(coordinator.allocate(pool, &mut block_lease, 13000, 13000, 13001, 13000));
         // The 4 hit and the 4 checkpoint blocks are cached now.
         assert_eq!(pool.active_blocks(), 11, "{version:?}");
         assert_eq!(pool.inactive_cached_blocks(), 8, "{version:?}");
@@ -5473,4 +5493,124 @@ fn block_with_the_key_of_the_prompt_tail_takes_its_full_key_when_a_later_chunk_f
             );
         }
     }
+}
+
+#[test]
+fn published_state_block_leaves_among_the_copy_sources_of_its_group_in_allocation_order() {
+    // A running request P writes past the state that it published at 48,
+    // inside its running state block, and a waiting request C starts on a hit
+    // of 48 tokens inside a block of another prefix, in one pass. vLLM
+    // collects the copies manager by manager, in group order, and each
+    // manager in the order of its allocations, and frees them at the end of
+    // `schedule()` (v0.31 kv_cache_manager.py:894-909, sched:1434-1442,
+    // v0.32 kv_cache_manager.py:854-869, sched:1474-1482, v0.33
+    // kv_cache_manager.py:863-878, sched:1698-1706). Of each pair one block
+    // gets free: the copy that holds P's key, and the hit block of C.
+    // So the free queue gets C's full-attention hit block,
+    // then the two state blocks in the order of the two allocations.
+    let hash = 4;
+    let groups = [attention("full", 32, None), state("s", 32, true, false)];
+    let tokens = |base: u32, count: u32| {
+        let tokens: Vec<u32> = (base..base + count).collect();
+        let mut lease = BlockRequestLease::new(Uuid::nil(), Vec::new());
+        lease.configure_prefix_hashes(&tokens, hash);
+        lease
+    };
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
+        for producer_first in [true, false] {
+            let label = format!("{version:?} producer_first={producer_first}");
+            let mut coordinator =
+                with_limits(GroupedPrefixRules::new(&groups, hash, version).unwrap());
+            let mut kv = kv_pool(&groups, 32);
+            let pool = kv.block_pool_mut().unwrap();
+            // F leaves the prefix that C hits: its state at 48 and its
+            // full-attention blocks, the second with the key of 48.
+            let finished = tokens(1000, 50);
+            let cold = coordinator.find_longest_hit(pool, &finished, 50);
+            let mut f = coordinator.new_lease();
+            let ends = prefill(&mut coordinator, pool, &mut f, &finished, 50, &cold, BUDGET);
+            assert_eq!(ends, [32, 48, 50], "{label}");
+            coordinator.release_request(pool, &mut f);
+            // P stands at its published state.
+            let producer = tokens(0, 50);
+            let cold = coordinator.find_longest_hit(pool, &producer, 50);
+            let mut p = coordinator.new_lease();
+            let mut before = 0;
+            for target in [32, 48] {
+                coordinator.begin_step();
+                assert!(coordinator.allocate(pool, &mut p, 50, before, target, before));
+                coordinator.finalize(pool, &mut p, &producer, 50, target, &cold);
+                assert_eq!(coordinator.release_copy_sources(pool), 0, "{label}");
+                before = target;
+            }
+            // One pass: P's write past 48 and C's first allocation.
+            coordinator.begin_step();
+            let consumer = tokens(1000, 60);
+            let c_hit = coordinator.find_longest_hit(pool, &consumer, 60);
+            assert_eq!(c_hit.tokens, 48, "{label}");
+            let mut c = coordinator.new_lease();
+            let write_past = |coordinator: &mut GroupedPrefixCoordinator,
+                              pool: &mut GroupedBlockPool,
+                              p: &mut GroupedBlockLease| {
+                assert!(coordinator.allocate(pool, p, 50, 48, 50, 48));
+            };
+            if producer_first {
+                write_past(&mut coordinator, pool, &mut p);
+            }
+            coordinator.pin_hit(pool, &mut c, &c_hit).unwrap();
+            assert!(coordinator.allocate(pool, &mut c, 60, 48, 60, 48));
+            if !producer_first {
+                write_past(&mut coordinator, pool, &mut p);
+            }
+            // C's full-attention block and state block, and P's published
+            // block.
+            assert_eq!(coordinator.copy_source_count(), 3, "{label}");
+            coordinator.finalize(pool, &mut p, &producer, 50, 50, &cold);
+            coordinator.finalize(pool, &mut c, &consumer, 60, 60, &c_hit);
+            let cached = pool.inactive_cached_blocks();
+            assert_eq!(coordinator.release_copy_sources(pool), 3, "{label}");
+            assert_eq!(pool.inactive_cached_blocks(), cached + 3, "{label}");
+
+            // The cached blocks that were free before the pass go first.
+            for _ in 0..cached {
+                evict_one(pool);
+            }
+            let resident = |pool: &GroupedBlockPool| {
+                [
+                    hit_exists_in(pool, 0, &finished, 48),
+                    hit_exists_in(pool, 1, &producer, 48),
+                    hit_exists_in(pool, 1, &finished, 48),
+                ]
+            };
+            assert_eq!(resident(pool), [true, true, true], "{label}");
+            evict_one(pool);
+            assert_eq!(resident(pool), [false, true, true], "{label}");
+            evict_one(pool);
+            assert_eq!(
+                resident(pool),
+                [false, !producer_first, producer_first],
+                "{label}"
+            );
+            evict_one(pool);
+            assert_eq!(resident(pool), [false, false, false], "{label}");
+            coordinator.release_request(pool, &mut p);
+            coordinator.release_request(pool, &mut c);
+        }
+    }
+}
+
+/// Whether the key of the first `tokens` tokens of `request` is cached in
+/// `group`.
+fn hit_exists_in(
+    pool: &GroupedBlockPool,
+    group: u16,
+    request: &BlockRequestLease,
+    tokens: usize,
+) -> bool {
+    pool.key_hit(group, request.prefix_hash_at(tokens).unwrap())
+        .is_some()
 }

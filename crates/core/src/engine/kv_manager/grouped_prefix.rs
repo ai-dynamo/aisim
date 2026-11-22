@@ -1682,11 +1682,13 @@ impl GroupedPrefixCoordinator {
     /// references until the end of `schedule()` (v0.31 `single:307`,
     /// `:387-397`, `:454-474`, `:1935-1937`, v0.32 `single:304`, `:387-397`,
     /// `:454-474`, `:1899-1901`, v0.33 `single:305`, `:388-398`, `:455-475`,
-    /// `:1916-1918`). `processed` is vLLM's processed token count,
+    /// `:1916-1918`). So does the running block of a state group that the
+    /// request published a state in and now writes past without a crossing:
+    /// the request takes a fresh running block, and the published block is
+    /// the copy of that pass. `processed` is vLLM's processed token count,
     /// `computed - num_in_flight_tokens`, on which the held state blocks and
     /// the window blocks go (v0.31 `mgr:549-556`, v0.32 `mgr:552-559`, v0.33
     /// `mgr:561-568`).
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn allocate(
         &mut self,
         pool: &mut GroupedBlockPool,
@@ -1695,7 +1697,6 @@ impl GroupedPrefixCoordinator {
         computed_before: usize,
         target: usize,
         processed: usize,
-        step: u64,
     ) -> bool {
         // The blocks can change here, so the step's `finalize` has to run.
         lease.quiet_until = 0;
@@ -1706,7 +1707,6 @@ impl GroupedPrefixCoordinator {
             computed_before,
             target,
             processed,
-            step,
             &mut self.plan,
             &mut self.releases,
         );
@@ -1761,10 +1761,19 @@ impl GroupedPrefixCoordinator {
                         }
                         let new = pool.take_private(&mut reservation);
                         if let Some(old) = state.running.replace(new) {
-                            state.previous.push((
-                                old,
-                                previous.expect("a replaced running block has a release rule"),
-                            ));
+                            match previous {
+                                Some(rule) => state.previous.push((old, rule)),
+                                // Only the write past its published state
+                                // replaced the block. It holds that key and
+                                // stays in use until the end of the pass, as
+                                // vLLM keeps the copy block until the end of
+                                // `schedule()` (v0.31.0 `single:1911-1913`,
+                                // `sched:1434-1442`, v0.32.0
+                                // `single:1875-1877`, `sched:1474-1482`,
+                                // v0.33.0 `single:1892-1894`,
+                                // `sched:1698-1706`).
+                                None => self.copy_sources.push((g, old)),
+                            }
                         }
                     }
                     if copy {
@@ -1807,7 +1816,6 @@ impl GroupedPrefixCoordinator {
         computed_before: usize,
         target: usize,
         processed: usize,
-        step: u64,
         plan: &mut Vec<Plan>,
         releases: &mut Vec<BlockCopyId>,
     ) -> usize {
@@ -1875,10 +1883,10 @@ impl GroupedPrefixCoordinator {
                     // A producer can also have published its own partial
                     // running state (v0.31 single:1903-1936, v0.32 :1867-1900,
                     // v0.33 :1884-1917).
-                    // As on the linear path, preserve that immutable copy in
-                    // `previous` and take a fresh writable block, even when
-                    // the next write stays inside the same logical block. A
-                    // release without a next write takes no copy: vLLM copies
+                    // As on the linear path, keep that immutable copy and
+                    // take a fresh writable block, even when the next write
+                    // stays inside the same logical block. A release without
+                    // a next write takes no copy: vLLM copies
                     // only when it allocates for scheduled tokens, and drops
                     // the producer when it frees the request (v0.31
                     // `single:1971-1977`, v0.32 `:1935-1941`).
@@ -1887,17 +1895,12 @@ impl GroupedPrefixCoordinator {
                         (state.running.is_none() || crossing || producer_cow) && !cow_is_running;
                     let copy = cow && !cow_is_running;
                     // The running block that a crossing leaves has index
-                    // `(computed_before - 1) / B` and goes by the rule below. A
-                    // block kept for a state published inside it goes at the
-                    // next step of the request, also with a step in flight.
-                    // vLLM holds no such block: it moves the key to the copy
-                    // block in the same allocation (see above).
-                    let previous = (running && state.running.is_some()).then(|| {
-                        if crossing {
-                            PreviousRelease::Above(((computed_before - 1) / block + 1) * block)
-                        } else {
-                            PreviousRelease::AfterStep(step)
-                        }
+                    // `(computed_before - 1) / B` and goes by the rule below,
+                    // also when the request published a state inside it. A
+                    // block that only the write past its published state
+                    // replaces gets no rule: it is a copy source of the pass.
+                    let previous = (running && crossing).then(|| {
+                        PreviousRelease::Above(((computed_before - 1) / block + 1) * block)
                     });
                     // A state group skips every token before the last
                     // processed one (v0.31 `single:1990-1995`, v0.32
@@ -1918,12 +1921,7 @@ impl GroupedPrefixCoordinator {
                     // with one exception: a previous block that a crossing
                     // after the checkpoint step left has a higher index than
                     // the checkpoint block, and replay releases the checkpoint
-                    // block first. A block kept for a published state has no
-                    // index in vLLM. vLLM frees the copy that holds its key at
-                    // the end of the step that wrote past it (v0.33
-                    // `sched:1698-1706`), before every block of a later
-                    // allocation, and replay releases the block as the newest
-                    // previous block, which gives the same order.
+                    // block first.
                     // A published checkpoint block keeps its key until eviction.
                     if let Some((checkpoint, pos)) = state.checkpoint
                         && processed > pos
@@ -1936,12 +1934,10 @@ impl GroupedPrefixCoordinator {
                             .previous
                             .iter()
                             .rev()
-                            .filter(|(_, rule)| rule.is_met(processed, step))
+                            .filter(|(_, rule)| rule.is_met(processed))
                             .map(|&(id, _)| id),
                     );
-                    state
-                        .previous
-                        .retain(|(_, rule)| !rule.is_met(processed, step));
+                    state.previous.retain(|(_, rule)| !rule.is_met(processed));
                     if let Some((copy, above)) = state.copy
                         && processed > above
                     {

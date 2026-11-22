@@ -2561,7 +2561,9 @@ fn grouped_destination_counts_the_copy_of_a_state_loaded_to_its_partial_tail() {
     // completes (V31 sched:3083-3085, V32 :3155-3157), so the request is a
     // producer, and what it still needs counts the block of the copy (V31
     // single:1770-1777 with sched:3003-3017, V32 single:1732-1739 with
-    // sched:3060-3076). Its first step takes that block.
+    // sched:3060-3076). Its first step takes that block, and the copy leaves
+    // at the end of that pass (v0.31 sched:1434-1442, v0.32 sched:1474-1482,
+    // v0.33 sched:1698-1706).
     for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let mut full = group("full", 32, 100, None);
         full.prefix_cacheable = Some(true);
@@ -2586,10 +2588,13 @@ fn grouped_destination_counts_the_copy_of_a_state_loaded_to_its_partial_tail() {
         assert_eq!(core.kv_manager.grouped_inflight_need(), 1, "{version}");
         let mut trace = TraceCollector::default();
         let mut step = 0;
+        block_pool(&core).reset_peak_active_blocks();
         step_pd(&mut core, &mut trace, &mut step);
         assert_eq!(core.kv_manager.grouped_inflight_need(), 0, "{version}");
-        // Two attention blocks, the new running block and the published one.
-        assert_eq!(block_pool(&core).active_blocks(), 4, "{version}");
+        // Two attention blocks, the new running block and,
+        // until the end of the pass, the published one.
+        assert_eq!(block_pool(&core).peak_active_blocks(), 4, "{version}");
+        assert_eq!(block_pool(&core).active_blocks(), 3, "{version}");
     }
 }
 
@@ -3911,7 +3916,8 @@ fn grouped_decode_one_token_load_takes_the_copy_of_its_state_in_its_first_pass()
     // `sched:3171-3172`). With a hash block of 1 token, vLLM 0.31.0 caches
     // the loaded state at token 1, the prompt's last hash boundary, inside
     // its 16-token block (V31 `single:2094-2138`), and the first step takes
-    // one block for its copy (V31 `single:1770-1777`, `:1891-1940`). vLLM
+    // one block for its copy (V31 `single:1770-1777`, `:1891-1940`), which
+    // leaves at the end of that pass (V31 `sched:1434-1442`). vLLM
     // 0.32.0 keeps that boundary below the last prompt token (V32
     // `kv_cache_interface.py:1110-1122`, `single:2067-2084`), and a hash
     // block of 16 has no boundary at 1 token, so these take no copy.
@@ -3936,14 +3942,18 @@ fn grouped_decode_one_token_load_takes_the_copy_of_its_state_in_its_first_pass()
             assert_eq!(block_pool(&core).active_blocks(), 2, "{label}");
             assert_eq!(core.kv_manager.grouped_inflight_need(), copy, "{label}");
             let mut now = 0.0;
+            block_pool(&core).reset_peak_active_blocks();
             let first = async_step(&mut core, &mut now);
             assert_eq!(first.output_signals.len(), 1, "{label}");
             assert_eq!(core.kv_manager.grouped_inflight_need(), 0, "{label}");
+            // The copy is in use in the pass that takes it
+            // and no longer after it.
             assert_eq!(
-                block_pool(&core).active_blocks(),
+                block_pool(&core).peak_active_blocks(),
                 2 + copy as usize,
                 "{label}"
             );
+            assert_eq!(block_pool(&core).active_blocks(), 2, "{label}");
         }
     }
 }
@@ -3957,8 +3967,11 @@ fn grouped_decode_one_token_loads_wait_for_the_block_of_the_copy() {
     // one fits its copy; the second one runs after the first one ended. On
     // 4 pages no block is free, so neither runs: vLLM stops its waiting loop
     // at a request that it cannot allocate (V31 `sched:1223-1230`).
+    // The peak of pass 0 counts each copy, which leaves at
+    // the end of the pass (V31 `sched:1434-1442`), so after the pass every
+    // load holds its attention block and its state block.
     for max_concurrent_batches in [1, 2] {
-        for (pages, first_pass, active) in [
+        for (pages, first_pass, peak) in [
             (6u64, vec![1001u128, 1002], 6usize),
             (5, vec![1001], 5),
             (4, vec![], 4),
@@ -3982,6 +3995,7 @@ fn grouped_decode_one_token_loads_wait_for_the_block_of_the_copy() {
             assert_eq!(block_pool(&core).active_blocks(), 4, "{label}");
             assert_eq!(core.kv_manager.grouped_inflight_need(), 2, "{label}");
             let mut now = 0.0;
+            block_pool(&core).reset_peak_active_blocks();
             let pass = async_step(&mut core, &mut now);
             let outputs: Vec<u128> = pass
                 .output_signals
@@ -3989,7 +4003,8 @@ fn grouped_decode_one_token_loads_wait_for_the_block_of_the_copy() {
                 .map(|output| output.uuid.as_u128())
                 .collect();
             assert_eq!(outputs, first_pass, "{label}");
-            assert_eq!(block_pool(&core).active_blocks(), active, "{label}");
+            assert_eq!(block_pool(&core).peak_active_blocks(), peak, "{label}");
+            assert_eq!(block_pool(&core).active_blocks(), 4, "{label}");
             assert_eq!(
                 core.kv_manager.grouped_inflight_need(),
                 2 - first_pass.len() as u64,
@@ -6442,36 +6457,43 @@ fn grouped_decode_rank_frees_the_previous_state_block_of_a_load_on_the_computed_
 }
 
 #[test]
-fn grouped_prefix_write_past_a_published_state_frees_the_published_block_at_the_next_pass_with_async_scheduling()
- {
+fn grouped_prefix_write_past_a_published_state_frees_the_published_block_at_the_end_of_the_pass() {
     // The GLM groups with a hash block of 1,088 tokens. One request of 3,500
     // tokens runs its chunks to 2,176, 3,264 and 3,500. Pass 1 crosses the
     // state blocks at 2,176, so the blocks of index 0 become previous blocks,
     // and it publishes the state at 3,264 inside the running blocks. Pass 2
-    // writes past that state, so replay takes a fresh running block in each
-    // state group and keeps the published block until the next step of the
-    // request. With async scheduling pass 2 has the processed count 2,176
-    // (v0.31 kv_cache_manager.py:549-556, v0.32 :552-559, v0.33 :561-568),
-    // and the blocks of index 0 stay (v0.33 single:682-720, :1608-1657): 2
-    // attention blocks, the ring block and 3 blocks in each of the 4 state
-    // groups, 15. With one batch the processed count is 3,264 and they go
-    // first: 11. The 15 is replay's count, not vLLM's. vLLM holds the block
-    // of index 0, the running block and the copy of the published state only
-    // while it allocates, frees the copy at the end of `schedule()` (v0.33
-    // sched:1698-1706) and holds 11 after the pass. Replay keeps the
-    // published block until the next step of the request. Pass 3 has the
-    // processed count 3,264 (or 3,500 with one batch), and both held blocks
-    // go: 7. The counts of passes 0, 1 and 3 are vLLM's.
+    // writes past that state, so each state group takes a fresh running
+    // block, and the published block is the copy of the pass: it leaves at
+    // the end of the pass, as vLLM frees the copy at the end of `schedule()`
+    // (v0.31 sched:1434-1442, v0.32 sched:1474-1482, v0.33 sched:1698-1706).
+    // With async scheduling pass 2 has the processed count 2,176 (v0.31
+    // kv_cache_manager.py:549-556, v0.32 :552-559, v0.33 :561-568), and the
+    // blocks of index 0 stay (v0.33 single:682-720, :1608-1657): 2 attention
+    // blocks, the ring block and 3 blocks in each of the 4 state groups, 15,
+    // while it allocates, and 11 after the pass. With one batch the
+    // processed count is 3,264 and the blocks of index 0 go first: 11 while
+    // it allocates and 7 after the pass. Pass 3 has the processed count
+    // 3,264 (or 3,500 with one batch), and the blocks of index 0 go: 7.
+    // So each state group holds 1, 2, 1 and 1 blocks after the four passes
+    // with one batch, and 1, 2, 2 and 1 with async scheduling.
     for version in ["0.31.0", "0.32.0", "0.33.0"] {
-        for (max_concurrent_batches, expected) in [(1, [6, 11, 11, 7]), (2, [6, 11, 15, 7])] {
+        for (max_concurrent_batches, expected, peaks) in [
+            (1, [6, 11, 7, 7], [6, 11, 11, 7]),
+            (2, [6, 11, 11, 7], [6, 11, 15, 11]),
+        ] {
             let mut core = VllmCore::new(pool_args(version, 18, max_concurrent_batches, 4352));
             let mut now = 0.0;
             submit_tokens(&mut core, 1, (44_000_000..44_003_500).collect(), 4);
-            let active = [(); 4].map(|()| {
+            let mut active = Vec::new();
+            let mut peak = Vec::new();
+            for _ in 0..4 {
+                block_pool(&core).reset_peak_active_blocks();
                 async_step(&mut core, &mut now);
-                block_pool(&core).active_blocks()
-            });
+                active.push(block_pool(&core).active_blocks());
+                peak.push(block_pool(&core).peak_active_blocks());
+            }
             assert_eq!(active, expected, "{version} {max_concurrent_batches}");
+            assert_eq!(peak, peaks, "{version} {max_concurrent_batches}");
         }
     }
 }
@@ -7356,6 +7378,112 @@ fn grouped_prefix_repeat_of_a_block_aligned_prompt_hits_up_to_its_partial_tail()
                 "{version} with {output} output tokens"
             );
             assert_eq!(block_pool(&core).active_blocks(), 0, "{version}");
+        }
+    }
+}
+
+#[test]
+fn grouped_prefix_copy_of_a_published_state_is_free_after_the_pass_that_takes_it() {
+    // Full attention, a ring and one state group at 32-token blocks and a
+    // hash block of 4, without a checkpoint block. A request publishes its
+    // state at the prompt's partial tail inside its running state block (20
+    // of 21 tokens, 44 of 45). The step that writes past it takes one block,
+    // and the cached copy is free again when that `schedule()` returns
+    // (v0.31 single:1911-1913, sched:1434-1442, v0.32 single:1875-1877,
+    // sched:1474-1482, v0.33 single:1892-1894, sched:1698-1706). The older
+    // state block of the 45-token prompt, at 32, goes in the same allocation
+    // with one batch and one step later with async scheduling (v0.31
+    // kv_cache_manager.py:549-556, v0.32 :552-559, v0.33 :561-568).
+    //
+    // Each row is (passes, blocks in use, cached blocks that no request
+    // holds) after a pass. The state group holds 1 block, then 2 for one
+    // pass with one batch or two passes with async scheduling at each
+    // crossing, and the copy is free from the pass that writes past the
+    // published state. The other groups add the attention blocks of the
+    // computed tokens and the ring block, and the attention block with the
+    // key of the prompt tail at the end. The rows
+    // stop before the pass of the last token, after which the request ends.
+    type Rows = &'static [(usize, usize, usize)];
+    // (prompt tokens, output tokens, batches, rows, the pool at the end)
+    type Case = (usize, usize, usize, Rows, (usize, usize));
+    let cases: [Case; 4] = [
+        // 21 prompt tokens, 20 output tokens, one batch: 20 passes, then
+        // the last one.
+        (
+            21,
+            20,
+            1,
+            &[(1, 3, 0), (12, 3, 1), (1, 5, 1), (6, 4, 1)],
+            (0, 2),
+        ),
+        // The same with async scheduling.
+        (
+            21,
+            20,
+            2,
+            &[(1, 3, 0), (12, 3, 1), (2, 5, 1), (5, 4, 1)],
+            (0, 2),
+        ),
+        // 45 prompt tokens, 30 output tokens, one batch: 31 passes, then
+        // the last one.
+        (
+            45,
+            30,
+            1,
+            &[(1, 3, 0), (1, 5, 0), (20, 4, 2), (1, 6, 2), (8, 5, 2)],
+            (0, 4),
+        ),
+        // The same with async scheduling.
+        (
+            45,
+            30,
+            2,
+            &[
+                (1, 3, 0),
+                (1, 5, 0),
+                (1, 5, 1),
+                (19, 4, 2),
+                (2, 6, 2),
+                (7, 5, 2),
+            ],
+            (0, 4),
+        ),
+    ];
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        for (prompt, output, max_concurrent_batches, rows, end) in cases {
+            let label = format!("{version} {prompt} {max_concurrent_batches}");
+            let mut core = block_32_core(version, false, max_concurrent_batches);
+            let mut now = 0.0;
+            submit(&mut core, 1, prompt, output);
+            let mut seen = Vec::new();
+            let expected: Vec<(usize, usize)> = rows
+                .iter()
+                .flat_map(|&(passes, active, cached)| vec![(active, cached); passes])
+                .collect();
+            for _ in 0..expected.len() {
+                async_step(&mut core, &mut now);
+                seen.push((
+                    block_pool(&core).active_blocks(),
+                    block_pool(&core).inactive_cached_blocks(),
+                ));
+            }
+            assert_eq!(seen, expected, "{label}");
+            for _ in 0..4 {
+                if core.is_drained() {
+                    break;
+                }
+                async_step(&mut core, &mut now);
+            }
+            assert!(core.is_drained(), "{label}");
+            assert_eq!(
+                (
+                    block_pool(&core).active_blocks(),
+                    block_pool(&core).inactive_cached_blocks()
+                ),
+                end,
+                "{label}"
+            );
+            assert_eq!(core.mocker_metrics().vllm_preemptions_total, 0, "{label}");
         }
     }
 }

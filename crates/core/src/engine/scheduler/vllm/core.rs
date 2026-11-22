@@ -3377,11 +3377,12 @@ impl VllmCore {
             }
         }
 
-        // vLLM keeps the copy sources of a prefix hit inside a block in use
-        // until the end of `schedule()`, so no later request of the step can
-        // take them (vllm/v1/core/sched/scheduler.py v0.31.0 1434-1442,
-        // v0.32.0 1474-1482, v0.33.0 1698-1706). Replay releases them here,
-        // once per pass.
+        // vLLM keeps the copy sources of a prefix hit inside a block, and
+        // the copy of a state that a running request published and writes
+        // past, in use until the end of `schedule()`, so no later request of
+        // the step can take them (vllm/v1/core/sched/scheduler.py v0.31.0
+        // 1434-1442, v0.32.0 1474-1482, v0.33.0 1698-1706). Replay releases
+        // them here, once per pass.
         self.kv_manager.release_grouped_copy_sources();
 
         if !defer_prefills && !preempted_any {

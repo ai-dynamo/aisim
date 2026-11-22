@@ -1207,8 +1207,9 @@ impl VllmKvManager {
         }
     }
 
-    /// Release the copy sources that the grouped prefix hits inside a block
-    /// of this scheduling pass hold.
+    /// Release the copy sources of this scheduling pass: the blocks that the
+    /// grouped prefix hits inside a block copied, and the state blocks that a
+    /// request wrote past after it published a state in them.
     pub(crate) fn release_grouped_copy_sources(&mut self) {
         if let (Some(grouped), Some(coordinator)) = (&mut self.grouped, &mut self.grouped_prefix)
             && let Some(pool) = grouped.block_pool_mut()
@@ -1427,7 +1428,6 @@ impl VllmKvManager {
                     computed_before,
                     cumulative_tokens,
                     processed,
-                    self.step,
                 ) {
                     if first {
                         // Undo the pin, so that the hit blocks return to the
@@ -2179,7 +2179,6 @@ impl VllmKvManager {
                         computed_before,
                         computed_after,
                         processed,
-                        self.step,
                     ));
                     before
                 });
@@ -2353,7 +2352,6 @@ impl VllmKvManager {
                     transfer,
                     transfer,
                     transfer,
-                    self.step,
                 ) {
                     // Undo the pin, so that the hit blocks return to the
                     // inactive LRU.
@@ -2879,8 +2877,7 @@ impl VllmKvManager {
                     // frees its held blocks with its other blocks, tail
                     // first, and replay frees them here first. The blocks are
                     // the same, and only their order in the free queue can
-                    // differ. The next step frees a block kept for a
-                    // published state too.
+                    // differ.
                     let released = coordinator.allocate(
                         grouped.block_pool_mut().expect("block mode"),
                         block_lease,
@@ -2888,7 +2885,6 @@ impl VllmKvManager {
                         computed,
                         computed,
                         computed,
-                        self.step + 1,
                     );
                     debug_assert!(released, "a release takes no fresh block");
                 }
