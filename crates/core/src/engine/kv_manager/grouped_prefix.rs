@@ -118,9 +118,11 @@ pub(crate) struct GroupedPrefixRules {
     specs: Vec<SpecGroup>,
     hash_block: usize,
     /// The hit alignment `A` (`coord:687-735`): the hash block with
-    /// fine-grained hits, else the scheduler block, the LCM of every group
-    /// block (`coord:87-92`).
+    /// fine-grained hits, else the scheduler block.
     alignment: usize,
+    /// The scheduler block, the LCM of every group block (V31
+    /// `kv_cache_utils.py:770`, V32 `:851`, v0.33 `:863`).
+    scheduler_block: usize,
     /// The smallest cacheable group block, vLLM's `cache_config.block_size`
     /// (`core:336-350`).
     cacheable_block: usize,
@@ -366,6 +368,7 @@ impl GroupedPrefixRules {
             specs,
             hash_block,
             alignment,
+            scheduler_block,
             cacheable_block,
             version,
             checkpoint,
@@ -1071,20 +1074,13 @@ impl GroupedPrefixCoordinator {
     ///    Mamba list keeps `min(floor / B, len)` blocks (V31 `mgr:852-853`,
     ///    V32 `mgr:826-827`).
     ///
-    /// With a full-attention group this finder always floors, so the decode
-    /// rank loads the sub-block tail of a fine-grained hit again, also where
-    /// vLLM keeps it. With a hash block smaller than the full-attention block,
-    /// vLLM keeps it when the first `num_tokens - 1` tokens end on a hash
-    /// block boundary and are all cached, and loads nothing, while replay
-    /// moves one attention block and the fixed bytes. It floors to the block
-    /// of the full-attention group, not to the scheduler block, the LCM of
-    /// every group block. The two differ
-    /// only for a fine-grained profile whose full-attention block is below the
-    /// scheduler block. A nonzero junction keeps its position. Without a
-    /// full-attention group nothing is floored. The drop of a state hit above
-    /// the floor then reads the agreed hit itself, so a state hit that ends
-    /// inside its block is dropped. vLLM still floors to the scheduler block
-    /// there, so it can drop more where that block exceeds a state block.
+    /// This finder always floors, so the decode rank loads the sub-block tail
+    /// of a fine-grained hit again, also where vLLM keeps it. With a hash
+    /// block smaller than the scheduler block, vLLM keeps it when the first
+    /// `num_tokens - 1` tokens end on a hash block boundary and are all
+    /// cached, and loads nothing, while replay moves the full-attention
+    /// blocks above the floor and the fixed bytes. A nonzero junction keeps
+    /// its position.
     ///
     /// Only the full-attention groups get hit blocks to pin. On a decode rank
     /// vLLM drops each group's hit blocks below its skipped tokens before it
@@ -1176,26 +1172,23 @@ impl GroupedPrefixCoordinator {
                 hit
             }
         };
-        // Rule 5, floored to the full-attention block: the attention keys are
+        // Rule 5, floored to the scheduler block: the attention keys are
         // full-attention keys here, and each group keeps the keys below the
         // floor.
-        if let Some(spec) = full {
-            let floor = hit.tokens / spec.block * spec.block;
-            if hit.junction_tokens > 0 {
-                hit.junction_tokens += hit.tokens - floor;
-            }
-            hit.tokens = floor;
-            for (blocks, rule) in hit.per_group.iter_mut().zip(&rules.groups) {
-                if let GroupHitBlocks::Attention(keys) = blocks {
-                    keys.truncate(floor / rule.block);
-                }
+        let floor = hit.tokens / rules.scheduler_block * rules.scheduler_block;
+        if hit.junction_tokens > 0 {
+            hit.junction_tokens += hit.tokens - floor;
+        }
+        hit.tokens = floor;
+        for (blocks, rule) in hit.per_group.iter_mut().zip(&rules.groups) {
+            if let GroupHitBlocks::Attention(keys) = blocks {
+                keys.truncate(floor / rule.block);
             }
         }
         // The truncation keeps `min(floor / B, len)` blocks of a Mamba list,
-        // so a state hit above the floor loses its cached block. Without a
-        // full-attention group nothing was floored, and this reads the agreed
-        // hit itself. A local prefix that reaches the loaded tokens loads
-        // nothing in vLLM, while replay still moves the state.
+        // so a state hit above the floor loses its cached block. A local
+        // prefix that reaches the loaded tokens loads nothing in vLLM, while
+        // replay still moves the state.
         let tokens = hit.tokens;
         for (blocks, rule) in hit.per_group.iter_mut().zip(&rules.groups) {
             if let GroupHitBlocks::DroppedState { tokens: own, .. } = *blocks

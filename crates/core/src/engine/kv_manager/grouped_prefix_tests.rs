@@ -1002,14 +1002,13 @@ fn decode_side_hit_without_a_full_attention_group_is_the_hit_every_group_agrees_
 
 #[test]
 fn decode_side_hit_without_a_full_attention_group_drops_a_state_hit_inside_its_block() {
-    // Without a full-attention group nothing is floored, so the drop reads
-    // the agreed hit itself. A window at the hash block 4 and a state of
-    // 16-token blocks make the hits fine-grained. Both groups hit at 20, so
-    // the agreed hit stays 20. The state's hit of 20 is cdiv(20, 16) = 2
-    // blocks, above the 1 whole block of the hit, so it is dropped. vLLM
-    // floors 20 to its scheduler block 16, the LCM of the group blocks, and
-    // the truncation keeps 1 state block (V32 `sched:1007-1018`,
-    // `mgr:826-827`), so it drops that hit too.
+    // A window at the hash block 4 and a state of 16-token blocks make the
+    // hits fine-grained. Both groups hit at 20, so the agreed hit is 20. A
+    // load past 20 truncates it to the scheduler block 16, the LCM of the
+    // group blocks (V31 `sched:974-985`, V32 `sched:1007-1018`, v0.33
+    // `sched:1167-1178`). The state's hit of 20 is cdiv(20, 16) = 2 blocks,
+    // above the 1 that the truncation keeps (V31 `mgr:852-853`, V32
+    // `mgr:826-827`, v0.33 `mgr:835-836`), so it is dropped.
     let groups = [attention("window", 4, Some(5)), state("s", 16, true, false)];
     let coordinator = with_limits(rules(&groups, 4));
     assert_eq!(coordinator.rules.alignment, 4);
@@ -1018,7 +1017,8 @@ fn decode_side_hit_without_a_full_attention_group_drops_a_state_hit_inside_its_b
     seed(pool, key(0, 4, 20));
     seed_inside(pool, &[1], 4, 16, 20);
     let hit = coordinator.find_destination_hit(pool, &lease(33, 4), 33, 32);
-    assert_eq!(hit.tokens, 20);
+    // 20 - 20 % 16.
+    assert_eq!(hit.tokens, 16);
     assert_eq!(hit.per_group[0], GroupHitBlocks::None);
     assert_eq!(hit.per_group[1], GroupHitBlocks::None);
     // An agreed hit of 16 ends on the state block, so the state's hit stays.
@@ -1114,6 +1114,139 @@ fn decode_side_hit_drops_a_state_hit_above_the_floored_prefix() {
             tokens: 32
         }
     );
+}
+
+#[test]
+fn decode_side_hit_floors_to_the_scheduler_block_above_the_full_attention_block() {
+    // Full attention with 16-token blocks and a state with 32-token blocks at
+    // hash block 4: the hits are fine-grained and the scheduler block is
+    // lcm(16, 32) = 32. The full-attention hit is 48 and the state's own hit
+    // 32, not deeper, so the local prefix is 48 (V31, V32 `mgr:356-369`, v0.33
+    // `mgr:365-378`). The scheduler offers 48 - 48 % 32 = 32 to the connector
+    // (V31 `sched:944-952`, V32 `sched:974-982`, v0.33 `sched:1134-1142`). The
+    // load of 96 - 32 = 64 tokens exceeds the tail of 16, so the hit is
+    // truncated to 32 (V31 `sched:974-985`, V32 `sched:1007-1018`, v0.33
+    // `sched:1167-1178`): full attention keeps 32 / 16 = 2 blocks and the
+    // state min(32 / 32, 1) = 1 (V31 `mgr:850-856`, V32 `mgr:824-830`, v0.33
+    // `mgr:833-839`).
+    let groups = [attention("a", 16, None), state("s", 32, true, false)];
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
+        let coordinator = with_limits(GroupedPrefixRules::new(&groups, 4, version).unwrap());
+        assert_eq!(coordinator.rules.alignment, 4);
+        let mut kv = kv_pool(&groups, 16);
+        let pool = kv.block_pool_mut().unwrap();
+        seed_many(pool, 0, 4, &[16, 32, 48]);
+        seed(pool, key(1, 4, 32));
+        let hit = coordinator.find_destination_hit(pool, &lease(97, 4), 97, 96);
+        // 48 - 48 % 32.
+        assert_eq!(hit.tokens, 32);
+        assert_eq!(hit.junction_tokens, 0);
+        // The first 32 / 16 blocks.
+        assert_eq!(
+            hit.per_group[0],
+            GroupHitBlocks::Attention(vec![Some(key(0, 4, 16)), Some(key(0, 4, 32))])
+        );
+        // The Mamba list of cdiv(32, 32) = 1 block stays.
+        assert_eq!(
+            hit.per_group[1],
+            GroupHitBlocks::DroppedState {
+                key: key(1, 4, 32),
+                tokens: 32
+            }
+        );
+        // The whole prompt of 97: full attention cdiv(97, 16) - 2 = 5 new and
+        // 2 free hit blocks. The state cdiv(97, 32) - 1 = 3 new, capped at 1
+        // with no copy block, as the local prefix of 32 ends on its block,
+        // and its free hit block: 2 (V31 `single:1762-1777`, `:1806-1811`, V32 `single:1724-1739`,
+        // `:1768-1773`, v0.33 `single:1740-1755`, `:1785-1790`). 7 + 2 = 9.
+        assert_eq!(
+            coordinator.destination_admission_blocks(pool, &hit, 96, 97),
+            9
+        );
+        // The load of 96: cdiv(96, 16) - 2 = 4 and 2, and
+        // min(cdiv(96, 32) - 1, 1) = 1 and 1: 8.
+        assert_eq!(coordinator.destination_load_blocks(pool, &hit, 96, 97), 8);
+    }
+}
+
+#[test]
+fn decode_side_hit_without_a_full_attention_group_floors_to_the_scheduler_block() {
+    // A window at the hash block 4 and a state with 32-token blocks: the hits
+    // are fine-grained and the scheduler block is lcm(4, 32) = 32. Without a
+    // full-attention group the local prefix is the hit that every group
+    // agrees on, 48 (V31, V32 `mgr:346-351`, v0.33 `mgr:353-358`). The
+    // scheduler offers 48 - 48 % 32 = 32, and the load of 96 - 32 = 64 tokens
+    // exceeds the tail of 16, so the hit is truncated to 32 (V31
+    // `sched:944-952`, `:974-985`, V32 `sched:974-982`, `:1007-1018`, v0.33
+    // `sched:1134-1142`, `:1167-1178`). The state's hit of 48 is
+    // cdiv(48, 32) = 2 blocks, above the 32 / 32 = 1 that the truncation keeps
+    // (V31 `mgr:850-853`, V32 `mgr:824-827`, v0.33 `mgr:833-836`), so it is
+    // dropped.
+    let groups = [attention("window", 4, Some(5)), state("s", 32, true, false)];
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
+        let coordinator = with_limits(GroupedPrefixRules::new(&groups, 4, version).unwrap());
+        assert_eq!(coordinator.rules.alignment, 4);
+        let mut kv = kv_pool(&groups, 16);
+        let pool = kv.block_pool_mut().unwrap();
+        seed(pool, key(0, 4, 48));
+        seed_inside(pool, &[1], 4, 32, 48);
+        let request = lease(97, 4);
+        assert_eq!(coordinator.find_longest_hit(pool, &request, 97).tokens, 48);
+        let hit = coordinator.find_destination_hit(pool, &request, 97, 96);
+        // 48 - 48 % 32.
+        assert_eq!(hit.tokens, 32);
+        assert_eq!(hit.junction_tokens, 0);
+        assert_eq!(hit.per_group[0], GroupHitBlocks::None);
+        assert_eq!(hit.per_group[1], GroupHitBlocks::None);
+    }
+}
+
+#[test]
+fn decode_side_hit_drops_a_state_hit_above_the_scheduler_block_floor() {
+    // Two states with 16-token and 32-token blocks at hash block 4: the
+    // scheduler block is lcm(16, 32) = 32. Both hold the key at 48, so the
+    // agreed hit is 48, and the scheduler truncates it to 48 - 48 % 32 = 32
+    // (V31 `sched:944-952`, `:974-985`, V32 `sched:974-982`, `:1007-1018`,
+    // v0.33 `sched:1134-1142`, `:1167-1178`). The hit of the 16-token state
+    // ends on its block, but its cdiv(48, 16) = 3 blocks are above the
+    // 32 / 16 = 2 that the truncation keeps (V31 `mgr:850-853`, V32
+    // `mgr:824-827`, v0.33 `mgr:833-836`), so both state hits are dropped.
+    let groups = [
+        state("small", 16, true, false),
+        state("large", 32, true, false),
+    ];
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
+        let coordinator = with_limits(GroupedPrefixRules::new(&groups, 4, version).unwrap());
+        let mut kv = kv_pool(&groups, 16);
+        let pool = kv.block_pool_mut().unwrap();
+        seed(pool, key(0, 4, 48));
+        seed_inside(pool, &[1], 4, 32, 48);
+        let request = lease(97, 4);
+        assert_eq!(coordinator.find_longest_hit(pool, &request, 97).tokens, 48);
+        let hit = coordinator.find_destination_hit(pool, &request, 97, 96);
+        // 48 - 48 % 32.
+        assert_eq!(hit.tokens, 32);
+        assert_eq!(hit.per_group[0], GroupHitBlocks::None);
+        assert_eq!(hit.per_group[1], GroupHitBlocks::None);
+        // No group keeps a hit block, so each state counts
+        // min(cdiv(97, B), 1) = 1 new block: 2.
+        assert_eq!(
+            coordinator.destination_admission_blocks(pool, &hit, 96, 97),
+            2
+        );
+    }
 }
 
 #[test]

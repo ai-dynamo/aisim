@@ -84,15 +84,16 @@
 //! and they equal the V32 values
 //! (`benchmarks/evidence/nixl-pd-transfer-bytes-20261117/`).
 //!
-//! Grouped P/D uses four different blocks. These rules read two of them. The
+//! Grouped P/D uses five different blocks. These rules read two of them. The
 //! transfer unit of a full-attention group and the window count read the
 //! group's own `block_size_tokens`, because vLLM clips the block list of each
 //! group with that group's spec (V31 `nixl/base_scheduler.py:133-146`,
 //! `:282-297`, V32 `:138-151`, `:280-291`), and the decode rank allocates it
 //! with that group's manager (see `fixed_bytes`). The timing unit is the one
 //! block of the full-attention groups. `GroupedPrefixRules` reads the other
-//! two: the decode-side hit reads the hit alignment, and the checkpoint rule
-//! reads the cacheable block, `cache_config.block_size` in vLLM 0.32.0. For
+//! three: the decode-side hit reads the hit alignment and is floored to the
+//! scheduler block, and the checkpoint rule reads the cacheable block,
+//! `cache_config.block_size` in vLLM 0.32.0. For
 //! GLM-5.3-Flash at TP 4, the scheduler block (the least common multiple of
 //! the group blocks), `cache_config.block_size`, the hash block and the
 //! alignment are all 2,176 tokens.
