@@ -120,17 +120,21 @@ def _sweeper_request(model, systems_paths=None, mode="op_level"):
 
 
 @pytest.mark.parametrize("mode", ["op_level", "auto"])
+@pytest.mark.parametrize("configure_defaults", [False, True])
 def test_the_recommendation_consumer_gets_the_saved_source_unless_the_user_names_roots(
     native_dataset,  # noqa: F811
     monkeypatch,
     tmp_path,
     mode,
+    configure_defaults,
 ):
     published, systems, config = native_dataset
     transport = FakeTransport(_tree(published))
     monkeypatch.setattr("aisim_core.data.fetch.HfTransport", lambda: transport)
     assert main(["init", "--on-demand", "--repo", REPO, "--revision", SHA]) == 0
     model = config.model
+    if configure_defaults:
+        res._configure_default_data_roots()
 
     # No roots given: the consumer still expands them to the default ones, and the saved source wins over those.
     resolver, request = _sweeper_request(model, mode=mode)
@@ -140,6 +144,7 @@ def test_the_recommendation_consumer_gets_the_saved_source_unless_the_user_names
     assert built.dataset_revisions == {"op-latency": SHA}
     selected = Path(built.diagnostics()["provenance"]["selected_systems_root"])
     assert selected.is_relative_to(Path(os.environ["AISIM_DATA_CACHE"]) / "materialized")
+    assert built.predict_prefill_latency(1, 4) >= 7.0  # the published 7 ms attention measurement is consumed
 
     # Roots the user gave win over the saved source.
     own = tmp_path / "own-roots"
@@ -212,15 +217,19 @@ def test_environment_root_reaches_prediction_for_packaged_only_paths(
     assert not transport.opened
 
 
+@pytest.mark.parametrize("configure_defaults", [False, True])
 def test_an_environment_choice_of_packaged_roots_outranks_the_saved_source(
     native_dataset,  # noqa: F811
     monkeypatch,
+    configure_defaults,
 ):
     published, _, config = native_dataset
     transport = FakeTransport(_tree(published))
     monkeypatch.setattr("aisim_core.data.fetch.HfTransport", lambda: transport)
     assert main(["init", "--on-demand", "--repo", REPO, "--revision", SHA]) == 0
     perf_database.set_systems_paths(None)
+    if configure_defaults:
+        res._configure_default_data_roots()
     monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", perf_database.get_systems_paths()[0])
     assert res._ensure_dataset(replace(config, systems_paths=("default",)), None) is None
     assert not transport.opened

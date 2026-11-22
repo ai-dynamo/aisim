@@ -1057,6 +1057,7 @@ def _names_systems_paths(config: ForwardPassPerfModelConfig | Mapping[str, Any])
     # An unset value expands to ``set_systems_paths``, then the environment variable, then the packaged roots.
     roots = _resolve_forward_pass_systems_paths(tuple(named or ()), require_directories=False)
     packaged = os.fspath(pkg_resources.files("aisim_core") / "systems")
+    # Default setup never writes this variable, so even an explicit packaged path is a caller choice.
     return os.environ.get("AICONFIGURATOR_SYSTEMS_PATH") is not None or roots != [packaged]
 
 
@@ -1860,8 +1861,8 @@ def _cached_engine_handle(model: Any, database: Any) -> Any:
     ``AicEngine`` loads its own perf DB; the system yaml is resolved from the
     ``database``'s own ``systems_root`` (the root the Python ``PerfDatabase``
     actually matched under multi-root ``--systems-paths``), falling back to
-    ``AICONFIGURATOR_SYSTEMS_PATH`` (set by ``_configure_default_data_roots``)
-    for duck-typed databases without a ``systems_root``.
+    the caller's ``AICONFIGURATOR_SYSTEMS_PATH`` or the SDK roots for duck-typed
+    databases without a ``systems_root``.
     """
     # The identity JSON is a hot-path cost: the engine-step helpers call this
     # per step and `_engine_config_json` runs ~2-3us of getattr + json.dumps
@@ -1901,6 +1902,9 @@ def _cached_engine_handle(model: Any, database: Any) -> Any:
     # env remains the fallback for duck-typed databases under an explicit
     # ``"rust"`` request.
     systems_path = getattr(database, "systems_root", None) or os.environ.get("AICONFIGURATOR_SYSTEMS_PATH")
+    if systems_path is None:
+        systems_root = _python_sdk_systems_root()
+        systems_path = None if systems_root is None else str(systems_root)
     nextn = getattr(model, "_nextn", None)
     try:
         spec_json = build_engine_spec_json(
@@ -2136,10 +2140,8 @@ def _moe_quant_to_dtype(value: Any) -> str | None:
 
 
 def _configure_default_data_roots() -> None:
-    if "AICONFIGURATOR_SYSTEMS_PATH" not in os.environ:
-        systems_root = _python_sdk_systems_root() or Path(str(pkg_resources.files("aisim_core") / "systems"))
-        if systems_root.exists():
-            os.environ["AICONFIGURATOR_SYSTEMS_PATH"] = str(systems_root)
+    # Pass default systems roots directly to the engine: persisting them in the environment would make
+    # a later best_available() mistake them for a caller choice and skip the saved init source.
     if "AICONFIGURATOR_MODEL_CONFIGS_PATH" not in os.environ:
         model_configs_root = Path(str(pkg_resources.files("aisim_core") / "model_configs"))
         if model_configs_root.exists():
