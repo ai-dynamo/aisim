@@ -963,6 +963,57 @@ def fpm_session(tmp_path):
 
 
 class TestFPMStaticAndMixed:
+    @pytest.mark.parametrize("backend_name", ["vllm", "trtllm"])
+    def test_cached_aggregate_weights_follow_the_native_prefill_schedule(self, tmp_path, backend_name):
+        from aisim.sdk.inference_session import InferenceSession
+
+        model = models.get_model("Qwen/Qwen3-0.6B", _model_config(forward_model="fpm"), backend_name)
+        identity = dict(zip(_CELL_MATCH_COLUMNS, model.context_ops[0]._match_identity, strict=True))
+        # Synthetic exact anchors: one complete 1096-token suffix + one
+        # decoder costs 12 + (3 - 2) = 13 ms. A 512-token budget instead
+        # prices three chunks at 7, 9, 5 ms (including the 72-token tail),
+        # each alongside that same 1 ms marginal decoder: mean 8 ms.
+        rows = [
+            _row("prefill", 1, tokens, past, ms, model_path=model.model_path, identity=identity)
+            for tokens, past, ms in [(1097, 3000, 12.0), (513, 3000, 7.0), (513, 3512, 9.0), (73, 4024, 5.0)]
+        ] + [
+            _row("decode", b, 0, kv, ms, model_path=model.model_path, identity=identity)
+            for b, kv, ms in [(1, 4099, 3.0), (2, 8198, 5.0), (1, 0, 2.0), (2, 0, 4.0)]
+        ]
+        rows = [dict(row, backend=backend_name) for row in rows]
+        shutil.copy(Path(_CORE_SYSTEMS) / f"{SYSTEM}.yaml", tmp_path / f"{SYSTEM}.yaml")
+        _write_pair(
+            str(tmp_path / "data" / SYSTEM / backend_name / VERSION), rows, sidecar_overrides={"backend": backend_name}
+        )
+        database = PerfDatabase(SYSTEM, backend_name, VERSION, systems_root=str(tmp_path))
+        backend = get_backend(backend_name)
+        runtime = sdk_config.RuntimeConfig(batch_size=2, isl=4096, osl=4, prefix=3000)
+        session = InferenceSession(model, database, backend)
+        summaries = {budget: session.run_agg(runtime, ctx_tokens=budget) for budget in (2048, 4096, 512)}
+        for budget in (2048, 4096, 512):
+            summary = summaries[budget]
+            scheduling = summary.get_per_ops_data()["scheduling"]
+            chunks, step_ms = (3, 8.0) if budget == 512 else (1, 13.0)
+            assert scheduling["num_mix_steps"] == 2 * chunks
+            assert scheduling["mix_step_latency_ms"] == pytest.approx(step_ms)
+            assert scheduling["num_genonly_steps"] == (0 if budget == 512 else 2)
+            assert scheduling["mix_decode_requests"] == 1
+            assert summary.get_aggregate_energy_breakdown()["mix_step"].latency_ms == pytest.approx(
+                2 * chunks * step_ms
+            )
+            # Apply the unchanged queue policy once to the priced sequence:
+            # vLLM has a 1.125 factor and 0.8 ms/layer dispatch; TRT-LLM's
+            # factor is 1.95 at two steps and 2.15 at six, with no dispatch.
+            expected_ttft = (
+                (chunks * step_ms + model._num_layers * 0.8) * 1.125
+                if backend_name == "vllm"
+                else chunks * step_ms * (2.15 if budget == 512 else 1.95)
+            )
+            assert summary.get_result_dict()["ttft"] == pytest.approx(expected_ttft)
+        small, large = (summaries[budget].get_result_dict() for budget in (2048, 4096))
+        for field in ("ttft", "tpot", "tokens/s"):
+            assert small[field] == pytest.approx(large[field])
+
     @pytest.mark.parametrize("xpu", [False, True])
     @pytest.mark.parametrize("prefix", [0, 3000])
     def test_cached_aggregate_schedules_fpm_target_and_draft_requests(self, tmp_path, xpu, prefix, monkeypatch):

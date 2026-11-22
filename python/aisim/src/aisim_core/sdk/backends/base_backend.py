@@ -2081,10 +2081,32 @@ class BaseBackend:
         # steps, and the step count the TTFT queuing factor reads.
         ttft_ctx_tokens = ctx_tokens
         ttft_steps_to_finish_ctx = steps_to_finish_ctx
+        fpm_prefill_chunks = None
         num_mix_steps = num_genonly_steps = 0
         num_mix_steps_for_tpot_calc = 0  # correction for tpot calc only
         if b > 1:
-            num_mix_gen_tokens = self._mix_step_gen_tokens(b, ctx_tokens, isl, decode_iterations)
+            scheduling_ctx_tokens = ctx_tokens
+            if _is_fpm_model(model) and isl > prefix:
+                # The native FPM query averages the actual uncached chunks.
+                # Express that work in prompt coordinates for the backend's
+                # decode-share policy, with at least one prefill/decode slot.
+                fresh_tokens = self._fpm_aggregate_prefill_tokens(ctx_tokens, isl, prefix, b - 1)
+                chunks = math.ceil((isl - prefix) / fresh_tokens)
+                requests = max(1.0, fresh_tokens / (isl - prefix))
+                scheduling_ctx_tokens = isl * requests / chunks
+            num_mix_gen_tokens = self._mix_step_gen_tokens(b, scheduling_ctx_tokens, isl, decode_iterations)
+            if _is_fpm_model(model) and isl > prefix:
+                num_mix_gen_tokens = min(b - 1, num_mix_gen_tokens)
+                # Use precisely the same capped fresh-token schedule as
+                # _run_agg_mixed_step. A query below one suffix is the mean
+                # of ceil(suffix/fresh) chunks; a larger query prices its
+                # scheduled fraction of the batch's total fresh work.
+                fresh_tokens = self._fpm_aggregate_prefill_tokens(ctx_tokens, isl, prefix, b - num_mix_gen_tokens)
+                chunks = math.ceil((isl - prefix) / fresh_tokens)
+                requests = max(1.0, fresh_tokens / (isl - prefix))
+                steps_to_finish_ctx = b * chunks / requests
+                fpm_prefill_chunks = chunks
+                ttft_steps_to_finish_ctx = steps_to_finish_ctx
             assert num_mix_gen_tokens >= 1, (
                 f"num_mix_gen_tokens: {num_mix_gen_tokens}, b: {b}, ctx_tokens: {ctx_tokens}, isl: {isl}"
             )
@@ -2231,6 +2253,10 @@ class BaseBackend:
             **(
                 {"prefill_total_ms": _prefill_step_ms * num_mix_steps}
                 if b == 1 and num_mix_steps > 1 and img_ctx_tokens == 0
+                # Base TTFT counts one request's native chunk sequence. Keep
+                # the scheduler budget available to backend queue calibration.
+                else {"prefill_total_ms": _prefill_step_ms * fpm_prefill_chunks}
+                if fpm_prefill_chunks is not None
                 else {}
             ),
         )

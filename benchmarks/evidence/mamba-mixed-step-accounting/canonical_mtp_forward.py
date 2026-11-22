@@ -55,11 +55,16 @@ for label, model_id, nextn in [("nano", config["model"], 3), ("control", "Qwen/Q
     record = {"config": resolved, "setup_ms": setup_ms, "queries": {}}
     for name, scheduled in cases.items():
         payload = [{"scheduled_requests": scheduled}]
-        value, cold_us, _, warm = measure_cold_and_warm(
+        value, cold_us, samples_us, warm = measure_cold_and_warm(
             lambda payload=payload: model.estimate_forward_pass_time_ms(payload), warmup=10, iterations=100
         )
         assert value is not None and value > 0
-        record["queries"][name] = {"predicted_ms": value, "first_query_us": cold_us, "warm": warm}
+        record["queries"][name] = {
+            "predicted_ms": value,
+            "first_query_us": cold_us,
+            "warm_samples_us": samples_us,
+            "warm": warm,
+        }
     result["builds"][label] = record
 result["identity"] = {
     "constructor_path": str(Path(nemotron_h.__file__).resolve()),

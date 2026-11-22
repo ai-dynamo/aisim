@@ -101,9 +101,10 @@ batch size and the new-token count. The collected scan rows start from a cold
 state, so they do not measure a prefill that restores a cached prefix. A
 qualified scan operation with a cached prefix therefore uses the SOL estimate,
 which counts the restored recurrent state. The collected convolution rows are
-cold too. A qualified convolution with a cached prefix keeps its cold row as a
-proxy, labeled `estimated`. A legacy operation, one with no recorded state
-dtype, still looks up the cold row. In `SILICON` or `HYBRID`
+cold too. A qualified convolution with a cached prefix uses a matching cold row
+as a proxy, labeled `estimated`, only when that lookup succeeds. If no matching
+row exists, it returns `sol` in both `SILICON` and `HYBRID`. A legacy operation,
+one with no recorded state dtype, still looks up the cold row. In `SILICON` or `HYBRID`
 mode, a successful lookup labels its result `silicon`. A `HYBRID` lookup that
 misses the model geometry gives `sol`, and `SOL` mode reads no row.
 Native op-level Replay supplies the observed prefill chunk lengths and prefixes
