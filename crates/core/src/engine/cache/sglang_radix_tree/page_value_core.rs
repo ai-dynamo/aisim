@@ -428,14 +428,21 @@ fn continuation_insert_preserves_rotation_checks_before_prefix_side_effects() {
     params.value = PageValue::from_vec(vec![3, 4]);
     params.prev_prefix_len = 2;
     params.rotation_base = Some(8);
+    params.priority = 99;
     for chunked in [true, false] {
         params.chunked = chunked;
+        let anchor_state = |tree: &TestCore| {
+            let node = tree.arena.node(tree.arena.resolve(anchor).unwrap());
+            (node.hit_count, node.last_access_counter, node.priority)
+        };
+        let before = anchor_state(&tree);
         let rejected = tree.insert_suffix_from_node(anchor, 2, &params);
         assert!(rejected.rotation_tail_declined);
         assert_eq!(rejected.prefix_len, 2);
         assert!(rejected.cache_actions.is_empty());
         assert!(rejected.adopted_ranges.unwrap().is_empty());
         assert_eq!(tree.evictable_size(), 2);
+        assert_eq!(anchor_state(&tree), before);
     }
     params.rotation_base = Some(7);
     let accepted = tree.insert_suffix_from_node(anchor, 2, &params);

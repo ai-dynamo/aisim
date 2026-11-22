@@ -56,6 +56,322 @@ fn eviction_walk_rechecks_a_leaf_refreshed_after_start() {
 }
 
 #[test]
+fn eviction_walk_rechecks_a_leaf_unlocked_after_start() {
+    for release_last_lock in [false, true] {
+        let mut tree = Core::new(CacheInitParams::default(), vec![FULL]);
+        let a = insert(&mut tree, vec![10, 20], &[1, 2]);
+        let first = tree.inc_lock_ref(a, Default::default()).unwrap();
+        let last = tree.inc_lock_ref(a, Default::default()).unwrap();
+        let b = insert(&mut tree, vec![30, 40], &[3, 4]);
+        tree.evict_device_start(FULL, 1);
+        tree.dec_lock_ref(a, &first.to_dec_params(), false).unwrap();
+        if release_last_lock {
+            tree.dec_lock_ref(a, &last.to_dec_params(), false).unwrap();
+        }
+        let (victim, _) = tree.evict_device_next_node(FULL, &HashMap::new());
+        assert_eq!(victim, Some(if release_last_lock { a } else { b }));
+        tree.evict_device_end(FULL);
+        if !release_last_lock {
+            tree.dec_lock_ref(a, &last.to_dec_params(), false).unwrap();
+        }
+        tree.try_sanity_check(&[], &[]).unwrap();
+    }
+}
+
+#[test]
+fn mamba_load_back_rechecks_an_independently_filled_destination() {
+    for filled in [false, true] {
+        let mut tree = Core::new(
+            CacheInitParams {
+                enable_hicache: true,
+                enable_kv_cache_events: true,
+                mamba_cache_chunk_size: Some(1),
+                ..Default::default()
+            },
+            vec![FULL, MAMBA],
+        );
+        let key = vec![10, 20];
+        let mut p = params(&key, &[1, 2]);
+        p.mamba_value = Some(PageValue::from_vec(vec![11]));
+        let leaf = tree.insert(&p).last_device_node_id.unwrap();
+        backup_components(&mut tree, leaf, MAMBA);
+        evict_auxiliary(&mut tree, leaf, MAMBA);
+        let (full, mut auxiliary) = tree.build_load_back_spec(leaf, None).unwrap();
+        assert!(full.node_row_counts.as_ref().unwrap().is_empty());
+        auxiliary.get_mut(&MAMBA).unwrap()[0].device_indices = Some(PageValue::from_vec(vec![302]));
+        if filled {
+            p.mamba_value = Some(PageValue::from_vec(vec![401]));
+            tree.insert(&p);
+        }
+        tree.take_events();
+        let sizes = (
+            tree.total_size(),
+            tree.evictable_size(),
+            tree.protected_size(),
+        );
+        let lru = tree.inspect_get_component_device_lru_node_ids(MAMBA);
+        let result = tree.commit_load_back(leaf, PageValue::from_vec(vec![]), full, auxiliary);
+        if filled {
+            assert!(matches!(
+                result,
+                Err(TreeCoreRuntimeError::InvalidLoadBackSpec { .. })
+            ));
+            assert_eq!(
+                (
+                    tree.total_size(),
+                    tree.evictable_size(),
+                    tree.protected_size()
+                ),
+                sizes
+            );
+            assert_eq!(tree.inspect_get_component_device_lru_node_ids(MAMBA), lru);
+        } else {
+            assert!(result.unwrap().is_empty());
+            tree.finish_load_back(leaf).unwrap();
+        }
+        let node = tree.arena.node(tree.arena.resolve(leaf).unwrap());
+        assert_eq!(
+            node.device_value(MAMBA).as_slice(),
+            if filled { &[401] } else { &[302] }
+        );
+        assert_eq!(node.device_value(FULL).as_slice(), &[1, 2]);
+        assert_eq!(node.load_back_pending_id, None);
+        assert!(tree.take_events().is_empty());
+        tree.try_sanity_check(&[], &[]).unwrap();
+    }
+}
+
+#[test]
+fn swa_load_back_rejects_split_rows_before_any_component_commits() {
+    for write_back in [false, true] {
+        let mut tree = Core::new(
+            CacheInitParams {
+                enable_hicache: true,
+                enable_kv_cache_events: true,
+                is_write_back: write_back,
+                swa_sliding_window_size: Some(2),
+                has_swa_host_pool: true,
+                ..Default::default()
+            },
+            vec![FULL, SWA],
+        );
+        let key = vec![10, 20];
+        let leaf = insert(&mut tree, key.clone(), &[1, 2]);
+        tree.attach_swa_window(
+            &key,
+            Default::default(),
+            0,
+            2,
+            &PageValue::from_vec(vec![11, 12]),
+        )
+        .unwrap();
+        backup_components(&mut tree, leaf, SWA);
+        evict_auxiliary(&mut tree, leaf, SWA);
+        let (full, mut auxiliary) = tree.build_load_back_spec(leaf, None).unwrap();
+        assert!(full.node_row_counts.as_ref().unwrap().is_empty());
+        auxiliary.get_mut(&SWA).unwrap()[0].device_indices =
+            Some(PageValue::from_vec(vec![301, 302]));
+        let prefix = tree
+            .match_prefix(&MatchPrefixParams {
+                key: &vec![10],
+                namespace: Default::default(),
+            })
+            .best_match_node_id;
+        tree.take_events();
+        let sizes = (
+            tree.total_size(),
+            tree.evictable_size(),
+            tree.protected_size(),
+        );
+        let lru = tree.inspect_get_component_device_lru_node_ids(SWA);
+        assert!(matches!(
+            tree.commit_load_back(leaf, PageValue::from_vec(vec![]), full, auxiliary),
+            Err(TreeCoreRuntimeError::InvalidLoadBackSpec { .. })
+        ));
+        assert_eq!(
+            (
+                tree.total_size(),
+                tree.evictable_size(),
+                tree.protected_size()
+            ),
+            sizes
+        );
+        assert_eq!(tree.inspect_get_component_device_lru_node_ids(SWA), lru);
+        assert!(tree.take_events().is_empty());
+        for id in [prefix, leaf] {
+            let node = tree.arena.node(tree.arena.resolve(id).unwrap());
+            assert!(!node.has_device_value(SWA));
+            assert_eq!(node.load_back_pending_id, None);
+        }
+        tree.try_sanity_check(&[], &[]).unwrap();
+        let (full, mut auxiliary) = tree.build_load_back_spec(leaf, None).unwrap();
+        assert_eq!(
+            auxiliary[&SWA][0].node_row_counts.as_deref(),
+            Some(&[1, 1][..])
+        );
+        auxiliary.get_mut(&SWA).unwrap()[0].device_indices =
+            Some(PageValue::from_vec(vec![301, 302]));
+        let actions = tree
+            .commit_load_back(leaf, PageValue::from_vec(vec![]), full, auxiliary)
+            .unwrap();
+        assert_eq!(actions.len(), 1);
+        let CacheAction::RebuildFullToSwaMapping {
+            full_indices,
+            swa_indices,
+        } = &actions[0]
+        else {
+            panic!("expected mapping rebuild after successful commit");
+        };
+        assert_eq!(PageValue::concat(full_indices).as_slice(), &[1, 2]);
+        assert_eq!(PageValue::concat(swa_indices).as_slice(), &[301, 302]);
+        for (id, value) in [(prefix, 301), (leaf, 302)] {
+            let node = tree.arena.node(tree.arena.resolve(id).unwrap());
+            assert_eq!(node.device_value(SWA).as_slice(), &[value]);
+        }
+        tree.finish_load_back(leaf).unwrap();
+        assert!(tree.take_events().is_empty());
+        tree.try_sanity_check(&[], &[]).unwrap();
+    }
+}
+
+#[test]
+fn foreign_pin_load_back_deferral_commits_as_a_noop() {
+    let mut tree = Core::new(
+        CacheInitParams {
+            enable_hicache: true,
+            is_write_back: true,
+            enable_kv_cache_events: true,
+            mamba_cache_chunk_size: Some(1),
+            ..Default::default()
+        },
+        vec![FULL, MAMBA],
+    );
+    let key = vec![10, 20];
+    let mut p = params(&key, &[1, 2]);
+    p.mamba_value = Some(PageValue::from_vec(vec![11]));
+    let parent = tree.insert(&p).last_device_node_id.unwrap();
+    let key = vec![10, 20, 30, 40];
+    let mut p = params(&key, &[1, 2, 3, 4]);
+    p.mamba_value = Some(PageValue::from_vec(vec![12]));
+    let child = tree.insert(&p).last_device_node_id.unwrap();
+    backup_components(&mut tree, parent, MAMBA);
+    backup_components(&mut tree, child, MAMBA);
+    tree.demote(child).unwrap();
+    tree.demote(parent).unwrap();
+    // Loading the child also pins the parent's Full rows. Its independent
+    // Mamba checkpoint remains host-only and must defer behind the child ack.
+    let (full, mut auxiliary) = tree.build_load_back_spec(child, None).unwrap();
+    auxiliary.get_mut(&MAMBA).unwrap()[0].device_indices = Some(PageValue::from_vec(vec![302]));
+    tree.commit_load_back(
+        child,
+        PageValue::from_vec(vec![5, 6, 7, 8]),
+        full,
+        auxiliary,
+    )
+    .unwrap();
+    tree.take_events();
+    let (full, auxiliary) = tree.build_load_back_spec(parent, None).unwrap();
+    assert_eq!(full.node_row_counts.as_deref(), Some(&[][..]));
+    assert!(auxiliary.is_empty());
+    let sizes = (
+        tree.total_size(),
+        tree.evictable_size(),
+        tree.protected_size(),
+    );
+    assert!(
+        tree.commit_load_back(parent, PageValue::from_vec(vec![]), full, auxiliary)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        (
+            tree.total_size(),
+            tree.evictable_size(),
+            tree.protected_size()
+        ),
+        sizes
+    );
+    let node = tree.arena.node(tree.arena.resolve(parent).unwrap());
+    assert_eq!(node.load_back_pending_id, Some(child));
+    assert!(!node.has_device_value(MAMBA));
+    assert!(tree.take_events().is_empty());
+    tree.finish_load_back(child).unwrap();
+    let (full, mut auxiliary) = tree.build_load_back_spec(parent, None).unwrap();
+    auxiliary.get_mut(&MAMBA).unwrap()[0].device_indices = Some(PageValue::from_vec(vec![303]));
+    tree.commit_load_back(parent, PageValue::from_vec(vec![]), full, auxiliary)
+        .unwrap();
+    tree.finish_load_back(parent).unwrap();
+    tree.try_sanity_check(&[], &[]).unwrap();
+}
+
+#[test]
+fn failed_backup_drops_subtrees_in_stable_postorder() {
+    for _ in 0..8 {
+        let mut tree = Core::new(
+            CacheInitParams {
+                enable_hicache: true,
+                is_write_back: true,
+                enable_kv_cache_events: true,
+                ..Default::default()
+            },
+            vec![FULL],
+        );
+        let parent = insert(&mut tree, vec![10], &[1]);
+        let a = insert(&mut tree, vec![10, 20], &[1, 2]);
+        let b = insert(&mut tree, vec![10, 30], &[1, 3]);
+        let aa = insert(&mut tree, vec![10, 20, 40], &[1, 2, 4]);
+        let ab = insert(&mut tree, vec![10, 20, 50], &[1, 2, 5]);
+        for (id, slot) in [(a, 102), (b, 103), (aa, 104), (ab, 105)] {
+            tree.commit_backup(id, PageValue::from_vec(vec![slot]), HashMap::new())
+                .unwrap();
+            let nodes = tree.mark_write_through_pending(vec![id], id).unwrap();
+            tree.finish_write_through(nodes, id).unwrap();
+        }
+        for id in [aa, ab, a, b] {
+            tree.demote(id).unwrap();
+        }
+        // Assign explicit hashes so the ordered CPU removal payload is observable.
+        for (id, hash) in [
+            (a, "0000000000000002"),
+            (b, "0000000000000003"),
+            (aa, "0000000000000004"),
+            (ab, "0000000000000005"),
+        ] {
+            tree.inspect_set_node_hash_values(id, Some(vec![hash.to_string()]))
+                .unwrap();
+        }
+        let expected_hashes = [aa, ab, a, b].map(|id| {
+            let hash = tree.get_hash_values(id).unwrap().remove(0);
+            super::node::hash_str_to_int64(&hash)
+        });
+        tree.take_events();
+        let (dropped, result) = tree.drop_subtree_no_host(parent).unwrap();
+        assert!(dropped);
+        let freed: Vec<_> = result.host_frees[&FULL]
+            .iter()
+            .flat_map(|v| v.as_slice())
+            .copied()
+            .collect();
+        assert_eq!(freed, vec![104, 105, 102, 103]);
+        assert_eq!(
+            tree.take_events()
+                .into_iter()
+                .filter_map(|event| match event {
+                    KvCacheEvent::BlockRemoved {
+                        block_hashes,
+                        medium: StorageMedium::Cpu,
+                    } => Some(block_hashes),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![expected_hashes.to_vec()]
+        );
+        assert_eq!(tree.total_size(), (0, 0));
+        tree.try_sanity_check(&[], &[]).unwrap();
+    }
+}
+
+#[test]
 fn skipped_full_host_receipt_cannot_release_a_later_lock() {
     for write_back in [false, true] {
         let mut tree = Core::new(

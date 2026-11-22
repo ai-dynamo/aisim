@@ -417,6 +417,9 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for FullComponent {
             }
             if old_lock_ref == 1 {
                 tree_core.update_evictable_leaf_sets_(cur);
+                if tree_core.evictable_device_leaves.contains(cur) {
+                    tree_core.full_evict_device_heap_dirty = true;
+                }
             }
             cur = parent;
         }

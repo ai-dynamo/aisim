@@ -365,7 +365,7 @@ pub struct PoolTransfer<V: RadixValue> {
     pub hit_policy: PoolHitPolicy,
     /// The nodes a load-back restores, ancestors first (external handles).
     pub nodes_to_load: Option<Vec<NodeId>>,
-    /// Full host-row counts at planning time, in `nodes_to_load` order.
+    /// Component host-row counts at planning time, in `nodes_to_load` order.
     pub node_row_counts: Option<Vec<usize>>,
 }
 
@@ -3004,13 +3004,18 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             .values()
             .copied()
             .collect();
+        // Reverse the stable preorder below to release descendants before
+        // parents, with sibling subtrees in ascending external NodeId order.
+        stack.sort_unstable_by_key(|&idx| self.arena.node(idx).id);
         while let Some(cur_id) = stack.pop() {
             let cur = self.arena.node(cur_id);
             if cur.is_device_locked() || cur.is_host_locked() {
                 return Ok((false, result));
             }
             descendants.push(cur_id);
+            let children_start = stack.len();
             stack.extend(cur.children.values().copied());
+            stack[children_start..].sort_unstable_by_key(|&idx| self.arena.node(idx).id);
         }
         for &desc_id in descendants.iter().rev() {
             {
@@ -4200,6 +4205,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 name: PoolName::Kv,
                 host_indices: Some(V::empty()),
                 nodes_to_load: Some(Vec::new()),
+                node_row_counts: Some(Vec::new()),
                 ..Default::default()
             };
             return Ok((empty_kv, HashMap::new()));
@@ -4555,6 +4561,48 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         if total != device_indices.len() || total != kv_xfer.host_indices.as_ref().map_or(0, V::len)
         {
             return Err(invalid());
+        }
+        // Auxiliary plans can become stale independently of Full KV, including
+        // when Full has no rows to restore. Check every destination before any
+        // component adopts rows or publishes events.
+        for (&component_type, transfers) in &comp_xfers {
+            for transfer in transfers {
+                let Some(node_ids) = &transfer.nodes_to_load else {
+                    continue; // Request-owned Mamba CoW destination, not a tree slot.
+                };
+                let counts = transfer.node_row_counts.as_deref().ok_or_else(invalid)?;
+                if counts.len() != node_ids.len() {
+                    return Err(invalid());
+                }
+                let mut auxiliary_total = 0usize;
+                let mut auxiliary_seen = std::collections::HashSet::new();
+                for (&id, &count) in node_ids.iter().zip(counts) {
+                    let idx = self.arena.resolve(id)?;
+                    let node = self.arena.node(idx);
+                    if !auxiliary_seen.insert(idx)
+                        || count == 0
+                        || node.has_device_value(component_type)
+                        || node.host_value_len(component_type) != count
+                    {
+                        return Err(invalid());
+                    }
+                    if component_type == SWA
+                        && if node.has_device_value(FULL) {
+                            node.device_value_len(FULL) != count
+                        } else {
+                            !seen.contains(&idx) || node.host_value_len(FULL) != count
+                        }
+                    {
+                        return Err(invalid());
+                    }
+                    auxiliary_total = auxiliary_total.checked_add(count).ok_or_else(invalid)?;
+                }
+                if transfer.device_indices.as_ref().map(V::len) != Some(auxiliary_total)
+                    || transfer.host_indices.as_ref().map(V::len) != Some(auxiliary_total)
+                {
+                    return Err(invalid());
+                }
+            }
         }
         let mut cache_actions: Vec<CacheAction<V>> = Vec::new();
         kv_xfer.device_indices = Some(device_indices);

@@ -565,6 +565,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for MambaComponent {
                         name: PoolName::Mamba,
                         host_indices: Some(host_value.shallow_clone()),
                         nodes_to_load: Some(vec![node.id]),
+                        node_row_counts: Some(vec![host_value.len()]),
                         ..Default::default()
                     });
                 }

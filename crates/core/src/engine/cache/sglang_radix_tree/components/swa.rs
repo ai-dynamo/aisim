@@ -992,6 +992,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
                 nodes_to_load.reverse();
                 Some(vec![PoolTransfer {
                     name: PoolName::Swa,
+                    node_row_counts: Some(backed_up.iter().map(V::len).collect()),
                     host_indices: Some(V::concat(&backed_up)),
                     nodes_to_load: Some(nodes_to_load),
                     ..Default::default()

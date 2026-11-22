@@ -157,7 +157,8 @@ These files are modified for module paths, a dependency alias, native-only
 build/test wiring, attribution headers, Rustfmt, and the local correctness and
 allocation corrections recorded in the patch. The bundled README maps each
 original path and documents every local correction; upstream native test
-assertions are unchanged. The bundled source is part of the existing
+assertions are retained, with rejected-rotation state assertions strengthened.
+The bundled source is part of the existing
 `aisimulate-core` crate and the `aisimulate` wheel, not an additional artifact.
 
 Source: https://github.com/sgl-project/sglang/tree/f0fda25fc95c357368b714f90a13a69c1b67f50a/rust/sglang-radix-tree
