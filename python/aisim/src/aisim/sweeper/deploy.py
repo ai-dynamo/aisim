@@ -5,10 +5,8 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from copy import deepcopy
-from functools import cache
 from typing import Any
 
 from ..capacity import estimate_kv_bytes_per_token, materialize_aic_num_gpu_blocks
@@ -72,8 +70,10 @@ def _engine_args_payload(
     *,
     backend_version: str,
     forward_pass_estimator: ForwardPassEstimatorSpec | None = None,
+    fpm_profile=None,
 ) -> dict[str, Any]:
     """Build the runner-neutral engine argument payload for one role."""
+    fpm_profile = fpm_profile or _profile_loader(sample)
     if any(is_active_engine_model_control(name, sample.get(name)) for name in ENGINE_MODEL_CONTROL_FIELDS) and (
         forward_pass_estimator is None or sample.get(f"{role}_timing_model") is not None
     ):
@@ -134,7 +134,7 @@ def _engine_args_payload(
     if context_length is not None:
         payload["max_model_len"] = int(context_length)
     if sample.get("fpm_profile") is not None and (role != "agg" or payload["enable_prefix_caching"]):
-        _add_grouped_prefix_caching(payload, sample, role, backend_version=backend_version)
+        _add_grouped_prefix_caching(payload, sample, role, backend_version=backend_version, fpm_profile=fpm_profile)
     if moe_tp * moe_ep > 1:
         payload["aic_moe_tp_size"] = moe_tp
         payload["aic_moe_ep_size"] = moe_ep
@@ -210,7 +210,7 @@ def _engine_args_payload(
     if (
         transfer_geometry == "auto"
         and role in {"prefill", "decode"}
-        and _grouped_deployment(sample, "prefill", backend_version=backend_version) is not None
+        and _grouped_deployment(sample, "prefill", backend_version=backend_version, fpm_profile=fpm_profile) is not None
     ):
         # A grouped prefill rank derives its transfer payload from its cache groups, as in the compiler.
         transfer_geometry = None
@@ -238,23 +238,25 @@ def _engine_args_payload(
     return payload
 
 
-@cache
-def _profile(fpm_profile_json: str):
-    """The loaded FPM profile of a candidate, keyed by its JSON text as the cached capacity function keys it.
-
-    The sweeper builds its candidates in one process, so it loads each profile once. Every caller only reads the
-    model and the deployment that ``select`` returns.
-    """
+def _profile_loader(sample: dict[str, Any]):
+    """Load the sample's FPM profile when a rank first needs it, once for a candidate. Every caller only reads it."""
     from aisim_core.sdk.fpm_profile import load_fpm_profile
 
-    return load_fpm_profile(fpm_profile_json)
+    loaded = []
+
+    def profile():
+        if not loaded:
+            loaded.append(load_fpm_profile(sample["fpm_profile"]))
+        return loaded[0]
+
+    return profile
 
 
-def _grouped_deployment(sample: dict[str, Any], role: str, *, backend_version: str):
+def _grouped_deployment(sample: dict[str, Any], role: str, *, backend_version: str, fpm_profile):
     """The FPM profile and the grouped deployment of a candidate's role, or None for a role with a linear cache."""
     if sample.get("fpm_profile") is None:
         return None
-    profile = _profile(json.dumps(sample["fpm_profile"], sort_keys=True))
+    profile = fpm_profile()
     # A profile without grouped deployments keeps its candidate path as it was.
     if all(deployment.resources.cache_layout != "grouped" for deployment in profile.deployments):
         return None
@@ -275,7 +277,7 @@ def _grouped_deployment(sample: dict[str, Any], role: str, *, backend_version: s
 
 
 def _add_grouped_prefix_caching(
-    payload: dict[str, Any], sample: dict[str, Any], role: str, *, backend_version: str
+    payload: dict[str, Any], sample: dict[str, Any], role: str, *, backend_version: str, fpm_profile
 ) -> None:
     """Give a grouped FPM rank the keys that the Rust gate needs, after the shared check.
 
@@ -283,7 +285,7 @@ def _add_grouped_prefix_caching(
     """
     from ..config.engine import grouped_prefix_caching_requirements
 
-    grouped = _grouped_deployment(sample, role, backend_version=backend_version)
+    grouped = _grouped_deployment(sample, role, backend_version=backend_version, fpm_profile=fpm_profile)
     if grouped is None:
         return
     profile, deployment = grouped
@@ -432,6 +434,8 @@ def build_backend_deployment(
         from ..config.epd import encoder_metadata
 
         common["performance_model_metadata"]["encoder"] = encoder_metadata(encoder)
+    # The roles and the transfer size of a candidate share one load of its FPM profile.
+    fpm_profile = _profile_loader(sample)
     if mode == "agg":
         return BackendDeploymentSpec(
             agg_engine_args=_engine_args_payload(
@@ -439,6 +443,7 @@ def build_backend_deployment(
                 "agg",
                 backend_version=backend_version,
                 forward_pass_estimator=forward_pass_estimators.get("agg"),
+                fpm_profile=fpm_profile,
             ),
             num_workers=int(sample["replicas"]),
             **common,
@@ -448,9 +453,14 @@ def build_backend_deployment(
         "prefill",
         backend_version=backend_version,
         forward_pass_estimator=forward_pass_estimators.get("prefill"),
+        fpm_profile=fpm_profile,
     )
     decode_args = _engine_args_payload(
-        sample, "decode", backend_version=backend_version, forward_pass_estimator=forward_pass_estimators.get("decode")
+        sample,
+        "decode",
+        backend_version=backend_version,
+        forward_pass_estimator=forward_pass_estimators.get("decode"),
+        fpm_profile=fpm_profile,
     )
     return BackendDeploymentSpec(
         prefill_engine_args=prefill_args,

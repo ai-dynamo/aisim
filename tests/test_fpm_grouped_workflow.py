@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
+import sys
 from copy import deepcopy
 from pathlib import Path
 
@@ -2244,37 +2246,44 @@ def _grouped_agg_sample(profile, root, budget):
     )
 
 
-def test_grouped_sweeper_loads_the_profile_once_per_process(grouped_case):
+def test_grouped_sweeper_loads_the_profile_once_per_candidate(grouped_case, monkeypatch):
     from aisim.sweeper import deploy
     from aisim.sweeper.config import SearchSpace
     from aisim.sweeper.parallel_enum import DisaggParallelConfig, ParallelShape, ReplicaParallelConfig
     from aisim.sweeper.sample import unroll_sample
+    from aisim_core.sdk import fpm_profile
 
+    loads = []
+    load = fpm_profile.load_fpm_profile
+
+    def counted(value):
+        # Other parts of the build read the profile too; this test counts the loads of the candidate's ranks.
+        if sys._getframe(1).f_code.co_filename == deploy.__file__:
+            loads.append(value)
+        return load(value)
+
+    monkeypatch.setattr(fpm_profile, "load_fpm_profile", counted)
     profile, root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile))
-    deploy._profile.cache_clear()
-    first = _grouped_agg_sample(profile, root, 128)
-    second = _grouped_agg_sample(deepcopy(profile), root, 128)
-    loaded = [
-        deploy._grouped_deployment(sample, "agg", backend_version="0.31.0")[0] for sample in (first, second, first)
-    ]
-    # An equal profile in another dict gives the model that the first load built.
-    assert loaded[0] is loaded[1] is loaded[2]
-    # The order of the keys does not matter, as it does not for the loader.
-    reordered = {**first, "fpm_profile": dict(reversed(first["fpm_profile"].items()))}
-    assert deploy._grouped_deployment(reordered, "agg", backend_version="0.31.0")[0] is loaded[0]
-    deploy.build_backend_deployment(first, backend_version="0.31.0")
-    deploy.build_backend_deployment(second, backend_version="0.31.0")
-    assert deploy._profile.cache_info().misses == 1
-    changed = deepcopy(profile)
-    changed["context_length"] += 1
-    deploy._grouped_deployment(_grouped_agg_sample(changed, root, 128), "agg", backend_version="0.31.0")
-    assert deploy._profile.cache_info().misses == 2
+    sample = _grouped_agg_sample(profile, root, 128)
+    args = deploy.build_backend_deployment(sample, backend_version="0.31.0").agg_engine_args
+    # An aggregated rank with prefix caching reads the profile once, as before.
+    assert len(loads) == 1
+    # A profile given as JSON text or as a loaded model builds the same rank as the dict that the search stores.
+    for value in (json.dumps(sample["fpm_profile"]), load(sample["fpm_profile"])):
+        assert (
+            deploy.build_backend_deployment({**sample, "fpm_profile": value}, backend_version="0.31.0").agg_engine_args
+            == args
+        )
 
-    # A disaggregated candidate reads the profile for both roles and for the transfer geometry, and loads it once.
-    pd_profile = _with_transfer_markers(profile)
-    raw = {**_pd_search(pd_profile, root), "kv_transfer_bytes_per_token": "auto", "kv_transfer_bandwidth": 1.0}
-    raw["prefill_enable_prefix_caching"] = True
+    # A disaggregated candidate reads the profile for both roles and for the transfer size of each role. It loaded the
+    # profile four times, once for each role and once more for each transfer size, and now loads it once.
+    raw = {
+        **_pd_search(_with_transfer_markers(profile), root),
+        "prefill_enable_prefix_caching": True,
+        "kv_transfer_bytes_per_token": "auto",
+        "kv_transfer_bandwidth": 1.0,
+    }
     worker = ReplicaParallelConfig(ParallelShape(tp=2, dp=1, moe_tp=2, moe_ep=1), replicas=1)
     sample = unroll_sample(
         search_space=SearchSpace.model_validate(raw),
@@ -2288,12 +2297,58 @@ def test_grouped_sweeper_loads_the_profile_once_per_process(grouped_case):
         },
         parallel_config=DisaggParallelConfig(prefill=worker, decode=worker),
     )
-    deploy._profile.cache_clear()
+    loads.clear()
     deployment = deploy.build_backend_deployment(sample, backend_version="0.31.0")
     assert deployment.prefill_engine_args["prefix_match_unit"] == 64
-    info = deploy._profile.cache_info()
-    assert (info.misses, info.currsize) == (1, 1)
-    assert info.hits >= 3
+    assert len(loads) == 1
+
+
+def test_a_build_error_outside_the_prefix_caching_rules_stays_failed(grouped_case):
+    from aisim.runner import EngineReplayRunnerFactory
+    from aisim.sweeper import deploy
+    from aisim.sweeper import search as search_module
+    from aisim.sweeper.config import SmartSearchConfig
+    from aisim.sweeper.parallel_enum import ParallelShape, ReplicaParallelConfig
+    from aisim.sweeper.replay import ForwardPassEstimatorSpec
+    from aisim.sweeper.result import ReasonCategory
+
+    profile, root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile))
+    sample = _grouped_agg_sample(profile, root, 128)
+    # The profile holds no deployment of vLLM 0.29.0. That is a fault of the inputs, not an engine setting.
+    with pytest.raises(ValueError, match="no matching FPM deployment profile") as error:
+        deploy.build_backend_deployment(sample, backend_version="0.29.0")
+    assert not isinstance(error.value, deploy.InfeasibleEngineSetting)
+
+    class OtherVersion:
+        def resolve_candidate(self, sample):
+            config = {
+                "model": sample["model_name"],
+                "system": "h200_sxm",
+                "backend": "vllm",
+                "backend_version": "0.29.0",
+                "database_mode": "SILICON",
+                "estimation_mode": "fpm_interpolation",
+            }
+            return {"agg": ForwardPassEstimatorSpec(config=config)}
+
+    config = SmartSearchConfig(
+        search_space=_prefix_search(profile, root, "0.31.0"),
+        workload=Workload(isl=1152, osl=4, concurrency=1, request_count=2),
+    )
+    prepared, result = search_module._materialize_one(
+        {"deployment_mode": "agg", "backend": "vllm", "agg_max_num_batched_tokens": 128, "agg_max_num_seqs": 4},
+        ReplicaParallelConfig(ParallelShape(tp=2, dp=1, moe_tp=2, moe_ep=1), replicas=1),
+        config=config,
+        goal=config.goal,
+        providers={},
+        provider_plans={},
+        runner_factory=EngineReplayRunnerFactory(),
+        estimator_resolver=OtherVersion(),
+    )
+    assert prepared is None
+    assert (result.outcome, result.reason_category) == ("failed", ReasonCategory.CANDIDATE_MATERIALIZATION)
+    assert result.reason.startswith("candidate build failed: ValueError: no matching FPM deployment profile")
 
 
 def test_grouped_sweeper_marks_an_off_grid_budget_infeasible_with_a_short_reason(grouped_case, caplog):
@@ -2335,6 +2390,7 @@ def test_grouped_sweeper_marks_an_off_grid_budget_infeasible_with_a_short_reason
         "max_batched_tokens that are multiples of 4"
     )
     assert "Sweeper candidate build failed" not in caplog.text
+    assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
 
 
 def _onboarding_plan(profile, tmp_path, capsys, version, runtime_version=None):
