@@ -890,11 +890,11 @@ host offload is not available for it, disaggregation needs
 `transfer_bytes_per_block` on every group, which import writes only from a
 probe phase with prefix caching and only for the measured cache shape, and its
 plan replays with prefix caching only under the conditions of
-[grouped caches](../../replay/engine/kv-cache.md#other-cache-modes). When the
-measured groups have a linear form and no layout claim was typed, the import
-result names it in `linear_layout_hint`, with the measured
-`kv_bytes_per_token`. A matching claim of either kind gives a linear profile,
-as described below.
+[grouped caches](../../replay/engine/kv-cache.md#other-cache-modes). When a
+linear layout describes the measured groups exactly and no layout claim was
+typed, the result of a complete import names it in `linear_layout_hint`, with
+the measured `kv_bytes_per_token`. A matching `cache_layout: linear` or
+`kv_bytes_per_token` claim gives a linear profile, as described below.
 Import checks each kind of claim against the measured groups:
 
 - A `cache_groups` claim must have the same groups as the measurement: the same

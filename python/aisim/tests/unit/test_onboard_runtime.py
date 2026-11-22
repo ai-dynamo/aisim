@@ -878,11 +878,15 @@ def test_linear_layout_claim_with_a_fractional_measurement_is_imported_as_groupe
     assert json.loads((tmp_path / "drafts" / "import.json").read_text())["configurations"]["tp2"] == result
 
 
-_LINEAR_HINT = (
-    "a linear layout describes this measurement exactly (kv_bytes_per_token=16); to get a linear profile, add "
-    "cache_layout: linear to the resource_overrides of this configuration in the checkpoint and run onboard "
-    "import-observations again"
-)
+def _linear_hint(kv_bytes_per_token):
+    return (
+        f"a linear layout describes this measurement exactly (kv_bytes_per_token={kv_bytes_per_token}); to get a "
+        "linear profile, add cache_layout: linear to inputs.resource_overrides of this configuration in the checkpoint "
+        "and run onboard import-observations again into a fresh --output-dir"
+    )
+
+
+_LINEAR_HINT = _linear_hint(16)
 
 # The two full-attention groups that the dense probe fixture measures, as a cache_groups claim.
 _DENSE_GROUPS = [
@@ -899,13 +903,40 @@ _DENSE_GROUPS = [
 
 
 def test_import_names_the_linear_layout_when_no_claim_was_typed(tmp_path, capsys):
-    _, _, request, result = _imported(tmp_path, capsys)
+    checkpoint, _, request, result = _imported(tmp_path, capsys)
     assert request.profile_deployment().resources.cache_layout == "grouped"
     assert result["linear_layout_hint"] == _LINEAR_HINT and "cache_layout_reason" not in result
     assert json.loads((tmp_path / "drafts" / "import.json").read_text())["configurations"]["tp2"] == result
-    # The hint is no part of the profile or of the validation record, so no saved profile changes.
+    # The hint is no part of the profile, the validation record or the checkpoint, so no saved file changes.
     assert "linear_layout_hint" not in request.fpm_profile.provenance
     assert "linear_layout_hint" not in Path(result["validation"]).read_text()
+    assert "linear_layout_hint" not in checkpoint.read_text()
+
+
+def test_linear_hint_names_the_bytes_per_token_of_the_measurement(tmp_path, capsys):
+    # Two full-attention groups of 128-byte pages per 2-token block: 128 / 2 + 128 / 2 = 128 bytes per token.
+    _, _, _, result = _imported(tmp_path, capsys, block_tokens=(2, 2))
+    assert result["linear_layout_hint"] == _linear_hint(128 // 2 + 128 // 2)
+
+
+def test_an_override_that_is_no_layout_claim_keeps_the_linear_hint(tmp_path, capsys):
+    _, _, _, result = _imported(tmp_path, capsys, resource_overrides={"max_num_tokens": 1024})
+    assert result["linear_layout_hint"] == _LINEAR_HINT
+
+
+def test_a_shared_layout_claim_gives_no_linear_hint(tmp_path, capsys):
+    # The import reads the shared inputs of the checkpoint together with those of the configuration.
+    checkpoint, index, _ = _campaign(tmp_path)
+    state = _load(checkpoint)
+    save_checkpoint(
+        checkpoint,
+        patch={"inputs": {"resource_overrides": {"cache_layout": "linear"}}},
+        expected_revision=state.revision,
+        accept=[],
+    )
+    assert _import(checkpoint, index, tmp_path / "drafts", configurations=["tp2"]) == 0
+    result = json.loads(capsys.readouterr().out)["configurations"]["tp2"]
+    assert result["cache_layout_reason"].startswith("linear: ") and "linear_layout_hint" not in result
 
 
 @pytest.mark.parametrize(
@@ -925,18 +956,14 @@ def test_import_gives_no_linear_hint_when_it_does_not_apply(tmp_path, capsys, ar
     assert result["status"] == "complete" and "linear_layout_hint" not in result
 
 
-def test_import_that_fails_after_its_records_pass_gives_no_linear_hint(tmp_path, capsys, monkeypatch):
-    import aisim.support.runtime as runtime
-
-    def refused(*args, **kwargs):
-        raise ValueError("draft refused")
-
-    # The records pass and hold the measured groups, but the configuration gets no draft.
-    monkeypatch.setattr(runtime, "_draft", refused)
-    checkpoint, index, _ = _campaign(tmp_path)
+def test_import_that_fails_after_its_records_pass_gives_no_linear_hint(tmp_path, capsys):
+    # The records pass and hold the measured groups, but the draft refuses an override that differs from the probe.
+    checkpoint, index, _ = _campaign(tmp_path, resource_overrides={"max_num_tokens": 999})
     assert _import(checkpoint, index, tmp_path / "drafts", configurations=["tp2"]) == 1
     result = json.loads(capsys.readouterr().out)["configurations"]["tp2"]
-    assert result["status"] == "incomplete" and result["diagnostics"] == ["draft refused"]
+    assert result["status"] == "incomplete"
+    refusal = "resource_overrides.max_num_tokens=999 differs from the runtime probe's measured"
+    assert refusal in str(result["diagnostics"])
     assert json.loads(Path(result["validation"]).read_text())["resources"]["cache_groups"]
     assert "linear_layout_hint" not in result
 
@@ -944,14 +971,14 @@ def test_import_that_fails_after_its_records_pass_gives_no_linear_hint(tmp_path,
 def test_following_the_linear_hint_gives_a_linear_profile(tmp_path, capsys):
     checkpoint, index, _, result = _imported(tmp_path, capsys)
     assert result["linear_layout_hint"] == _LINEAR_HINT
-    state = _load(checkpoint)
-    inputs = {**state.configurations["tp2"].inputs, "resource_overrides": {"cache_layout": "linear"}}
-    save_checkpoint(
-        checkpoint,
-        patch={"configurations": {"tp2": {"inputs": inputs}}},
-        expected_revision=state.revision,
-        accept=[],
-    )
+    # The hint, word by word: cache_layout: linear into inputs.resource_overrides of the configuration, with the
+    # checkpoint command, then the same import into a fresh --output-dir.
+    patch = tmp_path / "patch.json"
+    _write(patch, {"configurations": {"tp2": {"inputs": {"resource_overrides": {"cache_layout": "linear"}}}}})
+    revision = str(_load(checkpoint).revision)
+    command = ["onboard", "checkpoint", "--file", str(checkpoint), "--update", str(patch)]
+    assert cli.main([*command, "--expect-revision", revision]) == 0
+    capsys.readouterr()
     assert _import(checkpoint, index, tmp_path / "again", configurations=["tp2"]) == 0
     result = json.loads(capsys.readouterr().out)["configurations"]["tp2"]
     assert "linear_layout_hint" not in result

@@ -1049,8 +1049,8 @@ def import_observations(
                 results[name]["linear_layout_hint"] = (
                     "a linear layout describes this measurement exactly "
                     f"(kv_bytes_per_token={linear['kv_bytes_per_token']}); to get a linear profile, add "
-                    "cache_layout: linear to the resource_overrides of this configuration in the checkpoint and run "
-                    "onboard import-observations again"
+                    "cache_layout: linear to inputs.resource_overrides of this configuration in the checkpoint and "
+                    "run onboard import-observations again into a fresh --output-dir"
                 )
             # Why the import wrote no transfer_bytes_per_block, which a grouped P/D rank needs.
             if "transfer_bytes_reason" in result:
