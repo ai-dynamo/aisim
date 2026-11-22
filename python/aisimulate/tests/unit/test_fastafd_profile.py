@@ -282,6 +282,7 @@ def test_canonical_model_rejects_nested_parquet_before_positional_reads(tmp_path
     import pyarrow.parquet as pq
 
     from aisimulate_core.sdk import RustForwardPassPerfModel
+    from aisimulate_core.sdk.errors import PerfDataNotAvailableError
 
     profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload()))
     path = tmp_path / "profile.parquet"
@@ -296,7 +297,7 @@ def test_canonical_model_rejects_nested_parquet_before_positional_reads(tmp_path
     table = table.append_column("neighbor_ms", pa.array([24.0]))
     pq.write_table(table, path)
 
-    with pytest.raises(ValueError, match="flat parquet schema"):
+    with pytest.raises(PerfDataNotAvailableError, match="flat parquet schema"):
         RustForwardPassPerfModel.best_available(_canonical_config(path))
 
 
