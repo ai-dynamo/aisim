@@ -312,6 +312,65 @@ fn cold_prefill_checkpoint_only_replaces_rotation_in_one_pass() {
 }
 
 #[test]
+fn cold_non_block_multiple_budget_accounts_for_the_final_checkpoint() {
+    // A 100-token budget floors non-final chunks to 64 tokens. The chunks
+    // start at 0, 64 and 128; the final 65-token chunk exports checkpoint 192.
+    // Four token blocks, two two-block working states and the two-block
+    // checkpoint need ten blocks at the peak.
+    for capacity in [8, 10] {
+        let mut config = args(true, false);
+        config.block_size = 64;
+        config.prefix_match_unit = Some(64);
+        config.max_num_batched_tokens = Some(100);
+        config.num_gpu_blocks = capacity;
+        config.state_cache.as_mut().unwrap().bytes_per_request = 1500;
+        let mut core = VllmCore::new(config);
+        let id = submit(&mut core, 914, (0..193).collect(), 1);
+
+        for (start, computed) in [(0, 64), (64, 64), (128, 65)] {
+            assert_eq!(core.state.requests[&id].num_computed_tokens, start);
+            let pass = step(&mut core);
+            let fpm = pass.fpm.as_ref().unwrap();
+            if capacity == 8 {
+                assert!(pass.admissions.is_empty(), "reject before partial prefill");
+                assert_eq!(fpm.sum_prefill_tokens, 0);
+                assert!(
+                    pass.output_signals
+                        .iter()
+                        .any(|signal| { signal.uuid == id && signal.completed && signal.rejected })
+                );
+                break;
+            }
+
+            if start == 0 {
+                assert_eq!(pass.admissions.len(), 1);
+                assert_eq!(reused(&pass, id), 0);
+            } else {
+                assert!(pass.admissions.is_empty());
+            }
+            assert_eq!(fpm.sum_prefill_kv_tokens, start as u64);
+            assert_eq!(fpm.sum_prefill_tokens, computed);
+            if start == 128 {
+                assert!(
+                    pass.output_signals.iter().any(|signal| {
+                        signal.uuid == id && signal.completed && !signal.rejected
+                    })
+                );
+            } else {
+                assert!(pass.output_signals.is_empty());
+                assert_eq!(
+                    core.state.requests[&id].num_computed_tokens,
+                    start + computed as usize
+                );
+            }
+        }
+        assert!(core.state.requests.is_empty());
+        assert_eq!(core.kv_manager.num_active_blocks(), 0);
+        assert_eq!(core.state.preemptions_total, 0);
+    }
+}
+
+#[test]
 fn warm_junction_checkpoint_admission_accounts_for_the_final_chunk() {
     // Four token blocks and two two-block working states fit in eight blocks.
     // A warm attention-only prefix forces a stop at 64, so the final chunk
