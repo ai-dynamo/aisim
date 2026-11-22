@@ -659,19 +659,42 @@ fn equal_groups(count: usize) -> Vec<FpmCacheGroup> {
 
 #[test]
 fn rules_refuse_more_groups_than_a_cache_key_can_name() {
-    // `CacheKey::Grouped` holds the group position in a `u16`, so 65,536
-    // groups get 65,536 keys for one hash and one more group gets none.
-    assert!(GroupedPrefixRules::new(&equal_groups(65_536), 16, VllmRuleVersion::V0_31_0).is_ok());
-    // `err()` keeps a failure of this test from printing 65,537 rules.
-    let refusal = GroupedPrefixRules::new(&equal_groups(65_537), 16, VllmRuleVersion::V0_31_0)
-        .err()
-        .map(|err| err.to_string());
-    assert_eq!(
-        refusal.as_deref(),
-        Some(
-            "kv_cache_groups with enable_prefix_caching=true support at most 65536 groups; use fewer groups, or turn prefix caching off to replay them cold"
-        )
-    );
+    // `CacheKey::Grouped` names a group by its position among all groups of
+    // the rank, in a `u16`, so it can name the positions 0 to 65,535. The
+    // bound counts every group, also one that opts out of prefix caching:
+    // placed first, such a group moves the last caching group to position
+    // 65,536. So 65,536 caching groups plus one that opts out are refused
+    // in either order. The check is the same for each rule version.
+    let mut opted_out = attention("off", 16, None);
+    opted_out.prefix_cacheable = Some(false);
+    let mut opted_out_first = vec![opted_out.clone()];
+    opted_out_first.extend(equal_groups(65_536));
+    let mut opted_out_last = equal_groups(65_536);
+    opted_out_last.push(opted_out);
+    let too_many = [equal_groups(65_537), opted_out_first, opted_out_last];
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
+        assert!(
+            GroupedPrefixRules::new(&equal_groups(65_536), 16, version).is_ok(),
+            "{version:?}"
+        );
+        for (row, groups) in too_many.iter().enumerate() {
+            // `err()` keeps a failure of this test from printing 65,537 rules.
+            let refusal = GroupedPrefixRules::new(groups, 16, version)
+                .err()
+                .map(|err| err.to_string());
+            assert_eq!(
+                refusal.as_deref(),
+                Some(
+                    "kv_cache_groups with enable_prefix_caching=true support at most 65536 groups; use fewer groups, or turn prefix caching off to replay them cold"
+                ),
+                "{version:?} row {row}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -705,6 +728,41 @@ fn last_of_65536_groups_has_its_own_cache_key() {
         GroupHitBlocks::Attention(keys)
             if keys[..] == [Some(CacheKey::Grouped { group: u16::MAX, hash })]
     ));
+}
+
+#[test]
+fn state_group_at_the_last_position_is_found_inside_its_block() {
+    // 65,535 full-attention groups of block 16 form one spec, and a state
+    // group of block 32 at position 65,535 forms another. The hash block is
+    // 16, so a state hit below the block end 32 lies inside a block, and
+    // the lookup finds it only through the keys that the pool lists under
+    // the block's first hash for the state group's own position. The hit is
+    // the length that every spec accepts, as vLLM's hybrid lookup lowers it
+    // (v0.31.0 `coord:883-953`, v0.32.0 `coord:837-907`, v0.33.0
+    // `coord:847-917`). With a limit of 18 the attention spec hits 16 and
+    // the state spec hits only where its key sits, so the hit is 0 before
+    // the state key at 16 is cached and 16 after.
+    let mut groups = equal_groups(65_535);
+    groups.push(state("s", 32, true, false));
+    let coordinator = with_limits(rules(&groups, 16));
+    let mut kv = kv_pool(&groups, 70_000);
+    let pool = kv.block_pool_mut().unwrap();
+    let request = lease(32, 16);
+    let hash = request.prefix_hash_at(16).unwrap();
+    for group in 0..u16::MAX {
+        seed(pool, CacheKey::Grouped { group, hash });
+    }
+    assert_eq!(coordinator.find_longest_hit(pool, &request, 18).tokens, 0);
+    seed_inside(pool, &[u16::MAX], 16, 32, 16);
+    let hit = coordinator.find_longest_hit(pool, &request, 18);
+    assert_eq!(hit.tokens, 16);
+    assert_eq!(
+        hit.per_group[65_535],
+        GroupHitBlocks::State(Some(CacheKey::Grouped {
+            group: u16::MAX,
+            hash
+        }))
+    );
 }
 
 #[test]

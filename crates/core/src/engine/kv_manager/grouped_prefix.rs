@@ -128,8 +128,8 @@ pub(crate) struct GroupedPrefixRules {
     checkpoint: Option<CheckpointRule>,
 }
 
-/// The most groups of one grouped cache: `CacheKey::Grouped` holds the
-/// position of a group in a `u16`.
+/// The most groups of one grouped prefix cache: `CacheKey::Grouped` names a
+/// group by its position among all groups of the rank, in a `u16`.
 const MAX_CACHE_GROUPS: usize = 1 << u16::BITS;
 
 fn gcd(a: usize, b: usize) -> usize {
@@ -150,7 +150,10 @@ impl GroupedPrefixRules {
         version: VllmRuleVersion,
     ) -> anyhow::Result<Self> {
         ensure!(hash_block > 0, "prefix_match_unit must be positive");
-        // Byte mode has no cache key, so it takes any group count.
+        // The bound counts every group, also one that opts out of prefix
+        // caching: that group still takes a position, and a caching group
+        // after it must stay at a position that a key can name. Byte mode
+        // has no cache key, so it takes any group count.
         ensure!(
             groups.len() <= MAX_CACHE_GROUPS,
             "kv_cache_groups with enable_prefix_caching=true support at most {MAX_CACHE_GROUPS} groups; use fewer groups, or turn prefix caching off to replay them cold"
