@@ -1251,6 +1251,14 @@ def test_explicit_decode_points_prefill_their_suffixes_in_one_step(monkeypatch, 
         "above the token budget 3836"
     )
     assert [point.batch_size for point in build(2, scheduled=3838)._bench_grid] == [2]
+    # The input budget of a step starts at max_num_batched_tokens, so a larger max_num_scheduled_tokens cannot raise it.
+    with pytest.raises(ValueError) as refused:
+        build(2, budget=3836, scheduled=8192)
+    assert str(refused.value) == (
+        "GLM-5.3-Flash decode point of 2 requests at context 4096 needs 3838 suffix tokens in one step, "
+        "above the token budget 3836"
+    )
+    assert [point.batch_size for point in build(2, budget=3838, scheduled=8192)._bench_grid] == [2]
 
 
 def chunked_decode(module, tmp_path, batch_size, budget):
