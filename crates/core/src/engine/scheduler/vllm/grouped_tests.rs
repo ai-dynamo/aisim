@@ -381,7 +381,11 @@ fn grouped_resumed_request_takes_a_checkpoint_block_only_at_its_prefill_end() {
 
 #[test]
 fn grouped_window_replays_long_context_with_bounded_storage_and_logical_fpm_lengths() {
-    let mut core = core(vec![group("window", 4, 8, Some(4))], 24, 8);
+    // The whole sequence of the 32-token prompt is `min(cdiv(32, 4),
+    // cdiv(3 + 8, 4) + 1)` = 4 pages of 8 bytes (v0.33
+    // kv_cache_manager.py:531-548, kv_cache_interface.py:918-944), so the
+    // pool holds 32 bytes. The request itself holds at most 24.
+    let mut core = core(vec![group("window", 4, 8, Some(4))], 32, 8);
     let captured = Arc::new(CapturedDecodeQueries::default());
     core.args.perf_model = Arc::new(PerfModel::External {
         timing: captured.clone(),
@@ -404,7 +408,7 @@ fn grouped_window_replays_long_context_with_bounded_storage_and_logical_fpm_leng
         }
         bytes.push(pass.mocker_metrics.kv_cache_used_bytes.unwrap());
         assert_eq!(pass.mocker_metrics.total_blocks, 0);
-        assert_eq!(pass.mocker_metrics.kv_cache_capacity_bytes, Some(24));
+        assert_eq!(pass.mocker_metrics.kv_cache_capacity_bytes, Some(32));
         assert!(pass.mocker_metrics.physical_gpu_cache_usage_perc <= 1.0);
         assert_eq!(pass.mocker_metrics.vllm_preemptions_total, 0);
         for output in pass.output_signals {
@@ -521,9 +525,14 @@ fn grouped_waiting_request_cannot_preempt_running_work() {
 }
 
 #[test]
-fn grouped_oversized_chunk_fails_without_partial_allocation_or_endless_preemption() {
-    let mut core = core(vec![group("window", 4, 4, Some(4))], 8, 8);
-    let id = submit(&mut core, 107, 16, 2);
+fn grouped_oversized_decode_step_fails_without_partial_allocation_or_endless_preemption() {
+    // The whole sequence of the 8-token prompt is `cdiv(8, 4)` = 2 pages of
+    // 4 bytes, so it fits the 8-byte pool and is admitted (v0.33
+    // kv_cache_manager.py:531-548). A request whose whole sequence fits can
+    // outgrow the pool only in decode: the step from 8 to 9 tokens needs
+    // `cdiv(9, 4)` = 3 pages, 12 bytes.
+    let mut core = core(vec![group("full", 4, 4, None)], 8, 8);
+    let id = submit(&mut core, 107, 8, 3);
     let mut trace = TraceCollector::default();
     core.execute_pass(&mut trace, 0.0);
     assert_eq!(core.mocker_metrics().kv_cache_used_bytes, Some(8));
@@ -563,27 +572,181 @@ fn grouped_state_blocks_exceeding_the_pool_reject_at_admission() {
 }
 
 #[test]
-fn grouped_oversized_chunk_names_the_fixed_state_bytes() {
-    let mut core = core(
-        vec![group("window", 4, 4, Some(4)), state("kda", 2, 1)],
-        9,
-        8,
-    );
-    submit(&mut core, 116, 16, 2);
+fn grouped_oversized_decode_step_names_the_fixed_state_bytes() {
+    let mut core = core(vec![group("full", 4, 4, None), state("kda", 2, 1)], 10, 8);
+    submit(&mut core, 116, 8, 3);
     let mut trace = TraceCollector::default();
-    // The one-token forward needs one 4-byte window page and the 2-byte state
-    // block, 6 bytes, so admission passes. The first chunk of 8 tokens needs
-    // two window pages (8 bytes) and the state block, 10 bytes, above the pool.
+    // The whole sequence of the 8-token prompt is two 4-byte pages and the
+    // 2-byte state block, 10 bytes, so admission passes (v0.33
+    // kv_cache_manager.py:531-548). The decode step from 8 to 9 tokens needs
+    // three pages (12 bytes) and the state block, 14 bytes, above the pool.
+    core.execute_pass(&mut trace, 0.0);
     let error = core
-        .try_execute_pass(&mut trace, 0.0)
+        .try_execute_pass(&mut trace, 1.0)
         .unwrap_err()
         .to_string();
-    assert!(error.contains("needs 10 bytes for 8 scheduled tokens after 0 computed tokens"));
-    assert!(error.contains("exceeding the entire 9-byte cache pool"));
+    assert!(error.contains("needs 14 bytes for 1 scheduled tokens after 8 computed tokens"));
+    assert!(error.contains("exceeding the entire 10-byte cache pool"));
     assert!(error.contains("the fixed state blocks of one request take 2 bytes"));
     assert!(error.contains("reduce max_num_batched_tokens"));
     // The sentence comes before the remedy.
     assert!(error.contains("2 bytes of this pool; reduce max_num_batched_tokens"));
+}
+
+/// The uuids that `pass` admits.
+fn admitted(pass: &crate::engine::scheduler::EnginePassResult) -> Vec<Uuid> {
+    pass.admissions
+        .iter()
+        .map(|admission| admission.uuid)
+        .collect()
+}
+
+#[test]
+fn grouped_byte_mode_admits_a_waiting_request_only_when_its_whole_sequence_fits() {
+    // vLLM admits a waiting request only when the blocks of its whole
+    // sequence fit the free blocks (v0.33 kv_cache_manager.py:531-548,
+    // scheduler.py:1449-1454). A full-attention group of 4-token blocks of 4
+    // bytes in a 24-byte pool. The second request needs `cdiv(16, 4) * 4` =
+    // 16 bytes. Pass 0: the first takes the budget (8 bytes). Pass 1: the
+    // first holds `cdiv(9, 4) * 4` = 12 bytes, and 16 > 24 - 12, so the
+    // second waits, though its first chunk of 7 tokens (8 bytes) would fit.
+    // Pass 2: the first ends with its third output. Pass 3: 16 <= 24.
+    let mut core = core(vec![group("full", 4, 4, None)], 24, 8);
+    submit(&mut core, 120, 8, 3);
+    let second = submit(&mut core, 121, 16, 1);
+    let mut trace = TraceCollector::default();
+    let mut admissions = Vec::new();
+    for pass in 0..4 {
+        let result = core.execute_pass(&mut trace, pass as f64);
+        if admitted(&result).contains(&second) {
+            admissions.push(pass);
+        }
+        assert_eq!(result.mocker_metrics.vllm_preemptions_total, 0);
+        if pass < 3 {
+            assert_eq!(core.state.requests[&second].num_computed_tokens, 0);
+        }
+    }
+    assert_eq!(admissions, [3]);
+}
+
+#[test]
+fn grouped_byte_mode_caps_the_whole_sequence_of_a_window_group() {
+    // The whole-sequence count of a window group takes vLLM's admission cap
+    // (v0.33 single_type_kv_cache_manager.py:214-227): `cdiv(min(window - 1
+    // + max_in_flight_tokens, max_model_len), B) + 1` blocks
+    // (kv_cache_interface.py:918-944), where `max_in_flight_tokens` is
+    // `max_concurrent_batches * max_num_batched_tokens`. Window 4, 4-token
+    // blocks of 8 bytes, chunk 8, a prompt of 64 tokens: `cdiv(64, 4)` = 16
+    // blocks, capped at `cdiv(3 + 8, 4) + 1` = 4 blocks (32 bytes) with one
+    // batch and at `cdiv(3 + 16, 4) + 1` = 6 blocks (48 bytes) with two. A
+    // pool of one byte less refuses the request: 32 > 31 and 48 > 47.
+    for (capacity, batches, admits) in [
+        (31, 1, false),
+        (32, 1, true),
+        (32, 2, false),
+        (47, 2, false),
+        (48, 2, true),
+    ] {
+        let label = format!("{capacity} {batches}");
+        let mut args = core(vec![group("window", 4, 8, Some(4))], capacity, 8).args;
+        args.max_concurrent_batches = batches;
+        let mut core = VllmCore::new(args);
+        let id = submit(&mut core, 122, 64, 1);
+        let mut trace = TraceCollector::default();
+        let pass = core.execute_pass(&mut trace, 0.0);
+        let rejected = pass
+            .output_signals
+            .iter()
+            .any(|output| output.uuid == id && output.rejected);
+        assert_eq!(admitted(&pass) == [id], admits, "{label}");
+        assert_eq!(rejected, !admits, "{label}");
+    }
+}
+
+#[test]
+fn grouped_byte_mode_counts_every_block_without_a_token_budget() {
+    // Without a token budget `max_in_flight_tokens` has no bound, so the cap
+    // of the window group does not bind (v0.33
+    // kv_cache_interface.py:937-944): a prompt of 64 tokens counts
+    // `cdiv(64, 4)` = 16 blocks of 8 bytes, 128 bytes.
+    for (capacity, admits) in [(127, false), (128, true)] {
+        let mut args = core(vec![group("window", 4, 8, Some(4))], capacity, 8).args;
+        args.max_num_batched_tokens = None;
+        let mut core = VllmCore::new(args);
+        let id = submit(&mut core, 123, 64, 1);
+        let mut trace = TraceCollector::default();
+        let pass = core.execute_pass(&mut trace, 0.0);
+        let rejected = pass
+            .output_signals
+            .iter()
+            .any(|output| output.uuid == id && output.rejected);
+        assert_eq!(admitted(&pass) == [id], admits, "{capacity}");
+        assert_eq!(rejected, !admits, "{capacity}");
+    }
+}
+
+#[test]
+fn grouped_byte_mode_rejects_a_request_whose_whole_sequence_exceeds_the_pool() {
+    // Window 4, 4-token blocks of 4 bytes, chunk 8, an 8-byte pool. A prompt
+    // of 16 tokens counts `min(cdiv(16, 4), cdiv(3 + 8, 4) + 1)` = 4 blocks
+    // (v0.33 kv_cache_manager.py:531-548,
+    // single_type_kv_cache_manager.py:214-227), 16 bytes > 8. It never fits,
+    // so it is rejected in its first pass and never runs.
+    let mut alone = core(vec![group("window", 4, 4, Some(4))], 8, 8);
+    let id = submit(&mut alone, 124, 16, 2);
+    let mut trace = TraceCollector::default();
+    let pass = alone.execute_pass(&mut trace, 0.0);
+    assert!(pass.admissions.is_empty());
+    assert!(
+        pass.output_signals
+            .iter()
+            .any(|output| output.uuid == id && output.rejected)
+    );
+    assert_eq!(pass.mocker_metrics.kv_cache_used_bytes, Some(0));
+    assert_eq!(pass.mocker_metrics.vllm_preemptions_total, 0);
+
+    // The rejection comes before the wait for token budget. A (8 tokens,
+    // `min(2, 4)` = 2 blocks, 8 bytes) takes the whole budget of 8 tokens,
+    // and B is rejected in the same pass.
+    let mut ordered = core(vec![group("window", 4, 4, Some(4))], 8, 8);
+    let first = submit(&mut ordered, 125, 8, 2);
+    let second = submit(&mut ordered, 126, 16, 2);
+    let pass = ordered.execute_pass(&mut trace, 0.0);
+    assert_eq!(admitted(&pass), [first]);
+    assert!(
+        pass.output_signals
+            .iter()
+            .any(|output| output.uuid == second && output.rejected)
+    );
+}
+
+#[test]
+fn grouped_byte_mode_counts_the_output_tokens_of_a_resumed_request() {
+    // vLLM counts `request.num_tokens`, the output tokens included, in its
+    // whole-sequence test (v0.33 kv_cache_manager.py:533). A full-attention
+    // group of 4-token blocks of 4 bytes in a 20-byte pool, chunk 8. A and B
+    // have 8 tokens and 6 outputs each.
+    // Pass 0: A takes the budget (8 bytes). Pass 1: A 8 to 9 (12 bytes), B
+    // enters (8 <= 20 - 12) and computes 7 tokens (8 bytes). Pass 2: A 9 to
+    // 10, B 7 to 8 and its first output. Pass 3: A 10 to 11, B 8 to 9 needs
+    // 12 bytes, 24 > 20, so B preempts itself. Pass 4: B's 9 tokens need 12
+    // bytes > 20 - 12, so B waits, though its prompt (8 bytes) fits. Pass 5:
+    // A holds 16 bytes and ends with its sixth output. Pass 6: 12 <= 20.
+    let mut core = core(vec![group("full", 4, 4, None)], 20, 8);
+    submit(&mut core, 127, 8, 6);
+    let second = submit(&mut core, 128, 8, 6);
+    let mut trace = TraceCollector::default();
+    let mut admissions = Vec::new();
+    let mut preemptions = 0;
+    for pass in 0..7 {
+        let result = core.execute_pass(&mut trace, pass as f64);
+        if admitted(&result).contains(&second) {
+            admissions.push(pass);
+        }
+        preemptions = result.mocker_metrics.vllm_preemptions_total;
+    }
+    assert_eq!(admissions, [1, 6]);
+    assert_eq!(preemptions, 1);
 }
 
 #[test]
@@ -1767,7 +1930,7 @@ fn grouped_hybrid_destination_preempted_after_activation_recomputes_its_prompt()
 }
 
 #[test]
-fn grouped_decode_rank_readmits_a_held_request_when_the_bytes_in_use_fall_at_one_time() {
+fn grouped_decode_rank_admits_a_waiting_request_when_the_bytes_in_use_fall_at_one_time() {
     // A decode rank of 700 bytes in byte mode, with a budget of 4 tokens, a
     // full-attention group of 4-token blocks of 100 bytes and a group with a
     // window of 5 tokens and 2-token blocks of 1 byte. A destination of 10
@@ -1789,21 +1952,19 @@ fn grouped_decode_rank_readmits_a_held_request_when_the_bytes_in_use_fall_at_one
         Some(3)
     );
     assert_eq!(usage(&core), (302, 5));
-    // A local prompt of 13 tokens computes 4 tokens in each pass, at 0 ms.
-    // Its last token needs 4 full blocks and the window blocks 4 to 6, 403
-    // bytes, and 398 are free. So it preempts itself in pass 4, is admitted
-    // again in pass 5 and preempts itself in pass 8 with the same pool. From
-    // pass 9 on it waits.
+    // A local prompt of 13 tokens, with a budget of 4 tokens at 0 ms. Its
+    // whole sequence needs `cdiv(13, 4)` = 4 full blocks and `min(cdiv(13,
+    // 2), cdiv(5 - 1 + 4, 2) + 1)` = 5 window blocks: 405 bytes (v0.33
+    // kv_cache_manager.py:531-548, kv_cache_interface.py:918-944), and 398
+    // are free. So it waits and runs nothing.
     let local = submit(&mut core, 1639, 13, 1);
     let mut trace = TraceCollector::default();
-    let mut admissions = Vec::new();
     for pass in 1..=12 {
         let result = core.execute_pass(&mut trace, 0.0);
         assert_eq!(result.end_ms, 0.0, "pass {pass}");
-        admissions.extend(result.admissions.iter().map(|_| pass));
+        assert!(result.admissions.is_empty(), "pass {pass}");
     }
-    assert_eq!(admissions, [1, 5]);
-    assert_eq!(core.mocker_metrics().vllm_preemptions_total, 2);
+    assert_eq!(core.mocker_metrics().vllm_preemptions_total, 0);
     assert_eq!(usage(&core), (302, 5));
     // The destination is cancelled, and a destination of 7 tokens is
     // reserved at the same time. It holds 2 full blocks and the window
@@ -1834,13 +1995,13 @@ fn grouped_decode_rank_readmits_a_held_request_when_the_bytes_in_use_fall_at_one
         .map(|_| core.execute_pass(&mut trace, 0.0).output_signals.len())
         .collect();
     assert_eq!(outputs, [0, 0, 1]);
-    assert_eq!(core.mocker_metrics().vllm_preemptions_total, 2);
+    assert_eq!(core.mocker_metrics().vllm_preemptions_total, 0);
     assert!(core.state.requests.is_empty());
     assert_eq!(usage(&core), (203, 5));
 }
 
 #[test]
-fn grouped_decode_rank_readmits_a_held_request_when_a_load_activates_at_that_time() {
+fn grouped_decode_rank_keeps_a_local_prompt_waiting_for_its_whole_sequence_while_a_load_runs() {
     // A decode rank of 627 bytes in byte mode with a budget of 7 tokens: a
     // full-attention group of 4-token blocks of 100 bytes, a group with a
     // window of 5 tokens and 2-token blocks of 1 byte, and a state group of
@@ -1869,40 +2030,43 @@ fn grouped_decode_rank_readmits_a_held_request_when_a_load_activates_at_that_tim
         Some(2)
     );
     assert_eq!(usage(&core), (213, 6));
-    // A local prompt of 13 tokens computes 7 tokens in pass 1. Its other 6
-    // tokens need 4 full blocks, the window blocks 1 to 6 and the state
-    // block: 416 bytes. So it preempts itself in pass 2 and, with the same
-    // pool, in pass 4, and then it waits.
+    // A local prompt of 13 tokens. Its whole sequence needs `cdiv(13, 4)` = 4
+    // full blocks, `min(cdiv(13, 2), cdiv(5 - 1 + 7, 2) + 1)` = 7 window
+    // blocks and the state block: 417 bytes (v0.33
+    // kv_cache_manager.py:531-548, kv_cache_interface.py:918-944), and 414
+    // are free. So it waits. Without the state block it would fit.
     let local = submit(&mut core, 1644, 13, 1);
     let mut trace = TraceCollector::default();
-    let mut admissions = Vec::new();
     for pass in 1..=6 {
         let result = core.execute_pass(&mut trace, 0.0);
-        admissions.extend(result.admissions.iter().map(|_| pass));
+        assert!(result.admissions.is_empty(), "pass {pass}");
     }
-    assert_eq!(admissions, [1, 3]);
-    assert_eq!(core.mocker_metrics().vllm_preemptions_total, 2);
-    // The destination activates at the same time. Its first pass computes
-    // its sixth token inside the blocks that it holds, so the pool stays as
-    // it is. It runs before the local prompt and takes 1 token of the
-    // budget. The prompt then computes 6 tokens in a pass, which need 213
-    // and 315 bytes, and its last token needs 4 full blocks, the window
-    // blocks 4 to 6 and the state block: 413 bytes. So the prompt fits now.
-    // The pass of the activation admits it, and its third pass ends it.
+    assert_eq!(core.mocker_metrics().vllm_preemptions_total, 0);
+    // The destination activates at the same time and enters. It holds 213
+    // bytes, then 313 from 9 tokens and 413 at 13 tokens, so the local
+    // prompt keeps waiting. The load ends with its eighth output in its
+    // eighth pass.
     activate(&mut core, handoff_id);
     assert_eq!(usage(&core), (213, 6));
     let result = core.execute_pass(&mut trace, 0.0);
-    assert_eq!(
-        result
-            .admissions
-            .iter()
-            .map(|admission| admission.uuid)
-            .collect::<Vec<_>>(),
-        [load, local]
-    );
-    assert_eq!(usage(&core), (426, 12));
-    core.execute_pass(&mut trace, 0.0);
-    assert_eq!(usage(&core), (528, 15));
+    assert_eq!(admitted(&result), [load]);
+    assert_eq!(usage(&core), (213, 6));
+    for pass in 1..=7 {
+        let result = core.execute_pass(&mut trace, 0.0);
+        assert!(result.admissions.is_empty(), "pass {pass}");
+        assert_eq!(
+            result
+                .output_signals
+                .iter()
+                .any(|output| output.uuid == load && output.completed),
+            pass == 7,
+            "pass {pass}"
+        );
+    }
+    // Then 417 of 627 bytes fit. The local prompt computes 7 tokens and then
+    // its last 6, and ends.
+    let result = core.execute_pass(&mut trace, 0.0);
+    assert_eq!(admitted(&result), [local]);
     let result = core.execute_pass(&mut trace, 0.0);
     assert_eq!(
         result
@@ -1910,10 +2074,10 @@ fn grouped_decode_rank_readmits_a_held_request_when_a_load_activates_at_that_tim
             .iter()
             .map(|output| (output.uuid, output.completed))
             .collect::<Vec<_>>(),
-        [(load, false), (local, true)]
+        [(local, true)]
     );
-    assert_eq!(core.mocker_metrics().vllm_preemptions_total, 2);
-    assert_eq!(usage(&core), (213, 6));
+    assert_eq!(core.mocker_metrics().vllm_preemptions_total, 0);
+    assert_eq!(usage(&core), (0, 0));
 }
 
 /// Price every pass of `core` at 0 ms.
@@ -1957,18 +2121,17 @@ fn admitting_passes_at_0_ms(core: &mut VllmCore, passes: usize) -> Vec<usize> {
 }
 
 #[test]
-fn grouped_prefill_rank_readmits_a_held_request_when_a_held_source_leaves_at_that_time() {
+fn grouped_prefill_rank_admits_a_waiting_source_when_a_held_source_leaves_at_that_time() {
     for cancel in [false, true] {
         let (mut core, blocker) = byte_mode_prefill_rank_with_a_held_source();
         let usage = |core: &VllmCore| {
             let pool = grouped_pool(core);
             (pool.used_bytes(), pool.active_blocks())
         };
-        // A second source of 13 tokens computes 4 of its 12 tokens in each
-        // pass: 110 and 210 bytes. Its last 4 tokens need 3 full blocks and
-        // the state block, 310 bytes, and 290 are free. So it preempts
-        // itself in pass 3, is admitted again in pass 4 and preempts itself
-        // in pass 6 with the same pool. From pass 7 on it waits.
+        // A second source of 13 tokens computes 12 tokens. Its whole
+        // sequence needs 3 full blocks and the state block, 310 bytes (v0.33
+        // kv_cache_manager.py:531-548), and 290 are free. So it waits and
+        // runs nothing.
         let waiting = HandoffId::new(Uuid::from_u128(1648));
         let second = Uuid::from_u128(1647);
         core.apply_command(SchedulerCommand::SubmitHandoffPrefill {
@@ -1976,8 +2139,11 @@ fn grouped_prefill_rank_readmits_a_held_request_when_a_held_source_leaves_at_tha
             request: source_request(1647, 13),
         })
         .unwrap();
-        assert_eq!(admitting_passes_at_0_ms(&mut core, 10), [1, 4], "{cancel}");
-        assert_eq!(core.mocker_metrics().vllm_preemptions_total, 2);
+        assert!(
+            admitting_passes_at_0_ms(&mut core, 10).is_empty(),
+            "{cancel}"
+        );
+        assert_eq!(core.mocker_metrics().vllm_preemptions_total, 0);
         assert_eq!(usage(&core), (210, 3));
         // The held source is released or cancelled at the same time, so the
         // 500 bytes are free. The next pass at that time admits the second
@@ -2009,13 +2175,13 @@ fn grouped_prefill_rank_readmits_a_held_request_when_a_held_source_leaves_at_tha
         assert!(!core.source_is_held(waiting));
         core.execute_pass(&mut trace, 0.0);
         assert!(core.source_is_held(waiting), "{cancel}");
-        assert_eq!(core.mocker_metrics().vllm_preemptions_total, 2);
+        assert_eq!(core.mocker_metrics().vllm_preemptions_total, 0);
         assert_eq!(usage(&core), (310, 4));
     }
 }
 
 #[test]
-fn grouped_prefill_rank_keeps_the_request_behind_a_held_request_waiting() {
+fn grouped_prefill_rank_keeps_the_request_behind_a_waiting_request_waiting() {
     // The rank and the second source of the test above, and behind it a
     // third source of 5 tokens, whose 4 computed tokens need 110 bytes.
     let (mut core, blocker) = byte_mode_prefill_rank_with_a_held_source();
@@ -2038,17 +2204,17 @@ fn grouped_prefill_rank_keeps_the_request_behind_a_held_request_waiting() {
         })
         .unwrap();
     }
-    // Each pass in which the second source runs gives it the whole budget,
-    // and a pass that preempts admits no request. From pass 7 on the second
-    // source waits at the head of the queue. The hold stops the waiting
-    // loop, as on a decode rank, so the third source waits too, while its
-    // 110 bytes fit the 290 free bytes and the budget is free.
-    assert_eq!(admitting_passes_at_0_ms(&mut core, 10), [1, 4]);
-    assert_eq!(core.mocker_metrics().vllm_preemptions_total, 2);
+    // The second source waits at the head of the queue: its whole sequence
+    // needs 310 bytes and 290 are free. vLLM stops its waiting loop at the
+    // request that it refuses (v0.33 scheduler.py:1449-1461), so the third
+    // source waits too, while its 110 bytes fit the 290 free bytes and the
+    // budget is free.
+    assert!(admitting_passes_at_0_ms(&mut core, 10).is_empty());
+    assert_eq!(core.mocker_metrics().vllm_preemptions_total, 0);
     assert_eq!(usage(&core), (210, 3));
     assert_eq!(
         [second, third].map(|uuid| core.state.requests[&uuid].status),
-        [RequestStatus::Preempted, RequestStatus::Waiting]
+        [RequestStatus::Waiting, RequestStatus::Waiting]
     );
     // The held source is released at the same time. The second source runs
     // in the next three passes and is held with 310 bytes. The fourth pass
@@ -2071,7 +2237,7 @@ fn grouped_prefill_rank_keeps_the_request_behind_a_held_request_waiting() {
     }
     assert_eq!(admissions, [vec![second], vec![], vec![], vec![third]]);
     assert!(core.source_is_held(waiting) && core.source_is_held(behind));
-    assert_eq!(core.mocker_metrics().vllm_preemptions_total, 2);
+    assert_eq!(core.mocker_metrics().vllm_preemptions_total, 0);
     assert_eq!(usage(&core), (420, 6));
 }
 
@@ -4361,10 +4527,14 @@ fn grouped_state_bytes_stay_constant_while_window_pages_expire() {
         assert_eq!(core.kv_manager.num_active_blocks(), 0);
         bytes
     };
-    let without = run(vec![group("window", 4, 8, Some(4))], 24);
+    // The whole sequence of the 32-token prompt is `min(cdiv(32, 4),
+    // cdiv(3 + 8, 4) + 1)` = 4 window pages of 8 bytes (v0.33
+    // kv_cache_manager.py:531-548, kv_cache_interface.py:918-944), so the
+    // pools hold 32 bytes and 32 + 2 * 10 = 52 bytes.
+    let without = run(vec![group("window", 4, 8, Some(4))], 32);
     let with = run(
         vec![group("window", 4, 8, Some(4)), state("kda", 10, 2)],
-        44,
+        52,
     );
     // Window pages expire as the decode moves on (24 to 16 bytes), while the
     // two state blocks add a constant 20 bytes. The last pass completes the
@@ -4674,11 +4844,16 @@ fn grouped_prefix_admission_tests_the_whole_prompt() {
         assert_eq!(pass.mocker_metrics.vllm_preemptions_total, 0);
         assert_eq!(core.state.requests[&waiting].num_computed_tokens, 0);
     }
-    // Prefix caching off keeps the first-chunk test of byte mode. The first
-    // pass spends its budget on the running request. In the second pass the
-    // running request takes its last 4,808 tokens (6 G0 pages, the ring and
-    // the states: 11 pages) and the waiting request's first chunk of the
-    // 3,384 tokens left (2 pages, the ring and the states: 7 pages) fits.
+    // Prefix caching off tests the whole prompt too, in bytes (v0.33
+    // kv_cache_manager.py:531-548). The first pass spends its budget on the
+    // running request. In the second pass the running request takes its last
+    // 4,808 tokens (6 G0 pages, the ring and the states: 11 pages), so 19
+    // pages are free. The waiting request needs 19 G0 pages, the ring and the
+    // states: 24 pages. It waits, though its first chunk of the 3,384 tokens
+    // left (7 pages) fits, and though its G0 pages alone fit. The running
+    // request ends in the third pass. The fourth pass admits the waiting
+    // request with a first chunk of 8,192 tokens (4 G0 pages, the ring and
+    // the states: 9 pages).
     let mut off = core(glm_groups(false), 30 * GLM_PAGE, 8192);
     let running = submit(&mut off, 605, 13_000, 2);
     let waiting = submit_tokens(&mut off, 606, (100_000..140_000).collect(), 2);
@@ -4687,9 +4862,15 @@ fn grouped_prefix_admission_tests_the_whole_prompt() {
     assert_eq!(pass.admissions.len(), 1);
     assert_eq!(pass.admissions[0].uuid, running);
     let pass = off.execute_pass(&mut trace, 1.0);
-    assert_eq!(pass.admissions.len(), 1);
-    assert_eq!(pass.admissions[0].uuid, waiting);
-    assert_eq!(pass.mocker_metrics.kv_cache_used_bytes, Some(18 * GLM_PAGE));
+    assert!(pass.admissions.is_empty());
+    assert_eq!(pass.mocker_metrics.kv_cache_used_bytes, Some(11 * GLM_PAGE));
+    assert_eq!(off.state.requests[&waiting].num_computed_tokens, 0);
+    let pass = off.execute_pass(&mut trace, 2.0);
+    assert!(pass.admissions.is_empty());
+    let pass = off.execute_pass(&mut trace, 3.0);
+    assert_eq!(admitted(&pass), [waiting]);
+    assert_eq!(pass.mocker_metrics.kv_cache_used_bytes, Some(9 * GLM_PAGE));
+    assert_eq!(pass.mocker_metrics.vllm_preemptions_total, 0);
     // Byte mode also refuses a final forward that can never fit, as
     // grouped_state_blocks_exceeding_the_pool_reject_at_admission shows: the
     // 40,000-token prompt's last forward needs 24 pages of a 20-page pool.

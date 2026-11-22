@@ -113,12 +113,18 @@ impl G1Manager {
         self.inner.grouped_prefix_rules()
     }
 
-    pub(crate) fn set_grouped_transfer_rules(
-        &mut self,
-        rules: GroupedTransferRules,
-        limits: AdmissionLimits,
-    ) {
-        self.inner.set_grouped_transfer_rules(rules, limits);
+    pub(crate) fn set_grouped_admission_limits(&mut self, limits: AdmissionLimits) {
+        self.inner.set_grouped_admission_limits(limits);
+    }
+
+    pub(crate) fn set_grouped_transfer_rules(&mut self, rules: GroupedTransferRules) {
+        self.inner.set_grouped_transfer_rules(rules);
+    }
+
+    /// The bytes of the whole sequence of `tokens` tokens in a byte-mode
+    /// pool, admission cap and state blocks included.
+    pub(crate) fn grouped_whole_sequence_bytes(&self, tokens: usize) -> u64 {
+        self.inner.grouped_whole_sequence_bytes(tokens)
     }
 
     /// The transfer rules of a grouped cache on a prefill or decode rank.

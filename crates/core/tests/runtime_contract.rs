@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project.
-// Some tests of a modified Rust simulation of the vLLM v0.32.0
-// (5df63a7203cdb9328d824a27b682e77c7b9928be) grouped KV rules.
+// Some tests of a modified Rust simulation of the vLLM v0.31.0
+// (db9527a46873454610df6dbedf79a36d6bf1a7f6), v0.32.0
+// (5df63a7203cdb9328d824a27b682e77c7b9928be) and v0.33.0
+// (4ba787ec9959e566d3b587a796dff07673324da5) grouped KV rules.
 // Immutable sources and license: THIRD_PARTY_NOTICES.md.
 
 use std::cell::RefCell;
@@ -1195,21 +1197,19 @@ fn grouped_decode_rank_readmits_a_request_that_made_progress_at_one_time() {
 }
 
 #[test]
-fn grouped_prefill_rank_waits_for_a_transfer_end_after_a_repeated_self_preemption() {
+fn grouped_prefill_rank_in_byte_mode_waits_for_its_whole_sequence_until_a_transfer_ends() {
     // Two distinct prompts of 33 and 49 tokens with 2 output tokens each, in
     // byte mode, with prefill passes priced at 0 ms, a 16-token budget, a
     // prefill pool of 6 pages, a decode pool of 32 pages and handoffs at
     // 1e-5 GB/s, 10 bytes per ms. The prefill rank computes 32 and 48
     // tokens. It holds q0 at 0 ms with 2 attention pages and the state page,
-    // and the transfer of these 300 bytes ends at 30 ms. q1 computes 16 and
-    // 32 tokens in 3 pages. Its last chunk needs a fourth page, so q1
-    // preempts itself, and its readmission tests only the first chunk, which
-    // fits. With a prefill pass of 0 ms that turn repeats at 0 ms. After the
-    // second self-preemption with the same pool, replay lets q1 wait for
-    // the next event, the release of q0 at 30 ms. Then q1 computes its 48
-    // tokens and is held. The decode rank runs q0 from 30 ms and reserves q1
-    // when that pass ends, at 32 ms, so the 400 bytes of q1 arrive at 72 ms.
-    // Each request emits its 2 outputs in the two decode passes after its
+    // and the transfer of these 300 bytes ends at 30 ms. The whole sequence
+    // of q1 needs `cdiv(48, 16)` = 3 attention pages and the state page, 400
+    // bytes (v0.31 kv_cache_manager.py:519-536), and 300 are free. So q1
+    // waits from 0 ms until the release of q0 at 30 ms. Then q1 computes its
+    // 48 tokens and is held. The decode rank runs q0 from 30 ms and reserves
+    // q1 when that pass ends, at 32 ms, so the 400 bytes of q1 arrive at 72
+    // ms. Each request emits its 2 outputs in the two decode passes after its
     // activation.
     for async_scheduling in [true, false] {
         let requests = distinct_requests(&[(33, 2, 0.0), (49, 2, 0.0)]);
@@ -1235,7 +1235,7 @@ fn grouped_prefill_rank_waits_for_a_transfer_end_after_a_repeated_self_preemptio
             .filter(|admission| admission.pool == ReplayRequestPool::Prefill)
             .map(|admission| admission.at_ms)
             .collect();
-        assert_eq!(prefill_admissions, [0.0, 0.0, 30.0], "{async_scheduling}");
+        assert_eq!(prefill_admissions, [30.0], "{async_scheduling}");
         assert_eq!(
             (q0.source_held_ms, q0.source_released_ms, q1.source_held_ms),
             (Some(0.0), Some(30.0), Some(30.0)),
@@ -1244,6 +1244,52 @@ fn grouped_prefill_rank_waits_for_a_transfer_end_after_a_repeated_self_preemptio
         assert_eq!(
             [q0, q1].map(|record| (record.destination_activated_ms, record.terminal_time_ms)),
             [(Some(30.0), 34.0), (Some(72.0), 76.0)],
+            "{async_scheduling}"
+        );
+    }
+}
+
+#[test]
+fn grouped_aggregated_rank_in_byte_mode_rejects_a_request_whose_whole_sequence_exceeds_the_pool() {
+    // An aggregated rank in byte mode with one window group: window 4,
+    // 4-token blocks of 4 bytes, a 12-byte pool and a budget of 8 tokens per
+    // pass. The whole sequence of the 16-token prompt counts
+    // `min(cdiv(16, 4), cap)` = 4 blocks, 16 bytes > 12. The cap is
+    // `cdiv(3 + 8, 4) + 1` = 4 blocks with one batch and `cdiv(3 + 16, 4) +
+    // 1` = 6 with two (v0.33 kv_cache_manager.py:531-548,
+    // single_type_kv_cache_manager.py:214-227,
+    // kv_cache_interface.py:918-944). Its last forward alone needs one
+    // block, so only the whole-sequence test refuses it. vLLM's first test
+    // never admits such a request, and replay rejects it in its first pass.
+    // Each 4-token request holds 2 blocks at most, 8 bytes, and completes:
+    // the first beside the rejected request, the last after it.
+    for async_scheduling in [true, false] {
+        let requests = vec![
+            request("first", 0.0, 4, 2),
+            request("long", 0.0, 16, 1),
+            request("last", 100.0, 4, 2),
+        ];
+        let mut spec = aggregated_spec(Backend::Vllm, 1, 0.0, requests);
+        let rank = &mut spec.engine["rank"];
+        rank["enable_prefix_caching"] = false.into();
+        rank["max_num_batched_tokens"] = 8.into();
+        rank["kv_cache_capacity_bytes"] = 12.into();
+        rank["async_scheduling"] = async_scheduling.into();
+        rank["kv_cache_groups"] = serde_json::json!([
+            {"name":"window", "kind":"attention", "num_layers":1, "block_size_tokens":4, "page_size_bytes":4, "sliding_window":4}
+        ]);
+        let report = run_within_60_s(spec);
+        assert_eq!(
+            report.request_counts.completed_requests, 2,
+            "{async_scheduling}"
+        );
+        assert_eq!(
+            ["first", "long", "last"].map(|id| record(&report, id).terminal_status),
+            [
+                aisim_core::replay::ReplayTerminalStatus::Completed,
+                aisim_core::replay::ReplayTerminalStatus::Rejected,
+                aisim_core::replay::ReplayTerminalStatus::Completed,
+            ],
             "{async_scheduling}"
         );
     }

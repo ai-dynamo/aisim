@@ -3,8 +3,9 @@
 // Copyright contributors to the vLLM project.
 // Modified Rust simulation of vLLM b3563fc65ae0f5359802593d78e7ea097e1fed31
 // scheduling contracts and of the v0.31.0
-// (db9527a46873454610df6dbedf79a36d6bf1a7f6) and v0.32.0
-// (5df63a7203cdb9328d824a27b682e77c7b9928be) grouped KV rules;
+// (db9527a46873454610df6dbedf79a36d6bf1a7f6), v0.32.0
+// (5df63a7203cdb9328d824a27b682e77c7b9928be) and v0.33.0
+// (4ba787ec9959e566d3b587a796dff07673324da5) grouped KV rules;
 // immutable sources and license: THIRD_PARTY_NOTICES.md.
 // MTP slot/admission rules additionally adapted from vLLM v0.32.0, commit
 // 5df63a7203cdb9328d824a27b682e77c7b9928be, vllm/v1/core/sched/scheduler.py
@@ -164,12 +165,14 @@ pub(super) enum AdmissionDecision {
     Reject,
 }
 
-/// Grouped admission. In byte mode (prefix caching off) the pending
-/// forward's physical bytes decide, and logical prompt length remains
-/// independent of bounded cache residency. With `whole_prompt` (prefix
-/// caching on) the blocks of the whole prompt decide, as vLLM's
-/// `allocate_slots` does by default (`mgr:519-536`). Only a prompt whose
-/// blocks do not fit the empty pool is rejected.
+/// Grouped admission. Both modes follow the first test of vLLM's
+/// `allocate_slots`, on by default, which admits a request only when its
+/// whole sequence fits (v0.31 `mgr:519-536`, v0.32 `mgr:522-539`, v0.33
+/// `mgr:531-548`). With `whole_prompt` (prefix caching on) the blocks of the
+/// whole prompt decide. In byte mode (prefix caching off) the bytes of the
+/// whole sequence decide, counted with the admission cap of a window group
+/// and the fixed blocks of the state groups. Only a request that does not
+/// fit the empty pool is rejected.
 pub(super) fn decide_grouped_waiting_admission<S: PolicySequence>(
     sequence: &S,
     kv_manager: &G1Manager,
@@ -218,14 +221,27 @@ pub(super) fn decide_grouped_waiting_admission<S: PolicySequence>(
     if minimum.is_none_or(|bytes| bytes > pool.capacity_bytes()) {
         return Some(AdmissionDecision::Reject);
     }
+    // vLLM's first test counts the blocks of the whole sequence, the output
+    // tokens of a resumed request included (v0.33 `mgr:531-548`). A request
+    // whose whole sequence does not fit the empty pool is never admitted.
+    let whole = kv_manager.grouped_whole_sequence_bytes(required_tokens);
+    if whole > pool.capacity_bytes() {
+        return Some(AdmissionDecision::Reject);
+    }
     if token_budget == 0 || (!enable_chunked_prefill && required_tokens > token_budget) {
         return Some(AdmissionDecision::Wait);
     }
+    if whole > pool.capacity_bytes() - pool.used_bytes() {
+        return Some(AdmissionDecision::Wait);
+    }
+    // vLLM's second test counts the chunk (v0.33 `mgr:570-588`).
     let target = required_tokens.min(token_budget);
     let needed = pool.required_bytes(0, target);
-    // A request whose configured chunk alone exceeds the entire pool must
-    // enter schedule_request, which reports an explicit configuration error.
-    // Contention alone preserves FIFO and must never preempt running work.
+    // After the whole-sequence test above, this test cannot make a request
+    // wait: the bytes of the chunk of a request without blocks are at most
+    // the bytes of its whole sequence. It stays because it is vLLM's second
+    // test. Contention alone preserves FIFO and must never preempt running
+    // work.
     if needed.is_some_and(|bytes| {
         bytes <= pool.capacity_bytes() && bytes > pool.capacity_bytes() - pool.used_bytes()
     }) {

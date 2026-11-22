@@ -1109,11 +1109,11 @@ impl VllmCore {
                     capacity_bytes,
                 ));
             }
+            kv_manager.set_grouped_admission_limits(limits);
             if args.worker_type != WorkerType::Aggregated {
                 kv_manager.set_grouped_transfer_rules(
                     GroupedTransferRules::new(&args.kv_cache_groups)
                         .expect("validated grouped transfer rules"),
-                    limits,
                 );
             }
         }
@@ -3641,8 +3641,9 @@ impl VllmCore {
     /// `sched:3155-3158`, V32 `sched:3232-3235`). By default vLLM schedules
     /// a preempted request again only when its whole sequence fits (V31
     /// `mgr:519-536`, `sched:1223-1230`, V32 `mgr:522-539`,
-    /// `sched:1275-1282`). Byte mode admits on the first chunk, so there
-    /// vLLM keeps the request waiting where replay repeats the turn.
+    /// `sched:1275-1282`). In byte mode vLLM and replay both keep a
+    /// preempted request waiting until its whole sequence fits, so the
+    /// repeated turn is a block-mode case.
     fn defers_readmission(&self, uuid: Uuid, now_ms: f64) -> bool {
         self.state
             .requests

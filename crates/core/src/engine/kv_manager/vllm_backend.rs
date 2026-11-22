@@ -626,8 +626,9 @@ pub(crate) struct VllmKvManager {
     grouped_prefix: Option<GroupedPrefixCoordinator>,
     /// The P/D transfer rules of a grouped cache on a prefill or decode rank.
     grouped_transfer: Option<GroupedTransferRules>,
-    /// The limits of the sliding-window admission cap, set with the transfer
-    /// rules. Byte mode counts the need of a load with them.
+    /// The limits of the sliding-window admission cap, set for every grouped
+    /// rank. Byte mode counts the whole sequence of a waiting request and the
+    /// need of a load with them.
     grouped_limits: Option<AdmissionLimits>,
     state_cache: Option<StateCacheManager>,
     prefix_match_unit: Option<usize>,
@@ -666,19 +667,45 @@ impl VllmKvManager {
         self.grouped_prefix = Some(GroupedPrefixCoordinator::new(rules, limits));
     }
 
-    /// Set the P/D transfer rules of the grouped cache, with the limits of
-    /// the sliding-window admission cap.
-    pub(crate) fn set_grouped_transfer_rules(
-        &mut self,
-        rules: GroupedTransferRules,
-        limits: AdmissionLimits,
-    ) {
+    /// Set the limits of the sliding-window admission cap of the grouped
+    /// cache.
+    pub(crate) fn set_grouped_admission_limits(&mut self, limits: AdmissionLimits) {
+        assert!(
+            self.grouped.is_some(),
+            "grouped admission limits need a grouped cache"
+        );
+        self.grouped_limits = Some(limits);
+    }
+
+    /// Set the P/D transfer rules of the grouped cache.
+    pub(crate) fn set_grouped_transfer_rules(&mut self, rules: GroupedTransferRules) {
         assert!(
             self.grouped.is_some(),
             "grouped transfer rules need a grouped cache"
         );
         self.grouped_transfer = Some(rules);
-        self.grouped_limits = Some(limits);
+    }
+
+    /// The bytes of the whole sequence of `tokens` tokens of a request
+    /// without blocks in a byte-mode pool, as the first test of vLLM's
+    /// `allocate_slots` counts them (v0.33 `mgr:531-548`): the blocks of
+    /// `min(tokens, max_model_len)` tokens with the admission cap of a
+    /// window group (v0.33 `single:214-227`), and the fixed blocks of the
+    /// state groups, which vLLM counts for a request without blocks: a
+    /// Mamba group with prefix caching off (v0.33 `single:1713-1729`) and a
+    /// ring buffer (v0.33 `single:1203-1214`).
+    pub(crate) fn grouped_whole_sequence_bytes(&self, tokens: usize) -> u64 {
+        let grouped = self.grouped.as_ref().expect("a grouped cache");
+        let limits = self
+            .grouped_limits
+            .expect("the limits are set for every grouped rank");
+        remaining_bytes(
+            grouped.groups(),
+            0,
+            tokens.min(limits.max_model_len),
+            limits,
+        )
+        .saturating_add(grouped.fixed_request_bytes())
     }
 
     pub(crate) fn grouped(&self) -> Option<&GroupedKvPool> {
@@ -2119,7 +2146,7 @@ impl VllmKvManager {
                 // fixed blocks already.
                 let limits = self
                     .grouped_limits
-                    .expect("the limits come with the transfer rules");
+                    .expect("the limits are set for every grouped rank");
                 grouped_lease.first_pass_need =
                     remaining_bytes(grouped.groups(), transfer, prompt, limits);
                 (grouped_lease, None, full_blocks)
@@ -2148,8 +2175,7 @@ impl VllmKvManager {
     /// as vLLM's `_request_remaining_blocks` counts it (V31
     /// `sched:3003-3017`, V32 `sched:3060-3076`): blocks in block mode, bytes
     /// in byte mode. A lease without grouped blocks gives 0. Byte mode needs
-    /// the admission limits that come with the transfer rules of a decode
-    /// rank.
+    /// the admission limits, which are set for every grouped rank.
     pub(crate) fn grouped_remaining_need(&self, lease: &BlockRequestLease, tokens: usize) -> u64 {
         let (Some(grouped), Some(grouped_lease)) = (&self.grouped, &lease.grouped) else {
             return 0;
@@ -2167,7 +2193,7 @@ impl VllmKvManager {
             None => {
                 let limits = self
                     .grouped_limits
-                    .expect("the limits come with the transfer rules");
+                    .expect("the limits are set for every grouped rank");
                 remaining_bytes(grouped.groups(), lease.allocated_tokens, tokens, limits)
             }
         }
