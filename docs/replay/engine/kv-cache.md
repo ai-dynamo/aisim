@@ -1027,8 +1027,11 @@ sub-block matching without an explicit full-state scratch count.
   default, because its option `scheduler_reserve_full_isl` is on. The whole
   sequence holds the output tokens of a resumed request too, and a
   sliding-window group counts at most its admission cap. A request whose
-  whole sequence is larger than the pool is rejected. With prefix caching
-  on, replay tests the blocks of the whole prompt. See vLLM v0.31.0
+  whole sequence is larger than the pool is rejected. With async scheduling
+  vLLM frees the blocks that leave a window one step later than replay, so
+  replay can admit a waiting request one step earlier (see the first item of
+  the list "Replay differs from vLLM in these known ways" below). With prefix
+  caching on, replay tests the blocks of the whole prompt. See vLLM v0.31.0
   [`config/scheduler.py:191`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/config/scheduler.py#L191),
   [`kv_cache_manager.py:519-536`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_manager.py#L519-L536),
   [`scheduler.py:1218`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/sched/scheduler.py#L1218)

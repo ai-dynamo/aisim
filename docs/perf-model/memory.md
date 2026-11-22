@@ -507,7 +507,13 @@ its whole sequence fit the free bytes, with the admission cap of a window
 group, as vLLM's default `scheduler_reserve_full_isl` does. A request whose
 whole sequence is larger than the pool is rejected. A window
 of `W` keeps the blocks covering the last `W - 1` computed tokens and all tokens
-scheduled for the next forward. Expired completed pages are evicted before
+scheduled for the next forward. With async scheduling vLLM frees the blocks
+that leave a window one step later than replay, because it does not count the
+tokens of a step in flight, so the free bytes of replay can be higher for one
+step and a waiting request can be admitted one step earlier (see the first
+item of the list "Replay differs from vLLM in these known ways" in
+[Replay KV cache](../replay/engine/kv-cache.md#other-cache-modes)). Expired
+completed pages are evicted before
 subsequent forwards; temporary prefill pages remain charged through completion.
 Full-attention groups retain full history. A `state` group holds its
 `blocks_per_request` blocks from the request's first scheduled forward until the

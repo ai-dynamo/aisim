@@ -3188,6 +3188,15 @@ impl VllmCore {
                                 let known_tokens = request.sequence.len();
                                 pool.required_bytes(known_tokens.saturating_sub(1), known_tokens)
                             }),
+                        grouped_whole_sequence_bytes = self
+                            .kv_manager
+                            .grouped()
+                            .filter(|pool| pool.block_pool().is_none())
+                            .zip(self.state.requests.get(&uuid))
+                            .map(|(_, request)| {
+                                self.kv_manager
+                                    .grouped_whole_sequence_bytes(request.sequence.len())
+                            }),
                         grouped_capacity_bytes = self
                             .kv_manager
                             .grouped()
