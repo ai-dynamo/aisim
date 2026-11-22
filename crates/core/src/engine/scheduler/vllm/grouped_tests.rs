@@ -5763,6 +5763,29 @@ fn drain_async(core: &mut VllmCore, now_ms: &mut f64, label: &str) {
 }
 
 #[test]
+fn grouped_scheduler_tells_the_kv_manager_when_the_pass_before_is_in_flight() {
+    // Pass 0 has no pass before it. It computes the 4 prompt tokens, emits
+    // the only output and ends the request. With two batches pass 1 is formed
+    // at the end of pass 0, which ran work, so pass 0 is in flight (v0.33
+    // engine/core.py:735, :778-793). Pass 1 schedules nothing, so vLLM
+    // processes pass 0 before it forms pass 2, which has nothing in flight.
+    // With one batch vLLM processes each step before the next `schedule()`
+    // (v0.33 engine/core.py:677-691).
+    for (max_concurrent_batches, expected) in
+        [(1, [false, false, false]), (2, [false, true, false])]
+    {
+        let mut core = async_prefix_core("0.33.0", 12, max_concurrent_batches);
+        let mut now = 0.0;
+        submit_tokens(&mut core, 1, (1000..1004).collect(), 1);
+        let seen = [(); 3].map(|()| {
+            async_step(&mut core, &mut now);
+            core.kv_manager.previous_pass_in_flight()
+        });
+        assert_eq!(seen, expected, "{max_concurrent_batches}");
+    }
+}
+
+#[test]
 fn grouped_prefix_blocks_of_a_finished_request_first_serve_pass_k_plus_2_with_async_scheduling() {
     // X (4 tokens) keeps the rank busy. R (17 tokens) prefills in passes 0
     // and 1 and finishes in pass 1 with 5 attention blocks and 2 state blocks.

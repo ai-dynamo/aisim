@@ -281,6 +281,18 @@ impl PrefixHashMemo {
     }
 }
 
+/// The last scheduled step of a request on a grouped pool or a state cache,
+/// for the processed token count of its next allocation.
+#[derive(Debug, Clone, Copy)]
+struct ScheduledStep {
+    /// [`VllmKvManager`]'s step counter at the step.
+    step: u64,
+    /// The computed count before the step.
+    computed_before: usize,
+    /// The processed count of the step's allocation.
+    processed: usize,
+}
+
 /// Move-only native-G1 ownership token attached to one scheduler request.
 #[derive(Debug)]
 #[must_use = "a native block lease must be finished, aborted, retracted, or moved into a hold"]
@@ -316,6 +328,8 @@ pub(crate) struct BlockRequestLease {
     junction: Option<usize>,
     /// See [`VllmKvManager::get_waiting_lease_prefill_cost`].
     state_miss: Option<StateMiss>,
+    /// See [`VllmKvManager::processed_tokens`]. Cleared by preemption.
+    scheduled_step: Option<ScheduledStep>,
     pub(crate) session_id: Option<String>,
 }
 
@@ -343,6 +357,7 @@ impl BlockRequestLease {
             prefill_checkpoint: None,
             junction: None,
             state_miss: None,
+            scheduled_step: None,
             session_id: None,
         }
     }
@@ -744,6 +759,11 @@ pub(crate) struct VllmKvManager {
     /// Scheduler steps begun, for the one-step block lifetimes of the
     /// grouped coordinator.
     step: u64,
+    /// Whether the step before this one is still in flight: with async
+    /// scheduling vLLM forms a step before it processes the outputs of the
+    /// step before (v0.33 `vllm/v1/engine/core.py:735`, `:778-793`).
+    /// [`Self::begin_step`] clears it.
+    previous_pass_in_flight: bool,
     /// The sum of `first_pass_need` over the grouped destination loads in
     /// flight: reserved, or activated before their first pass. vLLM keeps
     /// the same blocks free for its in-flight prefills when it admits an
@@ -876,6 +896,7 @@ impl VllmKvManager {
             prefix_match_unit: None,
             state_handoffs: None,
             step: 0,
+            previous_pass_in_flight: false,
             grouped_inflight_need: 0,
         }
     }
@@ -1132,6 +1153,43 @@ impl VllmKvManager {
             coordinator.begin_step();
         }
         self.step = self.step.checked_add(1).expect("scheduler step overflow");
+        self.previous_pass_in_flight = false;
+    }
+
+    /// Tell the manager that the step before this one is still in flight.
+    /// Call it after [`Self::begin_step`].
+    pub(crate) fn set_previous_pass_in_flight(&mut self, in_flight: bool) {
+        self.previous_pass_in_flight = in_flight;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn previous_pass_in_flight(&self) -> bool {
+        self.previous_pass_in_flight
+    }
+
+    /// The processed token count of the request's allocation in this step:
+    /// vLLM's `max(0, total_computed_tokens - request.num_in_flight_tokens)`
+    /// (v0.33 `vllm/v1/core/kv_cache_manager.py:561-568`). A scheduled step
+    /// adds its tokens to the in-flight count (v0.33
+    /// `vllm/v1/core/sched/scheduler.py:1859`), and processing its outputs
+    /// takes them off (v0.33 `scheduler.py:2318`). Only the step before can
+    /// be in flight, so processed is the computed count before that step when
+    /// it is in flight and ran the request, and `computed_before` otherwise.
+    /// After the finalize of a step it is the count of that step's
+    /// allocation, whatever `computed_before` is, because the step's own
+    /// tokens are in flight too.
+    pub(crate) fn processed_tokens(
+        &self,
+        lease: &BlockRequestLease,
+        computed_before: usize,
+    ) -> usize {
+        match lease.scheduled_step {
+            Some(record) if record.step == self.step => record.processed,
+            Some(record) if self.previous_pass_in_flight && record.step + 1 == self.step => {
+                record.computed_before
+            }
+            _ => computed_before,
+        }
     }
 
     /// Release the copy sources that the grouped prefix hits inside a block
@@ -1327,6 +1385,7 @@ impl VllmKvManager {
                     prefill_end,
                     computed_before,
                     cumulative_tokens,
+                    computed_before,
                     self.step,
                 ) {
                     if first {
@@ -1798,6 +1857,16 @@ impl VllmKvManager {
         computed_before: usize,
         computed_after: usize,
     ) {
+        // The scheduler finalizes every request of a step, also one that
+        // allocates nothing new, so the record follows vLLM's in-flight count.
+        if self.grouped.is_some() || self.state_cache.is_some() {
+            let processed = self.processed_tokens(lease, computed_before);
+            lease.scheduled_step = Some(ScheduledStep {
+                step: self.step,
+                computed_before,
+                processed,
+            });
+        }
         self.finalize_computed_prefix(
             owner,
             sequence,
@@ -2068,6 +2137,7 @@ impl VllmKvManager {
                         prefill_end,
                         computed_before,
                         computed_after,
+                        computed_before,
                         self.step,
                     ));
                     before
@@ -2079,7 +2149,6 @@ impl VllmKvManager {
                     sequence.num_input_tokens(),
                     computed_after,
                     hit,
-                    self.step,
                 );
                 #[cfg(debug_assertions)]
                 if let Some(before) = quiet {
@@ -2240,6 +2309,7 @@ impl VllmKvManager {
                     pool,
                     &mut block_lease,
                     prompt,
+                    transfer,
                     transfer,
                     transfer,
                     self.step,
@@ -2681,7 +2751,6 @@ impl VllmKvManager {
                 prompt,
                 transfer,
                 &hit,
-                self.step,
             );
             // vLLM counts what the load still needs again at each test, and
             // a state published here inside its running block adds the block
@@ -2703,6 +2772,7 @@ impl VllmKvManager {
         lease.prefill_checkpoint = None;
         lease.junction = None;
         lease.state_miss = None;
+        lease.scheduled_step = None;
         if let (Some(manager), Some(state)) = (&mut self.state_cache, &mut lease.state) {
             manager.preempt(&mut self.pool, state);
         }
@@ -2753,12 +2823,22 @@ impl VllmKvManager {
                     .and_then(|grouped| grouped.block_lease.as_mut())
                     .filter(|block_lease| block_lease.allocated)
                 {
-                    // A finished request runs no next pass, so the previous
-                    // state block that a pass keeps one more step goes too.
+                    // vLLM frees the skipped blocks of an ending request on
+                    // its processed count (V31 `sched:2968-2971`, V32
+                    // `sched:3025-3028`, v0.33 `sched:3369-3372`). Nothing of
+                    // a finished request is in flight when vLLM processes its
+                    // last step, so every held state block goes here. A
+                    // dropped request can have a step in flight. vLLM then
+                    // frees its held blocks with its other blocks, tail
+                    // first, and replay frees them here first. The blocks are
+                    // the same, and only their order in the free queue can
+                    // differ. The next step frees a block kept for a
+                    // published state too.
                     let released = coordinator.allocate(
                         grouped.block_pool_mut().expect("block mode"),
                         block_lease,
                         lease.prompt_tokens,
+                        computed,
                         computed,
                         computed,
                         self.step + 1,

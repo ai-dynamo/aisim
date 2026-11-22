@@ -2,9 +2,10 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // SPDX-License-Identifier: Apache-2.0
 
-// Modified block-mode semantics derived from vLLM v0.31.0 and v0.32.0:
+// Modified block-mode semantics derived from vLLM v0.31.0, v0.32.0 and v0.33.0:
 // https://github.com/vllm-project/vllm/tree/db9527a46873454610df6dbedf79a36d6bf1a7f6
 // https://github.com/vllm-project/vllm/tree/5df63a7203cdb9328d824a27b682e77c7b9928be
+// https://github.com/vllm-project/vllm/tree/4ba787ec9959e566d3b587a796dff07673324da5
 // Exact upstream source paths and Apache-2.0 attribution: THIRD_PARTY_NOTICES.md.
 
 //! Request-owned cache groups sharing one rank-local physical budget. Byte
@@ -45,7 +46,9 @@ impl GroupedLease {
     }
 
     /// Adds the blocks each group holds for a forward from `computed` to
-    /// `target` tokens, or `None` when the bytes overflow.
+    /// `target` tokens, or `None` when the bytes overflow. A window starts
+    /// from `computed`, which `GroupedKvPool::allocate` gets as the processed
+    /// count.
     fn charge(mut self, groups: &[FpmCacheGroup], computed: u64, target: u64) -> Option<Self> {
         for group in groups {
             // A forward must retain the history needed by its first query,
@@ -110,17 +113,42 @@ impl GroupLease {
                 debug_assert_eq!(copies.iter().flatten().count(), copies.len() - first_live);
                 copies.len() - first_live
             }
-            Self::State(state) => [
-                state.running,
-                state.hit.map(|(id, _)| id),
-                state.previous.map(|(id, _)| id),
-                state.copy,
-                state.checkpoint.map(|(id, _)| id),
-            ]
-            .into_iter()
-            .flatten()
-            .count(),
+            Self::State(state) => {
+                [
+                    state.running,
+                    state.hit.map(|(id, _)| id),
+                    state.copy.map(|(id, _)| id),
+                    state.checkpoint.map(|(id, _)| id),
+                ]
+                .into_iter()
+                .flatten()
+                .count()
+                    + state.previous.len()
+            }
             Self::Ring { copy } => usize::from(copy.is_some()),
+        }
+    }
+}
+
+/// When a previous state block goes. vLLM frees the state block of index
+/// `i` at the first allocation of its request with a processed token count
+/// above `(i + 1) * B` (v0.31 `mgr:549-556`, `single:1626-1675`,
+/// `:1990-1995`, v0.32 `mgr:552-559`, `single:1592-1641`, `:1954-1959`,
+/// v0.33 `mgr:561-568`, `single:1608-1657`, `:1971-1976`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PreviousRelease {
+    /// The block goes at the first allocation with a processed token count
+    /// above this one.
+    Above(usize),
+    /// The block goes at the first allocation of a step after this one.
+    AfterStep(u64),
+}
+
+impl PreviousRelease {
+    pub(crate) fn is_met(self, processed: usize, step: u64) -> bool {
+        match self {
+            Self::Above(tokens) => processed > tokens,
+            Self::AfterStep(after) => step > after,
         }
     }
 }
@@ -130,15 +158,22 @@ pub(crate) struct GroupStateLease {
     /// The block that the request writes.
     pub(crate) running: Option<BlockCopyId>,
     /// A cached hit block, and the index of the block whose end it covers.
-    /// The block of a hit on a block boundary is held until the request's
-    /// next allocation.
+    /// The block of a hit on a block boundary is held until an allocation
+    /// whose processed token count lies past that block.
     pub(crate) hit: Option<(BlockCopyId, usize)>,
-    /// The running block before a boundary crossing or producer copy-on-write,
-    /// and the step after which it can go.
-    pub(crate) previous: Option<(BlockCopyId, u64)>,
-    /// The copy block of a partial hit.
-    pub(crate) copy: Option<BlockCopyId>,
-    /// A vLLM 0.32.0 prefill checkpoint block, and its token position.
+    /// The running blocks before a boundary crossing or a producer
+    /// copy-on-write, oldest first, each with its release rule. A crossing
+    /// from `c` tokens leaves the block of index `(c - 1) / B`, which goes
+    /// once the processed count passes its end. With the step before in
+    /// flight, the blocks of two crossings can be held at once. A block kept
+    /// for a state that the request published inside it goes at the next
+    /// step of the request.
+    pub(crate) previous: Vec<(BlockCopyId, PreviousRelease)>,
+    /// The copy block of a partial hit, and the token count above which the
+    /// processed count frees it: the end of its block.
+    pub(crate) copy: Option<(BlockCopyId, usize)>,
+    /// A vLLM 0.32.0 prefill checkpoint block, and its token position. It
+    /// goes once the processed count passes that position.
     pub(crate) checkpoint: Option<(BlockCopyId, usize)>,
     /// The key of a state that the request published inside its running
     /// block. The next allocation keeps that block and takes a fresh one.
@@ -433,6 +468,11 @@ impl GroupedKvPool {
 
     /// Reserve every group atomically. Expired blocks become reusable in this
     /// transition, but failed attempts leave both the lease and pool unchanged.
+    /// `computed_before` is the count that a window starts from: the caller
+    /// passes the processed count, `computed - num_in_flight_tokens` (v0.31
+    /// `mgr:549-556`, v0.32 `mgr:552-559`, v0.33 `mgr:561-568`). The lease
+    /// then holds the window of the step in flight and every token up to
+    /// `computed_after`.
     pub(crate) fn allocate(
         &mut self,
         lease: &mut Option<GroupedLease>,
@@ -691,6 +731,45 @@ mod tests {
     }
 
     #[test]
+    fn byte_pool_holds_the_window_of_the_step_in_flight() {
+        // The caller passes the processed count as the window start. With
+        // the step before in flight, that is its computed count before it
+        // (v0.33 mgr:561-568). Window 4, block 4, page 8: the window keeps
+        // the blocks from `(processed - 3) / 4` (v0.33 single:1148-1183,
+        // :682-720, where `extra_retained_tokens` is 0 without speculative
+        // decoding) to `cdiv(target, 4)`.
+        let mut pool = GroupedKvPool::new(
+            vec![FpmCacheGroup {
+                name: "window".into(),
+                kind: FpmCacheKind::Attention,
+                num_layers: 1,
+                block_size_tokens: 4,
+                page_size_bytes: 8,
+                sliding_window: Some(4),
+                blocks_per_request: None,
+                prefix_cacheable: None,
+                transfer_bytes_per_block: None,
+                prefill_checkpoint_blocks: None,
+                prefill_checkpoint_alignment: None,
+            }],
+            48,
+        );
+        let mut lease = None;
+        assert!(pool.allocate(&mut lease, 0, 8)); // blocks 0..2
+        assert_eq!(pool.used_bytes(), 16);
+        assert!(pool.allocate(&mut lease, 0, 16)); // step 1 in flight: 0..4
+        assert_eq!(pool.used_bytes(), 32);
+        assert!(pool.allocate(&mut lease, 8, 24)); // 5 / 4 = 1: 1..6
+        assert_eq!(pool.used_bytes(), 40);
+        assert!(pool.allocate(&mut lease, 16, 32)); // 13 / 4 = 3: 3..8
+        assert_eq!(pool.used_bytes(), 40);
+        assert!(pool.allocate(&mut lease, 24, 33)); // 21 / 4 = 5: 5..9
+        assert_eq!(pool.used_bytes(), 32);
+        assert!(pool.allocate(&mut lease, 32, 34)); // 29 / 4 = 7: 7..9
+        assert_eq!(pool.used_bytes(), 16);
+    }
+
+    #[test]
     fn block_mode_pins_hits_and_evicts_cached_blocks_in_lru_order() {
         let (h0, h1) = (10, 11);
         let hits = [
@@ -894,8 +973,8 @@ mod tests {
                     GroupLease::State(GroupStateLease {
                         running: Some(ids[3]),
                         hit: Some((ids[4], 1)),
-                        previous: Some((ids[5], 2)),
-                        copy: Some(ids[6]),
+                        previous: vec![(ids[5], PreviousRelease::AfterStep(2))],
+                        copy: Some((ids[6], 8)),
                         checkpoint: Some((ids[7], 8)),
                         published: None,
                     }),

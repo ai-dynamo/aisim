@@ -39,7 +39,9 @@
 //! - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/engine/core.py
 //! - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/config/vllm.py
 
-use super::grouped::{GroupLease, GroupStateLease, GroupedBlockLease, GroupedBlockPool};
+use super::grouped::{
+    GroupLease, GroupStateLease, GroupedBlockLease, GroupedBlockPool, PreviousRelease,
+};
 use super::vllm_backend::BlockRequestLease;
 use crate::engine::cache::vllm_block_pool::{BlockCopyId, CacheKey, KeyInBlock};
 use crate::perfmodel::{FpmCacheGroup, FpmCacheKind};
@@ -472,8 +474,10 @@ impl GroupedPrefixRules {
     /// only counts the blocks that a step completes. `allocate` takes a
     /// block when the target leaves the blocks that the request holds,
     /// retires a window block every `block` tokens, and releases the blocks
-    /// that a state group holds beside a private running block. A checkpoint
-    /// block needs a chunk that spans two state blocks.
+    /// that a state group holds beside a private running block. A window
+    /// block retires on the processed count, which is at or below the count
+    /// that the allocation starts from, so the bound holds with a step in
+    /// flight. A checkpoint block needs a chunk that spans two state blocks.
     fn quiet_until(
         &self,
         pool: &GroupedBlockPool,
@@ -1624,7 +1628,11 @@ impl GroupedPrefixCoordinator {
     /// references until the end of `schedule()` (v0.31 `single:307`,
     /// `:387-397`, `:454-474`, `:1935-1937`, v0.32 `single:304`, `:387-397`,
     /// `:454-474`, `:1899-1901`, v0.33 `single:305`, `:388-398`, `:455-475`,
-    /// `:1916-1918`).
+    /// `:1916-1918`). `processed` is vLLM's processed token count,
+    /// `computed - num_in_flight_tokens`, on which the held state blocks and
+    /// the window blocks go (v0.31 `mgr:549-556`, v0.32 `mgr:552-559`, v0.33
+    /// `mgr:561-568`).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn allocate(
         &mut self,
         pool: &mut GroupedBlockPool,
@@ -1632,6 +1640,7 @@ impl GroupedPrefixCoordinator {
         prefill_end: usize,
         computed_before: usize,
         target: usize,
+        processed: usize,
         step: u64,
     ) -> bool {
         // The blocks can change here, so the step's `finalize` has to run.
@@ -1642,6 +1651,7 @@ impl GroupedPrefixCoordinator {
             prefill_end,
             computed_before,
             target,
+            processed,
             step,
             &mut self.plan,
             &mut self.releases,
@@ -1666,6 +1676,7 @@ impl GroupedPrefixCoordinator {
                 (
                     Plan::State {
                         running,
+                        previous,
                         copy,
                         cow_is_running,
                         checkpoint,
@@ -1696,15 +1707,22 @@ impl GroupedPrefixCoordinator {
                         }
                         let new = pool.take_private(&mut reservation);
                         if let Some(old) = state.running.replace(new) {
-                            debug_assert!(
-                                state.previous.is_none(),
-                                "one boundary crossing per step"
-                            );
-                            state.previous = Some((old, step));
+                            state.previous.push((
+                                old,
+                                previous.expect("a replaced running block has a release rule"),
+                            ));
                         }
                     }
                     if copy {
-                        state.copy = Some(pool.take_private(&mut reservation));
+                        // The copy sits at the hit's index `computed_before /
+                        // B` (v0.33 `single:455-475`, `:1844-1847`) and goes
+                        // once the processed count passes the end of that
+                        // block.
+                        let block = self.rules.groups[g].block;
+                        state.copy = Some((
+                            pool.take_private(&mut reservation),
+                            (computed_before / block + 1) * block,
+                        ));
                     }
                     if let Some(pos) = checkpoint {
                         state.checkpoint = Some((pool.take_private(&mut reservation), pos));
@@ -1734,6 +1752,7 @@ impl GroupedPrefixCoordinator {
         prefill_end: usize,
         computed_before: usize,
         target: usize,
+        processed: usize,
         step: u64,
         plan: &mut Vec<Plan>,
         releases: &mut Vec<BlockCopyId>,
@@ -1754,7 +1773,16 @@ impl GroupedPrefixCoordinator {
                     },
                 ) => {
                     if let GroupRuleKind::SlidingWindow { window } = rule.kind {
-                        let skipped = computed_before.saturating_sub(window - 1) / block;
+                        // vLLM retires the blocks below the window of the
+                        // processed count (v0.31 `mgr:549-556`, v0.32
+                        // `mgr:552-559`, v0.33 `mgr:561-568`): a step in
+                        // flight still reads the window of its own start
+                        // (v0.33 `single:1148-1183`). vLLM also keeps
+                        // `extra_retained_tokens` tokens below the window.
+                        // That count is above 0 only with multi-module
+                        // speculative decoding, which a rank with cache
+                        // groups refuses, so it is 0 here.
+                        let skipped = processed.saturating_sub(window - 1) / block;
                         // Tail first, as `_remove_blocks_in_range` frees the
                         // range (v0.31 `single:660-685`, v0.32 `:645-670`).
                         let held = skipped.min(copies.len());
@@ -1778,27 +1806,14 @@ impl GroupedPrefixCoordinator {
                     Plan::Attention { new, copy }
                 }
                 (GroupRuleKind::State, GroupLease::State(state)) => {
-                    // A state group skips every token before the last computed
-                    // one (v0.32 `single:1954-1959`). So the next allocation
-                    // first frees every block below the last one, the
-                    // checkpoint block included (v0.32 `single:672-710`,
-                    // `:1592-1641`, `kv_cache_manager.py:546-559`). A request
-                    // allocates once per step, so a held checkpoint block
-                    // comes from an earlier step. A published checkpoint block keeps
-                    // its key until eviction. As for the previous block, the release takes
-                    // one pass, as on the linear path, where vLLM's async
-                    // scheduling waits one more.
-                    if let Some((checkpoint, _)) = state.checkpoint.take() {
-                        releases.push(checkpoint);
-                    }
                     let crossing = state.running.is_some()
                         && computed_before > 0
                         && (computed_before - 1) / block < (target - 1) / block;
                     // The copy-on-write block of a hit inside a block replaces
                     // the hit block (`single:454-474`, `:1891-1942`). It is the
                     // running block when the target stays in that block, and
-                    // otherwise goes at the next allocation like `previous`
-                    // (`single:1658-1675`, `:1868`).
+                    // otherwise goes like a previous block (`single:1658-1675`,
+                    // `:1868`).
                     let cow =
                         first && state.hit.is_some() && !computed_before.is_multiple_of(block);
                     let cow_is_running =
@@ -1817,21 +1832,74 @@ impl GroupedPrefixCoordinator {
                     let running =
                         (state.running.is_none() || crossing || producer_cow) && !cow_is_running;
                     let copy = cow && !cow_is_running;
-                    if !first && let Some(copy) = state.copy.take() {
-                        releases.push(copy);
+                    // The running block that a crossing leaves has index
+                    // `(computed_before - 1) / B` and goes by the rule below. A
+                    // block kept for a state published inside it goes at the
+                    // next step of the request, also with a step in flight.
+                    // vLLM holds no such block: it moves the key to the copy
+                    // block in the same allocation (see above).
+                    let previous = (running && state.running.is_some()).then(|| {
+                        if crossing {
+                            PreviousRelease::Above(((computed_before - 1) / block + 1) * block)
+                        } else {
+                            PreviousRelease::AfterStep(step)
+                        }
+                    });
+                    // A state group skips every token before the last
+                    // processed one (v0.31 `single:1990-1995`, v0.32
+                    // `:1954-1959`, v0.33 `:1971-1976`), and vLLM frees the
+                    // skipped blocks on the processed count before it
+                    // allocates (v0.31 `mgr:549-556`, v0.32 `mgr:552-559`,
+                    // v0.33 `mgr:561-568`). So the block of index `i` goes at
+                    // the first allocation with `processed > (i + 1) * B`
+                    // (v0.31 `single:1626-1675`, v0.32 `:1592-1641`, v0.33
+                    // `:1608-1657`). With one batch the processed count is the
+                    // computed count. With the step before in flight it is the
+                    // computed count before that step, so a request can hold
+                    // the blocks of two crossings.
+                    // vLLM frees the range from the highest index down
+                    // (v0.33 `single:1618-1626`). Replay releases the
+                    // checkpoint block, the previous blocks newest first, the
+                    // copy block, then the hit block. That is vLLM's order,
+                    // with one exception: a previous block that a crossing
+                    // after the checkpoint step left has a higher index than
+                    // the checkpoint block, and replay releases the checkpoint
+                    // block first. A block kept for a published state has no
+                    // index in vLLM. vLLM frees the copy that holds its key at
+                    // the end of the step that wrote past it (v0.33
+                    // `sched:1698-1706`), before every block of a later
+                    // allocation, and replay releases the block as the newest
+                    // previous block, which gives the same order.
+                    // A published checkpoint block keeps its key until eviction.
+                    if let Some((checkpoint, pos)) = state.checkpoint
+                        && processed > pos
+                    {
+                        releases.push(checkpoint);
+                        state.checkpoint = None;
                     }
-                    // The hit block of a hit on a block boundary leaves once
-                    // the request has computed past it, with the other skipped
-                    // blocks and before the reservation, as vLLM frees it on
-                    // the processed token count (v0.31 `mgr:552-556`,
-                    // `single:1626-1645`, v0.32 `mgr:555-559`,
-                    // `single:1592-1611`, v0.33 `mgr:564-568`,
-                    // `single:1608-1627`). vLLM 0.31.0 turns async scheduling
-                    // on by default and then holds it one more step. A hit
+                    releases.extend(
+                        state
+                            .previous
+                            .iter()
+                            .rev()
+                            .filter(|(_, rule)| rule.is_met(processed, step))
+                            .map(|&(id, _)| id),
+                    );
+                    state
+                        .previous
+                        .retain(|(_, rule)| !rule.is_met(processed, step));
+                    if let Some((copy, above)) = state.copy
+                        && processed > above
+                    {
+                        releases.push(copy);
+                        state.copy = None;
+                    }
+                    // The hit block of a hit on a block boundary has index
+                    // `cdiv(hit, B) - 1` (v0.33 `single:1844-1847`). A hit
                     // inside a block left the lease as a copy source in the
                     // first allocation, so this never applies to it.
                     if let Some((hit, index)) = state.hit
-                        && computed_before.div_ceil(block).saturating_sub(1) > index
+                        && processed.div_ceil(block).saturating_sub(1) > index
                     {
                         releases.push(hit);
                         state.hit = None;
@@ -1847,16 +1915,11 @@ impl GroupedPrefixCoordinator {
                             "the checkpoint block index lies within the request's blocks"
                         );
                     }
-                    if let Some((previous, previous_step)) = state.previous
-                        && step > previous_step
-                    {
-                        releases.push(previous);
-                        state.previous = None;
-                    }
                     fresh +=
                         usize::from(running) + usize::from(cow) + usize::from(checkpoint.is_some());
                     Plan::State {
                         running,
+                        previous,
                         copy,
                         cow_is_running,
                         checkpoint,
@@ -1958,7 +2021,6 @@ impl GroupedPrefixCoordinator {
     /// Publish the blocks that `computed_after` completes and apply the
     /// default retention (`single:476-560`, `single:864-880`,
     /// `single:1614-1622`, `single:1658-1675`, v0.32 `single:2017-2066`).
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn finalize(
         &mut self,
         pool: &mut GroupedBlockPool,
@@ -1967,7 +2029,6 @@ impl GroupedPrefixCoordinator {
         prompt: usize,
         computed_after: usize,
         hit: &GroupedHit,
-        step: u64,
     ) {
         let rules = &self.rules;
         let junction = (hit.junction_tokens > 0).then_some(hit.tokens + hit.junction_tokens);
@@ -2087,17 +2148,6 @@ impl GroupedPrefixCoordinator {
                         pool.cache_at(id, key, in_block(pos));
                         self.published_epoch += u64::from(self.published_this_step.insert(key));
                     }
-                    // The previous block goes after one pass, as on the linear
-                    // path and in the runtime probe, which ran without async
-                    // scheduling. vLLM 0.31.0 turns async scheduling on by
-                    // default and then holds it one more pass
-                    // (`kv_cache_manager.py:552-554` with `num_in_flight_tokens`).
-                    if let Some((id, previous_step)) = state.previous
-                        && step > previous_step
-                    {
-                        pool.release(id);
-                        state.previous = None;
-                    }
                 }
                 (kind, group) => unreachable!("rule {kind:?} with lease {group:?}"),
             }
@@ -2136,12 +2186,18 @@ impl GroupedPrefixCoordinator {
                         [
                             state.running.take(),
                             state.checkpoint.take().map(|(id, _)| id),
-                            state.previous.take().map(|(id, _)| id),
-                            state.hit.take().map(|(id, _)| id),
-                            state.copy.take(),
                         ]
                         .into_iter()
-                        .flatten(),
+                        .flatten()
+                        .chain(state.previous.drain(..).rev().map(|(id, _)| id))
+                        .chain(
+                            [
+                                state.hit.take().map(|(id, _)| id),
+                                state.copy.take().map(|(id, _)| id),
+                            ]
+                            .into_iter()
+                            .flatten(),
+                        ),
                     );
                 }
                 GroupLease::Ring { copy } => released.extend(copy.take()),
@@ -2161,6 +2217,8 @@ enum Plan {
     },
     State {
         running: bool,
+        /// The release rule of the running block that a fresh one replaces.
+        previous: Option<PreviousRelease>,
         copy: bool,
         cow_is_running: bool,
         checkpoint: Option<usize>,

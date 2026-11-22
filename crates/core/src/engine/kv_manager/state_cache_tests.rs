@@ -1819,3 +1819,71 @@ fn mtp_fine_prefix_uses_earlier_state_and_later_attention_tail() {
     manager.finish_lease(owner, reader);
     clear_reclaimable_and_assert_empty(&mut manager);
 }
+
+#[test]
+fn processed_count_follows_the_pass_in_flight() {
+    // vLLM frees on `computed - in_flight` (v0.33 kv_cache_manager.py:561-568).
+    // A step adds its tokens to the in-flight count after scheduling
+    // (v0.33 scheduler.py:1859), and processing its outputs takes them off
+    // (v0.33 scheduler.py:2318). With async scheduling only the step before
+    // is in flight when vLLM forms a step (v0.33 engine/core.py:735,
+    // :778-793).
+    let mut manager = manager(16, 6, 1, true);
+    manager.configure_prefix_match_unit(Some(2));
+    let owner = Uuid::from_u128(700);
+    let (mut sequence, mut lease) = fine_request(owner, 25, 6, 2, 0);
+    // Pass 1, nothing before it: processed = computed = 0.
+    manager.begin_step();
+    allocated(manager.allocate_lease(owner, &mut lease, 6, 0));
+    assert_eq!(manager.processed_tokens(&lease, 0), 0);
+    manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 0, 6);
+    // Pass 2 is formed while pass 1 is in flight: computed 6, in flight 6, processed 0.
+    manager.begin_step();
+    manager.set_previous_pass_in_flight(true);
+    assert_eq!(manager.processed_tokens(&lease, 6), 0);
+    allocated(manager.allocate_lease(owner, &mut lease, 12, 0));
+    assert_eq!(manager.processed_tokens(&lease, 6), 0); // the finalize of this pass has not run yet
+    manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 6, 12);
+    // After the finalize, pass 2's own tokens are in flight too: computed 12,
+    // in flight 6 + 6, processed 0, the count of pass 2's allocation.
+    assert_eq!(manager.processed_tokens(&lease, 12), 0);
+    // Pass 3 after an idle gap: begin_step clears the flag, processed = computed = 12.
+    manager.begin_step();
+    assert_eq!(manager.processed_tokens(&lease, 12), 12);
+    // Pass 3 does not run the request. Pass 4 is formed while pass 3 is in flight:
+    // the request has no token in flight, processed = computed = 12.
+    manager.begin_step();
+    manager.set_previous_pass_in_flight(true);
+    assert_eq!(manager.processed_tokens(&lease, 12), 12);
+    // A preemption clears the record. The next pass sees no token in flight.
+    allocated(manager.allocate_lease(owner, &mut lease, 18, 0));
+    manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 12, 18);
+    manager.preempt_lease(owner, &mut lease);
+    manager.begin_step();
+    manager.set_previous_pass_in_flight(true);
+    assert_eq!(manager.processed_tokens(&lease, 0), 0);
+}
+
+#[test]
+fn one_batch_never_sees_a_pass_in_flight() {
+    // Without async scheduling vLLM processes each step before the next
+    // `schedule()` (v0.33 engine/core.py:677-691), so nothing is in flight
+    // at an allocation and processed equals computed. After the finalize the
+    // step's own tokens are in flight (v0.33 scheduler.py:1859), so processed
+    // is the count before the step.
+    let mut manager = manager(16, 6, 1, true);
+    manager.configure_prefix_match_unit(Some(2));
+    let owner = Uuid::from_u128(701);
+    let (mut sequence, mut lease) = fine_request(owner, 25, 6, 2, 0);
+    let mut before = 0;
+    for end in [6, 12, 18] {
+        manager.begin_step();
+        assert!(!manager.previous_pass_in_flight());
+        assert_eq!(manager.processed_tokens(&lease, before), before);
+        allocated(manager.allocate_lease(owner, &mut lease, end, 0));
+        manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, before, end);
+        assert_eq!(manager.processed_tokens(&lease, end), before);
+        before = end;
+    }
+    manager.finish_lease(owner, lease);
+}

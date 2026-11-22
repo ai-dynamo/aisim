@@ -209,6 +209,24 @@ impl G1Manager {
         self.inner.begin_step();
     }
 
+    pub(crate) fn set_previous_pass_in_flight(&mut self, in_flight: bool) {
+        self.inner.set_previous_pass_in_flight(in_flight);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn previous_pass_in_flight(&self) -> bool {
+        self.inner.previous_pass_in_flight()
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn processed_tokens(
+        &self,
+        lease: &BlockRequestLease,
+        computed_before: usize,
+    ) -> usize {
+        self.inner.processed_tokens(lease, computed_before)
+    }
+
     pub(crate) fn release_grouped_copy_sources(&mut self) {
         self.inner.release_grouped_copy_sources();
     }

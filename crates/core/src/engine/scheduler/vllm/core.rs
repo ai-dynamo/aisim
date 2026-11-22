@@ -2660,6 +2660,8 @@ impl VllmCore {
         // runs, and processes the previous pass's outputs only afterwards,
         // unless that pass ran nothing or ended before now.
         let previous_in_flight = self.last_pass_end_ms == Some(now_ms);
+        self.kv_manager
+            .set_previous_pass_in_flight(previous_in_flight);
         if !previous_in_flight {
             let finished = std::mem::take(&mut self.finished_in_flight);
             self.free_finished(finished);
