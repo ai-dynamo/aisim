@@ -929,17 +929,6 @@ def build_collection_plan(
             raise ValueError(
                 f"GLM-5.3-Flash collection requires a model revision of 40 lowercase hex characters, got {revision!r}"
             )
-        # The producer refuses these limits, runtime versions and layouts when the engine starts. A bundle without the
-        # probe launch facts gives no runtime version: the planner refuses that pair later with its own text.
-        validate_glm_limits(options, deployments if profile is not None else ())
-        validate_glm_layout(
-            candidate_topologies,
-            _glm_runtime_version(
-                runtime_backend_version,
-                runtime_instrumentation if runtime_launch is not None else None,
-                deployments if profile is not None else (),
-            ),
-        )
     topologies, topology_memory_admission = filter_memory_infeasible_topologies(
         backend=backend,
         model_path=model_path,
@@ -1013,6 +1002,23 @@ def build_collection_plan(
         if (topology, kv_cache_dtype) in runnable_dtype_pairs
         for policy in policies
     )
+    if capability.architecture == GLM_ARCHITECTURE:
+        # The producer refuses these limits, runtime versions and layouts when the engine starts. The limits are read
+        # for the deployments whose topologies keep cells after memory admission, since only those launch.
+        kept = {cell.topology for cell in cells}
+        validate_glm_limits(
+            options,
+            [
+                deployment
+                for topology, deployment in zip(candidate_topologies, deployments, strict=True)
+                if topology in kept
+            ]
+            if profile is not None
+            else (),
+        )
+        validate_glm_layout(
+            candidate_topologies, _glm_runtime_version(runtime_backend_version, runtime_instrumentation, runtime_launch)
+        )
     revision = _git_revision()
     canonical = {
         "backend": backend,
@@ -1102,35 +1108,33 @@ def build_collection_plan(
 def _glm_runtime_version(
     runtime_backend_version: str | None,
     runtime_instrumentation,
-    deployments,
+    runtime_launch: dict[str, Any] | None,
 ) -> str | None:
-    """The vLLM version of the runtime that a GLM-5.3-Flash plan runs on, or None when the planner holds no fact of it.
+    """The vLLM version of the runtime that a GLM-5.3-Flash plan runs on, or None when the version rule must not speak.
 
-    The first that exists: the observed version, the runtime version of the instrumentation bundle that the plan
-    stages, and the one runtime version that the runtime memory of the accepted deployments records. The deployment's
-    backend_version is a data label and is never read. When the deployments record more than one version, the planner
-    cannot tell which one the plan runs on, and the producer's gate decides. A bundle that does not load gives no
-    version here: the planner refuses it later with its own text.
+    The plan runs on its observed version, or else on the runtime version of the instrumentation bundle that it stages;
+    the runner stops an attempt whose installed vLLM differs from it. The deployment's backend_version is a data label
+    and the version that its runtime memory records is that of the probe, so neither is read. Without a probe launch the
+    bundle gives no version. A bundle that does not load, or whose version differs from the observed one, gives no
+    version either. The planner refuses each of these three plans below with the text of the bundle, so the version
+    rule speaks only where no such text does. A launch without a bundle gives no version for the same reason.
     """
-    if runtime_backend_version is not None:
+    if (runtime_instrumentation is None) != (runtime_launch is None):
+        return None
+    if runtime_instrumentation is None:
         return runtime_backend_version
-    if runtime_instrumentation is not None:
-        bundle = runtime_instrumentation
-        if isinstance(bundle, (str, Path)):
-            from .runtime_instrumentation import load_instrumentation
+    bundle = runtime_instrumentation
+    if isinstance(bundle, (str, Path)):
+        from .runtime_instrumentation import load_instrumentation
 
-            try:
-                bundle = load_instrumentation(bundle)
-            except ValueError:
-                bundle = None
-        if bundle is not None:
-            return bundle.manifest["runtime"]["version"]
-    versions = {
-        deployment.resources.runtime_memory.runtime_framework_version
-        for deployment in deployments
-        if deployment.resources.runtime_memory is not None
-    } - {None}
-    return versions.pop() if len(versions) == 1 else None
+        try:
+            bundle = load_instrumentation(bundle)
+        except ValueError:
+            return None
+    version = bundle.manifest["runtime"]["version"]
+    if runtime_backend_version is not None and runtime_backend_version != version:
+        return None
+    return version
 
 
 def _validate_profile_identities(

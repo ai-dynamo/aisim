@@ -383,34 +383,61 @@ def _require_mamba_hash_block(deployments: Sequence[FpmDeploymentProfile]) -> No
 def validate_glm_limits(options: FPMCollectionOptions, deployments: Sequence[FpmDeploymentProfile]) -> None:
     """Refuse a token budget and a hash block of a plan that the producer refuses when the engine starts.
 
-    The rules hold for a generated and for a user list. Each phase that the plan collects is checked with the budget
-    that the runner renders for its cells: ``options.prefill_sampling.max_total_prefill_tokens`` for a prefill cell,
-    and for a decode cell ``options.max_num_batched_tokens`` or, with that unset, the ``max_num_tokens`` of the
-    accepted deployment. Each must be a multiple of the producer's chunk alignment. Each deployment's hash block must
-    then be the block of its Mamba groups.
+    The rules hold for a generated and for a user list. ``deployments`` are those that get cells. Each phase that the
+    plan collects is checked with the budget that the runner renders for its cells:
+    ``options.prefill_sampling.max_total_prefill_tokens`` for a prefill cell, and for a decode cell
+    ``options.max_num_batched_tokens`` or, with that unset, the ``max_num_tokens`` of its deployment. Each must be a
+    multiple of the producer's chunk alignment. Each deployment's hash block must then be the block of its Mamba groups.
+
+    The text names the way out that works for the form of the plan. A deployment with runtime memory takes only the
+    token limit that its runtime probe recorded, so a value that equals that limit needs a new probe. An aggregated
+    plan takes one value for both options, and so does a plan whose prefill budget is the shared option.
     """
     rule = "GLM-5.3-Flash collection requires a token budget that is a multiple of 4"
+    recorded = {
+        deployment.resources.max_num_tokens
+        for deployment in deployments
+        if deployment.resources.runtime_memory is not None
+    }
+    probe = (
+        ", the token limit that a runtime probe recorded in the accepted profile; probe the runtime again with a token "
+        "limit that is a multiple of 4"
+    )
+
+    def shared(value: int) -> str:
+        # The value must also stay within the token limit of every deployment of the profile, which the planner checks
+        # before memory admission.
+        bound = " within the max_num_tokens of every deployment of the accepted profile" if deployments else ""
+        return (
+            f"; set --fpm-max-prefill-isl and --fpm-max-num-batched-tokens to one multiple of 4{bound}, below {value}"
+        )
+
     phases = options.workload_kinds
     if "prefill" in phases:
         budget = options.prefill_sampling.max_total_prefill_tokens
         if budget % CHUNK_ALIGN:
-            raise ValueError(
-                f"{rule}: the prefill cells get a budget of {budget} tokens; set --fpm-max-prefill-isl to a multiple "
-                "of 4"
-            )
+            if budget in recorded:
+                remedy = probe
+            elif options.worker_type == "aggregated" or budget == options.max_num_batched_tokens:
+                remedy = shared(budget)
+            else:
+                remedy = f"; set --fpm-max-prefill-isl to a multiple of 4, for example {budget - budget % CHUNK_ALIGN}"
+            raise ValueError(f"{rule}: the prefill cells get a budget of {budget} tokens{remedy}")
     if "decode" in phases:
         if options.max_num_batched_tokens is not None:
-            if options.max_num_batched_tokens % CHUNK_ALIGN:
-                raise ValueError(
-                    f"{rule}: the decode cells get --fpm-max-num-batched-tokens={options.max_num_batched_tokens}; set "
-                    "it to a multiple of 4"
-                )
+            budget = options.max_num_batched_tokens
+            if budget % CHUNK_ALIGN:
+                # Runtime memory requires the option to equal the recorded limit.
+                remedy = probe if recorded else shared(budget)
+                raise ValueError(f"{rule}: the decode cells get --fpm-max-num-batched-tokens={budget}{remedy}")
         else:
             for deployment in deployments:
-                if deployment.resources.max_num_tokens % CHUNK_ALIGN:
+                budget = deployment.resources.max_num_tokens
+                if budget % CHUNK_ALIGN:
+                    remedy = probe if deployment.resources.runtime_memory is not None else shared(budget)
                     raise ValueError(
                         f"{rule}: the decode cells of the accepted deployment at TP {deployment.tp} get its "
-                        f"resources.max_num_tokens={deployment.resources.max_num_tokens}"
+                        f"resources.max_num_tokens={budget}{remedy}"
                     )
     _require_mamba_hash_block(deployments)
 

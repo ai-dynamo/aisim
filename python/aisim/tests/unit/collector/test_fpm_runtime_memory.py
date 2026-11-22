@@ -2195,6 +2195,8 @@ def _glm_plan(
     runtime_framework_version=None,
     runtime_memory=True,
     worker_type=None,
+    observed=None,
+    extra_deployments=(),
     **changes,
 ):
     """A GLM-5.3-Flash TP 4 collection plan with the cache resources that the runtime probe measured.
@@ -2206,7 +2208,9 @@ def _glm_plan(
     preset of the request, and ``topology`` a mapping of ``tp``, ``dp``, ``moe_tp`` and ``moe_ep`` that replaces those
     values of the deployment. A ``runtime_framework_version`` is the vLLM version that the runtime memory records.
     Without ``runtime_memory`` the profile holds no runtime memory, so its token limit need not equal the options. A
-    ``worker_type`` is the serving role of the deployment and of the options.
+    ``worker_type`` is the serving role of the deployment and of the options. An ``observed`` version is the observed
+    runtime version of the collector configuration. Each of ``extra_deployments`` is a mapping that updates a copy of
+    the deployment without runtime memory, with ``resources`` merged into its resources.
     ``changes`` replace option fields before planning. With a
     ``kda_checkpoint_alignment``, each of the four KDA groups holds one prefill checkpoint block of that alignment, as
     the import writes it for a launch that prefills KDA with FlashKDA. Without it, they hold none, as with the Triton
@@ -2303,6 +2307,12 @@ def _glm_plan(
     ]
     if worker_type is not None:
         changes["worker_type"] = worker_type
+    for extra in extra_deployments:
+        deployment = json.loads(json.dumps(profile["deployments"][0]))
+        deployment["resources"].pop("runtime_memory", None)
+        deployment["resources"].update(extra.get("resources", {}))
+        deployment.update({name: value for name, value in extra.items() if name != "resources"})
+        profile["deployments"].append(deployment)
     return _plan(
         profile,
         model_path=str(path),
@@ -2311,6 +2321,7 @@ def _glm_plan(
         has_model_cases=False,
         selected_ops={"attention_context", "attention_generation"},
         options=replace(FPMCollectionOptions.from_args(cli._parser().parse_args(argv)), **changes),
+        **({} if observed is None else {"collector_config": {"runtime_backend_version": observed}}),
     )
 
 
@@ -2443,38 +2454,95 @@ def _glm_user_points(tmp_path):
 
 
 _BUDGET_RULE = "GLM-5.3-Flash collection requires a token budget that is a multiple of 4"
+_PROBE_REMEDY = (
+    ", the token limit that a runtime probe recorded in the accepted profile; probe the runtime again with a token "
+    "limit that is a multiple of 4"
+)
+_SHARED_REMEDY = (
+    "; set --fpm-max-prefill-isl and --fpm-max-num-batched-tokens to one multiple of 4 within the max_num_tokens of "
+    "every deployment of the accepted profile, below 8190"
+)
 
 
 @pytest.mark.parametrize(
-    ("changes", "text"),
+    ("refused", "text", "remedy"),
     [
+        # Runtime memory takes only the recorded limit, for the prefill budget too (memory admission), so the way out is
+        # a new probe. A probe at 8,188 gives a profile that records 8,188.
         (
-            {"max_prefill_isl": 8190},
-            f"{_BUDGET_RULE}: the prefill cells get a budget of 8190 tokens; set --fpm-max-prefill-isl to a multiple "
-            "of 4",
-        ),
-        # Accepted runtime memory records the token limit of the options, so the deployment holds 8,190 too. The runner
-        # gives the decode cells the option, so the text names it.
-        (
-            {"max_num_tokens": 8190, "max_prefill_isl": 8188},
-            f"{_BUDGET_RULE}: the decode cells get --fpm-max-num-batched-tokens=8190; set it to a multiple of 4",
+            {"max_num_tokens": 8190},
+            f"{_BUDGET_RULE}: the prefill cells get a budget of 8190 tokens{_PROBE_REMEDY}",
+            {"max_num_tokens": 8188},
         ),
         (
-            {"max_num_tokens": 8190, "max_prefill_isl": 4096, "max_num_batched_tokens": None, "runtime_memory": False},
+            {"max_num_tokens": 8190, "worker_type": "decode"},
+            f"{_BUDGET_RULE}: the decode cells get --fpm-max-num-batched-tokens=8190{_PROBE_REMEDY}",
+            {"max_num_tokens": 8188, "worker_type": "decode"},
+        ),
+        (
+            {"max_num_tokens": 8190, "max_num_batched_tokens": None, "worker_type": "decode"},
             f"{_BUDGET_RULE}: the decode cells of the accepted deployment at TP 4 get its "
-            "resources.max_num_tokens=8190",
+            f"resources.max_num_tokens=8190{_PROBE_REMEDY}",
+            {"max_num_tokens": 8188, "max_num_batched_tokens": None, "worker_type": "decode"},
+        ),
+        # Without runtime memory the user sets the options. A prefill budget of its own takes the one option.
+        (
+            {"runtime_memory": False, "max_prefill_isl": 8190},
+            f"{_BUDGET_RULE}: the prefill cells get a budget of 8190 tokens; set --fpm-max-prefill-isl to a multiple "
+            "of 4, for example 8188",
+            {"runtime_memory": False, "max_prefill_isl": 8188},
+        ),
+        # An aggregated plan takes one value for both options. Here both are unset, and the budget is the profile's.
+        (
+            {
+                "runtime_memory": False,
+                "max_num_tokens": 8190,
+                "worker_type": "aggregated",
+                "max_prefill_isl": None,
+                "max_num_batched_tokens": None,
+            },
+            f"{_BUDGET_RULE}: the prefill cells get a budget of 8190 tokens{_SHARED_REMEDY}",
+            {
+                "runtime_memory": False,
+                "max_num_tokens": 8190,
+                "worker_type": "aggregated",
+                "max_prefill_isl": 8188,
+                "max_num_batched_tokens": 8188,
+            },
+        ),
+        (
+            {"runtime_memory": False, "max_num_tokens": 8192, "max_num_batched_tokens": 8190, "max_prefill_isl": 4096},
+            f"{_BUDGET_RULE}: the decode cells get --fpm-max-num-batched-tokens=8190{_SHARED_REMEDY}",
+            {"runtime_memory": False, "max_num_tokens": 8192, "max_num_batched_tokens": 8188, "max_prefill_isl": 8188},
+        ),
+        (
+            {"runtime_memory": False, "max_num_tokens": 8190, "max_num_batched_tokens": None, "max_prefill_isl": 4096},
+            f"{_BUDGET_RULE}: the decode cells of the accepted deployment at TP 4 get its "
+            f"resources.max_num_tokens=8190{_SHARED_REMEDY}",
+            {"runtime_memory": False, "max_num_tokens": 8190, "max_num_batched_tokens": 8188, "max_prefill_isl": 8188},
         ),
     ],
-    ids=["prefill-isl", "batched-tokens-option", "deployment"],
+    ids=[
+        "prefill-recorded",
+        "batched-tokens-recorded",
+        "deployment-recorded",
+        "prefill-isl",
+        "prefill-aggregated",
+        "batched-tokens-option",
+        "deployment",
+    ],
 )
-def test_glm_plan_with_a_user_point_list_refuses_a_token_budget_that_is_no_multiple_of_4(tmp_path, changes, text):
+def test_glm_plan_with_a_user_point_list_refuses_a_token_budget_that_is_no_multiple_of_4(
+    tmp_path, refused, text, remedy
+):
     # The producer refuses a token budget that is no multiple of its chunk alignment when the engine starts. A user list
     # skips the generator, so the planner checks the budget that the runner renders for the cells of each phase. Each
-    # case holds one such budget, and the other budgets are multiples of 4.
+    # case holds one such budget, and the other budgets are multiples of 4. The text names the source of the value and
+    # a way out, and the plan with that way out taken plans.
     with pytest.raises(ValueError) as error:
-        _glm_plan(tmp_path, **changes, **_glm_user_points(tmp_path))
+        _glm_plan(tmp_path, **refused, **_glm_user_points(tmp_path))
     assert str(error.value) == text
-    plan = _glm_plan(tmp_path, max_num_tokens=8192, **_glm_user_points(tmp_path))
+    plan = _glm_plan(tmp_path, **remedy, **_glm_user_points(tmp_path))
     assert plan.to_dict()["point_generation"]["source"] == "frozen_explicit_manifest"
 
 
@@ -2503,6 +2571,63 @@ def test_glm_plan_reads_no_deployment_budget_beside_the_option(tmp_path):
 def test_glm_plan_of_a_role_checks_the_budget_of_its_own_phase_only(tmp_path, role, changes):
     plan = _glm_plan(tmp_path, worker_type=role, runtime_memory=False, **changes, **_glm_user_points(tmp_path))
     assert {cell.workload_kind for cell in plan.cells} == {role}
+
+
+# Declared memory of a deployment without runtime memory: the weights alone exceed every GPU, or fit easily.
+_DECLARED_REST = {"activations_bytes": 1, "runtime_overhead_bytes": 1, "comm_overhead_bytes": 1}
+_DECLARED_HUGE = {"weights_bytes": 2**45, **_DECLARED_REST}
+_DECLARED_SMALL = {"weights_bytes": 2**20, **_DECLARED_REST}
+
+
+@pytest.mark.parametrize("fits", [False, True], ids=["dropped", "kept"])
+def test_glm_plan_checks_the_decode_budget_of_the_deployments_that_keep_cells(tmp_path, fits):
+    # A second pure-TP deployment at TP 8 holds a token limit that is no multiple of 4. When its declared memory does
+    # not fit a GPU, memory admission drops it, no cell launches with its limit, and the plan keeps the TP 4 cells.
+    extra = {
+        "tp": 8,
+        "moe_tp": 8,
+        "resources": {"max_num_tokens": 8190, **(_DECLARED_SMALL if fits else _DECLARED_HUGE)},
+    }
+    build = dict(
+        runtime_memory=False,
+        extra_deployments=[extra],
+        max_num_tokens=8192,
+        max_prefill_isl=4096,
+        max_num_batched_tokens=None,
+        gpu_counts=(4, 8),
+        max_gpus=8,
+        **_glm_user_points(tmp_path),
+    )
+    if not fits:
+        plan = _glm_plan(tmp_path, **build)
+        assert {(cell.topology.tp, cell.workload_kind) for cell in plan.cells} == {(4, "prefill"), (4, "decode")}
+        return
+    with pytest.raises(ValueError) as error:
+        _glm_plan(tmp_path, **build)
+    assert str(error.value) == (
+        f"{_BUDGET_RULE}: the decode cells of the accepted deployment at TP 8 get its resources.max_num_tokens=8190"
+        "; set --fpm-max-prefill-isl and --fpm-max-num-batched-tokens to one multiple of 4 within the max_num_tokens "
+        "of every deployment of the accepted profile, below 8190"
+    )
+
+
+def test_glm_plan_refuses_the_prefill_budget_before_the_decode_budget(tmp_path):
+    # Both budgets of this plan are no multiple of 4. The prefill budget speaks first.
+    with pytest.raises(ValueError) as error:
+        _glm_plan(
+            tmp_path, runtime_memory=False, max_num_tokens=8194, max_prefill_isl=8190, **_glm_user_points(tmp_path)
+        )
+    assert str(error.value) == (
+        f"{_BUDGET_RULE}: the prefill cells get a budget of 8190 tokens; set --fpm-max-prefill-isl to a multiple of 4, "
+        "for example 8188"
+    )
+
+
+def test_glm_plan_refuses_the_token_budget_before_the_hash_block(tmp_path):
+    # A user list with a recorded budget and a hash block that both break their rules. The budget speaks first.
+    with pytest.raises(ValueError) as error:
+        _glm_plan(tmp_path, max_num_tokens=8190, hash_block_size_tokens=16, **_glm_user_points(tmp_path))
+    assert str(error.value) == f"{_BUDGET_RULE}: the prefill cells get a budget of 8190 tokens{_PROBE_REMEDY}"
 
 
 @pytest.mark.parametrize("user_list", [False, True], ids=["generated", "user-list"])
@@ -2537,22 +2662,23 @@ def _version_refusal(runtime):
     return f"GLM-5.3-Flash collection supports vLLM 0.33.0 only, and the runtime of this plan is vLLM {runtime!r}"
 
 
-@pytest.mark.parametrize("runtime", ["0.31.0", "0.33.1", "0.33.0+local"])
-def test_glm_plan_refuses_another_vllm_runtime(tmp_path, runtime):
+@pytest.mark.parametrize("runtime", ["0.31.0", "0.32.0", "0.33.1", "0.33.0+local"])
+@pytest.mark.parametrize("recorded", [None, "0.32.0"], ids=["no-probe-version", "probe-0.32.0"])
+def test_glm_plan_refuses_another_observed_vllm_runtime(tmp_path, runtime, recorded):
     # The producer's gate takes the exact installed version 0.33.0 only, so a local version suffix is another runtime.
+    # The version that the runtime memory records does not change the outcome.
     with pytest.raises(ValueError) as error:
-        _glm_plan(tmp_path, backend_version="0.33.0", runtime_framework_version=runtime)
+        _glm_plan(tmp_path, backend_version="0.33.0", observed=runtime, runtime_framework_version=recorded)
     assert str(error.value) == _version_refusal(runtime)
 
 
 @pytest.mark.parametrize("label", ["0.31.0", "0.32.0", "glm53-pilot"])
-@pytest.mark.parametrize("runtime", [None, "0.33.0"], ids=["label-only", "runtime-0.33.0"])
-def test_glm_plan_reads_no_data_label_as_the_runtime_version(tmp_path, label, runtime):
-    # The deployment's backend_version is a data label. A profile that records the evidence of vLLM 0.33.0 under another
-    # label, as the documented reuse of an observed profile holds it, plans; so does a label without a runtime version,
-    # whose runtime the producer's gate checks.
-    plan = _glm_plan(tmp_path, backend_version=label, runtime_framework_version=runtime)
-    assert plan.fpm_profile.deployments[0].backend_version == label
+@pytest.mark.parametrize("recorded", [None, "0.33.0", "0.32.0"], ids=["label-only", "probe-0.33.0", "probe-0.32.0"])
+def test_glm_plan_reads_neither_the_data_label_nor_the_probe_version(tmp_path, label, recorded):
+    # The deployment's backend_version is a data label, and the version that its runtime memory records is that of the
+    # probe. Neither names the runtime of the plan, whose version the producer's gate checks in the container.
+    plan = _glm_plan(tmp_path, backend_version=label, runtime_framework_version=recorded)
+    assert (plan.fpm_profile.deployments[0].backend_version, plan.runtime_backend_version) == (label, None)
 
 
 @pytest.mark.parametrize(
@@ -2565,8 +2691,21 @@ def test_glm_plan_reads_no_data_label_as_the_runtime_version(tmp_path, label, ru
         ({"label": "0.32.0", "observed": None, "launch_runtime": None}, None),
         ({"label": "0.33.0", "observed": None, "launch_runtime": None, "bundle_version": "0.31.0"}, "0.31.0"),
         ({"label": "0.33.0", "observed": "0.33.1", "launch_runtime": "0.33.1", "bundle_version": "0.33.1"}, "0.33.1"),
+        # A probe version beside them is not read.
+        ({"recorded": "0.32.0", "observed": None, "launch_runtime": None}, None),
+        ({"recorded": "0.32.0", "observed": "0.32.0", "launch_runtime": None, "bundle_version": "0.32.0"}, "0.32.0"),
+        ({"recorded": "0.32.0", "observed": None, "launch_runtime": None, "bundle_version": "0.32.0"}, "0.32.0"),
     ],
-    ids=["observed", "launch", "bundle", "bundle-0.31.0", "observed-0.33.1"],
+    ids=[
+        "observed",
+        "launch",
+        "bundle",
+        "bundle-0.31.0",
+        "observed-0.33.1",
+        "probe-0.32.0",
+        "probe-and-observed-0.32.0",
+        "probe-and-bundle-0.32.0",
+    ],
 )
 @pytest.mark.usefixtures("no_models_or_timing_data")
 def test_probe_backed_glm_plan_takes_the_runtime_version_of_the_launch_or_the_bundle(tmp_path, kwargs, runtime):
@@ -2577,6 +2716,43 @@ def test_probe_backed_glm_plan_takes_the_runtime_version_of_the_launch_or_the_bu
     with pytest.raises(ValueError) as error:
         _probe_backed_glm_plan(tmp_path, **kwargs)
     assert str(error.value) == _version_refusal(runtime)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "text"),
+    [
+        ({"with_launch": False}, "^formal runtime instrumentation requires the accepted probe launch facts$"),
+        ({"damage": "manifest"}, "^invalid instrumentation manifest: "),
+        ({"damage": "file"}, "^artifact is not a contained regular file: observer.py$"),
+        ({"bundle_version": "0.33.0"}, "^instrumentation runtime version differs from the requested version$"),
+    ],
+    ids=["bundle-without-launch", "manifest-does-not-parse", "declared-file-missing", "bundle-differs"],
+)
+@pytest.mark.usefixtures("no_models_or_timing_data")
+def test_probe_backed_glm_plan_keeps_the_bundle_text_before_the_version_text(tmp_path, kwargs, text):
+    # The observed version 0.32.0 breaks the version rule, and the bundle breaks an older rule of the planner. The text
+    # of the bundle speaks first.
+    with pytest.raises(ValueError, match=text):
+        _probe_backed_glm_plan(
+            tmp_path, observed="0.32.0", launch_runtime=None, **{"bundle_version": "0.32.0", **kwargs}
+        )
+
+
+def test_probe_backed_glm_plan_without_a_profile_checks_the_prefill_sampling_budget(tmp_path):
+    # Without a profile the planner leaves --fpm-max-prefill-isl unset, and a prefill cell gets the shared option.
+    with pytest.raises(ValueError) as error:
+        _probe_backed_glm_plan(
+            tmp_path,
+            with_profile=False,
+            worker_type="prefill",
+            max_prefill_isl=None,
+            max_num_batched_tokens=8190,
+            **_glm_user_points(tmp_path),
+        )
+    assert str(error.value) == (
+        f"{_BUDGET_RULE}: the prefill cells get a budget of 8190 tokens; set --fpm-max-prefill-isl and "
+        "--fpm-max-num-batched-tokens to one multiple of 4, below 8190"
+    )
 
 
 @pytest.mark.parametrize(
@@ -2598,23 +2774,20 @@ def test_glm_plan_refuses_expert_and_data_parallel_layouts(tmp_path, preset, top
     assert "'moe_ep': 4" in text
 
 
-def test_glm_runtime_version_takes_the_first_source_that_exists(tmp_path):
-    def deployment(version):
-        memory = SimpleNamespace(runtime_framework_version=version)
-        return SimpleNamespace(resources=SimpleNamespace(runtime_memory=memory))
-
+def test_glm_runtime_version_reads_the_observed_version_and_the_staged_bundle_only(tmp_path):
     bundle = SimpleNamespace(manifest={"runtime": {"version": "0.33.1"}})
-    recorded = [deployment("0.32.0"), deployment(None), SimpleNamespace(resources=SimpleNamespace(runtime_memory=None))]
-    assert planner._glm_runtime_version("0.33.0", bundle, recorded) == "0.33.0"
-    assert planner._glm_runtime_version(None, bundle, recorded) == "0.33.1"
-    assert planner._glm_runtime_version(None, None, recorded) == "0.32.0"
-    # Deployments that record two versions name no runtime of the plan, and the producer's gate decides.
-    assert planner._glm_runtime_version(None, None, [*recorded, deployment("0.33.0")]) is None
-    # A bundle that does not load gives no version here; the planner refuses it later with its own text.
+    launch = {"identity": {}}
+    assert planner._glm_runtime_version("0.33.0", None, None) == "0.33.0"
+    assert planner._glm_runtime_version(None, None, None) is None
+    assert planner._glm_runtime_version(None, bundle, launch) == "0.33.1"
+    assert planner._glm_runtime_version("0.33.1", bundle, launch) == "0.33.1"
+    # Each of these plans gets the older text of the bundle or of the launch, so the version rule does not speak.
+    assert planner._glm_runtime_version("0.33.0", bundle, launch) is None
+    assert planner._glm_runtime_version("0.32.0", bundle, None) is None
+    assert planner._glm_runtime_version("0.32.0", None, launch) is None
     broken = tmp_path / "broken.yaml"
     broken.write_text("[")
-    assert planner._glm_runtime_version(None, str(broken), recorded) == "0.32.0"
-    assert planner._glm_runtime_version(None, None, ()) is None
+    assert planner._glm_runtime_version("0.32.0", str(broken), launch) is None
 
 
 def test_glm_plan_refuses_the_token_budget_before_the_layout(tmp_path):
@@ -2624,12 +2797,10 @@ def test_glm_plan_refuses_the_token_budget_before_the_layout(tmp_path):
             tmp_path,
             preset="tep",
             topology={"tp": 4, "dp": 1, "moe_tp": 1, "moe_ep": 4},
-            max_prefill_isl=8190,
+            max_num_tokens=8190,
             **_glm_user_points(tmp_path),
         )
-    assert str(error.value) == (
-        f"{_BUDGET_RULE}: the prefill cells get a budget of 8190 tokens; set --fpm-max-prefill-isl to a multiple of 4"
-    )
+    assert str(error.value) == f"{_BUDGET_RULE}: the prefill cells get a budget of 8190 tokens{_PROBE_REMEDY}"
 
 
 @pytest.mark.parametrize("tp", [1, 2, 4])
@@ -2809,6 +2980,11 @@ def _probe_backed_glm_plan(
     observed="0.33.0",
     launch_runtime="0.33.0",
     bundle_version="0.33.0",
+    recorded=None,
+    with_profile=True,
+    with_launch=True,
+    damage=None,
+    **changes,
 ):
     """The GLM-5.3-Flash collection plan of guided collection, bound to the accepted runtime probe.
 
@@ -2821,7 +2997,10 @@ def _probe_backed_glm_plan(
     the model revision of the launch only. ``label`` is the data label of the profile, the launch and the collector
     configuration. ``observed`` is the observed runtime version of the collector configuration, ``launch_runtime`` the
     runtime version of the launch identity and ``bundle_version`` the runtime version of the instrumentation bundle;
-    None leaves the first two out. Return the plan and the deployment inputs that it was planned with.
+    None leaves the first two out. A ``recorded`` version is the runtime version that the profile's runtime memory
+    records. ``with_profile`` and ``with_launch`` False leave the profile or the probe launch out. ``damage`` breaks the
+    bundle: ``"manifest"`` writes a manifest that does not parse, ``"file"`` removes a declared file. ``changes``
+    replace option fields before planning. Return the plan and the deployment inputs that it was planned with.
     """
     from collector.model_cases import build_collection_case_plan
 
@@ -2872,6 +3051,7 @@ def _probe_backed_glm_plan(
                         "enable_prefix_caching": True,
                         "mamba_cache_mode": "align",
                         "hash_block_size_tokens": 2176,
+                        **({} if recorded is None else {"runtime_framework_version": recorded}),
                     },
                     "cache_layout": "grouped",
                     "cache_groups": glm_tp4_cache_groups(),
@@ -2940,23 +3120,27 @@ def _probe_backed_glm_plan(
         labels["kvcache_quant_mode"],
     ]
     overrides = {"K8sConfig": {"k8s_image": image}}
+    if damage == "manifest":
+        manifest.write_text("[")
+    elif damage == "file":
+        (tmp_path / "observer.py").unlink()
     case_plan = build_collection_case_plan(backend="vllm", model_path=model, gpu_type=system)
     plan = planner.build_collection_plan(
         backend="vllm",
         model_path=model,
         system=system,
         selected_ops=set(case_plan.selected_ops),
-        options=FPMCollectionOptions.from_args(cli._parser().parse_args(argv)),
+        options=replace(FPMCollectionOptions.from_args(cli._parser().parse_args(argv)), **changes),
         model_architecture=case_plan.model_architecture,
         has_model_cases=bool(case_plan.model_cases_paths),
-        fpm_profile=profile,
+        fpm_profile=profile if with_profile else None,
         collector_config={
             **({} if observed is None else {"runtime_backend_version": observed}),
             "aic_database_version": label,
         },
         generator_overrides=overrides,
         runtime_instrumentation=str(manifest),
-        runtime_launch=launch,
+        runtime_launch=launch if with_launch else None,
         runtime_configuration=f"gb300-tp{tp}",
     )
     return plan, overrides
