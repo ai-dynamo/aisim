@@ -509,6 +509,13 @@ The connector-specific copy timing is:
   its copy ends. vLLM sleeps 1 ms after each empty step, so it schedules the
   request a few milliseconds later.
 
+Replay releases a load's CPU source-block pins when the copy finishes.
+With `offloading_v0_32`, it still retains the load's lookup keys until the
+scheduler activates the load after polling. vLLM keeps the source blocks
+pinned until it observes completion. This is an approximation under cache
+pressure: a competing store can evict the unpinned CPU blocks before the
+poll, so a later request may miss rather than wait for the existing load.
+
 Each check comes at the end of a launch, and only `launch` times launches, so
 the rule needs no setting of its own and applies only with `launch`. Without
 it, and with `offloading_v0_24`, a request can join the first pass decided

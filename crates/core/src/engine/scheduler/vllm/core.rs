@@ -768,6 +768,16 @@ enum LoadRelease {
     },
 }
 
+impl LoadRelease {
+    fn is_due(self, decision: u64, now_ms: f64) -> bool {
+        match self {
+            Self::Decision(from) => from <= decision,
+            Self::AfterPoll { .. } => false,
+            Self::At { at_ms, .. } => at_ms <= now_ms,
+        }
+    }
+}
+
 /// Load poll: where a CPU-tier load stands in vLLM's frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct LoadClock {
@@ -2376,10 +2386,20 @@ impl VllmCore {
     /// empty batch: a pending load is seen when its copy ends and is
     /// schedulable then.
     fn settle_loads_in_empty_steps(&mut self, now_ms: f64) {
+        if !self.load_poll() {
+            return;
+        }
         // An activated restore can still be in connector_waiting when a
         // running prefill consumed the previous pass's entire token budget.
-        let idle = !self.has_schedulable_requests();
-        if !self.load_poll() || !(idle || self.last_pass_empty) {
+        // A due activation is runnable too, even before schedule_pass releases
+        // it from its deadline-only connector wait. Neither permits empty
+        // steps to see another load before its next post-forward poll.
+        let idle = !self.has_schedulable_requests()
+            && !self
+                .pending_activations
+                .iter()
+                .any(|&(_, _, release)| release.is_due(self.passes_executed, now_ms));
+        if !(idle || self.last_pass_empty) {
             return;
         }
         for (_, _, release) in &mut self.pending_activations {
@@ -2413,15 +2433,11 @@ impl VllmCore {
         let mut due = Vec::new();
         self.pending_activations
             .retain(|&(uuid, transfer_id, release)| {
-                let release = match release {
-                    LoadRelease::Decision(from) => from <= decision,
-                    LoadRelease::AfterPoll { .. } => false,
-                    LoadRelease::At { at_ms, .. } => at_ms <= now_ms,
-                };
-                if release {
+                let due_now = release.is_due(decision, now_ms);
+                if due_now {
                     due.push(CompletedLoad { uuid, transfer_id });
                 }
-                !release
+                !due_now
             });
         if !due.is_empty() {
             self.activate_loads_now(due);

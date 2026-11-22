@@ -4565,6 +4565,53 @@ mod tests {
     }
 
     #[test]
+    fn a_due_restore_keeps_an_unpolled_restore_out_of_empty_steps() {
+        // The last decode ends after decision m+3. Restore A, issued by m,
+        // copies from S(m)+10 to S(m)+13. The poll of m+2 at S(m)+15 sees it,
+        // so it is due at m+4 but is still a deadline-only connector waiter
+        // when the last decode ends. Restore B, issued by m+2, copies until
+        // S(m)+33, after m+3's poll at S(m)+25. A must keep the engine busy:
+        // m+4 polls B during A's prefill, making B schedulable at m+6.
+        let mut run = PollRun::storing(
+            G2Connector::OffloadingV032,
+            3.0,
+            false,
+            Some(PollRun::LAUNCH),
+            &[(1, 0..22), (5, 100..122)],
+        );
+        run.submit(9, (900..906).collect(), 10);
+        for _ in 0..6 {
+            run.step();
+        }
+        let m = run.passes.len();
+        run.submit(3, (0..22).collect(), 2);
+        run.step();
+        run.step();
+        run.submit(6, (100..122).collect(), 2);
+        run.step();
+        run.step();
+        for id in [3, 6] {
+            let uuid = Uuid::from_u128(id);
+            assert!(run.core.test_awaits_poll(uuid));
+        }
+
+        run.step();
+        assert_eq!(admitted_in(&run, 3), Some(m + 4));
+        assert_eq!(admitted_in(&run, 6), None, "B still needs a poll");
+        run.step();
+        assert_eq!(admitted_in(&run, 6), None, "B waits two decisions");
+        run.step();
+        assert_eq!(admitted_in(&run, 6), Some(m + 6));
+        for _ in 0..16 {
+            if run.core.is_empty() && !run.core.is_ready() {
+                break;
+            }
+            run.step();
+        }
+        assert!(run.core.is_drained(), "every restore and store completes");
+    }
+
+    #[test]
     fn a_simple_cpu_copy_that_ends_before_replay_forms_its_pass_is_seen_by_the_next_poll() {
         // A 5 ms prefill launch. Pass P forms at T and was decided at T - 10.
         // Request 7 arrives after that decision, so the pass decided at T,
