@@ -332,7 +332,8 @@ def _glm_producer_record() -> dict[str, Any]:
         ).hexdigest(),
         "overlay_sha256": hashlib.sha256((_GLM_RUNTIME / "glm53flash_prefix_scheduler.py").read_bytes()).hexdigest(),
         # Version 1 names the shape of the context_policy record. Its rule is a lower bound: the runtime context is at
-        # least the measured context plus the producer's headroom. No consumer reads the number.
+        # least the measured context plus the producer's headroom. The reader only requires the number to be 1; nothing
+        # chooses a rule by it.
         "context_policy_version": 1,
         "warmup_repeats": 5,
         "measurement_repeats": 10,
@@ -587,7 +588,8 @@ def _validate_glm_provenance(
         )
 
     # The producer hashes each sidecar line without its line break and stores the digest in the row of the point with
-    # the line's benchmark_id. The lines follow the order in which the points ran.
+    # the line's benchmark_id. The lines follow the order in which the points ran. A row whose benchmark_id is no
+    # integer is left to the check of the row IDs in validate_native_collection.
     line_digests: dict[int, str] = {}
     for line in raw.splitlines():
         try:
@@ -603,7 +605,7 @@ def _validate_glm_provenance(
         if not _is_hex(row.get("repetition_evidence_sha256"), 64):
             raise lacks("repetition_evidence_sha256")
         benchmark_id = point.get("benchmark_id")
-        if type(benchmark_id) is not int or row["repetition_evidence_sha256"] != line_digests.get(benchmark_id):
+        if type(benchmark_id) is int and row["repetition_evidence_sha256"] != line_digests.get(benchmark_id):
             raise lacks("repetition_evidence_sha256")
         if point.get("point_type") == "decode":
             regime = "real_kv"

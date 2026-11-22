@@ -855,16 +855,6 @@ REFUSALS = [
     pytest.param("repetition_evidence", _first_line_is_no_utf8, id="sidecar-line-is-no-utf8"),
     pytest.param("repetition_evidence", _first_line_id_is_a_boolean, id="sidecar-id-is-a-boolean"),
     pytest.param(
-        "repetition_evidence_sha256",
-        lambda p, _: p["results"][0]["point"].update(benchmark_id=True),
-        id="row-id-is-a-boolean",
-    ),
-    pytest.param(
-        "repetition_evidence_sha256",
-        lambda p, _: p["results"][0]["point"].update(benchmark_id=[1]),
-        id="row-id-is-a-list",
-    ),
-    pytest.param(
         "kv_seed_regime", lambda p, _: p["results"][0].update(kv_seed_regime="real_prefix"), id="regime-of-cold-row"
     ),
     pytest.param(
@@ -979,21 +969,68 @@ def test_fixture_holds_the_real_token_stream_record():
 
 def test_seeded_input_record_cannot_be_changed_by_a_caller(tmp_path):
     record = native_artifact._glm_input_record(seeded.GENERATOR_VERSION)
-    with pytest.raises(TypeError):
-        record["seed"] = 54
-    with pytest.raises(TypeError):
-        del record["seed"]
-    # Every later validation of the process still compares with the pinned seed.
+    try:
+        with pytest.raises(TypeError):
+            record["seed"] = 54
+        with pytest.raises(TypeError):
+            del record["seed"]
+        # Every later validation of the process still compares with the pinned seed.
+        cell = glm_cell("prefill")
+        payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
+        payload["input_provenance"]["seed"] = 54
+        write_glm_rank(_pod(tmp_path, cell), payload)
+        with pytest.raises(ValueError, match=r"native GLM-5\.3-Flash result lacks valid input_provenance\.seed: "):
+            _validate(tmp_path, cell)
+    finally:
+        # A record that this test could change is drawn again for the tests that follow it.
+        native_artifact._glm_input_record.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("benchmark_id", "refusal"),
+    [
+        pytest.param(True, "native point field 'benchmark_id' must be an integer, got True", id="boolean"),
+        pytest.param(1.0, "native point field 'benchmark_id' must be an integer, got 1.0", id="float"),
+        pytest.param("1", "native point field 'benchmark_id' must be an integer, got '1'", id="string"),
+    ],
+)
+def test_row_id_that_is_no_integer_is_refused_by_the_check_of_the_row_ids(tmp_path, benchmark_id, refusal):
+    # The digest of the row is that of the line with ID 1. The digest rule compares only a row whose ID is an integer,
+    # so the check of the row IDs names the ID.
     cell = glm_cell("prefill")
+    pod = _pod(tmp_path, cell)
     payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
-    payload["input_provenance"]["seed"] = 54
-    write_glm_rank(_pod(tmp_path, cell), payload)
-    with pytest.raises(ValueError, match=r"native GLM-5\.3-Flash result lacks valid input_provenance\.seed: "):
+    artifact = write_glm_rank(pod, payload)
+    payload["results"][0]["point"]["benchmark_id"] = benchmark_id
+    artifact.write_text(json.dumps(payload))
+    with pytest.raises(ValueError) as error:
         _validate(tmp_path, cell)
+    assert str(error.value) == refusal
+
+
+def test_digest_rule_passes_a_row_whose_id_is_a_list_without_an_error(tmp_path):
+    # The digest rule compares only a row whose ID is an integer, so a list ID passes it and every other rule of the
+    # GLM-5.3-Flash reader. The check of the row IDs comes after it.
+    cell = glm_cell("prefill")
+    pod = _pod(tmp_path, cell)
+    payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
+    artifact = write_glm_rank(pod, payload)
+    payload["results"][0]["point"]["benchmark_id"] = [1]
+    artifact.write_text(json.dumps(payload))
+    stored = json.loads(artifact.read_text())
+    assert native_artifact._validate_glm_provenance(cell, stored, artifact) == stored["input_provenance"]
+
+
+def _other_execution_profile(payload: dict, _sidecar: Path) -> None:
+    payload["execution_identity"].update(execution_profile="decoder_bounded")
 
 
 def _no_chunk_alignment(payload: dict, _sidecar: Path) -> None:
     _evidence(payload).update(chunk_start_alignment=1)
+
+
+def _kvwarm_disabled(payload: dict, _sidecar: Path) -> None:
+    payload["kvwarm"].update(enabled=False)
 
 
 def _wall_clock_boundary(payload: dict, _sidecar: Path) -> None:
@@ -1016,6 +1053,10 @@ def _second_row_without_a_digest(payload: dict, _sidecar: Path) -> None:
     payload["results"][1].pop("repetition_evidence_sha256")
 
 
+def _second_row_with_the_digest_of_no_line(payload: dict, _sidecar: Path) -> None:
+    payload["results"][1].update(repetition_evidence_sha256=hashlib.sha256(b"another point").hexdigest())
+
+
 def _float_record_count(payload: dict, _sidecar: Path) -> None:
     _evidence(payload)["repetition_evidence_manifest"].update(records=2.0)
 
@@ -1036,25 +1077,39 @@ def _other_seed(payload: dict, _sidecar: Path) -> None:
     _evidence(payload).update(seed=54)
 
 
-# The reader checks, in this order: the input fields, the sidecar manifest with the type of its record count, kvwarm,
-# the timing boundary, the two older serving keys, the three serving rules of the producer's points, the producer
-# record, the sidecar lines, then for each row the form of its digest, its digest against its line and its regime, and
-# last the seeded input record. An artifact with two faults is refused for the one that comes first in this order.
+# The reader checks, in this order: the execution identity, the input fields, the sidecar manifest with the type of its
+# record count, kvwarm, the timing boundary, the serving keys enable_prefix_caching and async_scheduling, the Mamba
+# cache mode, the scheduler block, the aligned split, the producer record, the sidecar lines, then for each row in turn
+# the form of its digest, its digest against its line and its regime, and last the seeded input record. Each case names
+# a check that runs first and a check that runs second. An artifact with both faults is refused for the check that runs
+# first, whichever fault was written first.
 ORDERED_FAULTS = [
+    pytest.param(
+        _other_execution_profile,
+        "execution_identity",
+        _float_record_count,
+        "repetition_evidence_manifest",
+        id="execution-identity-before-the-record-count",
+    ),
     pytest.param(
         _no_chunk_alignment,
         "input_provenance.chunk_start_alignment",
         _float_record_count,
         "repetition_evidence_manifest",
-        "input_provenance.chunk_start_alignment",
-        id="record-count-after-the-input-fields",
+        id="input-fields-before-the-record-count",
     ),
     pytest.param(
-        _wall_clock_boundary,
-        "timing_boundary",
         _float_record_count,
         "repetition_evidence_manifest",
+        _kvwarm_disabled,
+        "kvwarm.enabled",
+        id="record-count-before-kvwarm",
+    ),
+    pytest.param(
+        _float_record_count,
         "repetition_evidence_manifest",
+        _wall_clock_boundary,
+        "timing_boundary",
         id="record-count-before-the-timing-boundary",
     ),
     pytest.param(
@@ -1062,47 +1117,62 @@ ORDERED_FAULTS = [
         "serving_config.async_scheduling",
         _mamba_mode_none,
         "serving_config.mamba_cache_mode",
-        "serving_config.async_scheduling",
-        id="mamba-mode-after-the-older-serving-keys",
+        id="async-scheduling-before-the-mamba-mode",
     ),
     pytest.param(
-        _other_warmup_repeats,
-        "producer.warmup_repeats",
+        _async_scheduling,
+        "serving_config.async_scheduling",
+        _small_scheduler_block,
+        "serving_config.block_size",
+        id="async-scheduling-before-the-scheduler-block",
+    ),
+    pytest.param(
+        _async_scheduling,
+        "serving_config.async_scheduling",
+        _no_aligned_split,
+        "serving_config.need_mamba_block_aligned_split",
+        id="async-scheduling-before-the-aligned-split",
+    ),
+    pytest.param(
         _mamba_mode_none,
         "serving_config.mamba_cache_mode",
+        _small_scheduler_block,
+        "serving_config.block_size",
+        id="mamba-mode-before-the-scheduler-block",
+    ),
+    pytest.param(
+        _mamba_mode_none,
         "serving_config.mamba_cache_mode",
+        _no_aligned_split,
+        "serving_config.need_mamba_block_aligned_split",
+        id="mamba-mode-before-the-aligned-split",
+    ),
+    pytest.param(
+        _small_scheduler_block,
+        "serving_config.block_size",
+        _no_aligned_split,
+        "serving_config.need_mamba_block_aligned_split",
+        id="scheduler-block-before-the-aligned-split",
+    ),
+    pytest.param(
+        _mamba_mode_none,
+        "serving_config.mamba_cache_mode",
+        _other_warmup_repeats,
+        "producer.warmup_repeats",
         id="mamba-mode-before-the-producer-record",
     ),
     pytest.param(
-        _async_scheduling,
-        "serving_config.async_scheduling",
         _small_scheduler_block,
         "serving_config.block_size",
-        "serving_config.async_scheduling",
-        id="block-after-the-older-serving-keys",
-    ),
-    pytest.param(
         _other_warmup_repeats,
         "producer.warmup_repeats",
-        _small_scheduler_block,
-        "serving_config.block_size",
-        "serving_config.block_size",
-        id="block-before-the-producer-record",
+        id="scheduler-block-before-the-producer-record",
     ),
     pytest.param(
-        _async_scheduling,
-        "serving_config.async_scheduling",
         _no_aligned_split,
         "serving_config.need_mamba_block_aligned_split",
-        "serving_config.async_scheduling",
-        id="aligned-split-after-the-older-serving-keys",
-    ),
-    pytest.param(
         _other_warmup_repeats,
         "producer.warmup_repeats",
-        _no_aligned_split,
-        "serving_config.need_mamba_block_aligned_split",
-        "serving_config.need_mamba_block_aligned_split",
         id="aligned-split-before-the-producer-record",
     ),
     pytest.param(
@@ -1110,15 +1180,13 @@ ORDERED_FAULTS = [
         "producer.warmup_repeats",
         _first_line_is_no_json,
         "repetition_evidence",
-        "producer.warmup_repeats",
-        id="sidecar-lines-after-the-producer-record",
+        id="producer-record-before-the-sidecar-lines",
     ),
     pytest.param(
-        _cold_row_with_a_prefix_regime,
-        "kv_seed_regime",
         _first_line_is_no_json,
         "repetition_evidence",
-        "repetition_evidence",
+        _cold_row_with_a_prefix_regime,
+        "kv_seed_regime",
         id="sidecar-lines-before-the-rows",
     ),
     pytest.param(
@@ -1126,45 +1194,49 @@ ORDERED_FAULTS = [
         "producer.warmup_repeats",
         _swap_the_row_digests,
         "repetition_evidence_sha256",
-        "producer.warmup_repeats",
-        id="row-digests-after-the-producer-record",
+        id="producer-record-before-the-row-digests",
+    ),
+    pytest.param(
+        _swap_the_row_digests,
+        "repetition_evidence_sha256",
+        _cold_row_with_a_prefix_regime,
+        "kv_seed_regime",
+        id="row-digest-before-the-regime-of-its-row",
     ),
     pytest.param(
         _cold_row_with_a_prefix_regime,
         "kv_seed_regime",
-        _swap_the_row_digests,
+        _second_row_with_the_digest_of_no_line,
         "repetition_evidence_sha256",
-        "repetition_evidence_sha256",
-        id="row-digest-before-the-regime-of-its-row",
+        id="regime-of-the-first-row-before-the-digest-of-the-second-row",
     ),
     pytest.param(
         _cold_row_with_a_prefix_regime,
         "kv_seed_regime",
         _other_seed,
         "input_provenance.seed",
-        "kv_seed_regime",
-        id="seeded-input-after-the-row-regimes",
+        id="row-regimes-before-the-seeded-input",
     ),
     pytest.param(
         _second_row_without_a_digest,
         "repetition_evidence_sha256",
         _other_seed,
         "input_provenance.seed",
-        "repetition_evidence_sha256",
-        id="seeded-input-after-the-row-digests",
+        id="row-digests-before-the-seeded-input",
     ),
 ]
 
 
-@pytest.mark.parametrize(("older", "older_field", "new", "new_field", "first_field"), ORDERED_FAULTS)
+@pytest.mark.parametrize(("runs_first", "first_field", "runs_second", "second_field"), ORDERED_FAULTS)
 def test_two_faults_are_refused_for_the_first_in_the_order_of_the_reader(
-    tmp_path, older, older_field, new, new_field, first_field
+    tmp_path, runs_first, first_field, runs_second, second_field
 ):
     cell = glm_cell("prefill")
     for name, tampers, field in (
-        ("older", [older], older_field),
-        ("new", [new], new_field),
-        ("both", [older, new], first_field),
+        ("first", [runs_first], first_field),
+        ("second", [runs_second], second_field),
+        ("both", [runs_first, runs_second], first_field),
+        ("both-written-the-other-way", [runs_second, runs_first], first_field),
     ):
         pod = _pod(tmp_path / name, cell)
         payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
