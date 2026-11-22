@@ -184,31 +184,47 @@ def _normalize_kv_dtype(value: str) -> str:
         ) from error
 
 
-def checkpoint_fmha_quant_mode(config: dict[str, object], architecture: str | None, kv_cache_dtype: str) -> str:
+def checkpoint_fmha_quant_mode(
+    config: dict[str, object],
+    architecture: str | None,
+    kv_cache_dtype: str,
+    inferred: dict[str, Any] | None = None,
+) -> str:
     """The FMHA label that checkpoint-native collection gives a checkpoint with one KV-cache dtype.
 
-    ``config`` is the effective model configuration after ``_attach_inferred_quant_fields``. A bfloat16 KV cache keeps
-    bfloat16 attention, because weight quantization does not require quantized KV storage. The other labels that
-    ``_normalize_kv_dtype`` accepts (``auto``, ``fp8``, ``fp8_e4m3`` and ``int8``) take the FMHA mode that the
-    checkpoint inference names, and bfloat16 when it names none. Any other label, for example ``half``, raises
-    ValueError. The runtime probe preview and the observation import apply the same label to each KV-cache dtype that
-    ``has_checkpoint_fmha`` accepts, so such a profile that passes them passes collection planning.
+    ``config`` is the effective model configuration after ``_attach_inferred_quant_fields``. ``inferred`` is the result
+    of ``_infer_quant_modes_from_raw_config(config, architecture)`` when the caller holds it; otherwise this function
+    infers it. A bfloat16 KV cache keeps bfloat16 attention, because weight quantization does not require quantized KV
+    storage. The other labels that ``_normalize_kv_dtype`` accepts (``auto``, ``fp8``, ``fp8_e4m3`` and ``int8``) take
+    the FMHA mode that the checkpoint inference names, and bfloat16 when it names none. Any other label, for example
+    ``half``, raises ValueError. The runtime probe preview and the observation import apply the same label to each
+    KV-cache dtype that ``has_checkpoint_fmha`` accepts, so such a profile that passes them passes collection planning.
+    For a bfloat16 KV cache the label is bfloat16, and the preview and the import refuse another one. For a KV-cache
+    dtype without an AIC mode, for example float16 (label ``half``), they keep the observed compute dtype. Neither
+    reads a checkpoint configuration for these two.
     """
     if _normalize_kv_dtype(kv_cache_dtype) == "bfloat16":
         return "bfloat16"
-    inferred = _infer_quant_modes_from_raw_config(config, architecture)
+    if inferred is None:
+        inferred = _infer_quant_modes_from_raw_config(config, architecture)
     return _enum_name(inferred.get("fmha_quant_mode", common.FMHAQuantMode.bfloat16))
 
 
 def has_checkpoint_fmha(kv_cache_dtype: str) -> bool:
     """Whether the FMHA label of this KV-cache dtype is the checkpoint-native one of ``checkpoint_fmha_quant_mode``.
 
-    True for an AIC KV-cache mode other than bfloat16, for example fp8. The runtime probe preview and the observation
-    import keep the observed compute dtype as the FMHA label of a bfloat16 KV cache and of a KV-cache dtype without an
-    AIC mode, for example float16 (label ``half``), and read no checkpoint configuration for it.
+    True for an AIC KV-cache mode other than bfloat16, for example fp8. For a bfloat16 KV cache the FMHA label is
+    bfloat16, and the runtime probe preview and the observation import refuse another one (``bfloat16_kv_cache``). For
+    a KV-cache dtype without an AIC mode, for example float16 (label ``half``), they keep the observed compute dtype as
+    the FMHA label. Neither reads a checkpoint configuration for these two.
     """
     mode = _KV_ALIASES.get(kv_cache_dtype.lower())
     return mode != "bfloat16" and mode in {item.name for item in common.KVCacheQuantMode}
+
+
+def bfloat16_kv_cache(kv_cache_dtype: str) -> bool:
+    """Whether the KV-cache dtype label is the AIC KV-cache mode bfloat16, whose FMHA collection label is bfloat16."""
+    return _KV_ALIASES.get(kv_cache_dtype.lower()) == "bfloat16"
 
 
 def _supported_modes(supported: dict[str, Any], op: str) -> set[str]:
@@ -420,7 +436,7 @@ def resolve_model_capability(
             # Weight quantization does not require quantized KV storage.
             # Keep BF16 attention/cache identity for an explicit BF16 campaign;
             # runtime evidence must still match before measurements are accepted.
-            fmha_by_kv[kv_name] = checkpoint_fmha_quant_mode(config, architecture, kv_name)
+            fmha_by_kv[kv_name] = checkpoint_fmha_quant_mode(config, architecture, kv_name, inferred)
             fmha_resolution_by_kv[kv_name] = (
                 f"kv_dtype_dispatch_from_{inferred_fmha}"
                 if fmha_by_kv[kv_name] != inferred_fmha

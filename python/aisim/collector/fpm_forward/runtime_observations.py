@@ -40,7 +40,7 @@ from aisim_core.fpm_profile import FpmResourceProfile
 from aisim_core.sdk.perf_database import load_system_spec
 
 from . import runtime_evidence, runtime_memory
-from .capabilities import checkpoint_fmha_quant_mode, has_checkpoint_fmha
+from .capabilities import bfloat16_kv_cache, checkpoint_fmha_quant_mode, has_checkpoint_fmha
 from .config import PrefillSamplingProfile, collection_phases
 from .model_capability import load_model_config
 from .planner import BackendPolicy, FPMCell
@@ -193,6 +193,8 @@ def _staged_checkpoint_fmha(root: Path, references: list[Any], launch: dict[str,
     the configuration comes from hash-bound copies. runtime_probe.stage_runtime_instrumentation writes model-config.json
     and each declared sidecar into every probe and collection phase, and the phase lists them with their digests. The
     collector's loader reads the copy and merges the hf_quant_config.json beside it, so that sidecar must be declared.
+    A staged hf_quant_config.json that the launch does not declare is refused on purpose: the probe stages only declared
+    sidecars, so such a file does not belong to the launch.
     """
     sources = _source_files(launch)
     staged: dict[str, list[tuple[Path, str]]] = {"model-config.json": [], "hf_quant_config.json": []}
@@ -304,7 +306,7 @@ def _validate_record(
 
     ``checkpoint_fmha`` is the checkpoint-native FMHA label of the phase's staged model configuration. It is None for
     a bfloat16 KV cache and for a KV-cache dtype without an AIC mode, whose FMHA precision is the observed compute
-    dtype.
+    dtype. A bfloat16 KV cache takes the label bfloat16.
     """
     if record.get("schema_version") != OBSERVATION_SCHEMA:
         raise ValueError("unsupported runtime observation schema")
@@ -396,6 +398,11 @@ def _validate_record(
     if checkpoint_fmha is None:
         if cell.fmha_quant_mode not in {"half", "bfloat16"} or observed != cell.fmha_quant_mode:
             raise ValueError("FMHA precision lacks a supported observed compute-dtype mapping")
+        if bfloat16_kv_cache(cell.kv_cache_dtype) and cell.fmha_quant_mode != "bfloat16":
+            raise ValueError(
+                f"FMHA precision {cell.fmha_quant_mode!r} differs from 'bfloat16', the collection label of KV-cache "
+                f"dtype {cell.kv_cache_dtype!r}"
+            )
     elif observed not in {"half", "bfloat16"}:
         raise ValueError("FMHA precision lacks a supported observed compute-dtype mapping")
     elif cell.fmha_quant_mode != checkpoint_fmha:

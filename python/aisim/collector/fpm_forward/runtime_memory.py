@@ -696,7 +696,11 @@ def _normalized_groups(cache: dict[str, Any], scheduler_cache: dict[str, Any], p
                 # Frozen older bundles lack this independent startup observation; keep their checks.
                 if "startup_blocks_per_request" in state:
                     startup = state["startup_blocks_per_request"]
-                    expected = 2 + checkpoint if state.get("mamba_cache_mode") == "align" else 1
+                    # vLLM counts the speculative blocks too (kv_cache_interface.py:1135-1141), as the concurrency
+                    # check of the import does. The count is 0 here: the check above refuses any other.
+                    expected = state["num_speculative_blocks"] + (
+                        2 + checkpoint if state.get("mamba_cache_mode") == "align" else 1
+                    )
                     if type(startup) is not int or startup != expected:
                         raise ValueError(f"runtime Mamba startup blocks_per_request contradicts its spec: {names}")
             # blocks_per_request is the steady count, held between block boundaries. In vLLM 0.33.0, a MambaSpec

@@ -134,6 +134,40 @@ def test_float16_checkpoint_with_an_fp8_kv_cache_imports_the_fmha_label_of_colle
         ]
 
 
+@pytest.mark.parametrize("version", ["0.27.0", "0.33.0"])
+def test_import_refuses_half_for_a_bfloat16_kv_cache(tmp_path, version):
+    # Collection labels the FMHA of a bfloat16 KV cache bfloat16. The rule reads the two labels and no staged file, so
+    # it holds for a phase that stages no model configuration.
+    path, launches = observation_fixture(tmp_path / "bfloat16", version=version)
+    launch = launches["tp2"]
+    assert (launch["precision"]["kvcache_quant_mode"], launch["precision"]["fmha_quant_mode"]) == (
+        "bfloat16",
+        "bfloat16",
+    )
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+
+    path, launches = observation_fixture(tmp_path / "half", version=version)
+    launch = launches["tp2"]
+    model = Path(launch["model_config"]["path"])
+    model.write_text(json.dumps({"model_type": "example", "torch_dtype": "float16"}))
+    launch["model_config"]["sha256"] = hashlib.sha256(model.read_bytes()).hexdigest()
+    launch["precision"].update(gemm_quant_mode="half", moe_quant_mode="half", fmha_quant_mode="half")
+    _replace_launch(path, launches)
+
+    def float16(record):
+        record["model_config_sha256"] = launch["model_config"]["sha256"]
+        record["resolved_config"]["model_config"].update(dtype="torch.float16", quantization=None)
+        record["resolved_config"]["quantization_config"] = None
+
+    _mutate(path, float16)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete"
+    assert result["diagnostics"] == [
+        "tp2: FMHA precision 'half' differs from 'bfloat16', the collection label of KV-cache dtype 'bfloat16'"
+    ]
+
+
 @pytest.mark.parametrize(
     "cache_dtype",
     [None, "auto", "bfloat16", "fp8_e5m2", "fp8_per_token_head", "int4_per_token_head", "nvfp4"],

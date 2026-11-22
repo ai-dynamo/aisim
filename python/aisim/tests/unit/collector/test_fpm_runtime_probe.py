@@ -589,6 +589,29 @@ def test_probe_rejects_ignored_checkpoint_precision_and_resolves_explicit_graph_
     assert result["configurations"]["valid"]["launch"]["collection"]["max_prefill_cudagraph_size"] == 2048
 
 
+def test_probe_preview_refuses_half_for_a_bfloat16_kv_cache(tmp_path):
+    # Collection planning labels the FMHA of a bfloat16 KV cache bfloat16, so the preview refuses the compute dtype
+    # half of a float16 checkpoint before any GPU work.
+    from collector.fpm_forward import runtime_probe
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+
+    launch, manifest, _marker = _inputs(tmp_path)
+    bundle = load_instrumentation(manifest)
+    plan = runtime_probe.build_runtime_probe_plan("bfloat16", launch, bundle)
+    assert {(cell.kv_cache_dtype, cell.fmha_quant_mode) for cell in plan.cells} == {("bfloat16", "bfloat16")}
+
+    config = Path(launch["model_config"]["path"])
+    config.write_text(json.dumps({**json.loads(config.read_text()), "torch_dtype": "float16"}))
+    launch["model_config"]["sha256"] = hashlib.sha256(config.read_bytes()).hexdigest()
+    launch["precision"].update(gemm_quant_mode="half", moe_quant_mode="half", fmha_quant_mode="half")
+    assert launch["precision"]["kvcache_quant_mode"] == "bfloat16"
+    with pytest.raises(ValueError) as error:
+        runtime_probe.build_runtime_probe_plan("half", launch, bundle)
+    assert str(error.value) == (
+        "precision.fmha_quant_mode='half' does not match 'bfloat16', the collection label of a bfloat16 KV cache"
+    )
+
+
 def _formal_cli_inputs(tmp_path):
     from .test_fpm_profile_collection import _profile
 

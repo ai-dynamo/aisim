@@ -23,7 +23,7 @@ from typing import Any
 from aisim.fpm_advisory import prefill_graph_advisory
 
 from . import runner
-from .capabilities import checkpoint_fmha_quant_mode, has_checkpoint_fmha
+from .capabilities import bfloat16_kv_cache, checkpoint_fmha_quant_mode, has_checkpoint_fmha
 from .config import FPM_WARMUP_ITERATIONS, FPMCollectionOptions, collection_phases, semantic_generator_overrides
 from .entry import _load_generator_overrides
 from .model_capability import ResolvedModelConfig, load_model_config
@@ -278,7 +278,8 @@ def build_runtime_probe_plan(configuration: str, facts: dict[str, Any], bundle: 
         if actual != precision[name]:
             raise ValueError(f"precision.{name}={precision[name]!r} does not match checkpoint-native {actual!r}")
     # Collection labels FMHA with the checkpoint-native mode of an AIC KV-cache mode other than bfloat16, and the import
-    # accepts only that label, so another label is refused here, before any GPU work.
+    # accepts only that label, so another label is refused here, before any GPU work. Collection labels the FMHA of a
+    # bfloat16 KV cache bfloat16 (checkpoint_fmha_quant_mode), so another label is refused here too.
     if has_checkpoint_fmha(precision["kvcache_quant_mode"]):
         expected = checkpoint_fmha_quant_mode(config, architecture, precision["kvcache_quant_mode"])
         if precision["fmha_quant_mode"] != expected:
@@ -286,6 +287,11 @@ def build_runtime_probe_plan(configuration: str, facts: dict[str, Any], bundle: 
                 f"precision.fmha_quant_mode={precision['fmha_quant_mode']!r} does not match checkpoint-native "
                 f"{expected!r}"
             )
+    elif bfloat16_kv_cache(precision["kvcache_quant_mode"]) and precision["fmha_quant_mode"] != "bfloat16":
+        raise ValueError(
+            f"precision.fmha_quant_mode={precision['fmha_quant_mode']!r} does not match 'bfloat16', the collection "
+            "label of a bfloat16 KV cache"
+        )
     topology = ParallelTopology(**launch["topology"])
     is_moe = identity["model_kind"] == "moe"
     strategy = topology_strategy(topology, is_moe=is_moe)
