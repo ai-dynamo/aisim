@@ -135,6 +135,192 @@ fn mamba_adopts_compact_slots_on_new_and_existing_nodes() {
 }
 
 #[test]
+fn mamba_rejects_invalid_donations_before_insert_mutation() {
+    for mode in ["root", "resumable", "continuation", "duplicate"] {
+        for donation in [vec![101, 102], vec![]] {
+            let mut tree = Core::new(
+                CacheInitParams {
+                    mamba_cache_chunk_size: Some(1),
+                    ..Default::default()
+                },
+                vec![FULL, MAMBA],
+            );
+            let key = vec![10, 20];
+            let mut p = params(&key, &[1, 2]);
+            p.mamba_value = Some(PageValue::from_vec(vec![100]));
+            let leaf = tree.insert(&p).last_device_node_id.unwrap();
+            let idx = tree.arena.resolve(leaf).unwrap();
+            let nodes = tree.inspect_get_all_node_ids();
+            let access = tree.arena.node(idx).last_access_counter;
+            let hits = tree.arena.node(idx).hit_count;
+            let lru = tree.inspect_get_component_device_lru_node_ids(MAMBA);
+            let key = match mode {
+                "continuation" => vec![10, 20, 30],
+                "duplicate" => vec![10, 20],
+                _ => vec![10, 30], // Would split the existing edge.
+            };
+            let mut p = params(
+                &key,
+                if mode == "continuation" {
+                    &[3]
+                } else {
+                    &[3, 4]
+                },
+            );
+            p.mamba_value = Some(PageValue::from_vec(donation));
+            p.priority = 99;
+            let result = match mode {
+                "resumable" => tree.try_begin_insert(&p).map(|_| ()),
+                "continuation" => tree.try_insert_suffix_from_node(leaf, 2, &p).map(|_| ()),
+                _ => tree.try_insert(&p).map(|_| ()),
+            };
+            assert!(matches!(
+                result,
+                Err(TreeCoreRuntimeError::InsertMambaValueLength { value_len })
+                    if value_len == p.mamba_value.as_ref().unwrap().len()
+            ));
+            assert_eq!(tree.inspect_get_all_node_ids(), nodes);
+            assert_eq!(tree.arena.node(idx).last_access_counter, access);
+            assert_eq!(tree.arena.node(idx).hit_count, hits);
+            assert_eq!(tree.inspect_get_component_device_lru_node_ids(MAMBA), lru);
+            assert_eq!(tree.total_size(), (2, 1));
+            assert_eq!(tree.arena.node(idx).device_value(MAMBA).as_slice(), &[100]);
+            tree.try_sanity_check(&[], &[]).unwrap();
+            // Rejection must leave the single-flight insert available for retry.
+            p.mamba_value = Some(PageValue::from_vec(vec![103]));
+            if mode == "continuation" {
+                tree.try_insert_suffix_from_node(leaf, 2, &p).unwrap();
+            } else {
+                tree.try_insert(&p).unwrap();
+            }
+            tree.try_sanity_check(&[], &[]).unwrap();
+        }
+    }
+}
+
+#[test]
+fn empty_mamba_inserts_do_not_adopt_or_validate_unused_donations() {
+    let mut tree = Core::new(
+        CacheInitParams {
+            mamba_cache_chunk_size: Some(1),
+            ..Default::default()
+        },
+        vec![FULL, MAMBA],
+    );
+    let key = vec![];
+    let mut p = params(&key, &[]);
+    p.mamba_value = Some(PageValue::from_vec(vec![101, 102]));
+    assert!(tree.try_insert(&p).unwrap().mamba_exist);
+    assert_eq!(tree.total_size(), (0, 0));
+
+    let key = vec![10, 20];
+    let mut p = params(&key, &[1, 2]);
+    p.mamba_value = Some(PageValue::from_vec(vec![100]));
+    let leaf = tree.insert(&p).last_device_node_id.unwrap();
+    let mut p = params(&key, &[]);
+    p.mamba_value = Some(PageValue::from_vec(vec![101, 102]));
+    assert!(
+        tree.try_insert_suffix_from_node(leaf, 2, &p)
+            .unwrap()
+            .mamba_exist
+    );
+    assert_eq!(tree.total_size(), (2, 1));
+    tree.try_sanity_check(&[], &[]).unwrap();
+}
+
+#[test]
+fn unbacked_device_leaf_survives_until_its_final_host_receipt_is_released() {
+    let mut tree = Core::new(
+        CacheInitParams {
+            enable_hicache: true,
+            mamba_cache_chunk_size: Some(1),
+            ..Default::default()
+        },
+        vec![FULL, MAMBA],
+    );
+    let key = vec![10, 20];
+    let mut p = params(&key, &[1, 2]);
+    p.mamba_value = Some(PageValue::from_vec(vec![100]));
+    let leaf = tree.insert(&p).last_device_node_id.unwrap();
+    let first = tree.inc_host_lock_ref(leaf).unwrap();
+    let second = tree.inc_host_lock_ref(leaf).unwrap();
+    assert!(first.skipped_lock_components.contains(FULL));
+    assert!(!first.skipped_lock_components.contains(MAMBA));
+    for receipt in [first, second] {
+        assert!(!tree.inspect_is_device_evictable_leaf(leaf));
+        tree.evict_device_start(FULL, 1);
+        let (victim, step) = tree.evict_device_next_node(FULL, &HashMap::new());
+        assert_eq!(victim, None);
+        assert!(step.device_frees.is_empty());
+        tree.evict_device_end(FULL);
+        tree.dec_host_lock_ref(leaf, &receipt.to_dec_params())
+            .unwrap();
+        tree.try_sanity_check(&[], &[]).unwrap();
+    }
+    assert!(tree.inspect_is_device_evictable_leaf(leaf));
+    tree.evict_device_start(FULL, 1);
+    let (victim, _) = tree.evict_device_next_node(FULL, &HashMap::new());
+    assert_eq!(victim, Some(leaf));
+    let (backup, step) = tree.evict_device_leaf(leaf, false).unwrap();
+    assert!(backup.is_none());
+    assert_eq!(step.device_frees[&FULL][0].as_slice(), &[1, 2]);
+    assert!(tree.arena.resolve(leaf).is_err());
+    tree.evict_device_end(FULL);
+    tree.try_sanity_check(&[], &[]).unwrap();
+}
+
+#[test]
+fn backed_device_leaf_can_demote_with_a_live_host_receipt() {
+    let mut tree = Core::new(
+        CacheInitParams {
+            enable_hicache: true,
+            mamba_cache_chunk_size: Some(1),
+            ..Default::default()
+        },
+        vec![FULL, MAMBA],
+    );
+    let key = vec![10, 20];
+    let mut p = params(&key, &[1, 2]);
+    p.mamba_value = Some(PageValue::from_vec(vec![100]));
+    let leaf = tree.insert(&p).last_device_node_id.unwrap();
+    backup_components(&mut tree, leaf, MAMBA);
+    let receipt = tree.inc_host_lock_ref(leaf).unwrap();
+    assert!(tree.inspect_is_device_evictable_leaf(leaf));
+    let (backup, step) = tree.evict_device_leaf(leaf, false).unwrap();
+    assert!(backup.is_none());
+    assert_eq!(step.device_frees[&FULL][0].as_slice(), &[1, 2]);
+    assert!(tree.arena.resolve(leaf).is_ok());
+    tree.dec_host_lock_ref(leaf, &receipt.to_dec_params())
+        .unwrap();
+    tree.try_sanity_check(&[], &[]).unwrap();
+}
+
+#[test]
+fn write_back_can_request_backup_with_a_live_host_receipt() {
+    let mut tree = Core::new(
+        CacheInitParams {
+            enable_hicache: true,
+            is_write_back: true,
+            mamba_cache_chunk_size: Some(1),
+            ..Default::default()
+        },
+        vec![FULL, MAMBA],
+    );
+    let key = vec![10, 20];
+    let mut p = params(&key, &[1, 2]);
+    p.mamba_value = Some(PageValue::from_vec(vec![100]));
+    let leaf = tree.insert(&p).last_device_node_id.unwrap();
+    let receipt = tree.inc_host_lock_ref(leaf).unwrap();
+    assert!(tree.inspect_is_device_evictable_leaf(leaf));
+    let (backup, step) = tree.evict_device_leaf(leaf, true).unwrap();
+    assert!(backup.is_some());
+    assert!(step.device_frees.is_empty());
+    tree.dec_host_lock_ref(leaf, &receipt.to_dec_params())
+        .unwrap();
+    tree.try_sanity_check(&[], &[]).unwrap();
+}
+
+#[test]
 fn swa_continuation_reports_the_full_branch_boundary() {
     let mut tree = Core::new(
         CacheInitParams {

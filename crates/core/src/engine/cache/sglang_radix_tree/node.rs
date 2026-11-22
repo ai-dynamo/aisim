@@ -834,6 +834,9 @@ pub enum TreeCoreRuntimeError {
         value_len: usize,
         required_len: usize,
     },
+    /// A donated Mamba checkpoint occupies exactly one state slot.
+    #[error("insert Mamba donation has {value_len} state slots, expected exactly one")]
+    InsertMambaValueLength { value_len: usize },
     /// An inspection-only invariant check failed without mutating the tree.
     #[cfg(test)]
     #[error("{0}")]

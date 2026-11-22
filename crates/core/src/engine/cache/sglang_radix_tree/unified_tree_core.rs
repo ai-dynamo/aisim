@@ -1930,6 +1930,17 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 required_len: value_len,
             });
         }
+        // Empty inserts do not adopt the donation. Validate real insertions
+        // before touching recency, splitting edges, or starting a resumable walk.
+        if aligned_key_len > prefix_len
+            && let Some(donation) = params.mamba_value.as_ref()
+            && self.try_component_by_type_(MAMBA).is_some()
+            && donation.len() != 1
+        {
+            return Err(TreeCoreRuntimeError::InsertMambaValueLength {
+                value_len: donation.len(),
+            });
+        }
         self.validate_insert_anchor_(prefix_node_idx, prefix_len, params)?;
         if aligned_key_len > 0
             && let Some(rotation_base) = params.rotation_base
@@ -3530,6 +3541,12 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             return false;
         }
         if node.is_device_locked() {
+            return false;
+        }
+        // Write-through eviction deletes unbacked anchors. Host receipts must
+        // remain releasable; backed nodes can still demote without deletion.
+        // Write-back may first back up a host-locked, device-only anchor.
+        if !self.is_write_back && !node.backuped() && node.is_host_locked() {
             return false;
         }
         if node.is_load_back_pending() {

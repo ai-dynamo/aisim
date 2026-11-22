@@ -330,6 +330,16 @@ and its LICENSE for provenance, the preserved license, and each local correction
      /// A non-root continuation stays inside the anchor's namespace.
      #[error("insert continuation namespace does not match non-root anchor {node_id}")]
      InsertContinuationNamespaceMismatch { node_id: NodeId },
+@@ -817,6 +834,9 @@
+         value_len: usize,
+         required_len: usize,
+     },
++    /// A donated Mamba checkpoint occupies exactly one state slot.
++    #[error("insert Mamba donation has {value_len} state slots, expected exactly one")]
++    InsertMambaValueLength { value_len: usize },
+     /// An inspection-only invariant check failed without mutating the tree.
+     #[cfg(test)]
+     #[error("{0}")]
 --- a/unified_tree_core.rs
 +++ b/unified_tree_core.rs
 @@ -260,6 +260,8 @@
@@ -505,7 +515,25 @@ and its LICENSE for provenance, the preserved license, and each local correction
          }
          Ok(())
      }
-@@ -1944,7 +1956,7 @@
+@@ -1916,6 +1928,17 @@
+             return Err(TreeCoreRuntimeError::InsertValueTooShort {
+                 value_len: params.value.len(),
+                 required_len: value_len,
++            });
++        }
++        // Empty inserts do not adopt the donation. Validate real insertions
++        // before touching recency, splitting edges, or starting a resumable walk.
++        if aligned_key_len > prefix_len
++            && let Some(donation) = params.mamba_value.as_ref()
++            && self.try_component_by_type_(MAMBA).is_some()
++            && donation.len() != 1
++        {
++            return Err(TreeCoreRuntimeError::InsertMambaValueLength {
++                value_len: donation.len(),
+             });
+         }
+         self.validate_insert_anchor_(prefix_node_idx, prefix_len, params)?;
+@@ -1944,7 +1967,7 @@
          if aligned_key_len == prefix_len {
              // An empty suffix still visited its retained boundary above.
              return Ok(InsertStepResult {
@@ -514,7 +542,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
                  result: Some(InsertResult {
                      prefix_len,
                      total_len: aligned_key_len,
-@@ -1955,9 +1967,11 @@
+@@ -1955,9 +1978,11 @@
                      // Nothing was inserted, so a donated Mamba slot was not
                      // adopted and the caller keeps (and frees) it.
                      mamba_exist: true,
@@ -528,7 +556,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
                  }),
              });
          }
-@@ -1966,6 +1980,7 @@
+@@ -1966,6 +1991,7 @@
          self.ongoing_insert_walk_state = Some(InsertWalkState {
              phase: InsertPhase::Walk,
              node_id: prefix_node_idx,
@@ -536,7 +564,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              key: K::from(params.key.as_ref()[prefix_len..aligned_key_len].to_vec()),
              key_offset: prefix_len,
              aligned_key_len,
-@@ -1983,6 +1998,7 @@
+@@ -1983,6 +2009,7 @@
              total_prefix_length: prefix_len,
              is_new_leaf: false,
              target_node_id: None,
@@ -544,7 +572,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              result: Some(InsertResult {
                  total_len: aligned_key_len,
                  adopted_ranges: params.track_adopted_ranges.then(HashMap::new),
-@@ -2090,10 +2106,22 @@
+@@ -2090,10 +2117,22 @@
      }
 
      /// Fallible variant of [`Self::resume_insert`].
@@ -570,7 +598,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          Ok(self.advance_insert_())
      }
 
-@@ -2185,6 +2213,7 @@
+@@ -2185,6 +2224,7 @@
          {
              let node = self.arena.node_mut(node_id);
              node.priority = node.priority.max(state.priority);
@@ -578,7 +606,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          }
 
          let params = InsertParams {
-@@ -2326,6 +2355,7 @@
+@@ -2326,6 +2366,7 @@
              state.node_id
          };
          state.target_node_id = Some(target_node_id);
@@ -586,7 +614,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
 
          // Finalize: let each component attach its data to the target node.
          // e.g. Mamba attaches mamba_value to the leaf node
-@@ -2336,7 +2366,7 @@
+@@ -2336,7 +2377,7 @@
              .as_mut()
              .expect("insert result exists during commit");
          result.prefix_len = state.total_prefix_length;
@@ -595,7 +623,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let params = InsertParams {
              rotation_base: state.rotation_base,
              key: &state.key,
-@@ -3178,7 +3208,7 @@
+@@ -3178,7 +3219,7 @@
      ) -> Result<EvictionStepResult<V>, TreeCoreRuntimeError> {
          let node_id = self.arena.resolve(node_id)?;
          let mut result = EvictionStepResult::default();
@@ -604,7 +632,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          if self.arena.node(node_id).is_load_back_pending() {
              return Ok(result);
          }
-@@ -3190,6 +3220,12 @@
+@@ -3190,6 +3231,12 @@
                      evicted: node.evicted(),
                      backuped: node.backuped(),
                  });
@@ -617,7 +645,20 @@ and its LICENSE for provenance, the preserved license, and each local correction
              }
          }
          self.demote_(
-@@ -4469,7 +4505,7 @@
+@@ -3494,6 +3541,12 @@
+             return false;
+         }
+         if node.is_device_locked() {
++            return false;
++        }
++        // Write-through eviction deletes unbacked anchors. Host receipts must
++        // remain releasable; backed nodes can still demote without deletion.
++        // Write-back may first back up a host-locked, device-only anchor.
++        if !self.is_write_back && !node.backuped() && node.is_host_locked() {
+             return false;
+         }
+         if node.is_load_back_pending() {
+@@ -4469,7 +4522,7 @@
          device_indices: V,
          mut kv_xfer: PoolTransfer<V>,
          comp_xfers: HashMap<ComponentType, Vec<PoolTransfer<V>>>,
@@ -626,7 +667,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let anchor_id = node_id;
          let node_id = self.arena.resolve(node_id)?;
          let loaded_node_indices = kv_xfer
-@@ -4479,6 +4515,30 @@
+@@ -4479,6 +4532,30 @@
              .map(|&loaded_id| self.arena.resolve(loaded_id))
              .collect::<Result<Vec<_>, _>>()?;
          self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
@@ -657,7 +698,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let mut cache_actions: Vec<CacheAction<V>> = Vec::new();
          kv_xfer.device_indices = Some(device_indices);
          let nodes_to_load = kv_xfer.nodes_to_load.clone();
-@@ -4709,8 +4769,12 @@
+@@ -4709,8 +4786,12 @@
              if node.write_through_pending_id == Some(ack_id) {
                  node.write_through_pending_id = None;
                  self.update_full_coexisting_host_tracking_(node_idx);
@@ -672,7 +713,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          }
          Ok(())
      }
-@@ -4829,6 +4893,11 @@
+@@ -4829,6 +4910,11 @@
          for &(child_id, pos, prefix_len) in &spans {
              if pos + prefix_len <= window_start {
                  continue;
@@ -684,7 +725,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              }
              if self.arena.has_device_value(child_id, SWA) {
                  return Err(format!(
-@@ -5833,6 +5902,12 @@
+@@ -5833,6 +5919,12 @@
          let last_device_node_idx = self.arena.resolve(result.last_device_node_id)?;
          self.arena.resolve(result.last_host_node_id)?;
          let best_match_node_idx = self.arena.resolve(result.best_match_node_id)?;
@@ -697,7 +738,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          Ok(self
              .component_by_type_(component_type)
              .finalize_match_result_in_tree_core(
-@@ -5843,6 +5918,7 @@
+@@ -5843,6 +5935,7 @@
                  params,
                  value_chunks,
                  best_value_len,

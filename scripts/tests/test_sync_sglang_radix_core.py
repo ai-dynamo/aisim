@@ -10,11 +10,116 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from textwrap import dedent
 from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location("sync_radix", Path(__file__).parents[1] / "sync_sglang_radix_core.py")
 sync = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(sync)
+
+
+class NativeSourceTests(unittest.TestCase):
+    def transform(self, source, text):
+        return sync.native_source(dedent(text).lstrip(), source).removeprefix(sync.HEADER)
+
+    def test_library_removes_python_and_torch_modules_but_preserves_native_modules(self):
+        result = self.transform(
+            "src/lib.rs",
+            """
+            #![allow(
+                dead_code,
+            )]
+            #[cfg(feature = "python-extension")]
+            mod python_bindings;
+            #[cfg(all(test, feature = "torch"))]
+            #[path = "tests/test_utils.rs"]
+            pub(crate) mod test_utils;
+            mod value;
+            pub use crate::value::RadixValue;
+            #[cfg(test)]
+            mod native_tests { #[test] fn still_runs() { assert_eq!(2 + 2, 4); } }
+            """,
+        )
+        self.assertNotIn("python_bindings", result)
+        self.assertNotIn("test_utils", result)
+        self.assertIn("    unused_imports,", result)
+        self.assertIn("mod value;", result)
+        self.assertIn("pub use crate::engine::cache::sglang_radix_tree::value::RadixValue;", result)
+        self.assertIn("mod native_tests { #[test] fn still_runs() { assert_eq!(2 + 2, 4); } }", result)
+        self.assertTrue(result.endswith("#[cfg(test)]\nmod page_value_core;\n"))
+
+    def test_value_removes_tensor_implementation_and_preserves_following_native_assertions(self):
+        result = self.transform(
+            "src/value.rs",
+            """
+            pub struct NativeValue;
+            #[cfg(feature = "torch")]
+            impl RadixValue for Tensor { fn torch_only() {} }
+            #[cfg(test)]
+            mod tests {
+                use crate::value::NativeValue;
+                #[test] fn native_value() { assert_eq!(vec![1, 2].len(), 2); }
+            }
+            #[cfg(all(test, feature = "torch"))]
+            mod tensor_tests { fn torch_only_test() {} }
+            """,
+        )
+        self.assertEqual(
+            result,
+            dedent("""
+                pub struct NativeValue;
+                #[cfg(test)]
+                mod tests {
+                    use crate::engine::cache::sglang_radix_tree::value::NativeValue;
+                    #[test] fn native_value() { assert_eq!(vec![1, 2].len(), 2); }
+                }
+                """).lstrip(),
+        )
+
+    def test_tree_removes_torch_wiring_and_preserves_following_native_code(self):
+        result = self.transform(
+            "src/unified_tree_core.rs",
+            """
+            use crate::value::RadixValue;
+            #[cfg(feature = "torch")]
+            use torch::Tensor;
+            #[cfg(feature = "torch")]
+            fn tensor_helper() {}
+            #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+            pub enum NativePhase { Walk, Commit }
+            #[cfg(any(test, feature = "inspection"))]
+            fn inspect_native() { assert!(matches!(NativePhase::Walk, NativePhase::Walk)); }
+            #[cfg(all(test, feature = "torch"))]
+            mod torch_tests { fn tensor_test() {} }
+            """,
+        )
+        self.assertEqual(
+            result,
+            dedent("""
+                use crate::engine::cache::sglang_radix_tree::value::RadixValue;
+                #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+                pub enum NativePhase { Walk, Commit }
+                #[cfg(test)]
+                fn inspect_native() { assert!(matches!(NativePhase::Walk, NativePhase::Walk)); }
+                """).lstrip(),
+        )
+
+    def test_node_and_integration_test_imports_are_rewritten(self):
+        node = self.transform("src/node.rs", "use std::fmt::Debug;\nuse crate::value::RadixValue;\n")
+        self.assertEqual(
+            node,
+            "use thiserror1 as thiserror;\n\nuse std::fmt::Debug;\n"
+            "use crate::engine::cache::sglang_radix_tree::value::RadixValue;\n",
+        )
+        integration = self.transform(
+            "tests/page_value_core.rs",
+            "use sglang_radix_tree::{PageValue};\n#[test] fn native() { assert_eq!(1, 1); }\n",
+        )
+        self.assertEqual(
+            integration,
+            "use crate::engine::cache::sglang_radix_tree::{self,PageValue};\n"
+            "#[test] fn native() { assert_eq!(1, 1); }\n",
+        )
 
 
 class SyncRadixTests(unittest.TestCase):

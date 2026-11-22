@@ -53,6 +53,11 @@ following local corrections to this pinned revision:
   against newly acquired component locks before taking values.
 - Reject zero Mamba chunk sizes, copy donated Mamba slots for adoption, and
   compare SWA continuation boundaries against the complete insert length.
+- Reject Mamba donations with other than one slot before insert mutations;
+  leave unused donations with the caller on empty inserts and continuations.
+- Preserve unbacked write-through leaves with live host receipts until the
+  final release refreshes eviction eligibility. Backed leaves can still demote,
+  and write-back leaves can still request a backup, without deleting the anchor.
 - Validate continuation key content in release builds during the existing
   ancestor walk, return retained-prefix backup actions for empty suffixes, and
   report reached SWA branch boundaries for those empty continuations.
