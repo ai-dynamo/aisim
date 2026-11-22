@@ -25,8 +25,8 @@ use super::profile::{
     AgenticIdleShift, AgenticProfileOptions, AgenticProfileReport, AgenticProfileState,
 };
 use super::trace::{
-    synthesize_validated_trace_tokens, validate_synthesizable_prompt,
-    validate_synthesizable_prompt_len,
+    extend_validated_trace_tokens, synthesize_validated_trace_tokens,
+    validate_synthesizable_prompt, validate_synthesizable_prompt_len,
 };
 use super::types::{
     AgenticDependency, AgenticDependencyRelation, AgenticDependencyTrigger, AgenticGraphIdentity,
@@ -35,7 +35,7 @@ use super::types::{
 };
 use super::{
     AgenticPlaySnapshot, AgenticReplayContext, AgenticSnapshotEvidence, PreparedAgenticSnapshots,
-    SYNTHETIC_OUTPUT_SEED, planned_output_token_ids,
+    SYNTHETIC_OUTPUT_SEED, SyntheticOutputStream, planned_output_token_ids,
 };
 use crate::engine::ImageSpec;
 use crate::engine::belady::{SequenceHash, input_sequence_hashes};
@@ -314,9 +314,9 @@ struct SessionRuntime {
 
 #[derive(Debug)]
 enum PromptTokens {
-    // Full-prompt traces stay in their compact on-disk representation until
-    // dispatch. Delta-cumulative traces remain eager because later turns append
-    // generated output to already-materialized session history.
+    // Trace prompts stay in their compact on-disk representation until
+    // dispatch. A delta-cumulative turn is then synthesized straight into its
+    // session history, the only place its tokens are read from.
     Deferred {
         input_length: usize,
         hash_ids: Vec<u32>,
@@ -328,7 +328,6 @@ enum PromptTokens {
         source_index: usize,
         slot: u64,
     },
-    Materialized(Vec<u32>),
 }
 
 impl PromptTokens {
@@ -345,7 +344,6 @@ impl PromptTokens {
             Self::Deferred { input_length, .. } | Self::Snapshot { input_length, .. } => {
                 *input_length
             }
-            Self::Materialized(tokens) => tokens.len(),
         }
     }
 
@@ -355,18 +353,9 @@ impl PromptTokens {
                 input_length,
                 hash_ids,
             } => (*input_length, std::mem::take(hash_ids)),
-            Self::Snapshot { .. } | Self::Materialized(_) => {
-                unreachable!("full-prompt turns must retain their deferred representation")
+            Self::Snapshot { .. } => {
+                unreachable!("trace turns must retain their deferred representation")
             }
-        }
-    }
-
-    fn materialized(&self) -> &[u32] {
-        match self {
-            Self::Deferred { .. } | Self::Snapshot { .. } => {
-                unreachable!("delta-cumulative prompts are materialized during driver setup")
-            }
-            Self::Materialized(tokens) => tokens,
         }
     }
 }
@@ -395,6 +384,9 @@ struct TurnRuntime {
     prompt_tokens: PromptTokens,
     max_output_tokens: usize,
     output_token_ids: Option<Vec<u32>>,
+    // A trace turn without authored ids records where its ids sit in the
+    // synthetic output stream and draws them at dispatch.
+    output_stream_offset: Option<u64>,
     delay_after_previous_ms: f64,
     priority: i32,
     strict_priority: u32,
@@ -406,11 +398,14 @@ struct TurnRuntime {
     deterministic_request_id: Option<Uuid>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct InFlightTurn {
     session_index: usize,
     turn_index: usize,
     emitted_output_tokens: usize,
+    // A delta turn's plan moves here at dispatch so each output token is
+    // checked from this entry alone. Full-prompt turns leave it empty.
+    planned_output_tokens: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -948,6 +943,7 @@ pub struct WorkloadDriver {
     agentic_profile: Option<AgenticProfileState>,
     agentic_speedup: f64,
     sessions: Vec<SessionRuntime>,
+    output_stream: SyntheticOutputStream,
     in_flight: FxHashMap<Uuid, InFlightTurn>,
     agentic_settling: FxHashMap<Uuid, usize>,
     ready_sessions: BinaryHeap<ReadySession>,
@@ -2135,6 +2131,7 @@ impl WorkloadDriver {
                         },
                         max_output_tokens: source.max_output_tokens,
                         output_token_ids: None,
+                        output_stream_offset: None,
                         delay_after_previous_ms: 0.0,
                         priority: source.priority,
                         strict_priority: source.strict_priority,
@@ -2215,6 +2212,7 @@ impl WorkloadDriver {
             agentic_profile: None,
             agentic_speedup: speedup,
             sessions,
+            output_stream: SyntheticOutputStream::new(),
             in_flight: FxHashMap::default(),
             agentic_settling: FxHashMap::default(),
             ready_sessions,
@@ -2463,6 +2461,7 @@ impl WorkloadDriver {
                     prompt_tokens,
                     max_output_tokens: node.max_output_tokens,
                     output_token_ids,
+                    output_stream_offset: None,
                     delay_after_previous_ms: 0.0,
                     priority: node.priority,
                     strict_priority: node.strict_priority,
@@ -2569,6 +2568,7 @@ impl WorkloadDriver {
             agentic_profile: None,
             agentic_speedup: 1.0,
             sessions,
+            output_stream: SyntheticOutputStream::new(),
             in_flight: FxHashMap::default(),
             agentic_settling: FxHashMap::default(),
             ready_sessions,
@@ -2589,7 +2589,7 @@ impl WorkloadDriver {
             u32::try_from(engine_block_size).context("engine_block_size does not fit in u32")?;
         let trace_block_size = trace.block_size;
         let is_concurrency = matches!(&policy, SchedulingPolicy::Concurrency(_));
-        let mut output_rng = StdRng::seed_from_u64(SYNTHETIC_OUTPUT_SEED);
+        let mut next_output_offset = 0_u64;
         let sessions: Vec<SessionRuntime> = trace
             .sessions
             .into_iter()
@@ -2599,41 +2599,36 @@ impl WorkloadDriver {
                 } else {
                     Some(session.first_arrival_timestamp_ms.unwrap_or(0.0))
                 };
-                let turns = session
+                // Collecting `Result`s has no length hint, so a one-turn session
+                // would start with room for four turns.
+                let mut turns = Vec::with_capacity(session.turns.len());
+                session
                     .turns
                     .into_iter()
                     .map(|mut turn| -> Result<TurnRuntime> {
-                        let prompt_tokens = match prompt_mode {
-                            PromptMode::Full => PromptTokens::deferred(
-                                turn.input_length,
-                                std::mem::take(&mut turn.hash_ids),
-                                trace_block_size,
-                            )?,
-                            PromptMode::DeltaCumulative => {
-                                // Image spans index the turn's own prompt, not the
-                                // session history the cumulative request carries.
-                                if !turn.images.is_empty() {
-                                    bail!(
-                                        "accumulating session deltas does not support image turns"
-                                    );
-                                }
-                                PromptTokens::Materialized(
-                                    turn.synthesize_tokens(trace_block_size)?,
-                                )
-                            }
-                        };
-                        let output_token_ids = Some(planned_output_token_ids(
-                            turn.output_token_ids,
-                            turn.max_output_tokens,
-                            &mut output_rng,
-                        ));
+                        // Image spans index the turn's own prompt, not the
+                        // session history the cumulative request carries.
+                        if prompt_mode == PromptMode::DeltaCumulative && !turn.images.is_empty() {
+                            bail!("accumulating session deltas does not support image turns");
+                        }
+                        let prompt_tokens = PromptTokens::deferred(
+                            turn.input_length,
+                            std::mem::take(&mut turn.hash_ids),
+                            trace_block_size,
+                        )?;
+                        let mut output_stream_offset = None;
+                        if turn.output_token_ids.is_none() {
+                            output_stream_offset = Some(next_output_offset);
+                            next_output_offset += turn.max_output_tokens as u64;
+                        }
                         Ok(TurnRuntime {
                             request_id: None,
                             play_id: None,
                             prompt_tokens,
                             replay_key: turn.replay_key,
                             max_output_tokens: turn.max_output_tokens,
-                            output_token_ids,
+                            output_token_ids: turn.output_token_ids,
+                            output_stream_offset,
                             delay_after_previous_ms: turn.delay_after_previous_ms,
                             priority: turn.priority,
                             strict_priority: turn.strict_priority,
@@ -2643,7 +2638,10 @@ impl WorkloadDriver {
                             deterministic_request_id: None,
                         })
                     })
-                    .collect::<Result<Vec<_>>>()?;
+                    .try_for_each(|turn| -> Result<()> {
+                        turns.push(turn?);
+                        Ok(())
+                    })?;
                 let cumulative_capacity = if prompt_mode == PromptMode::DeltaCumulative {
                     turns
                         .iter()
@@ -2652,7 +2650,7 @@ impl WorkloadDriver {
                                 + turn
                                     .output_token_ids
                                     .as_ref()
-                                    .map_or(0, |output| output.len())
+                                    .map_or(turn.max_output_tokens, Vec::len)
                         })
                         .sum()
                 } else {
@@ -2695,6 +2693,7 @@ impl WorkloadDriver {
             agentic_profile: None,
             agentic_speedup: 1.0,
             sessions,
+            output_stream: SyntheticOutputStream::new(),
             in_flight: FxHashMap::default(),
             agentic_settling: FxHashMap::default(),
             ready_sessions,
@@ -2927,6 +2926,10 @@ impl WorkloadDriver {
             };
             let session = &mut self.sessions[session_index];
             let turn = &mut session.turns[turn_index];
+            if let Some(offset) = turn.output_stream_offset {
+                turn.output_token_ids =
+                    Some(self.output_stream.ids_at(offset, turn.max_output_tokens));
+            }
             let replay_context = turn
                 .request_id
                 .as_ref()
@@ -3011,9 +3014,13 @@ impl WorkloadDriver {
                     )
                 }
                 PromptMode::DeltaCumulative => {
-                    session
-                        .cumulative_tokens
-                        .extend_from_slice(turn.prompt_tokens.materialized());
+                    let (input_length, hash_ids) = turn.prompt_tokens.take_deferred();
+                    extend_validated_trace_tokens(
+                        &mut session.cumulative_tokens,
+                        input_length,
+                        &hash_ids,
+                        self.trace_block_size,
+                    );
                     let request_tokens = session.cumulative_tokens.clone();
                     let replay_hashes = self.include_replay_hashes.then(|| {
                         ReplayRequestHashes::from_tokens(&request_tokens, self.engine_block_size)
@@ -3038,6 +3045,13 @@ impl WorkloadDriver {
                     (request, replay_hashes)
                 }
             };
+            let planned_output_tokens = match self.prompt_mode {
+                PromptMode::Full => Vec::new(),
+                PromptMode::DeltaCumulative => turn
+                    .output_token_ids
+                    .take()
+                    .expect("delta turns must have planned output tokens"),
+            };
             session.in_flight = Some(request_uuid);
             session.next_ready_at_ms = None;
             self.in_flight.insert(
@@ -3046,6 +3060,7 @@ impl WorkloadDriver {
                     session_index,
                     turn_index,
                     emitted_output_tokens: 0,
+                    planned_output_tokens,
                 },
             );
             let ready = CompactReadyTurn {
@@ -3120,15 +3135,10 @@ impl WorkloadDriver {
         }
         let in_flight = self
             .in_flight
-            .get(&request_uuid)
-            .copied()
+            .get_mut(&request_uuid)
             .ok_or_else(|| anyhow!("unknown workload request output for {request_uuid}"))?;
 
-        let turn = &self.sessions[in_flight.session_index].turns[in_flight.turn_index];
-        let planned_output_tokens = turn
-            .output_token_ids
-            .as_ref()
-            .expect("delta turns must have planned output tokens");
+        let planned_output_tokens = &in_flight.planned_output_tokens;
         let expected_token = planned_output_tokens
             .get(in_flight.emitted_output_tokens)
             .ok_or_else(|| {
@@ -3145,10 +3155,6 @@ impl WorkloadDriver {
             );
         }
 
-        let in_flight = self
-            .in_flight
-            .get_mut(&request_uuid)
-            .expect("validated in-flight request must still exist");
         in_flight.emitted_output_tokens = in_flight
             .emitted_output_tokens
             .checked_add(1)
@@ -3432,8 +3438,8 @@ impl WorkloadDriver {
         &self,
         request_uuid: Uuid,
         outcome: TurnOutcome,
-    ) -> Result<Option<InFlightTurn>> {
-        let Some(in_flight) = self.in_flight.get(&request_uuid).copied() else {
+    ) -> Result<Option<&InFlightTurn>> {
+        let Some(in_flight) = self.in_flight.get(&request_uuid) else {
             return match outcome {
                 TurnOutcome::Completed | TurnOutcome::Rejected | TurnOutcome::Failed => Err(
                     anyhow!("unknown workload request completion for {request_uuid}"),
@@ -3494,16 +3500,6 @@ impl WorkloadDriver {
             return Ok(None);
         };
         let session = &self.sessions[in_flight.session_index];
-        let turn = &session.turns[in_flight.turn_index];
-        let completed_output_tokens = (outcome == TurnOutcome::Completed
-            && self.prompt_mode == PromptMode::DeltaCumulative)
-            .then(|| {
-                let planned_output_tokens = turn
-                    .output_token_ids
-                    .as_ref()
-                    .expect("delta turns must have planned output tokens");
-                planned_output_tokens[..in_flight.emitted_output_tokens].to_vec()
-            });
         let (next_turn_index, next_ready_at_ms, session_ended) = match outcome {
             TurnOutcome::Completed | TurnOutcome::Rejected => {
                 let next_turn_index = in_flight
@@ -3519,7 +3515,8 @@ impl WorkloadDriver {
             TurnOutcome::Cancelled | TurnOutcome::Failed => (session.turns.len(), None, true),
         };
 
-        self.in_flight
+        let in_flight = self
+            .in_flight
             .remove(&request_uuid)
             .expect("validated in-flight request must still exist");
         let session = &mut self.sessions[in_flight.session_index];
@@ -3530,9 +3527,12 @@ impl WorkloadDriver {
             session.cumulative_tokens = Vec::new();
         }
         if next_ready_at_ms.is_some()
-            && let Some(output_tokens) = completed_output_tokens
+            && outcome == TurnOutcome::Completed
+            && self.prompt_mode == PromptMode::DeltaCumulative
         {
-            session.cumulative_tokens.extend(output_tokens);
+            session.cumulative_tokens.extend_from_slice(
+                &in_flight.planned_output_tokens[..in_flight.emitted_output_tokens],
+            );
         }
         if let Some(ready_at_ms) = next_ready_at_ms {
             self.ready_sessions.push(ReadySession {
@@ -3831,9 +3831,7 @@ mod tests {
             .iter()
             .map(|session| match &session.turns[0].prompt_tokens {
                 PromptTokens::Deferred { hash_ids, .. } => hash_ids.clone(),
-                PromptTokens::Snapshot { .. } | PromptTokens::Materialized(_) => {
-                    panic!("agentic prompts stay deferred")
-                }
+                PromptTokens::Snapshot { .. } => panic!("agentic prompts stay deferred"),
             })
             .collect();
         assert_eq!(
@@ -4082,6 +4080,7 @@ mod tests {
                 .iter()
                 .all(|turn| matches!(turn.prompt_tokens, PromptTokens::Deferred { .. }))
         }));
+        assert_eq!(driver.sessions[1].turns.capacity(), 1);
 
         let ready = driver.pop_ready(0.0, 1);
         assert_eq!(ready.len(), 1);
@@ -4109,19 +4108,6 @@ mod tests {
             assert!(request.materialized_tokens().is_none());
             assert_eq!(request.into_direct_request().tokens, vec![1, 2]);
         }
-    }
-
-    #[test]
-    fn delta_cumulative_prompts_remain_materialized_during_setup() {
-        let driver =
-            WorkloadDriver::new_concurrency_accumulating_deltas(two_session_trace(), 1, 1).unwrap();
-
-        assert!(driver.sessions.iter().all(|session| {
-            session
-                .turns
-                .iter()
-                .all(|turn| matches!(turn.prompt_tokens, PromptTokens::Materialized(_)))
-        }));
     }
 
     #[test]
@@ -4480,6 +4466,43 @@ mod tests {
     }
 
     #[test]
+    fn output_ids_drawn_at_dispatch_follow_trace_order() {
+        let trace = Trace {
+            block_size: 1,
+            sessions: [
+                (2.0, 70, None),
+                (3.0, 2, Some(vec![7, 8])),
+                (0.0, 5, None),
+                (1.0, 130, None),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(
+                |(index, (arrival, max_output_tokens, output_token_ids))| SessionTrace {
+                    session_id: format!("s{index}"),
+                    first_arrival_timestamp_ms: Some(arrival),
+                    turns: vec![TurnTrace {
+                        input_length: 1,
+                        max_output_tokens,
+                        output_token_ids,
+                        hash_ids: vec![index as u32],
+                        ..Default::default()
+                    }],
+                },
+            )
+            .collect(),
+        };
+        // The single-turn path draws every plan up front, in trace order.
+        let planned = trace.to_single_turn_requests().unwrap();
+
+        let mut driver = WorkloadDriver::new_trace(trace, 1).unwrap();
+        for (at_ms, index) in [(0.0, 2), (1.0, 3), (2.0, 0), (3.0, 1)] {
+            let request = driver.pop_ready(at_ms, usize::MAX).pop().unwrap().request;
+            assert_eq!(request.output_token_ids, planned[index].output_token_ids);
+        }
+    }
+
+    #[test]
     fn accumulating_delta_mode_rejects_image_turns() {
         let trace = Trace {
             block_size: 4,
@@ -4561,8 +4584,13 @@ mod tests {
         assert_eq!(first[0].request.output_token_ids, Some(vec![20, 21]));
         assert_eq!(first[0].request.priority, 3);
         assert_eq!(first[0].request.strict_priority, 4);
+        let request_uuid = first[0].request_uuid;
+        let error = driver.on_output_token(request_uuid, 21).unwrap_err();
+        assert!(error.to_string().contains("at position 0, expected 20"));
         driver.on_output_token(first[0].request_uuid, 20).unwrap();
         driver.on_output_token(first[0].request_uuid, 21).unwrap();
+        let error = driver.on_output_token(request_uuid, 22).unwrap_err();
+        assert!(error.to_string().contains("more than 2 planned"));
         driver.on_complete(first[0].request_uuid, 10.0).unwrap();
 
         let second = driver.pop_ready(15.0, usize::MAX);
@@ -4573,6 +4601,9 @@ mod tests {
         );
         assert_eq!(second[0].request.priority, -2);
         assert_eq!(second[0].request.strict_priority, 7);
+        // Dispatch leaves a turn's prompt only in the session history.
+        let (_, hash_ids) = driver.sessions[0].turns[0].prompt_tokens.take_deferred();
+        assert!(hash_ids.is_empty());
     }
 
     #[test]
