@@ -1398,7 +1398,9 @@ pub struct EngineConfig {
     /// vLLM release whose grouped-cache rules this rank follows. A rank with
     /// `kv_cache_groups` and `enable_prefix_caching`, and a grouped prefill or
     /// decode rank, must set it to `0.31.0`, `0.32.0` or `0.33.0`. A grouped
-    /// aggregated rank with prefix caching off does not read it.
+    /// aggregated rank with prefix caching off has no rule that depends on
+    /// the release, so it can leave the field out. A value that it states must
+    /// be one of the three.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vllm_version: Option<String>,
     /// Optional framework-native host-offload simulation.
@@ -2270,6 +2272,15 @@ impl EngineConfig {
             if self.enable_prefix_caching {
                 self.validate_grouped_prefix_caching()?;
             }
+            // The two gates above refuse another version with their own
+            // texts, so this text is for an aggregated rank with prefix
+            // caching off, which has no rule that depends on the release.
+            ensure!(
+                self.vllm_version
+                    .as_deref()
+                    .is_none_or(|version| VllmRuleVersion::parse(version).is_some()),
+                "vllm_version must be 0.31.0, 0.32.0 or 0.33.0; a rank with kv_cache_groups, worker_type=aggregated and enable_prefix_caching=false can leave it out"
+            );
         }
         if let Some(g3) = &self.g3_offload {
             g3.validate()?;
@@ -3552,6 +3563,46 @@ mod tests {
     }
 
     #[test]
+    fn grouped_aggregated_rank_without_prefix_caching_refuses_an_unsupported_version() {
+        // No rule of such a rank follows the version, so the rank can leave
+        // it out. A version that it states is still one of the three.
+        let unsupported = "vllm_version must be 0.31.0, 0.32.0 or 0.33.0; a rank with kv_cache_groups, worker_type=aggregated and enable_prefix_caching=false can leave it out";
+        let wire = |version: Option<&str>| {
+            let mut wire = glm_prefix_wire(version, None);
+            wire["enable_prefix_caching"] = false.into();
+            wire.as_object_mut().unwrap().remove("prefix_match_unit");
+            wire
+        };
+        // Only the three exact strings are supported, so a short form, a `v`
+        // prefix and a patch release are refused too.
+        for version in ["0.30.0", "0.99.0", "", "0.33", "v0.33.0", "0.33.1"] {
+            assert_eq!(
+                validation_error(wire(Some(version))),
+                unsupported,
+                "{version:?}"
+            );
+        }
+        for version in [Some("0.31.0"), Some("0.32.0"), Some("0.33.0"), None] {
+            validates(wire(version));
+        }
+        // The gate of a prefill or decode rank and the gate of prefix caching
+        // run first and keep their own texts.
+        for role in ["prefill", "decode"] {
+            let mut wire = glm_pd_wire(role);
+            wire["vllm_version"] = "0.30.0".into();
+            assert_eq!(
+                validation_error(wire),
+                "kv_cache_groups with worker_type=prefill or decode require vllm_version 0.31.0, 0.32.0 or 0.33.0",
+                "{role}"
+            );
+        }
+        assert_eq!(
+            validation_error(glm_prefix_wire(Some("0.30.0"), None)),
+            "kv_cache_groups with enable_prefix_caching=true require vllm_version 0.31.0, 0.32.0 or 0.33.0"
+        );
+    }
+
+    #[test]
     fn grouped_prefix_caching_refuses_a_startup_count_above_usize() {
         // Two full-attention groups of two-token blocks need 2^63 blocks each
         // for a max_model_len of u64::MAX. vLLM sums Python integers, which
@@ -3944,7 +3995,8 @@ mod tests {
             wire["prefill_schedule_interval"] = 2.into();
             validates(wire);
         }
-        // A grouped rank with prefix caching off does not read the version.
+        // A grouped aggregated rank with prefix caching off has no rule that
+        // depends on the version.
         let mut off = glm_prefix_wire(Some("0.33.0"), Some(1));
         off["enable_prefix_caching"] = false.into();
         off.as_object_mut().unwrap().remove("prefix_match_unit");
