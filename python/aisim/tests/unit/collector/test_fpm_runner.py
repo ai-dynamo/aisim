@@ -1918,6 +1918,14 @@ def test_smoke_receipts_match_the_smoke_selection_only(monkeypatch, tmp_path):
         with pytest.raises(ValueError) as error:
             fpm_runner._validate_points_receipts(plan, cell, raw, attempt_id, smoke=False)
         assert str(error.value).startswith("runtime benchmark-points receipt mismatch")
+        # A receipt that names the full list is no receipt of the smoke selection.
+        receipt = raw / "pod-0" / POINTS_RECEIPT_FILENAME
+        full = {**json.loads(receipt.read_text()), "sha256": plan.options.benchmark_points_sha256}
+        receipt.write_text(json.dumps(full))
+        with pytest.raises(ValueError) as error:
+            fpm_runner._validate_points_receipts(plan, cell, raw, attempt_id, smoke=True)
+        assert str(error.value).startswith("runtime benchmark-points receipt mismatch")
+        fpm_runner._validate_points_receipts(plan, cell, raw, attempt_id, smoke=False)
 
 
 def test_cell_of_another_model_keeps_no_producer_receipt(monkeypatch, tmp_path):

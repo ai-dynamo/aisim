@@ -330,6 +330,15 @@ def freeze_repeatability_plan(
         entry = checkpoint.get("cells", {}).get(cell.cell_id, {})
         if entry.get("status") != "passed" or not entry.get("attempt_id"):
             raise ValueError(f"repeatability requires a passed source cell: {cell.cell_id}")
+        smoke = entry.get("smoke_manifest") == GLM_SMOKE_MANIFEST
+        if smoke and comparison_mode == "full_grid":
+            # A full_grid sample keeps the options of the source and runs without smoke, so it stages the whole list
+            # and can never measure exactly the frozen coordinates of the subset.
+            raise ValueError(
+                f"repeatability source cell {cell.cell_id}: a smoke collection measured a subset of its point list, "
+                "and a full_grid repeatability run stages the full list: use --repeatability-comparison-mode "
+                "bounded, or a formal collection as the source"
+            )
         cell_dir = root / "cells" / cell.cell_id
         collection = validate_native_collection(
             cell,
@@ -342,7 +351,7 @@ def freeze_repeatability_plan(
             cell,
             cell_dir / "raw",
             entry["attempt_id"],
-            smoke=entry.get("smoke_manifest") == GLM_SMOKE_MANIFEST,
+            smoke=smoke,
         )
         selected = _select_points(
             collection, max_points_per_cell if comparison_mode == "bounded" else None, cell_id=cell.cell_id
