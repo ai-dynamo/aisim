@@ -1819,6 +1819,8 @@ def engine_identity(model: Any, database: Any) -> str:
     setters replace the mode member and the frozen policy instead of mutating
     them, so identity checks detect a change without rebuilding either key on
     this per-query path.
+    Structural edits to either model operation list advance a shared revision;
+    checking it keeps in-place graph edits from reusing a previous compilation.
     """
     # The stored attributes behind ``get_default_database_mode`` and
     # ``transfer_policy``; reading them directly keeps the check near main's
@@ -1826,7 +1828,9 @@ def engine_identity(model: Any, database: Any) -> str:
     mode = getattr(database, "_default_database_mode", None)
     policy = getattr(database, "_transfer_policy", None)
     memo = getattr(model, "_aic_engine_identity_memo", None)
-    if memo is not None and memo[0] is database and memo[1] is mode and memo[2] is policy:
+    revision = getattr(model, "_aic_op_list_revision", None)
+    graph_version = revision[0] if revision is not None else None
+    if memo is not None and memo[0] is database and memo[1] is mode and memo[2] is policy and memo[4] == graph_version:
         return memo[3]
     from aisim_core.sdk.engine import OpConversionError
 
@@ -1837,7 +1841,7 @@ def engine_identity(model: Any, database: Any) -> str:
         # Retry conversion on later calls; successful identities remain memoized.
         raise RustEngineUnsupportedError(str(exc)) from exc
     try:
-        model._aic_engine_identity_memo = (database, mode, policy, key)
+        model._aic_engine_identity_memo = (database, mode, policy, key, graph_version)
     except (AttributeError, TypeError):
         pass  # slotted/frozen model objects: recompute per call
     return key

@@ -45,6 +45,72 @@ logger = logging.getLogger(__name__)
 _MODEL_REGISTRY: dict[str, type] = {}
 
 
+class _OperationList(list):
+    """A model-owned list that versions structural edits without walking the graph.
+
+    Both phase lists share the counter. It has no back-reference to the model,
+    and deepcopy/pickle preserve the sharing in a restored model.
+    """
+
+    def __init__(self, values, revision):
+        super().__init__(values)
+        self._revision = revision
+
+    def _changed(self):
+        # Copy/unpickle may populate the list before restoring its attributes.
+        if (revision := getattr(self, "_revision", None)) is not None:
+            revision[0] += 1
+
+    def __setitem__(self, key, value):
+        self._changed()
+        return super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        self._changed()
+        return super().__delitem__(key)
+
+    def __iadd__(self, values):
+        self._changed()
+        return super().__iadd__(values)
+
+    def __imul__(self, count):
+        self._changed()
+        return super().__imul__(count)
+
+    def append(self, value):
+        self._changed()
+        return super().append(value)
+
+    def extend(self, values):
+        # Invalidate first: an iterator can raise after yielding some values.
+        self._changed()
+        return super().extend(values)
+
+    def insert(self, index, value):
+        self._changed()
+        return super().insert(index, value)
+
+    def pop(self, index=-1):
+        self._changed()
+        return super().pop(index)
+
+    def remove(self, value):
+        self._changed()
+        return super().remove(value)
+
+    def clear(self):
+        self._changed()
+        return super().clear()
+
+    def reverse(self):
+        self._changed()
+        return super().reverse()
+
+    def sort(self, *, key=None, reverse=False):
+        self._changed()
+        return super().sort(key=key, reverse=reverse)
+
+
 def register_model(*families: str):
     """Decorator: register ``cls`` as the implementation of one or more families.
 
@@ -107,6 +173,7 @@ class BaseModel:
         self.config = model_config
         self.extra_params = extra_params
         self._use_qk_norm = bool(extra_params.get("use_qk_norm", False)) if isinstance(extra_params, dict) else False
+        self._aic_op_list_revision = [0]
         self.encoder_ops = []
         self.context_ops = []
         self.generation_ops = []
@@ -159,7 +226,7 @@ class BaseModel:
     @context_ops.setter
     def context_ops(self, value):
         self.__dict__.pop("_aic_engine_identity_memo", None)
-        self.__dict__["context_ops"] = value
+        self.__dict__["context_ops"] = _OperationList(value, self._aic_op_list_revision)
 
     @property
     def generation_ops(self):
@@ -167,10 +234,8 @@ class BaseModel:
 
     @generation_ops.setter
     def generation_ops(self, value):
-        # All hybrid setters replace these lists before rebuilding them.
-        # Invalidate once at construction time, keeping warm queries cheap.
         self.__dict__.pop("_aic_engine_identity_memo", None)
-        self.__dict__["generation_ops"] = value
+        self.__dict__["generation_ops"] = _OperationList(value, self._aic_op_list_revision)
 
     @property
     def verify_width(self) -> int:

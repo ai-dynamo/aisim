@@ -3,7 +3,8 @@
 
 """XPU caller/fit comparison on synthetic FPM prices, not silicon accuracy.
 
-Usage from the repository root: python xpu_scoped_repair.py OUT.json
+Usage from the repository root:
+    python benchmarks/evidence/mamba-mixed-step-accounting/xpu_scoped_repair.py OUT.json
 The baseline class is read from the pinned commit; the candidate is imported.
 The base mixed-step seam records the shapes handed to native pricing and
 returns 1 ms/launch + .01 ms/new prefill token + .1 ms/decode request.

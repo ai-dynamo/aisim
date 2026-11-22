@@ -5205,6 +5205,54 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn padded_prefill_keeps_nondivisible_token_major_positions() {
+        let mut db = Arc::try_unwrap(build_engine(None).db)
+            .unwrap_or_else(|_| panic!("test database is shared"));
+        db.database_mode = DatabaseMode::Sol;
+        let mut spec = EngineSpec::new(
+            fixture_engine_config(None),
+            vec![
+                qualified_mamba(true, 1),
+                Op::Elementwise(ElementwiseOp::new("norm", 2.0)),
+            ],
+            vec![qualified_mamba(false, 1)],
+        );
+        spec.engine.database_mode = DatabaseMode::Sol;
+        let engine = Engine::build(spec, Arc::new(db)).unwrap();
+        let ms = |bytes: f64| bytes / engine.db.system_spec.gpu.mem_bw * 1000.0;
+        for decodes in [0, 1] {
+            let input = ForwardPassMetrics {
+                scheduled_requests: crate::ScheduledRequestMetrics {
+                    num_prefill_requests: 2,
+                    sum_prefill_tokens: 23,
+                    sum_prefill_padding_tokens: 6,
+                    prefill_chunks: Some(vec![[1, 8, 0], [1, 9, 0]]),
+                    num_decode_requests: decodes,
+                    sum_decode_kv_tokens: decodes * 16,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            // The scan processes 17 real prompt tokens and reads+writes two
+            // 1 MiB states. Norm touches every scheduled position (23, not
+            // floor(23/2)*2 = 22), plus a token for the optional decode rider.
+            let prefill_bytes = 17.0 * 18_560.0 + 2.0 * 2_097_152.0;
+            let decode_bytes = f64::from(decodes) * (18_560.0 + 2_097_152.0);
+            let norm_bytes = f64::from(23 + decodes) * 2.0;
+            let expected = ms(prefill_bytes + decode_bytes + norm_bytes);
+            let scalar = engine.forward_pass_time_ms(&[input.clone()]).unwrap();
+            assert!((scalar - expected).abs() < 1e-12, "decodes={decodes}");
+            let detail = engine.forward_pass_estimate(&[input], true, None).unwrap();
+            assert_eq!(detail.latency_ms.unwrap(), scalar);
+            let rows = &detail.ranks[0].operations;
+            let norm = rows.iter().find(|op| op.name == "norm").unwrap();
+            assert!((norm.latency_ms - ms(norm_bytes)).abs() < 1e-12);
+            let scan = rows.iter().find(|op| op.name == "context_ssm").unwrap();
+            assert!((scan.latency_ms - ms(prefill_bytes)).abs() < 1e-12);
+        }
+    }
+
+    #[test]
     fn qualified_mamba_exact_totals_preserve_new_tokens() {
         let mut scan = qualified_mamba(true, 1);
         if let Op::Mamba2(m) = &mut scan {

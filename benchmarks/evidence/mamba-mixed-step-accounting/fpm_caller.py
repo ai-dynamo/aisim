@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(sys.argv[1], os.path.dirname(HELPER)))
 import test_fpm_forward as t
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from committed_sources import require_committed
+from committed_sources import require_committed, verified_model_configs
 
 import aisim
 import aisim_core
@@ -36,6 +36,8 @@ from aisim_core.sdk.backends.factory import get_backend
 from aisim_core.sdk.config import RuntimeConfig
 from aisim_core.sdk.perf_database import PerfDatabase
 from aisim_core.sdk.step_estimate import MixedStepInput
+
+MODEL = "Qwen/Qwen3-0.6B"
 
 
 def verified_build(repo):
@@ -85,6 +87,7 @@ def verified_build(repo):
     return {
         "revision": revision,
         "packages": packages,
+        "model_configs": verified_model_configs(repo, revision, MODEL),
         "fixture_helper": {"path": HELPER, "sha256": hashlib.sha256(helper.read_bytes()).hexdigest()},
         "system_yaml": {
             "path": committed_yaml.relative_to(repo).as_posix(),
@@ -101,7 +104,7 @@ ISL, OSL = 512, 2
 PREFILL = {(1, 256, 256): 12.0, (2, 512, 512): 30.0, (1, 512, 0): 22.0}
 DECODE = {(1, 0, ISL + OSL // 2 + 1): 3.0, (1, 0, ISL + 1): 2.5}
 
-model = models.get_model("Qwen/Qwen3-0.6B", t._model_config(forward_model="fpm"), t.BACKEND)
+model = models.get_model(MODEL, t._model_config(forward_model="fpm"), t.BACKEND)
 identity = dict(zip(t._CELL_MATCH_COLUMNS, model.context_ops[0]._match_identity, strict=True))
 rows = [t._row("prefill", *key, ms, model_path=model.model_path, identity=identity) for key, ms in PREFILL.items()]
 rows += [t._row("decode", *key, ms, model_path=model.model_path, identity=identity) for key, ms in DECODE.items()]

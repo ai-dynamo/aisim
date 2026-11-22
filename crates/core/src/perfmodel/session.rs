@@ -359,6 +359,8 @@ pub(crate) fn run_context_ops_with<'a>(
 /// ([`mamba_cached_prefix`]), and every other op keeps `prefix`.
 /// `total_new_tokens` preserves an exact-total query's token sum for qualified
 /// Mamba, whose two balanced chunk lengths cannot be replaced by a mean.
+/// With exact prefill groups, token-major ops also retain scheduled padding
+/// positions rather than truncating their total to an integer request mean.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_context_ops_planned<'a>(
     ops: &'a [Op],
@@ -430,7 +432,9 @@ pub(crate) fn run_context_ops_planned<'a>(
             effective_isl,
             mamba_cached_prefix(op, prefix, any_cached),
             seq_imbalance_correction_scale,
-            None,
+            total_new_tokens.filter(|_| {
+                prefill_chunks.is_some() && !op.is_context_attention() && !op.is_logits_gemm()
+            }),
         );
         let result = memo.query(index, || {
             shared_query(op_memo, db, OpList::Context, index, op, &ctx)

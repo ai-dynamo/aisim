@@ -72,6 +72,8 @@ def test_canonical_mtp_prices_resolved_mamba_state_and_width(tmp_path, mtp, back
         if prefill:
             assert rows["context_mamba_ssm"]["latency_ms"] == pytest.approx(expected_prefill, rel=1e-9)
             assert rows["context_mamba_ssm"]["source"] == "sol"
+        else:
+            assert "context_mamba_ssm" not in rows or rows["context_mamba_ssm"]["latency_ms"] == 0
         payloads.append(payload)
 
     # Restoring the saved canonical configuration must rebuild the qualified
@@ -427,6 +429,45 @@ def _agg_ttft(backend, model, database):
 
     runtime = config.RuntimeConfig(batch_size=1, isl=4096, osl=64, prefix=3000)
     return _ttft(InferenceSession(model, database, backend).run_agg(runtime, ctx_tokens=2048))
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+def test_run_agg_reuse_observes_appended_qualified_operation(phase):
+    import aisim_core
+    from aisim.sdk.inference_session import InferenceSession
+    from aisim_core.sdk import config, rust_engine_step
+    from aisim_core.sdk.backends.factory import get_backend
+
+    database = _hybrid_trtllm_database()
+    model = _nano_with_state_dtypes(conv1d="float16", ssm="float16")
+    cold = _nano_with_state_dtypes(conv1d="float16", ssm="float16")
+    backend = get_backend("trtllm", "b200_sxm")
+    runtime = config.RuntimeConfig(batch_size=1, isl=4096, osl=64, prefix=3000)
+
+    def run(backend, model, budget):
+        return InferenceSession(model, database, backend).run_agg(runtime, ctx_tokens=budget)
+
+    rust_engine_step._engine_handle_cache_clear()
+    warm = run(backend, model, 2048)
+    old_identity = rust_engine_step.engine_identity(model, database)
+    for graph in (model, cold):
+        ops = getattr(graph, f"{phase}_ops")
+        spec = json.loads(next(op for op in ops if op._name == f"{phase}_mamba_ssm")._spec_json())
+        spec["Mamba2"]["name"] = f"extra_{phase}_ssm"
+        ops.append(aisim_core.op_from_spec_json(json.dumps(spec)))
+    assert rust_engine_step.engine_identity(model, database) != old_identity
+    # First reuse the existing workload and result cache, then query a new
+    # workload through the previously warmed compiled-handle cache. Compute
+    # the cold references afterwards so they cannot prime either warm cache.
+    actual = [run(backend, model, budget) for budget in (2048, 512)]
+    assert actual[0] is not warm
+    assert actual[0].get_per_ops_data() != warm.get_per_ops_data()
+    rust_engine_step._engine_handle_cache_clear()
+    for budget, got in zip((2048, 512), actual, strict=True):
+        expected = run(get_backend("trtllm", "b200_sxm"), cold, budget)
+        assert got.get_per_ops_data() == expected.get_per_ops_data()
+        assert got.get_summary_df().equals(expected.get_summary_df())
+        assert run(backend, model, budget) is got
 
 
 def test_run_agg_reuse_keeps_each_mamba_op_state_dtype():
