@@ -282,7 +282,11 @@ impl PrefixHashMemo {
 }
 
 /// The last scheduled step of a request on a grouped pool or a state cache,
-/// for the processed token count of its next allocation.
+/// for the processed token count of its next allocation. Only a grouped pool
+/// reads that count: its allocation frees held blocks on it, and the
+/// scheduler checks a grouped forward against it. A state cache records the
+/// step but does not read the count: an allocation of the request releases
+/// the copies that an earlier step held, with one batch and with two.
 #[derive(Debug, Clone, Copy)]
 struct ScheduledStep {
     /// [`VllmKvManager`]'s step counter at the step.
@@ -756,13 +760,21 @@ pub(crate) struct VllmKvManager {
     prefix_match_unit: Option<usize>,
     /// Present while a host tier takes recurrent-state stores.
     state_handoffs: Option<StateHandoffQueue>,
-    /// Scheduler steps begun, for the one-step block lifetimes of the
-    /// grouped coordinator.
+    /// Scheduler steps begun. The grouped coordinator times its one-step
+    /// block lifetimes with it, and the record of a lease's last scheduled
+    /// step holds it, so that [`Self::processed_tokens`] can tell whether
+    /// that step is in flight.
     step: u64,
-    /// Whether the step before this one is still in flight: with async
-    /// scheduling vLLM forms a step before it processes the outputs of the
-    /// step before (v0.33 `vllm/v1/engine/core.py:735`, `:778-793`).
-    /// [`Self::begin_step`] clears it.
+    /// Whether the processed token count of this step leaves out the tokens
+    /// of the step in flight, as vLLM's count does. The scheduler sets it
+    /// when the step before this one is still in flight and the rank is
+    /// aggregated: with async scheduling vLLM forms a step before it
+    /// processes the outputs of the step before (v0.33
+    /// `vllm/v1/engine/core.py:735`, `:778-793`). On a prefill or decode rank
+    /// it stays false, also with a step in flight. Only
+    /// [`Self::processed_tokens`] reads it, and only a grouped pool frees held
+    /// blocks on that count: a linear state cache releases its held copies by
+    /// the step. [`Self::begin_step`] clears it.
     previous_pass_in_flight: bool,
     /// The sum of `first_pass_need` over the grouped destination loads in
     /// flight: reserved, or activated before their first pass. vLLM keeps
@@ -1156,8 +1168,9 @@ impl VllmKvManager {
         self.previous_pass_in_flight = false;
     }
 
-    /// Tell the manager that the step before this one is still in flight.
-    /// Call it after [`Self::begin_step`].
+    /// Tell the manager if the processed token count of this step leaves out
+    /// the tokens of the step in flight: the step before this one is still in
+    /// flight, and the rank is aggregated. Call it after [`Self::begin_step`].
     pub(crate) fn set_previous_pass_in_flight(&mut self, in_flight: bool) {
         self.previous_pass_in_flight = in_flight;
     }
@@ -1174,10 +1187,12 @@ impl VllmKvManager {
     /// `vllm/v1/core/sched/scheduler.py:1859`), and processing its outputs
     /// takes them off (v0.33 `scheduler.py:2318`). Only the step before can
     /// be in flight, so processed is the computed count before that step when
-    /// it is in flight and ran the request, and `computed_before` otherwise.
-    /// After the finalize of a step it is the count of that step's
-    /// allocation, whatever `computed_before` is, because the step's own
-    /// tokens are in flight too.
+    /// the flag of this step is set and that step ran the request, and
+    /// `computed_before` otherwise. The scheduler sets the flag only on an
+    /// aggregated rank, so a prefill or decode rank gets `computed_before`
+    /// also with a step in flight. After the finalize of a step it is the
+    /// count of that step's allocation, whatever `computed_before` is,
+    /// because the step's own tokens are in flight too.
     pub(crate) fn processed_tokens(
         &self,
         lease: &BlockRequestLease,
@@ -1307,7 +1322,24 @@ impl VllmKvManager {
         reusable_prefix_blocks: usize,
     ) -> NativeAllocation<usize> {
         lease.debug_assert_owner(owner);
-        if let Some(grouped) = &mut self.grouped {
+        // The processed count of a grouped allocation, read before the
+        // grouped pool is borrowed, with the computed count that it falls
+        // back to. A first allocation in block mode starts from its hit,
+        // every other allocation from the tokens it holds.
+        let counts = self.grouped.is_some().then(|| {
+            let first_with_hit = self.grouped_prefix.is_some()
+                && !lease
+                    .grouped
+                    .as_ref()
+                    .and_then(|grouped| grouped.block_lease.as_ref())
+                    .is_some_and(|block_lease| block_lease.allocated);
+            let fallback = match &lease.grouped_hit {
+                Some(hit) if first_with_hit => hit.hit().tokens,
+                _ => lease.allocated_tokens,
+            };
+            (fallback, self.processed_tokens(lease, fallback))
+        });
+        if let (Some(grouped), Some((fallback, processed))) = (&mut self.grouped, counts) {
             assert!(self.enable_prefix_caching || reusable_prefix_blocks == 0);
             // Most decode steps stay inside the blocks the request holds, so
             // the coordinator has nothing to release or take for them.
@@ -1379,13 +1411,22 @@ impl VllmKvManager {
                 } else {
                     lease.allocated_tokens
                 };
+                debug_assert_eq!(
+                    fallback, computed_before,
+                    "the count of an allocation without a record is its computed count"
+                );
+                // Held blocks go on the processed count (v0.31
+                // `mgr:549-556`, v0.32 `mgr:552-559`, v0.33 `mgr:561-568`). A
+                // first allocation has no record of a step, so its count is
+                // its hit, the count that vLLM pads null window blocks below
+                // (v0.33 `single:293-312`).
                 if !coordinator.allocate(
                     pool,
                     block_lease,
                     prefill_end,
                     computed_before,
                     cumulative_tokens,
-                    computed_before,
+                    processed,
                     self.step,
                 ) {
                     if first {
@@ -1395,11 +1436,7 @@ impl VllmKvManager {
                     }
                     return NativeAllocation::CapacityExhausted;
                 }
-            } else if !grouped.allocate(
-                &mut lease.grouped,
-                lease.allocated_tokens,
-                cumulative_tokens,
-            ) {
+            } else if !grouped.allocate(&mut lease.grouped, processed, cumulative_tokens) {
                 return NativeAllocation::CapacityExhausted;
             }
             lease.allocated_tokens = cumulative_tokens;
@@ -2100,6 +2137,10 @@ impl VllmKvManager {
                 });
             }
         }
+        // The record of the step is written, so this is the count of its
+        // allocation.
+        #[cfg(debug_assertions)]
+        let processed = self.processed_tokens(lease, computed_before);
         if let (Some(grouped), Some(coordinator)) = (&mut self.grouped, &mut self.grouped_prefix)
             && publish_state
             && self.enable_prefix_caching
@@ -2137,7 +2178,7 @@ impl VllmKvManager {
                         prefill_end,
                         computed_before,
                         computed_after,
-                        computed_before,
+                        processed,
                         self.step,
                     ));
                     before

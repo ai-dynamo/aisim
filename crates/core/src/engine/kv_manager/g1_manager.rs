@@ -218,7 +218,6 @@ impl G1Manager {
         self.inner.previous_pass_in_flight()
     }
 
-    #[expect(dead_code)]
     pub(crate) fn processed_tokens(
         &self,
         lease: &BlockRequestLease,

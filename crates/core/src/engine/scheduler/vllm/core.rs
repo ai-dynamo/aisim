@@ -2660,8 +2660,29 @@ impl VllmCore {
         // runs, and processes the previous pass's outputs only afterwards,
         // unless that pass ran nothing or ended before now.
         let previous_in_flight = self.last_pass_end_ms == Some(now_ms);
-        self.kv_manager
-            .set_previous_pass_in_flight(previous_in_flight);
+        // vLLM frees skipped blocks on the processed token count, so a block
+        // of the step in flight stays one step longer (v0.31 `mgr:549-556`,
+        // v0.32 `mgr:552-559`, v0.33 `mgr:561-568`). A decode worker runs its
+        // connector as `kv_consumer` or `kv_both`, and a prefill worker as
+        // `kv_both` or `kv_producer`. vLLM counts `kv_both` as a consumer
+        // (v0.31, v0.32 and v0.33 `kv_transfer.py:11-12`). With a consumer
+        // connector vLLM pairs the longer hold with a stop: it does not
+        // preempt a request that the step in flight runs (v0.31
+        // `sched:175-181`, `:773-775`, v0.32 `sched:186-192`, `:804-806`,
+        // v0.33 `sched:189-195`, `:940-942`). Replay does not model the role
+        // of the connector of a prefill or decode rank, nor that stop there
+        // without a CPU tier, and the hold without the stop would preempt a
+        // request where vLLM waits one step. So only an aggregated rank gets
+        // the flag, and a prefill or decode rank frees on the computed count.
+        // The flag has an effect only on a rank with cache groups, through
+        // the processed count: the hold rules of its allocation and the
+        // forward check of a grouped request use that count. An aggregated
+        // rank with cache groups has no offload tier and so no connector. A
+        // linear state cache does not use the count: it frees a previous
+        // state copy at the next allocation of its request on every rank.
+        self.kv_manager.set_previous_pass_in_flight(
+            previous_in_flight && self.args.worker_type == WorkerType::Aggregated,
+        );
         if !previous_in_flight {
             let finished = std::mem::take(&mut self.finished_in_flight);
             self.free_finished(finished);
@@ -4106,9 +4127,15 @@ impl VllmCore {
                 work.known_end
             });
         if let Some(pool) = self.kv_manager.grouped() {
+            // The forward that the allocation takes: it holds the blocks
+            // above the processed count (V31 `mgr:549-556`, V32
+            // `mgr:552-559`, v0.33 `mgr:561-568`).
+            let window_start = self
+                .kv_manager
+                .processed_tokens(&request.sequence.lease, effective_computed_before);
             if let Some(blocks) = pool.block_pool() {
                 let required = pool
-                    .projected_blocks(effective_computed_before, desired_computed_after)
+                    .projected_blocks(window_start, desired_computed_after)
                     .ok_or_else(|| {
                         anyhow::anyhow!("grouped KV forward block calculation overflowed")
                     })?;
@@ -4125,7 +4152,7 @@ impl VllmCore {
                 );
             } else {
                 let required = pool
-                    .required_bytes(effective_computed_before, desired_computed_after)
+                    .required_bytes(window_start, desired_computed_after)
                     .ok_or_else(|| {
                         anyhow::anyhow!("grouped KV forward byte calculation overflowed")
                     })?;
