@@ -1201,21 +1201,45 @@ def test_reader_takes_the_producer_digests_of_a_receipt(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "change",
-    [{"plan_sha256": "0" * 64}, {"cell_id": "fpm-other"}, {"attempt_id": "a2"}],
+    ("change", "name", "key", "expected"),
+    [
+        ({"plan_sha256": "0" * 64}, "plan", "plan_sha256", PLAN_SHA256),
+        ({"cell_id": "fpm-other"}, "cell", "cell_id", None),
+        ({"attempt_id": "a2"}, "attempt", "attempt_id", ATTEMPT_ID),
+    ],
     ids=["plan", "cell", "attempt"],
 )
-def test_receipt_of_another_plan_cell_or_attempt_is_refused(tmp_path, change):
+def test_receipt_of_another_plan_cell_or_attempt_is_refused(tmp_path, change, name, key, expected):
     cell = _cell_of_another_producer_revision(tmp_path)
     path = _receipt(tmp_path, cell, **change)
+    expected = cell.cell_id if expected is None else expected
     with pytest.raises(ValueError) as refusal:
         _validate(tmp_path, cell)
-    assert str(refusal.value) == f"producer receipt names another plan, cell or attempt: {path}"
+    assert str(refusal.value) == (
+        f"producer receipt names another {name}: {key} actual={change[key]!r} expected={expected!r}: {path}"
+    )
+
+
+_RECEIPT_KEYS = "['attempt_id', 'cell_id', 'plan_sha256', 'producer', 'schema_name', 'schema_version']"
+_RECEIPT_OBJECT = f"it must be a JSON object with exactly the keys {_RECEIPT_KEYS}"
+_RECEIPT_VERSION = "schema_version must be the integer 1"
+_RECEIPT_PRODUCER = (
+    "producer must be a JSON object with exactly the keys ['overlay_sha256', 'runtime_source_manifest_sha256']"
+)
+_RECEIPT_LINK = "it must be a regular file, not a symbolic link"
+_RECEIPT_TEXT = "it must be JSON text in UTF-8"
 
 
 def _write_receipt_text(text: str):
     def write(cell_dir: Path, _cell: FPMCell) -> None:
         (cell_dir / "producer-receipt.json").write_text(text)
+
+    return write
+
+
+def _write_receipt_bytes(data: bytes):
+    def write(cell_dir: Path, _cell: FPMCell) -> None:
+        (cell_dir / "producer-receipt.json").write_bytes(data)
 
     return write
 
@@ -1238,52 +1262,87 @@ def _write_receipt_with(**changes):
 
 
 def _write_receipt_symlink(cell_dir: Path, cell: FPMCell) -> None:
-    outside = cell_dir / "outside"
-    outside.mkdir()
-    target = _receipt(outside, cell)
+    """A symbolic link at the receipt path to a valid receipt in a folder beside the cell folder."""
+    elsewhere = cell_dir.parent / "elsewhere"
+    elsewhere.mkdir()
+    target = _receipt(elsewhere, cell)
     (cell_dir / "producer-receipt.json").symlink_to(target)
 
 
+def _write_receipt_dangling_symlink(cell_dir: Path, _cell: FPMCell) -> None:
+    (cell_dir / "producer-receipt.json").symlink_to(cell_dir.parent / "missing.json")
+
+
+def _write_receipt_directory(cell_dir: Path, _cell: FPMCell) -> None:
+    (cell_dir / "producer-receipt.json").mkdir()
+
+
 @pytest.mark.parametrize(
-    "write",
+    ("write", "rule"),
     [
-        _write_receipt_text("[]"),
-        _write_receipt_text("{"),
-        _write_receipt_without("attempt_id"),
-        _write_receipt_with(note="added"),
-        _write_receipt_with(schema_version="1"),
-        _write_receipt_with(schema_version=True),
-        _write_receipt_with(schema_name="other"),
-        _write_receipt_with(producer={"runtime_source_manifest_sha256": "a" * 63, "overlay_sha256": "b" * 64}),
-        _write_receipt_with(producer={"runtime_source_manifest_sha256": "A" * 64, "overlay_sha256": "b" * 64}),
-        _write_receipt_with(
-            producer={"runtime_source_manifest_sha256": "a" * 64, "overlay_sha256": "b" * 64, "note": "added"}
+        (_write_receipt_text("[]"), _RECEIPT_OBJECT),
+        (_write_receipt_text("null"), _RECEIPT_OBJECT),
+        (_write_receipt_text("5"), _RECEIPT_OBJECT),
+        (_write_receipt_text("{"), _RECEIPT_TEXT),
+        (_write_receipt_bytes(b"\xff\xfe{}"), _RECEIPT_TEXT),
+        (_write_receipt_without("attempt_id"), _RECEIPT_OBJECT),
+        (_write_receipt_with(note="added"), _RECEIPT_OBJECT),
+        (_write_receipt_with(schema_version="1"), _RECEIPT_VERSION),
+        (_write_receipt_with(schema_version=True), _RECEIPT_VERSION),
+        (_write_receipt_with(schema_version=2), _RECEIPT_VERSION),
+        (_write_receipt_with(schema_version=1.0), _RECEIPT_VERSION),
+        (_write_receipt_with(schema_name="other"), "schema_name must be 'aic_fpm_producer_receipt'"),
+        (
+            _write_receipt_with(producer={"runtime_source_manifest_sha256": "a" * 63, "overlay_sha256": "b" * 64}),
+            "producer.runtime_source_manifest_sha256 must be 64 lowercase hexadecimal characters",
         ),
-        _write_receipt_with(producer=[]),
-        _write_receipt_symlink,
+        (
+            _write_receipt_with(producer={"runtime_source_manifest_sha256": "A" * 64, "overlay_sha256": "b" * 64}),
+            "producer.runtime_source_manifest_sha256 must be 64 lowercase hexadecimal characters",
+        ),
+        (
+            _write_receipt_with(
+                producer={"runtime_source_manifest_sha256": "a" * 64, "overlay_sha256": "b" * 64, "note": "added"}
+            ),
+            _RECEIPT_PRODUCER,
+        ),
+        (_write_receipt_with(producer=[]), _RECEIPT_PRODUCER),
+        (_write_receipt_with(producer=5), _RECEIPT_PRODUCER),
+        (_write_receipt_symlink, _RECEIPT_LINK),
+        (_write_receipt_dangling_symlink, _RECEIPT_LINK),
+        (_write_receipt_directory, "it must be a regular file"),
     ],
     ids=[
         "list",
+        "null",
+        "number",
         "no-json",
+        "no-utf8",
         "no-attempt-id",
         "added-key",
         "version-string",
         "version-bool",
+        "version-2",
+        "version-float",
         "other-schema",
         "short-digest",
         "upper-case-digest",
         "producer-added-key",
         "producer-list",
+        "producer-number",
         "symlink",
+        "dangling-symlink",
+        "directory",
     ],
 )
-def test_malformed_receipt_is_refused(tmp_path, write):
-    cell = _cell_of_another_producer_revision(tmp_path)
-    write(tmp_path, cell)
-    path = tmp_path / "producer-receipt.json"
+def test_malformed_receipt_is_refused(tmp_path, write, rule):
+    cell_dir = tmp_path / "cell"
+    cell = _cell_of_another_producer_revision(cell_dir)
+    write(cell_dir, cell)
+    path = cell_dir / "producer-receipt.json"
     with pytest.raises(ValueError) as refusal:
-        _validate(tmp_path, cell)
-    assert str(refusal.value) == f"invalid producer receipt: {path}"
+        _validate(cell_dir, cell)
+    assert str(refusal.value) == f"invalid producer receipt: {rule}: {path}"
 
 
 def test_receipt_leaves_the_other_producer_fields_to_the_reader(tmp_path):
@@ -1302,7 +1361,11 @@ def test_receipt_leaves_the_other_producer_fields_to_the_reader(tmp_path):
     _receipt(tmp_path / "digests", cell)
     with pytest.raises(ValueError) as refusal:
         _validate(tmp_path / "digests", cell)
-    assert "lacks valid producer.runtime_source_manifest_sha256: expected 'aaaa" in str(refusal.value)
+    # The expected digest is the one of the receipt, and the text says so.
+    assert str(refusal.value).startswith(
+        f"native GLM-5.3-Flash result lacks valid producer.runtime_source_manifest_sha256: expected {'a' * 64!r} "
+        f"(the value of the producer receipt of the cell), found {'c' * 64!r}: "
+    ), str(refusal.value)
 
 
 def test_receipt_is_not_read_for_a_cell_without_the_producer_contract(tmp_path):
@@ -1347,7 +1410,7 @@ def test_campaign_with_receipts_is_read_after_the_producer_files_change(tmp_path
         cell, tmp_path / "prefill", plan_sha256=PLAN_SHA256, attempt_id=ATTEMPT_ID
     )
     assert receipt == tmp_path / "prefill" / "producer-receipt.json"
-    assert json.loads(receipt.read_text()) == {
+    expected = {
         "attempt_id": ATTEMPT_ID,
         "cell_id": cell.cell_id,
         "plan_sha256": PLAN_SHA256,
@@ -1362,6 +1425,10 @@ def test_campaign_with_receipts_is_read_after_the_producer_files_change(tmp_path
         "schema_name": "aic_fpm_producer_receipt",
         "schema_version": 1,
     }
+    # The receipt is the JSON text with an indent of two, sorted keys and a final line break, and the write through a
+    # temporary file leaves no other file in the cell folder.
+    assert receipt.read_text() == json.dumps(expected, indent=2, sort_keys=True) + "\n"
+    assert sorted(item.name for item in (tmp_path / "prefill").iterdir()) == ["producer-receipt.json", "raw"]
 
     # A later revision of the producer: one more line in the scheduler file of the reading checkout.
     later = tmp_path / "later"

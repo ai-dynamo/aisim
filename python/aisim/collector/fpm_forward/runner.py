@@ -2037,8 +2037,15 @@ def _recover_completed_attempt(
 ) -> dict[str, Any] | None:
     """Recover a non-passed checkpoint cell whose salvaged artifacts are complete.
 
-    Recovery only flips identity fields; the passed-entry refresh loop that
-    follows in ``run_collection`` owns the metadata of every passed record.
+    Recovery flips identity fields of the checkpoint entry; the passed-entry
+    refresh loop that follows in ``run_collection`` owns the metadata of every
+    passed record. The one file that recovery writes is the producer receipt
+    of a GLM-5.3-Flash cell folder that holds none: the validation then
+    compared the artifacts with the producer files of this checkout. A
+    receipt that exists has just passed that validation for this plan, cell
+    and attempt, and its digests are the ones that the comparison used, so
+    recovery keeps it. A receipt that the validation refuses leaves the cell
+    unrecovered.
     Entries carrying ``cleanup_error`` are never recovered, whatever their
     status: their Kubernetes teardown was not verified, and only a rerun
     re-applies and re-deletes the leaked resource. ``running`` entries carry
@@ -2094,8 +2101,10 @@ def _recover_completed_attempt(
             )
             return None
 
+    receipt = cell_dir / PRODUCER_RECEIPT_FILENAME
     try:
-        write_producer_receipt(cell, cell_dir, plan_sha256=plan.sha256, attempt_id=attempt_id)
+        if not receipt.exists() and not receipt.is_symlink():
+            write_producer_receipt(cell, cell_dir, plan_sha256=plan.sha256, attempt_id=attempt_id)
     except OSError as error:
         logger.info(
             "FPM cell %s (status=%s) is not recoverable from local artifacts: %s",
@@ -2324,8 +2333,9 @@ def _run_collection_impl(
     checkpoint_changed = False
     # Recovery costs zero cluster time, so it runs on every resume: it only
     # acknowledges strictly validated, attempt-matched artifacts that already
-    # exist on disk. Rerunning (--resume-retry-failed) remains the only path
-    # that schedules cluster work.
+    # exist on disk, and writes no file but the producer receipt of such a
+    # cell when it has none. Rerunning (--resume-retry-failed) remains the
+    # only path that schedules cluster work.
     if resume:
         for cell in target_cells:
             entry = checkpoint["cells"].get(cell.cell_id)

@@ -307,9 +307,9 @@ def _glm_producer_record() -> dict[str, Any]:
     producer writes. The vLLM version is the exact supported runtime. The two digests are those of the pin manifest and
     of the producer file that this collector ships and that a launch of this collector mounts; the producer computes
     both the same way. A cell folder with a producer receipt (``write_producer_receipt``) gives the two digests instead:
-    the run that collected the cell wrote them from its own files after this comparison passed. A cell without a
-    receipt is compared with the files of the reading checkout, so a campaign of another producer revision without
-    receipts is refused.
+    the run that collected or recovered the cell wrote them from its own files after this comparison passed. A cell
+    without a receipt is compared with the files of the reading checkout, so a campaign of another producer revision
+    without receipts is refused.
     """
     return {
         "instrumentation_revision": "54960177085413259859c88bd34ed0734d4c2ea9",
@@ -350,10 +350,12 @@ def _glm_contract(cell: FPMCell) -> bool:
 def write_producer_receipt(cell: FPMCell, cell_dir: Path, *, plan_sha256: str, attempt_id: str) -> Path | None:
     """Write the producer receipt of a cell whose rank artifacts passed the strict comparison of this checkout.
 
-    The receipt binds the plan, the cell and the Collector attempt to the two digests of ``_glm_producer_record``, the
-    record that the comparison used; they are never copied from an artifact. A later read of the cell takes the two
-    digests from the receipt (``_producer_receipt``), so a later change of the producer files keeps the cell readable.
-    A cell without the GLM-5.3-Flash producer contract gets no receipt, and None is returned.
+    The receipt binds the plan, the cell and the Collector attempt to the two digests of ``_glm_producer_record``; they
+    are never copied from an artifact. The runner calls this only after a comparison that read no receipt (a new
+    attempt removes the receipt of the attempt that it replaces, and recovery keeps a receipt that its validation read),
+    so these are the digests that the comparison used. A later read of the cell takes the two digests from the receipt
+    (``_producer_receipt``), so a later change of the producer files keeps the cell readable. A cell without the
+    GLM-5.3-Flash producer contract gets no receipt, and None is returned.
     """
     if not _glm_contract(cell):
         return None
@@ -376,32 +378,47 @@ def write_producer_receipt(cell: FPMCell, cell_dir: Path, *, plan_sha256: str, a
 def _producer_receipt(cell: FPMCell, raw_root: Path, *, plan_sha256: str, attempt_id: str) -> dict[str, str] | None:
     """The two producer digests of the receipt in the cell folder of ``raw_root``, or None when it holds none.
 
-    A receipt that is no regular file, is malformed, or names another plan, cell or attempt is refused.
+    A receipt that is no regular file, is malformed, or names another plan, cell or attempt is refused. The refusal
+    names the rule that the file breaks, or the binding that differs with its actual and expected value.
     """
     path = raw_root.parent / PRODUCER_RECEIPT_FILENAME
     if not path.exists() and not path.is_symlink():
         return None
-    invalid = ValueError(f"invalid producer receipt: {path}")
-    if path.is_symlink() or not path.is_file():
-        raise invalid
+
+    def invalid(rule: str) -> ValueError:
+        return ValueError(f"invalid producer receipt: {rule}: {path}")
+
+    if path.is_symlink():
+        raise invalid("it must be a regular file, not a symbolic link")
+    if not path.is_file():
+        raise invalid("it must be a regular file")
     try:
         receipt = json.loads(path.read_text())
     except (UnicodeDecodeError, json.JSONDecodeError):
-        raise invalid from None
-    if (
-        not isinstance(receipt, dict)
-        or set(receipt) != {"attempt_id", "cell_id", "plan_sha256", "producer", "schema_name", "schema_version"}
-        or receipt["schema_name"] != _PRODUCER_RECEIPT_SCHEMA
-        or type(receipt["schema_version"]) is not int
-        or receipt["schema_version"] != 1
-        or not isinstance(receipt["producer"], dict)
-        or set(receipt["producer"]) != set(_PRODUCER_DIGEST_FIELDS)
-        or not all(_is_hex(receipt["producer"][field], 64) for field in _PRODUCER_DIGEST_FIELDS)
+        raise invalid("it must be JSON text in UTF-8") from None
+    keys = ["attempt_id", "cell_id", "plan_sha256", "producer", "schema_name", "schema_version"]
+    if not isinstance(receipt, dict) or sorted(receipt) != keys:
+        raise invalid(f"it must be a JSON object with exactly the keys {keys}")
+    if receipt["schema_name"] != _PRODUCER_RECEIPT_SCHEMA:
+        raise invalid(f"schema_name must be {_PRODUCER_RECEIPT_SCHEMA!r}")
+    if type(receipt["schema_version"]) is not int or receipt["schema_version"] != 1:
+        raise invalid("schema_version must be the integer 1")
+    producer = receipt["producer"]
+    if not isinstance(producer, dict) or sorted(producer) != sorted(_PRODUCER_DIGEST_FIELDS):
+        raise invalid(f"producer must be a JSON object with exactly the keys {sorted(_PRODUCER_DIGEST_FIELDS)}")
+    for field in _PRODUCER_DIGEST_FIELDS:
+        if not _is_hex(producer[field], 64):
+            raise invalid(f"producer.{field} must be 64 lowercase hexadecimal characters")
+    for key, name, expected in (
+        ("plan_sha256", "plan", plan_sha256),
+        ("cell_id", "cell", cell.cell_id),
+        ("attempt_id", "attempt", attempt_id),
     ):
-        raise invalid
-    if (receipt["plan_sha256"], receipt["cell_id"], receipt["attempt_id"]) != (plan_sha256, cell.cell_id, attempt_id):
-        raise ValueError(f"producer receipt names another plan, cell or attempt: {path}")
-    return {field: receipt["producer"][field] for field in _PRODUCER_DIGEST_FIELDS}
+        if receipt[key] != expected:
+            raise ValueError(
+                f"producer receipt names another {name}: {key} actual={receipt[key]!r} expected={expected!r}: {path}"
+            )
+    return {field: producer[field] for field in _PRODUCER_DIGEST_FIELDS}
 
 
 def _validate_glm_provenance(
@@ -506,8 +523,9 @@ def _validate_glm_provenance(
     expected_producer = {**_glm_producer_record(), **(producer_digests or {})}
     for key, value in expected_producer.items():
         if not _same(producer.get(key), value):
+            source = " (the value of the producer receipt of the cell)" if key in (producer_digests or {}) else ""
             raise ValueError(
-                f"native GLM-5.3-Flash result lacks valid producer.{key}: expected {value!r}, "
+                f"native GLM-5.3-Flash result lacks valid producer.{key}: expected {value!r}{source}, "
                 f"found {producer.get(key)!r}: {path}"
             )
     added = sorted(set(producer) - set(expected_producer))
