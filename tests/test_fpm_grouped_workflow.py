@@ -1893,6 +1893,7 @@ def _prefix_search(profile, root, version):
     [
         ("no_evidence", "prefix_caching=false for cold replay"),
         ("probe_without_prefix_caching", "prefix_caching=false for cold replay"),
+        ("probe_without_hash_block", "prefix_caching=false for cold replay"),
         (
             "unmarked_group",
             "every cache group to declare prefix_cacheable; "
@@ -1929,6 +1930,8 @@ def test_grouped_prefix_caching_needs_vllm_evidence_with_align_mode(grouped_case
         resources = deployment["resources"]
         if case == "probe_without_prefix_caching":
             resources["runtime_memory"].update(enable_prefix_caching=False, mamba_cache_mode="none")
+        elif case == "probe_without_hash_block":
+            del resources["runtime_memory"]["hash_block_size_tokens"]
         elif case == "unmarked_group":
             del resources["cache_groups"][1]["prefix_cacheable"]
         elif case == "convolution_group":
@@ -1960,6 +1963,23 @@ def test_grouped_prefix_caching_needs_vllm_evidence_with_align_mode(grouped_case
     if search is not None:
         with pytest.raises(ValidationError, match=error):
             SearchSpace.model_validate(search)
+
+
+def test_grouped_cold_replay_text_names_the_field_of_each_gate(grouped_case):
+    from aisim.sweeper.config import SearchSpace
+
+    profile, root = grouped_case
+    profile = _with_state_group(profile)  # no prefix-caching evidence
+    raw = _prediction(profile, root)
+    raw["engine"]["workers"]["aggregated"]["kv_cache"]["prefix_caching"] = True
+    with pytest.raises(
+        ValidationError, match=re.escape("grouped FPM cache requires kv_cache.prefix_caching=false for cold replay")
+    ):
+        CorePredictionConfig.model_validate(raw)
+    with pytest.raises(
+        ValidationError, match=re.escape("grouped FPM cache requires agg_enable_prefix_caching=false for cold replay")
+    ):
+        SearchSpace.model_validate(_prefix_search(profile, root, "0.25.1"))
 
 
 @pytest.mark.parametrize("version", ["0.31.0", "0.32.0", "0.33.0"])
