@@ -3940,6 +3940,28 @@ def test_plan_refuses_a_producer_architecture_whose_config_names_no_architecture
     )
 
 
+def test_eager_refusal_comes_before_the_architectures_refusal(tmp_path):
+    # A GLM-5.3-Flash config without architectures and an eager request break both rules. The eager rule speaks first.
+    architecture = "Glm5NextForConditionalGeneration"
+    path = _mixed_attention_config(tmp_path, architecture, True)
+    config = json.loads(path.read_text())
+    del config["architectures"]
+    path.write_text(json.dumps(config))
+    with pytest.raises(ValueError) as error:
+        build_collection_plan(
+            backend="vllm",
+            model_path=str(path),
+            system="b200_sxm",
+            selected_ops={"attention_context", "attention_generation"},
+            options=FPMCollectionOptions.from_args(_args(fpm_enforce_eager=True)),
+            model_architecture=architecture,
+            has_model_cases=False,
+            model_config_path=str(path),
+            collector_config={"aic_database_version": "0.27.0"},
+        )
+    assert str(error.value) == "explicit eager FPM collection is currently qualified only for DeepSeek V4.1"
+
+
 @pytest.mark.parametrize("corruption", ["missing", "tampered", "fake", "seed", "path", "coverage"])
 def test_v41_real_token_stream_validation_rejects_broken_witness(tmp_path, corruption):
     from collector.fpm_forward.native_artifact import _validate_token_streams

@@ -15,6 +15,8 @@ from collector.fpm_forward.glm53flash_points import (
     MAX_BATCH,
     MAX_CONTEXT,
     MAX_NEW,
+    TP_SIZES,
+    _require_mamba_hash_block,
     glm_align_stop,
     glm_measured_context,
     glm_plan_manifest,
@@ -543,11 +545,12 @@ def test_capacity_without_a_feasible_point_is_refused(caplog):
 def test_copied_limits_match_the_producer(monkeypatch):
     producer = load_producer(monkeypatch)
 
-    assert (CHUNK_ALIGN, MAX_BATCH, MAX_NEW, MAX_CONTEXT) == (
+    assert (CHUNK_ALIGN, MAX_BATCH, MAX_NEW, MAX_CONTEXT, TP_SIZES) == (
         producer.CHUNK_ALIGN,
         producer.MAX_BATCH,
         producer.MAX_NEW,
         producer.MAX_CONTEXT,
+        producer.TP_SIZES,
     )
     # The measured context keeps the producer's headroom below the runtime context.
     assert glm_measured_context(SimpleNamespace(vllm_max_model_len=4096)) == 4096 - producer.CONTEXT_HEADROOM
@@ -772,10 +775,43 @@ def test_plan_manifest_refuses_a_mamba_block_that_is_not_the_hash_block():
     deployment.resources.cache_groups[2].block_size_tokens = 4352
     with pytest.raises(ValueError) as error:
         glm_plan_manifest(_OPTIONS, [deployment])
-    assert str(error.value) == (
+    assert str(error.value) == _hash_block_refusal(2176, "mamba_0", 4352)
+
+
+def _hash_block_refusal(hash_block, group, block):
+    return (
         "GLM-5.3-Flash collection requires a hash block of the Mamba block size: the accepted profile holds "
-        "hash_block_size_tokens=2176 and cache group mamba_0 holds block_size_tokens=4352"
+        f"hash_block_size_tokens={hash_block} and cache group {group} holds block_size_tokens={block}; use a profile "
+        "from a runtime probe at the default prefix-caching settings, which give the hash block the Mamba block size"
     )
+
+
+def test_hash_block_rule_reads_every_deployment_that_holds_a_hash_block():
+    # The first deployment holds no hash block and is skipped; the rule still reads the second one.
+    first, second = _deployment((1, 16), (1, 16)), _deployment((1, 16), (1, 16))
+    first.resources.runtime_memory.hash_block_size_tokens = None
+    second.resources.cache_groups[3].block_size_tokens = 4352
+    with pytest.raises(ValueError) as error:
+        _require_mamba_hash_block([first, second])
+    assert str(error.value) == _hash_block_refusal(2176, "mamba_1", 4352)
+    # A deployment without runtime memory is skipped too.
+    first.resources.runtime_memory = None
+    second.resources.cache_groups[3].block_size_tokens = 2176
+    assert _require_mamba_hash_block([first, second]) is None
+
+
+def test_hash_block_rule_refuses_a_mamba_block_smaller_than_the_hash_block():
+    deployment = _deployment((1, 16), (1, 16))
+    deployment.resources.cache_groups[2].block_size_tokens = 1088
+    with pytest.raises(ValueError) as error:
+        _require_mamba_hash_block([deployment])
+    assert str(error.value) == _hash_block_refusal(2176, "mamba_0", 1088)
+
+
+_LAYOUT_REFUSAL = (
+    "GLM-5.3-Flash collection supports pure tensor parallelism only (TP 1, 2, 4 or 8, with DP, PP, CP and expert "
+    "parallelism 1): request the preset pure_tp. Got "
+)
 
 
 def test_layout_check_reads_the_axes_and_the_runtime_version():
@@ -784,15 +820,27 @@ def test_layout_check_reads_the_axes_and_the_runtime_version():
     assert validate_glm_layout([single], "0.33.0") is None
     # A plan without a version at plan time leaves the version to the gate in the container.
     assert validate_glm_layout([single], None) is None
-    with pytest.raises(ValueError) as error:
-        validate_glm_layout([single], "0.33.1")
-    assert str(error.value) == "GLM-5.3-Flash collection supports vLLM 0.33.0 only, got '0.33.1'"
-    prefix = (
-        "GLM-5.3-Flash collection supports pure tensor parallelism only (TP 1, 2, 4 or 8, with DP, PP, CP and expert "
-        "parallelism 1): request the preset pure_tp. Got "
-    )
-    for changes in ({"tp": 3, "moe_tp": 3}, {"pp": 2}):
-        topology = ParallelTopology(**{**single.to_dict(), **changes})
+    # The producer's gate takes the exact version string, so a local version suffix is another runtime.
+    for version in ("0.33.1", "0.33.0+local"):
         with pytest.raises(ValueError) as error:
-            validate_glm_layout([topology], "0.33.0")
-        assert str(error.value) == prefix + str(topology.to_dict())
+            validate_glm_layout([single], version)
+        assert str(error.value) == (
+            f"GLM-5.3-Flash collection supports vLLM 0.33.0 only, and the runtime of this plan is vLLM {version!r}"
+        )
+    eight = ParallelTopology(**{**single.to_dict(), "tp": 8, "moe_tp": 8})
+    assert validate_glm_layout([single, eight], "0.33.0") is None
+    for changes in ({"tp": 3, "moe_tp": 3}, {"tp": 16, "moe_tp": 16}, {"pp": 2}, {"dp": 2}, {"cp": 2}):
+        topology = ParallelTopology(**{**single.to_dict(), **changes})
+        # The wrong topology comes second, so the rule reads every topology.
+        with pytest.raises(ValueError) as error:
+            validate_glm_layout([single, topology], "0.33.0")
+        assert str(error.value) == _LAYOUT_REFUSAL + str(topology.to_dict())
+
+
+def test_layout_check_refuses_the_runtime_version_before_the_layout():
+    expert = ParallelTopology(tp=4, pp=1, dp=1, moe_tp=1, moe_ep=4, cp=1)
+    with pytest.raises(ValueError) as error:
+        validate_glm_layout([expert], "0.33.1")
+    assert str(error.value) == (
+        "GLM-5.3-Flash collection supports vLLM 0.33.0 only, and the runtime of this plan is vLLM '0.33.1'"
+    )

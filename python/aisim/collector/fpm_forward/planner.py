@@ -929,9 +929,17 @@ def build_collection_plan(
             raise ValueError(
                 f"GLM-5.3-Flash collection requires a model revision of 40 lowercase hex characters, got {revision!r}"
             )
-        # The producer refuses these limits, runtime versions and layouts when the engine starts.
+        # The producer refuses these limits, runtime versions and layouts when the engine starts. A bundle without the
+        # probe launch facts gives no runtime version: the planner refuses that pair later with its own text.
         validate_glm_limits(options, deployments if profile is not None else ())
-        validate_glm_layout(candidate_topologies, runtime_backend_version or backend_version)
+        validate_glm_layout(
+            candidate_topologies,
+            _glm_runtime_version(
+                runtime_backend_version,
+                runtime_instrumentation if runtime_launch is not None else None,
+                deployments if profile is not None else (),
+            ),
+        )
     topologies, topology_memory_admission = filter_memory_infeasible_topologies(
         backend=backend,
         model_path=model_path,
@@ -1089,6 +1097,40 @@ def build_collection_plan(
         runtime_backend_version=runtime_backend_version,
         backend_version=backend_version,
     )
+
+
+def _glm_runtime_version(
+    runtime_backend_version: str | None,
+    runtime_instrumentation,
+    deployments,
+) -> str | None:
+    """The vLLM version of the runtime that a GLM-5.3-Flash plan runs on, or None when the planner holds no fact of it.
+
+    The first that exists: the observed version, the runtime version of the instrumentation bundle that the plan
+    stages, and the one runtime version that the runtime memory of the accepted deployments records. The deployment's
+    backend_version is a data label and is never read. When the deployments record more than one version, the planner
+    cannot tell which one the plan runs on, and the producer's gate decides. A bundle that does not load gives no
+    version here: the planner refuses it later with its own text.
+    """
+    if runtime_backend_version is not None:
+        return runtime_backend_version
+    if runtime_instrumentation is not None:
+        bundle = runtime_instrumentation
+        if isinstance(bundle, (str, Path)):
+            from .runtime_instrumentation import load_instrumentation
+
+            try:
+                bundle = load_instrumentation(bundle)
+            except ValueError:
+                bundle = None
+        if bundle is not None:
+            return bundle.manifest["runtime"]["version"]
+    versions = {
+        deployment.resources.runtime_memory.runtime_framework_version
+        for deployment in deployments
+        if deployment.resources.runtime_memory is not None
+    } - {None}
+    return versions.pop() if len(versions) == 1 else None
 
 
 def _validate_profile_identities(

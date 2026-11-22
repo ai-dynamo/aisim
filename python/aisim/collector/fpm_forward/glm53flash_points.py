@@ -31,9 +31,10 @@ logger = logging.getLogger(__name__)
 GLM_ARCHITECTURE = "Glm5NextForConditionalGeneration"
 GLM_POINTS_ORIGIN = "glm53flash_grid_v1"
 GLM_SMOKE_MANIFEST = "glm53flash_grid_v1_smoke"
-# The producer's CHUNK_ALIGN, MAX_BATCH, MAX_NEW and MAX_CONTEXT. The producer module imports vLLM and Dynamo, so the
-# planner keeps copies.
+# The producer's CHUNK_ALIGN, MAX_BATCH, MAX_NEW, MAX_CONTEXT and TP_SIZES. The producer module imports vLLM and Dynamo,
+# so the planner keeps copies.
 CHUNK_ALIGN = 4
+TP_SIZES = (1, 2, 4, 8)
 MAX_BATCH = 32
 MAX_NEW = 8192
 MAX_CONTEXT = 131072
@@ -361,8 +362,8 @@ def _require_mamba_hash_block(deployments: Sequence[FpmDeploymentProfile]) -> No
 
     The producer refuses such a launch when the engine starts. A Mamba group is a cache group with the prefill
     checkpoint field, which the import writes for a MambaSpec group only. The tail ring is a state group of its own
-    4-token block without that field, so the rule does not read it. A deployment without a hash block is left to the
-    refusal that names the missing hash block.
+    4-token block without that field, so the rule does not read it. A deployment without a hash block is skipped. For a
+    generated list, ``glm_plan_manifest`` refuses it before this rule.
     """
     for deployment in deployments:
         memory = deployment.resources.runtime_memory
@@ -374,36 +375,62 @@ def _require_mamba_hash_block(deployments: Sequence[FpmDeploymentProfile]) -> No
                 raise ValueError(
                     "GLM-5.3-Flash collection requires a hash block of the Mamba block size: the accepted profile "
                     f"holds hash_block_size_tokens={hash_block} and cache group {group.name} holds "
-                    f"block_size_tokens={group.block_size_tokens}"
+                    f"block_size_tokens={group.block_size_tokens}; use a profile from a runtime probe at the default "
+                    "prefix-caching settings, which give the hash block the Mamba block size"
                 )
 
 
 def validate_glm_limits(options: FPMCollectionOptions, deployments: Sequence[FpmDeploymentProfile]) -> None:
-    """Refuse the limits of a plan that the producer refuses when the engine starts, for a generated or a user list.
+    """Refuse a token budget and a hash block of a plan that the producer refuses when the engine starts.
 
-    The runner renders ``options.max_prefill_isl`` for the prefill cells and ``options.max_num_batched_tokens`` for
-    the others, and else the ``max_num_tokens`` of the accepted deployment. Each token budget must be a multiple of the
-    producer's chunk alignment, and each deployment's hash block must be the block of its Mamba groups.
+    The rules hold for a generated and for a user list. Each phase that the plan collects is checked with the budget
+    that the runner renders for its cells: ``options.prefill_sampling.max_total_prefill_tokens`` for a prefill cell,
+    and for a decode cell ``options.max_num_batched_tokens`` or, with that unset, the ``max_num_tokens`` of the
+    accepted deployment. Each must be a multiple of the producer's chunk alignment. Each deployment's hash block must
+    then be the block of its Mamba groups.
     """
-    budgets = [options.max_prefill_isl, options.max_num_batched_tokens]
-    if options.max_num_batched_tokens is None:
-        budgets.extend(deployment.resources.max_num_tokens for deployment in deployments)
-    if any(budget is not None and budget % CHUNK_ALIGN for budget in budgets):
-        raise ValueError("GLM-5.3-Flash collection requires a token budget that is a multiple of 4")
+    rule = "GLM-5.3-Flash collection requires a token budget that is a multiple of 4"
+    phases = options.workload_kinds
+    if "prefill" in phases:
+        budget = options.prefill_sampling.max_total_prefill_tokens
+        if budget % CHUNK_ALIGN:
+            raise ValueError(
+                f"{rule}: the prefill cells get a budget of {budget} tokens; set --fpm-max-prefill-isl to a multiple "
+                "of 4"
+            )
+    if "decode" in phases:
+        if options.max_num_batched_tokens is not None:
+            if options.max_num_batched_tokens % CHUNK_ALIGN:
+                raise ValueError(
+                    f"{rule}: the decode cells get --fpm-max-num-batched-tokens={options.max_num_batched_tokens}; set "
+                    "it to a multiple of 4"
+                )
+        else:
+            for deployment in deployments:
+                if deployment.resources.max_num_tokens % CHUNK_ALIGN:
+                    raise ValueError(
+                        f"{rule}: the decode cells of the accepted deployment at TP {deployment.tp} get its "
+                        f"resources.max_num_tokens={deployment.resources.max_num_tokens}"
+                    )
     _require_mamba_hash_block(deployments)
 
 
 def validate_glm_layout(topologies: Sequence[ParallelTopology], runtime_version: str | None) -> None:
     """Refuse a runtime version and a parallel layout that the producer refuses when the engine starts.
 
-    A plan without a runtime version leaves the version to the producer's gate. The layout rule reads the axes of each
-    topology, not its strategy name: a one-GPU cell has the strategy ``single``.
+    ``runtime_version`` is the vLLM version of the runtime, never a data label. The producer takes the exact version
+    string only, so a local version suffix is another runtime. A plan without a runtime version leaves the version to
+    the producer's gate. The layout rule reads the axes of each topology, not its strategy name: a one-GPU cell has the
+    strategy ``single``.
     """
     baseline = BASELINE_VERSIONS["vllm"]
     if runtime_version is not None and runtime_version != baseline:
-        raise ValueError(f"GLM-5.3-Flash collection supports vLLM {baseline} only, got {runtime_version!r}")
+        raise ValueError(
+            f"GLM-5.3-Flash collection supports vLLM {baseline} only, and the runtime of this plan is vLLM "
+            f"{runtime_version!r}"
+        )
     for topology in topologies:
-        if topology.tp not in (1, 2, 4, 8) or (topology.pp, topology.dp, topology.moe_ep, topology.cp) != (1, 1, 1, 1):
+        if topology.tp not in TP_SIZES or (topology.pp, topology.dp, topology.moe_ep, topology.cp) != (1, 1, 1, 1):
             raise ValueError(
                 "GLM-5.3-Flash collection supports pure tensor parallelism only (TP 1, 2, 4 or 8, with DP, PP, CP and "
                 f"expert parallelism 1): request the preset pure_tp. Got {topology.to_dict()}"
