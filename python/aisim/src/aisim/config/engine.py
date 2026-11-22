@@ -1764,7 +1764,8 @@ def grouped_prefix_caching_requirements(
     if any(group.prefix_cacheable is None for group in groups):
         raise ValueError(
             "grouped FPM cache prefix caching requires every cache group to declare prefix_cacheable; "
-            "set prefix_cacheable (true or false) on each cache group of the profile"
+            "set prefix_cacheable (true or false) on each cache group of a hand-made profile, or import the runtime "
+            "probe again for a profile that the import wrote"
         )
     # The Rust rule table has no rule for a convolution group.
     if any(group.kind == "convolution" for group in groups):

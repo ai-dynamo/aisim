@@ -2416,10 +2416,11 @@ def test_grouped_sweeper_marks_an_off_grid_budget_infeasible_with_a_short_reason
     assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
 
 
-def _onboarding_plan(profile, tmp_path, capsys, version, runtime_version=None):
+def _onboarding_plan(profile, tmp_path, capsys, version, runtime_version=None, *, worker_type=None, max_num_tokens=128):
     """Run `aisim onboard plan` for one grouped profile and return its stderr and its files, with tmp_path removed."""
     request = SupportRequest.model_validate(
         {
+            **({} if worker_type is None else {"worker_type": worker_type}),
             "identity": {
                 "model": profile["model"],
                 "model_revision": profile["model_revision"],
@@ -2437,7 +2438,7 @@ def _onboarding_plan(profile, tmp_path, capsys, version, runtime_version=None):
                 "context_length": 1024,
             },
             "workload": {"input_tokens": 512, "output_tokens": 4},
-            "collection": {"max_num_tokens": 128, "max_batch_size": 4},
+            "collection": {"max_num_tokens": max_num_tokens, "max_batch_size": 4},
             "fpm_profile": profile,
         }
     )
@@ -2522,6 +2523,17 @@ def _label_differs(version, label):
 
 
 @reads_saved_config
+def test_grouped_plan_of_evidence_without_rules_under_another_label_names_the_version_of_the_evidence(
+    grouped_case, tmp_path, capsys
+):
+    # Both notes hold for evidence of vLLM 0.30.0 under the label 0.31.0. The version without rules comes first.
+    profile, _root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version="0.31.0")
+    stderr, files = _onboarding_plan(profile, tmp_path, capsys, "0.31.0", runtime_version="0.30.0")
+    assert stderr.strip() == _plan_reason(files) == _not_modeled("0.30.0")
+
+
+@reads_saved_config
 @pytest.mark.parametrize("label", ["custom-vllm", "0.33.0", "0.30.0"])
 def test_grouped_plan_with_modeled_evidence_under_another_label_is_cold(grouped_case, tmp_path, capsys, label):
     # The evidence is of vLLM 0.32.0, which has grouped rules, but replay would take the rules of the label. The plan
@@ -2578,7 +2590,7 @@ def _plan_cold_like_an_earlier_planner(monkeypatch):
     """Make `create_plan` of this module write the plan that AISim wrote before replay modeled grouped prefix caching.
 
     That planner gave every grouped profile `prefix_caching: false`. The planner plans cold when a deployment fails the
-    grouped prefix-caching requirements, so refusing them gives the same files.
+    grouped prefix-caching requirements, so refusing them and removing the recorded reason gives the same files.
     """
     import sys
 
@@ -2729,21 +2741,43 @@ def test_a_grouped_vllm_0330_plan_saved_cold_still_verifies(grouped_case, tmp_pa
 
 @reads_saved_config
 @pytest.mark.parametrize("version", ["0.30.0", "0.25.1"])
-def test_a_version_without_rules_plans_the_same_bytes_under_the_earlier_planner(
+def test_a_version_without_rules_plans_the_files_of_the_earlier_planner_and_records_why(
     grouped_case, tmp_path, capsys, monkeypatch, version
 ):
-    # A version without grouped rules plans cold, so the planner and the earlier planner write the same plan.
+    # A version without grouped rules plans cold, as the earlier planner did for every grouped profile. The two plans
+    # differ only in the reason that the planner records, and the plan of the earlier planner still verifies.
     from aisim.support import plan as plan_module
 
     profile, _root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile), version=version)
-    _stderr, files = _onboarding_plan(profile, tmp_path, capsys, version)
+    stderr, files = _onboarding_plan(profile, tmp_path, capsys, version)
+    assert stderr.strip() == _plan_reason(files) == _not_modeled(version)
     (tmp_path / "collection").rename(tmp_path / "planner")
-    monkeypatch.setattr(plan_module, "grouped_prefix_caching_requirements", _refuse_prefix_caching)
-    _stderr, earlier = _onboarding_plan(profile, tmp_path, capsys, version)
+    calls = []
+
+    def earlier_planner(*args):
+        # The earlier planner planned every grouped profile cold and recorded no reason.
+        calls.append(args)
+        return "an earlier planner"
+
+    monkeypatch.setattr(plan_module, "_grouped_cold_reason", earlier_planner)
+    _onboarding_plan(profile, tmp_path, capsys, version)
+    monkeypatch.undo()
+    assert calls
+    plan = tmp_path / "collection"
+    _drop_cold_reason(plan)
+    earlier = {
+        str(item.relative_to(plan)): item.read_bytes().replace(str(tmp_path).encode(), b"<tmp>")
+        for item in sorted(plan.rglob("*"))
+        if item.is_file()
+    }
+    planner = json.loads(files.pop("support-plan.json"))
+    assert planner["fpm"].pop("prefix_caching_reason") == _not_modeled(version)
+    assert planner == json.loads(earlier.pop("support-plan.json"))
     assert files == earlier
     worker = yaml.safe_load(files["predict/pilot.yaml"])["engine"]["workers"]["aggregated"]
     assert worker["kv_cache"]["prefix_caching"] is False
+    plan_module.check_plan(SupportRequest.from_yaml(plan / "request.yaml"), plan)
 
 
 _COLD = "The plan of this profile runs without prefix caching: "
@@ -2760,7 +2794,8 @@ def _plan_reason(files):
         (
             "unmarked_group",
             "grouped FPM cache prefix caching requires every cache group to declare prefix_cacheable; "
-            "set prefix_cacheable (true or false) on each cache group of the profile",
+            "set prefix_cacheable (true or false) on each cache group of a hand-made profile, or import the runtime "
+            "probe again for a profile that the import wrote",
         ),
         (
             "convolution_group",
@@ -2791,14 +2826,17 @@ def test_grouped_cold_plan_records_and_prints_its_reason(grouped_case, tmp_path,
 
 
 @reads_saved_config
+@pytest.mark.parametrize("version,runtime_version", [("0.33.0", None), ("0.30.0", None), ("0.31.0", "0.33.0")])
 def test_grouped_plan_of_a_probe_without_prefix_caching_records_the_reason_and_prints_nothing(
-    grouped_case, tmp_path, capsys
+    grouped_case, tmp_path, capsys, version, runtime_version
 ):
+    # The notes on the vLLM version of the evidence hold only for a probe that ran with prefix caching, so a version
+    # without rules and evidence under another label record the reason of the probe too.
     profile, _root = grouped_case
-    profile = _with_prefix_evidence(_with_state_group(profile), version="0.33.0")
+    profile = _with_prefix_evidence(_with_state_group(profile), version=version)
     for deployment in profile["deployments"]:
         deployment["resources"]["runtime_memory"].update(enable_prefix_caching=False, mamba_cache_mode="none")
-    stderr, files = _onboarding_plan(profile, tmp_path, capsys, "0.33.0")
+    stderr, files = _onboarding_plan(profile, tmp_path, capsys, version, runtime_version)
     assert "prefix caching" not in stderr
     assert _plan_reason(files) == _COLD + "grouped FPM cache requires kv_cache.prefix_caching=false for cold replay"
 
@@ -2867,7 +2905,8 @@ def test_grouped_plan_saved_before_the_reason_field_still_verifies(grouped_case,
 _REFUSAL_TEXT = {
     "unmarked_group": (
         "grouped FPM cache prefix caching requires every cache group to declare prefix_cacheable; "
-        "set prefix_cacheable (true or false) on each cache group of the profile"
+        "set prefix_cacheable (true or false) on each cache group of a hand-made profile, or import the runtime probe "
+        "again for a profile that the import wrote"
     ),
     "non_cacheable_window": (
         "kv_cache_groups with enable_prefix_caching=true do not model a sliding-window attention group with "
@@ -2905,6 +2944,55 @@ def test_the_marker_and_window_refusals_hold_on_each_version(grouped_case, tmp_p
     stderr, files = _onboarding_plan(profile, tmp_path, capsys, version)
     assert stderr.strip() == _plan_reason(files) == _COLD + _REFUSAL_TEXT[case]
     assert _prefix_caching_of(tmp_path / "collection") == [False, False]
+
+
+@reads_saved_config
+@pytest.mark.parametrize(
+    "role,case,text",
+    [
+        ("prefill", "unmarked_group", _REFUSAL_TEXT["unmarked_group"]),
+        ("decode", "unmarked_group", _REFUSAL_TEXT["unmarked_group"]),
+        # A prefill or decode rank refuses the window group with prefix caching off too, so its text names no such
+        # remedy.
+        ("decode", "non_cacheable_window", _PD_REPLAY_WINDOW),
+    ],
+)
+def test_grouped_cold_plan_of_one_role_records_and_prints_its_reason(grouped_case, tmp_path, capsys, role, case, text):
+    profile, _root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version="0.31.0")
+    for deployment in profile["deployments"]:
+        deployment["worker_type"] = role
+        groups = deployment["resources"]["cache_groups"]
+        if case == "unmarked_group":
+            del groups[1]["prefix_cacheable"]
+        else:
+            groups[1]["prefix_cacheable"] = False
+    stderr, files = _onboarding_plan(profile, tmp_path, capsys, "0.31.0", worker_type=role)
+    assert stderr.strip() == _plan_reason(files) == _COLD + text
+    worker = yaml.safe_load(files["worker.yaml"])["engine"]["workers"][role]
+    assert worker["kv_cache"]["prefix_caching"] is False
+
+
+@reads_saved_config
+def test_grouped_glm_plan_with_a_token_budget_off_the_grid_records_and_prints_its_reason(
+    grouped_case, tmp_path, capsys
+):
+    # The GLM-5.3-Flash requirement reads the token budget of the plan, so the note must use the same budget.
+    profile, _root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version="0.33.0")
+    profile["architecture"] = "Glm5NextForConditionalGeneration"
+    (Path(profile["model"]) / "config.json").write_text(json.dumps({"architectures": [profile["architecture"]]}))
+    for deployment in profile["deployments"]:
+        deployment["resources"]["max_num_tokens"] = 126
+    stderr, files = _onboarding_plan(profile, tmp_path, capsys, "0.33.0", max_num_tokens=126)
+    assert (
+        stderr.strip()
+        == _plan_reason(files)
+        == _COLD
+        + ("GLM-5.3-Flash prefix caching requires prefix_match_unit and max_batched_tokens that are multiples of 4")
+    )
+    worker = yaml.safe_load(files["predict/pilot.yaml"])["engine"]["workers"]["aggregated"]
+    assert worker["kv_cache"]["prefix_caching"] is False
 
 
 @pytest.mark.parametrize("label,recorded", [("0.32.0", "0.33.0"), ("0.33.0", "0.32.0")])

@@ -264,6 +264,7 @@ def _grouped_cold_reason(request: SupportRequest, deployment, max_batched_tokens
             architecture=request.fpm_profile.architecture,
             prefix_match_unit=None,
             max_batched_tokens=max_batched_tokens,
+            pd_rank=request.worker_type in {"prefill", "decode"},
         )
     except ValueError as exc:
         return f"The plan of this profile runs without prefix caching: {exc}"
