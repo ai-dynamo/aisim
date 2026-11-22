@@ -1972,14 +1972,17 @@ def test_grouped_cold_replay_text_names_the_field_of_each_gate(grouped_case):
     profile = _with_state_group(profile)  # no prefix-caching evidence
     raw = _prediction(profile, root)
     raw["engine"]["workers"]["aggregated"]["kv_cache"]["prefix_caching"] = True
-    with pytest.raises(
-        ValidationError, match=re.escape("grouped FPM cache requires kv_cache.prefix_caching=false for cold replay")
-    ):
+    # pydantic puts "Value error, " before the text of a ValueError and " [type=" after it.
+    text = "Value error, grouped FPM cache requires {}=false for cold replay [type="
+    with pytest.raises(ValidationError, match=re.escape(text.format("kv_cache.prefix_caching"))):
         CorePredictionConfig.model_validate(raw)
-    with pytest.raises(
-        ValidationError, match=re.escape("grouped FPM cache requires agg_enable_prefix_caching=false for cold replay")
-    ):
+    with pytest.raises(ValidationError, match=re.escape(text.format("agg_enable_prefix_caching"))):
         SearchSpace.model_validate(_prefix_search(profile, root, "0.25.1"))
+    # A prefill or decode rank names its own search field. The markers give the profile a P/D version.
+    pd_profile = _with_transfer_markers(profile)
+    for role in ("prefill", "decode"):
+        with pytest.raises(ValidationError, match=re.escape(text.format(f"{role}_enable_prefix_caching"))):
+            SearchSpace.model_validate({**_pd_search(pd_profile, root), f"{role}_enable_prefix_caching": True})
 
 
 @pytest.mark.parametrize("version", ["0.31.0", "0.32.0", "0.33.0"])
