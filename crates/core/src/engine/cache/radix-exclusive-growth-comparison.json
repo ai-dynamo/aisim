@@ -1,0 +1,1658 @@
+{
+  "baseline": "57a902aad462ab13b7994956ecdeda905220dc8b",
+  "candidate_source": "d4e983e1bae6705dd14f6d64e16d4bf6224e71a8",
+  "cpu": 0,
+  "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.41",
+  "rustc": "rustc 1.91.1 (ed61e7d7e 2025-11-07)",
+  "profile": "release: opt-level=3, codegen-units=1, lto=thin",
+  "warmups_per_arm": 1,
+  "pairs": 5,
+  "schedule": [
+    "baseline-first",
+    "candidate-first",
+    "baseline-first",
+    "candidate-first",
+    "baseline-first"
+  ],
+  "micro_artifacts": {
+    "baseline": {
+      "sha256": "4a5818e7fe12cd28cdc9c320770578bec06584c83223e3ca6dd58ec10f095bd2",
+      "features": [
+        "default"
+      ]
+    },
+    "candidate": {
+      "sha256": "a48da6e89517c5ba90a24f0786164cda4c0caa0649985664719d49ec14e36057",
+      "features": [
+        "default"
+      ]
+    }
+  },
+  "probe_sha256": "852732a3b202490edb6372ba5331a280b73dc129a16315889d42d266bc97b787",
+  "micro_rows": [
+    {
+      "growth_pages": 2,
+      "overlap": false,
+      "page_size": 32,
+      "prompt_tokens": 64,
+      "repetitions": 20,
+      "baseline": [
+        {
+          "warmup": true,
+          "elapsed_ns": 171840,
+          "growth_elapsed_ns": 27239
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 169838,
+          "growth_elapsed_ns": 28115
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 175737,
+          "growth_elapsed_ns": 28396
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 197443,
+          "growth_elapsed_ns": 29419
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 183120,
+          "growth_elapsed_ns": 31467
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 168711,
+          "growth_elapsed_ns": 28388
+        }
+      ],
+      "candidate": [
+        {
+          "warmup": true,
+          "elapsed_ns": 162883,
+          "growth_elapsed_ns": 19559
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 167764,
+          "growth_elapsed_ns": 17200
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 122169,
+          "growth_elapsed_ns": 17567
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 173962,
+          "growth_elapsed_ns": 17647
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 137532,
+          "growth_elapsed_ns": 16750
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 173337,
+          "growth_elapsed_ns": 17408
+        }
+      ]
+    },
+    {
+      "growth_pages": 2,
+      "overlap": true,
+      "page_size": 32,
+      "prompt_tokens": 64,
+      "repetitions": 20,
+      "baseline": [
+        {
+          "warmup": true,
+          "elapsed_ns": 100037,
+          "growth_elapsed_ns": 44724
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 96513,
+          "growth_elapsed_ns": 45131
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 104040,
+          "growth_elapsed_ns": 47160
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 94713,
+          "growth_elapsed_ns": 43952
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 95404,
+          "growth_elapsed_ns": 44567
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 106502,
+          "growth_elapsed_ns": 45586
+        }
+      ],
+      "candidate": [
+        {
+          "warmup": true,
+          "elapsed_ns": 92346,
+          "growth_elapsed_ns": 40803
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 88142,
+          "growth_elapsed_ns": 39772
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 87812,
+          "growth_elapsed_ns": 39105
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 91953,
+          "growth_elapsed_ns": 41006
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 91339,
+          "growth_elapsed_ns": 40342
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 91887,
+          "growth_elapsed_ns": 40533
+        }
+      ]
+    },
+    {
+      "growth_pages": 128,
+      "overlap": false,
+      "page_size": 32,
+      "prompt_tokens": 64,
+      "repetitions": 20,
+      "baseline": [
+        {
+          "warmup": true,
+          "elapsed_ns": 3326111,
+          "growth_elapsed_ns": 2404361
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 3539671,
+          "growth_elapsed_ns": 2574352
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 4313087,
+          "growth_elapsed_ns": 3094825
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 3619828,
+          "growth_elapsed_ns": 2656083
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 3955759,
+          "growth_elapsed_ns": 2804329
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 3657229,
+          "growth_elapsed_ns": 2645945
+        }
+      ],
+      "candidate": [
+        {
+          "warmup": true,
+          "elapsed_ns": 1789743,
+          "growth_elapsed_ns": 840572
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 1703481,
+          "growth_elapsed_ns": 786678
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 1716630,
+          "growth_elapsed_ns": 784535
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 1786040,
+          "growth_elapsed_ns": 808269
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 1769041,
+          "growth_elapsed_ns": 822537
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 1747812,
+          "growth_elapsed_ns": 813301
+        }
+      ]
+    },
+    {
+      "growth_pages": 128,
+      "overlap": true,
+      "page_size": 32,
+      "prompt_tokens": 64,
+      "repetitions": 20,
+      "baseline": [
+        {
+          "warmup": true,
+          "elapsed_ns": 3409146,
+          "growth_elapsed_ns": 2488338
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 3576851,
+          "growth_elapsed_ns": 2597411
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 3629251,
+          "growth_elapsed_ns": 2626151
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 3579085,
+          "growth_elapsed_ns": 2632427
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 3678661,
+          "growth_elapsed_ns": 2617536
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 3684178,
+          "growth_elapsed_ns": 2673820
+        }
+      ],
+      "candidate": [
+        {
+          "warmup": true,
+          "elapsed_ns": 1828070,
+          "growth_elapsed_ns": 896226
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 1909561,
+          "growth_elapsed_ns": 916356
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 1815486,
+          "growth_elapsed_ns": 878377
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 1832189,
+          "growth_elapsed_ns": 897941
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 1908352,
+          "growth_elapsed_ns": 975497
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 1866454,
+          "growth_elapsed_ns": 914926
+        }
+      ]
+    },
+    {
+      "growth_pages": 512,
+      "overlap": false,
+      "page_size": 32,
+      "prompt_tokens": 64,
+      "repetitions": 20,
+      "baseline": [
+        {
+          "warmup": true,
+          "elapsed_ns": 29936491,
+          "growth_elapsed_ns": 25498165
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 25895093,
+          "growth_elapsed_ns": 22249322
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 25524460,
+          "growth_elapsed_ns": 21868519
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 25923975,
+          "growth_elapsed_ns": 22273133
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 25999115,
+          "growth_elapsed_ns": 22281673
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 26332715,
+          "growth_elapsed_ns": 22602388
+        }
+      ],
+      "candidate": [
+        {
+          "warmup": true,
+          "elapsed_ns": 6640072,
+          "growth_elapsed_ns": 2925565
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 6417255,
+          "growth_elapsed_ns": 2838063
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 6108368,
+          "growth_elapsed_ns": 2761724
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 6511861,
+          "growth_elapsed_ns": 2947754
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 6529335,
+          "growth_elapsed_ns": 2916275
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 6660955,
+          "growth_elapsed_ns": 3013746
+        }
+      ]
+    },
+    {
+      "growth_pages": 512,
+      "overlap": true,
+      "page_size": 32,
+      "prompt_tokens": 64,
+      "repetitions": 20,
+      "baseline": [
+        {
+          "warmup": true,
+          "elapsed_ns": 25861424,
+          "growth_elapsed_ns": 22200534
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 25796276,
+          "growth_elapsed_ns": 22165856
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 25955648,
+          "growth_elapsed_ns": 22322506
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 28160241,
+          "growth_elapsed_ns": 24435983
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 25929095,
+          "growth_elapsed_ns": 22274991
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 25564603,
+          "growth_elapsed_ns": 22019378
+        }
+      ],
+      "candidate": [
+        {
+          "warmup": true,
+          "elapsed_ns": 8205306,
+          "growth_elapsed_ns": 3888113
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 6496155,
+          "growth_elapsed_ns": 2980703
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 6456937,
+          "growth_elapsed_ns": 3026657
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 7009985,
+          "growth_elapsed_ns": 3321593
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 6559515,
+          "growth_elapsed_ns": 3017257
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 6750922,
+          "growth_elapsed_ns": 3177364
+        }
+      ]
+    },
+    {
+      "growth_pages": 2048,
+      "overlap": false,
+      "page_size": 32,
+      "prompt_tokens": 64,
+      "repetitions": 20,
+      "baseline": [
+        {
+          "warmup": true,
+          "elapsed_ns": 284943018,
+          "growth_elapsed_ns": 270372457
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 290288137,
+          "growth_elapsed_ns": 275493261
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 289466141,
+          "growth_elapsed_ns": 275110405
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 291697435,
+          "growth_elapsed_ns": 277139205
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 289243333,
+          "growth_elapsed_ns": 274435816
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 293315295,
+          "growth_elapsed_ns": 278903453
+        }
+      ],
+      "candidate": [
+        {
+          "warmup": true,
+          "elapsed_ns": 26471021,
+          "growth_elapsed_ns": 11793369
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 25155773,
+          "growth_elapsed_ns": 11120978
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 25307150,
+          "growth_elapsed_ns": 11350949
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 26213948,
+          "growth_elapsed_ns": 11788283
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 26299022,
+          "growth_elapsed_ns": 11742373
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 26328710,
+          "growth_elapsed_ns": 11917526
+        }
+      ]
+    },
+    {
+      "growth_pages": 2048,
+      "overlap": true,
+      "page_size": 32,
+      "prompt_tokens": 64,
+      "repetitions": 20,
+      "baseline": [
+        {
+          "warmup": true,
+          "elapsed_ns": 285963207,
+          "growth_elapsed_ns": 271505469
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 331975089,
+          "growth_elapsed_ns": 316964117
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 286446150,
+          "growth_elapsed_ns": 271905785
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 311008727,
+          "growth_elapsed_ns": 296326083
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 299627883,
+          "growth_elapsed_ns": 284317149
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 288716661,
+          "growth_elapsed_ns": 273819003
+        }
+      ],
+      "candidate": [
+        {
+          "warmup": true,
+          "elapsed_ns": 26404087,
+          "growth_elapsed_ns": 12393973
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 25916308,
+          "growth_elapsed_ns": 11683714
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 26143311,
+          "growth_elapsed_ns": 11958267
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 26852005,
+          "growth_elapsed_ns": 12259685
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 26703010,
+          "growth_elapsed_ns": 12295490
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 26424746,
+          "growth_elapsed_ns": 12035189
+        }
+      ]
+    },
+    {
+      "growth_pages": 2,
+      "overlap": false,
+      "page_size": 32,
+      "prompt_tokens": 4096,
+      "repetitions": 20,
+      "baseline": [
+        {
+          "warmup": true,
+          "elapsed_ns": 109784,
+          "growth_elapsed_ns": 27668
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 123136,
+          "growth_elapsed_ns": 36498
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 115979,
+          "growth_elapsed_ns": 29487
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 108040,
+          "growth_elapsed_ns": 27500
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 115692,
+          "growth_elapsed_ns": 29488
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 115010,
+          "growth_elapsed_ns": 29417
+        }
+      ],
+      "candidate": [
+        {
+          "warmup": true,
+          "elapsed_ns": 101759,
+          "growth_elapsed_ns": 16777
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 97332,
+          "growth_elapsed_ns": 16571
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 168017,
+          "growth_elapsed_ns": 19163
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 101525,
+          "growth_elapsed_ns": 17299
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 101238,
+          "growth_elapsed_ns": 16759
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 141765,
+          "growth_elapsed_ns": 18831
+        }
+      ]
+    },
+    {
+      "growth_pages": 2,
+      "overlap": true,
+      "page_size": 32,
+      "prompt_tokens": 4096,
+      "repetitions": 20,
+      "baseline": [
+        {
+          "warmup": true,
+          "elapsed_ns": 137210,
+          "growth_elapsed_ns": 61044
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 143060,
+          "growth_elapsed_ns": 63453
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 153449,
+          "growth_elapsed_ns": 64496
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 136668,
+          "growth_elapsed_ns": 60575
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 144048,
+          "growth_elapsed_ns": 64204
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 152309,
+          "growth_elapsed_ns": 70504
+        }
+      ],
+      "candidate": [
+        {
+          "warmup": true,
+          "elapsed_ns": 139267,
+          "growth_elapsed_ns": 58697
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 142589,
+          "growth_elapsed_ns": 58595
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 140223,
+          "growth_elapsed_ns": 59697
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 139271,
+          "growth_elapsed_ns": 59509
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 136961,
+          "growth_elapsed_ns": 58349
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 143580,
+          "growth_elapsed_ns": 61410
+        }
+      ]
+    },
+    {
+      "growth_pages": 128,
+      "overlap": false,
+      "page_size": 32,
+      "prompt_tokens": 4096,
+      "repetitions": 20,
+      "baseline": [
+        {
+          "warmup": true,
+          "elapsed_ns": 3486523,
+          "growth_elapsed_ns": 2491603
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 3522730,
+          "growth_elapsed_ns": 2518263
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 3364280,
+          "growth_elapsed_ns": 2404708
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 3394961,
+          "growth_elapsed_ns": 2439646
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 3602554,
+          "growth_elapsed_ns": 2578157
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 3564651,
+          "growth_elapsed_ns": 2567304
+        }
+      ],
+      "candidate": [
+        {
+          "warmup": true,
+          "elapsed_ns": 1751214,
+          "growth_elapsed_ns": 770819
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 1988769,
+          "growth_elapsed_ns": 980127
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 1715172,
+          "growth_elapsed_ns": 744309
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 1708430,
+          "growth_elapsed_ns": 745943
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 1722050,
+          "growth_elapsed_ns": 740216
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 1704660,
+          "growth_elapsed_ns": 749327
+        }
+      ]
+    },
+    {
+      "growth_pages": 128,
+      "overlap": true,
+      "page_size": 32,
+      "prompt_tokens": 4096,
+      "repetitions": 20,
+      "baseline": [
+        {
+          "warmup": true,
+          "elapsed_ns": 3738395,
+          "growth_elapsed_ns": 2721028
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 3599851,
+          "growth_elapsed_ns": 2637198
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 3513109,
+          "growth_elapsed_ns": 2554754
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 3508590,
+          "growth_elapsed_ns": 2561838
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 3700854,
+          "growth_elapsed_ns": 2704761
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 3708442,
+          "growth_elapsed_ns": 2718328
+        }
+      ],
+      "candidate": [
+        {
+          "warmup": true,
+          "elapsed_ns": 1929169,
+          "growth_elapsed_ns": 928603
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 2070933,
+          "growth_elapsed_ns": 960955
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 1887007,
+          "growth_elapsed_ns": 924706
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 1866670,
+          "growth_elapsed_ns": 908229
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 1899420,
+          "growth_elapsed_ns": 931528
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 1894001,
+          "growth_elapsed_ns": 909679
+        }
+      ]
+    },
+    {
+      "growth_pages": 512,
+      "overlap": false,
+      "page_size": 32,
+      "prompt_tokens": 4096,
+      "repetitions": 20,
+      "baseline": [
+        {
+          "warmup": true,
+          "elapsed_ns": 24646600,
+          "growth_elapsed_ns": 21205122
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 25785409,
+          "growth_elapsed_ns": 22132501
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 24941177,
+          "growth_elapsed_ns": 21425077
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 26331057,
+          "growth_elapsed_ns": 22613233
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 26139873,
+          "growth_elapsed_ns": 22436026
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 24705339,
+          "growth_elapsed_ns": 21205091
+        }
+      ],
+      "candidate": [
+        {
+          "warmup": true,
+          "elapsed_ns": 6561446,
+          "growth_elapsed_ns": 2832240
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 6469706,
+          "growth_elapsed_ns": 2804831
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 6704878,
+          "growth_elapsed_ns": 2963876
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 6328338,
+          "growth_elapsed_ns": 2755713
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 6260239,
+          "growth_elapsed_ns": 2715756
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 6440900,
+          "growth_elapsed_ns": 2753480
+        }
+      ]
+    },
+    {
+      "growth_pages": 512,
+      "overlap": true,
+      "page_size": 32,
+      "prompt_tokens": 4096,
+      "repetitions": 20,
+      "baseline": [
+        {
+          "warmup": true,
+          "elapsed_ns": 25156365,
+          "growth_elapsed_ns": 21712463
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 26173861,
+          "growth_elapsed_ns": 22505570
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 27152230,
+          "growth_elapsed_ns": 23413866
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 25834431,
+          "growth_elapsed_ns": 22299490
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 26179519,
+          "growth_elapsed_ns": 22541243
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 25153101,
+          "growth_elapsed_ns": 21626250
+        }
+      ],
+      "candidate": [
+        {
+          "warmup": true,
+          "elapsed_ns": 6990185,
+          "growth_elapsed_ns": 3332714
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 6543025,
+          "growth_elapsed_ns": 3115206
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 7066657,
+          "growth_elapsed_ns": 3360465
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 6809829,
+          "growth_elapsed_ns": 3164085
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 6879692,
+          "growth_elapsed_ns": 3223746
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 6862192,
+          "growth_elapsed_ns": 3198553
+        }
+      ]
+    },
+    {
+      "growth_pages": 2048,
+      "overlap": false,
+      "page_size": 32,
+      "prompt_tokens": 4096,
+      "repetitions": 20,
+      "baseline": [
+        {
+          "warmup": true,
+          "elapsed_ns": 297142152,
+          "growth_elapsed_ns": 282496888
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 291031072,
+          "growth_elapsed_ns": 276665428
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 291081159,
+          "growth_elapsed_ns": 276634117
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 280159971,
+          "growth_elapsed_ns": 266092898
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 288082477,
+          "growth_elapsed_ns": 272946805
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 314955660,
+          "growth_elapsed_ns": 300392698
+        }
+      ],
+      "candidate": [
+        {
+          "warmup": true,
+          "elapsed_ns": 24100014,
+          "growth_elapsed_ns": 10263855
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 23537190,
+          "growth_elapsed_ns": 9739045
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 25204959,
+          "growth_elapsed_ns": 10629944
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 24023528,
+          "growth_elapsed_ns": 10101959
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 24887941,
+          "growth_elapsed_ns": 10512502
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 24537779,
+          "growth_elapsed_ns": 10480012
+        }
+      ]
+    },
+    {
+      "growth_pages": 2048,
+      "overlap": true,
+      "page_size": 32,
+      "prompt_tokens": 4096,
+      "repetitions": 20,
+      "baseline": [
+        {
+          "warmup": true,
+          "elapsed_ns": 293650133,
+          "growth_elapsed_ns": 278998241
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 285175146,
+          "growth_elapsed_ns": 270927893
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 285324054,
+          "growth_elapsed_ns": 270957457
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 315408640,
+          "growth_elapsed_ns": 300377496
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 286647372,
+          "growth_elapsed_ns": 271867983
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 288357587,
+          "growth_elapsed_ns": 273637537
+        }
+      ],
+      "candidate": [
+        {
+          "warmup": true,
+          "elapsed_ns": 25286041,
+          "growth_elapsed_ns": 11552865
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 25211705,
+          "growth_elapsed_ns": 11280809
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 26082015,
+          "growth_elapsed_ns": 11823443
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 26907787,
+          "growth_elapsed_ns": 12378515
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 26822614,
+          "growth_elapsed_ns": 12097100
+        },
+        {
+          "warmup": false,
+          "elapsed_ns": 25709592,
+          "growth_elapsed_ns": 11772380
+        }
+      ]
+    }
+  ],
+  "micro_timing_scope": "20 complete cache lifecycles per row (setup, growth, finish, repeat reuse check, eviction and cleanup); growth_elapsed_ns separately times only extension/allocation/canonicalization. No modeled serving time.",
+  "cli_artifacts": {
+    "baseline": {
+      "sha256": "e2aa8ca06f504dc46dd5a9b42cb470a56f70d354ee34f57118d841fc2890b32a",
+      "path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-363-20261122T042427116586Z/scratch/installed-baseline/aisimulate/_runtime.abi3.so",
+      "size": 13497184,
+      "features": [
+        "extension-module",
+        "python"
+      ],
+      "text_bytes": 9957364
+    },
+    "candidate": {
+      "sha256": "202cee2ad000cf31d2330078d3f372909d00d7a0c6fe3b392cceaebe9c61a4a7",
+      "path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-363-20261122T042427116586Z/scratch/venv/lib/python3.12/site-packages/aisimulate/_runtime.abi3.so",
+      "size": 13501720,
+      "features": [
+        "extension-module",
+        "python"
+      ],
+      "text_bytes": 9960116
+    }
+  },
+  "cli_rows": [
+    {
+      "output_tokens": 64,
+      "config": {
+        "traffic": {
+          "source": {
+            "type": "synthetic",
+            "input_tokens": 64,
+            "output_tokens": 64
+          },
+          "load": {
+            "type": "concurrency",
+            "concurrency": 1
+          },
+          "stop": {
+            "requests": 8
+          }
+        },
+        "engine": {
+          "mode": "aggregated",
+          "model": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-363-20261122T042427116586Z/scratch/performance/tiny-model",
+          "hardware": "h200_sxm",
+          "backend": "sglang",
+          "context_length": 131072,
+          "workers": {
+            "aggregated": {
+              "parallelism": {
+                "replicas": 1,
+                "tensor": 1,
+                "pipeline": 1,
+                "attention_data": 1,
+                "moe_tensor": 1,
+                "moe_expert": 1
+              },
+              "scheduler": {
+                "max_batched_tokens": 65536,
+                "max_sequences": 1
+              },
+              "kv_cache": {
+                "block_size": 1,
+                "prefix_caching": true,
+                "capacity": {
+                  "type": "fixed",
+                  "blocks": 32768
+                }
+              },
+              "timing": {
+                "type": "fixed",
+                "prefill_ms": 1,
+                "decode_ms": 1
+              }
+            }
+          }
+        },
+        "execution": {
+          "resources": {
+            "memory_limit_gb": 1.2,
+            "cpu_limit": 1
+          }
+        }
+      },
+      "samples": [
+        {
+          "side": "candidate",
+          "warmup": true,
+          "cli_elapsed_ns": 2518214191,
+          "replay_wall_time_ms": 0.937774
+        },
+        {
+          "side": "baseline",
+          "warmup": true,
+          "cli_elapsed_ns": 2038005540,
+          "replay_wall_time_ms": 1.3173499999999998
+        },
+        {
+          "side": "baseline",
+          "warmup": false,
+          "cli_elapsed_ns": 1973993153,
+          "replay_wall_time_ms": 1.1979810000000002
+        },
+        {
+          "side": "candidate",
+          "warmup": false,
+          "cli_elapsed_ns": 1973228945,
+          "replay_wall_time_ms": 0.961417
+        },
+        {
+          "side": "candidate",
+          "warmup": false,
+          "cli_elapsed_ns": 2032377733,
+          "replay_wall_time_ms": 1.680185
+        },
+        {
+          "side": "baseline",
+          "warmup": false,
+          "cli_elapsed_ns": 2033868515,
+          "replay_wall_time_ms": 1.200491
+        },
+        {
+          "side": "baseline",
+          "warmup": false,
+          "cli_elapsed_ns": 1959701436,
+          "replay_wall_time_ms": 1.251853
+        },
+        {
+          "side": "candidate",
+          "warmup": false,
+          "cli_elapsed_ns": 2022499283,
+          "replay_wall_time_ms": 1.017447
+        },
+        {
+          "side": "candidate",
+          "warmup": false,
+          "cli_elapsed_ns": 1971269249,
+          "replay_wall_time_ms": 1.0205520000000001
+        },
+        {
+          "side": "baseline",
+          "warmup": false,
+          "cli_elapsed_ns": 2020416308,
+          "replay_wall_time_ms": 1.399975
+        },
+        {
+          "side": "baseline",
+          "warmup": false,
+          "cli_elapsed_ns": 2028851164,
+          "replay_wall_time_ms": 1.323955
+        },
+        {
+          "side": "candidate",
+          "warmup": false,
+          "cli_elapsed_ns": 2036127624,
+          "replay_wall_time_ms": 1.01905
+        }
+      ],
+      "canonical_metrics_sha256": "dc43730864308f754b3a148c000decb6ebc9e93374cb889e2ad5de4954ab7cca",
+      "verified_metrics": {
+        "completed_requests": 8,
+        "total_input_tokens": 512,
+        "total_output_tokens": 512,
+        "duration_ms": 512.0,
+        "committed_prefill_tokens": 512,
+        "prefix_cache_reused_ratio": 0.0
+      }
+    },
+    {
+      "output_tokens": 512,
+      "config": {
+        "traffic": {
+          "source": {
+            "type": "synthetic",
+            "input_tokens": 64,
+            "output_tokens": 512
+          },
+          "load": {
+            "type": "concurrency",
+            "concurrency": 1
+          },
+          "stop": {
+            "requests": 8
+          }
+        },
+        "engine": {
+          "mode": "aggregated",
+          "model": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-363-20261122T042427116586Z/scratch/performance/tiny-model",
+          "hardware": "h200_sxm",
+          "backend": "sglang",
+          "context_length": 131072,
+          "workers": {
+            "aggregated": {
+              "parallelism": {
+                "replicas": 1,
+                "tensor": 1,
+                "pipeline": 1,
+                "attention_data": 1,
+                "moe_tensor": 1,
+                "moe_expert": 1
+              },
+              "scheduler": {
+                "max_batched_tokens": 65536,
+                "max_sequences": 1
+              },
+              "kv_cache": {
+                "block_size": 1,
+                "prefix_caching": true,
+                "capacity": {
+                  "type": "fixed",
+                  "blocks": 32768
+                }
+              },
+              "timing": {
+                "type": "fixed",
+                "prefill_ms": 1,
+                "decode_ms": 1
+              }
+            }
+          }
+        },
+        "execution": {
+          "resources": {
+            "memory_limit_gb": 1.2,
+            "cpu_limit": 1
+          }
+        }
+      },
+      "samples": [
+        {
+          "side": "candidate",
+          "warmup": true,
+          "cli_elapsed_ns": 2086728315,
+          "replay_wall_time_ms": 5.944597
+        },
+        {
+          "side": "baseline",
+          "warmup": true,
+          "cli_elapsed_ns": 2030900457,
+          "replay_wall_time_ms": 14.522673999999999
+        },
+        {
+          "side": "baseline",
+          "warmup": false,
+          "cli_elapsed_ns": 2020821375,
+          "replay_wall_time_ms": 18.23714
+        },
+        {
+          "side": "candidate",
+          "warmup": false,
+          "cli_elapsed_ns": 1976006948,
+          "replay_wall_time_ms": 5.57421
+        },
+        {
+          "side": "candidate",
+          "warmup": false,
+          "cli_elapsed_ns": 2017379687,
+          "replay_wall_time_ms": 5.353389
+        },
+        {
+          "side": "baseline",
+          "warmup": false,
+          "cli_elapsed_ns": 2018961806,
+          "replay_wall_time_ms": 14.663872999999999
+        },
+        {
+          "side": "baseline",
+          "warmup": false,
+          "cli_elapsed_ns": 2017282480,
+          "replay_wall_time_ms": 14.567883
+        },
+        {
+          "side": "candidate",
+          "warmup": false,
+          "cli_elapsed_ns": 2020246561,
+          "replay_wall_time_ms": 6.8717630000000005
+        },
+        {
+          "side": "candidate",
+          "warmup": false,
+          "cli_elapsed_ns": 2032099639,
+          "replay_wall_time_ms": 5.458813
+        },
+        {
+          "side": "baseline",
+          "warmup": false,
+          "cli_elapsed_ns": 2016980825,
+          "replay_wall_time_ms": 13.686060999999999
+        },
+        {
+          "side": "baseline",
+          "warmup": false,
+          "cli_elapsed_ns": 2035689008,
+          "replay_wall_time_ms": 13.922672
+        },
+        {
+          "side": "candidate",
+          "warmup": false,
+          "cli_elapsed_ns": 1961653938,
+          "replay_wall_time_ms": 5.493624
+        }
+      ],
+      "canonical_metrics_sha256": "06c6fb14ccb0a4f6968d36e6bf9f0c5c0cd3dccd248213b911ebb19042a3165b",
+      "verified_metrics": {
+        "completed_requests": 8,
+        "total_input_tokens": 512,
+        "total_output_tokens": 4096,
+        "duration_ms": 4096.0,
+        "committed_prefill_tokens": 512,
+        "prefix_cache_reused_ratio": 0.0
+      }
+    },
+    {
+      "output_tokens": 2048,
+      "config": {
+        "traffic": {
+          "source": {
+            "type": "synthetic",
+            "input_tokens": 64,
+            "output_tokens": 2048
+          },
+          "load": {
+            "type": "concurrency",
+            "concurrency": 1
+          },
+          "stop": {
+            "requests": 8
+          }
+        },
+        "engine": {
+          "mode": "aggregated",
+          "model": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-363-20261122T042427116586Z/scratch/performance/tiny-model",
+          "hardware": "h200_sxm",
+          "backend": "sglang",
+          "context_length": 131072,
+          "workers": {
+            "aggregated": {
+              "parallelism": {
+                "replicas": 1,
+                "tensor": 1,
+                "pipeline": 1,
+                "attention_data": 1,
+                "moe_tensor": 1,
+                "moe_expert": 1
+              },
+              "scheduler": {
+                "max_batched_tokens": 65536,
+                "max_sequences": 1
+              },
+              "kv_cache": {
+                "block_size": 1,
+                "prefix_caching": true,
+                "capacity": {
+                  "type": "fixed",
+                  "blocks": 32768
+                }
+              },
+              "timing": {
+                "type": "fixed",
+                "prefill_ms": 1,
+                "decode_ms": 1
+              }
+            }
+          }
+        },
+        "execution": {
+          "resources": {
+            "memory_limit_gb": 1.2,
+            "cpu_limit": 1
+          }
+        }
+      },
+      "samples": [
+        {
+          "side": "candidate",
+          "warmup": true,
+          "cli_elapsed_ns": 2014649289,
+          "replay_wall_time_ms": 20.749558
+        },
+        {
+          "side": "baseline",
+          "warmup": true,
+          "cli_elapsed_ns": 2198097802,
+          "replay_wall_time_ms": 135.70015999999998
+        },
+        {
+          "side": "baseline",
+          "warmup": false,
+          "cli_elapsed_ns": 2141842656,
+          "replay_wall_time_ms": 131.025081
+        },
+        {
+          "side": "candidate",
+          "warmup": false,
+          "cli_elapsed_ns": 2152563479,
+          "replay_wall_time_ms": 23.489738
+        },
+        {
+          "side": "candidate",
+          "warmup": false,
+          "cli_elapsed_ns": 2150565259,
+          "replay_wall_time_ms": 21.037798
+        },
+        {
+          "side": "baseline",
+          "warmup": false,
+          "cli_elapsed_ns": 2295912249,
+          "replay_wall_time_ms": 134.087653
+        },
+        {
+          "side": "baseline",
+          "warmup": false,
+          "cli_elapsed_ns": 2253172591,
+          "replay_wall_time_ms": 139.27581899999998
+        },
+        {
+          "side": "candidate",
+          "warmup": false,
+          "cli_elapsed_ns": 2150966902,
+          "replay_wall_time_ms": 21.34622
+        },
+        {
+          "side": "candidate",
+          "warmup": false,
+          "cli_elapsed_ns": 2147920088,
+          "replay_wall_time_ms": 21.284755999999998
+        },
+        {
+          "side": "baseline",
+          "warmup": false,
+          "cli_elapsed_ns": 2205191726,
+          "replay_wall_time_ms": 131.82143399999998
+        },
+        {
+          "side": "baseline",
+          "warmup": false,
+          "cli_elapsed_ns": 2276266471,
+          "replay_wall_time_ms": 150.39950499999998
+        },
+        {
+          "side": "candidate",
+          "warmup": false,
+          "cli_elapsed_ns": 2150447272,
+          "replay_wall_time_ms": 21.103101
+        }
+      ],
+      "canonical_metrics_sha256": "556e721326d38043caa855982219088feeb55fc82b5cb45818eed569ec7ef406",
+      "verified_metrics": {
+        "completed_requests": 8,
+        "total_input_tokens": 512,
+        "total_output_tokens": 16384,
+        "duration_ms": 16384.0,
+        "committed_prefill_tokens": 512,
+        "prefix_cache_reused_ratio": 0.0
+      }
+    }
+  ],
+  "cli_canonical_exclusions": [
+    "processed_output_tokens_per_s",
+    "processed_tokens_per_s",
+    "wall_time_ms"
+  ],
+  "cli_timing_scope": "Outer CLI process and separately native Replayer::run_inner through collector finalization, excluding model/CLI setup. Neither is a loop-only timer. Fixed 1 ms serving timings; no weights or measured serving-accuracy claim.",
+  "command": "python -m aisimulate predict --stack engine --config CONFIG --output-dir OUTPUT --format json",
+  "cargo_lock_sha256": "0b7c0821753c8b2ffed2783cb6bb38a531e71b511fae4cf89b0a11312cad7c8e",
+  "micro_artifact_note": "Both default-feature optimized unit-test binaries use the identical transplanted probe. Candidate additionally includes the test-only borrowed-key exposure counter; production wheels have no counter.",
+  "model_provenance": {
+    "source": "tests/e2e/configs/unified_cli/fixtures/tiny-model/config.json",
+    "source_sha256": "cba8a8e0788d0e6b4a1317305497f813939bba59ac3aaccf60e6971726321c44",
+    "modification": "max_position_embeddings=131072 in generated scratch config; no weights",
+    "generated_sha256": "4d3a32885a9ae66a75b3f41d4565e5455c582ad2185b69906490daae06384c3a"
+  },
+  "host_limits": {
+    "memory_max_bytes": 5368709120,
+    "cpu_max": "200000 100000"
+  },
+  "verification": {
+    "rust_workspace_passed": 1965,
+    "rust_workspace_ignored": 3,
+    "focused_growth_passed": 4,
+    "python_native_passed": 102,
+    "radix_tools_passed": 10,
+    "ruff_check": "passed",
+    "ruff_format": "passed: 1037 files",
+    "rustfmt": "passed",
+    "packaged_legal_files": "passed"
+  },
+  "earlier_attempts": "Initial manifest-only wheel selected CFFI; corrected to Python-project release extension build. Pytest plugin/scope setup and comparison fingerprint path corrected before successful reruns. Concurrent optimized workspace compilation exceeded 5 GiB; full suite passed with --jobs 1 and unchanged optimization/assertions. Initial CLI inspection during compilation was rejected by host headroom guard; complete final campaign passed after builds with the same 1.2 GB budget. Logs retained in scratch/logs; no measured sample discarded."
+}
