@@ -178,7 +178,7 @@ def _configs(
             # Replay reuses prefixes only when the deployment passes the grouped prefix-caching requirements that the
             # prediction checks. Replay takes the grouped rules from the label, so the vLLM version of the evidence
             # must also be the label. Otherwise the plan keeps the cold replay and records why. The plan of an earlier
-            # planner (grouped_cold) is cold and records no reason.
+            # planner (grouped_cold) is cold, and this function computes no reason for it.
             if not grouped_cold:
                 reason = _grouped_cold_reason(request, deployment, worker["scheduler"]["max_batched_tokens"])
             worker.setdefault("kv_cache", {})["prefix_caching"] = not grouped_cold and reason is None
@@ -752,7 +752,17 @@ def _check_paths(root: Path) -> None:
 
 
 def check_plan(request: SupportRequest, root: Path, *, allow_missing: bool = False) -> None:
-    """Verify saved identity before collecting or reusing any local output."""
+    """Verify saved identity before collecting or reusing any local output.
+
+    A saved support-plan.json must equal one of four renderings of the saved request, and each generated file must
+    hold the bytes of that rendering, or may be absent with allow_missing: the plan of this planner, the same plan
+    under the older command name, and each of the two with the grouped replay cold, as an earlier planner wrote it.
+    The text of fpm.prefix_caching_reason, the reason of a cold plan, is not compared: a rendering that holds the key
+    takes the string of the saved plan, so only the presence of the key is compared, and a value that is not a string
+    is refused. A cold rendering of a grouped profile keeps the string of the saved plan also when this planner
+    computes no reason, so a plan that was saved cold with its reason verifies when this planner plans its profile
+    with prefix caching on.
+    """
 
     _check_paths(root)
     if allow_missing and not (root / "support-plan.json").exists():

@@ -96,14 +96,15 @@ def _check_audited_sources(record: dict[str, Any], source_files: Mapping[str, st
 def _check_audited_class(name: Any, source_files: Mapping[str, str], role: str) -> None:
     parts = name.split(".") if isinstance(name, str) else []
     if not any(".".join(parts[:end]).replace(".", "/") + ".py" in source_files for end in range(len(parts) - 1, 0, -1)):
-        path = "/".join(parts[:-1]) + ".py" if len(parts) > 1 else repr(name)
+        path = "/".join(parts[:-1]) + ".py" if len(parts) > 1 else f"{role} class {name!r}"
         raise ValueError(f"selected {role} source has not been audited: {path}")
 
 
 # vLLM stores both capacity values in one call (vLLM 0.33.0 v1/core/kv_cache_utils.py:1136-1142), which the engine
 # core makes once, before it builds the scheduler (v1/engine/core.py:352). The token capacity is the integer part of
 # the concurrency times max_model_len (kv_cache_utils.py:1120-1128). The concurrency is the pool blocks over the
-# blocks of one request, a positive float for every layout with a cache group (:1076-1093, engine/core.py:337-352).
+# blocks of one request, a positive float for every layout with a cache group (:1076-1093,
+# v1/engine/core.py:337-352).
 # The startup concurrency check skips a layout with a sliding-window group, so this check refuses a concurrency that
 # is no positive finite number itself, with the text of that check.
 def _check_size_tokens(record: dict[str, Any]) -> None:

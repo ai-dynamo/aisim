@@ -38,8 +38,8 @@ _CELL_EXECUTION_FIELDS = frozenset({"execution_identity", "input_text_sha256"})
 _SPEC_TYPES = frozenset({*(_SPEC_MODULE + name for name in SPEC_KINDS), _UNIFORM_SPEC})
 # The vLLM 0.33.0 spec classes whose groups take no part in prefix caching (kv_cache_interface.py:998-1000). A
 # SlidingWindowMLASpec group takes part unless it replays a bounded window (:1015, :1027-1029), which no record holds.
-# The groups that replay share one window, so the import lets only groups of one window stay out
-# (runtime_observations._scheduler_hash_block_sizes).
+# The groups that replay share one window, so the import lets such groups stay out only when the windows that their
+# records hold are one (runtime_observations._scheduler_hash_block_sizes).
 _NO_PREFIX_CACHING_SPECS = frozenset({_SPEC_MODULE + "CircularBufferSpec"})
 # vLLM 0.33.0 cache settings that follow the prefix-caching mode (models/config.py:763-787), the
 # user prefix-match unit, and the block size that the engine core resolves in its own process

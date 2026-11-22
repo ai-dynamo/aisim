@@ -3773,7 +3773,7 @@ _OUTSIDE = "attention group layers lie outside their cache group: ['attn.0', 'at
         ("mamba_hybrid", "one_rank_backend", _UNAUDITED),
         # A module path alone is no class of that module.
         ("mamba_hybrid", "module_only", "selected backend source has not been audited: vllm/v1/attention/backends.py"),
-        ("mamba_hybrid", "missing_backend", "selected backend source has not been audited: None"),
+        ("mamba_hybrid", "missing_backend", "selected backend source has not been audited: backend class None"),
         ("mamba_hybrid", "missing_group_id", _OUTSIDE),
         (
             "mamba_hybrid",

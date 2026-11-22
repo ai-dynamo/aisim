@@ -44,9 +44,10 @@ def _is_moe(config: dict[str, object]) -> bool:
 def _check_layer_declarations(config: dict[str, object]) -> None:
     """The layer structure checks of a config without cache layout markers.
 
-    They are main's checks, which read only num_hidden_layers and checked neither the window fields nor
-    attn_type_list. A config with markers, other than DeepSeek-V4.1, runs check_marker_layout_declarations of
-    aisim.fpm_cache_layout instead, the checks that config intake runs.
+    They read the layer count from num_hidden_layers only, and they check neither the window fields nor attn_type_list.
+    A config with markers runs check_marker_layout_declarations of aisim.fpm_cache_layout instead, the checks that
+    config intake runs. A DeepSeek-V4.1 config runs neither: its markers are not read, and its template is chosen before
+    these checks.
     """
     layer_types = config.get("layer_types")
     layers = config.get("num_hidden_layers")

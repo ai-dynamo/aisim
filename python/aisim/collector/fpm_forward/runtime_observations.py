@@ -1217,9 +1217,9 @@ def _scheduler_hash_block_sizes(record: dict[str, Any]) -> list[Any]:
     the groups that take part in prefix caching, or of every group when none does. Each of these cases gives one size.
     Each SlidingWindowMLASpec group takes part unless its spec replays a bounded window (kv_cache_interface.py:1015,
     :1027-1029). The record does not hold which groups replay. The groups that replay share one window, their
-    sliding_window (core/sched/scheduler.py:302-313, kv_cache_interface.py:1031-1033), so the groups that stay out have
-    one sliding_window, and each such choice gives one size. A group whose record holds no positive integer window may
-    stay out with any window.
+    sliding_window (core/sched/scheduler.py:302-313, kv_cache_interface.py:1031-1033), so the SlidingWindowMLASpec
+    groups that stay out have one sliding_window, and each such choice gives one size. A group whose record holds no
+    positive integer window may stay out with any window.
     """
     groups, settings = record["cache"]["groups"], record["resolved_config"]["cache_config"]
     blocks = [_positive(group["block_size_tokens"], "cache block size") for group in groups]
