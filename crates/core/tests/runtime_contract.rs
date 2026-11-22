@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 
 use aisim_core::engine::generalized::{EngineIdentity, SchedulerCommand};
 use aisim_core::engine::{
-    Backend, Command, EngineConfig, EngineFactory, HandoffId, LifecycleEvent, Request,
-    SglangConfig, TimingModel, TimingModelConfig, WorkerType,
+    Backend, Command, EncoderShape, EngineConfig, EngineFactory, HandoffId, ImageSpec,
+    LifecycleEvent, Request, SglangConfig, TimingModel, TimingModelConfig, WorkerType,
 };
 use aisim_core::replay::loadgen::ReplayRequestPayload;
 use aisim_core::replay::{
@@ -710,6 +710,293 @@ fn grouped_and_linear_roles_cannot_pair_in_one_handoff() {
             "invalid replay spec: kv_cache_groups must be identical on the prefill and decode roles",
             "linear {role} rank"
         );
+    }
+}
+
+/// A request of `prompt` tokens and two output tokens.
+fn handoff_request(id: u128, prompt: usize) -> Request {
+    Request {
+        request_id: Uuid::from_u128(id),
+        tokens: (0..prompt as u32).collect(),
+        max_output_tokens: 2,
+        output_token_ids: None,
+        session_id: None,
+        cache_salt: None,
+        images: Vec::new(),
+        kv_hint: None,
+    }
+}
+
+/// The KV handoff command `kind` for handoff `handoff`, with a request of
+/// `request` where the command carries one.
+fn handoff_command(kind: &str, handoff: u128, request: u128, prompt: usize) -> Command {
+    let handoff_id = HandoffId::new(Uuid::from_u128(handoff));
+    match kind {
+        "SubmitHandoffPrefill" => Command::SubmitHandoffPrefill {
+            handoff_id,
+            request: handoff_request(request, prompt),
+        },
+        "ReleaseSource" => Command::ReleaseSource { handoff_id },
+        "CancelSource" => Command::CancelSource { handoff_id },
+        "ReserveDestination" => Command::ReserveDestination {
+            handoff_id,
+            request: handoff_request(request, prompt),
+        },
+        "ActivateDestination" => Command::ActivateDestination { handoff_id },
+        "CancelDestination" => Command::CancelDestination { handoff_id },
+        _ => unreachable!("{kind} is no KV handoff command"),
+    }
+}
+
+/// Run on `engine` a plain request and then one handoff of the rank's own
+/// role to its end, and describe every accepted command and every pass.
+/// `refuse` is called with the time, a handoff and a request number before
+/// the first command, while the first pass is in flight, after the own
+/// handoff starts and before it ends (the last two with its numbers).
+fn own_role_run(
+    engine: &mut aisim_core::engine::Engine,
+    worker_type: WorkerType,
+    prompt: usize,
+    refuse: &mut dyn FnMut(&mut aisim_core::engine::Engine, f64, u128, u128),
+) -> Vec<String> {
+    let mut trace = Vec::new();
+    let apply = |engine: &mut aisim_core::engine::Engine,
+                 trace: &mut Vec<String>,
+                 command: Command,
+                 now_ms: f64| {
+        let effects = engine
+            .apply_command_effects(SchedulerCommand::new(0, command), now_ms)
+            .unwrap();
+        trace.push(format!("command at {now_ms}: {effects:?}"));
+    };
+    // Run passes until `done` holds for a completed pass, or until no rank
+    // has work; refuse once while the first pass is in flight.
+    let run = |engine: &mut aisim_core::engine::Engine,
+               trace: &mut Vec<String>,
+               now_ms: &mut f64,
+               refuse: &mut dyn FnMut(&mut aisim_core::engine::Engine, f64, u128, u128),
+               in_flight: bool,
+               done: &dyn Fn(&str) -> bool| {
+        for pass_index in 0..200 {
+            let Some(pass) = engine.execute_pass(*now_ms).unwrap() else {
+                return;
+            };
+            trace.push(format!("pass started: {pass:?}"));
+            if in_flight && pass_index == 0 {
+                refuse(engine, *now_ms, 902, 903);
+            }
+            let completed = engine.complete_pass(pass.pass_id, pass.end_ms).unwrap();
+            *now_ms = pass.end_ms;
+            let completed = format!("pass completed: {completed:?}");
+            let stop = done(&completed);
+            trace.push(completed);
+            if stop {
+                return;
+            }
+        }
+        panic!("the engine did not finish in 200 passes");
+    };
+    let mut now_ms = 0.0;
+    refuse(engine, now_ms, 900, 901);
+    apply(
+        engine,
+        &mut trace,
+        Command::Submit(handoff_request(1, prompt)),
+        now_ms,
+    );
+    run(engine, &mut trace, &mut now_ms, refuse, true, &|_| false);
+    assert!(engine.is_drained());
+    if worker_type == WorkerType::Prefill {
+        apply(
+            engine,
+            &mut trace,
+            handoff_command("SubmitHandoffPrefill", 20, 21, prompt),
+            now_ms,
+        );
+        refuse(engine, now_ms, 20, 21);
+        run(engine, &mut trace, &mut now_ms, refuse, false, &|pass| {
+            pass.contains("SourceHeld")
+        });
+        assert!(trace.last().unwrap().contains("SourceHeld"));
+        refuse(engine, now_ms, 20, 21);
+        apply(
+            engine,
+            &mut trace,
+            handoff_command("ReleaseSource", 20, 21, prompt),
+            now_ms,
+        );
+        assert!(trace.last().unwrap().contains("result: Applied"));
+    } else {
+        apply(
+            engine,
+            &mut trace,
+            handoff_command("ReserveDestination", 20, 21, prompt),
+            now_ms,
+        );
+        assert!(trace.last().unwrap().contains("DestinationAccepted"));
+        refuse(engine, now_ms, 20, 21);
+        apply(
+            engine,
+            &mut trace,
+            handoff_command("ActivateDestination", 20, 21, prompt),
+            now_ms,
+        );
+        assert!(trace.last().unwrap().contains("result: Applied"));
+        refuse(engine, now_ms, 20, 21);
+        run(engine, &mut trace, &mut now_ms, refuse, false, &|_| false);
+    }
+    assert!(engine.is_drained());
+    trace
+}
+
+#[test]
+fn engine_refuses_kv_handoff_commands_of_the_opposite_role() {
+    // A KV handoff has a source on a prefill rank and a destination on a
+    // decode rank. `SchedulerRank` hands each command to the core of its
+    // rank, whose role check refuses a source command on a decode rank and a
+    // destination command on a prefill rank before any state changes, and
+    // `Engine::apply_command_effects` adds the context "applying command to
+    // attention-DP rank 0". So `{:#}` of the error is that context, ": ",
+    // and the text of the role.
+    let source = ["SubmitHandoffPrefill", "ReleaseSource", "CancelSource"];
+    let destination = [
+        "ReserveDestination",
+        "ActivateDestination",
+        "CancelDestination",
+    ];
+    let linear = |backend, worker_type| EngineConfig {
+        num_gpu_blocks: 64,
+        block_size: 4,
+        max_num_seqs: 4,
+        max_num_batched_tokens: 64,
+        worker_type,
+        sglang: SglangConfig {
+            num_reserved_decode_tokens: 0,
+            ..SglangConfig::default()
+        },
+        timing_model: TimingModelConfig::Fixed {
+            prefill_ms: 10.0,
+            decode_ms: 2.0,
+        },
+        ..EngineConfig::for_backend(backend)
+    };
+    let grouped =
+        serde_json::from_value::<ReplayEngineConfig>(disaggregated_grouped_spec(Vec::new()).engine)
+            .unwrap()
+            .rank;
+    // A grouped prefill rank refused `ReserveDestination` with its own text
+    // before this rule, so only the other two destination commands reach the
+    // role text there.
+    let mut ranks = Vec::new();
+    for backend in [Backend::Vllm, Backend::Trtllm, Backend::Sglang] {
+        ranks.push((
+            format!("{backend:?} decode"),
+            linear(backend, WorkerType::Decode),
+            16,
+            &source[..],
+        ));
+        ranks.push((
+            format!("{backend:?} prefill"),
+            linear(backend, WorkerType::Prefill),
+            16,
+            &destination[..],
+        ));
+    }
+    ranks.push((
+        "grouped vLLM prefill".to_string(),
+        EngineConfig {
+            worker_type: WorkerType::Prefill,
+            ..grouped
+        },
+        1000,
+        &destination[1..],
+    ));
+    let build = |config: &EngineConfig| {
+        EngineFactory::new(config.clone())
+            .unwrap()
+            .build(EngineIdentity::new(0), NonZeroU32::MIN)
+            .unwrap()
+    };
+    for (name, config, prompt, kinds) in ranks {
+        let reference = own_role_run(
+            &mut build(&config),
+            config.worker_type,
+            prompt,
+            &mut |_, _, _, _| {},
+        );
+        for kind in kinds {
+            let text = if config.worker_type == WorkerType::Decode {
+                format!(
+                    "applying command to attention-DP rank 0: a decode rank holds no KV handoff source, so it refuses {kind}; a prefill rank takes it"
+                )
+            } else {
+                format!(
+                    "applying command to attention-DP rank 0: a prefill rank loads no KV handoff destination, so it refuses {kind}; a decode rank takes it"
+                )
+            };
+            let mut refusals = 0;
+            let trace = own_role_run(
+                &mut build(&config),
+                config.worker_type,
+                prompt,
+                &mut |engine, now_ms, handoff, request| {
+                    let error = engine
+                        .apply_command_effects(
+                            SchedulerCommand::new(
+                                0,
+                                handoff_command(kind, handoff, request, prompt),
+                            ),
+                            now_ms,
+                        )
+                        .unwrap_err();
+                    assert_eq!(format!("{error:#}"), text, "{name}");
+                    refusals += 1;
+                },
+            );
+            assert_eq!(refusals, 4, "{name} {kind}");
+            // The refused commands left no trace: every command and pass of
+            // the plain request and of the own handoff is as without them.
+            assert_eq!(trace, reference, "{name} {kind}");
+        }
+    }
+
+    // On vLLM and TRT-LLM the image refusal comes before the role check.
+    let image = ImageSpec {
+        identity: 1,
+        token_start: 4,
+        token_end: 8,
+        encoder: EncoderShape {
+            sequences: 1,
+            patch_tokens: 16,
+            transformer_tokens: 16,
+            output_tokens: 4,
+        },
+        embedding_bytes: 128,
+    };
+    for backend in [Backend::Vllm, Backend::Trtllm] {
+        for (worker_type, kind) in [
+            (WorkerType::Decode, "SubmitHandoffPrefill"),
+            (WorkerType::Prefill, "ReserveDestination"),
+        ] {
+            let mut command = handoff_command(kind, 30, 31, 8);
+            match &mut command {
+                Command::SubmitHandoffPrefill { request, .. }
+                | Command::ReserveDestination { request, .. } => {
+                    request.images = vec![image.clone()];
+                }
+                _ => unreachable!(),
+            }
+            let mut engine = build(&linear(backend, worker_type));
+            let error = engine
+                .apply_command_effects(SchedulerCommand::new(0, command), 0.0)
+                .unwrap_err();
+            assert_eq!(
+                format!("{error:#}"),
+                "applying command to attention-DP rank 0: native request images require the SGLang backend; vLLM and TRT-LLM do not support them",
+                "{backend:?} {kind}"
+            );
+            assert!(engine.is_drained(), "{backend:?} {kind}");
+        }
     }
 }
 
