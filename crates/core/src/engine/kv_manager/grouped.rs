@@ -279,6 +279,20 @@ impl GroupedBlockPool {
         visible
     }
 
+    /// Give the cached block `id` one more key of its group, at `at` when the
+    /// key lies inside a block of the group. Nothing changes when the block
+    /// holds `key`. Returns whether `key` became visible.
+    pub(crate) fn cache_alias(
+        &mut self,
+        id: BlockCopyId,
+        key: CacheKey,
+        at: Option<KeyInBlock>,
+    ) -> bool {
+        let visible = self.pool.cache_grouped_alias(id, key, at);
+        self.retry_epoch += u64::from(visible);
+        visible
+    }
+
     /// See [`VllmBlockPool::grouped_keys_in_block`].
     pub(crate) fn keys_in_block(
         &self,
@@ -950,6 +964,41 @@ mod tests {
         assert!(pool.block_pool_mut().unwrap().cache_at(inside, key(11), at));
         assert!(after_end > start);
         assert_eq!(pool.retry_epoch() - after_end, after_end - start);
+    }
+
+    #[test]
+    fn block_mode_key_added_to_a_cached_block_moves_the_retry_epoch_as_any_publish() {
+        // A waiting load is tried again when a key becomes visible, also a
+        // key that a cached block gets beside its first key.
+        let key = |hash| CacheKey::Grouped { group: 0, hash };
+        let mut pool = GroupedKvPool::with_prefix_cache(three_groups(), 32, 8);
+        let blocks = pool.block_pool_mut().unwrap();
+        let mut reservation = blocks.reserve(&[], 1).unwrap();
+        let id = blocks.take_private(&mut reservation);
+        blocks.cancel(reservation);
+        let start = pool.retry_epoch();
+        assert!(pool.block_pool_mut().unwrap().cache(id, key(10)));
+        let after_first = pool.retry_epoch();
+        let at = Some(KeyInBlock {
+            first: 7,
+            offset: 4,
+        });
+        assert!(pool.block_pool_mut().unwrap().cache_alias(id, key(11), at));
+        assert!(after_first > start);
+        // Derived, not run: a key that becomes visible moves the count by the
+        // same amount, whichever way it was published.
+        assert_eq!(pool.retry_epoch() - after_first, after_first - start);
+        // Derived, not run: a key that the block holds changes nothing.
+        let after_alias = pool.retry_epoch();
+        assert!(!pool.block_pool_mut().unwrap().cache_alias(id, key(11), at));
+        assert!(
+            !pool
+                .block_pool_mut()
+                .unwrap()
+                .cache_alias(id, key(10), None)
+        );
+        assert_eq!(pool.retry_epoch(), after_alias);
+        assert!(pool.block_pool().unwrap().key_hit(0, 11).is_some());
     }
 
     #[test]
