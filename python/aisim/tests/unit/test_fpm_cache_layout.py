@@ -117,6 +117,9 @@ _NOT_AN_INTEGER = "must be an integer >={}, not a boolean, float or numeric stri
         # A list is required also when no layer count states its length.
         ({"layer_types": "ab"}, "layer_types must have one entry per num_hidden_layers"),
         ({"attn_type_list": "01"}, "attn_type_list must have one entry per num_hidden_layers"),
+        # A null list is a declaration too: its key is present.
+        ({"layer_types": None}, "layer_types must have one entry per num_hidden_layers"),
+        ({"attn_type_list": None}, "attn_type_list must have one entry per num_hidden_layers"),
         # The window is checked before the layer count.
         ({"sliding_window": True, "num_hidden_layers": "2"}, "sliding_window " + _NOT_AN_INTEGER.format(0)),
         # layer_types is checked before attn_type_list.
@@ -140,7 +143,8 @@ def test_marker_layout_declarations_return_the_layer_count():
 
 
 def test_intake_and_collector_run_the_shared_marker_block(tmp_path, monkeypatch):
-    # Each side calls the one function for a config with a layout marker, and neither repeats its four checks.
+    # Each side calls the one function for a config with a layout marker, and neither repeats the checks of the
+    # window, of layer_types and of attn_type_list. Intake reads the layer count again for its geometry.
     import json
 
     from collector.fpm_forward import capabilities
@@ -190,7 +194,57 @@ def test_intake_and_collector_run_the_shared_marker_block(tmp_path, monkeypatch)
 
     load_both({})
     assert calls == ["intake", "collector"]
-    # A malformed layer_types that only the shared checks refuse: neither side keeps a copy of them.
+    # A window, a layer_types list and an attn_type_list that only the shared checks refuse: neither side keeps a
+    # copy of these three.
     calls.clear()
-    load_both({"layer_types": ["linear_attention"]})
+    load_both({"sliding_window": "128", "layer_types": ["linear_attention"], "attn_type_list": "01"})
     assert calls == ["intake", "collector"]
+
+
+def test_intake_and_collector_pass_the_decoder_config_to_the_shared_marker_block(tmp_path, monkeypatch):
+    import json
+
+    from collector.fpm_forward import capabilities
+
+    from aisim.support import config_profile
+
+    seen = []
+
+    def record(raw):
+        seen.append(raw.get("layer_types"))
+
+    monkeypatch.setattr(config_profile, "check_marker_layout_declarations", record)
+    monkeypatch.setattr(capabilities, "check_marker_layout_declarations", record)
+    layer_types = ["linear_attention", "full_attention"]
+    # The declarations of a wrapper config are in its text decoder.
+    config = {
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "text_config": {
+            "num_hidden_layers": 2,
+            "hidden_size": 128,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 32,
+            "intermediate_size": 256,
+            "vocab_size": 1024,
+            "max_position_embeddings": 4096,
+            "torch_dtype": "bfloat16",
+            "layer_types": layer_types,
+        },
+    }
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    config_profile.load_model_config(path)
+    capabilities.resolve_model_capability(
+        backend="vllm",
+        model_path=str(path),
+        model_architecture=None,
+        selected_ops={"attention_context", "attention_generation"},
+        has_model_cases=False,
+        system="b200_sxm",
+        requested_weight_quantizations=(),
+        requested_kv_cache_dtypes=("auto",),
+        database_version="0.27.0",
+        checkpoint_native_dtypes=True,
+    )
+    assert seen == [layer_types, layer_types]

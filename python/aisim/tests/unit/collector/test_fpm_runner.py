@@ -3862,11 +3862,12 @@ def test_power_window_cannot_be_set_through_the_environment(name, source):
 
 @pytest.mark.parametrize(
     "launch,value,refused",
-    # vLLM reads the variable as bool(int(value)) (vllm/envs.py:638): "00" and " 0" read as off, "-1" as on, and a
-    # value that int() cannot read ("", "true", "0.0") stops vLLM. None leaves the variable unset.
+    # vLLM reads the variable as bool(int(value)) (vllm/envs.py:638): "00", " 0" and the Arabic-Indic digit zero read
+    # as off, "-1" as on, and a value that int() cannot read ("", "true", "0.0", "0x0") stops vLLM. None leaves the
+    # variable unset.
     [
-        *[("slurm_probe", value, True) for value in ("1", "2", "-1", "true", "", "0.0")],
-        *[("slurm_probe", value, False) for value in (None, "0", "00", " 0")],
+        *[("slurm_probe", value, True) for value in ("1", "2", "-1", "true", "", "0.0", "0x0")],
+        *[("slurm_probe", value, False) for value in (None, "0", "00", " 0", "\u0660")],
         ("kubernetes_probe", "1", False),
         ("slurm_collection", "1", False),
     ],

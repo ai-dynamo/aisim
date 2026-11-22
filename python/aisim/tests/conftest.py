@@ -55,6 +55,16 @@ def _restore_root_logger():
     root.setLevel(level)
 
 
+@pytest.fixture(autouse=True)
+def _no_vllm_batch_invariant(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run every test without VLLM_BATCH_INVARIANT in the environment.
+
+    A runtime probe on Slurm refuses the variable in the environment of the collector, so a test that builds such a
+    probe would fail in a shell that sets it. A test of that refusal sets the variable itself.
+    """
+    monkeypatch.delenv("VLLM_BATCH_INVARIANT", raising=False)
+
+
 @pytest.fixture
 def cli_parser() -> argparse.ArgumentParser:
     """Pre-configured CLI parser for testing."""

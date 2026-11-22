@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import re
-import sys
 from copy import deepcopy
 from pathlib import Path
 
@@ -2280,17 +2279,17 @@ def test_grouped_sweeper_loads_the_profile_once_per_candidate(grouped_case, monk
     load = fpm_profile.load_fpm_profile
 
     def counted(value):
-        # Other parts of the build read the profile too; this test counts the loads of the candidate's ranks.
-        if sys._getframe(1).f_code.co_filename == deploy.__file__:
-            loads.append(value)
+        loads.append(value)
         return load(value)
 
     monkeypatch.setattr(fpm_profile, "load_fpm_profile", counted)
     profile, root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile))
     sample = _grouped_agg_sample(profile, root, 128)
+    # The search validation that makes a sample loads the profile too, so the count starts after it.
+    loads.clear()
     args = deploy.build_backend_deployment(sample, backend_version="0.31.0").agg_engine_args
-    # An aggregated rank with prefix caching reads the profile once, as before.
+    # An aggregated rank with prefix caching reads the profile once.
     assert len(loads) == 1
     # A profile given as JSON text or as a loaded model builds the same rank as the dict that the search stores.
     for value in (json.dumps(sample["fpm_profile"]), load(sample["fpm_profile"])):
@@ -2298,9 +2297,17 @@ def test_grouped_sweeper_loads_the_profile_once_per_candidate(grouped_case, monk
             deploy.build_backend_deployment({**sample, "fpm_profile": value}, backend_version="0.31.0").agg_engine_args
             == args
         )
+    # An aggregated rank without prefix caching never reads the profile. So it does not load it, and a profile that
+    # the loader refuses builds the same rank.
+    loads.clear()
+    off = {**sample, "agg_enable_prefix_caching": False}
+    off_args = deploy.build_backend_deployment(off, backend_version="0.31.0").agg_engine_args
+    refused = {**off, "fpm_profile": {**sample["fpm_profile"], "context_length": 0}}
+    assert deploy.build_backend_deployment(refused, backend_version="0.31.0").agg_engine_args == off_args
+    assert not loads
 
-    # A disaggregated candidate reads the profile for both roles and for the transfer size of each role. It loaded the
-    # profile four times, once for each role and once more for each transfer size, and now loads it once.
+    # A disaggregated candidate reads the profile for both roles and for the transfer size of each role, four times in
+    # all, and loads it once.
     raw = {
         **_pd_search(_with_transfer_markers(profile), root),
         "prefill_enable_prefix_caching": True,
@@ -2341,6 +2348,11 @@ def test_a_build_error_outside_the_prefix_caching_rules_stays_failed(grouped_cas
     # The profile holds no deployment of vLLM 0.29.0. That is a fault of the inputs, not an engine setting.
     with pytest.raises(ValueError, match="no matching FPM deployment profile") as error:
         deploy.build_backend_deployment(sample, backend_version="0.29.0")
+    assert not isinstance(error.value, deploy.InfeasibleEngineSetting)
+    # A profile that the loader refuses is a fault of the inputs too.
+    refused = {**sample, "fpm_profile": {**sample["fpm_profile"], "context_length": 0}}
+    with pytest.raises(ValidationError, match="context_length") as error:
+        deploy.build_backend_deployment(refused, backend_version="0.31.0")
     assert not isinstance(error.value, deploy.InfeasibleEngineSetting)
 
     class OtherVersion:
@@ -3048,8 +3060,8 @@ def test_a_plan_of_a_warm_profile_whose_pilots_were_saved_cold_verifies_with_or_
     grouped_case, tmp_path, capsys, reason
 ):
     # Cold pilots for a profile that plans warm are the plan of an earlier planner, which the plan check accepts. Such
-    # a plan verifies without a recorded reason as an earlier planner wrote it, and with one as the planner of a later
-    # model of prefix caching writes it; a reason on warm pilots is refused.
+    # a plan verifies without a recorded reason as an earlier planner wrote it, and with one as a planner that records
+    # its reason wrote it before replay modeled prefix caching for the profile; a reason on warm pilots is refused.
     from aisim.support.plan import check_plan
 
     profile, _root = grouped_case

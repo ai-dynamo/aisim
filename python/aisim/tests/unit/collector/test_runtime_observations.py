@@ -11,7 +11,7 @@ import shutil
 from pathlib import Path
 
 import pytest
-from collector.fpm_forward import runtime_memory, runtime_observations
+from collector.fpm_forward import runtime_evidence, runtime_memory, runtime_observations
 from collector.fpm_forward.runtime import fpm_memory_observer as legacy
 from collector.fpm_forward.runtime_instrumentation import load_instrumentation
 from collector.fpm_forward.runtime_observations import validate_observations
@@ -126,9 +126,11 @@ def _raw_cache_config(record: dict, allocations: list[dict] | None = None) -> di
             else:
                 entry.update(dtype=group["dtype"], page_size_padded=None)
                 if spec_type != _V033_SPEC + "CircularBufferSpec":
-                    entry.update(
-                        sliding_window=group["sliding_window"], attention_chunk_size=group["attention_chunk_size"]
-                    )
+                    entry["sliding_window"] = group["sliding_window"]
+                    # SlidingWindowSpec and SlidingWindowMLASpec hold no attention_chunk_size
+                    # (kv_cache_interface.py:901-908, :1008).
+                    if not spec_type.startswith(_V033_SPEC + "SlidingWindow"):
+                        entry["attention_chunk_size"] = group["attention_chunk_size"]
                 if spec_type == _V033_SPEC + "MLAAttentionSpec":
                     entry["cache_role"] = first["cache_role"]
         groups.append(entry)
@@ -146,6 +148,9 @@ def _attention_groups(cache: dict) -> list[dict]:
     attention group holds a kernel block size only when it differs from the block size of its spec
     (v1/worker/utils.py:292-299), and the stride of its kernel-block view, which is 0 when vLLM binds the view
     unchanged (:402-403, :419-423). A Mamba view keeps the group block (:677-679).
+
+    A live worker record also holds attention_backend, the backend name or the list of the names
+    (observer.observe). The test records hold none: the import reads it only for a launch that names a backend.
     """
     entries = []
     for index, group in enumerate(cache["groups"]):
@@ -2268,7 +2273,7 @@ def test_prefix_caching_evidence_must_be_modeled_and_agree_across_ranks(tmp_path
     assert diagnostic in " ".join(result["diagnostics"])
 
 
-@pytest.mark.parametrize("workers", ["every_worker", "one_worker"])
+@pytest.mark.parametrize("workers", ["every_worker", "first_worker", "last_worker"])
 @pytest.mark.parametrize("mode", ["align", "none"])
 @pytest.mark.parametrize("layout", ["kernel_view", "mamba_hybrid"])
 @pytest.mark.parametrize("phase", ["prefill", "decode"])
@@ -2283,8 +2288,9 @@ def test_v033_worker_that_turned_prefix_caching_off_names_batch_invariance(tmp_p
             record["cache"]["prefix_caching"]["mamba_cache_mode"] = "none"
             record["resolved_config"]["cache_config"]["mamba_cache_mode"] = "none"
         # The worker process changed its own cache configuration, and the engine core kept prefix caching on.
+        ranks = {"first_worker": (0, 0), "last_worker": (1, 1)}
         if record["kind"] == "worker" and (
-            workers == "every_worker" or (record["dp_rank"], record["tp_rank"]) == (1, 1)
+            workers == "every_worker" or (record["dp_rank"], record["tp_rank"]) == ranks[workers]
         ):
             record["cache"]["prefix_caching"]["enable_prefix_caching"] = False
             record["resolved_config"]["cache_config"]["enable_prefix_caching"] = False
@@ -3414,13 +3420,14 @@ _SPEC_OF = {
         ("mamba_hybrid", "mamba", None, False),
         ("kernel_view", "latent", "no_role", False),
         ("kernel_view", "latent", "null_role", False),
-        # The two members of SparseCacheRole (kv_cache_interface.py:196-198), which the observer records by name.
+        # SparseCacheRole has the members SPARSE and INDEXER (kv_cache_interface.py:196-198), and the observer records
+        # a member by its name. Another name and the value of a member are refused.
         ("kernel_view", "latent", "DEFAULT", False),
         ("kernel_view", "latent", "sparse", False),
         # A spec inside a uniform group (kv_cache_interface.py:1291-1298).
         ("kernel_view", "latent", None, False),
         ("glm_tp4", "mamba", None, False),
-        ("kernel_view", "latent", 1, True),
+        ("kernel_view", "latent", "1/4", True),
         ("mamba_hybrid", "attention", "1/4", True),
     ],
 )
@@ -3537,6 +3544,18 @@ def test_v033_scheduler_size_tokens_truncate_the_capacity_product(tmp_path, phas
         f"tp2: {phase} scheduler of DP rank {dp} records kv_cache_size_tokens {recorded!r}, "
         "but its kv_cache_max_concurrency and max_model_len give 29251212"
     ]
+
+
+def test_v033_size_tokens_check_refuses_an_infinite_concurrency():
+    # read_json refuses Infinity before any check of the import, so only a direct call reaches this bound.
+    record = {
+        "phase": "prefill",
+        "dp_rank": 0,
+        "cache": {"kv_cache_max_concurrency": math.inf, "kv_cache_size_tokens": 0},
+        "resolved_config": {"model_config": {"max_model_len": 4096}},
+    }
+    with pytest.raises(ValueError, match="^prefill scheduler of DP rank 0 lacks a positive kv_cache_max_concurrency$"):
+        runtime_evidence._check_size_tokens(record)
 
 
 def _window_attention(record):
@@ -3780,8 +3799,9 @@ _OUTSIDE = "attention group layers lie outside their cache group: ['attn.0', 'at
         ),
         ("mamba_hybrid", "a_number", _VIEWS),
         ("mamba_hybrid", "true", _VIEWS),
-        # vLLM gives every cache group an attention group, a state or a ring group too (v1/worker/gpu/attn_utils.py:
-        # 217-265); only a spec without layer views gets none (:221-223), and the observer supports no such spec.
+        # vLLM gives every cache group an attention group, a state or a ring group too
+        # (v1/worker/gpu/attn_utils.py:217-265); only a spec without layer views gets none (:221-223), and the observer
+        # supports no such spec.
         ("mamba_hybrid", "attention_group_without_entry", _VIEWS),
         ("mamba_hybrid", "state_group_without_entry", _VIEWS),
         ("glm_tp4", "ring_group_without_entry", _VIEWS),
@@ -3823,7 +3843,11 @@ def test_v033_import_requires_audited_runner_and_backends(tmp_path, phase, layou
         elif case == "state_group_without_entry":
             del groups[1]
         elif case == "ring_group_without_entry":
-            assert groups[-1]["kv_cache_group_id"] == len(record["cache"]["groups"]) - 1
+            # The last cache group holds the rings, and only the last attention group names it.
+            ring = len(record["cache"]["groups"]) - 1
+            specs = record["cache"]["groups"][ring]["layer_specs"].values()
+            assert {spec["spec_type"] for spec in specs} == {_V033_SPEC + "CircularBufferSpec"}
+            assert [entry["kv_cache_group_id"] for entry in groups].index(ring) == len(groups) - 1
             del groups[-1]
         elif case == "unchanged":
             pass
@@ -4160,7 +4184,6 @@ def test_v033_raw_tensor_allocation_number_one_is_no_boolean(tmp_path, kind, val
     "kind,case,complete",
     [
         ("worker", "unchanged", True),
-        ("scheduler", "unchanged", True),
         ("worker", "window_64", False),
         ("scheduler", "window_missing", False),
         ("worker", "window_float", False),
@@ -4177,7 +4200,7 @@ def test_v033_raw_window_must_be_the_window_of_the_cache_record(tmp_path, kind, 
     def edit(record):
         group = record["raw_cache_config"]["groups"][0]
         assert (group["spec_type"], group["sliding_window"]) == (_V033_SPEC + "SlidingWindowSpec", 32)
-        del group["attention_chunk_size"]
+        assert "attention_chunk_size" not in group
         group["extra_retained_tokens"] = 0
         if (record["kind"], record["phase"], record["dp_rank"]) != (kind, "decode", 1):
             return
@@ -4643,14 +4666,15 @@ def test_v033_scheduler_hash_block_size_fits_its_cache_groups(specs, unit, expec
     [
         # Two replay windows: the two groups cannot both stay out. 64 tokens, which needs that, is no hash block size.
         ((64, 128), [16, 32], False),
-        # One window, and records without the field: today's result.
+        # One window, and records without the field: both window groups may stay out, so 64 tokens is a size.
         ((64, 64), [16, 32, 64], True),
         ((None, None), [16, 32, 64], True),
-        # A group without a positive integer window may stay out with any window: today's result.
+        # A group without a positive integer window may stay out with any window.
         ((None, 64), [16, 32, 64], True),
         (("64", 64), [16, 32, 64], True),
         ((True, 64), [16, 32, 64], True),
         ((-64, 64), [16, 32, 64], True),
+        ((0, 64), [16, 32, 64], True),
     ],
 )
 def test_v033_replay_windows_of_sliding_mla_groups_must_agree(windows, sizes, fits_with_a_unit):
@@ -4708,6 +4732,15 @@ def test_v033_replay_windows_of_sliding_mla_groups_must_agree(windows, sizes, fi
             [32, 64],
             True,
         ),
+        # The same unit fits only with the larger window out: the 96-token group of window 2 stays out, and the
+        # 128-token group of window 1 takes part.
+        (
+            [("FullAttentionSpec", 64, None), ("SlidingWindowMLASpec", 96, 2), ("SlidingWindowMLASpec", 128, 1)],
+            64,
+            64,
+            [32, 64],
+            True,
+        ),
         # The group without a window may stay out or take part with the group of window 64. When it takes part, vLLM
         # hashes in 32 tokens.
         (
@@ -4718,7 +4751,13 @@ def test_v033_replay_windows_of_sliding_mla_groups_must_agree(windows, sizes, fi
             True,
         ),
     ],
-    ids=["two_windows_gcd", "two_windows_none_out", "two_windows_unit", "group_without_a_window"],
+    ids=[
+        "two_windows_gcd",
+        "two_windows_both_out",
+        "two_windows_unit",
+        "two_windows_unit_larger_window_out",
+        "group_without_a_window",
+    ],
 )
 def test_v033_groups_of_one_replay_window_stay_out(specs, unit, hash_block, sizes, fits):
     groups = [
@@ -4740,6 +4779,72 @@ def test_v033_groups_of_one_replay_window_stay_out(specs, unit, hash_block, size
         )
         is fits
     )
+
+
+def _sliding_mla_groups(record, windows, hash_block):
+    # The two Mamba groups of mamba_hybrid as SlidingWindowMLASpec groups of 96 and 80 tokens, beside the attention
+    # group of 64 tokens. Each layer keeps its place in the tensor: 10 blocks of one 8,192-byte page.
+    cache, mla = record["cache"], _V033_SPEC + "SlidingWindowMLASpec"
+    for index, (block, window) in enumerate(zip((96, 80), windows, strict=True), start=1):
+        group = cache["groups"][index]
+        names = group["layer_names"]
+        spec = {
+            "spec_type": mla,
+            "page_size_bytes": 8192,
+            "dtype": "torch.bfloat16",
+            "tokens_per_state": 1,
+            "cache_role": None,
+        }
+        group.update(spec_type=mla, block_size_tokens=block, dtype="torch.bfloat16", sliding_window=window)
+        group["layer_specs"] = {name: dict(spec) for name in names}
+        group.pop("state", None)
+        if record["kind"] == "worker":
+            group.update(kind="attention", layer_classes=dict.fromkeys(names, "example.SlidingCache"))
+            for position, name in enumerate(names):
+                cache["layer_tensors"][name] = [
+                    {
+                        "storage_id": "s0",
+                        "storage_offset_bytes": position * 81_920,
+                        "shape": [10, 2, 64, 32],
+                        "stride_bytes": [8192, 4096, 64, 2],
+                        "element_size_bytes": 2,
+                        "block_axis": 0,
+                        "kernel_block_size_tokens": block,
+                        "kernel_block_stride": 0,
+                    }
+                ]
+    if record["kind"] == "worker":
+        cache["model_runner"]["kernel_block_sizes"] = [16, 96, 80]
+        cache["prefix_caching"]["mamba_cache_mode"] = "none"
+    else:
+        # The scheduler block is the LCM of 64, 96 and 80 tokens.
+        cache.update(block_size=960, hash_block_size=hash_block, mamba_cache_mode="none")
+        cache["prefix_caching"].update(block_size=960, hash_block_size=hash_block, mamba_cache_mode="none")
+    record["resolved_config"]["cache_config"]["mamba_cache_mode"] = "none"
+
+
+@pytest.mark.parametrize(
+    "windows,hash_block,diagnostic",
+    [
+        # One window: both window groups stay out, and vLLM hashes in the 64 tokens of the attention group.
+        ((64, 64), 64, None),
+        # Two windows: the 80-token group stays out, and vLLM hashes in gcd(64, 96) = 32 tokens.
+        ((64, 128), 32, None),
+        # Two windows: 64 tokens needs both groups out.
+        ((64, 128), 64, _BLOCK_SIZES),
+    ],
+    ids=["one_window_both_out", "two_windows_one_out", "two_windows_both_out"],
+)
+def test_v033_import_lets_window_groups_stay_out_only_when_their_windows_are_one(
+    tmp_path, windows, hash_block, diagnostic
+):
+    path, launches = observation_fixture(tmp_path, layout="mamba_hybrid")
+    _mutate(path, lambda record: _sliding_mla_groups(record, windows, hash_block))
+    result = validate_observations(path, launches)["tp2"]
+    if diagnostic is None:
+        assert (result["status"], result["diagnostics"]) == ("complete", [])
+        return
+    assert result["diagnostics"] == [f"tp2: {diagnostic}"]
 
 
 @pytest.mark.parametrize("spec", ["MLAAttentionSpec", "MambaSpec"])
