@@ -627,6 +627,11 @@ def setup_distributed(device):
     atexit.register(_shutdown_distributed, rendezvous_dir)
     init_method = (Path(rendezvous_dir) / "store").as_uri()
 
+    # vllm-ascend v0.30.0rc2, vllm_ascend/worker/worker.py:
+    # NPUWorker._init_worker_distributed_environment explicitly selects HCCL.
+    # Direct vLLM initialization defaults to NCCL, bypassing worker selection.
+    backend_kwargs = {"backend": "hccl"} if target_device.type == "npu" else {}
+
     # Keep ambient serving/launcher DP settings from changing this local
     # module benchmark into a multi-rank group. Do not mutate launcher env.
     with set_current_vllm_config(VllmConfig()):
@@ -635,6 +640,7 @@ def setup_distributed(device):
             rank=0,
             local_rank=local_rank,
             distributed_init_method=init_method,
+            **backend_kwargs,
         )
         ensure_model_parallel_initialized(1, 1)
 

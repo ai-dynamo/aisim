@@ -24,13 +24,12 @@ from collector.op_plans import plan_cases
 
 # The stock vLLM harness utilities reused here are device-neutral:
 # create_vllm_config builds a plain VllmConfig from a local fake HF model and
-# setup_distributed does a single-rank FileStore init whose process-group
-# backend comes from vLLM's own platform plugin (HCCL under vllm-ascend).
+# setup_distributed does a single-rank FileStore init with HCCL explicitly
+# selected for NPU devices, matching vllm-ascend's worker initialization.
 # The XPU fork (utils_xpu) stays off-limits to non-XPU collectors
 # (tests/unit/collector/test_vllm_xpu_utils.py), and its env://+port rendezvous
 # is prone to port conflicts in multi-worker runs; the stock FileStore
 # rendezvous is the robust default here.
-# TODO: on-device campaign — confirm that the single-rank init selects the HCCL PG.
 from collector.vllm.utils import create_vllm_config, setup_distributed, with_exit_stack
 from vllm.config import set_current_vllm_config
 from vllm.model_executor.layers.linear import RowParallelLinear
