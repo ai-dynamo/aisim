@@ -256,6 +256,17 @@ impl PerfRow {
             })
     }
 
+    /// FLOAT or DOUBLE, widened without rounding to f64 at an import boundary.
+    pub(crate) fn f64_widened(&self, col: usize) -> Result<f64, AicError> {
+        self.row
+            .get_double(col)
+            .or_else(|_| self.row.get_float(col).map(f64::from))
+            .map_err(|source| AicError::Parquet {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     /// BOOLEAN column, with fallbacks mirroring Python's `_to_bool` string
     /// coercion (`str(value).strip().lower() in {"1","true","yes","y"}`) for
     /// files that store flags as INT64 or strings.

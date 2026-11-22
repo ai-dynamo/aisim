@@ -36,6 +36,7 @@ def build_profile(
     *,
     repository: str,
     routing: str = "balanced",
+    output_path: str | Path | None = None,
 ) -> tuple[dict[str, Any], Counter[str]]:
     """Convert one directory of raw MegaMoE benchmark results into a profile document.
 
@@ -44,11 +45,12 @@ def build_profile(
     check are skipped and counted in the returned summary.
     """
 
-    files = sorted(Path(results_dir).glob("*.json"))
+    excluded = Path(output_path).resolve() if output_path is not None else None
+    files = sorted(path for path in Path(results_dir).glob("*.json") if excluded is None or path.resolve() != excluded)
     if not files:
         raise ValueError(f"no benchmark results in {results_dir}")
     summary: Counter[str] = Counter()
-    source: dict[str, str] | None = None
+    source: dict[str, Any] | None = None
     entries: list[dict[str, Any]] = []
     seen: dict[tuple[Any, ...], str] = {}
     for path in files:
@@ -62,6 +64,7 @@ def build_profile(
             "commit": payload["source"]["commit"],
             "benchmark": payload["schema"],
             "boundary": payload["measurement_boundary"],
+            "boundary_components": payload.get("measurement_boundary_components"),
         }
         if source is None:
             source = current
@@ -161,8 +164,10 @@ def main(argv: list[str] | None = None) -> int:
         "--output", required=True, help="profile .parquet path (native) or .json import document to write"
     )
     args = parser.parse_args(argv)
-    profile, summary = build_profile(args.results_dir, repository=args.repository, routing=args.routing)
     output = Path(args.output)
+    profile, summary = build_profile(
+        args.results_dir, repository=args.repository, routing=args.routing, output_path=output
+    )
     # Stage beside the destination so publication is an atomic replacement on
     # the same filesystem. Failed validation must preserve an existing profile.
     with tempfile.TemporaryDirectory(prefix=f".{output.name}.", dir=output.parent) as temporary:

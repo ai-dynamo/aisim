@@ -191,6 +191,7 @@ struct Source {
     commit: String,
     benchmark: String,
     boundary: String,
+    boundary_components: Vec<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -305,6 +306,11 @@ impl Document {
             ));
         }
         let s = &self.source;
+        if s.boundary_components != ["dispatch", "experts", "return", "combine"] {
+            return Err(invalid(
+                "FastAFD boundary_components must be dispatch, experts, return, combine (no router)",
+            ));
+        }
         if !text(&s.repository)
             || !digest(&s.commit, 40)
             || !text(&s.benchmark)
@@ -447,7 +453,7 @@ impl FastAfdTable {
                 entries.push(Entry {
                     key: serde_json::from_value(Value::Object(key))
                         .map_err(|e| invalid(e.to_string()))?,
-                    latency_ms: row.f64(latency)?,
+                    latency_ms: row.f64_widened(latency)?,
                     model_profile: capture.model_profile,
                     measurement: capture.measurement,
                     validation: capture.validation,
@@ -533,7 +539,7 @@ impl FastAfdTable {
             ffn_ms: e.latency_ms / (f64::from(e.key.moe_layers) * f64::from(e.key.microbatches)),
             num_layers: e.key.moe_layers,
             stage: json!({"profile_path":self.path,"profile_sha256":self.sha256,"key":e.key,"latency_ms":e.latency_ms,
-                "provider":"fastafd","schema":"aisimulate.fastafd-moe-stage.v1","repository":s.repository,"source_commit":s.commit,"benchmark":s.benchmark,"boundary":s.boundary,
+                "provider":"fastafd","schema":"aisimulate.fastafd-moe-stage.v1","repository":s.repository,"source_commit":s.commit,"benchmark":s.benchmark,"boundary":s.boundary,"boundary_components":s.boundary_components,
                 "model_profile":e.model_profile,"method":c.method,"method_version":c.method_version,"statistic":c.statistic,"sample_count":c.sample_count,
                 "cv_percent":c.cv_percent,"routing":c.routing,"source_tree_sha256":c.source_tree_sha256,"raw_artifact":c.raw_artifact,"raw_sha256":c.raw_sha256,"correctness":e.validation.correctness}),
         })
@@ -551,7 +557,7 @@ mod tests {
         // Each of the six pipeline units therefore costs exactly 2 ms.
         let document = json!({
             "schema":"aisimulate.fastafd-moe-stage.v1", "lookup_policy":"exact-only",
-            "source":{"repository":"https://example.invalid/fixture","commit":"0".repeat(40),"benchmark":"synthetic","boundary":"complete stage"},
+            "source":{"repository":"https://example.invalid/fixture","commit":"0".repeat(40),"benchmark":"synthetic","boundary":"complete stage","boundary_components":["dispatch","experts","return","combine"]},
             "entries":[{"key":{"model_path":"synthetic","system":"gb200","stage":"afd","topology":"4A8F","logical_batch_per_source_rank":128,"mtp_nextn":0,"microbatches":2,"moe_layers":3,"routed_topk":8,"moe_precision":"fp8","moe_backend":"megamoe"},
                 "latency_ms":12.0,"model_profile":"synthetic",
                 "measurement":{"scope":"complete_moe_stage","method":"synthetic","method_version":"1","statistic":"p50","sample_count":40,"cv_percent":0.5,"routing":"balanced","source_tree_sha256":"a".repeat(64),"raw_artifact":"fixture.json","raw_sha256":"b".repeat(64)},
@@ -622,10 +628,17 @@ mod tests {
         assert!(model.estimate_fastafd_stage(127).is_err());
         assert!(model.estimate_fastafd_stage(0).is_err());
         assert!(model.tune_with_fpms(&[Vec::new()]).is_err());
+        let error = model.tune_with_fpms(&[]).unwrap_err();
+        assert!(matches!(error, AicError::InvalidEngineConfig(_)));
+        assert!(error.to_string().contains("cannot be tuned"));
     }
 
     fn parquet_snapshot(document: &Value) -> bytes::Bytes {
-        use parquet::data_type::{ByteArray, ByteArrayType, DoubleType, Int64Type};
+        parquet_snapshot_with_latency_type(document, false)
+    }
+
+    fn parquet_snapshot_with_latency_type(document: &Value, float: bool) -> bytes::Bytes {
+        use parquet::data_type::{ByteArray, ByteArrayType, DoubleType, FloatType, Int64Type};
         use parquet::file::properties::WriterProperties;
         use parquet::file::writer::SerializedFileWriter;
         use parquet::schema::parser::parse_message_type;
@@ -649,7 +662,7 @@ mod tests {
             .iter()
             .map(|(name, value)| {
                 let data_type = if name == "latency_ms" {
-                    "DOUBLE"
+                    if float { "FLOAT" } else { "DOUBLE" }
                 } else if value.is_number() {
                     "INT64"
                 } else {
@@ -671,10 +684,17 @@ mod tests {
             for (name, value) in fields(document, entry) {
                 let mut column = group.next_column().unwrap().unwrap();
                 if name == "latency_ms" {
-                    column
-                        .typed::<DoubleType>()
-                        .write_batch(&[value.as_f64().unwrap()], None, None)
-                        .unwrap();
+                    if float {
+                        column
+                            .typed::<FloatType>()
+                            .write_batch(&[value.as_f64().unwrap() as f32], None, None)
+                            .unwrap();
+                    } else {
+                        column
+                            .typed::<DoubleType>()
+                            .write_batch(&[value.as_f64().unwrap()], None, None)
+                            .unwrap();
+                    }
                 } else if let Some(value) = value.as_i64() {
                     column
                         .typed::<Int64Type>()
@@ -691,6 +711,100 @@ mod tests {
             group.close().unwrap();
         }
         writer.into_inner().unwrap().into()
+    }
+
+    #[test]
+    fn canonical_stage_accepts_float_and_double_latency() {
+        let (_fixture, mut config) = fixture();
+        for float in [false, true] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            file.write_all(&parquet_snapshot_with_latency_type(
+                &fixture_document(),
+                float,
+            ))
+            .unwrap();
+            config
+                .estimator_config
+                .fastafd_stage
+                .as_mut()
+                .unwrap()
+                .profile_path = file.path().into();
+            let model = ForwardPassPerfModel::best_available(config.clone()).unwrap();
+            // Synthetic 12 ms / (three layers * two microbatches).
+            assert_eq!(model.estimate_fastafd_stage(128).unwrap().ffn_ms, 2.0);
+        }
+    }
+
+    #[test]
+    fn canonical_stage_rejects_incompatible_measurement_boundaries() {
+        let (_fixture, mut config) = fixture();
+        for components in [
+            json!(["dispatch", "experts", "return"]),
+            json!(["router", "dispatch", "experts", "return", "combine"]),
+            json!(["experts", "return", "combine"]),
+            json!(["dispatch", "experts", "combine"]),
+            Value::Null,
+        ] {
+            let mut document = fixture_document();
+            document["source"]["boundary_components"] = components;
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            file.write_all(&parquet_snapshot(&document)).unwrap();
+            config
+                .estimator_config
+                .fastafd_stage
+                .as_mut()
+                .unwrap()
+                .profile_path = file.path().into();
+            let error = ForwardPassPerfModel::best_available(config.clone())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("boundary_components") || error.contains("invalid type"),
+                "{error}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_stage_rejects_non_utf8_paths_and_symlink_targets() {
+        use std::os::unix::{ffi::OsStrExt, fs::symlink};
+        let (_fixture, mut config) = fixture();
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"stage-\xff.parquet"));
+        std::fs::write(&target, parquet_snapshot(&fixture_document())).unwrap();
+        let link = directory.path().join("stage.parquet");
+        symlink(&target, &link).unwrap();
+        for path in [target, link] {
+            config
+                .estimator_config
+                .fastafd_stage
+                .as_mut()
+                .unwrap()
+                .profile_path = path;
+            let error = ForwardPassPerfModel::best_available(config.clone()).unwrap_err();
+            assert!(matches!(error, AicError::InvalidEngineConfig(_)));
+            assert!(
+                error
+                    .to_string()
+                    .contains("canonical FastAFD profile_path must be UTF-8")
+            );
+        }
+    }
+
+    #[test]
+    fn empty_tuning_remains_a_noop_for_other_modes() {
+        let mut config = ForwardPassPerfModelConfig::new(
+            "synthetic",
+            "gb200",
+            BackendKind::Sglang,
+            ForwardPassWorkerType::Decode,
+        );
+        config.estimation_mode = EstimationMode::FpmRegression;
+        let mut model = ForwardPassPerfModel::best_available(config).unwrap();
+        model.tune_with_fpms(&[]).unwrap();
     }
 
     #[test]

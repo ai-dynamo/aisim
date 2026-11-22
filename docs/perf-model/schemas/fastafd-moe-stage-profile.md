@@ -3,8 +3,8 @@
 A profile is a parquet table or legacy JSON import document owned by AISimulate
 that carries exact measurements of
 the complete decode MoE stage, produced by FastAFD's MegaMoE model benchmarks.
-AISimulate reads the profile and never imports, installs, or runs FastAFD; no
-FastAFD change is required to load a profile. Lookup is exact-match only, and a
+AISimulate reads the profile and never imports, installs, or runs FastAFD.
+Lookup is exact-match only, and a
 missing measurement is an error, not an estimate.
 
 ## Native parquet table
@@ -12,7 +12,8 @@ missing measurement is an error, not an estimate.
 The Rust table loader reads the eleven `key` fields below as individual columns:
 identity strings as UTF-8 and count columns (`logical_batch_per_source_rank`,
 `mtp_nextn`, `microbatches`, `moe_layers`, `routed_topk`) as signed INT64, plus a floating-point
-`latency_ms`. `source_json` contains the source object; `capture_json` contains
+`latency_ms` (Parquet FLOAT or DOUBLE; FLOAT is widened to f64).
+`source_json` contains the source object; `capture_json` contains
 exactly `model_profile`, `measurement`, and `validation` from the JSON entry.
 The source must be identical for all rows. These JSON columns preserve raw
 capture metadata; selection and latency normalization run in Rust through the
@@ -39,7 +40,8 @@ inspection and conversion; production AFD timing does not use their lookup API.
     "repository": "https://github.com/<owner>/FastAFD",
     "commit": "<40-character git commit>",
     "benchmark": "fastafd.megamoe-colocated-model-benchmark.v2",
-    "boundary": "<the benchmark's own description of what the measured interval covers>"
+    "boundary": "<the benchmark's own description of what the measured interval covers>",
+    "boundary_components": ["dispatch", "experts", "return", "combine"]
   },
   "entries": [
     {
@@ -83,6 +85,15 @@ repository; a fork or a modified tree is recorded as such, and each entry's
 `source_tree_sha256` identifies the exact tree, so uncommitted modifications are
 visible as a tree that differs from the commit.
 
+| Source field | Required value | Behavior |
+| --- | --- | --- |
+| `boundary` | Nonempty description | Preserves the benchmark's own interval description as provenance. |
+| `boundary_components` | `["dispatch", "experts", "return", "combine"]` | Explicit ordered interval contract. Includes A-side combine and excludes the router, which attention charges separately. Missing or incompatible metadata is rejected before prediction. |
+
+The description alone cannot establish the interval contract. Existing import
+documents without `boundary_components` must be annotated from verified capture
+evidence before conversion; do not infer coverage from `scope` or benchmark names.
+
 The `key` identifies the model, hardware, stage (`agg` for a colocated EP group,
 `afd` for an attention/FFN split), topology (`ep<N>` or `<A>A<F>F`), per-source-rank
 batch, MTP degree, microbatches, measured MoE layer count, top-k, MoE precision, and
@@ -113,5 +124,11 @@ from one directory of raw benchmark results (one benchmark, one commit) into a
 profile. Results with another routing distribution (`--routing`, default
 `balanced`), an unstable timing, or a failed correctness check are skipped and
 counted. Repeated measurements of one key are an error; keep one run per directory.
+The designated output is excluded from input discovery, so the same command can
+replace a JSON profile inside the results directory. Other unsupported inputs fail.
+Raw results must include `measurement_boundary_components` with the exact ordered
+components above, in addition to the free-form `measurement_boundary` description.
+For older captures, verify the measured interval from the recorded benchmark tree
+before annotating this metadata. The builder never assumes a complete boundary.
 The raw results, the benchmark revision, and the procedure stay with the profile so
 that every entry can be traced to its evidence.

@@ -443,6 +443,12 @@ impl ForwardPassPerfModel {
                 path: path.clone(),
                 source,
             })?;
+            if path.to_str().is_none() {
+                return Err(AicError::InvalidEngineConfig(
+                    "canonical FastAFD profile_path must be UTF-8 for provenance serialization"
+                        .into(),
+                ));
+            }
             let table = load_stage(&config)?;
             config.moe_quant_mode = Some(table.precision().to_owned());
             return Ok(Self {
@@ -756,6 +762,11 @@ impl ForwardPassPerfModel {
         &mut self,
         iterations: &[Vec<ForwardPassMetrics>],
     ) -> Result<(), AicError> {
+        if matches!(self.mode, ForwardPassPerfMode::FastafdStage(_)) {
+            return Err(AicError::InvalidEngineConfig(
+                "measured FastAFD stage timing cannot be tuned".into(),
+            ));
+        }
         let Self {
             mode,
             options,

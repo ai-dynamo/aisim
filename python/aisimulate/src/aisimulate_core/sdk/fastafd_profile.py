@@ -58,6 +58,7 @@ class FastAFDProfileSource:
     commit: str
     benchmark: str
     boundary: str
+    boundary_components: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,7 @@ class FastAFDMoEStageMeasurement:
             "source_commit": self.source.commit,
             "benchmark": self.source.benchmark,
             "boundary": self.source.boundary,
+            "boundary_components": list(self.source.boundary_components),
             "model_profile": self.model_profile,
             "method": self.method,
             "method_version": self.method_version,
@@ -187,12 +189,20 @@ class FastAFDMoEStageProfile:
             raise ValueError(f"unsupported FastAFD profile schema: {root['schema']!r}")
         if root["lookup_policy"] != "exact-only":
             raise ValueError("FastAFD profile lookup_policy must be 'exact-only'")
-        origin = _object(root["source"], {"repository", "commit", "benchmark", "boundary"}, "source")
+        origin = _object(
+            root["source"], {"repository", "commit", "benchmark", "boundary", "boundary_components"}, "source"
+        )
+        # A complete stage includes the A-side combine and excludes the router,
+        # which is charged separately by the attention provider. Never infer
+        # this contract from the free-form provenance description.
+        if origin["boundary_components"] != ["dispatch", "experts", "return", "combine"]:
+            raise ValueError("source.boundary_components must be dispatch, experts, return, combine (no router)")
         source = FastAFDProfileSource(
             repository=_text(origin["repository"], "source.repository"),
             commit=_digest(origin["commit"], _SHA1, "source.commit"),
             benchmark=_text(origin["benchmark"], "source.benchmark"),
             boundary=_text(origin["boundary"], "source.boundary"),
+            boundary_components=tuple(origin["boundary_components"]),
         )
         if not isinstance(root["entries"], list) or not root["entries"]:
             raise ValueError("FastAFD profile entries must be a non-empty list")

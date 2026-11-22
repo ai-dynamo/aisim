@@ -25,6 +25,7 @@ def _colocated(tokens, *, routing="balanced", stable=True, p50=12.0, correctness
         "schema": "fastafd.megamoe-colocated-model-benchmark.v2",
         "system_label": "gb200",
         "measurement_boundary": "colocated MoE stage",
+        "measurement_boundary_components": ["dispatch", "experts", "return", "combine"],
         "primary_backend": "mega",
         "model_profile": _MODEL,
         "topology": {"ep_size": 8},
@@ -42,6 +43,7 @@ def _split(sequences):
         "schema": "fastafd.moe-m2n-model-benchmark.v2",
         "system_label": "gb200",
         "measurement_boundary": "split AFD MoE stage",
+        "measurement_boundary_components": ["dispatch", "experts", "return", "combine"],
         "moe_backend": "megamoe",
         "model_profile": _MODEL,
         "topology": {"ag_size": 16, "eg_size": 8},
@@ -82,6 +84,7 @@ def test_builds_colocated_profile_and_skips_unqualified_results(tmp_path):
         "commit": "0" * 40,
         "benchmark": "fastafd.megamoe-colocated-model-benchmark.v2",
         "boundary": "colocated MoE stage",
+        "boundary_components": ["dispatch", "experts", "return", "combine"],
     }
     entry = profile["entries"][0]
     assert entry["key"] == {
@@ -230,3 +233,37 @@ def test_invalid_timing_preserves_existing_profile(tmp_path, suffix):
     assert output.read_bytes() == original
     assert FastAFDMoEStageProfile.load(output).entries[0].latency_ms == 12.0
     assert sorted(path.name for path in tmp_path.iterdir()) == [output.name, "results"]
+
+
+def test_repeated_build_excludes_only_designated_output(tmp_path):
+    _write(tmp_path, "capture.json", _split(64))
+    output = tmp_path / "profile.json"
+    args = [str(tmp_path), "--repository", _REPOSITORY, "--output", str(output)]
+    assert main(args) == 0
+    original = output.read_bytes()
+    assert main(args) == 0
+    assert output.read_bytes() == original
+    assert FastAFDMoEStageProfile.load(output).entries[0].latency_ms == 11.4
+
+    # Arbitrary unsupported inputs must still fail; only --output is excluded.
+    _write(tmp_path, "unsupported.json", {"schema": "unsupported"})
+    with pytest.raises(ValueError, match="unsupported benchmark schema"):
+        main(args)
+    assert output.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "components",
+    [None, ["dispatch", "experts", "return"], ["router", "dispatch", "experts", "return", "combine"]],
+)
+def test_builder_rejects_unverified_or_incompatible_boundary(tmp_path, components):
+    payload = _split(64)
+    if components is None:
+        del payload["measurement_boundary_components"]
+    else:
+        payload["measurement_boundary_components"] = components
+    _write(tmp_path, "capture.json", payload)
+    output = tmp_path / "profile.json"
+    with pytest.raises(ValueError, match="boundary_components"):
+        main([str(tmp_path), "--repository", _REPOSITORY, "--output", str(output)])
+    assert not output.exists()

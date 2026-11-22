@@ -86,6 +86,7 @@ def _profile(tmp_path, entries=None) -> str:
                     "commit": "0" * 40,
                     "benchmark": "fastafd.moe-m2n-model-benchmark.v2",
                     "boundary": "split AFD MoE stage",
+                    "boundary_components": ["dispatch", "experts", "return", "combine"],
                 },
                 "entries": [_entry()] if entries is None else entries,
             }
@@ -181,6 +182,21 @@ def test_stage_latency_is_spread_over_layer_microbatch_units(tmp_path):
     assert provenance["attention"]["components"] == COMPONENTS
     assert provenance["attention"]["provider"] == "aic"
     assert set(provenance["composition"]) == {"attention_ms", "ffn_ms", "a_to_f_ms", "f_to_a_ms"}
+
+
+@pytest.mark.parametrize(
+    "components",
+    [None, ["dispatch", "experts", "return"], ["router", "dispatch", "experts", "return", "combine"]],
+)
+def test_matching_capture_with_incompatible_boundary_is_infeasible(tmp_path, components):
+    path = Path(_profile(tmp_path))
+    payload = json.loads(path.read_text())
+    payload["source"]["boundary_components"] = components
+    path.write_text(json.dumps(payload))
+    # The key matches, but recomposition cannot remove combine or charge a
+    # router twice just because the description calls this a complete stage.
+    with pytest.raises(AFDInfeasible, match="boundary_components"):
+        _provider(tmp_path, profile_path=path).measure(_request(_topology()))
 
 
 @pytest.mark.parametrize("response", ["extra-prefill", "extra-invalid", "prefill", "invalid", "empty", "duplicate"])

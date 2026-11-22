@@ -62,6 +62,7 @@ def _payload(entries=None):
             "commit": _COMMIT,
             "benchmark": "fastafd.moe-m2n-model-benchmark.v2",
             "boundary": "split AFD MoE stage",
+            "boundary_components": ["dispatch", "experts", "return", "combine"],
         },
         "entries": [_entry()] if entries is None else entries,
     }
@@ -85,6 +86,7 @@ def test_exact_lookup_preserves_source_and_method(tmp_path):
     assert provenance["repository"] == _REPOSITORY
     assert provenance["source_commit"] == _COMMIT
     assert provenance["benchmark"] == "fastafd.moe-m2n-model-benchmark.v2"
+    assert provenance["boundary_components"] == ["dispatch", "experts", "return", "combine"]
     assert provenance["method"] == "cuda_event"
     assert provenance["source_tree_sha256"] == "c" * 64
     assert provenance["correctness"] is None
@@ -258,8 +260,9 @@ def test_rejects_non_int64_parquet_counts(tmp_path, column, encoding):
 
 
 @pytest.mark.parametrize("location", ["direct", "symlink", "extensionless"])
-@pytest.mark.parametrize("profile_format", ["json", "parquet"])
-def test_profile_loads_through_canonical_model_preserving_source(tmp_path, location, profile_format):
+@pytest.mark.parametrize("profile_format", ["json", "parquet", "parquet-float"])
+@pytest.mark.parametrize("mode_field", ["estimation_mode", "forward_model"])
+def test_profile_loads_through_canonical_model_preserving_source(tmp_path, location, profile_format, mode_field):
     from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     payload = _payload()
@@ -269,9 +272,17 @@ def test_profile_loads_through_canonical_model_preserving_source(tmp_path, locat
     payload["entries"][0]["latency_ms"] = 12.0
     path = _write(tmp_path, payload)
     profile = FastAFDMoEStageProfile.load(path)
-    if profile_format == "parquet":
+    if profile_format != "json":
         path = tmp_path / "stage.parquet"
         profile.write_parquet(path)
+        if profile_format == "parquet-float":
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            table = pq.read_table(path)
+            index = table.schema.get_field_index("latency_ms")
+            table = table.set_column(index, "latency_ms", table.column(index).cast(pa.float32()))
+            pq.write_table(table, path)
     if location != "direct":
         target = path.with_suffix("")
         path.rename(target)
@@ -299,12 +310,29 @@ def test_profile_loads_through_canonical_model_preserving_source(tmp_path, locat
         },
         estimator_config={"fastafd_stage": {"profile_path": str(path)}},
     )
+    if mode_field == "forward_model":
+        config = config.to_dict()
+        config["forward_model"] = config.pop("estimation_mode")
     model = RustForwardPassPerfModel.best_available(config)
     estimate = model.estimate_fastafd_stage(48)
     assert estimate["ffn_ms"] == 2.0
+    assert estimate["stage"]["boundary_components"] == ["dispatch", "experts", "return", "combine"]
     assert estimate["stage"]["profile_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
     assert estimate["stage"]["profile_path"] == str(path.resolve())
     saved = model.diagnostics()["provenance"]["config"]
     assert saved["estimator_config"]["fastafd_stage"]["profile_path"] == str(path.resolve())
     restored = RustForwardPassPerfModel.best_available(saved)
     assert restored.estimate_fastafd_stage(48) == model.estimate_fastafd_stage(48)
+    with pytest.raises(ValueError, match="cannot be tuned"):
+        model.tune_with_fpms([])
+
+
+@pytest.mark.parametrize(
+    "components",
+    [None, ["dispatch", "experts", "return"], ["router", "dispatch", "experts", "return", "combine"]],
+)
+def test_inspection_rejects_unverified_or_incompatible_boundary(tmp_path, components):
+    payload = _payload()
+    payload["source"]["boundary_components"] = components
+    with pytest.raises(ValueError, match="boundary_components"):
+        FastAFDMoEStageProfile.load(_write(tmp_path, payload))
