@@ -2923,7 +2923,7 @@ def _unmarked_cold_plan(grouped_case, tmp_path, capsys):
 @pytest.mark.parametrize(
     "text",
     [
-        # The texts that earlier releases recorded for this profile, and any other text.
+        # Two older wordings of this requirement, and any other text.
         _COLD + "grouped FPM cache prefix caching requires every cache group to declare prefix_cacheable; "
         "set prefix_cacheable (true or false) on each cache group of the profile",
         _COLD + "grouped FPM cache prefix caching requires every cache group to declare prefix_cacheable; "
@@ -2960,10 +2960,14 @@ def test_grouped_cold_plan_verifies_with_the_reason_text_that_it_was_saved_with(
             cli.main(command)
         assert "reached the step after the plan check" in capsys.readouterr().err
     assert (plan / "support-plan.json").read_bytes() == before
+    # `onboard plan --overwrite` writes the text of the planner.
+    assert cli.main(["onboard", "plan", "--config", str(config), "--output-dir", str(plan), "--overwrite"]) == 0
+    saved = json.loads((plan / "support-plan.json").read_text())
+    assert saved["fpm"]["prefix_caching_reason"] == _COLD + _REFUSAL_TEXT["unmarked_group"]
 
 
 @reads_saved_config
-@pytest.mark.parametrize("value", [None, 0, ["text"], {"text": "text"}])
+@pytest.mark.parametrize("value", [None, 0, 1.5, True, False, ["text"], {"text": "text"}])
 def test_grouped_cold_plan_with_a_recorded_reason_that_is_not_a_string_is_refused(
     grouped_case, tmp_path, capsys, value
 ):
@@ -2973,6 +2977,100 @@ def test_grouped_cold_plan_with_a_recorded_reason_that_is_not_a_string_is_refuse
     _set_saved_reason(plan, value)
     with pytest.raises(ValueError, match="support-plan.json was modified; choose a new output directory"):
         check_plan(request, plan)
+
+
+@reads_saved_config
+@pytest.mark.parametrize("fpm", [["text"], "text", None])
+def test_grouped_cold_plan_whose_fpm_block_is_not_an_object_is_refused(grouped_case, tmp_path, capsys, fpm):
+    from aisim.support.plan import check_plan
+
+    plan, request = _unmarked_cold_plan(grouped_case, tmp_path, capsys)
+    path = plan / "support-plan.json"
+    saved = json.loads(path.read_text())
+    if fpm is None:
+        del saved["fpm"]
+    else:
+        saved["fpm"] = fpm
+    path.write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n")
+    with pytest.raises(ValueError, match="support-plan.json was modified; choose a new output directory"):
+        check_plan(request, plan)
+
+
+@reads_saved_config
+@pytest.mark.parametrize("worker_type", [None, "decode"])
+def test_grouped_plan_saved_cold_with_its_reason_verifies_when_a_later_release_plans_it_warm(
+    grouped_case, tmp_path, capsys, monkeypatch, worker_type
+):
+    # A later release that models one more vLLM version plans this profile warm. A plan that was saved cold, with
+    # its reason or without it, keeps verifying until `onboard plan --overwrite` writes it again.
+    from aisim.config import engine
+    from aisim.support import plan as plan_module
+
+    profile, _root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version="0.30.0")
+    for deployment in profile["deployments"]:
+        if worker_type is not None:
+            deployment["worker_type"] = worker_type
+    stderr, files = _onboarding_plan(profile, tmp_path, capsys, "0.30.0", worker_type=worker_type)
+    assert stderr.strip() == _plan_reason(files) == _not_modeled("0.30.0")
+    plan = tmp_path / "collection"
+    request = SupportRequest.from_yaml(plan / "request.yaml")
+    with_reason = (plan / "support-plan.json").read_bytes()
+    later = ("0.30.0", *engine.GROUPED_PREFIX_CACHING_VERSIONS)
+    monkeypatch.setattr(engine, "GROUPED_PREFIX_CACHING_VERSIONS", later)
+    monkeypatch.setattr(engine, "GROUPED_PD_VERSIONS", later)
+    monkeypatch.setattr(plan_module, "GROUPED_PREFIX_CACHING_VERSIONS", later)
+    # The stand-in for the later release plans the profile warm.
+    current, documents = plan_module._plan_documents(request, plan)
+    assert "prefix_caching_reason" not in current["fpm"]
+    pilot = "worker.yaml" if worker_type else "predict/pilot.yaml"
+    worker = yaml.safe_load(documents[Path(pilot)])["engine"]["workers"][worker_type or "aggregated"]
+    assert worker["kv_cache"]["prefix_caching"] is True
+    plan_module.check_plan(request, plan)
+    _drop_cold_reason(plan)
+    plan_module.check_plan(request, plan)
+    # The pilots of the saved plan stay cold; a changed pilot is still refused.
+    (plan / "support-plan.json").write_bytes(with_reason)
+    pilot_bytes = (plan / pilot).read_bytes()
+    assert b"prefix_caching: false" in pilot_bytes
+    (plan / pilot).write_bytes(pilot_bytes.replace(b"prefix_caching: false", b"prefix_caching: true"))
+    with pytest.raises(ValueError, match="was modified or missing; choose a new output directory"):
+        plan_module.check_plan(request, plan)
+    (plan / pilot).write_bytes(pilot_bytes)
+    config = tmp_path / "request.yaml"
+    assert cli.main(["onboard", "plan", "--config", str(config), "--output-dir", str(plan), "--overwrite"]) == 0
+    assert "prefix_caching_reason" not in json.loads((plan / "support-plan.json").read_text())["fpm"]
+
+
+@reads_saved_config
+@pytest.mark.parametrize("reason", [None, "Another text."])
+def test_a_plan_of_a_warm_profile_whose_pilots_were_saved_cold_verifies_with_or_without_a_reason(
+    grouped_case, tmp_path, capsys, reason
+):
+    # Cold pilots for a profile that plans warm are the plan of an earlier planner, which the plan check accepts. Such
+    # a plan verifies without a recorded reason as an earlier planner wrote it, and with one as the planner of a later
+    # model of prefix caching writes it; a reason on warm pilots is refused.
+    from aisim.support.plan import check_plan
+
+    profile, _root = grouped_case
+    _onboarding_plan(_with_prefix_evidence(_with_state_group(profile), version="0.31.0"), tmp_path, capsys, "0.31.0")
+    plan = tmp_path / "collection"
+    request = SupportRequest.from_yaml(plan / "request.yaml")
+    path = plan / "support-plan.json"
+    saved = json.loads(path.read_text())
+    if reason is not None:
+        saved["fpm"]["prefix_caching_reason"] = reason
+        path.write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n")
+        with pytest.raises(ValueError, match="support-plan.json was modified; choose a new output directory"):
+            check_plan(request, plan)
+    for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
+        pilot = yaml.safe_load((plan / name).read_text())
+        pilot["engine"]["workers"]["aggregated"]["kv_cache"]["prefix_caching"] = False
+        data = yaml.safe_dump(pilot, sort_keys=False).encode()
+        (plan / name).write_bytes(data)
+        saved["generated_files_sha256"][name] = hashlib.sha256(data).hexdigest()
+    path.write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n")
+    check_plan(request, plan)
 
 
 def _leaves(value, path=()):
@@ -3129,7 +3227,9 @@ def test_the_marker_and_window_refusals_hold_on_each_version(grouped_case, tmp_p
         ("decode", "marked", None),
     ],
 )
-def test_grouped_cold_plan_of_one_role_records_and_prints_its_reason(grouped_case, tmp_path, capsys, role, case, text):
+def test_grouped_plan_of_one_worker_type_records_and_prints_its_reason_or_stays_warm(
+    grouped_case, tmp_path, capsys, role, case, text
+):
     profile, _root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile), version="0.31.0")
     for deployment in profile["deployments"]:

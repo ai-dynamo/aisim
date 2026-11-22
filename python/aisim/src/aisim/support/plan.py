@@ -458,6 +458,14 @@ def _plan_documents(
     if reason is not None:
         # check_plan passes the reason text of a saved plan, which this rendering keeps only when it records a reason.
         plan["fpm"]["prefix_caching_reason"] = reason if recorded_reason is None else recorded_reason
+    elif (
+        grouped_cold
+        and recorded_reason is not None
+        and request.fpm_profile is not None
+        and request.profile_deployment().resources.cache_layout == "grouped"
+    ):
+        # A grouped plan that was saved cold with its reason, for a profile that plans with prefix caching now.
+        plan["fpm"]["prefix_caching_reason"] = recorded_reason
     if "prefill_cudagraph_policy" in request.collection.model_fields_set:
         plan["fpm"]["launch"] = (
             f"{'AISimulate' if legacy_cli else 'AISim'} launches and manages benchmark workers "
@@ -780,8 +788,9 @@ def check_plan(request: SupportRequest, root: Path, *, allow_missing: bool = Fal
         # hashes. Do not rewrite saved commands/evidence or ignore differing fields.
         # A plan saved before replay modeled grouped prefix caching keeps its
         # grouped replay cold until `onboard plan --overwrite` writes it again.
-        # The grouped_cold rendering writes no reason, so it is also a plan that
-        # was saved cold before plans recorded fpm.prefix_caching_reason.
+        # The grouped_cold rendering computes no reason and keeps the saved one of a
+        # grouped plan, so it is also a plan that was saved cold before plans recorded
+        # fpm.prefix_caching_reason, and a plan saved cold with its reason.
         for legacy_cli, grouped_cold in ((True, False), (False, True), (True, True)):
             expected, documents = _plan_documents(
                 saved, root, legacy_cli=legacy_cli, grouped_cold=grouped_cold, recorded_reason=recorded_reason
