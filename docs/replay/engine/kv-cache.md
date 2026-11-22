@@ -937,11 +937,70 @@ DeepSeek V4 falls back to one recurrent-style checkpoint per request.
 Kimi K3's recurrent state resumes only from a stored snapshot, so it does not
 land on every matching token. With `block_size: 1536` and `prefix_match_unit: 128`, a cold
 24,300-token prompt keeps snapshots at 23,040 and 24,192 tokens. A later request
-sharing 23,700 tokens resumes at 23,040. This follows vLLM v0.29.0 align mode,
-with one difference: when a prompt ends on a block boundary, replay also keeps
-the state one block earlier (two under the EAGLE block drop), so an identical
-resend resumes there. vLLM keeps a state there only if a prefill chunk ended
-there.
+sharing 23,700 tokens resumes at 23,040. This follows vLLM v0.29.0 align mode.
+Two differences are known for the default switches. The first is at the end of
+a prompt: when a prompt ends on a block boundary, replay also keeps the state
+one block earlier (two under the EAGLE block drop), so an identical resend
+resumes there. vLLM keeps a state there only if a prefill chunk ended there.
+
+The second difference is with async scheduling: replay then holds some state
+copies for one scheduler step less than vLLM. With `prefix_match_unit` set, a
+request holds three kinds of state copy that it no longer writes: the previous
+copy after a write that moves the state to a new block, the cached state of a
+hit on a block boundary, and the `prefill_checkpoint` copy. Replay releases
+each of them at the request's next allocation, with and without async
+scheduling, on aggregated, prefill and decode workers. vLLM frees such a block
+at the first allocation of the request whose processed token count lies past
+the block. The processed count is the computed token count less the tokens of a
+step in flight. See vLLM v0.29.0
+[`kv_cache_manager.py:503-507`](https://github.com/vllm-project/vllm/blob/98dff2a81d747d1dba01a47f939f48c3526d4206/vllm/v1/core/kv_cache_manager.py#L503-L507)
+and
+[`single_type_kv_cache_manager.py:1529-1557`](https://github.com/vllm-project/vllm/blob/98dff2a81d747d1dba01a47f939f48c3526d4206/vllm/v1/core/single_type_kv_cache_manager.py#L1529-L1557),
+vLLM v0.31.0
+[`kv_cache_manager.py:552-556`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_manager.py#L552-L556)
+and
+[`single_type_kv_cache_manager.py:1647-1675`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/single_type_kv_cache_manager.py#L1647-L1675),
+vLLM v0.32.0
+[`kv_cache_manager.py:555-559`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_manager.py#L555-L559)
+and
+[`single_type_kv_cache_manager.py:1613-1641`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py#L1613-L1641),
+and vLLM v0.33.0
+[`kv_cache_manager.py:564-568`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_manager.py#L564-L568)
+and
+[`single_type_kv_cache_manager.py:1629-1657`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py#L1629-L1657).
+With `async_scheduling: false` no step is in flight at an allocation, so vLLM
+frees the block at the request's next allocation, as replay does. With async
+scheduling the step before is still in flight (see
+[vLLM async scheduling](workers.md#vllm-async-scheduling)), and vLLM frees the
+block one step later. During that step replay counts one state copy less for
+the request than vLLM does. A released copy that holds a cache key also enters
+the eviction order one step early. vLLM v0.29.0 can keep such a block until the
+request ends, when a prefill chunk of more than one block left an empty slot
+above it. See vLLM v0.29.0
+[`single_type_kv_cache_manager.py:605-630`](https://github.com/vllm-project/vllm/blob/98dff2a81d747d1dba01a47f939f48c3526d4206/vllm/v1/core/single_type_kv_cache_manager.py#L605-L630).
+
+vLLM's startup check reserves two state blocks per Mamba group for one request,
+plus the speculative and prefill checkpoint blocks of the group. With the
+longer hold a request can hold one block per group more than that. See vLLM
+v0.31.0
+[`kv_cache_interface.py:1083-1094`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/kv_cache_interface.py#L1083-L1094),
+vLLM v0.32.0
+[`kv_cache_interface.py:1076-1082`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/kv_cache_interface.py#L1076-L1082)
+and vLLM v0.33.0
+[`kv_cache_interface.py:1135-1141`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py#L1135-L1141).
+So in a pool that the blocks of one request nearly fill, vLLM can preempt that
+request and compute its tokens again, or with a `prefix_match_unit` below
+`block_size` refuse it at every later step. See vLLM v0.33.0
+[`kv_cache_manager.py:570-588`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_manager.py#L570-L588),
+[`scheduler.py:930-980`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L930-L980)
+and
+[`kv_cache_manager.py:531-548`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_manager.py#L531-L548).
+Replay does not preempt the request in such a pool, and the request completes.
+
+Replay keeps the hold of one step for a state cache. The comparison above is
+for requests without speculative decoding. A
+[grouped cache](#other-cache-modes) holds these blocks as vLLM does on an
+aggregated worker.
 
 ### State pool from recorded runtime memory
 
@@ -983,6 +1042,21 @@ Two align-mode behaviors of vLLM are opt-in and off by default:
   `c = (P - 1) // block_size * block_size`, the chunk runs to the prompt end and
   its forward exports the state at `c` into one extra state reserved for that
   pass. Without it the chunk stops at `c`, which costs one more pass.
+  With this switch, replay and vLLM differ in the order in which one allocation
+  releases two cached states. A request that resumes from a cached state on a
+  block boundary holds that state for its first step. When that step is also
+  its final prefill chunk, the step publishes the checkpoint state too. The
+  request's next allocation then releases the state of the hit first and the
+  checkpoint state second, with and without async scheduling. vLLM frees the
+  blocks that a request no longer needs from the highest block index down, so
+  it frees the checkpoint block first, and the block that it frees first is the
+  block that it evicts first. So when the pool evicts, replay evicts the state
+  of the hit before the checkpoint state, and vLLM the checkpoint state before
+  the state of the hit. A later request can then find the other one of the two
+  states. See vLLM v0.33.0
+  [`single_type_kv_cache_manager.py:1608-1627`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py#L1608-L1627)
+  and
+  [`block_pool.py:816-847`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/block_pool.py#L816-L847).
 - **`junction_checkpoints`** is vLLM's default at v0.29.0, the revision the
   align model follows. When a lookup's attention
   hit runs deeper than its deepest state (`shared_prefix_boundary`), the
@@ -1083,11 +1157,8 @@ sub-block matching without an explicit full-state scratch count.
   default, because its option `scheduler_reserve_full_isl` is on. The whole
   sequence holds the output tokens of a resumed request too, and a
   sliding-window group counts at most its admission cap. A request whose
-  whole sequence is larger than the pool is rejected. With async scheduling
-  vLLM frees the blocks that leave a window one step later than replay, so
-  replay can admit a waiting request one step earlier (see the first item of
-  the list "Replay differs from vLLM in these known ways" below). With prefix
-  caching on, replay tests the blocks of the whole prompt. See vLLM v0.31.0
+  whole sequence is larger than the pool is rejected. With prefix caching
+  on, replay tests the blocks of the whole prompt. See vLLM v0.31.0
   [`config/scheduler.py:191`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/config/scheduler.py#L191),
   [`kv_cache_manager.py:519-536`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_manager.py#L519-L536),
   [`scheduler.py:1218`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/sched/scheduler.py#L1218)
@@ -1226,11 +1297,47 @@ sub-block matching without an explicit full-state scratch count.
     `prefix_cacheable: false` and no `sliding_window` takes no part in hits
     and takes blocks for the whole prompt. No full-attention cache spec of
     vLLM 0.31.0, 0.32.0 or 0.33.0 opts out of prefix caching.
+  - Replay frees the blocks that a request no longer needs on the processed
+    token count, as vLLM's `allocate_slots` does: the computed tokens less
+    the tokens of the request's step in flight. See vLLM v0.31.0
+    [`kv_cache_manager.py:552-556`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_manager.py#L552-L556),
+    vLLM v0.32.0
+    [`kv_cache_manager.py:555-559`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_manager.py#L555-L559)
+    and vLLM v0.33.0
+    [`kv_cache_manager.py:564-568`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_manager.py#L564-L568).
+    With `async_scheduling: false` no step is in flight at an allocation, so
+    the processed count is the computed count. With async scheduling vLLM
+    forms a step while the step before it is in flight (see
+    [vLLM async scheduling](workers.md#vllm-async-scheduling)). On an
+    aggregated worker replay then keeps the previous state block, the cached
+    block of a hit on a block boundary, the copy block of a hit inside a
+    block, the checkpoint block and the blocks that left a sliding window
+    one step longer, as vLLM does. A prefill or decode worker frees them on
+    the computed token count (the first item of the known differences
+    below). A request can then hold one block per prefix-cacheable state
+    group more than vLLM's startup check reserves, `2 + c` with `c` the
+    group's `prefill_checkpoint_blocks`: three blocks without a checkpoint
+    block, and four in a final chunk that takes the checkpoint block. See
+    vLLM v0.31.0
+    [`kv_cache_interface.py:1083-1094`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/kv_cache_interface.py#L1083-L1094),
+    vLLM v0.32.0
+    [`kv_cache_interface.py:1076-1082`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/kv_cache_interface.py#L1076-L1082)
+    and vLLM v0.33.0
+    [`kv_cache_interface.py:1135-1141`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py#L1135-L1141).
+    So in a pool of exactly that count a request near `max_model_len` can
+    preempt itself, as in vLLM, and compute its tokens again from the last
+    state that it kept, so a long prompt can be preempted several times.
+    [Memory accounting](../../perf-model/memory.md#fpm-profile-cache-groups-and-byte-budgets)
+    gives a case that never completes.
   - A request that resumes from a cached state on a block boundary holds the
     cached block and its running block during its first step. It releases the
-    cached block at its next step, as vLLM does at the request's next
-    allocation with `async_scheduling: false`. The block stays cached until
-    eviction. See vLLM v0.31.0
+    cached block at its first later allocation whose processed token count
+    lies past the hit, as vLLM does. That is the next step with
+    `async_scheduling: false`, and on an aggregated worker one step later
+    when the step before is still in flight. A prefill or decode worker
+    releases it at the next step in both modes (the first item of the known
+    differences below). The block stays cached until eviction. See vLLM
+    v0.31.0
     [`kv_cache_manager.py:552-556`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_manager.py#L552-L556)
     and
     [`single_type_kv_cache_manager.py:1626-1645`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/single_type_kv_cache_manager.py#L1626-L1645),
@@ -1270,8 +1377,12 @@ sub-block matching without an explicit full-state scratch count.
     sliding-window groups is not split.
   - On vLLM 0.32.0 and 0.33.0 a prefix-cacheable `state` group can carry a
     prefill checkpoint block, such as the FlashKDA block of a KDA group. The
-    request takes that block in the chunk that reaches the end of its prefill and
-    releases it at its next step. As in vLLM, the prefill of a request that
+    request takes that block in the chunk that reaches the end of its prefill.
+    It releases the block at its first later allocation after the chunk is
+    processed: the next step with `async_scheduling: false`, and on an
+    aggregated worker one step later with a step in flight. A prefill or
+    decode worker releases it at the next step in both modes. As in vLLM, the
+    prefill of a request that
     resumes after a preemption ends one token before its last known token,
     so it covers the output tokens too. The block stays cached until eviction
     when it holds the prompt's checkpoint, the last position before the end
@@ -1282,24 +1393,41 @@ sub-block matching without an explicit full-state scratch count.
 
   Replay differs from vLLM in these known ways:
 
-  - Replay holds the previous state block after a block boundary, the cached
-    block after a hit on a block boundary and the checkpoint block after the
-    final prefill chunk for one scheduler step, and it releases the blocks of
-    a sliding-window group once they leave the window. vLLM 0.31.0, 0.32.0 and
-    0.33.0 turn async scheduling on by default and then hold these blocks for
-    one more step. Replay models async scheduling in the arrival rule, in the
-    admission cap of a sliding-window group and in the blocks of a finished
-    request, which it frees after it has formed the next pass (see
-    [vLLM async scheduling](workers.md#vllm-async-scheduling)). It does not
-    model it in these holds. So block counts and admission can be optimistic
-    for one step, by one block per state group and held block and by the
-    window blocks that left the window. A held block, or a block of a
-    sliding-window group that left the window, also enters the eviction order
-    one step early: before the blocks of a request that finished in the pass
-    before, where vLLM frees it after them. When the pool evicts, a different
-    cached block can then go first, and a later hit can be shorter or longer
-    than in vLLM. With `async_scheduling: false` these blocks are held for one
-    step in vLLM too.
+  - The previous state block after a block boundary, the cached block after
+    a hit on a block boundary, the copy block of a hit inside a block, the
+    checkpoint block after the final prefill chunk and the blocks of a
+    sliding-window group that left the window are held as the rule above
+    says. vLLM 0.31.0, 0.32.0 and 0.33.0 turn async scheduling on when the
+    option is unset and the configuration allows it (see
+    [vLLM async scheduling](workers.md#vllm-async-scheduling)), and then hold
+    these blocks one step longer. With async scheduling an aggregated worker
+    holds these blocks as vLLM does. A prefill worker and a decode worker
+    hold them for one scheduler step, because vLLM pairs the longer hold with
+    a stop on a worker with a consumer connector, which replay does not
+    model. There replay also releases window blocks on the computed token
+    count; the item on the connector role below gives the stop. So on a
+    prefill or decode worker block counts and admission can be optimistic for
+    one step, by one block per state group and held block and by the window
+    blocks that left the window. A held block, or a block of a sliding-window group that
+    left the window, also enters the eviction order one step early there:
+    before the blocks of a request that finished in the pass before, where
+    vLLM frees it after them. When the pool evicts, a different cached block
+    can then go first, and a later hit can be shorter or longer than in vLLM.
+    With `async_scheduling: false` these blocks are held for one step in vLLM
+    too.
+  - Replay releases held blocks in another order than vLLM in two cases.
+    When one allocation releases a checkpoint block and a previous state
+    block that a crossing after the checkpoint step left, replay releases the
+    checkpoint block first, where vLLM frees from the highest block index
+    down, the previous block first. When a prefill or decode worker drops a request whose step is in
+    flight, replay releases the request's held blocks before its other
+    blocks, where vLLM frees them with the other blocks, tail first. The
+    blocks are the same, and only their order in the eviction queue differs.
+    See vLLM v0.33.0
+    [`single_type_kv_cache_manager.py:1608-1627`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py#L1608-L1627),
+    [`:591-599`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py#L591-L599)
+    and
+    [`scheduler.py:3367-3375`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L3367-L3375).
   - Replay caches blocks of prompt tokens only. vLLM also caches the
     full-attention blocks that output tokens fill. A request's hit is at most
     the shortest hit over its prefix-cacheable groups. Under the default
@@ -1375,7 +1503,13 @@ sub-block matching without an explicit full-state scratch count.
     request is preempted. Replay holds the published block until the
     request's next allocation, where vLLM frees it at the end of the
     scheduling pass that took the copy. So the block count can be higher by
-    one block per state group until then.
+    one block per state group until then. When that write also crosses a
+    block boundary, vLLM takes two blocks in the pass, the copy and the new
+    running block, and replay takes one. See vLLM v0.33.0
+    [`single_type_kv_cache_manager.py:1872-1874`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py#L1872-L1874).
+    Replay then holds the published block as a previous state block, by the
+    rule above this list, as vLLM holds the block that the copy leaves in the
+    request.
   - With hits inside a block and a prefill checkpoint block, vLLM 0.32.0 and
     0.33.0 can give a later request a longer hit than replay. The case needs a
     request whose state hit ends inside a block, while its full-attention
@@ -1494,8 +1628,9 @@ sub-block matching without an explicit full-state scratch count.
 
   When a request ends on a prefill or decode worker, the worker first
   releases the blocks that the request's next step does not need. Examples
-  are the blocks below a window, the previous state block and the cached
-  block of a hit on a block boundary. vLLM does this before it hands the
+  are the blocks below a window, the previous state block, the cached block
+  of a hit on a block boundary, the copy block of a hit inside a block and
+  the checkpoint block. vLLM does this before it hands the
   block table to its connector. Then the worker releases the rest. vLLM does
   both when it processes the outputs of the step that ended the request.
   With async scheduling that comes after it has scheduled the next step, so
@@ -1591,6 +1726,18 @@ sub-block matching without an explicit full-state scratch count.
     [`kv_transfer.py:11-12`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/config/kv_transfer.py#L11-L12).
     Replay does not model the rule on a grouped prefill worker either, and it
     releases the copy sources there at the end of the scheduling pass too.
+    With async scheduling vLLM also holds the blocks that a request no longer
+    needs one step longer on such a worker, as on every worker, and it pairs
+    that hold with the stop of this item. Replay models neither the role nor
+    the stop. So a grouped prefill worker and a grouped decode worker free
+    held state blocks and window blocks on the computed token count, one
+    step earlier than vLLM, because the longer hold without the stop would
+    preempt a request where vLLM waits one step. A prefill worker whose
+    connector runs in the role `kv_producer` has no such stop in vLLM and
+    holds these blocks one step longer. Replay cannot tell the two roles
+    apart and gives it the hold of one step too. A [state cache](#state-cache)
+    holds a previous state copy for one step on every worker, an aggregated
+    worker too.
   - Replay tests a waiting transferred request again between two passes: at
     the end of the forward of a pass, before it schedules the next pass. P/D
     replay does this for every KV cache type. vLLM tests such a request in

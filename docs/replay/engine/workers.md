@@ -420,6 +420,16 @@ which requests can be preempted:
   no forward-pass snapshot, as Dynamo's vLLM recorder skips empty batches. The
   engine protocol still reports an all-zero `forward_pass_metrics` for it, which
   a consumer that mirrors that recorder skips.
+- vLLM frees the blocks that a running request no longer needs, such as a
+  previous state block or the blocks below a sliding window, on the processed
+  token count, which leaves out the tokens of the pass in flight. A block that
+  a request stops needing in pass k is therefore freed when pass k+2 is
+  formed, if the request runs in it, and not when pass k+1 is formed. See
+  [KV cache](kv-cache.md#other-cache-modes). Replay does this on an aggregated
+  worker with a grouped cache. A prefill or decode worker frees such a block
+  when pass k+1 is formed, for the reason in the paragraph below the list. A
+  [state cache](kv-cache.md#state-cache) frees a previous state copy when pass
+  k+1 is formed on every worker.
 - With a CPU tier (`kv_cache.host_offload`), vLLM does not free the blocks of a
   request that the pass in flight runs until that pass ends, so it does not
   preempt that request. A running request that needs its blocks waits for the
@@ -427,9 +437,13 @@ which requests can be preempted:
 
 vLLM defers the same frees for a P/D connector that consumes KV (`kv_role`
 `kv_consumer` or `kv_both`). Replay does not model a P/D connector's role, so
-it applies the second rule only with a CPU tier. These rules follow `Scheduler`
-in vLLM
-[v0.30.0](https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/v1/core/sched/scheduler.py),
+it applies the third rule only with a CPU tier. For the same reason a prefill
+or decode worker frees the blocks of the second rule when pass k+1 is formed:
+the longer hold without the stop of the third rule would preempt a request
+where vLLM waits one pass. These rules follow `Scheduler` and
+`KVCacheManager.allocate_slots` in vLLM
+[v0.30.0](https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/v1/core/sched/scheduler.py)
+([`kv_cache_manager.py`](https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/v1/core/kv_cache_manager.py)),
 the first release that stops the allocation instead of preempting such a
 request.
 

@@ -427,7 +427,10 @@ window term counts two batches for every deployment. Two is vLLM's count with
 async scheduling at pipeline parallel size 1, and grouped execution supports
 PP1 only. With `async_scheduling: false` vLLM counts one batch, so the bound
 is then high by at most `ceil(max_num_tokens / block_size_tokens)` pages per
-window group.
+window group. The bound is vLLM's startup check, not a promise that every
+prompt up to the context length completes: with async scheduling a request
+can hold one block per prefix-cacheable state group more for a step, and the
+item on a hit inside a block below names a case that then never completes.
 For a linear layout it is the context length times the bytes per token. For
 an observed Mamba align pool it counts the pages of the context length, the
 old and the new state of each state group with its speculative states, and
@@ -510,14 +513,13 @@ rank-local byte budget. A waiting request is admitted only when the bytes of
 its whole sequence fit the free bytes, with the admission cap of a window
 group, as vLLM's default `scheduler_reserve_full_isl` does. A request whose
 whole sequence is larger than the pool is rejected. A window
-of `W` keeps the blocks covering the last `W - 1` computed tokens and all tokens
-scheduled for the next forward. With async scheduling vLLM frees the blocks
-that leave a window one step later than replay, because it does not count the
-tokens of a step in flight, so the free bytes of replay can be higher for one
-step and a waiting request can be admitted one step earlier (see the first
-item of the list "Replay differs from vLLM in these known ways" in
-[Replay KV cache](../replay/engine/kv-cache.md#other-cache-modes)). Expired
-completed pages are evicted before
+of `W` keeps the blocks covering the last `W - 1` processed tokens and all
+tokens up to the end of the scheduled forward. The processed tokens are the
+computed tokens less the tokens of the request's forward in flight. They equal
+the computed tokens with `async_scheduling: false`. On a prefill or decode
+worker replay uses the computed tokens with async scheduling too, where vLLM
+uses the processed tokens (see the known differences in
+[Replay KV cache](../replay/engine/kv-cache.md#other-cache-modes)). Expired completed pages are evicted before
 subsequent forwards; temporary prefill pages remain charged through completion.
 Full-attention groups retain full history. A `state` group holds its
 `blocks_per_request` blocks from the request's first scheduled forward until the
@@ -574,13 +576,27 @@ With prefix caching on, replay keeps the blocks of all groups in one block pool:
   more blocks than the pool holds, also in a pool that passes the startup
   check. The request then waits until running requests evict its hit blocks,
   as in vLLM. With no running request, vLLM waits forever, and replay stops
-  with a livelock error.
+  with a livelock error. With async scheduling one request on an aggregated
+  worker can reach this state alone. That can happen when the pool holds
+  exactly vLLM's startup count, the hash block is smaller than the state
+  block, the state groups have no checkpoint block, and the prompt's partial
+  tail lies in the last attention block of the context length. The request
+  preempts itself several times, then hits its own partial tail inside a
+  block and is refused at every step. It is not preempted without end. vLLM's
+  whole-sequence test refuses it in the same way; see vLLM v0.33.0
+  [`kv_cache_manager.py:531-548`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_manager.py#L531-L548).
+  With
+  `async_scheduling: false` or with a checkpoint block the request completes.
 - Full-attention groups keep their blocks while the request is running. A
   sliding-window group releases the blocks below its window before each
   allocation. A prefix-cacheable `state` group holds one running block. After
-  a block boundary, it also holds the previous block for one scheduler step,
-  and after it writes past a state that it published inside a block, the
-  published block until its next allocation. A ring holds one block. [Replay KV cache](../replay/engine/kv-cache.md#other-cache-modes)
+  a block boundary, it also holds the previous block until the first later
+  allocation whose processed token count lies past that block: for one
+  scheduler step with `async_scheduling: false`, and on an aggregated worker
+  for two with a step in flight. A prefill or decode worker holds it for one
+  step in both modes. After it writes past a state that it published inside
+  a block, it holds the published block until its next allocation. A ring
+  holds one block. [Replay KV cache](../replay/engine/kv-cache.md#other-cache-modes)
   describes the blocks of a hit and of a checkpoint.
 - A request releases its blocks tail first. With async scheduling, a finished
   request releases its blocks after replay has formed the next pass, as vLLM
