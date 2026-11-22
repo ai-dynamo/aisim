@@ -400,6 +400,7 @@ impl SglangCore {
         allow_destination_admission: bool,
         now_ms: Option<f64>,
     ) -> anyhow::Result<SchedulerCommandEffects> {
+        command.ensure_handoff_role(self.config.worker_type)?;
         match command {
             SchedulerCommand::Submit(mut request) => {
                 let uuid = request.uuid.unwrap_or_else(Uuid::new_v4);

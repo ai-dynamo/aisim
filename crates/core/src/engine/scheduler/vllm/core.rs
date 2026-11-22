@@ -1329,6 +1329,7 @@ impl VllmCore {
                 || !matches!(&command, SchedulerCommand::ReserveDestination { .. }),
             "a grouped prefill rank reserves no KV handoff destination"
         );
+        command.ensure_handoff_role(self.args.worker_type)?;
         let mutation_now_ms = command_now_ms.filter(|_| allow_destination_admission);
         match command {
             SchedulerCommand::Submit(mut request) => {

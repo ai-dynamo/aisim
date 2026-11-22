@@ -966,6 +966,54 @@ fn grouped_prefill_rank_refuses_a_destination() {
 }
 
 #[test]
+fn grouped_prefill_rank_refuses_to_activate_or_cancel_a_destination() {
+    // A prefill rank reserves no destination, so it has none to activate or
+    // to cancel.
+    for version in ["0.32.0", "0.33.0"] {
+        let byte_mode = pd_core(
+            glm_transfer_groups(version, false),
+            128 * GLM_PAGE,
+            8192,
+            WorkerType::Prefill,
+            None,
+        );
+        let mut args = prefix_core(
+            glm_transfer_groups(version, false),
+            128 * GLM_PAGE,
+            8192,
+            2176,
+            version,
+        )
+        .args;
+        args.worker_type = WorkerType::Prefill;
+        for (mode, mut core) in [("byte", byte_mode), ("block", VllmCore::new(args))] {
+            let handoff_id = HandoffId::new(Uuid::from_u128(1644));
+            for (kind, command) in [
+                (
+                    "ActivateDestination",
+                    SchedulerCommand::ActivateDestination { handoff_id },
+                ),
+                (
+                    "CancelDestination",
+                    SchedulerCommand::CancelDestination { handoff_id },
+                ),
+            ] {
+                let error = core.apply_command(command).unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "a prefill rank loads no KV handoff destination, so it refuses {kind}; a decode rank takes it"
+                    ),
+                    "{mode} mode"
+                );
+            }
+            assert!(core.is_drained(), "{mode} mode");
+            assert_eq!(grouped_pool(&core).active_blocks(), 0, "{mode} mode");
+        }
+    }
+}
+
+#[test]
 fn grouped_prefill_source_keeps_only_the_blocks_inside_its_window() {
     // A prompt of 1,024 tokens in one chunk, with a window of 32 tokens and
     // blocks of 16. The forward keeps the 64 blocks that its first query
