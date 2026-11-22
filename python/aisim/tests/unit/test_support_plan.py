@@ -72,6 +72,7 @@ def test_pre_rename_plan_is_verified_and_previewed_without_rewriting(tmp_path, c
     # Keep the real saved-plan checks while isolating collector model preflight.
     def resolve(command):
         assert "--plan-only" in command
+        return None, (SimpleNamespace(options=SimpleNamespace(benchmark_points_dropped_json=None)), {})
 
     monkeypatch.setattr(fpm, "_resolve_execution", resolve)
 
@@ -920,7 +921,10 @@ def _mock_collector_execution(monkeypatch, calls):
 
     def resolve(command):
         calls.append(command[3:])
-        return cli._parser().parse_args(command[3:]), (SimpleNamespace(cells=(), sha256="a" * 64), {})
+        return cli._parser().parse_args(command[3:]), (
+            SimpleNamespace(cells=(), sha256="a" * 64, options=SimpleNamespace(benchmark_points_dropped_json=None)),
+            {},
+        )
 
     monkeypatch.setattr(fpm, "_resolve_execution", resolve)
     monkeypatch.setattr(entry, "run_resolved", lambda *_: [{"error_message": "synthetic collection failure"}])

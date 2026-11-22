@@ -446,6 +446,13 @@ def _request_launch(request: SupportRequest, launch: dict[str, Any]) -> dict[str
             result["collection"].pop(field, None)
         else:
             result["collection"][field] = value
+    if "warmup_iterations" in result["collection"]:
+        from collector.fpm_forward.config import FPM_WARMUP_ITERATIONS
+
+        # A launch holds the count that the probe ran with: normalize_probe_launch writes the collector default
+        # when the request names none. So None compares as that default and never removes the field.
+        warmup = request.collection.warmup_iterations
+        result["collection"]["warmup_iterations"] = FPM_WARMUP_ITERATIONS if warmup is None else warmup
     return result
 
 

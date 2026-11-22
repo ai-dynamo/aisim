@@ -161,7 +161,7 @@ def _execution_status(frozen: dict[str, Any]) -> str:
 def _collection_source(request: SupportRequest, root: Path) -> tuple[Any, Path, Path, list[dict[str, Any]]]:
     """Verify formal publication against every native row before qualification."""
     import pyarrow.parquet as pq
-    from collector.fpm_forward.config import PrefillSamplingProfile
+    from collector.fpm_forward.config import FPM_WARMUP_ITERATIONS, PrefillSamplingProfile
     from collector.fpm_forward.database import (
         aggregate_cell,
         published_dense_synthetic_cells,
@@ -203,6 +203,7 @@ def _collection_source(request: SupportRequest, root: Path) -> tuple[Any, Path, 
         max_cudagraph_capture_size=request.collection.max_prefill_cudagraph_size,
         cudagraph_policy=request.collection.prefill_cudagraph_policy,
     )
+    warmup = request.collection.warmup_iterations
     if (
         plan.options.vllm_max_model_len != request.search.context_length
         or plan.options.max_num_batched_tokens != scheduler["max_batched_tokens"]
@@ -220,6 +221,7 @@ def _collection_source(request: SupportRequest, root: Path) -> tuple[Any, Path, 
             else None
         )
         or plan.options.max_cudagraph_capture_size != request.collection.max_cudagraph_capture_size
+        or plan.options.warmup_iterations != (FPM_WARMUP_ITERATIONS if warmup is None else warmup)
     ):
         raise ValueError("source collection runtime limits differ from the reviewed onboarding settings")
     deployment = request.profile_deployment()

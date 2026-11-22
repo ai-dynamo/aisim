@@ -219,6 +219,13 @@ def _resolve_execution(command: list[str]):
     return args, resolved
 
 
+def _report_dropped_points(plan) -> None:
+    """Show the points that each rule dropped from a generated list. Onboarding sets no log handler."""
+    dropped = getattr(plan.options, "benchmark_points_dropped_json", None)
+    if dropped is not None:
+        print(f"Point list: candidates and dropped points by phase and rule: {dropped}", file=sys.stderr)
+
+
 def _checkpoint_root(root: Path, checkpoint_dir: str | Path | None) -> Path:
     selected = Path(checkpoint_dir).expanduser().resolve() if checkpoint_dir else root / "fpm-checkpoint"
     if selected != root / "fpm-checkpoint" and root / "fpm-checkpoint" not in selected.parents:
@@ -310,7 +317,7 @@ def run_fpm(
         if request.fpm_profile is not None:
             # A prediction profile can be valid for historical timings while
             # its precision is incompatible with a new native campaign.
-            _resolve_execution(command)
+            _report_dropped_points(_resolve_execution(command)[1][0])
         print(shlex.join(command))
         return 0
     check_plan(request, root)
@@ -334,6 +341,7 @@ def run_fpm(
             collector_available = True
             args, resolved = _resolve_execution(command)
             frozen = resolved[0]
+            _report_dropped_points(frozen)
             if not smoke:
                 before = assess_readiness(request, root, selected_checkpoint, expected_plan=frozen)
                 recovery_only = resume and resume_without_workers(frozen, selected_checkpoint / "fpm_forward.json")

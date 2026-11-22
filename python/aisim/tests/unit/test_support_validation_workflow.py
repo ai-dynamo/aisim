@@ -1262,3 +1262,18 @@ def test_replay_revalidates_capacity_revision_against_original_timing_collection
     memory_config.write_text(memory_config.read_text() + "\n")
     with pytest.raises(ValueError, match="memory revision.*changed"):
         workflow._check_replay(replay / "validation.json", original, collection, plan)
+
+
+def test_collection_validation_refuses_a_collection_of_another_warmup_count(quality_case, monkeypatch):
+    case = quality_case
+    collected = case["plan"].options.warmup_iterations
+    payload = case["request"].model_dump(mode="json")
+    payload["collection"]["warmup_iterations"] = collected + 1
+    changed = SupportRequest.model_validate(payload)
+    # The onboarding plan of the changed request would be planned again; only the source collection is compared here.
+    monkeypatch.setattr(workflow, "check_plan", lambda *_: None)
+    workflow._collection_source(case["request"], case["root"])
+    with pytest.raises(
+        ValueError, match="source collection runtime limits differ from the reviewed onboarding settings"
+    ):
+        workflow._collection_source(changed, case["root"])

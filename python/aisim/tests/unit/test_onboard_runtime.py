@@ -9,6 +9,7 @@ import copy
 import hashlib
 import json
 import math
+import shlex
 import shutil
 import subprocess
 import sys
@@ -838,6 +839,51 @@ def test_request_without_warmup_iterations_keeps_its_identity(tmp_path):
     assert request_id(warmed) != request_id(request)
 
 
+def _with_warmup_iterations(request, value):
+    payload = request.model_dump(mode="json")
+    payload["collection"]["warmup_iterations"] = value
+    return SupportRequest.model_validate(payload)
+
+
+def _probe_launch(request):
+    from collector.fpm_forward.runtime_instrumentation import read_json
+
+    from aisim.support.runtime import runtime_probe_manifest
+
+    manifest = runtime_probe_manifest(request)
+    return read_json(Path(manifest["observations_index"]))["configurations"][manifest["configuration"]]["launch"]
+
+
+def test_warmup_iterations_edit_after_the_probe_needs_a_fresh_probe(tmp_path, capsys):
+    from aisim.support.runtime import verify_runtime_profile
+
+    _, _, request, _ = _imported(tmp_path, capsys, warmup_iterations=0)
+    assert verify_runtime_profile(request) is not None
+    with pytest.raises(ValueError, match="runtime-affecting draft edits require a compatible fresh probe"):
+        verify_runtime_profile(_with_warmup_iterations(request, 5))
+
+
+def test_request_without_a_warmup_count_verifies_against_a_launch_with_the_default(tmp_path, capsys):
+    from aisim.support.runtime import verify_runtime_profile
+
+    # The probe launch holds the collector default when the request names no count.
+    _, _, request, _ = _imported(tmp_path, capsys)
+    assert request.collection.warmup_iterations is None
+    assert _probe_launch(request)["collection"]["warmup_iterations"] == 5
+    assert verify_runtime_profile(request) is not None
+    assert verify_runtime_profile(_with_warmup_iterations(request, 5)) is not None
+
+
+def test_request_launch_leaves_a_launch_without_the_count_as_it_is(tmp_path, capsys):
+    from aisim.support.runtime import _request_launch
+
+    _, _, request, _ = _imported(tmp_path, capsys, warmup_iterations=0)
+    launch = copy.deepcopy(_probe_launch(request))
+    del launch["collection"]["warmup_iterations"]
+    assert request.collection.warmup_iterations == 0
+    assert _request_launch(request, launch) == launch
+
+
 # The dense probe fixture measures two full-attention groups of 128 bytes per 16-token block: 16 bytes per token.
 _LINEAR_CLAIM = {"kv_bytes_per_token": 16}
 
@@ -1571,7 +1617,10 @@ def test_plan_carries_explicit_formal_observer_flags_and_execution_requires_acce
 
     def resolve(command):
         commands.append(command[3:])
-        return collector_cli._parser().parse_args(command[3:]), (SimpleNamespace(cells=()), {})
+        return collector_cli._parser().parse_args(command[3:]), (
+            SimpleNamespace(cells=(), options=SimpleNamespace(benchmark_points_dropped_json=None)),
+            {},
+        )
 
     monkeypatch.setattr(fpm, "_resolve_execution", resolve)
     monkeypatch.setattr(collection_readiness, "assess_readiness", lambda *a, **k: {"ready_for_full_collection": True})
@@ -2243,6 +2292,49 @@ def test_formal_collection_and_finalization_keep_the_request_warmup_iterations(t
     target = tmp_path / "finalized"
     finalize(request, root, target)
     assert SupportRequest.from_yaml(target / "request.yaml").collection.warmup_iterations == 0
+
+
+_DROPPED_POINTS = (
+    '{"decode":{"cache_capacity":0,"candidates":97,"token_budget":16},'
+    '"prefill":{"cache_capacity":0,"candidates":496,"mamba_align_split":0}}'
+)
+
+
+def test_onboarding_shows_the_dropped_points_of_a_generated_list(tmp_path, capsys, monkeypatch):
+    from types import SimpleNamespace
+
+    from aisim.support import fpm
+
+    line = "Point list: candidates and dropped points by phase and rule: "
+    generated = SimpleNamespace(options=SimpleNamespace(benchmark_points_dropped_json=_DROPPED_POINTS))
+    fpm._report_dropped_points(generated)
+    captured = capsys.readouterr()
+    assert captured.err == line + _DROPPED_POINTS + "\n"
+    assert captured.out == ""
+    fpm._report_dropped_points(SimpleNamespace(options=SimpleNamespace(benchmark_points_dropped_json=None)))
+    assert capsys.readouterr() == ("", "")
+
+    checkpoint, _, _, files = _imported(tmp_path, capsys, capacity_multiplier=10)
+    root = tmp_path / "collection"
+    assert cli.main(["onboard", "plan", "--config", files["request"], "--output-dir", str(root)]) == 0
+    state = _load(checkpoint)
+    save_checkpoint(checkpoint, patch={}, expected_revision=state.revision, accept=["tp2"])
+    capsys.readouterr()
+    commands = json.loads((root / "commands.json").read_text())
+    preview = commands["fpm_run_local"][1:]
+    preview.remove("--execute")
+    resolved = []
+
+    def resolve(command):
+        resolved.append(command)
+        return None, (generated,)
+
+    monkeypatch.setattr(fpm, "_resolve_execution", resolve)
+    assert cli.main(preview) == 0
+    captured = capsys.readouterr()
+    assert line + _DROPPED_POINTS in captured.err.splitlines()
+    assert len(resolved) == 1
+    assert captured.out == shlex.join(resolved[0]) + "\n"
 
 
 @pytest.mark.parametrize("worker_type", ["prefill", "decode", "aggregated"])

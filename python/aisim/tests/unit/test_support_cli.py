@@ -1161,7 +1161,11 @@ def test_collector_failures_keep_public_cli_exit_codes(tmp_path, monkeypatch, ca
 
     monkeypatch.setattr(model_cases, "build_collection_case_plan", lambda **kwargs: SimpleNamespace(model_path=None))
     monkeypatch.setattr(
-        entry, "resolve_run_inputs", fail if stage == "input" else lambda *args: (SimpleNamespace(cells=()), {})
+        entry,
+        "resolve_run_inputs",
+        fail
+        if stage == "input"
+        else lambda *args: (SimpleNamespace(cells=(), options=SimpleNamespace(benchmark_points_dropped_json=None)), {}),
     )
     monkeypatch.setattr(entry, "run_resolved", fail)
     command = ["onboard", "collect-fpm", "-c", str(request_path), "--output-dir", str(root), "--execute"]
@@ -1470,3 +1474,59 @@ def test_onboard_v41_rejects_explicit_graph_execution(tmp_path, monkeypatch, cap
         _resolve_execution(fpm_cli_args(request, output_dir=tmp_path / "collection", plan_only=True))
     assert error.value.code == 2
     assert "DeepSeek V4.1 requires eager execution" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("model_config", "count"),
+    [(True, 0), (True, 3), (True, None), (False, 3)],
+    ids=["0", "3", "unset", "without-model-config"],
+)
+def test_init_takes_the_collector_warmup_iterations(tmp_path, capsys, model_config, count):
+    from .test_onboard_finalization import _prepare_collection
+
+    flag = () if count is None else ("--warmup-iterations", str(count))
+    if model_config:
+        _prepare_collection(tmp_path, flag)
+        saved = tmp_path / "draft.yaml"
+    else:
+        saved = tmp_path / "request.yaml"
+        assert cli.main([*_init_args(saved), *flag]) == 0
+    output = capsys.readouterr().out
+    request = SupportRequest.from_yaml(saved)
+    assert "warmup_iterations" not in request.collection_settings()
+    if count is None:
+        assert "warmup_iterations" not in yaml.safe_load(saved.read_text())["collection"]
+        assert "Collector warm-up iterations" not in output
+    else:
+        assert request.collection.warmup_iterations == count
+        assert f"Collector warm-up iterations: {count}" in output.splitlines()
+
+
+def test_saved_plan_with_a_warmup_count_still_verifies(tmp_path):
+    from aisim.support.plan import check_plan
+
+    from .test_onboard_finalization import _prepare_collection
+
+    _, root = _prepare_collection(tmp_path, ("--warmup-iterations", "0"))
+    request = SupportRequest.from_yaml(root / "request.yaml")
+    assert request.collection.warmup_iterations == 0
+    check_plan(request, root)
+    saved = json.loads((root / "support-plan.json").read_text())
+    assert "warmup_iterations" not in saved["fpm"]["runtime_limits"]
+
+
+@pytest.mark.parametrize("count", [0, None], ids=["0", "unset"])
+def test_profile_review_shows_the_collector_warmup_iterations(tmp_path, monkeypatch, capsys, count):
+    from .test_onboard_model_config import _args as _config_args
+    from .test_onboard_model_config import _files as _config_files
+
+    source, resources = _config_files(tmp_path)
+    _terminal(monkeypatch, ["accept"])
+    command = _config_args(tmp_path / "request.yaml", source, resources, warmup_iterations=count)
+    assert cli.main([*command, "--interactive"]) == 0
+    review = capsys.readouterr().out.rsplit("Review FPM profile before saving:", 1)[1].splitlines()
+    collection = next(index for index, line in enumerate(review) if line.startswith("  Collection: "))
+    if count is None:
+        assert not [line for line in review if "Collector warm-up iterations" in line]
+    else:
+        assert review[collection + 1] == f"  Collector warm-up iterations: {count}"
