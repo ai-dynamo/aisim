@@ -9,6 +9,9 @@ Python resolves the model's phase operations, dimensions, precision, and
 parallel placement into an `EngineSpec`. Rust loads the resolved performance
 database and evaluates that specification without re-entering Python on the hot
 path. Compilation produces a versioned operation plan, not a native executable.
+Saved `EngineSpec` JSON and bincode must use the current schema version.
+JSON conversion rejects old versions immediately with a request to recompile;
+it does not migrate an old plan by filling new operation fields with defaults.
 Use the [canonical estimator configuration](../configuration.md); low-level
 compiled-engine entry points are documented in the [Python](../api/python.md)
 and [Rust](../api/rust.md) references.
@@ -43,7 +46,8 @@ Each chunk retains the mixed step's concurrent decoders. Qualified Mamba
 therefore pays three recurrent-state charges and processes 1096 new prefill
 tokens, rather than scaling one chunk eight times. Per-request dispatch is
 added once. Batched cold text requests use the same exact chunk pricing when
-their context graph contains qualified Mamba operations, so a short final chunk
+either phase graph contains qualified Mamba operations, including operations
+constructed directly through the native API, so a short final chunk
 pays a full recurrent-state charge. Unqualified batched cold graphs retain the
 existing XPU scaling heuristic. For a single text request, `run_agg` already
 sums its actual chunk prices and XPU TTFT uses that total directly.
@@ -52,6 +56,13 @@ before capping prefill by the batch's demand. Whole-model FPM demand counts
 uncached tokens; op-level demand uses full prompt coordinates. The fitted XPU
 burst factor keeps its full-prompt denominator (`isl`), including for FPM:
 changing the query's token coordinates does not recalibrate the fit.
+
+Single-request op-level aggregates with visual tokens reject chunked prefill
+when either phase contains qualified Mamba. The visual mean-field schedule
+amortizes whole-prefill attention; multiplying its scan price by that weight
+would overcount fresh tokens and recurrent-state transfers. Use a budget that
+fits the uncached suffix or a text-only workload. Whole-model FPM visual
+overlays follow the uncached chunk schedule and sum to one whole overlay.
 
 Single-request op-level aggregates with visual tokens retain mean-field pricing
 when the uncached prompt exceeds the prefill budget. Native context attention

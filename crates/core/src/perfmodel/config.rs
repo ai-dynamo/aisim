@@ -135,8 +135,8 @@ pub const ENGINE_CONFIG_SCHEMA_VERSION: u32 = 1;
 //   pool execution plan; P2P fabric selectors and independent F-node width
 //   are part of the same positional wire-format change.
 // - 31 (Mamba mixed-step accounting): Mamba2Op gained tail-appended
-//   `state_dtype` and `token_width`. The serde defaults cover JSON only;
-//   schema-30 bincode payloads are rejected.
+//   `state_dtype` and `token_width`. Serde defaults cover omitted fields in
+//   current-version JSON; schema-30 JSON conversion and bincode are rejected.
 pub const ENGINE_SPEC_SCHEMA_VERSION: u32 = 31;
 
 /// Static engine identity and setup information carried by an

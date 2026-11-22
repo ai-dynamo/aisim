@@ -1351,20 +1351,33 @@ pre-FPM-correction implementation (`108835ac^`) and the `ctx/isl` calibration
 comment specify. No coefficients have been refitted. The uncached suffix still
 sets native FPM query coordinates and the capped demand in the ratio's numerator.
 
-Run from the repository root, with the corrected wheel installed:
+The following table is a **historical** synthetic snapshot of candidate
+`49ee01957177268bb5889f1bb058eeb0f867d101` against
+`0cfbdb5535583493e4ab073241e1f74d707acdde`. Its candidate XPU source SHA-256
+is `b033596de269fd446a7a958618a95b4129f3f076ceab9d18fc236272befb0c5d`.
+It does not describe the current driver/backend combination. The original
+numeric rows and driver fingerprint are preserved in
+[xpu-scoped-repair.json](mamba-mixed-step-accounting/xpu-scoped-repair.json).
+
+To reproduce the historical calculation, install that candidate's Python
+backends, then run the current driver from the repository root:
 
 ```bash
-python benchmarks/evidence/mamba-mixed-step-accounting/xpu_scoped_repair.py OUT.json
+python benchmarks/evidence/mamba-mixed-step-accounting/xpu_scoped_repair.py \
+  --candidate-revision 49ee01957177268bb5889f1bb058eeb0f867d101 OUT.json
 ```
 
 The driver reads the baseline class from
-`0cfbdb5535583493e4ab073241e1f74d707acdde` and imports the corrected class.
+`0cfbdb5535583493e4ab073241e1f74d707acdde` and imports the candidate class.
+It verifies both imported XPU and base backend sources against the specified
+revision; a current wheel cannot stand in for the historical candidate.
 It runs the actual XPU budget conversion, own-prefill scaling and burst formula
 over an explicitly synthetic FPM pricing seam: 1 ms per launch, 0.01 ms per new
 token and 0.1 ms per decoder. It holds decode growth at one and admits all 16
 requests. This isolates caller and fit behavior; it does not execute a native
 FPM table or establish XPU serving accuracy. Full inputs, shapes and outputs are
-in [xpu-scoped-repair.json](mamba-mixed-step-accounting/xpu-scoped-repair.json).
+in the historical snapshot linked above. A separate current result and its
+command are recorded in the scoped repair section below.
 
 | Prefix / token capacity | Pricing input (prefill, decode), before / after | TTFT ms, before / after |
 | --- | --- | --- |

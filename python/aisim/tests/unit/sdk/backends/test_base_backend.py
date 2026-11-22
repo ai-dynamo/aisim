@@ -1609,12 +1609,40 @@ def test_xpu_aggregate_exact_ttft_total_is_text_only(monkeypatch, visual_tokens)
     assert totals == ([None] if visual_tokens else [prefill_ms])
 
 
-def test_run_agg_visual_fpm_keeps_uncached_step_count(backend, model, database, monkeypatch):
-    # Whole-model FPM already averages its actual uncached chunks. Its 5 ms
-    # step must be counted twice, independently of the op-level fallback.
+@pytest.mark.parametrize("prefix,budget,chunks,qf", [(3000, 4096, 1, 1.9), (3000, 512, 3, 2.0), (2048, 1024, 2, 1.95)])
+def test_run_agg_visual_fpm_keeps_uncached_step_count(
+    backend, model, database, monkeypatch, prefix, budget, chunks, qf
+):
+    from aisim.sdk.backends import base_backend as base_backend_module
+
+    # FPM's synthetic 5 ms/500 W-ms mean prices the fresh suffix. A nonzero
+    # 4 ms/400 W-ms whole-request visual overlay must survive the real
+    # run_mixed -> run_agg -> summary path exactly once, including a short tail.
     model.forward_model = "fpm"
     model.encoder_config = _vision_encoder_config()
-    monkeypatch.setattr(backend, "run_mixed", lambda *_: StepEstimate(latency_ms=5.0, energy_wms=500.0))
+    model.visual_context_ops = [_StaticOp("visual_attention", 4.0, 400.0)]
+    seen = []
+
+    def native_breakdown(_model, _database, **kwargs):
+        seen.append(kwargs["ctx_tokens"])
+        return {
+            "latency_ms": 5.0,
+            "energy_wms": 500.0,
+            "component_latency_ms": {"shared_non_attention": 5.0},
+            "component_energy_wms": {"shared_non_attention": 500.0},
+            "per_op_latency_ms": {"fpm": 5.0},
+            "per_op_energy_wms": {"fpm": 500.0},
+            "per_op_source": {"fpm": "silicon"},
+            "covered_latency_ms": 5.0,
+            "moe_comm_fallbacks": (),
+        }
+
+    monkeypatch.setattr(base_backend_module, "estimate_mixed_step_breakdown_with_rust", native_breakdown)
+    monkeypatch.setattr(
+        backend,
+        "_run_visual_context_phase",
+        lambda *_: ({"visual_attention": 4.0}, {"visual_attention": 400.0}, {"visual_attention": "silicon"}),
+    )
     monkeypatch.setattr(backend, "_get_genonly_step_estimate", lambda *_: StepEstimate(latency_ms=0.0, energy_wms=0.0))
     summary = backend.run_agg(
         model,
@@ -1622,15 +1650,60 @@ def test_run_agg_visual_fpm_keeps_uncached_step_count(backend, model, database, 
         RuntimeConfig(
             batch_size=1,
             isl=3072,
-            prefix=2048,
+            prefix=prefix,
             osl=1,
             num_images_per_request=1,
             num_image_tokens=1024,
             engine_step_backend="rust",
         ),
-        ctx_tokens=1024,
+        ctx_tokens=budget,
     )
-    assert summary.get_result_dict()["ttft"] == pytest.approx(10.0 * 1.95)
+    assert seen == [min(budget, 4096 - prefix)]
+    total_ms = 5.0 * chunks + 4.0
     group = summary.get_aggregate_energy_breakdown()["mix_step"]
-    assert group.latency_ms == pytest.approx(10.0)
-    assert group.energy_wms == pytest.approx(1000.0)
+    assert summary.get_result_dict()["ttft"] == pytest.approx(total_ms * qf)
+    assert group.latency_ms == pytest.approx(total_ms)
+    assert group.energy_wms == pytest.approx(total_ms * 100)
+    assert group.covered_latency_ms == pytest.approx(total_ms)
+    assert group.per_op_latency_ms["visual_attention"] == pytest.approx(4.0)
+    assert group.per_op_energy_wms["visual_attention"] == pytest.approx(400.0)
+
+
+@pytest.mark.parametrize("native_op", [False, True])
+@pytest.mark.parametrize("phase", ["context", "generation"])
+@pytest.mark.parametrize("prefix", [0, 3000])
+def test_run_agg_rejects_chunked_visual_qualified_mamba(
+    backend, model, database, monkeypatch, native_op, phase, prefix
+):
+    from aisim_core import _native
+    from aisim_core.sdk.operations import Mamba2Kernel
+
+    mamba_type = _native.Mamba2Kernel if native_op else Mamba2Kernel
+    scan = mamba_type(
+        f"{phase}_mamba_ssm",
+        1,
+        "mamba_chunk_scan_combined" if phase == "context" else "selective_state_update",
+        phase,
+        4096,
+        64,
+        64,
+        128,
+        4,
+        8,
+        128,
+        state_dtype="float16",
+    )
+    getattr(model, f"{phase}_ops").append(scan)
+    model.encoder_config = _vision_encoder_config()
+    # Fail before any native prediction or encoder work: the visual mean-field
+    # weight cannot price 512, 512, 72 fresh tokens as three scan state pairs.
+    monkeypatch.setattr(backend, "run_mixed", lambda *_: pytest.fail("unsupported graph was priced"))
+    with pytest.raises(ValueError, match="qualified Mamba with chunked visual prefill is unsupported"):
+        backend.run_agg(
+            model,
+            database,
+            RuntimeConfig(
+                batch_size=1, isl=3072, prefix=prefix, osl=1, num_images_per_request=1, num_image_tokens=1024
+            ),
+            ctx_tokens=512,
+        )

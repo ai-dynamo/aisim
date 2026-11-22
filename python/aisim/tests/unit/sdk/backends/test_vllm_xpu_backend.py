@@ -564,6 +564,8 @@ def test_batched_cold_unqualified_mamba_keeps_calibrated_scaling(monkeypatch):
     assert calls == [1]
 
 
+@pytest.mark.parametrize("native_op", [False, True])
+@pytest.mark.parametrize("generation_only", [False, True])
 @pytest.mark.parametrize("regime", ["burst", "admission"])
 @pytest.mark.parametrize(
     "prefix,budget,chunks",
@@ -579,7 +581,10 @@ def test_batched_cold_unqualified_mamba_keeps_calibrated_scaling(monkeypatch):
         (0, 1002, [(1000, 0), (2000, 1000), (3000, 2000), (4000, 3000), (4096, 4000)]),
     ],
 )
-def test_batched_ttft_prices_native_uncached_chunks(monkeypatch, regime, prefix, budget, chunks):
+def test_batched_ttft_prices_native_uncached_chunks(
+    monkeypatch, regime, prefix, budget, chunks, native_op, generation_only
+):
+    from aisim_core import _native
     from aisim_core.sdk import operations as ops
     from aisim_core.sdk.config import ModelConfig, RuntimeConfig
     from aisim_core.sdk.models import get_model
@@ -594,26 +599,31 @@ def test_batched_ttft_prices_native_uncached_chunks(monkeypatch, regime, prefix,
         ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1),
         "vllm",
     )
-    model.context_ops = [
-        ops.Mamba2Kernel(
-            "context_mamba_ssm",
-            1,
-            "mamba_chunk_scan_combined",
-            "context",
-            4096,
-            64,
-            64,
-            128,
-            4,
-            8,
-            128,
-            state_dtype="float16",
-        )
-    ]
+    mamba_type = _native.Mamba2Kernel if native_op else ops.Mamba2Kernel
+    model.context_ops = (
+        []
+        if generation_only
+        else [
+            mamba_type(
+                "context_mamba_ssm",
+                1,
+                "mamba_chunk_scan_combined",
+                "context",
+                4096,
+                64,
+                64,
+                128,
+                4,
+                8,
+                128,
+                state_dtype="float16",
+            )
+        ]
+    )
     decode_attention = [op for op in model.generation_ops if op._name == "generation_attention"]
     assert decode_attention
     model.generation_ops = decode_attention + [
-        ops.Mamba2Kernel(
+        mamba_type(
             "generation_mamba_ssm",
             1,
             "selective_state_update",
@@ -656,8 +666,8 @@ def test_batched_ttft_prices_native_uncached_chunks(monkeypatch, regime, prefix,
     # six decode tokens/states, at B200's 7.7e12 B/s. The final 72 tokens
     # pay a full state charge. Dispatch is 0.3 ms once for the whole request.
     count = max(1, len(chunks))
-    activation_bytes = (4096 - prefix) * 20_608
-    state_bytes = count * 2 * 1_048_576
+    activation_bytes = 0 if generation_only else (4096 - prefix) * 20_608
+    state_bytes = 0 if generation_only else count * 2 * 1_048_576
     decode_scan_ms = (2 * 20_608 + 2 * 2 * 1_048_576) / 7.7e12 * 1000
     assert estimates[0].per_op_latency_ms["generation_mamba_ssm"] == pytest.approx(decode_scan_ms, rel=1e-9)
     # Concurrent decoders keep the original native KV shape, independently

@@ -63,6 +63,17 @@ def _is_fpm_model(model: BaseModel) -> bool:
     return getattr(model, "forward_model", "op_level") == "fpm"
 
 
+def _has_qualified_mamba(model: BaseModel) -> bool:
+    """Recognize both native operations and SDK subclasses in either phase."""
+    from aisim_core._native import Mamba2Kernel
+
+    return any(
+        isinstance(op, Mamba2Kernel) and op.__getnewargs_ex__()[1].get("state_dtype", "unrecorded") != "unrecorded"
+        for phase in ("context_ops", "generation_ops")
+        for op in getattr(model, phase, ())
+    )
+
+
 def _qwen_smart_resize(height: int, width: int, enc_cfg: common.VisionEncoderConfig) -> tuple[int, int]:
     """Resized height and width of the Qwen VL image processors' ``smart_resize``.
 
@@ -1813,8 +1824,12 @@ class BaseBackend:
         latency_ms = float(components["latency_ms"])
         energy_wms = float(components["energy_wms"])
         if self._has_visual_context_work(model, runtime_config):
-            visual_batch = int(np.ceil(step.context_tokens / isl))
-            visual_scale = float(np.ceil(isl / step.context_tokens))
+            # FPM consumes fresh tokens and averages uncached chunks. Its
+            # visual overlay must use the same schedule, including when the
+            # entire suffix fits in a single step.
+            visual_request_tokens = isl - prefix if _is_fpm_model(model) else isl
+            visual_batch = int(np.ceil(step.context_tokens / visual_request_tokens))
+            visual_scale = float(np.ceil(visual_request_tokens / step.context_tokens))
             visual_latency, visual_energy, visual_source = self._run_visual_context_phase(
                 model,
                 database,
@@ -2010,6 +2025,17 @@ class BaseBackend:
         isl = text_isl + img_ctx_tokens
         ctx_tokens = kwargs.get("ctx_tokens")
         assert ctx_tokens is not None, "ctx_tokens is required"
+        if (
+            b == 1
+            and img_ctx_tokens > 0
+            and not _is_fpm_model(model)
+            and 0 < ctx_tokens < isl - prefix
+            and _has_qualified_mamba(model)
+        ):
+            # The visual mean-field weight restores amortized attention, but
+            # cannot multiply a qualified scan's per-chunk state transfer.
+            # Exact visual chunk geometry is not represented by this path.
+            raise ValueError("qualified Mamba with chunked visual prefill is unsupported in run_agg")
         # None (or an omitted kwarg) means the caller did not model speculative
         # progress here; the summary then stays eligible for the upper-layer
         # post-hoc projection (SpeculativeDecodingProfile.project_summary).

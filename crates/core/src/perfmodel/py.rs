@@ -1079,6 +1079,13 @@ fn engine_spec_json_from_bincode(bytes: &[u8]) -> PyResult<String> {
 fn engine_spec_bincode_from_json(spec_json: &str) -> PyResult<Vec<u8>> {
     let spec: crate::perfmodel::engine::spec::EngineSpec = serde_json::from_str(spec_json)
         .map_err(|e| PyValueError::new_err(format!("engine spec JSON decode: {e}")))?;
+    if spec.schema_version != crate::ENGINE_SPEC_SCHEMA_VERSION {
+        return Err(aic_to_py(AicError::UnsupportedSchemaVersion {
+            kind: "EngineSpec",
+            got: spec.schema_version,
+            expected: crate::ENGINE_SPEC_SCHEMA_VERSION,
+        }));
+    }
     spec.to_bincode().map_err(aic_to_py)
 }
 

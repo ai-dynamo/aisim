@@ -2647,9 +2647,21 @@ def test_default_config_wideep_mla_spec_survives_the_real_bincode_decode():
     assert spec["context_ops"][0]["WideEpContextMla"]["attn_backend"] == "flashinfer"
     assert spec["generation_ops"][0]["WideEpGenerationMla"]["attn_backend"] == "flashinfer"
 
-    # The JSON -> bincode conversion is NOT schema-gated (the version check lives
-    # in `from_bincode`), so this exercises field validation on today's tree.
-    assert len(aisim_core.engine_spec_bincode_from_json(spec_json)) > 0
+    # Current-schema JSON still validates fields and round-trips. Stale JSON
+    # must fail at conversion rather than yielding bytes the engine rejects.
+    from aisim_core import _native
+
+    encoded = aisim_core.engine_spec_bincode_from_json(spec_json)
+    restored = _native.engine_spec_json_from_bincode(encoded)
+    assert aisim_core.engine_spec_bincode_from_json(restored) == encoded
+    for version in (30, spec["schema_version"] + 1):
+        stale = dict(spec, schema_version=version)
+        with pytest.raises(ValueError, match=f"got {version}, expected .*recompile with this engine"):
+            aisim_core.engine_spec_bincode_from_json(json.dumps(stale))
+        # Keep the independently enforced binary version gate strict too.
+        stale_bytes = version.to_bytes(4, "little") + encoded[4:]
+        with pytest.raises(ValueError, match=f"got {version}, expected .*recompile with this engine"):
+            _native.engine_spec_json_from_bincode(stale_bytes)
 
 
 def test_mixed_energy_coverage_keeps_missing_contributions_with_repeated_names(monkeypatch):

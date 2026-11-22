@@ -11,10 +11,10 @@ import logging
 import math
 from dataclasses import replace
 
+from aisim_core.sdk.backends.base_backend import _has_qualified_mamba
 from aisim_core.sdk.backends.vllm_backend import VLLMBackend
 from aisim_core.sdk.config import RuntimeConfig
 from aisim_core.sdk.models import BaseModel
-from aisim_core.sdk.operations import Mamba2Kernel
 from aisim_core.sdk.perf_database import PerfDatabase
 from aisim_core.sdk.step_estimate import MixedStepInput, StepEstimate
 
@@ -78,17 +78,7 @@ class VLLMXPUBackend(VLLMBackend):
             MixedStepInput(context_tokens=ctx_tokens if b > 1 else prefill_ctx, num_decode_requests=d),
         )
         exact_text_prefill = (
-            b > 1
-            and not is_fpm
-            and isl == runtime_config.isl
-            and (
-                prefix > 0
-                or any(
-                    isinstance(op, Mamba2Kernel)
-                    and op.__getnewargs_ex__()[1].get("state_dtype", "unrecorded") != "unrecorded"
-                    for op in getattr(model, "context_ops", ())
-                )
-            )
+            b > 1 and not is_fpm and isl == runtime_config.isl and (prefix > 0 or _has_qualified_mamba(model))
         )
         if exact_text_prefill:
             # A packed prompt budget is not a multiplier for already-priced

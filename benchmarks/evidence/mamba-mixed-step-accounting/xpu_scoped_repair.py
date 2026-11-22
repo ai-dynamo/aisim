@@ -12,42 +12,56 @@ Decode growth is held at one and capacity admits the full batch. The real
 XPU budget conversion, own-prefill scaling and burst factor execute unchanged.
 """
 
+import argparse
 import hashlib
 import inspect
 import json
 import subprocess
-import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 BASE = "0cfbdb5535583493e4ab073241e1f74d707acdde"
 SOURCE = "python/aisim/src/aisim_core/sdk/backends/vllm_backend_xpu.py"
+BASE_SOURCE = "python/aisim/src/aisim_core/sdk/backends/base_backend.py"
 
 
-def verified_candidate_hash(backend_class, expected_source):
+def verified_candidate_hash(backend_class, expected_source, *, revision=None):
     """Bind the fingerprint to the Python class actually used by the comparison."""
     imported_source = inspect.getsourcefile(backend_class)
     if imported_source is None:
         raise ValueError("candidate backend has no inspectable source")
     imported_bytes = Path(imported_source).read_bytes()
-    if imported_bytes != Path(expected_source).read_bytes():
+    expected_bytes = (
+        subprocess.check_output(["git", "show", f"{revision}:{expected_source}"])
+        if revision is not None
+        else Path(expected_source).read_bytes()
+    )
+    if imported_bytes != expected_bytes:
         raise ValueError(f"imported candidate backend differs from checkout: {imported_source}")
     return hashlib.sha256(imported_bytes).hexdigest()
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--candidate-revision", default="HEAD")
+    args = parser.parse_args()
+    candidate = subprocess.check_output(["git", "rev-parse", args.candidate_revision], text=True).strip()
+    from aisim_core.sdk.backends.base_backend import BaseBackend
     from aisim_core.sdk.backends.vllm_backend import VLLMBackend
     from aisim_core.sdk.backends.vllm_backend_xpu import VLLMXPUBackend
     from aisim_core.sdk.step_estimate import StepEstimate
 
-    expected_source = Path(__file__).resolve().parents[3] / SOURCE
-    candidate_hash = verified_candidate_hash(VLLMXPUBackend, expected_source)
+    candidate_hash = verified_candidate_hash(VLLMXPUBackend, SOURCE, revision=candidate)
+    base_hash = verified_candidate_hash(BaseBackend, BASE_SOURCE, revision=candidate)
     baseline_source = subprocess.check_output(["git", "show", f"{BASE}:{SOURCE}"], text=True)
     baseline = ModuleType("baseline_xpu")
     exec(compile(baseline_source, f"{BASE}:{SOURCE}", "exec"), baseline.__dict__)
     result = {
+        "candidate": candidate,
         "candidate_source_sha256": candidate_hash,
+        "candidate_base_source_sha256": base_hash,
         "baseline": BASE,
         "price_kind": "synthetic FPM caller fixture",
         "cases": [],
@@ -91,7 +105,7 @@ def main():
             case[name] = {"pricing_shapes": shapes, "ttft_ms": ttft}
         result["cases"].append(case)
     result["driver_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-    Path(sys.argv[1]).write_text(json.dumps(result, indent=2) + "\n")
+    args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result["cases"], indent=2))
 
 
