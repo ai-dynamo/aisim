@@ -5086,3 +5086,391 @@ fn startup_blocks_equal_the_pages_of_the_profile_peak_bound() {
         assert!(error.contains(refusal), "{error}");
     }
 }
+
+/// The hash boundaries of `request`, up to `tokens`, whose key is cached in
+/// `group`.
+fn cached_positions(
+    pool: &GroupedBlockPool,
+    group: u16,
+    request: &BlockRequestLease,
+    hash_block: usize,
+    tokens: usize,
+) -> Vec<usize> {
+    (hash_block..=tokens)
+        .step_by(hash_block)
+        .filter(|&end| {
+            pool.key_hit(group, request.prefix_hash_at(end).unwrap())
+                .is_some()
+        })
+        .collect()
+}
+
+/// Full attention, a ring and one state group, the first and the last with
+/// blocks of 32 tokens. With `checkpoint`, the state group has one prefill
+/// checkpoint block at alignment 4.
+fn groups_of_32(checkpoint: bool) -> Vec<FpmCacheGroup> {
+    let mut kda = state("kda", 32, true, checkpoint);
+    if checkpoint {
+        kda.prefill_checkpoint_alignment = Some(4);
+    }
+    vec![
+        attention("mla", 32, None),
+        state("kpool_tail", 4, false, false),
+        kda,
+    ]
+}
+
+#[test]
+fn block_that_one_chunk_fills_past_the_prompt_tail_takes_both_keys() {
+    // A prompt of 64 tokens at a hash block of 4, then the same prompt again.
+    // vLLM 0.32.0 and 0.33.0 put the partial tail at 60, inside the second
+    // block, which the same cache step has given its full key (v0.32.0
+    // single:830-884, block_pool.py:449-523, :626-646, v0.33.0
+    // single:840-897, block_pool.py:486-560, :666-686). vLLM 0.31.0 puts the
+    // tail at 64, a block end, and registers none (v0.31.0 single:876-880).
+    // Without a checkpoint block the same versions compute the prompt in
+    // three chunks, so the block gets the tail key first and its full key
+    // when the last chunk fills it (v0.32.0 block_pool.py:286-299, v0.33.0
+    // :290-303), and the same cache step adds the tail key back. A cached
+    // block counts once, whatever number of keys it holds.
+    let hash = 4;
+    for (
+        version,
+        checkpoint,
+        a_chunks,
+        a_keys,
+        a_states,
+        hit,
+        b_chunks,
+        b_blocks,
+        b_states,
+        cached,
+    ) in [
+        // v0.31.0: A is one chunk and leaves g0{32 64} g2{-}; B hits 0 with
+        // the junction 32, computes 32 and 32, takes 3 blocks first and
+        // leaves g2{32}.
+        (
+            VllmRuleVersion::V0_31_0,
+            false,
+            vec![64],
+            vec![32, 64],
+            vec![],
+            (0, 32),
+            vec![32, 64],
+            3,
+            vec![32],
+            // g0{32x2 64x2} g2{32} are 5 cached blocks.
+            5,
+        ),
+        // v0.32.0 and v0.33.0 with the checkpoint block: A is one chunk and
+        // leaves g0{32 64+60} g2{60}; B hits 60
+        // with no junction, computes 4, takes 6 blocks first and leaves
+        // g2{60}.
+        (
+            VllmRuleVersion::V0_32_0,
+            true,
+            vec![64],
+            vec![32, 60, 64],
+            vec![60],
+            (60, 0),
+            vec![64],
+            6,
+            vec![60],
+            // g0{32 64+60x2} g2{60} are 4 cached blocks.
+            4,
+        ),
+        (
+            VllmRuleVersion::V0_33_0,
+            true,
+            vec![64],
+            vec![32, 60, 64],
+            vec![60],
+            (60, 0),
+            vec![64],
+            6,
+            vec![60],
+            4,
+        ),
+        // v0.32.0 and v0.33.0 without the checkpoint block: A computes 32,
+        // 28 and 4 and leaves g0{32 64+60}
+        // g2{32 60}; B hits 60 with no junction, computes 4, takes 6 blocks
+        // first and leaves g2{32 60}.
+        (
+            VllmRuleVersion::V0_32_0,
+            false,
+            vec![32, 60, 64],
+            vec![32, 60, 64],
+            vec![32, 60],
+            (60, 0),
+            vec![64],
+            6,
+            vec![32, 60],
+            // g0{32 64+60x2} g2{32 60} are 5 cached blocks.
+            5,
+        ),
+        (
+            VllmRuleVersion::V0_33_0,
+            false,
+            vec![32, 60, 64],
+            vec![32, 60, 64],
+            vec![32, 60],
+            (60, 0),
+            vec![64],
+            6,
+            vec![32, 60],
+            5,
+        ),
+    ] {
+        let groups = groups_of_32(checkpoint);
+        let mut coordinator = with_limits(GroupedPrefixRules::new(&groups, hash, version).unwrap());
+        let mut kv = kv_pool(&groups, 64);
+        let pool = kv.block_pool_mut().unwrap();
+        let request = lease(64, hash);
+        let cold = coordinator.find_longest_hit(pool, &request, 64);
+        let mut a = coordinator.new_lease();
+        let ends = prefill(&mut coordinator, pool, &mut a, &request, 64, &cold, BUDGET);
+        assert_eq!(ends, a_chunks, "{version:?}");
+        assert_eq!(
+            cached_positions(pool, 0, &request, hash, 64),
+            a_keys,
+            "{version:?}"
+        );
+        assert_eq!(
+            cached_positions(pool, 2, &request, hash, 64),
+            a_states,
+            "{version:?}"
+        );
+        // The keys of group 0 lie on two blocks.
+        assert_eq!(attention_copies(&a, 0), 2, "{version:?}");
+        coordinator.release_request(pool, &mut a);
+
+        let b_hit = coordinator.find_longest_hit(pool, &request, 64);
+        assert_eq!((b_hit.tokens, b_hit.junction_tokens), hit, "{version:?}");
+        assert_eq!(
+            coordinator.first_allocation_blocks(pool, &b_hit, 64, b_chunks[0]),
+            b_blocks,
+            "{version:?}"
+        );
+        let mut b = coordinator.new_lease();
+        coordinator.pin_hit(pool, &mut b, &b_hit).unwrap();
+        let ends = prefill(&mut coordinator, pool, &mut b, &request, 64, &b_hit, BUDGET);
+        assert_eq!(ends, b_chunks, "{version:?}");
+        assert_eq!(
+            cached_positions(pool, 0, &request, hash, 64),
+            a_keys,
+            "{version:?}"
+        );
+        assert_eq!(
+            cached_positions(pool, 2, &request, hash, 64),
+            b_states,
+            "{version:?}"
+        );
+        coordinator.release_request(pool, &mut b);
+        assert_eq!(pool.active_blocks(), 0, "{version:?}");
+        assert_eq!(pool.inactive_cached_blocks(), cached, "{version:?}");
+    }
+}
+
+#[test]
+fn two_key_block_serves_a_hit_through_either_key_and_leaves_with_both() {
+    // The second block of a 64-token prompt holds its full key 64 and the
+    // key of the prompt tail 60 on vLLM 0.32.0 and 0.33.0. A repeat of the
+    // prompt takes the block through the tail key and leaves a second block
+    // with both keys, g0{32 64+60x2} (v0.32.0 single:830-884,
+    // block_pool.py:449-523, :626-646, v0.33.0 single:840-897,
+    // block_pool.py:486-560, :666-686). A longer prompt takes it through the
+    // full key.
+    let hash = 4;
+    for version in [VllmRuleVersion::V0_32_0, VllmRuleVersion::V0_33_0] {
+        let groups = groups_of_32(true);
+        let mut coordinator = with_limits(GroupedPrefixRules::new(&groups, hash, version).unwrap());
+        let mut kv = kv_pool(&groups, 64);
+        let pool = kv.block_pool_mut().unwrap();
+        let request = lease(64, hash);
+        let key_state = |pool: &GroupedBlockPool, tokens| {
+            pool.key_hit(0, request.prefix_hash_at(tokens).unwrap())
+                .map(|hit| hit.is_active)
+        };
+        let cold = coordinator.find_longest_hit(pool, &request, 64);
+        let mut a = coordinator.new_lease();
+        prefill(&mut coordinator, pool, &mut a, &request, 64, &cold, BUDGET);
+        coordinator.release_request(pool, &mut a);
+        // A's cached blocks, oldest first: the block of 64 and 60, the block
+        // of 32, the checkpoint block.
+        assert_eq!(pool.inactive_cached_blocks(), 3, "{version:?}");
+
+        // A prompt of 100 tokens finds the full blocks 32 and 64 in group 0
+        // and the state at 60, so it hits 60 with the junction 4 (v0.32.0
+        // coord:796-931, v0.33.0 coord:806-941) and takes the second block
+        // through its full key.
+        let long = lease(100, hash);
+        let long_hit = coordinator.find_longest_hit(pool, &long, 100);
+        assert_eq!((long_hit.tokens, long_hit.junction_tokens), (60, 4));
+        assert_eq!(
+            long_hit.per_group[0],
+            GroupHitBlocks::Attention(vec![Some(key(0, hash, 32)), Some(key(0, hash, 64))])
+        );
+        let mut held = coordinator.new_lease();
+        coordinator.pin_hit(pool, &mut held, &long_hit).unwrap();
+        assert_eq!(key_state(pool, 60), Some(true), "{version:?}");
+        assert_eq!(key_state(pool, 64), Some(true), "{version:?}");
+        coordinator.release_request(pool, &mut held);
+
+        // The repeat takes the same block through the tail key, copies it
+        // and gives its copy both keys.
+        let b_hit = coordinator.find_longest_hit(pool, &request, 64);
+        assert_eq!(
+            b_hit.per_group[0],
+            GroupHitBlocks::Attention(vec![Some(key(0, hash, 32)), Some(key(0, hash, 60))])
+        );
+        let mut b = coordinator.new_lease();
+        coordinator.pin_hit(pool, &mut b, &b_hit).unwrap();
+        prefill(&mut coordinator, pool, &mut b, &request, 64, &b_hit, BUDGET);
+        coordinator.release_request(pool, &mut b);
+        // Cached, oldest first: A's block of 64 and 60 and A's checkpoint
+        // block (the copy sources of B's pass), then B's block of 64 and 60,
+        // then the block of 32.
+        assert_eq!(pool.inactive_cached_blocks(), 4, "{version:?}");
+        // A block leaves with every key that it holds
+        // (v0.32.0 block_pool.py:590-609, :744, v0.33.0 :630-649, :784), and
+        // a key stays visible while another block holds it.
+        evict_one(pool);
+        assert_eq!(
+            cached_positions(pool, 0, &request, hash, 64),
+            [32, 60, 64],
+            "{version:?}"
+        );
+        evict_one(pool);
+        assert!(cached_positions(pool, 2, &request, hash, 64).is_empty());
+        evict_one(pool);
+        assert_eq!(
+            cached_positions(pool, 0, &request, hash, 64),
+            [32],
+            "{version:?}"
+        );
+        assert_eq!(pool.inactive_cached_blocks(), 1, "{version:?}");
+    }
+}
+
+#[test]
+fn block_with_the_key_of_the_prompt_tail_takes_its_full_key_when_a_later_chunk_fills_it() {
+    // Two full-attention groups with blocks of 64 and 16 tokens, so a hash
+    // block of 16 and hits on multiples of 64. A prompt of 128 tokens has its
+    // partial tail at 112 on vLLM 0.32.0 and 0.33.0, inside the second
+    // 64-token block, and at 128 on vLLM 0.31.0, which registers none. Then
+    // a prompt of 200 tokens with the same first 128 (v0.31.0
+    // single:845-892, v0.32.0 single:830-884, v0.33.0 single:840-897). At a
+    // budget of 120 replay gives the block the tail key in the chunk that
+    // ends at 120 and its full key in the chunk that fills it, the order of
+    // v0.32.0 block_pool.py:286-299 and v0.33.0 :290-303. vLLM caches only
+    // up to the scheduler block of 64 tokens here (v0.31.0
+    // kv_cache_coordinator.py:796-806, v0.32.0 :767-777, v0.33.0 :777-787),
+    // so it gives the block both keys in the second chunk. Both end with the
+    // same keys. At a budget of 512 one chunk gives the block its full key
+    // and then the tail key (v0.32.0 block_pool.py:449-523, :626-646,
+    // v0.33.0 :486-560, :666-686).
+    let hash = 16;
+    let groups = [attention("wide", 64, None), attention("narrow", 16, None)];
+    let narrow_keys: Vec<usize> = (16..=128).step_by(16).collect();
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
+        // Keys after A: g0{64 128} on v0.31.0 and g0{64 128+112} on v0.32.0
+        // and v0.33.0, and g1{16 .. 128} on all three.
+        let wide_keys = match version {
+            VllmRuleVersion::V0_31_0 => vec![64, 128],
+            VllmRuleVersion::V0_32_0 | VllmRuleVersion::V0_33_0 => vec![64, 112, 128],
+        };
+        // A computes 120 and 8 at a budget of 120, and 128 at a budget of
+        // 512.
+        for (budget, chunks) in [(120, vec![120, 128]), (512, vec![128])] {
+            let mut coordinator =
+                with_limits(GroupedPrefixRules::new(&groups, hash, version).unwrap());
+            let mut kv = kv_pool(&groups, 64);
+            let pool = kv.block_pool_mut().unwrap();
+            let request = lease(128, hash);
+            let cold = coordinator.find_longest_hit(pool, &request, 128);
+            let mut a = coordinator.new_lease();
+            let ends = prefill(&mut coordinator, pool, &mut a, &request, 128, &cold, budget);
+            assert_eq!(ends, chunks, "{version:?} at {budget}");
+            assert_eq!(
+                cached_positions(pool, 0, &request, hash, 128),
+                wide_keys,
+                "{version:?} at {budget}"
+            );
+            assert_eq!(
+                cached_positions(pool, 1, &request, hash, 128),
+                narrow_keys,
+                "{version:?} at {budget}"
+            );
+            // The keys of the 64-token group lie on two blocks.
+            assert_eq!(attention_copies(&a, 0), 2, "{version:?} at {budget}");
+            coordinator.release_request(pool, &mut a);
+
+            let tokens: Vec<u32> = (0..128).chain(5000..5072).collect();
+            let mut longer = BlockRequestLease::new(Uuid::nil(), Vec::new());
+            longer.configure_prefix_hashes(&tokens, hash);
+            let b_hit = coordinator.find_longest_hit(pool, &longer, 200);
+            // B finds the full key 128 in both groups, so it hits 128 with
+            // no junction. Its first allocation counts the blocks of 200
+            // tokens, cdiv(200, 64) + cdiv(200, 16) = 4 + 13 = 17, the hit
+            // blocks among them because no request holds them (v0.31.0
+            // single:216-268, v0.32.0 single:213-265, v0.33.0
+            // single:214-266).
+            assert_eq!(
+                (b_hit.tokens, b_hit.junction_tokens),
+                (128, 0),
+                "{version:?} at {budget}"
+            );
+            assert_eq!(
+                coordinator.first_allocation_blocks(pool, &b_hit, 200, 200),
+                17,
+                "{version:?} at {budget}"
+            );
+            let mut b = coordinator.new_lease();
+            coordinator.pin_hit(pool, &mut b, &b_hit).unwrap();
+            let ends = prefill(&mut coordinator, pool, &mut b, &longer, 200, &b_hit, budget);
+            // B computes its 72 new tokens in one chunk.
+            assert_eq!(ends, [200], "{version:?} at {budget}");
+            // Keys after B: g0{64 128(+112) 192} g1{16 .. 192}. The tail of
+            // B, (200 - 1) // 16 * 16 = 192 at v0.32.0 and v0.33.0 and
+            // 200 // 16 * 16 = 192 at v0.31.0, is a block end and gets no
+            // entry.
+            let mut wide_after = wide_keys.clone();
+            wide_after.push(192);
+            assert_eq!(
+                cached_positions(pool, 0, &longer, hash, 200),
+                wide_after,
+                "{version:?} at {budget}"
+            );
+            assert_eq!(
+                cached_positions(pool, 1, &longer, hash, 200),
+                (16..=192).step_by(16).collect::<Vec<_>>(),
+                "{version:?} at {budget}"
+            );
+            coordinator.release_request(pool, &mut b);
+
+            // B held every block of A and released its blocks tail first,
+            // the 64-token group first: the block of 192, A's second
+            // 64-token block, the block of 64. So the first eviction takes
+            // the block of 192 and its one key, and the second takes A's
+            // second block with every key that it holds (v0.31.0
+            // block_pool.py:593-612, :747, v0.32.0 :590-609, :744, v0.33.0
+            // :630-649, :784).
+            let before = cached_positions(pool, 0, &longer, hash, 200);
+            evict_one(pool);
+            assert_eq!(
+                cached_positions(pool, 0, &longer, hash, 200).len() + 1,
+                before.len()
+            );
+            evict_one(pool);
+            assert_eq!(
+                cached_positions(pool, 0, &longer, hash, 200),
+                [64],
+                "{version:?} at {budget}"
+            );
+        }
+    }
+}

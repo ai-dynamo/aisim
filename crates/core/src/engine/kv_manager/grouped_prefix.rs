@@ -2106,26 +2106,45 @@ impl GroupedPrefixCoordinator {
                     let full = (computed_after / block).min(copies.len());
                     for (i, copy) in copies.iter().enumerate().take(full).skip(*finalized) {
                         if let Some(id) = copy
-                            && pool.is_private(*id)
                             && let Some(key) = key_at((i + 1) * block)
                         {
-                            pool.cache(*id, key);
+                            if pool.is_private(*id) {
+                                pool.cache(*id, key);
+                            } else {
+                                // A cached block that the step completes
+                                // holds the key of the prompt's partial tail,
+                                // and vLLM gives it its full key too (v0.31.0
+                                // `vllm/v1/core/block_pool.py:286-299`,
+                                // v0.32.0 `:286-299`, v0.33.0 `:290-303`). For
+                                // a hit block, which holds this key, the call
+                                // changes nothing.
+                                pool.cache_alias(*id, key, None);
+                            }
                         }
                     }
                     *finalized = (*finalized).max(full);
                     // The prompt's partial-tail entry, so that a later prompt
                     // can hit up to the tail, inside the last block
-                    // (`single:864-880`, v0.32 `single:860-868`).
+                    // (`single:864-880`, v0.32 `single:860-868`, v0.33
+                    // `single:870-881`). vLLM adds it at every cache step,
+                    // also to a block that has its full key (v0.31.0
+                    // `single:845-892`, `vllm/v1/core/block_pool.py:505-526`,
+                    // `:629-649`, v0.32.0 `single:830-884`,
+                    // `block_pool.py:502-523`, `:626-646`, v0.33.0
+                    // `single:840-897`, `block_pool.py:539-560`, `:666-686`).
                     let tail = rules.partial_tail(prompt);
                     if rules.hash_block < block
                         && tail > 0
                         && !tail.is_multiple_of(block)
                         && tail <= computed_after
                         && let Some(Some(id)) = copies.get(tail / block)
-                        && pool.is_private(*id)
                         && let Some(key) = key_at(tail)
                     {
-                        pool.cache_at(*id, key, in_block(tail));
+                        if pool.is_private(*id) {
+                            pool.cache_at(*id, key, in_block(tail));
+                        } else {
+                            pool.cache_alias(*id, key, in_block(tail));
+                        }
                     }
                 }
                 (

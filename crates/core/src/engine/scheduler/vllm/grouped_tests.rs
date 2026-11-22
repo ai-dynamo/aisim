@@ -7288,3 +7288,116 @@ fn single_full_attention_group_matches_the_linear_pool() {
         );
     }
 }
+
+/// Full attention, a ring and one state group, the first and the last with
+/// blocks of 32 tokens, at a hash block of 4 tokens and a step budget of 512
+/// tokens. With `checkpoint`, vLLM 0.32.0 and 0.33.0 run with one prefill
+/// checkpoint block at alignment 4.
+fn block_32_core(version: &str, checkpoint: bool, max_concurrent_batches: usize) -> VllmCore {
+    let mut mla = group("mla", 32, 8, None);
+    mla.prefix_cacheable = Some(true);
+    let mut ring = state("kpool_tail", 8, 1);
+    ring.prefix_cacheable = Some(false);
+    let mut kda = state("kda", 8, 1);
+    kda.block_size_tokens = 32;
+    kda.prefix_cacheable = Some(true);
+    if version != "0.31.0" {
+        kda.prefill_checkpoint_blocks = Some(u32::from(checkpoint));
+        kda.prefill_checkpoint_alignment = checkpoint.then_some(4);
+    }
+    VllmCore::new(
+        MockEngineArgs::builder()
+            .block_size(4)
+            .num_gpu_blocks(1)
+            .max_num_batched_tokens(Some(512))
+            .max_num_seqs(Some(4))
+            .max_model_len(Some(256))
+            .enable_prefix_caching(true)
+            .prefix_match_unit(Some(4))
+            .vllm_version(Some(version.to_string()))
+            .kv_cache_groups(vec![mla, ring, kda])
+            .kv_cache_capacity_bytes(Some(200 * 8))
+            .speedup_ratio(0.0)
+            .max_concurrent_batches(max_concurrent_batches)
+            .build()
+            .unwrap(),
+    )
+}
+
+#[test]
+fn grouped_prefix_repeat_of_a_block_aligned_prompt_hits_up_to_its_partial_tail() {
+    // A prompt of 64 tokens fills two 32-token blocks in one chunk. vLLM
+    // 0.32.0 and 0.33.0 give the second block its full key and the key of
+    // the prompt's partial tail, 60, where the state group has its
+    // checkpoint key (v0.32.0 single_type_kv_cache_manager.py:830-884,
+    // block_pool.py:502-523, v0.33.0 :840-897, block_pool.py:539-560). vLLM
+    // 0.31.0 puts the tail at 64, a block end, and registers no partial key
+    // (v0.31.0 single_type_kv_cache_manager.py:876-880). So a repeat hits 60
+    // on 0.32.0 and 0.33.0, where both groups hold a key at 60, and 0 on
+    // 0.31.0, where the state group keeps no state of the first prompt. With
+    // six output tokens the decode steps fill no block and publish nothing,
+    // so the hit is the same. In debug builds the KV manager checks that
+    // those steps leave the two-key block as it is.
+    for (version, hit) in [("0.31.0", 0), ("0.32.0", 60), ("0.33.0", 60)] {
+        for output in [1, 6] {
+            let mut core = block_32_core(version, true, 1);
+            let mut trace = TraceCollector::default();
+            let mut step = 0;
+            let first = submit(&mut core, 1, 64, output);
+            assert_eq!(
+                drain(&mut core, &mut trace, &mut step),
+                vec![(first, 0)],
+                "{version} with {output} output tokens"
+            );
+            let repeat = submit(&mut core, 2, 64, 1);
+            assert_eq!(
+                drain(&mut core, &mut trace, &mut step),
+                vec![(repeat, hit)],
+                "{version} with {output} output tokens"
+            );
+            assert_eq!(block_pool(&core).active_blocks(), 0, "{version}");
+        }
+    }
+}
+
+#[test]
+fn grouped_prefix_block_keyed_at_the_prompt_tail_gets_its_full_key_from_a_later_chunk() {
+    // Two full-attention groups with blocks of 64 and 16 tokens, so a hash
+    // block of 16 and hits on multiples of 64. A prompt of 128 tokens is
+    // computed in chunks that end at 120 and 128. On vLLM 0.32.0 and 0.33.0
+    // its partial tail, 112, lies inside the second 64-token block, which
+    // also gets its full key when the second chunk fills it (v0.32.0
+    // block_pool.py:286-299, v0.33.0 :290-303). On vLLM 0.31.0 the tail lies
+    // at 128, a block end, with no partial key (v0.31.0
+    // single_type_kv_cache_manager.py:876-880). A prompt of 200 tokens with
+    // the same first 128 then finds the full key 128 in both groups and hits
+    // 128 on all three versions. With six output tokens the decode steps
+    // fill no block, so the hit is the same.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        for output in [1, 6] {
+            let mut wide = group("wide", 64, 8, None);
+            wide.prefix_cacheable = Some(true);
+            let mut narrow = group("narrow", 16, 8, None);
+            narrow.prefix_cacheable = Some(true);
+            let mut core = prefix_core(vec![wide, narrow], 200 * 8, 120, 16, version);
+            let mut trace = TraceCollector::default();
+            let mut step = 0;
+            let first = submit(&mut core, 1, 128, output);
+            assert_eq!(
+                drain(&mut core, &mut trace, &mut step),
+                vec![(first, 0)],
+                "{version} with {output} output tokens"
+            );
+            // The chunks 120 and 8, and one pass for each later output
+            // token.
+            assert_eq!(step, 1 + output, "{version}");
+            let longer = submit_tokens(&mut core, 2, (0..128).chain(5000..5072).collect(), 1);
+            assert_eq!(
+                drain(&mut core, &mut trace, &mut step),
+                vec![(longer, 128)],
+                "{version} with {output} output tokens"
+            );
+            assert_eq!(block_pool(&core).active_blocks(), 0, "{version}");
+        }
+    }
+}

@@ -407,6 +407,92 @@ fn grouped_prefix_hit_above_the_pool_is_a_livelock() {
 }
 
 #[test]
+fn grouped_prefix_tail_key_on_a_full_block_reaches_the_livelock_of_a_hit_above_the_pool() {
+    // Blocks of 4 tokens, a hash block of 2, a ring and two state groups with
+    // a checkpoint block: vLLM's startup count for a max_model_len of 47 is
+    // 12 attention blocks, the ring block and 3 blocks per state group, 19
+    // (v0.32 kv_cache_interface.py:1076-1082, v0.33 :1135-1141).
+    //
+    // The first prompt has 20 tokens. Its tail entry lies at (20 - 1) / 2 * 2
+    // = 18, inside the attention block 16..20. The chunk 12..20 fills that
+    // block, so the block has its full key when the tail entry comes, and
+    // vLLM gives it the tail key as one more key (v0.32
+    // single_type_kv_cache_manager.py:849-884, block_pool.py:449-523, v0.33
+    // single_type_kv_cache_manager.py:859-897, block_pool.py:486-560). Each
+    // state group keeps the checkpoint state at 18.
+    //
+    // The second prompt shares 19 tokens with the first, so it hits 18 tokens
+    // in every group, inside a block. Its whole prompt of 45 tokens then
+    // needs 12 attention blocks, 5 of them hit blocks that no request holds,
+    // and their copy block, the ring block, and per state group the hit
+    // block, the copy block, the running block and the checkpoint block:
+    // 13 + 1 + 2 * 4 = 22 (v0.32 kv_cache_manager.py:522-539,
+    // single_type_kv_cache_manager.py:213-265, :1724-1778, v0.33
+    // kv_cache_manager.py:531-548, single_type_kv_cache_manager.py:214-266,
+    // :1740-1795). In a pool of 19, 20 or 21 blocks vLLM keeps it waiting,
+    // and with nothing running nothing evicts the hit blocks. Replay reports
+    // the livelock and drops no request. In a pool of 22 blocks the second
+    // prompt computes 18..20, 20..32, 32..44 and 44..45, so with one batch
+    // its first token comes after four prefill passes of 10 ms, at 140 ms,
+    // and its second token one decode pass of 2 ms later.
+    for version in ["0.32.0", "0.33.0"] {
+        for async_scheduling in [true, false] {
+            for pool in [19, 20, 21, 22] {
+                let mut first = request("first", 0.0, 20, 3);
+                first.input_token_ids = Some((0..19).chain([1_000_000]).collect());
+                let mut second = request("second", 100.0, 45, 2);
+                second.input_token_ids = Some((0..19).chain(2_000_000..2_000_026).collect());
+                let mut spec = aggregated_spec(Backend::Vllm, 1, 0.0, vec![first, second]);
+                let rank = &mut spec.engine["rank"];
+                rank["enable_prefix_caching"] = true.into();
+                rank["prefix_match_unit"] = 2.into();
+                rank["vllm_version"] = version.into();
+                rank["max_model_len"] = 47.into();
+                rank["max_num_batched_tokens"] = 12.into();
+                rank["max_num_seqs"] = 2.into();
+                rank["kv_cache_capacity_bytes"] = (pool * 64).into();
+                if !async_scheduling {
+                    rank["async_scheduling"] = false.into();
+                }
+                let mut groups = vec![
+                    serde_json::json!({"name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":4, "page_size_bytes":64, "prefix_cacheable":true}),
+                    serde_json::json!({"name":"ring", "kind":"state", "num_layers":1, "block_size_tokens":4, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":false}),
+                ];
+                for index in 0..2 {
+                    groups.push(serde_json::json!({"name": format!("state_{index}"), "kind":"state", "num_layers":1, "block_size_tokens":4, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":true, "prefill_checkpoint_blocks":1, "prefill_checkpoint_alignment":2}));
+                }
+                rank["kv_cache_groups"] = serde_json::Value::Array(groups);
+                let replay = Replayer::new(spec, ReplayEngineFactory::new())
+                    .unwrap()
+                    .run();
+                let case = format!("{version} async {async_scheduling} pool {pool}");
+                if pool < 22 {
+                    assert_eq!(
+                        replay.unwrap_err().to_string(),
+                        "replay invariant violated: offline replay detected an effect-free zero-duration pass with 1 in-flight requests remaining",
+                        "{case}"
+                    );
+                    continue;
+                }
+                let report = replay.unwrap();
+                assert_eq!(report.request_counts.completed_requests, 2, "{case}");
+                let second = report
+                    .per_request
+                    .iter()
+                    .find(|row| row.request_id.as_deref() == Some("second"))
+                    .unwrap();
+                assert_eq!(second.reused_input_tokens, 18, "{case}");
+                assert_eq!(second.readmission_count, 0, "{case}");
+                if !async_scheduling {
+                    assert_eq!(second.first_token_ms, Some(140.0), "{case}");
+                    assert_eq!(second.last_token_ms, Some(142.0), "{case}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn grouped_prefix_lone_request_at_the_startup_count_is_a_livelock_with_async_scheduling() {
     // GLM-shaped groups of 2,176-token blocks with a hash block of 1,088 at
     // vLLM's startup count for a max_model_len of 13,056: 6 attention blocks,
