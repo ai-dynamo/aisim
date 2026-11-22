@@ -113,8 +113,10 @@ digest. Correcting a request changes snapshot membership even when the summary i
 auditing uses `raw_record_sha256` separately.
 
 When present, `observation_sha256` is also part of snapshot membership (`SnapshotMember.observation_sha256`), and
-`write_snapshot` binds members whose configuration is available locally to the persisted observation. Unversioned
-legacy observations and members keep their existing behavior and snapshot IDs.
+`write_snapshot` binds members whose configuration is available locally to the persisted observation. The
+configuration writer refreshes the digest from the rows it publishes, so edited requests change snapshot membership
+even when the raw summary is unchanged. Unversioned legacy observations and members keep their existing behavior
+and snapshot IDs.
 
 ### Metrics (`aisim-e2e-metrics/v1`)
 
@@ -126,7 +128,8 @@ explicit `missing` rows.
 
 The evaluator preserves throughput normalization and statistic in its full metrics map. Its per-device summary
 uses statistic `value`, then `mean`, then the sole available statistic. Multiple normalization sources at that
-statistic are ambiguous and rejected, so row order cannot choose between reported and derived throughput.
+statistic, or several other statistics with neither `value` nor `mean`, are ambiguous and rejected, so row order
+cannot choose between reported and derived throughput. Duplicate evaluator keys are rejected as well.
 
 ### Requests (`aisim-e2e-requests/v1`)
 

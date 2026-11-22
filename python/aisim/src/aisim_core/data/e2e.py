@@ -524,6 +524,18 @@ class RequestRow(_Record):
     attrs: str | None = None  # canonical JSON text: think time, dependency IDs, worker ID, ...
 
 
+def _observation_sha256(observation: ObservationRow, requests: Sequence[RequestRow]) -> str:
+    """Version the observation and its persisted request rows, including extension fields."""
+    return _sha(
+        _canonical(
+            {
+                "observation": observation.model_dump(exclude={"observation_sha256"}),
+                "requests": [row.model_dump() for row in requests],
+            }
+        )
+    )
+
+
 class SeriesRow(_Record):
     """One interval of a server-side time series (running requests, KV use, ...).
 
@@ -1042,6 +1054,8 @@ def write_configuration(root: Path, data: E2eConfigurationData, *, prefix: str =
     ``prefix`` (e.g. ``"data"``) is prepended to the configuration directory, so
     every path stays relative to the dataset root. Artifacts use immutable generation paths; only the manifest
     is replaced. Older generations remain available for readers that already opened their manifests.
+    Existing observation versions are refreshed from the rows being published;
+    the caller's objects are left untouched. Legacy unversioned rows stay unversioned.
     """
     root = Path(root)
     body = data.body
@@ -1062,6 +1076,17 @@ def write_configuration(root: Path, data: E2eConfigurationData, *, prefix: str =
         stray = {r.observation_id for r in rows} - known
         if stray:
             raise ValueError(f"rows reference unknown observations: {sorted(stray)}")
+    requests_by_observation: dict[str, list[RequestRow]] = {}
+    for request in data.requests:
+        requests_by_observation.setdefault(request.observation_id, []).append(request)
+    observations = [
+        o.model_copy(
+            update={"observation_sha256": _observation_sha256(o, requests_by_observation.get(o.observation_id, []))}
+        )
+        if o.observation_sha256 is not None
+        else o
+        for o in data.observations
+    ]
     # Everything is built in a staging directory first: a failure after the tables (an oversize raw artifact, say)
     # must leave an existing configuration readable, so published files are replaced only once all succeeded.
     root.mkdir(parents=True, exist_ok=True)
@@ -1070,7 +1095,7 @@ def write_configuration(root: Path, data: E2eConfigurationData, *, prefix: str =
         # Published artifacts are immutable. Readers holding an older manifest keep its complete generation.
         generation = f"{directory}/generations/{uuid4().hex}"
         artifacts = [
-            _write_table(stage, generation, "observations", OBSERVATIONS_SCHEMA, data.observations, "e2e-observations"),
+            _write_table(stage, generation, "observations", OBSERVATIONS_SCHEMA, observations, "e2e-observations"),
             _write_table(stage, generation, "metrics", METRICS_SCHEMA, data.metrics, "e2e-metrics"),
         ]
         if data.requests:
@@ -1215,6 +1240,8 @@ def evaluation_points(dataset: E2eDataset, *, observer: str | None = None) -> li
     Client and server measurements of one metric are different timing boundaries and never mix: with
     ``observer`` only that observer's rows are used; without it a (metric, statistic) reported twice is
     ambiguous and raises ``ValueError`` instead of letting row order decide.
+    The per-device projection uses ``value``, then ``mean``, or a sole remaining statistic; every statistic stays
+    in ``metrics``. Several other statistics, or several sources at the chosen one, are ambiguous and raise.
     """
     metrics: dict[str, list[MetricRow]] = {}
     for row in dataset.metrics:
@@ -1891,9 +1918,7 @@ def aiperf_to_configuration(
             }
         )
     )
-    obs.observation_sha256 = _sha(
-        _canonical({"observation": obs.model_dump(exclude={"observation_sha256"}), "requests": list(records)})
-    )
+    obs.observation_sha256 = _observation_sha256(obs, requests)
     return E2eConfigurationData(body, [obs], rows, requests, provenance)
 
 

@@ -452,6 +452,9 @@ def verify_record(
     the record's. GPU-free and deterministic. ``truth_root`` is the directory
     that holds the truth artifacts by their ``path``.
     """
+    # The predictor is caller code and may mutate the original record, including nested fields.
+    # Bind all checks and the report ID to the same private pre-prediction snapshot.
+    record = record.model_copy(deep=True)
     problems: list[str] = []
     checked_id = record.record_id
     if current_fingerprint != record.prediction.fingerprint:
