@@ -22,6 +22,7 @@ _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _AFD_TOPOLOGY = re.compile(r"[1-9][0-9]*A[1-9][0-9]*F\Z")
 _AGG_TOPOLOGY = re.compile(r"ep[1-9][0-9]*\Z")
 _U32_MAX = 2**32 - 1
+_U64_MAX = 2**64 - 1
 _COUNT_FIELDS = {"logical_batch_per_source_rank", "mtp_nextn", "microbatches", "moe_layers", "routed_topk"}
 _KEY_FIELDS = {
     "model_path",
@@ -298,9 +299,11 @@ def _digest(value: Any, pattern: re.Pattern[str], name: str) -> str:
     return text
 
 
-def _integer(value: Any, name: str, *, minimum: int = 1) -> int:
+def _integer(value: Any, name: str, *, minimum: int = 1, maximum: int | None = None) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise ValueError(f"{name} must be an integer >= {minimum}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be an integer <= {maximum}")
     return value
 
 
@@ -363,7 +366,7 @@ def _entry(value: Any, source: FastAFDProfileSource, index: int) -> FastAFDMoESt
         method=_text(capture["method"], f"{label}.measurement.method"),
         method_version=_text(capture["method_version"], f"{label}.measurement.method_version"),
         statistic="p50",
-        sample_count=_integer(capture["sample_count"], f"{label}.measurement.sample_count"),
+        sample_count=_integer(capture["sample_count"], f"{label}.measurement.sample_count", maximum=_U64_MAX),
         cv_percent=_number(capture["cv_percent"], f"{label}.measurement.cv_percent", minimum=0.0, exclusive=False),
         routing=_text(capture["routing"], f"{label}.measurement.routing"),
         source_tree_sha256=_digest(capture["source_tree_sha256"], _SHA256, f"{label}.measurement.source_tree_sha256"),

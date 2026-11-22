@@ -184,6 +184,26 @@ def test_stage_latency_is_spread_over_layer_microbatch_units(tmp_path):
     assert set(provenance["composition"]) == {"attention_ms", "ffn_ms", "a_to_f_ms", "f_to_a_ms"}
 
 
+def test_attention_provenance_snapshots_validated_components(tmp_path):
+    class RetainingAttention(_Attention):
+        def measure(self, request):
+            measurements = super().measure(request)
+            self.retained_components = measurements[0].provenance["components"]
+            self.retained_components["diagnostic_ms"] = 0.1
+            return measurements
+
+    attention = RetainingAttention()
+    (measurement,) = _provider(tmp_path, attention).measure(_request(_topology()))
+    components = measurement.provenance["attention"]["components"]
+    assert components == {**COMPONENTS, "diagnostic_ms": 0.1}
+    # The provider keeps its mutable mapping after returning the measurement.
+    attention.retained_components["a_router_ms"] = 0.004
+    attention.retained_components["diagnostic_ms"] = 0.2
+    assert components == {**COMPONENTS, "diagnostic_ms": 0.1}
+    assert measurement.attention_ms == pytest.approx(0.092)  # 0.09 compute + 0.002 router
+    assert type(components["attention_compute_ms"]) is float
+
+
 @pytest.mark.parametrize(
     "components",
     [None, ["dispatch", "experts", "return"], ["router", "dispatch", "experts", "return", "combine"]],

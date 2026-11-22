@@ -104,6 +104,10 @@ iterations. `stable` is the benchmark's own stability gate and must be true;
 `correctness` is the matched-output check against a reference backend, `null` when
 the benchmark ran no reference.
 
+| Measurement field | Required value | Behavior |
+| --- | --- | --- |
+| `sample_count` | Integer from 1 to 18446744073709551615 (u64) | Counts timed iterations independently of the u32 topology keys. JSON and Parquet imports preserve the same range through native estimation and provenance. |
+
 ## Consumers
 
 `afd` entries drive analytical AFD prediction through

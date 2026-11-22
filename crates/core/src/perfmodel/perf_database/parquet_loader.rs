@@ -95,6 +95,24 @@ impl<R: ChunkReader + 'static> PerfReader<R> {
         &self.path
     }
 
+    /// Positional row access uses top-level fields, whereas `col` indexes leaves.
+    /// Loaders with a flat-table contract must reject groups before resolving columns.
+    pub(crate) fn require_flat_schema(&self) -> Result<(), AicError> {
+        let schema = self.file_reader.metadata().file_metadata().schema_descr();
+        if schema
+            .root_schema()
+            .get_fields()
+            .iter()
+            .any(|field| !field.is_primitive())
+        {
+            return Err(AicError::PerfDatabase(format!(
+                "expected a flat parquet schema (no nested fields) at {}",
+                self.path.display()
+            )));
+        }
+        Ok(())
+    }
+
     /// Returns the position of `name` in the parquet schema. Errors when the
     /// column is absent, with the surviving column names in the message so
     /// schema drift is visible without opening the file.

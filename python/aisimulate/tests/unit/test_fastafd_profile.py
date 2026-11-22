@@ -74,6 +74,31 @@ def _write(tmp_path, payload):
     return path
 
 
+def _canonical_config(path, *, moe_layers=43):
+    from aisimulate_core.sdk import ForwardPassPerfModelConfig
+
+    return ForwardPassPerfModelConfig(
+        model=_entry()["key"]["model_path"],
+        system="gb200",
+        backend="sglang",
+        backend_version="0.5.14",
+        worker_type="decode",
+        estimation_mode="fastafd_stage",
+        moe_backend="megamoe",
+        afd={
+            "logical_batch_per_source_rank": 48,
+            "attention_gpus": 16,
+            "ffn_gpus": 8,
+            "f_moe_ep_size": 8,
+            "microbatches": 2,
+            "moe_layers": moe_layers,
+            "routed_topk": 6,
+            "boundary_on_attn": True,
+        },
+        estimator_config={"fastafd_stage": {"profile_path": str(path)}},
+    )
+
+
 def test_exact_lookup_preserves_source_and_method(tmp_path):
     profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload()))
     key = FastAFDMoEStageKey(**_entry()["key"])
@@ -203,15 +228,76 @@ def test_key_counts_respect_native_u32_bounds(tmp_path, field, value, suffix):
         assert profile.require(key).key == key
 
 
-def test_measurement_sample_count_is_not_limited_to_u32(tmp_path):
-    payload = _payload()
-    payload["entries"][0]["measurement"]["sample_count"] = 2**32
+@pytest.mark.parametrize("sample_count", [2**32 - 1, 2**32, 2**64 - 1])
+@pytest.mark.parametrize("suffix", ["json", "parquet"])
+def test_measurement_sample_count_is_not_limited_to_u32(tmp_path, sample_count, suffix):
+    from aisimulate_core.sdk import RustForwardPassPerfModel
 
-    profile = FastAFDMoEStageProfile.load(_write(tmp_path, payload))
+    payload = _payload()
+    payload["entries"][0]["measurement"]["sample_count"] = sample_count
+    path = _write(tmp_path, payload)
+    profile = FastAFDMoEStageProfile.load(path)
+    if suffix == "parquet":
+        path = tmp_path / "profile.parquet"
+        profile.write_parquet(path)
+
+    assert FastAFDMoEStageProfile.load(path).entries[0].sample_count == sample_count
+    model = RustForwardPassPerfModel.best_available(_canonical_config(path))
+    estimate = model.estimate_fastafd_stage(48)
+    assert estimate["stage"]["sample_count"] == sample_count
+    assert estimate["stage"]["latency_ms"] == 16.7
+
+
+@pytest.mark.parametrize("suffix", ["json", "parquet"])
+def test_measurement_sample_count_rejects_u64_overflow(tmp_path, suffix):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    payload = _payload()
+    payload["entries"][0]["measurement"]["sample_count"] = 2**64
+    if suffix == "json":
+        path = _write(tmp_path, payload)
+    else:
+        profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload()))
+        path = tmp_path / "profile.parquet"
+        profile.write_parquet(path)
+        table = pq.read_table(path)
+        capture = json.loads(table["capture_json"][0].as_py())
+        capture["measurement"]["sample_count"] = 2**64
+        index = table.schema.get_field_index("capture_json")
+        table = table.set_column(index, "capture_json", pa.array([json.dumps(capture)]))
+        pq.write_table(table, path)
+
+    with pytest.raises(ValueError, match=r"sample_count.*18446744073709551615"):
+        FastAFDMoEStageProfile.load(path)
+    with pytest.raises(ValueError, match=r"sample_count|out of range|invalid type"):
+        RustForwardPassPerfModel.best_available(_canonical_config(path))
+
+
+@pytest.mark.parametrize("nested_leaves", [1, 2])
+def test_canonical_model_rejects_nested_parquet_before_positional_reads(tmp_path, nested_leaves):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload()))
     path = tmp_path / "profile.parquet"
     profile.write_parquet(path)
+    table = pq.read_table(path)
+    # Keep every key and provenance field ahead of the nested group, so their
+    # reads still succeed. A two-leaf group shifts the latency leaf index onto
+    # the neighboring 24 ms DOUBLE although the actual measurement is 16.7 ms.
+    table = table.select([name for name in table.column_names if name != "latency_ms"] + ["latency_ms"])
+    nested = pa.array([{f"leaf_{i}": 0.0 for i in range(nested_leaves)}])
+    table = table.add_column(len(table.column_names) - 1, "nested", nested)
+    table = table.append_column("neighbor_ms", pa.array([24.0]))
+    pq.write_table(table, path)
 
-    assert FastAFDMoEStageProfile.load(path).entries[0].sample_count == 2**32
+    with pytest.raises(ValueError, match="flat parquet schema"):
+        RustForwardPassPerfModel.best_available(_canonical_config(path))
 
 
 def test_parquet_entries_and_digest_use_the_same_snapshot(tmp_path, monkeypatch):
@@ -263,7 +349,7 @@ def test_rejects_non_int64_parquet_counts(tmp_path, column, encoding):
 @pytest.mark.parametrize("profile_format", ["json", "parquet", "parquet-float"])
 @pytest.mark.parametrize("mode_field", ["estimation_mode", "forward_model"])
 def test_profile_loads_through_canonical_model_preserving_source(tmp_path, location, profile_format, mode_field):
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisimulate_core.sdk import RustForwardPassPerfModel
 
     payload = _payload()
     # Synthetic complete stage: 12 ms for 3 layers and 2 microbatches,
@@ -290,26 +376,7 @@ def test_profile_loads_through_canonical_model_preserving_source(tmp_path, locat
         if location == "extensionless":
             path = target
     assert FastAFDMoEStageProfile.load(path).entries == profile.entries
-    config = ForwardPassPerfModelConfig(
-        model=_entry()["key"]["model_path"],
-        system="gb200",
-        backend="sglang",
-        backend_version="0.5.14",
-        worker_type="decode",
-        estimation_mode="fastafd_stage",
-        moe_backend="megamoe",
-        afd={
-            "logical_batch_per_source_rank": 48,
-            "attention_gpus": 16,
-            "ffn_gpus": 8,
-            "f_moe_ep_size": 8,
-            "microbatches": 2,
-            "moe_layers": 3,
-            "routed_topk": 6,
-            "boundary_on_attn": True,
-        },
-        estimator_config={"fastafd_stage": {"profile_path": str(path)}},
-    )
+    config = _canonical_config(path, moe_layers=3)
     if mode_field == "forward_model":
         config = config.to_dict()
         config["forward_model"] = config.pop("estimation_mode")

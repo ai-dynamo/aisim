@@ -103,6 +103,15 @@ pub(crate) fn validate_config(config: &ForwardPassPerfModelConfig) -> Result<(),
             "FastAFD batch, layers and routed top-k must be positive",
         ));
     }
+    if config.backend_version.as_deref().is_some_and(|version| {
+        ["current", "previous", "next"]
+            .iter()
+            .any(|alias| version.trim().eq_ignore_ascii_case(alias))
+    }) {
+        return Err(invalid(
+            "FastAFD backend_version must be a literal version, not a slot alias",
+        ));
+    }
     if config.fallback_policy != ForwardPassFallbackPolicy::Deny
         || config.backend_version.is_none()
         || config.pp != 1
@@ -200,7 +209,7 @@ struct Capture {
     method: String,
     method_version: String,
     statistic: String,
-    sample_count: u32,
+    sample_count: u64,
     cv_percent: f64,
     routing: String,
     source_tree_sha256: String,
@@ -408,6 +417,7 @@ impl FastAfdTable {
             .profile_path;
         let mut document = {
             let reader = PerfReader::from_bytes(path, raw.clone())?;
+            reader.require_flat_schema()?;
             let key_names = [
                 "model_path",
                 "system",
@@ -631,6 +641,73 @@ mod tests {
         let error = model.tune_with_fpms(&[]).unwrap_err();
         assert!(matches!(error, AicError::InvalidEngineConfig(_)));
         assert!(error.to_string().contains("cannot be tuned"));
+    }
+
+    #[test]
+    fn canonical_stage_rejects_backend_version_slot_aliases() {
+        let (_file, config) = fixture();
+        for alias in ["current", "previous", "next"] {
+            let mut config = config.clone();
+            config.backend_version = Some(alias.into());
+            let error = ForwardPassPerfModel::best_available(config)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("backend_version must be a literal version"));
+        }
+        let model = ForwardPassPerfModel::best_available(config).unwrap();
+        assert_eq!(
+            model
+                .diagnostics()
+                .provenance
+                .unwrap()
+                .config
+                .backend_version,
+            Some("0.5.14".into())
+        );
+        assert_eq!(model.estimate_fastafd_stage(128).unwrap().ffn_ms, 2.0);
+    }
+
+    #[test]
+    fn canonical_stage_preserves_u64_sample_counts() {
+        let (file, config) = fixture();
+        for count in [u64::from(u32::MAX), u64::from(u32::MAX) + 1, u64::MAX] {
+            let mut document = fixture_document();
+            document["entries"][0]["measurement"]["sample_count"] = json!(count);
+            std::fs::write(file.path(), parquet_snapshot(&document)).unwrap();
+            let estimate = ForwardPassPerfModel::best_available(config.clone())
+                .unwrap()
+                .estimate_fastafd_stage(128)
+                .unwrap();
+            assert_eq!(estimate.stage["sample_count"], json!(count));
+            assert_eq!(estimate.ffn_ms, 2.0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_stage_symlink_to_extensionless_parquet_or_lfs_pointer() {
+        let (_file, mut config) = fixture();
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("capture");
+        let link = directory.path().join("capture.parquet");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        config
+            .estimator_config
+            .fastafd_stage
+            .as_mut()
+            .unwrap()
+            .profile_path = link;
+        std::fs::write(&target, parquet_snapshot(&fixture_document())).unwrap();
+        let model = ForwardPassPerfModel::best_available(config.clone()).unwrap();
+        assert_eq!(model.estimate_fastafd_stage(128).unwrap().ffn_ms, 2.0);
+
+        std::fs::write(&target, b"version https://git-lfs/spec/v1\n").unwrap();
+        let error = ForwardPassPerfModel::best_available(config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unresolved git-lfs pointer"));
+        assert!(error.contains("git lfs pull"));
+        assert!(error.contains(target.to_str().unwrap()));
     }
 
     fn parquet_snapshot(document: &Value) -> bytes::Bytes {

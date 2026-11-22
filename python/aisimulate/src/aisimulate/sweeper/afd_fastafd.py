@@ -109,8 +109,8 @@ class FastAFDMoEStagePerformanceModel:
                     "stage": estimate["stage"],
                     "config": config,
                     "attention": {
-                        "components": dict(components),
                         **dict(attention.provenance),
+                        "components": {**attention.provenance["components"], **components},
                     },
                 },
             ),
