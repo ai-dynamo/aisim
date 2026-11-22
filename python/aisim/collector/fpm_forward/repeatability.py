@@ -26,6 +26,7 @@ from . import planner
 from .capabilities import ModelCapabilityProfile, ResolvedDTypeProfile
 from .config import FPMCollectionOptions
 from .execution_evidence import _deployment_hashes, file_evidence, inspect_execution_evidence
+from .glm53flash_points import GLM_SMOKE_MANIFEST
 from .measurement_evidence import compare_measurements, extract_measurement_evidence
 from .memory_admission import DTypeMemoryEstimate, TopologyMemoryDecision
 from .model_capability import ResolvedModelConfig
@@ -336,7 +337,13 @@ def freeze_repeatability_plan(
             expected_plan_sha256=source_plan.sha256,
             expected_attempt_id=entry["attempt_id"],
         )
-        _validate_points_receipts(source_plan, cell, cell_dir / "raw", entry["attempt_id"])
+        _validate_points_receipts(
+            source_plan,
+            cell,
+            cell_dir / "raw",
+            entry["attempt_id"],
+            smoke=entry.get("smoke_manifest") == GLM_SMOKE_MANIFEST,
+        )
         selected = _select_points(
             collection, max_points_per_cell if comparison_mode == "bounded" else None, cell_id=cell.cell_id
         )

@@ -1904,6 +1904,22 @@ def test_passed_glm_cell_keeps_a_producer_receipt(monkeypatch, tmp_path):
         assert receipt == _expected_producer_receipt(plan, cell, attempt_id)
 
 
+def test_smoke_receipts_match_the_smoke_selection_only(monkeypatch, tmp_path):
+    from .test_fpm_runtime_memory import _glm_plan
+
+    plan = _glm_plan(tmp_path)
+    _staged, _receipts, checkpoint = _staged_run(monkeypatch, tmp_path / "run", plan, smoke=True)
+
+    campaign = tmp_path / "run" / "artifacts" / plan.sha256[:16] / "smoke"
+    for cell in plan.cells:
+        raw = campaign / "cells" / cell.cell_id / "raw"
+        attempt_id = checkpoint["cells"][cell.cell_id]["attempt_id"]
+        fpm_runner._validate_points_receipts(plan, cell, raw, attempt_id, smoke=True)
+        with pytest.raises(ValueError) as error:
+            fpm_runner._validate_points_receipts(plan, cell, raw, attempt_id, smoke=False)
+        assert str(error.value).startswith("runtime benchmark-points receipt mismatch")
+
+
 def test_cell_of_another_model_keeps_no_producer_receipt(monkeypatch, tmp_path):
     # The plans and runs of test_non_glm_cells_keep_their_launch_and_staging.
     for kind in ("default", "v41"):

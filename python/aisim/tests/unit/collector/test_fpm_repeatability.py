@@ -342,6 +342,27 @@ def test_freeze_selects_validated_native_extremes_and_reports_unselected_capture
     )
 
 
+def test_freeze_checks_the_receipts_of_a_smoke_source_against_the_smoke_selection(campaign, monkeypatch):
+    plan, source, checkpoint = campaign
+    recorded = []
+
+    def record(*_args, smoke=False):
+        recorded.append(smoke)
+
+    monkeypatch.setattr(repeatability, "_validate_points_receipts", record)
+    repeatability.freeze_repeatability_plan(plan, source, checkpoint, max_points_per_cell=6, comparison_mode="bounded")
+    assert recorded and set(recorded) == {False}
+
+    # A smoke cell of a generated list names its subset in the checkpoint entry.
+    saved = json.loads(checkpoint.read_text())
+    for entry in saved["cells"].values():
+        entry["smoke_manifest"] = "glm53flash_grid_v1_smoke"
+    checkpoint.write_text(json.dumps(saved))
+    recorded.clear()
+    repeatability.freeze_repeatability_plan(plan, source, checkpoint, max_points_per_cell=6, comparison_mode="bounded")
+    assert recorded and set(recorded) == {True}
+
+
 def test_too_small_budget_cannot_silently_drop_required_regimes(campaign):
     with pytest.raises(ValueError, match="cannot cover.*uncovered"):
         repeatability.freeze_repeatability_plan(*campaign, max_points_per_cell=1, comparison_mode="bounded")
