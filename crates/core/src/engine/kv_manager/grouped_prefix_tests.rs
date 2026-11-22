@@ -4035,3 +4035,36 @@ fn a_request_that_ends_first_frees_its_running_state_block_before_its_boundary_h
     assert_eq!(key_state(pool, 2, &request, 8704), None);
     assert_eq!(key_state(pool, 2, &request, 4352), Some(false));
 }
+
+#[test]
+fn startup_blocks_equal_the_pages_of_the_profile_peak_bound() {
+    // The startup check of replay and the peak bound of planning count the
+    // same blocks for one request of the context length. Every page of
+    // `groups_glm` is one byte. By hand: 8,192 tokens fill cdiv(8,192, 2,176)
+    // = 4 attention blocks, the ring holds 1, and each of the four KDA groups
+    // holds `2 + c` blocks in align mode (v0.33 `iface:1135-1141`): 4 + 1 +
+    // 4 * 2 = 13 without checkpoint blocks and 4 + 1 + 4 * 3 = 17 with them.
+    // Replay models no checkpoint block on the v0.31.0 row
+    // (`GroupedPrefixRules::new` refuses it), so that row has no case with
+    // one.
+    for (version, checkpoints) in [
+        (VllmRuleVersion::V0_31_0, &[(false, 13)][..]),
+        (VllmRuleVersion::V0_32_0, &[(false, 13), (true, 17)][..]),
+        (VllmRuleVersion::V0_33_0, &[(false, 13), (true, 17)][..]),
+    ] {
+        for &(checkpoint, blocks) in checkpoints {
+            let peak: u64 = groups_glm(checkpoint)
+                .iter()
+                .map(|group| {
+                    group.startup_request_bytes(8192, 8192, true).unwrap() / group.page_size_bytes
+                })
+                .sum();
+            assert_eq!(peak, blocks, "{version:?} {checkpoint}");
+            assert_eq!(
+                rules_glm(version, checkpoint).startup_blocks(8192, 16384),
+                blocks as usize,
+                "{version:?} {checkpoint}"
+            );
+        }
+    }
+}

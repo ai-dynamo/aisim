@@ -677,7 +677,11 @@ tests of these rules.
 check of `kv_cache_utils.py` that the pool holds one request of `max_model_len`
 tokens, with the size of each group from `kv_cache_interface.py`, summed per
 group.
-In v0.33.0 that check is in `kv_cache_planning.py`. `config.rs` also refuses
+In v0.33.0 that check is in `kv_cache_planning.py`.
+`crates/core/src/perfmodel/fpm/resources.rs` adapts, from
+`kv_cache_interface.py`, the startup size of a `MambaSpec` in align mode for the
+peak cache bound of planning.
+`config.rs` also refuses
 `prefill_schedule_interval` above 1 on the v0.33.0 row, because
 `sched/scheduler.py` of v0.33.0 applies that interval without data parallelism
 and the simulation does not.

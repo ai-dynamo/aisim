@@ -2224,7 +2224,44 @@ def test_grouped_sweeper_checks_each_candidate_budget_before_replay(grouped_case
         build_backend_deployment(sample, backend_version="0.31.0")
 
 
-def _onboarding_plan(profile, tmp_path, capsys, version, runtime_version=None):
+@pytest.mark.parametrize("pages", [28, 29])
+def test_grouped_sweeper_admits_an_align_pool_only_from_the_startup_count(grouped_case, pages):
+    from aisim.sweeper.model_hw import NoViableParallelConfig
+
+    # At the 1,024-token context and the 128-token chunk, one request needs 16 pages of the full group, 11 of the
+    # 512-token window group (min(16, cdiv(511 + 128 + 63, 64))) and 2 + c = 2 of the state group in align mode
+    # (v0.33.0 kv_cache_interface.py:1135-1141): 29 pages of 64 bytes. A pool of 28 pages admits no shape, and a pool
+    # of 29 admits both shapes of the fixture, which carry the same groups and pool.
+    profile, root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version="0.33.0")
+    for deployment in profile["deployments"]:
+        deployment["resources"]["runtime_memory"]["kv_cache_bytes"] = pages * 64
+
+    def shapes():
+        candidates = parallel_configs_for(
+            profile["model"],
+            "h200_sxm",
+            backend="vllm",
+            backend_version="0.33.0",
+            deployment_mode="agg",
+            gpu_budget=2,
+            max_num_tokens=128,
+            max_batch_size=4,
+            memory_fraction=0.9,
+            max_seq_len=1024,
+            fpm_profile=profile,
+            systems_paths=[str(root)],
+        )
+        return sorted({candidate.shape.strategy for candidate in candidates})
+
+    if pages == 28:
+        with pytest.raises(NoViableParallelConfig):
+            shapes()
+    else:
+        assert shapes() == ["dep", "tp"]
+
+
+def _onboarding_plan(profile, tmp_path, capsys, version, runtime_version=None, context_length=1024):
     """Run `aisim onboard plan` for one grouped profile and return its stderr and its files, with tmp_path removed."""
     request = SupportRequest.model_validate(
         {
@@ -2242,7 +2279,7 @@ def _onboarding_plan(profile, tmp_path, capsys, version, runtime_version=None):
                 "attention_data_parallel": 1,
                 "moe_tensor_parallel": 2,
                 "moe_expert_parallel": 1,
-                "context_length": 1024,
+                "context_length": context_length,
             },
             "workload": {"input_tokens": 512, "output_tokens": 4},
             "collection": {"max_num_tokens": 128, "max_batch_size": 4},
@@ -2528,6 +2565,168 @@ def test_a_grouped_vllm_0330_plan_saved_cold_still_verifies(grouped_case, tmp_pa
     assert cli.main(["onboard", "plan", "--config", str(config), "--output-dir", str(plan), "--overwrite"]) == 0
     assert _prefix_caching_of(plan) == [True, True]
     plan_module.check_plan(request, plan)
+
+
+# The peak cache bound of _with_prefix_evidence(_with_state_group(profile)) at the 1,024-token context and the 128-token
+# chunk of _onboarding_plan, in pages of 64 bytes. The full group holds cdiv(1,024, 64) = 16 pages and the 512-token
+# window group min(16, cdiv(511 + 128 + 63, 64)) = 11. The planner before the bound counted vLLM's startup blocks gave
+# the state group its 1 page of blocks_per_request: 28 pages. vLLM's startup check counts 2 + c = 2 pages for the state
+# group in align mode, with c = 0 (v0.33.0 kv_cache_interface.py:1135-1141): 29 pages.
+_EARLIER_PEAK = 28 * 64
+_STARTUP_PEAK = 29 * 64
+
+
+def _peak_like_an_earlier_planner(monkeypatch, peak=_EARLIER_PEAK):
+    """Make the estimate of the planner give the peak bound that AISim gave before it counted vLLM's startup blocks."""
+    from aisim_core.sdk import memory
+
+    original = memory.estimate_kv_cache
+
+    def earlier(*args, **kwargs):
+        return {**original(*args, **kwargs), "request_peak_cache_bytes": peak}
+
+    monkeypatch.setattr(memory, "estimate_kv_cache", earlier)
+
+
+def _set_saved_peak(plan, value):
+    path = plan / "support-plan.json"
+    saved = json.loads(path.read_text())
+    saved["resources"]["request_peak_cache_bytes"] = value
+    path.write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n")
+
+
+@reads_saved_config
+@pytest.mark.parametrize(
+    "case,version",
+    [
+        ("edited", "0.31.0"),
+        ("edited", "0.33.0"),
+        ("between", "0.33.0"),
+        ("cold", "0.33.0"),
+        ("legacy", "0.33.0"),
+        ("legacy_cold", "0.33.0"),
+    ],
+)
+def test_grouped_plan_saved_with_the_earlier_peak_bound_still_verifies(
+    grouped_case, tmp_path, capsys, monkeypatch, case, version
+):
+    from aisim.support import plan as plan_module
+
+    profile, _root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version=version)
+    if case == "between":
+        # A pool of exactly the earlier bound: the earlier planner admitted it, and the planner of the checkout refuses
+        # it, because vLLM does not start with it.
+        for deployment in profile["deployments"]:
+            deployment["resources"]["runtime_memory"]["kv_cache_bytes"] = _EARLIER_PEAK
+        (tmp_path / "checkout").mkdir()
+        with pytest.raises(SystemExit) as error:
+            _onboarding_plan(profile, tmp_path / "checkout", capsys, version)
+        assert error.value.code == 2
+        assert (
+            "observed FPM resources leave insufficient rank-local bytes for grouped cache peak allocation"
+            in capsys.readouterr().err
+        )
+        _peak_like_an_earlier_planner(monkeypatch)
+    if case.endswith("cold"):
+        # A plan saved cold before replay modeled grouped prefix caching, and with the earlier bound.
+        monkeypatch.setattr(plan_module, "grouped_prefix_caching_requirements", _refuse_prefix_caching)
+    if case.startswith("legacy"):
+        # A plan saved under the earlier command name, and with the earlier bound.
+        original = plan_module._plan_documents
+        monkeypatch.setattr(
+            plan_module, "_plan_documents", lambda *args, **kwargs: original(*args, **kwargs, legacy_cli=True)
+        )
+    _onboarding_plan(profile, tmp_path, capsys, version)
+    monkeypatch.undo()
+    plan = tmp_path / "collection"
+    saved = json.loads((plan / "support-plan.json").read_text())
+    if case == "between":
+        assert saved["resources"]["request_peak_cache_bytes"] == _EARLIER_PEAK
+    else:
+        assert saved["resources"]["request_peak_cache_bytes"] == _STARTUP_PEAK
+        _set_saved_peak(plan, _EARLIER_PEAK)
+    if case != "between":
+        assert _prefix_caching_of(plan) == ([False, False] if case.endswith("cold") else [True, True])
+    assert ('"aisimulate"' in (plan / "commands.json").read_text()) is case.startswith("legacy")
+    request = SupportRequest.from_yaml(plan / "request.yaml")
+    plan_module.check_plan(request, plan)
+    # A saved bound of any other value is neither the bound of the planner nor the earlier one. A plan whose pool is
+    # too small for the planner of the checkout gets the same text, because the earlier renderings complete.
+    _set_saved_peak(plan, _STARTUP_PEAK + 64)
+    with pytest.raises(ValueError, match="support-plan.json was modified; choose a new output directory"):
+        plan_module.check_plan(request, plan)
+
+
+@reads_saved_config
+@pytest.mark.parametrize(
+    "variant,earlier,startup",
+    [
+        # A 514-token window: min(16, cdiv(513 + 128 + 63, 64)) = 11 pages, so 16 + 11 + 1 = 28 pages earlier and
+        # 16 + 11 + 2 = 29 at startup.
+        ("window_514", 28 * 64, 29 * 64),
+        # A 600-token context: the full group holds cdiv(600, 64) = 10 pages and the window group
+        # min(10, cdiv(511 + 128 + 63, 64)) = 10 pages, so 10 + 10 + 1 = 21 pages earlier and 22 at startup.
+        ("context_600", 21 * 64, 22 * 64),
+        # The state group has pages of 128 bytes: 16 * 64 + 11 * 64 + 1 * 128 = 1,856 bytes earlier and
+        # 16 * 64 + 11 * 64 + 2 * 128 = 1,984 bytes at startup.
+        ("state_page_128", 1_856, 1_984),
+    ],
+)
+def test_the_earlier_peak_of_a_saved_plan_counts_each_group_by_its_own_rule(
+    grouped_case, tmp_path, capsys, variant, earlier, startup
+):
+    from aisim.support import plan as plan_module
+
+    profile, _root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version="0.33.0")
+    for deployment in profile["deployments"]:
+        for group in deployment["resources"]["cache_groups"]:
+            if variant == "window_514" and group.get("sliding_window") is not None:
+                group["sliding_window"] = 514
+            if variant == "state_page_128" and group["kind"] == "state":
+                group["page_size_bytes"] = 128
+    _onboarding_plan(profile, tmp_path, capsys, "0.33.0", context_length=600 if variant == "context_600" else 1024)
+    plan = tmp_path / "collection"
+    assert json.loads((plan / "support-plan.json").read_text())["resources"]["request_peak_cache_bytes"] == startup
+    _set_saved_peak(plan, earlier)
+    plan_module.check_plan(SupportRequest.from_yaml(plan / "request.yaml"), plan)
+
+
+@reads_saved_config
+@pytest.mark.parametrize("case", ["below", "fault"])
+def test_grouped_plan_check_keeps_every_refusal_but_that_of_the_earlier_peak(
+    grouped_case, tmp_path, capsys, monkeypatch, case
+):
+    from aisim.support import finalization
+    from aisim.support import plan as plan_module
+
+    profile, _root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version="0.33.0")
+    # "fault": a pool of the earlier bound, 28 pages, saved with that bound. "below": a pool of 27 pages, below both
+    # bounds, saved by a planner that stored no peak above it.
+    pages = 27 if case == "below" else 28
+    for deployment in profile["deployments"]:
+        deployment["resources"]["runtime_memory"]["kv_cache_bytes"] = pages * 64
+    _peak_like_an_earlier_planner(monkeypatch, peak=pages * 64)
+    _onboarding_plan(profile, tmp_path, capsys, "0.33.0")
+    monkeypatch.undo()
+    plan = tmp_path / "collection"
+    request = SupportRequest.from_yaml(plan / "request.yaml")
+    if case == "below":
+        # Every rendering refuses the pool, so the check gives the refusal of the planner.
+        with pytest.raises(ValueError, match="insufficient rank-local bytes for grouped cache peak allocation"):
+            plan_module.check_plan(request, plan)
+        return
+    plan_module.check_plan(request, plan)
+
+    # A fault of a rendering after its pool test is not taken for the pool refusal.
+    def fault(_request):
+        raise ValueError("a fault after the pool test")
+
+    monkeypatch.setattr(finalization, "finalization_manifest", fault)
+    with pytest.raises(ValueError, match="a fault after the pool test"):
+        plan_module.check_plan(request, plan)
 
 
 @reads_saved_config
