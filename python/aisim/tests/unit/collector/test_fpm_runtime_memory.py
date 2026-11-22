@@ -2189,6 +2189,9 @@ def _glm_plan(
     max_num_tokens=8192,
     model_revision=_GLM_REVISION,
     kda_checkpoint_alignment=None,
+    backend_version="0.33.0",
+    preset="pure_tp",
+    topology=None,
     **changes,
 ):
     """A GLM-5.3-Flash TP 4 collection plan with the cache resources that the runtime probe measured.
@@ -2196,7 +2199,9 @@ def _glm_plan(
     The config is a small stand-in with the hybrid layer types. The options are the limits that onboarding passes:
     ``max_num_tokens`` tokens, ``max_batch_size`` sequences and a 1,048,576-token context. The profile records the
     same token and sequence limits, because accepted runtime memory is exact for its scheduler settings. The producer
-    runs no global warm-up iterations. ``changes`` replace option fields before planning. With a
+    runs no global warm-up iterations. ``backend_version`` is the deployment's vLLM version, ``preset`` the parallel
+    preset of the request, and ``topology`` a mapping of ``tp``, ``dp``, ``moe_tp`` and ``moe_ep`` that replaces those
+    values of the deployment. ``changes`` replace option fields before planning. With a
     ``kda_checkpoint_alignment``, each of the four KDA groups holds one prefill checkpoint block of that alignment, as
     the import writes it for a launch that prefills KDA with FlashKDA. Without it, they hold none, as with the Triton
     KDA prefill backend.
@@ -2239,11 +2244,12 @@ def _glm_plan(
             {
                 "system": "b200_sxm",
                 "backend": "vllm",
-                "backend_version": "0.33.0",
+                "backend_version": backend_version,
                 "tp": 4,
                 "dp": 1,
                 "moe_tp": 4,
                 "moe_ep": 1,
+                **(topology or {}),
                 "gemm_quant_mode": "bfloat16",
                 "moe_quant_mode": "bfloat16",
                 "fmha_quant_mode": "bfloat16",
@@ -2270,7 +2276,7 @@ def _glm_plan(
         "--fpm-gpu-counts",
         "4",
         "--fpm-parallel-presets",
-        "pure_tp",
+        preset,
         "--fpm-max-model-len",
         "1048576",
         "--fpm-max-num-batched-tokens",
@@ -2405,6 +2411,90 @@ def test_glm_collection_plan_requires_batch_limits(tmp_path, changes):
     with pytest.raises(ValueError) as error:
         _glm_plan(tmp_path, **changes)
     assert str(error.value) == "GLM-5.3-Flash collection requires --fpm-max-num-seqs or the per-phase batch limits"
+
+
+def _glm_user_points(tmp_path):
+    """The option fields of a small user point list for a GLM-5.3-Flash plan, frozen as the collector freezes a file."""
+    from collector.fpm_forward.config import _freeze_benchmark_points
+
+    points = tmp_path / "points.json"
+    points.write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "prefill": [{"batch_size": 1, "total_prefill_tokens": 64, "total_kv_read_tokens": 0}],
+                "decode": [{"batch_size": 1, "total_kv_read_tokens": 4096}],
+            }
+        )
+    )
+    points_json, points_sha256 = _freeze_benchmark_points(str(points))
+    return {"benchmark_points_json": points_json, "benchmark_points_sha256": points_sha256}
+
+
+def test_glm_plan_with_a_user_point_list_refuses_an_odd_token_budget(tmp_path):
+    # The producer refuses a token budget that is no multiple of its chunk alignment when the engine starts. A user list
+    # skips the generator, so the planner checks the budgets that the runner renders.
+    with pytest.raises(ValueError) as error:
+        _glm_plan(tmp_path, max_num_tokens=8190, **_glm_user_points(tmp_path))
+    assert str(error.value) == "GLM-5.3-Flash collection requires a token budget that is a multiple of 4"
+    plan = _glm_plan(tmp_path, max_num_tokens=8192, **_glm_user_points(tmp_path))
+    assert plan.to_dict()["point_generation"]["source"] == "frozen_explicit_manifest"
+
+
+@pytest.mark.parametrize("user_list", [False, True], ids=["generated", "user-list"])
+def test_glm_plan_refuses_a_hash_block_that_is_not_the_mamba_block(tmp_path, user_list):
+    with pytest.raises(ValueError) as error:
+        _glm_plan(tmp_path, hash_block_size_tokens=16, **(_glm_user_points(tmp_path) if user_list else {}))
+    assert str(error.value) == (
+        "GLM-5.3-Flash collection requires a hash block of the Mamba block size: the accepted profile holds "
+        "hash_block_size_tokens=16 and cache group runtime_group_0 holds block_size_tokens=2176"
+    )
+
+
+def test_glm_plan_keeps_the_ring_with_its_own_block(tmp_path):
+    # The tail ring is a state group of 4-token blocks without a prefill checkpoint field, so the hash block rule of the
+    # Mamba groups does not read it.
+    plan = _glm_plan(tmp_path)
+    groups = plan.fpm_profile.deployments[0].resources.cache_groups
+    ring = [group for group in groups if group.kind == "state" and group.prefill_checkpoint_blocks is None]
+    assert [group.block_size_tokens for group in ring] == [4]
+    assert sorted(group.block_size_tokens for group in groups if group not in ring) == [2176] * 5
+    assert sum(group.prefill_checkpoint_blocks is not None for group in groups) == 4
+
+
+@pytest.mark.parametrize("version", ["0.31.0", "0.33.1"])
+def test_glm_plan_refuses_another_vllm_version(tmp_path, version):
+    with pytest.raises(ValueError) as error:
+        _glm_plan(tmp_path, backend_version=version)
+    assert str(error.value) == f"GLM-5.3-Flash collection supports vLLM 0.33.0 only, got {version!r}"
+
+
+@pytest.mark.parametrize(
+    ("preset", "topology"),
+    [
+        ("tep", {"tp": 4, "dp": 1, "moe_tp": 1, "moe_ep": 4}),
+        ("dep", {"tp": 1, "dp": 4, "moe_tp": 1, "moe_ep": 4}),
+    ],
+    ids=["tep", "dep"],
+)
+def test_glm_plan_refuses_expert_and_data_parallel_layouts(tmp_path, preset, topology):
+    with pytest.raises(ValueError) as error:
+        _glm_plan(tmp_path, preset=preset, topology=topology)
+    text = str(error.value)
+    assert text.startswith(
+        "GLM-5.3-Flash collection supports pure tensor parallelism only (TP 1, 2, 4 or 8, with DP, PP, CP and expert "
+        "parallelism 1): request the preset pure_tp. Got "
+    )
+    assert "'moe_ep': 4" in text
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4])
+@pytest.mark.usefixtures("no_models_or_timing_data")
+def test_glm_plan_accepts_pure_tensor_parallelism_at_tp_1_2_and_4(tmp_path, tp):
+    folder = tmp_path / str(tp)
+    folder.mkdir()
+    plan, *_ = _probe_backed_glm_plan(folder, tp=tp)
+    assert {cell.topology.tp for cell in plan.cells} == {tp}
 
 
 @pytest.mark.parametrize(

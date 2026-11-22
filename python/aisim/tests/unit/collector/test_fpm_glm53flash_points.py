@@ -21,7 +21,9 @@ from collector.fpm_forward.glm53flash_points import (
     glm_point_manifest,
     glm_points,
     glm_smoke_subset,
+    validate_glm_layout,
 )
+from collector.fpm_forward.types import ParallelTopology
 
 from .test_fpm_glm53flash_prefix_seed import load_producer
 
@@ -701,9 +703,14 @@ def _deployment(*state_groups: tuple[int | None, int | None]) -> SimpleNamespace
         SimpleNamespace(kind="state", page_size_bytes=PAGE, prefill_checkpoint_blocks=None),
         *(
             SimpleNamespace(
-                kind="state", page_size_bytes=PAGE, prefill_checkpoint_blocks=blocks, prefill_checkpoint_alignment=align
+                name=f"mamba_{index}",
+                kind="state",
+                block_size_tokens=2176,
+                page_size_bytes=PAGE,
+                prefill_checkpoint_blocks=blocks,
+                prefill_checkpoint_alignment=align,
             )
-            for blocks, align in state_groups
+            for index, (blocks, align) in enumerate(state_groups)
         ),
     ]
     return SimpleNamespace(resources=SimpleNamespace(runtime_memory=memory, cache_groups=groups))
@@ -758,3 +765,34 @@ def test_plan_manifest_refuses_deployments_with_different_checkpoint_alignments(
     with pytest.raises(ValueError) as error:
         glm_plan_manifest(_OPTIONS, [_deployment(*groups) for groups in deployments])
     assert str(error.value) == text
+
+
+def test_plan_manifest_refuses_a_mamba_block_that_is_not_the_hash_block():
+    deployment = _deployment((1, 16), (1, 16))
+    deployment.resources.cache_groups[2].block_size_tokens = 4352
+    with pytest.raises(ValueError) as error:
+        glm_plan_manifest(_OPTIONS, [deployment])
+    assert str(error.value) == (
+        "GLM-5.3-Flash collection requires a hash block of the Mamba block size: the accepted profile holds "
+        "hash_block_size_tokens=2176 and cache group mamba_0 holds block_size_tokens=4352"
+    )
+
+
+def test_layout_check_reads_the_axes_and_the_runtime_version():
+    # A one-GPU cell has the strategy "single", so the rule reads the axes of each topology.
+    single = ParallelTopology(tp=1, pp=1, dp=1, moe_tp=1, moe_ep=1, cp=1)
+    assert validate_glm_layout([single], "0.33.0") is None
+    # A plan without a version at plan time leaves the version to the gate in the container.
+    assert validate_glm_layout([single], None) is None
+    with pytest.raises(ValueError) as error:
+        validate_glm_layout([single], "0.33.1")
+    assert str(error.value) == "GLM-5.3-Flash collection supports vLLM 0.33.0 only, got '0.33.1'"
+    prefix = (
+        "GLM-5.3-Flash collection supports pure tensor parallelism only (TP 1, 2, 4 or 8, with DP, PP, CP and expert "
+        "parallelism 1): request the preset pure_tp. Got "
+    )
+    for changes in ({"tp": 3, "moe_tp": 3}, {"pp": 2}):
+        topology = ParallelTopology(**{**single.to_dict(), **changes})
+        with pytest.raises(ValueError) as error:
+            validate_glm_layout([topology], "0.33.0")
+        assert str(error.value) == prefix + str(topology.to_dict())

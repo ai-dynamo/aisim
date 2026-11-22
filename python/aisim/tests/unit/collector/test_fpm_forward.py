@@ -3865,6 +3865,48 @@ def test_deepseek_v41_plan_keeps_its_eager_rule():
         build()
 
 
+@pytest.mark.parametrize("architecture", ["DeepseekV41ForCausalLM", "Glm5NextForConditionalGeneration"])
+def test_plan_refuses_a_producer_architecture_whose_config_names_no_architecture(tmp_path, architecture):
+    # The producer contract of these models hangs on the execution identity, which comes from the architectures field
+    # of config.json. --model-architecture names the architecture, but it gives no identity.
+    if architecture == "Glm5NextForConditionalGeneration":
+        path = _mixed_attention_config(tmp_path, architecture, True)
+        config = json.loads(path.read_text())
+        points = tmp_path / "points.json"
+        points.write_text(
+            json.dumps(
+                {
+                    "schema_version": 3,
+                    "prefill": [{"batch_size": 1, "total_prefill_tokens": 64, "total_kv_read_tokens": 0}],
+                    "decode": [{"batch_size": 1, "total_kv_read_tokens": 4096}],
+                }
+            )
+        )
+        overrides = {"fpm_benchmark_points_file": str(points)}
+    else:
+        path = tmp_path / "config.json"
+        config = json.loads((_MODEL_CONFIGS / "deepseek-ai--DeepSeek-V4.1-Flash_config.json").read_text())
+        overrides = {"fpm_enforce_eager": True}
+    del config["architectures"]
+    path.write_text(json.dumps(config))
+    with pytest.raises(ValueError) as error:
+        build_collection_plan(
+            backend="vllm",
+            model_path=str(path),
+            system="b200_sxm",
+            selected_ops={"attention_context", "attention_generation"},
+            options=FPMCollectionOptions.from_args(_args(**overrides)),
+            model_architecture=architecture,
+            has_model_cases=False,
+            model_config_path=str(path),
+            collector_config={"aic_database_version": "0.27.0"},
+        )
+    assert str(error.value) == (
+        f"{architecture} FPM collection requires the architectures field in the checkpoint config.json: its execution "
+        "identity comes from that field, and --model-architecture does not replace it"
+    )
+
+
 @pytest.mark.parametrize("corruption", ["missing", "tampered", "fake", "seed", "path", "coverage"])
 def test_v41_real_token_stream_validation_rejects_broken_witness(tmp_path, corruption):
     from collector.fpm_forward.native_artifact import _validate_token_streams

@@ -38,7 +38,13 @@ from .config import (
     semantic_generator_overrides,
     with_kv_warmup_defaults,
 )
-from .glm53flash_points import GLM_ARCHITECTURE, GLM_POINTS_ORIGIN, glm_plan_manifest
+from .glm53flash_points import (
+    GLM_ARCHITECTURE,
+    GLM_POINTS_ORIGIN,
+    glm_plan_manifest,
+    validate_glm_layout,
+    validate_glm_limits,
+)
 from .memory_admission import TopologyMemoryDecision, filter_memory_infeasible_topologies
 from .runtime.fpm_memory_observer import MEMORY_SUPPORTED_VERSIONS, audited_release
 from .topology import enumerate_fpm_topologies, topology_strategy
@@ -825,10 +831,15 @@ def build_collection_plan(
     # Eager timing and the shared text corpus belong to DeepSeek V4.1 alone. GLM-5.3-Flash also has an execution
     # identity, but its producer requires the runtime's CUDA graph policy and seeds its own tokens.
     eager_required = capability.architecture == "DeepseekV41ForCausalLM"
-    if eager_required and not options.enforce_eager:
-        raise ValueError("V4.1 FPM collection currently requires --fpm-enforce-eager; graph timing is not qualified")
     if options.enforce_eager and not eager_required:
         raise ValueError("explicit eager FPM collection is currently qualified only for DeepSeek V4.1")
+    # The producer contract of these two models hangs on the execution identity, which comes from the architectures
+    # field of config.json. Without it the identity is the legacy one, and the reader would skip the contract.
+    if capability.architecture in {"DeepseekV41ForCausalLM", GLM_ARCHITECTURE} and execution[0] == "":
+        raise ValueError(
+            f"{capability.architecture} FPM collection requires the architectures field in the checkpoint "
+            "config.json: its execution identity comes from that field, and --model-architecture does not replace it"
+        )
     input_text_sha256 = (
         hashlib.sha256((Path(__file__).parent / "runtime" / "fpm_text.txt").read_bytes()).hexdigest()
         if eager_required
@@ -918,6 +929,9 @@ def build_collection_plan(
             raise ValueError(
                 f"GLM-5.3-Flash collection requires a model revision of 40 lowercase hex characters, got {revision!r}"
             )
+        # The producer refuses these limits, runtime versions and layouts when the engine starts.
+        validate_glm_limits(options, deployments if profile is not None else ())
+        validate_glm_layout(candidate_topologies, runtime_backend_version or backend_version)
     topologies, topology_memory_admission = filter_memory_infeasible_topologies(
         backend=backend,
         model_path=model_path,
