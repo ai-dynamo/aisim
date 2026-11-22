@@ -403,6 +403,22 @@ class RustForwardPassPerfModel:
         """Return native exact stage timing, normalized per layer and microbatch."""
         return json.loads(self._inner.estimate_fastafd_stage(logical_batch_per_source_rank))
 
+    def estimate_fastafd_attention(
+        self, *, isl: int, osl: int, prefix: int = 0, max_seq_len: int | None = None
+    ) -> dict[str, Any]:
+        """Measure only A compute and qualify both pools for the pinned stage.
+
+        AFD orchestration uses the existing native op evaluator. F contributes
+        memory at the selected stage precision, never modeled F latency.
+        """
+        from aisimulate.sdk.inference_session import _measure_fastafd_attention
+
+        provenance = self.diagnostics().get("provenance") or {}
+        config = provenance.get("config") or {}
+        if config.get("estimation_mode") != "fastafd_stage":
+            raise ValueError("estimate_fastafd_attention requires fastafd_stage selection")
+        return _measure_fastafd_attention(config, isl=isl, osl=osl, prefix=prefix, max_seq_len=max_seq_len)
+
     def predict_prefill_latency(self, bs: int, isl: int, prefix: int = 0) -> float:
         """Return uncorrected native prefill latency in milliseconds.
 

@@ -213,7 +213,7 @@ def test_non_unit_communication_calibration_fails_before_measurement(tmp_path, f
 
 
 @pytest.mark.parametrize("nextn", [0, 1])
-def test_builtin_provider_recomputes_the_fastafd_router_on_a(tmp_path, monkeypatch, nextn):
+def test_builtin_provider_recomputes_the_fastafd_router_on_a(tmp_path, monkeypatch, nextn, fastafd_attention_sol):
     """Native SOL evidence with the synthetic 64A8F stage fixture, not serving accuracy."""
     local_router_batches = []
     sum_latency = AFDInferenceSession._sum_latency
@@ -242,6 +242,129 @@ def test_builtin_provider_recomputes_the_fastafd_router_on_a(tmp_path, monkeypat
     assert components["router_ms"] > components["a_router_ms"] > 0.0
     assert measurement.attention_ms == pytest.approx(components["attention_compute_ms"] + components["a_router_ms"])
     assert measurement.attention_ms < components["attention_compute_ms"] + components["router_ms"]
+
+    local_router_batches.clear()
+    (attention_only,) = _provider(tmp_path, AICAFDPerformanceModel(), profile_path=profile).measure(request)
+    assert local_router_batches == [64 * (nextn + 1)]
+    # The full provider subtracts its combine term; the A-only path never
+    # queries it. Their recomposition differs only by floating-point rounding.
+    assert attention_only.attention_ms == pytest.approx(measurement.attention_ms, rel=1e-14, abs=1e-16)
+    assert attention_only.ffn_ms == measurement.ffn_ms
+
+
+@pytest.fixture
+def fastafd_attention_sol(monkeypatch):
+    """Native SOL timings and real memory accounting; no serving-accuracy claim."""
+    from aisimulate.sdk import perf_database
+
+    load = perf_database.get_database_view
+
+    def sol_view(system, backend, version, **kwargs):
+        kwargs.update(database_mode="SOL", allow_missing_data=True)
+        return load(system, backend, version, **kwargs)
+
+    monkeypatch.setattr(perf_database, "get_database_view", sol_view)
+
+
+def _kimi_request_and_profile(tmp_path, precision, *, moe_backend="megamoe"):
+    model = "moonshotai/Kimi-K2-Instruct"
+    entry = _entry(model_path=model, topology="64A4F", moe_layers=61, moe_precision=precision, moe_backend=moe_backend)
+    request = replace(
+        _request(_topology(n_f_nodes=1, f_moe_ep_size=4, num_experts=384)), model_name=model, max_seq_len=2048
+    )
+    return request, _profile(tmp_path, [entry])
+
+
+@pytest.mark.parametrize("moe_backend", ["megamoe", "deepep_deepgemm"])
+def test_builtin_fastafd_qualifies_selected_low_bit_f_memory(tmp_path, monkeypatch, fastafd_attention_sol, moe_backend):
+    """Kimi FP8 F weights exceed GB200 capacity; the measured 4-bit stage fits."""
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    request, profile = _kimi_request_and_profile(tmp_path, "w4a8_mxfp4_mxfp8", moe_backend=moe_backend)
+    with pytest.raises(RuntimeError, match="OOM"):
+        cli_estimate(
+            request.model_name,
+            SYSTEM,
+            mode="afd",
+            backend_name=request.backend,
+            backend_version=request.backend_version,
+            database_mode="SOL",
+            n_a_nodes=16,
+            n_f_nodes=1,
+            a_batch_size=128,
+            f_moe_ep_size=4,
+            num_microbatches=2,
+            afd_combined_with_pd=False,
+            isl=request.input_length,
+            osl=request.output_length,
+            max_seq_len=request.max_seq_len,
+        )
+
+    queries = []
+    sum_latency = AFDInferenceSession._sum_latency
+
+    def attention_only(self, ops, **kwargs):
+        assert kwargs["model"].config.tp_size == 1, "discarded F timing must never be queried"
+        queries.append(kwargs["seq_len"])
+        return sum_latency(self, ops, **kwargs)
+
+    def no_communication(*args, **kwargs):
+        raise AssertionError("communication is already inside the measured stage")
+
+    monkeypatch.setattr(AFDInferenceSession, "_sum_latency", attention_only)
+    monkeypatch.setattr(AFDInferenceSession, "_build_afd_comm_ops", no_communication)
+    (measurement,) = _provider(
+        tmp_path, AICAFDPerformanceModel(), profile_path=profile, moe_backend=moe_backend
+    ).measure(request)
+    provenance = measurement.provenance["attention"]
+    assert provenance["measurement_scope"] == "attention_only"
+    assert provenance["config"] == measurement.provenance["config"]
+    assert provenance["config"]["moe_quant_mode"] == "w4a8_mxfp4_mxfp8"
+    assert provenance["config"]["afd"]["ffn_gpus"] == 4
+    memory = provenance["memory"]
+    assert memory["f_worker"]["kvcache"] == 0.0
+    assert memory["a_worker"]["kvcache"] > 0.0
+    assert 0.0 < memory["f_worker"]["weights"] < 198674743296 / (1 << 30)
+    assert queries == [1025, 1057, 1089, 1121, 1025]
+    assert measurement.ffn_ms == pytest.approx(STAGE_MS / (61 * 2))
+    assert measurement.attention_ms > provenance["components"]["a_router_ms"] > 0.0
+
+    # Reconstruction uses the resolved precision and pinned pool identity too.
+    restored = RustForwardPassPerfModel.best_available(provenance["config"])
+    attention = restored.estimate_fastafd_attention(isl=1024, osl=128, max_seq_len=2048)
+    assert attention["provenance"]["memory"] == memory
+    assert attention["attention_ms"] == provenance["components"]["attention_compute_ms"]
+
+
+def test_external_aic_attention_layer_count_must_match_the_selected_stage(tmp_path):
+    def estimate(*args, **kwargs):
+        return SimpleNamespace(
+            raw={
+                "afd_layer_measurements": {
+                    "decode": {
+                        "attention_ms": 0.096,
+                        "ffn_ms": 0.6,
+                        "a_to_f_ms": 0.01,
+                        "f_to_a_ms": 0.01,
+                        "num_layers": 32,
+                        "components": COMPONENTS,
+                    }
+                }
+            }
+        )
+
+    with pytest.raises(AFDInfeasible, match="layer count does not match"):
+        _provider(tmp_path, AICAFDPerformanceModel(estimate)).measure(_request(_topology()))
+
+
+@pytest.mark.parametrize(("precision", "max_seq_len", "pool"), [("fp8", 2048, "F"), ("w4a8_mxfp4_mxfp8", 131072, "A")])
+def test_builtin_fastafd_still_rejects_oom_in_either_selected_pool(
+    tmp_path, fastafd_attention_sol, precision, max_seq_len, pool
+):
+    request, profile = _kimi_request_and_profile(tmp_path, precision)
+    request = replace(request, max_seq_len=max_seq_len)
+    with pytest.raises(AFDInfeasible, match=f"OOM: FastAFD {pool} pool"):
+        _provider(tmp_path, AICAFDPerformanceModel(), profile_path=profile).measure(request)
 
 
 @pytest.mark.parametrize("nextn", [0, 1])
@@ -489,6 +612,24 @@ def test_prediction_config_attaches_the_profile_stage(tmp_path):
     assert spec.backend_deployment.parallel_config["afd"]["a_batch_size"] == 128
     assert "fastafd_profile_path" not in spec.backend_deployment.parallel_config["afd"]
     assert attention.requests[0].topology.ffn_gpus == 8
+
+
+def test_prediction_config_uses_builtin_attention_with_low_bit_f_pool(tmp_path, fastafd_attention_sol):
+    request, profile = _kimi_request_and_profile(tmp_path, "w4a8_mxfp4_mxfp8")
+    raw = _prediction(profile)
+    raw["engine"].update(model=request.model_name, context_length=2048, backend_version="0.5.14")
+    raw["engine"]["afd"].update(n_f_nodes=1, f_moe_ep_size=4)
+    # The independent prefill pool still serves the checkpoint at FP8.
+    raw["engine"]["workers"]["prefill"]["parallelism"].update(tensor=8, moe_expert=8)
+    config = CorePredictionConfig.model_validate(raw)
+    for candidate in (config, CorePredictionConfig.model_validate_json(config.model_dump_json())):
+        spec = prediction_to_replay_spec(candidate)
+        (measurement,) = spec.backend_deployment.performance_model_metadata["afd"]["measurements"]
+        provenance = measurement["provenance"]
+        assert provenance["attention"]["measurement_scope"] == "attention_only"
+        assert provenance["config"]["moe_quant_mode"] == "w4a8_mxfp4_mxfp8"
+        assert provenance["attention"]["config"] == provenance["config"]
+        assert measurement["ffn_ms"] == pytest.approx(STAGE_MS / (61 * 2))
 
 
 def test_serial_decode_evaluates_the_replayed_profile_stage(tmp_path):

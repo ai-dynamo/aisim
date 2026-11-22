@@ -15,7 +15,13 @@ from aisimulate_core.sdk import RustForwardPassPerfModel
 from aisimulate_core.sdk.utils import get_model_config_from_model_path
 
 from .afd_parallel import AFDInfeasible, AFDPhase, AFDReasonCategory
-from .afd_perfmodel import AFD_MEASUREMENT_API_VERSION, AFDLayerTimes, AFDMeasurementRequest, AFDPerformanceModel
+from .afd_perfmodel import (
+    AFD_MEASUREMENT_API_VERSION,
+    AFDLayerTimes,
+    AFDMeasurementRequest,
+    AFDPerformanceModel,
+    AICAFDPerformanceModel,
+)
 
 # Per-layer attention components an attention provider must expose for the
 # recomposition to be exact: FastAFD runs the router on the A side outside its
@@ -69,9 +75,18 @@ class FastAFDMoEStagePerformanceModel:
             )
         except ValueError as exc:
             raise _infeasible(str(exc)) from exc
-        attention = self._attention(request)
+        if type(self.attention_model) is AICAFDPerformanceModel:
+            # Select precision before the built-in provider constructs either
+            # pool. F memory must describe this stage, not checkpoint defaults.
+            model_layers = get_model_config_from_model_path(request.model_name)["layers"]
+            estimate, config, model = self._select(request, model_layers)
+            attention = self._attention(request, model)
+        else:
+            attention = self._attention(request)
+            estimate, config, _model = self._select(request, attention.num_layers)
+        if attention.num_layers != estimate["num_layers"]:
+            raise _infeasible("the attention provider's layer count does not match the selected FastAFD stage")
         components = self._components(attention)
-        estimate, config = self._select(request, attention.num_layers)
         return (
             AFDLayerTimes(
                 phase=AFDPhase.DECODE,
@@ -100,8 +115,12 @@ class FastAFDMoEStagePerformanceModel:
             ),
         )
 
-    def _attention(self, request: AFDMeasurementRequest) -> AFDLayerTimes:
-        measurements = tuple(self.attention_model.measure(request))
+    def _attention(self, request: AFDMeasurementRequest, stage_model: Any = None) -> AFDLayerTimes:
+        measurements = tuple(
+            self.attention_model.measure_attention(request, stage_model)
+            if type(self.attention_model) is AICAFDPerformanceModel and stage_model is not None
+            else self.attention_model.measure(request)
+        )
         if (
             len(measurements) != 1
             or not isinstance(measurements[0], AFDLayerTimes)
@@ -157,7 +176,7 @@ class FastAFDMoEStagePerformanceModel:
         self,
         request: AFDMeasurementRequest,
         model_layers: int,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, Any], RustForwardPassPerfModel]:
         topology = request.topology
         try:
             routed_topk = get_model_config_from_model_path(request.model_name).get("topk")
@@ -202,7 +221,7 @@ class FastAFDMoEStagePerformanceModel:
                 canonical_config=config,
                 logical_batch_per_source_rank=topology.a_batch_size,
             ) from exc
-        return estimate, model.diagnostics()["provenance"]["config"]
+        return estimate, model.diagnostics()["provenance"]["config"], model
 
 
 __all__ = ["FastAFDMoEStagePerformanceModel"]

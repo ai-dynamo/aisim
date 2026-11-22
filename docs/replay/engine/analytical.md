@@ -50,7 +50,7 @@ engine:
 | `engine.afd.boundary_on_attn` | `true` | fixed | A/F boundary convention. |
 | `engine.afd.fastafd_profile_path` | `null` | Prediction only | Measured FastAFD split MoE stage; see [below](#measured-fastafd-moe-stage). Requires `phase: decode`, `tp_a: 1`, `f_moe_ep_size` equal to the F GPU count, and `boundary_on_attn: true`. |
 | `engine.afd.fastafd_moe_backend` | `null` | Prediction only | Required with `fastafd_profile_path`; `megamoe` or `deepep_deepgemm`. |
-| `engine.moe_quant_mode` | `null` | FastAFD prediction only | Exact profile `moe_precision` selector; required when otherwise matching entries differ in precision. Does not override attention or companion-worker timing. Unsupported for AFD without a FastAFD profile. |
+| `engine.moe_quant_mode` | `null` | FastAFD prediction only | Exact profile `moe_precision` selector; required when otherwise matching entries differ in precision. Also qualifies F memory at the selected precision. Does not override attention or companion-worker timing. Unsupported for AFD without a FastAFD profile. |
 | `engine.afd.max_af_ratio`, `max_candidates` | `4.0`, `10000` | Recommend only | Bounds on the generated topology space. |
 
 Workers:
@@ -97,6 +97,17 @@ these per-layer components; the built-in estimator does. Its `a_router_ms` is
 evaluated at the local A microbatch, widened by `nextn + 1` for MTP, using the A
 model. It is distinct from `router_ms`, the F-side router contribution measured
 at the combined F batch. Only `a_router_ms` is added to FastAFD attention time.
+The built-in provider measures A only: it does not query the discarded F compute,
+transfer, or combine models. Its combine component is zero because combine is
+already inside the measured stage. A memory includes the local router and KV
+cache; F memory uses the selected stage precision and excludes the router.
+Both pools must fit, so an oversized default-precision F model cannot reject a
+fitting low-bit stage. The resolved stage identity and both memory breakdowns
+are retained in attention provenance. Explicit external providers retain their
+own measurement and memory-qualification contracts.
+The canonical model returned by `RustForwardPassPerfModel.best_available` also
+exposes this composition as `estimate_fastafd_attention(isl=..., osl=...,
+max_seq_len=...)` for a selected `fastafd_stage` identity.
 This widening describes the lower-level provider. Public AFD configuration
 rejects nonzero `engine.nextn`, including `nextn: 1` with `nextn_accepted: 1`,
 before profile lookup. MTP profiles therefore cannot be selected through

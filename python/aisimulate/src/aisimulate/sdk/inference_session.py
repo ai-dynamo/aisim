@@ -29,6 +29,57 @@ logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
+def _measure_fastafd_attention(stage_config, *, isl, osl, prefix, max_seq_len):
+    """Internal composition for the canonical, already selected stage model."""
+    from aisimulate.sdk.backends.factory import get_backend
+    from aisimulate.sdk.config_builders import apply_nextn, build_model_config
+    from aisimulate.sdk.models import resolve_dsv4_moe_arch, resolve_nvfp4_for_system
+    from aisimulate.sdk.perf_database import get_database_view
+
+    identity = stage_config["afd"]
+    model_path, system, backend_name = (stage_config[key] for key in ("model", "system", "backend"))
+    database = get_database_view(system, backend_name, stage_config["backend_version"])
+    if database is None:
+        raise ValueError(f"No attention database for {system}/{backend_name}/{stage_config['backend_version']}")
+    gpus_per_node = int(database.system_spec["node"]["num_gpus_per_node"])
+    if any(identity[pool] % gpus_per_node for pool in ("attention_gpus", "ffn_gpus")):
+        raise ValueError("FastAFD pools must contain whole hardware nodes")
+    topology = config.AFDConfig(
+        n_a_nodes=identity["attention_gpus"] // gpus_per_node,
+        n_f_nodes=identity["ffn_gpus"] // gpus_per_node,
+        gpus_per_node=gpus_per_node,
+        tp_a=stage_config["tp"],
+        f_moe_ep_size=identity["f_moe_ep_size"],
+        a_batch_size=identity["logical_batch_per_source_rank"],
+        num_microbatches=identity["microbatches"],
+        phase="decode",
+        boundary_on_attn=identity["boundary_on_attn"],
+    )
+    a_config = build_model_config(stage_config["tp"], 1, 1, stage_config["tp"], 1)
+    f_config = build_model_config(
+        identity["ffn_gpus"],
+        1,
+        1,
+        identity["ffn_gpus"] // identity["f_moe_ep_size"],
+        identity["f_moe_ep_size"],
+        moe_quant_mode=stage_config["moe_quant_mode"],
+        moe_backend="megamoe" if stage_config["moe_backend"] == "megamoe" else "deepep_moe",
+    )
+    for model_config in (a_config, f_config):
+        apply_nextn(model_config, stage_config["nextn"])
+        resolve_dsv4_moe_arch(model_config, model_path, system_name=system, backend_name=backend_name)
+        resolve_nvfp4_for_system(model_config, system, model_path, backend_name=backend_name)
+    session = AFDInferenceSession(model_path, a_config, f_config, database, get_backend(backend_name), topology)
+    runtime = config.RuntimeConfig(
+        isl=isl, osl=osl, prefix=prefix, batch_size=topology.n_a_workers * topology.a_batch_size
+    )
+    result = session._measure_attention_decode(runtime, max_seq_len=max_seq_len)
+    if result["num_layers"] != identity["moe_layers"]:
+        raise ValueError("FastAFD stage layer count does not match the attention model")
+    result["provenance"]["config"] = stage_config
+    return result
+
+
 class InferenceSession:
     """
     InferenceSession holds the model and database to run inference loop
@@ -1518,6 +1569,84 @@ class AFDInferenceSession:
     # uses the same numerical integration grid as agg/disagg.
     _AFD_DECODE_STRIDE = 32
 
+    def _decode_samples(self, isl: int, osl: int):
+        for i in range(0, max(osl - 1, 1), self._AFD_DECODE_STRIDE):
+            repeat = min(self._AFD_DECODE_STRIDE, osl - 1 - i) if osl > 1 else 1
+            if repeat > 0:
+                yield isl + i + 1, repeat
+
+    def _measure_attention_decode(self, runtime_config, *, max_seq_len):
+        """A-only timing plus selected-precision memory, without F/comm queries."""
+        from aisimulate.sdk.afd_partition import build_afd_ops_partition
+
+        a_model, f_model = self._build_models()
+        a_partition = build_afd_ops_partition(a_model, boundary_on_attn=True)
+        f_partition = build_afd_ops_partition(f_model, boundary_on_attn=True)
+        routers = list(self._router_ops(a_partition.ffn_ops))
+        num_layers = int(a_model._num_layers)
+        _, a_batch, _, f_batch, _ = self._afd_batch_shape()
+        isl, osl = runtime_config.isl, runtime_config.osl
+        total_ms = 0.0
+        total_repeat = 0
+        for seq_len, repeat in self._decode_samples(isl, osl):
+            ms, _ = self._sum_latency(
+                a_partition.attn_ops,
+                batch_size=a_batch * (self._nextn + 1),
+                seq_len=seq_len,
+                model=a_model,
+                runtime_config=runtime_config,
+                is_context=False,
+            )
+            total_ms += ms * repeat
+            total_repeat += repeat
+        router_ms, _ = self._sum_latency(
+            routers,
+            batch_size=a_batch * (self._nextn + 1),
+            seq_len=isl + 1,
+            model=a_model,
+            runtime_config=runtime_config,
+            is_context=False,
+        )
+
+        # Router weights reside on A in FastAFD. Flatten overlap groups only
+        # for memory accounting so their nested router is removed from F too.
+        def f_memory_ops(ops):
+            for op in ops:
+                children = list(getattr(op, "_group_a", [])) + list(getattr(op, "_group_b", []))
+                if children:
+                    yield from f_memory_ops(children)
+                elif "router" not in op._name.lower():
+                    yield op
+
+        a_partition.attn_ops = [*a_partition.attn_ops, *routers]
+        f_partition.ffn_ops = list(f_memory_ops(f_partition.ffn_ops))
+        memory_args = dict(phase="decode", isl=isl, osl=osl, prefix=runtime_config.prefix, max_seq_len=max_seq_len)
+        a_memory = self._estimate_a_memory_dict(
+            a_model=a_model, a_partition=a_partition, batch_size=a_batch, **memory_args
+        )
+        f_memory = self._estimate_f_memory_dict(
+            f_model=f_model, f_partition=f_partition, batch_size=f_batch, **memory_args
+        )
+        fraction = self._backend.get_default_free_gpu_memory_fraction(self._database.version)
+        for pool, memory, free_fraction in (("A", a_memory, fraction), ("F", f_memory, None)):
+            summary = self._check_memory_dict(memory, runtime_config, free_fraction)
+            if summary.check_oom() or summary.check_kv_cache_oom():
+                raise RuntimeError(f"OOM: FastAFD {pool} pool does not fit in GPU memory")
+        compute_ms = total_ms / max(total_repeat, 1) / num_layers
+        return {
+            "attention_ms": compute_ms,
+            "num_layers": num_layers,
+            "provenance": {
+                "components": {
+                    "attention_compute_ms": compute_ms,
+                    # The measured stage includes combine; it is never queried here.
+                    "a_combine_ms": 0.0,
+                    "a_router_ms": router_ms / num_layers,
+                },
+                "memory": {"a_worker": a_memory, "f_worker": f_memory},
+            },
+        }
+
     def _integrate_decode_phase(
         self,
         *,
@@ -1558,7 +1687,6 @@ class AFDInferenceSession:
         evaluated on the full per-layer time, not on the compute-only
         time.
         """
-        stride = self._AFD_DECODE_STRIDE
         verify_width = self._nextn + 1
 
         t_a_layer_sum = 0.0
@@ -1570,16 +1698,7 @@ class AFDInferenceSession:
         total_repeat = 0
         comm_hidden = False
 
-        decode_steps = max(osl - 1, 1)
-        for i in range(0, decode_steps, stride):
-            s_i = isl + i + 1
-            # ``osl <= 1`` is degenerate (no decode tokens); fall back
-            # to a single representative sample so callers still get a
-            # non-zero estimate rather than zero-filled metrics.
-            repeat = min(stride, osl - 1 - i) if osl > 1 else 1
-            if repeat <= 0:
-                break
-
+        for s_i, repeat in self._decode_samples(isl, osl):
             t_a_step_i, a_per_op_i = self._sum_latency(
                 a_partition.attn_ops,
                 batch_size=a_batch_size * verify_width,

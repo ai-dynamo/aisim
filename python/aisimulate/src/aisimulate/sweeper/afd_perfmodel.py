@@ -149,6 +149,36 @@ class AICAFDPerformanceModel:
     def __init__(self, estimator: Callable[..., Any] | None = None) -> None:
         self._estimator = estimator
 
+    def measure_attention(self, request: AFDMeasurementRequest, stage_model: Any) -> tuple[AFDLayerTimes, ...]:
+        """Use the canonical stage identity without estimating discarded F ops."""
+        if self._estimator is not None:
+            # Explicit external estimators retain their existing provider contract.
+            return self.measure(request)
+        try:
+            item = stage_model.estimate_fastafd_attention(
+                isl=request.input_length,
+                osl=request.output_length,
+                prefix=request.prefix,
+                max_seq_len=request.max_seq_len,
+            )
+        except (ValueError, RuntimeError, OSError, KeyError) as exc:
+            raise AFDInfeasible(
+                AFDReasonCategory.INVALID_MEASUREMENT,
+                f"AIC could not measure FastAFD attention: {exc}",
+                provenance={"provider": "aic", "config": stage_model.diagnostics()["provenance"]["config"]},
+            ) from exc
+        return (
+            AFDLayerTimes(
+                phase=AFDPhase.DECODE,
+                attention_ms=item["attention_ms"],
+                ffn_ms=0.0,
+                a_to_f_ms=0.0,
+                f_to_a_ms=0.0,
+                num_layers=item["num_layers"],
+                provenance={"provider": "aic", "measurement_scope": "attention_only", **item["provenance"]},
+            ),
+        )
+
     def measure(self, request: AFDMeasurementRequest) -> tuple[AFDLayerTimes, ...]:
         estimator = self._estimator
         if estimator is None:
