@@ -7,14 +7,22 @@ internal project by hand.
 
 ## Install checklist (human step)
 
-1. In `aisim-hf-dataset-ci`, include this file (`include: project/ref/file`) at a reviewed ref.
-2. Set the protected variables listed at the top of the file. `AISIM_REVIEWED_COMMIT` is a full
-   40-hex SHA of this repository; bump it only through a reviewed merge request.
+1. Copy this definition into the protected default branch of `aisim-hf-dataset-ci` through a reviewed
+   merge request. In `.pinned.before_script`, replace `REPLACE_WITH_REVIEWED_40_HEX_AISIM_COMMIT`
+   with the full 40-hex code-reviewed AISim commit and `REPLACE_WITH_APPROVED_HTTPS_CACHE_REPO_URL`
+   with the approved private cache's exact HTTPS git URL. The source repository is fixed to
+   `https://github.com/ai-dynamo/aisim.git`. The template fails before network access until configured.
+   These values and `JOB_PY` are readonly shell assignments: pipeline, schedule and manual-job variables
+   cannot override them. Change the pin or destination only through another reviewed merge request;
+   never replace these assignments with CI/CD variables or inputs. Authenticated git commands disable
+   redirects so the cache token cannot be forwarded to another URL. If another project includes the
+   installed definition, pin its reviewed ref and restrict edits to that include and the definition.
+2. Set the protected credentials and alert variables listed at the top of the file. Do not create
+   CI/CD variables for `AISIM_REVIEWED_COMMIT`, `AISIM_REPO_URL`, `INFX_CACHE_REPO_URL` or `JOB_PY`.
    Set the GitLab project policy `ci_pipeline_variables_minimum_override_role` to
-   exclude everyone who must not override that reviewed pin (prefer `no_one_allowed`
-   when pipeline variables are unnecessary). This control also applies to scheduled
-   and manual runs. Protected project variables alone do not prevent higher-precedence
-   pipeline variables from overriding `AISIM_REVIEWED_COMMIT` or `JOB_PY`.
+   `no_one_allowed` when pipeline variables are unnecessary, as additional protection for other
+   job settings. The checkout and token-destination boundary is enforced by the shell assignments,
+   independently of this policy; protected project variables alone do not provide that boundary.
 3. Create a token that can write **only** `aisim-infx-cache` and store it as masked, protected
    `INFX_CACHE_WRITE_TOKEN`, with environment scope **`infx-cache-writer`**, never `*`.
    Only `publish_candidate` and `promote` select that environment. Add a separate masked,

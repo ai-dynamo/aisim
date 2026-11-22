@@ -62,6 +62,81 @@ def test_runs_only_on_schedule_or_manual_and_is_pinned(definition):
     assert "AISIM_REVIEWED_COMMIT" in pinned and "-eq 40" in pinned and "rev-parse HEAD" in pinned
 
 
+@pytest.mark.parametrize("job", ["publish_candidate", "promote", "staleness"])
+@pytest.mark.parametrize("installation", ["unconfigured", "pin-only", "ready"])
+def test_reviewed_trust_values_cannot_be_overridden_at_pipeline_or_manual_job_entry(
+    definition, tmp_path, job, installation
+):
+    # Installing the definition edits reviewed literals, never the process environment.
+    pin = "a" * 40
+    cache_url = "https://cache.example.test/approved/aisim-infx-cache.git"
+    setup = "\n".join(definition[".pinned"]["before_script"])
+    if installation != "unconfigured":
+        setup = setup.replace("REPLACE_WITH_REVIEWED_40_HEX_AISIM_COMMIT", pin)
+    if installation == "ready":
+        setup = setup.replace("REPLACE_WITH_APPROVED_HTTPS_CACHE_REPO_URL", cache_url)
+    assert definition[job]["extends"] == ".pinned"
+    clone = next(line for line in definition[job]["script"] if "clone -q --depth 1" in line)
+    clone = clone.replace("$[[ inputs.candidate-snapshot-id ]]", "b" * 64).replace(
+        "$[[ inputs.candidate-generation ]]", "42"
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    git = bin_dir / "git"
+    git.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "with (Path(os.environ['CI_PROJECT_DIR']) / 'git-calls.jsonl').open('a') as log:\n"
+        "    log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        f"if sys.argv[1:] == ['rev-parse', 'HEAD']: print({pin!r})\n"
+    )
+    git.chmod(0o755)
+    uv = bin_dir / "uv"
+    uv.write_text('#!/bin/sh\n[ "${INFX_CACHE_WRITE_TOKEN+x}" != x ] && [ "${INFX_CACHE_READ_TOKEN+x}" != x ]\n')
+    uv.chmod(0o755)
+    result = subprocess.run(
+        [
+            "sh",
+            "-eu",
+            "-c",
+            setup
+            + "\ntest \"$JOB_PY\" = 'uv run --frozen --project aisim/python/aisim python -m aisim_core.data.infx_job'\n"
+            + clone,
+        ],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "CI_PROJECT_DIR": str(tmp_path),
+            # These represent higher-precedence pipeline or manual-job variables.
+            "AISIM_REVIEWED_COMMIT": "c" * 40,
+            "AISIM_REPO_URL": "https://attacker.example.test/unreviewed.git",
+            "INFX_CACHE_REPO_URL": "https://attacker.example.test/steal-token.git",
+            "JOB_PY": "unreviewed-command",
+            "INFX_CACHE_WRITE_TOKEN": "synthetic-writer",
+            "INFX_CACHE_READ_TOKEN": "synthetic-reader",
+        },
+        capture_output=True,
+        text=True,
+    )
+    log = tmp_path / "git-calls.jsonl"
+    if installation != "ready":
+        assert result.returncode != 0
+        assert not log.exists()  # Pipeline values cannot turn an unconfigured template into a runnable job.
+        return
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert ["remote", "add", "origin", "https://github.com/ai-dynamo/aisim.git"] in calls
+    assert ["fetch", "-q", "--depth", "1", "origin", pin] in calls
+    cache_clone = calls[-1]
+    assert cache_clone[-2:] == [cache_url, "cache-repo"]
+    token = "synthetic-reader" if job == "staleness" else "synthetic-writer"
+    assert f"http.extraHeader=Authorization: Bearer {token}" in cache_clone
+    assert "http.followRedirects=false" in cache_clone
+    assert "attacker.example.test" not in json.dumps(calls)
+
+
 def test_ingestion_runs_without_the_cache_token_and_never_pushes_to_the_default_branch(definition):
     job = definition["publish_candidate"]
     text = _text(job)
@@ -175,9 +250,19 @@ def test_dependency_setup_cannot_read_either_cache_token(definition, tmp_path):
 
 
 def test_job_commands_do_not_resolve_new_dependencies(definition):
-    command = shlex.split(definition[".pinned"]["variables"]["JOB_PY"])
+    setup = "\n".join(definition[".pinned"]["before_script"])
+    assignment = next(line.strip() for line in setup.splitlines() if line.strip().startswith("readonly JOB_PY="))
+    command = shlex.split(shlex.split(assignment)[1].split("=", 1)[1])
     assert command[:3] == ["uv", "run", "--frozen"]
     assert command[command.index("--project") + 1] == "aisim/python/aisim"
+
+
+def test_all_authenticated_git_commands_disable_redirects(definition):
+    setup = "\n".join(definition[".pinned"]["before_script"])
+    for name in ("publish_candidate", "promote", "staleness"):
+        for line in (setup + "\n" + _text(definition[name])).splitlines():
+            if "http.extraHeader=" in line:
+                assert "-c http.followRedirects=false" in line, line
 
 
 @pytest.mark.parametrize("slack_fails", [False, True])

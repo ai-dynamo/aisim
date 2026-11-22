@@ -447,6 +447,7 @@ def agentx_bundles_to_configurations(bundles: Iterable[Path | str]) -> list[E2eC
     Bundles whose manifest bodies differ only in per-point facts (lanes, run) share a ``configuration_id``;
     their observations, metrics, requests and series are concatenated in bundle order. Differing
     runtime ``settings`` between merged bundles are kept as a gap on the merged body, never silently picked.
+    Matching identities with different origins are rejected to preserve the request-publication boundary.
     """
     merged: dict[str, E2eConfigurationData] = {}
     for bundle in bundles:

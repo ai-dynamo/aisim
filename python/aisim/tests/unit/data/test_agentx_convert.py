@@ -216,6 +216,24 @@ def test_same_origin_official_bundles_still_merge(tmp_path):
     assert len(configs[0].observations) == 2
 
 
+@pytest.mark.parametrize("categories", [("self_collected", "agentx"), ("agentx", "self_collected")])
+def test_bundles_with_different_origins_cannot_merge(tmp_path, categories):
+    bundles = [
+        _bundle(tmp_path, f"l{lanes}", category=category, lanes=lanes) for lanes, category in enumerate(categories, 1)
+    ]
+    # Origin is provenance, not serving identity. Neither order may relabel the other origin's requests.
+    assert len({agentx_bundle_to_configuration(bundle).body.configuration_id() for bundle in bundles}) == 1
+    with pytest.raises(AgentxBundleError, match="cannot merge.*origins"):
+        agentx_bundles_to_configurations(bundles)
+
+
+def test_official_lanes_still_merge_and_preserve_their_provenance(tmp_path):
+    bundles = [_bundle(tmp_path, f"l{lanes}", category="agentx", lanes=lanes) for lanes in (1, 4)]
+    (merged,) = agentx_bundles_to_configurations(bundles)
+    assert merged.body.origin == "official"
+    assert {r.observation_id for r in merged.requests} == {"l1", "l4"}
+
+
 def test_official_bundle_without_reference_keys_records_a_lineage_gap(tmp_path):
     data = agentx_bundle_to_configuration(_bundle(tmp_path, "agentx-1", category="agentx", with_keys=False))
     assert data.body.origin == "official" and data.observations[0].valid_for_submission is None
