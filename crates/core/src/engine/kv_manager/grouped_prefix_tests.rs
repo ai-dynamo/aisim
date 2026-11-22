@@ -650,6 +650,63 @@ fn rules_refuse_a_scheduler_block_above_usize() {
     assert_eq!(rules(&groups, 1).alignment, 18_446_744_060_824_649_730);
 }
 
+/// `count` full-attention groups of one block size, which form one spec.
+fn equal_groups(count: usize) -> Vec<FpmCacheGroup> {
+    (0..count)
+        .map(|i| attention(&format!("g{i}"), 16, None))
+        .collect()
+}
+
+#[test]
+fn rules_refuse_more_groups_than_a_cache_key_can_name() {
+    // `CacheKey::Grouped` holds the group position in a `u16`, so 65,536
+    // groups get 65,536 keys for one hash and one more group gets none.
+    assert!(GroupedPrefixRules::new(&equal_groups(65_536), 16, VllmRuleVersion::V0_31_0).is_ok());
+    // `err()` keeps a failure of this test from printing 65,537 rules.
+    let refusal = GroupedPrefixRules::new(&equal_groups(65_537), 16, VllmRuleVersion::V0_31_0)
+        .err()
+        .map(|err| err.to_string());
+    assert_eq!(
+        refusal.as_deref(),
+        Some(
+            "kv_cache_groups with enable_prefix_caching=true support at most 65536 groups; use fewer groups, or turn prefix caching off to replay them cold"
+        )
+    );
+}
+
+#[test]
+fn last_of_65536_groups_has_its_own_cache_key() {
+    // The groups have equal fields, so they form one spec, and a block of a
+    // spec hits only when every group of the spec holds it, as vLLM's
+    // `get_cached_block` asks (v0.31.0 and v0.32.0 `pool:198-224`, v0.33.0
+    // `pool:202-228`). The last group has the largest position that a key
+    // can hold, 65,535.
+    let groups = equal_groups(65_536);
+    let coordinator = with_limits(rules(&groups, 16));
+    let mut kv = kv_pool(&groups, 65_536);
+    let pool = kv.block_pool_mut().unwrap();
+    let request = lease(32, 16);
+    let hash = request.prefix_hash_at(16).unwrap();
+    for group in 0..u16::MAX {
+        seed(pool, CacheKey::Grouped { group, hash });
+    }
+    assert_eq!(coordinator.find_longest_hit(pool, &request, 32).tokens, 0);
+    seed(
+        pool,
+        CacheKey::Grouped {
+            group: u16::MAX,
+            hash,
+        },
+    );
+    let hit = coordinator.find_longest_hit(pool, &request, 32);
+    assert_eq!(hit.tokens, 16);
+    assert!(matches!(
+        &hit.per_group[65_535],
+        GroupHitBlocks::Attention(keys)
+            if keys[..] == [Some(CacheKey::Grouped { group: u16::MAX, hash })]
+    ));
+}
+
 #[test]
 fn alignment_is_the_hash_block_only_with_fine_grained_hits() {
     // coord:687-735. G2 to G5 are state rules with block 2176 and G0 is

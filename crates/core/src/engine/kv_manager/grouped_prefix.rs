@@ -128,6 +128,10 @@ pub(crate) struct GroupedPrefixRules {
     checkpoint: Option<CheckpointRule>,
 }
 
+/// The most groups of one grouped cache: `CacheKey::Grouped` holds the
+/// position of a group in a `u16`.
+const MAX_CACHE_GROUPS: usize = 1 << u16::BITS;
+
 fn gcd(a: usize, b: usize) -> usize {
     if b == 0 { a } else { gcd(b, a % b) }
 }
@@ -146,6 +150,11 @@ impl GroupedPrefixRules {
         version: VllmRuleVersion,
     ) -> anyhow::Result<Self> {
         ensure!(hash_block > 0, "prefix_match_unit must be positive");
+        // Byte mode has no cache key, so it takes any group count.
+        ensure!(
+            groups.len() <= MAX_CACHE_GROUPS,
+            "kv_cache_groups with enable_prefix_caching=true support at most {MAX_CACHE_GROUPS} groups; use fewer groups, or turn prefix caching off to replay them cold"
+        );
         let mut rules = Vec::with_capacity(groups.len());
         let mut checkpoints = Vec::new();
         for group in groups {
@@ -795,12 +804,17 @@ fn window_run(
     (0, 0)
 }
 
+/// The position of a group as a cache key holds it.
+fn key_group(group: usize) -> u16 {
+    u16::try_from(group).expect("GroupedPrefixRules::new allows at most 65,536 groups")
+}
+
 fn grouped_key(
     group: usize,
     hash: Option<crate::engine::common::hashing::SequenceHash>,
 ) -> Option<CacheKey> {
     hash.map(|hash| CacheKey::Grouped {
-        group: group as u16,
+        group: key_group(group),
         hash,
     })
 }
@@ -1220,7 +1234,7 @@ impl GroupedPrefixCoordinator {
         lease.prefix_hash_at(tokens).is_some_and(|hash| {
             spec.groups
                 .iter()
-                .all(|&g| pool.key_hit(g as u16, hash).is_some())
+                .all(|&g| pool.key_hit(key_group(g), hash).is_some())
         })
     }
 
@@ -1241,7 +1255,7 @@ impl GroupedPrefixCoordinator {
         // A request that ends before the block's first hash has no key in it.
         let first = lease.prefix_hash_at(floor + self.rules.hash_block)?;
         let mut ends = pool
-            .keys_in_block(spec.groups[0] as u16, first)
+            .keys_in_block(key_group(spec.groups[0]), first)
             .rev()
             .map(|offset| floor + offset as usize);
         let found = ends.find(|&end| end <= top && hits(end));

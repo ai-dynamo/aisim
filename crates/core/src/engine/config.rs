@@ -3646,6 +3646,40 @@ mod tests {
         validates(wire(false, "", 8));
     }
 
+    #[test]
+    fn grouped_prefix_caching_refuses_more_groups_than_a_cache_key_can_name() {
+        // A cache key of block mode holds the group position in 16 bits. Byte
+        // mode has no key, so prefix caching off keeps any group count.
+        let wire = |groups: usize, prefix_caching: bool| {
+            let groups: Vec<_> = (0..groups)
+                .map(|i| {
+                    serde_json::json!({
+                        "name": format!("g{i}"), "kind": "attention", "num_layers": 1,
+                        "block_size_tokens": 16, "page_size_bytes": 1, "prefix_cacheable": true
+                    })
+                })
+                .collect();
+            let mut wire = serde_json::json!({
+                "backend": "vllm",
+                "enable_prefix_caching": prefix_caching,
+                "max_model_len": 16,
+                "kv_cache_capacity_bytes": 65_537,
+                "kv_cache_groups": groups,
+            });
+            if prefix_caching {
+                wire["prefix_match_unit"] = 16.into();
+                wire["vllm_version"] = "0.31.0".into();
+            }
+            wire
+        };
+        validates(wire(65_536, true));
+        assert_eq!(
+            validation_error(wire(65_537, true)),
+            "kv_cache_groups with enable_prefix_caching=true support at most 65536 groups; use fewer groups, or turn prefix caching off to replay them cold"
+        );
+        validates(wire(65_537, false));
+    }
+
     /// `glm_groups_wire` with the bytes that the connector reads for one
     /// block of each GLM-5.3-Flash group at TP 4 on `version`: attention, ring
     /// and four KDA states. A live run measured the attention value and the
