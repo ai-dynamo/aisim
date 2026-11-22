@@ -1674,6 +1674,14 @@ def test_finalized_grouped_vllm_0330_profile_with_prefix_caching_evidence_plans_
     assert all(candidate.status is CandidateStatus.FEASIBLE for candidate in result.candidates)
 
 
+def _drop_cold_reason(plan):
+    """Give a saved plan the bytes that a planner wrote before plans recorded the reason of a cold replay."""
+    path = plan / "support-plan.json"
+    saved = json.loads(path.read_text())
+    saved["fpm"].pop("prefix_caching_reason")
+    path.write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n")
+
+
 def test_a_session_planned_cold_before_vllm_0330_rules_still_finalizes(tmp_path, capsys, monkeypatch):
     import yaml
 
@@ -1691,6 +1699,7 @@ def test_a_session_planned_cold_before_vllm_0330_rules_still_finalizes(tmp_path,
     with monkeypatch.context() as before:
         before.setattr(support_plan, "grouped_prefix_caching_requirements", refuse)
         _, request, files, root = _completed_runtime_collection(tmp_path, capsys, layout="mamba_hybrid")
+    _drop_cold_reason(root)
     saved = (root / "support-plan.json").read_bytes()
     assert not prefix_caching(root, "predict/pilot.yaml")
     # The cold plan and the plan with prefix caching on differ only in the two pilots and the plan manifest, so the
