@@ -209,8 +209,8 @@ Operation tables are not in the wheel. The default `systems/` root is composed o
 dataset revision pinned in `aisim_core/data/op_latency_pin.json` (a full commit SHA that ships with the
 release): every `op-latency` entry is downloaded into the data cache, hash-verified, and written next to the
 packaged specs, profiles and version tables as one root that later processes reuse. The first use downloads about
-180 MB (files are fetched concurrently); a warm cache makes no network request. Missing, corrupt or
-offline-uncached data raises `missing-data`; there is no packaged fallback.
+235 MB, under the 256 MiB auto-download threshold (files are fetched concurrently); a warm cache makes no
+network request. Missing, corrupt or offline-uncached data raises `missing-data`; there is no packaged fallback.
 
 | Setting | Effect |
 |---|---|

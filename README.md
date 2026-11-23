@@ -73,6 +73,34 @@ python3 -m pip install aisim
 aisim --help
 ```
 
+### Operation data is downloaded, not packaged
+
+> **Breaking change.** The `aisim` wheel no longer contains operation-latency
+> tables. They are downloaded on first use from the
+> [`ai-dynamo/aisim-data`](https://huggingface.co/datasets/ai-dynamo/aisim-data)
+> Hugging Face dataset at the commit pinned in the release, hash-verified, and
+> cached for later runs. Code that read `aisim_core/systems/data` inside the
+> installed package must use `--systems-paths`, `AICONFIGURATOR_SYSTEMS_PATH` or a
+> composed root instead.
+
+The first prediction downloads about 235 MB and needs network access; later runs
+reuse the cache. Choose when the data arrives:
+
+| Command | Effect |
+|---|---|
+| `aisim init --all` | Download the whole operation-latency database now. |
+| `aisim init --hardware h200_sxm` | Download one hardware platform now. |
+| `aisim data fetch --dry-run` | Show what would be downloaded, without downloading. |
+| `aisim data status` | Show the pin, cache path and size, saved choice and cached files. |
+| `aisim data clear` | Remove the cache and the saved choice. |
+
+For an offline or air-gapped host, prefetch once while connected, copy the cache
+directory, then run with `AISIM_DATA_OFFLINE=1 AISIM_DATA_CACHE=<copy>`. Roots you
+supply with `--systems-paths` or `AICONFIGURATOR_SYSTEMS_PATH` never download
+anything. The [CLI reference](docs/reference/cli.md#default-operation-data) lists
+every setting, and [Choose how data arrives](docs/reference/cli.md#init-status-clear)
+covers `init`, `status` and `clear`.
+
 ### Migrate an existing AISim environment
 
 `aisim` and `aisimulate` are different distribution names but install the same
