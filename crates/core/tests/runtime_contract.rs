@@ -949,7 +949,9 @@ fn grouped_prefix_two_state_groups_of_32_above_the_attention_block_complete_at_t
     // the scheduler block of 32, so an aggregated rank frees on the computed
     // count, one step earlier than vLLM. vLLM's startup count at
     // max_model_len 224 is cdiv(224, 8) = 28 attention blocks and 2 blocks per
-    // state group, 32. Two requests with a budget of 63 and 3 sequences: 182
+    // state group, 32 (v0.31 kv_cache_interface.py:1083-1094, v0.32
+    // :1076-1082, v0.33 :1135-1141). Two requests with a budget of 63 and 3
+    // sequences: 182
     // + 9 tokens at 0 ms and 217 + 3 at 10 ms, which shares no prompt token
     // with the first one (its first 142 tokens are the shared tokens of the
     // helper, which the first request does not have). Both complete. With the hold of vLLM the replay of
@@ -973,6 +975,61 @@ fn grouped_prefix_two_state_groups_of_32_above_the_attention_block_complete_at_t
         );
         let report = run_within_60_s(spec);
         assert_eq!(report.request_counts.completed_requests, 2, "{version}");
+    }
+}
+
+#[test]
+fn grouped_prefix_window_block_below_the_scheduler_block_completes_at_the_startup_count_with_async_scheduling()
+ {
+    // A full-attention group and four state groups of 8-token blocks beside a
+    // sliding-window group of 2-token blocks with a window of 4, the hash
+    // block 2, max_model_len 24, a budget of 7 and 4 sequences, at replay's
+    // startup count of 21 pages: 3 full-attention blocks, 10 window blocks
+    // and 2 blocks per state group. The same with a convolution group of
+    // 2-token blocks and a window of 2 at 20 pages, with 9 convolution
+    // blocks. One prompt of 23 tokens with 1 output token arrives at 0 ms.
+    // Every state block equals the scheduler block of 8, but the window or
+    // convolution block lies below it, so the layout loses the hold: an
+    // aggregated rank frees the blocks of a step in flight on the computed
+    // count, one step earlier than vLLM, and the request completes without a
+    // preemption at 50 ms. With the hold the replay of this request does not
+    // end. The cap of 10 s of simulated time bounds the run.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        for (small, pages) in [
+            (
+                serde_json::json!({"name":"window", "kind":"attention", "num_layers":1, "block_size_tokens":2, "page_size_bytes":64, "sliding_window":4, "prefix_cacheable":true}),
+                21,
+            ),
+            (
+                serde_json::json!({"name":"conv", "kind":"convolution", "num_layers":1, "block_size_tokens":2, "page_size_bytes":64, "sliding_window":2, "prefix_cacheable":true}),
+                20,
+            ),
+        ] {
+            let label = format!("{version} {}", small["name"].as_str().unwrap());
+            let groups = serde_json::json!([
+                {"name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":8, "page_size_bytes":64, "prefix_cacheable":true},
+                named_cacheable_state("state_0", 8, version),
+                named_cacheable_state("state_1", 8, version),
+                named_cacheable_state("state_2", 8, version),
+                named_cacheable_state("state_3", 8, version),
+                small,
+            ]);
+            let spec = startup_pool_spec(
+                groups,
+                version,
+                2,
+                24,
+                7,
+                4,
+                pages,
+                &[("q0", 0.0, 23, 1, 0)],
+            );
+            let report = run_within_60_s(spec);
+            assert_eq!(report.request_counts.completed_requests, 1, "{label}");
+            let record = record(&report, "q0");
+            assert_eq!(record.readmission_count, 0, "{label}");
+            assert_eq!(record.terminal_time_ms, 50.0, "{label}");
+        }
     }
 }
 
