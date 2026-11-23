@@ -1132,12 +1132,10 @@ def test_full_ci_owns_migrated_expensive_suites() -> None:
     assert "test_engine_step_parity.py" in regression_commands
     assert "test_compile_engine_parity.py" in regression_commands
     assert regression_commands.count("-c python/aisim/pytest.ini") == 2
-    assert regression_commands.index("check_prediction_numerics.py --fetch-baseline-only") < regression_commands.index(
-        "check_prediction_numerics.py --output"
-    )
-    policy_commands = _run_commands(_workflow("fast-ci.yml")["jobs"]["policy"])
-    fetch = "check_prediction_numerics.py --fetch-baseline-only"
-    assert policy_commands.index(fetch) < policy_commands.index("tests/test_ci_qualification.py")
+    assert "check_prediction_numerics.py --output" in regression_commands
+    # The sentinel values need no extra commit: no job fetches one.
+    for workflow in ("ci.yml", "fast-ci.yml"):
+        assert "--fetch-baseline-only" not in (WORKFLOW_ROOT / workflow).read_text()
 
     feature_mode_commands = _run_commands(jobs["rust-feature-modes"])
     assert "cargo test --workspace --features embed-python,replay-bench" in feature_mode_commands
@@ -2568,6 +2566,55 @@ def test_containerized_workflows_do_not_require_git_lfs_during_checkout() -> Non
         job = _workflow(workflow_name)["jobs"][job_name]
         checkout = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@"))
         assert checkout.get("with", {}).get("lfs") != "true"
+
+
+def test_numerics_jobs_run_on_github_hosted_runners() -> None:
+    # Both build AISim from source and use no NVIDIA-internal service. Old and
+    # new snapshots may come from different hosted CPUs; the report blocks only
+    # on status regressions and reports numerical drift.
+    golden = _workflow("ci.yml")["jobs"]["engine-golden-regression"]
+    prediction = _workflow("prediction-regression-gate.yml")["jobs"]
+    collect = prediction["collect"]
+
+    assert golden["name"] == "Engine Golden Regression"
+    assert collect["name"] == "Collect prediction snapshot (${{ matrix.side }})"
+    for job in (golden, collect, prediction["report"]):
+        assert job["runs-on"] == "ubuntu-24.04"
+        assert "container" not in job
+        assert "wheel-storage" not in json.dumps(job)
+        assert "WHEEL_STORAGE_URL" not in json.dumps(job)
+
+    # The sentinel check fetches its recorded baseline commit by SHA itself.
+    golden_checkout = next(step for step in golden["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+    assert "fetch-depth" not in golden_checkout["with"]
+    assert "check_prediction_numerics.py --fetch-baseline-only" in _run_commands(golden)
+    # The old side reads setup helpers from the workflow commit, so it keeps full history.
+    collect_checkout = next(step for step in collect["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+    assert collect_checkout["with"]["fetch-depth"] == "0"
+    assert 'git show "${GITHUB_SHA}:scripts/ci/ci_install_build_tools.sh"' in _run_commands(collect)
+
+
+def test_numerics_jobs_keep_single_run_artifact_contracts() -> None:
+    golden = _workflow("ci.yml")["jobs"]["engine-golden-regression"]
+    prediction = _workflow("prediction-regression-gate.yml")["jobs"]
+    collect = prediction["collect"]
+
+    assert "strategy" not in golden
+    assert collect["strategy"]["matrix"] == {"side": ["old", "new"]}
+    golden_upload = next(
+        step for step in golden["steps"] if step.get("uses", "").startswith("actions/upload-artifact@")
+    )
+    assert golden_upload["with"]["name"] == "native-prediction-numerics"
+    assert golden_upload["with"]["path"] == "numerical-sentinels.json"
+    collect_upload = next(
+        step for step in collect["steps"] if step.get("uses", "").startswith("actions/upload-artifact@")
+    )
+    assert collect_upload["with"]["name"] == "prediction-gate-${{ matrix.side }}"
+    assert "--old /tmp/prediction-snapshots/prediction-gate-old" in _run_commands(prediction["report"])
+    assert "--new /tmp/prediction-snapshots/prediction-gate-new" in _run_commands(prediction["report"])
+    for job in (golden, collect, prediction["report"]):
+        assert "sample" not in json.dumps(job)
+        assert "runner-cpu.txt" not in json.dumps(job)
 
 
 def test_active_workflows_do_not_call_nested_inert_github_assets() -> None:
