@@ -3320,6 +3320,57 @@ def test_pending_probe_preview_then_execute_reuses_output_directory(tmp_path, mo
     assert len(executions) == 2
 
 
+def test_probe_execute_names_the_missing_observer_for_a_detected_patch_release(tmp_path, monkeypatch, capsys):
+    from collector.fpm_forward import runner
+
+    from aisim.support import versioning
+
+    checkpoint, _, _ = _campaign(tmp_path)
+    state = _load(checkpoint)
+    draft = copy.deepcopy(state.configurations["tp2"].draft_request)
+    draft["identity"]["framework_version"] = "0.33.1"
+    save_checkpoint(
+        checkpoint,
+        patch={"configurations": {"tp2": {"draft_request": draft}}},
+        expected_revision=state.revision,
+        accept=[],
+    )
+    monkeypatch.setattr(runner, "_cell_runner", lambda *_: pytest.fail("a refused probe must not launch workers"))
+    output = tmp_path / "patch-release-probe"
+    command = [
+        "onboard",
+        "probe-runtime",
+        "--checkpoint",
+        str(checkpoint),
+        "--configuration",
+        "tp2",
+        "--output-dir",
+        str(output),
+    ]
+
+    # The detected version equals the requested one, so the launch identity holds no runtime version.
+    monkeypatch.setattr(versioning, "detect_runtime_versions", lambda *_: {"backend_version": "0.33.1"})
+    with pytest.raises(SystemExit, match="2"):
+        cli.main([*command, "--execute"])
+    error = capsys.readouterr().err
+    assert "no bundled runtime observer for vLLM 0.33.1; provide campaign-local --instrumentation" in error
+    assert "requires target-container version detection" not in error
+
+    # A detected version that differs from the requested one is named the same way.
+    monkeypatch.setattr(versioning, "detect_runtime_versions", lambda *_: {"backend_version": "0.33.2"})
+    with pytest.raises(SystemExit, match="2"):
+        cli.main([*command, "--execute"])
+    error = capsys.readouterr().err
+    assert "no bundled runtime observer for vLLM 0.33.2; provide campaign-local --instrumentation" in error
+    assert "requires target-container version detection" not in error
+
+    # Without --execute nothing is detected, and the preview stays pending.
+    monkeypatch.setattr(versioning, "detect_runtime_versions", lambda *_: pytest.fail("preview must not detect"))
+    assert cli.main(command) == 1
+    preview = _load(checkpoint).configurations["tp2"].history[-1]
+    assert preview["result"]["status"] == "pending_runtime_version"
+
+
 def test_mixed_known_and_pending_probe_preview_records_every_configuration(tmp_path, monkeypatch):
     from collector.fpm_forward import runner
 

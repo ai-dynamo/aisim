@@ -1091,7 +1091,7 @@ def run_runtime_command(args: argparse.Namespace) -> int:
     names = _selected(state, args.configuration)
     output = _new_root(args.output_dir, checkpoint, fresh=False)
     overrides = {key: getattr(args, key) for key in FPMDeployment.model_fields if getattr(args, key, None) is not None}
-    launches, failed = {}, {}
+    launches, failed, detected = {}, {}, {}
     for name in names:
         try:
             _, launches[name], _ = checkpoint_launch(
@@ -1107,8 +1107,11 @@ def run_runtime_command(args: argparse.Namespace) -> int:
 
                 observed = detect_runtime_versions(FPMDeployment.model_validate(launches[name]["deployment"]))
                 actual = observed["backend_version"]
+                detected[name] = actual
                 # Preserve old numeric launch identities when observation agrees.
                 # Custom labels carry a separate runtime pin into instrumentation.
+                # The detected version also goes to the probe beside the launches,
+                # so that a version without a bundled observer is named as such.
                 if actual != launches[name]["identity"].get("framework_version"):
                     launches[name]["identity"]["runtime_framework_version"] = actual
                 if launches[name]["identity"].get("framework_version") is None:
@@ -1119,7 +1122,12 @@ def run_runtime_command(args: argparse.Namespace) -> int:
             failed[name] = {"status": "incomplete", "diagnostics": [str(exc)]}
     result = (
         probe_runtime(
-            launches, instrumentation=args.instrumentation, output_dir=output, execute=args.execute, resume=args.resume
+            launches,
+            instrumentation=args.instrumentation,
+            output_dir=output,
+            execute=args.execute,
+            resume=args.resume,
+            detected_versions=detected,
         )
         if launches
         else {"status": "failed", "configurations": {}}

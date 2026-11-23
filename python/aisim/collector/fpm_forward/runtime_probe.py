@@ -873,6 +873,7 @@ def probe_runtime(
     output_dir: str | Path,
     execute: bool = False,
     resume: bool = False,
+    detected_versions: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Preview or capture all selected exact tuples; preserve every attempt."""
 
@@ -892,6 +893,12 @@ def probe_runtime(
                 # Existing literal-version previews can still select their
                 # historical bundle; this is not a claim of runtime detection.
                 version = identity["framework_version"]
+            if version is None and detected_versions and name in detected_versions:
+                # A version that the caller detected in the target container and
+                # that equals the requested one is not in the launch identity. No
+                # bundle exists for it, or the line above had taken it, so the
+                # refusal below names the missing observer.
+                version = detected_versions[name]
             if version is None:
                 unresolved.append(name)
             else:
