@@ -22,7 +22,10 @@ import math
 import os
 import re
 import tempfile
-from collections.abc import Callable, Mapping
+import threading
+import time
+from collections.abc import Callable, Collection, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
 
@@ -31,6 +34,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from aisim_core.data import Artifact, Digest, Identity
 from aisim_core.data.gpu_time import Finding, GpuTime, check_gpu_time, gpu_time_ok
+from aisim_core.data.hygiene import CandidatePolicy, bounded_json_bytes, checked_path
 from aisim_core.data.parquet import read_parquet, write_parquet
 
 EVAL_SCHEMA_ID = "aisim-eval/v1"
@@ -46,6 +50,7 @@ REL_TOL = 1e-6
 
 Layer = Literal["op", "fpm", "e2e"]
 Tier = Literal["submitted", "verified", "qualified"]
+TIER_RANK = {"submitted": 0, "verified": 1, "qualified": 2}  # the order attest and the mirror enforce
 
 
 class _Record(BaseModel):
@@ -270,38 +275,174 @@ def record_path(root: str | Path, record: EvalRecord) -> Path:
     return record_dir(root, record.truth.identity) / f"{record.record_id}.json"
 
 
-def write_record(root: str | Path, record: EvalRecord) -> Path:
+_RECORD_LOCK_WAIT_SECONDS = 30.0
+# Every writer must lock the same file, so the location cannot come from the environment (TMPDIR, TEMP, TMP): two
+# writers with different values would lock different files and could both publish a successor of one record.
+_LOCK_DIRECTORY = "/tmp" if os.path.isdir("/tmp") else tempfile.gettempdir()
+_THREAD_LOCK = threading.Lock()
+
+
+@contextmanager
+def _record_lock(directory: Path):
+    """Serialize writers of one record directory across processes and threads on this host.
+
+    The lock is an advisory ``flock`` that the operating system drops when its holder exits, however it exits, so a
+    killed writer never blocks the next one. Its backing file lives in ``/tmp`` (not the environment's temporary
+    directory, which writers may set differently), keyed by the directory's real path, so nothing is left in the
+    dataset (the mirror validator rejects stray files there).
+    """
+    try:
+        import fcntl
+    except ImportError:  # no flock (Windows): writers of one process still serialize
+        with _THREAD_LOCK:
+            yield
+        return
+    name = hashlib.sha256(os.path.realpath(directory).encode("utf-8")).hexdigest()
+    lock = Path(_LOCK_DIRECTORY) / f"aisim-eval-records-{name}.lock"
+    # Read-only and not following links: flock needs no write access, so users who share a directory share the lock.
+    fd = os.open(lock, os.O_RDONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o666)
+    try:
+        deadline = time.monotonic() + _RECORD_LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise ValueError(f"another record writer is publishing into {directory}") from exc
+                time.sleep(0.01)
+        yield
+    finally:
+        os.close(fd)  # closing releases the lock; the file stays, empty, for the next writer
+
+
+def write_record(root: str | Path, record: EvalRecord, *, sidecars: Mapping[str, bytes] | None = None) -> Path:
     """Write a record by content address. Never overwrites different content.
 
-    A superseding record must name an existing record in the same directory.
+    A superseding record must name an existing record in the same directory with no other successor.
     Writing identical content again is a no-op.
+
+    ``sidecars`` maps the path of each linked artifact the record declares (a findings file, which may be named by
+    its hash) to its bytes. They are checked against the declared size and digest and published under the same lock
+    as the record, from staged copies that record discovery cannot see. A hash-named file written beside the
+    records by hand is a record candidate until some record declares it, and a competing writer then reads it as a
+    corrupt record, so two successors of one predecessor cannot both be prepared that way.
     """
     path = record_path(root, record)
-    if record.supersedes is not None and not (path.parent / f"{record.supersedes}.json").is_file():
-        raise ValueError(f"superseded record {record.supersedes} not found next to the new record")
     text = json.dumps(record.model_dump(by_alias=True, mode="json"), indent=2, sort_keys=True, allow_nan=False) + "\n"
+    if len(text.encode("utf-8")) > CandidatePolicy().max_json_bytes:
+        raise ValueError(f"JSON exceeds the {CandidatePolicy().max_json_bytes}-byte limit")
+    declared = {a.path: a for a in [*record.truth.artifacts, *record.findings]}
+    for relative, data in (sidecars or {}).items():
+        artifact = declared.get(relative)
+        if artifact is None:
+            raise ValueError(f"sidecar {relative!r} is not an artifact of the record")
+        if len(data) != artifact.bytes or hashlib.sha256(data).hexdigest() != artifact.sha256:
+            raise ValueError(f"sidecar {relative!r} differs from its declared size or digest")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _record_lock(path.parent):
+        return _write_record(path, record, text, dict(sidecars or {}))
+
+
+def _write_record(path: Path, record: EvalRecord, text: str, sidecars: Mapping[str, bytes]) -> Path:
+    for relative, data in sidecars.items():
+        # Every destination is checked before anything is staged or published: a symlinked component would send the
+        # file outside the dataset. Ordinary nested directories stay allowed.
+        existing = checked_path(path.parent, relative)
+        if existing.exists() and existing.read_bytes() != data:
+            raise FileExistsError(f"refusing to overwrite {existing} with different content")
     if path.exists():
         if load_record(path) != record:
             raise FileExistsError(f"refusing to overwrite {path} with different content")
+        _publish_sidecars(path.parent, sidecars, _stage_sidecars(path.parent, sidecars))  # a retry completes them
         return path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    if record.supersedes is not None:
+        predecessor = path.parent / f"{record.supersedes}.json"
+        if not predecessor.is_file():
+            raise ValueError(f"superseded record {record.supersedes} not found next to the new record")
+        load_record(predecessor)
+        # The new record is not on disk yet, so its own sidecars (written first) are declared by it.
+        declared = {path.parent / a.path for a in [*record.truth.artifacts, *record.findings]}
+        for existing in _load_all(path.parent, declared):
+            if existing.supersedes == record.supersedes:
+                raise ValueError(f"superseded record {record.supersedes} already has successor {existing.record_id}")
+    staged = _stage_sidecars(path.parent, sidecars)
+    created = False
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-        os.link(tmp, path)  # fails if another writer created it first
-    except FileExistsError:
-        if load_record(path) != record:
-            raise
-    finally:
-        Path(tmp).unlink(missing_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            os.link(tmp, path)  # fails if another writer created it first
+            created = True
+        except FileExistsError:
+            if load_record(path) != record:
+                raise
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+    except BaseException:
+        for staged_copy in staged.values():
+            staged_copy.unlink(missing_ok=True)
+        raise
+    # The record goes first: it declares its sidecars, so discovery never sees an undeclared hash-named file. If a
+    # sidecar then fails to publish, the record is withdrawn with the sidecars this call linked, so the directory
+    # returns to its state before the call: no successor can be accepted on top of a record whose declared files
+    # are missing, and the whole write can simply be retried.
+    try:
+        _publish_sidecars(path.parent, sidecars, staged)
+    except BaseException:
+        if created:
+            path.unlink(missing_ok=True)
+        raise
     return path
 
 
+def _stage_sidecars(directory: Path, sidecars: Mapping[str, bytes]) -> dict[str, Path]:
+    """Complete copies of the sidecars under names that discovery ignores (dot-prefixed, never a record name)."""
+    staged: dict[str, Path] = {}
+    try:
+        for relative, data in sidecars.items():
+            target = directory / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+            staged[relative] = Path(tmp)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+    except BaseException:
+        for tmp in staged.values():
+            tmp.unlink(missing_ok=True)
+        raise
+    return staged
+
+
+def _publish_sidecars(directory: Path, sidecars: Mapping[str, bytes], staged: Mapping[str, Path]) -> None:
+    """Link the staged sidecars; on a failure, remove the ones this call linked (an existing identical one stays)."""
+    linked: list[Path] = []
+    try:
+        for relative, tmp in staged.items():
+            try:
+                os.link(tmp, directory / relative)
+                linked.append(directory / relative)
+            except FileExistsError:
+                if (directory / relative).read_bytes() != sidecars[relative]:
+                    raise
+    except BaseException:
+        for path in linked:
+            path.unlink(missing_ok=True)
+        raise
+    finally:
+        for tmp in staged.values():
+            tmp.unlink(missing_ok=True)
+
+
 def load_record(path: str | Path) -> EvalRecord:
-    """Load a record and check its file name equals its content hash."""
+    """Load a record and check its file name equals its content hash.
+
+    The read is bounded (the shared structured-JSON limit), so discovering records among large unrelated
+    JSON files never reads them whole; an oversized file is refused with a ``ValueError``.
+    """
     path = Path(path)
-    record = EvalRecord.model_validate_json(path.read_text(encoding="utf-8"))
+    record = EvalRecord.model_validate_json(bounded_json_bytes(path))
     if path.stem != record.record_id:
         raise ValueError(f"{path.name}: file name does not match record content hash {record.record_id}")
     return record
@@ -322,13 +463,52 @@ _RECORD_FILENAME = re.compile(r"^[0-9a-f]{64}\.json$")
 
 
 def record_files(directory: str | Path) -> list[Path]:
-    """The content-addressed record files of a directory; manifests and other JSON beside them are not records."""
-    return sorted(p for p in Path(directory).glob("*.json") if _RECORD_FILENAME.fullmatch(p.name))
+    """The content-addressed record files of a directory; manifests and other JSON beside them are not records.
+
+    A content-addressed name that a valid record declares as one of its own artifacts (a findings file may be
+    named by its hash) is that record's sidecar, not a record. Any other such name that fails to load stays listed,
+    so its corrupt content is rejected by the caller instead of being skipped.
+    """
+    return _record_files(directory, frozenset())
 
 
-def _load_all(directory: str | Path) -> list[EvalRecord]:
+def _record_files(directory: str | Path, extra_declared: Collection[Path]) -> list[Path]:
+    candidates = sorted(p for p in Path(directory).glob("*.json") if _RECORD_FILENAME.fullmatch(p.name))
+    records: set[Path] = set()
+    declared: set[Path] = set(extra_declared)
+    for path in candidates:
+        try:
+            record = load_record(path)
+        except (OSError, ValueError):
+            continue  # only an explicit artifact declaration can exclude this file
+        records.add(path)
+        declared.update(path.parent / a.path for a in [*record.truth.artifacts, *record.findings])
+    return [p for p in candidates if p in records or p not in declared]
+
+
+def record_paths(directory: str | Path, *, recursive: bool = False) -> list[Path]:
+    """Discover records separately from their declared JSON sidecars.
+
+    Undeclared JSON is still a record candidate, so malformed records fail in the
+    caller. A successfully loaded record is never hidden by an artifact reference.
+    """
+    root = Path(directory)
+    paths = sorted(root.rglob("*.json") if recursive else root.glob("*.json"))
+    records: set[Path] = set()
+    artifacts: set[Path] = set()
+    for path in paths:
+        try:
+            record = load_record(path)
+        except (OSError, ValueError):
+            continue  # only an explicit artifact declaration can exclude this file
+        records.add(path)
+        artifacts.update(path.parent / a.path for a in [*record.truth.artifacts, *record.findings])
+    return [p for p in paths if p in records or p not in artifacts]
+
+
+def _load_all(directory: str | Path, extra_declared: Collection[Path] = ()) -> list[EvalRecord]:
     # Corrupt content at a valid record filename is still rejected by load_record.
-    return [load_record(p) for p in record_files(directory)]
+    return [load_record(p) for p in _record_files(directory, extra_declared)]
 
 
 # --- truth table and metrics ------------------------------------------------
@@ -458,21 +638,29 @@ def verify_record(
     problems: list[str] = []
     checked_id = record.record_id
     if current_fingerprint != record.prediction.fingerprint:
-        return VerificationReport(ok=False, problems=["predictor fingerprint differs from the record's"])
+        return VerificationReport(
+            record_id=record.record_id, ok=False, problems=["predictor fingerprint differs from the record's"]
+        )
     table_art = next(a for a in record.truth.artifacts if a.artifact_id == record.truth.truth_table_artifact_id)
     path = Path(truth_root) / table_art.path
     if not path.is_file():
-        return VerificationReport(ok=False, problems=[f"truth table missing: {table_art.path}"])
+        return VerificationReport(
+            record_id=record.record_id, ok=False, problems=[f"truth table missing: {table_art.path}"]
+        )
     data = path.read_bytes()
     if hashlib.sha256(data).hexdigest() != table_art.sha256 or len(data) != table_art.bytes:
-        return VerificationReport(ok=False, problems=["truth table hash or size differs from record"])
+        return VerificationReport(
+            record_id=record.record_id, ok=False, problems=["truth table hash or size differs from record"]
+        )
     # Decode the bytes the digest covered, not a second read of the path (it could be replaced in between).
     table = read_parquet(pa.BufferReader(data), TRUTH_SCHEMA_ID)
     if tuple(table.column_names) != TRUTH_COLUMNS:
-        return VerificationReport(ok=False, problems=[f"truth table columns {table.column_names}"])
+        return VerificationReport(
+            record_id=record.record_id, ok=False, problems=[f"truth table columns {table.column_names}"]
+        )
     ids = table.column("case_id").to_pylist()
     if len(set(ids)) != len(ids):
-        return VerificationReport(ok=False, problems=["duplicate case_id in truth table"])
+        return VerificationReport(record_id=record.record_id, ok=False, problems=["duplicate case_id in truth table"])
     truths = table.column("truth_value").to_pylist()
     cases = []
     case_inputs: dict[str, str] = {}
@@ -483,7 +671,11 @@ def verify_record(
             inputs = None
         if not isinstance(inputs, Mapping):
             # A data defect in the truth table is a failed verification, never an exception for the caller.
-            return VerificationReport(ok=False, problems=[f"truth row {case_id!r} has no valid inputs_json object"])
+            return VerificationReport(
+                record_id=record.record_id,
+                ok=False,
+                problems=[f"truth row {case_id!r} has no valid inputs_json object"],
+            )
         case_inputs[case_id] = json.dumps(inputs, sort_keys=True, separators=(",", ":"))
         cases.append((case_id, truth, predict(inputs)))
     # Derive exclusions from the checked truth and this predictor. A producer cannot remove a valid error
@@ -526,6 +718,9 @@ def attest(record: EvalRecord, report: VerificationReport, tier: Tier = "verifie
         raise ValueError("verification report belongs to different record content")
     if tier == "submitted":
         raise ValueError("attest promotes to verified or qualified")
+    if TIER_RANK.get(tier, len(TIER_RANK)) < TIER_RANK.get(record.tier, 0):
+        # The successor supersedes the record, so a lower tier would hide it from the current view.
+        raise ValueError(f"cannot demote a {record.tier} record to {tier}")
     if record.status != "complete":
         raise ValueError("only complete records can be promoted")
     doc = record.model_dump(by_alias=True)

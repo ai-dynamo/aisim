@@ -164,7 +164,11 @@ def make_entry(root: Path, profile: dict, *, resources=None, with_measurements=F
     ]
     (root / ENTRY / "measurements").mkdir(parents=True, exist_ok=True)
     manifest_bytes = b'{"manifest_version": 5}'
-    iterations = b"not parquet: never read"
+    # One valid row: a planned measurement file is checked against its declared row count, but a default
+    # plan excludes it, so a prediction never needs it.
+    sink = pa.BufferOutputStream()
+    pq.write_table(pa.table({"iteration": [1]}), sink)
+    iterations = sink.getvalue().to_pybytes()
     if with_measurements:
         (root / ENTRY / "measurements/manifest.json").write_bytes(manifest_bytes)
         (root / ENTRY / "measurements/iterations-01.parquet").write_bytes(iterations)

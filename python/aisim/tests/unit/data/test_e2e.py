@@ -11,7 +11,7 @@ from dataclasses import replace
 import pyarrow.parquet as pq
 import pytest
 
-from aisim_core.data import check_manifest
+from aisim_core.data import check_dataset, check_manifest
 from aisim_core.data.e2e import (
     LOG_CAP_BYTES,
     E2eManifestBody,
@@ -139,6 +139,67 @@ def _dev_config(**kw):
     return aiperf_to_configuration(
         _aiperf_summary(), _aiperf_records(), _dev_body(), observation_id="dev:1", device_count=8, **kw
     )
+
+
+def _index_configuration(root, path):
+    from tests.unit.data.test_fetch import _artifact_json
+
+    manifest = json.loads((root / path).read_bytes())
+    index = {
+        "schema_version": "aisim-category-index/v1",
+        "category": "e2e",
+        "entries": [
+            {
+                **{k: manifest[k] for k in ("configuration_id", "identity", "purpose")},
+                "manifest": _artifact_json("manifest", path, (root / path).read_bytes(), format="json"),
+            }
+        ],
+    }
+    (root / "catalog").mkdir(exist_ok=True)
+    (root / "catalog/e2e.json").write_text(json.dumps(index))
+    dataset = {
+        "schema_version": "aisim-dataset-index/v1",
+        "dataset_id": "org/e2e",
+        "categories": {
+            "e2e": {
+                "root": "data",
+                "layout": "category",
+                "index": _artifact_json(
+                    "e2e-index", "catalog/e2e.json", (root / "catalog/e2e.json").read_bytes(), format="json"
+                ),
+            }
+        },
+    }
+    (root / "catalog/dataset.json").write_text(json.dumps(dataset))
+
+
+def test_check_dataset_dispatches_e2e_and_checks_the_protocol(tmp_path):
+    path = write_configuration(tmp_path, _dev_config())
+    _index_configuration(tmp_path, path)
+    assert check_dataset(tmp_path).categories.keys() == {"e2e"}
+    manifest = json.loads((tmp_path / path).read_bytes())
+    manifest["provenance"]["e2e"]["hardware"] = "b200_sxm"
+    (tmp_path / path).write_text(json.dumps(manifest))
+    _index_configuration(tmp_path, path)
+    with pytest.raises(LoaderError, match="body disagrees with the envelope"):
+        check_dataset(tmp_path)
+
+
+def test_check_dataset_checks_e2e_catalog_identity(tmp_path):
+    path = write_configuration(tmp_path, _dev_config())
+    _index_configuration(tmp_path, path)
+    from tests.unit.data.test_fetch import _artifact_json
+
+    index = json.loads((tmp_path / "catalog/e2e.json").read_bytes())
+    index["entries"][0]["identity"]["hardware"] = "b200_sxm"
+    (tmp_path / "catalog/e2e.json").write_text(json.dumps(index))
+    dataset = json.loads((tmp_path / "catalog/dataset.json").read_bytes())
+    dataset["categories"]["e2e"]["index"] = _artifact_json(
+        "e2e-index", "catalog/e2e.json", (tmp_path / "catalog/e2e.json").read_bytes(), format="json"
+    )
+    (tmp_path / "catalog/dataset.json").write_text(json.dumps(dataset))
+    with pytest.raises(ValueError, match="catalog and manifest identity mismatch"):
+        check_dataset(tmp_path)
 
 
 # ---------------------------------------------------------------- metrics
@@ -272,6 +333,43 @@ def test_aiperf_per_user_throughput_unit_spelling_converts():
     cfg = aiperf_to_configuration(summary, _aiperf_records(), _dev_body(), observation_id="dev:1", device_count=8)
     row = next(m for m in cfg.metrics if m.metric == "interactivity" and m.statistic == "mean")
     assert (row.status, row.value, row.unit) == ("valid", 42.0, "tokens/s/user")
+
+
+@pytest.mark.parametrize("observer", ["client", None])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_distinct_aiperf_throughput_statistics_reach_the_evaluator(tmp_path, observer, reverse):
+    import dataclasses
+
+    summary = _aiperf_summary(output_token_throughput={"unit": "tokens/second", "avg": 9600.0, "p50": 9000.0})
+    cfg = aiperf_to_configuration(summary, _aiperf_records(), _dev_body(), observation_id="dev:1", device_count=8)
+    dataset = load_e2e(tmp_path, write_configuration(tmp_path, cfg))
+    if reverse:
+        dataset = dataclasses.replace(dataset, metrics=list(reversed(dataset.metrics)))
+    (point,) = evaluation_points(dataset, observer=observer)
+    # Mean and median are different statistics of one observer: both survive, keyed by statistic.
+    assert point.metrics[("output_throughput:total", "mean")] == 9600.0
+    assert point.metrics[("output_throughput:total", "median")] == 9000.0
+    # The per-device value is the documented summary (``value``, else ``mean``): 9600 tokens/s over 8 devices.
+    assert point.per_device_throughput == {"output_throughput": 1200.0}
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_conflicting_per_device_sources_of_one_statistic_are_rejected_beside_other_statistics(tmp_path, reverse):
+    import dataclasses
+
+    dataset = load_e2e(tmp_path, write_configuration(tmp_path, _dev_config()))
+    rows = [
+        make_metric("dev:1", "output_throughput", "mean", 800.0, "tokens/s", normalization="total", device_count=8),
+        make_metric("dev:1", "output_throughput", "median", 790.0, "tokens/s", normalization="total", device_count=8),
+        make_metric("dev:1", "output_throughput", "mean", 120.0, "tokens/s", normalization="per_device"),
+    ]
+    ordered = rows[::-1] if reverse else rows
+    with pytest.raises(ValueError, match="ambiguous per-device throughput for output_throughput"):
+        evaluation_points(dataclasses.replace(dataset, metrics=ordered))
+    # Without the conflicting per-device mean only distinct statistics remain, which is accepted.
+    kept = [row for row in ordered if row.normalization == "total"]
+    (point,) = evaluation_points(dataclasses.replace(dataset, metrics=kept))
+    assert point.per_device_throughput == {"output_throughput": 100.0}
 
 
 def test_loader_rejects_tamper_and_wrong_schema(tmp_path):
@@ -467,6 +565,34 @@ def test_a_failure_while_publishing_restores_the_files_already_replaced(tmp_path
     monkeypatch.setattr(e2e_module.os, "replace", real_replace)
     assert {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
     assert load_e2e(tmp_path, path).observations[0].input_tokens == cfg.observations[0].input_tokens
+
+
+@pytest.mark.parametrize("client_first", [True, False])
+def test_total_and_per_device_throughput_cannot_overwrite_the_same_output(tmp_path, client_first):
+    import dataclasses
+
+    ds = load_e2e(tmp_path, write_configuration(tmp_path, _dev_config()))
+    pair = [
+        make_metric(
+            "dev:1",
+            "output_throughput",
+            "value",
+            800.0,
+            "tokens/s",
+            normalization="total",
+            device_count=8,
+            observer="client",
+        ),
+        make_metric(
+            "dev:1", "output_throughput", "value", 120.0, "tokens/s", normalization="per_device", observer="server"
+        ),
+    ]
+    both = dataclasses.replace(ds, metrics=pair if client_first else pair[::-1])
+    with pytest.raises(ValueError, match="ambiguous per-device throughput for output_throughput"):
+        evaluation_points(both)
+    for observer, expected in [("client", 100.0), ("server", 120.0)]:
+        (point,) = evaluation_points(both, observer=observer)
+        assert point.per_device_throughput["output_throughput"] == expected
 
 
 def test_a_rejected_snapshot_replacement_leaves_the_existing_snapshot_readable(tmp_path):

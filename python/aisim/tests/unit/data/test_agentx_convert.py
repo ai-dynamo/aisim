@@ -123,6 +123,61 @@ def test_bundle_converts_with_canonical_names_and_lineage(tmp_path):
     assert data.series[0].metric == "running_requests" and data.series[0].end_ms == 1000.0
 
 
+def test_manifest_and_observed_tensor_parallel_must_agree(tmp_path):
+    path = _bundle(tmp_path, "mismatch")
+    _set_effective_parallelism(path, tensor_parallel_size=4)
+    with pytest.raises(AgentxBundleError, match="tensor_parallel=8.*tensor_parallel_size=4"):
+        agentx_bundle_to_configuration(path)
+    _set_effective_parallelism(path, tensor_parallel_size=8)
+    assert agentx_bundle_to_configuration(path).body.parallelism["aggregated"]["tp"] == 8
+    _set_effective_parallelism(path, pipeline_parallel_size=1)
+    assert agentx_bundle_to_configuration(path).body.parallelism["aggregated"]["tp"] == 8
+
+
+@pytest.mark.parametrize(
+    "name", ["manifest.json", "configuration.json", "workload.json", "features.json", "observations.json"]
+)
+def test_bundle_hashes_the_bytes_it_parses_even_if_a_file_is_replaced(tmp_path, monkeypatch, name):
+    from aisim_core.data import agentx_convert
+
+    path = _bundle(tmp_path, "snapshot")
+    before = agentx_bundle_to_configuration(path)
+    original = (path / name).read_bytes()
+    read_bytes = Path.read_bytes
+    make_body = agentx_convert._body
+    reads = []
+
+    def counting_read(file):
+        if file.parent == path:
+            reads.append(file.name)
+        return read_bytes(file)
+
+    def body_then_replace(*args):
+        body = make_body(*args)
+        # Replace a parsed input before the observation digest is calculated.
+        (path / name).write_bytes(original + b"\n")
+        return body
+
+    monkeypatch.setattr(Path, "read_bytes", counting_read)
+    monkeypatch.setattr(agentx_convert, "_body", body_then_replace)
+    during = agentx_bundle_to_configuration(path)
+    assert during == before
+    assert len(reads) == len(set(reads)) == 5
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    monkeypatch.setattr(agentx_convert, "_body", make_body)
+    assert agentx_bundle_to_configuration(path).observations[0].record_sha256 != before.observations[0].record_sha256
+
+
+@pytest.mark.parametrize("content", [None, b"null", b"{}"])
+def test_optional_features_keep_their_empty_bundle_behavior(tmp_path, content):
+    path = _bundle(tmp_path, "optional-features")
+    if content is None:
+        (path / "features.json").unlink()
+    else:
+        (path / "features.json").write_bytes(content)
+    assert agentx_bundle_to_configuration(path).body.ext["agentx/1"]["features"] == []
+
+
 def test_silicon_statistics_match_the_agentx_cohort_definition(tmp_path):
     data = agentx_bundle_to_configuration(_bundle(tmp_path, "qwen-weka-l4"))
     out = tmp_path / "out"
@@ -159,6 +214,24 @@ def test_same_origin_official_bundles_still_merge(tmp_path):
     )
     assert len(configs) == 1 and configs[0].body.origin == "official"
     assert len(configs[0].observations) == 2
+
+
+@pytest.mark.parametrize("categories", [("self_collected", "agentx"), ("agentx", "self_collected")])
+def test_bundles_with_different_origins_cannot_merge(tmp_path, categories):
+    bundles = [
+        _bundle(tmp_path, f"l{lanes}", category=category, lanes=lanes) for lanes, category in enumerate(categories, 1)
+    ]
+    # Origin is provenance, not serving identity. Neither order may relabel the other origin's requests.
+    assert len({agentx_bundle_to_configuration(bundle).body.configuration_id() for bundle in bundles}) == 1
+    with pytest.raises(AgentxBundleError, match="cannot merge.*origins"):
+        agentx_bundles_to_configurations(bundles)
+
+
+def test_official_lanes_still_merge_and_preserve_their_provenance(tmp_path):
+    bundles = [_bundle(tmp_path, f"l{lanes}", category="agentx", lanes=lanes) for lanes in (1, 4)]
+    (merged,) = agentx_bundles_to_configurations(bundles)
+    assert merged.body.origin == "official"
+    assert {r.observation_id for r in merged.requests} == {"l1", "l4"}
 
 
 def test_official_bundle_without_reference_keys_records_a_lineage_gap(tmp_path):

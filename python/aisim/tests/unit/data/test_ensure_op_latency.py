@@ -1030,3 +1030,83 @@ def test_a_stale_repair_cannot_delete_a_root_another_caller_just_rebuilt(two_fam
     b.join(20)
     assert results["a"] == results["b"]
     assert (results["a"] / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet").read_bytes() == original
+
+
+def test_version_discovery_downloads_are_budgeted_and_warm_cache_is_free(tree, tmp_path):  # noqa: F811
+    from dataclasses import replace
+
+    from aisim_core.data.ensure import DataTooLargeError
+
+    from .test_fetch import FakeTransport, NoNetwork
+
+    published = tmp_path / "published"
+    _build(tree, published)
+    pin = DataPin(repo="org/dataset", revision="a" * 40, categories=("op-latency",), cache_dir=tmp_path / "cache")
+    config = {k: v for k, v in CONFIG.items() if k != "backend_version"}
+    transport = FakeTransport(_tree_files(published))
+    with pytest.raises(DataTooLargeError):
+        ensure_data(config, replace(pin, max_bytes=0), transport=transport)
+    assert transport.opened == []
+    out = ensure_data(config, pin, transport=transport)
+    assert out.downloaded_bytes == sum(len(transport.files[p]) for p in transport.opened)
+    warm = ensure_data(config, replace(pin, max_bytes=0), transport=NoNetwork())
+    assert warm.downloaded_bytes == 0 and warm.config["backend_version"] == out.config["backend_version"]
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        [],
+        None,
+        {"defaults": []},
+        {"overrides": []},
+        {"defaults": {"vllm": []}},
+        {"defaults": {"vllm": {"current": ["1.0"]}}},
+        {"defaults": {"vllm": {"current": ""}}},
+        {"default": {"vllm": {"current": "1.0"}}},
+        {"schema_version": True},
+    ],
+)
+def test_digest_correct_malformed_version_policy_cannot_select_latest(tree, tmp_path, document):  # noqa: F811
+    import hashlib
+
+    import yaml
+
+    published = tmp_path / "published"
+    _build(tree, published)
+    path = published / "data/op-latency/query_versions.parquet"
+    table = pq.read_table(path)
+    text = yaml.safe_dump(document).encode()
+    metadata = {
+        **table.schema.metadata,
+        b"aisim.source_yaml": text,
+        b"aisim.source_sha256": hashlib.sha256(text).hexdigest().encode(),
+    }
+    pq.write_table(table.replace_schema_metadata(metadata), path)
+    files = _tree_files(published)
+    index = json.loads(files["catalog/op-latency.json"])
+    artifact = next(a for a in index["support"] if a["path"] == path.relative_to(published).as_posix())
+    artifact.update(sha256=hashlib.sha256(path.read_bytes()).hexdigest(), bytes=path.stat().st_size)
+    files["catalog/op-latency.json"] = json.dumps(index).encode()
+    dataset = json.loads(files["catalog/dataset.json"])
+    index_bytes = files["catalog/op-latency.json"]
+    dataset["categories"]["op-latency"]["index"].update(
+        sha256=hashlib.sha256(index_bytes).hexdigest(), bytes=len(index_bytes)
+    )
+    files["catalog/dataset.json"] = json.dumps(dataset).encode()
+    for relative, raw in files.items():
+        (published / relative).write_bytes(raw)
+    config = {k: v for k, v in CONFIG.items() if k != "backend_version"}
+    with pytest.raises(MissingDataError, match="version policy"):
+        ensure_data(config, _pin(published, tmp_path))
+
+
+def test_a_valid_policy_without_an_applicable_entry_keeps_the_latest_held_version():
+    from aisim_core.data.ensure import _slot_version, _validate_version_policy
+
+    document = {"schema_version": 1, "defaults": {}, "overrides": {}}
+    _validate_version_policy(document)
+    assert (
+        _slot_version("h200_sxm", "vllm", None, {("h200_sxm", "vllm", "1.0"), ("h200_sxm", "vllm", "2.0")}, document)
+        == "2.0"
+    )

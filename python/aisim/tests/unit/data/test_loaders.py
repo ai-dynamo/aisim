@@ -11,7 +11,7 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 
-from aisim_core.data import Identity, configuration_id, prepare_execution_profile
+from aisim_core.data import Entry, Identity, configuration_id, prepare_execution_profile
 from aisim_core.data.fetch import Cache, Selection, SelectionError, fetch
 from aisim_core.data.loaders import (
     LOADERS,
@@ -193,6 +193,49 @@ def test_fpm_loader_matches_prepare_execution_profile_and_predicts(dataset, tmp_
     b = RustForwardPassPerfModel.best_available(reference)
     assert a.predict_prefill_latency(1, 4, 0) == b.predict_prefill_latency(1, 4, 0) == 6.0
     assert a.predict_prefill_latency(1, 8, 4) == b.predict_prefill_latency(1, 8, 4) == 15.0
+
+
+@pytest.mark.parametrize("damage", ["systems", "table", "profile", "config", "incomplete"])
+def test_cached_fpm_preparation_is_verified_and_rebuilt_before_native_use(dataset, tmp_path, monkeypatch, damage):  # noqa: F811
+    from aisim_core.data.ensure import _load
+
+    root, path, manifest = dataset
+    entry = Entry(
+        configuration_id=manifest["configuration_id"],
+        purpose=manifest["purpose"],
+        identity=manifest["identity"],
+        manifest=artifact(root, path, "manifest"),
+    )
+    loader = FpmLoader()
+    target = tmp_path / "materialized"
+    first = _load(loader, "fpm", root, entry, CONFIG, target)
+    prepared = next(p for p in tmp_path.glob("materialized-*") if p.is_dir())
+    # A valid warm hit must not reconstruct the native model or rewrite the outputs.
+    real_load = loader.load
+
+    def no_rebuild(*args, **kwargs):
+        pytest.fail("a complete cached preparation must be reused")
+
+    monkeypatch.setattr(loader, "load", no_rebuild)
+    assert _load(loader, "fpm", root, entry, CONFIG, target).config == first.config
+    monkeypatch.setattr(loader, "load", real_load)
+    if damage == "systems":
+        shutil.rmtree(prepared / "systems")
+    elif damage == "table":
+        runtime = next(a["runtime_path"] for a in manifest["artifacts"] if a.get("runtime_path"))
+        (prepared / "systems" / runtime).write_bytes(b"corrupt")
+    elif damage == "profile":
+        (prepared / "profile.json").unlink()
+    elif damage == "config":
+        config = json.loads((prepared / "config.json").read_bytes())
+        config["estimator_config"]["op_level"]["execution_profile"]["sha256"] = "0" * 64
+        (prepared / "config.json").write_text(json.dumps(config))
+    else:
+        (prepared / "config.json").unlink()
+    repaired = _load(loader, "fpm", root, entry, CONFIG, target)
+    assert repaired.config == first.config
+    model = RustForwardPassPerfModel.best_available(repaired.config)
+    assert model.predict_prefill_latency(1, 4, 0) == 6.0
 
 
 def test_fpm_loader_requires_output_dir_and_checks_identity(dataset, tmp_path):  # noqa: F811

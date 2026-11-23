@@ -360,7 +360,11 @@ def _identity_problem(record: EvalRecord, request: ValidationRequest, result) ->
     for manifest in owners:
         # Everything configuration_id hashes: effective settings, parallelism, precision, deployment and the rest.
         envelope = manifest.identity.model_dump()
-        differing = sorted(name for name, value in truth.model_dump().items() if envelope.get(name) != value)
+        differing = sorted(
+            name
+            for name, value in truth.model_dump().items()
+            if _canonical_inputs(envelope.get(name)) != _canonical_inputs(value)
+        )
         if differing:
             return f"record identity differs from its selected manifest in {differing}"
     return None

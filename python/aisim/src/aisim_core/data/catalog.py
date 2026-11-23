@@ -8,7 +8,7 @@ the last prediction, how good was the collection and what did it cost" without
 touching any payload. It is Parquet (zstd), sharded by category and hardware so
 an agent working on one GPU reads one small file per layer::
 
-    catalog/op-latency/<hardware>.parquet    schema aisim-catalog/v1
+    catalog/op-latency/<hardware>.parquet    schema aisim-catalog/v2
     catalog/fpm/<hardware>.parquet
     catalog/e2e/<hardware>.parquet
     catalog/systems.parquet                  schema aisim-catalog-systems/v1
@@ -36,6 +36,8 @@ a cell with no recorded GPU time has ``gpu_seconds`` null, never zero.
 """
 
 import json
+import os
+import tempfile
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -48,13 +50,17 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from aisim_core.data import CategoryIndex, DatasetIndex, Manifest, _verified_bytes, path_component
 from aisim_core.data.eval import EvalRecord, Layer, current_records, record_files
+from aisim_core.data.hygiene import bounded_json_bytes, json_sidecar_value
 from aisim_core.data.parquet import read_parquet, write_parquet
 from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR, packaged_system_specs, spec_file_sha256
 
-CATALOG_SCHEMA_ID = "aisim-catalog/v1"
+CATALOG_SCHEMA_ID = "aisim-catalog/v2"
+CATALOG_READ_SCHEMA_IDS = ("aisim-catalog/v1", CATALOG_SCHEMA_ID)
 SYSTEMS_SCHEMA_ID = "aisim-catalog-systems/v1"
 CATALOG_DIR = "catalog"
 SYSTEMS_FILE = "systems.parquet"
+COVERAGE_FILE = "coverage.json"
+MAX_CATALOG_ROWS = 100_000  # bound coverage expansion before allocating keys or row models
 
 LAYERS: tuple[Layer, ...] = ("op", "fpm", "e2e")
 LAYER_CATEGORY: dict[str, str] = {"op": "op-latency", "fpm": "fpm", "e2e": "e2e"}
@@ -71,8 +77,30 @@ class _Row(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, populate_by_name=True)
 
 
-class CatalogRow(_Row):
+class CatalogCoverage(_Row):
+    """Explicit coverage universe, retained so validation rebuilds the same missing cells."""
+
+    schema_version: Literal["aisim-catalog-coverage/v1"]  # required: an unidentified declaration is rejected
+    expected_models: list[str] = Field(default_factory=list)
+    expected_frameworks: list[str] = Field(default_factory=list)
+
+
+def read_catalog_coverage(root: Path) -> CatalogCoverage:
+    path = root / CATALOG_DIR / COVERAGE_FILE
+    try:
+        return (
+            CatalogCoverage.model_validate(json_sidecar_value(bounded_json_bytes(path)))
+            if path.is_file()
+            else CatalogCoverage(schema_version="aisim-catalog-coverage/v1")
+        )
+    except RecursionError as exc:
+        raise ValueError("catalog coverage JSON exceeds the nesting limit") from exc
+
+
+class CatalogRowV1(_Row):
     """One cell summary. ``model`` is null for the model-independent op layer."""
+
+    model_config = ConfigDict(title="CatalogRow")
 
     layer: Layer
     model: str | None
@@ -95,6 +123,12 @@ class CatalogRow(_Row):
     gpu_n_recorded: int = Field(default=0, ge=0)  # records contributing to gpu_seconds
     spec_sha256_current: str | None = None  # current packaged spec hash for this hardware
     stale_reason: str | None = None
+
+
+class CatalogRow(CatalogRowV1):
+    """V2 cell summary adds the exact prediction fingerprint to v1."""
+
+    acc_prediction_fingerprint: str | None = None  # includes code_version, spec and profile hashes
 
 
 class SystemRow(_Row):
@@ -126,6 +160,7 @@ _ROW_FIELDS = {
     "gpu_n_recorded": pa.int32(),
     "spec_sha256_current": pa.string(),
     "stale_reason": pa.string(),
+    "acc_prediction_fingerprint": pa.string(),
 }
 assert list(_ROW_FIELDS) == list(CatalogRow.model_fields)
 
@@ -213,7 +248,7 @@ def _read_eval_cells(root: Path, cells: dict[tuple, _Cell]) -> None:
 
 
 def _latest_accuracy(records: list[EvalRecord]) -> EvalRecord | None:
-    scored = [r for r in records if r.results.mape_pct is not None and r.status != "failed"]
+    scored = [r for r in records if r.results.mape_pct is not None and r.status == "complete"]
     return max(scored, key=lambda r: (_instant(r.created_at), r.record_id), default=None)
 
 
@@ -252,6 +287,7 @@ def _summarize(key: tuple, cell: _Cell | None, current_specs: Mapping[str, str])
         acc_record_id=latest.record_id if latest else None,
         acc_created_at=latest.created_at if latest else None,
         acc_spec_sha256=latest.prediction.spec_sha256 if latest else None,
+        acc_prediction_fingerprint=latest.prediction.fingerprint if latest else None,
         collection_quality_json=(
             None if quality is None else json.dumps(quality, sort_keys=True, separators=(",", ":"), allow_nan=False)
         ),
@@ -271,25 +307,38 @@ def build_catalog(
     dataset_root: str | Path,
     *,
     systems_dir: str | Path = PACKAGED_SYSTEMS_DIR,
-    expected_models: Iterable[str] = (),
-    expected_frameworks: Iterable[str] = (),
+    expected_models: Iterable[str] | None = None,
+    expected_frameworks: Iterable[str] | None = None,
     write: bool = True,
 ) -> list[CatalogRow]:
     """Build the catalog from a dataset root's category indexes, manifests and eval records.
 
     Returns every row (sorted by hardware, layer, model, framework). With
     ``write=True`` (default) it replaces the shards under ``<root>/catalog/``
-    and removes stale shards it no longer produces.
+    and removes stale shards it no longer produces. Explicit coverage is saved
+    in ``catalog/coverage.json``; omitted arguments reuse that declaration.
+    Pass an empty iterable to clear a previously declared dimension.
     """
     root = Path(dataset_root)
+    saved = read_catalog_coverage(root)
+    coverage = CatalogCoverage(
+        schema_version="aisim-catalog-coverage/v1",
+        expected_models=sorted(set(saved.expected_models if expected_models is None else expected_models)),
+        expected_frameworks=sorted(
+            set(saved.expected_frameworks if expected_frameworks is None else expected_frameworks)
+        ),
+    )
     specs = known_system_specs(systems_dir)
     cells: dict[tuple, _Cell] = defaultdict(_Cell)
     _read_indexed_cells(root, cells)
     _read_eval_cells(root, cells)
 
-    models = {k[1] for k in cells if k[1] is not None} | set(expected_models)
-    frameworks = {k[3] for k in cells} | set(expected_frameworks)
+    models = {k[1] for k in cells if k[1] is not None} | set(coverage.expected_models)
+    frameworks = {k[3] for k in cells} | set(coverage.expected_frameworks)
     hardware = {k[2] for k in cells} | set(specs)
+    projected = len(hardware) * len(frameworks) * (1 + 2 * len(models))
+    if projected > MAX_CATALOG_ROWS:
+        raise ValueError(f"projected catalog grid has {projected} rows; limit is {MAX_CATALOG_ROWS}")
     keys = set(cells)
     for hw in hardware:
         for fw in frameworks:
@@ -301,6 +350,17 @@ def build_catalog(
     rows.sort(key=lambda r: (r.hardware, *_row_sort_key(r)))
     if write:
         _write(root, rows, specs)
+        path = root / CATALOG_DIR / COVERAGE_FILE
+        if coverage.expected_models or coverage.expected_frameworks or path.exists():
+            pending = None
+            try:
+                with tempfile.NamedTemporaryFile("w", dir=path.parent, encoding="utf-8", delete=False) as handle:
+                    pending = Path(handle.name)
+                    handle.write(coverage.model_dump_json(indent=2) + "\n")
+                os.replace(pending, path)
+            finally:
+                if pending is not None:
+                    pending.unlink(missing_ok=True)
     return rows
 
 
@@ -362,7 +422,7 @@ class Catalog:
     ) -> list[CatalogRow]:
         out = []
         for path in self._shards(hardware, layer):
-            for item in read_parquet(path, CATALOG_SCHEMA_ID).to_pylist():
+            for item in read_parquet(path, CATALOG_READ_SCHEMA_IDS).to_pylist():
                 row = CatalogRow(**item)
                 if (
                     (model is None or row.model == model)

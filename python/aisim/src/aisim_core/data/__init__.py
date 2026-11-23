@@ -274,6 +274,11 @@ def check_manifest(root: Path, path: str) -> Manifest:
     """Check one manifest and all declared inputs without network access."""
     root = Path(root)
     manifest = Manifest.model_validate_json(_file(root, path).read_bytes())
+    return _check_manifest(root, manifest)
+
+
+def _check_manifest(root: Path, manifest: Manifest) -> Manifest:
+    """Validate an already parsed manifest and all its declared inputs."""
     if manifest.configuration_id != configuration_id(manifest.category, manifest.purpose, manifest.identity):
         raise ValueError("configuration identity hash mismatch")
     # fpm manifests are execution-profile bundles (the shared-envelope FPM layout);
@@ -299,7 +304,10 @@ def check_envelope(root: Path, path: str) -> Manifest:
     The category's own validators check the content; this keeps a missing or altered artifact from passing.
     """
     root = Path(root)
-    manifest = Manifest.model_validate_json(_file(root, path).read_bytes())
+    return _check_envelope(root, Manifest.model_validate_json(_file(root, path).read_bytes()))
+
+
+def _check_envelope(root: Path, manifest: Manifest) -> Manifest:
     if manifest.configuration_id != configuration_id(manifest.category, manifest.purpose, manifest.identity):
         raise ValueError("configuration identity hash mismatch")
     for artifact in manifest.artifacts:
@@ -316,8 +324,7 @@ def check_dataset(root: Path, *, unchecked_categories: tuple[str, ...] = ()) -> 
     root = Path(root)
     index = DatasetIndex.model_validate_json(_file(root, "catalog/dataset.json").read_bytes())
     for category, reference in index.categories.items():
-        path = _verify(root, reference.index)
-        entries = CategoryIndex.model_validate_json(path.read_bytes())
+        entries = CategoryIndex.model_validate_json(_verified_bytes(root, reference.index))
         if entries.category != category:
             raise ValueError("category index identity mismatch")
         for artifact in entries.support:
@@ -327,9 +334,19 @@ def check_dataset(root: Path, *, unchecked_categories: tuple[str, ...] = ()) -> 
             if entry.configuration_id in seen:
                 raise ValueError("duplicate configuration ID")
             seen.add(entry.configuration_id)
-            _verify(root, entry.manifest)
-            check = check_envelope if category in unchecked_categories else check_manifest
-            manifest = check(root, entry.manifest.path)
+            # Parse the bytes that passed the integrity check, then run the category's checks on that manifest.
+            manifest = Manifest.model_validate_json(_verified_bytes(root, entry.manifest))
+            if category in unchecked_categories:
+                manifest = _check_envelope(root, manifest)
+            elif category == "e2e":
+                # Import lazily: the E2E protocol builds on this shared envelope module.
+                from aisim_core.data.e2e import load_e2e
+
+                loaded = load_e2e(root, entry.manifest.path).manifest
+                if loaded.model_dump_json() != manifest.model_dump_json():
+                    raise ValueError("manifest changed during dataset validation")
+            else:
+                manifest = _check_manifest(root, manifest)
             if (manifest.category, manifest.configuration_id, manifest.identity, manifest.purpose) != (
                 category,
                 entry.configuration_id,

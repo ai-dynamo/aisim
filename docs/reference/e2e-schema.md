@@ -150,7 +150,7 @@ row with value 0. Replicas of a tensor-parallel group are never summed; `source`
 |---|---|
 | InferenceX model, hardware, framework, precision, parallelism, spec method | manifest identity core, `orchestrator`, `speculation`; spellings in `source_ids` |
 | InferenceX `metrics.*` | metrics rows in canonical units; unmapped keys stay in `unmapped_metrics_json` |
-| AgentX lanes, corpus, boundary, warmup | `workload`, observation `concurrency` and `attrs` |
+| AgentX lanes, corpus, boundary, warmup, seed | Shared facts in manifest `workload`; each observation keeps its workload facts in `attrs.workload` and its lane count in `concurrency` |
 | AgentX per-request observations | requests table |
 | AgentX server-side series | series table |
 | AgentX effective runtime settings | manifest `settings` with `observed` authority, `implementation` |

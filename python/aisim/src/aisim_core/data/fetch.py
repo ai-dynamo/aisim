@@ -50,7 +50,7 @@ from aisim_core.data import (
     configuration_id,
 )
 from aisim_core.data.fpm_layout import storage_path
-from aisim_core.data.parquet import read_parquet_schema_id
+from aisim_core.data.parquet import SCHEMA_METADATA_KEY
 from aisim_core.data.repos import resolve_ref
 
 
@@ -65,6 +65,10 @@ class _AliasTransport:
 
     def open_file(self, repo, sha, path):
         return self.transport.open_file(repo, sha, self.reference.path(path))
+
+    def file_size(self, repo, sha, path):
+        probe = getattr(self.transport, "file_size", None)
+        return None if probe is None else probe(repo, sha, self.reference.path(path))
 
 
 def _resolve_source(repo, revision, transport, category=None):
@@ -161,7 +165,12 @@ class Transport(Protocol):
         """Return the full 40-hex commit SHA for a branch, tag or SHA."""
 
     def open_file(self, repo: str, sha: str, path: str) -> Iterator[bytes]:
-        """Yield the content of ``path`` at commit ``sha`` in chunks."""
+        """Yield the content of ``path`` at commit ``sha`` in chunks.
+
+        A transport that cannot stop an oversized transfer while receiving it (it finishes the whole download before
+        yielding) may also offer ``file_size(repo, sha, path) -> int | None``: the planner asks it for the size of a
+        file that declares none, before any transfer starts.
+        """
 
 
 class HfTransport:
@@ -177,6 +186,17 @@ class HfTransport:
         from huggingface_hub import HfApi
 
         return HfApi(token=self._token).repo_info(repo, repo_type="dataset", revision=revision).sha
+
+    def file_size(self, repo: str, sha: str, path: str) -> int | None:
+        """Size of ``path`` at ``sha`` from the Hub's metadata, before any bytes move; ``None`` when it is unknown."""
+        from huggingface_hub import HfApi
+
+        try:
+            (info,) = HfApi(token=self._token).get_paths_info(repo, [path], repo_type="dataset", revision=sha)
+        except Exception:  # a failed probe only loses the early check; the transfer checks run as before
+            return None
+        size = getattr(info, "size", None)
+        return size if isinstance(size, int) else None
 
     def open_file(self, repo: str, sha: str, path: str) -> Iterator[bytes]:
         from huggingface_hub import hf_hub_download
@@ -377,7 +397,10 @@ class Cache:
         if expected is None or expected.sha256 is None:
             return True
         try:
-            return _digest(target) == (expected.sha256, expected.bytes)
+            if _digest(target) != (expected.sha256, expected.bytes):
+                return False
+            _verify_parquet(target, path, expected)
+            return True
         except OSError:
             return False
 
@@ -425,10 +448,16 @@ def _verify_file(local: Path, path: str, expected: PlannedFile) -> None:
         raise IntegrityError(path, f"size {size} != declared {expected.bytes}")
     if expected.sha256 is not None and digest != expected.sha256:
         raise IntegrityError(path, "SHA-256 mismatch")
+    _verify_parquet(local, path, expected)
+
+
+def _verify_parquet(local: Path, path: str, expected: PlannedFile) -> None:
     if expected.format == "parquet":
         try:
-            schema_id = read_parquet_schema_id(local)
-            rows = pq.ParquetFile(local).metadata.num_rows
+            metadata = pq.read_metadata(local)
+            value = (metadata.metadata or {}).get(SCHEMA_METADATA_KEY)
+            schema_id = None if value is None else value.decode()
+            rows = metadata.num_rows
         except Exception as exc:
             raise IntegrityError(path, f"unreadable Parquet: {exc}") from exc
         # A file published before schema stamping (the byte-identical FPM libraries) has no embedded ID;
@@ -458,7 +487,7 @@ def _ref(artifact: Artifact, role: str, category_roots: Mapping[str, str] | None
     )
 
 
-# A metadata file without a declared size (the root catalog) is refused past this many bytes.
+# Every metadata file is refused past this many bytes, independently of its declaration.
 _METADATA_CAP_BYTES = 16 * 1024 * 1024
 
 
@@ -506,10 +535,16 @@ class _Planner:
         call replaces a cached copy that fails it, and an invalid transfer is never cached.
         """
         plan = self.plan
+        if ref.bytes is not None and ref.bytes > _METADATA_CAP_BYTES:
+            raise IntegrityError(ref.path, f"metadata declaration exceeds {_METADATA_CAP_BYTES} bytes")
         online = not plan.offline and self.transport is not None
         if self.cache.valid(plan.repo, plan.revision, ref.path, ref):
-            data = self.cache.path_for(plan.repo, plan.revision, ref.path).read_bytes()
+            with self.cache.path_for(plan.repo, plan.revision, ref.path).open("rb") as handle:
+                data = handle.read(_METADATA_CAP_BYTES + 1)  # bounded: an oversized file is never read whole
             try:
+                # An oversized cached copy fails like any other invalid one: an online call repairs it.
+                if len(data) > _METADATA_CAP_BYTES:
+                    raise IntegrityError(ref.path, f"metadata exceeds {_METADATA_CAP_BYTES} bytes")
                 if validate is not None:
                     validate(data)
             except IntegrityError:
@@ -526,7 +561,13 @@ class _Planner:
         # budget stop an oversized stream before it is held in memory. A transport that finishes the whole
         # download before yielding (Hugging Face) can only be checked once its bytes arrive.
         limit = ref.bytes if ref.bytes is not None else _METADATA_CAP_BYTES
-        if self.budget is not None and plan.metadata_bytes + (ref.bytes or 1) > self.budget:
+        size = ref.bytes
+        if size is None and (probe := getattr(self.transport, "file_size", None)) is not None:
+            # No declared size, and a transport that cannot be stopped mid-transfer: ask for it before any byte moves.
+            size = probe(plan.repo, plan.revision, ref.path)
+            if size is not None and size > _METADATA_CAP_BYTES:
+                raise IntegrityError(ref.path, f"metadata is {size} bytes, over the {_METADATA_CAP_BYTES}-byte cap")
+        if self.budget is not None and plan.metadata_bytes + (size or 1) > self.budget:
             self._add(ref)
             raise BudgetExceededError(plan, self.budget)
         chunks: list[bytes] = []

@@ -756,3 +756,38 @@ def test_fpm_only_pin_without_categories_fails_naming_the_variable(tmp_path, fil
     assert "op-latency" in str(e.value) and e.value.source == f"{REPO}@{SHA}"
     named = pin_from_environment({**env, "AISIM_DATA_CATEGORIES": "fpm"})
     assert ensure_data(CONFIG, named, transport=FakeTransport(files)).revisions == {"fpm": SHA}
+
+
+def test_a_unique_fpm_entry_fixes_an_omitted_backend_version(tmp_path, files):
+    omitted = {k: v for k, v in CONFIG.items() if k != "backend_version"}
+    out = ensure_data(omitted, pin(tmp_path), transport=FakeTransport(files))
+    assert out.config["backend_version"] == CONFIG["backend_version"]
+    assert out.config["estimator_config"]["op_level"]["execution_profile"]["sha256"] == PROFILE_SHA
+    assert "backend_version" not in omitted  # the caller's mapping is not changed
+    # An explicit version that the dataset does not hold still finds nothing: there is no fallback.
+    with pytest.raises(MissingDataError, match="matched no catalog entries"):
+        ensure_data({**CONFIG, "backend_version": "9.9"}, pin(tmp_path), transport=FakeTransport(files))
+
+
+def test_configuration_discovery_obeys_a_zero_byte_allowance(tmp_path, files):
+    index = json.loads(files["catalog/fpm.json"])
+    transport = FakeTransport(files)
+    p = pin(
+        tmp_path,
+        max_bytes=0,
+        categories=("op-latency", "fpm"),
+        configuration_id=index["entries"][0]["configuration_id"],
+    )
+    with pytest.raises(DataTooLargeError):
+        ensure_data(CONFIG, p, transport=transport)
+    assert transport.opened == []
+
+
+def test_retired_pin_guidance_preserves_the_available_commit():
+    from aisim_core.data.repos import PUBLIC_REPO, RETIRED_FPM_REPO, resolve_ref, retired_repo_hint
+
+    historical = resolve_ref(RETIRED_FPM_REPO, "d" * 40)
+    assert (historical.repo, historical.revision, historical.via) == (RETIRED_FPM_REPO, "d" * 40, "verbatim")
+    assert resolve_ref(RETIRED_FPM_REPO, "main").repo == PUBLIC_REPO
+    hint = retired_repo_hint(RETIRED_FPM_REPO)
+    assert "unsupported by ensure_data" in hint and "commit and artifacts remain available" in hint

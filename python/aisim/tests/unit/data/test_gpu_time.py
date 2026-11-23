@@ -158,7 +158,12 @@ class _FakeKube:
 _JOB = {
     "metadata": {"name": "bench", "namespace": "ns"},
     "spec": {"template": {"spec": {"containers": [{"resources": {"limits": {"nvidia.com/gpu": "4"}}}]}}},
-    "status": {"succeeded": 1, "startTime": "2026-11-07T00:10:00Z", "completionTime": "2026-11-07T00:20:00Z"},
+    "status": {
+        "succeeded": 1,
+        "conditions": [{"type": "Complete", "status": "True"}],
+        "startTime": "2026-11-07T00:10:00Z",
+        "completionTime": "2026-11-07T00:20:00Z",
+    },
 }
 
 
@@ -390,3 +395,34 @@ def test_an_earlier_run_overlapping_the_final_window_is_not_charged_twice():
     # Disjoint runs keep the existing split (earlier run failed cost, final run measured).
     gt = gpu_time_from_kubernetes(job, [_pod_with([main])])
     assert (gt.wall_seconds, gt.failed.wall_seconds) == (30, 60)
+
+
+@pytest.mark.parametrize("apps,initializers,expected", [([1], [8], 8), ([3, 2], [1, 4], 5), ([1], [8, 4], 8)])
+def test_kubernetes_allocated_cost_uses_the_effective_pod_request(apps, initializers, expected):
+    from aisim_core.data.gpu_time import gpu_time_from_kubernetes
+
+    pod = _pod("p", "Succeeded", "2026-11-07T00:01:00Z", "2026-11-07T00:02:00Z")
+
+    def container(gpus):
+        return {"resources": {"requests": {"nvidia.com/gpu": str(gpus)}}}
+
+    pod["spec"]["containers"] = [container(gpus) for gpus in apps]
+    pod["spec"]["initContainers"] = [container(gpus) for gpus in initializers]
+    pod["status"]["initContainerStatuses"] = [
+        {"state": {"terminated": {"startedAt": "2026-11-07T00:00:00Z", "finishedAt": "2026-11-07T00:01:00Z"}}}
+    ]
+    result = gpu_time_from_kubernetes(_JOB, [pod])
+    assert result.gpu_count == expected and result.wall_seconds == 120
+    assert result.gpu_seconds == expected * 120
+
+
+@pytest.mark.parametrize(
+    "conditions", [[], [{"type": "Complete", "status": "False"}], [{"type": "SuccessCriteriaMet", "status": "True"}]]
+)
+def test_a_partially_successful_sequential_job_is_not_a_final_measurement(conditions):
+    from aisim_core.data.gpu_time import KubeParseError, gpu_time_from_kubernetes
+
+    job = {**_JOB, "spec": {**_JOB["spec"], "completions": 2}, "status": {"succeeded": 1, "conditions": conditions}}
+    pod = _pod("first", "Succeeded", "2026-11-07T00:00:00Z", "2026-11-07T00:01:00Z")
+    with pytest.raises(KubeParseError, match="not Complete=True"):
+        gpu_time_from_kubernetes(job, [pod])

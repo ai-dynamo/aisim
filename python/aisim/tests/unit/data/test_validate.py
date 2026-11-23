@@ -545,6 +545,11 @@ def test_the_request_filters_bind_the_record_identity(tmp_path):
         ({"precision": {"weights": "bfloat16"}}, {"precision": {"weights": "fp8"}}),
         ({"deployment": "aggregated"}, {"deployment": "disaggregated"}),
         ({"effective_settings": {"max_num_seqs": 64}}, {"effective_settings": {"max_num_seqs": 128}}),
+        (
+            {"effective_settings": {"prefix_cache": {"enabled": True}}},
+            {"effective_settings": {"prefix_cache": {"enabled": 1}}},
+        ),
+        ({"effective_settings": {"scale": 1}}, {"effective_settings": {"scale": 1.0}}),
     ],
 )
 def test_the_whole_effective_identity_is_bound_to_the_selected_manifest(tmp_path, envelope, record):
