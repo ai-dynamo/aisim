@@ -1558,6 +1558,37 @@ def test_malformed_parallelism_metric_is_refused(tmp_path, value):
         acquirer.acquire()
 
 
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("mean_ttft", "0.1"),
+        ("median_tpot", True),
+        ("p99_e2el", [0.1]),
+        ("mean_intvty", {"value": 1}),
+        ("input_tput_per_gpu", "1200"),
+    ],
+)
+def test_malformed_recognized_measurement_is_refused(tmp_path, key, value):
+    fake = FakeInfx(rows=[row(1, metrics={"mean_ttft": 0.1, key: value})])
+    acquirer = infx_ingest.Acquirer(InfxClient(fake), infx_ingest.AcquisitionCache(tmp_path / "cache"))
+    with pytest.raises(infx_ingest.IncompleteAcquisitionError, match=f"metrics.{key} must be a finite number or null"):
+        acquirer.acquire()
+
+
+def test_numeric_null_and_unrecognized_measurements_are_still_accepted(tmp_path):
+    from aisim_core.data.e2e import inferencex_metrics
+
+    metrics = {"mean_ttft": 0.1, "median_ttft": None, "tput_per_gpu": 1200, "weird_metric": "not numeric"}
+    fake = FakeInfx(rows=[row(1, metrics=metrics)], availability=[avail("h100")])
+    acquirer = infx_ingest.Acquirer(InfxClient(fake), infx_ingest.AcquisitionCache(tmp_path / "cache"))
+    assert len(acquirer.acquire().records) == 1
+    rows, unmapped = inferencex_metrics("inferencex:1", metrics, 8)
+    mean = next(r for r in rows if (r.metric, r.statistic) == ("ttft", "mean"))
+    assert (mean.status, mean.value, mean.unit) == ("valid", pytest.approx(100.0), "ms")  # 0.1 s reaches 100 ms
+    assert next(r for r in rows if (r.metric, r.statistic) == ("ttft", "median")).status == "missing"
+    assert unmapped == ["weird_metric"]
+
+
 def test_request_budget_applies_to_each_acquisition(tmp_path):
     fake = FakeInfx()
     client = InfxClient(fake, RetryPolicy(max_requests=6))

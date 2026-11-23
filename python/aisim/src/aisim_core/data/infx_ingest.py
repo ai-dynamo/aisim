@@ -35,6 +35,7 @@ import email.utils
 import hashlib
 import http.client
 import json
+import math
 import os
 import re
 import tempfile
@@ -56,6 +57,7 @@ from aisim_core.data.e2e import (
     SnapshotMember,
     configuration_dir,
     inferencex_to_configurations,
+    is_inferencex_measurement,
     load_e2e,
     read_snapshot,
     snapshot_id,
@@ -70,6 +72,17 @@ USER_AGENT = "aisim-infx-ingest/1"
 # Bound each upstream page before allocation; this is independent of the request budget.
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 SELECTION_POLICY = "inferencex-all-observations-in-scope/v1"
+
+
+def _finite_number(value: Any) -> bool:
+    if type(value) not in (int, float):  # bool is not a measurement
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # an integer too large for a float
+        return False
+
+
 _PARALLELISM_METRIC = re.compile(r"(?:(?:prefill|decode)_)?(?:pp|pcp_size|dcp_size)")
 REQUIRED_ROW_KEYS = (*INFERENCEX_CONFIG_FIELDS, "id", "metrics", "isl", "osl", "benchmark_type")
 # ``exact=true&date=D`` returns the logical snapshot as of D, so one benchmark id can reappear on later
@@ -422,13 +435,17 @@ class Acquirer:
                 _check_availability_values(row, url)
                 if not isinstance(row["metrics"], dict):
                     raise IncompleteAcquisitionError(f"{url}: metrics must be a mapping")
-                for key, degree in row["metrics"].items():
+                for key, value in row["metrics"].items():
                     if (
                         _PARALLELISM_METRIC.fullmatch(key)
-                        and degree is not None
-                        and (type(degree) is not int or degree < 0)
+                        and value is not None
+                        and (type(value) is not int or value < 0)
                     ):
                         raise IncompleteAcquisitionError(f"{url}: metrics.{key} must be a non-negative integer")
+                    # A recognized measurement that is not a number would otherwise be stored as an invalid metric
+                    # with no value, and the snapshot would still publish as complete. A null stays "not reported".
+                    if is_inferencex_measurement(key) and value is not None and not _finite_number(value):
+                        raise IncompleteAcquisitionError(f"{url}: metrics.{key} must be a finite number or null")
                 if row.get("run_url") is not None and not isinstance(row["run_url"], str):
                     raise IncompleteAcquisitionError(f"{url}: run_url must be a string or null")
                 if row["model"] not in valid_keys:

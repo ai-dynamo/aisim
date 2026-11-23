@@ -1512,6 +1512,11 @@ INFERENCEX_CONFIG_FIELDS = (
 INFERENCEX_LATENCY_UNIT = "s"  # InferenceX reports latencies in seconds
 
 
+def is_inferencex_measurement(key: str) -> bool:
+    """True for a source ``metrics`` key that the converter reads as a latency, interactivity or throughput value."""
+    return bool(_IFX_LATENCY.match(key) or _IFX_INTERACTIVITY.match(key) or key in _IFX_THROUGHPUT)
+
+
 def _stat(name: str) -> str:
     return name.replace("_", ".") if re.fullmatch(r"p\d+_\d+", name) else name  # p99_9 and p99.9 both -> p99.9
 
