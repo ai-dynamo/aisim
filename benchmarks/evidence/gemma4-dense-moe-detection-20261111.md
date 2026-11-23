@@ -12,14 +12,19 @@ available in this checkout; these tables remain historical author-reported
 results, not verification of the current head. No GPU was run, and no
 performance data was added, re-collected, or re-fitted.
 
-The published review head is `8f3a62e0fde729cf74db0b6b3551608338b367dd`,
-based on `0809faae9e543487dcf2142dc6afe2427a42f9bd`. The classifier fix
-is in `7d97aac50`; `ad2bb0b68` adds the embedded bridge tests, and
-`a584153b9` adds the request-wide fallback regression and the CI enforcement
-flag. **`8f3a62e0` changes production behavior**: both expert fields must be
-integers (excluding booleans), or absent, before sentinel and range checks.
-Earlier results do not validate that change. The exact-head verification below
-supersedes the PR description's `a584153b9` test totals. The branch does change
+The current review head is `d65e5b3966875af78b7c8144c9a85098a632f99f`, which
+merges `main` at `24d06d418db0ec4aee309e0e24770958c8fdea19`; see
+[Current head after the main merge](#current-head-d65e5b396-after-the-main-merge-2026-11-24)
+for the verification at that SHA. The pre-rebase head was
+`8f3a62e0fde729cf74db0b6b3551608338b367dd`, based on
+`0809faae9e543487dcf2142dc6afe2427a42f9bd`, where the classifier fix was
+`7d97aac50`, `ad2bb0b68` added the embedded bridge tests, and `a584153b9` added
+the request-wide fallback regression and the CI enforcement flag. That lineage
+is preserved by the rebase in `d4faab7fd`, `45d70db42` and `c63cd7668`; the
+2026-11-18 sections below are historical. **The production behavior change is
+the non-integer expert metadata check** (pre-rebase `8f3a62e0`, now
+`31800b398`): both expert fields must be integers (excluding booleans), or
+absent, before sentinel and range checks. The branch also changes
 `.github/workflows/ci.yml` to enforce bridge imports in an admitted Full CI run.
 
 ## Scope
@@ -32,7 +37,88 @@ constant metrics through offline runner and performance-model doubles, so
 candidate scores are placeholders; only the selected shape set and the
 feasible/infeasible status are meaningful.
 
-## Exact-head verification (2026-11-18)
+## Current head `d65e5b396` after the main merge (2026-11-24)
+
+The reviewed head is `d65e5b3966875af78b7c8144c9a85098a632f99f`.
+`bf527e451` merges `main` at `24d06d418db0ec4aee309e0e24770958c8fdea19` and
+reconciles one consumer with this branch: because the dense gate now raises
+`InvalidEngineConfigurationError` (a `ValueError`) instead of an
+`AssertionError`, `fpe_support_matrix.classify_failure` matches the anchored
+diagnostic as `ValueError`, with `test_fpe_support_matrix.py` updated to
+match. `d65e5b396` then updates the sentinel workflow-contract test after the
+merge. Below the merge are the reviewed commits: `d4faab7fd` (classifier fix),
+`13ca8aa81` (this document), `45d70db42` (embedded bridge tests),
+`c63cd7668` (request-wide fallback regression and the CI enforcement flag),
+`31800b398` (non-integer expert metadata), `d0075f9bb` (host budget pin) and
+`b761646c0` (the Rust error mapping described next).
+
+Relative to the merged main the branch changes 26 files. Apart from the two
+reconciliation edits above, those paths match the `31800b398` blobs, and those
+match the pre-rebase `8f3a62e0` blobs except two explained differences: the
+bridge test (`Python::with_gil` to `Python::attach`, required by main's pyo3
+0.30.1 move in `ff726a1ca`) and `.github/workflows/ci.yml` (the single added
+`AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1` line). `b761646c0` additionally changes
+`crates/core/src/perfmodel/memory.rs` and asserts the mapped variant in the
+bridge test.
+
+### Rust error contract
+
+`b761646c0` classifies the `PyErr` that crosses the KV-cache bridge: an
+`aisim_core.sdk.errors.InvalidEngineConfigurationError` now becomes
+`KvCacheEstimateError::BadConfig { field: "engine", .. }`, and every other
+Python failure keeps the historical `KvCacheEstimateError::Unsupported`
+mapping. Both variants keep the Python diagnostic in `reason`. If the error
+module cannot be imported the check fails closed to `Unsupported`.
+
+This adds no enum variant and removes none: `BadConfig` was already declared, so
+the `Serialize`/`Deserialize` shape is unchanged. The contract change is
+behavioral. A configuration rejection that used to surface as `Unsupported` —
+the variant an external caller could read as fallback-eligible — now surfaces
+as `BadConfig`. No Rust caller in this workspace matches
+`KvCacheEstimateError`, so no in-tree behavior changes beyond the reported
+variant; external consumers that treat every `Unsupported` as fallback-safe
+must treat `BadConfig` as terminal.
+
+`crates/core/tests/perfmodel/dense_gemma4_bridge.rs` pins both sides:
+`dense_gemma4_capacity_rejects_instead_of_estimating_naively` asserts the dense
+rejection is `BadConfig { field: "engine" }` (lines 218-222) while still
+checking the diagnostic, and
+`unsupported_capacity_keeps_the_fallback_eligible_variant` asserts a coverage
+miss keeps `Unsupported` with its model, backend, GPU SKU and reason intact.
+
+### Verification at the current head
+
+Local run at `d65e5b396` on macOS arm64, Python 3.13.9, with the native
+extension rebuilt from this head's tree (`maturin develop --release`, the `pyproject.toml`
+`extension-module,jemalloc` features) so the interpreter and extension agree on
+`ENGINE_SPEC_SCHEMA_VERSION` (30 in this tree and on `main`; an extension built
+from another branch with 31 fails unrelated `perfmodel::py` tests).
+
+| Verification | Tested commit | Result |
+| --- | --- | --- |
+| Targeted pytest selection from the 2026-11-18 command below | `d65e5b396` | 1,187 passed, 0 failed |
+| `cargo test -p aisim-core --features embed-python --lib perfmodel::` (covers `memory.rs` and the `fpm/model.rs` fallback policy test) | `d65e5b396` | 1,476 passed, 0 failed, 1 ignored |
+| `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1 cargo test -p aisim-core --features embed-python --test perfmodel_dense_gemma4_bridge` | `d65e5b396` | 5 passed; no skips |
+| `cargo fmt --all -- --check` | `d65e5b396` | clean |
+
+The lib-suite total is higher than the 1,460 recorded at `b761646c0` because the
+merge added perf-model tests. These are local results, and the commit after
+`d65e5b396` changes only this document, not code. **No Full CI run exists for
+this head**; admission remains with the maintainer.
+
+### Support-matrix artifacts at the current head
+
+Rebasing does not change the stale-row position, and this branch does not
+introduce those rows. [Support-matrix artifacts](#support-matrix-artifacts)
+below holds the per-file counts and the constraint that blocks regeneration:
+the 103 op-level FPE rows and the ten retired-version `FAIL` rows are
+byte-identical to `origin/main`, and neither a Gemma-only patch nor a
+per-model shard can refresh them. Until a maintainer settles the retirement
+contract and runs a same-source FPE campaign, the matrices do **not** agree
+with the classifier for those 113 rows; this PR neither fixes nor worsens
+them.
+
+## Exact-head verification at `8f3a62e0` (2026-11-18, historical)
 
 Local verification below covers the unchanged published head
 `8f3a62e0fde729cf74db0b6b3551608338b367dd`, on Linux x86_64 (WSL2),
@@ -369,23 +455,27 @@ still fail for a real reason (`PERF_DATA_MISSING`, `SDK_UNREPRESENTABLE`,
 
 Inspection at `8f3a62e0` confirms all 103 FPE rows and ten retired-version
 CLI rows above still record `FAIL`. Neither set was regenerated by the local
-verification above. The author's
-[retirement-contract objection](https://github.com/ai-dynamo/aisim/pull/783#issuecomment-6993101186)
-and [follow-up](https://github.com/ai-dynamo/aisim/pull/783#issuecomment-6994253205)
-remain unresolved: there are 212 failed `trtllm 1.3.0rc23` rows across all
-models, including ten for the routed Gemma 4 checkpoint too.
+verification above. The same counts and byte-identical rows were re-checked at
+`d65e5b396` against the current `main` tip `1e321d584` (and earlier at
+`b761646c0` against `19d8a245a`): 103 dense-rejection FPE rows on both trees,
+and the ten dense `FAIL` rows plus six `HW_INCOMPATIBLE` rows for
+`trtllm 1.3.0rc23` on both trees, so this branch neither adds nor clears any of
+them. There are 212 failed `trtllm 1.3.0rc23` rows across all models,
+including ten for the routed Gemma 4 checkpoint too.
 `VALID_STATUSES` in `tools/support_matrix/support_matrix.py`
 has no retired/non-current status, and `scripts/pages/prepare_fpe_pages.py`
 rejects unknown FPE statuses. Introducing one changes the artifact/consumer
-contract; the author explicitly requests a separate, consistent lifecycle
-change rather than inventing a Gemma-only status.
+contract, so it is a separate, consistent lifecycle change rather than a
+Gemma-only status.
 
-A maintainer must settle that disputed contract (including treatment of the
-other retired-version rows), or supply a complete same-source FPE campaign
-and an agreed retirement representation. The FPE guard must then land with
-the regenerated or explicitly non-current rows. Adding it against these
-unchanged artifacts would fail; an allowlist or skipped assertion would hide
-the remaining requirement. The Cross-Layer Contract finding stays open.
+That work is tracked as
+[issue #1006](https://github.com/ai-dynamo/aisim/issues/1006): settle the
+retirement contract (including the other retired-version rows), run a complete
+same-source FPE campaign, and extend the FPE guard to the regenerated or
+explicitly non-current rows. Adding the guard against these unchanged artifacts
+would fail today on `main` too, and an allowlist or skipped assertion would
+hide the remaining requirement. This PR therefore documents the disagreement
+instead of claiming the matrices are current.
 
 ### Guard
 
@@ -437,13 +527,18 @@ Three checks keep the classification and the rejection from regressing.
    `PYO3_PYTHON` pointing at the same interpreter the extension was built for;
    the module header records the exact command.
 
-   The capacity cases assert the message and its bridge context, not an error
-   variant: `memory.rs::estimate_kv_cache` maps every Python failure to
-   `KvCacheEstimateError::Unsupported` and
-   `python.rs::estimate_aic_num_gpu_blocks` wraps the `PyErr` in `anyhow`, so
-   those variants cannot separate a dense rejection from an unrepresentable
-   model. No caller branches on the difference today (`allow_naive_fallback` is
-   decided in Python), so a typed mapping is left as a separate change.
+   The capacity case asserts both the variant and the diagnostic:
+   `dense_gemma4_capacity_rejects_instead_of_estimating_naively` requires
+   `KvCacheEstimateError::BadConfig { field: "engine" }` and the dense message,
+   because `memory.rs::estimate_kv_cache` maps the SDK's
+   `InvalidEngineConfigurationError` to `BadConfig` and every other Python
+   failure to `Unsupported`
+   (`python.rs::estimate_aic_num_gpu_blocks` still wraps the `PyErr` in
+   `anyhow`, so that entry point keeps its own message-level check).
+   `unsupported_capacity_keeps_the_fallback_eligible_variant` is the control
+   that pins the `Unsupported` side, and
+   `dense_gemma4_expert_parallelism_is_not_fallback_safe` pins the separate
+   `AicError::InvalidEngineConfig` mapping that `best_available` reads.
 
 ## Limitations
 
