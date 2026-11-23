@@ -80,7 +80,10 @@ group's own `block_size_tokens`. The bytes of one block come from the profile's
 `transfer_bytes_per_block`. `bytes_per_full_block` adds them up over the
 full-attention groups. With `destination_missing`, a decode worker that already
 caches a prefix of the prompt does not receive the full-attention blocks of
-that prefix again. If a full-attention group is not prefix-cacheable, the
+that prefix again. That prefix is the local prefix of the decode worker,
+which ends on a multiple of the scheduler block, the least common multiple
+of the group blocks (see [grouped caches](kv-cache.md#other-cache-modes)).
+If a full-attention group is not prefix-cacheable, the
 decode worker receives every full-attention block, as one transfer unit holds
 a block of each full-attention group. No full-attention spec of vLLM 0.31.0,
 0.32.0 or 0.33.0 opts out of prefix caching. Only a profile that describes no
@@ -118,21 +121,24 @@ a profile and when a group's value stays unset.
 
 Replay differs from vLLM in these known ways for a grouped profile:
 
-- When the decode worker already caches every full-attention block of the
-  transferred prompt, vLLM moves nothing, but replay still charges
-  `fixed_bytes`. Only a prefill that stops one token short can reach this case.
-  It needs a prompt of `N` tokens whose first `N - 1` tokens fill whole
-  full-attention blocks, all cached on the decode worker. If the decode worker
-  lacks the state of those tokens, vLLM computes the prompt again from the hit
-  that every group agrees on. Replay computes one token. With a hash block
-  smaller than the full-attention block, vLLM also loads nothing when the first
-  `N - 1` tokens end on a hash block boundary and are all cached, while replay
-  rounds its hit down to the full-attention block and moves one attention block
-  and `fixed_bytes`. Neither live run measured these cases.
-- `fixed_bytes` charges every block of a sliding-window group inside the
-  window, whatever the decode worker caches. vLLM moves only the window blocks
-  that the decode worker does not cache. GLM-5.3-Flash has no sliding-window
-  group.
+- When the prefix cache of the decode worker already holds every transferred
+  token of a request, vLLM 0.31.0, 0.32.0 and 0.33.0 load nothing and charge
+  no transfer. Replay loads the state of such a request again: it reserves
+  the blocks of a load, applies the two tests of a load and charges
+  `fixed_bytes`. With hits inside a block, replay also rounds its local
+  prefix down to a multiple of the scheduler block, where vLLM keeps it, so
+  replay also moves the full-attention blocks above that multiple. So such a
+  request can wait for blocks that vLLM does not take, and a replay in which
+  it never gets them ends with an error where vLLM takes no block for a
+  load. Only a prefill that stops one token short can reach this case,
+  because a hit of the decode worker ends before the last prompt token. If
+  the decode worker lacks the state of the transferred tokens, vLLM computes
+  the prompt again from the hit that every group agrees on. Replay computes
+  one token. Neither live run measured these cases.
+- `fixed_bytes` charges every block of a sliding-window or `convolution`
+  group inside the window, whatever the decode worker caches. vLLM moves only
+  the window blocks that the decode worker does not cache. GLM-5.3-Flash has
+  no such group.
 - When one full-attention group is prefix-cacheable and another is not, replay
   moves every full-attention block of both groups. vLLM moves only the blocks
   that the decode worker does not hold, so it does not move the cached hit
