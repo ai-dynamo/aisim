@@ -2198,6 +2198,7 @@ class BaseBackend:
         ttft_ctx_tokens = ctx_tokens
         ttft_steps_to_finish_ctx = steps_to_finish_ctx
         prefill_chunks = None
+        qualified_prefill = b > 1 and not _is_fpm_model(model) and _has_qualified_mamba(model, phases=("context_ops",))
         num_mix_steps = num_genonly_steps = 0
         num_mix_steps_for_tpot_calc = 0  # correction for tpot calc only
         if b > 1:
@@ -2211,7 +2212,7 @@ class BaseBackend:
                 requests = max(1.0, fresh_tokens / (isl - prefix))
                 scheduling_ctx_tokens = isl * requests / chunks
             num_mix_gen_tokens = self._mix_step_gen_tokens(b, scheduling_ctx_tokens, isl, decode_iterations)
-            if _is_fpm_model(model) and isl > prefix:
+            if (_is_fpm_model(model) or qualified_prefill) and isl > prefix:
                 num_mix_gen_tokens = min(b - 1, num_mix_gen_tokens)
             assert num_mix_gen_tokens >= 1, (
                 f"num_mix_gen_tokens: {num_mix_gen_tokens}, b: {b}, ctx_tokens: {ctx_tokens}, isl: {isl}"
@@ -2260,7 +2261,6 @@ class BaseBackend:
                 model, database, runtime_config, MixedStepInput(num_mix_ctx_tokens, num_mix_gen_tokens)
             )
         if b > 1:
-            qualified_prefill = not _is_fpm_model(model) and _has_qualified_mamba(model, phases=("context_ops",))
             if (_is_fpm_model(model) or qualified_prefill) and isl > prefix:
                 # Read the actual fresh-token query after backend scheduling
                 # (including XPU decode caps and budget reservation). A query

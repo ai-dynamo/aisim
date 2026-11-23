@@ -1953,6 +1953,25 @@ def test_qualified_chunk_averaging_keeps_other_requests_decode_kv(monkeypatch):
     )
 
 
+def test_qualified_aggregate_keeps_a_prefill_slot_at_equal_phase_lengths(monkeypatch):
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.perf_database import get_database_view
+
+    backend = get_backend("trtllm")
+    model = _qualified_scan_model("trtllm")
+    database = get_database_view("b200_sxm", "trtllm", "1.3.0rc20", database_mode="SOL")
+    assert database is not None
+    monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+    # Both phases take 128 iterations. The generic throughput heuristic would
+    # admit both requests as decoders, leaving no slot for scheduled prefill.
+    summary = backend.run_agg(model, database, RuntimeConfig(batch_size=2, isl=4096, osl=128), ctx_tokens=64)
+    scheduling = summary.get_step_estimates()["scheduling"]
+    assert scheduling["mix_decode_requests"] == 1
+    assert scheduling["num_mix_steps"] == 128
+    norm_ms = summary.get_aggregate_energy_breakdown()["mix_step"].per_op_latency_ms["norm"]
+    assert norm_ms == pytest.approx((2 * 4096 + 128) * 2 / database.system_spec["gpu"]["mem_bw"] * 1000)
+
+
 def test_fixed_native_decode_pass_keeps_folded_energy_and_coverage(monkeypatch):
     from aisim_core.sdk import rust_engine_step
 
