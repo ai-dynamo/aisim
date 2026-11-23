@@ -2594,9 +2594,10 @@ def test_numerics_jobs_run_on_github_hosted_runners() -> None:
         assert "wheel-storage" not in json.dumps(job)
         assert "WHEEL_STORAGE_URL" not in json.dumps(job)
 
-    # Numerical sentinels validate the manifest in the checked-out source.
+    # Sentinels use checked-in expected values and need no historical commit.
     golden_checkout = next(step for step in golden["steps"] if step.get("uses", "").startswith("actions/checkout@"))
     assert "fetch-depth" not in golden_checkout["with"]
+    assert "--fetch-baseline-only" not in _run_commands(golden)
     assert "check_prediction_numerics.py --output numerical-sentinels.json" in _run_commands(golden)
     # The old side reads setup helpers from the workflow commit, so it keeps full history.
     collect_checkout = next(step for step in collect["steps"] if step.get("uses", "").startswith("actions/checkout@"))
