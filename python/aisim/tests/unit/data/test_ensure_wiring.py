@@ -185,6 +185,22 @@ def test_the_recommendation_consumer_keeps_an_explicit_default_root_distinct_fro
     assert res._ensure_dataset(unset, None) == "ensured"
 
 
+def test_request_roots_keep_the_configured_order_when_an_environment_root_is_set(monkeypatch, tmp_path):
+    from importlib import resources
+
+    from aisim.sweeper.forward_pass_estimator import request_systems_paths
+
+    packaged = str(resources.files("aisim_core") / "systems")
+    custom, environment = tmp_path / "custom", tmp_path / "environment"
+    custom.mkdir()
+    environment.mkdir()
+    monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", str(environment))
+    configured = [packaged, "default", str(custom)]
+    # The environment root replaces only an unset list; explicit entries stay in order, the token stays a token.
+    assert request_systems_paths(configured) == (packaged, "default", str(custom))
+    assert request_systems_paths(["default", str(custom)]) == ("default", str(custom))
+
+
 @pytest.mark.parametrize("how", ["environment", "set_systems_paths"])
 @pytest.mark.parametrize("mode", ["op_level", "auto"])
 def test_configured_roots_outrank_the_saved_source_whether_or_not_the_request_names_them(

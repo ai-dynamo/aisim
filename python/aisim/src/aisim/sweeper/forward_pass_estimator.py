@@ -47,9 +47,12 @@ def request_systems_paths(configured: list[str] | None) -> tuple[str, ...]:
     resolved = resolve_systems_paths(configured)
     if not any(isinstance(entry, str) and entry.strip().lower() == "default" for entry in entries):
         return resolved
+    # Resolve each entry next to the token, never alone: a lone packaged path is read as an expansion of unset roots
+    # and swapped for AICONFIGURATOR_SYSTEMS_PATH, which would move it ahead of the explicit custom roots.
     return tuple(
         dict.fromkeys(
-            "default" if entry.strip().lower() == "default" else resolve_systems_paths([entry])[0] for entry in entries
+            "default" if entry.strip().lower() == "default" else resolve_systems_paths([entry, "default"])[0]
+            for entry in entries
         )
     )
 
