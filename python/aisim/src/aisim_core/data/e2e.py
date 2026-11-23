@@ -39,8 +39,8 @@ specializes the shared envelope (``aisim-artifact-manifest/v1``, category
   hash-linked from the manifest, tier 3, size-capped, with a redaction flag.
   A configuration with many observations stores its raw records in one
   ``raw-output-bundle`` (one record per line); each observation keeps the byte
-  range (``raw_offset``, ``raw_length``) and the SHA-256 (``record_sha256``) of
-  its own record, so every row stays individually auditable.
+  range (``raw_offset``, ``raw_length``) and the SHA-256 of its own record
+  (``raw_record_sha256``, falling back to ``record_sha256`` for older rows).
 
 All tables are Parquet+zstd written through :mod:`aisim_core.data.parquet`.
 Offline only; no network access.
@@ -63,11 +63,12 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
 import pyarrow as pa
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
-from aisim_core.data import Artifact, Digest, Identity, Manifest, _file, _verify, configuration_id
+from aisim_core.data import Artifact, Digest, Identity, Manifest, _file, _relative, _verify, configuration_id
 from aisim_core.data.loaders import E2eLoader, E2eTables, LoaderError
 from aisim_core.data.names import NameFinding, canonical_name, canonical_unit, name_findings, normalize, split_framework
 from aisim_core.data.parquet import read_parquet, write_parquet
@@ -84,7 +85,7 @@ E2E_TABLE_SCHEMAS = (OBSERVATIONS_SCHEMA, METRICS_SCHEMA, REQUESTS_SCHEMA, SERIE
 PURPOSE = "e2e-configuration"
 # Minor version of the /v1 family. Bump when an optional field, column or registered name is added; a reader
 # of the same major accepts any minor and warns when a file is newer than it knows.
-SCHEMA_MINOR = 1
+SCHEMA_MINOR = 2
 
 # Canonical units. Latency statistics are milliseconds, throughput tokens/s.
 UNIT_MS = "ms"
@@ -372,9 +373,11 @@ class ObservationRow(_Record):
     requests_failed: int | None = Field(default=None, ge=0)
     device_count: int | None = Field(default=None, ge=0)
     raw_artifact_id: str | None = None
+    # Minor 2: raw summary/record digest when record_sha256 binds a larger evidence revision.
+    # Older observations use record_sha256 for both purposes.
+    raw_record_sha256: Digest | None = None
     # Member of a raw-output bundle: byte range of this observation's record inside the uncompressed
-    # bundle. Both null when the artifact holds exactly this observation's record. ``record_sha256`` is
-    # always the hash of that record, so every row can be audited on its own.
+    # bundle. Both null when the artifact holds exactly this observation's record.
     raw_offset: int | None = Field(default=None, ge=0)
     raw_length: int | None = Field(default=None, ge=0)
     log_artifact_id: str | None = None
@@ -735,7 +738,7 @@ def store_provenance(root: Path, directory: str, item: ProvenanceFile) -> tuple[
     name = item.name or f"{item.kind}-{(item.observation_id or full_sha[:12]).replace(':', '_').replace('/', '_')}"
     relative = f"{directory}/provenance/{name}.gz"
     payload = _gzip(kept)
-    path = Path(root) / relative
+    path = _destination(Path(root), relative)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(payload)
     artifact_id = f"{item.kind}:{name}"
@@ -792,8 +795,8 @@ def bundle_raw_records(records: Sequence[tuple[str, bytes]]) -> tuple[bytes, dic
 def read_raw_records(root: Path, manifest: Manifest, observations: Iterable[ObservationRow]) -> dict[str, bytes]:
     """Verified raw record bytes by observation ID, decompressing each artifact once.
 
-    Each record is checked against the observation's ``record_sha256`` (and the artifact against its
-    manifest hash), so a bundled and a one-file-per-observation dataset read identically.
+    Each record is checked against ``raw_record_sha256`` when present, otherwise ``record_sha256``
+    (and the artifact against its manifest hash), so bundled and one-file-per-observation datasets read identically.
     """
     artifacts = {a.artifact_id: a for a in manifest.artifacts}
     infos = {p.artifact_id: p for p in body_from_manifest(manifest).provenance_artifacts}
@@ -819,7 +822,7 @@ def read_raw_records(root: Path, manifest: Manifest, observations: Iterable[Obse
             data = data[obs.raw_offset : obs.raw_offset + obs.raw_length]
         elif info.kind == "raw-output-bundle":
             raise LoaderError(f"observation {obs.observation_id} needs a record range in a bundle")
-        if _sha(data) != obs.record_sha256:
+        if _sha(data) != (obs.raw_record_sha256 or obs.record_sha256):
             raise LoaderError(f"raw record hash mismatch: {obs.observation_id}")
         out[obs.observation_id] = data
     return out
@@ -878,13 +881,13 @@ def configuration_dir(body: E2eManifestBody) -> str:
 
 def _write_table(root: Path, directory: str, name: str, schema_id: str, rows: Sequence[BaseModel], role: str):
     relative = f"{directory}/{name}.parquet" if directory not in ("", ".") else f"{name}.parquet"
+    path = _destination(Path(root), relative)
     write_parquet(
         rows_to_table(schema_id, rows),
-        Path(root) / relative,
+        path,
         schema_id,
         extra_metadata={MINOR_METADATA_KEY.decode(): str(SCHEMA_MINOR)},
     )
-    path = Path(root) / relative
     return Artifact(
         artifact_id=name,
         path=relative,
@@ -897,30 +900,58 @@ def _write_table(root: Path, directory: str, name: str, schema_id: str, rows: Se
     )
 
 
+def _destination(root: Path, relative: str) -> Path:
+    """Validate a write destination before creating anything, including existing parent components."""
+    path = root
+    for part in _relative(relative).split("/"):
+        path = path / part
+        if path.is_symlink():
+            raise ValueError(f"symlink in output path: {relative}")
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise ValueError(f"output path leaves dataset root: {relative}")
+    return path
+
+
+class _PublicationRollbackError(OSError):
+    """Rollback was incomplete; the private staging directory must be retained for recovery."""
+
+
 def _publish_staged(stage: Path, root: Path, relatives: Sequence[str]) -> None:
     """Move staged files into ``root`` in order; if one move fails, restore every file already replaced.
 
-    The previous version of each file is kept as a hard link until all moves succeeded, so a failure in the middle
-    (a full disk on the second table) leaves the old manifest and the old tables it digests exactly as they were.
+    Existing files are backed up with hard links. Only successful replacements need restoration; every restoration
+    is attempted, and an incomplete rollback retains the stage for recovery. Configuration and snapshot writers
+    use fresh artifact paths, so only their final document switches a readable generation.
     """
     done: list[tuple[Path, Path | None]] = []
+    for relative in relatives:
+        _destination(stage, relative)
+        _destination(root, relative)
     try:
         for relative in relatives:
-            destination = root / relative
+            destination = _destination(root, relative)
             destination.parent.mkdir(parents=True, exist_ok=True)
             backup = None
             if destination.exists():
                 backup = stage / ".previous" / relative
                 backup.parent.mkdir(parents=True, exist_ok=True)
                 os.link(destination, backup)
-            done.append((destination, backup))
             os.replace(stage / relative, destination)
-    except BaseException:
+            done.append((destination, backup))
+    except BaseException as exc:
+        problems = []
         for destination, backup in reversed(done):
-            if backup is not None:
-                os.replace(backup, destination)
-            else:
-                destination.unlink(missing_ok=True)
+            try:
+                if backup is not None:
+                    os.replace(backup, destination)
+                else:
+                    destination.unlink(missing_ok=True)
+            except OSError as rollback_error:
+                problems.append(f"{destination}: {rollback_error}")
+        if problems:
+            raise _PublicationRollbackError(
+                f"publication failed; recovery files retained at {stage}: {'; '.join(problems)}"
+            ) from exc
         raise
 
 
@@ -928,12 +959,14 @@ def write_configuration(root: Path, data: E2eConfigurationData, *, prefix: str =
     """Write tables, provenance artifacts and the envelope manifest; return the manifest path.
 
     ``prefix`` (e.g. ``"data"``) is prepended to the configuration directory, so
-    every path stays relative to the dataset root.
+    every path stays relative to the dataset root. Artifacts use immutable generation paths; only the manifest
+    is replaced. Older generations remain available for readers that already opened their manifests.
     """
     root = Path(root)
     body = data.body
     cid = body.configuration_id()
-    directory = f"{prefix.strip('/')}/{configuration_dir(body)}" if prefix else configuration_dir(body)
+    directory = f"{_relative(prefix)}/{configuration_dir(body)}" if prefix else configuration_dir(body)
+    _destination(root, f"{directory}/manifest.json")
     if not data.observations:
         raise ValueError("a configuration needs at least one observation")
     known = {o.observation_id for o in data.observations}
@@ -951,17 +984,21 @@ def write_configuration(root: Path, data: E2eConfigurationData, *, prefix: str =
     root.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=".e2e-stage-", dir=root))
     try:
+        # Published artifacts are immutable. Readers holding an older manifest keep its complete generation.
+        generation = f"{directory}/generations/{uuid4().hex}"
         artifacts = [
-            _write_table(stage, directory, "observations", OBSERVATIONS_SCHEMA, data.observations, "e2e-observations"),
-            _write_table(stage, directory, "metrics", METRICS_SCHEMA, data.metrics, "e2e-metrics"),
+            _write_table(stage, generation, "observations", OBSERVATIONS_SCHEMA, data.observations, "e2e-observations"),
+            _write_table(stage, generation, "metrics", METRICS_SCHEMA, data.metrics, "e2e-metrics"),
         ]
         if data.requests:
-            artifacts.append(_write_table(stage, directory, "requests", REQUESTS_SCHEMA, data.requests, "e2e-requests"))
+            artifacts.append(
+                _write_table(stage, generation, "requests", REQUESTS_SCHEMA, data.requests, "e2e-requests")
+            )
         if data.series:
-            artifacts.append(_write_table(stage, directory, "series", SERIES_SCHEMA, data.series, "e2e-series"))
+            artifacts.append(_write_table(stage, generation, "series", SERIES_SCHEMA, data.series, "e2e-series"))
         infos = list(body.provenance_artifacts)
         for item in data.provenance:
-            artifact, info = store_provenance(stage, directory, item)
+            artifact, info = store_provenance(stage, generation, item)
             artifacts.append(artifact)
             infos.append(info)
         body = body.model_copy(update={"provenance_artifacts": infos})
@@ -987,13 +1024,18 @@ def write_configuration(root: Path, data: E2eConfigurationData, *, prefix: str =
                 if ref is not None and ref not in artifact_ids:
                     raise ValueError(f"observation {o.observation_id} references unknown artifact {ref}")
         relative = f"{directory}/manifest.json"
-        (stage / relative).write_text(
+        _destination(stage, relative).parent.mkdir(parents=True, exist_ok=True)
+        _destination(stage, relative).write_text(
             json.dumps(manifest.model_dump(mode="json", by_alias=True), indent=2, sort_keys=True, allow_nan=False)
             + "\n"
         )
         _publish_staged(stage, root, [*(a.path for a in artifacts), relative])  # the manifest last
+    except _PublicationRollbackError:
+        stage = None  # keep every remaining backup, with its path in the exception
+        raise
     finally:
-        shutil.rmtree(stage, ignore_errors=True)
+        if stage is not None:
+            shutil.rmtree(stage, ignore_errors=True)
     return relative
 
 
@@ -1077,7 +1119,8 @@ class EvaluationPoint:
     metrics: dict[tuple[str, str], float]
     # (metric, statistic) pairs that are missing or invalid; never zero-filled.
     unavailable: frozenset[tuple[str, str]]
-    # Per-device tokens/s by throughput metric, normalized explicitly.
+    # Per-device throughput at statistic "value", else "mean", else the sole reported statistic.
+    # Conflicting normalization sources at that statistic are rejected, never chosen by row order.
     per_device_throughput: dict[str, float]
     # Which timing boundary (``client`` or ``server``) reported each ``metrics`` key (``None``: the row is silent).
     observers: dict[tuple[str, str], str | None] = field(default_factory=dict)
@@ -1096,6 +1139,7 @@ def evaluation_points(dataset: E2eDataset, *, observer: str | None = None) -> li
     points = []
     for obs in dataset.observations:
         values, unavailable, device = {}, set(), {}
+        device_candidates: dict[str, list[MetricRow]] = {}
         reported: dict[tuple[str, str], str | None] = {}  # evaluator output key -> observer
         for row in metrics.get(obs.observation_id, []):
             if row.scope != "run" or (observer is not None and row.observer != observer):
@@ -1122,9 +1166,18 @@ def evaluation_points(dataset: E2eDataset, *, observer: str | None = None) -> li
                 if row.normalization == "total" and row.device_count is None and obs.device_count:
                     row = row.model_copy(update={"device_count": obs.device_count})
                 if row.normalization == "per_device" or (row.normalization == "total" and row.device_count):
-                    device[row.metric] = throughput_per_device(row)
+                    device_candidates.setdefault(row.metric, []).append(row)
             else:
                 values[key] = row.value
+        for metric, candidates in device_candidates.items():
+            statistics = {r.statistic for r in candidates}
+            chosen = next((s for s in ("value", "mean") if s in statistics), None)
+            if chosen is None and len(statistics) == 1:
+                chosen = next(iter(statistics))
+            selected = [r for r in candidates if r.statistic == chosen]
+            if len(selected) != 1:
+                raise ValueError(f"observation {obs.observation_id}: ambiguous per-device throughput for {metric}")
+            device[metric] = throughput_per_device(selected[0])
         points.append(
             EvaluationPoint(
                 obs.observation_id,
@@ -1165,6 +1218,7 @@ def write_snapshot(
     published last, so a rejected or failed replacement leaves the existing snapshot readable.
     """
     root = Path(root)
+    _destination(root, path)
     directory = str(Path(path).parent)
     ordered = sorted(members, key=lambda m: (m.configuration_id, m.observation_id))
     if len({m.observation_id for m in ordered}) != len(ordered):
@@ -1174,6 +1228,9 @@ def write_snapshot(
     root.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=".e2e-stage-", dir=root))
     try:
+        directory = (
+            f"{directory}/{stem}-generations/{uuid4().hex}" if directory != "." else f"{stem}-generations/{uuid4().hex}"
+        )
         member_artifact = _write_table(
             stage, directory, f"{stem}-members", SNAPSHOT_MEMBERS_SCHEMA, ordered, "e2e-snapshot-members"
         )
@@ -1201,14 +1258,18 @@ def write_snapshot(
             members=member_artifact,
             acquisition=acquisition_artifact,
         )
-        (stage / path).parent.mkdir(parents=True, exist_ok=True)
-        (stage / path).write_text(
+        _destination(stage, path).parent.mkdir(parents=True, exist_ok=True)
+        _destination(stage, path).write_text(
             json.dumps(snapshot.model_dump(mode="json", by_alias=True), indent=2, sort_keys=True) + "\n"
         )
         tables = [a.path for a in (member_artifact, acquisition_artifact) if a is not None]
         _publish_staged(stage, root, [*tables, path])  # the document last
+    except _PublicationRollbackError:
+        stage = None
+        raise
     finally:
-        shutil.rmtree(stage, ignore_errors=True)
+        if stage is not None:
+            shutil.rmtree(stage, ignore_errors=True)
     return snapshot
 
 
@@ -1667,6 +1728,7 @@ def aiperf_to_configuration(
         observation_id=observation_id,
         configuration_id=cid,
         record_sha256=_sha(summary_bytes),
+        raw_record_sha256=_sha(summary_bytes),
         source_kind="developer",
         producer_kind="aiperf",
         observer="client",
@@ -1685,6 +1747,17 @@ def aiperf_to_configuration(
         raw_artifact_id=raw_id,
         log_artifact_id=log_id,
         evidence_refs=[raw_id] + ([log_id] if log_id else []),
+    )
+    obs.record_sha256 = _sha(
+        _canonical(
+            {
+                "observation": obs.model_dump(mode="json", exclude={"record_sha256"}),
+                "summary": summary,
+                "records": list(records),
+                "log_sha256": _sha(log) if log is not None else None,
+                "log_redacted": log_redacted,
+            }
+        )
     )
     return E2eConfigurationData(body, [obs], rows, requests, provenance)
 

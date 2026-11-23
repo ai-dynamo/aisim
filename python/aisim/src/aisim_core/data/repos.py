@@ -43,7 +43,7 @@ class ResolvedRef:
 
     def path(self, path: str) -> str:
         """Repository path of ``path`` (as spelled for the *requested* repository) in the resolved one."""
-        if self.via == "successor-alias":
+        if self.via == "successor-alias" and path.startswith("data/"):
             return physical_path(path)
         return path
 

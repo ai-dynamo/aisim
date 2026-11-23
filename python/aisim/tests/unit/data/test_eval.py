@@ -98,6 +98,18 @@ def test_exclusion_and_metrics(built):
     assert record.results.coverage == pytest.approx(5 / 6)
 
 
+@pytest.mark.parametrize("mutate", [False, True])
+def test_attestation_requires_the_exact_record_that_was_verified(built, mutate):
+    root, record = built
+    report = verify_record(record, root, _predict, record.prediction.fingerprint)
+    assert report.ok and report.record_id == record.record_id
+    assert attest(record, report).verification.verified_record_id == record.record_id
+    other = record if mutate else record.model_copy(deep=True)
+    other.producer.name = "another producer"
+    with pytest.raises(ValueError, match="different record content"):
+        attest(other, report)
+
+
 def test_write_verify_supersede_exit_gate(built):
     root, record = built
     path = write_record(root, record)

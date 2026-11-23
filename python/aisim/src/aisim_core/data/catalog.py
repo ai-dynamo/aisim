@@ -46,7 +46,7 @@ from typing import Literal
 import pyarrow as pa
 from pydantic import BaseModel, ConfigDict, Field
 
-from aisim_core.data import CategoryIndex, DatasetIndex, Manifest, _verify, path_component
+from aisim_core.data import CategoryIndex, DatasetIndex, Manifest, _verified_bytes, path_component
 from aisim_core.data.eval import EvalRecord, Layer, current_records, record_files
 from aisim_core.data.parquet import read_parquet, write_parquet
 from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR, packaged_system_specs, spec_file_sha256
@@ -179,13 +179,18 @@ def _read_indexed_cells(root: Path, cells: dict[tuple, _Cell]) -> None:
         if layer is None:
             continue
         # Both references are digest-pinned: a manifest edited after indexing must not change published coverage.
-        entries = CategoryIndex.model_validate_json(_verify(root, ref.index).read_bytes())
+        entries = CategoryIndex.model_validate_json(_verified_bytes(root, ref.index))
         if entries.category != category:
             raise ValueError(f"category index identity mismatch: {ref.index.path}")
         for entry in entries.entries:
             ident = entry.identity
-            manifest = Manifest.model_validate_json(_verify(root, entry.manifest).read_bytes())
-            if manifest.configuration_id != entry.configuration_id:
+            manifest = Manifest.model_validate_json(_verified_bytes(root, entry.manifest))
+            if (manifest.category, manifest.configuration_id, manifest.identity, manifest.purpose) != (
+                category,
+                entry.configuration_id,
+                entry.identity,
+                entry.purpose,
+            ):
                 raise ValueError(f"catalog and manifest identity mismatch: {entry.manifest.path}")
             cell = cells[(layer, None if layer == "op" else ident.model, ident.hardware, ident.framework)]
             cell.versions.add(ident.framework_version)

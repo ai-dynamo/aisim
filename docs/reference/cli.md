@@ -125,6 +125,14 @@ same backend and the other backends the pinned `perf_data_reuse_manifest` allows
 does not publish is skipped. The root is rebuilt whenever the entries' artifact digests or the packaged specs
 change. An omitted `backend_version` or a slot alias (`current`, `previous`, `next`) is resolved from the pinned
 dataset's `query_versions` lookup, and the whole pin shares one `AISIM_DATA_MAX_BYTES` allowance.
+An FPM library pinned together with it is staged from that root alone, with no active systems root as a fallback.
+
+For FPM dataset selection, a mapping that omits topology leaves parallelism unfiltered. If both TP1 and TP4 entries
+match, `ensure_data` raises an ambiguity error; supply an explicit topology or set
+`AISIM_DATA_CONFIGURATION` to choose an entry. An explicit all-ones topology selects TP1. A typed
+`ForwardPassPerfModelConfig` always carries topology (`tp=1` by default), so it requests the TP1 entry; pass a mapping
+that omits topology to be told about several matches. An FPM entry's manifest must match the digest its catalog
+records, also for a local root.
 
 <a id="non-python-consumers"></a>
 

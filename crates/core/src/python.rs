@@ -10783,7 +10783,7 @@ mod tests {
             // power. That collection is outside the query slots, so the SDK reads it as a
             // raw data coordinate. The opt-in is set on the embedded interpreter, whose
             // `os.environ` no longer follows the process environment once it has started.
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 py.import("os")
                     .and_then(|os| os.getattr("environ"))
                     .and_then(|environ| environ.set_item("AIC_ALLOW_UNLISTED_VERSIONS", "1"))

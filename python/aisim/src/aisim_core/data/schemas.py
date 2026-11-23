@@ -32,6 +32,7 @@ from aisim_core.data.e2e import (
     SnapshotMember,
 )
 from aisim_core.data.eval import EvalRecord
+from aisim_core.data.fpm_library import FpmLibraryMetadata, FpmLibraryRow, FpmMeasurementManifest
 from aisim_core.data.gpu_time import GpuTime
 from aisim_core.data.op_schema import (
     OpDeclaredReuseRow,
@@ -59,6 +60,11 @@ SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "aisim-e2e-snapshot-members/v1": SnapshotMember,
     "aisim-eval/v1": EvalRecord,
     "aisim-gpu-time/v1": GpuTime,
+    # FPM contract. The data schema id ``aic_fpm_forward_perf`` stays as published; the snapshots below describe its
+    # v6 table notes and sidecar (with the optional ``resources`` block), and the measurement manifest v5.
+    "aic_fpm_forward_perf/v6": FpmLibraryRow,
+    "aic_fpm_forward_perf.metadata/v6": FpmLibraryMetadata,
+    "measurement-manifest/v5": FpmMeasurementManifest,
     "aisim-op-declared-reuse/v1": OpDeclaredReuseRow,
     "aisim-op-latency/v1": OpLatencyRow,
     "aisim-op-query-versions/v1": OpQueryVersionsRow,
@@ -89,13 +95,14 @@ def render_all() -> dict[str, str]:
 
 
 def write_snapshots(directory: str | Path = PACKAGED_SNAPSHOT_DIR) -> list[Path]:
-    """Write every snapshot, removing stale generated ones, and return the paths."""
+    """Write every registered snapshot without deleting unrecognized files, and return the paths.
+
+    A caller-supplied directory can contain unrelated JSON. Obsolete snapshots remain visible to
+    ``check_snapshots`` so their owner can explicitly remove them.
+    """
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     rendered = render_all()
-    for stale in directory.glob("*.json"):
-        if stale.name not in rendered:
-            stale.unlink()
     paths = []
     for name, text in rendered.items():
         path = directory / name
