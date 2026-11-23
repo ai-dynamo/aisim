@@ -4744,6 +4744,20 @@ mod tests {
             .unwrap();
         assert!(!run.core.test_waits_on_connector_deadline(peer));
         run.until_admitted(4);
+        // No further arrival: the peer must also finish, and the run drain.
+        for _ in 0..64 {
+            if run.core.is_empty() && !run.core.is_ready() {
+                break;
+            }
+            run.step();
+        }
+        let finished = run
+            .passes
+            .iter()
+            .flat_map(|pass| &pass.output_signals)
+            .any(|signal| signal.uuid == peer && signal.completed);
+        assert!(finished, "the woken peer completes");
+        assert!(run.core.is_drained(), "every restore and store completes");
     }
 
     #[test]
