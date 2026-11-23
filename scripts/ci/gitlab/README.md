@@ -19,10 +19,14 @@ internal project by hand.
    installed definition, pin its reviewed ref and restrict edits to that include and the definition.
 2. Set the protected credentials and alert variables listed at the top of the file. Do not create
    CI/CD variables for `AISIM_REVIEWED_COMMIT`, `AISIM_REPO_URL`, `INFX_CACHE_REPO_URL` or `JOB_PY`.
-   Set the GitLab project policy `ci_pipeline_variables_minimum_override_role` to
-   `no_one_allowed` when pipeline variables are unnecessary, as additional protection for other
-   job settings. The checkout and token-destination boundary is enforced by the shell assignments,
-   independently of this policy; protected project variables alone do not provide that boundary.
+   Set the GitLab project policy `ci_pipeline_variables_minimum_override_role` to `no_one_allowed`.
+   This is required: a pipeline variable outranks the file's `variables:` default that the routing rules
+   read as `INFX_JOB`, and it can add Git configuration through the environment. The definition also
+   fails closed without relying on the policy alone: its first setup step drops every `GIT_CONFIG*`
+   variable before any Git command, so no `url.<base>.insteadOf` rule can redirect the token header, and
+   it stops with exit 2 when `INFX_JOB` differs from the validated `job` input. The checkout and
+   token-destination boundary is enforced by the shell assignments; protected project variables alone
+   do not provide that boundary.
 3. Create a token that can write **only** `aisim-infx-cache` and store it as masked, protected
    `INFX_CACHE_WRITE_TOKEN`, with environment scope **`infx-cache-writer`**, never `*`.
    Only `publish_candidate` and `promote` select that environment. Add a separate masked,
@@ -31,7 +35,9 @@ internal project by hand.
    Dependency setup and the staleness CLI run with the read token removed; only the authenticated clone uses it.
    Acquisition (public GET) uses no credential.
 4. Supply CI/CD inputs, not pipeline variables: weekly with `job=ingest`; daily with
-   `job=staleness`. Manual refresh: run a web pipeline (default `job=ingest`). Promotion:
+   `job=staleness`. After installing, confirm that the weekly schedule creates only `publish_candidate`
+   (plus the failure alert) and the daily schedule only `staleness`, and that no pipeline variable named
+   `INFX_JOB` exists. Manual refresh: run a web pipeline (default `job=ingest`). Promotion:
    web pipeline with `job=promote`, `candidate-snapshot-id`, `candidate-generation`
    (the job ID suffix printed by ingestion; pipeline-ID suffixes of earlier branches remain valid) and
    `candidate-commit` (the full commit SHA of the branch tip the reviewer inspected, also printed by

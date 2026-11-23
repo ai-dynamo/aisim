@@ -70,7 +70,8 @@ def test_reviewed_trust_values_cannot_be_overridden_at_pipeline_or_manual_job_en
     # Installing the definition edits reviewed literals, never the process environment.
     pin = "a" * 40
     cache_url = "https://cache.example.test/approved/aisim-infx-cache.git"
-    setup = "\n".join(definition[".pinned"]["before_script"])
+    selector = {"publish_candidate": "ingest", "promote": "promote", "staleness": "staleness"}[job]
+    setup = "\n".join(definition[".pinned"]["before_script"]).replace("$[[ inputs.job ]]", selector)
     if installation != "unconfigured":
         setup = setup.replace("REPLACE_WITH_REVIEWED_40_HEX_AISIM_COMMIT", pin)
     if installation == "ready":
@@ -109,6 +110,7 @@ def test_reviewed_trust_values_cannot_be_overridden_at_pipeline_or_manual_job_en
             **os.environ,
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
             "CI_PROJECT_DIR": str(tmp_path),
+            "INFX_JOB": selector,
             # These represent higher-precedence pipeline or manual-job variables.
             "AISIM_REVIEWED_COMMIT": "c" * 40,
             "AISIM_REPO_URL": "https://attacker.example.test/unreviewed.git",
@@ -135,6 +137,78 @@ def test_reviewed_trust_values_cannot_be_overridden_at_pipeline_or_manual_job_en
     assert f"http.extraHeader=Authorization: Bearer {token}" in cache_clone
     assert "http.followRedirects=false" in cache_clone
     assert "attacker.example.test" not in json.dumps(calls)
+
+
+def _guard(definition, job="ingest"):
+    """The first setup block: Git's environment configuration is dropped and the job selector is checked."""
+    return definition[".pinned"]["before_script"][0].replace("$[[ inputs.job ]]", job)
+
+
+APPROVED = "https://cache.example.test/approved/aisim-infx-cache.git"
+ATTACKER = "https://attacker.example.test/"
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs a real git to resolve URLs")
+@pytest.mark.parametrize("channel", ["count-empty-value", "count", "parameters", "global-file"])
+def test_environment_git_configuration_cannot_rewrite_the_token_destination(definition, tmp_path, channel):
+    """Real Git URL resolution: a variable-supplied insteadOf rule must not change where the token header goes."""
+    (tmp_path / "home").mkdir()
+    attack = {
+        "count-empty-value": {  # an empty insteadOf matches every URL
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": f"url.{ATTACKER}.insteadOf",
+            "GIT_CONFIG_VALUE_0": "",
+        },
+        "count": {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": f"url.{ATTACKER}.insteadOf",
+            "GIT_CONFIG_VALUE_0": "https://cache.example.test/",
+        },
+        "parameters": {"GIT_CONFIG_PARAMETERS": f"'url.{ATTACKER}.insteadof=https://cache.example.test/'"},
+        "global-file": {"GIT_CONFIG_GLOBAL": str(tmp_path / "attacker-config")},
+    }[channel]
+    (tmp_path / "attacker-config").write_text(f'[url "{ATTACKER}"]\n\tinsteadOf = https://cache.example.test/\n')
+    env = {
+        **{k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+        "HOME": str(tmp_path / "home"),
+        "XDG_CONFIG_HOME": str(tmp_path / "home"),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "INFX_JOB": "ingest",
+        **attack,
+    }
+    resolve = f"git ls-remote --get-url {APPROVED}"
+
+    def run(script):
+        return subprocess.run(
+            ["sh", "-eu", "-c", script], cwd=tmp_path, env=env, capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    assert ATTACKER in run(resolve)  # without the guard, Git really sends the URL elsewhere
+    assert run(_guard(definition) + "\n" + resolve) == APPROVED
+
+
+@pytest.mark.parametrize("job", ["publish_candidate", "promote", "staleness"])
+def test_every_job_drops_git_environment_configuration_before_any_git_command(definition, job):
+    # The guard is the first setup block of the shared pinned template, ahead of the checkout's git commands.
+    assert definition[job]["extends"] == ".pinned" and "before_script" not in definition[job]
+    first, second = definition[".pinned"]["before_script"][:2]
+    assert "unset" in first and "GIT_CONFIG" in first
+    assert "git init" in second and "git init" not in first
+
+
+@pytest.mark.parametrize(
+    ("selector", "accepted"), [("ingest", True), ("staleness", False), ("promote", False), ("", False), (None, False)]
+)
+def test_a_pipeline_variable_cannot_replace_the_validated_job_selector(definition, tmp_path, selector, accepted):
+    env = {k: v for k, v in os.environ.items() if k != "INFX_JOB"}
+    if selector is not None:
+        env["INFX_JOB"] = selector
+    result = subprocess.run(
+        ["sh", "-eu", "-c", _guard(definition, "ingest")], cwd=tmp_path, env=env, capture_output=True, text=True
+    )
+    assert (result.returncode == 0) is accepted, result.stderr
+    if not accepted:
+        assert result.returncode == 2 and "INFX_JOB differs from the job input" in result.stderr
 
 
 def test_ingestion_runs_without_the_cache_token_and_never_pushes_to_the_default_branch(definition):
