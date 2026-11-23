@@ -2286,7 +2286,10 @@ enum Plan {
     },
     State {
         running: bool,
-        /// The release rule of the running block that a fresh one replaces.
+        /// The release rule of the running block that a fresh one replaces
+        /// after a block boundary crossing. `None` when no running block is
+        /// replaced, or when only the write past a published state replaces
+        /// it: that block then leaves as a copy source of the pass.
         previous: Option<PreviousRelease>,
         copy: bool,
         cow_is_running: bool,

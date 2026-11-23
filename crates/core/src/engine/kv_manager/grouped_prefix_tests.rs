@@ -2542,12 +2542,13 @@ fn keyed_state_blocks_of_a_released_request_enter_the_lru_in_vllms_order() {
     // by the crossing of step 2), and R1, the block of index 1 with the
     // state at 48 that the request published inside it. Step 3 wrote past
     // that state, so R1 left at the end of its pass, as vLLM frees the copy
-    // block with the key at 48 at the end of the schedule of step 3 (v0.33
-    // sched:1698-1706). A preemption then releases the request through
-    // `release_request`, and `free` frees each group tail first (v0.33
-    // single:591-599): the state block of index 0 with the key at 32 comes
-    // last. So the state key at 48 is older than every block of the released
-    // request in the free queue.
+    // block with the key at 48 at the end of the schedule of step 3 (v0.31
+    // sched:1434-1442, v0.32 sched:1474-1482, v0.33 sched:1698-1706). A
+    // preemption then releases the request through `release_request`, and
+    // `free` frees each group tail first (v0.31 and v0.32 single:581-589,
+    // v0.33 single:591-599): the state block of index 0 with the key at 32
+    // comes last. So the state key at 48 is older than every block of the
+    // released request in the free queue.
     let groups = [attention("full", 32, None), state("s", 32, true, false)];
     for version in [
         VllmRuleVersion::V0_31_0,

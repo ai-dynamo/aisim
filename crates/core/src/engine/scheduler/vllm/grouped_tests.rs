@@ -3916,8 +3916,13 @@ fn grouped_decode_one_token_load_takes_the_copy_of_its_state_in_its_first_pass()
     // `sched:3171-3172`). With a hash block of 1 token, vLLM 0.31.0 caches
     // the loaded state at token 1, the prompt's last hash boundary, inside
     // its 16-token block (V31 `single:2094-2138`), and the first step takes
-    // one block for its copy (V31 `single:1770-1777`, `:1891-1940`), which
-    // leaves at the end of that pass (V31 `sched:1434-1442`). vLLM
+    // one block for its copy (V31 `single:1770-1777`, `:1891-1940`). With
+    // one batch vLLM frees the copy at the end of that pass (V31
+    // `sched:1434-1442`). With two batches a decode worker defers that free
+    // until it processes the step that runs the copy (V31 `sched:175-181`,
+    // `:2712-2721`, `:1987-1989`), so vLLM still holds the copy after the
+    // pass. Replay does not model the deferred free and releases the copy at
+    // the end of the pass, so the two-batch rows give replay's count. vLLM
     // 0.32.0 keeps that boundary below the last prompt token (V32
     // `kv_cache_interface.py:1110-1122`, `single:2067-2084`), and a hash
     // block of 16 has no boundary at 1 token, so these take no copy.
@@ -3967,9 +3972,15 @@ fn grouped_decode_one_token_loads_wait_for_the_block_of_the_copy() {
     // one fits its copy; the second one runs after the first one ended. On
     // 4 pages no block is free, so neither runs: vLLM stops its waiting loop
     // at a request that it cannot allocate (V31 `sched:1223-1230`).
-    // The peak of pass 0 counts each copy, which leaves at
-    // the end of the pass (V31 `sched:1434-1442`), so after the pass every
-    // load holds its attention block and its state block.
+    // The peak of pass 0 counts each copy. With one batch vLLM frees each
+    // copy at the end of the pass (V31 `sched:1434-1442`), so after the pass
+    // every load holds its attention block and its state block. With two
+    // batches a decode worker defers that free until it processes the step
+    // that runs the copies (V31 `sched:175-181`, `:2712-2721`,
+    // `:1987-1989`), so vLLM still holds 6 and 5 blocks after pass 0 on 6
+    // and 5 pages. Replay does not model the deferred free and releases the
+    // copies at the end of the pass, so the two-batch rows give replay's
+    // count.
     for max_concurrent_batches in [1, 2] {
         for (pages, first_pass, peak) in [
             (6u64, vec![1001u128, 1002], 6usize),
