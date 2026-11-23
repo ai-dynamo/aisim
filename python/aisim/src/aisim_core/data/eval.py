@@ -23,7 +23,7 @@ import os
 import re
 import tempfile
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
@@ -321,7 +321,9 @@ def _write_record(path: Path, record: EvalRecord, text: str) -> Path:
         if not predecessor.is_file():
             raise ValueError(f"superseded record {record.supersedes} not found next to the new record")
         load_record(predecessor)
-        for existing in _load_all(path.parent):
+        # The new record is not on disk yet, so its own sidecars (written first) are declared by it.
+        declared = {path.parent / a.path for a in [*record.truth.artifacts, *record.findings]}
+        for existing in _load_all(path.parent, declared):
             if existing.supersedes == record.supersedes:
                 raise ValueError(f"superseded record {record.supersedes} already has successor {existing.record_id}")
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
@@ -365,8 +367,27 @@ _RECORD_FILENAME = re.compile(r"^[0-9a-f]{64}\.json$")
 
 
 def record_files(directory: str | Path) -> list[Path]:
-    """The content-addressed record files of a directory; manifests and other JSON beside them are not records."""
-    return sorted(p for p in Path(directory).glob("*.json") if _RECORD_FILENAME.fullmatch(p.name))
+    """The content-addressed record files of a directory; manifests and other JSON beside them are not records.
+
+    A content-addressed name that a valid record declares as one of its own artifacts (a findings file may be
+    named by its hash) is that record's sidecar, not a record. Any other such name that fails to load stays listed,
+    so its corrupt content is rejected by the caller instead of being skipped.
+    """
+    return _record_files(directory, frozenset())
+
+
+def _record_files(directory: str | Path, extra_declared: Collection[Path]) -> list[Path]:
+    candidates = sorted(p for p in Path(directory).glob("*.json") if _RECORD_FILENAME.fullmatch(p.name))
+    records: set[Path] = set()
+    declared: set[Path] = set(extra_declared)
+    for path in candidates:
+        try:
+            record = load_record(path)
+        except (OSError, ValueError):
+            continue  # only an explicit artifact declaration can exclude this file
+        records.add(path)
+        declared.update(path.parent / a.path for a in [*record.truth.artifacts, *record.findings])
+    return [p for p in candidates if p in records or p not in declared]
 
 
 def record_paths(directory: str | Path, *, recursive: bool = False) -> list[Path]:
@@ -389,9 +410,9 @@ def record_paths(directory: str | Path, *, recursive: bool = False) -> list[Path
     return [p for p in paths if p in records or p not in artifacts]
 
 
-def _load_all(directory: str | Path) -> list[EvalRecord]:
+def _load_all(directory: str | Path, extra_declared: Collection[Path] = ()) -> list[EvalRecord]:
     # Corrupt content at a valid record filename is still rejected by load_record.
-    return [load_record(p) for p in record_files(directory)]
+    return [load_record(p) for p in _record_files(directory, extra_declared)]
 
 
 # --- truth table and metrics ------------------------------------------------

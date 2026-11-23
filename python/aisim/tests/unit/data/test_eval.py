@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
 from pathlib import Path
 
 import pytest
 
-from aisim_core.data import Identity
+from aisim_core.data import Artifact, Identity
 from aisim_core.data.eval import (
     EvalRecord,
     Exclusion,
@@ -17,6 +18,7 @@ from aisim_core.data.eval import (
     load_record,
     prediction_fingerprint,
     record_dir,
+    record_files,
     record_path,
     verify_record,
     write_record,
@@ -433,3 +435,30 @@ def test_a_verification_report_cannot_attest_another_record(built):
     with pytest.raises(ValueError, match="different record content"):
         attest(changed, report)
     assert attest(record, report).supersedes == record.record_id
+
+
+def test_a_declared_findings_file_with_a_record_like_name_is_not_a_record(built):
+    root, record = built
+    directory = write_record(root, record).parent
+    payload = b'{"note": "synthetic findings"}'
+    digest = hashlib.sha256(payload).hexdigest()
+    (directory / f"{digest}.json").write_bytes(payload)  # a content-addressed name, like a record's
+    findings = Artifact(
+        artifact_id="findings",
+        path=f"{digest}.json",
+        role="findings",
+        format="json",
+        schema="findings/v1",
+        sha256=digest,
+        bytes=len(payload),
+    )
+    successor = record.model_copy(update={"findings": [findings], "supersedes": record.record_id})
+    # The successor check of the write loads every record beside it, including this sidecar's directory.
+    assert write_record(root, successor).parent == directory
+    assert [p.stem for p in record_files(directory)] == sorted([record.record_id, successor.record_id])
+    assert [r.record_id for r in current_records(directory)] == [successor.record_id]
+    # Undeclared content at a record-like name is still a corrupt record that callers must see.
+    (directory / f"{'e' * 64}.json").write_bytes(b"{}")
+    assert (directory / f"{'e' * 64}.json") in record_files(directory)
+    with pytest.raises(ValueError):
+        current_records(directory)
