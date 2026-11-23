@@ -633,22 +633,32 @@ def test_provenance_directory_cannot_write_through_a_symlink(tmp_path):
 
 
 @pytest.mark.parametrize("reverse", [False, True])
-@pytest.mark.parametrize("statistic", ["value", "mean"])
-def test_conflicting_per_device_throughput_never_depends_on_row_order(tmp_path, reverse, statistic):
+def test_conflicting_per_device_throughput_never_depends_on_row_order(tmp_path, reverse):
     ds = load_e2e(tmp_path, write_configuration(tmp_path, _dev_config()))
     total = make_metric("dev:1", "output_throughput", "value", 800.0, "tokens/s", normalization="total", device_count=8)
-    per_device = make_metric("dev:1", "output_throughput", statistic, 110.0, "tokens/s", normalization="per_device")
+    per_device = make_metric("dev:1", "output_throughput", "value", 110.0, "tokens/s", normalization="per_device")
     rows = [total, per_device]
     if reverse:
         rows.reverse()
-    with pytest.raises(ValueError, match="conflicting per-device output_throughput"):
+    with pytest.raises(ValueError, match="ambiguous per-device throughput"):
         evaluation_points(replace(ds, metrics=rows))
     for row in rows:
         (point,) = evaluation_points(replace(ds, metrics=[row]))
         assert point.per_device_throughput["output_throughput"] == (100.0 if row == total else 110.0)
+    # Several sources at the selected statistic are ambiguous even when they agree.
     equivalent = per_device.model_copy(update={"value": 100.0})
-    (point,) = evaluation_points(replace(ds, metrics=[total, equivalent]))
-    assert point.per_device_throughput["output_throughput"] == 100.0
+    with pytest.raises(ValueError, match="ambiguous per-device throughput"):
+        evaluation_points(replace(ds, metrics=[total, equivalent]))
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_a_per_device_mean_never_competes_with_a_total_value(tmp_path, reverse):
+    ds = load_e2e(tmp_path, write_configuration(tmp_path, _dev_config()))
+    total = make_metric("dev:1", "output_throughput", "value", 800.0, "tokens/s", normalization="total", device_count=8)
+    mean = make_metric("dev:1", "output_throughput", "mean", 110.0, "tokens/s", normalization="per_device")
+    rows = [mean, total] if reverse else [total, mean]
+    (point,) = evaluation_points(replace(ds, metrics=rows))
+    assert point.per_device_throughput["output_throughput"] == 100.0  # statistic ``value`` first, whatever the order
 
 
 def test_inferencex_manifest_keeps_only_public_run_facts(tmp_path):
