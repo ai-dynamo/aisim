@@ -161,11 +161,12 @@ from aisim_core.sdk.rust_engine_step import (
 # - 29 (native VL): optional `vision` section (encoder layout plus the patch,
 #   transformer and output op groups) appended after the op lists. Claimed 21
 #   concurrently with AIC-1781; renumbered after GLM-5.3-Flash at the merge.
-# - 30 (Kimi K3.1 DSA): explicit sparse attention backend/cache layout appended
-#   to DsaModuleOp; legacy JSON defaults do not cover positional bincode.
+# - 30 (AFD): source-ordered pool execution plan, P2P fabric selectors and
+#   independent F-node width.
+# - 31 (Kimi K3.1 DSA): DsaModuleOp records the sparse attention backend and
+#   cache layout. Legacy JSON defaults apply; v30 binary specs require recompilation.
 # Single owner: the Rust crate constant. Python re-exports it for
 # diagnostics/tests instead of declaring a twin to keep in sync.
-# Schema 30 adds P2P fabric selectors and independent AFD F-node width.
 ENGINE_SPEC_SCHEMA_VERSION = aisim_core.engine_spec_schema_version()
 ENGINE_CONFIG_SCHEMA_VERSION = 1
 

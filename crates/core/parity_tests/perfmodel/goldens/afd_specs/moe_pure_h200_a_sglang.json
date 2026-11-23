@@ -151,6 +151,7 @@
         "lane_order": [
           "fa3",
           "triton",
+          "fa4",
           "fla",
           "flashinfer",
           "trtllm_mha",
@@ -224,7 +225,9 @@
     "decoder_replay": false,
     "enable_shared_layer": true,
     "extra": {
-      "afd_pool_role": "a"
+      "afd_pool_role": "a",
+      "comm_quant_mode": "half",
+      "enable_eplb": "false"
     },
     "forward_model": "op_level",
     "fpm_fmha_dtype": null,
@@ -287,6 +290,7 @@
         "lane_order": [
           "fa3",
           "triton",
+          "fa4",
           "fla",
           "flashinfer",
           "trtllm_mha",
@@ -351,5 +355,5 @@
       }
     }
   ],
-  "schema_version": 30
+  "schema_version": 31
 }
