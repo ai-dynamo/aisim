@@ -1903,6 +1903,11 @@ impl VllmCore {
                     .configure_prefix_hashes_memoized(&tokens, memo),
                 None => sequence.lease.configure_prefix_hashes(&tokens, unit),
             }
+            // Only a grouped prefix cache reads prefix hashes of output
+            // tokens. A linear state cache keeps the hashes of the prompt.
+            if self.kv_manager.grouped_prefix_rules().is_some() {
+                sequence.lease.hash_output_tokens(&tokens);
+            }
         }
         let host_offload = self.native_host_offload.as_ref().map(|adapter| {
             Box::new(VllmHostRequestState::new(

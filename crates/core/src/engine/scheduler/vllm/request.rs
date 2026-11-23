@@ -80,6 +80,7 @@ impl RequestKvState {
         if opened_partial {
             self.lease.append_partial();
         }
+        self.lease.push_output_token(token);
         token
     }
 

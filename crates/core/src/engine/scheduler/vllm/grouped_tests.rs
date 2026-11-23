@@ -2447,12 +2447,13 @@ fn grouped_prefill_rank_keeps_the_request_behind_a_waiting_request_waiting() {
 fn grouped_prefill_rank_in_block_mode_readmits_a_held_request_when_a_held_source_leaves() {
     // A prefill rank of 5 pages in block mode on vLLM 0.31.0 with a budget of
     // 16 tokens and passes at 0 ms: a full-attention group and a state group
-    // of 16-token blocks, at a hash block of 16. A source of 17 tokens holds
-    // its 16 computed tokens in a full block and a state block, so 3 blocks
-    // are free.
+    // of 16-token blocks, at a hash block of 16. The full-attention group is
+    // not prefix-cacheable, so no full block gets a key and a turn can
+    // repeat. A source of 17 tokens holds its 16 computed tokens in a full
+    // block and a state block, so 3 blocks are free.
     for cancel in [false, true] {
         let mut full = group("full", 16, 100, None);
-        full.prefix_cacheable = Some(true);
+        full.prefix_cacheable = Some(false);
         full.transfer_bytes_per_block = Some(100);
         let mut recurrent = state("state", 100, 1);
         recurrent.block_size_tokens = 16;
@@ -3153,131 +3154,127 @@ fn grouped_destination_retries_when_a_pass_releases_the_cached_block_of_a_bounda
     }
 }
 
-/// One arrival of a scripted decode rank: before pass `pass`, a local
-/// request (`load: false`) or a KV load `id` whose first `shared` tokens are
-/// the shared prompt `0..` and whose other tokens are its own.
-struct Arrival {
-    pass: usize,
-    load: bool,
-    id: u128,
-    shared: u32,
-    prompt: u32,
-    output: usize,
-}
-
-/// A decode rank of 16 pages of the full-attention and state groups on
-/// `version`, with prefix caching on a hash block of 16 tokens and up to 8
-/// running requests. Each pass gets its arrivals, runs, and then retries the
-/// waiting loads, as replay does at a pass boundary. A load that reserves is
-/// activated at once. Returns the core before the retry after the last pass.
-fn scripted_decode_rank(arrivals: &[Arrival], passes: usize, version: &str) -> VllmCore {
-    scripted_decode_rank_with(arrivals, passes, 1, version)
-}
-
-/// `scripted_decode_rank` with `max_concurrent_batches` batches. With more
-/// than one, each pass ends at its boundary and the next pass starts at that
-/// end, so each pass that follows a pass with work is formed while that pass
-/// is in flight, as a rank does.
-fn scripted_decode_rank_with(
-    arrivals: &[Arrival],
-    passes: usize,
-    max_concurrent_batches: usize,
-    version: &str,
-) -> VllmCore {
-    let mut groups = full_and_state_transfer_groups();
-    groups[1].prefill_checkpoint_blocks = Some(0);
-    let mut args = prefix_core(groups, 1_600, 8192, 16, version).args;
-    args.worker_type = WorkerType::Decode;
-    args.max_num_seqs = Some(8);
-    args.max_concurrent_batches = max_concurrent_batches;
-    let mut core = VllmCore::new(args);
-    let mut trace = TraceCollector::default();
-    let mut step = 0;
-    let mut now = 0.0;
-    for pass in 0..passes {
-        for arrival in arrivals.iter().filter(|arrival| arrival.pass == pass) {
-            let id = arrival.id;
-            let tokens = (0..arrival.prompt)
-                .map(|i| {
-                    if i < arrival.shared {
-                        i
-                    } else {
-                        100_000 * id as u32 + i
-                    }
-                })
-                .collect();
-            if arrival.load {
-                let handoff_id = HandoffId::new(Uuid::from_u128(1_000_000 + id));
-                let request = DirectRequest {
-                    tokens,
-                    ..pd_request(id, 0, arrival.output)
-                };
-                if reserve_grouped(&mut core, handoff_id, request).is_some() {
-                    activate(&mut core, handoff_id);
-                }
-            } else {
-                submit_tokens(&mut core, id, tokens, arrival.output);
-            }
-        }
-        if max_concurrent_batches > 1 {
-            let result = core.execute_pass(&mut trace, now);
-            assert!(result.output_signals.iter().all(|output| !output.rejected));
-            core.complete_engine_boundary(result.end_ms);
-            now = result.end_ms;
-        } else {
-            step_pd(&mut core, &mut trace, &mut step);
-        }
-        if pass + 1 == passes {
-            break;
-        }
-        for event in core.retry_pending_destinations() {
-            if let SchedulerLifecycleEvent::DestinationReserved { handoff_id, .. } = event {
-                activate(&mut core, handoff_id);
-            }
-        }
-    }
-    core
-}
-
 #[test]
 fn grouped_destination_retries_when_the_loads_in_flight_need_less() {
-    let arrival = |pass, load, id, shared, prompt, output| Arrival {
-        pass,
-        load,
-        id,
-        shared,
-        prompt,
-        output,
-    };
-    let arrivals = [
-        arrival(4, true, 1, 96, 87, 10),
-        arrival(9, true, 2, 0, 40, 25),
-        arrival(10, true, 3, 64, 46, 12),
-        arrival(15, true, 4, 0, 72, 17),
-        arrival(19, true, 5, 96, 69, 24),
-        arrival(22, true, 6, 64, 65, 20),
-        arrival(25, true, 7, 80, 70, 12),
-        arrival(25, true, 8, 64, 65, 27),
-        arrival(29, true, 9, 80, 78, 25),
-        // A load of the first 73 tokens of the shared prefix. It waits.
-        arrival(29, true, 10, 96, 73, 25),
-        arrival(29, true, 11, 80, 65, 10),
-        arrival(32, true, 12, 0, 97, 23),
-        arrival(33, true, 13, 0, 63, 21),
-    ];
-    for version in ["0.32.0", "0.33.0"] {
-        let mut core = scripted_decode_rank(&arrivals, 35, version);
-        let head = HandoffId::new(Uuid::from_u128(1_000_010));
-        // Load 10 waits while the loads in flight need 2 blocks. The last pass
-        // releases no block, publishes and evicts no key and leaves the published
-        // epoch, so the retry epoch stays. It is the first pass of a load in
-        // flight, which takes that load out of the need: the need falls from 2
-        // blocks to 0. Load 10 then fits. vLLM sums that need again at each
-        // attempt (V32 `sched:1241-1251`, `:3088-3092`), so the retry after this
-        // pass reserves it.
+    // A decode rank in block mode with full-attention and state blocks of 16
+    // tokens, a hash block of 16 and 9 pages. R is a load of 32 tokens. A
+    // and B are loads of 17 tokens with the same first 16 tokens. The three
+    // are reserved before one of them is activated, so B finds no hit and
+    // loads its 16 tokens into blocks of its own. R holds 2 attention blocks
+    // and a state block, and its last token opens no block. A and B hold an
+    // attention block and a state block each, and token 17 opens a second
+    // attention block and a new state block: each still needs 2 blocks.
+    //
+    // A is activated and publishes the first copy of the attention key and
+    // of the state key at 16 tokens. Its first pass, pass 0, takes the last
+    // 2 free blocks. In pass 1 it releases the state block of its first 16
+    // tokens, which stays cached. Then R and B are activated, and B
+    // publishes a second copy of both keys in its own blocks. In pass 2, R
+    // computes its last token and ends. It leaves its 2 attention blocks
+    // cached and its state block free. B needs 2 blocks in that pass and
+    // finds the 1 cached block, so it waits (V31 `sched:1223-1230`, V32
+    // `sched:1275-1282`, v0.33 `sched:1454-1461`).
+    //
+    // The head is a load of 24 tokens with the same first 16 tokens: it
+    // loads 23 tokens on a hit of 16. vLLM takes the first block of a key
+    // (V31 and V32 `vllm/v1/core/block_pool.py:62-71`, `:198-224`, v0.33
+    // `:63-72`, `:202-228`). A holds the first copy of the attention key, so
+    // that hit block counts nothing. The first copy of the state key is the
+    // cached block that A released. No request holds it, so the load counts
+    // it (V31 `single:1813-1816`, V32 `single:1775-1778`, v0.33
+    // `single:1792-1795`), with a second attention block and a state block:
+    // 3 blocks. With the 2 blocks that B still needs, that is more than the 4
+    // free blocks, so the head waits.
+    //
+    // Pass 3 is the first pass of B. It takes the free block and the oldest
+    // cached block, which is the first copy of the state key. B holds the
+    // second copy. So the key stays resident, its first block is now a block
+    // that a request holds, and the head counts 2 blocks. The pass releases
+    // no block, publishes no key and takes the last copy of no key, and the
+    // published epoch stays. Of what the retry compares, only the need of
+    // the loads in flight moved, from 2 blocks to 0: vLLM takes a request
+    // out of that sum after its first pass (V31 `sched:1607-1609`, V32
+    // `sched:1640-1642`, v0.33 `sched:1869-1871`) and sums it again at each
+    // attempt (V31 `sched:1194-1204`, `:3032-3036`, V32 `sched:1241-1251`,
+    // `:3088-3092`, v0.33 `sched:1420-1430`, `:3432-3436`). The head finds
+    // 2 free blocks, so the retry after this pass reserves it.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let mut core = one_token_load_core(version, 16, 9, 1);
+        let mut trace = TraceCollector::default();
+        let mut step = 0;
+        let need = |core: &VllmCore| core.kv_manager.grouped_inflight_need();
+        let blocks = |core: &VllmCore| {
+            let pool = block_pool(core);
+            (pool.active_blocks(), pool.inactive_cached_blocks())
+        };
+        let load = |id: u128, tokens: Vec<u32>, output: usize| DirectRequest {
+            tokens,
+            ..pd_request(id, 0, output)
+        };
+        let shared = |own: std::ops::Range<u32>| (0..16).chain(own).collect::<Vec<u32>>();
+        let r = HandoffId::new(Uuid::from_u128(1901));
+        let a = HandoffId::new(Uuid::from_u128(1903));
+        let b = HandoffId::new(Uuid::from_u128(1905));
+        let head = HandoffId::new(Uuid::from_u128(1907));
+        // R misses cdiv(31, 16) = 2 full-attention blocks.
+        assert_eq!(
+            reserve_grouped(&mut core, r, load(1900, (1000..1032).collect(), 1)),
+            Some(2),
+            "{version}"
+        );
+        // A and B miss cdiv(16, 16) = 1 full-attention block each.
+        assert_eq!(
+            reserve_grouped(&mut core, a, load(1902, shared(100..101), 8)),
+            Some(1),
+            "{version}"
+        );
+        assert_eq!(
+            reserve_grouped(&mut core, b, load(1904, shared(200..201), 8)),
+            Some(1),
+            "{version}"
+        );
+        // 3 + 2 + 2 blocks held, and 2 + 2 blocks needed.
+        assert_eq!(blocks(&core), (7, 0), "{version}");
+        assert_eq!(need(&core), 4, "{version}");
+        activate(&mut core, a);
+        // Pass 0 emits one token of A. No destination waits before the head
+        // arrives, so a retry reserves nothing. Then 7 + 2 blocks are held,
+        // and A has left the loads in flight.
+        assert_eq!(step_pd(&mut core, &mut trace, &mut step), 1, "{version}");
+        assert!(core.retry_pending_destinations().is_empty(), "{version}");
+        assert_eq!(blocks(&core), (9, 0), "{version}");
+        assert_eq!(need(&core), 2, "{version}");
+        // Pass 1 emits one token of A, which released 1 state block. That
+        // block stays cached.
+        assert_eq!(step_pd(&mut core, &mut trace, &mut step), 1, "{version}");
+        assert!(core.retry_pending_destinations().is_empty(), "{version}");
+        assert_eq!(blocks(&core), (8, 1), "{version}");
+        activate(&mut core, r);
+        activate(&mut core, b);
+        // Pass 2 emits one token of A and one of R, and B waits. Then A holds
+        // 3 blocks and B 2. The cached blocks are the state block of A and the
+        // 2 attention blocks of R. B still needs 2 blocks.
+        assert_eq!(step_pd(&mut core, &mut trace, &mut step), 2, "{version}");
+        assert!(core.retry_pending_destinations().is_empty(), "{version}");
+        assert_eq!(blocks(&core), (5, 3), "{version}");
+        assert_eq!(need(&core), 2, "{version}");
+        // The head counts 3 blocks, plus the need of 2, against 9 - 5 = 4.
+        assert_eq!(
+            reserve_grouped(&mut core, head, load(1906, shared(2000..2008), 2)),
+            None,
+            "{version}"
+        );
+        // Pass 3 emits one token of A and one of B. Then 5 + 2 blocks are
+        // held, 1 of the 3 cached blocks is taken, and B has left the loads in
+        // flight.
+        assert_eq!(step_pd(&mut core, &mut trace, &mut step), 2, "{version}");
+        assert_eq!(blocks(&core), (7, 2), "{version}");
+        assert_eq!(need(&core), 0, "{version}");
+        // cdiv(23, 16) = 2 full-attention blocks less the 1 hit block.
         assert_eq!(
             reserved_units(&core.retry_pending_destinations(), head),
-            Some(1)
+            Some(1),
+            "{version}"
         );
     }
 }
@@ -3360,43 +3357,21 @@ fn grouped_destination_retries_when_a_step_start_makes_a_state_key_a_hit() {
 
 #[test]
 fn grouped_destination_retries_when_a_pass_evicts_a_key() {
-    let arrival = |pass, load, id, shared, prompt, output| Arrival {
-        pass,
-        load,
-        id,
-        shared,
-        prompt,
-        output,
-    };
-    let arrivals = [
-        arrival(2, false, 1, 0, 80, 3),
-        arrival(7, false, 2, 64, 41, 16),
-        arrival(8, false, 3, 0, 54, 18),
-        arrival(10, false, 4, 80, 75, 8),
-        arrival(12, false, 5, 96, 99, 24),
-        arrival(12, false, 6, 0, 61, 2),
-        arrival(15, true, 7, 64, 74, 27),
-        arrival(20, false, 8, 80, 66, 17),
-        arrival(23, true, 9, 96, 59, 11),
-        arrival(24, true, 10, 0, 76, 26),
-        arrival(28, false, 11, 64, 39, 1),
-        // A load of the first 71 tokens of the shared prefix. It waits.
-        arrival(29, true, 12, 80, 71, 15),
-    ];
-    for version in ["0.32.0", "0.33.0"] {
-        let mut core = scripted_decode_rank(&arrivals, 30, version);
-        let head = HandoffId::new(Uuid::from_u128(1_000_012));
-        // Load 12 waits after its arrival. The last pass releases no block and
-        // publishes no key. It takes two of the five inactive cached blocks, and
-        // one of them holds the last copy of a key, which moves the generation of
-        // the resident keys. A decode rank counts each state group's own hit, so
-        // that eviction can change what load 12 counts. The need of the loads in
-        // flight stays 0, and the published epoch stays. Load 12 now fits, so
-        // the retry after this pass reserves it.
-        assert_eq!(core.kv_manager.grouped_inflight_need(), 0);
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let (mut core, head) = decode_rank_after_a_pass_that_evicts_a_key(version, 1);
+        // The head waits after its arrival. The last pass releases no block
+        // and publishes no key. It takes the last copy of a key, which moves
+        // the generation of the resident keys. A decode rank counts each
+        // state group's own hit, so that eviction changes what the head
+        // counts. The need of the loads in flight stays 0, and the published
+        // epoch stays. The head then fits, so the retry after this pass
+        // reserves it.
+        // It reserves cdiv(70, 16) = 5 full-attention blocks less the 3 hit
+        // blocks.
         assert_eq!(
             reserved_units(&core.retry_pending_destinations(), head),
-            Some(2)
+            Some(2),
+            "{version}"
         );
     }
 }
@@ -7847,6 +7822,9 @@ fn waiting_probe(core: &VllmCore, id: u128, tokens: Vec<u32>) -> RequestKvState 
     probe
         .lease
         .configure_prefix_hashes(&tokens, core.args.prefix_match_unit.unwrap());
+    if core.kv_manager.grouped_prefix_rules().is_some() {
+        probe.lease.hash_output_tokens(&tokens);
+    }
     probe
 }
 
@@ -8016,6 +7994,1022 @@ fn grouped_prefix_waiting_hit_follows_new_prefix_hashes_of_the_request() {
         let other: Vec<u32> = (5000..5016).collect();
         probe.lease.configure_prefix_hashes(&other, 4);
         assert_eq!(waiting_hit(&core, &mut probe), 0, "{version}");
+    }
+}
+
+/// A request with `output` planned output tokens of the value 7.
+fn turn_with_outputs(id: u128, tokens: Vec<u32>, output: usize) -> DirectRequest {
+    DirectRequest {
+        uuid: Some(Uuid::from_u128(id)),
+        tokens,
+        max_output_tokens: output,
+        output_token_ids: Some(vec![7; output]),
+        ..Default::default()
+    }
+}
+
+/// The prompt of the turn after `turn_with_outputs`: its `prompt` tokens,
+/// its `output` output tokens and `new` tokens that count up from `new_base`.
+fn next_turn_tokens(prompt: &[u32], output: usize, new_base: u32, new: usize) -> Vec<u32> {
+    let mut tokens = prompt.to_vec();
+    tokens.extend(std::iter::repeat_n(7, output));
+    tokens.extend(new_base..new_base + new as u32);
+    tokens
+}
+
+/// The chained hash of the first `at` tokens of `tokens` at the hash block
+/// `unit`, as a prompt with these tokens gets it.
+fn hash_of(tokens: &[u32], unit: usize, at: usize) -> crate::engine::common::hashing::SequenceHash {
+    let mut lease = BlockRequestLease::new(Uuid::nil(), Vec::new());
+    lease.configure_prefix_hashes(tokens, unit);
+    lease.prefix_hash_at(at).unwrap()
+}
+
+/// `prefix_core` on a rank of `worker_type` with `batches` concurrent batches.
+fn batches_core(
+    groups: Vec<FpmCacheGroup>,
+    capacity: u64,
+    chunk: usize,
+    unit: usize,
+    version: &str,
+    batches: usize,
+    worker_type: WorkerType,
+) -> VllmCore {
+    let mut args = prefix_core(groups, capacity, chunk, unit, version).args;
+    args.max_concurrent_batches = batches;
+    args.worker_type = worker_type;
+    VllmCore::new(args)
+}
+
+/// Step until the core drains, each pass formed at the end of the pass
+/// before. Returns the passes.
+fn drain_async_passes(
+    core: &mut VllmCore,
+    now_ms: &mut f64,
+) -> Vec<crate::engine::scheduler::EnginePassResult> {
+    let mut passes = Vec::new();
+    for _ in 0..600 {
+        let pass = async_step(core, now_ms);
+        for output in &pass.output_signals {
+            assert!(!output.rejected, "{} rejected", output.uuid);
+        }
+        passes.push(pass);
+        if core.is_drained() {
+            return passes;
+        }
+    }
+    panic!("the core did not drain");
+}
+
+/// One full-attention group of 32-token blocks at 8 bytes a page, or two.
+fn full_groups_of_32(count: usize) -> Vec<FpmCacheGroup> {
+    (0..count)
+        .map(|i| {
+            let mut full = group(&format!("full_{i}"), 32, 8, None);
+            full.prefix_cacheable = Some(true);
+            full.transfer_bytes_per_block = Some(8);
+            full
+        })
+        .collect()
+}
+
+#[test]
+fn grouped_request_hashes_its_output_tokens_as_a_prompt_with_the_same_tokens() {
+    // vLLM extends the block hashes of a request with every output token
+    // that it appends (v0.31, v0.32 and v0.33 request.py:272-288), with the
+    // hash function of the prompt. So the hash at a position past the prompt
+    // is the hash that a prompt with the same tokens has there. The prompt
+    // ends inside a hash block (6 and 3 tokens, the second shorter than one
+    // block), on a boundary (8) and inside a later block (41 at a hash block
+    // of 16).
+    for (prompt, unit) in [(6usize, 4usize), (3, 4), (8, 4), (41, 16)] {
+        let mut full = group("full", 16, 8, None);
+        full.prefix_cacheable = Some(true);
+        let mut core = prefix_core(vec![full], 200 * 8, 8192, unit, "0.33.0");
+        let outputs: Vec<u32> = (500..540).collect();
+        let prompt_tokens: Vec<u32> = (1000..1000 + prompt as u32).collect();
+        let id = core.receive(DirectRequest {
+            uuid: Some(Uuid::from_u128(3100)),
+            tokens: prompt_tokens.clone(),
+            max_output_tokens: outputs.len(),
+            output_token_ids: Some(outputs.clone()),
+            ..Default::default()
+        });
+        let mut all = prompt_tokens;
+        all.extend(&outputs);
+        let mut trace = TraceCollector::default();
+        // 30 passes emit 30 of the 40 output tokens.
+        for step in 0..30 {
+            core.execute_pass(&mut trace, step as f64);
+        }
+        let request = &core.state.requests[&id];
+        let known = request.sequence.len();
+        assert_eq!(known, prompt + 30, "{prompt} {unit}");
+        for at in (unit..=known).step_by(unit) {
+            assert_eq!(
+                request.sequence.lease.prefix_hash_at(at),
+                // The hash of a prompt of the same tokens.
+                Some(hash_of(&all, unit, at)),
+                "{prompt} {unit} at {at}"
+            );
+        }
+        // No hash past the tokens that the request has.
+        assert_eq!(
+            request
+                .sequence
+                .lease
+                .prefix_hash_at(known / unit * unit + unit),
+            None,
+            "{prompt} {unit}"
+        );
+    }
+}
+
+#[test]
+fn grouped_output_tokens_fill_cached_full_attention_blocks_that_the_next_turn_hits() {
+    // vLLM hashes the output tokens of a request (v0.31, v0.32 and v0.33
+    // request.py:272-288) and caches every full block of the tokens that the
+    // request has (v0.31 kv_cache_manager.py:608-612, v0.32 :612-616, v0.33
+    // :621-625, and with async scheduling also v0.31 and v0.32
+    // sched/async_scheduler.py:73-77, v0.33 sched/scheduler.py:2407-2415).
+    // Turn 1 has 40 prompt tokens and 30, 25 or 26 output tokens. Its last
+    // output token is never computed, so with 25 the last computed token
+    // fills the block that ends at 64. Turn 2 repeats the tokens of turn 1
+    // and adds 10. vLLM merges two layers of one block size into one group;
+    // replay keeps two groups of one spec, and each holds the same keys.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        for batches in [1, 2] {
+            for groups in [1, 2] {
+                for output in [30, 25, 26] {
+                    let case =
+                        format!("{version} batches {batches} groups {groups} output {output}");
+                    let mut core = batches_core(
+                        full_groups_of_32(groups),
+                        200 * 8,
+                        512,
+                        32,
+                        version,
+                        batches,
+                        WorkerType::Aggregated,
+                    );
+                    let mut now = 0.0;
+                    let prompt: Vec<u32> = (1000..1040).collect();
+                    core.receive(turn_with_outputs(3001, prompt.clone(), output));
+                    drain_async_passes(&mut core, &mut now);
+                    let turn_two = next_turn_tokens(&prompt, output, 3000, 10);
+                    // The cached positions after turn 1 are 32 and 64: two
+                    // blocks. vLLM's scheduler, run on its own code at the
+                    // three tags with one batch and with two, gives these
+                    // keys for 30, 25 and 26 output tokens.
+                    for g in 0..groups as u16 {
+                        for at in [32, 64] {
+                            assert!(
+                                block_pool(&core)
+                                    .key_hit(g, hash_of(&turn_two, 32, at))
+                                    .is_some(),
+                                "{case} group {g} at {at}"
+                            );
+                        }
+                    }
+                    assert_eq!(
+                        block_pool(&core).inactive_cached_blocks(),
+                        2 * groups,
+                        "{case}"
+                    );
+                    let second = core.receive(turn_with_outputs(3002, turn_two, 1));
+                    block_pool(&core).reset_peak_active_blocks();
+                    let pass = async_step(&mut core, &mut now);
+                    let admissions: Vec<_> = pass
+                        .admissions
+                        .iter()
+                        .map(|admission| (admission.uuid, admission.reused_input_tokens))
+                        .collect();
+                    // Turn 2 hits 64 tokens with no junction, as in the same
+                    // runs of vLLM's scheduler.
+                    assert_eq!(admissions, [(second, 64)], "{case}");
+                    // cdiv(80, 32) = 3 blocks in each group, two of them the
+                    // hit. vLLM's first allocation of turn 2 takes 3 blocks
+                    // of its one group in those runs.
+                    assert_eq!(block_pool(&core).peak_active_blocks(), 3 * groups, "{case}");
+                    drain_async_passes(&mut core, &mut now);
+                    // The 80 computed tokens of turn 2 fill no third block:
+                    // the keys stay at 32 and 64.
+                    assert_eq!(
+                        block_pool(&core).inactive_cached_blocks(),
+                        2 * groups,
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn grouped_output_token_block_gets_its_key_in_the_pass_that_fills_it() {
+    // A has 40 prompt tokens and 30 output tokens. Pass 0 computes the
+    // prompt and each later pass one token, so pass 24 computes token 64 and
+    // fills the block that ends there. W repeats the first 64 tokens of A
+    // and adds 16. W is admitted after the running requests of its pass. In
+    // pass 23 it hits the prompt block of A, 32 tokens. In pass 24 it hits
+    // 64.
+    // With one batch vLLM gives the key in the same `schedule()` call too:
+    // that call caches up to `request.num_tokens`, which holds the output
+    // token of the step before (v0.31 kv_cache_manager.py:608-612, v0.32
+    // :612-616, v0.33 :621-625).
+    // With two batches vLLM forms the step before it has appended that
+    // output token (v0.31 engine/core.py:697, :740-755, v0.32
+    // engine/core.py:725, :768-783, v0.33 engine/core.py:735, :778-793), so
+    // `request.num_tokens` is one short and the block gets its key one step
+    // later: in the next `schedule()` call, or when vLLM processes the
+    // outputs of the filling step (v0.31 and v0.32
+    // sched/async_scheduler.py:73-77, v0.33 sched/scheduler.py:2407-2415). A
+    // request that vLLM admits in the filling step hits 32 tokens there.
+    // Replay gives the key in the filling pass with one batch and with two:
+    // a known difference from vLLM with async scheduling.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        for batches in [1usize, 2] {
+            // 32 before the filling pass, 64 in it. With one batch vLLM's
+            // scheduler, run on its own code, has the key at 64 when the
+            // schedule() call that fills the block returns. With two batches
+            // vLLM has the key one step later, so a request that it admits
+            // in the filling step hits 32; replay's 64 is the difference
+            // named above.
+            for (admitting_pass, hit) in [(23u64, 32), (24, 64)] {
+                let case = format!("{version} batches {batches} pass {admitting_pass}");
+                let mut core = batches_core(
+                    full_groups_of_32(1),
+                    200 * 8,
+                    512,
+                    32,
+                    version,
+                    batches,
+                    WorkerType::Aggregated,
+                );
+                let mut now = 0.0;
+                let prompt: Vec<u32> = (1000..1040).collect();
+                core.receive(turn_with_outputs(3201, prompt.clone(), 30));
+                // An arrival joins the pass after the next one with two
+                // batches, and the next pass with one.
+                let submit_after = admitting_pass - 2 * (batches as u64 - 1);
+                let mut admitted = None;
+                for pass_index in 0..=admitting_pass {
+                    if pass_index == submit_after {
+                        core.receive(turn_with_outputs(
+                            3202,
+                            next_turn_tokens(&prompt, 24, 3000, 16),
+                            1,
+                        ));
+                    }
+                    let pass = async_step(&mut core, &mut now);
+                    for admission in &pass.admissions {
+                        if admission.uuid == Uuid::from_u128(3202) {
+                            admitted = Some((pass_index, admission.reused_input_tokens));
+                        }
+                    }
+                }
+                assert_eq!(admitted, Some((admitting_pass, hit)), "{case}");
+            }
+        }
+    }
+}
+
+#[test]
+fn grouped_resumed_request_hits_the_block_that_its_output_tokens_filled() {
+    // A preempted request keeps its tokens, and vLLM looks its hit up with
+    // its block hashes, which hold its output tokens (v0.31, v0.32 and v0.33
+    // request.py:272-288), up to `num_tokens - 1` (v0.31 and v0.32
+    // kv_cache_manager.py:289-295, v0.33 :295-302). A request of 40 prompt
+    // tokens is
+    // preempted with 66 computed tokens and 67 known tokens. Its blocks that
+    // end at 32 and 64 stay cached, and its re-admission hits (67 - 1) / 32 *
+    // 32 = 64 tokens.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        for batches in [1, 2] {
+            let case = format!("{version} batches {batches}");
+            let mut core = batches_core(
+                full_groups_of_32(1),
+                200 * 8,
+                512,
+                32,
+                version,
+                batches,
+                WorkerType::Aggregated,
+            );
+            let mut now = 0.0;
+            let id = core.receive(turn_with_outputs(3301, (1000..1040).collect(), 60));
+            for _ in 0..200 {
+                if core.state.requests[&id].num_computed_tokens >= 66 {
+                    break;
+                }
+                async_step(&mut core, &mut now);
+            }
+            assert_eq!(core.state.requests[&id].num_computed_tokens, 66, "{case}");
+            assert_eq!(core.state.requests[&id].sequence.len(), 67, "{case}");
+            assert!(core.policy_preempt(now).is_some(), "{case}");
+            assert_eq!(block_pool(&core).active_blocks(), 0, "{case}");
+            assert_eq!(block_pool(&core).inactive_cached_blocks(), 2, "{case}");
+            let mut admitted = None;
+            for _ in 0..4 {
+                let pass = async_step(&mut core, &mut now);
+                if let Some(admission) = pass.admissions.first() {
+                    admitted = Some((admission.uuid, admission.reused_input_tokens));
+                    break;
+                }
+            }
+            assert_eq!(admitted, Some((id, 64)), "{case}");
+            drain_async_passes(&mut core, &mut now);
+        }
+    }
+}
+
+/// The reused input tokens and the junction tokens of the admission of `id`,
+/// which the next pass admits, and the chunk ends of its prefill. The
+/// request has two output tokens or more, so it outlives its last chunk.
+fn prefill_of(core: &mut VllmCore, now_ms: &mut f64, id: Uuid) -> (usize, usize, Vec<usize>) {
+    let prompt = core.state.requests[&id].sequence.num_input_tokens();
+    let pass = async_step(core, now_ms);
+    let admissions: Vec<_> = pass
+        .admissions
+        .iter()
+        .map(|admission| admission.uuid)
+        .collect();
+    assert_eq!(admissions, [id]);
+    let reused = pass.admissions[0].reused_input_tokens;
+    let junction = core.state.requests[&id]
+        .sequence
+        .lease
+        .grouped_hit()
+        .unwrap()
+        .junction_tokens;
+    let mut ends = vec![core.state.requests[&id].num_computed_tokens];
+    while *ends.last().unwrap() < prompt {
+        async_step(core, now_ms);
+        ends.push(core.state.requests[&id].num_computed_tokens);
+    }
+    (reused, junction, ends)
+}
+
+#[test]
+fn grouped_glm_shaped_next_turn_gets_a_junction_where_output_tokens_filled_a_block() {
+    // The GLM-5.3-Flash shape: one full-attention group and four Mamba
+    // groups with 2,176-token blocks at a hash block of 2,176. Turn 1 has
+    // 2,000 prompt tokens. With 400 output tokens they fill the
+    // full-attention block that ends at 2,176, which gets its key (v0.31
+    // kv_cache_manager.py:608-612, v0.32 :612-616, v0.33 :621-625). A Mamba
+    // group keeps no state at an output position under the default
+    // retention. Turn 2 repeats the 2,400 tokens and adds 100. Its
+    // full-attention lookup hits 2,176 tokens and its Mamba lookup none, so
+    // the hit is 0 and the junction 2,176 (v0.31, v0.32 and v0.33
+    // kv_cache_manager.py:312-321). The prefill stops at the junction and
+    // each Mamba group publishes its state there. With 100 output tokens
+    // turn 1 fills no block, and turn 2 (2,200 tokens) gets no junction. One
+    // step computes 2,176 tokens at most here, so the first chunk of turn 2
+    // ends at 2,176 in both cases.
+    for (version, checkpoint) in GLM_CORES {
+        for batches in [1, 2] {
+            // (output tokens of turn 1, cached blocks after turn 1, junction
+            // of turn 2, cached blocks after turn 2).
+            // vLLM's scheduler, run on its own code at the three tags with
+            // one batch and with two, with and without a checkpoint block,
+            // gives these rows. 400: one cached full-attention block after
+            // turn 1; turn 2 hits 0 with the junction 2,176 and the chunks
+            // 2,176 and 324; then two full-attention blocks hold the key at
+            // 2,176 and each of the four Mamba groups one. 100: no key after
+            // turn 1; turn 2 hits 0 with no junction and the chunks 2,176 and
+            // 24; then one full-attention block and four states.
+            for (output, cached_one, junction, cached_two) in [(400, 1, 2176, 6), (100, 0, 0, 5)] {
+                let case = format!("{version} {checkpoint} batches {batches} output {output}");
+                let mut core = batches_core(
+                    glm_groups(checkpoint),
+                    64 * GLM_PAGE,
+                    2176,
+                    2176,
+                    version,
+                    batches,
+                    WorkerType::Aggregated,
+                );
+                let mut now = 0.0;
+                let prompt: Vec<u32> = (1000..3000).collect();
+                core.receive(turn_with_outputs(3401, prompt.clone(), output));
+                drain_async_passes(&mut core, &mut now);
+                let turn_two = next_turn_tokens(&prompt, output, 30_000, 100);
+                let key = hash_of(&turn_two, 2176, 2176);
+                assert_eq!(
+                    block_pool(&core).key_hit(0, key).is_some(),
+                    cached_one == 1,
+                    "{case}"
+                );
+                for g in 2..6 {
+                    assert!(block_pool(&core).key_hit(g, key).is_none(), "{case} {g}");
+                }
+                assert_eq!(
+                    block_pool(&core).inactive_cached_blocks(),
+                    cached_one,
+                    "{case}"
+                );
+                let second = core.receive(turn_with_outputs(3402, turn_two.clone(), 2));
+                assert_eq!(
+                    prefill_of(&mut core, &mut now, second),
+                    (0, junction, vec![2176, turn_two.len()]),
+                    "{case}"
+                );
+                drain_async_passes(&mut core, &mut now);
+                for g in [0, 2, 3, 4, 5] {
+                    assert!(block_pool(&core).key_hit(g, key).is_some(), "{case} {g}");
+                }
+                assert_eq!(
+                    block_pool(&core).inactive_cached_blocks(),
+                    cached_two,
+                    "{case}"
+                );
+                // Turn 3 repeats turn 2 and its two output tokens and adds
+                // 100 tokens. It hits the state that turn 2 left at 2,176,
+                // which is the junction and also the replay boundary of turn
+                // 2, (len - 1) / 2176 * 2176.
+                let turn_three = next_turn_tokens(&turn_two, 2, 40_000, 100);
+                let third = core.receive(turn_with_outputs(3403, turn_three, 2));
+                assert_eq!(prefill_of(&mut core, &mut now, third).0, 2176, "{case}");
+                drain_async_passes(&mut core, &mut now);
+            }
+        }
+    }
+}
+
+#[test]
+fn grouped_glm_shaped_junction_below_the_replay_boundary_adds_a_chunk_stop_and_a_state() {
+    // Turn 1 as above: 2,000 prompt tokens and 400 output tokens leave the
+    // full-attention key at 2,176. Turn 2 repeats them and adds 2,100
+    // tokens: 4,500 tokens with the last cacheable position 4,352. Its hit
+    // is 0 and its junction 2,176, below 4,352. So its prefill stops at the
+    // junction too (v0.31 sched:414-527, v0.32 sched:443-556, v0.33
+    // sched:546-662) and each Mamba group publishes a state at 2,176 and at
+    // 4,352. With a checkpoint block the chunk from 2,176 runs to the prompt
+    // end and exports the state at 4,352 from inside its forward (v0.32
+    // sched:488-501, v0.33 sched:593-606). A sibling of turn 2, the 2,400
+    // tokens of turn 1 and 200 other tokens, then hits the state at 2,176.
+    for (version, checkpoint) in GLM_CORES {
+        for batches in [1, 2] {
+            let case = format!("{version} {checkpoint} batches {batches}");
+            let mut core = batches_core(
+                glm_groups(checkpoint),
+                64 * GLM_PAGE,
+                8192,
+                2176,
+                version,
+                batches,
+                WorkerType::Aggregated,
+            );
+            let mut now = 0.0;
+            let prompt: Vec<u32> = (1000..3000).collect();
+            core.receive(turn_with_outputs(3501, prompt.clone(), 400));
+            drain_async_passes(&mut core, &mut now);
+            let turn_two = next_turn_tokens(&prompt, 400, 30_000, 2100);
+            let second = core.receive(turn_with_outputs(3502, turn_two.clone(), 2));
+            let ends = if checkpoint {
+                vec![2176, 4500]
+            } else {
+                vec![2176, 4352, 4500]
+            };
+            assert_eq!(
+                prefill_of(&mut core, &mut now, second),
+                (0, 2176, ends),
+                "{case}"
+            );
+            drain_async_passes(&mut core, &mut now);
+            for at in [2176, 4352] {
+                for g in [0, 2, 3, 4, 5] {
+                    assert!(
+                        block_pool(&core)
+                            .key_hit(g, hash_of(&turn_two, 2176, at))
+                            .is_some(),
+                        "{case} group {g} at {at}"
+                    );
+                }
+            }
+            let sibling = next_turn_tokens(&prompt, 400, 50_000, 200);
+            let third = core.receive(turn_with_outputs(3503, sibling, 2));
+            assert_eq!(prefill_of(&mut core, &mut now, third).0, 2176, "{case}");
+            drain_async_passes(&mut core, &mut now);
+        }
+    }
+}
+
+#[test]
+fn grouped_block_with_the_partial_tail_key_gets_its_block_key_when_output_tokens_fill_it() {
+    // A full-attention group, a ring and a Mamba group with 32-token blocks
+    // at a hash block of 4. A has 21 prompt tokens: its partial tail is 20,
+    // and the first block of each cacheable group gets the key at 20. Its 20
+    // output tokens fill the full-attention block. vLLM then makes the block
+    // key at 32 the first key of that block and keeps the entry at 20 (v0.31
+    // and v0.32 block_pool.py:286-299, v0.33 block_pool.py:290-303): one
+    // block holds both keys. B has the same 21 prompt tokens and hits 20
+    // tokens. Its first allocation takes the hit block and a copy block in
+    // each of the two groups, and the ring block: 5 blocks. Its copy of the
+    // full-attention block gets the entry at 20, so the pool then holds 3
+    // cached blocks.
+    // With 45 prompt tokens the partial tail 44 lies in the second block.
+    // The first block gets the key at 32 from the prompt, and 30 output
+    // tokens fill the second block, which then holds 64 and 44. The Mamba
+    // group keeps the states at 32 and at 44. B hits 44 tokens and takes 2
+    // full-attention hit blocks, the state hit block, 2 copy blocks and the
+    // ring block: 6 blocks.
+    // The next turn of A repeats its prompt and its output tokens and adds
+    // 10 tokens. It hits the tokens of the partial tail, where every group
+    // has a key, and its full-attention lookup reaches the end of the block
+    // that the output tokens filled, so it has a junction there (v0.31 and
+    // v0.32 kv_cache_manager.py:312-321, v0.33 kv_cache_manager.py:319-328).
+    struct Row {
+        prompt: u32,
+        output: usize,
+        /// The positions with a full-attention key and with a Mamba key
+        /// after A, and a position without a Mamba key.
+        full: &'static [usize],
+        mamba: &'static [usize],
+        no_state: usize,
+        cached: usize,
+        /// The hit of B and the blocks of its first allocation.
+        hit: usize,
+        taken: usize,
+        cached_after: usize,
+        /// The junction of the next turn, in tokens past its hit.
+        junction: usize,
+    }
+    // vLLM's scheduler, run on its own code at the three tags with one
+    // batch and with two, gives the rows of A and B: for 21 prompt tokens
+    // one block with the keys 32 and 20 and the state at 20, B hits 20 with
+    // no junction and its first allocation takes 5 blocks; for 45 prompt
+    // tokens the blocks 32 and 64 + 44 and the states at 32 and 44, B hits
+    // 44 with no junction and takes 6 blocks. The junctions of the next
+    // turn, 32 - 20 and 64 - 44 tokens past the hit, follow from the
+    // full-attention lookup.
+    let rows = [
+        Row {
+            prompt: 21,
+            output: 20,
+            full: &[20, 32],
+            mamba: &[20],
+            no_state: 32,
+            cached: 2,
+            hit: 20,
+            taken: 5,
+            cached_after: 3,
+            junction: 12,
+        },
+        Row {
+            prompt: 45,
+            output: 30,
+            full: &[32, 44, 64],
+            mamba: &[32, 44],
+            no_state: 64,
+            cached: 4,
+            hit: 44,
+            taken: 6,
+            cached_after: 5,
+            junction: 20,
+        },
+    ];
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        for batches in [1, 2] {
+            for row in &rows {
+                let case = format!("{version} batches {batches} prompt {}", row.prompt);
+                let mut core = hash_below_block_core(version, batches);
+                let mut now = 0.0;
+                let prompt: Vec<u32> = (1000..1000 + row.prompt).collect();
+                core.receive(turn_with_outputs(3901, prompt.clone(), row.output));
+                drain_async_passes(&mut core, &mut now);
+                let turn_two = next_turn_tokens(&prompt, row.output, 3000, 10);
+                let keyed = |core: &VllmCore, g: u16, at: usize| {
+                    block_pool(core)
+                        .key_hit(g, hash_of(&turn_two, 4, at))
+                        .is_some()
+                };
+                for &at in row.full {
+                    assert!(keyed(&core, 0, at), "{case} group 0 at {at}");
+                }
+                for &at in row.mamba {
+                    assert!(keyed(&core, 2, at), "{case} group 2 at {at}");
+                }
+                assert!(!keyed(&core, 2, row.no_state), "{case} group 2");
+                // One block holds the block key and the entry, so the cached
+                // blocks are one per full-attention block and one per state.
+                assert_eq!(
+                    block_pool(&core).inactive_cached_blocks(),
+                    row.cached,
+                    "{case}"
+                );
+                let same = core.receive(turn_with_outputs(3902, prompt.clone(), 2));
+                block_pool(&core).reset_peak_active_blocks();
+                let (reused, no_junction, _) = prefill_of(&mut core, &mut now, same);
+                assert_eq!((reused, no_junction), (row.hit, 0), "{case}");
+                assert_eq!(block_pool(&core).peak_active_blocks(), row.taken, "{case}");
+                drain_async_passes(&mut core, &mut now);
+                assert_eq!(
+                    block_pool(&core).inactive_cached_blocks(),
+                    row.cached_after,
+                    "{case}"
+                );
+                let next = core.receive(turn_with_outputs(3903, turn_two.clone(), 2));
+                let (reused, past_hit, _) = prefill_of(&mut core, &mut now, next);
+                assert_eq!((reused, past_hit), (row.hit, row.junction), "{case}");
+                drain_async_passes(&mut core, &mut now);
+            }
+        }
+    }
+}
+
+#[test]
+fn grouped_resumed_request_keeps_the_partial_tail_key_on_the_block_that_output_tokens_fill() {
+    // The groups and the first prompt of the test above: a hash block of 4
+    // below the 32-token blocks, 21 prompt tokens, a partial tail of 20. The
+    // request is preempted with 34 computed tokens and resumes. Its first
+    // full-attention block holds the block key at 32 and the entry at 20
+    // (v0.31 and v0.32 block_pool.py:286-299, v0.33 block_pool.py:290-303).
+    // Its readmission hits the 20 tokens of the partial tail, where the
+    // Mamba group has its state. Its full-attention lookup reaches 32, so it
+    // has a junction 12 tokens past the hit (v0.31 and v0.32
+    // kv_cache_manager.py:312-321, v0.33 kv_cache_manager.py:319-328). Its
+    // recompute fills the block that ends at 32 again, from a copy of the
+    // hit block, and keeps a state at the junction. So the keys at 20 and at
+    // 32 stay in both groups.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        for batches in [1, 2] {
+            let case = format!("{version} batches {batches}");
+            let mut core = hash_below_block_core(version, batches);
+            let mut now = 0.0;
+            let prompt: Vec<u32> = (1000..1021).collect();
+            let id = core.receive(turn_with_outputs(3951, prompt.clone(), 20));
+            for _ in 0..200 {
+                if core.state.requests[&id].num_computed_tokens >= 34 {
+                    break;
+                }
+                async_step(&mut core, &mut now);
+            }
+            assert_eq!(core.state.requests[&id].num_computed_tokens, 34, "{case}");
+            assert!(core.policy_preempt(now).is_some(), "{case}");
+            let mut admitted = None;
+            for _ in 0..4 {
+                let pass = async_step(&mut core, &mut now);
+                if let Some(admission) = pass.admissions.first() {
+                    admitted = Some((admission.uuid, admission.reused_input_tokens));
+                    break;
+                }
+            }
+            assert_eq!(admitted, Some((id, 20)), "{case}");
+            let junction = core.state.requests[&id]
+                .sequence
+                .lease
+                .grouped_hit()
+                .unwrap()
+                .junction_tokens;
+            assert_eq!(junction, 12, "{case}");
+            drain_async_passes(&mut core, &mut now);
+            let known = next_turn_tokens(&prompt, 20, 0, 0);
+            for (g, at, cached) in [(0, 20, true), (0, 32, true), (2, 20, true), (2, 32, true)] {
+                assert_eq!(
+                    block_pool(&core)
+                        .key_hit(g, hash_of(&known, 4, at))
+                        .is_some(),
+                    cached,
+                    "{case} group {g} at {at}"
+                );
+            }
+        }
+    }
+}
+
+/// A full-attention group, a ring and a Mamba group with 32-token blocks at a
+/// hash block of 4, on an aggregated rank with 200 pages.
+fn hash_below_block_core(version: &str, batches: usize) -> VllmCore {
+    let mut full = group("mla", 32, GLM_PAGE, None);
+    full.prefix_cacheable = Some(true);
+    let groups = vec![
+        full,
+        glm_state("kpool_tail", 4, false, false),
+        glm_state("kda", 32, true, false),
+    ];
+    batches_core(
+        groups,
+        200 * GLM_PAGE,
+        512,
+        4,
+        version,
+        batches,
+        WorkerType::Aggregated,
+    )
+}
+
+#[test]
+fn grouped_block_after_the_partial_tail_block_and_a_prompt_block_get_their_block_keys() {
+    // Every full-attention block that a request fills gets its block key:
+    // the block that holds the partial-tail entry, the block after it, and
+    // a block that the prompt fills.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        for batches in [1, 2] {
+            let case = format!("{version} batches {batches}");
+            // 21 prompt tokens and 50 output tokens: 70 computed tokens. The
+            // block that ends at 32 holds the partial tail 20 and gets its
+            // block key beside that entry. The block that ends at 64 holds
+            // output tokens only and gets its key.
+            let mut core = hash_below_block_core(version, batches);
+            let mut now = 0.0;
+            let prompt: Vec<u32> = (1000..1021).collect();
+            core.receive(turn_with_outputs(3961, prompt.clone(), 50));
+            drain_async_passes(&mut core, &mut now);
+            let known = next_turn_tokens(&prompt, 50, 0, 0);
+            for (at, cached) in [(20, true), (32, true), (64, true)] {
+                assert_eq!(
+                    block_pool(&core)
+                        .key_hit(0, hash_of(&known, 4, at))
+                        .is_some(),
+                    cached,
+                    "{case} at {at}"
+                );
+            }
+            // 64 prompt tokens with a checkpoint block at alignment 4, on
+            // vLLM 0.32.0 and 0.33.0: the partial tail 60 lies inside the
+            // block that ends at 64. One chunk computes the prompt, as the
+            // checkpoint block exports the state at 60 (v0.32 sched:488-501,
+            // v0.33 sched:593-606). The prompt fills that block, so it gets
+            // its block key.
+            // vLLM's scheduler, run on its own code at 0.32.0 and 0.33.0
+            // with a checkpoint block, gives that block the key at 64.
+            if version == "0.31.0" {
+                continue;
+            }
+            let mut full = group("mla", 32, GLM_PAGE, None);
+            full.prefix_cacheable = Some(true);
+            let mut kda = glm_state("kda", 32, true, true);
+            kda.prefill_checkpoint_alignment = Some(4);
+            let groups = vec![full, glm_state("kpool_tail", 4, false, false), kda];
+            let mut core = batches_core(
+                groups,
+                200 * GLM_PAGE,
+                512,
+                4,
+                version,
+                batches,
+                WorkerType::Aggregated,
+            );
+            let prompt: Vec<u32> = (1000..1064).collect();
+            let id = core.receive(turn_with_outputs(3962, prompt.clone(), 2));
+            assert_eq!(prefill_of(&mut core, &mut now, id).2, [64], "{case}");
+            drain_async_passes(&mut core, &mut now);
+            assert!(
+                block_pool(&core)
+                    .key_hit(0, hash_of(&prompt, 4, 64))
+                    .is_some(),
+                "{case}"
+            );
+        }
+    }
+}
+
+#[test]
+fn grouped_output_tokens_fill_blocks_up_to_the_scheduler_block_of_two_full_attention_groups() {
+    // Full-attention groups of 64-token and 16-token blocks at a hash block
+    // of 16. Without a state group hits do not land inside a block, so vLLM
+    // caches the computed tokens up to the last multiple of the scheduler
+    // block, lcm(64, 16) = 64 (v0.31.0 `coord:796-806`, v0.32.0
+    // `coord:767-777`, v0.33.0 `coord:777-787`). A prompt of 120 tokens
+    // with 10 output tokens computes 129 tokens: the last output token is
+    // never computed. 129 rounds down to 128, so the 64-token group caches
+    // 2 blocks and the 16-token group 8. The block that ends at 128 holds
+    // the prompt's tail entry 112 too, so it is one block with two keys.
+    // The blocks that end past 112 hold output tokens, and vLLM hashes them
+    // (v0.31, v0.32 and v0.33 `request.py:272-288`). So 10 blocks stay
+    // cached when the request ends.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        for batches in [1, 2] {
+            let case = format!("{version} batches {batches}");
+            let mut wide = group("full_64", 64, 8, None);
+            wide.prefix_cacheable = Some(true);
+            let mut narrow = group("full_16", 16, 8, None);
+            narrow.prefix_cacheable = Some(true);
+            let mut core = batches_core(
+                vec![wide, narrow],
+                200 * 8,
+                512,
+                16,
+                version,
+                batches,
+                WorkerType::Aggregated,
+            );
+            let mut now = 0.0;
+            let prompt: Vec<u32> = (1000..1120).collect();
+            core.receive(turn_with_outputs(3971, prompt.clone(), 10));
+            drain_async_passes(&mut core, &mut now);
+            assert_eq!(block_pool(&core).inactive_cached_blocks(), 10, "{case}");
+            let known = next_turn_tokens(&prompt, 10, 0, 0);
+            for at in [64, 128] {
+                assert!(
+                    block_pool(&core)
+                        .key_hit(0, hash_of(&known, 16, at))
+                        .is_some(),
+                    "{case} group 0 at {at}"
+                );
+            }
+            for at in (16..=128).step_by(16) {
+                assert!(
+                    block_pool(&core)
+                        .key_hit(1, hash_of(&known, 16, at))
+                        .is_some(),
+                    "{case} group 1 at {at}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn grouped_output_token_blocks_of_a_finished_request_are_evicted_tail_first() {
+    // One full-attention group of 4-token blocks in a pool of 5 blocks. A
+    // has 6 prompt tokens and 7 output tokens: 12 computed tokens fill the
+    // blocks that end at 4, 8 and 12, and the 13th token opens a fourth
+    // block. vLLM frees the blocks of a request tail first, so that the tail
+    // blocks are evicted first (v0.31 kv_cache_manager.py:616-625, v0.32
+    // :620-629, v0.33 :629-638). B needs cdiv(9, 4) = 3 blocks: the 2 free
+    // ones and the oldest cached one, the block of A that ends at 12. The
+    // next turn of A (16 tokens) then hits 8 tokens.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let mut full = group("full", 4, 8, None);
+        full.prefix_cacheable = Some(true);
+        let mut core = prefix_core(vec![full], 5 * 8, 64, 4, version);
+        let mut now = 0.0;
+        let prompt: Vec<u32> = (1000..1006).collect();
+        core.receive(turn_with_outputs(3601, prompt.clone(), 7));
+        drain_async_passes(&mut core, &mut now);
+        assert_eq!(block_pool(&core).inactive_cached_blocks(), 3, "{version}");
+        core.receive(turn_with_outputs(3602, (5000..5009).collect(), 1));
+        drain_async_passes(&mut core, &mut now);
+        // The blocks of A that end at 4 and 8, and the two full blocks of B.
+        assert_eq!(block_pool(&core).inactive_cached_blocks(), 4, "{version}");
+        let turn_two = next_turn_tokens(&prompt, 7, 3000, 3);
+        for (at, cached) in [(4, true), (8, true), (12, false)] {
+            assert_eq!(
+                block_pool(&core)
+                    .key_hit(0, hash_of(&turn_two, 4, at))
+                    .is_some(),
+                cached,
+                "{version} at {at}"
+            );
+        }
+        let second = core.receive(turn_with_outputs(3603, turn_two, 1));
+        let pass = async_step(&mut core, &mut now);
+        let admissions: Vec<_> = pass
+            .admissions
+            .iter()
+            .map(|admission| (admission.uuid, admission.reused_input_tokens))
+            .collect();
+        assert_eq!(admissions, [(second, 8)], "{version}");
+    }
+}
+
+#[test]
+fn grouped_decode_rank_local_prefix_reaches_the_blocks_that_output_tokens_filled() {
+    // A decode rank computes the output tokens of a request that it loaded,
+    // so its full-attention blocks that they fill get their keys there. The
+    // first request loads its 40 prompt tokens, cdiv(40, 32) = 2 blocks, and
+    // decodes 30 tokens. The next turn has 80 tokens, cdiv(80, 32) = 3
+    // blocks. Its local prefix is the 64 tokens of the two cached blocks
+    // (v0.31 and v0.32 kv_cache_manager.py:346-351, v0.33 :352-358), so
+    // one block moves.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        for batches in [1, 2] {
+            let case = format!("{version} batches {batches}");
+            let mut core = batches_core(
+                full_groups_of_32(1),
+                200 * 8,
+                512,
+                32,
+                version,
+                batches,
+                WorkerType::Decode,
+            );
+            let mut now = 0.0;
+            let prompt: Vec<u32> = (1000..1040).collect();
+            let first = HandoffId::new(Uuid::from_u128(3702));
+            assert_eq!(
+                reserve_grouped(
+                    &mut core,
+                    first,
+                    turn_with_outputs(3701, prompt.clone(), 30)
+                ),
+                Some(2),
+                "{case}"
+            );
+            activate(&mut core, first);
+            drain_async_passes(&mut core, &mut now);
+            let turn_two = next_turn_tokens(&prompt, 30, 3000, 10);
+            for at in [32, 64] {
+                assert!(
+                    block_pool(&core)
+                        .key_hit(0, hash_of(&turn_two, 32, at))
+                        .is_some(),
+                    "{case} at {at}"
+                );
+            }
+            let second = HandoffId::new(Uuid::from_u128(3704));
+            assert_eq!(
+                reserve_grouped(&mut core, second, turn_with_outputs(3703, turn_two, 1)),
+                Some(1),
+                "{case}"
+            );
+            activate(&mut core, second);
+            let request = &core.state.requests[&Uuid::from_u128(3703)];
+            assert_eq!(
+                request.sequence.lease.grouped_hit().unwrap().tokens,
+                64,
+                "{case}"
+            );
+            drain_async_passes(&mut core, &mut now);
+        }
+    }
+}
+
+#[test]
+fn grouped_prefill_rank_caches_no_block_that_its_sampled_token_fills() {
+    // A prefill rank computes the prompt and samples one token, which it
+    // never computes. A source of 63 prompt tokens knows 64 tokens then, two
+    // blocks of 32, with 63 computed: only the block that ends at 32 gets a
+    // key (v0.31 kv_cache_manager.py:608-612, v0.32 :612-616, v0.33
+    // :621-625).
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        for batches in [1, 2] {
+            let case = format!("{version} batches {batches}");
+            let mut args = prefix_core(full_groups_of_32(1), 200 * 8, 8192, 32, version).args;
+            args.max_concurrent_batches = batches;
+            args.worker_type = WorkerType::Prefill;
+            args.kv_transfer_bandwidth = Some(1.0);
+            let mut core = VllmCore::new(args);
+            let prompt: Vec<u32> = (1000..1063).collect();
+            let handoff_id = HandoffId::new(Uuid::from_u128(3802));
+            core.apply_command(SchedulerCommand::SubmitHandoffPrefill {
+                handoff_id,
+                request: turn_with_outputs(3801, prompt.clone(), 1),
+            })
+            .unwrap();
+            held_timing(&mut core);
+            let known = next_turn_tokens(&prompt, 1, 0, 0);
+            assert!(
+                block_pool(&core)
+                    .key_hit(0, hash_of(&known, 32, 32))
+                    .is_some(),
+                "{case}"
+            );
+            assert!(
+                block_pool(&core)
+                    .key_hit(0, hash_of(&known, 32, 64))
+                    .is_none(),
+                "{case}"
+            );
+        }
+    }
+}
+
+#[test]
+fn grouped_prefix_waiting_hit_follows_the_output_tokens_of_the_request() {
+    // vLLM looks the hit of a request up with its block hashes, which hold
+    // its output tokens (v0.31, v0.32 and v0.33 request.py:272-288), up to
+    // `num_tokens - 1` (v0.31 and v0.32 kv_cache_manager.py:289-295, v0.33
+    // :295-302).
+    // A finished request of 6 prompt tokens and 4 output tokens leaves the
+    // keys at 4 and 8. A waiting request with the same 6 prompt tokens hits
+    // (6 - 1) / 4 * 4 = 4 tokens. Its stored hit has the stamp of 6 tokens.
+    // With the same 4 output tokens it has 10 tokens, so the lookup searches
+    // again and hits (10 - 1) / 4 * 4 = 8: the block that ends at 8 holds 2
+    // prompt tokens and 2 output tokens.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let mut full = group("full", 4, 8, None);
+        full.prefix_cacheable = Some(true);
+        let mut core = prefix_core(vec![full], 16 * 8, 64, 4, version);
+        let mut now = 0.0;
+        let mut probe = waiting_probe(&core, 2501, (0..6).collect());
+        // The output tokens that the probe generates.
+        let outputs: Vec<u32> = (0..4)
+            .map(|ordinal| {
+                crate::engine::common::sequence::synthetic_output_token(
+                    Uuid::from_u128(2501),
+                    ordinal,
+                )
+            })
+            .collect();
+        core.receive(DirectRequest {
+            uuid: Some(Uuid::from_u128(2502)),
+            tokens: (0..6).collect(),
+            max_output_tokens: outputs.len(),
+            output_token_ids: Some(outputs),
+            ..Default::default()
+        });
+        drain_async_passes(&mut core, &mut now);
+        assert_eq!(waiting_hit(&core, &mut probe), 4, "{version}");
+        assert_eq!(waiting_hit(&core, &mut probe), 4, "{version}");
+        for _ in 0..4 {
+            probe.generate_token();
+        }
+        assert_eq!(probe.len(), 10, "{version}");
+        assert_eq!(waiting_hit(&core, &mut probe), 8, "{version}");
+        assert_eq!(waiting_hit(&core, &mut probe), 8, "{version}");
     }
 }
 

@@ -495,9 +495,10 @@ impl GroupedPrefixRules {
     /// the pool as they are. 0 when the next step can change them.
     ///
     /// `settled` is the larger of the prompt and the junction. Every position
-    /// that `finalize` publishes at (replay boundary, partial tail, prompt
-    /// checkpoint and junction) lies at or below it, so past it `finalize`
-    /// publishes only in a step that completes a block. That holds for the
+    /// that `finalize` publishes a state, a window run or a key inside a
+    /// block at (replay boundary, partial tail, prompt checkpoint and
+    /// junction) lies at or below it, so past it `finalize` publishes only
+    /// the full-attention blocks that a step completes. That holds for the
     /// full-attention keys that wait for a multiple of the scheduler block
     /// too, the partial tail among them: such a multiple is a block end of
     /// every group. `allocate` takes a block when the target leaves the
@@ -970,9 +971,10 @@ impl GroupedPrefixCoordinator {
 
     /// Every input of [`Self::find_longest_hit`] that can change while a
     /// request waits: the pool, its resident keys, the keys published in
-    /// this step and the request's token count. The other inputs, the rules
-    /// and the request's prefix hashes, are fixed once the lease has its
-    /// prefix hashes. The search reads the pool only through
+    /// this step and the request's token count. The other inputs are the
+    /// rules, which are fixed, and the request's prefix hashes. A request
+    /// only appends tokens, so its token count fixes the hashes once the
+    /// lease has its prefix hashes. The search reads the pool only through
     /// `key_hit(..).is_some()` and `keys_in_block`, which only narrows where
     /// it looks. So two searches of one lease with equal stamps give equal
     /// hits.

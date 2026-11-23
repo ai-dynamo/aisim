@@ -558,6 +558,132 @@ fn grouped_prefix_lone_request_at_the_startup_count_is_a_livelock_with_async_sch
     }
 }
 
+/// An aggregated vLLM rank in block mode with a full-attention group, a ring
+/// and `states` prefix-cacheable state groups, all of `block`-token blocks
+/// except the 4-token ring, at a hash block equal to the block and a pool of
+/// `pages` pages.
+fn aggregated_state_spec(
+    requests: Vec<ReplayRequest>,
+    version: &str,
+    block: u64,
+    states: usize,
+    ring: bool,
+    max_model_len: u64,
+    budget: u64,
+    pages: u64,
+) -> ReplaySpec {
+    let mut spec = aggregated_spec(Backend::Vllm, 1, 0.0, requests);
+    let rank = &mut spec.engine["rank"];
+    rank["enable_prefix_caching"] = true.into();
+    rank["prefix_match_unit"] = block.into();
+    rank["vllm_version"] = version.into();
+    rank["max_model_len"] = max_model_len.into();
+    rank["max_num_batched_tokens"] = budget.into();
+    rank["max_num_seqs"] = 2.into();
+    rank["block_size"] = block.into();
+    rank["kv_cache_capacity_bytes"] = (pages * 64).into();
+    let mut groups = vec![
+        serde_json::json!({"name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":block, "page_size_bytes":64, "prefix_cacheable":true}),
+    ];
+    if ring {
+        groups.push(serde_json::json!({"name":"ring", "kind":"state", "num_layers":1, "block_size_tokens":4, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":false}));
+    }
+    for index in 0..states {
+        let mut state = serde_json::json!({"name": format!("state_{index}"), "kind":"state", "num_layers":1, "block_size_tokens":block, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":true});
+        if version != "0.31.0" {
+            state["prefill_checkpoint_blocks"] = 0.into();
+        }
+        groups.push(state);
+    }
+    rank["kv_cache_groups"] = serde_json::Value::Array(groups);
+    spec
+}
+
+#[test]
+fn grouped_prefix_request_preempted_after_output_tokens_resumes_on_its_own_blocks() {
+    // Blocks of 4 tokens, four state groups and no ring, max_model_len 44:
+    // vLLM's startup count is cdiv(44, 4) = 11 attention blocks and 2 blocks
+    // in each state group, 19 (v0.31 kv_cache_interface.py:1083-1094, v0.32
+    // :1076-1082, v0.33 :1135-1141). A prompt of 38 tokens with 5 output
+    // tokens arrives at 0 ms, and a prompt of 4 tokens at 26 ms, during its
+    // prefill. With async scheduling a block goes only on the processed
+    // count (v0.31 kv_cache_manager.py:549-556, v0.32 :552-559, v0.33
+    // :561-568), so a step of the long request after its first chunk needs
+    // the hit block, the block before it and a new block in each state
+    // group. In pools of 19 to 22 blocks the long request is preempted after
+    // it has output tokens past the block that ends at 36, its replay
+    // boundary. The block that ends at 40 holds prompt and output tokens.
+    // vLLM hashes output tokens (v0.31, v0.32 and v0.33 request.py:272-288)
+    // and caches that block when a step fills it (v0.31
+    // kv_cache_manager.py:608-612, v0.32 :612-616, v0.33 :621-625). So a
+    // resumed life has a junction at 40 (v0.31 and v0.32
+    // kv_cache_manager.py:312-318, v0.33 :319-325), keeps each state there,
+    // and the life after it hits 40. Run on its own scheduler code at v0.31.0
+    // and v0.33.0, vLLM completes every two-request run of larger blocks
+    // that reaches this state. No run of vLLM's scheduler exists for this
+    // small shape, so the test asserts only that both requests complete,
+    // well before the cap of 10 s of simulated time, and not how often the
+    // long request is preempted.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        for pages in 19..=22 {
+            let mut long = request("long", 0.0, 38, 5);
+            long.input_token_ids = Some((1_000_000..1_000_038).collect());
+            let mut short = request("short", 26.0, 4, 1);
+            short.input_token_ids = Some((2_000_000..2_000_004).collect());
+            let mut spec =
+                aggregated_state_spec(vec![long, short], version, 4, 4, false, 44, 5, pages);
+            spec.max_sim_time_ms = Some(10_000.0);
+            let report = run_within_60_s(spec);
+            assert_eq!(
+                report.request_counts.completed_requests, 2,
+                "{version} pool {pages}"
+            );
+        }
+    }
+}
+
+#[test]
+fn grouped_prefix_request_preempted_after_output_tokens_is_preempted_as_often_as_in_vllm() {
+    // GLM-shaped groups of 2,176-token blocks with the hash block 2,176, a
+    // 4-token ring and four state groups, max_model_len 26,112: vLLM's
+    // startup count is 12 + 1 + 4 x 2 = 21 blocks, and the pool has 29. A
+    // has 2,162 prompt tokens and 60 output tokens at 0 ms, L has 21,758
+    // prompt tokens and 30 output tokens at 13 ms, after the third pass.
+    // vLLM's scheduler, run on its own code at v0.31.0 and v0.33.0 with this
+    // layout and L added before its fourth engine step, preempts L three
+    // times and A never, and both complete:
+    // - L's prefill ends while A decodes. When A's step from 2,176 to 2,177
+    //   tokens needs a new attention block and a new block in each state
+    //   group, 5 blocks, and 4 are free, vLLM preempts L, the last running
+    //   request (v0.31 sched:765-771, v0.32 :796-802, v0.33 :932-938). The
+    //   token of L's step in flight is still delivered, so L has 2 output
+    //   tokens (v0.31 sched:1563-1566, v0.32 :1596-1599, v0.33
+    //   :1825-1828).
+    // - Life 2 hits 19,584 tokens, the states at that block end, and
+    //   computes up to 21,760. Its step to 21,761 needs 5 blocks and finds
+    //   3, so L preempts itself with 3 output tokens.
+    // - Life 3 has the same hit, and the junction 21,760: the block that ends
+    //   there holds 2 output tokens and has its key (v0.31, v0.32 and v0.33
+    //   request.py:272-288). Its chunk stops at the junction, and each state
+    //   group keeps its state there (v0.31 and v0.32 single:506-531, v0.33
+    //   single:508-535). It preempts itself as life 2 did.
+    // - Life 4 hits 21,760 tokens and decodes to the end.
+    for version in ["0.31.0", "0.33.0"] {
+        let mut a = request("a", 0.0, 2162, 60);
+        a.input_token_ids = Some((1_000_000..1_002_162).collect());
+        let mut l = request("l", 13.0, 21_758, 30);
+        l.input_token_ids = Some((2_000_000..2_021_758).collect());
+        let spec = aggregated_state_spec(vec![a, l], version, 2176, 4, true, 26_112, 2720, 29);
+        let report = run_within_60_s(spec);
+        assert_eq!(report.request_counts.completed_requests, 2, "{version}");
+        assert_eq!(
+            [record(&report, "a"), record(&report, "l")].map(|record| record.readmission_count),
+            [0, 3],
+            "{version}"
+        );
+    }
+}
+
 #[test]
 fn grouped_prefill_rank_holds_its_source_and_reports_block_unit_timing() {
     // Both roles pass the configuration gate, so the replay runs. The prefill
@@ -1579,6 +1705,11 @@ fn grouped_decode_rank_waits_for_an_event_after_a_repeated_self_preemption() {
     // h90 its last 50 bytes by 170 ms. h90 activates when the decode pass
     // that runs at 170 ms ends, at 171 ms.
     //
+    // The full-attention group is not prefix-cacheable, so no block of h14
+    // gets a key. With a prefix-cacheable group the turn below does not
+    // repeat: see
+    // `grouped_decode_rank_waits_for_blocks_when_a_preempted_request_hits_its_own_blocks`.
+    //
     // h14 holds 2 blocks and the loads in flight hold 14, so 1 block is
     // free. h14 emits outputs at 47, 49 and 51 ms. Token 17 then needs an
     // attention block and a new state block. The pass at 51 ms is formed
@@ -1606,6 +1737,7 @@ fn grouped_decode_rank_waits_for_an_event_after_a_repeated_self_preemption() {
         })
         .collect();
     let mut spec = small_grouped_pd_spec(requests, 17, Some(128));
+    spec.engine["rank"]["kv_cache_groups"][0]["prefix_cacheable"] = false.into();
     spec.engine["rank"]["kv_transfer_bandwidth"] = 1e-5.into();
     let report = run_within_60_s(spec);
     assert_eq!(report.request_counts.completed_requests, 3);
@@ -1633,6 +1765,76 @@ fn grouped_decode_rank_waits_for_an_event_after_a_repeated_self_preemption() {
     assert_eq!(h90.decode_admit_ms, Some(171.0));
 }
 
+#[test]
+fn grouped_decode_rank_waits_for_blocks_when_a_preempted_request_hits_its_own_blocks() {
+    // The script of
+    // `grouped_decode_rank_waits_for_an_event_after_a_repeated_self_preemption`
+    // with a prefix-cacheable full-attention group. The prefill rank and the
+    // transfers are the same: h14 activates at 45 ms, h84 at 165 ms and h90
+    // at 171 ms.
+    //
+    // h14 holds 2 blocks and the loads in flight hold 14, so 1 block is
+    // free. h14 emits outputs at 47, 49 and 51 ms. The pass at 49 ms
+    // computes token 16. The 14 prompt tokens and 2 output tokens fill the
+    // attention block, which gets its key. Token 17 then needs an attention
+    // block and a new state block. The pass at 51 ms is formed behind the
+    // pass that ran h14, so it stops h14, and the next pass at 51 ms, with
+    // no pass in flight, preempts it. Its attention block stays cached. Its
+    // readmission finds that block and no state, so it hits nothing and has
+    // a junction at 16 tokens (v0.31 and v0.32
+    // `vllm/v1/core/kv_cache_manager.py:312-321`, v0.33 `:319-328`). Its 17
+    // tokens need 3 blocks and find 3. Its 16-token chunk takes 2 at 0 ms,
+    // as a decode rank prices no prefill, and keeps the state at the
+    // junction. The pass behind that chunk stops h14 again, and the pass
+    // after it preempts it. The pool then has 3 cached blocks with 2 visible
+    // keys, and it had 1 cached block with 1 key after the first
+    // preemption, so the turn does not repeat. The next readmission hits 16
+    // tokens. vLLM counts a hit block that no request holds against the
+    // free blocks (v0.31
+    // `vllm/v1/core/single_type_kv_cache_manager.py:261-268`, `:1813-1816`,
+    // v0.32 `:258-265`, `:1775-1778`, v0.33 `:259-266`, `:1792-1795`). So the
+    // 17 tokens need a new block and the hit block in each group, 4 blocks,
+    // and 3 are free: h14 waits for blocks. h84 ends 8 passes after its
+    // activation, at 181 ms, and h90 at 187 ms. The blocks of h84 are free
+    // after the pass at 181 ms is formed, so the pass at 183 ms readmits h14
+    // with its 16 cached tokens, and h14 emits its last five outputs from
+    // 185 to 193 ms.
+    let requests = [84u32, 90, 14]
+        .iter()
+        .enumerate()
+        .map(|(i, &prompt)| {
+            let mut request = request(&format!("h{prompt}"), 0.0, prompt as usize, 8);
+            let first = 10_000 * (i as u32 + 1);
+            request.input_token_ids = Some((first..first + prompt).collect());
+            request
+        })
+        .collect();
+    let mut spec = small_grouped_pd_spec(requests, 17, Some(128));
+    spec.engine["rank"]["kv_transfer_bandwidth"] = 1e-5.into();
+    let report = run_within_60_s(spec);
+    assert_eq!(report.request_counts.completed_requests, 3);
+    let (h84, h90, h14) = (
+        record(&report, "h84"),
+        record(&report, "h90"),
+        record(&report, "h14"),
+    );
+    assert_eq!(
+        [h14, h84, h90].map(|record| record.destination_activated_ms),
+        [Some(45.0), Some(165.0), Some(171.0)]
+    );
+    // One readmission at 51 ms with no hit, then the wait for blocks until
+    // the pass at 183 ms: 2 readmissions, 183 + 5 passes of 2 ms, and the
+    // last admission hits the 16 cached tokens.
+    assert_eq!(decode_admissions(h14), [45.0, 51.0, 183.0]);
+    assert_eq!((h14.terminal_time_ms, h14.readmission_count), (193.0, 2));
+    assert_eq!(h14.decode_reused_input_tokens, Some(16));
+    assert_eq!(
+        [h84, h90].map(|record| (record.terminal_time_ms, record.readmission_count)),
+        [(181.0, 0), (187.0, 1)]
+    );
+    assert_eq!(h90.decode_admit_ms, Some(171.0));
+}
+
 /// Distinct prompts of the given (prompt, output, arrival) shapes, with the
 /// token IDs of request i starting at 1,000 * (i + 1).
 fn distinct_requests(shapes: &[(usize, usize, f64)]) -> Vec<ReplayRequest> {
@@ -1649,21 +1851,22 @@ fn distinct_requests(shapes: &[(usize, usize, f64)]) -> Vec<ReplayRequest> {
 }
 
 #[test]
-fn grouped_decode_rank_waits_when_a_turn_evicts_and_publishes_the_same_key() {
+fn grouped_decode_rank_waits_when_a_turn_leaves_the_pool_as_it_was() {
     // Three distinct prompts of 31, 30 and 34 tokens with 40, 31 and 20
     // outputs, arriving at 0, 3 and 6 ms, on pools of 13 pages in block mode,
     // with a 32-token budget, 0.5 ms decode passes and handoffs at
-    // 3e-7 GB/s. At 2,992 ms q0 has computed 64 of its 65 tokens and needs 2
-    // more blocks, while two loads in flight hold 7. It preempts itself and
-    // recomputes its tokens in 0 ms chunks with no hit. Each turn publishes
-    // one key and loses one, so q0 preempts itself again with 7 blocks in
-    // use, 1 cached block and the same visible key, while a count of
-    // publications grows by one per turn. q0 waits for the next event, and
-    // the three requests complete in both timing modes.
+    // 3e-7 GB/s. The full-attention group is not prefix-cacheable, so no
+    // block of q0 gets a key. At 2,992 ms q0 has computed 64 of its 65
+    // tokens and needs 2 more blocks, while two loads in flight hold 7. It
+    // preempts itself and recomputes its tokens in 0 ms chunks with no hit.
+    // The turn publishes no key, so q0 preempts itself again with 7 blocks
+    // in use and no cached block. q0 waits for the next event, and the
+    // three requests complete in both timing modes.
     for timing_mode in ["full_prompt", "destination_missing"] {
         let requests = distinct_requests(&[(31, 40, 0.0), (30, 31, 3.0), (34, 20, 6.0)]);
         let mut spec = small_grouped_pd_spec(requests, 13, Some(128));
         let rank = &mut spec.engine["rank"];
+        rank["kv_cache_groups"][0]["prefix_cacheable"] = false.into();
         rank["kv_transfer_bandwidth"] = 3e-7.into();
         rank["timing_model"] =
             serde_json::json!({"type": "fixed", "prefill_ms": 10.0, "decode_ms": 0.5});
@@ -1679,12 +1882,19 @@ fn grouped_decode_rank_readmits_a_request_whose_pool_lost_a_visible_key() {
     // Four distinct GLM-5.3-Flash prompts of 2,178, 6,000, 1,000 and 4,354
     // tokens, with decode prefix caching on 16 decode pages, a 128-page
     // prefill pool, a 2,176-token budget, handoffs at 0.01 GB/s and 5 ms
-    // decode passes. When g0 ends, g3 is readmitted and preempts itself three
-    // times at that time, always with 6 blocks in use. The second and the
-    // third time also have 5 cached blocks each, but one of the 3 visible
-    // keys left the pool between them. So g3 makes a fourth turn, as vLLM
-    // does, and that turn caches 4 more blocks. When g2 ends, the
-    // readmission of g3 then hits 2,176 tokens.
+    // decode passes. The second attention block of g0 holds 2 prompt tokens
+    // and 2,174 output tokens. It has its key and stays cached when g0 ends.
+    // Then g3 is readmitted and preempts itself three times at that time,
+    // always with 6 blocks in use. The first and the second time also have 5
+    // cached blocks each, but one of the 4 visible keys left the pool
+    // between them: the second turn takes the oldest cached block, the last
+    // copy of the key of g3 at 4,352 tokens. So g3 makes a third turn, as
+    // vLLM does. That turn has its junction at 2,176 tokens and caches 4
+    // more blocks, the states at the junction. The 4,412 tokens of g3 then
+    // hit 2,176 tokens. They need 2 new attention blocks and the hit block,
+    // the ring block, and a new block and the hit block in each of the 4
+    // state groups: 12 blocks, and 10 are free. So g3 waits. When g2 ends,
+    // the readmission of g3 hits 2,176 tokens.
     let requests = [
         (2178, 2500, 126.0),
         (6000, 50, 8.0),
@@ -1724,12 +1934,13 @@ fn grouped_decode_rank_readmits_a_request_whose_pool_lost_a_visible_key() {
         record(&report, "g3"),
     );
     let admissions = decode_admissions(g3);
+    // The three turns above.
     assert_eq!(
         admissions
             .iter()
             .filter(|&&at| at == g0.terminal_time_ms)
             .count(),
-        4
+        3
     );
     assert_eq!(admissions.last(), Some(&g2.terminal_time_ms));
     assert_eq!(g3.decode_reused_input_tokens, Some(2176));
@@ -1739,16 +1950,17 @@ fn grouped_decode_rank_readmits_a_request_whose_pool_lost_a_visible_key() {
 fn grouped_decode_rank_readmits_a_request_that_made_progress_at_one_time() {
     // Five distinct prompts on a decode pool of 14 pages in block mode, with
     // decode passes priced at 0 ms, a 32-token budget, a 160-page prefill
-    // pool and handoffs at 3e-6 GB/s. q1 and q2 activate at 283.33 ms, and
-    // every step at that time costs 0 ms. After 2 outputs the next token of
-    // q2 does not fit. The pass in flight ran q2, so that pass stops it, and
-    // the pass after it preempts it, with 11 blocks in use and no cached
-    // block. Readmitted, it emits 13 more outputs before q1 preempts it, and
-    // after its next readmission it preempts itself again after 15 outputs,
-    // with the same pool. It made progress in between, so it is readmitted.
-    // Only its third self-preemption repeats the second, and q2 waits until
-    // q1 ends at the same time. So q2 has 4 readmissions, all at its
-    // activation time.
+    // pool and handoffs at 3e-6 GB/s. The full-attention group is not
+    // prefix-cacheable, so no block of q2 gets a key and a turn can repeat.
+    // q1 and q2 activate at 283.33 ms, and every step at that time costs 0
+    // ms. After 2 outputs the next token of q2 does not fit. The pass in
+    // flight ran q2, so that pass stops it, and the pass after it preempts
+    // it, with 11 blocks in use and no cached block. Readmitted, it emits 13
+    // more outputs before q1 preempts it, and after its next readmission it
+    // preempts itself again after 15 outputs, with the same pool. It made
+    // progress in between, so it is readmitted. Only its third
+    // self-preemption repeats the second, and q2 waits until q1 ends at the
+    // same time. So q2 has 4 readmissions, all at its activation time.
     let requests = distinct_requests(&[
         (14, 33, 0.0),
         (15, 40, 3.0),
@@ -1758,6 +1970,7 @@ fn grouped_decode_rank_readmits_a_request_that_made_progress_at_one_time() {
     ]);
     let mut spec = small_grouped_pd_spec(requests, 14, Some(96));
     let rank = &mut spec.engine["rank"];
+    rank["kv_cache_groups"][0]["prefix_cacheable"] = false.into();
     rank["kv_transfer_bandwidth"] = 3e-6.into();
     rank["timing_model"] =
         serde_json::json!({"type": "fixed", "prefill_ms": 10.0, "decode_ms": 0.0});

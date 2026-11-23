@@ -36,7 +36,8 @@ use crate::engine::cache::vllm_block_pool::{
 };
 pub(crate) use crate::engine::cache::vllm_block_pool::{SourceReleaseOrder, SourceReuseDependency};
 use crate::engine::common::hashing::{
-    BlockHash, SequenceHash, block_hashes, compute_next_sequence_hash,
+    BlockHash, SequenceHash, XXH3_SEED, block_hashes, compute_block_hash_for_tokens,
+    compute_next_sequence_hash,
 };
 use crate::engine::common::kv_cache_trace;
 use crate::engine::common::protocols::{KvEventPublishers, PrefillCost, SchedulingPolicy};
@@ -307,7 +308,14 @@ pub(crate) struct BlockRequestLease {
     /// Anonymous request-owned slots, retained across draft rejection.
     opaque_copies: Vec<BlockCopyId>,
     prefix_hashes: Option<(usize, Vec<SequenceHash>)>,
-    /// The prompt length behind `prefix_hashes`.
+    /// The tokens after the last hash boundary, fewer than the hash unit, on
+    /// a rank with a grouped prefix cache. Each output token joins them, and
+    /// a full unit becomes the next prefix hash, as vLLM extends the block
+    /// hashes of a request with every output token that it appends (v0.31,
+    /// v0.32 and v0.33 `vllm/v1/request.py:272-288`). `None` on every other
+    /// rank, where the prefix hashes cover the prompt only.
+    hash_tail: Option<Vec<u32>>,
+    /// The length of the prompt that `configure_prefix_hashes` hashed.
     prompt_tokens: usize,
     /// Present only while newly acquired capacity awaits a scheduler-installed
     /// write fence. The default path does not allocate this state.
@@ -352,6 +360,7 @@ impl BlockRequestLease {
             allocated_tokens: 0,
             opaque_copies: Vec::new(),
             prefix_hashes: None,
+            hash_tail: None,
             prompt_tokens: 0,
             pending_capacity_writes: None,
             grouped: None,
@@ -430,6 +439,36 @@ impl BlockRequestLease {
         }
     }
 
+    /// Hash the output tokens of the request too, for a grouped prefix cache.
+    /// `tokens` is the prompt of `configure_prefix_hashes`: its tokens after
+    /// the last hash boundary start the next hash unit.
+    pub(crate) fn hash_output_tokens(&mut self, tokens: &[u32]) {
+        let (unit, _) = self
+            .prefix_hashes
+            .as_ref()
+            .expect("the prefix hashes are configured first");
+        self.hash_tail = Some(tokens[tokens.len() - tokens.len() % unit..].to_vec());
+    }
+
+    /// Add one output token to the hashed tokens. A full hash unit gets the
+    /// hash that `configure_prefix_hashes` gives a prompt with the same
+    /// tokens.
+    pub(crate) fn push_output_token(&mut self, token: u32) {
+        let (Some(tail), Some((unit, hashes))) = (&mut self.hash_tail, &mut self.prefix_hashes)
+        else {
+            return;
+        };
+        tail.push(token);
+        if tail.len() == *unit {
+            let local = compute_block_hash_for_tokens(tail, XXH3_SEED);
+            let hash = hashes
+                .last()
+                .map_or(local, |&parent| compute_next_sequence_hash(parent, local));
+            hashes.push(hash);
+            tail.clear();
+        }
+    }
+
     fn state_hash(&self, tokens: usize, block_size: usize) -> Option<SequenceHash> {
         if self.prefix_hashes.is_some() {
             return self.prefix_hash_at(tokens);
@@ -442,8 +481,8 @@ impl BlockRequestLease {
     }
 
     /// The chained hash of the first `tokens` tokens, for a positive multiple
-    /// of the prefix hash unit. `None` otherwise, and without configured
-    /// prefix hashes.
+    /// of the prefix hash unit. `None` otherwise, past the hashed tokens, and
+    /// without configured prefix hashes.
     pub(crate) fn prefix_hash_at(&self, tokens: usize) -> Option<SequenceHash> {
         let (unit, hashes) = self.prefix_hashes.as_ref()?;
         if !tokens.is_multiple_of(*unit) {

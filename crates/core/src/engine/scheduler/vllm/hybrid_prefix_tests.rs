@@ -331,3 +331,34 @@ fn linear_state_cache_holds_a_checkpoint_copy_for_one_step_in_both_scheduling_mo
         );
     }
 }
+
+#[test]
+fn resumed_request_keeps_no_state_at_a_junction_inside_its_output_tokens() {
+    // The prefix hashes of a linear state cache cover the prompt only, so a
+    // state past the prompt has no key. A request of 6 prompt tokens keeps
+    // its state at 4, the last full block before its final prompt token. It
+    // is preempted with 13 computed tokens, and its three full attention
+    // blocks stay cached. Its readmission hits the state at 4 and finds the
+    // junction 12, the end of its cached attention blocks. Its recompute
+    // passes 12 with no key for the state there. So after a second
+    // preemption its readmission hits 4 tokens again.
+    let mut core = VllmCore::new(args(false, true));
+    let id = submit(&mut core, 1, (0..6).collect(), 40);
+    for round in 0..2 {
+        for _ in 0..64 {
+            if core.state.requests[&id].num_computed_tokens >= 13 {
+                break;
+            }
+            step(&mut core);
+        }
+        assert!(core.state.requests[&id].num_computed_tokens >= 13);
+        assert!(core.policy_preempt(0.0).is_some());
+        let pass = step(&mut core);
+        assert_eq!(reused(&pass, id), 4, "readmission {round}");
+        assert_eq!(
+            core.state.requests[&id].sequence.lease.junction(),
+            Some(12),
+            "readmission {round}"
+        );
+    }
+}
