@@ -1295,6 +1295,10 @@ impl VllmCore {
                 handoff_id,
                 mut request,
             } => {
+                anyhow::ensure!(
+                    self.kv_manager.grouped_transfer().is_none() || !request.tokens.is_empty(),
+                    "grouped KV sources require a nonempty prompt"
+                );
                 let uuid = request.uuid.unwrap_or_else(Uuid::new_v4);
                 request.uuid = Some(uuid);
                 self.validate_request_id(uuid)?;
@@ -1304,7 +1308,15 @@ impl VllmCore {
                     // prompt, which the decode rank recomputes (V31
                     // `nixl/base_scheduler.py:409-436`, V32 `:405-435`).
                     let tokens = rules.transfer_tokens(request.tokens.len());
-                    request.tokens.truncate(tokens);
+                    if tokens < request.tokens.len() {
+                        request.tokens.truncate(tokens);
+                        // The source samples once; the decode rank computes
+                        // the backed-off prompt token before generating more.
+                        request.max_output_tokens = request.max_output_tokens.min(1);
+                        if let Some(output_ids) = &mut request.output_token_ids {
+                            output_ids.truncate(1);
+                        }
+                    }
                 }
                 let admissible_from_pass =
                     self.first_pass_admitting_arrival(!allow_destination_admission);

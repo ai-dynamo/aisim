@@ -633,6 +633,96 @@ fn grouped_aggregated_rank_refuses_source_commands() {
 }
 
 #[test]
+fn grouped_prefill_source_truncation_limits_the_output_budget() {
+    for version in ["0.31.0", "0.32.0"] {
+        for planned in [false, true] {
+            // A one-token prompt does not truncate and keeps both outputs.
+            for (prompt, expected_prompt, expected_outputs) in [(2177, 2176, 1), (1, 1, 2)] {
+                let mut core = pd_core(
+                    glm_transfer_groups(version, false),
+                    128 * GLM_PAGE,
+                    8192,
+                    WorkerType::Prefill,
+                    Some(1.0),
+                );
+                let handoff_id = HandoffId::new(Uuid::from_u128(1630));
+                core.apply_command(SchedulerCommand::SubmitHandoffPrefill {
+                    handoff_id,
+                    request: DirectRequest {
+                        max_output_tokens: 2,
+                        output_token_ids: planned.then(|| vec![90_000, 90_001]),
+                        ..source_request(1629, prompt)
+                    },
+                })
+                .unwrap();
+                let request = &core.state.requests[&Uuid::from_u128(1629)];
+                assert_eq!(request.sequence.num_input_tokens(), expected_prompt);
+                assert_eq!(request.sequence.max_output_tokens(), expected_outputs);
+                let first = core.try_execute_hidden_pass(0.0).unwrap();
+                assert_eq!(
+                    first
+                        .lifecycle_events
+                        .iter()
+                        .any(|event| matches!(event, SchedulerLifecycleEvent::SourceHeld { .. })),
+                    expected_outputs == 1,
+                    "{version} planned={planned} prompt={prompt}"
+                );
+                if expected_outputs > 1 {
+                    held_timing(&mut core);
+                }
+                core.apply_command(SchedulerCommand::ReleaseSource { handoff_id })
+                    .unwrap();
+                assert!(core.is_drained());
+                assert_eq!(core.kv_manager.grouped().unwrap().active_blocks(), 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn grouped_prefill_source_rejects_an_empty_prompt_before_registering_the_hold() {
+    for version in ["0.31.0", "0.32.0"] {
+        let mut core = pd_core(
+            glm_transfer_groups(version, false),
+            128 * GLM_PAGE,
+            8192,
+            WorkerType::Prefill,
+            Some(1.0),
+        );
+        let handoff_id = HandoffId::new(Uuid::from_u128(1632));
+        let error = core
+            .apply_command(SchedulerCommand::SubmitHandoffPrefill {
+                handoff_id,
+                request: DirectRequest {
+                    max_output_tokens: 0,
+                    ..source_request(1631, 0)
+                },
+            })
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "grouped KV sources require a nonempty prompt"
+        );
+        assert!(core.is_drained());
+        assert!(
+            core.try_execute_hidden_pass(0.0)
+                .unwrap()
+                .lifecycle_events
+                .is_empty()
+        );
+        assert_eq!(core.kv_manager.grouped().unwrap().active_blocks(), 0);
+        // The rejected command must leave both IDs available, and a single
+        // token still creates a valid source without backoff.
+        let timing = hold_grouped_source(&mut core, handoff_id, 1631, 1);
+        assert_eq!(timing.full_prompt_tokens, 1);
+        assert!(timing.state_bytes > 0);
+        core.apply_command(SchedulerCommand::ReleaseSource { handoff_id })
+            .unwrap();
+        assert!(core.is_drained());
+    }
+}
+
+#[test]
 fn grouped_prefill_source_keeps_only_the_blocks_inside_its_window() {
     // A prompt of 1,024 tokens in one chunk, with a window of 32 tokens and
     // blocks of 16. The forward keeps the 64 blocks that its first query
@@ -968,7 +1058,75 @@ fn grouped_prefill_source_takes_no_copy_of_a_state_published_at_its_end() {
         args.worker_type = WorkerType::Prefill;
         args.kv_transfer_bandwidth = Some(1.0);
         let mut core = VllmCore::new(args);
-        hold_grouped_source(&mut core, HandoffId::new(Uuid::from_u128(1_871)), 1_870, 49);
+        let handoff_id = HandoffId::new(Uuid::from_u128(1_871));
+        core.apply_command(SchedulerCommand::SubmitHandoffPrefill {
+            handoff_id,
+            request: source_request(1_870, 49),
+        })
+        .unwrap();
+        let first = core.try_execute_hidden_pass(0.0).unwrap();
+        let state_groups: Vec<_> = core
+            .args
+            .kv_cache_groups
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| {
+                group.kind == FpmCacheKind::State && group.prefix_cacheable == Some(true)
+            })
+            .map(|(index, _)| index as u16)
+            .collect();
+        if version == "0.32.0" {
+            assert!(first.lifecycle_events.is_empty(), "{version} case {index}");
+            let tail = 48 - core.args.prefix_match_unit.unwrap();
+            for _ in 0..8 {
+                if core.state.requests[&Uuid::from_u128(1_870)].num_computed_tokens == tail {
+                    break;
+                }
+                let pass = core.try_execute_hidden_pass(0.0).unwrap();
+                assert!(pass.lifecycle_events.is_empty(), "{version} case {index}");
+            }
+            assert_eq!(
+                core.state.requests[&Uuid::from_u128(1_870)].num_computed_tokens,
+                tail
+            );
+            let mut lease = BlockRequestLease::new(Uuid::nil(), Vec::new());
+            lease.configure_prefix_hashes(
+                &(0..48).collect::<Vec<u32>>(),
+                core.args.prefix_match_unit.unwrap(),
+            );
+            let hash = lease.prefix_hash_at(tail).unwrap();
+            for &group in &state_groups {
+                assert!(block_pool(&core).key_hit(group, hash).unwrap().is_active);
+            }
+            block_pool(&core).reset_peak_active_blocks();
+            held_timing(&mut core);
+            // The final chunk needs a new writable block in every state
+            // group while the published blocks are still active. This peak
+            // observes allocation before completion trims the old blocks.
+            assert_eq!(
+                block_pool(&core).peak_active_blocks(),
+                held + state_groups.len(),
+                "{version} case {index}"
+            );
+            for &group in &state_groups {
+                assert!(!block_pool(&core).key_hit(group, hash).unwrap().is_active);
+            }
+        } else if index < 2 {
+            assert!(
+                first
+                    .lifecycle_events
+                    .iter()
+                    .any(|event| matches!(event, SchedulerLifecycleEvent::SourceHeld { .. })),
+                "{version} case {index}"
+            );
+            assert_eq!(
+                block_pool(&core).peak_active_blocks(),
+                held,
+                "{version} case {index}"
+            );
+        } else {
+            held_timing(&mut core);
+        }
         assert_eq!(
             block_pool(&core).active_blocks(),
             held,
@@ -1115,9 +1273,7 @@ fn grouped_prefill_source_released_before_its_deferred_free_frees_every_block_on
             assert_eq!(blocks_besides(&core, x), 0, "{label}");
             async_step(&mut core, &mut now);
             assert_eq!(blocks_besides(&core, x), 0, "{label}");
-            while !core.is_drained() {
-                async_step(&mut core, &mut now);
-            }
+            drain_async(&mut core, &mut now, &label);
             assert_eq!(
                 core.kv_manager.grouped().unwrap().active_blocks(),
                 0,
@@ -1303,9 +1459,7 @@ fn grouped_prefill_rank_frees_the_boundary_hit_block_of_an_ending_request_with_i
             let mut now = 0.0;
             let rp: Vec<u32> = (44_000_000..44_004_400).collect();
             submit_tokens(&mut core, 1, rp.clone(), 1);
-            while !core.is_drained() {
-                async_step(&mut core, &mut now);
-            }
+            drain_async(&mut core, &mut now, &label);
             submit_tokens(&mut core, 2, (45_000_000..45_000_100).collect(), 8);
             let mut tokens = rp;
             tokens.extend(44_100_000..44_100_300);
@@ -2273,13 +2427,7 @@ fn pool_run(mut core: VllmCore, producer: u32, hit: usize) -> (usize, usize, Vec
     let mut now = 0.0;
     let rp: Vec<u32> = (44_000_000..44_000_000 + producer).collect();
     submit_tokens(&mut core, 1, rp.clone(), 4);
-    for _ in 0..50 {
-        if core.is_drained() {
-            break;
-        }
-        async_step(&mut core, &mut now);
-    }
-    assert!(core.is_drained());
+    drain_async(&mut core, &mut now, "pool producer");
     let mut rc_tokens = rp;
     rc_tokens.extend(44_100_000..44_100_300);
     let rc = submit_tokens(&mut core, 2, rc_tokens, 4);
@@ -2578,6 +2726,20 @@ fn async_step(core: &mut VllmCore, now_ms: &mut f64) -> crate::engine::scheduler
     core.complete_engine_boundary(result.end_ms);
     *now_ms = result.end_ms;
     result
+}
+
+fn drain_async(core: &mut VllmCore, now_ms: &mut f64, label: &str) {
+    for _ in 0..50 {
+        if core.is_drained() {
+            return;
+        }
+        async_step(core, now_ms);
+    }
+    assert!(
+        core.is_drained(),
+        "{label}: drain exceeded 50 passes; {} active blocks",
+        core.kv_manager.grouped().unwrap().active_blocks()
+    );
 }
 
 #[test]
