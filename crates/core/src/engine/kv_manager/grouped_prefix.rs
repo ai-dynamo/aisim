@@ -1397,8 +1397,13 @@ impl GroupedPrefixCoordinator {
                     // v0.33 :1884-1917).
                     // As on the linear path, preserve that immutable copy in
                     // `previous` and take a fresh writable block, even when
-                    // the next write stays inside the same logical block.
-                    let producer_cow = state.running.is_some_and(|id| !pool.is_private(id));
+                    // the next write stays inside the same logical block. A
+                    // release without a next write takes no copy: vLLM copies
+                    // only when it allocates for scheduled tokens, and drops
+                    // the producer when it frees the request (v0.31
+                    // `single:1971-1977`, v0.32 `:1935-1941`).
+                    let producer_cow = target > computed_before
+                        && state.running.is_some_and(|id| !pool.is_private(id));
                     let running =
                         (state.running.is_none() || crossing || producer_cow) && !cow_is_running;
                     let copy = cow && !cow_is_running;
