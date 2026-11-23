@@ -148,10 +148,14 @@ def test_cli_generated_plan_keeps_native_ops_model_scoped(monkeypatch, capsys, m
         assert build_collections(REGISTRY, "sglang", "0.5.21", ops)
 
 
-@pytest.mark.parametrize("ambient", [None, "0", "8192"])
+@pytest.mark.parametrize("ambient", [None, "0", "1", "8192"])
 @pytest.mark.parametrize(
     ("variable", "expected"),
-    [("SGLANG_DSA_FUSE_TOPK", "1"), ("SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD", "2048")],
+    [
+        ("SGLANG_DSA_FUSE_TOPK", "1"),
+        ("SGLANG_DSA_TOPK_BROADCAST", "0"),
+        ("SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD", "2048"),
+    ],
 )
 def test_native_dispatch_setting_is_fixed_for_child_and_standalone(monkeypatch, tmp_path, ambient, variable, expected):
     import collector.sglang.collect_kimi_k31_dsa_v1 as module
@@ -602,7 +606,8 @@ def test_native_exception_kills_launcher_and_tp_children(exception_type, monkeyp
 
 
 @pytest.mark.skipif(os.name != "posix", reason="native SGLang TP workers use POSIX process groups")
-def test_parent_only_sigterm_kills_native_group_and_rolls_back(tmp_path):
+@pytest.mark.parametrize("during_launch", [False, True])
+def test_parent_only_sigterm_kills_native_group_and_rolls_back(tmp_path, during_launch):
     import psutil
 
     output = tmp_path / "dsa_generation_module_perf.txt"
@@ -621,11 +626,14 @@ def test_parent_only_sigterm_kills_native_group_and_rolls_back(tmp_path):
     )
     driver = tmp_path / "collector_driver.py"
     driver.write_text(
-        "import subprocess, sys\n"
+        "import subprocess, sys, time\n"
+        "from pathlib import Path\n"
         "import collector.sglang.collect_kimi_k31_dsa_v1 as module\n"
         "real_popen = subprocess.Popen\n"
         "def launch(_command, **kwargs):\n"
-        f"    return real_popen([sys.executable, '-c', {launcher_code!r}], **kwargs)\n"
+        f"    child = real_popen([sys.executable, '-c', {launcher_code!r}], **kwargs)\n"
+        f"    while {during_launch!r} and not Path({str(tmp_path / 'release')!r}).exists(): time.sleep(0.01)\n"
+        "    return child\n"
         "module.subprocess.Popen = launch\n"
         f"case = module.ModuleCase(4096, 1, 48, 'fp8', 'bfloat16', 'bfloat16', {MODEL!r}, 0)\n"
         f"module.run_kimi_k31_dsa_fullnode(perf_filename={str(output)!r}, cases=[case])\n"
@@ -642,6 +650,7 @@ def test_parent_only_sigterm_kills_native_group_and_rolls_back(tmp_path):
                 time.sleep(0.01)
             # Send only to the collector PID, never its process group.
             os.kill(parent.pid, signal.SIGTERM)
+            (tmp_path / "release").touch()
             _, stderr = parent.communicate(timeout=30)
             assert parent.returncode == 128 + signal.SIGTERM, stderr
             assert output.read_text() == "previous row\n"

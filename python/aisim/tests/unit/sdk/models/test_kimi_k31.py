@@ -176,18 +176,24 @@ def test_k31_silicon_task_requires_selected_physical_lane(
 def test_fpm_cell_precision_is_independent_of_context_op_precision(tmp_path, k31_config, monkeypatch):
     from aisim.sdk.task_v2 import Task
 
+    k31_config["quantization_config"] = {"quant_method": "fp8"}
+    k31_config["quant_algo"] = "fp8"
+    db = SimpleNamespace(
+        supported_quant_mode={"dsa_context_module": ["bfloat16"], "dsa_generation_module": ["bfloat16"]},
+    )
+    monkeypatch.setattr(Task, "_try_load_role_database", lambda self, role: db)
+    monkeypatch.setattr(Task, "_context_fmha_supported_modes", lambda *args: {"bfloat16"})
     task = Task(
         model_path=_write_checkpoint(tmp_path, k31_config),
         system_name="b300_sxm",
         backend_name="sglang",
         database_mode="SILICON",
         attention_backend="flashmla",
-        fmha_quant_mode=common.FMHAQuantMode.fp8,
+        kvcache_quant_mode=common.KVCacheQuantMode.fp8,
         forward_model="fpm",
     )
-    db = SimpleNamespace(supported_quant_mode={"dsa_context_module": ["bfloat16"]})
-    monkeypatch.setattr(Task, "_try_load_role_database", lambda self, role: db)
-    task._check_role_against_db("agg", validate_context=True, validate_generation=False)
+    assert task.build_model_config(role="agg").fmha_quant_mode == common.FMHAQuantMode.fp8
+    task._check_role_against_db("agg", validate_context=True, validate_generation=True)
 
 
 @pytest.mark.parametrize("backend", ["flashmla", "trtllm_mla", None])

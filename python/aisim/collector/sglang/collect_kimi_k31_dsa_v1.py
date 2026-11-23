@@ -64,6 +64,7 @@ NATIVE_CASE_TIMEOUT_S = 3600
 # attention. Preserve that serving dispatch as well as the fused top-k path.
 NATIVE_ENV = {
     "SGLANG_DSA_FUSE_TOPK": "1",
+    "SGLANG_DSA_TOPK_BROADCAST": "0",
     "SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD": "2048",
 }
 
@@ -220,16 +221,35 @@ def run_kimi_k31_dsa_fullnode(*, perf_filename, limit=None, cases=None):
 
 @contextmanager
 def _native_termination_handler():
-    def terminate(signum, _frame):
-        # SystemExit escapes the per-case Exception handler after the child
-        # group and staged output have been cleaned up.
-        raise SystemExit(128 + signum)
+    process = None
+    cancelled = False
+
+    def kill_group():
+        if process is not None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    def terminate(_signum, _frame):
+        nonlocal cancelled
+        cancelled = True
+        kill_group()
+
+    def own(child):
+        nonlocal process
+        process = child
+        # A signal delivered inside Popen has no PID available yet.
+        if cancelled:
+            kill_group()
 
     previous = signal.signal(signal.SIGTERM, terminate)
     try:
-        yield
+        yield own
     finally:
         signal.signal(signal.SIGTERM, previous)
+        if cancelled:
+            raise SystemExit(128 + signal.SIGTERM)
 
 
 def _run_native_case(case, device, perf_filename):
@@ -249,7 +269,7 @@ def _run_native_case(case, device, perf_filename):
     # CUDA initialization. A clean subprocess owns SGLang's spawned TP ranks.
     try:
         with (
-            _native_termination_handler(),
+            _native_termination_handler() as own,
             subprocess.Popen(
                 [
                     sys.executable,
@@ -276,6 +296,7 @@ def _run_native_case(case, device, perf_filename):
                 },
             ) as process,
         ):
+            own(process)
             stderr = ""
             try:
                 _, stderr = process.communicate(timeout=NATIVE_CASE_TIMEOUT_S)

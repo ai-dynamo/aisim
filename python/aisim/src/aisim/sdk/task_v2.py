@@ -1106,9 +1106,9 @@ class Task:
         # means the FP8 it runs. A whole-model FPM identity is caller-owned, as in
         # the resolvers (helpers.resolve_trtllm_mla_compute): its fmha_quant_mode
         # names the collected cell, not the kernel precision.
+        if self.forward_model == "fpm":
+            return
         for role in roles:
-            if self.forward_model == "fpm":
-                break
             if role == "decode" or self._role_attr(role, "fmha_quant_mode") != common.FMHAQuantMode.bfloat16:
                 continue
             sm_version = load_system_spec(self._role_attr(role, "system_name")).get("gpu", {}).get("sm_version")
@@ -2409,6 +2409,10 @@ class Task:
                 if isinstance(mode, common.FMHAQuantMode) and getattr(database, "system_spec", None) is not None:
                     common.get_quant_tc_flops(database.system_spec, mode)
                 ops = [op for op in ops if op not in ("dsa_context_module", "dsa_generation_module")]
+            if self.forward_model == "fpm" and self._architecture == "KimiK31ForConditionalGeneration":
+                # The whole-forward profile supplies the timing cell. Keep the
+                # physical KV backend check above, independent of timing coverage.
+                ops = [op for op in ops if op != "dsa_generation_module"]
             informative = [op for op in ops if supported.get(op)]
             if not informative:
                 return
