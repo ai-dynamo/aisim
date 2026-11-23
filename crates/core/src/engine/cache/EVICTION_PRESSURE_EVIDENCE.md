@@ -131,10 +131,22 @@ the native probe. The 1.2 GB execution budget, one-CPU limit, and default
 
 For every CLI sample, require the configured request count, 32 input tokens
 and one output token per request, successful resource-supervisor completion,
-and complete worker termination. Compare the complete prediction JSON after
-removing only `wall_time_ms`, `processed_tokens_per_s`, and
-`processed_output_tokens_per_s` from its summary. Those three fields measure
-host execution cost; all simulated serving results must remain identical.
+and complete worker termination. The retained comparison covers the prediction
+**summary**, excluding `/summary/wall_time_ms`,
+`/summary/processed_tokens_per_s`, and
+`/summary/processed_output_tokens_per_s`. Those three fields measure host
+execution cost; every other retained summary field must remain identical.
+
+The shared canonical replay-record contract, `CANONICAL_RESULT_EXCLUSIONS`,
+also excludes `/planner/html_report_path`. The artifact's
+`canonical_exclusions` records that complete four-path set. No planner section
+is present in these digest inputs: `canonical_results[case]` contains only the
+summary, so the planner-path exclusion has no effect. Each `canonical_sha256`
+is SHA-256 of the UTF-8 bytes of
+`json.dumps(canonical_results[case], sort_keys=True, separators=(",", ":"))`,
+with no trailing newline. All three stored digests reproduce from the retained
+summaries. They establish summary parity, not full canonical-record or complete
+prediction-JSON byte parity; the original full outputs were not retained.
 
 The native `wall_time_ms` interval includes replay setup, execution, and
 collector finalization. It excludes timing-model construction before replay
@@ -209,8 +221,8 @@ against other leaves; there is no new size-dependent scan on that path.
 | pressure_8192 | 206.375 [205.922, 206.449] | 208.691 [208.293, 208.957] |
 
 The [CLI report](eviction-pressure-cli-comparison.json) records all 36 runs,
-full configurations, canonical prediction JSON and hashes, totals, completion,
-and sampled RSS. Every canonical prediction matched across both revisions
+full configurations, filtered prediction summaries and their hashes, totals,
+completion, and sampled RSS. Every retained summary matched across both revisions
 and all repetitions. The 8,192-block case reduces median native time by 88.0%
 and full CLI time by 12.2%. Native replay is 2.1x faster at 1,024 blocks;
 process startup and supervision dominate its full CLI interval, whose ranges

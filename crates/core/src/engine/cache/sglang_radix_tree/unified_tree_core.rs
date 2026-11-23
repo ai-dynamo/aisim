@@ -1340,8 +1340,14 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     ) -> Result<DecLockRefResult, NodeAccessError> {
         let node_idx = self.arena.resolve(node_id)?;
         self.assert_receipt_anchor_(node_idx, params);
+        let was_evictable = self.evictable_device_leaves.contains(node_idx);
         self.release_components_(node_idx, params, /* lock_host = */ true, false);
         self.update_evictable_leaf_sets_(node_idx);
+        if !was_evictable && self.evictable_device_leaves.contains(node_idx) {
+            // The final auxiliary receipt can expose an unbacked Full leaf
+            // after an active eviction walk built its heap.
+            self.full_evict_device_heap_dirty = true;
+        }
         Ok(DecLockRefResult::default())
     }
 
@@ -1790,8 +1796,15 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     /// root first: access tick and LRU refresh, priority floor, hit count, and the
     /// write-through backup trigger, at O(depth) cost. A chunked insert never bumps
     /// hit counts, so it touches only the anchor. Anchor validation still walks
-    /// the retained path. Use chunked inserts for per-step growth and finish
-    /// the request with a non-chunked insert. The
+    /// the retained path and compares all P retained key atoms: O(P + depth)
+    /// per call, including chunked calls. N one-page appends through this API
+    /// therefore perform O(N^2) validation work, bounded by the caller's maximum
+    /// retained sequence length (there is no independent bound in this core).
+    /// AISimulate bounds it by the configured request context and physical KV
+    /// capacity; its exclusive lease-growth path uses `RadixCache::append_locked_leaf`
+    /// with a lease-bound suffix instead. Shared/overlapping growth falls back
+    /// here. Use chunked inserts to avoid replaying prefix hit counts, then
+    /// finish with a non-chunked insert when those updates are needed. The
     /// component overlap hooks (SWA tombstone recovery, duplicate-slot release)
     /// are never replayed because they need the prefix KV, which this API does
     /// not receive.
@@ -2061,7 +2074,8 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     /// bumps its hit count, which is where write-through backups originate. A
     /// non-chunked continuation replays that root first so LRU, LFU/SLRU, and
     /// write-through behavior match a root insert. Chunked inserts never bump hit
-    /// counts, so they touch only the anchor and stay O(1).
+    /// counts, so this replay helper touches only the anchor in O(1). The caller
+    /// has already paid O(retained key atoms + depth) for anchor validation.
     fn visit_retained_prefix_(
         &mut self,
         anchor: NodeIdx_,
@@ -3083,12 +3097,17 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             );
             self.remove_leaf_from_parent_(desc_id);
         }
+        // Use the same Full-only, no-host-copy accounting as evict_device_leaf.
+        // Start after all deferral checks so a rejected drop leaves no tracker.
+        assert!(self.tracked_unbacked_tokens.is_none());
+        self.tracked_unbacked_tokens = Some(0);
         self.delete_unbacked_device_leaf_(
             node_id,
             &mut result.tracker,
             &mut result.device_frees,
             &mut result.host_frees,
         );
+        result.unbacked_tokens = self.tracked_unbacked_tokens.take().unwrap();
         Ok((true, result))
     }
 
@@ -4751,6 +4770,9 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 self.arena.node_mut(idx).load_back_pending_id = None;
                 // The pin blocked leaf-set membership; re-evaluate it.
                 self.update_evictable_leaf_sets_(idx);
+                if self.evictable_device_leaves.contains(idx) {
+                    self.full_evict_device_heap_dirty = true;
+                }
             }
             self.update_full_coexisting_host_tracking_(idx);
             node_id = self.arena.node(idx).try_parent();

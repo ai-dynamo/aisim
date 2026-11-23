@@ -418,12 +418,20 @@ impl EvictionIndex {
 struct BeladyPages {
     oracle: BeladyOracle,
     page_hashes: Vec<Option<SequenceHash>>,
-    /// Tail page -> (core split tick, pre-split recency). A real core access
-    /// changes the tick and supersedes the correction. Physical frees remove it.
-    retained_recency: HashMap<KvPageId, (i64, i64)>,
+    /// Tail page -> pre-split recency. Structural splits never access this page.
+    /// Actual matches/inserts supersede it; physical frees remove it.
+    retained_recency: HashMap<KvPageId, i64>,
 }
 
 impl BeladyPages {
+    fn record_access(&mut self, pages: &[KvPageId]) {
+        if !self.retained_recency.is_empty() {
+            for page in pages {
+                self.retained_recency.remove(page);
+            }
+        }
+    }
+
     fn priority(
         &self,
         candidate: sglang_radix_tree::FullDeviceEvictionCandidate<'_, CacheValue>,
@@ -433,8 +441,8 @@ impl BeladyPages {
         let access = self
             .retained_recency
             .get(page)
-            .filter(|(tick, _)| *tick == candidate.last_access_counter)
-            .map_or(candidate.last_access_counter, |(_, access)| *access);
+            .copied()
+            .unwrap_or(candidate.last_access_counter);
         (
             (
                 Reverse(self.oracle.next_use(hash)),
@@ -619,7 +627,7 @@ impl RadixCache {
                         .as_mut()
                         .expect("Belady configured")
                         .retained_recency
-                        .insert(page, (candidate.last_access_counter, access));
+                        .insert(page, access);
                 }
                 // Recompute next use from the retained tail, keeping its recency
                 // only when this operation split the selected compressed leaf.
@@ -722,6 +730,11 @@ impl RadixCache {
             result.cache_actions.is_empty(),
             "Full-only device match unexpectedly produced cache actions"
         );
+        if let Some(belady) = &mut self.belady {
+            // Only returned pages were accessed. An unmatched split suffix
+            // receives a native LRU tick but keeps its Belady correction.
+            belady.record_access(result.device_indices.as_slice());
+        }
         (
             result.device_indices.as_slice().len() * self.page_size,
             result.last_device_node_id,
@@ -742,6 +755,11 @@ impl RadixCache {
             result.cache_actions.is_empty(),
             "Full-only device match unexpectedly produced cache actions"
         );
+        if let Some(belady) = &mut self.belady {
+            // Only returned pages were accessed. An unmatched split suffix
+            // receives a native LRU tick but keeps its Belady correction.
+            belady.record_access(result.device_indices.as_slice());
+        }
         let last_node = result.last_device_node_id;
         let matched_tokens = result.device_indices.as_slice().len() * self.page_size;
         self.inc_lock_ref(last_node);
@@ -798,6 +816,11 @@ impl RadixCache {
             return None;
         }
         assert!(node.has_device_value(FULL));
+        if let Some(belady) = &mut self.belady
+            && let Some(page) = node.device_value(FULL).as_slice().last()
+        {
+            belady.retained_recency.remove(page);
+        }
         // RadixCache constructs only a Full, device-only LRU tree. Reuse its
         // native leaf creation and accounting, with no component/backup hooks.
         self.record_belady_pages(anchor, suffix, pages);
@@ -889,6 +912,28 @@ impl RadixCache {
             page_keys.len() - prefix_pages,
             "SGLang core returned an incomplete canonical suffix"
         );
+        if let Some(belady) = &mut self.belady {
+            // The lease's retained pages are canonical. Chunked continuation
+            // touches only its anchor; completion replays the retained path.
+            if chunked && prefix_pages > 0 {
+                // Corrections belong to a segment's tail; touching only the
+                // anchor invalidates at most that one saved page.
+                let prefix = self.tree.arena.resolve(prefix_node).expect("live prefix");
+                if let Some(page) = self
+                    .tree
+                    .arena
+                    .node(prefix)
+                    .device_value(FULL)
+                    .as_slice()
+                    .last()
+                {
+                    belady.retained_recency.remove(page);
+                }
+            } else {
+                belady.record_access(&pages[..prefix_pages]);
+            }
+            belady.record_access(&canonical_suffix);
+        }
         self.refresh_candidate(prefix_node);
         self.refresh_candidate(last_node);
 
@@ -1101,6 +1146,64 @@ mod tests {
         }
         assert!(cache.belady.as_ref().unwrap().retained_recency.is_empty());
         assert_eq!(cache.available_tokens(), 4);
+    }
+
+    #[rstest::rstest]
+    fn scoped_review_belady_distinguishes_split_from_reached_suffix(
+        #[values(false, true)] reach_suffix: bool,
+        #[values(false, true)] checkpoint: bool,
+        #[values("lookup", "locked_lookup", "insert")] access: &str,
+    ) {
+        let mut cache = RadixCache::new(4, 1);
+        cache.set_belady_oracle(oracle_for_prompts(&[]));
+        let older = cache.page_pool.allocate(3).unwrap();
+        cache.insert(&[1, 2, 3], &older);
+        let newer = cache.page_pool.allocate(1).unwrap();
+        cache.insert(&[9], &newer);
+        assert_eq!(cache.evict(1).1, vec![KvPageId(2)]);
+        if checkpoint {
+            cache = cache.admission_checkpoint();
+        }
+        let key = if reach_suffix { vec![1, 2] } else { vec![1] };
+        let (matched, locked) = if access == "locked_lookup" {
+            let hashes = cache.page_hashes(&key);
+            let (matched, locked, pages) = cache.match_prefix_hashes_and_lock(&hashes);
+            assert_eq!(
+                pages,
+                older[..key.len()]
+                    .iter()
+                    .map(|&p| KvPageId(p))
+                    .collect::<Vec<_>>()
+            );
+            (matched, locked)
+        } else {
+            let (matched, locked) = if access == "insert" {
+                (key.len(), cache.insert(&key, &older[..key.len()]))
+            } else {
+                cache.match_prefix(&key)
+            };
+            cache.inc_lock_ref(locked);
+            (matched, locked)
+        };
+        assert_eq!(matched, key.len());
+        if reach_suffix {
+            // Make A2 eligible: B must win by recency, not merely by A2's lock.
+            cache.dec_lock_ref(locked);
+        }
+        // Reaching only A1 must not make the unmatched A2 newer than B.
+        let expected = if reach_suffix {
+            KvPageId(3)
+        } else {
+            KvPageId(1)
+        };
+        assert_eq!(cache.evict(1).1, vec![expected]);
+        assert_eq!(cache.prefix_match_len(&key), key.len());
+        if !reach_suffix {
+            cache.dec_lock_ref(locked);
+        }
+        cache.evict(4);
+        assert_eq!(cache.available_tokens(), 4);
+        assert!(cache.belady.as_ref().unwrap().retained_recency.is_empty());
     }
 
     #[test]

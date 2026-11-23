@@ -1109,21 +1109,22 @@ fn early_swa_release_honors_skip_and_releases_acquired_mamba() {
     tree.try_sanity_check(&[], &[]).unwrap();
 }
 
-#[test]
-fn continuation_rejects_a_wrong_key_before_side_effects() {
+#[rstest::rstest]
+fn continuation_rejects_a_wrong_key_before_side_effects(#[values(false, true)] chunked: bool) {
     let mut tree = Core::new(CacheInitParams::default(), vec![FULL]);
     let anchor = insert(&mut tree, vec![10, 20], &[1, 2]);
     let tick = tree.inspect_get_node_access_counter(anchor).unwrap();
     let key = vec![30, 40, 50];
-    let p = params(&key, &[3]);
+    let mut p = params(&key, &[3]);
+    p.chunked = chunked;
     assert!(tree.try_insert_suffix_from_node(anchor, 2, &p).is_err());
     assert_eq!(tree.inspect_get_node_access_counter(anchor).unwrap(), tick);
     assert_eq!(tree.evictable_size(), 2);
     assert!(tree.inspect_get_child_node_ids(anchor).unwrap().is_empty());
     let valid_key = vec![10, 20, 50];
-    let result = tree
-        .try_insert_suffix_from_node(anchor, 2, &params(&valid_key, &[3]))
-        .unwrap();
+    let mut valid = params(&valid_key, &[3]);
+    valid.chunked = chunked;
+    let result = tree.try_insert_suffix_from_node(anchor, 2, &valid).unwrap();
     assert_eq!(result.total_len, 3);
     assert_eq!(tree.full_kv_prefix_len(&valid_key, Default::default()), 3);
     assert_eq!(tree.full_kv_prefix_len(&key, Default::default()), 0);
@@ -1832,6 +1833,106 @@ fn scoped_review_suspended_insert_rejects_evicted_and_reused_cursor() {
         let result = tree.try_insert(&params(&key, &[5, 6, 7])).unwrap();
         assert_eq!(result.total_len, 3);
         assert_eq!(tree.full_kv_prefix_len(&key, Default::default()), 3);
+        tree.try_sanity_check(&[], &[]).unwrap();
+    }
+}
+
+#[test]
+fn scoped_review_load_back_ack_refreshes_the_active_full_walk() {
+    let mut tree = Core::new(
+        CacheInitParams {
+            enable_hicache: true,
+            is_write_back: true,
+            ..Default::default()
+        },
+        vec![FULL],
+    );
+    let leaf = insert(&mut tree, vec![10, 20], &[1, 2]);
+    complete_backup(&mut tree, leaf);
+    tree.demote(leaf).unwrap();
+    let (full, auxiliary) = tree.build_load_back_spec(leaf, None).unwrap();
+    tree.commit_load_back(leaf, PageValue::from_vec(vec![3, 4]), full, auxiliary)
+        .unwrap();
+    tree.evict_device_start(FULL, 1);
+    assert_eq!(tree.evict_device_next_node(FULL, &HashMap::new()).0, None);
+    tree.finish_load_back(leaf).unwrap();
+    assert_eq!(
+        tree.evict_device_next_node(FULL, &HashMap::new()).0,
+        Some(leaf)
+    );
+    let (backup, result) = tree.evict_device_leaf(leaf, true).unwrap();
+    assert!(backup.is_none());
+    assert_eq!(result.device_frees[&FULL][0].as_slice(), &[3, 4]);
+    assert_eq!(result.unbacked_tokens, 0);
+    tree.evict_device_end(FULL);
+    tree.try_sanity_check(&[], &[]).unwrap();
+}
+
+#[test]
+fn scoped_review_final_auxiliary_host_receipt_refreshes_the_active_full_walk() {
+    let mut tree = Core::new(
+        CacheInitParams {
+            enable_hicache: true,
+            mamba_cache_chunk_size: Some(1),
+            ..Default::default()
+        },
+        vec![FULL, MAMBA],
+    );
+    let key = vec![10, 20];
+    let mut p = params(&key, &[1, 2]);
+    p.mamba_value = Some(PageValue::from_vec(vec![100]));
+    let leaf = tree.insert(&p).last_device_node_id.unwrap();
+    let first = tree.inc_host_lock_ref(leaf).unwrap();
+    let second = tree.inc_host_lock_ref(leaf).unwrap();
+    tree.evict_device_start(FULL, 1);
+    assert_eq!(tree.evict_device_next_node(FULL, &HashMap::new()).0, None);
+    tree.dec_host_lock_ref(leaf, &first.to_dec_params())
+        .unwrap();
+    assert_eq!(tree.evict_device_next_node(FULL, &HashMap::new()).0, None);
+    tree.dec_host_lock_ref(leaf, &second.to_dec_params())
+        .unwrap();
+    assert_eq!(
+        tree.evict_device_next_node(FULL, &HashMap::new()).0,
+        Some(leaf)
+    );
+    let (_, result) = tree.evict_device_leaf(leaf, false).unwrap();
+    assert_eq!(result.device_frees[&FULL][0].as_slice(), &[1, 2]);
+    assert_eq!(result.unbacked_tokens, 2);
+    tree.evict_device_end(FULL);
+    tree.try_sanity_check(&[], &[]).unwrap();
+}
+
+#[test]
+fn scoped_review_failed_backup_counts_only_unbacked_full_rows() {
+    for backup_succeeds in [false, true] {
+        let mut tree = Core::new(
+            CacheInitParams {
+                enable_hicache: true,
+                is_write_back: true,
+                mamba_cache_chunk_size: Some(1),
+                ..Default::default()
+            },
+            vec![FULL, MAMBA],
+        );
+        let key = vec![10, 20];
+        let mut p = params(&key, &[1, 2]);
+        p.mamba_value = Some(PageValue::from_vec(vec![100]));
+        let leaf = tree.insert(&p).last_device_node_id.unwrap();
+        let (backup, pending) = tree.evict_device_leaf(leaf, true).unwrap();
+        assert!(backup.is_some());
+        assert!(pending.device_frees.is_empty());
+        assert_eq!(pending.unbacked_tokens, 0);
+        let result = if backup_succeeds {
+            complete_backup(&mut tree, leaf);
+            tree.demote(leaf).unwrap()
+        } else {
+            let (dropped, result) = tree.drop_subtree_no_host(leaf).unwrap();
+            assert!(dropped);
+            result
+        };
+        assert_eq!(result.device_frees[&FULL][0].as_slice(), &[1, 2]);
+        assert_eq!(result.unbacked_tokens, if backup_succeeds { 0 } else { 2 });
+        assert_eq!(tree.arena.resolve(leaf).is_ok(), backup_succeeds);
         tree.try_sanity_check(&[], &[]).unwrap();
     }
 }

@@ -47,6 +47,11 @@ The mechanical modifications are:
 After those adaptations, `scripts/sglang_radix_core_fixes.patch` applies the
 following local corrections to this pinned revision:
 
+- Refresh an active Full eviction walk after load-back acknowledgments and
+  final auxiliary host-lock releases expose eligible leaves. Keep normal
+  eviction's incremental parent insertion.
+- Report freed unbacked Full rows when a failed write-back backup drops its
+  subtree; successful host-backed demotion still reports zero.
 - Rebuild Full eviction candidates after accesses and final device-lock releases,
   including buried MRU priority improvements, and recheck popped priorities. Preserve skipped Full host and
   SWA early-release lock receipts. Revalidate saved Mamba/SWA device cursors
@@ -93,6 +98,11 @@ following local corrections to this pinned revision:
   Publish CPU store events only for the matching write-through acknowledgement.
 - Drop failed-backup subtrees in stable NodeId sibling order, descendants first,
   preserving the order of host-free chunks and CPU removal hashes.
+- Document retained-key validation's O(P + depth) per-call cost, including
+  chunked continuations, and O(N^2) work over N one-page fallback appends.
+  AISimulate's usual exclusive growth uses its lease-bound suffix append;
+  shared/overlapping fallback is bounded by request context and KV capacity.
+- Assert the ordered SWA window values as well as presence and row counts.
 - Strengthen the rejected-rotation test to check the retained anchor's hit count,
   access tick, and priority before and after each rejected continuation.
 - Keep borrowed namespace fields private so their cached hash stays consistent.

@@ -516,6 +516,18 @@ fn page_value_swa_window_validates_and_attaches_loaded_indices() {
         vec![(0, 1), (3, 4)]
     );
     assert_eq!(tree.swa_evictable_size(), 2);
+    let window = tree
+        .inspect_get_all_node_ids()
+        .into_iter()
+        .find(|&id| tree.inspect_get_node_token_ids(id).unwrap() == [20, 30])
+        .expect("node covering [1, 3)");
+    assert_eq!(
+        tree.get_component_device_value(window, SWA)
+            .unwrap()
+            .unwrap()
+            .as_slice(),
+        &[5, 6]
+    );
     assert_eq!(tree.evictable_size(), 4);
     assert_eq!(
         tree.collect_full_device_indices(anchor, tree.root_node_handle(None))

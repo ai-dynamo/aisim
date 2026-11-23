@@ -999,9 +999,10 @@
     }
   },
   "canonical_exclusions": [
-    "wall_time_ms",
-    "processed_tokens_per_s",
-    "processed_output_tokens_per_s"
+    "/summary/wall_time_ms",
+    "/summary/processed_tokens_per_s",
+    "/summary/processed_output_tokens_per_s",
+    "/planner/html_report_path"
   ],
   "command_template": [
     "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-363-20261119T074632408104Z/scratch/venv/bin/python",
@@ -1176,5 +1177,7 @@
         }
       }
     }
-  }
+  },
+  "canonical_digest_input": "canonical_results[case]: prediction summary only; no planner section",
+  "canonical_digest_encoding": "UTF-8 json.dumps(summary, sort_keys=True, separators=(\",\", \":\")); no trailing newline"
 }
