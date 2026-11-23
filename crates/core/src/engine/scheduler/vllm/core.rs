@@ -2276,8 +2276,14 @@ impl VllmCore {
         }
         // With nothing to schedule, vLLM's next step is empty and it processes
         // this pass's outputs at once. A destination waiting for capacity
-        // schedules nothing: it needs the blocks these outputs free.
-        if !self.has_schedulable_requests() {
+        // schedules nothing: it needs the blocks these outputs free. A CPU-tier
+        // restore due at the next decision is work for that decision, which
+        // vLLM decides before it processes these outputs.
+        let due_restore = self
+            .pending_activations
+            .iter()
+            .any(|&(_, _, release)| release.is_due(self.passes_executed, now_ms));
+        if !self.has_schedulable_requests() && !due_restore {
             let finished = std::mem::take(&mut self.finished_in_flight);
             self.free_finished(finished);
         }

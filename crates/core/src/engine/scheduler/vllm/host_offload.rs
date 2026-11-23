@@ -4871,6 +4871,51 @@ mod tests {
         assert!(run.core.is_drained(), "every restore and store completes");
     }
 
+    #[test]
+    fn a_due_restore_keeps_finished_blocks_until_its_decision() {
+        // The due-restore run with a last decode one pass later: A (request
+        // 3) prefills at m+4 and decodes its last token at m+5. B (request 6)
+        // is seen by A's prefill poll and is due at m+6. When m+5 ends, B is
+        // still a deadline-only waiter, but it is work for the next decision:
+        // vLLM decides m+6 before it processes m+5's outputs, so A's blocks
+        // stay held until then. Freeing them at the boundary, as an engine
+        // with nothing to schedule does, let B's decision use blocks vLLM
+        // has not freed yet.
+        let mut run = PollRun::storing(
+            G2Connector::OffloadingV032,
+            3.0,
+            false,
+            Some(PollRun::LAUNCH),
+            &[(1, 0..22), (5, 100..122)],
+        );
+        run.submit(9, (900..906).collect(), 10);
+        for _ in 0..6 {
+            run.step();
+        }
+        let m = run.passes.len();
+        run.submit(3, (0..22).collect(), 2);
+        run.step();
+        run.step();
+        run.submit(6, (100..122).collect(), 2);
+        while run.passes.len() < m + 6 {
+            run.step();
+        }
+        assert_eq!(admitted_in(&run, 3), Some(m + 4));
+        assert_eq!(admitted_in(&run, 6), None, "B is due at m+6");
+        assert!(run.core.test_awaits_poll(Uuid::from_u128(6)));
+        let held = run.core.kv_manager.num_active_blocks();
+        assert_eq!(held, 11, "A's finished blocks are still held");
+        run.step();
+        assert_eq!(admitted_in(&run, 6), Some(m + 6));
+        for _ in 0..16 {
+            if run.core.is_empty() && !run.core.is_ready() {
+                break;
+            }
+            run.step();
+        }
+        assert!(run.core.is_drained(), "every restore and store completes");
+    }
+
     /// The pass that admitted `id`, if any.
     fn admitted_in(run: &PollRun, id: u128) -> Option<usize> {
         let uuid = Uuid::from_u128(id);
