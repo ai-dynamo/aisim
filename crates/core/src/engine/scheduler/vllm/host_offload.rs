@@ -4612,6 +4612,56 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_empty_decision_keeps_restores_on_the_poll_path() {
+        // Relative to pass m's GPU start, A copies until 13 ms and B until
+        // 23 ms. The poll of m+2 at 15 ms sees only A, due at m+4. The last
+        // decode ends at 30 ms, before replay forms the queued decision m+3.
+        // That empty decision polls at 20 ms and misses B. It must run before
+        // empty-step settlement: A runs at m+4 and its prefill poll sees B,
+        // which then waits until m+6. Settling at the decode boundary instead
+        // releases both loads at m+3, bypassing that queued decision.
+        let mut run = PollRun::storing(
+            G2Connector::OffloadingV032,
+            3.0,
+            false,
+            Some(PollRun::LAUNCH),
+            &[(1, 0..22), (5, 100..122)],
+        );
+        run.submit(9, (900..906).collect(), 9);
+        for _ in 0..6 {
+            run.step();
+        }
+        let m = run.passes.len();
+        run.submit(3, (0..22).collect(), 2);
+        run.step();
+        run.submit(6, (100..122).collect(), 2);
+        run.step();
+        run.step();
+        for id in [3, 6] {
+            assert!(run.core.test_awaits_poll(Uuid::from_u128(id)));
+        }
+
+        run.step();
+        assert!(run.passes[m + 3].committed_requests.is_empty());
+        assert_eq!(admitted_in(&run, 3), None, "A waits for decision m+4");
+        assert_eq!(admitted_in(&run, 6), None, "the queued poll misses B");
+        run.step();
+        assert_eq!(admitted_in(&run, 3), Some(m + 4));
+        assert_eq!(admitted_in(&run, 6), None, "B still needs a poll");
+        run.step();
+        assert_eq!(admitted_in(&run, 6), None, "B waits two decisions");
+        run.step();
+        assert_eq!(admitted_in(&run, 6), Some(m + 6));
+        for _ in 0..16 {
+            if run.core.is_empty() && !run.core.is_ready() {
+                break;
+            }
+            run.step();
+        }
+        assert!(run.core.is_drained(), "every restore and store completes");
+    }
+
+    #[test]
     fn a_simple_cpu_copy_that_ends_before_replay_forms_its_pass_is_seen_by_the_next_poll() {
         // A 5 ms prefill launch. Pass P forms at T and was decided at T - 10.
         // Request 7 arrives after that decision, so the pass decided at T,

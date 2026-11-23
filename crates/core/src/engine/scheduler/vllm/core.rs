@@ -2391,14 +2391,15 @@ impl VllmCore {
         }
         // An activated restore can still be in connector_waiting when a
         // running prefill consumed the previous pass's entire token budget.
-        // A due activation is runnable too, even before schedule_pass releases
-        // it from its deadline-only connector wait. Neither permits empty
-        // steps to see another load before its next post-forward poll.
+        // A polled activation also keeps the batch queue active, even before
+        // its release decision: queued empty decisions must still poll at
+        // their original times. Only an actual empty step with no pass in
+        // flight may collapse that delay through last_pass_empty below.
         let idle = !self.has_schedulable_requests()
-            && !self
-                .pending_activations
-                .iter()
-                .any(|&(_, _, release)| release.is_due(self.passes_executed, now_ms));
+            && !self.pending_activations.iter().any(|&(_, _, release)| {
+                matches!(release, LoadRelease::Decision(_))
+                    || release.is_due(self.passes_executed, now_ms)
+            });
         if !(idle || self.last_pass_empty) {
             return;
         }

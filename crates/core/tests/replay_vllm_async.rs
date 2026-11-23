@@ -519,3 +519,54 @@ fn a_restore_blocked_by_the_prefill_budget_keeps_other_loads_on_the_poll_path() 
             .all(|request| request.output_length == request.requested_output_length)
     );
 }
+
+#[test]
+fn a_queued_empty_decision_does_not_admit_a_restore_before_its_poll() {
+    // Requests 1 and 2 store distinct prefixes and request 3 evicts them.
+    // R (9) prefills at 1000 and decodes until 1160. A (4) and B (5) issue
+    // their loads with the decode passes starting at 1130 and 1140. Their
+    // copies end at 1143 and 1153. The decode poll at 1145 sees A, making it
+    // eligible two decisions later. The queued empty decision polls at 1150
+    // and misses B; A then prefills from 1160 to 1240. A's poll at 1210 sees
+    // B, which must wait two decisions until 1250. Settling loads as idle
+    // before the queued decision instead admits both at 1160.
+    let five_blocks_in_3_ms = 320.0 / (3.0 * 1e6);
+    let mut config = polled_cpu_tier(16, five_blocks_in_3_ms);
+    config.launch = Some(PassLaunchConfig {
+        decode_ms: 5.0,
+        piecewise_ms: 50.0,
+        eager_ms: 150.0,
+        max_cudagraph_capture_size: 4096,
+        eager_queue_fraction: 0.4,
+    });
+    config.timing_model = TimingModelConfig::Fixed {
+        prefill_ms: 80.0,
+        decode_ms: 10.0,
+    };
+    let report = run_tokens(
+        config,
+        vec![
+            tokens_request(1, (0..22).collect(), 1, 0.0),
+            tokens_request(2, (100..122).collect(), 1, 300.0),
+            tokens_request(3, (500..560).collect(), 1, 600.0),
+            tokens_request(9, (900..906).collect(), 9, 1000.0),
+            tokens_request(4, (0..22).collect(), 2, 1116.0),
+            tokens_request(5, (100..122).collect(), 2, 1126.0),
+        ],
+    );
+    assert_eq!(record(&report, 4).first_admit_ms, Some(1160.0));
+    assert_eq!(record(&report, 5).first_admit_ms, Some(1250.0));
+    for id in [4, 5] {
+        assert_eq!(
+            record(&report, id).first_admission_host_reused_input_tokens,
+            Some(20)
+        );
+    }
+    assert_eq!(report.per_request.len(), 6);
+    assert!(
+        report
+            .per_request
+            .iter()
+            .all(|request| request.output_length == request.requested_output_length)
+    );
+}
