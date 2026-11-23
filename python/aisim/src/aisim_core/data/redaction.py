@@ -402,6 +402,13 @@ def _check_requests(path: Path, rel: str, policy: RedactionPolicy) -> list[Findi
     return _check_table_text(read_parquet(path, REQUESTS_SCHEMA), rel, policy, "request column", path=path)
 
 
+def _is_list_view(dtype: pa.DataType) -> bool:
+    """List-view types only exist in newer PyArrow releases; the declared minimum (15.0.0) has no predicates."""
+    return any(
+        getattr(pa.types, name)(dtype) for name in ("is_list_view", "is_large_list_view") if hasattr(pa.types, name)
+    )
+
+
 def _stored_dictionaries(array: pa.Array | pa.ChunkedArray) -> Iterator[pa.Array]:
     """Every dictionary ``array`` stores, in all chunks and nested in lists, structs, maps and other dictionaries.
 
@@ -433,17 +440,37 @@ def _stored_dictionaries_at(
             yield from _stored_dictionaries_at(array.field(index), (*fields, dtype.field(index).name))
     elif pa.types.is_map(dtype):
         yield from _stored_dictionaries_at(array.keys, fields)
+        # A dictionary of item values keeps no record of the key each value was stored for, so judge every stored
+        # value as it would be for each key whose name carries a rule, as well as under the column alone.
+        for key in _map_key_contexts(array.keys):
+            yield from _stored_dictionaries_at(array.items, (*fields, key))
         yield from _stored_dictionaries_at(array.items, fields)
     elif (
         pa.types.is_list(dtype)
         or pa.types.is_large_list(dtype)
         or pa.types.is_fixed_size_list(dtype)
-        or pa.types.is_list_view(dtype)
-        or pa.types.is_large_list_view(dtype)
+        or _is_list_view(dtype)
     ):
         yield from _stored_dictionaries_at(array.values, fields)
     elif isinstance(array, pa.ExtensionArray):
         yield from _stored_dictionaries_at(array.storage, fields)
+
+
+def _map_key_contexts(keys: pa.Array | pa.ChunkedArray) -> list[str]:
+    """Map key names, visible or only stored in a dictionary, that a field-name rule applies to."""
+    names: dict[str, None] = {}
+    candidates = [keys.to_pylist()]
+    candidates.extend(dictionary.to_pylist() for dictionary in _stored_dictionaries(keys))
+    for values in candidates:
+        for value in values:
+            name = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+            if isinstance(name, str) and name not in names and _is_context_key(name):
+                names[name] = None
+    return list(names)
+
+
+def _is_context_key(name: str) -> bool:
+    return any(rule.search(name) for rule in (_CREDENTIAL_KEY, _IMAGE_KEY, _PATCH_KEY, _RUN_KEY))
 
 
 def _file_dictionaries(path: Path, footer: pq.FileMetaData) -> list[tuple[str, tuple[str, ...], pa.Array]]:

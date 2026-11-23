@@ -1511,6 +1511,48 @@ def test_an_unused_nested_credential_value_blocks_promotion_and_public_validatio
     assert not (target / relative).exists()
 
 
+@pytest.mark.parametrize("options", [{}, {"store_schema": False}], ids=["arrow-schema", "plain-strings"])
+@pytest.mark.parametrize("dictionary_keys", [False, True], ids=["plain-keys", "dictionary-keys"])
+def test_an_unused_map_credential_value_blocks_promotion_and_public_validation(tmp_path, options, dictionary_keys):
+    """A map item dictionary keeps no key for its unused values, so the keys' names are applied conservatively."""
+    unused = "synthetic-plain-password-123"
+    items = pa.array([unused, "[REDACTED]", "[REDACTED]"]).dictionary_encode().slice(1)
+    keys = pa.array(["password", "password"])
+    if dictionary_keys:
+        keys = pa.array(["password", "ordinary", "ordinary"]).dictionary_encode().slice(1)  # "password" only stored
+    column = pa.MapArray.from_arrays(pa.array([0, 1, 2], pa.int32()), keys, items)
+    table = pa.table({"kernel_source": ["synthetic-kernel"] * 2, "latency_ms": [1.0, 2.0], "diagnostic": column})
+    assert unused not in json.dumps(table["diagnostic"].to_pylist())  # every visible value is redacted
+    root, directory, relative = _op_mirror_table(tmp_path, table, **options)
+    assert validate_tree(root, repo=INTERNAL_REPO).ok
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
+    assert not plan.content_ok and not plan.ok
+    found = [f for f in plan.findings if f.code == "secret" and f.path == relative]
+    assert found and "column diagnostic (stored dictionary)" in found[0].message
+    assert any(f.code == "secret" and f.path == relative for f in validate_tree(root, profile="public").errors)
+    target = _target(tmp_path)
+    with pytest.raises(PromotionError):
+        apply_promotion(plan, root, target)
+    assert not (target / relative).exists()
+
+
+def test_list_view_detection_survives_a_pyarrow_without_the_predicates(monkeypatch):
+    """PyArrow 15 has no list-view predicates; a clean scalar column must still be traversed."""
+    monkeypatch.delattr(pa.types, "is_list_view", raising=False)
+    monkeypatch.delattr(pa.types, "is_large_list_view", raising=False)
+    assert redaction._is_list_view(pa.string()) is False
+    assert [d.to_pylist() for _, d in redaction._stored_dictionaries_at(pa.array(["a"]))] == []
+    stored = pa.array(["a", "b"]).dictionary_encode()
+    assert [d.to_pylist() for d in redaction._stored_dictionaries(stored)] == [["a", "b"]]
+
+
+def test_map_key_contexts_cover_stored_dictionary_keys_and_ignore_plain_names():
+    keys = pa.array(["password", "ordinary", "ordinary"]).dictionary_encode().slice(1)
+    assert redaction._map_key_contexts(keys) == ["password"]  # only stored in the dictionary, still a context
+    assert redaction._map_key_contexts(pa.array([b"api_key", b"label"])) == ["api_key"]
+
+
 def test_stored_dictionaries_keep_their_struct_field_names():
     inner = pa.array(["a", "b"]).dictionary_encode()
     outer = pa.StructArray.from_arrays([pa.StructArray.from_arrays([inner], names=["password"])], names=["auth"])
