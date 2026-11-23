@@ -409,6 +409,50 @@ def _is_list_view(dtype: pa.DataType) -> bool:
     )
 
 
+# What every data type has; an extension type's own parameters are the attributes beyond these.
+_TYPE_ATTRIBUTES = frozenset(dir(pa.DataType)) | {"extension_name", "storage_type"}
+
+
+def _is_extension(dtype: pa.DataType) -> bool:
+    return isinstance(dtype, getattr(pa, "BaseExtensionType", pa.ExtensionType))
+
+
+def _extension_parameters(dtype: pa.DataType) -> tuple[dict[str, Any], list[pa.DataType], bool]:
+    """Text, types and inspectability of an extension type's parameters.
+
+    The reader restores a built-in extension (opaque, tensor, ...) into type attributes and leaves
+    ``field.metadata`` empty, so its name and parameters are visible only here. Parameters are collected by probing
+    the type, not from a fixed list, so one a newer PyArrow adds is scanned too. Returns the scannable text by name,
+    the types the parameters refer to, and ``False`` when a serialization exists that cannot be read as text.
+    """
+    text: dict[str, Any] = {"extension_name": dtype.extension_name}
+    nested: list[pa.DataType] = []
+    inspectable = True
+    for name in dir(dtype):
+        if name.startswith("_") or name in _TYPE_ATTRIBUTES:
+            continue
+        try:
+            value = getattr(dtype, name)
+        except Exception:  # an attribute that does not apply to this type (a width of a variable-size one)
+            continue
+        if callable(value):
+            continue
+        values = value if isinstance(value, (list, tuple)) else [value]
+        nested.extend(v for v in values if isinstance(v, pa.DataType))
+        strings = [v.decode("utf-8", errors="replace") if isinstance(v, bytes) else v for v in values]
+        strings = [v for v in strings if isinstance(v, str)]
+        if strings:
+            text[name] = strings if isinstance(value, (list, tuple)) else strings[0]
+    serialize = getattr(dtype, "__arrow_ext_serialize__", None)
+    if serialize is not None:
+        try:
+            serialized = serialize()
+            text["serialized"] = serialized.decode("utf-8") if serialized else ""
+        except Exception:
+            inspectable = False
+    return text, nested, inspectable
+
+
 def _stored_dictionaries(array: pa.Array | pa.ChunkedArray) -> Iterator[pa.Array]:
     """Every dictionary ``array`` stores, in all chunks and nested in lists, structs, maps and other dictionaries.
 
@@ -516,21 +560,33 @@ def _check_table_text(table: pa.Table, rel: str, policy: RedactionPolicy, where:
     metadata = [table.schema.metadata or {}]
     field_names: dict[str, None] = {}
 
+    extensions: list[pa.DataType] = []
+
     def field_metadata(field: pa.Field) -> None:
         field_names[field.name] = None
         metadata.append(field.metadata or {})
-        if pa.types.is_struct(field.type):
-            for child in field.type:
+        type_metadata(field.type)
+
+    def type_metadata(dtype: pa.DataType) -> None:
+        if pa.types.is_struct(dtype):
+            for child in dtype:
                 field_metadata(child)
         elif (
-            pa.types.is_list(field.type)
-            or pa.types.is_large_list(field.type)
-            or pa.types.is_fixed_size_list(field.type)
+            pa.types.is_list(dtype)
+            or pa.types.is_large_list(dtype)
+            or pa.types.is_fixed_size_list(dtype)
+            or _is_list_view(dtype)
         ):
-            field_metadata(field.type.value_field)
-        elif pa.types.is_map(field.type):
-            field_metadata(field.type.key_field)
-            field_metadata(field.type.item_field)
+            field_metadata(dtype.value_field)
+        elif pa.types.is_map(dtype):
+            field_metadata(dtype.key_field)
+            field_metadata(dtype.item_field)
+        elif pa.types.is_dictionary(dtype):
+            type_metadata(dtype.value_type)
+        elif _is_extension(dtype) and not any(dtype.equals(seen) for seen in extensions):
+            # (the stored and the embedded schema repeat the same types, so each is inspected once)
+            extensions.append(dtype)
+            type_metadata(dtype.storage_type)
 
     for field in table.schema:
         field_metadata(field)
@@ -543,6 +599,20 @@ def _check_table_text(table: pa.Table, rel: str, policy: RedactionPolicy, where:
         metadata.append(schema.metadata or {})
         for field in schema:
             field_metadata(field)
+    # Extension parameters (a built-in's name, vendor or dimension names) are type attributes, not field metadata.
+    for extension in extensions:
+        text, nested, inspectable = _extension_parameters(extension)
+        for dtype in nested:
+            type_metadata(dtype)
+        out.extend(scan_value(text, policy, rel, "Arrow extension type"))
+        if not inspectable:
+            out.append(
+                Finding(
+                    "extension-type",
+                    f"extension type {extension.extension_name} has parameters that cannot be inspected",
+                    rel,
+                )
+            )
     # Field names are disclosure text even when the table has no rows or every cell is null.
     out.extend(scan_value(field_names, policy, rel, f"{where} name"))
     for entry in metadata:

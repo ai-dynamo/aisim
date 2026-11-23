@@ -1573,6 +1573,118 @@ def test_clean_dictionary_columns_are_promoted_with_their_unused_values(tmp_path
     assert report.ok, report.errors
 
 
+def _extension_table(kind, secret):
+    """An op-latency table whose ``diagnostic`` column has an Arrow extension type that carries ``secret``."""
+    if kind == "tensor-dim-names":
+        extension = pa.fixed_shape_tensor(pa.int32(), [2], dim_names=[secret])
+        storage = pa.array([[1, 2], [3, 4]], pa.list_(pa.int32(), 2))
+    else:
+        parameters = ("synthetic", secret) if kind == "opaque-vendor-name" else (secret, "synthetic")
+        extension = pa.opaque(pa.string(), *parameters)
+        storage = pa.array(["public"] * 2)
+    column = pa.ExtensionArray.from_storage(extension, storage)
+    if kind == "nested":  # an extension inside a list column
+        column = pa.ListArray.from_arrays(pa.array([0, 1, 2], pa.int32()), column)
+    return pa.table({"kernel_source": ["synthetic-kernel"] * 2, "latency_ms": [1.0, 2.0], "diagnostic": column})
+
+
+EXTENSION_KINDS = ["opaque-type-name", "opaque-vendor-name", "tensor-dim-names", "nested"]
+
+
+def _need_extension_types(kind):
+    needed = "fixed_shape_tensor" if kind == "tensor-dim-names" else "opaque"
+    if not hasattr(pa, needed):
+        pytest.skip(f"this PyArrow has no built-in {needed} extension type")
+
+
+@pytest.mark.parametrize("kind", EXTENSION_KINDS)
+@pytest.mark.parametrize(
+    ("secret", "code"),
+    [("https://node7.corp.nvidia.com/v1", "internal-host"), ("hf_" + "a" * 34, "secret")],
+    ids=["internal-url", "hf-token"],
+)
+def test_built_in_extension_parameters_block_promotion_and_public_validation(tmp_path, kind, secret, code):
+    _need_extension_types(kind)
+    root, directory, relative = _op_mirror_table(tmp_path, _extension_table(kind, secret))
+    # The reader restores the extension into type attributes; field metadata stays empty, so the token is recoverable
+    # from the published file's type alone.
+    schema_type = str(pq.read_table(root / relative).schema.field("diagnostic").type)
+    assert secret in schema_type
+    assert validate_tree(root, repo=INTERNAL_REPO).ok  # valid private data with a readable table
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
+    assert not plan.content_ok and not plan.ok  # approval cannot override disclosure checks
+    found = [f for f in plan.findings if f.code == code and f.path == relative]
+    assert found and "Arrow extension type" in found[0].message
+    assert any(f.code == code and f.path == relative for f in validate_tree(root, profile="public").errors)
+    target = _target(tmp_path)
+    with pytest.raises(PromotionError):
+        apply_promotion(plan, root, target)
+    assert not (target / relative).exists()
+
+
+@pytest.mark.parametrize("kind", EXTENSION_KINDS)
+def test_clean_built_in_extension_types_are_promoted(tmp_path, kind):
+    _need_extension_types(kind)
+    root, directory, relative = _op_mirror_table(tmp_path, _extension_table(kind, "public-label"))
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
+    assert plan.ok, plan.findings
+    target = _target(tmp_path)
+    apply_promotion(plan, root, target)
+    assert (target / relative).read_bytes() == (root / relative).read_bytes()
+    report = validate_tree(target, repo=PUBLIC, profile="public")
+    assert report.ok, report.errors
+
+
+class _LabeledType(pa.ExtensionType):
+    """A Python extension type whose serialized parameters are whatever bytes it was given."""
+
+    def __init__(self, parameters: bytes):
+        self._parameters = parameters
+        super().__init__(pa.string(), "aisim.test.labeled")
+
+    def __arrow_ext_serialize__(self):
+        return self._parameters
+
+    @classmethod
+    def __arrow_ext_deserialize__(cls, storage_type, serialized):
+        return cls(serialized)
+
+
+@pytest.fixture
+def labeled_extension():
+    pa.register_extension_type(_LabeledType(b""))
+    yield
+    pa.unregister_extension_type("aisim.test.labeled")
+
+
+@pytest.mark.parametrize(
+    ("parameters", "code"),
+    [
+        (b'{"label": "https://node7.corp.nvidia.com/v1"}', "internal-host"),
+        (b'{"label": "' + b"hf_" + b"a" * 34 + b'"}', "secret"),
+        (b"\xff\xfe\x00 not text", "extension-type"),  # parameters that cannot be inspected are refused
+    ],
+)
+def test_serialized_extension_parameters_are_scanned_or_refused(tmp_path, labeled_extension, parameters, code):
+    column = pa.ExtensionArray.from_storage(_LabeledType(parameters), pa.array(["public"] * 2))
+    table = pa.table({"kernel_source": ["synthetic-kernel"] * 2, "latency_ms": [1.0, 2.0], "diagnostic": column})
+    root, directory, relative = _op_mirror_table(tmp_path, table)
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
+    assert not plan.content_ok and any(f.code == code and f.path == relative for f in plan.findings)
+    assert any(f.code == code and f.path == relative for f in validate_tree(root, profile="public").errors)
+
+
+def test_a_plain_text_extension_parameter_is_accepted(tmp_path, labeled_extension):
+    column = pa.ExtensionArray.from_storage(_LabeledType(b'{"label": "public-benchmark"}'), pa.array(["a", "b"]))
+    table = pa.table({"kernel_source": ["synthetic-kernel"] * 2, "latency_ms": [1.0, 2.0], "diagnostic": column})
+    root, directory, _ = _op_mirror_table(tmp_path, table)
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    assert plan_promotion(root, _request(root, [directory], draft), _reviewers()).ok
+
+
 def test_stored_dictionaries_cover_chunks_and_nested_dictionaries():
     private = pa.array(["unused-a", "kept"]).dictionary_encode()
     other = pa.array(["unused-b", "kept"]).dictionary_encode()
