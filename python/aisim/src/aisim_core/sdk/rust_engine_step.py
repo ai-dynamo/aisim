@@ -1112,10 +1112,10 @@ def _resolve_forward_pass_systems_paths(entries: tuple[str, ...], *, require_dir
 
         entries = tuple(get_systems_paths())
     env_root = os.environ.get("AICONFIGURATOR_SYSTEMS_PATH")
-    # A packaged-only list can be a caller's expansion of the defaults; preserve the environment's choice.
-    if env_root is not None and all(
-        isinstance(entry, str) and (entry.lower() == "default" or entry == packaged) for entry in entries
-    ):
+    # The packaged path alone can be a caller's expansion of unset roots; preserve the environment's choice. A literal
+    # ``default`` is an explicit request for the bundled data (the sweeper resolves it to the packaged path), so the
+    # environment variable never replaces it.
+    if env_root is not None and entries and all(entry == packaged for entry in entries):
         entries = (env_root,)
     resolved: list[str] = []
     for entry in entries:

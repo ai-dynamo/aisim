@@ -191,7 +191,7 @@ def test_configured_roots_outrank_the_saved_source_whether_or_not_the_request_na
 
 @pytest.mark.parametrize("mode", ["op_level", "auto"])
 @pytest.mark.parametrize("as_mapping", [False, True])
-@pytest.mark.parametrize("roots", ["default", "expanded", "unset"])
+@pytest.mark.parametrize("roots", ["expanded", "unset"])
 def test_environment_root_reaches_prediction_for_packaged_only_paths(
     native_dataset,  # noqa: F811
     monkeypatch,
@@ -204,7 +204,7 @@ def test_environment_root_reaches_prediction_for_packaged_only_paths(
     monkeypatch.setattr("aisim_core.data.fetch.HfTransport", lambda: transport)
     assert main(["init", "--on-demand", "--repo", REPO, "--revision", SHA]) == 0
     perf_database.set_systems_paths(None)
-    entries = {"default": ("default",), "expanded": tuple(perf_database.get_systems_paths()), "unset": ()}[roots]
+    entries = {"expanded": tuple(perf_database.get_systems_paths()), "unset": ()}[roots]
     monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", str(systems))
     config = replace(config, estimation_mode=mode, systems_paths=entries)
     request = asdict(config) if as_mapping else config
@@ -215,6 +215,15 @@ def test_environment_root_reaches_prediction_for_packaged_only_paths(
     assert Path(model.diagnostics()["provenance"]["selected_systems_root"]) == systems
     assert model.predict_prefill_latency(1, 4) >= 7.0  # the fixture's 7 ms attention measurement is consumed
     assert not transport.opened
+
+
+def test_a_literal_default_stays_the_bundled_data_when_the_environment_names_a_root(tmp_path, monkeypatch):
+    perf_database.set_systems_paths(None)
+    packaged = perf_database.get_systems_paths()[0]
+    monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", str(tmp_path))
+    assert res._resolve_forward_pass_systems_paths(("default",)) == [packaged]  # an explicit request for bundled data
+    assert res._resolve_forward_pass_systems_paths((packaged,)) == [str(tmp_path)]  # the expansion of unset roots
+    assert res._resolve_forward_pass_systems_paths(()) == [str(tmp_path)]
 
 
 @pytest.mark.parametrize("configure_defaults", [False, True])
