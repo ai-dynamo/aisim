@@ -2123,30 +2123,10 @@ class BaseBackend:
             num_mix_gen_tokens = self._mix_step_gen_tokens(b, scheduling_ctx_tokens, isl, decode_iterations)
             if _is_fpm_model(model) and isl > prefix:
                 num_mix_gen_tokens = min(b - 1, num_mix_gen_tokens)
-                # Use precisely the same capped fresh-token schedule as
-                # _run_agg_mixed_step. A query below one suffix is the mean
-                # of ceil(suffix/fresh) chunks; a larger query prices its
-                # scheduled fraction of the batch's total fresh work.
-                fresh_tokens = self._fpm_aggregate_prefill_tokens(ctx_tokens, isl, prefix, b - num_mix_gen_tokens)
-                chunks = math.ceil((isl - prefix) / fresh_tokens)
-                requests = max(1.0, fresh_tokens / (isl - prefix))
-                steps_to_finish_ctx = b * chunks / requests
-                fpm_prefill_chunks = chunks
-                ttft_steps_to_finish_ctx = steps_to_finish_ctx
             assert num_mix_gen_tokens >= 1, (
                 f"num_mix_gen_tokens: {num_mix_gen_tokens}, b: {b}, ctx_tokens: {ctx_tokens}, isl: {isl}"
             )
             num_mix_ctx_tokens = ctx_tokens
-            if steps_to_finish_ctx >= decode_iterations:
-                num_mix_steps = steps_to_finish_ctx
-                num_genonly_steps = 0
-                num_genonly_tokens = 0
-                num_mix_steps_for_tpot_calc = num_mix_steps
-            else:
-                num_mix_steps = steps_to_finish_ctx
-                num_genonly_steps = decode_iterations - num_mix_steps
-                num_genonly_tokens = b
-                num_mix_steps_for_tpot_calc = self._tpot_mix_steps(num_mix_steps)
         elif b == 1:
             # special case for b=1: the packed budget holds at most this one
             # request, never unused budget. Op-level pricing reads prompt
@@ -2231,6 +2211,27 @@ class BaseBackend:
             mix_step_estimate = self._run_agg_mixed_step(
                 model, database, runtime_config, MixedStepInput(num_mix_ctx_tokens, num_mix_gen_tokens)
             )
+        if b > 1:
+            if _is_fpm_model(model) and isl > prefix:
+                # Read the actual fresh-token query after backend scheduling
+                # (including XPU decode caps and budget reservation). A query
+                # below one suffix averages ceil(suffix/fresh) chunks; larger
+                # queries price their fraction of the batch's fresh work.
+                fresh_tokens = mix_step_estimate.context_tokens
+                chunks = math.ceil((isl - prefix) / fresh_tokens)
+                requests = max(1.0, fresh_tokens / (isl - prefix))
+                steps_to_finish_ctx = b * chunks / requests
+                fpm_prefill_chunks = chunks
+                ttft_steps_to_finish_ctx = steps_to_finish_ctx
+            num_mix_steps = steps_to_finish_ctx
+            if steps_to_finish_ctx >= decode_iterations:
+                num_genonly_steps = 0
+                num_genonly_tokens = 0
+                num_mix_steps_for_tpot_calc = num_mix_steps
+            else:
+                num_genonly_steps = decode_iterations - num_mix_steps
+                num_genonly_tokens = b
+                num_mix_steps_for_tpot_calc = self._tpot_mix_steps(num_mix_steps)
         # Native FPM may also average several uncached chunks inside one
         # run_mixed call. Neither kind of mean is a single query coordinate.
         averages_mixed_shapes = averages_text_chunks or (

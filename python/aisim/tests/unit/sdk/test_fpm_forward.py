@@ -963,6 +963,63 @@ def fpm_session(tmp_path):
 
 
 class TestFPMStaticAndMixed:
+    @pytest.mark.parametrize(
+        "prefix,budget,kv_slots,prefill_rows,mix_steps,mix_ms,tpot_ms",
+        [
+            (2048, 2048, 1000, [(1, 2048, 2048, 12.0), (1, 30, 4081, 4.0)], 32, 9.0, 4.40625),
+            (2048, 2063, 1000, [(1, 2063, 2048, 12.0)], 16, 13.0, 4.171875),
+            (0, 4096, 1000, [(1, 4096, 0, 12.0), (1, 30, 4081, 4.0)], 32, 9.0, 4.40625),
+            (0, 4111, 1, [(2, 4111, 0, 12.0)], 65536 / 4110, 13.0, 3.0),
+        ],
+        ids=["cached-short-tail", "cached-exact-suffix", "cold-short-tail", "kv-cap-fractional-prefill"],
+    )
+    def test_xpu_aggregate_weights_use_the_scheduled_fpm_budget(
+        self, tmp_path, monkeypatch, prefix, budget, kv_slots, prefill_rows, mix_steps, mix_ms, tpot_ms
+    ):
+        from aisim.sdk.inference_session import InferenceSession
+        from aisim_core.sdk.backends.vllm_backend_xpu import VLLMXPUBackend
+
+        model = models.get_model("Qwen/Qwen3-0.6B", _model_config(forward_model="fpm"), BACKEND)
+        identity = dict(zip(_CELL_MATCH_COLUMNS, model.context_ops[0]._match_identity, strict=True))
+        # Synthetic exact anchors, not XPU calibration data. Fifteen decoders
+        # leave 2033 fresh tokens at budget 2048: each 2048-token suffix takes
+        # two chunks (2033 and 15), so 16 requests require 32 mixed steps.
+        # The 12/4 ms rows average to 8 ms, plus a 3-2=1 ms marginal decoder.
+        # Budget 2063 instead fits the entire suffix, taking 16 steps at 13 ms.
+        # The cold control has the same two-chunk boundary. With one KV slot,
+        # budget 4111 leaves 4110 fresh tokens: 65536 total / 4110 per step.
+        rows = [
+            _row("prefill", batch, tokens, past, ms, model_path=model.model_path, identity=identity)
+            for batch, tokens, past, ms in prefill_rows
+        ] + [
+            _row("decode", batch, 0, kv, ms, model_path=model.model_path, identity=identity)
+            for batch in (1, 15, 16)
+            for kv, ms in [(0, 2.0), (batch * 4161, 3.0)]
+        ]
+        shutil.copy(Path(_CORE_SYSTEMS) / f"{SYSTEM}.yaml", tmp_path / f"{SYSTEM}.yaml")
+        _write_pair(str(tmp_path / "data" / SYSTEM / BACKEND / VERSION), rows)
+        database = PerfDatabase(SYSTEM, BACKEND, VERSION, systems_root=str(tmp_path))
+        backend = VLLMXPUBackend()
+        monkeypatch.setattr(backend, "_max_kv_slots", lambda *a, **k: kv_slots)
+        runtime = sdk_config.RuntimeConfig(batch_size=16, isl=4096, osl=128, prefix=prefix)
+        summary = InferenceSession(model, database, backend).run_agg(runtime, ctx_tokens=budget)
+
+        scheduling = summary.get_step_estimates()["scheduling"]
+        assert scheduling["num_mix_steps"] == pytest.approx(mix_steps)
+        assert scheduling["num_genonly_steps"] == pytest.approx(128 - mix_steps)
+        assert scheduling["mix_step_latency_ms"] == pytest.approx(mix_ms)
+        groups = summary.get_aggregate_energy_breakdown()
+        assert groups["mix_step"].latency_ms == pytest.approx(mix_steps * mix_ms)
+        assert groups["genonly_step"].latency_ms == pytest.approx((128 - mix_steps) * 3)
+        # At nonbinding KV capacity, a request sees 30 or 15 mixed steps,
+        # respectively, out of its 128 decode iterations. At one KV slot it
+        # sees decode-only steps. Check the final TPOT and throughput too.
+        result = summary.get_result_dict()
+        assert result["tpot"] == pytest.approx(tpot_ms)
+        total_ms = mix_steps * mix_ms + (128 - mix_steps) * 3
+        expected_throughput = min(1000 * 16 * 127 / total_ms, 1000 * 16 * 127 / (result["ttft"] + tpot_ms * 127))
+        assert result["tokens/s"] == pytest.approx(expected_throughput)
+
     @pytest.mark.parametrize("backend_name", ["vllm", "trtllm"])
     def test_cached_aggregate_weights_follow_the_native_prefill_schedule(self, tmp_path, backend_name):
         from aisim.sdk.inference_session import InferenceSession
