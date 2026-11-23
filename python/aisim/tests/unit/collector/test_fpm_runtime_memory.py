@@ -2607,7 +2607,8 @@ def test_glm_plan_selects_one_batch_size_with_the_parallel_presets(tmp_path):
 
 def test_glm_batch_refusal_names_the_data_parallelism_of_two_deployments_at_one_tp(tmp_path):
     # A pure-TP deployment at one GPU with 16 sequences and a dep deployment at four GPUs with 8 share TP 1 and differ
-    # in DP and expert parallelism. The TP filter leaves out the pure-TP deployment at four GPUs.
+    # in DP and expert parallelism. The TP filter leaves out the pure-TP topology at four GPUs, for which this profile
+    # holds no deployment.
     with pytest.raises(ValueError) as error:
         _glm_plan(
             tmp_path,

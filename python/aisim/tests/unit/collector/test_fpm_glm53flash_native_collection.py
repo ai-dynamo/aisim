@@ -1855,6 +1855,7 @@ def test_glm_cell_under_a_plan_with_a_global_warmup_is_refused_before_a_pair_is_
         "integer 0"
     )
     rows = database.aggregate_cell(plan, cell, cell_dir, expected_attempt_id=ATTEMPT_ID, median_policy=False)
+    assert len(rows) == 2
     assert [(row["measurement_policy"], repr(row["global_warmup_iterations"])) for row in rows] == [
         (database.SINGLE_SAMPLE_MEASUREMENT_POLICY, repr(warmup))
     ] * len(rows)
@@ -2026,9 +2027,9 @@ def test_publication_verifies_with_the_label_of_its_sidecar(tmp_path, case):
     assert sorted(map(canonical, again)) == sorted(map(canonical, pq.read_table(parquet).to_pylist()))
 
 
-def test_callers_that_check_a_publication_take_the_label_of_its_sidecar():
-    """Finalization and collection validation aggregate with the label of the sidecar; publication and readiness
-    aggregate with the label of the producer contract."""
+def test_publication_and_readiness_aggregate_with_the_label_of_the_producer_contract():
+    """Publication and readiness aggregate with the label of the producer contract. Finalization and collection
+    validation take the label of the sidecar; tests/unit/test_onboard_runtime.py runs both on a producer campaign."""
     import ast
 
     import collector.fpm_forward
@@ -2036,8 +2037,6 @@ def test_callers_that_check_a_publication_take_the_label_of_its_sidecar():
     import aisim.support
 
     sources = {
-        "finalization": Path(aisim.support.__file__).parent / "finalization.py",
-        "validation_workflow": Path(aisim.support.__file__).parent / "validation_workflow.py",
         "collection_readiness": Path(aisim.support.__file__).parent / "collection_readiness.py",
         "runner": Path(collector.fpm_forward.__file__).parent / "runner.py",
     }
@@ -2053,8 +2052,6 @@ def test_callers_that_check_a_publication_take_the_label_of_its_sidecar():
             for call in calls
         ]
     assert keywords == {
-        "finalization": [["published_median_policy(published)"]],
-        "validation_workflow": [["published_median_policy(published)"]],
         "collection_readiness": [[]],
         "runner": [[]],
     }

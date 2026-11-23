@@ -1651,7 +1651,11 @@ def test_plan_carries_explicit_formal_observer_flags_and_execution_requires_acce
 
 
 def _formal_bindings(index, cells=None):
-    """Synthetic formal contexts bound to distinct native cell attempts."""
+    """Synthetic formal contexts bound to distinct native cell attempts.
+
+    The launch manifest and the observation records take the formal attempt. The staged files of the launch, the model
+    configuration among them, keep their bytes, as the launch records their SHA-256.
+    """
     document = json.loads(index.read_text())
     entry = document["configurations"]["tp2"]
     entry["active_attempt_id"] = "formal-parent"
@@ -1663,7 +1667,10 @@ def _formal_bindings(index, cells=None):
         attempt_id = f"native-{phase}"
         result.update(cell_id=cell_id, collector_attempt_id=attempt_id, status="passed")
         entries[cell_id] = {"status": "passed", "attempt_id": attempt_id}
-        for ref in [result["launch_manifest"], *result["artifacts"]]:
+        for ref in [
+            result["launch_manifest"],
+            *(ref for ref in result["artifacts"] if ref["kind"] != "runtime-artifact"),
+        ]:
             path = index.parent / ref["path"]
             value = json.loads(path.read_text())
             value.update(attempt_id="formal-parent", cell_id=cell_id, collector_attempt_id=attempt_id)
@@ -1686,7 +1693,11 @@ def _completed_runtime_collection(
     decode_prefix_caching=True,
     warmup_iterations=None,
     glm_point_list=False,
+    capacity_multiplier=10,
+    write_cell=None,
 ):
+    """A formal collection of the imported probe, ready for finalization. write_cell(plan, cell, directory, attempt_id)
+    writes the rank artifact of a cell in place of the default native artifact."""
     from collector.fpm_forward.cli import _parser
     from collector.fpm_forward.config import FPMCollectionOptions
     from collector.fpm_forward.database import aggregate_cell, write_formal_database
@@ -1701,7 +1712,7 @@ def _completed_runtime_collection(
     checkpoint, _, request, files = _imported(
         tmp_path,
         capsys,
-        capacity_multiplier=10,
+        capacity_multiplier=capacity_multiplier,
         tp=tp,
         worker_type=worker_type,
         model=model,
@@ -1775,7 +1786,10 @@ def _completed_runtime_collection(
             },
         }
         _write(raw / "collector-provenance.json", provenance)
-        _write(raw / "benchmark.json", _native(cell.workload_kind))
+        if write_cell is None:
+            _write(raw / "benchmark.json", _native(cell.workload_kind))
+        else:
+            write_cell(plan, cell, directory, provenance["attempt_id"])
         rows.extend(aggregate_cell(plan, cell, directory, expected_attempt_id=provenance["attempt_id"]))
     parquet, metadata, skipped = write_formal_database(plan, rows, systems_root=root / "systems/data")
     assert not skipped
@@ -2348,6 +2362,142 @@ def test_finalization_generates_the_glm_point_list_for_the_accepted_deployment(t
     assert [(options.benchmark_points_json, deployments) for options, deployments in calls] == [
         (None, [request.profile_deployment()])
     ]
+
+
+def _glm_producer_collection(tmp_path, capsys, *, receipts=True):
+    """A formal GLM-5.3-Flash collection of the imported TP 4 probe whose cells hold producer artifacts.
+
+    Each cell holds a rank artifact in the shape that the producer writes, for the frozen point list of the plan, the
+    receipt of that list and, with receipts, the producer receipt.
+    """
+    from collector.fpm_forward import runner
+    from collector.fpm_forward.native_artifact import write_producer_receipt
+
+    from aisim_core.sdk.fpm_identity import EXECUTION_COLUMNS
+
+    from .collector.test_fpm_glm53flash_native_collection import (
+        _glm_producer_shape,
+        glm_native_payload,
+        write_glm_rank,
+    )
+
+    shape = _glm_producer_shape(tmp_path / "shape")
+
+    def write_cell(plan, cell, directory, attempt_id):
+        specs = []
+        for point in json.loads(plan.options.benchmark_points_json)[cell.workload_kind]:
+            if cell.workload_kind == "decode":
+                specs.append({**point, "total_prefill_tokens": 0, "sample_reasons": ["explicit", "kvwarm_real_kv"]})
+            else:
+                seeded = ["prefill_real_seed"] if point["total_kv_read_tokens"] else []
+                specs.append({**point, "sample_reasons": ["explicit", *seeded]})
+        payload = glm_native_payload(cell.workload_kind, points=specs)
+        payload["execution_identity"] = dict(zip(EXECUTION_COLUMNS, cell.execution_identity, strict=True))
+        shape(cell.workload_kind, payload)
+        payload["timing"]["benchmark_elapsed_seconds"] = payload["timing"]["measured_iteration_seconds"] + 1.0
+        pod = directory / "raw/pod-0"
+        write_glm_rank(pod, payload)
+        # The receipt of the frozen point file, as the launch writes it beside the Collector provenance.
+        points_receipt = {
+            "plan_sha256": plan.sha256,
+            "cell_id": cell.cell_id,
+            "attempt_id": attempt_id,
+            "sha256": runner._cell_points(plan, cell, smoke=False)[1],
+            "phase": "after",
+        }
+        (pod / runner.POINTS_RECEIPT_FILENAME).write_text(json.dumps(points_receipt))
+        if receipts:
+            write_producer_receipt(cell, directory, plan_sha256=plan.sha256, attempt_id=attempt_id)
+
+    return _completed_runtime_collection(
+        tmp_path,
+        capsys,
+        tp=4,
+        model=str(tmp_path / "model-checkpoint"),
+        layout="glm_tp4",
+        warmup_iterations=0,
+        capacity_multiplier=1,
+        write_cell=write_cell,
+    )
+
+
+def test_glm_producer_campaign_finalizes_and_validates(tmp_path, capsys):
+    from aisim.support import validation_workflow
+    from aisim.support.finalization import finalization_manifest, finalize
+    from aisim.support.plan import check_plan
+    from aisim.support.runtime import verify_runtime_profile
+    from aisim_core.sdk.fpm_identity import LEGACY_EXECUTION_IDENTITY
+
+    _, request, _, root = _glm_producer_collection(tmp_path, capsys)
+    plan = json.loads(next((root / "fpm-artifacts").glob("*/collection-plan.json")).read_text())
+    assert sorted(cell["workload_kind"] for cell in plan["cells"]) == ["decode", "prefill"]
+    # The cells carry the execution identity of the model, not the legacy one.
+    assert all(tuple(cell["execution_identity"].values()) != LEGACY_EXECUTION_IDENTITY for cell in plan["cells"])
+    sidecar = json.loads(next((root / "systems/data").rglob("fpm_forward_perf.metadata.json")).read_text())
+    assert (sidecar["schema_version"], sidecar["measurement_policy"]) == (7, "vllm_native_fpm_prefix_seed_median_v1")
+    assert (sidecar["warmup_repeats"], sidecar["measurement_repeats"]) == (5, 10)
+    assert len(list(root.rglob("producer-receipt.json"))) == 2
+    cells, _, _, formal = validation_workflow._collection_source(request, root)
+    assert len(cells.cells) == len(formal) == 2
+    target = tmp_path / "finalized"
+    finalize(request, root, target)
+    resolved = SupportRequest.from_yaml(target / "request.yaml")
+    assert finalization_manifest(resolved)["runtime_compatibility"]["status"] == "compatible"
+    verify_runtime_profile(resolved)
+    check_plan(resolved, target)
+
+
+@pytest.mark.parametrize(
+    ("reader", "refusal"),
+    [
+        ("finalization", "formal FPM rows differ from the verified native collection or include unrelated cells"),
+        ("validation", "published formal rows differ from verified native collection"),
+    ],
+)
+def test_glm_producer_campaign_is_compared_under_the_label_of_its_sidecar(
+    tmp_path, capsys, monkeypatch, reader, refusal
+):
+    from collector.fpm_forward import database
+
+    from aisim.support import validation_workflow
+    from aisim.support.finalization import finalize
+
+    # Rows of the single-sample label differ from the published median rows, so each reader must take the label of the
+    # sidecar.
+    _, request, _, root = _glm_producer_collection(tmp_path, capsys)
+    monkeypatch.setattr(database, "published_median_policy", lambda metadata: False)
+    with pytest.raises(ValueError) as error:
+        if reader == "finalization":
+            finalize(request, root, tmp_path / "finalized")
+        else:
+            validation_workflow._collection_source(request, root)
+    assert str(error.value) == refusal
+
+
+@pytest.mark.parametrize("receipts", [True, False], ids=["receipts", "no-receipts"])
+def test_glm_producer_campaign_finalizes_after_a_change_of_a_producer_file_only_with_receipts(
+    tmp_path, capsys, monkeypatch, receipts
+):
+    from collector.fpm_forward import native_artifact
+
+    from aisim.support.finalization import finalize
+
+    _, request, _, root = _glm_producer_collection(tmp_path, capsys, receipts=receipts)
+    changed = tmp_path / "changed-producer"
+    shutil.copytree(native_artifact._GLM_RUNTIME, changed)
+    with (changed / "glm53flash_prefix_scheduler.py").open("a") as handle:
+        handle.write("# one more line\n")
+    monkeypatch.setattr(native_artifact, "_GLM_RUNTIME", changed)
+    native_artifact._glm_producer_record.cache_clear()
+    try:
+        if receipts:
+            finalize(request, root, tmp_path / "finalized")
+        else:
+            with pytest.raises(ValueError, match="lacks valid producer.overlay_sha256"):
+                finalize(request, root, tmp_path / "finalized")
+    finally:
+        monkeypatch.undo()
+        native_artifact._glm_producer_record.cache_clear()
 
 
 def test_finalized_request_with_another_warmup_count_needs_a_fresh_probe(tmp_path, capsys):

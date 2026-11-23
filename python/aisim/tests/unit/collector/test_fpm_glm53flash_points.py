@@ -705,11 +705,12 @@ def test_capacity_rule_counts_every_free_block_of_the_cache(caplog, pages, prefi
 def _vllm_blocks(workload_kind, point, checkpoint):
     """The blocks of one TP 4 point and the blocks of one request in one KDA group, stated apart from the generator.
 
-    vLLM 0.33.0's scheduler gave every point of the two TP 4 lists exactly these blocks, in a run of its own code with
-    the settings of the collector's launch (prefix caching, Mamba mode align, 2,176-token blocks, no async scheduling,
-    four KDA groups, one attention group and the ring), and one block less failed every point that an engine starts for
-    with that pool (269 of the 577 points of the list with a checkpoint block and 277 of the 537 points of the list
-    without one).
+    The count is the one of vLLM 0.33.0's allocator for the settings of the collector's launch (prefix caching, Mamba
+    mode align, 2,176-token blocks, no async scheduling, four KDA groups, one attention group and the ring). A request
+    holds the attention blocks of its tokens and one ring block (kv_cache_interface.py:982-989). In each KDA group it
+    holds its running block, the cached block of a prefix, and the checkpoint block of a chunk that saves a checkpoint
+    inside it (single_type_kv_cache_manager.py:1740-1795), which needs more than one hash block of new tokens
+    (kv_cache_interface.py:1189-1210).
     """
     batch = point["batch_size"]
     if workload_kind == "prefill":
@@ -731,8 +732,8 @@ def test_capacity_estimate_of_every_tp4_point_is_the_count_of_vllm(alignment, pe
     # Blocks of one request in one KDA group: 1 for the 54 decode points below one hash block and the 57 prefills of at
     # most one hash block without a prefix, 2 for the 27 decode points above it, the 5 longer prefills without a prefix
     # and the 399 prefills of at most one hash block with a prefix, and 3 for the 35 longer prefills with a prefix. The
-    # list without a checkpoint block holds no prefill of more than one hash block. vLLM 0.33.0's scheduler gave every
-    # point these blocks in a run of its own code.
+    # list without a checkpoint block holds no prefill of more than one hash block. _vllm_blocks cites the vLLM 0.33.0
+    # lines that give these counts.
     payload, _ = glm_points(**{**_TP4_LIMITS, "checkpoint_alignment": alignment})
     counts = Counter()
     for kind in ("prefill", "decode"):
@@ -749,10 +750,11 @@ def test_capacity_estimate_of_every_tp4_point_is_the_count_of_vllm(alignment, pe
 @pytest.mark.parametrize(("context", "blocks"), [(2048, 6), (2175, 6), (2176, 11), (2177, 11)])
 def test_decode_request_at_one_hash_block_holds_two_blocks_of_each_mamba_group(context, blocks):
     # The two TP 4 lists hold a context of 2,048 tokens and none of the three contexts at the edge of the first block.
-    # vLLM 0.33.0's scheduler, run with the settings of the collector's launch, gave one decode request at a context
-    # of 2,048 tokens 1 attention block, the ring block and 1 block in each KDA group, 6 in all, and the same 6 at
-    # 2,175 tokens, where the decode step fills the first block. At 2,176 and 2,177 tokens, without a seed, its decode
-    # steps enter the second block: 2 attention blocks, the ring block and 2 blocks in each KDA group, 11.
+    # In vLLM 0.33.0 a decode request at a context of 2,048 tokens holds 1 attention block, the ring block
+    # (kv_cache_interface.py:982-989) and 1 block in each KDA group, 6 in all, and the same 6 at 2,175 tokens, where
+    # the decode step fills the first block. At 2,176 and 2,177 tokens, without a seed, its decode steps enter the
+    # second block: 2 attention blocks, the ring block and 2 blocks in each KDA group
+    # (single_type_kv_cache_manager.py:1740-1795), 11.
     point = {"batch_size": 1, "total_kv_read_tokens": context}
     assert glm_point_blocks("decode", point, hash_block_size=2176, state_groups=((1, 4),), checkpoint_alignment=16) == (
         blocks
