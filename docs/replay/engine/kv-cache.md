@@ -1366,10 +1366,10 @@ sub-block matching without an explicit full-state scratch count.
     cached block at its first later allocation whose processed token count
     lies past the hit, as vLLM does. That is the next step with
     `async_scheduling: false`. When the step before is still in flight, it
-    is one step later: on an aggregated worker in the layouts of the rule
-    above, and on a prefill or decode worker in every layout. In the other
-    layouts an aggregated worker releases it at the next step in both
-    modes. The block stays cached until eviction. See vLLM
+    is one step later: on an aggregated worker except in the layouts that
+    the second item of the known differences below names, and on a prefill
+    or decode worker in every layout. In those layouts an aggregated worker
+    releases it at the next step in both modes. The block stays cached until eviction. See vLLM
     v0.31.0
     [`kv_cache_manager.py:552-556`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_manager.py#L552-L556)
     and
@@ -1413,8 +1413,9 @@ sub-block matching without an explicit full-state scratch count.
     request takes that block in the chunk that reaches the end of its prefill.
     It releases the block at its first later allocation after the chunk is
     processed: the next step with `async_scheduling: false`, and one step
-    later with a step in flight, on an aggregated worker in the layouts of
-    the rule above and on a prefill or decode worker in every layout. As in
+    later with a step in flight, on an aggregated worker except in the
+    layouts that the second item of the known differences below names, and
+    on a prefill or decode worker in every layout. As in
     vLLM, the
     prefill of a request that
     resumes after a preemption ends one token before its last known token,
