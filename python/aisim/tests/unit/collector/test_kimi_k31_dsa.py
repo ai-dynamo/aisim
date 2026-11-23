@@ -129,14 +129,18 @@ def test_explicit_native_request_rejected_before_stock_route_filtering(phase):
 
 
 @pytest.mark.parametrize("model_scoped", [False, True])
-def test_cli_generated_plan_keeps_native_ops_model_scoped(monkeypatch, capsys, model_scoped):
+def test_cli_generated_plan_keeps_native_ops_model_scoped(model_scoped):
     import collect
     from collector.version_resolver import build_collections
 
     selection = ["--model-path", MODEL] if model_scoped else ["--model-cases-full"]
-    monkeypatch.setattr(sys, "argv", ["collect", "--backend", "sglang", "--plan-only", *selection])
-    collect.main()
-    ops = json.loads(capsys.readouterr().out)["ops"]
+    result = subprocess.run(
+        [sys.executable, collect.__file__, "--backend", "sglang", "--plan-only", *selection],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    ops = json.loads(result.stdout)["ops"]
     native = {f"kimi_k31_dsa_{phase}_module" for phase in ("context", "generation")}
     if model_scoped:
         assert set(ops) == native
