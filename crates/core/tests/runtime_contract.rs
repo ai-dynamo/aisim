@@ -1977,6 +1977,11 @@ fn grouped_destination_in_byte_mode_with_a_window_group_stops_where_vllm_stops()
             .unwrap();
         assert_eq!(report.request_counts.completed_requests, 2, "{version}");
         let (first, second) = (record(&report, "first"), record(&report, "second"));
+        assert!(first.destination_reserved_ms.is_some(), "{version}");
+        assert_eq!(
+            first.destination_reserved_ms, second.destination_reserved_ms,
+            "{version}"
+        );
         assert_eq!(
             (first.readmission_count, second.readmission_count),
             (1, 0),

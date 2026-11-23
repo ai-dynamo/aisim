@@ -3574,8 +3574,11 @@ mod tests {
             wire
         };
         // Only the three exact strings are supported, so a short form, a `v`
-        // prefix and a patch release are refused too.
-        for version in ["0.30.0", "0.99.0", "", "0.33", "v0.33.0", "0.33.1"] {
+        // prefix, a patch release and a value with a space before or after it
+        // are refused too.
+        for version in [
+            "0.30.0", "0.99.0", "", "0.33", "v0.33.0", "0.33.1", " 0.33.0", "0.33.0 ",
+        ] {
             assert_eq!(
                 validation_error(wire(Some(version))),
                 unsupported,

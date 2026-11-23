@@ -637,6 +637,29 @@ fn rules_map_a_convolution_group_to_a_sliding_window() {
                 "{version:?} at {in_flight}"
             );
         }
+        // The profile can give a convolution group a window that is not its
+        // block. The window is then the `sliding_window` of the group: with a
+        // block of 4 and a window of 8 the admission cap is
+        // cdiv(min(7 + in flight, 256), 4) + 1, with the term
+        // `extra_retained_tokens` at its default 0 (v0.31.0 iface:838, v0.32.0
+        // :857, v0.33.0 :908), so the startup check counts 16 + 10 + 1 = 27
+        // blocks for 32 tokens in flight and 16 + 18 + 1 = 35 for 64.
+        let mut wide = attention("convolution", 4, Some(8));
+        wide.kind = FpmCacheKind::Convolution;
+        let rules =
+            GroupedPrefixRules::new(&[attention("full", 16, None), wide], 4, version).unwrap();
+        assert_eq!(
+            rules.groups.last().unwrap().kind,
+            GroupRuleKind::SlidingWindow { window: 8 },
+            "{version:?}"
+        );
+        for (in_flight, startup) in [(32, 27), (64, 35)] {
+            assert_eq!(
+                rules.startup_blocks(256, in_flight),
+                startup,
+                "{version:?} at {in_flight}"
+            );
+        }
         // The profile keeps the kind, so a convolution group and an attention
         // group with the same block and window stay two spec groups. vLLM
         // joins two groups only when their specs are equal in every field
@@ -1298,6 +1321,103 @@ fn decode_side_hit_drops_a_state_hit_above_the_scheduler_block_floor() {
             coordinator.destination_admission_blocks(pool, &hit, 96, 97),
             2
         );
+    }
+}
+
+#[test]
+fn decode_side_hit_floors_to_the_least_common_multiple_of_every_group_block() {
+    // vLLM's scheduler block is the least common multiple of the blocks of
+    // all cache groups (v0.31.0 kv_cache_utils.py:767-770, v0.32.0 :848-851,
+    // v0.33.0 :860-863), and the scheduler floors the local prefix to it
+    // (V31 sched:941-952, V32 sched:971-982, v0.33 sched:1131-1142). A load
+    // past the local prefix truncates the hit blocks of every group to the
+    // floor (V31 sched:974-985, V32 sched:1007-1018, v0.33 sched:1167-1178),
+    // and a Mamba list keeps min(floor / B, len) blocks (V31 mgr:852-853,
+    // V32 mgr:826-827, v0.33 mgr:835-836).
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
+        // Blocks that are not multiples of each other: full attention 16
+        // and a state group of 24 at a hash block of 8 have a scheduler
+        // block of 48. The full-attention keys reach 80 and the state key
+        // lies at 48, so the local prefix is 80 and its floor 48: 3
+        // full-attention keys, and the state list of cdiv(48, 24) = 2
+        // entries keeps min(48 / 24, 2) = 2, so the state hit stays. The
+        // largest block, 24, would give 72.
+        let groups = [attention("a", 16, None), state("s", 24, true, false)];
+        let coordinator = with_limits(GroupedPrefixRules::new(&groups, 8, version).unwrap());
+        assert_eq!(coordinator.rules().scheduler_block, 48, "{version:?}");
+        let mut kv = kv_pool(&groups, 64);
+        let pool = kv.block_pool_mut().unwrap();
+        seed_many(pool, 0, 8, &[16, 32, 48, 64, 80]);
+        seed(pool, key(1, 8, 48));
+        let hit = coordinator.find_destination_hit(pool, &lease(161, 8), 161, 160);
+        assert_eq!((hit.tokens, hit.junction_tokens), (48, 0), "{version:?}");
+        assert_eq!(
+            hit.per_group[0],
+            GroupHitBlocks::Attention(
+                [16, 32, 48]
+                    .iter()
+                    .map(|&end| Some(key(0, 8, end)))
+                    .collect()
+            ),
+            "{version:?}"
+        );
+        assert_eq!(
+            hit.per_group[1],
+            GroupHitBlocks::DroppedState {
+                key: key(1, 8, 48),
+                tokens: 48
+            },
+            "{version:?}"
+        );
+
+        // A group that is not prefix-cacheable enters the scheduler block:
+        // full attention 16, a state group of 32 and a ring of 24 at a hash
+        // block of 4 have a scheduler block of 96. The full-attention keys
+        // reach 176 and the state key lies at 96, so the local prefix is
+        // 176 and its floor 96: 6 full-attention keys, and the state list
+        // of 3 entries keeps min(96 / 32, 3) = 3. The blocks of the
+        // prefix-cacheable groups alone, 16 and 32, would give 160.
+        let groups = [
+            attention("a", 16, None),
+            state("s", 32, true, false),
+            state("ring", 24, false, false),
+        ];
+        let coordinator = with_limits(GroupedPrefixRules::new(&groups, 4, version).unwrap());
+        assert_eq!(coordinator.rules().scheduler_block, 96, "{version:?}");
+        let mut kv = kv_pool(&groups, 64);
+        let pool = kv.block_pool_mut().unwrap();
+        seed_many(
+            pool,
+            0,
+            4,
+            &[16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176],
+        );
+        seed(pool, key(1, 4, 96));
+        let hit = coordinator.find_destination_hit(pool, &lease(257, 4), 257, 256);
+        assert_eq!((hit.tokens, hit.junction_tokens), (96, 0), "{version:?}");
+        assert_eq!(
+            hit.per_group[0],
+            GroupHitBlocks::Attention(
+                [16, 32, 48, 64, 80, 96]
+                    .iter()
+                    .map(|&end| Some(key(0, 4, end)))
+                    .collect()
+            ),
+            "{version:?}"
+        );
+        assert_eq!(
+            hit.per_group[1],
+            GroupHitBlocks::DroppedState {
+                key: key(1, 4, 96),
+                tokens: 96
+            },
+            "{version:?}"
+        );
+        assert_eq!(hit.per_group[2], GroupHitBlocks::None, "{version:?}");
     }
 }
 
@@ -5366,6 +5486,42 @@ fn block_that_one_chunk_fills_past_the_prompt_tail_takes_both_keys() {
         coordinator.release_request(pool, &mut b);
         assert_eq!(pool.active_blocks(), 0, "{version:?}");
         assert_eq!(pool.inactive_cached_blocks(), cached, "{version:?}");
+    }
+}
+
+#[test]
+fn tail_key_goes_to_a_cached_block_when_one_step_ends_past_that_block() {
+    // A request of 64 prompt tokens that is admitted again after 35 output
+    // tokens knows 99 tokens. Without a hit its first step runs from 0 to
+    // 96, past the prompt end: 96 is the last block end below its 99 known
+    // tokens, above the partial tail 60, so the split has no stop at the
+    // tail. The cache step of 96 tokens gives the second block its full key,
+    // and vLLM then adds the tail entry at 60 to that block, because 60 is
+    // not above the cached count (v0.32.0 single:860-884, v0.33.0
+    // single:870-897). The lease of this test holds the hashes of the prompt
+    // only, so the block of the output tokens gets no key.
+    let hash = 4;
+    for version in [VllmRuleVersion::V0_32_0, VllmRuleVersion::V0_33_0] {
+        let groups = groups_of_32(false);
+        let mut coordinator = with_limits(GroupedPrefixRules::new(&groups, hash, version).unwrap());
+        assert_eq!(
+            coordinator.rules().align_split(0, 64, 99, 99, 0, BUDGET),
+            96
+        );
+        let mut kv = kv_pool(&groups, 64);
+        let pool = kv.block_pool_mut().unwrap();
+        let request = lease(64, hash);
+        let cold = coordinator.find_longest_hit(pool, &request, 64);
+        let mut a = coordinator.new_lease();
+        coordinator.begin_step();
+        assert!(coordinator.allocate(pool, &mut a, 98, 0, 96, 0));
+        coordinator.finalize(pool, &mut a, &request, 64, 96, &cold);
+        coordinator.release_copy_sources(pool);
+        assert_eq!(
+            cached_positions(pool, 0, &request, hash, 64),
+            [32, 60, 64],
+            "{version:?}"
+        );
     }
 }
 
