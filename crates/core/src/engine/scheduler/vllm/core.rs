@@ -6,8 +6,9 @@
 // async-scheduling batch queue, of the v0.29.0
 // (98dff2a81d747d1dba01a47f939f48c3526d4206) align-mode prefill split, of the
 // v0.30.0 (ced6857afa0ea7b2e3f0846a62e1394e90f15607) async block frees and of
-// the v0.31.0 (db9527a46873454610df6dbedf79a36d6bf1a7f6) and v0.32.0
-// (5df63a7203cdb9328d824a27b682e77c7b9928be) grouped KV rules;
+// the v0.31.0 (db9527a46873454610df6dbedf79a36d6bf1a7f6), v0.32.0
+// (5df63a7203cdb9328d824a27b682e77c7b9928be) and v0.33.0
+// (4ba787ec9959e566d3b587a796dff07673324da5) grouped KV rules;
 // immutable sources and license: THIRD_PARTY_NOTICES.md.
 // MTP/G2 semantics additionally adapted from vLLM v0.32.0, commit
 // 5df63a7203cdb9328d824a27b682e77c7b9928be, vllm/v1/core/sched/scheduler.py
@@ -34,7 +35,7 @@ use crate::engine::common::utils::{
 use crate::engine::host_offload::{G2Binding, HostTierHandle};
 use crate::engine::kv_manager::AllocationRequirement;
 use crate::engine::kv_manager::{
-    AdmissionLimits, G1Manager, GroupedKvPool, GroupedPrefixRules, VllmRuleVersion,
+    AdmissionLimits, G1Manager, GroupedKvPool, GroupedPrefixRules, PrefixHashMemo, VllmRuleVersion,
 };
 use crate::engine::kv_manager::{DestinationReservation, G1Acquire, NativeAllocation};
 use crate::engine::kv_manager::{mamba_prefill_checkpoint, state_boundaries};
@@ -707,6 +708,9 @@ pub(crate) struct VllmCore {
     g1_prefix_cache_lookup: Option<crate::engine::PrefixCacheLookupCounts>,
     retain_local_hashes: bool,
     emit_token_ids: bool,
+    /// The `prefix_match_unit` hashes of the prompt spans this engine has
+    /// hashed twice, under prefix caching.
+    prefix_hash_memo: Option<PrefixHashMemo>,
     native_host_offload: Option<VllmHostOffloadAdapter>,
     /// A host transfer completed while destinations were deferred.
     destination_retry_ready: bool,
@@ -724,7 +728,7 @@ pub(crate) struct VllmCore {
     /// Requests that finished in the latest pass. vLLM frees their blocks when
     /// it processes that pass's outputs, after it has formed the next pass.
     finished_in_flight: Vec<HeldVllmPrefill>,
-    /// Requests the pass in flight runs, sorted, when vLLM defers freeing their
+    /// Requests the pass in flight runs, when vLLM defers freeing their
     /// blocks until that pass ends: async scheduling with a CPU tier.
     in_flight_requests: Vec<Uuid>,
     /// `launch`: when vLLM decides the pass after the latest one, if that pass
@@ -973,6 +977,11 @@ impl VllmCore {
                 .as_ref()
                 .is_some_and(|host| host.scope == G2Scope::ClusterShared);
         let emit_token_ids = args.emit_kv_token_ids;
+        // Without prefix caching a block identity is random and names no prefix.
+        let prefix_hash_memo = args
+            .prefix_match_unit
+            .filter(|_| args.enable_prefix_caching)
+            .and_then(|unit| PrefixHashMemo::new(unit, args.block_size));
         let eagle_block_drop = args.aic_nextn.is_some() && !args.disable_eagle_block_drop;
         let speculative_sampler = args.aic_nextn.map(|nextn| {
             let rates =
@@ -1100,6 +1109,7 @@ impl VllmCore {
             g1_prefix_cache_lookup: None,
             retain_local_hashes,
             emit_token_ids,
+            prefix_hash_memo,
             native_host_offload,
             destination_retry_ready: false,
             wave_step: 0,
@@ -1623,7 +1633,7 @@ impl VllmCore {
     }
 
     fn make_request_state(
-        &self,
+        &mut self,
         request: DirectRequest,
         status: RequestStatus,
         waiting_order: u64,
@@ -1678,7 +1688,12 @@ impl VllmCore {
         );
         sequence.lease.session_id = request.session_id;
         if let (Some(unit), Some(tokens)) = (self.args.prefix_match_unit, prefix_tokens) {
-            sequence.lease.configure_prefix_hashes(&tokens, unit);
+            match &mut self.prefix_hash_memo {
+                Some(memo) => sequence
+                    .lease
+                    .configure_prefix_hashes_memoized(&tokens, memo),
+                None => sequence.lease.configure_prefix_hashes(&tokens, unit),
+            }
         }
         let host_offload = self.native_host_offload.as_ref().map(|adapter| {
             Box::new(VllmHostRequestState::new(
@@ -2285,6 +2300,7 @@ impl VllmCore {
         };
         let end_ms = forward_time.end_ms(pass.compute_start_ms);
         let mut result = pass.result;
+        result.forward_time = forward_time;
         result.end_ms = end_ms;
         // `launch`: vLLM returns the previous pass's outputs, then decides the
         // next pass, once it has launched this pass and the previous pass has
@@ -2994,7 +3010,8 @@ impl VllmCore {
         // vLLM keeps the copy sources of a prefix hit inside a block in use
         // until the end of `schedule()`, so no later request of the step can
         // take them (vllm/v1/core/sched/scheduler.py v0.31.0 1434-1442,
-        // v0.32.0 1474-1482). Replay releases them here, once per pass.
+        // v0.32.0 1474-1482, v0.33.0 1698-1706). Replay releases them here,
+        // once per pass.
         self.kv_manager.release_grouped_copy_sources();
 
         if !defer_prefills && !preempted_any {
@@ -3107,8 +3124,6 @@ impl VllmCore {
                 committed_requests.push(signal.uuid);
             }
         }
-        committed_requests.sort_unstable();
-        committed_requests.dedup();
         if self.args.max_concurrent_batches > 1 {
             self.pass_ran_work = !committed_requests.is_empty();
             if self.native_host_offload.is_some() {
@@ -3154,6 +3169,7 @@ impl VllmCore {
             }),
         };
         let result = EnginePassResult {
+            forward_time: ForwardTime::default(),
             committed_requests,
             // The forward's end and the retry it implies are set when it is
             // priced; `now_ms` holds their place.
@@ -3308,7 +3324,7 @@ impl VllmCore {
         // vLLM does not free the blocks of a request the pass in flight runs
         // until that pass ends (async scheduling with a CPU tier), so it does
         // not preempt such a request: the allocation stops instead.
-        if self.in_flight_requests.binary_search(&selected).is_ok() {
+        if self.in_flight_requests.contains(&selected) {
             return None;
         }
         let state_before = self.pressure_state();

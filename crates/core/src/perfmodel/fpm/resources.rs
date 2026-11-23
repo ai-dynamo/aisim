@@ -308,7 +308,7 @@ pub enum FpmMambaCacheMode {
 /// ran with. Selection and sizing do not read them. Grouped prefix caching
 /// needs `enable_prefix_caching` true and `hash_block_size_tokens`, and replay
 /// then hashes prompts in blocks of `hash_block_size_tokens`. Replay models grouped prefix caching
-/// for vLLM 0.31.0 and 0.32.0 only. For a linear profile, the simulated
+/// for vLLM 0.31.0, 0.32.0 and 0.33.0 only. For a linear profile, the simulated
 /// deployment decides prefix caching.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -609,7 +609,11 @@ impl ForwardPassPerfModelConfig {
             deployment
                 .get("resources")
                 .cloned()
-                .ok_or_else(|| invalid("FPM deployment requires resources"))?,
+                .ok_or_else(|| {
+                    invalid(
+                        "FPM resources are pending; supply cache_layout, max_num_tokens, max_batch_size, provenance, and kv_bytes_per_token (linear) or cache_groups (grouped) before cache sizing or replay",
+                    )
+                })?,
         )
         .map_err(|error| invalid(format!("FPM resource profile: {error}")))?;
         resources.validate()?;
@@ -677,7 +681,7 @@ impl ForwardPassPerfModelConfig {
         Ok(Some(binding))
     }
 
-    fn fpm_deployment(&self) -> Result<Option<&serde_json::Value>, AicError> {
+    pub(super) fn fpm_deployment(&self) -> Result<Option<&serde_json::Value>, AicError> {
         let Some(profile) = &self.fpm_profile else {
             return Ok(None);
         };
