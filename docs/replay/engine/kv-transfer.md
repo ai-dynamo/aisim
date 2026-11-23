@@ -124,7 +124,9 @@ Replay differs from vLLM in these known ways for a grouped profile:
 - When the prefix cache of the decode worker already holds every transferred
   token of a request, vLLM 0.31.0, 0.32.0 and 0.33.0 load nothing and charge
   no transfer. Replay loads the state of such a request again: it reserves
-  the blocks of a load, applies the two tests of a load and charges
+  the blocks of a load, applies the two tests that a decode worker makes to
+  reserve a transferred request (see
+  [grouped caches](kv-cache.md#other-cache-modes)) and charges
   `fixed_bytes`. With hits inside a block, replay also rounds its local
   prefix down to a multiple of the scheduler block, where vLLM keeps it, so
   replay also moves the full-attention blocks above that multiple. So such a

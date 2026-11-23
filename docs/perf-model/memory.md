@@ -601,9 +601,10 @@ With prefix caching on, replay keeps the blocks of all groups in one block pool:
   an aggregated worker holds it for one step, one step less than vLLM with
   a step in flight. A
   prefill or decode worker holds it for two steps with a step in flight, in
-  every layout. After it writes past a state that it published inside a
-  block, it holds the published block to the end of that scheduling pass,
-  or as a previous block when the write also crosses a block boundary. A ring
+  every layout. On every worker, after a request writes past a state that
+  it published inside a block, the group holds the published block to the
+  end of that scheduling pass, or as a previous block when the write also
+  crosses a block boundary. A ring
   holds one block. [Replay KV cache](../replay/engine/kv-cache.md#other-cache-modes)
   describes the blocks of a hit and of a checkpoint.
 - A request releases its blocks tail first. With async scheduling, a finished
