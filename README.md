@@ -408,6 +408,10 @@ APIs:
 
 Open-source whole-forward FPM datasets are hosted on
 [Hugging Face](https://huggingface.co/datasets/ai-dynamo/aisim-data).
+Download the files for one model and hardware platform with
+`aisim data fetch --category fpm --model MiniMaxAI/MiniMax-M2.7 --hardware h200_sxm`;
+add `--dry-run` to preview the download. FPM data is opt-in: it is never part of the
+default download and needs `--model` (or `--configuration`).
 FPM prediction requires a Parquet dataset and its adjacent, same-stem
 `.metadata.json` sidecar. See the
 [core API guide](docs/perf-model/methods/whole-forward.md#external-whole-forward-fpm-data) for

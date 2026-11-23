@@ -40,7 +40,7 @@ typed JSON error (`{"error": code, "message": ...}`) on stderr.
 aisim data fetch --dry-run                    # plan the whole op-latency database
 aisim data fetch                              # download it (same as --category op-latency --all)
 aisim fetch --hardware h200_sxm --framework vllm
-aisim data fetch --category fpm --model Qwen/Qwen3-32B --hardware h200_sxm
+aisim data fetch --category fpm --model MiniMaxAI/MiniMax-M2.7 --hardware h200_sxm
 ```
 
 With no arguments, `fetch` downloads the whole op-latency database. FPM, e2e and eval data are never part of
