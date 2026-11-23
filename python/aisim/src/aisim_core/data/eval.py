@@ -377,10 +377,18 @@ def compute_results(
     for case_id, truth, predicted in cases:
         if case_id in excluded:
             continue
-        if truth is None or predicted is None or not math.isfinite(predicted) or not truth > 0:
+        if (
+            truth is None
+            or not math.isfinite(truth)
+            or predicted is None
+            or not math.isfinite(predicted)
+            or not truth > 0
+        ):
             reason = "missing truth" if truth is None else "missing prediction"
             if truth is not None and predicted is not None and math.isfinite(predicted):
                 reason = "non-positive truth"
+            if truth is not None and not math.isfinite(truth):
+                reason = "non-finite truth"
             excluded[case_id] = Exclusion(case_id=case_id, reason=reason)
             continue
         errors.append((case_id, truth, predicted, (predicted - truth) / truth * 100.0))
@@ -471,12 +479,13 @@ def verify_record(
             return VerificationReport(ok=False, problems=[f"truth row {case_id!r} has no valid inputs_json object"])
         case_inputs[case_id] = json.dumps(inputs, sort_keys=True, separators=(",", ":"))
         cases.append((case_id, truth, predict(inputs)))
-    # Exclusions recorded by the producer are honored only if they name real rows.
-    unknown = [e.case_id for e in record.results.exclusions if e.case_id not in set(ids)]
-    if unknown:
-        problems.append(f"exclusions name unknown cases: {unknown[:3]}")
-    recorded_excl = [e for e in record.results.exclusions if e.case_id in set(ids)]
-    got = compute_results(cases, recorded_excl)
+    # Derive exclusions from the checked truth and this predictor. A producer cannot remove a valid error
+    # from the aggregate by labeling its case excluded.
+    got = compute_results(cases)
+    excluded_ids = {e.case_id for e in got.exclusions}
+    unjustified = [e.case_id for e in record.results.exclusions if e.case_id not in excluded_ids]
+    if unjustified:
+        problems.append(f"exclusions not justified by recomputation: {unjustified[:3]}")
     claimed = record.results
     for name in ("n_total", "n_scored"):
         if getattr(got, name) != getattr(claimed, name):

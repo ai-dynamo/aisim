@@ -359,6 +359,20 @@ def test_init_containers_count_toward_the_gpu_window_and_must_have_finished():
         gpu_time_from_kubernetes(job, [_pod_with(app, init=unfinished)])
 
 
+@pytest.mark.parametrize("init_gpus,sidecar,expected", [(4, False, 4), (1, False, 2), (3, True, 5)])
+def test_kubernetes_counts_the_effective_init_and_app_gpu_reservation(init_gpus, sidecar, expected):
+    from aisim_core.data.gpu_time import gpu_time_from_kubernetes
+
+    pod = _pod("p", "Succeeded", "2026-11-07T00:01:00Z", "2026-11-07T00:02:00Z", gpus="2")
+    init = {"resources": {"limits": {"nvidia.com/gpu": str(init_gpus)}}}
+    if sidecar:
+        init["restartPolicy"] = "Always"
+    pod["spec"]["initContainers"] = [init]
+    pod["status"]["initContainerStatuses"] = [_container("2026-11-07T00:00:00Z", "2026-11-07T00:01:00Z")]
+    gt = gpu_time_from_kubernetes({**_JOB, "spec": {}}, [pod])
+    assert (gt.gpu_count, gt.wall_seconds, gt.gpu_seconds) == (expected, 120.0, expected * 120.0)
+
+
 def test_an_earlier_run_overlapping_the_final_window_is_not_charged_twice():
     from aisim_core.data.gpu_time import KubeParseError, gpu_time_from_kubernetes
 

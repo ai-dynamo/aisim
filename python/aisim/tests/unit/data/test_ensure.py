@@ -529,7 +529,7 @@ def test_an_entry_whose_manifest_belongs_to_another_model_is_refused(tmp_path):
 def test_a_configuration_id_constrains_only_the_category_that_lists_it(tmp_path, monkeypatch, categories):
     seen = {}
 
-    def fake_ids(pin_, transport, category, out):
+    def fake_ids(pin_, transport, category, out=None):
         return {"cfg-fpm": {"cfg-a", "cfg-b"}, "cfg-op": {"cfg-x"}}.get(
             {"fpm": "cfg-fpm", "op-latency": "cfg-op"}[category], set()
         )

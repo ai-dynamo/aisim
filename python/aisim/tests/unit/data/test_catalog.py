@@ -305,6 +305,28 @@ def test_a_manifest_edited_after_indexing_is_not_counted(dataset):
         build_catalog(root, systems_dir=systems)
 
 
+@pytest.mark.parametrize("field", ["identity", "category"])
+def test_catalog_rejects_a_digest_pinned_manifest_for_another_cell(dataset, field):
+    root, systems = dataset
+    path = "data/fpm/m0.json"
+    doc = json.loads((root / path).read_bytes())
+    if field == "identity":
+        doc["identity"]["hardware"] = "h100_sxm"
+    else:
+        doc["category"] = "e2e"
+    (root / path).write_text(json.dumps(doc))
+    index_path = root / "catalog/fpm.json"
+    index = json.loads(index_path.read_bytes())
+    index["entries"][0]["manifest"] = _file_artifact(root, path).model_dump(by_alias=True)
+    index_path.write_text(json.dumps(index))
+    dataset_path = root / "catalog/dataset.json"
+    document = json.loads(dataset_path.read_bytes())
+    document["categories"]["fpm"]["index"] = _file_artifact(root, "catalog/fpm.json").model_dump(by_alias=True)
+    dataset_path.write_text(json.dumps(document))
+    with pytest.raises(ValueError, match="catalog and manifest identity mismatch"):
+        build_catalog(root, systems_dir=systems)
+
+
 def test_a_category_index_edited_after_indexing_is_refused(dataset):
     root, systems = dataset
     index = root / "catalog/e2e.json"

@@ -111,7 +111,7 @@ before moving the cache. `AISIM_DATA_CATEGORIES` defaults to `fpm`; name `op-lat
 a missing or corrupt file is a precise error, and there is no fallback to other data. A run that builds its
 operation tables from `systems_paths` or `AICONFIGURATOR_SYSTEMS_PATH` (an explicit `backend_version` in
 `aisim predict`, `recommend` or `replay`) does not read the pin; prepare a root for it as described below. Other pin variables: `AISIM_DATA_CATEGORIES` (default `fpm`),
-`AISIM_DATA_CONFIGURATION` (choose among several matches; with several categories it constrains only the category that lists the ID), `AISIM_DATA_MAX_BYTES` (auto-download
+`AISIM_DATA_CONFIGURATION` (choose among several matches; with several categories it constrains only the category that lists the ID; for operation tables it resolves only that operation family's conflict and retains complementary families), `AISIM_DATA_MAX_BYTES` (auto-download
 threshold, default 256 MiB) and `AISIM_DATA_LOCAL` (a dataset-layout directory used instead of Hugging Face).
 Private datasets use the standard `HF_TOKEN` only while connected; the cache needs none.
 
@@ -124,8 +124,11 @@ entry's `reuse.yaml` declares as donors, the `nccl`/`oneccl` entries the system 
 same backend and the other backends the pinned `perf_data_reuse_manifest` allows. A donor or source the dataset
 does not publish is skipped. The root is rebuilt whenever the entries' artifact digests or the packaged specs
 change. An omitted `backend_version` or a slot alias (`current`, `previous`, `next`) is resolved from the pinned
-dataset's `query_versions` lookup, and the whole pin shares one `AISIM_DATA_MAX_BYTES` allowance.
+dataset's `query_versions` lookup, and the whole pin shares one `AISIM_DATA_MAX_BYTES` allowance,
+including catalog, configuration-owner and version-policy discovery. Warm cached files consume none of it.
 An FPM library pinned together with it is staged from that root alone, with no active systems root as a fallback.
+Indexed layouts must pin both lookup tables; only legacy local indexes that omit the `support` field may use
+embedded lookup checksums alone.
 
 For FPM dataset selection, a mapping that omits topology leaves parallelism unfiltered. If both TP1 and TP4 entries
 match, `ensure_data` raises an ambiguity error; supply an explicit topology or set

@@ -30,6 +30,7 @@ HF dataset ──fetch──▶ local cache ──loader──▶ predictor inpu
   - No pin means a no-op.
   - A category named by the pin never falls back to packaged data.
 - `op-latency` composes every operation family for one system, backend and version, with the system specs, into one root.
+  A configuration ID resolves the conflict in its own family while retaining complementary families.
 - `fpm` selects one entry; several matches need `AISIM_DATA_CONFIGURATION`.
 - `materialize_systems_root` writes a self-contained root for Rust and other consumers that never run Python.
 
