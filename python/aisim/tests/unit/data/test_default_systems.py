@@ -197,3 +197,37 @@ def test_naming_roots_is_decided_without_composing_the_default(cold_offline, tmp
     monkeypatch.setattr(cold_offline, "_SYSTEMS_PATHS", None)  # drop the override; only the variable names roots
     monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", str(custom))
     assert _names_systems_paths({}) is True
+
+
+def test_restoring_an_unresolved_state_never_composes_the_default(cold_offline, tmp_path):
+    custom, other = tmp_path / "custom", tmp_path / "other"
+    custom.mkdir()
+    other.mkdir()
+    previous = cold_offline.explicit_systems_paths()
+    assert previous is None  # nothing resolved yet, and reading that state did not compose the default
+    cold_offline.set_systems_paths(str(custom))
+    cold_offline.restore_systems_paths(previous)
+    assert cold_offline.explicit_systems_paths() is None
+    cold_offline.set_systems_paths(str(custom))
+    cold_offline.restore_systems_paths([str(other)])
+    assert cold_offline.explicit_systems_paths() == [str(other)]
+
+
+def test_an_estimate_with_explicit_roots_never_composes_the_default(cold_offline, tmp_path, monkeypatch):
+    import aisim.legacy_cli.api as api
+
+    custom = tmp_path / "custom"
+    custom.mkdir()
+    seen = []
+    monkeypatch.setattr(cold_offline, "get_latest_database_version", lambda system, backend, systems_paths=None: "v1")
+    monkeypatch.setattr(api, "_run_agg_estimate", lambda **kwargs: seen.append(kwargs["resolved_version"]) or "done")
+    result = api.cli_estimate(
+        model_path="Qwen/Qwen3-32B",
+        system_name="h200_sxm",
+        mode="agg",
+        database_mode="SOL",
+        batch_size=1,
+        systems_paths=str(custom),
+    )
+    assert result == "done" and seen == ["v1"]
+    assert cold_offline.explicit_systems_paths() is None  # the call left the process as it found it

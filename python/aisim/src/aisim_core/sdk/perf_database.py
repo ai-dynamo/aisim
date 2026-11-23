@@ -134,6 +134,10 @@ def set_systems_paths(raw_paths: str | Iterable[str] | None) -> None:
             f"Invalid entries: {', '.join(invalid_paths)}"
         )
     _SYSTEMS_PATHS = resolved_paths
+    _drop_systems_caches()
+
+
+def _drop_systems_caches() -> None:
     _load_system_spec_from_paths.cache_clear()
     _cached_configured_database_view.cache_clear()
     from aisim_core.sdk.operations.base import clear_all_op_caches
@@ -144,6 +148,16 @@ def set_systems_paths(raw_paths: str | Iterable[str] | None) -> None:
 def explicit_systems_paths() -> list[str] | None:
     """The roots this process holds now (an override or an earlier lookup), or ``None``; never composes the default."""
     return None if _SYSTEMS_PATHS is None else list(_SYSTEMS_PATHS)
+
+
+def restore_systems_paths(previous: list[str] | None) -> None:
+    """Return to a state read earlier with ``explicit_systems_paths()``; ``None`` leaves the default unresolved."""
+    global _SYSTEMS_PATHS
+    if previous is not None:
+        set_systems_paths(previous)
+        return
+    _SYSTEMS_PATHS = None
+    _drop_systems_caches()
 
 
 def get_systems_paths() -> list[str]:
