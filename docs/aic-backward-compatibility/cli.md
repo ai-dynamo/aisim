@@ -627,7 +627,9 @@ print(result.best_configs["disagg"])
      0                60                 120               180              240
 tokens/s/gpu                        tokens/s/user
 ```
-The Pareto frontier shows the trade-off between generation speed `tokens/s/user` and throughput `tokens/s/gpu`. In this compatibility CLI example, generation speed is `1000 / TPOT_ms`, so a TPOT limit of 10 ms requires at least 100 tokens/s/user. Select the highest-throughput point at or to the right of that threshold; the boundary at 100 tokens/s/user qualifies. Points to its left exceed the TPOT limit. Changing the limit can change the selected configuration or whether aggregated or disaggregated serving has higher throughput.
+In this compatibility CLI example, the saved `pareto_frontier.png` plots per-GPU throughput (`tokens/s/gpu`) against generation speed (`tokens/s/user`). Generation speed is `1000 / TPOT_ms`, so a TPOT limit of 10 ms admits points at or to the right of 100 tokens/s/user, including the boundary.
+
+For a fixed GPU budget, the picker ranks configurations that meet the limit by `tokens/s/gpu_cluster`, which the worker setup table below displays as `tokens/s/gpu`. This metric averages throughput across the whole budget. If whole replicas leave some GPUs unused, a configuration with higher throughput in the saved plot can rank lower in the picker.
 
 Without `--strict-sla`, the plotted frontier can include points that violate the TPOT limit. Within each experiment, the top-N picker prefers configurations within the limit. When none meet it, the picker first keeps the configuration with the highest `tokens/s/gpu_cluster` value in each parallel group (`parallel` for aggregated serving, `(d)parallel` for disaggregated serving), then orders those representatives by increasing TPOT for its top-N results.
 
