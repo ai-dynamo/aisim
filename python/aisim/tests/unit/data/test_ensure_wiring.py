@@ -165,6 +165,26 @@ def test_the_recommendation_consumer_gets_the_saved_source_unless_the_user_names
     assert res._ensure_dataset(request, None) is None
 
 
+@pytest.mark.parametrize("mode", ["op_level", "auto"])
+def test_the_recommendation_consumer_keeps_an_explicit_default_root_distinct_from_unset_roots(
+    native_dataset,  # noqa: F811
+    monkeypatch,
+    mode,
+):
+    """Both expand to the packaged root, but only the literal ``default`` outranks the saved source."""
+    published, _, config = native_dataset
+    transport = FakeTransport(_tree(published))
+    monkeypatch.setattr("aisim_core.data.fetch.HfTransport", lambda: transport)
+    assert main(["init", "--on-demand", "--repo", REPO, "--revision", SHA]) == 0
+    seen = []
+    monkeypatch.setattr(ensure_mod, "ensure_data", lambda payload, pin: seen.append(payload) or "ensured")
+    _, explicit = _sweeper_request(config.model, systems_paths=["default"], mode=mode)
+    assert res._ensure_dataset(explicit, None) is None and seen == []
+    assert "default" in explicit.systems_paths
+    _, unset = _sweeper_request(config.model, mode=mode)
+    assert res._ensure_dataset(unset, None) == "ensured"
+
+
 @pytest.mark.parametrize("how", ["environment", "set_systems_paths"])
 @pytest.mark.parametrize("mode", ["op_level", "auto"])
 def test_configured_roots_outrank_the_saved_source_whether_or_not_the_request_names_them(
