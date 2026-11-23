@@ -4,7 +4,6 @@
 import json
 
 import pytest
-
 from collector.host_cpu import adapters
 from collector.host_cpu.ledger import job_cost, read_entries, render_markdown
 from collector.host_cpu.merge import merge_runs
