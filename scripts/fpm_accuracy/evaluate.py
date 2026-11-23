@@ -107,7 +107,7 @@ def score(
                 f"{case.configuration_id} {method}: construction failed: {exc}",
                 flush=True,
             )
-            construction_failed = not isinstance(exc, DependencyError)
+            construction_failed = not isinstance(exc, (DependencyError, ImportError))  # an unusable SDK is unsupported
             status = "predictor_error" if construction_failed else "unsupported_predictor"
     try:
         for observation in case.observations:

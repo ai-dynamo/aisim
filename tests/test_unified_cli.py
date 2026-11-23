@@ -1461,13 +1461,17 @@ def test_engine_stack_rejects_explicit_unavailable_component(tmp_path, monkeypat
     assert "engine.router" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize(("sla_field", "bound"), [("ttft_ms", 800.0), ("itl_ms", 30.0)])
+@pytest.mark.parametrize("input_suffix", [".yaml", ".json"])
+@pytest.mark.parametrize(
+    ("sla_field", "bound"), [("ttft_ms", 800.0), ("itl_ms", 30.0), ("ttft_ms", 1e-7), ("e2e_ms", 1e21)]
+)
 def test_partial_sla_recommendation_yaml_round_trips_into_predict(
-    tmp_path, monkeypatch, capsys, sla_field: str, bound: float
+    tmp_path, monkeypatch, capsys, sla_field: str, bound: float, input_suffix: str
 ) -> None:
-    config_path = tmp_path / "recommendation.yaml"
+    config_path = tmp_path / f"recommendation{input_suffix}"
+    serialize = json.dumps if input_suffix == ".json" else yaml.safe_dump
     config_path.write_text(
-        yaml.safe_dump(
+        serialize(
             {
                 "engine": {
                     "mode": "aggregated",
@@ -3143,6 +3147,7 @@ def test_invalid_analytical_epd_table_includes_banner():
     assert "AISim analytical EPD" in output
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_recommend_emits_explicit_hybrid_pin_with_native_capacity(tmp_path):
     shape = {"replicas": 1, "tensor": 2, "pipeline": 1, "attention_data": 4, "moe_tensor": 1, "moe_expert": 8}
     config = {
@@ -3337,6 +3342,7 @@ def test_failed_telemetry_serialization_removes_partial_artifacts(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("detail", ["memory", "all"])
 @pytest.mark.parametrize("afd_roles", [("aggregated",), ("prefill",), ("decode",), ("prefill", "decode")])
 def test_native_afd_detail_reaches_final_cli_consumer(tmp_path, capsys, detail, afd_roles):

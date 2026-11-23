@@ -561,7 +561,11 @@ def _planner(
         **overrides,
     }
     model = RustForwardPassPerfModel.best_available(ForwardPassPerfModelConfig(**fields))
-    reference = _native(worker, estimator_config={})
+    # The reference only shapes the synthetic observations. This tiny model's
+    # decode estimate is flat in batch and KV tokens to within table noise, and
+    # on the vLLM 0.32.0 tables the non-negative fit collapses to zero slopes
+    # (store never ready), so keep the collection the fixture was tuned on.
+    reference = _native(worker, estimator_config={}, backend_version="0.30.0")
     iterations = []
     for index in range(48):
         prefills, decodes = 1 + index % 4, 1 + index % 8
@@ -597,6 +601,10 @@ def planner_snapshots(tmp_path_factory) -> dict[str, Path]:
         "nextn": save("nextn", _planner("decode", kinds=("decode",), nextn=1)),
         "sglang-nextn": save("sglang-nextn", _planner("decode", kinds=("decode",), backend="sglang", nextn=1)),
         "nextn-agg": save("nextn-agg", _planner("aggregated", nextn=1)),
+        "mtp-agg": save("mtp-agg", _planner("aggregated", speculation={"kind": "mtp", "params": {"depth": 1}})),
+        "mtp-float-agg": save(
+            "mtp-float-agg", _planner("aggregated", speculation={"kind": "mtp", "params": {"depth": 1.0}})
+        ),
         "no-kv": save(
             "no-kv", _planner("decode", kinds=("decode",), deployment_limits={**_LIMITS, "max_kv_tokens": "unknown"})
         ),
@@ -917,15 +925,95 @@ def test_an_sglang_aggregated_planner_snapshot_needs_no_locally_mixed_store(plan
         _space(_planner_request(planner_snapshots["vllm-pure"], mode="aggregated"))
 
 
-def test_a_vllm_planner_snapshot_fitted_with_mtp_is_recommended_and_replayed_at_its_nextn(planner_snapshots):
-    # The snapshot pins nextn 1; the engine supplies the accepted draft tokens.
-    raw = _planner_request(planner_snapshots["nextn-agg"], mode="aggregated")
+@pytest.mark.parametrize("snapshot", ["nextn-agg", "mtp-agg", "mtp-float-agg"])
+def test_a_vllm_planner_snapshot_fitted_with_mtp_is_recommended_and_replayed_at_its_nextn(planner_snapshots, snapshot):
+    # The snapshot pins depth 1, fitted as nextn or as an MTP scheme; the engine supplies the accepted draft tokens.
+    raw = _planner_request(planner_snapshots[snapshot], mode="aggregated")
     raw["engine"].update(nextn=1, nextn_accepted=0.5)
     result = _planner_run(raw)
     assert result.counts.feasible == 1, [record.reason for record in result.candidates]
     [candidate] = result.selected_candidates
     assert candidate.prediction_config["engine"]["nextn"] == 1
     assert _replay(candidate.prediction_config).metrics["mean_tpot_ms"] == candidate.metrics["mean_tpot_ms"]
+    # An MTP scheme of the same depth is the same nextn.
+    prediction = deepcopy(candidate.prediction_config)
+    engine = prediction["engine"]
+    engine["speculation"] = {
+        "kind": "mtp",
+        "params": {"depth": engine.pop("nextn")},
+        "expected_accepted_tokens": engine.pop("nextn_accepted"),
+    }
+    assert _replay(prediction).metrics["mean_tpot_ms"] == candidate.metrics["mean_tpot_ms"]
+
+
+@pytest.mark.parametrize("depth", [3, 3.0])
+@pytest.mark.parametrize("saved_spelling", ["nextn", "mtp"])
+def test_regression_snapshot_restores_equivalent_mtp_depths(tmp_path, depth, saved_spelling):
+    # Synthetic fits exercise persistence, not accuracy. Both integer JSON
+    # representations compare alike without changing the saved cost identity.
+    fields = (
+        {"nextn": int(depth)}
+        if saved_spelling == "nextn"
+        else {"speculation": {"kind": "mtp", "params": {"depth": depth}}}
+    )
+    model = _planner("decode", kinds=("decode",), **fields)
+    try:
+        saved = model.save_state_snapshot(tmp_path / "snapshot")
+        query = [_rank(0, 2, 2048)]
+        expected = model.estimate_forward_pass_time_ms(query)
+        for overrides in (
+            {},
+            {"nextn": int(depth), "speculation": None},
+            {"nextn": 0, "speculation": {"kind": "mtp", "params": {"depth": depth}}},
+        ):
+            restored = RustForwardPassPerfModel.best_available({**saved, **overrides})
+            try:
+                assert restored.estimate_forward_pass_time_ms(query) == expected
+                identity = restored.diagnostics()["provenance"]["config"]
+                if overrides.get("speculation") is not None:
+                    # Comparing equivalent identities must not rewrite the saved cost identity.
+                    assert identity["speculation"]["params"] == {"depth": depth}
+                    assert type(identity["speculation"]["params"]["depth"]) is type(depth)
+            finally:
+                restored.close()
+        with pytest.raises(ValueError, match="differs from the snapshot's pinned identity at nextn"):
+            RustForwardPassPerfModel.best_available(
+                {**saved, "nextn": 0, "speculation": {"kind": "mtp", "params": {"depth": int(depth) + 1}}}
+            )
+    finally:
+        model.close()
+
+
+@pytest.mark.parametrize("depth", [6, 6.0])
+def test_a_regression_fitted_with_more_mtp_drafts_than_replay_runs_restores(tmp_path, depth):
+    # Cost schemes may exceed Replay's 1-5 limit; legacy nextn may not.
+    model = _planner("decode", kinds=("decode",), speculation={"kind": "mtp", "params": {"depth": depth}})
+    try:
+        saved = model.save_state_snapshot(tmp_path / "snapshot")
+        query = [_rank(0, 2, 2048)]
+        expected = model.estimate_forward_pass_time_ms(query)
+        for spelling in (6, 6.0):
+            restored = RustForwardPassPerfModel.best_available(
+                {**saved, "speculation": {"kind": "mtp", "params": {"depth": spelling}}}
+            )
+            try:
+                assert restored.diagnostics()["provenance"]["config"]["speculation"]["params"] == {"depth": spelling}
+                assert restored.estimate_forward_pass_time_ms(query) == expected
+            finally:
+                restored.close()
+        with pytest.raises(ValueError, match="nextn must be in 0..=5"):
+            RustForwardPassPerfModel.best_available({**saved, "nextn": 6, "speculation": None})
+    finally:
+        model.close()
+
+
+def test_recommendation_keeps_registered_schemes_prediction_only(planner_snapshots):
+    raw = _planner_request(planner_snapshots["mtp-agg"], mode="aggregated")
+    raw["engine"]["speculation"] = {"kind": "mtp", "params": {"depth": 1}, "expected_accepted_tokens": 0.5}
+    # Saved MTP identities are supported above through recommendation's public
+    # nextn spelling. Its scheme-block spelling remains prediction-only.
+    with pytest.raises(ValidationError, match="Input should be 'ngram'"):
+        CoreRecommendationConfig.model_validate(raw)
 
 
 def test_an_aggregated_planner_snapshot_with_attention_dp_needs_its_cross_rank_store(planner_snapshots):

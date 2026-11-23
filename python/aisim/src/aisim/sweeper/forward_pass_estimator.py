@@ -35,6 +35,28 @@ def resolve_systems_paths(configured: list[str] | None, *, require_directories: 
     return tuple(_resolve_forward_pass_systems_paths(tuple(configured or ()), require_directories=require_directories))
 
 
+def request_systems_paths(configured: list[str] | None) -> tuple[str, ...]:
+    """Roots for a forward-pass request: ``resolve_systems_paths`` plus a preserved explicit ``default``.
+
+    Unset roots and the literal ``default`` expand to the same packaged root, but only the literal token is a
+    choice that outranks the source saved by ``aisim init``. The token is resolved again when the native
+    configuration is built, so keeping it in the request only keeps that choice visible.
+    """
+
+    entries = tuple(configured or ())
+    resolved = resolve_systems_paths(configured)
+    if not any(isinstance(entry, str) and entry.strip().lower() == "default" for entry in entries):
+        return resolved
+    # Resolve each entry next to the token, never alone: a lone packaged path is read as an expansion of unset roots
+    # and swapped for AICONFIGURATOR_SYSTEMS_PATH, which would move it ahead of the explicit custom roots.
+    return tuple(
+        dict.fromkeys(
+            "default" if entry.strip().lower() == "default" else resolve_systems_paths([entry, "default"])[0]
+            for entry in entries
+        )
+    )
+
+
 def resolve_afd_backend_version(
     backend: str, requested: str | None, systems: tuple[tuple[str, tuple[str, ...]], ...]
 ) -> str:
@@ -169,7 +191,7 @@ class ForwardPassEstimatorResolver:
             estimation_mode=controls.get("estimation_mode", self._search_space.estimation_mode),
             database_mode=controls.get("database_mode", self._search_space.database_mode),
             transfer_policy=controls.get("transfer_policy", transfer_policy),
-            systems_paths=resolve_systems_paths(self._search_space.systems_paths_for(role)),
+            systems_paths=request_systems_paths(self._search_space.systems_paths_for(role)),
             fallback_policy=controls.get("fallback_policy", self._search_space.fallback_policy),
             estimator_config=estimator_config,
             # A language worker hosting the vision tower prices encoder calls too.

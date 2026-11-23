@@ -30,15 +30,220 @@ and writes additional artifacts after recommendation.
 Unless labeled as captured output, metric values in example results are hypothetical and
 illustrate the output format. Captured detail examples are simulation results, not hardware measurements.
 
+### Fetch dataset files
+
+`aisim data fetch` (alias `aisim fetch`) downloads dataset files into a local cache ahead of use, so
+later runs need no network. It prints one JSON object on stdout; failures print a message and a
+typed JSON error (`{"error": code, "message": ...}`) on stderr.
+
+```bash
+aisim data fetch --dry-run                    # plan the whole op-latency database
+aisim data fetch                              # download it (same as --category op-latency --all)
+aisim fetch --hardware h200_sxm --framework vllm
+aisim data fetch --category fpm --model Qwen/Qwen3-32B --hardware h200_sxm
+```
+
+With no arguments, `fetch` downloads the whole op-latency database. FPM, e2e and eval data are never part of
+that default: they need `--configuration` or `--hardware` (plus `--model`), and `--all` is refused for them.
+There is no default byte cap. When a download is large the planned size is printed on stderr before it starts;
+nothing waits for an answer. `AISIM_DATA_MAX_BYTES` stays an opt-in limit that `fetch` and `init` honor when you
+set it, and `--no-limit` ignores it for one command. The limit covers the catalog and manifest files that
+planning downloads as well as the artifacts.
+
+| Flag | Meaning |
+|---|---|
+| `--category` | `op-latency` (default), `fpm`, `e2e` or `eval`. |
+| `--all` | Whole category. `op-latency` only; it is also what no selector means there. |
+| `--model`, `--hardware`, `--framework`, `--framework-version`, `--operation-family` | Catalog identity filters. |
+| `--configuration ID` | Select by configuration ID; repeat or comma-separate for several. |
+| `--purpose` | `prediction` (default) selects the data a predictor reads (`op-latency` and `fpm` only); `full-evidence` applies no purpose filter. `validation` and `results` are reserved and exit `2` as unsupported. |
+| `--repo` | Hugging Face dataset repository, `owner/name`. Default: `$AISIM_DATASET`, then the saved `init` config, then `ai-dynamo/aisim-data`. |
+| `--revision` | Branch, tag or commit SHA. Default: `$AISIM_DATASET`, then the saved `init` config, then the revision shipped with the package (`aisim_core/data/op_latency_pin.json`; `main` while the package ships no pin). A ref resolves once to a full SHA, reported as `plan.revision`; the cache is keyed by that SHA. |
+| `--cache-dir` | Cache root. Defaults to `$AISIM_DATA_CACHE`, then the user cache directory. |
+| `--dry-run` | Print the plan (`files`, `total_bytes`, `uncached_bytes`) and download no artifacts. The small catalog and manifest files needed to expand the plan are still cached. |
+| `--offline` | Make no network requests. A missing file fails with `offline-missing` and the list of files; with `--dry-run` the list is reported in `missing` and the exit status is `0`. A non-SHA revision cannot be resolved offline. |
+| `--no-limit` | Ignore `AISIM_DATA_MAX_BYTES` for this download. |
+
+Selection precedence for repository and revision is flag, then environment, then saved config, then the
+shipped default. A selection must match at least one catalog entry. Repeating a fetch reuses verified cache
+entries and downloads nothing. Exit status is `0` on success, `2` for an invalid or unsupported selection or
+usage, and `1` for revision, transfer, integrity or offline failures.
+
+<a id="init-status-clear"></a>
+
+### Choose how data arrives: `init`, `status`, `clear`
+
+`aisim init` records how AISim gets op-latency data. In a terminal it asks `1) op database now` or
+`2) op data on demand`. Without a terminal it never prompts: pass a flag, or it exits `2` naming them.
+
+| Command | Effect |
+|---|---|
+| `aisim init --all` | Download the whole op-latency database now and save `all`. |
+| `aisim init --hardware H` | Download op data for one hardware platform now and save `hardware`. |
+| `aisim init --on-demand` | Download nothing now. A run downloads data only from a pinned source: `--repo`/`--revision` saved with this choice, or `AISIM_DATASET`. With neither, runs use the op data packaged with AISim. |
+
+`--repo`, `--revision`, `--cache-dir`, `--offline` and `--no-limit` behave as for `fetch`. The choice is saved
+only after the download succeeds (`--all` and `--hardware` also save the repository and revision they downloaded, so
+runs select that data), in `config.json` in the cache root: `~/.cache/aisim/config.json` (honoring
+`XDG_CACHE_HOME`), or `$AISIM_DATA_CACHE/config.json` when `AISIM_DATA_CACHE` is set. No file means on-demand.
+Precedence is flag, then environment variable, then config file, then shipped default; the config never
+overrides an environment variable.
+
+`aisim data status` prints the pin, the cache path and size on disk, the saved init mode, and for every cached
+revision its size and how many files of the whole op-latency database are cached or missing (computed offline).
+
+`aisim data clear` removes every cached revision and the init config after asking for confirmation. Pass
+`--yes` to skip the question; without a terminal it exits `2` unless `--yes` is given.
+
+<a id="validate-dataset"></a>
+
+### Validate a dataset
+
+`aisim data validate PATH` checks a dataset root, a category directory or one `manifest.json` locally, with no
+network: manifest schema, configuration-ID hashes, artifact sizes, SHA-256 digests and Parquet row counts,
+catalog consistency, and stored names that are not canonical (hardware, framework, precision, deployment and,
+for e2e, every table value). `aisim data validate --repo OWNER/NAME --revision V` downloads that Hugging Face
+revision into the cache first (needs network, and every category is fetched) and then runs the same checks.
+It rewrites nothing and prints one JSON object:
+
+```bash
+aisim data validate ./my-contribution
+# {"ok": false, "source": {"path": "./my-contribution"}, "manifests": 3, "dataset_catalog_checked": true,
+#  "categories_without_offline_checker": [], "findings": [{"check": "names", "path": "...",
+#  "message": "'B300' is not canonical", "kind": "hardware", "location": "identity.hardware",
+#  "value": "B300", "canonical": "b300_sxm"}]}
+```
+
+Each finding has a `check` (`names`, `manifest`, `dataset` or a category check), a `path` and a `message`. A name
+finding's `canonical` of `null` means the registry does not know the name. Exit status is `0` when clean and
+`1` on findings; a missing path or bad flags exit `2`. e2e, eval and systems manifests get name and digest
+checks only. Category-specific entry checks register through `aisim.data_validate.register_entry_check`. This
+replaces the former `check-names` command; see [e2e schema](e2e-schema.md#canonical-names) for the naming rule.
+
+### Air-gapped and offline use
+
+Prepare on a connected machine, then move the cache; the disconnected machine makes no
+network request. Pin the dataset to a full commit SHA, because a branch or tag cannot be
+resolved offline.
+
+Historical full-SHA references to `nvidia/aisimulate-fpm-dataset` preserve their original repository and
+commit; they are never silently rewritten. Historical layouts without `catalog/dataset.json` are unsupported
+by `ensure_data` and the unified fetch planner, even when those commits and artifacts remain available.
+Re-record the pin against a commit of `ai-dynamo/aisim-data`, whose FPM files live under `data/fpm/`.
+
+```bash
+# 1. Connected: check the size of the selected version, then prepare the whole closure of the real run.
+aisim data fetch --repo OWNER/NAME --revision <40-hex-sha> --category op-latency \
+  --hardware b200_sxm --framework vllm --framework-version 0.24.0 --dry-run --cache-dir ./aisim-cache
+export AISIM_DATASET=OWNER/NAME@<40-hex-sha> AISIM_DATA_CACHE=./aisim-cache AISIM_DATA_CATEGORIES=op-latency
+python - <<'PY'
+from aisim_core.data.ensure import ensure_data, pin_from_environment
+
+# The configuration you will predict with: it decides the version, donors, collectives and shared-layer sources.
+ensure_data({"system": "b200_sxm", "backend": "vllm", "backend_version": "0.24.0"}, pin_from_environment())
+PY
+
+# 2. Copy ./aisim-cache to the air-gapped host (any file transfer).
+# 3. Disconnected: pin offline and run.
+export AISIM_DATASET=OWNER/NAME@<40-hex-sha> AISIM_DATA_CACHE=./aisim-cache AISIM_DATA_CATEGORIES=op-latency \
+  AISIM_DATA_OFFLINE=1
+```
+
+`aisim data fetch ... --offline --dry-run` (an empty `missing` list) only shows that the files of the one selected
+version are cached. The runtime closure also holds donor versions, collective libraries and shared-layer sources
+that `ensure_data` (or `materialize_systems_root`, below) fetches for the real configuration, so run it connected
+before moving the cache. `AISIM_DATA_CATEGORIES` defaults to `op-latency`; name `fpm` (or `op-latency,fpm`) for FPM data.
+
+`AISIM_DATASET` (with `AISIM_DATA_CACHE` and `AISIM_DATA_OFFLINE`) pins model construction through
+`RustForwardPassPerfModel.best_available`: the data a configuration needs is taken from the cached revision,
+a missing or corrupt file is a precise error, and there is no fallback to other data. A run that builds its
+operation tables from `systems_paths` or `AICONFIGURATOR_SYSTEMS_PATH` (an explicit `backend_version` in
+`aisim predict`, `recommend` or `replay`) does not read the pin; prepare a root for it as described below. Other pin variables: `AISIM_DATA_CATEGORIES` (default `op-latency`),
+`AISIM_DATA_CONFIGURATION` (choose among several matches; with several categories it constrains only the category that lists the ID; for operation tables it resolves only that operation family's conflict and retains complementary families), `AISIM_DATA_MAX_BYTES` (auto-download
+threshold, default 256 MiB) and `AISIM_DATA_LOCAL` (a dataset-layout directory used instead of Hugging Face).
+The threshold covers discovery indexes and support files, selected artifacts, and dependency downloads together;
+verified cache hits cost zero bytes. When both `fpm` and `op-latency` are pinned, the prepared FPM settings
+apply before operation-table dependencies are planned, regardless of category order.
+Private datasets use the standard `HF_TOKEN` only while connected; the cache needs none.
+
+A pin without `AISIM_DATA_CATEGORIES` loads only `op-latency`; it used to load `fpm`. A run that needs FPM data
+sets `AISIM_DATA_CATEGORIES=fpm` (or `op-latency,fpm`). If the pinned dataset has no data for a category the pin
+loads, the run fails with a missing-data error that names this variable; it never switches to other data.
+A source saved by `aisim init` is a default for runs that read operation tables and name no roots. A
+configuration with `estimation_mode` `fpm_interpolation`, `fpm_regression` or `fpm_learned`, or one that sets its
+own `systems_paths` in any mode (`auto` reads FPM tables from them as a fallback), keeps its data. Roots set with
+`set_systems_paths` or `AICONFIGURATOR_SYSTEMS_PATH` count as your own too; only the packaged roots, which the
+Sweeper fills in when you set none, do not. Name the source with
+`AISIM_DATASET` or a pin to apply it to the configurations that keep their data.
+`AICONFIGURATOR_SYSTEMS_PATH` also supplies the root when `systems_paths` is unset or holds only the expanded
+packaged path. A literal `default` (the bundled data) and explicit custom `systems_paths` retain their precedence
+over the environment variable.
+
+An `op-latency` pin composes all matching operation families with the packaged system specs and support
+files into one systems root. That root replaces `systems_paths` for construction: a missing operation
+table fails instead of falling through to packaged or user-supplied operation tables. Packaged
+operation tables are never copied into the pinned root. The root also holds the other versions that a selected
+entry's `reuse.yaml` declares as donors, the `nccl`/`oneccl` entries the system spec names, and, unless
+`enable_shared_layer` is false, the sources the native shared-layer resolver may read: earlier versions of the
+same backend and the other backends the pinned `perf_data_reuse_manifest` allows. A donor or source the dataset
+does not publish is skipped. The root is rebuilt whenever the entries' artifact digests or the packaged specs
+change. An omitted `backend_version` or a slot alias (`current`, `previous`, `next`) is resolved from the pinned
+dataset's `query_versions` lookup, and the whole pin shares one `AISIM_DATA_MAX_BYTES` allowance,
+including catalog, configuration-owner and version-policy discovery. Warm cached files consume none of it.
+An FPM library pinned together with it is staged from that root alone, with no active systems root as a fallback.
+Indexed layouts must pin both lookup tables; only legacy local indexes that omit the `support` field may use
+embedded lookup checksums alone.
+
+For FPM dataset selection, a mapping that omits topology leaves parallelism unfiltered. If both TP1 and TP4 entries
+match, `ensure_data` raises an ambiguity error; supply an explicit topology or set
+`AISIM_DATA_CONFIGURATION` to choose an entry. An explicit all-ones topology selects TP1. A typed
+`ForwardPassPerfModelConfig` always carries topology (`tp=1` by default), so it requests the TP1 entry; pass a mapping
+that omits topology to be told about several matches. An FPM entry's manifest must match the digest its catalog
+records, also for a local root.
+
+<a id="non-python-consumers"></a>
+
+### Operation data for consumers without the Python data library
+
+Rust `perf_database` users, sweeper and planner embeddings and Rust tests read a `systems/` directory
+(`systems_paths`, `AICONFIGURATOR_SYSTEMS_PATH`) and never run the data library. Today that directory is the
+packaged `aisim_core/systems`. Once production operation data leaves the wheel, prepare a root in Python
+once and point the consumer at it:
+
+```python
+from aisim_core.data.ensure import DataPin
+from aisim_core.data.materialize import materialize_systems_root
+
+root = materialize_systems_root(
+    {"system": "b200_sxm", "backend": "vllm", "backend_version": "0.24.0"},
+    DataPin(repo="OWNER/NAME", revision="<40-hex-sha>", offline=True, cache_dir="./aisim-cache"),
+    "./systems-root",
+)
+# root.env == {"AICONFIGURATOR_SYSTEMS_PATH": "./systems-root"}; pass root.root as `systems_paths` / `systems_path`.
+```
+
+The root holds the packaged specs and support files plus copies of the verified pinned `data/` tables (never hard links,
+so editing the root cannot change the cache); it never mixes in packaged tables. The call fails if the destination exists.
+
+| Consumer | Preparation |
+|---|---|
+| Python code that builds the model with `best_available` | Automatic through the pin; `data fetch` only prefetches. |
+| `aisim predict`, `recommend` and `replay` runs | Read `systems_paths` / `AICONFIGURATOR_SYSTEMS_PATH`, not the pin: pass a prepared root. |
+| Sweeper, planner, Python embedding of the Rust engine | Pass `systems_paths` or set `AICONFIGURATOR_SYSTEMS_PATH` to the prepared root. |
+| Rust `perf_database` crate users | Same root as `systems_paths`/`DataRoots`; no Python at run time. |
+| Rust tests (about 38 files resolve the in-tree `systems/` directory) | Prepare a root before `cargo test` and route the sites through one resolver; a Phase 6 task. |
+| Air-gapped hosts | Prefetch with a full-SHA pin, copy the cache, run with `AISIM_DATA_OFFLINE=1`. |
+| `pip install` users | A wheel without op data needs one `data fetch` (or the automatic first-use download below the size threshold) per system and framework. |
+
 <a id="common-options"></a>
 
 ## Common Options
 
 | Option | Type | Default | Meaning |
 |---|---|---:|---|
-| `-c`, `--config PATH` | path | Required | Input YAML file. |
+| `-c`, `--config PATH` | path | Required | Input YAML or JSON file; a `.json` suffix (case insensitive) selects JSON parsing. |
 | `--stack NAME` | string | `engine` | Built-in or discovered execution stack. This selection is CLI-only and is never written into YAML. |
-| `--set PATH=YAML_VALUE` | repeatable assignment | None | Set a supported configuration path after loading YAML. |
+| `--set PATH=YAML_VALUE` | repeatable assignment | None | Set a supported configuration path after loading YAML or JSON; override values use YAML syntax. |
 | `--output-dir PATH` | path | `./aisim-output` | Directory for durable results. |
 | `--overwrite` | flag | `false` | Replace known AISim output files in an existing output directory. |
 | `--format table\|json` | enum | `table` | Standard-output presentation. It does not change durable output files. |
@@ -52,7 +257,7 @@ illustrate the output format. Captured detail examples are simulation results, n
 | `--online` | flag | `false` | Pace prediction against the real wall clock instead of virtual time. The selected stack must advertise online support. |
 
 The CLI deliberately does not expose field-specific flags such as `--request-per-second` or
-`--num-workers`. YAML is the authoritative semantic configuration surface.
+`--num-workers`. The [configuration schema](configuration.md) is the authoritative semantic surface for YAML and JSON.
 
 ### Eager execution and CUDA graphs
 
@@ -175,18 +380,22 @@ supported topologies. The external Dynamo Python adapter's diagnostics export
 requires separate qualification: native Rust compatibility aliases do not establish
 adapter parity. If a selected runner exports no typed evidence, energy details
 state that reason. Native AFD exports operation-energy evidence; numeric power
-depends on operation-energy coverage. Native Replay and unified prediction keep
-FPM, fixed, polynomial, and analytical EPD energy unavailable; their `power_w`
-and `power_coverage` summary fields are explicit nulls where unsupported. This
-includes fully powered schema-8 FPM pairs. Separately, Python static FPM
-`get_context_energy_wms_dict()` and `get_generation_energy_wms_dict()` can return
-nonzero operation energy with SOL interpolation. Aggregated results retain
-pure-decode energy and suppress mixed-step energy. The SDK and legacy
-`aiconfigurator cli estimate` (`cli_estimate()`) publish `power_w` for static,
-aggregated, and disaggregated schema-8 FPM results when their latency-weighted
-coverage reaches 90%; below that gate they return null power with numeric
-`power_coverage`. See
-[FPM power](../perf-model/power.md).
+depends on operation-energy coverage. Supported schema-8 FPM runs report numeric
+`power_coverage` in native Replay and unified prediction and publish `power_w`
+at or above 90% coverage. Below the gate, `power_w` is null and coverage stays
+numeric. The SDK and legacy `aiconfigurator cli estimate` (`cli_estimate()`)
+apply the same coverage gate to supported static, aggregate, and disaggregated
+schema-8 FPM results. Static SDK callers can inspect operation energy through
+`get_context_energy_wms_dict()` and `get_generation_energy_wms_dict()`.
+
+Aggregate mixed steps retain prefill energy and the positive decode marginal
+after subtracting the KV-floor baseline. The decode marginal contributes energy
+only when its latency is positive and both the target and baseline have power.
+Mixed-step watts are **unqualified** pending measured validation. FPM power
+remains unavailable for speculative runs, models with encoder operations,
+language-only EPD workers, v6/v7 profiles, and fitted estimators. Native
+fixed, polynomial, and analytical EPD timing also leave power and coverage
+unavailable. See [FPM power](../perf-model/power.md).
 
 <a id="prediction-directory"></a>
 
@@ -229,6 +438,17 @@ for `recommendation.json`, CSV, selected YAML and partial-result semantics.
 
 ### Existing Output Directories
 
+One `predict` or `recommend` run owns an output directory at a time. The run takes an advisory
+lock on the directory before it inspects or cleans it and holds it until its last report is
+written; the lock adds no file to the directory. The supervising `aisim` process hands the locked
+descriptor to its worker, so the directory stays locked through the worker's writes even if the
+supervisor exits first. A second run started on the same directory, with or without
+`--overwrite`, exits with code `2` and the message `another AISim run is using output directory
+...`, and removes nothing. A run refused for the directory's contents releases the lock at once.
+A symlinked path to the same directory shares the lock. The lock covers AISim processes only:
+other programs writing into the directory are not blocked, which is why the checks below still
+apply.
+
 Without `--overwrite`, the CLI rejects an existing nonempty output directory, with one exception:
 a directory left by a failed run is cleared and reused, and the CLI prints one line saying so. This
 lets you retry a failed, resource-limited, timed-out or cancelled run in the same directory. It
@@ -247,9 +467,17 @@ Specifically, overwrite may replace `prediction.json`, `report.html`, `recommend
 `execution-events.jsonl`, `afd-replay-spec.json`, `afd-qualification.json`, and numbered
 `recommendations/NNNN.yaml` files.
 Other files, including non-numbered files inside `recommendations/`, are preserved. Invalid
-configuration loading, overrides, core-schema validation, unknown top-level sections, and stacks or
-output adapters that are not installed leave existing artifacts intact. Errors raised while
-importing an installed plugin or inside an adapter occur after the known outputs are removed.
+configuration loading, overrides, core-schema validation, unknown top-level sections, stacks or
+output adapters that are not installed, and agentic warmup policies that the stack does not
+advertise leave existing artifacts intact, including a failed run's diagnostics, with or without
+`--overwrite`. So does a resource refusal, timeout or
+interrupt while AISim asks an installed stack whether it supports a non-default warmup policy; such
+a run writes no resource reports. A signal-terminated support probe exits `130`, as does cancellation
+with Ctrl-C. Errors raised while importing an installed plugin or inside an
+adapter occur after the known outputs are removed.
+If the effective configuration changes during the warmup support check, including scalar types or
+adapter section order, the command exits `2` before cleanup;
+otherwise execution uses the checked configuration, including path anchoring and `--set` overrides.
 
 For `engine.ais_perf_model`, an entry key that is not a perf-model field is a validation error, so
 existing artifacts stay. A key written twice inside `engine.ais_perf_model` in the configuration
@@ -359,10 +587,11 @@ Memory without evidence is omitted from `details.sections` and listed with a rea
 section with only some estimated roles is `partial` and records
 why other roles are unavailable. Energy retains an explicit unavailable status and reason when
 the runner exports no typed evidence. Missing measurements are never invented as zero;
-energy-aware runs with no covered operations report numeric zero coverage. Native Replay
-with whole-model FPM can report timing/source evidence while its energy details remain
-unsupported and unified `power_w`/`power_coverage` stay null. Python static FPM summary
-energy is a separate path. Fixed/polynomial timing, analytical EPD overlays, and adapters
+energy-aware runs with no covered operations report numeric zero coverage. Supported
+schema-8 FPM Replay exports energy details alongside timing and source evidence.
+Unified prediction reports numeric `power_coverage` and publishes `power_w` at
+or above 90% coverage. Unsupported FPM configurations can still report timing
+and source evidence. Fixed/polynomial timing, analytical EPD overlays, and adapters
 without the native export report operation timing/source evidence unavailable. Serving
 time statistics remain available where exported. See
 [diagnostic availability](../aic-backward-compatibility/migration.md#prediction-details-and-power).
@@ -528,10 +757,15 @@ Without `--output`, `migrate` prints the plan and writes nothing: the new
   file system without hard links, a new `FILE` is empty for a moment before
   the converted text is moved into it.
 - **JSON.** A `FILE` that ends with `.json`, in any letter case, is written as
-  JSON. A `.json` configuration converted in place stays JSON. AISim
-  reads configuration files as YAML. When the JSON text would not be read
-  back as the same config, `migrate` writes nothing and exits `2`:
-  `cannot write small.json as JSON: engine.ais_perf_model.estimator_config.ridge is 1e-05 and would be read back from the file as '1e-05'; name a file that does not end with .json to write YAML`.
+  JSON. A `.json` configuration converted in place stays JSON. AISim reads
+  these files with the JSON parser, preserving scientific notation such as
+  `1e-7` as a number. If a value cannot round-trip through JSON, such as a
+  non-string mapping key or a non-finite number, `migrate` writes nothing and
+  exits `2` with the filename and reason. Use a filename without `.json` to
+  retain YAML-only values. When writing through symlinks or replacing the input
+  through another name, all known names of the output must select the same
+  format. Mixed JSON/YAML aliases are refused before writing; use matching
+  extensions or write a separate output file.
 - **All or nothing.** When one field cannot be converted, nothing is
   converted. `migrate` prints a `cannot convert: <field>: <reason>` line for
   each such field and then `Nothing was converted.`, `--output` writes no

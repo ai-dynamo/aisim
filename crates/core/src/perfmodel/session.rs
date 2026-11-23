@@ -18,7 +18,7 @@ use crate::common::error::AicError;
 use crate::memo::Memo;
 use crate::operators::base::PerformanceResult;
 use crate::operators::op::MemoField;
-use crate::operators::{Op, RuntimeContext};
+use crate::operators::{Dsv41StageOp, Op, RuntimeContext};
 use crate::perf_database::PerfDatabase;
 
 /// The engine op list an [`OpMemo`] entry belongs to.
@@ -37,6 +37,9 @@ pub(crate) struct OpMemo {
     fields: [Box<[Option<MemoField>]>; 2],
     /// Keyed by list, index and field value ([`Self::key`]).
     results: Memo<u64, PerformanceResult>,
+    /// A generation stage's children that read only the token count, in
+    /// child order with `None` for the others; keyed like `results`.
+    stage_children: Memo<u64, Arc<[Option<PerformanceResult>]>>,
 }
 
 impl OpMemo {
@@ -47,12 +50,14 @@ impl OpMemo {
         Self {
             fields: [fields(context_ops), fields(generation_ops)],
             results: Memo::flat(capacity).verifying_hits(),
+            // One entry per generation stage and token count, about 1.5 KB each.
+            stage_children: Memo::flat(4096).verifying_hits(),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.results.len()
+        self.results.len() + self.stage_children.len()
     }
 
     /// The entry key of the op at `index` of `list` with its field at `value`.
@@ -77,9 +82,37 @@ impl OpMemo {
         self.results
             .get_or_price(db, Self::key(list, index, field.of(ctx)), query)
     }
+
+    /// [`Dsv41StageOp::query`] of the generation stage at `index` of `list`,
+    /// which queries every child at `ctx` itself: the children that read
+    /// only the token count come from the walk that first reached this count.
+    fn query_stage(
+        &self,
+        db: &PerfDatabase,
+        list: OpList,
+        index: usize,
+        stage: &Dsv41StageOp,
+        ctx: &RuntimeContext,
+    ) -> Result<PerformanceResult, AicError> {
+        let key = Self::key(list, index, ctx.num_tokens);
+        // A child that fails is left out and queried again below, so the
+        // stage still reports its first failing child.
+        let shared = self.stage_children.get_or_price(db, key, || {
+            let children = stage.children.iter().map(|op| match op.memo_field() {
+                Some(MemoField::NumTokens) => op.query(db, ctx).ok(),
+                _ => None,
+            });
+            Ok::<_, AicError>(children.collect::<Arc<[_]>>())
+        })?;
+        stage.query_with(ctx, |i, op, child_ctx| match &shared[i] {
+            Some(result) => Ok(result.clone()),
+            None => op.query(db, child_ctx),
+        })
+    }
 }
 
-/// [`OpMemo::query`] through `op_memo` when there is one.
+/// [`OpMemo::query`] through `op_memo` when there is one, and
+/// [`OpMemo::query_stage`] for a DeepSeek-V4.1 generation stage.
 fn shared_query(
     op_memo: Option<&OpMemo>,
     db: &PerfDatabase,
@@ -88,9 +121,12 @@ fn shared_query(
     op: &Op,
     ctx: &RuntimeContext,
 ) -> Result<PerformanceResult, AicError> {
-    match op_memo {
-        Some(op_memo) => op_memo.query(db, list, index, ctx, || op.query(db, ctx)),
-        None => op.query(db, ctx),
+    match (op_memo, op) {
+        (Some(op_memo), Op::Dsv41Stage(stage)) if !stage.is_context => {
+            op_memo.query_stage(db, list, index, stage, ctx)
+        }
+        (Some(op_memo), _) => op_memo.query(db, list, index, ctx, || op.query(db, ctx)),
+        (None, _) => op.query(db, ctx),
     }
 }
 
@@ -163,11 +199,12 @@ impl OpListPlan {
     }
 }
 
-/// Pricing key of a GLM-5.3-Flash boundary without its per-layer display
-/// names. These names, including those of generic children, never select
-/// data, so identical layers price identically; debug builds re-price every
-/// shared query to check this ([`QueryMemo::query`]). Other families return
-/// `None` and are always queried.
+/// Pricing key of a GLM-5.3-Flash boundary or a DeepSeek-V4.1 stage without
+/// its per-layer display names. These names, including those of GLM generic
+/// children, never select data, so identical layers price identically; debug
+/// builds re-price every shared query to check this ([`QueryMemo::query`]).
+/// A DeepSeek-V4.1 stage's children carry no layer in their names and keep
+/// them. Other families return `None` and are always queried.
 fn pricing_identity(op: &Op) -> Option<String> {
     if !matches!(
         op,
@@ -176,6 +213,7 @@ fn pricing_identity(op: &Op) -> Option<String> {
             | Op::Glm53Router(_)
             | Op::Glm53Ffn(_)
             | Op::Glm53Primitive(_)
+            | Op::Dsv41Stage(_)
     ) {
         return None;
     }
@@ -752,4 +790,109 @@ pub(crate) fn get_mix_step_ops<'a>(
     }
 
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::enums::GemmQuantMode;
+    use crate::operators::GemmOp;
+    use crate::perf_database::energy_test_fixtures::{
+        Col, write_energy_systems_root, write_parquet,
+    };
+
+    #[test]
+    fn dsv41_stage_memo_preserves_first_child_error_and_omits_failed_children() {
+        // Valid SILICON queries: BF16 has a measurement, FP8 and NVFP4 do not.
+        // Missing measurements must stay errors, including on memo hits.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = write_energy_systems_root(tmp.path());
+        write_parquet(
+            &data.join("gemm_perf.parquet"),
+            &[
+                Col::Str("gemm_dtype", vec!["bfloat16"]),
+                Col::I64("m", vec![128]),
+                Col::I64("n", vec![1024]),
+                Col::I64("k", vec![1024]),
+                Col::F64("latency", vec![1.0]),
+                Col::F64("power", vec![100.0]),
+            ],
+        );
+        let db = PerfDatabase::load(tmp.path(), "testsys", "vllm", "1.0").unwrap();
+        let child = |name, quant| Op::Gemm(GemmOp::new(name, 1024, 1024, quant));
+        let ctx = RuntimeContext {
+            batch_size: 128,
+            num_tokens: 128,
+            s: 512,
+            ..RuntimeContext::default()
+        };
+        for two_failures in [false, true] {
+            let stage = Dsv41StageOp {
+                name: "generation_stage".into(),
+                is_context: false,
+                decoder_replay: true,
+                bounded: true,
+                window_size: 128,
+                children: vec![
+                    child("before", GemmQuantMode::Bfloat16),
+                    child("first_missing", GemmQuantMode::Fp8),
+                    child("after", GemmQuantMode::Bfloat16),
+                    child(
+                        "last",
+                        if two_failures {
+                            GemmQuantMode::Nvfp4
+                        } else {
+                            GemmQuantMode::Bfloat16
+                        },
+                    ),
+                ],
+            };
+            assert!(
+                stage
+                    .children
+                    .iter()
+                    .all(|op| op.memo_field() == Some(MemoField::NumTokens))
+            );
+            let first_error = stage.children[1].query(&db, &ctx).unwrap_err();
+            assert!(first_error.is_missing_perf_data());
+            let expected = format!("{first_error:?}");
+            assert_eq!(
+                format!("{:?}", stage.query(&db, &ctx).unwrap_err()),
+                expected
+            );
+            if two_failures {
+                let later_error = stage.children[3].query(&db, &ctx).unwrap_err();
+                assert!(later_error.is_missing_perf_data());
+                assert_ne!(format!("{later_error:?}"), expected);
+            }
+
+            let op = Op::Dsv41Stage(stage.clone());
+            let memo = OpMemo::new(16, &[], std::slice::from_ref(&op));
+            assert_eq!(memo.stage_children.len(), 0);
+            // A cold query, a hit at another KV length, and a repeated hit
+            // all report the first failing child, never the later failure.
+            for s in [512, 4096, 4096] {
+                let ctx = RuntimeContext { s, ..ctx };
+                assert_eq!(
+                    format!("{:?}", stage.query(&db, &ctx).unwrap_err()),
+                    expected
+                );
+                let error =
+                    shared_query(Some(&memo), &db, OpList::Generation, 0, &op, &ctx).unwrap_err();
+                assert_eq!(format!("{error:?}"), expected);
+                assert_eq!(memo.stage_children.len(), 1);
+                let key = OpMemo::key(OpList::Generation, 0, ctx.num_tokens);
+                let (stored, _) = memo.stage_children.peek(&key).unwrap();
+                assert_eq!(stored.len(), stage.children.len());
+                // Inspect every child, including successful children after
+                // the failure: only successful queries have a stored result.
+                for (op, cached) in stage.children.iter().zip(stored.iter()) {
+                    match op.query(&db, &ctx) {
+                        Ok(result) => assert_eq!(cached.as_ref(), Some(&result)),
+                        Err(_) => assert!(cached.is_none()),
+                    }
+                }
+            }
+        }
+    }
 }

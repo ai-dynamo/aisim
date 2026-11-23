@@ -43,6 +43,7 @@ engine:
 | `workers.<role>.hardware` | `engine.hardware` | fixed | Ordinary workers: `prefill` and `decode` in disaggregated mode only. AFD: fallback for both A/F pools in any role, overridden by explicit pool hardware. One concrete system identifier; `auto` is rejected for ordinary role overrides. |
 | `workers.<role>.context_length` | `engine.context_length` | fixed | Positive token limit. Recommendation accepts it for `prefill` and `decode` and for every AFD role; ordinary aggregated recommendations use `engine.context_length`. See [Context limits](#context-limits). |
 | `workers.<role>.startup_seconds` | `0` | fixed | Nonnegative. Delay before a worker added during the run becomes ready. Initial workers are ready at time zero. |
+| `workers.<role>.wait_power_w` | Unset | predict only | Finite nonnegative watts per GPU for in-pass attention-DP wait. Not accepted on AFD workers. See [attention-DP wait power](#attention-dp-wait-power). |
 | `workers.<role>.parallelism.preset` | Not applicable | `default` | Recommend only. `default` searches the generated parallelism space; a list pins candidate shapes; `false` or `{}` disables presets so the individual fields below define the space. See [search space](../../sweeper/search-space.md). |
 | `workers.<role>.parallelism.replicas` | `1` | Searched | Number of workers in this role. |
 | `workers.<role>.parallelism.tensor` | `1` | Searched | Attention tensor parallelism. |
@@ -56,6 +57,7 @@ engine:
 | `workers.<role>.scheduler.max_sequences` | `256`; `1` for `prefill` | Prefill: `{choices: [1, 2, 4, 8, 16, 32, 64, 128, 256]}`; others: `{choices: [256, 512, 1024]}` | Positive. Maximum running requests on one attention-DP rank. |
 | `workers.<role>.scheduler.prefill_schedule_interval` | `1` | predict only | vLLM only. See [vLLM prefill schedule interval](#vllm-prefill-schedule-interval). |
 | `workers.<role>.scheduler.prefill_decode_interval` | `0` | predict only | SGLang only. See [SGLang prefill/decode interval](#sglang-prefilldecode-interval). |
+| `workers.<role>.scheduler.scheduler_select_time_ms` | `0` | predict only | A positive cost requires the built-in engine, `backend: sglang`, `host_loop: false`, and no AFD on the worker. See [SGLang batch-selection cost](#sglang-batch-selection-cost). |
 | `workers.decode.scheduler.load_balance_method` | `round_robin` | predict only | SGLang PD decode only (`--load-balance-method`). `total_tokens` places a request on the attention-DP rank with the smallest scheduler token budget; `round_robin` takes ranks in turn. |
 | `workers.<role>.scheduler.async_scheduling` | vLLM's default: on, off with ngram drafts or MTP + G2 | predict only | vLLM only. Boolean. `true` is rejected with ngram drafts or MTP + G2. See [vLLM async scheduling](#vllm-async-scheduling). |
 | `workers.aggregated.scheduler.launch` | Unset | predict only | vLLM only, with async scheduling, on one-GPU workers (`tensor`, `pipeline`, `attention_data` and `prefill_context` of 1) and `--stack engine`. `{decode_ms, piecewise_ms, eager_ms, max_cudagraph_capture_size, eager_queue_fraction}`: CPU launch costs measured on the deployment. Outputs leave once the next pass is launched, and an arrival joins the first pass decided after it. See [vLLM pass launch](#vllm-pass-launch). |
@@ -74,6 +76,30 @@ do not support image workloads. AFD workers themselves do not accept these field
 
 A backend-specific scheduler field set to a non-default value on another
 backend fails validation.
+
+SGLang's checkpoint-aware `sglang.mamba_cache` is a separate
+[native Replay option](kv-cache.md#native-sglang-mamba-checkpoints), not a field
+under this Python worker schema. It requires an aggregated worker with
+attention DP, prefill context parallelism and pipeline parallelism all equal
+to one. Python prediction YAML and deployment generation do not enable it.
+
+## Attention-DP wait power
+
+Set `engine.workers.<role>.wait_power_w` to an assumed draw per GPU while
+a rank waits on peers inside a forward pass. For example:
+
+```yaml
+engine:
+  workers:
+    aggregated:
+      wait_power_w: 60
+```
+
+Use `aisim predict --stack engine --detail energy` to see estimated
+`step_power_w` and total `attention_dp_wait_ms`. Prefill and decode roles
+can each use a different assumption. AFD workers (`type: afd`) do not accept
+this field. A role with wait and no configured watts
+makes the step estimate unavailable. See the [power contract](../../perf-model/power.md).
 
 ## Context limits
 
@@ -299,7 +325,13 @@ release, so waiting sources may be blocked even when no prefill is running.
 `prefill_schedule_interval: N` admits prefill work only on every `N`-th pass of
 an attention-DP group. It mirrors vLLM's `prefill_schedule_interval`, which
 keeps decode steps balanced across DP ranks. It has an effect only when
-`attention_data` is above 1.
+`attention_data` is above 1. vLLM 0.33.0 also applies the interval without
+data parallelism, and it gives a dense DP rank its own cadence; see vLLM
+v0.33.0 [`scheduler.py:396-425`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L396-L425)
+and [`:780-791`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L780-L791).
+Replay does not model that. A grouped FPM cache with prefix caching on vLLM
+0.33.0 refuses an interval above 1. Where replay accepts the interval, it
+applies it only for `attention_data` above 1.
 
 ```yaml
 engine:
@@ -471,6 +503,26 @@ which
 selects for one GPU, and the CUDA-graph
 [`dispatch`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/cudagraph_utils.py)
 of v0.32.0.
+
+### SGLang batch-selection cost
+
+`scheduler_select_time_ms` adds measured CPU batch-selection time to each
+productive pass of a non-overlapped SGLang worker. For attention DP, measure
+the union of batch-selection intervals that lie between completion of the
+previous pass on all ranks and the first forward launch of the next pass.
+Use a cost representative of the deployment and workload. The engine clock
+includes the cost once per group. Active and idle ranks exclude the selection
+cost from forward-pass telemetry. Idle and same-timestamp retry passes with no
+model work take their usual time.
+
+Predict uses `type: afd` for AFD workers and rejects a positive selection cost
+on those workers. The public predict timing schema accepts `default`, `fixed`,
+and `polynomial`. Native replay configurations can also supply an external
+timing model. Native validation rejects a positive selection cost with either
+the `afd` or `aic-afd` external provider, including when AFD metadata is absent.
+
+Use this option with forward-only timing and exclude any time already priced
+by the configured timing provider, such as an observed whole-iteration cost.
 
 <a id="sglang-prefilldecode-interval"></a>
 

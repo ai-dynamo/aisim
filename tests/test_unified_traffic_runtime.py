@@ -445,6 +445,7 @@ def test_power_report_table_surfaces_withheld_power_as_unavailable() -> None:
     assert "42.00" not in active_power_row
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_b200_power_survives_native_json_and_runner_normalization() -> None:
     # Pin the measured-data identity and workload from migration section 4.11.
     report = _run(
@@ -544,6 +545,31 @@ def test_sglang_prefill_decode_interval_reaches_native_scheduler(tmp_path, inter
     assert waiting["first_token_ms"] == pytest.approx(4.0 if interval else 2.0)
     assert running["ttst_ms"] == pytest.approx(1.0 if interval else 2.0)
     assert (running["output_length"], waiting["output_length"]) == (6, 2)
+
+
+@pytest.mark.parametrize("selection_ms", [0.0, 1.5])
+def test_sglang_scheduler_selection_cost_reaches_native_scheduler(selection_ms: float) -> None:
+    engine = _engine()
+    engine["backend"] = "sglang"
+    worker = engine["workers"]["aggregated"]
+    worker["scheduler"] = {"scheduler_select_time_ms": selection_ms}
+    worker["timing"] = {"type": "fixed", "prefill_ms": 7, "decode_ms": 2}
+    report = _run(
+        {
+            "engine": engine,
+            "traffic": {
+                "source": {"type": "synthetic", "input_tokens": 8, "output_tokens": 2},
+                "load": {"type": "concurrency", "concurrency": 1},
+                "stop": {"requests": 1},
+            },
+        }
+    )
+
+    # One prefill emits the first token, and one decode emits the second.
+    # Each of these two productive passes pays the selection cost once.
+    assert report.metrics["completed_requests"] == 1
+    assert report.metrics["mean_ttft_ms"] == pytest.approx(7.0 + selection_ms)
+    assert report.metrics["mean_tpot_ms"] == pytest.approx(2.0 + selection_ms)
 
 
 @pytest.mark.parametrize("seeded", [False, True], ids=["fresh", "completed_prior_wave"])

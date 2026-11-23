@@ -443,6 +443,7 @@ class RustForwardPassPerfModel:
         config: ForwardPassPerfModelConfig | Mapping[str, Any] | None = None,
         *,
         state_snapshot: str | os.PathLike[str] | None = None,
+        dataset: Any | None = None,
     ) -> RustForwardPassPerfModel:
         """Construct one estimator from the canonical role-bound configuration.
 
@@ -466,6 +467,14 @@ class RustForwardPassPerfModel:
         without ``include_perf_db`` only locates the data, which must match
         the snapshot's content fingerprint. Snapshot I/O failures raise ``OSError`` subclasses
         such as ``FileNotFoundError``, never ``PerfDataNotAvailableError``.
+
+        ``dataset`` is an optional :class:`aisim_core.data.ensure.DataPin`
+        (default: the ``AISIM_DATASET``/``AISIM_DATA_LOCAL`` environment pin, if
+        any). With a pin, the dataset for the resolved ``system``/``backend``/
+        ``backend_version``/``model`` is fetched, verified and wired into the
+        configuration before construction, and the returned model's
+        ``dataset_revisions`` reports the revision used. Without a pin nothing
+        changes. Missing data raises a ``DataFetchError`` and never falls back.
         """
         import aisim_core
 
@@ -473,7 +482,12 @@ class RustForwardPassPerfModel:
             raise TypeError("best_available requires exactly one of config or state_snapshot")
         if state_snapshot is not None:
             config = _snapshot_config(state_snapshot)
-        return cls(aisim_core.RustForwardPassPerfModel.best_available(_forward_pass_config_json(config)))
+        ensured = _ensure_dataset(config, dataset) if state_snapshot is None else None
+        if ensured is not None:
+            config = ensured.config
+        model = cls(aisim_core.RustForwardPassPerfModel.best_available(_forward_pass_config_json(config)))
+        model.dataset_revisions = {} if ensured is None else ensured.revisions
+        return model
 
     @staticmethod
     def inspect_state_snapshot(path: str | os.PathLike[str]) -> dict[str, Any]:
@@ -1008,9 +1022,55 @@ def _carries_state_snapshot(estimator_config: Any) -> bool:
     return isinstance(estimator_config, Mapping) and estimator_config.get("state_snapshot") is not None
 
 
+_FPM_ESTIMATION_MODES = frozenset({"fpm_interpolation", "fpm_regression", "fpm_learned"})
+
+
+def _ensure_dataset(config: ForwardPassPerfModelConfig | Mapping[str, Any], pin: Any | None):
+    """Resolve and load pinned dataset inputs; ``None`` (a no-op) when no pin is configured."""
+    from aisim_core.data.ensure import ensure_data, ensuring, pin_from_environment
+
+    if ensuring():  # the loader's own readiness check constructs a model from the prepared config
+        return None
+    payload = config.to_dict() if isinstance(config, ForwardPassPerfModelConfig) else dict(config)
+    if _carries_state_snapshot(payload.get("estimator_config")):
+        return None  # a snapshot restores its own pinned inputs; a pin selecting other data would only conflict
+    pin = pin if pin is not None else pin_from_environment()
+    if pin is None:
+        return None
+    if pin.saved_source and (payload.get("estimation_mode") in _FPM_ESTIMATION_MODES or _names_systems_paths(config)):
+        # The op-latency source saved by ``aisim init`` would replace the ``systems_paths`` the caller named, which
+        # carry the FPM tables of these modes and of the FPM candidates of ``auto``. The saved source is a default
+        # for runs that name no roots; only a source the caller or environment names overrides them.
+        return None
+    return ensure_data(payload, pin)
+
+
+def _names_systems_paths(config: ForwardPassPerfModelConfig | Mapping[str, Any]) -> bool:
+    """Whether the roots of ``config`` were chosen by someone: its ``systems_paths``, ``set_systems_paths`` or the
+    ``AICONFIGURATOR_SYSTEMS_PATH`` environment variable.
+
+    Callers such as the Sweeper expand an unset ``systems_paths`` before construction, so the roots they hand over
+    may be that expansion rather than a choice. Only the packaged roots are a default: any other roots, however
+    they were set, outrank the source saved by ``aisim init``.
+    """
+    named = config.systems_paths if isinstance(config, ForwardPassPerfModelConfig) else config.get("systems_paths")
+    # The literal ``default`` token is an explicit request for the bundled tables, not an unset value.
+    if any(isinstance(entry, str) and entry.strip().lower() == "default" for entry in named or ()):
+        return True
+    # An unset value expands to ``set_systems_paths``, then the environment variable, then the packaged roots.
+    roots = _resolve_forward_pass_systems_paths(tuple(named or ()), require_directories=False)
+    packaged = os.fspath(pkg_resources.files("aisim_core") / "systems")
+    # Default setup never writes this variable, so even an explicit packaged path is a caller choice.
+    return os.environ.get("AICONFIGURATOR_SYSTEMS_PATH") is not None or roots != [packaged]
+
+
 def _forward_pass_config_json(config: ForwardPassPerfModelConfig | Mapping[str, Any]) -> str:
     payload = config.to_dict() if isinstance(config, ForwardPassPerfModelConfig) else dict(config)
-    if payload.get("estimation_mode") not in {"fpm_regression", "fpm_learned"} or payload.get("systems_paths"):
+    # ``to_dict`` already resolved a typed config's roots. Resolving them again would read an explicit ``default``
+    # (now the packaged path) as an expansion of unset roots and let AICONFIGURATOR_SYSTEMS_PATH replace it.
+    if not isinstance(config, ForwardPassPerfModelConfig) and (
+        payload.get("estimation_mode") not in {"fpm_regression", "fpm_learned"} or payload.get("systems_paths")
+    ):
         # A snapshot owns its packed performance data; Rust points those paths
         # into the snapshot before it reads them.
         payload["systems_paths"] = _resolve_forward_pass_systems_paths(
@@ -1057,9 +1117,13 @@ def _resolve_forward_pass_systems_paths(entries: tuple[str, ...], *, require_dir
     if not entries:
         from aisim_core.sdk.perf_database import get_systems_paths
 
-        configured = get_systems_paths()
-        env_root = os.environ.get("AICONFIGURATOR_SYSTEMS_PATH")
-        entries = tuple([env_root] if configured == [packaged] and env_root is not None else configured)
+        entries = tuple(get_systems_paths())
+    env_root = os.environ.get("AICONFIGURATOR_SYSTEMS_PATH")
+    # The packaged path alone can be a caller's expansion of unset roots; preserve the environment's choice. A literal
+    # ``default`` is an explicit request for the bundled data (the sweeper resolves it to the packaged path), so the
+    # environment variable never replaces it.
+    if env_root is not None and entries and all(entry == packaged for entry in entries):
+        entries = (env_root,)
     resolved: list[str] = []
     for entry in entries:
         if not isinstance(entry, str) or not entry.strip():
@@ -1453,14 +1517,16 @@ def estimate_mixed_step_breakdown_with_rust(
     """
     handle = _cached_engine_handle(model, database)
     try:
-        shared_ops, ctx_attn_ops, decode_attn_ops = handle._mixed_step_breakdown_per_op_with_metadata(
-            int(ctx_tokens),
-            int(gen_tokens),
-            int(isl),
-            int(osl),
-            int(prefix or 0),
-            seq_imbalance_correction_scale=_scale_or_one(seq_imbalance_correction_scale),
-            gen_seq_imbalance_correction_scale=_scale_or_one(gen_seq_imbalance_correction_scale),
+        (shared_ops, ctx_attn_ops, decode_attn_ops), covered_latency_ms = (
+            handle._mixed_step_breakdown_per_op_with_metadata(
+                int(ctx_tokens),
+                int(gen_tokens),
+                int(isl),
+                int(osl),
+                int(prefix or 0),
+                seq_imbalance_correction_scale=_scale_or_one(seq_imbalance_correction_scale),
+                gen_seq_imbalance_correction_scale=_scale_or_one(gen_seq_imbalance_correction_scale),
+            )
         )
     except ValueError as exc:
         _reraise_engine_error(exc)
@@ -1500,6 +1566,10 @@ def estimate_mixed_step_breakdown_with_rust(
         "context_attention": ctx_attention_energy,
         "decode_attention": dec_attention_energy,
     }
+    if covered_latency_ms is None:
+        covered_latency_ms = sum(
+            entry[1] for group in (shared_ops, ctx_attn_ops, decode_attn_ops) for entry in group if entry[2] > 0
+        )
     return {
         "latency_ms": sum(component_latency_ms.values()),
         "energy_wms": sum(component_energy_wms.values()),
@@ -1507,9 +1577,7 @@ def estimate_mixed_step_breakdown_with_rust(
         "component_energy_wms": component_energy_wms,
         "per_op_latency_ms": per_op_latency_ms,
         "per_op_energy_wms": per_op_energy_wms,
-        "covered_latency_ms": sum(
-            entry[1] for group in (shared_ops, ctx_attn_ops, decode_attn_ops) for entry in group if entry[2] > 0
-        ),
+        "covered_latency_ms": covered_latency_ms,
         "per_op_source": per_op_source,
         "moe_comm_fallbacks": fallbacks,
     }
@@ -1800,8 +1868,8 @@ def _cached_engine_handle(model: Any, database: Any) -> Any:
     ``AicEngine`` loads its own perf DB; the system yaml is resolved from the
     ``database``'s own ``systems_root`` (the root the Python ``PerfDatabase``
     actually matched under multi-root ``--systems-paths``), falling back to
-    ``AICONFIGURATOR_SYSTEMS_PATH`` (set by ``_configure_default_data_roots``)
-    for duck-typed databases without a ``systems_root``.
+    the caller's ``AICONFIGURATOR_SYSTEMS_PATH`` or the SDK roots for duck-typed
+    databases without a ``systems_root``.
     """
     # The identity JSON is a hot-path cost: the engine-step helpers call this
     # per step and `_engine_config_json` runs ~2-3us of getattr + json.dumps
@@ -1841,6 +1909,9 @@ def _cached_engine_handle(model: Any, database: Any) -> Any:
     # env remains the fallback for duck-typed databases under an explicit
     # ``"rust"`` request.
     systems_path = getattr(database, "systems_root", None) or os.environ.get("AICONFIGURATOR_SYSTEMS_PATH")
+    if systems_path is None:
+        systems_root = _python_sdk_systems_root()
+        systems_path = None if systems_root is None else str(systems_root)
     nextn = getattr(model, "_nextn", None)
     try:
         spec_json = build_engine_spec_json(
@@ -2076,10 +2147,8 @@ def _moe_quant_to_dtype(value: Any) -> str | None:
 
 
 def _configure_default_data_roots() -> None:
-    if "AICONFIGURATOR_SYSTEMS_PATH" not in os.environ:
-        systems_root = _python_sdk_systems_root() or Path(str(pkg_resources.files("aisim_core") / "systems"))
-        if systems_root.exists():
-            os.environ["AICONFIGURATOR_SYSTEMS_PATH"] = str(systems_root)
+    # Pass default systems roots directly to the engine: persisting them in the environment would make
+    # a later best_available() mistake them for a caller choice and skip the saved init source.
     if "AICONFIGURATOR_MODEL_CONFIGS_PATH" not in os.environ:
         model_configs_root = Path(str(pkg_resources.files("aisim_core") / "model_configs"))
         if model_configs_root.exists():

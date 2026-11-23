@@ -97,9 +97,11 @@ For a linear EAGLE3 draft, use `kind: eagle3`,
 `params: {num_speculative_tokens: 3}`, and the draft checkpoint path or validated
 configuration required by the scheme. Standalone `draft_model` still requires
 its checkpoint path; retained `draft_config` does not replace checkpoint access.
-Scheme-specific model and backend checks remain unchanged. Explicit MTP is
-rejected for Kimi-K3 (`KimiK3ForConditionalGeneration`), the architecture in the
-DSPARK capability gate. MiniMax EAGLE3 remains unsupported.
+Scheme-specific model and backend checks remain unchanged. Under OP timing,
+the DSPARK capability gate rejects explicit MTP for Kimi-K3
+(`KimiK3ForConditionalGeneration`). An explicit vLLM `fpm_regression` does not
+compile that OP graph; it follows the fitted-snapshot requirements below.
+MiniMax EAGLE3 remains unsupported.
 Selecting a scheme does not override these model-family gates.
 
 Replay uses the existing NextN executor for a linear chain of 1–5 draft tokens.
@@ -116,8 +118,15 @@ The selected scheme may impose a narrower backend/model constraint. Use default
 timing so the canonical constructor retains draft costs; fixed and polynomial
 timing are rejected for generic schemes. OP/SOL support and estimator fallback
 follow the [cost-model contract](../../perf-model/configuration.md#speculative-decoding-configuration):
-an explicit FPM request with `fallback_policy: deny` fails, while an allowed
-fallback can select OP without discarding the scheme.
+an unsupported explicit FPM request with `fallback_policy: deny` fails, while an
+allowed fallback can select OP without discarding the scheme. An explicit vLLM
+`fpm_regression` accepts MTP directly instead: a matching `state_snapshot`
+fitted at depth N times `kind: mtp` with `depth: N` as legacy `nextn: N`, and
+requires `fallback_policy: deny`. Without a snapshot, `fallback_policy: allow`
+still selects the regression, then Runner preflight rejects its untrained fit;
+it does not retry OP. Select `estimation_mode: op_level` explicitly for OP
+timing. See
+[engine replay timing](../../perf-model/configuration.md#engine-replay-timing).
 
 `kind: mtp` also supports [G2 host offload](kv-cache.md#host-offload-g2)
 on aggregated and P/D vLLM workers with prefix caching enabled and

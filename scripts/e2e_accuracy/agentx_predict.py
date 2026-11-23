@@ -7,6 +7,7 @@ import hashlib
 import importlib
 import importlib.resources
 import json
+import os
 import sys
 import time
 from dataclasses import asdict
@@ -14,6 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.e2e_accuracy.simulation_features import build as build_features
+from scripts.release.package_identity import runtime_module
 
 
 def predict(config_path, output):
@@ -21,10 +23,10 @@ def predict(config_path, output):
     # Branch wheels have different capabilities. Import inside this isolated
     # boundary so an older wheel produces an explicit unsupported outcome.
     try:
-        api = importlib.import_module("aisim")
-        compiler = importlib.import_module("aisim.compiler")
-        database = importlib.import_module("aisim.sdk.perf_database")
-        dashboard = importlib.import_module("aisim.replay.dashboard")
+        api = runtime_module("aisim")
+        compiler = runtime_module("aisim.compiler")
+        database = runtime_module("aisim.sdk.perf_database")
+        dashboard = runtime_module("aisim.replay.dashboard")
         requirements = api.ReplayOutputRequirements(
             include_raw_report=True, capture_per_request=True, capture_telemetry=True
         )
@@ -32,14 +34,18 @@ def predict(config_path, output):
         return {"outcome": "unsupported", "reason": "replay_telemetry_unavailable"}
     config = json.loads(config_path.read_text())
     engine = config["engine"]
-    version = config.pop("prediction_database_version", None) or database.get_latest_database_version(
-        system=engine["hardware"], backend=engine["backend"]
-    )
+    pinned = config.pop("prediction_database_version", None)
+    version = pinned or database.get_latest_database_version(system=engine["hardware"], backend=engine["backend"])
     if not version:
         return {"outcome": "unsupported", "reason": "database_unavailable"}
+    if pinned:
+        # A reviewed pin names the collection the accuracy baselines were scored on. It leaves the
+        # query slots when newer collections are promoted and stays readable as a raw data
+        # coordinate; this process serves one prediction, so the opt-in reaches nothing else.
+        os.environ["AIC_ALLOW_UNLISTED_VERSIONS"] = "1"
     engine["backend_version"] = version
     try:
-        data_root = importlib.resources.files("aisim_core") / "systems/data"
+        data_root = importlib.resources.files(runtime_module("aisim_core")) / "systems/data"
     except ImportError:
         return {"outcome": "unsupported", "reason": "database_unavailable", "prediction_backend_version": version}
     relative = (
@@ -68,8 +74,8 @@ def predict(config_path, output):
     architecture, dspark_architectures = None, None
     if context is not None:
         try:
-            utils = importlib.import_module("aisim_core.sdk.utils")
-            common = importlib.import_module("aisim_core.sdk.common")
+            utils = runtime_module("aisim_core.sdk.utils")
+            common = runtime_module("aisim_core.sdk.common")
             architecture = utils.get_model_config_from_model_path(parsed.engine.model).get("architecture")
         except (ImportError, AttributeError):
             return {
