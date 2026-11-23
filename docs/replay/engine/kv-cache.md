@@ -226,9 +226,11 @@ what Replay actually reused. A readmission after preemption can reuse KV the
 request itself computed, which raises `reused_input_tokens` but not
 `first_admission_reused_input_tokens`; the summary's
 `first_admission_prefix_cache_reused_ratio` aggregates the latter. On a vLLM
-worker with a [grouped cache](#other-cache-modes) and prefix caching, that
-KV can hold output tokens of the request, so `reused_input_tokens` can
-exceed the input length.
+worker with prefix caching, with or without a
+[grouped cache](#other-cache-modes), that KV can hold output tokens of the
+request, so `reused_input_tokens` can exceed the input length. The summary's
+`prefix_cache_reused_ratio` is the sum of `reused_input_tokens` over the sum
+of the input tokens, so it can exceed 1 in a run with preemptions.
 
 ### SGLang request cache salt
 
@@ -1368,8 +1370,8 @@ sub-block matching without an explicit full-state scratch count.
     `async_scheduling: false`. When the step before is still in flight, it
     is one step later: on an aggregated worker except in the layouts that
     the second item of the known differences below names, and on a prefill
-    or decode worker in every layout. In those layouts an aggregated worker
-    releases it at the next step in both modes. The block stays cached until eviction. See vLLM
+    or decode worker in every layout. In the layouts that the item names, an
+    aggregated worker releases it at the next step in both modes. The block stays cached until eviction. See vLLM
     v0.31.0
     [`kv_cache_manager.py:552-556`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_manager.py#L552-L556)
     and
@@ -1478,21 +1480,24 @@ sub-block matching without an explicit full-state scratch count.
     `replay invariant violated: offline replay detected an effect-free zero-duration pass`
     where a replay that held the blocks would complete. In a layout in which
     the block of a prefix-cacheable `state` group is below the scheduler
-    block, vLLM itself can starve a request with async scheduling and a pool
-    of exactly its startup count. Without hits inside a block, a preempted
-    request keeps cache hits only up to a multiple of the scheduler block, so
-    a state group with a smaller block loses the progress inside that block.
-    While a step of the request is in flight, the request needs one more
-    state block than the pool has, so it preempts itself, and its next life
-    hits the same tokens again. A replay that followed vLLM there would not
-    end. So replay completes requests that vLLM starves in such a layout,
-    and in a pool near the startup count it can count fewer preemptions than
-    vLLM. In every other layout that loses the hold, replay frees these
+    block, with async scheduling and a pool of exactly vLLM's startup count,
+    vLLM's rules can make a request preempt itself: while a step of the
+    request is in flight, its next chunk can need one more state block than
+    the pool has, and vLLM then preempts the request. A replay that held the
+    blocks as vLLM does can repeat that preemption without end. So replay
+    does not hold them in such a layout: it completes such a request, and in
+    a pool near the startup count it can count fewer preemptions than vLLM.
+    In every other layout that loses the hold, replay frees these
     blocks one step earlier than vLLM in the same way. In the GLM-5.3-Flash
     groups the attention block and every state block equal the scheduler
     block, 2,176 tokens, beside a ring of 4 tokens, so they keep the longer
     hold. With prefix caching off an aggregated worker with cache groups
-    holds the blocks of a sliding-window group as vLLM does in every layout.
+    holds the blocks of a sliding-window or `convolution` group as vLLM does
+    in every layout. Replay has no startup check with prefix caching off. So
+    in a pool below vLLM's startup count this hold can stop the replay with
+    the error `grouped KV forward needs ... exceeding the entire ... cache pool`,
+    where a replay with `async_scheduling: false` completes; see
+    [memory accounting](../../perf-model/memory.md#fpm-profile-cache-groups-and-byte-budgets).
   - Replay releases held blocks in another order than vLLM in two cases.
     When one allocation releases a checkpoint block and a previous state
     block that a crossing after the checkpoint step left, replay releases the
@@ -1866,7 +1871,15 @@ sub-block matching without an explicit full-state scratch count.
     preempted request does not fit. Replay keeps the transferred requests
     that wait for a reservation in a queue of their own, and a preempted
     request that waits does not hold back the first of them. So replay can
-    reserve a load that vLLM holds back behind a preempted request.
+    reserve a load that vLLM holds back behind a preempted request. While a
+    transferred request waits for a reservation, the waiting loop of replay
+    takes only requests that hold their loaded KV and does not test a
+    preempted request, where vLLM tests the request at the front of its
+    waiting queue after those. On a decode pool that holds only a few
+    requests, preempted requests can then wait until no transferred request
+    waits, and if the loaded requests hold the pool and none of their first
+    steps fits, the replay ends with the error
+    `replay invariant violated: offline disagg replay encountered an effect-free zero-duration pass`.
 
 - **Belady eviction.** The native ReplaySpec field
   `engine.kv_eviction_policy: belady` evicts the block whose next use in the

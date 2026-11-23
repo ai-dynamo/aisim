@@ -460,9 +460,16 @@ gives the steps of that import. The import writes the field only from a vLLM
 out a deployment shape whose pool is below it. Prediction does not test the
 pool against the bound. With prefix caching on, the native rank then refuses
 a pool below its startup count. With prefix caching off the replay runs, and
-it rejects each request whose whole sequence is larger than the pool. vLLM
-does not start with a pool that cannot hold one request of `max_model_len`
-tokens.
+it rejects each request whose whole sequence is larger than the pool. With
+async scheduling an aggregated worker also keeps the window blocks of the
+request's forward in flight, as vLLM does, so one forward of a window group
+can need up to
+`ceil(min(W - 1 + 2 * max_num_tokens, max_model_len) / block_size_tokens) + 1`
+blocks, the count of vLLM's startup check. In a pool below that count the
+replay can then stop with the error
+`grouped KV forward needs ... exceeding the entire ... cache pool`, also at a
+step that fits with `async_scheduling: false`. vLLM does not start with a pool
+that cannot hold one request of `max_model_len` tokens.
 
 When `request_occupancy_tokens` is supplied, the result also includes
 `request_occupancy_cache_bytes`. KV-relative synthetic loads use this native
