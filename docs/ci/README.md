@@ -434,6 +434,15 @@ goldens establish numerical stability; hardware accuracy is supported by the
 specific measured configurations in the
 [accuracy evidence](../../README.md#accuracy-evidence).
 
+Engine Golden Regression and both prediction-snapshot collections build AISim
+from source on GitHub-hosted `ubuntu-24.04` runners without the CI job
+container; they use no NVIDIA-internal service. Each job, and each side of the
+comparison, may run on a different CPU model. The compiled engine uses baseline
+x86-64 code generation, the golden and sentinel checks use relative
+tolerances, and the comparison reports drift above a 0.01% relative change
+without blocking on it. Investigate drift on a PR that does not change
+numerical behavior as a runner difference; do not refresh goldens to absorb it.
+
 The macOS platform-wheel and daily README jobs use the ARM64 `macos-15` runner.
 This replaces `macos-14`, which GitHub is
 [retiring on November 2, 2026](https://github.com/actions/runner-images/issues/13518).

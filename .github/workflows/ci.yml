@@ -951,17 +951,13 @@ jobs:
     name: Engine Golden Regression
     needs: [fast-ci, select-full-ci]
     if: ${{ needs.select-full-ci.outputs.engine_golden_regression == 'true' }}
-    runs-on: prod-aisim-default-amd64-v1
+    # Builds from source with no NVIDIA-internal dependency; the numerical
+    # sentinel step fetches its own baseline commit, so no full history.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
-    container:
-      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
-      env:
-        HOME: /__w/aisim/aisim
-        USER: runner
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/setup-python-rust
         with:
