@@ -39,6 +39,105 @@ fn complete_backup(tree: &mut Core, leaf: NodeId) {
 }
 
 #[test]
+fn scoped_review_host_hash_count_is_validated_before_mutation() {
+    for page_size in [1, 2] {
+        for enable_kv_cache_events in [false, true] {
+            let mut tree = Core::new(
+                CacheInitParams {
+                    page_size,
+                    enable_hicache: true,
+                    enable_kv_cache_events,
+                    ..Default::default()
+                },
+                vec![FULL],
+            );
+            let root = tree.root_node_handle(None);
+            let key: Vec<_> = (1..=2 * page_size as i64).map(|i| 10 * i).collect();
+            let rows: Vec<_> = (100..100 + 2 * page_size as u32).collect();
+            let hashes = vec!["11".repeat(32), "22".repeat(32)];
+            // Exercise an empty root, a walk that would split an existing edge,
+            // and a non-root anchor whose recency must also remain unchanged.
+            let mut anchor = root;
+            for populated in [false, true] {
+                if populated {
+                    anchor = tree
+                        .insert_host(
+                            root,
+                            None,
+                            key.clone(),
+                            PageValue::from_vec(rows.clone()),
+                            hashes.clone(),
+                        )
+                        .unwrap()
+                        .inserted_host_node
+                        .unwrap();
+                    tree.take_events();
+                }
+                let starts = if populated {
+                    vec![root, anchor]
+                } else {
+                    vec![root]
+                };
+                for start in starts {
+                    for hash_count in [0, 1, 3] {
+                        let nodes = tree.inspect_get_all_node_ids();
+                        let ticks: Vec<_> = nodes
+                            .iter()
+                            .map(|&id| tree.inspect_get_node_access_counter(id).unwrap())
+                            .collect();
+                        let mut incoming_key = key.clone();
+                        if populated && start == root {
+                            *incoming_key.last_mut().unwrap() += 1;
+                        }
+                        let result = tree.insert_host_in_namespace(
+                            start,
+                            KeyNamespaceRef::default(),
+                            incoming_key,
+                            PageValue::from_vec(rows.clone()),
+                            vec!["hash".into(); hash_count],
+                        );
+                        assert!(matches!(
+                            result,
+                            Err(TreeCoreRuntimeError::InsertHostHashCount {
+                                hash_count: actual,
+                                page_count: 2,
+                            }) if actual == hash_count
+                        ));
+                        assert_eq!(tree.inspect_get_all_node_ids(), nodes);
+                        for (&id, tick) in nodes.iter().zip(ticks) {
+                            assert_eq!(tree.inspect_get_node_access_counter(id).unwrap(), tick);
+                        }
+                        assert!(tree.take_events().is_empty());
+                    }
+                }
+            }
+            // Valid hashes survive the exact partial-match split that used to
+            // panic after an empty hash vector was accepted with events off.
+            let matched = tree.match_prefix(&MatchPrefixParams {
+                key: &key[..page_size].to_vec(),
+                namespace: KeyNamespaceRef::default(),
+            });
+            assert_eq!(matched.host_hit_length, page_size);
+            assert_eq!(
+                tree.inspect_get_component_host_value(matched.last_host_node_id, FULL)
+                    .unwrap()
+                    .unwrap()
+                    .as_slice(),
+                &rows[..page_size]
+            );
+            let prefix = tree.arena.resolve(matched.last_host_node_id).unwrap();
+            assert_eq!(
+                tree.arena.node(prefix).hash_value.as_ref().unwrap(),
+                &hashes[..1]
+            );
+            let suffix = tree.arena.node(tree.arena.resolve(anchor).unwrap());
+            assert_eq!(suffix.hash_value.as_ref().unwrap(), &hashes[1..]);
+            tree.try_sanity_check(&[], &[]).unwrap();
+        }
+    }
+}
+
+#[test]
 fn scoped_review_lru_and_mru_free_different_competing_pages() {
     for (policy, expected) in [("lru", 1), ("mru", 2)] {
         let mut tree = Core::new(

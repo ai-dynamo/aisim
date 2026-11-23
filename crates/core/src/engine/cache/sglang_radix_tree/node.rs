@@ -802,6 +802,12 @@ pub enum TreeCoreRuntimeError {
     /// A host insert below a non-root anchor must remain in that anchor's namespace.
     #[error("insert_host namespace does not match non-root anchor {node_id}")]
     InsertHostNamespaceMismatch { node_id: NodeId },
+    /// Every host-backed radix page must carry exactly one storage hash.
+    #[error("host insert has {hash_count} page hashes, expected {page_count}")]
+    InsertHostHashCount {
+        hash_count: usize,
+        page_count: usize,
+    },
     /// Continuation inserts must start at the exact page-aligned prefix boundary.
     #[error(
         "insert continuation prefix length {prefix_len} is not aligned to page size {page_size}"

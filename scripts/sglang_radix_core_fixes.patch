@@ -360,7 +360,18 @@ and its LICENSE for provenance, the preserved license, and each local correction
      /// An arena slot beyond the arena's bounds — never allocated. `size` is the
      /// arena's current slot count, so valid ids are `0..size`.
      #[error("node access out of bounds: id {id} not in [0, {size})")]
-@@ -787,6 +807,9 @@
+@@ -782,11 +802,20 @@
+     /// A host insert below a non-root anchor must remain in that anchor's namespace.
+     #[error("insert_host namespace does not match non-root anchor {node_id}")]
+     InsertHostNamespaceMismatch { node_id: NodeId },
++    /// Every host-backed radix page must carry exactly one storage hash.
++    #[error("host insert has {hash_count} page hashes, expected {page_count}")]
++    InsertHostHashCount {
++        hash_count: usize,
++        page_count: usize,
++    },
+     /// Continuation inserts must start at the exact page-aligned prefix boundary.
+     #[error(
          "insert continuation prefix length {prefix_len} is not aligned to page size {page_size}"
      )]
      InsertPrefixNotPageAligned { prefix_len: usize, page_size: usize },
@@ -370,7 +381,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
      /// The retained prefix cannot extend beyond the aligned input key.
      #[error(
          "insert continuation prefix length {prefix_len} exceeds aligned key length {aligned_key_len}"
-@@ -804,6 +827,9 @@
+@@ -804,6 +833,9 @@
          node_prefix_len: usize,
          prefix_len: usize,
      },
@@ -380,7 +391,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
      /// A non-root continuation stays inside the anchor's namespace.
      #[error("insert continuation namespace does not match non-root anchor {node_id}")]
      InsertContinuationNamespaceMismatch { node_id: NodeId },
-@@ -817,6 +843,9 @@
+@@ -817,6 +849,9 @@
          value_len: usize,
          required_len: usize,
      },
@@ -828,7 +839,21 @@ and its LICENSE for provenance, the preserved license, and each local correction
              return false;
          }
          if node.is_load_back_pending() {
-@@ -4147,6 +4251,7 @@
+@@ -3834,6 +3938,13 @@
+         if !anchor.is_root() && anchor.namespace.as_ref() != namespace {
+             return Err(TreeCoreRuntimeError::InsertHostNamespaceMismatch { node_id: anchor.id });
+         }
++        let page_count = total_len / self.page_size;
++        if hash_value.len() != page_count {
++            return Err(TreeCoreRuntimeError::InsertHostHashCount {
++                hash_count: hash_value.len(),
++                page_count,
++            });
++        }
+         self.touch_node_(node_id);
+         if total_len == 0 {
+             return Ok(InsertResult {
+@@ -4147,6 +4258,7 @@
                  name: PoolName::Kv,
                  host_indices: Some(V::empty()),
                  nodes_to_load: Some(Vec::new()),
@@ -836,7 +861,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
                  ..Default::default()
              };
              return Ok((empty_kv, HashMap::new()));
-@@ -4469,7 +4574,7 @@
+@@ -4469,7 +4581,7 @@
          device_indices: V,
          mut kv_xfer: PoolTransfer<V>,
          comp_xfers: HashMap<ComponentType, Vec<PoolTransfer<V>>>,
@@ -845,7 +870,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let anchor_id = node_id;
          let node_id = self.arena.resolve(node_id)?;
          let loaded_node_indices = kv_xfer
-@@ -4479,6 +4584,98 @@
+@@ -4479,6 +4591,98 @@
              .map(|&loaded_id| self.arena.resolve(loaded_id))
              .collect::<Result<Vec<_>, _>>()?;
          self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
@@ -944,7 +969,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let mut cache_actions: Vec<CacheAction<V>> = Vec::new();
          kv_xfer.device_indices = Some(device_indices);
          let nodes_to_load = kv_xfer.nodes_to_load.clone();
-@@ -4709,8 +4906,12 @@
+@@ -4709,8 +4913,12 @@
              if node.write_through_pending_id == Some(ack_id) {
                  node.write_through_pending_id = None;
                  self.update_full_coexisting_host_tracking_(node_idx);
@@ -959,7 +984,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          }
          Ok(())
      }
-@@ -4829,6 +5030,11 @@
+@@ -4829,6 +5037,11 @@
          for &(child_id, pos, prefix_len) in &spans {
              if pos + prefix_len <= window_start {
                  continue;
@@ -971,7 +996,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              }
              if self.arena.has_device_value(child_id, SWA) {
                  return Err(format!(
-@@ -5833,6 +6039,12 @@
+@@ -5833,6 +6046,12 @@
          let last_device_node_idx = self.arena.resolve(result.last_device_node_id)?;
          self.arena.resolve(result.last_host_node_id)?;
          let best_match_node_idx = self.arena.resolve(result.best_match_node_id)?;
@@ -984,7 +1009,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          Ok(self
              .component_by_type_(component_type)
              .finalize_match_result_in_tree_core(
-@@ -5843,6 +6055,7 @@
+@@ -5843,6 +6062,7 @@
                  params,
                  value_chunks,
                  best_value_len,

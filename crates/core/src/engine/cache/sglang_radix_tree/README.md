@@ -70,6 +70,8 @@ following local corrections to this pinned revision:
   Reject demoted retained paths as well; restore their device rows and resume
   the same walk, preserving duplicate frees already consumed at the barrier.
 - Validate SWA eviction-boundary alignment before inserting Full KV or events.
+- Reject host insertions with a page-hash count that differs from the key's
+  page count before touching recency, splitting edges, or attaching host rows.
 - Preserve integer-first T-LRU arithmetic when it fits; convert positive
   history-plus-estimate overflow to finite floating-point arithmetic.
 - Defer demotion while device locks are held or device children have appeared,

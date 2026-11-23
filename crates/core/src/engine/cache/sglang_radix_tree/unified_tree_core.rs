@@ -3938,6 +3938,13 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         if !anchor.is_root() && anchor.namespace.as_ref() != namespace {
             return Err(TreeCoreRuntimeError::InsertHostNamespaceMismatch { node_id: anchor.id });
         }
+        let page_count = total_len / self.page_size;
+        if hash_value.len() != page_count {
+            return Err(TreeCoreRuntimeError::InsertHostHashCount {
+                hash_count: hash_value.len(),
+                page_count,
+            });
+        }
         self.touch_node_(node_id);
         if total_len == 0 {
             return Ok(InsertResult {
