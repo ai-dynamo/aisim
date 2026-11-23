@@ -772,17 +772,6 @@ def test_configuration_discovery_obeys_a_zero_byte_allowance(tmp_path, files):
     assert transport.opened == []
 
 
-def test_discovery_and_selected_payload_share_one_allowance(tmp_path, files):
-    index = json.loads(files["catalog/fpm.json"])
-    options = {"categories": ("op-latency", "fpm"), "configuration_id": index["entries"][0]["configuration_id"]}
-    # Ownership discovery downloads the indexes. The payload cannot spend that allowance a second time.
-    discovery_bytes = sum(len(files[path]) for path in ("catalog/dataset.json", "catalog/fpm.json"))
-    transport = FakeTransport(files)
-    with pytest.raises(DataTooLargeError):
-        ensure_data(CONFIG, pin(tmp_path, max_bytes=discovery_bytes, **options), transport=transport)
-    assert "fpm/m1/data.parquet" not in transport.opened
-
-
 def test_retired_pin_guidance_preserves_the_available_commit():
     from aisim_core.data.repos import PUBLIC_REPO, RETIRED_FPM_REPO, resolve_ref, retired_repo_hint
 

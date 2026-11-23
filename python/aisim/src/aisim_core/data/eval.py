@@ -543,9 +543,7 @@ def verify_record(
         )
     ids = table.column("case_id").to_pylist()
     if len(set(ids)) != len(ids):
-        return VerificationReport(
-            record_id=record.record_id, ok=False, problems=["duplicate case_id in truth table"]
-        )
+        return VerificationReport(record_id=record.record_id, ok=False, problems=["duplicate case_id in truth table"])
     truths = table.column("truth_value").to_pylist()
     cases = []
     case_inputs: dict[str, str] = {}

@@ -606,7 +606,7 @@ def test_internal_fails_on_everything_the_public_validator_rejects(tmp_path, pro
     repo = PUBLIC if profile == "public" else INTERNAL_REPO
     assert validate_tree(root, repo=repo, profile=profile).ok
     directory = (root / manifests[0]).parent
-    metrics = directory / "metrics.parquet"
+    metrics = next(directory.rglob("metrics.parquet"))  # tables live under an immutable generation directory
     original = metrics.read_bytes()
 
     metrics.write_bytes(original[:-9] + b"corrupt!!")  # tampered table
@@ -940,7 +940,7 @@ def test_changed_bytes_invalidate_approval_and_apply(tmp_path, monkeypatch):
 
     def change_after_checkout_check(*args):
         real_check(*args)
-        (root / directory / "metrics.parquet").write_bytes(b"changed")
+        next((root / directory).rglob("metrics.parquet")).write_bytes(b"changed")
 
     monkeypatch.setattr(promote, "_check_source_checkout", change_after_checkout_check)
     target = _target(tmp_path)
@@ -1078,7 +1078,7 @@ def test_snapshot_text_blocks_promotion_and_public_validation(tmp_path, location
     plan = plan_promotion(root, _request(root, directories, draft), _reviewers())
     assert not plan.content_ok and not plan.ok  # valid approvals cannot override content checks
     filename = "snapshot.json" if location == "metadata" else f"snapshot-{location}.parquet"
-    path = f"{directories[-1]}/{filename}"
+    path = next((root / directories[-1]).rglob(filename)).relative_to(root).as_posix()
     assert any(f.code == code and f.path == path for f in plan.findings)
     assert any(f.code == code and f.path == path for f in validate_tree(root, profile="public").errors)
     target = _target(tmp_path)
@@ -1101,7 +1101,7 @@ def test_clean_snapshot_is_promoted_by_copy_and_passes_public_validation(tmp_pat
     assert plan.ok, plan.findings
     target = _target(tmp_path)
     apply_promotion(plan, root, target)
-    for path in (root / directories[-1]).iterdir():
+    for path in (p for p in (root / directories[-1]).rglob("*") if p.is_file()):
         assert (target / path.relative_to(root)).read_bytes() == path.read_bytes()
     report = validate_tree(target, repo=PUBLIC, profile="public")
     assert report.ok, report.errors
@@ -1131,7 +1131,7 @@ def test_eval_record_is_promoted_with_its_configuration(tmp_path):
 def test_lineage_of_redacted_originals_is_recorded_privately(tmp_path):
     root, directory = _promotable(tmp_path)
     original = "e" * 64
-    path = f"{directory}/metrics.parquet"
+    path = next((root / directory).rglob("metrics.parquet")).relative_to(root).as_posix()
     _public(root, directory, original_sha256={path: original})
     draft = plan_promotion(root, _request(root, [directory]), _reviewers())
     plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
@@ -1332,7 +1332,7 @@ def test_metric_and_series_text_blocks_promotion_and_public_validation(tmp_path,
     draft = plan_promotion(root, _request(root, [directory]), _reviewers())
     plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
     assert not plan.content_ok and not plan.ok  # approval does not override disclosure checks
-    artifact_path = f"{directory}/{table}.parquet"
+    artifact_path = next((root / directory).rglob(f"{table}.parquet")).relative_to(root).as_posix()
     assert any(f.code == code and f.path == artifact_path and f"column {column}" in f.message for f in plan.findings)
     assert any(f.code == code and f.path == artifact_path for f in validate_tree(root, profile="public").errors)
     with pytest.raises(PromotionError):
@@ -1368,7 +1368,7 @@ def test_clean_metric_and_series_text_can_be_promoted(tmp_path, value):
     target = _target(tmp_path)
     apply_promotion(plan, root, target)
     for table in ("metrics", "series"):
-        relative = f"{directory}/{table}.parquet"
+        relative = next((root / directory).rglob(f"{table}.parquet")).relative_to(root).as_posix()
         assert (target / relative).read_bytes() == (root / relative).read_bytes()
     report = validate_tree(target, repo=PUBLIC, profile="public")
     assert report.ok, report.errors
@@ -1957,6 +1957,7 @@ def test_standalone_snapshot_validation_checks_member_contents(tmp_path, change)
         "hash": {"record_sha256": "f" * 64},
         "none": {},
     }
+    shutil.rmtree(root / snapshot_dir / "snapshot-generations")  # the replaced snapshot leaves no orphan tables
     write_snapshot(
         root,
         snapshot_dir + "/snapshot.json",
@@ -3340,7 +3341,7 @@ def test_snapshot_artifacts_must_be_in_the_approved_selection(tmp_path, which):
 
 def test_lineage_uses_the_governing_visibility_entry(tmp_path):
     root, directory = _promotable(tmp_path)
-    relative = f"{directory}/metrics.parquet"
+    relative = next((root / directory).rglob("metrics.parquet")).relative_to(root).as_posix()
     write_ledger(
         root,
         VisibilityLedger(

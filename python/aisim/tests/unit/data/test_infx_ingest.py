@@ -600,9 +600,7 @@ def test_promotion_verifies_member_configuration_artifacts(root, tmp_path, artif
     state = infx_job.load_state(root)
     _, members = read_snapshot(root, state["candidate"]["snapshot_path"])
     directory = (root / members[0].manifest_path).parent
-    path = directory / artifact
-    if not path.exists():
-        path = next(directory.glob("*metrics*.parquet"))
+    path = next(directory.rglob(artifact))  # tables live under an immutable generation directory
     path.unlink()
     before = (root / infx_job.STATE_FILE).read_bytes()
     with pytest.raises((OSError, ValueError)):
