@@ -8082,6 +8082,7 @@ mod tests {
                     ForwardPassWorkerType::Aggregated,
                     None,
                     false,
+                    false,
                     &mut Vec::new(),
                     &mut serde_json::Map::new(),
                 )
@@ -8157,6 +8158,7 @@ mod tests {
                 true,
                 ForwardPassWorkerType::Decode,
                 None,
+                false,
                 false,
                 &mut Vec::new(),
                 &mut serde_json::Map::new(),
