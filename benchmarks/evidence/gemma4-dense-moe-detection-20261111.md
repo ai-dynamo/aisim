@@ -12,10 +12,10 @@ available in this checkout; these tables remain historical author-reported
 results, not verification of the current head. No GPU was run, and no
 performance data was added, re-collected, or re-fitted.
 
-The current code head is `f9d44bcdc8f986d942b4a96ab3d7096bf420085a`, which
-merges `main` at `1e321d5848ffc09dc7686cbc819eaf3dc5f52eac`; later commits
-change only this document. See
-[Current head after the main merges](#current-head-f9d44bcdc-after-the-main-merges-2026-11-24)
+The current code head is `396756274139fbc81dfdda901836e80f851de375`, which
+sits on the merge of `main` at `1e321d5848ffc09dc7686cbc819eaf3dc5f52eac`;
+later commits change only this document. See
+[Current head after the main merges](#current-head-after-the-main-merges-2026-11-24)
 for the verification at that SHA. The pre-rebase head was
 `8f3a62e0fde729cf74db0b6b3551608338b367dd`, based on
 `0809faae9e543487dcf2142dc6afe2427a42f9bd`, where the classifier fix was
@@ -38,10 +38,11 @@ constant metrics through offline runner and performance-model doubles, so
 candidate scores are placeholders; only the selected shape set and the
 feasible/infeasible status are meaningful.
 
-## Current head `f9d44bcdc` after the main merges (2026-11-24)
+## Current head after the main merges (2026-11-24)
 
-The reviewed code head is `f9d44bcdc8f986d942b4a96ab3d7096bf420085a`; any
-later commit changes only this document. Two merges of `main` sit on top of
+The reviewed code head is `396756274139fbc81dfdda901836e80f851de375`; any
+later commit changes only this document. It adds the omitted-MoE-dimension
+inference described below on top of two merges of `main`, which sit on top of
 the reviewed commits. `bf527e451` merges `main` at
 `24d06d418db0ec4aee309e0e24770958c8fdea19` and reconciles one consumer with
 this branch: because the dense gate now raises
@@ -98,9 +99,26 @@ checking the diagnostic, and
 `unsupported_capacity_keeps_the_fallback_eligible_variant` asserts a coverage
 miss keeps `Unsupported` with its model, backend, GPU SKU and reason intact.
 
+### Omitted MoE dimensions
+
+The request-wide re-raise exposes a pre-existing default in
+`KVCacheEstimator.from_request`: it replaced an omitted `moe_tp_size` or
+`moe_ep_size` with `1` before building the config. With exactly one dimension
+omitted, that defeated `ModelConfig`'s inference from the attention width
+(`config.resolve_moe_parallelism`), so a valid request such as `tp_size=4` with
+`moe_tp_size=2` became a width mismatch, and the new re-raise made that
+terminal instead of reaching the naive fallback. `from_request` now leaves a
+single omitted dimension unset so the config contract resolves it, and keeps
+the historical `moe_tp_size=moe_ep_size=1` default for an omitted pair, which
+carries no layout to infer. Two tests pin both sides:
+`test_estimate_kv_cache_infers_an_omitted_moe_dimension` and
+`test_estimate_kv_cache_keeps_the_tp_only_default_for_an_omitted_moe_pair`.
+This changes production behavior for callers that passed only one dimension:
+the request now estimates natively instead of failing the width check.
+
 ### Verification at the current head
 
-Local run at `f9d44bcdc` on macOS arm64, Python 3.13.9, with the native
+Local run at `396756274` on macOS arm64, Python 3.13.9, with the native
 extension rebuilt from this head's tree (`maturin develop --release`, the `pyproject.toml`
 `extension-module,jemalloc` features) so the interpreter and extension agree on
 `ENGINE_SPEC_SCHEMA_VERSION` (30 in this tree and on `main`; an extension built
@@ -108,11 +126,11 @@ from another branch with 31 fails unrelated `perfmodel::py` tests).
 
 | Verification | Tested commit | Result |
 | --- | --- | --- |
-| Targeted pytest selection from the 2026-11-18 command below | `f9d44bcdc` | 1,187 passed, 0 failed |
-| `cargo test -p aisim-core --features embed-python --lib perfmodel::` (covers `memory.rs` and the `fpm/model.rs` fallback policy test) | `f9d44bcdc` | 1,476 passed, 0 failed, 1 ignored |
-| `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1 cargo test -p aisim-core --features embed-python --test perfmodel_dense_gemma4_bridge` | `f9d44bcdc` | 5 passed; no skips |
-| `cargo fmt --all -- --check` | `f9d44bcdc` | clean |
-| `tests/test_ci_workflow_contracts.py` with Fast CI's invocation | `f9d44bcdc` | 782 passed, 3 skipped, 5 failed for host-only reasons (see below) |
+| Targeted pytest selection from the 2026-11-18 command below (includes the two new MoE-inference tests) | `396756274` | 1,189 passed, 0 failed |
+| `cargo test -p aisim-core --features embed-python --lib perfmodel::` (covers `memory.rs` and the `fpm/model.rs` fallback policy test) | `396756274` | 1,476 passed, 0 failed, 1 ignored |
+| `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1 cargo test -p aisim-core --features embed-python --test perfmodel_dense_gemma4_bridge` | `396756274` | 5 passed; no skips |
+| `cargo fmt --all -- --check` | `396756274` | clean |
+| `tests/test_ci_workflow_contracts.py` with Fast CI's invocation | `396756274` | 782 passed, 3 skipped, 5 failed for host-only reasons (see below) |
 
 The 5 workflow-contract failures are environmental, not merge regressions: the
 same five fail identically at `main` `1e321d584` in a clean worktree. One needs
@@ -120,7 +138,7 @@ a Linux manylinux Python 3.12 root (`test_manylinux_bootstrap_exports_working_py
 and four need the `pip-licenses` distribution that this macOS dev venv does not
 install (`test_real_pip_licenses_enforces_the_policy`). The perf-model lib total
 is higher than the 1,460 recorded at `b761646c0` because main added tests.
-These are local results; the commits after `f9d44bcdc` change only this
+These are local results; the commits after `396756274` change only this
 document. **No Full CI run exists for this head**; admission remains with the
 maintainer.
 
@@ -391,6 +409,8 @@ Pinned by
 | `test_estimate_kv_cache_keeps_the_naive_fallback_for_a_valid_dense_gemma4_checkpoint` | A well-formed dense checkpoint with a missing database still takes the documented naive fallback |
 | `test_estimate_kv_cache_rejects_dense_gemma4_moe_ep_before_the_database` | A dense checkpoint with `moe_ep_size=2` and `allow_naive_fallback=True` is rejected before the perf-DB lookup and never priced by the naive estimator |
 | `test_estimate_kv_cache_does_not_naive_fallback_on_a_non_gemma_configuration_error` | Outside Gemma 4: a `deepseek-ai/DeepSeek-V3` width mismatch with `allow_naive_fallback=True` raises instead of returning a `source="naive_fallback"` capacity |
+| `test_estimate_kv_cache_infers_an_omitted_moe_dimension` | `tp_size=4` with `moe_tp_size=2` and no `moe_ep_size` is resolved by the config contract and estimated natively, instead of failing the width check because the estimator filled `1` |
+| `test_estimate_kv_cache_keeps_the_tp_only_default_for_an_omitted_moe_pair` | An omitted `moe_tp_size`/`moe_ep_size` pair keeps the historical pure-TP default |
 | `test_dense_gemma4_static_estimate_skips_moe_comm_resolution` | Static CLI gate: no `resolve_model_config_moe_comm` call for dense Gemma 4 |
 | `test_dense_gemma4_disagg_estimate_skips_moe_comm_resolution` | Disagg CLI gate: neither role resolves MoE communication for dense Gemma 4 |
 | `test_routed_gemma4_static_estimate_still_resolves_moe_comm` | Routed Gemma 4 keeps the static-path resolution for both required phases |
@@ -474,8 +494,9 @@ still fail for a real reason (`PERF_DATA_MISSING`, `SDK_UNREPRESENTABLE`,
 Inspection at `8f3a62e0` confirms all 103 FPE rows and ten retired-version
 CLI rows above still record `FAIL`. Neither set was regenerated by the local
 verification above. The same counts and byte-identical rows were re-checked at
-`f9d44bcdc` against `main` `1e321d584` (and earlier at `d65e5b396` against
-`1e321d584` and at `b761646c0` against `19d8a245a`): 103 dense-rejection FPE
+`396756274` against `main` `1e321d584` (and earlier at `d65e5b396` and
+`f9d44bcdc` against `1e321d584`, and at `b761646c0` against `19d8a245a`): 103
+dense-rejection FPE
 rows on both trees,
 and the ten dense `FAIL` rows plus six `HW_INCOMPATIBLE` rows for
 `trtllm 1.3.0rc23` on both trees, so this branch neither adds nor clears any of
