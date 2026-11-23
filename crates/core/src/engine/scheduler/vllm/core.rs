@@ -3876,12 +3876,11 @@ impl VllmCore {
         if let Some(oracle) = &self.belady_oracle {
             oracle.retire_requests([uuid]);
         }
-        // Before any host-tier cancellation below: dropping a completed load
-        // that awaits vLLM's poll, or cancelling one in flight, returns its
-        // G1 destination, and a destination waiting for capacity must see
-        // that release.
-        let active_blocks_before = self.kv_manager.num_active_blocks();
         let mut cancelled_host_load = false;
+        // Dropping a completed load that awaits vLLM's poll returns its G1
+        // destination before the capacity baseline below is taken; count it
+        // so a destination waiting for capacity is retried.
+        let mut released_polled_load = false;
         self.load_clock.remove(&uuid);
         if let Some(position) = self
             .pending_activations
@@ -3896,7 +3895,9 @@ impl VllmCore {
                     .get_mut(&uuid)
                     .and_then(|request| request.host_offload.as_deref_mut()),
             ) {
+                let blocks_before = self.kv_manager.num_active_blocks();
                 adapter.drop_completed_load(host, &mut self.kv_manager);
+                released_polled_load = self.kv_manager.num_active_blocks() < blocks_before;
                 // Its keys stayed held for vLLM's poll; a peer waiting on
                 // them retries now.
                 cancelled_host_load = true;
@@ -3922,13 +3923,15 @@ impl VllmCore {
         if cancelled_host_load {
             self.state.wake_connector_deadline_waiters();
         }
+        let active_blocks_before = self.kv_manager.num_active_blocks();
         let Some(request) = self.state.requests.get(&uuid) else {
-            if self.kv_manager.num_active_blocks() < active_blocks_before {
+            if released_polled_load || self.kv_manager.num_active_blocks() < active_blocks_before {
                 self.bump_capacity_generation();
             }
             return;
         };
-        let capacity_improved = request.sequence.num_allocated_tokens() > 0
+        let capacity_improved = released_polled_load
+            || request.sequence.num_allocated_tokens() > 0
             || self.state.running_members.contains(&uuid)
             || self.kv_manager.num_active_blocks() < active_blocks_before;
         self.source_holds.remove_request(uuid);
