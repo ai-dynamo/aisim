@@ -1763,3 +1763,36 @@ def test_qualified_mamba_aggregate_translates_capacity_before_native_validation(
     # converting the same invalid shape as if it were scheduler capacity.
     with pytest.raises(ValueError, match="partial prefill extend"):
         backend.run_mixed(model, database, runtime, MixedStepInput(budget, 2))
+
+
+def test_generation_only_mamba_qualification_keeps_legacy_prefill_coordinates(backend):
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.operations import ElementWise, Mamba2Kernel
+    from aisim_core.sdk.perf_database import get_database_view
+
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL", allow_unlisted_version=True)
+    assert database is not None
+    model = get_model("Qwen/Qwen3-0.6B", ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1), "vllm")
+    model.context_ops = [ElementWise("norm", 1, 1, 0)]
+    model.generation_ops = [
+        Mamba2Kernel(
+            "generation_scan",
+            1,
+            "selective_state_update",
+            "generation",
+            4096,
+            64,
+            64,
+            128,
+            4,
+            4,
+            128,
+            state_dtype="float16",
+        )
+    ]
+    runtime = RuntimeConfig(batch_size=4, isl=100, prefix=60, osl=128)
+    mixed = backend._run_agg_mixed_step(model, database, runtime, MixedStepInput(150, 2))
+    # Only a qualified context scan selects the strict native prefill split.
+    # Legacy context work retains 150 - 60 = 90 new tokens plus two decoders.
+    assert mixed.context_tokens == 150
+    assert mixed.per_op_latency_ms["norm"] == pytest.approx(92 * 2 / database.system_spec["gpu"]["mem_bw"] * 1000)

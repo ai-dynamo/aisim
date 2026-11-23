@@ -63,13 +63,13 @@ def _is_fpm_model(model: BaseModel) -> bool:
     return getattr(model, "forward_model", "op_level") == "fpm"
 
 
-def _has_qualified_mamba(model: BaseModel) -> bool:
+def _has_qualified_mamba(model: BaseModel, *, phases: tuple[str, ...] = ("context_ops", "generation_ops")) -> bool:
     """Recognize both native operations and SDK subclasses in either phase."""
     from aisim_core._native import Mamba2Kernel
 
     return any(
         isinstance(op, Mamba2Kernel) and op.__getnewargs_ex__()[1].get("state_dtype", "unrecorded") != "unrecorded"
-        for phase in ("context_ops", "generation_ops")
+        for phase in phases
         for op in getattr(model, phase, ())
     )
 
@@ -2017,7 +2017,11 @@ class BaseBackend:
 
     def _schedule_qualified_mamba_prefill(self, model, runtime_config, step: MixedStepInput) -> MixedStepInput:
         """Drop unused aggregate capacity before querying a scheduled Mamba step."""
-        if not _is_fpm_model(model) and runtime_config.prefix > 0 and _has_qualified_mamba(model):
+        if (
+            not _is_fpm_model(model)
+            and runtime_config.prefix > 0
+            and _has_qualified_mamba(model, phases=("context_ops",))
+        ):
             isl = runtime_config.isl + self._visual_context_tokens(model, runtime_config)
             if isl > runtime_config.prefix:
                 full, partial = divmod(step.context_tokens, isl)

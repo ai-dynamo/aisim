@@ -686,7 +686,7 @@ def test_batched_ttft_prices_native_uncached_chunks(
     assert ttft == pytest.approx(expected, rel=1e-9)
     prompt_budget = budget - 2 * width
     full, partial = divmod(prompt_budget, 4096)
-    scheduled = full * 4096 + min(partial, 4096 - prefix)
+    scheduled = prompt_budget if generation_only else full * 4096 + min(partial, 4096 - prefix)
     assert calls[0] == (4096, prefix, scheduled, 2)
     assert estimates[0].num_decode_query_tokens == 2 * width
     # Uncached prefill plus packed decode stays within the scheduler capacity.

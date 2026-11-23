@@ -5431,7 +5431,10 @@ pub(crate) mod tests {
             vec![],
         );
         spec.engine.database_mode = DatabaseMode::Sol;
-        let engine = Engine::build(spec, build_engine(None).db).unwrap();
+        let mut db = Arc::try_unwrap(build_engine(None).db)
+            .unwrap_or_else(|_| panic!("test database is shared"));
+        db.database_mode = DatabaseMode::Sol;
+        let engine = Engine::build(spec, Arc::new(db)).unwrap();
         // A 100-token prompt with 60 cached tokens can extend at most 40
         // tokens. Test both a lone partial request and one after a full prompt.
         for ctx in [41, 99, 141, 150, 199] {
