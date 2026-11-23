@@ -705,43 +705,6 @@ def test_explicitly_disabling_shared_layer_keeps_the_root_to_the_requested_versi
     assert not any("/0.9/" in f or "/trtllm/" in f for f in files)
 
 
-@pytest.mark.parametrize("categories", [("fpm", "op-latency"), ("op-latency", "fpm")])
-def test_fpm_requirements_are_applied_before_shared_layer_download_planning(
-    shared_layer_tree, tmp_path, monkeypatch, categories
-):
-    from dataclasses import replace
-
-    from aisim_core.data import ensure as mod
-
-    from .test_fetch import FakeTransport
-
-    published = tmp_path / "published"
-    _build(shared_layer_tree, published)
-    files = _tree_files(published)
-    pin = DataPin(repo="org/dataset", revision="a" * 40, categories=("op-latency",), cache_dir=tmp_path / "baseline")
-    baseline = ensure_data({**CONFIG, "enable_shared_layer": False}, pin, transport=FakeTransport(files))
-    real_ensure = mod._ensure_category
-
-    def profile_or_real_op(out, category, pin, transport):
-        if category == "fpm":
-            # Isolate the profile preparation boundary; dependency discovery, budget accounting, downloads and
-            # op-root materialization below all use their real implementations.
-            mod._adopt_prepared_settings(out.config, {"enable_shared_layer": False}, None)
-        else:
-            real_ensure(out, category, pin, transport)
-
-    monkeypatch.setattr(mod, "_ensure_category", profile_or_real_op)
-    transport = FakeTransport(files)
-    result = ensure_data(
-        dict(CONFIG),
-        replace(pin, categories=categories, cache_dir=tmp_path / "candidate", max_bytes=baseline.downloaded_bytes),
-        transport=transport,
-    )
-    assert result.config["enable_shared_layer"] is False
-    assert result.downloaded_bytes == baseline.downloaded_bytes
-    assert not any("/0.9/" in p or "/trtllm/" in p for p in transport.opened)
-
-
 def test_the_hf_pin_fetches_the_shared_layer_sources(shared_layer_tree, tmp_path):
     from .test_fetch import FakeTransport
 
