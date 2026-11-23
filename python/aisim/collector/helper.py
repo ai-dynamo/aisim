@@ -420,6 +420,22 @@ class PeriodicGarbageCollector:
 
 
 @contextmanager
+def native_publication_lock(output: Path):
+    """Own one native output from snapshot through checkpoint and publication."""
+    import fcntl
+
+    # Keep the inode stable across attempts. Closing the descriptor after an
+    # exception or process death releases ownership without stale-lock guessing.
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.with_name(f".{output.name}.publication-lock").open("a+b") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(f"Native output already has a publication owner: {output}") from exc
+        yield
+
+
+@contextmanager
 def benchmark_with_power(
     device,
     kernel_func,

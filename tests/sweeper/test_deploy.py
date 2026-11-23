@@ -331,7 +331,7 @@ def test_disagg_auto_transfer_geometry_uses_prefill_source_shape(monkeypatch):
     assert deployment.decode_engine_args["kv_transfer_bytes_per_token"] == 20_001
 
 
-@pytest.mark.parametrize("feature", ["transfer", "host_offload"])
+@pytest.mark.parametrize("feature", ["transfer", "afd_decode_transfer", "host_offload"])
 def test_auto_geometry_uses_resolved_source_identity(feature, monkeypatch):
     from aisim.sweeper.replay import ForwardPassEstimatorSpec
 
@@ -342,7 +342,7 @@ def test_auto_geometry_uses_resolved_source_identity(feature, monkeypatch):
     }
     settings = (
         {"kv_transfer_bytes_per_token": "auto", "kv_transfer_bandwidth": 400.0}
-        if feature == "transfer"
+        if feature != "host_offload"
         else {
             "prefill_native_host_offload": host_offload,
             "decode_native_host_offload": host_offload,
@@ -364,6 +364,18 @@ def test_auto_geometry_uses_resolved_source_identity(feature, monkeypatch):
         ),
         parallel_config=DisaggParallelConfig(prefill=prefill, decode=decode),
     )
+    if feature == "afd_decode_transfer":
+        sample["afd_roles"] = {
+            "decode": {
+                "n_a_nodes": 1,
+                "n_f_nodes": 1,
+                "gpus_per_node": 1,
+                "a_tp_size": 1,
+                "batch_size_per_a_replica": 3,
+                "is_moe": True,
+                "num_experts": 8,
+            }
+        }
     sample.update(prefill_cp=2, prefill_dcp=2, decode_dcp=4)
     # The canonical estimator may resolve defaults absent from the sample.
     # Each role owns its cache layout; transfer always prices the source role.
@@ -412,12 +424,12 @@ def test_auto_geometry_uses_resolved_source_identity(feature, monkeypatch):
         forward_pass_estimators={role: ForwardPassEstimatorSpec(config=config) for role, config in configs.items()},
     )
 
-    field = "kv_transfer_bytes_per_token" if feature == "transfer" else "kv_cache_bytes_per_token"
+    field = "kv_transfer_bytes_per_token" if feature != "host_offload" else "kv_cache_bytes_per_token"
     assert deployment.prefill_engine_args[field] == 100
-    assert deployment.decode_engine_args[field] == (100 if feature == "transfer" else 200)
+    assert deployment.decode_engine_args[field] == (100 if feature != "host_offload" else 200)
     assert [identity["worker_type"] for _, identity in calls] == [
         "prefill",
-        "prefill" if feature == "transfer" else "decode",
+        "prefill" if feature != "host_offload" else "decode",
     ]
     for model, identity in calls:
         expected = configs[identity["worker_type"]]

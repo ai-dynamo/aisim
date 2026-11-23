@@ -502,6 +502,7 @@ def _build_afd_roles_deployment(sample, backend_version, estimators, encoder):
                         "prefill",
                         backend_version=backend_version,
                         forward_pass_estimator=estimators.get("prefill"),
+                        prefill_estimator=estimators.get("prefill"),
                     )["kv_transfer_bytes_per_token"]
                 raw["kv_transfer_bytes_per_token"] = transfer
                 raw["kv_transfer_timing_mode"] = sample.get("kv_transfer_timing_mode", "destination_missing")
@@ -522,7 +523,11 @@ def _build_afd_roles_deployment(sample, backend_version, estimators, encoder):
                 else _performance_model_metadata(sample, legacy, backend_version=backend_version)
             )
             raw = _engine_args_payload(
-                sample, legacy, backend_version=backend_version, forward_pass_estimator=estimator
+                sample,
+                legacy,
+                backend_version=backend_version,
+                forward_pass_estimator=estimator,
+                prefill_estimator=estimators.get("prefill"),
             )
             count = int(sample[f"{prefix}replicas"])
         kwargs["agg_engine_args" if role == "aggregated" else f"{role}_engine_args"] = raw
