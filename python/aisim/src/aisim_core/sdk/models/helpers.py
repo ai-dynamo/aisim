@@ -891,6 +891,8 @@ def _infer_mixed_precision_quant_modes(raw_config: dict, quant_dynamic: bool | N
         overrides["moe_quant_mode"] = common.MoEQuantMode.w4a16_nvfp4
     elif "nvfp4" in moe_algos:
         overrides["moe_quant_mode"] = common.MoEQuantMode.nvfp4
+    elif "w4a16_mxfp4" in moe_algos:
+        overrides["moe_quant_mode"] = common.MoEQuantMode.w4a16_mxfp4
     elif "mxfp8" in moe_algos or "fp8_block" in moe_algos:
         overrides["moe_quant_mode"] = common.MoEQuantMode.fp8_block
     elif "fp8" in moe_algos:

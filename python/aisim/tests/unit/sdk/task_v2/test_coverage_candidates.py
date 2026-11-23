@@ -524,6 +524,50 @@ def test_compute_coverage_is_quant_specific(synth_systems):
     assert t.agg_moe_ep_candidates == [1, 2, 4, 8, 16]  # fused defaults
 
 
+@pytest.mark.parametrize("model_path", [SYNTH_MODEL, "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"])
+@pytest.mark.parametrize("format_location", ["group", "checkpoint"])
+def test_mixed_mxfp4_task_probes_the_built_expert_lane(
+    synth_vllm_systems, monkeypatch, tmp_path, model_path, format_location
+):
+    import aisim.sdk.task_v2 as task_v2
+
+    bundled = Path(aisim_core.__file__).parent / "model_configs" / f"{model_path.replace('/', '--')}_config.json"
+    raw = json.loads(bundled.read_text())
+    group = {
+        "weights": {"num_bits": 4, "type": "float", "group_size": 32},
+        "input_activations": None,
+        "targets": ["*.experts.*"],
+    }
+    quant = {"quant_algo": "MIXED_PRECISION", "config_groups": {"experts": group}}
+    (group if format_location == "group" else quant)["format"] = "mxfp4-pack-quantized"
+    raw["quantization_config"] = quant
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+
+    probed = {}
+    compute_coverage = task_v2.moe_compute_coverage
+
+    def record_probe(database, *, quant_mode, phase, **kwargs):
+        probed[phase] = quant_mode
+        return compute_coverage(database, quant_mode=quant_mode, phase=phase, **kwargs)
+
+    monkeypatch.setattr(task_v2, "moe_compute_coverage", record_probe)
+    task = _synth_task(model_path=str(tmp_path), backend_name="vllm")
+    model = get_model(str(tmp_path), task.build_model_config(role="agg", parallel=(1, 1, 1, 1, 1, 1)), "vllm")
+    expected = common.MoEQuantMode.w4a16_mxfp4
+    assert task.moe_quant_mode == model.config.moe_quant_mode == expected
+    for pipeline in (model.context_ops, model.generation_ops):
+        assert {op._quant_mode for op in pipeline if op._name in ("context_moe", "generation_moe")} == {expected}
+    if model_path == SYNTH_MODEL:
+        assert probed == {"context": expected, "generation": expected}
+        # The synthetic tables contain only BF16 compute. They must not admit
+        # large EP for these packed 4-bit experts through the BF16 default.
+        assert not task._large_ep_coverage("agg")
+        assert 32 not in task.agg_moe_ep_candidates
+    else:
+        # Nemotron-H builds per-layer experts but is not large-EP-ready.
+        assert not probed
+
+
 def test_coverage_probes_the_weight_only_nvfp4_lane_off_blackwell(synth_systems, monkeypatch):
     """Off Blackwell the Task runs native NVFP4 experts weight-only, so coverage probes that lane."""
     import aisim.sdk.task_v2 as task_v2
