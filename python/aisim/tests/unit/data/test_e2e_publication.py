@@ -4,19 +4,24 @@
 """Publication, evidence revision and evaluator regressions for E2E datasets."""
 
 import dataclasses
+import gzip
+import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from aisim_core.data import e2e as module
 from aisim_core.data.e2e import (
     ProvenanceFile,
+    SnapshotAcquisition,
     SnapshotMember,
     aiperf_to_configuration,
     evaluation_points,
     load_e2e,
     make_metric,
+    read_provenance,
     read_raw_record,
     read_snapshot,
     store_provenance,
@@ -244,3 +249,49 @@ def test_aiperf_request_corrections_change_snapshot_revision_and_preserve_raw_au
             ).snapshot_id
         )
     assert ids[0] != ids[1]
+
+
+def _replace_after_hashing(monkeypatch, path, replacement):
+    """Replace ``path`` right after the integrity check hashed its current bytes, as a concurrent refresh could."""
+    import aisim_core.data as data_module
+
+    original = path.read_bytes()
+
+    def sha256(content=b"", **kwargs):  # a check that hashes bytes it already holds
+        digest = hashlib.sha256(content, **kwargs)
+        if content == original:
+            path.write_bytes(replacement)
+        return digest
+
+    def file_digest(stream, *args, **kwargs):  # a check that hashes the open file
+        digest = hashlib.file_digest(stream, *args, **kwargs)
+        if Path(getattr(stream, "name", "")) == path:
+            path.write_bytes(replacement)
+        return digest
+
+    spy = SimpleNamespace(**{**vars(hashlib), "sha256": sha256, "file_digest": file_digest})
+    monkeypatch.setattr(data_module, "hashlib", spy)
+
+
+@pytest.mark.parametrize("table", ["members", "acquisition"])
+def test_snapshot_parses_the_tables_that_passed_verification(tmp_path, monkeypatch, table):
+    members, kwargs = _snapshot_args("o1")
+    acquisition = [SnapshotAcquisition(observation_id="o1", source_uri="https://benchmark.example/data")]
+    snapshot = write_snapshot(tmp_path / "live", "snapshot.json", members, **kwargs, acquisition=acquisition)
+    # Another valid table with the same schema: a refresh that lands between the digest check and the parse.
+    other_members, _ = _snapshot_args("o2")
+    other_acquisition = [SnapshotAcquisition(observation_id="o2", source_uri="https://other.example/data")]
+    other = write_snapshot(tmp_path / "other", "snapshot.json", other_members, **kwargs, acquisition=other_acquisition)
+    live_table = getattr(snapshot, table).path
+    replacement = (tmp_path / "other" / getattr(other, table).path).read_bytes()
+    _replace_after_hashing(monkeypatch, tmp_path / "live" / live_table, replacement)
+    loaded, rows = read_snapshot(tmp_path / "live", "snapshot.json")
+    assert (loaded, rows) == (snapshot, members)  # the verified bytes were parsed, not the replacement
+
+
+def test_provenance_returns_the_bytes_that_passed_verification(tmp_path, monkeypatch):
+    dataset = load_e2e(tmp_path, write_configuration(tmp_path, _dev_config()))
+    artifact = next(a for a in dataset.manifest.artifacts if a.format == "gzip")
+    expected = read_provenance(tmp_path, artifact)
+    _replace_after_hashing(monkeypatch, tmp_path / artifact.path, gzip.compress(b"tampered after the check"))
+    assert read_provenance(tmp_path, artifact) == expected

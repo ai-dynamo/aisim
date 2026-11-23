@@ -1447,12 +1447,15 @@ def read_snapshot(
     for table in (snapshot.members, snapshot.acquisition):
         if payload is not None and table is not None and table.path not in payload:
             raise ValueError(f"snapshot table {table.path} must be a listed dataset payload file")
+    # Parse the bytes that passed the integrity check: a table replaced after it must not be read unverified.
     members = table_to_rows(
-        SNAPSHOT_MEMBERS_SCHEMA, read_parquet(_verify(root, snapshot.members), SNAPSHOT_MEMBERS_SCHEMA)
+        SNAPSHOT_MEMBERS_SCHEMA,
+        read_parquet(pa.BufferReader(_verified_bytes(root, snapshot.members)), SNAPSHOT_MEMBERS_SCHEMA),
     )
     if snapshot.acquisition is not None:
         table_to_rows(
-            SNAPSHOT_ACQUISITION_SCHEMA, read_parquet(_verify(root, snapshot.acquisition), SNAPSHOT_ACQUISITION_SCHEMA)
+            SNAPSHOT_ACQUISITION_SCHEMA,
+            read_parquet(pa.BufferReader(_verified_bytes(root, snapshot.acquisition)), SNAPSHOT_ACQUISITION_SCHEMA),
         )
     if snapshot.counts.get("observations") != len(members):
         raise ValueError("snapshot observation count mismatch")
