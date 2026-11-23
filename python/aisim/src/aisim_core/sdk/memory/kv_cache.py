@@ -370,6 +370,8 @@ class KVCacheEstimator:
             dcp_size=dcp_size,
             **encoder_layout,
         )
+        # Hardware identity for system-dependent model construction (per-layer NVFP4 lanes).
+        model_config.system = system
         # Apply nextn/MTP onto the config BEFORE get_model so the built model is
         # spec-decode aware (e.g. for any draft-module weights). This does NOT scale
         # the capacity activation by (nextn+1); that multiplier is suppressed below
@@ -386,6 +388,9 @@ class KVCacheEstimator:
             systems_paths=systems_path,
             allow_missing_data=True,
         )
+        # get_database may skip an invalid or unavailable overlay. Model construction
+        # must use the hardware from the root that actually supplied the database.
+        model_config.systems_path = getattr(database, "systems_root", systems_path)
         resolve_sglang_mla_compute(model_config, model_path, backend, database.version, database.system_spec)
         resolve_trtllm_mla_compute(model_config, model_path, backend, database.system_spec)
         model = get_model(model_path, model_config, backend)

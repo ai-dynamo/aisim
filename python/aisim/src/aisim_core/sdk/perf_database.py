@@ -95,10 +95,12 @@ def _normalize_systems_paths(raw_paths: str | Iterable[str] | None) -> list[str]
     default_path = os.fspath(pkg_resources.files("aisim_core") / "systems")
     if raw_paths is None:
         return [default_path]
+    if isinstance(raw_paths, os.PathLike):
+        raw_paths = [raw_paths]  # one root; a str would be split on commas
     if isinstance(raw_paths, str):
         entries = [part.strip() for part in raw_paths.split(",") if part.strip()]
     else:
-        entries = [os.fspath(entry) for entry in raw_paths if entry is not None]
+        entries = [os.fsdecode(entry) for entry in raw_paths if entry is not None]
     if not entries:
         return [default_path]
     resolved: list[str] = []
@@ -387,11 +389,13 @@ def load_system_spec(
     return _load_system_spec_from_paths(tuple(resolved_paths), system_name)
 
 
-def is_blackwell_system(system_name: str | None) -> bool:
+def is_blackwell_system(
+    system_name: str | None, systems_paths: str | os.PathLike | Iterable[str] | None = None
+) -> bool:
     """True for Blackwell-class systems (SM >= 100, e.g. b200_sxm / gb200 / b300 / gb300)."""
     if not system_name:
         return False
-    spec = load_system_spec(system_name)
+    spec = load_system_spec(system_name, systems_paths=systems_paths)
     return int(spec.get("gpu", {}).get("sm_version", -1)) >= 100
 
 

@@ -22,6 +22,32 @@ from aisim.sdk.task_v2 import Task
 pytestmark = pytest.mark.unit
 
 
+@pytest.mark.parametrize(
+    "model_path,system,backend",
+    [
+        ("openai/gpt-oss-120b", "b200_sxm", "trtllm"),
+        ("openai/gpt-oss-120b", "h200_sxm", "trtllm"),
+        ("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4", "b200_sxm", "vllm"),
+        ("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4", "h200_sxm", "vllm"),
+        ("RedHatAI/DeepSeek-V4-Flash-NVFP4-FP8", "b200_sxm", "sglang"),
+        ("RedHatAI/DeepSeek-V4-Flash-NVFP4-FP8", "h200_sxm", "sglang"),
+        ("moonshotai/Kimi-K3", "b200_sxm", "sglang"),
+    ],
+)
+def test_cleared_moe_mode_uses_the_constructor_execution_default(model_path, system, backend):
+    identity = dict(model_path=model_path, system_name=system, backend_name=backend)
+    fresh = Task(**identity)
+    task = Task(**identity, moe_quant_mode=common.MoEQuantMode.bfloat16)
+
+    task.moe_quant_mode = None
+
+    assert task.moe_quant_mode == fresh.moe_quant_mode
+    assert not task._moe_quant_mode_explicit_by_role["agg"]
+    assert task.build_model_config(role="agg").moe_quant_mode == fresh.build_model_config(role="agg").moe_quant_mode
+    restored = Task.from_yaml(yaml.safe_load(task.to_yaml()))
+    assert restored.moe_quant_mode == fresh.moe_quant_mode
+
+
 @pytest.mark.parametrize("explicit", [None, common.FMHAQuantMode.fp8])
 @pytest.mark.parametrize("wide_ep", [False, True])
 def test_hopper_mla_task_resolves_execution_before_model_construction(monkeypatch, explicit, wide_ep):
@@ -787,6 +813,47 @@ def test_fmha_data_fallback_skips_generation_only_decode(caplog):
     assert len(fallback_msgs) == 1 and fallback_msgs[0].startswith("prefill ")
 
 
+@pytest.mark.parametrize("serving_mode", ["agg", "disagg"])
+def test_clearing_fmha_override_restores_task_data_fallback(serving_mode):
+    from aisim.legacy_cli.api import _build_recommend_tasks
+
+    model_path = "Qwen/Qwen3-32B-FP8-Static-PerTensor"
+    values = dict(
+        model_path=model_path,
+        system_name="a100_sxm",
+        backend_name="sglang",
+        gemm_quant_mode=common.GEMMQuantMode.bfloat16,
+        kvcache_quant_mode=common.KVCacheQuantMode.bfloat16,
+        fmha_quant_mode=common.FMHAQuantMode.bfloat16,
+    )
+    if serving_mode == "agg":
+        task = Task(**values)
+        role, field = "agg", "fmha_quant_mode"
+    else:
+        task = Task(
+            serving_mode="disagg",
+            **{f"{r}_{key}": value for r in ("prefill", "decode") for key, value in values.items()},
+        )
+        role, field = "prefill", "prefill_fmha_quant_mode"
+    # Clear an explicit field, then clear the inferred fallback again. Both
+    # builds and serialization must keep the same BF16 context-attention op.
+    for _ in range(2):
+        setattr(task, field, None)
+        assert getattr(task, field) == common.FMHAQuantMode.bfloat16
+        assert task._fmha_explicit[role] is False
+        assert task._fmha_from_data[role] is True
+        for other in (
+            task,
+            Task.from_yaml(yaml.safe_load(task.to_yaml())),
+            _build_recommend_tasks({serving_mode: task}, 8)[serving_mode],
+        ):
+            other.validate()
+            model = get_model(model_path, other.build_model_config(role=role, parallel=(1, 1, 1, 1, 1, 1)), "sglang")
+            attention = [op for op in model.context_ops if op._name == "context_attention"]
+            assert len(attention) == 1
+            assert attention[0]._fmha_quant_mode == common.FMHAQuantMode.bfloat16
+
+
 def test_fmha_data_fallback_without_bf16_slice_left_untouched(monkeypatch, caplog):
     """When the context table has fmha data but neither fp8 nor bf16 slices
     (e.g. wideep tables carry only fp8_block), the fallback must leave the
@@ -887,13 +954,8 @@ def test_large_ep_trtllm_context_fmha_capability_uses_granular_table(caplog):
     assert not any("context_mla_granular" in r.message for r in caplog.records)
 
 
-def test_trtllm_large_ep_context_fmha_falls_back_when_only_the_module_table_has_fp8(monkeypatch, caplog):
-    """The negative case of the test above, through the real table selection: the granular
-    context_mla table carries only a bfloat16 fmha slice under the fp8 KV cache while the module
-    table keeps its fp8 slice. The inferred fp8 falls back to bfloat16, and the warning names the
-    granular key, because the merged list's module-only fp8 rows cannot serve the large-EP path."""
-    import logging
-
+@pytest.fixture
+def trtllm_granular_without_fp8(monkeypatch):
     from aisim.sdk import common
     from aisim.sdk.perf_database import get_database
 
@@ -915,6 +977,15 @@ def test_trtllm_large_ep_context_fmha_falls_back_when_only_the_module_table_has_
 
     database = GranularWithoutFp8(get_database("gb200", "trtllm", "1.3.0rc29"))
     monkeypatch.setattr(Task, "_try_load_role_database", lambda self, role: database)
+    return database
+
+
+def test_trtllm_large_ep_context_fmha_falls_back_when_only_the_module_table_has_fp8(
+    trtllm_granular_without_fp8, caplog
+):
+    """The granular table's BF16-only slice must decide large-EP FMHA support."""
+    import logging
+
     with caplog.at_level(logging.WARNING):
         t = Task(
             serving_mode="agg",
@@ -939,6 +1010,65 @@ def test_trtllm_large_ep_context_fmha_falls_back_when_only_the_module_table_has_
     assert mc._fmha_quant_mode_from_data is True
     resolve_trtllm_mla_compute(mc, t.model_path, "trtllm", load_system_spec("gb200"))
     assert mc.fmha_quant_mode == common.FMHAQuantMode.bfloat16
+
+
+@pytest.mark.parametrize("role", ["agg", "prefill", "decode"])
+@pytest.mark.parametrize("explicit", [None, common.FMHAQuantMode.fp8])
+@pytest.mark.parametrize("pinned", [False, True])
+def test_live_moe_mode_refreshes_inferred_fmha(trtllm_granular_without_fp8, role, explicit, pinned):
+    identity = dict(
+        model_path="deepseek-ai/DeepSeek-V3",
+        system_name="gb200",
+        backend_name="trtllm",
+        backend_version="1.3.0rc29",
+    )
+    kwargs = {"serving_mode": "agg" if role == "agg" else "disagg"}
+    for active in ["agg"] if role == "agg" else ["prefill", "decode"]:
+        prefix = "" if active == "agg" else f"{active}_"
+        kwargs.update({f"{prefix}{name}": value for name, value in identity.items()})
+        kwargs[f"{prefix}gemm_quant_mode"] = common.GEMMQuantMode.nvfp4
+        kwargs[f"{prefix}moe_quant_mode"] = common.MoEQuantMode.bfloat16
+    prefix = "" if role == "agg" else f"{role}_"
+    kwargs[f"{prefix}fmha_quant_mode"] = explicit
+    task = Task(**kwargs)
+    if pinned:
+        for dim in ("num_gpu", "tp", "pp", "dp", "moe_tp", "moe_ep", "cp"):
+            name = f"{role}_{dim}_candidates"
+            kwargs[name] = getattr(task, name)
+        task = Task(**kwargs)
+    task.validate()
+    assert len(task._reachable_attention_op_keys(role)) == 1
+    initial_fmha = task._role_attr(role, "fmha_quant_mode")
+    partner = "decode" if role == "prefill" else "prefill"
+    partner_before = task.build_model_config(role=partner) if role != "agg" else None
+
+    setattr(task, f"{prefix}moe_quant_mode", common.MoEQuantMode.nvfp4)
+
+    fresh = Task(**(kwargs | {f"{prefix}moe_quant_mode": common.MoEQuantMode.nvfp4}))
+    assert len(task._reachable_attention_op_keys(role)) == 2
+    expected = (
+        common.FMHAQuantMode.fp8
+        if role == "decode" or explicit is common.FMHAQuantMode.fp8
+        else common.FMHAQuantMode.bfloat16
+    )
+    assert task._role_attr(role, "fmha_quant_mode") == fresh._role_attr(role, "fmha_quant_mode") == expected
+    assert task._fmha_explicit == fresh._fmha_explicit
+    assert task._fmha_from_data == fresh._fmha_from_data
+    task.validate()
+    parallel = next(p for p in task.iter_parallel(role) if task._resolve_moe_comm_backend(role, p))
+    built = task.build_model_config(role=role, parallel=parallel)
+    assert built.fmha_quant_mode == fresh.build_model_config(role=role, parallel=parallel).fmha_quant_mode
+    assert (
+        built._fmha_quant_mode_from_data
+        == fresh.build_model_config(role=role, parallel=parallel)._fmha_quant_mode_from_data
+    )
+    if role != "agg":
+        assert task.build_model_config(role=partner) == partner_before
+
+    # Removing large EP restores checkpoint inference and clears the old data-fallback marker.
+    setattr(task, f"{prefix}moe_quant_mode", common.MoEQuantMode.bfloat16)
+    assert task._role_attr(role, "fmha_quant_mode") == initial_fmha
+    assert role not in task._fmha_from_data
 
 
 def test_nextn_never_auto_enabled(caplog):
@@ -2386,16 +2516,22 @@ def test_validate_gemm_quant_transfer_reachable_in_hybrid():
         with pytest.raises(ValueError, match="Unsupported gemm quant mode 'int4_wo'"):
             make("HYBRID", disabled).validate()
 
-    # nvfp4 (fp4 MMA) can never run on Hopper: strict per-dtype resolution
-    # (#1398) rejects it at validate() in EVERY mode and policy — BEFORE the
-    # transfer ladder is consulted — mirroring the query-entry behavior, so
-    # impossible sweep configurations fail early instead of on the first
-    # HYBRID query.
+    # A live NVFP4 override takes the same Hopper weight-only lane as a
+    # constructor override. Its data/transfer admission remains strict.
+    # Native FP4 compute still has no usable FLOPS entry on Hopper.
     from aisim.sdk.errors import MissingSystemFlopsError
 
     for mode, policy in (("SILICON", None), ("HYBRID", None), ("HYBRID", "xprofile")):
+        task = make(mode, policy, quant=common.GEMMQuantMode.nvfp4)
+        assert task.gemm_quant_mode == common.GEMMQuantMode.nvfp4_wo
+        assert task._gemm_quant_mode_explicit_by_role["agg"] is True
+        if mode == "SILICON":
+            with pytest.raises(ValueError, match="Unsupported gemm quant mode 'nvfp4_wo'"):
+                task.validate()
+        else:
+            task.validate()
         with pytest.raises(MissingSystemFlopsError, match="fp4_tc_flops"):
-            make(mode, policy, quant=common.GEMMQuantMode.nvfp4).validate()
+            common.get_quant_tc_flops(task._try_load_role_database("agg").system_spec, common.GEMMQuantMode.nvfp4)
 
 
 def test_validate_nvfp4_wo_ladder_admitted_in_hybrid():
@@ -2662,7 +2798,7 @@ def test_nvfp4_remapped_to_nvfp4_wo_on_hopper():
     """nvfp4 models on non-Blackwell get remapped to nvfp4_wo unconditionally."""
     t = Task(
         serving_mode="agg",
-        model_path="nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
+        model_path="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
         system_name="h100_sxm",
         backend_name="trtllm",
     )
@@ -2674,7 +2810,7 @@ def test_nvfp4_preserved_on_blackwell():
     """Blackwell keeps native nvfp4 quant modes."""
     t = Task(
         serving_mode="agg",
-        model_path="nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
+        model_path="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
         system_name="b200_sxm",
         backend_name="trtllm",
     )

@@ -44,6 +44,44 @@ which contributes to the decoder context but not the encoder embeddings.
 For example, a 70×70 image with patch size 14 and merge size 2 gives 36 encoder
 patches, 9 embeddings, and 12 context tokens.
 
+## Per-layer checkpoint precision
+
+For Nemotron-H, the SDK reads the precision of each GEMM projection (Mamba,
+attention, dense MLP, shared experts, latent projections) and of the routed
+experts from the checkpoint's per-layer metadata (`quantized_layers`,
+`config_groups`, exclusions). Each precision is priced for its own count of
+layers, and the MoE dispatch ops follow the routed-expert split. Other model
+families keep one precision per op kind.
+
+- A projection that a targets-only ModelOpt MIXED_PRECISION export leaves
+  out is BF16, the rule vLLM and SGLang apply. Other metadata, including a
+  MIXED_PRECISION export that declares a base lane such as block FP8, leaves it
+  on the global mode.
+- An excluded module, or a module inside an excluded parent, is BF16.
+- On non-Blackwell systems, NVFP4 runs weight-only (`nvfp4_wo`).
+- An explicit `gemm_quant_mode` or `moe_quant_mode` prices every projection
+  or routed expert with that one mode.
+- Loading fails when a module has conflicting or unsupported algorithms, or
+  when the modules of one fused op, such as Q, K and V, resolve to different
+  modes. An explicitly declared packed `qkv_proj` takes precedence over the
+  split Q/K/V checkpoint names, matching vLLM's packed-module lookup.
+
+Known limits:
+
+- The routed-expert precision of a layer comes from expert 0. If the expert
+  block has its own entry, or expert 0 is unlisted, it comes from the expert
+  block, as vLLM resolves it: the block's own entry first, else any listed
+  expert of that block. For example, a block-level
+  FP8 entry prices that layer FP8 even when the global mode is NVFP4. An
+  exclusion that matches the block itself makes the layer BF16.
+- An FP8 projection is dynamic FP8 only when the checkpoint's `quant_dynamic`
+  setting is true, as for the global mode.
+- A checkpoint that lists `W4A16_NVFP4` layers, such as Nemotron 3.5
+  Lightning, keeps the global MoE mode for routed experts; GEMM projections
+  still use their listed precisions. No packaged table has `w4a16_nvfp4` MoE
+  rows yet. Only the vLLM 0.30.0 b200 and gb200 tables and the vLLM 0.31.0
+  b200 table have `w4a16_nvfp4` GEMM rows.
+
 ## Other scoped boundaries
 
 - [Support](support-matrix.md) distinguishes engine queries from Replay and accuracy.
