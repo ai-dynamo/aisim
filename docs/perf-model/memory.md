@@ -74,6 +74,19 @@ encoded by `mem_fraction_static`. Native estimates return it as
 `memory_breakdown.cuda_graph_reserved_bytes`; naive fallback estimates apply it
 but keep `memory_breakdown=None` because the other components are unavailable.
 
+A naive estimate reads only the model's `config.json`. When the first entry
+of `architectures` is an architecture that AISim supports, the config must
+pass AISim's config parser. If the parser refuses it, the estimate fails
+with `HF config of the supported architecture <name> is invalid: <error
+type>: <parser message>`. A config of any other architecture is read from
+its raw keys. If such a config holds `text_config`, or an `llm_config` that
+is a nonempty object, the estimate reads the text decoder under that key,
+which `context_length: max` reads too. The estimate refuses a `text_config`
+that is not a nonempty object, and a decoder that holds a decoder key
+itself. It also refuses an `architectures` value that is not a list of
+strings. `bytes_per_token: auto` for a deployment without an FPM profile is
+a naive estimate and has the same refusals.
+
 The Rust `KvCacheEstimateRequest` exposes the same field. Engine replay accepts
 the value in its engine arguments and carries it through native AIC capacity
 rematerialization, so the Python estimator and native scheduler use the same
