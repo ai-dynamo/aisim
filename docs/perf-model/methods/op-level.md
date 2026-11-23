@@ -42,8 +42,10 @@ describe already scheduled work and retain their explicit prefill count.
 Batched text aggregates weight the actual uncached chunks, including the short
 final chunk and one recurrent-state transfer per chunk. For batch four,
 ISL 4096, prefix 3072 and a 512-token prefill budget, this means eight mixed
-steps; the cold control still needs 32. Chunk prices include the concurrent
-decoders and the prefix accumulated by each request's earlier chunks.
+steps; the cold control still needs 32 and retains its original amortized query.
+Cached or ragged text chunks include the concurrent decoders and the prefix
+accumulated by each request's earlier chunks. The other requests' decode KV
+lengths stay fixed throughout that prefill progress.
 Aggregate result caching also distinguishes Nemotron-H state-cache precision,
 even when non-MTP graphs can reuse the same compiled timing handle.
 

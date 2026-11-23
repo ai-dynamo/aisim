@@ -1754,3 +1754,94 @@ work per call. Aggregate translation scans the context phase list for qualified
 Mamba on a cache miss, retains no new state, and adds no pricing query. Exact
 XPU prefill may require an additional chunk when the correct decode reservation
 crosses a boundary; that is necessary modeled work, not redundant host work.
+
+## Scoped aggregate repair after `1173b040`
+
+Source correction: `56591a7deb2a9b3ff45813614ccc6146383f061b`, compared with
+`1173b040d1539fb316b764ac718b004c14063fb5`. The three aggregate findings
+(`PRRT_kwDOT0t9uc66ibwo`, `PRRT_kwDOT0t9uc66ibwq`, and
+`PRRT_kwDOT0t9uc66ibwr`) are addressed independently of the unavailable Qwen
+run provenance (`PRRT_kwDOT0t9uc66ibwn`, qualified beside its original link).
+
+- Qualified aggregate prefill is capped by request slots left after decode,
+  including the boundary where the generic heuristic would assign every
+  request to decode. Direct mixed calls can still schedule two full prefills.
+- Aggregate summary reuse includes the Mamba state-cache dtype. A real
+  non-MTP Nano FP32-to-FP16 rebuild reuses its compiled timing handle, but its
+  warm FP16 memory equals a cold FP16 result and its OOM verdict is recomputed.
+- Cached batched text prefill counts uncached chunks and their state transfers.
+  Exact chunk pricing retains fixed decode KV lengths for the other requests,
+  including native per-op energy, sources and power coverage. Uniform cold
+  chunks keep their original amortized query and 32-step control.
+
+The native scan/norm micrograph regression has an independent traffic oracle:
+18,560 activation bytes per fresh scan token, 2,097,152 bytes per state
+read/write pair, and two bytes per shared norm token, divided by system memory
+bandwidth. For batch four and suffix 1024 with budget 512, eight mixed steps
+process 4096 fresh tokens and eight state transfers; the old 32-step weight
+processed 16,384 tokens and 32 transfers. Prefix 3000 instead requires twelve
+steps, including each request's 72-token tail. The regression also checks the
+existing vLLM queue/dispatch calibration and resulting public throughput.
+
+Reproducible full-graph SOL comparisons and paired host measurements are in
+[`scoped-aggregate-56591a7d.json`](mamba-mixed-step-accounting/scoped-aggregate-56591a7d.json).
+These are analytical predictions and local host timings, not serving accuracy.
+For built-in Nano MTP3, batch four, ISL 4096, OSL 64 and budget 512:
+
+| Prefix | Mixed steps, before → after | Weighted Mamba ms | Output tokens/s |
+| --- | --- | --- | --- |
+| 3072 | 32 → 8 | 22.658748 → 5.664687 | 394.104490 → 485.333194 |
+| 3000 | 32 → 12 | 22.658748 → 7.194027 | 394.073957 → 470.188180 |
+| 0, cold control | 32 → 32 | 22.658748 → 22.658748 | 393.446444 → 393.446444 |
+
+Both cold MTP and non-Mamba control predictions are unchanged. The driver's
+diagnostic Mamba sum normalizes numpy/Python scalar types before accumulation;
+its initial exact comparison exposed a one-ulp diagnostic difference, while
+TTFT, TPOT and throughput were already identical.
+
+The driver loads the three changed baseline `BaseBackend` methods from the
+pinned source into the same installed optimized wheel. Native code and all
+other dependencies are shared; this is a caller comparison, not two independently
+built wheel revisions. The artifact records source/driver/native SHA256 values,
+explicit case inputs and all six alternating round orders. Each round uses
+30 paired aggregate misses with warm native handles and 200 cache hits per
+miss. Timers exclude setup, native compilation and result formatting. Run:
+
+```bash
+git show 1173b040d1539fb316b764ac718b004c14063fb5:python/aisim/src/aisim_core/sdk/backends/base_backend.py > "$TMPDIR/baseline-base_backend.py"
+python benchmarks/evidence/mamba-mixed-step-accounting/scoped_aggregate_perf.py \
+  "$TMPDIR/baseline-base_backend.py" \
+  1173b040d1539fb316b764ac718b004c14063fb5 \
+  56591a7deb2a9b3ff45813614ccc6146383f061b "$TMPDIR/scoped-aggregate.json"
+```
+
+Median aggregate miss cost changes from 130.9 to 255.1 us for prefix 3072
+(candidate round medians 250.5–267.5 us), and 138.3 to 308.9 us for the
+three-chunk prefix-3000 case (296.8–322.6 us). Exact per-prefix native queries
+and one fixed-decode pass account for this necessary cold-summary work.
+The earlier implementation also repriced uniform cold chunks unnecessarily;
+retaining their original query reduced that candidate cost from about 521 us
+to 139.6 us (127.8–158.8 us), versus 127.6 us baseline (116.0–139.4 us).
+Non-Mamba misses are 95.9 to 98.3 us. Aggregate hits change by at most 0.06 us
+in these medians (about 3 us total), with no additional memoization cache or
+retained chunk history. Chunk processing retains O(operations) evidence and prices one
+request's chunk sequence, independent of batch size. Native Replay does not
+call this aggregate summary path; no simulator event-loop code changed.
+
+Final local checks use Python 3.12.12, locked Python dependencies and a Rust
+1.96.0 `maturin build --release --locked` wheel with the repository's optimized
+release profile, extension-module and jemalloc features. The imported Python
+sources match the committed correction. Results: 91 base-backend tests,
+271 related XPU/adapter/model/single-oracle tests, and 390 engine-step/compile
+parity tests pass. The existing forward-perf worker also executes its Qwen3-32B
+SILICON context and generation controls successfully. Repository Python lint,
+format and whitespace checks pass; no numerical goldens changed.
+
+The pinned baseline reproduced five regression failures and one passing cold
+control. An intermediate adapter test caught an extra default dictionary key;
+metadata capture is now opt-in, and the original assertion passes unchanged.
+Root-directory wheel/format setup invocations and one evidence-driver lint
+invocation were corrected before the successful final checks. Attempt logs and
+`verification-history.json` remain in the repair scratch directory. Fast/Full
+CI, fresh bot reviews, technical reapproval and human approval remain controller
+or maintainer responsibilities; these local results do not satisfy those gates.
