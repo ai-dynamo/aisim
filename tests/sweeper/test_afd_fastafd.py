@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from importlib.resources import files
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from aisimulate.compiler import prediction_to_replay_spec
@@ -311,6 +313,60 @@ def fastafd_attention_sol(monkeypatch):
         return load(system, backend, version, **kwargs)
 
     monkeypatch.setattr(perf_database, "get_database_view", sol_view)
+
+
+@pytest.mark.parametrize("root_source", ["environment", "sdk", "explicit"])
+@pytest.mark.parametrize("typed_config", [False, True])
+def test_canonical_fastafd_pins_attention_data_roots(
+    tmp_path, monkeypatch, fastafd_attention_sol, root_source, typed_config
+):
+    """Real native SOL queries and capacity checks follow the selected A root."""
+    from aisimulate.sdk import perf_database
+    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+
+    packaged = files("aisimulate_core") / "systems"
+    monkeypatch.setattr(perf_database, "_SYSTEMS_PATHS", [str(packaged)])
+    monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", str(packaged))
+    (baseline,) = _provider(tmp_path, AICAFDPerformanceModel()).measure(_request(_topology()))
+    payload = dict(baseline.provenance["config"])
+    payload.pop("systems_paths")
+
+    root = tmp_path / "calibrated"
+    root.mkdir()
+    spec = yaml.safe_load((packaged / f"{SYSTEM}.yaml").read_text())
+    spec["data_dir"] = str(packaged / spec["data_dir"])
+    spec["gpu"]["mem_bw"] /= 2
+    (root / f"{SYSTEM}.yaml").write_text(yaml.safe_dump(spec))
+    if root_source == "environment":
+        monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", str(root))
+    elif root_source == "sdk":
+        monkeypatch.setattr(perf_database, "_SYSTEMS_PATHS", [str(root)])
+    else:
+        payload["systems_paths"] = [str(root)]
+    config = ForwardPassPerfModelConfig(**payload) if typed_config else payload
+    model = RustForwardPassPerfModel.best_available(config)
+    saved = model.diagnostics()["provenance"]["config"]
+    assert saved["systems_paths"] == [str(root)]
+
+    # Construction pins the A role's roots, even after process defaults change.
+    monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", str(packaged))
+    monkeypatch.setattr(perf_database, "_SYSTEMS_PATHS", [str(packaged)])
+    restored = RustForwardPassPerfModel.best_available(ForwardPassPerfModelConfig(**json.loads(json.dumps(saved))))
+    attention = model.estimate_fastafd_attention(isl=1024, osl=128, max_seq_len=2048)
+    assert attention == restored.estimate_fastafd_attention(isl=1024, osl=128, max_seq_len=2048)
+    assert attention["provenance"]["config"]["systems_paths"] == [str(root)]
+    # Halving memory bandwidth increases A latency; the measured F cell is fixed.
+    components = attention["provenance"]["components"]
+    assert components["attention_compute_ms"] > baseline.provenance["attention"]["components"]["attention_compute_ms"]
+    assert model.estimate_fastafd_stage(128)["ffn_ms"] == baseline.ffn_ms
+
+    small_root = tmp_path / "insufficient-capacity"
+    small_root.mkdir()
+    spec["gpu"]["mem_capacity"] = 1
+    (small_root / f"{SYSTEM}.yaml").write_text(yaml.safe_dump(spec))
+    constrained = RustForwardPassPerfModel.best_available({**saved, "systems_paths": [str(small_root)]})
+    with pytest.raises(RuntimeError, match="OOM: FastAFD A pool"):
+        constrained.estimate_fastafd_attention(isl=1024, osl=128, max_seq_len=2048)
 
 
 def _kimi_request_and_profile(tmp_path, precision, *, moe_backend="megamoe", f_gpus=4):

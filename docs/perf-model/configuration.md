@@ -100,6 +100,7 @@ it with the configured attention provider. It does not select a second estimator
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `estimation_mode: fastafd_stage` | Explicit selection | Native measured stage; requires decode role, literal backend version and `fallback_policy: deny`. Auto's existing candidate priority is unchanged. |
+| `systems_paths` | Resolved SDK or environment roots in Python | Ordered systems roots for A-side timing and A/F memory qualification. Retained in the resolved configuration; the measured F stage still comes only from its profile. |
 | `afd` | `null` | Immutable split-pool and model geometry, required only for this mode. |
 | `afd.logical_batch_per_source_rank` | Required | Positive total per-A-rank batch before splitting into microbatches, fixed for this stage model. |
 | `afd.attention_gpus`, `afd.ffn_gpus` | Required | Positive A/F pool GPU counts. `tp` must be 1; independent whole-forward parallelism controls are unsupported. |
@@ -119,6 +120,10 @@ selected precision, including when the selector was omitted. A different batch
 requires another canonical configuration. Saved resolved configurations
 retain all controls and an absolute profile path. Reconstructing reloads that
 artifact; provenance records its SHA-256 so artifact changes remain observable.
+Python resolves A-side systems roots at construction using the same explicit,
+SDK, environment, and packaged-root precedence as the other canonical estimators.
+Attention queries and both pools' capacity checks use those saved roots even if
+the process defaults change before the query or configuration reload.
 Unrelated graph/data controls are rejected rather than ignored.
 
 ### Speculative decoding configuration

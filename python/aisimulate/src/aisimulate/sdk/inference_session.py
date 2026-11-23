@@ -38,7 +38,9 @@ def _measure_fastafd_attention(stage_config, *, isl, osl, prefix, max_seq_len):
 
     identity = stage_config["afd"]
     model_path, system, backend_name = (stage_config[key] for key in ("model", "system", "backend"))
-    database = get_database_view(system, backend_name, stage_config["backend_version"])
+    database = get_database_view(
+        system, backend_name, stage_config["backend_version"], systems_paths=stage_config["systems_paths"]
+    )
     if database is None:
         raise ValueError(f"No attention database for {system}/{backend_name}/{stage_config['backend_version']}")
     gpus_per_node = int(database.system_spec["node"]["num_gpus_per_node"])

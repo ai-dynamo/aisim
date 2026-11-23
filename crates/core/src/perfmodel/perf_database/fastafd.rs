@@ -134,7 +134,6 @@ pub(crate) fn validate_config(config: &ForwardPassPerfModelConfig) -> Result<(),
         || config.attention_backend.is_some()
         || config.database_mode != crate::DatabaseMode::Silicon
         || config.transfer_policy.is_some()
-        || !config.systems_paths.is_empty()
         || config.strict_provenance
         || config.kv_block_size.is_some()
     {
@@ -947,6 +946,27 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(error.contains("unresolved-stage.parquet"));
+    }
+
+    #[test]
+    fn canonical_stage_retains_attention_systems_paths() {
+        let (_file, mut config) = fixture();
+        let directory = tempfile::tempdir().unwrap();
+        config.systems_paths = vec![directory.path().to_path_buf()];
+        let model = ForwardPassPerfModel::best_available(config.clone()).unwrap();
+        assert_eq!(
+            model.diagnostics().provenance.unwrap().config.systems_paths,
+            config.systems_paths
+        );
+        assert_eq!(model.estimate_fastafd_stage(128).unwrap().ffn_ms, 2.0);
+
+        config.systems_paths.push(directory.path().join("missing"));
+        assert!(
+            ForwardPassPerfModel::best_available(config)
+                .unwrap_err()
+                .to_string()
+                .contains("systems_paths entry is not an existing directory")
+        );
     }
 
     #[test]

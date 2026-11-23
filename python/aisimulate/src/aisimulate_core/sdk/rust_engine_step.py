@@ -202,7 +202,7 @@ class ForwardPassPerfModelConfig:
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["transfer_policy"] = _resolve_forward_pass_transfer_policy(self.transfer_policy)
-        if self.estimation_mode not in {"fpm_regression", "fastafd_stage"} or self.systems_paths:
+        if self.estimation_mode != "fpm_regression" or self.systems_paths:
             payload["systems_paths"] = _resolve_forward_pass_systems_paths(self.systems_paths)
         return payload
 
@@ -615,7 +615,7 @@ def _json_dumps(value: Any) -> str:
 def _forward_pass_config_json(config: ForwardPassPerfModelConfig | Mapping[str, Any]) -> str:
     payload = config.to_dict() if isinstance(config, ForwardPassPerfModelConfig) else dict(config)
     mode = payload.get("estimation_mode", payload.get("forward_model"))
-    if mode not in {"fpm_regression", "fastafd_stage"} or payload.get("systems_paths"):
+    if mode != "fpm_regression" or payload.get("systems_paths"):
         payload["systems_paths"] = _resolve_forward_pass_systems_paths(tuple(payload.get("systems_paths") or ()))
     if "transfer_policy" in payload:
         payload["transfer_policy"] = _resolve_forward_pass_transfer_policy(payload["transfer_policy"])
