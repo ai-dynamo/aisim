@@ -2597,7 +2597,9 @@ def test_glm_plan_selects_one_batch_size_with_the_parallel_presets(tmp_path):
     with pytest.raises(ValueError) as error:
         _two_batch_sizes(tmp_path, 16, 8, gpus=(4,), preset=("pure_tp", "tep"), topology=tep)
     assert str(error.value) == _batch_refusal(
-        "prefill", "the accepted deployment at TP 4 holds 16, the accepted deployment at TP 4 holds 8"
+        "prefill",
+        "the accepted deployment at TP 4 (DP 1, MoE TP 4, MoE EP 1) holds 16, the accepted deployment at TP 4 (DP 1, "
+        "MoE TP 1, MoE EP 4) holds 8",
     )
     plan = _two_batch_sizes(tmp_path, 16, 8, gpus=(4,), preset="pure_tp", topology=tep)
     assert (_cells(plan), _largest_batches(plan)) == ([(4, "decode"), (4, "prefill")], (16, 16))
@@ -2955,6 +2957,18 @@ def test_probe_backed_glm_plan_without_a_profile_checks_the_prefill_sampling_bud
         f"{_BUDGET_RULE}: the prefill cells get a budget of 8190 tokens; set --fpm-max-prefill-isl and "
         "--fpm-max-num-batched-tokens to one multiple of 4"
     )
+    # The way out of the text: both options at one multiple of 4. The budget rule then passes, and the plan meets the
+    # rule of the probe launch, which needs the accepted profile.
+    with pytest.raises(ValueError) as error:
+        _probe_backed_glm_plan(
+            tmp_path,
+            with_profile=False,
+            worker_type="prefill",
+            max_prefill_isl=8188,
+            max_num_batched_tokens=8188,
+            **_glm_user_points(tmp_path),
+        )
+    assert str(error.value) == "formal collection model revision differs from the accepted runtime probe"
 
 
 @pytest.mark.parametrize(

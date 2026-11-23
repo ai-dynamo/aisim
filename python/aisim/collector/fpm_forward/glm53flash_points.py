@@ -319,8 +319,15 @@ def glm_plan_manifest(
             # points of one of them.
             sizes = {deployment.resources.max_batch_size for deployment in deployments}
             if len(sizes) > 1 and phase in options.workload_kinds:
+                shared = [deployment.tp for deployment in deployments]
                 held = ", ".join(
-                    f"the accepted deployment at TP {deployment.tp} holds {deployment.resources.max_batch_size}"
+                    f"the accepted deployment at TP {deployment.tp}"
+                    + (
+                        f" (DP {deployment.dp}, MoE TP {deployment.moe_tp}, MoE EP {deployment.moe_ep})"
+                        if shared.count(deployment.tp) > 1
+                        else ""
+                    )
+                    + f" holds {deployment.resources.max_batch_size}"
                     for deployment in deployments
                 )
                 raise ValueError(
@@ -453,9 +460,9 @@ def validate_glm_limits(options: FPMCollectionOptions, deployments: Sequence[Fpm
 
     The text names the source of the value and what to change. A value that equals the token limit that the runtime
     probe of a deployment with runtime memory recorded needs a new probe, since runtime memory takes only that limit.
-    For an aggregated plan, for a prefill budget that is the shared option and for a decode budget without runtime
-    memory, the text names both options at one value; else it names --fpm-max-prefill-isl. The other limits of the
-    plan, such as the batch limit, still apply to the new value, and a plan that sets neither option can meet the
+    Otherwise, for an aggregated plan, for a prefill budget that is the shared option and for a decode budget without
+    runtime memory, the text names both options at one value; else it names --fpm-max-prefill-isl. The other limits of
+    the plan, such as the batch limit, still apply to the new value, and a plan that sets neither option can meet the
     decode text after the prefill text.
     """
     rule = "GLM-5.3-Flash collection requires a token budget that is a multiple of 4"
