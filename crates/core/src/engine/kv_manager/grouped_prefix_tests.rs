@@ -594,8 +594,10 @@ fn non_cacheable_full_attention_group_takes_no_part_in_the_hit() {
 }
 
 #[test]
-fn rules_refuse_convolution_groups() {
-    // A convolution group keeps a window, and the table has no rule for it.
+fn rules_map_a_convolution_group_to_a_sliding_window() {
+    // vLLM's convolution state is a plain `SlidingWindowSpec` whose block and
+    // window are the kernel size (v0.31.0, v0.32.0 and v0.33.0
+    // vllm/models/inkling/nvidia/sconv_swa_attn.py:158-159, :185-193).
     let mut convolution = attention("convolution", 4, Some(4));
     convolution.kind = FpmCacheKind::Convolution;
     for version in [
@@ -605,16 +607,68 @@ fn rules_refuse_convolution_groups() {
     ] {
         for groups in [
             vec![convolution.clone()],
-            vec![attention("full", 4, None), convolution.clone()],
+            vec![attention("full", 16, None), convolution.clone()],
         ] {
-            let err = GroupedPrefixRules::new(&groups, 4, version)
-                .unwrap_err()
-                .to_string();
+            let rules = GroupedPrefixRules::new(&groups, 4, version).unwrap();
             assert_eq!(
-                err,
-                "grouped prefix caching does not support convolution cache groups; turn prefix caching off to replay them cold",
+                rules.groups.last().unwrap().kind,
+                GroupRuleKind::SlidingWindow { window: 4 },
                 "{version:?}"
             );
+        }
+        // With a full-attention group of 16-token blocks the scheduler block
+        // is lcm(16, 4) = 16. No state group allows hits inside a block, so
+        // hits land on multiples of 16. The startup check of a max_model_len
+        // of 256 counts 256 / 16 = 16 full-attention blocks and the admission
+        // cap of the window, cdiv(min(3 + in flight, 256), 4) + 1 (v0.31.0
+        // kv_cache_interface.py:859-866, v0.32.0 :878-885, v0.33.0 :937-944):
+        // 18, 10 and 65 blocks for 64, 32 and 512 or 256 tokens in flight.
+        let rules = GroupedPrefixRules::new(
+            &[attention("full", 16, None), convolution.clone()],
+            4,
+            version,
+        )
+        .unwrap();
+        assert_eq!(rules.alignment, 16, "{version:?}");
+        for (in_flight, startup) in [(64, 34), (32, 26), (512, 81), (256, 81)] {
+            assert_eq!(
+                rules.startup_blocks(256, in_flight),
+                startup,
+                "{version:?} at {in_flight}"
+            );
+        }
+        // The profile keeps the kind, so a convolution group and an attention
+        // group with the same block and window stay two spec groups. vLLM
+        // joins two groups only when their specs are equal in every field
+        // (v0.31.0 kv_cache_coordinator.py:755-761, v0.32.0 :726-732,
+        // v0.33.0 :736-742), and the profile does not hold the other fields
+        // of a spec, such as the head size.
+        let rules = GroupedPrefixRules::new(
+            &[attention("window", 4, Some(4)), convolution.clone()],
+            4,
+            version,
+        )
+        .unwrap();
+        assert_eq!(rules.specs.len(), 2, "{version:?}");
+
+        let mut opted_out = convolution.clone();
+        opted_out.prefix_cacheable = Some(false);
+        let mut no_window = convolution.clone();
+        no_window.sliding_window = None;
+        for (group, text) in [
+            (
+                opted_out,
+                "kv_cache_groups with enable_prefix_caching=true do not model a convolution group with prefix_cacheable=false; turn prefix caching off to replay it cold",
+            ),
+            (
+                no_window,
+                "convolution cache groups require a sliding_window",
+            ),
+        ] {
+            let err = GroupedPrefixRules::new(&[attention("full", 16, None), group], 4, version)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(err, text, "{version:?}");
         }
     }
 }
@@ -5858,5 +5912,91 @@ fn cached_count_is_the_computed_count_where_vllm_does_not_round_it() {
             "{version:?}"
         );
         coordinator.release_request(pool, &mut a);
+    }
+}
+
+#[test]
+fn convolution_group_keeps_one_block_before_the_replay_boundary() {
+    // A full-attention group of 16-token blocks and a convolution group with
+    // a block and a window of 4 tokens, at a hash block of 4: a scheduler
+    // block of 16, and hits on multiples of 16. A prompt of 64 tokens runs in
+    // two chunks of 32. The full-attention group keys its four full blocks,
+    // and at v0.32.0 and v0.33.0 the prompt tail (64 - 1) / 4 * 4 = 60 on the
+    // block that ends at 64 (v0.32.0 single_type_kv_cache_manager.py:860-868,
+    // v0.33.0 :870-881); v0.31.0 takes 64 / 4 * 4 = 64, a block end (v0.31.0
+    // :876). Under the default retention a window keeps only the block below
+    // the replay boundary, num_prompt_tokens - 1 = 63, rounded down to the
+    // alignment: the block that ends at 48 (v0.31.0 kv_cache_coordinator.py
+    // :319-338, v0.32.0 :65-86, v0.33.0 :65-86, and the window mask v0.31.0
+    // single_type_kv_cache_manager.py:1072-1151, v0.32.0 :1054-1133, v0.33.0
+    // :1067-1146). So 4 + 1 blocks stay cached.
+    //
+    // A prompt of 74 tokens with the same first 64 then hits 48: the window
+    // has no key at 64, and a hit is the shortest over the groups. The
+    // junction is 64. It holds 3 hit and 2 new full-attention blocks, and
+    // the convolution block that ends at 48 plus cdiv(74, 4) - 12 = 7 new
+    // ones: 13 blocks. It computes the block that ends at 64 again, which
+    // gets the key 64 a second time, and its window keeps the block below 64,
+    // the replay boundary 73 and the junction rounded down to 16. Its tail
+    // 72 lies above its last scheduler block, 64, and gets no key. So 7
+    // blocks stay cached, two of them in the convolution group.
+    let hash = 4;
+    let mut convolution = attention("convolution", 4, Some(4));
+    convolution.kind = FpmCacheKind::Convolution;
+    let groups = [attention("full", 16, None), convolution];
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
+        let mut coordinator = with_limits(GroupedPrefixRules::new(&groups, hash, version).unwrap());
+        let mut kv = kv_pool(&groups, 200);
+        let pool = kv.block_pool_mut().unwrap();
+        let request = lease(64, hash);
+        let cold = coordinator.find_longest_hit(pool, &request, 64);
+        let mut a = coordinator.new_lease();
+        let ends = prefill(&mut coordinator, pool, &mut a, &request, 64, &cold, 32);
+        assert_eq!(ends, [32, 64], "{version:?}");
+        let full_keys = match version {
+            VllmRuleVersion::V0_31_0 => vec![16, 32, 48, 64],
+            VllmRuleVersion::V0_32_0 | VllmRuleVersion::V0_33_0 => vec![16, 32, 48, 60, 64],
+        };
+        assert_eq!(
+            cached_positions(pool, 0, &request, hash, 64),
+            full_keys,
+            "{version:?}"
+        );
+        assert_eq!(
+            cached_positions(pool, 1, &request, hash, 64),
+            [48],
+            "{version:?}"
+        );
+        coordinator.release_request(pool, &mut a);
+        assert_eq!(pool.inactive_cached_blocks(), 5, "{version:?}");
+
+        let tokens: Vec<u32> = (0..64).chain(2000..2010).collect();
+        let mut longer = BlockRequestLease::new(Uuid::nil(), Vec::new());
+        longer.configure_prefix_hashes(&tokens, hash);
+        let hit = coordinator.find_longest_hit(pool, &longer, 74);
+        assert_eq!(
+            (hit.tokens, hit.tokens + hit.junction_tokens),
+            (48, 64),
+            "{version:?}"
+        );
+        let mut b = coordinator.new_lease();
+        coordinator.pin_hit(pool, &mut b, &hit).unwrap();
+        coordinator.begin_step();
+        assert!(coordinator.allocate(pool, &mut b, 74, 48, 74, 48));
+        assert_eq!(pool.active_blocks(), 13, "{version:?}");
+        assert_eq!(attention_copies(&b, 0), 5, "{version:?}");
+        assert_eq!(attention_copies(&b, 1), 8, "{version:?}");
+        coordinator.finalize(pool, &mut b, &longer, 74, 74, &hit);
+        coordinator.release_request(pool, &mut b);
+        assert_eq!(pool.inactive_cached_blocks(), 7, "{version:?}");
+        assert_eq!(
+            cached_positions(pool, 1, &longer, hash, 74),
+            [48, 64],
+            "{version:?}"
+        );
     }
 }

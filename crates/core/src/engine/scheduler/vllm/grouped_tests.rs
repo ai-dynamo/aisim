@@ -7612,3 +7612,218 @@ fn grouped_prefix_request_leaves_no_key_past_its_last_scheduler_block() {
         );
     }
 }
+
+/// One full-attention group of 16-token blocks and one convolution group
+/// with a block and a window of 4 tokens on an aggregated rank, at a hash
+/// block of 4 tokens and a `max_model_len` of 256.
+fn convolution_core(
+    version: &str,
+    budget: usize,
+    blocks: u64,
+    max_concurrent_batches: usize,
+) -> VllmCore {
+    let mut full = group("full", 16, 8, None);
+    full.prefix_cacheable = Some(true);
+    let mut convolution = group("convolution", 4, 8, Some(4));
+    convolution.kind = FpmCacheKind::Convolution;
+    convolution.prefix_cacheable = Some(true);
+    VllmCore::new(
+        MockEngineArgs::builder()
+            .block_size(4)
+            .num_gpu_blocks(1)
+            .max_num_batched_tokens(Some(budget))
+            .max_num_seqs(Some(4))
+            .max_model_len(Some(256))
+            .enable_prefix_caching(true)
+            .prefix_match_unit(Some(4))
+            .vllm_version(Some(version.to_string()))
+            .kv_cache_groups(vec![full, convolution])
+            .kv_cache_capacity_bytes(Some(blocks * 8))
+            .speedup_ratio(0.0)
+            .max_concurrent_batches(max_concurrent_batches)
+            .build()
+            .unwrap(),
+    )
+}
+
+/// Step until the rank drains. Returns the blocks in use after each pass is
+/// formed, before its boundary frees what it finished, the hit of each
+/// admission with the number of its pass, and the most blocks in use.
+fn convolution_stage(
+    core: &mut VllmCore,
+    now: &mut f64,
+) -> (Vec<usize>, Vec<(u128, usize, usize)>, usize) {
+    let (mut in_use, mut admissions, mut most) = (Vec::new(), Vec::new(), 0);
+    for pass in 1..=64 {
+        if core.is_drained() {
+            break;
+        }
+        block_pool(core).reset_peak_active_blocks();
+        let mut trace = TraceCollector::default();
+        let result = core.execute_pass(&mut trace, *now);
+        in_use.push(block_pool(core).active_blocks());
+        most = most.max(block_pool(core).peak_active_blocks());
+        core.complete_engine_boundary(result.end_ms);
+        *now = result.end_ms;
+        admissions.extend(result.admissions.iter().map(|admission| {
+            (
+                admission.uuid.as_u128(),
+                admission.reused_input_tokens,
+                pass,
+            )
+        }));
+        assert_eq!(result.mocker_metrics.vllm_preemptions_total, 0);
+    }
+    assert!(core.is_drained());
+    (in_use, admissions, most)
+}
+
+#[test]
+fn grouped_prefix_convolution_group_runs_as_vllms_sliding_window() {
+    // vLLM builds the convolution state as a plain `SlidingWindowSpec` whose
+    // block and window are the kernel size (v0.31.0, v0.32.0 and v0.33.0
+    // vllm/models/inkling/nvidia/sconv_swa_attn.py:158-159, :185-193). With a
+    // full-attention group of 16-token blocks the hash block is 4, the
+    // scheduler block is 16 and hits land on multiples of 16. The step budget
+    // is 32 tokens, so a prompt runs in chunks of 32.
+    //
+    // Blocks in use after a pass to `t` tokens: cdiv(t, 16) full-attention
+    // blocks, and cdiv(t, 4) - max(p - 3, 0) / 4 convolution blocks, where
+    // `p` is the processed count when the pass is formed. The window frees a
+    // block that lies wholly below p - 3, the tokens that the window skips
+    // (v0.31.0 single_type_kv_cache_manager.py:1153-1189, v0.32.0
+    // :1135-1172, v0.33.0 :1148-1185). With one batch `p` is the computed
+    // count before the pass. With two batches it is one pass behind, and a
+    // finished request is freed after the next pass is formed. With one batch
+    // replay frees a finished request inside its last pass, so its last count
+    // is 0.
+    //
+    // The startup count is 16 full-attention blocks plus the admission cap
+    // of the window, cdiv(min(3 + in flight, 256), 4) + 1 (v0.31.0
+    // kv_cache_interface.py:859-866, v0.32.0 :878-885, v0.33.0 :937-944):
+    // 16 + 10 = 26 with 32 tokens in flight, 16 + 18 = 34 with 64.
+    let prompt = |base: u32, tokens: u32, more: u32| -> Vec<u32> {
+        (base..base + tokens).chain(2000..2000 + more).collect()
+    };
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        for (batches, startup, first, second, long, most, second_admission) in [
+            // One batch. S1 to 32, 64, 70, 71 and 72 tokens: 2 + 8, 4 + 9,
+            // 5 + 3, 5 + 2, and 0 for the finished request. S2 to 32, 64,
+            // 65 and 66: 10, 13, 5 + 2, 0. S3 to 32, 64, ..., 192, 200, 201
+            // and 202: 10, 13, then 6, 8, 10, 12 full-attention blocks with 9
+            // convolution blocks, 13 + 3, 13 + 2, 0. S4: the second request
+            // needs cdiv(200, 16) + 10 = 23 blocks for its whole sequence; it
+            // finds 26 - 16 = 10 and 26 - 15 = 11 free blocks in passes 7 and
+            // 8, and the first request is freed in pass 8.
+            (
+                1,
+                26,
+                vec![10, 13, 8, 7, 0],
+                vec![10, 13, 7, 0],
+                vec![10, 13, 15, 17, 19, 21, 16, 15, 0],
+                21,
+                9,
+            ),
+            // Two batches. S1 to 32, 64, 70, 71 and 72 tokens with 0, 0, 32,
+            // 64 and 70 processed: 2 + 8, 4 + 16, 5 + 11, 5 + 3, 5 + 2. S2 to
+            // 32, 64, 65 and 66 with 0, 0, 32 and 64 processed: 10, 20,
+            // 5 + 10, 5 + 2. S3: 10, 20, then 6, 8, 10, 12 full-attention
+            // blocks with 17 convolution blocks, then 13 + 11, 13 + 4,
+            // 13 + 2. S4: the second request needs cdiv(200, 16) + 18 = 31
+            // blocks; it finds 34 - 24 = 10, 34 - 17 = 17 and 17 free blocks
+            // in passes 7, 8 and 9, and the first request is freed after
+            // pass 9 is formed.
+            (
+                2,
+                34,
+                vec![10, 20, 16, 8, 7],
+                vec![10, 20, 15, 7],
+                vec![10, 20, 23, 25, 27, 29, 24, 17, 15],
+                29,
+                10,
+            ),
+        ] {
+            let label = format!("{version} {batches}");
+            // S1: 70 prompt tokens and 3 output tokens. The full-attention
+            // group keys 16 to 64, and the window keeps the block below the
+            // replay boundary 69 rounded down to 16, the block that ends at
+            // 64: 5 cached blocks. Then the 70 and 10 new tokens hit 64 and
+            // take 1 + 4 new blocks, 10 in use; their block that ends at 80
+            // gets a key, 6 cached. Then the 70 again hit 64 and hold 5 + 3
+            // blocks; their tail block ends inside a scheduler block and
+            // gets no key, 6 cached.
+            let mut core = convolution_core(version, 32, 200, batches);
+            let mut now = 0.0;
+            submit_tokens(&mut core, 1, prompt(1000, 70, 0), 3);
+            let (in_use, admissions, _) = convolution_stage(&mut core, &mut now);
+            assert_eq!(in_use, first, "{label}");
+            assert_eq!(admissions, [(1, 0, 1)], "{label}");
+            assert_eq!(block_pool(&core).inactive_cached_blocks(), 5, "{label}");
+            submit_tokens(&mut core, 2, prompt(1000, 70, 10), 1);
+            let (_, admissions, peak) = convolution_stage(&mut core, &mut now);
+            assert_eq!(admissions[0].1, 64, "{label}");
+            assert_eq!(peak, 10, "{label}");
+            assert_eq!(block_pool(&core).inactive_cached_blocks(), 6, "{label}");
+            submit_tokens(&mut core, 3, prompt(1000, 70, 0), 1);
+            let (_, admissions, peak) = convolution_stage(&mut core, &mut now);
+            assert_eq!(admissions[0].1, 64, "{label}");
+            assert_eq!(peak, 8, "{label}");
+            assert_eq!(block_pool(&core).inactive_cached_blocks(), 6, "{label}");
+
+            // S2: 64 prompt tokens. The window keeps the block that ends at
+            // 48, below the replay boundary 63, so the 64 and 10 new tokens
+            // hit 48 and hold 3 + 2 and 1 + 7 blocks; they key the block that
+            // ends at 64 again in each group: 7 cached. The 64 again hit 48,
+            // the largest window key below 63, hold 3 + 1 and 1 + 4 blocks
+            // and key one more full-attention copy of the block that ends at
+            // 64: 8 cached.
+            let mut core = convolution_core(version, 32, 200, batches);
+            let mut now = 0.0;
+            submit_tokens(&mut core, 1, prompt(1000, 64, 0), 3);
+            let (in_use, _, _) = convolution_stage(&mut core, &mut now);
+            assert_eq!(in_use, second, "{label}");
+            assert_eq!(block_pool(&core).inactive_cached_blocks(), 5, "{label}");
+            submit_tokens(&mut core, 2, prompt(1000, 64, 10), 1);
+            let (_, admissions, peak) = convolution_stage(&mut core, &mut now);
+            assert_eq!(admissions[0].1, 48, "{label}");
+            assert_eq!(peak, 13, "{label}");
+            assert_eq!(block_pool(&core).inactive_cached_blocks(), 7, "{label}");
+            submit_tokens(&mut core, 3, prompt(1000, 64, 0), 1);
+            let (_, admissions, peak) = convolution_stage(&mut core, &mut now);
+            assert_eq!(admissions[0].1, 48, "{label}");
+            assert_eq!(peak, 9, "{label}");
+            assert_eq!(block_pool(&core).inactive_cached_blocks(), 8, "{label}");
+
+            // S3: 200 prompt tokens on a pool at the startup count: admitted
+            // at once, no preemption. The full-attention group keys 16 to
+            // 192, the window the block that ends at 192. The 200 and 20 new
+            // tokens hit 192 and hold 12 + 2 and 1 + 7 blocks, 22; they key
+            // the blocks that end at 208 in each group: 15 cached.
+            let mut core = convolution_core(version, 32, startup, batches);
+            let mut now = 0.0;
+            submit_tokens(&mut core, 1, prompt(1000, 200, 0), 3);
+            let (in_use, admissions, peak) = convolution_stage(&mut core, &mut now);
+            assert_eq!(in_use, long, "{label}");
+            assert_eq!(admissions, [(1, 0, 1)], "{label}");
+            assert_eq!(peak, most, "{label}");
+            submit_tokens(&mut core, 2, prompt(1000, 200, 20), 1);
+            let (_, admissions, peak) = convolution_stage(&mut core, &mut now);
+            assert_eq!(admissions[0].1, 192, "{label}");
+            assert_eq!(peak, 22, "{label}");
+            assert_eq!(block_pool(&core).inactive_cached_blocks(), 15, "{label}");
+
+            // S4: two prompts of 200 tokens added together on a pool at the
+            // startup count. The first one takes the whole step budget in
+            // passes 1 to 6. The second one waits until its whole sequence
+            // fits (v0.31.0 kv_cache_manager.py:519-536, v0.32.0 :522-539,
+            // v0.33.0 :531-548) and is admitted in the pass after the first
+            // one is freed.
+            let mut core = convolution_core(version, 32, startup, batches);
+            let mut now = 0.0;
+            submit_tokens(&mut core, 1, prompt(1000, 200, 0), 2);
+            submit_tokens(&mut core, 2, prompt(5000, 200, 0), 2);
+            let (_, admissions, _) = convolution_stage(&mut core, &mut now);
+            assert_eq!(admissions, [(1, 0, 1), (2, 0, second_admission)], "{label}");
+        }
+    }
+}

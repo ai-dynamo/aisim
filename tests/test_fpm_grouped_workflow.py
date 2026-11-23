@@ -265,8 +265,8 @@ def _with_prefix_evidence(profile, *, hash_block=64, version="0.31.0"):
     """Runtime memory of a hand-made profile with prefix caching on, and every group marked cacheable.
 
     The Rust gate needs one page size, a hash block that divides every cacheable block and one running block
-    per state group, so every page is 64 bytes and every block is one hash block. Grouped prefix caching refuses
-    convolution groups, so the fictional convolution group goes.
+    per state group, so every page is 64 bytes and every block is one hash block. The fictional convolution group
+    goes; a case that needs one adds _CONVOLUTION_GROUP.
     """
     profile = deepcopy(profile)
     for deployment in profile["deployments"]:
@@ -1914,7 +1914,12 @@ def _prefix_search(profile, root, version):
             "every cache group to declare prefix_cacheable; "
             "set prefix_cacheable \\(true or false\\) on each cache group",
         ),
-        ("convolution_group", "grouped prefix caching does not support convolution cache groups"),
+        ("convolution_group", None),
+        (
+            "non_cacheable_convolution",
+            "kv_cache_groups with enable_prefix_caching=true do not model a convolution group with "
+            "prefix_cacheable=false; turn prefix caching off to replay it cold",
+        ),
         (
             "non_cacheable_window",
             "kv_cache_groups with enable_prefix_caching=true do not model a sliding-window attention group with "
@@ -1949,6 +1954,8 @@ def test_grouped_prefix_caching_needs_vllm_evidence_with_align_mode(grouped_case
             del resources["cache_groups"][1]["prefix_cacheable"]
         elif case == "convolution_group":
             resources["cache_groups"].append(dict(_CONVOLUTION_GROUP))
+        elif case == "non_cacheable_convolution":
+            resources["cache_groups"].append({**_CONVOLUTION_GROUP, "prefix_cacheable": False})
         elif case == "non_cacheable_window":
             # The window group of the fixture, as the Rust rule table refuses it.
             resources["cache_groups"][1]["prefix_cacheable"] = False
@@ -2139,7 +2146,7 @@ def test_grouped_plan_on_an_unmodeled_vllm_version_stays_cold(grouped_case, tmp_
     assert json.loads((output / "validation.json").read_text())["status"] == "covered"
 
 
-@pytest.mark.parametrize("unsupported", ["state_without_align", "convolution_group"])
+@pytest.mark.parametrize("unsupported", ["state_without_align", "non_cacheable_convolution"])
 def test_grouped_plan_that_fails_a_prefix_caching_requirement_stays_cold(
     grouped_case, tmp_path, monkeypatch, unsupported
 ):
@@ -2152,7 +2159,7 @@ def test_grouped_plan_that_fails_a_prefix_caching_requirement_stays_cold(
         if unsupported == "state_without_align":
             resources["runtime_memory"]["mamba_cache_mode"] = "none"
         else:
-            resources["cache_groups"].append(dict(_CONVOLUTION_GROUP))
+            resources["cache_groups"].append({**_CONVOLUTION_GROUP, "prefix_cacheable": False})
     plan, output = _plan_and_validate_weka(profile, tmp_path, monkeypatch, version="0.31.0", context_length=1024)
     for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
         worker = yaml.safe_load((plan / name).read_text())["engine"]["workers"]["aggregated"]

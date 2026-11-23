@@ -1785,11 +1785,12 @@ def grouped_prefix_caching_requirements(
             "grouped FPM cache prefix caching requires every cache group to declare prefix_cacheable; "
             "set prefix_cacheable (true or false) on each cache group of the profile"
         )
-    # The Rust rule table has no rule for a convolution group.
-    if any(group.kind == "convolution" for group in groups):
+    # The Rust rule table takes a convolution group as a sliding window, and refuses one that opts out of prefix
+    # caching with this text at native startup.
+    if any(group.kind == "convolution" and group.prefix_cacheable is False for group in groups):
         raise ValueError(
-            "grouped prefix caching does not support convolution cache groups; turn prefix caching off to replay "
-            "them cold"
+            "kv_cache_groups with enable_prefix_caching=true do not model a convolution group with "
+            "prefix_cacheable=false; turn prefix caching off to replay it cold"
         )
     # The Rust rule table models no sliding-window attention group that opts out of prefix caching, and refuses it
     # with this text at native startup on an aggregated rank. A prefill or decode rank refused it above.

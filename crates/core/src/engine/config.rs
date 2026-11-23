@@ -3662,10 +3662,16 @@ mod tests {
     }
 
     #[test]
-    fn grouped_prefix_caching_refuses_convolution_groups() {
-        // The grouped rule table has no rule for a convolution group, so the
-        // gate refuses it with prefix caching on, whatever the capacity. Cold
-        // replay keeps the group.
+    fn grouped_prefix_caching_accepts_convolution_groups() {
+        // The grouped rule table takes a convolution group as a sliding
+        // window, and the startup check counts its admission cap:
+        // cdiv(min(window - 1 + tokens in flight, max_model_len), block) + 1
+        // (v0.31.0 kv_cache_interface.py:859-866, v0.32.0 :878-885, v0.33.0
+        // :937-944). Two batches of 8 tokens are 16 tokens in flight, so the
+        // one group needs cdiv(min(3 + 16, 128), 4) + 1 = 6 blocks: 6 pages
+        // validate and 5 are refused with the capacity text. A convolution
+        // group that opts out of prefix caching beside a cacheable group has
+        // no rule. Cold replay keeps the group.
         let wire = |prefix_caching: bool, version: &str, pages: u64| {
             let mut wire = serde_json::json!({
                 "backend": "vllm",
@@ -3686,13 +3692,28 @@ mod tests {
             wire
         };
         for version in ["0.31.0", "0.32.0", "0.33.0"] {
-            for pages in [8, 32] {
-                assert_eq!(
-                    validation_error(wire(true, version, pages)),
-                    "grouped prefix caching does not support convolution cache groups; turn prefix caching off to replay them cold",
-                    "{version} at {pages} pages"
-                );
+            for pages in [6, 32] {
+                validates(wire(true, version, pages));
             }
+            assert_eq!(
+                validation_error(wire(true, version, 5)),
+                "kv_cache_groups with enable_prefix_caching=true need capacity for the full prompt of max_model_len plus the state blocks of one request",
+                "{version}"
+            );
+            let mut opted_out = wire(true, version, 64);
+            opted_out["kv_cache_groups"][0]["prefix_cacheable"] = false.into();
+            opted_out["kv_cache_groups"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "name": "full", "kind": "attention", "num_layers": 1,
+                    "block_size_tokens": 4, "page_size_bytes": 64, "prefix_cacheable": true
+                }));
+            assert_eq!(
+                validation_error(opted_out),
+                "kv_cache_groups with enable_prefix_caching=true do not model a convolution group with prefix_cacheable=false; turn prefix caching off to replay it cold",
+                "{version}"
+            );
         }
         validates(wire(false, "", 8));
     }

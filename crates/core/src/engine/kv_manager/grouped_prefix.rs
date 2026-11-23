@@ -201,7 +201,7 @@ impl GroupedPrefixRules {
                         GroupRuleKind::Ring
                     }
                 }
-                FpmCacheKind::Attention => match group.sliding_window {
+                FpmCacheKind::Attention | FpmCacheKind::Convolution => match group.sliding_window {
                     Some(window) => {
                         // The window specs that opt out of prefix caching are
                         // a ring of one block per request (v0.31
@@ -213,20 +213,31 @@ impl GroupedPrefixRules {
                         // in vLLM (v0.31 `coord:743-749`, v0.32
                         // `coord:713-720`).
                         ensure!(
-                            cacheable,
+                            cacheable || group.kind == FpmCacheKind::Convolution,
                             "kv_cache_groups with enable_prefix_caching=true do not model a sliding-window attention group with prefix_cacheable=false; describe a ring buffer as a state group with blocks_per_request: 1 and prefix_cacheable: false, and turn prefix caching off for a bounded replay window, which replay does not model"
+                        );
+                        // A convolution group is vLLM's plain
+                        // `SlidingWindowSpec`, with the kernel size as its
+                        // block and its window (v0.31.0, v0.32.0 and v0.33.0
+                        // `vllm/models/inkling/nvidia/sconv_swa_attn.py:158-159`,
+                        // `:185-193`), and that spec takes part in prefix
+                        // caching. The profile keeps its kind, so it forms
+                        // its own spec group.
+                        ensure!(
+                            cacheable,
+                            "kv_cache_groups with enable_prefix_caching=true do not model a convolution group with prefix_cacheable=false; turn prefix caching off to replay it cold"
                         );
                         GroupRuleKind::SlidingWindow {
                             window: window as usize,
                         }
                     }
+                    // `EngineConfig::validate` refuses this group with the
+                    // same text before it reaches the rule table.
+                    None if group.kind == FpmCacheKind::Convolution => {
+                        bail!("convolution cache groups require a sliding_window")
+                    }
                     None => GroupRuleKind::FullAttention,
                 },
-                // The table has no rule for a convolution group, so the
-                // group fails here and does not lose its window.
-                FpmCacheKind::Convolution => bail!(
-                    "grouped prefix caching does not support convolution cache groups; turn prefix caching off to replay them cold"
-                ),
             };
             cacheable &= kind != GroupRuleKind::Ring;
             if cacheable {
