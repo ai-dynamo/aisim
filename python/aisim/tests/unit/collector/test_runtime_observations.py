@@ -2273,7 +2273,7 @@ def test_prefix_caching_evidence_must_be_modeled_and_agree_across_ranks(tmp_path
     assert diagnostic in " ".join(result["diagnostics"])
 
 
-@pytest.mark.parametrize("workers", ["every_worker", "first_worker", "last_worker"])
+@pytest.mark.parametrize("workers", ["every_worker", "first_worker", "middle_worker", "last_worker"])
 @pytest.mark.parametrize("mode", ["align", "none"])
 @pytest.mark.parametrize("layout", ["kernel_view", "mamba_hybrid"])
 @pytest.mark.parametrize("phase", ["prefill", "decode"])
@@ -2288,7 +2288,7 @@ def test_v033_worker_that_turned_prefix_caching_off_names_batch_invariance(tmp_p
             record["cache"]["prefix_caching"]["mamba_cache_mode"] = "none"
             record["resolved_config"]["cache_config"]["mamba_cache_mode"] = "none"
         # The worker process changed its own cache configuration, and the engine core kept prefix caching on.
-        ranks = {"first_worker": (0, 0), "last_worker": (1, 1)}
+        ranks = {"first_worker": (0, 0), "middle_worker": (0, 1), "last_worker": (1, 1)}
         if record["kind"] == "worker" and (
             workers == "every_worker" or (record["dp_rank"], record["tp_rank"]) == ranks[workers]
         ):

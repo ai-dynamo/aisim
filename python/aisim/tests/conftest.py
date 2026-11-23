@@ -59,8 +59,9 @@ def _restore_root_logger():
 def _no_vllm_batch_invariant(monkeypatch: pytest.MonkeyPatch) -> None:
     """Run every test without VLLM_BATCH_INVARIANT in the environment.
 
-    A runtime probe on Slurm refuses the variable in the environment of the collector, so a test that builds such a
-    probe would fail in a shell that sets it. A test of that refusal sets the variable itself.
+    A runtime probe on Slurm refuses the variable in the environment of the collector unless int() reads its value as 0,
+    so a test that builds such a probe would fail in a shell that sets it to another value. A test of that refusal sets
+    the variable itself.
     """
     monkeypatch.delenv("VLLM_BATCH_INVARIANT", raising=False)
 

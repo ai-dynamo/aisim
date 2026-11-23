@@ -279,19 +279,28 @@ def build_runtime_probe_plan(configuration: str, facts: dict[str, Any], bundle: 
             raise ValueError(f"precision.{name}={precision[name]!r} does not match checkpoint-native {actual!r}")
     # Collection labels FMHA with the checkpoint-native mode of an AIC KV-cache mode other than bfloat16, and the import
     # accepts only that label, so another label is refused here, before any GPU work. Collection labels the FMHA of a
-    # bfloat16 KV cache bfloat16 (checkpoint_fmha_quant_mode), so another label is refused here too.
+    # bfloat16 KV cache bfloat16 (checkpoint_fmha_quant_mode), so another label is refused here too. For an
+    # unquantized float16 checkpoint the import also requires the label to equal the compute dtype half, so no label of
+    # a bfloat16 KV cache imports, and that cache is refused here as a whole.
     if has_checkpoint_fmha(precision["kvcache_quant_mode"]):
-        expected = checkpoint_fmha_quant_mode(config, architecture, precision["kvcache_quant_mode"])
+        expected = checkpoint_fmha_quant_mode(config, architecture, precision["kvcache_quant_mode"], inferred)
         if precision["fmha_quant_mode"] != expected:
             raise ValueError(
                 f"precision.fmha_quant_mode={precision['fmha_quant_mode']!r} does not match checkpoint-native "
                 f"{expected!r}"
             )
-    elif bfloat16_kv_cache(precision["kvcache_quant_mode"]) and precision["fmha_quant_mode"] != "bfloat16":
-        raise ValueError(
-            f"precision.fmha_quant_mode={precision['fmha_quant_mode']!r} does not match 'bfloat16', the collection "
-            "label of a bfloat16 KV cache"
-        )
+    elif bfloat16_kv_cache(precision["kvcache_quant_mode"]):
+        if precision["gemm_quant_mode"] == "half":
+            raise ValueError(
+                f"precision.kvcache_quant_mode={precision['kvcache_quant_mode']!r} cannot be imported for an "
+                "unquantized float16 checkpoint: the observation import accepts no FMHA label for it (a bfloat16 KV "
+                "cache takes the label bfloat16, and the label must equal the compute dtype half)"
+            )
+        if precision["fmha_quant_mode"] != "bfloat16":
+            raise ValueError(
+                f"precision.fmha_quant_mode={precision['fmha_quant_mode']!r} does not match 'bfloat16', the "
+                "collection label of a bfloat16 KV cache"
+            )
     topology = ParallelTopology(**launch["topology"])
     is_moe = identity["model_kind"] == "moe"
     strategy = topology_strategy(topology, is_moe=is_moe)
@@ -895,9 +904,10 @@ def probe_runtime(
                 version = identity["framework_version"]
             if version is None and detected_versions and name in detected_versions:
                 # The version that the caller detected in the target container,
-                # read only when neither source above gives one. When the selected
-                # configurations give one version in all and no bundle exists for
-                # it, the refusal below names the missing observer.
+                # taken as the version of the bundled selection only when neither
+                # source above gives one. When the selected configurations give
+                # one version in all and no bundle exists for it, the refusal
+                # below names the missing observer.
                 version = detected_versions[name]
             if version is None:
                 unresolved.append(name)

@@ -589,27 +589,79 @@ def test_probe_rejects_ignored_checkpoint_precision_and_resolves_explicit_graph_
     assert result["configurations"]["valid"]["launch"]["collection"]["max_prefill_cudagraph_size"] == 2048
 
 
-def test_probe_preview_refuses_half_for_a_bfloat16_kv_cache(tmp_path):
-    # Collection planning labels the FMHA of a bfloat16 KV cache bfloat16, so the preview refuses the compute dtype
-    # half of a float16 checkpoint before any GPU work.
-    from collector.fpm_forward import runtime_probe
+def _preview_launch(tmp_path, *, torch_dtype, weight, kv, fmha):
+    """The probe launch of the fixture for a checkpoint of ``torch_dtype``, with these precision labels."""
     from collector.fpm_forward.runtime_instrumentation import load_instrumentation
 
+    tmp_path.mkdir()
     launch, manifest, _marker = _inputs(tmp_path)
-    bundle = load_instrumentation(manifest)
-    plan = runtime_probe.build_runtime_probe_plan("bfloat16", launch, bundle)
-    assert {(cell.kv_cache_dtype, cell.fmha_quant_mode) for cell in plan.cells} == {("bfloat16", "bfloat16")}
-
     config = Path(launch["model_config"]["path"])
-    config.write_text(json.dumps({**json.loads(config.read_text()), "torch_dtype": "float16"}))
+    config.write_text(json.dumps({**json.loads(config.read_text()), "torch_dtype": torch_dtype}))
     launch["model_config"]["sha256"] = hashlib.sha256(config.read_bytes()).hexdigest()
-    launch["precision"].update(gemm_quant_mode="half", moe_quant_mode="half", fmha_quant_mode="half")
-    assert launch["precision"]["kvcache_quant_mode"] == "bfloat16"
+    launch["precision"].update(
+        gemm_quant_mode=weight, moe_quant_mode=weight, fmha_quant_mode=fmha, kvcache_quant_mode=kv
+    )
+    return launch, load_instrumentation(manifest)
+
+
+@pytest.mark.parametrize("kv", ["bfloat16", "bf16", "BF16"])
+def test_probe_preview_refuses_another_fmha_label_than_bfloat16_for_a_bfloat16_kv_cache(tmp_path, kv):
+    # Collection planning labels the FMHA of a bfloat16 KV cache bfloat16, under each spelling of that cache dtype.
+    from collector.fpm_forward import runtime_probe
+
+    launch, bundle = _preview_launch(
+        tmp_path / "bfloat16", torch_dtype="bfloat16", weight="bfloat16", kv=kv, fmha="bfloat16"
+    )
+    plan = runtime_probe.build_runtime_probe_plan("bfloat16", launch, bundle)
+    assert {(cell.kv_cache_dtype, cell.fmha_quant_mode) for cell in plan.cells} == {(kv, "bfloat16")}
+    launch, bundle = _preview_launch(tmp_path / "half", torch_dtype="bfloat16", weight="bfloat16", kv=kv, fmha="half")
     with pytest.raises(ValueError) as error:
         runtime_probe.build_runtime_probe_plan("half", launch, bundle)
     assert str(error.value) == (
         "precision.fmha_quant_mode='half' does not match 'bfloat16', the collection label of a bfloat16 KV cache"
     )
+
+
+@pytest.mark.parametrize("fmha", ["half", "bfloat16"])
+@pytest.mark.parametrize("kv", ["bfloat16", "bf16", "BF16"])
+def test_probe_preview_refuses_a_bfloat16_kv_cache_of_an_unquantized_float16_checkpoint(tmp_path, kv, fmha):
+    # The import takes only bfloat16 as the FMHA label of a bfloat16 KV cache, and only the compute dtype, half for
+    # this checkpoint, as the label. No label meets both, so the preview refuses the launch before any GPU work.
+    from collector.fpm_forward import runtime_probe
+
+    launch, bundle = _preview_launch(tmp_path / "float16", torch_dtype="float16", weight="half", kv=kv, fmha=fmha)
+    with pytest.raises(ValueError) as error:
+        runtime_probe.build_runtime_probe_plan("float16", launch, bundle)
+    assert str(error.value) == (
+        f"precision.kvcache_quant_mode={kv!r} cannot be imported for an unquantized float16 checkpoint: the "
+        "observation import accepts no FMHA label for it (a bfloat16 KV cache takes the label bfloat16, and the label "
+        "must equal the compute dtype half)"
+    )
+
+
+def test_probe_preview_infers_the_checkpoint_quantization_once(tmp_path, monkeypatch):
+    from collector.fpm_forward import capabilities, runtime_probe
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+
+    from aisim.sdk.models import helpers
+
+    launch, manifest, _marker = _inputs(tmp_path)
+    # An fp8 KV cache takes the checkpoint-native FMHA label, which the preview reads from the inferred modes.
+    launch["precision"]["kvcache_quant_mode"] = "fp8"
+    bundle = load_instrumentation(manifest)
+    calls = []
+    infer = helpers._infer_quant_modes_from_raw_config
+
+    def counted(*args, **kwargs):
+        calls.append(args)
+        return infer(*args, **kwargs)
+
+    # The preview and the label helper call the inference under these two names.
+    monkeypatch.setattr(helpers, "_infer_quant_modes_from_raw_config", counted)
+    monkeypatch.setattr(capabilities, "_infer_quant_modes_from_raw_config", counted)
+    plan = runtime_probe.build_runtime_probe_plan("fp8", launch, bundle)
+    assert {(cell.kv_cache_dtype, cell.fmha_quant_mode) for cell in plan.cells} == {("fp8", "bfloat16")}
+    assert len(calls) == 1
 
 
 def _formal_cli_inputs(tmp_path):

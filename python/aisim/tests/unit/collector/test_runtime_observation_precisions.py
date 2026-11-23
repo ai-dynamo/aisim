@@ -203,3 +203,38 @@ def test_fp8_semantics_cannot_relabel_bf16_storage(tmp_path):
     result = validate_observations(path, launches)["tp2"]
     assert result["status"] == "incomplete"
     assert "cache group dtype" in " ".join(result["diagnostics"])
+
+
+def test_import_accepts_half_for_the_float16_kv_cache_of_a_float16_checkpoint(tmp_path):
+    # The bfloat16 label rule binds a bfloat16 KV cache only: a float16 checkpoint with its float16 KV cache keeps the
+    # observed compute dtype half as its FMHA label.
+    path, launches = _precision_fixture(
+        tmp_path, cache_dtype="float16", storage_dtype="torch.float16", item_size=2, precision="half"
+    )
+    launch = launches["tp2"]
+    model = Path(launch["model_config"]["path"])
+    model.write_text(json.dumps({"model_type": "example", "torch_dtype": "float16"}))
+    launch["model_config"]["sha256"] = hashlib.sha256(model.read_bytes()).hexdigest()
+    launch["precision"].update(gemm_quant_mode="half", moe_quant_mode="half", fmha_quant_mode="half")
+    _replace_launch(path, launches)
+
+    def float16(record):
+        record["model_config_sha256"] = launch["model_config"]["sha256"]
+        record["resolved_config"]["model_config"].update(dtype="torch.float16", quantization=None)
+        record["resolved_config"]["quantization_config"] = None
+
+    _mutate(path, float16)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+
+
+@pytest.mark.parametrize("version", ["0.27.0", "0.33.0"])
+def test_import_names_the_observed_compute_dtype_before_the_label_of_a_bfloat16_kv_cache(tmp_path, version):
+    # A bfloat16 checkpoint with a bfloat16 KV cache and the label half: the label is not the observed compute dtype,
+    # and the check of that mapping runs before the label rule of the bfloat16 KV cache.
+    path, launches = observation_fixture(tmp_path, version=version)
+    launches["tp2"]["precision"]["fmha_quant_mode"] = "half"
+    _replace_launch(path, launches)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete"
+    assert result["diagnostics"] == ["tp2: FMHA precision lacks a supported observed compute-dtype mapping"]

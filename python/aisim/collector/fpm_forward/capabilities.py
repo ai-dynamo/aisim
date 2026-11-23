@@ -47,6 +47,7 @@ def _check_layer_declarations(config: dict[str, object]) -> None:
     They read the layer count from num_hidden_layers only, and they check neither the window fields nor attn_type_list.
     A config with markers runs check_marker_layout_declarations of aisim.fpm_cache_layout instead, the checks that
     config intake runs. A DeepSeek-V4.1 config runs neither: its markers are not read, and its template is chosen before
+    these checks. A DeepSeek-V4 or MiniMax-M3 config without markers runs neither too: its template is chosen before
     these checks.
     """
     layer_types = config.get("layer_types")
@@ -199,9 +200,11 @@ def checkpoint_fmha_quant_mode(
     the FMHA mode that the checkpoint inference names, and bfloat16 when it names none. Any other label, for example
     ``half``, raises ValueError. The runtime probe preview and the observation import apply the same label to each
     KV-cache dtype that ``has_checkpoint_fmha`` accepts, so such a profile that passes them passes collection planning.
-    For a bfloat16 KV cache the label is bfloat16, and the preview and the import refuse another one. For a KV-cache
-    dtype without an AIC mode, for example float16 (label ``half``), they keep the observed compute dtype. Neither
-    reads a checkpoint configuration for these two.
+    For a bfloat16 KV cache the label is bfloat16, and the preview and the import refuse another one; the preview also
+    refuses that cache for an unquantized float16 checkpoint, for which the import accepts no label. For a KV-cache
+    dtype without an AIC mode, for example float16 (label ``half``), the import keeps the observed compute dtype as the
+    FMHA label, and the preview checks no FMHA label. The import reads no checkpoint configuration for these two, and
+    the preview reads it for the GEMM and MoE labels only.
     """
     if _normalize_kv_dtype(kv_cache_dtype) == "bfloat16":
         return "bfloat16"
@@ -215,8 +218,9 @@ def has_checkpoint_fmha(kv_cache_dtype: str) -> bool:
 
     True for an AIC KV-cache mode other than bfloat16, for example fp8. For a bfloat16 KV cache the FMHA label is
     bfloat16, and the runtime probe preview and the observation import refuse another one (``bfloat16_kv_cache``). For
-    a KV-cache dtype without an AIC mode, for example float16 (label ``half``), they keep the observed compute dtype as
-    the FMHA label. Neither reads a checkpoint configuration for these two.
+    a KV-cache dtype without an AIC mode, for example float16 (label ``half``), the import keeps the observed compute
+    dtype as the FMHA label, and the preview checks no FMHA label. The import reads no checkpoint configuration for
+    these two, and the preview reads it for the GEMM and MoE labels only.
     """
     mode = _KV_ALIASES.get(kv_cache_dtype.lower())
     return mode != "bfloat16" and mode in {item.name for item in common.KVCacheQuantMode}

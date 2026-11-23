@@ -103,7 +103,7 @@ def test_detected_versions_are_read_after_the_launch_sources_for_each_configurat
         runtime_probe.probe_runtime(
             both, output_dir=tmp_path / "s4", execute=True, detected_versions={"a": "0.33.1", "b": "0.33.1"}
         )
-    # Two detected versions meet the one-version refusal before any version is looked up.
+    # Two detected versions meet the one-version refusal before the bundle of the selected version is looked up.
     other = {"a": launch("0.33.1"), "b": launch("0.33.2")}
     with pytest.raises(ValueError, match=one_version):
         runtime_probe.probe_runtime(

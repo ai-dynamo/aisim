@@ -3424,7 +3424,7 @@ def _probe_with_local_observer(tmp_path, monkeypatch, *, requested, detected):
     return probe, executions
 
 
-@pytest.mark.parametrize("bundle_version", ["0.33.0", "0.33.2", "0.33.1+cu130"])
+@pytest.mark.parametrize("bundle_version", ["0.33.0", "0.33.2", "0.33.1+cu130", "v0.33.1"])
 def test_probe_execute_refuses_a_local_observer_of_another_version_than_the_detected_one(
     tmp_path, monkeypatch, bundle_version
 ):
@@ -3444,6 +3444,48 @@ def test_probe_execute_refuses_a_local_observer_of_another_version_than_the_dete
     status, result = probe("0.33.1", "detected-version")
     assert status == 0
     assert result["status"] == "completed"
+    assert executions == [("tp2", "prefill"), ("tp2", "decode")]
+
+
+def test_probe_execute_compares_the_local_observer_with_the_detected_version_of_each_configuration(
+    tmp_path, monkeypatch
+):
+    # One command probes two configurations with one campaign-local observer of vLLM 0.33.1. The image of tp2 reports
+    # 0.33.1 and the image of incomplete reports 0.33.0, so only incomplete is refused, before any of its phases runs.
+    from collector.fpm_forward import runner
+
+    from aisim.support import versioning
+
+    from .collector.test_fpm_runtime_probe import _SyntheticExecutor
+
+    checkpoint, index, _ = _campaign(tmp_path)
+    state = _load(checkpoint)
+    patch, images = {}, {}
+    for position, (name, version) in enumerate((("tp2", "0.33.1"), ("incomplete", "0.33.0"))):
+        draft = copy.deepcopy(state.configurations[name].draft_request)
+        draft["identity"]["framework_version"] = version
+        deployment = dict(state.configurations[name].inputs["collection_deployment"])
+        deployment["image"] = f"example/runtime-{position}@sha256:" + "c" * 64
+        images[deployment["image"]] = version
+        patch[name] = {"draft_request": draft, "inputs": {"collection_deployment": deployment}}
+    save_checkpoint(checkpoint, patch={"configurations": patch}, expected_revision=state.revision, accept=[])
+    monkeypatch.setattr(
+        versioning, "detect_runtime_versions", lambda deployment: {"backend_version": images[deployment.image]}
+    )
+    executions = []
+    monkeypatch.setattr(runner, "_cell_runner", lambda p, c, _m, d: _SyntheticExecutor(p, c, d, executions))
+    manifest = _local_observer(index.parent, tmp_path / "observer", "0.33.1")
+    command = ["onboard", "probe-runtime", "--checkpoint", str(checkpoint), "--output-dir", str(tmp_path / "out")]
+    command += ["--configuration", "tp2", "--configuration", "incomplete", "--execute", "--instrumentation"]
+    assert cli.main([*command, str(manifest)]) == 1
+    configurations = _load(checkpoint).configurations
+    assert configurations["tp2"].history[-1]["result"]["status"] == "completed"
+    result = configurations["incomplete"].history[-1]["result"]
+    assert result["status"] == "failed"
+    assert result["diagnostics"] == [
+        "instrumentation runtime version 0.33.1 differs from vLLM 0.33.0 detected in the target container; "
+        "provide campaign-local --instrumentation for vLLM 0.33.0"
+    ]
     assert executions == [("tp2", "prefill"), ("tp2", "decode")]
 
 
