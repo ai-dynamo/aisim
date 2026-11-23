@@ -13,9 +13,10 @@ import sys
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
-from aisim_core.data import Artifact, Identity, Manifest, configuration_id
+from aisim_core.data import Artifact, Identity, Manifest, configuration_id, redaction
 from aisim_core.data.catalog import build_catalog
 from aisim_core.data.e2e import (
     E2eManifestBody,
@@ -175,13 +176,29 @@ def _mirror(tmp_path, *, repo=INTERNAL_REPO, dev=("synthetic/model-a",)):
 
 
 def _op_mirror(tmp_path, column, value):
+    columns = {"kernel_source": ["synthetic-kernel"] * 2, "latency_ms": [1.0, 2.0]}
+    columns[column] = ["synthetic-kernel" if column == "kernel_source" else None, value]
+    return _op_mirror_table(tmp_path, pa.table(columns))
+
+
+def _op_mirror_table(tmp_path, table, *, store_schema=True, row_group_size=None):
+    """A valid private op-latency mirror holding exactly ``table`` (any Arrow layout the writer accepts).
+
+    ``store_schema=False`` writes the file as another producer might: the Arrow schema is not embedded, so a
+    reader sees plain string columns although the stored dictionary pages keep every value their writer put there.
+    ``row_group_size`` splits the rows into row groups, which read back as several chunks with their own dictionaries.
+    """
     root = tmp_path / "mirror"
     directory = "data/op-latency/h100_sxm/gemm/vllm/0.11.0"
     relative = f"{directory}/gemm_perf.parquet"
-    columns = {"kernel_source": ["synthetic-kernel"] * 2, "latency_ms": [1.0, 2.0]}
-    columns[column] = ["synthetic-kernel" if column == "kernel_source" else None, value]
-    table = pa.table(columns)
-    path = write_parquet(table, root / relative, OP_TABLE_SCHEMA_ID)
+    if store_schema and row_group_size is None:
+        path = write_parquet(table, root / relative, OP_TABLE_SCHEMA_ID)
+    else:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with pq.ParquetWriter(path, table.schema, compression="zstd", store_schema=store_schema) as writer:
+            writer.add_key_value_metadata({"aisim.schema": OP_TABLE_SCHEMA_ID})
+            writer.write_table(table, row_group_size=row_group_size)
     identity = Identity(
         hardware="h100_sxm", framework="vllm", framework_version="0.11.0", operation_family="gemm",
         model=None, effective_settings={}, unresolved_identity=None,
@@ -1412,6 +1429,96 @@ def test_clean_operation_table_text_can_be_promoted(tmp_path, value):
     assert (target / relative).read_bytes() == (root / relative).read_bytes()
     report = validate_tree(target, repo=PUBLIC, profile="public")
     assert report.ok, report.errors
+
+
+def _dictionary_table(layout, unused):
+    """An op-latency table whose ``diagnostic`` column keeps ``unused`` only as an unreferenced dictionary value."""
+    dictionary = pa.array([unused, "public-benchmark", "public-benchmark"]).dictionary_encode()
+    if layout == "list":
+        column = pa.ListArray.from_arrays(pa.array([0, 1, 2], pa.int32()), dictionary.slice(1))
+    elif layout == "struct":
+        column = pa.StructArray.from_arrays([dictionary.slice(1)], names=["label"])
+    elif layout == "map":
+        column = pa.MapArray.from_arrays(pa.array([0, 1, 2], pa.int32()), pa.array(["a", "b"]), dictionary.slice(1))
+    else:  # an ordinary filter or slice, as in the review reproduction
+        column = dictionary.slice(1)
+    table = pa.table({"kernel_source": ["synthetic-kernel"] * 2, "latency_ms": [1.0, 2.0], "diagnostic": column})
+    assert unused not in json.dumps(table["diagnostic"].to_pylist())  # no visible row carries it
+    return table
+
+
+DICTIONARY_LAYOUTS = [
+    pytest.param("sliced", {}, id="sliced"),
+    pytest.param("sliced", {"row_group_size": 1}, id="chunked-row-groups"),
+    pytest.param("list", {}, id="list"),
+    pytest.param("struct", {}, id="struct"),
+    pytest.param("map", {}, id="map"),
+    # The embedded Arrow schema is absent: the file reads back as plain strings.
+    pytest.param("sliced", {"store_schema": False}, id="plain-strings"),
+]
+
+
+@pytest.mark.parametrize(("layout", "options"), DICTIONARY_LAYOUTS)
+@pytest.mark.parametrize(
+    ("unused", "code"),
+    [
+        ("https://node7.corp.nvidia.com/v1", "internal-host"),
+        ("hf_" + "a" * 34, "secret"),
+    ],
+    ids=["internal-url", "hf-token"],
+)
+def test_unused_dictionary_values_block_promotion_and_public_validation(tmp_path, layout, options, unused, code):
+    root, directory, relative = _op_mirror_table(tmp_path, _dictionary_table(layout, unused), **options)
+    # The file really stores the unreferenced value, although no visible row carries it.
+    schema = pq.ParquetFile(root / relative).schema
+    text_columns = [schema.column(i).path for i in range(len(schema)) if schema.column(i).physical_type == "BYTE_ARRAY"]
+    stored = pq.ParquetFile(root / relative, read_dictionary=text_columns).read()
+    stored_values = [d.to_pylist() for d in redaction._stored_dictionaries(stored["diagnostic"])]
+    assert unused in json.dumps(stored_values)
+    assert validate_tree(root, repo=INTERNAL_REPO).ok  # valid private data with a normal, readable table
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
+    assert not plan.content_ok and not plan.ok  # approval cannot override disclosure checks
+    found = [f for f in plan.findings if f.code == code and f.path == relative]
+    assert found and "column diagnostic (stored dictionary)" in found[0].message
+    assert any(f.code == code and f.path == relative for f in validate_tree(root, profile="public").errors)
+    target = _target(tmp_path)
+    with pytest.raises(PromotionError):
+        apply_promotion(plan, root, target)
+    assert not (target / relative).exists()
+
+
+@pytest.mark.parametrize(("layout", "options"), DICTIONARY_LAYOUTS)
+def test_clean_dictionary_columns_are_promoted_with_their_unused_values(tmp_path, layout, options):
+    root, directory, relative = _op_mirror_table(tmp_path, _dictionary_table(layout, "retired-benchmark"), **options)
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
+    assert plan.ok, plan.findings
+    target = _target(tmp_path)
+    apply_promotion(plan, root, target)
+    assert (target / relative).read_bytes() == (root / relative).read_bytes()
+    report = validate_tree(target, repo=PUBLIC, profile="public")
+    assert report.ok, report.errors
+
+
+def test_stored_dictionaries_cover_chunks_and_nested_dictionaries():
+    private = pa.array(["unused-a", "kept"]).dictionary_encode()
+    other = pa.array(["unused-b", "kept"]).dictionary_encode()
+    nested = pa.DictionaryArray.from_arrays(pa.array([0, 0], pa.int8()), pa.array([["unused-c"], ["kept"]]))
+    columns = {
+        "chunked": pa.chunked_array([private.slice(1), other.slice(1)]),
+        "list": pa.ListArray.from_arrays(pa.array([0, 1], pa.int32()), private.slice(1)),
+        "fixed": pa.FixedSizeListArray.from_arrays(private.slice(1), 1),
+        "struct": pa.StructArray.from_arrays([private.slice(1)], names=["v"]),
+        "map": pa.MapArray.from_arrays(pa.array([0, 1], pa.int32()), pa.array(["k"]), private.slice(1)),
+        "dictionary of lists": nested,
+    }
+    seen = {name: [d.to_pylist() for d in redaction._stored_dictionaries(array)] for name, array in columns.items()}
+    flat = {name: json.dumps(values) for name, values in seen.items()}
+    assert "unused-a" in flat["chunked"] and "unused-b" in flat["chunked"]
+    for name in ("list", "fixed", "struct", "map"):
+        assert "unused-a" in flat[name], name
+    assert "unused-c" in flat["dictionary of lists"]
 
 
 @pytest.mark.parametrize(

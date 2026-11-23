@@ -31,7 +31,7 @@ import base64
 import json
 import math
 import re
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -402,8 +402,65 @@ def _check_requests(path: Path, rel: str, policy: RedactionPolicy) -> list[Findi
     return _check_table_text(read_parquet(path, REQUESTS_SCHEMA), rel, policy, "request column", path=path)
 
 
+def _stored_dictionaries(array: pa.Array | pa.ChunkedArray) -> Iterator[pa.Array]:
+    """Every dictionary ``array`` stores, in all chunks and nested in lists, structs, maps and other dictionaries.
+
+    A dictionary keeps the values that no row references after filtering or slicing, and the Parquet writer
+    stores the whole dictionary, so reading the visible rows (``to_pylist``) does not cover everything a file holds.
+    """
+    if isinstance(array, pa.ChunkedArray):
+        for chunk in array.chunks:
+            yield from _stored_dictionaries(chunk)
+        return
+    dtype = array.type
+    if pa.types.is_dictionary(dtype):
+        yield array.dictionary
+        yield from _stored_dictionaries(array.dictionary)
+    elif pa.types.is_struct(dtype):
+        for index in range(dtype.num_fields):
+            yield from _stored_dictionaries(array.field(index))
+    elif pa.types.is_map(dtype):
+        yield from _stored_dictionaries(array.keys)
+        yield from _stored_dictionaries(array.items)
+    elif (
+        pa.types.is_list(dtype)
+        or pa.types.is_large_list(dtype)
+        or pa.types.is_fixed_size_list(dtype)
+        or pa.types.is_list_view(dtype)
+        or pa.types.is_large_list_view(dtype)
+    ):
+        yield from _stored_dictionaries(array.values)
+    elif isinstance(array, pa.ExtensionArray):
+        yield from _stored_dictionaries(array.storage)
+
+
+def _file_dictionaries(path: Path, footer: pq.FileMetaData) -> list[tuple[str, pa.Array]]:
+    """Dictionaries stored in the file, as ``(top-level column, dictionary)``, whatever its Arrow schema says.
+
+    A reader returns a plain string column unless the embedded Arrow schema names a dictionary, yet the dictionary
+    page itself keeps every value its writer put there. Reading the dictionary-encoded byte-array columns with
+    ``read_dictionary`` returns those pages as written.
+    """
+    encoded: dict[str, None] = {}
+    for group in range(footer.num_row_groups):
+        for index in range(footer.num_columns):
+            chunk = footer.row_group(group).column(index)
+            if chunk.has_dictionary_page and chunk.physical_type == "BYTE_ARRAY":
+                encoded[chunk.path_in_schema] = None
+    if not encoded:
+        return []
+    try:
+        table = pq.ParquetFile(path, read_dictionary=list(encoded)).read()
+    except pa.ArrowException as exc:  # unreadable pages cannot be vouched for; callers report a ValueError
+        raise ValueError(f"cannot inspect the stored dictionaries of {path.name}: {exc}") from exc
+    return [(name, dictionary) for name in table.column_names for dictionary in _stored_dictionaries(table[name])]
+
+
 def _check_table_text(table: pa.Table, rel: str, policy: RedactionPolicy, where: str, *, path: Path) -> list[Finding]:
-    """Scan metadata and text, including UTF-8 binary cells; undecodable bytes are invalid."""
+    """Scan metadata and text, including UTF-8 binary cells; undecodable bytes are invalid.
+
+    Stored dictionary values are text too: they are scanned like the visible cells of their column.
+    """
     footer = pq.ParquetFile(path).metadata
     out = scan_value(footer.created_by, policy, rel, "Parquet producer")
     # The footer's column-chunk ``file_path`` is readable text that the Arrow schema metadata does not carry.
@@ -462,11 +519,26 @@ def _check_table_text(table: pa.Table, rel: str, policy: RedactionPolicy, where:
             return [disclosure_value(item, dtype.value_type) for item in value]
         return value
 
+    # Dictionaries kept by the table itself and by the stored file, by top-level column.
+    stored: dict[str, list[pa.Array]] = {}
+    for name in table.column_names:
+        stored.setdefault(name, []).extend(_stored_dictionaries(table[name]))
+    for name, dictionary in _file_dictionaries(path, footer):
+        stored.setdefault(name, []).append(dictionary)
     for name in table.column_names:
         column = table.column(name)
         values = [disclosure_value(value, column.type) for value in column.to_pylist()]
-        if values:
-            out.extend(scan_value({name: values}, policy, rel, f"{where} {name}")[:1])
+        found = scan_value({name: values}, policy, rel, f"{where} {name}")[:1] if values else []
+        if not found:
+            # Not a visible cell: a value left in a dictionary that filtering or slicing stopped referencing.
+            dictionary_values = [
+                disclosure_value(value, dictionary.type)
+                for dictionary in stored.get(name, ())
+                for value in dictionary.to_pylist()
+            ]
+            if dictionary_values:
+                found = scan_value({name: dictionary_values}, policy, rel, f"{where} {name} (stored dictionary)")[:1]
+        out.extend(found)
     return out
 
 
