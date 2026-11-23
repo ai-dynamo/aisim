@@ -41,6 +41,32 @@ def _installed_wheel_namespace():
     return None
 
 
+# Pure-Python modules the dataset library imports from the package root, and the names it needs from the first.
+_SUPPORT_MODULES = ("quantization", "fpm_profile")
+_SUPPORT_NAMES = ("FpmDeploymentProfile", "FpmResourceProfile")
+
+
+def _bind_support_modules(aisim_core) -> None:
+    """Give the dataset library the profile models it imports when the installed wheel does not ship them.
+
+    A wheel whose ``fpm_profile`` already has the models is left alone: it is part of the SDK under test.
+    """
+    try:
+        import aisim_core.fpm_profile as installed
+
+        if all(hasattr(installed, name) for name in _SUPPORT_NAMES):
+            return
+    except ImportError:
+        pass
+    for name in _SUPPORT_MODULES:
+        full = f"aisim_core.{name}"
+        spec = importlib.util.spec_from_file_location(full, SOURCE / "aisim_core" / f"{name}.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[full] = module
+        spec.loader.exec_module(module)
+        setattr(aisim_core, name, module)
+
+
 def bind() -> None:
     try:
         import aisim_core
@@ -53,6 +79,7 @@ def bind() -> None:
     loaded = sys.modules.get("aisim_core.data")
     if loaded is not None and Path(loaded.__file__).resolve() == package / "__init__.py":
         return
+    _bind_support_modules(aisim_core)
     if loaded is not None:
         for name in [n for n in sys.modules if n == "aisim_core.data" or n.startswith("aisim_core.data.")]:
             del sys.modules[name]
