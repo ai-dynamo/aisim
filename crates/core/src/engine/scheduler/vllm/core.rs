@@ -1301,6 +1301,14 @@ impl VllmCore {
             })
     }
 
+    /// Park waiting `uuid` as a connector waiter that sleeps until transfer
+    /// progress, as a lookup deferred behind an in-flight store does.
+    #[cfg(test)]
+    pub(super) fn test_wait_for_transfer_progress(&mut self, uuid: Uuid) {
+        self.state.remove_from_waiting(uuid);
+        self.state.restore_connector_waiting_front(uuid, true);
+    }
+
     /// A G2 load of `uuid` is in flight or awaits admission.
     #[cfg(test)]
     pub(super) fn test_has_host_load(&self, uuid: Uuid) -> bool {
@@ -2382,10 +2390,6 @@ impl VllmCore {
     /// decision f + 2. An engine taking empty steps sees it when its copy
     /// ends.
     fn poll_completed_loads(&mut self, completed: Vec<CompletedLoad>) {
-        let now_ms = self
-            .native_host_offload
-            .as_ref()
-            .map_or(0.0, VllmHostOffloadAdapter::current_time_ms);
         for load in completed {
             let clock = self
                 .load_clock
@@ -2403,7 +2407,9 @@ impl VllmCore {
             self.pending_activations
                 .push((load.uuid, load.transfer_id, release));
         }
-        self.settle_loads_in_empty_steps(now_ms);
+        // Idleness is settled by the caller once this progress has also woken
+        // its connector waiters: a waiter it makes runnable keeps the engine
+        // busy, and the load on the poll path.
     }
 
     /// Load poll: the pass `index`, formed at `now_ms`, was decided at

@@ -4821,6 +4821,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transfer_progress_that_wakes_a_waiter_keeps_its_load_on_the_poll_path() {
+        // Request 9 decodes six tokens, one 10 ms pass after another. Restore
+        // A (request 3), issued by pass m, copies for 25 ms; request 8 waits
+        // for transfer progress, as a request whose lookup is deferred behind
+        // an in-flight store does. Request 9's last decode, m+3, ends at
+        // S(m)+40 with A's copy complete, and that boundary's progress also
+        // wakes request 8. Request 8 is runnable, so the engine takes no empty
+        // step: m+4 prefills it, its post-forward poll sees A, and A is
+        // schedulable at m+6. Deciding idleness before the wake released A at
+        // the boundary, beside request 8, with no poll after its copy.
+        let mut run = PollRun::storing(
+            G2Connector::OffloadingV032,
+            25.0,
+            false,
+            Some(PollRun::LAUNCH),
+            &[(1, 0..22)],
+        );
+        run.submit(9, (900..906).collect(), 6);
+        run.step();
+        run.step();
+        let m = run.passes.len();
+        run.submit(3, (0..22).collect(), 2);
+        run.submit(8, (3000..3008).collect(), 2);
+        let (load, waiter) = (Uuid::from_u128(3), Uuid::from_u128(8));
+        for _ in 0..4 {
+            run.core.test_wait_for_transfer_progress(waiter);
+            run.step();
+        }
+        assert_eq!(run.passes.len(), m + 4, "request 9's last decode ran");
+        assert!(run.core.test_awaits_poll(load), "the copy completed");
+        assert_eq!(
+            run.core.test_unseen_idle_release_ms(load),
+            None,
+            "the woken waiter keeps the load on the poll path"
+        );
+        for _ in 0..4 {
+            run.step();
+        }
+        assert_eq!(admitted_in(&run, 8), Some(m + 4));
+        assert_eq!(admitted_in(&run, 3), Some(m + 6));
+        for _ in 0..16 {
+            if run.core.is_empty() && !run.core.is_ready() {
+                break;
+            }
+            run.step();
+        }
+        assert!(run.core.is_drained(), "every restore and store completes");
+    }
+
     /// The pass that admitted `id`, if any.
     fn admitted_in(run: &PollRun, id: u128) -> Option<usize> {
         let uuid = Uuid::from_u128(id);
