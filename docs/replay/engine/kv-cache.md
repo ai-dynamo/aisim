@@ -1000,7 +1000,8 @@ Replay does not preempt the request in such a pool, and the request completes.
 Replay keeps the hold of one step for a state cache. The comparison above is
 for requests without speculative decoding. A
 [grouped cache](#other-cache-modes) holds these blocks as vLLM does on an
-aggregated worker.
+aggregated worker, except in a layout with a prefix-cacheable `state` group
+whose block is below the block of a full-attention group.
 
 ### State pool from recorded runtime memory
 
@@ -1312,7 +1313,10 @@ sub-block matching without an explicit full-state scratch count.
     aggregated worker replay then keeps the previous state block, the cached
     block of a hit on a block boundary, the copy block of a hit inside a
     block, the checkpoint block and the blocks that left a sliding window
-    one step longer, as vLLM does. A prefill or decode worker frees them on
+    one step longer, as vLLM does, in a layout in which every
+    prefix-cacheable `state` group has a block at or above the block of
+    every full-attention group (the second item of the known differences
+    below gives the other layouts). A prefill or decode worker frees them on
     the computed token count (the first item of the known differences
     below). A request can then hold one block per prefix-cacheable state
     group more than vLLM's startup check reserves, `2 + c` with `c` the
@@ -1334,7 +1338,8 @@ sub-block matching without an explicit full-state scratch count.
     cached block at its first later allocation whose processed token count
     lies past the hit, as vLLM does. That is the next step with
     `async_scheduling: false`, and on an aggregated worker one step later
-    when the step before is still in flight. A prefill or decode worker
+    when the step before is still in flight, in the layouts of the rule
+    above. A prefill or decode worker
     releases it at the next step in both modes (the first item of the known
     differences below). The block stays cached until eviction. See vLLM
     v0.31.0
@@ -1380,7 +1385,8 @@ sub-block matching without an explicit full-state scratch count.
     request takes that block in the chunk that reaches the end of its prefill.
     It releases the block at its first later allocation after the chunk is
     processed: the next step with `async_scheduling: false`, and on an
-    aggregated worker one step later with a step in flight. A prefill or
+    aggregated worker one step later with a step in flight, in the layouts of
+    the rule above. A prefill or
     decode worker releases it at the next step in both modes. As in vLLM, the
     prefill of a request that
     resumes after a preemption ends one token before its last known token,
@@ -1401,7 +1407,7 @@ sub-block matching without an explicit full-state scratch count.
     option is unset and the configuration allows it (see
     [vLLM async scheduling](workers.md#vllm-async-scheduling)), and then hold
     these blocks one step longer. With async scheduling an aggregated worker
-    holds these blocks as vLLM does. A prefill worker and a decode worker
+    holds these blocks as vLLM does, except in the layouts of the next item. A prefill worker and a decode worker
     hold them for one scheduler step, because vLLM pairs the longer hold with
     a stop on a worker with a consumer connector, which replay does not
     model. There replay also releases window blocks on the computed token
@@ -1415,6 +1421,21 @@ sub-block matching without an explicit full-state scratch count.
     can then go first, and a later hit can be shorter or longer than in vLLM.
     With `async_scheduling: false` these blocks are held for one step in vLLM
     too.
+  - In a layout with a prefix-cacheable `state` group whose block is below
+    the block of a full-attention group, such as a state block of 2 tokens
+    beside a full-attention block of 8 tokens, an aggregated worker frees
+    these blocks on the computed token count, one step earlier than vLLM
+    with async scheduling. A ring and a sliding-window group do not count.
+    In such a layout, with async scheduling and a pool of exactly vLLM's
+    startup count, vLLM itself can starve a request: while one chunk of the
+    request is in flight, its next chunk needs one more state block than the
+    pool has, so the request preempts itself, and its next life hits the
+    same tokens again, because the full-attention block of that chunk is
+    not full and has no key. A replay that followed vLLM there would not
+    end. So replay completes requests that vLLM starves in such a layout,
+    and in a pool near the startup count it can count fewer preemptions than
+    vLLM. The GLM-5.3-Flash groups have one block size and keep the longer
+    hold.
   - Replay releases held blocks in another order than vLLM in two cases.
     When one allocation releases a checkpoint block and a previous state
     block that a crossing after the checkpoint step left, replay releases the
