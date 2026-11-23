@@ -575,6 +575,7 @@ def test_raw_output_and_log_with_the_same_name_have_distinct_verified_bytes(tmp_
                 "raw_artifact_id": "raw-output:same",
                 "log_artifact_id": "log:same",
                 "record_sha256": hashlib.sha256(raw).hexdigest(),
+                "raw_record_sha256": hashlib.sha256(raw).hexdigest(),  # the raw check prefers this digest
                 "evidence_refs": [],
             }
         )
@@ -615,7 +616,7 @@ def test_snapshot_paths_are_validated_before_any_table_write(tmp_path, monkeypat
 
 @pytest.mark.parametrize("name", ["../escape", "../../escape", "/tmp/escape", "a\\escape"])
 def test_provenance_names_are_validated_before_writing(tmp_path, name):
-    with pytest.raises(ValueError, match="path component"):
+    with pytest.raises(ValueError, match="relative path"):
         store_provenance(tmp_path, "d", ProvenanceFile("log", b"bytes", name=name))
     assert not list(tmp_path.iterdir())
 

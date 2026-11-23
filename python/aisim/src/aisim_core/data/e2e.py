@@ -61,7 +61,7 @@ import typing
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -768,18 +768,6 @@ def _gzip(data: bytes) -> bytes:
     return gzip.compress(data, compresslevel=6, mtime=0)  # fixed mtime keeps bytes deterministic
 
 
-def _write_path(root: Path, relative: str) -> Path:
-    """Apply the artifact path rules before any write, including through existing symlink parents."""
-    path = Path(root)
-    for part in PurePosixPath(_relative(relative)).parts:
-        path = path / part
-        if path.is_symlink():
-            raise ValueError(f"symlink in dataset path: {relative}")
-    if not path.absolute().is_relative_to(Path(root).absolute()):
-        raise ValueError(f"dataset path leaves its root: {relative}")
-    return path
-
-
 def store_provenance(root: Path, directory: str, item: ProvenanceFile) -> tuple[Artifact, ProvenanceInfo]:
     """Write one compressed provenance artifact under ``root/directory/provenance/``.
 
@@ -797,7 +785,9 @@ def store_provenance(root: Path, directory: str, item: ProvenanceFile) -> tuple[
         kept = full[:LOG_EXCERPT_BYTES] + TRUNCATION_MARKER + full[-LOG_EXCERPT_BYTES:]
         truncated = True
     full_sha = _sha(full)
-    name = path_component(
+    # The kind prefixes the stored file so a raw output and a log of one name keep distinct bytes. A name may be
+    # nested but never leaves its provenance directory.
+    name = _relative(
         item.name or f"{item.kind}-{(item.observation_id or full_sha[:12]).replace(':', '_').replace('/', '_')}"
     )
     relative = f"{directory}/provenance/{item.kind}-{name}.gz"
@@ -991,9 +981,6 @@ def _publish_staged(stage: Path, root: Path, relatives: Sequence[str]) -> None:
     """
     if len(set(relatives)) != len(relatives):
         raise ValueError("duplicate publication destination")
-    for relative in relatives:
-        _write_path(stage, relative)
-        _write_path(root, relative)
     done: list[tuple[Path, Path | None]] = []
     for relative in relatives:
         _destination(stage, relative)
