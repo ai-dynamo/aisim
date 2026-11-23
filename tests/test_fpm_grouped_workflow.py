@@ -2273,16 +2273,18 @@ def test_grouped_sweeper_loads_the_profile_once_per_candidate(grouped_case, monk
     from aisim.sweeper.config import SearchSpace
     from aisim.sweeper.parallel_enum import DisaggParallelConfig, ParallelShape, ReplicaParallelConfig
     from aisim.sweeper.sample import unroll_sample
-    from aisim_core.sdk import fpm_profile
+    from aisim_core.fpm_profile import FpmModelProfile
+    from aisim_core.sdk.fpm_profile import load_fpm_profile as load
 
+    # Every name of the loader ends in this one validation, so the count sees a load through any of them.
     loads = []
-    load = fpm_profile.load_fpm_profile
+    validate = FpmModelProfile.model_validate
 
-    def counted(value):
+    def counted(cls, value, **kwargs):
         loads.append(value)
-        return load(value)
+        return validate(value, **kwargs)
 
-    monkeypatch.setattr(fpm_profile, "load_fpm_profile", counted)
+    monkeypatch.setattr(FpmModelProfile, "model_validate", classmethod(counted))
     profile, root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile))
     sample = _grouped_agg_sample(profile, root, 128)
@@ -2351,7 +2353,7 @@ def test_a_build_error_outside_the_prefix_caching_rules_stays_failed(grouped_cas
     assert not isinstance(error.value, deploy.InfeasibleEngineSetting)
     # A profile that the loader refuses is a fault of the inputs too.
     refused = {**sample, "fpm_profile": {**sample["fpm_profile"], "context_length": 0}}
-    with pytest.raises(ValidationError, match="context_length") as error:
+    with pytest.raises(ValueError, match="context_length") as error:
         deploy.build_backend_deployment(refused, backend_version="0.31.0")
     assert not isinstance(error.value, deploy.InfeasibleEngineSetting)
 
