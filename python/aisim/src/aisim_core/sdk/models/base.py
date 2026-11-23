@@ -50,6 +50,8 @@ class _OperationList(list):
 
     Both phase lists share the counter. It has no back-reference to the model,
     and deepcopy/pickle preserve the sharing in a restored model.
+    Callback-capable edits invalidate before and after the change so reentrant
+    estimates cannot retain an intermediate graph.
     """
 
     def __init__(self, values, revision):
@@ -63,44 +65,71 @@ class _OperationList(list):
 
     def __setitem__(self, key, value):
         self._changed()
-        return super().__setitem__(key, value)
+        try:
+            return super().__setitem__(key, value)
+        finally:
+            self._changed()
 
     def __delitem__(self, key):
         self._changed()
-        return super().__delitem__(key)
+        try:
+            return super().__delitem__(key)
+        finally:
+            self._changed()
 
     def __iadd__(self, values):
         self._changed()
-        return super().__iadd__(values)
+        try:
+            return super().__iadd__(values)
+        finally:
+            self._changed()
 
     def __imul__(self, count):
         self._changed()
-        return super().__imul__(count)
+        try:
+            return super().__imul__(count)
+        finally:
+            self._changed()
 
     def append(self, value):
         self._changed()
         return super().append(value)
 
     def extend(self, values):
-        # Invalidate first: an iterator can raise after yielding some values.
+        # Iteration can estimate an intermediate graph, then yield more or raise.
         self._changed()
-        return super().extend(values)
+        try:
+            return super().extend(values)
+        finally:
+            self._changed()
 
     def insert(self, index, value):
         self._changed()
-        return super().insert(index, value)
+        try:
+            return super().insert(index, value)
+        finally:
+            self._changed()
 
     def pop(self, index=-1):
         self._changed()
-        return super().pop(index)
+        try:
+            return super().pop(index)
+        finally:
+            self._changed()
 
     def remove(self, value):
         self._changed()
-        return super().remove(value)
+        try:
+            return super().remove(value)
+        finally:
+            self._changed()
 
     def clear(self):
         self._changed()
-        return super().clear()
+        try:
+            return super().clear()
+        finally:
+            self._changed()
 
     def reverse(self):
         self._changed()
@@ -108,7 +137,10 @@ class _OperationList(list):
 
     def sort(self, *, key=None, reverse=False):
         self._changed()
-        return super().sort(key=key, reverse=reverse)
+        try:
+            return super().sort(key=key, reverse=reverse)
+        finally:
+            self._changed()
 
 
 def register_model(*families: str):
@@ -225,8 +257,10 @@ class BaseModel:
 
     @context_ops.setter
     def context_ops(self, value):
+        replacement = _OperationList(value, self._aic_op_list_revision)
+        self.__dict__["context_ops"] = replacement
+        # Materialization may estimate the old graph before installation.
         self.__dict__.pop("_aic_engine_identity_memo", None)
-        self.__dict__["context_ops"] = _OperationList(value, self._aic_op_list_revision)
 
     @property
     def generation_ops(self):
@@ -234,8 +268,10 @@ class BaseModel:
 
     @generation_ops.setter
     def generation_ops(self, value):
+        replacement = _OperationList(value, self._aic_op_list_revision)
+        self.__dict__["generation_ops"] = replacement
+        # Materialization may estimate the old graph before installation.
         self.__dict__.pop("_aic_engine_identity_memo", None)
-        self.__dict__["generation_ops"] = _OperationList(value, self._aic_op_list_revision)
 
     @property
     def verify_width(self) -> int:

@@ -5505,6 +5505,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn qualified_mamba_packed_attention_divisor_handles_large_prefill() {
+        let engine = qualified_mamba_engine(0);
+        for tokens in [16, 2_147_483_649] {
+            for chunks in [None, Some(vec![[1, tokens, 1]])] {
+                let metrics = ForwardPassMetrics {
+                    scheduled_requests: crate::ScheduledRequestMetrics {
+                        num_prefill_requests: 1,
+                        sum_prefill_tokens: tokens,
+                        sum_prefill_kv_tokens: 1,
+                        num_decode_requests: 1,
+                        sum_decode_kv_tokens: 8,
+                        prefill_chunks: chunks,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                // The combined count fits u32, but tokens + tokens - 1 does
+                // not. Even without context attention, its divisor is computed.
+                // Each token transfers 18,560 activation bytes. The prefill
+                // and width-one decode each read and write one 1 MiB state.
+                let bytes = (f64::from(tokens) + 1.0) * 18_560.0 + 4_194_304.0;
+                let expected = bytes / engine.db.system_spec.gpu.mem_bw * 1000.0;
+                let got = engine.forward_pass_time_ms(&[metrics]).unwrap();
+                assert!((got - expected).abs() < expected * 1e-12);
+            }
+        }
+    }
+
+    #[test]
     fn qualified_mamba_mixed_steps_preserve_prefill_and_decode_shapes() {
         let mut engine = build_engine(Some(3));
         engine.context_ops = vec![qualified_mamba(true, 1)];

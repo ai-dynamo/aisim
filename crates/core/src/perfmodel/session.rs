@@ -837,7 +837,7 @@ pub(crate) fn get_mix_step_ops<'a>(
     // whenever the count does not divide `ctx_tokens`.
     let isl_eff_pass2 = new_tokens_per_prefill_req.max(1);
     let ctx_attn_batch = prefill_batch.max(1);
-    let scale_factor = ((isl_eff_pass2 + ctx_tokens - 1) / ctx_tokens.max(1)).max(1) as f64;
+    let scale_factor = isl_eff_pass2.div_ceil(ctx_tokens.max(1)).max(1) as f64;
     let mut memo = QueryMemo::new(context_plan, context_ops);
     for (index, op) in context_ops.iter().enumerate() {
         if !in_packed_attention_pass(op) {
