@@ -317,9 +317,19 @@ def _check_eval(root: Path, report: TreeReport, declared: set[str]) -> None:
         verified[(path.parent, record.record_id)] = (rel, record)
         declared.add(rel)
         report.eval_records += 1
+    successors: dict[tuple[Path, str], list[tuple[str, str]]] = {}
     for (directory, _), (rel, record) in verified.items():
         if record.supersedes is not None and (directory, record.supersedes) not in verified:
             report.add("eval-predecessor-missing", "superseded record must be verified in the same directory", rel)
+        if record.supersedes is not None:
+            successors.setdefault((directory, record.supersedes), []).append((rel, record.record_id))
+    # Two branches can each publish a valid successor of one record and then merge: both files stay, because their
+    # names differ, and the catalog would count the same evaluation twice. A linear history has one per record.
+    for (_, predecessor), found in successors.items():
+        if len(found) > 1:
+            ids = ", ".join(sorted(record_id for _, record_id in found))
+            for rel, _ in sorted(found):
+                report.add("eval-competing-successors", f"record {predecessor} has competing successors: {ids}", rel)
 
 
 def snapshot_documents(root: Path, paths: Iterable[str]) -> set[str]:

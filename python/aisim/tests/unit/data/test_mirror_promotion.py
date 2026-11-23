@@ -3999,6 +3999,37 @@ def test_category_indexes_must_be_dataset_payloads(tmp_path, monkeypatch, profil
     assert report.ok == (not location.startswith(".git/")), report.errors
 
 
+def test_competing_eval_successors_of_one_record_are_reported(tmp_path):
+    from aisim_core.data.eval import current_records, load_record, record_path
+
+    root, manifests = _mirror(tmp_path)
+    first_path = _eval(root, [load_e2e(root, manifests[0]).manifest.configuration_id])
+    first = load_record(first_path)
+    # A linear history of three records is valid: each record has exactly one successor.
+    second = first.model_copy(update={"supersedes": first.record_id, "created_at": "2026-11-08T00:00:00Z"})
+    write_record(root, second)
+    third = second.model_copy(update={"supersedes": second.record_id, "created_at": "2026-11-09T00:00:00Z"})
+    third_path = write_record(root, third)
+    build_catalog(root)
+    assert validate_tree(root).ok, validate_tree(root).errors
+    assert [r.record_id for r in current_records(first_path.parent)] == [third.record_id]
+    # Another branch published its own successor of the same record. Merging keeps both files: their names differ.
+    producer = second.producer.model_copy(update={"name": "another branch"})
+    rival = third.model_copy(update={"producer": producer})
+    rival_path = record_path(root, rival)
+    rival_path.write_text(json.dumps(rival.model_dump(by_alias=True, mode="json"), indent=2, sort_keys=True) + "\n")
+    report = validate_tree(root)
+    conflicts = [f for f in report.errors if f.code == "eval-competing-successors"]
+    assert {f.path for f in conflicts} == {
+        rival_path.relative_to(root).as_posix(),
+        third_path.relative_to(root).as_posix(),
+    }
+    for finding in conflicts:
+        assert second.record_id in finding.message and third.record_id in finding.message
+        assert rival.record_id in finding.message
+    assert not report.ok
+
+
 @pytest.mark.parametrize("predecessor", ["valid", "missing", "invalid"])
 def test_eval_successor_requires_verified_local_predecessor(tmp_path, predecessor):
     from aisim_core.data.eval import load_record
