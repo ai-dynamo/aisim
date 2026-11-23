@@ -131,7 +131,7 @@ def test_cli_worker_exit_fails_without_publishing_partial_results(case, tmp_path
             cli.installed_distribution = lambda: SimpleNamespace(
                 read_text=lambda _: json.dumps({"archive_info": {"hashes": {"sha256": digest}}})
             )
-            cli.HfDataset.from_hub = lambda **_: SimpleNamespace(
+            cli.HfDataset.from_hub = lambda *_, **__: SimpleNamespace(
                 revision="a" * 40,
                 configurations=lambda: [case.configuration],
                 measurement_case=lambda *a, **kw: case,
@@ -180,7 +180,7 @@ def test_cli_duplicate_comparison_identity_cannot_publish_partial_results(case, 
     monkeypatch.setattr(
         cli.HfDataset,
         "from_hub",
-        lambda **_: SimpleNamespace(
+        lambda *_, **__: SimpleNamespace(
             revision="a" * 40,
             configurations=lambda: configurations,
             measurement_case=lambda *args, **kwargs: case,
@@ -227,6 +227,107 @@ def test_cli_duplicate_comparison_identity_cannot_publish_partial_results(case, 
     assert not comparison.exists()
 
 
+@pytest.mark.parametrize(
+    "extra,error",
+    [
+        (["--configuration", CONFIGURATION_PATH], None),  # filters after loading, as it always did
+        (["--configuration", "fixture/unknown"], "unknown smoke configuration"),
+        (["--model", "Org/Model"], "--model and --hardware need the unified dataset layout"),
+        (["--hardware", "h100_sxm"], "--model and --hardware need the unified dataset layout"),
+    ],
+)
+def test_cli_selects_from_a_legacy_local_snapshot_after_loading(tmp_path, monkeypatch, extra, error):
+    from scripts.fpm_accuracy import run_fpm_accuracy as cli
+
+    legacy = tmp_path / "legacy"
+    content = "\n".join(json.dumps(_fpm_payload(counter=index, wall_time=0.01)) for index in range(12)).encode()
+    _build_dataset(legacy, protocol_id="forward-pass-measurement-v1", files=[("truth", "traffic.jsonl", content)])
+    wheel = tmp_path / "fixture.whl"
+    wheel.write_bytes(b"synthetic wheel identity for legacy selection test")
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    monkeypatch.setattr(cli, "runtime_module", lambda _: SimpleNamespace(RustForwardPassPerfModel=object()))
+    monkeypatch.setattr(
+        cli,
+        "installed_distribution",
+        lambda: SimpleNamespace(read_text=lambda _: json.dumps({"archive_info": {"hashes": {"sha256": digest}}})),
+    )
+    evaluated = []
+
+    class Stop(Exception):
+        pass
+
+    def evaluate(case, *_):
+        evaluated.append(case.configuration.configuration_path)
+        raise Stop
+
+    monkeypatch.setattr(cli, "evaluate_isolated", evaluate)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_fpm_accuracy", "--branch", "main", "--commit", "a" * 40, "--evaluator-sha", "a" * 40]
+        + ["--hf-revision", "a" * 40, "--wheel", str(wheel), "--run-id", "1", "--run-attempt", "1"]
+        + ["--output", str(tmp_path / "public"), "--local-dataset", str(legacy), *extra],
+    )
+    if error is None:
+        with pytest.raises(Stop):
+            cli.main()
+        assert evaluated == [CONFIGURATION_PATH]
+    else:
+        with pytest.raises(ValueError, match=error):
+            cli.main()
+        assert not evaluated
+
+
+def test_cli_accepts_explicit_configurations_that_the_model_filter_drops(case, tmp_path, monkeypatch):
+    from scripts.fpm_accuracy import run_fpm_accuracy as cli
+
+    wheel = tmp_path / "fixture.whl"
+    wheel.write_bytes(b"synthetic wheel identity for model-filter test")
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    monkeypatch.setattr(cli, "runtime_module", lambda _: SimpleNamespace(RustForwardPassPerfModel=object()))
+    monkeypatch.setattr(
+        cli,
+        "installed_distribution",
+        lambda: SimpleNamespace(read_text=lambda _: json.dumps({"archive_info": {"hashes": {"sha256": digest}}})),
+    )
+    requested = {}
+
+    def from_hub(*args, **kwargs):
+        requested.update(kwargs)
+        # The unified catalog validated both paths; the model filter left only the first.
+        return SimpleNamespace(
+            revision="a" * 40,
+            layout="unified",
+            configurations=lambda: [case.configuration],
+            measurement_case=lambda *a, **k: case,
+        )
+
+    monkeypatch.setattr(cli.HfDataset, "from_hub", from_hub)
+    evaluated = []
+
+    class Stop(Exception):
+        pass
+
+    def evaluate(selected, *_):
+        evaluated.append(selected.configuration.configuration_path)
+        raise Stop
+
+    monkeypatch.setattr(cli, "evaluate_isolated", evaluate)
+    second = "data/Other--Model/h100-sxm/vllm/1.0/single"
+    arguments = ["--configuration", CONFIGURATION_PATH, "--configuration", second, "--model", "Org/Model"]
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_fpm_accuracy", "--branch", "main", "--commit", "a" * 40, "--evaluator-sha", "a" * 40]
+        + ["--hf-revision", "a" * 40, "--wheel", str(wheel), "--run-id", "1", "--run-attempt", "1"]
+        + ["--output", str(tmp_path / "public"), *arguments],
+    )
+    with pytest.raises(Stop):
+        cli.main()
+    assert evaluated == [CONFIGURATION_PATH]
+    assert requested["configuration_paths"] == [CONFIGURATION_PATH, second] and requested["models"] == ["Org/Model"]
+
+
 @pytest.mark.parametrize("namespace", ["aisim_core", "aisimulate_core"])
 def test_fpm_predictor_reaches_current_and_historical_runtime_namespaces(tmp_path, namespace):
     package = tmp_path / namespace
@@ -263,14 +364,22 @@ def test_fpm_predictor_reaches_current_and_historical_runtime_namespaces(tmp_pat
 
 
 @pytest.mark.parametrize("method", ["warmup", "learned"])
-@pytest.mark.parametrize("failure", ["missing_export", "initialization_error"])
+@pytest.mark.parametrize("failure", ["missing_export", "initialization_error", "late_import_error"])
 def test_predictor_export_absence_preserves_scoring_classification(case, monkeypatch, method, failure):
     from scripts.fpm_accuracy.evaluate import score
     from scripts.fpm_accuracy.models import learned_predictor
 
+    calls = []
+
     def load_runtime(name):
+        calls.append(name)
         if failure == "initialization_error":
             raise AttributeError("unrelated module initialization failure")
+        if failure == "late_import_error" and len(calls) > 1:
+            # The SDK imports once, then a later lazy import cannot load its native runtime.
+            raise ModuleNotFoundError("import of aisim._runtime halted")
+        if failure == "late_import_error":
+            return SimpleNamespace(RustForwardPassPerfModel=SimpleNamespace(), ForwardPassPerfModelConfig=None)
         return SimpleNamespace()
 
     adapter = aic_predictors if method == "warmup" else learned_predictor
@@ -662,6 +771,7 @@ def recommended_regression_config():
 @pytest.mark.parametrize("dcp", [1, 8])
 @pytest.mark.parametrize("role", ["prefill", "decode", "aggregated"])
 def test_real_regression_uses_recommended_gym_config_only(tmp_path, dcp, role, recommended_regression_config):
+    pytest.importorskip("aisim._runtime")
     sdk = pytest.importorskip("aisim_core.sdk")
     from scripts.fpm_accuracy.models.fpt_predictor import PredictorContext
 
@@ -698,6 +808,7 @@ def test_real_regression_uses_recommended_gym_config_only(tmp_path, dcp, role, r
     "grid_options,bins", [({}, [4, 1]), ({"bucket_count": 9}, [3, 3]), ({"bucket_shape": [2, 3]}, [2, 3])]
 )
 def test_real_regression_preserves_explicit_controls(case, grid_options, bins, recommended_regression_config):
+    pytest.importorskip("aisim._runtime")
     pytest.importorskip("aisim_core.sdk")
     from scripts.fpm_accuracy.models.fpt_predictor import PredictorContext
 
@@ -736,6 +847,7 @@ def test_real_regression_preserves_explicit_controls(case, grid_options, bins, r
     ],
 )
 def test_real_regression_preserves_explicit_canonical_sampling(case, sampling, recommended_regression_config):
+    pytest.importorskip("aisim._runtime")
     sdk = pytest.importorskip("aisim_core.sdk")
     from scripts.fpm_accuracy.models.fpt_predictor import PredictorContext
 
@@ -760,6 +872,7 @@ def test_real_regression_preserves_explicit_canonical_sampling(case, sampling, r
 
 @pytest.mark.parametrize("options", [{"bucket_count": 9}, {"bucket_shape": [3, 2]}])
 def test_real_regression_rejects_conflicting_canonical_and_legacy_grids(case, options):
+    pytest.importorskip("aisim._runtime")
     pytest.importorskip("aisim_core.sdk")
     from scripts.fpm_accuracy.models.fpt_predictor import PredictorContext
 
@@ -776,6 +889,7 @@ def test_real_regression_rejects_conflicting_canonical_and_legacy_grids(case, op
 
 
 def test_worker_regression_reports_resolved_native_grid(case):
+    pytest.importorskip("aisim._runtime")
     pytest.importorskip("aisim_core.sdk")
     from scripts.fpm_accuracy.evaluate import create_predictor
     from scripts.fpm_accuracy.models.fpt_predictor import PredictorContext
@@ -791,6 +905,7 @@ def test_worker_regression_reports_resolved_native_grid(case):
 
 
 def test_worker_regression_preserves_canonical_sampling_and_explicit_options(case):
+    pytest.importorskip("aisim._runtime")
     pytest.importorskip("aisim_core.sdk")
     from scripts.fpm_accuracy.evaluate import create_predictor
     from scripts.fpm_accuracy.models.fpt_predictor import PredictorContext
@@ -829,6 +944,7 @@ def test_predictor_uses_canonical_api_or_older_wheel_adapter(case, tmp_path, mon
     from scripts.fpm_accuracy.models.fpt_predictor import PredictorContext
 
     if canonical:
+        pytest.importorskip("aisim._runtime")
         pytest.importorskip("aisim_core.sdk")
     else:
         monkeypatch.setattr(aic_predictors, "_canonical_config_type", lambda: None)

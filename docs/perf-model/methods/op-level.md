@@ -35,9 +35,9 @@ cross-shape or cross-precision transfer must retain its transfer provenance.
 
 ### Context-attention measurement boundaries
 
-TRT-LLM `torch_flow` context-attention rows produced by `1.3.0rc20` and
-`1.3.0rc29` time the attention forward with internal RoPE and both K/V-cache
-writes. The estimator therefore does not add separate RoPE or KV-write costs
+TRT-LLM `torch_flow` context-attention rows produced by `1.3.0rc20`,
+`1.3.0rc29` and `1.4.0rc2` time the attention forward with internal RoPE and
+both K/V-cache writes. The estimator therefore does not add separate RoPE or KV-write costs
 on top of these timings. Q/K normalization remains a separate estimate.
 
 This decision follows the stored framework, version, and selected kernel lane,
@@ -189,6 +189,30 @@ Public and private repositories use the same additive `catalog/dataset.json`
 contract (`aisim-dataset-index/v1`). Category entries reference hashed indexes;
 `aisim-category-index/v1` lists configuration identities and hashed manifests.
 Repository identity and authentication do not change the schema.
+
+Catalog shards use `aisim-catalog/v2`, which adds `acc_prediction_fingerprint`
+to bind the latest accuracy to its prediction code, spec and profiles. New readers
+also accept v1 shards, returning null for the absent fingerprint. Older v1 readers
+reject v2 by its schema ID; rebuild catalogs with the upgraded writer to migrate.
+The published v1 schema remains unchanged.
+
+The coverage catalog normally crosses the models and frameworks found in the dataset.
+`build_catalog(expected_models=..., expected_frameworks=...)` can widen that universe;
+with `write=True` (the default), the builder saves the declaration in
+`catalog/coverage.json` (`aisim-catalog-coverage/v1`)
+so subsequent builds and mirror/public validation reproduce the same missing cells.
+With `write=False`, it returns rows without saving the declaration. The builder
+rejects projected coverage grids above 100,000 rows, including all hardware,
+before expanding model and framework combinations.
+
+| Coverage field | Contract |
+| --- | --- |
+| `schema_version` | `aisim-catalog-coverage/v1`. |
+| `expected_models` | Additional model IDs to include even without measured data. |
+| `expected_frameworks` | Additional framework IDs to include even without measured data. |
+
+Omitted builder arguments reuse the saved declaration; an explicit empty iterable clears that
+dimension. A missing declaration preserves the default universe. Invalid declarations fail validation.
 
 Operation tables live under
 `data/op-latency/<hardware>/<operation-family>/<framework>/<version>/`.

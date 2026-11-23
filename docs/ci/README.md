@@ -373,17 +373,33 @@ explicit exception and its workflow contract test.
 16 frozen queries on B200: eight vLLM 0.24.0 queries for dense Qwen3-32B and
 MoE MiniMax-M2.5, plus four Qwen3-32B queries each for TRT-LLM 1.3.0rc20 and
 SGLang 0.5.14. Every backend covers prefill/decode and short/long sequences.
+These collections are frozen data coordinates outside the queryable version
+slots; the script admits them for its own queries, so promoting a newer
+collection changes neither the expected values nor the query inputs.
 The [manifest](../../.github/prediction-numerical-sentinels.json)
-records a full baseline commit that must resolve in the checkout. Fast CI and
-the numerical-check job explicitly fetch that SHA from `origin` if missing;
-full branch history alone can omit a baseline from a squashed PR. Fetch or
-commit-validation failures remain errors. Fetch-only mode does not load the
-AISim runtime; the subsequent checks validate the complete manifest.
-To prepare a checkout locally, run:
+records each query's inputs and expected value, but no source commit: a commit
+from a squashed PR branch is not on `main`, and a mirror without the PR refs
+cannot fetch it. In a clone with full history,
+`git log -p -- .github/prediction-numerical-sentinels.json` shows each change
+to the expected values and the PR that made it; that PR holds the evidence of
+how its values were produced. The current values come from:
 
-```sh
-python scripts/prediction_regression/check_prediction_numerics.py --fetch-baseline-only
-```
+| PR | Values |
+| --- | --- |
+| #187 | the eight vLLM cases |
+| #244 | the four MiniMax values, changed (see below) |
+| #261 | the four TRT-LLM and four SGLang Qwen3-32B cases, added (see below) |
+| #728 | the two TRT-LLM Qwen3-32B prefill values, changed |
+
+Full CI runs this check (`engine-golden-regression`) on every push to `main`
+and `release/*` and on every manual dispatch, because those runs select all
+components. On a trusted PR copy (`pull-request/*`), it runs only when
+`scripts/ci/select_full_ci.py` selects it: for Rust code, prediction or engine
+code, and collector or performance data, and whenever the selector falls back
+to the full matrix (a CI or shared repository contract change, an unclassified
+path such as this manifest, or more than 3000 changed files). A PR copy that
+changes only documentation skips it. A pass means the values hold within
+tolerance, not that they reproduce exactly.
 
 Tolerances are 2% relative and 0.0001 ms absolute. Missing, duplicate, failed, nonfinite,
 nonpositive, or out-of-tolerance results fail. Intentional modeling changes
@@ -411,12 +427,18 @@ prediction-stability values, not measured whole-model accuracy.
 
 After the PR #244 squash merge, its original baseline commit was no longer
 reachable in fresh CI checkouts. All eight sentinels were revalidated at
-`ba64235a645580a8a1b20a424fffef6514ff0103`; the manifest now references that
-permanent main-branch merge commit, which survives subsequent squash merges.
-Expected values, query inputs, and tolerances are unchanged.
+`ba64235a645580a8a1b20a424fffef6514ff0103`, the PR #244 squash commit on
+`main`, with unchanged expected values, query inputs, and tolerances. On `main`,
+the manifest recorded `a4c77310` (PR #187, a `main` commit), then commits from
+the squashed branches of PR #244 (`af91885d`), PR #261 (`d066e918`) and
+PR #728 (`fc6e26a8`). A fresh checkout reaches those only by fetching the PR's
+commit by SHA, which fails in a mirror without those PR refs, so the manifest
+no longer records a commit.
 
-The 16-case manifest was reproduced from runtime and packaged data at
-`d066e918705b98e2d55eed55743ce8d225f129ea`. The original eight vLLM values
+When PR #261 extended the manifest to 16 cases, the values were reproduced from
+runtime and packaged data at `d066e918705b98e2d55eed55743ce8d225f129ea`, a
+commit on that PR's branch. PR #728 later changed two of them; the other 14
+values are still those of that reproduction. The original eight vLLM values
 were reproduced exactly and retained unchanged. The eight added backend values
 use the same four dense-model query shapes and SILICON mode, without shared
 layer reuse. These operator-level queries complement the engine integration
@@ -430,6 +452,15 @@ harness, the report explicitly contains new-side statistics only. Frozen
 goldens establish numerical stability; hardware accuracy is supported by the
 specific measured configurations in the
 [accuracy evidence](../../README.md#accuracy-evidence).
+
+Engine Golden Regression and both prediction-snapshot collections build AISim
+from source on GitHub-hosted `ubuntu-24.04` runners without the CI job
+container; they use no NVIDIA-internal service. Each job, and each side of the
+comparison, may run on a different CPU model. The compiled engine uses baseline
+x86-64 code generation, the golden and sentinel checks use relative
+tolerances, and the comparison reports drift above a 0.01% relative change
+without blocking on it. Investigate drift on a PR that does not change
+numerical behavior as a runner difference; do not refresh goldens to absorb it.
 
 The macOS platform-wheel and daily README jobs use the ARM64 `macos-15` runner.
 This replaces `macos-14`, which GitHub is

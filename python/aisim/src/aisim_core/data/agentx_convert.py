@@ -60,13 +60,16 @@ class AgentxBundleError(ValueError):
     """A bundle is missing a file or declares an unsupported schema."""
 
 
-def _load(bundle: Path, name: str, *, required: bool = True) -> Any:
+def _load(bundle: Path, name: str, inputs: dict[str, bytes], *, required: bool = True) -> Any:
     path = bundle / name
-    if not path.is_file():
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
         if required:
-            raise AgentxBundleError(f"{bundle}: missing {name}")
+            raise AgentxBundleError(f"{bundle}: missing {name}") from None
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    inputs[name] = data
+    return json.loads(data)
 
 
 def _percentile(sorted_values: Sequence[float], q: float) -> float:
@@ -192,6 +195,12 @@ def _body(
     implementation = dict(configuration.get("implementation_identity") or {})
     if effective:
         implementation["ranks_observed"] = len(effective)
+    observed_tp = observed.get("tp")
+    if observed_tp is not None and observed_tp != manifest["tensor_parallel"]:
+        raise AgentxBundleError(
+            f"{manifest['id']}: manifest tensor_parallel={manifest['tensor_parallel']!r} "
+            f"conflicts with observed tensor_parallel_size={observed_tp!r}"
+        )
     return E2eManifestBody(
         origin=normalize("origin", manifest["category"]),
         model_id=normalize("model", manifest["model"]),
@@ -329,7 +338,7 @@ def _series(observation_id: str, workload: Mapping[str, Any]) -> list[SeriesRow]
 _BUNDLE_FILES = ("manifest.json", "configuration.json", "workload.json", "features.json", "observations.json")
 
 
-def _bundle_digest(bundle: Path, observations_bytes: bytes) -> str:
+def _bundle_digest(inputs: Mapping[str, bytes]) -> str:
     """Revision of everything the published rows are derived from, not only the request observations.
 
     A corrected lineage in ``workload.json`` changes the stored rows without touching ``observations.json``, so the
@@ -337,13 +346,7 @@ def _bundle_digest(bundle: Path, observations_bytes: bytes) -> str:
     """
     digest = hashlib.sha256()
     for name in _BUNDLE_FILES:
-        data = (
-            observations_bytes
-            if name == "observations.json"
-            else (bundle / name).read_bytes()
-            if (bundle / name).is_file()
-            else None
-        )
+        data = inputs.get(name)
         if data is not None:
             digest.update(f"{name}\0{len(data)}\0".encode())
             digest.update(data)
@@ -353,14 +356,14 @@ def _bundle_digest(bundle: Path, observations_bytes: bytes) -> str:
 def agentx_bundle_to_configuration(bundle: Path | str) -> E2eConfigurationData:
     """One AgentX bundle directory to one configuration with one observation."""
     bundle = Path(bundle)
-    manifest = _load(bundle, "manifest.json")
+    inputs: dict[str, bytes] = {}
+    manifest = _load(bundle, "manifest.json", inputs)
     if manifest.get("schema") != BUNDLE_SCHEMA:
         raise AgentxBundleError(f"{bundle}: unsupported bundle schema {manifest.get('schema')!r}")
-    configuration = _load(bundle, "configuration.json")
-    workload = _load(bundle, "workload.json")
-    features = _load(bundle, "features.json", required=False) or {"features": []}
-    observations_bytes = (bundle / "observations.json").read_bytes()
-    rows = json.loads(observations_bytes)
+    configuration = _load(bundle, "configuration.json", inputs)
+    workload = _load(bundle, "workload.json", inputs)
+    features = _load(bundle, "features.json", inputs, required=False) or {"features": []}
+    rows = _load(bundle, "observations.json", inputs)
 
     body = _body(manifest, configuration, workload, features)
     observation_id = manifest["id"]
@@ -394,6 +397,8 @@ def agentx_bundle_to_configuration(bundle: Path | str) -> E2eConfigurationData:
             "repeat": variant.get("repeat"),
             "measured_requests": manifest.get("measured_requests"),
             "benchmark_url": manifest.get("benchmark_url"),
+            # Workload facts are per observation; merged configurations retain only shared facts in the body.
+            "workload": body.workload.model_dump(mode="json", exclude_none=True),
         }.items()
         if v is not None
     }
@@ -411,7 +416,7 @@ def agentx_bundle_to_configuration(bundle: Path | str) -> E2eConfigurationData:
     observation = ObservationRow(
         observation_id=observation_id,
         configuration_id=body.configuration_id(),
-        record_sha256=_bundle_digest(bundle, observations_bytes),
+        record_sha256=_bundle_digest(inputs),
         source_kind="agentx",
         source_observation_id=manifest["id"],
         producer_kind="github-actions" if manifest.get("source_run_url") else None,
@@ -442,6 +447,7 @@ def agentx_bundles_to_configurations(bundles: Iterable[Path | str]) -> list[E2eC
     Bundles whose manifest bodies differ only in per-point facts (lanes, run) share a ``configuration_id``;
     their observations, metrics, requests and series are concatenated in bundle order. Differing
     runtime ``settings`` between merged bundles are kept as a gap on the merged body, never silently picked.
+    Matching identities with different origins are rejected to preserve the request-publication boundary.
     """
     merged: dict[str, E2eConfigurationData] = {}
     for bundle in bundles:
@@ -451,6 +457,12 @@ def agentx_bundles_to_configurations(bundles: Iterable[Path | str]) -> list[E2eC
         if first is None:
             merged[key] = data
             continue
+        if first.body.origin != data.body.origin:
+            raise AgentxBundleError(
+                f"cannot merge configuration {key} with mixed origins {first.body.origin!r} and {data.body.origin!r}"
+            )
+        if first.body.workload != data.body.workload:
+            raise AgentxBundleError(f"{key}: cannot merge bundles with different workload facts")
         if first.body.settings != data.body.settings:
             differing = sorted(
                 name

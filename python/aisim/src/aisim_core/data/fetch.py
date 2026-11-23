@@ -10,7 +10,8 @@ This is the internal library behind ``aisim data fetch`` (DEP #435,
   later read uses that SHA, so a moving ref can never mix revisions.
 * A selection is required. It must name configuration IDs or a hardware filter
   (plus a model for fpm/e2e/eval) and must match at least one catalog entry;
-  an empty selection is an error, never a whole-repository download.
+  an empty selection is an error, never a whole-repository download (``select_all`` is the
+  explicit, opt-in whole-category exception).
 * Files are verified (size, SHA-256, Parquet schema ID and row count) before
   they enter the cache. The cache is keyed by repo + commit + path and entries
   are renamed into place atomically, so an interrupted transfer leaves nothing
@@ -30,7 +31,7 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -46,8 +47,39 @@ from aisim_core.data import (
     Entry,
     Manifest,
     _relative,
+    configuration_id,
 )
-from aisim_core.data.parquet import read_parquet_schema_id
+from aisim_core.data.fpm_layout import storage_path
+from aisim_core.data.parquet import SCHEMA_METADATA_KEY
+from aisim_core.data.repos import resolve_ref
+
+
+class _AliasTransport:
+    """Rewrite moved FPM paths only at the transport boundary; cache and identity paths stay logical."""
+
+    def __init__(self, transport, reference):
+        self.transport, self.reference = transport, reference
+
+    def resolve_revision(self, repo, revision):
+        return self.transport.resolve_revision(repo, revision)
+
+    def open_file(self, repo, sha, path):
+        return self.transport.open_file(repo, sha, self.reference.path(path))
+
+    def file_size(self, repo, sha, path):
+        probe = getattr(self.transport, "file_size", None)
+        return None if probe is None else probe(repo, sha, self.reference.path(path))
+
+
+def _resolve_source(repo, revision, transport, category=None):
+    # An ensure call can share the aliased transport across categories. Only FPM artifacts moved under data/fpm/.
+    if isinstance(transport, _AliasTransport) and category not in (None, "fpm"):
+        transport = transport.transport
+    reference = resolve_ref(repo, revision)
+    if reference.via == "successor-alias" and transport is not None and category in (None, "fpm"):
+        transport = _AliasTransport(transport, reference)
+    return reference.repo, reference.revision, transport
+
 
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _REPO = re.compile(r"^[A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*$")
@@ -133,7 +165,12 @@ class Transport(Protocol):
         """Return the full 40-hex commit SHA for a branch, tag or SHA."""
 
     def open_file(self, repo: str, sha: str, path: str) -> Iterator[bytes]:
-        """Yield the content of ``path`` at commit ``sha`` in chunks."""
+        """Yield the content of ``path`` at commit ``sha`` in chunks.
+
+        A transport that cannot stop an oversized transfer while receiving it (it finishes the whole download before
+        yielding) may also offer ``file_size(repo, sha, path) -> int | None``: the planner asks it for the size of a
+        file that declares none, before any transfer starts.
+        """
 
 
 class HfTransport:
@@ -149,6 +186,17 @@ class HfTransport:
         from huggingface_hub import HfApi
 
         return HfApi(token=self._token).repo_info(repo, repo_type="dataset", revision=revision).sha
+
+    def file_size(self, repo: str, sha: str, path: str) -> int | None:
+        """Size of ``path`` at ``sha`` from the Hub's metadata, before any bytes move; ``None`` when it is unknown."""
+        from huggingface_hub import HfApi
+
+        try:
+            (info,) = HfApi(token=self._token).get_paths_info(repo, [path], repo_type="dataset", revision=sha)
+        except Exception:  # a failed probe only loses the early check; the transfer checks run as before
+            return None
+        size = getattr(info, "size", None)
+        return size if isinstance(size, int) else None
 
     def open_file(self, repo: str, sha: str, path: str) -> Iterator[bytes]:
         from huggingface_hub import hf_hub_download
@@ -202,8 +250,19 @@ class Selection:
     # Artifact roles to leave out of the plan (for example ``fpm-provenance``,
     # 75 % of the FPM bytes, which no evaluation reads). Manifests are still read.
     exclude_roles: tuple[str, ...] = ()
+    # Parallelism dimensions (degree 1 omitted), e.g. ``(("dp", 4), ("ep", 4))``; matches any worker role of an
+    # entry that declares parallelism. Parallelism is part of an FPM identity: ``dep4`` and ``tep4`` differ.
+    parallelism: tuple[tuple[str, int], ...] | None = None
+    # Additional exclusions only for published FPM library entries. Legacy execution-profile preparation
+    # verifies every declared artifact, so it must fetch its auxiliary files too.
+    library_exclude_roles: tuple[str, ...] = ()
+    # Whole-category selection (every matching entry, no identity filter required). The command line
+    # allows it for op-latency only; FPM, e2e and eval stay selective.
+    select_all: bool = False
 
     def validate(self) -> None:
+        if self.select_all:
+            return
         if not self.configuration_ids:
             if self.hardware is None:
                 raise SelectionError("selection needs configuration_ids or a hardware filter")
@@ -224,6 +283,10 @@ class Selection:
             (self.operation_family, identity.operation_family),
         ):
             if want is not None and want != have:
+                return False
+        if self.parallelism is not None and identity.parallelism is not None:
+            wanted = dict(self.parallelism)
+            if not any(dims == wanted for dims in identity.parallelism.values()):
                 return False
         return True
 
@@ -334,7 +397,10 @@ class Cache:
         if expected is None or expected.sha256 is None:
             return True
         try:
-            return _digest(target) == (expected.sha256, expected.bytes)
+            if _digest(target) != (expected.sha256, expected.bytes):
+                return False
+            _verify_parquet(target, path, expected)
+            return True
         except OSError:
             return False
 
@@ -382,10 +448,16 @@ def _verify_file(local: Path, path: str, expected: PlannedFile) -> None:
         raise IntegrityError(path, f"size {size} != declared {expected.bytes}")
     if expected.sha256 is not None and digest != expected.sha256:
         raise IntegrityError(path, "SHA-256 mismatch")
+    _verify_parquet(local, path, expected)
+
+
+def _verify_parquet(local: Path, path: str, expected: PlannedFile) -> None:
     if expected.format == "parquet":
         try:
-            schema_id = read_parquet_schema_id(local)
-            rows = pq.ParquetFile(local).metadata.num_rows
+            metadata = pq.read_metadata(local)
+            value = (metadata.metadata or {}).get(SCHEMA_METADATA_KEY)
+            schema_id = None if value is None else value.decode()
+            rows = metadata.num_rows
         except Exception as exc:
             raise IntegrityError(path, f"unreadable Parquet: {exc}") from exc
         # A file published before schema stamping (the byte-identical FPM libraries) has no embedded ID;
@@ -402,9 +474,9 @@ def _verify_file(local: Path, path: str, expected: PlannedFile) -> None:
 # --------------------------------------------------------------------------- plan
 
 
-def _ref(artifact: Artifact, role: str) -> PlannedFile:
+def _ref(artifact: Artifact, role: str, category_roots: Mapping[str, str] | None = None) -> PlannedFile:
     return PlannedFile(
-        path=artifact.path,
+        path=storage_path(artifact.path, category_roots or {}),
         bytes=artifact.bytes,
         sha256=artifact.sha256,
         role=role,
@@ -415,8 +487,23 @@ def _ref(artifact: Artifact, role: str) -> PlannedFile:
     )
 
 
-# A metadata file without a declared size (the root catalog) is refused past this many bytes.
+# Every metadata file is refused past this many bytes, independently of its declaration.
 _METADATA_CAP_BYTES = 16 * 1024 * 1024
+
+
+def _check_manifest(manifest: Manifest, entry: Entry, path: str) -> None:
+    """The manifest must hash to its own ID and describe exactly the catalog entry that selected it.
+
+    A digest-correct manifest of another hardware or model can carry a copied ID, so its identity and purpose must
+    be the entry's before any of its artifacts is planned. The category stamp is not compared: legacy stamps are
+    valid where the loader permits them.
+    """
+    if manifest.configuration_id != configuration_id(manifest.category, manifest.purpose, manifest.identity):
+        raise IntegrityError(path, "manifest configuration identity hash mismatch")
+    if manifest.configuration_id != entry.configuration_id:
+        raise IntegrityError(path, "manifest configuration ID differs from the catalog entry")
+    if (manifest.purpose, manifest.identity) != (entry.purpose, entry.identity):
+        raise IntegrityError(path, "manifest identity or purpose differs from the catalog entry")
 
 
 class _Planner:
@@ -448,10 +535,16 @@ class _Planner:
         call replaces a cached copy that fails it, and an invalid transfer is never cached.
         """
         plan = self.plan
+        if ref.bytes is not None and ref.bytes > _METADATA_CAP_BYTES:
+            raise IntegrityError(ref.path, f"metadata declaration exceeds {_METADATA_CAP_BYTES} bytes")
         online = not plan.offline and self.transport is not None
         if self.cache.valid(plan.repo, plan.revision, ref.path, ref):
-            data = self.cache.path_for(plan.repo, plan.revision, ref.path).read_bytes()
+            with self.cache.path_for(plan.repo, plan.revision, ref.path).open("rb") as handle:
+                data = handle.read(_METADATA_CAP_BYTES + 1)  # bounded: an oversized file is never read whole
             try:
+                # An oversized cached copy fails like any other invalid one: an online call repairs it.
+                if len(data) > _METADATA_CAP_BYTES:
+                    raise IntegrityError(ref.path, f"metadata exceeds {_METADATA_CAP_BYTES} bytes")
                 if validate is not None:
                     validate(data)
             except IntegrityError:
@@ -468,6 +561,15 @@ class _Planner:
         # budget stop an oversized stream before it is held in memory. A transport that finishes the whole
         # download before yielding (Hugging Face) can only be checked once its bytes arrive.
         limit = ref.bytes if ref.bytes is not None else _METADATA_CAP_BYTES
+        size = ref.bytes
+        if size is None and (probe := getattr(self.transport, "file_size", None)) is not None:
+            # No declared size, and a transport that cannot be stopped mid-transfer: ask for it before any byte moves.
+            size = probe(plan.repo, plan.revision, ref.path)
+            if size is not None and size > _METADATA_CAP_BYTES:
+                raise IntegrityError(ref.path, f"metadata is {size} bytes, over the {_METADATA_CAP_BYTES}-byte cap")
+        if self.budget is not None and plan.metadata_bytes + (size or 1) > self.budget:
+            self._add(ref)
+            raise BudgetExceededError(plan, self.budget)
         chunks: list[bytes] = []
         received = 0
         for chunk in self.transport.open_file(plan.repo, plan.revision, ref.path):
@@ -481,7 +583,8 @@ class _Planner:
         plan.metadata_bytes += received
         if validate is not None:
             validate(b"".join(chunks))
-        self.cache.discard(plan.repo, plan.revision, ref.path)
+        # ``store`` verifies a temporary file and atomically replaces the destination, so an existing entry
+        # (possibly another reader's verified download) is never removed ahead of a transfer that may fail.
         self.cache.store(plan.repo, plan.revision, ref.path, chunks, ref)
         self._add(ref)
         return self.cache.path_for(plan.repo, plan.revision, ref.path).read_bytes()
@@ -505,6 +608,7 @@ def plan(
     here. Offline, nothing is downloaded and absent files go in ``missing``.
     """
     selection.validate()
+    repo, revision, transport = _resolve_source(repo, revision, transport, selection.category)
     cache = cache or Cache()
     sha = _resolved or resolve_revision(transport, repo, revision, offline=offline)
     out = FetchPlan(repo=repo, revision=sha, requested_revision=revision, offline=offline)
@@ -523,10 +627,12 @@ def plan(
     if raw is None:
         return out
     dataset = parse(DatasetIndex, raw, DATASET_INDEX_PATH)
+    category_roots = {name: ref.root for name, ref in dataset.categories.items()}
+
     reference = dataset.categories.get(selection.category)
     if reference is None:
         raise SelectionError(f"dataset has no {selection.category!r} category")
-    raw = planner.read(_ref(reference.index, "index"))
+    raw = planner.read(_ref(reference.index, "index", category_roots))
     if raw is None:
         return out
     index = parse(CategoryIndex, raw, reference.index.path)
@@ -536,22 +642,22 @@ def plan(
     if not entries:
         raise SelectionError("selection matched no catalog entries")
     for artifact in index.support:  # files every selection of the category needs, e.g. the op-latency lookups
-        planner._add(_ref(artifact, "artifact"))
+        planner._add(_ref(artifact, "artifact", category_roots))
     for entry in entries:
-        raw = planner.read(_ref(entry.manifest, "manifest"))
+        raw = planner.read(_ref(entry.manifest, "manifest", category_roots))
         if raw is None:
             continue
         manifest = parse(Manifest, raw, entry.manifest.path)
-        if manifest.configuration_id != entry.configuration_id:
-            raise IntegrityError(entry.manifest.path, "manifest configuration ID differs from the catalog entry")
-        # A digest-correct manifest of another hardware or model can carry a copied ID; its identity and purpose must
-        # be the entry's before any of its artifacts is planned (the category stamp is not compared: legacy
-        # stamps are valid where the loader permits them).
-        if manifest.identity != entry.identity or manifest.purpose != entry.purpose:
-            raise IntegrityError(entry.manifest.path, "manifest identity or purpose differs from the catalog entry")
+        _check_manifest(manifest, entry, entry.manifest.path)
+        excluded = selection.exclude_roles
+        prediction_only = selection.library_exclude_roles and any(a.role == "fpm-library" for a in manifest.artifacts)
+        if prediction_only:
+            excluded = (*excluded, *selection.library_exclude_roles)
         for artifact in manifest.artifacts:
-            if artifact.role not in selection.exclude_roles:
-                planner._add(_ref(artifact, "artifact"))
+            if artifact.role not in excluded and (
+                not prediction_only or artifact.role in ("fpm-library", "fpm-library-metadata")
+            ):
+                planner._add(_ref(artifact, "artifact", category_roots))
     out.files.sort(key=lambda f: f.path)
     if offline:
         out.missing = sorted({*out.missing, *(f.path for f in out.files if not f.cached)})
@@ -571,6 +677,7 @@ def fetch(
     max_bytes: int | None = None,
     allow_over_budget: bool = False,
     offline: bool = False,
+    pinned_sha: str | None = None,
 ) -> FetchResult:
     """Resolve once, plan, enforce the budget, then download and verify.
 
@@ -578,11 +685,17 @@ def fetch(
     nothing); a larger plan raises :class:`BudgetExceededError` before any
     artifact transfer unless ``allow_over_budget`` is set. Offline with any
     file missing raises :class:`OfflineMissingError` listing every such file.
+    ``pinned_sha`` is a commit an earlier plan already resolved for ``revision``: it is used instead of resolving
+    the revision again, while ``repo`` and ``revision`` still select the source, so a retired repository's alias and
+    its path mapping apply to a commit that belongs to the successor.
     """
     if max_bytes is not None and max_bytes < 0:
         raise ValueError("max_bytes must be non-negative")
+    if pinned_sha is not None and not _FULL_SHA.fullmatch(pinned_sha):
+        raise RevisionError(f"pinned_sha must be a full 40-hex commit SHA, got {pinned_sha!r}")
+    repo, revision, transport = _resolve_source(repo, revision, transport, selection.category)
     cache = cache or Cache()
-    sha = resolve_revision(transport, repo, revision, offline=offline)
+    sha = pinned_sha or resolve_revision(transport, repo, revision, offline=offline)
     result_plan = plan(
         selection,
         repo=repo,
@@ -609,7 +722,6 @@ def fetch(
     for f in result_plan.files:
         if f.cached:
             continue
-        cache.discard(repo, sha, f.path)
         _, size = cache.store(repo, sha, f.path, transport.open_file(repo, sha, f.path), f)
         downloaded += size
         f.cached = True
@@ -625,16 +737,23 @@ def load_category_index(
     transport: Transport | None = None,
     cache: Cache | None = None,
     offline: bool = False,
+    max_bytes: int | None = None,
+    _accounting: FetchPlan | None = None,
 ) -> tuple[str, CategoryIndex, DatasetIndex]:
     """Resolve ``revision`` once and read the dataset and category indexes (a few KB).
 
     Returns ``(full_sha, category_index, dataset_index)``. Use it to choose
     configuration IDs before any artifact is planned or downloaded.
     """
+    repo, revision, transport = _resolve_source(repo, revision, transport, category)
     cache = cache or Cache()
     sha = resolve_revision(transport, repo, revision, offline=offline)
-    out = FetchPlan(repo=repo, revision=sha, requested_revision=revision, offline=offline)
-    planner = _Planner(transport, cache, out)
+    out = (
+        _accounting
+        if _accounting is not None
+        else FetchPlan(repo=repo, revision=sha, requested_revision=revision, offline=offline)
+    )
+    planner = _Planner(transport, cache, out, budget=max_bytes)
 
     def parse(model, raw: bytes | None, path: str):
         if raw is None:
@@ -655,7 +774,8 @@ def load_category_index(
     reference = dataset.categories.get(category)
     if reference is None:
         raise SelectionError(f"dataset has no {category!r} category")
-    index = parse(CategoryIndex, planner.read(_ref(reference.index, "index")), reference.index.path)
+    category_roots = {name: ref.root for name, ref in dataset.categories.items()}
+    index = parse(CategoryIndex, planner.read(_ref(reference.index, "index", category_roots)), reference.index.path)
     if index.category != category:
         raise IntegrityError(reference.index.path, f"category index names {index.category!r}, not {category!r}")
     return sha, index, dataset
@@ -669,24 +789,39 @@ def fetch_support(
     transport: Transport | None = None,
     cache: Cache | None = None,
     offline: bool = False,
+    max_bytes: int | None = None,
+    _accounting: FetchPlan | None = None,
 ) -> tuple[str, CategoryIndex, dict[str, Path]]:
     """Read a category index and fetch only its ``support`` files (a few KB), verified.
 
     Returns ``(full_sha, category_index, {dataset path: local file})``. Use it for policy a selection depends on
     (the op-latency version slots) before any entry is chosen.
     """
+    repo, revision, transport = _resolve_source(repo, revision, transport, category)
     cache = cache or Cache()
-    sha, index, _ = load_category_index(
-        category, repo=repo, revision=revision, transport=transport, cache=cache, offline=offline
+    sha = resolve_revision(transport, repo, revision, offline=offline)
+    accounting = (
+        _accounting
+        if _accounting is not None
+        else FetchPlan(repo=repo, revision=sha, requested_revision=revision, offline=offline)
     )
+    sha, index, dataset = load_category_index(
+        category,
+        repo=repo,
+        revision=sha,
+        transport=transport,
+        cache=cache,
+        offline=offline,
+        max_bytes=max_bytes,
+        _accounting=accounting,
+    )
+    planner = _Planner(transport, cache, accounting, budget=max_bytes)
     paths: dict[str, Path] = {}
+    category_roots = {name: ref.root for name, ref in dataset.categories.items()}
     for artifact in index.support:
-        ref = _ref(artifact, "artifact")
-        if not cache.valid(repo, sha, ref.path, ref):
-            if offline or transport is None:
-                raise OfflineMissingError([ref.path])
-            cache.discard(repo, sha, ref.path)
-            cache.store(repo, sha, ref.path, transport.open_file(repo, sha, ref.path), ref)
+        ref = _ref(artifact, "artifact", category_roots)
+        if planner.read(ref) is None:
+            raise OfflineMissingError([ref.path])
         paths[ref.path] = cache.path_for(repo, sha, ref.path)
     return sha, index, paths
 

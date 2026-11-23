@@ -1,0 +1,188 @@
+{
+  "$id": "aic_fpm_forward_perf/v6",
+  "additionalProperties": true,
+  "description": "Notes for one row of ``fpm_forward_perf.parquet`` (``aic_fpm_forward_perf/v6``).\n\nThe table is read natively; this model records the columns AISim relies on. A table may carry more. The\nrequired fields are exactly the columns the native loader looks up unconditionally (see\n``NATIVE_REQUIRED_COLUMNS``); single-sample legacy tables may omit the per-row measurement-policy columns.",
+  "properties": {
+    "attention_backend": {
+      "title": "Attention Backend",
+      "type": "string"
+    },
+    "backend": {
+      "title": "Backend",
+      "type": "string"
+    },
+    "backend_version": {
+      "title": "Backend Version",
+      "type": "string"
+    },
+    "batch_size": {
+      "maximum": 4294967295,
+      "minimum": 1,
+      "title": "Batch Size",
+      "type": "integer"
+    },
+    "cell_id": {
+      "title": "Cell Id",
+      "type": "string"
+    },
+    "comm_quant_mode": {
+      "title": "Comm Quant Mode",
+      "type": "string"
+    },
+    "cp": {
+      "title": "Cp",
+      "type": "integer"
+    },
+    "dp": {
+      "title": "Dp",
+      "type": "integer"
+    },
+    "enable_eplb": {
+      "title": "Enable Eplb",
+      "type": "boolean"
+    },
+    "enable_wideep": {
+      "title": "Enable Wideep",
+      "type": "boolean"
+    },
+    "fmha_quant_mode": {
+      "title": "Fmha Quant Mode",
+      "type": "string"
+    },
+    "gemm_quant_mode": {
+      "title": "Gemm Quant Mode",
+      "type": "string"
+    },
+    "kv_cache_dtype": {
+      "title": "Kv Cache Dtype",
+      "type": "string"
+    },
+    "latency_ms": {
+      "title": "Latency Ms",
+      "type": "number"
+    },
+    "measurement_policy": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Measurement Policy"
+    },
+    "measurement_repeats": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Measurement Repeats"
+    },
+    "model_path": {
+      "title": "Model Path",
+      "type": "string"
+    },
+    "moe_backend": {
+      "title": "Moe Backend",
+      "type": "string"
+    },
+    "moe_ep": {
+      "title": "Moe Ep",
+      "type": "integer"
+    },
+    "moe_quant_mode": {
+      "title": "Moe Quant Mode",
+      "type": "string"
+    },
+    "moe_tp": {
+      "title": "Moe Tp",
+      "type": "integer"
+    },
+    "partition_policy": {
+      "title": "Partition Policy",
+      "type": "string"
+    },
+    "pp": {
+      "title": "Pp",
+      "type": "integer"
+    },
+    "system": {
+      "title": "System",
+      "type": "string"
+    },
+    "total_kv_read_tokens": {
+      "maximum": 4294967295,
+      "minimum": 0,
+      "title": "Total Kv Read Tokens",
+      "type": "integer"
+    },
+    "total_prefill_tokens": {
+      "maximum": 4294967295,
+      "minimum": 0,
+      "title": "Total Prefill Tokens",
+      "type": "integer"
+    },
+    "tp": {
+      "title": "Tp",
+      "type": "integer"
+    },
+    "warmup_repeats": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Warmup Repeats"
+    },
+    "weight_quantization": {
+      "title": "Weight Quantization",
+      "type": "string"
+    },
+    "workload_kind": {
+      "title": "Workload Kind",
+      "type": "string"
+    }
+  },
+  "required": [
+    "cell_id",
+    "model_path",
+    "system",
+    "backend",
+    "backend_version",
+    "weight_quantization",
+    "tp",
+    "pp",
+    "dp",
+    "moe_tp",
+    "moe_ep",
+    "cp",
+    "workload_kind",
+    "batch_size",
+    "total_prefill_tokens",
+    "total_kv_read_tokens",
+    "partition_policy",
+    "latency_ms",
+    "gemm_quant_mode",
+    "moe_quant_mode",
+    "fmha_quant_mode",
+    "comm_quant_mode",
+    "kv_cache_dtype",
+    "moe_backend",
+    "attention_backend",
+    "enable_wideep",
+    "enable_eplb"
+  ],
+  "title": "FpmLibraryRow",
+  "type": "object"
+}

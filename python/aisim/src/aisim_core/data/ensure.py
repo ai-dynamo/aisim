@@ -32,7 +32,7 @@ module accepts, stores and prints no token.
 
 Environment (read by :func:`pin_from_environment`): ``AISIM_DATASET=<repo>@<revision>``
 (use a full commit SHA for offline reuse), ``AISIM_DATA_LOCAL``, ``AISIM_DATA_CATEGORIES``
-(default ``fpm``), ``AISIM_DATA_CONFIGURATION``, ``AISIM_DATA_MAX_BYTES``,
+(default ``op-latency``), ``AISIM_DATA_CONFIGURATION``, ``AISIM_DATA_MAX_BYTES``,
 ``AISIM_DATA_OFFLINE`` and ``AISIM_DATA_CACHE``.
 """
 
@@ -44,6 +44,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import tempfile
 from collections.abc import Callable, Mapping
@@ -56,11 +57,13 @@ import yaml
 from pydantic import ValidationError
 
 from aisim_core.data import CategoryIndex, DatasetIndex, Entry, _file, _verify
+from aisim_core.data.config import config_path, load_config, resolve_source
 from aisim_core.data.fetch import (
     DATASET_INDEX_PATH,
     BudgetExceededError,
     Cache,
     DataFetchError,
+    FetchPlan,
     FetchResult,
     IntegrityError,
     OfflineMissingError,
@@ -68,10 +71,12 @@ from aisim_core.data.fetch import (
     Selection,
     SelectionError,
     Transport,
+    _resolve_source,
     fetch,
     fetch_support,
     resolve_revision,
 )
+from aisim_core.data.fpm_library import PREDICTION_ROLES, STAGED_MARKER, _stageable_roots, staged_inputs_digest
 from aisim_core.data.loaders import LOADERS, FpmData, LoaderError
 from aisim_core.data.op_schema import DATA_PREFIX, QUERY_VERSIONS_NAME
 from aisim_core.data.op_tree import (
@@ -84,7 +89,6 @@ from aisim_core.data.op_tree import (
     read_entry_manifest,
     verify_op_latency_support,
 )
-from aisim_core.data.repos import resolve_ref
 from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR, packaged_system_specs
 
 DEFAULT_MAX_BYTES = 256 * 1024 * 1024
@@ -155,11 +159,14 @@ class DataPin:
     repo: str | None = None
     revision: str | None = None  # full commit SHA recommended: it resolves with no network
     local_root: Path | None = None
-    categories: tuple[str, ...] = ("fpm",)
+    categories: tuple[str, ...] = ("op-latency",)
     configuration_id: str | None = None  # disambiguates several catalog matches
     max_bytes: int = DEFAULT_MAX_BYTES
     offline: bool = False
     cache_dir: Path | None = None
+    # Built from the source ``aisim init`` saved, not named by the caller or the environment. Such an ambient pin
+    # selects op-latency data only for runs that read operation tables (see ``rust_engine_step._ensure_dataset``).
+    saved_source: bool = False
 
     def __post_init__(self) -> None:
         if self.local_root is None and not (self.repo and self.revision):
@@ -189,19 +196,25 @@ class EnsuredData:
 
 
 def pin_from_environment(env: Mapping[str, str] | None = None) -> DataPin | None:
-    """Build a pin from ``AISIM_DATA*`` variables; ``None`` when none is set (the default)."""
+    """Build a pin from ``AISIM_DATA*`` variables, else the source saved by ``aisim init``.
+
+    ``None`` when neither names a source (the shipped default applies).
+    """
     env = os.environ if env is None else env
     spec, local = env.get("AISIM_DATASET"), env.get("AISIM_DATA_LOCAL")
+    from_saved = False
     if not spec and not local:
-        return None
+        saved = load_config(config_path(env))  # a corrupt saved config raises ConfigError
+        if not saved or not (saved.repo or saved.revision):
+            return None
+        spec = "{}@{}".format(*resolve_source(env=env, config=saved))  # same rules as ``data fetch``
+        from_saved = True
     repo = revision = None
     if spec:
         repo, sep, revision = spec.partition("@")
         if not sep or not repo or not revision:
             raise ValueError("AISIM_DATASET must be <owner>/<name>@<revision>")
-        # A symbolic ref on the retired FPM repository follows its successor; a commit SHA never moves.
-        resolved = resolve_ref(repo, revision)
-        repo, revision = resolved.repo, resolved.revision
+        # Keep the requested name until transport setup: the successor's path mapping must survive resolution.
     kwargs: dict[str, Any] = {}
     if env.get("AISIM_DATA_CATEGORIES"):
         kwargs["categories"] = tuple(c.strip() for c in env["AISIM_DATA_CATEGORIES"].split(",") if c.strip())
@@ -215,6 +228,7 @@ def pin_from_environment(env: Mapping[str, str] | None = None) -> DataPin | None
         local_root=Path(local) if local else None,
         configuration_id=env.get("AISIM_DATA_CONFIGURATION") or None,
         offline=env.get("AISIM_DATA_OFFLINE", "").lower() in {"1", "true", "yes"},
+        saved_source=from_saved,
         **kwargs,
     )
 
@@ -260,7 +274,8 @@ def _describe(selection: Selection) -> str:
 
 
 def _command(pin: DataPin, selection: Selection) -> str:
-    flags = [f"--category {selection.category}"]
+    """A ``aisim data fetch`` command that is valid for ``selection`` (it needs a selector)."""
+    flags = ["--category", selection.category]
     for flag, value in (
         ("--model", selection.model),
         ("--hardware", selection.hardware),
@@ -269,12 +284,20 @@ def _command(pin: DataPin, selection: Selection) -> str:
         ("--operation-family", selection.operation_family),
         ("--repo", pin.repo),
         ("--revision", pin.revision),
+        ("--cache-dir", pin.cache_dir),
     ):
         if value:
-            flags.append(f"{flag} {value}")
+            flags += [flag, str(value)]
     # One flag per ID: without them the command would download every matching entry, not the one the pin names.
-    flags.extend(f"--configuration {cid}" for cid in selection.configuration_ids)
-    return "aisim data fetch " + " ".join(flags)
+    for configuration_id in selection.configuration_ids:
+        flags += ["--configuration", configuration_id]
+    has_selector = selection.configuration_ids or selection.hardware
+    if selection.select_all or (selection.category == "op-latency" and not has_selector):
+        flags.append("--all")
+    # The command line does not apply the auto-download threshold to an explicit fetch unless
+    # AISIM_DATA_MAX_BYTES is set; --no-limit makes the command valid in both cases.
+    flags.append("--no-limit")
+    return shlex.join(["aisim", "data", "fetch", *flags])
 
 
 # --------------------------------------------------------------------------- ensure
@@ -300,6 +323,8 @@ def ensure_data(
 
         transport = HfTransport()
     if pin.local_root is None:
+        repo, revision, transport = _resolve_source(pin.repo, pin.revision, transport)
+        pin = replace(pin, repo=repo, revision=revision)
         # One commit for the whole call: policy, primary and dependency fetches must read the same revision even if
         # a branch moves meanwhile. A full SHA needs no network.
         try:
@@ -309,8 +334,9 @@ def ensure_data(
     with _guard():
         if "op-latency" in pin.categories:
             _resolve_backend_version(out, pin, transport)
-        owner = _configuration_owner(pin, transport)
-        for category in pin.categories:
+        owner = _configuration_owner(pin, transport, out)
+        # Operation data first: an FPM library staged after it must take operation tables from the pinned root alone.
+        for category in sorted(pin.categories, key=lambda name: name != "op-latency"):
             # A configuration ID names one entry of one category: it constrains only that category.
             category_pin = pin if owner in (None, category) else replace(pin, configuration_id=None)
             _ensure_category(out, category, category_pin, transport)
@@ -346,10 +372,10 @@ def _compose_pinned_roots(out: EnsuredData) -> None:
                 f"fpm entry {fpm} and op-latency entries {op} provide different content for the same operation "
                 f"table(s) {clashes[:3]}; pin one of them (AISIM_DATA_CATEGORIES) or republish the bundle"
             )
-    out.config["systems_paths"] = [*map(str, fpm_roots), str(op_root)]
+    out.config["systems_paths"] = list(dict.fromkeys([*map(str, fpm_roots), str(op_root)]))
 
 
-def _configuration_owner(pin: DataPin, transport: Transport | None) -> str | None:
+def _configuration_owner(pin: DataPin, transport: Transport | None, out: EnsuredData) -> str | None:
     """The category whose index lists ``pin.configuration_id``; ``None`` when no choice has to be made.
 
     A single-category pin keeps its plain behavior (the category reports a miss itself). With several categories
@@ -357,7 +383,7 @@ def _configuration_owner(pin: DataPin, transport: Transport | None) -> str | Non
     """
     if pin.configuration_id is None or len(pin.categories) < 2:
         return None
-    owners = [c for c in pin.categories if pin.configuration_id in _category_configuration_ids(pin, transport, c)]
+    owners = [c for c in pin.categories if pin.configuration_id in _category_configuration_ids(pin, transport, c, out)]
     if not owners:
         raise MissingDataError(
             f"configuration {pin.configuration_id} is not in any category of the pin {list(pin.categories)}"
@@ -365,10 +391,10 @@ def _configuration_owner(pin: DataPin, transport: Transport | None) -> str | Non
     return owners[0]
 
 
-def _category_configuration_ids(pin: DataPin, transport: Transport | None, category: str) -> set[str]:
+def _category_configuration_ids(
+    pin: DataPin, transport: Transport | None, category: str, out: EnsuredData | None = None
+) -> set[str]:
     """Configuration IDs listed by one category index of the pinned dataset (empty when it has no such category)."""
-    from aisim_core.data.fetch import load_category_index
-
     try:
         if pin.local_root is not None:
             root = Path(pin.local_root).absolute()
@@ -378,18 +404,27 @@ def _category_configuration_ids(pin: DataPin, transport: Transport | None, categ
                 return set()
             index = CategoryIndex.model_validate_json(_verify(root, reference.index).read_bytes())
         else:
-            common = {"repo": pin.repo, "revision": pin.revision, "cache": Cache(pin.cache_dir)}
-            try:
-                _, index, _ = load_category_index(category, transport=None, offline=True, **common)
-            except (OfflineMissingError, RevisionError, IntegrityError) as exc:
-                if pin.offline:
-                    raise MissingDataError(f"offline: the {category} catalog is not usable: {exc}") from exc
-                _, index, _ = load_category_index(category, transport=transport, **common)
+            index = _remote_category_index(pin, transport, category, out)
     except SelectionError:
         return set()
     except (ValueError, ValidationError) as exc:
         raise MissingDataError(f"the {category} catalog is unusable: {exc}") from exc
     return {e.configuration_id for e in index.entries}
+
+
+def _remote_category_index(
+    pin: DataPin, transport: Transport | None, category: str, out: EnsuredData | None
+) -> CategoryIndex:
+    """The pinned remote dataset's index of ``category``: the cache first, then a read charged to the pin."""
+    from aisim_core.data.fetch import load_category_index
+
+    common = {"repo": pin.repo, "revision": pin.revision, "cache": Cache(pin.cache_dir)}
+    try:
+        return load_category_index(category, transport=None, offline=True, **common)[1]
+    except (OfflineMissingError, RevisionError, IntegrityError) as exc:
+        if pin.offline:
+            raise MissingDataError(f"offline: the {category} catalog is not usable: {exc}") from exc
+    return _fetch_preselection(load_category_index, category, pin, transport, out)[1]
 
 
 _SLOT_ALIASES = ("current", "previous", "next")
@@ -408,12 +443,44 @@ def _resolve_backend_version(out: EnsuredData, pin: DataPin, transport: Transpor
     system, backend = out.config.get("system"), out.config.get("backend")
     if not system or not backend:
         return  # nothing to select; the category selection reports the missing field
-    index, query_versions = _version_policy(pin, transport)
+    index, query_versions = _version_policy(pin, transport, out)
     versions = {(e.identity.hardware, e.identity.framework, e.identity.framework_version) for e in index.entries}
     out.config["backend_version"] = _slot_version(system, backend, requested, versions, query_versions)
 
 
-def _version_policy(pin: DataPin, transport: Transport | None):
+def _fetch_preselection(fetcher, category, pin, transport, out):
+    """Charge policy and ownership reads to the same allowance as primary and dependency fetches."""
+    spent = out.downloaded_bytes if out is not None else 0
+    accounting = FetchPlan(repo=pin.repo, revision=pin.revision, requested_revision=pin.revision, offline=False)
+    try:
+        return fetcher(
+            category,
+            repo=pin.repo,
+            revision=pin.revision,
+            transport=transport,
+            cache=Cache(pin.cache_dir),
+            max_bytes=max(pin.max_bytes - spent, 0),
+            _accounting=accounting,
+        )
+    except BudgetExceededError as exc:
+        selection = Selection(
+            category=category,
+            configuration_ids=(pin.configuration_id,) if pin.configuration_id else (),
+            hardware=(out.config.get("system") if out is not None else None),
+            model=(out.config.get("model") if out is not None else None),
+        )
+        raise DataTooLargeError(
+            spent + exc.plan.uncached_bytes + exc.plan.metadata_bytes,
+            pin.max_bytes,
+            _command(pin, selection),
+            already_downloaded=spent + accounting.metadata_bytes,
+        ) from exc
+    finally:
+        if out is not None:
+            out.downloaded_bytes += accounting.metadata_bytes
+
+
+def _version_policy(pin: DataPin, transport: Transport | None, out: EnsuredData):
     """The op-latency category index of the pinned dataset and its parsed ``query_versions`` document."""
     name = f"{DATA_PREFIX}/{QUERY_VERSIONS_NAME}.parquet"
     where = str(pin.local_root) if pin.local_root is not None else f"{pin.repo}@{pin.revision}"
@@ -438,14 +505,52 @@ def _version_policy(pin: DataPin, transport: Transport | None):
             except (OfflineMissingError, RevisionError, IntegrityError) as exc:
                 if pin.offline:
                     raise MissingDataError(f"offline: the version policy of {where} is not usable: {exc}") from exc
-                _, index, paths = fetch_support("op-latency", transport=transport, **common)
+                _, index, paths = _fetch_preselection(fetch_support, "op-latency", pin, transport, out)
             path = paths.get(name)
         if path is None or not Path(path).is_file():
             raise MissingDataError(f"{where} publishes no {name}; the backend version cannot be resolved")
         document = yaml.safe_load(lookup_yaml(Path(path)))
+        if not isinstance(document, dict):
+            raise ValueError("version policy must be a mapping")
     except (LoaderError, ValueError, SelectionError) as exc:
         raise MissingDataError(f"cannot read the version policy of {where}: {exc}") from exc
-    return index, document if isinstance(document, dict) else {}
+    try:
+        _validate_version_policy(document)
+    except ValueError as exc:
+        raise MissingDataError(f"cannot read the version policy of {where}: {exc}") from exc
+    return index, document
+
+
+def _validate_version_policy(document: Any) -> None:
+    """Reject malformed policies while permitting a valid mapping with no applicable entry."""
+    if not isinstance(document, dict):
+        raise ValueError("version policy must be a mapping")
+    if document.keys() - {"schema_version", "defaults", "overrides"}:
+        raise ValueError("unknown version policy fields")
+    version = document.get("schema_version", 1)
+    if type(version) is not int or version != 1:
+        raise ValueError("unsupported version policy schema_version")
+
+    def entries(mapping):
+        if not isinstance(mapping, dict):
+            raise ValueError("version policy entries must be mappings")
+        for backend, slots in mapping.items():
+            if not isinstance(backend, str) or not isinstance(slots, dict):
+                raise ValueError("version policy backend slots must be mappings")
+            if any(
+                name not in ("current", "previous") or (v is not None and (not isinstance(v, str) or not v))
+                for name, v in slots.items()
+            ):
+                raise ValueError("version policy slots must be version strings or null")
+
+    entries(document.get("defaults", {}))
+    overrides = document.get("overrides", {})
+    if not isinstance(overrides, dict):
+        raise ValueError("version policy overrides must be a mapping")
+    for system, backends in overrides.items():
+        if not isinstance(system, str):
+            raise ValueError("version policy system names must be strings")
+        entries(backends)
 
 
 def _slot_version(system: str, backend: str, requested: str | None, versions, document: Mapping[str, Any]) -> str:
@@ -487,7 +592,9 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
         selection = loader.select(out.config)
     except SelectionError as exc:
         raise MissingDataError(f"cannot derive a {category} selection from the configuration: {exc}") from exc
-    if pin.configuration_id:
+    # A configuration ID names one entry of a category. Operation families are complementary inputs of one root,
+    # so there it chooses only among the entries of its own family and every other family still arrives.
+    if pin.configuration_id and category != "op-latency":
         selection = replace(selection, configuration_ids=(pin.configuration_id,))
 
     if pin.local_root is not None:
@@ -495,6 +602,19 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
         source, revision, downloaded = "local", f"local:{root}", 0
         source_key = "local-" + hashlib.sha256(str(root).encode()).hexdigest()[:16]
     else:
+        if category == "op-latency" and pin.configuration_id:
+            # Choose from the catalog before any manifest is planned, so a rejected alternative is never downloaded.
+            where = f"{pin.repo}@{pin.revision}"
+            try:
+                index = _remote_category_index(pin, transport, category, out)
+                chosen = _one_entry_per_family(
+                    [e for e in index.entries if selection.matches(e)], selection, where, pin.configuration_id
+                )
+            except SelectionError as exc:
+                raise MissingDataError(f"{exc} ({_describe(selection)} in {where})", selection=selection) from exc
+            except (ValueError, ValidationError) as exc:
+                raise MissingDataError(f"the {category} catalog is unusable: {exc}", selection=selection) from exc
+            selection = replace(selection, configuration_ids=tuple(e.configuration_id for e in chosen))
         result = _fetch_pinned(selection, pin, transport, out)
         root = result.root
         source = "hf-download" if result.downloaded_bytes else "hf-cache"
@@ -505,12 +625,13 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
     where = f"{pin.repo}@{revision}" if pin.local_root is None else str(root)
     if not entries:
         raise MissingDataError(
-            f"no {category} data for {_describe(selection)} in {where}; there is no fallback to other data",
+            f"no {category} data for {_describe(selection)} in {where}; there is no fallback to other data"
+            + _categories_hint(pin),
             selection=selection,
             source=where,
         )
     if category == "op-latency":
-        entries = _one_entry_per_family(entries, selection, where)
+        entries = _one_entry_per_family(entries, selection, where, pin.configuration_id)
         loaded, entry_ids = _load_op_latency(
             root,
             entries,
@@ -540,10 +661,17 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
             "set AISIM_DATA_CONFIGURATION (DataPin.configuration_id) to choose one"
         )
     entry = entries[0]
+    if out.config.get("backend_version") is None and entry.identity.framework_version is not None:
+        # The one match fixes an omitted version, so the identity check and the returned configuration use it. An
+        # explicit version never reaches here with another one (the selection filters it) and several matches
+        # were refused above.
+        out.config["backend_version"] = entry.identity.framework_version
     cache = Cache(pin.cache_dir)
     output_dir = cache.root / "materialized" / source_key / entry.configuration_id
     try:
-        loaded = _load(loader, category, root, entry, out.config, output_dir)
+        loaded = _load(
+            loader, category, root, entry, out.config, output_dir, isolate_roots="op-latency" in out.datasets
+        )
     except (LoaderError, ValueError) as exc:
         raise MissingDataError(
             f"{category} data {entry.configuration_id} in {where} failed verification: {exc}",
@@ -559,6 +687,12 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
         "configuration_id": entry.configuration_id,
         "downloaded_bytes": downloaded,
     }
+
+
+def _categories_hint(pin: DataPin) -> str:
+    return (
+        f"; this pin loads {', '.join(pin.categories)} (set AISIM_DATA_CATEGORIES to load other categories, e.g. fpm)"
+    )
 
 
 def _fetch_pinned(
@@ -594,7 +728,9 @@ def _fetch_pinned(
             ) from exc
     except SelectionError as exc:
         # Cached catalog exists but matches nothing: the answer is final for this revision.
-        raise MissingDataError(f"{exc} ({_describe(selection)} in {where})", selection=selection, source=where) from exc
+        raise MissingDataError(
+            f"{exc} ({_describe(selection)} in {where}){_categories_hint(pin)}", selection=selection, source=where
+        ) from exc
     try:
         # The auto-download allowance belongs to the whole pin: a donor fetched after the primary selection gets only
         # what the earlier fetches left.
@@ -610,15 +746,141 @@ def _fetch_pinned(
             already_downloaded=spent,
         ) from exc
     except SelectionError as exc:
-        raise MissingDataError(f"{exc} ({_describe(selection)} in {where})", selection=selection, source=where) from exc
+        raise MissingDataError(
+            f"{exc} ({_describe(selection)} in {where}){_categories_hint(pin)}", selection=selection, source=where
+        ) from exc
 
 
-def _load(loader, category: str, root: Path, entry: Entry, config: Mapping[str, Any], output_dir: Path):
+def _materialization_is_intact(systems: Path, manifest) -> bool:
+    """True when every runtime artifact of ``manifest`` is present under ``systems`` with its declared bytes."""
+    try:
+        for artifact in manifest.artifacts:
+            if artifact.runtime_path is not None:
+                _verify(systems, artifact.model_copy(update={"path": artifact.runtime_path}))
+    except (ValueError, OSError):
+        return False
+    return True
+
+
+def _cached_pin_is_valid(output_dir: Path, manifest, cached: Mapping[str, Any]) -> bool:
+    """True when the cached config pins the manifest's profile at the path this materialization wrote."""
+    try:
+        profile = next(a for a in manifest.artifacts if a.role == "execution-profile")
+        pin = cached["estimator_config"]["op_level"]["execution_profile"]
+        if pin.get("sha256") != profile.sha256 or Path(pin.get("path", "")) != output_dir / "profile.json":
+            return False
+        _verify(output_dir, profile.model_copy(update={"path": "profile.json"}))
+    except (StopIteration, KeyError, TypeError, AttributeError, ValueError, OSError):
+        return False
+    return True
+
+
+def _drop_generated_library_path(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy of ``config`` without an ``fpm_parquet_path`` that an earlier ensure call generated.
+
+    Such a path names a staged library of another materialization, in this cache or another one; keeping it would
+    pair a new dataset revision with the old library. A path the user set elsewhere, even one inside a cache
+    directory, is a genuine override and stays: only a root AISim staged counts as generated.
+    """
+    out = dict(config)
+    estimator = out.get("estimator_config")
+    interpolation = estimator.get("fpm_interpolation") if isinstance(estimator, Mapping) else None
+    path = interpolation.get("fpm_parquet_path") if isinstance(interpolation, Mapping) else None
+    # The generated file itself is a symlink to the dataset source. Resolve its
+    # parent to identify the materialization without following that final link.
+    if path is not None:
+        parent = Path(path).expanduser().parent.resolve()
+        if any(_is_generated_root(ancestor) for ancestor in (parent, *parent.parents)):
+            interpolation = {k: v for k, v in interpolation.items() if k != "fpm_parquet_path"}
+            out["estimator_config"] = {**out["estimator_config"], "fpm_interpolation": interpolation}
+    return out
+
+
+_GENERATED_ROOT_NAME = re.compile(r".+-[0-9a-f]{64}")
+
+
+def _is_generated_root(path: str | Path) -> bool:
+    """True for a staged library root that an earlier ensure call wrote, in any cache directory.
+
+    A root has the shape ``<cache>/materialized/<source key>/<configuration>-<roots digest>`` and carries the staging
+    marker that records AISim owns it (a cache directory that no longer exists leaves nothing to own, so the stale
+    name still counts). A configuration saved with another cache directory names such a root too, and it must not
+    outlive its pin as an explicit root; a manual file that only sits under ``materialized`` is not one.
+    """
+    resolved = Path(path).expanduser().resolve()
+    if resolved.parent.parent.name != "materialized" or _GENERATED_ROOT_NAME.fullmatch(resolved.name) is None:
+        return False
+    return (resolved / STAGED_MARKER).is_file() or not resolved.exists()
+
+
+def _drop_generated_roots(config: Mapping[str, Any]) -> Mapping[str, Any]:
+    """``config`` without the staged roots of earlier ensure calls in ``systems_paths``.
+
+    A returned configuration lists its own staging root. Keeping it as an explicit root when the configuration is
+    repinned would let that stale copy of the system definition and linked data shadow the roots a fresh load uses.
+    """
+    paths = config.get("systems_paths")
+    if not paths:
+        return config
+    kept = [p for p in paths if not _is_generated_root(p)]
+    return config if len(kept) == len(paths) else {**config, "systems_paths": kept}
+
+
+def _load(
+    loader,
+    category: str,
+    root: Path,
+    entry: Entry,
+    config: Mapping[str, Any],
+    output_dir: Path,
+    *,
+    isolate_roots: bool = False,
+):
     manifest_path = entry.manifest.path
+    # Preparation saves absolute paths, including for a relative cache; compare and key on the same spelling.
+    output_dir = output_dir.absolute()
     if category == "fpm":
-        # The catalog's pinned digest, identity and purpose first (a partly refreshed local dataset must be refused),
-        # then every declared artifact.
-        manifest = read_entry_manifest(root, entry, config, loader)
+        # The catalog's pinned digest, identity and purpose first (a partly refreshed local dataset must be refused);
+        # the peek hashes no artifact, so a library entry is not hashed twice.
+        peek = read_entry_manifest(root, entry, config, loader, roles=())
+        if any(a.role == "fpm-library" for a in peek.artifacts):
+            # Roots change the copied system definition and linked op data. Keep each ordered effective root
+            # set in its own materialization so later calls cannot replace an earlier configuration's inputs.
+            # A configuration returned by an earlier call lists that call's own staging root; it is derived from
+            # the same inputs, not a different user root, so it must not key this materialization or shadow it.
+            # With an op-latency pin the pinned root is the only source: no active root may fill a missing family.
+            config = _drop_generated_roots(_drop_generated_library_path(config))
+            roots = tuple(
+                str(p)
+                for p in _stageable_roots(config.get("systems_paths"), output_dir, include_active=not isolate_roots)
+                if not _is_generated_root(p)
+            )
+            # The key covers the ordered roots and the copies and links the build would make, so a definition edited in
+            # place, or a table that now resolves to another root, gets its own directory rather than replacing the
+            # one an earlier configuration still points at. An unchanged plan reuses its directory.
+            # It also covers the verified library pair, so a corrected pair published under the same configuration ID
+            # (even under new file names) is staged beside the earlier one rather than over it.
+            pair = sorted((a.role, a.path, a.sha256, a.bytes) for a in peek.artifacts if a.role in PREDICTION_ROLES)
+            inputs = {
+                "roots": roots,
+                "staged": staged_inputs_digest(
+                    entry.identity.hardware, entry.identity.framework, entry.identity.framework_version, roots
+                ),
+                "pair": pair,
+            }
+            roots_key = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+            output_dir = output_dir.with_name(f"{output_dir.name}-{roots_key}")
+            output_dir.parent.mkdir(parents=True, exist_ok=True)
+            # The tuple above is the complete staging input: staging must not expand the active roots again.
+            return loader.load(
+                root,
+                manifest_path,
+                output_dir=output_dir,
+                config=config,
+                systems_paths=roots,
+                isolate_systems_roots=True,
+            )
+        manifest = read_entry_manifest(root, entry, config, loader)  # then verifies every declared artifact
         # Keyed by content: a configuration ID names an identity, so a dataset republished in place with corrected
         # measurements must not be served from the preparation of the old ones.
         content = hashlib.sha256()
@@ -627,19 +889,46 @@ def _load(loader, category: str, root: Path, entry: Entry, config: Mapping[str, 
                 f"{artifact.path}\0{artifact.runtime_path}\0{artifact.role}\0{artifact.sha256}\0{artifact.bytes}\n".encode()
             )
         output_dir = output_dir.with_name(f"{output_dir.name}-{content.hexdigest()[:16]}")
-        cached = output_dir / "config.json"
-        if cached.is_file():  # materialized by an earlier verified load; config.json is written last
-            return FpmData(manifest, config=json.loads(cached.read_text()))
+        output_dir = output_dir.absolute()
         output_dir.parent.mkdir(parents=True, exist_ok=True)
-        data = loader.load(root, manifest_path, output_dir=output_dir, config=config)
-        if data.config is None:
-            raise LoaderError("an fpm-profile artifact cannot be built into a best_available configuration")
-        return data
+        # The lock covers the check, the rebuild of a stale directory and the build itself: a second caller must not
+        # remove a directory the first is still writing (config.json is written last).
+        with _cache_lock(output_dir):
+            cached = output_dir / "config.json"
+            if cached.is_file():  # materialized by an earlier load; config.json is written last
+                try:
+                    cached_config = json.loads(cached.read_text())
+                    if _materialization_is_intact(output_dir / "systems", manifest) and _cached_pin_is_valid(
+                        output_dir, manifest, cached_config
+                    ):
+                        cached_config["systems_paths"] = [str(output_dir / "systems")]
+                        return FpmData(manifest, config=cached_config)
+                except ValueError:
+                    pass
+            if output_dir.exists():  # partial, stale or edited: rebuild, never serve or trip over it
+                shutil.rmtree(output_dir)
+            data = loader.load(root, manifest_path, output_dir=output_dir, config=config)
+            if data.config is None:
+                raise LoaderError("an fpm-profile artifact cannot be built into a best_available configuration")
+            return data
     raise ValueError(f"no loader for category {category!r}")
 
 
-def _one_entry_per_family(entries: list[Entry], selection: Selection, where: str) -> list[Entry]:
-    """Operation families are complementary inputs of one root; two entries for one family are a real conflict."""
+def _one_entry_per_family(
+    entries: list[Entry], selection: Selection, where: str, configuration_id: str | None = None
+) -> list[Entry]:
+    """Operation families are complementary inputs of one root; two entries for one family are a real conflict.
+
+    ``configuration_id`` settles the conflict of its own family only: the other families are kept as they are, and
+    one that still has several entries stays a conflict.
+    """
+    if configuration_id is not None:
+        chosen = next((e for e in entries if e.configuration_id == configuration_id), None)
+        if chosen is None:
+            raise MissingDataError(
+                f"no op-latency data for configuration {configuration_id} in {where}", selection=selection, source=where
+            )
+        entries = [e for e in entries if e.identity.operation_family != chosen.identity.operation_family or e == chosen]
     by_family: dict[str | None, list[Entry]] = {}
     for entry in entries:
         by_family.setdefault(entry.identity.operation_family, []).append(entry)
@@ -931,6 +1220,11 @@ def _wire(config: dict[str, Any], category: str, loaded: Any, entry: Entry | Non
         config["systems_paths"] = [str(loaded.root)]
         return
     loaded_config = loaded.config
+    if loaded.kind == "library":
+        # The loader built this from the user's configuration, so every user choice is kept.
+        config.clear()
+        config.update(loaded_config)
+        return
     paths = [*(loaded_config.get("systems_paths") or ()), *(config.get("systems_paths") or ())]
     config["systems_paths"] = list(dict.fromkeys(str(p) for p in paths))
     wanted = loaded_config["estimator_config"]["op_level"]["execution_profile"]

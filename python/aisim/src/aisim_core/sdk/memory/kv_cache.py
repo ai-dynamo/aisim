@@ -51,7 +51,7 @@ from aisim_core.sdk.common import DefaultHFModels
 from aisim_core.sdk.config import validate_parallel_size
 from aisim_core.sdk.config_builders import apply_nextn, build_model_config, validate_moe_controls, validate_nextn
 from aisim_core.sdk.errors import InvalidEngineConfigurationError
-from aisim_core.sdk.fpm_profile import FpmModelProfile, load_fpm_profile
+from aisim_core.sdk.fpm_profile import FpmModelProfile, _load_fpm_timing_profile
 from aisim_core.sdk.models import get_model
 from aisim_core.sdk.models.helpers import (
     resolve_sglang_mla_compute,
@@ -1245,7 +1245,7 @@ def estimate_kv_cache(
                 "FPM profile resources carry the measured rank memory; colocated_encoder, "
                 "reserved_bytes and encoder_parallel apply to the model build path only"
             )
-        profile = load_fpm_profile(fpm_profile)
+        profile = _load_fpm_timing_profile(fpm_profile)
         if backend_version is None:
             raise ValueError("FPM profile memory estimation requires the profile's literal backend_version")
         deployment = profile.select(
@@ -1274,7 +1274,7 @@ def estimate_kv_cache(
             enable_eplb=enable_eplb,
             wideep_num_slots=wideep_num_slots,
         )
-        resources = deployment.resources
+        resources = deployment.require_resources()
         resources.require_memory()
         resources.validate_envelope(max_num_tokens=max_num_tokens, max_batch_size=max_batch_size)
         if (
