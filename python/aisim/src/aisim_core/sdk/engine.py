@@ -922,19 +922,23 @@ def _resolve_attention_lane_orders(
 
     for op in ops:
         if isinstance(op, ContextAttention):
-            op._lane_order = resolved_lane_order_for_op(
+            order = resolved_lane_order_for_op(
                 database,
                 "_context_attention_data",
                 override,
                 architecture,
             )
+            if op._lane_order != order:
+                op._lane_order = order
         elif isinstance(op, GenerationAttention):
-            op._lane_order = resolved_lane_order_for_op(
+            order = resolved_lane_order_for_op(
                 database,
                 "_generation_attention_data",
                 override,
                 architecture,
             )
+            if op._lane_order != order:
+                op._lane_order = order
         elif isinstance(op, FPMForwardOp):
             _resolve_attention_lane_orders(op._sol_ops, database, override, architecture)
 

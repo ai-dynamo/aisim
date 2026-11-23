@@ -1857,9 +1857,17 @@ def engine_identity(model: Any, database: Any) -> str:
         and memo[5] == mutation_epoch
     ):
         return memo[3]
-    from aisim_core.sdk.engine import OpConversionError
+    from aisim_core.sdk.engine import OpConversionError, _resolve_attention_lane_orders
 
     try:
+        # Compilation resolves these fields on the source graph. Normalize
+        # them before taking its identity, and don't mistake that preparation
+        # for an edit made after publication. The resolver skips equal values.
+        override = getattr(getattr(model, "config", None), "attention_backend", None)
+        architecture = getattr(model, "architecture", None)
+        for phase in ("context_ops", "generation_ops"):
+            _resolve_attention_lane_orders(getattr(model, phase, ()), database, override, architecture)
+        mutation_epoch = Operation._mutation_epoch()
         key = _engine_config_json(model, database)
     except OpConversionError as exc:
         # There is no conversion-independent graph key for a rejected identity.

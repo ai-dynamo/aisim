@@ -87,11 +87,13 @@ def main():
         "python": sys.version,
         "platform": platform.platform(),
         "source_baseline": "d32fb0aa013ae4a0ab98074093d6d71d36fc72c9",
-        "source_candidate": "32d50c27d31f63c124e9eb042853cf46ecb05847",
+        "source_candidate": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
         "driver_sha256": fingerprint(__file__),
         "warmup_calls": 1000,
         "timed_calls": 100,
-        "variant_difference": "Only sdk/rust_engine_step.py is restored; both use the candidate optimized native extension.",
+        "variant_difference": (
+            "Only sdk/rust_engine_step.py is restored; both use the candidate optimized native extension."
+        ),
     }
     with tempfile.TemporaryDirectory() as temporary:
         for index in range(6):
