@@ -158,10 +158,13 @@ def _download(selection: Selection, args: argparse.Namespace, repo: str, revisio
             f"{_NAME}: downloading {_mib(planned.uncached_bytes)} in {len(planned.uncached)} files "
             f"from {repo}@{planned.revision[:12]}\n"
         )
-    # The plan resolved the revision; reuse the SHA so the download needs no second lookup.
+    # The plan resolved the revision; reuse the SHA so the download needs no second lookup. When the plan followed a
+    # retired repository to its successor, the SHA belongs to the successor and fetch() would take it verbatim from
+    # the retired name, without the alias and its path mapping, so resolve the requested revision again instead.
     # The metadata the plan downloaded is spent: the rest of the allowance bounds the artifacts.
     remaining = None if cap is None else max(cap - planned.metadata_bytes, 0)
-    result = fetch(selection, revision=planned.revision, max_bytes=remaining, **common)
+    resolved_revision = planned.revision if planned.repo == repo else revision
+    result = fetch(selection, revision=resolved_revision, max_bytes=remaining, **common)
     result.plan.requested_revision = revision
     result.plan.metadata_bytes += planned.metadata_bytes
     return {"dry_run": False, **result.to_dict()}
