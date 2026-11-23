@@ -9,6 +9,7 @@
 #   * runs the library at AISIM_REVIEWED_COMMIT (a full SHA) and nothing else;
 #   * checkout pin, repository URLs and launcher are readonly shell literals in the reviewed definition, git runs
 #     without environment configuration, and a pipeline variable cannot replace the validated job selector;
+#   * inherited Git configuration cannot rewrite those URLs or redirect cache authorization headers;
 #   * only `publish_candidate` and `promote` see the scoped write token, only `staleness` the read token,
 #     and neither reaches dependency setup or the library processes;
 #   * an unchanged refresh makes no commit; a candidate goes to a candidate/* branch, never the default branch;
@@ -85,6 +86,14 @@ variables:
         https://*) ;;
         *) echo "install the approved HTTPS cache URL in the reviewed definition" >&2; exit 2 ;;
       esac
+      # Git applies insteadOf before HTTP redirect policy. Ignore caller/runner
+      # configuration for setup and every later clone, fetch and push in this shell.
+      unset GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR \
+        GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+      export GIT_CONFIG_COUNT=0 GIT_CONFIG_NOSYSTEM=1
+      export GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_GLOBAL=/dev/null
+      # Fresh repositories must not acquire local config or hooks from a template.
+      export GIT_TEMPLATE_DIR=
       rm -rf aisim && mkdir aisim && cd aisim
       git init -q && git remote add origin "$AISIM_REPO_URL"
       git fetch -q --depth 1 origin "$AISIM_REVIEWED_COMMIT"

@@ -14,8 +14,11 @@ internal project by hand.
    `https://github.com/ai-dynamo/aisim.git`. The template fails before network access until configured.
    These values and `JOB_PY` are readonly shell assignments: pipeline, schedule and manual-job variables
    cannot override them. Change the pin or destination only through another reviewed merge request;
-   never replace these assignments with CI/CD variables or inputs. Authenticated git commands disable
-   redirects so the cache token cannot be forwarded to another URL. If another project includes the
+   never replace these assignments with CI/CD variables or inputs. Before the first Git command, setup
+   clears inherited command configuration and repository selectors, disables system/global configuration,
+   and disables repository templates. This prevents inherited `url.*.insteadOf` rewrites from changing
+   the destination of cache authorization headers during setup, clone, fetch or push. Authenticated Git
+   commands also disable HTTP redirects. If another project includes the
    installed definition, pin its reviewed ref and restrict edits to that include and the definition.
 2. Set the protected credentials and alert variables listed at the top of the file. Do not create
    CI/CD variables for `AISIM_REVIEWED_COMMIT`, `AISIM_REPO_URL`, `INFX_CACHE_REPO_URL` or `JOB_PY`.
