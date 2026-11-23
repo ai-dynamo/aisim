@@ -1450,6 +1450,8 @@ def estimate_mixed_step_breakdown_with_rust(
     prefix: int,
     seq_imbalance_correction_scale: float = 1.0,
     gen_seq_imbalance_correction_scale: float = 1.0,
+    _decode_ops: Any = None,
+    _capture_decode_ops: bool = False,
 ) -> dict[str, Any]:
     """Estimate one mixed step with per-op and per-component values retained.
 
@@ -1477,6 +1479,15 @@ def estimate_mixed_step_breakdown_with_rust(
     except ValueError as exc:
         _reraise_engine_error(exc)
     _note_rust_provenance(handle)
+
+    if _decode_ops is not None:
+        # Aggregate chunks advance one request's prefix. Other requests keep
+        # their original decode KV lengths. Reuse their native pass entries
+        # before name folding, including energy, sources, and fallback metadata.
+        covered_latency_ms += sum(entry[1] for entry in _decode_ops if entry[2] > 0) - sum(
+            entry[1] for entry in decode_attn_ops if entry[2] > 0
+        )
+        decode_attn_ops = _decode_ops
 
     shared_latency, shared_energy, _, _ = _fold_per_op(shared_ops)
     ctx_latency, ctx_energy, _, _ = _fold_per_op(ctx_attn_ops)
@@ -1521,7 +1532,7 @@ def estimate_mixed_step_breakdown_with_rust(
         "context_attention": ctx_attention_energy,
         "decode_attention": dec_attention_energy,
     }
-    return {
+    result = {
         "latency_ms": sum(component_latency_ms.values()),
         "energy_wms": sum(component_energy_wms.values()),
         "component_latency_ms": component_latency_ms,
@@ -1533,6 +1544,9 @@ def estimate_mixed_step_breakdown_with_rust(
         "per_op_source": per_op_source,
         "moe_comm_fallbacks": fallbacks,
     }
+    if _capture_decode_ops:
+        result["_decode_ops"] = decode_attn_ops
+    return result
 
 
 def estimate_decode_step_latency_with_rust(

@@ -36,6 +36,17 @@ Data-source inheritance and empirical transfer are different. A row inherited
 from an approved measured donor is still collected data. An estimated
 cross-shape or cross-precision transfer must retain its transfer provenance.
 
+For qualified Mamba context graphs, aggregate prefill capacity is limited to
+the request slots left after decode admission. Direct `run_mixed` inputs
+describe already scheduled work and retain their explicit prefill count.
+Batched text aggregates weight the actual uncached chunks, including the short
+final chunk and one recurrent-state transfer per chunk. For batch four,
+ISL 4096, prefix 3072 and a 512-token prefill budget, this means eight mixed
+steps; the cold control still needs 32. Chunk prices include the concurrent
+decoders and the prefix accumulated by each request's earlier chunks.
+Aggregate result caching also distinguishes Nemotron-H state-cache precision,
+even when non-MTP graphs can reuse the same compiled timing handle.
+
 For cached-prefix text requests, the XPU vLLM aggregate TTFT estimate prices
 one request's uncached chunks explicitly before applying its burst or admission
 factor. Full prompt tokens remain the native op-level budget coordinates;

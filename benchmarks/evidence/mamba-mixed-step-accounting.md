@@ -974,6 +974,14 @@ The raw rounds are in
 and
 [`host-perf-qwen-d462dab8-d6b02759.json`](mamba-mixed-step-accounting/host-perf-qwen-d462dab8-d6b02759.json).
 
+The Qwen artifact predates `worker_runs` and retains only `orders` and
+`results`. The original command, exact `HOST_PERF_MODELS` and
+`HOST_PERF_MODES` environment values, and revision supplying `host_perf.py`
+are not preserved in the available run records. Its Qwen-only SILICON case
+set does not establish those environment values or the driver revision.
+The historical measurements above remain unchanged; reproducing their
+original invocation requires the author's run records.
+
 `c51eceaf` adds one covered-latency value per folded operation and per
 query, with no new traversal, query or cache. Native Replay ran
 `aisim predict --stack engine` with `d6b02759` and `c51eceaf` in 6 alternating

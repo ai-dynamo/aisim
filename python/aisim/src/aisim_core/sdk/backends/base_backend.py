@@ -1780,6 +1780,8 @@ class BaseBackend:
         database: PerfDatabase,
         runtime_config: RuntimeConfig,
         step: MixedStepInput,
+        *,
+        _decode_ops=None,
     ) -> StepEstimate:
         """Estimate one scheduled mixed prefill/decode forward pass.
 
@@ -1814,6 +1816,7 @@ class BaseBackend:
             prefix=prefix,
             seq_imbalance_correction_scale=runtime_config.seq_imbalance_correction_scale,
             gen_seq_imbalance_correction_scale=runtime_config.gen_seq_imbalance_correction_scale,
+            **({"_decode_ops": _decode_ops} if _decode_ops is not None else {}),
         )
         component_latency_ms = dict(components["component_latency_ms"])
         component_energy_wms = dict(components["component_energy_wms"])
@@ -2017,16 +2020,79 @@ class BaseBackend:
 
     def _schedule_qualified_mamba_prefill(self, model, runtime_config, step: MixedStepInput) -> MixedStepInput:
         """Drop unused aggregate capacity before querying a scheduled Mamba step."""
-        if (
-            not _is_fpm_model(model)
-            and runtime_config.prefix > 0
-            and _has_qualified_mamba(model, phases=("context_ops",))
-        ):
+        if not _is_fpm_model(model) and _has_qualified_mamba(model, phases=("context_ops",)):
             isl = runtime_config.isl + self._visual_context_tokens(model, runtime_config)
             if isl > runtime_config.prefix:
-                full, partial = divmod(step.context_tokens, isl)
+                prefill_slots = max(1, runtime_config.batch_size - step.num_decode_requests)
+                full, partial = divmod(min(step.context_tokens, prefill_slots * isl), isl)
                 step = dataclasses.replace(step, context_tokens=full * isl + min(partial, isl - runtime_config.prefix))
         return step
+
+    def _average_agg_text_chunks(self, model, database, runtime_config, chunk_tokens, num_decode_requests=0):
+        """Average one request's exact chunks, retaining only O(operations) evidence.
+
+        Batched chunks have already passed backend admission. Price their
+        scheduled coordinates directly, without reserving decode capacity twice.
+        The work scales with one suffix's chunk count, not the batch size.
+        """
+        isl, prefix = runtime_config.isl, runtime_config.prefix
+        chunks = math.ceil((isl - prefix) / chunk_tokens)
+        scalar_totals = dict.fromkeys(("latency_ms", "energy_wms", "covered_latency_ms"), 0.0)
+        maps = {
+            field: defaultdict(float)
+            for field in (
+                "per_op_latency_ms",
+                "per_op_energy_wms",
+                "component_latency_ms",
+                "component_energy_wms",
+            )
+        }
+        sources = {}
+        fallbacks = ()
+        decode_ops = None
+        if num_decode_requests:
+            decode_ops = estimate_mixed_step_breakdown_with_rust(
+                model,
+                database,
+                ctx_tokens=0,
+                gen_tokens=num_decode_requests,
+                isl=isl,
+                osl=runtime_config.osl,
+                prefix=prefix,
+                seq_imbalance_correction_scale=runtime_config.seq_imbalance_correction_scale,
+                gen_seq_imbalance_correction_scale=runtime_config.gen_seq_imbalance_correction_scale,
+                _capture_decode_ops=True,
+            )["_decode_ops"]
+        for done in range(0, isl - prefix, chunk_tokens):
+            length = min(chunk_tokens, isl - prefix - done)
+            past = prefix + done
+            chunk_runtime = copy.copy(runtime_config)
+            chunk_runtime.isl = past + length
+            chunk_runtime.prefix = past
+            budget = length if _is_fpm_model(model) else past + length
+            step = MixedStepInput(budget, num_decode_requests)
+            chunk = (
+                BaseBackend.run_mixed(self, model, database, chunk_runtime, step, _decode_ops=decode_ops)
+                if num_decode_requests
+                else self.run_mixed(model, database, chunk_runtime, step)
+            )
+            for field in scalar_totals:
+                scalar_totals[field] += getattr(chunk, field)
+            for field, totals in maps.items():
+                for name, value in getattr(chunk, field).items():
+                    totals[name] += value
+            for name, source in chunk.per_op_source.items():
+                sources[name] = source if name not in sources or sources[name] == source else "mixed"
+            fallbacks = merge_moe_comm_fallbacks(fallbacks, chunk.moe_comm_fallbacks)
+        # A mean has no individual iteration's context coordinates.
+        return StepEstimate(
+            **{field: total / chunks for field, total in scalar_totals.items()},
+            **{field: {name: value / chunks for name, value in totals.items()} for field, totals in maps.items()},
+            per_op_source=sources,
+            moe_comm_fallbacks=fallbacks,
+            num_decode_requests=num_decode_requests,
+            num_decode_query_tokens=num_decode_requests * (model._nextn + 1),
+        )
 
     def run_agg(
         self, model: BaseModel, database: PerfDatabase, runtime_config: RuntimeConfig, **kwargs
@@ -2102,7 +2168,15 @@ class BaseBackend:
         self._require_rust_engine_step(runtime_config, database, surface="aggregate")
         # The compiled-engine identity scopes reuse to this model graph and
         # this database in its current mode; it is memoized on the model.
-        cache_key = (cache_key, engine_identity(model, database))
+        hybrid_config = getattr(model, "_hybrid_config", None)
+        cache_key = (
+            cache_key,
+            engine_identity(model, database),
+            # This frozen configuration also controls resident Mamba state.
+            # Non-MTP timing graphs omit its cache dtype and may share a handle,
+            # but their memory footprints and OOM verdicts must stay distinct.
+            hybrid_config if isinstance(hybrid_config, common.NemotronHConfig) else None,
+        )
         cached = self._agg_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -2122,7 +2196,7 @@ class BaseBackend:
         # steps, and the step count the TTFT queuing factor reads.
         ttft_ctx_tokens = ctx_tokens
         ttft_steps_to_finish_ctx = steps_to_finish_ctx
-        fpm_prefill_chunks = None
+        prefill_chunks = None
         num_mix_steps = num_genonly_steps = 0
         num_mix_steps_for_tpot_calc = 0  # correction for tpot calc only
         if b > 1:
@@ -2179,64 +2253,33 @@ class BaseBackend:
         # its image fields stay intact so run_mixed adds them exactly once.
         averages_text_chunks = b == 1 and num_mix_steps > 1 and img_ctx_tokens == 0
         if averages_text_chunks:
-            # Fold each exact chunk immediately: retain O(operations) evidence,
-            # rather than O(chunks * operations) complete StepEstimate objects.
-            scalar_totals = dict.fromkeys(("latency_ms", "energy_wms", "covered_latency_ms"), 0.0)
-            maps = {
-                field: defaultdict(float)
-                for field in (
-                    "per_op_latency_ms",
-                    "per_op_energy_wms",
-                    "component_latency_ms",
-                    "component_energy_wms",
-                )
-            }
-            sources = {}
-            fallbacks = ()
-            # Each chunk has one request and its already computed prefix. The
-            # op-level budget includes that prefix; FPM consumes new tokens.
-            for done in range(0, isl - prefix, ctx_tokens):
-                length = min(ctx_tokens, isl - prefix - done)
-                past = prefix + done
-                chunk_runtime = copy.copy(runtime_config)
-                chunk_runtime.isl = past + length
-                chunk_runtime.prefix = past
-                budget = length if getattr(model, "forward_model", "op_level") == "fpm" else past + length
-                chunk = self.run_mixed(model, database, chunk_runtime, MixedStepInput(budget, 0))
-                for field in scalar_totals:
-                    scalar_totals[field] += getattr(chunk, field)
-                for field, totals in maps.items():
-                    for name, value in getattr(chunk, field).items():
-                        totals[name] += value
-                for name, source in chunk.per_op_source.items():
-                    sources[name] = source if name not in sources or sources[name] == source else "mixed"
-                fallbacks = merge_moe_comm_fallbacks(fallbacks, chunk.moe_comm_fallbacks)
-            # The summary API weights this aggregate mean by its iteration
-            # count. It has no individual iteration's workload coordinates.
-            mix_step_estimate = StepEstimate(
-                **{field: total / num_mix_steps for field, total in scalar_totals.items()},
-                **{
-                    field: {name: value / num_mix_steps for name, value in totals.items()}
-                    for field, totals in maps.items()
-                },
-                per_op_source=sources,
-                moe_comm_fallbacks=fallbacks,
-            )
+            mix_step_estimate = self._average_agg_text_chunks(model, database, runtime_config, ctx_tokens)
         else:
             mix_step_estimate = self._run_agg_mixed_step(
                 model, database, runtime_config, MixedStepInput(num_mix_ctx_tokens, num_mix_gen_tokens)
             )
         if b > 1:
-            if _is_fpm_model(model) and isl > prefix:
+            qualified_prefill = not _is_fpm_model(model) and _has_qualified_mamba(model, phases=("context_ops",))
+            if (_is_fpm_model(model) or qualified_prefill) and isl > prefix:
                 # Read the actual fresh-token query after backend scheduling
                 # (including XPU decode caps and budget reservation). A query
                 # below one suffix averages ceil(suffix/fresh) chunks; larger
                 # queries price their fraction of the batch's fresh work.
                 fresh_tokens = mix_step_estimate.context_tokens
+                if qualified_prefill:
+                    full, partial = divmod(fresh_tokens, isl)
+                    fresh_tokens = full * (isl - prefix) + partial
                 chunks = math.ceil((isl - prefix) / fresh_tokens)
                 requests = max(1.0, fresh_tokens / (isl - prefix))
                 steps_to_finish_ctx = b * chunks / requests
-                fpm_prefill_chunks = chunks
+                if qualified_prefill and chunks > 1 and img_ctx_tokens == 0:
+                    # Include the short final chunk and its state transfer;
+                    # charging a full-budget scan `chunks` times invents tokens.
+                    mix_step_estimate = self._average_agg_text_chunks(
+                        model, database, runtime_config, fresh_tokens, mix_step_estimate.num_decode_requests
+                    )
+                    averages_text_chunks = True
+                prefill_chunks = chunks
                 ttft_steps_to_finish_ctx = steps_to_finish_ctx
             num_mix_steps = steps_to_finish_ctx
             if steps_to_finish_ctx >= decode_iterations:
@@ -2316,8 +2359,8 @@ class BaseBackend:
                 if b == 1 and num_mix_steps > 1 and img_ctx_tokens == 0
                 # Base TTFT counts one request's native chunk sequence. Keep
                 # the scheduler budget available to backend queue calibration.
-                else {"prefill_total_ms": _prefill_step_ms * fpm_prefill_chunks}
-                if fpm_prefill_chunks is not None
+                else {"prefill_total_ms": _prefill_step_ms * prefill_chunks}
+                if prefill_chunks is not None
                 else {}
             ),
         )
