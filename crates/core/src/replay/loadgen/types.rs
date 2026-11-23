@@ -188,6 +188,11 @@ pub struct AgenticMooncakeRow {
     /// configured engine timing model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded_api_time_ms: Option<f64>,
+    /// Source-recorded start offset of a request that `not_before_ms` does not
+    /// hold to the recorded clock. A snapshot reads it for the cut and for the
+    /// request's timer after the cut; replay does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_start_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -262,6 +267,11 @@ pub struct AgenticNode {
     // recorded request starts. Excluded from the canonical graph contract.
     #[serde(skip)]
     pub(super) recorded_interval_ms: Option<(f64, Option<f64>)>,
+    // The recorded start still holds this request when it resumes after a
+    // snapshot cut with its causal predecessor in history. Excluded like the
+    // interval.
+    #[serde(skip)]
+    pub(super) recorded_start_gates_frontier: bool,
     pub(super) priority: i32,
     pub(super) strict_priority: u32,
     pub(super) policy_class: Option<String>,
@@ -480,7 +490,7 @@ pub enum SessionPartitionSpec {
     RoundRobin { num_partitions: usize },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ReplayRequestHashes {
     /// Local hashes for complete engine blocks, including any cache salt.
     ///
@@ -511,6 +521,32 @@ impl ReplayRequestHashes {
         Self::from_local_block_hashes(
             block_hashes_with_salt(tokens, engine_block_size as usize, cache_salt).collect(),
         )
+    }
+
+    /// Extend hashes that cover a prefix of `tokens` to all of its complete
+    /// blocks. Equal to [`Self::from_tokens`] over `tokens`: a block's local
+    /// hash reads only its own tokens and a sequence hash only its parent, so
+    /// appending tokens never changes a hash that is already here.
+    pub(crate) fn extend_from_tokens(&mut self, tokens: &[u32], engine_block_size: u32) {
+        let block_size = engine_block_size as usize;
+        if block_size == 0 {
+            return;
+        }
+        let new_tokens = &tokens[self.local_block_hashes.len() * block_size..];
+        let new_blocks = new_tokens.len() / block_size;
+        self.local_block_hashes.reserve(new_blocks);
+        self.sequence_hashes.reserve(new_blocks);
+        for block_hash in block_hashes_with_salt(new_tokens, block_size, None) {
+            let sequence_hash = self
+                .sequence_hashes
+                .last()
+                .copied()
+                .map_or(block_hash, |parent| {
+                    compute_next_sequence_hash(parent, block_hash)
+                });
+            self.local_block_hashes.push(block_hash);
+            self.sequence_hashes.push(sequence_hash);
+        }
     }
 
     /// Equal to [`Self::from_tokens_with_cache_salt`] over the prompt that

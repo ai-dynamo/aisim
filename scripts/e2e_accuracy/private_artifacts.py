@@ -8,11 +8,23 @@ import os
 import tempfile
 from pathlib import Path
 
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 MAGIC = b"AISIM-HF-ARTIFACT-v1\0"
+
+
+class PrivateArtifactAuthenticationError(InvalidTag):
+    """Authentication failed: the artifact was altered, or the opening job's token differs from the sealing job's."""
+
+    def __init__(self, path: Path):
+        super().__init__(
+            f"private artifact {path.name} failed authentication: it was altered, or HF_READ_AISIM_INFX_CACHE "
+            "resolves to a different value in this job's environment than in the job that sealed it "
+            "(the artifact key is derived from it, so every environment in a run must resolve the same token)"
+        )
 
 
 def transfer(source: Path, destination: Path, *, decrypt: bool):
@@ -66,7 +78,10 @@ def transfer(source: Path, destination: Path, *, decrypt: bool):
                         raise ValueError("truncated private artifact")
                     remaining -= len(block)
                     outgoing.write(transform.update(block))
-                outgoing.write(transform.finalize())
+                try:
+                    outgoing.write(transform.finalize())
+                except InvalidTag as exc:
+                    raise PrivateArtifactAuthenticationError(path) from exc
                 if not decrypt:
                     outgoing.write(transform.tag)
             temporary.replace(target)

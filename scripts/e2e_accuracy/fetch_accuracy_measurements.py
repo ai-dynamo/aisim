@@ -70,7 +70,7 @@ def release_items(path: str) -> list[dict]:
     """Read every page of release metadata from the fixed upstream repository."""
     items = []
     for page in range(1, 101):
-        headers = {"Accept": "application/vnd.github+json", "User-Agent": "aisimulate-accuracy"}
+        headers = {"Accept": "application/vnd.github+json", "User-Agent": "aisim-accuracy"}
         if token := os.environ.get("GITHUB_TOKEN"):
             headers["Authorization"] = f"Bearer {token}"
         request = urllib.request.Request(
@@ -321,6 +321,6 @@ if __name__ == "__main__":
     if args.resolve_latest:
         resolved = resolve_latest_manifest(manifest)
         args.output.write_text(json.dumps(resolved, sort_keys=True) + "\n")
-        print(f"Resolved {resolved['release_tag']}")
+        print(f"Resolved {resolved['release_tag']} snapshot {resolved.get('snapshot_id', 'unrecorded')}")
     else:
         fetch(manifest, args.output)

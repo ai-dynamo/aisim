@@ -28,6 +28,8 @@ import pytest
 import yaml
 
 from scripts.ci import check_python_licenses as python_licenses
+from scripts.ci import generate_license_evidence as license_evidence
+from scripts.ci import readme_rc_wheels as rc_wheels
 from scripts.ci.check_application_test_inventory import Inventory, assignment
 from scripts.ci.require_fast_ci import REQUIRED_JOBS, GateError, latest_run, require_fast_ci, verify_jobs
 from scripts.ci.select_full_ci import COMPONENTS, select_components
@@ -39,6 +41,107 @@ from scripts.release.build_manylinux_wheel import manylinux_platform
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_ROOT = REPOSITORY_ROOT / ".github" / "workflows"
 ACTION_ROOT = REPOSITORY_ROOT / ".github" / "actions"
+
+
+@pytest.mark.parametrize("pool", ["amd64", "arm64"])
+@pytest.mark.parametrize("failed_probe", [None, "machine", "workspace", "scratch"])
+def test_runner_canary_probes_survive_container_home_override(tmp_path, pool, failed_probe):
+    job = _workflow("runner-canary.yml")["jobs"]["canary"]
+    entry = next(item for item in job["strategy"]["matrix"]["include"] if item["pool"] == pool)
+    step = next(item for item in job["steps"] if "run" in item)
+    assert job["container"]["env"]["USER"] == "runner"
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    workspace.mkdir()
+    scratch.mkdir()
+    log = tmp_path / "probes.log"
+    log.touch()
+    # Model the runner replacing container HOME, then applying the job and step
+    # environments. Only host paths and architecture are controlled here; the
+    # exact canary run block still performs its HOME and source assertions.
+    env = {
+        **os.environ,
+        **job["container"]["env"],
+        "HOME": "/github/home",
+        **job.get("env", {}),
+        "EXPECTED_MACHINE": entry["machine"],
+        "REPORTED_MACHINE": "incompatible-machine" if failed_probe == "machine" else entry["machine"],
+        "EXPECT_SCRATCH": str(entry["scratch"]).lower(),
+        "GITHUB_REPOSITORY": "ai-dynamo/aisim",
+        "GITHUB_SHA": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPOSITORY_ROOT, text=True).strip(),
+        "RUNNER_NAME": f"controlled-{pool}",
+        "PROBE_WORKSPACE": str(workspace),
+        "PROBE_SCRATCH": str(scratch),
+        "PROBE_WORKSPACE_WRITABLE": str(failed_probe != "workspace").lower(),
+        "PROBE_SCRATCH_WRITABLE": str(failed_probe != "scratch").lower(),
+        "PROBE_LOG": str(log),
+    }
+    controls = r"""
+pwd() { printf '/__w/aisim/aisim\n'; }
+uname() { printf 'architecture\n' >> "$PROBE_LOG"; printf '%s\n' "$REPORTED_MACHINE"; }
+test() {
+  if [[ "$1" == -w && "$2" == /__w/aisim/aisim ]]; then
+    [[ "$PROBE_WORKSPACE_WRITABLE" == true ]] && builtin test -w "$PROBE_WORKSPACE"
+  elif [[ "$1" == -w && "$2" == /scratch ]]; then
+    [[ "$PROBE_SCRATCH_WRITABLE" == true ]] && builtin test -w "$PROBE_SCRATCH"
+  else
+    builtin test "$@"
+  fi
+}
+mktemp() {
+  printf '%s\n' "$1" >> "$PROBE_LOG"
+  case "$1" in
+    /__w/aisim/aisim/*) command mktemp "$PROBE_WORKSPACE/${1##*/}" ;;
+    /scratch/*) command mktemp "$PROBE_SCRATCH/${1##*/}" ;;
+    *) return 1 ;;
+  esac
+}
+"""
+    result = subprocess.run(
+        ["bash", "-euc", controls + step["run"]],
+        cwd=REPOSITORY_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    probes = [
+        "architecture",
+        "/__w/aisim/aisim/.runner-canary.XXXXXX",
+        "/scratch/runner-canary.XXXXXX",
+    ]
+    if failed_probe is None:
+        assert result.returncode == 0, result.stderr
+        assert f"({entry['machine']}) with writable HOME=/__w/aisim/aisim" in result.stdout
+        assert log.read_text().splitlines() == probes
+    else:
+        assert result.returncode != 0
+        assert "Verified source" not in result.stdout
+        completed = {"workspace": 0, "machine": 1, "scratch": 2}[failed_probe]
+        assert log.read_text().splitlines() == probes[:completed]
+    assert not list(workspace.iterdir())
+    assert not list(scratch.iterdir())
+
+
+def test_documented_active_runner_labels_match_workflow_selectors():
+    labels = set()
+    for path in WORKFLOW_ROOT.glob("*.yml"):
+        for job in _workflow(path.name)["jobs"].values():
+            selector = job.get("runs-on", "")
+            matrix = job.get("strategy", {}).get("matrix", {})
+            if selector == "${{ matrix.runner }}":
+                selectors = [entry["runner"] for entry in matrix["include"]]
+            elif isinstance(selector, str) and "${{ matrix.arch }}" in selector:
+                arches = matrix["arch"] if "arch" in matrix else [entry["arch"] for entry in matrix["include"]]
+                selectors = [selector.replace("${{ matrix.arch }}", arch) for arch in arches]
+            else:
+                selectors = selector if isinstance(selector, list) else [selector]
+            labels.update(label for label in selectors if isinstance(label, str) and label.startswith("prod-aisim"))
+    assert labels
+    documentation = (REPOSITORY_ROOT / "docs/ci/README.md").read_text()
+    assert set(re.findall(r"`(prod-aisim[^`]+)`", documentation)) == labels
+    lint_labels = yaml.safe_load((REPOSITORY_ROOT / ".github/actionlint.yaml").read_text())
+    assert {label for label in lint_labels["self-hosted-runner"]["labels"] if label.startswith("prod-aisim")} == labels
 
 
 def test_stable_release_migrations_require_reviewed_clearance(tmp_path):
@@ -114,6 +217,8 @@ def test_forward_perf_selects_before_allocating_the_benchmark_runner():
     selector = workflow["jobs"]["select"]
     compare = workflow["jobs"]["compare"]
     assert selector["runs-on"] == "ubuntu-24.04"
+    # Draft and stacked-base skips are selector decisions with a reported reason.
+    assert "if" not in selector
     assert "python scripts/performance/select_forward_perf.py" in _run_commands(selector)
     assert compare["needs"] == "select"
     assert compare["if"] == "needs.select.outputs.run_comparison == 'true'"
@@ -125,7 +230,7 @@ def test_forward_perf_selects_before_allocating_the_benchmark_runner():
     }
     checkout = next(step for step in compare["steps"] if step.get("uses", "").startswith("actions/checkout@"))
     assert checkout["with"]["ref"] == "${{ needs.select.outputs.head_sha }}"
-    assert "${BASE_SRC}/python/aisimulate/tools/forward_perf_gate/run.py" in _run_commands(compare)
+    assert "${BASE_SRC}/python/aisim/tools/forward_perf_gate/run.py" in _run_commands(compare)
 
 
 def test_forward_perf_validates_the_pr_controller_without_replacing_the_base_comparison():
@@ -144,8 +249,8 @@ def test_forward_perf_validates_the_pr_controller_without_replacing_the_base_com
         assert f'python -m maturin build --release --locked --out "{destination}"' in build["run"]
     expected = base["run"].replace('"${BASE_VENV}/bin/python"', '"${HEAD_VENV}/bin/python"', 1)
     expected = expected.replace(
-        "${BASE_SRC}/python/aisimulate/tools/forward_perf_gate/run.py",
-        "${HEAD_SRC}/python/aisimulate/tools/forward_perf_gate/run.py",
+        "${BASE_SRC}/python/aisim/tools/forward_perf_gate/run.py",
+        "${HEAD_SRC}/python/aisim/tools/forward_perf_gate/run.py",
     )
     expected = expected.replace('--output-dir "${RESULTS_DIR}"', '--output-dir "${RESULTS_DIR}/head-controller"')
     assert head["run"] == expected
@@ -158,10 +263,10 @@ def test_forward_perf_validates_the_pr_controller_without_replacing_the_base_com
 @pytest.mark.parametrize(
     ("path", "expected"),
     [
-        ("python/aisimulate/tools/forward_perf_gate/cases.py", True),
-        ("python/aisimulate/tools/forward_perf_gate/measurement.py", True),
-        ("python/aisimulate/tools/prediction_regression_gate/grid.py", True),
-        ("python/aisimulate/tools/forward_perf_gate/README.md", False),
+        ("python/aisim/tools/forward_perf_gate/cases.py", True),
+        ("python/aisim/tools/forward_perf_gate/measurement.py", True),
+        ("python/aisim/tools/prediction_regression_gate/grid.py", True),
+        ("python/aisim/tools/forward_perf_gate/README.md", False),
     ],
 )
 def test_forward_perf_controller_change_detection(tmp_path, path, expected):
@@ -180,7 +285,7 @@ def test_forward_perf_controller_change_detection(tmp_path, path, expected):
             **os.environ,
             "base_sha": base,
             "PR_HEAD_SHA": head,
-            "gate_path": "python/aisimulate/tools/forward_perf_gate",
+            "gate_path": "python/aisim/tools/forward_perf_gate",
             "GITHUB_OUTPUT": str(output),
         },
         check=True,
@@ -195,7 +300,7 @@ def test_forward_perf_skips_incompatible_data_policies(tmp_path, base_protocol):
     revisions = next(step for step in steps if step.get("id") == "revisions")["run"]
     protocol_check = revisions.split('if [[ -z "${skip_reason}" ]]; then', 1)[1]
     protocol_check = 'if [[ -z "${skip_reason}" ]]; then' + protocol_check.split("controller_changes=", 1)[0]
-    gate_path = "python/aisimulate/tools/forward_perf_gate"
+    gate_path = "python/aisim/tools/forward_perf_gate"
     _git(tmp_path, "init", "--quiet")
     (tmp_path / gate_path).mkdir(parents=True)
     base = _commit_file(tmp_path, f"{gate_path}/__init__.py", f"PROTOCOL_VERSION = {base_protocol}\n")
@@ -224,10 +329,11 @@ def test_forward_perf_skips_incompatible_data_policies(tmp_path, base_protocol):
         assert not summary.exists()
 
 
-def _forward_api(pages, *, count=None, after=None, canonical="a" * 40):
+def _forward_api(pages, *, count=None, after=None, canonical="a" * 40, draft=False, base_ref="main"):
     pull = {
         "head": {"sha": "a" * 40},
-        "base": {"sha": "b" * 40, "ref": "main"},
+        "base": {"sha": "b" * 40, "ref": base_ref},
+        "draft": draft,
         "changed_files": sum(map(len, pages)) if count is None else count,
     }
     calls = []
@@ -248,7 +354,7 @@ def _forward_api(pages, *, count=None, after=None, canonical="a" * 40):
     [
         ([[{"filename": "crates/core/src/python.rs"}]], None, "true"),
         ([[{"filename": "docs/ci.md"}]], None, "false"),
-        ([[{"filename": "python/aisimulate/tools/forward_perf_gate/README.md"}]], None, "false"),
+        ([[{"filename": "python/aisim/tools/forward_perf_gate/README.md"}]], None, "false"),
         # Full PR files still include the code change after a later docs-only push.
         (
             [[{"filename": "docs/ci.md"}], [{"filename": "crates/core/src/python.rs"}]],
@@ -260,7 +366,7 @@ def _forward_api(pages, *, count=None, after=None, canonical="a" * 40):
                 [
                     {
                         "filename": "archive/old.py",
-                        "previous_filename": "python/aisimulate/src/aisimulate_core/foo.py",
+                        "previous_filename": "python/aisim/src/aisim_core/foo.py",
                     }
                 ]
             ],
@@ -284,6 +390,45 @@ def test_forward_perf_uses_complete_pr_files(pages, count, expected):
     assert any("/files?per_page=100" in call for call in calls) is (count != 3001)
 
 
+@pytest.mark.parametrize("selector", ["select_forward_perf", "select_simulation_perf"])
+@pytest.mark.parametrize(
+    ("draft", "base_ref", "reason"),
+    [
+        (False, "main", None),
+        (False, "release/0.3", None),
+        (True, "main", "PR is a draft"),
+        (True, "feature/base", "PR is a draft"),
+        (False, "feature/base", "PR targets `feature/base`"),
+        (False, "release/0.3/backport", "PR targets `release/0.3/backport`"),
+        (False, "mainline", "PR targets `mainline`"),
+    ],
+)
+def test_perf_pushes_skip_drafts_and_stacked_bases(selector, draft, base_ref, reason):
+    module = importlib.import_module(f"scripts.performance.{selector}")
+    api, calls = _forward_api([[{"filename": "crates/core/src/python.rs"}]], draft=draft, base_ref=base_ref)
+    result = module.select_comparison("owner/repo", "push", "refs/heads/pull-request/236", "a" * 40, api=api)
+    assert result["number"] == "236"
+    assert result["head_sha"] == "a" * 40
+    assert result["base_ref"] == base_ref
+    assert calls[0] == calls[-1] == "repos/owner/repo/pulls/236"
+    if reason is None:
+        assert result["run_comparison"] == "true"
+        assert any("/files?per_page=100" in call for call in calls)
+    else:
+        # Skips need no file list, but still re-read the PR for a stable revision.
+        assert result["run_comparison"] == "false"
+        assert result["reason"].startswith(reason)
+        assert "Dispatch manually with pr_number" in result["reason"]
+        assert calls == ["repos/owner/repo/pulls/236"] * 2
+
+
+@pytest.mark.parametrize("draft", [None, "false"])
+def test_perf_selection_rejects_an_unknown_draft_state(draft):
+    api, _ = _forward_api([[{"filename": "crates/core/src/python.rs"}]], draft=draft)
+    with pytest.raises(ValueError, match="Invalid draft state for PR #236"):
+        forward_perf.select_comparison("owner/repo", "push", "refs/heads/pull-request/236", "a" * 40, api=api)
+
+
 @pytest.mark.parametrize(
     ("path", "expected"),
     [
@@ -291,11 +436,11 @@ def test_forward_perf_uses_complete_pr_files(pages, count, expected):
         ("Cargo.toml.bak", False),
         ("crates/core/src/engine/nested/predict.rs", True),
         ("crates/core/src/engine-other/predict.rs", False),
-        ("python/aisimulate/src/aisimulate_core/example.py", True),
-        ("python/aisimulate/src/aisimulate_core/unrelated/example.py", False),
-        ("python/aisimulate/src/aisimulate_core/systems/h100_sxm.yaml", True),
+        ("python/aisim/src/aisim_core/example.py", True),
+        ("python/aisim/src/aisim_core/unrelated/example.py", False),
+        ("python/aisim/src/aisim_core/systems/h100_sxm.yaml", True),
         (
-            "python/aisimulate/src/aisimulate_core/systems/unrelated/nested.yaml",
+            "python/aisim/src/aisim_core/systems/unrelated/nested.yaml",
             False,
         ),
     ],
@@ -304,13 +449,19 @@ def test_forward_perf_path_matching_preserves_directory_boundaries(path, expecte
     assert forward_perf.matches_path(path) is expected
 
 
-def test_forward_perf_manual_dispatch_forces_comparison_of_the_trusted_copy():
-    api, calls = _forward_api([[{"filename": "docs/ci.md"}]])
+@pytest.mark.parametrize(
+    ("draft", "base_ref"),
+    [(False, "main"), (True, "main"), (False, "feature/base"), (True, "feature/base")],
+)
+def test_forward_perf_manual_dispatch_forces_comparison_of_the_trusted_copy(draft, base_ref):
+    api, calls = _forward_api([[{"filename": "docs/ci.md"}]], draft=draft, base_ref=base_ref)
     result = forward_perf.select_comparison(
         "owner/repo", "workflow_dispatch", "refs/heads/main", "c" * 40, "236", api=api
     )
     assert result["run_comparison"] == "true"
+    assert result["reason"] == "Manual dispatch requests a comparison."
     assert result["head_sha"] == "a" * 40
+    assert result["base_ref"] == base_ref
     assert not any("/files?" in call for call in calls)
 
 
@@ -339,9 +490,22 @@ def test_forward_perf_rejects_changed_or_stale_revisions(change):
         )
 
 
-@pytest.mark.parametrize("fail_api", [False, True])
-def test_forward_perf_cli_reports_skip_or_api_failure(monkeypatch, tmp_path, fail_api):
-    api, _ = _forward_api([[{"filename": "docs/ci.md"}]])
+@pytest.mark.parametrize(
+    ("scenario", "reason"),
+    [
+        ("unrelated", "No PR files affect forward prediction."),
+        ("draft", "PR is a draft"),
+        ("stacked", "PR targets `feature/base`"),
+        ("api_failure", None),
+    ],
+)
+def test_forward_perf_cli_reports_skip_or_api_failure(monkeypatch, tmp_path, scenario, reason):
+    fail_api = scenario == "api_failure"
+    api, _ = _forward_api(
+        [[{"filename": "docs/ci.md"}]],
+        draft=scenario == "draft",
+        base_ref="feature/base" if scenario == "stacked" else "main",
+    )
 
     def run(command, **kwargs):
         assert command[:4] == ["gh", "api", "--paginate", "--slurp"]
@@ -366,7 +530,7 @@ def test_forward_perf_cli_reports_skip_or_api_failure(monkeypatch, tmp_path, fai
         assert not (tmp_path / "summary").exists()
     else:
         assert "run_comparison=false" in (tmp_path / "output").read_text()
-        assert "**SKIPPED**" in (tmp_path / "summary").read_text()
+        assert f"**SKIPPED** — {reason}" in (tmp_path / "summary").read_text()
 
 
 def _fast_run(**overrides):
@@ -375,12 +539,12 @@ def _fast_run(**overrides):
         "path": ".github/workflows/fast-ci.yml",
         "head_sha": "a" * 40,
         "head_branch": "main",
-        "head_repository": {"full_name": "ai-dynamo/aisimulate"},
+        "head_repository": {"full_name": "ai-dynamo/aisim"},
         "event": "push",
         "status": "completed",
         "conclusion": "success",
         "run_attempt": 1,
-        "html_url": "https://github.com/ai-dynamo/aisimulate/actions/runs/10",
+        "html_url": "https://github.com/ai-dynamo/aisim/actions/runs/10",
         **overrides,
     }
 
@@ -393,7 +557,7 @@ def _fast_jobs():
 
 
 def _require_fast(api, **kwargs):
-    return require_fast_ci("ai-dynamo/aisimulate", "a" * 40, "refs/heads/main", "push", api=api, **kwargs)
+    return require_fast_ci("ai-dynamo/aisim", "a" * 40, "refs/heads/main", "push", api=api, **kwargs)
 
 
 def test_fast_prerequisite_accepts_all_jobs_from_the_latest_attempt_across_pages():
@@ -418,7 +582,7 @@ def test_fast_prerequisite_accepts_all_jobs_from_the_latest_attempt_across_pages
     [
         {"head_sha": "b" * 40},
         {"head_branch": "release/old"},
-        {"head_repository": {"full_name": "someone/aisimulate"}},
+        {"head_repository": {"full_name": "someone/aisim"}},
         {"path": ".github/workflows/ci.yml"},
         {"event": "pull_request"},
         {"event": "workflow_dispatch"},
@@ -432,9 +596,7 @@ def test_fast_prerequisite_rejects_wrong_commit_branch_origin_workflow_and_event
 def test_manual_full_ci_can_reuse_a_same_branch_push_or_manual_fast_run():
     for event in ("push", "workflow_dispatch"):
         run = _fast_run(event=event)
-        assert (
-            latest_run([{"workflow_runs": [run]}], "a" * 40, "main", "workflow_dispatch", "ai-dynamo/aisimulate") == run
-        )
+        assert latest_run([{"workflow_runs": [run]}], "a" * 40, "main", "workflow_dispatch", "ai-dynamo/aisim") == run
 
 
 @pytest.mark.parametrize("conclusion", ["failure", "cancelled", "skipped", "neutral", "timed_out", None])
@@ -527,7 +689,7 @@ def _run_fast_prerequisite_cli(tmp_path, *, overrides=False, failure=None):
     env = {
         **os.environ,
         "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
-        "GITHUB_REPOSITORY": "ai-dynamo/aisimulate",
+        "GITHUB_REPOSITORY": "ai-dynamo/aisim",
         "GITHUB_SHA": "a" * 40,
         "GITHUB_REF": "refs/heads/codex/manual",
         "GITHUB_EVENT_NAME": "workflow_dispatch",
@@ -555,13 +717,13 @@ def test_fast_prerequisite_cli_verifies_manual_run_and_appends_summary(tmp_path,
     result, summary = _run_fast_prerequisite_cli(tmp_path, overrides=overrides)
     assert result.returncode == 0, result.stdout + result.stderr
     assert summary.read_text().startswith("Existing evidence\n### Standalone Fast CI verified")
-    for evidence in ("a" * 40, "https://github.com/ai-dynamo/aisimulate/actions/runs/10", "attempt 1"):
+    for evidence in ("a" * 40, "https://github.com/ai-dynamo/aisim/actions/runs/10", "attempt 1"):
         assert evidence in result.stdout
         assert evidence in summary.read_text()
     calls = (tmp_path / "calls").read_text().splitlines()
     assert calls[0] == calls[2]
-    assert calls[0].startswith("repos/ai-dynamo/aisimulate/actions/workflows/fast-ci.yml/runs?")
-    assert calls[1] == "repos/ai-dynamo/aisimulate/actions/runs/10/attempts/1/jobs?per_page=100"
+    assert calls[0].startswith("repos/ai-dynamo/aisim/actions/workflows/fast-ci.yml/runs?")
+    assert calls[1] == "repos/ai-dynamo/aisim/actions/runs/10/attempts/1/jobs?per_page=100"
 
 
 @pytest.mark.parametrize("failure", ["api", "wrong-job-sha"])
@@ -579,15 +741,18 @@ def test_fast_prerequisite_cli_errors_leave_success_summary_unwritten(tmp_path, 
         ("tests/unit/generator/test_unmarked.py", set(), "unit"),
         ("tests/unit/sdk/test_mixed.py", {"integration"}, "unit"),
         ("tests/golden/generator/test_contract.py", set(), "unit"),
-        ("tests/integration/test_new.py", set(), "integration"),
+        ("tests/integration/test_new.py", set(), "integration-build"),
         ("tests/cross_package/test_public_api.py", set(), "contracts"),
         ("tests/e2e/cli/test_new.py", {"build"}, "cli-build"),
-        ("tests/e2e/support_matrix/test_new.py", {"build"}, "support-matrix"),
-        ("tests/e2e/tools/test_new.py", {"build"}, "tools-build"),
+        ("tests/e2e/support_matrix/test_new.py", {"build"}, "integration-build"),
+        ("tests/e2e/tools/test_new.py", {"build"}, "integration-build"),
     ],
 )
 def test_collected_inventory_assigns_cases_without_requiring_unit_markers(path, markers, expected):
     assert assignment(path, markers, {})[0] == expected
+    # Inventory shards name the Full CI legs that run the case.
+    shards = _workflow("ci.yml")["jobs"]["application-tests"]["strategy"]["matrix"]["shard"]
+    assert expected in {shard["suite"] for shard in shards}
 
 
 def test_collected_inventory_requires_explicit_manual_exceptions():
@@ -629,6 +794,138 @@ def test_collected_inventory_reports_unexpected_skips_and_collection_failures():
 def _workflow(name: str) -> dict:
     with (WORKFLOW_ROOT / name).open(encoding="utf-8") as handle:
         return yaml.load(handle, Loader=yaml.BaseLoader)
+
+
+def test_nvskills_request_events():
+    assert _workflow("request-nvskills-ci.yml")["on"] == {
+        "issue_comment": {"types": ["created"]},
+        "pull_request": {"types": ["opened", "reopened", "synchronize", "ready_for_review"]},
+        "push": "",
+    }
+
+
+def test_nvskills_request_token_permissions():
+    workflow = _workflow("request-nvskills-ci.yml")
+    assert workflow["permissions"] == {}
+    assert workflow["jobs"]["request"]["permissions"] == {
+        "contents": "read",
+        "pull-requests": "read",
+        "statuses": "read",
+    }
+
+
+def test_nvskills_request_pins_the_external_callee():
+    request = _workflow("request-nvskills-ci.yml")["jobs"]["request"]
+    assert request["uses"] == (
+        "NVIDIA/skills/.github/workflows/team-request.yml@bdc6bf92f4f76c741f0d499415f75c2ee7ceab6f"
+    )
+
+
+def test_nvskills_request_passes_only_the_dispatch_secret():
+    jobs = _workflow("request-nvskills-ci.yml")["jobs"]
+    assert set(jobs) == {"request"}
+    assert jobs["request"]["secrets"] == {"NVSKILLS_CI_DISPATCH_TOKEN": "${{ secrets.NVSKILLS_CI_DISPATCH_TOKEN }}"}
+    assert "steps" not in jobs["request"]
+
+
+def _nvskills_comment(body, *, is_pr=True):
+    issue = {"pull_request": {"url": "https://api.github.com/repos/ai-dynamo/aisim/pulls/936"}} if is_pr else {}
+    return {"event_name": "issue_comment", "event": {"issue": issue, "comment": {"body": body}}}
+
+
+def _nvskills_push(actor="nv-skills-ci[bot]", message="Attach NVSkills validation signatures"):
+    return {"event_name": "push", "actor": actor, "event": {"head_commit": {"message": message}}}
+
+
+@pytest.mark.parametrize(
+    ("github", "variables", "expected"),
+    [
+        *[
+            pytest.param({"event_name": "pull_request", "event": {"action": action}}, {}, True, id=f"pr-{action}")
+            for action in ("opened", "reopened", "synchronize", "ready_for_review")
+        ],
+        pytest.param(_nvskills_comment("/nvskills-ci"), {}, True, id="pr-command"),
+        pytest.param(_nvskills_comment("/nvskills-ci --force"), {}, True, id="command-arguments"),
+        pytest.param(_nvskills_comment("/nvskills-ci\nmore context"), {}, True, id="multiline-comment"),
+        pytest.param(_nvskills_comment("/NVSKILLS-CI"), {}, True, id="case-insensitive-command"),
+        # startsWith deliberately accepts suffixes; this is not an exact command parser.
+        pytest.param(_nvskills_comment("/nvskills-ci-extra"), {}, True, id="command-prefix"),
+        pytest.param(_nvskills_comment("ordinary review comment"), {}, False, id="ordinary-comment"),
+        pytest.param(_nvskills_comment(""), {}, False, id="empty-comment"),
+        pytest.param(_nvskills_comment(" /nvskills-ci"), {}, False, id="leading-space-comment"),
+        pytest.param(_nvskills_comment("/nvskills-ci", is_pr=False), {}, False, id="non-pr-issue"),
+        pytest.param({"event_name": "issue_comment", "event": {}}, {}, False, id="missing-comment-fields"),
+        pytest.param(_nvskills_comment(None), {}, False, id="null-comment"),
+        pytest.param(_nvskills_push(), {}, True, id="signature-push"),
+        pytest.param(
+            _nvskills_push(message="Attach NVSkills validation signatures\n\nSigned-off-by: Bot"),
+            {},
+            True,
+            id="multiline-commit",
+        ),
+        pytest.param(
+            _nvskills_push("NV-SKILLS-CI[BOT]", "attach nvskills validation signatures"),
+            {},
+            True,
+            id="case-insensitive-push",
+        ),
+        pytest.param(
+            _nvskills_push(message="Attach NVSkills validation signatures for PR 936"), {}, True, id="title-prefix"
+        ),
+        pytest.param(_nvskills_push(actor="contributor"), {}, False, id="wrong-push-actor"),
+        pytest.param(_nvskills_push(message="Update skills"), {}, False, id="wrong-commit-title"),
+        pytest.param(_nvskills_push(actor=""), {}, False, id="empty-push-actor"),
+        pytest.param({"event_name": "push", "actor": "nv-skills-ci[bot]"}, {}, False, id="missing-head-commit"),
+        pytest.param(_nvskills_push(message=None), {}, False, id="null-commit-message"),
+        pytest.param(
+            _nvskills_push("custom[bot]", "Sign skills for PR 936"),
+            {"NVSKILLS_SIGNATURE_PUSH_ACTOR": "custom[bot]", "NVSKILLS_SIGNATURE_COMMIT_TITLE": "Sign skills"},
+            True,
+            id="configured-actor-and-title",
+        ),
+        pytest.param(
+            _nvskills_push(),
+            {"NVSKILLS_SIGNATURE_PUSH_ACTOR": "custom[bot]"},
+            False,
+            id="override-rejects-default-actor",
+        ),
+        pytest.param(
+            _nvskills_push(),
+            {"NVSKILLS_SIGNATURE_COMMIT_TITLE": "Sign skills"},
+            False,
+            id="override-rejects-default-title",
+        ),
+        pytest.param(
+            _nvskills_push(),
+            {"NVSKILLS_SIGNATURE_PUSH_ACTOR": "", "NVSKILLS_SIGNATURE_COMMIT_TITLE": ""},
+            True,
+            id="empty-overrides-use-defaults",
+        ),
+        pytest.param({"event_name": "workflow_dispatch"}, {}, False, id="manual-event"),
+        pytest.param({"event_name": "schedule"}, {}, False, id="scheduled-event"),
+    ],
+)
+def test_nvskills_request_gate(github, variables, expected):
+    expression = _workflow("request-nvskills-ci.yml")["jobs"]["request"]["if"]
+    contexts = {"github": github, "vars": variables}
+
+    def substitute(match):
+        token = match[0]
+        if token.startswith("'"):
+            value = token[1:-1].replace("''", "'")
+        else:
+            value = contexts
+            for part in token.split("."):
+                value = value.get(part, "") if isinstance(value, dict) else ""
+        # GitHub treats absent properties as empty strings, compares strings
+        # without case, and casts null to an empty string in startsWith.
+        return repr(value.casefold() if isinstance(value, str) else "" if value is None else value)
+
+    # Evaluate the actual caller expression, using only the operators/functions
+    # it needs. actionlint independently validates the GitHub expression syntax.
+    expression = " ".join(expression.splitlines()).replace("&&", " and ").replace("||", " or ")
+    expression = re.sub(r"'(?:[^']|'')*'|(?:github|vars)(?:\.[\w_]+)+", substitute, expression)
+    assert bool(eval(expression, {"__builtins__": {}}, {"startsWith": str.startswith})) is expected
 
 
 def _run_commands(job: dict) -> str:
@@ -674,6 +971,79 @@ def test_restored_workflows_are_active_at_repository_root() -> None:
     assert not (WORKFLOW_ROOT / "build-platform-wheels-copied-pr.yml").exists()
 
 
+def test_runner_canary_checks_both_production_architectures_with_step_home() -> None:
+    workflow = _workflow("runner-canary.yml")
+    assert set(workflow["on"]) == {"workflow_dispatch", "push"}
+    assert workflow["on"]["push"]["branches"] == ["pull-request/*"]
+    assert workflow["permissions"] == {"contents": "read"}
+    production = workflow["jobs"]["canary"]
+    pools = production["strategy"]["matrix"]["include"]
+    assert {(pool["runner"], pool["machine"], pool["scratch"]) for pool in pools} == {
+        ("prod-aisim-default-amd64-v1", "x86_64", "true"),
+        ("prod-aisim-default-arm64-v1", "aarch64", "true"),
+    }
+    assert production["runs-on"] == "${{ matrix.runner }}"
+    # container.env alone is overwritten by the runner's /github/home default.
+    assert production["env"]["HOME"] == "/__w/aisim/aisim"
+    commands = _run_commands(production)
+    assert 'test "${HOME}" = /__w/aisim/aisim' in commands
+    assert 'test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"' in commands
+    assert 'test "$(uname -m)" = "${EXPECTED_MACHINE}"' in commands
+    assert "test -w /scratch" in commands
+    shared = workflow["jobs"]["shared"]
+    assert shared["runs-on"] == "dynamo-cpu-4gi-amd64"
+    assert "container" not in shared  # Shared admission does not permit container pods.
+
+
+def test_workflow_runner_selectors_match_registered_pools_and_runbook() -> None:
+    labels = yaml.safe_load((REPOSITORY_ROOT / ".github/actionlint.yaml").read_text())["self-hosted-runner"]["labels"]
+    for name in ("prod-aisim-default-amd64-v1", "prod-aisim-default-arm64-v1", "dynamo-cpu-4gi-amd64"):
+        assert name in labels
+        assert f"`{name}`" in (REPOSITORY_ROOT / "docs/ci/README.md").read_text()
+    for path in WORKFLOW_ROOT.glob("*.yml"):
+        assert "prod-aisimulate-default-" not in path.read_text(), path
+
+
+# Jobs that need nothing from the NVIDIA network stay off the capped self-hosted
+# pools. Values map each matrix architecture to its GitHub-hosted label.
+GITHUB_HOSTED_JOBS = {
+    ("ci.yml", "cargo-deny"): {"amd64": "ubuntu-24.04", "arm64": "ubuntu-24.04-arm"},
+    ("ci.yml", "rust"): {"amd64": "ubuntu-24.04", "arm64": "ubuntu-24.04-arm"},
+    ("ci.yml", "public-api-rust"): {"amd64": "ubuntu-24.04", "arm64": "ubuntu-24.04-arm"},
+    ("ci.yml", "python-compliance"): {"amd64": "ubuntu-24.04"},
+    ("ci.yml", "python-compatibility"): {"amd64": "ubuntu-24.04"},
+    ("ci.yml", "rust-feature-modes"): {"amd64": "ubuntu-24.04"},
+    ("collector-check.yml", "check"): {"amd64": "ubuntu-24.04"},
+    ("collector-check.yml", "cross-backend-consistency"): {"amd64": "ubuntu-24.04"},
+}
+
+
+@pytest.mark.parametrize(("workflow_name", "job_name"), sorted(GITHUB_HOSTED_JOBS))
+def test_public_network_jobs_run_on_github_hosted_runners(workflow_name: str, job_name: str) -> None:
+    job = _workflow(workflow_name)["jobs"][job_name]
+    expected = GITHUB_HOSTED_JOBS[(workflow_name, job_name)]
+    if job["runs-on"] == "${{ matrix.runner }}":
+        include = job["strategy"]["matrix"]["include"]
+        assert "arch" not in job["strategy"]["matrix"]
+        runners = {entry["arch"]: entry["runner"] for entry in include}
+        assert len(runners) == len(include)
+        assert "${{ matrix.arch }}" in job["name"]
+    else:
+        assert "strategy" not in job or "arch" not in job["strategy"]["matrix"]
+        runners = {"amd64": job["runs-on"]}
+    assert runners == expected
+    assert int(job["timeout-minutes"]) > 0
+    # Hosted runners cannot resolve Artifactory and get no internal job image.
+    assert "container" not in job
+    assert "environment" not in job
+    serialized = json.dumps(job)
+    for internal in ("wheel-storage", "WHEEL_STORAGE", "ARTIFACTORY", "secrets.", "vars.", "/__w/"):
+        assert internal not in serialized, internal
+    if job_name == "cargo-deny":
+        targets = {entry["arch"]: entry["cargo_deny_target"] for entry in job["strategy"]["matrix"]["include"]}
+        assert targets == {"amd64": "x86_64-unknown-linux-musl", "arm64": "aarch64-unknown-linux-musl"}
+
+
 def test_full_ci_owns_migrated_expensive_suites() -> None:
     jobs = _workflow("ci.yml")["jobs"]
 
@@ -692,30 +1062,34 @@ def test_full_ci_owns_migrated_expensive_suites() -> None:
     assert jobs["prediction-regression"]["uses"] == "./.github/workflows/prediction-regression-gate.yml"
 
     application_test_wheel = jobs["application-test-wheel"]
-    assert application_test_wheel["timeout-minutes"] == "10"
+    assert application_test_wheel["timeout-minutes"] == "${{ matrix.build_timeout_minutes }}"
+    assert {
+        entry["arch"]: entry["build_timeout_minutes"]
+        for entry in application_test_wheel["strategy"]["matrix"]["include"]
+    } == {"amd64": "15", "arm64": "15"}
     assert {"fast-ci", "select-full-ci"}.issubset(application_test_wheel["needs"])
     assert "application-test-wheel" in jobs["application-tests"]["needs"]
     assert {shard["suite"] for shard in jobs["application-tests"]["strategy"]["matrix"]["shard"]} == {
         "contracts",
         "unit",
-        "integration",
+        "integration-build",
         "cli-build",
-        "support-matrix",
-        "tools-build",
     }
     application_commands = _run_commands(jobs["application-tests"])
     compatibility_commands = _run_commands(jobs["python-compatibility"])
-    assert "python/aisimulate/tests/cross_package" in application_commands
-    assert "python/aisimulate/tests/cross_package" in compatibility_commands
+    assert "python/aisim/tests/cross_package" in application_commands
+    assert "python/aisim/tests/cross_package" in compatibility_commands
     assert "tests/unit tests/golden" in application_commands
-    integration_steps = [
-        step for step in jobs["application-tests"]["steps"] if step.get("if") == "matrix.shard.suite == 'integration'"
+    integration_build_steps = [
+        step for step in jobs["application-tests"]["steps"] if "'integration-build'" in step.get("if", "")
     ]
-    assert len(integration_steps) == 1
-    assert "tests/integration" in integration_steps[0]["run"]
-    assert "--ignore" not in integration_steps[0]["run"]
-    assert "-m" not in shlex.split(integration_steps[0]["run"])[3:]
-    assert integration_steps[0]["working-directory"] == "python/aisimulate"
+    # The merged leg keeps each suite's own selection, workers and timeout.
+    assert [shlex.split(step["run"])[3:] for step in integration_build_steps] == [
+        ["-q", "-ra", "tests/integration", "-n", "2", "--timeout=600"],
+        ["-q", "tests/e2e/support_matrix", "-m", "build", "-n", "auto", "--timeout=180"],
+        ["-q", "tests/e2e/tools", "-m", "build", "-n", "auto", "--timeout=600"],
+    ]
+    assert all(step["working-directory"] == "python/aisim" for step in integration_build_steps)
     assert "scripts/ci/check_application_test_inventory.py" in application_commands
     assert "tests/e2e/cli" in application_commands
     assert "tests/e2e/support_matrix" in application_commands
@@ -727,7 +1101,7 @@ def test_full_ci_owns_migrated_expensive_suites() -> None:
         step for step in jobs["application-tests"]["steps"] if step.get("if") == "matrix.shard.suite == 'contracts'"
     ]
     assert len(contract_steps) == 1
-    assert 'echo "AISIMULATE_TEST_WHEEL=${GITHUB_WORKSPACE}/${wheels[0]}" >> "${GITHUB_ENV}"' in application_commands
+    assert 'echo "AISIM_TEST_WHEEL=${GITHUB_WORKSPACE}/${wheels[0]}" >> "${GITHUB_ENV}"' in application_commands
     contract_command = contract_steps[0]["run"]
     assert "--group scripts/pyproject.toml:e2e-accuracy" in contract_command
     assert "--ignore=tests/fpm_accuracy" not in contract_command
@@ -742,8 +1116,8 @@ def test_full_ci_owns_migrated_expensive_suites() -> None:
     assert f"--ignore={recommendation_path}" in recommendation_steps[1]["run"]
 
     build_marker_files = {
-        path.relative_to(REPOSITORY_ROOT / "python" / "aisimulate").as_posix()
-        for path in (REPOSITORY_ROOT / "python" / "aisimulate" / "tests").rglob("test_*.py")
+        path.relative_to(REPOSITORY_ROOT / "python" / "aisim").as_posix()
+        for path in (REPOSITORY_ROOT / "python" / "aisim" / "tests").rglob("test_*.py")
         if "pytest.mark.build" in path.read_text(encoding="utf-8")
     }
     assert build_marker_files
@@ -757,13 +1131,11 @@ def test_full_ci_owns_migrated_expensive_suites() -> None:
     assert regression["name"] == "Engine Golden Regression"
     assert "test_engine_step_parity.py" in regression_commands
     assert "test_compile_engine_parity.py" in regression_commands
-    assert regression_commands.count("-c python/aisimulate/pytest.ini") == 2
-    assert regression_commands.index("check_prediction_numerics.py --fetch-baseline-only") < regression_commands.index(
-        "check_prediction_numerics.py --output"
-    )
-    policy_commands = _run_commands(_workflow("fast-ci.yml")["jobs"]["policy"])
-    fetch = "check_prediction_numerics.py --fetch-baseline-only"
-    assert policy_commands.index(fetch) < policy_commands.index("tests/test_ci_qualification.py")
+    assert regression_commands.count("-c python/aisim/pytest.ini") == 2
+    assert "check_prediction_numerics.py --output" in regression_commands
+    # The sentinel values need no extra commit: no job fetches one.
+    for workflow in ("ci.yml", "fast-ci.yml"):
+        assert "--fetch-baseline-only" not in (WORKFLOW_ROOT / workflow).read_text()
 
     feature_mode_commands = _run_commands(jobs["rust-feature-modes"])
     assert "cargo test --workspace --features embed-python,replay-bench" in feature_mode_commands
@@ -805,6 +1177,545 @@ def test_readme_checks_remain_in_full_ci_without_standalone_daily_jobs() -> None
     for name in ("readme-daily.yml", "readme-report.yml"):
         assert not (WORKFLOW_ROOT / name).exists()
         assert all(name not in path.read_text() for path in WORKFLOW_ROOT.glob("*.yml"))
+
+
+def _rc_producer():
+    artifact = {
+        "name": "bundle-manifest",
+        "expired": False,
+        "workflow_run": {
+            "id": 10,
+            "repository_id": 123,
+            "head_repository_id": 123,
+            "head_sha": "a" * 40,
+        },
+    }
+    run = {
+        "id": 10,
+        "status": "completed",
+        "conclusion": "success",
+        "path": ".github/workflows/ci.yml",
+        "event": "push",
+        "head_branch": "main",
+        "head_sha": "a" * 40,
+        "repository": {"id": 123},
+        "head_repository": {"id": 123},
+    }
+    env = {
+        "GITHUB_REPOSITORY": "ai-dynamo/aisim",
+        "GITHUB_REPOSITORY_ID": "123",
+        "GITHUB_RUN_ID": "20",
+        "GITHUB_REF_NAME": "pull-request/42",
+        "GITHUB_SHA": "b" * 40,
+        "RC_PR_NUMBER": "42",
+    }
+    return artifact, run, env
+
+
+def test_rc_wheels_reuse_only_successful_main_or_exact_current_pr():
+    artifact, run, env = _rc_producer()
+
+    def request(endpoint):
+        return {"artifacts": [artifact]} if "/artifacts?" in endpoint else run
+
+    assert rc_wheels.find_producer("bundle", env, request) == {
+        "run-id": "10",
+        "scope": "preview",
+        "pr-number": "",
+    }
+    run["head_branch"] = env["GITHUB_REF_NAME"]
+    run["head_sha"] = artifact["workflow_run"]["head_sha"] = env["GITHUB_SHA"]
+    assert rc_wheels.find_producer("bundle", env, request) == {
+        "run-id": "10",
+        "scope": "pr",
+        "pr-number": "42",
+    }
+    run["head_sha"] = artifact["workflow_run"]["head_sha"] = "c" * 40
+    assert rc_wheels.find_producer("bundle", env, request)["run-id"] == ""
+
+
+@pytest.mark.parametrize(
+    ("target", "key", "value"),
+    [
+        ("artifact", "expired", True),
+        ("artifact", "name", "other-manifest"),
+        ("producer", "head_repository_id", 999),
+        ("producer", "repository_id", 999),
+        ("producer", "id", 20),
+        ("run", "status", "in_progress"),
+        ("run", "conclusion", "failure"),
+        ("run", "path", ".github/workflows/untrusted.yml"),
+        ("run", "event", "pull_request"),
+        ("run", "head_branch", "pull-request/99"),
+        ("run", "head_sha", "d" * 40),
+        ("run", "repository", {"id": 999}),
+        ("run", "head_repository", {"id": 999}),
+    ],
+)
+def test_rc_wheels_reject_untrusted_incomplete_or_superseded_producers(target, key, value):
+    artifact, run, env = _rc_producer()
+    {"artifact": artifact, "producer": artifact["workflow_run"], "run": run}[target][key] = value
+
+    def request(endpoint):
+        return {"artifacts": [artifact]} if "/artifacts?" in endpoint else run
+
+    assert rc_wheels.find_producer("bundle", env, request)["run-id"] == ""
+
+
+def test_rc_wheels_discovery_paginates_past_expired_manifests():
+    artifact, run, env = _rc_producer()
+    calls = []
+
+    def request(endpoint):
+        calls.append(endpoint)
+        if parse_qs(urlsplit(endpoint).query).get("page") == ["1"]:
+            return {"artifacts": [{**artifact, "expired": True}] * 100}
+        return {"artifacts": [artifact]} if "/artifacts?" in endpoint else run
+
+    assert rc_wheels.find_producer("bundle", env, request)["run-id"] == "10"
+    assert any("page=2" in call for call in calls)
+
+
+RC_OS_RELEASE = (
+    'PRETTY_NAME="Ubuntu 24.04.3 LTS"\nID=ubuntu\nVERSION_ID="24.04"\nVERSION="24.04.3 LTS (Noble Numbat)"\n'
+)
+
+
+def _rc_dpkg_database():
+    """A trimmed noble runner database: package -> (version, Pre-Depends/Depends, Provides, status)."""
+    return {
+        "build-essential": ("12.10ubuntu1", "libc6-dev | libc-dev, gcc (>= 4:12.3), g++, make, dpkg-dev", ""),
+        "gcc": ("4:13.2.0-7ubuntu1", "cpp (= 4:13.2.0-7ubuntu1), gcc-13 (>= 13.2.0-11~)", "c-compiler"),
+        "g++": ("4:13.2.0-7ubuntu1", "gcc (= 4:13.2.0-7ubuntu1), g++-13 (>= 13.2.0-11~)", "c++-compiler"),
+        "cpp": ("4:13.2.0-7ubuntu1", "cpp-13 (>= 13.2.0-11~)", ""),
+        "cpp-13": ("13.3.0-6ubuntu2~24.04.1", "gcc-13-base (= 13.3.0-6ubuntu2~24.04.1)", ""),
+        "gcc-13": ("13.3.0-6ubuntu2~24.04.1", "cpp-13 (= 13.3.0-6ubuntu2~24.04.1), binutils (>= 2.42), libc6", ""),
+        "gcc-13-base": ("13.3.0-6ubuntu2~24.04.1", "", ""),
+        "g++-13": ("13.3.0-6ubuntu2~24.04.1", "gcc-13 (= 13.3.0-6ubuntu2~24.04.1), libstdc++-13-dev", ""),
+        "libstdc++-13-dev": ("13.3.0-6ubuntu2~24.04.1", "libc6-dev (>= 2.13-0ubuntu6), libstdc++6", ""),
+        "libstdc++6": ("14.2.0-4ubuntu2~24.04.1", "libgcc-s1, libc6 (>= 2.36)", ""),
+        "libgcc-s1": ("14.2.0-4ubuntu2~24.04.1", "libc6 (>= 2.35)", ""),
+        "binutils": ("2.42-4ubuntu2.10", "libc6 (>= 2.38)", ""),
+        "make": ("4.3-4.1build2", "libc6 (>= 2.34)", ""),
+        "dpkg-dev": ("1.22.6ubuntu6.6", "perl:any, make, binutils", ""),
+        "libc6": ("2.39-0ubuntu8.12", "libgcc-s1", ""),
+        "libc6-dev": ("2.39-0ubuntu8.12", "libc6 (= 2.39-0ubuntu8.12), libc-dev-bin, linux-libc-dev", "libc-dev"),
+        "libc-dev-bin": ("2.39-0ubuntu8.11", "libc6", "", "rc "),
+        "linux-libc-dev": ("6.8.0-149.149", "", ""),
+        "cmake": ("3.28.3-1build7", "cmake-data (= 3.28.3-1build7), libc6, libstdc++6", ""),
+        "cmake-data": ("3.28.3-1build7", "", ""),
+        "libclang-dev": ("1:18.0-59~exp2", "libclang-18-dev", ""),
+        "libclang-18-dev": ("1:18.1.3-1ubuntu1", "libclang1-18 (= 1:18.1.3-1ubuntu1)", ""),
+        "libclang1-18": ("1:18.1.3-1ubuntu1", "libc6, libstdc++6", ""),
+        "libhwloc-dev": ("2.10.0-1build1", "libhwloc15 (= 2.10.0-1build1)", ""),
+        "libhwloc15": ("2.10.0-1build1", "libc6, libudev1 (>= 183)", ""),
+        "libudev-dev": ("255.4-1ubuntu8.18", "libudev1 (= 255.4-1ubuntu8.18)", ""),
+        "libudev1": ("255.4-1ubuntu8.18", "libc6", ""),
+        "pkg-config": ("1.8.1-2build1", "pkgconf", ""),
+        "pkgconf": ("1.8.1-2build1", "libc6", "pkg-config"),
+        "protobuf-compiler": ("3.21.12-8.2ubuntu0.4", "libprotoc32t64 (= 3.21.12-8.2ubuntu0.4)", ""),
+        "libprotoc32t64": ("3.21.12-8.2ubuntu0.4", "libc6, libstdc++6", ""),
+        # Installed in the job but unreachable from the build prerequisites.
+        "gh": ("2.45.0-1ubuntu0.3", "libc6 (>= 2.34)", ""),
+        "systemd": ("255.4-1ubuntu8.18", "libudev1, libc6", ""),
+        "tzdata": ("2025b-0ubuntu0.24.04.1", "debconf", ""),
+    }
+
+
+def _fake_rc_runner(tmp_path, monkeypatch, packages):
+    for key in ("AISIM_RC_REVISION", "DYNAMO_RC_REVISION"):
+        monkeypatch.setenv(key, "a" * 40)
+    monkeypatch.setenv("RC_JOB_IMAGE", "runner:2.336.0")
+    monkeypatch.setenv("RC_STORAGE_REPO", "sw-dynamo-aisimulate-pr-pypi-local")
+    monkeypatch.setenv("RC_STORAGE_URL", "https://artifactory.invalid/artifactory")
+    os_release = tmp_path / "os-release"
+    os_release.write_text(RC_OS_RELEASE)
+    monkeypatch.setattr(rc_wheels, "OS_RELEASE", os_release)
+    monkeypatch.setattr(rc_wheels.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(rc_wheels.platform, "machine", lambda: "x86_64")
+
+    def check_output(command, text=False):
+        if command[0] != "dpkg-query":
+            return "pinned tool version"
+        if command[2] == f"--showformat={rc_wheels.INVENTORY_FORMAT}":
+            return "".join(f"{name}={entry[0]}\n" for name, entry in sorted(packages.items())).encode()
+        assert command[2] == f"--showformat={rc_wheels.DEPENDENCY_FORMAT}" and text
+        return "".join(
+            f"{(entry + ('ii ',))[3]}\t{name}\t{entry[0]}\t{entry[2]}\t, {entry[1]}\n"
+            for name, entry in sorted(packages.items())
+        )
+
+    monkeypatch.setattr(rc_wheels.subprocess, "check_output", check_output)
+    for relative in rc_wheels.INPUTS:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("original")
+    return os_release
+
+
+def _rc_key(tmp_path):
+    return rc_wheels.handoff_name(rc_wheels.identity(tmp_path))
+
+
+@pytest.mark.parametrize("changed_input", rc_wheels.INPUTS)
+def test_rc_wheels_build_recipe_changes_invalidate_reuse(tmp_path, monkeypatch, changed_input):
+    os_release = _fake_rc_runner(tmp_path, monkeypatch, _rc_dpkg_database())
+    original = _rc_key(tmp_path)
+    (tmp_path / changed_input).write_text("changed")
+    assert _rc_key(tmp_path) != original
+    (tmp_path / changed_input).write_text("original")
+    monkeypatch.setenv("RC_JOB_IMAGE", "runner:new-version")
+    assert _rc_key(tmp_path) != original
+    monkeypatch.setenv("RC_JOB_IMAGE", "runner:2.336.0")
+    os_release.write_text(RC_OS_RELEASE.replace('VERSION_ID="24.04"', 'VERSION_ID="26.04"'))
+    assert _rc_key(tmp_path) != original
+    os_release.write_text(RC_OS_RELEASE)
+    monkeypatch.setenv("RC_STORAGE_REPO", "sw-dynamo-aisimulate-pypi-local")
+    assert _rc_key(tmp_path) != original
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        # Packages the build cannot reach, and a removed package's leftover record.
+        {"gh": "2.83.0-1"},
+        {"systemd": "255.4-1ubuntu8.19"},
+        {"tzdata": "2026a-0ubuntu0.24.04.1"},
+        {"libc-dev-bin": "2.40-1ubuntu1"},
+    ],
+    ids=["gh", "systemd", "tzdata", "removed"],
+)
+def test_rc_wheels_key_ignores_unrelated_packages(tmp_path, monkeypatch, changes):
+    packages = _rc_dpkg_database()
+    os_release = _fake_rc_runner(tmp_path, monkeypatch, packages)
+    original, evidence = _rc_key(tmp_path), rc_wheels.environment()
+    for name, version in changes.items():
+        packages[name] = (version, *packages[name][1:])
+    assert _rc_key(tmp_path) == original
+    # The full inventory still records the drift, outside the key.
+    changed = rc_wheels.environment()
+    assert changed["packages_sha256"] != evidence["packages_sha256"]
+    assert {f"{name}={version}" for name, version in changes.items()} <= set(changed["packages"])
+    os_release.write_text(RC_OS_RELEASE.replace("24.04.3", "24.04.4"))
+    assert _rc_key(tmp_path) == original
+    assert rc_wheels.environment()["os_release_sha256"] != evidence["os_release_sha256"]
+
+
+def test_rc_wheels_kernel_header_revision_pair_invalidates_cached_build(tmp_path, monkeypatch):
+    packages = _rc_dpkg_database()
+    _fake_rc_runner(tmp_path, monkeypatch, packages)
+    original = rc_wheels.identity(tmp_path)
+    assert packages["linux-libc-dev"][0] == "6.8.0-149.149"
+    (tmp_path / "rc-build-inputs.json").write_text(json.dumps(original))
+
+    # This Ubuntu revision pair changes public headers despite the same upstream version.
+    packages["linux-libc-dev"] = ("6.8.0-151.151", *packages["linux-libc-dev"][1:])
+    changed = rc_wheels.identity(tmp_path)
+    assert rc_wheels.handoff_name(changed) != rc_wheels.handoff_name(original)
+    assert original["image"]["build_packages"]["linux-libc-dev"] == "6.8.0-149.149"
+    assert changed["image"]["build_packages"]["linux-libc-dev"] == "6.8.0-151.151"
+    with pytest.raises(ValueError, match="build inputs"):
+        rc_wheels.verify(tmp_path, changed)
+
+
+@pytest.mark.parametrize(
+    ("package", "version"),
+    [
+        ("libudev-dev", "255.4-1ubuntu8.19"),
+        ("libudev1", "255.4-1ubuntu8.19"),
+        ("libc6", "2.39-0ubuntu8.13"),
+        ("libc6-dev", "2.39-0ubuntu8.13"),
+        ("gcc-13", "13.3.0-6ubuntu2~24.04.2"),
+        ("libstdc++-13-dev", "13.3.0-6ubuntu2~24.04.2"),
+        ("binutils", "2.42-4ubuntu2.11"),
+        ("dpkg-dev", "1.22.6ubuntu6.7"),
+        ("build-essential", "12.10ubuntu1.1"),
+        ("libclang-18-dev", "1:18.1.3-1ubuntu2"),
+        ("libprotoc32t64", "3.21.12-8.2ubuntu0.5"),
+        ("cmake", "3.28.3-1build8"),
+        ("pkgconf", "1.8.1-2build2"),
+        ("libhwloc15", "2.10.0-1build2"),
+    ],
+)
+def test_rc_wheels_native_package_revision_changes_invalidate_reuse(tmp_path, monkeypatch, package, version):
+    packages = _rc_dpkg_database()
+    _fake_rc_runner(tmp_path, monkeypatch, packages)
+    original = _rc_key(tmp_path)
+    packages[package] = (version, *packages[package][1:])
+    assert _rc_key(tmp_path) != original
+
+
+@pytest.mark.parametrize(
+    ("package", "version"),
+    [
+        ("gcc-13", "13.4.0-1ubuntu1~24.04"),  # C compiler, behind the gcc meta package
+        ("libstdc++-13-dev", "14.2.0-4ubuntu2~24.04"),  # C++ headers
+        ("binutils", "2.43-1ubuntu1"),  # linker
+        ("libc6", "2.40-1ubuntu1"),  # glibc
+        ("linux-libc-dev", "6.11.0-8.8"),  # kernel headers
+        ("libclang-18-dev", "1:18.1.8-1ubuntu1"),  # bindgen, behind the libclang-dev meta package
+        ("libprotoc32t64", "3.25.3-1ubuntu1"),  # protoc
+        ("cmake", "3.30.3-1"),
+        ("pkgconf", "2.1.0-1"),  # provider behind pkg-config
+        ("libhwloc15", "2.11.0-1"),
+        ("libudev-dev", "256.1-1ubuntu1"),
+    ],
+)
+def test_rc_wheels_toolchain_and_library_changes_invalidate_reuse(tmp_path, monkeypatch, package, version):
+    packages = _rc_dpkg_database()
+    _fake_rc_runner(tmp_path, monkeypatch, packages)
+    original = _rc_key(tmp_path)
+    packages[package] = (version, *packages[package][1:])
+    assert _rc_key(tmp_path) != original
+
+
+def test_rc_wheels_key_follows_new_build_dependencies(tmp_path, monkeypatch):
+    packages = _rc_dpkg_database()
+    _fake_rc_runner(tmp_path, monkeypatch, packages)
+    original = _rc_key(tmp_path)
+    assert "tzdata" not in rc_wheels.build_packages()
+    packages["libhwloc15"] = (packages["libhwloc15"][0], "libc6, libudev1 (>= 183), tzdata", "")
+    assert "tzdata" in rc_wheels.build_packages()
+    assert _rc_key(tmp_path) != original
+
+
+@pytest.mark.parametrize("removed", [True, False], ids=["removed", "never-installed"])
+def test_rc_wheels_require_every_build_prerequisite(tmp_path, monkeypatch, removed):
+    packages = _rc_dpkg_database()
+    _fake_rc_runner(tmp_path, monkeypatch, packages)
+    if removed:
+        packages["libudev-dev"] = (*packages["libudev-dev"][:3], "rc ")
+    else:
+        del packages["libudev-dev"]
+    with pytest.raises(ValueError, match="libudev-dev"):
+        rc_wheels.identity(tmp_path)
+
+
+def test_rc_wheels_key_covers_every_native_prerequisite_except_gh():
+    job = _workflow("readme-checks.yml")["jobs"]["dynamo"]
+    install = re.search(r"apt-get install -y ([^\n]+)", _run_commands(job))
+    assert install is not None
+    installed = set(install[1].split())
+    assert set(rc_wheels.BUILD_PACKAGES) <= installed
+    assert installed - set(rc_wheels.BUILD_PACKAGES) == {"gh"}
+
+
+def test_main_rc_producers_share_test_storage_with_pr_consumers():
+    workflow = _workflow("readme-checks.yml")
+    job = workflow["jobs"]["dynamo"]
+    assert job["environment"] == "pr-wheel-staging"
+    prepare = next(step for step in job["steps"] if step.get("id") == "rc-wheels")
+    assert prepare["env"]["RC_STORAGE_REPO"] == "${{ vars.WHEEL_STORAGE_REPO }}"
+    upload = next(
+        step
+        for step in job["steps"]
+        if step.get("uses", "").endswith("/wheel-storage") and step["with"]["mode"] == "upload"
+    )
+    assert upload["with"]["scope"] == "${{ inputs.pr_number != '' && 'pr' || 'preview' }}"
+    assert job["runs-on"] == "prod-aisim-default-amd64-v1"
+    assert job["container"] == "${{ vars.CI_JOB_CONTAINER_IMAGE }}"
+    commands = _run_commands(job)
+    assert commands.index("socket.getaddrinfo") < commands.index("readme_rc_wheels.py prepare")
+    assert commands.index("apt-get install") < commands.index("readme_rc_wheels.py prepare")
+
+
+@pytest.mark.parametrize(
+    "producer",
+    [
+        {"run-id": "", "scope": "", "pr-number": ""},
+        {"run-id": "10", "scope": "preview", "pr-number": ""},
+        {"run-id": "11", "scope": "pr", "pr-number": "42"},
+    ],
+    ids=["cold", "trusted-main", "exact-pr"],
+)
+def test_rc_prepare_cli_outputs_reach_workflow_restore_inputs(tmp_path, monkeypatch, producer):
+    expected = {"verified": "build identity"}
+    inventory = {"packages_sha256": "full runner inventory"}
+    monkeypatch.setattr(rc_wheels, "identity", lambda: expected)
+    monkeypatch.setattr(rc_wheels, "environment", lambda: inventory)
+    monkeypatch.setattr(rc_wheels, "find_producer", lambda name, env: producer)
+    output = tmp_path / "github-output"
+    directory = tmp_path / "wheels"
+    evidence = tmp_path / "rc-build-environment.json"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    monkeypatch.setattr(sys, "argv", ["readme_rc_wheels.py", "prepare", "--directory", str(directory)])
+    with pytest.raises(SystemExit):
+        rc_wheels.main()
+    assert not output.exists()
+    monkeypatch.setattr(sys, "argv", [*sys.argv, "--evidence", str(evidence)])
+    rc_wheels.main()
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert values == {"name": rc_wheels.handoff_name(expected), **producer}
+    assert json.loads((directory / "rc-build-inputs.json").read_text()) == expected
+    # The inventory stays out of the wheelhouse, which is the Artifactory handoff.
+    assert json.loads(evidence.read_text()) == inventory
+    assert [path.name for path in directory.iterdir()] == ["rc-build-inputs.json"]
+
+    job = _workflow("readme-checks.yml")["jobs"]["dynamo"]
+    prepare = next(step for step in job["steps"] if step.get("id") == "rc-wheels")
+    assert 'prepare --directory "$wheelhouse" --evidence "$evidence"' in prepare["run"]
+    assert 'evidence="${RUNNER_TEMP}/rc-build-environment.json"' in prepare["run"]
+    assert 'echo "AISIM_RC_EVIDENCE=${evidence}" >> "${GITHUB_ENV}"' in prepare["run"]
+    preserve = next(step for step in job["steps"] if step.get("name") == "Preserve RC build-input and runner evidence")
+    assert "${{ env.AISIM_RC_EVIDENCE }}" in preserve["with"]["path"].splitlines()
+    assert job["env"]["RC_PR_NUMBER"] == "${{ inputs.pr_number }}"
+    restore = next(step for step in job["steps"] if step.get("name") == "Restore verified pinned Dynamo RC wheels")
+    inputs = {}
+    for name in ("name", "run-id", "scope", "pr-number"):
+        binding = re.fullmatch(r"\$\{\{ steps\.rc-wheels\.outputs\.([^ ]+) \}\}", restore["with"][name])
+        assert binding is not None, f"restore input {name} must consume the RC prepare outputs"
+        inputs[name] = values[binding[1]]
+    assert inputs == {"name": rc_wheels.handoff_name(expected), **producer}
+
+
+def test_rc_wheels_require_all_three_packages_and_matching_build_inputs(tmp_path):
+    expected = {"pinned": "build inputs"}
+    (tmp_path / "rc-build-inputs.json").write_text(json.dumps(expected))
+    for name in ("aisim", "ai_dynamo", "ai_dynamo_runtime"):
+        with zipfile.ZipFile(tmp_path / f"{name}.whl", "w") as archive:
+            archive.writestr(f"{name}.dist-info/METADATA", f"Name: {name}\nVersion: 1.0\n")
+    rc_wheels.verify(tmp_path, expected)
+    with pytest.raises(ValueError, match="build inputs"):
+        rc_wheels.verify(tmp_path, {"pinned": "different"})
+    (tmp_path / "ai_dynamo.whl").unlink()
+    with pytest.raises(ValueError, match="exactly the matching"):
+        rc_wheels.verify(tmp_path, expected)
+
+
+def test_pinned_rc_build_executes_all_three_locked_feature_builds(tmp_path):
+    job = _workflow("readme-checks.yml")["jobs"]["dynamo"]
+    log = tmp_path / "commands.jsonl"
+    executables = tmp_path / "bin"
+    executables.mkdir()
+    for name in ("git", "uv"):
+        executable = executables / name
+        executable.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            "with open(os.environ['COMMAND_LOG'], 'a') as output:\n"
+            "    output.write(json.dumps([os.path.basename(sys.argv[0]), *sys.argv[1:]]) + '\\n')\n"
+        )
+        executable.chmod(0o755)
+    wheelhouse = tmp_path / "wheelhouse"
+    subprocess.run(
+        ["bash", str(REPOSITORY_ROOT / "scripts/ci/build_readme_rc_wheels.sh")],
+        check=True,
+        env={
+            **os.environ,
+            "PATH": str(executables) + os.pathsep + os.environ["PATH"],
+            "RUNNER_TEMP": str(tmp_path),
+            "COMMAND_LOG": str(log),
+            "AISIM_RC_WHEELHOUSE": str(wheelhouse),
+            "AISIM_RC_REVISION": job["env"]["AISIM_RC_REVISION"],
+            "DYNAMO_RC_REVISION": job["env"]["DYNAMO_RC_REVISION"],
+        },
+    )
+    commands = [json.loads(line) for line in log.read_text().splitlines()]
+    expected = []
+    for name, revision in (
+        ("aisim", "77d82652b2f83fd67afefc3141d69a5f06e630be"),
+        ("dynamo", "9653d05441b37b6a004837651fd991e44158d755"),
+    ):
+        checkout = str(tmp_path / f"{name}-rc")
+        expected.extend(
+            [
+                ["git", "init", checkout],
+                ["git", "-C", checkout, "fetch", "--depth", "1", f"https://github.com/ai-dynamo/{name}.git", revision],
+                ["git", "-C", checkout, "checkout", "--detach", "FETCH_HEAD"],
+            ]
+        )
+    build = ["uv", "build", "--wheel", "--out-dir", str(wheelhouse)]
+    expected.extend(
+        [
+            [*build, "--config-setting=build-args=--locked", str(tmp_path / "aisim-rc/python/aisim")],
+            [*build, str(tmp_path / "dynamo-rc")],
+            [
+                *build,
+                "--config-setting=build-args=--locked --features ais-forward-pass",
+                str(tmp_path / "dynamo-rc/lib/bindings/python"),
+            ],
+        ]
+    )
+    assert commands == expected
+
+
+@pytest.mark.parametrize("filename,exists", [("missing.whl", False), ("not-a-wheel.txt", True)])
+def test_release_build_rejects_invalid_prebuilt_wheel_before_building(tmp_path, monkeypatch, filename, exists):
+    wheel = tmp_path / filename
+    if exists:
+        wheel.write_bytes(b"not a wheel")
+    calls = []
+    monkeypatch.setattr(release_artifacts, "_run", lambda *args, **kwargs: calls.append(args))
+    output = tmp_path / "dist"
+    with pytest.raises(ValueError, match="existing .whl file"):
+        release_artifacts.build(output, release_artifacts.VERSION, release_artifacts.VERSION, wheel)
+    assert calls == []
+    assert list(output.iterdir()) == []
+
+
+def test_release_main_forwards_prebuilt_wheel_argument(tmp_path, monkeypatch):
+    wheel = tmp_path / "application.whl"
+    output = tmp_path / "dist"
+    monkeypatch.setattr(
+        sys, "argv", ["build_release_artifacts.py", "--output-dir", str(output), "--prebuilt-wheel", str(wheel)]
+    )
+    monkeypatch.setattr(release_artifacts, "check_manifests", lambda: ("1.2.3", "1.2.3"))
+    # main supports historical source roots; restore its derived globals after this invocation.
+    for name in ("EXPECTED_PYTHON_PROJECTS", "EXPECTED_CRATE"):
+        monkeypatch.setattr(release_artifacts, name, getattr(release_artifacts, name))
+    calls = []
+    monkeypatch.setattr(release_artifacts, "build", lambda *args: calls.append(args))
+    release_artifacts.main()
+    assert calls == [(output.resolve(), "1.2.3", "1.2.3", wheel)]
+
+
+@pytest.mark.parametrize("reuse", [False, True])
+def test_release_build_reuses_exact_wheel_but_still_builds_and_verifies_crate(tmp_path, monkeypatch, reuse):
+    version = release_artifacts.VERSION
+    dist_info = f"aisim-{version}.dist-info"
+    wheel = tmp_path / f"aisim-{version}-cp311-abi3-manylinux_2_28_x86_64.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(f"{dist_info}/METADATA", f"Name: aisim\nVersion: {version}\n")
+        scripts = "\n".join(f"{key} = {value}" for key, value in release_artifacts._expected_scripts().items())
+        archive.writestr(f"{dist_info}/entry_points.txt", "[console_scripts]\n" + scripts)
+        for name in release_artifacts.LEGAL_FILES:
+            archive.writestr(f"{dist_info}/licenses/{name}", (REPOSITORY_ROOT / name).read_bytes())
+    calls = []
+
+    def run(*command, **kwargs):
+        calls.append(command)
+        if command[:2] == ("cargo", "package"):
+            target = Path(command[command.index("--target-dir") + 1]) / "package"
+            target.mkdir(parents=True)
+            (target / f"aisim-core-{version}.crate").write_bytes(b"crate output")
+        else:
+            assert "build_manylinux_wheel.py" in command[1]
+            shutil.copy2(wheel, Path(command[-1]) / wheel.name)
+
+    monkeypatch.setattr(release_artifacts, "_run", run)
+    monkeypatch.setattr(release_artifacts.sys, "platform", "linux")
+    output = tmp_path / "dist"
+    release_artifacts.build(output, version, version, wheel if reuse else None)
+    assert (output / wheel.name).read_bytes() == wheel.read_bytes()
+    assert (output / f"aisim-core-{version}.crate").is_file()
+    assert len(calls) == (1 if reuse else 2)
+    assert calls[-1][:2] == ("cargo", "package")
+
+
+def test_release_contract_reuses_the_same_source_architecture_wheel():
+    jobs = _workflow("ci.yml")["jobs"]
+    job = jobs["release-artifact-contract"]
+    assert "application-test-wheel" in job["needs"]
+    download = next(step for step in job["steps"] if step.get("uses", "").endswith("/wheel-storage"))
+    assert download["with"]["source-sha"] == "${{ github.sha }}"
+    assert download["with"]["architecture"] == "${{ matrix.arch }}"
+    assert download["with"]["name"] == "application-test-wheel-${{ matrix.arch }}"
+    assert "--prebuilt-wheel application-test-dist/*.whl" in _run_commands(job)
+    cases = yaml.safe_load((REPOSITORY_ROOT / ".github/full-ci-selection-cases.yml").read_text())
+    for case in cases["cases"]:
+        components = select_components(case["paths"])["components"]
+        if components["release_artifact_contract"]:
+            assert components["application_tests"], case
 
 
 def test_full_ci_aggregate_checks_every_declared_dependency() -> None:
@@ -938,16 +1849,16 @@ def test_exact_target_checks_bind_expressions_through_step_environments() -> Non
 
 
 def test_platform_wheel_build_and_verifiers_cover_collector_payload() -> None:
-    dockerfile = (REPOSITORY_ROOT / "python" / "aisimulate" / "docker" / "Dockerfile").read_text()
-    release_verifier = (REPOSITORY_ROOT / "python" / "aisimulate" / "tools" / "verify_release_wheels.py").read_text()
+    dockerfile = (REPOSITORY_ROOT / "python" / "aisim" / "docker" / "Dockerfile").read_text()
+    release_verifier = (REPOSITORY_ROOT / "python" / "aisim" / "tools" / "verify_release_wheels.py").read_text()
     installed_verifier = (
-        REPOSITORY_ROOT / "python" / "aisimulate" / "tools" / "verify_installed_package_layers.py"
+        REPOSITORY_ROOT / "python" / "aisim" / "tools" / "verify_installed_package_layers.py"
     ).read_text()
 
-    assert "COPY python/aisimulate/collector/ /workspace/python/aisimulate/collector/" in dockerfile
+    assert "COPY python/aisim/collector/ /workspace/python/aisim/collector/" in dockerfile
     assert "ln -s ../src" not in dockerfile
-    assert "test -d /workspace/python/aisimulate/src/aisimulate_core/model_configs" in dockerfile
-    assert "test -d /workspace/python/aisimulate/src/aisimulate_core/systems" in dockerfile
+    assert "test -d /workspace/python/aisim/src/aisim_core/model_configs" in dockerfile
+    assert "test -d /workspace/python/aisim/src/aisim_core/systems" in dockerfile
     assert '"cases/**/*.yaml"' in release_verifier
     assert '"fpm_forward/**/*.py"' in release_verifier
     assert '"collector/fpm_forward/runtime/fpm_exec.sh"' in installed_verifier
@@ -981,7 +1892,7 @@ def test_linux_release_wheels_are_repaired_for_manylinux_2_28() -> None:
     assert 'sys.platform.startswith("linux")' in release_builder
     assert '"scripts/release/build_manylinux_wheel.py"' in release_builder
 
-    dockerfile = (REPOSITORY_ROOT / "python" / "aisimulate" / "docker" / "Dockerfile").read_text()
+    dockerfile = (REPOSITORY_ROOT / "python" / "aisim" / "docker" / "Dockerfile").read_text()
     assert 'MATURIN_PEP517_ARGS="--auditwheel skip"' in dockerfile
     assert "auditwheel repair" in dockerfile
     assert "auditwheel show /workspace/dist/*.whl" in dockerfile
@@ -1020,13 +1931,13 @@ def _manylinux_build_case(
         if command[:3] == (sys.executable, "-m", "maturin"):
             raw_output = Path(command[command.index("--out") + 1])
             for index in range(raw_count):
-                (raw_output / f"aisimulate-0.12.{index}-cp311-abi3-linux_{machine}.whl").touch()
+                (raw_output / f"aisim-0.12.{index}-cp311-abi3-linux_{machine}.whl").touch()
         elif command[:2] == ("auditwheel", "repair"):
             if fail_repair:
                 raise subprocess.CalledProcessError(1, command)
             tag = repaired_tag or f"manylinux_2_28_{machine}"
             for index in range(repaired_count):
-                (output / f"aisimulate-0.12.{index}-cp311-abi3-{tag}.whl").touch()
+                (output / f"aisim-0.12.{index}-cp311-abi3-{tag}.whl").touch()
         else:
             assert command[:2] == ("auditwheel", "show")
 
@@ -1039,8 +1950,8 @@ def test_manylinux_build_repairs_the_exact_raw_wheel_then_audits_it(tmp_path, mo
     output, calls = _manylinux_build_case(tmp_path, monkeypatch, machine=machine)
     repaired = manylinux_builder.build(output)
     raw_output = calls[0][0][-1]
-    raw_wheel = str(Path(raw_output) / f"aisimulate-0.12.0-cp311-abi3-linux_{machine}.whl")
-    assert repaired == output / f"aisimulate-0.12.0-cp311-abi3-manylinux_2_28_{machine}.whl"
+    raw_wheel = str(Path(raw_output) / f"aisim-0.12.0-cp311-abi3-linux_{machine}.whl")
+    assert repaired == output / f"aisim-0.12.0-cp311-abi3-manylinux_2_28_{machine}.whl"
     assert list(output.iterdir()) == [repaired]
     assert calls == [
         (
@@ -1135,7 +2046,7 @@ def _run_comparison_base(
     assert step["env"]["PR_BASE_SHA"] == "${{ steps.pr-target.outputs.base }}"
     gh = tmp_path / "gh"
     gh.write_text(
-        '#!/bin/bash\n[[ "$*" == "api -X GET repos/ai-dynamo/aisimulate/commits/main --jq .sha" ]] || exit 9\n'
+        '#!/bin/bash\n[[ "$*" == "api -X GET repos/ai-dynamo/aisim/commits/main --jq .sha" ]] || exit 9\n'
         'touch "${GH_CALLED}"\nprintf "%s\\n" "${TEST_API_SHA}"\nexit "${TEST_API_STATUS}"\n'
     )
     gh.chmod(0o755)
@@ -1149,7 +2060,7 @@ def _run_comparison_base(
             "GITHUB_REF": ref,
             "BEFORE_SHA": before,
             "PR_BASE_SHA": pr_base,
-            "REPOSITORY": "ai-dynamo/aisimulate",
+            "REPOSITORY": "ai-dynamo/aisim",
             "GITHUB_OUTPUT": str(output_path),
             "GH_CALLED": str(tmp_path / "gh-called"),
             "TEST_API_SHA": api_sha,
@@ -1201,6 +2112,14 @@ def test_full_ci_manual_source_branches_replace_only_their_branch():
 @pytest.mark.parametrize("ref", ["refs/heads/main", "refs/heads/release/0.12.0", "refs/tags/v0.12.0"])
 def test_full_ci_preserves_every_lifecycle_and_tag_run(event, ref):
     assert _full_ci_concurrency_group(event, ref, "101") != _full_ci_concurrency_group(event, ref, "102")
+
+
+def test_copy_pr_bot_syncs_ready_prs_but_not_drafts():
+    # Every trusted-copy push starts Full CI and the advisory performance
+    # workflows on the self-hosted pools; drafts keep Fast CI only until they
+    # are marked ready or a maintainer comments `/ok to test <sha>`.
+    config = yaml.safe_load((REPOSITORY_ROOT / ".github/copy-pr-bot.yaml").read_text())
+    assert config == {"enabled": True, "auto_sync_draft": False, "auto_sync_ready": True}
 
 
 def test_fast_ci_is_standalone_with_an_exact_commit_prerequisite() -> None:
@@ -1257,7 +2176,7 @@ def _run_pr_target(
             "GITHUB_EVENT_NAME": "push",
             "GITHUB_REF": "refs/heads/pull-request/121",
             "RUN_SHA": "a" * 40,
-            "REPOSITORY": "ai-dynamo/aisimulate",
+            "REPOSITORY": "ai-dynamo/aisim",
             "GITHUB_OUTPUT": str(output_path),
             "GH_CALLED": str(calls_path),
             "TEST_PR_HEAD": head,
@@ -1266,7 +2185,7 @@ def _run_pr_target(
         },
     )
     assert calls_path.read_text().splitlines() == [
-        "api -X GET repos/ai-dynamo/aisimulate/pulls/121 --jq [.head.sha, .base.sha] | @tsv"
+        "api -X GET repos/ai-dynamo/aisim/pulls/121 --jq [.head.sha, .base.sha] | @tsv"
     ]
     output = dict(line.split("=", 1) for line in output_path.read_text().splitlines()) if output_path.exists() else {}
     return result, output
@@ -1275,7 +2194,7 @@ def _run_pr_target(
 def test_full_ci_trusted_copy_validates_the_stacked_pr_base(tmp_path: Path) -> None:
     result, output = _run_pr_target(tmp_path, "a" * 40, "d" * 40)
     assert result.returncode == 0, result.stderr
-    assert output == {"base": "d" * 40}
+    assert output == {"base": "d" * 40, "number": "121"}
 
 
 @pytest.mark.parametrize("pr_base", ["d" * 40, "", "main", "d" * 39])
@@ -1362,7 +2281,7 @@ def _run_whitespace_step(
             "TARGET_SHA": target,
             "GH_TOKEN": "ci-contract-dummy-token",
             "PATH": f"{repository}{os.pathsep}{os.environ['PATH']}",
-            "REPOSITORY": "ai-dynamo/aisimulate",
+            "REPOSITORY": "ai-dynamo/aisim",
             "TEST_PR_BASE": base,
         },
         capture_output=True,
@@ -1501,7 +2420,7 @@ def test_fpe_job_uses_required_container_without_legacy_lfs_data() -> None:
             "-C",
             str(REPOSITORY_ROOT),
             "ls-files",
-            "python/aisimulate/src/aisimulate_core/systems/**/*.txt",
+            "python/aisim/src/aisim_core/systems/**/*.txt",
         ],
         text=True,
     ).splitlines()
@@ -1619,14 +2538,14 @@ def test_macos_wheel_environment_seeds_pip_for_shared_verification() -> None:
         action = yaml.load(handle, Loader=yaml.BaseLoader)
 
     commands = _run_commands(action["runs"])
-    assert 'uv venv --seed --python 3.13 "${RUNNER_TEMP}/aisimulate-wheel-venv"' in commands
+    assert 'uv venv --seed --python 3.13 "${RUNNER_TEMP}/aisim-wheel-venv"' in commands
     assert "python -m pip install --quiet wheelhouse/*.whl" in commands
 
 
 def test_omitted_wheel_base_preserves_dockerfile_default() -> None:
     with (ACTION_ROOT / "build-platform-wheel" / "action.yml").open(encoding="utf-8") as handle:
         action = yaml.load(handle, Loader=yaml.BaseLoader)
-    dockerfile = (REPOSITORY_ROOT / "python/aisimulate/docker/Dockerfile").read_text()
+    dockerfile = (REPOSITORY_ROOT / "python/aisim/docker/Dockerfile").read_text()
     docker_default = re.search(r"^ARG WHEEL_BUILD_BASE=(.+)$", dockerfile, re.MULTILINE).group(1)
     wheel_base = action["inputs"]["wheel_base"]
     assert wheel_base["required"] == "false"
@@ -1649,9 +2568,59 @@ def test_containerized_workflows_do_not_require_git_lfs_during_checkout() -> Non
         assert checkout.get("with", {}).get("lfs") != "true"
 
 
+def test_numerics_jobs_run_on_github_hosted_runners() -> None:
+    # Both build AISim from source and use no NVIDIA-internal service. Old and
+    # new snapshots may come from different hosted CPUs; the report blocks only
+    # on status regressions and reports numerical drift.
+    golden = _workflow("ci.yml")["jobs"]["engine-golden-regression"]
+    prediction = _workflow("prediction-regression-gate.yml")["jobs"]
+    collect = prediction["collect"]
+
+    assert golden["name"] == "Engine Golden Regression"
+    assert collect["name"] == "Collect prediction snapshot (${{ matrix.side }})"
+    for job in (golden, collect, prediction["report"]):
+        assert job["runs-on"] == "ubuntu-24.04"
+        assert "container" not in job
+        assert "wheel-storage" not in json.dumps(job)
+        assert "WHEEL_STORAGE_URL" not in json.dumps(job)
+
+    # Sentinels use checked-in expected values and need no historical commit.
+    golden_checkout = next(step for step in golden["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+    assert "fetch-depth" not in golden_checkout["with"]
+    assert "--fetch-baseline-only" not in _run_commands(golden)
+    assert "check_prediction_numerics.py --output numerical-sentinels.json" in _run_commands(golden)
+    # The old side reads setup helpers from the workflow commit, so it keeps full history.
+    collect_checkout = next(step for step in collect["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+    assert collect_checkout["with"]["fetch-depth"] == "0"
+    assert 'git show "${GITHUB_SHA}:scripts/ci/ci_install_build_tools.sh"' in _run_commands(collect)
+
+
+def test_numerics_jobs_keep_single_run_artifact_contracts() -> None:
+    golden = _workflow("ci.yml")["jobs"]["engine-golden-regression"]
+    prediction = _workflow("prediction-regression-gate.yml")["jobs"]
+    collect = prediction["collect"]
+
+    assert "strategy" not in golden
+    assert collect["strategy"]["matrix"] == {"side": ["old", "new"]}
+    golden_upload = next(
+        step for step in golden["steps"] if step.get("uses", "").startswith("actions/upload-artifact@")
+    )
+    assert golden_upload["with"]["name"] == "native-prediction-numerics"
+    assert golden_upload["with"]["path"] == "numerical-sentinels.json"
+    collect_upload = next(
+        step for step in collect["steps"] if step.get("uses", "").startswith("actions/upload-artifact@")
+    )
+    assert collect_upload["with"]["name"] == "prediction-gate-${{ matrix.side }}"
+    assert "--old /tmp/prediction-snapshots/prediction-gate-old" in _run_commands(prediction["report"])
+    assert "--new /tmp/prediction-snapshots/prediction-gate-new" in _run_commands(prediction["report"])
+    for job in (golden, collect, prediction["report"]):
+        assert "sample" not in json.dumps(job)
+        assert "runner-cpu.txt" not in json.dumps(job)
+
+
 def test_active_workflows_do_not_call_nested_inert_github_assets() -> None:
     for path in WORKFLOW_ROOT.glob("*.yml"):
-        assert "./python/aisimulate/.github/" not in path.read_text(encoding="utf-8")
+        assert "./python/aisim/.github/" not in path.read_text(encoding="utf-8")
 
 
 def _run_full_ci_aggregate(
@@ -1756,7 +2725,7 @@ def test_full_ci_scope_resolver_handles_copy_manual_and_race_cases(
         "GITHUB_SHA": target_sha,
         "GITHUB_OUTPUT": str(output),
         "RUNNER_TEMP": str(tmp_path),
-        "REPOSITORY": "ai-dynamo/aisimulate",
+        "REPOSITORY": "ai-dynamo/aisim",
         "FAKE_PR_HEAD": target_sha,
         "FAKE_FILES": "\n".join(
             base64.b64encode(path.encode()).decode() for path in ("README.md", "crates/core/src/replay/event.rs")
@@ -1832,7 +2801,9 @@ def test_full_ci_aggregate_accepts_only_explicit_na_results() -> None:
         "verify-target": "success",
         "select-full-ci": "success",
         "fast-ci": "success",
-        "python-compliance": "skipped",
+        "python-compliance": "success",
+        "license-crate-inventory": "success",
+        "license-evidence": "success",
         **{
             component.replace("_", "-"): ("success" if plan[component] == "true" else "skipped")
             for component in COMPONENTS
@@ -1862,7 +2833,9 @@ def test_full_ci_aggregate_rejects_missing_selection_output() -> None:
         "verify-target": "success",
         "select-full-ci": "success",
         "fast-ci": "success",
-        "python-compliance": "skipped",
+        "python-compliance": "success",
+        "license-crate-inventory": "success",
+        "license-evidence": "success",
         **{component.replace("_", "-"): "skipped" for component in COMPONENTS},
         "application-test-wheel": "skipped",
     }
@@ -1878,7 +2851,9 @@ def test_full_ci_aggregate_rejects_missing_dependency() -> None:
         "verify-target": "success",
         "select-full-ci": "success",
         "fast-ci": "success",
-        "python-compliance": "skipped",
+        "python-compliance": "success",
+        "license-crate-inventory": "success",
+        "license-evidence": "success",
         **{component.replace("_", "-"): "skipped" for component in COMPONENTS},
         "application-test-wheel": "skipped",
     }
@@ -1897,7 +2872,7 @@ def test_full_ci_selector_skips_heavy_jobs_for_documentation() -> None:
 
 
 def test_full_ci_selector_maps_python_rust_and_data_boundaries() -> None:
-    python_plan = select_components(["python/aisimulate/src/aisimulate/traffic.py"])
+    python_plan = select_components(["python/aisim/src/aisim/traffic.py"])
     assert {component for component, selected in python_plan["components"].items() if selected} == {
         "readme_commands",
         "platform_wheels",
@@ -1913,7 +2888,7 @@ def test_full_ci_selector_maps_python_rust_and_data_boundaries() -> None:
     assert rust_plan["components"]["collector_data"] is True
     assert rust_plan["components"]["cargo_deny"] is False
 
-    data_plan = select_components(["python/aisimulate/src/aisimulate_core/systems/data/b200/op.parquet"])
+    data_plan = select_components(["python/aisim/src/aisim_core/systems/data/b200/op.parquet"])
     assert data_plan["components"]["collector_data"] is True
     assert data_plan["components"]["prediction_regression"] is True
     assert data_plan["components"]["engine_golden_regression"] is True
@@ -1987,9 +2962,9 @@ def test_full_ci_selector_cli_decodes_paths_and_writes_outputs(tmp_path: Path) -
 
 def test_python_dependency_changes_run_the_complete_matrix() -> None:
     for path in (
-        "python/aisimulate/pyproject.toml",
-        "python/aisimulate/uv.lock",
-        "python/aisimulate/pytest.ini",
+        "python/aisim/pyproject.toml",
+        "python/aisim/uv.lock",
+        "python/aisim/pytest.ini",
     ):
         plan = select_components([path])
 
@@ -2037,18 +3012,99 @@ def test_parallel_test_matrix_has_no_missing_or_duplicate_partitions():
         "prediction-regression",
     }.issubset(jobs["readiness"]["needs"])
     assert set(jobs["stage-application-wheel"]["needs"]) == {"readiness", "application-wheel"}
-    for suite in ("unit", "cli-build"):
-        steps = [
-            step for step in jobs["application-tests"]["steps"] if step.get("if") == f"matrix.shard.suite == '{suite}'"
-        ]
-        assert len(steps) == 1
-        command = steps[0]["run"]
+    split_steps = [step for step in jobs["application-tests"]["steps"] if "--splits" in step.get("run", "")]
+    assert [re.findall(r"matrix\.shard\.suite == '([\w-]+)'", step["if"]) for step in split_steps] == [
+        ["unit"],
+        ["cli-build"],
+    ]
+    for step in split_steps:
+        command = step["run"]
         assert command.count("--splits ") == 1
         assert command.count("--group ") == 1
         assert command.count("--splitting-algorithm ") == 1
         assert "--splits ${{ matrix.shard.groups }}" in command
         assert "--group ${{ matrix.shard.group }}" in command
         assert "--splitting-algorithm least_duration" in command
+
+
+def _unwrap_expression(expression: str) -> str:
+    return expression.strip().removeprefix("${{").removesuffix("}}").strip()
+
+
+def _application_expression(expression: str, shard: dict, *, outcomes: dict, failed: bool, cancelled: bool):
+    # Evaluate the workflow's own expression with GitHub's operand-returning
+    # `&&`/`||`, which Python's `and`/`or` share. actionlint checks the syntax.
+    def substitute(match):
+        token = match[0]
+        if token.startswith("'"):
+            return token
+        if token.startswith("steps."):
+            return repr(outcomes.get(token.split(".")[1], ""))
+        return repr(int(shard["group"]) if token == "matrix.shard.group" else shard[token.rsplit(".", 1)[1]])
+
+    expression = _unwrap_expression(expression)
+    expression = re.sub(r"'[^']*'|steps\.[\w-]+\.outcome|matrix\.shard\.\w+", substitute, expression)
+    for function, value in (
+        ("!cancelled()", not cancelled),
+        ("cancelled()", cancelled),
+        ("always()", True),
+        ("success()", not failed and not cancelled),
+        ("failure()", failed),
+    ):
+        expression = expression.replace(function, repr(value))
+    return eval(expression.replace("&&", " and ").replace("||", " or "), {"__builtins__": {}}, {})
+
+
+def _application_leg_steps(job: dict, shard: dict, *, failing: str = "", cancelled: bool = False) -> list[str]:
+    ran, outcomes, failed = [], {}, False
+    for step in job["steps"]:
+        name = step.get("name") or step["uses"]
+        condition = _unwrap_expression(step.get("if", "success()"))
+        if not re.search(r"\b(?:success|failure|always|cancelled)\(\)", condition):
+            condition = f"success() && ({condition})"
+        runs = _application_expression(condition, shard, outcomes=outcomes, failed=failed, cancelled=cancelled)
+        outcome = "skipped" if not runs else "failure" if name == failing else "success"
+        outcomes[step.get("id", "")] = outcome
+        failed = failed or outcome == "failure"
+        if runs:
+            ran.append(name)
+    return ran
+
+
+def test_application_test_legs_still_report_every_suite_after_an_earlier_failure():
+    job = _workflow("ci.yml")["jobs"]["application-tests"]
+    install = "Install the prebuilt application and test dependencies"
+    suite_steps = {
+        "contracts": ["Run repository and package contracts"],
+        "unit": ["Run unit tests"],
+        "cli-build": ["Run recommendation E2E without parallel resource contention", "Run remaining CLI build tests"],
+        "integration-build": [
+            "Run migrated integration tests against the installed wheel",
+            "Run support-matrix build tests",
+            "Run tool build tests",
+        ],
+    }
+    test_steps = {name for names in suite_steps.values() for name in names}
+    assert test_steps == {step["name"] for step in job["steps"] if "pytest" in step.get("run", "")}
+    assert job["timeout-minutes"] == "15"
+    checkout = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+    depths = {}
+    for shard in job["strategy"]["matrix"]["shard"]:
+        expected = suite_steps[shard["suite"]]
+
+        def tests_run(**kwargs) -> list[str]:
+            return [name for name in _application_leg_steps(job, shard, **kwargs) if name in test_steps]
+
+        assert tests_run() == expected
+        for failing in expected:
+            assert tests_run(failing=failing) == expected
+        assert tests_run(failing=install) == []
+        assert tests_run(cancelled=True) == []
+        depths[shard["suite"]] = _application_expression(
+            checkout["with"]["fetch-depth"], shard, outcomes={}, failed=False, cancelled=False
+        )
+    # Repository-root contracts read Git history; the application suites do not.
+    assert depths == {"contracts": 0, "unit": 1, "cli-build": 1, "integration-build": 1}
 
 
 @pytest.mark.parametrize("failed", ["package", "rust", "neither"])
@@ -2146,8 +3202,13 @@ def test_release_qualification_pins_source_and_tooling_across_all_jobs():
     assert "maturin build --release --locked" in prepare
     assert "run_release_fpe.py record-wheel" in prepare
     assert "run_release_fpe.py discover" in prepare
-    assert "uv sync --project release-source/python/aisimulate --locked --no-install-project --no-dev" in prepare
+    assert 'project_directory(Path("release-source"))' in prepare
+    assert 'uv sync --project "${project}" --locked --no-install-project --no-dev' in prepare
     generate = _run_commands(jobs["generate"])
+    assert 'project_directory(Path("release-source"))' in generate
+    assert 'uv sync --project "${project}" --locked --no-install-project --no-dev' in generate
+    assert 'echo "RELEASE_PROJECT=${project}" >> "${GITHUB_ENV}"' in generate
+    assert '"${RELEASE_PROJECT}/.venv/bin/python" scripts/fpe/run_release_fpe.py probe' in generate
     assert "run_release_fpe.py probe" in generate
     assert "--max-workers 8" in generate
     assert "--max-topologies-per-role" not in generate
@@ -2171,7 +3232,11 @@ def test_release_artifact_handoffs_cannot_mix_versions():
         "fpe-release-probes.json",
     }
     for name in ("generate", "qualify"):
-        download = next(s for s in jobs[name]["steps"] if s.get("uses", "").startswith("actions/download-artifact@"))
+        download = next(
+            s
+            for s in jobs[name]["steps"]
+            if s.get("uses", "").endswith("/wheel-storage") and s["with"]["mode"] == "download"
+        )
         assert download["with"]["name"] == wheel
     assert wheel == "fpe-release-wheel-${{ inputs.release }}"
     upload = jobs["generate"]["steps"][-1]["with"]["name"]
@@ -2186,6 +3251,22 @@ def test_release_artifact_handoffs_cannot_mix_versions():
                 .replace("${{ matrix.shard.backend }}", "vllm")
             )
             assert fnmatch.fnmatchcase(name, selected_pattern) == (version == selected)
+
+
+def test_release_reproduction_documents_manifest_artifact_instead_of_wheel_payload():
+    jobs = _workflow("fpe-release-qualify.yml")["jobs"]
+    handoff = jobs["prepare"]["steps"][-1]["with"]
+    action = yaml.safe_load((ACTION_ROOT / "wheel-storage/action.yml").read_text())
+    upload = next(
+        step["with"] for step in action["runs"]["steps"] if "actions/upload-artifact@" in step.get("uses", "")
+    )
+    artifact = upload["name"].replace("${{ inputs.name }}", handoff["name"])
+    artifact = artifact.replace("${{ inputs.release }}", "<version>")
+    documentation = (REPOSITORY_ROOT / "docs/ci/accuracy.md").read_text()
+    reproduction = documentation.split("To reproduce a release result,", 1)[1].split("\nThe deployed", 1)[0]
+    assert f"`{artifact}`" in reproduction
+    assert "`fpe-release-wheel-<version>`" not in reproduction
+    assert "`wheel-manifest.json`" in reproduction
 
 
 def test_main_fpe_preserves_discovered_probe_plan_when_packaging(tmp_path):
@@ -2230,12 +3311,12 @@ def test_main_fpe_preserves_discovered_probe_plan_when_packaging(tmp_path):
 def test_release_smoke_checks_manifest_version(tmp_path, monkeypatch, manifest_version, installed_matches):
     import importlib.metadata
 
-    manifest = tmp_path / "python/aisimulate/pyproject.toml"
+    manifest = tmp_path / "python/aisim/pyproject.toml"
     manifest.parent.mkdir(parents=True)
     manifest.write_text(f'[project]\nversion = "{manifest_version}"\n')
     monkeypatch.chdir(tmp_path)
     installed_version = manifest_version if installed_matches else "0.12.0"
-    for name in ("aisimulate", "aisimulate_core"):
+    for name in ("aisim", "aisim_core"):
         monkeypatch.setitem(sys.modules, name, SimpleNamespace(__version__=installed_version))
     monkeypatch.setattr(importlib.metadata, "version", lambda name: installed_version)
     monkeypatch.setattr(importlib.metadata, "distributions", lambda: [])
@@ -2402,7 +3483,7 @@ def test_manual_nightly_checks_selected_source_with_current_license_tooling():
         {"ref": "${{ github.sha }}", "persist-credentials": "false"},
         {"ref": target, "path": "source", "persist-credentials": "false"},
     ]
-    assert "--pyproject source/python/aisimulate/pyproject.toml" in _run_commands(compliance)
+    assert "--pyproject source/python/aisim/pyproject.toml" in _run_commands(compliance)
     build = jobs["build-artifacts"]
     checkout = next(s for s in build["steps"] if "actions/checkout@" in s.get("uses", ""))
     assert checkout["with"]["ref"] == target
@@ -2445,7 +3526,7 @@ def test_nightly_dependency_execution_cannot_modify_staged_artifacts_or_inherit_
     evidence = jobs["license-evidence"]
     assert "environment" not in evidence
     assert "pip install" not in _run_commands(evidence)
-    assert set(evidence["needs"]) == {"build-artifacts", "python-compliance"}
+    assert set(evidence["needs"]) == {"changes-guard", "build-artifacts", "python-compliance"}
 
 
 def _nightly_license_report(
@@ -2456,6 +3537,10 @@ def _nightly_license_report(
     workspace_members=(),
     manual_prior=None,
     artifact_pages=None,
+    preceding_runs=0,
+    baseline_csv=None,
+    failure_stage=None,
+    missing_deps=False,
     bundled=None,
     bundled_arches=("amd64", "arm64"),
 ):
@@ -2496,34 +3581,56 @@ def _nightly_license_report(
         )
     )
 
-    def archived(rows):
+    def archived(rows, include_deps=True):
         prior_csv = io.StringIO()
         writer = csv.DictWriter(prior_csv, fieldnames=["dependency_type", "name", "version", "spdx_license"])
         writer.writeheader()
         writer.writerows(rows or [])
         archive = io.BytesIO()
         with zipfile.ZipFile(archive, "w") as zipped:
-            zipped.writestr("deps.csv", prior_csv.getvalue())
+            if include_deps:
+                zipped.writestr("deps.csv", prior_csv.getvalue())
+            else:
+                zipped.writestr("unrelated.csv", "name\nfixture\n")
         return archive.getvalue()
 
-    archives = {"https://fixture/archive": archived(prior), "https://fixture/manual-archive": archived(manual_prior)}
+    archives = {
+        "https://fixture/archive": archived(prior, include_deps=not missing_deps),
+        "https://fixture/manual-archive": archived(manual_prior),
+    }
+    if baseline_csv is not None:
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as zipped:
+            zipped.writestr("deps.csv", baseline_csv)
+        archives["https://fixture/archive"] = archive.getvalue()
 
     responses = []
 
     def urlopen(request, timeout):
         assert timeout == 30
         assert request.get_header("Authorization") == "Bearer fixture"
-        if lookup_error is not None:
+        if lookup_error is not None and failure_stage is None:
             raise lookup_error
         if "/runs?" in request.full_url:
             query = parse_qs(urlsplit(request.full_url).query)
+            assert query["branch"] == ["main"]
+            assert query["status"] == ["success"]
+            assert query["per_page"] == ["10"]
             runs = [{"id": 1, "artifacts_url": "https://fixture/artifacts"}] if prior else []
+            runs = [
+                {"id": i + 10, "artifacts_url": "https://fixture/empty-artifacts"} for i in range(preceding_runs)
+            ] + runs
             if manual_prior and query.get("event") != ["schedule"]:
                 # A newer successful dispatch shares the main workflow ref,
                 # but its selected release source has unrelated dependencies.
                 runs.insert(0, {"id": 3, "artifacts_url": "https://fixture/manual-artifacts"})
-            payload = {"workflow_runs": runs}
+            page = int(query.get("page", ["1"])[0])
+            payload = {"workflow_runs": runs[(page - 1) * 10 : page * 10]}
+        elif request.full_url.startswith("https://fixture/empty-artifacts?"):
+            payload = {"artifacts": []}
         elif request.full_url.startswith("https://fixture/artifacts?"):
+            if failure_stage == "artifacts":
+                raise lookup_error
             query = parse_qs(urlsplit(request.full_url).query)
             assert query["per_page"] == ["100"]
             if artifact_pages is not None:
@@ -2537,6 +3644,8 @@ def _nightly_license_report(
                 "artifacts": [{"name": "license-artifacts", "archive_download_url": "https://fixture/manual-archive"}]
             }
         elif request.full_url in archives:
+            if failure_stage == "archive":
+                raise lookup_error
             # Exercise urllib's actual redirect handling, which used to carry
             # the GitHub bearer token to the signed storage URL and cause 401.
             from urllib.request import HTTPRedirectHandler
@@ -2554,18 +3663,16 @@ def _nightly_license_report(
         responses.append(response)
         return response
 
-    step = next(
-        s
-        for s in _workflow("nightly-ci.yml")["jobs"]["license-evidence"]["steps"]
-        if s.get("name") == "Generate license compliance evidence"
-    )
-    source = step["run"].split("<<'EOF'\n", 1)[1].rsplit("\nEOF", 1)[0]
     with (
-        patch.object(sys, "argv", ["nightly-evidence", str(tmp_path)]),
         patch.dict(os.environ, {"GH_API_TOKEN": "fixture", "GITHUB_REPOSITORY": "owner/repo", "GITHUB_RUN_ID": "2"}),
         patch("urllib.request.urlopen", side_effect=urlopen),
     ):
-        exec(compile(source, "nightly-ci-evidence", "exec"), {})
+        assert (
+            license_evidence.main(
+                [str(tmp_path), "--previous-nightly", "--source-sha", "a" * 40, "--source-ref", "refs/heads/main"]
+            )
+            == 0
+        )
     assert all(response.closed for response in responses)
     with (tmp_path / "deps.csv").open() as inventory, (tmp_path / "deps-diff.csv").open() as difference:
         return list(csv.DictReader(inventory)), list(csv.DictReader(difference))
@@ -2605,9 +3712,125 @@ def test_nightly_license_first_run_uses_empty_baseline(tmp_path, capsys):
     assert "No prior scheduled license evidence" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("has_baseline", [False, True])
+def test_nightly_license_report_records_source_and_baseline_provenance(tmp_path, has_baseline):
+    crates = [("0.2.17", "MIT")]
+    prior, _ = _nightly_license_report(tmp_path, crates)
+    _nightly_license_report(tmp_path, crates, prior if has_baseline else None)
+    evidence = json.loads((tmp_path / "evidence.json").read_text())
+    assert evidence["source_sha"] == "a" * 40
+    assert evidence["source_ref"] == "refs/heads/main"
+    assert evidence["base_sha"] == ""
+    assert evidence["baseline_status"] == ("previous_scheduled_nightly" if has_baseline else "unavailable")
+
+
+@pytest.mark.parametrize("preceding_runs", [10, 20])
+def test_nightly_license_baseline_finds_evidence_after_artifact_free_runs(tmp_path, preceding_runs):
+    crates = [("0.2.17", "MIT")]
+    prior, _ = _nightly_license_report(tmp_path, crates)
+    assert _nightly_license_report(tmp_path, crates, prior, preceding_runs=preceding_runs)[1] == []
+    assert json.loads((tmp_path / "evidence.json").read_text())["baseline_status"] == "previous_scheduled_nightly"
+
+
+def test_nightly_license_baseline_exhausts_artifact_free_run_pages(tmp_path):
+    inventory, difference = _nightly_license_report(tmp_path, [("0.2.17", "MIT")], preceding_runs=10)
+    assert len(inventory) == len(difference) == 3
+    assert json.loads((tmp_path / "evidence.json").read_text())["baseline_status"] == "unavailable"
+
+
+@pytest.mark.parametrize(
+    "baseline_csv",
+    [
+        "",
+        "dependency_type,name,version,spdx_license\n",
+        "dependency_type,name,version\npython,prettytable,3.16.0\n",
+        "dependency_type,name,version,spdx_license,extra\npython,prettytable,3.16.0,BSD-3-Clause,x\n",
+        "dependency_type,name,version,spdx_license\npython,prettytable,3.16.0\n",
+        "dependency_type,name,version,spdx_license\npython,prettytable,,BSD-3-Clause\n",
+    ],
+)
+def test_nightly_license_baseline_rejects_invalid_inventory_before_publishing(tmp_path, baseline_csv):
+    prior = [{"dependency_type": "python", "name": "prettytable", "version": "3.16.0", "spdx_license": "BSD-3-Clause"}]
+    with pytest.raises(ValueError, match="invalid prior license inventory"):
+        _nightly_license_report(tmp_path, [("0.2.17", "MIT")], prior, baseline_csv=baseline_csv)
+    for filename in ("deps.csv", "deps-diff.csv", "evidence.json"):
+        assert not (tmp_path / filename).exists()
+
+
+@pytest.mark.parametrize("licenses", [("GPL-3.0-only", "MIT"), ("MIT", "GPL-3.0-only")])
+def test_nightly_license_baseline_rejects_conflicting_duplicates_before_publishing(tmp_path, licenses):
+    prior = [
+        {"dependency_type": "crate", "name": "getrandom", "version": "0.2.17", "spdx_license": spdx}
+        for spdx in licenses
+    ]
+    with pytest.raises(ValueError, match="conflicting license metadata"):
+        _nightly_license_report(tmp_path, [("0.2.17", "MIT")], prior)
+    for filename in ("deps.csv", "deps-diff.csv", "evidence.json"):
+        assert not (tmp_path / filename).exists()
+
+
+def test_nightly_license_baseline_accepts_identical_duplicates(tmp_path):
+    crates = [("0.2.17", "MIT")]
+    prior, _ = _nightly_license_report(tmp_path, crates)
+    assert _nightly_license_report(tmp_path, crates, prior * 2)[1] == []
+
+
+@pytest.mark.parametrize(
+    "bundled",
+    [[], [{"dependency_type": "python", "name": "example", "version": "1.0", "spdx_license": "Apache-2.0"}]],
+)
+def test_nightly_license_inventory_rejects_empty_or_wrong_type_bundled_rows(tmp_path, bundled):
+    with pytest.raises(SystemExit, match="invalid bundled configuration inventory"):
+        _nightly_license_report(tmp_path, [], bundled=bundled)
+    assert not (tmp_path / "deps-diff.csv").exists()
+
+
 def test_nightly_license_baseline_lookup_failure_does_not_publish_diff(tmp_path):
     with pytest.raises(OSError, match="baseline API unavailable"):
         _nightly_license_report(tmp_path, [("0.2.17", "MIT")], lookup_error=OSError("baseline API unavailable"))
+    assert not (tmp_path / "deps-diff.csv").exists()
+
+
+def test_nightly_license_baseline_rejects_archive_without_inventory():
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as stream:
+        stream.writestr("evidence.json", "{}")
+    responses = [
+        io.BytesIO(json.dumps({"workflow_runs": [{"id": 1, "artifacts_url": "https://fixture/artifacts"}]}).encode()),
+        io.BytesIO(
+            json.dumps(
+                {"artifacts": [{"name": "license-artifacts", "archive_download_url": "https://fixture/archive"}]}
+            ).encode()
+        ),
+        io.BytesIO(archive.getvalue()),
+    ]
+    with (
+        patch.dict(os.environ, {"GH_API_TOKEN": "fixture", "GITHUB_REPOSITORY": "owner/repo", "GITHUB_RUN_ID": "2"}),
+        patch("urllib.request.urlopen", side_effect=responses),
+        pytest.raises(RuntimeError, match="missing deps.csv"),
+    ):
+        license_evidence.previous_nightly()
+    assert all(response.closed for response in responses)
+
+
+@pytest.mark.parametrize("failure_stage", ["artifacts", "archive"])
+def test_nightly_license_post_selection_failure_does_not_publish_diff(tmp_path, failure_stage):
+    prior = [{"dependency_type": "crate", "name": "getrandom", "version": "0.2.17", "spdx_license": "MIT"}]
+    with pytest.raises(OSError, match=f"{failure_stage} unavailable"):
+        _nightly_license_report(
+            tmp_path,
+            [("0.2.17", "MIT")],
+            prior,
+            lookup_error=OSError(f"{failure_stage} unavailable"),
+            failure_stage=failure_stage,
+        )
+    assert not (tmp_path / "deps-diff.csv").exists()
+
+
+def test_nightly_license_missing_deps_csv_does_not_publish_diff(tmp_path):
+    prior = [{"dependency_type": "crate", "name": "getrandom", "version": "0.2.17", "spdx_license": "MIT"}]
+    with pytest.raises(RuntimeError, match="missing deps.csv"):
+        _nightly_license_report(tmp_path, [("0.2.17", "MIT")], prior, missing_deps=True)
     assert not (tmp_path / "deps-diff.csv").exists()
 
 
@@ -2627,8 +3850,149 @@ def test_nightly_license_inventory_excludes_workspace_packages(tmp_path):
 
 
 def test_nightly_license_inventory_rejects_conflicting_metadata(tmp_path):
-    with pytest.raises(SystemExit, match="conflicting license metadata"):
+    with pytest.raises(ValueError, match="conflicting license metadata"):
         _nightly_license_report(tmp_path, [("0.2.17", "MIT"), ("0.2.17", "GPL-3.0-only")])
+
+
+def test_ci_license_diff_uses_exact_local_baseline_and_records_commit_identity(tmp_path):
+    head = tmp_path / "head"
+    base = tmp_path / "base"
+    head.mkdir()
+    base.mkdir()
+    _nightly_license_report(head, [("0.3.4", "MIT"), ("0.4.3", "Apache-2.0")])
+    _nightly_license_report(base, [("0.2.17", "MIT"), ("0.3.4", "MIT")])
+    # Full CI collects dependencies without building wheels or extracting their
+    # bundled configuration inventories. Nightly alone requires those inputs.
+    for directory in (head, base):
+        shutil.rmtree(directory / "bundled")
+    with patch("urllib.request.urlopen", side_effect=AssertionError("CI must not select a nightly baseline")):
+        assert (
+            license_evidence.main(
+                [
+                    str(head),
+                    "--base-dir",
+                    str(base),
+                    "--source-sha",
+                    "a" * 40,
+                    "--base-sha",
+                    "b" * 40,
+                    "--source-ref",
+                    "refs/heads/pull-request/123",
+                ]
+            )
+            == 0
+        )
+    with (head / "deps-diff.csv").open() as stream:
+        changes = list(csv.DictReader(stream))
+    assert {(row["change"], row["version"], row["prior_version"]) for row in changes} == {
+        ("added", "0.4.3", ""),
+        ("removed", "", "0.2.17"),
+    }
+    evidence = json.loads((head / "evidence.json").read_text())
+    assert evidence["source_sha"] == "a" * 40
+    assert evidence["base_sha"] == "b" * 40
+    assert evidence["baseline_status"] == "exact_commit"
+
+
+def test_ci_license_evidence_requires_complete_baseline_inventories(tmp_path):
+    head = tmp_path / "head"
+    head.mkdir()
+    _nightly_license_report(head, [("0.2.17", "MIT")])
+    (head / "deps-diff.csv").unlink()
+    with pytest.raises(ValueError, match="missing Python dependency inventories"):
+        license_evidence.main([str(head), "--base-dir", str(tmp_path / "missing-base")])
+    assert not (head / "deps-diff.csv").exists()
+
+
+@pytest.mark.parametrize("input_side", ["head", "base"])
+@pytest.mark.parametrize(
+    "python_row",
+    [
+        ",1.0,MIT",
+        " ,1.0,MIT",
+        "example,,MIT",
+        "example, ,MIT",
+        "example,1.0,",
+        "example,1.0, \t",
+        "example,1.0",
+    ],
+)
+def test_ci_license_evidence_rejects_incomplete_local_rows_before_publishing(tmp_path, input_side, python_row):
+    for side in ("head", "base"):
+        directory = tmp_path / side
+        (directory / "python").mkdir(parents=True)
+        (directory / "python" / "inventory.csv").write_text("Name,Version,License\nexample,1.0,MIT\n")
+        (directory / "cargo-metadata.json").write_text('{"packages": []}')
+    (tmp_path / input_side / "python" / "inventory.csv").write_text(f"Name,Version,License\n{python_row}\n")
+
+    with pytest.raises(ValueError, match="missing or empty required fields"):
+        license_evidence.main([str(tmp_path / "head"), "--base-dir", str(tmp_path / "base")])
+    for filename in ("deps.csv", "deps-diff.csv", "evidence.json"):
+        assert not (tmp_path / "head" / filename).exists()
+
+
+def test_full_ci_evidence_runs_independently_of_build_scope_and_uses_shared_generator():
+    jobs = _workflow("ci.yml")["jobs"]
+    python = jobs["python-compliance"]
+    assert "outputs.application_wheel" not in python["if"]
+    head = next(step for step in python["steps"] if step.get("name") == "Check Python dependency licenses")
+    assert "--inventory" in head["run"] and "--inventory-only" not in head["run"]
+    assert "--inventory-only" in _run_commands(python)
+    for job_name in ("python-compliance", "license-crate-inventory"):
+        assert "verify-target" in jobs[job_name]["needs"]
+        assert any(
+            step.get("with", {}).get("ref") == "${{ needs.verify-target.outputs.comparison-base }}"
+            for step in jobs[job_name]["steps"]
+        )
+    evidence = jobs["license-evidence"]
+    assert set(evidence["needs"]) == {"fast-ci", "verify-target", "python-compliance", "license-crate-inventory"}
+    commands = _run_commands(evidence)
+    assert "--base-dir" in commands and "--previous-nightly" not in commands
+    assert "pip install" not in commands and "cargo " not in commands
+    for job in (python, jobs["license-crate-inventory"], evidence):
+        assert "environment" not in job
+        assert "secrets." not in json.dumps(job)
+    for workflow in ("ci.yml", "nightly-ci.yml"):
+        steps = _workflow(workflow)["jobs"]["license-evidence"]["steps"]
+        assert "scripts/ci/generate_license_evidence.py" in _run_commands({"steps": steps})
+        upload = next(step for step in steps if "upload-artifact@" in step.get("uses", ""))
+        assert upload["with"]["name"] == "license-artifacts"
+        assert upload["with"]["overwrite"] == "true"
+        directory = "license-inventories/head" if workflow == "ci.yml" else "license-artifacts"
+        assert "${{ runner.temp }}/" + directory + "/evidence.json" in upload["with"]["path"]
+    python_commands = _run_commands(python)
+    assert "python/aisim/pyproject.toml" in python_commands
+    assert "python/aisimulate/" not in python_commands
+    nightly_report = next(
+        step
+        for step in _workflow("nightly-ci.yml")["jobs"]["license-evidence"]["steps"]
+        if step.get("name") == "Generate license compliance evidence"
+    )
+    assert nightly_report["env"]["SOURCE_SHA"] == "${{ needs.changes-guard.outputs.target-sha }}"
+    assert nightly_report["env"]["SOURCE_REF"] == "${{ needs.changes-guard.outputs.target-ref }}"
+    assert '--source-sha "${SOURCE_SHA}"' in nightly_report["run"]
+    assert '--source-ref "${SOURCE_REF}"' in nightly_report["run"]
+    nightly_checkout = next(
+        step
+        for step in _workflow("nightly-ci.yml")["jobs"]["license-evidence"]["steps"]
+        if "checkout@" in step.get("uses", "")
+    )
+    assert nightly_checkout["with"]["ref"] == "${{ github.workflow_sha }}"
+
+
+@pytest.mark.parametrize("job", ["python-compliance", "license-crate-inventory", "license-evidence"])
+def test_missing_license_evidence_blocks_even_documentation_only_full_ci(job):
+    jobs = _workflow("ci.yml")["jobs"]
+    plan = dict.fromkeys(COMPONENTS, "false")
+    results = dict.fromkeys(jobs["readiness"]["needs"], "success")
+    for component in COMPONENTS:
+        results[component.replace("_", "-")] = "skipped"
+    results["application-test-wheel"] = "skipped"
+    assert _run_full_ci_aggregate(results, plan).returncode == 0
+    results[job] = "skipped"
+    failed = _run_full_ci_aggregate(results, plan)
+    assert failed.returncode != 0
+    assert f"{job}=skipped, expected success" in failed.stdout
 
 
 def test_nightly_osrb_reports_include_bundled_configs_once_and_diff_byte_changes(tmp_path):
@@ -2703,7 +4067,7 @@ python() {
     assert result.returncode == 0, result.stderr
 
 
-def test_bundled_config_gates_run_before_wheel_publication_or_installation():
+def test_bundled_config_gates_run_before_wheel_publication_or_installation(tmp_path):
     policy = _workflow("fast-ci.yml")["jobs"]["policy"]
     assert "scripts/ci/check_bundled_configs.py" in _run_commands(policy)
     assert "tests/test_bundled_configs.py" in _run_commands(policy)
@@ -2731,16 +4095,25 @@ def test_bundled_config_gates_run_before_wheel_publication_or_installation():
     assert check < stage
     assert "check_bundled_configs.py extract --check" in steps[check]["run"]
     assert "release-tooling/scripts/ci/check_bundled_configs.py" in steps[check]["run"]
-    for collection in (application, action["runs"]["steps"], steps):
+    for kind, collection in zip(
+        ("application", "platform", "nightly"), (application, action["runs"]["steps"], steps), strict=True
+    ):
         upload_report = next(
             step for step in collection if step.get("name") == "Preserve wheel configuration inventory"
         )
-        paths = upload_report["with"]["path"].splitlines()
-        assert {path.rsplit("/", 1)[-1] for path in paths} == {
-            "bundled-deps.csv",
-            "bundled-provenance.json",
-            "extracted-files.json",
-        }
+        pattern = upload_report["with"]["path"]
+        assert len(pattern.splitlines()) == 1
+        assert pattern.startswith("${{ runner.temp }}/")
+        root = tmp_path / f"bundled-configs-{kind}"
+        payload = root / "files/model_configs"
+        payload.mkdir(parents=True)
+        reports = {"bundled-deps.csv", "bundled-provenance.json", "extracted-files.json"}
+        for name in reports:
+            (root / name).touch()
+        for name in ("nested.csv", "nested.json"):
+            (payload / name).touch()
+        # Check the upload path's intended file selection against a fixture tree.
+        assert set(tmp_path.glob(pattern.removeprefix("${{ runner.temp }}/"))) == {root / name for name in reports}
     tooling = next(step for step in steps if step.get("with", {}).get("path") == "release-tooling")
     for file in ["check_bundled_configs.py", "bundled_configs.json", "bundled_config_legacy.json"]:
         assert "/scripts/ci/" + file in tooling["with"]["sparse-checkout"]
@@ -2854,7 +4227,7 @@ def test_python_license_gate_checks_target_environment_before_export(
     tmp_path, monkeypatch, capsys, license_result, manifest_selection
 ):
     manifest = tmp_path / "pyproject.toml"
-    manifest.write_text('[project]\ndependencies = ["prettytable>=3", "wcwidth", "aisimulate-core==1.0"]\n')
+    manifest.write_text('[project]\ndependencies = ["prettytable>=3", "wcwidth", "aisim-core==1.0"]\n')
     # A historical source needs only its manifest; the policy/tool lives in
     # the workflow checkout. A missing default detects accidental fallback.
     monkeypatch.setattr(
@@ -2922,6 +4295,27 @@ def test_python_license_install_failure_blocks_check_and_export(tmp_path, monkey
     assert not inventory.exists()
 
 
+def test_comparison_inventory_can_record_a_license_removed_by_the_head(tmp_path, monkeypatch):
+    manifest = tmp_path / "pyproject.toml"
+    manifest.write_text('[project]\ndependencies = ["old-dependency"]\n')
+    output = tmp_path / "licenses.csv"
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        assert "--allow-only" not in command
+        if "--format=csv" in command:
+            kwargs["stdout"].write("Name,Version,License\nold-dependency,1.0,GPL-3.0-only\n")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(python_licenses.subprocess, "run", run)
+    assert python_licenses.check_licenses("python", output, manifest, inventory_only=True) == 0
+    assert len(calls) == 2
+    assert "GPL-3.0-only" in output.read_text()
+    with pytest.raises(ValueError, match="output path"):
+        python_licenses.check_licenses("python", pyproject=manifest, inventory_only=True)
+
+
 def test_nightly_artifact_handoff_matches_fpe_and_accuracy_consumers():
     jobs = _workflow("nightly-ci.yml")["jobs"]
     steps = jobs["build-artifacts"]["steps"]
@@ -2935,13 +4329,17 @@ def test_nightly_artifact_handoff_matches_fpe_and_accuracy_consumers():
     upload = steps[names.index("Upload verified nightly artifacts")]["with"]
     assert upload["name"] == "nightly-dist-${{ matrix.arch }}"
     assert upload["path"] == "${{ runner.temp }}/nightly-dist/*"
-    assert upload["overwrite"] == "true"
+    assert upload["mode"] == "upload"
     artifact = upload["name"].replace("${{ matrix.arch }}", "amd64")
     assert jobs["fpe-support-matrix"]["with"]["wheel_artifact"] == artifact
     resolver = _workflow("e2e-accuracy.yml")["jobs"]["resolve"]["steps"][0]["with"]["script"]
-    assert f"artifact.name === '{artifact}'" in resolver
+    assert f"artifact.name === '{artifact}-manifest'" in resolver
     consumer = _workflow("e2e-accuracy-branch.yml")["jobs"]["wheel"]["steps"]
-    download = next(step for step in consumer if "download-artifact@" in step.get("uses", ""))
+    download = next(
+        step
+        for step in consumer
+        if step.get("uses", "").endswith("/wheel-storage") and step["with"]["mode"] == "download"
+    )
     assert download["with"]["name"] == artifact
 
 
@@ -2961,7 +4359,7 @@ def test_nightly_provenance_and_checksums_pass_real_accuracy_consumer(tmp_path, 
     wheel = directory / f"{package}-0.12.0.dev20260917-cp311-abi3-manylinux_2_28_x86_64.whl"
     wheel.write_bytes(b"fixture wheel")
     (directory / f"{package}-core-0.12.0-dev.20260917.crate").write_bytes(b"fixture crate")
-    manifest = tmp_path / "python/aisimulate/pyproject.toml"
+    manifest = tmp_path / "python/aisim/pyproject.toml"
     manifest.parent.mkdir(parents=True)
     manifest.write_text('[project]\nversion = "0.12.0.dev20260917"\n')
     python = tmp_path / "tools/venv-build/bin/python"
@@ -2980,8 +4378,8 @@ def test_nightly_provenance_and_checksums_pass_real_accuracy_consumer(tmp_path, 
         "MATRIX_ARCH": "amd64",
         "MATRIX_RUNNER": "fixture",
         "CONTAINER_IMAGE": "fixture@sha256:" + "b" * 64,
-        "GH_REPOSITORY": "ai-dynamo/aisimulate",
-        "GH_WORKFLOW_REF": "ai-dynamo/aisimulate/.github/workflows/nightly-ci.yml@refs/heads/main",
+        "GH_REPOSITORY": "ai-dynamo/aisim",
+        "GH_WORKFLOW_REF": "ai-dynamo/aisim/.github/workflows/nightly-ci.yml@refs/heads/main",
         "GH_REF": source_ref,
         "GH_SHA": "a" * 40,
         "GH_RUN_ID": "123",
@@ -3158,7 +4556,7 @@ new AsyncFunction('github', 'context', 'core', process.argv[2])(github, context,
 
 
 def _current_product_version():
-    manifest = tomllib.loads((REPOSITORY_ROOT / "python/aisimulate/pyproject.toml").read_text())
+    manifest = tomllib.loads((REPOSITORY_ROOT / "python/aisim/pyproject.toml").read_text())
     return manifest["project"]["version"]
 
 
@@ -3189,10 +4587,13 @@ def test_nightly_versions_are_unique_date_ordered_and_stable_across_retries():
 @pytest.mark.parametrize("suffix", [".dev20260917", ".dev202609170000001234"])
 @pytest.mark.parametrize("base_version", [None, "0.12.0"], ids=["current", "historical"])
 @pytest.mark.parametrize("package", ["aisim", "aisimulate"])
-def test_current_release_tools_stamp_and_validate_historical_manifests(tmp_path, suffix, base_version, package):
+@pytest.mark.parametrize("inherit_version", [True, False], ids=["workspace-version", "explicit-version"])
+def test_current_release_tools_stamp_and_validate_historical_manifests(
+    tmp_path, suffix, base_version, package, inherit_version
+):
     current_version = _current_product_version()
     base_version = base_version or current_version
-    for name in ("Cargo.toml", "crates/core/Cargo.toml", "python/aisimulate/pyproject.toml", "scripts/pyproject.toml"):
+    for name in ("Cargo.toml", "crates/core/Cargo.toml", "python/aisim/pyproject.toml", "scripts/pyproject.toml"):
         target = tmp_path / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(
@@ -3200,15 +4601,23 @@ def test_current_release_tools_stamp_and_validate_historical_manifests(tmp_path,
             .read_text()
             .replace(f'version = "{current_version}"', f'version = "{base_version}"')
         )
+    core_manifest = tmp_path / "crates/core/Cargo.toml"
+    if not inherit_version:
+        core_manifest.write_text(
+            core_manifest.read_text().replace("version.workspace = true", f'version = "{base_version}"')
+        )
     if package == "aisimulate":
-        for name in ("crates/core/Cargo.toml", "python/aisimulate/pyproject.toml"):
+        for name in ("crates/core/Cargo.toml", "python/aisim/pyproject.toml"):
             target = tmp_path / name
             target.write_text(
                 target.read_text()
                 .replace('name = "aisim"', 'name = "aisimulate"')
                 .replace('name = "aisim-core"', 'name = "aisimulate-core"')
-                .replace('aisim = "aisimulate.supervision:main"\n', "")
+                .replace('aisim = "aisim.supervision:main"\n', "")
+                .replace("aisim.supervision", "aisimulate.supervision")
+                .replace("aisim.legacy_cli", "aisimulate.legacy_cli")
             )
+    original_core = core_manifest.read_bytes()
     for args in (
         ["init", "-q"],
         ["add", "."],
@@ -3232,8 +4641,33 @@ def test_current_release_tools_stamp_and_validate_historical_manifests(tmp_path,
         capture_output=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert f"{base_version}{suffix}" in (tmp_path / "python/aisimulate/pyproject.toml").read_text()
-    assert f"{base_version}-dev.{suffix[4:]}" in (tmp_path / "crates/core/Cargo.toml").read_text()
+    assert f"{base_version}{suffix}" in (tmp_path / "python/aisim/pyproject.toml").read_text()
+    assert f"{base_version}-dev.{suffix[4:]}" in (tmp_path / "Cargo.toml").read_text()
+    if inherit_version:
+        assert core_manifest.read_bytes() == original_core
+    else:
+        assert f"{base_version}-dev.{suffix[4:]}" in core_manifest.read_text()
+
+
+def test_standalone_gitlab_stamper_preserves_dependency_versions(tmp_path):
+    # GitLab extracts just the stamper and runs system Python without tomllib.
+    stamper = tmp_path / "stamper.py"
+    shutil.copyfile(REPOSITORY_ROOT / "scripts/release/apply_dev_version.py", stamper)
+    (tmp_path / "tomllib.py").write_text('raise ModuleNotFoundError("tomllib unavailable")\n')
+    project = tmp_path / "python/aisim/pyproject.toml"
+    project.parent.mkdir(parents=True)
+    project.write_text('[project]\nversion = "0.15.0"\n')
+    workspace = tmp_path / "Cargo.toml"
+    dependency = '[workspace.dependencies.other]\nversion = "1.2.3"\n'
+    workspace.write_text(dependency + '[workspace.package]\nversion = "0.15.0"\n')
+    core = tmp_path / "crates/core/Cargo.toml"
+    core.parent.mkdir(parents=True)
+    core.write_text('[package]\nversion = { workspace = true }\n[dependencies.other]\nversion = "1.2.3"\n')
+    original_core = core.read_bytes()
+
+    subprocess.run([sys.executable, "-E", "-S", str(stamper), ".dev20261120", str(tmp_path)], check=True)
+    assert workspace.read_text() == dependency + '[workspace.package]\nversion = "0.15.0-dev.20261120"\n'
+    assert core.read_bytes() == original_core
 
 
 def test_manual_fpe_uses_current_harness_and_selected_inventory_for_every_job():
@@ -3293,7 +4727,9 @@ def test_simulation_performance_rollout_and_revision_contract():
     )
     assert '"${RUNNER_TEMP}/callback-venv/bin/python"' in build_commands
     downloads = [
-        step["with"]["name"] for step in comparison["steps"] if "actions/download-artifact@" in step.get("uses", "")
+        step["with"]["name"]
+        for step in comparison["steps"]
+        if step.get("uses", "").endswith("/wheel-storage") and step["with"]["mode"] == "download"
     ]
     assert downloads == [
         "simulation-wheel-base-${{ needs.select.outputs.base_sha }}",
@@ -3308,10 +4744,10 @@ def test_simulation_performance_rollout_and_revision_contract():
     assert "was not benchmarked" in commands
     commands = _run_commands(comparison)
     assert "repetitions=3" in commands
-    assert "${BASE_SRC}/python/aisimulate/tools/simulation_perf_gate/run.py" in commands
-    assert "${HEAD_SRC}/python/aisimulate/tools/simulation_perf_gate/run.py" in commands
-    assert "${BASE_SRC}/python/aisimulate/tools/simulation_perf_gate/worker.py" in commands
-    assert "${HEAD_SRC}/python/aisimulate/tools/simulation_perf_gate/worker.py" in commands
+    assert "${BASE_SRC}/python/aisim/tools/simulation_perf_gate/run.py" in commands
+    assert "${HEAD_SRC}/python/aisim/tools/simulation_perf_gate/run.py" in commands
+    assert "${BASE_SRC}/python/aisim/tools/simulation_perf_gate/worker.py" in commands
+    assert "${HEAD_SRC}/python/aisim/tools/simulation_perf_gate/worker.py" in commands
 
 
 @pytest.mark.parametrize(
@@ -3319,25 +4755,25 @@ def test_simulation_performance_rollout_and_revision_contract():
     [
         ("crates/core/src/replay/loadgen/weka.rs", True),
         ("crates/core/src/engine/scheduler/vllm/core.rs", True),
-        ("python/aisimulate/src/aisimulate/traffic.py", True),
-        ("python/aisimulate/src/aisimulate/compiler.py", True),
-        ("python/aisimulate/src/aisimulate_core/systems/data/b200_sxm/gemm/vllm/0.24.0/gemm_perf.parquet", True),
-        ("python/aisimulate/tools/simulation_perf_gate/fixtures/agentx.jsonl", True),
+        ("python/aisim/src/aisim/traffic.py", True),
+        ("python/aisim/src/aisim/compiler.py", True),
+        ("python/aisim/src/aisim_core/systems/data/b200_sxm/gemm/vllm/0.24.0/gemm_perf.parquet", True),
+        ("python/aisim/tools/simulation_perf_gate/fixtures/agentx.jsonl", True),
         ("scripts/performance/build_simulation_dynamo.py", True),
         ("scripts/performance/check_dynamo_callback.py", True),
         ("scripts/performance/dynamo_callback_contract.rs", True),
         ("scripts/performance/simulation_dynamo_requirements.in", True),
         ("scripts/performance/simulation_dynamo_requirements.txt", True),
-        ("python/aisimulate/uv.lock", True),
-        ("python/aisimulate/tools/simulation_perf_gate/README.md", False),
-        ("python/aisimulate/tools/forward_perf_gate/run.py", False),
+        ("python/aisim/uv.lock", True),
+        ("python/aisim/tools/simulation_perf_gate/README.md", False),
+        ("python/aisim/tools/forward_perf_gate/run.py", False),
         ("docs/cli/user-guide.md", False),
     ],
 )
 def test_simulation_performance_selects_complete_pr_files(path, expected):
     from scripts.performance import select_simulation_perf
 
-    pull = {"head": {"sha": "a" * 40}, "base": {"sha": "b" * 40, "ref": "main"}, "changed_files": 1}
+    pull = {"head": {"sha": "a" * 40}, "base": {"sha": "b" * 40, "ref": "main"}, "draft": False, "changed_files": 1}
 
     def api(endpoint):
         return [[{"filename": path}]] if "/files?" in endpoint else [pull]
@@ -3367,7 +4803,7 @@ def test_simulation_perf_controller_change_detection(tmp_path, path, expected):
     steps = _workflow("simulation-performance.yml")["jobs"]["select"]["steps"]
     revisions = next(step for step in steps if step.get("id") == "revisions")["run"]
     detection = "controller_changes=" + revisions.split("controller_changes=", 1)[1].split('echo "base_sha=', 1)[0]
-    gate = "python/aisimulate/tools/simulation_perf_gate"
+    gate = "python/aisim/tools/simulation_perf_gate"
     _git(tmp_path, "init", "--quiet")
     base = _commit_file(tmp_path, "base", "base\n")
     # A runtime change selects the normal comparison; only benchmark code/input
@@ -3401,7 +4837,7 @@ def test_simulation_perf_revision_preparation(tmp_path, scenario):
     steps = _workflow("simulation-performance.yml")["jobs"]["select"]["steps"]
     script = next(step["run"] for step in steps if step.get("id") == "revisions")
     _git(tmp_path, "init", "--quiet")
-    gate = tmp_path / "python/aisimulate/tools/simulation_perf_gate"
+    gate = tmp_path / "python/aisim/tools/simulation_perf_gate"
     (gate / "fixtures").mkdir(parents=True)
     for name in ("cases.py", "compare.py", "contract.py", "run.py", "worker.py", "fixtures/agentx.jsonl"):
         (gate / name).write_text("fixture\n")
@@ -3485,9 +4921,9 @@ def test_simulation_perf_invocations(tmp_path, self_compare, fail_first, count):
     invocations = calls.read_text().splitlines()
     assert len(invocations) == count
     for attempt, invocation in enumerate(invocations, 1):
-        assert invocation.startswith("/base-src/python/aisimulate/tools/simulation_perf_gate/run.py ")
-        assert "--base-worker /base-src/python/aisimulate/tools/simulation_perf_gate/worker.py" in invocation
-        assert "--head-worker /head-src/python/aisimulate/tools/simulation_perf_gate/worker.py" in invocation
+        assert invocation.startswith("/base-src/python/aisim/tools/simulation_perf_gate/run.py ")
+        assert "--base-worker /base-src/python/aisim/tools/simulation_perf_gate/worker.py" in invocation
+        assert "--head-worker /head-src/python/aisim/tools/simulation_perf_gate/worker.py" in invocation
         assert ("--qualification" in invocation) == self_compare
         assert (
             f"--output-dir /results/qualification-{attempt}" in invocation
@@ -3558,7 +4994,7 @@ _PLACEMENT_LITERAL = (
     "        }\n"
     "    }\n"
 )
-_MARKER = "// Modified by AISimulate CI: Dynamo does not set these optional fields yet.\n"
+_MARKER = "// Modified by AISim CI: Dynamo does not set these optional fields yet.\n"
 
 
 def _literal_fixture(tmp_path, monkeypatch, request_extra="", placement_extra="", request_literal=_REQUEST_LITERAL):
@@ -3664,7 +5100,7 @@ def test_simulation_dynamo_text_only_request_against_current_api(tmp_path, monke
         "            session_id: None,\n"
         "            cache_salt: None,\n"
         "            kv_hint: None,\n"
-        "            // Modified by AISimulate CI: the pinned Dynamo request is text-only.\n"
+        "            // Modified by AISim CI: the pinned Dynamo request is text-only.\n"
         "            images: {\n"
         "                assert!(\n"
         "                    request.images.is_empty(),\n"
@@ -3677,7 +5113,7 @@ def test_simulation_dynamo_text_only_request_against_current_api(tmp_path, monke
     expected = expected.replace(
         "        Ok(match event {\n",
         "        Ok(match event {\n"
-        "            // Modified by AISimulate CI: host-loop/frontend events are unsupported.\n"
+        "            // Modified by AISim CI: host-loop/frontend events are unsupported.\n"
         "            LifecycleEvent::TtftMilestone { request_id, stage, at_ms } => {\n"
         "                return Err(anyhow!(\n"
         '                    "pinned Dynamo CI adapter does not support TTFT milestone {stage:?}'
@@ -3808,6 +5244,130 @@ def test_simulation_dynamo_speculation_depth_patch_fails_without_writing(tmp_pat
     with pytest.raises(ValueError, match=error):
         builder.patch_speculation_depth(dynamo)
     assert path.read_bytes() == original
+
+
+def _write_lock(source, *versions):
+    source.mkdir(parents=True, exist_ok=True)
+    (source / "Cargo.lock").write_text(
+        "".join(f'[[package]]\nname = "pyo3"\nversion = "{version}"\n\n' for version in versions)
+        + '[[package]]\nname = "pyo3-ffi"\nversion = "0.30.1"\n'
+    )
+
+
+@pytest.mark.parametrize(
+    ("versions", "error"), [(("0.23.5",), None), (("0.30.1",), None), ((), "found"), (("0.23.5", "0.30.1"), "found")]
+)
+def test_simulation_dynamo_reads_one_locked_pyo3_version(tmp_path, versions, error):
+    from scripts.performance import build_simulation_dynamo as builder
+
+    _write_lock(tmp_path, *versions)
+    if error:
+        with pytest.raises(ValueError, match=error):
+            builder.locked_pyo3_version(tmp_path / "Cargo.lock")
+    else:
+        assert builder.locked_pyo3_version(tmp_path / "Cargo.lock") == versions[0]
+
+
+_PYO3_BINDINGS_MANIFEST = (
+    'pyo3 = { version = "0.23.4", default-features = false }\n'
+    'pyo3-async-runtimes = { version = "0.23.0", default-features = false }\n'
+    'pythonize = "0.23"\n'
+)
+_PYO3_LIB = (
+    "//! Fixture bindings.\nuse pyo3::IntoPyObjectExt;\n\n#[pyclass]\n#[derive(Clone)]\npub struct Endpoint {}\n"
+)
+_PYO3_USER = "use pyo3::prelude::*;\n\nfn call(o: PyObject) {\n    Python::with_gil(|py| o.bind(py).len());\n}\n"
+
+
+def _pyo3_fixture(tmp_path, monkeypatch, core_pyo3):
+    from scripts.performance import build_simulation_dynamo as builder
+
+    source, dynamo = tmp_path / "source", tmp_path / "dynamo"
+    _write_lock(source, core_pyo3)
+    bindings = dynamo / builder.PYO3_BINDINGS
+    (bindings / "rust").mkdir(parents=True)
+    files = {
+        bindings / "Cargo.toml": _PYO3_BINDINGS_MANIFEST,
+        bindings / "rust/lib.rs": _PYO3_LIB,
+        bindings / "rust/user.rs": _PYO3_USER,
+    }
+    for path, text in files.items():
+        path.write_text(text)
+    monkeypatch.setattr(builder, "PYO3_030_RENAMES", ((r"Python::with_gil\(", "Python::attach(", 1),))
+    monkeypatch.setattr(builder, "PYO3_030_PYOBJECT_FILES", ("rust/user.rs",))
+    monkeypatch.setattr(builder, "PYO3_030_BY_VALUE_CLASSES", {"rust/lib.rs": ("Endpoint",)})
+    monkeypatch.setattr(builder, "PYO3_030_EDITS", (builder.PYO3_030_EDITS[0],))
+    return builder, source, dynamo, files
+
+
+def test_simulation_dynamo_pyo3_bindings_unchanged_for_matching_core(tmp_path, monkeypatch):
+    builder, source, dynamo, files = _pyo3_fixture(tmp_path, monkeypatch, "0.23.5")
+
+    def unexpected_write(*args, **kwargs):
+        pytest.fail("a core on the bindings' pyo3 must not rewrite Dynamo")
+
+    monkeypatch.setattr(Path, "write_text", unexpected_write)
+    assert builder.patch_pyo3_bindings(source, dynamo) == {"core_pyo3": "0.23.5", "files": []}
+    assert all(path.read_text() == text for path, text in files.items())
+
+
+def test_simulation_dynamo_pyo3_bindings_move_to_core_pyo3(tmp_path, monkeypatch):
+    builder, source, dynamo, files = _pyo3_fixture(tmp_path, monkeypatch, "0.30.1")
+
+    record = builder.patch_pyo3_bindings(source, dynamo)
+
+    bindings = dynamo / builder.PYO3_BINDINGS
+    marker = "Modified by AISim CI: moved from the pyo3 0.23 API to the pyo3 0.30 API."
+    assert (bindings / "Cargo.toml").read_text() == (
+        f"# {marker}\n"
+        'pyo3 = { version = "0.30.1", default-features = false }\n'
+        'pyo3-async-runtimes = { version = "0.30.0", default-features = false }\n'
+        'pythonize = "0.30"\n'
+    )
+    lib = (bindings / "rust/lib.rs").read_text()
+    assert lib.startswith(f"//! Fixture bindings.\n// {marker}\nuse pyo3::IntoPyObjectExt;\n")
+    assert "pub(crate) type PyObject = pyo3::Py<pyo3::PyAny>;" in lib
+    assert "#[pyclass(from_py_object)]\n#[derive(Clone)]\npub struct Endpoint" in lib
+    assert (bindings / "rust/user.rs").read_text() == (
+        f"// {marker}\n"
+        "use crate::PyObject;\nuse pyo3::prelude::*;\n\nfn call(o: PyObject) {\n"
+        "    Python::attach(|py| o.bind(py).len());\n}\n"
+    )
+    assert record["core_pyo3"] == "0.30.1"
+    assert sorted(entry["path"] for entry in record["files"]) == sorted(str(path.relative_to(dynamo)) for path in files)
+    for entry in record["files"]:
+        path = dynamo / entry["path"]
+        assert entry["before_sha256"] == hashlib.sha256(files[path].encode()).hexdigest()
+        assert entry["after_sha256"] == hashlib.sha256(path.read_text().encode()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "fault", ["unsupported_core", "rename_count", "edit_anchor", "dependency", "class", "pyobject"]
+)
+def test_simulation_dynamo_pyo3_bindings_fail_without_writing(tmp_path, monkeypatch, fault):
+    builder, source, dynamo, files = _pyo3_fixture(
+        tmp_path, monkeypatch, "0.29.0" if fault == "unsupported_core" else "0.30.1"
+    )
+    bindings = dynamo / builder.PYO3_BINDINGS
+    if fault == "rename_count":
+        monkeypatch.setattr(builder, "PYO3_030_RENAMES", ((r"Python::with_gil\(", "Python::attach(", 2),))
+    elif fault == "edit_anchor":
+        (bindings / "rust/lib.rs").write_text(_PYO3_LIB.replace("IntoPyObjectExt", "IntoPyObject"))
+    elif fault == "dependency":
+        (bindings / "Cargo.toml").write_text(_PYO3_BINDINGS_MANIFEST.replace("0.23.4", "0.23.5"))
+    elif fault == "class":
+        monkeypatch.setattr(builder, "PYO3_030_BY_VALUE_CLASSES", {"rust/lib.rs": ("Context",)})
+    elif fault == "pyobject":
+        (bindings / "rust/extra.rs").write_text("use pyo3::prelude::*;\nfn f(o: PyObject) {}\n")
+    before = {path: path.read_text() for path in sorted(bindings.rglob("*")) if path.is_file()}
+
+    def unexpected_write(*args, **kwargs):
+        pytest.fail("failed bindings validation must not write source files")
+
+    monkeypatch.setattr(Path, "write_text", unexpected_write)
+    with pytest.raises(ValueError):
+        builder.patch_pyo3_bindings(source, dynamo)
+    assert {path: path.read_text() for path in sorted(bindings.rglob("*")) if path.is_file()} == before
 
 
 @pytest.mark.parametrize("field_type", [None, "u32", "usize"])
@@ -3942,7 +5502,7 @@ def test_simulation_dynamo_synthetic_trace_remains_text_only(tmp_path, monkeypat
     site = site._replace(sha256=hashlib.sha256(_SYNTHETIC_TRACE_LITERAL.encode()).hexdigest())
     monkeypatch.setattr(builder, "OPTIONAL_FIELD_LITERALS", (site,))
     if image_field not in ("", "pub images: Option<SyntheticImages>,") or drift:
-        with pytest.raises(ValueError, match="reviewed source|unreviewed AISimulate SyntheticTraceSpec"):
+        with pytest.raises(ValueError, match="reviewed source|unreviewed AISim SyntheticTraceSpec"):
             builder.patch_optional_literal_fields(core, dynamo)
         assert path.read_text() == original
     else:
@@ -3952,7 +5512,7 @@ def test_simulation_dynamo_synthetic_trace_remains_text_only(tmp_path, monkeypat
             original.replace(
                 "        arrival_seed,\n",
                 "        arrival_seed,\n"
-                "        // Modified by AISimulate CI: retain the pinned text-only replay configuration.\n"
+                "        // Modified by AISim CI: retain the pinned text-only replay configuration.\n"
                 "        images: None,\n",
             )
             if image_field
@@ -3962,8 +5522,9 @@ def test_simulation_dynamo_synthetic_trace_remains_text_only(tmp_path, monkeypat
         assert record["after_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+@pytest.mark.parametrize("chat_template", [False, True])
 @pytest.mark.parametrize("client_type", [None, "WekaClient", "OtherClient"])
-def test_simulation_dynamo_weka_client_preserves_default(tmp_path, monkeypatch, client_type):
+def test_simulation_dynamo_weka_client_preserves_default(tmp_path, monkeypatch, client_type, chat_template):
     from scripts.performance import build_simulation_dynamo as builder
 
     site = next(site for site in builder.OPTIONAL_FIELD_LITERALS if site.struct == "WekaImportOptions")
@@ -3972,6 +5533,8 @@ def test_simulation_dynamo_weka_client_preserves_default(tmp_path, monkeypatch, 
     api.parent.mkdir(parents=True)
     adapter.parent.mkdir(parents=True)
     fields = f"pub client: {client_type}," if client_type else ""
+    if chat_template:
+        fields += " pub chat_template: Option<WekaChatTemplate>,"
     api.write_text(f"pub struct WekaImportOptions {{pub nested_timestamp_basis: WekaNestedTimestampBasis, {fields}}}")
     source = "fn parse_weka_import_options() {\n    WekaImportOptions {\n        nested_timestamp_basis,\n    }\n}\n"
     adapter.write_text(source)
@@ -3979,15 +5542,18 @@ def test_simulation_dynamo_weka_client_preserves_default(tmp_path, monkeypatch, 
         builder, "OPTIONAL_FIELD_LITERALS", (site._replace(sha256=hashlib.sha256(source.encode()).hexdigest()),)
     )
     if client_type == "OtherClient":
-        with pytest.raises(ValueError, match="unreviewed AISimulate WekaImportOptions"):
+        with pytest.raises(ValueError, match="unreviewed AISim WekaImportOptions"):
             builder.patch_optional_literal_fields(core, dynamo)
         assert adapter.read_text() == source
     else:
         [record] = builder.patch_optional_literal_fields(core, dynamo)
-        assert record["inserted_fields"] == (["client"] if client_type else [])
+        inserted = (["client"] if client_type else []) + (["chat_template"] if chat_template else [])
+        assert record["inserted_fields"] == inserted
         if client_type:
             assert "client: WekaImportOptions::default().client," in adapter.read_text()
-        else:
+        if chat_template:
+            assert "chat_template: None," in adapter.read_text()
+        if not inserted:
             assert adapter.read_text() == source
 
 
@@ -4021,7 +5587,7 @@ def test_simulation_dynamo_sglang_config_preserves_text_defaults(tmp_path, monke
     adapter.write_text(source)
     monkeypatch.setattr(builder, "REPLAY_ADAPTER_SHA256", hashlib.sha256(source.encode()).hexdigest())
     if drift:
-        with pytest.raises(ValueError, match="unreviewed AISimulate SglangConfig"):
+        with pytest.raises(ValueError, match="unreviewed AISim SglangConfig"):
             builder.patch_replay_engine_config(core, dynamo)
         assert adapter.read_text() == source
     else:
@@ -4041,7 +5607,10 @@ def test_simulation_dynamo_sglang_config_preserves_text_defaults(tmp_path, monke
         assert record["after_sha256"] == hashlib.sha256(adapter.read_bytes()).hexdigest()
 
 
-def test_simulation_dynamo_sglang_adapter_against_current_api(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "mamba_cache", [None, "None", "Some(custom_mamba_cache)"], ids=["omitted", "explicit-none", "custom"]
+)
+def test_simulation_dynamo_sglang_adapter_against_current_api(tmp_path, monkeypatch, mamba_cache):
     from scripts.performance import build_simulation_dynamo as builder
 
     dynamo = tmp_path / "dynamo"
@@ -4054,7 +5623,9 @@ def test_simulation_dynamo_sglang_adapter_against_current_api(tmp_path, monkeypa
         "        chunked_prefill_size: 8192,\n"
         "        clip_max_new_tokens: 4096,\n"
         "        schedule_conservativeness: 1.0,\n"
-        "    };\n" + "        num_gpu_blocks_is_explicit: Some(true),\n" * 4
+        + (f"        mamba_cache: {mamba_cache},\n" if mamba_cache is not None else "")
+        + "    };\n"
+        + "        num_gpu_blocks_is_explicit: Some(true),\n" * 4
     )
     adapter.write_text(source)
     monkeypatch.setattr(builder, "REPLAY_ADAPTER_SHA256", hashlib.sha256(source.encode()).hexdigest())
@@ -4064,6 +5635,11 @@ def test_simulation_dynamo_sglang_adapter_against_current_api(tmp_path, monkeypa
     assert "disaggregation_decode_enable_radix_cache: false," in adapter.read_text()
     assert "num_reserved_decode_tokens: SglangConfig::default().num_reserved_decode_tokens," in adapter.read_text()
     assert "disaggregation_decode_extra_slots: None," in adapter.read_text()
+    assert "swa_prefix_tails: None," in adapter.read_text()
+    assert f"mamba_cache: {mamba_cache or 'None'}," in adapter.read_text()
+    assert adapter.read_text().count("mamba_cache:") == 1
+    assert ("mamba_cache" in record["inserted_sglang_fields"]) == (mamba_cache is None)
+    assert "scheduler_select_time_ms: SglangConfig::default().scheduler_select_time_ms," in adapter.read_text()
     assert record["after_sha256"] == hashlib.sha256(adapter.read_bytes()).hexdigest()
 
 
@@ -4081,7 +5657,7 @@ def test_simulation_dynamo_lifecycle_rejects_unsupported_host_events(extra):
 
     api = "pub enum LifecycleEvent { SourceHeld {}, DestinationReserved {}, " + extra + "}"
     if "u64" in extra or "OtherEvent" in extra:
-        with pytest.raises(ValueError, match="unreviewed AISimulate lifecycle API"):
+        with pytest.raises(ValueError, match="unreviewed AISim lifecycle API"):
             builder._patch_ttft_lifecycle(_LIFECYCLE_LITERAL, api)
     else:
         patched, rejected = builder._patch_ttft_lifecycle(_LIFECYCLE_LITERAL, api)
@@ -4122,6 +5698,7 @@ def test_simulation_dynamo_resolves_then_builds_locked(tmp_path, monkeypatch, wr
         "before_sha256": "a" * 64,
         "after_sha256": "b" * 64,
     }
+    pyo3_compatibility = {"core_pyo3": "0.30.1", "files": [{"path": "x.rs", "before_sha256": "c", "after_sha256": "d"}]}
 
     def patch_handoff_timing(actual_core, actual_dynamo):
         assert actual_core == core.parent and actual_dynamo == dynamo
@@ -4143,6 +5720,11 @@ def test_simulation_dynamo_resolves_then_builds_locked(tmp_path, monkeypatch, wr
         patched.append(("replay", actual_core, actual_dynamo))
         return {"prefill_context_parallel_size": 1}
 
+    def patch_pyo3_bindings(actual_source, actual_dynamo):
+        assert actual_source == source and actual_dynamo == dynamo
+        patched.append(("pyo3", actual_source, actual_dynamo))
+        return pyo3_compatibility
+
     def check_output(args, **kwargs):
         if args[:2] == ["cargo", "metadata"]:
             assert patched == [
@@ -4150,6 +5732,7 @@ def test_simulation_dynamo_resolves_then_builds_locked(tmp_path, monkeypatch, wr
                 ("literals", core.parent, dynamo),
                 ("speculation", dynamo),
                 ("replay", core.parent, dynamo),
+                ("pyo3", source, dynamo),
             ]
             assert "--locked" not in args
             assert kwargs["cwd"] == bindings
@@ -4187,8 +5770,9 @@ def test_simulation_dynamo_resolves_then_builds_locked(tmp_path, monkeypatch, wr
     monkeypatch.setattr(builder, "patch_optional_literal_fields", patch_optional_literal_fields)
     monkeypatch.setattr(builder, "patch_speculation_depth", patch_speculation_depth)
     monkeypatch.setattr(builder, "patch_replay_engine_config", patch_replay_engine_config)
+    monkeypatch.setattr(builder, "patch_pyo3_bindings", patch_pyo3_bindings)
     if wrong_core:
-        with pytest.raises(ValueError, match="different AISimulate core"):
+        with pytest.raises(ValueError, match="different AISim core"):
             builder.build(source, dynamo, output)
         assert not built
         assert not list(output.iterdir())
@@ -4202,6 +5786,7 @@ def test_simulation_dynamo_resolves_then_builds_locked(tmp_path, monkeypatch, wr
         assert provenance["literal_compatibility"] == literal_compatibility
         assert provenance["speculation_compatibility"] == speculation_compatibility
         assert provenance["replay_compatibility"] == {"prefill_context_parallel_size": 1}
+        assert provenance["pyo3_compatibility"] == pyo3_compatibility
         assert (output / "dynamo-build.patch").read_bytes() == b"dependency patch\n"
 
 
@@ -4224,7 +5809,7 @@ def test_simulation_dynamo_resolves_then_builds_locked(tmp_path, monkeypatch, wr
 def test_simulation_perf_artifact_verification(tmp_path, fault):
     from scripts.performance.simulation_perf_artifact import sha256, verify
 
-    wheel = tmp_path / "aisimulate-test.whl"
+    wheel = tmp_path / "aisim-test.whl"
     wheel.write_bytes(b"built wheel")
     requirements = tmp_path / "requirements.txt"
     requirements.write_text("locked\n")
@@ -4256,7 +5841,7 @@ def test_simulation_perf_artifact_verification(tmp_path, fault):
     elif fault == "requirements":
         requirements.write_text("wrong dependencies\n")
     elif fault == "extra_wheel":
-        (tmp_path / "aisimulate-other.whl").write_bytes(b"another wheel")
+        (tmp_path / "aisim-other.whl").write_bytes(b"another wheel")
     elif fault == "unverified_wheel":
         (tmp_path / "unexpected_package-1.0-py3-none-any.whl").write_bytes(b"unverified wheel")
     elif fault == "embedded_core":
@@ -4317,15 +5902,15 @@ python() {
     assert result.stdout.strip() == layout
 
 
-@pytest.mark.parametrize("extra", ["other/pyproject.toml", "python/aisimulate/pyproject.toml"])
+@pytest.mark.parametrize("extra", ["other/pyproject.toml", "python/unknown/pyproject.toml"])
 def test_release_manifest_discovery_rejects_unknown_tool_only_manifests(tmp_path, monkeypatch, extra):
-    for name in ("Cargo.toml", "crates/core/Cargo.toml", "python/aisimulate/pyproject.toml", "scripts/pyproject.toml"):
+    for name in ("Cargo.toml", "crates/core/Cargo.toml", "python/aisim/pyproject.toml", "scripts/pyproject.toml"):
         target = tmp_path / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes((REPOSITORY_ROOT / name).read_bytes())
     monkeypatch.setattr(release_artifacts, "ROOT", tmp_path)
     monkeypatch.setattr(
-        release_artifacts, "EXPECTED_PYTHON_PROJECTS", {tmp_path / "python/aisimulate/pyproject.toml": "aisim"}
+        release_artifacts, "EXPECTED_PYTHON_PROJECTS", {tmp_path / "python/aisim/pyproject.toml": "aisim"}
     )
     monkeypatch.setattr(release_artifacts, "EXPECTED_CRATE", tmp_path / "crates/core/Cargo.toml")
     release_artifacts.check_manifests()
@@ -4382,20 +5967,25 @@ def test_release_output_checks_embedded_identity_and_scripts(tmp_path, monkeypat
     (output / f"{package}-core-{version}.crate").write_bytes(b"crate fixture")
     for name in release_artifacts.LEGAL_FILES:
         (tmp_path / name).write_text(f"fixture legal text for {name}\n")
-    scripts = {"aiconfigurator": "aisimulate.legacy_cli.entrypoint:main", "aisimulate": "aisimulate.supervision:main"}
+    namespace = "aisim" if package == "aisim" else "aisimulate"
+    monkeypatch.setattr(release_artifacts, "PYTHON_NAMESPACE", namespace)
+    scripts = {
+        "aiconfigurator": f"{namespace}.legacy_cli.entrypoint:main",
+        "aisimulate": f"{namespace}.supervision:main",
+    }
     if alias:
-        scripts["aisim"] = "aisimulate.supervision:main"
+        scripts["aisim"] = f"{namespace}.supervision:main"
     if failure == "missing-command":
         del scripts["aisimulate"]
     elif failure == "alias":
         if alias:
             del scripts["aisim"]
         else:
-            scripts["aisim"] = "aisimulate.supervision:main"
+            scripts["aisim"] = f"{namespace}.supervision:main"
     elif failure == "wrong-target":
         scripts["aisimulate"] = "wrong.module:main"
     elif failure == "extra-script":
-        scripts["unexpected"] = "aisimulate.supervision:main"
+        scripts["unexpected"] = f"{namespace}.supervision:main"
     embedded_name = "other-product" if failure == "name" else package
     embedded_version = "0.0.1" if failure == "version" else version
     metadata = f"Metadata-Version: 2.1\nName: {embedded_name}\nVersion: {embedded_version}\n"

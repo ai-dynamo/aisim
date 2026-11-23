@@ -5,6 +5,11 @@
 import math
 import re
 
+
+class IncompleteSiliconEvidence(ValueError):
+    """A snapshot cannot publish under the current silicon evidence contract."""
+
+
 SCHEMA = "aisimulate.benchmark.features.v1"
 STATES = {"enabled", "disabled", "not_applicable", "unknown"}
 USAGE = {"exercised", "not_observed", "unknown"}
@@ -141,7 +146,7 @@ def validate_qwen_baseline(value):
     return value
 
 
-def validate(value, benchmark_id=None):
+def validate(value, benchmark_id=None, *, require_complete=False):
     if not isinstance(value, dict) or set(value) != {"schema", "benchmark_id", "taxonomy", "features"}:
         raise ValueError("Invalid feature metadata fields")
     if value["schema"] != SCHEMA or not re.fullmatch(r"[a-z0-9-]+", value["benchmark_id"]):
@@ -234,8 +239,48 @@ def validate(value, benchmark_id=None):
             raise ValueError("Speculation requires method and draft length")
         if length is not None and (type(length) is not int or length <= 0):
             raise ValueError("Invalid configured draft length")
-        if method == "off" and (rows["speculation"]["state"] != "disabled" or length is not None):
+        if method == "off" and (
+            rows["speculation"]["state"] not in {"disabled", "not_applicable"} or length is not None
+        ):
             raise ValueError("Speculation off makes draft length not applicable")
+    if require_complete:
+        if seen != SILICON_FEATURES:
+            raise IncompleteSiliconEvidence("New self-collected publications require the eight silicon features")
+        incomplete_evidence = None
+        for row in value["features"]:
+            identity, state = row["id"], row["state"]
+            if state == "unknown" or not row["evidence"]:
+                if incomplete_evidence is None:
+                    incomplete_evidence = IncompleteSiliconEvidence(
+                        f"New self-collected publications require resolved, evidenced settings: {identity}"
+                    )
+                if state == "unknown":
+                    continue
+            params = {p["name"]: p["value"] for p in row["parameters"]}
+            if identity in {"cache.g2", "cache.g3"}:
+                scopes = {"local", "shared"} if state == "enabled" else {"not_applicable"}
+                if params.get("scope") not in scopes:
+                    raise ValueError(f"Resolved offload scope required: {identity}")
+                if state == "enabled" and (
+                    not isinstance(params.get("implementation"), str) or not params["implementation"].strip()
+                ):
+                    raise ValueError(f"Enabled offload requires an implementation: {identity}")
+            if state == "enabled":
+                numeric = {
+                    "cache.sub_block_prefix_reuse": ("match_granularity_tokens", "block_size"),
+                    "cache.g2": ("size",),
+                    "speculation": ("draft_length",),
+                }.get(identity, ())
+                if any(type(params.get(name)) is not int or params[name] <= 0 for name in numeric):
+                    raise ValueError(f"Enabled feature requires positive configured parameters: {identity}")
+                if identity == "cache.hybrid_state" and not isinstance(params.get("cache_types"), list):
+                    raise ValueError("Enabled hybrid caching requires cache_types")
+            if identity == "speculation":
+                methods = STRING_VALUES["method"] - {"off", "unknown"} if state == "enabled" else {"off"}
+                if params.get("method") not in methods:
+                    raise ValueError("Resolved speculation method required")
+        if incomplete_evidence is not None:
+            raise incomplete_evidence
     return value
 
 

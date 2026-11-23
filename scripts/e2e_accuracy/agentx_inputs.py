@@ -4,6 +4,7 @@
 
 import hashlib
 import json
+import math
 import re
 
 from scripts.e2e_accuracy.benchmark_features import SILICON_FEATURES, validate
@@ -341,6 +342,83 @@ def manual_geometry(workers):
     return mapping
 
 
+# Share of the profile phase that nonzero acceptance samples must cover.
+MIN_ACCEPTANCE_COVERAGE = 0.9
+
+
+def series_acceptance(workload, depth):
+    """Mean accepted draft tokens per forward over the profile phase, or None when the series is unusable.
+
+    The silicon acceptance gauge reports accepted drafts plus the bonus token, so one token per forward is
+    subtracted. A zero row is the gauge's initialization value, not a measurement, and is skipped.
+    """
+    try:
+        silicon = workload["silicon_reference"]["silicon"]
+        definition = silicon["metric_definitions"]["acceptance"]
+        profile = silicon["phases"]["profile"]
+        rows, duration = profile["series"]["acceptance"], profile["duration_s"]
+    except (KeyError, TypeError):
+        return None
+    if (
+        definition.get("kind") != "gauge"
+        or definition.get("unit") != "tokens/forward"
+        or type(duration) not in {int, float}
+        or not math.isfinite(duration)
+        or duration <= 0
+        or not isinstance(rows, list)
+    ):
+        return None
+    covered = weighted = 0.0
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"start", "end", "value", "coverage"}:
+            raise ValueError("Invalid measured speculative acceptance series")
+        start, end, value, coverage = row["start"], row["end"], row["value"], row["coverage"]
+        if any(type(v) not in {int, float} or not math.isfinite(v) for v in (start, end, value, coverage)):
+            raise ValueError("Invalid measured speculative acceptance series")
+        if not 0 <= coverage <= 1 or value < 0 or 0 < value < 1:
+            raise ValueError("Invalid measured speculative acceptance series")
+        # Final source intervals may extend past the phase boundary.
+        span = min(end, duration) - max(start, 0.0)
+        if value == 0 or span <= 0:
+            continue
+        covered += span * coverage
+        weighted += span * coverage * value
+    if covered < MIN_ACCEPTANCE_COVERAGE * duration:
+        return None
+    accepted = weighted / covered - 1
+    return accepted if 0 <= accepted <= depth else None
+
+
+def measured_acceptance(point, depth, workload=None):
+    """Read depth-matched acceptance, or None when speculation is disabled.
+
+    The point receipt is authoritative. Only when it carries no acceptance does the profile-phase acceptance
+    series of ``workload`` (a callable returning the workload document) supply the measurement; an invalid
+    receipt is never replaced.
+    """
+    if type(depth) is not int or depth < 0:
+        raise ValueError("Invalid recorded verification depth")
+    if depth == 0:
+        return None
+    metrics = point.get("metrics", {})
+    if "speculative_acceptance" not in metrics and workload is not None:
+        measured = series_acceptance(workload(), depth)
+        if measured is not None:
+            return measured
+    receipt = metrics.get("speculative_acceptance")
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != {"verification_depth", "accepted_draft_tokens"}
+        or type(receipt["verification_depth"]) is not int
+        or receipt["verification_depth"] != depth
+    ):
+        raise ValueError("Missing depth-matched measured speculative acceptance")
+    accepted = receipt["accepted_draft_tokens"]
+    if type(accepted) not in {int, float} or not math.isfinite(accepted) or not 0 <= accepted <= depth:
+        raise ValueError("Invalid measured speculative acceptance")
+    return accepted
+
+
 def replay_config(root, run):
     """Simulation policy lives in CI; measured settings come from verified receipts."""
     if (run["backend"], run["model"], run["hardware"], run["tensor_parallel"], run["precision"]) not in {
@@ -419,7 +497,12 @@ def replay_config(root, run):
             "max_sequences": args["max-running-requests"],
         }
         # Recorded verification depth and measured acceptance remain distinct from configured draft length.
-        engine.update(context_length=args["context-length"], nextn=args["speculative-num-steps"], nextn_accepted=1.99)
+        depth = args["speculative-num-steps"]
+        engine.update(
+            context_length=args["context-length"],
+            nextn=depth,
+            nextn_accepted=measured_acceptance(point, depth, lambda: document(root, run, "workload")),
+        )
         source = document(root, run, "source_manifest")["initial_selection"]
         snapshot = {
             "seed": source["seed"],

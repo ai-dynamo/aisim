@@ -59,7 +59,7 @@ This is **Option 1**. Select an FPM explicitly so construction cannot choose an
 OP estimator, and leave `speculation` unset and `nextn` at zero:
 
 ```python
-from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
 stp_config = ForwardPassPerfModelConfig(
     model="Qwen/Qwen3-0.6B",
@@ -230,13 +230,13 @@ For a reviewed profile and table whose identity matches the values below:
 import json
 from pathlib import Path
 
-from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
 sd_config = ForwardPassPerfModelConfig(
     model="Qwen/Qwen3-8B",
     system="h200_sxm",
     backend="vllm",
-    backend_version="0.24.0",
+    backend_version="0.32.0",
     worker_type="decode",
     fpm_profile=json.loads(Path("/data/measured-sd-profile.json").read_text()),
     nextn=3,  # Must match the profile's recorded draft depth.
@@ -260,13 +260,17 @@ or an OP draft tail would count it again. The paths above are user-supplied
 artifacts, including the table's required metadata sidecar; this example does
 not assert packaged measured-SD coverage for that identity.
 
-Resources must use a linear cache with observed `runtime_memory`. The recorded
-usable KV pool already reflects draft and graph allocations; capacity sizing
-does not subtract them again. Pending or analytically declared memory alone is
+Replay resources require observed `runtime_memory` with a linear or supported
+Mamba align cache. The recorded usable KV pool already reflects draft and graph
+allocations. Capacity sizing does not subtract them again. Pending or analytically declared memory alone is
 insufficient. Grouped caches, generic `speculation` configurations, recorded
 DCP and non-pure-TP topologies remain unsupported on this route. Use `nextn`
 with the exact recorded `execution_profile`; generic speculation cost graphs
 must not be composed with measurements that already include the draft work.
+
+Standalone timing queries also accept `cache_layout: unmodeled` with observed
+`runtime_memory`. This descriptor preserves a native allocation whose behavior
+AIS cannot simulate. Cache sizing and replay reject these profiles.
 
 Supported queries are single-rank `ForwardPassMetrics` (pure prefill, pure
 decode and mixed), prefill static/detailed queries, and replay's prefill and
@@ -313,7 +317,7 @@ Replay need finalized resource evidence.
 Set `estimator_config.fpm_interpolation.fpm_parquet_path` on the canonical configuration to use an external parquet and its required same-stem `.metadata.json` sidecar:
 
 ```python
-from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
 config = ForwardPassPerfModelConfig(
     model="Qwen/Qwen3-0.6B",
@@ -331,7 +335,7 @@ model = RustForwardPassPerfModel.best_available(config)
 
 The parquet identity must match the requested model, hardware, backend version, topology, and quantization. The systems YAML is still required, but a backend timing-data directory is unnecessary. Relative paths bind to the working directory when the model is constructed; resolved provenance stores the absolute path. The control applies when FPM interpolation is selected; other estimators retain it in provenance without opening the file. Saved legacy `timing.forward_model: fpm` and `timing.fpm_parquet_path` inputs migrate to the same canonical control, which is preserved in replay and per-role recommendation output.
 
-`model.static_phase_latency(batch_size=1, input_tokens=512, output_tokens=4, prefill=False)` exposes the native engine's existing static integration before online correction. Prefill returns one prefill latency; decode returns total decode latency for the output sequence. This method requires a native estimator. AFD+PD uses it for an external-FPM regular companion, dividing total decode latency by `max(1, output_tokens - 1)` for TPOT. AFD attention and FFN workers retain their existing timing provider.
+`model.static_phase_latency(batch_size=1, input_tokens=512, output_tokens=4, prefill=False)` exposes the native engine's existing static integration before online correction. Prefill returns one prefill latency; decode returns total decode latency for the output sequence. This method requires a native estimator. Ordinary companions of AFD roles use the canonical replay timing provider; they do not use a separate static-phase execution path. AFD pools require op-level estimation for their source-ordered execution plans.
 
 ### Direct-FPM query coverage
 
@@ -407,7 +411,9 @@ their decode work as a separate decode pass. The CLI also saves
 error stops replay; the Python exception retains a `fpm_query_coverage`
 attribute for that failure path. A passing replay coverage status requires completed requests,
 nonempty resolved queries and no unsupported lookup. It is distinct from
-operation/energy evidence, which whole-model FPM does not provide. See
+operation-level evidence and from the [power coverage gate](../power.md):
+supported non-speculative schema-v8 whole-model FPM can provide energy,
+while v6/v7 and fitted estimators remain latency-only. See
 [FPM replay validation](../fpm-self-service/implementation.md#validate-fpm-query-coverage-with-agentx-replay)
 for the stricter whole-corpus completion checks and saved onboarding artifacts.
 
@@ -464,10 +470,13 @@ are rejected before interpolation; the existing execution-identity and real-KV
 requirements still apply. The legacy `dynamo_native_single_sample_v1` contract
 is unchanged.
 
+Schema 8 adds measured per-row power under its own sidecar policy; see
+[measured power](#measured-power-schema-8).
+
 For a Kimi K3 text profile, an explicit configuration can be:
 
 ```python
-from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
 config = ForwardPassPerfModelConfig(
     model="moonshotai/Kimi-K3", system="gb300", backend="vllm",
@@ -506,7 +515,7 @@ the canonical quant-mode fields and `attention_backend`, alongside estimator
 selection and controls. DCP FPM replay requires explicit fixed KV block capacity;
 automatic DCP/hybrid capacity sizing is not implemented. Host offload or P/D
 transfer also requires explicit KV bytes per token with DCP.
-`decode_context` is currently supported by AISimulate's `--stack engine` only.
+`decode_context` is currently supported by AISim's `--stack engine` only.
 Dynamo Replay and Planner do not yet support this field; their configuration
 propagation, cache identity, and dependency version need a downstream update.
 These timing precision/backend overrides are prediction-only; recommendation
@@ -522,3 +531,110 @@ rejected before payload decoding. Configuration and profiles without DCP
 remain accepted as unrecorded DCP.
 
 Detailed per-query support and weights are described in the [Python API](../api/python.md#direct-fpm-query-evidence).
+
+## Measured power (schema 8)
+
+Schema 8 adds measured GPU power to vLLM self-benchmark tables. It is the only
+whole-forward table that supplies operation energy. Where V1 publishes that
+power, and where it does not, is described in
+[modeled power](../power.md#whole-forward-fpm-power).
+
+### Table contract
+
+- The sidecar declares `schema_version: 8` and `measurement_policy:
+  dynamo_native_single_sample_power_window_v1`; no other sidecar field is
+  added. Schema 8 pairs only with this policy and backend `vllm`. Every other
+  policy stays at schema 6 or 7 and is latency-only.
+- Every row must also declare
+  `measurement_policy: dynamo_native_single_sample_power_window_v1`; missing,
+  null, legacy or unknown row policies are rejected. One pair therefore cannot
+  hold power-window rows next to latency-only rows.
+- The Parquet file must have a `power_w` column (float64, nullable), even when
+  every value is null. It is the mean power of one GPU over the row's power
+  window, averaged across `topology.total_gpus`, in watts. Every non-null value
+  must be finite and greater than zero. `null` means that the point has no
+  power; the reason stays in the raw rank artifact. The Rust loader represents
+  it as NaN rather than inventing a zero-watt measurement.
+- Units are ms, W and W-ms. Power is never derived from latency, TDP or power
+  limits.
+
+Schema 6 and 7 pairs load as before, do not read `power_w`, and their latency
+is unchanged. A loader that predates schema 8 rejects a schema-8 pair instead
+of dropping its power. Fake-KV healing keeps the selected anchor's power,
+including unknown power.
+
+The collector publishes schema 8 as soon as any row comes from a power-window
+run, even when every window was unavailable. It refuses to merge power-window
+rows into an existing schema-6 or 7 pair, or latency-only rows into a schema-8
+pair, before writing anything; publish to a clean destination or collect every
+cell with the same `--fpm-measure-power` setting.
+
+The accuracy dataset gate validates the schema-8 policy, row binding, DOUBLE
+column and power values before it admits a pair. Its Gym worker adapter still
+rejects schema 7 and 8 execution identities as unsupported, so passing artifact
+validation does not establish predictor support or measured serving accuracy.
+
+### Measurement method
+
+The latency sample is unchanged: one synchronized iteration defines
+`latency_ms`. Power comes from a separate window that follows it:
+
+1. Dynamo repeats the same point in synchronized iterations until the measured
+   window lasts at least `FPM_POWER_MIN_WINDOW_S`, 2 s. NVML counter
+   calibration found that the energy counter updates every 100 ms on H200 and
+   B200, and the window must span at least 20 updates. A single iteration
+   lasts milliseconds, which would mostly measure counter quantization.
+2. It reads the NVML cumulative energy counter
+   (`nvmlDeviceGetTotalEnergyConsumption`, mJ, which equals W-ms) on every GPU
+   at the window's group-barrier edges.
+3. `power_w = sum over GPUs of energy_wms / (total_gpus * window_ms)`. Because
+   the window consists of synchronized group iterations, it includes the time
+   ranks spend waiting, as the latency sample does.
+
+Prefill repeats use fresh suffix token IDs from the same generator, so they
+are not served from the prefix cache. The prefix tokens and `cache_salt` stay
+as staged. A repeat whose cached-token count differs from the latency sample's
+makes the point's power unavailable (`prefill_cache_mismatch`).
+
+Decode repeats append one token per request per iteration, so the KV read
+grows during the window. The artifact records this drift. When it exceeds 10%
+of the point's `total_kv_read_tokens`, the point keeps its latency and gets
+`power_w: null`. With roughly 100 to 1,000 iterations in a 2 s window, decode
+points with less than about ten times that many context tokens per request
+carry no power. The low-KV end of every decode curve is therefore unpowered.
+
+A point also keeps its latency with `power_w: null` when any rank reports the
+window unavailable, for example `nvml_error`, `nvml_permission`,
+`counter_wrap` or `window_below_minimum`. Decode points of hybrid,
+sliding-window and Mamba KV-warmup shadow layouts always report power
+unavailable (`kvwarm_shadow_headroom`). The DeepSeek-V4.1 real-KV and
+GLM-5.3-Flash prefix-seed adapters stay on their pinned runtime without the
+window, and the SGLang native-FPM client writes no power. Collection details
+and the opt-out are in the
+[onboarding guide](../fpm-self-service/implementation.md#how-the-collection-grid-is-determined).
+
+### From rows to operation energy
+
+The SOL and direct methods blend each row's power with the same weights as its
+latency, using the anchors selected by that method: exact hits, curve
+interpolation, SOL transfer, decode brackets and the decode pass baseline. The FPM operation then returns
+`energy_wms = power_w * latency_ms` for the query. A prefill clamp scales
+latency and energy and leaves power unchanged.
+
+A query that touches a row without power, whether as an exact hit, an
+interpolation neighbour, a bracket side or a boundary-hold anchor, returns
+energy 0. Its latency is unchanged. Energy 0 is the missing-data sentinel, so
+the query counts as uncovered and coverage drops by exactly its latency.
+Queries whose rows all carry power stay covered.
+
+In a non-speculative mixed step, the prefill contributes its own energy.
+Effective decode energy is `max(0, E_target - E_floor)` only when the marginal
+latency is positive and both target and KV-floor baseline queries have power;
+otherwise it is zero. Coverage is tracked per component, so powered prefill
+cannot cover an unpowered decode marginal. Mixed-step watts remain unqualified
+until measured validation passes.
+
+Native Replay and the detailed forward-pass result carry component energy for
+supported schema-8 configurations. The scalar
+`estimate_forward_pass_time_ms()` iteration query still returns latency only.
+Schema-6/7, speculative and fitted providers remain latency-only.

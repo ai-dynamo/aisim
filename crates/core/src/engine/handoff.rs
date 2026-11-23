@@ -3,7 +3,7 @@
 
 //! Runtime-neutral identities and timing inputs for prefill-to-decode handoff.
 //!
-//! These value types are owned by the `aisimulate-core::engine` module because native
+//! These value types are owned by the `aisim-core::engine` module because native
 //! schedulers must retain them with their KV ownership state. Replay owns the
 //! handoff coordinator, ordering, and virtual transfer event.
 //!
@@ -61,6 +61,11 @@ pub enum TransferTimingMode {
 /// Schedulers publish this value when source KV ownership becomes held.
 /// The Replayer combines it with the destination's missing-token observation
 /// and schedules the virtual transfer completion.
+///
+/// A grouped KV source counts in units of one full-attention block.
+/// `full_prompt_tokens` is then the number of such blocks of the transferred
+/// prompt. `kv_bytes_per_token` is the payload of one block, summed over the
+/// full-attention groups. `state_bytes` is every fixed byte of the request.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HandoffTransferTiming {
     /// Which prompt footprint contributes to transfer time.
@@ -75,6 +80,11 @@ pub struct HandoffTransferTiming {
     pub state_bytes: usize,
     /// Modeled transfer bandwidth in decimal gigabytes per second.
     pub bandwidth_gb_s: Option<f64>,
+    /// Milliseconds the source's last forward still spends in later pipeline stages after the
+    /// scheduler sees it complete (a PP prefill worker retires its passes at the per-stage rate).
+    /// The transfer becomes ready that much later; it is not part of `delay_ms`.
+    #[serde(default)]
+    pub pipeline_fill_ms: f64,
 }
 
 impl HandoffTransferTiming {
@@ -140,6 +150,7 @@ pub fn prefill_handoff_delay_ms(
         kv_bytes_per_token,
         state_bytes: 0,
         bandwidth_gb_s,
+        pipeline_fill_ms: 0.0,
     }
     .full_prompt_delay_ms()
 }
@@ -163,9 +174,15 @@ mod tests {
             kv_bytes_per_token: Some(1_000),
             state_bytes: 0,
             bandwidth_gb_s: Some(1.0),
+            pipeline_fill_ms: 0.0,
         };
 
         assert_eq!(timing.delay_ms(20), Some(0.02));
+        let filled = HandoffTransferTiming {
+            pipeline_fill_ms: 5.0,
+            ..timing
+        };
+        assert_eq!(filled.delay_ms(20), Some(0.02), "the fill is not link work");
         assert_eq!(timing.full_prompt_delay_ms(), Some(0.1));
     }
 
@@ -177,6 +194,7 @@ mod tests {
             kv_bytes_per_token: Some(1_000),
             state_bytes: 50_000,
             bandwidth_gb_s: Some(1.0),
+            pipeline_fill_ms: 0.0,
         };
         let close = |value: Option<f64>, expected: f64| (value.unwrap() - expected).abs() < 1e-12;
         assert!(close(timing.delay_ms(0), 0.05));
@@ -192,6 +210,7 @@ mod tests {
             kv_bytes_per_token: None,
             state_bytes: 0,
             bandwidth_gb_s: Some(1.0),
+            pipeline_fill_ms: 0.0,
         };
         assert_eq!(timing.delay_ms(0), None);
 

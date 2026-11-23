@@ -35,7 +35,7 @@ claim serving support or measured coverage. For FP8 KV, an explicit
 `flashmla` or `trtllm_mla` attention backend identifies the physical layout:
 FlashMLA uses 656 bytes (FP8 latent, FP32 scales, BF16 RoPE), while TRTLLM
 uses 576 raw FP8 bytes. Index storage is additional in both cases. KDA state
-continues to use the existing K3 five-slot analytic state model. Token KV is
+continues to use the existing K3 five-slot analytic state model. At PP=1, token KV is
 18,912 bytes per token per rank with FlashMLA or 16,992 with TRTLLM MLA,
 independent of TP; KDA state is sharded by attention heads. Batch capacity
 reserves one state per admitted request, and token-byte metadata excludes

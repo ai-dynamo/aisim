@@ -8,8 +8,8 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use aisimulate_core::engine::{Backend, EngineConfig, NativeHostOffloadConfig, TimingModelConfig};
-use aisimulate_core::replay::loadgen::{
+use aisim_core::engine::{Backend, EngineConfig, NativeHostOffloadConfig, TimingModelConfig};
+use aisim_core::replay::loadgen::{
     AGENTIC_MOONCAKE_SCHEMA, AGENTIC_MOONCAKE_VERSION, AgenticDependency,
     AgenticDependencyRelation, AgenticDependencyTrigger, AgenticHashIdScope,
     AgenticLifecycleEventKind, AgenticMooncakeHeader, AgenticMooncakeRow, AgenticPlayStatus,
@@ -17,7 +17,7 @@ use aisimulate_core::replay::loadgen::{
     PreparedAgenticSnapshots, ValidatedAgenticGraph, WekaImporter, WorkloadDriver,
     load_agentic_mooncake, load_weka_agentic_graph,
 };
-use aisimulate_core::replay::{
+use aisim_core::replay::{
     PerRequestRecord, ReplayCaptureOptions, ReplayDeterminism, ReplayEngineConfig,
     ReplayEngineFactory, ReplayReport, ReplayRuntimeInput, ReplaySpec, ReplayTerminalStatus,
     ReplayTopology, Replayer, WorkerPoolSpec,
@@ -552,6 +552,86 @@ fn agentx_g2_profile_cancels_pending_host_restore_and_releases_server_resources(
     assert_eq!(restore.output_length, 0);
 }
 
+/// [`g2_spec`] with one shared pool, on two workers per role of two
+/// attention-DP ranks each.
+fn g2_fleet_spec(disaggregated: bool, h2d: f64) -> ReplaySpec {
+    let mut spec = g2_spec(disaggregated, true, Some(8), h2d);
+    spec.topology = if disaggregated {
+        let pool = || WorkerPoolSpec {
+            initial_workers: 2,
+            ..Default::default()
+        };
+        ReplayTopology::Disaggregated {
+            prefill: pool(),
+            decode: pool(),
+            handoff_latency_ms: 1.0,
+        }
+    } else {
+        ReplayTopology::aggregated(2)
+    };
+    spec.engine["dp_size"] = serde_json::json!(2);
+    spec
+}
+
+#[rstest]
+fn agentx_g2_fleet_warmup_shares_the_pool_across_ranks_before_profiling(
+    #[values(false, true)] disaggregated: bool,
+) {
+    let mut spec = g2_fleet_spec(disaggregated, 1.0);
+    // The primer's two-block store takes 200 ms.
+    spec.engine["rank"]["native_host_offload"]["d2h_bandwidth_gbps"] = serde_json::json!(0.01);
+    let warm = run_g2(spec, g2_snapshot_driver(true, false));
+    let phases = warm.agentic_phases.as_ref().unwrap();
+    assert_eq!(phases.phase, AgenticReplayPhase::Profile);
+    let origin = phases.profile_start_ms.unwrap();
+    let settled = phases
+        .requests
+        .iter()
+        .filter_map(|row| row.quiescent_at_ms)
+        .max_by(f64::total_cmp)
+        .unwrap();
+    assert!(origin >= settled, "{phases:?}");
+    // The first warm-up request runs on another rank, so it restores the
+    // primer's prefix from the shared pool once that store has landed.
+    let second = &phases.requests[1];
+    let waited = second.quiescent_at_ms.unwrap() - second.dispatched_at_ms.unwrap();
+    assert!(waited >= 200.0, "{second:?}");
+    assert_eq!(warm.request_counts.completed_requests, 3);
+    assert_eq!(warm.g2_domains.len(), 1);
+    // Round-robin picks the rank, so the parent's two blocks come from that
+    // rank's G1 or from the pool.
+    let restore = g2_request(&warm, "restore");
+    let g1 = restore.first_admission_g1_reused_input_tokens.unwrap();
+    let host = restore.first_admission_host_reused_input_tokens.unwrap();
+    assert_eq!(g1 + host, 8);
+}
+
+#[rstest]
+fn agentx_g2_fleet_profile_cancels_a_restore_from_the_shared_pool(
+    #[values(false, true)] disaggregated: bool,
+) {
+    let mut driver = g2_snapshot_driver(false, true);
+    driver
+        .enable_agentic_profile(AgenticProfileOptions {
+            // As in the single-worker case: the restored parent's two-block
+            // H2D outlasts the profile.
+            duration_seconds: 0.1,
+            response_grace_seconds: 0.0,
+            ..Default::default()
+        })
+        .unwrap();
+    let mut spec = g2_fleet_spec(disaggregated, 0.01);
+    spec.max_sim_time_ms = None;
+    let report = run_g2(spec, driver);
+    let profile = report.agentic_profile.as_ref().unwrap();
+    assert_eq!(profile.canceled_requests, 1, "{profile:?}");
+    assert_eq!(profile.client_in_flight_requests, 0);
+    assert_eq!(profile.server_unsettled_requests, 0);
+    assert_eq!(profile.finished_at_ms, Some(100.0));
+    let restore = g2_request(&report, "restore");
+    assert_eq!(restore.terminal_status, ReplayTerminalStatus::Canceled);
+}
+
 fn snapshot_pin_report(
     graph: &ValidatedAgenticGraph,
     mode: &str,
@@ -671,26 +751,30 @@ fn snapshot_warmup_and_profile_reports_are_pinned() {
     // To re-pin, run this test and copy the `left:` list from the failure. A
     // mismatch the change did not intend must first be diffed semantically
     // against the previous report, per-request and lifecycle output.
+    // The AISim rename deliberately changes lifecycle and Weka source digests.
+    // A three-domain-only before/after comparison recovered every old pin;
+    // complete per-request records and lifecycle event streams were identical.
+    // See benchmarks/evidence/pr796-rename/agentx-domain-comparison.json.
     let expected = [
-        "g2 snapshot agg: 5 6b28fe341f87b490",
-        "g2 snapshot disagg: 5 515ff132fcdc6b08",
-        "g2 warmup agg: 5 b89358b190c66046",
-        "g2 warmup disagg: 5 1a9c63bc1919b472",
-        "g2 profile agg: 168 b8aa80a7a5d00b2b",
-        "g2 profile disagg: 151 f3062f253ba53636",
-        "g2 profile-cold agg: 168 0cbdef689a45e540",
-        "g2 profile-cold disagg: 151 1a03cbac9330a961",
-        "two-plays snapshot agg: 3 6ee98c82ab648f45",
-        "two-plays snapshot disagg: 3 a01db8613f512a83",
-        "two-plays warmup agg: 3 0f7ad48710c5d7c6",
-        "two-plays warmup disagg: 3 26a20280546a6cc7",
-        "two-plays profile agg: 821 10a719a78e167cd4",
-        "two-plays profile disagg: 667 c737d31ab004240b",
-        "two-plays profile-cold agg: 820 720a0b2eb0c2c09b",
+        "g2 snapshot agg: 5 6cbb612c534c4835",
+        "g2 snapshot disagg: 5 223e5df120da3b73",
+        "g2 warmup agg: 5 4a868a5c33ea746b",
+        "g2 warmup disagg: 5 727e03e2b6458069",
+        "g2 profile agg: 168 3836acf6cc08fea7",
+        "g2 profile disagg: 151 5a87dfb36cf47921",
+        "g2 profile-cold agg: 168 4d3fe50afc4f2048",
+        "g2 profile-cold disagg: 151 e2916a8f8909348f",
+        "two-plays snapshot agg: 3 f32d45662c04076b",
+        "two-plays snapshot disagg: 3 46193e1206325680",
+        "two-plays warmup agg: 3 8a40174c1b270569",
+        "two-plays warmup disagg: 3 35307eb4e477fbd3",
+        "two-plays profile agg: 821 b4ee47cad4b96929",
+        "two-plays profile disagg: 667 b25bb6287a94ebd6",
+        "two-plays profile-cold agg: 820 1c2fdbee5fa71dcf",
         // Same-timestamp arrivals now join the synchronous prefill pass: the
         // first affected recycled request admits at 13 ms instead of 15 ms,
         // allowing 667 requests to issue before the 1 s profiling cutoff.
-        "two-plays profile-cold disagg: 667 126b8310bccd00f3",
+        "two-plays profile-cold disagg: 667 03b6b577866b0ec4",
     ];
     assert_eq!(actual, expected);
 }

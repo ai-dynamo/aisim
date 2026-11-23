@@ -41,6 +41,123 @@ WHEEL = "c" * 64
 IDENTITY = {"schema_version": 1, "source_branch": "release/0.12.0", "source_sha": SHA, "tooling_sha": TOOLING}
 
 
+@pytest.mark.parametrize("layout", ["aisim", "aisimulate"])
+def test_release_project_layout_is_selected_without_mutating_source(tmp_path, layout):
+    from scripts.release.package_identity import project_directory
+
+    project = tmp_path / "python" / layout
+    project.mkdir(parents=True)
+    assert project_directory(tmp_path) == project
+    (tmp_path / "python" / ({"aisim", "aisimulate"} - {layout}).pop()).mkdir()
+    with pytest.raises(ValueError, match="expected one AISim Python project"):
+        project_directory(tmp_path)
+
+
+def test_release_project_compatibility_symlink_prefers_canonical_path(tmp_path):
+    from scripts.release.package_identity import project_directory
+
+    project = tmp_path / "python/aisim"
+    project.mkdir(parents=True)
+    # Tracked release/0.14.0 layout at 77d82652b2f83fd67afefc3141d69a5f06e630be.
+    compatibility = project.with_name("aisimulate")
+    compatibility.symlink_to("aisim", target_is_directory=True)
+    assert project_directory(tmp_path) == project
+    assert compatibility.readlink() == Path("aisim")
+
+
+@pytest.mark.parametrize("canonical,historical", [("aisim", "aisimulate"), ("aisim_core", "aisimulate_core")])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_evaluators_import_the_namespace_of_the_installed_wheel(tmp_path, canonical, historical, legacy):
+    package = tmp_path / (historical if legacy else canonical)
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "sdk.py").write_text("identity = 'unchanged-release'\n")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            "-c",
+            f"from scripts.release.package_identity import runtime_module; "
+            f"assert runtime_module('{canonical}.sdk').identity == 'unchanged-release'",
+        ],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join((str(ROOT), str(tmp_path)))},
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_namespace_compatibility_does_not_hide_a_broken_canonical_dependency(monkeypatch):
+    from scripts.release import package_identity
+
+    missing = ModuleNotFoundError("missing native dependency", name="broken_native_dependency")
+    importer = Mock(side_effect=missing)
+    monkeypatch.setattr(package_identity.importlib, "import_module", importer)
+    with pytest.raises(ModuleNotFoundError, match="missing native dependency"):
+        package_identity.runtime_module("aisim_core.sdk")
+    importer.assert_called_once_with("aisim_core.sdk")
+
+
+@pytest.mark.parametrize("canonical,historical", [("aisim", "aisimulate"), ("aisim_core", "aisimulate_core")])
+def test_missing_canonical_submodule_cannot_select_a_historical_runtime(tmp_path, canonical, historical):
+    for name in (canonical, historical):
+        package = tmp_path / name
+        package.mkdir()
+        (package / "__init__.py").touch()
+    (tmp_path / historical / "sdk.py").write_text("identity = 'historical'\n")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            "-c",
+            "import sys\n"
+            "from scripts.release.package_identity import runtime_module\n"
+            "try:\n"
+            f"    runtime_module('{canonical}.sdk')\n"
+            "except ModuleNotFoundError as error:\n"
+            f"    assert error.name == '{canonical}.sdk', error\n"
+            "else:\n"
+            "    raise AssertionError('a broken canonical runtime must not fall back')\n"
+            f"assert '{historical}.sdk' not in sys.modules\n",
+        ],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join((str(ROOT), str(tmp_path)))},
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize("namespace", ["aisim_core", "aisimulate_core"])
+def test_fpe_probe_uses_the_unchanged_release_sdk(tmp_path, namespace):
+    package = tmp_path / namespace
+    package.mkdir()
+    (package / "__init__.py").touch()
+    (package / "sdk.py").write_text(
+        "class EngineHandle:\n    @staticmethod\n    def compile(*args, **kwargs):\n        return args, kwargs\n"
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            "-c",
+            "from types import SimpleNamespace; "
+            "from scripts.fpe.run_release_fpe import load_tool; "
+            "probe = load_tool('fpe_support_matrix'); "
+            "plan = SimpleNamespace(model='fixture/model', system='fixture_gpu', backend='vllm', "
+            "compile_kwargs=lambda: {'worker_type': 'aggregated'}); "
+            "assert probe._default_engine_factory(plan) == "
+            "(('fixture/model', 'fixture_gpu', 'vllm'), {'worker_type': 'aggregated'})",
+        ],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join((str(tmp_path), str(ROOT)))},
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 @pytest.fixture
 def probe_plan():
     selectors = json.loads((ROOT / ".github/fpe-required-probes.json").read_text())["probes"]
@@ -160,11 +277,15 @@ def test_discovery_does_not_silently_truncate_releases(tmp_path):
         RELEASE.list_releases(tmp_path)
 
 
-def test_harness_uses_release_inventory_and_current_probe_code(tmp_path):
+@pytest.mark.parametrize("layout", ["aisim", "aisimulate", "compatibility-symlink"])
+def test_harness_uses_release_inventory_and_current_probe_code(tmp_path, layout):
     source = tmp_path / "release"
-    inventory = source / RELEASE.PROBES / "support_matrix.py"
+    project = source / "python" / ("aisim" if layout == "compatibility-symlink" else layout)
+    inventory = project / "tools/support_matrix/support_matrix.py"
     inventory.parent.mkdir(parents=True)
     inventory.write_text("release inventory\n")
+    if layout == "compatibility-symlink":
+        project.with_name("aisimulate").symlink_to("aisim", target_is_directory=True)
     destination = RELEASE.prepare_harness(source, tmp_path / "harness")
     copied = destination / "tools/support_matrix"
     assert (copied / "support_matrix.py").read_text() == "release inventory\n"
@@ -196,20 +317,30 @@ def test_identity_rejects_wrong_source_and_modified_checkouts(tmp_path):
 def test_wheel_requires_exactly_one_package(tmp_path):
     with pytest.raises(ValueError, match="exactly one"):
         RELEASE.wheel_identity(tmp_path)
-    (tmp_path / "aisimulate-one.whl").write_bytes(b"one")
-    (tmp_path / "aisimulate-two.whl").write_bytes(b"two")
+    (tmp_path / "aisim-one.whl").write_bytes(b"one")
+    (tmp_path / "aisim-two.whl").write_bytes(b"two")
     with pytest.raises(ValueError, match="exactly one"):
         RELEASE.wheel_identity(tmp_path)
 
 
-def test_installed_bytes_and_active_imports_must_belong_to_release_wheel(tmp_path):
+@pytest.mark.parametrize(
+    ("package", "application"), [("aisimulate", "aisimulate"), ("aisim", "aisimulate"), ("aisim", "aisim")]
+)
+@pytest.mark.parametrize("import_fault", [None, "external", "no-origin", "missing", "unowned"])
+def test_installed_bytes_and_active_imports_must_belong_to_release_wheel(tmp_path, package, application, import_fault):
     names = [
-        "aisimulate/__init__.py",
-        "aisimulate/_runtime.so",
-        "aisimulate_core/__init__.py",
-        "aisimulate_core/_native.py",
+        f"{application}/__init__.py",
+        f"{application}/_runtime.so",
+        f"{application}_core/__init__.py",
+        f"{application}_core/_native.py",
     ]
-    wheel = tmp_path / "aisimulate-test.whl"
+    if application == "aisim":
+        names += ["aisimulate/__init__.py", "aisimulate_core/__init__.py"]
+    else:
+        # 0.12 shims delegate to these implementation packages. Their bytes
+        # must be bound to the wheel as well as the public facade's bytes.
+        names += ["aiconfigurator/__init__.py", "aiconfigurator_core/sdk/engine.py"]
+    wheel = tmp_path / f"{package}-test.whl"
     site = tmp_path / "site"
     with zipfile.ZipFile(wheel, "w") as archive:
         for name in names:
@@ -217,23 +348,41 @@ def test_installed_bytes_and_active_imports_must_belong_to_release_wheel(tmp_pat
             path = site / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("release bytes")
-    dist = SimpleNamespace(files=names, locate_file=lambda p: site / p)
+    runtime = f"{application}._runtime"
+    owned = [name for name in names if import_fault != "unowned" or name != f"{application}/_runtime.so"]
+    dist = SimpleNamespace(files=owned, locate_file=lambda p: site / p)
 
     def find_spec(name):
-        path = "aisimulate/_runtime.so" if name == "aisimulate._runtime" else name + "/__init__.py"
+        # Modern compatibility imports can have an alias loader with no origin;
+        # the native implementation must be verified under its canonical name.
+        if application == "aisim" and name == "aisimulate._runtime":
+            return SimpleNamespace(origin=None)
+        if name == runtime:
+            if import_fault == "missing":
+                return None
+            if import_fault == "no-origin":
+                return SimpleNamespace(origin=None)
+            if import_fault == "external":
+                return SimpleNamespace(origin="/other/_runtime.so")
+        path = f"{application}/_runtime.so" if name == runtime else name + "/__init__.py"
         return SimpleNamespace(origin=str(site / path))
 
-    with patch.object(RELEASE.importlib.util, "find_spec", side_effect=find_spec):
+    with patch.object(RELEASE.importlib.util, "find_spec", side_effect=find_spec) as lookup:
+        if import_fault:
+            with pytest.raises(ValueError, match="not imported"):
+                RELEASE.verify_installed_wheel(wheel, distribution=dist)
+            return
         RELEASE.verify_installed_wheel(wheel, distribution=dist)
-        (site / names[0]).write_text("different source")
-        with pytest.raises(ValueError, match="differs"):
-            RELEASE.verify_installed_wheel(wheel, distribution=dist)
-        (site / names[0]).write_text("release bytes")
-    with (
-        patch.object(RELEASE.importlib.util, "find_spec", return_value=SimpleNamespace(origin="/other/__init__.py")),
-        pytest.raises(ValueError, match="not imported"),
-    ):
-        RELEASE.verify_installed_wheel(wheel, distribution=dist)
+        assert call(runtime) in lookup.call_args_list
+        if application == "aisim":
+            assert call("aisimulate._runtime") not in lookup.call_args_list
+        # Canonical implementation files and compatibility aliases must all match.
+        for name in names:
+            path = site / name
+            path.write_text("different source")
+            with pytest.raises(ValueError, match="differs"):
+                RELEASE.verify_installed_wheel(wheel, distribution=dist)
+            path.write_text("release bytes")
 
 
 def reports(root, required):
@@ -290,7 +439,15 @@ def test_complete_release_reports_produce_publishable_ci_artifact(tmp_path, prob
     source = tmp_path / "reports"
     shards = reports(source, probe_plan["probes"])
     destination = tmp_path / "web"
-    RELEASE.package_reports(source, IDENTITY, WHEEL, shards, destination, probe_plan=probe_plan)
+    RELEASE.package_reports(
+        source,
+        IDENTITY,
+        WHEEL,
+        shards,
+        destination,
+        probe_plan=probe_plan,
+        source_project=Path("release-source/python/aisim"),
+    )
     qualification = json.loads((destination / "fpe-qualification.json").read_text())
     assert qualification["source_sha"] == SHA
     assert qualification["tooling_sha"] == TOOLING
@@ -308,7 +465,7 @@ def test_complete_release_reports_produce_publishable_ci_artifact(tmp_path, prob
     assert len(rows) == 4
     assert all(
         shlex.split(row["Command"])[3:6]
-        == ["release-source/python/aisimulate/.venv/bin/python", "scripts/fpe/run_release_fpe.py", "probe"]
+        == ["release-source/python/aisim/.venv/bin/python", "scripts/fpe/run_release_fpe.py", "probe"]
         for row in rows
     )
     assert all(SHA in row["Command"] and TOOLING in row["Command"] for row in rows)
@@ -321,7 +478,15 @@ def test_incomplete_release_cannot_produce_a_web_artifact(tmp_path, probe_plan):
     next(source.rglob("fpe_support_matrix.json")).unlink()
     destination = tmp_path / "web"
     with pytest.raises(ValueError, match="missing shards"):
-        RELEASE.package_reports(source, IDENTITY, WHEEL, shards, destination, probe_plan=probe_plan)
+        RELEASE.package_reports(
+            source,
+            IDENTITY,
+            WHEEL,
+            shards,
+            destination,
+            probe_plan=probe_plan,
+            source_project=Path("release-source/python/aisim"),
+        )
     assert not destination.exists()
 
 
@@ -338,7 +503,15 @@ def test_passing_previous_version_cannot_replace_a_failed_current_probe(tmp_path
         path.write_text(json.dumps(payload))
     destination = tmp_path / "web"
     with pytest.raises(ValueError, match="required known-good probes no longer pass"):
-        RELEASE.package_reports(source, IDENTITY, WHEEL, shards, destination, probe_plan=probe_plan)
+        RELEASE.package_reports(
+            source,
+            IDENTITY,
+            WHEEL,
+            shards,
+            destination,
+            probe_plan=probe_plan,
+            source_project=Path("release-source/python/aisim"),
+        )
     assert not destination.exists()
 
 
@@ -349,7 +522,15 @@ def test_packaging_rejects_another_wheels_probe_plan_before_creating_output(tmp_
     wrong_plan["wheel_sha256"] = "d" * 64
     destination = tmp_path / "web"
     with pytest.raises(ValueError, match="provenance or policy"):
-        RELEASE.package_reports(source, IDENTITY, WHEEL, shards, destination, probe_plan=wrong_plan)
+        RELEASE.package_reports(
+            source,
+            IDENTITY,
+            WHEEL,
+            shards,
+            destination,
+            probe_plan=wrong_plan,
+            source_project=Path("release-source/python/aisim"),
+        )
     assert not destination.exists()
 
 
@@ -388,7 +569,11 @@ def test_discovery_plan_round_trips_through_packaging_cli(tmp_path, monkeypatch,
     monkeypatch.setenv("GITHUB_OUTPUT", str(output))
     destination = tmp_path / "web"
     plan_path = tmp_path / "resolved-probes.json"
+    source = tmp_path / "release"
+    (source / "python/aisimulate").mkdir(parents=True)
     arguments = [
+        "--source-root",
+        str(source),
         "--wheel-dir",
         str(wheel_dir),
         "--shards",
@@ -414,6 +599,16 @@ def test_discovery_plan_round_trips_through_packaging_cli(tmp_path, monkeypatch,
     verified.assert_not_called()
     result = json.loads((destination / "fpe-qualification.json").read_text())
     assert result["required_probes"] == probe_plan["probes"]
+    commands = []
+    for path in (destination / RELEASE.DATA).glob("*.csv"):
+        with path.open(newline="") as handle:
+            commands.extend(row["Command"] for row in csv.DictReader(handle))
+    assert commands
+    assert all(
+        shlex.split(command)[3:6]
+        == ["release-source/python/aisimulate/.venv/bin/python", "scripts/fpe/run_release_fpe.py", "probe"]
+        for command in commands
+    )
 
 
 @pytest.mark.parametrize("branch", ["main", "release/0.12.0"])
@@ -451,7 +646,7 @@ def test_distribution_identity_requires_exactly_one_installed_product(monkeypatc
 
 @pytest.mark.parametrize("installed", [(), ("aisim",), ("aisimulate",), ("aisim", "aisimulate")])
 def test_installed_package_verifier_rejects_old_application_overlap(monkeypatch, installed):
-    path = ROOT / "python/aisimulate/tools/verify_installed_package_layers.py"
+    path = ROOT / "python/aisim/tools/verify_installed_package_layers.py"
     spec = importlib.util.spec_from_file_location("verify_installed_layers", path)
     verifier = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(verifier)

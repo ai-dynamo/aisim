@@ -31,6 +31,7 @@ from scripts.fpm_accuracy.scenario_contract import (
     SELECTOR_ONLINE_RECIPE,
 )
 from scripts.fpm_accuracy.types.forward_pass import ForwardPassInput, ForwardPassIteration
+from scripts.release.package_identity import runtime_module
 
 _TRAINING_FIELDS = (
     "target",
@@ -438,10 +439,10 @@ class LearnedScenarioPredictor(ForwardPassTimePredictor):
                     scope.model.tune_with_fpms([rows])
                     scope.feedback_observations += 1
                 except Exception as exc:
-                    from aisimulate_core.sdk.errors import PerfDataNotAvailableError
+                    perf_data_error = runtime_module("aisim_core.sdk.errors").PerfDataNotAvailableError
 
                     error = exc
-                    prior_unavailable = isinstance(exc, PerfDataNotAvailableError)
+                    prior_unavailable = isinstance(exc, perf_data_error)
                 if (
                     (error is None or prior_unavailable)
                     and self._adaptation != "frozen"

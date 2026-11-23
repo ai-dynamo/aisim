@@ -1,5 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
+// Copyright contributors to the vLLM project.
+// Tests of a modified Rust simulation of the vLLM v0.29.0
+// (98dff2a81d747d1dba01a47f939f48c3526d4206) align-mode state cache.
+// Immutable sources and license: THIRD_PARTY_NOTICES.md.
 
 //! Acceptance cases for the manual G1 token/state capacity model.
 
@@ -561,6 +565,338 @@ fn newly_published_checkpoint_becomes_restorable_only_next_step() {
     );
     manager.finish_lease(owner, lease);
     clear_reclaimable_and_assert_empty(&mut manager);
+}
+
+#[test]
+fn waiting_lookup_reuses_a_state_miss_until_a_state_or_a_longer_overlap_ends_it() {
+    let mut manager = manager(16, 4, 1, true);
+    manager.configure_prefix_match_unit(Some(4));
+    let (query, mut waiting) = request(Uuid::from_u128(2), 17, 4, true, 0);
+    let hashes = (0..4)
+        .map(|block| waiting.sequence_hash(block).unwrap())
+        .collect::<Vec<_>>();
+    let cached = |manager: &VllmKvManager, waiting: &mut BlockRequestLease| {
+        manager
+            .get_waiting_lease_prefill_cost(&query, waiting)
+            .cached_tokens
+    };
+
+    // A 9-token prompt publishes its state at token 8, hidden from lookups
+    // until the next step.
+    let owner = Uuid::from_u128(1);
+    let (mut sequence, mut lease) = request(owner, 9, 4, true, 0);
+    allocated(manager.allocate_lease(owner, &mut lease, 8, 0));
+    manager.begin_step();
+    manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 0, 8);
+    assert_eq!(cached(&manager, &mut waiting), 0);
+    assert!(manager.repeated_state_miss(&query, &waiting).is_some());
+    assert_eq!(cached(&manager, &mut waiting), 0);
+    manager.begin_step();
+    assert!(manager.repeated_state_miss(&query, &waiting).is_none());
+    assert_eq!(cached(&manager, &mut waiting), 8);
+    manager.finish_lease(owner, lease);
+    clear_reclaimable_and_assert_empty(&mut manager);
+
+    // Three token blocks hit, so a state at token 16 is out of reach until
+    // the fourth block is cached too.
+    for &hash in &hashes[..3] {
+        seed_key(&mut manager, CacheKey::Token(hash));
+    }
+    let state = |block: usize| CacheKey::State {
+        prefix: hashes[block],
+        slot: 0,
+    };
+    seed_key(&mut manager, state(3));
+    assert_eq!(cached(&manager, &mut waiting), 0);
+    assert!(manager.repeated_state_miss(&query, &waiting).is_some());
+    seed_key(&mut manager, CacheKey::Token(hashes[3]));
+    assert!(manager.repeated_state_miss(&query, &waiting).is_none());
+    assert_eq!(cached(&manager, &mut waiting), 16);
+    clear_reclaimable_and_assert_empty(&mut manager);
+
+    // A state that becomes visible inside the overlap ends the miss.
+    for &hash in &hashes[..3] {
+        seed_key(&mut manager, CacheKey::Token(hash));
+    }
+    assert_eq!(cached(&manager, &mut waiting), 0);
+    assert!(manager.repeated_state_miss(&query, &waiting).is_some());
+    seed_key(&mut manager, state(1));
+    assert!(manager.repeated_state_miss(&query, &waiting).is_none());
+    assert_eq!(cached(&manager, &mut waiting), 8);
+    clear_reclaimable_and_assert_empty(&mut manager);
+
+    // Preemption drops the miss: the request resumes with a longer sequence.
+    assert_eq!(cached(&manager, &mut waiting), 0);
+    assert!(manager.repeated_state_miss(&query, &waiting).is_some());
+    manager.preempt_lease(waiting.owner(), &mut waiting);
+    assert!(manager.repeated_state_miss(&query, &waiting).is_none());
+}
+
+#[test]
+fn waiting_state_miss_is_bypassed_when_a_host_load_lands_private_state() {
+    let mut manager = manager(16, 4, 1, true);
+    manager.configure_prefix_match_unit(Some(4));
+    let owner = Uuid::from_u128(1);
+    let (query, mut waiting) = request(owner, 17, 4, true, 0);
+    let hashes = (0..3)
+        .map(|block| waiting.sequence_hash(block).unwrap())
+        .collect::<Vec<_>>();
+    for &hash in &hashes {
+        seed_key(&mut manager, CacheKey::Token(hash));
+    }
+    assert_eq!(
+        manager
+            .get_waiting_lease_prefill_cost(&query, &mut waiting)
+            .cached_tokens,
+        0
+    );
+    assert!(manager.repeated_state_miss(&query, &waiting).is_some());
+    let epoch = manager
+        .state_cache
+        .as_ref()
+        .unwrap()
+        .lookup_epoch(&manager.pool);
+
+    // Land a host prefix at token 8, below the last prompt boundary (16).
+    // This uses the real load path and leaves its state private: neither the
+    // visibility epoch nor the token block after the old overlap changes.
+    let reservation =
+        match manager.reserve_external_prefix_lease(owner, &waiting, 0, &hashes[..2], true) {
+            VllmAcquire::Ready(reservation) => reservation,
+            VllmAcquire::CapacityExhausted => panic!("host load should fit"),
+        };
+    manager.activate_destination_lease(owner, &query, &mut waiting, reservation);
+    let state = waiting.state.as_ref().unwrap();
+    assert_eq!(state.computed_tokens, 8);
+    assert!(!state.working.is_empty());
+    assert!(
+        state
+            .working
+            .iter()
+            .all(|&copy| manager.pool.is_private(copy))
+    );
+    assert_eq!(
+        manager
+            .state_cache
+            .as_ref()
+            .unwrap()
+            .lookup_epoch(&manager.pool),
+        epoch
+    );
+    assert!(
+        manager
+            .pool
+            .prefix_hit(waiting.sequence_hash(3).unwrap())
+            .is_none()
+    );
+    assert!(manager.repeated_state_miss(&query, &waiting).is_none());
+    let cost = manager.get_waiting_lease_prefill_cost(&query, &mut waiting);
+    assert_eq!(cost.cached_tokens, 8);
+    // Prefix lookup still selects the older inactive token copies, rather
+    // than the duplicate copies owned by this load.
+    assert_eq!(cost.active_cached_tokens, 0);
+    assert_eq!(cost.new_tokens, 9);
+    assert_eq!(cost.new_blocks, 3);
+    assert!(waiting.state_miss.is_none());
+    manager.finish_lease(owner, waiting);
+    clear_reclaimable_and_assert_empty(&mut manager);
+}
+
+#[test]
+fn waiting_state_miss_survives_a_duplicate_visible_state_copy() {
+    let mut manager = manager(16, 4, 1, true);
+    manager.configure_prefix_match_unit(Some(4));
+    let (query, mut waiting) = request(Uuid::from_u128(1), 17, 4, true, 0);
+    for block in 0..3 {
+        seed_key(
+            &mut manager,
+            CacheKey::Token(waiting.sequence_hash(block).unwrap()),
+        );
+    }
+    // A visible state beyond the attention overlap cannot restore this request.
+    let key = CacheKey::State {
+        prefix: waiting.sequence_hash(3).unwrap(),
+        slot: 0,
+    };
+    let first = seed_key(&mut manager, key);
+    assert_eq!(
+        manager
+            .get_waiting_lease_prefill_cost(&query, &mut waiting)
+            .cached_tokens,
+        0
+    );
+    assert!(manager.repeated_state_miss(&query, &waiting).is_some());
+    let epoch = manager.pool.state_visibility_epoch();
+    let second = seed_key(&mut manager, key);
+    assert_ne!(first, second);
+    assert_eq!(manager.pool.state_visibility_epoch(), epoch);
+    assert!(manager.repeated_state_miss(&query, &waiting).is_some());
+    let cost = manager.get_waiting_lease_prefill_cost(&query, &mut waiting);
+    assert_eq!(
+        cost.cached_tokens,
+        manager
+            .get_lease_prefill_cost(&query, &waiting)
+            .cached_tokens
+    );
+    assert_eq!(cost.cached_tokens, 0);
+    assert_eq!(cost.active_cached_tokens, 0);
+    assert_eq!(cost.new_tokens, 17);
+    assert_eq!(cost.new_blocks, 5);
+    clear_reclaimable_and_assert_empty(&mut manager);
+}
+
+#[test]
+fn waiting_sub_block_lookup_never_memoizes_a_state_miss() {
+    let mut manager = manager(16, 6, 1, true);
+    manager.configure_prefix_match_unit(Some(2));
+    let (query, mut waiting) = fine_request(Uuid::from_u128(1), 17, 6, 2, 0);
+    for block in 0..2 {
+        seed_key(
+            &mut manager,
+            CacheKey::Token(waiting.sequence_hash(block).unwrap()),
+        );
+    }
+    let partial = waiting.state_hash(16, 6).unwrap();
+    seed_key(
+        &mut manager,
+        CacheKey::State {
+            prefix: partial,
+            slot: 0,
+        },
+    );
+    // The state exists, but the partial attention page is not yet available.
+    for _ in 0..2 {
+        assert_eq!(
+            manager
+                .get_waiting_lease_prefill_cost(&query, &mut waiting)
+                .cached_tokens,
+            0
+        );
+        assert!(waiting.state_miss.is_none());
+        assert!(manager.repeated_state_miss(&query, &waiting).is_none());
+    }
+    let epoch = manager.pool.state_visibility_epoch();
+    seed_key(&mut manager, CacheKey::Token(partial));
+    assert_eq!(manager.pool.state_visibility_epoch(), epoch);
+    // A new partial-page alias changes the answer without a new full block
+    // or state key. Every waiting pass must therefore do the full lookup.
+    for _ in 0..2 {
+        assert_eq!(
+            manager
+                .get_waiting_lease_prefill_cost(&query, &mut waiting)
+                .cached_tokens,
+            16
+        );
+        assert!(waiting.state_miss.is_none());
+    }
+    clear_reclaimable_and_assert_empty(&mut manager);
+}
+
+#[test]
+fn waiting_speculative_drop_lookup_never_memoizes_a_state_miss() {
+    let mut manager = manager(16, 4, 1, true);
+    manager.configure_state_cache(
+        Some(crate::engine::StateCacheConfig {
+            bytes_per_request: 4,
+            sliding_window: None,
+            num_speculative_states: Some(2),
+            prefill_checkpoint: false,
+            junction_checkpoints: false,
+        }),
+        Some(1),
+        true,
+    );
+    manager.configure_prefix_match_unit(Some(4));
+    assert!(manager.state_cache.as_ref().unwrap().speculative_drop());
+    let (query, mut waiting) = request(Uuid::from_u128(1), 17, 4, true, 4);
+    for block in 0..3 {
+        seed_key(
+            &mut manager,
+            CacheKey::Token(waiting.sequence_hash(block).unwrap()),
+        );
+    }
+    seed_key(
+        &mut manager,
+        CacheKey::State {
+            prefix: waiting.sequence_hash(2).unwrap(),
+            slot: 0,
+        },
+    );
+    // Attention hits token 12, but dropping one unit bounds state reuse at 8.
+    for _ in 0..2 {
+        assert_eq!(
+            manager
+                .get_waiting_lease_prefill_cost(&query, &mut waiting)
+                .cached_tokens,
+            0
+        );
+        assert!(waiting.state_miss.is_none());
+        assert!(manager.repeated_state_miss(&query, &waiting).is_none());
+    }
+    seed_key(
+        &mut manager,
+        CacheKey::Token(waiting.sequence_hash(3).unwrap()),
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            manager
+                .get_waiting_lease_prefill_cost(&query, &mut waiting)
+                .cached_tokens,
+            12
+        );
+        assert!(waiting.state_miss.is_none());
+    }
+    clear_reclaimable_and_assert_empty(&mut manager);
+}
+
+#[test]
+fn hybrid_hit_below_the_overlap_counts_only_its_own_active_blocks() {
+    // Cover both shorter-side branches, including the long-overlap case from
+    // review: a one-block state hit beneath 4,096 cached attention blocks.
+    for (overlap, full) in [(3, 1), (3, 2), (4096, 1), (4096, 4095)] {
+        let cached_tokens = full * 4;
+        let mut manager = manager(overlap + 4, 4, 1, true);
+        manager.configure_prefix_match_unit(Some(4));
+        let (query, mut waiting) = request(Uuid::from_u128(1), (overlap + 1) * 4 + 1, 4, true, 0);
+        let hashes = (0..overlap)
+            .map(|block| waiting.sequence_hash(block).unwrap())
+            .collect::<Vec<_>>();
+        for &hash in &hashes {
+            seed_key(&mut manager, CacheKey::Token(hash));
+        }
+        let state = CacheKey::State {
+            prefix: hashes[full - 1],
+            slot: 0,
+        };
+        seed_key(&mut manager, state);
+        for indices in [
+            vec![overlap - 1],
+            (0..overlap).collect(),
+            (0..overlap).step_by(3).collect(),
+        ] {
+            let pinned = indices
+                .iter()
+                .map(|&index| hashes[index])
+                .collect::<Vec<_>>();
+            let pins = manager.pool.reserve(&pinned, 0).unwrap().reservation;
+            // The previous algorithm scanned every block before the state hit.
+            let previous_active = hashes[..full]
+                .iter()
+                .filter(|&&hash| manager.pool.prefix_hit(hash).unwrap().is_active)
+                .count()
+                * 4;
+            assert_eq!(
+                previous_active,
+                indices.iter().filter(|&&index| index < full).count() * 4
+            );
+            let cost = manager.get_waiting_lease_prefill_cost(&query, &mut waiting);
+            assert_eq!(cost.cached_tokens, cached_tokens);
+            assert_eq!(cost.active_cached_tokens, previous_active);
+            assert!(waiting.state_miss.is_none());
+            manager.pool.cancel(pins);
+        }
+        clear_reclaimable_and_assert_empty(&mut manager);
+    }
 }
 
 #[test]
@@ -1367,4 +1703,119 @@ fn sliding_window_turn_resumes_at_prompt_boundary_after_decode_crosses_a_block()
             manager.finish_lease(next, lease);
         }
     }
+}
+
+#[test]
+fn speculative_state_capacity_is_atomic_and_survives_slot_turnover() {
+    let mut manager = manager(10, 4, 2, true);
+    manager.configure_state_cache(
+        Some(crate::engine::StateCacheConfig {
+            bytes_per_request: 8,
+            sliding_window: None,
+            num_speculative_states: Some(2),
+            prefill_checkpoint: false,
+            junction_checkpoints: false,
+        }),
+        Some(1),
+        true,
+    );
+    manager.configure_prefix_match_unit(Some(4));
+    let owner = Uuid::from_u128(800);
+    let (mut sequence, mut lease) = request(owner, 12, 4, true, 0);
+    assert_eq!(
+        allocated(manager.allocate_lease(owner, &mut lease, 4, 0)),
+        7
+    );
+    let scratch = lease.state.as_ref().unwrap().speculative.clone();
+    assert_eq!(scratch.len(), 4);
+    manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 0, 4);
+    manager.begin_step();
+    assert_eq!(
+        allocated(manager.allocate_lease(owner, &mut lease, 8, 0)),
+        3
+    );
+    assert_eq!(manager.num_active_blocks(), 10);
+    assert_eq!(lease.state.as_ref().unwrap().speculative, scratch);
+    // A second request cannot partially allocate a working state or its scratch.
+    let other = Uuid::from_u128(801);
+    let (_, mut second) = request(other, 4, 4, true, 0);
+    assert!(matches!(
+        manager.allocate_lease(other, &mut second, 4, 0),
+        NativeAllocation::CapacityExhausted
+    ));
+    assert!(second.state.is_none());
+    manager.preempt_lease(owner, &mut lease);
+    assert_eq!(manager.num_active_blocks(), 0);
+    assert_eq!(
+        allocated(manager.allocate_lease(other, &mut second, 4, 0)),
+        7
+    );
+    manager.finish_lease(other, second);
+    manager.finish_lease(owner, lease);
+    clear_reclaimable_and_assert_empty(&mut manager);
+}
+
+#[test]
+fn mtp_fine_prefix_uses_earlier_state_and_later_attention_tail() {
+    let mut manager = manager(32, 6, 1, true);
+    manager.configure_state_cache(
+        Some(crate::engine::StateCacheConfig {
+            bytes_per_request: 6,
+            sliding_window: None,
+            num_speculative_states: Some(3),
+            prefill_checkpoint: false,
+            junction_checkpoints: false,
+        }),
+        Some(1),
+        true,
+    );
+    manager.configure_prefix_match_unit(Some(2));
+    let owner = Uuid::from_u128(810);
+    let (mut sequence, mut lease) = fine_request(owner, 17, 6, 2, 4);
+    let mut before = 0;
+    for end in [6, 12, 14, 17] {
+        allocated(manager.allocate_lease(owner, &mut lease, end, 0));
+        manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, before, end);
+        manager.begin_step();
+        before = end;
+    }
+    assert!(fine_checkpoint(&manager, &lease, 14));
+    let tail_hash = lease.state_hash(16, 6).unwrap();
+    assert!(manager.pool.prefix_hit(tail_hash).is_some());
+    // A source with only the longer attention alias still proves the prefix.
+    let state_hash = lease.state_hash(14, 6).unwrap();
+    assert!(manager.pool.prefix_hit(state_hash).is_none());
+    manager.finish_lease(owner, lease);
+    for (input_tokens, expected) in [(16, 6), (17, 14), (18, 14), (19, 14)] {
+        let (query, reader) = fine_request(Uuid::from_u128(812), input_tokens, 6, 2, 4);
+        assert_eq!(
+            manager
+                .get_lease_prefill_cost(&query, &reader)
+                .cached_tokens,
+            expected,
+            "input_tokens={input_tokens}"
+        );
+    }
+    let owner = Uuid::from_u128(811);
+    let (query, mut reader) = fine_request(owner, 19, 6, 2, 4);
+    assert_eq!(
+        manager
+            .get_lease_prefill_cost(&query, &reader)
+            .cached_tokens,
+        14
+    );
+    allocated(manager.allocate_lease(owner, &mut reader, 18, 7));
+    assert_eq!(reader.computed_state_tokens(), Some(14));
+    assert_eq!(reader.state.as_ref().unwrap().speculative.len(), 3);
+    assert!(
+        manager
+            .pool
+            .key_hit(CacheKey::State {
+                prefix: state_hash,
+                slot: 0
+            })
+            .is_some()
+    );
+    manager.finish_lease(owner, reader);
+    clear_reclaimable_and_assert_empty(&mut manager);
 }

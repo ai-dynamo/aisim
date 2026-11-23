@@ -5,15 +5,15 @@
 
 import pytest
 
-import aisimulate.sweeper.deploy as deploy_module
-from aisimulate.sweeper.config import SearchSpace
-from aisimulate.sweeper.deploy import build_backend_deployment
-from aisimulate.sweeper.parallel_enum import (
+import aisim.sweeper.deploy as deploy_module
+from aisim.sweeper.config import SearchSpace
+from aisim.sweeper.deploy import build_backend_deployment
+from aisim.sweeper.parallel_enum import (
     DisaggParallelConfig,
     ParallelShape,
     ReplicaParallelConfig,
 )
-from aisimulate.sweeper.sample import unroll_sample
+from aisim.sweeper.sample import unroll_sample
 
 BACKEND_VERSION = "1.3.0rc10"
 
@@ -183,6 +183,14 @@ def test_disagg_deployment_lowers_only_the_sglang_decode_radix_cache(backend, en
     assert deployment.decode_engine_args["enable_prefix_caching"] is prefix_caching
     assert "sglang" not in deployment.prefill_engine_args
 
+    if backend == "sglang":
+        # A prefill budget off the scheduler's default is its chunk, in whole pages.
+        sample["prefill_max_num_batched_tokens"] = 2049
+        sample["prefill_block_size"] = 16
+        deployment = build_backend_deployment(sample, backend_version=BACKEND_VERSION)
+        assert deployment.prefill_engine_args["sglang"] == {"chunked_prefill_size": 2048}
+        assert deployment.decode_engine_args.get("sglang") == expected
+
 
 def test_disagg_backend_deployment_uses_role_hardware():
     parallel = DisaggParallelConfig(
@@ -325,9 +333,13 @@ def test_disagg_auto_transfer_geometry_uses_prefill_source_shape(monkeypatch):
 
 @pytest.mark.parametrize("feature", ["transfer", "host_offload"])
 def test_auto_geometry_uses_resolved_source_identity(feature, monkeypatch):
-    from aisimulate.sweeper.replay import ForwardPassEstimatorSpec
+    from aisim.sweeper.replay import ForwardPassEstimatorSpec
 
-    host_offload = {"num_host_blocks": 4096, "d2h_bandwidth_gbps": 7.0, "h2d_bandwidth_gbps": 38.0}
+    host_offload = {
+        "num_host_blocks": 4096,
+        "d2h_bandwidth_gbps": 7.0,
+        "h2d_bandwidth_gbps": 38.0,
+    }
     settings = (
         {"kv_transfer_bytes_per_token": "auto", "kv_transfer_bandwidth": 400.0}
         if feature == "transfer"
@@ -456,7 +468,12 @@ def _role_geometry_profile(roles):
                     "activations_bytes": 128,
                     "runtime_overhead_bytes": 128,
                     "comm_overhead_bytes": 0,
-                    "kv_bytes_per_token": {None: 512, "prefill": 512, "decode": 1024, "aggregated": 2048}[role],
+                    "kv_bytes_per_token": {
+                        None: 512,
+                        "prefill": 512,
+                        "decode": 1024,
+                        "aggregated": 2048,
+                    }[role],
                     "cache_layout": "linear",
                     "max_num_tokens": 8192,
                     "max_batch_size": 256,
@@ -470,7 +487,7 @@ def _role_geometry_profile(roles):
 
 @pytest.mark.parametrize("mismatch", ["grouped", "attention_backend", "dcp"])
 def test_scalar_geometry_rejects_incompatible_profile_layout(mismatch):
-    from aisimulate.capacity import estimate_kv_bytes_per_token
+    from aisim.capacity import estimate_kv_bytes_per_token
 
     profile = _role_geometry_profile(("aggregated",))
     overrides = {}
@@ -514,7 +531,11 @@ def test_scalar_geometry_rejects_incompatible_profile_layout(mismatch):
 @pytest.mark.parametrize("feature", ["transfer", "host_offload"])
 def test_disagg_auto_geometry_selects_matching_profile_role(roles, feature):
     profile = _role_geometry_profile(roles)
-    host_offload = {"num_host_blocks": 4096, "d2h_bandwidth_gbps": 7.0, "h2d_bandwidth_gbps": 38.0}
+    host_offload = {
+        "num_host_blocks": 4096,
+        "d2h_bandwidth_gbps": 7.0,
+        "h2d_bandwidth_gbps": 38.0,
+    }
     settings = (
         {"kv_transfer_bytes_per_token": "auto", "kv_transfer_bandwidth": 400.0}
         if feature == "transfer"
@@ -527,7 +548,12 @@ def test_disagg_auto_geometry_selects_matching_profile_role(roles, feature):
     )
     parallel = ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), 1)
     sample = unroll_sample(
-        search_space=_space(model_name=profile["model"], hardware_sku="h200_sxm", fpm_profile=profile, **settings),
+        search_space=_space(
+            model_name=profile["model"],
+            hardware_sku="h200_sxm",
+            fpm_profile=profile,
+            **settings,
+        ),
         selection=_agg_selection(
             deployment_mode="disagg",
             backend="vllm",
@@ -554,7 +580,11 @@ def test_agg_auto_host_offload_geometry_selects_aggregated_profile_role(roles, e
             model_name=profile["model"],
             hardware_sku="h200_sxm",
             fpm_profile=profile,
-            agg_native_host_offload={"num_host_blocks": 4096, "d2h_bandwidth_gbps": 7.0, "h2d_bandwidth_gbps": 38.0},
+            agg_native_host_offload={
+                "num_host_blocks": 4096,
+                "d2h_bandwidth_gbps": 7.0,
+                "h2d_bandwidth_gbps": 38.0,
+            },
             agg_kv_bytes_per_token="auto",
         ),
         selection=_agg_selection(backend="vllm"),
@@ -676,7 +706,9 @@ def test_disagg_forward_model_is_lowered_per_role():
         decode_max_num_seqs=1024,
     )
     sample = unroll_sample(
-        search_space=_space(decode_forward_model="fpm"), selection=selection, parallel_config=parallel
+        search_space=_space(decode_forward_model="fpm"),
+        selection=selection,
+        parallel_config=parallel,
     )
 
     deployment = build_backend_deployment(sample, backend_version=BACKEND_VERSION)
@@ -701,3 +733,54 @@ def test_fixed_timing_drops_the_forward_model_field(monkeypatch):
     assert "aic_forward_model" not in deployment.agg_engine_args
     assert deployment.agg_engine_args["timing_model"]["type"] == "fixed"
     assert deployment.performance_model_metadata["aggregated"]["config"]["forward_model"] == "op_level"
+
+
+@pytest.mark.parametrize("dcp", [1, 2, 4])
+def test_non_kimi_host_offload_auto_kv_respects_dcp_stripes(tmp_path, dcp):
+    import json
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["LlamaForCausalLM"],
+                "hidden_size": 1024,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "num_hidden_layers": 4,
+                "intermediate_size": 2048,
+                "vocab_size": 1000,
+            }
+        )
+    )
+    sample = unroll_sample(
+        search_space=_space(model_name=str(tmp_path), agg_native_host_offload={"num_host_blocks": 10}),
+        selection=_agg_selection(backend="vllm"),
+        parallel_config=ReplicaParallelConfig(ParallelShape(tp=8, dp=1, moe_tp=8, moe_ep=1), replicas=1),
+    )
+    sample["dcp"] = dcp
+    deployment = build_backend_deployment(sample, backend_version=BACKEND_VERSION)
+    # TP8 replicates each of two KV heads on four ranks. A single rank
+    # has K/V * 1 head * 128 dimensions * 4 layers * BF16 / DCP.
+    assert deployment.agg_engine_args["kv_cache_bytes_per_token"] == 2048 // dcp
+
+
+def test_auto_dcp_cannot_shard_distinct_kv_heads(tmp_path):
+    import json
+
+    from aisim.capacity import estimate_kv_bytes_per_token
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["LlamaForCausalLM"],
+                "hidden_size": 1024,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 8,
+                "num_hidden_layers": 4,
+                "intermediate_size": 2048,
+                "vocab_size": 1000,
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="not exceed KV-head replication=1"):
+        estimate_kv_bytes_per_token(str(tmp_path), tp_size=8, pp_size=1, dcp_size=2)

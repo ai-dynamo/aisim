@@ -37,11 +37,12 @@ Sweeper workloads, and the native JSON execution boundary.
 The built-in engine supports offline vLLM and SGLang with aggregated or separate
 prefill/decode workers and HBM-only KV cache, including speculative decoding
 with explicit acceptance assumptions and a compatible timing model.
-vLLM also supports local or shared [G2 host offload](../engine/kv-cache.md#agentic-g2) on a static
-single aggregated worker or 1P1D, or local G2 on several static aggregated workers,
-with attention DP=1 on every role and speculative decoding disabled. The supported
-exception is canonical MTP on a single aggregated worker with local G2 and prefix
-caching; see the [combined scope](../engine/speculation.md#registered-schemes).
+vLLM also supports local or shared [G2 host offload](../engine/kv-cache.md#agentic-g2) on static
+workers of any count and attention DP. Speculative decoding with G2 is limited
+to canonical MTP with prefix caching (see the
+[combined scope](../engine/speculation.md#registered-schemes)), and to MTP on a
+[hybrid G2](../engine/kv-cache.md#hybrid-g2) with
+`engine.speculation.disable_eagle_block_drop`.
 Weka, Agentic Mooncake, and agentic Dynamo traces share this path. Online execution,
 other backends, and Dynamo-owned routing need their own qualified integration.
 
@@ -60,10 +61,16 @@ plus the recorded delay, never at its authored source offset, so a server that
 answers faster than the recorded API shortens the play. A turn that joins
 children waits for them and for its own recorded delay after its predecessor.
 The first request of a detected chain, which the trace anchors only with a
-replay barrier, starts when that barrier clears. Only play roots and, after a
-snapshot cut, each stream's next request whose predecessor lies before the cut
-keep a source-clock timer. Finite replay without a profile still waits for
-authored offsets.
+replay barrier, starts when that barrier clears. Only play roots keep a
+source-clock timer. After a snapshot cut, rows carrying `recorded_start_ms`
+also keep a timer relative to the cut when their previous or spawning turn
+lies before it. Legacy Agentic Mooncake dependent rows without this field
+gain no such timer: they can dispatch at the cut once dependency delays have
+elapsed. Live joins and replay barriers still gate dispatch.
+With `traffic.source.client: agentx` and `agentic_snapshot`, this snapshot timer
+rule also applies to finite replay without a profile; other AgentX requests
+follow dependency events. With `client: recorded`, finite replay still waits
+for authored offsets.
 
 Idle guards advance pending workload timers after a tree or the whole client
 workload has no outstanding requests for its configured cap. Requests queued
@@ -118,15 +125,17 @@ have a request observation interval shorter or longer than one hour.
 The default warmup policy repeats saved primer inputs and keeps the original
 snapshot frontier. The opt-in [live trajectory policy](warmup.md#live-trajectory-policy)
 advances the dependency graph during warmup and preserves its surviving frontier.
-Initial sampling retains AISimulate's existing deterministic algorithm unless
+Initial sampling retains AISim's existing deterministic algorithm unless
 reference cuts and the shared sequential cursor are explicitly imported. This is
 functional qualification of profile control, not complete AgentX parity or
 hardware performance accuracy. Long profiles retain lifecycle evidence and can
 use more host memory than a finite corpus replay. Resource admission still checks
 the initial trace, but does not use its finite size as a peak-memory estimate for
-the full profile. The CLI and guarded recommendation/Sweeper paths admit one
-profiled candidate at a time under live host-memory supervision. Low-level
-runner/native callers remain responsible for resource supervision. A run can stop
+the full profile. For native Weka profiles, the CLI and guarded `Sweeper` can
+admit parallel candidates when each worker has enough memory for initial trace
+materialization and its baseline plus the array lower bound. Other continuous
+profiles run one candidate at a time. See [host memory admission](../../reference/local-resources.md).
+Low-level runner/native callers remain responsible for resource supervision. A run can stop
 with `resource_limited` if it exhausts the host budget; choosing a duration does
 not reserve enough memory to guarantee completion.
 
@@ -136,13 +145,13 @@ From the repository root, first install the current source as described in
 [Use current source](../../getting-started/installation.md#use-current-source):
 
 ```bash
-uv sync --project python/aisimulate --extra dev
+uv sync --project python/aisim --extra dev
 ```
 
 Then run:
 
 ```bash
-python/aisimulate/.venv/bin/aisimulate predict \
+python/aisim/.venv/bin/aisim predict \
   --config examples/cli/agentic-profile.yaml \
   --capture-per-request --capture-telemetry --format json --output-dir /tmp/agentic-profile
 ```
@@ -171,7 +180,7 @@ defined in `src/aiperf/metrics/types/benchmark_duration_metric.py`.
 InferenceX [`4ab85c1e33b66d6bd5a3087b3de5ba3e86cbbe80`](https://github.com/SemiAnalysisAI/InferenceX/tree/4ab85c1e33b66d6bd5a3087b3de5ba3e86cbbe80)
 pins that executor under `utils/aiperf` and supplies the AgentX recipe in
 `benchmarks/benchmark_lib.sh` and `benchmarks/runtime_settings.sh`.
-The AISimulate implementation uses its native dependency graph and virtual event
+The AISim implementation uses its native dependency graph and virtual event
 loop; the tests and example workload are locally authored. Source and attribution evidence is retained in the
 [replay evidence record](../../../benchmarks/evidence/accuracy/replay-evidence.md).
 
@@ -179,7 +188,7 @@ Known release differences:
 
 - Upstream AIPerf releases on PyPI (0.12.0 and 0.13.0) resume a turn blocked
   on a join as soon as its children complete, without the turn's own recorded
-  delay. AISimulate follows the pinned fork, which waits for both. Compare
+  delay. AISim follows the pinned fork, which waits for both. Compare
   against a live run only with the matching executor.
 - The Weka import keeps recorded gaps that the fork drops. A joining turn also
   waits its recorded gap after each child ends. A subagent's start offset is
@@ -193,5 +202,5 @@ Known release differences:
 - The fork's per-tree guard shifts again only when its earliest timer lands on
   a request held by a replay barrier. When it lands on a joining turn whose
   children still wait on later timers, the fork leaves that tree idle until its
-  next timer fires. AISimulate shifts again in both cases, as the fork's global
+  next timer fires. AISim shifts again in both cases, as the fork's global
   guard does.

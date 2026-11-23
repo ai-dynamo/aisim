@@ -3,10 +3,10 @@
 
 //! Rust -> Python embedding smoke test.
 //!
-//! Proves that `aisimulate-core` with `embed-python` links libpython and can start a Python
+//! Proves that `aisim-core` with `embed-python` links libpython and can start a Python
 //! interpreter via PyO3's `auto-initialize`. This is the linkage that
 //! `AicEngineBuilder::build` relies on. It does NOT import the
-//! `aisimulate_core` extension itself (that `.so` is not on `sys.path`
+//! `aisim_core` extension itself (that `.so` is not on `sys.path`
 //! during `cargo test`); it only exercises the embedded interpreter.
 
 #![cfg(feature = "embed-python")]
@@ -16,7 +16,7 @@ use pyo3::types::PyModule;
 
 #[test]
 fn embeds_python_interpreter() {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         // Import a stdlib module to confirm the interpreter is live.
         let sys = PyModule::import(py, "sys").expect("import sys");
         let version: String = sys

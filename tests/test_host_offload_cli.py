@@ -4,29 +4,34 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 pytest.importorskip(
-    "aisimulate.runner",
-    reason="standalone AISimulate runtime is not installed",
+    "aisim.runner",
+    reason="standalone AISim runtime is not installed",
     exc_type=ImportError,
 )
 
 import yaml
 from pydantic import ValidationError
 
-from aisimulate import main as cli
-from aisimulate.compiler import prediction_to_replay_spec
-from aisimulate.config.cli import CorePredictionConfig, CoreRecommendationConfig
-from aisimulate.config.engine import KvCachePredictionConfig
-from aisimulate.recommend import _candidate_prediction, recommendation_to_sweeper
-from aisimulate.runner import EngineReplayRunnerFactory
-from aisimulate.sweeper.deploy import build_backend_deployment
-from aisimulate.sweeper.parallel_enum import ParallelShape, ReplicaParallelConfig
-from aisimulate.sweeper.replay import ReplayOutputRequirements, ReplaySpec
-from aisimulate.sweeper.sample import unroll_sample
+from aisim import main as cli
+from aisim.compiler import prediction_to_replay_spec
+from aisim.config.cli import CorePredictionConfig, CoreRecommendationConfig
+from aisim.config.engine import KvCachePredictionConfig
+from aisim.recommend import _candidate_prediction, recommendation_to_sweeper
+from aisim.runner import EngineReplayRunnerFactory
+from aisim.sweeper.deploy import build_backend_deployment
+from aisim.sweeper.parallel_enum import ParallelShape, ReplicaParallelConfig
+from aisim.sweeper.replay import (
+    ReplayOutputRequirements,
+    ReplaySpec,
+    RunnerCapabilities,
+)
+from aisim.sweeper.sample import unroll_sample
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -126,6 +131,7 @@ def _mtp_host_engine(*, mode="aggregated", expected=1.5) -> dict:
     return engine
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("agentic", [False, True])
 def test_canonical_mtp_host_config_roundtrips_and_preserves_cost_identity(
     agentic,
@@ -165,7 +171,6 @@ def test_canonical_mtp_host_config_roundtrips_and_preserves_cost_identity(
     "change,error",
     [
         ({"scheduler": {"async_scheduling": True}}, "async_scheduling=false"),
-        ({"parallelism": {"attention_data": 2}}, "attention_data=1"),
         (
             {"kv_cache": {"host_offload": {"scope": "cluster_shared", "num_host_blocks": 16}}},
             "dp_rank_local",
@@ -191,14 +196,64 @@ def test_canonical_mtp_host_config_preserves_composition_limits(change, error) -
         CorePredictionConfig.model_validate({"engine": engine})
 
 
-def test_canonical_mtp_host_config_rejects_disaggregated_workers() -> None:
-    with pytest.raises(ValidationError, match="aggregated vllm"):
-        CorePredictionConfig.model_validate({"engine": _mtp_host_engine(mode="disaggregated")})
+@pytest.mark.usefixtures("raw_data_coordinates")
+def test_canonical_mtp_host_config_takes_attention_dp() -> None:
+    engine = _mtp_host_engine()
+    engine["workers"]["aggregated"]["parallelism"]["attention_data"] = 2
+    runtime = _RecordingRuntime()
+    config = CorePredictionConfig.model_validate({"engine": engine})
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(prediction_to_replay_spec(config))
+    lowered = runtime.execution_spec["spec"]["engine"]
+    assert lowered["dp_size"] == 2
+    assert lowered["rank"]["aic_nextn"] == 2
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
+def test_canonical_mtp_host_config_takes_prefill_and_decode_workers_without_kvcr() -> None:
+    engine = _mtp_host_engine(mode="disaggregated")
+    # These workers take either pool scope; an aggregated worker only a local pool.
+    engine["workers"]["prefill"]["kv_cache"]["host_offload"]["scope"] = "cluster_shared"
+    runtime = _RecordingRuntime()
+    config = CorePredictionConfig.model_validate({"engine": engine})
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(prediction_to_replay_spec(config))
+    lowered = runtime.execution_spec["spec"]["engine"]
+    assert lowered["prefill"]["rank"]["native_host_offload"]["scope"] == "cluster_shared"
+    assert lowered["decode"]["rank"]["native_host_offload"] == _host_offload()
+    for role in ("prefill", "decode"):
+        assert lowered[role]["rank"]["aic_nextn"] == 2
+    # KVCR needs a local pool, and MTP then rejects it on this role.
+    engine["workers"]["prefill"]["kv_cache"]["host_offload"]["scope"] = "dp_rank_local"
+    engine["workers"]["prefill"]["kv_cache"]["kvcr"] = {}
+    with pytest.raises(ValidationError, match="kvcr on workers.prefill"):
+        CorePredictionConfig.model_validate({"engine": engine})
+
+
+@pytest.mark.parametrize("canonical_mtp", [False, True])
+def test_host_offload_stays_unsupported_with_an_afd_worker(canonical_mtp) -> None:
+    engine = _prediction_engine(mode="disaggregated")
+    engine["backend"] = "sglang"
+    engine["workers"]["decode"] = {
+        "type": "afd",
+        "afd": {"n_a_nodes": 1, "n_f_nodes": 1, "tp_a": 1, "a_batch_size": 8},
+    }
+    engine["workers"]["prefill"]["kv_cache"]["host_offload"] = _host_offload()
+    if canonical_mtp:
+        engine["speculation"] = {
+            "kind": "mtp",
+            "params": {"depth": 2},
+            "expected_accepted_tokens": 1.5,
+        }
+    with pytest.raises(
+        ValidationError,
+        match="host_offload is supported only for aggregated or disaggregated",
+    ):
+        CorePredictionConfig.model_validate({"engine": engine})
+
+
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("expected", [0.0, 2.0])
 def test_canonical_mtp_native_replay_restores_an_evicted_host_prefix(expected) -> None:
-    from aisimulate import _runtime
+    from aisim import _runtime
 
     engine = _mtp_host_engine(expected=expected)
     worker = engine["workers"]["aggregated"]
@@ -384,7 +439,7 @@ def test_prediction_host_offload_auto_geometry_uses_aggregated_shape(
         calls.append(shape)
         return 444_444
 
-    monkeypatch.setattr("aisimulate.compiler.estimate_kv_bytes_per_token", estimate)
+    monkeypatch.setattr("aisim.compiler.estimate_kv_bytes_per_token", estimate)
     rank = prediction_to_replay_spec(
         CorePredictionConfig.model_validate({"engine": engine})
     ).backend_deployment.agg_engine_args
@@ -422,7 +477,7 @@ def test_prediction_auto_transfer_geometry_uses_prefill_source_shape(
         calls.append(shape)
         return 10_000 * shape["tp_size"] + shape["pp_size"]
 
-    monkeypatch.setattr("aisimulate.compiler.estimate_kv_bytes_per_token", estimate)
+    monkeypatch.setattr("aisim.compiler.estimate_kv_bytes_per_token", estimate)
     deployment = prediction_to_replay_spec(CorePredictionConfig.model_validate({"engine": engine})).backend_deployment
 
     assert deployment.prefill_engine_args["kv_transfer_bytes_per_token"] == 20_001
@@ -432,14 +487,30 @@ def test_prediction_auto_transfer_geometry_uses_prefill_source_shape(
     assert deployment.decode_engine_args["kv_transfer_timing_mode"] == "destination_missing"
 
 
-def test_saved_prediction_preserves_kv_layout_precision_and_parallelism(monkeypatch) -> None:
+def test_saved_prediction_preserves_kv_layout_precision_and_parallelism(
+    monkeypatch,
+) -> None:
     engine = _prediction_engine(mode="disaggregated")
-    engine.update(backend="sglang", backend_version="0.5.14", kvcache_quant_mode="bfloat16", attention_backend="fa3")
+    engine.update(
+        backend="sglang",
+        backend_version="0.5.14",
+        kvcache_quant_mode="bfloat16",
+        attention_backend="fa3",
+    )
     engine["kv_transfer"] = {"bandwidth_gb_per_second": 400.0}
     prefill = engine["workers"]["prefill"]
-    prefill["timing"] = {"type": "default", "kvcache_quant_mode": "fp8", "attention_backend": "flashmla"}
+    prefill["timing"] = {
+        "type": "default",
+        "kvcache_quant_mode": "fp8",
+        "attention_backend": "flashmla",
+    }
     prefill["parallelism"].update(
-        tensor=8, attention_data=2, moe_tensor=2, moe_expert=16, prefill_context=2, decode_context=2
+        tensor=8,
+        attention_data=2,
+        moe_tensor=2,
+        moe_expert=16,
+        prefill_context=2,
+        decode_context=2,
     )
     engine["workers"]["decode"]["timing"] = {"type": "default"}
     calls = []
@@ -476,7 +547,7 @@ def test_saved_prediction_preserves_kv_layout_precision_and_parallelism(monkeypa
 
 
 def test_kv_geometry_reads_saved_snapshot_controls_when_unspecified(tmp_path, monkeypatch) -> None:
-    from aisimulate.compiler import _resolve_kv_bytes_per_token
+    from aisim.compiler import _resolve_kv_bytes_per_token
 
     engine = _prediction_engine()
     engine["estimator_config"] = {"state_snapshot": {"path": str(tmp_path)}}
@@ -508,6 +579,44 @@ def test_kv_geometry_reads_saved_snapshot_controls_when_unspecified(tmp_path, mo
     assert seen["kvcache_quant_mode"] == "fp8"
 
 
+def test_unknown_snapshot_kv_identity_uses_dense_checkpoint_geometry(tmp_path) -> None:
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+
+    model_name = "Qwen/Qwen3-0.6B"
+    model = RustForwardPassPerfModel.best_available(
+        ForwardPassPerfModelConfig(
+            model=model_name,
+            system="h200_sxm",
+            backend="vllm",
+            worker_type="aggregated",
+            tp=1,
+            pp=1,
+            attention_dp=1,
+            kv_block_size=16,
+            estimation_mode="fpm_regression",
+            kvcache_quant_mode="unknown",
+        )
+    )
+    pinned = model.save_state_snapshot(tmp_path / "snapshot")
+    assert pinned["kvcache_quant_mode"] == "unknown"
+    engine = _prediction_engine()
+    engine.update(
+        model=model_name,
+        estimation_mode="fpm_regression",
+        estimator_config=pinned["estimator_config"],
+    )
+    worker = engine["workers"]["aggregated"]
+    worker["timing"] = {"type": "default"}
+    worker["kv_cache"].update(bytes_per_token="auto", host_offload=_host_offload())
+    args = prediction_to_replay_spec(
+        CorePredictionConfig.model_validate({"engine": engine})
+    ).backend_deployment.agg_engine_args
+    # Bundled Qwen3-0.6B: 28 layers * K/V * 8 KV heads * 128 dims * 2 BF16 bytes.
+    assert args["kv_cache_bytes_per_token"] == 28 * 2 * 8 * 128 * 2
+    assert args["timing_model"]["config"]["kvcache_quant_mode"] == "unknown"
+    RustForwardPassPerfModel.best_available(args["timing_model"]["config"])
+
+
 def test_prediction_transfer_and_cache_geometry_are_independent(monkeypatch) -> None:
     engine = _prediction_engine(mode="disaggregated")
     engine["kv_transfer"] = {
@@ -517,7 +626,7 @@ def test_prediction_transfer_and_cache_geometry_are_independent(monkeypatch) -> 
     engine["workers"]["prefill"]["kv_cache"]["bytes_per_token"] = 111
     engine["workers"]["decode"]["kv_cache"]["bytes_per_token"] = 222
     monkeypatch.setattr(
-        "aisimulate.compiler.estimate_kv_bytes_per_token",
+        "aisim.compiler.estimate_kv_bytes_per_token",
         lambda *_args, **_kwargs: pytest.fail("explicit geometry must not be estimated"),
     )
 
@@ -674,7 +783,7 @@ def test_native_speculative_field_is_not_part_of_public_engine_schema() -> None:
 
 
 def _kvcr_defaults() -> dict:
-    return {"latency_to_first_byte_ms": 1.0, "bandwidth_gbps": 50.0}
+    return {"latency_to_first_byte_ms": 1.0, "bandwidth_gbps": 32.0}
 
 
 @pytest.mark.parametrize(
@@ -774,11 +883,56 @@ def test_kvcr_defaults_and_overrides() -> None:
         "latency_to_first_byte_ms": 0.0,
         "bandwidth_gbps": 0.0,
     }
+    # KVCR-owned memory is part of the descriptor only when configured.
+    cache["kvcr"] = {"local_g2": {"num_blocks": 4}}
+    assert KvCachePredictionConfig.model_validate(cache).kvcr.model_dump() == {
+        **_kvcr_defaults(),
+        "local_g2": {"num_blocks": 4, "policy": "lru", "copy_bandwidth_gbps": 6.0},
+    }
+    for local_g2 in (
+        {"num_blocks": 0},
+        {"num_blocks": 4, "policy": "g3_lru"},
+        {"policy": "fifo"},
+    ):
+        cache["kvcr"] = {"local_g2": local_g2}
+        with pytest.raises(ValidationError, match="local_g2"):
+            KvCachePredictionConfig.model_validate(cache)
+    # KVCR-owned disk needs the memory it takes evicted blocks from.
+    cache["kvcr"] = {"g3": {"num_blocks": 8}}
+    with pytest.raises(ValidationError, match="kvcr.g3 requires kvcr.local_g2"):
+        KvCachePredictionConfig.model_validate(cache)
+
+
+@pytest.mark.parametrize("tier", ["local_g2", "g3"])
+@pytest.mark.parametrize("num_blocks", [1, (1 << 64) - 1])
+def test_kvcr_block_count_accepts_u64_boundaries(tier: str, num_blocks: int) -> None:
+    cache = {
+        "bytes_per_token": 131_072,
+        "host_offload": _host_offload(),
+        "kvcr": {"local_g2": {"num_blocks": 4}} | {tier: {"num_blocks": num_blocks}},
+    }
+    config = KvCachePredictionConfig.model_validate(cache)
+    assert getattr(config.kvcr, tier).num_blocks == num_blocks
+    assert KvCachePredictionConfig.model_validate_json(config.model_dump_json()) == config
+
+
+@pytest.mark.parametrize("tier", ["local_g2", "g3"])
+@pytest.mark.parametrize("num_blocks", [0, -1, 1 << 64, True, 1.0])
+def test_kvcr_block_count_rejects_values_outside_rust_contract(tier: str, num_blocks: object) -> None:
+    engine = _prediction_engine()
+    engine["workers"]["aggregated"]["kv_cache"].update(
+        bytes_per_token=131_072,
+        host_offload=_host_offload(),
+        kvcr={"local_g2": {"num_blocks": 4}} | {tier: {"num_blocks": num_blocks}},
+    )
+    with pytest.raises(ValidationError) as error:
+        CorePredictionConfig.model_validate({"engine": engine})
+    assert any(issue["loc"][-3:] == ("kvcr", tier, "num_blocks") for issue in error.value.errors())
 
 
 def test_kvcr_defaults_match_the_rust_runtime() -> None:
-    from aisimulate import _runtime
-    from aisimulate.config.engine import KvcrConfig
+    from aisim import _runtime
+    from aisim.config.engine import KvcrConfig
 
     # Rust fills the fields an empty `kvcr` block omits; Python must default to the same values.
     role = {
@@ -790,6 +944,85 @@ def test_kvcr_defaults_match_the_rust_runtime() -> None:
     }
     launch = json.loads(_runtime.engine_launch_from_replay_role_json(json.dumps(role)))
     assert launch["engine"]["kvcr"] == KvcrConfig().model_dump() == _kvcr_defaults()
+    # The same holds for the tiers KVCR owns.
+    role["rank"]["kvcr"] = {"local_g2": {"num_blocks": 4}, "g3": {"num_blocks": 8}}
+    launch = json.loads(_runtime.engine_launch_from_replay_role_json(json.dumps(role)))
+    assert launch["engine"]["kvcr"] == KvcrConfig(**role["rank"]["kvcr"]).model_dump()
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_kvcr_g3_requires_an_explicit_runner_capability(nested) -> None:
+    engine = _prediction_engine()
+    cache = engine["workers"]["aggregated"]["kv_cache"]
+    cache.update(
+        bytes_per_token=256,
+        host_offload=_host_offload(),
+        kvcr={"local_g2": {"num_blocks": 4}},
+    )
+
+    def spec() -> ReplaySpec:
+        built = prediction_to_replay_spec(CorePredictionConfig.model_validate({"engine": engine}))
+        args = built.backend_deployment.agg_engine_args
+        deployment = replace(built.backend_deployment, agg_engine_args={"rank": args} if nested else args)
+        return replace(built, backend_deployment=deployment)
+
+    assert RunnerCapabilities().supports_kvcr_g3 is False
+    capabilities = EngineReplayRunnerFactory().capabilities()
+    unsupported = replace(capabilities, supports_kvcr_g3=False)
+    # KVCR-owned memory alone needs no capability.
+    unsupported.require_compatible(spec())
+    cache["kvcr"]["g3"] = {"num_blocks": 8}
+    capabilities.require_compatible(spec())
+    with pytest.raises(ValueError, match="runner does not support kvcr.g3"):
+        unsupported.require_compatible(spec())
+
+
+def test_predict_cli_spills_to_kvcr_g3_through_the_real_runtime(tmp_path, capsys) -> None:
+    engine = _prediction_engine()
+    engine["model"] = str(ROOT / "tests/e2e/configs/unified_cli/fixtures/tiny-model")
+    engine["workers"]["aggregated"]["kv_cache"].update(
+        bytes_per_token=256,
+        host_offload={"num_host_blocks": 8, "d2h_bandwidth_gbps": 0},
+        kvcr={
+            "local_g2": {"num_blocks": 1, "copy_bandwidth_gbps": 0},
+            "g3": {
+                "num_blocks": 8,
+                "latency_to_first_byte_ms": 0,
+                "write_bandwidth_gbps": 0,
+            },
+        },
+    )
+    # Distinct synthetic prompts make the second completed store evict the
+    # first from KVCR memory. Generation gives each G2 store time to complete.
+    config = {
+        "engine": engine,
+        "traffic": {
+            "source": {"type": "synthetic", "input_tokens": 33, "output_tokens": 4},
+            "load": {"type": "concurrency", "concurrency": 1},
+            "stop": {"requests": 2},
+        },
+    }
+    path = tmp_path / "g3.yaml"
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    assert (
+        cli.main(
+            [
+                "predict",
+                "--stack",
+                "engine",
+                "--config",
+                str(path),
+                "--format",
+                "json",
+                "--output-dir",
+                str(tmp_path / "g3"),
+            ]
+        )
+        == 0
+    )
+    report = json.loads(capsys.readouterr().out)
+    assert report["completed_requests"] == 2
+    assert report["kvcr"]["g3"]["stored_blocks"] > 0
 
 
 def test_kvcr_supports_the_prefill_role_and_rejects_the_decode_role() -> None:
@@ -841,7 +1074,7 @@ def test_kvcr_recommendation_is_rejected_not_silently_dropped() -> None:
 
 
 def test_predict_cli_runs_kvcr_through_the_real_runtime(tmp_path, capsys) -> None:
-    from aisimulate import _runtime
+    from aisim import _runtime
 
     assert callable(_runtime.run_replay_json)
     engine = _prediction_engine()
@@ -874,7 +1107,7 @@ def test_predict_cli_runs_kvcr_through_the_real_runtime(tmp_path, capsys) -> Non
 def _hinted_replay(*, kvcr: bool) -> dict:
     """Run a ReplaySpec with an authored hint directly on the Rust runtime. Request `a`
     computes four blocks on DP rank 0; `b` extends them on DP rank 1 and names rank 0."""
-    from aisimulate import _runtime
+    from aisim import _runtime
 
     rank = {
         "num_gpu_blocks": 64,
@@ -931,9 +1164,9 @@ def test_authored_kv_hints_pull_through_the_python_runtime() -> None:
     # Four blocks of 4 tokens at 250,000 bytes per token.
     assert (kvcr["blocks"], kvcr["bytes"]) == (4, 4_000_000)
     # Default timing: the pull starts at b's arrival (rank 0 is idle), waits 1 ms
-    # for its first byte, then moves 4 MB at 50 GB/s.
+    # for its first byte, then moves 4 MB at 32 GB/s.
     assert kvcr["source_wait_ms"] == 0.0
-    assert kvcr["remote_deliver_ms"] == 1.08
+    assert kvcr["remote_deliver_ms"] == 1.125
     assert kvcr["loaded_blocks"] == 4
     assert "bypassed" not in kvcr
     # b reuses all four blocks from its own G2, where the pull put them.
@@ -982,7 +1215,7 @@ def test_kvcr_docs_example_validates(monkeypatch) -> None:
     cache.update(extension)
     prediction = CorePredictionConfig.model_validate(config)
     # Validate lowering without downloading the example's gated model metadata.
-    monkeypatch.setattr("aisimulate.compiler.estimate_kv_bytes_per_token", lambda *_args, **_kwargs: 256)
+    monkeypatch.setattr("aisim.compiler.estimate_kv_bytes_per_token", lambda *_args, **_kwargs: 256)
     deployment = prediction_to_replay_spec(prediction).backend_deployment
     # The documented values are the defaults in the knob table.
     assert deployment.agg_engine_args["kvcr"] == _kvcr_defaults()
@@ -1014,7 +1247,7 @@ def test_public_host_offload_rejects_legacy_speculation(depth) -> None:
 def test_native_host_offload_rejects_noncanonical_speculation_before_pricing(
     timing,
 ) -> None:
-    from aisimulate import _runtime
+    from aisim import _runtime
 
     payload = {
         "version": 1,
@@ -1104,3 +1337,52 @@ def test_hicache_rejects_disaggregated_and_recommendation_paths() -> None:
     engine["workers"]["aggregated"]["kv_cache"]["hicache"] = {"num_host_blocks": 32}
     with pytest.raises(ValidationError, match="prediction only"):
         CoreRecommendationConfig.model_validate({"engine": engine})
+
+
+@pytest.mark.parametrize("local_heads", [2, 4])
+def test_auto_text_kv_ignores_malformed_vision_metadata_and_rereads_local_config(tmp_path, local_heads):
+    from copy import deepcopy
+
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    raw = deepcopy(_load_pre_downloaded_hf_config("meta-llama/Llama-4-Scout-17B-16E-Instruct"))
+    raw.pop("image_processor_config")
+    raw["text_config"].update(
+        hidden_size=1024,
+        num_attention_heads=8,
+        num_key_value_heads=2,
+        num_hidden_layers=4,
+        head_dim=128,
+        no_rope_layers=[0, 0, 0, 0],
+    )
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(raw))
+    (tmp_path / "preprocessor_config.json").write_text("{malformed optional image metadata")
+    kwargs = dict(tp_size=1, pp_size=1, kvcache_quant_mode="bfloat16")
+    assert estimate_kv_bytes_per_token(str(tmp_path), **kwargs) == 4096  # 2 K/V * 2 heads * 128 * 4 layers * 2 B
+    raw["text_config"]["num_key_value_heads"] = local_heads
+    config_path.write_text(json.dumps(raw))
+    assert estimate_kv_bytes_per_token(str(tmp_path), **kwargs) == 2048 * local_heads
+
+
+@pytest.mark.parametrize("authored", [None, False, True])
+@pytest.mark.parametrize("saved_eplb", [False, True])
+@pytest.mark.parametrize("roundtrip", [False, True])
+def test_snapshot_eplb_distinguishes_omission_from_explicit_false(authored, saved_eplb, roundtrip):
+    from aisim.compiler import _worker_model_control
+
+    payload = _prediction_engine()
+    payload["workers"]["aggregated"]["timing"] = {"type": "default"}
+    if authored is not None:
+        payload["enable_eplb"] = authored
+    config = CorePredictionConfig.model_validate({"engine": payload})
+    if roundtrip:
+        config = CorePredictionConfig.model_validate_json(config.model_dump_json())
+    actual = _worker_model_control(
+        config.engine,
+        config.engine.workers.aggregated,
+        "enable_eplb",
+        {"enable_eplb": saved_eplb},
+    )
+    assert actual is (saved_eplb if authored is None else authored)

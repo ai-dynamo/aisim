@@ -4,7 +4,7 @@
 //! Attention family perf tables: context, generation, encoder.
 //!
 //! Mirrors the raw table layout used by Python's
-//! `aisimulate.sdk.operations.attention.{ContextAttention,
+//! `aisim.sdk.operations.attention.{ContextAttention,
 //! GenerationAttention, EncoderAttention}._query_*_table` SILICON paths.
 //!
 //! Each variant nests its data as `(discrete keys) -> 3-D grid` where the
@@ -98,7 +98,7 @@ impl ContextTimingBoundary {
         // internal RoPE and CacheType.SELF. Older 1.0.0 rows used SELFKONLY;
         // their contract, and other lanes/versions, remain unknown here.
         let inclusive = framework == Some("TRTLLM")
-            && matches!(version, Some("1.3.0rc20" | "1.3.0rc29"))
+            && matches!(version, Some("1.3.0rc20" | "1.3.0rc29" | "1.4.0rc2"))
             && lane == "torch_flow";
         Self {
             includes_rope: inclusive,
@@ -1415,6 +1415,7 @@ fn kv_cache_quant_by_name(name: &str) -> Option<KvCacheQuantMode> {
         "bfloat16" => Bfloat16,
         "int8" => Int8,
         "fp8" => Fp8,
+        "nvfp4" => Nvfp4,
         _ => return None,
     })
 }
@@ -1555,6 +1556,7 @@ mod tests {
         let sources = [PerfSource(path.clone(), None)];
         for (versions, inclusive) in [
             (vec!["1.3.0rc20", "1.0.0"], true),
+            (vec!["1.4.0rc2", "1.0.0"], true),
             (vec!["1.0.0", "1.3.0rc29"], false),
         ] {
             write_boundary_rows(&path, versions, vec![256, 256]);
@@ -1564,6 +1566,13 @@ mod tests {
             assert_eq!(slice.boundary.includes_kv_write, inclusive);
             assert_eq!(slice.grid[&32][&256][&1].latency, 2.0);
         }
+        // A 1.4.0rc2 slice keeps the points only 1.3.0rc29 measured: both
+        // revisions time the same boundary, so backward fill may merge them.
+        write_boundary_rows(&path, vec!["1.4.0rc2", "1.3.0rc29"], vec![256, 512]);
+        let (rows, _) = load_context_parquet(&sources).unwrap();
+        let slice = rows["torch_flow"].values().next().unwrap();
+        assert!(slice.boundary.includes_rope && slice.boundary.includes_kv_write);
+        assert_eq!(slice.grid[&32].len(), 2);
         write_boundary_rows(&path, vec!["1.3.0rc20", "1.0.0"], vec![256, 512]);
         let error = match load_context_parquet(&sources) {
             Err(error) => error,
@@ -1601,13 +1610,13 @@ mod tests {
     fn b200_vllm_data_root() -> PathBuf {
         PathBuf::from(REPO_ROOT_HINT)
             .join("../..")
-            .join("python/aisimulate/src/aisimulate_core/systems/data/b200_sxm/vllm/0.24.0")
+            .join("python/aisim/src/aisim_core/systems/data/b200_sxm/vllm/0.24.0")
     }
 
     fn b200_sxm_spec() -> SystemSpec {
         let systems_yaml = PathBuf::from(REPO_ROOT_HINT)
             .join("../..")
-            .join("python/aisimulate/src/aisimulate_core/systems/b200_sxm.yaml");
+            .join("python/aisim/src/aisim_core/systems/b200_sxm.yaml");
         SystemSpec::load(&systems_yaml).expect("b200_sxm.yaml must parse")
     }
     fn lanes(names: &[&str]) -> Vec<String> {
@@ -1938,7 +1947,7 @@ mod tests {
     fn b200_sglang_0514_data_root() -> PathBuf {
         PathBuf::from(REPO_ROOT_HINT)
             .join("../..")
-            .join("python/aisimulate/src/aisimulate_core/systems/data/b200_sxm/sglang/0.5.14")
+            .join("python/aisim/src/aisim_core/systems/data/b200_sxm/sglang/0.5.14")
     }
 
     /// Two-lane in-memory context table: `head` carries only the `hs=128`
