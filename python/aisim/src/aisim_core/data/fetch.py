@@ -66,6 +66,10 @@ class _AliasTransport:
     def open_file(self, repo, sha, path):
         return self.transport.open_file(repo, sha, self.reference.path(path))
 
+    def file_size(self, repo, sha, path):
+        probe = getattr(self.transport, "file_size", None)
+        return None if probe is None else probe(repo, sha, self.reference.path(path))
+
 
 def _resolve_source(repo, revision, transport, category=None):
     # An ensure call can share the aliased transport across categories. Only FPM artifacts moved under data/fpm/.
@@ -161,7 +165,12 @@ class Transport(Protocol):
         """Return the full 40-hex commit SHA for a branch, tag or SHA."""
 
     def open_file(self, repo: str, sha: str, path: str) -> Iterator[bytes]:
-        """Yield the content of ``path`` at commit ``sha`` in chunks."""
+        """Yield the content of ``path`` at commit ``sha`` in chunks.
+
+        A transport that cannot stop an oversized transfer while receiving it (it finishes the whole download before
+        yielding) may also offer ``file_size(repo, sha, path) -> int | None``: the planner asks it for the size of a
+        file that declares none, before any transfer starts.
+        """
 
 
 class HfTransport:
@@ -177,6 +186,17 @@ class HfTransport:
         from huggingface_hub import HfApi
 
         return HfApi(token=self._token).repo_info(repo, repo_type="dataset", revision=revision).sha
+
+    def file_size(self, repo: str, sha: str, path: str) -> int | None:
+        """Size of ``path`` at ``sha`` from the Hub's metadata, before any bytes move; ``None`` when it is unknown."""
+        from huggingface_hub import HfApi
+
+        try:
+            (info,) = HfApi(token=self._token).get_paths_info(repo, [path], repo_type="dataset", revision=sha)
+        except Exception:  # a failed probe only loses the early check; the transfer checks run as before
+            return None
+        size = getattr(info, "size", None)
+        return size if isinstance(size, int) else None
 
     def open_file(self, repo: str, sha: str, path: str) -> Iterator[bytes]:
         from huggingface_hub import hf_hub_download
@@ -540,7 +560,13 @@ class _Planner:
         # budget stop an oversized stream before it is held in memory. A transport that finishes the whole
         # download before yielding (Hugging Face) can only be checked once its bytes arrive.
         limit = ref.bytes if ref.bytes is not None else _METADATA_CAP_BYTES
-        if self.budget is not None and plan.metadata_bytes + (ref.bytes or 1) > self.budget:
+        size = ref.bytes
+        if size is None and (probe := getattr(self.transport, "file_size", None)) is not None:
+            # No declared size, and a transport that cannot be stopped mid-transfer: ask for it before any byte moves.
+            size = probe(plan.repo, plan.revision, ref.path)
+            if size is not None and size > _METADATA_CAP_BYTES:
+                raise IntegrityError(ref.path, f"metadata is {size} bytes, over the {_METADATA_CAP_BYTES}-byte cap")
+        if self.budget is not None and plan.metadata_bytes + (size or 1) > self.budget:
             self._add(ref)
             raise BudgetExceededError(plan, self.budget)
         chunks: list[bytes] = []
