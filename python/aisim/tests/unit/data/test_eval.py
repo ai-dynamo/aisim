@@ -482,3 +482,106 @@ def test_attest_cannot_demote_a_record_but_can_keep_or_raise_its_tier(built):
         attest(qualified, report_for(qualified), "verified")
     assert attest(qualified, report_for(qualified), "qualified").tier == "qualified"  # equal-tier re-attestation
     assert attest(verified, report_for(verified)).tier == "verified"
+
+
+def _successor_with_findings(record, tag):
+    """A successor of ``record`` that links its own hash-named findings file; returns it with the file's bytes."""
+    payload = f'{{"note": "{tag}"}}'.encode()
+    digest = hashlib.sha256(payload).hexdigest()
+    findings = Artifact(
+        artifact_id="findings",
+        path=f"{digest}.json",
+        role="findings",
+        format="json",
+        schema="findings/v1",
+        sha256=digest,
+        bytes=len(payload),
+    )
+    successor = record.model_copy(update={"findings": [findings], "supersedes": record.record_id})
+    return successor, {findings.path: payload}
+
+
+def _leftovers(directory):
+    return sorted(p.name for p in directory.iterdir() if p.name.startswith(".") or p.suffix == ".tmp")
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_two_pending_findings_files_leave_one_successor_and_a_clean_failure(built, reverse):
+    root, record = built
+    directory = write_record(root, record).parent
+    first, first_files = _successor_with_findings(record, "one")
+    second, second_files = _successor_with_findings(record, "two")
+    pairs = [(first, first_files), (second, second_files)]
+    winner, loser = pairs[::-1] if reverse else pairs
+    # Neither caller has written anything beside the records: each findings file is published with its record.
+    write_record(root, winner[0], sidecars=winner[1])
+    with pytest.raises(ValueError, match=f"already has successor {winner[0].record_id}"):
+        write_record(root, loser[0], sidecars=loser[1])
+    assert [r.record_id for r in current_records(directory)] == [winner[0].record_id]
+    (kept,) = winner[1]
+    (dropped,) = loser[1]
+    assert (directory / kept).read_bytes() == winner[1][kept]
+    assert not (directory / dropped).exists()  # the competing writer left nothing behind
+    assert _leftovers(directory) == []
+    # The winner can be written again, and the loser's retry fails the same way, not on a corrupt record.
+    assert write_record(root, winner[0], sidecars=winner[1]).parent == directory
+    with pytest.raises(ValueError, match="already has successor"):
+        write_record(root, loser[0], sidecars=loser[1])
+
+
+def test_concurrent_successors_with_pending_findings_publish_exactly_one(built):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    root, record = built
+    directory = write_record(root, record).parent
+    candidates = [_successor_with_findings(record, tag) for tag in ("one", "two", "three", "four")]
+    barrier = Barrier(len(candidates))
+
+    def attempt(candidate):
+        barrier.wait()
+        try:
+            return write_record(root, candidate[0], sidecars=candidate[1])
+        except ValueError as exc:
+            return exc
+
+    with ThreadPoolExecutor(len(candidates)) as pool:
+        results = list(pool.map(attempt, candidates))
+    published = [r for r in results if isinstance(r, Path)]
+    failures = [r for r in results if isinstance(r, ValueError)]
+    assert len(published) == 1 and len(failures) == len(candidates) - 1
+    assert all("already has successor" in str(f) for f in failures)
+    (current,) = current_records(directory)
+    assert published[0] == record_path(root, current)
+    assert sorted(p.name for p in directory.glob("*.json")) == sorted(
+        [f"{record.record_id}.json", f"{current.record_id}.json", current.findings[0].path]
+    )
+    assert _leftovers(directory) == []
+
+
+def test_a_retry_completes_the_sidecars_of_an_already_published_record(built):
+    root, record = built
+    directory = write_record(root, record).parent
+    successor, files = _successor_with_findings(record, "one")
+    path = write_record(root, successor, sidecars=files)
+    (name,) = files
+    (directory / name).unlink()  # a failure between the record and its sidecar
+    assert write_record(root, successor, sidecars=files) == path
+    assert (directory / name).read_bytes() == files[name]
+    assert [r.record_id for r in current_records(directory)] == [successor.record_id]
+
+
+def test_sidecars_are_checked_against_the_record_before_anything_is_published(built):
+    root, record = built
+    directory = write_record(root, record).parent
+    successor, files = _successor_with_findings(record, "one")
+    (name,) = files
+    with pytest.raises(ValueError, match="not an artifact of the record"):
+        write_record(root, successor, sidecars={**files, "other.json": b"{}"})
+    with pytest.raises(ValueError, match="declared size or digest"):
+        write_record(root, successor, sidecars={name: b'{"note": "tampered"}'})
+    (directory / name).write_bytes(b'{"note": "someone else"}')  # a different file already holds the name
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        write_record(root, successor, sidecars=files)
+    assert not record_path(root, successor).exists()
+    assert _leftovers(directory) == []

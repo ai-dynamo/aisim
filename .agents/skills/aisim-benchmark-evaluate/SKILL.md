@@ -36,7 +36,9 @@ the result a verifiable record.
 4. Build `EvalRecord` at tier `submitted`, with `gpu_time` from the collect stage (`None` or
    unknown if never recorded), `simulation_cost`, and `producer` (`kind="agent"`, this skill's
    name, evaluator revision). Partial or failed attempts are kept with `status_reason`.
-5. Store: `write_record(dataset_root, record)`. It is content-addressed and refuses overwrites.
+5. Store: `write_record(dataset_root, record)`. It is content-addressed and refuses overwrites. Pass a linked
+   findings file as `sidecars={path: bytes}` rather than writing it beside the records: it is then published
+   under the record lock, and a hash-named file written by hand reads as a corrupt record to a competing writer.
 6. Verify and promote one tier only for records with `status == "complete"`:
 
    ```bash

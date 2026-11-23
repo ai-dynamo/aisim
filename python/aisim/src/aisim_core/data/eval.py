@@ -297,25 +297,43 @@ def _record_lock(directory: Path):
         lock.unlink()
 
 
-def write_record(root: str | Path, record: EvalRecord) -> Path:
+def write_record(root: str | Path, record: EvalRecord, *, sidecars: Mapping[str, bytes] | None = None) -> Path:
     """Write a record by content address. Never overwrites different content.
 
     A superseding record must name an existing record in the same directory with no other successor.
     Writing identical content again is a no-op.
+
+    ``sidecars`` maps the path of each linked artifact the record declares (a findings file, which may be named by
+    its hash) to its bytes. They are checked against the declared size and digest and published under the same lock
+    as the record, from staged copies that record discovery cannot see. A hash-named file written beside the
+    records by hand is a record candidate until some record declares it, and a competing writer then reads it as a
+    corrupt record, so two successors of one predecessor cannot both be prepared that way.
     """
     path = record_path(root, record)
     text = json.dumps(record.model_dump(by_alias=True, mode="json"), indent=2, sort_keys=True, allow_nan=False) + "\n"
     if len(text.encode("utf-8")) > CandidatePolicy().max_json_bytes:
         raise ValueError(f"JSON exceeds the {CandidatePolicy().max_json_bytes}-byte limit")
+    declared = {a.path: a for a in [*record.truth.artifacts, *record.findings]}
+    for relative, data in (sidecars or {}).items():
+        artifact = declared.get(relative)
+        if artifact is None:
+            raise ValueError(f"sidecar {relative!r} is not an artifact of the record")
+        if len(data) != artifact.bytes or hashlib.sha256(data).hexdigest() != artifact.sha256:
+            raise ValueError(f"sidecar {relative!r} differs from its declared size or digest")
     path.parent.mkdir(parents=True, exist_ok=True)
     with _record_lock(path.parent):
-        return _write_record(path, record, text)
+        return _write_record(path, record, text, dict(sidecars or {}))
 
 
-def _write_record(path: Path, record: EvalRecord, text: str) -> Path:
+def _write_record(path: Path, record: EvalRecord, text: str, sidecars: Mapping[str, bytes]) -> Path:
+    for relative, data in sidecars.items():
+        existing = path.parent / relative
+        if existing.exists() and existing.read_bytes() != data:
+            raise FileExistsError(f"refusing to overwrite {existing} with different content")
     if path.exists():
         if load_record(path) != record:
             raise FileExistsError(f"refusing to overwrite {path} with different content")
+        _publish_sidecars(path.parent, sidecars, _stage_sidecars(path.parent, sidecars))  # a retry completes them
         return path
     if record.supersedes is not None:
         predecessor = path.parent / f"{record.supersedes}.json"
@@ -327,17 +345,57 @@ def _write_record(path: Path, record: EvalRecord, text: str) -> Path:
         for existing in _load_all(path.parent, declared):
             if existing.supersedes == record.supersedes:
                 raise ValueError(f"superseded record {record.supersedes} already has successor {existing.record_id}")
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    staged = _stage_sidecars(path.parent, sidecars)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-        os.link(tmp, path)  # fails if another writer created it first
-    except FileExistsError:
-        if load_record(path) != record:
-            raise
-    finally:
-        Path(tmp).unlink(missing_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            os.link(tmp, path)  # fails if another writer created it first
+        except FileExistsError:
+            if load_record(path) != record:
+                raise
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+    except BaseException:
+        for staged_copy in staged.values():
+            staged_copy.unlink(missing_ok=True)
+        raise
+    # The record goes first: it declares its sidecars, so discovery never sees an undeclared hash-named file. A
+    # failure between the two leaves a record whose missing sidecars the same call completes when retried.
+    _publish_sidecars(path.parent, sidecars, staged)
     return path
+
+
+def _stage_sidecars(directory: Path, sidecars: Mapping[str, bytes]) -> dict[str, Path]:
+    """Complete copies of the sidecars under names that discovery ignores (dot-prefixed, never a record name)."""
+    staged: dict[str, Path] = {}
+    try:
+        for relative, data in sidecars.items():
+            target = directory / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+            staged[relative] = Path(tmp)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+    except BaseException:
+        for tmp in staged.values():
+            tmp.unlink(missing_ok=True)
+        raise
+    return staged
+
+
+def _publish_sidecars(directory: Path, sidecars: Mapping[str, bytes], staged: Mapping[str, Path]) -> None:
+    try:
+        for relative, tmp in staged.items():
+            try:
+                os.link(tmp, directory / relative)
+            except FileExistsError:
+                if (directory / relative).read_bytes() != sidecars[relative]:
+                    raise
+    finally:
+        for tmp in staged.values():
+            tmp.unlink(missing_ok=True)
 
 
 def load_record(path: str | Path) -> EvalRecord:
