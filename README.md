@@ -75,11 +75,12 @@ aisim --help
 
 ### Operation data is downloaded, not packaged
 
-> **Breaking change.** The `aisim` wheel no longer contains operation-latency
-> tables. They are downloaded on first use from the
+> **Breaking change in AISim 0.15.0.** The `aisim` wheel no longer contains
+> operation-latency tables (earlier releases still do). AISim now downloads them on
+> first use from the
 > [`ai-dynamo/aisim-data`](https://huggingface.co/datasets/ai-dynamo/aisim-data)
-> Hugging Face dataset at the commit pinned in the release, hash-verified, and
-> cached for later runs. Code that read `aisim_core/systems/data` inside the
+> Hugging Face dataset at the commit pinned in the release, hash-verifies them, and
+> caches them for later runs. Code that read `aisim_core/systems/data` inside the
 > installed package must use `--systems-paths`, `AICONFIGURATOR_SYSTEMS_PATH` or a
 > composed root instead.
 
@@ -88,7 +89,8 @@ reuse the cache. Choose when the data arrives:
 
 | Command | Effect |
 |---|---|
-| `aisim init --all` | Download the whole operation-latency database now. |
+| `aisim init` | In a terminal, ask whether to download now or on demand. Scripts and CI have no terminal and must pass one of the flags below. |
+| `aisim init --all` | Download the whole operation-latency database now, without asking. |
 | `aisim init --hardware h200_sxm` | Download one hardware platform now. |
 | `aisim data fetch --dry-run` | Show what would be downloaded, without downloading. |
 | `aisim data status` | Show the pin, cache path and size, saved choice and cached files. |
