@@ -165,6 +165,7 @@ def _collection_source(request: SupportRequest, root: Path) -> tuple[Any, Path, 
     from collector.fpm_forward.database import (
         aggregate_cell,
         published_dense_synthetic_cells,
+        published_median_policy,
         validate_formal_database_commit,
     )
     from collector.fpm_forward.planner import backend_identity_columns
@@ -265,6 +266,7 @@ def _collection_source(request: SupportRequest, root: Path) -> tuple[Any, Path, 
                 campaign / "cells" / cell.cell_id,
                 expected_attempt_id=entry["attempt_id"],
                 dense_synthetic_kv=cell.cell_id in dense_cells,
+                median_policy=published_median_policy(published),
             )
         )
     canonical = lambda row: json.dumps(row, sort_keys=True, allow_nan=False)

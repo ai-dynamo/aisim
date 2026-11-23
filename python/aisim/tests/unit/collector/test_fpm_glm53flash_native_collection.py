@@ -1694,7 +1694,30 @@ def test_published_glm_pair_loads_through_the_rust_fpm_loader(tmp_path):
         write_glm_rank(_pod(tmp_path / phase, cell), payload)
         rows += database.aggregate_cell(plan, cell, tmp_path / phase, expected_attempt_id=ATTEMPT_ID)
     systems = tmp_path / "systems"
-    database.write_formal_database(plan, rows, systems_root=systems / "data")
+    _parquet, metadata, _skipped = database.write_formal_database(plan, rows, systems_root=systems / "data")
+    assert {
+        (
+            row["measurement_policy"],
+            row["global_warmup_iterations"],
+            row["warmup_repeats"],
+            row["measurement_repeats"],
+            row["state_protocol"],
+            row["timing_boundary"],
+        )
+        for row in rows
+    } == {
+        (
+            "vllm_native_fpm_prefix_seed_median_v1",
+            0,
+            5,
+            10,
+            "glm53flash_prefix_cache_real_seed_v1",
+            "dynamo_vllm_instrumented_scheduler_fpm_wall_time",
+        )
+    }
+    sidecar = json.loads(metadata.read_text())
+    assert (sidecar["schema_version"], sidecar["measurement_policy"]) == (7, "vllm_native_fpm_prefix_seed_median_v1")
+    assert (sidecar["warmup_repeats"], sidecar["measurement_repeats"]) == (5, 10)
     system_file = f"{plan.system}.yaml"
     shutil.copyfile(Path(aisim_core.__file__).parent / "systems" / system_file, systems / system_file)
     engine = dict(
@@ -1731,6 +1754,121 @@ def test_published_glm_pair_loads_through_the_rust_fpm_loader(tmp_path):
         )
         fpm = dict(version=1, wall_time=1.0, scheduled_requests=scheduled)
         assert model.estimate_forward_pass_time_ms(fpm) == pytest.approx(row["latency_ms"])
+
+
+def test_rows_of_other_models_keep_the_single_sample_policy(tmp_path, monkeypatch):
+    cell = glm_cell("prefill")
+    write_glm_rank(_pod(tmp_path, cell), glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED]))
+    valid = _validate(tmp_path, cell)
+    rows = _publish(monkeypatch, tmp_path, cell, replace(valid, execution_mode=None))
+    assert len(rows) == 2
+    for row in rows:
+        assert (row["measurement_policy"], row["warmup_repeats"], row["measurement_repeats"]) == (
+            database.SINGLE_SAMPLE_MEASUREMENT_POLICY,
+            0,
+            1,
+        )
+        assert not {"state_protocol", "timing_boundary"} & row.keys()
+
+
+def _producer_cells(tmp_path: Path) -> dict[str, tuple[FPMCell, Path]]:
+    """The prefill and the decode cell of GLM-5.3-Flash, each with an artifact in the shape that the producer writes."""
+    shape = _glm_producer_shape(tmp_path)
+    cells = {}
+    for phase, points in (("prefill", [PREFILL_COLD, PREFILL_CACHED]), ("decode", DECODE_POINTS)):
+        cell = glm_cell(phase)
+        payload = glm_native_payload(phase, points=points)
+        shape(phase, payload)
+        write_glm_rank(_pod(tmp_path / phase, cell), payload)
+        cells[phase] = (cell, tmp_path / phase)
+    return cells
+
+
+@pytest.mark.parametrize("order", ["median-first", "single-first"])
+def test_glm_rows_and_single_sample_rows_cannot_share_a_database(tmp_path, order):
+    plan = _glm_plan()
+    (prefill, prefill_dir), (decode, decode_dir) = _producer_cells(tmp_path).values()
+    median = database.aggregate_cell(plan, prefill, prefill_dir, expected_attempt_id=ATTEMPT_ID)
+    single = database.aggregate_cell(plan, decode, decode_dir, expected_attempt_id=ATTEMPT_ID, median_policy=False)
+    first, second = (median, single) if order == "median-first" else (single, median)
+    systems = tmp_path / "systems"
+    parquet, metadata, _skipped = database.write_formal_database(plan, first, systems_root=systems)
+    sealed = (parquet.read_bytes(), metadata.read_bytes())
+    with pytest.raises(ValueError) as error:
+        database.write_formal_database(plan, second, systems_root=systems)
+    assert str(error.value) == (
+        "cannot mix GLM-5.3-Flash producer rows and other FPM rows in one database: the sidecar holds one "
+        "measurement_policy, and 'vllm_native_fpm_prefix_seed_median_v1' binds every row. Publish to a clean "
+        f"destination: {parquet}"
+    )
+    assert (parquet.read_bytes(), metadata.read_bytes()) == sealed
+
+
+@pytest.mark.parametrize("case", ["sealed-before", "sealed-now"])
+def test_publication_sealed_with_the_single_sample_label_still_verifies(tmp_path, case):
+    import pyarrow.parquet as pq
+
+    plan = _glm_plan()
+    cells = _producer_cells(tmp_path)
+    median = case == "sealed-now"
+    rows = [
+        row
+        for cell, cell_dir in cells.values()
+        for row in database.aggregate_cell(plan, cell, cell_dir, expected_attempt_id=ATTEMPT_ID, median_policy=median)
+    ]
+    parquet, metadata, _skipped = database.write_formal_database(plan, rows, systems_root=tmp_path / "systems")
+    # As finalization and collection validation read a publication: the sidecar selects the label of the rows.
+    published = database.validate_formal_database_commit(
+        parquet, metadata, plan, required_cells=tuple(cell for cell, _cell_dir in cells.values())
+    )
+    assert database.published_median_policy(published) is median
+    again = [
+        row
+        for cell, cell_dir in cells.values()
+        for row in database.aggregate_cell(
+            plan,
+            cell,
+            cell_dir,
+            expected_attempt_id=ATTEMPT_ID,
+            median_policy=database.published_median_policy(published),
+        )
+    ]
+    canonical = lambda row: json.dumps(row, sort_keys=True, allow_nan=False)
+    assert sorted(map(canonical, again)) == sorted(map(canonical, pq.read_table(parquet).to_pylist()))
+
+
+def test_callers_that_check_a_publication_take_the_label_of_its_sidecar():
+    """Finalization and collection validation aggregate with the label of the sidecar; publication and readiness write
+    the label of the producer contract."""
+    import ast
+
+    import collector.fpm_forward
+
+    import aisim.support
+
+    sources = {
+        "finalization": Path(aisim.support.__file__).parent / "finalization.py",
+        "validation_workflow": Path(aisim.support.__file__).parent / "validation_workflow.py",
+        "collection_readiness": Path(aisim.support.__file__).parent / "collection_readiness.py",
+        "runner": Path(collector.fpm_forward.__file__).parent / "runner.py",
+    }
+    keywords = {}
+    for name, path in sources.items():
+        calls = [
+            node
+            for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "aggregate_cell"
+        ]
+        keywords[name] = [
+            [ast.unparse(keyword.value) for keyword in call.keywords if keyword.arg == "median_policy"]
+            for call in calls
+        ]
+    assert keywords == {
+        "finalization": [["published_median_policy(published)"]],
+        "validation_workflow": [["published_median_policy(published)"]],
+        "collection_readiness": [[]],
+        "runner": [[]],
+    }
 
 
 def test_glm_producer_record_must_name_the_supported_vllm(tmp_path):

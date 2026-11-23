@@ -300,6 +300,8 @@ def _is_hex(value: object, digits: int) -> bool:
 
 
 _GLM_RUNTIME = Path(__file__).parent / "runtime" / "glm53flash"
+# The timing boundary that the GLM-5.3-Flash producer records in its rank artifacts and that its published rows carry.
+GLM_TIMING_BOUNDARY = "dynamo_vllm_instrumented_scheduler_fpm_wall_time"
 
 
 @functools.cache
@@ -549,7 +551,7 @@ def _validate_glm_provenance(
     for key, value in expected_kvwarm:
         if not _same(kvwarm.get(key), value):
             raise lacks(f"kvwarm.{key}")
-    if not _same(payload.get("timing_boundary"), "dynamo_vllm_instrumented_scheduler_fpm_wall_time"):
+    if not _same(payload.get("timing_boundary"), GLM_TIMING_BOUNDARY):
         raise lacks("timing_boundary")
     serving = payload.get("serving_config")
     serving = serving if isinstance(serving, dict) else {}
