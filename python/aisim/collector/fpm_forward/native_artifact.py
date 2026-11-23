@@ -467,8 +467,9 @@ def _validate_glm_provenance(
     point and keeps the evidence of the repetitions in a sidecar file next to the artifact. Its ``producer`` record
     must equal the record of the supported producer (``_glm_producer_record``). A refusal names the first item that is
     absent or malformed. ``producer_digests``, the two digests of the cell's producer receipt, replace the two digests
-    of that record. The digest of each row must be that of the sidecar line with its benchmark_id, and the seeded
-    input must be the record of a generator version that this collector can draw. The caller has already checked that
+    of that record. The digest of a row whose benchmark_id is an integer (and not a bool) must be that of the sidecar
+    line with that benchmark_id; a row with any other ID is left to the check of the row IDs. The seeded input must be
+    the record of a generator version that this collector can draw. The caller has already checked that
     the rows are mappings with mapping points.
     """
 
@@ -519,8 +520,8 @@ def _validate_glm_provenance(
     if not _same(evidence.get("chunk_start_alignment"), 4):
         raise lacks("input_provenance.chunk_start_alignment")
 
-    # The sidecar is bound by its name, its digest and its record count, one record per measured point, and each row by
-    # the digest of its line.
+    # The sidecar is bound by its name, its digest and its record count, one record per measured point, and each row
+    # whose benchmark_id is an integer by the digest of the line with that ID.
     sidecar = path.with_name(f"{path.stem}.repetitions.jsonl")
     manifest = evidence.get("repetition_evidence_manifest")
     raw = sidecar.read_bytes() if sidecar.is_file() else None

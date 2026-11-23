@@ -589,6 +589,17 @@ def _first_line_is_no_utf8(payload: dict, sidecar: Path) -> None:
     _rewrite_sidecar(payload, sidecar, [b"\xff", *_sidecar_lines(sidecar)[1:]])
 
 
+def _second_line_names_another_point(payload: dict, sidecar: Path) -> None:
+    # Rows 1 and 2 with sidecar lines 1 and 3. The second row carries the digest of the line with ID 3, so its own ID 2
+    # names no line.
+    lines = _sidecar_lines(sidecar)
+    second = json.loads(lines[1])
+    second["benchmark_id"] = 3
+    line = json.dumps(second, sort_keys=True, separators=(",", ":")).encode()
+    _rewrite_sidecar(payload, sidecar, [lines[0], line])
+    payload["results"][1]["repetition_evidence_sha256"] = hashlib.sha256(line).hexdigest()
+
+
 def _first_line_id_is_a_boolean(payload: dict, sidecar: Path) -> None:
     # The row of ID 1 carries the digest of the changed line, so only the type of the line's ID is wrong.
     lines = _sidecar_lines(sidecar)
@@ -854,6 +865,7 @@ REFUSALS = [
     pytest.param("repetition_evidence", _first_line_is_no_object, id="sidecar-line-is-no-object"),
     pytest.param("repetition_evidence", _first_line_is_no_utf8, id="sidecar-line-is-no-utf8"),
     pytest.param("repetition_evidence", _first_line_id_is_a_boolean, id="sidecar-id-is-a-boolean"),
+    pytest.param("repetition_evidence_sha256", _second_line_names_another_point, id="row-id-of-no-line"),
     pytest.param(
         "kv_seed_regime", lambda p, _: p["results"][0].update(kv_seed_regime="real_prefix"), id="regime-of-cold-row"
     ),
@@ -989,14 +1001,15 @@ def test_seeded_input_record_cannot_be_changed_by_a_caller(tmp_path):
 @pytest.mark.parametrize(
     ("benchmark_id", "refusal"),
     [
-        pytest.param(True, "native point field 'benchmark_id' must be an integer, got True", id="boolean"),
-        pytest.param(1.0, "native point field 'benchmark_id' must be an integer, got 1.0", id="float"),
+        pytest.param(False, "native point field 'benchmark_id' must be an integer, got False", id="boolean"),
+        pytest.param(2.0, "native point field 'benchmark_id' must be an integer, got 2.0", id="float"),
         pytest.param("1", "native point field 'benchmark_id' must be an integer, got '1'", id="string"),
     ],
 )
 def test_row_id_that_is_no_integer_is_refused_by_the_check_of_the_row_ids(tmp_path, benchmark_id, refusal):
-    # The digest of the row is that of the line with ID 1. The digest rule compares only a row whose ID is an integer,
-    # so the check of the row IDs names the ID.
+    # The row carries the digest of the line with ID 1. A plain lookup by its ID would not give that digest: no line has
+    # the key False (0), and the key 2.0 finds the line of the second row. The digest rule compares only a row whose ID
+    # is an integer and not a bool, so the check of the row IDs names the ID.
     cell = glm_cell("prefill")
     pod = _pod(tmp_path, cell)
     payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
