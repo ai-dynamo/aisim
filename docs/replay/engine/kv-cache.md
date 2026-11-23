@@ -1000,8 +1000,9 @@ Replay does not preempt the request in such a pool, and the request completes.
 Replay keeps the hold of one step for a state cache. The comparison above is
 for requests without speculative decoding. A
 [grouped cache](#other-cache-modes) holds these blocks as vLLM does on an
-aggregated worker, except in a layout with a prefix-cacheable `state` group
-whose block is below the block of a full-attention group.
+aggregated worker, except in the layouts with a prefix-cacheable `state`
+group that [grouped caches](#other-cache-modes) name in their known
+differences.
 
 ### State pool from recorded runtime memory
 
@@ -1299,7 +1300,8 @@ sub-block matching without an explicit full-state scratch count.
     and takes blocks for the whole prompt. No full-attention cache spec of
     vLLM 0.31.0, 0.32.0 or 0.33.0 opts out of prefix caching.
   - Replay frees the blocks that a request no longer needs on the processed
-    token count, as vLLM's `allocate_slots` does: the computed tokens less
+    token count, as vLLM's `allocate_slots` does, except in the layouts named
+    below: the computed tokens less
     the tokens of the request's step in flight. See vLLM v0.31.0
     [`kv_cache_manager.py:552-556`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_manager.py#L552-L556),
     vLLM v0.32.0
@@ -1313,10 +1315,11 @@ sub-block matching without an explicit full-state scratch count.
     aggregated worker replay then keeps the previous state block, the cached
     block of a hit on a block boundary, the copy block of a hit inside a
     block, the checkpoint block and the blocks that left a sliding window
-    one step longer, as vLLM does, in a layout in which every
-    prefix-cacheable `state` group has a block at or above the block of
-    every full-attention group (the second item of the known differences
-    below gives the other layouts). A prefill or decode worker frees them on
+    one step longer, as vLLM does, in a layout without a prefix-cacheable
+    `state` group, and in a layout with a prefix-cacheable full-attention
+    group in which the block of every prefix-cacheable `state` group equals
+    the scheduler block (the second item of the known differences below
+    gives the other layouts). A prefill or decode worker frees them on
     the computed token count (the first item of the known differences
     below). A request can then hold one block per prefix-cacheable state
     group more than vLLM's startup check reserves, `2 + c` with `c` the
@@ -1421,21 +1424,29 @@ sub-block matching without an explicit full-state scratch count.
     can then go first, and a later hit can be shorter or longer than in vLLM.
     With `async_scheduling: false` these blocks are held for one step in vLLM
     too.
-  - In a layout with a prefix-cacheable `state` group whose block is below
-    the block of a full-attention group, such as a state block of 2 tokens
-    beside a full-attention block of 8 tokens, an aggregated worker frees
-    these blocks on the computed token count, one step earlier than vLLM
-    with async scheduling. A ring and a sliding-window group do not count.
-    In such a layout, with async scheduling and a pool of exactly vLLM's
-    startup count, vLLM itself can starve a request: while one chunk of the
-    request is in flight, its next chunk needs one more state block than the
-    pool has, so the request preempts itself, and its next life hits the
-    same tokens again, because the full-attention block of that chunk is
-    not full and has no key. A replay that followed vLLM there would not
+  - In a layout with a prefix-cacheable `state` group, an aggregated
+    worker holds these blocks as vLLM does only if the layout has a
+    prefix-cacheable full-attention group and the block of every
+    prefix-cacheable `state` group equals the scheduler block, the least
+    common multiple of the blocks of all groups. In the other layouts with a
+    prefix-cacheable `state` group it frees these blocks on the computed
+    token count, one step earlier than vLLM with async scheduling. Examples
+    are a state block of 2 tokens beside a full-attention block of 8 tokens,
+    a state block of 4 tokens beside a ring of 12 tokens, and a layout whose
+    only attention group is a sliding-window group, a convolution group or a
+    full-attention group with `prefix_cacheable: false`. Without hits inside
+    a block, a preempted request keeps cache hits only up to a multiple of
+    the scheduler block, so a state group with a smaller block loses the
+    progress inside that block. In such a layout, with async scheduling and
+    a pool of exactly vLLM's startup count, vLLM itself can starve a
+    request: while a step of the request is in flight, it needs one more
+    state block than the pool has, so it preempts itself, and its next life
+    hits the same tokens again. A replay that followed vLLM there would not
     end. So replay completes requests that vLLM starves in such a layout,
     and in a pool near the startup count it can count fewer preemptions than
-    vLLM. The GLM-5.3-Flash groups have one block size and keep the longer
-    hold.
+    vLLM. The state blocks of the GLM-5.3-Flash groups equal its attention
+    block and its scheduler block, 2,176 tokens, beside a ring of 4 tokens,
+    so they keep the longer hold.
   - Replay releases held blocks in another order than vLLM in two cases.
     When one allocation releases a checkpoint block and a previous state
     block that a crossing after the checkpoint step left, replay releases the

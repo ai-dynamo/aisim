@@ -580,8 +580,8 @@ With prefix caching on, replay keeps the blocks of all groups in one block pool:
   worker can reach this state alone. That can happen when the pool holds
   exactly vLLM's startup count, the hash block is smaller than the state
   block, the state groups have no checkpoint block, and the prompt's partial
-  tail lies in the last attention block of the context length, and no
-  state block is below the attention block. The request
+  tail lies in the last attention block of the context length, and the
+  state block equals the scheduler block. The request
   preempts itself several times, then hits its own partial tail inside a
   block and is refused at every step. It is not preempted without end. vLLM's
   whole-sequence test refuses it in the same way; see vLLM v0.33.0
@@ -594,9 +594,11 @@ With prefix caching on, replay keeps the blocks of all groups in one block pool:
   a block boundary, it also holds the previous block until the first later
   allocation whose processed token count lies past that block: for one
   scheduler step with `async_scheduling: false`, and on an aggregated worker
-  for two with a step in flight. In a layout with a state block below a
-  full-attention block an aggregated worker holds it for one step in both
-  modes, one step less than vLLM (see the known differences in
+  for two with a step in flight. In a layout in which the block of a
+  prefix-cacheable `state` group is below the scheduler block, or that has
+  no prefix-cacheable full-attention group, an aggregated worker holds it
+  for one step in both modes, one step less than vLLM (see the known
+  differences in
   [Replay KV cache](../replay/engine/kv-cache.md#other-cache-modes)). A prefill or decode worker holds it for one
   step in both modes. After it writes past a state that it published inside
   a block, it holds the published block until its next allocation. A ring

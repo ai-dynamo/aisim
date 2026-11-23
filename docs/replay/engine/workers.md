@@ -427,9 +427,11 @@ which requests can be preempted:
   formed, if the request runs in it, and not when pass k+1 is formed. See
   [KV cache](kv-cache.md#other-cache-modes). Replay does this on an aggregated
   worker with a grouped cache, except with prefix caching on in a layout with
-  a prefix-cacheable state group whose block is below the block of a
-  full-attention group: there it frees such a block when pass k+1 is formed,
-  where vLLM can starve a request at exactly its startup count. A prefill or decode worker frees such a block
+  a prefix-cacheable state group whose block is below the scheduler block, or
+  without a prefix-cacheable full-attention group: there it frees such a
+  block when pass k+1 is formed, because vLLM can starve a request in such a
+  layout at a pool of exactly its startup count (see the known differences
+  in [KV cache](kv-cache.md#other-cache-modes)). A prefill or decode worker frees such a block
   when pass k+1 is formed, for the reason in the paragraph below the list. A
   [state cache](kv-cache.md#state-cache) frees a previous state copy when pass
   k+1 is formed on every worker.
