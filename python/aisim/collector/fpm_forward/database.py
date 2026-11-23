@@ -286,7 +286,21 @@ def aggregate_cell(
     if powered and not getattr(plan.options, "measure_power", False):
         # An image-level DYN_BENCHMARK_POWER_WINDOW_S bypasses the plan's identity.
         raise ValueError(f"{cell.cell_id} wrote power-window artifacts under a plan without measure_power")
+    if powered and collection.execution_mode == "native_graph_policy":
+        # The median label holds no power, and the power-window label names a single sample: neither is true here.
+        raise ValueError(
+            f"{cell.cell_id} wrote power-window artifacts for a GLM-5.3-Flash producer cell, and no FPM measurement "
+            "policy describes the rows of such a cell with a power window"
+        )
     if median_policy and collection.execution_mode == "native_graph_policy":
+        # The loader of the published pair reads a median row only with a global warm-up of 0, so a pair that holds
+        # another value cannot be read at all.
+        if plan.options.warmup_iterations != 0:
+            raise ValueError(
+                f"{cell.cell_id} is a GLM-5.3-Flash producer cell under a plan with "
+                f"warmup_iterations={plan.options.warmup_iterations!r}, and its rows carry "
+                f"measurement_policy={VLLM_PREFIX_SEED_MEDIAN_POLICY!r}, which requires a global warm-up of 0"
+            )
         policy_columns = {
             "warmup_repeats": GLM_PRODUCER_PROTOCOL["warmup_repeats"],
             "measurement_repeats": GLM_PRODUCER_PROTOCOL["measurement_repeats"],

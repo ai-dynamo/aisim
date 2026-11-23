@@ -1809,11 +1809,14 @@ def test_published_glm_pair_loads_through_the_rust_fpm_loader(tmp_path):
         assert model.estimate_forward_pass_time_ms(fpm) == pytest.approx(row["latency_ms"])
 
 
-def test_rows_of_other_models_keep_the_single_sample_policy(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode", [None, "eager"], ids=["no-execution-mode", "eager"])
+def test_rows_of_other_models_keep_the_single_sample_policy(tmp_path, monkeypatch, mode):
+    # A cell without an execution identity has no execution mode, and a DeepSeek V4.1 cell has the audited mode eager.
+    # Only the mode of the GLM-5.3-Flash producer takes the median label.
     cell = glm_cell("prefill")
     write_glm_rank(_pod(tmp_path, cell), glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED]))
     valid = _validate(tmp_path, cell)
-    rows = _publish(monkeypatch, tmp_path, cell, replace(valid, execution_mode=None))
+    rows = _publish(monkeypatch, tmp_path, cell, replace(valid, execution_mode=mode))
     assert len(rows) == 2
     for row in rows:
         assert (row["measurement_policy"], row["warmup_repeats"], row["measurement_repeats"]) == (
@@ -1837,6 +1840,49 @@ def _producer_cells(tmp_path: Path) -> dict[str, tuple[FPMCell, Path]]:
     return cells
 
 
+def test_glm_cell_under_a_plan_with_a_global_warmup_is_refused_before_a_pair_is_written(tmp_path):
+    # The loader of a published pair reads a median row only with a global warm-up of 0, so a median row of this plan
+    # would make the whole pair unreadable. The single-sample label of a pair sealed with it has no such rule.
+    plan = _glm_plan()
+    plan.options = SimpleNamespace(warmup_iterations=5)
+    cell, cell_dir = _producer_cells(tmp_path)["prefill"]
+    with pytest.raises(ValueError) as error:
+        database.aggregate_cell(plan, cell, cell_dir, expected_attempt_id=ATTEMPT_ID)
+    assert str(error.value) == (
+        f"{cell.cell_id} is a GLM-5.3-Flash producer cell under a plan with warmup_iterations=5, and its rows carry "
+        "measurement_policy='vllm_native_fpm_prefix_seed_median_v1', which requires a global warm-up of 0"
+    )
+    rows = database.aggregate_cell(plan, cell, cell_dir, expected_attempt_id=ATTEMPT_ID, median_policy=False)
+    assert {(row["measurement_policy"], row["global_warmup_iterations"]) for row in rows} == {
+        (database.SINGLE_SAMPLE_MEASUREMENT_POLICY, 5)
+    }
+
+
+@pytest.mark.parametrize("median_policy", [True, False], ids=["median-label", "single-sample-label"])
+def test_glm_cell_with_power_window_artifacts_is_refused(tmp_path, monkeypatch, median_policy):
+    # The median label holds no power, and the power-window label names a single sample, so no label is true for the
+    # rows of a producer cell with a power window.
+    cell = glm_cell("prefill")
+    write_glm_rank(_pod(tmp_path, cell), glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED]))
+    valid = _validate(tmp_path, cell)
+    assert valid.execution_mode == "native_graph_policy"
+    powered = replace(
+        valid,
+        artifact_schema_version=database.FPM_NATIVE_BENCHMARK_POWER_RESULT_SCHEMA_VERSION,
+        points=tuple(replace(point, power_w=100.0) for point in valid.points),
+    )
+    plan = _glm_plan()
+    plan.options = SimpleNamespace(warmup_iterations=0, measure_power=True)
+    monkeypatch.setattr(database, "validate_native_collection", lambda *_args, **_kwargs: powered)
+    monkeypatch.setattr(database, "extract_measurement_evidence", lambda *_args, **_kwargs: {})
+    with pytest.raises(ValueError) as error:
+        database.aggregate_cell(plan, cell, tmp_path, expected_attempt_id=ATTEMPT_ID, median_policy=median_policy)
+    assert str(error.value) == (
+        f"{cell.cell_id} wrote power-window artifacts for a GLM-5.3-Flash producer cell, and no FPM measurement "
+        "policy describes the rows of such a cell with a power window"
+    )
+
+
 @pytest.mark.parametrize("order", ["median-first", "single-first"])
 def test_glm_rows_and_single_sample_rows_cannot_share_a_database(tmp_path, order):
     plan = _glm_plan()
@@ -1857,13 +1903,70 @@ def test_glm_rows_and_single_sample_rows_cannot_share_a_database(tmp_path, order
     assert (parquet.read_bytes(), metadata.read_bytes()) == sealed
 
 
-@pytest.mark.parametrize("case", ["sealed-before", "sealed-now"])
-def test_publication_sealed_with_the_single_sample_label_still_verifies(tmp_path, case):
+@pytest.mark.parametrize("order", ["median-first", "power-first"])
+def test_glm_rows_and_power_window_rows_read_the_power_window_refusal(tmp_path, order):
+    # A pair cannot hold power-window rows and median rows. The power-window refusal runs first, so it names the fault.
+    plan = _glm_plan()
+    (prefill, prefill_dir), (decode, decode_dir) = _producer_cells(tmp_path).values()
+    median = database.aggregate_cell(plan, prefill, prefill_dir, expected_attempt_id=ATTEMPT_ID)
+    single = database.aggregate_cell(plan, decode, decode_dir, expected_attempt_id=ATTEMPT_ID, median_policy=False)
+    power = [
+        {**row, "measurement_policy": database.POWER_WINDOW_MEASUREMENT_POLICY, "power_w": 120.0} for row in single
+    ]
+    first, second = (median, power) if order == "median-first" else (power, median)
+    systems = tmp_path / "systems"
+    parquet, metadata, _skipped = database.write_formal_database(plan, first, systems_root=systems)
+    sealed = (parquet.read_bytes(), metadata.read_bytes())
+    with pytest.raises(ValueError) as error:
+        database.write_formal_database(plan, second, systems_root=systems)
+    assert str(error.value) == (
+        "cannot mix power-window and latency-only FPM rows in one database: schema 8 requires every row to carry "
+        "measurement_policy='dynamo_native_single_sample_power_window_v1'. Publish to a clean destination, or collect "
+        f"every cell with the same --fpm-measure-power setting: {parquet}"
+    )
+    assert (parquet.read_bytes(), metadata.read_bytes()) == sealed
+
+
+def test_glm_rows_cannot_join_rows_without_a_measurement_policy(tmp_path):
+    plan = _glm_plan()
+    (prefill, prefill_dir), (decode, decode_dir) = _producer_cells(tmp_path).values()
+    median = database.aggregate_cell(plan, prefill, prefill_dir, expected_attempt_id=ATTEMPT_ID)
+    single = database.aggregate_cell(plan, decode, decode_dir, expected_attempt_id=ATTEMPT_ID, median_policy=False)
+    bare = [{key: value for key, value in row.items() if key != "measurement_policy"} for row in single]
+    systems = tmp_path / "systems"
+    parquet, metadata, _skipped = database.write_formal_database(plan, bare, systems_root=systems)
+    sealed = (parquet.read_bytes(), metadata.read_bytes())
+    with pytest.raises(ValueError) as error:
+        database.write_formal_database(plan, median, systems_root=systems)
+    assert str(error.value) == (
+        "cannot mix GLM-5.3-Flash producer rows and other FPM rows in one database: the sidecar holds one "
+        "measurement_policy, and 'vllm_native_fpm_prefix_seed_median_v1' binds every row. Publish to a clean "
+        f"destination: {parquet}"
+    )
+    assert (parquet.read_bytes(), metadata.read_bytes()) == sealed
+
+
+@pytest.mark.parametrize(
+    ("policy", "median"),
+    [
+        ("dynamo_native_single_sample_v1", False),
+        ("dynamo_native_single_sample_power_window_v1", False),
+        ("vllm_native_fpm_prefix_seed_median_v1", True),
+        (None, False),
+    ],
+    ids=["single-sample", "power-window", "median", "none"],
+)
+def test_only_the_median_label_of_a_sidecar_selects_the_median_rows(policy, median):
+    assert database.published_median_policy({"measurement_policy": policy}) is median
+
+
+@pytest.mark.parametrize("case", ["single-sample-label", "median-label"])
+def test_publication_verifies_with_the_label_of_its_sidecar(tmp_path, case):
     import pyarrow.parquet as pq
 
     plan = _glm_plan()
     cells = _producer_cells(tmp_path)
-    median = case == "sealed-now"
+    median = case == "median-label"
     rows = [
         row
         for cell, cell_dir in cells.values()
@@ -1891,8 +1994,8 @@ def test_publication_sealed_with_the_single_sample_label_still_verifies(tmp_path
 
 
 def test_callers_that_check_a_publication_take_the_label_of_its_sidecar():
-    """Finalization and collection validation aggregate with the label of the sidecar; publication and readiness write
-    the label of the producer contract."""
+    """Finalization and collection validation aggregate with the label of the sidecar; publication and readiness
+    aggregate with the label of the producer contract."""
     import ast
 
     import collector.fpm_forward
