@@ -4462,18 +4462,21 @@ def xpu_graph_measure_enabled() -> bool:
 
 
 def torch_npu_module():
-    """Return ``torch.npu``, or None when the torch_npu plugin is unavailable.
+    """Return ``torch.npu``, or None when the torch_npu plugin is not installed.
 
     Unlike CUDA and XPU, ``torch.npu`` does not exist in stock PyTorch: the
     out-of-tree ``torch_npu`` plugin attaches it as an import side effect, so
     callers cannot probe the device with ``hasattr(torch, "npu")`` alone.
+    Import failures from an installed plugin propagate to the caller.
     """
     import torch
 
     if not hasattr(torch, "npu"):
         try:
             import torch_npu  # noqa: F401  # attaches torch.npu
-        except ImportError:
+        except ModuleNotFoundError as exc:
+            if exc.name != "torch_npu":
+                raise
             return None
     return getattr(torch, "npu", None)
 

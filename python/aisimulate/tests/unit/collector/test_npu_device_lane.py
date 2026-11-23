@@ -9,6 +9,7 @@ is the branch structure: which device module a request resolves to, in which
 order the no-argument fallback probes, and which vLLM registry a host selects.
 """
 
+import builtins
 import importlib.util
 import sys
 from pathlib import Path
@@ -67,6 +68,52 @@ def test_torch_npu_module_returns_torch_npu_after_plugin_import(monkeypatch):
     npu = _device_module("npu", available=True)
     _install_torch(monkeypatch, npu=npu, npu_plugin=True)
     assert helper_mod.torch_npu_module() is npu
+
+
+@pytest.fixture(
+    params=[
+        ModuleNotFoundError("No module named 'libascend'", name="libascend"),
+        ImportError("libascend.so: cannot open shared object file"),
+    ],
+    ids=["missing-dependency", "shared-library"],
+)
+def broken_torch_npu(monkeypatch, request):
+    torch = _install_torch(monkeypatch)
+    real_import = builtins.__import__
+
+    def import_with_broken_plugin(name, *args, **kwargs):
+        if name == "torch_npu":
+            raise request.param
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_with_broken_plugin)
+    return torch, request.param
+
+
+@pytest.mark.parametrize(
+    ("probe", "args"),
+    [
+        (helper_mod.torch_npu_module, ()),
+        (helper_mod.get_device_module, ("npu:0",)),
+        (helper_mod.get_device_module, ()),
+        (helper_mod.get_device_str, ()),
+    ],
+    ids=["plugin", "explicit-device", "auto-device", "device-string"],
+)
+def test_npu_probes_propagate_broken_plugin_import(broken_torch_npu, probe, args):
+    _, import_error = broken_torch_npu
+    with pytest.raises(type(import_error)) as raised:
+        probe(*args)
+    assert raised.value is import_error
+
+
+def test_npu_context_error_reports_broken_plugin_without_probing_cuda(broken_torch_npu):
+    torch, import_error = broken_torch_npu
+    cuda_probes = []
+    torch.cuda.synchronize = lambda device: cuda_probes.append(device)
+
+    assert helper_mod.cuda_context_error("npu:0") == f"{type(import_error).__name__}: {import_error}"
+    assert cuda_probes == []
 
 
 def test_device_str_ignores_a_plugin_without_a_device(monkeypatch):
