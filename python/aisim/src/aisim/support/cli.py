@@ -413,6 +413,7 @@ _CORRECTION_PROMPTS = {
         lambda value: [int(x) for x in value.split()],
     ),
     "max_cudagraph_capture_size": ("CUDA graph capture limit for this role", int),
+    "warmup_iterations": ("Collector warm-up iterations", int),
     "framework": ("Runtime (vllm)", str),
     "tokenizer_revision": ("Pinned tokenizer revision", str),
     "chat_template_revision": ("Pinned chat-template revision", str),

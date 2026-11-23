@@ -859,8 +859,10 @@ def test_warmup_iterations_edit_after_the_probe_needs_a_fresh_probe(tmp_path, ca
 
     _, _, request, _ = _imported(tmp_path, capsys, warmup_iterations=0)
     assert verify_runtime_profile(request) is not None
-    with pytest.raises(ValueError, match="runtime-affecting draft edits require a compatible fresh probe"):
-        verify_runtime_profile(_with_warmup_iterations(request, 5))
+    # Without a count the request compares as the collector default, which differs from the 0 of the launch.
+    for other in (5, None):
+        with pytest.raises(ValueError, match="runtime-affecting draft edits require a compatible fresh probe"):
+            verify_runtime_profile(_with_warmup_iterations(request, other))
 
 
 def test_request_without_a_warmup_count_verifies_against_a_launch_with_the_default(tmp_path, capsys):
@@ -2294,6 +2296,22 @@ def test_formal_collection_and_finalization_keep_the_request_warmup_iterations(t
     assert SupportRequest.from_yaml(target / "request.yaml").collection.warmup_iterations == 0
 
 
+def test_finalized_request_with_another_warmup_count_needs_a_fresh_probe(tmp_path, capsys):
+    from aisim.support.finalization import finalize
+    from aisim.support.runtime import verify_runtime_profile
+
+    _, request, _, root = _completed_runtime_collection(tmp_path, capsys, warmup_iterations=0)
+    target = tmp_path / "finalized"
+    finalize(request, root, target)
+    finalized = SupportRequest.from_yaml(target / "request.yaml")
+    assert verify_runtime_profile(finalized) is None
+    for other in (5, None):
+        with pytest.raises(
+            ValueError, match="finalized runtime settings changed; a compatible fresh probe is required"
+        ):
+            verify_runtime_profile(_with_warmup_iterations(finalized, other))
+
+
 _DROPPED_POINTS = (
     '{"decode":{"cache_capacity":0,"candidates":97,"token_budget":16},'
     '"prefill":{"cache_capacity":0,"candidates":496,"mamba_align_split":0}}'
@@ -2327,7 +2345,7 @@ def test_onboarding_shows_the_dropped_points_of_a_generated_list(tmp_path, capsy
 
     def resolve(command):
         resolved.append(command)
-        return None, (generated,)
+        return None, (generated, {})
 
     monkeypatch.setattr(fpm, "_resolve_execution", resolve)
     assert cli.main(preview) == 0
@@ -2335,6 +2353,40 @@ def test_onboarding_shows_the_dropped_points_of_a_generated_list(tmp_path, capsy
     assert line + _DROPPED_POINTS in captured.err.splitlines()
     assert len(resolved) == 1
     assert captured.out == shlex.join(resolved[0]) + "\n"
+
+
+def test_glm_preview_shows_the_dropped_points_of_the_planned_list(tmp_path, capsys, monkeypatch):
+    from aisim.support import fpm
+
+    # The model is the local checkpoint folder of the fixture, so the planner reads no remote repository.
+    checkpoint, _, _, files = _imported(
+        tmp_path, capsys, tp=4, layout="glm_tp4", model=str(tmp_path / "model-checkpoint"), warmup_iterations=0
+    )
+    root = tmp_path / "collection"
+    assert cli.main(["onboard", "plan", "--config", files["request"], "--output-dir", str(root)]) == 0
+    state = _load(checkpoint)
+    save_checkpoint(checkpoint, patch={}, expected_revision=state.revision, accept=["tp2"])
+    capsys.readouterr()
+    preview = json.loads((root / "commands.json").read_text())["fpm_run_local"][1:]
+    preview.remove("--execute")
+    real_resolve = fpm._resolve_execution
+    plans = []
+
+    def resolve(command):
+        args, resolved = real_resolve(command)
+        plans.append(resolved[0])
+        return args, resolved
+
+    monkeypatch.setattr(fpm, "_resolve_execution", resolve)
+    assert cli.main(preview) == 0
+    captured = capsys.readouterr()
+    prefix = "Point list: candidates and dropped points by phase and rule: "
+    lines = [line for line in captured.err.splitlines() if line.startswith(prefix)]
+    assert len(lines) == 1
+    assert len(plans) == 1
+    dropped = plans[0].to_dict()["point_generation"]["dropped_points"]
+    assert set(dropped) == {"prefill", "decode"}
+    assert json.loads(lines[0].removeprefix(prefix)) == dropped
 
 
 @pytest.mark.parametrize("worker_type", ["prefill", "decode", "aggregated"])

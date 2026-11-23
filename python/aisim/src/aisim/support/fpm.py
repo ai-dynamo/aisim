@@ -220,8 +220,11 @@ def _resolve_execution(command: list[str]):
 
 
 def _report_dropped_points(plan) -> None:
-    """Show the points that each rule dropped from a generated list. Onboarding sets no log handler."""
-    dropped = getattr(plan.options, "benchmark_points_dropped_json", None)
+    """Show how many candidates a generated list had and how many points each rule dropped.
+
+    Onboarding sets no log handler.
+    """
+    dropped = plan.options.benchmark_points_dropped_json
     if dropped is not None:
         print(f"Point list: candidates and dropped points by phase and rule: {dropped}", file=sys.stderr)
 

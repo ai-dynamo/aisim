@@ -1530,3 +1530,22 @@ def test_profile_review_shows_the_collector_warmup_iterations(tmp_path, monkeypa
         assert not [line for line in review if "Collector warm-up iterations" in line]
     else:
         assert review[collection + 1] == f"  Collector warm-up iterations: {count}"
+
+
+def test_interactive_init_corrects_a_negative_warmup_count(tmp_path, monkeypatch, capsys):
+    prompts = _terminal(monkeypatch, ["0"])
+    saved = tmp_path / "request.yaml"
+    assert cli.main([*_init_args(saved), "--tensor-parallel", "1", "--warmup-iterations", "-1", "--interactive"]) == 0
+    assert prompts == ["Collector warm-up iterations [-1]: "]
+    assert "warmup_iterations: Input should be greater than or equal to 0" in capsys.readouterr().out.splitlines()
+    assert SupportRequest.from_yaml(saved).collection.warmup_iterations == 0
+
+
+def test_model_config_init_names_the_warmup_flag_of_a_negative_count(tmp_path, capsys):
+    from .test_onboard_model_config import _args as _config_args
+    from .test_onboard_model_config import _files as _config_files
+
+    source, resources = _config_files(tmp_path)
+    with pytest.raises(SystemExit):
+        cli.main(_config_args(tmp_path / "request.yaml", source, resources, warmup_iterations=-1))
+    assert "  --warmup-iterations: Input should be greater than or equal to 0" in capsys.readouterr().err.splitlines()

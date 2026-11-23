@@ -1264,16 +1264,23 @@ def test_replay_revalidates_capacity_revision_against_original_timing_collection
         workflow._check_replay(replay / "validation.json", original, collection, plan)
 
 
+@pytest.mark.parametrize(
+    "quality_case", [False, {"warmup_iterations": 0}], indirect=True, ids=["collector-default", "zero"]
+)
 def test_collection_validation_refuses_a_collection_of_another_warmup_count(quality_case, monkeypatch):
     case = quality_case
     collected = case["plan"].options.warmup_iterations
-    payload = case["request"].model_dump(mode="json")
-    payload["collection"]["warmup_iterations"] = collected + 1
-    changed = SupportRequest.model_validate(payload)
-    # The onboarding plan of the changed request would be planned again; only the source collection is compared here.
+    named = case["request"].collection.warmup_iterations
+    # A request without a count was collected with the collector default.
+    assert collected == (5 if named is None else named)
+    # The onboarding plan of a changed request would be planned again; only the source collection is compared here.
     monkeypatch.setattr(workflow, "check_plan", lambda *_: None)
     workflow._collection_source(case["request"], case["root"])
-    with pytest.raises(
-        ValueError, match="source collection runtime limits differ from the reviewed onboarding settings"
-    ):
-        workflow._collection_source(changed, case["root"])
+    others = [collected + 1] if named is None else [collected + 1, None]
+    for other in others:
+        payload = case["request"].model_dump(mode="json")
+        payload["collection"]["warmup_iterations"] = other
+        with pytest.raises(
+            ValueError, match="source collection runtime limits differ from the reviewed onboarding settings"
+        ):
+            workflow._collection_source(SupportRequest.model_validate(payload), case["root"])
