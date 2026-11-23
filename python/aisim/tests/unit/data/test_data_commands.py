@@ -748,7 +748,10 @@ def test_check_names_is_not_a_user_command(run):
         run("data", "check-names", ".")
 
 
-@pytest.mark.parametrize(("retired", "expected"), [(True, "main"), (False, SHA)])
+@pytest.mark.parametrize(
+    ("retired", "expected"),
+    [(True, {"revision": "main", "pinned_sha": SHA}), (False, {"revision": SHA, "pinned_sha": None})],
+)
 def test_fetch_hands_the_sha_only_to_the_repository_that_resolved_it(monkeypatch, tmp_path, retired, expected):
     """A retired repository's alias is followed by plan(); its successor's SHA must not go back under the old name."""
     from types import SimpleNamespace
@@ -769,7 +772,7 @@ def test_fetch_hands_the_sha_only_to_the_repository_that_resolved_it(monkeypatch
         )
 
     def fake_fetch(selection, revision, **kwargs):
-        seen.update(revision=revision, repo=kwargs["repo"])
+        seen.update(revision=revision, repo=kwargs["repo"], pinned_sha=kwargs.get("pinned_sha"))
         plan = SimpleNamespace(requested_revision=None, metadata_bytes=0)
         return SimpleNamespace(plan=plan, to_dict=lambda: {})
 
@@ -777,5 +780,5 @@ def test_fetch_hands_the_sha_only_to_the_repository_that_resolved_it(monkeypatch
     monkeypatch.setattr(data_cli, "fetch", fake_fetch)
     args = SimpleNamespace(cache_dir=str(tmp_path), offline=True, dry_run=False, no_limit=True)
     data_cli._download(Selection(category="fpm", model="m1", hardware="h200"), args, repo, "main")
-    # Under the retired name the symbolic revision is resolved again, so fetch() follows the alias itself.
-    assert seen == {"revision": expected, "repo": repo}
+    # Under the retired name fetch() follows the alias itself, for the commit the plan resolved and budgeted.
+    assert seen == {**expected, "repo": repo}

@@ -636,6 +636,7 @@ def fetch(
     max_bytes: int | None = None,
     allow_over_budget: bool = False,
     offline: bool = False,
+    pinned_sha: str | None = None,
 ) -> FetchResult:
     """Resolve once, plan, enforce the budget, then download and verify.
 
@@ -643,12 +644,17 @@ def fetch(
     nothing); a larger plan raises :class:`BudgetExceededError` before any
     artifact transfer unless ``allow_over_budget`` is set. Offline with any
     file missing raises :class:`OfflineMissingError` listing every such file.
+    ``pinned_sha`` is a commit an earlier plan already resolved for ``revision``: it is used instead of resolving
+    the revision again, while ``repo`` and ``revision`` still select the source, so a retired repository's alias and
+    its path mapping apply to a commit that belongs to the successor.
     """
     if max_bytes is not None and max_bytes < 0:
         raise ValueError("max_bytes must be non-negative")
+    if pinned_sha is not None and not _FULL_SHA.fullmatch(pinned_sha):
+        raise RevisionError(f"pinned_sha must be a full 40-hex commit SHA, got {pinned_sha!r}")
     repo, revision, transport = _resolve_source(repo, revision, transport, selection.category)
     cache = cache or Cache()
-    sha = resolve_revision(transport, repo, revision, offline=offline)
+    sha = pinned_sha or resolve_revision(transport, repo, revision, offline=offline)
     result_plan = plan(
         selection,
         repo=repo,

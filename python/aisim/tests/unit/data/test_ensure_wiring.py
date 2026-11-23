@@ -3,6 +3,7 @@
 
 """Dataset source selection reaches the native predictor, including saved init settings."""
 
+import json
 import os
 import shutil
 from dataclasses import asdict, replace
@@ -183,6 +184,28 @@ def test_the_recommendation_consumer_keeps_an_explicit_default_root_distinct_fro
     assert "default" in explicit.systems_paths
     _, unset = _sweeper_request(config.model, mode=mode)
     assert res._ensure_dataset(unset, None) == "ensured"
+
+
+def test_an_explicit_default_root_survives_native_serialization_with_an_environment_root(monkeypatch, tmp_path):
+    from importlib import resources
+
+    packaged = str(resources.files("aisim_core") / "systems")
+    environment = tmp_path / "environment"
+    environment.mkdir()
+    monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", str(environment))
+
+    def serialized(**roots):
+        config = res.ForwardPassPerfModelConfig(
+            model="m", system="h200_sxm", backend="vllm", worker_type="prefill", estimation_mode="op_level", **roots
+        )
+        return json.loads(res._forward_pass_config_json(config))["systems_paths"]
+
+    # An explicit default is the bundled data even though the environment names other roots; unset roots follow it.
+    assert serialized(systems_paths=("default",)) == [packaged]
+    assert serialized() == [str(environment)]
+    # The raw mapping form resolves once as well.
+    mapping = {"estimation_mode": "op_level", "systems_paths": ["default"]}
+    assert json.loads(res._forward_pass_config_json(mapping))["systems_paths"] == [packaged]
 
 
 def test_request_roots_keep_the_configured_order_when_an_environment_root_is_set(monkeypatch, tmp_path):

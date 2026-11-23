@@ -160,11 +160,14 @@ def _download(selection: Selection, args: argparse.Namespace, repo: str, revisio
         )
     # The plan resolved the revision; reuse the SHA so the download needs no second lookup. When the plan followed a
     # retired repository to its successor, the SHA belongs to the successor and fetch() would take it verbatim from
-    # the retired name, without the alias and its path mapping, so resolve the requested revision again instead.
+    # the retired name, without the alias and its path mapping. Keep the requested revision for the source and hand
+    # the planned commit over separately, so the download is the commit that was planned and budgeted.
     # The metadata the plan downloaded is spent: the rest of the allowance bounds the artifacts.
     remaining = None if cap is None else max(cap - planned.metadata_bytes, 0)
-    resolved_revision = planned.revision if planned.repo == repo else revision
-    result = fetch(selection, revision=resolved_revision, max_bytes=remaining, **common)
+    if planned.repo == repo:
+        result = fetch(selection, revision=planned.revision, max_bytes=remaining, **common)
+    else:
+        result = fetch(selection, revision=revision, pinned_sha=planned.revision, max_bytes=remaining, **common)
     result.plan.requested_revision = revision
     result.plan.metadata_bytes += planned.metadata_bytes
     return {"dry_run": False, **result.to_dict()}

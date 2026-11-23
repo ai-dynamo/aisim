@@ -1066,7 +1066,11 @@ def _names_systems_paths(config: ForwardPassPerfModelConfig | Mapping[str, Any])
 
 def _forward_pass_config_json(config: ForwardPassPerfModelConfig | Mapping[str, Any]) -> str:
     payload = config.to_dict() if isinstance(config, ForwardPassPerfModelConfig) else dict(config)
-    if payload.get("estimation_mode") not in {"fpm_regression", "fpm_learned"} or payload.get("systems_paths"):
+    # ``to_dict`` already resolved a typed config's roots. Resolving them again would read an explicit ``default``
+    # (now the packaged path) as an expansion of unset roots and let AICONFIGURATOR_SYSTEMS_PATH replace it.
+    if not isinstance(config, ForwardPassPerfModelConfig) and (
+        payload.get("estimation_mode") not in {"fpm_regression", "fpm_learned"} or payload.get("systems_paths")
+    ):
         # A snapshot owns its packed performance data; Rust points those paths
         # into the snapshot before it reads them.
         payload["systems_paths"] = _resolve_forward_pass_systems_paths(

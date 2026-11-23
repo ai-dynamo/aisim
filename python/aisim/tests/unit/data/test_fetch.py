@@ -235,6 +235,14 @@ def files(tmp_path):
     return build_repo(tmp_path)
 
 
+def test_fetch_uses_a_pinned_sha_without_resolving_the_symbolic_revision_again(files, tmp_path):
+    transport = FakeTransport(files, refs={"main": SHA2})  # the branch moved after the plan that resolved SHA
+    result = fetch(SEL, repo=REPO, revision="main", pinned_sha=SHA, transport=transport, cache=Cache(tmp_path / "c"))
+    assert transport.resolves == 0 and result.plan.revision == SHA
+    with pytest.raises(RevisionError, match="pinned_sha"):
+        fetch(SEL, repo=REPO, revision="main", pinned_sha="main", transport=transport, cache=Cache(tmp_path / "d"))
+
+
 def test_plan_lists_closure_and_bytes(files, tmp_path):
     t = FakeTransport(files)
     p = plan(SEL, repo=REPO, revision="main", transport=t, cache=Cache(tmp_path / "c"))
