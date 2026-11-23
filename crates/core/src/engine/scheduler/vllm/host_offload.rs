@@ -72,7 +72,9 @@ use crate::engine::kv_manager::{
     BlockRequestLease, DestinationReservation, G1Acquire, G1Manager, SourceReleaseOrder,
     SourceReuseDependency, StateHandoff,
 };
-use crate::engine::{HostOffloadObserver, KvHintSource, NativeHostOffloadConfig};
+use crate::engine::{
+    HostOffloadObserver, KvEventDomain, KvEventTier, KvHintSource, NativeHostOffloadConfig,
+};
 
 struct LoadingPrefix {
     transfer_id: TransferId,
@@ -163,7 +165,7 @@ pub(super) struct VllmHostRequestState {
     kv_hint: Option<KvHintSource>,
     /// G3 or KVCR restore rounds; the two are exclusive in v1.
     restore_rounds: RestoreRounds,
-    /// What the latest G3 staging found in G2.
+    /// What the latest G3 or KVCR staging found in G2.
     g3_held: super::g3_offload::HeldPrefix,
     next_store_block: usize,
     latest_store: Option<TransferId>,
@@ -179,6 +181,8 @@ pub(super) struct VllmHostRequestState {
     accessed_blocks: BTreeSet<usize>,
     /// With `touches_prompt`: the latest prompt touch.
     prompt_touch: Option<ReversedTouch>,
+    /// With KVCR-owned memory under LRU: the blocks its stores re-rank there.
+    kvcr_prefix: Option<super::kvcr::SharedStorePrefix>,
     /// The latest lookup's walk. A blocked queue head looks up again on
     /// every pass and reuses it while G2 and the keys being loaded are
     /// unchanged.
@@ -201,6 +205,13 @@ enum CohortWait {
     /// It found no room at this room epoch of the pool.
     NoRoomAt(u64),
     LargerThanPool,
+    /// It misses more blocks than the pool had empty or evictable, among
+    /// them `witness`, when the pool had admitted this many blocks.
+    Short {
+        missing: usize,
+        admitted: u64,
+        witness: HostBlockKey,
+    },
 }
 
 impl VllmHostRequestState {
@@ -253,6 +264,7 @@ impl VllmHostRequestState {
             lookup_pin: None,
             accessed_blocks: BTreeSet::new(),
             prompt_touch: None,
+            kvcr_prefix: None,
             hit_walk: HitWalk::default(),
             accessed_states: BTreeSet::new(),
             unstored_states: Vec::new(),
@@ -495,14 +507,21 @@ impl VllmHostOffloadAdapter {
         &mut self,
         registry: crate::engine::kvcr::SharedKvcrRegistry,
         rank: KvHintSource,
-    ) -> HostTierHandle {
-        self.kvcr = Some(super::kvcr::VllmKvcrAdapter::new(registry, rank));
-        self.host.tier_handle()
+        gpus_per_rank: usize,
+    ) -> anyhow::Result<HostTierHandle> {
+        let block_bytes = self.host.lock().block_bytes();
+        let mut kvcr = super::kvcr::VllmKvcrAdapter::new(registry, rank)
+            .with_local_g2(block_bytes, gpus_per_rank)?;
+        if self.publishes_residency {
+            kvcr.publish_local_g2();
+        }
+        self.kvcr = Some(kvcr);
+        Ok(self.host.tier_handle())
     }
 
     /// Changes whenever G3 or KVCR stages, lands or loads; drives
     /// same-timestamp retries. `None` without G3 until this rank's first KVCR
-    /// pull, so an idle KVCR schedules exactly like G2 alone.
+    /// pull or copy, so an idle KVCR schedules exactly like G2 alone.
     pub(super) fn retry_epoch(&self) -> Option<u64> {
         let kvcr_epoch = self.kvcr.as_ref().map_or(0, |kvcr| kvcr.epoch);
         (self.g3.is_some() || kvcr_epoch > 0)
@@ -611,12 +630,11 @@ impl VllmHostOffloadAdapter {
         }
         // vLLM skips a request waiting for its async connector load
         // (`WAITING_FOR_REMOTE_KVS`) without a lookup or LRU touch until the
-        // load finishes; a landing pull or H2D completion wakes it.
+        // load finishes; a landing pull, promotion or H2D completion wakes it.
         if matches!(request.load, Some(LoadState::Loading(_)))
-            || self
-                .kvcr
-                .as_ref()
-                .is_some_and(|kvcr| kvcr.is_pulling(request.owner))
+            || self.kvcr.as_ref().is_some_and(|kvcr| {
+                kvcr.is_pulling(request.owner) || kvcr.is_promoting(request.owner, now_ms)
+            })
         {
             return HostLookup::Deferred;
         }
@@ -692,15 +710,17 @@ impl VllmHostOffloadAdapter {
         {
             HostLookup::Deferred
         } else if let Some(kvcr) = kvcr
-            && let Some(source) = request.kv_hint
+            && (request.kv_hint.is_some() || kvcr.has_local_g2())
             && !request.restore_rounds.bypassed()
             && kvcr.stage(
                 &mut tier,
                 host.id(),
                 request.owner,
-                source,
+                request.kv_hint,
                 &mut request.restore_rounds,
-                &request.block_keys[base_g1_blocks..request.prompt_blocks],
+                &mut request.g3_held,
+                &mut request.kvcr_prefix,
+                (&request.block_keys[..request.prompt_blocks], base_g1_blocks),
                 request
                     .block_meta
                     .as_deref()
@@ -946,7 +966,34 @@ impl VllmHostOffloadAdapter {
         // Drain after G3 and KVCR: a promotion or pull landing in G2 above
         // publishes residency that no later deadline would otherwise deliver.
         for event in tier.take_events(client) {
-            kv_manager.publish_host_pinned_event(event);
+            let (tier, domain) = (KvEventTier::HostPinned, KvEventDomain::Worker);
+            kv_manager.publish_residency_event(event, tier, domain);
+        }
+        if let Some(kvcr) = (self.kvcr.as_mut()).filter(|kvcr| kvcr.has_local_g2()) {
+            // What KVCR holds changes here: a disk write ends, then a
+            // completed store starts its copy into KVCR-owned memory.
+            kvcr.advance_g3(&tier, now_ms);
+            for transfer in &completed {
+                if let CompletedTransfer::Store {
+                    request_id,
+                    transfer_id,
+                    blocks,
+                } = transfer
+                {
+                    kvcr.store_local(&tier, *request_id, *transfer_id, blocks, now_ms);
+                    kvcr.pin_store(&mut tier, *transfer_id, blocks);
+                }
+            }
+            // The stores whose last waiting block has its outcome. A
+            // release moves G2's room epoch, so only a real one may.
+            let unpin = kvcr.take_g2_unpins();
+            if !unpin.is_empty() {
+                tier.unpin_external(&unpin);
+            }
+            // KVCR publishes what it owns apart from the rank's G2.
+            for (tier, event) in kvcr.take_events() {
+                kv_manager.publish_residency_event(event, tier, KvEventDomain::CacheOwner);
+            }
         }
         let mut loads = Vec::new();
         for transfer in completed {
@@ -1134,13 +1181,33 @@ impl VllmHostOffloadAdapter {
         };
         let start = request.next_store_block;
         let end = end.max(start);
+        // The cohort found no room before; its first failure is on record.
+        let mut parked = false;
         if let Some(wait) = request.cohort_wait {
+            let mut tier = self.host.lock();
             // Applies due completions, as the offer it stands for would.
-            let now = self.host.lock().room_epoch(now_ms);
-            if wait == CohortWait::LargerThanPool || wait == CohortWait::NoRoomAt(now) {
+            let now = tier.room_epoch(now_ms);
+            let waits = match wait {
+                CohortWait::LargerThanPool => true,
+                CohortWait::NoRoomAt(at) => at == now,
+                // Each block that entered G2 since can be one the cohort
+                // missed; with no room at all, one block still missing is
+                // enough.
+                CohortWait::Short {
+                    missing,
+                    admitted,
+                    witness,
+                } => {
+                    let (free, entered) = (tier.free_blocks(), tier.admitted_blocks() - admitted);
+                    (free as u64).saturating_add(entered) < missing as u64
+                        || free == 0 && tier.lookup(witness) == Lookup::Miss
+                }
+            };
+            if waits {
                 return;
             }
             request.cohort_wait = None;
+            parked = true;
         }
         let window = self.hybrid.filter(|hybrid| hybrid.is_window());
         let checkpoints = window.map_or_else(Vec::new, |window| {
@@ -1182,6 +1249,19 @@ impl VllmHostOffloadAdapter {
         }
         if missing_indices.is_empty() && checkpoints.is_empty() {
             request.next_store_block = end;
+            return;
+        }
+        // A parked cohort that still misses more blocks than G2 has empty or
+        // evictable ones cannot fit; it stays parked without being prepared.
+        if parked
+            && (self.kvcr.as_ref()).is_some_and(|kvcr| kvcr.has_local_g2())
+            && tier.free_blocks() < missing_indices.len()
+        {
+            request.cohort_wait = Some(CohortWait::Short {
+                missing: missing_indices.len(),
+                admitted: tier.admitted_blocks(),
+                witness: request.block_keys[missing_indices[0]],
+            });
             return;
         }
         // A cohort of checkpoints alone copies no token block from G1.
@@ -1244,6 +1324,23 @@ impl VllmHostOffloadAdapter {
                     } else {
                         CohortWait::NoRoomAt(tier.room_epoch(now_ms))
                     });
+                } else if !structurally_unfittable
+                    && (self.kvcr.as_ref()).is_some_and(|kvcr| kvcr.has_local_g2())
+                {
+                    // Stores being copied into KVCR-owned memory stay pinned
+                    // and can leave G2 no room for as long as a copy takes.
+                    // A cohort that misses more blocks than G2 has empty or
+                    // evictable ones cannot fit until that changes.
+                    let missing = missing_indices.len();
+                    request.cohort_wait = Some(if tier.free_blocks() < missing {
+                        CohortWait::Short {
+                            missing,
+                            admitted: tier.admitted_blocks(),
+                            witness: request.block_keys[missing_indices[0]],
+                        }
+                    } else {
+                        CohortWait::NoRoomAt(tier.room_epoch(now_ms))
+                    });
                 }
             }
             StoreOutcome::Prepared {
@@ -1283,6 +1380,16 @@ impl VllmHostOffloadAdapter {
                     });
                 }
                 request.latest_store = Some(transfer_id);
+                if let Some(kvcr) = &mut self.kvcr {
+                    // Up to the last block the store copies.
+                    if let Some(last) = missing_indices.last() {
+                        kvcr.expect_store(
+                            transfer_id,
+                            &mut request.kvcr_prefix,
+                            &request.block_keys[..=*last],
+                        );
+                    }
+                }
                 request.next_store_block = resume;
                 if rules.touches_prompt {
                     if let Some(touch) = &mut request.prompt_touch {
@@ -1395,6 +1502,16 @@ impl VllmHostOffloadAdapter {
     ) {
         if let Some(pinned) = request.lookup_pin.take() {
             self.host.lock().unpin_external(&pinned);
+        }
+        if let Some(kvcr) = &mut self.kvcr {
+            // vLLM re-ranks only the blocks the request processed: none for
+            // a request dropped while it waited (`on_request_finished`).
+            let processed = request.prompt_blocks.min(computed_tokens / block_size);
+            kvcr.align_local(
+                request.kvcr_prefix.as_ref(),
+                &request.block_keys[..processed],
+            );
+            kvcr.forget_promotions(request.owner);
         }
         if self.rules.stores_at_finish {
             // Everything computed is confirmed once the request leaves.
@@ -1600,7 +1717,9 @@ mod tests {
     use crate::engine::kv_manager::NativeAllocation;
     use crate::engine::scheduler::vllm::core::VllmCore;
     use crate::engine::trace::TraceCollector;
-    use crate::engine::{G2Connector, HostOffloadObservation, HostOffloadObservationData};
+    use crate::engine::{
+        G2Connector, HostOffloadObservation, HostOffloadObservationData, KvEventData,
+    };
 
     fn adapter(capacity_blocks: usize) -> VllmHostOffloadAdapter {
         VllmHostOffloadAdapter::new(
@@ -2415,6 +2534,7 @@ mod tests {
                 session_id: Some("producer-session".into()),
             }),
             tier: KvEventTier::HostPinned,
+            domain: KvEventDomain::Worker,
         };
         for producer_publishes in [true, false] {
             let binding = G2Binding {
@@ -2474,6 +2594,21 @@ mod tests {
         host: Option<NativeHostOffloadConfig>,
         waves: &[&[&[u32]]],
     ) -> (Vec<Vec<crate::engine::KvEvent>>, Vec<usize>) {
+        let (events, host_reused, _) = served_kvcr_events(host, None, waves);
+        (events, host_reused)
+    }
+
+    /// [`served_kv_events`] for a rank that also joins a KVCR pool of its
+    /// own; returns the pool's counters too.
+    fn served_kvcr_events(
+        host: Option<NativeHostOffloadConfig>,
+        kvcr: Option<crate::engine::KvcrConfig>,
+        waves: &[&[&[u32]]],
+    ) -> (
+        Vec<Vec<crate::engine::KvEvent>>,
+        Vec<usize>,
+        Option<crate::engine::KvcrStats>,
+    ) {
         let args = MockEngineArgs::builder()
             .num_gpu_blocks(4)
             .block_size(4)
@@ -2484,6 +2619,18 @@ mod tests {
             .build()
             .unwrap();
         let mut core = VllmCore::new_with_worker_rank(args, 0, 0, 0, true, None).unwrap();
+        let registry = kvcr.map(|config| {
+            let registry = crate::engine::kvcr::KvcrRegistry::new(config);
+            let rank = KvHintSource {
+                worker_id: 0,
+                dp_rank: 0,
+            };
+            let g2 = core.set_kvcr(Arc::clone(&registry), rank, 1).unwrap();
+            let mut pool = registry.lock().unwrap();
+            pool.register_worker(0, vec![g2], 1).unwrap();
+            drop(pool);
+            registry
+        });
         let (mut now_ms, mut next_uuid) = (0.0, 0u128);
         let mut host_reused = Vec::new();
         let events = waves
@@ -2500,7 +2647,7 @@ mod tests {
                     });
                 }
                 let mut events = Vec::new();
-                for _ in 0..8 {
+                for _ in 0..12 {
                     if core.is_ready() {
                         let pass = core.execute_pass(&mut TraceCollector::default(), now_ms);
                         now_ms = pass.end_ms;
@@ -2523,7 +2670,199 @@ mod tests {
                 panic!("wave did not drain")
             })
             .collect();
-        (events, host_reused)
+        let stats = registry.map(|registry| registry.lock().unwrap().stats());
+        (events, host_reused, stats)
+    }
+
+    /// The residency changes of `tier` among `events`, in order.
+    fn residency(
+        events: &[Vec<crate::engine::KvEvent>],
+        (tier, domain): (KvEventTier, KvEventDomain),
+    ) -> Vec<(&'static str, Vec<u64>)> {
+        let of_tier =
+            (events.iter().flatten()).filter(|event| event.tier == tier && event.domain == domain);
+        of_tier
+            .map(|event| match &event.data {
+                KvEventData::Stored(stored) => (
+                    "stored",
+                    stored.blocks.iter().map(|block| block.block_hash).collect(),
+                ),
+                KvEventData::Removed { block_hashes } => ("removed", block_hashes.clone()),
+            })
+            .collect()
+    }
+
+    /// The domain of what a rank's KVCR store holds.
+    const KVCR: KvEventDomain = KvEventDomain::CacheOwner;
+
+    /// The residency changes of a one-block cache that holds `blocks` in turn.
+    fn one_at_a_time(blocks: &[u64]) -> Vec<(&'static str, Vec<u64>)> {
+        let mut changes = vec![("stored", vec![blocks[0]])];
+        for pair in blocks.windows(2) {
+            changes.extend([("removed", vec![pair[0]]), ("stored", vec![pair[1]])]);
+        }
+        changes
+    }
+
+    #[test]
+    fn kvcr_disk_takes_what_memory_evicts_and_publishes_its_own_tier() {
+        use crate::engine::{
+            KvcrConfig, KvcrG3Config, KvcrG3Stats, KvcrLocalG2Config, KvcrLocalG2Stats,
+        };
+        // One-block prompts A X Y Z W, X again, then V, on a one-block G2,
+        // two blocks of KVCR memory and two of disk. Each prompt is served
+        // alone, so a disk that takes time, the default, gives the same
+        // result as one that takes none: the rank comes back for each write.
+        let prompts: Vec<Vec<u32>> = [1, 11, 21, 31, 41, 11, 51]
+            .iter()
+            .map(|first| (*first..first + 5).collect())
+            .collect();
+        let waves: Vec<Vec<&[u32]>> = prompts.iter().map(|prompt| vec![&prompt[..]]).collect();
+        let waves: Vec<&[&[u32]]> = waves.iter().map(|wave| &wave[..]).collect();
+        let host = Some(NativeHostOffloadConfig::new(1).with_bandwidths(1.0, 1.0));
+        let [a, x, y, z, w, _, v] = [0, 1, 2, 3, 4, 5, 6].map(|index: usize| {
+            let (_, _, host) = request(Uuid::nil(), prompts[index].clone());
+            host.block_keys[0].sequence_hash()
+        });
+        let timed = KvcrG3Config::new(2);
+        let instant = KvcrG3Config {
+            latency_to_first_byte_ms: 0.0,
+            read_bandwidth_gbps: 0.0,
+            write_bandwidth_gbps: 0.0,
+            ..timed.clone()
+        };
+        for g3 in [instant, timed] {
+            let kvcr = KvcrConfig {
+                local_g2: Some(KvcrLocalG2Config::new(2)),
+                g3: Some(g3),
+                ..Default::default()
+            };
+            let (events, host_reused, stats) = served_kvcr_events(host.clone(), Some(kvcr), &waves);
+            // X is read from disk into G2 and loaded from there.
+            assert_eq!(host_reused, vec![0, 0, 0, 0, 0, 4, 0]);
+            // Memory writes its least recently used block when a third arrives;
+            // a full disk drops A, then Y, which X's second request outranks.
+            let (stored, removed) = (
+                |hash| ("stored", vec![hash]),
+                |hash| ("removed", vec![hash]),
+            );
+            assert_eq!(
+                residency(&events, (KvEventTier::Disk, KVCR)),
+                [
+                    stored(a),
+                    stored(x),
+                    removed(a),
+                    stored(y),
+                    removed(y),
+                    stored(z)
+                ]
+            );
+            // KVCR-owned memory is the cache owner's host memory: a block
+            // enters when its copy ends and leaves once it is on disk.
+            assert_eq!(
+                residency(&events, (KvEventTier::HostPinned, KVCR)),
+                [
+                    stored(a),
+                    stored(x),
+                    removed(a),
+                    stored(y),
+                    removed(x),
+                    stored(z),
+                    removed(y),
+                    stored(w),
+                    removed(z),
+                    stored(v),
+                ]
+            );
+            // The worker's host memory is G2 alone, which holds the latest
+            // prompt. X comes back into it from disk and is dropped for V.
+            assert_eq!(
+                residency(&events, (KvEventTier::HostPinned, KvEventDomain::Worker)),
+                one_at_a_time(&[a, x, y, z, w, x, v])
+            );
+            let stats = stats.unwrap();
+            // The names the report and the event stream serialize.
+            let report = serde_json::to_value(&stats).unwrap();
+            assert_eq!(report["g3"]["stored_blocks"], 4);
+            assert_eq!(serde_json::to_value(KvEventTier::Disk).unwrap(), "disk");
+            assert_eq!(serde_json::to_value(KVCR).unwrap(), "cache_owner");
+            assert_eq!(
+                stats.local_g2,
+                Some(KvcrLocalG2Stats {
+                    stored_blocks: 6,
+                    dropped_blocks: 0,
+                    evicted_blocks: 4,
+                    promoted_blocks: 0,
+                    loaded_blocks: 1,
+                })
+            );
+            assert_eq!(
+                stats.g3,
+                Some(KvcrG3Stats {
+                    stored_blocks: 4,
+                    evicted_blocks: 2,
+                    read_blocks: 1,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn kvcr_memory_restores_what_g2_evicted_and_publishes_as_a_cache_owner() {
+        use crate::engine::{KvcrConfig, KvcrLocalG2Config, KvcrLocalG2Stats};
+        // One-block prompts A X Y Z W, A again, then V: a one-block G2 keeps
+        // only the latest, five blocks of KVCR memory keep the rest.
+        let prompts: Vec<Vec<u32>> = [1, 11, 21, 31, 41, 1, 51]
+            .iter()
+            .map(|first| (*first..first + 5).collect())
+            .collect();
+        let waves: Vec<Vec<&[u32]>> = prompts.iter().map(|prompt| vec![&prompt[..]]).collect();
+        let waves: Vec<&[&[u32]]> = waves.iter().map(|wave| &wave[..]).collect();
+        let host = || Some(NativeHostOffloadConfig::new(1).with_bandwidths(1.0, 1.0));
+        let block = |index: usize| {
+            let (_, _, host) = request(Uuid::nil(), prompts[index].clone());
+            host.block_keys[0].sequence_hash()
+        };
+
+        // G2 alone has dropped A by the time it returns.
+        let (_, host_reused) = served_kv_events(host(), &waves);
+        assert_eq!(host_reused, vec![0; 7]);
+
+        let kvcr = KvcrConfig {
+            local_g2: Some(KvcrLocalG2Config::new(5)),
+            ..Default::default()
+        };
+        let (events, host_reused, stats) = served_kvcr_events(host(), Some(kvcr), &waves);
+        // A is promoted from KVCR memory into G2 and loaded from there.
+        assert_eq!(host_reused, vec![0, 0, 0, 0, 0, 4, 0]);
+        let (stored, removed) = (
+            |index| ("stored", vec![block(index)]),
+            |index| ("removed", vec![block(index)]),
+        );
+        // KVCR memory publishes a block when its copy ends. X, the least
+        // recently used block there once V arrives, is its only removal.
+        let mut expected: Vec<_> = [0, 1, 2, 3, 4].map(stored).into();
+        expected.extend([removed(1), stored(6)]);
+        assert_eq!(
+            residency(&events, (KvEventTier::HostPinned, KVCR)),
+            expected
+        );
+        // The worker's host memory is G2 alone: each prompt replaces the one
+        // before it, A the second time through its promotion.
+        assert_eq!(
+            residency(&events, (KvEventTier::HostPinned, KvEventDomain::Worker)),
+            one_at_a_time(&[0, 1, 2, 3, 4, 0, 6].map(block))
+        );
+        assert_eq!(
+            stats.unwrap().local_g2,
+            Some(KvcrLocalG2Stats {
+                stored_blocks: 6,
+                dropped_blocks: 0,
+                evicted_blocks: 1,
+                promoted_blocks: 1,
+                loaded_blocks: 1,
+            })
+        );
     }
 
     #[test]
@@ -2932,7 +3271,9 @@ mod tests {
         });
         let adapters = [0, 1].map(|index| {
             let mut adapter = adapter(blocks[index]);
-            let g2 = adapter.set_kvcr(Arc::clone(&registry), ranks[index]);
+            let g2 = adapter
+                .set_kvcr(Arc::clone(&registry), ranks[index], 1)
+                .unwrap();
             registry
                 .lock()
                 .unwrap()
@@ -2948,6 +3289,7 @@ mod tests {
         let config = crate::engine::KvcrConfig {
             latency_to_first_byte_ms: 1.0,
             bandwidth_gbps: 1.0,
+            ..Default::default()
         };
         // Worker 1 pulls from worker 0.
         let (registry, ranks, [mut source, mut target]) = kvcr_workers(config, [4, 4]);
@@ -3014,6 +3356,7 @@ mod tests {
         let config = crate::engine::KvcrConfig {
             latency_to_first_byte_ms: 0.0,
             bandwidth_gbps: 0.0,
+            ..Default::default()
         };
         // A pull never evicts its own prefix, but the target's one-block G2
         // holds only one of two one-block prefixes, so each request's pull
@@ -3068,6 +3411,7 @@ mod tests {
         let config = crate::engine::KvcrConfig {
             latency_to_first_byte_ms: 1.0,
             bandwidth_gbps: 0.0,
+            ..Default::default()
         };
         let (registry, ranks, [mut source, mut target]) = kvcr_workers(config, [4, 4]);
         let owner = Uuid::from_u128(915);
@@ -3117,6 +3461,7 @@ mod tests {
         let config = crate::engine::KvcrConfig {
             latency_to_first_byte_ms: 0.0,
             bandwidth_gbps: 0.0,
+            ..Default::default()
         };
         let (registry, ranks, [mut source, mut target]) = kvcr_workers(config, [2, 2]);
         let owner = Uuid::from_u128(913);
@@ -3149,7 +3494,10 @@ mod tests {
             StartLoad::Retry
         ));
         assert_eq!(registry.lock().unwrap().stats().loaded_blocks, 0);
-        assert_eq!(target.host.lock().take_kvcr_origin(&host.block_keys), 1);
+        assert_eq!(
+            target.host.lock().take_kvcr_origin(&host.block_keys),
+            [1, 0]
+        );
     }
 
     #[test]
