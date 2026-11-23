@@ -5981,9 +5981,10 @@ fn full_attention_keys_of_several_groups_wait_for_the_scheduler_block() {
         // scheduler block of 16. No state group has a block above the hash
         // block of 4, so hits stay on multiples of 16, and a prompt of 22
         // tokens caches 16 tokens: the full key 16 and no entry at the
-        // partial tail, 20. A longer prompt that shares the 22 tokens hits
-        // 16. vLLM's scheduler gives these keys and this hit at v0.31.0,
-        // v0.32.0 and v0.33.0.
+        // partial tail, 20. A longer prompt that shares the 22 tokens hits 16.
+        // These keys and this hit are derived from the rules above and from
+        // vLLM's lookup, which skips a group that is not prefix-cacheable
+        // (v0.31.0 coord:748-749, v0.32.0 :719-720, v0.33.0 :729-730).
         let ringed = [attention("full", 16, None), state("ring", 4, false, false)];
         let (request, longer) = (lease(22, 4), extended(22, 20, 4));
         let (keys, hit) = keys_and_hit(&ringed, 4, version, (&request, 22), (&longer, 42));
@@ -5994,8 +5995,8 @@ fn full_attention_keys_of_several_groups_wait_for_the_scheduler_block() {
         // tokens on the groups of 64 and 16 tokens cache 64 tokens, so the
         // keys are 64 and 16 to 64, and the partial tail, 112 at every
         // version (127 / 16 * 16 and 126 / 16 * 16), gets no entry. A longer
-        // prompt that shares the 127 tokens hits 64. vLLM's scheduler gives
-        // these keys and this hit at v0.31.0, v0.32.0 and v0.33.0.
+        // prompt that shares the 127 tokens hits 64. These keys and this hit
+        // are derived from the same rules.
         let (request, longer) = (lease(127, hash), extended(127, 73, hash));
         let (keys, hit) = keys_and_hit(&groups, hash, version, (&request, 127), (&longer, 200));
         assert_eq!(keys, [vec![64], narrow(64)], "{version:?}");
@@ -6010,8 +6011,8 @@ fn full_attention_keys_of_several_groups_wait_for_the_scheduler_block() {
         // 24 tokens and leaves the keys 8, 16 and 24; its partial tail, 28
         // at every version (30 / 4 * 4 and 29 / 4 * 4), lies above 24 and
         // gets no entry. A longer prompt that shares the 30 tokens hits 24.
-        // vLLM's scheduler gives these keys and these hits at v0.31.0,
-        // v0.32.0 and v0.33.0.
+        // These keys and these hits are derived from the same rules and the
+        // scheduler block of 24.
         let ringed = [attention("full", 8, None), state("ring", 3, false, false)];
         for (prompt, expected, expected_hit) in [(22, vec![], 0), (30, vec![8, 16, 24], 24)] {
             let (request, longer) = (lease(prompt, 4), extended(prompt, 20, 4));
@@ -6036,9 +6037,14 @@ fn full_attention_keys_of_several_groups_wait_for_the_scheduler_block() {
         // :65-86, v0.33.0 :65-86) rounded down to the scheduler block, here
         // 16, so its key is 16 too. A prompt of 70 tokens caches 64 tokens: the
         // full-attention keys 16 to 64 and no entry at the partial tail, 68,
-        // and the window key at the replay boundary 64. vLLM's scheduler
-        // gives these keys at v0.31.0, v0.32.0 and v0.33.0, and a longer
-        // prompt hits 16 and 64.
+        // and the window key at the replay boundary 64. These keys and the hits
+        // 16 and 64 of a longer prompt are derived from the rules above and
+        // from the retention of a window group: at the default retention
+        // interval 0 (v0.31.0 config/cache.py:160, v0.32.0 :159, v0.33.0 :275)
+        // it keeps only the cdiv(4 - 1, 4) = 1 block that ends at the replay
+        // boundary rounded down to the scheduler block (v0.31.0 single:961-971,
+        // :1072-1151, v0.32.0 :943-953, :1054-1133, v0.33.0 :956-966,
+        // :1067-1146).
         let windowed = [attention("full", 16, None), attention("window", 4, Some(4))];
         for (prompt, full, window) in [
             (22, vec![16], vec![16]),

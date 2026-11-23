@@ -6623,10 +6623,10 @@ fn grouped_decode_rank_frees_the_previous_state_block_of_a_load_on_the_processed
     // block goes: 4. With async scheduling the second pass is formed while the
     // first is in flight, so it has the processed count 32 and holds the block
     // one step longer (v0.31 kv_cache_manager.py:549-556, v0.32 :552-559, v0.33
-    // :561-568): 5. The third pass has the count 33 and frees it: 4. vLLM's
-    // scheduler, run with the scheduler side of its NIXL connector, holds 2
-    // state blocks per group of the GLM groups during 2 calls with async
-    // scheduling and during 1 call with one batch.
+    // :561-568): 5. The third pass has the count 33 and frees it: 4. So vLLM
+    // holds 2 state blocks of a group during 2 `schedule()` calls with async
+    // scheduling and during 1 call with one batch (derived from the rule
+    // above).
     for (max_concurrent_batches, expected) in [(1, [5, 4, 4]), (2, [5, 5, 4])] {
         let mut args = prefix_core(full_and_state_transfer_groups(), 800, 8192, 16, "0.31.0").args;
         args.worker_type = WorkerType::Decode;
@@ -7110,11 +7110,12 @@ fn grouped_prefill_rank_stops_a_source_behind_the_pass_in_flight_and_preempts_no
     // and no pass stops. With one batch the processed count is the computed
     // count, and no pass stops either.
     for version in ["0.31.0", "0.32.0", "0.33.0"] {
-        // vLLM's scheduler, run with the scheduler side of its NIXL connector
-        // at v0.31.0, v0.32.0 and v0.33.0, gives these rows: its running loop
-        // stops in the `schedule()` calls 3, 5, 7 and 9 (and 11 with a hash
-        // block of 1,088), uses 6, 11, 11, 12, 12, 13, 13, 14, 14 and 15
-        // blocks, and preempts nothing.
+        // Derived from the rules above, the same at v0.31.0, v0.32.0 and
+        // v0.33.0: with a hash block of 2,176 vLLM's running loop stops in the
+        // `schedule()` calls 3, 5, 7 and 9, uses 6, 11, 11, 12, 12, 13, 13, 14,
+        // 14 and 15 blocks, and preempts nothing. Replay gives the row of a
+        // hash block of 1,088: its last chunks end at 11,968 and 11,999, and
+        // its pass 10 stops too.
         let (computed, peaks, retries, preemptions) = lone_glm_source(version, false, 2176, 15, 2);
         assert_eq!(
             computed,
@@ -7138,8 +7139,7 @@ fn grouped_prefill_rank_stops_a_source_behind_the_pass_in_flight_and_preempts_no
         assert_eq!(retries, [2, 4, 6, 8, 10], "{version}");
         assert_eq!(preemptions, 0, "{version}");
 
-        // The same run with one batch: no stop, no preemption, 2 state blocks
-        // per group.
+        // With one batch: no stop, no preemption, 2 state blocks per group.
         for (hash, expected) in [
             (2176, vec![2176, 4352, 6528, 8704, 10_880, 11_999]),
             (1088, vec![2176, 4352, 6528, 8704, 10_880, 11_968, 11_999]),
@@ -7149,9 +7149,9 @@ fn grouped_prefill_rank_stops_a_source_behind_the_pass_in_flight_and_preempts_no
             assert_eq!((retries, preemptions), (Vec::new(), 0), "{version} {hash}");
         }
         if version != "0.31.0" {
-            // The same run with a checkpoint block at v0.32.0 and v0.33.0: pool
-            // 19, no stop, no preemption, 3 state blocks per group, 6, 11, 16,
-            // 17, 18 and 19 blocks in use.
+            // With a checkpoint block at v0.32.0 and v0.33.0: pool 19, no stop,
+            // no preemption, 3 state blocks per group, 6, 11, 16, 17, 18 and 19
+            // blocks in use.
             let (computed, peaks, retries, preemptions) =
                 lone_glm_source(version, true, 2176, 19, 2);
             assert_eq!(
@@ -7259,10 +7259,13 @@ fn grouped_decode_rank_stops_a_request_that_the_pass_in_flight_runs_and_preempts
     // either: with R0 ended its blocks are free and R1 fits, and with R0
     // running R1 is preempted in that pass.
     let stop = (None, Some(2176), 0, true);
-    // vLLM's scheduler, run with the scheduler side of its NIXL connector
-    // at v0.31.0, v0.32.0 and v0.33.0, stops in `schedule()` call 5,
-    // preempts nothing and uses 7, 12, 12, 14, 14, 11, 16 and 12 blocks
-    // in calls 1 to 8.
+    // Derived from the rules above, from the free on the processed count (v0.31
+    // kv_cache_manager.py:549-556, v0.32 :552-559, v0.33 :561-568) and from the
+    // rule that does not schedule a request whose step in flight reaches its
+    // `max_tokens` (v0.31 sched:635-649, v0.32 sched:664-678, v0.33
+    // sched:800-814), the same at v0.31.0, v0.32.0 and v0.33.0: vLLM stops in
+    // `schedule()` call 5, preempts nothing and uses 7, 12, 12, 14, 14, 11, 16
+    // and 12 blocks in calls 1 to 8.
     let (rows, peaks) = two_glm_requests(WorkerType::Decode, 2, 3, &[]);
     assert_eq!(
         rows,
@@ -7280,12 +7283,10 @@ fn grouped_decode_rank_stops_a_request_that_the_pass_in_flight_runs_and_preempts
     );
     assert_eq!(peaks[..7], [7, 12, 12, 14, 14, 11, 16]);
 
-    // The same run at v0.33.0 with R0 ending on a stop token as its output
-    // 4 while step 6 runs it stops in call 5, preempts R1 in call 6 at
-    // 2,176 computed tokens, and uses 14, 14 and 8 blocks after calls 4
-    // to 6 and 14, 11 and 16 in calls 7 to 9. vLLM defers that free until
-    // step 6 ends. Here R0 ends at its output limit in pass 5, which holds
-    // its blocks for the same passes.
+    // Derived from the same rules, with R0 running through pass 5: vLLM stops
+    // in call 5, preempts R1 in call 6 at 2,176 computed tokens, and has 14, 14
+    // and 8 blocks in use after calls 4 to 6. Replay gives 14, 11 and 16 blocks
+    // in use in the passes 6 to 8, where R1 runs again.
     let (rows, peaks) = two_glm_requests(WorkerType::Decode, 2, 5, &[]);
     assert_eq!(
         rows[3..9],
@@ -7300,8 +7301,9 @@ fn grouped_decode_rank_stops_a_request_that_the_pass_in_flight_runs_and_preempts
     );
     assert_eq!(peaks[3..9], [14, 14, 14, 14, 11, 16]);
 
-    // vLLM's scheduler without a connector, at the three versions,
-    // preempts R1 in call 5 at 2,176 computed tokens.
+    // Without a connector vLLM sets no deferred free (v0.31 sched:175-181,
+    // v0.32 sched:186-192, v0.33 sched:193-195), so it preempts R1 in call 5 at
+    // 2,176 computed tokens.
     let (rows, _) = two_glm_requests(WorkerType::Aggregated, 2, 3, &[]);
     assert_eq!(
         rows[3..6],
@@ -8291,9 +8293,10 @@ fn grouped_output_tokens_fill_cached_full_attention_blocks_that_the_next_turn_hi
                     drain_async_passes(&mut core, &mut now);
                     let turn_two = next_turn_tokens(&prompt, output, 3000, 10);
                     // The cached positions after turn 1 are 32 and 64: two
-                    // blocks. vLLM's scheduler, run on its own code at the
-                    // three tags with one batch and with two, gives these
-                    // keys for 30, 25 and 26 output tokens.
+                    // blocks, for 30, 25 and 26 output tokens, with one batch
+                    // and with two (derived from the rules above: turn 1
+                    // computes 64 tokens or more, and vLLM caches every full
+                    // block of them).
                     for g in 0..groups as u16 {
                         for at in [32, 64] {
                             assert!(
@@ -8317,12 +8320,12 @@ fn grouped_output_tokens_fill_cached_full_attention_blocks_that_the_next_turn_hi
                         .iter()
                         .map(|admission| (admission.uuid, admission.reused_input_tokens))
                         .collect();
-                    // Turn 2 hits 64 tokens with no junction, as in the same
-                    // runs of vLLM's scheduler.
+                    // Turn 2 hits 64 tokens with no junction: the two cached
+                    // blocks.
                     assert_eq!(admissions, [(second, 64)], "{case}");
                     // cdiv(80, 32) = 3 blocks in each group, two of them the
-                    // hit. vLLM's first allocation of turn 2 takes 3 blocks
-                    // of its one group in those runs.
+                    // hit. vLLM's first allocation of turn 2 takes the same 3
+                    // blocks of its one group (derived from the rule).
                     assert_eq!(block_pool(&core).peak_active_blocks(), 3 * groups, "{case}");
                     drain_async_passes(&mut core, &mut now);
                     // The 80 computed tokens of turn 2 fill no third block:
@@ -8368,9 +8371,9 @@ fn grouped_output_token_block_gets_its_key_in_the_pass_that_fills_it() {
     // difference from vLLM with async scheduling.
     for version in ["0.31.0", "0.32.0", "0.33.0"] {
         for batches in [1usize, 2] {
-            // 32 before the filling pass, 64 in it. With one batch vLLM's
-            // scheduler, run on its own code, has the key at 64 when the
-            // schedule() call that fills the block returns. With two batches
+            // 32 before the filling pass, 64 in it. With one batch vLLM has the
+            // key at 64 when the schedule() call that fills the block returns
+            // (derived from the rule above). With two batches
             // the row of pass 24 pins replay's 64, and vLLM's value there is
             // 32: vLLM has the key one step later, so a request that it
             // admits in the filling step hits 32.
@@ -8509,14 +8512,18 @@ fn grouped_glm_shaped_next_turn_gets_a_junction_where_output_tokens_filled_a_blo
         for batches in [1, 2] {
             // (output tokens of turn 1, cached blocks after turn 1, junction
             // of turn 2, cached blocks after turn 2).
-            // vLLM's scheduler, run on its own code at the three tags with
-            // one batch and with two, with and without a checkpoint block,
-            // gives these rows. 400: one cached full-attention block after
-            // turn 1; turn 2 hits 0 with the junction 2,176 and the chunks
-            // 2,176 and 324; then two full-attention blocks hold the key at
-            // 2,176 and each of the four Mamba groups one. 100: no key after
-            // turn 1; turn 2 hits 0 with no junction and the chunks 2,176 and
-            // 24; then one full-attention block and four states.
+            // Derived from the rules above, the same at the three versions with
+            // one batch and with two: turn 1 leaves one cached full-attention
+            // block with 400 output tokens and none with 100. Replay gives the
+            // rest of the rows, with and without a checkpoint block. 400: no
+            // Mamba state after turn 1; turn 2 hits 0 with the junction 2,176
+            // and the chunks 2,176 and 324; then two full-attention blocks hold
+            // the key at 2,176 and each of the four Mamba groups one. 100: turn
+            // 2 hits 0 with no junction and the chunks 2,176 and 24; then one
+            // full-attention block and four states. Replay keeps a Mamba state
+            // only at the replay boundary and at a junction, the rule of vLLM's
+            // default retention (v0.31 single:1567-1624, v0.32 :1533-1590,
+            // v0.33 :1549-1606).
             for (output, cached_one, junction, cached_two) in [(400, 1, 2176, 6), (100, 0, 0, 5)] {
                 let case = format!("{version} {checkpoint} batches {batches} output {output}");
                 let mut core = batches_core(
@@ -8674,12 +8681,11 @@ fn grouped_block_with_the_partial_tail_key_gets_its_block_key_when_output_tokens
         /// The junction of the next turn, in tokens past its hit.
         junction: usize,
     }
-    // vLLM's scheduler, run on its own code at the three tags with one
-    // batch and with two, gives the rows of A and B: for 21 prompt tokens
-    // one block with the keys 32 and 20 and the state at 20, B hits 20 with
-    // no junction and its first allocation takes 5 blocks; for 45 prompt
-    // tokens the blocks 32 and 64 + 44 and the states at 32 and 44, B hits
-    // 44 with no junction and takes 6 blocks. The junctions of the next
+    // Replay gives the rows of A and B, with one batch and with two: for 21
+    // prompt tokens one block with the keys 32 and 20 and the state at 20, B
+    // hits 20 with no junction and its first allocation takes 5 blocks; for 45
+    // prompt tokens the blocks 32 and 64 + 44 and the states at 32 and 44, B
+    // hits 44 with no junction and takes 6 blocks. The junctions of the next
     // turn, 32 - 20 and 64 - 44 tokens past the hit, follow from the
     // full-attention lookup.
     let rows = [
@@ -9024,10 +9030,9 @@ fn grouped_block_after_the_partial_tail_block_and_a_prompt_block_get_their_block
             // vLLM 0.32.0 and 0.33.0: the partial tail 60 lies inside the
             // block that ends at 64. One chunk computes the prompt, as the
             // checkpoint block exports the state at 60 (v0.32 sched:488-501,
-            // v0.33 sched:593-606). The prompt fills that block, so it gets
-            // its block key.
-            // vLLM's scheduler, run on its own code at 0.32.0 and 0.33.0
-            // with a checkpoint block, gives that block the key at 64.
+            // v0.33 sched:593-606). The prompt fills that block, so it gets its
+            // block key (v0.32 block_pool.py:286-299, v0.33
+            // block_pool.py:290-303).
             if version == "0.31.0" {
                 continue;
             }

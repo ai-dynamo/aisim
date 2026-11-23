@@ -649,17 +649,18 @@ fn grouped_prefix_state_block_below_the_attention_block_completes_at_the_startup
     // blocks, the hash block 2 and max_model_len 16: vLLM's startup count is
     // cdiv(16, 8) = 2 attention blocks and 2 state blocks, 4 (v0.31
     // kv_cache_interface.py:1083-1094, v0.32 :1076-1082, v0.33 :1135-1141).
-    // Two prompts of 8 and 14 tokens with 2 output tokens each arrive at 0
-    // ms, with a budget of 3 tokens. Run on its own scheduler code at
-    // v0.31.0, v0.32.0 and v0.33.0 with two batches and this pool, vLLM
-    // starves the second request: each life hits 8 tokens, computes 8 to 10,
-    // and preempts itself, because the block of the state at 8 goes only on
-    // the processed count (v0.31 kv_cache_manager.py:549-556, v0.32
-    // :552-559, v0.33 :561-568) and the next chunk needs a third state
-    // block. In this layout replay frees that block on the computed count,
-    // one step earlier than vLLM, so both requests complete without a
-    // preemption, as they do in vLLM with one batch. The cap of 10 s of
-    // simulated time bounds the run.
+    // Two prompts of 8 and 14 tokens with 2 output tokens each arrive at 0 ms,
+    // with a budget of 3 tokens. By vLLM's rules at v0.31.0, v0.32.0 and
+    // v0.33.0, with two batches and this pool a life of the second request that
+    // has passed token 8 preempts itself (derived from the rules): it holds 2
+    // attention blocks and 2 state blocks, the whole pool, so it is the only
+    // running request, and the block of a state that it has left goes only on
+    // the processed count (v0.31 kv_cache_manager.py:549-556, v0.32 :552-559,
+    // v0.33 :561-568), so a chunk behind its step in flight needs a third state
+    // block, 5 blocks in a pool of 4. In this layout replay frees that block on
+    // the computed count, one step earlier than vLLM, so both requests complete
+    // without a preemption, as they do in vLLM with one batch. The cap of 10 s
+    // of simulated time bounds the run.
     for (version, checkpoint) in [("0.31.0", None), ("0.32.0", Some(0)), ("0.33.0", Some(0))] {
         let mut first = request("first", 0.0, 8, 2);
         first.input_token_ids = Some([0].into_iter().chain(1_000_000..1_000_007).collect());
@@ -863,10 +864,7 @@ fn grouped_prefix_ring_of_12_above_the_state_block_completes_at_the_startup_coun
 fn grouped_prefix_ring_of_16_above_the_state_block_completes_at_the_startup_count_with_async_scheduling()
  {
     // max_model_len 128: 32 attention blocks, 1 ring block and 2 state
-    // blocks, 35 pages, and a prompt of 125 tokens. vLLM's own scheduler at
-    // v0.31.0, with this layout and pool, max_model_len 128, a budget of 5
-    // and one request of 125 prompt and 3 output tokens, does not complete
-    // the request in 600 engine steps, and every life starts without a hit.
+    // blocks, 35 pages, and a prompt of 125 tokens.
     assert_ring_layout_completes(16, 128, 35, 125);
 }
 
@@ -1905,8 +1903,10 @@ fn grouped_destination_in_byte_mode_with_a_window_group_stops_where_vllm_stops()
     // - 28 pages: both loads are reserved and the first step of the first
     //   request fits. The first request is preempted once, and the second
     //   request ends first.
-    // vLLM's scheduler, with the scheduler side of its NIXL connector, gives
-    // these three rows at v0.31.0, v0.32.0 and v0.33.0.
+    // The rows of 26 and 27 pages and the reservation of both loads at 28 pages
+    // are derived from these rules, the same at v0.31.0, v0.32.0 and v0.33.0.
+    // Replay gives the rest of the row of 28 pages: the first request is
+    // preempted once, and the second request ends first.
     for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let spec = |pages: u64| {
             let requests = ["first", "second"]
