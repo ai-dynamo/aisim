@@ -1835,6 +1835,89 @@ def test_flat_config_and_an_llm_config_that_is_no_decoder_load_in_the_collector_
     assert load_model_config(str(path)).parsed_payload()["raw_config"]["architectures"] == document["architectures"]
 
 
+def _gemma4_without_decoder_layers():
+    document = _packaged_config("google--gemma-4-26B-A4B")
+    del document["text_config"]["num_hidden_layers"]
+    del document["text_config"]["layer_types"]
+    return document
+
+
+@pytest.mark.parametrize(
+    ("document", "problem"),
+    [
+        (
+            {**_packaged_config("google--gemma-4-26B-A4B"), "vision_config": "x"},
+            "Gemma4ForConditionalGeneration is invalid: ValueError: Expected 'vision_config' to be a dict for "
+            "architecture Gemma4ForConditionalGeneration, got str",
+        ),
+        (
+            {**_packaged_config("meta-llama--Llama-4-Scout-17B-16E-Instruct"), "vision_config": {}},
+            "Llama4ForConditionalGeneration is invalid: ValueError: Llama 4 vision_config is missing required fields: "
+            "hidden_size, num_hidden_layers, num_attention_heads, num_channels, intermediate_size, image_size, "
+            "patch_size, pixel_shuffle_ratio, projector_input_dim, projector_output_dim, vision_output_dim",
+        ),
+        (
+            _gemma4_without_decoder_layers(),
+            "Gemma4ForConditionalGeneration is invalid: ValueError: Model config must define 'num_hidden_layers' or "
+            "a parseable layer pattern.",
+        ),
+    ],
+    ids=["gemma4-vision-field", "llama4-vision-field", "gemma4-decoder"],
+)
+def test_render_refuses_a_registered_wrapper_that_the_parser_refuses_with_the_parser_message(
+    tmp_path, document, problem
+):
+    # The parser reads the wrapper with its vision fields; the decoder alone would parse, or fail for another field.
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(document))
+    with pytest.raises(ValueError) as error:
+        load_model_config(str(path)).parsed_payload()
+    assert str(error.value) == f"HF config of the supported architecture {problem}"
+    assert type(error.value.__cause__) is ValueError
+
+
+def test_render_keeps_the_parse_of_a_valid_registered_wrapper_and_the_decoder_geometry_of_an_unknown_one(tmp_path):
+    (tmp_path / "registered").mkdir()
+    registered = tmp_path / "registered" / "config.json"
+    registered.write_text(json.dumps(_packaged_config("google--gemma-4-26B-A4B")))
+    parsed = load_model_config(str(registered)).parsed_payload()
+    # The values of the packaged text_config, read by the normalized parse.
+    assert (parsed["architecture"], parsed["layers"], parsed["hidden_size"], parsed["inter_size"]) == (
+        "Gemma4ForConditionalGeneration",
+        30,
+        2816,
+        2112,
+    )
+    assert (parsed["vocab"], parsed["num_experts"]) == (262144, 128)
+    decoder = {
+        "hidden_size": 256,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "intermediate_size": 1024,
+        "vocab_size": 1000,
+        "torch_dtype": "bfloat16",
+    }
+    (tmp_path / "unknown").mkdir()
+    unknown = tmp_path / "unknown" / "config.json"
+    unknown.write_text(
+        json.dumps(
+            {"architectures": ["UnknownWrapperForConditionalGeneration"], "hidden_size": 4096, "text_config": decoder}
+        )
+    )
+    bootstrap = load_model_config(str(unknown)).parsed_payload()
+    del bootstrap["raw_config"]
+    assert bootstrap == {
+        "architecture": "UnknownWrapperForConditionalGeneration",
+        "layers": 4,
+        "hidden_size": 256,
+        "inter_size": 1024,
+        "vocab": 1000,
+        "num_experts": 0,
+        "moe_inter_size": 1024,
+    }
+
+
 def _detected_layout_plan(tmp_path, monkeypatch, generator_overrides):
     config = _unknown_fp8_moe_config()
     config["layer_types"] = ["linear_attention", "full_attention"] * 2

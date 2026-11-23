@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from aisim.sdk.common import MULTIMODAL_TEXT_CONFIG_KEY
+from aisim.sdk.common import ARCHITECTURE_TO_MODEL_FAMILY, MULTIMODAL_TEXT_CONFIG_KEY
 from aisim.sdk.memory import NaiveKVCacheEstimator
 from aisim.sdk.utils import (
     HuggingFaceDownloadError,
@@ -122,13 +122,21 @@ class ResolvedModelConfig:
             parser_config = {**source, "architectures": [architecture], text_key: raw_config}
         try:
             parsed = _parse_hf_config_json(parser_config)
-        except ValueError:
+        except ValueError as error:
+            # A config of a registered architecture that the parser refuses is
+            # refused with the message of this parse, which reads a wrapper
+            # with its encoder and processor fields, in the form of the naive
+            # estimator's refusal.
+            if architecture in ARCHITECTURE_TO_MODEL_FAMILY:
+                raise ValueError(
+                    f"HF config of the supported architecture {architecture} is invalid: "
+                    f"{type(error).__name__}: {error}"
+                ) from error
             # Bootstrap templates intentionally admit real HF architectures
             # that the native AIC parser does not know yet. Normalize their
             # frozen config with the architecture-agnostic estimator so render
             # stays offline and receives the same scalar shape as the native
-            # parser rather than re-resolving plan.model_path. A config of a
-            # registered architecture that the parser refuses is refused here too.
+            # parser rather than re-resolving plan.model_path.
             geometry = NaiveKVCacheEstimator.from_hf_config(
                 raw_config,
                 tp_size=1,

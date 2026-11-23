@@ -234,6 +234,39 @@ class TestEstimateModelWeightBytes:
 
         assert _estimate_model_weight_bytes(str(tmp_path)) == 153354240
 
+    def test_refuses_an_invalid_config_of_a_supported_architecture_with_the_parser_message(self, tmp_path):
+        (tmp_path / "config.json").write_text(json.dumps({"architectures": ["LlamaForCausalLM"], "hidden_size": 128}))
+
+        with pytest.raises(RuntimeError) as error:
+            _estimate_model_weight_bytes(str(tmp_path))
+        assert str(error.value) == (
+            f"Could not estimate model size for {str(tmp_path)!r}: HF config of the supported architecture "
+            "LlamaForCausalLM is invalid: ValueError: Model config must define 'num_hidden_layers' or a parseable "
+            "layer pattern."
+        )
+
+    def test_estimates_an_unknown_wrapper_from_its_decoder(self, tmp_path):
+        decoder = {
+            "hidden_size": 256,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "intermediate_size": 1024,
+            "vocab_size": 1000,
+            "torch_dtype": "bfloat16",
+        }
+        wrapper = {
+            "architectures": ["UnknownWrapperForConditionalGeneration"],
+            "hidden_size": 4096,
+            "num_hidden_layers": 48,
+            "num_attention_heads": 32,
+            "text_config": decoder,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(wrapper))
+
+        # 2 * 1,000 * 256 + 4 * (4 * 256**2 + 3 * 256 * 1,024) = 4,706,304 parameters at 2 bytes each.
+        assert _estimate_model_weight_bytes(str(tmp_path)) == 9_412_608
+
     @patch(
         "aisim.generator.naive._load_model_config_from_model_path",
         return_value=_UNSUPPORTED_GPT_NEOX_CONFIG,

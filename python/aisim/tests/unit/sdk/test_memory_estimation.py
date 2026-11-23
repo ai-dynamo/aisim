@@ -891,44 +891,70 @@ _UNKNOWN_DECODER = {
 }
 
 
+# The decoder above: head_dim 256 / 8 = 32, so K and V of 2 heads in 4 layers at 2 bytes hold 2 * 2 * 32 * 4 * 2 =
+# 1,024 bytes per token, and 2 * 1,000 * 256 + 4 * (4 * 256**2 + 3 * 256 * 1,024) = 4,706,304 parameters hold
+# 9,412,608 bytes.
+_UNKNOWN_DECODER_KV_BYTES = 1024
+_UNKNOWN_DECODER_WEIGHT_BYTES = 9_412_608
+_UNKNOWN_WRAPPER = "UnknownWrapperForConditionalGeneration"
+_NO_LAYERS_TEXT = (
+    "HF config of the supported architecture LlamaForCausalLM is invalid: ValueError: "
+    "Model config must define 'num_hidden_layers' or a parseable layer pattern."
+)
+
+
 @pytest.mark.parametrize(
-    ("config", "text"),
+    ("config", "text", "cause"),
     [
-        (
-            {"architectures": ["LlamaForCausalLM"], "hidden_size": 128},
-            "HF config of the supported architecture LlamaForCausalLM is invalid: ValueError: "
-            "Model config must define 'num_hidden_layers' or a parseable layer pattern.",
-        ),
+        ({"architectures": ["LlamaForCausalLM"], "hidden_size": 128}, _NO_LAYERS_TEXT, ValueError),
         (
             {"architectures": ["LlamaForCausalLM"], "num_hidden_layers": 2},
             "HF config of the supported architecture LlamaForCausalLM is invalid: KeyError: 'hidden_size'",
+            KeyError,
         ),
+        ({"architectures": ["LlamaForCausalLM", "OtherForCausalLM"], "hidden_size": 128}, _NO_LAYERS_TEXT, ValueError),
     ],
-    ids=["no-layers", "no-hidden-size"],
+    ids=["no-layers", "no-hidden-size", "known-first-of-two-names"],
 )
-def test_naive_estimate_of_a_known_architecture_fails_with_the_parser_message(config, text):
+def test_naive_estimate_of_a_known_architecture_fails_with_the_parser_message(config, text, cause):
     with pytest.raises(ValueError) as error:
         NaiveKVCacheEstimator.from_hf_config(config, tp_size=1, pp_size=1)
     assert str(error.value) == text
+    assert type(error.value.__cause__) is cause
+
+
+@pytest.mark.parametrize(
+    "architectures",
+    [["LlamaForCausalLM", 5], [["LlamaForCausalLM"]]],
+    ids=["known-name-and-a-number", "nested-list"],
+)
+def test_naive_estimate_checks_the_architectures_field_before_the_parser(architectures):
+    # A known first name with the layer count missing would reach the known-architecture refusal if the parser ran
+    # first; a nested list is no name at all.
+    with pytest.raises(ValueError) as error:
+        NaiveKVCacheEstimator.from_hf_config({"architectures": architectures, "hidden_size": 128}, tp_size=1, pp_size=1)
+    assert str(error.value) == f"HF config architectures must be a list of strings, got {architectures!r}"
 
 
 @pytest.mark.parametrize("key", ["text_config", "llm_config"])
 def test_naive_estimate_of_an_unknown_wrapper_reads_its_decoder(key):
-    name = "UnknownWrapperForConditionalGeneration"
+    name = _UNKNOWN_WRAPPER
     flat = NaiveKVCacheEstimator.from_hf_config({**_UNKNOWN_DECODER, "architectures": [name]}, tp_size=1, pp_size=1)
-    # The wrapper's own fields describe another model. The estimate must not read them.
+    # The wrapper's own fields describe another model. The estimate must not read them, head_dim included, which
+    # only the wrapper holds.
     wrapper = {
         "architectures": [name],
         "hidden_size": 4096,
         "num_hidden_layers": 48,
         "num_attention_heads": 32,
+        "head_dim": 128,
         "torch_dtype": "float32",
         key: _UNKNOWN_DECODER,
     }
     nested = NaiveKVCacheEstimator.from_hf_config(wrapper, tp_size=1, pp_size=1)
     assert nested.geometry == flat.geometry
-    assert nested.kv_bytes_per_token() == flat.kv_bytes_per_token()
-    assert nested.weight_bytes() == flat.weight_bytes()
+    assert nested.kv_bytes_per_token() == flat.kv_bytes_per_token() == _UNKNOWN_DECODER_KV_BYTES
+    assert nested.weight_bytes() == flat.weight_bytes() == _UNKNOWN_DECODER_WEIGHT_BYTES
     assert (nested.architecture, nested.dtype_bytes) == (name, flat.dtype_bytes)
     # The decoder names no dtype: the wrapper's applies.
     decoder = {name_: value for name_, value in _UNKNOWN_DECODER.items() if name_ != "torch_dtype"}
@@ -936,29 +962,69 @@ def test_naive_estimate_of_an_unknown_wrapper_reads_its_decoder(key):
         {"architectures": [name], "torch_dtype": "float32", key: decoder}, tp_size=1, pp_size=1
     )
     assert inherited.dtype_bytes == 4
+    # A decoder that names its own class leaves the architecture of the document that was passed in.
+    named = NaiveKVCacheEstimator.from_hf_config(
+        {"architectures": [name], key: {**_UNKNOWN_DECODER, "architectures": ["UnknownDecoderForCausalLM"]}},
+        tp_size=1,
+        pp_size=1,
+    )
+    assert (named.architecture, named.geometry) == (name, flat.geometry)
+
+
+def test_naive_estimate_reads_the_first_architecture_name_and_the_text_config_of_any_unknown_document():
+    # Only the first name decides whether the architecture is known.
+    flat = NaiveKVCacheEstimator.from_hf_config(
+        {**_UNKNOWN_DECODER, "architectures": [_UNKNOWN_WRAPPER, "LlamaForCausalLM"]}, tp_size=1, pp_size=1
+    )
+    assert (flat.architecture, flat.kv_bytes_per_token()) == (_UNKNOWN_WRAPPER, _UNKNOWN_DECODER_KV_BYTES)
+    # A document that names no architecture is read through its decoder too.
+    unnamed = NaiveKVCacheEstimator.from_hf_config(
+        {"hidden_size": 4096, "num_hidden_layers": 48, "num_attention_heads": 32, "text_config": _UNKNOWN_DECODER},
+        tp_size=1,
+        pp_size=1,
+    )
+    assert (unnamed.architecture, unnamed.kv_bytes_per_token()) == (None, _UNKNOWN_DECODER_KV_BYTES)
+    # With both decoder keys side by side, text_config is the decoder.
+    both = NaiveKVCacheEstimator.from_hf_config(
+        {
+            "architectures": [_UNKNOWN_WRAPPER],
+            "text_config": _UNKNOWN_DECODER,
+            "llm_config": {**_UNKNOWN_DECODER, "num_hidden_layers": 9},
+        },
+        tp_size=1,
+        pp_size=1,
+    )
+    assert (both.geometry["layers"], both.kv_bytes_per_token()) == (4, _UNKNOWN_DECODER_KV_BYTES)
 
 
 @pytest.mark.parametrize(
     ("config", "text"),
     [
         (
-            {"architectures": ["UnknownWrapperForConditionalGeneration"], "hidden_size": 256, "text_config": None},
+            {"architectures": [_UNKNOWN_WRAPPER], "hidden_size": 256, "text_config": None},
+            "HF config: text_config must be a nonempty object describing one text decoder",
+        ),
+        (
+            {"architectures": [_UNKNOWN_WRAPPER], "hidden_size": 256, "text_config": {}},
             "HF config: text_config must be a nonempty object describing one text decoder",
         ),
         (
             {
-                "architectures": ["UnknownWrapperForConditionalGeneration"],
+                "architectures": [_UNKNOWN_WRAPPER],
                 "text_config": {**_UNKNOWN_DECODER, "llm_config": _UNKNOWN_DECODER},
             },
             "HF config: ambiguous nested llm_config in text_config",
         ),
     ],
-    ids=["null-text-config", "nested-decoder"],
+    ids=["null-text-config", "empty-text-config", "nested-decoder"],
 )
 def test_naive_estimate_refuses_a_malformed_decoder_of_an_unknown_wrapper(config, text):
     with pytest.raises(ValueError) as error:
         NaiveKVCacheEstimator.from_hf_config(config, tp_size=1, pp_size=1)
     assert str(error.value) == text
+    # The cause is the parser's refusal of the unknown architecture.
+    assert type(error.value.__cause__) is ValueError
+    assert str(error.value.__cause__).startswith(f"The model's architecture {_UNKNOWN_WRAPPER} is not supported.")
 
 
 def test_naive_estimate_refuses_a_malformed_text_config_of_a_registered_wrapper():
@@ -970,7 +1036,7 @@ def test_naive_estimate_refuses_a_malformed_text_config_of_a_registered_wrapper(
     )
 
 
-def test_no_packaged_model_config_reaches_the_naive_fallback():
+def test_the_parser_accepts_every_packaged_model_config():
     from importlib import resources
 
     from aisim_core.sdk.utils import _parse_hf_config_json
@@ -988,6 +1054,57 @@ def test_no_packaged_model_config_reaches_the_naive_fallback():
             refused[path.name] = repr(error)
     assert len(files) >= 97
     assert refused == {}
+
+
+def _write_config(folder, config):
+    (folder / "config.json").write_text(json.dumps(config))
+    return str(folder)
+
+
+_UNKNOWN_WRAPPER_CONFIG = {
+    "architectures": [_UNKNOWN_WRAPPER],
+    "hidden_size": 4096,
+    "num_hidden_layers": 48,
+    "num_attention_heads": 32,
+    "text_config": _UNKNOWN_DECODER,
+}
+
+
+def test_replay_capacity_refuses_an_invalid_known_config_and_reads_the_decoder_of_an_unknown_wrapper(tmp_path):
+    from aisim.capacity import estimate_kv_bytes_per_token
+
+    (tmp_path / "known").mkdir()
+    known = _write_config(tmp_path / "known", {"architectures": ["LlamaForCausalLM"], "hidden_size": 128})
+    with pytest.raises(ValueError) as error:
+        estimate_kv_bytes_per_token(known, tp_size=1, pp_size=1)
+    assert str(error.value) == _NO_LAYERS_TEXT
+    (tmp_path / "wrapper").mkdir()
+    wrapper = _write_config(tmp_path / "wrapper", _UNKNOWN_WRAPPER_CONFIG)
+    assert estimate_kv_bytes_per_token(wrapper, tp_size=1, pp_size=1) == _UNKNOWN_DECODER_KV_BYTES
+
+
+def test_memory_preflight_refuses_an_invalid_known_config_and_reads_the_decoder_of_an_unknown_wrapper(tmp_path):
+    def preflight(folder):
+        return memory.estimate_kv_cache(
+            folder,
+            "h200_sxm",
+            "vllm",
+            max_num_tokens=8192,
+            max_batch_size=256,
+            memory_fraction_kind="of_total",
+            memory_fraction_value=0.9,
+            gpu_memory_capacity_bytes_override=200 * _GIB,
+            allow_naive_fallback=True,
+        )
+
+    (tmp_path / "known").mkdir()
+    known = _write_config(tmp_path / "known", {"architectures": ["LlamaForCausalLM"], "hidden_size": 128})
+    with pytest.raises(ValueError) as error:
+        preflight(known)
+    assert str(error.value) == _NO_LAYERS_TEXT
+    (tmp_path / "wrapper").mkdir()
+    out = preflight(_write_config(tmp_path / "wrapper", _UNKNOWN_WRAPPER_CONFIG))
+    assert (out["source"], out["kv_size_per_token_bytes"]) == ("naive_fallback", _UNKNOWN_DECODER_KV_BYTES)
 
 
 def test_naive_fallback_raises_without_config():
