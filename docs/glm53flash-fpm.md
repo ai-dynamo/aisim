@@ -109,12 +109,15 @@ included, before the scheduler loads.
   does not refuse the artifact. With measurement evidence version 2, the
   default, the execution evidence of each cell names the gap
   `injected prompt hashes unavailable`, so its status is `incomplete` or
-  `failed` and not `qualified`. The execution gate of
-  `aisim onboard validate-collection` takes the status of each cell, so the
-  collection validation of a GLM-5.3-Flash campaign then does not read
-  `passed`. Publication does not read that status. Finalization does not
-  refuse on it: with `--collection-report`, it records the status of the
-  report and of each gate in `collection_quality` of the profile.
+  `failed` and not `qualified`. Publication does not read that status.
+  `aisim onboard validate-collection` does not finish on a GLM-5.3-Flash
+  campaign. It writes a first report whose execution gate is `incomplete`,
+  and then its interpolation holdout stops with `No FPM cell matches`: a
+  query that is built from an FPM profile carries no execution identity, and
+  the rows of a producer cell carry one. For the same reason `aisim predict`
+  and `aisim recommend` with the files of the onboarding plan do not read the
+  collected table, and `finalize --collection-report` has no report of such a
+  campaign to record. A query without a profile reads the published table.
 - A pinned revision needs the configuration of its own checkpoint. The
   producer accepts any other revision whose configuration equals the
   configuration of a pinned checkpoint. `DYN_FPM_TOKENIZER_REVISION` is the
@@ -312,8 +315,8 @@ collector passes no `--prefix-match-unit`. It also sets these variables:
 | `PYTHONPATH` | `/tmp/fpm-bench:/opt/glm53flash-dynamo` |
 
 `DYN_FPM_GLM53FLASH_PREFIX_MATCH_UNIT` stays unset, so the native hash block of
-the engine is the prefix unit. The planner refuses a hash block that is not a
-multiple of 4. The planner also refuses an accepted profile in which the hash
+the engine is the prefix unit. For a generated point list the planner refuses
+a hash block that is not a multiple of 4. The planner also refuses an accepted profile in which the hash
 block of a selected deployment differs from the block size of one of its Mamba
 groups. For a generated point list, as in guided onboarding, it checks every
 selected deployment. For a point file, it checks the deployments that keep

@@ -89,10 +89,10 @@ for required source changes to request and memory-breakdown structs.
 A naive estimate reads only the model's `config.json`. When the first entry
 of `architectures` is an architecture that AISim supports, the config must
 pass AISim's config parser. If the parser refuses it, the estimate fails
-with `HF config of the supported architecture <name> is invalid: <error
-type>: <parser message>`. A config of any other architecture is read from
-its raw keys. If such a config holds `text_config`, or an `llm_config` that
-is a nonempty object, the estimate reads the text decoder under that key,
+with `the config parser refuses the HF config of the supported architecture
+<name>: <error type>: <parser message>`. A config of any other architecture
+is read from its raw keys. If such a config holds `text_config`, or an
+`llm_config` that is a nonempty object, the estimate reads the text decoder under that key,
 which `context_length: max` reads too. For such a config, the estimate
 refuses a `text_config` that is not a nonempty object, and a decoder that
 itself holds `text_config` or a nonempty `llm_config` object. It also refuses
@@ -100,7 +100,8 @@ an `architectures` value that is not a list of strings, except a null, false,
 zero or empty value, which it reads as no architecture.
 `bytes_per_token: auto` of a worker with `host_offload` or `hicache`, without
 an FPM profile and without `state_cache`, is a naive estimate and has the same
-refusals.
+refusals. So is `engine.kv_transfer.bytes_per_token: auto` of a disaggregated
+engine without an FPM profile and without `state_cache` on its prefill role.
 
 ### FPM profile cache groups and byte budgets
 

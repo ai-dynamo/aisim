@@ -231,9 +231,9 @@ config cache, or Hugging Face. A real model architecture that is not registered
 by AIC uses a config-derived bootstrap template; an unresolved or empty config
 fails before planning. A config of a registered architecture that the AIC
 parser refuses fails when the collector renders a cell, with
-`HF config of the supported architecture <name> is invalid: <error type>:
-<parser message>`. When the checkpoint exists only inside the runtime Pod,
-pass its real local metadata explicitly with
+`the config parser refuses the HF config of the supported architecture <name>:
+<error type>: <parser message>`. When the checkpoint exists only inside the
+runtime Pod, pass its real local metadata explicitly with
 `--fpm-model-config /path/to/config.json` (a directory containing `config.json`
 is also accepted). The resolved config snapshot and SHA-256 are frozen into the
 collection plan.
