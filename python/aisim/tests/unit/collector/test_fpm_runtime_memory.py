@@ -2197,6 +2197,7 @@ def _glm_plan(
     worker_type=None,
     observed=None,
     extra_deployments=(),
+    flags=None,
     **changes,
 ):
     """A GLM-5.3-Flash TP 4 collection plan with the cache resources that the runtime probe measured.
@@ -2210,7 +2211,9 @@ def _glm_plan(
     Without ``runtime_memory`` the profile holds no runtime memory, so its token limit need not equal the options. A
     ``worker_type`` is the serving role of the deployment and of the options. An ``observed`` version is the observed
     runtime version of the collector configuration. Each of ``extra_deployments`` is a mapping that updates a copy of
-    the deployment without runtime memory, with ``resources`` merged into its resources.
+    the deployment without runtime memory, with ``resources`` merged into its resources. With ``flags``, the two token
+    options come from these command-line arguments in place of ``max_num_tokens``, and the role from
+    ``--fpm-worker-type``, so the options pass the argument parser as a user's do.
     ``changes`` replace option fields before planning. With a
     ``kda_checkpoint_alignment``, each of the four KDA groups holds one prefill checkpoint block of that alignment, as
     the import writes it for a launch that prefills KDA with FlashKDA. Without it, they hold none, as with the Triton
@@ -2305,7 +2308,12 @@ def _glm_plan(
         "--fpm-warmup-iterations",
         "0",
     ]
-    if worker_type is not None:
+    if flags is not None:
+        for name in ("--fpm-max-num-batched-tokens", "--fpm-max-prefill-isl"):
+            index = argv.index(name)
+            del argv[index : index + 2]
+        argv += [*flags, *(() if worker_type is None else ("--fpm-worker-type", worker_type))]
+    elif worker_type is not None:
         changes["worker_type"] = worker_type
     for extra in extra_deployments:
         deployment = json.loads(json.dumps(profile["deployments"][0]))
@@ -2460,66 +2468,67 @@ _PROBE_REMEDY = (
 )
 _SHARED_REMEDY = (
     "; set --fpm-max-prefill-isl and --fpm-max-num-batched-tokens to one multiple of 4 within the max_num_tokens of "
-    "every deployment of the accepted profile, below 8190"
+    "each deployment that the request selects"
 )
+
+
+def _isl(value):
+    return ["--fpm-max-prefill-isl", str(value)]
+
+
+def _batched(value):
+    return ["--fpm-max-num-batched-tokens", str(value)]
 
 
 @pytest.mark.parametrize(
     ("refused", "text", "remedy"),
     [
         # Runtime memory takes only the recorded limit, for the prefill budget too (memory admission), so the way out is
-        # a new probe. A probe at 8,188 gives a profile that records 8,188.
+        # a new probe. A probe at 8,188 gives a profile that records 8,188, and the request passes that limit.
         (
-            {"max_num_tokens": 8190},
+            {"max_num_tokens": 8190, "flags": _isl(8190) + _batched(8190)},
             f"{_BUDGET_RULE}: the prefill cells get a budget of 8190 tokens{_PROBE_REMEDY}",
-            {"max_num_tokens": 8188},
+            {"max_num_tokens": 8188, "flags": _isl(8188) + _batched(8188)},
         ),
         (
-            {"max_num_tokens": 8190, "worker_type": "decode"},
+            {"max_num_tokens": 8190, "worker_type": "decode", "flags": _isl(8190) + _batched(8190)},
             f"{_BUDGET_RULE}: the decode cells get --fpm-max-num-batched-tokens=8190{_PROBE_REMEDY}",
-            {"max_num_tokens": 8188, "worker_type": "decode"},
+            {"max_num_tokens": 8188, "worker_type": "decode", "flags": _isl(8188) + _batched(8188)},
         ),
         (
-            {"max_num_tokens": 8190, "max_num_batched_tokens": None, "worker_type": "decode"},
+            {"max_num_tokens": 8190, "worker_type": "decode", "flags": _isl(8190)},
             f"{_BUDGET_RULE}: the decode cells of the accepted deployment at TP 4 get its "
             f"resources.max_num_tokens=8190{_PROBE_REMEDY}",
-            {"max_num_tokens": 8188, "max_num_batched_tokens": None, "worker_type": "decode"},
+            {"max_num_tokens": 8188, "worker_type": "decode", "flags": _isl(8188)},
         ),
         # Without runtime memory the user sets the options. A prefill budget of its own takes the one option.
         (
-            {"runtime_memory": False, "max_prefill_isl": 8190},
+            {"runtime_memory": False, "flags": _isl(8190) + _batched(8192)},
             f"{_BUDGET_RULE}: the prefill cells get a budget of 8190 tokens; set --fpm-max-prefill-isl to a multiple "
-            "of 4, for example 8188",
-            {"runtime_memory": False, "max_prefill_isl": 8188},
+            "of 4",
+            {"runtime_memory": False, "flags": _isl(8188) + _batched(8192)},
         ),
         # An aggregated plan takes one value for both options. Here both are unset, and the budget is the profile's.
         (
-            {
-                "runtime_memory": False,
-                "max_num_tokens": 8190,
-                "worker_type": "aggregated",
-                "max_prefill_isl": None,
-                "max_num_batched_tokens": None,
-            },
+            {"runtime_memory": False, "max_num_tokens": 8190, "worker_type": "aggregated", "flags": []},
             f"{_BUDGET_RULE}: the prefill cells get a budget of 8190 tokens{_SHARED_REMEDY}",
             {
                 "runtime_memory": False,
                 "max_num_tokens": 8190,
                 "worker_type": "aggregated",
-                "max_prefill_isl": 8188,
-                "max_num_batched_tokens": 8188,
+                "flags": _isl(8188) + _batched(8188),
             },
         ),
         (
-            {"runtime_memory": False, "max_num_tokens": 8192, "max_num_batched_tokens": 8190, "max_prefill_isl": 4096},
+            {"runtime_memory": False, "flags": _isl(4096) + _batched(8190)},
             f"{_BUDGET_RULE}: the decode cells get --fpm-max-num-batched-tokens=8190{_SHARED_REMEDY}",
-            {"runtime_memory": False, "max_num_tokens": 8192, "max_num_batched_tokens": 8188, "max_prefill_isl": 8188},
+            {"runtime_memory": False, "flags": _isl(8188) + _batched(8188)},
         ),
         (
-            {"runtime_memory": False, "max_num_tokens": 8190, "max_num_batched_tokens": None, "max_prefill_isl": 4096},
+            {"runtime_memory": False, "max_num_tokens": 8190, "flags": _isl(4096)},
             f"{_BUDGET_RULE}: the decode cells of the accepted deployment at TP 4 get its "
             f"resources.max_num_tokens=8190{_SHARED_REMEDY}",
-            {"runtime_memory": False, "max_num_tokens": 8190, "max_num_batched_tokens": 8188, "max_prefill_isl": 8188},
+            {"runtime_memory": False, "max_num_tokens": 8190, "flags": _isl(8188) + _batched(8188)},
         ),
     ],
     ids=[
@@ -2606,8 +2615,33 @@ def test_glm_plan_checks_the_decode_budget_of_the_deployments_that_keep_cells(tm
         _glm_plan(tmp_path, **build)
     assert str(error.value) == (
         f"{_BUDGET_RULE}: the decode cells of the accepted deployment at TP 8 get its resources.max_num_tokens=8190"
-        "; set --fpm-max-prefill-isl and --fpm-max-num-batched-tokens to one multiple of 4 within the max_num_tokens "
-        "of every deployment of the accepted profile, below 8190"
+        f"{_SHARED_REMEDY}"
+    )
+
+
+@pytest.mark.parametrize("fits", [False, True], ids=["dropped", "kept"])
+def test_glm_plan_checks_the_layout_of_the_topologies_that_keep_cells(tmp_path, fits):
+    # The request names the presets pure_tp and tep. When the declared memory of the tep deployment does not fit a GPU,
+    # memory admission drops its topology, no cell launches with that layout, and the plan keeps the pure-TP cells.
+    extra = {"moe_tp": 1, "moe_ep": 4, "resources": _DECLARED_SMALL if fits else _DECLARED_HUGE}
+    build = dict(
+        runtime_memory=False,
+        extra_deployments=[extra],
+        max_num_tokens=8192,
+        max_prefill_isl=4096,
+        max_num_batched_tokens=None,
+        parallel_presets=("pure_tp", "tep"),
+        **_glm_user_points(tmp_path),
+    )
+    if not fits:
+        plan = _glm_plan(tmp_path, **build)
+        assert {(cell.topology.moe_ep, cell.workload_kind) for cell in plan.cells} == {(1, "prefill"), (1, "decode")}
+        return
+    with pytest.raises(ValueError) as error:
+        _glm_plan(tmp_path, **build)
+    assert str(error.value) == (
+        "GLM-5.3-Flash collection supports pure tensor parallelism only (TP 1, 2, 4 or 8, with DP, PP, CP and expert "
+        "parallelism 1): request the preset pure_tp. Got {'tp': 4, 'pp': 1, 'dp': 1, 'moe_tp': 1, 'moe_ep': 4, 'cp': 1}"
     )
 
 
@@ -2618,8 +2652,7 @@ def test_glm_plan_refuses_the_prefill_budget_before_the_decode_budget(tmp_path):
             tmp_path, runtime_memory=False, max_num_tokens=8194, max_prefill_isl=8190, **_glm_user_points(tmp_path)
         )
     assert str(error.value) == (
-        f"{_BUDGET_RULE}: the prefill cells get a budget of 8190 tokens; set --fpm-max-prefill-isl to a multiple of 4, "
-        "for example 8188"
+        f"{_BUDGET_RULE}: the prefill cells get a budget of 8190 tokens; set --fpm-max-prefill-isl to a multiple of 4"
     )
 
 
@@ -2751,7 +2784,7 @@ def test_probe_backed_glm_plan_without_a_profile_checks_the_prefill_sampling_bud
         )
     assert str(error.value) == (
         f"{_BUDGET_RULE}: the prefill cells get a budget of 8190 tokens; set --fpm-max-prefill-isl and "
-        "--fpm-max-num-batched-tokens to one multiple of 4, below 8190"
+        "--fpm-max-num-batched-tokens to one multiple of 4"
     )
 
 

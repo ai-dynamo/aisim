@@ -389,9 +389,12 @@ def validate_glm_limits(options: FPMCollectionOptions, deployments: Sequence[Fpm
     ``options.max_num_batched_tokens`` or, with that unset, the ``max_num_tokens`` of its deployment. Each must be a
     multiple of the producer's chunk alignment. Each deployment's hash block must then be the block of its Mamba groups.
 
-    The text names the way out that works for the form of the plan. A deployment with runtime memory takes only the
-    token limit that its runtime probe recorded, so a value that equals that limit needs a new probe. An aggregated
-    plan takes one value for both options, and so does a plan whose prefill budget is the shared option.
+    The text names the source of the value and what to change. A value that equals the token limit that the runtime
+    probe of a deployment with runtime memory recorded needs a new probe, since runtime memory takes only that limit.
+    For an aggregated plan, for a prefill budget that is the shared option and for a decode budget without runtime
+    memory, the text names both options at one value; else it names --fpm-max-prefill-isl. The other limits of the
+    plan, such as the batch limit, still apply to the new value, and a plan that sets neither option can meet the
+    decode text after the prefill text.
     """
     rule = "GLM-5.3-Flash collection requires a token budget that is a multiple of 4"
     recorded = {
@@ -404,13 +407,10 @@ def validate_glm_limits(options: FPMCollectionOptions, deployments: Sequence[Fpm
         "limit that is a multiple of 4"
     )
 
-    def shared(value: int) -> str:
-        # The value must also stay within the token limit of every deployment of the profile, which the planner checks
-        # before memory admission.
-        bound = " within the max_num_tokens of every deployment of the accepted profile" if deployments else ""
-        return (
-            f"; set --fpm-max-prefill-isl and --fpm-max-num-batched-tokens to one multiple of 4{bound}, below {value}"
-        )
+    # The value must also stay within the token limit of each deployment that the request selects, whose envelope the
+    # planner checks before memory admission.
+    bound = " within the max_num_tokens of each deployment that the request selects" if deployments else ""
+    shared = f"; set --fpm-max-prefill-isl and --fpm-max-num-batched-tokens to one multiple of 4{bound}"
 
     phases = options.workload_kinds
     if "prefill" in phases:
@@ -419,22 +419,22 @@ def validate_glm_limits(options: FPMCollectionOptions, deployments: Sequence[Fpm
             if budget in recorded:
                 remedy = probe
             elif options.worker_type == "aggregated" or budget == options.max_num_batched_tokens:
-                remedy = shared(budget)
+                remedy = shared
             else:
-                remedy = f"; set --fpm-max-prefill-isl to a multiple of 4, for example {budget - budget % CHUNK_ALIGN}"
+                remedy = "; set --fpm-max-prefill-isl to a multiple of 4"
             raise ValueError(f"{rule}: the prefill cells get a budget of {budget} tokens{remedy}")
     if "decode" in phases:
         if options.max_num_batched_tokens is not None:
             budget = options.max_num_batched_tokens
             if budget % CHUNK_ALIGN:
                 # Runtime memory requires the option to equal the recorded limit.
-                remedy = probe if recorded else shared(budget)
+                remedy = probe if recorded else shared
                 raise ValueError(f"{rule}: the decode cells get --fpm-max-num-batched-tokens={budget}{remedy}")
         else:
             for deployment in deployments:
                 budget = deployment.resources.max_num_tokens
                 if budget % CHUNK_ALIGN:
-                    remedy = probe if deployment.resources.runtime_memory is not None else shared(budget)
+                    remedy = probe if deployment.resources.runtime_memory is not None else shared
                     raise ValueError(
                         f"{rule}: the decode cells of the accepted deployment at TP {deployment.tp} get its "
                         f"resources.max_num_tokens={budget}{remedy}"

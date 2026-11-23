@@ -1003,8 +1003,9 @@ def build_collection_plan(
         for policy in policies
     )
     if capability.architecture == GLM_ARCHITECTURE:
-        # The producer refuses these limits, runtime versions and layouts when the engine starts. The limits are read
-        # for the deployments whose topologies keep cells after memory admission, since only those launch.
+        # The producer refuses these limits, runtime versions and layouts when the engine starts. The limits and the
+        # layouts are read for the topologies that keep cells after memory admission, and for their deployments, since
+        # only those launch.
         kept = {cell.topology for cell in cells}
         validate_glm_limits(
             options,
@@ -1017,7 +1018,8 @@ def build_collection_plan(
             else (),
         )
         validate_glm_layout(
-            candidate_topologies, _glm_runtime_version(runtime_backend_version, runtime_instrumentation, runtime_launch)
+            [topology for topology in candidate_topologies if topology in kept],
+            _glm_runtime_version(runtime_backend_version, runtime_instrumentation, runtime_launch),
         )
     revision = _git_revision()
     canonical = {
