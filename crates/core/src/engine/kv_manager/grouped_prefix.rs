@@ -500,13 +500,13 @@ impl GroupedPrefixRules {
     /// publishes only in a step that completes a block. That holds for the
     /// full-attention keys that wait for a multiple of the scheduler block
     /// too, the partial tail among them: such a multiple is a block end of
-    /// every group. `allocate` takes a
-    /// block when the target leaves the blocks that the request holds,
-    /// retires a window block every `block` tokens, and releases the blocks
-    /// that a state group holds beside a private running block. A window
-    /// block retires on the processed count, which is at or below the count
-    /// that the allocation starts from, so the bound holds with a step in
-    /// flight. A checkpoint block needs a chunk that spans two state blocks.
+    /// every group. `allocate` takes a block when the target leaves the
+    /// blocks that the request holds, retires a window block every `block`
+    /// tokens, and releases the blocks that a state group holds beside a
+    /// private running block. A window block retires on the processed count,
+    /// which is at or below the count that the allocation starts from, so
+    /// the bound holds with a step in flight. A checkpoint block needs a
+    /// chunk that spans two state blocks.
     fn quiet_until(
         &self,
         pool: &GroupedBlockPool,
@@ -2085,9 +2085,10 @@ impl GroupedPrefixCoordinator {
             .sum()
     }
 
-    /// Publish the blocks that `computed_after` completes and apply the
-    /// default retention (`single:476-560`, `single:864-880`,
-    /// `single:1614-1622`, `single:1658-1675`, v0.32 `single:2017-2066`).
+    /// Run the cache step of `computed_after` computed tokens: publish the
+    /// blocks that vLLM caches at that count and apply the default retention
+    /// (`single:476-560`, `single:864-880`, `single:1614-1622`,
+    /// `single:1658-1675`, v0.32 `single:2017-2066`).
     pub(crate) fn finalize(
         &mut self,
         pool: &mut GroupedBlockPool,
@@ -2119,8 +2120,9 @@ impl GroupedPrefixCoordinator {
                     // `coord:796-806`, `:808-840`, v0.32.0 `coord:767-794`,
                     // v0.33.0 `coord:777-804`). The hit alignment is the
                     // scheduler block, or with hits inside a block the hash
-                    // block, which divides every block and the partial tail,
-                    // so rounding to it changes nothing there. One cache
+                    // block, which divides the block of every
+                    // prefix-cacheable group and the partial tail, so
+                    // rounding to it changes nothing there. One cache
                     // group has vLLM's coordinator of one group, which
                     // caches the computed tokens as they are (v0.31.0
                     // `coord:340-364`, `:1043-1044`, v0.32.0 `coord:346-377`,
@@ -2130,9 +2132,10 @@ impl GroupedPrefixCoordinator {
                     } else {
                         computed_after
                     };
-                    // Only the blocks that this step completes, as
-                    // `num_cached_block` limits vLLM (`single:500-533`).
-                    // Earlier ones are cached, or have no key.
+                    // Only the blocks that the cached count covers for the
+                    // first time, as `num_cached_block` limits vLLM
+                    // (`single:500-533`). Earlier ones are cached, or have
+                    // no key.
                     let full = (cacheable / block).min(copies.len());
                     for (i, copy) in copies.iter().enumerate().take(full).skip(*finalized) {
                         if let Some(id) = copy

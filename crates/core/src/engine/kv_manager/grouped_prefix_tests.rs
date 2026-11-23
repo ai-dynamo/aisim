@@ -4048,9 +4048,14 @@ fn rescan_finds_a_block(
 #[test]
 fn finalize_publishes_what_a_full_rescan_would() {
     // Two requests share a prefix on a full-attention and a sliding-window
-    // group, with chunked prefills and decode steps. After every step a scan
-    // of all completed blocks finds nothing more to publish, so the cursor
-    // skips only blocks that are cached or have no key.
+    // group, with chunked prefills and decode steps. The two groups and no
+    // hits inside a block make vLLM cache the computed tokens up to the last
+    // multiple of the scheduler block (v0.31.0 coord:796-806, v0.32.0
+    // coord:767-777, v0.33.0 coord:777-787). After every step a scan of the
+    // full-attention blocks up to that count, and of the window blocks below
+    // the published positions, finds nothing more to publish, so the cursor
+    // skips only blocks that are cached or have no key. No full-attention
+    // block past that count holds a key.
     let mut state: u64 = 0xD1B5_4A32_D192_ED03;
     let mut next = |bound: u64| {
         state ^= state << 13;
@@ -4120,6 +4125,19 @@ fn finalize_publishes_what_a_full_rescan_would() {
                     ),
                     "case {case} {groups:?} prompt {prompt} hit {} at {target}",
                     hit.tokens
+                );
+                let rules = coordinator.rules();
+                let GroupLease::Attention { copies, .. } = &block_lease.groups[0] else {
+                    unreachable!("group 0 is a full-attention group");
+                };
+                let cached = target / rules.alignment * rules.alignment / rules.groups[0].block;
+                assert!(
+                    copies
+                        .iter()
+                        .skip(cached)
+                        .flatten()
+                        .all(|id| pool.is_private(*id)),
+                    "case {case} {groups:?} prompt {prompt}: a block past the cached count holds a key at {target}"
                 );
                 computed = target;
             }
@@ -5809,36 +5827,151 @@ fn full_attention_keys_of_several_groups_wait_for_the_scheduler_block() {
         // scheduler block of 16. No state group has a block above the hash
         // block of 4, so hits stay on multiples of 16, and a prompt of 22
         // tokens caches 16 tokens: the full key 16 and no entry at the
-        // partial tail, 20.
+        // partial tail, 20. A longer prompt that shares the 22 tokens hits
+        // 16. vLLM's scheduler gives these keys and this hit at v0.31.0,
+        // v0.32.0 and v0.33.0.
         let ringed = [attention("full", 16, None), state("ring", 4, false, false)];
-        let mut coordinator = with_limits(GroupedPrefixRules::new(&ringed, 4, version).unwrap());
-        let mut kv = kv_pool(&ringed, 64);
-        let pool = kv.block_pool_mut().unwrap();
-        let request = lease(22, 4);
-        let cold = coordinator.find_longest_hit(pool, &request, 22);
-        let mut a = coordinator.new_lease();
-        prefill(&mut coordinator, pool, &mut a, &request, 22, &cold, BUDGET);
-        assert_eq!(
-            cached_positions(pool, 0, &request, 4, 22),
-            [16],
-            "{version:?}"
-        );
-        coordinator.release_request(pool, &mut a);
+        let (request, longer) = (lease(22, 4), extended(22, 20, 4));
+        let (keys, hit) = keys_and_hit(&ringed, 4, version, (&request, 22), (&longer, 42));
+        assert_eq!(keys, [vec![16]], "{version:?}");
+        assert_eq!(hit, 16, "{version:?}");
+
+        // A prompt one token below a multiple of the scheduler block: 127
+        // tokens on the groups of 64 and 16 tokens cache 64 tokens, so the
+        // keys are 64 and 16 to 64, and the partial tail, 112 at every
+        // version (127 / 16 * 16 and 126 / 16 * 16), gets no entry. A longer
+        // prompt that shares the 127 tokens hits 64. vLLM's scheduler gives
+        // these keys and this hit at v0.31.0, v0.32.0 and v0.33.0.
+        let (request, longer) = (lease(127, hash), extended(127, 73, hash));
+        let (keys, hit) = keys_and_hit(&groups, hash, version, (&request, 127), (&longer, 200));
+        assert_eq!(keys, [vec![64], narrow(64)], "{version:?}");
+        assert_eq!(hit, 64, "{version:?}");
+
+        // A scheduler block above the largest group block: a full-attention
+        // group of 8 tokens and a ring of 3 tokens have a scheduler block of
+        // 24, the least common multiple of the two blocks (v0.31.0
+        // kv_cache_utils.py:767-770, v0.32.0 :848-851, v0.33.0 :860-863).
+        // A prompt of 22 tokens caches 0 tokens and leaves no key, and a
+        // longer prompt that shares it hits 0. A prompt of 30 tokens caches
+        // 24 tokens and leaves the keys 8, 16 and 24; its partial tail, 28
+        // at every version (30 / 4 * 4 and 29 / 4 * 4), lies above 24 and
+        // gets no entry. A longer prompt that shares the 30 tokens hits 24.
+        // vLLM's scheduler gives these keys and these hits at v0.31.0,
+        // v0.32.0 and v0.33.0.
+        let ringed = [attention("full", 8, None), state("ring", 3, false, false)];
+        for (prompt, expected, expected_hit) in [(22, vec![], 0), (30, vec![8, 16, 24], 24)] {
+            let (request, longer) = (lease(prompt, 4), extended(prompt, 20, 4));
+            let (keys, hit) = keys_and_hit(
+                &ringed,
+                4,
+                version,
+                (&request, prompt),
+                (&longer, prompt + 20),
+            );
+            assert_eq!(keys, [expected], "{version:?} prompt {prompt}");
+            assert_eq!(hit, expected_hit, "{version:?} prompt {prompt}");
+        }
+
+        // A sliding-window group as the second group: a full-attention group
+        // of 16 tokens and a window of 4 tokens on blocks of 4 tokens, at a
+        // hash block of 4, have a scheduler block of 16. A prompt of 22
+        // tokens caches 16 tokens: the full-attention key 16, and no entry at
+        // the partial tail, 20 at every version. Under the default retention
+        // the window keeps the block below the replay boundary, the prompt
+        // length minus 1 (v0.31.0 kv_cache_coordinator.py:319-338, v0.32.0
+        // :65-86, v0.33.0 :65-86) rounded down to the scheduler block, here
+        // 16, so its key is 16 too. A prompt of 70 tokens caches 64 tokens: the
+        // full-attention keys 16 to 64 and no entry at the partial tail, 68,
+        // and the window key at the replay boundary 64. vLLM's scheduler
+        // gives these keys at v0.31.0, v0.32.0 and v0.33.0, and a longer
+        // prompt hits 16 and 64.
+        let windowed = [attention("full", 16, None), attention("window", 4, Some(4))];
+        for (prompt, full, window) in [
+            (22, vec![16], vec![16]),
+            (70, vec![16, 32, 48, 64], vec![64]),
+        ] {
+            let (request, longer) = (lease(prompt, 4), extended(prompt, 20, 4));
+            let (keys, hit) = keys_and_hit(
+                &windowed,
+                4,
+                version,
+                (&request, prompt),
+                (&longer, prompt + 20),
+            );
+            assert_eq!(keys, [full, window], "{version:?} prompt {prompt}");
+            assert_eq!(hit, prompt / 16 * 16, "{version:?} prompt {prompt}");
+        }
     }
 }
 
+/// A lease of the tokens `0..prompt` followed by `extra` other tokens.
+fn extended(prompt: usize, extra: usize, hash_block: usize) -> BlockRequestLease {
+    let tokens: Vec<u32> = (0..prompt as u32)
+        .chain(5000..5000 + extra as u32)
+        .collect();
+    let mut lease = BlockRequestLease::new(Uuid::nil(), Vec::new());
+    lease.configure_prefix_hashes(&tokens, hash_block);
+    lease
+}
+
+/// Prefill the `prompt` tokens of `request` cold in one chunk on a fresh
+/// pool of `groups` and release it. Returns the cached hash boundaries of
+/// each prefix-cacheable group, up to the prompt, and the hit of the
+/// `longer_len` tokens of `longer` after the release.
+fn keys_and_hit(
+    groups: &[FpmCacheGroup],
+    hash_block: usize,
+    version: VllmRuleVersion,
+    (request, prompt): (&BlockRequestLease, usize),
+    (longer, longer_len): (&BlockRequestLease, usize),
+) -> (Vec<Vec<usize>>, usize) {
+    let mut coordinator =
+        with_limits(GroupedPrefixRules::new(groups, hash_block, version).unwrap());
+    let mut kv = kv_pool(groups, 64);
+    let pool = kv.block_pool_mut().unwrap();
+    let cold = coordinator.find_longest_hit(pool, request, prompt);
+    let mut a = coordinator.new_lease();
+    let ends = prefill(
+        &mut coordinator,
+        pool,
+        &mut a,
+        request,
+        prompt,
+        &cold,
+        BUDGET,
+    );
+    assert_eq!(ends, [prompt], "{version:?}");
+    coordinator.release_request(pool, &mut a);
+    let keys = coordinator
+        .rules()
+        .groups
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| rule.cacheable)
+        .map(|(g, _)| cached_positions(pool, g as u16, request, hash_block, prompt))
+        .collect();
+    let hit = coordinator
+        .find_longest_hit(pool, longer, longer_len)
+        .tokens;
+    (keys, hit)
+}
+
 #[test]
-fn cached_count_is_the_computed_count_where_vllm_does_not_round_it() {
+fn rounding_to_the_scheduler_block_changes_no_key_where_it_is_the_full_attention_block() {
     for version in [
         VllmRuleVersion::V0_31_0,
         VllmRuleVersion::V0_32_0,
         VllmRuleVersion::V0_33_0,
     ] {
-        // The GLM groups at a hash block equal to their block: the scheduler
-        // block is the block of the full-attention group, so rounding to it
-        // changes no key. After each chunk the group holds the keys of its
-        // full blocks, and the hash block equals the block, so there is no
-        // partial tail entry.
+        // The GLM groups at a hash block equal to their block: several cache
+        // groups and no hits inside a block, so vLLM rounds the cached count
+        // down to the scheduler block (v0.31.0 coord:796-806, v0.32.0
+        // coord:767-777, v0.33.0 coord:777-787), which is the block of the
+        // full-attention group: the ring block of 4 tokens divides it. Every
+        // block end of that group is a multiple of the scheduler block, so
+        // the rounding changes no key. After each chunk the group holds the
+        // keys of its full blocks, and the hash block equals the block, so
+        // there is no partial tail entry.
         let hash = GLM_BLOCK as usize;
         let groups = groups_glm(false);
         let mut coordinator = with_limits(rules_glm(version, false));
@@ -5860,7 +5993,16 @@ fn cached_count_is_the_computed_count_where_vllm_does_not_round_it() {
             computed = target;
         }
         coordinator.release_request(pool, &mut a);
+    }
+}
 
+#[test]
+fn cached_count_is_the_computed_count_with_hits_inside_a_block_or_one_group() {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         // Hits inside a block: vLLM caches the computed count as it is
         // (v0.31.0 coord:804-805, v0.32.0 coord:775-776, v0.33.0
         // coord:785-786). A prompt of 45 tokens at a hash block of 4 on the
@@ -5891,13 +6033,24 @@ fn cached_count_is_the_computed_count_where_vllm_does_not_round_it() {
         }
         coordinator.release_request(pool, &mut a);
 
-        // One cache group: vLLM's coordinator of one group passes the
-        // computed count as it is (v0.31.0 coord:340-364, :1043-1044, v0.32.0
-        // coord:346-377, :1009-1010, v0.33.0 coord:350-381, :1021-1022). A
-        // prompt of 22 tokens at a hash block of 4 has its partial tail at 20
-        // at every version (22 / 4 * 4 and 21 / 4 * 4), inside the second
-        // 16-token block, and the key is there when the 22 tokens are
-        // computed, beside the full key 16.
+        // One cache group with a hash block below its block is a layout of
+        // replay alone. vLLM takes the block as the hash block of one group
+        // at v0.31.0 and ignores the unit (v0.31.0 kv_cache_utils.py:761-765),
+        // so its scheduler keeps only the key 16 for this prompt, and it
+        // refuses the unit at v0.32.0 and v0.33.0 (v0.32.0
+        // kv_cache_utils.py:828-846, v0.33.0 :840-858). Its coordinator of
+        // one group requires the hash block to equal the block (v0.31.0
+        // kv_cache_coordinator.py:572-574, v0.32.0 :565-567, v0.33.0
+        // :573-575). Replay accepts the layout and applies to it the rule of
+        // that coordinator, which does not round the cached count (v0.31.0
+        // coord:340-364, :1043-1044, v0.32.0 coord:346-377, :1009-1010,
+        // v0.33.0 coord:350-381, :1021-1022), and the partial-tail entry of
+        // a hash block below the block (v0.31.0 single:845-893, v0.32.0
+        // single:830-884, v0.33.0 single:840-897). So a prompt of 22 tokens
+        // at a hash block of 4 has its partial tail at 20 at every version
+        // (22 / 4 * 4 and 21 / 4 * 4), inside the second 16-token block, and
+        // the key is there when the 22 tokens are computed, beside the full
+        // key 16.
         let groups = [attention("full", 16, None)];
         let mut coordinator = with_limits(GroupedPrefixRules::new(&groups, hash, version).unwrap());
         let mut kv = kv_pool(&groups, 64);
