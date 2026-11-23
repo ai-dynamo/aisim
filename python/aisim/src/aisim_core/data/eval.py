@@ -22,6 +22,7 @@ import math
 import os
 import re
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Collection, Mapping
 from contextlib import contextmanager
@@ -274,27 +275,41 @@ def record_path(root: str | Path, record: EvalRecord) -> Path:
     return record_dir(root, record.truth.identity) / f"{record.record_id}.json"
 
 
+_RECORD_LOCK_WAIT_SECONDS = 30.0
+_THREAD_LOCK = threading.Lock()
+
+
 @contextmanager
 def _record_lock(directory: Path):
-    """Serialize writers across processes and threads, without leaving files in a candidate.
+    """Serialize writers of one record directory across processes and threads on this host.
 
-    After a writer crash, an operator must confirm it is gone before removing its lock.
+    The lock is an advisory ``flock`` that the operating system drops when its holder exits, however it exits, so a
+    killed writer never blocks the next one. Its backing file lives in the temporary directory, keyed by the
+    directory's real path, so nothing is left in the dataset (the mirror validator rejects stray files there).
     """
-    lock = directory / ".records.lock"
-    deadline = time.monotonic() + 30
-    while True:
-        try:
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            break
-        except FileExistsError as exc:
-            if time.monotonic() >= deadline:
-                raise ValueError(f"another record writer holds {lock}; check for a crashed writer") from exc
-            time.sleep(0.01)
     try:
+        import fcntl
+    except ImportError:  # no flock (Windows): writers of one process still serialize
+        with _THREAD_LOCK:
+            yield
+        return
+    name = hashlib.sha256(os.path.realpath(directory).encode("utf-8")).hexdigest()
+    lock = Path(tempfile.gettempdir()) / f"aisim-eval-records-{name}.lock"
+    # Read-only and not following links: flock needs no write access, so users who share a directory share the lock.
+    fd = os.open(lock, os.O_RDONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o666)
+    try:
+        deadline = time.monotonic() + _RECORD_LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise ValueError(f"another record writer is publishing into {directory}") from exc
+                time.sleep(0.01)
         yield
     finally:
-        os.close(fd)
-        lock.unlink()
+        os.close(fd)  # closing releases the lock; the file stays, empty, for the next writer
 
 
 def write_record(root: str | Path, record: EvalRecord, *, sidecars: Mapping[str, bytes] | None = None) -> Path:

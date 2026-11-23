@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
+import os
 from pathlib import Path
 
 import pytest
@@ -585,3 +586,57 @@ def test_sidecars_are_checked_against_the_record_before_anything_is_published(bu
         write_record(root, successor, sidecars=files)
     assert not record_path(root, successor).exists()
     assert _leftovers(directory) == []
+
+
+def _hold_lock_in_another_process(directory):
+    """A process that holds the record lock of ``directory`` until it is killed."""
+    import subprocess
+    import sys
+
+    import aisim_core
+
+    code = (
+        "import sys, time\nfrom pathlib import Path\nfrom aisim_core.data.eval import _record_lock\n"
+        "with _record_lock(Path(sys.argv[1])):\n    print('held', flush=True)\n    time.sleep(120)\n"
+    )
+    source = str(Path(aisim_core.__file__).parents[1])
+    env = {**os.environ, "PYTHONPATH": source}
+    holder = subprocess.Popen([sys.executable, "-c", code, str(directory)], stdout=subprocess.PIPE, text=True, env=env)
+    assert holder.stdout.readline().strip() == "held"
+    return holder
+
+
+def test_a_killed_writer_does_not_block_the_next_one(built, monkeypatch):
+    from aisim_core.data import eval as eval_module
+
+    root, record = built
+    directory = write_record(root, record).parent
+    successor, files = _successor_with_findings(record, "one")
+    monkeypatch.setattr(eval_module, "_RECORD_LOCK_WAIT_SECONDS", 0.3)
+    holder = _hold_lock_in_another_process(directory)
+    try:
+        # While the holder is alive the directory is busy, so no competing successor can be published.
+        with pytest.raises(ValueError, match="another record writer is publishing"):
+            write_record(root, successor, sidecars=files)
+        assert not record_path(root, successor).exists()
+    finally:
+        holder.kill()  # no cleanup runs: the lock is released by the operating system
+        holder.wait()
+    monkeypatch.setattr(eval_module, "_RECORD_LOCK_WAIT_SECONDS", 5.0)
+    assert write_record(root, successor, sidecars=files) == record_path(root, successor)
+    assert _leftovers(directory) == []  # no lock file is left in the dataset
+
+
+def test_the_record_lock_is_exclusive_between_live_writers_of_one_directory(built, monkeypatch):
+    from aisim_core.data import eval as eval_module
+
+    root, record = built
+    directory = write_record(root, record).parent
+    successor, files = _successor_with_findings(record, "one")
+    monkeypatch.setattr(eval_module, "_RECORD_LOCK_WAIT_SECONDS", 0.2)
+    with (
+        eval_module._record_lock(directory),
+        pytest.raises(ValueError, match="another record writer is publishing"),
+    ):
+        write_record(root, successor, sidecars=files)
+    write_record(root, successor, sidecars=files)  # released on exit, however the holder leaves
