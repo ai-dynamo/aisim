@@ -39,7 +39,11 @@ def _measure_fastafd_attention(stage_config, *, isl, osl, prefix, max_seq_len):
     identity = stage_config["afd"]
     model_path, system, backend_name = (stage_config[key] for key in ("model", "system", "backend"))
     database = get_database_view(
-        system, backend_name, stage_config["backend_version"], systems_paths=stage_config["systems_paths"]
+        system,
+        backend_name,
+        stage_config["backend_version"],
+        systems_paths=stage_config["systems_paths"],
+        strict_provenance=stage_config["strict_provenance"],
     )
     if database is None:
         raise ValueError(f"No attention database for {system}/{backend_name}/{stage_config['backend_version']}")

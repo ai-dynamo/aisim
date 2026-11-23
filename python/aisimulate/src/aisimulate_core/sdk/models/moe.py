@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 
 import aisimulate_core.sdk.operations as ops
@@ -353,6 +354,48 @@ class MOEModel(BaseModel):
         pp_scale_factor = pp_size - 1
         self.context_ops.append(ops.P2P("context_p2p", pp_scale_factor, h, pp_size, seq_split=cp))
         self.generation_ops.append(ops.P2P("generation_p2p", pp_scale_factor * self._mtp_scale_factor, h, pp_size))
+
+    def _afd_ffn_memory_model(self, model_config):
+        """Build F-resident MoE weights without an unused attention graph.
+
+        Keep the selected F configuration intact: backend memory accounting
+        can depend on its TP size even though F never evaluates attention.
+        """
+        from aisimulate_core.sdk.models.helpers import _apply_model_quant_defaults, _get_model_info
+
+        model = copy.copy(self)
+        model.config = copy.deepcopy(model_config)
+        _apply_model_quant_defaults(
+            model.config, _get_model_info(self.model_path).get("raw_config", {}), self.architecture, self._backend_name
+        )
+        model.config.resolve_moe_parallelism()
+        if model.config.moe_ep_size > self._num_experts:
+            raise ValueError(f"ep size cannot be larger than num_experts {self._num_experts}")
+        model._validate_fp8_block_quantized_moe_config()
+        shape = MoEBlockShape(
+            hidden_size=self._hidden_size,
+            moe_inter_size=self._moe_inter_size,
+            topk=self._topk,
+            num_experts=self._num_experts,
+            num_shared_experts=0,
+            num_moe_layers=self._num_layers,
+        )
+        block_ops = build_moe_block_ops(
+            "generation",
+            shape,
+            model.config,
+            model.config.moe_quant_mode,
+            power_law_distribution(model.config.workload_distribution, self._power_law_alpha),
+            scale_factor=self._num_layers * self._mtp_scale_factor,
+            backend_name=self._backend_name,
+            inference_phase="generation",
+            model_family=self.model_family,
+            gpus_per_node=self._gpus_per_node,
+        )
+        model.context_ops = block_ops
+        model.generation_ops = block_ops
+        model.encoder_ops = []
+        return model
 
     def _validate_fp8_block_quantized_moe_config(self) -> None:
         """

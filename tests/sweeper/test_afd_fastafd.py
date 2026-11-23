@@ -352,6 +352,33 @@ def fastafd_attention_sol(monkeypatch):
     monkeypatch.setattr(perf_database, "get_database_view", sol_view)
 
 
+def test_canonical_fastafd_pins_attention_provenance_policy(tmp_path, monkeypatch, fastafd_attention_sol):
+    """A saved non-strict policy overrides a stricter process environment."""
+    from aisimulate.sdk import perf_database
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    monkeypatch.delenv("AIC_STRICT_PROVENANCE", raising=False)
+    (baseline,) = _provider(tmp_path, AICAFDPerformanceModel()).measure(
+        replace(_request(_topology()), max_seq_len=2048)
+    )
+    saved = json.loads(json.dumps(baseline.provenance["config"]))
+    assert saved["strict_provenance"] is False
+    monkeypatch.setenv("AIC_STRICT_PROVENANCE", "1")
+    load = perf_database.get_database_view
+
+    def pinned_policy(*args, **kwargs):
+        database = load(*args, **kwargs)
+        assert database.strict_provenance is False
+        return database
+
+    monkeypatch.setattr(perf_database, "get_database_view", pinned_policy)
+    restored = RustForwardPassPerfModel.best_available(saved)
+    attention = restored.estimate_fastafd_attention(isl=1024, osl=128, max_seq_len=2048)
+    assert attention["provenance"]["config"]["strict_provenance"] is False
+    assert attention["provenance"]["memory"] == baseline.provenance["attention"]["memory"]
+    assert attention["attention_ms"] == baseline.provenance["attention"]["components"]["attention_compute_ms"]
+
+
 @pytest.mark.parametrize("root_source", ["environment", "sdk", "explicit"])
 @pytest.mark.parametrize("typed_config", [False, True])
 def test_canonical_fastafd_pins_attention_data_roots(
@@ -481,14 +508,25 @@ def test_builtin_fastafd_qualifies_selected_low_bit_f_memory(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize("moe_backend", ["megamoe", "deepep_deepgemm"])
-@pytest.mark.parametrize("f_gpus", [4, 128])
+@pytest.mark.parametrize("f_gpus", [4, 8, 128])
+@pytest.mark.parametrize("model_name", [MODEL, "moonshotai/Kimi-K2-Instruct"])
 def test_builtin_fastafd_f_memory_without_unused_attention(
-    tmp_path, monkeypatch, fastafd_attention_sol, moe_backend, f_gpus
+    tmp_path, monkeypatch, fastafd_attention_sol, moe_backend, f_gpus, model_name
 ):
-    """Kimi's 384 experts support EP128 although its 64 attention heads do not."""
+    """Qwen and Kimi support EP128 although their 64 attention heads do not."""
     from aisimulate.sdk import models
 
-    request, profile = _kimi_request_and_profile(tmp_path, "w4a8_mxfp4_mxfp8", moe_backend=moe_backend, f_gpus=f_gpus)
+    if model_name == MODEL:
+        request = replace(_request(_topology(n_f_nodes=f_gpus // 4, f_moe_ep_size=f_gpus)), max_seq_len=2048)
+        profile = _profile(tmp_path, [_entry(topology=f"64A{f_gpus}F", moe_backend=moe_backend)])
+        layers, hidden, inter, experts, shared = LAYERS, 4096, 1536, 128, 0
+        model_class = models.MOEModel
+    else:
+        request, profile = _kimi_request_and_profile(
+            tmp_path, "w4a8_mxfp4_mxfp8", moe_backend=moe_backend, f_gpus=f_gpus
+        )
+        layers, hidden, inter, experts, shared = 61, 7168, 2048, 384, 1
+        model_class = models.DeepSeekModel
     get_model = models.get_model
     constructed = []
 
@@ -504,17 +542,17 @@ def test_builtin_fastafd_f_memory_without_unused_attention(
     memory = measurement.provenance["attention"]["memory"]
     assert memory["f_worker"]["kvcache"] == 0.0
     assert memory["a_worker"]["kvcache"] > 0.0
-    # Existing homogeneous-layer accounting: three expert matrices per layer,
-    # 7168 x 2048 each, 384 routed experts at 4 bits and one shared at FP8,
-    # sharded across the F ranks. Router weights belong to A.
-    expected_weights = 61 * 3 * 7168 * 2048 * (384 / 2 + 1) / f_gpus / (1 << 30)
+    # Checkpoint tensor inventory: three expert matrices per layer, routed
+    # experts at 4 bits and Kimi's shared expert at FP8, sharded across F.
+    # Router weights belong to A.
+    expected_weights = layers * 3 * hidden * inter * (experts / 2 + shared) / f_gpus / (1 << 30)
     assert memory["f_worker"]["weights"] == pytest.approx(expected_weights)
-    assert measurement.ffn_ms == pytest.approx(STAGE_MS / (61 * 2))
+    assert measurement.ffn_ms == pytest.approx(STAGE_MS / (layers * 2))
     assert measurement.provenance["config"]["afd"]["f_moe_ep_size"] == f_gpus
-    if f_gpus == 4:
+    if f_gpus in (4, 8):
         # On a topology supported by full-model construction, compare every
         # resource component against the previous F-graph path.
-        monkeypatch.delattr(models.DeepSeekModel, "_afd_ffn_memory_model")
+        monkeypatch.delattr(model_class, "_afd_ffn_memory_model")
         (legacy,) = _provider(
             tmp_path, AICAFDPerformanceModel(), profile_path=profile, moe_backend=moe_backend
         ).measure(request)

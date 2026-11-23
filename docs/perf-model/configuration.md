@@ -101,6 +101,7 @@ it with the configured attention provider. It does not select a second estimator
 | --- | --- | --- |
 | `estimation_mode: fastafd_stage` | Explicit selection | Native measured stage; requires decode role, literal backend version and `fallback_policy: deny`. Auto's existing candidate priority is unchanged. |
 | `systems_paths` | Resolved SDK or environment roots in Python | Ordered systems roots for A-side timing and A/F memory qualification. Retained in the resolved configuration; the measured F stage still comes only from its profile. |
+| `strict_provenance` | `false` | FastAFD requires `false`; the saved value also governs A-side database loading, overriding `AIC_STRICT_PROVENANCE`. |
 | `afd` | `null` | Immutable split-pool and model geometry, required only for this mode. |
 | `afd.logical_batch_per_source_rank` | Required | Positive total per-A-rank batch before splitting into microbatches, fixed for this stage model. |
 | `afd.attention_gpus`, `afd.ffn_gpus` | Required | Positive A/F pool GPU counts. `tp` must be 1; independent whole-forward parallelism controls are unsupported. |
@@ -128,6 +129,8 @@ Python resolves A-side systems roots at construction using the same explicit,
 SDK, environment, and packaged-root precedence as the other canonical estimators.
 Attention queries and both pools' capacity checks use those saved roots even if
 the process defaults change before the query or configuration reload.
+The A-side lookup also preserves the saved `strict_provenance: false` policy
+when the process enables `AIC_STRICT_PROVENANCE`.
 Unrelated graph/data controls are rejected rather than ignored.
 
 ### Speculative decoding configuration
