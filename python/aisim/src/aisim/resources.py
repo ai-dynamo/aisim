@@ -18,7 +18,7 @@ import math
 import os
 import threading
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
@@ -54,6 +54,11 @@ class ResourceEstimate:
     estimated_peak_bytes: int | None
     reason: str = ""
     api_version: int = 1
+
+
+@dataclass(frozen=True)
+class _WekaProfileEstimate(ResourceEstimate):
+    materialization_peak_bytes: int = field(kw_only=True)
 
 
 class ResourceLimitError(RuntimeError):
@@ -590,7 +595,15 @@ def _estimate_weka_trace(workload: Mapping[str, Any], *, inspection_budget_bytes
                 peak,
                 "initial profile trace materialization estimate exceeds live headroom",
             )
-        return _profile_estimate(lower)
+        return _WekaProfileEstimate(
+            "agentic-profile-unqualified-v1",
+            None,
+            0,
+            lower,
+            None,
+            "profile growth after initial trace materialization requires live supervision",
+            materialization_peak_bytes=peak,
+        )
     return estimate
 
 
@@ -1061,6 +1074,14 @@ def build_plan(
         raise ResourceLimitError("runner returned an invalid host resource estimate")
     workers = min(requested_parallelism, budget["cpu_limit"], free // peak) if peak else 0
     reason = "" if workers else "candidate exceeds the host memory budget"
+    profile_minimum = None
+    if isinstance(estimate, _WekaProfileEstimate) and stack == "engine" and not callable(estimator):
+        from .runner import EngineReplayRunnerFactory
+
+        if type(factory) is EngineReplayRunnerFactory and factory.runtime is None:
+            profile_minimum = max(
+                estimate.materialization_peak_bytes, WORKER_BASELINE_BYTES + estimate.lower_bound_bytes
+            )
     if peak is None:
         if free < _reserved_bytes(peak, estimate.lower_bound_bytes, external=callable(estimator)):
             reason = (
@@ -1071,7 +1092,7 @@ def build_plan(
         elif not os.environ.get("_AISIM_SUPERVISED_BUDGET"):
             reason = f"unknown peak requires supervised serial execution: {estimate.reason}"
         else:
-            workers = 1  # Unqualified estimates require serial, continuously monitored execution.
+            workers = min(requested_parallelism, budget["cpu_limit"], free // profile_minimum) if profile_minimum else 1
             reason = estimate.reason
     return {
         "schema_version": 1,
@@ -1082,6 +1103,7 @@ def build_plan(
         "estimate": asdict(estimate),
         "requested_parallelism": requested_parallelism,
         "effective_parallelism": workers,
+        **({"profile_worker_min_bytes": profile_minimum} if profile_minimum is not None else {}),
         "reason": reason,
     }
 
@@ -1208,9 +1230,9 @@ def descendants_of(process: psutil.Process) -> list[psutil.Process]:
     return descendants
 
 
-def _child_memory_bytes() -> int:
+def _child_memory_bytes(parent: psutil.Process | None = None) -> int:
     try:
-        children = descendants_of(psutil.Process())
+        children = descendants_of(parent if parent is not None else psutil.Process())
         total = 0
         for child in children:
             try:
@@ -1220,6 +1242,21 @@ def _child_memory_bytes() -> int:
         return total
     except psutil.Error as exc:
         raise ResourceLimitError(f"cannot inspect owned execution processes: {exc}") from exc
+
+
+def profile_worker_pressure(worker_pids: Iterable[int], rss_limit: int) -> dict[str, int] | None:
+    """Sample the RSS of each worker and its descendants while a profile wave runs."""
+    for pid in worker_pids:
+        try:
+            process = psutil.Process(pid)
+            rss = process.memory_info().rss + _child_memory_bytes(process)
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.Error as exc:
+            raise ResourceLimitError(f"cannot inspect profile worker: {exc}") from exc
+        if rss > rss_limit:
+            return {"worker_pid": pid, "worker_rss_bytes": rss, "worker_rss_limit_bytes": rss_limit}
+    return None
 
 
 def _trace_identity(workload: Mapping[str, Any]) -> tuple[Any, ...] | None:
@@ -1270,6 +1307,7 @@ class GuardedRunnerFactory:
         external = callable(getattr(self.factory, "estimate_host_resources", None))
         plans = []
         reservations = []
+        partition_profile_wave = False
         for spec in specs:
             plan = build_plan(
                 _replay_resource_workload(spec, self.stack),
@@ -1282,6 +1320,12 @@ class GuardedRunnerFactory:
             plans.append(plan)
             estimate = plan["estimate"]
             observed = self._observed_reservation(spec, estimate)
+            minimum = plan.get("profile_worker_min_bytes")
+            if minimum is not None and len(specs) > 1:
+                require_plan(plan)
+                reservations.append(minimum)
+                partition_profile_wave = True
+                continue
             if estimate["estimated_peak_bytes"] is None and observed is None and len(specs) > 1:
                 raise _SerialAdmissionRequired(
                     "candidate wave requires supervised serial execution",
@@ -1295,6 +1339,8 @@ class GuardedRunnerFactory:
                 if observed is not None and len(specs) > 1
                 else _reserved_bytes(estimate["estimated_peak_bytes"], estimate["lower_bound_bytes"], external=external)
             )
+        if partition_profile_wave:
+            host = discover_host()  # A large trace scan can outlive the initial headroom snapshot.
         budget = resolve_budget(self.policy, host)
         budget["coordinator_memory_bytes"] += _child_memory_bytes()
         available = max(
@@ -1305,7 +1351,12 @@ class GuardedRunnerFactory:
             ),
         )
         required = sum(reservations)
-        admitted = required <= available and len(specs) <= budget["cpu_limit"]
+        share = available // len(specs) if partition_profile_wave else None
+        admitted = (
+            required <= available
+            and len(specs) <= budget["cpu_limit"]
+            and (share is None or max(reservations) <= share)
+        )
         plan = {
             "status": "admitted" if admitted else "resource_limited",
             "reserved_bytes": reservations,
@@ -1315,6 +1366,8 @@ class GuardedRunnerFactory:
             "workers": len(specs),
             "candidates": plans,
         }
+        if share is not None:
+            plan["profile_worker_rss_limit_bytes"] = share
         if not admitted:
             raise ResourceLimitError("candidate wave exceeds current host headroom", plan=plan)
         return plan
