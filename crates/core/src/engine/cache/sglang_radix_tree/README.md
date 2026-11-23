@@ -53,8 +53,11 @@ following local corrections to this pinned revision:
   against newly acquired component locks before taking values.
 - Reject zero Mamba chunk sizes, copy donated Mamba slots for adoption, and
   compare SWA continuation boundaries against the complete insert length.
-- Reject Mamba donations with other than one slot before insert mutations;
-  leave unused donations with the caller on empty inserts and continuations.
+- Reject missing Mamba donations and donations with other than one slot before
+  insert mutations. For an empty continuation at a nonempty retained prefix,
+  commit the Mamba checkpoint if missing without replaying Full overlap frees.
+  Leave unused donations with the caller at the empty root or an anchor that
+  already holds a checkpoint.
 - Preserve unbacked write-through leaves with live host receipts until the
   final release refreshes eviction eligibility. Backed leaves can still demote,
   and write-back leaves can still request a backup, without deleting the anchor.
@@ -93,11 +96,15 @@ following local corrections to this pinned revision:
 - Keep borrowed namespace fields private so their cached hash stays consistent.
 - Describe the bundled module as native-only.
 - Borrow child edge keys during removal and copy visible page slices directly
-  into compact shared storage during adoption.
+  into compact shared storage during adoption and splitting, avoiding temporary
+  vectors for both split halves.
 
 These are local deviations from upstream, covered by the AISimulate-authored
 `../sglang_radix_regressions.rs` and adapter tests. The pinned eviction policies,
-including split recency and whole-leaf LRU eviction, remain in use. Upstream's
+including split recency and whole-leaf LRU eviction, remain in use. The
+[two-leaf split comparison](../EVICTION_EVIDENCE.md#two-leaf-split-recency)
+records the legacy and native physical victims for a partial match and its
+full-match control. Upstream's
 native assertions are retained, with the rejected-rotation assertions strengthened.
 Adoption removes an intermediate allocation;
 removal avoids a key allocation. Continuation validation compares the retained key atoms without allocating a

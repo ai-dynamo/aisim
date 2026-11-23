@@ -1938,16 +1938,18 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 page_size: self.page_size,
             });
         }
-        // Empty inserts do not adopt the donation. Validate real insertions
-        // before touching recency, splitting edges, or starting a resumable walk.
-        if aligned_key_len > prefix_len
-            && let Some(donation) = params.mamba_value.as_ref()
-            && self.try_component_by_type_(MAMBA).is_some()
-            && donation.len() != 1
+        // Validate any checkpoint that must be adopted before touching recency,
+        // splitting edges, recording stores, or starting a resumable walk. An
+        // empty continuation can still need a checkpoint on its retained anchor.
+        let mamba_component = self.try_component_by_type_(MAMBA);
+        if mamba_component.is_some()
+            && (aligned_key_len > prefix_len
+                || (aligned_key_len > 0 && !self.arena.has_device_value(prefix_node_idx, MAMBA)))
         {
-            return Err(TreeCoreRuntimeError::InsertMambaValueLength {
-                value_len: donation.len(),
-            });
+            let value_len = params.mamba_value.as_ref().map_or(0, V::len);
+            if value_len != 1 {
+                return Err(TreeCoreRuntimeError::InsertMambaValueLength { value_len });
+            }
         }
         self.validate_insert_anchor_(prefix_node_idx, prefix_len, params)?;
         if aligned_key_len > 0
@@ -1973,25 +1975,41 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         let mut prefix_actions = Vec::new();
         self.visit_retained_prefix_(prefix_node_idx, params, &mut prefix_actions);
         if aligned_key_len == prefix_len {
-            // An empty suffix still visited its retained boundary above.
+            let mut result = InsertResult {
+                prefix_len,
+                total_len: aligned_key_len,
+                last_device_node_id: Some(self.arena.node(prefix_node_idx).id),
+                inserted_host_node: None,
+                host_insert_dropped: false,
+                rotation_tail_declined: false,
+                // The empty root never adopts a donation. An existing retained
+                // checkpoint also leaves the extra slot with the caller.
+                mamba_exist: true,
+                swa_branch_inserted: params
+                    .swa_branching_seqlen
+                    .is_some_and(|boundary| aligned_key_len >= boundary),
+                adopted_ranges: params.track_adopted_ranges.then(HashMap::new),
+                cache_actions: Vec::new(),
+            };
+            if aligned_key_len > 0
+                && params.mamba_value.is_some()
+                && let Some(component) = mamba_component
+            {
+                // Only Mamba needs committing here. Replaying Full/SWA overlap
+                // hooks would free rows the suffix-only caller never donated.
+                result.mamba_exist = false;
+                component.commit_insert_component_data(
+                    self,
+                    prefix_node_idx,
+                    false,
+                    params,
+                    &mut result,
+                    &mut prefix_actions,
+                );
+            }
             return Ok(InsertStepResult {
                 actions: prefix_actions,
-                result: Some(InsertResult {
-                    prefix_len,
-                    total_len: aligned_key_len,
-                    last_device_node_id: Some(self.arena.node(prefix_node_idx).id),
-                    inserted_host_node: None,
-                    host_insert_dropped: false,
-                    rotation_tail_declined: false,
-                    // Nothing was inserted, so a donated Mamba slot was not
-                    // adopted and the caller keeps (and frees) it.
-                    mamba_exist: true,
-                    swa_branch_inserted: params
-                        .swa_branching_seqlen
-                        .is_some_and(|boundary| aligned_key_len >= boundary),
-                    adopted_ranges: params.track_adopted_ranges.then(HashMap::new),
-                    cache_actions: Vec::new(),
-                }),
+                result: Some(result),
             });
         }
         // The walk owns only [prefix_len, aligned_key_len); the ragged tail and

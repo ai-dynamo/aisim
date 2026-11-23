@@ -159,7 +159,7 @@ where
         assert!(0 < at && at < self.len(), "split point must be internal");
         // Both halves stay in the tree, so neither may keep the wider buffer alive.
         let (head, tail) = self.as_slice().split_at(at);
-        (Self::from_vec(head.to_vec()), Self::from_vec(tail.to_vec()))
+        (Self::from_slice(head), Self::from_slice(tail))
     }
 
     fn concat(values: &[Self]) -> Self {

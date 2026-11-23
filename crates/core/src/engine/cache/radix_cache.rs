@@ -1305,6 +1305,29 @@ mod tests {
     }
 
     #[test]
+    fn lru_split_recency_victim_matches_native_policy() {
+        for partial_match in [true, false] {
+            let mut cache = RadixCache::new(4, 1);
+            let ab = cache.page_pool.allocate(2).unwrap();
+            cache.insert(&[10, 20], &ab);
+            let c = cache.page_pool.allocate(1).unwrap();
+            cache.insert(&[30], &c);
+            let key: &[u32] = if partial_match { &[10] } else { &[10, 20] };
+            let (matched, locked) = cache.match_prefix(key);
+            assert_eq!(matched, key.len());
+            cache.inc_lock_ref(locked);
+            // SGLang refreshes the suffix's tick on a partial split. A full
+            // match is the control: both select C, leaving A protected.
+            assert_eq!(cache.evict(1), (1, vec![KvPageId(c[0])]));
+            assert_eq!(cache.prefix_match_len(&[10, 20]), 2);
+            assert_eq!(cache.prefix_match_len(&[30]), 0);
+            cache.dec_lock_ref(locked);
+            assert_eq!(cache.evict(4).0, 2);
+            assert_eq!(cache.available_tokens(), 4);
+        }
+    }
+
+    #[test]
     fn leaf_eviction_borrows_the_child_edge_key() {
         let mut cache = RadixCache::new(64, 4);
         let pages = cache.page_pool.allocate(8).unwrap();

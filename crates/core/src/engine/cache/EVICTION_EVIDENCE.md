@@ -72,6 +72,88 @@ tail reranking, global forecast retirement, locked-prefix preservation with
 four-token pages, and equal local hashes beneath different prefixes. The JSON
 explains every differing call and its dependent prefix/capacity changes.
 
+## Two-leaf split recency
+
+The native default LRU deliberately retains the pinned SGLang split policy,
+including its Full-KV access-counter refresh on the untouched suffix. This is
+an additional behavior change from the legacy simulator, separate from
+whole-leaf over-eviction. The component linked-list positions preserved by
+`split_node_` do not determine Full LRU ranking; Full uses `last_access_counter`.
+Belady retains its separate adapter correction and is unchanged by this case.
+
+An identical synthetic probe was run against legacy main
+`8288046ac88fccaee124714cd60e62b2ad4e184d` and published native head
+`5f0da35ae7ef81cde8b68d49abb89ec168a0ff25`, using Rust 1.91.1, the unoptimized
+test profile, each revision's lockfile, and no Cargo features. Each case starts
+with capacity four and page size one. Insert `[A,B] = [10,20]` into physical
+pages `[0,1]`, then `[C] = [30]` into physical page `[2]`. Match and lock the
+indicated key, then request one page of eviction:
+
+| Matched and locked key | Legacy physical victim | Native physical victim |
+| --- | --- | --- |
+| `[A]` (partial match; splits `[A,B]`) | `[1]` (B) | `[2]` (C) |
+| `[A,B]` (full-match control; no split) | `[2]` (C) | `[2]` (C) |
+
+Both revisions free exactly one page and retain the lock. After unlocking,
+both drain the remaining two pages and restore all four free pages. A partial
+match therefore changes subsequent prefix reuse under eviction pressure; it is
+not equivalent to the legacy suffix-recency policy. The native adapter keeps
+this production SGLang behavior as intended by the integration. No change to
+the pinned tree's split algorithm or serving-accuracy claim follows from this
+synthetic evidence.
+
+`radix_cache::tests::lru_split_recency_victim_matches_native_policy` asserts the
+native physical victim, surviving prefix, allocator accounting, and final
+drain for both cases. Run it with:
+
+```bash
+cargo test -p aisimulate-core --locked --lib lru_split_recency_victim_matches_native_policy
+```
+
+To reproduce the comparison, archive each revision into a separate fresh
+scratch directory (outside the checkout), append the identical probe below to
+its `crates/core/src/engine/cache/radix_cache.rs`, and set `split_revision` to
+that snapshot's full SHA. Run from the snapshot with a separate target directory
+so embedded manifest paths cannot be reused from the other snapshot:
+
+```bash
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$TMPDIR/radix-target}/lru-split-$split_revision" \
+  cargo test -p aisimulate-core --locked --lib scoped_review_lru_split_victim_evidence -- --nocapture
+```
+
+The probe uses only APIs present in both revisions and prints the observed
+physical victims without imposing either revision's victim policy:
+
+```rust
+#[cfg(test)]
+mod scoped_split_recency_evidence {
+    use super::*;
+    #[test]
+    fn scoped_review_lru_split_victim_evidence() {
+        for partial_match in [true, false] {
+            let mut cache = RadixCache::new(4, 1);
+            let ab = cache.page_pool.allocate(2).unwrap();
+            cache.insert(&[10, 20], &ab);
+            let c = cache.page_pool.allocate(1).unwrap();
+            cache.insert(&[30], &c);
+            assert_eq!(ab, vec![0, 1]);
+            assert_eq!(c, vec![2]);
+            let key: &[u32] = if partial_match { &[10] } else { &[10, 20] };
+            let (matched, locked) = cache.match_prefix(key);
+            assert_eq!(matched, key.len());
+            cache.inc_lock_ref(locked);
+            let (freed, victims) = cache.evict(1);
+            assert_eq!(freed, 1);
+            assert_eq!(cache.available_tokens(), 2);
+            println!("LRU_SPLIT partial={partial_match} victims={victims:?}");
+            cache.dec_lock_ref(locked);
+            assert_eq!(cache.evict(4).0, 2);
+            assert_eq!(cache.available_tokens(), 4);
+        }
+    }
+}
+```
+
 ## Engine-golden coverage and validation
 
 The existing `engine_step.json`, `compile_engine.json`, and `per_op.json`

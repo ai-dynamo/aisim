@@ -667,9 +667,10 @@ fn mamba_adopts_compact_slots_on_new_and_existing_nodes() {
 #[test]
 fn mamba_rejects_invalid_donations_before_insert_mutation() {
     for mode in ["root", "resumable", "continuation", "duplicate"] {
-        for donation in [vec![101, 102], vec![]] {
+        for donation in [Some(vec![101, 102]), Some(vec![]), None] {
             let mut tree = Core::new(
                 CacheInitParams {
+                    enable_kv_cache_events: true,
                     mamba_cache_chunk_size: Some(1),
                     ..Default::default()
                 },
@@ -679,6 +680,7 @@ fn mamba_rejects_invalid_donations_before_insert_mutation() {
             let mut p = params(&key, &[1, 2]);
             p.mamba_value = Some(PageValue::from_vec(vec![100]));
             let leaf = tree.insert(&p).last_device_node_id.unwrap();
+            assert!(!tree.take_events().is_empty());
             let idx = tree.arena.resolve(leaf).unwrap();
             let nodes = tree.inspect_get_all_node_ids();
             let access = tree.arena.node(idx).last_access_counter;
@@ -697,7 +699,7 @@ fn mamba_rejects_invalid_donations_before_insert_mutation() {
                     &[3, 4]
                 },
             );
-            p.mamba_value = Some(PageValue::from_vec(donation));
+            p.mamba_value = donation.map(PageValue::from_vec);
             p.priority = 99;
             let result = match mode {
                 "resumable" => tree.try_begin_insert(&p).map(|_| ()),
@@ -707,7 +709,7 @@ fn mamba_rejects_invalid_donations_before_insert_mutation() {
             assert!(matches!(
                 result,
                 Err(TreeCoreRuntimeError::InsertMambaValueLength { value_len })
-                    if value_len == p.mamba_value.as_ref().unwrap().len()
+                    if value_len == p.mamba_value.as_ref().map_or(0, RadixValue::len)
             ));
             assert_eq!(tree.inspect_get_all_node_ids(), nodes);
             assert_eq!(tree.arena.node(idx).last_access_counter, access);
@@ -715,6 +717,7 @@ fn mamba_rejects_invalid_donations_before_insert_mutation() {
             assert_eq!(tree.inspect_get_component_device_lru_node_ids(MAMBA), lru);
             assert_eq!(tree.total_size(), (2, 1));
             assert_eq!(tree.arena.node(idx).device_value(MAMBA).as_slice(), &[100]);
+            assert!(tree.take_events().is_empty());
             tree.try_sanity_check(&[], &[]).unwrap();
             // Rejection must leave the single-flight insert available for retry.
             p.mamba_value = Some(PageValue::from_vec(vec![103]));
@@ -739,6 +742,7 @@ fn empty_mamba_inserts_do_not_adopt_or_validate_unused_donations() {
     );
     let key = vec![];
     let mut p = params(&key, &[]);
+    assert!(tree.try_insert(&p).unwrap().mamba_exist);
     p.mamba_value = Some(PageValue::from_vec(vec![101, 102]));
     assert!(tree.try_insert(&p).unwrap().mamba_exist);
     assert_eq!(tree.total_size(), (0, 0));
@@ -756,6 +760,81 @@ fn empty_mamba_inserts_do_not_adopt_or_validate_unused_donations() {
     );
     assert_eq!(tree.total_size(), (2, 1));
     tree.try_sanity_check(&[], &[]).unwrap();
+}
+
+#[test]
+fn mamba_empty_continuation_adopts_only_a_missing_checkpoint() {
+    for chunked in [false, true] {
+        let mut tree = Core::new(
+            CacheInitParams {
+                enable_kv_cache_events: true,
+                mamba_cache_chunk_size: Some(1),
+                ..Default::default()
+            },
+            vec![FULL, MAMBA],
+        );
+        let key = vec![10, 20, 30, 40];
+        let mut p = params(&key, &[1, 2, 3, 4]);
+        p.mamba_value = Some(PageValue::from_vec(vec![100]));
+        let tail = tree.insert(&p).last_device_node_id.unwrap();
+        let key = vec![10, 20];
+        tree.match_prefix(&MatchPrefixParams {
+            key: &key,
+            namespace: Default::default(),
+        });
+        let tail_idx = tree.arena.resolve(tail).unwrap();
+        let anchor_idx = tree.arena.node(tail_idx).parent();
+        let anchor = tree.arena.node(anchor_idx).id;
+        assert!(!tree.arena.has_device_value(anchor_idx, MAMBA));
+        tree.take_events();
+
+        let mut p = params(&key, &[]);
+        p.chunked = chunked;
+        // A nonempty prefix needs a checkpoint even when no Full rows are new.
+        for donation in [None, Some(vec![]), Some(vec![101, 102])] {
+            let tick = tree.arena.node(anchor_idx).last_access_counter;
+            p.mamba_value = donation.map(PageValue::from_vec);
+            assert!(matches!(
+                tree.try_insert_suffix_from_node(anchor, 2, &p),
+                Err(TreeCoreRuntimeError::InsertMambaValueLength { .. })
+            ));
+            assert_eq!(tree.arena.node(anchor_idx).last_access_counter, tick);
+            assert_eq!(tree.total_size(), (4, 1));
+            assert!(tree.take_events().is_empty());
+        }
+
+        let donor = PageValue::from_vec(vec![101, 102, 103]);
+        p.mamba_value = Some(donor.slice(1, 1));
+        let result = tree.try_insert_suffix_from_node(anchor, 2, &p).unwrap();
+        assert!(!result.mamba_exist);
+        assert_eq!((result.prefix_len, result.total_len), (2, 2));
+        assert_eq!(result.last_device_node_id, Some(anchor));
+        // In particular, do not replay Full overlap frees without donated rows.
+        assert!(result.cache_actions.is_empty());
+        assert!(tree.take_events().is_empty());
+        let adopted = tree.arena.node(anchor_idx).device_value(MAMBA);
+        assert_eq!(adopted.as_slice(), &[102]);
+        assert_ne!(adopted.as_slice().as_ptr(), donor.as_slice()[1..].as_ptr());
+        assert_eq!(tree.total_size(), (4, 2));
+
+        p.mamba_value = Some(PageValue::from_vec(vec![104]));
+        assert!(
+            tree.try_insert_suffix_from_node(anchor, 2, &p)
+                .unwrap()
+                .mamba_exist
+        );
+        assert_eq!(
+            tree.arena.node(anchor_idx).device_value(MAMBA).as_slice(),
+            &[102]
+        );
+        assert_eq!(
+            tree.collect_full_device_indices(tail, tree.root_node_handle(None))
+                .unwrap()
+                .as_slice(),
+            &[1, 2, 3, 4]
+        );
+        tree.try_sanity_check(&[], &[]).unwrap();
+    }
 }
 
 #[test]
