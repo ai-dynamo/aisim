@@ -467,15 +467,15 @@ sidecar and every row must declare integer counts of 5 warmups and 10
 measurements. Every row must also declare `global_warmup_iterations=0` and
 the policy's protocol and boundary. Missing or inconsistent median metadata
 and `fake_fallback` KV rows are rejected before interpolation; the existing
-execution-identity and real-KV requirements still apply. The legacy `dynamo_native_single_sample_v1` contract
-is unchanged.
+execution-identity and real-KV requirements still apply. The legacy
+`dynamo_native_single_sample_v1` contract is unchanged.
 
 The FPM collector writes the vLLM policy for each GLM-5.3-Flash cell that
 its vLLM producer measured. Every row of such a cell carries the policy, the
 two counts, the state protocol and the timing boundary. The sidecar carries
 the policy and the two counts. The collector refuses to merge these rows
-with rows of another policy in one pair, and it leaves the existing pair
-unchanged; publish to a clean destination.
+with rows of another policy or rows without a policy in one pair, and it
+leaves the existing pair unchanged; publish to a clean destination.
 [GLM-5.3-Flash FPM](../../glm53flash-fpm.md#consumer) gives the cells that
 the collector refuses to publish.
 

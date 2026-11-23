@@ -284,10 +284,11 @@ A latency-only publication into a destination containing a schema-6 pair
 merges its rows, assigns them legacy execution identity, and writes a
 schema-7 commit record. Publish to a fresh output directory to leave the
 schema-6 pair unchanged. Rows of the GLM-5.3-Flash vLLM producer carry
-`measurement_policy: vllm_native_fpm_prefix_seed_median_v1`, and one pair
-holds such rows only or none. The collector refuses a publication that
-would put them beside rows of another policy or rows without a policy, and
-it leaves the existing pair unchanged. Publish them to a clean destination.
+`measurement_policy: vllm_native_fpm_prefix_seed_median_v1`, and a pair that
+the collector writes holds rows of that policy only or none. The collector
+refuses a publication that would put them beside rows of another policy or
+rows without a policy, and it leaves the existing pair unchanged. Publish
+them to a clean destination.
 
 To resume a campaign created before power collection was introduced, pass
 `--no-fpm-measure-power` along with its original arguments and `--resume`.

@@ -112,7 +112,9 @@ included, before the scheduler loads.
   `failed` and not `qualified`. The execution gate of
   `aisim onboard validate-collection` takes the status of each cell, so the
   collection validation of a GLM-5.3-Flash campaign then does not read
-  `passed`. Publication and finalization do not read that status.
+  `passed`. Publication does not read that status. Finalization does not
+  refuse on it: with `--collection-report`, it records the status of the
+  report and of each gate in `collection_quality` of the profile.
 - A pinned revision needs the configuration of its own checkpoint. The
   producer accepts any other revision whose configuration equals the
   configuration of a pinned checkpoint. `DYN_FPM_TOKENIZER_REVISION` is the
@@ -167,9 +169,11 @@ this producer. The cell selects these rules, not the artifact:
   reviewed vLLM revision `4ba787ec`, the digests of the two producer files,
   `runtime-source-sha256.json` and `glm53flash_prefix_scheduler.py`, the
   context policy version and the repetition counts above. The two digests
-  are those of the producer receipt of the cell. When the cell folder holds
-  no receipt, they are those of the files of the checkout that reads the
-  artifact. A missing, changed or added field is refused.
+  are those of the producer receipt of the cell, the file
+  `producer-receipt.json` that the collector writes when the cell passes. When
+  the cell folder holds no receipt, they are those of the files of the
+  checkout that reads the artifact. A missing, changed or added field is
+  refused.
 - The vLLM version of the record must equal the runtime that the Collector
   provenance of the launch names.
 - The seeded input of the record must be the input that this collector draws:
@@ -232,9 +236,13 @@ accepts, and writes one when the cell folder holds none. It does not recover
 a cell whose receipt the reader refuses. No command writes the receipt of a
 passed cell again, so a passed cell with a refused receipt needs a new
 collection. The plan hash covers the collector revision, which
-`collection-plan.json` records as `aic_revision`. A resume by a collector of
-another revision is therefore refused with
-`FPM checkpoint does not match the current frozen plan`.
+`collection-plan.json` records as `aic_revision`. A direct
+`collector --fpm --resume` by a collector of another revision is therefore
+refused with `FPM checkpoint does not match the current frozen plan`. A formal
+`aisim onboard collect-fpm --resume --execute` stops before that, at its
+readiness check, with `full collection requires usable prefill and decode
+readiness for this exact runtime/launch; inspect --check-readiness and run
+--smoke --execute first`.
 
 A cell folder without a receipt is compared with the files of the checkout
 that reads it. After any change of either file, a comment included, the
@@ -251,10 +259,10 @@ an integrity issue of that file. An attempt to accept such a profile fails with
 the same text and status 2. The saved-plan check of a finalized directory whose finalization
 kept a collection report refuses the campaign too.
 `onboard import-observations` reads only the observation files and is not
-affected. Read such a campaign with the collector revision that collected it, which
-`collection-plan.json` records as `aic_revision`, or collect a new smoke and a
-new campaign. The simulator keeps loading a published table, because loading
-reads the table and not the raw artifacts. Artifacts of other models are not affected.
+affected. Read such a campaign with the collector revision that collected it,
+or collect a new smoke and a new campaign. The simulator keeps loading a
+published table, because loading reads the table and not the raw artifacts.
+Artifacts of other models are not affected.
 
 Engine arguments, beyond the usual Dynamo benchmark flags:
 `--enable-prefix-caching --kv-cache-dtype fp8
@@ -304,13 +312,15 @@ collector passes no `--prefix-match-unit`. It also sets these variables:
 
 `DYN_FPM_GLM53FLASH_PREFIX_MATCH_UNIT` stays unset, so the native hash block of
 the engine is the prefix unit. The planner refuses a hash block that is not a
-multiple of 4. When the planner generates the point list, as it does for
-guided onboarding, it also refuses an accepted profile whose hash block
-differs from the block size of one of its Mamba groups. A Mamba group is a
-state group that the profile records with `prefill_checkpoint_blocks`: the KDA
-groups, and not the tail ring. The refusal names the group and both sizes. The
-producer still checks every prefill chunk start. A decode point seeds
-`(c - 2) // hash_block * hash_block` tokens, as in the launch above.
+multiple of 4. The planner also refuses an accepted profile in which the hash
+block of a selected deployment differs from the block size of one of its Mamba
+groups. For a generated point list, as in guided onboarding, it checks every
+selected deployment. For a point file, it checks the deployments that keep
+cells after memory admission. A Mamba group is a state group that the profile
+records with `prefill_checkpoint_blocks`: the KDA groups, and not the fifth
+state group, which is a ring group. The refusal names the group and both
+sizes. The producer still checks every prefill chunk start. A decode point
+seeds `(c - 2) // hash_block * hash_block` tokens, as in the launch above.
 
 The container needs one overlay directory at `/opt/glm53flash-dynamo`. A Slurm
 run can mount it with `--container-mount`. The collector uses that path unless
@@ -402,14 +412,14 @@ preview and with `--execute`, in the line `Point list: candidates and dropped
 points by phase and rule: <counts as JSON>`. The planner refuses a plan with
 no prefill point or no decode point. The estimate counts the blocks that the
 requests of a point hold. Each request holds the attention blocks of its tokens
-and one block in each state group. A prefill request with a prefix holds one more
-block in each Mamba group, the cached block of its prefix beside its running
-block. So does a decode request at a context of at least one hash block. In a
-launch where each Mamba group holds a prefill checkpoint block, a prefill of
-more than one hash block of new tokens also holds that block in each Mamba
-group. With several deployments, a point takes the count of the deployment
-that needs the most blocks. At TP4 with 2,176-token hash
-blocks, 8,192 tokens, 256 sequences and a 1,048,576-token context, a FlashKDA
+and one block in each state group. A prefill request with a prefix holds one
+more block in each Mamba group, the cached block of its prefix beside its
+running block. So does a decode request at a context of at least one hash
+block. In a launch where each Mamba group holds a prefill checkpoint block, a
+prefill of more than one hash block of new tokens also holds that block in
+each Mamba group. With several deployments, a point takes the count of the
+deployment that needs the most blocks. At TP4 with 2,176-token hash blocks,
+8,192 tokens, 256 sequences and a 1,048,576-token context, a FlashKDA
 launch (five state groups, four of them KDA groups with a checkpoint block) has
 496 prefill points and 81 decode points. The align rule drops none of 496
 prefill candidates, and the token budget drops 16 of 97 decode candidates.
@@ -430,19 +440,21 @@ measures it. An aggregated request collects both phases, so its smoke measures
 four or five points. A prefill or decode role collects one phase, so its smoke
 measures the points of that phase. The smoke takes no point of the other phase.
 `aisim onboard collect-fpm --smoke` runs every cell of the plan, or the first
-cells up to `--limit`. A direct `collector --fpm --smoke` call without
-`--limit` runs the first cell of each phase that the plan collects.
+cells up to `--limit`. A direct `python3 -m collector.fpm_forward --smoke`
+call without `--limit` runs the first cell of each phase that the plan
+collects.
 The smoke runs under the plan hash of formal collection and keeps its own
 campaign directory. A smoke campaign can be the source of a repeatability run
 only in the `bounded` comparison mode
 (`--repeatability-comparison-mode bounded`). The default mode, `full_grid`,
 stages the full list, so the collector refuses a smoke source in that mode
-before any launch. The prefill points are one request with 64 new tokens, once
-without a prefix and once after one hash block of prefix. The third prefill
-point is one request with two hash blocks of new tokens after one hash block of
-prefix. The list holds it only for a launch with a prefill checkpoint block.
-Its chunk holds a block boundary before its end, and vLLM's `align` mode saves
-the checkpoint inside the chunk instead of stopping there. So the smoke shows
+before any launch. The prefill points of the smoke are one request with 64 new
+tokens, once without a prefix and once after one hash block of prefix. The
+third prefill point is one request with two hash blocks of new tokens after
+one hash block of prefix. The list holds it only for a launch with a prefill
+checkpoint block. Its chunk holds a block boundary before its end, and vLLM's
+`align` mode saves the checkpoint inside the chunk instead of stopping there.
+So the smoke shows
 that such a point runs in one step. An aggregated smoke therefore measures
 four points when the launch has no prefill checkpoint block, and five points
 with the FlashKDA backend, as for the TP4 list above. The decode points are one
@@ -521,21 +533,24 @@ boundary (see [whole-forward](perf-model/methods/whole-forward.md)):
 | vLLM | `vllm_native_fpm_prefix_seed_median_v1` | `glm53flash_prefix_cache_real_seed_v1` | `dynamo_vllm_instrumented_scheduler_fpm_wall_time` |
 | SGLang | `sglang_native_fpm_radix_seed_median_v1` | `glm53flash_sglang_radix_real_seed_v1` | `sglang_native_fpm_rank0_device_timer_wall_time` |
 
-The collector publishes the rows of a GLM-5.3-Flash producer cell under the
-vLLM policy. Each row carries `measurement_policy`
-`vllm_native_fpm_prefix_seed_median_v1`, `warmup_repeats` 5,
-`measurement_repeats` 10, and the state protocol and the timing boundary of
-the table. The sidecar carries the same policy and the two counts. The
-collector refuses to publish such a cell in two cases. In the first, the
-global warm-up count of the plan (`--fpm-warmup-iterations`, which guided
-onboarding sets from `collection.warmup_iterations`) is not the integer 0. In
-the second, the cell wrote power-window artifacts. The collector also refuses
-to merge rows of this policy into a database pair that holds rows of another
-policy or rows without a policy, and it leaves that pair unchanged. A
-database root holds one pair for each system, backend and backend version, so
-publish a GLM-5.3-Flash collection to a root that holds no rows of another
-model for them. Finalization and collection validation read the policy from
-the sidecar of the publication that they check.
+The collector publishes the rows of a GLM-5.3-Flash cell that the vLLM
+producer measured, a producer cell, under the vLLM policy. Each row carries
+`measurement_policy` `vllm_native_fpm_prefix_seed_median_v1`, `warmup_repeats`
+5, `measurement_repeats` 10, and the state protocol and the timing boundary of
+the table. The sidecar, the `.metadata.json` file beside the Parquet file,
+carries the same policy and the two counts. The two files are one database
+pair. Two conditions of this policy also refuse the publication of such a
+cell. In the first, the global warm-up count of the plan
+(`--fpm-warmup-iterations`, which guided onboarding sets from
+`collection.warmup_iterations`) is not the integer 0. In the second, the cell
+wrote power-window artifacts. The collector also refuses to merge rows of this
+policy into a database pair that holds rows of another policy or rows without
+a policy, and it leaves that pair unchanged. A database root holds one pair
+for each system, backend and backend version, so publish a GLM-5.3-Flash
+collection to a clean destination, or to a root whose pair for them holds no
+rows of another policy and no rows without a policy. Finalization and
+collection validation read the policy from the sidecar of the publication that
+they check.
 
 Align-4 constrains collection only. The consumer answers queries for any
 prefix length.
