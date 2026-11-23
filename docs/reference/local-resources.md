@@ -84,8 +84,14 @@ budget at startup, then samples total owned RSS and live host headroom every
 50 ms, including initialization and output serialization. Runtime thread pools
 are limited to one thread per worker. During recommendation evaluation, memory
 pressure triggers worker cleanup and retries unfinished candidates at lower
-parallelism, at most twice. Completed candidates are retained. Workers must be
-reaped before another batch can start. Persistent pressure produces an explicit
+parallelism, at most twice. The scheduler retains completed candidates and reaps
+interrupted workers before retrying. A native Weka sweep can keep healthy workers
+across waves when the workload, trace files, and worker count match. Reuse requires
+the native engine runner with `trace_graph_cache=True`. The `recommend` CLI enables
+this cache. Direct `Sweeper` callers can enable it on `EngineReplayRunnerFactory`.
+The scheduler admits each wave against live memory. If idle workers prevent admission, it reaps
+them and retries at the same width. If a retained worker dies, the scheduler
+retries unfinished work in a fresh pool. An error in the fresh pool propagates. Persistent pressure produces an explicit
 `resource_limited` candidate and the sweep continues with other candidates.
 A sudden jump past the supervisor limit stops the entire execution tree.
 
@@ -270,7 +276,7 @@ underlying estimate reason as well as the supervision requirement.
 
 Before a peak is observed, such a run requires the existing live supervisor and
 executes one simulation at a time; admission adds the 512 MiB worker baseline
-to the lower bound. Each sweep worker reports its high-water RSS
+to the lower bound. Each sweep worker reports its lifetime high-water RSS
 (`getrusage` for the worker and its waited-for children) with every completed
 replay. The coordinator keeps the largest observation per trace identity
 (format, configured block size and paths). Later candidates of that trace
@@ -303,7 +309,7 @@ energy, or GPU capacity. Their provenance and qualification are:
 | Native Weka traces | Separate per-play import and replay phases; see below. | Uses the native importer/driver contracts, including real output arrays and synthesized hashes. Covers snapshot and warmup storage; Weka on the Dynamo stack uses the finite trace lower bound and observed peak instead. |
 | Process allowances | 256 MiB within the native Weka peak model; 512 MiB for other built-in worker reservations; coordinator RSS plus 256 MiB. | Engineering reserves, not calibrated platform-specific measurements. |
 | Finite trace arrays | Maximum of retained source `Vec<u64>` hashes plus authored `Vec<u32>` outputs, prepared `Vec<u32>` hash/output storage, and the largest `Vec<u32>` input prompt or drawn output. Covers every finite trace format on both stacks except native-engine Weka, without file-size, block-size or lane multipliers. | Array widths are concrete. Other allocations, including importer temporary storage, are excluded: this is a lower bound, not a peak RSS estimate. Continuous profiles use it without an observed peak. |
-| Observed trace peaks | The largest `getrusage` high-water RSS of completed replays of the same trace, times 1.5. | Measured on the executing host and code, so it needs no recalibration when native allocations change. The first replay of a trace runs alone under supervision; the margin is policy headroom that sizes parallel waves only. |
+| Observed trace peaks | The largest worker lifetime high-water RSS (`getrusage`) reported after a completed replay of the same trace, times 1.5. | Measured on the executing host and code, so it needs no recalibration when native allocations change. The first replay of a trace runs alone under supervision; the margin is policy headroom that sizes parallel waves only. |
 | Admission and recovery | The sum of candidate estimates must fit one live budget; observed pressure stops workers before bounded retry. | Budget/accounting invariants tested with bounded fixtures and real owned subprocesses. |
 
 The resource tests exercise arithmetic boundaries, combined-wave accounting,

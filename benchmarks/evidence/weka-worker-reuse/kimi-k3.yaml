@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Run from the directory that contains the 32-play AgentX sample.
+engine:
+  model: moonshotai/Kimi-K3
+  hardware: gb200
+  backend: vllm
+  backend_version: "0.24.0"
+  mode: aggregated
+  context_length: 262144
+  workers:
+    aggregated:
+      parallelism: {preset: false, tensor: 16, pipeline: 1, attention_data: 1, moe_tensor: 16, moe_expert: 1, replicas: 1}
+      scheduler:
+        max_batched_tokens: {choices: [1024, 1536, 2048, 3072, 4096, 5120, 6144, 7168, 8192]}
+        max_sequences: {choices: [8, 12, 16, 24, 32, 64, 128]}
+      kv_cache:
+        block_size: 384
+        prefix_caching: true
+        capacity: {type: fixed, blocks: 4096}
+      timing: {type: default, database_mode: SOL, estimation_mode: op_level, fallback_policy: deny}
+traffic:
+  source:
+    type: trace
+    format: weka
+    paths: [agentx-32.jsonl]
+    block_size: 64
+    client: agentx
+    nested_timestamp_basis: absolute
+  load:
+    type: trace_timestamps
+    agentic_lanes: 16
+    agentic_snapshot: {seed: 42}
+    agentic_warmup: true
+    agentic_warmup_policy: live_trajectory_v1
+    agentic_profile: {duration_seconds: 120, global_idle_cap_seconds: 10, tree_idle_cap_seconds: 300}
+optimization:
+  target: throughput_per_gpu
+  constraints: {max_candidate_gpus: 16}
+optimizer: {algorithm: random, max_trials: 6, parallelism: 1, candidate_timeout_seconds: 90, seed: 42}
+execution:
+  resources: {memory_limit_gb: 12, cpu_limit: 1}
