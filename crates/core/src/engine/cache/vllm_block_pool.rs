@@ -334,6 +334,14 @@ impl HashCopies {
         CopyRemoval::Remaining
     }
 
+    /// Make `id`, one of several copies of the key, its last copy. The
+    /// other copies keep their order.
+    fn move_to_back(&mut self, id: BlockCopyId) {
+        if self.duplicates.is_some() && matches!(self.remove(id), CopyRemoval::Remaining) {
+            self.push(id);
+        }
+    }
+
     fn iter(&self) -> impl Iterator<Item = BlockCopyId> + '_ {
         std::iter::once(self.primary).chain(
             self.duplicates
@@ -1054,7 +1062,7 @@ impl VllmBlockPool {
 
     /// Give a cached copy that holds a grouped key one more key of its group,
     /// with its place when it lies inside a block of the group. Returns
-    /// whether `key` became visible. This function only adds a key, and it
+    /// whether `key` became visible. This function adds a key, and it
     /// changes nothing when the copy holds `key`. That is the rule of vLLM's
     /// `_insert_block_hash` for a block that has a hash (v0.31.0
     /// `vllm/v1/core/block_pool.py:629-649`, v0.32.0 `:626-646`, v0.33.0
@@ -1065,7 +1073,9 @@ impl VllmBlockPool {
     /// covers more tokens than the block's partial primary key (v0.31.0
     /// `:514-521`, v0.32.0 `:511-518`, v0.33.0 `:548-555`). This function
     /// removes no key, so a caller uses it only where the block ends with the
-    /// same keys as in vLLM.
+    /// same keys as in vLLM. When a copy whose first key lies inside its
+    /// block gets its full key, it becomes the last copy of its first key, as
+    /// the block in vLLM becomes the last block of that key (below).
     pub(crate) fn cache_grouped_alias(
         &mut self,
         id: BlockCopyId,
@@ -1095,6 +1105,27 @@ impl VllmBlockPool {
             return false;
         }
         aliases.push((hash, at));
+        // A block whose first key lies inside it gets its full key. vLLM
+        // removes every key of the block, inserts the full key and registers
+        // the prompt's tail entry for the block again in the same cache step
+        // (v0.31.0 `vllm/v1/core/block_pool.py:286-299`, v0.32.0
+        // `:286-299`, v0.33.0 `:290-303`; v0.31.0
+        // `vllm/v1/core/single_type_kv_cache_manager.py:845-862`, v0.32.0
+        // `:830-847`, v0.33.0 `:840-857`). Its map of a key keeps the other
+        // blocks in their order and appends a block that it inserts (v0.31.0
+        // and v0.32.0 `block_pool.py:85-127`, v0.33.0 `:86-128`), so the
+        // block becomes the last block of its first key. A lookup takes the
+        // first block of a key (v0.31.0 and v0.32.0 `:62-72`, v0.33.0
+        // `:63-73`).
+        if at.is_none()
+            && let Some(&(_, Some(_))) = index.by_copy.get(&id)
+        {
+            index
+                .by_key
+                .get_mut(&(group, first))
+                .expect("a cached grouped copy is listed under its first key")
+                .move_to_back(id);
+        }
         if let Some(at) = at {
             index.list_in_block(group, at);
         }
@@ -3226,6 +3257,99 @@ mod tests {
             .reservation;
         pool.cancel(reservation);
         assert_eq!((pool.num_active(), pool.num_inactive()), (0, 1));
+        pool.assert_lru_consistent();
+    }
+
+    #[test]
+    fn grouped_block_that_gets_its_full_key_becomes_the_last_holder_of_its_other_key() {
+        // A block whose first key lies inside it gets its full key when the
+        // block becomes full. vLLM then removes every key of the block and
+        // inserts the full key (v0.31.0 and v0.32.0 block_pool.py:286-299,
+        // v0.33.0 :290-303), and the same cache step registers the prompt's
+        // tail entry for the block again (v0.31.0
+        // single_type_kv_cache_manager.py:845-862, v0.32.0 :830-847,
+        // v0.33.0 :840-857). Removing a block from a key keeps the other
+        // blocks of the key in their order, and inserting a block appends it
+        // (v0.31.0 and v0.32.0 block_pool.py:85-127, v0.33.0 :86-128). So the
+        // block becomes the last block of both keys, and a lookup, which
+        // takes the first block of a key (v0.31.0 and v0.32.0 :62-72, v0.33.0
+        // :63-73), takes the other block.
+        let key = |hash| CacheKey::Grouped { group: 0, hash };
+        let inside = Some(KeyInBlock {
+            first: 14,
+            offset: 12,
+        });
+        let mut pool = VllmBlockPool::new(3);
+        let mut reservation = reserve(&mut pool, &[], 1).reservation;
+        let filling = pool.allocate_private(&mut reservation);
+        pool.cancel(reservation);
+        assert!(pool.cache_private_key_at(filling, key(17), inside));
+        // Another block with the full key 18 and the key 17 inside it.
+        let other = grouped_copy(&mut pool, 0, 18);
+        assert!(!pool.cache_grouped_alias(other, key(17), inside));
+        assert_eq!(grouped_key_copies(&pool, 17), [filling, other]);
+        let (generation, keys) = (pool.grouped_key_generation(), pool.grouped_keys());
+        // The first block gets its full key. Both keys were visible, so the
+        // visible keys stay.
+        assert!(!pool.cache_grouped_alias(filling, key(18), None));
+        assert_eq!(grouped_key_copies(&pool, 17), [other, filling]);
+        assert_eq!(grouped_key_copies(&pool, 18), [other, filling]);
+        assert_eq!(
+            (pool.grouped_key_generation(), pool.grouped_keys()),
+            (generation, keys)
+        );
+        assert_eq!(pool.grouped_keys_in_block(0, 14).collect::<Vec<_>>(), [12]);
+        pool.assert_hash_index_consistent();
+        // The request of the first block holds it, and the other block is
+        // free: a lookup through either key finds the free block.
+        pool.release(other);
+        for hash in [17, 18] {
+            assert!(pool.key_hit(key(hash)).is_some_and(|hit| !hit.is_active));
+        }
+        // A key that one block holds stays where it is, and the full key
+        // becomes visible.
+        let mut reservation = reserve(&mut pool, &[], 1).reservation;
+        let alone = pool.allocate_private(&mut reservation);
+        pool.cancel(reservation);
+        let inside_alone = Some(KeyInBlock {
+            first: 24,
+            offset: 12,
+        });
+        assert!(pool.cache_private_key_at(alone, key(27), inside_alone));
+        let generation = pool.grouped_key_generation();
+        assert!(pool.cache_grouped_alias(alone, key(28), None));
+        assert_eq!(pool.grouped_key_generation(), generation + 1);
+        assert_eq!(grouped_key_copies(&pool, 27), [alone]);
+        assert_eq!(grouped_key_copies(&pool, 28), [alone]);
+        pool.assert_hash_index_consistent();
+        pool.release(filling);
+        pool.release(alone);
+        pool.assert_lru_consistent();
+    }
+
+    #[test]
+    fn grouped_block_that_has_its_full_key_keeps_its_place_when_it_gets_a_key_inside_it() {
+        // A block whose first key is its full key gets a key inside it. That
+        // key covers fewer tokens, so vLLM removes no key of the block and
+        // only adds the new one (v0.31.0 block_pool.py:505-526, v0.32.0
+        // :502-523, v0.33.0 :539-560), which appends the block to the blocks
+        // of the new key (v0.31.0 and v0.32.0 :85-99, v0.33.0 :86-100). The
+        // block keeps its place among the blocks of its full key.
+        let key = |hash| CacheKey::Grouped { group: 0, hash };
+        let inside = Some(KeyInBlock {
+            first: 14,
+            offset: 12,
+        });
+        let mut pool = VllmBlockPool::new(2);
+        let first = grouped_copy(&mut pool, 0, 18);
+        let second = grouped_copy(&mut pool, 0, 18);
+        assert_eq!(grouped_key_copies(&pool, 18), [first, second]);
+        assert!(pool.cache_grouped_alias(first, key(17), inside));
+        assert_eq!(grouped_key_copies(&pool, 18), [first, second]);
+        assert_eq!(grouped_key_copies(&pool, 17), [first]);
+        pool.assert_hash_index_consistent();
+        pool.release(first);
+        pool.release(second);
         pool.assert_lru_consistent();
     }
 

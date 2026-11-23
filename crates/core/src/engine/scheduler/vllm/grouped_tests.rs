@@ -8699,6 +8699,163 @@ fn hash_below_block_core(version: &str, batches: usize) -> VllmCore {
     )
 }
 
+/// The groups of `hash_below_block_core` on an aggregated rank of `pages`
+/// pages with one batch.
+fn hash_below_block_core_of(version: &str, pages: u64) -> VllmCore {
+    let mut full = group("mla", 32, GLM_PAGE, None);
+    full.prefix_cacheable = Some(true);
+    let groups = vec![
+        full,
+        glm_state("kpool_tail", 4, false, false),
+        glm_state("kda", 32, true, false),
+    ];
+    batches_core(
+        groups,
+        pages * GLM_PAGE,
+        512,
+        4,
+        version,
+        1,
+        WorkerType::Aggregated,
+    )
+}
+
+#[test]
+fn grouped_block_that_output_tokens_fill_becomes_the_last_holder_of_the_tail_key() {
+    // The groups of `hash_below_block_core`, one batch. Q0 has 61 prompt
+    // tokens and 8 output tokens, Q1 the first 61 tokens of Q0 and 3 more,
+    // and 1 output token. Q0 computes 32, 60 and 61 tokens in its first
+    // three passes and one token in each later pass. Its partial tail is 60
+    // (v0.31.0 `61 // 4 * 4`, v0.32.0 and v0.33.0 `(61 - 1) // 4 * 4`), so
+    // its second full-attention block holds the key at 60. Q1 arrives
+    // before pass 4, hits 60 and computes its last 4 tokens in a copy of that
+    // block, which gets the key at 64 and, at v0.32.0 and v0.33.0, its own
+    // tail entry at (64 - 1) // 4 * 4 = 60; at v0.31.0 the tail is
+    // 64 // 4 * 4 = 64, a block end, so no entry. Q1 ends in pass 4. Pass 5
+    // computes token 64 of Q0, and Q0's block gets its key at 64. vLLM
+    // removes every key of that block, inserts the key at 64 and registers
+    // the tail entry 60 again (v0.31.0 and v0.32.0 `block_pool.py:286-299`,
+    // v0.33.0 `:290-303`; v0.31.0 `single_type_kv_cache_manager.py:845-862`,
+    // v0.32.0 `:830-847`, v0.33.0 `:840-857`). The removal keeps the other
+    // blocks of a key in their order and the insertion appends (v0.31.0 and
+    // v0.32.0 `block_pool.py:85-127`, v0.33.0 `:86-128`), so Q1's free copy
+    // becomes the first block of the key at 60, and a lookup takes the first
+    // block (v0.31.0 and v0.32.0 `:62-72`, v0.33.0 `:63-73`). At v0.31.0 Q0's
+    // block is the only block with that key.
+    // vLLM's scheduler, run on its own code at v0.33.0 with one batch on
+    // these requests, shows the order: after Q1 the blocks of the key at 60
+    // are Q0's block and Q1's copy, after the step that fills Q0's block
+    // they are Q1's copy and Q0's block, and a later request with Q1's
+    // prompt hits through Q1's copy. Its first allocation then takes 6
+    // blocks: the two hit blocks, a copy block, the ring block, the state
+    // hit block and a new state block. No run exists at v0.31.0 or v0.32.0;
+    // the rule is the same there.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let mut core = hash_below_block_core(version, 1);
+        let mut now = 0.0;
+        let q0: Vec<u32> = (1000..1061).collect();
+        let q1: Vec<u32> = (1000..1064).collect();
+        core.receive(turn_with_outputs(4001, q0, 8));
+        let tail = hash_of(&q1, 4, 60);
+        let mut first_holder_active = Vec::new();
+        for pass in 0..9 {
+            if pass == 4 {
+                core.receive(turn_with_outputs(4002, q1.clone(), 1));
+            }
+            async_step(&mut core, &mut now);
+            if pass >= 4 {
+                first_holder_active.push(block_pool(&core).key_hit(0, tail).unwrap().is_active);
+            }
+        }
+        let q0_holds_it_alone = version == "0.31.0";
+        // Pass 4: Q0's block is the first block of the key. From pass 5 on
+        // Q1's free copy is, except at v0.31.0.
+        assert_eq!(
+            first_holder_active,
+            [
+                true,
+                q0_holds_it_alone,
+                q0_holds_it_alone,
+                q0_holds_it_alone,
+                q0_holds_it_alone
+            ],
+            "{version}"
+        );
+        drain_async_passes(&mut core, &mut now);
+        // The attention blocks that end at 32 and 64 (two of them) and the
+        // states at 32 and 60.
+        assert_eq!(block_pool(&core).inactive_cached_blocks(), 5, "{version}");
+        let q2 = core.receive(turn_with_outputs(4003, q1.clone(), 1));
+        block_pool(&core).reset_peak_active_blocks();
+        let pass = async_step(&mut core, &mut now);
+        let admissions: Vec<_> = pass
+            .admissions
+            .iter()
+            .map(|admission| (admission.uuid, admission.reused_input_tokens))
+            .collect();
+        assert_eq!(admissions, [(q2, 60)], "{version}");
+        assert_eq!(block_pool(&core).peak_active_blocks(), 6, "{version}");
+        drain_async_passes(&mut core, &mut now);
+        assert_eq!(block_pool(&core).inactive_cached_blocks(), 6, "{version}");
+    }
+}
+
+#[test]
+fn grouped_request_counts_the_free_holder_of_a_tail_key_that_output_tokens_moved_behind_it() {
+    // The requests of the test above on a pool of 10 blocks, with Q2, which
+    // has Q1's prompt and 1 output token, arriving before pass 6. Q1's
+    // allocation in pass 4 needs 4 blocks and finds 6: the copy block of its
+    // partial hit, the ring block, the state hit block, which no request
+    // holds, and a new state block (v0.31.0
+    // `single_type_kv_cache_manager.py:261-268`, `:1813-1816`, v0.32.0
+    // `:258-265`, `:1775-1778`, v0.33.0 `:259-266`, `:1792-1795`). Pass 6
+    // computes token 65 of Q0, which takes a new attention block and a new
+    // state block: Q0 then holds 6 blocks, and 4 are free. Q2 hits 60 tokens
+    // through the block that ends at 32, which Q0 holds, and the first block
+    // of the key at 60. At v0.32.0 and v0.33.0 that is Q1's free copy (see
+    // the test above), so Q2 needs that block, a copy block, the ring block,
+    // the state hit block and a new state block: 5 blocks, and it waits.
+    // Pass 7 frees Q0's state block of its first 60 tokens, once the
+    // processed count passes it (v0.31 kv_cache_manager.py:549-556, v0.32
+    // :552-559, v0.33 :561-568), so 5 blocks are free and Q2 is admitted. At
+    // v0.31.0 the first block of the key at 60 is Q0's block, which Q0 holds,
+    // so Q2 needs 4 blocks and is admitted in pass 6. In both cases the pool
+    // evicts no key that Q2 hits: the blocks that Q0 takes in pass 6 come
+    // from the free blocks without a key, and vLLM evicts there only the
+    // state at 32.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let mut core = hash_below_block_core_of(version, 10);
+        let mut now = 0.0;
+        let q0: Vec<u32> = (1000..1061).collect();
+        let q1: Vec<u32> = (1000..1064).collect();
+        core.receive(turn_with_outputs(4101, q0, 8));
+        let mut admitted = Vec::new();
+        for pass in 0..8 {
+            if pass == 4 {
+                core.receive(turn_with_outputs(4102, q1.clone(), 1));
+            }
+            if pass == 6 {
+                core.receive(turn_with_outputs(4103, q1.clone(), 1));
+            }
+            let result = async_step(&mut core, &mut now);
+            admitted.extend(result.admissions.iter().map(|admission| {
+                (
+                    pass,
+                    admission.uuid.as_u128(),
+                    admission.reused_input_tokens,
+                )
+            }));
+        }
+        let q2_pass = if version == "0.31.0" { 6 } else { 7 };
+        assert_eq!(
+            admitted,
+            [(0, 4101, 0), (4, 4102, 60), (q2_pass, 4103, 60)],
+            "{version}"
+        );
+        drain_async_passes(&mut core, &mut now);
+    }
+}
+
 #[test]
 fn grouped_block_after_the_partial_tail_block_and_a_prompt_block_get_their_block_keys() {
     // Every full-attention block that a request fills gets its block key:

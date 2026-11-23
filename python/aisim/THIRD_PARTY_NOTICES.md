@@ -662,12 +662,17 @@ upstream tests listed below.
 From `block_pool.py` of v0.31.0, v0.32.0 and v0.33.0,
 `crates/core/src/engine/cache/vllm_block_pool.rs` adapts the later keys that one
 cached block of a grouped pool holds beside its first key, and their removal
-with the block when it is evicted.
+with the block when it is evicted. With the full-attention manager of
+`single_type_kv_cache_manager.py`, which registers the prompt's tail entry
+again in the cache step that gives a block its full key, it adapts the order
+of the blocks of a key: such a block becomes the last block of its tail key.
 From v0.31.0, v0.32.0 and v0.33.0, `crates/core/src/engine/kv_manager/vllm_backend.rs`
 adapts, from `kv_cache_manager.py`, the whole-prompt admission cost of
 `allocate_slots`, its test of the first chunk before the hit blocks are
 pinned and the prefill end of a request that resumes after a preemption, and
-`grouped_prefix.rs` counts the blocks of that first chunk.
+`grouped_prefix.rs` counts the blocks of that first chunk. From `request.py`,
+`vllm_backend.rs` adapts the block hashes that each output token of a request
+extends.
 `crates/core/src/engine/scheduler/vllm/policy.rs` adapts the whole-prompt test
 of `allocate_slots` and, from `sched/scheduler.py`, the token budget of a prompt
 without chunked prefill and the stop of the waiting loop at a request that does
