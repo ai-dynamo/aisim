@@ -1,0 +1,62 @@
+{
+  "candidate": "4177ff01a63823f787949fcf854d8a8fd426069d",
+  "candidate_sources_sha256": {
+    "python/aisim/src/aisim_core/sdk/backends/base_backend.py": "8af662a88c1b2a3f8852497f2ba06063d30a24c45b22c63a093bf62f590135b4",
+    "python/aisim/src/aisim_core/sdk/backends/vllm_backend_xpu.py": "c516bfd62ab3308e8d2117d345494888d1df566ce09ce4e638d5281b721f2dfd"
+  },
+  "driver_sha256": "f0efdf3fc0afb74a9b335f2dd3718874f97e096581f66e5a7d58272e4a894516",
+  "baseline": "25c424119adaa47ad6c748d982719384e8a16b04",
+  "native_extension_sha256": "ee5bc20eb497e4b3e0a274827404fddf29f7e673260c0556571a2f9eb79d0cfd",
+  "workload": {
+    "system": "b200_sxm",
+    "backend": "vllm",
+    "backend_version": "0.24.0",
+    "database_mode": "SOL",
+    "gpu_mem_bw_bytes_per_second": 7700000000000,
+    "isl": 4096,
+    "osl": 64,
+    "batch": 4,
+    "layers": 1
+  },
+  "kind": "native SOL accounting predictions, not silicon accuracy or host performance",
+  "comparison_boundary": "baseline XPU Python class versus candidate class, both using the candidate native engine",
+  "reproduction_command": "python benchmarks/evidence/mamba-mixed-step-accounting/scoped_xpu_width.py --candidate-revision 4177ff01a63823f787949fcf854d8a8fd426069d OUT.json",
+  "cases": [
+    {
+      "prefix": 0,
+      "budget": 514,
+      "decoders": 2,
+      "width": 4,
+      "before": {
+        "prefill_tokens": 512,
+        "decode_query_tokens": 8,
+        "mixed_latency_ms": 0.003025853506493506,
+        "ttft_ms": 0.43498884088462564
+      },
+      "after": {
+        "prefill_tokens": 506,
+        "decode_query_tokens": 8,
+        "mixed_latency_ms": 0.0030097953246753244,
+        "ttft_ms": 0.43721010221964446
+      }
+    },
+    {
+      "prefix": 3000,
+      "budget": 514,
+      "decoders": 2,
+      "width": 4,
+      "before": {
+        "prefill_tokens": 512,
+        "decode_query_tokens": 8,
+        "mixed_latency_ms": 0.003025853506493506,
+        "ttft_ms": 0.4131098895712664
+      },
+      "after": {
+        "prefill_tokens": 506,
+        "decode_query_tokens": 8,
+        "mixed_latency_ms": 0.0030097953246753244,
+        "ttft_ms": 0.4131098895712664
+      }
+    }
+  ]
+}

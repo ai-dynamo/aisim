@@ -1657,3 +1657,83 @@ The Rust test passed when built separately with `cargo test --release
 qualified_mamba_round_trips_and_schema_30_layout_is_rejected`.
 Detailed attempt logs remain outside the checkout in the repair scratch area.
 The two outstanding evidence/contract decisions above remain open.
+
+## Scoped review repair after 25c42411
+
+Source correction: `4177ff01a63823f787949fcf854d8a8fd426069d`.
+The baseline is the published starting head
+`25c424119adaa47ad6c748d982719384e8a16b04`.
+[scoped-xpu-width-4177ff01.json](mamba-mixed-step-accounting/scoped-xpu-width-4177ff01.json)
+records an isolated native SOL scan graph, with both Python XPU caller versions
+using the candidate native engine. It is a caller-accounting comparison, not
+a complete historical replay, silicon measurement, calibration or host-speed
+measurement. Occupancy is fixed at two decoders and four admitted requests.
+The artifact fingerprints the loaded Python sources and its driver.
+
+Reproduce with an optimized wheel containing the source correction:
+
+```bash
+python benchmarks/evidence/mamba-mixed-step-accounting/scoped_xpu_width.py \
+  --candidate-revision 4177ff01a63823f787949fcf854d8a8fd426069d OUT.json
+```
+
+For ISL 4096, OSL 64, capacity 514 and two width-four decoders:
+
+| Quantity | Before | After |
+| --- | ---: | ---: |
+| Fresh prefill tokens in the first mixed step | 512 | 506 |
+| Decode query tokens | 8 | 8 |
+| Total scheduled tokens | 520 | 514 |
+| First mixed latency, ms (cold or prefix 3000) | 0.003025853506493506 | 0.0030097953246753244 |
+| Cold TTFT, ms | 0.43498884088462564 | 0.43721010221964446 |
+| Prefix-3000 TTFT, ms | 0.4131098895712664 | 0.4131098895712664 |
+
+The cold prompt now needs nine chunks (eight 506-token chunks and a 48-token
+tail) instead of eight 512-token chunks. That extra native scan/state and
+concurrent decode contribution explains the increased cold TTFT despite the
+smaller first step. The cached suffix still needs three chunks, so its total
+work and TTFT stay unchanged. The native regression
+`test_speculative_xpu_ttft_reserves_packed_decode_width_for_every_native_chunk`
+checks the chunk coordinates and a hand-derived traffic oracle. The FPM
+target/draft regression also uses a validated ngram configuration with
+`nextn=3`, retains the width-one control and checks capacity after translation.
+
+For the SGLang FPM case (batch 4, ISL 4096, prefix 3000, OSL 2, capacity 8192),
+the native query schedules one 1096-token suffix and three decoders. Result
+counts change from two/two to one/three; the synthetic exact-row prediction
+remains 13 ms. Capacity-based memory reservation remains 8194 tokens with two
+MTP-scaled reservation slots, independently checked by the memory-hook test.
+For qualified op-level Mamba, an overlong scheduled partial extend now raises
+before querying any operation. Aggregate capacity is explicitly translated
+first: 2048 becomes 1096 and 6000 becomes 5192 at prefix 3000 / ISL 4096,
+retaining the previously priced 1096/2192 fresh tokens and state counts.
+
+The 412 affected Python tests and both required parity modules plus the
+single-oracle contract (400 cases) passed with unchanged numerical goldens.
+Full Python lint/format and documentation-link checks passed. The optimized
+wheel was built before parity testing with Rust 1.91.1 and Python 3.12.12.
+The final Python-only qualification filter was copied into that isolated
+environment; source fingerprints verify the imported files against the source
+correction. The later Rust fixture edit changes test-only code.
+A subsequent Rust test build with thin LTO exceeded this container's 5 GiB
+memory limit. A lower-memory rerun exposed a SOL/SILICON mismatch in the new
+Rust boundary-test fixture; the fixture now uses SOL consistently. The final rerun passed all 127 runtime tests using `CARGO_PROFILE_RELEASE_LTO=false`,
+`CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`, and `CARGO_BUILD_JOBS=2`.
+Strict crate-wide Rustdoc validation still reports nine unresolved links on
+unchanged baseline text, including feature-gated Python names and `Op` aliases.
+The scoped `run_context_ops` links are gone and the referenced planned walker
+exists. These broader Rustdoc errors were not repaired in this comment scope.
+A concurrent Python verification attempt hit the CLI host-memory guard in two
+cases; the final run executes separately from native compilation. Four stale
+expectations in the generation-only control were also corrected to retain its
+legacy coordinates. Detailed commands and attempt logs remain in the repair
+scratch area.
+Full CI has not run on this corrective head; workflow-list access returned 403
+through the read-only facade. Fresh CI, reviews and reapproval remain controller
+responsibilities. The two earlier evidence/contract decisions remain open.
+
+Host-cost assessment: validation and request-count arithmetic are constant
+work per call. Aggregate translation scans the context phase list for qualified
+Mamba on a cache miss, retains no new state, and adds no pricing query. Exact
+XPU prefill may require an additional chunk when the correct decode reservation
+crosses a boundary; that is necessary modeled work, not redundant host work.
