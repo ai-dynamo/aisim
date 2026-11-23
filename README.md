@@ -91,14 +91,16 @@ limits. Choose when the data arrives:
 | Command | Effect |
 |---|---|
 | `aisim init` | In a terminal, ask whether to download now or on demand. Scripts and CI have no terminal and must pass one of the flags below. |
-| `aisim init --all` | Download the whole operation-latency database now, without asking. |
-| `aisim init --hardware h200_sxm` | Download one hardware platform now. |
+| `aisim init --all` | Download the whole operation-latency database now, without asking, and cache the Hugging Face configs of the [model manifest](docs/reference/cli.md#model-configs). |
+| `aisim init --hardware h200_sxm` | Download one hardware platform now, and cache the same model configs. |
+| `aisim data fetch --category model-config --model Qwen/Qwen3-32B` | Cache the config of one Hugging Face model (comma-separate several). |
 | `aisim data fetch --dry-run` | Show what would be downloaded, without downloading. |
 | `aisim data status` | Show the pin, cache path and size, saved choice and cached files. |
 | `aisim data clear` | Remove the cache and the saved choice. |
 
 For an offline or air-gapped host, prefetch once while connected, copy the cache
-directory, then run with `AISIM_DATA_OFFLINE=1 AISIM_DATA_CACHE=<copy>`. Roots you
+directory, then run with `AISIM_DATA_OFFLINE=1 AISIM_DATA_CACHE=<copy>`. The cache holds
+the operation data and the Hugging Face model configs. Roots you
 supply with `--systems-paths` or `AICONFIGURATOR_SYSTEMS_PATH` never download
 anything. The [CLI reference](docs/reference/cli.md#default-operation-data) lists
 every setting, and [Choose how data arrives](docs/reference/cli.md#init-status-clear)
@@ -111,7 +113,7 @@ AISim downloads from Hugging Face in two places, and a token helps in both:
 | Download | Why a token helps |
 |---|---|
 | Operation data and other datasets from `ai-dynamo/aisim-data` | Anonymous downloads are rate limited (HTTP 429). A first download without a token can stall for minutes. |
-| `config.json` (and quantization JSON) of a model AISim does not bundle | AISim fetches it from huggingface.co on first use. A gated model needs a token with access, and anonymous requests can be rate limited. |
+| `config.json` (and quantization JSON) of a model AISim does not bundle | A gated model needs a token whose account accepted the model's terms, and anonymous requests can be rate limited. |
 
 AISim uses the first token it finds and falls back to anonymous requests when there
 is none:
@@ -126,6 +128,16 @@ is none:
 `HF_TOKEN` or run `aisim init` in a terminal, which asks for the token with hidden
 input and saves it through Hugging Face's own login. AISim never writes the token to
 its own config, logs or output.
+
+**Models AISim does not bundle.** AISim reads their config from Hugging Face the first
+time a run needs it and keeps it in the data cache (`$AISIM_DATA_CACHE`, default
+`~/.cache/aisim/data/model-configs`). `main` is resolved to one commit that the cache
+records, so later runs and offline runs (`AISIM_DATA_OFFLINE=1`) use the same file.
+A rate limit (HTTP 429) is retried with backoff, honoring `Retry-After`; a gated model
+that your token cannot read is skipped with a warning by `aisim init`. Any failure other
+than "no such file" while reading the optional `hf_quant_config.json` stops the run
+rather than dropping the quantization metadata. See
+[Hugging Face model configs](docs/reference/cli.md#model-configs).
 
 ### Migrate an existing AISim environment
 

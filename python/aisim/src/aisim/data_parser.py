@@ -12,6 +12,8 @@ from __future__ import annotations
 from typing import Any
 
 SUPPORTED_CATEGORIES = ("op-latency", "fpm", "e2e", "eval")
+#: Not a dataset category: the config.json files of Hugging Face models AISim does not bundle.
+MODEL_CONFIG_CATEGORY = "model-config"
 PURPOSES = ("prediction", "validation", "results", "full-evidence")
 # Library entry purposes that hold the data a predictor reads, per category.
 # ``full-evidence`` applies no purpose filter. ``validation`` and ``results``
@@ -37,14 +39,19 @@ def _add_fetch_args(parser: Any) -> None:
     parser.add_argument(
         "--category",
         default="op-latency",
-        help=f"one of: {', '.join(SUPPORTED_CATEGORIES)} (default: op-latency; fpm, e2e and eval need selectors)",
+        help=f"one of: {', '.join((*SUPPORTED_CATEGORIES, MODEL_CONFIG_CATEGORY))} (default: op-latency; fpm, e2e and "
+        f"eval need selectors; {MODEL_CONFIG_CATEGORY} caches Hugging Face model metadata, not dataset files)",
     )
     parser.add_argument(
         "--all",
         action="store_true",
         help="whole category; op-latency only. This is also what no selector means for op-latency",
     )
-    parser.add_argument("--model")
+    parser.add_argument(
+        "--model",
+        help=f"model selector; for {MODEL_CONFIG_CATEGORY}, Hugging Face model IDs, comma-separated "
+        "(default: the manifest AISim ships)",
+    )
     parser.add_argument("--hardware")
     parser.add_argument("--framework")
     parser.add_argument("--framework-version")
@@ -62,6 +69,11 @@ def _add_fetch_args(parser: Any) -> None:
         "--dry-run", action="store_true", help="print the plan; downloads only the small catalog and manifest files"
     )
     parser.add_argument("--offline", action="store_true", help="make no network requests")
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help=f"{MODEL_CONFIG_CATEGORY} only: resolve the model's branch again instead of reusing the cached commit",
+    )
     parser.add_argument(
         "--no-limit", action="store_true", help="ignore the opt-in AISIM_DATA_MAX_BYTES limit for this download"
     )
@@ -123,7 +135,9 @@ def add_init_parser(subparsers: Any) -> None:
         help="Choose how AISim gets op-latency data: the whole database now, or on demand.",
         description=(
             "In a terminal, asks: 1) op database now, 2) op data on demand. Without a terminal, pass --all, "
-            "--on-demand or --hardware. The choice is saved in the cache root and 'aisim data clear' removes it."
+            "--on-demand or --hardware. The choice is saved in the cache root and 'aisim data clear' removes it. "
+            "--all and --hardware also cache the config.json of the Hugging Face models AISim lists in its model "
+            "manifest (--no-models skips them); a gated or denied model is skipped with a warning."
         ),
     )
     group = init.add_mutually_exclusive_group()
@@ -138,6 +152,11 @@ def add_init_parser(subparsers: Any) -> None:
     _add_source_args(init)
     init.add_argument(
         "--offline", action="store_true", help="make no network requests (downloads come from the cache only)"
+    )
+    init.add_argument(
+        "--no-models",
+        action="store_true",
+        help="do not cache the Hugging Face model configs of the manifest (--all and --hardware cache them)",
     )
     init.add_argument("--no-limit", action="store_true", help="ignore the opt-in AISIM_DATA_MAX_BYTES limit")
     init.set_defaults(data_command="init")

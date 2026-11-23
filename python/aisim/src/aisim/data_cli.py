@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """``aisim data`` (fetch, status, clear, validate), ``aisim fetch`` and ``aisim init``: a thin command line
-over ``aisim_core.data``.
+over ``aisim_core.data`` and the Hugging Face model-metadata cache (``aisim_core.sdk.hf_model_files``).
 
 Selection, revision pinning, caching and verification all live in the library;
 this module only maps flags to library calls and library results to JSON.
@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import sys
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -40,8 +41,15 @@ from aisim_core.data.fetch import (
     fetch,
     plan,
 )
+from aisim_core.sdk import hf_model_files
 
-from .data_parser import _PREDICTION_PURPOSE, PURPOSES, SUPPORTED_CATEGORIES, add_data_parser  # noqa: F401
+from .data_parser import (  # noqa: F401
+    _PREDICTION_PURPOSE,
+    MODEL_CONFIG_CATEGORY,
+    PURPOSES,
+    SUPPORTED_CATEGORIES,
+    add_data_parser,
+)
 
 EXIT_FAILURE = 1
 EXIT_USAGE = 2
@@ -174,6 +182,10 @@ def _download(selection: Selection, args: argparse.Namespace, repo: str, revisio
 
 
 def run_fetch(args: argparse.Namespace) -> int:
+    if args.category == MODEL_CONFIG_CATEGORY:
+        return run_fetch_model_configs(args)
+    if args.refresh:
+        raise UsageError(f"--refresh only applies to --category {MODEL_CONFIG_CATEGORY}")
     saved = load_config(config_path(cache_dir=args.cache_dir))
     repo, revision = resolve_source(args.repo, args.revision, config=saved)
     selection = build_selection(args)
@@ -216,8 +228,107 @@ def run_init(args: argparse.Namespace) -> int:
         # exactly that data (and an offline fetch needs no lookup) even with no flag or saved source.
         config = replace(config, repo=repo, revision=payload["fetch"]["plan"]["revision"])
     save_config(config, path)  # saved only after the download succeeded
+    if mode != "on-demand" and not args.no_models:
+        # Best effort: a model that is gated, denied or unreachable is reported, never a failed init; the loader
+        # fetches it through the same cache the next time a run needs it.
+        payload["model_configs"] = prefetch_model_configs(hf_model_files.load_manifest(), args=args)
+        _warn_about_models(payload["model_configs"])
     _emit(payload)
     return 0
+
+
+def _model_config_cache(args: argparse.Namespace) -> hf_model_files.ModelFileCache:
+    """The model-metadata cache: ``model-configs`` inside the data cache (``--cache-dir`` or ``AISIM_DATA_CACHE``)."""
+    return hf_model_files.ModelFileCache(Cache(Path(args.cache_dir) if args.cache_dir else None).root / "model-configs")
+
+
+def prefetch_model_configs(
+    models: Sequence[str],
+    *,
+    args: argparse.Namespace,
+    revision: str | None = None,
+    dry_run: bool = False,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Cache the Hugging Face metadata files of ``models`` and report each model's outcome.
+
+    A model AISim bundles needs nothing. A gated, denied or missing model is ``skipped`` and an unreachable one
+    ``failed``, both with a reason; neither stops the others. ``--offline`` and ``--dry-run`` open no connection.
+    """
+    from aisim_core.sdk.common import DefaultHFModels
+    from aisim_core.sdk.utils import model_files_to_cache
+
+    cache = _model_config_cache(args)
+    offline = bool(args.offline) or dry_run
+    transport = None if offline else hf_model_files.make_transport()
+    if not offline and models:
+        sys.stderr.write(f"{_NAME}: fetching {len(models)} model config(s) from Hugging Face into {cache.root}\n")
+    entries = []
+    for model in models:
+        entry = hf_model_files.prefetch_model(
+            model,
+            revision=revision,
+            bundled=DefaultHFModels,
+            extra_files=model_files_to_cache,
+            transport=transport,
+            cache=cache,
+            offline=offline,
+            refresh=refresh,
+        )
+        if dry_run and entry.status == "missing":
+            entry.status, entry.reason = "to-fetch", None
+        entries.append(entry)
+    counts: dict[str, int] = {}
+    for entry in entries:
+        counts[entry.status] = counts.get(entry.status, 0) + 1
+    return {
+        "cache": str(cache.root),
+        "dry_run": dry_run,
+        "offline": offline,
+        "counts": counts,
+        "models": [entry.to_dict() for entry in entries],
+    }
+
+
+def _warn_about_models(result: dict[str, Any]) -> None:
+    for entry in result["models"]:
+        if entry["status"] in ("skipped", "failed", "missing"):
+            sys.stderr.write(f"{_NAME}: warning: model config {entry['model']} {entry['status']}: {entry['reason']}\n")
+    counts = result["counts"]
+    if counts.get("failed") or counts.get("missing"):
+        sys.stderr.write(
+            f"{_NAME}: warning: {counts.get('failed', 0) + counts.get('missing', 0)} model config(s) are not cached; "
+            f"a run downloads them when it needs them, or retry with "
+            f"`aisim data fetch --category {MODEL_CONFIG_CATEGORY}`\n"
+        )
+
+
+def run_fetch_model_configs(args: argparse.Namespace) -> int:
+    """``aisim data fetch --category model-config``: the shipped manifest, or the models named by ``--model``."""
+    for flag in ("repo", "hardware", "framework", "framework_version", "operation_family"):
+        if getattr(args, flag):
+            raise UsageError(
+                f"--{flag.replace('_', '-')} does not apply to --category {MODEL_CONFIG_CATEGORY}; "
+                "select models with --model (comma-separated) and --revision"
+            )
+    if args.all or args.configuration:
+        raise UsageError(f"--all and --configuration do not apply to --category {MODEL_CONFIG_CATEGORY}")
+    models = tuple(m.strip() for m in (args.model or "").split(",") if m.strip())
+    if args.model is not None and not models:
+        raise UsageError("--model needs at least one Hugging Face model ID")
+    if args.revision and len(models) != 1:
+        raise UsageError("--revision names one model's commit: pass exactly one --model with it")
+    result = prefetch_model_configs(
+        models or hf_model_files.load_manifest(),
+        args=args,
+        revision=args.revision,
+        dry_run=args.dry_run,
+        refresh=args.refresh,
+    )
+    _emit({"category": MODEL_CONFIG_CATEGORY, **result})
+    _warn_about_models(result)
+    broken = result["counts"].get("failed", 0) + (0 if args.dry_run else result["counts"].get("missing", 0))
+    return EXIT_FAILURE if broken else 0
 
 
 _TOKEN_URL = "https://huggingface.co/settings/tokens"
@@ -309,6 +420,7 @@ def run_status(args: argparse.Namespace) -> int:
             entry["error"] = str(exc)
         revisions.append(entry)
     pinned_cached = any(r["pinned"] for r in revisions)
+    models = _model_config_cache(args)
     payload = {
         "pin": {
             "repo": repo,
@@ -324,6 +436,11 @@ def run_status(args: argparse.Namespace) -> int:
             "saved": saved is not None,
             "config": str(path),
         },
+        "model_configs": {
+            "path": str(models.root),
+            "models": len(models.repos()),
+            "size_bytes": _dir_size(models.root) if models.root.is_dir() else 0,
+        },
         "revisions": revisions,
     }
     _emit(payload)
@@ -334,7 +451,7 @@ def run_clear(args: argparse.Namespace) -> int:
     cache = Cache(Path(args.cache_dir) if args.cache_dir else None)
     path = config_path(cache_dir=args.cache_dir)
     targets = [p for _, _, p in _sha_dirs(cache)]
-    extras = [p for p in (cache.root / "materialized",) if p.exists()]
+    extras = [p for p in (cache.root / "materialized", _model_config_cache(args).root) if p.exists()]
     sizes = sum(_dir_size(p) for p in (*targets, *extras))
     if not args.yes:
         if not sys.stdin.isatty():

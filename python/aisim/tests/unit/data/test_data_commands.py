@@ -18,6 +18,7 @@ from aisim_core.data.config import InitConfig, config_path, load_config, resolve
 from aisim_core.data.ensure import DataPin, _command, pin_from_environment
 from aisim_core.data.fetch import Selection
 from aisim_core.data.parquet import write_parquet
+from aisim_core.sdk import hf_model_files
 
 from .test_fetch import REPO, SHA, FakeTransport, NoNetwork, _artifact_json
 
@@ -176,18 +177,46 @@ def env(monkeypatch, tmp_path):
     return cache
 
 
+ALPHA, BETA, GATED, LIMITED = "acme/Alpha", "acme/Beta", "acme/Gated", "acme/Limited"
+BUNDLED = "meta-llama/Meta-Llama-3.1-8B"  # a model AISim bundles: nothing to fetch
+MODEL_SHA = "d" * 40
+
+
+class FakeModelHub:
+    """Hugging Face model repositories: every model has a ``config.json`` at ``MODEL_SHA``; two are not readable."""
+
+    def __init__(self):
+        self.calls: list[tuple] = []
+        self.denied = {GATED: 403, LIMITED: 429}
+
+    def resolve_revision(self, repo, revision):
+        self.calls.append(("resolve", repo, revision))
+        return MODEL_SHA
+
+    def read_file(self, repo, sha, filename):
+        self.calls.append(("read", repo, filename))
+        if repo in self.denied:
+            raise hf_model_files.HuggingFaceHTTPError(f"HTTP {self.denied[repo]} for {repo}", self.denied[repo])
+        return b'{"architectures": ["LlamaForCausalLM"]}' if filename == "config.json" else None
+
+
 @pytest.fixture
 def run(monkeypatch, tmp_path, capsys, env):
     files = build_ops(tmp_path)
     transport = FakeTransport(files)
     monkeypatch.setattr(data_cli, "make_transport", lambda: transport)
+    hub = FakeModelHub()
+    manifest = tmp_path / "hf_model_manifest.json"
+    manifest.write_text(json.dumps({"version": 1, "models": [ALPHA, BETA, GATED, LIMITED, BUNDLED]}))
+    monkeypatch.setattr(hf_model_files, "make_transport", lambda: hub)
+    monkeypatch.setattr(hf_model_files, "MANIFEST_PATH", manifest)
 
     def _run(*argv):
         status = main(list(argv))
         out = capsys.readouterr()
         return status, out.out, out.err
 
-    _run.transport, _run.files, _run.cache = transport, files, env
+    _run.transport, _run.files, _run.cache, _run.hub = transport, files, env, hub
     return _run
 
 
@@ -867,3 +896,139 @@ def test_fetch_hands_the_sha_only_to_the_repository_that_resolved_it(monkeypatch
     data_cli._download(Selection(category="fpm", model="m1", hardware="h200"), args, repo, "main")
     # Under the retired name fetch() follows the alias itself, for the commit the plan resolved and budgeted.
     assert seen == {**expected, "repo": repo}
+
+
+# ------------------------------------------------------------------ Hugging Face model configs
+
+
+def _cached_models(cache_root):
+    return sorted(p.parent.name for p in (cache_root / "model-configs").glob("*/*/refs"))
+
+
+def test_init_all_caches_the_manifest_models_and_warns_about_the_ones_it_cannot_read(run):
+    status, out, err = run("init", "--all", "--revision", SHA)
+    result = json.loads(out)["model_configs"]
+    assert status == 0 and load_config().mode == "all"  # a gated or rate-limited model never fails init
+    assert result["counts"] == {"fetched": 2, "skipped": 1, "failed": 1, "bundled": 1}
+    by_model = {e["model"]: e for e in result["models"]}
+    assert by_model[ALPHA]["status"] == "fetched" and by_model[ALPHA]["revision"] == MODEL_SHA
+    assert by_model[GATED]["status"] == "skipped" and "gated or private" in by_model[GATED]["reason"]
+    assert by_model[LIMITED]["status"] == "failed" and by_model[BUNDLED]["status"] == "bundled"
+    assert _cached_models(run.cache) == ["Alpha", "Beta"]
+    assert f"warning: model config {GATED} skipped" in err and f"warning: model config {LIMITED} failed" in err
+    assert "1 model config(s) are not cached" in err and "aisim data fetch --category model-config" in err
+    assert not any(call[1] == BUNDLED for call in run.hub.calls)  # AISim ships it: no request
+
+
+def test_init_hardware_also_caches_the_model_configs(run):
+    status, out, _ = run("init", "--hardware", "h200_sxm", "--revision", SHA)
+    assert status == 0 and json.loads(out)["model_configs"]["counts"]["fetched"] == 2
+
+
+def test_init_on_demand_and_no_models_touch_neither_the_hub_nor_the_cache(run):
+    for argv in (["init", "--on-demand"], ["init", "--all", "--no-models", "--revision", SHA]):
+        status, out, _ = run(*argv)
+        assert status == 0 and "model_configs" not in json.loads(out)
+    assert run.hub.calls == [] and _cached_models(run.cache) == []
+
+
+def test_init_all_offline_reads_the_model_cache_and_makes_no_request(run):
+    run("init", "--all", "--revision", SHA)
+    run.hub.calls.clear()
+    status, out, err = run("init", "--all", "--offline", "--revision", SHA)
+    counts = json.loads(out)["model_configs"]["counts"]
+    assert status == 0 and counts == {"cached": 2, "missing": 2, "bundled": 1}  # nothing was cached for the other two
+    assert run.hub.calls == [] and f"model config {GATED} missing" in err
+
+
+def test_init_without_a_terminal_prints_warnings_on_stderr_and_one_json_object_on_stdout(run):
+    status, out, err = run("init", "--all", "--revision", SHA)
+    assert status == 0 and json.loads(out)["mode"] == "all" and "warning" in err and "warning" not in out
+
+
+def test_fetch_model_config_defaults_to_the_manifest_and_fails_only_for_unreachable_models(run):
+    status, out, err = run("fetch", "--category", "model-config")
+    payload = json.loads(out)
+    assert (
+        status == 1 and payload["category"] == "model-config" and payload["cache"] == str(run.cache / "model-configs")
+    )
+    assert payload["counts"] == {"fetched": 2, "skipped": 1, "failed": 1, "bundled": 1}
+    assert "fetching 5 model config(s)" in err
+    run.hub.denied.pop(LIMITED)  # the rate limit passed
+    status, out, _ = run("data", "fetch", "--category", "model-config")
+    assert status == 0 and json.loads(out)["counts"] == {"cached": 2, "fetched": 1, "skipped": 1, "bundled": 1}
+
+
+def test_fetch_model_config_selects_models_and_a_revision(run):
+    status, out, _ = run("fetch", "--category", "model-config", "--model", f"{ALPHA}, {BETA}")
+    assert status == 0 and [e["model"] for e in json.loads(out)["models"]] == [ALPHA, BETA]
+    status, out, _ = run("fetch", "--category", "model-config", "--model", ALPHA, "--revision", "e" * 40)
+    entry = json.loads(out)["models"][0]
+    assert status == 0 and entry["revision"] == "e" * 40 and ("resolve", ALPHA, "e" * 40) not in run.hub.calls
+    # A bundled model with an explicit revision is cached: the FPM profile reads its pinned config that way.
+    status, out, _ = run("fetch", "--category", "model-config", "--model", BUNDLED, "--revision", "f" * 40)
+    assert json.loads(out)["models"][0]["status"] == "fetched"
+
+
+def test_fetch_model_config_refresh_resolves_the_branch_again(run):
+    run("fetch", "--category", "model-config", "--model", ALPHA)
+    run.hub.calls.clear()
+    run("fetch", "--category", "model-config", "--model", ALPHA)
+    assert run.hub.calls == []  # the pinned commit is reused
+    run("fetch", "--category", "model-config", "--model", ALPHA, "--refresh")
+    assert ("resolve", ALPHA, "main") in run.hub.calls
+
+
+def test_fetch_model_config_dry_run_opens_no_connection(run):
+    status, out, _ = run("fetch", "--category", "model-config", "--dry-run")
+    payload = json.loads(out)
+    assert status == 0 and payload["dry_run"] is True and run.hub.calls == []
+    assert payload["counts"] == {"to-fetch": 4, "bundled": 1}
+    run("fetch", "--category", "model-config", "--model", ALPHA)
+    status, out, _ = run("fetch", "--category", "model-config", "--model", ALPHA, "--dry-run")
+    assert json.loads(out)["models"][0]["status"] == "cached"
+
+
+def test_fetch_model_config_offline_reports_what_is_not_cached(run):
+    status, out, err = run("fetch", "--category", "model-config", "--model", ALPHA, "--offline")
+    entry = json.loads(out)["models"][0]
+    assert status == 1 and entry["status"] == "missing" and run.hub.calls == []
+    assert "aisim data fetch --category model-config" in err
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--hardware", "h200_sxm"], "--hardware does not apply"),
+        (["--repo", REPO], "--repo does not apply"),
+        (["--all"], "--all and --configuration do not apply"),
+        (["--configuration", "x"], "--all and --configuration do not apply"),
+        (["--revision", SHA], "exactly one --model"),
+        (["--model", "a/b,c/d", "--revision", SHA], "exactly one --model"),
+        (["--model", " , "], "--model needs at least one"),
+    ],
+)
+def test_fetch_model_config_rejects_selectors_it_cannot_honor(run, argv, message):
+    status, out, err = run("fetch", "--category", "model-config", *argv)
+    assert status == 2 and out == "" and message in err and run.hub.calls == []
+
+
+def test_refresh_is_only_for_model_configs(run):
+    status, _, err = run("fetch", "--refresh")
+    assert status == 2 and "--refresh only applies to --category model-config" in err and run.transport.opened == []
+
+
+def test_status_reports_the_model_config_cache_and_clear_removes_it(run):
+    run("fetch", "--category", "model-config", "--model", f"{ALPHA},{BETA}")
+    models = json.loads(run("data", "status")[1])["model_configs"]
+    assert models["path"] == str(run.cache / "model-configs") and models["models"] == 2 and models["size_bytes"] > 0
+    status, out, _ = run("data", "clear", "--yes")
+    assert status == 0 and json.loads(out)["freed_bytes"] > 0 and not (run.cache / "model-configs").exists()
+    assert json.loads(run("data", "status")[1])["model_configs"]["models"] == 0
+
+
+def test_the_model_cache_follows_cache_dir(run, tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    status, out, _ = run("fetch", "--category", "model-config", "--model", ALPHA, "--cache-dir", str(elsewhere))
+    assert status == 0 and json.loads(out)["cache"] == str(elsewhere / "model-configs")
+    assert _cached_models(elsewhere) == ["Alpha"] and _cached_models(run.cache) == []
