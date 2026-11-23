@@ -388,10 +388,10 @@ def load_system_spec(
 
 
 def _is_nvidia_system_spec(spec: dict) -> bool:
-    gpu = spec.get("gpu")
-    if not isinstance(gpu, dict):
+    if not spec:
         return False
-    if "vendor" not in gpu:
+    gpu = spec.get("gpu")
+    if isinstance(gpu, dict) and "vendor" not in gpu:
         return True
     return _gpu_vendor(gpu, "the loaded system spec") == "nvidia"
 

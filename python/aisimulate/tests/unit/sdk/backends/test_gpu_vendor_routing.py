@@ -170,3 +170,27 @@ def test_unknown_vendor_fails_loud() -> None:
         is_xpu_system_spec({"gpu": {"vendor": None}})
     with pytest.raises(ValueError, match="gpu.vendor"):
         get_backend("vllm", "ignored", system_spec={"gpu": {"vendor": None}})
+
+
+@pytest.mark.parametrize("classifier", [is_blackwell_system, is_hopper_system])
+@pytest.mark.parametrize("spec_yaml", ["gpu: null", "gpu: []", "gpu: invalid", "gpu: 42", "node: {}"])
+def test_arch_classification_rejects_malformed_gpu_block(tmp_path, monkeypatch, classifier, spec_yaml) -> None:
+    (tmp_path / "malformed.yaml").write_text(spec_yaml, encoding="utf-8")
+    monkeypatch.setattr("aisimulate_core.sdk.perf_database.get_systems_paths", lambda: [str(tmp_path)])
+
+    with pytest.raises(ValueError, match="Cannot resolve GPU spec"):
+        classifier("malformed")
+
+
+@pytest.mark.parametrize("classifier", [is_blackwell_system, is_hopper_system])
+@pytest.mark.parametrize("system_name", [None, "", "unknown-system"])
+def test_arch_classification_without_a_spec_returns_false(tmp_path, monkeypatch, classifier, system_name) -> None:
+    monkeypatch.setattr("aisimulate_core.sdk.perf_database.get_systems_paths", lambda: [str(tmp_path)])
+
+    assert classifier(system_name) is False
+
+
+@pytest.mark.parametrize("classifier", [is_blackwell_system, is_hopper_system])
+@pytest.mark.parametrize("system_name", ["b60", "ascend_950dt"])
+def test_non_nvidia_systems_keep_their_arch_classification(classifier, system_name) -> None:
+    assert classifier(system_name) is False
