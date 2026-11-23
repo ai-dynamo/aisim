@@ -85,7 +85,8 @@ aisim --help
 > composed root instead.
 
 The first prediction downloads about 235 MB and needs network access; later runs
-reuse the cache. Choose when the data arrives:
+reuse the cache. Use a [Hugging Face token](#hugging-face-token) to avoid rate
+limits. Choose when the data arrives:
 
 | Command | Effect |
 |---|---|
@@ -102,6 +103,29 @@ supply with `--systems-paths` or `AICONFIGURATOR_SYSTEMS_PATH` never download
 anything. The [CLI reference](docs/reference/cli.md#default-operation-data) lists
 every setting, and [Choose how data arrives](docs/reference/cli.md#init-status-clear)
 covers `init`, `status` and `clear`.
+
+### Hugging Face token
+
+AISim downloads from Hugging Face in two places, and a token helps in both:
+
+| Download | Why a token helps |
+|---|---|
+| Operation data and other datasets from `ai-dynamo/aisim-data` | Anonymous downloads are rate limited (HTTP 429). A first download without a token can stall for minutes. |
+| `config.json` (and quantization JSON) of a model AISim does not bundle | AISim fetches it from huggingface.co on first use. A gated model needs a token with access, and anonymous requests can be rate limited. |
+
+AISim uses the first token it finds and falls back to anonymous requests when there
+is none:
+
+1. the `HF_TOKEN` environment variable;
+2. the `HUGGING_FACE_HUB_TOKEN` environment variable;
+3. the login saved by `hf auth login` or by `aisim init` (`~/.cache/huggingface/token`,
+   or `$HF_HOME/token`).
+
+`HF_HUB_DISABLE_IMPLICIT_TOKEN=1` turns this off. Create a free read-only token at
+[huggingface.co/settings/tokens](https://huggingface.co/settings/tokens), then export
+`HF_TOKEN` or run `aisim init` in a terminal, which asks for the token with hidden
+input and saves it through Hugging Face's own login. AISim never writes the token to
+its own config, logs or output.
 
 ### Migrate an existing AISim environment
 

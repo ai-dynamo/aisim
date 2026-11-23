@@ -89,6 +89,19 @@ runs select that data), in `config.json` in the cache root: `~/.cache/aisim/conf
 Precedence is flag, then environment variable, then config file, then shipped default; the config never
 overrides an environment variable.
 
+<a id="hugging-face-token"></a>
+
+Before any download, `init` checks for a Hugging Face token (`HF_TOKEN`, or a login saved by `hf auth login`).
+Anonymous downloads are rate limited (HTTP 429), and the op-latency database is thousands of files, so a first
+download without a token can stall for minutes. When no token is found, `init` says so on stderr and, in a
+terminal, offers a hidden prompt: paste a free read-only token from <https://huggingface.co/settings/tokens>, or
+press Enter to continue anonymously. A pasted token is validated and saved by Hugging Face's own login, so every
+Hugging Face tool and later AISim downloads use it, including the `config.json` AISim fetches for a model it does not
+bundle; it is never written to AISim's config, logs or output. The lookup order is `HF_TOKEN`, then
+`HUGGING_FACE_HUB_TOKEN`, then the saved login (`$HF_HOME/token`), then anonymous requests;
+`HF_HUB_DISABLE_IMPLICIT_TOKEN=1` skips all three. Without a
+terminal `init` only prints the notice, so scripts set `HF_TOKEN`. `--offline` skips the step.
+
 `aisim data status` prints the pin, the cache path and size on disk, the saved init mode, and for every cached
 revision its size and how many files of the whole op-latency database are cached or missing (computed offline).
 
