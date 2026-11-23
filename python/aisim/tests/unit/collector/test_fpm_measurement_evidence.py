@@ -457,6 +457,42 @@ def test_internal_decode_samples_remain_one_launch_estimate(tmp_path):
     assert point["ranks"]["0"]["raw_fpms"][-1]["wall_time"] == 0.03
 
 
+def test_raw_sample_workload_rule_applies_to_the_producer_contract_only(tmp_path):
+    # Dynamo's own adjacent_upper_median samples are adjacent decode steps of one launch, so the KV total of each
+    # sample grows by the batch size, and a cell without the producer contract may run a global warm-up.
+    collection = _artifacts(tmp_path)
+
+    def adjacent(payload):
+        fpm = payload["results"][0]["fpms"][0]
+        measurement = fpm["benchmark_measurement"]
+        rank = payload["dp"]["rank"]
+        batch = payload["results"][0]["point"]["batch_size"]
+        measurement.update(
+            expected_internal_samples=4,
+            raw_fpms=[
+                {
+                    "counter_id": fpm["counter_id"],
+                    "dp_rank": rank,
+                    "wall_time": fpm["wall_time"] * scale,
+                    "scheduled_requests": {"num_decode_requests": batch, "sum_decode_kv_tokens": 64 + step * batch},
+                }
+                for step, scale in enumerate((4, 0.8, 1, 3))
+            ],
+            estimate={"method": "adjacent_upper_median", "raw_sample_indices": [1, 2, 3]},
+        )
+        payload["measurement_protocol"]["preparation"]["warmup_iterations"] = 5
+
+    _edit(tmp_path, adjacent)
+    _edit(tmp_path, _add_execution_protocol)
+    evidence = extract_measurement_evidence(tmp_path, collection)
+    point = next(iter(evidence["points"].values()))
+    assert evidence["measurement_protocol"]["preparation"]["warmup_iterations"] == 5
+    assert point["wall_time_seconds"] == 0.011
+    samples = point["ranks"]["0"]["raw_fpms"]
+    assert [sample["scheduled_requests"]["sum_decode_kv_tokens"] for sample in samples] == [64, 68, 72, 76]
+    assert samples[-1]["wall_time"] == 0.03
+
+
 def test_duplicate_launch_cannot_count_as_an_independent_repetition(tmp_path):
     left, _, key = _read_pair(tmp_path)
     assert compare_measurements(left, copy.deepcopy(left), point_key=key)["status"] == "mismatch"

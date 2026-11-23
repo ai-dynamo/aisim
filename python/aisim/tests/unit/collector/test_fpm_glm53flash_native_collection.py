@@ -1449,6 +1449,148 @@ def test_glm_publication_refuses_a_producer_record_whose_retained_median_moved(t
     assert "benchmark_measurement reduction disagrees with retained timing" in str(error.value)
 
 
+def _publication_refusal(tmp_path, phase, tamper) -> str:
+    """Shape a GLM-5.3-Flash artifact as the producer writes it, apply ``tamper``, and return publication's refusal.
+
+    The native validator must accept the tampered artifact, so that the refusal comes from the measurement record.
+    """
+    cell = glm_cell(phase)
+    points = [PREFILL_COLD, PREFILL_CACHED] if phase == "prefill" else DECODE_POINTS
+    payload = glm_native_payload(phase, points=points)
+    _glm_producer_shape(tmp_path)(phase, payload)
+    tamper(payload)
+    write_glm_rank(_pod(tmp_path, cell), payload)
+    _validate(tmp_path, cell)
+    with pytest.raises(ValueError) as error:
+        database.aggregate_cell(_glm_plan(), cell, tmp_path, expected_attempt_id=ATTEMPT_ID)
+    return str(error.value)
+
+
+def _first_record(payload) -> dict:
+    return payload["results"][0]["fpms"][0]["benchmark_measurement"]
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_glm_publication_refuses_a_raw_sample_of_another_workload(tmp_path, phase):
+    def tamper(payload):
+        scheduled = _first_record(payload)["raw_fpms"][3]["scheduled_requests"]
+        if phase == "prefill":
+            scheduled["sum_prefill_tokens"] += 4
+        else:
+            scheduled["sum_decode_kv_tokens"] += 1
+
+    refusal = _publication_refusal(tmp_path, phase, tamper)
+    assert "benchmark_measurement raw sample 3 does not hold the workload of its point" in refusal
+
+
+def test_glm_publication_refuses_a_global_warmup_in_the_protocol(tmp_path):
+    def tamper(payload):
+        payload["measurement_protocol"]["preparation"]["warmup_iterations"] = 5
+
+    refusal = _publication_refusal(tmp_path, "prefill", tamper)
+    assert (
+        "measurement_protocol.preparation.warmup_iterations must be 0 for the GLM-5.3-Flash producer: "
+        "expected 0, found 5"
+    ) in refusal
+
+
+_ABSENT = object()
+
+
+def _set_scheduled(index, key, value):
+    def tamper(payload):
+        sample = _first_record(payload)["raw_fpms"][index]
+        if key is None:
+            sample["scheduled_requests"] = value
+        elif value is _ABSENT:
+            del sample["scheduled_requests"][key]
+        else:
+            sample["scheduled_requests"][key] = value(sample["scheduled_requests"][key])
+
+    return tamper
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+@pytest.mark.parametrize(
+    ("index", "tamper"),
+    [
+        pytest.param(0, _set_scheduled(0, None, None), id="first-sample-without-a-mapping"),
+        pytest.param(9, _set_scheduled(9, None, []), id="last-sample-holds-a-list"),
+        pytest.param(3, _set_scheduled(3, "num_decode_requests", _ABSENT), id="key-absent"),
+        pytest.param(3, _set_scheduled(3, "num_prefill_requests", float), id="count-is-a-float"),
+        pytest.param(3, _set_scheduled(3, "sum_prefill_kv_tokens", bool), id="count-is-a-boolean"),
+        pytest.param(3, _set_scheduled(3, "sum_decode_kv_tokens", str), id="count-is-a-string"),
+    ],
+)
+def test_glm_publication_refuses_a_raw_sample_whose_workload_is_malformed(tmp_path, phase, index, tamper):
+    # The producer copies vLLM's integer counts into each raw sample, so a count of another JSON type that compares
+    # equal (1.0, False for 0) is no workload that the producer writes.
+    refusal = _publication_refusal(tmp_path, phase, tamper)
+    assert f"benchmark_measurement raw sample {index} does not hold the workload of its point" in refusal
+
+
+@pytest.mark.parametrize("value", [True, 0.0, 1.0, "0", None], ids=["boolean", "zero-float", "float", "string", "null"])
+def test_glm_publication_keeps_the_form_refusal_of_a_warmup_count_that_is_no_integer(tmp_path, value):
+    def tamper(payload):
+        payload["measurement_protocol"]["preparation"]["warmup_iterations"] = value
+
+    refusal = _publication_refusal(tmp_path, "prefill", tamper)
+    assert "measurement_protocol has malformed preparation settings" in refusal
+
+
+def _global_warmup(payload):
+    payload["measurement_protocol"]["preparation"]["warmup_iterations"] = 5
+
+
+def _unobserved_is_text(payload):
+    payload["measurement_protocol"]["unobserved"] = "kv_cache_tensors"
+
+
+def _raw_sample_of_another_workload(payload):
+    _first_record(payload)["raw_fpms"][3]["scheduled_requests"]["sum_prefill_tokens"] += 4
+
+
+def _eleven_expected_samples(payload):
+    _first_record(payload)["expected_internal_samples"] = 11
+
+
+def _raw_sample_is_a_list(payload):
+    _first_record(payload)["raw_fpms"][3] = []
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "text"),
+    [
+        pytest.param(
+            _unobserved_is_text,
+            _global_warmup,
+            "measurement_protocol must describe unobserved inputs",
+            id="unobserved-inputs-before-the-global-warmup",
+        ),
+        pytest.param(
+            _eleven_expected_samples,
+            _raw_sample_of_another_workload,
+            "benchmark_measurement does not hold the producer's ten measured repetitions",
+            id="ten-repetitions-before-the-raw-sample-workload",
+        ),
+        pytest.param(
+            _raw_sample_is_a_list,
+            lambda payload: None,
+            "benchmark_measurement has invalid raw counter/rank/timing evidence",
+            id="raw-sample-form-before-the-raw-sample-workload",
+        ),
+    ],
+)
+def test_glm_publication_reads_the_measurement_record_in_its_order(tmp_path, first, second, text):
+    # The check of the measurement record that runs first names its fault when an artifact holds two faults. A raw
+    # sample that is no mapping holds no workload, so the form check of the raw samples names it.
+    def tamper(payload):
+        first(payload)
+        second(payload)
+
+    assert text in _publication_refusal(tmp_path, "prefill", tamper)
+
+
 def test_glm_publication_refuses_an_artifact_without_the_producer_protocol(tmp_path):
     # The producer writes its measurement protocol into every rank artifact, so an artifact without it is not the
     # producer's, although the native validator accepts it.
