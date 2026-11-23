@@ -2168,6 +2168,24 @@ def test_grouped_plan_that_fails_a_prefix_caching_requirement_stays_cold(
     assert json.loads((output / "prediction/prediction.json").read_text())["completed_requests"] == 2
 
 
+def test_grouped_plan_with_a_prefix_cacheable_convolution_group_keeps_prefix_caching_on(
+    grouped_case, tmp_path, monkeypatch
+):
+    # The Rust rule table takes a prefix-cacheable convolution group as a sliding window, so a hand-made profile with
+    # evidence and markers on a modeled version plans prefix caching on with such a group. validate-fpm tests FPM
+    # timing, so its replay stays cold and runs.
+    profile, _root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile))
+    for deployment in profile["deployments"]:
+        deployment["resources"]["cache_groups"].append(dict(_CONVOLUTION_GROUP))
+    plan, output = _plan_and_validate_weka(profile, tmp_path, monkeypatch, version="0.31.0", context_length=1024)
+    for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
+        worker = yaml.safe_load((plan / name).read_text())["engine"]["workers"]["aggregated"]
+        assert worker["kv_cache"]["prefix_caching"] is True
+    assert json.loads((output / "validation.json").read_text())["status"] == "covered"
+    assert json.loads((output / "prediction/prediction.json").read_text())["completed_requests"] == 2
+
+
 @pytest.mark.parametrize("prefix_caching", [False, True])
 def test_grouped_sweeper_candidate_rank_takes_the_probe_hash_block(grouped_case, prefix_caching):
     from aisim.sweeper.config import SearchSpace
