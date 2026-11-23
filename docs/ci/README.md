@@ -342,8 +342,8 @@ with the job's read-only token:
 | `main` after the wait | Scope | Comparison base |
 | --- | --- | --- |
 | Still this commit | Every component | Last full-scope main commit with successful comparisons |
-| A newer commit that contains this one | Superseded: build, verify, and stage this commit's wheel | Previous main commit, used only by license evidence |
-| Unreadable, or a commit that does not contain this one | Every component | Last full-scope main commit with successful comparisons |
+| A newer commit that contains this one and has a scheduled or successful Full CI push run | Superseded: build, verify, and stage this commit's wheel | Previous main commit, used only by license evidence |
+| No eligible successor run, unreadable state, or a commit that does not contain this one | Every component | Last full-scope main commit with successful comparisons |
 
 Reruns (`github.run_attempt > 1`) always select every component, even if `main`
 advanced after the first attempt. Retrying a failed full-scope run therefore
@@ -353,10 +353,10 @@ A superseded run builds the application test wheel, verifies and smoke-tests it 
 **Application Wheel**, collects license evidence, and stages the wheel through
 `automated-release`. Its application test legs and every other component are
 explicit N/A, and `Full CI Success` reports the commit as superseded.
-**Its staged wheel was built and verified, but its full test suite ran only with a
-later main commit that contains it.** A failure in that later run can come from
-any commit in the batch. Its **Select Full CI Scope** summary lists the commits it
-covers. Manual Full CI runs only branch heads, so check an individual deferred
+**Its staged wheel was built and verified. Its full test suite was deferred to
+the successor Full CI run named in the scope summary.** Check the successor
+result. A later failure can come from any commit in the batch. The successor's
+**Select Full CI Scope** summary lists the commits it covers. Manual Full CI runs only branch heads, so check an individual deferred
 commit locally or through a PR.
 
 The newest run compares old and new revisions from the last full-scope main

@@ -4,8 +4,8 @@
 """Select the expensive Full CI components required by changed paths.
 
 Pushes to main are batched: after a bounded wait, a commit that main has
-already moved past builds, verifies, and stages its wheel only, and the newest
-commit runs every component against the last full-scope main commit whose
+already moved past can build, verify, and stage its wheel with tests deferred
+to an available successor run. The newest run selects every component against the last full-scope main commit whose
 comparison jobs completed successfully. Reruns always keep the full scope.
 """
 
@@ -47,7 +47,7 @@ APPLICATION_TEST_WHEEL_CONSUMERS = {
     "release_artifact_contract",
 }
 # A main commit that a newer main commit has superseded still builds, verifies,
-# and stages its own wheel. Its test suite runs with the newer commit.
+# and stages its own wheel. Its test suite is deferred to the successor run.
 SUPERSEDED_MAIN_COMPONENTS = {
     "application_test_wheel",
     "application_wheel",
@@ -479,6 +479,31 @@ def last_full_scope_commit(
     )
 
 
+def _main_successor_run(repository: str, sha: str, *, api: Callable[[str], dict]) -> int | None:
+    """Find a scheduled or successful Full CI push run for the newer main commit."""
+    query = urlencode({"branch": "main", "event": "push", "head_sha": sha, "per_page": 1})
+    runs = api(f"repos/{repository}/actions/workflows/ci.yml/runs?{query}").get("workflow_runs")
+    if not isinstance(runs, list) or not runs:
+        return None
+    run = runs[0]
+    if (
+        not isinstance(run, dict)
+        or run.get("path") != WORKFLOW_PATH
+        or run.get("event") != "push"
+        or run.get("head_branch") != "main"
+        or run.get("head_sha") != sha
+        or type(run.get("id")) is not int
+        or run["id"] <= 0
+    ):
+        return None
+    status, conclusion = run.get("status"), run.get("conclusion")
+    if (status, conclusion) == ("completed", "success"):
+        return run["id"]
+    if conclusion is None and status in ("requested", "queued", "pending", "waiting", "in_progress"):
+        return run["id"]
+    return None
+
+
 def resolve_main_push(
     repository: str,
     sha: str,
@@ -515,18 +540,25 @@ def resolve_main_push(
         status = "unavailable"
         notes.append(("warning", f"Could not compare this commit with main ({error}); running the full scope."))
     if status == "ahead" and run_attempt == 1:
-        return {
-            "superseded": True,
-            "main_sha": main_sha,
-            "comparison_base": parent,
-            "notes": [
-                (
-                    "notice",
-                    f"main moved to `{main_sha}`, which contains this commit. This run builds, verifies, "
-                    "and stages this commit's wheel; its full test suite runs with the newer main commit.",
-                )
-            ],
-        }
+        try:
+            successor_run = _main_successor_run(repository, main_sha, api=api)
+        except GitHubError as error:
+            notes.append(("warning", f"Could not verify Full CI for newer main ({error}); running the full scope."))
+        else:
+            if successor_run is not None:
+                return {
+                    "superseded": True,
+                    "main_sha": main_sha,
+                    "comparison_base": parent,
+                    "notes": [
+                        (
+                            "notice",
+                            f"main moved to `{main_sha}`, which contains this commit. This run builds, verifies, "
+                            f"and stages this commit's wheel and defers its full suite to Full CI run {successor_run}.",
+                        )
+                    ],
+                }
+            notes.append(("warning", f"No eligible Full CI run for newer main `{main_sha}`; running the full scope."))
     if run_attempt > 1:
         notes.append(("notice", f"Run attempt {run_attempt} keeps the full scope to retry every required component."))
     if status not in {"ahead", "identical", "unavailable"}:

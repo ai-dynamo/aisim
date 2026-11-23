@@ -1178,7 +1178,7 @@ jobs:
               summary += [
                   "",
                   "Superseded main commit: its wheel was built, verified, and staged;"
-                  " its full test suite runs with a newer main commit.",
+                  " its tests are deferred to the successor run named in Select Full CI Scope.",
               ]
           if summary_path := os.environ.get("GITHUB_STEP_SUMMARY"):
               with open(summary_path, "a", encoding="utf-8") as handle:

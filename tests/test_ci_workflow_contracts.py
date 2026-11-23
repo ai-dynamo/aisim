@@ -3076,6 +3076,7 @@ def _main_batch_api(
     *,
     compare: dict[str, str] | None = None,
     runs: tuple[dict, ...] = (),
+    successor: dict | Exception | None = None,
     jobs: dict[int, dict | list[dict]] | None = None,
     failing: tuple[str, ...] = (),
 ) -> tuple[object, list]:
@@ -3093,6 +3094,11 @@ def _main_batch_api(
             return {"status": (compare or {})[path.rsplit("/", 1)[1]]}
         if path == "repos/ai-dynamo/aisim/actions/workflows/ci.yml/runs":
             query = parse_qs(urlsplit(endpoint).query)
+            if "head_sha" in query:
+                assert query == {"branch": ["main"], "event": ["push"], "head_sha": [main_sha], "per_page": ["1"]}
+                if isinstance(successor, Exception):
+                    raise successor
+                return {"workflow_runs": [successor] if successor else []}
             page = int(query.pop("page", ["1"])[0])
             assert query == {
                 "branch": ["main"],
@@ -3115,19 +3121,25 @@ def _main_batch_api(
     return api, calls
 
 
-def test_main_push_waits_then_defers_its_tests_when_main_moved_on() -> None:
-    api, calls = _main_batch_api(MAIN_NEWER, compare={f"{MAIN_TARGET}...{MAIN_NEWER}": "ahead"})
+@pytest.mark.parametrize(("status", "conclusion"), [("queued", None), ("in_progress", None), ("completed", "success")])
+def test_main_push_waits_then_defers_its_tests_when_main_moved_on(status: str, conclusion: str | None) -> None:
+    api, calls = _main_batch_api(
+        MAIN_NEWER,
+        compare={f"{MAIN_TARGET}...{MAIN_NEWER}": "ahead"},
+        successor=_main_run(201, MAIN_NEWER, status=status, conclusion=conclusion),
+    )
 
     batch = full_ci_selector.resolve_main_push(
         "ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, api=api, sleep=lambda seconds: calls.append(seconds)
     )
 
     assert full_ci_selector.MAIN_DEBOUNCE_SECONDS == 600
-    # Wait first, then require that the newer main head contains this commit.
+    # Wait first, then confirm ancestry and an available run for the successor.
     assert calls == [
         600,
         "repos/ai-dynamo/aisim/commits/main",
         f"repos/ai-dynamo/aisim/compare/{MAIN_TARGET}...{MAIN_NEWER}?per_page=1",
+        f"repos/ai-dynamo/aisim/actions/workflows/ci.yml/runs?branch=main&event=push&head_sha={MAIN_NEWER}&per_page=1",
     ]
     assert batch["superseded"] is True
     assert batch["main_sha"] == MAIN_NEWER
@@ -3138,6 +3150,36 @@ def test_main_push_waits_then_defers_its_tests_when_main_moved_on() -> None:
         "application_test_wheel",
         "application_wheel",
     }
+
+
+@pytest.mark.parametrize(
+    "successor",
+    [
+        None,
+        _main_run(201, MAIN_NEWER, status="completed", conclusion="skipped"),
+        _main_run(201, MAIN_NEWER, status="completed", conclusion="cancelled"),
+        _main_run(201, MAIN_NEWER, status="completed", conclusion="failure"),
+        _main_run(201, MAIN_TARGET, status="queued", conclusion=None),
+        full_ci_selector.GitHubError("unavailable"),
+    ],
+)
+def test_main_push_keeps_full_scope_without_an_eligible_successor(successor: dict | Exception | None) -> None:
+    api, _ = _main_batch_api(
+        MAIN_NEWER,
+        compare={f"{MAIN_TARGET}...{MAIN_NEWER}": "ahead", f"{MAIN_PARENT}...{MAIN_TARGET}": "ahead"},
+        successor=successor,
+        runs=(_main_run(199, MAIN_PARENT),),
+        jobs={199: _scope_jobs()},
+    )
+
+    batch = full_ci_selector.resolve_main_push(
+        "ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, api=api, sleep=lambda _: None
+    )
+
+    assert batch["superseded"] is False
+    assert batch["comparison_base"] == MAIN_PARENT
+    assert batch["notes"][0][0] == "warning"
+    assert all(select_components([], force_all=True, superseded=batch["superseded"])["components"].values())
 
 
 def test_main_push_keeps_full_scope_and_compares_with_the_last_full_scope_commit() -> None:
@@ -3444,6 +3486,7 @@ def test_main_batching_cli_writes_scope_and_comparison_outputs(
         MAIN_NEWER if main_advanced else MAIN_TARGET,
         compare={f"{MAIN_TARGET}...{MAIN_NEWER}": "ahead", f"{validated}...{MAIN_TARGET}": "ahead"},
         runs=(_main_run(199, MAIN_PARENT), _main_run(198, validated)),
+        successor=_main_run(201, MAIN_NEWER, status="queued", conclusion=None),
         jobs={199: _scope_jobs("success"), 198: _scope_jobs("skipped")},
     )
     monkeypatch.setattr(full_ci_selector, "github_api", api)
