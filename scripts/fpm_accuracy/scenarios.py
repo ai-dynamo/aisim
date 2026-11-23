@@ -239,7 +239,7 @@ def score_scenario(
                 predictor.close()
                 predictor = None
             print(f"{case.configuration_id} {scenario}/{method}: fit failed: {exc}", flush=True)
-            construction_failed = not isinstance(exc, DependencyError)
+            construction_failed = not isinstance(exc, (DependencyError, ImportError))  # an unusable SDK is unsupported
             status = "predictor_error" if construction_failed else "unsupported_predictor"
             reason = (
                 "The predictor failed during offline preparation."
