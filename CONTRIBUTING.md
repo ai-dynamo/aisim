@@ -21,6 +21,22 @@ instructions, see the [application README](python/aisim/README.md).
 - [Office Hours](https://www.youtube.com/playlist?list=PL5B692fm6--tgryKu94h2Zb7jTFM3Go4X)
 - [Community Meetings](https://docs.google.com/document/d/1uR8xD_hlYGwV6QspvSc36k1H-wo1BUcVmFbHH9xlXd8/view) ([YouTube](https://www.youtube.com/@ai-dynamo-community)) -- Weekly (Wed 10:30 AM PT) development community meetings
 
+## Commit authorship
+
+Commits must name the responsible human author. Do not name AI assistants or
+bot accounts (such as Codex, Claude, Copilot, Cursor, Devin, or Gemini) as the
+Git author, a `Co-authored-by`, or a `Signed-off-by` identity. Human co-authors
+and ordinary mentions of AI tools in commit descriptions are allowed.
+
+The **Human authorship** CI check scans all commits introduced by a PR, including
+signatures embedded in squashed commit messages. It matches known AI identities;
+it cannot determine whether an arbitrary identity belongs to a bot. To resolve a
+failure, amend or rebase every flagged commit, then push the corrected history.
+Configure **Human authorship** as a required status check in the repository rules
+to enforce it before merging. Keep the final squash/merge message compliant too:
+PR checks cannot inspect edits made only when merging. The main-branch push
+check detects violations after the merge but cannot undo it.
+
 ## Developer Certificate of Origin
 
 AISim is an open source project released under the Apache 2.0 license
