@@ -998,6 +998,39 @@ def test_fastafd_rejects_invalid_or_inconsistent_sample_traces(tmp_path, trace, 
         _provider(tmp_path, SimpleNamespace(measure=lambda _: (attention,))).measure(_request(_topology()))
 
 
+@pytest.mark.parametrize("repeats", [(32, 1), (32, 33)])
+def test_fastafd_rejects_decode_sample_coverage_mismatch(tmp_path, repeats):
+    request = replace(_request(_topology()), output_length=65)
+    (attention,) = _Attention().measure(request)
+    attention = replace(
+        attention,
+        provenance={
+            **attention.provenance,
+            "decode_samples": [{"repeat": repeat, "components": COMPONENTS} for repeat in repeats],
+        },
+    )
+    with pytest.raises(AFDInfeasible, match="repeat total must equal the request decode steps") as error:
+        _provider(tmp_path, SimpleNamespace(measure=lambda _: (attention,))).measure(request)
+    assert error.value.category is AFDReasonCategory.INVALID_MEASUREMENT
+    assert error.value.provenance["expected_steps"] == 64
+    assert error.value.provenance["covered_steps"] == sum(repeats)
+
+
+@pytest.mark.parametrize("output_length,repeats", [(1, (1,)), (2, (1,)), (65, (32, 32))])
+def test_fastafd_accepts_decode_samples_covering_request(tmp_path, output_length, repeats):
+    request = replace(_request(_topology()), output_length=output_length)
+    (attention,) = _Attention().measure(request)
+    attention = replace(
+        attention,
+        provenance={
+            **attention.provenance,
+            "decode_samples": [{"repeat": repeat, "components": COMPONENTS} for repeat in repeats],
+        },
+    )
+    (measurement,) = _provider(tmp_path, SimpleNamespace(measure=lambda _: (attention,))).measure(request)
+    assert measurement.decode_attention_samples == tuple((0.092, repeat) for repeat in repeats)
+
+
 @pytest.mark.parametrize("precision", ["w4a8_mxfp4_mxfp8", "fp8"])
 @pytest.mark.parametrize("companion_timing", ["default", "fixed"])
 def test_prediction_config_selects_profile_precision(tmp_path, precision, companion_timing):
@@ -1174,7 +1207,10 @@ def test_native_stage_query_pins_profile_until_reconstruction(tmp_path):
 
     path = _profile(tmp_path)
     (measurement,) = _provider(tmp_path, profile_path=path).measure(_request(_topology()))
-    saved = measurement.provenance["config"]
+    # Persist both parts: config reloads the current artifact; stage retains
+    # the original digest needed to detect a same-key replacement.
+    saved_provenance = json.loads(json.dumps(dict(measurement.provenance)))
+    saved = saved_provenance["config"]
     model = RustForwardPassPerfModel.best_available(saved)
     original = model.estimate_fastafd_stage(128)
     payload = json.loads(Path(path).read_text())
@@ -1185,6 +1221,7 @@ def test_native_stage_query_pins_profile_until_reconstruction(tmp_path):
     refreshed = RustForwardPassPerfModel.best_available(saved).estimate_fastafd_stage(128)
     assert refreshed["ffn_ms"] == 2 * original["ffn_ms"]
     assert refreshed["stage"]["profile_sha256"] != original["stage"]["profile_sha256"]
+    assert saved_provenance["stage"]["profile_sha256"] == original["stage"]["profile_sha256"]
 
 
 def test_canonical_stage_pins_batch_and_resolved_precision(tmp_path):

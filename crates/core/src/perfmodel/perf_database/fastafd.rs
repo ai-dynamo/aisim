@@ -152,13 +152,6 @@ pub(crate) fn validate_config(config: &ForwardPassPerfModelConfig) -> Result<(),
     let controls = &config.estimator_config;
     let mut supported = crate::EstimatorConfig::default();
     supported.fastafd_stage = controls.fastafd_stage.clone();
-    // Canonical resolution expands the unrelated Auto default to Sol. Accept
-    // that same default before and after serialization, without permitting a
-    // direct interpolation override on the stage estimator.
-    if controls.fpm_interpolation.method == crate::FpmInterpolationMethod::Sol {
-        supported.fpm_interpolation.method = crate::FpmInterpolationMethod::Sol;
-    }
-
     if controls != &supported {
         return Err(invalid(
             "FastAFD stage timing does not support controls for other estimators",
@@ -417,6 +410,7 @@ impl FastAfdTable {
         let mut document = {
             let reader = PerfReader::from_bytes(path, raw.clone())?;
             reader.require_flat_schema()?;
+            reader.require_unique_columns()?;
             let key_names = [
                 "model_path",
                 "system",
@@ -631,6 +625,10 @@ mod tests {
         );
         assert!(model.estimate_forward_pass_time_ms(&[]).is_err());
         let saved = model.diagnostics().provenance.unwrap().config;
+        assert_eq!(
+            saved.estimator_config.fpm_interpolation.method,
+            crate::FpmInterpolationMethod::Auto
+        );
         let restored = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
         let mut model = ForwardPassPerfModel::best_available(restored).unwrap();
         assert_eq!(model.estimate_fastafd_stage(128).unwrap().ffn_ms, 2.0);
@@ -714,13 +712,25 @@ mod tests {
     }
 
     fn parquet_snapshot_with_latency_type(document: &Value, float: bool) -> bytes::Bytes {
+        parquet_snapshot_with_columns(document, float, false)
+    }
+
+    fn parquet_snapshot_with_columns(
+        document: &Value,
+        float: bool,
+        duplicate_latency: bool,
+    ) -> bytes::Bytes {
         use parquet::data_type::{ByteArray, ByteArrayType, DoubleType, FloatType, Int64Type};
         use parquet::file::properties::WriterProperties;
         use parquet::file::writer::SerializedFileWriter;
         use parquet::schema::parser::parse_message_type;
         use std::sync::Arc;
 
-        fn fields(document: &Value, entry: &Value) -> serde_json::Map<String, Value> {
+        fn fields(
+            document: &Value,
+            entry: &Value,
+            duplicate_latency: bool,
+        ) -> Vec<(String, Value)> {
             let mut fields = entry["key"].as_object().unwrap().clone();
             let mut capture = entry.as_object().unwrap().clone();
             capture.remove("key");
@@ -731,9 +741,13 @@ mod tests {
                 json!(Value::Object(capture).to_string()),
             );
             fields.insert("source_json".into(), json!(document["source"].to_string()));
+            let mut fields: Vec<_> = fields.into_iter().collect();
+            if duplicate_latency {
+                fields.push(("latency_ms".into(), json!(24.0)));
+            }
             fields
         }
-        let first = fields(document, &document["entries"][0]);
+        let first = fields(document, &document["entries"][0], duplicate_latency);
         let columns = first
             .iter()
             .map(|(name, value)| {
@@ -757,7 +771,7 @@ mod tests {
         .unwrap();
         for entry in document["entries"].as_array().unwrap() {
             let mut group = writer.next_row_group().unwrap();
-            for (name, value) in fields(document, entry) {
+            for (name, value) in fields(document, entry, duplicate_latency) {
                 let mut column = group.next_column().unwrap().unwrap();
                 if name == "latency_ms" {
                     if float {
@@ -808,6 +822,43 @@ mod tests {
             let model = ForwardPassPerfModel::best_available(config.clone()).unwrap();
             // Synthetic 12 ms / (three layers * two microbatches).
             assert_eq!(model.estimate_fastafd_stage(128).unwrap().ffn_ms, 2.0);
+        }
+    }
+
+    #[test]
+    fn canonical_stage_rejects_duplicate_parquet_columns() {
+        let (file, config) = fixture();
+        // The ordinary 12 ms capture covers three layers * two microbatches.
+        let model = ForwardPassPerfModel::best_available(config.clone()).unwrap();
+        assert_eq!(model.estimate_fastafd_stage(128).unwrap().ffn_ms, 2.0);
+        std::fs::write(
+            file.path(),
+            parquet_snapshot_with_columns(&fixture_document(), false, true),
+        )
+        .unwrap();
+        let error = ForwardPassPerfModel::best_available(config)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("duplicate parquet column \"latency_ms\""),
+            "{error}"
+        );
+        assert!(error.contains(file.path().to_str().unwrap()), "{error}");
+    }
+
+    #[test]
+    fn canonical_stage_rejects_unused_interpolation_overrides() {
+        let (_file, config) = fixture();
+        for method in [
+            crate::FpmInterpolationMethod::Sol,
+            crate::FpmInterpolationMethod::Direct,
+        ] {
+            let mut config = config.clone();
+            config.estimator_config.fpm_interpolation.method = method;
+            let error = ForwardPassPerfModel::best_available(config)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("controls for other estimators"), "{error}");
         }
     }
 
@@ -1030,16 +1081,25 @@ mod tests {
                 }
                 "unstable" => value["entries"][0]["validation"]["stable"] = json!(false),
                 "bad_digest" => value["entries"][0]["measurement"]["raw_sha256"] = json!("bad"),
-                _ => value["entries"][0]["key"]["routed_topk"] = json!(0),
+                _ => {
+                    let mut malformed = value["entries"][0].clone();
+                    malformed["key"]["routed_topk"] = json!(0);
+                    value["entries"].as_array_mut().unwrap().push(malformed);
+                }
             }
             file.as_file_mut().set_len(0).unwrap();
             use std::io::{Seek, SeekFrom};
             file.seek(SeekFrom::Start(0)).unwrap();
             file.write_all(&parquet_snapshot(&value)).unwrap();
-            assert!(
-                ForwardPassPerfModel::best_available(config.clone()).is_err(),
-                "{kind}"
-            );
+            let error = ForwardPassPerfModel::best_available(config.clone())
+                .unwrap_err()
+                .to_string();
+            let expected = if kind == "duplicate" {
+                "duplicate FastAFD MoE stage key"
+            } else {
+                "invalid or unqualified FastAFD measurement"
+            };
+            assert!(error.contains(expected), "{kind}: {error}");
         }
     }
 }

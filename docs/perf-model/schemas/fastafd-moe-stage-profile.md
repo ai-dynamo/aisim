@@ -25,9 +25,14 @@ may be zero.
 `FastAFDMoEStageProfile.load(path).write_parquet(output)` converts a validated
 legacy document without changing its measured values. Python's canonical model
 constructor imports legacy JSON as an in-memory Parquet snapshot before native
-estimation; direct Rust callers supply Parquet. Provenance and saved
-configurations retain the original source path and SHA-256 digest. The Python
-profile objects expose raw data for
+estimation; direct Rust callers supply Parquet. Saved resolved configurations
+retain the absolute source path and selected precision, but do not pin the
+artifact's digest. To detect replacement of that path, save the stage provenance
+returned by `estimate_fastafd_stage` alongside the configuration and compare its
+`stage.profile_sha256` with the restored estimate's digest. The AFD adapter
+includes both `config` and `stage` in its measurement provenance; persist both.
+Reconstruction loads the current artifact, while an existing model retains its
+original snapshot and digest. The Python profile objects expose raw data for
 inspection and conversion; production AFD timing does not use their lookup API.
 
 ## Document

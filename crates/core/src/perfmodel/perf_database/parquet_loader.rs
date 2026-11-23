@@ -113,6 +113,21 @@ impl<R: ChunkReader + 'static> PerfReader<R> {
         Ok(())
     }
 
+    /// Duplicate paths can alias column chunks in the record reader. Reject
+    /// them before iterating rows when the loader requires unambiguous fields.
+    pub(crate) fn require_unique_columns(&self) -> Result<(), AicError> {
+        let mut names = std::collections::HashSet::new();
+        for name in &self.column_names {
+            if !names.insert(name) {
+                return Err(AicError::PerfDatabase(format!(
+                    "duplicate parquet column {name:?} at {}",
+                    self.path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the position of `name` in the parquet schema. Errors when the
     /// column is absent, with the surviving column names in the message so
     /// schema drift is visible without opening the file.

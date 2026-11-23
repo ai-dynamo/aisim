@@ -109,7 +109,7 @@ it with the configured attention provider. It does not select a second estimator
 | `afd.moe_layers` | Required | Measured MoE block repetition count. The AFD adapter requires the checkpoint's total `layers` and the attention provider's `num_layers` to match it; see the [homogeneous layer contract](schemas/fastafd-moe-stage-profile.md#consumers). |
 | `afd.routed_topk` | Required | Positive routed width, resolved by the AFD adapter from normalized model metadata (`topk`). |
 | `afd.boundary_on_attn` | Required | Must be `true`. |
-| `estimator_config.fastafd_stage` | `null` | Controls for this estimator, required together with `afd`. Other estimator controls must retain their defaults. |
+| `estimator_config.fastafd_stage` | `null` | Controls for this estimator, required together with `afd`. Other estimator controls must retain their defaults, including `fpm_interpolation.method: auto` in new and saved configurations. |
 | `estimator_config.fastafd_stage.profile_path` | Required | Native Parquet table. Python also imports legacy profile JSON as in-memory Parquet while retaining the original source path and digest. Rust validates the Parquet snapshot, rejects duplicate/unqualified captures, and pins its data at construction. |
 
 `model`, `system`, `nextn`, `moe_backend` (`megamoe` or `deepep_deepgemm`),
@@ -120,7 +120,10 @@ Missing cells and ambiguous precision variants are errors; set
 selected precision, including when the selector was omitted. A different batch
 requires another canonical configuration. Saved resolved configurations
 retain all controls and an absolute profile path. Reconstructing reloads that
-artifact; provenance records its SHA-256 so artifact changes remain observable.
+artifact. The configuration alone does not retain the original digest: save
+the estimate's `stage` provenance alongside it, then compare the saved
+`stage.profile_sha256` with the restored estimate to detect artifact changes.
+AFD measurement provenance contains both `config` and `stage` for this purpose.
 Python resolves A-side systems roots at construction using the same explicit,
 SDK, environment, and packaged-root precedence as the other canonical estimators.
 Attention queries and both pools' capacity checks use those saved roots even if

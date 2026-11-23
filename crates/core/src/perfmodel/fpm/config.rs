@@ -326,11 +326,15 @@ impl ForwardPassPerfModelConfig {
         } else {
             None
         };
-        self.estimator_config.fpm_interpolation.method = self
-            .estimator_config
-            .fpm_interpolation
-            .method
-            .resolve(registered)?;
+        // A measured stage has no FPM interpolation to resolve. Retain Auto
+        // so saved stage configurations keep the unrelated control at default.
+        if self.estimation_mode != EstimationMode::FastafdStage {
+            self.estimator_config.fpm_interpolation.method = self
+                .estimator_config
+                .fpm_interpolation
+                .method
+                .resolve(registered)?;
+        }
         if self.estimator_config.fpm_interpolation.method == super::FpmInterpolationMethod::Direct
             && self.database_mode != DatabaseMode::Silicon
         {

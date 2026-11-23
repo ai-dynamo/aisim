@@ -108,6 +108,16 @@ class FastAFDMoEStagePerformanceModel:
         if attention.num_layers != estimate["num_layers"]:
             raise _infeasible("the attention provider's layer count does not match the selected FastAFD stage")
         components = self._components(attention)
+        decode_samples = self._decode_samples(attention)
+        if decode_samples:
+            expected_steps = max(request.output_length - 1, 1)
+            covered_steps = sum(repeat for _, repeat in decode_samples)
+            if covered_steps != expected_steps:
+                raise _infeasible(
+                    "decode_samples repeat total must equal the request decode steps",
+                    covered_steps=covered_steps,
+                    expected_steps=expected_steps,
+                )
         return (
             AFDLayerTimes(
                 phase=AFDPhase.DECODE,
@@ -116,7 +126,7 @@ class FastAFDMoEStagePerformanceModel:
                 a_to_f_ms=0.0,
                 f_to_a_ms=0.0,
                 num_layers=estimate["num_layers"],
-                decode_attention_samples=self._decode_samples(attention),
+                decode_attention_samples=decode_samples,
                 provenance={
                     "provider": "fastafd",
                     "api_version": AFD_MEASUREMENT_API_VERSION,
