@@ -4222,7 +4222,7 @@ def test_v033_raw_window_must_be_the_window_of_the_cache_record(tmp_path, kind, 
 
 
 def _reorder_allocations(record):
-    """Reverse the tensor allocations of a worker cache and its views keep their bytes: no older check reads order."""
+    """Reverse the tensor allocations of a worker cache and its views keep their bytes: no other check reads order."""
     record["cache"]["tensor_allocations"].reverse()
 
 

@@ -2957,7 +2957,7 @@ def test_probe_backed_glm_plan_takes_the_runtime_version_of_the_launch_or_the_bu
 )
 @pytest.mark.usefixtures("no_models_or_timing_data")
 def test_probe_backed_glm_plan_keeps_the_bundle_text_before_the_version_text(tmp_path, kwargs, text):
-    # The observed version 0.32.0 breaks the version rule, and the bundle breaks an older rule of the planner. The text
+    # The observed version 0.32.0 breaks the version rule, and the bundle breaks another rule of the planner. The text
     # of the bundle speaks first.
     with pytest.raises(ValueError, match=text):
         _probe_backed_glm_plan(
@@ -3020,7 +3020,7 @@ def test_glm_runtime_version_reads_the_observed_version_and_the_staged_bundle_on
     assert planner._glm_runtime_version(None, None, None) is None
     assert planner._glm_runtime_version(None, bundle, launch) == "0.33.1"
     assert planner._glm_runtime_version("0.33.1", bundle, launch) == "0.33.1"
-    # Each of these plans gets the older text of the bundle or of the launch, so the version rule does not speak.
+    # Each of these plans gets the text of the bundle or of the launch, so the version rule does not speak.
     assert planner._glm_runtime_version("0.33.0", bundle, launch) is None
     assert planner._glm_runtime_version("0.32.0", bundle, None) is None
     assert planner._glm_runtime_version("0.32.0", None, launch) is None

@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Evidence checks of one vLLM 0.33.0 phase that stand apart from the older import checks.
+"""Evidence checks of one vLLM 0.33.0 phase that the import runs after its own checks of the phase.
 
-The import runs them after every older check of a phase, so an older refusal keeps its text.
+The import runs them last, so a refusal of one of its own checks keeps its text.
 """
 
 from __future__ import annotations
@@ -177,7 +177,7 @@ _MAMBA_STATE_FIELDS = (
 # layer in all workers (:1620-1628). The raw fields that the cache record does not hold (kv_cache_layout; head_size,
 # num_kv_heads, kv_quant_mode; the padded page of a group that is no MambaSpec) are not compared, and neither is
 # extra_retained_tokens: the cache record gives 0 for a class without the field, whose raw group holds no key, and the
-# older retention check requires 0.
+# retention check of the import requires 0.
 def _check_raw_cache_config(record: dict[str, Any], workers: Sequence[dict[str, Any]]) -> None:
     def refuse(what: str) -> ValueError:
         return ValueError(f"{label}: raw cache configuration contradicts the cache record: {what}")

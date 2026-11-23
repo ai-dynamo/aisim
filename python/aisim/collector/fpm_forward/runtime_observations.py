@@ -1992,8 +1992,8 @@ def _configuration(
         if prefix_caching[phase] is not None:
             for _, scheduler in sorted(schedulers.items()):
                 _validate_startup_concurrency(scheduler)
-            # The evidence checks of a vLLM 0.33.0 phase run after every older check, so an older refusal keeps its
-            # text.
+            # The evidence checks of a vLLM 0.33.0 phase run after the checks above, so a refusal of one of those
+            # keeps its text.
             runtime_evidence.validate_phase(phase, workers, schedulers, bundle.manifest["runtime"]["source_files"])
     # The import of one phase writes the transfer bytes only for a phase with prefix caching. Another record gets no
     # value, and the result gives the reason in its own key, outside the provenance and the profile.

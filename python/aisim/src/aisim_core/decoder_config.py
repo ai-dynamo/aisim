@@ -3,7 +3,8 @@
 
 """Choose the key of a checkpoint config that nests the text decoder.
 
-FPM config intake, the FPM collector and the FPM profile check call decoder_config_key, so all three read one decoder.
+FPM config intake, the FPM collector, the FPM profile check, the context lookup of replay and the naive KV-cache
+estimator call decoder_config_key, so all five read one decoder.
 LLM_CONFIG_WRAPPERS and TEXT_CONFIG_WRAPPERS name the wrappers whose text decoder is under llm_config and under
 text_config. Config intake, the FPM collector, the FPM profile check and the context lookup of replay call
 wrapper_key_problem and refuse a wrapper of either set that holds only the other decoder key.
@@ -98,9 +99,9 @@ def decoder_config_problem(key: str, decoder: object) -> str | None:
     as a nonempty object, so it never fails the first check.
 
     The text is the diagnosis only: "<key> must be a nonempty object describing one text decoder", or the text of
-    nested_decoder_ambiguity. The collector adds its remedy after "; ". The FPM profile check and the context lookup
-    of replay put their own text before the diagnosis and add no remedy. Config intake keeps its own two checks,
-    because it words the remedy of each differently. The function never raises.
+    nested_decoder_ambiguity. The collector adds its remedy after "; ". The FPM profile check, the context lookup of
+    replay and the naive KV-cache estimator put their own text before the diagnosis and add no remedy. Config intake
+    keeps its own two checks, because it words the remedy of each differently. The function never raises.
     """
     if not isinstance(decoder, dict) or not decoder:
         return f"{key} must be a nonempty object describing one text decoder"

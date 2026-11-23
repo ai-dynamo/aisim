@@ -464,7 +464,7 @@ def _plan_documents(
         and request.fpm_profile is not None
         and request.profile_deployment().resources.cache_layout == "grouped"
     ):
-        # A grouped plan that was saved cold with its reason, for a profile that plans with prefix caching now.
+        # A grouped plan that was saved cold with its reason, for a profile that this planner plans with prefix caching.
         plan["fpm"]["prefix_caching_reason"] = recorded_reason
     if "prefill_cudagraph_policy" in request.collection.model_fields_set:
         plan["fpm"]["launch"] = (

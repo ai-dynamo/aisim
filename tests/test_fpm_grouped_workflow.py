@@ -2937,7 +2937,7 @@ def _unmarked_cold_plan(grouped_case, tmp_path, capsys):
 @pytest.mark.parametrize(
     "text",
     [
-        # Two older wordings of this requirement, and any other text.
+        # Two other wordings of this requirement, and any other text.
         _COLD + "grouped FPM cache prefix caching requires every cache group to declare prefix_cacheable; "
         "set prefix_cacheable (true or false) on each cache group of the profile",
         _COLD + "grouped FPM cache prefix caching requires every cache group to declare prefix_cacheable; "
