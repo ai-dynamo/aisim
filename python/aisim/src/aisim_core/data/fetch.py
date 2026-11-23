@@ -540,10 +540,11 @@ class _Planner:
         online = not plan.offline and self.transport is not None
         if self.cache.valid(plan.repo, plan.revision, ref.path, ref):
             with self.cache.path_for(plan.repo, plan.revision, ref.path).open("rb") as handle:
-                data = handle.read(_METADATA_CAP_BYTES + 1)
-            if len(data) > _METADATA_CAP_BYTES:
-                raise IntegrityError(ref.path, f"metadata exceeds {_METADATA_CAP_BYTES} bytes")
+                data = handle.read(_METADATA_CAP_BYTES + 1)  # bounded: an oversized file is never read whole
             try:
+                # An oversized cached copy fails like any other invalid one: an online call repairs it.
+                if len(data) > _METADATA_CAP_BYTES:
+                    raise IntegrityError(ref.path, f"metadata exceeds {_METADATA_CAP_BYTES} bytes")
                 if validate is not None:
                     validate(data)
             except IntegrityError:

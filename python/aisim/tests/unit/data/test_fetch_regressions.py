@@ -241,3 +241,24 @@ def test_the_successor_alias_probes_the_physical_path(tmp_path):
     assert _AliasTransport(Probe({}), reference).file_size(PUBLIC_REPO, SHA, "data/m1/manifest.json") == 1
     assert probed == [physical_path("data/m1/manifest.json")]
     assert _AliasTransport(FakeTransport({}), reference).file_size(PUBLIC_REPO, SHA, "data/m1/manifest.json") is None
+
+
+def test_an_oversized_cached_catalog_is_repaired_online_and_refused_offline(tmp_path, monkeypatch):
+    files = build_repo(tmp_path)
+    catalog = "catalog/dataset.json"  # the root catalog declares no digest, so only its size can condemn the copy
+    monkeypatch.setattr(fetch_module, "_METADATA_CAP_BYTES", max(map(len, files.values())) + 8)
+    cache = Cache(tmp_path / "cache")
+    cached = cache.path_for(REPO, SHA, catalog)
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(b"x" * (fetch_module._METADATA_CAP_BYTES + 1))  # corrupt and over the cap
+    with pytest.raises(IntegrityError, match="metadata exceeds"):
+        load_category_index("fpm", repo=REPO, revision=SHA, cache=cache, offline=True)
+    assert cached.read_bytes().startswith(b"x")  # offline cannot repair, and does not touch the copy
+    transport = FakeTransport(files)
+    load_category_index("fpm", repo=REPO, revision=SHA, transport=transport, cache=cache)
+    assert catalog in transport.opened  # the remote copy was fetched instead of failing before any request
+    assert cached.read_bytes() == files[catalog]
+    # The read stays bounded: a valid copy within the cap is read as before, with no transfer.
+    quiet = FakeTransport(files)
+    load_category_index("fpm", repo=REPO, revision=SHA, transport=quiet, cache=cache)
+    assert catalog not in quiet.opened
