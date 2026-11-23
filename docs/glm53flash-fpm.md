@@ -237,8 +237,9 @@ a cell whose receipt the reader refuses. No command writes the receipt of a
 passed cell again, so a passed cell with a refused receipt needs a new
 collection. The plan hash covers the collector revision, which
 `collection-plan.json` records as `aic_revision`. A direct
-`collector --fpm --resume` by a collector of another revision is therefore
-refused with `FPM checkpoint does not match the current frozen plan`. A formal
+`python3 -m collector.fpm_forward --resume` by a collector of another revision
+is therefore refused with
+`FPM checkpoint does not match the current frozen plan`. A formal
 `aisim onboard collect-fpm --resume --execute` stops before that, at its
 readiness check, with `full collection requires usable prefill and decode
 readiness for this exact runtime/launch; inspect --check-readiness and run
@@ -317,10 +318,11 @@ block of a selected deployment differs from the block size of one of its Mamba
 groups. For a generated point list, as in guided onboarding, it checks every
 selected deployment. For a point file, it checks the deployments that keep
 cells after memory admission. A Mamba group is a state group that the profile
-records with `prefill_checkpoint_blocks`: the KDA groups, and not the fifth
-state group, which is a ring group. The refusal names the group and both
-sizes. The producer still checks every prefill chunk start. A decode point
-seeds `(c - 2) // hash_block * hash_block` tokens, as in the launch above.
+records with `prefill_checkpoint_blocks`: the KDA groups, and not the ring
+group, a state group that the profile records without that field. The refusal
+names the group and both sizes. The producer still checks every prefill chunk
+start. A decode point seeds `(c - 2) // hash_block * hash_block` tokens, as in
+the launch above.
 
 The container needs one overlay directory at `/opt/glm53flash-dynamo`. A Slurm
 run can mount it with `--container-mount`. The collector uses that path unless
@@ -539,18 +541,18 @@ producer measured, a producer cell, under the vLLM policy. Each row carries
 5, `measurement_repeats` 10, and the state protocol and the timing boundary of
 the table. The sidecar, the `.metadata.json` file beside the Parquet file,
 carries the same policy and the two counts. The two files are one database
-pair. Two conditions of this policy also refuse the publication of such a
-cell. In the first, the global warm-up count of the plan
-(`--fpm-warmup-iterations`, which guided onboarding sets from
-`collection.warmup_iterations`) is not the integer 0. In the second, the cell
-wrote power-window artifacts. The collector also refuses to merge rows of this
-policy into a database pair that holds rows of another policy or rows without
-a policy, and it leaves that pair unchanged. A database root holds one pair
-for each system, backend and backend version, so publish a GLM-5.3-Flash
-collection to a clean destination, or to a root whose pair for them holds no
-rows of another policy and no rows without a policy. Finalization and
-collection validation read the policy from the sidecar of the publication that
-they check.
+pair. Besides the reader rules of the section [vLLM producer](#vllm-producer),
+two conditions of this policy refuse the publication of such a cell. In the
+first, the global warm-up count of the plan (`--fpm-warmup-iterations`, which
+guided onboarding sets from `collection.warmup_iterations`) is not the
+integer 0. In the second, the cell wrote power-window artifacts. The collector
+also refuses to put rows of this policy into one database pair with rows of
+another policy or rows without a policy, in either order, and it leaves the
+existing pair unchanged. A database root holds one pair for each system,
+backend and backend version, so publish a GLM-5.3-Flash collection to a clean
+destination, or to a root whose pair for them holds no rows of another policy
+and no rows without a policy. Finalization and collection validation read the
+policy from the sidecar of the publication that they check.
 
 Align-4 constrains collection only. The consumer answers queries for any
 prefix length.
