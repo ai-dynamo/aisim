@@ -417,8 +417,13 @@ def test_context_length_max_refuses_a_malformed_or_nested_decoder(tmp_path, docu
             "Qwen3_5MoeForConditionalGeneration keeps its text decoder under text_config, "
             "but this config holds llm_config and no text_config",
         ),
+        (
+            {"architectures": ["NemotronH_Omni_Reasoning_V3"], "text_config": None},
+            "NemotronH_Omni_Reasoning_V3 keeps its text decoder under llm_config, "
+            "but this config holds text_config and no llm_config",
+        ),
     ],
-    ids=["llm-wrapper", "text-wrapper"],
+    ids=["llm-wrapper", "text-wrapper", "llm-wrapper-with-a-null-text-config"],
 )
 def test_context_length_max_refuses_a_registered_wrapper_with_only_the_other_decoder_key(tmp_path, document, problem):
     (tmp_path / "config.json").write_text(json.dumps(document))

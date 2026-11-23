@@ -1804,6 +1804,60 @@ def test_registered_wrapper_with_only_the_other_decoder_key_is_refused_by_every_
     with pytest.raises(ValueError) as effective:
         _ = ResolvedModelConfig(document, source_kind="explicit", source_reference="test").effective_payload
     assert str(effective.value) == f"{problem}; supply one text decoder config"
+    with pytest.raises(ValueError) as collector:
+        _layout_capability(path, native=True)
+    assert str(collector.value) == f"{problem}; supply one text decoder config"
+    # Render reads the same view.
+    with pytest.raises(ValueError) as render:
+        load_model_config(str(path)).parsed_payload()
+    assert str(render.value) == f"{problem}; supply one text decoder config"
+    profile = SimpleNamespace(model=str(tmp_path), model_revision=None, architecture=wrapper)
+    with pytest.raises(ValueError) as check:
+        _validate_checkpoint_architecture(profile)
+    identity = f"{str(tmp_path)!r} at model_revision=None"
+    assert str(check.value) == (
+        f"FPM profile checkpoint config.json for {identity} has no single text decoder: {problem}"
+    )
+
+
+def test_registered_wrapper_with_only_the_other_decoder_key_is_refused_before_its_sidecar_is_read(tmp_path):
+    from aisim.support.config_profile import load_model_config as load_intake_config
+
+    # The adjacent sidecar conflicts with the decoder under the other key. The collector names the wrapper, as config
+    # intake does, and not a conflict with a decoder that it does not read.
+    wrapper = "Qwen3_5MoeForConditionalGeneration"
+    quantization = {"quant_method": "fp8", "quant_algo": "fp8"}
+    decoder = {**_packaged_config(_NEMOTRON_SUPER), "quantization_config": quantization}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"architectures": [wrapper], "llm_config": decoder}))
+    sidecar = {"quantization": {"quant_algo": "NVFP4", "kv_cache_quant_algo": None}}
+    (tmp_path / "hf_quant_config.json").write_text(json.dumps(sidecar))
+    problem = f"{wrapper} keeps its text decoder under text_config, but this config holds llm_config and no text_config"
+    with pytest.raises(ValueError) as collector:
+        _ = load_model_config(str(path)).effective_payload
+    assert str(collector.value) == f"{problem}; supply one text decoder config"
+    with pytest.raises(ValueError) as intake:
+        load_intake_config(path)
+    assert str(intake.value) == f"{problem}; supply its decoder config or a complete --fpm-profile"
+
+
+def test_registered_wrapper_with_a_null_other_decoder_key_is_refused_before_the_key_is_read(tmp_path):
+    from aisim.support.config_profile import load_model_config as load_intake_config
+    from aisim_core.sdk.fpm_profile import _validate_checkpoint_architecture
+
+    # Each reader names the wrapper before it reads the decoder key, so the null text_config gets the wrapper text and
+    # not the text of a decoder key that holds no decoder.
+    wrapper = "NemotronH_Omni_Reasoning_V3"
+    document = {"architectures": [wrapper], "text_config": None}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(document))
+    problem = f"{wrapper} keeps its text decoder under llm_config, but this config holds text_config and no llm_config"
+    with pytest.raises(ValueError) as intake:
+        load_intake_config(path)
+    assert str(intake.value) == f"{problem}; supply its decoder config or a complete --fpm-profile"
+    with pytest.raises(ValueError) as effective:
+        _ = ResolvedModelConfig(document, source_kind="explicit", source_reference="test").effective_payload
+    assert str(effective.value) == f"{problem}; supply one text decoder config"
     profile = SimpleNamespace(model=str(tmp_path), model_revision=None, architecture=wrapper)
     with pytest.raises(ValueError) as check:
         _validate_checkpoint_architecture(profile)
@@ -1867,7 +1921,8 @@ def _gemma4_without_decoder_layers():
 def test_render_refuses_a_registered_wrapper_that_the_parser_refuses_with_the_parser_message(
     tmp_path, document, problem
 ):
-    # The parser reads the wrapper with its vision fields; the decoder alone would parse, or fail for another field.
+    # The parser reads the wrapper with its vision fields. In the two vision cases the decoder alone would parse, or
+    # fail for another field; in the third case the decoder alone fails for the same field.
     path = tmp_path / "config.json"
     path.write_text(json.dumps(document))
     with pytest.raises(ValueError) as error:
@@ -1916,6 +1971,60 @@ def test_render_keeps_the_parse_of_a_valid_registered_wrapper_and_the_decoder_ge
         "num_experts": 0,
         "moe_inter_size": 1024,
     }
+
+
+@pytest.mark.parametrize(
+    ("name", "damage", "architecture", "cause"),
+    [
+        (
+            "google--gemma-4-26B-A4B",
+            lambda document: document["text_config"].pop("hidden_size"),
+            "Gemma4ForConditionalGeneration",
+            KeyError,
+        ),
+        (
+            "Qwen--Qwen3-VL-235B-A22B-Instruct",
+            lambda document: document.update(vision_config="x"),
+            "Qwen3VLMoeForConditionalGeneration",
+            TypeError,
+        ),
+    ],
+    ids=["missing-key", "wrong-type"],
+)
+def test_render_refuses_a_registered_architecture_for_each_error_class_of_the_parse(
+    tmp_path, name, damage, architecture, cause
+):
+    # The parser reports a missing key with a KeyError and a value of a wrong type with a TypeError. The render gives
+    # both the form of a ValueError of the parse: the type and the text of the parser's error after the prefix.
+    document = _packaged_config(name)
+    damage(document)
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(document))
+    with pytest.raises(ValueError) as error:
+        load_model_config(str(path)).parsed_payload()
+    assert type(error.value.__cause__) is cause
+    assert str(error.value) == (
+        f"HF config of the supported architecture {architecture} is invalid: {cause.__name__}: {error.value.__cause__}"
+    )
+
+
+def test_render_passes_on_a_parse_error_that_is_no_value_error_for_an_architecture_that_is_not_registered(tmp_path):
+    # The prefixed form is for a registered architecture. This config names no architecture, so the error of the
+    # parser passes out as it is.
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"hidden_size": 16, "num_hidden_layers": 2}))
+    with pytest.raises(KeyError) as error:
+        load_model_config(str(path)).parsed_payload()
+    assert error.value.args == ("architectures",)
+
+
+def test_render_keeps_the_decoder_geometry_of_a_registered_wrapper_whose_decoder_names_another_class(tmp_path):
+    # The packaged Kimi-K3 wrapper is registered. Its decoder names a class of its own that is not, so the render reads
+    # the decoder under that class and keeps its geometry.
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(_packaged_config("moonshotai--Kimi-K3")))
+    parsed = load_model_config(str(path)).parsed_payload()
+    assert (parsed["architecture"], parsed["layers"], parsed["hidden_size"]) == ("KimiLinearForCausalLM", 93, 7168)
 
 
 def _detected_layout_plan(tmp_path, monkeypatch, generator_overrides):

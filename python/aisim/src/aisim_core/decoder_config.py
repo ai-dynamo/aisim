@@ -19,8 +19,8 @@ from collections.abc import Mapping
 from typing import Any
 
 # The wrappers whose text decoder is under llm_config, and those whose text decoder is under text_config.
-# aisim_core.sdk.common builds MULTIMODAL_TEXT_CONFIG_KEY from these two sets, so the op-level parser and the readers
-# here unwrap the same wrappers.
+# aisim_core.sdk.common builds MULTIMODAL_TEXT_CONFIG_KEY from these two sets, so the op-level parser and the callers
+# of this module agree on the decoder key of every registered wrapper.
 LLM_CONFIG_WRAPPERS = frozenset({"NemotronH_Omni_Reasoning_V3"})
 TEXT_CONFIG_WRAPPERS = frozenset(
     {

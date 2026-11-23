@@ -74,7 +74,8 @@ class ResolvedModelConfig:
         """Return decoder metadata, inheriting only identity and shared precision.
 
         A decoder config that is not one nonempty object, or that holds a decoder key, raises ValueError, as config
-        intake refuses it. Only a config with no decoder key is read flat.
+        intake refuses it. So does a registered wrapper that holds only the other decoder key. Only a config with no
+        decoder key is read flat.
         """
 
         payload = self.payload
@@ -122,16 +123,19 @@ class ResolvedModelConfig:
             parser_config = {**source, "architectures": [architecture], text_key: raw_config}
         try:
             parsed = _parse_hf_config_json(parser_config)
-        except ValueError as error:
-            # A config of a registered architecture that the parser refuses is
-            # refused with the message of this parse, which reads a wrapper
-            # with its encoder and processor fields, in the form of the naive
-            # estimator's refusal.
+        except Exception as error:
+            # A config of a registered architecture that this parse refuses is
+            # refused with the type and the message of its error, in the form
+            # of the naive estimator's refusal. This parse reads a registered
+            # wrapper whose decoder names no class of its own together with
+            # its encoder and processor fields.
             if architecture in ARCHITECTURE_TO_MODEL_FAMILY:
                 raise ValueError(
                     f"HF config of the supported architecture {architecture} is invalid: "
                     f"{type(error).__name__}: {error}"
                 ) from error
+            if not isinstance(error, ValueError):
+                raise
             # Bootstrap templates intentionally admit real HF architectures
             # that the native AIC parser does not know yet. Normalize their
             # frozen config with the architecture-agnostic estimator so render
@@ -178,6 +182,8 @@ def _load_json_mapping(path: Path, *, description: str) -> tuple[dict[str, Any],
 
 
 def _attach_modelopt_sidecar(payload: dict[str, Any], sidecar: dict[str, Any]) -> dict[str, Any]:
+    if (problem := wrapper_key_problem(payload)) is not None:
+        raise ValueError(f"{problem}; supply one text decoder config")
     key = decoder_config_key(payload)
     decoder = payload.get(key)
     if payload.get("hf_quant_config") is not None and payload["hf_quant_config"] != sidecar:

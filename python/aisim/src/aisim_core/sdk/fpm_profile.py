@@ -118,7 +118,8 @@ def _validate_checkpoint_architecture(profile: FpmModelProfile) -> None:
         raise ValueError(f"FPM profile checkpoint config.json must be a mapping for {identity}")
     # Match the collector's text-model view of checkpoint metadata. A decoder that declares no architectures,
     # absent or null, keeps the wrapper's, as the collector and config intake read it. A decoder key that does not
-    # hold one text decoder is refused, as the collector and config intake refuse it.
+    # hold one text decoder is refused, as the collector and config intake refuse it. A registered wrapper that holds
+    # only the other decoder key is refused too.
     if (problem := wrapper_key_problem(metadata)) is not None:
         raise ValueError(f"FPM profile checkpoint config.json for {identity} has no single text decoder: {problem}")
     key = decoder_config_key(metadata)
