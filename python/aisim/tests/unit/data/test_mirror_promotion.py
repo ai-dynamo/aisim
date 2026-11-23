@@ -3,6 +3,7 @@
 
 """Mirror validator, redaction rules and promotion procedure, on synthetic data only."""
 
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -1050,31 +1051,49 @@ def test_snapshot_never_spans_private_and_public(tmp_path, document_name):
     _ = private_dir
 
 
+@contextlib.contextmanager
+def _unbound_membership(root, manifest):
+    """Hide a configuration while a snapshot is written, as for external membership.
+
+    The writer binds members whose manifest it can see to the full version of their observation, rebuilding the
+    member row. A member it cannot see keeps exactly the fields it was given, including a future column or a
+    deliberately wrong pin, which is what these tests exercise.
+    """
+    visible = root / Path(manifest).parent
+    hidden = root / "hidden-configuration"
+    visible.rename(hidden)
+    try:
+        yield
+    finally:
+        hidden.rename(visible)
+
+
 def _snapshot_mirror(tmp_path, *, source_scope=None, selection_policy="synthetic", member=None, acquisition=None):
     root, manifests = _mirror(tmp_path)
     manifest = manifests[0]
     observation = load_e2e(root, manifest).observations[0]
     snapshot_dir = "data/e2e-snapshots/s1"
     (root / snapshot_dir).mkdir(parents=True)
-    write_snapshot(
-        root,
-        f"{snapshot_dir}/snapshot.json",
-        [
-            SnapshotMember(
-                configuration_id=observation.configuration_id,
-                observation_id=observation.observation_id,
-                record_sha256=observation.record_sha256,
-                manifest_path=manifest,
-                **(member or {}),
-            )
-        ],
-        source_scope=source_scope or {"kind": "synthetic"},
-        selection_policy=selection_policy,
-        completeness="complete",
-        acquisition=[SnapshotAcquisition(observation_id=observation.observation_id, **acquisition)]
-        if acquisition is not None
-        else [],
-    )
+    with _unbound_membership(root, manifest) if member else contextlib.nullcontext():
+        write_snapshot(
+            root,
+            f"{snapshot_dir}/snapshot.json",
+            [
+                SnapshotMember(
+                    configuration_id=observation.configuration_id,
+                    observation_id=observation.observation_id,
+                    record_sha256=observation.record_sha256,
+                    manifest_path=manifest,
+                    **(member or {}),
+                )
+            ],
+            source_scope=source_scope or {"kind": "synthetic"},
+            selection_policy=selection_policy,
+            completeness="complete",
+            acquisition=[SnapshotAcquisition(observation_id=observation.observation_id, **acquisition)]
+            if acquisition is not None
+            else [],
+        )
     directories = [str(Path(manifest).parent), snapshot_dir]
     _public(root, *directories)
     return root, directories
@@ -2385,14 +2404,16 @@ def test_standalone_snapshot_validation_checks_member_contents(tmp_path, change)
         "none": {},
     }
     shutil.rmtree(root / snapshot_dir / "snapshot-generations")  # the replaced snapshot leaves no orphan tables
-    write_snapshot(
-        root,
-        snapshot_dir + "/snapshot.json",
-        [member.model_copy(update=updates[change])],
-        source_scope={"kind": "synthetic"},
-        selection_policy="synthetic",
-        completeness="complete",
-    )
+    # A deliberately wrong pin cannot be written by a writer that sees the configuration, so hide it for the write.
+    with _unbound_membership(root, path):
+        write_snapshot(
+            root,
+            snapshot_dir + "/snapshot.json",
+            [member.model_copy(update=updates[change])],
+            source_scope={"kind": "synthetic"},
+            selection_policy="synthetic",
+            completeness="complete",
+        )
     shutil.rmtree(root / "mirror")  # a standalone public tree has no private visibility ledger
     report = validate_tree(root, profile="public")
     if change == "none":
