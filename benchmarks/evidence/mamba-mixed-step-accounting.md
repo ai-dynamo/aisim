@@ -1723,6 +1723,15 @@ Strict crate-wide Rustdoc validation still reports nine unresolved links on
 unchanged baseline text, including feature-gated Python names and `Op` aliases.
 The scoped `run_context_ops` links are gone and the referenced planned walker
 exists. These broader Rustdoc errors were not repaired in this comment scope.
+On verification recovery, the runtime module gained a
+`deny(rustdoc::broken_intra_doc_links)` lint when its `python` embedding API is
+enabled. `cargo doc --release --locked --features python --lib --no-deps`
+passes with that scoped denial active. A negative control temporarily restored
+the reviewed `run_context_ops` link and confirmed Rustdoc rejected it; the
+corrected source was restored before the passing final run. Unrelated baseline
+warnings remain visible. This follow-up changes documentation validation only;
+the numerical source and the native binary used by the passing suites above
+are unchanged.
 A concurrent Python verification attempt hit the CLI host-memory guard in two
 cases; the final run executes separately from native compilation. Four stale
 expectations in the generation-only control were also corrected to retain its

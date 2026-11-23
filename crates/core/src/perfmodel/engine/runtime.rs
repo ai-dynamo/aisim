@@ -18,6 +18,10 @@
 //! embedded [`crate::AicEngineBuilder`] live in [`crate::py`]. The agg sweep is
 //! orchestrated in Python — there is no Rust `run_agg`.
 
+// Check this module's links with its Python embedding API available. Without
+// that feature, the embedding entry points linked above do not exist.
+#![cfg_attr(feature = "python", deny(rustdoc::broken_intra_doc_links))]
+
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
