@@ -276,6 +276,9 @@ def record_path(root: str | Path, record: EvalRecord) -> Path:
 
 
 _RECORD_LOCK_WAIT_SECONDS = 30.0
+# Every writer must lock the same file, so the location cannot come from the environment (TMPDIR, TEMP, TMP): two
+# writers with different values would lock different files and could both publish a successor of one record.
+_LOCK_DIRECTORY = "/tmp" if os.path.isdir("/tmp") else tempfile.gettempdir()
 _THREAD_LOCK = threading.Lock()
 
 
@@ -284,8 +287,9 @@ def _record_lock(directory: Path):
     """Serialize writers of one record directory across processes and threads on this host.
 
     The lock is an advisory ``flock`` that the operating system drops when its holder exits, however it exits, so a
-    killed writer never blocks the next one. Its backing file lives in the temporary directory, keyed by the
-    directory's real path, so nothing is left in the dataset (the mirror validator rejects stray files there).
+    killed writer never blocks the next one. Its backing file lives in ``/tmp`` (not the environment's temporary
+    directory, which writers may set differently), keyed by the directory's real path, so nothing is left in the
+    dataset (the mirror validator rejects stray files there).
     """
     try:
         import fcntl
@@ -294,7 +298,7 @@ def _record_lock(directory: Path):
             yield
         return
     name = hashlib.sha256(os.path.realpath(directory).encode("utf-8")).hexdigest()
-    lock = Path(tempfile.gettempdir()) / f"aisim-eval-records-{name}.lock"
+    lock = Path(_LOCK_DIRECTORY) / f"aisim-eval-records-{name}.lock"
     # Read-only and not following links: flock needs no write access, so users who share a directory share the lock.
     fd = os.open(lock, os.O_RDONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o666)
     try:

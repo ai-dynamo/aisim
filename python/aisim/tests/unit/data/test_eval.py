@@ -588,7 +588,7 @@ def test_sidecars_are_checked_against_the_record_before_anything_is_published(bu
     assert _leftovers(directory) == []
 
 
-def _hold_lock_in_another_process(directory):
+def _hold_lock_in_another_process(directory, **environment):
     """A process that holds the record lock of ``directory`` until it is killed."""
     import subprocess
     import sys
@@ -600,7 +600,7 @@ def _hold_lock_in_another_process(directory):
         "with _record_lock(Path(sys.argv[1])):\n    print('held', flush=True)\n    time.sleep(120)\n"
     )
     source = str(Path(aisim_core.__file__).parents[1])
-    env = {**os.environ, "PYTHONPATH": source}
+    env = {**os.environ, "PYTHONPATH": source, **environment}
     holder = subprocess.Popen([sys.executable, "-c", code, str(directory)], stdout=subprocess.PIPE, text=True, env=env)
     assert holder.stdout.readline().strip() == "held"
     return holder
@@ -674,3 +674,31 @@ def test_sidecars_cannot_follow_a_symlinked_directory_out_of_the_dataset(built, 
     nested, files = _successor_declaring(record, "nested/note.json")
     path = write_record(root, nested, sidecars=files)
     assert path.exists() and (directory / "nested/note.json").read_bytes() == files["nested/note.json"]
+
+
+def test_the_record_lock_does_not_depend_on_the_temporary_directory_setting(built, monkeypatch, tmp_path):
+    import tempfile
+
+    from aisim_core.data import eval as eval_module
+
+    root, record = built
+    directory = write_record(root, record).parent
+    successor, files = _successor_with_findings(record, "one")
+    holder_tmp, writer_tmp = tmp_path / "holder-tmp", tmp_path / "writer-tmp"
+    holder_tmp.mkdir()
+    writer_tmp.mkdir()
+    holder = _hold_lock_in_another_process(directory, TMPDIR=str(holder_tmp), TEMP=str(holder_tmp), TMP=str(holder_tmp))
+    try:
+        # A writer whose environment names another temporary directory must still meet the holder's lock.
+        for name in ("TMPDIR", "TEMP", "TMP"):
+            monkeypatch.setenv(name, str(writer_tmp))
+        monkeypatch.setattr(tempfile, "tempdir", None)
+        assert tempfile.gettempdir() == str(writer_tmp)
+        monkeypatch.setattr(eval_module, "_RECORD_LOCK_WAIT_SECONDS", 0.3)
+        with pytest.raises(ValueError, match="another record writer is publishing"):
+            write_record(root, successor, sidecars=files)
+        assert not record_path(root, successor).exists()
+        assert not list(writer_tmp.iterdir()) and not list(holder_tmp.iterdir())  # no lock file depends on either
+    finally:
+        holder.kill()
+        holder.wait()
