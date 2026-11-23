@@ -531,16 +531,17 @@ def test_mixed_step_breakdown_bridge_shapes_missing_attention_passes(monkeypatch
 
 
 @pytest.mark.parametrize(
-    "native,public",
-    [("context_attention", "context_attention (scaled)"), ("fpm_forward_decode", "generation_attention")],
+    "native,public,decode",
+    [("context_attention", "context_attention (scaled)", False), ("fpm_forward_decode", "generation_attention", True)],
 )
-def test_mixed_display_alias_preserves_literal_rows(monkeypatch, native, public):
+def test_mixed_display_alias_preserves_literal_rows(monkeypatch, native, public, decode):
     class Handle:
         def _mixed_step_breakdown_per_op_with_metadata(self, *args, **kwargs):
+            row = [(native, 2.0, 20.0, "silicon")]
             return (
                 [(public, 3.0, 30.0, "estimated"), (f"{public} (operation)", 5.0, 50.0, "silicon")],
-                [(native, 2.0, 20.0, "silicon")],
-                [],
+                [] if decode else row,
+                row if decode else [],
                 10.0,
             )
 
@@ -552,7 +553,7 @@ def test_mixed_display_alias_preserves_literal_rows(monkeypatch, native, public)
         None,
         None,
         ctx_tokens=16,
-        gen_tokens=0,
+        gen_tokens=int(decode),
         isl=16,
         osl=1,
         prefix=0,
@@ -562,6 +563,9 @@ def test_mixed_display_alias_preserves_literal_rows(monkeypatch, native, public)
     assert result["per_op_latency_ms"][f"{public} (operation) (operation)"] == 3.0
     assert sum(result["per_op_latency_ms"].values()) == result["latency_ms"] == 10.0
     assert sum(result["per_op_energy_wms"].values()) == result["energy_wms"] == 100.0
+    component = "decode_attention" if decode else "context_attention"
+    assert result["component_latency_ms"][component] == 2.0
+    assert result["component_energy_wms"][component] == 20.0
 
 
 def test_mixed_display_alias_matches_native_total(monkeypatch):

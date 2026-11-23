@@ -474,10 +474,11 @@ def test_compute_ttft_single_request_feeds_the_step_its_model_tokens(monkeypatch
     assert ttft == pytest.approx(40.0 + 10 * 0.3)
 
 
-@pytest.mark.parametrize(("forward_model", "prefill_ms"), [("op_level", 40.0 * 4096 / 2048), ("fpm", 40.0 * 2)])
+@pytest.mark.parametrize(("forward_model", "prefill_ms"), [("op_level", 40.0 * 5000 / 2048), ("fpm", 40.0 * 2)])
 def test_compute_ttft_single_request_counts_a_short_final_fpm_chunk(monkeypatch, forward_model, prefill_ms):
-    # 3000 new tokens under a 2048-token budget: an FPM step prices the mean of the
-    # 2048- and 952-token chunks, so one request's prefill is two chunks, not 3000/2048.
+    # 5000 prompt tokens with 2000 cached tokens: the 3000-token suffix needs
+    # two chunks, whereas using the full prompt would incorrectly count three.
+    # The stub isolates the chunk count; native chunk pricing is tested separately.
     backend = VLLMXPUBackend()
     model = MagicMock(forward_model=forward_model, _num_layers=10)
     monkeypatch.setattr(
@@ -487,7 +488,7 @@ def test_compute_ttft_single_request_counts_a_short_final_fpm_chunk(monkeypatch,
             latency_ms=40.0, energy_wms=0.0, context_tokens=step.context_tokens
         ),
     )
-    ttft = backend._compute_ttft(model, MagicMock(), MagicMock(), 1, 4096, 10, 2048, 1096, **_ttft_kwargs())
+    ttft = backend._compute_ttft(model, MagicMock(), MagicMock(), 1, 5000, 10, 2048, 2000, **_ttft_kwargs())
     assert ttft == pytest.approx(prefill_ms + 10 * 0.3)
 
 

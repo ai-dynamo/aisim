@@ -70,6 +70,10 @@ counts every verified token, and its source is `sol`. For a state-scan
 operation, it also counts each request's recurrent-state traffic. The
 convolution update has no recurrent-state term. A decode batch must hold
 whole requests, so its token count must be a multiple of `token_width`.
+Qualified Mamba2 generation requires `beam_width: 1`; native static generation
+rejects other beam widths because its recurrent-state estimate does not model
+beam expansion. Legacy operations with an unrecorded state dtype retain their
+existing behavior.
 Native op-level Replay packs every decode request at the configured width,
 `nextn + 1`. If its scheduler verifies fewer tokens for a request, the
 estimate counts more tokens than that request verifies.

@@ -963,6 +963,43 @@ def fpm_session(tmp_path):
 
 
 class TestFPMStaticAndMixed:
+    @pytest.mark.parametrize("budget,chunks,step_ms,decode_energy", [(1096, 2, 9.0, 0.0), (1097, 1, 13.0, 2700.0)])
+    def test_xpu_cached_suffix_boundary_weights_latency_and_energy(
+        self, fpm_power_root, monkeypatch, budget, chunks, step_ms, decode_energy
+    ):
+        from aisim.sdk.inference_session import InferenceSession
+        from aisim_core.sdk.backends.vllm_backend_xpu import VLLMXPUBackend
+
+        model = models.get_model("Qwen/Qwen3-0.6B", _model_config(forward_model="fpm"), BACKEND)
+        identity = dict(zip(_CELL_MATCH_COLUMNS, model.context_ops[0]._match_identity, strict=True))
+        # Two requests each need 1096 fresh tokens. XPU reserves one decode
+        # token: budget 1096 queries a 1095-token chunk then a one-token tail;
+        # budget 1097 fits one suffix. Synthetic native rows price these at
+        # 12/4 ms plus a 3-2=1 ms marginal decoder. Mixed FPM energy is
+        # deliberately unavailable (AISIM-1973 D10). Powered decode-only
+        # steps cost 3 ms * 450 W: zero or two such steps, hence 0/2700 W-ms.
+        rows = [
+            _row("prefill", 1, tokens, past, ms, model_path=model.model_path, identity=identity)
+            for tokens, past, ms in [(1096, 3000, 12.0), (2, 4095, 4.0), (1097, 3000, 12.0)]
+        ] + [
+            _row("decode", batch, 0, kv, ms, model_path=model.model_path, identity=identity)
+            for batch in (1, 2)
+            for kv, ms in [(0, 2.0), (batch * 4099, 3.0)]
+        ]
+        rows = [dict(row, backend_version=_POWER_VERSION) for row in rows]
+        database = fpm_power_root(model, _full_power, rows=rows)
+        backend = VLLMXPUBackend()
+        monkeypatch.setattr(backend, "_max_kv_slots", lambda *a, **k: 1000)
+        runtime = sdk_config.RuntimeConfig(batch_size=2, isl=4096, osl=4, prefix=3000)
+        summary = InferenceSession(model, database, backend).run_agg(runtime, ctx_tokens=budget)
+        scheduling = summary.get_step_estimates()["scheduling"]
+        assert scheduling["num_mix_steps"] == 2 * chunks
+        assert scheduling["mix_step_latency_ms"] == pytest.approx(step_ms)
+        groups = summary.get_aggregate_energy_breakdown()
+        assert groups["mix_step"].latency_ms == pytest.approx(2 * chunks * step_ms)
+        assert groups["mix_step"].energy_wms == 0.0
+        assert groups["genonly_step"].energy_wms == pytest.approx(decode_energy)
+
     @pytest.mark.parametrize(
         "prefix,budget,kv_slots,prefill_rows,mix_steps,mix_ms,tpot_ms",
         [

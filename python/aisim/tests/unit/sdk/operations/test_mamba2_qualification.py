@@ -204,9 +204,9 @@ def _qualified_nano_session(monkeypatch):
         get_backend("trtllm", "b200_sxm"),
     )
 
-    def run(batch_size, ctx_tokens, prefix):
+    def run(batch_size, ctx_tokens, prefix, *, isl=4096):
         return session.run_agg(
-            config.RuntimeConfig(batch_size=batch_size, isl=4096, osl=64, prefix=prefix), ctx_tokens=ctx_tokens
+            config.RuntimeConfig(batch_size=batch_size, isl=isl, osl=64, prefix=prefix), ctx_tokens=ctx_tokens
         )
 
     return run
@@ -304,6 +304,21 @@ def test_run_agg_ttft_counts_uncached_prefill_steps(monkeypatch, prefix, chunks,
     summary = run(1, 2048, prefix=prefix)
     step_ms = sum(summary.get_per_ops_data()["mix_step"].values())
     assert _ttft(summary) == pytest.approx(step_ms * chunks * qf, abs=1e-3)
+
+
+def test_run_agg_ttft_prices_uneven_uncached_chunks(monkeypatch):
+    run = _qualified_nano_session(monkeypatch)
+    summary = run(1, 512, prefix=3000)
+    # Price each actual native chunk independently: 512, 512, then 72 fresh
+    # tokens, with the prefix growing after each step. Every chunk pays one
+    # state read/write pair. A full-size tail would overprice this request.
+    chunks = [run(1, end, prefix=past, isl=end) for end, past in [(3512, 3000), (4024, 3512), (4096, 4024)]]
+    chunk_ms = [sum(chunk.get_per_ops_data()["mix_step"].values()) for chunk in chunks]
+    scan_ms = sum(chunk.get_per_ops_data()["mix_step"]["context_mamba_ssm"] for chunk in chunks)
+    assert scan_ms == pytest.approx(_scan_ms(3, 1096), rel=1e-9)
+    assert chunk_ms[-1] < chunk_ms[0]
+    # TensorRT-LLM applies qf = 2 + (3 - 3) / 20 once to the three-step sum.
+    assert _ttft(summary) == pytest.approx(sum(chunk_ms) * 2.0, abs=1e-3)
 
 
 def test_run_agg_one_step_ttft_does_not_depend_on_the_budget(monkeypatch):

@@ -5132,6 +5132,65 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn qualified_mamba_static_generation_rejects_beams() {
+        let db = build_engine(None).db;
+        for (dtype, width) in [
+            ("float16", 1),
+            ("bfloat16", 1),
+            ("float32", 4),
+            ("unrecorded", 1),
+        ] {
+            let Op::Mamba2(mut scan) = qualified_mamba(false, width) else {
+                unreachable!()
+            };
+            scan.state_dtype = dtype.into();
+            let op = Op::Mamba2(scan);
+            let engine = Engine::build(
+                EngineSpec::new(
+                    fixture_engine_config(Some(width - 1)),
+                    vec![],
+                    vec![op.clone()],
+                ),
+                Arc::clone(&db),
+            )
+            .unwrap();
+            for beam_width in [1, 2] {
+                let rt = RuntimeConfig {
+                    batch_size: 2,
+                    isl: 64,
+                    osl: 2,
+                    beam_width,
+                    ..Default::default()
+                };
+                // Both the direct operation boundary and the static trajectory
+                // must reject unmodeled beam expansion. No FPM profile is set.
+                let direct = op.query(
+                    &db,
+                    &RuntimeContext {
+                        batch_size: 2 * width,
+                        beam_width,
+                        s: 65,
+                        ..Default::default()
+                    },
+                );
+                let trajectory = engine.run_static(&rt, StaticMode::Generation, 1);
+                if dtype == "unrecorded" || beam_width == 1 {
+                    assert!(direct.is_ok(), "{dtype}, width {width}: {direct:?}");
+                    assert!(trajectory.is_ok(), "{dtype}, width {width}: {trajectory:?}");
+                } else {
+                    for result in [direct.map(drop), trajectory.map(drop)] {
+                        assert!(
+                            matches!(&result, Err(AicError::InvalidEngineConfig(m))
+                                if m.contains("qualified generation requires beam_width 1, got 2")),
+                            "{dtype}, width {width}: {result:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn qualified_mamba_rejects_packed_decode_counts_beyond_u32() {
         // Two requests of width u32::MAX would saturate to one request's width,
         // which qualified Mamba would divide back into a single request. A graph
