@@ -631,9 +631,11 @@ In this compatibility CLI example, the saved `pareto_frontier.png` plots per-GPU
 
 For a fixed GPU budget, the picker ranks configurations that meet the limit by `tokens/s/gpu_cluster`, which the worker setup table below displays as `tokens/s/gpu`. This metric averages throughput across the whole budget. If whole replicas leave some GPUs unused, a configuration with higher throughput in the saved plot can rank lower in the picker.
 
+The saved plot can also omit the picker's best configuration: its single-backend rendering computes another Pareto front using `tokens/s/gpu`. For example, with an eight-GPU budget, an eight-GPU replica at 100 tokens/s/gpu ranks above a five-GPU replica at 120 tokens/s/gpu: their budget-adjusted rates are 100 and 75 tokens/s/gpu_cluster. If the five-GPU replica also has higher generation speed, it dominates the eight-GPU replica in the plot. Use the worker setup table or the saved `best_config_topn.csv` for the picker's ranking.
+
 Without `--strict-sla`, the plotted frontier can include points that violate the TPOT limit. Within each experiment, the top-N picker prefers configurations within the limit. When none meet it, the picker first keeps the configuration with the highest `tokens/s/gpu_cluster` value in each parallel group (`parallel` for aggregated serving, `(d)parallel` for disaggregated serving), then orders those representatives by increasing TPOT for its top-N results.
 
-If no configuration meets the TPOT constraint, the terminal worker setup table omits the fallback configurations and reports that none met the constraint. Use `--save-dir DIR` and open `best_config_topn.csv` in the experiment's output directory to see those configurations. See [strict SLA filtering](#strict-sla-filtering).
+Without `--strict-sla`, if no configuration meets the TPOT constraint and fallback rows are available, the terminal worker setup table omits those rows and reports that none met the constraint. Use `--save-dir DIR` and open `best_config_topn.csv` in the experiment's output directory to see the fallback configurations. With `--strict-sla`, if no configurations qualify, the picker returns no fallback rows and the worker setup table omits that message. See [strict SLA filtering](#strict-sla-filtering).
 
 The unified Sweeper uses a different aggregate per-user metric; see [Pareto objectives](../sweeper/optimization-goals.md#pareto) before interpreting its x-axis as a TPOT threshold.
 
