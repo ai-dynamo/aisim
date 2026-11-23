@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from aisimulate_core.sdk import RustForwardPassPerfModel
-from aisimulate_core.sdk.utils import get_model_config_from_model_path
+from aisimulate_core.sdk.utils import HuggingFaceDownloadError, get_model_config_from_model_path
 
 from .afd_parallel import AFDInfeasible, AFDPhase, AFDReasonCategory
 from .afd_perfmodel import (
@@ -75,15 +75,34 @@ class FastAFDMoEStagePerformanceModel:
             )
         except ValueError as exc:
             raise _infeasible(str(exc)) from exc
+        try:
+            metadata = get_model_config_from_model_path(request.model_name)
+            model_layers = metadata["layers"]
+            routed_topk = metadata.get("topk")
+        except (OSError, ValueError, KeyError, HuggingFaceDownloadError) as exc:
+            raise _infeasible(
+                f"cannot resolve the model's checkpoint metadata: {exc}", model=request.model_name
+            ) from exc
+        if isinstance(model_layers, bool) or not isinstance(model_layers, int) or model_layers < 1:
+            raise _infeasible(
+                "the model's layer count must be a known positive integer",
+                model=request.model_name,
+                model_layers=model_layers,
+            )
+        if isinstance(routed_topk, bool) or not isinstance(routed_topk, int) or routed_topk < 1:
+            raise _infeasible(
+                "the model's routed top-k must be a known positive integer",
+                model=request.model_name,
+                routed_topk=routed_topk,
+            )
         if type(self.attention_model) is AICAFDPerformanceModel:
             # Select precision before the built-in provider constructs either
             # pool. F memory must describe this stage, not checkpoint defaults.
-            model_layers = get_model_config_from_model_path(request.model_name)["layers"]
-            estimate, config, model = self._select(request, model_layers)
+            estimate, config, model = self._select(request, model_layers, routed_topk)
             attention = self._attention(request, model)
         else:
             attention = self._attention(request)
-            estimate, config, _model = self._select(request, attention.num_layers)
+            estimate, config, _model = self._select(request, attention.num_layers, routed_topk)
         if attention.num_layers != estimate["num_layers"]:
             raise _infeasible("the attention provider's layer count does not match the selected FastAFD stage")
         components = self._components(attention)
@@ -223,18 +242,9 @@ class FastAFDMoEStagePerformanceModel:
         self,
         request: AFDMeasurementRequest,
         model_layers: int,
+        routed_topk: int,
     ) -> tuple[dict[str, Any], dict[str, Any], RustForwardPassPerfModel]:
         topology = request.topology
-        try:
-            routed_topk = get_model_config_from_model_path(request.model_name).get("topk")
-        except (OSError, ValueError, KeyError) as exc:
-            raise _infeasible(f"cannot resolve the model's routed top-k: {exc}", model=request.model_name) from exc
-        if isinstance(routed_topk, bool) or not isinstance(routed_topk, int) or routed_topk < 1:
-            raise _infeasible(
-                "the model's routed top-k must be a known positive integer",
-                model=request.model_name,
-                routed_topk=routed_topk,
-            )
         config = {
             "model": request.model_name,
             "system": request.hardware_sku,

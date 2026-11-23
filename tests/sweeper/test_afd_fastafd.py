@@ -21,7 +21,7 @@ from aisimulate.sdk.inference_session import AFDInferenceSession
 from aisimulate.sweeper import afd_fastafd
 from aisimulate.sweeper.afd_engine import AFDForegroundEngine, evaluate_afd_phase
 from aisimulate.sweeper.afd_fastafd import FastAFDMoEStagePerformanceModel
-from aisimulate.sweeper.afd_parallel import AFDInfeasible, AFDTopology
+from aisimulate.sweeper.afd_parallel import AFDInfeasible, AFDReasonCategory, AFDTopology
 from aisimulate.sweeper.afd_perfmodel import AFDLayerTimes, AFDMeasurementRequest, AICAFDPerformanceModel
 from aisimulate_core.sdk.fastafd_profile import FASTAFD_PROFILE_SCHEMA
 
@@ -280,7 +280,18 @@ def test_builtin_provider_recomputes_the_fastafd_router_on_a(tmp_path, monkeypat
     assert measurement.attention_ms < components["attention_compute_ms"] + components["router_ms"]
 
     local_router_batches.clear()
+    metadata_reads = []
+    load_metadata = afd_fastafd.get_model_config_from_model_path
+
+    def tracked_metadata(model):
+        metadata_reads.append(model)
+        return load_metadata(model)
+
+    monkeypatch.setattr(afd_fastafd, "get_model_config_from_model_path", tracked_metadata)
     (attention_only,) = _provider(tmp_path, AICAFDPerformanceModel(), profile_path=profile).measure(request)
+    assert metadata_reads == [MODEL]
+    assert attention_only.provenance["config"]["afd"]["moe_layers"] == LAYERS
+    assert attention_only.provenance["config"]["afd"]["routed_topk"] == 8
     assert local_router_batches == [64 * (nextn + 1)]
     # The full provider subtracts its combine term; the A-only path never
     # queries it. Their recomposition differs only by floating-point rounding.
@@ -510,18 +521,52 @@ def test_other_layer_counts_and_topk_do_not_make_an_exact_match_ambiguous(tmp_pa
 
 @pytest.mark.parametrize("topk", [None, 0, -1, True, "8", 8.5])
 def test_unknown_or_invalid_model_topk_fails_closed(tmp_path, monkeypatch, topk):
-    monkeypatch.setattr(afd_fastafd, "get_model_config_from_model_path", lambda _: {"topk": topk})
+    monkeypatch.setattr(afd_fastafd, "get_model_config_from_model_path", lambda _: {"layers": LAYERS, "topk": topk})
     with pytest.raises(AFDInfeasible, match="routed top-k must be a known positive integer"):
         _provider(tmp_path).measure(_request(_topology()))
 
 
-def test_unresolvable_model_topk_fails_closed(tmp_path, monkeypatch):
+@pytest.mark.parametrize("attention", ["builtin", "custom"])
+@pytest.mark.parametrize("error_type", [OSError, ValueError, KeyError, afd_fastafd.HuggingFaceDownloadError])
+def test_unresolvable_model_metadata_fails_closed(tmp_path, monkeypatch, attention, error_type):
+    cause = error_type("unreadable checkpoint")
+
     def missing_model(_):
-        raise ValueError("unknown model")
+        raise cause
+
+    def unexpected_attention(*args, **kwargs):
+        raise AssertionError("unreadable metadata must fail before attention measurement")
 
     monkeypatch.setattr(afd_fastafd, "get_model_config_from_model_path", missing_model)
-    with pytest.raises(AFDInfeasible, match="cannot resolve the model's routed top-k"):
-        _provider(tmp_path).measure(_request(_topology()))
+    monkeypatch.setattr(AICAFDPerformanceModel, "measure_attention", unexpected_attention)
+    monkeypatch.setattr(_Attention, "measure", unexpected_attention)
+    provider = AICAFDPerformanceModel() if attention == "builtin" else _Attention()
+    with pytest.raises(AFDInfeasible, match="cannot resolve the model's checkpoint metadata") as error:
+        _provider(tmp_path, provider).measure(_request(_topology()))
+    assert error.value.category is AFDReasonCategory.INVALID_MEASUREMENT
+    assert error.value.provenance["model"] == MODEL
+    assert error.value.__cause__ is cause
+
+
+@pytest.mark.parametrize("contents", [None, "{invalid json", "{}"])
+def test_builtin_provider_rejects_unreadable_local_checkpoint(tmp_path, contents):
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    if contents is not None:
+        (checkpoint / "config.json").write_text(contents)
+    request = replace(_request(_topology()), model_name=str(checkpoint))
+    with pytest.raises(AFDInfeasible, match="cannot resolve the model's checkpoint metadata") as error:
+        _provider(tmp_path, AICAFDPerformanceModel()).measure(request)
+    assert error.value.category is AFDReasonCategory.INVALID_MEASUREMENT
+    assert error.value.provenance["model"] == str(checkpoint)
+
+
+@pytest.mark.parametrize("layers", [None, 0, -1, True, "94", 94.5])
+def test_unknown_or_invalid_model_layers_fail_closed(tmp_path, monkeypatch, layers):
+    monkeypatch.setattr(afd_fastafd, "get_model_config_from_model_path", lambda _: {"layers": layers, "topk": 8})
+    with pytest.raises(AFDInfeasible, match="layer count must be a known positive integer") as error:
+        _provider(tmp_path, AICAFDPerformanceModel()).measure(_request(_topology()))
+    assert error.value.provenance["model"] == MODEL
 
 
 @pytest.mark.parametrize(
