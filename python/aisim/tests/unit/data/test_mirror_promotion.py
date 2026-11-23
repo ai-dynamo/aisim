@@ -181,24 +181,36 @@ def _op_mirror(tmp_path, column, value):
     return _op_mirror_table(tmp_path, pa.table(columns))
 
 
-def _op_mirror_table(tmp_path, table, *, store_schema=True, row_group_size=None):
+def _op_mirror_table(tmp_path, table, *, store_schema=True, row_group_size=None, footer=None, **writer_options):
     """A valid private op-latency mirror holding exactly ``table`` (any Arrow layout the writer accepts).
 
     ``store_schema=False`` writes the file as another producer might: the Arrow schema is not embedded, so a
     reader sees plain string columns although the stored dictionary pages keep every value their writer put there.
     ``row_group_size`` splits the rows into row groups, which read back as several chunks with their own dictionaries.
+    ``footer`` is ``(old, new)``: the same-length bytes ``new`` replace ``old`` inside the file's footer only, so the
+    visible cells and the data pages stay as written while the footer's statistics say something else.
     """
     root = tmp_path / "mirror"
     directory = "data/op-latency/h100_sxm/gemm/vllm/0.11.0"
     relative = f"{directory}/gemm_perf.parquet"
-    if store_schema and row_group_size is None:
+    if store_schema and row_group_size is None and not writer_options:
         path = write_parquet(table, root / relative, OP_TABLE_SCHEMA_ID)
     else:
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        with pq.ParquetWriter(path, table.schema, compression="zstd", store_schema=store_schema) as writer:
+        with pq.ParquetWriter(
+            path, table.schema, compression="zstd", store_schema=store_schema, **writer_options
+        ) as writer:
             writer.add_key_value_metadata({"aisim.schema": OP_TABLE_SCHEMA_ID})
             writer.write_table(table, row_group_size=row_group_size)
+    if footer is not None:
+        old, new = footer
+        assert len(old) == len(new)
+        data = path.read_bytes()
+        length = int.from_bytes(data[-8:-4], "little")
+        body, tail = data[: -8 - length], data[-8 - length :]
+        assert tail.count(old) >= 1  # the statistics hold the value
+        path.write_bytes(body + tail.replace(old, new))
     identity = Identity(
         hardware="h100_sxm", framework="vllm", framework_version="0.11.0", operation_family="gemm",
         model=None, effective_settings={}, unresolved_identity=None,
@@ -1683,6 +1695,84 @@ def test_a_plain_text_extension_parameter_is_accepted(tmp_path, labeled_extensio
     root, directory, _ = _op_mirror_table(tmp_path, table)
     draft = plan_promotion(root, _request(root, [directory]), _reviewers())
     assert plan_promotion(root, _request(root, [directory], draft), _reviewers()).ok
+
+
+def _statistics_table(secret, visible=None):
+    """A table whose visible cells are clean: the largest one is as long as ``secret``, so a footer can swap them."""
+    low = ("public-benchmark-" + "a" * len(secret))[: len(secret)]
+    high = visible or ("public-benchmark-" + "z" * len(secret))[: len(secret)]
+    return pa.table({"kernel_source": ["synthetic-kernel"] * 2, "latency_ms": [1.0, 2.0], "diagnostic": [low, high]})
+
+
+@pytest.mark.parametrize(
+    ("secret", "code"),
+    [("https://node7.corp.nvidia.com/v1", "internal-host"), ("hf_" + "a" * 34, "secret")],
+    ids=["internal-url", "hf-token"],
+)
+@pytest.mark.parametrize("bound", ["max", "min"])
+def test_footer_statistics_block_promotion_and_public_validation(tmp_path, secret, code, bound):
+    table = _statistics_table(secret)
+    cells = table["diagnostic"].to_pylist()
+    old = cells[1] if bound == "max" else cells[0]
+    root, directory, relative = _op_mirror_table(tmp_path, table, footer=(old.encode(), secret.encode()))
+    # The visible cells are clean and the dictionary pages hold only them; the footer alone carries the text.
+    assert secret not in json.dumps(pq.read_table(root / relative).to_pydict())
+    footer_statistics = pq.ParquetFile(root / relative).metadata.row_group(0).column(2).statistics
+    assert secret in (footer_statistics.min, footer_statistics.max)
+    assert validate_tree(root, repo=INTERNAL_REPO).ok  # valid private data: digests were taken after the edit
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
+    assert not plan.content_ok and not plan.ok  # approval cannot override disclosure checks
+    found = [f for f in plan.findings if f.code == code and f.path == relative]
+    assert found and "column diagnostic (Parquet statistics)" in found[0].message
+    assert any(f.code == code and f.path == relative for f in validate_tree(root, profile="public").errors)
+    target = _target(tmp_path)
+    with pytest.raises(PromotionError):
+        apply_promotion(plan, root, target)
+    assert not (target / relative).exists()
+
+
+def test_footer_statistics_are_judged_under_their_column_names(tmp_path):
+    visible = "[REDACTED]"  # a redacted credential cell passes; the footer must not carry another value
+    column = pa.StructArray.from_arrays([pa.array([visible, visible])], names=["password"])
+    table = pa.table({"kernel_source": ["synthetic-kernel"] * 2, "latency_ms": [1.0, 2.0], "diagnostic": column})
+    clean_root, clean_directory, _ = _op_mirror_table(tmp_path / "clean", table)
+    draft = plan_promotion(clean_root, _request(clean_root, [clean_directory]), _reviewers())
+    assert plan_promotion(clean_root, _request(clean_root, [clean_directory], draft), _reviewers()).ok
+    root, directory, relative = _op_mirror_table(tmp_path / "edited", table, footer=(visible.encode(), b"hunter2-xy"))
+    plan = plan_promotion(root, _request(root, [directory]), _reviewers())
+    assert any(
+        f.code == "secret" and f.path == relative and "diagnostic.password (Parquet statistics)" in f.message
+        for f in plan.findings
+    )
+
+
+def test_undecodable_footer_statistics_are_refused(tmp_path):
+    table = _statistics_table("public-benchmark-zzzz")
+    old = table["diagnostic"].to_pylist()[1].encode()
+    root, directory, relative = _op_mirror_table(tmp_path, table, footer=(old, b"\xff" * len(old)))
+    plan = plan_promotion(root, _request(root, [directory]), _reviewers())
+    assert not plan.content_ok
+    assert any(f.code == "parquet-statistics" and f.path == relative for f in plan.findings)
+    assert any(f.code == "parquet-statistics" for f in validate_tree(root, profile="public").errors)
+
+
+def test_a_page_index_over_text_columns_is_refused_and_clean_statistics_are_promoted(tmp_path):
+    table = _statistics_table("public-benchmark-zzzz")
+    root, directory, relative = _op_mirror_table(tmp_path / "indexed", table, write_page_index=True)
+    plan = plan_promotion(root, _request(root, [directory]), _reviewers())
+    assert any(f.code == "parquet-page-index" and f.path == relative for f in plan.findings)
+    # The same table written normally has clean min/max values in its footer and promotes as a copy.
+    root, directory, relative = _op_mirror_table(tmp_path / "plain", table)
+    statistics = pq.ParquetFile(root / relative).metadata.row_group(0).column(2).statistics
+    assert statistics.has_min_max and statistics.min.startswith("public-benchmark-")
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
+    assert plan.ok, plan.findings
+    target = _target(tmp_path)
+    apply_promotion(plan, root, target)
+    assert (target / relative).read_bytes() == (root / relative).read_bytes()
+    assert validate_tree(target, repo=PUBLIC, profile="public").ok
 
 
 def test_stored_dictionaries_cover_chunks_and_nested_dictionaries():

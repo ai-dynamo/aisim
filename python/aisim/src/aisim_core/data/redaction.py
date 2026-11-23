@@ -543,6 +543,44 @@ def _file_dictionaries(path: Path, footer: pq.FileMetaData) -> list[tuple[str, t
     ]
 
 
+_TEXT_PHYSICAL_TYPES = ("BYTE_ARRAY", "FIXED_LEN_BYTE_ARRAY")
+
+
+def _footer_statistics(footer: pq.FileMetaData) -> tuple[dict[str, dict[str, None]], list[str], list[str]]:
+    """Text held by the footer's column-chunk statistics, by column path, plus what cannot be read as text.
+
+    A column chunk's min and max are stored as raw bytes in the footer, whatever its visible cells hold, and
+    promotion copies them verbatim. Returns the decoded values per column path, the paths whose statistics are not
+    valid UTF-8 (refused, as undecodable cells are), and the text columns that carry a page index (per-page min and
+    max values this reader cannot inspect). Attributes are probed so older PyArrow releases keep working.
+    """
+    texts: dict[str, dict[str, None]] = {}
+    undecodable: dict[str, None] = {}
+    indexed: dict[str, None] = {}
+    for group in range(footer.num_row_groups):
+        for index in range(footer.num_columns):
+            chunk = footer.row_group(group).column(index)
+            if chunk.physical_type not in _TEXT_PHYSICAL_TYPES:
+                continue  # a number holds no text
+            column = chunk.path_in_schema
+            if getattr(chunk, "has_column_index", False):
+                indexed[column] = None
+            statistics = chunk.statistics if getattr(chunk, "is_stats_set", True) else None
+            if statistics is None or not statistics.has_min_max:
+                continue
+            for bound in ("min", "max"):
+                try:
+                    value = getattr(statistics, f"{bound}_raw", None)  # the stored bytes, when this release offers them
+                    value = getattr(statistics, bound) if value is None else value
+                    text = value.decode("utf-8") if isinstance(value, (bytes, bytearray)) else value
+                except (UnicodeDecodeError, ValueError, pa.ArrowException):
+                    undecodable[column] = None
+                    continue
+                if isinstance(text, str):
+                    texts.setdefault(column, {})[text] = None
+    return texts, list(undecodable), list(indexed)
+
+
 def _check_table_text(table: pa.Table, rel: str, policy: RedactionPolicy, where: str, *, path: Path) -> list[Finding]:
     """Scan metadata and text, including UTF-8 binary cells; undecodable bytes are invalid.
 
@@ -656,6 +694,21 @@ def _check_table_text(table: pa.Table, rel: str, policy: RedactionPolicy, where:
                 if found:
                     break
         out.extend(found)
+    statistics, undecodable, indexed = _footer_statistics(footer)
+    for column, values in statistics.items():
+        # The column path's names are the key context, as for the visible cells of that column.
+        nested: Any = list(values)
+        for part in reversed(column.split(".")):
+            nested = {part: nested}
+        out.extend(scan_value(nested, policy, rel, f"{where} {column} (Parquet statistics)")[:1])
+    for column in undecodable:
+        out.append(Finding("parquet-statistics", f"column {column} has statistics that are not valid UTF-8 text", rel))
+    for column in indexed:
+        out.append(
+            Finding(
+                "parquet-page-index", f"column {column} has a page index whose min/max values cannot be inspected", rel
+            )
+        )
     return out
 
 
