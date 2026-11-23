@@ -1238,8 +1238,12 @@ The forward driver uses the existing forward gate's `measure_cold_and_warm`:
 after construction and one 64-token prefill prime, it measures the first
 unseen query, then 100 repeats after 10 warmups. Each of six alternating
 baseline/candidate rounds uses a fresh process. This separates construction,
-first-use data loading and warm query caching. Raw rounds and full inputs are
-in [canonical-mtp-forward-perf.json](mamba-mixed-step-accounting/canonical-mtp-forward-perf.json).
+first-use data loading and warm query caching. Per-round summaries and full
+inputs are in
+[canonical-mtp-forward-perf.json](mamba-mixed-step-accounting/canonical-mtp-forward-perf.json).
+This historical record is summary-only: it does not retain the underlying warm
+samples, so its means, medians and percentiles cannot be independently
+recomputed. The complete remeasurement below retains those samples.
 Run [canonical_mtp_forward.py](mamba-mixed-step-accounting/canonical_mtp_forward.py)
 with the corresponding installed SDK; `PYTHONPATH=BASE_SDK` selects the pinned
 baseline, and an unset `PYTHONPATH` selects the candidate:
@@ -1845,3 +1849,122 @@ invocation were corrected before the successful final checks. Attempt logs and
 `verification-history.json` remain in the repair scratch directory. Fast/Full
 CI, fresh bot reviews, technical reapproval and human approval remain controller
 or maintainer responsibilities; these local results do not satisfy those gates.
+
+### Scoped comment repair after `d32fb0aa`
+
+Corrective code commit `32d50c27d31f63c124e9eb042853cf46ecb05847`
+addresses two independent cache/sweep defects:
+
+- Native operation setters advance a process-wide mutation epoch. The Python
+  engine-identity memo checks it before reusing a serialized graph, so an edit
+  through either a Python shell or a raw native operation cannot reuse an old
+  aggregate summary or compiled handle. Native operation construction does
+  not advance the epoch. An edit conservatively expires other models' identity memos, but
+  unchanged serialized identities still reuse their handles and summaries.
+  The name-edit regressions warm both caches, rename a context or generation
+  scan to the reserved `context_attention (scaled)` name, and require the same
+  rejection as a cold graph at both the old and a new workload. Scale and GEMM
+  field edits also compare the repriced result with a cold copy.
+- An aggregate sweep skips the same single-request qualified visual chunks
+  that `run_agg` rejects, before pricing or recording candidates. Direct calls
+  retain that rejection. With effective ISL 4096, prefix 3000 and stride 512,
+  the sweep reaches budget 1536 after excluding 512 and 1024. Without a cached
+  prefix it reaches 4096. The regression exercises the real sweep and native
+  scan pricing, with only the unrelated memory estimate replaced.
+
+#### Complete canonical forward remeasurement
+
+The original canonical forward record remains unchanged and is labeled
+summary-only above. Its missing warm samples have not been reconstructed.
+[canonical-mtp-forward-refresh-32d50c27.json](mamba-mixed-step-accounting/canonical-mtp-forward-refresh-32d50c27.json)
+is a new complete six-round measurement using the existing
+[`canonical_mtp_forward_rounds.py`](mamba-mixed-step-accounting/canonical_mtp_forward_rounds.py)
+and [`canonical_mtp_forward.py`](mamba-mixed-step-accounting/canonical_mtp_forward.py).
+Every round alternates which side runs first, with a fresh interpreter for
+each side. All 96 query records retain their 100 individual warm samples:
+9600 samples in total. The regression in
+[`test_canonical_mtp_forward_samples.py`](mamba-mixed-step-accounting/test_canonical_mtp_forward_samples.py)
+recomputes every mean, median, percentile and range, checks the loaded source
+identities, and requires unchanged non-Mamba control predictions.
+
+As in the original constructor comparison, restore only `nemotron_h.py`
+byte-for-byte from `22a3fec3c24613fd68cf056a83ede789bd74cf8d` in a copy of
+the installed candidate SDK. The baseline and candidate constructor SHA-256
+values are respectively
+`233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2` and
+`187a7c4c3bee1494ec90d9177ee1810af525e0ee45ca3574bd770e538ba9cfcc`.
+All other SDK files, dependencies and packaged performance data are identical.
+Both sides use the `32d50c27` native binary, SHA-256
+`01c3f6422a18fadcd1b8341068922efc581195baa3db0b33253b9e95a6e5c712`.
+It was built with Rust 1.91.1 and `maturin build --release --locked` from
+`python/aisim`, with extension-module/jemalloc features, optimization level 3,
+thin LTO, one codegen unit and `CARGO_BUILD_JOBS=2`. All 269 native source
+inventory entries matched the checkout. The host was an i9-14900K under
+Linux/WSL2, Python 3.12.12, with a 5 GiB container memory limit. Full build,
+driver and source fingerprints are recorded alongside the new rounds.
+
+```bash
+python benchmarks/evidence/mamba-mixed-step-accounting/canonical_mtp_forward_rounds.py \
+  BASE_SDK CANDIDATE_SDK OUT.json
+```
+
+Here `BASE_SDK` and `CANDIDATE_SDK` contain the installed `aisim` and
+`aisim_core` packages; the runner verifies both loaded paths. The record adds
+build provenance to the unmodified round output. Construction time, the
+first unseen query after the 64-token prime, and warm queries after ten
+warmups retain their original separate timing boundaries. Across the eight
+model/query cells, medians of round warm medians change by -1.9% to +1.2%
+(at most 0.046 us). Some individual baseline/control rounds reached
+5.5–6.0 us, versus typical 2.3–2.9 us. These are host timing observations
+for the constructor comparison, not a reconstruction of the historical
+native build, a full-PR performance qualification or serving-accuracy evidence.
+
+#### Mutation-check host cost
+
+[`cache_identity_perf.py`](mamba-mixed-step-accounting/cache_identity_perf.py)
+compares the exact pinned `d32fb0aa` Python bridge with the `32d50c27` bridge,
+on the same candidate native extension and model constructors. Restore only
+`aisim_core/sdk/rust_engine_step.py` from the pinned revision in another copy
+of the installed SDK. Run from the repository root:
+
+```bash
+python benchmarks/evidence/mamba-mixed-step-accounting/cache_identity_perf.py \
+  BASE_SDK CANDIDATE_SDK OUT.json
+```
+
+[cache-identity-perf-32d50c27.json](mamba-mixed-step-accounting/cache-identity-perf-32d50c27.json)
+retains six alternating fresh-process rounds, identities, setup and first-query
+times, and all 7200 warm samples after 1000 warmups per cell. It requires equal
+predictions, native hashes and constructors, and different bridge hashes. Both
+models use vLLM 0.24.0, B200 SOL, TP1, effective ISL 4096, prefix 3000, OSL64,
+budget 512 and batch four; Nano is MTP3 and Qwen3-0.6B is the MTP0 control.
+The direct mixed call uses three decoders. Aggregate misses clear only the
+summary cache; they reuse the warmed compiled handle. Setup covers model and
+database preparation, excluding imports. The table gives medians of round
+warm medians, pinned bridge / corrected bridge, in microseconds:
+
+| Caller | Nano MTP3 | Qwen control |
+| --- | --- | --- |
+| SDK mixed step, warm native memo | 1.864 / 2.272 | 1.665 / 1.723 |
+| Aggregate summary miss | 322.333 / 317.990 | 105.170 / 99.412 |
+| Aggregate summary hit | 3.332 / 3.349 | 3.231 / 3.343 |
+
+The direct Nano helper increases by 0.408 us (+21.9%); the Qwen helper by
+0.058 us (+3.5%). The identity check itself adds one atomic read/native call
+and one scalar comparison, independent of graph size, with one additional
+memo field and no graph scan or retained graph copy. An isolated six-pair,
+100,000-call `timeit` comparison of the exact old/new identity functions on
+the same warmed graph measured 0.128–0.152 / 0.157–0.184 us. The native epoch
+call alone was 0.015–0.016 us. Thus the direct helper delta should not all be
+attributed to the epoch read. Process-level timings also varied: Nano miss
+medians ranged 317–407 / 304–594 us, and occasional hit cells reached 7.8 us.
+An initial ten-warmup run was noisier; its logs remain in repair scratch.
+
+The constant-time check is necessary to observe edits through raw native
+setters; serializing every operation per query would scale with graph size,
+while tracking every operation owner adds ownership machinery to rare edits.
+The measured bounded check is retained. The sweep filter runs once per sweep
+and only tests eligible budgets; nonvisual graphs do not scan qualifications.
+Native Replay's scheduler and iteration execution are unchanged, and the
+canonical compiled model does not re-enter this Python identity check on each
+query. These measurements cover SDK caller cost, not serving prediction accuracy.

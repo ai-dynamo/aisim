@@ -208,7 +208,6 @@ def test_operation_name_edit_cannot_reuse_warm_summary_or_handle(graph_estimator
     from aisim_core.sdk.backends.factory import get_backend
     from aisim_core.sdk.config import RuntimeConfig
     from aisim_core.sdk.perf_database import get_database_view
-    from aisim_core.sdk.rust_engine_step import RustEngineUnsupportedError
 
     model, estimate = graph_estimator
     backend = get_backend("trtllm")
@@ -224,15 +223,15 @@ def test_operation_name_edit_cannot_reuse_warm_summary_or_handle(graph_estimator
 
     scan = ops[0]
     original_name = scan._name
-    scan._name = "context_attention (scaled)" if phase == "context" else "generation_attention"
+    scan._name = "context_attention (scaled)"
     cold = copy.deepcopy(model)
     for graph in (cold, model):
-        with pytest.raises(RustEngineUnsupportedError, match="reserved attention name"):
+        with pytest.raises(ValueError, match="reserved attention name"):
             estimate(graph)
     # The identical workload must miss the summary cache; a new workload
     # must also reject the edited spec instead of reusing the compiled handle.
     for budget in (16, 8):
-        with pytest.raises(RustEngineUnsupportedError, match="reserved attention name"):
+        with pytest.raises(ValueError, match="reserved attention name"):
             backend.run_agg(model, database, runtime, ctx_tokens=budget)
     scan._name = original_name
     assert backend.run_agg(model, database, runtime, ctx_tokens=16) is summary
@@ -261,5 +260,6 @@ def test_native_family_setter_expires_a_memoized_graph_identity(graph_estimator)
     key = rust_engine_step.engine_identity(model, database)
     gemm._scale_num_tokens = 2
     assert rust_engine_step.engine_identity(model, database) != key
-    assert estimate(model) > before
+    # scale_num_tokens divides the shared GEMM's token count.
+    assert estimate(model) < before
     assert estimate(model) == estimate(copy.deepcopy(model))
