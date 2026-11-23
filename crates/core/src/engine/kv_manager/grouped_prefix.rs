@@ -410,19 +410,21 @@ impl GroupedPrefixRules {
     /// `prefix_cacheable: false`) and a full-attention group with
     /// `prefix_cacheable: false` count only through the scheduler block. In
     /// every other layout an aggregated rank frees on the computed count,
-    /// one step earlier than vLLM.
+    /// one step earlier than vLLM. A rank without this table, such as one
+    /// with prefix caching off, keeps the hold in every layout (see the
+    /// switch in the scheduler).
     ///
     /// The reason for the rule: with one block size for every
     /// prefix-cacheable group, every state boundary is a boundary of every
     /// group that takes part in a cache hit, so a preempted request loses no
-    /// progress inside a block. The layouts that were compared with vLLM's
-    /// own scheduler have this form; the rule rests on that and on searches
-    /// of replays, not on an argument that covers every layout. In a layout
-    /// with a prefix-cacheable state block below the scheduler block, a
-    /// preempted request without hits inside a block keeps hits only up to
-    /// a multiple of the scheduler block. At a pool of exactly vLLM's startup
-    /// count, which reserves `2 + c` blocks per Mamba group (v0.31
-    /// `kv_cache_interface.py:1083-1094`, v0.32 `:1076-1082`, v0.33
+    /// progress inside a block. The cache groups of GLM-5.3-Flash have this
+    /// form, so its replay keeps vLLM's hold. The rule is chosen for that,
+    /// and the reason above is not an argument that covers every layout.
+    /// In a layout with a prefix-cacheable state block below the scheduler
+    /// block, a preempted request without hits inside a block keeps hits
+    /// only up to a multiple of the scheduler block. At a pool of exactly
+    /// vLLM's startup count, which reserves `2 + c` blocks per Mamba group
+    /// (v0.31 `kv_cache_interface.py:1083-1094`, v0.32 `:1076-1082`, v0.33
     /// `:1135-1141`), the hold on the processed count (v0.31
     /// `kv_cache_manager.py:549-556`, v0.32 `:552-559`, v0.33 `:561-568`)
     /// can then make the request need one more state block than the pool

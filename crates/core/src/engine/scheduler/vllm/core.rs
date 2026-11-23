@@ -2699,7 +2699,8 @@ impl VllmCore {
         // connector. A linear state cache does not use the count: it frees a
         // previous state copy at the next allocation of its request on every
         // rank.
-        // An aggregated rank holds the blocks only in a layout that
+        // An aggregated rank with grouped prefix rules, which need prefix
+        // caching, holds the blocks only in a layout that
         // `GroupedPrefixRules::keeps_in_flight_hold` names: no
         // prefix-cacheable state group, or a prefix-cacheable full-attention
         // group and every prefix-cacheable block equal to the scheduler
@@ -2710,8 +2711,9 @@ impl VllmCore {
         // preempts itself, and hits the same tokens in its next life, and a
         // replay that follows it does not end. In every layout that loses the
         // hold an aggregated rank frees on the computed count, one step
-        // earlier than vLLM. A grouped prefill or decode rank keeps the hold
-        // in every layout.
+        // earlier than vLLM. An aggregated rank without those rules, such as
+        // one with prefix caching off, and a grouped prefill or decode rank
+        // keep the hold in every layout.
         let aggregated_hold = self.args.worker_type == WorkerType::Aggregated
             && self
                 .kv_manager
