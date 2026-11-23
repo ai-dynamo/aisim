@@ -337,6 +337,78 @@ def test_inherited_git_configuration_cannot_redirect_cache_credentials(
     assert [json.loads(line) for line in log.read_text().splitlines()] == [{"url": cache_url, "headers": [header]}]
 
 
+SHADOW = "import pathlib\npathlib.Path('../shadowed').write_text('imported from the checkout')\nraise SystemExit(99)\n"
+SHADOWS = {"json.py": SHADOW, "aisim_core/__init__.py": SHADOW}
+
+
+def _shadowed_checkout(tmp_path):
+    """A workspace whose ``cache-repo`` holds files named like the standard library and the AISim package."""
+    checkout = tmp_path / "cache-repo"
+    for name, code in SHADOWS.items():
+        (checkout / name).parent.mkdir(parents=True, exist_ok=True)
+        (checkout / name).write_text(code)
+    uv = tmp_path / "bin" / "uv"
+    uv.parent.mkdir()
+    # Only uv's interpreter selection is replaced; the interpreter's own arguments (-I) are passed through.
+    uv.write_text(
+        '#!/bin/sh\ntest "$1" = run && test "$5" = python || exit 2\nshift 5\n'
+        f'exec {shlex.quote(sys.executable)} "$@"\n'
+    )
+    uv.chmod(0o755)
+    python3 = tmp_path / "bin" / "python3"
+    python3.write_text(
+        f'#!/bin/sh\n[ "${{INFX_CACHE_WRITE_TOKEN+x}}" != x ] || exit 3\nexec {shlex.quote(sys.executable)} "$@"\n'
+    )
+    python3.chmod(0o755)
+    (tmp_path / "run-report.json").write_text(json.dumps({"snapshot_id": "a" * 64}))
+    return checkout, {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "INFX_CACHE_WRITE_TOKEN": "x"}
+
+
+def _publish_script(definition):
+    return definition["publish_candidate"]["script"][-1]
+
+
+def _run_in_checkout(tmp_path, command):
+    checkout, env = _shadowed_checkout(tmp_path)
+    result = subprocess.run(["sh", "-u", "-c", command], cwd=checkout, env=env, capture_output=True, text=True)
+    return result, (tmp_path / "shadowed").exists()
+
+
+def test_report_parsing_runs_isolated_and_without_the_write_token(definition, tmp_path):
+    line = next(line.strip() for line in _publish_script(definition).splitlines() if line.strip().startswith("SID=$("))
+    result, shadowed = _run_in_checkout(tmp_path, f'{line}\necho "$SID"')
+    assert result.stdout.strip() == "a" * 64, result.stderr
+    assert not shadowed  # a json.py in the checkout was not imported
+    # The token never reached the interpreter (the stub refuses to run with it). Without -I the checkout would run.
+    unisolated = line.replace(" -I", "")
+    _, shadowed = _run_in_checkout(tmp_path / "control", f'{unisolated}\necho "$SID"')
+    assert shadowed
+
+
+def _verifier_commands(definition):
+    lines = _publish_script(definition).splitlines()
+    start = next(i for i, line in enumerate(lines) if "python -I - <<'PY'" in line)
+    heredoc = lines[start : lines.index("PY", start) + 1]
+    verify = next(line.strip() for line in lines if "infx_job verify" in line)
+    return "\n".join(heredoc), verify
+
+
+@pytest.mark.parametrize("which", ["pending-branch-verifier", "candidate-verify"])
+def test_verifiers_in_the_cache_checkout_import_the_pinned_library_not_the_checkout(definition, tmp_path, which):
+    heredoc, verify = _verifier_commands(definition)
+    command = heredoc + '\necho "RC=${RC:-0}"' if which == "pending-branch-verifier" else f"SID={'b' * 64}\n{verify}"
+    result, shadowed = _run_in_checkout(tmp_path, f"RC=0\n{command}")
+    assert not shadowed, result.stderr  # nothing from the checkout was imported
+    assert "No module named" not in result.stderr, result.stderr  # the pinned installation still resolves
+    if which == "pending-branch-verifier":
+        # The verifier ran and reached its own verdict: this checkout has no state to reuse (exit code 3).
+        assert "RC=3" in result.stdout, (result.stdout, result.stderr)
+    # The unisolated spelling would have executed the checkout's package.
+    control = command.replace("python -I ", "python ")
+    _, shadowed = _run_in_checkout(tmp_path / "control", f"RC=0\n{control}")
+    assert shadowed
+
+
 def test_ingestion_runs_without_the_cache_token_and_never_pushes_to_the_default_branch(definition):
     job = definition["publish_candidate"]
     text = _text(job)

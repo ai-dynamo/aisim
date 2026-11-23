@@ -91,6 +91,10 @@ commit and otherwise fails (exit 4) so a rerun starts from the new baseline. It 
 snapshot and its member artifacts from the exact commit it pushes, so a Git ignore rule that omits a required
 artifact stops the job before any branch is created.
 
+The Python commands that run beside the cache checkout (report parsing and both verifiers) use isolated mode
+(`-I`): the checkout's files cannot shadow the standard library or the reviewed AISim installation, and report
+parsing runs without the write token.
+
 Promotion refuses a candidate branch whose tip is not `candidate-commit`, and one whose recorded qualified
 baseline differs from the default branch's current qualification (its change counts would be stale); rerun
 ingestion from the new baseline in that case.

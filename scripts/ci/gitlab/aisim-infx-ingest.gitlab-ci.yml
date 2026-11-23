@@ -137,7 +137,9 @@ publish_candidate:
       }
       STATUS=$(git status --porcelain) || exit "$?"
       if [ -z "$STATUS" ]; then baseline_unchanged; echo "unchanged refresh: no commit, no snapshot"; exit 0; fi
-      SID=$(python3 -c "import json;print(json.load(open('../run-report.json'))['snapshot_id'])")
+      # Python runs isolated (-I) from here on: its import path must not include this checkout, whose files could
+      # otherwise shadow the standard library or the reviewed AISim installation. Report parsing needs no token.
+      SID=$(env -u INFX_CACHE_WRITE_TOKEN python3 -I -c "import json;print(json.load(open('../run-report.json'))['snapshot_id'])")
       # A branch is reusable only while this exact snapshot is pending against
       # the current qualification. Historical reviews stay untouched.
       git -c http.followRedirects=false -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" ls-remote --heads origin "candidate/${SID}" "candidate/${SID}-*" > ../candidate-refs
@@ -145,7 +147,7 @@ publish_candidate:
         git -c http.followRedirects=false -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" fetch -q --depth 1 origin "$REF"
         git worktree add -q --detach ../remote-candidate FETCH_HEAD
         RC=0
-        env -u INFX_CACHE_WRITE_TOKEN uv run --frozen --project ../aisim/python/aisim python - <<'PY' || RC=$?
+        env -u INFX_CACHE_WRITE_TOKEN uv run --frozen --project ../aisim/python/aisim python -I - <<'PY' || RC=$?
       import sys
       from pathlib import Path
 
@@ -191,7 +193,7 @@ publish_candidate:
       COMMIT=$(git rev-parse HEAD)
       # `git add -A` honors ignore rules, so verify the exact commit rather than the checkout before publishing it.
       git worktree add -q --detach ../pushed "$COMMIT"
-      env -u INFX_CACHE_WRITE_TOKEN uv run --frozen --project ../aisim/python/aisim python -m aisim_core.data.infx_job verify --root ../pushed --snapshot-id "$SID"
+      env -u INFX_CACHE_WRITE_TOKEN uv run --frozen --project ../aisim/python/aisim python -I -m aisim_core.data.infx_job verify --root ../pushed --snapshot-id "$SID"
       git worktree remove ../pushed
       baseline_unchanged
       git -c http.followRedirects=false -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" push -q origin "$BRANCH"
