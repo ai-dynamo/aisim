@@ -32,6 +32,11 @@ ai-dynamo/aisim#435; this skill does not widen them.
    Require no `("error", message)` entries in `SizeReport.findings`; report `"warn"` entries without
    treating them as hard failures.
 6. Hygiene: no tokens, private inventory or private payloads; redact logs; keep raw output hash-linked.
+   Before any upload to a public repository, the bundle must pass the public disclosure profile with no
+   errors: `aisim_core.data.mirror.validate_tree(bundle, repo="ai-dynamo/aisim-data", profile="public")`
+   (`python -m aisim_core.data.mirror validate --root <bundle> --repo ai-dynamo/aisim-data --profile public`).
+   It scans every artifact and metadata field and rejects content the public policy withholds, such as
+   InferenceX-derived E2E configurations, which the gates above do not check. Report its findings.
 
 ## Candidate, not promotion
 
@@ -40,8 +45,15 @@ ai-dynamo/aisim#435; this skill does not widen them.
   as returned by `write_record`) with the regenerated catalog. Collector or packaged operation
   tables are converted to the op-latency layout with
   `python/aisim/tools/perf_database/publish_op_latency_tree.py build` and re-verified with `... audit`
-  (a supported publish step until the collector emits the layout directly). Writes to a public repository go
-  through a Hugging Face PR revision, and private or sensitive data goes only to the internal mirror.
+  (a supported publish step until the collector emits the layout directly). Both commands read the
+  packaged systems tree unless `--systems-dir` names another, so for a new collector run that is not in
+  the packaged data, a default `build` and `audit` agree with each other while the candidate omits the new
+  measurements. Prepare a systems tree that holds the collected tables under `data/<system>/<family>/<backend>/<version>/`
+  beside the `perf_data_reuse_manifest.yaml` and `query_versions.yaml` the run uses, pass the same
+  `--systems-dir` to `build` and `audit`, and check the staged `source_map` rows
+  (`source_sha256`, `destination_sha256`) against the SHA-256 of the run's own tables. Writes to a public
+  repository go through a Hugging Face PR revision, and private or sensitive data goes only to the internal
+  mirror.
 - The library on this branch has no publish function and no `aisim data fetch` CLI. Stop at the
   validated local bundle plus the gate output and give the user the exact upload step; upload only
   with explicit authorization, using their existing `huggingface-cli login` or `HF_TOKEN`
