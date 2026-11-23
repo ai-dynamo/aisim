@@ -1483,15 +1483,47 @@ def test_glm_publication_refuses_a_raw_sample_of_another_workload(tmp_path, phas
     assert "benchmark_measurement raw sample 3 does not hold the workload of its point" in refusal
 
 
-def test_glm_publication_refuses_a_global_warmup_in_the_protocol(tmp_path):
+@pytest.mark.parametrize("count", [1, 5])
+def test_glm_publication_refuses_a_global_warmup_in_the_protocol(tmp_path, count):
     def tamper(payload):
-        payload["measurement_protocol"]["preparation"]["warmup_iterations"] = 5
+        payload["measurement_protocol"]["preparation"]["warmup_iterations"] = count
 
     refusal = _publication_refusal(tmp_path, "prefill", tamper)
     assert (
         "measurement_protocol.preparation.warmup_iterations must be 0 for the GLM-5.3-Flash producer: "
-        "expected 0, found 5"
+        f"expected 0, found {count}"
     ) in refusal
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_glm_publication_refuses_a_raw_sample_whose_count_is_below_its_point(tmp_path, phase):
+    # The decode case holds the count of the first recorded step of a decode repetition: the point's KV total less one
+    # token for each request.
+    def tamper(payload):
+        row = payload["results"][0]
+        scheduled = row["fpms"][0]["benchmark_measurement"]["raw_fpms"][3]["scheduled_requests"]
+        if phase == "prefill":
+            scheduled["sum_prefill_tokens"] -= 4
+        else:
+            scheduled["sum_decode_kv_tokens"] -= row["point"]["batch_size"]
+
+    refusal = _publication_refusal(tmp_path, phase, tamper)
+    assert "benchmark_measurement raw sample 3 does not hold the workload of its point" in refusal
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_glm_publication_refuses_a_raw_sample_of_another_workload_in_a_later_point(tmp_path, phase):
+    def tamper(payload):
+        row = payload["results"][-1]
+        assert row is not payload["results"][0]
+        scheduled = row["fpms"][0]["benchmark_measurement"]["raw_fpms"][5]["scheduled_requests"]
+        if phase == "prefill":
+            scheduled["sum_prefill_tokens"] += 4
+        else:
+            scheduled["sum_decode_kv_tokens"] += 1
+
+    refusal = _publication_refusal(tmp_path, phase, tamper)
+    assert "benchmark_measurement raw sample 5 does not hold the workload of its point" in refusal
 
 
 _ABSENT = object()
@@ -1523,8 +1555,8 @@ def _set_scheduled(index, key, value):
     ],
 )
 def test_glm_publication_refuses_a_raw_sample_whose_workload_is_malformed(tmp_path, phase, index, tamper):
-    # The producer copies vLLM's integer counts into each raw sample, so a count of another JSON type that compares
-    # equal (1.0, False for 0) is no workload that the producer writes.
+    # The producer copies the integer counts of Dynamo's FPM into each raw sample, so a count of another JSON type that
+    # compares equal (1.0, False for 0) is no workload that the producer writes.
     refusal = _publication_refusal(tmp_path, phase, tamper)
     assert f"benchmark_measurement raw sample {index} does not hold the workload of its point" in refusal
 
@@ -1558,6 +1590,10 @@ def _raw_sample_is_a_list(payload):
     _first_record(payload)["raw_fpms"][3] = []
 
 
+def _raw_sample_without_its_sample_record(payload):
+    del _first_record(payload)["raw_fpms"][3]["benchmark_sample"]
+
+
 @pytest.mark.parametrize(
     ("first", "second", "text"),
     [
@@ -1578,6 +1614,12 @@ def _raw_sample_is_a_list(payload):
             lambda payload: None,
             "benchmark_measurement has invalid raw counter/rank/timing evidence",
             id="raw-sample-form-before-the-raw-sample-workload",
+        ),
+        pytest.param(
+            _raw_sample_of_another_workload,
+            _raw_sample_without_its_sample_record,
+            "benchmark_measurement raw sample 3 does not hold the workload of its point",
+            id="raw-sample-workload-before-the-observed-execution",
         ),
     ],
 )
