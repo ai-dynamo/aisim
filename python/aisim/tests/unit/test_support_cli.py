@@ -1314,8 +1314,8 @@ def test_real_collector_artifact_symlink_rejected_before_first_write(tmp_path, m
         reached_checkpoint.append(True)
         raise RuntimeError("collector reached checkpoint loading")
 
-    # The real collector writes collection-plan.json before loading its
-    # checkpoint. Keep that path intact and stop before any GPU work.
+    # The real collector loads its checkpoint before its first write. Stop
+    # there, before any write and any GPU work.
     monkeypatch.setattr(runner, "_load_checkpoint", stop_before_gpu)
 
     with pytest.raises(SystemExit) as error:

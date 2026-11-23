@@ -2299,7 +2299,8 @@ def _run_collection_impl(
     runtime_exec = Path(__file__).resolve().parent / "runtime" / "fpm_exec.sh"
     runtime_preflight = Path(__file__).resolve().parent / "runtime" / "preflight.py"
     adapter = _ADAPTER_DIRS.get(getattr(getattr(plan, "capability", None), "architecture", None))
-    if cell_limit is not None:
+    # A limit of 0 is no limit.
+    if cell_limit:
         target_cells = plan.cells[:cell_limit]
     elif smoke:
         # The first cell of each phase that the plan collects.
@@ -2344,12 +2345,15 @@ def _run_collection_impl(
     checkpoint_changed = False
     # Recovery costs zero cluster time, so it runs on every resume: it only
     # acknowledges strictly validated, attempt-matched artifacts that already
-    # exist on disk. For such a cell it writes the producer receipt when the
-    # cell has none and, when the plan holds runtime instrumentation, archives
-    # the cell's observations (a copy of the cell folder and the index
-    # runtime-observations.json). After the loop it writes the checkpoint if
-    # it recovered a cell. Rerunning (--resume-retry-failed) remains the only
-    # path that schedules cluster work.
+    # exist on disk. For an entry with status running it first stops the
+    # abandoned workload on the cluster and waits until it is gone; a failed
+    # teardown leaves the cell unrecovered. For a recovered GLM-5.3-Flash cell
+    # whose folder holds no producer receipt it writes one; a cell of another
+    # model gets none. When the plan holds runtime instrumentation, it archives
+    # the observations of each recovered cell (a copy of the cell folder and
+    # the index runtime-observations.json). After the loop it writes the
+    # checkpoint if it recovered a cell. Rerunning (--resume-retry-failed)
+    # remains the only path that schedules cluster work.
     if resume:
         for cell in target_cells:
             entry = checkpoint["cells"].get(cell.cell_id)

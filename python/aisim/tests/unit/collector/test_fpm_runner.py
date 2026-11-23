@@ -2254,11 +2254,11 @@ def test_recovery_whose_validation_fails_writes_no_receipt(tmp_path, monkeypatch
         assert not (campaign / "cells" / cell.cell_id / "producer-receipt.json").exists()
 
 
-def test_default_smoke_runs_one_cell_of_each_collected_phase(monkeypatch, tmp_path):
+def _two_layout_plan(tmp_path):
+    """A GLM-5.3-Flash plan with a second layout: two prefill cells, then two decode cells."""
     from .test_fpm_runtime_memory import _glm_plan
 
     plan = _glm_plan(tmp_path)
-    # A second layout of the same plan: two prefill cells, then two decode cells.
     prefill, decode = plan.cells
     cells = (
         prefill,
@@ -2266,10 +2266,74 @@ def test_default_smoke_runs_one_cell_of_each_collected_phase(monkeypatch, tmp_pa
         decode,
         dataclasses.replace(decode, cell_id="fpm-second-decode"),
     )
-    staged, _, checkpoint = _staged_run(
-        monkeypatch, tmp_path / "run", dataclasses.replace(plan, cells=cells), smoke=True, every_cell=False
+    return dataclasses.replace(plan, cells=cells)
+
+
+def test_default_smoke_runs_one_cell_of_each_collected_phase(monkeypatch, tmp_path):
+    plan = _two_layout_plan(tmp_path)
+    prefill, _, decode, _ = plan.cells
+    staged, _, checkpoint = _staged_run(monkeypatch, tmp_path / "run", plan, smoke=True, every_cell=False)
+    # The cells run in the order of the plan. The checkpoint file sorts its keys.
+    assert list(staged) == [prefill.cell_id, decode.cell_id]
+    assert set(checkpoint["cells"]) == set(staged)
+
+
+@pytest.mark.parametrize(("smoke", "every_cell"), [(True, True), (False, False)])
+def test_limit_of_every_cell_and_run_without_smoke_run_every_cell(monkeypatch, tmp_path, smoke, every_cell):
+    plan = _two_layout_plan(tmp_path)
+    staged, _, checkpoint = _staged_run(monkeypatch, tmp_path / "run", plan, smoke=smoke, every_cell=every_cell)
+    assert list(staged) == [cell.cell_id for cell in plan.cells]
+    assert set(checkpoint["cells"]) == set(staged)
+
+
+def test_smoke_with_a_limit_of_one_runs_the_first_cell(monkeypatch, tmp_path):
+    plan = _two_layout_plan(tmp_path)
+    root = tmp_path / "run"
+    # The first run installs the in-process cluster.
+    _staged_run(monkeypatch, root, plan, smoke=True, every_cell=False)
+    errors = run_collection(
+        plan,
+        generator_overrides={},
+        checkpoint_dir=str(root / "one" / "checkpoints"),
+        artifact_root=str(root / "one" / "artifacts"),
+        resume=False,
+        retry_failed=False,
+        smoke=True,
+        cell_limit=1,
+        publish_database=False,
     )
-    assert set(staged) == set(checkpoint["cells"]) == {prefill.cell_id, decode.cell_id}
+    assert errors == []
+    checkpoint = json.loads((root / "one" / "checkpoints" / "fpm_forward_smoke.json").read_text())
+    assert set(checkpoint["cells"]) == {plan.cells[0].cell_id}
+
+
+@pytest.mark.parametrize("smoke", [True, False])
+def test_limit_of_zero_is_no_limit(monkeypatch, tmp_path, smoke):
+    plan = _two_layout_plan(tmp_path)
+    prefill, _, decode, _ = plan.cells
+    root = tmp_path / "run"
+    # The first run installs the in-process cluster.
+    staged, _, _ = _staged_run(monkeypatch, root, plan, smoke=smoke, every_cell=False)
+    staged.clear()
+    errors = run_collection(
+        plan,
+        generator_overrides={},
+        checkpoint_dir=str(root / "zero" / "checkpoints"),
+        artifact_root=str(root / "zero" / "artifacts"),
+        resume=False,
+        retry_failed=False,
+        smoke=smoke,
+        cell_limit=0,
+        publish_database=smoke,
+    )
+    assert errors == []
+    expected = [prefill.cell_id, decode.cell_id] if smoke else [cell.cell_id for cell in plan.cells]
+    assert list(staged) == expected
+    name = "fpm_forward_smoke.json" if smoke else "fpm_forward.json"
+    checkpoint = json.loads((root / "zero" / "checkpoints" / name).read_text())
+    assert set(checkpoint["cells"]) == set(expected)
+    if smoke:
+        assert (checkpoint["smoke"]["status"], checkpoint["smoke"]["cell_count"]) == ("passed", 2)
 
 
 def test_default_smoke_of_a_prefill_role_runs_its_one_phase(monkeypatch, tmp_path):
@@ -2303,9 +2367,10 @@ def test_resume_with_another_frozen_plan_writes_no_campaign_file(tmp_path):
 
 
 def _tree_state(root: Path) -> dict:
-    """Each path under ``root`` with its inode and, for a file, its bytes: a rewrite with equal bytes still shows."""
+    """Each path under ``root`` with its inode, its modification time and, for a file, its bytes."""
     return {
-        path: (path.stat().st_ino, path.read_bytes() if path.is_file() else None) for path in sorted(root.rglob("*"))
+        path: (path.stat().st_ino, path.stat().st_mtime_ns, path.read_bytes() if path.is_file() else None)
+        for path in sorted(root.rglob("*"))
     }
 
 
@@ -4272,7 +4337,7 @@ def test_runtime_default_path_is_adapter_owned():
 @pytest.mark.parametrize(
     ("architecture", "name"), [("DeepseekV41ForCausalLM", "V4.1"), (GLM_ARCHITECTURE, "GLM-5.3-Flash")]
 )
-@pytest.mark.parametrize("value", ["", None, "relative/overlay", "/opt/a::/opt/b", "/opt/a\n/opt/b"])
+@pytest.mark.parametrize("value", ["", None, "relative/overlay", "/opt/a::/opt/b", "/opt/a\n/opt/b", "/opt/a\r/opt/b"])
 def test_adapter_python_path_must_name_absolute_paths(architecture, name, value):
     with pytest.raises(ValueError) as error:
         _adapter_python_path(architecture, {"PYTHONPATH": {"name": "PYTHONPATH", "value": value}})
@@ -4286,6 +4351,9 @@ def test_adapter_python_path_puts_the_staged_files_first():
             "name": "PYTHONPATH",
             "value": "/tmp/fpm-bench:/opt/a:/opt/b",
         }
+    # A declared path that already holds the staged folder names it once, first.
+    repeated = {"PYTHONPATH": {"name": "PYTHONPATH", "value": "/opt/a:/tmp/fpm-bench:/opt/b"}}
+    assert _adapter_python_path(GLM_ARCHITECTURE, repeated)["value"] == "/tmp/fpm-bench:/opt/a:/opt/b"
     assert _adapter_python_path("LlamaForCausalLM", declared) is None
 
 
