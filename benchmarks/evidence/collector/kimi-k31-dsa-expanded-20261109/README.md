@@ -37,6 +37,9 @@ checks the exact frozen case sets, and verifies that all columns of the earlier
 B300 rows remain unchanged. `x86/manifest.json` and `arm/manifest.json` bind the
 finite public evidence packages. Original raw CSV-formatted files preserve
 their CRLF bytes; source events and original table columns survive the unions.
+The inventory records paths at collection time. To verify it against this
+checkout, replace the prefix `python/aisimulate/src/aisimulate_core/systems/`
+with `python/aisim/src/aisim_core/systems/` and hash each file at that path.
 All campaign allocations have been released.
 
 The GB200 union explicitly migrates legacy schema-1 events to schema 2. The
