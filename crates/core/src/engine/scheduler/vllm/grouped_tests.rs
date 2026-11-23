@@ -6111,9 +6111,9 @@ fn grouped_scheduler_tells_the_kv_manager_when_the_pass_before_is_in_flight() {
     // can count as a consumer (v0.31, v0.32 and v0.33 kv_transfer.py:11-12).
     // vLLM then pairs the hold on the processed count with a stop (v0.31
     // sched:175-181, :773-775, v0.32 sched:186-192, :804-806, v0.33
-    // sched:193-195, :940-942). Replay models that stop on a grouped prefill
-    // or decode rank only, so a linear prefill or decode rank gets the
-    // computed count as its processed count, with a state cache and without
+    // sched:193-195, :940-942). Among prefill and decode ranks, replay models
+    // that stop on a grouped rank only, so a linear prefill or decode rank gets
+    // the computed count as its processed count, with a state cache and without
     // one.
     for (max_concurrent_batches, expected) in
         [(1, [false, false, false]), (2, [false, true, false])]
@@ -7468,12 +7468,12 @@ fn linear_prefill_and_decode_ranks_preempt_a_request_that_the_pass_in_flight_run
     // the fifth block in pass 5, and the token 9 of Y finds none. Y is the last
     // running request, and pass 4 ran it. With a consumer connector and async
     // scheduling vLLM stops there (v0.31 sched:175-181, :773-775, v0.32
-    // sched:186-192, :804-806, v0.33 sched:193-195, :940-942). Replay models
-    // that stop on a grouped prefill or decode rank only, so a linear rank
-    // preempts Y in pass 5 with two batches as with one. An aggregated rank has
-    // no connector and preempts Y too. A state cache adds blocks to each
-    // request, so on its pool of 7 blocks a pass preempts Y earlier, and the
-    // passes of two batches are those of one batch there too.
+    // sched:186-192, :804-806, v0.33 sched:193-195, :940-942). Among prefill
+    // and decode ranks, replay models that stop on a grouped rank only, so a
+    // linear rank preempts Y in pass 5 with two batches as with one. An
+    // aggregated rank has no connector and preempts Y too. A state cache adds
+    // blocks to each request, so on its pool of 7 blocks a pass preempts Y
+    // earlier, and the passes of two batches are those of one batch there too.
     for pool in ["linear", "state cache"] {
         for worker_type in [
             WorkerType::Prefill,
@@ -8501,9 +8501,9 @@ fn grouped_glm_shaped_next_turn_gets_a_junction_where_output_tokens_filled_a_blo
     // full-attention lookup hits 2,176 tokens and its Mamba lookup none, so
     // the hit is 0 and the junction 2,176 (v0.31 and v0.32
     // kv_cache_manager.py:312-321, v0.33 :319-328). The prefill stops at the
-    // junction and each Mamba group publishes its state there. With 100 output tokens
-    // turn 1 fills no block, and turn 2 (2,200 tokens) gets no junction. One
-    // step computes 2,176 tokens at most here, so the first chunk of turn 2
+    // junction and each Mamba group publishes its state there. With 100 output
+    // tokens turn 1 fills no block, and turn 2 (2,200 tokens) gets no junction.
+    // One step computes 2,176 tokens at most here, so the first chunk of turn 2
     // ends at 2,176 in both cases.
     for (version, checkpoint) in GLM_CORES {
         for batches in [1, 2] {

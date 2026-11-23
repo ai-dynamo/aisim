@@ -613,11 +613,14 @@ fn grouped_prefix_request_preempted_after_output_tokens_resumes_on_its_own_block
     // after it has output tokens past the block that ends at 36, its replay
     // boundary. The block that ends at 40 holds prompt and output tokens.
     // vLLM hashes output tokens (v0.31, v0.32 and v0.33 request.py:272-288),
-    // and replay gives that block its key in the pass that fills it. With
-    // two batches vLLM gives the key only in the request's next
-    // `allocate_slots` call that succeeds (v0.31 kv_cache_manager.py:574-576
-    // and :608-612, v0.32 :577-579 and :612-616, v0.33 :586-588 and
-    // :621-625), so the lives of the long request can differ from vLLM's.
+    // and replay gives that block its key in the pass that fills it. With two
+    // batches vLLM gives the key in the request's next `allocate_slots` call if
+    // that call succeeds (v0.31 kv_cache_manager.py:574-576 and :608-612, v0.32
+    // :577-579 and :612-616, v0.33 :586-588 and :621-625), or when it processes
+    // the outputs of the filling step while the request still runs (v0.31 and
+    // v0.32 sched/async_scheduler.py:73-77, v0.33
+    // sched/scheduler.py:2407-2415), so the lives of the long request can
+    // differ from vLLM's.
     // The test pins only that the replay ends: both requests complete, well
     // before the cap of 10 s of simulated time. It does not pin how often
     // replay preempts either request.
@@ -1398,8 +1401,8 @@ fn own_role_run(
             .unwrap();
         trace.push(format!("command at {now_ms}: {effects:?}"));
     };
-    // Run passes until `done` holds for a completed pass, or until no rank
-    // has work; refuse once while the first pass is in flight.
+    // Run passes until `done` holds for a completed pass, or until no rank has
+    // work; with `in_flight`, refuse once while the first pass is in flight.
     let run = |engine: &mut aisim_core::engine::Engine,
                trace: &mut Vec<String>,
                now_ms: &mut f64,
@@ -1513,9 +1516,9 @@ fn engine_refuses_kv_handoff_commands_of_the_opposite_role() {
         serde_json::from_value::<ReplayEngineConfig>(disaggregated_grouped_spec(Vec::new()).engine)
             .unwrap()
             .rank;
-    // A grouped prefill rank refused `ReserveDestination` with its own text
-    // before this rule, so only the other two destination commands reach the
-    // role text there.
+    // A grouped prefill rank refuses `ReserveDestination` with its own text, in
+    // a check that runs before the role check, so only the other two
+    // destination commands reach the role text there.
     let mut ranks = Vec::new();
     for backend in [Backend::Vllm, Backend::Trtllm, Backend::Sglang] {
         ranks.push((
@@ -1880,12 +1883,13 @@ fn grouped_destination_in_byte_mode_with_a_window_group_stops_where_vllm_stops()
     // 1 = 13 pages for 50 ms. With the loaded tokens computed, the reserve
     // that vLLM keeps for a held load counts the rest of its sequence with
     // the cap: 11 - 10 = 1 full-attention page, and for the window group
-    // min(11, 5) less the 10 block positions that the load holds, null
-    // blocks included, so no page (v0.31.0 `vllm/v1/core/sched/scheduler.py:3003-3017`, v0.32.0
-    // `:3060-3076`, v0.33.0 `:3404-3420`). The first step after the load
-    // counts the window page that token 161 opens, without the cap: 2 pages
-    // (v0.31.0 `vllm/v1/core/kv_cache_manager.py:558-576`, v0.32.0
-    // `:561-579`, v0.33.0 `:570-588`).
+    // min(11, 5) less the 10 block positions that the load holds, null blocks
+    // included, so no page (v0.31.0
+    // `vllm/v1/core/sched/scheduler.py:3003-3017`, v0.32.0 `:3060-3076`,
+    // v0.33.0 `:3404-3420`). The first step after the load counts the window
+    // page that token 161 opens, without the cap: 2 pages (v0.31.0
+    // `vllm/v1/core/kv_cache_manager.py:558-576`, v0.32.0 `:561-579`, v0.33.0
+    // `:570-588`).
     // - 26 pages: the second load needs 13 pages and the reserve 1, against
     //   13 free, so it waits, and it is reserved when the first request ends.
     // - 27 pages: the second load fits on 14 free pages with the reserve, and

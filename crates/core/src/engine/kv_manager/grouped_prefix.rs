@@ -2148,12 +2148,13 @@ impl GroupedPrefixCoordinator {
     /// caches a block that a sampled token fills one step later: in the
     /// request's next `allocate_slots` call if that call succeeds (v0.31
     /// `mgr:574-576` and `mgr:608-612`, v0.32 `mgr:577-579` and
-    /// `mgr:612-616`, v0.33 `mgr:586-588` and `mgr:621-625`), or, for a
-    /// request that still runs, when vLLM processes the outputs of the
-    /// filling step. Replay
-    /// publishes that block in the pass that fills it, and keeps it for a
-    /// request that is preempted in the next pass, where vLLM frees it
-    /// without its key.
+    /// `mgr:612-616`, v0.33 `mgr:586-588` and `mgr:621-625`), or when vLLM
+    /// processes the outputs of the filling step, if the request runs at that
+    /// time (v0.31 and v0.32 `async_scheduler.py:73-77`, v0.33
+    /// `sched:2407-2415`, where vLLM also skips the outputs of a step that
+    /// was in flight when it preempted the request). Replay publishes that
+    /// block in the pass that fills it, and keeps it for a request that is
+    /// preempted in the next pass, where vLLM frees it without its key.
     pub(crate) fn finalize(
         &mut self,
         pool: &mut GroupedBlockPool,

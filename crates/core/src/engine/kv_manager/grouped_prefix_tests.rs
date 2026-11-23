@@ -5381,9 +5381,8 @@ fn block_that_one_chunk_fills_past_the_prompt_tail_takes_both_keys() {
             5,
         ),
         // v0.32.0 and v0.33.0 with the checkpoint block: A is one chunk and
-        // leaves g0{32 64+60} g2{60}; B hits 60
-        // with no junction, computes 4, takes 6 blocks first and leaves
-        // g2{60}.
+        // leaves g0{32 64+60} g2{60}; B hits 60 with no junction, computes 4,
+        // takes 6 blocks first and leaves g2{60}.
         (
             VllmRuleVersion::V0_32_0,
             true,
@@ -5409,10 +5408,9 @@ fn block_that_one_chunk_fills_past_the_prompt_tail_takes_both_keys() {
             vec![60],
             4,
         ),
-        // v0.32.0 and v0.33.0 without the checkpoint block: A computes 32,
-        // 28 and 4 and leaves g0{32 64+60}
-        // g2{32 60}; B hits 60 with no junction, computes 4, takes 6 blocks
-        // first and leaves g2{32 60}.
+        // v0.32.0 and v0.33.0 without the checkpoint block: A computes 32, 28
+        // and 4 and leaves g0{32 64+60} g2{32 60}; B hits 60 with no junction,
+        // computes 4, takes 6 blocks first and leaves g2{32 60}.
         (
             VllmRuleVersion::V0_32_0,
             false,

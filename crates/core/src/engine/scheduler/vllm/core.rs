@@ -2692,12 +2692,13 @@ impl VllmCore {
         // connector, so a grouped prefill rank has the stop of a `kv_both`
         // connector, which a `kv_producer` connector lacks. A linear prefill
         // or decode rank has no stop and frees on the computed count.
-        // The flag has an effect only on a rank with cache groups, through
-        // the processed count: the hold rules of its allocation and the
-        // forward check of a grouped request use that count. An aggregated
-        // rank with cache groups has no offload tier and so no connector. A
-        // linear state cache does not use the count: it frees a previous
-        // state copy at the next allocation of its request on every rank.
+        // The flag has an effect only on a rank with cache groups, through the
+        // processed count: the hold rules of its allocation use that count, and
+        // so does the forward check of a grouped request on an aggregated rank.
+        // An aggregated rank with cache groups has no offload tier and so no
+        // connector. A linear state cache does not use the count: it frees a
+        // previous state copy at the next allocation of its request on every
+        // rank.
         // An aggregated rank holds the blocks only in a layout that
         // `GroupedPrefixRules::keeps_in_flight_hold` names: no
         // prefix-cacheable state group, or a prefix-cacheable full-attention

@@ -1067,15 +1067,18 @@ impl VllmBlockPool {
     /// `_insert_block_hash` for a block that has a hash (v0.31.0
     /// `vllm/v1/core/block_pool.py:629-649`, v0.32.0 `:626-646`, v0.33.0
     /// `:666-686`). Before that function runs, vLLM removes every key of the
-    /// block in two cases, so that the new key becomes the only key of the
+    /// block in these cases, so that the new key becomes the only key of the
     /// block: when the new key is the block's full key (v0.31.0 and v0.32.0
-    /// `:286-299`, v0.33.0 `:290-303`), and when it is a partial key that
-    /// covers more tokens than the block's partial primary key (v0.31.0
-    /// `:514-521`, v0.32.0 `:511-518`, v0.33.0 `:548-555`). This function
-    /// removes no key, so a caller uses it only where the block ends with the
-    /// same keys as in vLLM. When a copy whose first key lies inside its
-    /// block gets its full key, it becomes the last copy of its first key, as
-    /// the block in vLLM becomes the last block of that key (below).
+    /// `:286-299`, v0.33.0 `:290-303`), when it is a partial key that covers
+    /// more tokens than the block's partial primary key (v0.31.0 `:514-521`,
+    /// v0.32.0 `:511-518`, v0.33.0 `:548-555`), and when the caller says that
+    /// the contents of the block were replaced (`replace_existing_hashes`,
+    /// v0.31.0 `:510-513`, v0.32.0 `:507-510`, v0.33.0 `:544-547`), as the
+    /// Mamba manager does for its checkpoint block. This function removes no
+    /// key, so a caller uses it only where the block ends with the same keys as
+    /// in vLLM. When a copy whose first key lies inside its block gets its full
+    /// key, it becomes the last copy of its first key, as the block in vLLM
+    /// becomes the last block of that key (below).
     pub(crate) fn cache_grouped_alias(
         &mut self,
         id: BlockCopyId,
