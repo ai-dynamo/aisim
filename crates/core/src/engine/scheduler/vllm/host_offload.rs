@@ -4746,6 +4746,67 @@ mod tests {
         run.until_admitted(4);
     }
 
+    #[test]
+    fn cancelling_a_load_that_awaits_vllms_poll_retries_a_destination_waiting_for_capacity() {
+        // The busy run with a 25 ms copy. The follow-up's G2 load reserves its
+        // G1 destination and completes while request 9 decodes; no poll has
+        // seen it yet. A KV handoff destination then waits for capacity.
+        // Cancelling the follow-up returns its destination blocks, so the
+        // waiting destination must be retried and reserved at once.
+        use crate::engine::handoff::HandoffId;
+        use crate::engine::scheduler::{SchedulerCommand, SchedulerLifecycleEvent};
+        let mut run = PollRun::new(G2Connector::OffloadingV032, 25.0, true, true);
+        run.submit(3, (0..30).collect(), 2);
+        let follow_up = Uuid::from_u128(3);
+        for _ in 0..64 {
+            if run.core.test_awaits_poll(follow_up) {
+                break;
+            }
+            run.step();
+        }
+        assert!(run.core.test_awaits_poll(follow_up));
+        let free = 16 - run.core.kv_manager.num_active_blocks();
+        let handoff_id = HandoffId::from(Uuid::from_u128(40));
+        let tokens = 4 * (free + 1);
+        let waiting = run
+            .core
+            .apply_command_effects(
+                SchedulerCommand::ReserveDestination {
+                    handoff_id,
+                    request: DirectRequest {
+                        tokens: (2000..2000 + tokens as u32).collect(),
+                        max_output_tokens: 1,
+                        uuid: Some(Uuid::from_u128(41)),
+                        ..Default::default()
+                    },
+                },
+                true,
+            )
+            .unwrap();
+        assert!(
+            waiting.lifecycle_events.is_empty(),
+            "the destination waits for capacity"
+        );
+        let cancelled = run
+            .core
+            .apply_command_effects(
+                SchedulerCommand::CancelRequest {
+                    request_id: follow_up,
+                },
+                true,
+            )
+            .unwrap();
+        assert!(!run.core.test_awaits_poll(follow_up));
+        assert!(
+            cancelled.lifecycle_events.iter().any(|event| matches!(
+                event,
+                SchedulerLifecycleEvent::DestinationReserved { handoff_id: id, .. } if *id == handoff_id
+            )),
+            "the cancelled load's blocks admit the waiting destination: {:?}",
+            cancelled.lifecycle_events
+        );
+    }
+
     /// The pass that admitted `id`, if any.
     fn admitted_in(run: &PollRun, id: u128) -> Option<usize> {
         let uuid = Uuid::from_u128(id);

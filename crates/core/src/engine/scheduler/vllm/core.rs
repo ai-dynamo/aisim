@@ -3870,6 +3870,11 @@ impl VllmCore {
         if let Some(oracle) = &self.belady_oracle {
             oracle.retire_requests([uuid]);
         }
+        // Before any host-tier cancellation below: dropping a completed load
+        // that awaits vLLM's poll, or cancelling one in flight, returns its
+        // G1 destination, and a destination waiting for capacity must see
+        // that release.
+        let active_blocks_before = self.kv_manager.num_active_blocks();
         let mut cancelled_host_load = false;
         self.load_clock.remove(&uuid);
         if let Some(position) = self
@@ -3911,7 +3916,6 @@ impl VllmCore {
         if cancelled_host_load {
             self.state.wake_connector_deadline_waiters();
         }
-        let active_blocks_before = self.kv_manager.num_active_blocks();
         let Some(request) = self.state.requests.get(&uuid) else {
             if self.kv_manager.num_active_blocks() < active_blocks_before {
                 self.bump_capacity_generation();
