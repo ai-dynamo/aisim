@@ -1628,7 +1628,10 @@ def _cell_generator_overrides(
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
             raise TypeError("K8sConfig.extra_env entries must be {name, value} mappings")
         name = item["name"]
-        if plan.options.executor == "slurm" and name in {"FPM_SLURM_CPUS_PER_TASK", "FPM_SLURM_CPU_BIND"}:
+        if (
+            name in {"FPM_SLURM_CPUS_PER_TASK", "FPM_SLURM_CPU_BIND"}
+            and getattr(plan.options, "executor", None) == "slurm"
+        ):
             raise ValueError(f"{name} is owned by the Slurm launcher")
         if name == "PYTHONHOME":
             raise ValueError("K8sConfig.extra_env does not support PYTHONHOME; use the image's Python prefix")

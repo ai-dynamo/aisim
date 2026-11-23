@@ -289,7 +289,7 @@ def test_text_only_qwen35_rejects_sol_before_graph_construction(
     profile_dict["architecture"] = wrapper if wrapper_profile else decoder
     checkpoint_configs[profile_dict["model"]] = {
         "architectures": [wrapper],
-        "text_config": {} if wrapper_profile else {"architectures": [decoder]},
+        "text_config": {"num_hidden_layers": 6} if wrapper_profile else {"architectures": [decoder]},
     }
     monkeypatch.setattr(engine, "compile_engine", _fail_graph)
     request = _request(profile_dict)
@@ -314,7 +314,9 @@ def test_text_only_qwen35_queries_unmeasured_point_with_direct_interpolation(
     profile_dict["deployments"][0]["system"] = "h200_sxm"
     checkpoint_configs[profile_dict["model"]] = {
         "architectures": [stem + "ForConditionalGeneration"],
-        "text_config": {} if wrapper_profile else {"architectures": [profile_dict["architecture"]]},
+        "text_config": {"num_hidden_layers": 6}
+        if wrapper_profile
+        else {"architectures": [profile_dict["architecture"]]},
     }
     monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
     monkeypatch.setattr(engine, "get_model", _fail_graph)

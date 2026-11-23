@@ -1785,7 +1785,7 @@ def test_run_collection_stages_owned_runtime_files(monkeypatch, tmp_path, pendin
     assert "database" not in checkpoint
 
 
-def _staged_run(monkeypatch, root: Path, plan, *, smoke: bool):
+def _staged_run(monkeypatch, root: Path, plan, *, smoke: bool, overrides=None):
     """Run every cell of ``plan`` on an in-process cluster.
 
     Return the names that each cell stages, the point-list receipt that each cell records after execution, and the
@@ -1844,7 +1844,7 @@ def _staged_run(monkeypatch, root: Path, plan, *, smoke: bool):
     )
     errors = run_collection(
         plan,
-        generator_overrides={},
+        generator_overrides=overrides or {},
         checkpoint_dir=str(root / "checkpoints"),
         artifact_root=str(root / "artifacts"),
         resume=False,
@@ -1932,8 +1932,8 @@ def test_run_collection_stages_the_smoke_of_a_prefill_role_glm_plan(monkeypatch,
 def test_formal_glm_run_stages_the_full_point_list(monkeypatch, tmp_path):
     from .test_fpm_runtime_memory import _probe_backed_glm_plan
 
-    plan, _overrides = _probe_backed_glm_plan(tmp_path)
-    staged, receipts, checkpoint = _staged_run(monkeypatch, tmp_path / "run", plan, smoke=False)
+    plan, overrides = _probe_backed_glm_plan(tmp_path)
+    staged, receipts, checkpoint = _staged_run(monkeypatch, tmp_path / "run", plan, smoke=False, overrides=overrides)
 
     full = plan.options.benchmark_points_json.encode()
     full_sha256 = hashlib.sha256(full).hexdigest()
@@ -4075,14 +4075,16 @@ def test_startup_environment_activates_the_runtime_adapter_before_preflight(tmp_
             directory = tmp_path / kind / phase
             directory.mkdir(parents=True)
             fpm_runner._write_runtime_environment(directory, _cell_generator_overrides(plan, cell, {}))
-            # The default and V4.1 files are the ones from before the GLM-5.3-Flash adapter.
-            assert (directory / fpm_runner.RUNTIME_ENV_FILENAME).read_text().splitlines() == [
-                "# Generated Collector startup environment; engine settings remain in run.sh.",
-                *lines,
-                "export FPM_READINESS_TIMEOUT_SECONDS=900",
-                "export DYN_BENCH_KV_WARMUP=on",
-                "export DYN_BENCH_PREFILL_REAL_SEED=on",
-            ]
+            startup = (directory / fpm_runner.RUNTIME_ENV_FILENAME).read_text().splitlines()
+            assert set(lines) <= set(startup)
+            assert f"export FPM_RUN_ID={cell.cell_id}" in startup
+            assert "export DYN_FPM_BENCHMARK_OUTPUT_PATH=/results/benchmark.json" in startup
+            assert "export FPM_READINESS_TIMEOUT_SECONDS=900" in startup
+            assert "export DYN_BENCH_KV_WARMUP=on" in startup
+            assert "export DYN_BENCH_PREFILL_REAL_SEED=on" in startup
+            for other, other_lines in adapter_lines.items():
+                if other != kind:
+                    assert not set(other_lines).difference(lines).intersection(startup)
 
 
 @pytest.mark.parametrize("transport", ["kubernetes", "slurm"])
