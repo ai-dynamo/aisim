@@ -509,7 +509,11 @@ The connector-specific copy timing is:
   its copy ends. vLLM sleeps 1 ms after each empty step, so it schedules the
   request a few milliseconds later.
 
-Replay releases a load's CPU source-block pins when the copy finishes.
+Replay releases a load's CPU source-block pins when the copy finishes, but
+never before replay forms the issuing pass. A SimpleCPU copy can finish
+earlier in the connector's timeline: if it ends at T + 55 ms but replay forms
+the issuing pass at T + 100 ms, the physical pin release is clamped to
+T + 100 ms. Poll eligibility still uses the earlier T + 55 ms copy end.
 With `offloading_v0_32`, it still retains the load's lookup keys until the
 scheduler activates the load after polling. vLLM keeps the source blocks
 pinned until it observes completion. This is an approximation under cache

@@ -343,6 +343,50 @@ fn run_tokens(engine: EngineConfig, requests: Vec<DirectRequest>) -> ReplayRepor
 }
 
 #[test]
+fn a_simple_cpu_copy_finishing_before_its_issuing_pass_forms_reuses_host_tokens() {
+    // Request 1 stores five prompt blocks in G2; request 2 evicts them from
+    // G1. R (3) prefills from 600 to 700. N (4) arrives after R's launch, so
+    // it joins the pass decided at 700, prefilling beside R's decode from
+    // 710 to 820. A (5) arrives at 701 and issues its load in the next pass,
+    // m, decided at 710. SimpleCPU starts copying at m's launch end, 715,
+    // and finishes 40 ms later, at 755, before replay forms m at 820.
+    // m+1 polls at 825 and sees the copy; A is eligible two decisions later,
+    // in m+3 at 850. Starting the copy at pass formation would end it at 860
+    // and miss this admission. Its first admission must retain the G2 reuse
+    // in the replay report, even though the copy ended before m formed.
+    let five_blocks_in_40_ms = 320.0 / (40.0 * 1e6);
+    let mut config = launch(engine(20), [5.0; 3], 0.0);
+    config.enable_prefix_caching = true;
+    config.kv_cache_bytes_per_token = Some(16);
+    config.native_host_offload = Some(
+        NativeHostOffloadConfig::new(64)
+            .with_bandwidths(0.0, five_blocks_in_40_ms)
+            .with_connector(G2Connector::SimpleCpuV032),
+    );
+    let report = run_tokens(
+        config,
+        vec![
+            tokens_request(1, (0..22).collect(), 1, 0.0),
+            tokens_request(2, (500..576).collect(), 1, 300.0),
+            tokens_request(3, (900..904).collect(), 20, 600.0),
+            tokens_request(4, (700..708).collect(), 4, 695.0),
+            tokens_request(5, (0..30).collect(), 2, 701.0),
+        ],
+    );
+    assert_eq!(record(&report, 4).first_admit_ms, Some(710.0));
+    let restored = record(&report, 5);
+    assert_eq!(restored.first_admit_ms, Some(850.0));
+    assert_eq!(restored.first_admission_host_reused_input_tokens, Some(20));
+    assert_eq!(report.per_request.len(), 5);
+    assert!(
+        report
+            .per_request
+            .iter()
+            .all(|request| request.output_length == request.requested_output_length)
+    );
+}
+
+#[test]
 fn a_load_awaiting_vllms_poll_does_not_stall_an_engine_with_only_a_blocked_waiter() {
     // Request 1 stores its five prompt blocks in the CPU tier, and request 2
     // fills G1 and evicts them. R (request 3) prefills from 600 and decodes
