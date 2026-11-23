@@ -9,7 +9,7 @@ import json
 from functools import cache
 from pathlib import Path
 
-from aisim_core.fpm_profile import _MUTABLE_REFERENCES
+from aisim_core.fpm_profile import _MUTABLE_REFERENCES, _load_fpm_timing_profile
 from aisim_core.fpm_profile import FpmCacheGroup as FpmCacheGroup
 from aisim_core.fpm_profile import FpmDeploymentProfile as FpmDeploymentProfile
 from aisim_core.fpm_profile import FpmMambaCache as FpmMambaCache
@@ -29,7 +29,7 @@ def _require_forward_pass_profile_memory(config: dict) -> None:
     """
     if config.get("fpm_profile") is None:
         return
-    deployment = load_fpm_profile(config["fpm_profile"]).select(
+    deployment = _load_fpm_timing_profile(config["fpm_profile"]).select(
         model=config["model"],
         system=config["system"],
         backend=config["backend"],
@@ -41,7 +41,7 @@ def _require_forward_pass_profile_memory(config: dict) -> None:
         moe_tp_size=config.get("moe_tp_size"),
         moe_ep_size=config.get("moe_ep_size"),
     )
-    deployment.resources.require_memory()
+    deployment.require_resources().require_memory()
 
 
 def _quantization_from_engine_config(config_json: str) -> dict[str, str]:
@@ -55,7 +55,7 @@ def _quantization_from_engine_config(config_json: str) -> dict[str, str]:
     from aisim_core.sdk.rust_engine_step import _moe_quant_to_dtype, _quant_to_dtype
 
     config = json.loads(config_json)
-    profile = load_fpm_profile(config["extra"]["fpm_profile"])
+    profile = _load_fpm_timing_profile(config["extra"]["fpm_profile"])
     deployment = profile.select(
         model=config["model_name"],
         system=config["system_name"],
@@ -152,7 +152,7 @@ def _validate_forward_pass_profile(config_json: str) -> str:
     Estimator defaults and interpolation selection belong to Rust.
     """
     config = json.loads(config_json)
-    profile = load_fpm_profile(config["fpm_profile"])
+    profile = _load_fpm_timing_profile(config["fpm_profile"])
     version = config.get("backend_version")
     if not isinstance(version, str) or version.lower() in _MUTABLE_REFERENCES | {"previous", "next"}:
         raise ValueError("fpm_profile requires a literal backend_version")

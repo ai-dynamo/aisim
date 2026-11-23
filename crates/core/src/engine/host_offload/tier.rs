@@ -115,6 +115,23 @@ pub(crate) struct HostBlockMeta {
     pub(crate) session_id: Option<Arc<str>>,
 }
 
+impl HostBlockMeta {
+    /// A `Stored` event of the one block `key` with this identity.
+    pub(crate) fn stored(&self, key: HostBlockKey) -> StoredBlocks {
+        StoredBlocks {
+            cache_salt: self.cache_salt.as_deref().map(str::to_owned),
+            parent_hash: self.parent,
+            start_position: Some(self.position),
+            blocks: vec![KvBlock {
+                block_hash: key.sequence_hash(),
+                tokens_hash: self.tokens_hash,
+                token_ids: None,
+            }],
+            session_id: self.session_id.as_deref().map(str::to_owned),
+        }
+    }
+}
+
 /// Visibility of one logical host block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Lookup {
@@ -156,7 +173,16 @@ impl ExternalPlan {
     pub(crate) fn reserved(&self) -> &[HostBlockKey] {
         &self.reserved
     }
+
+    /// The blocks applying the plan evicts.
+    pub(crate) fn victims(&self) -> &[HostBlockKey] {
+        &self.victims
+    }
 }
+
+/// The last block the searches of [`HostTier::oldest_evictable`] passed.
+#[derive(Default)]
+pub(crate) struct EvictionCursor(Option<NonZeroU32>);
 
 /// Result of scheduling an H2D selected by a framework adapter.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -192,8 +218,8 @@ pub(crate) struct ReversedTouch {
     absent_from: usize,
     /// The [`Lru`] run the keys' blocks join as they move.
     run: u32,
-    /// The blocks the call left newest, if the first key had one. While
-    /// `run` is whole they move again as one, without lookups.
+    /// The blocks the call left newest, if the first key had one. From the
+    /// place `run` is whole from, they move again as one.
     leading: Option<Leading>,
 }
 
@@ -203,6 +229,13 @@ impl ReversedTouch {
     pub(crate) fn stored(&mut self, blocks: usize, end: usize) {
         self.admitted += blocks as u64;
         self.absent_from = self.absent_from.max(end);
+    }
+
+    /// The caller's key list grew, or blocks entered the tier outside its
+    /// stores: the next call looks up every key after the kept run.
+    pub(crate) fn rescan(&mut self) {
+        self.lru_touches = u64::MAX;
+        self.admitted = u64::MAX;
     }
 }
 
@@ -229,12 +262,21 @@ struct Entry {
     /// This block's [`Lru`] node while it is resident and unpinned, or while
     /// it is present in a [`HostPolicy::Ranked`] tier.
     lru_slot: Option<NonZeroU32>,
-    /// Filled by a KVCR peer fetch rather than a local store.
-    kvcr_origin: bool,
+    /// Filled by KVCR rather than a local store; cleared at the first load.
+    kvcr_origin: Option<KvcrOrigin>,
     /// Pool blocks the entry occupies: one, or a state checkpoint's rows.
     /// External reservations and [`HostTier::free_blocks`] count entries;
     /// they never share a pool with a weighted entry.
     weight: u32,
+}
+
+/// Where KVCR filled a G2 block from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KvcrOrigin {
+    /// A peer rank.
+    Peer,
+    /// This rank's KVCR-owned memory.
+    LocalG2,
 }
 
 /// Declaration order is the same-timestamp completion order.
@@ -720,7 +762,7 @@ impl HostTier {
                 state: EntryState::PendingStore { transfer_id },
                 load_pins: 0,
                 lru_slot: None,
-                kvcr_origin: false,
+                kvcr_origin: None,
                 weight: if index < units { 1 } else { weight },
             };
             if self.config.policy == HostPolicy::Ranked {
@@ -753,6 +795,29 @@ impl HostTier {
             },
         );
         transfer_id
+    }
+
+    /// The least recently used resident block that no pin holds and the
+    /// caller does not keep: the one a caller-managed pool evicts next. The
+    /// search resumes after the blocks `passed` records and adds those it
+    /// passes, so start a fresh cursor once `kept` changes or a passed block
+    /// may have been re-ranked.
+    pub(crate) fn oldest_evictable(
+        &self,
+        passed: &mut EvictionCursor,
+        kept: impl Fn(HostBlockKey) -> bool,
+    ) -> Option<HostBlockKey> {
+        for (node, key) in self.lru.oldest_after(passed.0) {
+            let evictable = !kept(key)
+                && self.entries.get(&key).is_some_and(|entry| {
+                    entry.state == EntryState::Resident && entry.load_pins == 0
+                });
+            if evictable {
+                return Some(key);
+            }
+            passed.0 = Some(node);
+        }
+        None
     }
 
     /// Remove an unpinned resident in a caller-managed pool, publishing the same eviction effects
@@ -871,6 +936,27 @@ impl HostTier {
     /// Add one key, absent after the plan's victims so far, to `plan`. False,
     /// leaving `plan` unchanged, when neither a free slot nor a victim is left.
     pub(crate) fn plan_reserve(&self, plan: &mut ExternalPlan, key: HostBlockKey) -> bool {
+        self.plan_reserve_unless(plan, key, |_| false)
+    }
+
+    /// Whether one more external key can fit without evicting a protected
+    /// block. Unlike reserving, this leaves the plan unchanged on success too.
+    pub(crate) fn plan_has_room(&self, plan: &ExternalPlan) -> bool {
+        plan.free > 0
+            || (self.config.eviction != HostEviction::Caller
+                && self
+                    .lru
+                    .oldest_after(plan.cursor)
+                    .any(|(_, key)| !plan.protected.contains(&key)))
+    }
+
+    /// [`Self::plan_reserve`] that also never evicts a block `in_use`.
+    pub(crate) fn plan_reserve_unless(
+        &self,
+        plan: &mut ExternalPlan,
+        key: HostBlockKey,
+        in_use: impl Fn(HostBlockKey) -> bool,
+    ) -> bool {
         debug_assert!(self.planned_lookup(Some(plan), key) == Lookup::Miss);
         if let Some(free) = plan.free.checked_sub(1) {
             plan.free = free;
@@ -886,7 +972,7 @@ impl HostTier {
             let Some((node, victim)) = self
                 .lru
                 .oldest_after(plan.cursor)
-                .find(|(_, key)| !plan.protected.contains(key))
+                .find(|(_, key)| !plan.protected.contains(key) && !in_use(*key))
             else {
                 return false;
             };
@@ -967,6 +1053,52 @@ impl HostTier {
         )
     }
 
+    /// Apply one prompt-ordered plan as two reservations, classified by
+    /// `first`. Both parts share its capacity decision and protected prefix.
+    /// Evict the victims once, before either part is admitted; no consumer
+    /// can observe the intermediate state of this synchronous operation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reserve_planned_partitioned(
+        &mut self,
+        client: u64,
+        owner: Uuid,
+        plan: ExternalPlan,
+        meta: Option<Vec<HostBlockMeta>>,
+        mut first: impl FnMut(HostBlockKey) -> bool,
+        now: f64,
+    ) -> [Option<TransferId>; 2] {
+        let now_ms = self.prepare_mutation(now);
+        let meta = match meta {
+            Some(meta) => meta.into_iter().map(Some).collect::<Vec<_>>(),
+            None => vec![None; plan.reserved.len()],
+        };
+        assert_eq!(meta.len(), plan.reserved.len());
+        let mut keys = [Vec::new(), Vec::new()];
+        let mut metadata = [Vec::new(), Vec::new()];
+        for (key, meta) in plan.reserved.into_iter().zip(meta) {
+            let part = usize::from(!first(key));
+            keys[part].push(key);
+            metadata[part].push(meta);
+        }
+        let mut victims = plan.victims;
+        std::array::from_fn(|part| {
+            if keys[part].is_empty() {
+                return None;
+            }
+            let units = (keys[part].len(), 1);
+            Some(self.admit(
+                client,
+                owner,
+                &std::mem::take(&mut victims),
+                std::mem::take(&mut keys[part]),
+                std::mem::take(&mut metadata[part]),
+                units,
+                now_ms,
+                Kind::External,
+            ))
+        })
+    }
+
     /// Record that an external reservation stopped at `key` for lack of space.
     pub(crate) fn note_external_capacity_retry(&self, owner: Uuid, key: HostBlockKey, now: f64) {
         self.observe(HostOffloadObservation {
@@ -994,15 +1126,15 @@ impl HostTier {
     }
 
     pub(crate) fn complete_external(&mut self, id: TransferId) {
-        self.complete_external_with(id, false);
+        self.complete_external_with(id, None);
     }
 
-    /// Complete a KVCR peer fetch, marking each block as filled by it.
-    pub(crate) fn complete_external_from_kvcr(&mut self, id: TransferId) {
-        self.complete_external_with(id, true);
+    /// Complete a reservation KVCR filled, marking each block with its origin.
+    pub(crate) fn complete_external_from_kvcr(&mut self, id: TransferId, origin: KvcrOrigin) {
+        self.complete_external_with(id, Some(origin));
     }
 
-    fn complete_external_with(&mut self, id: TransferId, kvcr_origin: bool) {
+    fn complete_external_with(&mut self, id: TransferId, kvcr_origin: Option<KvcrOrigin>) {
         let transfer = self
             .remove_transfer(id)
             .filter(|transfer| transfer.kind == Kind::External)
@@ -1022,18 +1154,18 @@ impl HostTier {
         self.notify_peers(transfer.client);
     }
 
-    /// Count the `keys` a KVCR peer fetch filled and clear their mark, so each
-    /// pulled block counts once, at its first load.
-    pub(crate) fn take_kvcr_origin(&mut self, keys: &[HostBlockKey]) -> usize {
-        let mut count = 0;
+    /// Count the `keys` KVCR filled, as `[peer, local G2]`, and clear their
+    /// marks, so each such block counts once, at its first load.
+    pub(crate) fn take_kvcr_origin(&mut self, keys: &[HostBlockKey]) -> [usize; 2] {
+        let mut counts = [0; 2];
         for key in keys {
             if let Some(entry) = self.entries.get_mut(key)
-                && std::mem::take(&mut entry.kvcr_origin)
+                && let Some(origin) = entry.kvcr_origin.take()
             {
-                count += 1;
+                counts[origin as usize] += 1;
             }
         }
-        count
+        counts
     }
 
     /// Roll back an unsubmitted reservation.
@@ -1256,6 +1388,11 @@ impl HostTier {
         }
     }
 
+    /// The router identity retained for `key`, if the pool publishes residency.
+    pub(crate) fn meta(&self, key: HostBlockKey) -> Option<&HostBlockMeta> {
+        self.meta.get(&key)
+    }
+
     /// Moves whenever an entry appears, disappears or becomes resident, the
     /// only changes to a [`Self::lookup`] answer, so answers read at one
     /// epoch hold until it moves.
@@ -1283,53 +1420,66 @@ impl HostTier {
         keys: &[HostBlockKey],
         last: &mut Option<ReversedTouch>,
     ) {
-        let (run, end, kept) = match last {
-            None => (self.lru.new_run(), keys.len(), None),
+        let (run, end, mut kept, whole_from) = match last {
+            None => (self.lru.new_run(), keys.len(), None, 0),
             Some(last) if last.lru_touches == self.lru.touches() => return,
             Some(last) => {
-                let whole = self.lru.resume_run(last.run);
+                let whole_from = self.lru.resume_run(last.run);
                 let end = if last.admitted == self.admitted_blocks {
                     last.absent_from.min(keys.len())
                 } else {
                     keys.len()
                 };
-                (last.run, end, last.leading.filter(|_| whole))
+                let kept = last.leading.filter(|leading| whole_from < leading.len);
+                (last.run, end, kept, whole_from)
             }
         };
         let kept_len = kept.map_or(0, |kept| kept.len);
         debug_assert!(kept_len <= end);
         let mut leading: Option<Leading> = None;
         let mut absent_from = kept_len;
-        let mut index = end;
-        while index > kept_len {
-            index -= 1;
-            let Some(entry) = self.entries.get(&keys[index]) else {
-                leading = None;
-                continue;
+        // The keys after the kept blocks' are walked first.
+        let (mut index, mut floor) = (end, kept_len);
+        loop {
+            while index > floor {
+                index -= 1;
+                let Some(entry) = self.entries.get(&keys[index]) else {
+                    leading = None;
+                    continue;
+                };
+                absent_from = absent_from.max(index + 1);
+                // The linked blocks are the ones a touch moves.
+                let Some(oldest) = entry.lru_slot else {
+                    leading = None;
+                    continue;
+                };
+                let len = index + 1;
+                let (newest, matched) =
+                    self.lru
+                        .touch_matching_span(run, oldest, index, &keys[floor..index]);
+                index -= matched;
+                leading
+                    .get_or_insert(Leading {
+                        len,
+                        oldest,
+                        newest,
+                    })
+                    .newest = newest;
+            }
+            // The kept blocks move next, as one: every leading block from
+            // `whole_from` on. The keys before them are walked last.
+            let Some(kept) = kept.take() else {
+                break;
             };
-            absent_from = absent_from.max(index + 1);
-            // The linked blocks are the ones a touch moves.
-            let Some(oldest) = entry.lru_slot else {
-                leading = None;
-                continue;
+            let newest = match whole_from {
+                0 => kept.newest,
+                _ => (self.entries.get(&keys[whole_from]))
+                    .and_then(|entry| entry.lru_slot)
+                    .expect("a block stays linked while it is in a run"),
             };
-            let len = index + 1;
-            let (newest, matched) =
-                self.lru
-                    .touch_matching_span(run, oldest, &keys[kept_len..index]);
-            index -= matched;
-            leading
-                .get_or_insert(Leading {
-                    len,
-                    oldest,
-                    newest,
-                })
-                .newest = newest;
-        }
-        // The kept blocks are the first keys', so they move last, as one.
-        if let Some(kept) = kept {
-            self.lru.touch_span(kept.oldest, kept.newest);
-            leading.get_or_insert(kept).newest = kept.newest;
+            self.lru.touch_span(kept.oldest, newest);
+            leading.get_or_insert(kept).newest = newest;
+            (index, floor) = (whole_from, 0);
         }
         *last = Some(ReversedTouch {
             lru_touches: self.lru.touches(),
@@ -1681,6 +1831,12 @@ impl HostTier {
         self.config.capacity_blocks
     }
 
+    /// Unit blocks ever admitted. While it stands, no absent key has entered
+    /// the tier.
+    pub(crate) fn admitted_blocks(&self) -> u64 {
+        self.admitted_blocks
+    }
+
     /// Empty physical slots, excluding all resident and pending blocks.
     pub(crate) fn empty_blocks(&self) -> usize {
         self.config.capacity_blocks - self.used_blocks
@@ -1775,11 +1931,6 @@ impl HostTier {
             let Some(meta) = self.meta.get(key) else {
                 continue;
             };
-            let block = KvBlock {
-                block_hash: key.sequence_hash(),
-                tokens_hash: meta.tokens_hash,
-                token_ids: None,
-            };
             match events.last_mut() {
                 Some(KvEventData::Stored(stored))
                     if stored.blocks.last().map(|last: &KvBlock| last.block_hash)
@@ -1787,18 +1938,26 @@ impl HostTier {
                         && stored.session_id.as_deref() == meta.session_id.as_deref()
                         && stored.cache_salt.as_deref() == meta.cache_salt.as_deref() =>
                 {
-                    stored.blocks.push(block);
+                    stored.blocks.push(KvBlock {
+                        block_hash: key.sequence_hash(),
+                        tokens_hash: meta.tokens_hash,
+                        token_ids: None,
+                    });
                 }
-                _ => events.push(KvEventData::Stored(StoredBlocks {
-                    cache_salt: meta.cache_salt.as_deref().map(str::to_owned),
-                    parent_hash: meta.parent,
-                    start_position: Some(meta.position),
-                    blocks: vec![block],
-                    session_id: meta.session_id.as_deref().map(str::to_owned),
-                })),
+                _ => events.push(KvEventData::Stored(meta.stored(*key))),
             }
         }
         events
+    }
+
+    /// Publish resident `key` as removed: its owner stopped serving it. Its
+    /// eviction then publishes nothing.
+    pub(crate) fn unpublish(&mut self, key: HostBlockKey) {
+        if self.meta.remove(&key).is_some() {
+            self.publish(|| KvEventData::Removed {
+                block_hashes: vec![key.sequence_hash()],
+            });
+        }
     }
 
     fn publish(&mut self, event: impl Fn() -> KvEventData) {
@@ -2069,7 +2228,7 @@ pub(crate) mod tests {
                 };
                 assert_occupancy(&tier, 1, 2);
                 if kvcr {
-                    tier.complete_external_from_kvcr(transfer_id);
+                    tier.complete_external_from_kvcr(transfer_id, KvcrOrigin::Peer);
                 } else {
                     tier.complete_external(transfer_id);
                 }
@@ -2176,10 +2335,10 @@ pub(crate) mod tests {
         else {
             panic!("reservation")
         };
-        tier.complete_external_from_kvcr(transfer_id);
-        assert_eq!(tier.take_kvcr_origin(&[a]), 1);
-        assert_eq!(tier.take_kvcr_origin(&[a, b, c]), 1); // only `b` was left
-        assert_eq!(tier.take_kvcr_origin(&[a, b, c]), 0);
+        tier.complete_external_from_kvcr(transfer_id, KvcrOrigin::Peer);
+        assert_eq!(tier.take_kvcr_origin(&[a]), [1, 0]);
+        assert_eq!(tier.take_kvcr_origin(&[a, b, c]), [1, 0]); // only `b` was left
+        assert_eq!(tier.take_kvcr_origin(&[a, b, c]), [0, 0]);
         assert_eq!(tier.block_bytes(), 1_000_000);
 
         // A completion that is not a KVCR peer fetch never carries the mark.
@@ -2189,7 +2348,7 @@ pub(crate) mod tests {
             panic!("reservation")
         };
         tier.complete_external(transfer_id);
-        assert_eq!(tier.take_kvcr_origin(&[c]), 0);
+        assert_eq!(tier.take_kvcr_origin(&[c]), [0, 0]);
     }
 
     #[test]
@@ -2406,8 +2565,10 @@ pub(crate) mod tests {
         tier.touch_reversed(&prompt, &mut last);
         assert_eq!(tier.lru_order(), [9, 4, 3, 2, 1].map(key));
 
-        // A block touched alone leaves the run, which is found by key again.
-        tier.touch(key(2));
+        // A block touched alone leaves the run and is found by key again.
+        // The blocks after it, 4, 3 and 2, still move as one.
+        tier.touch(key(9));
+        tier.touch(key(1));
         tier.touch_reversed(&prompt, &mut last);
         assert_eq!(tier.lru_order(), [9, 4, 3, 2, 1].map(key));
 
@@ -2420,6 +2581,16 @@ pub(crate) mod tests {
         // And blocks that another caller's touch joins to its own run.
         tier.touch_reversed(&[1, 2, 9].map(key), &mut None);
         assert_eq!(tier.lru_order(), [7, 3, 9, 2, 1].map(key));
+        tier.touch_reversed(&prompt, &mut last);
+        assert_eq!(tier.lru_order(), [7, 9, 3, 2, 1].map(key));
+
+        // A pinned block is out of the LRU: the blocks after it still move as
+        // one, and it leads the run again once released.
+        tier.pin_external(&[key(1)]);
+        tier.touch(key(9));
+        tier.touch_reversed(&prompt, &mut last);
+        assert_eq!(tier.lru_order(), [7, 9, 3, 2].map(key));
+        tier.unpin_external(&[key(1)]);
         tier.touch_reversed(&prompt, &mut last);
         assert_eq!(tier.lru_order(), [7, 9, 3, 2, 1].map(key));
     }
@@ -3254,6 +3425,23 @@ pub(crate) mod tests {
             eviction: HostEviction::Caller,
         });
         assert!(result.err().unwrap().to_string().contains("private pool"));
+    }
+
+    #[test]
+    fn a_victim_search_resumes_after_the_blocks_the_last_one_passed() {
+        let mut tier = tier(4);
+        tier.config.eviction = HostEviction::Caller;
+        let now = make_resident(&mut tier, &[key(1), key(2), key(3), key(4)], 0.0);
+        let (passed, calls) = (&mut EvictionCursor::default(), std::cell::Cell::new(0));
+        let kept = |block| {
+            calls.set(calls.get() + 1);
+            block == key(1) || block == key(2)
+        };
+        // The second search starts at k4, not at the kept k1 and k2 again.
+        assert_eq!(tier.oldest_evictable(passed, kept), Some(key(3)));
+        assert!(tier.evict_resident(request_id(), key(3), now));
+        assert_eq!(tier.oldest_evictable(passed, kept), Some(key(4)));
+        assert_eq!(calls.get(), 4);
     }
 
     #[test]
