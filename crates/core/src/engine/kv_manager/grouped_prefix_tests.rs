@@ -3967,9 +3967,13 @@ fn rescan_finds_a_block(
         };
         let block = rule.block;
         match rule.kind {
-            GroupRuleKind::FullAttention => {
-                (0..computed_after / block).any(|i| publishable(g, copies.get(i), (i + 1) * block))
-            }
+            // The test has two groups and no hits inside a block, so only the
+            // blocks up to the last multiple of the scheduler block get a key
+            // (v0.31.0 coord:796-806, v0.32.0 coord:767-777, v0.33.0
+            // coord:777-787).
+            GroupRuleKind::FullAttention => (0..computed_after / rules.alignment * rules.alignment
+                / block)
+                .any(|i| publishable(g, copies.get(i), (i + 1) * block)),
             GroupRuleKind::SlidingWindow { window } => [
                 Some(rules.replay_boundary(prompt, block)),
                 junction.map(|junction| rules.block_floor(junction, block)),
@@ -5615,4 +5619,244 @@ fn hit_exists_in(
 ) -> bool {
     pool.key_hit(group, request.prefix_hash_at(tokens).unwrap())
         .is_some()
+}
+
+#[test]
+fn full_attention_keys_of_several_groups_wait_for_the_scheduler_block() {
+    // With more than one cache group and no hits inside a block, vLLM caches
+    // only the computed tokens up to the last multiple of the scheduler block
+    // (v0.31.0 coord:796-806, :808-840, v0.32.0 coord:767-794, v0.33.0
+    // coord:777-804). Two full-attention groups with blocks of 64 and 16
+    // tokens have a scheduler block of 64 and a hash block of 16, and no
+    // state group, so hits stay on multiples of 64.
+    let hash = 16;
+    let groups = [attention("wide", 64, None), attention("narrow", 16, None)];
+    let narrow = |end: usize| (16..=end).step_by(16).collect::<Vec<_>>();
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
+        // A prompt of 120 tokens in one chunk. The cached count is 120
+        // rounded down to 64: one block of the 64-token group and four of
+        // the 16-token group. The partial tail is 112 at every version (120
+        // / 16 * 16 and 119 / 16 * 16), above 64, so it gets no key
+        // (v0.31.0 single:845-893, v0.32.0 single:830-884, v0.33.0
+        // single:840-897).
+        let mut coordinator = with_limits(GroupedPrefixRules::new(&groups, hash, version).unwrap());
+        let mut kv = kv_pool(&groups, 64);
+        let pool = kv.block_pool_mut().unwrap();
+        let request = lease(120, hash);
+        let cold = coordinator.find_longest_hit(pool, &request, 120);
+        let mut a = coordinator.new_lease();
+        let ends = prefill(&mut coordinator, pool, &mut a, &request, 120, &cold, 512);
+        assert_eq!(ends, [120], "{version:?}");
+        assert_eq!(
+            cached_positions(pool, 0, &request, hash, 120),
+            [64],
+            "{version:?}"
+        );
+        assert_eq!(
+            cached_positions(pool, 1, &request, hash, 120),
+            narrow(64),
+            "{version:?}"
+        );
+        coordinator.release_request(pool, &mut a);
+        // Each of those 5 keys is on its own block, so 5 blocks stay cached.
+        assert_eq!(pool.inactive_cached_blocks(), 5, "{version:?}");
+        // A prompt of 200 tokens with the same first 120 hits 64 in both
+        // groups, with no junction. Its first allocation counts the 5 hit
+        // blocks and the fresh blocks of 200 tokens: 4 - 1 of the 64-token
+        // group and 13 - 4 of the 16-token group, 17 in all.
+        let tokens: Vec<u32> = (0..120).chain(5000..5080).collect();
+        let mut longer = BlockRequestLease::new(Uuid::nil(), Vec::new());
+        longer.configure_prefix_hashes(&tokens, hash);
+        let b_hit = coordinator.find_longest_hit(pool, &longer, 200);
+        assert_eq!(
+            (b_hit.tokens, b_hit.junction_tokens),
+            (64, 0),
+            "{version:?}"
+        );
+        assert_eq!(
+            coordinator.first_allocation_blocks(pool, &b_hit, 200, 200),
+            17,
+            "{version:?}"
+        );
+        let mut b = coordinator.new_lease();
+        coordinator.pin_hit(pool, &mut b, &b_hit).unwrap();
+        let ends = prefill(&mut coordinator, pool, &mut b, &longer, 200, &b_hit, 512);
+        assert_eq!(ends, [200], "{version:?}");
+        // 200 rounded down to 64 is 192, a block end of both groups, and the
+        // partial tail of 200 tokens is 192 at every version, so it adds no
+        // entry.
+        assert_eq!(
+            cached_positions(pool, 0, &longer, hash, 200),
+            [64, 128, 192],
+            "{version:?}"
+        );
+        assert_eq!(
+            cached_positions(pool, 1, &longer, hash, 200),
+            narrow(192),
+            "{version:?}"
+        );
+        coordinator.release_request(pool, &mut b);
+
+        // A prompt of 128 tokens in chunks that end at 120 and 128. After
+        // the first chunk the cached count is 64. The second chunk reaches
+        // 128, a multiple of 64: the second 64-token block gets its full key
+        // 128, and the 16-token group its keys from 80 to 128. vLLM 0.31.0
+        // puts the partial tail at 128, a block end, with no entry. vLLM
+        // 0.32.0 and 0.33.0 put it at 127 / 16 * 16 = 112, inside the second
+        // block, which gets that key beside its full key (v0.32.0
+        // block_pool.py:286-299, :449-523, v0.33.0 block_pool.py:290-303,
+        // :486-560).
+        let mut coordinator = with_limits(GroupedPrefixRules::new(&groups, hash, version).unwrap());
+        let mut kv = kv_pool(&groups, 64);
+        let pool = kv.block_pool_mut().unwrap();
+        let request = lease(128, hash);
+        let cold = coordinator.find_longest_hit(pool, &request, 128);
+        let mut a = coordinator.new_lease();
+        coordinator.begin_step();
+        assert!(coordinator.allocate(pool, &mut a, 128, 0, 120, 0));
+        coordinator.finalize(pool, &mut a, &request, 128, 120, &cold);
+        assert_eq!(
+            cached_positions(pool, 0, &request, hash, 128),
+            [64],
+            "{version:?}"
+        );
+        assert_eq!(
+            cached_positions(pool, 1, &request, hash, 128),
+            narrow(64),
+            "{version:?}"
+        );
+        coordinator.begin_step();
+        assert!(coordinator.allocate(pool, &mut a, 128, 120, 128, 120));
+        coordinator.finalize(pool, &mut a, &request, 128, 128, &cold);
+        let wide = match version {
+            VllmRuleVersion::V0_31_0 => vec![64, 128],
+            VllmRuleVersion::V0_32_0 | VllmRuleVersion::V0_33_0 => vec![64, 112, 128],
+        };
+        assert_eq!(
+            cached_positions(pool, 0, &request, hash, 128),
+            wide,
+            "{version:?}"
+        );
+        assert_eq!(
+            cached_positions(pool, 1, &request, hash, 128),
+            narrow(128),
+            "{version:?}"
+        );
+        coordinator.release_request(pool, &mut a);
+
+        // A group that takes no part in prefix caching still counts: vLLM
+        // picks its coordinator by the number of all cache groups (v0.31.0
+        // coord:1043-1044, v0.32.0 :1009-1010, v0.33.0 :1021-1022). A
+        // full-attention group of 16 tokens and a ring of 4 tokens have a
+        // scheduler block of 16. No state group has a block above the hash
+        // block of 4, so hits stay on multiples of 16, and a prompt of 22
+        // tokens caches 16 tokens: the full key 16 and no entry at the
+        // partial tail, 20.
+        let ringed = [attention("full", 16, None), state("ring", 4, false, false)];
+        let mut coordinator = with_limits(GroupedPrefixRules::new(&ringed, 4, version).unwrap());
+        let mut kv = kv_pool(&ringed, 64);
+        let pool = kv.block_pool_mut().unwrap();
+        let request = lease(22, 4);
+        let cold = coordinator.find_longest_hit(pool, &request, 22);
+        let mut a = coordinator.new_lease();
+        prefill(&mut coordinator, pool, &mut a, &request, 22, &cold, BUDGET);
+        assert_eq!(
+            cached_positions(pool, 0, &request, 4, 22),
+            [16],
+            "{version:?}"
+        );
+        coordinator.release_request(pool, &mut a);
+    }
+}
+
+#[test]
+fn cached_count_is_the_computed_count_where_vllm_does_not_round_it() {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
+        // The GLM groups at a hash block equal to their block: the scheduler
+        // block is the block of the full-attention group, so rounding to it
+        // changes no key. After each chunk the group holds the keys of its
+        // full blocks, and the hash block equals the block, so there is no
+        // partial tail entry.
+        let hash = GLM_BLOCK as usize;
+        let groups = groups_glm(false);
+        let mut coordinator = with_limits(rules_glm(version, false));
+        let mut kv = kv_pool(&groups, 64);
+        let pool = kv.block_pool_mut().unwrap();
+        let request = lease(9000, hash);
+        let cold = coordinator.find_longest_hit(pool, &request, 9000);
+        let mut a = coordinator.new_lease();
+        let mut computed = 0;
+        for target in [6528, 8704, 9000] {
+            coordinator.begin_step();
+            assert!(coordinator.allocate(pool, &mut a, 9000, computed, target, computed));
+            coordinator.finalize(pool, &mut a, &request, 9000, target, &cold);
+            assert_eq!(
+                cached_positions(pool, 0, &request, hash, 9000),
+                (hash..=target).step_by(hash).collect::<Vec<_>>(),
+                "{version:?} at {target}"
+            );
+            computed = target;
+        }
+        coordinator.release_request(pool, &mut a);
+
+        // Hits inside a block: vLLM caches the computed count as it is
+        // (v0.31.0 coord:804-805, v0.32.0 coord:775-776, v0.33.0
+        // coord:785-786). A prompt of 45 tokens at a hash block of 4 on the
+        // 32-token layout computes 32, 44 and 45. Its partial tail is 44 at
+        // every version (45 / 4 * 4 and 44 / 4 * 4), inside the second
+        // block, so the full-attention group has the key 32 after the first
+        // chunk and the keys 32 and 44 from the chunk to 44 on.
+        let hash = 4;
+        let groups = groups_of_32(false);
+        let mut coordinator = with_limits(GroupedPrefixRules::new(&groups, hash, version).unwrap());
+        let mut kv = kv_pool(&groups, 64);
+        let pool = kv.block_pool_mut().unwrap();
+        let request = lease(45, hash);
+        let cold = coordinator.find_longest_hit(pool, &request, 45);
+        let mut a = coordinator.new_lease();
+        let mut computed = 0;
+        for (target, keys) in [(32, vec![32]), (44, vec![32, 44]), (45, vec![32, 44])] {
+            coordinator.begin_step();
+            assert!(coordinator.allocate(pool, &mut a, 45, computed, target, computed));
+            coordinator.finalize(pool, &mut a, &request, 45, target, &cold);
+            coordinator.release_copy_sources(pool);
+            assert_eq!(
+                cached_positions(pool, 0, &request, hash, 45),
+                keys,
+                "{version:?} at {target}"
+            );
+            computed = target;
+        }
+        coordinator.release_request(pool, &mut a);
+
+        // One cache group: vLLM's coordinator of one group passes the
+        // computed count as it is (v0.31.0 coord:340-364, :1043-1044, v0.32.0
+        // coord:346-377, :1009-1010, v0.33.0 coord:350-381, :1021-1022). A
+        // prompt of 22 tokens at a hash block of 4 has its partial tail at 20
+        // at every version (22 / 4 * 4 and 21 / 4 * 4), inside the second
+        // 16-token block, and the key is there when the 22 tokens are
+        // computed, beside the full key 16.
+        let groups = [attention("full", 16, None)];
+        let mut coordinator = with_limits(GroupedPrefixRules::new(&groups, hash, version).unwrap());
+        let mut kv = kv_pool(&groups, 64);
+        let pool = kv.block_pool_mut().unwrap();
+        let request = lease(22, hash);
+        let cold = coordinator.find_longest_hit(pool, &request, 22);
+        let mut a = coordinator.new_lease();
+        prefill(&mut coordinator, pool, &mut a, &request, 22, &cold, BUDGET);
+        assert_eq!(
+            cached_positions(pool, 0, &request, hash, 22),
+            [16, 20],
+            "{version:?}"
+        );
+        coordinator.release_request(pool, &mut a);
+    }
 }

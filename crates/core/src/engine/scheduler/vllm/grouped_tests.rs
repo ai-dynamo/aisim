@@ -7578,3 +7578,37 @@ fn grouped_prefix_block_keyed_at_the_prompt_tail_gets_its_full_key_from_a_later_
         }
     }
 }
+
+#[test]
+fn grouped_prefix_request_leaves_no_key_past_its_last_scheduler_block() {
+    // Two full-attention groups with blocks of 64 and 16 tokens: a scheduler
+    // block of 64 and a hash block of 16. A prompt of 120 tokens ends inside
+    // the second scheduler block, so vLLM caches the first 64 tokens only
+    // (v0.31.0 kv_cache_coordinator.py:796-806, v0.32.0 :767-777, v0.33.0
+    // :777-787): one block of the 64-token group and four of the 16-token
+    // group, 5 cached blocks, and no key at the prompt's partial tail, 112.
+    // A prompt of 200 tokens with the same first 120 then hits 64, the
+    // largest multiple of 64 that both groups hold.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let mut wide = group("wide", 64, 8, None);
+        wide.prefix_cacheable = Some(true);
+        let mut narrow = group("narrow", 16, 8, None);
+        narrow.prefix_cacheable = Some(true);
+        let mut core = prefix_core(vec![wide, narrow], 200 * 8, 512, 16, version);
+        let mut trace = TraceCollector::default();
+        let mut step = 0;
+        let first = submit(&mut core, 1, 120, 1);
+        assert_eq!(
+            drain(&mut core, &mut trace, &mut step),
+            vec![(first, 0)],
+            "{version}"
+        );
+        assert_eq!(block_pool(&core).inactive_cached_blocks(), 5, "{version}");
+        let longer = submit_tokens(&mut core, 2, (0..120).chain(5000..5080).collect(), 1);
+        assert_eq!(
+            drain(&mut core, &mut trace, &mut step),
+            vec![(longer, 64)],
+            "{version}"
+        );
+    }
+}

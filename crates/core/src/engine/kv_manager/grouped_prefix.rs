@@ -486,7 +486,10 @@ impl GroupedPrefixRules {
     /// `settled` is the larger of the prompt and the junction. Every position
     /// that `finalize` publishes at (replay boundary, partial tail, prompt
     /// checkpoint and junction) lies at or below it, so past it `finalize`
-    /// only counts the blocks that a step completes. `allocate` takes a
+    /// publishes only in a step that completes a block. That holds for the
+    /// full-attention keys that wait for a multiple of the scheduler block
+    /// too, the partial tail among them: such a multiple is a block end of
+    /// every group. `allocate` takes a
     /// block when the target leaves the blocks that the request holds,
     /// retires a window block every `block` tokens, and releases the blocks
     /// that a state group holds beside a private running block. A window
@@ -2099,10 +2102,27 @@ impl GroupedPrefixCoordinator {
                         copies, finalized, ..
                     },
                 ) => {
+                    // With several cache groups vLLM caches the computed
+                    // tokens only up to the last multiple of the scheduler
+                    // block, unless hits land inside a block (v0.31.0
+                    // `coord:796-806`, `:808-840`, v0.32.0 `coord:767-794`,
+                    // v0.33.0 `coord:777-804`). The hit alignment is the
+                    // scheduler block, or with hits inside a block the hash
+                    // block, which divides every block and the partial tail,
+                    // so rounding to it changes nothing there. One cache
+                    // group has vLLM's coordinator of one group, which
+                    // caches the computed tokens as they are (v0.31.0
+                    // `coord:340-364`, `:1043-1044`, v0.32.0 `coord:346-377`,
+                    // `:1009-1010`, v0.33.0 `coord:350-381`, `:1021-1022`).
+                    let cacheable = if rules.groups.len() > 1 {
+                        computed_after / rules.alignment * rules.alignment
+                    } else {
+                        computed_after
+                    };
                     // Only the blocks that this step completes, as
                     // `num_cached_block` limits vLLM (`single:500-533`).
                     // Earlier ones are cached, or have no key.
-                    let full = (computed_after / block).min(copies.len());
+                    let full = (cacheable / block).min(copies.len());
                     for (i, copy) in copies.iter().enumerate().take(full).skip(*finalized) {
                         if let Some(id) = copy
                             && let Some(key) = key_at((i + 1) * block)
@@ -2135,7 +2155,7 @@ impl GroupedPrefixCoordinator {
                     if rules.hash_block < block
                         && tail > 0
                         && !tail.is_multiple_of(block)
-                        && tail <= computed_after
+                        && tail <= cacheable
                         && let Some(Some(id)) = copies.get(tail / block)
                         && let Some(key) = key_at(tail)
                     {
