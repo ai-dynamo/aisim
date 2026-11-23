@@ -1011,6 +1011,13 @@ recipe. Each point's checksum-pinned `feature_point_receipt` must retain
 `metrics.speculative_acceptance` with `verification_depth` matching that recipe
 and finite `accepted_draft_tokens` between zero and the depth. Missing, invalid or
 depth-mismatched acceptance stops preparation; no other point's value is reused.
+The full fetch prepares each point's recorded replay configuration before
+downloading or reconstructing corpora. It checks acceptance receipts, phase
+structure and profile timing bounds, and reports receipt-preparation errors by
+benchmark ID. Use `fetch --metadata-only` to retain fetched metadata for diagnosis
+without fetching corpora. Direct replay also prepares configuration before
+reconstructing a trace. Complete configuration-schema and wheel-capability
+validation remains in the isolated predictor.
 Depth zero needs no acceptance receipt and supplies zero accepted draft tokens.
 These values are distinct from the silicon's configured draft length. Historical
 snapshots retain their original explicit prediction settings and provenance.

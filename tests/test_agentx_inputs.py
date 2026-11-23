@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from test_agentx_accuracy import result, silicon_inputs
 
+from scripts.e2e_accuracy import run_agentx_accuracy as agentx_run
 from scripts.e2e_accuracy.agentx_contract import canonical, validate_catalog
 from scripts.e2e_accuracy.agentx_inputs import (
     checked,
@@ -20,6 +21,7 @@ from scripts.e2e_accuracy.agentx_inputs import (
     load_runs,
     manual_geometry,
     reconstruct,
+    recorded_profile,
     replay_config,
     safe_path,
 )
@@ -295,6 +297,331 @@ def test_non_speculative_replay_validates_without_acceptance(tmp_path):
         env={**os.environ, "PYTHONPATH": str(source)},
         check=True,
     )
+
+
+def hub_replay_inputs(tmp_path, monkeypatch, acceptance, *, phase_overrides=None):
+    hub = tmp_path / "hub"
+    catalog = silicon_inputs(hub, result())
+    manifest_path = hub / catalog["runs"][0]["manifest"]["path"]
+    manifest = json.loads(manifest_path.read_bytes())
+    replay = tmp_path / "replay"
+    replay.mkdir()
+    extra = sglang_replay_inputs(replay, acceptance=acceptance)
+
+    def put(role, value):
+        content = canonical(value)
+        path = manifest_path.parent / f"{role}.json"
+        path.write_bytes(content)
+        manifest["artifacts"][role] = {
+            "path": path.name,
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "bytes": len(content),
+        }
+
+    for role, entry in extra["artifacts"].items():
+        if role != "workload":
+            value = json.loads((replay / entry["path"]).read_bytes())
+            if role == "feature_harness_receipt" and phase_overrides is not None:
+                value["input_config"]["phases"][0].update(phase_overrides)
+            put(role, value)
+    workload = json.loads((manifest_path.parent / manifest["artifacts"]["workload"]["path"]).read_bytes())
+    workload.update(
+        corpus_id="test-corpus",
+        silicon_reference={"namespace_map": {"trace": "weka:1111111111111111"}},
+    )
+    put("workload", workload)
+    manifest["corpus_id"] = "test-corpus"
+    content = canonical(manifest)
+    manifest_path.write_bytes(content)
+    catalog["runs"][0]["manifest"].update(sha256=hashlib.sha256(content).hexdigest(), bytes=len(content))
+    del catalog["snapshot_id"]
+    catalog["snapshot_id"] = hashlib.sha256(canonical(catalog)).hexdigest()
+    (hub / agentx_run.INDEX).write_bytes(canonical(catalog))
+
+    corpus = tmp_path / "upstream.jsonl"
+    corpus.write_bytes(b'{"id":"trace","requests":[{"in":4,"out":2}]}\n')
+    checksum = hashlib.sha256(corpus.read_bytes()).hexdigest()
+    registry = {
+        "schema": "aisimulate.agentx.corpora.v1",
+        "sources": {
+            "test-corpus": {
+                "repository": "org/corpus",
+                "revision": "b" * 40,
+                "filename": "traces.jsonl",
+                "sha256": checksum,
+                "derived_sha256": checksum,
+                "transformations": [],
+            }
+        },
+    }
+    (hub / agentx_run.CORPORA).write_bytes(canonical(registry))
+    downloads = []
+
+    def download(repo, name, **kwargs):
+        downloads.append((repo, name))
+        return str(hub / name) if repo == agentx_run.REPO else str(corpus)
+
+    monkeypatch.setattr(agentx_run, "hf_hub_download", download)
+    return downloads, corpus
+
+
+@pytest.mark.parametrize("acceptance", [None, {"verification_depth": 2, "accepted_draft_tokens": 1.25}])
+def test_fetch_preflights_acceptance_before_downloading_corpus(tmp_path, monkeypatch, acceptance):
+    downloads, _ = hub_replay_inputs(tmp_path, monkeypatch, acceptance)
+    output = tmp_path / "inputs"
+    with pytest.raises(ValueError, match="agentx-446063.*acceptance"):
+        agentx_run.fetch("a" * 40, output)
+    assert all(repo == agentx_run.REPO for repo, _ in downloads)
+    assert not (output / "corpora").exists()
+
+
+def test_fetch_rejects_invalid_profile_duration_before_corpus(tmp_path, monkeypatch):
+    downloads, _ = hub_replay_inputs(
+        tmp_path,
+        monkeypatch,
+        {"verification_depth": 3, "accepted_draft_tokens": 1.25},
+        phase_overrides={"duration": "not-a-duration"},
+    )
+    with pytest.raises(ValueError, match="agentx-446063.*duration"):
+        agentx_run.fetch("a" * 40, tmp_path / "inputs")
+    assert all(repo == agentx_run.REPO for repo, _ in downloads)
+
+
+def test_recorded_profile_matches_canonical_timing_validation():
+    phases = [
+        {"duration": 60, "system_idle_gap_cap_seconds": 2, "grace_period": 5, **changes}
+        for changes in (
+            {},
+            {"duration": "60"},
+            {"duration": True},
+            {"duration": "not-a-duration"},
+            {"duration": 0},
+            {"duration": -1},
+            {"duration": None},
+            {"duration": float("inf")},
+            {"duration": float("nan")},
+            {"duration": 1e306},
+            {"duration": 1e305, "grace_period": 1e305},
+            {"system_idle_gap_cap_seconds": 0},
+            {"system_idle_gap_cap_seconds": -1},
+            {"system_idle_gap_cap_seconds": "bad"},
+            {"grace_period": 0},
+            {"grace_period": -1},
+            {"grace_period": float("nan")},
+            {"grace_period": "bad"},
+        )
+    ]
+    profiles = [
+        {
+            "duration_seconds": phase["duration"],
+            "global_idle_cap_seconds": phase["system_idle_gap_cap_seconds"],
+            "response_grace_seconds": phase["grace_period"],
+            "tree_idle_cap_seconds": 300,
+            "cancel_drain_seconds": 10,
+        }
+        for phase in phases
+    ]
+    source = Path(__file__).resolve().parents[1] / "python/aisim/src"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json,sys\n"
+            "from aisim.config.traffic import AgenticProfileOptions\n"
+            "results=[]\n"
+            "for profile in json.load(sys.stdin):\n"
+            " try:\n"
+            "  AgenticProfileOptions.model_validate(profile)\n"
+            "  results.append(True)\n"
+            " except ValueError:\n"
+            "  results.append(False)\n"
+            "print(json.dumps(results))\n",
+        ],
+        input=json.dumps(profiles),
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": str(source)},
+        check=True,
+    )
+    expected = json.loads(result.stdout)
+    for phase, profile, valid in zip(phases, profiles, expected, strict=True):
+        if valid:
+            assert recorded_profile(phase) == profile
+        else:
+            with pytest.raises(ValueError):
+                recorded_profile(phase)
+
+
+@pytest.mark.parametrize("input_error", ["missing", "null_base", "null_override", "empty_phases"])
+def test_fetch_reports_malformed_input_and_later_acceptance(tmp_path, monkeypatch, input_error):
+    downloads, _ = hub_replay_inputs(tmp_path, monkeypatch, None)
+    hub = tmp_path / "hub"
+    catalog = json.loads((hub / agentx_run.INDEX).read_bytes())
+    first_path = hub / catalog["runs"][0]["manifest"]["path"]
+    first = json.loads(first_path.read_bytes())
+    second_path = first_path.parent.parent / "agentx-446068" / first_path.name
+    second_path.parent.mkdir()
+    for source in first_path.parent.iterdir():
+        if source.is_file():
+            (second_path.parent / source.name).write_bytes(source.read_bytes())
+    second = copy.deepcopy(first)
+    second.update(id="agentx-446068", lanes=4)
+    for role in ("feature_metadata", "workload"):
+        entry = second["artifacts"][role]
+        path = second_path.parent / entry["path"]
+        value = json.loads(path.read_bytes())
+        value["benchmark_id"] = second["id"]
+        path.write_bytes(canonical(value))
+        entry.update(sha256=hashlib.sha256(path.read_bytes()).hexdigest(), bytes=path.stat().st_size)
+    if input_error == "empty_phases":
+        for role in ("feature_point_receipt", "feature_harness_receipt"):
+            entry = first["artifacts"][role]
+            path = first_path.parent / entry["path"]
+            value = json.loads(path.read_bytes())
+            if role == "feature_point_receipt":
+                value["metrics"]["speculative_acceptance"] = {"verification_depth": 3, "accepted_draft_tokens": 1.25}
+            else:
+                value["input_config"]["phases"] = []
+            path.write_bytes(canonical(value))
+            entry.update(sha256=hashlib.sha256(path.read_bytes()).hexdigest(), bytes=path.stat().st_size)
+    elif input_error == "missing":
+        del first["artifacts"]["recipe"]
+    else:
+        entry = first["artifacts"]["recipe"]
+        path = first_path.parent / entry["path"]
+        recipe = json.loads(path.read_bytes())
+        recipe["base" if input_error == "null_base" else "override_c1"] = None
+        path.write_bytes(canonical(recipe))
+        entry.update(sha256=hashlib.sha256(path.read_bytes()).hexdigest(), bytes=path.stat().st_size)
+    catalog["runs"] = []
+    for manifest, path in ((first, first_path), (second, second_path)):
+        path.write_bytes(canonical(manifest))
+        entry = {key: manifest[key] for key in ("id", "category", "configuration_id")}
+        entry["manifest"] = {
+            "path": path.relative_to(hub).as_posix(),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "bytes": path.stat().st_size,
+        }
+        catalog["runs"].append(entry)
+    del catalog["snapshot_id"]
+    catalog["snapshot_id"] = hashlib.sha256(canonical(catalog)).hexdigest()
+    (hub / agentx_run.INDEX).write_bytes(canonical(catalog))
+    with pytest.raises(ValueError) as caught:
+        agentx_run.fetch("a" * 40, tmp_path / "inputs")
+    assert "agentx-446063:" in str(caught.value)
+    assert "agentx-446068: Missing depth-matched measured speculative acceptance" in str(caught.value)
+    assert all(repo == agentx_run.REPO for repo, _ in downloads)
+
+
+@pytest.mark.parametrize("backend,missing", [("sglang", "phases"), ("vllm", "phases"), ("vllm", "datasets")])
+def test_replay_rejects_empty_recorded_collections(tmp_path, cache_workers, backend, missing):
+    run = (
+        sglang_replay_inputs(tmp_path, acceptance={"verification_depth": 3, "accepted_draft_tokens": 1.25})
+        if backend == "sglang"
+        else result(
+            backend="vllm",
+            measured_backend_version="0.31.0",
+            model="Qwen/Qwen3.5-397B-A17B",
+            precision="BF16",
+            corpus_id="test-corpus",
+            artifacts={},
+        )
+    )
+
+    def put(role, value):
+        path = tmp_path / f"{role}.json"
+        content = canonical(value)
+        path.write_bytes(content)
+        run["artifacts"][role] = {
+            "path": path.name,
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "bytes": len(content),
+        }
+
+    if backend == "sglang":
+        put("feature_harness_receipt", {"input_config": {"phases": []}})
+    else:
+        for worker in cache_workers:
+            worker["model"]["max_model_len"] = 8192
+            worker["scheduler"].update(max_num_seqs=32, max_num_batched_tokens=512)
+        put("cache_receipt", {"workers": cache_workers})
+        put("workload", {"silicon_reference": {"namespace_map": {"trace": "weka:1111111111111111"}}})
+        put("snapshot_receipt", [{"lane_index": 0, "root_id": "trace", "snapshot": {"t_star_ms": 0}}])
+        harness = {
+            "phases": [{"duration": 60, "system_idle_gap_cap_seconds": 2, "grace_period": 5}],
+            "datasets": [{"random_seed": 42}],
+        }
+        harness[missing] = []
+        put("harness_receipt", harness)
+        registry = tmp_path / agentx_run.CORPORA
+        registry.parent.mkdir(parents=True)
+        registry.write_bytes(canonical({"sources": {"test-corpus": {"transformations": []}}}))
+    with pytest.raises(ValueError, match=missing):
+        replay_config(tmp_path, run)
+
+
+def test_fetch_preflights_valid_inputs_and_preserves_corpus(tmp_path, monkeypatch):
+    downloads, corpus = hub_replay_inputs(
+        tmp_path, monkeypatch, {"verification_depth": 3, "accepted_draft_tokens": 1.25}
+    )
+    output = tmp_path / "inputs"
+    agentx_run.fetch("a" * 40, output)
+    assert ("org/corpus", "traces.jsonl") in downloads
+    assert (output / "corpora/test-corpus.jsonl").read_bytes() == corpus.read_bytes()
+
+
+def test_metadata_fetch_retains_invalid_inputs_for_diagnosis(tmp_path, monkeypatch):
+    downloads, _ = hub_replay_inputs(tmp_path, monkeypatch, None)
+    output = tmp_path / "inputs"
+    agentx_run.fetch("a" * 40, output, metadata_only=True)
+    assert len(load_runs(output, json.loads((output / agentx_run.INDEX).read_bytes()))) == 1
+    assert all(repo == agentx_run.REPO for repo, _ in downloads)
+
+
+def test_metadata_fetch_retains_catalog_when_workload_validation_fails(tmp_path, monkeypatch):
+    downloads, _ = hub_replay_inputs(tmp_path, monkeypatch, None)
+    hub = tmp_path / "hub"
+    catalog_path = hub / agentx_run.INDEX
+    catalog = json.loads(catalog_path.read_bytes())
+    manifest_entry = catalog["runs"][0]["manifest"]
+    manifest_path = hub / manifest_entry["path"]
+    manifest = json.loads(manifest_path.read_bytes())
+    workload_entry = manifest["artifacts"]["workload"]
+    workload_path = manifest_path.parent / workload_entry["path"]
+    workload = json.loads(workload_path.read_bytes())
+    workload["schema"] = "invalid-workload-schema"
+    workload_path.write_bytes(canonical(workload))
+    workload_entry.update(
+        sha256=hashlib.sha256(workload_path.read_bytes()).hexdigest(), bytes=workload_path.stat().st_size
+    )
+    manifest_path.write_bytes(canonical(manifest))
+    manifest_entry.update(
+        sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(), bytes=manifest_path.stat().st_size
+    )
+    del catalog["snapshot_id"]
+    catalog["snapshot_id"] = hashlib.sha256(canonical(catalog)).hexdigest()
+    catalog_path.write_bytes(canonical(catalog))
+
+    output = tmp_path / "inputs"
+    with pytest.raises(ValueError, match="Silicon workload identity mismatch"):
+        agentx_run.fetch("a" * 40, output, metadata_only=True)
+    assert (output / agentx_run.INDEX).read_bytes() == catalog_path.read_bytes()
+    assert (output / workload_path.relative_to(hub)).read_bytes() == workload_path.read_bytes()
+    assert all(repo == agentx_run.REPO for repo, _ in downloads)
+
+
+def test_rejected_replay_does_not_reconstruct_trace(tmp_path, monkeypatch):
+    hub_replay_inputs(tmp_path, monkeypatch, None)
+    root = tmp_path / "inputs"
+    agentx_run.fetch("a" * 40, root, metadata_only=True)
+    run = load_runs(root, json.loads((root / agentx_run.INDEX).read_bytes()))[0]
+    monkeypatch.setattr(
+        agentx_run,
+        "prepare_trace",
+        lambda *args: pytest.fail("Reconstructed a rejected trace"),
+    )
+    with pytest.raises(ValueError, match="acceptance"):
+        agentx_run.run_one(root, run, tmp_path / "output", 1, {})
 
 
 @pytest.fixture
