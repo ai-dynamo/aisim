@@ -2172,10 +2172,11 @@ class BaseBackend:
         cache_key = (
             cache_key,
             engine_identity(model, database),
-            # This frozen configuration also controls resident Mamba state.
+            # State precision also controls resident Mamba memory. The other
+            # geometry is already recorded by the compiled operation graph.
             # Non-MTP timing graphs omit its cache dtype and may share a handle,
             # but their memory footprints and OOM verdicts must stay distinct.
-            hybrid_config if isinstance(hybrid_config, common.NemotronHConfig) else None,
+            hybrid_config.mamba_ssm_cache_dtype if isinstance(hybrid_config, common.NemotronHConfig) else None,
         )
         cached = self._agg_cache.get(cache_key)
         if cached is not None:
@@ -2272,9 +2273,16 @@ class BaseBackend:
                 chunks = math.ceil((isl - prefix) / fresh_tokens)
                 requests = max(1.0, fresh_tokens / (isl - prefix))
                 steps_to_finish_ctx = b * chunks / requests
-                if qualified_prefill and chunks > 1 and img_ctx_tokens == 0:
+                if (
+                    qualified_prefill
+                    and chunks > 1
+                    and img_ctx_tokens == 0
+                    and (prefix > 0 or (isl - prefix) % fresh_tokens != 0)
+                ):
                     # Include the short final chunk and its state transfer;
                     # charging a full-budget scan `chunks` times invents tokens.
+                    # Uniform cold chunks retain the existing amortized query:
+                    # its scan/shared work and iteration count are already exact.
                     mix_step_estimate = self._average_agg_text_chunks(
                         model, database, runtime_config, fresh_tokens, mix_step_estimate.num_decode_requests
                     )
