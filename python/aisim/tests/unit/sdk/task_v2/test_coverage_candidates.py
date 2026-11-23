@@ -757,16 +757,7 @@ def test_all_tables_uninformative_abstains(monkeypatch):
 @pytest.mark.parametrize(
     "kwargs, expect_large_ep, expect_raises",
     [
-        # No coverage for the Qwen3 shape -> fused regime only.
         (dict(model_path=SYNTH_MODEL, system_name="h200_sxm", backend_name="sglang", total_gpus=8), False, False),
-        # Dense model -> never large EP.
-        (
-            dict(model_path="meta-llama/Meta-Llama-3.1-70B", system_name="h100_sxm", backend_name="sglang"),
-            False,
-            False,
-        ),
-        # Covered model pinned to EP-only tuples -> large-EP regime only, and
-        # the inferred fp8 fmha has no wideep_context_mla slice (fp8_block).
         (
             dict(
                 model_path="deepseek-ai/DeepSeek-R1",

@@ -1370,49 +1370,6 @@ def test_scripted_init_requires_context_evidence(tmp_path, capsys):
     assert "--context-length is required" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("kv_dtype", ["bfloat16", "fp8"])
-def test_minimax_collection_preview_preserves_selected_precision(tmp_path, capsys, monkeypatch, kv_dtype):
-    from collector.fpm_forward import entry
-
-    monkeypatch.setenv("COLLECTOR_MODEL_PATH", "")
-    monkeypatch.setattr(entry, "run_resolved", lambda *_args: pytest.fail("preview must not launch workers"))
-    config = Path(__file__).parents[2] / "src/aisim_core/model_configs/MiniMaxAI--MiniMax-M2.7_config.json"
-    overrides = tmp_path / "overrides.json"
-    overrides.write_text(json.dumps({"fmha_quant_mode": kv_dtype, "kv_cache_dtype": kv_dtype}))
-    request = tmp_path / "request.yaml"
-    assert (
-        cli.main(
-            [
-                *_init_args(
-                    request,
-                    model="MiniMaxAI/MiniMax-M2.7",
-                    model_kind="moe",
-                    tensor_parallel=4,
-                    context_length=8192,
-                    framework_version="0.27.0",
-                ),
-                "--model-config",
-                str(config),
-                "--resource-overrides",
-                str(overrides),
-            ]
-        )
-        == 0
-    )
-    root = tmp_path / "plan"
-    assert cli.main(["onboard", "plan", "-c", str(request), "--output-dir", str(root)]) == 0
-    before = {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
-    command = ["onboard", "collect-fpm", "-c", str(root / "request.yaml"), "--output-dir", str(root)]
-    capsys.readouterr()
-    assert cli.main(command) == 0
-    output = capsys.readouterr().out
-    assert "--plan-only" in output
-    assert f"--fpm-kv-cache-dtypes {kv_dtype}" in output
-    assert {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()} == before
-    assert not (root / "fpm-checkpoint").exists()
-    assert not (root / "fpm-artifacts").exists()
-
-
 @pytest.mark.parametrize("mode", [None, "NONE"])
 def test_onboard_v41_automatically_selects_eager(tmp_path, capsys, monkeypatch, mode):
     from collector.fpm_forward.runner import _cell_generator_overrides

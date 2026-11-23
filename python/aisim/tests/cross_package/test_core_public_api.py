@@ -686,17 +686,6 @@ def test_static_phase_diagnostics_stub_matches_native_contract() -> None:
     assert json.loads(result) == []
 
 
-def test_state_memory_api_is_standalone_in_a_fresh_interpreter() -> None:
-    script = """
-import sys
-from aisim_core.sdk import estimate_state_cache
-result = estimate_state_cache("moonshotai/Kimi-K3", tp_size=8)
-assert result["bytes_per_request"] == 61046784
-assert not {"aisim.config.engine", "vllm"}.intersection(sys.modules)
-"""
-    subprocess.run([sys.executable, "-c", script], check=True)
-
-
 def test_state_memory_public_paths_share_one_implementation() -> None:
     from aisim import capacity
     from aisim.sdk.memory import estimate_state_cache as legacy

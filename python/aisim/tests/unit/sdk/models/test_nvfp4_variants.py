@@ -22,12 +22,9 @@ NVFP4_VARIANTS = (
     "nvidia/Qwen3.5-122B-A10B-NVFP4",
     "nvidia/Gemma-4-31B-IT-NVFP4",
     "nvidia/Gemma-4-26B-A4B-NVFP4",
-    "nvidia/Kimi-K2.6-NVFP4",
-    "nvidia/Kimi-K2.7-Code-NVFP4",
     "nvidia/DeepSeek-V4-Flash-NVFP4",
     "nvidia/DeepSeek-V4-Pro-NVFP4",
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
-    "nvidia/MiniMax-M3-NVFP4",
 )
 
 
@@ -111,24 +108,6 @@ def test_lightning_nvfp4_loads_bundled_quant_config_offline(monkeypatch):
         *[
             (
                 hf_id,
-                common.GEMMQuantMode.nvfp4,
-                common.MoEQuantMode.nvfp4,
-                common.KVCacheQuantMode.fp8,
-                common.FMHAQuantMode.fp8,
-            )
-            for hf_id in (
-                "nvidia/Qwen3.5-397B-A17B-NVFP4",
-                "nvidia/Qwen3.5-122B-A10B-NVFP4",
-                "nvidia/Gemma-4-31B-IT-NVFP4",
-                "nvidia/Gemma-4-26B-A4B-NVFP4",
-                "nvidia/Kimi-K2.6-NVFP4",
-                "nvidia/Kimi-K2.7-Code-NVFP4",
-                "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
-            )
-        ],
-        *[
-            (
-                hf_id,
                 common.GEMMQuantMode.fp8_block,
                 common.MoEQuantMode.nvfp4,
                 common.KVCacheQuantMode.fp8,
@@ -139,16 +118,6 @@ def test_lightning_nvfp4_loads_bundled_quant_config_offline(monkeypatch):
                 "nvidia/DeepSeek-V4-Pro-NVFP4",
             )
         ],
-        (
-            "nvidia/MiniMax-M3-NVFP4",
-            # MXFP8 prices as fp8_block (owner decision 2026-08-09; DSV4
-            # precedent, and the shipped M3 MSA tables carry the fp8_block
-            # gemm tier this lane resolves to — see helpers.py).
-            common.GEMMQuantMode.fp8_block,
-            common.MoEQuantMode.nvfp4,
-            common.KVCacheQuantMode.bfloat16,
-            common.FMHAQuantMode.bfloat16,
-        ),
     ],
 )
 def test_nvfp4_variant_infers_checkpoint_quant_modes(hf_id, gemm_mode, moe_mode, kv_mode, fmha_mode):
@@ -316,30 +285,6 @@ def test_gemma4_exclusions_keep_attention_and_mlp_bf16():
     assert by_name["context_swa_qkv_gemm"]._quant_mode == common.GEMMQuantMode.bfloat16
     assert by_name["context_swa_shared_mlp_gate_up_gemm"]._quant_mode == common.GEMMQuantMode.bfloat16
     assert by_name["context_swa_moe"]._quant_mode == common.MoEQuantMode.bfloat16
-
-
-def test_kimi_k26_exclusions_keep_attention_and_shared_experts_bf16():
-    model = get_model("nvidia/Kimi-K2.6-NVFP4", _model_config(), backend_name="vllm")
-    by_name = {op._name: op for op in model.context_ops + model.generation_ops}
-    attention_block = by_name["context_mla_block"]
-
-    assert attention_block._primary._gemm_quant_mode == common.GEMMQuantMode.bfloat16
-    assert all(
-        op._quant_mode == common.GEMMQuantMode.bfloat16
-        for op in attention_block._fallback
-        if hasattr(op, "_quant_mode")
-    )
-    assert by_name["context_shared_gate_up_gemm"]._quant_mode == common.GEMMQuantMode.bfloat16
-    assert by_name["context_moe"]._quant_mode == common.MoEQuantMode.nvfp4
-
-
-def test_minimax_m3_uses_mxfp8_lane_for_non_experts_and_nvfp4_for_experts():
-    model = get_model("nvidia/MiniMax-M3-NVFP4", _model_config(), backend_name="trtllm")
-    by_name = {op._name: op for op in model.context_ops + model.generation_ops}
-
-    # MXFP8 non-expert lane prices as fp8_block (owner decision 2026-08-09).
-    assert by_name["context_shared_gate_up_gemm"]._quant_mode == common.GEMMQuantMode.fp8_block
-    assert by_name["context_moe"]._quant_mode == common.MoEQuantMode.nvfp4
 
 
 @pytest.mark.parametrize(

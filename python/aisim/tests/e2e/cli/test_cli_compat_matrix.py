@@ -15,9 +15,6 @@ MODELS_TO_TEST = [
     "meta-llama/Llama-2-7b-hf",
     "meta-llama/Llama-2-13b-hf",
     "meta-llama/Llama-2-70b-hf",
-    "meta-llama/Meta-Llama-3.1-8B",
-    "meta-llama/Meta-Llama-3.1-70B",
-    "meta-llama/Meta-Llama-3.1-405B",
     "mistralai/Mixtral-8x7B-v0.1",
     "mistralai/Mixtral-8x22B-v0.1",
     "deepseek-ai/DeepSeek-V3",
@@ -30,7 +27,6 @@ MODELS_TO_TEST = [
     "Qwen/Qwen3-1.7B",
     "Qwen/Qwen3-8B",
     "Qwen/Qwen3-235B-A22B",
-    "nvidia/Llama-3_3-Nemotron-Super-49B-v1",
 ]
 
 SYSTEMS_TO_TEST = [

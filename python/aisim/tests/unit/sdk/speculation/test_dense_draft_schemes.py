@@ -624,27 +624,3 @@ def test_disabled_scheme_is_cost_only():
     assert SpeculationConfig().replay_depth() == 0
     with pytest.raises(ValidationError, match="omit speculation"):
         REPLAY_CONFIG.validate_python({"kind": "none", "expected_accepted_tokens": 0})
-
-
-@pytest.mark.parametrize(
-    "cost,target,backend,tp,error",
-    [
-        (REPLAY_SCHEMES[2], "MiniMaxAI/MiniMax-M2.7", "vllm", 4, "model families"),
-        (REPLAY_SCHEMES[0], "moonshotai/Kimi-K3", "sglang", 8, "DSPARK"),
-    ],
-)
-def test_explicit_scheme_preserves_model_family_validation(cost, target, backend, tp, error):
-    with pytest.raises(ValueError, match=error):
-        RustForwardPassPerfModel.best_available(
-            dict(
-                model=target,
-                system="b200_sxm",
-                backend=backend,
-                backend_version="0.24.0" if backend == "vllm" else "0.5.14",
-                worker_type="aggregated",
-                tp=tp,
-                moe_tp_size=tp,
-                moe_ep_size=1,
-                speculation=cost,
-            )
-        )

@@ -50,7 +50,6 @@ pytestmark = pytest.mark.unit
 
 DSR1 = "deepseek-ai/DeepSeek-R1"
 DSV32 = "deepseek-ai/DeepSeek-V3.2-Exp"
-KIMIK25 = "nvidia/Kimi-K2.5-NVFP4"
 QWEN3 = "Qwen/Qwen3-235B-A22B"
 
 SGLANG_COMM = {"context": "deepep_ht", "generation": "deepep_ll"}
@@ -363,7 +362,6 @@ class TestDeepSeekTrtllmLargeEP:
         ("model_path", "q_width", "kv_width", "o_width"),
         [
             (DSR1, 128 * 192, 128 * 256, 128 * 128),
-            (KIMIK25, 64 * 192, 64 * 256, 64 * 128),
         ],
     )
     def test_mla_projection_widths_follow_checkpoint_head_count(self, model_path, q_width, kv_width, o_width):

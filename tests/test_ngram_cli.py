@@ -184,7 +184,7 @@ def _with_timing(raw, timing):
 
 
 @pytest.mark.parametrize("mode", ["aggregated", "disaggregated"])
-@pytest.mark.parametrize("timing", ["fixed", "polynomial", "default"])
+@pytest.mark.parametrize("timing", ["fixed", "polynomial"])
 def test_ngram_turns_vllm_async_scheduling_off_for_every_timing_model(mode, timing):
     raw = _with_timing(_prediction(mode=mode), timing)
     runtime = _RecordingRuntime()
@@ -239,58 +239,6 @@ def test_ngram_admits_a_busy_engine_arrival_at_the_next_pass(tmp_path):
     # Without drafts vLLM's default async scheduling has already queued that
     # pass, so the arrival waits one more.
     assert _busy_arrival(tmp_path, speculation=False) == 30.0
-
-
-def test_native_aic_compiles_ngram_cost_without_mtp_draft_layers(monkeypatch):
-    from aisim_core.sdk import engine
-
-    calls = []
-    original = engine.compile_engine
-    original_spec = engine.build_engine_spec_json
-
-    def capture_graph(model, **kwargs):
-        assert model.spec_scheme.kind == "ngram"
-        assert model.spec_scheme.verify_width() == 3
-        assert model.spec_scheme.build_draft_generation_ops(model) == []
-        assert model.spec_scheme.build_draft_context_ops(model) == []
-        assert model.spec_scheme.draft_weights_bytes(model) == 0
-        assert model.spec_scheme.draft_kv_bytes_per_sequence(model, 128) == 0
-        return original_spec(model, **kwargs)
-
-    monkeypatch.setattr(engine, "build_engine_spec_json", capture_graph)
-
-    def capture(*args, **kwargs):
-        calls.append(kwargs)
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(engine, "compile_engine", capture)
-    report = _run(_prediction(timing="default"))
-    assert report.metrics["completed_requests"] == 1
-    assert report.metrics["mean_e2e_latency_ms"] > 0
-    assert calls and all(call["speculation"] == _COST and call["nextn"] == 0 for call in calls)
-
-
-def test_canonical_estimator_round_trip_preserves_prompt_lookup_cost():
-    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
-
-    config = ForwardPassPerfModelConfig(
-        model="meta-llama/Meta-Llama-3.1-8B",
-        system="h200_sxm",
-        backend="vllm",
-        backend_version="0.24.0",
-        worker_type="aggregated",
-        speculation=deepcopy(_COST),
-    )
-    for _ in range(2):
-        model = RustForwardPassPerfModel.best_available(config)
-        try:
-            provenance = model.diagnostics()["provenance"]
-            assert provenance["selected_estimation_mode"] == "op_level"
-            assert provenance["config"]["speculation"] == _COST
-            assert provenance["config"]["nextn"] == 0
-            config = ForwardPassPerfModelConfig(**provenance["config"])
-        finally:
-            model.close()
 
 
 @pytest.mark.parametrize("mode", ["fpm_interpolation", "fpm_regression"])
@@ -434,14 +382,6 @@ def test_native_progress_clamps_final_burst(output_tokens):
     assert report.metrics["mean_e2e_latency_ms"] == pytest.approx(1 + rounds)
 
 
-def test_ngram_rejection_still_pays_target_verification_cost():
-    raw = _prediction(timing="default", rates=(0.0, 1.0))
-    speculative = _run(raw)
-    raw["engine"].pop("speculation")
-    ordinary = _run(raw)
-    assert speculative.metrics["mean_e2e_latency_ms"] > ordinary.metrics["mean_e2e_latency_ms"]
-
-
 def test_agentic_hbm_execution_accepts_ngram_capability():
     raw = _prediction()
     raw["traffic"] = {
@@ -482,7 +422,7 @@ def test_generic_speculation_fixed_capacity_error_identifies_scheme_and_role(rol
 
 
 @pytest.mark.parametrize("mode", ["fpm_interpolation", "fpm_regression"])
-@pytest.mark.parametrize("fallback", ["allow", "deny"])
+@pytest.mark.parametrize("fallback", ["deny"])
 @pytest.mark.parametrize(
     "speculation",
     [

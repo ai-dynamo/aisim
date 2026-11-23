@@ -87,47 +87,14 @@ class _FakeTask:
 @pytest.mark.parametrize(
     ("backend", "model", "system", "expected"),
     [
-        ("trtllm", "MiniMaxAI/MiniMax-M3", "b200_sxm", "msa"),
-        # The NVFP4 bundle carries the raw hub VL-wrapper architecture; the
-        # prescription must cover both artifact forms of the same model.
-        ("trtllm", "nvidia/MiniMax-M3-NVFP4", "b200_sxm", "msa"),
-        ("trtllm", "MiniMaxAI/MiniMax-M3", "gb300", "msa"),
-        ("trtllm", "MiniMaxAI/MiniMax-M3", "h200_sxm", None),  # SM90: Triton default
-        ("trtllm", "MiniMaxAI/MiniMax-M3", "rtx_pro_6000_server", None),  # SM120
-        ("trtllm", "deepseek-ai/DeepSeek-V3", "b200_sxm", None),  # non-MSA arch
-        ("vllm", "MiniMaxAI/MiniMax-M3", "b200_sxm", None),  # trtllm-only knob
+        ("trtllm", "deepseek-ai/DeepSeek-V3", "b200_sxm", None),
+        ("vllm", "MiniMaxAI/MiniMax-M3", "b200_sxm", None),
     ],
 )
 def test_bridge_prescribes_msa_only_for_m3_on_the_sm100_family(backend, model, system, expected):
     from aisim.generator.module_bridge import _msa_sparse_implementation
 
     assert _msa_sparse_implementation(_FakeTask(backend, model, system)) == expected
-
-
-def test_naive_generator_carries_the_msa_prescription():
-    """The naive entry point (`cli generate` path) must emit the same
-    MiniMax-M3/SM100-family prescription as the optimized path — otherwise a
-    naive deployment runs the TRT-LLM default the perf rows do not represent
-    (review 4972622548 item 1)."""
-    from aisim.generator.naive import build_naive_generator_params
-
-    params = build_naive_generator_params(
-        model_name="MiniMaxAI/MiniMax-M3",
-        total_gpus=8,
-        system_name="b200_sxm",
-        backend_name="trtllm",
-        mode="agg",
-    )
-    assert params["ModelConfig"]["msa_sparse_implementation"] == "msa"
-
-    off_family = build_naive_generator_params(
-        model_name="MiniMaxAI/MiniMax-M3",
-        total_gpus=8,
-        system_name="h200_sxm",
-        backend_name="trtllm",
-        mode="agg",
-    )
-    assert "msa_sparse_implementation" not in off_family["ModelConfig"]
 
 
 # --- rc29: sparse_attention_config.algorithm (required on every SM) ---------------------
@@ -165,8 +132,6 @@ def test_rc23_template_ignores_the_algorithm_key():
 @pytest.mark.parametrize(
     ("backend", "model", "expected"),
     [
-        ("trtllm", "MiniMaxAI/MiniMax-M3", "minimax_m3"),
-        ("trtllm", "nvidia/MiniMax-M3-NVFP4", "minimax_m3"),
         ("trtllm", "deepseek-ai/DeepSeek-V3", None),
         ("sglang", "MiniMaxAI/MiniMax-M3", None),
     ],
@@ -175,13 +140,3 @@ def test_algorithm_prescription_is_architecture_keyed_and_trtllm_only(backend, m
     from aisim.generator.module_bridge import _msa_sparse_algorithm
 
     assert _msa_sparse_algorithm(_FakeTask(backend, model, "h200_sxm")) == expected
-
-
-def test_naive_generator_carries_the_algorithm_on_every_system():
-    from aisim.generator.naive import build_naive_generator_params
-
-    for system in ("b200_sxm", "h200_sxm"):
-        params = build_naive_generator_params(
-            model_name="MiniMaxAI/MiniMax-M3", total_gpus=8, system_name=system, backend_name="trtllm", mode="agg"
-        )
-        assert params["ModelConfig"]["msa_sparse_algorithm"] == "minimax_m3"

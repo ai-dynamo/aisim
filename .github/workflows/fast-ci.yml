@@ -150,7 +150,6 @@ jobs:
           --config python/aisim/pyproject.toml
           python/aisim/src/aisim
           python/aisim/tests/e2e/cli/test_cli_experiments.py
-          python/aisim/tests/e2e/cli/test_cli_recommend.py
           tests
       - name: Ruff format
         run: >-
@@ -158,13 +157,11 @@ jobs:
           --config python/aisim/pyproject.toml
           python/aisim/src/aisim
           python/aisim/tests/e2e/cli/test_cli_experiments.py
-          python/aisim/tests/e2e/cli/test_cli_recommend.py
           tests
       - name: Compile Python sources
         run: >-
           python -m compileall -q
           python/aisim/src
-          python/aisim/tests/e2e/cli/test_cli_recommend.py
           tests
       - name: Check changed-line whitespace
         shell: bash

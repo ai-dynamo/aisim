@@ -6,8 +6,6 @@
 import pytest
 from pydantic import ValidationError
 
-from aisim.config import CoreRecommendationConfig
-from aisim.recommend import recommendation_to_sweeper
 from aisim.sweeper import OptimizationTarget, SmartSearchConfig
 from aisim.sweeper.config import (
     OptimizationGoal,
@@ -272,47 +270,6 @@ sweep:
     }
     assert config.workload.request_rate == 2
     assert config.sweep.max_rounds == 2
-
-
-def test_aic_strict_sla_migration_yaml_loads(tmp_path):
-    """Keep the command-migration guide's strict-SLA example executable."""
-    path = tmp_path / "recommendation.yaml"
-    path.write_text(
-        """
-traffic:
-  source:
-    type: synthetic
-    input_tokens: 1024
-    output_tokens: 128
-  load:
-    type: constant_rate
-    requests_per_second: 4
-  stop:
-    requests_per_load_unit: 10
-engine:
-  mode: aggregated
-  model: meta-llama/Meta-Llama-3.1-8B
-  hardware: gb200
-  backend: trtllm
-  workers:
-    aggregated: {}
-evaluation:
-  sla:
-    ttft_ms: 800
-    itl_ms: 30
-optimization:
-  target: throughput
-  strict_sla: true
-  constraints:
-    max_candidate_gpus: 8
-"""
-    )
-
-    public = CoreRecommendationConfig.from_yaml(path)
-    config = recommendation_to_sweeper(public)
-
-    assert config.goal.strict_sla
-    assert config.goal.sla == SLATarget(ttft_ms=800, itl_ms=30)
 
 
 def test_defaults_are_backend_only():

@@ -666,23 +666,6 @@ def test_runner_can_advertise_disaggregated_attention_dp(monkeypatch):
     assert branch.parallel_configs == (_DISAGG_DP1_CFG, _DISAGG_DP8_CFG)
 
 
-def test_pinned_parallel_configs_replace_generated_menu():
-    config = _config(
-        model_name="meta-llama/Meta-Llama-3.1-8B",
-        deployment_mode=["agg"],
-        gpu_budget=32,
-        parallel_configs=[{"tp": 4, "replicas": 2}, {"tp": 8, "replicas": 1}],
-    )
-
-    (branch,) = enumerate_branches(config)
-
-    assert {(item.shape.tp, item.replicas) for item in branch.parallel_configs} == {
-        (4, 2),
-        (8, 1),
-    }
-    assert all(item.total_gpus == 8 for item in branch.parallel_configs)
-
-
 @pytest.mark.parametrize(
     "backend,budget,has_capacity,accepted",
     [("vllm", 8, True, True), ("trtllm", 8, True, False), ("vllm", 7, True, False), ("vllm", 8, False, False)],
@@ -859,18 +842,6 @@ def test_mixed_parallel_budget_diagnostic_preserves_heterogeneous_role_context(m
     assert set(checked_roles) == {("h200_sxm", 1024), ("gb200", 8192)}
     assert "used_gpus=" not in str(error.value)
     assert "increase the GPU budget" not in str(error.value)
-
-
-def test_illegal_pinned_parallel_config_is_rejected():
-    config = _config(
-        model_name="meta-llama/Meta-Llama-3.1-8B",
-        deployment_mode=["agg"],
-        gpu_budget=32,
-        parallel_configs=[{"tp": 3, "replicas": 1}],
-    )
-
-    with pytest.raises(NoViableParallelConfig):
-        enumerate_branches(config)
 
 
 def test_infeasible_mode_is_skipped_while_viable_mode_remains(monkeypatch):

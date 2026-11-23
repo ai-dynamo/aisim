@@ -277,16 +277,6 @@ class TestCollectMoeImportSurface:
         with pytest.raises(FileNotFoundError, match=re.escape("RadixArk/Qwen3.8-2.4T-A95B-NVFP4")):
             module._load_model_moe_config("RadixArk/Qwen3.8-2.4T-A95B-NVFP4")
 
-    def test_load_model_moe_config_succeeds_for_base_and_fp8_qwen38_max_ids(self, monkeypatch):
-        """Companion: the base bf16 id and its packaged -FP8 alias id both
-        DO have a packaged config (proves the RadixArk gap above is a real,
-        specific absence, not a general fixture problem)."""
-        _install_fake_vllm(monkeypatch, VLLM_0271_MOE_SURFACE)
-        module = _import_fresh(monkeypatch, _COLLECT_MOE_DOTTED, _COLLECT_MOE_PATH)
-        for model_name in ("Qwen/Qwen3.8-2.4T-A95B", "Qwen/Qwen3.8-2.4T-A95B-FP8"):
-            config = module._load_model_moe_config(model_name)
-            assert config.get("model_type") == "qwen3_5_moe_text"
-
 
 # ---------------------------------------------------------------------------
 # collect_gemm.py -- byte-identical framework surface at both pinned

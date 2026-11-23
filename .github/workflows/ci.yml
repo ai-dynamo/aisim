@@ -720,10 +720,6 @@ jobs:
           name: application-test-inventory-${{ matrix.arch }}
           path: application-test-inventory.json
           if-no-files-found: error
-      - name: Run recommendation E2E without parallel resource contention
-        if: matrix.shard.suite == 'cli-build' && matrix.shard.group == 1
-        run: python -m pytest -q tests/e2e/cli/test_cli_recommend.py --timeout=180
-        working-directory: python/aisim
       - name: Run migrated integration tests against the installed wheel
         if: matrix.shard.suite == 'integration'
         run: >-
@@ -738,7 +734,6 @@ jobs:
           python -m pytest -q
           tests/e2e/cli
           -m build
-          --ignore=tests/e2e/cli/test_cli_recommend.py
           --splits ${{ matrix.shard.groups }} --group ${{ matrix.shard.group }}
           --splitting-algorithm least_duration
           -n 4

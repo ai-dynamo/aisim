@@ -194,30 +194,6 @@ class TestKvCacheOomProperties:
             max_num_tokens=2 * isl,
         )
 
-    def test_smaller_model_has_more_kv_capacity(self):
-        """8B model has much more KV capacity than 32B on the same GPU.
-
-        Both models use bfloat16 KV cache to match benchmark conditions and ensure
-        a fair comparison (default KV quant mode differs between model families).
-
-        h100_sxm / tp=1 / isl=osl=2048 / f=0.9 / bfloat16 KV:
-          32B threshold ≈ 30, 8B threshold ≈ 88.
-          bs=60: OOM for 32B, fits for 8B.
-        """
-        isl, osl = 2048, 2048
-        model_8b, db, backend = _load(
-            "h100_sxm", "meta-llama/Meta-Llama-3.1-8B", tp=1, kvcache_quant_mode=common.KVCacheQuantMode.bfloat16
-        )
-        model_32b, _, _ = _load(
-            "h100_sxm", "Qwen/Qwen3-32B-FP8", tp=1, kvcache_quant_mode=common.KVCacheQuantMode.bfloat16
-        )
-        assert _is_kv_oom(
-            backend, model_32b, db, 60, isl, osl, 0.9, max_seq_len=isl + osl + _BENCHMARK_SLACK, max_num_tokens=2 * isl
-        )
-        assert not _is_kv_oom(
-            backend, model_8b, db, 60, isl, osl, 0.9, max_seq_len=isl + osl + _BENCHMARK_SLACK, max_num_tokens=2 * isl
-        )
-
     def test_deepseek_fits_on_gb300(self):
         """DeepSeek-V3 (MLA) fits on GB300 TP=4: bs=1 is not KV OOM, bs=10000 is."""
         model_ds, db, backend = _load("gb300", "deepseek-ai/DeepSeek-V3", tp=4, moe_ep_size=4)
@@ -253,13 +229,6 @@ class TestKvCacheOomProperties:
             0.9,
             max_seq_len=2048 + 2048 + _BENCHMARK_SLACK,
             max_num_tokens=2 * 2048,
-        )
-
-    def test_model_too_large_is_regular_oom(self):
-        """405B on single H100 (TP=1): model doesn't fit → KV OOM returns True for bs=1."""
-        model, db, backend = _load("h100_sxm", "meta-llama/Meta-Llama-3.1-405B", tp=1)
-        assert _is_kv_oom(
-            backend, model, db, 1, 1024, 1024, 0.9, max_seq_len=1024 + 1024 + _BENCHMARK_SLACK, max_num_tokens=2 * 1024
         )
 
 
@@ -323,44 +292,8 @@ _BENCHMARK_DATA = [
     ("gb300", "Qwen/Qwen3-32B-FP8", 4, 4096, 4096, 0.9, 419),
     # ===== meta-llama/Llama-3.1-8B =====
     # --- H100_SXM, fraction=0.8 ---
-    ("h100_sxm", "meta-llama/Meta-Llama-3.1-8B", 1, 2048, 2048, 0.8,  78),
-    ("h100_sxm", "meta-llama/Meta-Llama-3.1-8B", 2, 2048, 2048, 0.8, 173),
-    ("h100_sxm", "meta-llama/Meta-Llama-3.1-8B", 4, 2048, 2048, 0.8, 363),
-    ("h100_sxm", "meta-llama/Meta-Llama-3.1-8B", 1, 2048, 4096, 0.8,  56),
-    ("h100_sxm", "meta-llama/Meta-Llama-3.1-8B", 2, 2048, 4096, 0.8, 124),
-    ("h100_sxm", "meta-llama/Meta-Llama-3.1-8B", 4, 2048, 4096, 0.8, 259),
-    ("h100_sxm", "meta-llama/Meta-Llama-3.1-8B", 1, 4096, 2048, 0.8,  55),
-    ("h100_sxm", "meta-llama/Meta-Llama-3.1-8B", 2, 4096, 2048, 0.8, 123),
-    ("h100_sxm", "meta-llama/Meta-Llama-3.1-8B", 4, 4096, 2048, 0.8, 258),
-    ("h100_sxm", "meta-llama/Meta-Llama-3.1-8B", 1, 4096, 4096, 0.8,  43),
-    ("h100_sxm", "meta-llama/Meta-Llama-3.1-8B", 2, 4096, 4096, 0.8,  96),
-    ("h100_sxm", "meta-llama/Meta-Llama-3.1-8B", 4, 4096, 4096, 0.8, 201),
     # --- GB300, Llama-3.1-8B, fraction=0.8 ---
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 1, 2048, 2048, 0.8, 330),
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 1, 2048, 4096, 0.8, 236),
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 1, 4096, 2048, 0.8, 235),
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 1, 4096, 4096, 0.8, 183),
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 2, 2048, 2048, 0.8, 677),
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 2, 2048, 4096, 0.8, 484),
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 2, 4096, 2048, 0.8, 483),
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 2, 4096, 4096, 0.8, 376),
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 4, 2048, 2048, 0.8, 1371),
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 4, 2048, 4096, 0.8, 979),
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 4, 4096, 2048, 0.8, 978),
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 4, 4096, 4096, 0.8, 761),
     # --- GB300, Llama-3.1-8B, fraction=0.9 ---
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 1, 2048, 2048, 0.9, 372),
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 1, 2048, 4096, 0.9, 265),
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 1, 4096, 2048, 0.9, 265),
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 1, 4096, 4096, 0.9, 206),
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 2, 2048, 2048, 0.9, 762),
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 2, 2048, 4096, 0.9, 544),
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 2, 4096, 2048, 0.9, 544),
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 2, 4096, 4096, 0.9, 423),
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 4, 2048, 2048, 0.9, 1542),
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 4, 2048, 4096, 0.9, 1101),
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 4, 4096, 2048, 0.9, 1100),
-    ("gb300", "meta-llama/Meta-Llama-3.1-8B", 4, 4096, 4096, 0.9, 856),
 ]
 # fmt: on
 

@@ -141,6 +141,12 @@ present must still match a catalog path/hash and its notices. A historical file
 with different or unrecorded bytes fails; backport its provenance rather than
 silently skipping the check.
 
+### Release 0.14.0 bundled-config scope
+
+The release excludes the 31 custom-license configuration and quantization JSON files previously covered by the scoped decisions in [PR #954](https://github.com/ai-dynamo/aisim/pull/954). The source tree and wheel contain 93 bundled configurations. Their provenance and license-review inventories exclude the removed files; the license gate and frozen legacy baseline remain enforced. Existing notices and redistribution credits are retained conservatively and do not establish that the removed files are still packaged.
+
+The affected model IDs are MiniMaxAI MiniMax-M2.5/M2.7/M3 and their NVIDIA NVFP4 exports; Qwen3.8-2.4T-A95B and its FP8 variant; Llama 4 Scout/Maverick, Meta-Llama-3.1 8B/70B/405B, NVIDIA Llama-3.1-70B-Instruct-FP8 and Llama-3_3-Nemotron-Super-49B-v1; Moonshot Kimi-K2-Instruct/K2.5/K3 and NVIDIA Kimi-K2.5/K2.6/K2.7-Code NVFP4; and Z.AI GLM-5.3/GLM-5.3-BF16 and NVIDIA GLM-5.3-NVFP4. These IDs are no longer bundled defaults. The existing loader can still read a user-supplied local configuration or retrieve an explicitly selected Hugging Face model; offline use requires supplying the configuration and any quantization sidecar locally. Architecture implementations and performance profiles remain available for that use. Release-branch regressions that read the removed configs, including the four MiniMax numerical sentinels, are removed; unrelated model cases and synthetic regression coverage remain. The release does not redistribute model weights.
+
 ### Configuration license approval gate
 
 `python-compliance` now runs `scripts/ci/check_config_license_approvals.py` before installing dependencies in Full CI and every nightly architecture/Python job. Full CI's metadata-only license job uses GitHub-hosted Ubuntu 24.04, so license decisions do not wait for the dedicated native-build runner pool. Nightly architecture/Python checks retain their build environments. It applies even when a PR's wheel/test components are N/A. A failure blocks dependent wheel/staging jobs and `Full CI Success`; nightly publication also remains gated. The findings JSON is uploaded with `always()` as `config-license-approval` (nightlies append the architecture and Python version). There is no `continue-on-error` or legacy UNKNOWN exception in this approval gate.

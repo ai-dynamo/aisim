@@ -482,26 +482,6 @@ def test_prefix_match_unit_requires_state_and_old_alignment_field_is_rejected():
 
 
 @pytest.mark.parametrize(
-    "controls,block_size,token_bytes,state_bytes",
-    [
-        ({}, 768, 27648, 61046784),
-        ({"kvcache_quant_mode": "fp8"}, 1472, 13824, 58503168),
-        ({"kvcache_quant_mode": "fp8", "block_size": 128}, 1536, 13824, 61046784),
-        ({"kv_bytes_per_token": 13824, "block_size": 128}, 1536, 13824, 61046784),
-    ],
-)
-def test_k3_state_estimator_resolves_attention_geometry(controls, block_size, token_bytes, state_bytes):
-    from aisim_core.sdk import estimate_state_cache
-
-    result = estimate_state_cache("moonshotai/Kimi-K3", tp_size=8, **controls)
-    assert result["block_size"] == block_size
-    assert result["kv_bytes_per_token"] == token_bytes
-    assert result["raw_bytes_per_request"] == 56171520
-    assert result["bytes_per_request"] == state_bytes
-    assert result["padding_bytes_per_request"] == state_bytes - 56171520
-
-
-@pytest.mark.parametrize(
     "model,controls,row,token_bytes,state_bytes,raw_state_bytes",
     [
         (FLASH, {}, 1002240, 3915, 26058240, 15420416),
@@ -548,7 +528,6 @@ def test_dsv4_draft_tokens_widen_sliding_windows():
         (FLASH, {"kvcache_quant_mode": "bfloat16"}, "fp8_ds_mla"),
         (FLASH, {"mamba_cache_dtype": "float32"}, "Kimi K3 only"),
         (FLASH, {"indexer_cache_dtype": "bfloat16"}, "auto, fp8 or mxfp4"),
-        ("moonshotai/Kimi-K3", {"tp_size": 8, "indexer_cache_dtype": "fp8"}, "DeepSeek V4 only"),
         ("deepseek-ai/DeepSeek-V4.1-Flash", {}, "Kimi K3 and DeepSeek V4"),
     ],
 )
@@ -569,41 +548,6 @@ def _auto_payload(model, capacity):
 @pytest.fixture
 def auto_k3_payload():
     return _auto_payload("moonshotai/Kimi-K3", {"bytes": 8 * 21233664})
-
-
-def test_auto_state_geometry_reaches_native_wire_and_fixed_budget(auto_k3_payload, forbid_estimators):
-    config = CorePredictionConfig.model_validate(auto_k3_payload)
-    config = CorePredictionConfig.model_validate_json(config.model_dump_json())
-    spec = prediction_to_replay_spec(config)
-    args = spec.backend_deployment.agg_engine_args
-    assert args["block_size"] == 768
-    assert args["kv_cache_bytes_per_token"] == 27648
-    assert args["num_gpu_blocks"] == 8
-    assert args["state_cache"] == {"bytes_per_request": 61046784}
-    info = spec.backend_deployment.performance_model_metadata["aggregated"]["state_cache"]
-    assert info["source"] == "inferred"
-    assert info["state_blocks"] == 3
-    assert info["allocated_bytes_per_request"] == 63700992
-    runtime = RecordingRuntime()
-    EngineReplayRunnerFactory(runtime=runtime).create(0).run(spec)
-    rank = runtime.execution_spec["spec"]["engine"]["rank"]
-    for field in ("block_size", "kv_cache_bytes_per_token", "num_gpu_blocks", "state_cache"):
-        assert rank[field] == args[field]
-
-
-def test_auto_pd_state_resolves_each_role_and_transfer_bytes(auto_k3_payload, forbid_estimators):
-    _to_pd(auto_k3_payload, kv_transfer={"bytes_per_token": "auto", "bandwidth_gb_per_second": 50})
-    decode = auto_k3_payload["engine"]["workers"]["decode"]
-    decode["parallelism"] = {"tensor": 4}
-    decode["kv_cache"]["capacity"] = {"type": "fixed", "blocks": 8}
-    deployment = prediction_to_replay_spec(CorePredictionConfig.model_validate(auto_k3_payload)).backend_deployment
-    prefill_args, decode_args = deployment.prefill_engine_args, deployment.decode_engine_args
-    assert (prefill_args["block_size"], prefill_args["state_cache"]) == (768, {"bytes_per_request": 61046784})
-    assert (decode_args["block_size"], decode_args["state_cache"]) == (1472, {"bytes_per_request": 117006336})
-    # MLA token bytes from the state estimate, not the naive all-layer estimate.
-    assert prefill_args["kv_transfer_bytes_per_token"] == decode_args["kv_transfer_bytes_per_token"] == 27648
-    for role in ("prefill", "decode"):
-        assert deployment.performance_model_metadata[role]["state_cache"]["source"] == "inferred"
 
 
 @pytest.fixture
@@ -661,43 +605,3 @@ def test_auto_dsv4_pd_transfers_rows_and_state(auto_dsv4_payload, forbid_estimat
     for args in (deployment.prefill_engine_args, deployment.decode_engine_args):
         assert args["kv_transfer_bytes_per_token"] == 3915
         assert args["state_cache"] == {"bytes_per_request": 26058240}
-
-
-@pytest.mark.parametrize(
-    "changes,error",
-    [
-        ({"capacity": {"type": "fixed", "bytes": 4 * 21233664 - 1}}, "capacity must fit"),
-        ({"prefix_match_unit": 512}, "divisor"),
-    ],
-)
-def test_auto_state_validates_capacity_and_prefix_after_resolution(auto_k3_payload, changes, error):
-    auto_k3_payload["engine"]["workers"]["aggregated"]["kv_cache"].update(changes)
-    config = CorePredictionConfig.model_validate(auto_k3_payload)
-    with pytest.raises(ValueError, match=error):
-        prediction_to_replay_spec(config)
-
-
-def test_auto_state_matches_manual_partial_prefix_replay(auto_k3_payload, forbid_estimators):
-    payload = auto_k3_payload
-    payload["engine"]["context_length"] = 32768
-    worker = payload["engine"]["workers"]["aggregated"]
-    worker["scheduler"] = {"max_batched_tokens": 8192}
-    cache = worker["kv_cache"]
-    cache.update(block_size=128, bytes_per_token=13824, prefix_match_unit=128)
-    cache["capacity"] = {"type": "fixed", "blocks": 512}
-    payload["traffic"]["source"].update(input_tokens=24300, output_tokens=2, cached_prefix_tokens=24192)
-    payload["traffic"]["stop"]["requests"] = 2
-    automatic = prediction_to_replay_spec(CorePredictionConfig.model_validate(payload))
-    args = automatic.backend_deployment.agg_engine_args
-    assert args["block_size"] == 1536
-    assert args["prefix_match_unit"] == 128
-    assert args["state_cache"] == {"bytes_per_request": 61046784}
-    cache.update(block_size=1536, state_cache=args["state_cache"])
-    manual = prediction_to_replay_spec(CorePredictionConfig.model_validate(payload))
-    assert manual.backend_deployment.agg_engine_args == args
-    for spec in (automatic, manual):
-        metrics = EngineReplayRunnerFactory().create(0).run(spec).metrics
-        assert metrics["completed_requests"] == 2
-        assert metrics["total_output_tokens"] == 4
-        assert metrics["committed_prefill_tokens"] == 48600 - 24192
-        assert metrics["prefix_cache_reused_ratio"] == pytest.approx(24192 / 48600)

@@ -83,16 +83,6 @@ def test_persistent_kv_divisor_is_dcp_not_prefill_cp():
     assert BaseModel._cp_kv_memory_divisor(shell) == 4
 
 
-def test_get_model_gates_dcp_on_model_capability():
-    from aisim_core.sdk.models import get_model
-
-    # Dense GQA DCP is only modeled on vLLM (SGLang's GQA DCP lives in its
-    # Triton backend), so the sglang request must fail loud.
-    model_config = config.ModelConfig(tp_size=16, moe_tp_size=16, moe_ep_size=1, dcp_size=2)
-    with pytest.raises(NotImplementedError, match="dcp_size=2"):
-        get_model("meta-llama/Meta-Llama-3.1-70B", model_config, "sglang")
-
-
 # --------------------------------------------------------------------------
 # Model-level rewrite: sharded decode attention + merge collectives
 # --------------------------------------------------------------------------
@@ -231,30 +221,6 @@ def test_dsa_dcp_on_vllm_flashmla_sparse_rejects_what_vllm_refuses(overrides, ne
     )
 
 
-def test_gqa_dcp_is_bounded_by_kv_head_replication():
-    from aisim_core.sdk.models import get_model
-
-    # Llama-3.1-70B: 8 kv heads. tp=16 replicates each kv head twice -> dcp<=2.
-    ok = get_model(
-        "meta-llama/Meta-Llama-3.1-70B",
-        config.ModelConfig(tp_size=16, moe_tp_size=16, moe_ep_size=1, dcp_size=2),
-        "vllm",
-    )
-    assert all(op._dcp_size == 2 for _, op in _decode_attention_ops(ok))
-    with pytest.raises(ValueError, match="KV-head replication"):
-        get_model(
-            "meta-llama/Meta-Llama-3.1-70B",
-            config.ModelConfig(tp_size=16, moe_tp_size=16, moe_ep_size=1, dcp_size=4),
-            "vllm",
-        )
-    with pytest.raises(ValueError, match="must be positive and divide tp_size"):
-        get_model(
-            "meta-llama/Meta-Llama-3.1-70B",
-            config.ModelConfig(tp_size=16, moe_tp_size=16, moe_ep_size=1, dcp_size=3),
-            "vllm",
-        )
-
-
 def test_fpm_forward_model_prices_dcp_from_recorded_cells_on_vllm_only():
     from aisim_core.sdk.models import get_model
 
@@ -267,17 +233,6 @@ def test_fpm_forward_model_prices_dcp_from_recorded_cells_on_vllm_only():
     assert model._cp_kv_memory_divisor() == 8
     with pytest.raises(NotImplementedError, match="DCP timing requires measured vLLM FPM interpolation"):
         get_model("deepseek-ai/DeepSeek-V3", model_config, "sglang")
-
-
-def test_get_model_records_the_backend_for_families_that_do_not():
-    # The DCP merge collective defaults per backend (a2a on sglang); dense
-    # families do not store backend_name themselves, so get_model must.
-    from aisim_core.sdk.models import get_model
-
-    for backend in ("vllm", "sglang"):
-        model = get_model("meta-llama/Meta-Llama-3.1-70B", config.ModelConfig(tp_size=8), backend)
-        assert model._backend_name == backend
-        assert model._dcp_comm_style() == ("a2a" if backend == "sglang" else "ag_rs")
 
 
 def test_dcp_one_leaves_the_decode_graph_untouched():
@@ -394,24 +349,6 @@ def test_query_replication_requires_an_a2a_merge():
     model_config = config.ModelConfig(tp_size=8, moe_tp_size=8, moe_ep_size=1, dcp_size=4, dcp_q_replicate=True)
     with pytest.raises(ValueError, match="dcp_q_replicate requires the a2a"):
         get_model("deepseek-ai/DeepSeek-V3", model_config, "vllm")
-
-
-def test_kimi_k3_dcp_is_modeled_on_sglang_with_replicated_q_by_default():
-    from aisim_core.sdk.models import get_model
-
-    model_config = config.ModelConfig(tp_size=8, attention_dp_size=1, moe_tp_size=8, moe_ep_size=1, dcp_size=4)
-    model = get_model("moonshotai/Kimi-K3", model_config, "sglang")
-    attention = _decode_attention_ops(model)
-    assert attention, "K3 exposes its MLA decode attention to the DCP rewrite"
-    assert all(op._dcp_size == 4 for _, op in attention)
-    names = _generation_op_names(model)
-    # SGLang's K3 override: a2a merge with dcp_replicate_q_proj=True, so no
-    # per-layer query all-gather; the KDA layers carry no KV and stay untouched.
-    assert any(name.endswith("_dcp_out_all_to_all") for name in names)
-    assert not any(name.endswith("_dcp_q_all_gather") for name in names)
-    assert not any("kda" in name and "_dcp_" in name for name in names)
-    with pytest.raises(NotImplementedError, match="not supported for model_family='KIMIK3' on backend='vllm'"):
-        get_model("moonshotai/Kimi-K3", model_config, "vllm")
 
 
 def test_striped_context_dsa_module_survives_a_deepcopy():

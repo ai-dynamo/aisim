@@ -10,6 +10,8 @@ These notices apply only to the identified third-party material. Dependencies
 installed separately by package managers are governed by the license material
 distributed with those packages.
 
+Notices for model-configuration files removed from release 0.14.0 are retained conservatively for historical attribution. The current `scripts/ci/bundled_configs.json` inventory identifies the configurations included in the source tree and validated wheel. Retained notices do not mean a removed configuration is still packaged.
+
 Unless otherwise stated, AISim file paths in this document are relative
 to `python/aisim/` in the repository source tree.
 

@@ -1549,15 +1549,6 @@ def test_vllm_dsa_reference_covers_native_full_and_reuse_without_duplicate_artif
     } | {"zai-org/GLM-5.3", "zai-org/GLM-5.3-BF16", "nvidia/GLM-5.3-NVFP4"}
 
 
-def test_vllm_mla_module_artifacts_have_local_configs():
-    from collector.case_generator import get_mla_module_model_specs
-
-    config_root = REPO_ROOT / "src" / "aisim_core" / "model_configs"
-    for spec in get_mla_module_model_specs(backend="vllm", apply_model_filter=False):
-        config_path = config_root / f"{spec.model_path.replace('/', '--')}_config.json"
-        assert config_path.is_file(), f"{spec.model_path} would require a runtime Hub download"
-
-
 def test_shape_only_mla_alias_uses_canonical_model(monkeypatch):
     monkeypatch.setenv("COLLECTOR_MODEL_PATH", "moonshotai/Kimi-K2-Instruct")
     from collector.case_generator import get_context_mla_case_specs

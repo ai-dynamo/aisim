@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # AISim
 
-**Built with Llama.** AISim includes Llama model-configuration metadata; the [third-party notices](https://github.com/ai-dynamo/aisim/blob/release/0.14.0/THIRD_PARTY_NOTICES.md) identify the applicable versions, sources and license terms.
+**Built with Llama.** Historical bundled Llama model-configuration metadata is credited in the [third-party notices](https://github.com/ai-dynamo/aisim/blob/release/0.14.0/THIRD_PARTY_NOTICES.md), which identify the applicable versions, sources and license terms. Those configuration files are excluded from this release.
 
 AISim predicts LLM serving behavior and searches for deployment
 configurations offline, without bringing up a GPU serving cluster. The Python

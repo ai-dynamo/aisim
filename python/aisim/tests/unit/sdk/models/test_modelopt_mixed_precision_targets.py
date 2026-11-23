@@ -14,15 +14,13 @@ nvidia/GLM-5.3-NVFP4 lists only its three dense FP8 MLP layers and the NVFP4
 routed experts, so its attention, indexer and shared experts run BF16.
 
 Synthetic fixtures use the packaged GLM-5.2-NVFP4 / DeepSeek-V3 geometry
-with a generated ModelOpt header shaped like that export. The packaged
-nvidia/GLM-5.3-NVFP4 itself is an unmodified copy of the upstream export at
-e3b8f9f2 (model_configs/GLM53_NVFP4_PROVENANCE.md); the graph and SILICON
-tests run on both.
+with a generated ModelOpt header shaped like that export. The graph and SILICON
+tests use synthetic exports; the custom-license GLM-5.3-NVFP4 checkpoint files
+are excluded from this release.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,12 +43,7 @@ pytestmark = pytest.mark.unit
 _CONFIGS = Path(aisim_core.__file__).parent / "model_configs"
 _GLM_BASE = "nvidia--GLM-5.2-NVFP4"
 _DSV3_BASE = "deepseek-ai--DeepSeek-V3"
-_PACKAGED = "nvidia/GLM-5.3-NVFP4"
 # nvidia/GLM-5.3-NVFP4@e3b8f9f2fad29727dfa95e766c5cac18ea1414bf, byte for byte.
-_PACKAGED_SHA256 = {
-    "config": "b0b6b9ab922a82e3688bc39a4117bc443e106fcf88969ef48b3627778f4bdf7b",
-    "hf_quant_config": "13799d4fed353c20dde2264fbdd7f68a780b514782f8d80bba96ac5e44aa9bba",
-}
 
 GLM_LAYERS = 78
 DENSE_LAYERS = 3
@@ -148,10 +141,10 @@ def glm53(tmp_path_factory):
     return _write_export(tmp_path_factory.mktemp("glm53") / "export", _GLM_BASE, _glm53_layers())
 
 
-@pytest.fixture(params=["synthetic", "packaged"])
-def glm53_export(request, glm53):
-    """The synthetic export and the packaged upstream copy resolve alike."""
-    return glm53 if request.param == "synthetic" else _PACKAGED
+@pytest.fixture
+def glm53_export(glm53):
+    """Use the synthetic export; custom-license checkpoint files are not bundled."""
+    return glm53
 
 
 def _native(model, phase):
@@ -374,7 +367,6 @@ def test_per_algorithm_gemm_mode(algo, quant_dynamic, expected):
     [
         ("nvidia/DeepSeek-V4-Flash-NVFP4", ("fp8_block", "nvfp4", "fp8", None)),
         ("nvidia/DeepSeek-V4-Pro-NVFP4", ("fp8_block", "nvfp4", "fp8", None)),
-        ("nvidia/MiniMax-M3-NVFP4", ("fp8_block", "nvfp4", None, None)),
         ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4", ("fp8_static", "w4a16_nvfp4", "fp8", "fp8")),
         ("nvidia/Qwen3.6-27B-NVFP4", ("fp8_static", None, "fp8", "fp8")),
         ("nvidia/Qwen3.6-35B-A3B-NVFP4", ("fp8_static", "w4a16_nvfp4", "fp8", "fp8")),
@@ -513,40 +505,12 @@ class TestDeepSeekFamily:
             _build(path, "sglang", tp_size=8, moe_ep_size=8)
 
 
-class TestPackagedExport:
-    """The packaged nvidia/GLM-5.3-NVFP4 is the upstream targets-only export."""
-
-    @pytest.mark.parametrize("suffix", list(_PACKAGED_SHA256))
-    def test_bundle_is_the_pinned_upstream_bytes(self, suffix):
-        data = (_CONFIGS / f"nvidia--GLM-5.3-NVFP4_{suffix}.json").read_bytes()
-        assert hashlib.sha256(data).hexdigest() == _PACKAGED_SHA256[suffix]
-
-    def test_bundle_resolves_the_listed_modes(self):
-        info = get_model_config_from_model_path(_PACKAGED)
-        raw = info["raw_config"]
-        modes = H._infer_quant_modes_from_raw_config(raw, info["architecture"])
-        assert (modes["gemm_quant_mode"], modes["moe_quant_mode"], modes["kvcache_quant_mode"]) == (
-            FP8_STATIC,
-            common.MoEQuantMode.nvfp4,
-            common.KVCacheQuantMode.fp8,
-        )
-        assert len(H.modelopt_mixed_precision_targets(raw)) == 87
-        assert H.attention_projection_exclusions(raw) == ALL_GROUPS
-        assert H.modelopt_shared_experts_unlisted(raw) is True
-        assert _dense_mlp_groups(raw, GLM_LAYERS, FP8_STATIC) == [(DENSE_LAYERS, FP8_STATIC, FP8_STATIC)]
-        # The upstream config carries head_dim 64 (the rope width); it is read
-        # as is. For DSA it only feeds the activation-memory width (all
-        # backends); latency op keys and KV bytes per token are unaffected.
-        assert info["d"] == 64
-
-
 def test_packaged_targets_only_checkpoints_are_reviewed():
     """Every packaged checkpoint the targets-only rule reaches, by family.
 
     The changed resolvers run only for the DEEPSEEK/KIMIK25/DEEPSEEKV32
-    families. nvidia/GLM-5.3-NVFP4 is the only member of those families in
-    scope, so the other predictions here do not move. A new member needs the
-    same review.
+    families. The remaining packaged targets-only checkpoints belong to other
+    families. A new member needs the same review.
     """
     in_scope = {}
     for path in sorted(DefaultHFModels):
@@ -554,8 +518,6 @@ def test_packaged_targets_only_checkpoints_are_reviewed():
         if H.modelopt_mixed_precision_targets(info["raw_config"]) is not None:
             in_scope[path] = H._architecture_to_model_family(info["architecture"])
     assert in_scope == {
-        _PACKAGED: "DEEPSEEKV32",
-        "nvidia/MiniMax-M3-NVFP4": "MINIMAXM3",
         "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4": "NEMOTRONH",
         "nvidia/Qwen3.6-27B-NVFP4": "QWEN35",
         "nvidia/Qwen3.6-35B-A3B-NVFP4": "QWEN35",

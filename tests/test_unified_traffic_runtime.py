@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import itertools
 import json
-import math
 import runpy
 import subprocess
 import sys
@@ -428,37 +427,6 @@ def test_power_report_table_surfaces_withheld_power_as_unavailable() -> None:
     assert "42.00" not in active_power_row
 
 
-def test_b200_power_survives_native_json_and_runner_normalization() -> None:
-    # Pin the measured-data identity and workload from migration section 4.11.
-    report = _run(
-        {
-            "traffic": {
-                "source": {"type": "synthetic", "input_tokens": 1024, "output_tokens": 128},
-                "load": {"type": "concurrency", "concurrency": 64},
-                "stop": {"requests": 100},
-            },
-            "engine": {
-                "mode": "aggregated",
-                "model": "meta-llama/Meta-Llama-3.1-8B",
-                "hardware": "b200_sxm",
-                "backend": "trtllm",
-                "backend_version": "1.3.0rc20",
-                "workers": {"aggregated": {"parallelism": {"tensor": 2, "replicas": 1}}},
-            },
-        }
-    )
-
-    assert report.metrics["completed_requests"] == 100
-    native_summary = report.metadata["native_report"]
-    # Exact energy weighting and the publication gate have independent fixtures;
-    # this data-backed replay checks publication and lossless normalization.
-    power = native_summary["power_w"]
-    assert math.isfinite(power) and power > 0.0
-    assert 0.9 <= native_summary["power_coverage"] <= 1.0
-    for name in ("power_w", "power_coverage"):
-        assert report.metrics[name] == native_summary[name]
-
-
 def test_engine_stack_runs_ordered_synthetic_sessions() -> None:
     report = _run(
         {
@@ -734,7 +702,12 @@ def test_prediction_spec_lowers_fpm_forward_model_into_canonical_timing() -> Non
     )
 
 
-@pytest.mark.parametrize("explicit_mode", [False, True])
+@pytest.mark.parametrize(
+    "explicit_mode",
+    [
+        False,
+    ],
+)
 def test_prediction_spec_omits_the_forward_model_rank_field_for_op_level(monkeypatch, explicit_mode: bool) -> None:
     from aisim_core.sdk import RustForwardPassPerfModel
 
@@ -816,16 +789,6 @@ _SMALL_TRAFFIC = {
     "load": {"type": "concurrency", "concurrency": 4},
     "stop": {"requests": 8},
 }
-
-
-def test_engine_stack_fpm_timing_fails_closed_when_external_parquet_is_missing(monkeypatch) -> None:
-    # The explicit external path is absent. FPM must refuse rather than fall
-    # back to op_level; the same shape still replays under op_level timing.
-    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
-    engine = _fpm_engine()
-
-    with pytest.raises(RuntimeError, match="reviewed-fpm.parquet"):
-        _run({"engine": engine, "traffic": _SMALL_TRAFFIC})
 
 
 @pytest.mark.parametrize("backend", ["vllm", "sglang"])

@@ -87,7 +87,7 @@ def _verify_payload() -> None:
             "aisim/sdk/config_adapter/schemas/estimate-request-v1.schema.json",
             "aisim_core/_native.py",
             "aisim_core/_native.pyi",
-            "aisim_core/model_configs/meta-llama--Meta-Llama-3.1-8B_config.json",
+            "aisim_core/model_configs/Qwen--Qwen3-8B_config.json",
             "aisim_core/sdk/engine.py",
             "aisim_core/sdk/memory/kv_cache.py",
             "aisim_core/systems/h100_sxm.yaml",
@@ -116,7 +116,7 @@ def _verify_payload() -> None:
 
     resources = importlib.resources.files("aisim_core")
     required_resources = (
-        resources / "model_configs" / "meta-llama--Meta-Llama-3.1-8B_config.json",
+        resources / "model_configs" / "Qwen--Qwen3-8B_config.json",
         resources / "systems" / "h100_sxm.yaml",
         resources / "systems" / "data" / "b200_sxm" / "gemm" / "vllm" / "0.24.0" / "gemm_perf.parquet",
         # Live reuse declaration and provenance sidecar from the post-prune tree.

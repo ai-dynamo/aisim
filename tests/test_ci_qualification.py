@@ -186,17 +186,16 @@ def _build_image(tmp_path, base):
     return result, log.read_text() if log.exists() else ""
 
 
-def test_manifest_retains_dense_moe_prefill_and_decode():
+def test_manifest_retains_dense_prefill_and_decode():
     manifest = json.loads((ROOT / ".github/prediction-numerical-sentinels.json").read_text())
     cases = validate_cases(manifest)
-    assert len(cases) == 16
+    assert len(cases) == 12
     assert {
         (c["compile"]["backend"], c["compile"]["model_path"], c["method"], c["arguments"]["isl"]) for c in cases
     } == {
         (backend, model, method, isl)
         for backend, model in (
             ("vllm", "Qwen/Qwen3-32B"),
-            ("vllm", "MiniMaxAI/MiniMax-M2.5"),
             ("trtllm", "Qwen/Qwen3-32B"),
             ("sglang", "Qwen/Qwen3-32B"),
         )

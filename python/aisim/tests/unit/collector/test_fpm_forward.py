@@ -882,30 +882,6 @@ def test_source_revision_fails_when_no_explicit_git_or_installed_identity(_pinne
     assert metadata_attempted is True
 
 
-def test_minimax_m3_keeps_family_dtype_and_parallel_capabilities():
-    plan = build_collection_plan(
-        backend="vllm",
-        model_path="MiniMaxAI/MiniMax-M3",
-        model_architecture="MiniMaxM3ForCausalLM",
-        system="b200_sxm",
-        selected_ops={"attention_context", "attention_generation"},
-        has_model_cases=False,
-        options=FPMCollectionOptions.from_args(
-            _args(
-                fpm_max_gpus=16,
-                fpm_gpu_counts=[8, 16],
-            )
-        ),
-    )
-
-    assert plan.capability.support_level == "family_template"
-    assert plan.capability.template_id == "aic_family:minimaxm3:moe_msa"
-    assert plan.capability.attention_kind == "moe_msa"
-    assert plan.capability.attention_source == "dsa_module"
-    assert plan.capability.allow_pure_tp is True
-    assert {cell.parallel_strategy for cell in plan.cells} == {"pure_tp", "tep", "dep"}
-
-
 _DSV4_ATTENTION_OPS = {
     "dsv4_csa_context_module",
     "dsv4_hca_context_module",
@@ -1177,7 +1153,6 @@ def test_qwen_gdn_hybrid_model_cases_cannot_select_exact_dense_attention(tmp_pat
 @pytest.mark.parametrize(
     "model,architecture,reasons,is_moe",
     [
-        ("moonshotai/Kimi-K3", "KimiLinearForCausalLM", "recurrent-state field linear_attn_config", True),
         (
             "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
             "NemotronHForCausalLM",
@@ -1457,11 +1432,9 @@ _GOLDEN_FIELDS = (
 @pytest.mark.parametrize(
     "model",
     [
-        "meta-llama/Meta-Llama-3.1-8B",
         "Qwen/Qwen3-30B-A3B",
         "deepseek-ai/DeepSeek-V3",
         "deepseek-ai/DeepSeek-V4.1-Flash",
-        "MiniMaxAI/MiniMax-M3",
         "openai/gpt-oss-20b",
     ],
 )
@@ -1480,42 +1453,6 @@ def test_capability_without_cache_layout_markers_is_unchanged(model):
     ).to_dict()
     golden = json.loads(_GOLDEN_CAPABILITIES.read_text())["capabilities"][model]
     assert {field: capability[field] for field in _GOLDEN_FIELDS} == golden
-
-
-def test_collector_cache_layout_markers_match_config_intake_for_packaged_configs():
-    from aisim.support.config_profile import load_model_config as load_intake_config
-
-    detected, unrecognized_only = set(), set()
-    # ModelOpt sidecars share the file suffix but are not model configs.
-    for path in sorted(p for p in _MODEL_CONFIGS.glob("*_config.json") if not p.name.endswith("_hf_quant_config.json")):
-        name = path.name.removesuffix("_config.json")
-        try:
-            intake = load_intake_config(path)
-        except ValueError:
-            continue
-        markers = tuple(
-            reason for reason in intake.runtime_layout if not reason.startswith("unrecognized architecture")
-        )
-        if intake.runtime_layout and not markers:
-            unrecognized_only.add(name)
-        capability = _layout_capability(name.replace("--", "/", 1), native=True, model_config_path=str(path))
-        if markers:
-            detected.add(name)
-            assert capability.template_id == GENERIC_RUNTIME_TEMPLATE_ID, name
-            assert capability.support_reason == (
-                f"config.json cannot describe this cache layout ({', '.join(markers)}). "
-                "The native runtime measures every cell."
-            ), name
-        else:
-            # The rule for unrecognized architectures stays in intake; AIC model families handle them here.
-            assert capability.template_id != GENERIC_RUNTIME_TEMPLATE_ID, name
-    assert {
-        "zai-org--GLM-5.3-Flash",
-        "moonshotai--Kimi-K3",
-        "nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
-        "Qwen--Qwen3.5-27B",
-    } <= detected
-    assert {"Qwen--Qwen3-VL-8B-Instruct", "XiaomiMiMo--MiMo-7B-Base", "MiniMaxAI--MiniMax-M3"} <= unrecognized_only
 
 
 def _packaged_config(name):
@@ -1551,41 +1488,6 @@ def _dsa_layers(config):
 
 def _mamba_wrapper(_config):
     return "recurrent architecture LlavaMambaForConditionalGeneration"
-
-
-@pytest.mark.parametrize(
-    "build,reason",
-    [
-        (_unnamed_dsa_config, _dsa_layers),
-        (_dsa_text_config_under_a_wrapper, _dsa_layers),
-        (_llama_under_a_mamba_wrapper, _mamba_wrapper),
-    ],
-    ids=["unnamed-dsa-config", "dsa-text-config-under-a-wrapper", "llama-under-a-mamba-wrapper"],
-)
-def test_collector_checks_cache_layout_markers_with_its_own_architecture(tmp_path, build, reason):
-    """Intake checks the decoder architecture, which model_type can name. The collector checks the config's
-    architectures entry, which can name a wrapper, or --model-architecture. In these shapes the collector is
-    stricter."""
-    from aisim.support.config_profile import load_model_config as load_intake_config
-
-    # The packaged config is read here, so a missing file fails only the tests that use it.
-    config = build()
-    path = tmp_path / "config.json"
-    path.write_text(json.dumps(config))
-    assert load_intake_config(path).runtime_layout == ()
-    capability = _layout_capability(path, native=True)
-    assert capability.template_id == GENERIC_RUNTIME_TEMPLATE_ID
-    assert capability.support_reason == (
-        f"config.json cannot describe this cache layout ({reason(config)}). The native runtime measures every cell."
-    )
-
-
-def test_model_architecture_names_an_unnamed_config_as_intake_does(tmp_path):
-    path = tmp_path / "config.json"
-    path.write_text(json.dumps(_unnamed_dsa_config()))
-    # Onboarding passes the decoder architecture with --model-architecture, so the DSA layers are recognized.
-    capability = _layout_capability(path, "GlmMoeDsaForCausalLM", native=True)
-    assert capability.template_id == "aic_family:deepseekv32:moe_dsa"
 
 
 def _detected_layout_plan(tmp_path, monkeypatch, generator_overrides):
@@ -2729,29 +2631,6 @@ def test_formal_database_serializes_concurrent_publishers(tmp_path):
     metadata = json.loads((destination / "fpm_forward_perf.metadata.json").read_text())
     assert table.num_rows == len(rows)
     assert metadata["row_count"] == len(rows)
-
-
-def test_minimax_m3_family_routing_survives_inherited_base_attention_ops():
-    """include_base-inherited dense ops must not count as exact evidence."""
-
-    plan = build_collection_plan(
-        backend="vllm",
-        model_path="MiniMaxAI/MiniMax-M3",
-        model_architecture="MiniMaxM3ForCausalLM",
-        system="b200_sxm",
-        selected_ops={"attention_context", "attention_generation"},
-        has_model_cases=True,
-        options=FPMCollectionOptions.from_args(
-            _args(
-                fpm_max_gpus=16,
-                fpm_gpu_counts=[8, 16],
-            )
-        ),
-    )
-
-    assert plan.capability.support_level == "family_template"
-    assert plan.capability.template_id == "aic_family:minimaxm3:moe_msa"
-    assert plan.capability.attention_source == "dsa_module"
 
 
 def test_fmha_resolves_per_kv_dtype_against_joint_evidence(monkeypatch):

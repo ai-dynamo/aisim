@@ -1229,35 +1229,6 @@ class TestFPMStaticAndMixed:
         assert total == pytest.approx(7.0)
 
 
-def test_text_only_kimi_profile_preserves_encoder_weights_and_dcp_identity():
-    cfg = _model_config(
-        forward_model="fpm",
-        tp_size=8,
-        moe_tp_size=8,
-        moe_ep_size=1,
-        dcp_size=8,
-        fpm_config=FpmCompileConfig(
-            {"text_only": True, "unrecorded_quant_modes": ["fmha", "comm"]}, attention_backend="FLASHINFER_MLA"
-        ),
-    )
-    model = models.get_model("moonshotai/Kimi-K3", cfg, "vllm")
-    assert model.encoder_ops
-    assert sum(op.get_weights() for op in model.encoder_ops) > 0
-    assert all(isinstance(op, FPMForwardOp) for op in (*model.context_ops, *model.generation_ops))
-    identity = model.context_ops[0]._match_identity
-    assert identity[2:4] == ("", "")
-    assert identity[12] == "FLASHINFER_MLA"
-    assert len(identity) == len(_CELL_MATCH_COLUMNS)
-    assert model.context_ops[0]._dcp_size == 8
-    assert cfg.total_gpus_per_worker == 8
-    from aisim_core.sdk.engine import _fpm_spec_dict
-
-    prefill = model.context_ops[0]
-    assert _fpm_spec_dict(prefill)["FpmForward"]["dcp_size"] == 8
-    resident = _fpm_spec_dict(prefill)["FpmForward"]["weight_bytes"]
-    assert resident == prefill.get_weights() + sum(op.get_weights() for op in model.encoder_ops)
-
-
 @pytest.fixture
 def kimi_fpm_profile(tmp_path, request):
     from aisim_core.sdk import ForwardPassPerfModelConfig
@@ -1315,96 +1286,6 @@ def kimi_fpm_profile(tmp_path, request):
             "correction": {"enabled": False},
         },
     )
-
-
-@pytest.mark.parametrize("kimi_fpm_profile", [None, 1, 8], indirect=True)
-def test_canonical_kimi_dcp_profile_queries_measured_points(kimi_fpm_profile):
-    from aisim_core.sdk import RustForwardPassPerfModel
-
-    config = kimi_fpm_profile
-    model = RustForwardPassPerfModel.best_available(config)
-    try:
-        assert model.estimate_forward_pass_time_ms(
-            {
-                "version": 1,
-                "scheduled_requests": {
-                    "num_prefill_requests": 1,
-                    "sum_prefill_tokens": 128,
-                },
-            }
-        ) == pytest.approx(7.0)
-        assert model.estimate_forward_pass_time_ms(
-            {
-                "version": 1,
-                "scheduled_requests": {
-                    "num_decode_requests": 1,
-                    "sum_decode_kv_tokens": 128,
-                },
-            }
-        ) == pytest.approx(3.0)
-        assert model.diagnostics()["provenance"]["config"]["dcp"] == config.dcp
-    finally:
-        model.close()
-    from dataclasses import replace
-
-    from aisim_core.sdk.errors import PerfDataNotAvailableError
-
-    for dcp in (None, 1, 8):
-        if dcp == config.dcp:
-            continue
-        with pytest.raises(PerfDataNotAvailableError, match="No FPM cell matches"):
-            RustForwardPassPerfModel.best_available(replace(config, dcp=dcp))
-    automatic = RustForwardPassPerfModel.best_available(replace(config, estimation_mode="auto"))
-    try:
-        provenance = automatic.diagnostics()["provenance"]
-        assert provenance["selected_estimation_mode"] == "fpm_interpolation"
-        assert provenance["config"]["dcp"] == config.dcp
-    finally:
-        automatic.close()
-
-
-def test_session_cache_preserves_fpm_identity(kimi_fpm_profile):
-    from dataclasses import replace
-
-    from aisim.sdk.inference_session import InferenceSession
-    from aisim_core.sdk.config import RuntimeConfig
-    from aisim_core.sdk.errors import PerfDataNotAvailableError
-    from aisim_core.sdk.rust_engine_step import _engine_handle_cache_clear
-
-    config = _model_config(
-        tp_size=8,
-        moe_tp_size=8,
-        moe_ep_size=1,
-        dcp_size=8,
-        forward_model="fpm",
-        fpm_config=FpmCompileConfig(
-            {"text_only": True, "unrecorded_quant_modes": ["fmha", "comm"]}, attention_backend="FLASHINFER_MLA"
-        ),
-        kvcache_quant_mode=common.KVCacheQuantMode.fp8,
-        moe_quant_mode=common.MoEQuantMode.w4a16_mxfp4,
-    )
-    database = PerfDatabase(SYSTEM, BACKEND, VERSION, systems_root=kimi_fpm_profile.systems_paths[0])
-    runtime = RuntimeConfig(batch_size=1, isl=128, osl=2)
-
-    def prefill(model_config):
-        model = models.get_model(kimi_fpm_profile.model, model_config, BACKEND)
-        return InferenceSession(model, database, get_backend(BACKEND)).run_static_latency_only(runtime, "static_ctx")
-
-    _engine_handle_cache_clear()
-    try:
-        assert prefill(config) == pytest.approx(7.0)  # synthetic measured prefill row
-        for different in (
-            replace(config, dcp_size=1),
-            replace(config, fpm_config=FpmCompileConfig({"text_only": True}, attention_backend="FLASHINFER_MLA")),
-            replace(config, fpm_config=FpmCompileConfig(config.fpm_config.options, attention_backend="auto")),
-        ):
-            with pytest.raises(PerfDataNotAvailableError, match="No FPM cell matches"):
-                prefill(different)
-        with pytest.raises(NotImplementedError, match="encoder/multimodal"):
-            prefill(replace(config, fpm_config=FpmCompileConfig()))
-        assert prefill(config) == pytest.approx(7.0)
-    finally:
-        _engine_handle_cache_clear()
 
 
 def test_session_cache_separates_text_only_mode(fpm_session):

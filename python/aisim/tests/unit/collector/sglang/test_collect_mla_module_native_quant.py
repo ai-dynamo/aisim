@@ -383,11 +383,3 @@ class TestUnchangedExports:
 
     def test_no_files(self, mod):
         assert mod._model_native_gemm_quant(MODEL_ID) is None
-
-
-def test_bundled_glm53_nvfp4_export_selects_the_nvfp4_loader():
-    # Reads the bundled files, not tmp_path. The check passes on the pure-NVFP4 copy
-    # (top-level quant_algo NVFP4) through the top-level branch, and on the MIXED_PRECISION
-    # export only through the mixed rule.
-    mod = _import_module()
-    assert mod._model_native_gemm_quant("nvidia/GLM-5.3-NVFP4") == "nvfp4"

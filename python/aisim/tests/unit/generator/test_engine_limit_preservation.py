@@ -6,14 +6,11 @@ from __future__ import annotations
 import copy
 import logging
 import shlex
-from types import SimpleNamespace
 
-import pandas as pd
 import pytest
 import yaml
 
 from aisim.generator.api import generate_backend_artifacts
-from aisim.generator.module_bridge import task_config_to_generator_config
 from aisim.generator.rendering.engine import render_backend_templates
 from aisim.generator.rendering.rule_engine import apply_rule_plugins
 from aisim.generator.request import from_legacy_params, to_legacy_params
@@ -386,37 +383,6 @@ def test_trtllm_rules_only_default_block_size_for_unpinned_requests(rule, preser
             assert actual["cache_transceiver_max_tokens_in_buffer"] > 0
             assert actual["cache_transceiver_max_tokens_in_buffer"] % 32 == 0
         assert actual["cache_transceiver_backend"] == "DEFAULT"
-
-
-@pytest.mark.parametrize("value", [True, False])
-def test_module_bridge_propagates_preserve_engine_limits(value: bool):
-    task = SimpleNamespace(
-        primary_backend_name="vllm",
-        primary_system_name="gb200",
-        primary_backend_version="0.19.0",
-        primary_model_path="meta-llama/Meta-Llama-3.1-8B",
-        prefix=0,
-        is_moe=False,
-        nextn=0,
-        nextn_accepted=None,
-        serving_mode="agg",
-        total_gpus=1,
-        system_name="gb200",
-        isl=128,
-        osl=16,
-        ttft=1000.0,
-        tpot=100.0,
-    )
-    row = pd.Series({"workers": 1, "tp": 1, "pp": 1, "dp": 1, "bs": 16})
-
-    result = task_config_to_generator_config(
-        task,
-        row,
-        generator_overrides={"preserve_engine_limits": value},
-        num_gpus_per_node=4,
-    )
-
-    assert result["preserve_engine_limits"] is value
 
 
 @pytest.mark.unit
