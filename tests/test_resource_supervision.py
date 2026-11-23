@@ -1431,10 +1431,52 @@ def test_supervisor_entry_point_groups_match_their_resolvers():
 
 
 @pytest.mark.parametrize("command", ["predict", "recommend"])
+def test_overwrite_preserves_trace_alias_published_during_cleanup(tmp_path, monkeypatch, capsys, command):
+    from aisim import output as output_module
+    from aisim import supervision
+
+    config = _small_cli_config(tmp_path, command)
+    output = tmp_path / "output"
+    output.mkdir()
+    requests = output / "requests.jsonl"
+    fixture = Path(__file__).parent / "e2e/configs/unified_cli/fixtures/traces/mooncake.jsonl"
+    trace_bytes = fixture.read_bytes()
+    requests.write_bytes(trace_bytes)
+    trace = tmp_path / "trace.jsonl"
+    raw = yaml.safe_load(config.read_text())
+    raw["traffic"] = {
+        "source": {"type": "trace", "format": "mooncake", "paths": [str(trace)]},
+        "load": {"type": "trace_timestamps"},
+    }
+    config.write_text(yaml.safe_dump(raw))
+    check = output_module._check_input_collisions
+
+    def check_then_publish(targets, input_paths):
+        check(targets, input_paths)
+        # Publish the configured input immediately after the initial cleanup check.
+        if not trace.is_symlink():
+            trace.symlink_to(requests)
+
+    def unexpected_worker(*args, **kwargs):
+        assert trace.exists(), "overwrite removed the newly published trace before starting the worker"
+        pytest.fail("a cleanup collision must be rejected before starting the worker")
+
+    monkeypatch.setattr(output_module, "_check_input_collisions", check_then_publish)
+    monkeypatch.setattr(supervision, "run_process", unexpected_worker)
+    with pytest.raises(SystemExit) as error:
+        supervision.main([command, "--config", str(config), "--output-dir", str(output), "--overwrite"])
+
+    assert error.value.code == 2
+    assert "output cleanup would remove input file" in capsys.readouterr().err
+    assert trace.is_symlink()
+    assert trace.read_bytes() == trace_bytes
+
+
+@pytest.mark.parametrize("command", ["predict", "recommend"])
 @pytest.mark.parametrize("input_kind", ["file", "directory_alias"])
 @pytest.mark.parametrize("cleanup_name", ["requests.jsonl", "resource-runtime.json"])
 def test_worker_cleanup_preserves_trace_created_after_parent_preflight(
-    tmp_path, monkeypatch, command, input_kind, cleanup_name
+    tmp_path, monkeypatch, capfd, command, input_kind, cleanup_name
 ):
     import subprocess
 
@@ -1494,12 +1536,13 @@ def test_worker_cleanup_preserves_trace_created_after_parent_preflight(
 
     monkeypatch.setattr(supervision, "run_process", produce_then_run)
     result = supervision.main([command, "--config", str(config), "--output-dir", str(output), "--overwrite"])
+    assert result == 2
+    assert "output cleanup would remove input file" in capfd.readouterr().err
     assert trace.exists()
     assert trace.read_bytes() == trace_bytes
     if input_kind == "directory_alias":
         assert cleanup.is_symlink()
         assert cleanup.readlink() == inputs
-    assert result != 0
 
 
 def test_resource_plan_cleanup_preserves_trace_input(tmp_path, monkeypatch, capsys):

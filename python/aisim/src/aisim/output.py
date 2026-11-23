@@ -425,6 +425,7 @@ def _prepare_locked(root: Path, *, overwrite: bool, input_paths: Iterable[str | 
         for target in targets:
             # An earlier directory symlink may make a snapshotted child unreachable.
             if target.is_file() or target.is_symlink():
+                _check_input_collisions((target,), input_paths)
                 target.unlink(missing_ok=True)
 
 
