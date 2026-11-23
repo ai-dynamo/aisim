@@ -76,6 +76,8 @@ def _measure_fastafd_attention(stage_config, *, isl, osl, prefix, max_seq_len):
         isl=isl, osl=osl, prefix=prefix, batch_size=topology.n_a_workers * topology.a_batch_size
     )
     result = session._measure_attention_decode(runtime, max_seq_len=max_seq_len)
+    # Both sides use the homogeneous pipeline count (all model layers), not
+    # the checkpoint's routed-only count. Never renormalize a shorter capture.
     if result["num_layers"] != identity["moe_layers"]:
         raise ValueError("FastAFD stage layer count does not match the attention model")
     result["provenance"]["config"] = stage_config

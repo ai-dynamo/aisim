@@ -104,6 +104,10 @@ iterations. `stable` is the benchmark's own stability gate and must be true;
 `correctness` is the matched-output check against a reference backend, `null` when
 the benchmark ran no reference.
 
+| Key field | Required value | Behavior |
+| --- | --- | --- |
+| `moe_layers` | Positive u32 | Number of MoE block repetitions actually timed, copied from the capture's `workload.layers`. It is not inferred from the checkpoint's number of routed layers. |
+
 | Measurement field | Required value | Behavior |
 | --- | --- | --- |
 | `sample_count` | Integer from 1 to 18446744073709551615 (u64) | Counts timed iterations independently of the u32 topology keys. JSON and Parquet imports preserve the same range through native estimation and provenance. |
@@ -114,11 +118,24 @@ the benchmark ran no reference.
 `engine.afd.fastafd_profile_path`; see
 [measured FastAFD MoE stage](../../replay/engine/analytical.md#measured-fastafd-moe-stage).
 The consumer resolves `routed_topk` from the model's normalized `topk` metadata;
-missing or invalid routing width is infeasible. Both this width and the attention
-provider's layer count must match the profile key before precision selection.
+missing or invalid routing width is infeasible. The AFD adapter resolves the
+pipeline layer count from normalized checkpoint metadata (`layers`) and requires
+both the profile's `moe_layers` and the attention provider's `num_layers` to equal
+it. The profile count and routing width are matched before precision selection.
 Other routing widths or layer counts do not make an exact match ambiguous. The
 selected key, including `routed_topk` and `moe_layers`, is retained in measurement
 provenance.
+
+The current AFD pipeline uses homogeneous layer accounting: DeepSeek-V3 models
+61 attention and MoE block repetitions, although its checkpoint has only 58
+routed layers after a three-layer dense prefix. A compatible capture must
+therefore actually time 61 MoE block repetitions and record `moe_layers: 61`.
+A capture of 58 repetitions remains a valid stage-only profile, but cannot be
+composed with that 61-layer AFD model. It is rejected rather than relabeled,
+rescaled, or treated as including the dense FFNs. Custom attention providers
+must use the same checkpoint-derived count; they cannot select a different
+pipeline by returning 58. Modeling the heterogeneous dense prefix separately
+is outside this homogeneous pipeline's contract.
 
 ## Building a profile
 

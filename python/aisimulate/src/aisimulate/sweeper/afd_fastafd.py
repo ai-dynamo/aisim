@@ -39,6 +39,8 @@ class FastAFDMoEStagePerformanceModel:
 
     The profile entry is an exact measurement of the complete decode MoE stage for
     one ``<A>A<F>F`` topology, per-A-rank batch, MTP degree, microbatch count, and
+    measured block repetition count. The homogeneous AFD pipeline requires that
+    count to equal the checkpoint's total layers and the attention provider's
     layer count. Its latency is spread evenly over ``moe_layers * microbatches``
     pipeline units and becomes ``ffn_ms``; both transfer stages are zero because
     dispatch and return are inside the measured stage. ``attention_ms`` is the
@@ -95,14 +97,14 @@ class FastAFDMoEStagePerformanceModel:
                 model=request.model_name,
                 routed_topk=routed_topk,
             )
-        if type(self.attention_model) is AICAFDPerformanceModel:
-            # Select precision before the built-in provider constructs either
-            # pool. F memory must describe this stage, not checkpoint defaults.
-            estimate, config, model = self._select(request, model_layers, routed_topk)
-            attention = self._attention(request, model)
-        else:
-            attention = self._attention(request)
-            estimate, config, _model = self._select(request, attention.num_layers, routed_topk)
+        # The existing homogeneous pipeline models a MoE block at every layer
+        # position, including a checkpoint's dense prefix. Match that many
+        # measured repetitions; neither a routed-only count nor a custom
+        # attention provider may redefine the pipeline geometry. Select first
+        # so unmeasured stages fail before attention work, and F memory uses
+        # the measured precision instead of checkpoint defaults.
+        estimate, config, model = self._select(request, model_layers, routed_topk)
+        attention = self._attention(request, model)
         if attention.num_layers != estimate["num_layers"]:
             raise _infeasible("the attention provider's layer count does not match the selected FastAFD stage")
         components = self._components(attention)

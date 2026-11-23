@@ -81,8 +81,14 @@ time through the canonical Rust `fastafd_stage` estimator from an AISimulate
 [FastAFD MoE stage profile](../../perf-model/schemas/fastafd-moe-stage-profile.md)
 instead of the operation model. The profile's `afd` entry must match the model,
 hardware, `<A GPUs>A<F GPUs>F` topology, `a_batch_size`, MTP degree,
-`num_microbatches`, the attention provider's layer count, and the model's routed
-top-k exactly; nothing is interpolated or projected. Top-k comes from normalized
+`num_microbatches`, the checkpoint's total layer count, and the model's routed
+top-k exactly; nothing is interpolated or projected. The attention provider must
+report the same layer count. The current pipeline models a MoE block at every
+layer position, including dense-prefix positions: DeepSeek-V3 requires a capture
+of 61 block repetitions, not its checkpoint's 58 routed layers. Captures with a
+different repetition count are rejected; see the
+[homogeneous layer contract](../../perf-model/schemas/fastafd-moe-stage-profile.md#consumers).
+Top-k comes from normalized
 model metadata (`topk`); an unknown or invalid width is infeasible. Its stage latency
 covers dispatch, experts, return and the A-side combine for every MoE layer of one
 decode step, so it is spread evenly over `moe_layers × num_microbatches` pipeline

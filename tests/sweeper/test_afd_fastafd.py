@@ -186,6 +186,43 @@ def test_stage_latency_is_spread_over_layer_microbatch_units(tmp_path):
     assert set(provenance["composition"]) == {"attention_ms", "ffn_ms", "a_to_f_ms", "f_to_a_ms"}
 
 
+@pytest.mark.parametrize("attention_kind", ["builtin", "custom"])
+@pytest.mark.parametrize("profile_layers", [58, 61])
+def test_dense_prefix_stage_matches_homogeneous_model_layers(
+    tmp_path, fastafd_attention_sol, attention_kind, profile_layers
+):
+    """Synthetic stage and native SOL A timing, not measured serving accuracy."""
+    model = "deepseek-ai/DeepSeek-V3"
+    metadata = afd_fastafd.get_model_config_from_model_path(model)
+    assert metadata["layers"] == 61
+    assert metadata["raw_config"]["first_k_dense_replace"] == 3
+    request = replace(_request(_topology()), model_name=model, max_seq_len=2048)
+    profile = _profile(tmp_path, [_entry(model_path=model, moe_layers=profile_layers)])
+    attention = AICAFDPerformanceModel() if attention_kind == "builtin" else _Attention(num_layers=61)
+    provider = _provider(tmp_path, attention, profile_path=profile)
+
+    if profile_layers == 58:
+        # A capture of only the checkpoint's routed layers cannot describe
+        # the existing homogeneous 61-unit AFD pipeline. Never rescale it.
+        with pytest.raises(AFDInfeasible, match="no FastAFD split MoE stage measurement"):
+            provider.measure(request)
+        return
+
+    (measurement,) = provider.measure(request)
+    assert measurement.num_layers == 61
+    assert measurement.provenance["config"]["afd"]["moe_layers"] == 61
+    assert measurement.provenance["stage"]["key"]["moe_layers"] == 61
+    assert measurement.ffn_ms == pytest.approx(STAGE_MS / (61 * 2))
+
+
+def test_custom_attention_cannot_select_checkpoint_moe_layer_count(tmp_path):
+    model = "deepseek-ai/DeepSeek-V3"
+    profile = _profile(tmp_path, [_entry(model_path=model, moe_layers=count) for count in (58, 61)])
+    request = replace(_request(_topology()), model_name=model)
+    with pytest.raises(AFDInfeasible, match="layer count does not match"):
+        _provider(tmp_path, _Attention(num_layers=58), profile_path=profile).measure(request)
+
+
 def test_attention_provenance_snapshots_validated_components(tmp_path):
     class RetainingAttention(_Attention):
         def measure(self, request):
@@ -601,7 +638,7 @@ def test_precision_is_selected_explicitly_when_several_entries_match(tmp_path):
 
 
 def test_layer_count_must_match_the_attention_model(tmp_path):
-    with pytest.raises(AFDInfeasible, match="no FastAFD split MoE stage measurement"):
+    with pytest.raises(AFDInfeasible, match="layer count does not match"):
         _provider(tmp_path, _Attention(num_layers=95)).measure(_request(_topology()))
 
 

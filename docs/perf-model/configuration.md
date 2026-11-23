@@ -106,7 +106,8 @@ it with the configured attention provider. It does not select a second estimator
 | `afd.attention_gpus`, `afd.ffn_gpus` | Required | Positive A/F pool GPU counts. `tp` must be 1; independent whole-forward parallelism controls are unsupported. |
 | `afd.f_moe_ep_size` | Required | Must equal `afd.ffn_gpus`. |
 | `afd.microbatches` | Required | Positive microbatch count matched exactly. |
-| `afd.moe_layers`, `afd.routed_topk` | Required | Positive model geometry. The AFD adapter resolves these from the attention measurement and normalized model metadata. |
+| `afd.moe_layers` | Required | Measured MoE block repetition count. The AFD adapter requires the checkpoint's total `layers` and the attention provider's `num_layers` to match it; see the [homogeneous layer contract](schemas/fastafd-moe-stage-profile.md#consumers). |
+| `afd.routed_topk` | Required | Positive routed width, resolved by the AFD adapter from normalized model metadata (`topk`). |
 | `afd.boundary_on_attn` | Required | Must be `true`. |
 | `estimator_config.fastafd_stage` | `null` | Controls for this estimator, required together with `afd`. Other estimator controls must retain their defaults. |
 | `estimator_config.fastafd_stage.profile_path` | Required | Native Parquet table. Python also imports legacy profile JSON as in-memory Parquet while retaining the original source path and digest. Rust validates the Parquet snapshot, rejects duplicate/unqualified captures, and pins its data at construction. |
