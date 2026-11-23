@@ -27,7 +27,7 @@ the root too (the native database reads them beside the requested version and sk
 by the same pin; a donor the dataset does not publish is skipped, as it is there.
 
 With no pin the whole step is a no-op and behavior is unchanged. Credentials are
-the standard Hugging Face ones (``HF_TOKEN`` / ``huggingface-cli login``); this
+the standard Hugging Face ones (``HF_TOKEN`` / ``hf auth login``); this
 module accepts, stores and prints no token.
 
 Environment (read by :func:`pin_from_environment`): ``AISIM_DATASET=<repo>@<revision>``
