@@ -189,7 +189,9 @@ class SchedulerPredictionConfig(StrictModel):
         default=None,
         description=(
             "vLLM aggregated workers with async scheduling only: CPU launch costs of vLLM's engine loop. A pass's "
-            "outputs then leave once the next pass is launched, and an arrival joins the first pass decided after it."
+            "outputs then leave once the next pass is launched, and an arrival joins the first pass decided after it. "
+            "With an offloading_v0_32 or simple_cpu_v0_32 CPU tier, a finished load is admitted only after vLLM "
+            "(Model Runner V2) polls the connector."
         ),
     )
 

@@ -1189,7 +1189,9 @@ impl NativeHostOffloadConfig {
 ///
 /// vLLM decides and launches pass k+1 before it returns pass k's outputs, so a
 /// pass's outputs leave once the next pass is launched, and a request joins the
-/// first pass decided after it arrives.
+/// first pass decided after it arrives. With an `offloading_v0_32` or
+/// `simple_cpu_v0_32` CPU tier, a finished load is admitted only after vLLM
+/// (Model Runner V2) polls the connector.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PassLaunchConfig {
