@@ -1413,6 +1413,12 @@ def test_clean_metric_and_series_text_can_be_promoted(tmp_path, value):
         ("future_text", json.dumps({"endpoint": "https://node7.corp.nvidia.com/v1"}), "internal-host"),
         ("future_text", {"authorization": "Bearer " + "a" * 24}, "secret"),
         ("future_text", ["https://node7.corp.nvidia.com/v1"], "internal-host"),
+        # A password in URL userinfo under a neutral field, on a public host and in no known token format.
+        ("kernel_source", "https://synthetic-user:plain-synthetic-password@example.org/repo", "secret"),
+        ("future_text", "https://synthetic-user:plain-synthetic-password@example.org/repo", "secret"),
+        ("future_text", "https://:plain-synthetic-password@example.org/repo", "secret"),
+        ("future_text", {"endpoint": "git+ssh://synthetic-user:plain-synthetic-password@example.org/repo"}, "secret"),
+        ("future_text", json.dumps({"source_url": "https://u:p@example.org/repo"}), "secret"),
     ],
 )
 def test_operation_table_text_blocks_promotion_and_public_validation(tmp_path, column, value, code):
@@ -1430,7 +1436,19 @@ def test_operation_table_text_blocks_promotion_and_public_validation(tmp_path, c
     assert not (target / relative).exists()
 
 
-@pytest.mark.parametrize("value", [None, "", "[REDACTED]", '{"source": "public-benchmark"}'])
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "",
+        "[REDACTED]",
+        '{"source": "public-benchmark"}',
+        # Ordinary public URLs, including userinfo without a password and an @ outside the authority.
+        "https://example.org/repo",
+        "ssh://git@example.org/repo.git",
+        "https://example.org/path?next=a:b@c",
+    ],
+)
 def test_clean_operation_table_text_can_be_promoted(tmp_path, value):
     root, directory, relative = _op_mirror(tmp_path, "future_text", value)
     draft = plan_promotion(root, _request(root, [directory]), _reviewers())

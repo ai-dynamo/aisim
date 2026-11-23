@@ -77,6 +77,8 @@ _PATCH_VALUE = re.compile(r"(?m)^(?:diff --git |--- a/|\+\+\+ b/)|\.(?:patch|dif
 _SECRET = re.compile(
     r"(hf_[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_\-]{20,}|bearer\s+[A-Za-z0-9._\-]{16,})", re.I
 )
+# A URL whose userinfo carries a password (``scheme://user:password@host``), whatever the host or token format.
+_URL_PASSWORD = re.compile(r"[a-z][a-z0-9+.\-]*://[^/\s?#@:]*:[^/\s?#@]+@", re.I)
 _CREDENTIAL_KEY = re.compile(
     r"^(password|passwd|secret|client_secret|api_key|access_token|auth_token|refresh_token|id_token|"
     r"private_key|authorization|credential|credentials|"
@@ -267,7 +269,7 @@ def scan_value(value: Any, policy: RedactionPolicy, path: str, where: str, *, _k
             flag("image-name", "image name must be removed or [REDACTED]")
         if _PATCH_KEY.search(key) or _PATCH_VALUE.search(text):
             flag("patch-reference", "patch reference or diff text must be removed")
-        if _SECRET.search(text):
+        if _SECRET.search(text) or _URL_PASSWORD.search(text):
             flag("secret", "credential-like text")
         if _INTERNAL_HOST.search(text):
             flag("internal-host", "internal host name")
