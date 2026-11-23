@@ -181,7 +181,9 @@ def _op_mirror(tmp_path, column, value):
     return _op_mirror_table(tmp_path, pa.table(columns))
 
 
-def _op_mirror_table(tmp_path, table, *, store_schema=True, row_group_size=None, footer=None, **writer_options):
+def _op_mirror_table(
+    tmp_path, table, *, store_schema=True, row_group_size=None, footer=None, provenance=None, **writer_options
+):
     """A valid private op-latency mirror holding exactly ``table`` (any Arrow layout the writer accepts).
 
     ``store_schema=False`` writes the file as another producer might: the Arrow schema is not embedded, so a
@@ -235,7 +237,7 @@ def _op_mirror_table(tmp_path, table, *, store_schema=True, row_group_size=None,
                 runtime_path="data/h100_sxm/gemm/vllm/0.11.0/gemm_perf.parquet",
             )
         ],
-        provenance={},
+        provenance=provenance or {},
         evidence_gaps=[],
     )
     manifest_path = f"{directory}/manifest.json"
@@ -1791,6 +1793,32 @@ def test_a_page_index_over_text_columns_is_refused_and_clean_statistics_are_prom
     apply_promotion(plan, root, target)
     assert (target / relative).read_bytes() == (root / relative).read_bytes()
     assert validate_tree(target, repo=PUBLIC, profile="public").ok
+
+
+@pytest.mark.parametrize(
+    ("provenance", "expected"),
+    [
+        ({"image": {"password": 12345}}, {"secret"}),  # a populated numeric credential inside an image configuration
+        ({"image": {"password": "hunter2"}}, {"secret", "image-name"}),  # both rules apply to a string
+        ({"image": {"password": "[REDACTED]"}}, set()),  # a redacted control stays exempt
+        ({"image": ["ghcr.io/acme/benchmark:1"]}, {"image-name"}),  # a plain image list keeps its own rule
+    ],
+    ids=["numeric-credential", "string-credential", "redacted-control", "plain-image-list"],
+)
+def test_a_credential_nested_in_an_image_configuration_keeps_its_own_rule(tmp_path, provenance, expected):
+    table = pa.table({"kernel_source": ["synthetic-kernel"] * 2, "latency_ms": [1.0, 2.0]})
+    root, directory, relative = _op_mirror_table(tmp_path, table, provenance=provenance)
+    manifest = f"{directory}/manifest.json"
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
+    assert {f.code for f in plan.findings if f.path == manifest} == expected
+    public = validate_tree(root, profile="public")
+    assert {f.code for f in public.errors if f.path == manifest} == expected
+    if not expected:
+        assert plan.ok
+        target = _target(tmp_path)
+        apply_promotion(plan, root, target)
+        assert validate_tree(target, repo=PUBLIC, profile="public").ok
 
 
 def test_stored_dictionaries_cover_chunks_and_nested_dictionaries():

@@ -202,15 +202,16 @@ def _walk(value: Any, key: str = "", seen: set[tuple[int, str]] | None = None) -
             # values) so the field-name rules see "password", not "b'password'". Entries stay separate.
             name = k.decode("utf-8") if isinstance(k, bytes) else str(k)
             yield "", name  # content rules apply to keys; field-name rules apply only to their values
-            context = (
-                key
-                if _IMAGE_KEY.search(key)
-                or _PATCH_KEY.search(key)
-                or _RUN_KEY.search(key)
-                or _CREDENTIAL_KEY.search(key)
-                else name
+            inherited = (
+                _IMAGE_KEY.search(key) or _PATCH_KEY.search(key) or _RUN_KEY.search(key) or _CREDENTIAL_KEY.search(key)
             )
-            yield from _walk(v, context, seen)
+            # A value under a ruled key keeps that key's rule. A nested credential field also keeps its own, so a
+            # credential inside an image configuration is judged as a credential (a number is a value too).
+            contexts = [key] if inherited else [name]
+            if inherited and _CREDENTIAL_KEY.search(name):
+                contexts.append(name)
+            for context in contexts:
+                yield from _walk(v, context, seen)
     elif isinstance(value, (list, tuple)):
         for v in value:
             yield from _walk(v, key, seen)
