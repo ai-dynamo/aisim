@@ -809,7 +809,7 @@ pub(crate) struct VllmKvManager {
     /// of the step in flight, as vLLM's count does. The scheduler sets it
     /// when the step before this one is still in flight and the rank is a
     /// grouped prefill or decode rank, or an aggregated rank whose layout
-    /// passes [`GroupedPrefixRules::state_blocks_reach_full_attention`] or
+    /// passes [`GroupedPrefixRules::keeps_in_flight_hold`] or
     /// has no grouped prefix rules: with async scheduling
     /// vLLM forms a step before it processes the outputs of the step before
     /// (v0.33 `vllm/v1/engine/core.py:735`, `:778-793`). On a linear prefill

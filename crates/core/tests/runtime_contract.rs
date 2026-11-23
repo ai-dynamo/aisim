@@ -691,6 +691,210 @@ fn grouped_prefix_state_block_below_the_attention_block_completes_at_the_startup
     }
 }
 
+/// An aggregated vLLM rank in block mode with `groups`, the hash block
+/// `hash`, two batches and a pool of `pages` pages, with a cap of 10 s of
+/// simulated time. Each request is `(id, arrival ms, prompt tokens, output
+/// tokens, prompt tokens shared with the other requests)`: its prompt starts
+/// with the shared tokens 0, 1, 2, ... and goes on with tokens of its own.
+#[allow(clippy::too_many_arguments)]
+fn startup_pool_spec(
+    groups: serde_json::Value,
+    version: &str,
+    hash: u64,
+    max_model_len: u64,
+    budget: u64,
+    max_num_seqs: u64,
+    pages: u64,
+    requests: &[(&str, f64, usize, usize, usize)],
+) -> ReplaySpec {
+    let requests = requests
+        .iter()
+        .enumerate()
+        .map(|(index, &(id, arrival, prompt, output, shared))| {
+            let own = 1_000_000 * (index as u32 + 1);
+            let mut replay_request = request(id, arrival, prompt, output);
+            replay_request.input_token_ids = Some(
+                (0..shared as u32)
+                    .chain(own..own + (prompt - shared) as u32)
+                    .collect(),
+            );
+            replay_request
+        })
+        .collect();
+    let mut spec = aggregated_spec(Backend::Vllm, 1, 0.0, requests);
+    spec.max_sim_time_ms = Some(10_000.0);
+    let rank = &mut spec.engine["rank"];
+    rank["enable_prefix_caching"] = true.into();
+    rank["prefix_match_unit"] = hash.into();
+    rank["vllm_version"] = version.into();
+    rank["max_model_len"] = max_model_len.into();
+    rank["max_num_batched_tokens"] = budget.into();
+    rank["max_num_seqs"] = max_num_seqs.into();
+    rank["kv_cache_capacity_bytes"] = (pages * 64).into();
+    rank["kv_cache_groups"] = groups;
+    spec
+}
+
+/// A prefix-cacheable state group of `block`-token blocks, with a
+/// checkpoint count of 0 where the version takes one.
+fn cacheable_state(block: u64, version: &str) -> serde_json::Value {
+    let mut state = serde_json::json!({"name":"state", "kind":"state", "num_layers":1, "block_size_tokens":block, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":true});
+    if version != "0.31.0" {
+        state["prefill_checkpoint_blocks"] = 0.into();
+    }
+    state
+}
+
+/// Runs `spec` and asserts that every request completes without a
+/// readmission.
+fn assert_completes_without_readmission(spec: ReplaySpec, label: &str) {
+    let requests = spec.requests.len();
+    let report = run_within_60_s(spec);
+    assert_eq!(
+        report.request_counts.completed_requests, requests,
+        "{label}"
+    );
+    assert!(
+        report
+            .per_request
+            .iter()
+            .all(|record| record.readmission_count == 0),
+        "{label}"
+    );
+}
+
+#[test]
+fn grouped_prefix_window_group_above_the_state_block_completes_at_the_startup_count_with_async_scheduling()
+ {
+    // A sliding-window group of 8-token blocks with a window of 16 beside a
+    // state group of 2-token blocks, the hash block 2, no full-attention
+    // group, max_model_len 40 and a budget of 3: the smallest pool that the
+    // configuration accepts is 6 pages, 4 window blocks and 2 state blocks.
+    // One prompt of 32 tokens with 2 output tokens arrives at 0 ms. The layout
+    // has no prefix-cacheable full-attention group, so an aggregated rank
+    // frees the blocks of a step in flight on the computed count, one step
+    // earlier than vLLM, and the request completes without a preemption, as
+    // with one batch. With the hold of vLLM the replay of this request does
+    // not end: the request preempts itself in every life. The cap of 10 s of
+    // simulated time bounds the run.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let groups = serde_json::json!([
+            {"name":"window", "kind":"attention", "num_layers":1, "block_size_tokens":8, "page_size_bytes":64, "sliding_window":16, "prefix_cacheable":true},
+            cacheable_state(2, version),
+        ]);
+        let spec = startup_pool_spec(groups, version, 2, 40, 3, 2, 6, &[("q0", 0.0, 32, 2, 9)]);
+        assert_completes_without_readmission(spec, version);
+    }
+}
+
+#[test]
+fn grouped_prefix_convolution_group_above_the_state_block_completes_at_the_startup_count_with_async_scheduling()
+ {
+    // A convolution group of 8-token blocks with a window of 8 beside a state
+    // group of 2-token blocks, the hash block 2, no full-attention group,
+    // max_model_len 40 and a budget of 3: the smallest pool that the
+    // configuration accepts is 5 pages, 3 convolution blocks and 2 state
+    // blocks. One prompt of 32 tokens with 2 output tokens arrives at 0 ms.
+    // The layout has no prefix-cacheable full-attention group, so an
+    // aggregated rank frees on the computed count, one step earlier than
+    // vLLM, and the request completes without a preemption. With the hold of
+    // vLLM the replay of this request does not end. The cap of 10 s of
+    // simulated time bounds the run.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let groups = serde_json::json!([
+            {"name":"conv", "kind":"convolution", "num_layers":1, "block_size_tokens":8, "page_size_bytes":64, "sliding_window":8, "prefix_cacheable":true},
+            cacheable_state(2, version),
+        ]);
+        let spec = startup_pool_spec(groups, version, 2, 40, 3, 2, 5, &[("q0", 0.0, 32, 2, 9)]);
+        assert_completes_without_readmission(spec, version);
+    }
+}
+
+/// A full-attention group of 4-token blocks, a ring of `ring` tokens and a
+/// state group of 4-token blocks, the hash block 4. The ring makes the
+/// scheduler block `ring`, above the state block, so a hit of a resumed
+/// request ends on a multiple of `ring`. vLLM's startup count is
+/// cdiv(max_model_len, 4) attention blocks, 1 ring block and 2 state blocks
+/// (v0.31 kv_cache_interface.py:1083-1094, v0.32 :1076-1082, v0.33
+/// :1135-1141), `pages`. One prompt of `prompt` tokens with 3 output tokens
+/// arrives at 115 ms, with a budget of 4 tokens and 3 sequences. An
+/// aggregated rank frees on the computed count in this layout, one step
+/// earlier than vLLM, and the request completes without a preemption. With
+/// the hold of vLLM the replay of this request does not end. The cap of 10 s
+/// of simulated time bounds the run.
+fn assert_ring_layout_completes(ring: u64, max_model_len: u64, pages: u64, prompt: usize) {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let groups = serde_json::json!([
+            {"name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":4, "page_size_bytes":64, "prefix_cacheable":true},
+            {"name":"ring", "kind":"state", "num_layers":1, "block_size_tokens":ring, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":false},
+            cacheable_state(4, version),
+        ]);
+        let spec = startup_pool_spec(
+            groups,
+            version,
+            4,
+            max_model_len,
+            4,
+            3,
+            pages,
+            &[("q0", 115.0, prompt, 3, 0)],
+        );
+        assert_completes_without_readmission(spec, version);
+    }
+}
+
+#[test]
+fn grouped_prefix_ring_of_12_above_the_state_block_completes_at_the_startup_count_with_async_scheduling()
+ {
+    // max_model_len 96: 24 attention blocks, 1 ring block and 2 state blocks,
+    // 27 pages, and a prompt of 93 tokens.
+    assert_ring_layout_completes(12, 96, 27, 93);
+}
+
+#[test]
+fn grouped_prefix_ring_of_16_above_the_state_block_completes_at_the_startup_count_with_async_scheduling()
+ {
+    // max_model_len 128: 32 attention blocks, 1 ring block and 2 state
+    // blocks, 35 pages, and a prompt of 125 tokens. vLLM's own scheduler at
+    // v0.31.0, with this layout and pool, max_model_len 128, a budget of 5
+    // and one request of 125 prompt and 3 output tokens, does not complete
+    // the request in 600 engine steps, and every life starts without a hit.
+    assert_ring_layout_completes(16, 128, 35, 125);
+}
+
+#[test]
+fn grouped_prefix_opted_out_attention_group_completes_at_the_startup_count_with_async_scheduling() {
+    // A full-attention group of 3-token blocks with prefix_cacheable: false
+    // beside a state group of 4-token blocks, the hash block 4. The layout
+    // has no prefix-cacheable full-attention group, and its scheduler block
+    // is 12. vLLM's startup count at max_model_len 72 is cdiv(72, 3) = 24
+    // attention blocks and 2 state blocks, 26 (v0.31
+    // kv_cache_interface.py:1083-1094, v0.32 :1076-1082, v0.33 :1135-1141).
+    // A prompt of 70 tokens arrives at 30 ms and one of 68 tokens at 60 ms,
+    // each with 1 output token, with a budget of 7 and 2 sequences. An
+    // aggregated rank frees on the computed count in this layout, one step
+    // earlier than vLLM, and both requests complete without a preemption.
+    // With the hold of vLLM the replay does not end. The cap of 10 s of
+    // simulated time bounds the run.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let groups = serde_json::json!([
+            {"name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":3, "page_size_bytes":64, "prefix_cacheable":false},
+            cacheable_state(4, version),
+        ]);
+        let spec = startup_pool_spec(
+            groups,
+            version,
+            4,
+            72,
+            7,
+            2,
+            26,
+            &[("q0", 60.0, 68, 1, 0), ("q1", 30.0, 70, 1, 0)],
+        );
+        assert_completes_without_readmission(spec, version);
+    }
+}
+
 #[test]
 fn grouped_prefix_request_preempted_after_output_tokens_is_preempted_as_often_as_in_vllm() {
     // GLM-shaped groups of 2,176-token blocks with the hash block 2,176, a

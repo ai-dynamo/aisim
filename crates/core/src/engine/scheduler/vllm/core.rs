@@ -2685,7 +2685,8 @@ impl VllmCore {
         // `sched:175-181`, `:773-775`, v0.32 `sched:186-192`, `:804-806`,
         // v0.33 `sched:189-195`, `:940-942`). The hold without the stop
         // would preempt a request where vLLM waits one step. An aggregated
-        // rank has no connector and frees on the processed count. A grouped
+        // rank has no connector and frees on the processed count in the
+        // layouts named below. A grouped
         // prefill or decode rank frees on it too and has the stop (see
         // `in_flight_requests`). Replay does not model the role of a
         // connector, so a grouped prefill rank has the stop of a `kv_both`
@@ -2697,22 +2698,23 @@ impl VllmCore {
         // rank with cache groups has no offload tier and so no connector. A
         // linear state cache does not use the count: it frees a previous
         // state copy at the next allocation of its request on every rank.
-        // An aggregated rank holds the blocks only in a layout in which every
-        // prefix-cacheable state group has a block at or above the block of
-        // every full-attention group. In another layout, at a pool of exactly
-        // vLLM's startup count, the hold can starve a request: while one
-        // chunk of the request is in flight, its next chunk needs one more
-        // state block than the pool has, so it preempts itself, and its next
-        // life hits the same tokens again, because the full-attention block
-        // of that chunk is not full and has no key. vLLM itself starves the
+        // An aggregated rank holds the blocks only in a layout that
+        // `GroupedPrefixRules::keeps_in_flight_hold` names: no
+        // prefix-cacheable state group, or a prefix-cacheable full-attention
+        // group and every prefix-cacheable state block equal to the scheduler
+        // block. In another layout, at a pool of exactly vLLM's startup
+        // count, the hold can starve a request: it needs one more state block
+        // than the pool has while a step is in flight, preempts itself, and
+        // hits the same tokens in its next life. vLLM itself can starve the
         // request there, and a replay that follows it does not end. So in
         // such a layout an aggregated rank frees on the computed count, one
-        // step earlier than vLLM.
+        // step earlier than vLLM. A grouped prefill or decode rank keeps the
+        // hold in every layout.
         let aggregated_hold = self.args.worker_type == WorkerType::Aggregated
             && self
                 .kv_manager
                 .grouped_prefix_rules()
-                .is_none_or(GroupedPrefixRules::state_blocks_reach_full_attention);
+                .is_none_or(GroupedPrefixRules::keeps_in_flight_hold);
         self.kv_manager.set_previous_pass_in_flight(
             previous_in_flight && (aggregated_hold || self.kv_manager.grouped_transfer().is_some()),
         );

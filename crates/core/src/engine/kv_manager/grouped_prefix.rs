@@ -128,10 +128,9 @@ pub(crate) struct GroupedPrefixRules {
     cacheable_block: usize,
     version: VllmRuleVersion,
     checkpoint: Option<CheckpointRule>,
-    /// Whether every prefix-cacheable state group has a block at or above
-    /// the block of every full-attention group. See
-    /// [`Self::state_blocks_reach_full_attention`].
-    state_blocks_reach_full_attention: bool,
+    /// Whether an aggregated rank holds the blocks of a step in flight. See
+    /// [`Self::keeps_in_flight_hold`].
+    keeps_in_flight_hold: bool,
 }
 
 /// The most groups of one grouped prefix cache: `CacheKey::Grouped` names a
@@ -378,17 +377,16 @@ impl GroupedPrefixRules {
             }
         }
         specs.sort_by_key(|spec| spec.kind != GroupRuleKind::FullAttention);
-        let largest_full_attention_block = rules
+        let has_state = rules.iter().any(|rule| rule.kind == GroupRuleKind::State);
+        let has_full_attention = rules
             .iter()
-            .filter(|rule| rule.kind == GroupRuleKind::FullAttention)
-            .map(|rule| rule.block)
-            .max();
-        let state_blocks_reach_full_attention = largest_full_attention_block.is_none_or(|full| {
-            rules
-                .iter()
-                .filter(|rule| rule.kind == GroupRuleKind::State)
-                .all(|rule| rule.block >= full)
-        });
+            .any(|rule| rule.kind == GroupRuleKind::FullAttention && rule.cacheable);
+        let keeps_in_flight_hold = !has_state
+            || (has_full_attention
+                && rules
+                    .iter()
+                    .filter(|rule| rule.kind == GroupRuleKind::State)
+                    .all(|rule| rule.block == scheduler_block));
         Ok(Self {
             groups: rules,
             specs,
@@ -398,20 +396,32 @@ impl GroupedPrefixRules {
             cacheable_block,
             version,
             checkpoint,
-            state_blocks_reach_full_attention,
+            keeps_in_flight_hold,
         })
     }
 
-    /// Whether every prefix-cacheable state group has a block at or above
-    /// the block of every full-attention group. A ring (a state group with
-    /// `prefix_cacheable: false`) and a sliding-window group do not count,
-    /// and a full-attention group counts with or without
-    /// `prefix_cacheable`. A layout without a prefix-cacheable state group
-    /// or without a full-attention group has it. The scheduler of an
-    /// aggregated rank holds the blocks of a step in flight only in a layout
-    /// that has it.
-    pub(crate) fn state_blocks_reach_full_attention(&self) -> bool {
-        self.state_blocks_reach_full_attention
+    /// Whether an aggregated rank holds the blocks of a step in flight, as
+    /// vLLM does with async scheduling. A layout without a prefix-cacheable
+    /// state group holds them. A layout with one holds them only if it has
+    /// a prefix-cacheable full-attention group and the block of every
+    /// prefix-cacheable state group equals the scheduler block, the least
+    /// common multiple of the blocks of all groups. A ring (a state group
+    /// with `prefix_cacheable: false`), a sliding-window group, a
+    /// convolution group and a full-attention group with
+    /// `prefix_cacheable: false` count only through the scheduler block.
+    ///
+    /// The reason: without hits inside a block, a preempted request keeps
+    /// cache hits only up to a multiple of the scheduler block, so a state
+    /// group with a smaller block loses the progress inside that block. With
+    /// the hold, a request can then need one more state block than a pool of
+    /// vLLM's startup count has, preempt itself, and hit the same tokens in
+    /// its next life. vLLM itself can starve such a request, and a replay
+    /// that follows it does not end. A layout without a prefix-cacheable
+    /// full-attention group can starve a request in the same way. In every
+    /// other layout an aggregated rank frees on the computed count, one step
+    /// earlier than vLLM.
+    pub(crate) fn keeps_in_flight_hold(&self) -> bool {
+        self.keeps_in_flight_hold
     }
 
     /// The pool blocks that vLLM's startup check reserves for one request of

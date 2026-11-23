@@ -6155,57 +6155,47 @@ fn convolution_group_keeps_one_block_before_the_replay_boundary() {
 }
 
 #[test]
-fn state_blocks_reach_full_attention_in_each_kind_of_layout() {
-    // Every prefix-cacheable state group must have a block at or above the
-    // block of every full-attention group. A ring and a sliding-window group
-    // do not count, and a full-attention group counts also when it opts out
-    // of prefix caching. Each layout lists its groups, its hash block and the
-    // answer.
-    let mut opted_out_full = attention("full_16", 16, None);
-    opted_out_full.prefix_cacheable = Some(false);
-    let cases: [(&str, Vec<FpmCacheGroup>, usize, bool); 8] = [
+fn keeps_in_flight_hold_in_each_kind_of_layout() {
+    // A layout without a prefix-cacheable state group keeps the hold. A
+    // layout with one keeps it only if it has a prefix-cacheable
+    // full-attention group and every prefix-cacheable state block equals the
+    // scheduler block, the least common multiple of the blocks of all
+    // groups. Each layout lists its groups, its hash block, its scheduler
+    // block in the label, and the answer.
+    let opted_out = |name: &str, block: u32| {
+        let mut group = attention(name, block, None);
+        group.prefix_cacheable = Some(false);
+        group
+    };
+    let mut convolution = attention("conv", 8, Some(8));
+    convolution.kind = FpmCacheKind::Convolution;
+    let cases: [(&str, Vec<FpmCacheGroup>, usize, bool); 16] = [
         (
-            "equal blocks",
-            vec![attention("full", 8, None), state("s", 8, true, false)],
-            8,
-            true,
-        ),
-        (
-            "state block above",
-            vec![attention("full", 8, None), state("s", 16, true, false)],
-            8,
-            true,
-        ),
-        (
-            "state block below",
-            vec![attention("full", 8, None), state("s", 2, true, false)],
-            2,
-            false,
-        ),
-        (
-            "state block below the larger of two full-attention blocks",
-            vec![
-                attention("full_4", 4, None),
-                state("s", 4, true, false),
-                attention("full_8", 8, None),
-            ],
-            4,
-            false,
-        ),
-        (
-            "no state group",
+            "no state group (8)",
             vec![attention("full_8", 8, None), attention("full_4", 4, None)],
             4,
             true,
         ),
         (
-            "no full-attention group",
-            vec![attention("window", 8, Some(16)), state("s", 2, true, false)],
-            2,
+            "no state group, a window group only (8)",
+            vec![attention("window", 8, Some(16))],
+            8,
             true,
         ),
         (
-            "ring below equal blocks",
+            "equal blocks (8)",
+            vec![attention("full", 8, None), state("s", 8, true, false)],
+            8,
+            true,
+        ),
+        (
+            "state block above the full-attention block (16)",
+            vec![attention("full", 8, None), state("s", 16, true, false)],
+            8,
+            true,
+        ),
+        (
+            "ring below equal blocks (8)",
             vec![
                 attention("full", 8, None),
                 state("ring", 4, false, false),
@@ -6215,9 +6205,85 @@ fn state_blocks_reach_full_attention_in_each_kind_of_layout() {
             true,
         ),
         (
-            "full-attention group without prefix caching above the state block",
+            "state block below the full-attention block (8)",
+            vec![attention("full", 8, None), state("s", 2, true, false)],
+            2,
+            false,
+        ),
+        (
+            "state block below the larger of two full-attention blocks (8)",
             vec![
-                opted_out_full,
+                attention("full_4", 4, None),
+                state("s", 4, true, false),
+                attention("full_8", 8, None),
+            ],
+            4,
+            false,
+        ),
+        (
+            "two state blocks, one below the other (8)",
+            vec![
+                attention("full", 4, None),
+                state("s_4", 4, true, false),
+                state("s_8", 8, true, false),
+            ],
+            4,
+            false,
+        ),
+        (
+            "state and ring only (2)",
+            vec![state("ring", 2, false, false), state("s", 2, true, false)],
+            2,
+            false,
+        ),
+        (
+            "no prefix-cacheable full-attention group, a window group (8)",
+            vec![attention("window", 8, Some(16)), state("s", 2, true, false)],
+            2,
+            false,
+        ),
+        (
+            "no prefix-cacheable full-attention group, a convolution group (8)",
+            vec![convolution.clone(), state("s", 2, true, false)],
+            2,
+            false,
+        ),
+        (
+            "an opted-out full-attention group only, at the state block (4)",
+            vec![opted_out("full", 4), state("s", 4, true, false)],
+            4,
+            false,
+        ),
+        (
+            "an opted-out full-attention group only, below the state block (12)",
+            vec![opted_out("full", 3), state("s", 4, true, false)],
+            4,
+            false,
+        ),
+        (
+            "state block below the scheduler block by a ring of 12 (12)",
+            vec![
+                attention("full", 4, None),
+                state("ring", 12, false, false),
+                state("s", 4, true, false),
+            ],
+            4,
+            false,
+        ),
+        (
+            "state block below the scheduler block by a window group (8)",
+            vec![
+                attention("full", 2, None),
+                attention("window", 8, Some(16)),
+                state("s", 2, true, false),
+            ],
+            2,
+            false,
+        ),
+        (
+            "state block below the scheduler block by an opted-out group (16)",
+            vec![
+                opted_out("full_16", 16),
                 attention("full_4", 4, None),
                 state("s", 4, true, false),
             ],
@@ -6227,14 +6293,23 @@ fn state_blocks_reach_full_attention_in_each_kind_of_layout() {
     ];
     for (label, groups, hash, expected) in cases {
         assert_eq!(
-            rules(&groups, hash).state_blocks_reach_full_attention(),
+            rules(&groups, hash).keeps_in_flight_hold(),
             expected,
             "{label}"
         );
     }
+    // A state block below the scheduler block by a convolution group, beside
+    // a full-attention group at the state block (8).
+    let groups = vec![
+        attention("full", 2, None),
+        convolution,
+        state("s", 2, true, false),
+    ];
+    assert!(!rules(&groups, 2).keeps_in_flight_hold());
     // The GLM-5.3-Flash layout: MLA and four state groups of 2,176-token
-    // blocks and a 4-token ring, at the hash block 2,176 and at a hash block
-    // of 4, with and without a checkpoint block where the version takes one.
+    // blocks and a 4-token ring, so the scheduler block is 2,176, at the hash
+    // block 2,176 and at a hash block of 4, with and without a checkpoint
+    // block where the version takes one.
     for (version, checkpoint) in [
         (VllmRuleVersion::V0_31_0, false),
         (VllmRuleVersion::V0_32_0, false),
@@ -6244,7 +6319,7 @@ fn state_blocks_reach_full_attention_in_each_kind_of_layout() {
     ] {
         for hash in [GLM_BLOCK as usize, 4] {
             assert!(
-                rules_glm_hash(version, checkpoint, hash).state_blocks_reach_full_attention(),
+                rules_glm_hash(version, checkpoint, hash).keeps_in_flight_hold(),
                 "{} {checkpoint} {hash}",
                 version.label()
             );

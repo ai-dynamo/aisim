@@ -6507,15 +6507,16 @@ fn grouped_prefix_decode_crossing_holds_the_previous_state_block_for_two_passes_
 }
 
 #[test]
-fn grouped_prefix_aggregated_rank_holds_the_previous_state_block_only_if_no_state_block_is_below_a_full_attention_block()
+fn grouped_prefix_aggregated_rank_holds_the_previous_state_block_only_if_the_state_block_equals_the_scheduler_block()
  {
     // The sequence of the decode crossing test above, with two batches, in
-    // two layouts. With full-attention and state blocks of 4 tokens the rank
-    // holds the state block of index 0 one step longer, as vLLM does: the
-    // active blocks are 2, 4, 4 and 3, and the processed counts 0, 0, 4 and
-    // 5, the values of that test. With a full-attention block of 8 tokens the
-    // state block of 4 tokens lies below it, so the rank frees on the
-    // computed count: the processed counts are 0, 4, 5 and 6, as with one
+    // two layouts. With full-attention and state blocks of 4 tokens the state
+    // block equals the scheduler block, and the rank holds the state block of
+    // index 0 one step longer, as vLLM does: the active blocks are 2, 4, 4
+    // and 3, and the processed counts 0, 0, 4 and 5, the values of that test.
+    // With a full-attention block of 8 tokens the state block of 4 tokens lies
+    // below the scheduler block of 8, so the rank frees on the computed
+    // count: the processed counts are 0, 4, 5 and 6, as with one
     // batch, and the block of index 0 goes in pass 2. X then holds one
     // attention block, so the active blocks are 2, 3, 2 and 2. vLLM would
     // hold the block in pass 2 in this layout too, with the active blocks
@@ -6929,6 +6930,88 @@ fn grouped_prefill_and_decode_ranks_hold_the_state_blocks_of_an_aggregated_rank_
                 assert_eq!(peaks, expected, "{label}");
                 assert_eq!(core.mocker_metrics().vllm_preemptions_total, 0, "{label}");
             }
+        }
+    }
+}
+
+#[test]
+fn grouped_prefill_and_decode_ranks_hold_the_state_blocks_where_an_aggregated_rank_does_not() {
+    // A full-attention block of 8 tokens beside a state block of 4 tokens,
+    // the hash block 4, chunks of 4 tokens and a pool of 20 pages. A decode
+    // and an aggregated rank compute a local prompt of 13 tokens, and a
+    // prefill rank the 13 tokens of a 14-token source, in chunks that end at
+    // 4, 8, 12 and 13. The chunks to 8, 12 and 13 each cross a state block
+    // boundary. vLLM frees the state block of index i at the first allocation
+    // whose processed count lies above (i + 1) * 4 (v0.31 single:687-725,
+    // :1626-1675, v0.32 :672-710, :1592-1641, v0.33 :682-720, :1608-1657),
+    // on a worker of every role (v0.31 kv_cache_manager.py:549-556, v0.32
+    // :552-559, v0.33 :561-568). With one batch the processed counts of the
+    // four passes are 0, 4, 8 and 12. The pass to 4 holds 1 attention block
+    // and 1 state block: 2. The pass to 8 holds the blocks of index 0 and 1:
+    // 3. The pass to 12 frees the block of index 0 and takes a second
+    // attention block: 2 and 2, 4. The pass to 13 frees the block of index 1:
+    // 4. With async scheduling the processed counts are 0, 0, 4 and 8, as in
+    // vLLM, on a prefill and a decode rank: the pass to 12 holds the blocks of
+    // index 0, 1 and 2, 5, and the pass to 13 frees the block of index 0 and
+    // holds the blocks of index 1, 2 and 3, 5. An aggregated rank frees on the
+    // computed count in this layout, because the state block lies below the
+    // scheduler block of 8, so it takes the blocks of one batch with two
+    // batches too, one step earlier than vLLM. The pool holds every pass, so
+    // no allocation fails.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        for (max_concurrent_batches, worker_type, flags, expected) in [
+            (1, WorkerType::Prefill, [false; 4], [2, 3, 4, 4]),
+            (1, WorkerType::Decode, [false; 4], [2, 3, 4, 4]),
+            (1, WorkerType::Aggregated, [false; 4], [2, 3, 4, 4]),
+            (
+                2,
+                WorkerType::Prefill,
+                [false, true, true, true],
+                [2, 3, 5, 5],
+            ),
+            (
+                2,
+                WorkerType::Decode,
+                [false, true, true, true],
+                [2, 3, 5, 5],
+            ),
+            (2, WorkerType::Aggregated, [false; 4], [2, 3, 4, 4]),
+        ] {
+            let label = format!("{version} {max_concurrent_batches} {worker_type:?}");
+            let mut groups = full_and_state_transfer_groups();
+            groups[0].block_size_tokens = 8;
+            groups[1].block_size_tokens = 4;
+            if version != "0.31.0" {
+                groups[1].prefill_checkpoint_blocks = Some(0);
+            }
+            let mut args = prefix_core(groups, 20 * 100, 4, 4, version).args;
+            args.worker_type = worker_type;
+            args.max_concurrent_batches = max_concurrent_batches;
+            if worker_type == WorkerType::Prefill {
+                args.kv_transfer_bandwidth = Some(1.0);
+            }
+            let mut core = VllmCore::new(args);
+            if worker_type == WorkerType::Prefill {
+                core.apply_command(SchedulerCommand::SubmitHandoffPrefill {
+                    handoff_id: HandoffId::new(Uuid::from_u128(1902)),
+                    request: source_request(1901, 14),
+                })
+                .unwrap();
+            } else {
+                submit(&mut core, 1901, 13, 1);
+            }
+            let mut now = 0.0;
+            let mut seen_flags = Vec::new();
+            let mut peaks = Vec::new();
+            for _ in 0..4 {
+                block_pool(&core).reset_peak_active_blocks();
+                async_step(&mut core, &mut now);
+                seen_flags.push(core.kv_manager.previous_pass_in_flight());
+                peaks.push(block_pool(&core).peak_active_blocks());
+            }
+            assert_eq!(seen_flags, flags, "{label}");
+            assert_eq!(peaks, expected, "{label}");
+            assert_eq!(core.mocker_metrics().vllm_preemptions_total, 0, "{label}");
         }
     }
 }
