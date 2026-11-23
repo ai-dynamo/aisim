@@ -1574,6 +1574,10 @@ def _global_warmup(payload):
     payload["measurement_protocol"]["preparation"]["warmup_iterations"] = 5
 
 
+def _warmup_history_of_another_status(payload):
+    payload["warmup_evidence"]["status"] = "pending"
+
+
 def _unobserved_is_text(payload):
     payload["measurement_protocol"]["unobserved"] = "kv_cache_tensors"
 
@@ -1602,6 +1606,13 @@ def _raw_sample_without_its_sample_record(payload):
             _global_warmup,
             "measurement_protocol must describe unobserved inputs",
             id="unobserved-inputs-before-the-global-warmup",
+        ),
+        pytest.param(
+            _global_warmup,
+            _warmup_history_of_another_status,
+            "measurement_protocol.preparation.warmup_iterations must be 0 for the GLM-5.3-Flash producer: "
+            "expected 0, found 5",
+            id="global-warmup-before-the-warmup-history",
         ),
         pytest.param(
             _eleven_expected_samples,
@@ -2035,8 +2046,10 @@ def test_reader_takes_the_producer_digests_of_a_receipt(tmp_path):
         ({"plan_sha256": "0" * 64}, "plan", "plan_sha256", PLAN_SHA256),
         ({"cell_id": "fpm-other"}, "cell", "cell_id", None),
         ({"attempt_id": "a2"}, "attempt", "attempt_id", ATTEMPT_ID),
+        # A receipt of another plan, cell and attempt names the plan, the first binding that the reader compares.
+        ({"plan_sha256": "0" * 64, "cell_id": "fpm-other", "attempt_id": "a2"}, "plan", "plan_sha256", PLAN_SHA256),
     ],
-    ids=["plan", "cell", "attempt"],
+    ids=["plan", "cell", "attempt", "plan-cell-and-attempt"],
 )
 def test_receipt_of_another_plan_cell_or_attempt_is_refused(tmp_path, change, name, key, expected):
     cell = _cell_of_another_producer_revision(tmp_path)
