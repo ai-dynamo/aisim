@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +13,14 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def _clean_environment() -> dict[str, str]:
+    """A minimal environment that still lets an interpreter with a shared libpython start (CI toolcache builds)."""
+    env = {"PYTHONHASHSEED": "0"}
+    if os.environ.get("LD_LIBRARY_PATH"):
+        env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
+    return env
 
 
 def test_data_library_comes_from_the_evaluator_when_the_wheel_lacks_it(tmp_path: Path) -> None:
@@ -33,7 +42,7 @@ def test_data_library_comes_from_the_evaluator_when_the_wheel_lacks_it(tmp_path:
         capture_output=True,
         text=True,
         check=False,
-        env={"PYTHONHASHSEED": "0"},
+        env=_clean_environment(),
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok"
@@ -60,7 +69,7 @@ def test_a_historical_wheel_sdk_is_aliased_and_never_replaced_by_the_checkout(tm
         capture_output=True,
         text=True,
         check=False,
-        env={"PYTHONHASHSEED": "0"},
+        env=_clean_environment(),
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok"
