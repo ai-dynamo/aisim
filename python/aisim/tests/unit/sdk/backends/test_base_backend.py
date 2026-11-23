@@ -1707,3 +1707,59 @@ def test_run_agg_rejects_chunked_visual_qualified_mamba(
             ),
             ctx_tokens=512,
         )
+
+
+@pytest.mark.parametrize("xpu", [False, True])
+@pytest.mark.parametrize("budget,scheduled,new_tokens,prefills", [(2048, 1096, 1096, 1), (6000, 5192, 2192, 2)])
+def test_qualified_mamba_aggregate_translates_capacity_before_native_validation(
+    monkeypatch, xpu, budget, scheduled, new_tokens, prefills
+):
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.backends.vllm_backend_xpu import VLLMXPUBackend
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.operations import ElementWise, Mamba2Kernel
+    from aisim_core.sdk.perf_database import get_database_view
+
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL", allow_unlisted_version=True)
+    assert database is not None
+    model = get_model("Qwen/Qwen3-0.6B", ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1), "vllm")
+    model.context_ops = [
+        Mamba2Kernel(
+            "context_scan",
+            1,
+            "mamba_chunk_scan_combined",
+            "context",
+            4096,
+            64,
+            64,
+            128,
+            4,
+            4,
+            128,
+            state_dtype="float16",
+        ),
+        ElementWise("norm", 1, 1, 0),
+    ]
+    model.generation_ops = []
+    backend = VLLMXPUBackend() if xpu else get_backend("vllm")
+    monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+    if xpu:
+        monkeypatch.setattr(backend, "_max_kv_slots", lambda *a, **k: 100)
+    runtime = RuntimeConfig(batch_size=4, isl=4096, prefix=3000, osl=128)
+    summary = backend.run_agg(model, database, runtime, ctx_tokens=budget)
+    mixed = summary.get_step_estimates()["mixed"]
+    assert mixed.context_tokens == scheduled
+    assert summary.get_step_estimates()["scheduling"]["mix_context_token_budget"] == budget
+    # Hand-derived SOL traffic: 18,560 activation bytes per new token,
+    # one 1 MiB state read/write per prefill, and 2 bytes per norm token.
+    bw = database.system_spec["gpu"]["mem_bw"]
+    assert mixed.per_op_latency_ms["context_scan"] == pytest.approx(
+        (new_tokens * 18_560 + prefills * 2_097_152) / bw * 1000
+    )
+    assert mixed.per_op_latency_ms["norm"] == pytest.approx(
+        (new_tokens + mixed.num_decode_query_tokens) * 2 / bw * 1000
+    )
+    # Public scheduled input keeps the strict boundary instead of silently
+    # converting the same invalid shape as if it were scheduler capacity.
+    with pytest.raises(ValueError, match="partial prefill extend"):
+        backend.run_mixed(model, database, runtime, MixedStepInput(budget, 2))

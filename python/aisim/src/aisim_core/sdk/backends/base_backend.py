@@ -2011,7 +2011,18 @@ class BaseBackend:
                     max(1, runtime_config.batch_size - step.num_decode_requests),
                 ),
             )
+        else:
+            step = self._schedule_qualified_mamba_prefill(model, runtime_config, step)
         return self.run_mixed(model, database, runtime_config, step)
+
+    def _schedule_qualified_mamba_prefill(self, model, runtime_config, step: MixedStepInput) -> MixedStepInput:
+        """Drop unused aggregate capacity before querying a scheduled Mamba step."""
+        if not _is_fpm_model(model) and runtime_config.prefix > 0 and _has_qualified_mamba(model):
+            isl = runtime_config.isl + self._visual_context_tokens(model, runtime_config)
+            if isl > runtime_config.prefix:
+                full, partial = divmod(step.context_tokens, isl)
+                step = dataclasses.replace(step, context_tokens=full * isl + min(partial, isl - runtime_config.prefix))
+        return step
 
     def run_agg(
         self, model: BaseModel, database: PerfDatabase, runtime_config: RuntimeConfig, **kwargs
@@ -2232,6 +2243,18 @@ class BaseBackend:
                 num_genonly_steps = decode_iterations - num_mix_steps
                 num_genonly_tokens = b
                 num_mix_steps_for_tpot_calc = self._tpot_mix_steps(num_mix_steps)
+        # FPM prices fresh-token requests, rather than ceil(input budget/isl).
+        # Save the executed counts before an averaged query loses its coordinate.
+        fpm_request_counts = None
+        if _is_fpm_model(model) and isl > prefix:
+            fpm_request_counts = (
+                (1, 0)
+                if b == 1
+                else (
+                    math.ceil(mix_step_estimate.context_tokens / (isl - prefix)),
+                    mix_step_estimate.num_decode_requests,
+                )
+            )
         # Native FPM may also average several uncached chunks inside one
         # run_mixed call. Neither kind of mean is a single query coordinate.
         averages_mixed_shapes = averages_text_chunks or (
@@ -2346,6 +2369,7 @@ class BaseBackend:
         if b == 1:
             num_ctx_requests = 1
             num_gen_requests = 1
+        reported_ctx_requests, reported_gen_requests = fpm_request_counts or (num_ctx_requests, num_gen_requests)
 
         # correct output_throughput and concurrency for attention dp (global batch)
         scale_factor = model.config.pp_size * model.config.attention_dp_size
@@ -2460,11 +2484,11 @@ class BaseBackend:
             "comm": comm,
             "memory": mem,
             "balance_score": balance_score,
-            "num_ctx_reqs": num_ctx_requests,
-            "num_gen_reqs": num_gen_requests,
+            "num_ctx_reqs": reported_ctx_requests,
+            "num_gen_reqs": reported_gen_requests,
             "num_tokens": num_tokens,
             "ctx_tokens": ctx_tokens,
-            "gen_tokens": num_gen_requests,
+            "gen_tokens": reported_gen_requests,
             "backend": database.backend,
             "version": database.version,
             "system": database.system,

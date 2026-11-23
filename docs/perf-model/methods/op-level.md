@@ -51,11 +51,15 @@ constructed directly through the native API, so a short final chunk
 pays a full recurrent-state charge. Unqualified batched cold graphs retain the
 existing XPU scaling heuristic. For a single text request, `run_agg` already
 sums its actual chunk prices and XPU TTFT uses that total directly.
-The aggregate scheduler reserves decode slots from the full token capacity
+The aggregate scheduler reserves `nextn + 1` query-token slots per decoder from the full token capacity
 before capping prefill by the batch's demand. Whole-model FPM demand counts
 uncached tokens; op-level demand uses full prompt coordinates. The fitted XPU
 burst factor keeps its full-prompt denominator (`isl`), including for FPM:
 changing the query's token coordinates does not recalibrate the fit.
+Qualified Mamba mixed-step queries reject a partial prefill extend longer than
+one request's uncached suffix instead of dropping its excess tokens. Aggregate
+callers first translate their capacity to a scheduled shape, leaving excess
+space unused. Complete prompts retain their packed prefix coordinates.
 
 Single-request op-level aggregates with visual tokens reject chunked prefill
 when either phase contains qualified Mamba. The visual mean-field schedule
@@ -84,6 +88,9 @@ comes from the executed `StepEstimate`, after budget translation (for example,
 retains its scheduling weights and latency, but omits `mix_context_tokens` and
 the raw `mixed` step entry: the mean has no single query coordinate. Its
 aggregate energy step likewise leaves `context_tokens` at zero.
+FPM result rows report `num_ctx_reqs` and `num_gen_reqs` from that executed
+schedule. The input `ctx_tokens` capacity and activation-memory reservation
+remain separate from those execution counts.
 
 ### Context-attention measurement boundaries
 

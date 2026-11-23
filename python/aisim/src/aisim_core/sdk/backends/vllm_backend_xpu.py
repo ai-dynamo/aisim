@@ -379,7 +379,7 @@ class VLLMXPUBackend(VLLMBackend):
         if getattr(model, "forward_model", "op_level") == "fpm":
             request_tokens = max(1, isl - int(runtime_config.prefix or 0))
         demand = max(1, int(getattr(runtime_config, "batch_size", 1) or 1)) * request_tokens
-        budget = max(1, step.context_tokens - step.num_decode_requests)
+        budget = max(1, step.context_tokens - step.num_decode_requests * (model._nextn + 1))
         if getattr(model, "forward_model", "op_level") == "fpm" and runtime_config.batch_size > 1:
             budget = self._fpm_aggregate_prefill_tokens(
                 budget,
@@ -388,4 +388,5 @@ class VLLMXPUBackend(VLLMBackend):
                 max(1, runtime_config.batch_size - step.num_decode_requests),
             )
         step = replace(step, context_tokens=max(1, min(demand, budget)))
+        step = self._schedule_qualified_mamba_prefill(model, runtime_config, step)
         return super().run_mixed(model, database, runtime_config, step)

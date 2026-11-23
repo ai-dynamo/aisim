@@ -10,7 +10,7 @@
 //! `_run_context_phase` / `_run_generation_phase`) but executes a precompiled
 //! [`EngineSpec`] — Python no longer walks the op list per call. The per-phase
 //! op iteration is the shared logic in [`crate::session`]
-//! ([`run_context_ops`] / [`run_generation_ops_step`]); the `Engine` wraps the
+//! (`run_context_ops_planned` / [`run_generation_ops_step`]); the `Engine` wraps the
 //! stride quadrature and the `(nextn + 1)` decode-batch multiplier around it.
 //!
 //! The `Engine` is pure-Rust internals; its PyO3 bindings (`run_static`,
@@ -2759,14 +2759,22 @@ impl Engine {
         // Qualified Mamba and the shared token-major ops compute the same new
         // prefill tokens. Cache the graph classification in the plan and split
         // the budget once per step, rather than once per Mamba operation.
-        let mamba_prefill = self.mix_plan.qualified_mamba.then(|| {
+        let mamba_prefill = if self.mix_plan.qualified_mamba {
             let per_request = isl.saturating_sub(prefix).max(1);
-            let (mut full, mut partial) = (ctx_tokens / isl, (ctx_tokens % isl).min(per_request));
+            let (mut full, mut partial) = (ctx_tokens / isl, ctx_tokens % isl);
+            if partial > per_request {
+                return Err(AicError::InvalidEngineConfig(format!(
+                    "qualified Mamba partial prefill extend ({partial}) exceeds \
+                     one request's uncached length ({per_request})"
+                )));
+            }
             if partial == per_request {
                 (full, partial) = (full + 1, 0);
             }
-            (full, partial, per_request)
-        });
+            Some((full, partial, per_request))
+        } else {
+            None
+        };
         let shared_tokens = match mamba_prefill {
             Some((full, partial, length)) => (full * length + partial)
                 .checked_add(decode_query_tokens)
@@ -2788,8 +2796,8 @@ impl Engine {
                 // `ctx_tokens` packs `floor(ctx/isl)` complete requests (each
                 // `isl - prefix` new tokens) plus one request's partial extend,
                 // the `ceil(ctx/isl)` requests that context attention prices.
-                // `run_agg` passes its budget here, so the extend never exceeds
-                // one request's `isl - prefix` new tokens and never adds requests.
+                // Aggregate callers translate their capacity to this scheduled
+                // shape first, capping unused space at the uncached suffix.
                 // shortcut: sum uniform timing rows until variable-length batches are
                 // calibrated; this can overcount launch overhead for ragged batches.
                 // A partial extend as long as a full request joins its batch: one
@@ -4022,7 +4030,7 @@ impl Engine {
     /// consumes ALREADY-PACKED telemetry: the FPM fields are the observed
     /// per-iteration counts, so the `(nextn + 1)` MTP multiplier is NOT applied
     /// here (it is already baked into the scheduled-decode counts the engine
-    /// emitted). The dispatch reuses the shared [`run_context_ops`] /
+    /// emitted). The dispatch reuses the shared `run_context_ops_planned` /
     /// [`run_generation_ops_step`] / [`get_mix_step_ops`] free fns so this path
     /// and the live engine-step path stay numerically identical.
     pub fn forward_pass_time_ms(
@@ -4249,7 +4257,7 @@ impl Engine {
     /// Dispatch one rank's FPM on its scheduled workload. Literal port of
     /// `SessionEstimator::rank_latency_ms` (520dcfff `session.rs:308`):
     /// prefill+decode -> mix step ([`get_mix_step_ops`]); prefill-only ->
-    /// [`run_context_ops`]; decode-only -> [`run_generation_ops_step`]. The FPM
+    /// `run_context_ops_planned`; decode-only -> [`run_generation_ops_step`]. The FPM
     /// counts pass through unscaled (no `nextn` multiplier — see
     /// [`Self::forward_pass_time_ms`]). With diagnostics, a whole-model FPM
     /// rank records its direct lookups and an operation graph its operations;
@@ -5379,14 +5387,14 @@ pub(crate) mod tests {
             spec.engine.database_mode = DatabaseMode::Sol;
             let engine = Engine::build(spec, Arc::clone(&db)).unwrap();
             for (ctx, new_tokens) in [
-                (6000, 2192),
+                (5192, 2192),
                 (5000, 2000),
-                (2048, 1096),
+                (1096, 1096),
                 (8192, 2192),
                 (0, 0),
             ] {
                 // Two width-four decode requests add eight shared tokens.
-                // The 6000-token budget schedules two 1096-token cached
+                // The 5192-token shape schedules two 1096-token cached
                 // suffixes: exactly 2200 norm tokens, never 3008.
                 let norm_tokens = if qualified {
                     new_tokens + 8
@@ -5413,6 +5421,55 @@ pub(crate) mod tests {
                 assert_eq!(shared.iter().find(|op| op.0 == "norm").unwrap().1, norm_ms);
             }
         }
+    }
+
+    #[test]
+    fn qualified_mamba_rejects_overlong_partial_prefill_before_querying_ops() {
+        let mut spec = EngineSpec::new(
+            fixture_engine_config(None),
+            vec![qualified_mamba(true, 1)],
+            vec![],
+        );
+        spec.engine.database_mode = DatabaseMode::Sol;
+        let engine = Engine::build(spec, build_engine(None).db).unwrap();
+        // A 100-token prompt with 60 cached tokens can extend at most 40
+        // tokens. Test both a lone partial request and one after a full prompt.
+        for ctx in [41, 99, 141, 150, 199] {
+            let mut queried = false;
+            let error = engine
+                .mixed_step_breakdown_with(ctx, 1, 100, 2, 60, 1.0, 1.0, |_, _, _| {
+                    queried = true;
+                })
+                .unwrap_err();
+            assert!(matches!(error, AicError::InvalidEngineConfig(_)));
+            assert!(error.to_string().contains("partial prefill extend"));
+            assert!(!queried, "invalid input must fail before executing an op");
+            assert!(
+                engine
+                    .mixed_step_latency(ctx, 1, 100, 2, 60, 1.0, 1.0)
+                    .is_err()
+            );
+            assert!(
+                engine
+                    .mixed_step_breakdown_per_op(ctx, 1, 100, 2, 60, 1.0, 1.0)
+                    .is_err()
+            );
+        }
+        // At or below the suffix boundary the scheduled input remains valid.
+        for ctx in [39, 40, 100, 139, 140, 200] {
+            assert!(
+                engine
+                    .mixed_step_latency(ctx, 1, 100, 2, 60, 1.0, 1.0)
+                    .is_ok()
+            );
+        }
+        // Unqualified graphs retain their legacy partial-extend contract.
+        let legacy = build_engine(None);
+        assert!(
+            legacy
+                .mixed_step_latency(150, 1, 100, 2, 60, 1.0, 1.0)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -5469,15 +5526,14 @@ pub(crate) mod tests {
         };
         // (ctx, isl, prefix, prefill requests, new tokens): `ceil(ctx/isl)`
         // requests, as context attention prices them. A partially cached chunk;
-        // a complete cached request plus a partial extend capped at its 1096 new
-        // tokens; a budget above one request's new tokens (`run_agg` with one
-        // request: 1096 tokens, never a second state); two complete requests;
+        // a complete cached request plus a partial extend at its 1096 new
+        // tokens; a single complete uncached suffix; two complete requests;
         // and no prefill.
         for (ctx, isl, prefix, requests, new_tokens) in [
             (512, 4096, 1024, 1, 512),
-            (6000, 4096, 3000, 2, 2192),
-            (8128, 4096, 1024, 2, 6144),
-            (2048, 4096, 3000, 1, 1096),
+            (5192, 4096, 3000, 2, 2192),
+            (7168, 4096, 1024, 2, 6144),
+            (1096, 4096, 3000, 1, 1096),
             (8192, 4096, 3000, 2, 2192),
             (0, 4096, 1024, 0, 0),
         ] {
@@ -5516,10 +5572,10 @@ pub(crate) mod tests {
                 "telemetry chunk={ctx}"
             );
         }
-        // A partial extend as long as a full request joins its batch: 6000 tokens
+        // A partial extend as long as a full request joins its batch: 5192 tokens
         // at isl 4096 and prefix 3000 are one (2, 1096) query, as packed telemetry
         // prices them. A shorter extend keeps its own query: (1, 1096) + (1, 904).
-        for (ctx, prefix, queries) in [(6000, 3000, 1), (8128, 1024, 1), (5000, 3000, 2)] {
+        for (ctx, prefix, queries) in [(5192, 3000, 1), (7168, 1024, 1), (5000, 3000, 2)] {
             let mut seen = 0;
             engine
                 .mixed_step_breakdown_with(ctx, 2, 4096, 1, prefix, 1.0, 1.0, |pass, _, _| {

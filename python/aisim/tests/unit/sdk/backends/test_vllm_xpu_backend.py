@@ -370,9 +370,9 @@ def test_agg_run_mixed_reserves_decode_slots_from_the_budget(monkeypatch) -> Non
     backend = VLLMXPUBackend()
     captured = {}
     _capture_mixed_step(monkeypatch, captured)
-    rc = SimpleNamespace(isl=100, osl=100, batch_size=16)
+    rc = SimpleNamespace(isl=100, osl=100, prefix=0, batch_size=16)
     step = MixedStepInput(context_tokens=1000, num_decode_requests=50)
-    backend.run_agg(MagicMock(), MagicMock(), rc, step=step)
+    backend.run_agg(MagicMock(_nextn=0), MagicMock(), rc, step=step)
     # steady_running = round(1000*100/200)=500; cap = min(500, 3) = 3.
     assert captured["step"].num_decode_requests == 3
     assert captured["step"].context_tokens == 1000 - 3
@@ -445,11 +445,11 @@ def test_direct_run_mixed_is_independent_of_call_history(monkeypatch) -> None:
         return "summary"
 
     monkeypatch.setattr(VLLMBackend, "run_agg", fake_base_run_agg)
-    rc = SimpleNamespace(isl=1024, osl=128)
+    rc = SimpleNamespace(isl=1024, osl=128, prefix=0)
     step = MixedStepInput(context_tokens=1000, num_decode_requests=4)
 
     first = backend.run_mixed(MagicMock(), MagicMock(), rc, step)
-    backend.run_agg(MagicMock(), MagicMock(), rc, ctx_tokens=8192)  # agg sweep in between
+    backend.run_agg(MagicMock(_nextn=0), MagicMock(), rc, ctx_tokens=8192)  # agg sweep in between
     second = backend.run_mixed(MagicMock(), MagicMock(), rc, step)
     assert first == second == step
     assert [c for c in captured_direct if c == step] == [step, step]
@@ -502,7 +502,7 @@ def test_batched_ttft_caps_prefill_after_reserving_decode(monkeypatch, forward_m
     backend = VLLMXPUBackend()
     backend._in_agg = True
     runtime = SimpleNamespace(isl=4096, osl=128, prefix=prefix, batch_size=16)
-    model = SimpleNamespace(forward_model=forward_model, _num_layers=10)
+    model = SimpleNamespace(forward_model=forward_model, _num_layers=10, _nextn=0)
     seen = []
 
     def native_step(self, _model, _database, _runtime, step):
@@ -583,7 +583,7 @@ def test_batched_cold_unqualified_mamba_keeps_calibrated_scaling(monkeypatch):
     ],
 )
 def test_batched_ttft_prices_native_uncached_chunks(
-    monkeypatch, regime, prefix, budget, chunks, native_op, generation_only
+    monkeypatch, regime, prefix, budget, chunks, native_op, generation_only, nextn=0
 ):
     from aisim_core import _native
     from aisim_core.sdk import operations as ops
@@ -597,7 +597,7 @@ def test_batched_ttft_prices_native_uncached_chunks(
     assert database is not None
     model = get_model(
         "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
-        ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1),
+        ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1, nextn=nextn),
         "vllm",
     )
     mamba_type = _native.Mamba2Kernel if native_op else ops.Mamba2Kernel
@@ -637,6 +637,7 @@ def test_batched_ttft_prices_native_uncached_chunks(
             8,
             128,
             state_dtype="float16",
+            token_width=nextn + 1,
         )
     ]
     model._num_layers = 1
@@ -669,7 +670,8 @@ def test_batched_ttft_prices_native_uncached_chunks(
     count = max(1, len(chunks))
     activation_bytes = 0 if generation_only else (4096 - prefix) * 20_608
     state_bytes = 0 if generation_only else count * 2 * 1_048_576
-    decode_scan_ms = (2 * 20_608 + 2 * 2 * 1_048_576) / 7.7e12 * 1000
+    width = nextn + 1
+    decode_scan_ms = (2 * width * 20_608 + 2 * (1 + width) * 1_048_576) / 7.7e12 * 1000
     assert estimates[0].per_op_latency_ms["generation_mamba_ssm"] == pytest.approx(decode_scan_ms, rel=1e-9)
     # Concurrent decoders keep the original native KV shape, independently
     # of this request's growing prefix. Reuse that component, not its scan
@@ -682,6 +684,20 @@ def test_batched_ttft_prices_native_uncached_chunks(
     else:
         expected = own_ms + (4 - 2) / 2 * (own_ms + 64 * 1.5)
     assert ttft == pytest.approx(expected, rel=1e-9)
-    assert calls[0] == (4096, prefix, budget - 2, 2)
+    prompt_budget = budget - 2 * width
+    full, partial = divmod(prompt_budget, 4096)
+    scheduled = full * 4096 + min(partial, 4096 - prefix)
+    assert calls[0] == (4096, prefix, scheduled, 2)
+    assert estimates[0].num_decode_query_tokens == 2 * width
+    # Uncached prefill plus packed decode stays within the scheduler capacity.
+    assert (scheduled - full * prefix) + 2 * width <= budget
     assert calls[1:] == [(isl, past, isl, 2) for isl, past in chunks]
     assert (runtime.isl, runtime.prefix, runtime.batch_size) == (4096, prefix, 4)
+
+
+@pytest.mark.parametrize("prefix", [0, 3000])
+def test_speculative_xpu_ttft_reserves_packed_decode_width_for_every_native_chunk(monkeypatch, prefix):
+    # Capacity 514 minus two width-four decoders leaves 506 fresh tokens:
+    # cached suffix 1096 -> 506 + 506 + 84; cold prompt -> eight 506 + 48.
+    chunks = [(min(4096, past + 506), past) for past in range(prefix, 4096, 506)]
+    test_batched_ttft_prices_native_uncached_chunks(monkeypatch, "burst", prefix, 514, chunks, False, False, nextn=3)

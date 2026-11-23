@@ -1120,15 +1120,24 @@ class TestFPMStaticAndMixed:
         for field in ("ttft", "tpot", "tokens/s"):
             assert small[field] == pytest.approx(large[field])
 
+    @pytest.mark.parametrize("width", [1, 4])
     @pytest.mark.parametrize("xpu", [False, True])
     @pytest.mark.parametrize("prefix", [0, 3000])
-    def test_cached_aggregate_schedules_fpm_target_and_draft_requests(self, tmp_path, xpu, prefix, monkeypatch):
+    def test_cached_aggregate_schedules_fpm_target_and_draft_requests(self, tmp_path, xpu, prefix, width, monkeypatch):
         from aisim.sdk.inference_session import InferenceSession
         from aisim_core.sdk.backends.vllm_backend_xpu import VLLMXPUBackend
         from aisim_core.sdk.operations import Mamba2Kernel
+        from aisim_core.sdk.speculation import SpeculationConfig
         from aisim_core.sdk.step_estimate import MixedStepInput
 
-        model = models.get_model("Qwen/Qwen3-0.6B", _model_config(forward_model="fpm"), BACKEND)
+        config = _model_config(
+            forward_model="fpm",
+            speculation=SpeculationConfig(kind="ngram", params={"num_speculative_tokens": width - 1})
+            if width > 1
+            else None,
+        )
+        model = models.get_model("Qwen/Qwen3-0.6B", config, BACKEND)
+        assert model._nextn == width - 1
         model.context_ops.append(
             Mamba2Kernel(
                 "draft_scan",
@@ -1150,12 +1159,12 @@ class TestFPMStaticAndMixed:
         # Invented exact anchors distinguish one scheduled suffix + one decoder
         # from a native caller scheduling 4096 genuinely new tokens (4 prefills).
         rows = [
-            _row("prefill", 1, 1097, 3000, 12.0, model_path=model.model_path, identity=identity),
-            _row("prefill", 4, 4097, 12000, 33.0, model_path=model.model_path, identity=identity),
-            _row("prefill", 1, 4097, 0, 22.0, model_path=model.model_path, identity=identity),
+            _row("prefill", 1, 1096 + width, 3000, 12.0, model_path=model.model_path, identity=identity),
+            _row("prefill", 4, 4096 + width, 12000, 33.0, model_path=model.model_path, identity=identity),
+            _row("prefill", 1, 4096 + width, 0, 22.0, model_path=model.model_path, identity=identity),
             _row("prefill", 1, 4096, 0, 21.0, model_path=model.model_path, identity=identity),
         ] + [
-            _row("decode", b, 0, kv, ms, model_path=model.model_path, identity=identity)
+            _row("decode", b * width, 0, kv, ms, model_path=model.model_path, identity=identity)
             for b, kv, ms in [(1, 4098, 3.0), (2, 8196, 5.0), (1, 0, 2.0), (2, 0, 4.0)]
         ]
         shutil.copy(Path(_CORE_SYSTEMS) / f"{SYSTEM}.yaml", tmp_path / f"{SYSTEM}.yaml")
@@ -1165,9 +1174,9 @@ class TestFPMStaticAndMixed:
         if xpu:
             monkeypatch.setattr(backend, "_max_kv_slots", lambda *a, **k: 2)
         runtime = sdk_config.RuntimeConfig(batch_size=2, isl=4096, osl=2, prefix=prefix)
-        # XPU reserves one token for decode before pricing the cold 4096-token
-        # control; the cached case uses the exact reported 4096-token budget.
-        budget = 4096 + int(xpu and not prefix)
+        # The total XPU budget reserves the decoder's full verification width.
+        # Cold prefill still schedules exactly 4096 new tokens at either width.
+        budget = 4096 + (width if xpu and not prefix else 0)
         summary = InferenceSession(model, database, backend).run_agg(runtime, ctx_tokens=budget)
         ops = summary.get_per_ops_data()["mix_step"]
         assert ops["fpm_forward_prefill"] == pytest.approx(12.0 if prefix else 22.0)
@@ -1176,12 +1185,55 @@ class TestFPMStaticAndMixed:
         new_tokens = 1096 if prefix else 4096
         expected_ms = (new_tokens * 18_560 + 2_097_152) / database.system_spec["gpu"]["mem_bw"] * 1000
         assert ops["draft_scan"] == pytest.approx(expected_ms, rel=1e-9)
+        mixed = summary.get_step_estimates()["mixed"]
+        assert mixed.context_tokens == new_tokens
+        assert mixed.num_decode_query_tokens == width
+        if xpu:
+            assert mixed.context_tokens + mixed.num_decode_query_tokens <= budget
         if prefix:
             # Public run_mixed keeps its fresh-token convention, even after agg.
             direct = InferenceSession(model, database, backend).run_mixed(runtime, MixedStepInput(4096, 1))
             assert direct.per_op_latency_ms["fpm_forward_prefill"] == pytest.approx(33.0)
             expected_direct = (4096 * 18_560 + 4 * 2_097_152) / database.system_spec["gpu"]["mem_bw"] * 1000
             assert direct.per_op_latency_ms["draft_scan"] == pytest.approx(expected_direct, rel=1e-9)
+
+    def test_fpm_result_counts_follow_executed_schedule_and_keep_memory_reservation(self, tmp_path, monkeypatch):
+        from aisim.sdk.inference_session import InferenceSession
+
+        model = models.get_model("Qwen/Qwen3-0.6B", _model_config(forward_model="fpm"), "sglang")
+        identity = dict(zip(_CELL_MATCH_COLUMNS, model.context_ops[0]._match_identity, strict=True))
+        # One 1096-token suffix plus three decoders: a synthetic 12 ms
+        # prefill anchor and a 3-2=1 ms marginal decoder, totaling 13 ms.
+        rows = [_row("prefill", 1, 1099, 3000, 12.0, model_path=model.model_path, identity=identity)] + [
+            _row("decode", b, 0, kv, ms, model_path=model.model_path, identity=identity)
+            for b in (3, 4)
+            for kv, ms in [(0, 2.0), (b * 4098, 3.0)]
+        ]
+        rows = [dict(row, backend="sglang") for row in rows]
+        shutil.copy(Path(_CORE_SYSTEMS) / f"{SYSTEM}.yaml", tmp_path / f"{SYSTEM}.yaml")
+        _write_pair(str(tmp_path / "data" / SYSTEM / "sglang" / VERSION), rows, sidecar_overrides={"backend": "sglang"})
+        database = PerfDatabase(SYSTEM, "sglang", VERSION, systems_root=str(tmp_path))
+        backend = get_backend("sglang")
+        reservations = []
+        get_memory = backend._get_memory_usage
+
+        def record_memory(*args, **kwargs):
+            reservations.append((kwargs["num_tokens"], kwargs["mtp_scaled_tokens"]))
+            return get_memory(*args, **kwargs)
+
+        monkeypatch.setattr(backend, "_get_memory_usage", record_memory)
+        runtime = sdk_config.RuntimeConfig(batch_size=4, isl=4096, osl=2, prefix=3000)
+        summary = InferenceSession(model, database, backend).run_agg(runtime, ctx_tokens=8192)
+        row = summary.get_summary_df().iloc[0]
+        mixed = summary.get_step_estimates()["mixed"]
+        assert (mixed.context_tokens, mixed.num_decode_requests) == (1096, 3)
+        assert mixed.latency_ms == pytest.approx(13.0)
+        assert (row["num_ctx_reqs"], row["num_gen_reqs"], row["gen_tokens"]) == (1, 3, 3)
+        # Reservation still uses the full 8192-token capacity and its legacy
+        # two decoder slots. Reporting the one/three execution must not resize it.
+        assert row["ctx_tokens"] == 8192
+        assert row["num_tokens"] == 8194
+        assert reservations == [(8194, 2)]
 
     @pytest.mark.parametrize("ctx_tokens", [256, 512])
     @pytest.mark.parametrize("gen_requests", [0, 2])

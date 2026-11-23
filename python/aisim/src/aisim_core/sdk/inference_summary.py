@@ -573,8 +573,9 @@ class InferenceSummary:
     def get_step_estimates(self) -> dict | None:
         """Get raw per-iteration estimates and aggregate scheduling metadata.
 
-        ``mixed`` is absent when scheduling averages multiple exact text
-        chunks. Their mean is in ``scheduling`` and their totals are in
+        ``mixed`` is absent when Python scheduling averages multiple exact
+        text chunks or the native FPM averages uncached prefill chunks within
+        one call. Their mean is in ``scheduling`` and their totals are in
         :meth:`get_aggregate_energy_breakdown`.
         """
         return self._step_estimates

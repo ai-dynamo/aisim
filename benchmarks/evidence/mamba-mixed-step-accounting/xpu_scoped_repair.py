@@ -92,7 +92,7 @@ def main():
 
             with patch.object(VLLMBackend, "run_mixed", native_step):
                 ttft = backend._compute_ttft(
-                    SimpleNamespace(forward_model="fpm", _num_layers=10),
+                    SimpleNamespace(forward_model="fpm", _num_layers=10, _nextn=0),
                     None,
                     SimpleNamespace(isl=4096, osl=128, prefix=prefix, batch_size=16),
                     16,
