@@ -738,6 +738,8 @@ def _load(
     isolate_roots: bool = False,
 ):
     manifest_path = entry.manifest.path
+    # Preparation saves absolute paths, including for a relative cache; compare and key on the same spelling.
+    output_dir = output_dir.absolute()
     if category == "fpm":
         # The catalog's pinned digest, identity and purpose first (a partly refreshed local dataset must be refused);
         # the peek hashes no artifact, so a library entry is not hashed twice.
