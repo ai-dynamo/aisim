@@ -41,6 +41,7 @@ aisim data fetch --dry-run                    # plan the whole op-latency databa
 aisim data fetch                              # download it (same as --category op-latency --all)
 aisim fetch --hardware h200_sxm --framework vllm
 aisim data fetch --category fpm --model MiniMaxAI/MiniMax-M2.7 --hardware h200_sxm
+aisim data fetch --category model-config      # Hugging Face model configs, see below
 ```
 
 With no arguments, `fetch` downloads the whole op-latency database. FPM, e2e and eval data are never part of
@@ -52,9 +53,9 @@ planning downloads as well as the artifacts.
 
 | Flag | Meaning |
 |---|---|
-| `--category` | `op-latency` (default), `fpm`, `e2e` or `eval`. |
+| `--category` | `op-latency` (default), `fpm`, `e2e`, `eval` or `model-config` (Hugging Face model configs, see [Hugging Face model configs](#model-configs)). |
 | `--all` | Whole category. `op-latency` only; it is also what no selector means there. |
-| `--model`, `--hardware`, `--framework`, `--framework-version`, `--operation-family` | Catalog identity filters. |
+| `--model`, `--hardware`, `--framework`, `--framework-version`, `--operation-family` | Catalog identity filters. For `model-config`, `--model` is the only one: Hugging Face model IDs, comma-separated. |
 | `--configuration ID` | Select by configuration ID; repeat or comma-separate for several. |
 | `--purpose` | `prediction` (default) selects the data a predictor reads (`op-latency` and `fpm` only); `full-evidence` applies no purpose filter. `validation` and `results` are reserved and exit `2` as unsupported. |
 | `--repo` | Hugging Face dataset repository, `owner/name`. Default: `$AISIM_DATASET`, then the saved `init` config, then `ai-dynamo/aisim-data`. |
@@ -63,6 +64,7 @@ planning downloads as well as the artifacts.
 | `--dry-run` | Print the plan (`files`, `total_bytes`, `uncached_bytes`) and download no artifacts. The small catalog and manifest files needed to expand the plan are still cached. |
 | `--offline` | Make no network requests. A missing file fails with `offline-missing` and the list of files; with `--dry-run` the list is reported in `missing` and the exit status is `0`. A non-SHA revision cannot be resolved offline. |
 | `--no-limit` | Ignore `AISIM_DATA_MAX_BYTES` for this download. |
+| `--refresh` | `model-config` only: resolve the model's branch again instead of reusing the commit recorded in the cache. |
 
 Selection precedence for repository and revision is flag, then environment, then saved config, then the
 shipped default. A selection must match at least one catalog entry. Repeating a fetch reuses verified cache
@@ -78,11 +80,12 @@ usage, and `1` for revision, transfer, integrity or offline failures.
 
 | Command | Effect |
 |---|---|
-| `aisim init --all` | Download the whole op-latency database now and save `all`. |
-| `aisim init --hardware H` | Download op data for one hardware platform now and save `hardware`. |
+| `aisim init --all` | Download the whole op-latency database now and save `all`. Also caches the [Hugging Face model configs](#model-configs) of the shipped manifest. |
+| `aisim init --hardware H` | Download op data for one hardware platform now and save `hardware`. Also caches the model configs. |
 | `aisim init --on-demand` | Download nothing now. A run downloads data only from a pinned source: `--repo`/`--revision` saved with this choice, or `AISIM_DATASET`. With neither, runs use the default op data: the dataset revision pinned in the release (see [Default operation data](#default-operation-data)). |
 
-`--repo`, `--revision`, `--cache-dir`, `--offline` and `--no-limit` behave as for `fetch`. The choice is saved
+`--repo`, `--revision`, `--cache-dir`, `--offline` and `--no-limit` behave as for `fetch`. `--no-models` skips the
+model configs of `--all` and `--hardware`; `--on-demand` never fetches them. The choice is saved
 only after the download succeeds (`--all` and `--hardware` also save the repository and revision they downloaded, so
 runs select that data), in `config.json` in the cache root: `~/.cache/aisim/config.json` (honoring
 `XDG_CACHE_HOME`), or `$AISIM_DATA_CACHE/config.json` when `AISIM_DATA_CACHE` is set. No file means on-demand.
@@ -93,7 +96,7 @@ overrides an environment variable.
 
 Before any download, `init` checks for a Hugging Face token (`HF_TOKEN`, or a login saved by `hf auth login`).
 Anonymous downloads are rate limited (HTTP 429), and the op-latency database is thousands of files, so a first
-download without a token can stall for minutes. When no token is found, `init` says so on stderr and, in a
+download without a token can stall for minutes. AISim retries a rate limit with backoff, but a token avoids it. When no token is found, `init` says so on stderr and, in a
 terminal, offers a hidden prompt: paste a free read-only token from <https://huggingface.co/settings/tokens>, or
 press Enter to continue anonymously. A pasted token is validated and saved by Hugging Face's own login, so every
 Hugging Face tool and later AISim downloads use it, including the `config.json` AISim fetches for a model it does not
@@ -104,9 +107,58 @@ terminal `init` only prints the notice, so scripts set `HF_TOKEN`. `--offline` s
 
 `aisim data status` prints the pin, the cache path and size on disk, the saved init mode, and for every cached
 revision its size and how many files of the whole op-latency database are cached or missing (computed offline).
+`model_configs` reports the Hugging Face model-config cache: its path, the number of models and its size.
 
-`aisim data clear` removes every cached revision and the init config after asking for confirmation. Pass
+`aisim data clear` removes every cached revision, the cached model configs and the init config after asking for confirmation. Pass
 `--yes` to skip the question; without a terminal it exits `2` unless `--yes` is given.
+
+<a id="model-configs"></a>
+
+### Hugging Face model configs
+
+AISim bundles the `config.json` of a fixed set of models. For any other model ID, such as `Qwen/Qwen3-32B` when it
+is not bundled, AISim reads the model's small JSON files from its Hugging Face repository: `config.json`, the
+optional `hf_quant_config.json`, and the processor files (`preprocessor_config.json`,
+`video_preprocessor_config.json`) of the multimodal families that use them (Llama 4, Kimi and Qwen3-VL). They are
+cached on your machine under `model-configs/` in the data cache (`$AISIM_DATA_CACHE`, default
+`~/.cache/aisim/data`). AISim never ships or copies these files; each user downloads them from Hugging Face with
+their own token.
+
+| Behavior | Detail |
+|---|---|
+| Cache | A file is stored after a successful download and read before any network call, keyed by repository and commit. A file the repository does not have (HTTP 404) is recorded too, so it is not requested again. |
+| Pinned revision | `main` (or any branch or tag) is resolved to a commit SHA once. The SHA is recorded in the cache and every later run of that model reads the same commit, so a moving branch never changes a prediction. `aisim data fetch --category model-config --model ID --refresh` resolves it again. Pass `--revision` (a branch, tag or SHA) with one `--model` to choose another commit; a model pinned by an FPM profile (`model_revision`) always uses that commit. |
+| Offline | With `AISIM_DATA_OFFLINE=1` AISim never connects. A model that is not cached fails with a `missing-data` error that names the file and the command that fetches it. |
+| Rate limits | HTTP 429 and the transient 500, 502, 503 and 504 are retried, up to 5 tries. AISim waits the `Retry-After` the server sends, else 1, 2, 4 and 8 seconds. A `Retry-After` above 60 seconds is reported instead of waited for. The final error names the token options: `HF_TOKEN`, `aisim init` and `hf auth login`. |
+| Quantization metadata | A missing `hf_quant_config.json` (HTTP 404) means the checkpoint has none. Any other failure (a rate limit that persists, a timeout, a server error) stops the run, because continuing would drop the quantization metadata and change the prediction. |
+| Token | The same lookup as for dataset downloads: `HF_TOKEN`, then `HUGGING_FACE_HUB_TOKEN`, then the login saved by `hf auth login` or `aisim init`. A gated model needs a token whose account accepted the model's terms. |
+
+To make a host work offline, cache the models before disconnecting. `aisim init --all` and
+`aisim init --hardware H` do it for the model IDs listed in `aisim_core/data/hf_model_manifest.json` (a list of
+Hugging Face IDs only, never model metadata), and `fetch` does it for any models you name:
+
+```bash
+aisim data fetch --category model-config --dry-run        # what the manifest would cache
+aisim data fetch --category model-config                  # the manifest
+aisim data fetch --category model-config --model Qwen/Qwen3-32B,nvidia/Llama-3.1-8B-Instruct-FP8
+aisim data fetch --category model-config --model Qwen/Qwen3-32B --revision <40-hex-sha>
+AISIM_DATA_OFFLINE=1 aisim predict ...                    # later, with no network
+```
+
+`fetch --category model-config` prints one JSON object: `cache`, `counts` and one entry per model. Entries carry a
+`status`, the pinned `revision`, the per-file result (`files`) and a `reason` for a problem:
+
+| Status | Meaning | Effect on exit status |
+|---|---|---|
+| `bundled` | AISim ships this model's config; nothing to fetch. | none |
+| `cached` | Everything AISim reads for the model is already cached. | none |
+| `fetched` | Downloaded now. | none |
+| `skipped` | Gated, denied (HTTP 401 or 403) or not found (HTTP 404). A warning on stderr names the model and the fix. | none |
+| `failed` | A rate limit that persisted, a network error or a server error. A warning names the reason. | `data fetch` exits `1`; `init` still exits `0` and the model downloads when a run needs it |
+| `missing` | `--offline` and not cached. | `data fetch` exits `1` |
+
+`--dry-run` makes no request and reports `to-fetch` for what is not cached. `--repo`, `--hardware`, `--framework`,
+`--framework-version`, `--operation-family`, `--all` and `--configuration` do not apply to `model-config` and exit `2`.
 
 <a id="validate-dataset"></a>
 
@@ -938,6 +990,8 @@ Check KV capacity against request lengths, context limits, and traffic stop limi
 | Resource refusal, exit `3` | Inspect resource diagnostics and any completed recommendation ledger. | Check the [local resource budget](local-resources.md); preserve completed results before choosing a smaller workload or another host. |
 | A candidate fails to resolve performance data | Check the model, hardware, backend version, and timing mode. FPM needs a matching collected cell. | Use a covered combination from the [support reference](../../README.md#support-and-accuracy) or the [FPM workflow](../perf-model/methods/whole-forward.md). |
 | `host cost table ... does not exist yet` (or a missing-row message) | A native SGLang VL prediction reads the frontend stage from a host cost table row measured on the serving host; the message prints the `collect` command that adds the row. | Run the printed `python -m aisim.vl.collect ...` with `--sglang-python` pointing at the serving venv, then rerun `predict`; see [SGLang VL host loop](../replay/engine/sglang-vl-host-loop.md). |
+| `HTTP error 429` while loading a model config or dataset | Hugging Face is rate limiting anonymous requests. AISim already retried with backoff. | Create a token, then export `HF_TOKEN` or run `aisim init` or `hf auth login`. |
+| `missing-data` error naming `aisim data fetch --category model-config` | `AISIM_DATA_OFFLINE=1` and the model's config is not cached. | While online, run the printed command (or `aisim init --all`), then copy the cache directory to the offline host. |
 | `--online` is rejected | The selected stack must advertise online support. | Use offline execution with `--stack engine`, or an integration that supports online execution. |
 
 For automation, check the exit code as well as standard output. `--format json` changes successful

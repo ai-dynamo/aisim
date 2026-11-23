@@ -24,6 +24,7 @@ from aisim.sdk.utils import (
     enumerate_ttft_tpot_constraints,
     get_model_config_from_model_path,
 )
+from aisim_core.sdk import hf_model_files
 
 pytestmark = pytest.mark.unit
 
@@ -33,19 +34,26 @@ pytestmark = pytest.mark.unit
     [(None, "main"), ("a" * 40, "a" * 40), ("release/v1", "release%2Fv1")],
 )
 def test_download_hf_config_json_revision(monkeypatch, revision, path_revision):
+    """``_download_hf_json`` resolves the revision once, then fetches the commit; both URLs carry the revision."""
     requests = []
     metadata = {"architectures": ["UnregisteredDecoderForCausalLM"]}
+    sha = "c" * 40
 
     def fetch(request, *, timeout):
         requests.append(request.full_url)
         assert timeout == 30
-        return io.BytesIO(json.dumps(metadata).encode())
+        body = {"sha": sha} if "/api/models/" in request.full_url else metadata
+        return io.BytesIO(json.dumps(body).encode())
 
-    monkeypatch.setattr(utils, "_get_hf_auth_headers", lambda: {})
-    monkeypatch.setattr(utils.urllib.request, "urlopen", fetch)
+    monkeypatch.setattr(hf_model_files.urllib.request, "urlopen", fetch)
+    monkeypatch.setattr(hf_model_files, "make_transport", lambda: hf_model_files.UrllibTransport(headers=dict))
     kwargs = {} if revision is None else {"revision": revision}
     assert utils._download_hf_json("test/model", "config.json", **kwargs) == metadata
-    assert requests == [f"https://huggingface.co/test/model/raw/{path_revision}/config.json"]
+    commit = revision if revision and len(revision) == 40 else sha
+    expected = [f"https://huggingface.co/test/model/raw/{commit}/config.json"]
+    if commit == sha:
+        expected.insert(0, f"https://huggingface.co/api/models/test/model/revision/{path_revision}")
+    assert requests == expected
 
 
 @pytest.mark.parametrize("use_tilde", [False, True])

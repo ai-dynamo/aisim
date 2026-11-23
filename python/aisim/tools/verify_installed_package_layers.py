@@ -121,6 +121,8 @@ def _verify_payload() -> None:
         resources / "systems" / "h100_sxm.yaml",
         # Operation tables come from the pinned dataset; the wheel ships only the pin.
         resources / "data" / "op_latency_pin.json",
+        # Model IDs `aisim init` prefetches from Hugging Face; the wheel ships no model metadata.
+        resources / "data" / "hf_model_manifest.json",
     )
     missing = [str(path) for path in required_resources if not path.is_file()]
     if missing:

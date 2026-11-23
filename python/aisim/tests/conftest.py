@@ -55,6 +55,22 @@ def _restore_root_logger():
     root.setLevel(level)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_hf_model_cache(request, monkeypatch):
+    """Keep unit tests off the user's Hugging Face model-metadata cache.
+
+    Non-bundled model configs are cached under the AISim data cache. A unit test gets an empty cache of its own, so it
+    neither reads nor pollutes the one on the machine running it.
+    """
+    if request.node.get_closest_marker("unit") is None:
+        return
+    from aisim_core.sdk import hf_model_files
+
+    monkeypatch.setattr(
+        hf_model_files, "default_cache_root", lambda: request.getfixturevalue("tmp_path") / "hf-model-configs"
+    )
+
+
 @pytest.fixture
 def raw_data_coordinates(monkeypatch: pytest.MonkeyPatch) -> None:
     """Admit perf-data versions outside the queryable slots.

@@ -17,10 +17,8 @@ import logging
 import os
 import re
 import tempfile
-import urllib.request
 from functools import cache
 from pathlib import Path
-from urllib.parse import quote
 
 import yaml
 
@@ -36,6 +34,11 @@ from aisim_core.sdk.common import (
     Qwen35Config,
     VisionEncoderConfig,
 )
+from aisim_core.sdk.hf_model_files import (
+    HuggingFaceDownloadError,  # noqa: F401  (re-exported: callers import it from here)
+    load_model_json,
+)
+from aisim_core.sdk.hf_model_files import hf_auth_headers as _get_hf_auth_headers  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -408,54 +411,14 @@ def safe_mkdir(target_path: str, exist_ok: bool = True) -> Path:
         raise ValueError(f"Failed to create directory: {e}") from e
 
 
-class HuggingFaceDownloadError(Exception):
-    """
-    Exception raised when a HuggingFace JSON file cannot be downloaded.
-    """
-
-    pass
-
-
-def _get_hf_auth_headers() -> dict[str, str]:
-    """Respect Hugging Face token/cache settings for model metadata downloads."""
-    if os.environ.get("HF_HUB_DISABLE_IMPLICIT_TOKEN", "").upper() in ("1", "ON", "YES", "TRUE"):
-        return {}
-    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    if not hf_token:
-        default_home = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "huggingface"
-        hf_home = Path(os.environ.get("HF_HOME", default_home))
-        token_path = Path(os.environ.get("HF_TOKEN_PATH", hf_home / "token")).expanduser()
-        try:
-            hf_token = token_path.read_text().strip()
-        except FileNotFoundError:
-            hf_token = None
-    headers: dict[str, str] = {}
-    if hf_token:
-        headers["Authorization"] = f"Bearer {hf_token}"
-    return headers
-
-
 def _download_hf_json(hf_id: str, filename: str, *, raise_on_404: bool = True, revision: str = "main") -> dict | None:
-    """Download and parse a JSON file from a HuggingFace model repo."""
-    url = f"https://huggingface.co/{hf_id}/raw/{quote(revision, safe='')}/{filename}"
-    try:
-        req = urllib.request.Request(url, headers=_get_hf_auth_headers())
-        with urllib.request.urlopen(req, timeout=30) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as e:
-        if e.code == 404 and not raise_on_404:
-            return None
-        token_path = Path.home() / ".cache" / "huggingface" / "token"
-        raise HuggingFaceDownloadError(
-            f"Failed to download {hf_id}'s {filename} from HuggingFace: "
-            f"HuggingFace returned HTTP error {e.code}: {e.reason}. "
-            f"URL: {url}. If using a gated model, authenticate via one of the following "
-            f"(in priority order): (1) set the HF_TOKEN environment variable, "
-            f"(2) set the HUGGING_FACE_HUB_TOKEN environment variable, or "
-            f"(3) run `huggingface-cli login` (token stored at {token_path})."
-        ) from e
-    except Exception as e:
-        raise HuggingFaceDownloadError(f"Failed to download {hf_id}'s {filename} from HuggingFace: {e}") from e
+    """Load and parse a JSON file of a HuggingFace model repo, from the AISim data cache when it is there.
+
+    ``revision`` (a branch, tag or commit SHA) is resolved to one commit that the cache records, so later runs read
+    the same commit; pass a full commit SHA to pin it explicitly. ``AISIM_DATA_OFFLINE=1`` never opens a
+    connection (see :mod:`aisim_core.sdk.hf_model_files`).
+    """
+    return load_model_json(hf_id, filename, revision=revision, required=raise_on_404)
 
 
 def _download_hf_config(hf_id: str) -> dict:
@@ -2004,12 +1967,33 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
         )
 
     config = _attach_llama4_processor_config(_download_hf_config(model_path), model_path)
-    try:
-        hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False)
-    except Exception as exc:  # best-effort for optional quant config
-        logger.debug("Failed to download hf_quant_config.json for %s: %s", model_path, exc)
-        hf_quant_config = None
+    # hf_quant_config.json is optional, but only in the sense that the repository may not have it (HTTP 404). Any other
+    # failure (rate limit, timeout, server error) must stop the run: continuing would drop the quantization metadata
+    # and silently change the prediction.
+    hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False)
     return _attach_inferred_quant_fields(_attach_hf_quant_config(config, hf_quant_config))
+
+
+_KIMI_PROCESSOR_ARCHITECTURES = ("KimiK25ForConditionalGeneration", "KimiK3ForConditionalGeneration")
+_QWEN_VL_PROCESSOR_ARCHITECTURES = ("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration")
+
+
+def model_files_to_cache(raw_config: dict) -> tuple[str, ...]:
+    """The Hugging Face files, besides ``config.json``, that loading a non-bundled model with this config reads.
+
+    ``aisim init`` and ``aisim data fetch --category model-config`` cache exactly these, so an offline run finds
+    everything the loader asks for: the optional quantization metadata for every model, and the processor files of
+    the multimodal families that consume them.
+    """
+    architecture = (raw_config.get("architectures") or [None])[0]
+    files = ["hf_quant_config.json"]
+    if architecture == "Llama4ForConditionalGeneration" and "image_processor_config" not in raw_config:
+        files.append("preprocessor_config.json")
+    elif architecture in _KIMI_PROCESSOR_ARCHITECTURES:
+        files += ["preprocessor_config.json", "video_preprocessor_config.json"]
+    elif architecture in _QWEN_VL_PROCESSOR_ARCHITECTURES:
+        files.append("preprocessor_config.json")
+    return tuple(files)
 
 
 @cache
@@ -2026,8 +2010,8 @@ def get_model_config_from_model_path(model_path: str) -> dict:
     """
     raw_config = _load_model_config_from_model_path(model_path)
     architecture = (raw_config.get("architectures") or [None])[0]
-    kimi = architecture in ("KimiK25ForConditionalGeneration", "KimiK3ForConditionalGeneration")
-    qwen_vl = architecture in ("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration")
+    kimi = architecture in _KIMI_PROCESSOR_ARCHITECTURES
+    qwen_vl = architecture in _QWEN_VL_PROCESSOR_ARCHITECTURES
     if (kimi or qwen_vl) and model_path not in DefaultHFModels:
         # Only Kimi and Qwen3-VL consume these processor files. Bundled
         # checkpoints use the pinned processor defaults; local/downloaded
