@@ -89,11 +89,13 @@ following local corrections to this pinned revision:
 - Reject Full and auxiliary load-back plans whose per-node row counts changed
   after a split, or whose row totals do not match the device allocation, before
   any adoption.
-  Compare the ordered Full host source rows and anchor path before commit,
-  rejecting plans invalidated by host reclaim and replacement with equal counts.
+  Compare ordered Full and auxiliary host source rows and the Full anchor path
+  before commit, rejecting plans invalidated by host reclaim and replacement
+  with equal counts.
   Index comparisons use borrowed slices without another concatenated buffer.
-  Reject auxiliary destinations filled since planning, and retain empty row
-  counts on foreign-pin deferrals so they still commit as no-ops.
+  Reject auxiliary destinations filled since planning. Mark foreign-pin
+  deferrals explicitly so they commit as no-ops even for host-only anchors,
+  while ordinary empty plans still require device-resident Full KV.
   Refresh each restored node's parent eligibility before another eviction.
   Publish CPU store events only for the matching write-through acknowledgement.
 - Drop failed-backup subtrees in stable NodeId sibling order, descendants first,
@@ -105,6 +107,8 @@ following local corrections to this pinned revision:
 - Assert the ordered SWA window values as well as presence and row counts.
 - Strengthen the rejected-rotation test to check the retained anchor's hit count,
   access tick, and priority before and after each rejected continuation.
+- Assert that the read-only prefix probe preserves the compressed edge and its
+  access tick immediately, before the mutating match control.
 - Keep borrowed namespace fields private so their cached hash stays consistent.
 - Describe the bundled module as native-only.
 - Borrow child edge keys during removal and copy visible page slices directly

@@ -403,7 +403,46 @@ and its LICENSE for provenance, the preserved license, and each local correction
      #[error("{0}")]
 --- a/page_value_core.rs
 +++ b/page_value_core.rs
-@@ -428,14 +428,21 @@
+@@ -49,12 +49,25 @@
+ #[test]
+ fn page_value_core_supports_read_only_match_and_continuation_insert() {
+     let mut tree = core("lru");
+-    insert(&mut tree, &[10, 20, 30, 40], &[1, 2, 3, 4]);
++    let original = insert(&mut tree, &[10, 20, 30, 40], &[1, 2, 3, 4])
++        .last_device_node_id
++        .unwrap();
++    let original_length = tree.inspect_get_node_key_length(original).unwrap();
++    let original_tick = tree.inspect_get_node_access_counter(original).unwrap();
++    assert_eq!(original_length, 4);
+
+     let partial_key = vec![10, 20, 50, 60];
+     assert_eq!(
+         tree.full_kv_prefix_len(&partial_key, KeyNamespaceRef::default()),
+         2
++    );
++    assert_eq!(
++        tree.inspect_get_node_key_length(original).unwrap(),
++        original_length
++    );
++    assert_eq!(
++        tree.inspect_get_node_access_counter(original).unwrap(),
++        original_tick
+     );
+     // On a FULL-only tree the read-only length is the admitted prefix.
+     let admitted = tree.match_prefix(&MatchPrefixParams {
+@@ -62,6 +75,11 @@
+         namespace: KeyNamespaceRef::default(),
+     });
+     assert_eq!(admitted.device_indices.len(), 2);
++    assert_eq!(tree.inspect_get_node_key_length(original).unwrap(), 2);
++    assert_ne!(
++        tree.inspect_get_node_access_counter(original).unwrap(),
++        original_tick
++    );
+
+     let prefix_key = vec![10, 20];
+     let prefix = tree.match_prefix(&MatchPrefixParams {
+@@ -428,14 +446,21 @@
      params.value = PageValue::from_vec(vec![3, 4]);
      params.prev_prefix_len = 2;
      params.rotation_base = Some(8);
@@ -425,7 +464,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
      }
      params.rotation_base = Some(7);
      let accepted = tree.insert_suffix_from_node(anchor, 2, &params);
-@@ -509,6 +516,18 @@
+@@ -509,6 +534,18 @@
          vec![(0, 1), (3, 4)]
      );
      assert_eq!(tree.swa_evictable_size(), 2);
@@ -475,24 +514,27 @@ and its LICENSE for provenance, the preserved license, and each local correction
      result: Option<InsertResult<V>>,
      /// Emitted actions awaiting the next barrier flush (or the final step).
      pending_actions: Vec<CacheAction<V>>,
-@@ -362,6 +365,8 @@
+@@ -362,6 +365,10 @@
      pub hit_policy: PoolHitPolicy,
      /// The nodes a load-back restores, ancestors first (external handles).
      pub nodes_to_load: Option<Vec<NodeId>>,
 +    /// Component host-row counts at planning time, in `nodes_to_load` order.
 +    pub node_row_counts: Option<Vec<usize>>,
++    /// An empty Full load-back descriptor deferred behind another anchor's pin.
++    pub load_back_deferred: bool,
  }
 
  impl<V: RadixValue> Default for PoolTransfer<V> {
-@@ -373,6 +378,7 @@
+@@ -373,6 +380,8 @@
              keys: None,
              hit_policy: PoolHitPolicy::default(),
              nodes_to_load: None,
 +            node_row_counts: None,
++            load_back_deferred: false,
          }
      }
  }
-@@ -654,6 +660,8 @@
+@@ -654,6 +663,8 @@
      pub(crate) lru_lists: [UnifiedLRUList; NUM_VALUE_SLOTS],
      /// Device-eviction candidates; the lowest priority is popped first.
      pub(crate) full_evict_device_heap: BinaryHeap<Reverse<(PriorityKey, NodeIdx_)>>,
@@ -501,7 +543,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
      /// Eviction-priority strategy; lower priority evicts first.
      pub(crate) eviction_strategy: Arc<dyn EvictionStrategy<K, V> + Send + Sync>,
      /// Keep path depths and branch high-water marks only for T-LRU.
-@@ -727,6 +735,7 @@
+@@ -727,6 +738,7 @@
              tracked_unbacked_tokens: None,
              lru_lists: self.lru_lists.clone(),
              full_evict_device_heap: self.full_evict_device_heap.clone(),
@@ -509,7 +551,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              eviction_strategy: Arc::clone(&self.eviction_strategy),
              tlru_bookkeeping: self.tlru_bookkeeping,
              page_size: self.page_size,
-@@ -1002,6 +1011,7 @@
+@@ -1002,6 +1014,7 @@
              // Disabled components keep harmless empty lists, like component_states.
              lru_lists: Self::new_lru_lists(),
              full_evict_device_heap: BinaryHeap::new(),
@@ -517,7 +559,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              eviction_strategy: get_eviction_strategy(
                  &params.eviction_policy,
                  params.slru_protected_threshold,
-@@ -1261,7 +1271,9 @@
+@@ -1261,7 +1274,9 @@
          let Some(swa) = self.try_component_by_type_(SWA) else {
              return Ok(());
          };
@@ -528,7 +570,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
 
          // Drop strictly-lower-priority locks co-located on the node, skipping
          // any the paired inc never took.
-@@ -1328,8 +1340,14 @@
+@@ -1328,8 +1343,14 @@
      ) -> Result<DecLockRefResult, NodeAccessError> {
          let node_idx = self.arena.resolve(node_id)?;
          self.assert_receipt_anchor_(node_idx, params);
@@ -543,7 +585,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          Ok(DecLockRefResult::default())
      }
 
-@@ -1599,11 +1617,14 @@
+@@ -1599,11 +1620,14 @@
              component.refresh_lru(self, LRURefreshPhase::MatchEnd, best_match_node_id);
          }
 
@@ -558,7 +600,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              cur = self.arena.node(id).try_parent();
          }
          let newest_tick = self
-@@ -1641,8 +1662,14 @@
+@@ -1641,8 +1665,14 @@
              full_kv_hit_length,
              cache_actions: Vec::new(),
          };
@@ -575,7 +617,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              result = component.finalize_match_result_in_tree_core(
                  self,
                  result,
-@@ -1651,6 +1678,7 @@
+@@ -1651,6 +1681,7 @@
                  params,
                  &value,
                  best_match_device_value_len,
@@ -583,7 +625,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              );
          }
          result.cache_actions = action.into_iter().collect();
-@@ -1706,6 +1734,7 @@
+@@ -1706,6 +1737,7 @@
 
      /// Refresh a node's access tick and component LRU positions.
      pub(crate) fn touch_node_(&mut self, node_id: NodeIdx_) {
@@ -591,7 +633,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let tick = self.arena.get_and_bump_access_counter();
          let node = self.arena.node_mut(node_id);
          node.last_access_counter = tick;
-@@ -1767,8 +1796,15 @@
+@@ -1767,8 +1799,15 @@
      /// root first: access tick and LRU refresh, priority floor, hit count, and the
      /// write-through backup trigger, at O(depth) cost. A chunked insert never bumps
      /// hit counts, so it touches only the anchor. Anchor validation still walks
@@ -609,7 +651,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
      /// component overlap hooks (SWA tombstone recovery, duplicate-slot release)
      /// are never replayed because they need the prefix KV, which this API does
      /// not receive.
-@@ -1809,14 +1845,23 @@
+@@ -1809,14 +1848,23 @@
              return Err(TreeCoreRuntimeError::InsertAnchorNotDeviceResident { node_id: anchor.id });
          }
 
@@ -633,7 +675,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              cursor = node.parent();
          }
          if node_prefix_len != prefix_len {
-@@ -1826,28 +1871,8 @@
+@@ -1826,28 +1874,8 @@
                  prefix_len,
              });
          }
@@ -664,7 +706,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          }
          Ok(())
      }
-@@ -1917,6 +1942,27 @@
+@@ -1917,6 +1945,27 @@
                  value_len: params.value.len(),
                  required_len: value_len,
              });
@@ -692,7 +734,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          }
          self.validate_insert_anchor_(prefix_node_idx, prefix_len, params)?;
          if aligned_key_len > 0
-@@ -1942,23 +1988,41 @@
+@@ -1942,23 +1991,41 @@
          let mut prefix_actions = Vec::new();
          self.visit_retained_prefix_(prefix_node_idx, params, &mut prefix_actions);
          if aligned_key_len == prefix_len {
@@ -750,7 +792,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              });
          }
          // The walk owns only [prefix_len, aligned_key_len); the ragged tail and
-@@ -1966,6 +2030,7 @@
+@@ -1966,6 +2033,7 @@
          self.ongoing_insert_walk_state = Some(InsertWalkState {
              phase: InsertPhase::Walk,
              node_id: prefix_node_idx,
@@ -758,7 +800,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              key: K::from(params.key.as_ref()[prefix_len..aligned_key_len].to_vec()),
              key_offset: prefix_len,
              aligned_key_len,
-@@ -1983,6 +2048,7 @@
+@@ -1983,6 +2051,7 @@
              total_prefix_length: prefix_len,
              is_new_leaf: false,
              target_node_id: None,
@@ -766,7 +808,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              result: Some(InsertResult {
                  total_len: aligned_key_len,
                  adopted_ranges: params.track_adopted_ranges.then(HashMap::new),
-@@ -2008,7 +2074,8 @@
+@@ -2008,7 +2077,8 @@
      /// bumps its hit count, which is where write-through backups originate. A
      /// non-chunked continuation replays that root first so LRU, LFU/SLRU, and
      /// write-through behavior match a root insert. Chunked inserts never bump hit
@@ -776,7 +818,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
      fn visit_retained_prefix_(
          &mut self,
          anchor: NodeIdx_,
-@@ -2090,10 +2157,42 @@
+@@ -2090,10 +2160,42 @@
      }
 
      /// Fallible variant of [`Self::resume_insert`].
@@ -822,7 +864,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          Ok(self.advance_insert_())
      }
 
-@@ -2185,6 +2284,7 @@
+@@ -2185,6 +2287,7 @@
          {
              let node = self.arena.node_mut(node_id);
              node.priority = node.priority.max(state.priority);
@@ -830,7 +872,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          }
 
          let params = InsertParams {
-@@ -2326,6 +2426,7 @@
+@@ -2326,6 +2429,7 @@
              state.node_id
          };
          state.target_node_id = Some(target_node_id);
@@ -838,7 +880,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
 
          // Finalize: let each component attach its data to the target node.
          // e.g. Mamba attaches mamba_value to the leaf node
-@@ -2336,7 +2437,7 @@
+@@ -2336,7 +2440,7 @@
              .as_mut()
              .expect("insert result exists during commit");
          result.prefix_len = state.total_prefix_length;
@@ -847,7 +889,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let params = InsertParams {
              rotation_base: state.rotation_base,
              key: &state.key,
-@@ -2963,13 +3064,18 @@
+@@ -2963,13 +3067,18 @@
              .values()
              .copied()
              .collect();
@@ -866,7 +908,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          }
          for &desc_id in descendants.iter().rev() {
              {
-@@ -2991,12 +3097,17 @@
+@@ -2991,12 +3100,17 @@
              );
              self.remove_leaf_from_parent_(desc_id);
          }
@@ -884,7 +926,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          Ok((true, result))
      }
 
-@@ -3178,7 +3289,7 @@
+@@ -3178,7 +3292,7 @@
      ) -> Result<EvictionStepResult<V>, TreeCoreRuntimeError> {
          let node_id = self.arena.resolve(node_id)?;
          let mut result = EvictionStepResult::default();
@@ -893,7 +935,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          if self.arena.node(node_id).is_load_back_pending() {
              return Ok(result);
          }
-@@ -3190,6 +3301,12 @@
+@@ -3190,6 +3304,12 @@
                      evicted: node.evicted(),
                      backuped: node.backuped(),
                  });
@@ -906,7 +948,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              }
          }
          self.demote_(
-@@ -3494,6 +3611,12 @@
+@@ -3494,6 +3614,12 @@
              return false;
          }
          if node.is_device_locked() {
@@ -919,7 +961,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              return false;
          }
          if node.is_load_back_pending() {
-@@ -3834,6 +3957,13 @@
+@@ -3834,6 +3960,13 @@
          if !anchor.is_root() && anchor.namespace.as_ref() != namespace {
              return Err(TreeCoreRuntimeError::InsertHostNamespaceMismatch { node_id: anchor.id });
          }
@@ -933,15 +975,16 @@ and its LICENSE for provenance, the preserved license, and each local correction
          self.touch_node_(node_id);
          if total_len == 0 {
              return Ok(InsertResult {
-@@ -4147,6 +4277,7 @@
+@@ -4147,6 +4280,8 @@
                  name: PoolName::Kv,
                  host_indices: Some(V::empty()),
                  nodes_to_load: Some(Vec::new()),
 +                node_row_counts: Some(Vec::new()),
++                load_back_deferred: true,
                  ..Default::default()
              };
              return Ok((empty_kv, HashMap::new()));
-@@ -4469,7 +4600,7 @@
+@@ -4469,7 +4604,7 @@
          device_indices: V,
          mut kv_xfer: PoolTransfer<V>,
          comp_xfers: HashMap<ComponentType, Vec<PoolTransfer<V>>>,
@@ -950,7 +993,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let anchor_id = node_id;
          let node_id = self.arena.resolve(node_id)?;
          let loaded_node_indices = kv_xfer
-@@ -4479,6 +4610,98 @@
+@@ -4479,6 +4614,115 @@
              .map(|&loaded_id| self.arena.resolve(loaded_id))
              .collect::<Result<Vec<_>, _>>()?;
          self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
@@ -977,6 +1020,14 @@ and its LICENSE for provenance, the preserved license, and each local correction
 +        if total != device_indices.len() || total != kv_xfer.host_indices.as_ref().map_or(0, V::len)
 +        {
 +            return Err(invalid());
++        }
++        // A foreign-pin deferral intentionally leaves even a host-only anchor
++        // untouched. Ordinary empty plans still must pass the Full path guard.
++        if kv_xfer.load_back_deferred {
++            if total != 0 || !comp_xfers.is_empty() {
++                return Err(invalid());
++            }
++            return Ok(Vec::new());
 +        }
 +        // Bind this plan to the anchor's current host-only suffix and exact
 +        // ordered source rows. Equal counts alone survive reclaim/re-backup
@@ -1005,8 +1056,8 @@ and its LICENSE for provenance, the preserved license, and each local correction
 +            return Err(invalid());
 +        }
 +        // Auxiliary plans can become stale independently of Full KV, including
-+        // when Full has no rows to restore. Check every destination before any
-+        // component adopts rows or publishes events.
++        // when Full has no rows to restore. Check every destination and ordered
++        // host source before any component adopts rows or publishes events.
 +        for (&component_type, transfers) in &comp_xfers {
 +            for transfer in transfers {
 +                let Some(node_ids) = &transfer.nodes_to_load else {
@@ -1016,6 +1067,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
 +                if counts.len() != node_ids.len() {
 +                    return Err(invalid());
 +                }
++                let host_indices = transfer.host_indices.as_ref().ok_or_else(invalid)?;
 +                let mut auxiliary_total = 0usize;
 +                let mut auxiliary_seen = std::collections::HashSet::new();
 +                for (&id, &count) in node_ids.iter().zip(counts) {
@@ -1037,10 +1089,18 @@ and its LICENSE for provenance, the preserved license, and each local correction
 +                    {
 +                        return Err(invalid());
 +                    }
-+                    auxiliary_total = auxiliary_total.checked_add(count).ok_or_else(invalid)?;
++                    let end = auxiliary_total.checked_add(count).ok_or_else(invalid)?;
++                    if end > host_indices.len()
++                        || !node
++                            .host_value(component_type)
++                            .indices_equal(&host_indices.slice(auxiliary_total, count))
++                    {
++                        return Err(invalid());
++                    }
++                    auxiliary_total = end;
 +                }
 +                if transfer.device_indices.as_ref().map(V::len) != Some(auxiliary_total)
-+                    || transfer.host_indices.as_ref().map(V::len) != Some(auxiliary_total)
++                    || host_indices.len() != auxiliary_total
 +                {
 +                    return Err(invalid());
 +                }
@@ -1049,7 +1109,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let mut cache_actions: Vec<CacheAction<V>> = Vec::new();
          kv_xfer.device_indices = Some(device_indices);
          let nodes_to_load = kv_xfer.nodes_to_load.clone();
-@@ -4547,6 +4770,9 @@
+@@ -4547,6 +4791,9 @@
                  self.arena.node_mut(idx).load_back_pending_id = None;
                  // The pin blocked leaf-set membership; re-evaluate it.
                  self.update_evictable_leaf_sets_(idx);
@@ -1059,7 +1119,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              }
              self.update_full_coexisting_host_tracking_(idx);
              node_id = self.arena.node(idx).try_parent();
-@@ -4709,8 +4935,12 @@
+@@ -4709,8 +4956,12 @@
              if node.write_through_pending_id == Some(ack_id) {
                  node.write_through_pending_id = None;
                  self.update_full_coexisting_host_tracking_(node_idx);
@@ -1074,7 +1134,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          }
          Ok(())
      }
-@@ -4829,6 +5059,11 @@
+@@ -4829,6 +5080,11 @@
          for &(child_id, pos, prefix_len) in &spans {
              if pos + prefix_len <= window_start {
                  continue;
@@ -1086,7 +1146,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              }
              if self.arena.has_device_value(child_id, SWA) {
                  return Err(format!(
-@@ -5833,6 +6068,12 @@
+@@ -5833,6 +6089,12 @@
          let last_device_node_idx = self.arena.resolve(result.last_device_node_id)?;
          self.arena.resolve(result.last_host_node_id)?;
          let best_match_node_idx = self.arena.resolve(result.best_match_node_id)?;
@@ -1099,7 +1159,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          Ok(self
              .component_by_type_(component_type)
              .finalize_match_result_in_tree_core(
-@@ -5843,6 +6084,7 @@
+@@ -5843,6 +6105,7 @@
                  params,
                  value_chunks,
                  best_value_len,

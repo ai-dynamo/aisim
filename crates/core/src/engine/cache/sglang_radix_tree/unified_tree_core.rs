@@ -367,6 +367,8 @@ pub struct PoolTransfer<V: RadixValue> {
     pub nodes_to_load: Option<Vec<NodeId>>,
     /// Component host-row counts at planning time, in `nodes_to_load` order.
     pub node_row_counts: Option<Vec<usize>>,
+    /// An empty Full load-back descriptor deferred behind another anchor's pin.
+    pub load_back_deferred: bool,
 }
 
 impl<V: RadixValue> Default for PoolTransfer<V> {
@@ -379,6 +381,7 @@ impl<V: RadixValue> Default for PoolTransfer<V> {
             hit_policy: PoolHitPolicy::default(),
             nodes_to_load: None,
             node_row_counts: None,
+            load_back_deferred: false,
         }
     }
 }
@@ -4278,6 +4281,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 host_indices: Some(V::empty()),
                 nodes_to_load: Some(Vec::new()),
                 node_row_counts: Some(Vec::new()),
+                load_back_deferred: true,
                 ..Default::default()
             };
             return Ok((empty_kv, HashMap::new()));
@@ -4634,6 +4638,14 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         {
             return Err(invalid());
         }
+        // A foreign-pin deferral intentionally leaves even a host-only anchor
+        // untouched. Ordinary empty plans still must pass the Full path guard.
+        if kv_xfer.load_back_deferred {
+            if total != 0 || !comp_xfers.is_empty() {
+                return Err(invalid());
+            }
+            return Ok(Vec::new());
+        }
         // Bind this plan to the anchor's current host-only suffix and exact
         // ordered source rows. Equal counts alone survive reclaim/re-backup
         // with different host allocations. Compare borrowed views before any
@@ -4661,8 +4673,8 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             return Err(invalid());
         }
         // Auxiliary plans can become stale independently of Full KV, including
-        // when Full has no rows to restore. Check every destination before any
-        // component adopts rows or publishes events.
+        // when Full has no rows to restore. Check every destination and ordered
+        // host source before any component adopts rows or publishes events.
         for (&component_type, transfers) in &comp_xfers {
             for transfer in transfers {
                 let Some(node_ids) = &transfer.nodes_to_load else {
@@ -4672,6 +4684,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 if counts.len() != node_ids.len() {
                     return Err(invalid());
                 }
+                let host_indices = transfer.host_indices.as_ref().ok_or_else(invalid)?;
                 let mut auxiliary_total = 0usize;
                 let mut auxiliary_seen = std::collections::HashSet::new();
                 for (&id, &count) in node_ids.iter().zip(counts) {
@@ -4693,10 +4706,18 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                     {
                         return Err(invalid());
                     }
-                    auxiliary_total = auxiliary_total.checked_add(count).ok_or_else(invalid)?;
+                    let end = auxiliary_total.checked_add(count).ok_or_else(invalid)?;
+                    if end > host_indices.len()
+                        || !node
+                            .host_value(component_type)
+                            .indices_equal(&host_indices.slice(auxiliary_total, count))
+                    {
+                        return Err(invalid());
+                    }
+                    auxiliary_total = end;
                 }
                 if transfer.device_indices.as_ref().map(V::len) != Some(auxiliary_total)
-                    || transfer.host_indices.as_ref().map(V::len) != Some(auxiliary_total)
+                    || host_indices.len() != auxiliary_total
                 {
                     return Err(invalid());
                 }

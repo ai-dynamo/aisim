@@ -618,6 +618,291 @@ fn foreign_pin_load_back_deferral_commits_as_a_noop() {
 }
 
 #[test]
+fn foreign_pin_load_back_deferral_with_host_only_anchor_commits_as_a_noop() {
+    let mut tree = Core::new(
+        CacheInitParams {
+            enable_hicache: true,
+            is_write_back: true,
+            enable_kv_cache_events: true,
+            swa_sliding_window_size: Some(2),
+            has_swa_host_pool: true,
+            ..Default::default()
+        },
+        vec![FULL, SWA],
+    );
+    let a = insert(&mut tree, vec![10], &[1]);
+    let b = insert(&mut tree, vec![10, 20, 30], &[1, 2, 3]);
+    let c = insert(&mut tree, vec![10, 40], &[1, 4]);
+    for (id, key, start, device, host, full_host) in [
+        (a, vec![10], 0, vec![11], vec![101], vec![201]),
+        (
+            b,
+            vec![10, 20, 30],
+            1,
+            vec![12, 13],
+            vec![102, 103],
+            vec![202, 203],
+        ),
+        (c, vec![10, 40], 1, vec![14], vec![104], vec![204]),
+    ] {
+        tree.attach_swa_window(
+            &key,
+            Default::default(),
+            start,
+            key.len(),
+            &PageValue::from_vec(device),
+        )
+        .unwrap();
+        tree.commit_backup(
+            id,
+            PageValue::from_vec(full_host),
+            [(
+                SWA,
+                vec![PoolTransfer {
+                    name: PoolName::Swa,
+                    host_indices: Some(PageValue::from_vec(host)),
+                    nodes_to_load: Some(vec![id]),
+                    ..Default::default()
+                }],
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+        let pending = tree.mark_write_through_pending(vec![id], id).unwrap();
+        tree.finish_write_through(pending, id).unwrap();
+    }
+    for id in [b, c, a] {
+        tree.demote(id).unwrap();
+    }
+    let (full, mut auxiliary) = tree.build_load_back_spec(b, None).unwrap();
+    auxiliary.get_mut(&SWA).unwrap()[0].device_indices = Some(PageValue::from_vec(vec![302, 303]));
+    tree.commit_load_back(b, PageValue::from_vec(vec![5, 6, 7]), full, auxiliary)
+        .unwrap();
+    tree.take_events();
+    let nodes = tree.inspect_get_all_node_ids();
+    let sizes = (
+        tree.total_size(),
+        tree.evictable_size(),
+        tree.protected_size(),
+    );
+    // C still needs Full, while its two-atom SWA window crosses A's foreign pin.
+    let (full, auxiliary) = tree.build_load_back_spec(c, None).unwrap();
+    assert_eq!(full.node_row_counts.as_deref(), Some(&[][..]));
+    assert!(auxiliary.is_empty());
+    assert!(
+        tree.commit_load_back(c, PageValue::from_vec(vec![]), full, auxiliary)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(tree.inspect_get_all_node_ids(), nodes);
+    assert_eq!(
+        (
+            tree.total_size(),
+            tree.evictable_size(),
+            tree.protected_size()
+        ),
+        sizes
+    );
+    for id in [a, b, c] {
+        let node = tree.arena.node(tree.arena.resolve(id).unwrap());
+        assert_eq!(
+            node.load_back_pending_id,
+            if id == c { None } else { Some(b) }
+        );
+        assert_eq!(node.has_device_value(FULL), id != c);
+        assert_eq!(node.has_device_value(SWA), id == b);
+    }
+    assert!(tree.take_events().is_empty());
+    // An ordinary empty plan must not bypass the missing Full restore.
+    assert!(matches!(
+        tree.commit_load_back(
+            c,
+            PageValue::from_vec(vec![]),
+            PoolTransfer {
+                host_indices: Some(PageValue::from_vec(vec![])),
+                nodes_to_load: Some(vec![]),
+                node_row_counts: Some(vec![]),
+                ..Default::default()
+            },
+            HashMap::new()
+        ),
+        Err(TreeCoreRuntimeError::InvalidLoadBackSpec { .. })
+    ));
+    tree.finish_load_back(b).unwrap();
+    let (full, mut auxiliary) = tree.build_load_back_spec(c, None).unwrap();
+    assert_eq!(full.node_row_counts.as_deref(), Some(&[1][..]));
+    assert_eq!(
+        auxiliary[&SWA][0].node_row_counts.as_deref(),
+        Some(&[1, 1][..])
+    );
+    auxiliary.get_mut(&SWA).unwrap()[0].device_indices = Some(PageValue::from_vec(vec![301, 304]));
+    let actions = tree
+        .commit_load_back(c, PageValue::from_vec(vec![8]), full, auxiliary)
+        .unwrap();
+    let [
+        CacheAction::RebuildFullToSwaMapping {
+            full_indices,
+            swa_indices,
+        },
+    ] = actions.as_slice()
+    else {
+        panic!("expected SWA mapping for the replanned window");
+    };
+    assert_eq!(PageValue::concat(full_indices).as_slice(), &[5, 8]);
+    assert_eq!(PageValue::concat(swa_indices).as_slice(), &[301, 304]);
+    tree.finish_load_back(c).unwrap();
+    tree.try_sanity_check(&[], &[]).unwrap();
+}
+
+#[test]
+fn auxiliary_load_back_rejects_replaced_host_rows_before_any_commit() {
+    for component in [SWA, MAMBA] {
+        for write_back in [false, true] {
+            for replaced in [false, true] {
+                let mut tree = Core::new(
+                    CacheInitParams {
+                        enable_hicache: true,
+                        is_write_back: write_back,
+                        enable_kv_cache_events: true,
+                        swa_sliding_window_size: Some(2),
+                        has_swa_host_pool: true,
+                        mamba_cache_chunk_size: Some(1),
+                        ..Default::default()
+                    },
+                    vec![FULL, component],
+                );
+                let key = vec![10, 20];
+                let mut p = params(&key, &[1, 2]);
+                p.mamba_value = Some(PageValue::from_vec(vec![11]));
+                let leaf = tree.insert(&p).last_device_node_id.unwrap();
+                if component == SWA {
+                    tree.attach_swa_window(
+                        &key,
+                        Default::default(),
+                        0,
+                        2,
+                        &PageValue::from_vec(vec![11, 12]),
+                    )
+                    .unwrap();
+                }
+                backup_components(&mut tree, leaf, component);
+                evict_auxiliary(&mut tree, leaf, component);
+                let (full, mut auxiliary) = tree.build_load_back_spec(leaf, None).unwrap();
+                let rows = if component == SWA { 2 } else { 1 };
+                auxiliary.get_mut(&component).unwrap()[0].device_indices =
+                    Some(PageValue::from_vec((301..301 + rows).collect()));
+                if replaced {
+                    let reclaim = tree.drive_host_eviction(component, rows as usize);
+                    assert_eq!(
+                        reclaim.host_frees[&component][0].as_slice(),
+                        if component == SWA {
+                            &[201, 202][..]
+                        } else {
+                            &[201][..]
+                        }
+                    );
+                    assert!(reclaim.device_frees.is_empty());
+                    if component == SWA {
+                        tree.attach_swa_window(
+                            &key,
+                            Default::default(),
+                            0,
+                            2,
+                            &PageValue::from_vec(vec![21, 22]),
+                        )
+                        .unwrap();
+                    } else {
+                        p.mamba_value = Some(PageValue::from_vec(vec![21]));
+                        tree.insert(&p);
+                    }
+                    tree.commit_backup(
+                        leaf,
+                        PageValue::from_vec(vec![]),
+                        [(
+                            component,
+                            vec![PoolTransfer {
+                                host_indices: Some(PageValue::from_vec(
+                                    (401..401 + rows).collect(),
+                                )),
+                                nodes_to_load: Some(vec![leaf]),
+                                ..Default::default()
+                            }],
+                        )]
+                        .into_iter()
+                        .collect(),
+                    )
+                    .unwrap();
+                    let pending = tree.mark_write_through_pending(vec![leaf], leaf).unwrap();
+                    tree.finish_write_through(pending, leaf).unwrap();
+                    evict_auxiliary(&mut tree, leaf, component);
+                }
+                tree.take_events();
+                let sizes = (
+                    tree.total_size(),
+                    tree.evictable_size(),
+                    tree.protected_size(),
+                );
+                let lru = tree.inspect_get_component_device_lru_node_ids(component);
+                let result =
+                    tree.commit_load_back(leaf, PageValue::from_vec(vec![]), full, auxiliary);
+                if replaced {
+                    assert!(matches!(
+                        result,
+                        Err(TreeCoreRuntimeError::InvalidLoadBackSpec { .. })
+                    ));
+                    assert_eq!(
+                        (
+                            tree.total_size(),
+                            tree.evictable_size(),
+                            tree.protected_size()
+                        ),
+                        sizes
+                    );
+                    assert_eq!(
+                        tree.inspect_get_component_device_lru_node_ids(component),
+                        lru
+                    );
+                    let node = tree.arena.node(tree.arena.resolve(leaf).unwrap());
+                    assert!(!node.has_device_value(component));
+                    assert_eq!(
+                        node.host_value(component).as_slice(),
+                        if component == SWA {
+                            &[401, 402][..]
+                        } else {
+                            &[401][..]
+                        }
+                    );
+                    assert_eq!(node.load_back_pending_id, None);
+                    assert!(tree.take_events().is_empty());
+                    let (full, mut auxiliary) = tree.build_load_back_spec(leaf, None).unwrap();
+                    auxiliary.get_mut(&component).unwrap()[0].device_indices =
+                        Some(PageValue::from_vec((301..301 + rows).collect()));
+                    tree.commit_load_back(leaf, PageValue::from_vec(vec![]), full, auxiliary)
+                        .unwrap();
+                } else {
+                    result.unwrap();
+                }
+                tree.finish_load_back(leaf).unwrap();
+                let node = tree.arena.node(tree.arena.resolve(leaf).unwrap());
+                assert_eq!(
+                    node.device_value(component).as_slice(),
+                    if component == SWA {
+                        &[301, 302][..]
+                    } else {
+                        &[301][..]
+                    }
+                );
+                assert_eq!(node.device_value(FULL).as_slice(), &[1, 2]);
+                assert_eq!(node.load_back_pending_id, None);
+                assert!(tree.take_events().is_empty());
+                tree.try_sanity_check(&[], &[]).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
 fn failed_backup_drops_subtrees_in_stable_postorder() {
     for _ in 0..8 {
         let mut tree = Core::new(

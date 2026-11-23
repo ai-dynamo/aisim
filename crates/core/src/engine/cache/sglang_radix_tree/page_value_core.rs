@@ -49,12 +49,25 @@ fn release_params(receipt: &IncLockRefResult) -> DecLockRefParams {
 #[test]
 fn page_value_core_supports_read_only_match_and_continuation_insert() {
     let mut tree = core("lru");
-    insert(&mut tree, &[10, 20, 30, 40], &[1, 2, 3, 4]);
+    let original = insert(&mut tree, &[10, 20, 30, 40], &[1, 2, 3, 4])
+        .last_device_node_id
+        .unwrap();
+    let original_length = tree.inspect_get_node_key_length(original).unwrap();
+    let original_tick = tree.inspect_get_node_access_counter(original).unwrap();
+    assert_eq!(original_length, 4);
 
     let partial_key = vec![10, 20, 50, 60];
     assert_eq!(
         tree.full_kv_prefix_len(&partial_key, KeyNamespaceRef::default()),
         2
+    );
+    assert_eq!(
+        tree.inspect_get_node_key_length(original).unwrap(),
+        original_length
+    );
+    assert_eq!(
+        tree.inspect_get_node_access_counter(original).unwrap(),
+        original_tick
     );
     // On a FULL-only tree the read-only length is the admitted prefix.
     let admitted = tree.match_prefix(&MatchPrefixParams {
@@ -62,6 +75,11 @@ fn page_value_core_supports_read_only_match_and_continuation_insert() {
         namespace: KeyNamespaceRef::default(),
     });
     assert_eq!(admitted.device_indices.len(), 2);
+    assert_eq!(tree.inspect_get_node_key_length(original).unwrap(), 2);
+    assert_ne!(
+        tree.inspect_get_node_access_counter(original).unwrap(),
+        original_tick
+    );
 
     let prefix_key = vec![10, 20];
     let prefix = tree.match_prefix(&MatchPrefixParams {
