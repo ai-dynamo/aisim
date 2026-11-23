@@ -3095,17 +3095,21 @@ fn grouped_destination_retries_when_a_pass_releases_the_cached_block_of_a_bounda
     // holds 5 blocks: the 2 hit blocks and a new full-attention block, and
     // the cached state block of its hit and a running state block. The load
     // B of 33 tokens needs 4 blocks for its whole prompt and finds 3, so it
-    // waits. In pass 1 L allocates again, has computed past the hit block,
-    // and releases it with its other skipped blocks. The retry after pass 1
+    // waits. In pass 1 L allocates again. With one batch its processed
+    // count is its computed count, 42, which lies past the hit block, so L
+    // releases it with its other skipped blocks. The retry after pass 1
     // reserves B in the 4 free blocks. vLLM frees that block in the running
     // loop of the step and can reserve B in the waiting loop of the same
-    // step, one forward pass earlier. A decode rank frees on the computed
-    // count with async scheduling too, so both modes release the block in
-    // pass 1. On 7 pages B fits only once L ends, in pass 5, and the retry
-    // after pass 5 reserves it.
+    // step, one forward pass earlier. With async scheduling pass 1 is formed
+    // while pass 0 is in flight, so its processed count is L's count before
+    // pass 0, the 32 tokens of its hit, which does not lie past the hit
+    // block (v0.31 kv_cache_manager.py:549-556, v0.32 :552-559, v0.33
+    // :561-568). The block stays in pass 1 and goes in pass 2, and the retry
+    // after pass 2 reserves B. On 7 pages B fits only once L ends, in pass 5,
+    // and the retry after pass 5 reserves it.
     for version in ["0.31.0", "0.32.0", "0.33.0"] {
         for max_concurrent_batches in [1, 2] {
-            for (pages, reserving_pass) in [(8u64, 1), (7, 5)] {
+            for (pages, reserving_pass) in [(8u64, max_concurrent_batches), (7, 5)] {
                 let label = format!("{version} {max_concurrent_batches} {pages}");
                 let mut groups = full_and_state_transfer_groups();
                 if version != "0.31.0" {
@@ -3397,45 +3401,145 @@ fn grouped_destination_retries_when_a_pass_evicts_a_key() {
     }
 }
 
+/// A decode rank whose third pass evicts the last copy of a key that the
+/// waiting head hits, on `version` with `batches` concurrent batches. Returns
+/// the rank before the retry after that pass, and the handoff of the head.
+///
+/// Full-attention and state blocks of 16 tokens, a hash block of 16 and 10
+/// pages. S is a prefix of 64 tokens. Q is a load of 63 tokens, the first 48
+/// tokens of S and 15 of its own. It holds 4 attention blocks and a state
+/// block, and its activation publishes the attention keys of S at 16, 32 and
+/// 48 tokens. P is a load of 65 tokens that starts with S. It hits the 3
+/// blocks of Q, loads the fourth attention block and a state block, and its
+/// activation publishes the attention key and the state key of S at 64
+/// tokens. P is cancelled before its first pass. vLLM frees the blocks of a
+/// request group by group, each group from its last block (V31
+/// `coord:387-395`, `single:581-589`, V32 `coord:400-408`, `single:581-589`,
+/// v0.33 `coord:404-412`, `single:591-599`), so the attention block of P is
+/// the older cached block and its state block the newer one. U is a load of
+/// 48 other tokens. It takes the 3 free blocks and the oldest cached block,
+/// so the attention key of S at 64 tokens leaves the pool and the state key
+/// stays.
+///
+/// Pass 0 is the first pass of Q and of U, and U ends. It leaves its 3
+/// attention blocks cached and its state block free. Pass 1 computes token
+/// 64 of Q. Then the head arrives, a load of 71 tokens that starts with S. Q
+/// holds the attention blocks of its hit of 48 tokens. The state group hits
+/// 64 tokens, deeper than the full-attention group, so the local prefix is
+/// the hit that every group agrees on (V31 and V32 `mgr:360-364`, v0.33
+/// `mgr:369-373`), and the groups agree on no token. The head counts 5
+/// attention blocks and a state block for its 70 loaded tokens, and 5 blocks
+/// are free, so it waits.
+///
+/// Pass 2 computes token 65 of Q, which opens an attention block and a new
+/// state block. They take the free block and the oldest cached block, the
+/// state block of P: the last copy of the state key of S at 64 tokens. The
+/// pass releases no block and publishes no key, the loads in flight need 0
+/// blocks before and after it, and the published epoch stays. Now no group
+/// hits deeper than the full-attention group, so the local prefix of the
+/// head is its 48 tokens (V31 and V32 `mgr:366-369`, v0.33 `mgr:375-378`).
+/// It counts 2 attention blocks and a state block, and 3 blocks are free.
+fn decode_rank_after_a_pass_that_evicts_a_key(
+    version: &str,
+    batches: usize,
+) -> (VllmCore, HandoffId) {
+    let label = format!("{version} {batches}");
+    let mut core = one_token_load_core(version, 16, 10, batches);
+    let mut trace = TraceCollector::default();
+    let mut step = 0;
+    let mut now = 0.0;
+    let mut pass = |core: &mut VllmCore| {
+        if batches > 1 {
+            async_step(core, &mut now).output_signals.len()
+        } else {
+            step_pd(core, &mut trace, &mut step)
+        }
+    };
+    let need = |core: &VllmCore| core.kv_manager.grouped_inflight_need();
+    let blocks = |core: &VllmCore| {
+        let pool = block_pool(core);
+        (pool.active_blocks(), pool.inactive_cached_blocks())
+    };
+    let load = |id: u128, tokens: Vec<u32>, output: usize| DirectRequest {
+        tokens,
+        ..pd_request(id, 0, output)
+    };
+    let prefix =
+        |shared: u32, own: std::ops::Range<u32>| (0..shared).chain(own).collect::<Vec<u32>>();
+    let q = HandoffId::new(Uuid::from_u128(1911));
+    let p = HandoffId::new(Uuid::from_u128(1913));
+    let u = HandoffId::new(Uuid::from_u128(1915));
+    let head = HandoffId::new(Uuid::from_u128(1917));
+    // cdiv(62, 16) = 4 missing full-attention blocks.
+    assert_eq!(
+        reserve_grouped(&mut core, q, load(1910, prefix(48, 700..715), 8)),
+        Some(4),
+        "{label}"
+    );
+    activate(&mut core, q);
+    // cdiv(64, 16) = 4 full-attention blocks less the 3 hit blocks. P takes 2
+    // blocks beside the 5 of Q and needs 2 more for token 65.
+    assert_eq!(
+        reserve_grouped(&mut core, p, load(1912, prefix(64, 800..801), 2)),
+        Some(1),
+        "{label}"
+    );
+    assert_eq!(blocks(&core), (7, 0), "{label}");
+    assert_eq!(need(&core), 2, "{label}");
+    activate(&mut core, p);
+    core.apply_command(SchedulerCommand::CancelDestination { handoff_id: p })
+        .unwrap();
+    // The 2 blocks of P are cached, and its need is gone.
+    assert_eq!(blocks(&core), (5, 2), "{label}");
+    assert_eq!(need(&core), 0, "{label}");
+    // cdiv(47, 16) = 3 missing full-attention blocks. U takes 3 attention
+    // blocks and a state block: the 3 free blocks and 1 cached block.
+    assert_eq!(
+        reserve_grouped(&mut core, u, load(1914, (1000..1048).collect(), 1)),
+        Some(3),
+        "{label}"
+    );
+    assert_eq!(blocks(&core), (9, 1), "{label}");
+    activate(&mut core, u);
+    // Pass 0 emits one token of Q and one of U, and pass 1 one of Q. No
+    // destination waits, so a retry reserves nothing. After pass 1 the 5 blocks
+    // of Q are in use, and the state block of P and the 3 attention blocks of U
+    // are cached.
+    assert_eq!(pass(&mut core), 2, "{label}");
+    assert!(core.retry_pending_destinations().is_empty(), "{label}");
+    assert_eq!(pass(&mut core), 1, "{label}");
+    assert!(core.retry_pending_destinations().is_empty(), "{label}");
+    assert_eq!(blocks(&core), (5, 4), "{label}");
+    // 5 + 1 blocks against 10 - 5 = 5.
+    assert_eq!(
+        reserve_grouped(&mut core, head, load(1916, prefix(64, 900..907), 2)),
+        None,
+        "{label}"
+    );
+    // Pass 2 emits one token of Q, which now holds 7 blocks, and takes 1 of the
+    // 4 cached blocks. No load is in flight.
+    assert_eq!(pass(&mut core), 1, "{label}");
+    assert_eq!(blocks(&core), (7, 3), "{label}");
+    assert_eq!(need(&core), 0, "{label}");
+    (core, head)
+}
+
 #[test]
 fn grouped_destination_retries_when_a_pass_evicts_a_key_with_async_scheduling() {
-    let arrival = |pass, load, id, shared, prompt, output| Arrival {
-        pass,
-        load,
-        id,
-        shared,
-        prompt,
-        output,
-    };
-    let arrivals = [
-        arrival(5, false, 1, 80, 86, 5),
-        arrival(5, false, 2, 64, 91, 2),
-        arrival(9, true, 3, 96, 42, 11),
-        arrival(10, false, 4, 64, 52, 19),
-        arrival(12, false, 5, 80, 99, 13),
-        arrival(17, false, 6, 0, 47, 11),
-        arrival(17, false, 7, 64, 45, 4),
-        arrival(17, true, 8, 0, 86, 4),
-        arrival(19, false, 9, 80, 93, 5),
-        arrival(20, false, 10, 0, 56, 20),
-        arrival(22, true, 11, 96, 69, 25),
-        arrival(22, true, 12, 96, 81, 15),
-    ];
-    for version in ["0.32.0", "0.33.0"] {
-        let mut core = scripted_decode_rank_with(&arrivals, 27, 2, version);
-        let head = HandoffId::new(Uuid::from_u128(1_000_012));
-        // With async scheduling. Load 12 waits after its arrival. The last pass
-        // releases no block and publishes no key, so the pool's own epoch stays.
-        // It takes two of the six inactive cached blocks, and both hold the last
-        // copy of a key, which moves the generation of the resident keys by 2.
-        // The need of the loads in flight stays 0, and the published epoch
-        // stays. Load 12 now fits, so the retry after this pass reserves it with
-        // one transfer unit. Without the key generation in the retry epoch, that
-        // retry skips it.
-        assert_eq!(core.kv_manager.grouped_inflight_need(), 0);
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let (mut core, head) = decode_rank_after_a_pass_that_evicts_a_key(version, 2);
+        // With async scheduling. The head waits after its arrival. The last
+        // pass releases no block and publishes no key, so the pool's own
+        // epoch stays. It takes the last copy of a key, which moves the
+        // generation of the resident keys. The need of the loads in flight
+        // stays 0, and the published epoch stays. The head now fits, so the
+        // retry after this pass reserves it. Without the key generation in
+        // the retry epoch, that retry skips it.
+        // cdiv(70, 16) = 5 full-attention blocks less the 3 hit blocks.
         assert_eq!(
             reserved_units(&core.retry_pending_destinations(), head),
-            Some(1)
+            Some(2),
+            "{version}"
         );
     }
 }
@@ -6014,13 +6118,17 @@ fn grouped_scheduler_tells_the_kv_manager_when_the_pass_before_is_in_flight() {
     // processes pass 0 before it forms pass 2, which has nothing in flight.
     // With one batch vLLM processes each step before the next `schedule()`
     // (v0.33 engine/core.py:677-691).
-    // Only an aggregated rank tells the KV manager. A prefill or decode rank
-    // has a connector, whose role vLLM can count as a consumer (v0.31, v0.32
-    // and v0.33 kv_transfer.py:11-12). vLLM then pairs the hold on the
-    // processed count with a stop (v0.33 sched:193-195, :940-942), which
-    // replay does not model, so such a rank gets the computed count as its
-    // processed count, with a linear pool with a state cache as with a
-    // grouped pool.
+    // An aggregated rank tells the KV manager, and so does a grouped prefill
+    // or decode rank: vLLM frees on the processed count on a worker of every
+    // role (v0.31 kv_cache_manager.py:549-556, v0.32 :552-559, v0.33
+    // :561-568). A prefill or decode rank has a connector, whose role vLLM
+    // can count as a consumer (v0.31, v0.32 and v0.33 kv_transfer.py:11-12).
+    // vLLM then pairs the hold on the processed count with a stop (v0.31
+    // sched:175-181, :773-775, v0.32 sched:186-192, :804-806, v0.33
+    // sched:193-195, :940-942). Replay models that stop on a grouped prefill
+    // or decode rank only, so a linear prefill or decode rank gets the
+    // computed count as its processed count, with a state cache and without
+    // one.
     for (max_concurrent_batches, expected) in
         [(1, [false, false, false]), (2, [false, true, false])]
     {
@@ -6040,15 +6148,18 @@ fn grouped_scheduler_tells_the_kv_manager_when_the_pass_before_is_in_flight() {
         WorkerType::Prefill,
         WorkerType::Decode,
     ] {
-        for grouped in [false, true] {
+        for pool in ["linear", "state cache", "grouped"] {
+            let grouped = pool == "grouped";
             expected.push((
                 worker_type,
-                grouped,
-                [false, worker_type == WorkerType::Aggregated, false],
+                pool,
+                [
+                    false,
+                    worker_type == WorkerType::Aggregated || grouped,
+                    false,
+                ],
             ));
-            let mut args = if grouped {
-                async_prefix_core("0.33.0", 12, 2).args
-            } else {
+            let linear = || {
                 MockEngineArgs::builder()
                     .num_gpu_blocks(64)
                     .block_size(4)
@@ -6056,6 +6167,11 @@ fn grouped_scheduler_tells_the_kv_manager_when_the_pass_before_is_in_flight() {
                     .max_num_seqs(Some(8))
                     .enable_prefix_caching(true)
                     .speedup_ratio(0.0)
+                    .max_concurrent_batches(2)
+            };
+            let mut args = match pool {
+                "grouped" => async_prefix_core("0.33.0", 12, 2).args,
+                "state cache" => linear()
                     .kv_cache_bytes_per_token(Some(16))
                     .state_cache(Some(crate::engine::StateCacheConfig {
                         bytes_per_request: 64,
@@ -6065,9 +6181,9 @@ fn grouped_scheduler_tells_the_kv_manager_when_the_pass_before_is_in_flight() {
                         junction_checkpoints: false,
                     }))
                     .prefix_match_unit(Some(4))
-                    .max_concurrent_batches(2)
                     .build()
-                    .unwrap()
+                    .unwrap(),
+                _ => linear().build().unwrap(),
             };
             args.worker_type = worker_type;
             if worker_type != WorkerType::Aggregated {
@@ -6089,7 +6205,7 @@ fn grouped_scheduler_tells_the_kv_manager_when_the_pass_before_is_in_flight() {
             submit_tokens(&mut core, 1, (1000..1004).collect(), 1);
             seen.push((
                 worker_type,
-                grouped,
+                pool,
                 [(); 3].map(|()| {
                     async_step(&mut core, &mut now);
                     core.kv_manager.previous_pass_in_flight()
@@ -6332,7 +6448,7 @@ fn grouped_prefill_rank_keeps_copy_sources_until_the_scheduling_pass_ends() {
     // sched:1474-1482). It defers that free by one step only with async
     // scheduling and a connector in a consumer role, `kv_consumer` or
     // `kv_both` (v0.31 sched:156, :175-181, v0.32 sched:167, :186-192), and
-    // replay does not model a connector's role. So with one batch and with
+    // replay does not model that deferred free. So with one batch and with
     // async scheduling RC holds its 7 blocks and the 5 sources in its pass,
     // and RN waits one pass on pools of 13 to 17 blocks, as on an aggregated
     // rank.
@@ -6405,34 +6521,32 @@ fn grouped_prefix_decode_crossing_holds_the_previous_state_block_for_two_passes_
 }
 
 #[test]
-fn grouped_prefill_rank_frees_the_previous_state_block_on_the_computed_count_with_async_scheduling()
-{
-    // A prefill rank with full-attention and state blocks of 16 tokens
-    // computes the 48 tokens of a 49-token source in chunks of 16. Each chunk
-    // crosses a state block boundary. vLLM frees the state block of index i
-    // at the first allocation whose processed count lies above (i + 1) * 16
-    // (v0.33 single:682-720, :1608-1657), and with one batch the processed
-    // count is the computed count, because vLLM processes the outputs of
-    // each step before the next `schedule()` (v0.33 engine/core.py:677-691).
-    // Replay frees on the computed count on a prefill rank with async
-    // scheduling too. Pass 0 (0 to 16) holds 1 attention block and 1 state
-    // block: 2. Pass 1 (16 to 32) has the computed count 16, which is not
-    // above 16, so the block of index 0 stays beside the new running block:
-    // 2 attention blocks and 2 state blocks, 4. Pass 2 (32 to 48) has the
-    // computed count 32, so the block of index 0 goes first, and the pass
-    // holds 3 attention blocks, the block of index 1 and the new running
-    // block: 5 at its peak. A prefill worker runs its connector as
-    // `kv_both` or `kv_producer`, and vLLM counts `kv_both` as a consumer
-    // (v0.31, v0.32 and v0.33 kv_transfer.py:11-12). With a consumer
-    // connector and async scheduling vLLM holds the block one step longer on
-    // its processed count and pairs that hold with a stop: it does not
-    // preempt a request that the step in flight runs (v0.33 sched:193-195,
-    // :940-942). Replay models neither, so a rank with a connector keeps the
-    // computed count. The source ends in pass 2. Nothing of it is in flight
-    // when it ends, so its skipped state block goes at the end of the pass,
-    // and the held source keeps 4 blocks.
+fn grouped_prefill_rank_frees_the_previous_state_block_on_the_processed_count_with_async_scheduling()
+ {
+    // A prefill rank with full-attention and state blocks of 16 tokens computes
+    // the 48 tokens of a 49-token source in chunks of 16. Each chunk crosses a
+    // state block boundary. vLLM frees the state block of index i at the first
+    // allocation whose processed count lies above (i + 1) * 16 (v0.31
+    // single:687-725, :1626-1675, v0.32 :672-710, :1592-1641, v0.33 :682-720,
+    // :1608-1657). Pass 0 (0 to 16) holds 1 attention block and 1 state block:
+    // 2. Pass 1 (16 to 32) has a processed count of at most 16, which is not
+    // above 16, so the block of index 0 stays beside the new running block: 2
+    // attention blocks and 2 state blocks, 4. With one batch the processed
+    // count is the computed count, because vLLM processes the outputs of each
+    // step before the next `schedule()` (v0.31 engine/core.py:640-654, v0.32
+    // :667-681, v0.33 :677-691): pass 2 (32 to 48) has the count 32, so the
+    // block of index 0 goes first, and the pass holds 3 attention blocks, the
+    // block of index 1 and the new running block: 5 at its peak. With async
+    // scheduling pass 2 is formed while pass 1 is in flight, and its processed
+    // count is the computed count before pass 1, 16 (v0.31
+    // kv_cache_manager.py:549-556, v0.32 :552-559, v0.33 :561-568). The block
+    // of index 0 stays, and the pass holds 3 attention blocks and 3 state
+    // blocks: 6. The pool of 8 pages holds them, so no allocation fails. The
+    // source ends in pass 2. vLLM frees its skipped state blocks when it
+    // processes the outputs of that pass, and the held source keeps 3 attention
+    // blocks and the state block of its last token: 4.
     for version in ["0.31.0", "0.32.0", "0.33.0"] {
-        for max_concurrent_batches in [1, 2] {
+        for (max_concurrent_batches, peaks) in [(1, [2, 4, 5]), (2, [2, 4, 6])] {
             let label = format!("{version} {max_concurrent_batches}");
             let mut groups = full_and_state_transfer_groups();
             if version != "0.31.0" {
@@ -6461,47 +6575,49 @@ fn grouped_prefill_rank_frees_the_previous_state_block_on_the_computed_count_wit
                         .any(|event| matches!(event, SchedulerLifecycleEvent::SourceHeld { .. })),
                 );
             }
-            assert_eq!(seen, [2, 4, 5], "{label}");
+            assert_eq!(seen, peaks, "{label}");
             assert_eq!(held, [false, false, true], "{label}");
             assert_eq!(block_pool(&core).active_blocks(), 4, "{label}");
+            assert_eq!(core.mocker_metrics().vllm_preemptions_total, 0, "{label}");
         }
     }
 }
 
 #[test]
-fn grouped_decode_rank_frees_the_previous_state_block_of_a_load_on_the_computed_count_with_async_scheduling()
+fn grouped_decode_rank_frees_the_previous_state_block_of_a_load_on_the_processed_count_with_async_scheduling()
  {
     // The decode rank of
     // `grouped_destination_retries_when_a_pass_releases_a_state_block`. The
     // load computes 32 of its 33 tokens remotely. Its first pass (32 to 33)
-    // crosses the state block boundary at 32: 3 attention blocks, the
-    // running state block and the previous block of index 1, 5. The second
-    // pass has the computed count 33, which lies above 32, so the block goes
-    // (v0.33 single:682-720, :1608-1657): 4. With async scheduling vLLM frees
-    // on the processed count 32 and holds the block one step longer (v0.31
-    // kv_cache_manager.py:549-556, v0.32 :552-559, v0.33 :561-568). A decode
-    // worker runs its connector as a consumer, and vLLM pairs that hold with
-    // a stop: it does not preempt a request that the step in flight runs
-    // (v0.31 sched:175-181, :773-775, v0.32 sched:186-192, :804-806, v0.33
-    // sched:189-195, :940-942). Replay models neither on a decode rank, so
-    // it frees on the computed count in both modes.
-    for max_concurrent_batches in [1, 2] {
+    // crosses the state block boundary at 32: 3 attention blocks, the running
+    // state block and the previous block of index 1, 5. vLLM frees that block
+    // at the first allocation whose processed count lies above 32 (v0.31
+    // single:687-725, :1626-1675, v0.32 :672-710, :1592-1641, v0.33 :682-720,
+    // :1608-1657). With one batch the second pass has the count 33 and the
+    // block goes: 4. With async scheduling the second pass is formed while the
+    // first is in flight, so it has the processed count 32 and holds the block
+    // one step longer (v0.31 kv_cache_manager.py:549-556, v0.32 :552-559, v0.33
+    // :561-568): 5. The third pass has the count 33 and frees it: 4. vLLM's
+    // scheduler, run with the scheduler side of its NIXL connector, holds 2
+    // state blocks per group of the GLM groups during 2 calls with async
+    // scheduling and during 1 call with one batch.
+    for (max_concurrent_batches, expected) in [(1, [5, 4, 4]), (2, [5, 5, 4])] {
         let mut args = prefix_core(full_and_state_transfer_groups(), 800, 8192, 16, "0.31.0").args;
         args.worker_type = WorkerType::Decode;
         args.max_concurrent_batches = max_concurrent_batches;
         let mut core = VllmCore::new(args);
         let first = HandoffId::new(Uuid::from_u128(1644));
         assert_eq!(
-            reserve_grouped(&mut core, first, pd_request(1643, 33, 3)),
+            reserve_grouped(&mut core, first, pd_request(1643, 33, 4)),
             Some(2)
         );
         activate(&mut core, first);
         let mut now = 0.0;
-        let active = [(); 2].map(|()| {
+        let active = [(); 3].map(|()| {
             async_step(&mut core, &mut now);
             block_pool(&core).active_blocks()
         });
-        assert_eq!(active, [5, 4], "{max_concurrent_batches}");
+        assert_eq!(active, expected, "{max_concurrent_batches}");
     }
 }
 
@@ -6726,6 +6842,691 @@ fn grouped_prefix_lone_long_prompt_at_the_startup_count_preempts_itself_in_pairs
         assert_eq!(block_pool(&core).active_blocks(), 0, "{version}");
         assert_eq!(core.mocker_metrics().vllm_preemptions_total, 8, "{version}");
         assert_eq!(quiet[21..], [true; 3], "{version}");
+    }
+}
+
+#[test]
+fn grouped_prefill_and_decode_ranks_hold_the_state_blocks_of_an_aggregated_rank_with_async_scheduling()
+ {
+    // Full-attention and state blocks of 16 tokens in a pool of 10 pages. An
+    // aggregated and a decode rank compute a local prompt of 49 tokens, and a
+    // prefill rank the 49 tokens of a 50-token source, in chunks that end at
+    // 16, 32, 48 and 49. The chunks to 32, 48 and 49 each cross a state block
+    // boundary, back to back. vLLM frees the state block of index i at the
+    // first allocation whose processed count lies above (i + 1) * 16 (v0.31
+    // single:687-725, :1626-1675, v0.32 :672-710, :1592-1641, v0.33 :682-720,
+    // :1608-1657), on a worker of every role (v0.31
+    // kv_cache_manager.py:549-556, v0.32 :552-559, v0.33 :561-568). With one
+    // batch the processed counts of the four passes are 0, 16, 32 and 48. The
+    // pass to 32 holds 2 attention blocks and the blocks of index 0 and 1: 4.
+    // The pass to 48 frees the block of index 0 and holds 3 attention blocks
+    // and 2 state blocks: 5. The pass to 49 frees the block of index 1 and
+    // holds 4 and 2: 6. With async scheduling each pass is formed while the
+    // pass before is in flight, and the processed counts are 0, 0, 16 and 32.
+    // The pass to 48 still holds the block of index 0: 3 attention blocks and 3
+    // state blocks, 6. The pass to 49 frees it and holds the blocks of index 1,
+    // 2 and 3: 4 and 3, 7. The pool holds every pass, so no allocation fails
+    // and the three rank types take the same blocks.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        for (max_concurrent_batches, expected) in [(1, [2, 4, 5, 6]), (2, [2, 4, 6, 7])] {
+            for worker_type in [
+                WorkerType::Aggregated,
+                WorkerType::Prefill,
+                WorkerType::Decode,
+            ] {
+                let label = format!("{version} {max_concurrent_batches} {worker_type:?}");
+                let mut groups = full_and_state_transfer_groups();
+                if version != "0.31.0" {
+                    groups[1].prefill_checkpoint_blocks = Some(0);
+                }
+                let mut args = prefix_core(groups, 10 * 100, 16, 16, version).args;
+                args.worker_type = worker_type;
+                args.max_concurrent_batches = max_concurrent_batches;
+                if worker_type == WorkerType::Prefill {
+                    args.kv_transfer_bandwidth = Some(1.0);
+                }
+                let mut core = VllmCore::new(args);
+                if worker_type == WorkerType::Prefill {
+                    core.apply_command(SchedulerCommand::SubmitHandoffPrefill {
+                        handoff_id: HandoffId::new(Uuid::from_u128(1802)),
+                        request: source_request(1801, 50),
+                    })
+                    .unwrap();
+                } else {
+                    submit(&mut core, 1801, 49, 1);
+                }
+                let mut now = 0.0;
+                let peaks = [(); 4].map(|()| {
+                    block_pool(&core).reset_peak_active_blocks();
+                    async_step(&mut core, &mut now);
+                    block_pool(&core).peak_active_blocks()
+                });
+                assert_eq!(peaks, expected, "{label}");
+                assert_eq!(core.mocker_metrics().vllm_preemptions_total, 0, "{label}");
+            }
+        }
+    }
+}
+
+/// A GLM prefill rank with a pool of `pool` pages at a `max_model_len` of
+/// 13,056 and a step budget of one block, with one source of 12,000 tokens.
+/// Steps until the rank holds the source. Returns the computed tokens of the
+/// source after each pass, with 11,999 for the pass that ends it, the peak of
+/// the active blocks in each pass, the passes that asked for a retry at the
+/// same time, and the preemptions.
+fn lone_glm_source(
+    version: &str,
+    checkpoint: bool,
+    hash: usize,
+    pool: u64,
+    max_concurrent_batches: usize,
+) -> (Vec<usize>, Vec<usize>, Vec<usize>, u64) {
+    let mut args = prefix_core(
+        glm_transfer_groups(version, checkpoint),
+        pool * GLM_PAGE,
+        2176,
+        hash,
+        version,
+    )
+    .args;
+    args.worker_type = WorkerType::Prefill;
+    args.kv_transfer_bandwidth = Some(1.0);
+    args.max_model_len = Some(13_056);
+    args.max_concurrent_batches = max_concurrent_batches;
+    let mut core = VllmCore::new(args);
+    let source = Uuid::from_u128(1901);
+    core.apply_command(SchedulerCommand::SubmitHandoffPrefill {
+        handoff_id: HandoffId::new(Uuid::from_u128(1902)),
+        request: DirectRequest {
+            uuid: Some(source),
+            tokens: (44_000_000..44_012_000).collect(),
+            max_output_tokens: 1,
+            ..Default::default()
+        },
+    })
+    .unwrap();
+    let mut now = 0.0;
+    let (mut computed, mut peaks, mut retries) = (Vec::new(), Vec::new(), Vec::new());
+    for pass in 0..40 {
+        block_pool(&core).reset_peak_active_blocks();
+        let result = async_step(&mut core, &mut now);
+        peaks.push(block_pool(&core).peak_active_blocks());
+        if result.same_timestamp_retry == crate::engine::generalized::SameTimestampRetry::Retry {
+            retries.push(pass);
+        }
+        match core.state.requests.get(&source) {
+            Some(request) => computed.push(request.num_computed_tokens),
+            None => {
+                assert!(
+                    result
+                        .lifecycle_events
+                        .iter()
+                        .any(|event| matches!(event, SchedulerLifecycleEvent::SourceHeld { .. }))
+                );
+                computed.push(11_999);
+                break;
+            }
+        }
+    }
+    (
+        computed,
+        peaks,
+        retries,
+        core.mocker_metrics().vllm_preemptions_total,
+    )
+}
+
+#[test]
+fn grouped_prefill_rank_stops_a_source_behind_the_pass_in_flight_and_preempts_nothing() {
+    // The GLM groups at a `max_model_len` of 13,056 with a step budget of one
+    // block, on a prefill rank at vLLM's startup count: 6 attention blocks,
+    // the ring block and `2 + c` blocks per state group, 15 without a
+    // checkpoint block and 19 with one (v0.31 kv_cache_interface.py:1083-1094,
+    // v0.32 :1076-1082, v0.33 :1135-1141). One source of 12,000 tokens
+    // computes 11,999. With async scheduling its third chunk in a row has the
+    // processed count 2,176, the count before the chunk in flight (v0.31
+    // kv_cache_manager.py:549-556, v0.32 :552-559, v0.33 :561-568), so the
+    // blocks of index 0 stay and the chunk needs an attention block and 4
+    // running blocks with 4 blocks free. The allocation fails, the victim is
+    // the source itself, and the step in flight runs it. With a consumer
+    // connector vLLM does not preempt such a request: the running loop
+    // stops, the step schedules nothing, and the next `schedule()` call
+    // follows the outputs of the step in flight, has the processed count
+    // 4,352 and frees the blocks of index 0 first (v0.31 sched:175-181,
+    // :773-775, :2694-2698, v0.32 sched:186-192, :804-806, :2759-2763, v0.33
+    // sched:193-195, :940-942, :3077-3082). So every second pass from pass 2
+    // on schedules nothing and holds what the pass before it held: 4 such
+    // passes with a hash block of 2,176, and 5 with a hash block of 1,088,
+    // whose last chunks end at 11,968 and 11,999. No pass preempts. With a
+    // checkpoint block the pool of 19 holds three state blocks per group,
+    // and no pass stops. With one batch the processed count is the computed
+    // count, and no pass stops either.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        // vLLM's scheduler, run with the scheduler side of its NIXL connector
+        // at v0.31.0, v0.32.0 and v0.33.0, gives these rows: its running loop
+        // stops in the `schedule()` calls 3, 5, 7 and 9 (and 11 with a hash
+        // block of 1,088), uses 6, 11, 11, 12, 12, 13, 13, 14, 14 and 15
+        // blocks, and preempts nothing.
+        let (computed, peaks, retries, preemptions) = lone_glm_source(version, false, 2176, 15, 2);
+        assert_eq!(
+            computed,
+            [
+                2176, 4352, 4352, 6528, 6528, 8704, 8704, 10_880, 10_880, 11_999
+            ],
+            "{version}"
+        );
+        assert_eq!(peaks, [6, 11, 11, 12, 12, 13, 13, 14, 14, 15], "{version}");
+        assert_eq!(retries, [2, 4, 6, 8], "{version}");
+        assert_eq!(preemptions, 0, "{version}");
+
+        let (computed, _, retries, preemptions) = lone_glm_source(version, false, 1088, 15, 2);
+        assert_eq!(
+            computed,
+            [
+                2176, 4352, 4352, 6528, 6528, 8704, 8704, 10_880, 10_880, 11_968, 11_968, 11_999
+            ],
+            "{version}"
+        );
+        assert_eq!(retries, [2, 4, 6, 8, 10], "{version}");
+        assert_eq!(preemptions, 0, "{version}");
+
+        // The same run with one batch: no stop, no preemption, 2 state blocks
+        // per group.
+        for (hash, expected) in [
+            (2176, vec![2176, 4352, 6528, 8704, 10_880, 11_999]),
+            (1088, vec![2176, 4352, 6528, 8704, 10_880, 11_968, 11_999]),
+        ] {
+            let (computed, _, retries, preemptions) = lone_glm_source(version, false, hash, 15, 1);
+            assert_eq!(computed, expected, "{version} {hash}");
+            assert_eq!((retries, preemptions), (Vec::new(), 0), "{version} {hash}");
+        }
+        if version != "0.31.0" {
+            // The same run with a checkpoint block at v0.32.0 and v0.33.0: pool
+            // 19, no stop, no preemption, 3 state blocks per group, 6, 11, 16,
+            // 17, 18 and 19 blocks in use.
+            let (computed, peaks, retries, preemptions) =
+                lone_glm_source(version, true, 2176, 19, 2);
+            assert_eq!(
+                computed,
+                [2176, 4352, 6528, 8704, 10_880, 11_999],
+                "{version}"
+            );
+            assert_eq!(peaks, [6, 11, 16, 17, 18, 19], "{version}");
+            assert_eq!((retries, preemptions), (Vec::new(), 0), "{version}");
+        }
+    }
+}
+
+/// A pass of `two_glm_requests`: the computed tokens of R0 and R1 after it
+/// (`None` once a request has ended), the requests it preempted and whether
+/// it asked for a retry at the same time.
+type TwoRequestPass = (Option<usize>, Option<usize>, u64, bool);
+
+/// Two local requests of 6,000 tokens on the GLM groups: R0 with
+/// `first_outputs` output tokens and R1 with 3, on a pool of 17 pages at a
+/// `max_model_len` of 13,056 with a step budget of two blocks. Steps until
+/// the rank drains, with `gap_before` passes formed 1 ms after the pass
+/// before ended. Returns each pass and the peak of the active blocks in each
+/// pass.
+fn two_glm_requests(
+    worker_type: WorkerType,
+    max_concurrent_batches: usize,
+    first_outputs: usize,
+    gap_before: &[usize],
+) -> (Vec<TwoRequestPass>, Vec<usize>) {
+    let groups = if worker_type == WorkerType::Aggregated {
+        glm_groups(false)
+    } else {
+        glm_transfer_groups("0.33.0", false)
+    };
+    let mut args = prefix_core(groups, 17 * GLM_PAGE, 4352, 2176, "0.33.0").args;
+    args.worker_type = worker_type;
+    args.max_model_len = Some(13_056);
+    args.max_concurrent_batches = max_concurrent_batches;
+    let mut core = VllmCore::new(args);
+    let r0 = submit_tokens(&mut core, 1, (0..6000).collect(), first_outputs);
+    let r1 = submit_tokens(&mut core, 2, (100_000..106_000).collect(), 3);
+    let mut now = 0.0;
+    let (mut rows, mut peaks) = (Vec::new(), Vec::new());
+    for pass in 0..20 {
+        if core.is_drained() {
+            break;
+        }
+        if gap_before.contains(&pass) {
+            now += 1.0;
+        }
+        let before = core.mocker_metrics().vllm_preemptions_total;
+        block_pool(&core).reset_peak_active_blocks();
+        let result = async_step(&mut core, &mut now);
+        let computed = |uuid| {
+            core.state
+                .requests
+                .get(&uuid)
+                .map(|request| request.num_computed_tokens)
+        };
+        rows.push((
+            computed(r0),
+            computed(r1),
+            result.mocker_metrics.vllm_preemptions_total - before,
+            result.same_timestamp_retry == crate::engine::generalized::SameTimestampRetry::Retry,
+        ));
+        peaks.push(block_pool(&core).peak_active_blocks());
+    }
+    assert!(core.is_drained());
+    (rows, peaks)
+}
+
+#[test]
+fn grouped_decode_rank_stops_a_request_that_the_pass_in_flight_runs_and_preempts_one_that_it_does_not()
+ {
+    // Two local requests of 6,000 tokens on a GLM decode rank of 17 pages with
+    // a step budget of two blocks. R0 computes to 4,352, 6,000 and then one
+    // token per pass. R1 waits until its whole sequence fits and starts in pass
+    // 3 with 2,176 tokens. In pass 4 its second chunk crosses a state block
+    // boundary and needs an attention block and 4 running blocks with 3 blocks
+    // free, while the 8 blocks of R0 are still held. The victim is R1 itself,
+    // the last running request.
+    //
+    // With async scheduling pass 3 is in flight when pass 4 is formed, and it
+    // ran R1. With a consumer connector vLLM does not preempt such a request:
+    // the running loop stops, and the next step tries the request again (v0.31
+    // sched:175-181, :773-775, :2694-2698, v0.32 sched:186-192, :804-806,
+    // :2759-2763, v0.33 sched:193-195, :940-942, :3077-3082).
+    //
+    // R0 with 3 output tokens ends in pass 3. Pass 4 schedules nothing, and
+    // vLLM then processes pass 3 and frees R0 (v0.31 engine/core.py:697,
+    // :740-755, v0.32 :725, :768-783, v0.33 :735, :778-793). Pass 5 holds no
+    // pass in flight, and R1 computes to 4,352, 6,000 and its outputs. No pass
+    // preempts.
+    //
+    // R0 with 5 output tokens still runs in passes 4 and 5. Pass 4 stops R1 and
+    // runs R0. Pass 5 is formed behind pass 4, which did not run R1, so R1's
+    // blocks can be freed: its allocation fails again, and vLLM preempts it. R0
+    // ends in pass 5, and R1 starts again in pass 6.
+    //
+    // An aggregated rank has no connector and no stop: R1 is preempted in pass
+    // 4. With one batch nothing is in flight: R0 frees its previous state
+    // blocks one pass earlier, R1 starts in pass 2 and is preempted in pass 3.
+    // A pass 4 that is formed after pass 3 has ended has no pass in flight
+    // either: with R0 ended its blocks are free and R1 fits, and with R0
+    // running R1 is preempted in that pass.
+    let stop = (None, Some(2176), 0, true);
+    // vLLM's scheduler, run with the scheduler side of its NIXL connector
+    // at v0.31.0, v0.32.0 and v0.33.0, stops in `schedule()` call 5,
+    // preempts nothing and uses 7, 12, 12, 14, 14, 11, 16 and 12 blocks
+    // in calls 1 to 8.
+    let (rows, peaks) = two_glm_requests(WorkerType::Decode, 2, 3, &[]);
+    assert_eq!(
+        rows,
+        [
+            (Some(4352), Some(0), 0, false),
+            (Some(6000), Some(0), 0, false),
+            (Some(6001), Some(0), 0, false),
+            (None, Some(2176), 0, false),
+            stop,
+            (None, Some(4352), 0, false),
+            (None, Some(6000), 0, false),
+            (None, Some(6001), 0, false),
+            (None, None, 0, false),
+        ]
+    );
+    assert_eq!(peaks[..7], [7, 12, 12, 14, 14, 11, 16]);
+
+    // The same run at v0.33.0 with R0 ending on a stop token as its output
+    // 4 while step 6 runs it stops in call 5, preempts R1 in call 6 at
+    // 2,176 computed tokens, and uses 14, 14 and 8 blocks after calls 4
+    // to 6 and 14, 11 and 16 in calls 7 to 9. vLLM defers that free until
+    // step 6 ends. Here R0 ends at its output limit in pass 5, which holds
+    // its blocks for the same passes.
+    let (rows, peaks) = two_glm_requests(WorkerType::Decode, 2, 5, &[]);
+    assert_eq!(
+        rows[3..9],
+        [
+            (Some(6002), Some(2176), 0, false),
+            (Some(6003), Some(2176), 0, false),
+            (None, Some(0), 1, false),
+            (None, Some(2176), 0, false),
+            (None, Some(4352), 0, false),
+            (None, Some(6000), 0, false),
+        ]
+    );
+    assert_eq!(peaks[3..9], [14, 14, 14, 14, 11, 16]);
+
+    // vLLM's scheduler without a connector, at the three versions,
+    // preempts R1 in call 5 at 2,176 computed tokens.
+    let (rows, _) = two_glm_requests(WorkerType::Aggregated, 2, 3, &[]);
+    assert_eq!(
+        rows[3..6],
+        [
+            (None, Some(2176), 0, false),
+            (None, Some(0), 1, true),
+            (None, Some(2176), 0, false),
+        ]
+    );
+
+    let (rows, _) = two_glm_requests(WorkerType::Decode, 1, 3, &[]);
+    assert_eq!(
+        rows[..4],
+        [
+            (Some(4352), Some(0), 0, false),
+            (Some(6000), Some(0), 0, false),
+            (Some(6001), Some(2176), 0, false),
+            (None, Some(0), 1, false),
+        ]
+    );
+
+    let (rows, _) = two_glm_requests(WorkerType::Decode, 2, 3, &[4]);
+    assert_eq!(
+        rows[3..5],
+        [(None, Some(2176), 0, false), (None, Some(4352), 0, false)]
+    );
+    let (rows, _) = two_glm_requests(WorkerType::Decode, 2, 5, &[4]);
+    assert_eq!(
+        rows[3..5],
+        [
+            (Some(6002), Some(2176), 0, false),
+            (Some(6003), Some(0), 1, false),
+        ]
+    );
+}
+
+#[test]
+fn grouped_decode_rank_stops_a_request_whose_chunk_in_flight_computed_only_output_tokens() {
+    // Full-attention and state blocks of 16 tokens on a decode rank of 12
+    // pages with a step budget of 32 tokens. X (20 tokens) and R (5 tokens)
+    // start in pass 0 and decode one token per pass. The prompt of X takes
+    // two passes, as its first chunk ends at the state block boundary 16, so
+    // from pass 1 on X has computed 19 + k tokens after pass k, and R 5 + k.
+    //
+    // In pass 46 X crosses the state block boundary at 64 and needs an
+    // attention block and a running block. X holds 5 blocks. R holds 6: 4
+    // attention blocks, its running state block and the block of index 2,
+    // which it left in pass 44 and which its allocation of pass 45 kept on
+    // the processed count 48. X is scheduled before R, so R has not
+    // allocated in pass 46 yet. The victim is R, the last running request,
+    // and pass 45 ran it, so the running loop stops and the pass schedules
+    // nothing. Pass 47 has no pass in flight, X fails again and R is
+    // preempted with 50 computed tokens.
+    //
+    // R starts again in pass 48, when its whole sequence fits, and computes
+    // 16 tokens per pass beside X: the first chunk holds its 5 prompt
+    // tokens, and the chunks to 32 and 48 hold only output tokens that it
+    // computes again and emit nothing. vLLM stamps every request that a step
+    // schedules with that step (v0.31 sched:1594-1600, v0.32 :1627-1633,
+    // v0.33 :1856-1862). In pass 51 the chunk from 48 has the processed
+    // count 32 (v0.31 kv_cache_manager.py:549-556, v0.32 :552-559, v0.33
+    // :561-568). It frees the block of index 0 and needs 4 attention blocks
+    // and the blocks of index 1, 2 and 3, 7 blocks beside the 6 of X. The
+    // victim is R, and pass 50 ran it, so vLLM stops and R keeps its blocks
+    // (v0.31 sched:773-775, :2694-2698, v0.32 sched:804-806, :2759-2763,
+    // v0.33 sched:940-942, :3077-3082). Pass 52 was formed behind pass 51,
+    // which did not run R: its processed count is 48, the block of index 1
+    // goes, and R computes to its last known token and emits. So R is
+    // preempted once in these passes.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let mut groups = full_and_state_transfer_groups();
+        if version != "0.31.0" {
+            groups[1].prefill_checkpoint_blocks = Some(0);
+        }
+        let mut args = prefix_core(groups, 12 * 100, 32, 16, version).args;
+        args.worker_type = WorkerType::Decode;
+        args.max_concurrent_batches = 2;
+        let mut core = VllmCore::new(args);
+        let x = submit_tokens(&mut core, 1, (1000..1020).collect(), 120);
+        let r = submit_tokens(&mut core, 2, (2000..2005).collect(), 60);
+        let mut now = 0.0;
+        let mut rows = Vec::new();
+        for _ in 0..=52 {
+            let before = core.mocker_metrics().vllm_preemptions_total;
+            let result = async_step(&mut core, &mut now);
+            rows.push((
+                core.state.requests[&x].num_computed_tokens,
+                core.state.requests[&r].num_computed_tokens,
+                result.mocker_metrics.vllm_preemptions_total - before,
+                result.output_signals.len(),
+            ));
+        }
+        // Each row is X's computed tokens, R's computed tokens, the
+        // preemptions and the outputs of the pass.
+        assert_eq!(
+            rows[45..],
+            [
+                (64, 50, 0, 2),
+                (64, 50, 0, 0),
+                (65, 0, 1, 1),
+                (66, 16, 0, 1),
+                (67, 32, 0, 1),
+                (68, 48, 0, 1),
+                (69, 48, 0, 1),
+                (70, 51, 0, 2),
+            ],
+            "{version}"
+        );
+        assert_eq!(core.mocker_metrics().vllm_preemptions_total, 1, "{version}");
+    }
+}
+
+#[test]
+fn grouped_decode_rank_stops_for_the_last_of_eight_requests_that_the_pass_in_flight_runs() {
+    // Full-attention and state blocks of 16 tokens on a decode rank of 17
+    // pages with 8 running requests. X (12 tokens) and seven requests of 3
+    // tokens start in pass 0, hold 2 blocks each, 16 in all, and decode one
+    // token per pass. After pass 4 X has computed 16 tokens. In pass 5 it
+    // crosses the state block boundary and needs an attention block and a
+    // running block with 1 block free. The victim is the last running
+    // request, and pass 4 ran all eight, so vLLM stops (v0.31 sched:773-775,
+    // :2694-2698, v0.32 sched:804-806, :2759-2763, v0.33 sched:940-942,
+    // :3077-3082). X is the first running request, so pass 5 schedules
+    // nothing. Pass 6 has no pass in flight, X fails again, and the last
+    // request is preempted. X then takes its two blocks.
+    let mut args = prefix_core(full_and_state_transfer_groups(), 17 * 100, 64, 16, "0.31.0").args;
+    args.worker_type = WorkerType::Decode;
+    args.max_num_seqs = Some(8);
+    args.max_concurrent_batches = 2;
+    let mut core = VllmCore::new(args);
+    let x = submit_tokens(&mut core, 1, (1000..1012).collect(), 20);
+    let others: Vec<_> = (2..=8u32)
+        .map(|id| {
+            submit_tokens(
+                &mut core,
+                u128::from(id),
+                (id * 1000..id * 1000 + 3).collect(),
+                20,
+            )
+        })
+        .collect();
+    let mut now = 0.0;
+    let mut rows = Vec::new();
+    for _ in 0..7 {
+        let before = core.mocker_metrics().vllm_preemptions_total;
+        let result = async_step(&mut core, &mut now);
+        rows.push((
+            core.state.requests[&x].num_computed_tokens,
+            core.state.requests[&others[6]].num_computed_tokens,
+            result.mocker_metrics.vllm_preemptions_total - before,
+            result.output_signals.len(),
+        ));
+    }
+    // Each row is X's computed tokens, those of the last request, the
+    // preemptions and the outputs of the pass.
+    assert_eq!(rows[4..], [(16, 7, 0, 8), (16, 7, 0, 0), (17, 0, 1, 7)]);
+}
+
+#[test]
+fn linear_prefill_and_decode_ranks_preempt_a_request_that_the_pass_in_flight_runs() {
+    // Linear ranks of 4-token blocks without a CPU tier. X and Y (4 tokens
+    // each) start in pass 0 and decode one token per pass. On a pool of 5
+    // blocks each holds 2 blocks from its token 5 on, the token 9 of X takes
+    // the fifth block in pass 5, and the token 9 of Y finds none. Y is the last
+    // running request, and pass 4 ran it. With a consumer connector and async
+    // scheduling vLLM stops there (v0.31 sched:175-181, :773-775, v0.32
+    // sched:186-192, :804-806, v0.33 sched:193-195, :940-942). Replay models
+    // that stop on a grouped prefill or decode rank only, so a linear rank
+    // preempts Y in pass 5 with two batches as with one. An aggregated rank has
+    // no connector and preempts Y too. A state cache adds blocks to each
+    // request, so on its pool of 7 blocks a pass preempts Y earlier, and the
+    // passes of two batches are those of one batch there too.
+    for pool in ["linear", "state cache"] {
+        for worker_type in [
+            WorkerType::Prefill,
+            WorkerType::Decode,
+            WorkerType::Aggregated,
+        ] {
+            let run = |max_concurrent_batches| {
+                let builder = MockEngineArgs::builder()
+                    .num_gpu_blocks(if pool == "linear" { 5 } else { 7 })
+                    .block_size(4)
+                    .max_num_batched_tokens(Some(64))
+                    .max_num_seqs(Some(8))
+                    .enable_prefix_caching(true)
+                    .speedup_ratio(0.0)
+                    .max_concurrent_batches(max_concurrent_batches);
+                let mut args = if pool == "linear" {
+                    builder.build().unwrap()
+                } else {
+                    builder
+                        .kv_cache_bytes_per_token(Some(16))
+                        .state_cache(Some(crate::engine::StateCacheConfig {
+                            bytes_per_request: 64,
+                            sliding_window: None,
+                            num_speculative_states: None,
+                            prefill_checkpoint: false,
+                            junction_checkpoints: false,
+                        }))
+                        .prefix_match_unit(Some(4))
+                        .build()
+                        .unwrap()
+                };
+                args.worker_type = worker_type;
+                let mut core = VllmCore::new(args);
+                let x = submit_tokens(&mut core, 1, (1000..1004).collect(), 20);
+                let y = submit_tokens(&mut core, 2, (2000..2004).collect(), 20);
+                let mut now = 0.0;
+                [(); 8].map(|()| {
+                    let before = core.mocker_metrics().vllm_preemptions_total;
+                    let result = async_step(&mut core, &mut now);
+                    (
+                        core.state.requests[&x].num_computed_tokens,
+                        core.state.requests[&y].num_computed_tokens,
+                        result.mocker_metrics.vllm_preemptions_total - before,
+                    )
+                })
+            };
+            let label = format!("{pool} {worker_type:?}");
+            let rows = run(2);
+            assert_eq!(rows, run(1), "{label}");
+            if pool == "linear" {
+                assert_eq!(rows[4..6], [(8, 8, 0), (9, 0, 1)], "{label}");
+            }
+            // A pass preempts Y on both pools, so the passes cover the case.
+            assert!(rows.iter().any(|row| row.2 == 1), "{label}");
+        }
+    }
+}
+
+#[test]
+fn grouped_prefill_and_decode_ranks_check_a_forward_on_the_count_that_the_stop_reaches() {
+    // The pools of
+    // `grouped_byte_mode_oversized_decode_step_gives_the_configuration_error_with_async_scheduling`
+    // and of its block-mode twin: a full-attention group of 3-token blocks and
+    // a window group of window 4 and 4-token blocks, in 36 bytes or 7 blocks. A
+    // forward to `t` tokens holds `cdiv(t, 3)` full blocks and the window
+    // blocks from `(processed - 3) / 4` up to `cdiv(t, 4)` (v0.31
+    // single:687-725, :1153-1188, kv_cache_manager.py:549-556, v0.32
+    // single:672-710, :1135-1170, kv_cache_manager.py:552-559, v0.33
+    // single:682-720, :1148-1183, kv_cache_manager.py:561-568). With async
+    // scheduling the step from 15 to 16 tokens has the processed count 14: 6
+    // full blocks and 2 window blocks, more than the pool. On a prefill or
+    // decode rank that allocation fails behind the pass in flight, which ran
+    // the request, so vLLM stops, and the next step has the processed count 15
+    // and needs 6 full blocks and 1 window block, which fit (v0.31
+    // sched:175-181, :773-775, v0.32 sched:186-192, :804-806, v0.33
+    // sched:193-195, :940-942). So the forward check of a grouped prefill or
+    // decode rank counts from the computed count: a request of 8 prompt tokens
+    // and 9 output tokens, whose last step ends at 16 tokens, drains with one
+    // pass that schedules nothing, pass 8. With 10 output tokens the step from
+    // 16 to 17 needs 6 full blocks and 2 window blocks on the computed count
+    // too, and the check reports the configuration error. An aggregated rank
+    // has no stop, so its check counts from the processed count and reports the
+    // step from 15 to 16.
+    for block_mode in [false, true] {
+        for worker_type in [
+            WorkerType::Prefill,
+            WorkerType::Decode,
+            WorkerType::Aggregated,
+        ] {
+            for output in [9, 10] {
+                let label = format!("{block_mode} {worker_type:?} {output}");
+                let mut full = group("full", 3, if block_mode { 8 } else { 4 }, None);
+                let mut window = group("window", 4, 8, Some(4));
+                for group in [&mut full, &mut window] {
+                    group.prefix_cacheable = Some(true);
+                    if worker_type != WorkerType::Aggregated {
+                        group.transfer_bytes_per_block = Some(group.page_size_bytes);
+                    }
+                }
+                let mut args = if block_mode {
+                    prefix_core(vec![full, window], 7 * 8, 8, 1, "0.33.0").args
+                } else {
+                    pd_core(vec![full, window], 36, 8, worker_type, None).args
+                };
+                args.worker_type = worker_type;
+                args.max_concurrent_batches = 2;
+                let mut core = VllmCore::new(args);
+                submit(&mut core, 1, 8, output);
+                let mut trace = TraceCollector::default();
+                let mut now = 0.0;
+                let mut quiet = Vec::new();
+                let mut error = None;
+                for pass in 0..12 {
+                    if core.is_drained() {
+                        break;
+                    }
+                    match core.try_execute_pass(&mut trace, now) {
+                        Ok(result) => {
+                            if result.output_signals.is_empty() {
+                                quiet.push(pass);
+                            }
+                            core.complete_engine_boundary(result.end_ms);
+                            now = result.end_ms;
+                        }
+                        Err(failure) => {
+                            error = Some((pass, failure.to_string()));
+                            break;
+                        }
+                    }
+                }
+                assert_eq!(core.mocker_metrics().vllm_preemptions_total, 0, "{label}");
+                let needs = if block_mode {
+                    "needs 8 blocks for 1 scheduled tokens after"
+                } else {
+                    "needs 40 bytes for 1 scheduled tokens after"
+                };
+                match (worker_type, output) {
+                    (WorkerType::Aggregated, _) => {
+                        let (pass, text) = error.expect(&label);
+                        assert_eq!(pass, 8, "{label}");
+                        assert!(
+                            text.contains(&format!("{needs} 15 computed tokens")),
+                            "{label}: {text}"
+                        );
+                    }
+                    (_, 9) => {
+                        assert_eq!(error, None, "{label}");
+                        assert!(core.is_drained(), "{label}");
+                        assert_eq!(quiet, [8], "{label}");
+                    }
+                    _ => {
+                        let (pass, text) = error.expect(&label);
+                        assert_eq!((pass, &quiet[..]), (10, &[8][..]), "{label}");
+                        assert!(
+                            text.contains(&format!("{needs} 16 computed tokens")),
+                            "{label}: {text}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 

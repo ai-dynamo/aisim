@@ -1238,7 +1238,8 @@ fn grouped_destination_keeps_room_for_the_first_pass_of_each_load() {
     // fit the 4 free pages, so the second load is reserved at 10 ms. In block
     // mode the first pass needs 2, so the second load waits. The first load
     // activates at 11 ms, and its first pass leaves 2 free pages. The next
-    // pass frees the previous state block, so 3 are free, less than the 4 of
+    // pass is formed while the first is in flight and holds the previous
+    // state block one step longer, so 2 pages stay free, less than the 4 of
     // the whole prompt. The first request ends at 15 ms, and the second load
     // is reserved then. In byte mode both loads activate at 11 ms. The first
     // pass of the first request takes the last free page, so the first pass
@@ -1567,25 +1568,33 @@ fn grouped_decode_rank_waits_for_an_event_after_a_repeated_self_preemption() {
     // Prompts of 84, 90 and 14 tokens with 8 output tokens each, on pools of
     // 17 pages in block mode, with handoffs at 1e-5 GB/s, 10 bytes per ms.
     // The prefill rank computes 13, 83 and 89 tokens. It holds h14 at 10 ms
-    // and h84 at 20 ms. At 10 ms h90 does not fit beside h84 and preempts
-    // itself. It is readmitted at 20 ms with its 80 cached tokens and held
-    // at 30 ms. The transfers of 200, 700 and 700 bytes share the links
-    // fairly. h14 sends 100 bytes alone, 50 beside h84 and its last 50
-    // beside both loads, by 45 ms. h84 sends its last 600 bytes at 5 bytes
-    // per ms by 165 ms, and h90 its last 50 bytes by 170 ms. h90 activates
-    // when the decode pass that runs at 170 ms ends, at 171 ms.
+    // and h84 at 20 ms. At 10 ms h90 does not fit beside h84. The pass in
+    // flight ran h90, so vLLM does not preempt it there (v0.31
+    // `vllm/v1/core/sched/scheduler.py:773-775`, v0.32 `:804-806`, v0.33
+    // `:940-942`). At 20 ms it still does not fit and preempts itself. It is
+    // readmitted at 20 ms with its 80 cached tokens and held at 30 ms. The
+    // transfers of 200, 700 and 700 bytes share the links fairly. h14 sends
+    // 100 bytes alone, 50 beside h84 and its last 50 beside both loads, by
+    // 45 ms. h84 sends its last 600 bytes at 5 bytes per ms by 165 ms, and
+    // h90 its last 50 bytes by 170 ms. h90 activates when the decode pass
+    // that runs at 170 ms ends, at 171 ms.
     //
     // h14 holds 2 blocks and the loads in flight hold 14, so 1 block is
     // free. h14 emits outputs at 47, 49 and 51 ms. Token 17 then needs an
-    // attention block and a new state block, so h14 preempts itself. Its
-    // readmission needs 3 blocks and finds 3. Its 16-token chunk takes 2 at
-    // 0 ms, as a decode rank prices no prefill, and the next pass preempts
-    // it again with the same pool. vLLM repeats that turn until a transfer
-    // ends. Replay lets h14 wait for the next event, the activation of h84
-    // at 165 ms. Then h84 decodes every 2 ms, and h14 is readmitted in every
-    // other pass until h84 ends at 181 ms. The pass at 171 ms preempts h14
-    // and admits nothing, so h90 runs from 173 ms and ends at 189 ms. h14
-    // emits its last five outputs from 185 to 193 ms.
+    // attention block and a new state block. The pass at 51 ms is formed
+    // behind the pass that ran h14, so it stops h14, and the next pass at
+    // 51 ms, with no pass in flight, preempts it. Its readmission needs 3
+    // blocks and finds 3. Its 16-token chunk takes 2 at 0 ms, as a decode
+    // rank prices no prefill. The pass behind that chunk stops h14 again,
+    // and the pass after it preempts it with the same pool. vLLM repeats
+    // that turn until a transfer ends. Replay lets h14 wait for the next
+    // event, the activation of h84 at 165 ms. Then h84 decodes every 2 ms,
+    // and a turn of h14 takes three passes: one readmits it, one stops it
+    // behind the pass that ran its chunk, and one preempts it. So h14 is
+    // readmitted at 165, 171, 177 and 183 ms. The pass at 171 ms preempts no
+    // request, so it admits h90, which ends 8 passes later at 187 ms. h84
+    // ends at 181 ms. Token 17 of h14 then fits in the pass at 185 ms, and
+    // h14 emits its last five outputs from 187 to 195 ms.
     let requests = [84u32, 90, 14]
         .iter()
         .enumerate()
@@ -1611,13 +1620,17 @@ fn grouped_decode_rank_waits_for_an_event_after_a_repeated_self_preemption() {
     );
     assert_eq!(
         decode_admissions(h14),
-        [45.0, 51.0, 165.0, 169.0, 173.0, 177.0, 181.0]
+        [45.0, 51.0, 165.0, 171.0, 177.0, 183.0]
     );
-    assert_eq!((h14.terminal_time_ms, h14.readmission_count), (193.0, 6));
+    assert_eq!((h14.terminal_time_ms, h14.readmission_count), (195.0, 5));
+    // h84 ends 8 passes of 2 ms after 165 ms. h90 is admitted by the pass
+    // at 171 ms and ends 8 passes later. Its readmission is the one of
+    // the prefill rank.
     assert_eq!(
         [h84, h90].map(|record| (record.terminal_time_ms, record.readmission_count)),
-        [(181.0, 0), (189.0, 1)]
+        [(181.0, 0), (187.0, 1)]
     );
+    assert_eq!(h90.decode_admit_ms, Some(171.0));
 }
 
 /// Distinct prompts of the given (prompt, output, arrival) shapes, with the
@@ -1727,13 +1740,15 @@ fn grouped_decode_rank_readmits_a_request_that_made_progress_at_one_time() {
     // Five distinct prompts on a decode pool of 14 pages in block mode, with
     // decode passes priced at 0 ms, a 32-token budget, a 160-page prefill
     // pool and handoffs at 3e-6 GB/s. q1 and q2 activate at 283.33 ms, and
-    // every step at that time costs 0 ms. q2 preempts itself after 2 outputs,
-    // with 11 blocks in use and no cached block. Readmitted, it emits 14 more
-    // outputs before q1 preempts it, and after its next readmission it
-    // preempts itself again after 16 outputs, with the same pool. It made
-    // progress in between, so it is readmitted. Only its third
-    // self-preemption repeats the second, and q2 waits until q1 ends at the
-    // same time. So q2 has 4 readmissions, all at its activation time.
+    // every step at that time costs 0 ms. After 2 outputs the next token of
+    // q2 does not fit. The pass in flight ran q2, so that pass stops it, and
+    // the pass after it preempts it, with 11 blocks in use and no cached
+    // block. Readmitted, it emits 13 more outputs before q1 preempts it, and
+    // after its next readmission it preempts itself again after 15 outputs,
+    // with the same pool. It made progress in between, so it is readmitted.
+    // Only its third self-preemption repeats the second, and q2 waits until
+    // q1 ends at the same time. So q2 has 4 readmissions, all at its
+    // activation time.
     let requests = distinct_requests(&[
         (14, 33, 0.0),
         (15, 40, 3.0),
@@ -1856,6 +1871,53 @@ fn grouped_aggregated_rank_in_byte_mode_rejects_a_request_whose_whole_sequence_e
             "{async_scheduling}"
         );
     }
+}
+
+#[test]
+fn grouped_decode_rank_checks_a_forward_on_the_count_that_its_next_pass_reaches() {
+    // A full-attention group of 3-token pages of 4 bytes and a window group of
+    // window 4 and 4-token pages of 8 bytes, in byte mode on pools of 36 bytes,
+    // with an 8-token budget. A prompt of 9 tokens loads 8 and computes one
+    // token per decode pass. A forward to `t` tokens holds `cdiv(t, 3)` full
+    // pages and the window pages from `(processed - 3) / 4` up to `cdiv(t, 4)`
+    // (`vllm/v1/core/single_type_kv_cache_manager.py` v0.31 `:687-725`,
+    // `:1153-1188`, v0.32 `:672-710`, `:1135-1170`, v0.33 `:682-720`,
+    // `:1148-1183`; `vllm/v1/core/kv_cache_manager.py` v0.31 `:549-556`, v0.32
+    // `:552-559`, v0.33 `:561-568`). With async scheduling the pass from 15 to
+    // 16 tokens is formed behind the pass in flight and has the processed count
+    // 14: 6 full pages and 2 window pages, 40 bytes. The allocation fails, the
+    // pass in flight ran the request, and vLLM stops
+    // (`vllm/v1/core/sched/scheduler.py` v0.31 `:175-181`, `:773-775`, v0.32
+    // `:186-192`, `:804-806`, v0.33 `:193-195`, `:940-942`). The next pass has
+    // the processed count 15 and needs 6 full pages and 1 window page, 32
+    // bytes. So a request with 8 output tokens, whose last pass ends at 16
+    // tokens, completes. With 9 output tokens the pass from 16 to 17 needs 40
+    // bytes on the computed count too, and the forward check reports the
+    // configuration error.
+    let run = |output| {
+        let mut spec = disaggregated_grouped_spec(distinct_requests(&[(9, output, 0.0)]));
+        let rank = &mut spec.engine["rank"];
+        rank["kv_cache_groups"] = serde_json::json!([
+            {"name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":3, "page_size_bytes":4, "prefix_cacheable":true, "transfer_bytes_per_block":4},
+            {"name":"window", "kind":"attention", "num_layers":1, "block_size_tokens":4, "page_size_bytes":8, "sliding_window":4, "prefix_cacheable":true, "transfer_bytes_per_block":8},
+        ]);
+        rank["kv_cache_capacity_bytes"] = 36.into();
+        rank["kv_transfer_bandwidth"] = serde_json::Value::Null;
+        rank["max_num_batched_tokens"] = 8.into();
+        Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+    };
+    let report = run(8).unwrap();
+    assert_eq!(report.request_counts.completed_requests, 1);
+    assert_eq!(report.per_request[0].readmission_count, 0);
+    let error = run(9).unwrap_err().to_string();
+    assert!(
+        error.contains(
+            "grouped KV forward needs 40 bytes for 1 scheduled tokens after 16 computed tokens, exceeding the entire 36-byte cache pool"
+        ),
+        "{error}"
+    );
 }
 
 #[test]

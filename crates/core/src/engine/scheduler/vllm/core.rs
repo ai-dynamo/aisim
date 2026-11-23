@@ -774,7 +774,12 @@ pub(crate) struct VllmCore {
     /// it processes that pass's outputs, after it has formed the next pass.
     finished_in_flight: Vec<DeferredFree>,
     /// Requests the pass in flight runs, when vLLM defers freeing their
-    /// blocks until that pass ends: async scheduling with a CPU tier.
+    /// blocks until that pass ends: async scheduling with a CPU tier, or on a
+    /// grouped prefill or decode rank. A rank with a CPU tier lists the
+    /// requests the pass committed. A grouped prefill or decode rank lists
+    /// every request the pass scheduled, as vLLM stamps each of them with the
+    /// step (v0.31 `sched:1594-1600`, v0.32 `sched:1627-1633`, v0.33
+    /// `sched:1856-1862`).
     in_flight_requests: Vec<Uuid>,
     /// `launch`: when vLLM decides the pass after the latest one, if that pass
     /// follows it back to back.
@@ -2670,11 +2675,14 @@ impl VllmCore {
         // connector vLLM pairs the longer hold with a stop: it does not
         // preempt a request that the step in flight runs (v0.31
         // `sched:175-181`, `:773-775`, v0.32 `sched:186-192`, `:804-806`,
-        // v0.33 `sched:189-195`, `:940-942`). Replay does not model the role
-        // of the connector of a prefill or decode rank, nor that stop there
-        // without a CPU tier, and the hold without the stop would preempt a
-        // request where vLLM waits one step. So only an aggregated rank gets
-        // the flag, and a prefill or decode rank frees on the computed count.
+        // v0.33 `sched:189-195`, `:940-942`). The hold without the stop
+        // would preempt a request where vLLM waits one step. An aggregated
+        // rank has no connector and frees on the processed count. A grouped
+        // prefill or decode rank frees on it too and has the stop (see
+        // `in_flight_requests`). Replay does not model the role of a
+        // connector, so a grouped prefill rank has the stop of a `kv_both`
+        // connector, which a `kv_producer` connector lacks. A linear prefill
+        // or decode rank has no stop and frees on the computed count.
         // The flag has an effect only on a rank with cache groups, through
         // the processed count: the hold rules of its allocation and the
         // forward check of a grouped request use that count. An aggregated
@@ -2682,7 +2690,9 @@ impl VllmCore {
         // linear state cache does not use the count: it frees a previous
         // state copy at the next allocation of its request on every rank.
         self.kv_manager.set_previous_pass_in_flight(
-            previous_in_flight && self.args.worker_type == WorkerType::Aggregated,
+            previous_in_flight
+                && (self.args.worker_type == WorkerType::Aggregated
+                    || self.kv_manager.grouped_transfer().is_some()),
         );
         if !previous_in_flight {
             let finished = std::mem::take(&mut self.finished_in_flight);
@@ -3499,6 +3509,12 @@ impl VllmCore {
             self.pass_ran_work = !committed_requests.is_empty();
             if self.native_host_offload.is_some() {
                 self.in_flight_requests.clone_from(&committed_requests);
+            } else if self.kv_manager.grouped_transfer().is_some() {
+                // A chunk of a resumed request that computes only output
+                // tokens and ends before its last known token is scheduled
+                // and not committed. vLLM stamps it too.
+                self.in_flight_requests.clear();
+                self.in_flight_requests.extend(scheduled.keys().copied());
             }
         }
         self.passes_executed += 1;
@@ -3749,8 +3765,9 @@ impl VllmCore {
         }
         let selected = selected?;
         // vLLM does not free the blocks of a request the pass in flight runs
-        // until that pass ends (async scheduling with a CPU tier), so it does
-        // not preempt such a request: the allocation stops instead.
+        // until that pass ends (async scheduling with a CPU tier, or on a
+        // grouped prefill or decode rank), so it does not preempt such a
+        // request: the allocation stops instead.
         if self.in_flight_requests.contains(&selected) {
             return None;
         }
@@ -4131,10 +4148,16 @@ impl VllmCore {
         if let Some(pool) = self.kv_manager.grouped() {
             // The forward that the allocation takes: it holds the blocks
             // above the processed count (V31 `mgr:549-556`, V32
-            // `mgr:552-559`, v0.33 `mgr:561-568`).
-            let window_start = self
-                .kv_manager
-                .processed_tokens(&request.sequence.lease, effective_computed_before);
+            // `mgr:552-559`, v0.33 `mgr:561-568`). On a grouped prefill or
+            // decode rank an allocation that does not fit behind the pass in
+            // flight stops, and the next pass tries it on the computed count
+            // (see `in_flight_requests`), so this check counts from it.
+            let window_start = if self.kv_manager.grouped_transfer().is_some() {
+                effective_computed_before
+            } else {
+                self.kv_manager
+                    .processed_tokens(&request.sequence.lease, effective_computed_before)
+            };
             if let Some(blocks) = pool.block_pool() {
                 let required = pool
                     .projected_blocks(window_start, desired_computed_after)

@@ -769,10 +769,10 @@ pub(crate) struct VllmKvManager {
     /// Whether the processed token count of this step leaves out the tokens
     /// of the step in flight, as vLLM's count does. The scheduler sets it
     /// when the step before this one is still in flight and the rank is
-    /// aggregated: with async scheduling vLLM forms a step before it
-    /// processes the outputs of the step before (v0.33
-    /// `vllm/v1/engine/core.py:735`, `:778-793`). On a prefill or decode rank
-    /// it stays false, also with a step in flight. Only
+    /// aggregated or a grouped prefill or decode rank: with async scheduling
+    /// vLLM forms a step before it processes the outputs of the step before
+    /// (v0.33 `vllm/v1/engine/core.py:735`, `:778-793`). On a linear prefill
+    /// or decode rank it stays false, also with a step in flight. Only
     /// [`Self::processed_tokens`] reads it, and only a grouped pool frees held
     /// blocks on that count: a linear state cache releases its held copies by
     /// the step. [`Self::begin_step`] clears it.
@@ -1171,7 +1171,8 @@ impl VllmKvManager {
 
     /// Tell the manager if the processed token count of this step leaves out
     /// the tokens of the step in flight: the step before this one is still in
-    /// flight, and the rank is aggregated. Call it after [`Self::begin_step`].
+    /// flight, and the rank is aggregated or a grouped prefill or decode rank.
+    /// Call it after [`Self::begin_step`].
     pub(crate) fn set_previous_pass_in_flight(&mut self, in_flight: bool) {
         self.previous_pass_in_flight = in_flight;
     }
@@ -1190,8 +1191,9 @@ impl VllmKvManager {
     /// be in flight, so processed is the computed count before that step when
     /// the flag of this step is set and that step ran the request, and
     /// `computed_before` otherwise. The scheduler sets the flag only on an
-    /// aggregated rank, so a prefill or decode rank gets `computed_before`
-    /// also with a step in flight. After the finalize of a step it is the
+    /// aggregated rank and on a grouped prefill or decode rank, so a linear
+    /// prefill or decode rank gets `computed_before` also with a step in
+    /// flight. After the finalize of a step it is the
     /// count of that step's allocation, whatever `computed_before` is,
     /// because the step's own tokens are in flight too.
     pub(crate) fn processed_tokens(
