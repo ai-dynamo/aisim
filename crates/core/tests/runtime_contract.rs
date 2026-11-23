@@ -642,6 +642,58 @@ fn grouped_prefix_request_preempted_after_output_tokens_resumes_on_its_own_block
 }
 
 #[test]
+fn grouped_prefix_state_block_below_the_attention_block_completes_at_the_startup_count_with_async_scheduling()
+ {
+    // A full-attention group of 8-token blocks, a state group of 2-token
+    // blocks, the hash block 2 and max_model_len 16: vLLM's startup count is
+    // cdiv(16, 8) = 2 attention blocks and 2 state blocks, 4 (v0.31
+    // kv_cache_interface.py:1083-1094, v0.32 :1076-1082, v0.33 :1135-1141).
+    // Two prompts of 8 and 14 tokens with 2 output tokens each arrive at 0
+    // ms, with a budget of 3 tokens. Run on its own scheduler code at
+    // v0.31.0, v0.32.0 and v0.33.0 with two batches and this pool, vLLM
+    // starves the second request: each life hits 8 tokens, computes 8 to 10,
+    // and preempts itself, because the block of the state at 8 goes only on
+    // the processed count (v0.31 kv_cache_manager.py:549-556, v0.32
+    // :552-559, v0.33 :561-568) and the next chunk needs a third state
+    // block. In this layout replay frees that block on the computed count,
+    // one step earlier than vLLM, so both requests complete without a
+    // preemption, as they do in vLLM with one batch. The cap of 10 s of
+    // simulated time bounds the run.
+    for (version, checkpoint) in [("0.31.0", None), ("0.32.0", Some(0)), ("0.33.0", Some(0))] {
+        let mut first = request("first", 0.0, 8, 2);
+        first.input_token_ids = Some([0].into_iter().chain(1_000_000..1_000_007).collect());
+        let mut second = request("second", 0.0, 14, 2);
+        second.input_token_ids = Some([0].into_iter().chain(2_000_000..2_000_013).collect());
+        let mut spec = aggregated_spec(Backend::Vllm, 1, 0.0, vec![first, second]);
+        spec.max_sim_time_ms = Some(10_000.0);
+        let rank = &mut spec.engine["rank"];
+        rank["enable_prefix_caching"] = true.into();
+        rank["prefix_match_unit"] = 2.into();
+        rank["vllm_version"] = version.into();
+        rank["max_model_len"] = 16.into();
+        rank["max_num_batched_tokens"] = 3.into();
+        rank["max_num_seqs"] = 3.into();
+        rank["kv_cache_capacity_bytes"] = (4 * 64).into();
+        let mut state = serde_json::json!({"name":"state", "kind":"state", "num_layers":1, "block_size_tokens":2, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":true});
+        if let Some(blocks) = checkpoint {
+            state["prefill_checkpoint_blocks"] = blocks.into();
+        }
+        rank["kv_cache_groups"] = serde_json::json!([
+            {"name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":8, "page_size_bytes":64, "prefix_cacheable":true},
+            state,
+        ]);
+        let report = run_within_60_s(spec);
+        assert_eq!(report.request_counts.completed_requests, 2, "{version}");
+        assert_eq!(
+            [record(&report, "first"), record(&report, "second")]
+                .map(|record| record.readmission_count),
+            [0, 0],
+            "{version}"
+        );
+    }
+}
+
+#[test]
 fn grouped_prefix_request_preempted_after_output_tokens_is_preempted_as_often_as_in_vllm() {
     // GLM-shaped groups of 2,176-token blocks with the hash block 2,176, a
     // 4-token ring and four state groups, max_model_len 26,112: vLLM's

@@ -6036,7 +6036,18 @@ fn grouped_prefix_eviction_frees_cached_blocks_oldest_first() {
 /// A rank with a full-attention group and a prefix-cacheable state group of
 /// 4-token blocks, a hash block of 4 and `blocks` pool blocks.
 fn async_prefix_core(version: &str, blocks: u64, max_concurrent_batches: usize) -> VllmCore {
-    let mut attention = group("attention", 4, 8, None);
+    async_prefix_core_with_attention_block(version, 4, blocks, max_concurrent_batches)
+}
+
+/// The core of [`async_prefix_core`] with a full-attention block of
+/// `attention_block` tokens beside the 4-token state block.
+fn async_prefix_core_with_attention_block(
+    version: &str,
+    attention_block: u32,
+    blocks: u64,
+    max_concurrent_batches: usize,
+) -> VllmCore {
+    let mut attention = group("attention", attention_block, 8, None);
     attention.prefix_cacheable = Some(true);
     let mut kda = state("kda", 8, 1);
     kda.prefix_cacheable = Some(true);
@@ -6489,6 +6500,45 @@ fn grouped_prefix_decode_crossing_holds_the_previous_state_block_for_two_passes_
                 recorded.push(recorded_processed(&core, x));
             }
             let label = format!("{version} {max_concurrent_batches}");
+            assert_eq!(seen, active, "{label}");
+            assert_eq!(recorded, processed, "{label}");
+        }
+    }
+}
+
+#[test]
+fn grouped_prefix_aggregated_rank_holds_the_previous_state_block_only_if_no_state_block_is_below_a_full_attention_block()
+ {
+    // The sequence of the decode crossing test above, with two batches, in
+    // two layouts. With full-attention and state blocks of 4 tokens the rank
+    // holds the state block of index 0 one step longer, as vLLM does: the
+    // active blocks are 2, 4, 4 and 3, and the processed counts 0, 0, 4 and
+    // 5, the values of that test. With a full-attention block of 8 tokens the
+    // state block of 4 tokens lies below it, so the rank frees on the
+    // computed count: the processed counts are 0, 4, 5 and 6, as with one
+    // batch, and the block of index 0 goes in pass 2. X then holds one
+    // attention block, so the active blocks are 2, 3, 2 and 2. vLLM would
+    // hold the block in pass 2 in this layout too, with the active blocks
+    // 2, 3, 3 and 2, so replay frees it there one step earlier than vLLM.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        for (attention_block, flags, active, processed) in [
+            (4, [false, true, true, true], [2, 4, 4, 3], [0, 0, 4, 5]),
+            (8, [false; 4], [2, 3, 2, 2], [0, 4, 5, 6]),
+        ] {
+            let mut core = async_prefix_core_with_attention_block(version, attention_block, 12, 2);
+            let mut now = 0.0;
+            let x = submit_tokens(&mut core, 1, (1000..1004).collect(), 6);
+            let mut seen_flags = Vec::new();
+            let mut seen = Vec::new();
+            let mut recorded = Vec::new();
+            for _ in 0..4 {
+                async_step(&mut core, &mut now);
+                seen_flags.push(core.kv_manager.previous_pass_in_flight());
+                seen.push(block_pool(&core).active_blocks());
+                recorded.push(recorded_processed(&core, x));
+            }
+            let label = format!("{version} {attention_block}");
+            assert_eq!(seen_flags, flags, "{label}");
             assert_eq!(seen, active, "{label}");
             assert_eq!(recorded, processed, "{label}");
         }

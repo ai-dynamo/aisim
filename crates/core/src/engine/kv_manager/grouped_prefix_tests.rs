@@ -6153,3 +6153,101 @@ fn convolution_group_keeps_one_block_before_the_replay_boundary() {
         );
     }
 }
+
+#[test]
+fn state_blocks_reach_full_attention_in_each_kind_of_layout() {
+    // Every prefix-cacheable state group must have a block at or above the
+    // block of every full-attention group. A ring and a sliding-window group
+    // do not count, and a full-attention group counts also when it opts out
+    // of prefix caching. Each layout lists its groups, its hash block and the
+    // answer.
+    let mut opted_out_full = attention("full_16", 16, None);
+    opted_out_full.prefix_cacheable = Some(false);
+    let cases: [(&str, Vec<FpmCacheGroup>, usize, bool); 8] = [
+        (
+            "equal blocks",
+            vec![attention("full", 8, None), state("s", 8, true, false)],
+            8,
+            true,
+        ),
+        (
+            "state block above",
+            vec![attention("full", 8, None), state("s", 16, true, false)],
+            8,
+            true,
+        ),
+        (
+            "state block below",
+            vec![attention("full", 8, None), state("s", 2, true, false)],
+            2,
+            false,
+        ),
+        (
+            "state block below the larger of two full-attention blocks",
+            vec![
+                attention("full_4", 4, None),
+                state("s", 4, true, false),
+                attention("full_8", 8, None),
+            ],
+            4,
+            false,
+        ),
+        (
+            "no state group",
+            vec![attention("full_8", 8, None), attention("full_4", 4, None)],
+            4,
+            true,
+        ),
+        (
+            "no full-attention group",
+            vec![attention("window", 8, Some(16)), state("s", 2, true, false)],
+            2,
+            true,
+        ),
+        (
+            "ring below equal blocks",
+            vec![
+                attention("full", 8, None),
+                state("ring", 4, false, false),
+                state("s", 8, true, false),
+            ],
+            8,
+            true,
+        ),
+        (
+            "full-attention group without prefix caching above the state block",
+            vec![
+                opted_out_full,
+                attention("full_4", 4, None),
+                state("s", 4, true, false),
+            ],
+            4,
+            false,
+        ),
+    ];
+    for (label, groups, hash, expected) in cases {
+        assert_eq!(
+            rules(&groups, hash).state_blocks_reach_full_attention(),
+            expected,
+            "{label}"
+        );
+    }
+    // The GLM-5.3-Flash layout: MLA and four state groups of 2,176-token
+    // blocks and a 4-token ring, at the hash block 2,176 and at a hash block
+    // of 4, with and without a checkpoint block where the version takes one.
+    for (version, checkpoint) in [
+        (VllmRuleVersion::V0_31_0, false),
+        (VllmRuleVersion::V0_32_0, false),
+        (VllmRuleVersion::V0_32_0, true),
+        (VllmRuleVersion::V0_33_0, false),
+        (VllmRuleVersion::V0_33_0, true),
+    ] {
+        for hash in [GLM_BLOCK as usize, 4] {
+            assert!(
+                rules_glm_hash(version, checkpoint, hash).state_blocks_reach_full_attention(),
+                "{} {checkpoint} {hash}",
+                version.label()
+            );
+        }
+    }
+}

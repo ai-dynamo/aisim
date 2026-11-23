@@ -128,6 +128,10 @@ pub(crate) struct GroupedPrefixRules {
     cacheable_block: usize,
     version: VllmRuleVersion,
     checkpoint: Option<CheckpointRule>,
+    /// Whether every prefix-cacheable state group has a block at or above
+    /// the block of every full-attention group. See
+    /// [`Self::state_blocks_reach_full_attention`].
+    state_blocks_reach_full_attention: bool,
 }
 
 /// The most groups of one grouped prefix cache: `CacheKey::Grouped` names a
@@ -374,6 +378,17 @@ impl GroupedPrefixRules {
             }
         }
         specs.sort_by_key(|spec| spec.kind != GroupRuleKind::FullAttention);
+        let largest_full_attention_block = rules
+            .iter()
+            .filter(|rule| rule.kind == GroupRuleKind::FullAttention)
+            .map(|rule| rule.block)
+            .max();
+        let state_blocks_reach_full_attention = largest_full_attention_block.is_none_or(|full| {
+            rules
+                .iter()
+                .filter(|rule| rule.kind == GroupRuleKind::State)
+                .all(|rule| rule.block >= full)
+        });
         Ok(Self {
             groups: rules,
             specs,
@@ -383,7 +398,20 @@ impl GroupedPrefixRules {
             cacheable_block,
             version,
             checkpoint,
+            state_blocks_reach_full_attention,
         })
+    }
+
+    /// Whether every prefix-cacheable state group has a block at or above
+    /// the block of every full-attention group. A ring (a state group with
+    /// `prefix_cacheable: false`) and a sliding-window group do not count,
+    /// and a full-attention group counts with or without
+    /// `prefix_cacheable`. A layout without a prefix-cacheable state group
+    /// or without a full-attention group has it. The scheduler of an
+    /// aggregated rank holds the blocks of a step in flight only in a layout
+    /// that has it.
+    pub(crate) fn state_blocks_reach_full_attention(&self) -> bool {
+        self.state_blocks_reach_full_attention
     }
 
     /// The pool blocks that vLLM's startup check reserves for one request of

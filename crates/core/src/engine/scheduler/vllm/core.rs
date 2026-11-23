@@ -2694,10 +2694,24 @@ impl VllmCore {
         // rank with cache groups has no offload tier and so no connector. A
         // linear state cache does not use the count: it frees a previous
         // state copy at the next allocation of its request on every rank.
+        // An aggregated rank holds the blocks only in a layout in which every
+        // prefix-cacheable state group has a block at or above the block of
+        // every full-attention group. In another layout, at a pool of exactly
+        // vLLM's startup count, the hold can starve a request: while one
+        // chunk of the request is in flight, its next chunk needs one more
+        // state block than the pool has, so it preempts itself, and its next
+        // life hits the same tokens again, because the full-attention block
+        // of that chunk is not full and has no key. vLLM itself starves the
+        // request there, and a replay that follows it does not end. So in
+        // such a layout an aggregated rank frees on the computed count, one
+        // step earlier than vLLM.
+        let aggregated_hold = self.args.worker_type == WorkerType::Aggregated
+            && self
+                .kv_manager
+                .grouped_prefix_rules()
+                .is_none_or(GroupedPrefixRules::state_blocks_reach_full_attention);
         self.kv_manager.set_previous_pass_in_flight(
-            previous_in_flight
-                && (self.args.worker_type == WorkerType::Aggregated
-                    || self.kv_manager.grouped_transfer().is_some()),
+            previous_in_flight && (aggregated_hold || self.kv_manager.grouped_transfer().is_some()),
         );
         if !previous_in_flight {
             let finished = std::mem::take(&mut self.finished_in_flight);

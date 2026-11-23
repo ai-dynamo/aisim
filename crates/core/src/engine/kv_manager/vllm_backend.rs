@@ -807,8 +807,10 @@ pub(crate) struct VllmKvManager {
     step: u64,
     /// Whether the processed token count of this step leaves out the tokens
     /// of the step in flight, as vLLM's count does. The scheduler sets it
-    /// when the step before this one is still in flight and the rank is
-    /// aggregated or a grouped prefill or decode rank: with async scheduling
+    /// when the step before this one is still in flight and the rank is a
+    /// grouped prefill or decode rank, or an aggregated rank whose layout
+    /// passes [`GroupedPrefixRules::state_blocks_reach_full_attention`] or
+    /// has no grouped prefix rules: with async scheduling
     /// vLLM forms a step before it processes the outputs of the step before
     /// (v0.33 `vllm/v1/engine/core.py:735`, `:778-793`). On a linear prefill
     /// or decode rank it stays false, also with a step in flight. Only
@@ -1210,7 +1212,8 @@ impl VllmKvManager {
 
     /// Tell the manager if the processed token count of this step leaves out
     /// the tokens of the step in flight: the step before this one is still in
-    /// flight, and the rank is aggregated or a grouped prefill or decode rank.
+    /// flight, and the rank is a grouped prefill or decode rank or an
+    /// aggregated rank whose layout keeps the hold (see the scheduler).
     /// Call it after [`Self::begin_step`].
     pub(crate) fn set_previous_pass_in_flight(&mut self, in_flight: bool) {
         self.previous_pass_in_flight = in_flight;
