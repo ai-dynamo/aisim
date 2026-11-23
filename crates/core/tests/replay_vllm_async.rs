@@ -614,3 +614,45 @@ fn a_queued_empty_decision_does_not_admit_a_restore_before_its_poll() {
             .all(|request| request.output_length == request.requested_output_length)
     );
 }
+
+#[test]
+fn simple_cpu_copies_from_the_launch_end_and_offloading_from_the_pass_end() {
+    // The sharing run's G1 with five blocks copying in 50 ms; R (request 3)
+    // decodes twelve tokens. A (request 4) arrives with R, so the pass formed
+    // at 600 prefills R and issues A's load: its launch ends at 620 and its
+    // GPU work at 700. SimpleCPU's copy thread starts at the launch end, so
+    // the copy runs from 620 to 670, inside that pass's GPU work and before
+    // replay forms the next pass at 700. That pass polls at 622 and misses
+    // it; the next, decided at 700, polls at 702 and sees it, so A is
+    // schedulable two decisions later, in the pass decided at 720 that
+    // starts at 730. The offloading connector waits for the GPU work: its
+    // copy runs from 700 to 750, the pass decided at 750 polls at 752 and
+    // sees it, and A's pass starts at 780. Both reuse A's 20 host-tier
+    // tokens.
+    let five_blocks_in_50_ms = 320.0 / (50.0 * 1e6);
+    let first_admission = |connector| {
+        let mut config = polled_cpu_tier(20, five_blocks_in_50_ms);
+        config.native_host_offload = config
+            .native_host_offload
+            .map(|host| host.with_connector(connector));
+        let report = run_tokens(
+            config,
+            vec![
+                tokens_request(1, (0..20).collect(), 1, 0.0),
+                tokens_request(2, (500..576).collect(), 1, 300.0),
+                tokens_request(3, (900..904).collect(), 12, 600.0),
+                tokens_request(4, (0..24).collect(), 2, 600.0),
+            ],
+        );
+        let a = record(&report, 4);
+        (a.first_admit_ms, a.first_admission_host_reused_input_tokens)
+    };
+    assert_eq!(
+        first_admission(G2Connector::SimpleCpuV032),
+        (Some(730.0), Some(20))
+    );
+    assert_eq!(
+        first_admission(G2Connector::OffloadingV032),
+        (Some(780.0), Some(20))
+    );
+}
