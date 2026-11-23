@@ -1007,10 +1007,16 @@ prediction database selection, and simulator cache geometry belong to CI rather
 than the HF bundles. The reviewed policies currently cover B300 TP8 GLM/SGLang and
 Qwen/vLLM. They retain the existing op-level policy, correction disabled, and SGLang
 0.5.21 / vLLM 0.31.0 databases. SGLang verification depth comes from the resolved
-recipe. Each point's checksum-pinned `feature_point_receipt` must retain
+recipe. Each point's checksum-pinned `feature_point_receipt` should retain
 `metrics.speculative_acceptance` with `verification_depth` matching that recipe
-and finite `accepted_draft_tokens` between zero and the depth. Missing, invalid or
-depth-mismatched acceptance stops preparation; no other point's value is reused.
+and finite `accepted_draft_tokens` between zero and the depth. A receipt without
+that key falls back to the point's own measured profile-phase acceptance gauge in
+`workload.json` (`silicon_reference.silicon.phases.profile.series.acceptance`,
+tokens per forward including the bonus token): zero initialization rows are
+skipped, the weighted mean is taken over the profile span, one token per forward
+is subtracted, and nonzero samples must cover at least 90% of the phase. Missing,
+invalid or depth-mismatched acceptance stops preparation, and an invalid receipt
+is never replaced by the series; no other point's value is reused.
 Depth zero needs no acceptance receipt and supplies zero accepted draft tokens.
 These values are distinct from the silicon's configured draft length. Historical
 snapshots retain their original explicit prediction settings and provenance.

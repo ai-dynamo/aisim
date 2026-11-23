@@ -181,9 +181,10 @@ for pinned scheduler settings, measurement selection, and provenance.
 
 AgentX snapshots that lack silicon receipts required by the current contract
 are rejected and shown as failed refreshes. Pages can still deploy the other
-qualified results and documentation. Missing measured speculative acceptance
-continues to fail AgentX evaluation; no default acceptance or partial cohort
-can qualify as a complete campaign.
+qualified results and documentation. Measured speculative acceptance comes from
+the point receipt or, when the receipt has none, from the point's own profile-phase
+acceptance series. Missing measured acceptance continues to fail AgentX evaluation;
+no default acceptance or partial cohort can qualify as a complete campaign.
 
 ### Weekly accuracy Slack report
 
