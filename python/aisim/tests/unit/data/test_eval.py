@@ -462,3 +462,23 @@ def test_a_declared_findings_file_with_a_record_like_name_is_not_a_record(built)
     assert (directory / f"{'e' * 64}.json") in record_files(directory)
     with pytest.raises(ValueError):
         current_records(directory)
+
+
+def test_attest_cannot_demote_a_record_but_can_keep_or_raise_its_tier(built):
+    root, record = built
+    # Qualification needs a known GPU time.
+    measured = GpuTime(authority="measured", gpu_count=4, wall_seconds=1.0)
+    record = EvalRecord.model_validate({**record.model_dump(by_alias=True), "gpu_time": measured.model_dump()})
+
+    def report_for(current):
+        return verify_record(current, root, _predict, current.prediction.fingerprint)
+
+    verified = attest(record, report_for(record))
+    qualified = attest(verified, report_for(verified), "qualified")
+    assert (verified.tier, qualified.tier) == ("verified", "qualified")
+    with pytest.raises(ValueError, match="cannot demote a qualified record to verified"):
+        attest(qualified, report_for(qualified))  # the default target tier is "verified"
+    with pytest.raises(ValueError, match="cannot demote a qualified record to verified"):
+        attest(qualified, report_for(qualified), "verified")
+    assert attest(qualified, report_for(qualified), "qualified").tier == "qualified"  # equal-tier re-attestation
+    assert attest(verified, report_for(verified)).tier == "verified"
