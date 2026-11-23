@@ -1666,8 +1666,6 @@ impl SglangCore {
                     committed_requests.push(signal.uuid);
                 }
             }
-            committed_requests.sort_unstable();
-            committed_requests.dedup();
         }
         if let Some(host) = &mut self.host {
             // `retract_decode` marks a request before the previous forward's result is

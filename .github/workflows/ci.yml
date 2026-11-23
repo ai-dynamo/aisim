@@ -723,7 +723,6 @@ jobs:
         run: |
           python -m uv pip install --system "${AISIM_TEST_WHEEL}[dev]" --group scripts/pyproject.toml:ci --group scripts/pyproject.toml:fpm-accuracy --group scripts/pyproject.toml:e2e-accuracy
           python -m pip check
-          python scripts/prediction_regression/check_prediction_numerics.py --fetch-baseline-only
           python scripts/ci/check_application_test_inventory.py --output application-test-inventory.json
           python -m pytest -q \
             python/aisim/tests/unit/cli/test_aisim_compatibility.py \
@@ -951,17 +950,13 @@ jobs:
     name: Engine Golden Regression
     needs: [fast-ci, select-full-ci]
     if: ${{ needs.select-full-ci.outputs.engine_golden_regression == 'true' }}
-    runs-on: prod-aisim-default-amd64-v1
+    # Builds from source with no NVIDIA-internal dependency; numerical
+    # sentinels use checked-in expected values, so no full history is needed.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
-    container:
-      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
-      env:
-        HOME: /__w/aisim/aisim
-        USER: runner
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/setup-python-rust
         with:
@@ -982,7 +977,6 @@ jobs:
           crates/core/parity_tests/perfmodel/test_afd_execution_plan_parity.py
       - name: Check native prediction numerical sentinels
         run: |
-          python scripts/prediction_regression/check_prediction_numerics.py --fetch-baseline-only
           python scripts/prediction_regression/check_prediction_numerics.py --output numerical-sentinels.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()

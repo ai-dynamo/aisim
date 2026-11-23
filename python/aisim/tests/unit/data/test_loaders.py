@@ -6,12 +6,13 @@
 import hashlib
 import json
 import shutil
+from pathlib import Path
 
 import pyarrow as pa
 import pytest
 
-from aisim_core.data import Identity, configuration_id, prepare_execution_profile
-from aisim_core.data.fetch import Selection, SelectionError
+from aisim_core.data import Entry, Identity, configuration_id, prepare_execution_profile
+from aisim_core.data.fetch import Cache, Selection, SelectionError, fetch
 from aisim_core.data.loaders import (
     LOADERS,
     E2eLoader,
@@ -21,6 +22,7 @@ from aisim_core.data.loaders import (
 )
 from aisim_core.data.parquet import write_parquet
 from aisim_core.sdk import RustForwardPassPerfModel
+from tests.unit.data.test_fetch import FakeTransport
 from tests.unit.sdk.test_dataset_contracts import artifact, dataset, write  # noqa: F401
 
 pytestmark = pytest.mark.unit
@@ -30,6 +32,62 @@ CONFIG = {"system": "h200_sxm", "backend": "vllm", "backend_version": "1.0", "mo
 
 def _tree(root):
     return {str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+@pytest.mark.parametrize("damage", ["missing-table", "edited-table", "profile", "config"])
+@pytest.mark.parametrize("relative_cache", [False, True])
+def test_cached_fpm_preparation_reuses_intact_files_and_repairs_damage(
+    dataset,  # noqa: F811
+    tmp_path,
+    monkeypatch,
+    damage,
+    relative_cache,
+):
+    from aisim_core.data import Artifact, Entry, Manifest
+    from aisim_core.data.ensure import _load
+
+    root, path, doc = dataset
+    manifest = Manifest.model_validate(doc)
+    data = (root / path).read_bytes()
+    entry = Entry(
+        configuration_id=manifest.configuration_id,
+        purpose=manifest.purpose,
+        identity=manifest.identity,
+        manifest=Artifact(
+            artifact_id="manifest",
+            path=path,
+            role="manifest",
+            format="json",
+            schema=manifest.schema_version,
+            sha256=hashlib.sha256(data).hexdigest(),
+            bytes=len(data),
+        ),
+    )
+    loader = FpmLoader()
+    real_load = loader.load
+    loads = []
+
+    def counted(*args, **kwargs):
+        loads.append(True)
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(loader, "load", counted)
+    monkeypatch.chdir(tmp_path)
+    output = Path("materialized") if relative_cache else tmp_path / "materialized"
+    first = _load(loader, "fpm", root, entry, CONFIG, output)
+    systems = Path(first.config["systems_paths"][0])
+    pristine = _tree(systems.parent)
+    assert _load(loader, "fpm", root, entry, CONFIG, output).config == first.config
+    assert len(loads) == 1  # no native reconstruction for an intact cache
+    runtime = next(a.runtime_path for a in manifest.artifacts if a.runtime_path is not None)
+    if damage == "missing-table":
+        (systems / runtime).unlink()
+    else:
+        victim = systems / runtime if damage == "edited-table" else systems.parent / f"{damage}.json"
+        victim.write_bytes(b"damaged")
+    repaired = _load(loader, "fpm", root, entry, CONFIG, output)
+    assert repaired.config == first.config and _tree(systems.parent) == pristine
+    assert len(loads) == 2
 
 
 def _op_manifest(root, manifest, **identity_overrides):
@@ -135,6 +193,49 @@ def test_fpm_loader_matches_prepare_execution_profile_and_predicts(dataset, tmp_
     b = RustForwardPassPerfModel.best_available(reference)
     assert a.predict_prefill_latency(1, 4, 0) == b.predict_prefill_latency(1, 4, 0) == 6.0
     assert a.predict_prefill_latency(1, 8, 4) == b.predict_prefill_latency(1, 8, 4) == 15.0
+
+
+@pytest.mark.parametrize("damage", ["systems", "table", "profile", "config", "incomplete"])
+def test_cached_fpm_preparation_is_verified_and_rebuilt_before_native_use(dataset, tmp_path, monkeypatch, damage):  # noqa: F811
+    from aisim_core.data.ensure import _load
+
+    root, path, manifest = dataset
+    entry = Entry(
+        configuration_id=manifest["configuration_id"],
+        purpose=manifest["purpose"],
+        identity=manifest["identity"],
+        manifest=artifact(root, path, "manifest"),
+    )
+    loader = FpmLoader()
+    target = tmp_path / "materialized"
+    first = _load(loader, "fpm", root, entry, CONFIG, target)
+    prepared = next(p for p in tmp_path.glob("materialized-*") if p.is_dir())
+    # A valid warm hit must not reconstruct the native model or rewrite the outputs.
+    real_load = loader.load
+
+    def no_rebuild(*args, **kwargs):
+        pytest.fail("a complete cached preparation must be reused")
+
+    monkeypatch.setattr(loader, "load", no_rebuild)
+    assert _load(loader, "fpm", root, entry, CONFIG, target).config == first.config
+    monkeypatch.setattr(loader, "load", real_load)
+    if damage == "systems":
+        shutil.rmtree(prepared / "systems")
+    elif damage == "table":
+        runtime = next(a["runtime_path"] for a in manifest["artifacts"] if a.get("runtime_path"))
+        (prepared / "systems" / runtime).write_bytes(b"corrupt")
+    elif damage == "profile":
+        (prepared / "profile.json").unlink()
+    elif damage == "config":
+        config = json.loads((prepared / "config.json").read_bytes())
+        config["estimator_config"]["op_level"]["execution_profile"]["sha256"] = "0" * 64
+        (prepared / "config.json").write_text(json.dumps(config))
+    else:
+        (prepared / "config.json").unlink()
+    repaired = _load(loader, "fpm", root, entry, CONFIG, target)
+    assert repaired.config == first.config
+    model = RustForwardPassPerfModel.best_available(repaired.config)
+    assert model.predict_prefill_latency(1, 4, 0) == 6.0
 
 
 def test_fpm_loader_requires_output_dir_and_checks_identity(dataset, tmp_path):  # noqa: F811
@@ -266,3 +367,121 @@ def test_e2e_tables_are_parsed_from_the_verified_bytes(tmp_path, monkeypatch):
 
     monkeypatch.setattr(loaders_module, "_verified_bytes", verify_then_swap)
     assert len(load_e2e(tmp_path, path).metrics) == len(expected.metrics)
+
+
+def test_legacy_fpm_cold_fetch_keeps_auxiliary_measurement_provenance(dataset, tmp_path):  # noqa: F811
+    root, path, manifest = dataset
+    auxiliary = "metadata/measurement-provenance.json"
+    write(root, auxiliary, {"provenance": "Synthetic fixture, not measured evidence."})
+    manifest["artifacts"].append(artifact(root, auxiliary, "measurement-provenance"))
+    # Catalog this legacy execution-profile bundle under FPM, as FpmLoader.select requests.
+    manifest["category"] = "fpm"
+    manifest["configuration_id"] = configuration_id("fpm", "execution-profile", Identity(**manifest["identity"]))
+    write(root, path, manifest)
+    write(
+        root,
+        "catalog/fpm/index.json",
+        {
+            "schema_version": "aisim-category-index/v1",
+            "category": "fpm",
+            "entries": [
+                {
+                    "configuration_id": manifest["configuration_id"],
+                    "purpose": manifest["purpose"],
+                    "identity": manifest["identity"],
+                    "manifest": artifact(root, path, "manifest"),
+                }
+            ],
+        },
+    )
+    write(
+        root,
+        "catalog/dataset.json",
+        {
+            "schema_version": "aisim-dataset-index/v1",
+            "dataset_id": "org/dataset",
+            "categories": {
+                "fpm": {
+                    "root": "data/fpm",
+                    "layout": "category",
+                    "index": artifact(root, "catalog/fpm/index.json", "index"),
+                }
+            },
+        },
+    )
+    transport = FakeTransport({str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()})
+    fetched = fetch(
+        FpmLoader().select(CONFIG),
+        repo="org/dataset",
+        revision="a" * 40,
+        transport=transport,
+        cache=Cache(tmp_path / "cold-cache"),
+    )
+    assert auxiliary in transport.opened
+    loaded = FpmLoader().load(fetched.root, path, output_dir=tmp_path / "loaded", config=CONFIG)
+    model = RustForwardPassPerfModel.best_available(loaded.config)
+    assert model.predict_prefill_latency(1, 4, 0) == 6.0
+
+
+def test_catalog_parallelism_keeps_omitted_topology_distinct_from_explicit_all_ones():
+    from aisim_core.data.loaders import _parallelism
+    from aisim_core.sdk import ForwardPassPerfModelConfig
+
+    assert _parallelism({"model": "m", "system": "h200"}) is None  # omitted: the catalog stays unfiltered
+    assert _parallelism({"tp": 1}) == ()  # explicit all-ones selects the single-GPU identity
+    assert _parallelism({"tp": 4, "attention_dp": 1, "moe_ep_size": 4}) == (("ep", 4), ("tp", 4))
+    # A typed configuration always carries topology (tp=1 by default), so it requests the single-GPU entry.
+    typed = ForwardPassPerfModelConfig(
+        model="m", system="h200", backend="vllm", backend_version="1", worker_type="aggregated"
+    )
+    assert _parallelism(typed.to_dict()) == ()
+
+
+def test_moved_fpm_embedded_keys_reach_the_native_profile_consumer(dataset, tmp_path):  # noqa: F811
+    root, _, manifest = dataset
+    logical_dir = "data/Meta-Llama/h200/vllm/1/tp1"
+    for item in manifest["artifacts"]:
+        original = root / item["path"]
+        item["path"] = f"{logical_dir}/{original.name}"
+        destination = root / item["path"].replace("data/", "data/fpm/", 1)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        original.rename(destination)
+    logical_manifest = f"{logical_dir}/manifest.json"
+    stored_manifest = logical_manifest.replace("data/", "data/fpm/", 1)
+    write(root, stored_manifest, manifest)
+    manifest_ref = artifact(root, stored_manifest, "manifest")
+    manifest_ref["path"] = logical_manifest
+    write(
+        root,
+        "catalog/fpm.json",
+        {
+            "schema_version": "aisim-category-index/v1",
+            "category": "fpm",
+            "entries": [
+                {
+                    "configuration_id": manifest["configuration_id"],
+                    "identity": manifest["identity"],
+                    "purpose": manifest["purpose"],
+                    "manifest": manifest_ref,
+                }
+            ],
+        },
+    )
+    write(
+        root,
+        "catalog/dataset.json",
+        {
+            "schema_version": "aisim-dataset-index/v1",
+            "dataset_id": "ai-dynamo/aisim-data",
+            "categories": {
+                "fpm": {"root": "data/fpm", "layout": "category", "index": artifact(root, "catalog/fpm.json", "index")}
+            },
+        },
+    )
+    shutil.rmtree(root.parent / "producer-systems")
+    loaded = FpmLoader().load(root, logical_manifest, output_dir=tmp_path / "moved", config=CONFIG)
+    assert [a.path for a in loaded.manifest.artifacts] == [a["path"] for a in manifest["artifacts"]]
+    model = RustForwardPassPerfModel.best_available(loaded.config)
+    # Independent fixture oracle: scale factor 3 times the retained measured cells of 2 ms and 5 ms.
+    assert model.predict_prefill_latency(1, 4, 0) == 6.0
+    assert model.predict_prefill_latency(1, 8, 4) == 15.0

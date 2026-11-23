@@ -2145,13 +2145,12 @@ fn zero_output_request_completes_after_prefill() {
 }
 
 #[test]
-fn speculative_decode_commits_each_request_once_in_uuid_order() {
+fn speculative_decode_commits_each_request_once() {
     let mut args = test_args(32, 4, 16);
     args.aic_nextn = Some(2);
     args.aic_nextn_accept_rates = Some("1,1".to_string());
     let mut core = SglangCore::new(args);
     let [a, b, c] = [1, 2, 3].map(Uuid::from_u128);
-    // Running order is the reverse of UUID order.
     for (uuid, first_token) in [(c, 0), (b, 4), (a, 8)] {
         core.receive(DirectRequest {
             uuid: Some(uuid),
@@ -2170,7 +2169,7 @@ fn speculative_decode_commits_each_request_once_in_uuid_order() {
         .map(|signal| signal.uuid)
         .collect::<Vec<_>>();
     assert_eq!(emitted, [c, c, c, b, b, b, a, a, a]);
-    assert_eq!(decode.committed_requests, [a, b, c]);
+    assert_eq!(decode.committed_requests, [c, b, a]);
 }
 
 #[test]

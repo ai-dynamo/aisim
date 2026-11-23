@@ -80,6 +80,7 @@ def build_dataset(
     record_hardware=None,
     identity_update=None,
     record_identity=None,
+    status="complete",
 ):
     rows = [(f"s{i}", {"tokens": 10 * i}, 10.0 * i) for i in range(1, 5)] + [("bad", {"tokens": 1}, None)]
     art = write_truth_table(tmp_path / "t.parquet", rows)
@@ -112,6 +113,8 @@ def build_dataset(
             "producer": {"kind": "human", "name": "t", "evaluator_revision": "r"},
             "tier": "submitted",
             "created_at": "2026-11-07T00:00:00Z",
+            "status": status,
+            "status_reason": "archival incomplete evidence" if status != "complete" else None,
         }
     )
     rec_name = f"eval/{record.record_id}.json"
@@ -232,6 +235,22 @@ def test_pass_binds_all_identities(tmp_path):
     assert [o.status for o in r.required_cases] == ["pass", "pass"]
     assert r.accuracy is not None and r.accuracy.n_scored == 4
     assert PrValidationReport.model_validate_json(r.model_dump_json()) == r
+
+
+@pytest.mark.parametrize("status", ["failed", "partial"])
+def test_archival_incomplete_records_cannot_pass_validation(tmp_path, status):
+    from aisim_core.data.eval import load_record, verify_record
+
+    files, rec, cfg, record = build_dataset(tmp_path, status=status)
+    # The scores themselves pass; archival reads and score verification stay available.
+    archive = tmp_path / f"{record.record_id}.json"
+    archive.write_bytes(files[rec])
+    assert load_record(archive).status == status
+    (tmp_path / "eval").mkdir()
+    (tmp_path / "eval/truth.parquet").write_bytes(files["eval/truth.parquet"])
+    assert verify_record(record, tmp_path, _predict, record.prediction.fingerprint).ok
+    report = run(tmp_path, files, request(rec, cfg))
+    assert report.verdict == "fail" and any("status must be complete" in p for p in report.problems)
 
 
 def test_wrong_claims_fail(tmp_path):
@@ -355,10 +374,11 @@ def test_refuse_credentials():
         refuse_credentials({"HF_TOKEN": "x"})
 
 
-def test_cli_run_and_recheck(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("status", ["complete", "failed", "partial"])
+def test_cli_run_and_recheck(tmp_path, monkeypatch, capsys, status):
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
-    files, rec, cfg, _ = build_dataset(tmp_path)
+    files, rec, cfg, _ = build_dataset(tmp_path, status=status)
     req = request(rec, cfg)
     (tmp_path / "req.json").write_text(req.model_dump_json())
     payload = {"number": 7, "state": "open", "head": {"sha": HEAD}, "base": {"sha": BASE}}
@@ -394,6 +414,10 @@ def test_cli_run_and_recheck(tmp_path, monkeypatch, capsys):
     assert main(bad_factory) == 2  # outside the trusted prefixes
 
     monkeypatch.setattr("aisim_core.data.validate._load_factory", lambda spec: factory)
+    if status != "complete":
+        assert main(run_args, transport=FakeTransport(files)) == 1
+        assert "PR validation: FAIL" in (tmp_path / "sum.md").read_text()
+        return
     assert main(run_args, transport=FakeTransport(files)) == 0
     assert "PR validation: PASS" in (tmp_path / "sum.md").read_text()
     report = PrValidationReport.model_validate_json(out.read_text())
@@ -521,6 +545,11 @@ def test_the_request_filters_bind_the_record_identity(tmp_path):
         ({"precision": {"weights": "bfloat16"}}, {"precision": {"weights": "fp8"}}),
         ({"deployment": "aggregated"}, {"deployment": "disaggregated"}),
         ({"effective_settings": {"max_num_seqs": 64}}, {"effective_settings": {"max_num_seqs": 128}}),
+        (
+            {"effective_settings": {"prefix_cache": {"enabled": True}}},
+            {"effective_settings": {"prefix_cache": {"enabled": 1}}},
+        ),
+        ({"effective_settings": {"scale": 1}}, {"effective_settings": {"scale": 1.0}}),
     ],
 )
 def test_the_whole_effective_identity_is_bound_to_the_selected_manifest(tmp_path, envelope, record):

@@ -1883,7 +1883,7 @@ def test_unsupervised_refusal_keeps_the_estimate_reason(tmp_path, monkeypatch, h
 
 
 @pytest.mark.parametrize("profile", [{}, {"duration_seconds": 86400}])
-def test_profile_resource_admission_requires_supervision_and_one_worker(tmp_path, host, monkeypatch, profile):
+def test_profile_without_a_native_runner_requires_supervision_and_one_worker(tmp_path, host, monkeypatch, profile):
     from aisim.recommend import recommendation_to_sweeper
 
     trace = tmp_path / "play.json"
@@ -1922,7 +1922,7 @@ def test_profile_resource_admission_requires_supervision_and_one_worker(tmp_path
     assert unmonitored["estimate"]["reason"] in unmonitored["reason"]
 
     # The recommendation compiler's concrete workload reaches both the per-run
-    # guard and whole-wave admission; profile estimates must not admit a pool.
+    # guard and whole-wave admission. An unspecified runner stays serial.
     smart = recommendation_to_sweeper(config)
     spec = SimpleNamespace(workload=smart.workload.model_dump(mode="python", exclude_none=True), concurrency=None)
     monkeypatch.setattr(resources, "discover_host", lambda: host)

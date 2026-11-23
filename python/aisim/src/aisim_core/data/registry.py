@@ -104,6 +104,7 @@ class Context:
     num_attention_heads: int | None = None
     cp_type: str | None = None  # ULYSSES | STAR | HELIX (TensorRT-LLM)
     attention_dp_enabled: bool | None = None  # source boolean, kept apart from the degree
+    dwdp_size: int | None = None  # TensorRT-LLM: 0/1 is the standard layout, >1 is DWDP, None is unknown
 
 
 _MISSING = object()
@@ -229,6 +230,9 @@ def _node_fit(ctx: Context) -> str | None:
 
 def _moe_world(ctx: Context) -> str | None:
     """moe_tp * moe_ep (* moe_cluster) must cover the attention group. Model-scope seed and TRT-LLM rule."""
+    _need(dwdp_size=ctx.dwdp_size)
+    if ctx.dwdp_size > 1:
+        return None  # TensorRT-LLM skips this equality for DWDP layouts.
     tp, dp, cp = _get(ctx, "tp"), _get(ctx, "attention_dp"), _get(ctx, "cp")
     mtp, ep, cl = _get(ctx, "moe_tp"), _get(ctx, "ep"), _get(ctx, "moe_cluster")
     for name, v in (("tp", tp), ("attention_dp", dp), ("cp", cp), ("moe_tp", mtp), ("ep", ep), ("moe_cluster", cl)):
@@ -413,13 +417,14 @@ RULES: tuple[Rule, ...] = (
         "F-trtllm-moe-world",
         "framework",
         "error",
-        "moe_tp * ep * moe_cluster == tp * attention_dp * cp (cp counts only when cp > 1 and cp_type is not ULYSSES).",
+        "For non-DWDP layouts, moe_tp * ep * moe_cluster == tp * attention_dp * cp "
+        "(cp counts only when cp > 1 and cp_type is not ULYSSES).",
         Verification(
             True,
             (f"{_TRT}:tensorrt_llm/mapping.py:170-173 moe_world_size = tp (* cp unless ULYSSES)",),
             "TensorRT-LLM tp already includes attention DP, hence tp*attention_dp here. "
             "With cp > 1 the cp_type decides: ULYSSES leaves cp out, any other type multiplies it; an unknown "
-            "cp_type is an evidence gap.",
+            "cp_type is an evidence gap. DWDP skips this equality; unknown dwdp_size is an evidence gap.",
         ),
         _moe_world,
         frameworks=("trtllm",),

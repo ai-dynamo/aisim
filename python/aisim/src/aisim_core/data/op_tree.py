@@ -76,15 +76,21 @@ def op_latency_entries(
 
 
 def read_entry_manifest(
-    tree: Path, entry: Entry, config: Mapping[str, Any] | None = None, loader: Any | None = None
+    tree: Path,
+    entry: Entry,
+    config: Mapping[str, Any] | None = None,
+    loader: Any | None = None,
+    *,
+    roles: tuple[str, ...] | None = None,
 ) -> Manifest:
     """The verified manifest of a catalog entry: the index's pinned digest first, then the contents, then identity.
 
     A replacement manifest can keep an identity and declare other table bytes; only the catalog's digest for it
-    says which manifest the dataset published. ``loader`` is the category loader (default: op-latency).
+    says which manifest the dataset published. ``loader`` is the category loader (default: op-latency); ``roles``
+    limits the artifact hash check as in ``Loader.read_manifest`` (``()`` checks none).
     """
     _verify(Path(tree), entry.manifest)
-    manifest = (loader or OpLatencyLoader()).read_manifest(Path(tree), entry.manifest.path, config)
+    manifest = (loader or OpLatencyLoader()).read_manifest(Path(tree), entry.manifest.path, config, roles=roles)
     if (manifest.configuration_id, manifest.identity, manifest.purpose) != (
         entry.configuration_id,
         entry.identity,
@@ -109,13 +115,16 @@ def composed_root_matches(
     """
     systems, tree = Path(systems), Path(tree)
     try:
+        expected_files = set()
         for manifest in manifests:
             for artifact in manifest.artifacts:
                 if artifact.runtime_path is not None:
+                    expected_files.add(artifact.runtime_path)
                     _verify(systems, artifact.model_copy(update={"path": artifact.runtime_path}))
         lookups = set()
         for name in (REUSE_MANIFEST_NAME, QUERY_VERSIONS_NAME):
             lookups.add(f"{name}.yaml")
+            expected_files.add(f"{name}.yaml")
             expected = lookup_yaml(tree / DATA_PREFIX / f"{name}.parquet")
             if (systems / f"{name}.yaml").read_bytes() != expected:
                 return False
@@ -125,6 +134,14 @@ def composed_root_matches(
                     continue
                 if not _same_tree(source, systems / source.name):
                     return False
+                expected_files.update(
+                    p.relative_to(packaged_systems).as_posix()
+                    for p in (source.rglob("*") if source.is_dir() else [source])
+                    if p.is_file()
+                )
+        actual_files = {p.relative_to(systems).as_posix() for p in systems.rglob("*") if p.is_file() or p.is_symlink()}
+        if actual_files != expected_files:
+            return False
     except (OSError, ValueError, LoaderError):
         return False
     return True
@@ -136,7 +153,7 @@ def _same_tree(source: Path, copy: Path) -> bool:
         if not copy.is_dir():
             return False
         names = {p.name for p in source.iterdir()}
-        return all(_same_tree(source / n, copy / n) for n in names)
+        return names == {p.name for p in copy.iterdir()} and all(_same_tree(source / n, copy / n) for n in names)
     return copy.is_file() and hashlib.sha256(source.read_bytes()).digest() == hashlib.sha256(copy.read_bytes()).digest()
 
 
@@ -146,7 +163,15 @@ def verify_op_latency_support(tree: Path) -> None:
     Reusing a composed root is only safe after this passes, exactly as a cold build requires.
     """
     tree = Path(tree)
-    for artifact in _op_latency_index(tree).support:
+    index = _op_latency_index(tree)
+    if "support" in index.model_fields_set:
+        # Only an index that omits the field entirely is a legacy local layout. An indexed layout must pin
+        # both policies before they can affect version or donor selection, even with an explicit version.
+        required = {f"{DATA_PREFIX}/{name}.parquet" for name in (REUSE_MANIFEST_NAME, QUERY_VERSIONS_NAME)}
+        missing = required - {a.path for a in index.support}
+        if missing:
+            raise LoaderError(f"op-latency index lacks required lookup support: {sorted(missing)}")
+    for artifact in index.support:
         _verify(tree, artifact)
 
 
@@ -264,6 +289,7 @@ def _write_lookup_yaml(tree: Path, destination: Path) -> tuple[str, ...]:
     for a pinned lookup. A tree whose index predates ``support`` can still be read from a local directory, with
     only the checksum embedded in the file to guard it.
     """
+    verify_op_latency_support(tree)
     support = {a.path: a for a in _op_latency_index(tree).support}
     written = []
     for name in (REUSE_MANIFEST_NAME, QUERY_VERSIONS_NAME):

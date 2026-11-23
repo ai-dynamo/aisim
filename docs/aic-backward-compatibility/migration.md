@@ -671,7 +671,8 @@ explains the retained workload routing and feature mathematics.
   `State`. Serialized groups that omit the field still deserialize, and `None`
   is not serialized. Literals must also supply `prefix_cacheable` and
   `transfer_bytes_per_block`. Use `None` for unknown values. A hand-made
-  `transfer_bytes_per_block` requires a measurement for that specific group;
+  `transfer_bytes_per_block` requires a measurement or other evidence that
+  identifies the bytes of that specific group;
   aggregate transfer sizes for multiple state groups cannot populate it. See
   the [transfer measurement limits](../perf-model/memory.md#fpm-profile-cache-groups-and-byte-budgets).
   Serialized groups that omit these fields still deserialize, and `None` is
