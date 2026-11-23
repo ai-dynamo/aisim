@@ -477,8 +477,8 @@ def test_bounded_repeat_of_a_glm_smoke_source_measures_the_frozen_subset(monkeyp
 def test_full_grid_repeat_of_a_glm_smoke_source_is_refused_before_a_launch(monkeypatch, tmp_path, mode):
     plan = _glm_short_request_plan(tmp_path, "prefill")
     [cell] = plan.cells
-    source, checkpoint, _saved = _glm_smoke_source(monkeypatch, tmp_path, plan)
-    _read_the_staged_lists(monkeypatch)
+    source, checkpoint, saved = _glm_smoke_source(monkeypatch, tmp_path, plan)
+    # No reader is replaced: the staged run holds no rank artifacts, so a read of one would raise another text.
     launches = []
     monkeypatch.setattr(repeatability, "run_collection", lambda *args, **kwargs: launches.append(args))
     files = sorted(tmp_path.rglob("*"))
@@ -496,6 +496,12 @@ def test_full_grid_repeat_of_a_glm_smoke_source_is_refused_before_a_launch(monke
     assert str(error.value) == text
     assert launches == []
     assert sorted(tmp_path.rglob("*")) == files
+
+    # A cell that did not pass keeps its own refusal.
+    saved["cells"][cell.cell_id]["status"] = "failed"
+    checkpoint.write_text(json.dumps(saved))
+    with pytest.raises(ValueError, match="^repeatability requires a passed source cell"):
+        repeatability.freeze_repeatability_plan(plan, source, checkpoint, **mode)
 
 
 @pytest.mark.parametrize("mode", ["full_grid", "bounded"])

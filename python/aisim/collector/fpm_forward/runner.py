@@ -2343,17 +2343,19 @@ def _run_collection_impl(
             logger.info("Validated completed FPM database; resume has no publication work")
 
     checkpoint_changed = False
-    # Recovery costs zero cluster time, so it runs on every resume: it only
-    # acknowledges strictly validated, attempt-matched artifacts that already
-    # exist on disk. For an entry with status running it first stops the
+    # Recovery starts no workload, so it runs on every resume: it acknowledges
+    # only strictly validated, attempt-matched artifacts that already exist on
+    # disk. For an entry with status running it first stops the
     # abandoned workload on the cluster and waits until it is gone; a failed
     # teardown leaves the cell unrecovered. For a recovered GLM-5.3-Flash cell
     # whose folder holds no producer receipt it writes one; a cell of another
     # model gets none. When the plan holds runtime instrumentation, it archives
     # the observations of each recovered cell (a copy of the cell folder and
     # the index runtime-observations.json). After the loop it writes the
-    # checkpoint if it recovered a cell. Rerunning (--resume-retry-failed)
-    # remains the only path that schedules cluster work.
+    # checkpoint if it recovered a cell. Only a rerun schedules cluster work.
+    # A plain resume reruns a cell that has no entry, or that is interrupted
+    # or running and was not recovered; --resume-retry-failed also reruns a
+    # cell that failed or whose cleanup failed.
     if resume:
         for cell in target_cells:
             entry = checkpoint["cells"].get(cell.cell_id)
