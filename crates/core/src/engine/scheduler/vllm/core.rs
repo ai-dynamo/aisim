@@ -728,7 +728,7 @@ pub(crate) struct VllmCore {
     /// Requests that finished in the latest pass. vLLM frees their blocks when
     /// it processes that pass's outputs, after it has formed the next pass.
     finished_in_flight: Vec<HeldVllmPrefill>,
-    /// Requests the pass in flight runs, sorted, when vLLM defers freeing their
+    /// Requests the pass in flight runs, when vLLM defers freeing their
     /// blocks until that pass ends: async scheduling with a CPU tier.
     in_flight_requests: Vec<Uuid>,
     /// `launch`: when vLLM decides the pass after the latest one, if that pass
@@ -3124,8 +3124,6 @@ impl VllmCore {
                 committed_requests.push(signal.uuid);
             }
         }
-        committed_requests.sort_unstable();
-        committed_requests.dedup();
         if self.args.max_concurrent_batches > 1 {
             self.pass_ran_work = !committed_requests.is_empty();
             if self.native_host_offload.is_some() {
@@ -3326,7 +3324,7 @@ impl VllmCore {
         // vLLM does not free the blocks of a request the pass in flight runs
         // until that pass ends (async scheduling with a CPU tier), so it does
         // not preempt such a request: the allocation stops instead.
-        if self.in_flight_requests.binary_search(&selected).is_ok() {
+        if self.in_flight_requests.contains(&selected) {
             return None;
         }
         let state_before = self.pressure_state();
