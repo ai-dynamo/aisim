@@ -43,6 +43,9 @@ class _Checkpoint:
     def mark_attempted_many(self, task_ids):
         self.attempted.extend(task_ids)
 
+    def has_passed(self, task_id):
+        return task_id in self.passed
+
     def mark_passed(self, task_id):
         self.passed.append(task_id)
 

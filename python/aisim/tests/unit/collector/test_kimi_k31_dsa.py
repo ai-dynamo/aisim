@@ -901,6 +901,8 @@ def test_native_fullnode_resumes_after_last_completed_case(monkeypatch, tmp_path
     def native(case, _device, filename):
         ran.append(case)
         if len(ran) == 2:
+            with Path(filename).open("a") as stream:
+                stream.write("unconfirmed row\n")
             raise KeyboardInterrupt("allocation cancelled during B")
         with Path(filename).open("a") as stream:
             stream.write(str(case) + "\n")

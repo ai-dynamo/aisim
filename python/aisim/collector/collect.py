@@ -1503,6 +1503,12 @@ class ResumeCheckpoint:
             logger.info(f"{self.module_name}: {', '.join(parts)}")
         return runnable
 
+    def has_unfinished_attempts(self) -> bool:
+        return bool(self._attempted - self._done - self._failed)
+
+    def has_passed(self, task_id: str) -> bool:
+        return task_id in self._done
+
     def mark_passed(self, task_id: str):
         """Mark a task as successfully completed. Skipped on resume."""
         self._done.add(task_id)

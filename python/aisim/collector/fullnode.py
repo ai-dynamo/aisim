@@ -11,12 +11,14 @@ failure mapping out of the top-level backend entrypoint.
 import json
 import os
 import random
+import shutil
+import tempfile
 import traceback
 from datetime import datetime
 from pathlib import Path
 
 from collector.case_generator import without_models
-from collector.helper import create_test_case_id
+from collector.helper import collector_retained_path, create_test_case_id
 from collector.op_plans import OP_PLANS
 from collector.skips import filter_cases, models
 from collector.version_resolver import _check_compat
@@ -222,6 +224,50 @@ def collect_sglang_fullnode_op(
             except OSError as exc:
                 logger.warning(f"Failed to mirror collector diagnostics to {report}: {exc}")
 
+    # A native worker can outlive a killed launcher. Give each attempt a
+    # private staging file. Only the parent publishes its bytes, after the
+    # checkpoint is durable. A receipt bridges the two atomic replacements.
+    native = op.startswith("kimi_k31_dsa_")
+    output = Path(collection["perf_filename"])
+    receipt = output.with_name(f".{output.name}.pending")
+
+    def finish_publication():
+        if not receipt.exists():
+            return
+        transaction = json.loads(receipt.read_text())
+        name = transaction["stage"]
+        if Path(name).name != name or not name.startswith(f".{output.name}.stage-"):
+            raise ValueError(f"invalid native staging filename in {receipt}")
+        stage = output.with_name(name)
+        if resume_tracker.has_passed(transaction["task_id"]) and stage.exists():
+            if collector_retained_path(output).exists():
+                # Reuse the retained inode through the same publication protocol
+                # as the other collector writers after a closed event.
+                from collector.collect import _atomic_write_bytes
+
+                _atomic_write_bytes(output, stage.read_bytes())
+                stage.unlink()
+            else:
+                os.replace(stage, output)
+        else:
+            stage.unlink(missing_ok=True)
+        receipt.unlink()
+
+    if native:
+        if Path(f"{output}.lock").exists():
+            raise RuntimeError(f"Native output already has a writer lock: {output}.lock")
+        if (
+            resume_options
+            and resume_options.get("resume")
+            and not receipt.exists()
+            and output.exists()
+            and resume_tracker.has_unfinished_attempts()
+        ):
+            raise RuntimeError(
+                f"Unreconciled native staging rows in {output}; preserve and restart in a fresh directory"
+            )
+        finish_publication()
+
     if not task_infos:
         logger.info(f"{full_name}: no full-node tasks to run")
         return errors + _resume_errors(full_name, resume_tracker, resume_options, logger, errors)
@@ -237,10 +283,22 @@ def collect_sglang_fullnode_op(
         batches = ([task_info] for task_info in task_infos) if op.startswith("kimi_k31_dsa_") else (task_infos,)
         for batch in batches:
             batch_ids = {str(task_info["params"]): task_info["id"] for task_info in batch}
+            filename = collection["perf_filename"]
+            if native:
+                with tempfile.NamedTemporaryFile(
+                    dir=output.parent, prefix=f".{output.name}.stage-", delete=False
+                ) as tmp:
+                    filename = Path(tmp.name)
+                if output.exists():
+                    shutil.copyfile(output, filename)
+                transaction = {"task_id": batch[0]["id"], "stage": filename.name}
+                pending = receipt.with_suffix(".pending.tmp")
+                pending.write_text(json.dumps(transaction))
+                os.replace(pending, receipt)
             resume_tracker.mark_attempted_many(batch_ids.values())
             submitted.update(batch_ids.values())
             result = run_func(
-                perf_filename=collection["perf_filename"],
+                perf_filename=str(filename) if native else filename,
                 limit=None,
                 cases=[task_info["params"] for task_info in batch],
             )
@@ -293,6 +351,8 @@ def collect_sglang_fullnode_op(
                 else:
                     resume_tracker.mark_passed(task_id)
             resume_tracker.flush(force=True)
+            if native:
+                finish_publication()
     except Exception as e:
         logger.exception(f"{full_name} full-node collection failed")
         for task_id in submitted - completed:
@@ -312,5 +372,7 @@ def collect_sglang_fullnode_op(
         persist_errors()
         resume_tracker.flush(force=True)
 
+    if native:
+        finish_publication()
     errors.extend(_resume_errors(full_name, resume_tracker, resume_options, logger, errors))
     return errors
