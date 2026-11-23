@@ -20,6 +20,7 @@ import pytest
 
 from aisim_core.data import repos
 from aisim_core.data.ensure import pin_from_environment
+from aisim_core.data.fetch import _resolve_source
 from aisim_core.data.fpm_layout import physical_path
 from aisim_core.sdk import fpm_dataset
 
@@ -69,9 +70,17 @@ def test_paths_follow_the_alias_only_when_the_repository_does():
 
 
 def test_environment_pin_follows_symbolic_refs_but_not_shas():
-    assert (pin := pin_from_environment({"AISIM_DATASET": f"{OLD}@main"})) and (pin.repo, pin.revision) == (NEW, "main")
-    assert (pin := pin_from_environment({"AISIM_DATASET": f"{OLD}@{SHA}"})) and (pin.repo, pin.revision) == (OLD, SHA)
-    assert (pin := pin_from_environment({"AISIM_DATASET": f"{NEW}@{SHA}"})) and (pin.repo, pin.revision) == (NEW, SHA)
+    # The pin keeps the requested name; ``ensure_data`` resolves it at transport setup so the successor's path
+    # mapping survives (see ``test_environment_successor_alias_keeps_mapping_through_ensure``).
+    def resolved(spec):
+        pin = pin_from_environment({"AISIM_DATASET": spec})
+        assert pin is not None
+        source = _resolve_source(pin.repo, pin.revision, object())
+        return source[:2]
+
+    assert resolved(f"{OLD}@main") == (NEW, "main")
+    assert resolved(f"{OLD}@{SHA}") == (OLD, SHA)
+    assert resolved(f"{NEW}@{SHA}") == (NEW, SHA)
 
 
 @pytest.fixture
