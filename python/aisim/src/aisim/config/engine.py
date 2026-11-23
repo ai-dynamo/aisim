@@ -1417,7 +1417,15 @@ class ParallelismRecommendationConfig(StrictModel):
         return self
 
 
-class SchedulerRecommendationConfig(StrictModel):
+PREFILL_INTERVAL_FIELDS = {"vllm": "prefill_schedule_interval", "sglang": "prefill_decode_interval"}
+
+
+class PrefillIntervalSearch(StrictModel):
+    prefill_schedule_interval: PositiveInt | Choices[PositiveInt] | None = None
+    prefill_decode_interval: NonNegativeInt | Choices[NonNegativeInt] | None = None
+
+
+class SchedulerRecommendationConfig(PrefillIntervalSearch):
     max_batched_tokens: PositiveInt | Choices[PositiveInt] | IntegerRange | None = None
     max_sequences: PositiveInt | Choices[PositiveInt] | IntegerRange | None = None
 
@@ -1611,6 +1619,9 @@ class EngineRecommendationConfig(EstimatorPolicyConfig):
             worker = getattr(self.workers, role)
             if worker is None or is_afd_worker(worker):
                 continue
+            for backend, field in PREFILL_INTERVAL_FIELDS.items():
+                if getattr(worker.scheduler, field) is not None and (role != "aggregated" or backend not in backends):
+                    raise ValueError(f"{field} search requires an aggregated {backend} worker")
             cache = worker.kv_cache
             if cache.state_cache is not None:
                 if not isinstance(self.speculation, MtpDepthSearch):
@@ -1738,7 +1749,6 @@ def _validate_fpm_profile(engine, modes: set[str], backends: set[str]) -> None:
                         prefix_match_unit=cache.prefix_match_unit,
                         max_batched_tokens=worker.scheduler.max_batched_tokens,
                     )
-                    # Only a prediction states the interval. The search space and the onboarding plan run with 1.
                     if backend_version == "0.33.0" and worker.scheduler.prefill_schedule_interval != 1:
                         raise ValueError(
                             "grouped prefix caching on vLLM 0.33.0 requires prefill_schedule_interval=1; vLLM 0.33.0 "

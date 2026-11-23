@@ -18,7 +18,7 @@ from aisim_core.sdk.rust_engine_step import UNKNOWN_IDENTITY
 from .capacity import resolve_model_context_length
 from .config.cli import CorePredictionConfig, CoreRecommendationConfig
 from .config.common import ENGINE_MODEL_CONTROL_FIELDS
-from .config.engine import is_afd_worker, resolve_block_size
+from .config.engine import PREFILL_INTERVAL_FIELDS, is_afd_worker, resolve_block_size
 from .config.traffic import TrafficPredictionConfig
 from .config_adapter import (
     CompiledSweepProvider,
@@ -434,6 +434,10 @@ def _role_search_space(
         scheduler = raw.get("scheduler") or {}
         if not isinstance(scheduler, dict):
             raise ValueError(f"engine.workers.{public_role}.scheduler must be a mapping")
+        if legacy_role == "agg":
+            intervals = {field: scheduler[field] for field in PREFILL_INTERVAL_FIELDS.values() if field in scheduler}
+            if intervals:
+                result["agg_prefill_intervals"] = intervals
         tokens_default = [8192] if legacy_role == "decode" else [8192, 16384, 32768]
         sequences_default = [1, 2, 4, 8, 16, 32, 64, 128, 256] if legacy_role == "prefill" else [256, 512, 1024]
         tokens_name = f"{legacy_role}_max_num_batched_tokens"
@@ -1123,6 +1127,11 @@ def _candidate_prediction(
             "scheduler": {
                 "max_batched_tokens": sample[f"{role}_max_num_batched_tokens"],
                 "max_sequences": sample[f"{role}_max_num_seqs"],
+                **{
+                    field: sample[field]
+                    for field in PREFILL_INTERVAL_FIELDS.values()
+                    if role == "agg" and field in sample
+                },
             },
             "kv_cache": kv_cache,
             "timing": timing,

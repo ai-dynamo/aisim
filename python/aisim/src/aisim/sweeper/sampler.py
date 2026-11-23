@@ -45,7 +45,7 @@ from .parallel_projection import (
     ParallelProjection,
 )
 from .replay import canonical_json
-from .search_space import BranchSpace, matches_parallel_domains
+from .search_space import BranchSpace, matches_parallel_domains, prefill_interval_arms
 
 _CONSTANT_PARAM = "_sweeper_constant"
 _METRIC = "objective"
@@ -790,6 +790,12 @@ def _conditional_arm_id(assignments: dict[str, Any]) -> str:
 def _expand_conditional_arms(branch: BranchSpace) -> list[tuple[str, BranchSpace]]:
     """Expand conditional selectors into flat sampler-compatible branch arms."""
 
+    if branch.prefill_interval_choices:
+        return [
+            (_conditional_arm_id({"prefill": group, "arm": arm_id}), arm)
+            for group, subspace in prefill_interval_arms(branch)
+            for arm_id, arm in _expand_conditional_arms(subspace)
+        ]
     selectors = tuple(dict.fromkeys(condition.selector for condition in branch.conditional_dimensions))
     arms: list[tuple[str, BranchSpace]] = []
     for raw_values in product(*(branch.knob_choices[selector] for selector in selectors)):
@@ -922,7 +928,14 @@ def make_branch_sampler(
         if flat_branch.prefer_smallest:
             # min_gpus: ascending GPU-count search, whatever optimizer was requested.
             return SmallestFirstBranchSampler(flat_branch, seed=flat_seed, bound=bound)
-        if algorithm == "random":
+        # A fully pinned interval arm has exactly one trial. Retire it after that trial
+        # so the optimizer can spend the remaining budget on arms with choices.
+        if algorithm == "random" or (
+            branch.prefill_interval_choices
+            and len(flat_branch.parallel_configs) == 1
+            and all(len(values) == 1 for values in flat_branch.knob_choices.values())
+            and all(lo == hi for lo, hi in (*flat_branch.float_ranges.values(), *flat_branch.integer_ranges.values()))
+        ):
             return RandomBranchSampler(flat_branch, seed=flat_seed)
         if algorithm == "bayesian":
             return SeededBayesianBranchSampler(
@@ -938,7 +951,7 @@ def make_branch_sampler(
             seed=flat_seed,
         )
 
-    if branch.conditional_dimensions:
+    if branch.conditional_dimensions or branch.prefill_interval_choices:
         return ConditionalBranchSampler(
             branch,
             sampler_factory=construct,

@@ -43,6 +43,7 @@ from ..config.common import (
 from ..config.engine import (
     MtpDepthSearch,
     NgramSpeculationConfig,
+    PrefillIntervalSearch,
     ReplayEstimationMode,
     grouped_prefix_caching_requirements,
 )
@@ -695,6 +696,7 @@ class SearchSpace(BaseModel):
     decode_context_length: int | None = Field(default=None, gt=0)
 
     # agg engine (agg branch): scheduler batching capacity
+    agg_prefill_intervals: PrefillIntervalSearch | None = None
     agg_max_num_batched_tokens: list[int] = [8192, 16384, 32768]
     agg_max_num_seqs: list[int] = [256, 512, 1024]
     # pinned

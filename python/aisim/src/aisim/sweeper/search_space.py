@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import warnings
 from bisect import bisect_left, bisect_right
+from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from heapq import merge
 from typing import Any
 
+from aisim.config.engine import PREFILL_INTERVAL_FIELDS
 from aisim_core._native import validate_afd_attention_tp, validate_afd_routing_location
 
 from .afd_parallel import (
@@ -110,6 +112,7 @@ class BranchSpace:
     conditional_dimensions: tuple[ConditionalDimensionSpace, ...] = ()
     domain_provenance: dict[str, Any] = field(default_factory=dict)
     prefer_smallest: bool = False
+    prefill_interval_choices: dict[str, list[int]] = field(default_factory=dict)
 
 
 def _parallel_leaf_values(config: _ParallelConfig) -> dict[str, int]:
@@ -131,6 +134,39 @@ def _parallel_leaf_values(config: _ParallelConfig) -> dict[str, int]:
         **role_values("prefill_", config.prefill),
         **role_values("decode_", config.decode),
     }
+
+
+def prefill_interval_arms(branch: BranchSpace) -> Iterator[tuple[tuple[str, int | None], BranchSpace]]:
+    """Visit each requested interval on its eligible topologies and keep DP1 in its own study."""
+    for backend in branch.knob_choices["backend"]:
+        interval = PREFILL_INTERVAL_FIELDS.get(backend)
+        groups = {}
+        for config in branch.parallel_configs:
+            if backend in branch.supported_backends[config]:
+                active = interval if config.shape.dp > 1 and interval in branch.prefill_interval_choices else None
+                groups.setdefault(active, []).append(config)
+        for active, configs in groups.items():
+            choices = {**branch.knob_choices, "backend": [backend]}
+            # Independent parallelism samples these leaves before matching a topology.
+            leaves = [_parallel_leaf_values(cfg) for cfg in configs] if branch.parallel_independent_choices else []
+            domains = {
+                name: tuple(sorted({leaf[name] for leaf in leaves})) for name in branch.parallel_independent_choices
+            }
+            bounds = {name: (min(domains[name]), max(domains[name])) for name in branch.parallel_independent_log_ranges}
+            arm = replace(
+                branch,
+                parallel_configs=tuple(configs),
+                supported_backends={config: frozenset({backend}) for config in configs},
+                knob_choices=choices,
+                parallel_independent_choices=domains,
+                parallel_independent_log_ranges=bounds,
+                prefill_interval_choices={},
+            )
+            if active is None:
+                yield (backend, None), arm
+            else:
+                for value in branch.prefill_interval_choices[active]:
+                    yield (backend, value), replace(arm, knob_choices={**choices, active: [value]})
 
 
 def matches_parallel_domains(config: _ParallelConfig, choices, log_ranges) -> bool:
@@ -929,6 +965,12 @@ def enumerate_branches(
             )
             if config.workload.load_log_scale:
                 log_float_ranges.add("traffic_load")
+        interval_choices = {}
+        if deployment_mode == "agg" and ss.agg_prefill_intervals is not None:
+            for backend, field_name in PREFILL_INTERVAL_FIELDS.items():
+                domain = getattr(ss.agg_prefill_intervals, field_name)
+                if domain is not None and any(cfg.shape.dp > 1 and backend in bs for cfg, bs in support.items()):
+                    interval_choices[field_name] = [domain] if isinstance(domain, int) else domain.choices
         branches.append(
             # Omitted ranges are derived from the legal pool; requested leaf
             # domains have already been intersected with joint feasibility.
@@ -959,6 +1001,7 @@ def enumerate_branches(
                     for name, bounds in ss.parallel_independent_log_ranges_by_mode.get(deployment_mode, {}).items()
                 },
                 parallel_custom_choices=custom_by_role,
+                prefill_interval_choices=interval_choices,
             )
         )
 
