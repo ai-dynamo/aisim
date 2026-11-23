@@ -16,16 +16,12 @@ a failed check.
 """
 
 import argparse
-import hashlib
 import importlib.util
 import json
-import os
-import shutil
 import sys
-import tempfile
 from pathlib import Path
 
-from aisim_core.data import _verify
+from aisim_core.data import _verified_bytes, _verify
 from aisim_core.data.eval import attest, check_record_gpu_time, load_record, record_dir, verify_record, write_record
 from aisim_core.data.gpu_time import check_gpu_time
 from aisim_core.data.hygiene import checked_path
@@ -48,24 +44,6 @@ def _load_predictor(path: Path):
             sys.modules[spec.name] = previous
         raise
     return module.predict, module.fingerprint()
-
-
-def _publish_artifact(source: Path, target: Path, sha256: str) -> None:
-    """Publish complete, verified bytes without replacing a competing writer's artifact."""
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, pending = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb") as output, source.open("rb") as incoming:
-            shutil.copyfileobj(incoming, output)
-        # A source that changed after preflight must never reach the final path, where every retry would reject it.
-        if hashlib.sha256(Path(pending).read_bytes()).hexdigest() != sha256:
-            raise ValueError(f"source changed after verification: {source}")
-        try:
-            os.link(pending, target)
-        except FileExistsError:
-            pass  # the caller verifies the winner against the expected artifact hash
-    finally:
-        Path(pending).unlink(missing_ok=True)
 
 
 def main(argv=None) -> int:
@@ -108,32 +86,33 @@ def main(argv=None) -> int:
             history = [record]
             while history[-1].supersedes:
                 history.append(load_record(args.record.parent / f"{history[-1].supersedes}.json"))
-            # Preflight every input and collision before staging any record.
+            # Preflight every input and collision before anything is published.
+            source_root = args.truth_root or args.record.parent
+            ordered = [*reversed(history), verified]  # each record after the one it supersedes
             destinations = {
                 item.record_id: checked_path(args.attest_root, record_dir(Path(), item.truth.identity).as_posix())
-                for item in [*history, verified]
+                for item in ordered
             }
-            copies = {}
-            for item in [*history, verified]:
+            digests = {}
+            for item in ordered:
                 destination = destinations[item.record_id]
                 for artifact in [*item.truth.artifacts, *item.findings]:
-                    source = _verify(args.truth_root or args.record.parent, artifact)
+                    _verify(source_root, artifact)
                     target = checked_path(destination, artifact.path)
-                    if target in copies and copies[target][1] != artifact.sha256:
+                    if target in digests and digests[target] != artifact.sha256:
                         raise ValueError(f"conflicting artifact content: {target}")
                     if target.exists():
                         _verify(destination, artifact)
-                    copies[target] = (source, artifact.sha256)
-            for target, (source, digest) in copies.items():
-                if not target.exists():
-                    _publish_artifact(source, target, digest)
-            for item in [*history, verified]:
-                destination = destinations[item.record_id]
-                for artifact in [*item.truth.artifacts, *item.findings]:
-                    _verify(destination, artifact)
-            for predecessor in reversed(history):
-                write_record(args.attest_root, predecessor)
-            out["verified_record_path"] = str(write_record(args.attest_root, verified))
+                    digests[target] = artifact.sha256
+            # Each record publishes its linked files with itself, under the record lock, in predecessor order: a
+            # file copied ahead of its record would read as a corrupt record to the next successor check.
+            for item in ordered:
+                files = {
+                    artifact.path: _verified_bytes(source_root, artifact)  # the bytes that pass, not a second read
+                    for artifact in [*item.truth.artifacts, *item.findings]
+                }
+                written = write_record(args.attest_root, item, sidecars=files)
+            out["verified_record_path"] = str(written)
             out["verified_record_id"] = verified.record_id
     json.dump(out, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")

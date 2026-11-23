@@ -539,11 +539,12 @@ def test_concurrent_attestations_never_replace_published_artifacts(built_record,
     )
     destination = tmp_path / "attested"
     target = record_dir(destination, record.truth.identity) / finding.path
-    original = tool.os.link
+    original = tool.write_record
     winners = []
 
-    def interleave(staged, final):
-        if Path(final) == target and not winners:
+    def interleave(root, item, **kwargs):
+        # A competing writer publishes its own finding at the same path after this attestation's preflight.
+        if not winners:
             winners.append(other_record.record_id)
             assert (
                 tool.main(
@@ -559,9 +560,9 @@ def test_concurrent_attestations_never_replace_published_artifacts(built_record,
                 )
                 == 0
             )
-        return original(staged, final)
+        return original(root, item, **kwargs)
 
-    monkeypatch.setattr(tool.os, "link", interleave)
+    monkeypatch.setattr(tool, "write_record", interleave)
     args = [
         str(first_path),
         "--truth-root",
@@ -574,7 +575,7 @@ def test_concurrent_attestations_never_replace_published_artifacts(built_record,
     if same_content:
         assert tool.main(args) == 0
     else:
-        with pytest.raises(ValueError, match="integrity mismatch"):
+        with pytest.raises(FileExistsError, match="refusing to overwrite"):
             tool.main(args)
     assert winners and target.read_bytes() == other_content
     assert not list(destination.rglob("*.tmp"))
@@ -729,17 +730,80 @@ def test_attestation_confines_identity_directories(built_record, tmp_path, escap
     assert not list(destination.rglob("*.parquet")) and not list(destination.rglob("*.json"))
 
 
-def test_changed_source_is_not_published_to_the_final_path(tmp_path):
-    import hashlib
-
+def test_changed_source_is_not_published_to_the_final_path(built_record, tmp_path, monkeypatch):  # noqa: F811
+    root, record = built_record
+    path = write_record(root, record)
     tool = _script("aisim-benchmark-evaluate", "check_eval_record.py")
-    source, target = tmp_path / "src.bin", tmp_path / "out" / "dst.bin"
-    source.write_bytes(b"original")
-    digest = hashlib.sha256(b"original").hexdigest()
-    source.write_bytes(b"changed after preflight")
-    with pytest.raises(ValueError, match="changed after verification"):
-        tool._publish_artifact(source, target, digest)
-    assert not target.exists() and not list(target.parent.iterdir())
-    source.write_bytes(b"original")  # restoring the source permits a retry without cleanup
-    tool._publish_artifact(source, target, digest)
-    assert target.read_bytes() == b"original"
+    predictor = tmp_path / "predict.py"
+    predictor.write_text(
+        "def predict(inputs):\n    return inputs['tokens'] * 1.1 + (5.0 if inputs['tokens'] == 40 else 0.0)\n"
+        f"def fingerprint():\n    return {record.prediction.fingerprint!r}\n"
+    )
+    destination = tmp_path / "attested"
+    truth = root / record.truth.artifacts[0].path
+    original = tool._verify
+    preflight = [0]
+
+    def change_after_preflight(source_root, artifact):
+        checked = original(source_root, artifact)
+        preflight[0] += 1
+        if preflight[0] == 2:  # the record and its attestation each verify the truth table; then publication starts
+            truth.write_bytes(b"changed after preflight")
+        return checked
+
+    monkeypatch.setattr(tool, "_verify", change_after_preflight)
+    args = [str(path), "--truth-root", str(root), "--predictor", str(predictor), "--attest-root", str(destination)]
+    with pytest.raises(ValueError, match="integrity mismatch"):
+        tool.main(args)
+    assert not list(destination.rglob("*"))  # nothing reached the final paths, so a retry needs no cleanup
+
+
+def test_history_import_publishes_each_record_with_its_hash_named_findings(built_record, tmp_path, capsys):  # noqa: F811
+    root, record = built_record
+    payload = b'{"reason": "synthetic findings named by their hash"}'
+    digest = hashlib.sha256(payload).hexdigest()
+    (root / f"{digest}.json").write_bytes(payload)  # content-addressed, like a record file's name
+    findings = Artifact(
+        artifact_id="findings",
+        path=f"{digest}.json",
+        role="findings",
+        format="json",
+        schema="fixture-findings/v1",
+        sha256=digest,
+        bytes=len(payload),
+    )
+    # A valid history P -> M -> C whose last record declares the hash-named findings file.
+    first = record.model_copy(update={"status": "failed", "status_reason": "synthetic first attempt"})
+    middle = record.model_copy(
+        update={"status": "partial", "status_reason": "synthetic second attempt", "supersedes": first.record_id}
+    )
+    last = record.model_copy(update={"findings": [findings], "supersedes": middle.record_id})
+    for item in (first, middle, last):
+        write_record(root, item)
+    path = write_record(root, last)
+    predictor = tmp_path / "predictor.py"
+    predictor.write_text(
+        "def predict(inputs):\n    return inputs['tokens'] * 1.1 + (5.0 if inputs['tokens'] == 40 else 0.0)\n"
+        f"def fingerprint():\n    return {record.prediction.fingerprint!r}\n"
+    )
+    destination = tmp_path / "fresh-attest-root"
+    tool = _script("aisim-benchmark-evaluate", "check_eval_record.py")
+    args = [str(path), "--truth-root", str(root), "--predictor", str(predictor), "--attest-root", str(destination)]
+    assert tool.main(args) == 0
+    out = json.loads(capsys.readouterr().out)
+    verified = load_record(out["verified_record_path"])
+    directory = Path(out["verified_record_path"]).parent
+    assert verified.supersedes == last.record_id
+    assert {p.stem for p in directory.glob("*.json")} == {
+        first.record_id,
+        middle.record_id,
+        last.record_id,
+        verified.record_id,
+        digest,
+    }
+    assert (directory / f"{digest}.json").read_bytes() == payload
+    assert [r.record_id for r in current_records(directory)] == [verified.record_id]
+    assert not [p for p in directory.iterdir() if p.name.startswith(".")]
+    # A retry changes nothing and fails on nothing.
+    assert tool.main(args) == 0
+    assert [r.record_id for r in current_records(directory)] == [verified.record_id]
