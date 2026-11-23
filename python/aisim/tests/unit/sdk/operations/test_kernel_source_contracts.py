@@ -169,6 +169,7 @@ def test_k31_fallback_propagates_corrupt_metadata_but_allows_missing_coverage(tm
 
     source = "sglang_dsa_kv_raw_fp8_kv_flashmla_packed_eager" if corrupt else "default"
     row = _dsa_bucket_row(source, "fp8", 1024)
+    row["num_heads"] = 96  # Native K3.1 TP1 geometry.
     if corrupt:
         row["architecture"] = "KimiK31ForConditionalGeneration"
     # The missing-coverage control has valid legacy data but no K3.1 rows.
@@ -179,14 +180,14 @@ def test_k31_fallback_propagates_corrupt_metadata_but_allows_missing_coverage(tm
         ContextDSAModule(
             "dsa",
             1.0,
-            32,
+            96,
             common.KVCacheQuantMode.fp8,
             common.FMHAQuantMode.bfloat16,
             common.GEMMQuantMode.bfloat16,
             **kwargs,
         )
         if phase == "context"
-        else GenerationDSAModule("dsa", 1.0, 32, common.KVCacheQuantMode.fp8, common.GEMMQuantMode.bfloat16, **kwargs)
+        else GenerationDSAModule("dsa", 1.0, 96, common.KVCacheQuantMode.fp8, common.GEMMQuantMode.bfloat16, **kwargs)
     )
     fallback = FallbackOp("fallback", primary=primary, fallback=[OverlapOp("empty", group_a=[], group_b=[])])
 
