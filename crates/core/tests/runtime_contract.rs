@@ -1327,6 +1327,125 @@ fn grouped_destination_keeps_room_for_a_first_pass_in_byte_mode_too() {
 }
 
 #[test]
+fn grouped_destination_in_byte_mode_with_a_window_group_stops_where_vllm_stops() {
+    // Full attention, a window of 33 tokens and a state group of one block per
+    // request, 16-token blocks and 100-byte pages, max_model_len 240, one
+    // batch of 32 tokens and prefix caching off, so the window cap is
+    // cdiv(32 + 32, 16) + 1 = 5 blocks. Two distinct prompts of 161 tokens
+    // end their prefills together, and each load of 160 tokens holds 10 + 2 +
+    // 1 = 13 pages for 50 ms. With the loaded tokens computed, the reserve
+    // that vLLM keeps for a held load counts the rest of its sequence with
+    // the cap: 11 - 10 = 1 full-attention page, and for the window group
+    // min(11, 5) less the 10 block positions that the load holds, null
+    // blocks included, so no page (v0.31.0 `vllm/v1/core/sched/scheduler.py:3003-3017`, v0.32.0
+    // `:3060-3076`, v0.33.0 `:3404-3420`). The first step after the load
+    // counts the window page that token 161 opens, without the cap: 2 pages
+    // (v0.31.0 `vllm/v1/core/kv_cache_manager.py:558-576`, v0.32.0
+    // `:561-579`, v0.33.0 `:570-588`).
+    // - 26 pages: the second load needs 13 pages and the reserve 1, against
+    //   13 free, so it waits, and it is reserved when the first request ends.
+    // - 27 pages: the second load fits on 14 free pages with the reserve, and
+    //   1 page stays free. After both loads each first step needs 2. vLLM's
+    //   waiting loop breaks at the first refusal (v0.31.0
+    //   `vllm/v1/core/sched/scheduler.py:1194-1230`, v0.32.0 `:1241-1282`,
+    //   v0.33.0 `:1420-1461`), and its engine loop goes on with empty steps
+    //   (v0.31.0 `vllm/v1/engine/core.py:1526-1542`, v0.32.0 `:1603-1619`,
+    //   v0.33.0 `:1678-1696`). No request runs again until a client aborts
+    //   one of them (v0.31.0 `vllm/v1/core/sched/scheduler.py:2585-2648`,
+    //   v0.32.0 `:2649-2712`, v0.33.0 `:2964-3029`). Replay ends with the
+    //   error of a pass without effect.
+    // - 28 pages: both loads are reserved and the first step of the first
+    //   request fits. The first request is preempted once, and the second
+    //   request ends first.
+    // vLLM's scheduler, with the scheduler side of its NIXL connector, gives
+    // these three rows at v0.31.0, v0.32.0 and v0.33.0.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let spec = |pages: u64| {
+            let requests = ["first", "second"]
+                .into_iter()
+                .zip([0u32, 1_000])
+                .map(|(id, first_token)| {
+                    let mut request = request(id, 0.0, 161, 40);
+                    request.input_token_ids = Some((first_token..first_token + 161).collect());
+                    request
+                })
+                .collect();
+            let mut spec = small_grouped_pd_spec(requests, pages, None);
+            spec.topology = ReplayTopology::Disaggregated {
+                prefill: WorkerPoolSpec {
+                    initial_workers: 1,
+                    startup_delay_ms: 0.0,
+                },
+                decode: WorkerPoolSpec {
+                    initial_workers: 1,
+                    startup_delay_ms: 0.0,
+                },
+                handoff_latency_ms: 50.0,
+            };
+            let rank = &mut spec.engine["rank"];
+            rank["kv_cache_groups"] = serde_json::json!([
+                {"name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":16, "page_size_bytes":100, "prefix_cacheable":true, "transfer_bytes_per_block":100},
+                {"name":"window", "kind":"attention", "num_layers":1, "block_size_tokens":16, "page_size_bytes":100, "sliding_window":33, "prefix_cacheable":true, "transfer_bytes_per_block":100},
+                {"name":"state", "kind":"state", "num_layers":1, "block_size_tokens":16, "page_size_bytes":100, "blocks_per_request":1, "prefix_cacheable":true, "prefill_checkpoint_blocks":0, "transfer_bytes_per_block":100},
+            ]);
+            rank["vllm_version"] = version.into();
+            rank["max_num_batched_tokens"] = 32.into();
+            rank["max_model_len"] = 240.into();
+            rank["async_scheduling"] = false.into();
+            // The prefill rank ends both prefills in one pass.
+            let mut prefill = rank.clone();
+            prefill["max_num_batched_tokens"] = 4096.into();
+            prefill["kv_cache_capacity_bytes"] = (64 * 100).into();
+            spec.engine["prefill"] = serde_json::json!({ "rank": prefill });
+            spec
+        };
+
+        let report = Replayer::new(spec(26), ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(report.request_counts.completed_requests, 2, "{version}");
+        let (first, second) = (record(&report, "first"), record(&report, "second"));
+        assert_eq!(
+            second.destination_reserved_ms,
+            Some(first.terminal_time_ms),
+            "{version}"
+        );
+        assert_eq!(
+            (first.readmission_count, second.readmission_count),
+            (0, 0),
+            "{version}"
+        );
+
+        let error = Replayer::new(spec(27), ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "replay invariant violated: offline disagg replay encountered an effect-free zero-duration pass with 2 in-flight requests remaining",
+            "{version}"
+        );
+
+        let report = Replayer::new(spec(28), ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(report.request_counts.completed_requests, 2, "{version}");
+        let (first, second) = (record(&report, "first"), record(&report, "second"));
+        assert_eq!(
+            (first.readmission_count, second.readmission_count),
+            (1, 0),
+            "{version}"
+        );
+        assert!(
+            second.terminal_time_ms < first.terminal_time_ms,
+            "{version}"
+        );
+    }
+}
+
+#[test]
 fn grouped_destination_burst_completes_without_readmission() {
     // Four distinct prompts of 2,177 tokens on a GLM-5.3-Flash decode pool of
     // 16 pages, in byte mode and in block mode. A load holds 6 blocks for its

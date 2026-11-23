@@ -753,8 +753,9 @@ pub(crate) struct VllmKvManager {
     /// The P/D transfer rules of a grouped cache on a prefill or decode rank.
     grouped_transfer: Option<GroupedTransferRules>,
     /// The limits of the sliding-window admission cap, set for every grouped
-    /// rank. Byte mode counts the whole sequence of a waiting request and the
-    /// need of a load with them.
+    /// rank. Byte mode counts the whole sequence of a waiting request, the
+    /// whole prompt of a destination reservation and the need of a load with
+    /// them.
     grouped_limits: Option<AdmissionLimits>,
     state_cache: Option<StateCacheManager>,
     prefix_match_unit: Option<usize>,
@@ -2466,17 +2467,18 @@ impl VllmKvManager {
     }
 
     /// The bytes that a grouped destination of `prompt_tokens` needs, with no
-    /// local hit. vLLM's default `scheduler_reserve_full_isl` (V32
-    /// `vllm/config/scheduler.py:190`, V31 `:191`) admits a request only when
-    /// the whole prompt fits with the loaded tokens computed (V32
-    /// `vllm/v1/core/kv_cache_manager.py:522-539`, V31 `:519-536`). So a
-    /// window group needs the blocks inside the window of the first token
-    /// that the decode rank computes, and a full-attention group every block
-    /// of the prompt. `reserve_grouped_destination` checks the free capacity
-    /// for the same prompt, with its local hit, and caps a window group at
-    /// its admission blocks there. This count has no cap: it is also the
-    /// forward of the backoff tokens after the load, which the whole pool
-    /// must hold. `None` without a grouped cache.
+    /// local hit, for the first forward after its load: from the transferred
+    /// tokens to the whole prompt, without an admission cap. So a window
+    /// group needs the blocks inside the window of the first token that the
+    /// decode rank computes, and a full-attention group every block of the
+    /// prompt. The whole pool must hold that forward, so a destination whose
+    /// count is above the whole pool can never run. vLLM's test of the whole
+    /// prompt with the loaded tokens computed, which the default
+    /// `scheduler_reserve_full_isl` turns on (V32 `vllm/config/scheduler.py:190`,
+    /// V31 `:191`, v0.33 `:190`; V32 `vllm/v1/core/kv_cache_manager.py:522-539`,
+    /// V31 `:519-536`, v0.33 `:531-548`), is the one that
+    /// `reserve_grouped_destination` makes, with its local hit and the
+    /// admission cap of a window group. `None` without a grouped cache.
     pub(crate) fn grouped_destination_required_bytes(&self, prompt_tokens: usize) -> Option<u64> {
         let grouped = self.grouped.as_ref()?;
         let rules = self

@@ -1635,20 +1635,21 @@ fn destination_admission_bytes_equal_the_blocks_of_block_mode() {
         // 11 + 0 + 1 blocks of 100 bytes.
         assert_eq!(bytes(160, 161), 1_200);
         assert_eq!(blocks(160, 161), 12);
-        // The cap binds and the window is not skipped past it: loaded 96 of 97 counts cdiv(97, 16) = 7 full-attention
-        // blocks, min(7, 5) - floor((96 - 32) / 16) = 5 - 4 = 1 window block
-        // and 1 state block: 9.
+        // The cap binds and the window is not skipped past it: loaded 96 of
+        // 97 counts cdiv(97, 16) = 7 full-attention blocks, min(7, 5) -
+        // floor((96 - 32) / 16) = 5 - 4 = 1 window block and 1 state block:
+        // 9.
         assert_eq!(bytes(96, 97), 900);
         assert_eq!(blocks(96, 97), 9);
-        // Below the cap: loaded 32 of 33 counts
-        // cdiv(33, 16) = 3 full-attention blocks, min(3, 5) - 0 = 3 window
-        // blocks and 1 state block: 7.
+        // Below the cap: loaded 32 of 33 counts cdiv(33, 16) = 3
+        // full-attention blocks, min(3, 5) - 0 = 3 window blocks and 1 state
+        // block: 7.
         assert_eq!(bytes(32, 33), 700);
         assert_eq!(blocks(32, 33), 7);
-        // The window of the loaded tokens, not of the prompt, sets the skipped blocks: loaded 47 of 48 counts
-        // cdiv(48, 16) = 3 full-attention blocks, min(3, 5) -
-        // floor((47 - 32) / 16) = 3 - 0 = 3 window blocks and 1 state block:
-        // 7.
+        // The window of the loaded tokens, not of the prompt, sets the
+        // skipped blocks: loaded 47 of 48 counts cdiv(48, 16) = 3
+        // full-attention blocks, min(3, 5) - floor((47 - 32) / 16) = 3 - 0 =
+        // 3 window blocks and 1 state block: 7.
         assert_eq!(bytes(47, 48), 700);
         assert_eq!(blocks(47, 48), 7);
     }

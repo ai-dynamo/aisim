@@ -794,6 +794,9 @@ pub(crate) fn remaining_bytes(
 /// v0.33 `single:214-249`, `:1180-1183`). As in `remaining_bytes`, that is a
 /// sliding-window attention group or a convolution group. The state groups
 /// count `state_bytes`, their fixed blocks, for a request with tokens.
+/// vLLM's test counts `min(tokens, max_model_len)` tokens. The scheduler
+/// refuses a destination prompt of `max_model_len` tokens or more before it
+/// reserves one, so `tokens` is below that bound here.
 pub(crate) fn destination_admission_bytes(
     groups: &[FpmCacheGroup],
     state_bytes: u64,

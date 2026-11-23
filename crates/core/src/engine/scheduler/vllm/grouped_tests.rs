@@ -3704,6 +3704,44 @@ fn grouped_destination_in_byte_mode_rejects_a_prompt_whose_first_pass_cannot_fit
 }
 
 #[test]
+fn grouped_destination_in_byte_mode_skips_the_blocks_below_the_window_of_the_loaded_tokens() {
+    // Full attention, a window of 18 tokens and a state, with 16-token blocks
+    // and 100-byte pages, and one batch of 32 tokens: the window cap is
+    // cdiv(17 + 32, 16) + 1 = 5 blocks (V31
+    // `vllm/v1/kv_cache_interface.py:859-866`, V32 `:878-885`, v0.33
+    // `:937-944`). A window skips max(computed - 17, 0) tokens (V31
+    // `vllm/v1/core/single_type_kv_cache_manager.py:1185-1188`, V32
+    // `:1167-1170`, v0.33 `:1180-1183`). A first load of 33 of 34 tokens
+    // holds 3 attention pages, 3 - floor(16 / 16) = 2 window pages and the
+    // state page, 600 bytes, and its first pass opens no block, so 700 of the
+    // 1,300 bytes are free. A distinct prompt of 49 tokens loads 48. vLLM's
+    // whole-prompt test counts cdiv(49, 16) = 4 attention pages, min(4, 5) -
+    // floor((48 - 17) / 16) = 3 window pages and the state page: 800 bytes
+    // (V31 `vllm/v1/core/single_type_kv_cache_manager.py:216-251`, V32
+    // `:213-248`, v0.33 `:214-249`), above the 700 free bytes, so the load
+    // waits. The skip of the prompt, floor((49 - 17) / 16) = 2, would count
+    // 2 window pages and 700 bytes, and the load would be reserved.
+    let mut groups = full_window_and_state_transfer_groups();
+    groups[1].sliding_window = Some(18);
+    let mut core = pd_core(groups, 1_300, 32, WorkerType::Decode, None);
+    let first = HandoffId::new(Uuid::from_u128(1797));
+    // cdiv(33, 16) = 3 missing full-attention blocks.
+    assert_eq!(
+        reserve_grouped(&mut core, first, pd_request(1796, 34, 2)),
+        Some(3)
+    );
+    assert_eq!(core.kv_manager.grouped_inflight_need(), 0);
+    assert_eq!(grouped_pool(&core).used_bytes(), 600);
+    let second = HandoffId::new(Uuid::from_u128(1799));
+    let request = DirectRequest {
+        tokens: (1_000..1_049).collect(),
+        ..pd_request(1798, 0, 2)
+    };
+    assert_eq!(reserve_grouped(&mut core, second, request), None);
+    assert_eq!(grouped_pool(&core).used_bytes(), 600);
+}
+
+#[test]
 fn grouped_destination_in_byte_mode_waits_for_its_whole_prompt_with_no_load_in_flight() {
     // Six pages of 100 bytes in byte mode. The first load of 32 tokens holds
     // 3 pages, and its first pass takes a third attention page. Then nothing
