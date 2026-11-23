@@ -2198,6 +2198,7 @@ def _glm_plan(
     observed=None,
     extra_deployments=(),
     flags=None,
+    kv_cache_bytes=185_126_092_800,
     **changes,
 ):
     """A GLM-5.3-Flash TP 4 collection plan with the cache resources that the runtime probe measured.
@@ -2213,8 +2214,8 @@ def _glm_plan(
     runtime version of the collector configuration. Each of ``extra_deployments`` is a mapping that updates a copy of
     the deployment without runtime memory, with ``resources`` merged into its resources. With ``flags``, the two token
     options come from these command-line arguments in place of ``max_num_tokens``, and the role from
-    ``--fpm-worker-type``, so the options pass the argument parser as a user's do.
-    ``changes`` replace option fields before planning. With a
+    ``--fpm-worker-type``, so the options pass the argument parser as a user's do. The runtime memory holds a cache of
+    ``kv_cache_bytes``. ``changes`` replace option fields before planning. With a
     ``kda_checkpoint_alignment``, each of the four KDA groups holds one prefill checkpoint block of that alignment, as
     the import writes it for a launch that prefills KDA with FlashKDA. Without it, they hold none, as with the Triton
     KDA prefill backend.
@@ -2236,7 +2237,7 @@ def _glm_plan(
     architecture = "Glm5NextForConditionalGeneration"
     path = _mixed_attention_config(tmp_path, architecture, True)
     memory = {
-        "kv_cache_bytes": 185_126_092_800,
+        "kv_cache_bytes": kv_cache_bytes,
         "gpu_memory_utilization": 0.9,
         "max_model_len": 1_048_576,
         "provenance": "Runtime probe capacity of GLM-5.3-Flash at TP 4, declared for this test.",
@@ -2349,6 +2350,7 @@ def test_glm_collection_plan_freezes_the_generated_point_list(tmp_path):
         # The KDA groups of the fixture profile hold no prefill checkpoint block.
         checkpoint_alignment=None,
         checkpoint_groups=0,
+        mamba_groups=4,
     )
     saved = plan.to_dict()
 
@@ -2396,6 +2398,7 @@ def test_glm_collection_plan_with_prefill_checkpoint_blocks_keeps_every_prefill(
         state_groups=5,
         checkpoint_alignment=16,
         checkpoint_groups=4,
+        mamba_groups=4,
     )
     saved = plan.to_dict()
 
@@ -2433,14 +2436,29 @@ def test_glm_collection_plan_records_the_points_that_each_rule_drops(tmp_path):
 
 @pytest.mark.parametrize(
     "changes",
-    [{"max_num_seqs": None}, {"max_num_seqs": None, "max_prefill_batch_size": None, "max_decode_batch_size": 256}],
+    [{"max_num_seqs": None}, {"max_num_seqs": None, "max_prefill_batch_size": None, "max_decode_batch_size": 8}],
     ids=["decode", "prefill"],
 )
-def test_glm_collection_plan_requires_batch_limits(tmp_path, changes):
-    # The runtime falls back to the profile's batch size, but the list needs the limit of each phase.
-    with pytest.raises(ValueError) as error:
-        _glm_plan(tmp_path, **changes)
-    assert str(error.value) == "GLM-5.3-Flash collection requires --fpm-max-num-seqs or the per-phase batch limits"
+def test_glm_collection_plan_without_a_batch_limit_takes_the_limit_of_the_deployment(tmp_path, changes):
+    # The runner renders the profile's batch size for a phase without a limit, and the list follows it. Both phases
+    # then take 8 requests at most. The KDA groups hold no checkpoint block, so a prefill keeps at most one hash block
+    # of new tokens: the 9 lengths from 4 to 1,024 tokens take the batches 1, 2, 4 and 8, and 2,048 and 2,176 tokens
+    # three batches, each at 8 rungs: 8 * (9 * 4 + 2 * 3) = 336. The decode contexts keep 4 batches each, but 2,048,
+    # 4,096 and 8,192 keep 3 within the token budget: 16 * 4 - 3 = 61. The digest is that of the list of 256 requests
+    # of the same profile without its points of more than 8 requests.
+    plan = _glm_plan(tmp_path, max_batch_size=8, **changes)
+    points = json.loads(plan.options.benchmark_points_json)
+    assert (len(points["prefill"]), len(points["decode"])) == (336, 61)
+    assert plan.options.benchmark_points_sha256 == "572dcc17e11be93c679dbd6cd5ac133b986a70bca486c0edb0963c3f189d238d"
+    assert max(point["batch_size"] for point in points["decode"]) == 8
+
+
+def test_glm_collection_plan_counts_two_blocks_for_each_mamba_group(tmp_path):
+    # 2,300 usable blocks hold every FlashKDA point but the 7 prefills of 32 requests after 60 hash blocks, which need
+    # 32 * (61 + 5 + 4 + 4) = 2,368 blocks with the second block of each of the 4 KDA groups.
+    plan = _glm_plan(tmp_path, kda_checkpoint_alignment=16, kv_cache_bytes=2300 * 13_516_800)
+    dropped = plan.to_dict()["point_generation"]["dropped_points"]
+    assert (dropped["prefill"]["cache_capacity"], dropped["decode"]["cache_capacity"]) == (7, 0)
 
 
 def _glm_user_points(tmp_path):

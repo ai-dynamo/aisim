@@ -1685,6 +1685,7 @@ def _completed_runtime_collection(
     layout="attention",
     decode_prefix_caching=True,
     warmup_iterations=None,
+    glm_point_list=False,
 ):
     from collector.fpm_forward.cli import _parser
     from collector.fpm_forward.config import FPMCollectionOptions
@@ -1719,6 +1720,20 @@ def _completed_runtime_collection(
     manifest = runtime_probe_manifest(request)
     snapshot = Path(manifest["observations_index"])
     launch = json.loads(snapshot.read_text())["configurations"]["tp2"]["launch"]
+    options = FPMCollectionOptions.from_args(args)
+    if glm_point_list:
+        # The list that the planner generates for a GLM-5.3-Flash plan, for the accepted deployment of the request.
+        from dataclasses import replace
+
+        from collector.fpm_forward.glm53flash_points import GLM_POINTS_ORIGIN, glm_plan_manifest
+
+        points_json, points_sha256, _ = glm_plan_manifest(options, [request.profile_deployment()])
+        options = replace(
+            options,
+            benchmark_points_json=points_json,
+            benchmark_points_sha256=points_sha256,
+            benchmark_points_origin=GLM_POINTS_ORIGIN,
+        )
     plan = build_collection_plan(
         backend="vllm",
         model_path=request.identity.model,
@@ -1726,7 +1741,7 @@ def _completed_runtime_collection(
         model_config_path=launch["model_config"]["path"],
         system=request.identity.gpu,
         selected_ops={"attention_context", "attention_generation"},
-        options=FPMCollectionOptions.from_args(args),
+        options=options,
         fpm_profile=request.fpm_profile,
         generator_overrides=_load_generator_overrides(args),
         runtime_instrumentation=args.fpm_runtime_instrumentation,
@@ -2294,6 +2309,44 @@ def test_formal_collection_and_finalization_keep_the_request_warmup_iterations(t
     target = tmp_path / "finalized"
     finalize(request, root, target)
     assert SupportRequest.from_yaml(target / "request.yaml").collection.warmup_iterations == 0
+
+
+@pytest.mark.parametrize("matches", [True, False], ids=["generated", "differs"])
+def test_finalization_generates_the_glm_point_list_for_the_accepted_deployment(tmp_path, capsys, monkeypatch, matches):
+    from collector.fpm_forward import glm53flash_points
+
+    from aisim.support.finalization import finalize
+
+    # The accepted deployment of the probe holds runtime memory with a hash block and Mamba groups of that block, so
+    # the collection saves the list that the planner generates for it.
+    _, request, _, root = _completed_runtime_collection(tmp_path, capsys, layout="mamba_hybrid", glm_point_list=True)
+    generate, calls = glm53flash_points.glm_plan_manifest, []
+
+    def record(options, deployments):
+        calls.append((options, deployments))
+        canonical, digest, dropped = generate(options, deployments)
+        return canonical, digest if matches else "0" * 64, dropped
+
+    # The saved plan cannot carry another list for the "differs" case, because the plan hash covers its list. The
+    # generator gives another digest instead.
+    monkeypatch.setattr(glm53flash_points, "glm_plan_manifest", record)
+    target = tmp_path / "finalized"
+    if matches:
+        finalize(request, root, target)
+        resolved = SupportRequest.from_yaml(target / "request.yaml")
+        assert resolved.profile_deployment().resources.memory_source == "runtime"
+    else:
+        with pytest.raises(ValueError) as error:
+            finalize(request, root, target)
+        assert str(error.value) == (
+            "saved GLM-5.3-Flash point list differs from the list generated for the reviewed settings"
+        )
+        assert not target.exists()
+    # Finalization generates the list from the reviewed settings and the accepted deployment, with no replaced
+    # resources, and does not read it from the plan.
+    assert [(options.benchmark_points_json, deployments) for options, deployments in calls] == [
+        (None, [request.profile_deployment()])
+    ]
 
 
 def test_finalized_request_with_another_warmup_count_needs_a_fresh_probe(tmp_path, capsys):
