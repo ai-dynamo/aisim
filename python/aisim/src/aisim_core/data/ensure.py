@@ -372,8 +372,6 @@ def _category_configuration_ids(
     pin: DataPin, transport: Transport | None, category: str, out: EnsuredData | None = None
 ) -> set[str]:
     """Configuration IDs listed by one category index of the pinned dataset (empty when it has no such category)."""
-    from aisim_core.data.fetch import load_category_index
-
     try:
         if pin.local_root is not None:
             root = Path(pin.local_root).absolute()
@@ -383,18 +381,27 @@ def _category_configuration_ids(
                 return set()
             index = CategoryIndex.model_validate_json(_verify(root, reference.index).read_bytes())
         else:
-            common = {"repo": pin.repo, "revision": pin.revision, "cache": Cache(pin.cache_dir)}
-            try:
-                _, index, _ = load_category_index(category, transport=None, offline=True, **common)
-            except (OfflineMissingError, RevisionError, IntegrityError) as exc:
-                if pin.offline:
-                    raise MissingDataError(f"offline: the {category} catalog is not usable: {exc}") from exc
-                _, index, _ = _fetch_preselection(load_category_index, category, pin, transport, out)
+            index = _remote_category_index(pin, transport, category, out)
     except SelectionError:
         return set()
     except (ValueError, ValidationError) as exc:
         raise MissingDataError(f"the {category} catalog is unusable: {exc}") from exc
     return {e.configuration_id for e in index.entries}
+
+
+def _remote_category_index(
+    pin: DataPin, transport: Transport | None, category: str, out: EnsuredData | None
+) -> CategoryIndex:
+    """The pinned remote dataset's index of ``category``: the cache first, then a read charged to the pin."""
+    from aisim_core.data.fetch import load_category_index
+
+    common = {"repo": pin.repo, "revision": pin.revision, "cache": Cache(pin.cache_dir)}
+    try:
+        return load_category_index(category, transport=None, offline=True, **common)[1]
+    except (OfflineMissingError, RevisionError, IntegrityError) as exc:
+        if pin.offline:
+            raise MissingDataError(f"offline: the {category} catalog is not usable: {exc}") from exc
+    return _fetch_preselection(load_category_index, category, pin, transport, out)[1]
 
 
 _SLOT_ALIASES = ("current", "previous", "next")
@@ -524,7 +531,9 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
         selection = loader.select(out.config)
     except SelectionError as exc:
         raise MissingDataError(f"cannot derive a {category} selection from the configuration: {exc}") from exc
-    if pin.configuration_id:
+    # A configuration ID names one entry of a category. Operation families are complementary inputs of one root,
+    # so there it chooses only among the entries of its own family and every other family still arrives.
+    if pin.configuration_id and category != "op-latency":
         selection = replace(selection, configuration_ids=(pin.configuration_id,))
 
     if pin.local_root is not None:
@@ -532,6 +541,19 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
         source, revision, downloaded = "local", f"local:{root}", 0
         source_key = "local-" + hashlib.sha256(str(root).encode()).hexdigest()[:16]
     else:
+        if category == "op-latency" and pin.configuration_id:
+            # Choose from the catalog before any manifest is planned, so a rejected alternative is never downloaded.
+            where = f"{pin.repo}@{pin.revision}"
+            try:
+                index = _remote_category_index(pin, transport, category, out)
+                chosen = _one_entry_per_family(
+                    [e for e in index.entries if selection.matches(e)], selection, where, pin.configuration_id
+                )
+            except SelectionError as exc:
+                raise MissingDataError(f"{exc} ({_describe(selection)} in {where})", selection=selection) from exc
+            except (ValueError, ValidationError) as exc:
+                raise MissingDataError(f"the {category} catalog is unusable: {exc}", selection=selection) from exc
+            selection = replace(selection, configuration_ids=tuple(e.configuration_id for e in chosen))
         result = _fetch_pinned(selection, pin, transport, out)
         root = result.root
         source = "hf-download" if result.downloaded_bytes else "hf-cache"
@@ -547,7 +569,7 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
             source=where,
         )
     if category == "op-latency":
-        entries = _one_entry_per_family(entries, selection, where)
+        entries = _one_entry_per_family(entries, selection, where, pin.configuration_id)
         loaded, entry_ids = _load_op_latency(
             root,
             entries,
@@ -811,8 +833,21 @@ def _load(
     raise ValueError(f"no loader for category {category!r}")
 
 
-def _one_entry_per_family(entries: list[Entry], selection: Selection, where: str) -> list[Entry]:
-    """Operation families are complementary inputs of one root; two entries for one family are a real conflict."""
+def _one_entry_per_family(
+    entries: list[Entry], selection: Selection, where: str, configuration_id: str | None = None
+) -> list[Entry]:
+    """Operation families are complementary inputs of one root; two entries for one family are a real conflict.
+
+    ``configuration_id`` settles the conflict of its own family only: the other families are kept as they are, and
+    one that still has several entries stays a conflict.
+    """
+    if configuration_id is not None:
+        chosen = next((e for e in entries if e.configuration_id == configuration_id), None)
+        if chosen is None:
+            raise MissingDataError(
+                f"no op-latency data for configuration {configuration_id} in {where}", selection=selection, source=where
+            )
+        entries = [e for e in entries if e.identity.operation_family != chosen.identity.operation_family or e == chosen]
     by_family: dict[str | None, list[Entry]] = {}
     for entry in entries:
         by_family.setdefault(entry.identity.operation_family, []).append(entry)
