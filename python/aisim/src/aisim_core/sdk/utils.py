@@ -2138,7 +2138,7 @@ def _load_resolved_model_config(model_path: str, *, model_revision: str | None =
         return _attach_inferred_quant_fields(_attach_hf_quant_config(config, _load_local_quant_config(model_path)))
 
     if model_revision is not None:
-        from aisimulate_core.sdk.fpm_profile import _load_pinned_checkpoint_config
+        from aisim_core.sdk.fpm_profile import _load_pinned_checkpoint_config
 
         # Use the same immutable config as profile eligibility, including for
         # models with bundled configs whose source revision is not recorded.
