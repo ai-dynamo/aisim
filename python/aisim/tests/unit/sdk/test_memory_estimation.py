@@ -1213,6 +1213,49 @@ def test_estimate_kv_cache_does_not_naive_fallback_on_a_non_gemma_configuration_
         )
 
 
+def test_estimate_kv_cache_infers_an_omitted_moe_dimension():
+    # tp_size=4 with moe_tp_size=2 and no moe_ep_size is a valid MoE layout,
+    # because ModelConfig infers moe_ep_size=2 from the attention width. The
+    # estimator used to fill the omitted value with 1, which made that request
+    # a width mismatch; with the request-wide re-raise that mismatch became a
+    # terminal error where it previously reached the naive fallback.
+    out = memory.estimate_kv_cache(
+        "deepseek-ai/DeepSeek-V3",
+        "h200_sxm",
+        "vllm",
+        max_num_tokens=8192,
+        max_batch_size=256,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        tp_size=4,
+        moe_tp_size=2,
+        gpu_memory_capacity_bytes_override=800 * _GIB,
+        allow_naive_fallback=True,
+    )
+    # Inference happens before the fallback is considered, so the request stays
+    # native instead of raising the width mismatch the old default produced.
+    assert out["source"] == "native"
+
+
+def test_estimate_kv_cache_keeps_the_tp_only_default_for_an_omitted_moe_pair():
+    # An omitted pair carries no layout to infer, so the historical pure-TP
+    # default (moe_tp_size=moe_ep_size=1) still applies. Pinned so the inference
+    # change above does not turn existing TP-only callers into errors.
+    out = memory.estimate_kv_cache(
+        "deepseek-ai/DeepSeek-V3",
+        "h200_sxm",
+        "vllm",
+        max_num_tokens=8192,
+        max_batch_size=256,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        tp_size=1,
+        gpu_memory_capacity_bytes_override=800 * _GIB,
+        allow_naive_fallback=False,
+    )
+    assert out["source"] == "native"
+
+
 def test_estimate_kv_cache_keeps_the_naive_fallback_for_a_valid_dense_gemma4_checkpoint(monkeypatch):
     # The metadata gate must not turn the documented naive fallback into an
     # error for a well-formed dense checkpoint whose database is unavailable.

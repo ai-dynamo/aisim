@@ -342,8 +342,18 @@ class KVCacheEstimator:
         Raises when AIC cannot build the model/backend or the system spec is missing --
         the signal for the caller to fall back to the naive estimator.
         """
-        resolved_moe_tp = moe_tp_size if moe_tp_size is not None else 1
-        resolved_moe_ep = moe_ep_size if moe_ep_size is not None else 1
+        if moe_tp_size is None and moe_ep_size is None:
+            # Preserve the historical TP-only default: an omitted pair carries
+            # no MoE layout to infer, and callers relied on this entry point
+            # selecting pure tensor parallelism.
+            resolved_moe_tp = resolved_moe_ep = 1
+        else:
+            # Leave a single omitted dimension unset so ModelConfig infers it
+            # from the attention width, as every other SDK path does. Filling
+            # it with 1 here would turn a valid, inferable request into a
+            # width mismatch that the native path rejects.
+            resolved_moe_tp = moe_tp_size
+            resolved_moe_ep = moe_ep_size
         validate_moe_controls(
             model_path=model_path,
             enable_eplb=enable_eplb,
