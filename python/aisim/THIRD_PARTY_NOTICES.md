@@ -829,7 +829,10 @@ block of a ring group. From `single_type_kv_cache_manager.py`,
 `glm_point_blocks` adapts the blocks that a request holds in a Mamba group when
 it is admitted: its running block, the cached block of its prefix and the
 checkpoint block. The planner generates the GLM-5.3-Flash point list with these
-rules.
+rules. `_glm_align_stop` in
+`python/aisim/collector/fpm_forward/runtime/glm53flash/glm53flash_prefix_scheduler.py`
+holds the same adaptation of the chunk stops and of the checkpoint test. The
+producer refuses a prefill point that vLLM would split.
 
 - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py
 - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py
