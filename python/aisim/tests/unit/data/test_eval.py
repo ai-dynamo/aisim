@@ -702,3 +702,51 @@ def test_the_record_lock_does_not_depend_on_the_temporary_directory_setting(buil
     finally:
         holder.kill()
         holder.wait()
+
+
+def _successor_with_two_sidecars(record, tag):
+    first, first_files = _successor_with_findings(record, f"{tag}-one")
+    second = f'{{"note": "{tag}-two"}}'.encode()
+    digest = hashlib.sha256(second).hexdigest()
+    other = Artifact(
+        artifact_id="more-findings",
+        path=f"{digest}.json",
+        role="findings",
+        format="json",
+        schema="findings/v1",
+        sha256=digest,
+        bytes=len(second),
+    )
+    successor = first.model_copy(update={"findings": [*first.findings, other]})
+    return successor, {**first_files, other.path: second}
+
+
+def test_a_failed_sidecar_publication_withdraws_the_record_so_no_successor_builds_on_it(built, monkeypatch):
+    root, record = built
+    directory = write_record(root, record).parent
+    predecessor, files = _successor_with_two_sidecars(record, "predecessor")
+    last = list(files)[-1]
+    real_link = os.link
+
+    def failing_link(source, target, *args, **kwargs):
+        if Path(target).name == last:
+            raise OSError("the second sidecar cannot be linked")
+        return real_link(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", failing_link)
+    with pytest.raises(OSError, match="cannot be linked"):
+        write_record(root, predecessor, sidecars=files)
+    monkeypatch.setattr(os, "link", real_link)
+    # Nothing of the failed write remains: not the record, not the sidecar that did link, no staged copy.
+    assert not record_path(root, predecessor).exists()
+    assert [p.name for p in directory.glob("*.json")] == [f"{record.record_id}.json"]
+    assert _leftovers(directory) == []
+    # A successor cannot be accepted on top of the withdrawn record, so it cannot claim the missing path either.
+    rival, rival_files = _successor_with_findings(predecessor, "rival")
+    with pytest.raises(ValueError, match="not found next to the new record"):
+        write_record(root, rival, sidecars=rival_files)
+    # Retrying the whole write completes it; only then can a successor build on it.
+    assert write_record(root, predecessor, sidecars=files) == record_path(root, predecessor)
+    assert all((directory / name).read_bytes() == data for name, data in files.items())
+    write_record(root, rival, sidecars=rival_files)
+    assert [r.record_id for r in current_records(directory)] == [rival.record_id]

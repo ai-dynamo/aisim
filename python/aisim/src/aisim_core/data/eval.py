@@ -367,12 +367,14 @@ def _write_record(path: Path, record: EvalRecord, text: str, sidecars: Mapping[s
             if existing.supersedes == record.supersedes:
                 raise ValueError(f"superseded record {record.supersedes} already has successor {existing.record_id}")
     staged = _stage_sidecars(path.parent, sidecars)
+    created = False
     try:
         fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(text)
             os.link(tmp, path)  # fails if another writer created it first
+            created = True
         except FileExistsError:
             if load_record(path) != record:
                 raise
@@ -382,9 +384,16 @@ def _write_record(path: Path, record: EvalRecord, text: str, sidecars: Mapping[s
         for staged_copy in staged.values():
             staged_copy.unlink(missing_ok=True)
         raise
-    # The record goes first: it declares its sidecars, so discovery never sees an undeclared hash-named file. A
-    # failure between the two leaves a record whose missing sidecars the same call completes when retried.
-    _publish_sidecars(path.parent, sidecars, staged)
+    # The record goes first: it declares its sidecars, so discovery never sees an undeclared hash-named file. If a
+    # sidecar then fails to publish, the record is withdrawn with the sidecars this call linked, so the directory
+    # returns to its state before the call: no successor can be accepted on top of a record whose declared files
+    # are missing, and the whole write can simply be retried.
+    try:
+        _publish_sidecars(path.parent, sidecars, staged)
+    except BaseException:
+        if created:
+            path.unlink(missing_ok=True)
+        raise
     return path
 
 
@@ -407,13 +416,20 @@ def _stage_sidecars(directory: Path, sidecars: Mapping[str, bytes]) -> dict[str,
 
 
 def _publish_sidecars(directory: Path, sidecars: Mapping[str, bytes], staged: Mapping[str, Path]) -> None:
+    """Link the staged sidecars; on a failure, remove the ones this call linked (an existing identical one stays)."""
+    linked: list[Path] = []
     try:
         for relative, tmp in staged.items():
             try:
                 os.link(tmp, directory / relative)
+                linked.append(directory / relative)
             except FileExistsError:
                 if (directory / relative).read_bytes() != sidecars[relative]:
                     raise
+    except BaseException:
+        for path in linked:
+            path.unlink(missing_ok=True)
+        raise
     finally:
         for tmp in staged.values():
             tmp.unlink(missing_ok=True)
