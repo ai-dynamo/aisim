@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
+import importlib.util
 import json
 import sys
 from dataclasses import replace
@@ -14,7 +15,10 @@ import pytest
 from cryptography.exceptions import InvalidTag
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python" / "aisim" / "src"))
+if importlib.util.find_spec("aisim_core") is None:
+    # The Pages job installs no wheel, so fall back to this checkout's pure-Python data library. Never shadow an
+    # installed wheel: its compiled runtime is missing from the source tree and spawned workers inherit sys.path.
+    sys.path.append(str(Path(__file__).resolve().parents[1] / "python" / "aisim" / "src"))
 from aisim_core.data.fetch import Cache
 from scripts.e2e_accuracy import hf_measurements as hf
 from scripts.e2e_accuracy import private_artifacts
