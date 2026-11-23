@@ -2199,6 +2199,7 @@ def _glm_plan(
     extra_deployments=(),
     flags=None,
     kv_cache_bytes=185_126_092_800,
+    gpus=(4,),
     **changes,
 ):
     """A GLM-5.3-Flash TP 4 collection plan with the cache resources that the runtime probe measured.
@@ -2215,7 +2216,8 @@ def _glm_plan(
     the deployment without runtime memory, with ``resources`` merged into its resources. With ``flags``, the two token
     options come from these command-line arguments in place of ``max_num_tokens``, and the role from
     ``--fpm-worker-type``, so the options pass the argument parser as a user's do. The runtime memory holds a cache of
-    ``kv_cache_bytes``. ``changes`` replace option fields before planning. With a
+    ``kv_cache_bytes``. ``gpus`` are the GPU counts of the request and ``preset`` one preset or a tuple of them, both
+    passed as command-line arguments. ``changes`` replace option fields before planning. With a
     ``kda_checkpoint_alignment``, each of the four KDA groups holds one prefill checkpoint block of that alignment, as
     the import writes it for a launch that prefills KDA with FlashKDA. Without it, they hold none, as with the Triton
     KDA prefill backend.
@@ -2289,11 +2291,11 @@ def _glm_plan(
         "--gpu",
         "b200_sxm",
         "--fpm-max-gpus",
-        "4",
+        str(max(gpus)),
         "--fpm-gpu-counts",
-        "4",
+        *(str(count) for count in gpus),
         "--fpm-parallel-presets",
-        preset,
+        *((preset,) if isinstance(preset, str) else preset),
         "--fpm-max-model-len",
         "1048576",
         "--fpm-max-num-batched-tokens",
@@ -2346,11 +2348,9 @@ def test_glm_collection_plan_freezes_the_generated_point_list(tmp_path):
         measured_context=131072,
         kv_cache_bytes=185_126_092_800,
         page_size_bytes=13_516_800,
-        state_groups=5,
-        # The KDA groups of the fixture profile hold no prefill checkpoint block.
+        # The tail ring and the four KDA groups, which hold no prefill checkpoint block in the fixture profile.
+        state_groups=((1, 4),),
         checkpoint_alignment=None,
-        checkpoint_groups=0,
-        mamba_groups=4,
     )
     saved = plan.to_dict()
 
@@ -2395,10 +2395,8 @@ def test_glm_collection_plan_with_prefill_checkpoint_blocks_keeps_every_prefill(
         measured_context=131072,
         kv_cache_bytes=185_126_092_800,
         page_size_bytes=13_516_800,
-        state_groups=5,
+        state_groups=((1, 4),),
         checkpoint_alignment=16,
-        checkpoint_groups=4,
-        mamba_groups=4,
     )
     saved = plan.to_dict()
 
@@ -2453,12 +2451,165 @@ def test_glm_collection_plan_without_a_batch_limit_takes_the_limit_of_the_deploy
     assert max(point["batch_size"] for point in points["decode"]) == 8
 
 
-def test_glm_collection_plan_counts_two_blocks_for_each_mamba_group(tmp_path):
-    # 2,300 usable blocks hold every FlashKDA point but the 7 prefills of 32 requests after 60 hash blocks, which need
-    # 32 * (61 + 5 + 4 + 4) = 2,368 blocks with the second block of each of the 4 KDA groups.
-    plan = _glm_plan(tmp_path, kda_checkpoint_alignment=16, kv_cache_bytes=2300 * 13_516_800)
+def test_glm_collection_plan_takes_the_decode_limit_and_the_batch_size_of_the_deployment_for_prefill(tmp_path):
+    # The request sets a decode limit of 4 and no prefill limit, and the runner renders 4 for the decode cell and the
+    # deployment's 8 for the prefill cell. The prefill points keep the 336 of a limit of 8. The decode contexts keep
+    # the batches 1, 2 and 4, which every token budget limit of the list holds: 16 * 3 = 48.
+    plan = _glm_plan(
+        tmp_path, max_batch_size=8, max_num_seqs=None, max_prefill_batch_size=None, max_decode_batch_size=4
+    )
+    points = json.loads(plan.options.benchmark_points_json)
+    assert (len(points["prefill"]), len(points["decode"])) == (336, 48)
+    assert (
+        max(point["batch_size"] for point in points["prefill"]),
+        max(point["batch_size"] for point in points["decode"]),
+    ) == (8, 4)
+
+
+@pytest.mark.parametrize(("pages", "dropped_counts"), [(2240, (0, 0)), (2239, (7, 0))])
+def test_glm_collection_plan_counts_two_blocks_for_each_mamba_group(tmp_path, pages, dropped_counts):
+    # The 7 FlashKDA prefills of 32 requests after 60 hash blocks need 32 * (61 + 1 + 4 * 2) = 2,240 blocks: the
+    # cached prefix block beside the running block in each of the 4 KDA groups. Every other point needs fewer.
+    plan = _glm_plan(tmp_path, kda_checkpoint_alignment=16, kv_cache_bytes=pages * 13_516_800)
     dropped = plan.to_dict()["point_generation"]["dropped_points"]
-    assert (dropped["prefill"]["cache_capacity"], dropped["decode"]["cache_capacity"]) == (7, 0)
+    assert (dropped["prefill"]["cache_capacity"], dropped["decode"]["cache_capacity"]) == dropped_counts
+
+
+def _second_deployment(max_batch_size, **topology):
+    """A second deployment with the runtime memory of the TP 4 probe, at TP 8 or at ``topology``."""
+    memory = {
+        "kv_cache_bytes": 185_126_092_800,
+        "gpu_memory_utilization": 0.9,
+        "max_model_len": 1_048_576,
+        "provenance": "Runtime probe capacity of GLM-5.3-Flash, declared for this test.",
+        "enable_prefix_caching": True,
+        "mamba_cache_mode": "align",
+        "hash_block_size_tokens": 2176,
+    }
+    return {
+        "tp": 8,
+        "moe_tp": 8,
+        **topology,
+        "resources": {"runtime_memory": memory, "max_batch_size": max_batch_size},
+    }
+
+
+def _two_batch_sizes(tmp_path, first, second, *, gpus=(4, 8), preset="pure_tp", topology=None, **changes):
+    """A plan of a TP 4 deployment with ``first`` sequences and a second one with ``second``, without batch options."""
+    return _glm_plan(
+        tmp_path,
+        max_batch_size=first,
+        extra_deployments=[_second_deployment(second, **(topology or {}))],
+        gpus=gpus,
+        preset=preset,
+        **{"max_num_seqs": None, "max_prefill_batch_size": None, **changes},
+    )
+
+
+def _batch_refusal(phase, held):
+    return (
+        "GLM-5.3-Flash collection generates one point list for every deployment, and the request sets no batch limit "
+        f"for the {phase} cells while the deployments that it selects hold different max_batch_size values: {held}; "
+        "select deployments that share one max_batch_size with --fpm-gpu-counts or --fpm-parallel-presets, or probe "
+        "the runtime again so that the deployments record one max_batch_size"
+    )
+
+
+_HELD = "the accepted deployment at TP 4 holds 16, the accepted deployment at TP 8 holds 8"
+
+
+def _cells(plan):
+    return sorted((cell.topology.tp, cell.workload_kind) for cell in plan.cells)
+
+
+def _largest_batches(plan):
+    points = json.loads(plan.options.benchmark_points_json)
+    return tuple(max(point["batch_size"] for point in points[phase]) for phase in ("prefill", "decode"))
+
+
+def test_glm_plan_without_a_batch_limit_takes_the_batch_size_that_the_deployments_share(tmp_path):
+    # Both deployments record 16 sequences, which the runner renders for every cell. The prefills of at most 512 new
+    # tokens and the decode contexts of at most 256 tokens hold 16 requests within the token budget.
+    plan = _two_batch_sizes(tmp_path, 16, 16)
+    assert _cells(plan) == [(4, "decode"), (4, "prefill"), (8, "decode"), (8, "prefill")]
+    assert _largest_batches(plan) == (16, 16)
+
+
+@pytest.mark.parametrize(
+    ("worker_type", "changes", "phase"),
+    [
+        (None, {}, "prefill"),
+        ("aggregated", {}, "prefill"),
+        ("prefill", {}, "prefill"),
+        ("decode", {}, "decode"),
+        # The decode limit leaves the prefill phase without one, and the plan collects it.
+        (None, {"max_decode_batch_size": 8}, "prefill"),
+    ],
+    ids=["both-phases", "aggregated", "prefill-role", "decode-role", "decode-limit-of-both-phases"],
+)
+def test_glm_plan_refuses_a_collected_phase_without_a_batch_limit_over_different_batch_sizes(
+    tmp_path, worker_type, changes, phase
+):
+    with pytest.raises(ValueError) as error:
+        _two_batch_sizes(tmp_path, 16, 8, worker_type=worker_type, **changes)
+    assert str(error.value) == _batch_refusal(phase, _HELD)
+
+
+def test_glm_plan_of_a_decode_role_with_its_decode_limit_takes_the_smallest_batch_size_for_prefill(tmp_path):
+    # The decode cells take their limit of 8. The plan collects no prefill phase, whose points take the smaller batch
+    # size, 8, and are never measured.
+    plan = _two_batch_sizes(tmp_path, 16, 8, worker_type="decode", max_decode_batch_size=8)
+    assert _cells(plan) == [(4, "decode"), (8, "decode")]
+    assert _largest_batches(plan) == (8, 8)
+
+
+def test_glm_plan_with_a_second_deployment_that_launches_no_cell_keeps_the_hash_block_text(tmp_path):
+    # The TP 8 deployment holds declared memory that fits no GPU, so memory admission would drop it, and no runtime
+    # memory, so it has no hash block. The plan is refused for its hash block before the batch sizes are read.
+    extra = {"tp": 8, "moe_tp": 8, "resources": {"max_batch_size": 8, **_DECLARED_HUGE}}
+    with pytest.raises(ValueError) as error:
+        _glm_plan(
+            tmp_path,
+            max_batch_size=16,
+            extra_deployments=[extra],
+            gpus=(4, 8),
+            max_num_seqs=None,
+            max_prefill_batch_size=None,
+        )
+    assert str(error.value) == "GLM-5.3-Flash collection requires the accepted profile's hash_block_size_tokens"
+
+
+@pytest.mark.parametrize(
+    ("gpus", "cells", "largest"),
+    [((4,), [(4, "decode"), (4, "prefill")], (16, 16)), ((8,), [(8, "decode"), (8, "prefill")], (8, 8))],
+    ids=["tp4", "tp8"],
+)
+def test_glm_plan_with_one_selected_batch_size_plans(tmp_path, gpus, cells, largest):
+    # The remedy of the refusal: --fpm-gpu-counts selects the TP 4 or the TP 8 deployment alone.
+    plan = _two_batch_sizes(tmp_path, 16, 8, gpus=gpus)
+    assert (_cells(plan), _largest_batches(plan)) == (cells, largest)
+
+
+def test_glm_plan_selects_one_batch_size_with_the_parallel_presets(tmp_path):
+    # Two deployments at TP 4: the pure-TP one with 16 sequences and a tep one with 8. The presets pure_tp and tep
+    # select both and are refused. The preset pure_tp alone selects one batch size and plans.
+    tep = {"tp": 4, "moe_tp": 1, "moe_ep": 4}
+    with pytest.raises(ValueError) as error:
+        _two_batch_sizes(tmp_path, 16, 8, gpus=(4,), preset=("pure_tp", "tep"), topology=tep)
+    assert str(error.value) == _batch_refusal(
+        "prefill", "the accepted deployment at TP 4 holds 16, the accepted deployment at TP 4 holds 8"
+    )
+    plan = _two_batch_sizes(tmp_path, 16, 8, gpus=(4,), preset="pure_tp", topology=tep)
+    assert (_cells(plan), _largest_batches(plan)) == ([(4, "decode"), (4, "prefill")], (16, 16))
+
+
+def test_glm_plan_with_one_probed_batch_size_plans(tmp_path):
+    # The other remedy: a new probe records one batch size, 8, for both deployments.
+    plan = _two_batch_sizes(tmp_path, 8, 8)
+    assert (_cells(plan), _largest_batches(plan)) == (
+        [(4, "decode"), (4, "prefill"), (8, "decode"), (8, "prefill")],
+        (8, 8),
+    )
 
 
 def _glm_user_points(tmp_path):

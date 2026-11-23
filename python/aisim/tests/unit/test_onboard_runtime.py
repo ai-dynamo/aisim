@@ -2317,8 +2317,9 @@ def test_finalization_generates_the_glm_point_list_for_the_accepted_deployment(t
 
     from aisim.support.finalization import finalize
 
-    # The accepted deployment of the probe holds runtime memory with a hash block and Mamba groups of that block, so
-    # the collection saves the list that the planner generates for it.
+    # The accepted deployment of the probe holds runtime memory with a hash block and Mamba groups of that block. The
+    # helper freezes the list that glm_plan_manifest gives for it into the options of the collection, with the origin of
+    # a generated list.
     _, request, _, root = _completed_runtime_collection(tmp_path, capsys, layout="mamba_hybrid", glm_point_list=True)
     generate, calls = glm53flash_points.glm_plan_manifest, []
 
