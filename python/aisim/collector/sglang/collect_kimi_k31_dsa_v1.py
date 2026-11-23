@@ -39,7 +39,7 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
-from collector.helper import get_sm_version, log_perf
+from collector.helper import get_sm_version, log_perf, native_publication_lock
 from collector.op_plans import ModuleCase, plan_cases
 
 __compat__ = "sglang==0.0.0.dev1+g41208373c.d20261104"
@@ -62,6 +62,7 @@ NATIVE_CASE_TIMEOUT_S = 3600
 # The same revision's Envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD
 # defaults to 2048; DeepseekSparseAttnBackend uses it for dense short-prefill
 # attention. Preserve that serving dispatch as well as the fused top-k path.
+SKIP_SOFTMAX_ENV = "SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR"
 NATIVE_ENV = {
     "SGLANG_DSA_FUSE_TOPK": "1",
     "SGLANG_DSA_TOPK_BROADCAST": "0",
@@ -258,12 +259,17 @@ def _run_native_case(case, device, perf_filename):
     if perf_filename is None:
         raise ValueError("native Kimi K3.1 collection requires an output filename")
     output = Path(perf_filename)
+    with native_publication_lock(output):
+        _run_owned_native_case(case, device, output)
+
+
+def _run_owned_native_case(case, device, output):
     writer_lock = Path(str(output) + ".lock")
     if writer_lock.exists():
         raise RuntimeError(f"native Kimi K3.1 output already has a writer lock: {writer_lock}")
     existed = output.exists()
     previous_size = output.stat().st_size if existed else 0
-    phase = "context" if "context" in Path(perf_filename).name else "generation"
+    phase = "context" if "context" in output.name else "generation"
     validate_case(case, phase)
     # The generic executor's worker must not create children using fork after
     # CUDA initialization. A clean subprocess owns SGLang's spawned TP ranks.
@@ -280,7 +286,7 @@ def _run_native_case(case, device, perf_filename):
                     "--phase",
                     phase,
                     "--output",
-                    str(Path(perf_filename).resolve()),
+                    str(output.resolve()),
                     "--device",
                     str(device),
                 ],
@@ -288,7 +294,7 @@ def _run_native_case(case, device, perf_filename):
                 text=True,
                 start_new_session=True,
                 env={
-                    **os.environ,
+                    **{k: v for k, v in os.environ.items() if k != SKIP_SOFTMAX_ENV},
                     **NATIVE_ENV,
                     "PYTHONPATH": os.pathsep.join(
                         [str(Path(__file__).resolve().parents[2]), *filter(None, [os.environ.get("PYTHONPATH")])]
@@ -621,6 +627,7 @@ def main() -> None:
     args = parser.parse_args()
     case = ModuleCase(*json.loads(args.case))
     tp = validate_case(case, args.phase)
+    os.environ.pop(SKIP_SOFTMAX_ENV, None)
     os.environ.update(NATIVE_ENV)
     _assert_runtime()
     import torch

@@ -14,11 +14,12 @@ import random
 import shutil
 import tempfile
 import traceback
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
 from collector.case_generator import without_models
-from collector.helper import collector_retained_path, create_test_case_id
+from collector.helper import collector_retained_path, create_test_case_id, native_publication_lock
 from collector.op_plans import OP_PLANS
 from collector.skips import filter_cases, models
 from collector.version_resolver import _check_compat
@@ -172,6 +173,41 @@ def collect_sglang_fullnode_op(
             }
         ]
 
+    native = op.startswith("kimi_k31_dsa_")
+    output = Path(collection["perf_filename"])
+    with native_publication_lock(output) if native else nullcontext():
+        return _collect_selected_cases(
+            cases,
+            op,
+            full_name,
+            run_func,
+            run_func_name,
+            output,
+            native,
+            backend,
+            runtime_version,
+            sm_version,
+            resume_options,
+            resume_checkpoint_cls,
+            logger,
+        )
+
+
+def _collect_selected_cases(
+    cases,
+    op,
+    full_name,
+    run_func,
+    run_func_name,
+    output,
+    native,
+    backend,
+    runtime_version,
+    sm_version,
+    resume_options,
+    resume_checkpoint_cls,
+    logger,
+):
     raw_task_infos = [
         {
             "id": create_test_case_id(case, run_func_name, full_name),
@@ -227,8 +263,6 @@ def collect_sglang_fullnode_op(
     # A native worker can outlive a killed launcher. Give each attempt a
     # private staging file. Only the parent publishes its bytes, after the
     # checkpoint is durable. A receipt bridges the two atomic replacements.
-    native = op.startswith("kimi_k31_dsa_")
-    output = Path(collection["perf_filename"])
     receipt = output.with_name(f".{output.name}.pending")
 
     def finish_publication():
@@ -251,6 +285,7 @@ def collect_sglang_fullnode_op(
                 os.replace(stage, output)
         else:
             stage.unlink(missing_ok=True)
+        stage.with_name(f".{stage.name}.publication-lock").unlink(missing_ok=True)
         receipt.unlink()
 
     if native:
@@ -283,7 +318,7 @@ def collect_sglang_fullnode_op(
         batches = ([task_info] for task_info in task_infos) if op.startswith("kimi_k31_dsa_") else (task_infos,)
         for batch in batches:
             batch_ids = {str(task_info["params"]): task_info["id"] for task_info in batch}
-            filename = collection["perf_filename"]
+            filename = str(output)
             if native:
                 with tempfile.NamedTemporaryFile(
                     dir=output.parent, prefix=f".{output.name}.stage-", delete=False
