@@ -827,10 +827,17 @@ def _require_sglang_launcher_cells(
 ) -> None:
     """Refuse every cell the SGLang launcher cannot measure.
 
-    The launcher runs one engine with one data-parallel replica and one pipeline stage: a dense model under
-    tensor parallelism, or a model with expert layers whose experts are spread over the tensor-parallel ranks.
-    Each cell of a plan gets ``execution``, one of ``topologies`` and the strategy of that topology, so these
-    arguments cover the cells before any is built.
+    The launcher runs one engine with one pipeline stage. It measures three layouts: a dense model under
+    tensor parallelism; a model with expert layers whose experts are spread over the tensor-parallel ranks
+    (TEP); and such a model under DP attention with one GPU per attention-DP rank and one expert-parallel rank
+    on each (DEP). Each cell of a plan gets ``execution``, one of ``topologies`` and the strategy of that
+    topology, so these arguments cover the cells before any is built.
+
+    What ran (the collector README, "DEP cells", has the whole account): on 2026-11-18 the DEP cells of two
+    ranks of one MoE model (Qwen/Qwen1.5-MoE-A2.7B) were planned with the ``dep`` preset and collected on two
+    H200 GPUs, with smoke grids at SGLang 0.5.22 and 0.5.23 and with the default grid at 0.5.23. No DEP cell of
+    more than two ranks has been collected, and no DEP cell of another model; with four ranks only the launcher
+    command of a prefill cell ran, outside the collector.
     """
     if execution != LEGACY_EXECUTION_IDENTITY:
         # The launcher's artifact carries no execution_mode, which validate_native_collection demands of a cell
@@ -850,24 +857,32 @@ def _require_sglang_launcher_cells(
                 )
             continue
         if topology.dp > 1:
-            # The DEP preset, which the default preset "auto" plans for a MoE model beside TEP. AISim's generated
-            # SGLang serving deployment runs it with DP attention (src/aisim/generator/rule_plugin/sglang.rule,
-            # ``enable_attention_dp``), and sglbench_launcher.py refuses a resolved attention DP size other than
-            # 1 (``_RESOLVED_CHECKS``): its result files hold one data-parallel rank.
-            raise ValueError(
-                f"SGLang FPM collection does not support DP attention yet (topology {topology.to_dict()}); pass "
-                "--fpm-parallel-presets tep to collect the tensor- and expert-parallel cells of a MoE model"
-            )
+            # The DEP preset, which the default preset "auto" plans for a MoE model beside TEP: strategy "dep"
+            # with one GPU and one expert-parallel rank per data-parallel rank. AISim's generated SGLang
+            # serving deployment runs it with DP attention (src/aisim/generator/rule_plugin/sglang.rule,
+            # ``enable_attention_dp``), and so does the cell: the cell builder writes the data-parallel size as
+            # SGLang's attention-DP size (sglang_fpm_builder.py), and the launcher writes one rank file per
+            # attention-DP rank. The launcher admits DP attention only with one scheduler process per rank, so
+            # a cell with tensor parallelism inside a data-parallel rank is refused here: that layout is not
+            # built.
+            fixed_sizes = (topology.tp, topology.pp, topology.cp, topology.moe_tp)
+            if any(size != 1 for size in fixed_sizes) or topology.moe_ep != topology.dp:
+                raise ValueError(
+                    "SGLang FPM collection supports DP attention for the DEP cells of a MoE model only (tp, pp, "
+                    "cp and moe_tp must be 1, and moe_ep must equal dp; attention TP inside a DP rank is not "
+                    f"built); got topology {topology.to_dict()}"
+                )
+            continue
         # What is left for a MoE model is the TEP preset: strategy "tep" with one expert-parallel rank per
         # tensor-parallel rank, or "single" for its one-GPU cell, where both sizes are 1. The cell builder
         # writes that expert-parallel size as --ep-size (sglang_fpm_builder.py), and the launcher refuses a
         # resolved ``ep_size`` that is neither 1 nor the tensor-parallel size. Pure TP (moe_tp above 1) is not
         # planned for this backend (capabilities.py, ``allow_pure_tp``) and is refused here all the same.
-        fixed_sizes = (topology.pp, topology.dp, topology.cp, topology.moe_tp)
+        fixed_sizes = (topology.pp, topology.cp, topology.moe_tp)
         if any(size != 1 for size in fixed_sizes) or topology.moe_ep != topology.tp:
             raise ValueError(
-                "SGLang FPM collection supports the tensor- and expert-parallel cells of a MoE model only (pp, dp, "
-                f"cp and moe_tp must be 1, and moe_ep must equal tp); got topology {topology.to_dict()}"
+                "SGLang FPM collection supports the TEP and the DEP cells of a MoE model only; a cell without DP "
+                f"attention must have pp, cp and moe_tp of 1 and moe_ep equal to tp; got topology {topology.to_dict()}"
             )
 
 

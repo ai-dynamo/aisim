@@ -4,18 +4,18 @@
 """Tests of ``sglang_fpm_builder.py``, the cell builder of the SGLang self-benchmark. No SGLang, no GPU, no pod.
 
 Every cell is rendered by the real ``runner._render_cell``, so by the real Generator, from a real collection
-plan: one dense model on two GPUs, or one MoE model with the TEP preset on one and two GPUs. The plan is built
-as a vLLM plan and turned into an SGLang plan with ``dataclasses.replace``: the tests therefore need neither
-the planner's admission of ``sglang`` nor the runner's branch that calls the builder.
+plan: one dense model on two GPUs, or one MoE model with the TEP or the DEP preset on one and two GPUs. The
+plan is built as a vLLM plan and turned into an SGLang plan with ``dataclasses.replace``: the tests therefore
+need neither the planner's admission of ``sglang`` nor the runner's branch that calls the builder.
 
 What is FAKE is named so: the models (configs typed in here, no checkpoint), the image name, and the
 ``python3`` that one test puts first on ``PATH`` to see how ``run.sh`` starts its command. Nothing of the
 launcher runs in a pod here; what the tests show is the text of the cell's files and that the launcher's own
 flag reader takes the command.
 
-The three tests that read SGLang's field declarations need a local checkout of SGLang for each release the
-launcher accepts. ``AISIM_SGLBENCH_SGLANG_SOURCES`` names a folder that holds them as ``v<version>``, the
-variable and the layout of ``test_fpm_sglbench_preflight.py``; without it those three tests are skipped.
+The tests that read SGLang's source need a local checkout of SGLang for each release the launcher accepts.
+``AISIM_SGLBENCH_SGLANG_SOURCES`` names a folder that holds them as ``v<version>``, the variable and the layout
+of ``test_fpm_sglbench_preflight.py``; without it those tests are skipped.
 """
 
 from __future__ import annotations
@@ -115,6 +115,7 @@ SGLANG_FLAGS = {
     "--model-path",
     "--served-model-name",
     "--tp-size",
+    "--attn-dp-size",
     "--ep-size",
     "--kv-cache-dtype",
     "--mem-fraction-static",
@@ -134,10 +135,10 @@ REFUSED_BY_THE_LAUNCHER = {
     "--data-parallel-size",
     "--pp-size",
     "--pipeline-parallel-size",
-    "--attn-dp-size",
-    "--attention-data-parallel-size",
-    "--enable-dp-attention",
 }
+# The other spellings of the attention-DP size, which the builder does not write: SGLang's alias of
+# --attn-dp-size, and the deprecated switch that makes an attention-DP size of --dp-size.
+OTHER_ATTENTION_DP_SPELLINGS = {"--attention-data-parallel-size", "--enable-dp-attention"}
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -201,6 +202,22 @@ def _moe_plan(tmp_path: Path, monkeypatch, **options) -> FPMCollectionPlan:
         ("prefill", "tep", 2, 2),
         ("decode", "single", 1, 1),
         ("decode", "tep", 2, 2),
+    ]
+    return plan
+
+
+def _dep_plan(tmp_path: Path, monkeypatch, **options) -> FPMCollectionPlan:
+    """An SGLang plan of the FAKE MoE model with the DEP preset: per phase a one-GPU and a two-rank DEP cell."""
+    presets = {"fpm_gpu_counts": [1, 2], "fpm_parallel_presets": ["dep"]}
+    plan = _sglang_plan(tmp_path, monkeypatch, MOE_MODEL, FAKE_MOE_MODEL_CONFIG, **{**presets, **options})
+    assert [
+        (cell.workload_kind, cell.parallel_strategy, cell.topology.tp, cell.topology.dp, cell.topology.moe_ep)
+        for cell in plan.cells
+    ] == [
+        ("prefill", "single", 1, 1, 1),
+        ("prefill", "dep", 1, 2, 2),
+        ("decode", "single", 1, 1, 1),
+        ("decode", "dep", 1, 2, 2),
     ]
     return plan
 
@@ -373,6 +390,137 @@ def test_moe_cell_changes_only_the_command_line_and_keeps_the_dataset_folder_blo
     ]
     assert any("DYN_BENCH_KV_WARMUP_CACHE_DIR" in line for line in sglang_lines)
     subprocess.run(["bash", "-n", str(tmp_path / "sglang" / "run.sh")], check=True)
+
+
+# The DEP cell of two GPUs. SGLang's --tp-size and --ep-size count the ranks of both data-parallel ranks, and
+# --attn-dp-size, in the place of vLLM's --data-parallel-size, makes the two ranks attention-DP ranks. SGLang
+# divides the chunk size by the number of those ranks, so the cell writes twice the token budget for it and
+# each rank gets the budget; the other token bound and the cap of the new-token axis stay the budget.
+DEP_SIZES = "2 --ep-size 2 --attn-dp-size 2"
+DEP_TOKEN_BUDGET = "--chunked-prefill-size 16384 --max-prefill-tokens 8192"
+assert MOE_PREFILL.count(TOKEN_BUDGET) == 1
+DEP_PREFILL_COMMAND = MOE_PREFILL.replace(TOKEN_BUDGET, DEP_TOKEN_BUDGET).format(sizes=DEP_SIZES).split()
+DEP_DECODE_COMMAND = MOE_DECODE.format(sizes=DEP_SIZES).split()
+# What the Generator's vLLM command of that cell says about its ranks.
+VLLM_DEP_SIZES = [
+    *("--tensor-parallel-size", "1", "--pipeline-parallel-size", "1", "--data-parallel-size", "2"),
+    "--enable-expert-parallel",
+]
+
+
+def test_the_commands_of_the_two_gpu_dep_cell_typed_out_in_full():
+    # Typed once without the shared pieces above, so that a change of any of them shows here.
+    assert " ".join(DEP_PREFILL_COMMAND) == (
+        "python3 /tmp/fpm-bench/sglbench_launcher.py --model-path private-org/moe-model"
+        " --served-model-name private-org/moe-model --tp-size 2 --ep-size 2 --attn-dp-size 2"
+        " --kv-cache-dtype fp8_e4m3 --benchmark-timeout 10200 --benchmark-mode prefill"
+        " --benchmark-warmup-iterations 5 --prefill-max-kv-read-token-samples 29 --chunked-prefill-size 16384"
+        " --max-prefill-tokens 8192 --dump-config-to /results/resolved-config-node0.json"
+        " --benchmark-output-path /results/benchmark.json --prefill-max-new-token-samples 8192"
+    )
+    assert " ".join(DEP_DECODE_COMMAND) == (
+        "python3 /tmp/fpm-bench/sglbench_launcher.py --model-path private-org/moe-model"
+        " --served-model-name private-org/moe-model --tp-size 2 --ep-size 2 --attn-dp-size 2"
+        " --kv-cache-dtype fp8_e4m3 --benchmark-timeout 10200 --benchmark-mode decode"
+        " --benchmark-warmup-iterations 5 --dump-config-to /results/resolved-config-node0.json"
+        " --benchmark-output-path /results/benchmark.json"
+    )
+
+
+@pytest.mark.parametrize(("phase", "expected"), [("prefill", DEP_PREFILL_COMMAND), ("decode", DEP_DECODE_COMMAND)])
+def test_dep_cell_command(tmp_path, monkeypatch, phase, expected):
+    plan = _dep_plan(tmp_path, monkeypatch)
+    cell = _cell(plan, phase, "dep")
+    assert cell.topology == ParallelTopology(tp=1, pp=1, dp=2, moe_tp=1, moe_ep=2, cp=1)
+    _render_vllm(plan, cell, tmp_path / "vllm")
+
+    _render(plan, cell, tmp_path / "sglang")
+
+    command = _command(tmp_path / "sglang")
+    assert command == expected
+    # What was translated is the Generator's own vLLM command of the cell: one tensor-parallel rank in each of
+    # two data-parallel ranks, the expert-parallel switch, and the start-up of the data-parallel engine cores.
+    vllm = _command(tmp_path / "vllm")
+    start = vllm.index("--tensor-parallel-size")
+    assert vllm[start : start + len(VLLM_DEP_SIZES)] == VLLM_DEP_SIZES
+    assert vllm[vllm.index("--data-parallel-backend") + 1] == "mp"
+    # No data-parallel name of vLLM reaches SGLang's parser, where --data-parallel-size counts whole replicas,
+    # and the deprecated spelling of DP attention is not written either.
+    assert not {"--data-parallel-size", "--data-parallel-backend", "--dp-size", "--enable-dp-attention"} & set(command)
+    # The token budget of the vLLM cell, which each of its two data-parallel ranks gets whole: SGLang halves the
+    # chunk size for a rank, so twice the budget is written for it. SGLang does not divide the other bound.
+    if phase == "prefill":
+        budget = vllm[vllm.index("--max-num-batched-tokens") + 1]
+        assert budget == "8192"
+        assert command[command.index("--chunked-prefill-size") + 1] == "16384"
+        assert command[command.index("--max-prefill-tokens") + 1] == budget
+        assert command[command.index("--prefill-max-new-token-samples") + 1] == budget
+    # The launcher's own reader of flags takes the command and hands the three sizes to SGLang's parser.
+    environment = {"DYN_BENCH_KV_WARMUP": "on", "DYN_BENCH_PREFILL_REAL_SEED": "on"}
+    options = launcher._read_options(command[2:], environment)
+    assert (options.rejection, options.output_problem, options.mode) == (None, None, phase)
+    engine_arguments = MOE_ENGINE.format(sizes=DEP_SIZES).split()
+    assert options.sglang_argv[: len(engine_arguments)] == engine_arguments
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_the_one_gpu_cell_of_the_dep_preset_renders_as_the_one_of_the_tep_preset(tmp_path, monkeypatch, phase):
+    dep_plan = _dep_plan(tmp_path, monkeypatch)
+    tep_plan = _moe_plan(tmp_path, monkeypatch)
+
+    _render(dep_plan, _cell(dep_plan, phase, "single"), tmp_path / "dep-preset")
+    _render(tep_plan, _cell(tep_plan, phase, "single"), tmp_path / "tep-preset")
+
+    command = _command(tmp_path / "dep-preset")
+    assert command == _command(tmp_path / "tep-preset")
+    # One data-parallel rank writes no attention-DP size and no expert-parallel size.
+    assert command == (MOE_PREFILL if phase == "prefill" else MOE_DECODE).format(sizes="1").split()
+
+
+def test_dep_cell_changes_only_the_command_line_and_asks_the_gate_for_two_rank_files(tmp_path, monkeypatch):
+    plan = _dep_plan(tmp_path, monkeypatch)
+    cell = _cell(plan, "decode", "dep")
+    _render_vllm(plan, cell, tmp_path / "vllm")
+
+    _render(plan, cell, tmp_path / "sglang")
+
+    vllm, sglang = _files(tmp_path / "vllm"), _files(tmp_path / "sglang")
+    vllm_lines, sglang_lines = vllm["run.sh"].split("\n"), sglang["run.sh"].split("\n")
+    changed = [index for index, pair in enumerate(zip(vllm_lines, sglang_lines, strict=True)) if pair[0] != pair[1]]
+    assert len(changed) == 1
+    assert sglang_lines[changed[0]] == f"{COMMAND_LINE_START}{shlex.join(DEP_DECODE_COMMAND)})"
+    subprocess.run(["bash", "-n", str(tmp_path / "sglang" / "run.sh")], check=True)
+    # The environment of the gate is the vLLM render's: one node, and two data-parallel ranks on it. In its
+    # mode without etcd the gate waits for one rank file per local rank (runtime/fpm_exec.sh), which is what
+    # the launcher writes for a cell with two attention-DP ranks.
+    assert sglang["fpm_env.sh"] == vllm["fpm_env.sh"]
+    exports = sglang["fpm_env.sh"].splitlines()
+    for line in ("export FPM_NODE_COUNT=1", "export FPM_DATA_PARALLEL_SIZE=2", "export FPM_LOCAL_DATA_PARALLEL_SIZE=2"):
+        assert line in exports
+    assert (
+        sglang["collector-runtime-env.sh"] == vllm["collector-runtime-env.sh"] + "export AISIMULATE_SGLBENCH_GATE=1\n"
+    )
+    # The pod asks for one GPU per rank.
+    pod = yaml.safe_load(sglang["k8s_deploy.yaml"])
+    (container,) = pod["spec"]["containers"]
+    assert container["resources"]["limits"]["nvidia.com/gpu"] == "2"
+    assert "workingDir" not in container
+
+
+def test_dep_and_tep_cells_of_the_same_gpus_ask_for_the_same_resources(tmp_path, monkeypatch):
+    plan = _sglang_plan(
+        tmp_path, monkeypatch, MOE_MODEL, FAKE_MOE_MODEL_CONFIG, fpm_gpu_counts=[2], fpm_parallel_presets=["tep", "dep"]
+    )
+    resources = {}
+    for strategy in ("tep", "dep"):
+        _render(plan, _cell(plan, "decode", strategy), tmp_path / strategy)
+        pod = yaml.safe_load((tmp_path / strategy / "k8s_deploy.yaml").read_text())
+        resources[strategy] = pod["spec"]["containers"][0]["resources"]
+
+    # The Generator sizes the pod by its GPUs. A DEP cell runs one scheduler process per GPU, as a TEP cell
+    # does, and the DP controller process in addition.
+    assert resources["dep"] == resources["tep"]
+    assert resources["dep"]["limits"]["nvidia.com/gpu"] == "2"
 
 
 # The variables a plan may set for the content of a cell, with FAKE values. The launcher reads them.
@@ -683,6 +831,28 @@ def test_context_length_memory_fraction_and_decode_batch(tmp_path, monkeypatch):
     )
     assert _command(tmp_path / "prefill") == prefill.split()
     assert _command(tmp_path / "decode") == decode.split()
+
+
+def test_request_cap_of_a_dep_cell_is_written_for_both_ranks(tmp_path, monkeypatch):
+    plan = _dep_plan(tmp_path, monkeypatch, fpm_max_decode_batch_size=64)
+    for strategy in ("dep", "single"):
+        cell = _cell(plan, "decode", strategy)
+        _render_vllm(plan, cell, tmp_path / f"vllm-{strategy}")
+        _render(plan, cell, tmp_path / f"sglang-{strategy}")
+        # What the Generator writes for the cell: the cap of one data-parallel rank.
+        vllm = _command(tmp_path / f"vllm-{strategy}")
+        assert vllm[vllm.index("--max-num-seqs") + 1] == "64"
+
+    # SGLang halves the cap it is given for each of the two ranks, so the DEP cell writes twice the cap. The
+    # one-GPU cell of the same plan writes it as it is.
+    engine = MOE_ENGINE.format(sizes=DEP_SIZES)
+    assert _command(tmp_path / "sglang-dep") == (
+        f"{LAUNCHER} {engine} {BENCHMARK.format(phase='decode')} --max-running-requests 128 {RESULT_FILES}".split()
+    )
+    engine = MOE_ENGINE.format(sizes="1")
+    assert _command(tmp_path / "sglang-single") == (
+        f"{LAUNCHER} {engine} {BENCHMARK.format(phase='decode')} --max-running-requests 64 {RESULT_FILES}".split()
+    )
 
 
 @pytest.mark.parametrize(
@@ -1065,17 +1235,26 @@ def test_vllm_capture_list_is_refused(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("topology", "flag"),
+    ("topology", "message"),
     [
-        (ParallelTopology(tp=1, pp=1, dp=2, moe_tp=1, moe_ep=1, cp=1), "--data-parallel-size 2"),
-        (ParallelTopology(tp=1, pp=2, dp=1, moe_tp=1, moe_ep=1, cp=1), "--pipeline-parallel-size 2"),
+        # Two data-parallel ranks of a dense model: whole replicas, which no plan holds.
+        (
+            ParallelTopology(tp=1, pp=1, dp=2, moe_tp=1, moe_ep=1, cp=1),
+            "--data-parallel-size 2 without --enable-expert-parallel: the launcher runs data-parallel ranks only as "
+            "DP attention with one expert-parallel rank on each",
+        ),
+        (
+            ParallelTopology(tp=1, pp=2, dp=1, moe_tp=1, moe_ep=1, cp=1),
+            "--pipeline-parallel-size 2: the launcher runs one pipeline stage",
+        ),
     ],
+    ids=["data-parallel-replicas", "pipeline-stages"],
 )
-def test_parallel_size_other_than_one_is_refused(tmp_path, monkeypatch, topology, flag):
+def test_parallel_size_other_than_one_is_refused(tmp_path, monkeypatch, topology, message):
     plan = _plan(tmp_path, monkeypatch)
     cell = dataclasses.replace(_cell(plan, "prefill"), topology=topology)
 
-    with _refusal(f"{flag}: the launcher runs one data-parallel replica and one pipeline stage"):
+    with _refusal(message):
         _render(plan, cell, tmp_path / "cell")
 
 
@@ -1088,6 +1267,21 @@ def test_cell_on_more_than_one_node_is_refused(tmp_path, monkeypatch):
 
     with _refusal("the launcher runs on one node, and fpm_env.sh exports 2 as FPM_NODE_COUNT"):
         _render(plan, cell, tmp_path / "cell")
+
+
+def test_dep_cell_on_more_than_one_node_is_refused(tmp_path, monkeypatch):
+    plan = _dep_plan(tmp_path, monkeypatch)
+    # Sixteen data-parallel ranks are two nodes of this system, with eight ranks on each.
+    cell = dataclasses.replace(
+        _cell(plan, "decode", "dep"), topology=ParallelTopology(tp=1, pp=1, dp=16, moe_tp=1, moe_ep=16, cp=1)
+    )
+
+    with _refusal("the launcher runs on one node, and fpm_env.sh exports 2 as FPM_NODE_COUNT"):
+        _render(plan, cell, tmp_path / "cell")
+
+    # The vLLM render stays, with the ranks of one node in its environment.
+    assert "export FPM_LOCAL_DATA_PARALLEL_SIZE=8" in (tmp_path / "cell" / "fpm_env.sh").read_text().splitlines()
+    assert _command(tmp_path / "cell")[:3] == ["python3", "-m", "dynamo.vllm"]
 
 
 def test_timeout_that_leaves_the_launcher_under_a_minute_is_refused(tmp_path, monkeypatch):
@@ -1224,6 +1418,11 @@ def test_manifest_without_exactly_one_working_dir_is_refused(tmp_path, monkeypat
 
 def test_every_row_of_the_table_in_one_command():
     values = {
+        # Two data-parallel ranks, so that the attention-DP size is written too. With it the three numbers of
+        # one rank are written as their product with it: the tensor-parallel size (with the expert-parallel
+        # size after it), the chunk size of the token budget and the request cap.
+        "--data-parallel-size": "2",
+        "--data-parallel-backend": "mp",
         "--kv-cache-dtype": "bfloat16",
         "--benchmark-mode": "decode",
         "--benchmark-timeout": "7200",
@@ -1239,12 +1438,13 @@ def test_every_row_of_the_table_in_one_command():
     assert (
         command
         == (
-            f"{LAUNCHER} --model-path 1 --served-model-name 1 --tp-size 1 --ep-size 1 --kv-cache-dtype auto"
-            " --mem-fraction-static 1 --benchmark-mode decode --benchmark-warmup-iterations 1 --benchmark-points-file 1"
+            f"{LAUNCHER} --model-path 1 --served-model-name 1 --tp-size 2 --ep-size 2 --attn-dp-size 2"
+            " --kv-cache-dtype auto --mem-fraction-static 1 --benchmark-mode decode"
+            " --benchmark-warmup-iterations 1 --benchmark-points-file 1"
             " --benchmark-output-path 1 --dump-config-to 1 --prefill-max-new-token-samples 1"
             " --prefill-max-kv-read-token-samples 1 --prefix-max-batch-size-samples 1"
             " --decode-max-kv-read-token-samples 1 --decode-max-batch-size-samples 1 --benchmark-timeout 6600"
-            " --context-length 4096 --chunked-prefill-size 2048 --max-prefill-tokens 2048 --max-running-requests 1"
+            " --context-length 4096 --chunked-prefill-size 4096 --max-prefill-tokens 2048 --max-running-requests 2"
         ).split()
     )
     # The table is the whole of what can be written.
@@ -1285,6 +1485,35 @@ def test_every_row_of_the_table_in_one_command():
         ),
         # Without the switch no size is written, and SGLang's default of one expert-parallel rank applies.
         ("--benchmark-mode decode --tensor-parallel-size 2", "--benchmark-mode decode --tp-size 2"),
+        # The command of a DEP cell. --tp-size and --ep-size count the ranks of every data-parallel rank, the
+        # data-parallel size is written as the attention-DP size in the place of the vLLM flag, and the
+        # start-up of vLLM's data-parallel engine cores is dropped.
+        (
+            "--tensor-parallel-size 1 --pipeline-parallel-size 1 --data-parallel-size 2 --enable-expert-parallel"
+            " --benchmark-mode decode --data-parallel-backend mp",
+            "--tp-size 2 --ep-size 2 --attn-dp-size 2 --benchmark-mode decode",
+        ),
+        (
+            "--tensor-parallel-size 1 --data-parallel-size=8 --enable-expert-parallel --benchmark-mode decode",
+            "--tp-size 8 --ep-size 8 --attn-dp-size 8 --benchmark-mode decode",
+        ),
+        # The product of the two sizes, whatever the order of the flags. No plan holds such a cell, and the
+        # launcher refuses the layout.
+        (
+            "--data-parallel-size 4 --benchmark-mode decode --enable-expert-parallel --tensor-parallel-size 2",
+            "--attn-dp-size 4 --benchmark-mode decode --tp-size 8 --ep-size 8",
+        ),
+        # One data-parallel rank writes nothing, with or without the start-up flag, and the tensor-parallel
+        # size then stays the text it was: nothing is computed.
+        (
+            "--benchmark-mode decode --tensor-parallel-size 02 --data-parallel-size 1 --data-parallel-backend mp",
+            "--benchmark-mode decode --tp-size 02",
+        ),
+        (
+            "--tensor-parallel-size 4 --data-parallel-size 1 --enable-expert-parallel --benchmark-mode decode",
+            "--tp-size 4 --ep-size 4 --benchmark-mode decode",
+        ),
+        ("--benchmark-mode decode --data-parallel-size 1", "--benchmark-mode decode"),
     ],
 )
 def test_translation_of_single_flags(flags, expected):
@@ -1328,16 +1557,41 @@ def test_translation_of_single_flags(flags, expected):
             "--tensor-parallel-size 2 --enable-expert-parallel --enable-expert-parallel",
             "--enable-expert-parallel is given twice",
         ),
-        # The command of a DEP cell: its experts are spread over data-parallel replicas.
+        # Data-parallel ranks without the expert-parallel switch: whole replicas of the model.
         (
-            "--tensor-parallel-size 1 --pipeline-parallel-size 1 --data-parallel-size 2 --enable-expert-parallel"
-            " --benchmark-mode decode",
-            "--data-parallel-size 2: the launcher runs one data-parallel replica and one pipeline stage",
+            "--tensor-parallel-size 1 --pipeline-parallel-size 1 --data-parallel-size 2 --benchmark-mode decode"
+            " --data-parallel-backend mp",
+            "--data-parallel-size 2 without --enable-expert-parallel: the launcher runs data-parallel ranks only as "
+            "DP attention with one expert-parallel rank on each",
         ),
+        # With the switch, the product needs both sizes, and each must be a positive integer.
+        (
+            "--data-parallel-size 2 --enable-expert-parallel --benchmark-mode decode",
+            "--enable-expert-parallel is written with the value of --tensor-parallel-size, which the command does "
+            "not give",
+        ),
+        (
+            "--tensor-parallel-size two --data-parallel-size 2 --enable-expert-parallel --benchmark-mode decode",
+            "--tensor-parallel-size two: a positive integer is required",
+        ),
+        (
+            "--tensor-parallel-size 0 --data-parallel-size 2 --enable-expert-parallel --benchmark-mode decode",
+            "--tensor-parallel-size 0: a positive integer is required",
+        ),
+        ("--data-parallel-size 0", "--data-parallel-size 0: a positive integer is required"),
+        ("--data-parallel-size -1", "--data-parallel-size -1: a positive integer is required"),
+        ("--data-parallel-size two", "--data-parallel-size two: a positive integer is required"),
+        ("--data-parallel-size 2 --data-parallel-size 2", "--data-parallel-size is given twice"),
+        # Another start-up of vLLM's data-parallel engine cores than the one the Generator writes.
+        ("--data-parallel-backend ray", "--data-parallel-backend ray: only mp, the value the Generator writes, is"),
+        ("--data-parallel-backend", "--data-parallel-backend has no value"),
+        ("--pipeline-parallel-size 2", "--pipeline-parallel-size 2: the launcher runs one pipeline stage"),
         # The other MoE flags of a vLLM cell, and SGLang's own names, which are no vLLM flags.
         ("--kernel-config {}", "the vLLM flag --kernel-config has no SGLang translation"),
         ("--enable-eplb", "the vLLM flag --enable-eplb has no SGLang translation"),
-        ("--data-parallel-backend mp", "the vLLM flag --data-parallel-backend has no SGLang translation"),
+        ("--attn-dp-size 2", "the vLLM flag --attn-dp-size has no SGLang translation"),
+        ("--dp-size 2", "the vLLM flag --dp-size has no SGLang translation"),
+        ("--enable-dp-attention", "the vLLM flag --enable-dp-attention has no SGLang translation"),
         ("--ep-size 2", "the vLLM flag --ep-size has no SGLang translation"),
         ("--expert-parallel-size 2", "the vLLM flag --expert-parallel-size has no SGLang translation"),
         ("--moe-a2a-backend deepep", "the vLLM flag --moe-a2a-backend has no SGLang translation"),
@@ -1362,11 +1616,116 @@ def test_only_the_expert_parallel_switch_is_written_with_the_value_of_another_fl
         None,
         "--tensor-parallel-size",
     )
-    # The flag it takes its value from is written unchanged, so the two sizes of a command are one text.
+    # The flag it takes its value from is written unchanged for one data-parallel rank and as the product
+    # above that. Either way the two sizes of a command are one text.
     source = builder._TRANSLATION[row.value_of]
     assert (source.writes, source.takes_value, source.value) == (("--tp-size",), True, None)
+    assert source.times == "--data-parallel-size"
     # No other MoE setting of SGLang can be written: the launcher pins them to SGLang's defaults.
     assert not {flag for flag in _written_flags() if "moe" in flag or "eplb" in flag or "expert" in flag}
+
+
+def test_what_is_multiplied_and_only_by_a_written_attention_dp_size():
+    multiplied = {flag: row for flag, row in builder._TRANSLATION.items() if row.times is not None}
+
+    # The three numbers that SGLang counts over all attention-DP ranks and vLLM for one data-parallel rank.
+    assert list(multiplied) == ["--tensor-parallel-size", "--max-num-batched-tokens", "--max-num-seqs"]
+    assert {row.times for row in multiplied.values()} == {"--data-parallel-size"}
+    factor = builder._TRANSLATION["--data-parallel-size"]
+    # The factor is what the data-parallel size writes: nothing for one rank, the attention-DP size above it.
+    assert (factor.writes, factor.takes_value, factor.value_of, factor.times) == (("--attn-dp-size",), True, None, None)
+    assert [factor.value("--data-parallel-size", size) for size in ("1", "01", "2", "8", "016")] == [
+        None,
+        None,
+        "2",
+        "8",
+        "16",
+    ]
+    # The start-up flag of vLLM's data-parallel engine cores writes nothing, whatever its value.
+    assert builder._TRANSLATION["--data-parallel-backend"].writes == ()
+    # Of the two flags the token budget writes, only the chunk size carries the product: SGLang divides that
+    # one by the attention-DP size and not the other. The two other rows multiply all they write, and the row
+    # the expert-parallel switch takes its value from is one of them.
+    assert {flag: row.times_writes for flag, row in multiplied.items()} == {
+        "--tensor-parallel-size": None,
+        "--max-num-batched-tokens": ("--chunked-prefill-size",),
+        "--max-num-seqs": None,
+    }
+    assert multiplied["--max-num-batched-tokens"].writes == ("--chunked-prefill-size", "--max-prefill-tokens")
+    assert multiplied["--max-num-seqs"].writes == ("--max-running-requests",)
+    assert not [row for row in builder._TRANSLATION.values() if row.times is None and row.times_writes is not None]
+
+
+@pytest.mark.parametrize("size", ["1", "01", "2", "4", "016"])
+def test_each_rank_of_a_dep_cell_gets_the_whole_token_budget_and_request_cap(size):
+    command = builder._translate_command(
+        _vllm(
+            *("--tensor-parallel-size", "1", "--data-parallel-size", size, "--enable-expert-parallel"),
+            *("--benchmark-mode", "prefill", "--max-num-batched-tokens", "8192", "--max-num-seqs", "64"),
+        )
+    )
+
+    # What SGLang gives one rank is the written number divided by the attention-DP size, rounded down
+    # (``test_sglang_divides_the_chunk_size_and_the_request_cap_of_a_rank_at_each_tested_release``).
+    ranks = int(size)
+    assert command[command.index("--chunked-prefill-size") + 1] == str(8192 * ranks)
+    assert command[command.index("--max-running-requests") + 1] == str(64 * ranks)
+    # SGLang does not divide the new tokens of one prefill batch, and the cap of the new-token axis is the
+    # chunk size of one rank.
+    assert command[command.index("--max-prefill-tokens") + 1] == "8192"
+    assert command[command.index("--prefill-max-new-token-samples") + 1] == "8192"
+    # With one rank the command is the one of a cell without data-parallel ranks.
+    assert ("--attn-dp-size" in command) is (ranks > 1)
+
+
+@pytest.mark.parametrize("order", ["budget-first", "ranks-first"])
+def test_the_product_does_not_depend_on_where_the_data_parallel_size_stands(order):
+    limits = ("--max-num-batched-tokens=4096", "--max-num-seqs=7")
+    ranks = ("--tensor-parallel-size", "1", "--data-parallel-size=3", "--enable-expert-parallel")
+    flags = (*limits, *ranks) if order == "budget-first" else (*ranks, *limits)
+
+    command = builder._translate_command(_vllm(*flags, "--benchmark-mode", "decode"))
+
+    assert command[command.index("--chunked-prefill-size") + 1] == "12288"
+    assert command[command.index("--max-prefill-tokens") + 1] == "4096"
+    assert command[command.index("--max-running-requests") + 1] == "21"
+    assert command[command.index("--tp-size") + 1] == command[command.index("--ep-size") + 1] == "3"
+
+
+def test_a_limit_with_leading_zeros_is_multiplied_as_a_number():
+    dep = ("--tensor-parallel-size", "1", "--data-parallel-size", "02", "--enable-expert-parallel")
+    limits = ("--benchmark-mode", "prefill", "--max-num-batched-tokens", "08192", "--max-num-seqs", "064")
+
+    command = builder._translate_command(_vllm(*dep, *limits))
+
+    assert command[command.index("--attn-dp-size") + 1] == "2"
+    assert command[command.index("--chunked-prefill-size") + 1] == "16384"
+    assert command[command.index("--max-prefill-tokens") + 1] == "8192"
+    assert command[command.index("--max-running-requests") + 1] == "128"
+    assert command[command.index("--prefill-max-new-token-samples") + 1] == "8192"
+
+    # Without data-parallel ranks the token budget is written as its number, as before, and the request cap
+    # as the text it was.
+    command = builder._translate_command(_vllm(*limits))
+
+    assert command[command.index("--chunked-prefill-size") + 1] == "8192"
+    assert command[command.index("--max-prefill-tokens") + 1] == "8192"
+    assert command[command.index("--max-running-requests") + 1] == "064"
+
+
+def test_a_request_cap_that_is_no_positive_integer_is_refused_for_a_dep_cell_only():
+    dep = ("--tensor-parallel-size", "1", "--data-parallel-size", "2", "--enable-expert-parallel")
+    # Without data-parallel ranks, and with one, the value is passed on as it is, for SGLang's parser to judge.
+    one_rank = ("--tensor-parallel-size", "1", "--data-parallel-size", "1")
+    for ranks in ((), one_rank):
+        for value in ("many", "0"):
+            command = builder._translate_command(_vllm(*ranks, "--benchmark-mode", "decode", "--max-num-seqs", value))
+            assert command[command.index("--max-running-requests") + 1] == value
+
+    with _refusal("--max-num-seqs many: a positive integer is required"):
+        builder._translate_command(_vllm(*dep, "--benchmark-mode", "decode", "--max-num-seqs", "many"))
+    with _refusal("--max-num-seqs 0: a positive integer is required"):
+        builder._translate_command(_vllm(*dep, "--benchmark-mode", "decode", "--max-num-seqs", "0"))
 
 
 def test_the_generators_sglang_serving_deployment_writes_the_same_size_under_sglangs_alias():
@@ -1401,6 +1760,7 @@ def test_nothing_the_launcher_refuses_can_be_written(tmp_path, monkeypatch):
     written = _written_flags()
 
     assert written.isdisjoint(REFUSED_BY_THE_LAUNCHER)
+    assert written.isdisjoint(OTHER_ATTENTION_DP_SPELLINGS)
     assert written.isdisjoint(flag for _dest, flag, _variable, _why in launcher._REFUSED_SWITCHES)
     assert written.isdisjoint(flag for _dest, flag, _variable, _use in launcher._LEGACY_FLAGS)
     # The two flags a vLLM cell switches scheduling and caching with have no counterpart in the cell.
@@ -1410,6 +1770,13 @@ def test_nothing_the_launcher_refuses_can_be_written(tmp_path, monkeypatch):
     for phase in ("prefill", "decode"):
         _render(plan, _cell(plan, phase), tmp_path / phase)
         assert REFUSED_BY_THE_LAUNCHER.isdisjoint(_command(tmp_path / phase))
+    # A DEP cell writes the attention-DP size under its current name and none of the names beside it.
+    dep_plan = _dep_plan(tmp_path, monkeypatch)
+    for phase in ("prefill", "decode"):
+        _render(dep_plan, _cell(dep_plan, phase, "dep"), tmp_path / f"dep-{phase}")
+        command = _command(tmp_path / f"dep-{phase}")
+        assert "--attn-dp-size" in command
+        assert (REFUSED_BY_THE_LAUNCHER | OTHER_ATTENTION_DP_SPELLINGS).isdisjoint(command)
 
 
 def _sglang_field_files(version: str) -> list[Path]:
@@ -1467,7 +1834,78 @@ def test_sglang_flags_are_declared_at_each_tested_release(version):
 
     assert sorted(SGLANG_FLAGS - set(declared)) == []
     # What the launcher refuses is a real flag of that release, so leaving it out is a choice and no accident.
-    assert sorted(REFUSED_BY_THE_LAUNCHER - {"--enable-dp-attention"} - set(declared)) == []
+    assert sorted(REFUSED_BY_THE_LAUNCHER - set(declared)) == []
+
+
+@pytest.mark.parametrize("version", compat.TESTED_VERSIONS)
+def test_the_attention_dp_size_is_its_own_field_and_vllms_name_is_another_at_each_tested_release(version):
+    files = _sglang_field_files(version)
+    declared = _declared_arguments(files)
+
+    # The flag the builder writes for vLLM's data-parallel size, with its alias, declared beside ``tp_size``.
+    assert declared["--attention-data-parallel-size"] is declared["--attn-dp-size"]
+    (parallel,) = [path for path in files if path.name == "parallel.py"]
+    assert {"--tp-size", "--attn-dp-size", "--ep-size"} <= set(_declared_arguments([parallel]))
+    # vLLM's own name is a flag of SGLang too, and it is another field: the number of whole replicas. A
+    # command that passed it on would start replicas and no DP attention.
+    assert declared["--data-parallel-size"] is declared["--dp-size"]
+    assert declared["--dp-size"] is not declared["--attn-dp-size"]
+    # SGLang's default is one attention-DP rank, which a cell without data-parallel ranks runs with.
+    fields = {
+        node.target.id: node
+        for node in ast.walk(ast.parse(parallel.read_text()))
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    }
+    assert (ast.literal_eval(fields["attn_dp_size"].value), ast.literal_eval(fields["dp_size"].value)) == (1, 1)
+    # The deprecated switch is no flag of the field files (``no_cli``). SGLang registers it by hand, as
+    # deprecated, and turns the pair with --dp-size into the attention-DP size.
+    assert "--enable-dp-attention" not in declared
+    assert "no_cli=True" in ast.unparse(fields["enable_dp_attention"].annotation)
+    srt = parallel.parents[2]
+    registration = (srt / "server_args.py").read_text()
+    assert registration.count('"--enable-dp-attention"') == 1
+    assert "DeprecatedStoreTrueAction" in registration.split('"--enable-dp-attention"', 1)[1][:400]
+    hook = ast.parse((srt / "arg_groups" / "parallel_hook.py").read_text())
+    (resolution,) = [
+        node
+        for node in ast.walk(hook)
+        if isinstance(node, ast.FunctionDef) and node.name == "handle_deprecated_dp_attention"
+    ]
+    assert "attn_dp_size=cfg.dp_size" in ast.unparse(resolution) and "dp_size=1" in ast.unparse(resolution)
+
+
+@pytest.mark.parametrize("version", compat.TESTED_VERSIONS)
+def test_sglang_divides_the_chunk_size_and_the_request_cap_of_a_rank_at_each_tested_release(version):
+    # What the note at the translation table says SGLang does with the two numbers of a DEP cell, which is why
+    # the cell writes them multiplied by the attention-DP size.
+    srt = _sglang_field_files(version)[0].parents[2]
+    hook = ast.parse((srt / "arg_groups" / "parallel_hook.py").read_text())
+    (data_parallelism,) = [
+        node for node in ast.walk(hook) if isinstance(node, ast.FunctionDef) and node.name == "handle_data_parallelism"
+    ]
+    source = ast.unparse(data_parallelism)
+    assert "chunked_prefill_size=cfg.chunked_prefill_size // cfg.attn_dp_size" in source
+    assert "assert cfg.tp_size % cfg.attn_dp_size == 0" in source
+    # The new tokens of one prefill batch are not divided there.
+    assert "max_prefill_tokens" not in source
+
+    configurator = ast.parse((srt / "mem_cache" / "kv_cache_configurator.py").read_text())
+    (per_rank_requests,) = [
+        node
+        for node in ast.walk(configurator)
+        if isinstance(node, ast.FunctionDef) and node.name == "resolve_max_num_reqs"
+    ]
+    division = "max_num_reqs // self.attn_dp_size"
+    assert division in ast.unparse(per_rank_requests)
+    # Only the later release keeps at least one request for a rank.
+    assert (f"max(1, {division})" in ast.unparse(per_rank_requests)) is (version == "0.5.23")
+
+    # The width of attention inside one rank, which makes ``tp_size`` the width over all ranks.
+    context = ast.parse((srt / "runtime_context.py").read_text())
+    (width,) = [
+        node for node in ast.walk(context) if isinstance(node, ast.FunctionDef) and node.name == "derive_attn_tp_size"
+    ]
+    assert "return tp_size // attn_dp_size // attn_cp_size" in ast.unparse(width)
 
 
 @pytest.mark.parametrize("version", compat.TESTED_VERSIONS)
@@ -1505,37 +1943,61 @@ def test_kv_cache_dtypes_are_sglangs_choices_at_each_tested_release(version):
 # ---------------------------------------------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("ranks", [1, 2, 4])
 @pytest.mark.parametrize("page_size", [1, 64])
 @pytest.mark.parametrize(
-    "graph_sizes",
+    ("graph_sizes", "low_end"),
     [
-        (),
-        (4, 8, 16, 32, 64, 128, 256, 512),
-        # The longest axis there can be: a graph for every token count up to the budget.
-        tuple(range(1, 513)),
-        # Graph sizes above the budget add nothing below it.
-        (256, 1024, 4096),
+        # No prefill graph and so no step: the low end is the 1 that the axis of powers of two starts with.
+        ((), [1]),
+        # A batch of 2 tokens is padded to 4, twice its tokens, and runs with that graph; a batch of 1 does not.
+        ((4, 8, 16, 32, 64, 128, 256, 512), [1, 2]),
+        # The longest axis there can be: a graph for every token count up to the budget. One token has a graph
+        # of its own, so no batch runs without one and the low end is the 1 that is a graph size.
+        (tuple(range(1, 513)), [1]),
+        # Graph sizes above the budget add nothing below it. The smallest size, 256, is at most twice the tokens
+        # of a batch from 128 tokens on.
+        ((256, 1024, 4096), [1, 127, 128]),
     ],
 )
-def test_token_budget_as_the_cap_never_cuts_the_new_token_axis(page_size, graph_sizes):
+def test_token_budget_as_the_cap_never_cuts_the_new_token_axis(ranks, page_size, graph_sizes, low_end):
     budget = 512
-    command = builder._translate_command(_vllm("--benchmark-mode", "prefill", "--max-num-batched-tokens", str(budget)))
+    sizes = ("--tensor-parallel-size", "1", "--data-parallel-size", str(ranks), "--enable-expert-parallel")
+    command = builder._translate_command(
+        _vllm(*sizes, "--benchmark-mode", "prefill", "--max-num-batched-tokens", str(budget))
+    )
     cap = int(command[command.index("--prefill-max-new-token-samples") + 1])
-    # What an engine started with the cell's two token flags reports, with FAKE sizes for the rest.
+    # What an engine started with the cell's two token flags reports, with FAKE sizes for the rest. Under DP
+    # attention a scheduler reports the written chunk size divided by the number of ranks.
     limits = grid.Limits(
         page_size=page_size,
         max_req_input_len=131072,
         max_total_num_tokens=1048576,
         max_running_requests=64,
         max_prefill_tokens=int(command[command.index("--max-prefill-tokens") + 1]),
-        chunked_prefill_size=int(command[command.index("--chunked-prefill-size") + 1]),
+        chunked_prefill_size=int(command[command.index("--chunked-prefill-size") + 1]) // ranks,
         prefill_graph_sizes=graph_sizes,
     )
 
     axis = grid.prefill_new_token_axis(limits, grid.SampleCaps(prefill_max_new_token_samples=cap))
 
-    uncut = grid.graph_axis(graph_sizes, grid.largest_prefill_new_tokens(limits))
-    assert axis == (uncut if uncut[0] == 1 else [1, *uncut])
+    n_limit = grid.largest_prefill_new_tokens(limits)
+    uncut = grid.graph_axis(graph_sizes, n_limit)
+    # The low end of the axis, worked out here from SGLang's rule and not with the grid's own function: 1 and
+    # the two sides of the first step. A batch of no more tokens than the smallest prefill graph size is padded
+    # to that size, and SGLang runs it with that graph only when the size is at most twice the batch's tokens
+    # (``can_replay_locally`` in python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py). The
+    # step lies just below the first token count for which that holds. A side below 1 or above the largest
+    # new-token count is left out.
+    step = []
+    if graph_sizes:
+        smallest = min(graph_sizes)
+        first = next(tokens for tokens in range(1, smallest + 1) if smallest <= 2 * tokens)
+        step = [first - 1, first]
+    assert sorted({1, *(tokens for tokens in step if 1 <= tokens <= n_limit)}) == low_end
+    # The cap of the cell cuts nothing: the axis is the whole graph axis with the low end, which is put on the
+    # axis after the cut and does not count against the cap.
+    assert axis == sorted({*uncut, *low_end})
     assert len(uncut) <= budget == cap
     if len(uncut) > grid.SampleCaps().prefill_max_new_token_samples:
         # Without the cap of the cell the launcher's default would cut this axis.

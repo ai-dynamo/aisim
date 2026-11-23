@@ -34,6 +34,21 @@ is named so:
   driver reads it.
 - ``FakeBaseScheduler``, ``FakeBatch``, ``FakeRequest``, ``FakeResult`` and ``FakeCopyDone`` carry the
   attributes the recorder reads from SGLang's objects.
+- With ``--attn-dp-size`` above 1 the FAKE engine is one with DP attention, modelled on what was read in
+  SGLang's source and on what engines showed on 2026-11-18 (the module docstring of ``sglbench_launcher.py``
+  says what ran). It starts one FAKE scheduler process for each attention-DP rank through the same entry, with
+  the ten arguments SGLang passes there. A FAKE DP controller gives the requests of a call to the ranks in
+  turn, from where the request before left off. Each rank has a FAKE prefix cache of its own. The ranks run in
+  lockstep: in every step each rank runs one FAKE batch, an idle one when it has nothing left, and all batches
+  of a step carry the same ``global_num_tokens``. A rank that decodes in a step in which another rank
+  extends, and no rank idles, runs that step as SGLang runs a decode batch it has turned into an extend
+  batch: mode ``EXTEND`` and one computed token per request (``_FakeEngine._fake_decode_to_extend``; read in
+  the source, never seen on an engine). SGLang does that only when the prefill graphs of every rank can
+  replay the step; a test can make the FAKE engine one whose graphs cannot, which leaves the decode batch as
+  it is. A step takes as long as its slowest rank. Each answer names the rank its request ran on. A FAKE
+  scheduler has an input blocker exactly when SGLANG_ENABLE_COLOCATED_BATCH_GEN is on in the environment at
+  the moment it is built; the FAKE engine releases the requests of a call together either way, so the
+  blocker shows in the recorder headers only.
 - The cached-token counts come from ``PageCacheModel``, the model of SGLang's prefix cache written in
   ``test_fpm_sglbench_content.py``. They are model results, not measurements.
 - Every time is FAKE. ``_FakeClock`` counts ticks of 2**-20 s and moves only when a FAKE batch runs or
@@ -74,6 +89,7 @@ import http.client
 import inspect
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -185,9 +201,13 @@ LAUNCHER_PRODUCER_KEYS = (
     "streaming",
     "enable_nvidia_megakernel",
     "tp_size",
+    "attn_dp_size",
     "expert_keys",
     "moe",
 )
+# One more key of the launcher, written only in a run with several attention-DP ranks.
+DP_PRODUCER_KEY = "dp_attention"
+BLOCKER_ENV = "SGLANG_ENABLE_COLOCATED_BATCH_GEN"
 DRIVER_PRODUCER_KEYS = (
     "timing_metric",
     "timing_clock",
@@ -208,7 +228,10 @@ DRIVER_PRODUCER_KEYS = (
 # schedule.py, memory.py, serving.py, exec_.py, spec.py, disagg.py, device.py); ``device`` and
 # ``prefill_decode_interval`` are None there and resolution fills them in. ``enable_nvidia_megakernel`` exists
 # at v0.5.23 only. The six fields of the expert layers have these defaults for every model (``ep_size`` and
-# ``moe_dense_tp_size`` in parallel.py, the other four in exec_.py ``ExecMoe``).
+# ``moe_dense_tp_size`` in parallel.py, the other four in exec_.py ``ExecMoe``). The last four are read only
+# with ``attn_dp_size`` above 1 (three in parallel.py, ``enable_tokenizer_batch_encode`` in serving.py);
+# ``load_balance_method`` is ``auto`` there and resolution turns it into ``round_robin`` outside disaggregated
+# serving (srt/arg_groups/serving_hook.py).
 FAKE_RESOLVED_ARGUMENTS = {
     "nnodes": 1,
     "node_rank": 0,
@@ -263,7 +286,18 @@ FAKE_RESOLVED_ARGUMENTS = {
     "max_queued_requests": None,
     "device": "cuda",
     "enable_nvidia_megakernel": False,
+    "load_balance_method": "round_robin",
+    "enable_dp_lm_head": False,
+    "enable_dp_attention_local_control_broadcast": False,
+    "enable_tokenizer_batch_encode": False,
 }
+# The four fields the launcher reads only in a run with several attention-DP ranks.
+DP_ONLY_FIELDS = (
+    "load_balance_method",
+    "enable_dp_lm_head",
+    "enable_dp_attention_local_control_broadcast",
+    "enable_tokenizer_batch_encode",
+)
 
 _TIER = "only the built-in in-GPU radix cache is supported"
 _ELASTIC = "elastic EP is not supported"
@@ -277,7 +311,7 @@ _CP = "attention context parallelism is not supported"
 STAGE_S_REFUSALS = [
     ("nnodes", 2, "more than one node is not supported (nnodes=2)"),
     ("node_rank", 1, "more than one node is not supported (node_rank=1)"),
-    ("attn_dp_size", 2, "DP attention is not supported yet (attn_dp_size=2)"),
+    ("attn_dp_size", 0, "attn_dp_size must be a positive int (got 0)"),
     ("dp_size", 2, "data-parallel replicas are not supported (dp_size=2)"),
     ("pp_size", 2, "pipeline parallelism is not supported (pp_size=2)"),
     ("attn_cp_size", 2, f"{_CP} (attn_cp_size=2)"),
@@ -349,7 +383,11 @@ STAGE_S_MORE_REFUSALS = [
     ("nnodes", True, "more than one node is not supported (nnodes=true)"),
     ("nnodes", None, "more than one node is not supported (nnodes=null)"),
     ("node_rank", False, "more than one node is not supported (node_rank=false)"),
-    ("attn_dp_size", 0, "DP attention is not supported yet (attn_dp_size=0)"),
+    ("attn_dp_size", -1, "attn_dp_size must be a positive int (got -1)"),
+    ("attn_dp_size", None, "attn_dp_size must be a positive int (got null)"),
+    ("attn_dp_size", True, "attn_dp_size must be a positive int (got true)"),
+    ("attn_dp_size", "2", "attn_dp_size must be a positive int (got 2)"),
+    ("attn_dp_size", 2.0, "attn_dp_size must be a positive int (got 2.0)"),
     ("dp_size", None, "data-parallel replicas are not supported (dp_size=null)"),
     ("dwdp_size", None, "DWDP is not supported (dwdp_size=null)"),
     ("dwdp_size", True, "DWDP is not supported (dwdp_size=true)"),
@@ -392,6 +430,9 @@ STAGE_S_MORE_REFUSALS = [
 ]
 # Values other than the default that pass.
 STAGE_S_ACCEPTED = [
+    # Any number of attention-DP ranks passes here; the layout is tested once the model config was read.
+    ("attn_dp_size", 2),
+    ("attn_dp_size", 8),
     ("dwdp_size", 0),
     ("scheduler_recv_interval", 0),
     ("scheduler_recv_interval", -1),
@@ -417,8 +458,49 @@ SGLANG_ENV_REFUSALS = [
     ("SGLANG_TEST_SCRIPTED_RUNTIME", "1", "SGLANG_TEST_SCRIPTED_RUNTIME is a test switch and must be unset"),
     ("SGLANG_SCHEDULER_MAX_RECV_PER_POLL", "0", _PER_POLL.format(0)),
     ("SGLANG_SCHEDULER_MAX_RECV_PER_POLL", "4", _PER_POLL.format(4)),
-    ("SGLANG_ENABLE_COLOCATED_BATCH_GEN", "1", _BLOCKER),
-    ("SGLANG_ENABLE_COLOCATED_BATCH_GEN", "TRUE", _BLOCKER),
+]
+# The variables whose meaning depends on the number of attention-DP ranks, which are tested after resolution:
+# (ranks, name, value, the whole refusal).
+_SKIP_GATHER = (
+    "SGLANG_SCHEDULER_SKIP_ALL_GATHER must be unset under DP attention: the ranks would not tell each other "
+    "what they run in a step"
+)
+_SPEC_COORDINATION = (
+    "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION must be unset under DP attention: it changes what a rank runs "
+    "in a step in which another rank extends"
+)
+DP_ENV_REFUSALS = [
+    (1, BLOCKER_ENV, "1", _BLOCKER),
+    (1, BLOCKER_ENV, "TRUE", _BLOCKER),
+    (1, BLOCKER_ENV, "true", _BLOCKER),
+    (2, "SGLANG_SCHEDULER_SKIP_ALL_GATHER", "1", _SKIP_GATHER),
+    (2, "SGLANG_SCHEDULER_SKIP_ALL_GATHER", "True", _SKIP_GATHER),
+    (4, "SGLANG_SCHEDULER_SKIP_ALL_GATHER", "y", _SKIP_GATHER),
+    (2, "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION", "yes", _SPEC_COORDINATION),
+    (3, "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION", "1", _SPEC_COORDINATION),
+]
+DP_ENV_ACCEPTED = [
+    # One rank: the blocker variable off or unreadable, and the two variables of DP attention, which SGLang
+    # does not look at with one rank.
+    (1, BLOCKER_ENV, "0"),
+    (1, BLOCKER_ENV, "false"),
+    (1, BLOCKER_ENV, "yes"),
+    (1, BLOCKER_ENV, ""),
+    (1, "SGLANG_SCHEDULER_SKIP_ALL_GATHER", "1"),
+    (1, "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION", "1"),
+    # Several ranks: whatever the blocker variable says, because the launcher sets it itself; and the two
+    # variables of DP attention off or unreadable.
+    (2, BLOCKER_ENV, "1"),
+    (2, BLOCKER_ENV, "TRUE"),
+    (2, BLOCKER_ENV, "0"),
+    (2, BLOCKER_ENV, "false"),
+    (2, BLOCKER_ENV, ""),
+    (2, "SGLANG_SCHEDULER_SKIP_ALL_GATHER", "0"),
+    (2, "SGLANG_SCHEDULER_SKIP_ALL_GATHER", "false"),
+    (2, "SGLANG_SCHEDULER_SKIP_ALL_GATHER", "maybe"),
+    (2, "SGLANG_SCHEDULER_SKIP_ALL_GATHER", ""),
+    (2, "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION", "no"),
+    (2, "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION", ""),
 ]
 SGLANG_ENV_ACCEPTED = [
     ("SGLANG_MAX_NEW_TOKENS_LIMIT", "7"),
@@ -675,6 +757,8 @@ class FakeBatch:
     extend_num_tokens: int | None = None
     prefix_lens: list | None = None
     extend_lens: list | None = None
+    # None without DP attention; with it, what every attention-DP rank runs in the step of this batch.
+    global_num_tokens: list | None = None
 
     def copy(self) -> FakeBatch:
         return dataclasses.replace(self, reqs=self.reqs[:])
@@ -700,12 +784,21 @@ class FakeResult:
 
 @dataclasses.dataclass
 class _FakeProcess:
-    """One FAKE scheduler process: its TP rank, its FAKE process id and the origin of its own FAKE clock."""
+    """One FAKE scheduler process: its TP rank, its FAKE process id and the origin of its own FAKE clock.
+
+    ``dp_rank`` is the attention-DP rank whose batches the process runs, 0 without DP attention.
+    """
 
     tp_rank: int
     pid: int
     clock_offset_ticks: int
     parallel: types.SimpleNamespace
+    dp_rank: int = 0
+
+
+def _fake_blocker_variable_is_on() -> bool:
+    """FAKE of how SGLang reads the variable of its input blocker: only true and 1 count, in any letter case."""
+    return os.environ.get(BLOCKER_ENV, "false").lower() in ("true", "1")
 
 
 class FakeBaseScheduler:
@@ -734,8 +827,9 @@ class FakeBaseScheduler:
             )
         )
         self.enable_overlap = True
-        # Only the process with TP rank 0 reads the request socket.
-        self.recv_from_tokenizer = object() if self.fake_process.tp_rank == 0 else None
+        # Only the process with attention-TP rank 0 reads a request socket: one process without DP attention,
+        # one for each attention-DP rank with it.
+        self.recv_from_tokenizer = object() if self.fake_process.parallel.attn_tp_rank == 0 else None
         self.disable_radix_cache = False
         self.is_hybrid_swa = False
         self.is_hybrid_ssm = False
@@ -748,7 +842,8 @@ class FakeBaseScheduler:
         self.prefill_delayer = None
         self.min_free_slots_delayer = None
         self.recv_skipper = None
-        self.input_blocker = None
+        # SGLang builds the blocker in every scheduler process, and only when the variable is on at that time.
+        self.input_blocker = object() if _fake_blocker_variable_is_on() else None
         for name, value in world.scheduler_attributes.items():
             setattr(self, name, value)
         self.forward_ct = 0
@@ -794,13 +889,27 @@ def _fake_sglang_modules(world: _FakeWorld) -> dict[str, types.ModuleType]:
 
     scheduler_module = module("sglang.srt.managers.scheduler", Scheduler=FakeBaseScheduler)
 
-    def run_scheduler_process(server_args, port_args, gpu_id, tp_rank, pp_rank, dp_rank, pipe_writer):
+    def run_scheduler_process(
+        server_args,
+        port_args,
+        gpu_id,
+        tp_rank,
+        pp_rank,
+        dp_rank,
+        pipe_writer,
+        display_tp_rank=None,
+        display_dp_rank=None,
+        display_moe_ep_rank=None,
+    ):
         """FAKE of SGLang's scheduler entry: apply the class replacement, build the scheduler, report it.
 
-        The real entry then runs the event loop for the life of the process. Here the fake engine keeps the
-        scheduler object and calls its two batch methods itself.
+        It takes the seven arguments SGLang's engine passes without DP attention and the three display ranks
+        that follow them when the process was started for an attention-DP rank. The real entry then runs the
+        event loop for the life of the process. Here the fake engine keeps the scheduler object and calls its
+        two batch methods itself.
         """
         world.entry_calls.append((gpu_id, tp_rank, pp_rank, dp_rank))
+        world.entry_displays.append((display_tp_rank, display_dp_rank, display_moe_ep_rank))
         stock = scheduler_module.Scheduler
         for target, hook, hook_type in registered:
             assert (target, hook_type) == ("sglang.srt.managers.scheduler.Scheduler", _FakeHookType.REPLACE)
@@ -827,14 +936,27 @@ def _fake_sglang_modules(world: _FakeWorld) -> dict[str, types.ModuleType]:
         parser.add_argument("--model-path", required=True)
         parser.add_argument("--tp-size", type=int, default=1)
         parser.add_argument("--ep-size", type=int, default=1)
+        parser.add_argument("--attn-dp-size", type=int, default=1)
+        parser.add_argument("--enable-dp-attention-local-control-broadcast", action="store_true")
+        parser.add_argument("--enable-dp-lm-head", action="store_true")
+        parser.add_argument("--enable-tokenizer-batch-encode", action="store_true")
+        parser.add_argument("--load-balance-method", default="auto")
         parser.add_argument("--page-size", type=int, default=1)
         parser.add_argument("--stream-interval", type=int, default=1)
         parser.add_argument(STREAMING_FLAG, action="store_true")
         parsed = parser.parse_args(argv)
         world.sglang_argv = list(argv)
         # The FAKE engine follows the flags, so a flag that does not reach this parser shows in the run.
-        world.use(parsed.page_size, parsed.tp_size)
+        world.use(parsed.page_size, parsed.tp_size, parsed.attn_dp_size)
         world.resolved["ep_size"] = parsed.ep_size
+        world.resolved["enable_dp_attention_local_control_broadcast"] = (
+            parsed.enable_dp_attention_local_control_broadcast
+        )
+        world.resolved["enable_dp_lm_head"] = parsed.enable_dp_lm_head
+        world.resolved["enable_tokenizer_batch_encode"] = parsed.enable_tokenizer_batch_encode
+        # FAKE of SGLang's resolution: ``auto`` becomes ``round_robin`` outside disaggregated serving.
+        method = parsed.load_balance_method
+        world.resolved["load_balance_method"] = "round_robin" if method == "auto" else method
         world.resolved["stream_interval"] = parsed.stream_interval
         world.resolved["incremental_streaming_output"] = parsed.incremental_streaming_output
         world.server_args = FakeSglangServerArgs(world, list(argv))
@@ -859,6 +981,8 @@ def _fake_sglang_modules(world: _FakeWorld) -> dict[str, types.ModuleType]:
 
         It has the seam (``run_scheduler_process_func``, read through ``self``), an event loop of its own,
         ``async_generate`` in its batch form with a stream of chunks, a tokenizer manager, and ``shutdown``.
+        Under DP attention the stream of a batch call has the same form; the FAKE engine behind it deals the
+        requests to the ranks.
         """
 
         run_scheduler_process_func = staticmethod(run_scheduler_process)
@@ -885,7 +1009,7 @@ def _fake_sglang_modules(world: _FakeWorld) -> dict[str, types.ModuleType]:
 
         async def _fake_stream(self, prompts, rids, max_new_tokens):
             """FAKE stream of a batch call: one chunk per request and output token, requests interleaved."""
-            fault = world.call_faults.get(_FakeCall(prompts, rids, max_new_tokens, None, []).key)
+            fault = world.call_faults.get(_FakeCall(prompts, rids, max_new_tokens, None, []).key, "").partition("@")[0]
             if fault == "sglang_exit":
                 # FAKE of SGLang after SIGTERM: a task of its own on the loop ends the process with sys.exit(0).
                 async def fake_sigterm_watchdog() -> None:
@@ -901,19 +1025,24 @@ def _fake_sglang_modules(world: _FakeWorld) -> dict[str, types.ModuleType]:
                         finish = {"type": "length", "length": max_new_tokens}
                         if fault == "abort" and index == 0:
                             finish = {"type": "abort", "message": "FAKE abort", "status_code": 400, "err_type": None}
-                    yield {
-                        "index": index,
-                        "text": "",
-                        "output_ids": [step - 1],
-                        "meta_info": {
-                            "id": response["rid"],
-                            "finish_reason": finish,
-                            "prompt_tokens": response["prompt_tokens"],
-                            "cached_tokens": response["cached_tokens"],
-                            "completion_tokens": step,
-                            "num_retractions": 0,
-                        },
+                    meta_info = {
+                        "id": response["rid"],
+                        "finish_reason": finish,
+                        "prompt_tokens": response["prompt_tokens"],
+                        "cached_tokens": response["cached_tokens"],
+                        "completion_tokens": step,
+                        "num_retractions": 0,
                     }
+                    # SGLang sets the key in every chunk: the rank under DP attention, None without a DP
+                    # controller. A test can make the FAKE an SGLang whose chunks name no rank, or name it
+                    # as text.
+                    if world.rank_in_chunks == "as SGLang reports it":
+                        meta_info["dp_rank"] = response["dp_rank"]
+                    elif world.rank_in_chunks == "as text":
+                        meta_info["dp_rank"] = str(response["dp_rank"])
+                    else:
+                        assert world.rank_in_chunks == "no key"
+                    yield {"index": index, "text": "", "output_ids": [step - 1], "meta_info": meta_info}
 
         def get_all_child_pids(self) -> list[int]:
             return [process.pid for process in world.processes]
@@ -1095,7 +1224,11 @@ class _FakeCall:
     rids: list[str]
     max_new_tokens: int
     timeout_seconds: object
+    # The modes of the FAKE batches attention-DP rank 0 ran for the call; without DP attention that is all.
     modes: list[str]
+    # The attention-DP rank each request ran on, and the modes of the FAKE batches each rank ran for the call.
+    ranks: list[int] = dataclasses.field(default_factory=list)
+    rank_modes: list[list[str]] = dataclasses.field(default_factory=list)
 
     @property
     def key(self) -> tuple[int, str, int]:
@@ -1104,7 +1237,11 @@ class _FakeCall:
 
 
 def _fake_limits(page_size: int) -> grid.Limits:
-    """Small FAKE limits that grow with the page size and admit the 256-token warm-up prompt."""
+    """Small FAKE limits that grow with the page size and admit the 256-token warm-up prompt.
+
+    They are the limits of one scheduler, so under DP attention of one attention-DP rank: every FAKE rank
+    reports the same record.
+    """
     unit = grid.cached_unit(page_size)
     return grid.Limits(
         page_size=page_size,
@@ -1121,12 +1258,14 @@ def _fake_limits(page_size: int) -> grid.Limits:
 class _FakeWorld:
     """Everything FAKE of one launch, and a note of what the launcher did with it."""
 
-    def __init__(self, page_size: int = 1, tp_size: int = 1) -> None:
+    def __init__(self, page_size: int = 1, tp_size: int = 1, dp_size: int = 1) -> None:
         self.clock = _FakeClock()
         self.limits = _fake_limits(page_size)
+        # The number of FAKE scheduler processes, and the number of attention-DP ranks they form.
         self.tp_size = tp_size
+        self.dp_size = dp_size
         self.version = FAKE_SGLANG_VERSION
-        self.resolved = {**FAKE_RESOLVED_ARGUMENTS, "tp_size": tp_size}
+        self.resolved = {**FAKE_RESOLVED_ARGUMENTS, "tp_size": tp_size, "attn_dp_size": dp_size}
         self.platform = {"is_cuda": True, "is_hip": False}
         self.experts: dict = {}
         self.vocabulary = {"size": FAKE_VOCABULARY["size"], "excluded": list(FAKE_VOCABULARY["excluded"])}
@@ -1162,12 +1301,24 @@ class _FakeWorld:
         self.tasks: list = []
         self.entry: object = None
         self.entry_calls: list[tuple] = []
+        # The three display ranks each call of the entry carried after its seven arguments, or three None.
+        self.entry_displays: list[tuple] = []
         self.processes: list[_FakeProcess] = []
         self.current_process: _FakeProcess | None = None
         self.schedulers: list = []
         self.calls: list[_FakeCall] = []
+        # FAKE scheduler steps so far. Every FAKE scheduler process runs one batch in each of them.
         self.batches_run = 0
-        self.cache = PageCacheModel(page_size)
+        # One FAKE prefix cache for each attention-DP rank.
+        self.caches = [PageCacheModel(page_size) for _rank in range(dp_size)]
+        # FAKE of the counter of SGLang's DP controller: the rank the next request without a rank goes to.
+        self.round_robin = 0
+        # How the chunks of the FAKE sglang package name the rank of a request: "as SGLang reports it",
+        # "no key" or "as text".
+        self.rank_in_chunks = "as SGLang reports it"
+        # FAKE: whether the prefill graphs of every rank can replay any step, which is what lets SGLang turn
+        # a decode batch into an extend batch under DP attention.
+        self.prefill_graphs_replay = True
         self.gpu_free_ticks = 0
         self.step_done_ticks = 0
         self.shutdowns = 0
@@ -1181,12 +1332,19 @@ class _FakeWorld:
         if name in self.raises:
             raise self.raises[name]
 
-    def use(self, page_size: int, tp_size: int) -> None:
-        """Make the FAKE engine one with this page size and this many scheduler processes."""
+    def use(self, page_size: int, tp_size: int, dp_size: int = 1) -> None:
+        """Make the FAKE engine one with this page size, this many scheduler processes and this many ranks."""
         self.limits = _fake_limits(page_size)
-        self.cache = PageCacheModel(page_size)
         self.tp_size = tp_size
+        self.dp_size = dp_size
+        self.caches = [PageCacheModel(page_size) for _rank in range(dp_size)]
         self.resolved["tp_size"] = tp_size
+        self.resolved["attn_dp_size"] = dp_size
+
+    def fake_eviction(self, ranks: tuple[int, ...] | None = None) -> None:
+        """FAKE fault: the engine needed room and dropped every cache entry, on all ranks or on some."""
+        for rank in range(self.dp_size) if ranks is None else ranks:
+            self.caches[rank] = PageCacheModel(self.limits.page_size)
 
     # -- FAKE clocks
 
@@ -1207,32 +1365,66 @@ class _FakePipeWriter:
         self.sent.append(message)
 
 
+def _fake_step_tokens(batch: dict) -> int:
+    """What SGLang counts for one rank in one step: computed tokens, decoding requests, or 0 for an idle rank."""
+    if batch["mode"] == "EXTEND":
+        return sum(batch["extend_lens"])
+    return len(batch["rids"]) if batch["mode"] == "DECODE" else 0
+
+
+# The key of a FAKE batch that marks a decode step the FAKE engine ran as an extend batch. It is no field of
+# SGLang's batch.
+FAKE_DECODE_STEP = "fake_decode_step"
+
+
 class _FakeEngine:
-    """Stands in for SGLang's engine and its scheduler processes. Everything it reports is FAKE."""
+    """Stands in for SGLang's engine and its scheduler processes. Everything it reports is FAKE.
+
+    With ``world.dp_size`` above 1 it is an engine with DP attention; the module docstring says what that
+    fakes. A fault of ``world.call_faults`` that is about one attention-DP rank names it, ``"evict@1"``.
+    """
 
     def __init__(self, world: _FakeWorld, server_args: _FakeServerArgs, scheduler_entry) -> None:
         self.world = world
         world.entry = scheduler_entry
         writer = _FakePipeWriter()
+        dp_size = world.dp_size
+        # SGLang: a rank has tp_size // attn_dp_size scheduler processes, and the TP rank of a process says
+        # which rank it belongs to and which place it has inside it.
+        assert world.tp_size % dp_size == 0, "FAKE of SGLang's own refusal: tp_size is no multiple of attn_dp_size"
+        processes_per_rank = world.tp_size // dp_size
+        expert_groups = world.resolved.get("ep_size")
+        expert_groups = expert_groups if type(expert_groups) is int and 0 < expert_groups <= world.tp_size else 1
         for tp_rank in range(world.tp_size):
+            dp_rank = tp_rank // processes_per_rank
             parallel = types.SimpleNamespace(
                 tp_size=world.tp_size,
                 pp_size=1,
-                attn_dp_size=1,
-                attn_dp_enabled=False,
-                attn_tp_rank=tp_rank,
+                attn_dp_size=dp_size,
+                attn_dp_enabled=dp_size > 1,
+                attn_tp_rank=tp_rank % processes_per_rank,
                 attn_cp_rank=0,
-                attn_dp_rank=0,
+                attn_dp_rank=dp_rank,
                 pp_rank=0,
                 pp_max_micro_batch_size=world.limits.max_running_requests,
             )
             # Every FAKE process has a clock origin of its own, as the monotonic clocks of real processes do.
-            process = _FakeProcess(tp_rank, FAKE_FIRST_PID + tp_rank, (tp_rank + 1) * 1000 * TICKS_PER_SECOND, parallel)
+            offset = (tp_rank + 1) * 1000 * TICKS_PER_SECOND
+            process = _FakeProcess(tp_rank, FAKE_FIRST_PID + tp_rank, offset, parallel, dp_rank)
             world.processes.append(process)
             world.current_process = process
-            # SGLang's engine passes seven positional arguments when no DP controller is in the way:
-            # server_args, port_args, gpu_id, tp_rank, pp_rank, dp_rank (None) and the pipe writer.
-            scheduler_entry(server_args, FAKE_PORT_ARGS, tp_rank, tp_rank, 0, None, writer)
+            if dp_size > 1:
+                # Under DP attention SGLang starts the entry in a scheduler process with ten positional
+                # arguments: the DP rank in the place of None, and after the pipe the three ranks it shows in
+                # its log lines.
+                expert_rank = tp_rank // (world.tp_size // expert_groups)
+                scheduler_entry(
+                    server_args, FAKE_PORT_ARGS, tp_rank, tp_rank, 0, dp_rank, writer, tp_rank, dp_rank, expert_rank
+                )
+            else:
+                # SGLang's engine passes seven positional arguments when no DP controller is in the way:
+                # server_args, port_args, gpu_id, tp_rank, pp_rank, dp_rank (None) and the pipe writer.
+                scheduler_entry(server_args, FAKE_PORT_ARGS, tp_rank, tp_rank, 0, None, writer)
         world.schedulers = list(writer.sent)
 
     # -- the FAKE scheduler loop
@@ -1241,7 +1433,8 @@ class _FakeEngine:
         """Extend batches filled up to the chunk budget, then one decode batch for every further output token.
 
         A request is charged its uncached tokens rounded up to whole pages. A request that does not fit what is
-        left of the budget is cut: the part that fits goes into this batch and the rest into the next ones.
+        left of the budget is cut: the part that fits goes into this batch and the rest into the next ones. A
+        rank that got no request of a call forms no batch.
         """
         page, chunk = self.world.limits.page_size, self.world.limits.chunked_prefill_size
         batches: list[dict] = []
@@ -1265,43 +1458,105 @@ class _FakeEngine:
                     room = chunk
         if current["rids"]:
             batches.append(current)
-        batches.extend({"mode": "DECODE", "rids": list(rids)} for _step in range(output_tokens - 1))
+        if rids:
+            batches.extend({"mode": "DECODE", "rids": list(rids)} for _step in range(output_tokens - 1))
         return batches
 
-    def _run_batches(self, batches: list[dict], stage: str) -> None:
-        """Run the FAKE batches of one call on every FAKE scheduler process, in the order of the overlap loop.
+    def _fake_decode_to_extend(self, rank_batches: list[list[dict]], prompt_tokens: dict[str, int]) -> None:
+        """FAKE of what SGLang does to a rank that decodes in a step in which another rank extends.
 
-        In one pass SGLang's overlap loop runs the next batch first and processes the result of the batch
-        before it second. The result is processed on a copy of the batch.
+        Under DP attention SGLang turns such a decode batch into an extend batch, unless a rank idles in the
+        step (srt/managers/scheduler_components/dp_attn.py
+        ``SchedulerDPAttnAdapter.maybe_convert_decode_to_extend``). The batch keeps its requests and its token
+        count of the step. Its mode becomes ``EXTEND``, every request computes one token after everything it
+        holds so far, and ``extend_num_tokens`` is the number of requests (srt/managers/schedule_batch.py
+        ``ScheduleBatch.convert_decode_to_extend``). SGLang does it only when every rank reports that its
+        prefill graphs can replay the step (the vote in ``prepare_mlp_sync_batch_raw``); FAKE: the ranks
+        report what ``world.prefill_graphs_replay`` says, for every step alike. Read in the source at both
+        tags; no engine showed such a batch.
+
+        The batches are changed in place, so that the modes a test reads off a call are the ones the FAKE
+        schedulers ran. Without DP attention nothing is changed.
+        """
+        if self.world.dp_size == 1 or not self.world.prefill_graphs_replay:
+            return
+        for step in range(max(len(batches) for batches in rank_batches)):
+            row = [batches[step] if step < len(batches) else {"mode": "IDLE", "rids": []} for batches in rank_batches]
+            modes = {batch["mode"] for batch in row}
+            if "EXTEND" not in modes or "IDLE" in modes:
+                continue
+            for batches, batch in zip(rank_batches, row, strict=True):
+                if batch["mode"] != "DECODE":
+                    continue
+                # The decode step with zero-based index i reads the prompt and the i output tokens before it.
+                steps_before = [
+                    earlier["mode"] == "DECODE" or FAKE_DECODE_STEP in earlier for earlier in batches[:step]
+                ]
+                done = sum(steps_before)
+                rids = list(batch["rids"])
+                batches[step] = {
+                    "mode": "EXTEND",
+                    "rids": rids,
+                    "prefix_lens": [prompt_tokens[rid] + done for rid in rids],
+                    "extend_lens": [1] * len(rids),
+                    FAKE_DECODE_STEP: True,
+                }
+
+    def _run_batches(self, rank_batches: list[list[dict]], stage: str) -> None:
+        """Run the FAKE batches of one call, step by step, in the order of the overlap loop.
+
+        ``rank_batches`` holds the batches of every attention-DP rank. In one step every rank runs its next
+        batch, or an idle one when it has none left, on each of its FAKE scheduler processes. In one pass
+        SGLang's overlap loop runs the next batch first and processes the result of the batch before it
+        second. The result is processed on a copy of the batch.
         """
         world = self.world
+        size = world.dp_size
         waiting: list = [None] * len(world.schedulers)
-        last_extend: dict = {}
-        decode_step = 0
-        for batch in batches:
-            if batch["mode"] == "EXTEND":
-                computed = sum(batch["extend_lens"])
-                ticks = FAKE_EXTEND_BASE_TICKS + computed + (FAKE_WARM_SHOT_EXTRA_TICKS if stage == "warm" else 0)
-                last_extend = {
-                    "extend_num_tokens": computed,
-                    "prefix_lens": list(batch["prefix_lens"]),
-                    "extend_lens": list(batch["extend_lens"]),
-                }
-            else:
-                tenths = FAKE_DECODE_STEP_TENTHS[decode_step % len(FAKE_DECODE_STEP_TENTHS)]
-                ticks = (FAKE_DECODE_BASE_TICKS + len(batch["rids"])) * tenths
-                decode_step += 1
-            # FAKE GPU: it runs one batch after the other.
+        last_extend: list[dict] = [{} for _rank in range(size)]
+        decode_steps = [0] * size
+        for step in range(max(len(batches) for batches in rank_batches)):
+            row = []
+            ticks = 0
+            for rank, batches in enumerate(rank_batches):
+                batch = batches[step] if step < len(batches) else {"mode": "IDLE", "rids": []}
+                row.append(batch)
+                if batch["mode"] == "EXTEND":
+                    computed = sum(batch["extend_lens"])
+                    rank_ticks = FAKE_EXTEND_BASE_TICKS + computed
+                    rank_ticks += FAKE_WARM_SHOT_EXTRA_TICKS if stage == "warm" else 0
+                    # A decode step that runs as an extend batch gets its three extend fields anew, as SGLang
+                    # binds them anew on the batch object, and the decode batches after it carry those.
+                    last_extend[rank] = {
+                        "extend_num_tokens": computed,
+                        "prefix_lens": list(batch["prefix_lens"]),
+                        "extend_lens": list(batch["extend_lens"]),
+                    }
+                    decode_steps[rank] += 1 if FAKE_DECODE_STEP in batch else 0
+                elif batch["mode"] == "DECODE":
+                    tenths = FAKE_DECODE_STEP_TENTHS[decode_steps[rank] % len(FAKE_DECODE_STEP_TENTHS)]
+                    rank_ticks = (FAKE_DECODE_BASE_TICKS + len(batch["rids"])) * tenths
+                    decode_steps[rank] += 1
+                else:
+                    rank_ticks = 0  # a FAKE idle batch has no work of its own
+                # The ranks run a step together: it takes as long as the slowest of them.
+                ticks = max(ticks, rank_ticks)
+            # Under DP attention every batch of a step carries what every rank runs in it.
+            tokens = [_fake_step_tokens(batch) for batch in row] if size > 1 else None
+            # FAKE GPU: it runs one step after the other.
             world.step_done_ticks = world.gpu_free_ticks = max(world.gpu_free_ticks, world.clock.ticks) + ticks
             world.batches_run += 1
             queued = []
             for scheduler in world.schedulers:
                 world.current_process = scheduler.fake_process
+                rank = scheduler.fake_process.dp_rank
+                batch = row[rank]
                 # A decode batch still carries the extend fields of the extend batch its object came from.
                 fake_batch = FakeBatch(
                     reqs=[FakeRequest(rid) for rid in batch["rids"]],
                     forward_mode=FakeForwardMode[batch["mode"]],
-                    **last_extend,
+                    global_num_tokens=None if tokens is None else list(tokens),
+                    **last_extend[rank],
                 )
                 # As in SGLang's loop: the batch is run first, and the copy is taken after that.
                 result = scheduler.run_batch(fake_batch)
@@ -1326,7 +1581,7 @@ class _FakeEngine:
         if world.sglang_takes_sigterm and len(world.calls) == 1:
             # FAKE of what SGLang does at its first request: it puts a handler of its own on SIGTERM.
             signal.signal(signal.SIGTERM, world.fake_sglang_sigterm_handler)
-        fault = world.call_faults.get(call.key)
+        fault, _, named_rank = world.call_faults.get(call.key, "").partition("@")
         if fault == "system_exit":
             raise SystemExit(0)
         if fault == "keyboard_interrupt":
@@ -1336,18 +1591,42 @@ class _FakeEngine:
         if fault == "engine_error":
             raise compat.EngineCallError("FAKE: the engine call timed out")
         if fault == "evict":
-            world.cache = PageCacheModel(world.limits.page_size)
+            world.fake_eviction((int(named_rank),) if named_rank else None)
+        if fault == "stray_request":
+            # FAKE: a request that is not the benchmark's reached the DP controller before this call and took
+            # the turn of one rank.
+            world.round_robin = (world.round_robin + 1) % world.dp_size
 
-        # A call is one batch of arrivals: every request is matched against the cache before any is stored.
-        cached = [world.cache.cached(prompt) for prompt in call.prompts]
-        batches = self._fake_batches(call.rids, call.prompts, cached, max_new_tokens)
-        call.modes.extend(batch["mode"] for batch in batches)
-        self._run_batches(batches, call.key[1])
-        for prompt in call.prompts:
+        # FAKE placement. The call names no rank, so each request goes to the next rank in turn, from where
+        # the request before it left off. Without DP attention that is rank 0 for all.
+        size = world.dp_size
+        call.ranks = [(world.round_robin + index) % size for index in range(len(call.rids))]
+        world.round_robin = (world.round_robin + len(call.rids)) % size
+        # A call is one batch of arrivals: every request is matched against the cache of its rank before any
+        # is stored.
+        cached = [world.caches[rank].cached(prompt) for rank, prompt in zip(call.ranks, call.prompts, strict=True)]
+        rank_batches = []
+        for rank in range(size):
+            mine = [index for index, ran_on in enumerate(call.ranks) if ran_on == rank]
+            rank_batches.append(
+                self._fake_batches(
+                    [call.rids[index] for index in mine],
+                    [call.prompts[index] for index in mine],
+                    [cached[index] for index in mine],
+                    max_new_tokens,
+                )
+            )
+        self._fake_decode_to_extend(
+            rank_batches, {rid: len(prompt) for rid, prompt in zip(call.rids, call.prompts, strict=True)}
+        )
+        call.modes.extend(batch["mode"] for batch in rank_batches[0])
+        call.rank_modes = [[batch["mode"] for batch in batches] for batches in rank_batches]
+        self._run_batches(rank_batches, call.key[1])
+        for rank, prompt in zip(call.ranks, call.prompts, strict=True):
             # A finished request stores its prompt and the generated tokens that have KV: all but the last.
             # The FAKE output tokens are negative numbers, so they equal no token id: not an allocated one, not
             # a seeded one and not an id of a text, which the pool keeps from 0 upwards.
-            world.cache.finish_prefill([*prompt, *range(-1, -max_new_tokens, -1)])
+            world.caches[rank].finish_prefill([*prompt, *range(-1, -max_new_tokens, -1)])
         if fault == "deadline":
             world.clock.advance(FAKE_TIMEOUT_SECONDS * TICKS_PER_SECOND)
         return [
@@ -1358,8 +1637,11 @@ class _FakeEngine:
                 "completion_tokens": max_new_tokens,
                 "finish_type": "length",
                 "num_retractions": 0,
+                # Under DP attention an answer names the rank its request ran on; without it SGLang reports
+                # none.
+                "dp_rank": rank if size > 1 else None,
             }
-            for rid, prompt, hit in zip(call.rids, call.prompts, cached, strict=True)
+            for rid, prompt, hit, rank in zip(call.rids, call.prompts, cached, call.ranks, strict=True)
         ]
 
 
@@ -1526,10 +1808,12 @@ def _process_state(monkeypatch, tmp_path):
             monkeypatch.delenv(name)
     monkeypatch.setattr(launcher.urllib.request, "urlopen", _refuse_the_network)
     monkeypatch.setattr(launcher, "DEFAULT_DATASET_CACHE_DIR", str(tmp_path / "FAKE-default-cache"))
-    # The launcher sets this variable for the life of its process. Setting and deleting it here makes pytest
-    # take the launcher's value out again after the test.
-    monkeypatch.setenv(RECORDER_ENV, "")
-    monkeypatch.delenv(RECORDER_ENV)
+    # The launcher sets these variables for the life of its process: the first in every launch, the second
+    # in a launch with several attention-DP ranks. Setting and deleting them here makes pytest take the
+    # launcher's values out again after the test.
+    for name in (RECORDER_ENV, BLOCKER_ENV):
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
     saved = {signum: signal.getsignal(signum) for signum in (signal.SIGTERM, signal.SIGINT)}
     yield
     for signum, handler in saved.items():
@@ -1560,6 +1844,14 @@ class _Launch:
     def merged_path(self) -> Path:
         return self.pod / "benchmark_merged.json"
 
+    def rank_paths(self, dp_size: int) -> list[Path]:
+        """The rank files of a run with ``dp_size`` attention-DP ranks, typed here on their own."""
+        return [self.rank_path, *(self.pod / f"benchmark_dp{rank}.json" for rank in range(1, dp_size))]
+
+    def result_files(self) -> list[str]:
+        """The names of the result files in the pod directory, as the collector would sweep them."""
+        return sorted(path.name for path in self.pod.glob("benchmark*.json"))
+
     def artifact(self) -> dict:
         return json.loads(self.rank_path.read_text(encoding="utf-8"))
 
@@ -1586,6 +1878,7 @@ def _launch(
     *,
     page_size: int = 1,
     tp_size: int = 1,
+    dp_size: int = 1,
     flags: tuple | list = (),
     env: dict | None = None,
     prepare=None,
@@ -1597,10 +1890,11 @@ def _launch(
 ) -> _Launch:
     """Lay out a pod, put the fakes in place and call ``launcher.main`` with the flags of a small run.
 
-    With ``real_compat`` the FAKE engine gets its page size and its TP size from the flags alone, through the
-    FAKE parser of the FAKE ``sglang`` package.
+    ``tp_size`` is the number of FAKE scheduler processes and ``dp_size`` the number of attention-DP ranks
+    they form. With ``real_compat`` the FAKE engine gets its page size and both sizes from the flags alone,
+    through the FAKE parser of the FAKE ``sglang`` package.
     """
-    world = _FakeWorld() if real_compat else _FakeWorld(page_size, tp_size)
+    world = _FakeWorld() if real_compat else _FakeWorld(page_size, tp_size, dp_size)
     cell, pod_dir = _new_pod(tmp_path, mode) if pod is None else pod
     if prepare is not None:
         prepare(world, pod_dir)
@@ -1617,7 +1911,7 @@ def _launch(
         str(FAKE_TIMEOUT_SECONDS),
         *(SMALL_CAP_FLAGS if cap_flags is None else cap_flags),
         *flags,
-        *_fake_sglang_argv(page_size, tp_size),
+        *_fake_sglang_argv(page_size, tp_size, dp_size),
     ]
     code = launcher.main(argv)
     return _Launch(code, world, mode, cell, tmp_path, pod_dir, caps, manifest)
@@ -1791,9 +2085,22 @@ def _tep_cell(mode: str, tp_size: int = 2):
     return dataclasses.replace(cell, topology=topology)
 
 
-def _fake_sglang_argv(page_size: int = 1, tp_size: int = 1) -> list[str]:
-    """Flags of SGLang's own parser, which the launcher has to hand on."""
-    return ["--model-path", "fake/dense-model", "--page-size", str(page_size), "--tp-size", str(tp_size)]
+def _dep_cell(mode: str, dp_size: int = 2):
+    """A cell of the layout AISim plans as ``dep``: ``dp_size`` GPUs, each one data-parallel rank and one
+    expert group."""
+    cell = _cell(phase=mode, dp=dp_size, strategy="dep")
+    topology = cell.topology
+    assert (topology.tp, topology.dp, topology.moe_tp, topology.moe_ep) == (1, dp_size, 1, dp_size)
+    return cell
+
+
+def _fake_sglang_argv(page_size: int = 1, tp_size: int = 1, dp_size: int = 1) -> list[str]:
+    """Flags of SGLang's own parser, which the launcher has to hand on.
+
+    ``--attn-dp-size`` is among them only above 1, as the cell builder writes it.
+    """
+    argv = ["--model-path", "fake/dense-model", "--page-size", str(page_size), "--tp-size", str(tp_size)]
+    return [*argv, "--attn-dp-size", str(dp_size)] if dp_size > 1 else argv
 
 
 def _planned(mode: str, page_size: int = 1) -> grid.Grid:
@@ -1949,6 +2256,12 @@ def test_end_to_end_run_passes_the_validator_and_the_gate(tmp_path, monkeypatch,
     decode_lines = [line for line in lines[1:] if line["mode"] == "DECODE"]
     assert all(line["extend_num_tokens"] is line["prefix_lens"] is line["extend_lens"] is None for line in decode_lines)
     assert bool(decode_lines)
+    # Without DP attention the FAKE batches hold no token counts of other ranks, and no rank ever idles.
+    assert all(line["global_num_tokens"] is None and line["mode"] != "IDLE" for line in lines[1:])
+    # The entry was called with SGLang's seven arguments: no display rank followed the pipe.
+    assert world.entry_displays == [(None, None, None)]
+    # Every answer of the FAKE engine named no rank, and every request ran on the one rank there is.
+    assert {rank for call in world.calls for rank in call.ranks} == {0}
 
     # What reached the FAKE engine class: one streamed batch call per stage, with three sampling settings and
     # no other request field.
@@ -1993,15 +2306,20 @@ def test_end_to_end_run_passes_the_validator_and_the_gate(tmp_path, monkeypatch,
         "sglang_version": "0.5.23",
         "enable_nvidia_megakernel": False,
         "tp_size": 1,
+        # One attention-DP rank: the size is written all the same, and nothing else about DP attention.
+        "attn_dp_size": 1,
         # A model without expert layers: no expert key, and no layout of expert layers to record.
         "expert_keys": {},
         "moe": None,
     }
     assert set(producer) == {*LAUNCHER_PRODUCER_KEYS, *DRIVER_PRODUCER_KEYS, "name", "artifact_format"}
+    assert DP_PRODUCER_KEY not in producer and producer["staging"] == "one_batch_call"
+    # The launcher left SGLang's blocker variable alone, and no FAKE scheduler has a blocker.
+    assert BLOCKER_ENV not in os.environ and lines[0]["checks"]["input_blocker"] is False
     # A run with seeded ids writes the content block it always wrote.
     assert set(producer["content"]) == {"source", "seed", "token_range", "issued"}
     assert (producer["content"]["source"], producer["content"]["seed"]) == ("seeded_token_ids", "0")
-    assert (producer["name"], producer["scheduler_processes"], producer["recorder_format"]) == ("aisim_sglbench", 1, 1)
+    assert (producer["name"], producer["scheduler_processes"], producer["recorder_format"]) == ("aisim_sglbench", 1, 2)
     assert (producer["limits"], producer["page_size"]) == (world.limits.as_dict(), page_size)
     assert (producer["enable_overlap"], producer["restaged_points"]) == (True, [])
     assert producer["content"]["token_range"] == FAKE_TOKEN_RANGE
@@ -2096,7 +2414,8 @@ def test_end_to_end_with_a_points_manifest(tmp_path, monkeypatch):
     _assert_no_module_of_the_benchmark_is_replaced()
     on_disk = _assert_accepted(launch)
     built = launch.planned()
-    # The file's points in the file's order, each stamped explicit; the caps on the command line are ignored.
+    # The file's points in the file's order, each stamped explicit; the caps on the command line are ignored,
+    # and the generated axes add nothing: no point of 1 or of 2 new tokens per request stands beside them.
     assert [(point.batch_size, point.new_tokens, point.cached_tokens) for point in built.points] == [
         (2, 32, 32),
         (1, 5, 0),
@@ -2998,6 +3317,7 @@ def test_every_field_the_launcher_tests_has_a_refused_value_here():
     # The fields the launcher reads besides: the platform, the three run settings, the recorded field, the
     # expert-parallel size, which is tested against the TP size and the model, and the runner of the expert
     # layers, which is recorded for a model that has them.
+    # Four more are read only in a run with several attention-DP ranks.
     assert set(FAKE_RESOLVED_ARGUMENTS) - set(tested) == {
         "device",
         "tp_size",
@@ -3006,6 +3326,7 @@ def test_every_field_the_launcher_tests_has_a_refused_value_here():
         "enable_nvidia_megakernel",
         "ep_size",
         "moe_runner_backend",
+        *DP_ONLY_FIELDS,
     }
 
 
@@ -3423,10 +3744,31 @@ OTHER_FILES = {
     "runtime-preflight.json": b"{}",
     "engine.stdout.log": b"out\n",
     "engine.stderr.log": b"err\n",
-    "benchmark_dp1.json": b'{"not": "ours"}',
     "benchmark_merged_worker_probe.json": b'{"not": "ours"}',
     "resolved-config-node7.json": b'{"not": "ours"}',
     "sglbench-recorder/older-run/sched-1.jsonl": b'{"type":"header"}\n',
+    # Names that look like the file of an attention-DP rank and are none: no digits, more than digits, another
+    # stem, another ending, the merged file of another stem, and a rank file in another directory.
+    "benchmark_dp.json": b'{"not": "ours"}',
+    "benchmark_dpx.json": b'{"not": "ours"}',
+    "benchmark_dp1x.json": b'{"not": "ours"}',
+    "benchmark_dp-1.json": b'{"not": "ours"}',
+    "benchmark_dp1.json.bak": b'{"not": "ours"}',
+    "benchmark_dp1_merged.json": b'{"not": "ours"}',
+    "other_dp1.json": b'{"not": "ours"}',
+    "xbenchmark_dp1.json": b'{"not": "ours"}',
+    "benchmark_dp1": b'{"not": "ours"}',
+    "older/benchmark_dp1.json": b'{"not": "ours"}',
+}
+# What an earlier run in the same directory can have left: the file of every attention-DP rank it had, and the
+# merged file. The launcher deletes all of them, whatever the number of ranks of the new run is.
+STALE_RESULT_FILES = {
+    "benchmark.json": b'{"stale": "rank 0"}',
+    "benchmark_merged.json": b'{"stale": "merged"}',
+    "benchmark_dp1.json": b'{"stale": "rank 1"}',
+    "benchmark_dp2.json": b'{"stale": "rank 2"}',
+    "benchmark_dp13.json": b'{"stale": "rank 13"}',
+    "benchmark_dp007.json": b'{"stale": "digits"}',
 }
 
 
@@ -3437,8 +3779,8 @@ def test_only_the_launchers_own_old_files_are_deleted(tmp_path, monkeypatch, fai
         if data is not None:
             (pod_dir / name).parent.mkdir(parents=True, exist_ok=True)
             (pod_dir / name).write_bytes(data)
-    (pod_dir / "benchmark.json").write_bytes(b'{"stale": "rank"}')
-    (pod_dir / "benchmark_merged.json").write_bytes(b'{"stale": "merged"}')
+    for name, data in STALE_RESULT_FILES.items():
+        (pod_dir / name).write_bytes(data)
     before = {name: (pod_dir / name).read_bytes() for name in OTHER_FILES}
     seen = {}
 
@@ -3451,13 +3793,16 @@ def test_only_the_launchers_own_old_files_are_deleted(tmp_path, monkeypatch, fai
     env = {"DYN_BENCH_PREFILL_CONTENT": "random"} if failing else None
     launch = _launch(tmp_path, monkeypatch, "prefill", prepare=prepare, pod=(cell, pod_dir), env=env)
 
-    # Both old result files were gone before SGLang was touched; nothing else was.
-    assert seen["at_start"] == ["benchmark_dp1.json", "benchmark_merged_worker_probe.json"]
+    # Every old result file was gone before SGLang was touched, the files of the other ranks included, and
+    # nothing else was: what is left starts with the same word and is not the launcher's.
+    assert seen["at_start"] == sorted(name for name in OTHER_FILES if name.startswith("benchmark"))
     assert {name: (pod_dir / name).read_bytes() for name in OTHER_FILES} == before
     assert launch.code == (64 if failing else 0)
     assert launch.artifact()["status"] == ("failed" if failing else "complete")
-    # A failed run has no merged file, also not the stale one.
+    # A failed run has no merged file, also not the stale one. This run has one rank, and no file of another
+    # rank is left beside its own.
     assert launch.merged_path.exists() is not failing
+    assert not [name for name in STALE_RESULT_FILES if name.startswith("benchmark_dp") and (pod_dir / name).exists()]
 
 
 def test_the_recorder_directory_is_new_absolute_and_named_to_the_scheduler_processes(tmp_path, monkeypatch):
@@ -3722,9 +4067,14 @@ def test_nothing_runs_at_import():
     assert ast.unparse(guard.test) == "__name__ == '__main__'"
     assert [ast.unparse(statement) for statement in guard.body] == ["sys.exit(main())"] and not guard.orelse
     assert tree.body[-1] is guard
-    # The module reads the environment in one place only: the mapping ``main`` hands to its readers.
+    # The module reaches the environment in one place only: the mapping ``main`` hands to its readers, to the
+    # recorder's directory variable and to the function that sets SGLang's blocker variable.
     source = MODULE_PATH.read_text(encoding="utf-8")
-    assert source.count("os.environ") == 3 and "os.getenv" not in source
+    assert source.count("os.environ") == 4 and "os.getenv" not in source
+    main_source = ast.get_source_segment(
+        source, next(node for node in tree.body if getattr(node, "name", "") == "main")
+    )
+    assert main_source.count("os.environ") == 4
     assert "FPM_" not in source.replace("DYN_FPM_", "").replace("every FPM_* variable", "")
 
 
@@ -3816,7 +4166,16 @@ def test_the_constants_the_modules_share():
     assert compat.TESTED_VERSIONS == ("0.5.22", "0.5.23")
     # No key of the launcher's producer facts is one the driver or the artifact module writes.
     reserved = {*DRIVER_PRODUCER_KEYS, "name", "artifact_format", "omitted_launcher_blocks"}
-    assert not reserved & {*LAUNCHER_PRODUCER_KEYS, "engine_shutdown_error"}
+    assert not reserved & {*LAUNCHER_PRODUCER_KEYS, DP_PRODUCER_KEY, "engine_shutdown_error"}
+    # The two words the driver writes for how a stage is sent, and the variable the launcher sets for the
+    # second of them.
+    assert (driver.STAGING_ONE_BATCH_CALL, driver.STAGING_BALANCED_BATCH_CALL) == (
+        "one_batch_call",
+        "balanced_batch_call",
+    )
+    assert launcher.ENV_INPUT_BLOCKER == BLOCKER_ENV == "SGLANG_ENABLE_COLOCATED_BATCH_GEN"
+    assert (driver.REASON_DP_PLACEMENT, driver.REASON_DP_STEP) == ("dp_rank_placement_mismatch", "dp_ranks_out_of_step")
+    assert (recorder.RECORD_FORMAT, driver.RECORD_FORMAT) == (2, 2)
 
 
 def test_the_header_and_the_docstring_of_the_module():
@@ -5302,9 +5661,11 @@ _HOST_WANTS_TEXT = (
     "native SGLang rank artifact of a MoE plan did not send dataset text: "
     "expected producer.content.source 'dataset_text_chains', found 'seeded_token_ids': "
 )
+# The braces take the three sizes the host expects of the cell and then the three it found: SGLang's TP size,
+# its expert-parallel size and its number of attention-DP ranks.
 _HOST_WANTS_THE_LAYOUT = (
     "native SGLang rank artifact of a MoE plan did not run the layout of its cell: "
-    "expected producer.tp_size {} and producer.moe.ep_size {}, found {} and {}: "
+    "expected producer.tp_size {}, producer.moe.ep_size {} and producer.attn_dp_size {}, found {}, {} and {}: "
 )
 # name: (GPUs of the cell, the size flags that reach the pod, the expert keys the pod finds, the content word,
 # what the host says when it holds the result against the cell of a MoE plan; None when it accepts)
@@ -5313,11 +5674,17 @@ _RUNS_OF_A_MOE_CELL = {
     "one-gpu": (1, [], FAKE_EXPERTS, None, None),
     "one-gpu-with-the-text-word": (1, [], FAKE_EXPERTS, "sharegpt_chain", None),
     # The command reached the pod without --ep-size, and the launcher takes an expert-parallel size of 1.
-    "tep-without-ep-size": (2, [], FAKE_EXPERTS, None, _HOST_WANTS_THE_LAYOUT.format(2, 2, 2, 1)),
+    "tep-without-ep-size": (2, [], FAKE_EXPERTS, None, _HOST_WANTS_THE_LAYOUT.format(2, 2, 1, 2, 1, 1)),
     # The pod found no expert layers in the model config.
     "no-experts-found": (1, [], {}, None, _HOST_WANTS_TEXT),
     "no-experts-found-with-the-seeded-word": (1, [], {}, "random", _HOST_WANTS_TEXT),
-    "no-experts-found-with-the-text-word": (1, [], {}, "sharegpt_chain", _HOST_WANTS_THE_LAYOUT.format(1, 1, 1, None)),
+    "no-experts-found-with-the-text-word": (
+        1,
+        [],
+        {},
+        "sharegpt_chain",
+        _HOST_WANTS_THE_LAYOUT.format(1, 1, 1, 1, None, 1),
+    ),
 }
 
 
@@ -5384,3 +5751,2080 @@ def test_the_constants_of_a_text_run():
     assert (content.CONTENT_SEEDED_IDS, content.CONTENT_TEXT_CHAINS) == ("seeded_token_ids", "dataset_text_chains")
     # The pool is not refused or wrapped when a variable of Dynamo's flat pool is set: that variable is refused.
     assert "DYN_BENCH_POOL_TAG" in launcher._REFUSED_VARIABLES
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# DP attention: the launch of a DEP cell
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def _fake_expected_rank_sample(point: grid.Point, rank: int) -> float:
+    """The FAKE sample of one attention-DP rank, worked out here from the FAKE timings.
+
+    The FAKE scheduler processes of a step launch their batches one after the other, each a FAKE host step
+    after the one before, and the results of a step are on the host at one FAKE moment. A prefill sample runs
+    from the launch of the rank's own batch, so rank ``r`` has ``r`` host steps less than rank 0. A decode
+    sample is taken between two outputs, which are the same moments for every rank.
+    """
+    if point.phase == grid.PREFILL:
+        ticks = FAKE_EXTEND_BASE_TICKS + point.batch_size * point.new_tokens - rank * FAKE_HOST_TICKS
+        return ticks / TICKS_PER_SECOND
+    return _fake_expected_sample(point)
+
+
+def _launch_dep(
+    tmp_path: Path,
+    monkeypatch,
+    mode: str = "decode",
+    *,
+    dp_size: int = 2,
+    word: str | None = None,
+    flags: tuple | list = (),
+    prepare=None,
+    pod_dir: Path | None = None,
+    **options,
+) -> _Launch:
+    """Launch a DEP cell: a FAKE model with expert layers on ``dp_size`` attention-DP ranks, with dataset text.
+
+    The command is the one of the cell: ``--tp-size D --attn-dp-size D --ep-size D``. With the FAKE compat
+    functions no parser reads ``--ep-size``, so the resolved value is put into the FAKE world here.
+    ``pod_dir`` is the pod directory of an earlier launch to run in again; a new one is laid out without it.
+    """
+    cell = _dep_cell(mode, dp_size)
+    if pod_dir is None:
+        pod_dir = _pod(tmp_path, cell, sglang_version=FAKE_SGLANG_VERSION)
+
+    def prepare_dep(world, pod):
+        world.experts = FAKE_EXPERTS
+        world.resolved["ep_size"] = dp_size
+        if prepare is not None:
+            prepare(world, pod)
+
+    return _launch_text(
+        tmp_path,
+        monkeypatch,
+        mode,
+        word=word,
+        tp_size=dp_size,
+        dp_size=dp_size,
+        flags=["--ep-size", str(dp_size), *flags],
+        prepare=prepare_dep,
+        pod=(cell, pod_dir),
+        **options,
+    )
+
+
+def _held_against_the_moe_cell(launch: _Launch):
+    """The validator as the host calls it for a cell of an SGLang plan whose model has expert layers."""
+    return validate_native_collection(
+        launch.cell,
+        launch.root / "raw",
+        expected_plan_sha256="plan-sha",
+        expected_attempt_id="attempt",
+        expected_backend="sglang",
+        expected_moe=True,
+    )
+
+
+def _assert_ranks_accepted(launch: _Launch, dp_size: int = 2) -> list[dict]:
+    """A complete run with several attention-DP ranks: exit code 0, one rank file per rank and the merged
+    file, and the validator and the gate accept them. Returns the rank files, in rank order."""
+    built = launch.planned()
+    assert launch.code == 0
+    rank_paths = launch.rank_paths(dp_size)
+    assert launch.result_files() == sorted([*(path.name for path in rank_paths), launch.merged_path.name])
+    on_disk = [json.loads(path.read_text(encoding="utf-8")) for path in rank_paths]
+    for rank, payload in enumerate(on_disk):
+        assert (payload["status"], payload["valid"], payload["usable"], payload["error"]) == (
+            "complete",
+            True,
+            True,
+            None,
+        )
+        assert payload["dp"] == {"size": dp_size, "rank": rank}
+        assert payload["coverage"] == {
+            "expected_points": len(built.points),
+            "completed_points": len(built.points),
+            "skipped_points": 0,
+        }
+        assert payload["grid_digest"] == built.digest
+        for point, row, group in zip(built.points, payload["results"], payload["iteration_groups"], strict=True):
+            # A row holds the record of its own rank: the batch size and the token counts of ONE rank, which
+            # are the point's, and the FAKE sample of that rank's own FAKE scheduler process.
+            (fpm,) = row["fpms"]
+            assert (row["point"], row["kv_seed_regime"]) == (point.as_dict(), _expected_regime(point))
+            assert (fpm["dp_rank"], fpm["wall_time"], fpm["worker_id"]) == (
+                rank,
+                _fake_expected_rank_sample(point, rank),
+                FAKE_WORKER_ID,
+            )
+            assert fpm["scheduled_requests"] == artifact.scheduled_requests(point.as_dict())
+            if point.phase == grid.DECODE:
+                assert fpm[artifact.DECODE_STEPS_KEY] == _fake_expected_steps(point)
+            # A group holds the record of every rank, and its time is the slowest rank's.
+            assert [entry["dp_rank"] for entry in group["rank_results"]] == list(range(dp_size))
+            assert group["wall_time"] == max(_fake_expected_rank_sample(point, other) for other in range(dp_size))
+        # Every rank file carries the same groups, the same run and the same facts of the run.
+        assert payload["iteration_groups"] == on_disk[0]["iteration_groups"]
+        assert (payload["run_id"], payload["producer"]) == (on_disk[0]["run_id"], on_disk[0]["producer"])
+    merged = json.loads(launch.merged_path.read_text(encoding="utf-8"))
+    assert (merged["artifact_type"], merged["rank_files"]) == ("merged", [str(path) for path in rank_paths])
+    assert merged["dp"]["source_ranks"] == list(range(dp_size))
+    if launch.mode != grid.AGG:
+        # The host holds the three sizes the launcher recorded against the cell: for a DEP cell of D ranks
+        # SGLang's TP size D, its expert-parallel size D and D attention-DP ranks.
+        collection = _held_against_the_moe_cell(launch)
+        assert [measurement.point for measurement in collection.points] == built.point_dicts()
+        assert [measurement.rank_wall_times for measurement in collection.points] == [
+            tuple((rank, _fake_expected_rank_sample(point, rank)) for rank in range(dp_size)) for point in built.points
+        ]
+        assert (collection.runtime_run_id, collection.runtime_grid_digest) == (on_disk[0]["run_id"], built.digest)
+    gate = _gate([str(path) for path in rank_paths], launch.mode)
+    assert gate.returncode == GATE_ACCEPT, gate.stderr
+    return on_disk
+
+
+def _rank_logs(launch: _Launch) -> list[list[dict]]:
+    """The lines of every recorder log of the one run of a launch, in the order of the FAKE process ids."""
+    (recorder_dir,) = launch.recorder_dirs()
+    return [
+        [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        for path in sorted(recorder_dir.iterdir())
+    ]
+
+
+DP_ATTENTION_FACTS = {"local_control_broadcast": False, "input_blocker": True, "placement": "round_robin_checked"}
+
+
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+def test_end_to_end_a_dep_launch_passes_the_validator_and_the_gate(tmp_path, monkeypatch, capsys, mode):
+    seen = {}
+
+    def prepare(world, _pod_dir):
+        # What the FAKE scheduler processes inherit: the variable as it stands when the engine is built.
+        world.hooks["Engine"] = lambda: seen.update(blocker=os.environ.get(BLOCKER_ENV))
+
+    # No content word: the expert keys of the FAKE model config make this a text run.
+    launch = _launch_dep(tmp_path, monkeypatch, mode, prepare=prepare, real_compat=True)
+
+    _assert_no_module_of_the_benchmark_is_replaced()
+    topology = launch.cell.topology
+    assert (launch.cell.parallel_strategy, topology.tp, topology.dp, topology.moe_ep) == ("dep", 1, 2, 2)
+    built = launch.planned()
+    assert len(built.points) >= 8 and built.missing_phases == ()
+    on_disk = _assert_ranks_accepted(launch)
+    world = launch.world
+
+    # The flags of the cell reached the FAKE parser as they were typed, and nothing was added but the
+    # streaming flag.
+    assert world.sglang_argv == ["--ep-size", "2", *_fake_sglang_argv(1, 2, 2), STREAMING_FLAG]
+    assert world.sglang_argv[-3:-1] == ["--attn-dp-size", "2"]
+    # The launcher set SGLang's blocker variable before the engine was built, and left it set.
+    assert seen == {"blocker": "1"} and os.environ[BLOCKER_ENV] == "1"
+
+    # One FAKE scheduler process for each attention-DP rank, each started through the recorder's entry with
+    # the ten arguments SGLang passes there: the DP rank, and after the pipe the three display ranks.
+    assert world.entry is recorder.recorder_entry
+    assert world.entry_calls == [(0, 0, 0, 0), (1, 1, 0, 1)]
+    assert world.entry_displays == [(0, 0, 0), (1, 1, 1)]
+    assert [type(scheduler).__name__ for scheduler in world.schedulers] == ["SglbenchRecorderScheduler"] * 2
+
+    # Two logs, written by the real recorder. Both processes are the leader of their rank and have a blocker.
+    logs = _rank_logs(launch)
+    headers = [lines[0] for lines in logs]
+    assert [(header["pid"], header["leader"], header["format"]) for header in headers] == [
+        (4100, True, 2),
+        (4101, True, 2),
+    ]
+    assert [header["ranks"] for header in headers] == [
+        {
+            "tp_size": 2,
+            "pp_size": 1,
+            "attn_dp_size": 2,
+            "attn_dp_enabled": True,
+            "attn_tp_rank": 0,
+            "attn_cp_rank": 0,
+            "attn_dp_rank": rank,
+            "pp_rank": 0,
+        }
+        for rank in range(2)
+    ]
+    assert [header["checks"]["input_blocker"] for header in headers] == [True, True]
+    assert headers[0]["limits"] == headers[1]["limits"]
+    # The FAKE ranks ran in lockstep: line for line the same mode, the same step number and the same token
+    # counts, one count for each rank and both equal, and no rank ever idled.
+    first, second = (lines[1:] for lines in logs)
+    assert len(first) == len(second) == world.batches_run > 20
+    for own, other in zip(first, second, strict=True):
+        assert (own["mode"], own["forward_iter"], own["global_num_tokens"]) == (
+            other["mode"],
+            other["forward_iter"],
+            other["global_num_tokens"],
+        )
+        assert own["mode"] in ("EXTEND", "DECODE") and len(own["rids"]) == len(other["rids"]) > 0
+        assert len(own["global_num_tokens"]) == 2 and len(set(own["global_num_tokens"])) == 1
+        # Each log holds the requests of its own rank only.
+        assert {content.parse_request_id(rid)["rank"] for rid in own["rids"]} == {0}
+        assert {content.parse_request_id(rid)["rank"] for rid in other["rids"]} == {1}
+    # Each FAKE process stamped its lines on a FAKE clock of its own.
+    assert all(8000.0 <= line["launch_ts"] < line["out_ts"] < 9000.0 for line in first)
+    assert all(9000.0 <= line["launch_ts"] < line["out_ts"] < 10000.0 for line in second)
+
+    # Every call is SGLang's public batch call and nothing else: no request names a rank, and no field is
+    # set beyond those of a run with one rank.
+    assert len(world.engine_requests) == len(world.calls)
+    for request, call in zip(world.engine_requests, world.calls, strict=True):
+        assert request == {
+            "prompt": None,
+            "sampling_params": {"max_new_tokens": call.max_new_tokens, "temperature": 0.0, "ignore_eos": True},
+            "stream": True,
+            "more": {},
+        }
+    # Every call is balanced: slot by slot and rank inside. The request ids carry the planned rank, and the
+    # FAKE DP controller, which deals the requests out in turn, placed each on that rank.
+    for call in world.calls:
+        slots, odd = divmod(len(call.rids), 2)
+        assert odd == 0 and call.ranks == [0, 1] * slots
+        parts = [content.parse_request_id(rid) for rid in call.rids]
+        assert [(part["slot"], part["rank"]) for part in parts] == [
+            (slot, rank) for slot in range(slots) for rank in (0, 1)
+        ]
+        assert call.rank_modes[0] == call.rank_modes[1] == call.modes
+    # The self-test and the warm-up reached both ranks: seven free calls, the warm-up with one prompt per rank.
+    assert [call.key for call in world.calls[:7]] == [(0, "free", number) for number in range(7)]
+    assert [len(call.rids) for call in world.calls[:7]] == [4, 4, 4, 4, 4, 4, 2]
+    assert [call.max_new_tokens for call in world.calls[:7]] == [1, 1, 1, 1, 1, 7, 5]
+    order = [call.key[0] for call in world.calls if call.key[0]]
+    assert order == sorted(order) and set(order) == {point.benchmark_id for point in built.points}
+
+    producer = on_disk[0]["producer"]
+    assert set(producer) == {
+        *LAUNCHER_PRODUCER_KEYS,
+        DP_PRODUCER_KEY,
+        *DRIVER_PRODUCER_KEYS,
+        "name",
+        "artifact_format",
+    }
+    # The sizes SGLang resolved for the cell: its TP size counts the processes of both ranks.
+    assert (producer["tp_size"], producer["attn_dp_size"], producer["moe"]["ep_size"]) == (2, 2, 2)
+    assert producer[DP_PRODUCER_KEY] == DP_ATTENTION_FACTS
+    assert (producer["staging"], producer["scheduler_processes"], producer["recorder_format"]) == (
+        "balanced_batch_call",
+        2,
+        2,
+    )
+    assert producer["expert_keys"] == FAKE_EXPERTS and producer["restaged_points"] == []
+    assert producer["limits"] == world.limits.as_dict()
+    assert producer["self_test"] == ["batch_shape", "aligned_prefix", "unaligned_prompt", "seven_token_run"]
+    kept = _fake_kept_texts(_fake_dataset_records())
+    assert producer["content"] == {
+        "source": "dataset_text_chains",
+        "seed": "0",
+        "token_range": FAKE_TOKEN_RANGE,
+        "issued": producer["content"]["issued"],
+        "dataset": launch.dataset,
+        "pool": _fake_pool_counts(kept),
+    }
+    if mode == "decode":
+        dataset_keys = ("path", "sha256", "collection_pool", "conversations")
+        assert on_disk[0]["kvwarm"]["dataset"] == {key: launch.dataset[key] for key in dataset_keys}
+        assert on_disk[1]["kvwarm"] == on_disk[0]["kvwarm"]
+    else:
+        assert "kvwarm" not in on_disk[0] and "kvwarm" not in on_disk[1]
+
+    # What the launcher asked of the FAKE sglang package, in order: as for any text run.
+    assert world.events == [
+        "clock",
+        "load_plugins",
+        "prepare_server_args",
+        "resolve_once",
+        "get_platform",
+        "from_server_args",
+        "Engine",
+        "tokenizer",
+        "Engine.shutdown",
+        "sleep",
+    ]
+    text_ids = {_FakeTokenizer.fake_id(word) for text in kept for word in text.split()}
+    _assert_free_calls_are_text(world, text_ids)
+    lines = _stderr_lines(capsys)
+    rank_0, rank_1 = launch.rank_paths(2)
+    assert lines[-1] == f"[sglbench] complete: wrote {rank_0}, {rank_1}, {launch.merged_path}"
+    assert (
+        "[sglbench] DP attention with 2 ranks: SGLANG_ENABLE_COLOCATED_BATCH_GEN is set to 1 for the scheduler "
+        "processes, and every call carries the same number of prompts for every rank"
+    ) in lines
+    # No file of the recorder tree has a name the collector or the gate sweeps for.
+    for path in (launch.pod / "sglbench-recorder").rglob("*"):
+        assert not any(fnmatch.fnmatch(path.name, pattern) for pattern in FORBIDDEN_FILE_PATTERNS)
+
+
+def test_end_to_end_local_control_broadcast_is_taken_from_the_command_line_and_recorded(tmp_path, monkeypatch):
+    flag = "--enable-dp-attention-local-control-broadcast"
+
+    launch = _launch_dep(tmp_path, monkeypatch, "decode", flags=[flag], real_compat=True)
+
+    _assert_no_module_of_the_benchmark_is_replaced()
+    on_disk = _assert_ranks_accepted(launch)
+    # The flag is SGLang's: the launcher handed it on as it was typed, and SGLang resolved the field.
+    assert launch.world.sglang_argv == ["--ep-size", "2", flag, *_fake_sglang_argv(1, 2, 2), STREAMING_FLAG]
+    assert on_disk[0]["producer"][DP_PRODUCER_KEY] == {**DP_ATTENTION_FACTS, "local_control_broadcast": True}
+    # The run is the same either way: the same calls, placed and released in the same way.
+    assert on_disk[0]["producer"]["staging"] == "balanced_batch_call"
+    assert all(call.ranks == [0, 1] * (len(call.rids) // 2) for call in launch.world.calls)
+
+
+def test_local_control_broadcast_without_dp_attention_is_not_looked_at(tmp_path, monkeypatch):
+    launch = _launch(
+        tmp_path, monkeypatch, "prefill", flags=["--enable-dp-attention-local-control-broadcast"], real_compat=True
+    )
+
+    producer = _assert_accepted(launch)["producer"]
+    assert launch.world.resolved["enable_dp_attention_local_control_broadcast"] is True
+    assert (producer["attn_dp_size"], DP_PRODUCER_KEY in producer) == (1, False)
+
+
+@pytest.mark.parametrize("mode", ["prefill", "decode", "agg"])
+def test_a_dep_launch_with_three_ranks(tmp_path, monkeypatch, mode):
+    launch = _launch_dep(tmp_path, monkeypatch, mode, dp_size=3)
+
+    on_disk = _assert_ranks_accepted(launch, 3)
+    world = launch.world
+    assert launch.result_files() == [
+        "benchmark.json",
+        "benchmark_dp1.json",
+        "benchmark_dp2.json",
+        "benchmark_merged.json",
+    ]
+    producer = on_disk[0]["producer"]
+    assert (producer["tp_size"], producer["attn_dp_size"], producer["scheduler_processes"]) == (3, 3, 3)
+    assert producer[DP_PRODUCER_KEY] == DP_ATTENTION_FACTS
+    assert world.entry_calls == [(rank, rank, 0, rank) for rank in range(3)]
+    assert all(call.ranks == [0, 1, 2] * (len(call.rids) // 3) for call in world.calls)
+    # Three logs in lockstep, with one token count for each of the three ranks.
+    logs = [lines[1:] for lines in _rank_logs(launch)]
+    assert len({len(lines) for lines in logs}) == 1
+    for row in zip(*logs, strict=True):
+        assert len({(line["mode"], line["forward_iter"], tuple(line["global_num_tokens"])) for line in row}) == 1
+        assert len(row[0]["global_num_tokens"]) == 3 and len(set(row[0]["global_num_tokens"])) == 1
+    # The grid is a grid of per-rank points: the one a run with one rank plans from the same FAKE limits.
+    assert launch.planned().points == _planned(mode).points
+
+
+def test_a_dep_launch_plans_and_sends_what_a_one_rank_launch_sends_to_its_one_rank(tmp_path, monkeypatch):
+    # The launch with one rank comes first: a launcher with several ranks leaves SGLang's blocker variable set
+    # in its process, which here is the test's.
+    one = _launch_text(
+        tmp_path / "one",
+        monkeypatch,
+        "prefill",
+        word=None,
+        prepare=lambda world, _pod: setattr(world, "experts", FAKE_EXPERTS),
+    )
+    dep = _launch_dep(tmp_path / "dep", monkeypatch, "prefill")
+
+    on_disk, single = _assert_ranks_accepted(dep), _assert_accepted(one)
+    assert on_disk[0]["grid_digest"] == single["grid_digest"]
+    assert [call.key for call in dep.world.calls] == [call.key for call in one.world.calls]
+    for call, other in zip(dep.world.calls, one.world.calls, strict=True):
+        # Rank 0 gets the prompts of the run with one rank: content depends on the seed, the rank and the slot,
+        # and the run id only names the requests. Rank 1 gets prompts of the same lengths and its own content.
+        assert call.prompts[0::2] == other.prompts and call.max_new_tokens == other.max_new_tokens
+        assert [len(prompt) for prompt in call.prompts[1::2]] == [len(prompt) for prompt in other.prompts]
+        assert call.rank_modes == [other.modes, other.modes]
+    # The keys of the producer block differ by the one block about DP attention.
+    assert set(on_disk[0]["producer"]) - set(single["producer"]) == {DP_PRODUCER_KEY}
+    assert set(single["producer"]) <= set(on_disk[0]["producer"])
+    assert (single["producer"]["attn_dp_size"], single["producer"]["staging"]) == (1, "one_batch_call")
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# DP attention: what the launcher admits
+# ---------------------------------------------------------------------------------------------------------------
+
+_DEP_ONLY = (
+    "attn_dp_size={} is supported only as the DEP layout of a model with expert layers "
+    "(tp_size == attn_dp_size and ep_size == tp_size): {}"
+)
+_ROUND_ROBIN = (
+    "load_balance_method must be round_robin under DP attention (got {}); the requests of a call are placed "
+    "on the ranks in turn"
+)
+_LM_HEAD = "enable_dp_lm_head is not supported (enable_dp_lm_head={})"
+_BATCH_ENCODE = (
+    "enable_tokenizer_batch_encode must be off under DP attention (got {}); SGLang then sends a call as one "
+    "batch message outside its block region, so the ranks are not released together"
+)
+
+# (expert keys of the model, resolved fields beside the defaults)
+DP_LAYOUTS_ACCEPTED = [
+    # No DP attention: nothing is tested, whatever the other fields say.
+    ({}, {}),
+    ({}, {"tp_size": 4, "load_balance_method": "total_tokens", "enable_dp_lm_head": True}),
+    ({}, {"tp_size": 2, "enable_tokenizer_batch_encode": True}),
+    (FAKE_EXPERTS, {"tp_size": 2, "ep_size": 2, "enable_tokenizer_batch_encode": True}),
+    (FAKE_EXPERTS, {"tp_size": 2, "ep_size": 2}),
+    # The DEP layout: a model with expert layers, one scheduler process and one expert group for each rank.
+    (FAKE_EXPERTS, {"attn_dp_size": 2, "tp_size": 2, "ep_size": 2}),
+    (FAKE_EXPERTS, {"attn_dp_size": 4, "tp_size": 4, "ep_size": 4}),
+    (
+        FAKE_EXPERTS,
+        {"attn_dp_size": 2, "tp_size": 2, "ep_size": 2, "enable_dp_attention_local_control_broadcast": True},
+    ),
+    ({"num_local_experts": 8}, {"attn_dp_size": 8, "tp_size": 8, "ep_size": 8}),
+]
+# The three sizes of a DEP layout with two ranks.
+_DEP_SIZES = {"attn_dp_size": 2, "tp_size": 2, "ep_size": 2}
+# (expert keys of the model, resolved fields beside the defaults, the whole refusal)
+DP_LAYOUT_REFUSALS = [
+    # A model without expert layers has no cell with DP attention.
+    ({}, {"attn_dp_size": 2, "tp_size": 2, "ep_size": 2}, _DEP_ONLY.format(2, "the model has no expert layers")),
+    (
+        {},
+        {"attn_dp_size": 2, "tp_size": 2},
+        _DEP_ONLY.format(2, "the model has no expert layers; ep_size=1"),
+    ),
+    # Attention TP above 1 inside a DP rank: the TP size is a multiple of the number of ranks.
+    (FAKE_EXPERTS, {"attn_dp_size": 2, "tp_size": 4, "ep_size": 4}, _DEP_ONLY.format(2, "tp_size=4")),
+    (FAKE_EXPERTS, {"attn_dp_size": 2, "tp_size": 4, "ep_size": 2}, _DEP_ONLY.format(2, "tp_size=4; ep_size=2")),
+    # A TP size below the number of ranks, which SGLang itself refuses.
+    (FAKE_EXPERTS, {"attn_dp_size": 2}, _DEP_ONLY.format(2, "tp_size=1")),
+    # Every rank holds a slice of every expert: no cell is planned for that under DP attention.
+    (FAKE_EXPERTS, {"attn_dp_size": 2, "tp_size": 2}, _DEP_ONLY.format(2, "ep_size=1")),
+    (FAKE_EXPERTS, {"attn_dp_size": 4, "tp_size": 4, "ep_size": 1}, _DEP_ONLY.format(4, "ep_size=1")),
+    (
+        {},
+        {"attn_dp_size": 3, "tp_size": 6},
+        _DEP_ONLY.format(3, "the model has no expert layers; tp_size=6; ep_size=1"),
+    ),
+    # A value of another type is never taken for the size.
+    (FAKE_EXPERTS, {"attn_dp_size": 2, "tp_size": 2.0, "ep_size": 2}, _DEP_ONLY.format(2, "tp_size=2.0; ep_size=2")),
+    (FAKE_EXPERTS, {"attn_dp_size": 2, "tp_size": 2, "ep_size": "2"}, _DEP_ONLY.format(2, "ep_size=2")),
+    (FAKE_EXPERTS, {"attn_dp_size": 2, "tp_size": None, "ep_size": 2}, _DEP_ONLY.format(2, "tp_size=null; ep_size=2")),
+    # Inside the DEP layout: how the DP controller places a request, and the output head.
+    (
+        FAKE_EXPERTS,
+        {"attn_dp_size": 2, "tp_size": 2, "ep_size": 2, "load_balance_method": "total_tokens"},
+        _ROUND_ROBIN.format("total_tokens"),
+    ),
+    (
+        FAKE_EXPERTS,
+        {"attn_dp_size": 2, "tp_size": 2, "ep_size": 2, "load_balance_method": "auto"},
+        _ROUND_ROBIN.format("auto"),
+    ),
+    (
+        FAKE_EXPERTS,
+        {"attn_dp_size": 2, "tp_size": 2, "ep_size": 2, "load_balance_method": None},
+        _ROUND_ROBIN.format("null"),
+    ),
+    (FAKE_EXPERTS, {"attn_dp_size": 2, "tp_size": 2, "ep_size": 2, "enable_dp_lm_head": True}, _LM_HEAD.format("true")),
+    (FAKE_EXPERTS, {"attn_dp_size": 2, "tp_size": 2, "ep_size": 2, "enable_dp_lm_head": None}, _LM_HEAD.format("null")),
+    (FAKE_EXPERTS, {"attn_dp_size": 2, "tp_size": 2, "ep_size": 2, "enable_dp_lm_head": 0}, _LM_HEAD.format(0)),
+    # Inside the DEP layout: batch tokenization, with which SGLang sends a call as one message that its
+    # block and unblock messages do not enclose.
+    (
+        FAKE_EXPERTS,
+        {"attn_dp_size": 2, "tp_size": 2, "ep_size": 2, "enable_tokenizer_batch_encode": True},
+        _BATCH_ENCODE.format("true"),
+    ),
+    (
+        FAKE_EXPERTS,
+        {"attn_dp_size": 2, "tp_size": 2, "ep_size": 2, "enable_tokenizer_batch_encode": None},
+        _BATCH_ENCODE.format("null"),
+    ),
+    (
+        FAKE_EXPERTS,
+        {"attn_dp_size": 4, "tp_size": 4, "ep_size": 4, "enable_tokenizer_batch_encode": 0},
+        _BATCH_ENCODE.format(0),
+    ),
+    # The settings are tested in this order, and the first that fails is named.
+    (
+        FAKE_EXPERTS,
+        {**_DEP_SIZES, "enable_dp_lm_head": True, "enable_tokenizer_batch_encode": True},
+        _LM_HEAD.format("true"),
+    ),
+]
+
+
+@pytest.mark.parametrize(("experts", "resolved"), DP_LAYOUTS_ACCEPTED)
+def test_no_dp_attention_and_the_dep_layout_pass(experts, resolved):
+    view = _FakeView({**FAKE_RESOLVED_ARGUMENTS, **resolved})
+    launcher._check_resolved(view)
+    launcher._check_expert_parallel(view, experts)
+    launcher._check_dp_attention(view, experts)
+
+
+@pytest.mark.parametrize(("experts", "resolved", "refusal"), DP_LAYOUT_REFUSALS)
+def test_every_other_layout_with_dp_attention_is_refused(experts, resolved, refusal):
+    view = _FakeView({**FAKE_RESOLVED_ARGUMENTS, **resolved})
+
+    with pytest.raises(launcher._Failed) as raised:
+        launcher._check_dp_attention(view, experts)
+
+    assert raised.value.reason == f"rejected: {refusal}"
+
+
+def test_without_dp_attention_the_four_fields_of_dp_attention_are_not_read(tmp_path, monkeypatch):
+    fields = {name: value for name, value in FAKE_RESOLVED_ARGUMENTS.items() if name not in DP_ONLY_FIELDS}
+    launcher._check_dp_attention(_FakeView(fields), {})
+    producer: dict = {}
+    assert launcher._resolved_settings(_FakeView(fields), producer)["dp_size"] == 1
+
+    def prepare(world, _pod_dir):
+        for name in DP_ONLY_FIELDS:
+            del world.resolved[name]
+
+    # A whole launch with one rank on an SGLang without these fields runs as before.
+    _assert_accepted(_launch(tmp_path, monkeypatch, "prefill", prepare=prepare))
+
+
+@pytest.mark.parametrize("missing", ["tp_size", "ep_size", *DP_ONLY_FIELDS])
+def test_with_dp_attention_every_field_the_checks_read_must_exist(tmp_path, monkeypatch, missing):
+    def prepare(world, _pod_dir):
+        del world.resolved[missing]
+
+    launch = _launch_dep(tmp_path, monkeypatch, "prefill", prepare=prepare)
+
+    assert launch.code == 70 and "build_engine" not in launch.world.events
+    assert launch.artifact()["error"].startswith(
+        f"internal_error: AttributeError: SGLang's resolved arguments have no field '{missing}'"
+    )
+    assert BLOCKER_ENV not in os.environ
+
+
+def _reaches_the_check_of_dp_attention(experts: dict, resolved: dict) -> bool:
+    """Whether a launch with these fields gets as far as the layout of DP attention.
+
+    The expert-parallel size is tested first and has its own refusals: it must be 1, or the TP size of a
+    model with expert layers. Typed here on its own.
+    """
+    ep_size, tp_size = resolved.get("ep_size", 1), resolved.get("tp_size", 1)
+    if type(ep_size) is int and ep_size == 1:
+        return True
+    return bool(experts) and type(ep_size) is int and type(tp_size) is int and ep_size == tp_size
+
+
+DP_LAYOUT_REFUSALS_AT_LAUNCH = [row for row in DP_LAYOUT_REFUSALS if _reaches_the_check_of_dp_attention(*row[:2])]
+
+
+def test_the_layouts_refused_at_launch_are_of_every_kind():
+    refusals = [refusal for _experts, _resolved, refusal in DP_LAYOUT_REFUSALS_AT_LAUNCH]
+    assert len(refusals) == 16
+    for part in (
+        "the model has no expert layers",
+        "tp_size=",
+        "ep_size=1",
+        "load_balance_method",
+        "enable_dp_lm_head",
+        "enable_tokenizer_batch_encode",
+    ):
+        assert any(part in refusal for refusal in refusals), part
+
+
+@pytest.mark.parametrize(("experts", "resolved", "refusal"), DP_LAYOUT_REFUSALS_AT_LAUNCH)
+def test_a_dp_attention_layout_the_benchmark_does_not_cover_ends_the_launch_with_64(
+    tmp_path, monkeypatch, capsys, experts, resolved, refusal
+):
+    stale = b'{"stale": "rank 1 of an earlier run"}'
+
+    def prepare(world, pod_dir):
+        world.experts = experts
+        world.resolved.update(resolved)
+        (pod_dir / "benchmark_dp1.json").write_bytes(stale)
+
+    dump = tmp_path / "resolved-config-node0.json"
+    launch = _launch_text(
+        tmp_path, monkeypatch, "decode", prepare=prepare, word="sharegpt_chain", flags=["--dump-config-to", str(dump)]
+    )
+
+    on_disk = _assert_failed_before_the_grid(launch, 64, f"rejected: {refusal}")
+    # Refused after the model config was read and before anything was built, set or dumped.
+    assert launch.world.events[-3:] == ["model_expert_keys", "write", "sleep"]
+    assert "build_engine" not in launch.world.events and not dump.exists()
+    assert BLOCKER_ENV not in os.environ
+    # The number of ranks was never taken over: one failed rank file, at the output path, and the stale file
+    # of another rank is gone.
+    assert launch.result_files() == ["benchmark.json"]
+    assert (on_disk["dp"], "attn_dp_size" in on_disk["producer"]) == ({"size": 1, "rank": 0}, False)
+    assert on_disk["producer"]["expert_keys"] == experts
+    assert _stderr_lines(capsys)[-2:] == [
+        f"[sglbench] FAILED: rejected: {refusal}",
+        f"[sglbench] wrote the failed artifact {launch.rank_path}",
+    ]
+
+
+def test_the_expert_parallel_size_is_tested_before_the_layout_of_dp_attention(tmp_path, monkeypatch):
+    def prepare(world, _pod_dir):
+        world.experts = FAKE_EXPERTS
+        world.resolved.update({"attn_dp_size": 2, "tp_size": 4, "ep_size": 2})
+
+    launch = _launch_text(tmp_path, monkeypatch, "decode", prepare=prepare, word=None)
+
+    _assert_failed_before_the_grid(launch, 64, f"rejected: {_EP_NOT_TP.format(2, 4)}")
+
+
+@pytest.mark.parametrize(
+    ("resolved", "refusal"),
+    [
+        # Whole copies of the model beside DP attention: refused as replicas are without it.
+        ({"attn_dp_size": 2, "dp_size": 2}, "data-parallel replicas are not supported (dp_size=2)"),
+        ({"attn_dp_size": 0}, "attn_dp_size must be a positive int (got 0)"),
+        # DWDP switches DP attention on by itself and is refused by name.
+        ({"attn_dp_size": 2, "dwdp_size": 2}, "DWDP is not supported (dwdp_size=2)"),
+        ({"attn_dp_size": 2, "moe_dense_tp_size": 1}, "moe_dense_tp_size must not be set (got 1)"),
+        ({"attn_dp_size": 2, "moe_a2a_backend": "deepep"}, f"{_A2A} (moe_a2a_backend=deepep)"),
+        ({"attn_dp_size": 2, "enable_eplb": True}, "EPLB is not supported (enable_eplb=true)"),
+        (
+            {"attn_dp_size": 2, "ep_num_redundant_experts": 2},
+            "redundant experts are not supported (ep_num_redundant_experts=2)",
+        ),
+    ],
+)
+def test_the_settings_refused_without_dp_attention_are_refused_with_it(tmp_path, monkeypatch, resolved, refusal):
+    def prepare(world, _pod_dir):
+        world.resolved.update(resolved)
+
+    launch = _launch_dep(tmp_path, monkeypatch, "decode", prepare=prepare)
+
+    _assert_failed_before_the_grid(launch, 64, f"rejected: {refusal}")
+    assert launch.world.events[-3:] == ["resolve", "write", "sleep"]
+    assert BLOCKER_ENV not in os.environ
+
+
+@pytest.mark.parametrize("real_compat", [False, True])
+def test_seeded_ids_are_refused_for_a_dep_launch_as_for_any_model_with_expert_layers(
+    tmp_path, monkeypatch, real_compat
+):
+    launch = _launch_dep(tmp_path, monkeypatch, "prefill", word="random", real_compat=real_compat)
+
+    on_disk = _assert_failed_before_the_grid(launch, 64, f"rejected: {_SEEDED_WITH_EXPERTS.format('num_experts=60')}")
+    assert launch.world.events[-2:] == (["from_server_args", "sleep"] if real_compat else ["write", "sleep"])
+    assert on_disk["producer"]["content"]["source"] == "seeded_token_ids"
+    # Refused before the number of ranks was taken over: one failed file, and the variable is not set.
+    assert launch.result_files() == ["benchmark.json"] and BLOCKER_ENV not in os.environ
+
+
+def test_a_model_without_expert_layers_is_refused_for_dp_attention_also_with_the_text_word(tmp_path, monkeypatch):
+    launch = _launch(
+        tmp_path,
+        monkeypatch,
+        "decode",
+        tp_size=2,
+        dp_size=2,
+        env={ENV_CONTENT: "sharegpt_chain"},
+        real_compat=True,
+    )
+
+    reason = "rejected: " + _DEP_ONLY.format(2, "the model has no expert layers; ep_size=1")
+    on_disk = _assert_failed_before_the_grid(launch, 64, reason)
+    assert launch.world.events[-2:] == ["from_server_args", "sleep"] and "Engine" not in launch.world.events
+    assert on_disk["producer"]["content"]["source"] == "dataset_text_chains"
+
+
+def test_end_to_end_batch_tokenization_is_refused_for_a_dep_launch_and_not_for_one_rank(tmp_path, monkeypatch):
+    flag = "--enable-tokenizer-batch-encode"
+
+    # One rank first: a launch with several ranks leaves SGLang's blocker variable set in the test's process.
+    one = _launch(tmp_path / "one", monkeypatch, "prefill", flags=[flag], real_compat=True)
+    _assert_accepted(one)
+    assert one.world.resolved["enable_tokenizer_batch_encode"] is True
+
+    launch = _launch_dep(tmp_path / "dep", monkeypatch, "decode", flags=[flag], real_compat=True)
+
+    _assert_no_module_of_the_benchmark_is_replaced()
+    # The flag is SGLang's and reached its parser; the launcher refused the field SGLang resolved from it.
+    assert flag in launch.world.sglang_argv
+    _assert_failed_before_the_grid(launch, 64, "rejected: " + _BATCH_ENCODE.format("true"))
+    # Refused after the model config was read and before the engine was built or the variable was set.
+    assert launch.world.events[-2:] == ["from_server_args", "sleep"] and "Engine" not in launch.world.events
+    assert launch.result_files() == ["benchmark.json"] and BLOCKER_ENV not in os.environ
+
+
+def test_end_to_end_chunks_without_a_rank_fail_a_dep_launch_at_its_first_call(tmp_path, monkeypatch):
+    def prepare(world, _pod_dir):
+        # FAKE of an SGLang whose output records list no rank: the chunks then have no ``dp_rank``.
+        world.rank_in_chunks = "no key"
+
+    launch = _launch_dep(tmp_path, monkeypatch, "decode", prepare=prepare, real_compat=True)
+
+    _assert_no_module_of_the_benchmark_is_replaced()
+    (call,) = launch.world.calls
+    reason = (
+        f"self_test_failed: batch_shape: dp_rank_placement_mismatch: {call.rids[0]}: the engine reports no "
+        "dp_rank, the request was planned for rank 0"
+    )
+    _assert_every_rank_failed(launch, 65, reason)
+    assert launch.world.events[-2:] == ["Engine.shutdown", "sleep"]
+
+
+def test_end_to_end_a_rank_that_is_no_int_fails_the_engine_call(tmp_path, monkeypatch):
+    def prepare(world, _pod_dir):
+        world.rank_in_chunks = "as text"
+
+    launch = _launch_dep(tmp_path, monkeypatch, "prefill", prepare=prepare, real_compat=True)
+
+    (call,) = launch.world.calls
+    reason = (
+        f"self_test_failed: batch_shape: engine_call_failed: EngineCallError: request {call.rids[0]}: dp_rank is "
+        "'0', not a rank"
+    )
+    _assert_every_rank_failed(launch, 65, reason)
+
+
+def test_end_to_end_chunks_without_a_rank_do_not_matter_to_a_launch_with_one_rank(tmp_path, monkeypatch):
+    def prepare(world, _pod_dir):
+        world.rank_in_chunks = "no key"
+
+    launch = _launch(tmp_path, monkeypatch, "decode", tp_size=2, prepare=prepare, real_compat=True)
+
+    _assert_no_module_of_the_benchmark_is_replaced()
+    _assert_accepted(launch)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# DP attention: SGLang's variables
+# ---------------------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("ranks", "name", "value", "refusal"), DP_ENV_REFUSALS)
+def test_refused_variables_of_sglang_that_depend_on_the_number_of_ranks(ranks, name, value, refusal):
+    with pytest.raises(launcher._Failed) as raised:
+        launcher._check_dp_environment({name: value}, ranks)
+
+    assert raised.value.reason == f"rejected: {refusal}"
+    # The checks that run before resolution do not look at these variables.
+    launcher._check_sglang_environment({name: value})
+
+
+@pytest.mark.parametrize(("ranks", "name", "value"), DP_ENV_ACCEPTED)
+def test_accepted_variables_of_sglang_that_depend_on_the_number_of_ranks(ranks, name, value):
+    launcher._check_dp_environment({name: value}, ranks)
+    launcher._check_dp_environment({}, ranks)
+
+
+def test_every_variable_the_launcher_refuses_under_dp_attention_has_a_test():
+    assert [name for name, _why in launcher._DP_REFUSED_VARIABLES] == [
+        "SGLANG_SCHEDULER_SKIP_ALL_GATHER",
+        "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION",
+    ]
+    assert {name for ranks, name, _value, _refusal in DP_ENV_REFUSALS if ranks > 1} == {
+        name for name, _why in launcher._DP_REFUSED_VARIABLES
+    }
+    assert launcher.ENV_INPUT_BLOCKER == BLOCKER_ENV
+
+
+def test_without_dp_attention_the_blocker_variable_is_refused_once_the_arguments_are_resolved(tmp_path, monkeypatch):
+    launch = _launch(tmp_path, monkeypatch, "decode", env={BLOCKER_ENV: "1"})
+
+    _assert_failed_before_the_grid(launch, 64, f"rejected: {_BLOCKER}")
+    # The number of ranks is SGLang's resolved value, so the refusal comes after resolution and before the
+    # platform is looked at.
+    assert launch.world.events == [
+        "clock",
+        "sglang_version",
+        "load_plugins",
+        "parse_server_args",
+        "resolve",
+        "write",
+        "sleep",
+    ]
+    # The launcher did not touch the variable.
+    assert os.environ[BLOCKER_ENV] == "1"
+
+
+def test_the_variables_that_do_not_depend_on_the_ranks_and_the_resolved_arguments_are_refused_first(
+    tmp_path, monkeypatch
+):
+    def prepare(world, _pod_dir):
+        world.resolved["stream_interval"] = 2
+
+    first = _launch(tmp_path / "a", monkeypatch, "decode", env={BLOCKER_ENV: "1"}, prepare=prepare)
+    _assert_failed_before_the_grid(first, 64, "rejected: stream_interval must be 1 (got 2)")
+
+    second = _launch(tmp_path / "b", monkeypatch, "decode", env={BLOCKER_ENV: "1", "SGLANG_RADIX_FORCE_MISS": "1"})
+    _assert_failed_before_the_grid(second, 64, "rejected: SGLANG_RADIX_FORCE_MISS disables every cache hit")
+    assert "resolve" not in second.world.events
+
+
+@pytest.mark.parametrize("before", [None, "", "0", "false", "no", "1", "TRUE"])
+def test_with_dp_attention_the_launcher_sets_the_blocker_variable_whatever_it_was(tmp_path, monkeypatch, before):
+    seen = {}
+
+    def prepare(world, _pod_dir):
+        world.hooks["resolve"] = lambda: seen.update(at_resolution=os.environ.get(BLOCKER_ENV))
+        world.hooks["build_engine"] = lambda: seen.update(at_the_build=os.environ.get(BLOCKER_ENV))
+
+    env = {} if before is None else {BLOCKER_ENV: before}
+    launch = _launch_dep(tmp_path, monkeypatch, "prefill", prepare=prepare, env=env)
+
+    # The variable was the operator's until the layout was admitted, and "1" from then on.
+    assert seen == {"at_resolution": before, "at_the_build": "1"}
+    assert os.environ[BLOCKER_ENV] == "1"
+    on_disk = _assert_ranks_accepted(launch)
+    # Every FAKE scheduler process found it on when it was built.
+    assert [lines[0]["checks"]["input_blocker"] for lines in _rank_logs(launch)] == [True, True]
+    assert on_disk[0]["producer"][DP_PRODUCER_KEY]["input_blocker"] is True
+
+
+@pytest.mark.parametrize(("ranks", "name", "value", "refusal"), [row for row in DP_ENV_REFUSALS if row[0] == 2])
+def test_a_variable_refused_under_dp_attention_ends_the_launch_before_the_engine_is_built(
+    tmp_path, monkeypatch, ranks, name, value, refusal
+):
+    launch = _launch_dep(tmp_path, monkeypatch, "decode", dp_size=ranks, env={name: value})
+
+    _assert_failed_before_the_grid(launch, 64, f"rejected: {refusal}")
+    assert launch.world.events[-3:] == ["resolve", "write", "sleep"]
+    assert BLOCKER_ENV not in os.environ and launch.result_files() == ["benchmark.json"]
+
+
+def test_a_variable_sglang_sets_while_it_resolves_is_seen_by_the_check_after_resolution(tmp_path, monkeypatch):
+    def prepare(world, _pod_dir):
+        # FAKE of a resolution step that switches the exchange between the ranks off by itself, as SGLang's
+        # DWDP step does.
+        world.hooks["resolve"] = lambda: monkeypatch.setenv("SGLANG_SCHEDULER_SKIP_ALL_GATHER", "True")
+
+    launch = _launch_dep(tmp_path, monkeypatch, "decode", prepare=prepare)
+
+    _assert_failed_before_the_grid(launch, 64, f"rejected: {_SKIP_GATHER}")
+    assert "build_engine" not in launch.world.events
+
+
+def test_the_same_two_variables_do_not_stop_a_launch_with_one_rank(tmp_path, monkeypatch):
+    env = {"SGLANG_SCHEDULER_SKIP_ALL_GATHER": "1", "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION": "1"}
+
+    launch = _launch(tmp_path, monkeypatch, "prefill", env=env)
+
+    _assert_accepted(launch)
+    assert BLOCKER_ENV not in os.environ
+
+
+def test_scheduler_processes_without_the_blocker_are_refused_from_their_headers(tmp_path, monkeypatch):
+    def prepare(world, _pod_dir):
+        # FAKE of scheduler processes that do not see the variable the launcher set.
+        world.hooks["build_engine"] = lambda: os.environ.pop(BLOCKER_ENV)
+
+    launch = _launch_dep(tmp_path, monkeypatch, "decode", prepare=prepare)
+
+    reason = (
+        "rejected: SGLANG_ENABLE_COLOCATED_BATCH_GEN must be set under DP attention (input_blocker=false); the "
+        "launcher sets it before it builds the engine"
+    )
+    on_disk = _assert_failed_before_the_grid(launch, 64, reason)
+    assert launch.world.events[-3:] == ["shutdown", "write", "sleep"]
+    assert [scheduler.input_blocker for scheduler in launch.world.schedulers] == [None, None]
+    # The number of ranks was known by then: a failed rank file for each of them, and no merged file.
+    assert launch.result_files() == ["benchmark.json", "benchmark_dp1.json"]
+    assert on_disk["producer"][DP_PRODUCER_KEY] == DP_ATTENTION_FACTS
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# DP attention: the run settings, the producer block and the result files
+# ---------------------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("tp_size", "dp_size"), [(1, 1), (2, 1), (2, 2), (4, 4)])
+def test_the_resolved_sizes_reach_the_driver_and_the_producer_block(tp_size, dp_size):
+    fields = {**FAKE_RESOLVED_ARGUMENTS, "tp_size": tp_size, "attn_dp_size": dp_size, "max_queued_requests": 64}
+    producer: dict = {"sglang_version": "0.5.23"}
+
+    settings = launcher._resolved_settings(_FakeView(fields), producer)
+
+    # One recorder header is waited for from every scheduler process: SGLang's TP size, which under DP
+    # attention counts the processes of all ranks. The number of ranks is SGLang's attention-DP size.
+    assert settings == {
+        "expected_scheduler_processes": tp_size,
+        "dp_size": dp_size,
+        "prefill_max_requests": None,
+        "max_queued_requests": 64,
+    }
+    assert producer == {"sglang_version": "0.5.23", "tp_size": tp_size, "attn_dp_size": dp_size}
+    # They are fields of the driver's settings record, the second with the default of a run with one rank.
+    names = {field.name: field.default for field in dataclasses.fields(driver.RunSettings)}
+    assert set(settings) <= set(names) and names["dp_size"] == 1
+
+
+@pytest.mark.parametrize("dp_size", [0, None, True, "2", 2.0])
+def test_an_attention_dp_size_that_is_not_a_positive_int_is_never_taken_over(dp_size):
+    fields = {**FAKE_RESOLVED_ARGUMENTS, "attn_dp_size": dp_size}
+    producer: dict = {}
+
+    with pytest.raises(TypeError, match="SGLang's resolved attn_dp_size is .*, not a positive int"):
+        launcher._resolved_settings(_FakeView(fields), producer)
+
+    assert producer == {}
+
+
+@pytest.mark.parametrize("broadcast", [False, True])
+def test_the_blocker_is_switched_on_in_the_mapping_it_is_given_and_recorded(broadcast):
+    fields = {**FAKE_RESOLVED_ARGUMENTS, "enable_dp_attention_local_control_broadcast": broadcast}
+    environ = {BLOCKER_ENV: "0", "FAKE_OTHER": "kept"}
+    producer: dict = {"attn_dp_size": 2}
+
+    launcher._switch_on_input_blocker(_FakeView(fields), environ, producer)
+
+    assert environ == {BLOCKER_ENV: "1", "FAKE_OTHER": "kept"}
+    assert producer == {
+        "attn_dp_size": 2,
+        DP_PRODUCER_KEY: {**DP_ATTENTION_FACTS, "local_control_broadcast": broadcast},
+    }
+    assert type(producer[DP_PRODUCER_KEY]["local_control_broadcast"]) is bool
+    # The block is JSON as it stands, and its keys are no keys of the driver or of the artifact module.
+    assert json.loads(json.dumps(producer[DP_PRODUCER_KEY])) == producer[DP_PRODUCER_KEY]
+    assert launcher.PLACEMENT_ROUND_ROBIN_CHECKED == "round_robin_checked"
+
+
+@pytest.mark.parametrize("broadcast", [None, 1, 0, "true"])
+def test_a_broadcast_field_that_is_not_a_bool_is_an_error_and_nothing_is_set(broadcast):
+    fields = {**FAKE_RESOLVED_ARGUMENTS, "enable_dp_attention_local_control_broadcast": broadcast}
+    environ: dict = {}
+    producer: dict = {}
+
+    with pytest.raises(TypeError, match="enable_dp_attention_local_control_broadcast is .*, not a bool"):
+        launcher._switch_on_input_blocker(_FakeView(fields), environ, producer)
+
+    assert environ == {} and producer == {}
+
+
+def test_a_broadcast_field_that_is_not_a_bool_ends_the_launch_as_an_internal_error(tmp_path, monkeypatch):
+    def prepare(world, _pod_dir):
+        world.resolved["enable_dp_attention_local_control_broadcast"] = "yes"
+
+    launch = _launch_dep(tmp_path, monkeypatch, "prefill", prepare=prepare)
+
+    reason = (
+        "internal_error: TypeError: SGLang's resolved enable_dp_attention_local_control_broadcast is 'yes', not a bool"
+    )
+    on_disk = _assert_failed_before_the_grid(launch, 70, reason)
+    assert "build_engine" not in launch.world.events and BLOCKER_ENV not in os.environ
+    # The sizes were taken over before: both ranks have a failed file, and the block about DP attention,
+    # which is written with the variable, is not there.
+    assert launch.result_files() == ["benchmark.json", "benchmark_dp1.json"]
+    assert on_disk["producer"]["attn_dp_size"] == 2 and DP_PRODUCER_KEY not in on_disk["producer"]
+
+
+def _assert_every_rank_failed(launch: _Launch, code: int, reason: str, dp_size: int = 2) -> list[dict]:
+    """A failed run with several ranks: a failed rank file for every rank with the same reason, no merged file,
+    and both checkers refuse."""
+    _assert_failed(launch, code, reason)
+    rank_paths = launch.rank_paths(dp_size)
+    assert launch.result_files() == [path.name for path in rank_paths]
+    on_disk = [json.loads(path.read_text(encoding="utf-8")) for path in rank_paths]
+    for rank, payload in enumerate(on_disk):
+        assert (payload["status"], payload["valid"], payload["usable"]) == ("failed", False, False)
+        assert (payload["error"], payload["dp"]) == (reason, {"size": dp_size, "rank": rank})
+        assert (payload["run_id"], payload["producer"]) == (on_disk[0]["run_id"], on_disk[0]["producer"])
+    gate = _gate([str(path) for path in rank_paths], launch.cell.workload_kind)
+    assert gate.returncode == GATE_INVALID
+    return on_disk
+
+
+def test_a_point_that_fails_in_a_dep_launch_leaves_a_failed_file_for_every_rank(tmp_path, monkeypatch, capsys):
+    victim = _planned("prefill").points[3]
+
+    def prepare(world, _pod_dir):
+        world.call_faults[(victim.benchmark_id, "meas", 0)] = "engine_error"
+
+    launch = _launch_dep(tmp_path, monkeypatch, "prefill", prepare=prepare)
+
+    reason = (
+        f"benchmark_id={victim.benchmark_id}: benchmark point failed: engine_call_failed: EngineCallError: "
+        "FAKE: the engine call timed out"
+    )
+    on_disk = _assert_every_rank_failed(launch, 65, reason)
+    assert [payload["coverage"]["completed_points"] for payload in on_disk] == [victim.benchmark_id - 1] * 2
+    assert launch.world.events[-3:] == ["shutdown", "write", "sleep"]
+    rank_0, rank_1 = launch.rank_paths(2)
+    assert _stderr_lines(capsys)[-2:] == [
+        f"[sglbench] FAILED: {reason}",
+        f"[sglbench] wrote the failed artifact {rank_0}, {rank_1}",
+    ]
+
+
+@pytest.mark.parametrize("stage", ["self-test", "point"])
+def test_a_request_that_ran_on_another_rank_than_planned_fails_a_dep_launch(tmp_path, monkeypatch, stage):
+    victim = _planned("decode").points[2]
+    key = (0, "free", 1) if stage == "self-test" else (victim.benchmark_id, "run", 0)
+
+    def prepare(world, _pod_dir):
+        # FAKE: one more request reached SGLang's DP controller before this call, so the turn of every
+        # request of the call moved on by one rank.
+        world.call_faults[key] = "stray_request"
+
+    launch = _launch_dep(tmp_path, monkeypatch, "decode", prepare=prepare)
+
+    call = next(call for call in launch.world.calls if call.key == key)
+    assert call.ranks == [1, 0] * (len(call.rids) // 2)
+    detail = (
+        f"dp_rank_placement_mismatch: {call.rids[0]}: the engine reports dp_rank 1, the request was planned for rank 0"
+    )
+    if stage == "self-test":
+        reason = f"self_test_failed: aligned_prefix: {detail}"
+    else:
+        reason = f"benchmark_id={victim.benchmark_id}: benchmark point failed: {detail}"
+    on_disk = _assert_every_rank_failed(launch, 65, reason)
+    # The call was the last one: nothing is staged again after a request ran on another rank.
+    assert launch.world.calls[-1] is call
+    assert on_disk[0]["producer"]["restaged_points"] == []
+
+
+def test_a_cache_miss_on_one_rank_stages_the_point_again_on_every_rank(tmp_path, monkeypatch):
+    victim = next(point for point in _planned("decode").points[1:] if point.cached_tokens > 8)
+
+    def prepare(world, _pod_dir):
+        # FAKE: rank 1 alone dropped its cache just before the run of the point.
+        world.call_faults[(victim.benchmark_id, "run", 0)] = "evict@1"
+
+    launch = _launch_dep(tmp_path, monkeypatch, "decode", prepare=prepare)
+
+    on_disk = _assert_ranks_accepted(launch)
+    assert on_disk[0]["producer"]["restaged_points"] == [victim.benchmark_id]
+    calls = launch.calls_of(victim.benchmark_id)
+    assert [call.key[1:] for call in calls] == [("seed", 0), ("run", 0), ("seed", 1), ("run", 1)]
+    # Each of the four calls went to both ranks, the second attempt too.
+    assert all(call.ranks == [0, 1] * victim.batch_size for call in calls)
+
+
+def _launch_with_a_miss_on_rank_1_above_the_chunk_budget(tmp_path: Path, monkeypatch, replay: bool = True) -> tuple:
+    """A DEP launch in which rank 1 alone drops its cache just before the run of a large decode point.
+
+    The point is the decode point with the most tokens to compute once its cache is gone, more than one
+    extend batch of a rank holds. ``replay`` says whether the FAKE prefill graphs can replay a step, which
+    decides whether the FAKE engine runs a decode step beside an extend batch as an extend batch. Returns the
+    launch, the point and the call of its first run.
+    """
+    victim = max(_planned("decode").points, key=lambda point: point.batch_size * point.cached_tokens)
+    assert victim.batch_size * (victim.cached_tokens - grid.DECODE_PROMPT_LEAD) > _fake_limits(1).chunked_prefill_size
+
+    def prepare(world, _pod_dir):
+        world.call_faults[(victim.benchmark_id, "run", 0)] = "evict@1"
+        world.prefill_graphs_replay = replay
+
+    launch = _launch_dep(tmp_path, monkeypatch, "decode", prepare=prepare)
+    (run,) = [call for call in launch.world.calls if call.key == (victim.benchmark_id, "run", 0)]
+    return launch, victim, run
+
+
+def test_a_cache_miss_on_one_rank_whose_neighbour_decodes_meanwhile_is_staged_again(tmp_path, monkeypatch):
+    launch, victim, run = _launch_with_a_miss_on_rank_1_above_the_chunk_budget(tmp_path, monkeypatch)
+
+    # Rank 1 computed its whole prompts again, in more extend batches than rank 0 has decode steps. Rank 0 hit
+    # its cache: one extend batch, and then its six decode steps, each beside an extend batch of rank 1. The
+    # FAKE engine ran those six steps as SGLang does, as extend batches of one token per request.
+    batch = victim.batch_size
+    assert run.rank_modes[0] == ["EXTEND"] * 7
+    assert run.rank_modes[1][:8] == ["EXTEND"] * 8 and run.rank_modes[1][-6:] == ["DECODE"] * 6
+    # The real recorder wrote them as what they were: the log of rank 0 holds seven EXTEND lines for the run
+    # and no DECODE line. Each of the six holds exactly the requests of rank 0, with one computed token for
+    # each after its prompt and the output tokens before, and the count of a decode batch for its rank.
+    first = _rank_logs(launch)[0][1:]
+    mine = [line for line in first if set(line["rids"]) & set(run.rids)]
+    assert [line["mode"] for line in mine] == ["EXTEND"] * 7
+    for step, line in enumerate(mine[1:]):
+        assert sorted(line["rids"]) == sorted(run.rids[0::2])
+        assert (line["extend_lens"], line["extend_num_tokens"]) == ([1] * batch, batch)
+        assert line["prefix_lens"] == [len(prompt) + step for prompt in run.prompts[0::2]]
+        assert line["global_num_tokens"][0] == batch < line["global_num_tokens"][1]
+
+    # The driver saw the missed cache in the answers of rank 1 before it waited for decode batches, staged
+    # the point again on both ranks and kept the second attempt. The log wait never ran to its deadline.
+    on_disk = _assert_ranks_accepted(launch)
+    assert on_disk[0]["producer"]["restaged_points"] == [victim.benchmark_id]
+    calls = launch.calls_of(victim.benchmark_id)
+    assert [call.key[1:] for call in calls] == [("seed", 0), ("run", 0), ("seed", 1), ("run", 1)]
+    assert calls[-1].rank_modes == [["EXTEND"] + ["DECODE"] * 6] * 2
+    assert driver.POLL_SECONDS not in launch.world.clock.sleeps
+
+
+@pytest.mark.parametrize("replay", [True, False], ids=["decode-steps-as-extend", "decode-batches-kept"])
+def test_a_rank_that_idles_while_another_one_works_writes_idle_lines_the_run_does_not_trip_over(
+    tmp_path, monkeypatch, replay
+):
+    launch, victim, run = _launch_with_a_miss_on_rank_1_above_the_chunk_budget(tmp_path, monkeypatch, replay)
+
+    # Rank 1 computed its whole prompts again, in more extend batches than the chunk budget lets rank 0 need,
+    # and rank 0 had nothing left to run while rank 1 still worked. On a FAKE engine whose prefill graphs
+    # cannot replay a step, rank 0 kept its six decode batches meanwhile.
+    assert len(run.rank_modes[1]) > len(run.rank_modes[0]) == 7
+    assert run.rank_modes[0] == (["EXTEND"] * 7 if replay else ["EXTEND"] + ["DECODE"] * 6)
+    first, second = (lines[1:] for lines in _rank_logs(launch))
+    idle = [line for line in first if line["mode"] == "IDLE"]
+    assert len(idle) == len(run.rank_modes[1]) - len(run.rank_modes[0]) and not [
+        line for line in second if line["mode"] == "IDLE"
+    ]
+    # The real recorder wrote each idle batch as a line without a request and without a fault: rank 0 ran
+    # nothing in that step and rank 1 did.
+    for line in idle:
+        assert (line["rids"], line["extend_num_tokens"], line["prefix_lens"], line["extend_lens"]) == (
+            [],
+            None,
+            None,
+            None,
+        )
+        assert line["global_num_tokens"][0] == 0 < line["global_num_tokens"][1]
+    assert len(first) == len(second) and [line["forward_iter"] for line in first] == [
+        line["forward_iter"] for line in second
+    ]
+    # The driver read past the idle lines, saw the missed cache in the answers of rank 1 and staged the point
+    # again on both ranks. The run is complete.
+    on_disk = _assert_ranks_accepted(launch)
+    assert on_disk[0]["producer"]["restaged_points"] == [victim.benchmark_id]
+
+
+def test_the_soft_deadline_ends_a_dep_launch_with_a_partial_file_for_every_rank(tmp_path, monkeypatch):
+    planned = _planned("decode")
+    last_done = planned.points[1]
+
+    def prepare(world, _pod_dir):
+        world.call_faults[(last_done.benchmark_id, "run", 0)] = "deadline"
+
+    launch = _launch_dep(tmp_path, monkeypatch, "decode", prepare=prepare)
+
+    assert launch.code == 66
+    assert launch.result_files() == ["benchmark.json", "benchmark_dp1.json", "benchmark_merged.json"]
+    for rank, path in enumerate(launch.rank_paths(2)):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert (payload["status"], payload["stop_reason"], payload["dp"]) == (
+            "partial",
+            "timeout",
+            {"size": 2, "rank": rank},
+        )
+        assert payload["coverage"]["completed_points"] == last_done.benchmark_id
+    assert _gate([str(path) for path in launch.rank_paths(2)], "decode").returncode == GATE_INVALID
+
+
+# Names the artifact module can be asked to derive rank files from, also ones AISim never renders.
+OUTPUT_NAMES = [
+    "benchmark.json",
+    "benchmark_results.json",
+    "benchmark",
+    "a.b.json",
+    "x_dp1.json",
+    "x_dp.json",
+    ".hidden.json",
+    ".hidden",
+    "benchmark_merged.json",
+    "1.2",
+]
+
+
+@pytest.mark.parametrize("name", OUTPUT_NAMES)
+def test_the_name_of_a_rank_file_is_read_off_the_artifact_module(tmp_path, name):
+    output = str(tmp_path / name)
+    head, tail = launcher._rank_file_frame(output)
+    rank_0, merged = launcher._result_paths(output)
+    assert (rank_0, merged) == (output, artifact.merged_output_path(output))
+    for rank in (1, 2, 9, 10, 11, 123, 4096):
+        # The file the writer would write for this rank is one the launcher takes for a rank file.
+        written = artifact.rank_output_path(output, rank)
+        assert Path(written).name == f"{head}{rank}{tail}"
+        assert launcher._is_rank_file_name(Path(written).name, head, tail)
+        assert launcher._is_result_file(output, written)
+    # The file of rank 0 and the merged file are result files and have no name of a rank above 0.
+    for own in (rank_0, merged):
+        assert launcher._is_result_file(output, own) and not launcher._is_rank_file_name(Path(own).name, head, tail)
+    # A name with nothing, or with more than digits, in the place of the rank is none. The last one is a digit
+    # of another script, which is no digit of a rank.
+    for middle in ("", "x", "1x", "x1", "-1", "1.5", " 1", "1 ", chr(0x661)):
+        assert chr(0x661).isdigit() and not launcher._is_rank_file_name(f"{head}{middle}{tail}", head, tail), middle
+    assert not launcher._is_rank_file_name(f"x{head}1{tail}", head, tail)
+    assert not launcher._is_rank_file_name(f"{head}1{tail}x", head, tail)
+    # The same name in another directory is another file.
+    assert not launcher._is_result_file(output, str(tmp_path / "other" / f"{head}1{tail}"))
+    assert not launcher._is_result_file(output, str(tmp_path / "other" / name))
+
+
+def test_the_old_outputs_are_the_rank_files_of_every_rank_and_the_merged_file(tmp_path):
+    output = tmp_path / "pod" / "benchmark.json"
+    # A directory that does not exist yet holds nothing to delete beyond the two fixed names.
+    assert launcher._old_outputs(str(output)) == [str(output), str(output.with_name("benchmark_merged.json"))]
+
+    output.parent.mkdir()
+    for name in (*OTHER_FILES, *STALE_RESULT_FILES):
+        (output.parent / name).parent.mkdir(parents=True, exist_ok=True)
+        (output.parent / name).write_bytes(b"{}")
+    assert launcher._old_outputs(str(output)) == [
+        str(output),
+        str(output.with_name("benchmark_merged.json")),
+        *(str(output.with_name(name)) for name in sorted(STALE_RESULT_FILES) if name.startswith("benchmark_dp")),
+    ]
+    launcher._remove_old_outputs(str(output))
+    left = sorted(str(path.relative_to(output.parent)) for path in output.parent.rglob("*") if path.is_file())
+    assert left == sorted(OTHER_FILES)
+
+
+@pytest.mark.parametrize(
+    "name", ["benchmark_dp1.json", "benchmark_dp2.json", "benchmark_dp17.json", "./benchmark_dp3.json"]
+)
+def test_a_dump_path_that_is_the_file_of_another_rank_is_refused(tmp_path, monkeypatch, name):
+    monkeypatch.chdir(tmp_path)
+
+    options = _options(["--benchmark-output-path", f"{tmp_path}/benchmark.json", "--dump-config-to", name])
+
+    assert options.rejection == f"--dump-config-to {name!r} is one of the result files of the run"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "resolved-config-node0.json",
+        "benchmark_dp.json",
+        "benchmark_dpx.json",
+        "benchmark_dp1.json.txt",
+        "benchmark_dp1_merged.json",
+        "other/benchmark_dp1.json",
+        "other/benchmark.json",
+    ],
+)
+def test_a_dump_path_that_only_looks_like_a_result_file_is_accepted(tmp_path, monkeypatch, name):
+    monkeypatch.chdir(tmp_path)
+
+    options = _options(["--benchmark-output-path", f"{tmp_path}/benchmark.json", "--dump-config-to", name])
+
+    assert options.rejection is None and options.dump_config_to == name
+
+
+def test_the_rank_files_of_an_earlier_launch_with_more_ranks_are_gone_after_the_next_launch(tmp_path, monkeypatch):
+    first = _launch_dep(tmp_path, monkeypatch, "decode", dp_size=3)
+    _assert_ranks_accepted(first, 3)
+    assert first.result_files() == [
+        "benchmark.json",
+        "benchmark_dp1.json",
+        "benchmark_dp2.json",
+        "benchmark_merged.json",
+    ]
+    first_run = first.artifact()["run_id"]
+
+    # A second launcher process starts without the variable the first one set for itself.
+    monkeypatch.delenv(BLOCKER_ENV)
+    second = _launch_dep(tmp_path / "again", monkeypatch, "decode", dp_size=2, pod_dir=first.pod)
+
+    assert second.code == 0 and second.pod == first.pod
+    assert second.result_files() == ["benchmark.json", "benchmark_dp1.json", "benchmark_merged.json"]
+    for path in second.rank_paths(2):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["run_id"] != first_run and payload["dp"]["size"] == 2
+
+
+def test_the_flags_of_dp_attention_go_to_sglang_as_they_were_typed():
+    argv = [
+        "--tp-size",
+        "2",
+        "--attn-dp-size",
+        "2",
+        "--ep-size=2",
+        "--enable-dp-attention-local-control-broadcast",
+        "--load-balance-method",
+        "round_robin",
+    ]
+
+    options = _options(argv)
+
+    # None of them is a flag of the launcher: all pass to SGLang's parser, in their order.
+    assert (options.rejection, options.sglang_argv) == (None, [*argv, STREAMING_FLAG])
+    own = {action.dest for action in launcher._build_parser()._actions}
+    assert not {name for name in own if "dp" in name.split("_")}
+
+
+def test_the_module_says_what_ran_with_dp_attention_and_holds_the_deviation_note_of_the_blocker():
+    docstring = " ".join(launcher.__doc__.split())
+    assert "With DP attention this launcher ran on engines on 2026-11-18, with SGLang 0.5.22 and 0.5.23" in docstring
+    assert "--tp-size 2 --ep-size 2 --attn-dp-size 2" in docstring
+    # It says what did not run, and that the spike of the same day was not a run of the launcher.
+    assert "Not run on an engine under DP attention: more than four ranks, and four ranks in any cell but" in docstring
+    assert "The launcher did not run in it." in docstring
+    note = " ".join(launcher._switch_on_input_blocker.__doc__.split())
+    for part in (
+        "Deviation note (SGLang's input blocker is switched on under DP attention).",
+        "What differs:",
+        "Direction of the error:",
+        "Sources:",
+        "How to retire it:",
+        "In the runs of 2026-11-18 (module docstring) the launcher set the variable",
+    ):
+        assert part in note, part
+    # The four modules say the same about what ran: each names the day, the two releases and the layout.
+    for module in (compat, driver, recorder):
+        text = " ".join(module.__doc__.split())
+        assert "2026-11-18" in text and "0.5.22 and 0.5.23" in text, module.__name__
+        assert "--tp-size 2 --ep-size 2 --attn-dp-size 2" in text, module.__name__
+    assert "Run on engines with DP attention on 2026-11-18 through sglbench_launcher.py" in " ".join(
+        compat.__doc__.split()
+    )
+    # No sentence of the old state is left in any of them.
+    for module in (launcher, compat, driver, recorder):
+        text = " ".join(Path(module.__file__).read_text(encoding="utf-8").split())
+        for old in ("has not run on an engine", "Not run through this", "Not seen through this module"):
+            assert old not in text, (module.__name__, old)
+    assert "No refusal of this function was run on an engine" in " ".join(launcher._check_dp_attention.__doc__.split())
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# What a launch with one attention-DP rank sends and writes. Without the low end of the prefill new-token axis
+# it is what the launcher sent and wrote before it knew DP attention; with it, the same and the added points.
+# ---------------------------------------------------------------------------------------------------------------
+
+# A FAKE run id that is the same in every launch, so that the request ids and the result files repeat.
+FAKE_FIXED_RUN_ID = "5eedfacade5eedfacade5eedfacade00"
+
+# name: (mode, page size, FAKE scheduler processes, content word, expert keys of the FAKE model, SGLang flags)
+ONE_RANK_LAUNCHES = {
+    "seeded-prefill-tp1": ("prefill", 1, 1, None, {}, []),
+    "seeded-agg-tp2": ("agg", 16, 2, None, {}, []),
+    "text-prefill-tp1": ("prefill", 64, 1, "sharegpt_chain", {}, []),
+    "text-decode-tep2": ("decode", 1, 2, None, FAKE_EXPERTS, ["--ep-size", "2"]),
+}
+
+# SHA-256 of what each of those launches sent, wrote as result files and logged (``_one_rank_digests``) when
+# its prefill new-token axis is planned as it was before the axis had a low end: 1 in front of the graph axis
+# and nothing more (``_plan_without_the_low_end``).
+# They were taken once from the launcher and the accessor module as they stood before DP attention, loaded
+# beside the present driver and recorder: the two files of the commit before this change, with ``driver.RANK``,
+# a constant the driver no longer has, typed as 0. The result files are hashed without ``producer.attn_dp_size``,
+# the one key the launcher writes since. A change that is meant to alter what a launch with one rank sends or
+# writes for the points it planned then has to retype them, and the digests of ``ONE_RANK_DIGESTS`` with them.
+ONE_RANK_DIGESTS_WITHOUT_THE_LOW_END = {
+    "seeded-prefill-tp1": {
+        "calls": "4481acf436e2e4105a21581e8e6901533e0d4467aafe93e81c6be8f682a3d9fb",
+        "results": "942cdb57d69b1cfed40d5a939b25d7df9bd7a1941ac39546f2fd18fd4447f27e",
+        "logs": "16a81d1c055d1e95a4a617bfbb23c49f9bb54c6710560f08a1b70b3e00958ffe",
+    },
+    "seeded-agg-tp2": {
+        "calls": "177a96a7adf7ba38b0baec5d391abcea06451cc37c22e6ec8ddc456729f07450",
+        "results": "f888c8d33847412ac291f41c815a81d746c41cf6da1089cff971dbb88ab1ab3a",
+        "logs": "5873b775602c63aa554a5965ea35a846dfd3a1ee4a0ae6218bc2fe09ba1b1159",
+    },
+    "text-prefill-tp1": {
+        "calls": "f3e97d41680895354ed4481090e801ee83deaca5171e42fb6276ec895bcc52bb",
+        "results": "a5f7c792463b778305f858175f121abe4082f7d701d6adc1f17548cc9baf3c18",
+        "logs": "a20366f850a55f629096003041bc0aec5f318c043938050fb82eb7edcc3f8f41",
+    },
+    "text-decode-tep2": {
+        "calls": "bfcb8e156c7e0039f868abd6e0db62d6ac88a378e2de14e841cb5fc8a5860799",
+        "results": "6ee2f1c5a32cee0012e04808f2056115fc9b4682677c80a1749c0d80317e4434",
+        "logs": "da15318e7d7bc7dc2d232df27affa4281567a1b5b73b715de0fa091c35c0cd39",
+    },
+}
+
+# What the low end adds to each of those launches: the batch size and the cached tokens per request of the
+# points of 2 new tokens per request, in the order they run. Typed here from the rules of the axes. The FAKE
+# prefill graph sizes start at 4, so a batch of 2 tokens is the smallest that runs with a graph, and 2 joins 1
+# on the axis. The small caps keep batch 1 and 2 for it, and three cached prefixes for each batch size: the
+# candidates are 0, the cached unit doubled up to the longest prefix, and the longest prefix, and the cap
+# keeps the first, the middle one and the last. Beside 2 new tokens the longest prefix below the FAKE input
+# limit is 416 tokens of 428 at page sizes 1 and 16 (unit 16: 0, 16, 32, 64, 128, 256, 416) and 768 tokens of
+# 812 at page size 64 (unit 64: 0, 64, 128, 256, 512, 768, where the middle of six is the fourth). The larger
+# batch runs first, and of its prefixes the longer one. A decode run has no prefill block.
+ONE_RANK_LOW_END_POINTS = {
+    "seeded-prefill-tp1": [(2, 416), (2, 64), (2, 0), (1, 416), (1, 64), (1, 0)],
+    "seeded-agg-tp2": [(2, 416), (2, 64), (2, 0), (1, 416), (1, 64), (1, 0)],
+    "text-prefill-tp1": [(2, 768), (2, 256), (2, 0), (1, 768), (1, 256), (1, 0)],
+    "text-decode-tep2": [],
+}
+
+# The same three digests of the launches as they are planned now, with the low end. A digest cannot be typed
+# from a rule: these were taken from the launcher as it stands. Three tests show that they are the digests of
+# the right launch. Without the low end the launch still gives the digests above. With it the launch is
+# accepted row by row against the plan. And the two launches are compared: they differ by the points of
+# ``ONE_RANK_LOW_END_POINTS`` and by what follows from them
+# (``test_the_low_end_adds_its_points_to_a_launch_with_one_rank_and_leaves_the_other_points_as_they_were``).
+# The decode launch plans what it planned before and keeps its digests. A change to the low end has to retype
+# these and no digest above.
+ONE_RANK_DIGESTS = {
+    "seeded-prefill-tp1": {
+        "calls": "bd90820b51553944b7d208ba7e22dc7aca457f2586f25ee3437e2d5409c4293a",
+        "results": "dc74faf11f7ab0eb99bc1fb6baff4600e96bd6d58aaf7e3a6ef6a2e414cad887",
+        "logs": "4de8ed3ad318e52d314d892262cb163ea62c86ecff78d5ae8870c045e825e4cc",
+    },
+    "seeded-agg-tp2": {
+        "calls": "0a62c219b7196115f933ef84001fe4a5fcf81b441c9722af0c7d6297a737acf3",
+        "results": "39cc9ed0c393e57325f1a2c1b167806a7af10cdfb0efa85775004daa5121ca6d",
+        "logs": "29d35e3056168bf3d26b09fe82e4cdd24839d6bab083a928d60a6e495d97af8d",
+    },
+    "text-prefill-tp1": {
+        "calls": "66e99d04e6f19cbf68b54779f2a40b4ed0654eec1bd89e5eb68cc066a571bc1f",
+        "results": "91f53ca9e8bda161a8ef91a141e02e4a3470dff048af4eb6a3d4210ca6f25f86",
+        "logs": "f54d519535a3a5b9ac3f687c5a50f30a45c79f24bd5808961bfefbe05ebce77d",
+    },
+    "text-decode-tep2": ONE_RANK_DIGESTS_WITHOUT_THE_LOW_END["text-decode-tep2"],
+}
+
+
+def _plan_without_the_low_end(monkeypatch) -> None:
+    """Make the grid module plan the prefill new-token axis as it did before the axis had a low end.
+
+    The axis was 1 in front of the cut graph axis. It is that again when the module finds no first batch that
+    runs with a graph. ``first_prefill_graph_tokens`` is replaced in ``sglbench_grid`` itself, the one module
+    object the launcher, the driver and this file plan with, so a launch and what a test expects of it change
+    together. Nothing else of the benchmark is replaced.
+    """
+    assert launcher.grid is grid and driver.grid is grid
+    # 4, 65 and 96 are what the small cap of three leaves of the graph axis of the FAKE limits at page size 1.
+    assert grid.prefill_new_token_axis(_fake_limits(1), SMALL_CAPS) == [1, 2, 4, 65, 96]
+    monkeypatch.setattr(grid, "first_prefill_graph_tokens", lambda graph_sizes: None)
+    assert grid.prefill_new_token_axis(_fake_limits(1), SMALL_CAPS) == [1, 4, 65, 96]
+
+
+def _launch_one_rank(tmp_path: Path, monkeypatch, name: str) -> _Launch:
+    """One of ``ONE_RANK_LAUNCHES``, end to end against the FAKE sglang package, with the fixed FAKE run id."""
+    mode, page_size, tp_size, word, experts, flags = ONE_RANK_LAUNCHES[name]
+    fixed = types.SimpleNamespace(uuid4=lambda: types.SimpleNamespace(hex=FAKE_FIXED_RUN_ID))
+    monkeypatch.setattr(launcher, "uuid", fixed)
+    options = {
+        "page_size": page_size,
+        "tp_size": tp_size,
+        "flags": flags,
+        "prepare": lambda world, _pod_dir: setattr(world, "experts", experts),
+        "real_compat": True,
+    }
+    if word is not None or experts:
+        return _launch_text(tmp_path, monkeypatch, mode, word=word, **options)
+    return _launch(tmp_path, monkeypatch, mode, **options)
+
+
+def _one_rank_digests(launch: _Launch) -> dict:
+    """What a launch sent and wrote, as three SHA-256 digests.
+
+    ``calls``: the prompts, the request ids and the output-token count of every engine call, with the time
+    limit. ``results``: every result file, parsed, in the key order it was written in and without
+    ``producer.attn_dp_size``. ``logs``: every recorder log. The directory of the test is written as a fixed
+    word, because it differs from run to run. So is the process id of the test in a launch with one FAKE
+    scheduler process, whose recorder takes that id; with several processes the ids in the log are FAKE ones.
+    """
+    root = str(launch.root)
+    real_pid = os.getpid() if len(launch.world.processes) == 1 else None
+
+    def digest(text: str) -> str:
+        return hashlib.sha256(text.replace(root, "<ROOT>").encode()).hexdigest()
+
+    calls = [[call.prompts, call.rids, call.max_new_tokens, call.timeout_seconds] for call in launch.world.calls]
+    results = []
+    for name in launch.result_files():
+        payload = json.loads((launch.pod / name).read_text(encoding="utf-8"))
+        if isinstance(payload.get("producer"), dict):
+            payload["producer"].pop("attn_dp_size", None)
+        results.append([name, payload])
+    logs = []
+    for recorder_dir in launch.recorder_dirs():
+        for path in sorted(recorder_dir.iterdir()):
+            name, text = path.name, path.read_text(encoding="utf-8")
+            if real_pid is not None:
+                name = name.replace(f"-{real_pid}.", "-<PID>.")
+                text = text.replace(f'"pid":{real_pid},', '"pid":"<PID>",')
+            logs.append([recorder_dir.name, name, text])
+    return {
+        "calls": digest(json.dumps(calls)),
+        "results": digest(json.dumps(results)),
+        "logs": digest(json.dumps(logs)),
+    }
+
+
+@pytest.mark.parametrize("name", list(ONE_RANK_LAUNCHES))
+def test_a_launch_with_one_rank_and_without_the_low_end_sends_and_writes_what_it_did_before_dp_attention(
+    tmp_path, monkeypatch, name
+):
+    _plan_without_the_low_end(monkeypatch)
+    launch = _launch_one_rank(tmp_path, monkeypatch, name)
+
+    # One function of the grid module is replaced, by ``_plan_without_the_low_end``, and nothing else.
+    _assert_no_module_of_the_benchmark_is_replaced()
+    on_disk = _assert_accepted(launch)
+    assert on_disk["run_id"] == FAKE_FIXED_RUN_ID and len(launch.world.calls) > 20
+    # What the result files have gained is the one key, with the value of a run without DP attention.
+    assert on_disk["producer"]["attn_dp_size"] == 1 and DP_PRODUCER_KEY not in on_disk["producer"]
+    assert _one_rank_digests(launch) == ONE_RANK_DIGESTS_WITHOUT_THE_LOW_END[name]
+
+
+@pytest.mark.parametrize("name", list(ONE_RANK_LAUNCHES))
+def test_a_launch_with_one_rank_sends_and_writes_what_it_did_when_the_low_end_was_added(tmp_path, monkeypatch, name):
+    launch = _launch_one_rank(tmp_path, monkeypatch, name)
+
+    _assert_no_module_of_the_benchmark_is_replaced()
+    on_disk = _assert_accepted(launch)
+    assert on_disk["run_id"] == FAKE_FIXED_RUN_ID and len(launch.world.calls) > 20
+    assert on_disk["producer"]["attn_dp_size"] == 1 and DP_PRODUCER_KEY not in on_disk["producer"]
+    assert _one_rank_digests(launch) == ONE_RANK_DIGESTS[name]
+
+
+@pytest.mark.parametrize("name", list(ONE_RANK_LAUNCHES))
+def test_the_low_end_adds_its_points_to_a_launch_with_one_rank_and_leaves_the_other_points_as_they_were(
+    tmp_path, monkeypatch, name
+):
+    """What separates the two tables of digests, shown on the two launches themselves.
+
+    The launch with the low end runs the points of ``ONE_RANK_LOW_END_POINTS`` and is, in every other point,
+    the launch without it: the same points in the same order, the same rows but for the ids, the same calls up
+    to the first added point, and after it calls of the same shape. The shots of the prefill points that run
+    after the added ones are the only calls that carry other tokens than before: the tokens of a shot follow
+    from how many shots of its kind were issued before it, and the added shots are issued before those.
+    """
+    launch = _launch_one_rank(tmp_path / "with", monkeypatch, name)
+    points = launch.planned().points
+    monkeypatch.delenv(RECORDER_ENV, raising=False)
+    _plan_without_the_low_end(monkeypatch)
+    before = _launch_one_rank(tmp_path / "without", monkeypatch, name)
+    assert (launch.code, before.code) == (0, 0)
+
+    added = [point for point in points if point.phase == grid.PREFILL and point.new_tokens == 2]
+    assert [(point.batch_size, point.cached_tokens) for point in added] == ONE_RANK_LOW_END_POINTS[name]
+    added_ids = [point.benchmark_id for point in added]
+
+    def id_before(benchmark_id: int) -> int:
+        """The id a point has in the launch without the added points: one less for each that runs before it."""
+        return benchmark_id - sum(1 for added_id in added_ids if added_id < benchmark_id)
+
+    # The plan: the other points are the points of the launch without the low end, in its order.
+    others = [point for point in points if point not in added]
+    assert [dataclasses.replace(point, benchmark_id=id_before(point.benchmark_id)) for point in others] == list(
+        before.planned().points
+    )
+
+    # The result files, the rank file and the merged file.
+    assert launch.result_files() == before.result_files() == ["benchmark.json", "benchmark_merged.json"]
+    for file_name in launch.result_files():
+        payloads = [json.loads((run.pod / file_name).read_text(encoding="utf-8")) for run in (launch, before)]
+        # The rows of the other points are the rows of the launch without the low end, but for the two ids a
+        # row carries.
+        rows = [row for row in payloads[0]["results"] if row["point"]["benchmark_id"] not in added_ids]
+        for row in rows:
+            row["point"]["benchmark_id"] = id_before(row["point"]["benchmark_id"])
+            for fpm in row["fpms"]:
+                fpm["counter_id"] = id_before(fpm["counter_id"])
+        assert len(rows) == len(others) and rows == payloads[1]["results"]
+        # The rest of the file is its file, but for the blocks that count points, prompts or FAKE time.
+        rest = []
+        for run, payload in zip((launch, before), payloads, strict=True):
+            for key in ("results", "iteration_groups", "coverage", "grid_digest", "timing"):
+                del payload[key]
+            del payload["producer"]["content"]["issued"], payload["producer"]["first_token_need"]
+            rest.append(json.dumps(payload).replace(str(run.root), "<ROOT>"))
+        assert rest[0] == rest[1]
+
+    def sent(call: _FakeCall) -> list:
+        return [call.prompts, call.rids, call.max_new_tokens, call.timeout_seconds]
+
+    def lengths(call: _FakeCall) -> list[int]:
+        return [len(prompt) for prompt in call.prompts]
+
+    # The calls up to the first added point are the calls of the launch without the low end, to the last token
+    # and the last request id.
+    calls, calls_before = launch.world.calls, before.world.calls
+    first = next((index for index, call in enumerate(calls) if call.key[0] in added_ids), len(calls))
+    assert first > 20 and [sent(call) for call in calls[:first]] == [sent(call) for call in calls_before[:first]]
+    # The calls of the other points are its calls in stage, prompt lengths, output tokens and time limit.
+    other_calls = [call for call in calls if call.key[0] not in added_ids]
+    assert [
+        (id_before(call.key[0]), *call.key[1:], lengths(call), call.max_new_tokens, call.timeout_seconds)
+        for call in other_calls
+    ] == [(*call.key, lengths(call), call.max_new_tokens, call.timeout_seconds) for call in calls_before]
+    # Other tokens went out for the shots of the prefill points after the added ones, and for nothing else:
+    # every seed and every decode run sends the prefix of its slot, which no earlier call changes.
+    changed = [call.key for call, old in zip(other_calls, calls_before, strict=True) if call.prompts != old.prompts]
+    last_added = max(added_ids, default=len(points))
+    later = [point for point in others if point.phase == grid.PREFILL and point.benchmark_id > last_added]
+    assert changed == [(point.benchmark_id, stage, 0) for point in later for stage in ("warm", "meas")]
+    assert len(later) == len(added) and {point.new_tokens for point in later} <= {1}
+    # Each call of an added point is one FAKE batch more in the log of every FAKE scheduler process.
+    more = len(calls) - len(calls_before)
+    assert more == sum(3 if cached else 2 for _batch, cached in ONE_RANK_LOW_END_POINTS[name])
+    (log_dir,), (log_dir_before,) = launch.recorder_dirs(), before.recorder_dirs()
+    for log, log_before in zip(sorted(log_dir.iterdir()), sorted(log_dir_before.iterdir()), strict=True):
+        lines, lines_before = (path.read_text(encoding="utf-8").splitlines() for path in (log, log_before))
+        assert len(lines) == len(lines_before) + more
+
+
+def test_the_digests_of_a_launch_with_one_rank_notice_a_change(tmp_path, monkeypatch):
+    launch = _launch_one_rank(tmp_path, monkeypatch, "seeded-prefill-tp1")
+    before = _one_rank_digests(launch)
+
+    # One more token in one prompt, one more key in one result file, one more line in one log.
+    launch.world.calls[3].prompts[0].append(7)
+    payload = launch.artifact()
+    payload["producer"]["FAKE_new_key"] = 1
+    launch.rank_path.write_text(json.dumps(payload), encoding="utf-8")
+    (log,) = sorted(launch.recorder_dirs()[0].iterdir())
+    log.write_text(log.read_text(encoding="utf-8") + "{}\n", encoding="utf-8")
+
+    after = _one_rank_digests(launch)
+    assert [after[key] != before[key] for key in ("calls", "results", "logs")] == [True, True, True]
+    # The same launch in another directory has the same digests.
+    monkeypatch.delenv(RECORDER_ENV, raising=False)
+    again = _launch_one_rank(tmp_path / "elsewhere", monkeypatch, "seeded-prefill-tp1")
+    assert _one_rank_digests(again) == before == ONE_RANK_DIGESTS["seeded-prefill-tp1"]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The two lines about a prefill grid the KV pool cut
+# ---------------------------------------------------------------------------------------------------------------
+
+# The second line: where a pool comes from. The same in every case.
+POOL_LEVER_LINE = (
+    "[sglbench] a larger pool needs a larger memory share (SGLang's --mem-fraction-static, which a plan of AISim's "
+    "collector gives as --fpm-gpu-memory-utilization), or a larger --max-total-tokens where the command gives one"
+)
+# The prefill new-token axis of the FAKE limits with the launcher's default caps, by page size, typed here from
+# the rule. The FAKE prefill graph sizes are 4, 8, 16, 32 and 64, and the largest request is the FAKE chunk
+# budget: 96 tokens at page size 1 and 384 at page size 64. The axis holds every size c and c + 1, the
+# doublings of 64 that the largest request leaves room for, the largest request, and the low end: 1 and 2,
+# because a batch of 2 tokens is the smallest that SGLang runs with the graph of 4. The cap of 64 values cuts
+# nothing.
+FAKE_NEW_TOKEN_AXIS = {
+    1: [1, 2, 4, 5, 8, 9, 16, 17, 32, 33, 64, 65, 96],
+    64: [1, 2, 4, 5, 8, 9, 16, 17, 32, 33, 64, 65, 128, 256, 384],
+}
+
+# For the FAKE limits at page 1 and the launcher's default caps, typed here on their own. The 32 pairs are
+# batch 1, 2 and 4 for each n of 1, 2, 4, 5, 8, 9, 16 and 17, batch 1, 2 and 3 for 32, batch 1 and 2 for 33 and
+# batch 1 for 64, 65 and 96. The pool of 1,184 tokens ends the cached prefix of the 8 pairs at batch 4 and of
+# the pair of n = 32 at batch 3, and the longest batch of four, 4 * (425 + 2) = 1,708 tokens, must stay below
+# the pool. ``test_the_numbers_of_the_pool_lines_are_the_ones_a_count_from_the_feasibility_rule_gives`` counts
+# the numbers of this line and of the three after it.
+POOL_CUT_LINES = [
+    "[sglbench] the KV pool of one rank, 1184 tokens, cuts the prefill grid: of the 32 pairs of new tokens and "
+    "batch size planned without the pool limit, pairs left out: 0, pairs that end at a shorter cached prefix: 9; "
+    "a pool of 1709 tokens holds the whole grid",
+    POOL_LEVER_LINE,
+]
+# At page size 64: I = 812, S = 2304 and a cached unit of 64 tokens. The 41 pairs are batch 1, 2 and 4 for each
+# of the 11 values of n up to 64, batch 1, 2 and 3 for 65 and for 128, and batch 1 for 256 and 384. The pool
+# shortens the 11 pairs at batch 4 and the 2 at batch 3, and the longest batch of four,
+# 4 * (768 + 64 + 65) = 3,588 tokens, must stay below a pool of whole pages.
+POOL_CUT_LINES_AT_PAGE_64 = [
+    "[sglbench] the KV pool of one rank, 2304 tokens, cuts the prefill grid: of the 41 pairs of new tokens and "
+    "batch size planned without the pool limit, pairs left out: 0, pairs that end at a shorter cached prefix: 13; "
+    "a pool of 3648 tokens holds the whole grid",
+    POOL_LEVER_LINE,
+]
+# A pool of 2 tokens at page 1 holds no request: every one of the 32 pairs is left out.
+POOL_CUT_LINES_WITHOUT_A_PAIR = [
+    "[sglbench] the KV pool of one rank, 2 tokens, cuts the prefill grid: of the 32 pairs of new tokens and "
+    "batch size planned without the pool limit, pairs left out: 32, pairs that end at a shorter cached prefix: 0; "
+    "a pool of 1709 tokens holds the whole grid",
+    POOL_LEVER_LINE,
+]
+# A pool of 434 tokens at page 1, the FAKE input limit of 428 and 6: it keeps every pair and shortens the 10 at
+# batch 2 (every n up to 33), the 8 at batch 4 and the one at batch 3.
+POOL_CUT_LINES_NOT_ABOVE_THE_CONTEXT = [
+    "[sglbench] the KV pool of one rank, 434 tokens, cuts the prefill grid: of the 32 pairs of new tokens and "
+    "batch size planned without the pool limit, pairs left out: 0, pairs that end at a shorter cached prefix: 19; "
+    "with the present input limit a pool of 1709 tokens holds the whole grid; the pool is not above the model's "
+    "context: if it is below the context, SGLang took the input limit from the pool, and a larger pool raises "
+    "the input limit too, which can lengthen the grid",
+    POOL_LEVER_LINE,
+]
+# No cap flag at all: the launcher's default caps, which plan batch 1, 2 and 4 for prefill, or 3 where four
+# requests no longer fit a step.
+DEFAULT_CAPS = {"caps": grid.SampleCaps(), "cap_flags": []}
+
+
+def _pool_lines(lines: list[str]) -> list[str]:
+    return [line for line in lines if "KV pool" in line or "memory share" in line]
+
+
+def _counted_pool_cut(limits: grid.Limits) -> tuple[int, int, int, int]:
+    """What the pool takes from the prefill block of the default caps, counted here from the feasibility rule.
+
+    The four numbers of the launcher's line: the pairs of new tokens and batch size planned without the pool
+    limit, how many of them the pool leaves out, how many it ends at a shorter cached prefix, and the smallest
+    pool that holds the block planned without the pool limit. Of ``sglbench_grid`` only the rule
+    (``prefill_unfit_reason``) and the cached unit are used. The new tokens are ``FAKE_NEW_TOKEN_AXIS``, the
+    batch sizes of one value are the first three of the powers of two up to the largest batch and that batch,
+    and every largest value is found by trying the candidates one by one. The planned block is counted over
+    the same new tokens as the block without the pool limit, which is right while the pool leaves the axis
+    whole or leaves no request at all; the test that calls this checks it.
+    """
+    page = limits.page_size
+    unit = grid.cached_unit(page)
+
+    def with_pool(tokens: int) -> grid.Limits:
+        return dataclasses.replace(limits, max_total_num_tokens=tokens)
+
+    def longest_prefixes(record: grid.Limits) -> dict[tuple[int, int], int]:
+        """(new tokens, batch size) of every pair the record plans -> the longest cached prefix of the pair."""
+
+        def fits(batch: int, new: int, cached: int) -> bool:
+            return grid.prefill_unfit_reason(record, batch, new, cached) is None
+
+        longest = {}
+        for new in FAKE_NEW_TOKEN_AXIS[page]:
+            fitting = [batch for batch in range(1, record.max_running_requests + 1) if fits(batch, new, 0)]
+            powers = [batch for batch in fitting if batch & (batch - 1) == 0]
+            for batch in sorted({*powers, *fitting[-1:]})[:3]:
+                prefixes = range(0, record.max_req_input_len, unit)
+                longest[(new, batch)] = max(cached for cached in prefixes if fits(batch, new, cached))
+        return longest
+
+    # A pool of a million pages is out of the reach of every point: none of the FAKE limits needs as much as
+    # 9 * (812 + 2 * 64 + 1) tokens.
+    wanted, kept = longest_prefixes(with_pool(1_000_000 * page)), longest_prefixes(limits)
+    dropped = [pair for pair in wanted if pair not in kept]
+    shortened = [pair for pair, longest in wanted.items() if pair in kept and kept[pair] < longest]
+
+    def holds(tokens: int) -> bool:
+        record = with_pool(tokens)
+        return all(
+            grid.prefill_unfit_reason(record, batch, new, longest) is None for (new, batch), longest in wanted.items()
+        )
+
+    # A pool is a whole number of pages. A pair's longest prefix needs the most of it.
+    whole = next(tokens for tokens in range(page, 1_000_000 * page, page) if holds(tokens))
+    return len(wanted), len(dropped), len(shortened), whole
+
+
+@pytest.mark.parametrize(
+    ("page_size", "pool_tokens", "line"),
+    [
+        (1, None, POOL_CUT_LINES[0]),
+        (64, None, POOL_CUT_LINES_AT_PAGE_64[0]),
+        (1, 2, POOL_CUT_LINES_WITHOUT_A_PAIR[0]),
+        (1, 434, POOL_CUT_LINES_NOT_ABOVE_THE_CONTEXT[0]),
+    ],
+)
+def test_the_numbers_of_the_pool_lines_are_the_ones_a_count_from_the_feasibility_rule_gives(
+    page_size, pool_tokens, line
+):
+    """``pool_tokens`` None is the pool of the FAKE limits; a number is the pool a test gives the FAKE engine."""
+    limits = _fake_limits(page_size)
+    if pool_tokens is not None:
+        limits = dataclasses.replace(limits, max_total_num_tokens=pool_tokens)
+    # The axis typed above is the one the launcher plans, with 2 beside 1. In these cases a pool either leaves
+    # it whole or leaves no request at all.
+    roomy = dataclasses.replace(limits, max_total_num_tokens=1_000_000 * page_size)
+    assert grid.prefill_new_token_axis(roomy, grid.SampleCaps()) == FAKE_NEW_TOKEN_AXIS[page_size]
+    assert grid.prefill_new_token_axis(limits, grid.SampleCaps()) in (FAKE_NEW_TOKEN_AXIS[page_size], [])
+
+    counted = _counted_pool_cut(limits)
+
+    numbers = re.fullmatch(
+        r"\[sglbench\] the KV pool of one rank, (\d+) tokens, cuts the prefill grid: of the (\d+) pairs of new "
+        r"tokens and batch size planned without the pool limit, pairs left out: (\d+), pairs that end at a shorter "
+        r"cached prefix: (\d+); (?:with the present input limit )?a pool of (\d+) tokens holds the whole grid(?:; .*)?",
+        line,
+    )
+    assert [int(number) for number in numbers.groups()] == [limits.max_total_num_tokens, *counted]
+    # The grid module, which the launcher takes its numbers from, counts the same.
+    cut = grid.prefill_pool_cut(limits, grid.SampleCaps())
+    assert (cut.pairs, cut.dropped_pairs, cut.shortened_pairs, cut.whole_grid_pool_tokens) == counted
+
+
+def _assert_pool_lines_said_twice(lines: list[str], pool_lines: list[str], outcome_lines: int) -> None:
+    """The lines stand once where the grid is planned and once directly before the outcome, and nowhere else."""
+    assert _pool_lines(lines) == [*pool_lines, *pool_lines]
+    first = lines.index(pool_lines[0])
+    # The grid is planned after the engine is built and, in a text run, after the text pool is made.
+    assert lines[first - 1].startswith(("[sglbench] the engine is built", "[sglbench] the text pool holds "))
+    assert lines[first + 1] == pool_lines[1]
+    end = len(lines) - outcome_lines
+    assert lines[end - len(pool_lines) : end] == pool_lines
+
+
+@pytest.mark.parametrize("mode", ["prefill", "agg"])
+def test_a_prefill_grid_the_kv_pool_cut_is_said_when_it_is_planned_and_before_the_outcome(
+    tmp_path, monkeypatch, capsys, mode
+):
+    launch = _launch(tmp_path, monkeypatch, mode, **DEFAULT_CAPS)
+
+    assert launch.code == 0
+    lines = _stderr_lines(capsys)
+    _assert_pool_lines_said_twice(lines, POOL_CUT_LINES, 1)
+    assert lines[-1] == f"[sglbench] complete: wrote {launch.rank_path}, {launch.merged_path}"
+    # The lines are on stderr only: no result file holds them.
+    for name in launch.result_files():
+        assert "KV pool" not in (launch.pod / name).read_text(encoding="utf-8")
+
+
+def test_the_pool_lines_of_a_dep_launch_are_about_the_pool_of_one_rank(tmp_path, monkeypatch, capsys):
+    launch = _launch_dep(tmp_path, monkeypatch, "prefill", **DEFAULT_CAPS)
+
+    assert launch.code == 0 and len(launch.result_files()) == 3
+    _assert_pool_lines_said_twice(_stderr_lines(capsys), POOL_CUT_LINES, 1)
+
+
+def test_the_pool_lines_at_a_page_size_of_64(tmp_path, monkeypatch, capsys):
+    launch = _launch(tmp_path, monkeypatch, "prefill", page_size=64, **DEFAULT_CAPS)
+
+    assert launch.code == 0
+    _assert_pool_lines_said_twice(_stderr_lines(capsys), POOL_CUT_LINES_AT_PAGE_64, 1)
+
+
+def test_nothing_is_said_about_the_pool_with_caps_that_plan_no_batch_above_two(tmp_path, monkeypatch, capsys):
+    launch = _launch(tmp_path, monkeypatch, "prefill")
+
+    assert launch.code == 0 and _pool_lines(_stderr_lines(capsys)) == []
+
+
+def test_nothing_is_said_about_the_pool_in_a_decode_run(tmp_path, monkeypatch, capsys):
+    launch = _launch(tmp_path, monkeypatch, "decode", **DEFAULT_CAPS)
+
+    assert launch.code == 0 and _pool_lines(_stderr_lines(capsys)) == []
+
+
+def test_nothing_is_said_about_a_pool_that_holds_the_whole_prefill_grid(tmp_path, monkeypatch, capsys):
+    def prepare(world, _pod_dir):
+        world.limits = dataclasses.replace(world.limits, max_total_num_tokens=1709)
+
+    launch = _launch(tmp_path, monkeypatch, "prefill", prepare=prepare, **DEFAULT_CAPS)
+
+    assert launch.code == 0 and _pool_lines(_stderr_lines(capsys)) == []
+
+
+def test_nothing_is_said_about_the_pool_in_a_run_that_is_refused_before_a_grid_exists(tmp_path, monkeypatch, capsys):
+    launch = _launch(
+        tmp_path, monkeypatch, "prefill", flags=["--stream-interval", "4"], real_compat=True, **DEFAULT_CAPS
+    )
+
+    assert launch.code == 64
+    lines = _stderr_lines(capsys)
+    assert "[sglbench] FAILED: rejected: stream_interval must be 1 (got 4)" in lines
+    assert _pool_lines(lines) == []
+
+
+def test_the_pool_lines_come_before_the_lines_of_a_failed_point(tmp_path, monkeypatch, capsys):
+    victim = grid.build_grid("prefill", _fake_limits(1), grid.SampleCaps()).points[1]
+
+    def prepare(world, _pod_dir):
+        world.call_faults[(victim.benchmark_id, "meas", 0)] = "abort"
+
+    launch = _launch(tmp_path, monkeypatch, "prefill", prepare=prepare, real_compat=True, **DEFAULT_CAPS)
+
+    assert launch.code == 65
+    lines = _stderr_lines(capsys)
+    _assert_pool_lines_said_twice(lines, POOL_CUT_LINES, 2)
+    assert lines[-2].startswith(f"[sglbench] FAILED: benchmark_id={victim.benchmark_id}: benchmark point failed: ")
+    assert lines[-1].startswith("[sglbench] wrote the failed artifact ")
+
+
+def test_the_pool_lines_come_before_the_line_of_a_partial_run(tmp_path, monkeypatch, capsys):
+    last_done = grid.build_grid("prefill", _fake_limits(1), grid.SampleCaps()).points[1]
+
+    def prepare(world, _pod_dir):
+        # A prefill point is measured in its "meas" call.
+        world.call_faults[(last_done.benchmark_id, "meas", 0)] = "deadline"
+
+    launch = _launch(tmp_path, monkeypatch, "prefill", prepare=prepare, **DEFAULT_CAPS)
+
+    assert launch.code == 66
+    lines = _stderr_lines(capsys)
+    _assert_pool_lines_said_twice(lines, POOL_CUT_LINES, 1)
+    assert lines[-1].startswith("[sglbench] PARTIAL: the soft deadline ended the run (timeout); wrote ")
+
+
+def test_the_pool_lines_come_before_the_lines_of_a_run_a_signal_stopped(tmp_path, monkeypatch, capsys):
+    victim = grid.build_grid("prefill", _fake_limits(1), grid.SampleCaps()).points[1]
+
+    def prepare(world, _pod_dir):
+        world.call_faults[(victim.benchmark_id, "meas", 0)] = "sigterm"
+
+    launch = _launch(tmp_path, monkeypatch, "prefill", prepare=prepare, real_compat=True, **DEFAULT_CAPS)
+
+    assert launch.code == 65
+    lines = _stderr_lines(capsys)
+    _assert_pool_lines_said_twice(lines, POOL_CUT_LINES, 2)
+    assert lines[-2] == "[sglbench] FAILED: stopped: signal SIGTERM"
+
+
+def test_the_pool_lines_come_before_the_line_of_a_failed_write(tmp_path, monkeypatch, capsys):
+    def prepare(world, pod_dir):
+        # The results directory is taken away while the engine shuts down.
+        world.hooks["shutdown"] = lambda: shutil.rmtree(pod_dir)
+
+    launch = _launch(tmp_path, monkeypatch, "prefill", prepare=prepare, **DEFAULT_CAPS)
+
+    assert launch.code == 70
+    lines = _stderr_lines(capsys)
+    _assert_pool_lines_said_twice(lines, POOL_CUT_LINES, 1)
+    assert lines[-1].startswith("[sglbench] FAILED: internal_error: the result files could not be written: ")
+
+
+def test_the_pool_lines_when_the_pool_leaves_out_every_pair(tmp_path, monkeypatch, capsys):
+    """A pool of 2 tokens holds no request, so no prefill point is planned and the run fails for that."""
+
+    def prepare(world, _pod_dir):
+        world.limits = dataclasses.replace(world.limits, max_total_num_tokens=2)
+
+    launch = _launch(tmp_path, monkeypatch, "prefill", prepare=prepare, **DEFAULT_CAPS)
+
+    assert launch.code == 65
+    lines = _stderr_lines(capsys)
+    _assert_pool_lines_said_twice(lines, POOL_CUT_LINES_WITHOUT_A_PAIR, 2)
+    assert lines[-2] == "[sglbench] FAILED: no feasible benchmark points for phase(s): prefill"
+
+
+def test_the_pool_lines_when_the_pool_is_not_above_the_context(tmp_path, monkeypatch, capsys):
+    """The FAKE input limit is 428. A pool of 434 tokens is a pool that is not above the model's context.
+
+    The limits do not say whether it is below the context or equal to it, so the line says "if".
+    """
+
+    def prepare(world, _pod_dir):
+        world.limits = dataclasses.replace(world.limits, max_total_num_tokens=434)
+
+    launch = _launch(tmp_path, monkeypatch, "prefill", prepare=prepare, **DEFAULT_CAPS)
+
+    assert launch.code == 0
+    _assert_pool_lines_said_twice(_stderr_lines(capsys), POOL_CUT_LINES_NOT_ABOVE_THE_CONTEXT, 1)
+
+
+def test_the_pool_lines_when_only_the_input_limit_comes_from_the_pool(tmp_path, monkeypatch, capsys):
+    """With batch 1 alone the pool ends no axis itself; the grid can still be shorter, through the input limit."""
+
+    def prepare(world, _pod_dir):
+        world.limits = dataclasses.replace(world.limits, max_total_num_tokens=434)
+
+    one_batch = [*SMALL_CAP_FLAGS[:-1], "--prefix-max-batch-size-samples=1"]
+    caps = dataclasses.replace(SMALL_CAPS, prefix_max_batch_size_samples=1)
+    launch = _launch(tmp_path, monkeypatch, "prefill", prepare=prepare, caps=caps, cap_flags=one_batch)
+
+    assert launch.code == 0
+    cut = grid.prefill_pool_cut(launch.world.limits, caps)
+    assert (cut.dropped_pairs, cut.shortened_pairs, cut.pool_sets_input_limit) == (0, 0, True)
+    expected = [
+        "[sglbench] the KV pool of one rank, 434 tokens, cuts nothing from the prefill grid of the present input "
+        "limit; the pool is not above the model's context: if it is below the context, SGLang took the input limit "
+        "from the pool, and a larger pool raises the input limit, which can lengthen the grid",
+        POOL_LEVER_LINE,
+    ]
+    _assert_pool_lines_said_twice(_stderr_lines(capsys), expected, 1)
+
+
+def test_a_fault_in_the_pool_note_changes_neither_the_outcome_nor_the_exit_code(tmp_path, monkeypatch, capsys):
+    def broken(_run):
+        raise RuntimeError("FAKE fault")
+
+    monkeypatch.setattr(driver.BenchmarkRun, "prefill_pool_cut", broken)
+    launch = _launch(tmp_path, monkeypatch, "prefill", **DEFAULT_CAPS)
+
+    assert launch.code == 0
+    _assert_accepted(launch)
+    note = "[sglbench] what the KV pool takes from the prefill grid could not be worked out: RuntimeError: FAKE fault"
+    lines = _stderr_lines(capsys)
+    assert [line for line in lines if "KV pool" in line] == [note, note]
+    assert lines[-2:] == [note, f"[sglbench] complete: wrote {launch.rank_path}, {launch.merged_path}"]
+
+
+def test_a_fault_that_cannot_be_put_into_words_is_named_by_its_type(monkeypatch):
+    class _Mute(RuntimeError):
+        def __str__(self):
+            raise RuntimeError("FAKE str fault")
+
+    class _Run:
+        def prefill_pool_cut(self):
+            raise _Mute()
+
+    said = []
+    monkeypatch.setattr(launcher, "_say", said.append)
+    launcher._say_pool_cut(_Run())
+    assert said == ["what the KV pool takes from the prefill grid could not be worked out: _Mute"]
+
+
+def test_the_pool_lines_are_said_before_the_first_engine_call_and_after_the_last(tmp_path, monkeypatch):
+    """The two places themselves. On stderr the four lines are adjacent wherever they were said, because the
+    launcher prints nothing between the planned grid and the end of the run, so the other tests of this section
+    pin the count, the text and the line before the outcome, and this one pins when each line was said."""
+    seen = {}
+    calls_at = []
+    say = launcher._say
+
+    def prepare(world, _pod_dir):
+        seen["world"] = world
+
+    def counting(text):
+        if "KV pool" in text or "memory share" in text:
+            calls_at.append(len(seen["world"].calls))
+        say(text)
+
+    monkeypatch.setattr(launcher, "_say", counting)
+    launch = _launch(tmp_path, monkeypatch, "prefill", prepare=prepare, **DEFAULT_CAPS)
+
+    assert launch.code == 0
+    total = len(launch.world.calls)
+    assert total > 0 and calls_at == [0, 0, total, total]
+
+
+def test_a_stderr_that_cannot_take_the_pool_lines_does_not_stop_the_note(monkeypatch):
+    """``_say_pool_cut`` raises no ``Exception``, also when printing itself fails."""
+
+    class _Run:
+        def prefill_pool_cut(self):
+            return grid.PoolCut(36, 12, 2, 2, 43, False)
+
+    said = []
+
+    def refuse(text):
+        said.append(text)
+        raise OSError("FAKE closed stream")
+
+    monkeypatch.setattr(launcher, "_say", refuse)
+    launcher._say_pool_cut(_Run())
+    # The first line was tried, and the second was not.
+    assert len(said) == 1 and said[0].startswith("the KV pool of one rank, 36 tokens, cuts the prefill grid")
+
+
+def test_the_flags_of_the_pool_lines_are_the_ones_the_collector_and_sglang_use():
+    """The launcher only prints the names. The collector owns two of them: its plan flag and its translation row."""
+    from collector.fpm_forward import sglang_fpm_builder
+
+    assert (launcher.MEMORY_SHARE_FLAG, launcher.PLAN_MEMORY_SHARE_FLAG, launcher.POOL_TOKENS_FLAG) == (
+        "--mem-fraction-static",
+        "--fpm-gpu-memory-utilization",
+        "--max-total-tokens",
+    )
+    forward = Path(launcher.__file__).resolve().parents[1]
+    # The plan flag is defined by the collector's parser. The runner hands its value to the generator as
+    # ``kv_cache_free_gpu_memory_fraction`` (pinned in test_fpm_runtime_probe.py and test_fpm_profile_collection.py),
+    # which the generator renders as vLLM's ``--gpu-memory-utilization``. The cell builder writes that one as
+    # SGLang's flag: the row is checked here.
+    assert f'"{launcher.PLAN_MEMORY_SHARE_FLAG}",\n' in (forward / "config.py").read_text(encoding="utf-8")
+    assert sglang_fpm_builder._TRANSLATION["--gpu-memory-utilization"].writes == (launcher.MEMORY_SHARE_FLAG,)
+    # A cell of the collector never carries SGLang's cap on the pool: the builder has no row that writes it.
+    assert all(launcher.POOL_TOKENS_FLAG not in row.writes for row in sglang_fpm_builder._TRANSLATION.values())
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The low end of the prefill new-token axis in a launch: a row on each side of the first step of the table
+# ---------------------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("caps", "new_tokens", "batch_sizes"),
+    [
+        # The small caps: 4, 65 and 96 are what a cap of three leaves of the graph axis, and 1 and 2 do not
+        # count against it. Two batch sizes.
+        ({}, [96, 65, 4, 2, 1], [2, 1]),
+        # The launcher's default caps: ``FAKE_NEW_TOKEN_AXIS`` from its upper end, and batch 4, 2 and 1.
+        (DEFAULT_CAPS, FAKE_NEW_TOKEN_AXIS[1][::-1], [4, 2, 1]),
+    ],
+)
+def test_a_generated_prefill_block_is_measured_at_one_and_at_two_new_tokens_per_request(
+    tmp_path, monkeypatch, caps, new_tokens, batch_sizes
+):
+    """The FAKE prefill graph sizes start at 4, as SGLang's default sizes do.
+
+    SGLang then runs a batch of one new token without a graph and a batch of two with the graph of 4. The
+    launcher measures both, so that the table has a row on each side of that step, also under a cap that
+    leaves three values of the graph axis.
+    """
+    launch = _launch(tmp_path, monkeypatch, "prefill", real_compat=True, **caps)
+
+    # Accepted: every row is the planned point with the FAKE time of a batch of its size and its new tokens.
+    on_disk = _assert_accepted(launch)
+    points = [row["point"] for row in on_disk["results"]]
+    # New tokens per request, in the order their groups ran.
+    per_request = [point["total_prefill_tokens"] // point["batch_size"] for point in points]
+    assert all(point["total_prefill_tokens"] % point["batch_size"] == 0 for point in points)
+    assert list(dict.fromkeys(per_request)) == new_tokens
+    two = [point for point, new in zip(points, per_request, strict=True) if new == 2]
+    assert list(dict.fromkeys(point["batch_size"] for point in two)) == batch_sizes
+    # Every one of them ran as planned: the measured call sent, for each request, the cached prefix and 2
+    # tokens more, and the FAKE scheduler computed exactly those 2 beside the prefix it found in its cache.
+    (recorder_dir,) = launch.recorder_dirs()
+    (log,) = sorted(recorder_dir.iterdir())
+    batches = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()[1:]]
+    for point in two:
+        batch_size = point["batch_size"]
+        cached = point["total_kv_read_tokens"] // batch_size
+        (measured,) = [call for call in launch.calls_of(point["benchmark_id"]) if call.key[1] == "meas"]
+        assert [len(prompt) for prompt in measured.prompts] == [cached + 2] * batch_size
+        assert measured.max_new_tokens == 1
+        (batch,) = [batch for batch in batches if batch["rids"] == measured.rids]
+        assert (batch["mode"], batch["extend_num_tokens"]) == ("EXTEND", 2 * batch_size)
+        assert (batch["prefix_lens"], batch["extend_lens"]) == ([cached] * batch_size, [2] * batch_size)

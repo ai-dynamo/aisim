@@ -300,8 +300,8 @@ attempts; a no-op resume writes no historical attempts.
 ### SGLang cells
 
 `--backend sglang`, on either route, collects cells from SGLang itself: the
-tensor-parallel cells of a dense model, and the one-GPU and the tensor- and
-expert-parallel cells of an MoE model ([MoE cells](#moe-cells)). A cell starts
+tensor-parallel cells of a dense model, and the one-GPU cell, the TEP cells
+and the DEP cells of an MoE model ([MoE cells](#moe-cells)). A cell starts
 `runtime/sglbench_launcher.py` in an SGLang image,
 with no Dynamo worker and no etcd. The launcher builds SGLang's engine in its
 own process, plans the points from the limits and CUDA graph sizes that engine
@@ -340,7 +340,8 @@ It may not give `--fpm-model-profile`, `--fpm-runtime-instrumentation`,
 (`--fpm-moe-backend`, `--fpm-attention-backend`, `--fpm-enable-wideep true`,
 `--fpm-enable-eplb true`). Planning also refuses a model with an FPM execution
 identity (DeepSeek V4.1, GLM-5.3-Flash) and, for an MoE model, every cell
-other than the one-GPU cell and the TEP cells ([MoE cells](#moe-cells)).
+other than the one-GPU cell, the TEP cells and the DEP cells
+([MoE cells](#moe-cells)).
 Repeatability validation and the runtime probe remain vLLM only.
 
 An SGLang cell runs on one node. Planning does not know how many GPUs a node
@@ -370,9 +371,42 @@ tree refuses a data label that has no measured data there, and the tree holds
 none for SGLang 0.5.22 or 0.5.23, so a formal SGLang table labelled with its
 release needs `--fpm-database-root`.
 
-An SGLang table carries four deviation notes. Each lives at the code that the
+The prefill table of an SGLang cell starts at one new token per request and
+holds both sides of the first step of SGLang's prefill graphs. SGLang runs a
+prefill batch with a captured graph only when the size it pads the batch to
+holds at most twice the batch's own tokens. Its default sizes start at 4, so
+a batch of one new token runs without a graph and a batch of two to four
+with the graph of 4, which is another time: in the MoE cells collected on
+H200 a batch of one new token took 36 to 48 ms and a batch of four took 5 to
+7 ms. The launcher therefore plans 1 and 2 new tokens per request beside the
+graph sizes (`prefill_new_token_axis` in `runtime/sglbench_grid.py`), and
+the two values do not count against `--prefill-max-new-token-samples`.
+
+The 2 was added on 2026-11-23. Every cell named in this file, except the DEP
+cells collected that day, was collected before that, with an axis of 1, 4, 5,
+8 and so on, and the point counts given for those cells are the counts of
+that grid. From such a table AISim's
+reader prices a prefill of 2 or 3 new tokens on the line between a row
+without a graph and a row with one: for 8 such steps of a served engine the
+prediction was 3.7 times the measured time. A cell collected now plans the
+2 at each of its batch sizes: 3,347 points where the formal DEP prefill cell
+had 3,314, and 8 where a smoke prefill cell had 6. Its grid digest differs,
+so rank files of an earlier collection cannot be mixed with new ones, and
+its rows reach a table only in a root that does not hold the cell yet
+(first publisher wins). The rule is read from SGLang's source at both
+releases, and the unit tests publish a grid with typed-in times and read it
+back at 2 and 3 new tokens. On an engine the row has been collected once: the
+two formal DEP cells of `Qwen/Qwen1.5-MoE-A2.7B` at SGLang 0.5.23 on two H200
+GPUs, on 2026-11-23 ([DEP cells](#dep-cells)). One request of two new tokens
+on each rank took 8.2 to 8.8 ms there, as one of four new tokens did, and one
+of one new token 45 to 50 ms. SGLang's own batch lines show every batch of
+one request with two new tokens with a captured graph, and from that table
+the reader answers 8.3 ms for 2 and for 3 new tokens.
+
+An SGLang table carries these deviation notes. Each lives at the code that the
 item names. The first two are differences from AISim's generated SGLang
-serving deployment:
+serving deployment, and the last two apply to DEP cells only
+([DEP cells](#dep-cells)):
 
 - Mixed chunk and the decode graph list (`sglang_fpm_builder.py`). The
   generated serving deployment switches mixed chunk on and passes its own
@@ -389,18 +423,34 @@ serving deployment:
   accepts two SGLang releases, and neither is the collector's operator pin
   (`0.5.21` in `framework_manifest.yaml`). The formal FPM path does not consult
   that pin for any backend.
+- Static memory of a DEP prefill cell (`sglang_fpm_builder.py`). The cell
+  writes the chunk size as the token budget times the number of ranks, so
+  that each attention-DP rank gets the whole budget, as a vLLM rank does.
+  SGLang works out the share of GPU memory for weights and KV pool from the
+  written number. With the default budget the KV pool of a rank is then
+  smaller than with the budget written unchanged, and smaller still with
+  more ranks, unless the plan sets `--fpm-gpu-memory-utilization`. The cell
+  passes a share only when the plan gives one. "DEP cells" below has the
+  measured numbers, how a pool that is too small shows, and what to set
+  then.
+- Input blocker of a DEP cell (`runtime/sglbench_launcher.py`). The launcher
+  switches on SGLang's input blocker, which serving does not use. Its poll
+  over all ranks is inside every measured decode step; a prefill time also
+  spans one receive step with the poll, and its effect there was not
+  measured.
 
 #### MoE cells
 
-For an MoE model an SGLang plan holds two kinds of cell: the one-GPU cell
-(strategy `single`) and the TEP cell (strategy `tep`), which has one
-data-parallel replica and one expert-parallel rank per tensor-parallel rank.
-The default preset `auto` also plans a DEP cell for every GPU count above 1.
-DEP needs DP attention, which the launcher does not run, so planning refuses a
-plan that holds a DEP cell and names the option to pass,
-`--fpm-parallel-presets tep`. A plan of one GPU only holds the one-GPU cell
-under `auto`, `tep` and `dep` alike and is admitted. The plan of one and two
-GPUs:
+For an MoE model an SGLang plan holds three kinds of cell: the one-GPU cell
+(strategy `single`), the TEP cell (strategy `tep`), which has one
+data-parallel rank and one expert-parallel rank per tensor-parallel rank, and
+the DEP cell (strategy `dep`), which has one GPU and one expert-parallel rank
+per data-parallel rank and runs with SGLang's DP attention
+([DEP cells](#dep-cells)). The default preset `auto` plans a TEP and a DEP
+cell for every GPU count above 1, as it does for vLLM.
+`--fpm-parallel-presets tep` or `dep` plans one of the two. A plan of one GPU
+only holds the one-GPU cell under `auto`, `tep` and `dep` alike. The plan of
+one and two GPUs with the TEP preset:
 
 ```bash
 python3 -m collector.fpm_forward \
@@ -417,28 +467,33 @@ python3 -m collector.fpm_forward \
   --plan-only
 ```
 
-The vLLM render of a TEP cell carries the switch `--enable-expert-parallel`.
-The cell builder writes it as `--ep-size` with the tensor-parallel size, right
-after `--tp-size`. This is the size AISim's generated SGLang serving deployment
-passes under SGLang's alias `--expert-parallel-size`. A one-GPU cell gets no
-`--ep-size`, and no other MoE flag has a translation. The launcher then
-checks what SGLang resolved. It requires an expert-parallel size of 1 or of
-the tensor-parallel size, no all-to-all backend (`moe_a2a_backend` is `none`),
-no separate TP size for the dense MLP layers (`moe_dense_tp_size`), no EPLB
-and no redundant experts, and it refuses an expert-parallel size above 1 for a
-model without expert layers. Pure TP, DP attention, elastic EP, a model with
-hybrid sliding-window or state-space layers and a model with an FPM execution
-identity stay refused, each at its own step:
+The vLLM render of a TEP or a DEP cell carries the switch
+`--enable-expert-parallel`. The cell builder writes it as `--ep-size` with the
+value it wrote for `--tp-size`, right after that flag. For a TEP cell that is
+the tensor-parallel size; for a DEP cell it is the number of data-parallel
+ranks ([DEP cells](#dep-cells)). This is the size AISim's generated SGLang
+serving deployment passes under SGLang's alias `--expert-parallel-size`. A
+one-GPU cell gets no `--ep-size`, and no other MoE flag has a translation. The
+launcher then checks what SGLang resolved. It requires an expert-parallel size
+of 1 or of SGLang's `tp_size`, no all-to-all backend (`moe_a2a_backend` is
+`none`), no separate TP size for the dense MLP layers (`moe_dense_tp_size`),
+no EPLB and no redundant experts, and it refuses an expert-parallel size above
+1 for a model without expert layers. Pure TP, DP attention in any layout other
+than DEP, elastic EP, a model with hybrid sliding-window or state-space layers
+and a model with an FPM execution identity stay refused, each at its own step:
 
-- Planning refuses pure TP, DEP and an execution identity.
+- Planning refuses pure TP, an execution identity and every topology with more
+  than one data-parallel rank that is not DEP, for example tensor parallelism
+  inside a data-parallel rank. The message names the topology.
 - A cell whose vLLM command holds a flag without a translation is planned and
   refused when it is rendered, before a pod is scheduled. The cells of a
   `GlmMoeDsaForCausalLM` model are refused in this way (`--trust-remote-code`
   and `--reasoning-parser`), and so are those of some other packaged MoE
   models: some DeepSeek V4 checkpoints (`--trust-remote-code`) and MiniMax-M3
   (`--block-size`).
-- The launcher refuses DP attention and elastic EP in the pod, when it checks
-  what SGLang resolved, before the engine is built.
+- The launcher refuses elastic EP, and DP attention in any layout other than
+  the DEP layout, in the pod, when it checks what SGLang resolved, before the
+  engine is built.
 - A hybrid model is planned and rendered. The launcher refuses it in the pod
   only after the engine is built, because SGLang decides by its own lists of
   architectures, which planning does not read. By those lists about half of
@@ -446,11 +501,12 @@ identity stay refused, each at its own step:
   among them Qwen3.5, Nemotron 3, Kimi K3, Llama 4, Gemma 4, DeepSeek V4,
   MiMo-V2 and gpt-oss. Try one cell with `--smoke --limit 1` before a
   campaign.
-- A TEP cell whose GPU count does not divide the model's number of experts is
-  planned and rendered and passes the launcher's checks. SGLang then stops
-  while it builds the engine, at an assertion of its MoE layer. This is read
-  in SGLang's source at both releases and was not run. No packaged MoE model
-  has a number of experts that 2, 4 or 8 does not divide.
+- A TEP or a DEP cell whose GPU count does not divide the model's number of
+  experts is planned and rendered and passes the launcher's checks. SGLang
+  then stops while it builds the engine, at an assertion of its MoE layer on
+  the expert-parallel size. This is read in SGLang's source at both releases
+  and was not run. No packaged MoE model has a number of experts that 2, 4 or
+  8 does not divide.
 
 Which experts a token is sent to depends on the token, so the cells of an MoE
 model send dataset text. In such a run every prompt is text: the cached
@@ -548,18 +604,26 @@ Dynamo writes (`path`, `sha256`, `collection_pool`, `conversations`). The
 checkpoint keeps that block as `native_kvwarm` in the record of a decode cell.
 The published rows have no column for the content: `kv_seed_regime` says how
 the cached state was produced, not which tokens it holds. The rows of a TEP
-cell carry `parallel_strategy: tep` and the cell's `moe_ep`.
+cell carry `parallel_strategy: tep` and the cell's `moe_ep`; those of a DEP
+cell are described under [DEP cells](#dep-cells).
 
 The rows take those labels from the plan, so for a cell of an MoE plan
 validation holds what the pod recorded against the cell:
-`producer.content.source` must be `dataset_text_chains`, and
-`producer.tp_size` and `producer.moe.ep_size` must be the cell's `tp` and
-`moe_ep`. Two runs complete in the pod and are refused by this comparison. A
+`producer.content.source` must be `dataset_text_chains`, and the three sizes
+SGLang resolved must be the ones of the cell. SGLang's `tp_size` counts every
+rank of the engine, so `producer.tp_size` must be the cell's `tp` times its
+`dp`, `producer.moe.ep_size` its `moe_ep`, and `producer.attn_dp_size` its
+`dp`. A producer block without `attn_dp_size` counts as 1: the launcher wrote
+no such key before it could run DP attention, and the result files of that
+time still pass for their one-GPU and TEP cells and are refused for a DEP
+cell. Two runs
+complete in the pod and are refused by this comparison. A
 pod whose launcher finds no expert key in the model config (`EXPERT_KEYS`)
 sends seeded token ids unless `sharegpt_chain` is set, and records no
 `producer.moe` block. A
 command that reaches the pod without `--ep-size` runs with an expert-parallel
-size of 1, which the launcher accepts at any tensor-parallel size. The cell
+size of 1, which the launcher accepts at any tensor-parallel size without DP
+attention. The cell
 fails with `native SGLang rank artifact of a MoE plan did not send dataset
 text` or `... did not run the layout of its cell`. The comparison is made
 when a cell has run, when a resume looks at the files of a cell again, and
@@ -584,10 +648,424 @@ plan.
 The unit tests cover this path without a GPU: the plan, the command of each
 cell, and the validation and publication of result files whose times were
 typed in. On H200, the cells of `Qwen/Qwen1.5-MoE-A2.7B` have been collected
-with the default grid: the one-GPU cells at SGLang 0.5.22 and the TEP cells on
-two GPUs at 0.5.23. The texts of those cells gave no token id outside the
+with the default grid as it was before 2026-11-23, without the row of 2 new
+tokens per request ([SGLang cells](#sglang-cells)): the one-GPU cells at
+SGLang 0.5.22 and the TEP cells on two GPUs at 0.5.23. The texts of those cells gave no token id outside the
 ordinary ids, so a prompt that holds the id of a special token has run in the
-unit tests only.
+unit tests only. The DEP cells of that model on two GPUs have run with smoke
+grids at both releases; [DEP cells](#dep-cells) says what ran and what did
+not.
+
+##### DEP cells
+
+A DEP cell has one GPU and one expert-parallel rank per data-parallel rank:
+topology `tp=1, dp=D, moe_ep=D` with D of 2 or more. For backend `sglang` it
+runs with SGLang's DP attention. One engine starts D scheduler processes, one
+per GPU. Each is an attention-DP rank: it schedules its own requests and runs
+attention on them, while the expert layers stay spread over all ranks. The
+default preset `auto` plans the cell for every GPU count above 1, and
+`--fpm-parallel-presets dep` plans it without the TEP cells. Planning refuses
+every other topology with more than one data-parallel rank and names it in
+the message; tensor parallelism inside a data-parallel rank is not built. A
+dense model has no such cell.
+
+The vLLM render of the cell carries `--tensor-parallel-size 1
+--data-parallel-size D --enable-expert-parallel --data-parallel-backend mp`.
+SGLang's `tp_size` counts every rank of the engine, so the cell builder
+writes, for a tensor-parallel size T and a data-parallel size D:
+
+| vLLM flag | Launcher command |
+|---|---|
+| `--tensor-parallel-size T` | `--tp-size T*D` |
+| `--enable-expert-parallel` | `--ep-size T*D`, right after `--tp-size` |
+| `--data-parallel-size D` | `--attn-dp-size D`, and nothing for D of 1 |
+| `--data-parallel-backend mp` | Nothing. Any other value refuses the cell. |
+| `--max-num-batched-tokens B` | `--chunked-prefill-size B*D --max-prefill-tokens B` |
+| `--max-num-seqs N` | `--max-running-requests N*D` |
+
+The DEP cell of two GPUs gets `--tp-size 2 --ep-size 2 --attn-dp-size 2`, and
+its prefill command carries `--chunked-prefill-size 16384 --max-prefill-tokens
+8192` for the default budget of 8,192. The last two rows give each rank the
+budget and the cap a vLLM rank gets; "The token budget and the request cap of
+one rank" below has the reason. A cell with one data-parallel rank gets the
+command it got before.
+`--data-parallel-size` above 1 without `--enable-expert-parallel` refuses the
+cell. vLLM's `--data-parallel-size` is never passed on: in SGLang that name is
+an alias of `--dp-size`, the number of whole replicas of the model. AISim's
+generated SGLang serving deployment asks for the same layout with the pair
+`--data-parallel-size D --enable-dp-attention`, which SGLang marks as
+deprecated and resolves to the same sizes at both releases.
+
+The launcher admits an attention-DP size above 1 for this layout only: a model
+with expert layers, one replica, one scheduler process per attention-DP rank
+(`tp_size` equals `attn_dp_size`) and one expert-parallel rank on each
+(`ep_size` equals `tp_size`). It also requires SGLang's round-robin load
+balancing, and it refuses `enable_dp_lm_head`,
+`enable_tokenizer_batch_encode` and the environment variables
+`SGLANG_SCHEDULER_SKIP_ALL_GATHER` and
+`SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION`. Any other run with DP attention
+ends with status 64 before the engine is built.
+
+A point of a DEP cell is a point of one rank. For a point of batch size b the
+launcher sends every stage (seed, warm shot, measured shot, decode run,
+warm-up and self-test) as one batch call of D*b prompts, ordered so that item
+i belongs to rank i mod D. SGLang deals the requests of such a call to the
+ranks in turn. The launcher checks the rank that each response names. A
+request on another rank fails the run with `dp_rank_placement_mismatch`. From
+the scheduler logs it also checks that the kept batches of all ranks ran in
+the same steps with the same token counts. Ranks out of step fail the point
+with `dp_ranks_out_of_step`. Every other check of a point runs once per rank.
+A wrong cached-token count on one rank stages the point once more on all
+ranks, and any other failure on one rank fails the point.
+
+The launcher writes one rank file per attention-DP rank and the merged file:
+rank 0 at the output path (`benchmark.json`), rank r at `benchmark_dp<r>.json`.
+The gate waits for all of them. Each rank's times come from its own scheduler
+log, by the rules of a cell with one rank. A row of a DEP cell carries:
+
+- `parallel_strategy: dep`, `tp: 1`, `dp: D` and `moe_ep: D`, from the plan;
+- the batch size and the token counts of one rank. The engine ran D times as
+  many requests and tokens in that step;
+- the time of the slowest rank, as a vLLM DEP row does.
+
+The `producer` block of every rank file holds `attn_dp_size` (1 for a cell
+without DP attention). For a DEP cell it also holds `dp_attention`, with
+`local_control_broadcast`, `input_blocker` and `placement`, and its `staging`
+reads `balanced_batch_call`. No published column changes.
+
+Four things differ from serving or from the vLLM table of the same cell:
+
+- The input blocker. For a DEP cell the launcher sets
+  `SGLANG_ENABLE_COLOCATED_BATCH_GEN=1` before it builds the engine. SGLang
+  then holds the requests of one batch call back until every rank has them, so
+  that all ranks start them in the same step. Serving does not set the
+  variable. With it, every scheduler process makes one more poll over all
+  ranks in each of its loop iterations for the whole life of the engine
+  (`managers/scheduler_input_blocker.py` and `utils/poll_based_barrier.py`
+  under `python/sglang/srt/`, each identical at both releases), so the poll is
+  inside every measured decode step; a prefill time also spans one receive
+  step with the poll, and its effect there was not measured. The cost in a
+  decode step cannot be measured inside a benchmark run and is in no result
+  file. It was measured apart, outside the launcher, with stock SGLang
+  0.5.22 and 0.5.23 on two H200 GPUs for `Qwen/Qwen1.5-MoE-A2.7B`
+  (`--tp-size 2 --attn-dp-size 2 --ep-size 2`): the steady decode step of
+  free-running requests (48 tokens, context 1,024), with the variable on and
+  off and local control broadcast off and on, eight launches in all. A launch
+  gives, for each rank, the median over five runs of the median time between
+  the decode outputs of steps 16 to 40. At 32 requests per rank the step was
+  6.45 to 6.60 ms in all eight launches, with no difference between on and
+  off. At 4 requests per rank it was 3.32 to 3.50 ms, with one launch at
+  3.72 ms (0.5.22, variable on, broadcast off). A repeat of the pair with
+  broadcast off, two launches each per release, gave at 4 requests per rank
+  3.32 to 3.37 ms with the variable on and 3.33 to 3.34 ms with it off at
+  0.5.22, and 3.45 to 3.49 ms on and 3.45 to 3.47 ms off at 0.5.23. At 32 per
+  rank it gave 6.45 ms at 0.5.22 and 6.58 to 6.59 ms at 0.5.23, on and off
+  alike. The 3.72 ms did not repeat. An earlier probe of the same variable at
+  two ranks on dense models, with 4 requests per rank, found the step 8 to 21
+  percent longer with the variable on for `Qwen/Qwen3-0.6B`, whose step is
+  2.2 to 2.4 ms without it, and no difference for `Qwen/Qwen3-8B` (4.7 ms,
+  0.5.23 only). So a cell with a shorter decode step than the 3.3 to 3.5 ms
+  of this model may pay more. The cost was not measured for another MoE
+  model, for more than two ranks or inside a launcher run.
+- The token budget and the request cap of one rank
+  (`sglang_fpm_builder.py`). vLLM gives every data-parallel rank the whole
+  `--fpm-max-num-batched-tokens` B and the whole `--fpm-max-num-seqs` N.
+  Under DP attention SGLang divides its chunk size and its running-request
+  cap by D, so the cell writes `--chunked-prefill-size B*D` and
+  `--max-running-requests N*D`, and each rank gets B and N. SGLang does not
+  divide `--max-prefill-tokens`, which is written as B. With the default B of
+  8,192 the prefill cell of two ranks carries `--chunked-prefill-size 16384
+  --max-prefill-tokens 8192`. Both ranks then reported 8,192 for both, and
+  the table reached 8,192 new tokens for a rank, summed over the requests of
+  its batch. One thing follows: the KV pool of a rank is smaller than with B
+  written, and smaller than in the decode cell, which carries no token
+  budget. It is the next item. That SGLang
+  divides the request cap was read in its source at both releases; no cell
+  with `--fpm-max-num-seqs` has run. Before this
+  rule the cell wrote B and N as they are. Both ranks then reported a chunk
+  size of 4,096, with 8,192 on the command and with SGLang's own default of
+  8,192, through the launcher and outside it. Outside the launcher, a call
+  of four requests of 1,024 new tokens per rank ran as one batch per rank,
+  and with 1,025 each both ranks split alike into 4,096 and 4 tokens.
+- The memory share of a DEP prefill cell (`sglang_fpm_builder.py`,
+  `runtime/sglbench_launcher.py`). The share is the part of a GPU's memory
+  that the weights and the KV pool take together. The cell passes one only
+  when the plan gives `--fpm-gpu-memory-utilization`; otherwise SGLang works
+  it out. It does so from the chunk size as it is written, before it divides
+  it, and keeps 1.5 MiB free for every token of it. With B*D written and the
+  default B of 8,192, the share is smaller than with B written, and the KV
+  pool of a rank with it. At two ranks SGLang chose 0.805 and a pool of
+  529,112 tokens, where the command before this rule, with 8,192 written,
+  gave 0.892 and 594,583 tokens. At four ranks it chose 0.574 and a pool of
+  389,686 tokens. Part of that fall is SGLang's own reserve for decode
+  graphs, which is larger at four ranks.
+
+  Most of what SGLang keeps free was not used. Of the memory left after
+  weights and pool, a GPU used 3.8 of 26.7 GB at its sampled peak at two
+  ranks and 6.0 of 58.6 GB at four (GB of 2^30 bytes, as SGLang prints them;
+  one sample every 0.1 s). The peak was while SGLang
+  captured its graphs. While the benchmark ran, the used memory of a GPU
+  rose by under 0.1 GB, and every prefill batch above one token ran a
+  captured graph. The 1.5 MiB for each token are room for a prefill forward
+  without a graph, and no run held one of more than one token. With a share
+  given on the command the same grid ran: 0.95 at two ranks, and 0.90 at
+  four ranks with a pool of 635,112 tokens and 7.5 GB of each GPU left at
+  the peak. At four ranks 0.95 would have left about 0.6 GB and was not run.
+  These numbers are of one small model. A large model has larger graphs, and
+  none was measured.
+
+  A pool that is too small shows in two ways:
+
+  - The engine does not start. SGLang stops with "Loaded weights leave no
+    GPU memory for the KV cache", which names `--mem-fraction-static` and a
+    value, or with "Not enough memory. Please try to increase
+    --mem-fraction-static." Read in SGLang's source at both releases; no
+    cell has failed this way.
+  - The cell passes and its table reaches less far. The launcher plans only
+    the points the pool holds, so the longest cached prefixes of the largest
+    batches are missing, while the number of points can be the same. The
+    launcher then prints two lines on stderr, once when it plans the grid
+    and once more before its last lines. The first starts with
+    `[sglbench] the KV pool of one rank`. It counts pairs, where a pair is
+    one number of new tokens at one batch size: how many pairs the grid has
+    without the pool limit, how many of them are left out, and how many end
+    at a shorter cached prefix. It also gives the pool that would hold the
+    whole grid. The second names `--mem-fraction-static`,
+    `--fpm-gpu-memory-utilization` and `--max-total-tokens`. The last is
+    SGLang's cap on the pool in tokens; a collector cell never carries it.
+
+    The pool can shorten the grid in a second way, through the input limit,
+    the longest input SGLang takes for one request. Where the pool is below
+    the model's context, SGLang takes that limit from the pool. The limits
+    an engine reports do not tell a pool below the context from one equal to
+    it. For a pool that is not above the context the first line therefore
+    says that a larger pool raises the input limit if the pool is below the
+    context. Its counts and its pool figure are then for the grid of the
+    present input limit, and the line is also printed, without counts, when
+    the pool itself cuts nothing.
+
+    The lines are for the generated prefill grid of any SGLang cell, not
+    only of a DEP cell. A decode grid is not looked at: with SGLang's
+    default request cap and no cap on the batch size, the pool ends the
+    decode grid in an ordinary run, so there is nothing to report. A point
+    of `--fpm-benchmark-points-file` that does not fit is refused by name.
+    No cell of the runs below was cut: the largest batch of the default grid
+    held 32,740 tokens, and a pool of 32,749 tokens holds that grid.
+
+  Where to look. The collector keeps a copy of the cell's stderr as
+  `engine.stderr.log` in the cell's `raw/` folder. In every formal cell of
+  the runs below that copy held the launcher's first lines and ended before
+  its last ones, and the smoke cells kept none of it. That is why the two
+  lines are printed when the grid is planned as well, early in the log. They
+  have not run in a collected cell.
+
+  In either case give the campaign `--fpm-gpu-memory-utilization`, which the
+  cell writes as `--mem-fraction-static`. 0.95 ran at two ranks and 0.90 at
+  four, and both left memory free for this small model. A larger model needs
+  more room for its graphs, and no share was run for one. No SGLang cell has
+  been collected with the flag: the memory runs passed
+  `--mem-fraction-static` on the launcher's own command, outside the
+  collector.
+- Local control broadcast. SGLang's
+  `--enable-dp-attention-local-control-broadcast` replaces a broadcast over
+  all ranks in every scheduler iteration by one inside each rank (the help
+  text of the flag, the same at both releases). No collector input switches
+  it on: AISim's generated SGLang serving deployment does not pass the flag,
+  so a collected DEP cell runs with it off. The launcher takes the flag on its
+  own command line and records what SGLang resolved as
+  `producer.dp_attention.local_control_broadcast`.
+
+The pod of a DEP cell asks for the GPUs, CPUs and memory of the TEP cell of
+the same GPU count. On Slurm a DEP cell of D ranks is refused when
+`--fpm-slurm-cpus-per-task` is below D. D is the least the collector accepts,
+not what the cell needs: it runs D scheduler processes, SGLang's DP controller
+process and the launcher. No CPU count was measured for such a cell.
+
+What has run on GPUs. Every run named here is one of the runs of 2026-11-18:
+stock SGLang images, one pod with two H200 GPUs, `Qwen/Qwen1.5-MoE-A2.7B`
+with two ranks (`--tp-size 2 --ep-size 2 --attn-dp-size 2`) and SGLang's page
+size of 1; the two runs with four ranks are named as such, and so is the
+one campaign of 2026-11-23. The runs of 2026-11-18 used the prefill grid as
+it was then, without the row of 2 new tokens per request
+([SGLang cells](#sglang-cells)), and their point counts are the counts of
+that grid. Their files are
+not kept in this repository, and neither are those of the earlier probe of
+the blocker on dense models.
+
+Through the collector, at SGLang 0.5.22 and 0.5.23: one campaign per release
+with `--fpm-parallel-presets dep --smoke --limit 2`, each with one prefill
+cell of 6 points and one decode cell of 4 points, dataset text in every
+prompt and the launcher's default options. All four cells went through plan,
+render, pod, launcher, gate and validation and passed, and no point was
+staged again. In each of them:
+
+- the preflight in the pod passed, the launcher admitted the layout and set
+  the blocker variable, and the self-test passed with a pair of requests per
+  rank;
+- the two scheduler processes were the leaders of rank 0 and rank 1, and both
+  reported the blocker, a chunk size of 4,096 and a running-request cap of
+  4,096;
+- every response of every call named the planned rank;
+- every batch line of one rank had a line of the other rank with the same
+  step number, mode, number of requests and token counts, and no rank logged
+  an idle step. The launch times of the two ranks in a step differed by a
+  median of about 0.01 ms and by at most 0.51 ms;
+- the largest decode points ran 4,096 requests per rank, 8,192 in one call;
+- the launcher wrote the two rank files and the merged file, the gate waited
+  for the three, and validation accepted the cell with `producer.tp_size`,
+  `producer.moe.ep_size` and `producer.attn_dp_size` of 2;
+- the two ranks' times of a point differed by at most 0.9 percent, and the
+  merged time is the larger one.
+
+The formal cells, at 0.5.23 through the collector: two campaigns with
+`--fpm-parallel-presets dep` and the default grid.
+
+The first ran before the cell multiplied the token budget. Its prefill cell
+carried `--chunked-prefill-size 8192 --max-prefill-tokens 8192`; both ranks
+reported a chunk size of 4,096, and the table ended at 4,096 new tokens per
+rank. The prefill cell gave 2,892 points and the decode cell 857, no point
+was staged again, and the 3,749 rows were published with the strategy `dep`,
+`tp` 1, `dp` 2 and `moe_ep` 2. Every batch line of the prefill cell and of
+the decode cell's runs had a line of the other rank with the same step
+number, mode, number of requests and token counts: all 8,433 steps of the
+prefill cell, and the 857 prefill and 5,142 decode steps of the decode
+cell's runs. The seeds of the decode cell
+did not run alike on the two ranks, which the procedure allows, since a seed
+only has to complete on its rank: 534 seed steps held different numbers of
+requests on the two ranks, and in 281 steps one rank ran a seed batch while
+the other logged an idle step. None of those steps lay inside a run. The two
+ranks' times of a point differed by at most 7.5 percent in the prefill cell
+and 3.1 percent in the decode cell.
+
+The second ran with the command the cell writes now, and with the code after
+the two later changes named below. Its prefill cell carried
+`--chunked-prefill-size 16384 --max-prefill-tokens 8192`; both ranks
+reported 8,192 for both, and a KV pool of 529,112 tokens. It gave 3,314
+points, 455 of them above 4,096 new tokens per rank: the same points as the
+TEP prefill cell of the same model and GPUs, run on 2026-11-17. The decode
+cell carries no token budget and gave the same 857 points as in the first
+campaign, with a pool of 594,583 tokens. No point was staged again, and the
+4,171 rows were published with the same labels. Every batch line of a
+measured call had its line on the other rank as above: all 9,654 steps of
+the prefill cell, and the 857 prefill and 5,142 decode steps of the decode
+cell's runs. The seeds of the decode cell ran as in the first campaign, with
+the same counts. The two ranks' times of a point differed by at most 4.7
+percent in the prefill cell and 2.7 percent in the decode cell.
+
+A third formal campaign ran on 2026-11-23 with the same command and the grid
+that plans 2 new tokens per request. The boot time that its schedulers'
+clocks imply is not that of the first two campaigns, so it ran on another
+machine. Its prefill cell
+gave 3,347 points: the 3,314 points of the second campaign and 33 more, 2 new
+tokens per request at batch 1, 2 and 4 with each of the eleven cached lengths.
+Its decode cell gave 857 points, four of them one token of context shorter
+than before, because the engine reported a KV pool of 594,573 tokens where it
+had reported 594,583. No point was staged again, every batch line of a rank
+had its line on the other rank in the prefill cell (9,750 steps), and the
+4,204 rows were published to a root of their own. SGLang's batch lines show
+the 44 batches of one request with two new tokens with a captured graph, and
+no batch of more than one token without one; the kept copy of that log ends
+about two seconds before the run did.
+
+Two things in the table of that campaign are not explained:
+
+- Its rows of at most about 10 new tokens in a rank's batch are about 1.1 ms
+  above those of the second campaign (8.3 against 7.0 ms for one request of
+  four new tokens), the 33 new rows among them. For those batches the forward
+  call of rank 1 took 6.8 to 7.3 ms where that of rank 0 took 5.8 to 6.1 ms,
+  and a step ends when both ranks are done. It began about 130 points before
+  the first point of two new tokens, so those points did not start it. The
+  first campaign shows the same on rank 0 in 12 of its 99 rows of that size,
+  the second in none, this one in 118 of 132. The cause is not known: the
+  machine and the launcher and driver, which hold the pool line since the
+  second campaign, both differ from that campaign's, and neither is ruled
+  out.
+- Its first decode point, 4,096 requests per rank at 140 tokens each, holds
+  589.5 ms where the second campaign's holds 116.9 ms. That point had a step
+  of about 0.6 s among its three kept steps in all three campaigns. In this
+  one two of the three were slow, and the median of three is then a slow
+  step. Each decode cell has 6 to 10 such steps among its 4,285 decode steps
+  after the first; the time lies on the host between one output and the
+  launch of the next batch. The cause is not known.
+
+With local control broadcast on, at 0.5.23 only and outside the collector:
+the launcher commands of the two cells with the flag added, started in a pod
+with the environment of the cell's run script and a smoke grid. Both ended
+with status 0, the prefill run with 6 points and the decode run with 4. They
+showed the same placement and the same steps on both ranks, with no idle
+step, and their result files record `local_control_broadcast: true`. Those
+files were not put through validation.
+
+The memory of the prefill cell, at 0.5.23 and outside the collector: the
+launcher command of the prefill cell with the default grid, run in a pod
+without the collector. `nvidia-smi` sampled the used memory of each GPU
+every 100 ms, and a copy of the recorder, made for these runs only, also
+noted PyTorch's peak memory around the forwards. Four runs: two ranks with
+SGLang's own share and with `--mem-fraction-static 0.95`, and four ranks
+(one pod with four H200 GPUs, `--tp-size 4 --ep-size 4 --attn-dp-size 4
+--chunked-prefill-size 32768 --max-prefill-tokens 8192`) with SGLang's own
+share and with 0.90. All four ended with status 0 and the same 3,314 points,
+no point was staged again, and the runs with four ranks wrote four rank
+files. The numbers are in the item on the memory share above. In every run
+the peak was during graph capture, the used memory of a GPU rose by under
+100 MiB while the benchmark ran, and SGLang's own batch lines say that every
+prefill batch of 2 to 8,192 new tokens ran a captured graph and every batch
+of one new token ran without one. The files were not put through validation,
+and the times are not formal: the recorder carried the probe, and two of
+the runs shared a host. These are the only runs with more than two ranks.
+
+The launcher runs above, except the second formal campaign and the four
+memory runs, used the code before two later changes: what the driver does
+when SGLang runs a decode
+step of one rank as a prefill batch, and the launcher's refusal of
+`enable_tokenizer_batch_encode` under DP attention. After them the smoke
+campaign at 0.5.23 ran once more and passed with the same observations, 6
+prefill points and 4 decode points, and then the second formal campaign ran.
+No decode step ran as a prefill batch in either, so that part of the driver
+has run in the unit tests only.
+
+Outside the launcher: stock SGLang of both releases with the same layout, the
+blocker variable set, SGLang's public batch call and random token ids. In 24
+of 24 batch calls (b of 1, 4 and 32, streamed and not), with local control
+broadcast off and on, and then at 60 of 60 points with it off, item i ran on
+rank i mod 2 and each rank's log held one batch with exactly its b requests
+in the same step. A seed sent that way sat on the rank of its slot: the
+measured prompt found its cached tokens there, and none when it was sent to
+the other rank. A seven-token run gave one prefill batch and six decode
+batches of b requests in the same seven steps on both ranks, and the kept
+steps 3 to 5 differed between the ranks by at most 0.64 ms (by more than
+0.1 ms in 14 of 72 steps); the dropped steps differed more, step 1 by up to
+108 ms and step 2 by up to 3.5 ms. A batch call of one prompt went to the
+next rank in turn while the other rank logged idle steps, which is why every
+call of the launcher carries the same number of prompts for every rank. Only
+these runs stand behind the blocker's cost, the chunk check, the cache check
+on the other rank, the call of one prompt and local control broadcast at
+0.5.22.
+
+Not run on an engine:
+
+- the row of 2 new tokens per request, which the grid plans since
+  2026-11-23, in any cell but the DEP prefill cell of two ranks at 0.5.23:
+  a dense model, a one-GPU or TEP cell, 0.5.22, a smoke grid;
+- a DEP cell of more than four ranks, four ranks in a decode cell or
+  through the collector, or a model other than `Qwen/Qwen1.5-MoE-A2.7B`;
+- a prefill grid that the KV pool cut, and with it the launcher's two lines
+  about it, which have run in the unit tests only; an engine that SGLang
+  refuses to start for its memory share; a prefill forward of more than one
+  token without a captured graph; an SGLang cell collected with
+  `--fpm-gpu-memory-utilization`;
+- any failure path under DP attention: a request on another rank than
+  planned, ranks out of step, a wrong cached-token count on one rank and the
+  second staging on all ranks, an idle step inside a run, and SGLang's change
+  of a decode batch into a prefill batch while another rank prefills;
+- a page size other than 1;
+- `--fpm-max-num-seqs` or `--fpm-max-model-len` on a DEP cell;
+- local control broadcast through the launcher at 0.5.22, and in a collected
+  cell at either release;
+- a DEP cell on Slurm.
+
+The unit tests cover the plan, the command, the gate with two rank files, and
+the validation and publication of two rank files whose times were typed in.
 
 ### Prefill batch sizes
 

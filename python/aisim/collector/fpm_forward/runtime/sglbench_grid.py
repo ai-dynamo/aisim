@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-FileCopyrightText: Copyright 2023-2026 SGLang Team
 # SPDX-License-Identifier: Apache-2.0
-# The feasibility rules follow SGLang v0.5.22 and v0.5.23; see THIRD_PARTY_NOTICES.md.
+# The feasibility rules and the first prefill graph step follow SGLang v0.5.22 and v0.5.23; see THIRD_PARTY_NOTICES.md.
 # Source: https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
 # Source: https://github.com/sgl-project/sglang/tree/297e54fd105e974cdf401e5b4d20253a22c16f90
 # The sample caps, the axis rules, the points manifest and the order and digest of the grid are re-implemented from
@@ -58,6 +58,12 @@ under ``python/sglang`` to check the arithmetic::
     srt/arg_groups/validation_hook.py        check_server_args
     srt/arg_groups/cuda_graph_hook.py        generate_decode_cuda_graph_batch_sizes,
                                              generate_prefill_cuda_graph_batch_sizes
+    srt/model_executor/runner/prefill_cuda_graph_runner.py
+                                             _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR,
+                                             get_prefill_num_tokens_to_capture,
+                                             PrefillCudaGraphRunner.can_replay_locally
+    srt/model_executor/runner/base_cuda_graph_runner.py
+                                             BaseCudaGraphRunner._pad_to_bucket
 
 The candidate rule of the graph-driven axes is mirrored on the collector host in
 ``collector/fpm_forward/config.py`` (``_dynamo_cudagraph_axis_points``). The sample-cap flag names are the ones
@@ -77,7 +83,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 PREFILL = "prefill"
 DECODE = "decode"
@@ -219,6 +225,8 @@ class Limits:
     """What one SGLang scheduler (one attention-DP rank) admits. Read off the running engine, never guessed.
 
     The grid is built once from one record; the caller must check that every rank reports the same one.
+    Under DP attention the grid is therefore a grid of per-rank points: a point with batch ``b`` is ``b``
+    requests on every attention-DP rank, and each limit is the one a rank's scheduler reports for itself.
     Construction validates and raises; the only conversion is that the two graph-size lists are stored as sorted,
     de-duplicated tuples.
     """
@@ -259,7 +267,8 @@ class Limits:
     decode_graph_sizes: tuple[int, ...] = ()
     # Token counts that have a captured prefill graph; empty = no prefill graphs.
     # SGLang: srt/arg_groups/cuda_graph_hook.py ``generate_prefill_cuda_graph_batch_sizes``
-    # (``cuda_graph_config.prefill.bs``).
+    # (``cuda_graph_config.prefill.bs``); the captured list, which SGLang pads a batch to, is
+    # srt/model_executor/runner/prefill_cuda_graph_runner.py ``PrefillCudaGraphRunner.capture_num_tokens``.
     prefill_graph_sizes: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
@@ -695,16 +704,17 @@ class SampleCaps:
     the header of this file names).
 
     The two graph-driven axes (prefill new tokens and decode batch) always start at 1. When the cut axis does
-    not hold 1, it is put in front AFTER the cut and does not count against the cap, so each of these two axes
-    can hold one value more than its cap.
+    not hold 1, it is put in front AFTER the cut and does not count against the cap, so the decode batch axis
+    can hold one value more than its cap. The prefill new-token axis also gets the two sides of its first
+    step in that way (``prefill_new_token_axis``), so it can hold up to three values more than its cap.
 
     A points manifest replaces the generated grid, and then every cap here is ignored.
     """
 
-    # --prefill-max-new-token-samples: prefill new-token axis (``limit_graph_axis``); cap + 1 values when 1 is
-    # added. It bounds the values of ``n`` PER REQUEST, not the batch totals: every ``n`` is planned at up to
-    # ``prefix_max_batch_size_samples`` batch sizes, so a grid can hold more distinct ``total_prefill_tokens``
-    # values than this cap. In Dynamo the flag of this name caps an axis of batch totals
+    # --prefill-max-new-token-samples: prefill new-token axis (``limit_graph_axis``); up to cap + 3 values with
+    # the low end added. It bounds the values of ``n`` PER REQUEST, not the batch totals: every ``n`` is planned
+    # at up to ``prefix_max_batch_size_samples`` batch sizes, so a grid can hold more distinct
+    # ``total_prefill_tokens`` values than this cap. In Dynamo the flag of this name caps an axis of batch totals
     # (``_bench_generate_prefill_grid``).
     prefill_max_new_token_samples: int = 64
     # --prefill-max-kv-read-token-samples: prefill cached-token axis, per (n, b) (``limit_uniform``).
@@ -892,17 +902,57 @@ def _starting_at_one(axis: list[int]) -> list[int]:
     return axis if axis[0] == 1 else [1, *axis]
 
 
-def prefill_new_token_axis(limits: Limits, caps: SampleCaps) -> list[int]:
-    """New tokens per request: 1, each prefill graph size ``c`` and ``c + 1``, a doubling tail, and ``n_limit``.
+# SGLang replays a captured prefill graph for a batch only when the size it pads the batch to holds at most
+# this many times the batch's own tokens; a batch below that runs without a graph
+# (``_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR`` and the last statements of ``can_replay_locally`` in
+# python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py, which are the same at v0.5.22 and v0.5.23).
+PREFILL_GRAPH_PADDING_FACTOR = 2
 
-    The graph axis is cut to ``prefill_max_new_token_samples`` values first. 1 is put in front afterwards when
-    it is not among them, so it does not count against the cap and the axis can hold one value more than the
-    cap. AISim's collector host sizes this cap as the number of candidates of its own mirror of ``graph_axis``
-    (collector/fpm_forward/config.py ``PrefillSamplingProfile.build``), which has no forced 1; a cap sized that
+
+def first_prefill_graph_tokens(graph_sizes: Iterable[int]) -> int | None:
+    """The smallest token count of a batch that SGLang runs with its smallest prefill graph; None without one.
+
+    With the smallest captured size ``c`` a batch of ``t`` tokens is padded to ``c`` and replays that graph when
+    ``c <= PREFILL_GRAPH_PADDING_FACTOR * t``, so the count is ``ceil(c / PREFILL_GRAPH_PADDING_FACTOR)``. A
+    smaller batch runs without a graph. For SGLang's default sizes, which start at 4, the count is 2: a batch
+    of one new token runs without a graph and a batch of two with the graph of 4.
+    """
+    sizes = [size for size in graph_sizes if _require_int("graph size", size) >= 1]
+    if not sizes:
+        return None
+    return -(-min(sizes) // PREFILL_GRAPH_PADDING_FACTOR)
+
+
+def prefill_new_token_axis(limits: Limits, caps: SampleCaps) -> list[int]:
+    """New tokens per request: the low end, each prefill graph size ``c`` and ``c + 1``, a doubling tail, ``n_limit``.
+
+    The graph axis is cut to ``prefill_max_new_token_samples`` values first. The values of the low end are put on
+    the axis afterwards when they are not among them, so they do not count against the cap and the axis can hold
+    up to three values more than the cap (two with SGLang's default graph sizes). AISim's collector host sizes
+    this cap as the number of candidates of its own mirror of ``graph_axis``
+    (collector/fpm_forward/config.py ``PrefillSamplingProfile.build``), which has no low end; a cap sized that
     way must not cut a graph value.
 
-    SGLang keys a prefill graph on the batch's TOTAL new tokens (``b * n``), so the graph sizes line up with this
-    per-request axis exactly at ``b = 1``.
+    The low end is 1 and, when prefill graphs are captured, the two sides of the first step of the table:
+    ``first - 1`` and ``first``, where ``first`` is ``first_prefill_graph_tokens``. Below ``first`` a batch runs
+    without a graph, and from ``first`` on with the smallest one, which is another time: on H200 a batch of one
+    new token took 36 to 48 ms and a batch of 4 took 5 to 7 ms in the collected MoE cells, and 20 ms against 6 ms
+    for a small dense model. ``graph_axis`` samples both sides of the steps between graph sizes, and this is the
+    one step below the smallest size. With SGLang's default sizes the low end is 1 and 2. Without the 2 the
+    table held 1 and 4, and AISim's reader priced a batch of 2 or 3 new tokens on the line between a row
+    without a graph and a row with one: in serving of 2026-11-23 such steps were predicted 3.7 times too slow.
+    SGLang keys a prefill graph on the batch's TOTAL new tokens (``b * n``), so the graph sizes and the low end
+    line up with this per-request axis exactly at ``b = 1``.
+
+    Not sampled, and neither can happen with SGLang's default sizes:
+
+    - A step inside the graph sizes, where one size is more than ``PREFILL_GRAPH_PADDING_FACTOR`` times the
+      size before it and the batches just above the smaller one run without a graph. The default sizes have
+      no such pair.
+    - The first step of the rows of two or more requests, when the smallest size is 7 or more. With a
+      smallest size of 8 the low end is 1, 3 and 4: two requests of one new token run without a graph and
+      two requests of two with it, and the table holds two requests of one and of three. With the default
+      smallest size of 4 every batch of two or more requests runs with a graph.
     """
     caps = _require_caps(caps)
     n_limit = largest_prefill_new_tokens(limits)
@@ -914,7 +964,11 @@ def prefill_new_token_axis(limits: Limits, caps: SampleCaps) -> list[int]:
     # collected range of an axis and never extrapolates, SGLang's default prefill graph sizes start at 4, and a
     # prefill step of 1 to 3 new tokens is ordinary serving (at page size 1 a fully cached prompt recomputes
     # exactly one token).
-    return _starting_at_one(axis)
+    low_end = {1}
+    first = first_prefill_graph_tokens(sizes)
+    if first is not None:
+        low_end.update(value for value in (first - 1, first) if 1 <= value <= n_limit)
+    return sorted({*axis, *low_end})
 
 
 def prefill_batch_axis(limits: Limits, caps: SampleCaps, new_tokens: int) -> list[int]:
@@ -1222,6 +1276,105 @@ def build_grid(mode: str, limits: Limits, caps: SampleCaps | None = None, manife
         digest=grid_digest([point.as_dict() for point in points]),
         missing_phases=tuple(missing_phases),
         source=SOURCE_MANIFEST if explicit else SOURCE_GENERATED,
+    )
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# What the KV pool takes from the generated prefill block
+#
+# The generated axes end where the first rule ends them, and nothing in a result file says which rule that was.
+# For the prefill block it is usually the input limit and the two step budgets. When it is the KV pool, the
+# table reaches less far than the other limits allow and the run still completes: the longest cached prefixes
+# of the largest batches are not planned, and the number of points can stay the same. A pool can be small
+# because SGLang sized its memory share for more than the engine uses (the deviation note on the static memory
+# of a DEP cell, collector/fpm_forward/sglang_fpm_builder.py), so the launcher says when this happens.
+#
+# Only the prefill block is looked at. With SGLang's default request cap and no cap on the batch size the decode
+# block reaches the pool in an ordinary run: its largest batch at the input limit is more than the pool holds,
+# so the pool is what ends its context axis, and a line about it would say nothing. With a request cap set on
+# the command, or with --benchmark-max-batch-size, it may or may not, and nothing says which.
+# ---------------------------------------------------------------------------------------------------------------
+
+# How far SGLang keeps the input limit below a pool that is not above the model's context:
+# ``max_req_input_len = min(context_len - 1, kv_capacity - 1) - 5`` (``Limits.max_req_input_len``). Read at
+# both tags. ``kv_capacity`` is the reported pool except in three engines, none of which reaches this code: a
+# hybrid SWA model (the driver refuses it from the header), logical-page sharding of the KV pool and a diffusion
+# model, which also takes its block size from the input limit (the launcher refuses both).
+_INPUT_LIMIT_BELOW_POOL = 6
+
+
+@dataclass(frozen=True)
+class PoolCut:
+    """What the KV pool takes from the generated prefill block. A "pair" is one (new tokens, batch size).
+
+    The pairs counted are those of the block that the other limits alone give. The planned block can hold
+    pairs that are not among them, for example batch 3 where batch 4 no longer fits, so ``pairs`` less
+    ``dropped_pairs`` is not the number of planned pairs.
+    """
+
+    # S of the limits the block was planned for: the pool of one scheduler, so of one attention-DP rank.
+    pool_tokens: int
+    # Pairs of the block that the other limits alone give.
+    pairs: int
+    # Of those, pairs without any point in the planned block.
+    dropped_pairs: int
+    # Of those, pairs in the planned block whose longest cached prefix there is shorter.
+    shortened_pairs: int
+    # The smallest pool, in tokens, that holds every point of the block that the other limits alone give.
+    whole_grid_pool_tokens: int
+    # The input limit is the pool less 6, which SGLang gives exactly when the pool is not above the model's
+    # context. The counts and ``whole_grid_pool_tokens`` are for the grid of this input limit. If the pool is
+    # below the context, SGLang took the input limit from the pool, and a larger pool raises the input limit
+    # too, which can lengthen the grid. If the pool equals the context it does not. The limits cannot tell
+    # the two apart.
+    pool_sets_input_limit: bool
+
+
+def prefill_pool_cut(limits: Limits, caps: SampleCaps | None = None) -> PoolCut | None:
+    """What the KV pool takes from the generated prefill block, or ``None`` when it takes nothing.
+
+    The block is generated for ``limits`` and for the same record with a pool that no point can reach. The
+    answer is ``None`` when the two blocks are the same list of points, so that the pool ends no planned axis,
+    and the pool is above the model's context.
+
+    The other limits are taken as reported. SGLang lowers ``max_req_input_len`` itself when the pool is below
+    the model's context. The block "without the pool" can then already be shorter than a larger pool would
+    give, also when the two blocks are the same, so a pool that is not above the context always gives a record,
+    which says so in ``pool_sets_input_limit``. Its two blocks can both be empty.
+    """
+    limits = _require_limits(limits)
+    caps = SampleCaps() if caps is None else _require_caps(caps)
+    page = limits.page_size
+    # Rule 6 of ``prefill_unfit_reason`` holds b * (k + ceilP(n) + P + 1) below S. Rules 2 and 3 keep k + n
+    # below I and b at or below R, and ceilP(n) is below n + P, so the left side stays below
+    # R * (I + 2 * P). A pool of R * (I + 2 * P + 1) tokens, rounded up to whole pages, is therefore out of
+    # reach of every point, and of every closed form of the largest-value searches.
+    out_of_reach = _ceil_pages(limits.max_running_requests * (limits.max_req_input_len + 2 * page + 1), page)
+    without_pool = _generated_prefill(replace(limits, max_total_num_tokens=out_of_reach), caps)
+    planned = _generated_prefill(limits, caps)
+    sets_input_limit = limits.max_req_input_len + _INPUT_LIMIT_BELOW_POOL == limits.max_total_num_tokens
+    if planned == without_pool and not sets_input_limit:
+        return None
+
+    # The cached axis of a pair always holds its longest prefix (``prefill_cached_axis``).
+    def reach(block: list[tuple[int, int, int]]) -> dict[tuple[int, int], int]:
+        longest: dict[tuple[int, int], int] = {}
+        for batch, new, cached in block:
+            longest[(new, batch)] = max(longest.get((new, batch), 0), cached)
+        return longest
+
+    wanted, kept = reach(without_pool), reach(planned)
+    # Rule 6 for every point of the block without the pool: the largest left side, plus one, in whole pages.
+    # An input limit that admits no request leaves both blocks empty: nothing is held.
+    extra = page + PREFILL_OUTPUT_TOKENS
+    held = max((batch * (cached + _ceil_pages(new, page) + extra) for batch, new, cached in without_pool), default=0)
+    return PoolCut(
+        pool_tokens=limits.max_total_num_tokens,
+        pairs=len(wanted),
+        dropped_pairs=sum(1 for pair in wanted if pair not in kept),
+        shortened_pairs=sum(1 for pair, longest in wanted.items() if pair in kept and kept[pair] < longest),
+        whole_grid_pool_tokens=_ceil_pages(held + 1, page),
+        pool_sets_input_limit=sets_input_limit,
     )
 
 

@@ -50,16 +50,24 @@ v0.5.23 (297e54fd105e974cdf401e5b4d20253a22c16f90) of ``sgl-project/sglang`` (Ap
   (``embed_tokens``) and ``GlmImageForConditionalGeneration`` (the size of its output head);
 * ``srt/entrypoints/engine.py``, ``Engine``: ``run_scheduler_process_func``, ``__init__``,
   ``_ensure_event_loop``, ``async_generate``, ``get_all_child_pids`` and ``shutdown``;
-* ``srt/managers/io_struct.py``, ``GenerateReqInput._determine_batch_size`` and ``_normalize_rid``;
+* ``srt/managers/io_struct.py``, ``GenerateReqInput._determine_batch_size`` and ``_normalize_rid``, and the
+  field ``dp_ranks`` of ``BatchTokenIDOutput`` and of ``BatchStrOutput``;
 * ``srt/managers/tokenizer_manager.py``, ``TokenizerManager``: ``generate_request``,
   ``auto_create_handle_loop``, ``_handle_batch_request``, ``_send_batch_request``,
+  ``_should_use_batch_tokenization``, ``_send_one_request``,
   ``_stream_batch_responses``, ``_stream_one_response``, ``_coalesce_streaming_chunks``,
   ``_handle_batch_output``, ``_handle_abort_req``, ``_release_req_states_on_failure``,
   ``_validate_one_request``, ``sigterm_watchdog``, ``init_model_config``,
   ``init_tokenizer_and_processor`` and ``_tokenize_texts`` (SGLang's own batch call of the tokenizer);
 * ``srt/managers/schedule_batch.py``: the ``to_json`` forms of ``FINISH_LENGTH``, ``FINISH_MATCHED_TOKEN``
   and ``FINISH_ABORT``, and ``Req._check_token_based_finish``;
-* ``srt/managers/scheduler_components/output_streamer.py``, ``_GenerationStreamAccumulator.accept``;
+* ``srt/managers/scheduler_components/output_streamer.py``, ``_GenerationStreamAccumulator.accept`` and
+  ``to_payload``, and ``SchedulerOutputStreamer._stream_output_generation``;
+* ``srt/managers/detokenizer_manager.py``, ``DetokenizerManager.handle_batch_token_id_out``;
+* ``srt/managers/scheduler.py``, ``run_scheduler_process`` and ``resolve_spawn_dp_rank``;
+  ``srt/runtime_context.py``, ``SpawnRanks``; ``srt/managers/data_parallel_controller.py``,
+  ``DataParallelController.launch_tensor_parallel_group`` and ``round_robin_scheduler``;
+  ``srt/managers/scheduler_input_blocker.py``, ``input_blocker_guard_region``;
 * ``srt/sampling/sampling_params.py``, ``SamplingParams`` and its ``__post_init__``;
 * ``srt/utils/hf_transformers/common.py``, ``attach_additional_stop_token_ids``.
 
@@ -89,6 +97,17 @@ not hold the value: the launcher began to write it afterwards, as the upper end 
 ``producer.content.pool.id_range``, wherever a result file has the ``pool`` record. The result file of the
 second holds it. At 0.5.22 it rests on the source, where it reads the attribute that ``vocabulary`` read on
 those engines.
+
+Run on engines with DP attention on 2026-11-18 through sglbench_launcher.py, with SGLang 0.5.22 and 0.5.23 on
+two H200 GPUs: ``generate_batch`` in two-rank DEP cells of ``Qwen/Qwen1.5-MoE-A2.7B`` (``--tp-size 2 --ep-size 2
+--attn-dp-size 2``). Each release ran a prefill cell and a decode cell of a smoke grid through AISim's
+collector, and SGLang 0.5.23 ran the two cells once more with ``--enable-dp-attention-local-control-broadcast``.
+Every call gave a complete answer for every request, in calls of up to 8,192 requests, and the answer of request
+``i`` named rank ``i mod 2`` as its ``dp_rank``; the driver fails a run on any other rank. The preflight of the
+collector's cells found the two ``dp_ranks`` rows of ``SGLANG_SEAM_NAMES`` at both releases. Not run on an
+engine with DP attention: more than four ranks (four ran in one prefill cell, on the launcher's own command),
+an answer that names another rank than planned or none, and a model other than that one. The files of those
+runs are not kept in this repository.
 
 Not run on any engine, and so resting on the source alone: an abort or a timeout of a call and
 ``child_pids``. The tokenizer interface (``vocab_size``, ``all_special_ids``,
@@ -132,6 +151,20 @@ TESTED_VERSIONS = ("0.5.22", "0.5.23")
 #   ``tokenizer_manager``, ``hf_config``, ``hf_text_config``, ``vocab_size``), the tokenizer's attributes and
 #   its batch call, the request fields ``generate_batch`` sets and the chunk fields it reads. A change of one
 #   of these shows at the call that uses it.
+# The last two rows are of another kind: names this module does not import. ``dp_rank``, which
+# ``generate_batch`` reads from a chunk, is there only when both output records have the field ``dp_ranks``.
+# The scheduler writes the rank into a ``BatchTokenIDOutput``
+# (srt/managers/scheduler_components/output_streamer.py ``_GenerationStreamAccumulator.to_payload``), the
+# detokenizer copies it into the ``BatchStrOutput`` it sends on (srt/managers/detokenizer_manager.py
+# ``DetokenizerManager.handle_batch_token_id_out``), and the tokenizer manager reads it with
+# ``getattr(recv_obj, "dp_ranks", None)`` (srt/managers/tokenizer_manager.py
+# ``TokenizerManager._handle_batch_output``). A record without the field then gives a chunk without the key
+# and raises nothing, and a run with several attention-DP ranks would fail at its first call, after the model
+# was loaded. Both records are ``msgspec.Struct`` classes of srt/managers/io_struct.py, which the engine module
+# imports at both tags. A field of such a class is an attribute of the class, so the kind is "attribute" and
+# not "field", which is for dataclasses. That was seen with msgspec 0.21.1 on a class typed for the purpose,
+# and on SGLang's own classes when the preflight passed with both rows in the runs of 2026-11-18 (module
+# docstring).
 SGLANG_SEAM_NAMES = (
     ("sglang", "__version__", "name"),
     ("sglang.srt.plugins", "load_plugins", "name"),
@@ -146,6 +179,8 @@ SGLANG_SEAM_NAMES = (
     ("sglang.srt.entrypoints.engine", "Engine.async_generate", "attribute"),
     ("sglang.srt.entrypoints.engine", "Engine.get_all_child_pids", "attribute"),
     ("sglang.srt.entrypoints.engine", "Engine.shutdown", "attribute"),
+    ("sglang.srt.managers.io_struct", "BatchTokenIDOutput.dp_ranks", "attribute"),
+    ("sglang.srt.managers.io_struct", "BatchStrOutput.dp_ranks", "attribute"),
 )
 
 # Config attributes that say a model has expert layers. A truthy value of any of them on the top config or on
@@ -185,6 +220,20 @@ _COUNT_KEYS = ("prompt_tokens", "cached_tokens", "completion_tokens", "num_retra
 # ``meta_info`` without them (it sets ``id``, ``finish_reason``, ``weight_version``, ``e2e_latency`` and
 # ``completion_tokens``), so a final chunk without them is an abort whatever its finish reason says.
 _ABORT_ECHO_ABSENT_KEYS = ("prompt_tokens", "cached_tokens")
+
+# The key of ``meta_info`` that names the data-parallel rank of the scheduler that ran the request.
+# ``TokenizerManager._handle_batch_output`` copies it from the output record, into which the scheduler wrote
+# its own ``get_parallel().dp_rank`` for every request of the output
+# (srt/managers/scheduler_components/output_streamer.py ``SchedulerOutputStreamer._stream_output_generation``
+# and ``_GenerationStreamAccumulator.to_payload``). That rank is the one the scheduler process was started
+# with (srt/managers/scheduler.py ``run_scheduler_process``, srt/runtime_context.py ``SpawnRanks``):
+# - under DP attention the attention-DP rank, which the DP controller derives from the TP rank of the process
+#   (srt/managers/data_parallel_controller.py ``DataParallelController.launch_tensor_parallel_group``);
+# - without a DP controller ``None``, unless SGLANG_DP_RANK is set (``resolve_spawn_dp_rank``). The key is
+#   then there with the value ``None``.
+# Read in the source at both tags. The value under DP attention was seen through this module in the runs of
+# 2026-11-18 (module docstring): rank 0 or 1, as planned, in every answer.
+_RANK_KEY = "dp_rank"
 
 
 class EngineCallError(RuntimeError):
@@ -439,6 +488,12 @@ def _final_record(rid: str, meta_info: dict) -> dict:
             raise EngineCallError(f"request {rid}: its final meta_info has no {key}")
         if not _is_count(meta_info[key]) or meta_info[key] < 0:
             raise EngineCallError(f"request {rid}: {key} is {meta_info[key]!r}, not a count")
+    # The rank is passed on and not judged: a ``meta_info`` without the key, or with ``None`` under it, gives
+    # ``None``, and whether that is a failure is the caller's rule. Anything else that is not a rank is
+    # refused here, like a count that is not a count.
+    dp_rank = meta_info.get(_RANK_KEY)
+    if dp_rank is not None and (not _is_count(dp_rank) or dp_rank < 0):
+        raise EngineCallError(f"request {rid}: {_RANK_KEY} is {dp_rank!r}, not a rank")
     return {
         "rid": rid,
         "prompt_tokens": meta_info["prompt_tokens"],
@@ -446,6 +501,7 @@ def _final_record(rid: str, meta_info: dict) -> dict:
         "completion_tokens": meta_info["completion_tokens"],
         "finish_type": finish_type,
         "num_retractions": meta_info["num_retractions"],
+        _RANK_KEY: dp_rank,
     }
 
 
@@ -464,6 +520,10 @@ async def _collect_stream(engine, prompts, rids, sampling_params) -> list[dict]:
       ``_coalesce_streaming_chunks``: token ids are joined, ``meta_info`` is the last one) or all but the last
       are dropped (cumulative streaming). So only the last chunk is read, and only its ``meta_info``, whose
       counts are totals in both modes.
+
+    The stream has this form under DP attention too. The requests of the call are then sent to the scheduler
+    one by one, and ``TokenizerManager._handle_batch_request`` still reads all of them through
+    ``_stream_batch_responses`` (read at both tags; run through this module on 2026-11-18, module docstring).
 
     An error is raised at the chunk that shows it, without waiting for the other requests; the stream is then
     closed, which makes SGLang abort them.
@@ -535,6 +595,19 @@ async def _collect_stream(engine, prompts, rids, sampling_params) -> list[dict]:
 #   of that batch. Seen on running engines: one call of 2 and one of 128 prompts each ran as one extend batch
 #   (benchmarks/evidence/collector/sglbench-engine-probe-20261113, check_2; 128 prompts in nine of its ten
 #   runs, 32 in the other).
+#   Under DP attention the same call is not one message. The tokenizer manager then sends the prompts one by
+#   one (``TokenizerManager._should_use_batch_tokenization`` is false there unless the server field
+#   ``enable_tokenizer_batch_encode`` is on, so ``_handle_batch_request`` calls ``_send_one_request`` for
+#   each), and the DP controller gives each request that names no rank to the next rank in turn
+#   (srt/managers/data_parallel_controller.py ``DataParallelController.round_robin_scheduler``). With
+#   SGLANG_ENABLE_COLOCATED_BATCH_GEN set, SGLang puts a block and an unblock message of its own around those
+#   sends (srt/managers/scheduler_input_blocker.py ``input_blocker_guard_region``), so the requests still
+#   enter every rank's scheduler together. With ``enable_tokenizer_batch_encode`` on, the call would be one
+#   message again and neither message would be sent; the launcher refuses that field for a run with several
+#   attention-DP ranks (sglbench_launcher.py ``_check_dp_attention``). This module sends neither message,
+#   names no rank in a request and reads no variable: the launcher sets that one, and the driver orders the
+#   prompts and checks where each ran (sglbench_driver.py ``BenchmarkRun._stage``, where the deviation note
+#   for that case is).
 #   Retire by: staging the requests of a batch through SGLang's serving frontend.
 # - ``temperature`` 0.0. ``SamplingParams.__post_init__`` (srt/sampling/sampling_params.py) turns it into
 #   greedy sampling (``top_k = 1``). A served request samples as its client asks. Direction of the error: not
@@ -560,11 +633,14 @@ def generate_batch(engine, prompts, rids, max_new_tokens, timeout_seconds) -> li
     distinct request ids. Each returned dict is::
 
         {"rid": str, "prompt_tokens": int, "cached_tokens": int, "completion_tokens": int,
-         "finish_type": str | None, "num_retractions": int}
+         "finish_type": str | None, "num_retractions": int, "dp_rank": int | None}
 
     taken from the ``meta_info`` of the request's last stream chunk (``_collect_stream`` says how a batch
     stream delivers chunks). ``finish_type`` is ``finish_reason["type"]``: ``"length"`` for a request that
-    produced ``max_new_tokens`` tokens, ``"stop"`` for one that ended earlier.
+    produced ``max_new_tokens`` tokens, ``"stop"`` for one that ended earlier. ``dp_rank`` is the rank of the
+    scheduler that ran the request, as SGLang reports it (``_RANK_KEY``): under DP attention the
+    attention-DP rank, and ``None`` when the ``meta_info`` holds no rank, as on an engine without a DP
+    controller. Nothing is concluded from it here.
 
     The call is ``engine.async_generate(input_ids=prompts, sampling_params={"max_new_tokens": ...,
     "temperature": 0.0, "ignore_eos": True}, rid=rids, stream=True)`` (srt/entrypoints/engine.py
@@ -583,7 +659,8 @@ def generate_batch(engine, prompts, rids, max_new_tokens, timeout_seconds) -> li
     or a final ``meta_info`` without ``prompt_tokens`` or ``cached_tokens``, which is the echo of an abort); a
     stream that ended without the final chunk of a request; a chunk without ``index`` when the call has more
     than one request, or with an index or a request id that does not belong to the call; a missing key; a
-    cancellation; and any other exception of the call. The call is never sent again.
+    ``dp_rank`` that is neither a rank nor ``None``; a cancellation; and any other exception of the call. The
+    call is never sent again.
 
     ``SystemExit`` and ``KeyboardInterrupt`` pass through; the launcher's stop on a signal is a ``SystemExit``
     (sglbench_launcher.py ``_StopRequested``). SGLang's own SIGTERM handling ends with ``sys.exit(0)`` inside a

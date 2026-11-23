@@ -449,7 +449,7 @@ def test_a_moe_plan_with_the_tep_preset_is_frozen_with_a_single_and_a_tep_cell(t
     assert identity.cells == plan.cells
 
 
-def test_the_cli_plans_a_moe_collection_with_the_tep_preset(tmp_path, monkeypatch, capsys):
+def test_the_cli_plans_a_moe_collection_with_the_tep_preset_and_with_the_default_preset(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("COLLECTOR_MODEL_PATH", MOE_MODEL)
     arguments = [
         *("--backend", "sglang", "--model-path", MOE_MODEL, "--model-architecture", "NewMoeDsaForCausalLM"),
@@ -473,11 +473,19 @@ def test_the_cli_plans_a_moe_collection_with_the_tep_preset(tmp_path, monkeypatc
     ]
     assert saved_plan_identity(printed).backend == "sglang"
 
-    # Without the preset the plan of a MoE model holds DEP cells, and the refusal names the flag to pass.
-    with pytest.raises(SystemExit) as refused:
-        cli.main(arguments)
-    assert refused.value.code == 2
-    assert "error: SGLang FPM collection does not support DP attention yet" in capsys.readouterr().err
+    # Without the preset the plan of a MoE model holds a DEP cell as well for every GPU count above 1.
+    assert cli.main(arguments) == 0
+
+    printed = json.loads(capsys.readouterr().out)
+    assert [
+        (cell["workload_kind"], cell["parallel_strategy"], cell["topology"]["tp"], cell["topology"]["dp"])
+        for cell in printed["cells"]
+    ] == [
+        (phase, strategy, tp, dp)
+        for phase in ("prefill", "decode")
+        for strategy, tp, dp in (("single", 1, 1), ("dep", 1, 2), ("tep", 2, 1))
+    ]
+    assert saved_plan_identity(printed).backend == "sglang"
 
 
 def test_memory_admission_still_drops_a_moe_cell_that_does_not_fit(tmp_path, monkeypatch):
@@ -503,19 +511,84 @@ def test_memory_admission_still_drops_a_moe_cell_that_does_not_fit(tmp_path, mon
     ]
 
 
+# What a preset plans per phase for the FAKE MoE model on one and two GPUs: (strategy, tp, dp, moe_ep).
+SINGLE_CELL, TEP_CELL, DEP_CELL = ("single", 1, 1, 1), ("tep", 2, 1, 2), ("dep", 1, 2, 2)
+
+
+@pytest.mark.parametrize(
+    ("presets", "per_phase"),
+    [
+        # The default preset "auto" plans TEP and DEP for a MoE model, as it does for vLLM.
+        (None, [SINGLE_CELL, DEP_CELL, TEP_CELL]),
+        (["auto"], [SINGLE_CELL, DEP_CELL, TEP_CELL]),
+        (["tep", "dep"], [SINGLE_CELL, DEP_CELL, TEP_CELL]),
+        (["dep"], [SINGLE_CELL, DEP_CELL]),
+    ],
+    ids=["default", "auto", "tep-and-dep", "dep"],
+)
+def test_a_moe_plan_holds_a_dep_cell_under_the_default_preset_and_under_the_dep_preset(tmp_path, presets, per_phase):
+    plan = build_collection_plan(**_moe_plan_inputs(tmp_path, options=_options(fpm_parallel_presets=presets)))
+
+    assert [
+        (cell.workload_kind, cell.parallel_strategy, cell.topology.tp, cell.topology.dp, cell.topology.moe_ep)
+        for cell in plan.cells
+    ] == [(phase, *sizes) for phase in ("prefill", "decode") for sizes in per_phase]
+    # The DEP cell: one GPU and one expert-parallel rank per data-parallel rank, and nothing else above 1.
+    for cell in plan.cells:
+        if cell.parallel_strategy == "dep":
+            assert cell.topology == ParallelTopology(tp=1, pp=1, dp=2, moe_tp=1, moe_ep=2, cp=1)
+            assert cell.topology.total_gpus == 2
+    assert {cell.execution_identity for cell in plan.cells} == {LEGACY_EXECUTION_IDENTITY}
+    # Memory admission looked at every topology and dropped none (no estimate in this suite, _hermetic_plans).
+    assert [(decision.topology, decision.disposition) for decision in plan.topology_memory_admission] == [
+        (topology, "unknown") for topology in plan.topologies
+    ]
+    # The saved form names the strategy, and its reader recomputes the hash and rebuilds every cell.
+    saved = plan.to_dict()
+    assert [
+        (topology["strategy"], topology["tp"], topology["dp"], topology["moe_ep"]) for topology in saved["topologies"]
+    ] == per_phase
+    identity = saved_plan_identity(json.loads(json.dumps(saved)))
+    assert (identity.backend, identity.sha256) == ("sglang", plan.sha256)
+    assert identity.cells == plan.cells
+
+
+def test_a_dep_cell_is_another_cell_than_the_tep_cell_of_the_same_gpus_and_the_tep_plan_is_unchanged(tmp_path):
+    both = build_collection_plan(**_moe_plan_inputs(tmp_path, options=_options(fpm_parallel_presets=None)))
+    tep_only = build_collection_plan(**_moe_plan_inputs(tmp_path))
+
+    ids = {(cell.workload_kind, cell.parallel_strategy): cell.cell_id for cell in both.cells}
+    assert len(set(ids.values())) == 6
+    # The cells a TEP plan holds are the same cells in the plan of the default preset: admitting DEP gave
+    # them no new id. The plan is another plan, because it holds more topologies.
+    assert {(cell.workload_kind, cell.parallel_strategy): cell.cell_id for cell in tep_only.cells} == {
+        key: cell_id for key, cell_id in ids.items() if key[1] != "dep"
+    }
+    assert both.sha256 != tep_only.sha256
+
+
+def test_the_dep_preset_plans_a_cell_for_every_gpu_count_and_the_width_filter_picks_one(tmp_path):
+    def strategies(**options):
+        plan = build_collection_plan(**_moe_plan_inputs(tmp_path, options=_options(**options)))
+        return [(cell.parallel_strategy, cell.topology.dp, cell.topology.moe_ep) for cell in _cells(plan)["decode"]]
+
+    assert strategies(fpm_max_gpus=8, fpm_parallel_presets=["dep"]) == [
+        ("single", 1, 1),
+        ("dep", 2, 2),
+        ("dep", 4, 4),
+        ("dep", 8, 8),
+    ]
+    assert strategies(fpm_max_gpus=4, fpm_parallel_presets=["dep"], fpm_dp_sizes=[4]) == [("dep", 4, 4)]
+
+
 @pytest.mark.parametrize(
     ("presets", "message"),
     [
-        # The default preset "auto" plans TEP and DEP for a MoE model, and DEP needs DP attention.
-        (None, r"does not support DP attention yet \(topology \{'tp': 1, 'pp': 1, 'dp': 2, 'moe_tp': 1, 'moe_ep': 2"),
-        (["auto"], "does not support DP attention yet"),
-        (["dep"], "does not support DP attention yet"),
-        (["tep", "dep"], "does not support DP attention yet"),
         # Refused before the SGLang check: pure TP is admitted for vLLM only, and plain TP for a dense model only.
         (["pure_tp"], "pure TP was requested, but the AIC model/runtime capability profile does not explicitly admit"),
         (["tp"], "MoE models use TEP or DEP; plain TP is not an independent typical preset"),
     ],
-    ids=["default", "auto", "dep", "tep-and-dep", "pure-tp", "tp"],
+    ids=["pure-tp", "tp"],
 )
 def test_the_other_presets_of_a_moe_model_are_refused(tmp_path, presets, message):
     _refused(tmp_path, message, **_moe_plan_inputs(tmp_path, options=_options(fpm_parallel_presets=presets)))
@@ -534,14 +607,17 @@ def test_a_one_gpu_plan_of_a_moe_model_holds_the_single_cell_under_these_presets
     ]
 
 
-def test_the_dp_attention_refusal_names_the_preset_to_pass(tmp_path):
+def test_a_refused_topology_with_data_parallel_ranks_is_named_in_the_refusal():
+    # Attention TP inside a data-parallel rank: four GPUs as two ranks of two. No preset plans it.
+    topology = ParallelTopology(tp=2, pp=1, dp=2, moe_tp=1, moe_ep=4, cp=1)
+
     with pytest.raises(ValueError) as refused:
-        build_collection_plan(**_moe_plan_inputs(tmp_path, options=_options()))
+        planner._require_sglang_launcher_cells(is_moe=True, execution=LEGACY_EXECUTION_IDENTITY, topologies=(topology,))
 
     assert str(refused.value) == (
-        "SGLang FPM collection does not support DP attention yet (topology "
-        "{'tp': 1, 'pp': 1, 'dp': 2, 'moe_tp': 1, 'moe_ep': 2, 'cp': 1}); pass --fpm-parallel-presets tep to "
-        "collect the tensor- and expert-parallel cells of a MoE model"
+        "SGLang FPM collection supports DP attention for the DEP cells of a MoE model only (tp, pp, cp and moe_tp "
+        "must be 1, and moe_ep must equal dp; attention TP inside a DP rank is not built); got topology "
+        "{'tp': 2, 'pp': 1, 'dp': 2, 'moe_tp': 1, 'moe_ep': 4, 'cp': 1}"
     )
 
 
@@ -622,40 +698,66 @@ def test_the_single_and_the_tep_topologies_of_a_moe_model_are_admitted():
         planner._require_sglang_launcher_cells(is_moe=False, execution=LEGACY_EXECUTION_IDENTITY, topologies=admitted)
 
 
+def test_the_dep_topologies_of_a_moe_model_are_admitted_and_those_of_a_dense_model_are_not():
+    moe = {"is_moe": True, "execution": LEGACY_EXECUTION_IDENTITY}
+    admitted = tuple(_moe_topology(tp=1, dp=dp, moe_ep=dp) for dp in (2, 4, 8))
+    assert [topology_strategy(topology, is_moe=True) for topology in admitted] == ["dep", "dep", "dep"]
+
+    planner._require_sglang_launcher_cells(**moe, topologies=admitted)
+    # Beside the one-GPU cell and the TEP cells, as the default preset plans them.
+    planner._require_sglang_launcher_cells(**moe, topologies=(_moe_topology(tp=1), *admitted, _moe_topology(tp=2)))
+
+    # A dense model has no cell with more than one data-parallel rank.
+    with pytest.raises(ValueError, match=r"supports tensor-parallel cells only .*got topology .*'dp': 2"):
+        planner._require_sglang_launcher_cells(is_moe=False, execution=LEGACY_EXECUTION_IDENTITY, topologies=admitted)
+
+
 @pytest.mark.parametrize(
     ("sizes", "message"),
     [
-        # DEP at two and four GPUs, and DP attention beside tensor parallelism.
-        ({"tp": 1, "dp": 2, "moe_ep": 2}, r"does not support DP attention yet \(topology .*'dp': 2.*\); pass "),
-        ({"tp": 1, "dp": 4, "moe_ep": 4}, r"does not support DP attention yet \(topology .*'dp': 4.*\); pass "),
-        ({"tp": 2, "dp": 2, "moe_ep": 4}, r"does not support DP attention yet \(topology .*'dp': 2.*\); pass "),
-        # Pure TP, an expert-parallel size that is not the tensor-parallel size, and the two fixed axes.
-        ({"tp": 2, "moe_tp": 2, "moe_ep": 1}, r"moe_ep must equal tp\); got topology .*'moe_tp': 2, 'moe_ep': 1"),
-        ({"tp": 2, "moe_ep": 1}, r"moe_ep must equal tp\); got topology .*'tp': 2, .*'moe_ep': 1"),
-        ({"tp": 4, "moe_ep": 2}, r"moe_ep must equal tp\); got topology .*'tp': 4, .*'moe_ep': 2"),
-        ({"tp": 1, "moe_ep": 2}, r"moe_ep must equal tp\); got topology .*'tp': 1, .*'moe_ep': 2"),
-        ({"tp": 4, "moe_tp": 2, "moe_ep": 2}, r"moe_ep must equal tp\); got topology .*'moe_tp': 2, 'moe_ep': 2"),
+        # With data-parallel ranks: attention TP inside a rank, an expert-parallel size that is not the number
+        # of ranks, and the three fixed axes.
+        ({"tp": 2, "dp": 2, "moe_ep": 4}, r"moe_ep must equal dp; .*\); got topology .*'tp': 2, .*'dp': 2"),
+        ({"tp": 2, "dp": 2, "moe_ep": 2}, r"moe_ep must equal dp; .*\); got topology .*'tp': 2, .*'dp': 2"),
+        ({"tp": 1, "dp": 2, "moe_ep": 1}, r"moe_ep must equal dp; .*\); got topology .*'dp': 2, .*'moe_ep': 1"),
+        ({"tp": 1, "dp": 2, "moe_ep": 4}, r"moe_ep must equal dp; .*\); got topology .*'dp': 2, .*'moe_ep': 4"),
+        ({"tp": 1, "dp": 4, "moe_ep": 2}, r"moe_ep must equal dp; .*\); got topology .*'dp': 4, .*'moe_ep': 2"),
+        ({"tp": 1, "dp": 2, "moe_tp": 2, "moe_ep": 2}, r"moe_ep must equal dp; .*\); got topology .*'moe_tp': 2"),
+        ({"tp": 1, "dp": 2, "moe_ep": 2, "pp": 2}, r"moe_ep must equal dp; .*\); got topology .*'pp': 2"),
+        ({"tp": 1, "dp": 2, "moe_ep": 2, "cp": 2}, r"moe_ep must equal dp; .*\); got topology .*'cp': 2"),
+        # Without them: pure TP, an expert-parallel size that is not the tensor-parallel size, and the fixed axes.
+        ({"tp": 2, "moe_tp": 2, "moe_ep": 1}, r"moe_ep equal to tp; got topology .*'moe_tp': 2, 'moe_ep': 1"),
+        ({"tp": 2, "moe_ep": 1}, r"moe_ep equal to tp; got topology .*'tp': 2, .*'moe_ep': 1"),
+        ({"tp": 4, "moe_ep": 2}, r"moe_ep equal to tp; got topology .*'tp': 4, .*'moe_ep': 2"),
+        ({"tp": 1, "moe_ep": 2}, r"moe_ep equal to tp; got topology .*'tp': 1, .*'moe_ep': 2"),
+        ({"tp": 4, "moe_tp": 2, "moe_ep": 2}, r"moe_ep equal to tp; got topology .*'moe_tp': 2, 'moe_ep': 2"),
         # The expert-parallel size is the tensor-parallel size, and only moe_tp is not 1.
-        ({"tp": 2, "moe_tp": 2}, r"moe_ep must equal tp\); got topology .*'tp': 2, .*'moe_tp': 2, 'moe_ep': 2"),
-        ({"pp": 2}, r"moe_ep must equal tp\); got topology .*'pp': 2"),
-        ({"cp": 2}, r"moe_ep must equal tp\); got topology .*'cp': 2"),
+        ({"tp": 2, "moe_tp": 2}, r"moe_ep equal to tp; got topology .*'tp': 2, .*'moe_tp': 2, 'moe_ep': 2"),
+        ({"pp": 2}, r"moe_ep equal to tp; got topology .*'pp': 2"),
+        ({"cp": 2}, r"moe_ep equal to tp; got topology .*'cp': 2"),
     ],
     ids=[
-        *("dep-2", "dep-4", "dp-with-tp", "pure-tp", "no-ep", "ep-below-tp", "ep-above-tp", "mixed"),
-        *("moe-tp-beside-ep", "pp", "cp"),
+        *("dp-with-tp", "dp-with-tp-and-ep-of-dp", "dp-without-ep", "ep-above-dp", "ep-below-dp"),
+        *("dp-with-moe-tp", "dp-with-pp", "dp-with-cp"),
+        *("pure-tp", "no-ep", "ep-below-tp", "ep-above-tp", "mixed", "moe-tp-beside-ep", "pp", "cp"),
     ],
 )
 def test_every_other_topology_of_a_moe_model_is_refused(sizes, message):
     moe = {"is_moe": True, "execution": LEGACY_EXECUTION_IDENTITY}
-    admitted = (_moe_topology(tp=1), _moe_topology(tp=2))
+    admitted = (_moe_topology(tp=1), _moe_topology(tp=2), _moe_topology(tp=1, dp=2, moe_ep=2))
 
     with pytest.raises(ValueError, match=message) as refused:
         planner._require_sglang_launcher_cells(**moe, topologies=(*admitted, _moe_topology(**sizes)))
 
-    if "DP attention" not in message:
+    if sizes.get("dp", 1) > 1:
         assert str(refused.value).startswith(
-            "SGLang FPM collection supports the tensor- and expert-parallel cells of a MoE model only (pp, dp, cp "
-            "and moe_tp must be 1, and moe_ep must equal tp); got topology {"
+            "SGLang FPM collection supports DP attention for the DEP cells of a MoE model only (tp, pp, cp and "
+            "moe_tp must be 1, and moe_ep must equal dp; attention TP inside a DP rank is not built); got topology {"
+        )
+    else:
+        assert str(refused.value).startswith(
+            "SGLang FPM collection supports the TEP and the DEP cells of a MoE model only; a cell without DP "
+            "attention must have pp, cp and moe_tp of 1 and moe_ep equal to tp; got topology {"
         )
 
 

@@ -127,6 +127,7 @@ BATCH_KEYS = [
     "extend_num_tokens",
     "prefix_lens",
     "extend_lens",
+    "global_num_tokens",
 ]
 
 # Names the collector and the in-pod gate sweep for. No file of the recorder tree may match one of them.
@@ -195,6 +196,8 @@ class FakeBatch:
     extend_num_tokens: int | None = None
     prefix_lens: list | None = None
     extend_lens: list | None = None
+    # None, as the dataclass default of SGLang's field, until a sync step has bound a list to it.
+    global_num_tokens: list | None = None
 
     def copy(self):
         # As ScheduleBatch.copy: a new object, a copy of the list reqs, the other fields as they are now.
@@ -206,6 +209,7 @@ class FakeBatch:
             extend_num_tokens=self.extend_num_tokens,
             prefix_lens=self.prefix_lens,
             extend_lens=self.extend_lens,
+            global_num_tokens=self.global_num_tokens,
         )
 
 
@@ -620,7 +624,7 @@ def _extend_batch(rids=(RID_A, RID_B)):
 def _expected_header():
     return {
         "type": "header",
-        "format": 1,
+        "format": 2,
         "pid": os.getpid(),
         "class": CLASS_NAME,
         "mro": [CLASS_NAME, "Scheduler", "FakeSchedulerBase"],
@@ -673,7 +677,7 @@ def _fake_time(reading):
 
 def test_public_names_have_the_values_a_reader_of_the_log_expects():
     assert recorder.ENV_RECORDER_DIR == ENV
-    assert recorder.RECORD_FORMAT == 1
+    assert recorder.RECORD_FORMAT == 2
     assert recorder.RECORDER_CLASS_NAME == CLASS_NAME
     assert recorder.LOG_FILE_PREFIX == "sched-"
     assert recorder.LOG_FILE_SUFFIX == ".jsonl"
@@ -712,7 +716,7 @@ def test_module_imports_in_a_bare_interpreter_without_sglang_torch_or_numpy():
     )
     assert done.returncode == 0, done.stderr
     # SGLang is imported only when the entry runs, and without SGLang the entry says so; it does not go on.
-    assert done.stdout.splitlines() == ["entry: blocked for this test: sglang", f"1 {CLASS_NAME}"]
+    assert done.stdout.splitlines() == ["entry: blocked for this test: sglang", f"2 {CLASS_NAME}"]
 
 
 def test_module_source_imports_sglang_only_inside_functions_and_reads_one_variable():
@@ -784,6 +788,7 @@ SEAM_NAMES = (
     ("sglang.srt.managers.schedule_batch", "ScheduleBatch.extend_num_tokens", "field"),
     ("sglang.srt.managers.schedule_batch", "ScheduleBatch.prefix_lens", "field"),
     ("sglang.srt.managers.schedule_batch", "ScheduleBatch.extend_lens", "field"),
+    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.global_num_tokens", "field"),
     ("sglang.srt.managers.utils", "GenerationBatchResult.copy_done", "field"),
     ("sglang.srt.managers.utils", "EmbeddingBatchResult.copy_done", "field"),
     ("sglang.srt.model_executor.forward_batch_info", "ForwardMode.EXTEND", "attribute"),
@@ -1256,6 +1261,7 @@ def test_extend_batch_line(world):
         "extend_num_tokens": 128,
         "prefix_lens": [0, 0],
         "extend_lens": [64, 64],
+        "global_num_tokens": None,
     }
     assert world.lines_of("fault") == []
 
@@ -1306,6 +1312,7 @@ def test_decode_batch_line_leaves_the_stale_extend_fields_out(world):
         "extend_num_tokens": None,
         "prefix_lens": None,
         "extend_lens": None,
+        "global_num_tokens": None,
     }
 
 
@@ -1325,6 +1332,77 @@ def test_extend_fields_are_not_even_read_for_another_mode(world, mode):
     assert line["rids"] == []
     assert (line["extend_num_tokens"], line["prefix_lens"], line["extend_lens"]) == (None, None, None)
     assert world.lines_of("fault") == []
+
+
+@pytest.mark.parametrize(
+    ("held", "written"),
+    [
+        pytest.param(None, None, id="none"),
+        pytest.param([128], [128], id="one-count"),
+        pytest.param([128, 128], [128, 128], id="two-ranks"),
+        pytest.param((4096, 0, 4095), [4096, 0, 4095], id="a-tuple-of-three"),
+        pytest.param([], [], id="empty"),
+    ],
+)
+@pytest.mark.parametrize("mode", [FakeForwardMode.EXTEND, FakeForwardMode.DECODE])
+def test_global_num_tokens_is_written_as_the_batch_holds_it(world, mode, held, written):
+    scheduler = _scheduler(world)
+    batch = _extend_batch()
+    batch.forward_mode = mode
+    batch.global_num_tokens = held
+    scheduler.process_batch_result(batch, scheduler.run_batch(batch))
+
+    (line,) = world.lines_of("batch")
+    assert list(line) == BATCH_KEYS
+    assert line["global_num_tokens"] == written
+    # The counts are written for every mode, unlike the three extend fields.
+    assert (line["extend_num_tokens"] is None) == (mode is FakeForwardMode.DECODE)
+    assert world.lines_of("fault") == []
+
+
+@pytest.mark.parametrize("copy_done", ["event", "none"])
+def test_an_idle_batch_of_a_rank_without_work_gets_a_line_without_request_ids_and_no_fault(world, copy_done):
+    # FAKE of a scheduler process under DP attention: rank 1 of two, with an input blocker. SGLang gives a rank
+    # that has nothing to run an idle batch in every step in which another rank runs one.
+    world.sglang.parallel.values.update({"tp_size": 2, "attn_dp_size": 2, "attn_dp_enabled": True, "attn_dp_rank": 1})
+    scheduler = _scheduler(world, overrides={"input_blocker": object()})
+    (header,) = world.records()
+    assert (header["leader"], header["checks"]["input_blocker"]) == (True, True)
+    assert header["ranks"] == {
+        **FAKE_RANKS,
+        "tp_size": 2,
+        "attn_dp_size": 2,
+        "attn_dp_enabled": True,
+        "attn_dp_rank": 1,
+    }
+
+    # Step 1: the other rank extends alone. Step 2: both ranks extend. Step 3: the other rank decodes alone.
+    steps = [
+        FakeBatch(reqs=[], forward_mode=FakeForwardMode.IDLE, global_num_tokens=[128, 0]),
+        dataclasses.replace(_extend_batch(), global_num_tokens=[128, 128]),
+        FakeBatch(reqs=[], forward_mode=FakeForwardMode.IDLE, global_num_tokens=[2, 0]),
+    ]
+    for batch in steps:
+        if copy_done == "none":
+            world.results.append(FakeResult(None))
+        assert scheduler.process_batch_result(batch, scheduler.run_batch(batch)) is world.stock_process_return
+
+    lines = world.lines_of("batch")
+    assert [list(line) for line in lines] == [BATCH_KEYS] * 3
+    assert [(line["seq"], line["forward_iter"], line["mode"], line["rids"]) for line in lines] == [
+        (1, 1, "IDLE", []),
+        (2, 2, "EXTEND", [RID_A, RID_B]),
+        (3, 3, "IDLE", []),
+    ]
+    # An idle step counts as a step, and its line holds what every rank ran in it.
+    assert [line["global_num_tokens"] for line in lines] == [[128, 0], [128, 128], [2, 0]]
+    idle = lines[0]
+    assert (idle["extend_num_tokens"], idle["prefix_lens"], idle["extend_lens"]) == (None, None, None)
+    assert type(idle["launch_ts"]) is type(idle["out_ts"]) is float
+    assert [line["copy_done"] for line in lines] == [copy_done == "event"] * 3
+    assert world.lines_of("fault") == []
+    # The stock methods got every batch, the idle ones included.
+    assert [call[0] for call in world.stock_calls] == ["run_batch", "process_batch_result"] * 3
 
 
 def test_seq_counts_the_batch_lines_from_one(world):
@@ -1367,18 +1445,22 @@ def test_overlap_order_joins_by_forward_iter_and_reads_the_copy(world):
     scheduler = _scheduler(world)
     queue = collections.deque()
     live = _extend_batch()
+    # FAKE: the sync step of a two-rank engine bound the counts of both ranks before step 1 ran.
+    live.global_num_tokens = [128, 128]
 
     # As Scheduler.event_loop_overlap. Pass 1: run step 1 and queue a copy of the batch with its result.
     result_1 = scheduler.run_batch(live)
     queue.append((live.copy(), result_1))
     # The live object becomes the batch of the next step. Its request list is rebound with a third request,
     # as when SGLang merges a batch into the running one, and its extend fields are overwritten here, so that
-    # the line of step 1 can only be right when it is built from the queued copy.
+    # the line of step 1 can only be right when it is built from the queued copy. The sync step of step 2
+    # binds a new list of counts, as SGLang does: it never edits the list the copy still holds.
     live.forward_mode = FakeForwardMode.DECODE
     live.reqs = [*live.reqs, FakeRequest(RID_C)]
     live.extend_num_tokens = 3
     live.prefix_lens = [63, 63, 63]
     live.extend_lens = [1, 1, 1]
+    live.global_num_tokens = [3, 3]
     # Pass 2: run step 2 first, then process the result of step 1.
     result_2 = scheduler.run_batch(live)
     queue.append((live.copy(), result_2))
@@ -1421,6 +1503,7 @@ def test_overlap_order_joins_by_forward_iter_and_reads_the_copy(world):
             "extend_num_tokens": 128,
             "prefix_lens": [0, 0],
             "extend_lens": [64, 64],
+            "global_num_tokens": [128, 128],
         },
         {
             "type": "batch",
@@ -1435,6 +1518,7 @@ def test_overlap_order_joins_by_forward_iter_and_reads_the_copy(world):
             "extend_num_tokens": None,
             "prefix_lens": None,
             "extend_lens": None,
+            "global_num_tokens": [3, 3],
         },
     ]
     # Step 2 was launched before the output of step 1 was taken, and the live object says nothing about step 1.
@@ -1614,6 +1698,11 @@ def test_fault_in_the_run_batch_step_leaves_the_stock_result_untouched(world, sp
         pytest.param("prefix_lens", [0, "0"], "TypeError", id="prefix-lens-str"),
         pytest.param("extend_lens", None, "TypeError", id="extend-lens-none"),
         pytest.param("extend_lens", [64, True], "TypeError", id="extend-lens-bool"),
+        pytest.param("global_num_tokens", 128, "TypeError", id="global-num-tokens-int"),
+        pytest.param("global_num_tokens", "128", "TypeError", id="global-num-tokens-str"),
+        pytest.param("global_num_tokens", [128, True], "TypeError", id="global-num-tokens-bool"),
+        pytest.param("global_num_tokens", [128.0, 128.0], "TypeError", id="global-num-tokens-float"),
+        pytest.param("global_num_tokens", [128, None], "TypeError", id="global-num-tokens-none-inside"),
         pytest.param("copy_done", "absent", "AttributeError", id="result-without-copy-done"),
         pytest.param("clock", "raises", "RuntimeError", id="clock-raises"),
         pytest.param("batch", "empty", "AttributeError", id="batch-without-fields"),

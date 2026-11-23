@@ -2826,10 +2826,12 @@ https://github.com/ai-dynamo/dynamo/blob/b20fe6fe94021b854597965c7305931175e8f48
 
 ## SGLang v0.5.22 and v0.5.23 admission rules in the SGLang self-benchmark producer core
 
-The feasibility rules in repository-root
-`python/aisim/collector/fpm_forward/runtime/sglbench_grid.py`, the admission and
-graph-size models in `python/aisim/tests/unit/collector/test_fpm_sglbench_grid.py`, and
-the prefix-cache model `PageCacheModel` in
+The feasibility rules and the first step of the prefill new-token axis in repository-root
+`python/aisim/collector/fpm_forward/runtime/sglbench_grid.py`, the admission,
+graph-size and graph-replay models in
+`python/aisim/tests/unit/collector/test_fpm_sglbench_grid.py`, the graph-replay model in
+`python/aisim/tests/unit/collector/test_fpm_sglbench_producer.py`, and the prefix-cache
+model `PageCacheModel` in
 `python/aisim/tests/unit/collector/test_fpm_sglbench_content.py`, which
 `python/aisim/tests/unit/collector/test_fpm_sglbench_producer.py` also uses, are modified
 behavioral adaptations of SGLang v0.5.22 at commit
@@ -2841,16 +2843,24 @@ https://github.com/sgl-project/sglang/tree/297e54fd105e974cdf401e5b4d20253a22c16
 Upstream paths, under `python/sglang/srt/`:
 `managers/{tp_worker.py,utils.py,scheduler.py,schedule_policy.py,schedule_batch.py}`,
 `mem_cache/{prefill_budget.py,allocator/base.py,radix_cache.py,kv_cache_configurator.py,common.py}`,
-`model_executor/pool_configurator.py` and
-`arg_groups/{validation_hook.py,cuda_graph_hook.py}`.
+`model_executor/pool_configurator.py`,
+`model_executor/runner/{prefill_cuda_graph_runner.py,base_cuda_graph_runner.py}`,
+`arg_groups/{validation_hook.py,cuda_graph_hook.py}`,
+`hardware_backend/npu/utils.py` and `layers/attention/dsv4/metadata.py`.
 Copyright 2023-2026 SGLang Team. Licensed under Apache-2.0. No upstream root NOTICE
 exists. The upstream license is at
 https://github.com/sgl-project/sglang/blob/297e54fd105e974cdf401e5b4d20253a22c16f90/LICENSE
 
 Modified: the admission arithmetic is restated as closed forms over a record of engine
-limits, and the tests model one admission pass, the graph-size ladders and whole-page
-prefix matching. Nothing is imported from SGLang, no upstream function or block of source
-is copied and no serving implementation is vendored. `sglbench_content.py` and
+limits, the rule by which a batch replays a captured prefill graph is restated as the
+smallest token count that runs with the smallest captured size, and the tests model one
+admission pass, the graph-size ladders, that replay rule and whole-page
+prefix matching. Nothing is imported from SGLang, no upstream function is copied and no
+serving implementation is vendored. `test_fpm_sglbench_grid.py` holds single upstream
+statements as strings and compares them with a local checkout of each release when one is
+given: the last five statements of `PrefillCudaGraphRunner.can_replay_locally`, the last
+two of `BaseCudaGraphRunner._pad_to_bucket`, two assignments of the prefill runner and two
+statements of `generate_prefill_cuda_graph_batch_sizes`. `sglbench_content.py` and
 `sglbench_artifact.py` name SGLang functions in comments and docstrings only.
 
 ## SGLang v0.5.22 and v0.5.23 interfaces used by the SGLang self-benchmark launcher
@@ -2872,40 +2882,48 @@ under SGLang's names. `sglbench_compat.py` imports SGLang inside its functions a
 its argument parser, engine, tokenizer and plugin loader; it follows the layout of the
 streamed response chunks. `sglbench_driver.py` checks the batch sequences SGLang's
 scheduler produces for one call, and `sglbench_launcher.py` tests SGLang's resolved
-arguments and environment variables under their upstream names; these two import no
+arguments and environment variables under their upstream names and sets one of them
+(`SGLANG_ENABLE_COLOCATED_BATCH_GEN`) for a run with DP attention; these two import no
 SGLang. The tests model those interfaces with fakes.
 
 The collector path that starts the launcher follows the same two revisions.
 `python/aisim/collector/fpm_forward/sglang_fpm_builder.py`, with the test
-`python/aisim/tests/unit/collector/test_fpm_sglang_builder.py`, writes ten of SGLang's
+`python/aisim/tests/unit/collector/test_fpm_sglang_builder.py`, writes eleven of SGLang's
 command-line flags under their upstream names, among them `--ep-size` for the
-expert-parallel size of a MoE cell, and repeats the choice names of the `kv_cache_dtype`
-field; it imports no SGLang.
+expert-parallel size of a MoE cell and `--attn-dp-size` for the data-parallel ranks of a
+DEP cell, and repeats the choice names of the `kv_cache_dtype` field; it imports no SGLang.
 `python/aisim/collector/fpm_forward/runtime/sglbench_preflight.py`, with the tests
 `python/aisim/tests/unit/collector/test_fpm_sglbench_{preflight,gate}.py`, types no SGLang
 name: it looks up the module, class, attribute and field names that `sglbench_compat.py`
 and `sglbench_recorder.py` list in `SGLANG_SEAM_NAMES`.
+`python/aisim/collector/fpm_forward/native_artifact.py` holds the sizes a result file
+records against its cell under SGLang's meaning of `tp_size` and `attn_dp_size`, and
+`python/aisim/collector/README.md` describes SGLang's input blocker; both name SGLang
+files in prose only.
 
-Upstream paths, under `python/sglang/`: `__init__.py`, `version.py` and, under `srt/`,
+Upstream paths, under `python/sglang/`: `__init__.py`, `launch_server.py`, `version.py`
+and, under `srt/`,
 `server_args.py`, `environ.py`, `runtime_context.py`,
-`arg_groups/{arg_utils.py,kv_cache_hook.py,model_override_base.py,moe_hook.py,overrides.py,parallel_hook.py,serving_hook.py,validation_hook.py}`,
+`arg_groups/{arg_utils.py,kv_cache_hook.py,memory_hook.py,model_override_base.py,moe_hook.py,overrides.py,parallel_hook.py,pipeline.py,serving_hook.py,validation_hook.py}`,
 `arg_groups/fields/{device.py,disagg.py,exec_.py,memory.py,model.py,parallel.py,schedule.py,serving.py,spec.py}`,
 `configs/{model_config.py,step3_vl.py}`, `entrypoints/engine.py`, `eplb/expert_location.py`,
 `layers/moe/fused_moe_triton/layer.py`,
-`managers/{data_parallel_controller.py,io_struct.py,min_free_slots_delayer.py,schedule_batch.py,schedule_policy.py,scheduler.py,tokenizer_manager.py,tp_worker.py,utils.py}`,
+`managers/{data_parallel_controller.py,detokenizer_manager.py,io_struct.py,min_free_slots_delayer.py,schedule_batch.py,schedule_policy.py,scheduler.py,scheduler_input_blocker.py,tokenizer_manager.py,tp_worker.py,utils.py}`,
 `managers/async_d2h_copy_worker.py` (v0.5.23 only),
 `managers/scheduler_components/{batch_result_processor.py,dp_attn.py,ipc_channels.py,metrics_reporter.py,output_streamer.py,recv_skipper.py,request_receiver.py}`,
-`mem_cache/{common.py,kv_cache_builder.py,kv_cache_dtype.py,registry.py}`,
-`model_executor/{forward_batch_info.py,model_runner.py}`,
+`mem_cache/{common.py,kv_cache_builder.py,kv_cache_configurator.py,kv_cache_dtype.py,registry.py}`,
+`model_executor/{forward_batch_info.py,model_runner.py,pool_configurator.py}`,
 `model_executor/runner/{decode_cuda_graph_runner.py,eager_runner.py,prefill_cuda_graph_runner.py}`,
 `model_loader/utils.py`, `models/{dbrx.py,glm_image_vl.py,step3_vl.py}`,
 `plugins/{__init__.py,hook_registry.py}`,
 `sampling/{sampling_params.py,watermarking/core.py}` and
-`utils/{common.py,watchdog.py,hf_transformers/common.py}`.
+`utils/{common.py,poll_based_barrier.py,watchdog.py,hf_transformers/common.py}`.
 Copyright 2023-2026 SGLang Team. Licensed under Apache-2.0. No upstream root NOTICE
 exists. The upstream license is at
 https://github.com/sgl-project/sglang/blob/297e54fd105e974cdf401e5b4d20253a22c16f90/LICENSE
 
-No upstream function or block of source is copied and nothing is vendored. SGLang is not
-a dependency of AISim: these files run inside an SGLang container, where SGLang is
-already installed.
+No upstream function is copied and nothing is vendored. `test_fpm_sglang_builder.py`
+holds single expressions of `handle_data_parallelism`, `handle_deprecated_dp_attention`,
+`resolve_max_num_reqs` and `derive_attn_tp_size` as strings and compares them with a
+local checkout of each release when one is given. SGLang is not a dependency of AISim:
+these files run inside an SGLang container, where SGLang is already installed.

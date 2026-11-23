@@ -70,7 +70,17 @@ FAKE_E2E_LATENCY = 0.25
 FAKE_CLOCK_START = 1000.0
 CALL_TIMEOUT = 900.0
 
-RESULT_KEYS = ["rid", "prompt_tokens", "cached_tokens", "completion_tokens", "finish_type", "num_retractions"]
+RESULT_KEYS = [
+    "rid",
+    "prompt_tokens",
+    "cached_tokens",
+    "completion_tokens",
+    "finish_type",
+    "num_retractions",
+    "dp_rank",
+]
+# In the place of a ``dp_rank`` when a FAKE ``meta_info`` is to have no such key.
+NO_RANK_KEY = object()
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -529,9 +539,14 @@ def _length(count):
     return {"type": "length", "length": count}
 
 
-def _meta(rid, *, finish=None, prompt=8, cached=0, completion=1, retractions=0):
-    """A ``meta_info`` as ``TokenizerManager._handle_batch_output`` builds it for a generation request."""
-    return {
+def _meta(rid, *, finish=None, prompt=8, cached=0, completion=1, retractions=0, rank=None):
+    """A ``meta_info`` as ``TokenizerManager._handle_batch_output`` builds it for a generation request.
+
+    ``dp_rank`` is its last key and is ``None`` unless ``rank`` says otherwise: SGLang sets the key whenever
+    the output record lists a rank for every request, and without a DP controller every one of them is
+    ``None``. ``NO_RANK_KEY`` leaves the key out.
+    """
+    meta_info = {
         "id": rid,
         "finish_reason": finish,
         "prompt_tokens": prompt,
@@ -541,6 +556,9 @@ def _meta(rid, *, finish=None, prompt=8, cached=0, completion=1, retractions=0):
         "completion_tokens": completion,
         "cached_tokens": cached,
     }
+    if rank is not NO_RANK_KEY:
+        meta_info["dp_rank"] = rank
+    return meta_info
 
 
 def _chunk(index, rid, output_ids=(1,), **meta):
@@ -679,6 +697,7 @@ def test_interleaved_chunks_are_joined_by_index_and_the_last_chunk_of_each_reque
             "completion_tokens": 2,
             "finish_type": "length",
             "num_retractions": 1,
+            "dp_rank": None,
         },
         {
             "rid": r1,
@@ -687,6 +706,7 @@ def test_interleaved_chunks_are_joined_by_index_and_the_last_chunk_of_each_reque
             "completion_tokens": 2,
             "finish_type": "length",
             "num_retractions": 0,
+            "dp_rank": None,
         },
         {
             "rid": r2,
@@ -695,6 +715,7 @@ def test_interleaved_chunks_are_joined_by_index_and_the_last_chunk_of_each_reque
             "completion_tokens": 2,
             "finish_type": "stop",
             "num_retractions": 0,
+            "dp_rank": None,
         },
     ]
     assert [list(result) for result in results] == [RESULT_KEYS] * 3
@@ -731,6 +752,7 @@ def test_a_batch_of_one_with_an_index_and_a_single_stream_without_one(loop):
             "completion_tokens": 2,
             "finish_type": "length",
             "num_retractions": 0,
+            "dp_rank": None,
         }
     ]
     assert with_index.calls[0]["input_ids"] == [[100] * 8], "a batch of one is still a list of lists"
@@ -759,6 +781,49 @@ def test_a_finish_reason_without_a_type_gives_none_as_finish_type(loop):
     (rid,) = _rids(1)
     engine = _FakeStreamEngine(loop, [_chunk(0, rid, completion=2, finish={"length": 2})])
     assert _generate(engine, 1)[0]["finish_type"] is None
+
+
+def test_the_rank_of_each_request_is_passed_on_as_sglang_reports_it(loop):
+    rids = _rids(4)
+    # FAKE of an engine with two attention-DP ranks: the requests of a call ran on the ranks in turn. The
+    # unfinished chunks of a request carry the rank too; only the final one is read.
+    script = [_chunk(index, rid, completion=1, rank=index % 2) for index, rid in enumerate(rids)]
+    script += [_chunk(index, rid, completion=2, finish=_length(2), rank=index % 2) for index, rid in enumerate(rids)]
+    results = _generate(_FakeStreamEngine(loop, script), 4)
+
+    assert [result["dp_rank"] for result in results] == [0, 1, 0, 1]
+    assert all(type(result["dp_rank"]) is int for result in results)
+    assert [list(result) for result in results] == [RESULT_KEYS] * 4
+    # Nothing is concluded from the rank here: a call whose requests all ran on one rank is returned as it is.
+    one_rank = [_chunk(index, rid, completion=2, finish=_length(2), rank=1) for index, rid in enumerate(rids)]
+    assert [result["dp_rank"] for result in _generate(_FakeStreamEngine(loop, one_rank), 4)] == [1, 1, 1, 1]
+
+
+@pytest.mark.parametrize("rank", [None, NO_RANK_KEY], ids=["none", "no key"])
+def test_a_request_without_a_rank_has_none_as_its_rank(loop, rank):
+    # ``None`` under the key is what SGLang reports without a DP controller; no key at all is an output record
+    # without ranks.
+    rids = _rids(2)
+    script = [_chunk(index, rid, completion=2, finish=_length(2), rank=rank) for index, rid in enumerate(rids)]
+    results = _generate(_FakeStreamEngine(loop, script), 2)
+
+    assert [result["dp_rank"] for result in results] == [None, None]
+    assert [list(result) for result in results] == [RESULT_KEYS] * 2
+
+
+@pytest.mark.parametrize("rank", [True, False, -1, "1", 1.0, [1], {"rank": 1}])
+def test_a_rank_that_is_neither_a_plain_int_nor_none_fails_the_call(loop, rank):
+    r0, r1 = _rids(2)
+    script = [_chunk(0, r0, completion=2, finish=_length(2), rank=0), _chunk(1, r1, completion=2, finish=_length(2))]
+    script[1]["meta_info"]["dp_rank"] = rank
+    error = _fails(_FakeStreamEngine(loop, script), 2, "not a rank")
+    assert str(error) == f"request {r1}: dp_rank is {rank!r}, not a rank"
+
+
+def test_a_rank_in_an_unfinished_chunk_is_not_read(loop):
+    (rid,) = _rids(1)
+    script = [_chunk(0, rid, completion=1, rank="FAKE: not a rank"), _chunk(0, rid, completion=2, finish=_length(2))]
+    assert _generate(_FakeStreamEngine(loop, script), 1)[0]["dp_rank"] is None
 
 
 def test_every_call_runs_on_the_engines_own_loop_and_leaves_it_open(loop):
@@ -1592,6 +1657,9 @@ SEAM_NAMES = (
     ("sglang.srt.entrypoints.engine", "Engine.async_generate", "attribute"),
     ("sglang.srt.entrypoints.engine", "Engine.get_all_child_pids", "attribute"),
     ("sglang.srt.entrypoints.engine", "Engine.shutdown", "attribute"),
+    # Not imported by the module: the field of SGLang's two output records behind the ``dp_rank`` of a chunk.
+    ("sglang.srt.managers.io_struct", "BatchTokenIDOutput.dp_ranks", "attribute"),
+    ("sglang.srt.managers.io_struct", "BatchStrOutput.dp_ranks", "attribute"),
 )
 
 
@@ -1620,6 +1688,13 @@ def test_seam_names_are_the_typed_rows_and_name_everything_the_module_imports_fr
     # The two tests ``build_engine`` makes of the class before it subclasses it are rows as well.
     assert ("sglang.srt.entrypoints.engine", "Engine", "class") in SEAM_NAMES
     assert ("sglang.srt.entrypoints.engine", "Engine.run_scheduler_process_func", "attribute") in SEAM_NAMES
+    # The last two rows name what the module never imports: the field behind the ``dp_rank`` of a chunk, in
+    # both output records of SGLang. Every other row is of a module the accessors import.
+    imported_modules = {module for module, _name in reached}
+    assert [row[0] in imported_modules for row in SEAM_NAMES] == [True] * (len(SEAM_NAMES) - 2) + [False, False]
+    assert [row[1].partition(".")[2] for row in SEAM_NAMES[-2:]] == ["dp_ranks", "dp_ranks"]
+    # The key the module reads from a chunk is the singular of that field.
+    assert compat._RANK_KEY == "dp_rank"
 
 
 def test_every_seam_name_is_in_the_sglang_source_at_both_tags():

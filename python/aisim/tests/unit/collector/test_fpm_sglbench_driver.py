@@ -15,9 +15,21 @@ No SGLang and no GPU are involved. Everything that stands in for an engine is FA
 
 - ``_FakeEngine`` answers ``generate`` with cached-token counts from ``PageCacheModel`` (the model of SGLang's
   prefix cache written in ``test_fpm_sglbench_content.py``) and appends the batch lines of each call to FAKE
-  recorder files. It writes those files itself, to record format 1; ``sglbench_recorder.py`` is not used here.
+  recorder files. It writes those files itself, to record format 2; ``sglbench_recorder.py`` is not used here.
   Its batches follow a FAKE scheduler: extend batches filled up to the chunk budget, then one decode batch for
   every further output token.
+- With ``dp_size`` above 1 the fake engine stands in for an engine with DP attention: one FAKE scheduler
+  process, one prefix-cache model and one log per attention-DP rank. A request that names no rank is dealt to
+  the ranks in turn by a FAKE counter that never resets, as SGLang's DP controller deals them, and the response
+  says where it ran (``dp_rank``). Every rank forms the batches of its own requests, and the ranks then run
+  in FAKE lockstep: in each step every rank writes one line, an ``IDLE`` line without requests when it has
+  nothing left, all with the same ``forward_iter`` and the same ``global_num_tokens``. A rank that decodes in a
+  step in which another rank extends, and no rank idles, writes its line as SGLang writes a decode batch it
+  has turned into an extend batch: mode ``EXTEND`` and one computed token per request
+  (``_FakeEngine._fake_decode_to_extend``). SGLang does that only when the prefill graphs of every rank can
+  replay the step; a test can make the fake an engine whose graphs cannot, which then leaves the decode batch
+  as it is. No SGLang input blocker is modelled: the fake releases every call on all ranks in one step unless
+  a fault says otherwise.
 - Every time is FAKE. ``_FakeClock`` counts whole ticks of 2**-20 s and moves only when the fake engine runs a
   batch or the driver sleeps. The durations come from ``FAKE_*`` constants. They were typed in to exercise the
   arithmetic and were never measured. The artifacts say so in ``producer``, among the facts of the launcher;
@@ -39,6 +51,7 @@ from __future__ import annotations
 import ast
 import collections
 import dataclasses
+import hashlib
 import inspect
 import itertools
 import json
@@ -208,12 +221,18 @@ class _FakeClock:
             hook()
 
 
-def _fake_header(pid: int, tp_rank: int, limits: grid.Limits, processes: int) -> dict:
-    """A FAKE recorder header of format 1, typed here key by key."""
+def _fake_header(
+    pid: int, tp_rank: int, limits: grid.Limits, processes: int, *, dp_size: int = 1, dp_rank: int = 0
+) -> dict:
+    """A FAKE recorder header of format 2, typed here key by key.
+
+    Without DP attention the process with TP rank 0 is the leader. With ``dp_size`` above 1 the header is that
+    of a process of attention-DP rank ``dp_rank`` in an engine with SGLang's input blocker.
+    """
     record = limits.as_dict()
     return {
         "type": "header",
-        "format": 1,
+        "format": 2,
         "pid": pid,
         "class": "SglbenchRecorderScheduler",
         "mro": ["SglbenchRecorderScheduler", "Scheduler", "object"],
@@ -222,11 +241,11 @@ def _fake_header(pid: int, tp_rank: int, limits: grid.Limits, processes: int) ->
         "ranks": {
             "tp_size": processes,
             "pp_size": 1,
-            "attn_dp_size": 1,
-            "attn_dp_enabled": False,
+            "attn_dp_size": dp_size,
+            "attn_dp_enabled": dp_size > 1,
             "attn_tp_rank": tp_rank,
             "attn_cp_rank": 0,
-            "attn_dp_rank": 0,
+            "attn_dp_rank": dp_rank,
             "pp_rank": 0,
         },
         "limits": {
@@ -253,7 +272,7 @@ def _fake_header(pid: int, tp_rank: int, limits: grid.Limits, processes: int) ->
             "prefill_delayer": False,
             "min_free_slots_delayer": False,
             "recv_skipper": False,
-            "input_blocker": False,
+            "input_blocker": dp_size > 1,
             "pp_max_micro_batch_size": record["max_running_requests"],
             "is_hip": False,
         },
@@ -300,7 +319,8 @@ class _FakeLog:
             {
                 "type": "batch",
                 "seq": self.seq,
-                "forward_iter": self.forward_iter,
+                # The count of the lines of this FAKE process, idle ones included, unless a fault spoils it.
+                "forward_iter": batch.get("forward_iter", self.forward_iter),
                 "mode": batch["mode"],
                 "launch_ts": batch.get("launch_ts", launch / TICKS_PER_SECOND),
                 "run_return_ts": (launch + 1) / TICKS_PER_SECOND,
@@ -310,6 +330,8 @@ class _FakeLog:
                 "extend_num_tokens": batch["extend_num_tokens"] if extend else None,
                 "prefix_lens": batch["prefix_lens"] if extend else None,
                 "extend_lens": batch["extend_lens"] if extend else None,
+                # Null without DP attention, as on a batch SGLang wrote no counts on.
+                "global_num_tokens": batch.get("global_num_tokens"),
             }
         )
 
@@ -322,7 +344,10 @@ class _FakeCall:
     rids: list[str]
     max_new_tokens: int
     extra: tuple  # positional and keyword arguments beyond the three of the call; the driver sends none
-    modes: list[str]  # the modes of the FAKE batches written for the call, faults included
+    modes: list[str]  # the modes of the FAKE batches rank 0 wrote for the call, faults included
+    # Under DP attention: the rank each request ran on, and the modes of the lines each rank wrote for the call.
+    ranks: list[int] = dataclasses.field(default_factory=list)
+    rank_modes: list[list[str]] = dataclasses.field(default_factory=list)
 
     @property
     def key(self) -> tuple[int, str, int]:
@@ -334,12 +359,39 @@ def _extend_batch(rids=(), prefix_lens=(), extend_lens=()) -> dict:
     return {"mode": "EXTEND", "rids": list(rids), "prefix_lens": list(prefix_lens), "extend_lens": list(extend_lens)}
 
 
+def _idle_batch() -> dict:
+    """A FAKE idle batch: what a rank with nothing to run writes for a step in which another rank runs."""
+    return {"mode": "IDLE", "rids": []}
+
+
+def _fake_step_tokens(batch: dict) -> int:
+    """What SGLang counts for one rank in one step: computed tokens, decoding requests, or 0 for an idle rank."""
+    if batch["mode"] == "EXTEND":
+        return batch["extend_num_tokens"]
+    return len(batch["rids"]) if batch["mode"] == "DECODE" else 0
+
+
+# The key of a FAKE batch that marks a decode step the FAKE engine ran as an extend batch. It is no field of a
+# recorder line.
+FAKE_DECODE_STEP = "fake_decode_step"
+
+
+def _is_fake_decode_step(batch: dict) -> bool:
+    """Whether a FAKE batch is a decode step of its requests: a decode batch, or one that was run as an extend."""
+    return batch["mode"] == "DECODE" or batch.get(FAKE_DECODE_STEP, False)
+
+
 class _FakeEngine:
     """Stands in for an SGLang engine and its scheduler processes. Everything it reports is FAKE.
 
-    ``faults`` maps ``(benchmark_id, stage, attempt)`` of a call to the name of what goes wrong in it.
+    ``faults`` maps ``(benchmark_id, stage, attempt)`` of a call to the name of what goes wrong in it. Under DP
+    attention a fault that is about one rank can name it, ``"split_extend@1"``; without a name it is rank 0.
     ``evictions`` maps a benchmark id to a number of attempts: the cache is dropped just before the measured
-    call (``meas`` or ``run``) of that many attempts of the point.
+    call (``meas`` or ``run``) of that many attempts of the point, on every rank or on ``eviction_ranks``.
+
+    ``dp_size`` above 1 makes it an engine with DP attention; the module docstring says what that fakes.
+    ``prefill_graphs_replay`` says whether the FAKE prefill graphs of every rank can replay any step, which
+    is what lets SGLang turn a decode batch into an extend batch (``_fake_decode_to_extend``).
     """
 
     def __init__(
@@ -349,22 +401,32 @@ class _FakeEngine:
         clock: _FakeClock,
         *,
         processes: int = 1,
+        dp_size: int = 1,
         faults: dict | None = None,
         evictions: dict | None = None,
+        eviction_ranks: tuple[int, ...] | None = None,
         edit_header=None,
         headers: bool = True,
+        prefill_graphs_replay: bool = True,
     ) -> None:
+        assert dp_size == 1 or processes == dp_size, "FAKE DP attention: one scheduler process per rank"
         self.limits = limits
         self.clock = clock
         self.processes = processes
+        self.dp_size = dp_size
+        self.prefill_graphs_replay = prefill_graphs_replay
         self.faults = dict(faults or {})
         self.evictions = dict(evictions or {})
+        self.eviction_ranks = eviction_ranks
         self.edit_header = edit_header
-        self.cache = PageCacheModel(limits.page_size)
+        # One FAKE prefix cache per attention-DP rank.
+        self.caches = [PageCacheModel(limits.page_size) for _rank in range(dp_size)]
+        # FAKE of the counter of SGLang's DP controller: the rank the next request without a rank goes to.
+        self.round_robin = 0
         self.calls: list[_FakeCall] = []
         self.late: list = []  # writes of a late follower, done after a few FAKE sleeps
-        self.pending: list = []  # FAKE batches of a call that are written when the next call starts
-        # Every FAKE process has its own clock origin and the followers are a little slower, as the monotonic
+        self.pending: list = []  # (rank, FAKE batch) of a call, written when the next call starts
+        # Every FAKE process has its own clock origin and the later ones are a little slower, as the monotonic
         # clocks of real processes are unrelated. A driver that mixed the logs up would show it in its samples.
         self.logs = [
             _FakeLog(recorder_dir / f"sched-{FAKE_FIRST_PID + index}.jsonl", index * 1000 * TICKS_PER_SECOND, index * 7)
@@ -375,15 +437,27 @@ class _FakeEngine:
 
     def write_headers(self) -> None:
         for index, log in enumerate(self.logs):
-            header = _fake_header(FAKE_FIRST_PID + index, index, self.limits, self.processes)
+            if self.dp_size > 1:
+                # FAKE DP attention: process ``index`` is the one scheduler process, and so the leader, of rank
+                # ``index``.
+                header = _fake_header(
+                    FAKE_FIRST_PID + index, 0, self.limits, self.processes, dp_size=self.dp_size, dp_rank=index
+                )
+            else:
+                header = _fake_header(FAKE_FIRST_PID + index, index, self.limits, self.processes)
             if self.edit_header is not None:
                 header = self.edit_header(index, header)
             if header is not None:
                 log.write(header)
 
-    def fake_eviction(self) -> None:
-        """FAKE fault: the engine needed room and dropped every unlocked cache entry."""
-        self.cache = PageCacheModel(self.limits.page_size)
+    def fake_eviction(self, ranks: tuple[int, ...] | None = None) -> None:
+        """FAKE fault: the engine needed room and dropped every unlocked cache entry, on all ranks or on some."""
+        for rank in range(self.dp_size) if ranks is None else ranks:
+            self.caches[rank] = PageCacheModel(self.limits.page_size)
+
+    def _rank_logs(self, rank: int) -> list[_FakeLog]:
+        """The FAKE logs that hold the batches of one rank: every process without DP attention, else its own."""
+        return self.logs if self.dp_size == 1 else [self.logs[rank]]
 
     # -- the FAKE scheduler
 
@@ -391,7 +465,8 @@ class _FakeEngine:
         """Extend batches filled up to the chunk budget, then one decode batch for every further output token.
 
         A request is charged its uncached tokens rounded up to whole pages. One that does not fit what is left
-        of the budget is cut: the part that fits goes into this batch and the rest into the next ones.
+        of the budget is cut: the part that fits goes into this batch and the rest into the next ones. A rank
+        that got no request of a call forms no batch.
         """
         page, chunk = self.limits.page_size, self.limits.chunked_prefill_size
         batches = []
@@ -419,12 +494,13 @@ class _FakeEngine:
                 left_in_batch = chunk
         if current["rids"]:
             batches.append(current)
-        batches.extend({"mode": "DECODE", "rids": list(rids)} for _step in range(output_tokens - 1))
+        if rids:
+            batches.extend({"mode": "DECODE", "rids": list(rids)} for _step in range(output_tokens - 1))
         return batches
 
     @staticmethod
     def _fake_fault_in_batches(fault: str | None, batches: list, rids: list[str], prompts: list[list[int]]) -> None:
-        """Apply a FAKE fault that changes the batch lines of a call."""
+        """Apply a FAKE fault that changes the batch lines of one rank of a call."""
         decodes = [index for index, batch in enumerate(batches) if batch["mode"] == "DECODE"]
         first = batches[0]
         if fault == "foreign_id":
@@ -457,9 +533,9 @@ class _FakeEngine:
         elif fault == "foreign_between":
             batches.insert(decodes[2], _extend_batch([FAKE_FOREIGN_RID], [0], [1]))
         elif fault == "idle_between":
-            batches.insert(decodes[2], {"mode": "IDLE", "rids": []})
+            batches.insert(decodes[2], _idle_batch())
         elif fault == "idle_after":
-            batches.append({"mode": "IDLE", "rids": []})
+            batches.append(_idle_batch())
         elif fault == "extend_after_decode":
             batches.insert(1, batches.pop(0))
         elif fault == "second_extend_of_one_request":
@@ -487,30 +563,98 @@ class _FakeEngine:
             first["prefix_lens"] = first["prefix_lens"][:-1]
         elif fault == "idle_with_ids_follows":
             batches.append({"mode": "IDLE", "rids": list(rids)})
+        elif fault == "late":
+            # FAKE: the rank was released one step after the others. It idles while they run their first batch.
+            batches.insert(0, _idle_batch())
+        elif fault == "no_forward_iter":
+            first["forward_iter"] = None
+        elif fault == "decode_as_extend":
+            # FAKE: the first decode step of the rank ran as an extend batch of one token per request, with
+            # the fields SGLang gives a decode batch it turns into an extend batch.
+            batches[decodes[0]] = {
+                "mode": "EXTEND",
+                "rids": list(rids),
+                "prefix_lens": [len(prompt) for prompt in prompts],
+                "extend_lens": [1] * len(rids),
+                "extend_num_tokens": len(rids),
+                FAKE_DECODE_STEP: True,
+            }
+        elif fault == "extend_between_decodes":
+            # FAKE: an extend batch of one token for every request of the rank, after its first decode batch.
+            lengths = [len(prompt) + 1 for prompt in prompts]
+            batches.insert(decodes[0] + 1, _extend_batch(rids, lengths, [1] * len(rids)))
 
-    def _write_batches(self, fault: str | None, batches: list, stage: str) -> None:
-        if fault == "silent":
+    def _fake_decode_to_extend(self, rank_batches: list[list[dict]], prompt_tokens: dict[str, int]) -> None:
+        """FAKE of what SGLang does to a rank that decodes in a step in which another rank extends.
+
+        Under DP attention SGLang turns such a decode batch into an extend batch, unless a rank idles in the
+        step (srt/managers/scheduler_components/dp_attn.py
+        ``SchedulerDPAttnAdapter.maybe_convert_decode_to_extend``). The batch keeps its requests and its token
+        count of the step. Its mode becomes ``EXTEND``, every request computes one token after everything it
+        holds so far, and ``extend_num_tokens`` is the number of requests (srt/managers/schedule_batch.py
+        ``ScheduleBatch.convert_decode_to_extend``). SGLang does it only when every rank reports that its
+        prefill graphs can replay the step (the vote in ``prepare_mlp_sync_batch_raw``); FAKE: the ranks
+        report what ``prefill_graphs_replay`` says, for every step alike. Read in the source at both tags;
+        no engine showed such a batch.
+
+        The batches are changed in place, after the faults of the call, so that the modes a test reads off a
+        call are the ones the logs hold. Without DP attention nothing is changed.
+        """
+        if self.dp_size == 1 or not self.prefill_graphs_replay:
             return
-        for step, batch in enumerate(batches):
-            if batch["mode"] == "EXTEND":
-                computed = sum(batch["extend_lens"])
-                batch.setdefault("extend_num_tokens", computed + (1 if fault == "wrong_extend_tokens" else 0))
-                batch["ticks"] = FAKE_EXTEND_BASE_TICKS + computed
-                if stage == "warm":
-                    batch["ticks"] += FAKE_WARM_SHOT_EXTRA_TICKS
-            elif batch["mode"] == "DECODE":
-                decode_step = sum(1 for earlier in batches[:step] if earlier["mode"] == "DECODE")
-                tenths = FAKE_DECODE_STEP_TENTHS[decode_step % len(FAKE_DECODE_STEP_TENTHS)]
-                batch["ticks"] = (FAKE_DECODE_BASE_TICKS + len(batch["rids"])) * tenths
-            else:
-                batch["ticks"] = 0  # a FAKE idle batch takes no time
-            if fault == "zero_duration":
-                batch["ticks"] = 0
-            if step:
-                batch["lead_ticks"] = FAKE_OVERLAP_LEAD_TICKS
-            start = self.clock.ticks
-            self.clock.advance(batch["ticks"])
-            for index, log in enumerate(self.logs):
+        for step in range(max(len(batches) for batches in rank_batches)):
+            row = [batches[step] if step < len(batches) else _idle_batch() for batches in rank_batches]
+            modes = {batch["mode"] for batch in row}
+            if "EXTEND" not in modes or "IDLE" in modes:
+                continue
+            for batches, batch in zip(rank_batches, row, strict=True):
+                if batch["mode"] != "DECODE":
+                    continue
+                # The decode step with zero-based index i reads the prompt and the i output tokens before it.
+                done = sum(1 for earlier in batches[:step] if _is_fake_decode_step(earlier))
+                rids = list(batch["rids"])
+                batches[step] = {
+                    **batch,
+                    "mode": "EXTEND",
+                    # FAKE: a request the call does not hold has no prompt here.
+                    "prefix_lens": [prompt_tokens.get(rid, 0) + done for rid in rids],
+                    "extend_lens": [1] * len(rids),
+                    "extend_num_tokens": len(rids),
+                    FAKE_DECODE_STEP: True,
+                }
+
+    def _fake_global_tokens(self, fault: str | None, target: int, rank: int, tokens: list[int]) -> list | None:
+        """What one rank writes as ``global_num_tokens`` for a step in which the ranks ran ``tokens``."""
+        if fault == "uneven_tokens":
+            # FAKE: every rank holds the same list, and the list says that one rank ran one token more.
+            return [count + (1 if index == target else 0) for index, count in enumerate(tokens)]
+        if fault == "own_tokens_only":
+            # FAKE: every rank holds its own count alone, which is what SGLang writes on a batch when it does
+            # not keep the counts of all ranks (srt/managers/scheduler_components/dp_attn.py
+            # ``_update_gather_batch`` without ``require_mlp_tp_gather``).
+            return [tokens[rank]]
+        if rank == target:
+            if fault == "unequal_tokens":
+                return [*tokens[:-1], tokens[-1] + 1]
+            if fault == "no_global_tokens":
+                return None
+            if fault == "local_tokens":
+                return [tokens[rank]]
+            if fault == "bool_tokens":
+                return [bool(count) for count in tokens]
+        return list(tokens)
+
+    def _write_step(self, fault: str | None, target: int, row: list[dict], start: int) -> None:
+        """Write the FAKE batches of one step, one per rank, to the logs of their ranks.
+
+        Under DP attention every line of the step gets the same ``global_num_tokens``. Every log counts its
+        own lines, so the lines of one step also carry the same ``forward_iter``.
+        """
+        tokens = [_fake_step_tokens(batch) for batch in row] if self.dp_size > 1 else None
+        for rank, batch in enumerate(row):
+            if tokens is not None:
+                batch = {**batch, "global_num_tokens": self._fake_global_tokens(fault, target, rank, tokens)}
+            for index, log in enumerate(self._rank_logs(rank)):
                 if index and fault == "follower_missing":
                     continue
                 if index and fault == "follower_other_ids":
@@ -521,6 +665,37 @@ class _FakeEngine:
                     self.late.append((log, batch, start))
                 else:
                     log.batch(batch, start)
+
+    def _write_batches(self, fault: str | None, target: int, rank_batches: list[list[dict]], stage: str) -> None:
+        """Run the FAKE batches of a call: step by step, every rank its next batch, or an idle one."""
+        if fault == "silent":
+            return
+        for step in range(max(len(batches) for batches in rank_batches)):
+            row = []
+            for rank, batches in enumerate(rank_batches):
+                batch = batches[step] if step < len(batches) else _idle_batch()
+                faulty = fault if rank == target else None
+                if batch["mode"] == "EXTEND":
+                    computed = sum(batch["extend_lens"])
+                    batch.setdefault("extend_num_tokens", computed + (1 if faulty == "wrong_extend_tokens" else 0))
+                    batch["ticks"] = FAKE_EXTEND_BASE_TICKS + computed
+                    if stage == "warm":
+                        batch["ticks"] += FAKE_WARM_SHOT_EXTRA_TICKS
+                elif batch["mode"] == "DECODE":
+                    decode_step = sum(1 for earlier in batches[:step] if _is_fake_decode_step(earlier))
+                    tenths = FAKE_DECODE_STEP_TENTHS[decode_step % len(FAKE_DECODE_STEP_TENTHS)]
+                    batch["ticks"] = (FAKE_DECODE_BASE_TICKS + len(batch["rids"])) * tenths
+                else:
+                    batch["ticks"] = 0  # a FAKE idle batch takes no time
+                if faulty == "zero_duration":
+                    batch["ticks"] = 0
+                if step:
+                    batch["lead_ticks"] = FAKE_OVERLAP_LEAD_TICKS
+                row.append(batch)
+            start = self.clock.ticks
+            # The ranks run a step together: it takes as long as the slowest of them.
+            self.clock.advance(max(batch["ticks"] for batch in row))
+            self._write_step(fault, target, row, start)
         if fault == "follower_late":
             sleeps_then = self.clock.sleeps
 
@@ -540,15 +715,18 @@ class _FakeEngine:
         call = _FakeCall([list(prompt) for prompt in prompts], list(rids), max_new_tokens, (args, kwargs), [])
         self.calls.append(call)
         benchmark_id, stage, attempt = call.key
-        fault = self.faults.get(call.key)
+        fault, _, named_rank = self.faults.get(call.key, "").partition("@")
+        fault = fault or None
+        target = int(named_rank) if named_rank else 0
         if stage in ("meas", "run") and self.evictions.get(benchmark_id, 0) > attempt:
-            self.fake_eviction()
+            self.fake_eviction(self.eviction_ranks)
         if fault == "evict":
-            self.fake_eviction()
-        # FAKE: a batch the scheduler launched for the call before reaches the log only now.
-        for batch in self.pending:
-            for log in self.logs:
-                log.batch(batch, self.clock.ticks)
+            self.fake_eviction((target,) if named_rank else None)
+        # FAKE: a batch the scheduler launched for the call before reaches the log only now. Under DP attention
+        # the other ranks idle in that step.
+        for rank, batch in self.pending:
+            row = [batch if index == rank else {**_idle_batch(), "ticks": 0} for index in range(self.dp_size)]
+            self._write_step(None, 0, row, self.clock.ticks)
         self.pending.clear()
         if fault == "raise":
             raise RuntimeError("FAKE engine failure")
@@ -559,23 +737,56 @@ class _FakeEngine:
         if fault == "keyboard_interrupt":
             raise KeyboardInterrupt
 
-        # A call is one batch of arrivals: every request is matched against the cache before any is stored.
-        cached = [self.cache.cached(prompt) for prompt in call.prompts]
-        batches = self._fake_batches(call.rids, call.prompts, cached, max_new_tokens)
-        self._fake_fault_in_batches(fault, batches, call.rids, call.prompts)
-        call.modes.extend(batch["mode"] for batch in batches)
-        self._write_batches(fault, batches, stage)
+        # FAKE placement. The call names no rank, so each request goes to the next rank in turn, from where
+        # the request before it left off, whatever call that one belonged to. Without DP attention that is
+        # rank 0 for all.
+        size = self.dp_size
+        call.ranks = [(self.round_robin + index) % size for index in range(len(call.rids))]
+        self.round_robin = (self.round_robin + len(call.rids)) % size
+        if fault == "misplaced":
+            # FAKE: the first two requests of the call ran on each other's rank.
+            call.ranks[0], call.ranks[1] = call.ranks[1], call.ranks[0]
+        # A call is one batch of arrivals: every request is matched against the cache of its rank before any
+        # is stored.
+        cached = [self.caches[rank].cached(prompt) for rank, prompt in zip(call.ranks, call.prompts, strict=True)]
+        rank_batches = []
+        mine: list[list[int]] = []
+        for rank in range(size):
+            mine.append([index for index, ran_on in enumerate(call.ranks) if ran_on == rank])
+            rank_rids = [call.rids[index] for index in mine[rank]]
+            rank_prompts = [call.prompts[index] for index in mine[rank]]
+            batches = self._fake_batches(
+                rank_rids, rank_prompts, [cached[index] for index in mine[rank]], max_new_tokens
+            )
+            if rank == target and batches:
+                self._fake_fault_in_batches(fault, batches, rank_rids, rank_prompts)
+            rank_batches.append(batches)
+        self._fake_decode_to_extend(
+            rank_batches, {rid: len(prompt) for rid, prompt in zip(call.rids, call.prompts, strict=True)}
+        )
+        call.modes.extend(batch["mode"] for batch in rank_batches[0])
+        call.rank_modes = [[batch["mode"] for batch in batches] for batches in rank_batches]
+        self._write_batches(fault, target, rank_batches, stage)
         if fault == "fault_line":
-            self.logs[0].write({"type": "fault", "where": "process_batch_result", "error": "FAKE recorder fault"})
+            record = {"type": "fault", "where": "process_batch_result", "error": "FAKE recorder fault"}
+            self._rank_logs(target)[0].write(record)
         if fault == "follower_fault_line":
             self.logs[-1].write({"type": "fault", "where": "process_batch_result", "error": "FAKE recorder fault"})
         if fault == "late_decode":
-            self.pending.append({"mode": "DECODE", "rids": list(call.rids), "ticks": FAKE_DECODE_BASE_TICKS})
-        for prompt in call.prompts:
+            late_rids = [call.rids[index] for index in mine[target]]
+            self.pending.append((target, {"mode": "DECODE", "rids": late_rids, "ticks": FAKE_DECODE_BASE_TICKS}))
+        if fault == "line_of_the_next_rank":
+            # FAKE: after the batches of the call the log of the named rank gets one more line, and that line
+            # holds the requests of the rank after it. The other ranks idle in the step.
+            other_rids = [call.rids[index] for index in mine[(target + 1) % size]]
+            stray = {"mode": "DECODE", "rids": other_rids, "ticks": 0}
+            row = [stray if index == target else {**_idle_batch(), "ticks": 0} for index in range(size)]
+            self._write_step(None, 0, row, self.clock.ticks)
+        for rank, prompt in zip(call.ranks, call.prompts, strict=True):
             # A finished request stores its prompt and the generated tokens that have KV: all but the last.
             # The FAKE output tokens are negative numbers, so they equal no token id: not an allocated one, not
             # a seeded one and not an id of a text, which a pool can keep from 0 upwards.
-            self.cache.finish_prefill([*prompt, *range(-1, -max_new_tokens, -1)])
+            self.caches[rank].finish_prefill([*prompt, *range(-1, -max_new_tokens, -1)])
         if fault == "deadline":
             self.clock.advance(round(FAKE_TIMEOUT_SECONDS * TICKS_PER_SECOND))
 
@@ -590,6 +801,10 @@ class _FakeEngine:
             }
             for rid, prompt, hit in zip(call.rids, call.prompts, cached, strict=True)
         ]
+        if size > 1:
+            # Under DP attention a response names the rank its request ran on.
+            for response, rank in zip(responses, call.ranks, strict=True):
+                response["dp_rank"] = rank
         if fault == "prompt_count":
             responses[0]["prompt_tokens"] += 1
         elif fault == "retraction":
@@ -606,6 +821,15 @@ class _FakeEngine:
             responses.pop()
         elif fault == "wrong_rid":
             responses[0]["rid"] = FAKE_FOREIGN_RID
+        elif fault == "no_dp_rank":
+            del responses[0]["dp_rank"]
+        elif fault == "dp_rank_none":
+            responses[0]["dp_rank"] = None
+        elif fault == "dp_rank_true":
+            responses[0]["dp_rank"] = True
+        elif fault == "odd_dp_rank":
+            # FAKE: an engine without DP attention reports a rank anyway.
+            responses[0]["dp_rank"] = 5
         return responses
 
 
@@ -648,8 +872,29 @@ class _FakeRun:
             )
 
     def payload(self) -> dict:
+        """The one rank artifact of a run without DP attention."""
         (payload,) = self.run.payloads()
         return payload
+
+    def payload_of_rank(self, rank: int) -> dict:
+        """The artifact of one attention-DP rank."""
+        return self.run.payloads()[rank]
+
+    @property
+    def dp_size(self) -> int:
+        return self.settings.dp_size
+
+    def rank_paths(self) -> list[str]:
+        """Where the rank files go: rank 0 at the output path, rank ``r`` beside it with ``_dp<r>``."""
+        return [
+            str(self.pod / ("benchmark.json" if rank == 0 else f"benchmark_dp{rank}.json"))
+            for rank in range(self.dp_size)
+        ]
+
+    def rank_lines(self, rank: int) -> list[dict]:
+        """The batch lines the FAKE leader of an attention-DP rank wrote, in file order."""
+        text = (self.recorder_dir / f"sched-{FAKE_FIRST_PID + rank}.jsonl").read_text(encoding="utf-8")
+        return [line for line in map(json.loads, text.splitlines()) if line["type"] == "batch"]
 
     def sent(self) -> list[dict]:
         """The parts of every request id the fake engine received, in order."""
@@ -672,11 +917,14 @@ def _start(
     page_size: int = 1,
     *,
     limits: grid.Limits | None = None,
-    processes: int = 1,
+    processes: int | None = None,
+    dp_size: int = 1,
     faults: dict | None = None,
     evictions: dict | None = None,
+    eviction_ranks: tuple[int, ...] | None = None,
     edit_header=None,
     headers: bool = True,
+    prefill_graphs_replay: bool = True,
     tokens: tuple[int, int] = (TOKEN_LOW, TOKEN_HIGH),
     execute: bool = True,
     started_before_seconds: float = 0.0,
@@ -687,10 +935,14 @@ def _start(
     """Lay out a pod, start a fake engine, build a run and, unless told not to, execute it.
 
     ``started_before_seconds`` is the FAKE time between the start of the launcher and the run: what an engine
-    build would take. ``text_pool`` and ``dataset`` make the run a text run.
+    build would take. ``text_pool`` and ``dataset`` make the run a text run. ``dp_size`` above 1 makes it a run
+    with that many attention-DP ranks against a FAKE engine with one scheduler process per rank, for a cell
+    of the layout ``dep``. ``prefill_graphs_replay`` set to False makes that engine one that never turns a
+    decode batch into an extend batch.
     """
     limits = _limits(page_size) if limits is None else limits
-    cell = _cell(phase="prefill" if mode == "agg" else mode, dp=1, strategy="single")
+    processes = dp_size if processes is None else processes
+    cell = _cell(phase="prefill" if mode == "agg" else mode, dp=dp_size, strategy="single" if dp_size == 1 else "dep")
     pod = _pod(tmp_path, cell)
     # Where the launcher puts the recorder files: under the directory of the output path. The validator sweeps
     # that tree, so the files of the FAKE recorder are in its way on purpose.
@@ -702,10 +954,13 @@ def _start(
         limits,
         clock,
         processes=processes,
+        dp_size=dp_size,
         faults=faults,
         evictions=evictions,
+        eviction_ranks=eviction_ranks,
         edit_header=edit_header,
         headers=headers,
+        prefill_graphs_replay=prefill_graphs_replay,
     )
     values = {
         "mode": mode,
@@ -724,6 +979,7 @@ def _start(
         "max_queued_requests": None,
         "log_wait_seconds": 2.0,
         "header_wait_seconds": 2.0,
+        "dp_size": dp_size,
     }
     values.update(overrides)
     settings = driver.RunSettings(**values)
@@ -742,10 +998,15 @@ def _start_text(tmp_path: Path, mode: str = "prefill", page_size: int = 1, **opt
     return _start(tmp_path, mode, page_size, **options)
 
 
-def _expected_sample(point: grid.Point) -> float:
-    """The FAKE sample a point must carry, worked out here from the FAKE timings."""
+def _expected_sample(point: grid.Point, rank: int = 0) -> float:
+    """The FAKE sample a point must carry on one attention-DP rank, worked out here from the FAKE timings.
+
+    The batch size and the token counts of a point are those of ONE rank. The FAKE process of rank ``r``
+    delivers every output seven ticks per rank later than rank 0, which shows in a prefill sample (launch to
+    output) and not in a decode step (output to output).
+    """
     if point.phase == grid.PREFILL:
-        return (FAKE_EXTEND_BASE_TICKS + point.batch_size * point.new_tokens) / TICKS_PER_SECOND
+        return (FAKE_EXTEND_BASE_TICKS + point.batch_size * point.new_tokens + 7 * rank) / TICKS_PER_SECOND
     return (FAKE_DECODE_BASE_TICKS + point.batch_size) * 10 / TICKS_PER_SECOND
 
 
@@ -802,26 +1063,32 @@ def _assert_accepted(fake: _FakeRun) -> dict:
 
 
 def _assert_rejected(fake: _FakeRun, status: str) -> dict:
-    """A run that is not complete: write it, then the validator raises and the gate fails the pod."""
+    """A run that is not complete: write it, then the validator raises and the gate fails the pod.
+
+    Returns the file of rank 0. A run with several attention-DP ranks writes one file per rank, all with the
+    same status.
+    """
     written = fake.run.write()
     assert fake.run.status == status
-    rank_path = str(fake.pod / "benchmark.json")
+    rank_paths = fake.rank_paths()
     merged_path = fake.pod / "benchmark_merged.json"
     if status == "failed":
         # A failed run has no merged file.
-        assert written == {"status": "failed", "paths": [rank_path]}
+        assert written == {"status": "failed", "paths": rank_paths}
         assert not merged_path.exists()
     else:
-        assert written == {"status": "partial", "paths": [rank_path, str(merged_path)]}
-    on_disk = json.loads(Path(rank_path).read_text(encoding="utf-8"))
-    assert on_disk == fake.payload()
-    assert (on_disk["status"], on_disk["valid"]) == (status, False)
+        assert written == {"status": "partial", "paths": [*rank_paths, str(merged_path)]}
+    on_disk = [json.loads(Path(path).read_text(encoding="utf-8")) for path in rank_paths]
+    assert on_disk == fake.run.payloads()
+    for rank, payload in enumerate(on_disk):
+        assert (payload["status"], payload["valid"]) == (status, False)
+        assert payload["dp"] == {"size": fake.dp_size, "rank": rank}
     with pytest.raises(ValueError, match="invalid native terminal result envelope"):
         _validate(fake.cell, fake.root)
-    gate = _gate([rank_path], fake.cell.workload_kind)
+    gate = _gate(rank_paths, fake.cell.workload_kind)
     assert gate.returncode == GATE_INVALID
     assert f"status={status!r} valid=False" in gate.stderr
-    return on_disk
+    return on_disk[0]
 
 
 def _assert_point_failed(fake: _FakeRun, victim: grid.Point, reason: str) -> dict:
@@ -892,7 +1159,7 @@ def test_complete_run_of_the_default_grid_passes_the_validator_and_the_gate(tmp_
         "timing_metric": "scheduler_wall_time",
         "timing_clock": "process_local_monotonic",
         "staging": "one_batch_call",
-        "recorder_format": 1,
+        "recorder_format": 2,
         "scheduler_processes": 1,
         "limits": fake.limits.as_dict(),
         "page_size": page_size,
@@ -983,6 +1250,58 @@ def test_the_stages_of_each_point_are_sent_in_order_with_the_planned_prompts(tmp
     # Points run in grid order and nothing else was sent for a point.
     order = [call.key[0] for call in fake.engine.calls if call.key[0]]
     assert order == sorted(order) and set(order) == {point.benchmark_id for point in built.points}
+
+
+@pytest.mark.parametrize("page_size", [1, 64])
+def test_one_request_of_two_new_tokens_is_measured_like_any_other_prefill_point(tmp_path, page_size):
+    """The low end of the prefill new-token axis at batch 1, with a cached prefix and without one.
+
+    The FAKE prefill graph sizes start at 4, as SGLang's default sizes do. A batch of two new tokens is then
+    the smallest that SGLang runs with a graph, and the grid plans it beside the batch of one
+    (``grid.prefill_new_token_axis``).
+    """
+    fake = _start(tmp_path, "prefill", page_size)
+
+    # One request of two new tokens can carry a prefix of up to I - 3 tokens in whole units of G: 425 tokens
+    # give 26 * 16 = 416 at page 1, and 809 give 12 * 64 = 768 at page 64. SMALL_CAPS keep the two ends and the
+    # middle of the prefixes 0, G, 2 G, 4 G and so on up to the longest.
+    longest, middle = {1: (416, 64), 64: (768, 256)}[page_size]
+    points = [point for point in fake.built.points if (point.batch_size, point.new_tokens) == (1, 2)]
+    assert [point.cached_tokens for point in points] == [longest, middle, 0]
+    on_disk = _assert_accepted(fake)
+    _assert_not_staged_again(fake)
+    for point in points:
+        number, cached = point.benchmark_id, point.cached_tokens
+        calls = fake.calls_of(number)
+        # A seed when there is a prefix, then one warm shot and one measured shot: one request and one output
+        # token each.
+        stages = ["seed", "warm", "meas"] if cached else ["warm", "meas"]
+        assert [call.rids for call in calls] == [[_rank_rid(number, stage, 0, 0, 0)] for stage in stages]
+        assert [call.max_new_tokens for call in calls] == [1] * len(stages)
+        warm, meas = calls[-2:]
+        times = []
+        for shot in (warm, meas):
+            # The prompt is the prefix and two new tokens. It ran as one extend batch, which found the planned
+            # cached count in the FAKE cache and computed the two tokens.
+            (prompt,) = shot.prompts
+            assert len(prompt) == cached + 2
+            (line,) = _lines_of_call(fake, 0, shot)
+            assert (line["mode"], line["rids"]) == ("EXTEND", shot.rids)
+            assert (line["prefix_lens"], line["extend_lens"], line["extend_num_tokens"]) == ([cached], [2], 2)
+            times.append(line["out_ts"] - line["launch_ts"])
+        # The two shots share the prefix, which is the prompt of the seed, and differ in their first new token.
+        assert warm.prompts[0][:cached] == meas.prompts[0][:cached]
+        assert warm.prompts[0][cached] != meas.prompts[0][cached]
+        if cached:
+            assert calls[0].prompts == [meas.prompts[0][:cached]]
+        # The row holds the counters of the batch of the measured shot and its FAKE time, not the time of the
+        # warm shot.
+        measured = (FAKE_EXTEND_BASE_TICKS + 2) / TICKS_PER_SECOND
+        assert times == [measured + FAKE_WARM_SHOT_EXTRA_TICKS / TICKS_PER_SECOND, measured]
+        row = on_disk["results"][number - 1]
+        assert row == _low_end_row(number, 1, cached)
+        assert (row["point"]["total_prefill_tokens"], row["point"]["total_kv_read_tokens"]) == (2, cached)
+        assert row["fpms"][0]["wall_time"] == measured
 
 
 def test_request_fields(tmp_path):
@@ -1303,6 +1622,9 @@ DECODE_FAULTS = [
     ("run", "second_extend_of_one_request", _CONTEXT + ": {rid0} is in 2 extend batches of the run"),
     ("run", "seven_decode", _SEQUENCE.replace("{found}", "1 EXTEND, 7 DECODE")),
     ("run", "extend_after_decode", _SEQUENCE.replace("{found}", "1 DECODE, 1 EXTEND, 5 DECODE")),
+    # An extend batch of requests that an earlier batch of the run had extended. With one rank that is a wrong
+    # sequence and nothing more: no decode step runs as an extend batch without DP attention.
+    ("run", "extend_between_decodes", _SEQUENCE.replace("{found}", "1 EXTEND, 1 DECODE, 1 EXTEND, 5 DECODE")),
     ("run", "foreign_between", _BETWEEN),
     ("run", "decode_missing_id", _DECODE_IDS.replace("{held}", "{b0}")),
     ("run", "decode_foreign_id", _DECODE_IDS.replace("{held}", "{b1}")),
@@ -1556,8 +1878,10 @@ def test_more_headers_than_scheduler_processes_fail_the_run(tmp_path):
     [
         # The stock scheduler was built: the class replacement did not apply.
         (_edit("class", "Scheduler"), "sched-4100.jsonl: class 'Scheduler', expected 'SglbenchRecorderScheduler'"),
-        (_edit("format", 2), "sched-4100.jsonl: format 2, expected 1"),
-        (_edit("format", True), "sched-4100.jsonl: format True, expected 1"),
+        # A recorder of the format before: its batch lines lack the token counts of the ranks.
+        (_edit("format", 1), "sched-4100.jsonl: format 1, expected 2"),
+        (_edit("format", 3), "sched-4100.jsonl: format 3, expected 2"),
+        (_edit("format", True), "sched-4100.jsonl: format True, expected 2"),
         (_edit("leader", False), "0 leader header(s), expected exactly one: []"),
         (_edit("leader", 1), "sched-4100.jsonl: leader is 1, expected true or false"),
         (_edit("checks", {}), "sched-4100.jsonl: the header has no checks.disable_radix_cache"),
@@ -1601,6 +1925,10 @@ _POLICY = "schedule policy must be fcfs without priority scheduling ({name})"
 _AMD = "only NVIDIA CUDA is supported (is_hip={v}); SGLang has AMD-only admission rules"
 _INTERVAL = "prefill_decode_interval must be 0 (got {v}); SGLang sets 22 for some Qwen3-VL setups"
 _OUTPUT_CAP = "SGLANG_MAX_NEW_TOKENS_LIMIT={v} is below the 7 output tokens of a decode run"
+_OTHER_LAYOUT = (
+    "the scheduler reports attn_dp_size={size} and attn_dp_enabled={enabled}, the run was set up for {planned} "
+    "attention-DP rank(s)"
+)
 
 STAGE_H_REJECTIONS = [
     (
@@ -1637,8 +1965,11 @@ STAGE_H_REJECTIONS = [
     ("checks.max_new_tokens_limit", True, _OUTPUT_CAP.format(v="true")),
     ("checks.pp_max_micro_batch_size", 8, "pp_max_micro_batch_size 8 differs from the running cap 9"),
     ("checks.pp_max_micro_batch_size", None, "pp_max_micro_batch_size null differs from the running cap 9"),
-    ("ranks.attn_dp_enabled", True, "DP attention is not supported yet (attn_dp_size=1)"),
-    ("ranks.attn_dp_size", 2, "DP attention is not supported yet (attn_dp_size=2)"),
+    # The run was set up without DP attention: a scheduler that reports another layout is refused.
+    ("ranks.attn_dp_enabled", True, _OTHER_LAYOUT.format(size="1", enabled="true", planned=1)),
+    ("ranks.attn_dp_size", 2, _OTHER_LAYOUT.format(size="2", enabled="false", planned=1)),
+    ("ranks.attn_dp_size", True, _OTHER_LAYOUT.format(size="true", enabled="false", planned=1)),
+    ("ranks.attn_dp_enabled", None, _OTHER_LAYOUT.format(size="1", enabled="null", planned=1)),
     ("ranks.pp_size", 2, "pipeline parallelism is not supported (pp_size=2)"),
     ("sglang_version", "0.5.24", "SGLang 0.5.24 is not a tested version (tested: 0.5.22, 0.5.23)"),
     ("sglang_version", "0.5.2", "SGLang 0.5.2 is not a tested version (tested: 0.5.22, 0.5.23)"),
@@ -2313,6 +2644,15 @@ def test_the_constructor_refuses_what_no_artifact_can_carry(tmp_path):
         build(run_id=7)
     with pytest.raises(TypeError, match="settings must be a RunSettings record"):
         driver.BenchmarkRun({"mode": "prefill"}, fake.recorder_dir, started_at=0.0)
+    # The number of attention-DP ranks decides how many rank files there are, so not even a failed artifact
+    # can be written without it.
+    with pytest.raises(ValueError, match="settings.dp_size must be >= 1, got 0"):
+        build(dp_size=0)
+    with pytest.raises(TypeError, match="settings.dp_size must be an int, got bool: True"):
+        build(dp_size=True)
+    with pytest.raises(TypeError, match="settings.dp_size must be an int, got str: '2'"):
+        build(dp_size="2")
+    assert build(dp_size=3).settings.dp_size == 3
     with pytest.raises(TypeError, match="started_at must be a finite reading"):
         driver.BenchmarkRun(good, fake.recorder_dir, started_at=None)
     # The defaults are the real clock and the real sleep, and the two waits of the settings.
@@ -2529,7 +2869,7 @@ def test_recorder_logs_read_only_what_was_appended_and_keep_a_half_written_line_
 
     logs = driver.RecorderLogs(tmp_path)
     path = tmp_path / "sched-1.jsonl"
-    header = {"type": "header", "format": 1}
+    header = {"type": "header", "format": 2}
     first = _line(_batch_line(1))
     path.write_bytes(_line(header) + first[:10])
     (tmp_path / "other.jsonl").write_bytes(b"not a recorder file\n")
@@ -2564,7 +2904,7 @@ def test_recorder_logs_read_only_what_was_appended_and_keep_a_half_written_line_
 def test_recorder_logs_ignore_idle_lines_without_requests_and_keep_the_others(tmp_path):
     logs = driver.RecorderLogs(str(tmp_path))
     lines = [
-        {"type": "header", "format": 1},
+        {"type": "header", "format": 2},
         _batch_line(1, "IDLE", []),
         _batch_line(2, "IDLE", ["a"]),
         _batch_line(3, "EXTEND", []),
@@ -2577,11 +2917,11 @@ def test_recorder_logs_ignore_idle_lines_without_requests_and_keep_the_others(tm
     assert logs.faults == []
 
 
-def test_recorder_logs_list_fault_lines_and_everything_that_is_not_format_1(tmp_path):
+def test_recorder_logs_list_fault_lines_and_everything_that_is_not_a_line_of_the_format(tmp_path):
     logs = driver.RecorderLogs(tmp_path)
     good = tmp_path / "sched-1.jsonl"
     good.write_bytes(
-        _line({"type": "header", "format": 1})
+        _line({"type": "header", "format": 2})
         + _line(_batch_line(1))
         + _line({"type": "fault", "where": "run_batch", "error": "FAKE"})
         + b"not json\n"
@@ -2589,7 +2929,7 @@ def test_recorder_logs_list_fault_lines_and_everything_that_is_not_format_1(tmp_
         + b"[1, 2]\n"
         + b"\n"
         + _line({"type": "summary"})
-        + _line({"type": "header", "format": 1})
+        + _line({"type": "header", "format": 2})
         + _line(_batch_line(3))  # seq 2 was lost
         + _line(_batch_line(4, mode=None))
         + _line({"type": "batch", "seq": 5, "mode": "EXTEND", "rids": ["a", 7]})
@@ -2629,7 +2969,7 @@ def test_recorder_logs_list_fault_lines_and_everything_that_is_not_format_1(tmp_
     ]
 
 
-def test_a_recorder_line_that_is_not_format_1_fails_the_run_before_the_first_request(tmp_path):
+def test_a_recorder_line_that_is_not_of_the_format_fails_the_run_before_the_first_request(tmp_path):
     fake = _start(tmp_path, "decode", execute=False)
     with (fake.recorder_dir / LEADER_LOG).open("a", encoding="utf-8") as handle:
         handle.write("FAKE: not a recorder line\n")
@@ -2685,7 +3025,7 @@ print(sorted(name for name in sys.modules if name.startswith("sglbench_")))
 
 def test_the_driver_imports_in_a_bare_interpreter_without_sglang():
     done = subprocess.run(
-        [sys.executable, "-I", "-S", "-c", _POD_SCRIPT, str(RUNTIME)],
+        [sys.executable, "-I", "-S", "-B", "-c", _POD_SCRIPT, str(RUNTIME)],
         capture_output=True,
         text=True,
         timeout=120,
@@ -2709,7 +3049,7 @@ def _module_constants(path: Path) -> dict:
 
 def test_the_constants_the_driver_repeats_are_the_ones_of_the_recorder_and_of_compat():
     # Typed here once more, as the recorder log format gives them.
-    assert (driver.RECORD_FORMAT, driver.RECORDER_CLASS_NAME) == (1, "SglbenchRecorderScheduler")
+    assert (driver.RECORD_FORMAT, driver.RECORDER_CLASS_NAME) == (2, "SglbenchRecorderScheduler")
     assert (driver.LOG_FILE_PREFIX, driver.LOG_FILE_SUFFIX) == ("sched-", ".jsonl")
     assert driver.TESTED_SGLANG_VERSIONS == ("0.5.22", "0.5.23")
     assert driver.WARMUP_PROMPT_TOKENS == 256
@@ -2748,11 +3088,12 @@ def test_the_public_names_have_the_agreed_shape(tmp_path):
         "log_wait_seconds",
         "header_wait_seconds",
         "content_source",
+        "dp_size",
     ]
-    # The last one has a default, so a caller that names no source makes a run with seeded ids.
-    assert {field.name: field.default for field in dataclasses.fields(driver.RunSettings)}["content_source"] == (
-        "seeded_token_ids"
-    )
+    # The last two have defaults, so a caller that names neither makes a run with seeded ids and one
+    # attention-DP rank.
+    defaults = {field.name: field.default for field in dataclasses.fields(driver.RunSettings)}
+    assert (defaults["content_source"], defaults["dp_size"]) == ("seeded_token_ids", 1)
     fake = _start(tmp_path, execute=False)
     with pytest.raises(dataclasses.FrozenInstanceError):
         fake.settings.mode = "decode"
@@ -2778,10 +3119,13 @@ def test_the_public_names_have_the_agreed_shape(tmp_path):
         ("token_high", "KEYWORD_ONLY"),
         ("text_pool", "KEYWORD_ONLY"),
         ("dataset", "KEYWORD_ONLY"),
+        ("on_grid", "KEYWORD_ONLY"),
     ]
-    # A run with seeded ids is started without the last two.
+    # A run with seeded ids is started without the text pool and the dataset, and a caller with nothing to say
+    # about the grid names no hook.
     parameters = inspect.signature(driver.BenchmarkRun.execute).parameters
     assert (parameters["text_pool"].default, parameters["dataset"].default) == (None, None)
+    assert parameters["on_grid"].default is None
     assert kinds(driver.BenchmarkRun.record_failure) == [
         ("self", "POSITIONAL_OR_KEYWORD"),
         ("reason", "POSITIONAL_OR_KEYWORD"),
@@ -2789,6 +3133,7 @@ def test_the_public_names_have_the_agreed_shape(tmp_path):
     assert (
         kinds(driver.BenchmarkRun.payloads) == kinds(driver.BenchmarkRun.write) == [("self", "POSITIONAL_OR_KEYWORD")]
     )
+    assert kinds(driver.BenchmarkRun.prefill_pool_cut) == [("self", "POSITIONAL_OR_KEYWORD")]
     assert kinds(driver.ordinary_token_range) == [
         ("size", "POSITIONAL_OR_KEYWORD"),
         ("excluded", "POSITIONAL_OR_KEYWORD"),
@@ -2844,7 +3189,18 @@ def test_the_reason_strings_and_the_staging_constants_are_the_shared_ones():
     assert grid.DECODE_OUTPUT_TOKENS - 1 == artifact.DECODE_RAW_STEPS == 6
     assert artifact.DECODE_KEPT_STEP_INDICES[len(artifact.DECODE_KEPT_STEP_INDICES) // 2] == grid.DECODE_PROMPT_LEAD
     assert {"seed", "warm", "meas", "run", "free"} == set(content.STAGES)
-    assert (driver.RANK, driver.DP_SIZE, driver.RUN_TAG_CHARACTERS) == (0, 1, 8)
+    assert driver.RUN_TAG_CHARACTERS == 8
+    # The two reasons of a run with several attention-DP ranks, and what the producer block says of the staging.
+    assert (driver.REASON_DP_PLACEMENT, driver.REASON_DP_STEP) == (
+        "dp_rank_placement_mismatch",
+        "dp_ranks_out_of_step",
+    )
+    assert (driver.STAGING_ONE_BATCH_CALL, driver.STAGING_BALANCED_BATCH_CALL) == (
+        "one_batch_call",
+        "balanced_batch_call",
+    )
+    # The number of ranks is a setting of the run, not a constant of the module.
+    assert not hasattr(driver, "RANK") and not hasattr(driver, "DP_SIZE")
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -3423,3 +3779,1614 @@ def test_a_dataset_record_that_cannot_be_written_is_left_out_with_the_launcher_b
     # The record of the pool is the driver's own and stays whole, its id range included.
     assert producer["content"]["pool"]["id_range"] == [TOKEN_LOW, TOKEN_HIGH]
     assert on_disk.get("kvwarm") == (None if mode == "prefill" else SEEDED_KVWARM)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Attention-DP ranks: balanced calls, every check per rank, the ranks held against each other
+# ---------------------------------------------------------------------------------------------------------------
+
+# Under FAKE DP attention the second FAKE process is the leader of rank 1.
+RANK_1_LOG = "sched-4101.jsonl"
+_PLACEMENT = "dp_rank_placement_mismatch"
+_STEP = "dp_ranks_out_of_step"
+_STEPS_DIFFER = _STEP + ": batch 1 of {of} (EXTEND) ran in the steps [{step}, {step1}], one forward_iter per rank"
+_TOKENS_DIFFER = (
+    _STEP + ": batch 1 of {of} (EXTEND) in step {step} has the global_num_tokens {tokens}, one list per rank; "
+    "expected 2 equal counts, the same on every rank"
+)
+# A decode run in which the log of a rank holds a decode step that ran as an extend batch.
+_DECODE_AS_EXTEND = (
+    _STEP + ": rank {rank}: the batches of the run are {found}; the EXTEND batch(es) with seq {seqs} hold only "
+    "requests that an earlier batch of the run had extended, which is how SGLang runs a decode step of a rank "
+    "while another rank extends"
+)
+
+
+def _lines_of_call(fake: _FakeRun, rank: int, call: _FakeCall) -> list[dict]:
+    """The batch lines of a rank's FAKE leader log that hold a request of that rank of a call, in log order."""
+    wanted = set(call.rids[rank :: fake.dp_size])
+    return [line for line in fake.rank_lines(rank) if wanted & set(line["rids"])]
+
+
+def _assert_decode_steps_as_extend(lines: list[dict], rank: int, prompts: list[list[int]]) -> None:
+    """``lines`` are the first decode steps of one rank of a call, which hold the requests of ``prompts``. The
+    FAKE engine must have written each as SGLang writes a decode batch it has turned into an extend batch."""
+    assert lines
+    for step, line in enumerate(lines):
+        assert (line["mode"], line["extend_lens"], line["extend_num_tokens"]) == (
+            "EXTEND",
+            [1] * len(prompts),
+            len(prompts),
+        )
+        # Every request reads its prompt and the output tokens of the decode steps before this one.
+        assert line["prefix_lens"] == [len(prompt) + step for prompt in prompts]
+        # The count of the rank in the step is still the one of a decode batch: its requests.
+        assert line["global_num_tokens"][rank] == len(prompts)
+
+
+def _rank_rid(benchmark_id: int, stage: str, attempt: int, rank: int, slot: int) -> str:
+    return f"sglb-{FAKE_RUN_TAG}-p{benchmark_id}-{stage}{attempt}-r{rank}-s{slot}-e"
+
+
+def _line_of(fake: _FakeRun, rank: int, rid: str) -> dict:
+    """The first batch line of a rank's FAKE leader log that holds a request."""
+    return next(line for line in fake.rank_lines(rank) if rid in line["rids"])
+
+
+def _assert_ranks_accepted(fake: _FakeRun) -> list[dict]:
+    """A complete run with several attention-DP ranks: write it, then both checkers accept every rank file.
+
+    Returns the rank files as they are on disk, in rank order.
+    """
+    built = fake.built
+    size = fake.dp_size
+    assert (fake.run.status, fake.run.reason) == ("complete", None)
+    written = fake.run.write()
+    rank_paths = fake.rank_paths()
+    merged_path = fake.pod / "benchmark_merged.json"
+    assert written == {"status": "complete", "paths": [*rank_paths, str(merged_path)]}
+    assert sorted(path.name for path in fake.pod.glob("benchmark*")) == sorted(
+        [*(Path(path).name for path in rank_paths), merged_path.name]
+    )
+    on_disk = [json.loads(Path(path).read_text(encoding="utf-8")) for path in rank_paths]
+    assert on_disk == fake.run.payloads()
+    for rank, payload in enumerate(on_disk):
+        assert (payload["status"], payload["valid"], payload["usable"]) == ("complete", True, True)
+        assert payload["dp"] == {"size": size, "rank": rank}
+        assert payload["coverage"] == {
+            "expected_points": len(built.points),
+            "completed_points": len(built.points),
+            "skipped_points": 0,
+        }
+        assert (payload["run_id"], payload["grid_digest"]) == (FAKE_RUN_ID, built.digest)
+        for point, row, group in zip(built.points, payload["results"], payload["iteration_groups"], strict=True):
+            # A row holds the record of its own rank: the rank's FAKE sample, and the batch size and the token
+            # counts of ONE rank, which are the point's.
+            (fpm,) = row["fpms"]
+            assert row["point"] == point.as_dict()
+            assert (fpm["dp_rank"], fpm["wall_time"], fpm["worker_id"]) == (
+                rank,
+                _expected_sample(point, rank),
+                FAKE_WORKER_ID,
+            )
+            assert fpm["scheduled_requests"] == artifact.scheduled_requests(point.as_dict())
+            if point.phase == grid.DECODE:
+                assert fpm[artifact.DECODE_STEPS_KEY] == _expected_steps(point)
+            # A group holds the record of every rank, and its time is the slowest rank's.
+            assert [entry["dp_rank"] for entry in group["rank_results"]] == list(range(size))
+            assert group["rank_results"][rank]["fpms"] == [fpm]
+            assert group["wall_time"] == max(_expected_sample(point, other) for other in range(size))
+        # Every rank file carries the same groups and the same facts of the run.
+        assert payload["iteration_groups"] == on_disk[0]["iteration_groups"]
+        assert payload["producer"] == on_disk[0]["producer"]
+    merged = json.loads(merged_path.read_text(encoding="utf-8"))
+    assert (merged["artifact_type"], merged["rank_files"]) == ("merged", rank_paths)
+    assert merged["dp"]["source_ranks"] == list(range(size))
+    if fake.settings.mode != grid.AGG:
+        collection = _validate(fake.cell, fake.root)
+        assert [measurement.point for measurement in collection.points] == built.point_dicts()
+        assert [measurement.rank_wall_times for measurement in collection.points] == [
+            tuple((rank, _expected_sample(point, rank)) for rank in range(size)) for point in built.points
+        ]
+        assert (collection.runtime_run_id, collection.runtime_grid_digest) == (FAKE_RUN_ID, built.digest)
+    gate = _gate(rank_paths, fake.settings.mode)
+    assert gate.returncode == GATE_ACCEPT, gate.stderr
+    return on_disk
+
+
+def _assert_not_staged_again(fake: _FakeRun) -> None:
+    assert fake.run.payloads()[0]["producer"]["restaged_points"] == []
+    assert {parts["attempt"] for parts in fake.sent() if parts["benchmark_id"]} == {0}
+
+
+@pytest.mark.parametrize("page_size", [1, 64])
+@pytest.mark.parametrize("mode", ["prefill", "decode", "agg"])
+def test_a_complete_run_with_two_ranks_passes_the_validator_and_the_gate(tmp_path, mode, page_size):
+    fake = _start(tmp_path / "two", mode, page_size, dp_size=2)
+    single = _start(tmp_path / "one", mode, page_size)
+
+    built = fake.built
+    # The grid is a grid of per-rank points: the one a run without DP attention plans from the same limits.
+    assert built.points == single.built.points and len(built.points) >= 8
+    on_disk = _assert_ranks_accepted(fake)
+
+    # The producer block says how the stages were sent. Its other keys are those of a run with one rank.
+    producer, one_rank = on_disk[0]["producer"], single.payload()["producer"]
+    assert producer["staging"] == "balanced_batch_call" and one_rank["staging"] == "one_batch_call"
+    assert (producer["scheduler_processes"], producer["recorder_format"]) == (2, 2)
+    assert set(producer) == set(one_rank)
+    assert (producer["limits"], producer["self_test"]) == (fake.limits.as_dict(), list(driver.SELF_TEST_CHECKS))
+    assert producer["restaged_points"] == []
+    # The first-token need is the need of one rank, and the plan issued it once for each of the two.
+    assert producer["first_token_need"] == one_rank["first_token_need"]
+    issued, issued_by_one = producer["content"]["issued"], one_rank["content"]["issued"]
+    assert issued == {key: 2 * value for key, value in issued_by_one.items()}
+
+    # Every call is balanced: twice the requests of the same call of a run with one rank, slot by slot and rank
+    # inside, and each request ran on the rank its id names.
+    assert [call.key for call in fake.engine.calls] == [call.key for call in single.engine.calls]
+    for call, one in zip(fake.engine.calls, single.engine.calls, strict=True):
+        benchmark_id, stage, attempt = call.key
+        slots = len(one.rids)
+        assert call.rids == [
+            _rank_rid(benchmark_id, stage, attempt, rank, slot) for slot in range(slots) for rank in range(2)
+        ]
+        assert call.ranks == [0, 1] * slots
+        assert (call.max_new_tokens, call.extra) == (one.max_new_tokens, ((), {}))
+        # Rank 0 is sent what the run with one rank sends: content depends on the seed, the rank and the slot.
+        assert (call.prompts[0::2], call.rids[0::2]) == (one.prompts, one.rids)
+        # Rank 1 is sent prompts of the same lengths and of its own content.
+        assert [len(prompt) for prompt in call.prompts[1::2]] == [len(prompt) for prompt in one.prompts]
+        assert all(own != other for own, other in zip(call.prompts[0::2], call.prompts[1::2], strict=True))
+        # Both ranks ran the batches of the call in the same shape.
+        assert call.rank_modes == [one.modes, one.modes]
+
+    # The FAKE ranks ran in lockstep: line for line the same mode, step number and token counts, with as many
+    # requests on each rank, and no rank ever idled.
+    lines = [fake.rank_lines(rank) for rank in range(2)]
+    assert len(lines[0]) == len(lines[1]) > 20
+    for first, second in zip(*lines, strict=True):
+        assert (first["mode"], first["forward_iter"], len(first["rids"])) == (
+            second["mode"],
+            second["forward_iter"],
+            len(second["rids"]),
+        )
+        assert first["global_num_tokens"] == second["global_num_tokens"]
+        assert len(set(first["global_num_tokens"])) == 1 and len(first["global_num_tokens"]) == 2
+        assert first["mode"] != "IDLE"
+        assert {content.parse_request_id(rid)["rank"] for rid in first["rids"]} == {0}
+        assert {content.parse_request_id(rid)["rank"] for rid in second["rids"]} == {1}
+    # The clock of the second FAKE process is 1000 s ahead: no time of one rank was set against the other's.
+    assert lines[1][0]["launch_ts"] - lines[0][0]["launch_ts"] == 1000.0
+
+
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+def test_a_complete_run_with_three_ranks_passes_the_validator_and_the_gate(tmp_path, mode):
+    fake = _start(tmp_path, mode, dp_size=3)
+
+    on_disk = _assert_ranks_accepted(fake)
+    assert [Path(path).name for path in fake.rank_paths()] == [
+        "benchmark.json",
+        "benchmark_dp1.json",
+        "benchmark_dp2.json",
+    ]
+    assert [payload["dp"] for payload in on_disk] == [{"size": 3, "rank": rank} for rank in range(3)]
+    assert all(call.ranks == [0, 1, 2] * (len(call.rids) // 3) for call in fake.engine.calls)
+    # The warm-up is one prompt of 256 tokens on every rank, and the self-test a pair on every rank.
+    free = [call for call in fake.engine.calls if call.key[0] == 0]
+    assert [len(call.prompts) for call in free] == [6, 6, 6, 6, 6, 6, 3]
+    assert [len(prompt) for prompt in free[FREE_WARMUP].prompts] == [256, 256, 256]
+
+
+@pytest.mark.parametrize("page_size", [1, 64])
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+def test_a_text_run_with_two_ranks_passes_the_validator_and_the_gate(tmp_path, mode, page_size):
+    fake = _start_text(tmp_path, mode, page_size, dp_size=2)
+
+    on_disk = _assert_ranks_accepted(fake)
+    producer = on_disk[0]["producer"]
+    assert (producer["staging"], producer["restaged_points"]) == ("balanced_batch_call", [])
+    assert producer["content"]["source"] == "dataset_text_chains"
+    assert producer["content"]["dataset"] == FAKE_DATASET
+    if mode == "decode":
+        # Every rank file names the dataset in its ``kvwarm`` block, and the merged file with them.
+        assert [payload["kvwarm"] for payload in on_disk] == [{**SEEDED_KVWARM, "dataset": FAKE_KVWARM_DATASET}] * 2
+    # A prompt that is one slot prefix or one free prompt is text after its first token, on both ranks, and a
+    # rank's prompts are its own.
+    free = [call for call in fake.engine.calls if call.key[0] == 0]
+    whole = [free[number] for number in (FREE_BATCH_SHAPE, FREE_UNALIGNED_SEED, FREE_SEVEN_TOKEN_RUN, FREE_WARMUP)]
+    whole += [call for call in fake.engine.calls if call.key[1] in ("seed", "run")]
+    assert len(whole) > 8
+    for call in whole:
+        assert all(_is_fake_text(prompt[1:]) for prompt in call.prompts)
+    for call in fake.engine.calls:
+        assert all(own != other for own, other in zip(call.prompts[0::2], call.prompts[1::2], strict=True))
+
+
+def test_the_calls_outside_any_point_are_balanced_too(tmp_path):
+    fake = _start(tmp_path, "decode", dp_size=2)
+    assert fake.run.status == "complete"
+
+    free = [call for call in fake.engine.calls if call.key[0] == 0]
+    assert fake.engine.calls[: len(free)] == free
+    # The self-test sends its pairs to every rank, and the warm-up one prompt of 256 tokens to every rank.
+    assert [call.key for call in free] == [(0, "free", number) for number in range(7)]
+    assert [len(call.prompts) for call in free] == [4, 4, 4, 4, 4, 4, 2]
+    assert [call.max_new_tokens for call in free] == [1, 1, 1, 1, 1, 7, 5]
+    assert [sorted({len(prompt) for prompt in call.prompts}) for call in free] == [
+        [16],
+        [16],
+        [32],
+        [39],
+        [39],
+        [16],
+        [256],
+    ]
+    assert free[FREE_WARMUP].rids == [_rank_rid(0, "free", 6, rank, 0) for rank in range(2)]
+    # No call of the run holds an odd number of requests, so the FAKE round robin never shifts.
+    assert all(len(call.rids) % 2 == 0 for call in fake.engine.calls)
+    assert fake.engine.round_robin == 0
+    # The seven-token run of the self-test: one extend and six decode batches on each rank, in the same steps.
+    run = free[FREE_SEVEN_TOKEN_RUN]
+    assert run.rank_modes == [["EXTEND"] + ["DECODE"] * 6] * 2
+    first = _line_of(fake, 0, run.rids[0])["forward_iter"]
+    for rank in range(2):
+        steps = [line["forward_iter"] for line in fake.rank_lines(rank) if run.rids[rank] in line["rids"]]
+        assert steps == list(range(first, first + 7))
+    # Without the warm-up nothing is sent in its place.
+    without = _start(tmp_path / "zero", "decode", dp_size=2, warmup_iterations=0)
+    assert [len(call.prompts) for call in without.engine.calls if call.key[0] == 0] == [4] * 6
+    assert without.run.status == "complete"
+
+
+def test_the_first_token_need_of_a_run_with_two_ranks_is_the_need_of_one_rank(tmp_path, monkeypatch):
+    # The content plan accepts a small range here, so that a small grid can fill it to the last id.
+    monkeypatch.setattr(content, "MIN_VOCAB_SIZE", 16)
+    need = _start(tmp_path / "need", "prefill").payload()["producer"]["first_token_need"]
+
+    # Each rank allocates its first tokens from the whole range, so the range of one rank's need is enough.
+    exact = _start(tmp_path / "exact", "prefill", dp_size=2, tokens=(1000, 1000 + need["total"]))
+    assert exact.run.status == "complete"
+    assert exact.run.payloads()[0]["producer"]["first_token_need"] == need
+    short = _start(tmp_path / "short", "prefill", dp_size=2, tokens=(1000, 1000 + need["total"] - 1))
+    assert short.run.reason.startswith(f"token_range_too_small: the run needs {need['total']} first tokens (")
+    assert short.engine.calls == []
+
+
+# -- placement
+
+
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+@pytest.mark.parametrize(
+    ("fault", "found"),
+    [
+        ("misplaced", "dp_rank 1"),
+        ("no_dp_rank", "no dp_rank"),
+        ("dp_rank_none", "no dp_rank"),
+        # Only an int is a rank: the engine object hands over an int or None.
+        ("dp_rank_true", "dp_rank True"),
+    ],
+)
+@pytest.mark.parametrize("measured", [True, False], ids=["measured-call", "seed"])
+def test_a_request_that_did_not_run_on_its_planned_rank_fails_the_point(tmp_path, mode, fault, found, measured):
+    victim = _victim(_plan_only(tmp_path, mode, dp_size=2))
+    stage = "seed" if not measured else "meas" if mode == "prefill" else "run"
+    fake = _start(tmp_path, mode, dp_size=2, faults={(victim.benchmark_id, stage, 0): fault})
+
+    rid = _rank_rid(victim.benchmark_id, stage, 0, 0, 0)
+    _assert_point_failed(
+        fake, victim, f"{_PLACEMENT}: {rid}: the engine reports {found}, the request was planned for rank 0"
+    )
+    # Placement is looked at on every call, the seed included, and a point that was placed wrongly is not
+    # staged again.
+    _assert_not_staged_again(fake)
+    assert fake.calls_of(victim.benchmark_id)[-1].key[1] == stage
+
+
+def test_a_call_that_is_not_the_drivers_shifts_the_placement_and_the_run_fails_at_its_first_call(tmp_path):
+    fake = _start(tmp_path, "decode", dp_size=2, execute=False)
+    # FAKE: something else sent the engine one request without a rank before the run. The FAKE round robin,
+    # like the counter of SGLang's DP controller, then starts the first call of the run on rank 1.
+    stray = content.request_id("stray", 0, "free", 0, 0, 0)
+    fake.engine.generate([[TOKEN_LOW]], [stray], 1)
+    assert fake.engine.calls.pop().ranks == [0] and fake.engine.round_robin == 1
+    fake.execute()
+
+    rid = _rank_rid(0, "free", 0, 0, 0)
+    assert fake.run.reason == (
+        f"self_test_failed: batch_shape: {_PLACEMENT}: {rid}: the engine reports dp_rank 1, the request was "
+        "planned for rank 0"
+    )
+    assert fake.engine.calls[0].ranks == [1, 0, 1, 0] and len(fake.engine.calls) == 1
+    _assert_rejected(fake, "failed")
+
+
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+def test_a_run_with_one_rank_asks_for_no_rank_in_a_response(tmp_path, mode):
+    # The FAKE engine without DP attention reports no ``dp_rank`` at all, and every other test of this file
+    # passes on that. A rank it does report is not looked at either.
+    victim = _victim(_plan_only(tmp_path, mode))
+    stage = "meas" if mode == "prefill" else "run"
+    fake = _start(tmp_path, mode, faults={(victim.benchmark_id, stage, 0): "odd_dp_rank"})
+    _assert_accepted(fake)
+
+
+# -- the same step on every rank
+
+
+@pytest.mark.parametrize("stage", ["meas", "warm"])
+def test_a_rank_that_runs_a_prefill_shot_one_step_late_fails_the_point(tmp_path, stage):
+    victim = _victim(_plan_only(tmp_path, "prefill", dp_size=2))
+    fake = _start(tmp_path, "prefill", dp_size=2, faults={(victim.benchmark_id, stage, 0): "late@1"})
+
+    # Each rank's own log looks right: its one batch holds exactly its requests. Rank 1 idled in the step in
+    # which rank 0 ran its batch, and rank 0 in the step of rank 1.
+    (call,) = fake.calls_of(victim.benchmark_id, stage)
+    assert call.rank_modes == [["EXTEND"], ["IDLE", "EXTEND"]]
+    first = _line_of(fake, 0, call.rids[0])
+    late = _line_of(fake, 1, call.rids[1])
+    assert (first["mode"], late["mode"]) == ("EXTEND", "EXTEND")
+    assert late["forward_iter"] == first["forward_iter"] + 1
+    assert sorted(first["rids"]) == sorted(call.rids[0::2]) and sorted(late["rids"]) == sorted(call.rids[1::2])
+    reason = _STEPS_DIFFER.format(of=1, step=first["forward_iter"], step1=late["forward_iter"])
+    _assert_point_failed(fake, victim, reason)
+    _assert_not_staged_again(fake)
+
+
+def test_a_rank_that_runs_a_decode_run_one_step_late_fails_the_point_at_once(tmp_path):
+    victim = _victim(_plan_only(tmp_path, "decode", dp_size=2))
+    fake = _start(tmp_path, "decode", dp_size=2, faults={(victim.benchmark_id, "run", 0): "late@1"})
+
+    # Rank 1 idled in the first step and extended in the second, in which rank 0 ran its first decode step.
+    # The FAKE engine wrote that step of rank 0 as SGLang does: as an extend batch of one token per request.
+    # So the log of rank 0 holds two EXTEND and five DECODE lines for the run.
+    (run,) = fake.calls_of(victim.benchmark_id, "run")
+    assert run.rank_modes == [["EXTEND", "EXTEND"] + ["DECODE"] * 5, ["IDLE", "EXTEND"] + ["DECODE"] * 6]
+    on_time, late = _lines_of_call(fake, 0, run), _lines_of_call(fake, 1, run)
+    assert (len(on_time), len(late)) == (7, 7)
+    assert late[0]["forward_iter"] == on_time[1]["forward_iter"] == on_time[0]["forward_iter"] + 1
+    _assert_decode_steps_as_extend(on_time[1:2], 0, run.prompts[0::2])
+    # The line holds exactly the requests of rank 0, each of them for the second time in an extend batch.
+    assert sorted(on_time[1]["rids"]) == sorted(on_time[0]["rids"]) == sorted(run.rids[0::2])
+    reason = _DECODE_AS_EXTEND.format(rank=0, found="2 EXTEND, 5 DECODE", seqs=[on_time[1]["seq"]])
+    _assert_point_failed(fake, victim, reason)
+    _assert_not_staged_again(fake)
+    # The run failed when its batches were looked at: the driver did not wait for a sixth DECODE line of rank 0
+    # until the log wait ran out.
+    assert fake.clock.sleeps == 0
+
+
+def test_a_rank_that_runs_a_decode_run_one_step_late_on_an_engine_that_keeps_its_decode_batches(tmp_path):
+    # FAKE: the prefill graphs cannot replay the step, so the decode step of rank 0 beside the extend batch of
+    # rank 1 stays a decode batch, as SGLang leaves it then.
+    victim = _victim(_plan_only(tmp_path, "decode", dp_size=2))
+    faults = {(victim.benchmark_id, "run", 0): "late@1"}
+    fake = _start(tmp_path, "decode", dp_size=2, faults=faults, prefill_graphs_replay=False)
+
+    # Each rank's own log looks right: one extend batch and six decode batches with exactly its requests.
+    # Rank 1 ran each of them one step after rank 0.
+    (run,) = fake.calls_of(victim.benchmark_id, "run")
+    assert run.rank_modes == [["EXTEND"] + ["DECODE"] * 6, ["IDLE", "EXTEND"] + ["DECODE"] * 6]
+    first, late = _lines_of_call(fake, 0, run)[0], _lines_of_call(fake, 1, run)[0]
+    assert late["forward_iter"] == first["forward_iter"] + 1
+    reason = _STEPS_DIFFER.format(of=7, step=first["forward_iter"], step1=late["forward_iter"])
+    _assert_point_failed(fake, victim, reason)
+    _assert_not_staged_again(fake)
+    assert fake.clock.sleeps == 0
+
+
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+def test_a_seed_is_not_held_to_one_step_on_all_ranks(tmp_path, mode):
+    # Nothing of a seed is kept: it only has to complete on its rank, in whatever steps.
+    victim = _victim(_plan_only(tmp_path, mode, dp_size=2))
+    fake = _start(tmp_path, mode, dp_size=2, faults={(victim.benchmark_id, "seed", 0): "late@1"})
+
+    (seed,) = fake.calls_of(victim.benchmark_id, "seed")
+    assert seed.rank_modes[1][0] == "IDLE"
+    _assert_ranks_accepted(fake)
+
+
+@pytest.mark.parametrize(
+    ("fault", "tokens"),
+    [
+        # The lists of the two ranks differ.
+        ("unequal_tokens@1", "[[8, 8], [8, 9]]"),
+        # Both ranks hold the same list, and it says that rank 1 ran another number of tokens than rank 0.
+        ("uneven_tokens@1", "[[8, 9], [8, 9]]"),
+        # A rank whose batch holds no counts, or only its own, or values that are not counts.
+        ("no_global_tokens@1", "[[8, 8], null]"),
+        ("no_global_tokens@0", "[null, [8, 8]]"),
+        ("local_tokens@1", "[[8, 8], [8]]"),
+        ("bool_tokens@0", "[[true, true], [8, 8]]"),
+        # Every rank holds the same list, and it has one entry where the run has two ranks: the lists are
+        # equal and their entries are, so only their length tells.
+        ("own_tokens_only", "[[8], [8]]"),
+    ],
+)
+def test_token_counts_that_do_not_show_the_same_step_on_every_rank_fail_the_point(tmp_path, fault, tokens):
+    victim = _victim(_plan_only(tmp_path, "prefill", dp_size=2))
+    assert (victim.batch_size, victim.new_tokens) == (2, 4)  # eight computed tokens on each rank
+    fake = _start(tmp_path, "prefill", dp_size=2, faults={(victim.benchmark_id, "meas", 0): fault})
+
+    # The step number is the same on both ranks; only the token counts tell.
+    rid = _rank_rid(victim.benchmark_id, "meas", 0, 0, 0)
+    step = _line_of(fake, 0, rid)["forward_iter"]
+    assert _line_of(fake, 1, _rank_rid(victim.benchmark_id, "meas", 0, 1, 0))["forward_iter"] == step
+    _assert_point_failed(fake, victim, _TOKENS_DIFFER.format(of=1, step=step, tokens=tokens))
+    _assert_not_staged_again(fake)
+
+
+def test_token_counts_are_compared_for_every_kept_batch_of_a_decode_run(tmp_path):
+    victim = _victim(_plan_only(tmp_path, "decode", dp_size=2))
+    fake = _start(tmp_path, "decode", dp_size=2, faults={(victim.benchmark_id, "run", 0): "unequal_tokens@1"})
+
+    rid = _rank_rid(victim.benchmark_id, "run", 0, 0, 0)
+    line = _line_of(fake, 0, rid)
+    counts = line["global_num_tokens"]
+    assert counts == [line["extend_num_tokens"]] * 2
+    tokens = json.dumps([counts, [counts[0], counts[1] + 1]])
+    _assert_point_failed(fake, victim, _TOKENS_DIFFER.format(of=7, step=line["forward_iter"], tokens=tokens))
+
+
+def test_a_rank_that_splits_the_extend_of_a_decode_run_fails_the_point(tmp_path):
+    # The sequence of rank 1 is one a decode run may have: two extend batches and six decode batches with
+    # exactly its requests. It took one extend batch more than rank 0, so its decode steps are one step behind,
+    # and the first decode step of rank 0 ran beside the second extend batch of rank 1. The FAKE engine wrote
+    # that step of rank 0 as SGLang does, as an extend batch.
+    victim = _victim(_plan_only(tmp_path, "decode", dp_size=2))
+    fake = _start(tmp_path, "decode", dp_size=2, faults={(victim.benchmark_id, "run", 0): "split_extend@1"})
+
+    (run,) = fake.calls_of(victim.benchmark_id, "run")
+    assert run.rank_modes == [["EXTEND", "EXTEND"] + ["DECODE"] * 5, ["EXTEND", "EXTEND"] + ["DECODE"] * 6]
+    whole = _lines_of_call(fake, 0, run)
+    _assert_decode_steps_as_extend(whole[1:2], 0, run.prompts[0::2])
+    reason = _DECODE_AS_EXTEND.format(rank=0, found="2 EXTEND, 5 DECODE", seqs=[whole[1]["seq"]])
+    _assert_point_failed(fake, victim, reason)
+    _assert_not_staged_again(fake)
+    assert fake.clock.sleeps == 0
+
+    # FAKE: an engine whose prefill graphs cannot replay the step. Rank 0 then keeps its decode batches, and
+    # each rank's own sequence is one a decode run may have. The ranks are held against each other.
+    kept = _start(
+        tmp_path / "kept",
+        "decode",
+        dp_size=2,
+        faults={(victim.benchmark_id, "run", 0): "split_extend@1"},
+        prefill_graphs_replay=False,
+    )
+    (run,) = kept.calls_of(victim.benchmark_id, "run")
+    assert run.rank_modes == [["EXTEND"] + ["DECODE"] * 6, ["EXTEND", "EXTEND"] + ["DECODE"] * 6]
+    _assert_point_failed(kept, victim, f"{_STEP}: the ranks ran the call as [7, 8] batches, one number per rank")
+    _assert_not_staged_again(kept)
+
+
+def test_a_decode_step_that_ran_as_an_extend_batch_is_never_kept_as_a_batch_of_the_point(tmp_path):
+    victim = _victim(_plan_only(tmp_path, "decode", dp_size=2))
+    fake = _start(tmp_path, "decode", dp_size=2, faults={(victim.benchmark_id, "run", 0): "decode_as_extend@0"})
+
+    # FAKE: the first decode step of rank 0 ran as an extend batch, and so did that of rank 1, which the FAKE
+    # engine turned into one because rank 0 extended in the step. The ranks are then in step with each other:
+    # line for line the same mode, the same step number and the same token counts.
+    (run,) = fake.calls_of(victim.benchmark_id, "run")
+    assert run.rank_modes == [["EXTEND", "EXTEND"] + ["DECODE"] * 5] * 2
+    lines = [_lines_of_call(fake, rank, run) for rank in range(2)]
+    for own, other in zip(*lines, strict=True):
+        assert (own["mode"], own["forward_iter"], own["global_num_tokens"]) == (
+            other["mode"],
+            other["forward_iter"],
+            other["global_num_tokens"],
+        )
+        assert len(set(own["global_num_tokens"])) == 1
+    for rank in range(2):
+        _assert_decode_steps_as_extend(lines[rank][1:2], rank, run.prompts[rank::2])
+    # At page size 1 a request of the run computes one token in its extend batch, as it does in such a line, so
+    # the token counts of the line are those of a planned extend batch. The run still fails: it has five
+    # lines of mode DECODE.
+    assert grid.expected_extend_tokens(grid.DECODE, 0, victim.cached_tokens, 1) == 1
+    reason = _DECODE_AS_EXTEND.format(rank=0, found="2 EXTEND, 5 DECODE", seqs=[lines[0][1]["seq"]])
+    _assert_point_failed(fake, victim, reason)
+    _assert_not_staged_again(fake)
+    assert fake.clock.sleeps == 0
+
+
+def test_a_second_extend_batch_of_other_requests_is_no_decode_step(tmp_path):
+    # Page size 64: a decode run of more than six requests takes two extend batches on each rank, the second
+    # with the requests the first had no room for. That is no decode step under another mode, so a wrong
+    # sequence on a rank keeps the reason a run with one rank gives for it.
+    plan = _plan_only(tmp_path, "decode", 64, dp_size=2)
+    victim = next(point for point in plan.built.points[2:] if point.batch_size > 6)
+    fake = _start(tmp_path, "decode", 64, dp_size=2, faults={(victim.benchmark_id, "run", 0): "seven_decode@1"})
+
+    (run,) = fake.calls_of(victim.benchmark_id, "run")
+    assert run.rank_modes == [["EXTEND", "EXTEND"] + ["DECODE"] * 6, ["EXTEND", "EXTEND"] + ["DECODE"] * 7]
+    first, second = _lines_of_call(fake, 1, run)[:2]
+    assert not set(first["rids"]) & set(second["rids"])
+    _assert_point_failed(
+        fake,
+        victim,
+        f"{_CONTEXT}: rank 1: the batches of the run are 2 EXTEND, 7 DECODE, expected one or more EXTEND and then "
+        "6 DECODE",
+    )
+    # The same run without the fault is kept: its two extend batches stand for no decode step.
+    _assert_ranks_accepted(_start(tmp_path / "whole", "decode", 64, dp_size=2))
+
+
+def test_with_one_rank_an_extend_batch_is_never_counted_as_a_decode_step(tmp_path):
+    # The same FAKE line in a run with one rank, where SGLang turns no decode batch into an extend batch. The
+    # driver waits for six lines of mode DECODE, as it did before it knew attention-DP ranks.
+    victim = _victim(_plan_only(tmp_path, "decode"))
+    fake = _start(tmp_path, "decode", faults={(victim.benchmark_id, "run", 0): "decode_as_extend"})
+
+    (run,) = fake.calls_of(victim.benchmark_id, "run")
+    assert run.modes == ["EXTEND", "EXTEND"] + ["DECODE"] * 5
+    _assert_point_failed(
+        fake, victim, f"no_fpm_before_deadline: {LEADER_LOG} holds 5 of the 6 decode batch(es) after 2.0 s"
+    )
+    assert fake.clock.sleeps == 2.0 / driver.POLL_SECONDS
+
+
+def test_a_step_number_that_is_not_a_count_is_a_recorder_fault(tmp_path):
+    victim = _victim(_plan_only(tmp_path, "prefill", dp_size=2))
+    fake = _start(tmp_path, "prefill", dp_size=2, faults={(victim.benchmark_id, "meas", 0): "no_forward_iter@1"})
+
+    seq = _line_of(fake, 1, _rank_rid(victim.benchmark_id, "meas", 0, 1, 0))["seq"]
+    _assert_point_failed(fake, victim, f"recorder_fault: {RANK_1_LOG}: batch seq {seq} has forward_iter=None")
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_an_idle_batch_inside_the_decode_run_of_a_rank_fails_the_point(tmp_path, rank):
+    victim = _victim(_plan_only(tmp_path, "decode", dp_size=2))
+    fake = _start(tmp_path, "decode", dp_size=2, faults={(victim.benchmark_id, "run", 0): f"idle_between@{rank}"})
+
+    (run,) = fake.calls_of(victim.benchmark_id, "run")
+    assert run.rank_modes[rank] == ["EXTEND", "DECODE", "DECODE", "IDLE", "DECODE", "DECODE", "DECODE", "DECODE"]
+    seqs = [line["seq"] for line in fake.rank_lines(rank) if run.rids[rank] in line["rids"]]
+    assert len(seqs) == 7 and seqs[-1] - seqs[0] == 7  # the idle line took one number between them
+    _assert_point_failed(
+        fake,
+        victim,
+        f"measured_decode_context_mismatch: rank {rank}: an IDLE batch without requests lies between the batches "
+        f"of the run (seq {seqs})",
+    )
+    _assert_not_staged_again(fake)
+
+
+def test_idle_lines_around_the_batches_of_a_call_are_skipped(tmp_path):
+    # A rank idles whenever another rank runs a step alone. Such lines hold no request, and the driver passes
+    # over them where it looks for the batches of its requests.
+    plan = _plan_only(tmp_path, "agg", dp_size=2)
+    prefill = next(point for point in plan.built.points[2:] if point.phase == "prefill" and point.batch_size >= 2)
+    decode = next(point for point in plan.built.points if point.phase == "decode" and point.batch_size >= 2)
+    faults = {(prefill.benchmark_id, "meas", 0): "idle_after@1", (decode.benchmark_id, "run", 0): "idle_after@0"}
+    fake = _start(tmp_path, "agg", dp_size=2, faults=faults)
+
+    assert fake.calls_of(prefill.benchmark_id, "meas")[0].rank_modes == [["EXTEND"], ["EXTEND", "IDLE"]]
+    assert fake.calls_of(decode.benchmark_id, "run")[0].rank_modes[0][-1] == "IDLE"
+    # The FAKE ranks run in lockstep, so in each of the two steps the other rank wrote an idle line as well.
+    assert [sum(1 for line in fake.rank_lines(rank) if line["mode"] == "IDLE") for rank in range(2)] == [2, 2]
+    _assert_ranks_accepted(fake)
+
+
+# -- every check on every rank
+
+
+# (mode, stage, FAKE fault, the reason a run with one rank gives for it)
+RANK_FAULTS = [
+    ("prefill", "meas", "split_extend", _SPLIT),
+    ("prefill", "warm", "split_extend", _SPLIT),
+    ("prefill", "meas", "foreign_id", _FOREIGN_IN_EXTEND),
+    ("prefill", "meas", "chunked", _CHUNKED),
+    ("prefill", "meas", "decode_follows", _DECODE_AFTER),
+    ("prefill", "meas", "wrong_extend_tokens", _TOKENS_REPORTED),
+    ("prefill", "meas", "wrong_extend_lens", _TOKENS_COUNTED),
+    ("decode", "run", "foreign_id", _CONTEXT + ": extend batch seq {seq} holds a foreign request"),
+    ("decode", "run", "seven_decode", _SEQUENCE.replace("{found}", "1 EXTEND, 7 DECODE")),
+    ("decode", "run", "decode_missing_id", _DECODE_IDS.replace("{held}", "{b0}")),
+]
+# Two more, in which the faulty rank runs one extend batch more than the other while the other decodes. The
+# FAKE engine, as SGLang, then writes that decode step of the other rank as an extend batch. The ranks are
+# looked at in rank order, so the faulty rank is named only when it is rank 0.
+RANK_FAULTS_WITH_ONE_EXTEND_MORE = [
+    ("decode", "run", "foreign_between", _BETWEEN),
+    ("decode", "run", "second_extend_of_one_request", _CONTEXT + ": {rid0} is in 2 extend batches of the run"),
+]
+
+
+@pytest.mark.parametrize(
+    ("mode", "stage", "fault", "reason", "rank"),
+    [
+        *((*row, rank) for rank in (0, 1) for row in RANK_FAULTS),
+        *((*row, 0) for row in RANK_FAULTS_WITH_ONE_EXTEND_MORE),
+    ],
+    ids=lambda value: str(value) if not isinstance(value, str) or " " not in value else None,
+)
+def test_a_check_that_fails_on_one_rank_fails_the_point_and_names_the_rank(tmp_path, mode, stage, fault, reason, rank):
+    victim = _victim(_plan_only(tmp_path, mode, dp_size=2))
+    fake = _start(tmp_path, mode, dp_size=2, faults={(victim.benchmark_id, stage, 0): f"{fault}@{rank}"})
+
+    # The reason is the one a run with one rank gives, with the rank in front of its detail and the numbers of
+    # that rank's log.
+    (call,) = fake.calls_of(victim.benchmark_id, stage)
+    mine = [line for line in fake.rank_lines(rank) if set(line["rids"]) & set(call.rids[rank::2])]
+    seq = mine[0]["seq"]
+    batch = victim.batch_size
+    code, _, detail = reason.partition(": ")
+    detail = detail.format(
+        seq=seq,
+        seq1=seq + 1,
+        seq4=seq + 4,
+        seqs=[line["seq"] for line in mine],
+        b=batch,
+        b0=batch - 1,
+        b1=batch + 1,
+        bn=batch * victim.new_tokens,
+        bn1=batch * victim.new_tokens + 1,
+        rid0=_rank_rid(victim.benchmark_id, stage, 0, rank, 0),
+    )
+    _assert_point_failed(fake, victim, f"{code}: rank {rank}: {detail}")
+    _assert_not_staged_again(fake)
+
+
+@pytest.mark.parametrize(
+    ("fault", "found", "converted"),
+    [
+        # A foreign extend batch on rank 1 between its third and its fourth decode step.
+        ("foreign_between", "1 EXTEND, 2 DECODE, 1 EXTEND, 3 DECODE", 3),
+        # A second extend batch of one request on rank 1, right after its first.
+        ("second_extend_of_one_request", "2 EXTEND, 5 DECODE", 1),
+    ],
+)
+def test_an_extend_batch_more_on_rank_1_inside_a_decode_run_shows_in_the_log_of_rank_0_first(
+    tmp_path, fault, found, converted
+):
+    assert ("decode", "run", fault) in [row[:3] for row in RANK_FAULTS_WITH_ONE_EXTEND_MORE]
+    victim = _victim(_plan_only(tmp_path, "decode", dp_size=2))
+    fake = _start(tmp_path, "decode", dp_size=2, faults={(victim.benchmark_id, "run", 0): f"{fault}@1"})
+
+    # Rank 0 decoded in the step in which rank 1 ran its extra extend batch, and the FAKE engine wrote that
+    # step of rank 0 as an extend batch. Rank 0 is looked at first, so the run fails as ranks out of step.
+    (run,) = fake.calls_of(victim.benchmark_id, "run")
+    lines = _lines_of_call(fake, 0, run)
+    assert [line["mode"] for line in lines].count("DECODE") == 5 and lines[converted]["mode"] == "EXTEND"
+    assert lines[converted]["extend_lens"] == [1] * victim.batch_size
+    reason = _DECODE_AS_EXTEND.format(rank=0, found=found, seqs=[lines[converted]["seq"]])
+    _assert_point_failed(fake, victim, reason)
+    _assert_not_staged_again(fake)
+    assert fake.clock.sleeps == 0
+
+
+@pytest.mark.parametrize(
+    ("mode", "stage", "fault", "reason"),
+    [
+        ("prefill", "meas", "copy_done_false", "batch seq {seq} was stamped without a copy event (copy_done=False)"),
+        (
+            "prefill",
+            "meas",
+            "no_lens",
+            "extend batch seq {seq} has no usable prefix_lens, extend_lens and extend_num_tokens",
+        ),
+        (
+            "decode",
+            "run",
+            "decode_copy_done_false",
+            "batch seq {seq4} was stamped without a copy event (copy_done=False)",
+        ),
+        ("decode", "run", "fault_line", "process_batch_result: FAKE recorder fault"),
+    ],
+)
+def test_a_recorder_fault_on_rank_1_names_the_log_of_rank_1(tmp_path, mode, stage, fault, reason):
+    victim = _victim(_plan_only(tmp_path, mode, dp_size=2))
+    fake = _start(tmp_path, mode, dp_size=2, faults={(victim.benchmark_id, stage, 0): f"{fault}@1"})
+
+    seq = _line_of(fake, 1, _rank_rid(victim.benchmark_id, stage, 0, 1, 0))["seq"]
+    _assert_point_failed(fake, victim, f"recorder_fault: {RANK_1_LOG}: " + reason.format(seq=seq, seq4=seq + 4))
+
+
+def test_a_log_of_one_rank_without_the_batches_of_a_call_fails_at_the_deadline(tmp_path):
+    victim = _victim(_plan_only(tmp_path, "decode", dp_size=2))
+    fake = _start(tmp_path, "decode", dp_size=2, faults={(victim.benchmark_id, "run", 0): "five_decode@1"})
+
+    # Rank 0 holds every batch of its part of the call; rank 1 lacks its sixth decode batch.
+    _assert_point_failed(
+        fake, victim, f"no_fpm_before_deadline: {RANK_1_LOG} holds 5 of the 6 decode batch(es) after 2.0 s"
+    )
+    assert fake.clock.sleeps == 2.0 / driver.POLL_SECONDS
+
+
+@pytest.mark.parametrize(
+    ("mode", "stage", "reason"),
+    [("decode", "run", "measured_decode_context_mismatch"), ("prefill", "meas", "measured_prefill_tokens_mismatch")],
+)
+def test_a_late_batch_on_rank_1_fails_the_run_and_names_the_rank(tmp_path, mode, stage, reason):
+    victim = _victim(_plan_only(tmp_path, mode, dp_size=2))
+    fake = _start(tmp_path, mode, dp_size=2, faults={(victim.benchmark_id, stage, 0): "late_decode@1"})
+
+    assert fake.run.status == "failed"
+    assert f"{reason}: rank 1: a DECODE batch (seq " in fake.run.reason
+    assert fake.run.reason.endswith(") holds requests of a call that had already been checked")
+    _assert_rejected(fake, "failed")
+
+
+@pytest.mark.parametrize(
+    ("mode", "stage", "reason"),
+    [("decode", "run", "measured_decode_context_mismatch"), ("prefill", "meas", "measured_prefill_tokens_mismatch")],
+)
+def test_a_request_of_rank_1_in_the_log_of_rank_0_fails_the_run(tmp_path, mode, stage, reason):
+    victim = _victim(_plan_only(tmp_path, mode, dp_size=2))
+    fake = _start(tmp_path, mode, dp_size=2, faults={(victim.benchmark_id, stage, 0): "line_of_the_next_rank@0"})
+
+    # FAKE: after the batches of the call, the log of rank 0 got one more line, with the requests of rank 1.
+    # The line holds no request of rank 0, so it is none of the lines the call was checked on, and the log of
+    # rank 1 holds what it should. It is found when the lines of the call are dropped, by the request ids of
+    # the run that it holds and that are not those of rank 0.
+    (call,) = fake.calls_of(victim.benchmark_id, stage)
+    of_rank_1 = set(call.rids[1::2])
+    (stray,) = [line for line in fake.rank_lines(0) if of_rank_1 & set(line["rids"])]
+    assert stray["rids"] == call.rids[1::2] and stray["seq"] == _lines_of_call(fake, 0, call)[-1]["seq"] + 1
+    assert len(_lines_of_call(fake, 1, call)) == (7 if mode == "decode" else 1)
+    assert (fake.run.status, fake.run.reason) == (
+        "failed",
+        f"{reason}: rank 0: a DECODE batch (seq {stray['seq']}) holds requests of a call that had already been checked",
+    )
+    # The call itself passed its checks. The line was found before the first call of the next point was sent,
+    # and the failure names no point, because the line belongs to none that was being staged.
+    assert max(fake.sent_benchmark_ids()) == victim.benchmark_id
+    assert fake.calls_of(victim.benchmark_id)[-1] is call
+    _assert_rejected(fake, "failed")
+
+
+# -- a wrong cached count on one rank
+
+
+@pytest.mark.parametrize("ranks", [(1,), (0,), None], ids=["rank-1", "rank-0", "both-ranks"])
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+def test_a_cache_miss_on_one_rank_stages_the_point_again_on_all_ranks(tmp_path, mode, ranks):
+    victim = _victim(_plan_only(tmp_path, mode, dp_size=2))
+    fake = _start(tmp_path, mode, dp_size=2, evictions={victim.benchmark_id: 1}, eviction_ranks=ranks)
+
+    # Every stage of the point was sent twice, each time to both ranks, the seed included.
+    stages = ["seed", "warm", "meas"] if mode == "prefill" else ["seed", "run"]
+    calls = fake.calls_of(victim.benchmark_id)
+    assert [call.key for call in calls] == [
+        (victim.benchmark_id, stage, attempt) for attempt in (0, 1) for stage in stages
+    ]
+    assert all(call.ranks == [0, 1] * victim.batch_size for call in calls)
+    assert {parts["benchmark_id"] for parts in fake.sent() if parts["attempt"] and parts["benchmark_id"]} == {
+        victim.benchmark_id
+    }
+    on_disk = _assert_ranks_accepted(fake)
+    assert on_disk[0]["producer"]["restaged_points"] == [victim.benchmark_id]
+
+
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+def test_two_cache_misses_on_one_rank_fail_the_point(tmp_path, mode):
+    victim = _victim(_plan_only(tmp_path, mode, dp_size=2))
+    fake = _start(tmp_path, mode, dp_size=2, evictions={victim.benchmark_id: 2}, eviction_ranks=(1,))
+
+    expected = grid.expected_cached_tokens(mode, victim.cached_tokens, 1)
+    stage = "meas" if mode == "prefill" else "run"
+    batch = victim.batch_size
+    # Only the requests of rank 1 missed, and the first of them is named.
+    on_disk = _assert_point_failed(
+        fake,
+        victim,
+        f"real_seed_cache_validation_failed: {batch} of {2 * batch} request(s) report another cached count than "
+        f"the planned {expected}: {_rank_rid(victim.benchmark_id, stage, 1, 1, 0)} reports 0",
+    )
+    assert on_disk["producer"]["restaged_points"] == [victim.benchmark_id]
+
+
+def _decode_point_above_the_chunk_budget(plan: _FakeRun) -> grid.Point:
+    """A planned decode point whose prompts, once they are computed whole, do not fit one extend batch of a rank."""
+    chunk = plan.limits.chunked_prefill_size
+    return next(
+        point
+        for point in plan.built.points[2:]
+        if point.batch_size >= 2 and point.batch_size * (point.cached_tokens - grid.DECODE_PROMPT_LEAD) > chunk
+    )
+
+
+@pytest.mark.parametrize("missing", [1, 0])
+def test_a_cache_miss_on_one_rank_in_a_decode_run_above_the_chunk_budget_is_staged_again(tmp_path, missing):
+    victim = _decode_point_above_the_chunk_budget(_plan_only(tmp_path, "decode", dp_size=2))
+    hit = 1 - missing
+    fake = _start(tmp_path, "decode", dp_size=2, evictions={victim.benchmark_id: 1}, eviction_ranks=(missing,))
+
+    # First attempt. The rank that lost its cache computed its prompts again, in several extend batches. The
+    # rank that hit its cache extended in the first step only and decoded from the second step on, beside the
+    # further extend batches of the other rank. The FAKE engine wrote those decode steps as SGLang does, as
+    # extend batches of one token per request, so the log of that rank holds fewer than six DECODE lines.
+    first, second = fake.calls_of(victim.benchmark_id, "run")
+    assert (first.key[2], second.key[2]) == (0, 1)
+    extends = first.rank_modes[missing].count("EXTEND")
+    assert extends >= 2 and first.rank_modes[missing] == ["EXTEND"] * extends + ["DECODE"] * 6
+    converted = min(extends - 1, 6)
+    assert first.rank_modes[hit] == ["EXTEND"] * (1 + converted) + ["DECODE"] * (6 - converted)
+    lines = _lines_of_call(fake, hit, first)
+    _assert_decode_steps_as_extend(lines[1 : 1 + converted], hit, first.prompts[hit::2])
+    # The other rank's count in each of those steps is the tokens of one of its extend batches.
+    assert all(line["global_num_tokens"][missing] > victim.batch_size for line in lines[1 : 1 + converted])
+    assert first.ranks == [0, 1] * victim.batch_size
+
+    # The driver saw the missed cache in the responses and staged the point again on both ranks, without
+    # waiting for DECODE lines that were never written. The second attempt ran as planned and is kept.
+    assert [call.key[1:] for call in fake.calls_of(victim.benchmark_id)] == [
+        ("seed", 0),
+        ("run", 0),
+        ("seed", 1),
+        ("run", 1),
+    ]
+    assert second.rank_modes == [["EXTEND"] + ["DECODE"] * 6] * 2
+    assert fake.clock.sleeps == 0
+    on_disk = _assert_ranks_accepted(fake)
+    assert on_disk[0]["producer"]["restaged_points"] == [victim.benchmark_id]
+
+
+def test_a_cache_miss_on_one_rank_is_staged_again_on_an_engine_that_keeps_its_decode_batches(tmp_path):
+    # FAKE: the prefill graphs cannot replay the step, so the rank that hit its cache keeps its six decode
+    # batches while the other rank still extends, and idles once it is done.
+    victim = _decode_point_above_the_chunk_budget(_plan_only(tmp_path, "decode", dp_size=2))
+    fake = _start(
+        tmp_path,
+        "decode",
+        dp_size=2,
+        evictions={victim.benchmark_id: 1},
+        eviction_ranks=(1,),
+        prefill_graphs_replay=False,
+    )
+
+    first = fake.calls_of(victim.benchmark_id, "run")[0]
+    assert first.rank_modes[0] == ["EXTEND"] + ["DECODE"] * 6 and first.rank_modes[1].count("EXTEND") >= 2
+    assert fake.clock.sleeps == 0
+    on_disk = _assert_ranks_accepted(fake)
+    assert on_disk[0]["producer"]["restaged_points"] == [victim.benchmark_id]
+
+
+def test_after_a_cache_miss_on_one_rank_only_the_extend_batches_of_a_decode_run_are_waited_for(tmp_path):
+    victim = _victim(_plan_only(tmp_path / "two", "decode", dp_size=2))
+    # FAKE: rank 1 lost its cache before the run, and the log of rank 0 lacks the last decode step of the run.
+    fake = _start(
+        tmp_path / "two",
+        "decode",
+        dp_size=2,
+        evictions={victim.benchmark_id: 1},
+        eviction_ranks=(1,),
+        faults={(victim.benchmark_id, "run", 0): "five_decode@0"},
+    )
+
+    # Nothing of a call that missed its cache is kept, so the missing line is not waited for: the point is
+    # staged again at once and the second attempt is kept.
+    first = fake.calls_of(victim.benchmark_id, "run")[0]
+    assert len(first.rank_modes[0]) == 6 and first.rank_modes[0][0] == "EXTEND"
+    assert fake.clock.sleeps == 0
+    on_disk = _assert_ranks_accepted(fake)
+    assert on_disk[0]["producer"]["restaged_points"] == [victim.benchmark_id]
+
+    # With one rank the batches of the run are waited for first, as before: the missing line ends the run at
+    # the deadline of the log wait, and the missed cache is never reached.
+    victim = _victim(_plan_only(tmp_path / "one", "decode"))
+    one = _start(
+        tmp_path / "one",
+        "decode",
+        evictions={victim.benchmark_id: 1},
+        faults={(victim.benchmark_id, "run", 0): "five_decode"},
+    )
+    _assert_point_failed(
+        one, victim, f"no_fpm_before_deadline: {LEADER_LOG} holds 5 of the 6 decode batch(es) after 2.0 s"
+    )
+    assert one.clock.sleeps == 2.0 / driver.POLL_SECONDS and one.payload()["producer"]["restaged_points"] == []
+
+
+def test_a_kept_batch_that_missed_the_cache_on_one_rank_is_staged_again_and_not_called_out_of_step(tmp_path):
+    # The recorder line of rank 1 says that nothing was cached, so rank 1 computed more tokens than rank 0 and
+    # the token counts of the step are not equal. The cached tokens are looked at first: the point is staged
+    # again as after an eviction, and the second attempt is kept.
+    victim = _victim(_plan_only(tmp_path, "prefill", dp_size=2))
+    fake = _start(tmp_path, "prefill", dp_size=2, faults={(victim.benchmark_id, "meas", 0): "line_missed_the_cache@1"})
+
+    line = _line_of(fake, 1, _rank_rid(victim.benchmark_id, "meas", 0, 1, 0))
+    assert line["global_num_tokens"][0] != line["global_num_tokens"][1]
+    on_disk = _assert_ranks_accepted(fake)
+    assert on_disk[0]["producer"]["restaged_points"] == [victim.benchmark_id]
+
+    faults = {(victim.benchmark_id, "meas", attempt): "line_missed_the_cache@1" for attempt in (0, 1)}
+    twice = _start(tmp_path / "twice", "prefill", dp_size=2, faults=faults)
+    planned = victim.batch_size * victim.cached_tokens
+    _assert_point_failed(
+        twice,
+        victim,
+        f"real_seed_cache_validation_failed: rank 1: sum_prefill_kv_tokens is 0 in the kept batch, the point "
+        f"plans {planned}",
+    )
+
+
+# -- self-test
+
+
+@pytest.mark.parametrize(
+    ("call", "fault", "reason", "passed"),
+    [
+        (FREE_BATCH_SHAPE, "split_extend@1", "batch_shape: " + _SIZE + ": rank 1: " + _SPLIT.partition(": ")[2], []),
+        (FREE_BATCH_SHAPE, "late@1", "batch_shape: " + _STEPS_DIFFER.format(of=1, step=1, step1=2), []),
+        (
+            FREE_BATCH_SHAPE,
+            "uneven_tokens@1",
+            "batch_shape: " + _TOKENS_DIFFER.format(of=1, step=1, tokens="[[32, 33], [32, 33]]"),
+            [],
+        ),
+        (
+            # The cache of rank 1 alone lost the seeded prefix.
+            FREE_ALIGNED_SHOTS,
+            "evict@1",
+            "aligned_prefix: 2 of 4 request(s) report another cached count than the planned 16: "
+            + _rank_rid(0, "free", 2, 1, 0)
+            + " reports 0",
+            ["batch_shape"],
+        ),
+        (
+            FREE_ALIGNED_SHOTS,
+            "late@1",
+            "aligned_prefix: " + _STEPS_DIFFER.format(of=1, step=3, step1=4),
+            ["batch_shape"],
+        ),
+        (
+            FREE_UNALIGNED_AGAIN,
+            "evict@0",
+            "unaligned_prompt: 2 of 4 request(s) report another cached count than the planned 38: "
+            + _rank_rid(0, "free", 4, 0, 0)
+            + " reports 0",
+            ["batch_shape", "aligned_prefix"],
+        ),
+        (
+            # Rank 0 split its extend batch. Its own sequence is looked at first and has one extend too many.
+            FREE_SEVEN_TOKEN_RUN,
+            "split_extend@0",
+            "seven_token_run: measured_decode_context_mismatch: rank 0: the run has 2 extend batches, expected one",
+            _ALL_BUT_LAST,
+        ),
+        (
+            # Rank 1 split its extend batch, or was released one step late. Either way rank 0 ran its first
+            # decode step beside an extend batch of rank 1, and the FAKE engine, as SGLang, wrote that step
+            # as an extend batch: line 7 of the log of rank 0, after the five one-token calls and the extend
+            # batch of the run.
+            FREE_SEVEN_TOKEN_RUN,
+            "split_extend@1",
+            "seven_token_run: " + _DECODE_AS_EXTEND.format(rank=0, found="2 EXTEND, 5 DECODE", seqs=[7]),
+            _ALL_BUT_LAST,
+        ),
+        (
+            FREE_SEVEN_TOKEN_RUN,
+            "late@1",
+            "seven_token_run: " + _DECODE_AS_EXTEND.format(rank=0, found="2 EXTEND, 5 DECODE", seqs=[7]),
+            _ALL_BUT_LAST,
+        ),
+        (
+            FREE_SEVEN_TOKEN_RUN,
+            "misplaced",
+            "seven_token_run: " + _PLACEMENT + ": " + _rank_rid(0, "free", 5, 0, 0) + ": the engine reports dp_rank 1, "
+            "the request was planned for rank 0",
+            _ALL_BUT_LAST,
+        ),
+    ],
+    ids=lambda value: value if isinstance(value, str) and " " not in value else None,
+)
+def test_a_self_test_check_that_fails_on_one_rank_ends_the_run_before_the_sweep(tmp_path, call, fault, reason, passed):
+    fake = _start(tmp_path, "prefill", dp_size=2, faults={(0, "free", call): fault})
+
+    assert (fake.run.status, fake.run.reason) == ("failed", f"self_test_failed: {reason}")
+    assert fake.sent_benchmark_ids() == {0}
+    assert [made.key[2] for made in fake.engine.calls] == list(range(call + 1))
+    on_disk = _assert_rejected(fake, "failed")
+    assert on_disk["producer"]["self_test"] == passed
+
+
+def test_a_warm_up_that_is_misplaced_fails_the_run(tmp_path):
+    fake = _start(tmp_path, dp_size=2, faults={(0, "free", FREE_WARMUP): "misplaced"})
+    assert fake.run.reason == (
+        f"{_PLACEMENT}: {_rank_rid(0, 'free', 6, 0, 0)}: the engine reports dp_rank 1, the request was planned "
+        "for rank 0"
+    )
+    assert fake.payload_of_rank(0)["producer"]["self_test"] == list(driver.SELF_TEST_CHECKS)
+
+
+# -- headers
+
+
+def _edit_rank(path: str, value, *, rank: int):
+    return _edit(path, value, process=rank)
+
+
+@pytest.mark.parametrize(
+    ("edit", "reason"),
+    [
+        # No leader for rank 1: its one scheduler process says it holds no request socket.
+        (
+            _edit_rank("leader", False, rank=1),
+            "recorder_header_invalid: no leader header for attention-DP rank(s) [1], expected exactly one for each "
+            "of [0, 1]: the leaders are ['sched-4100.jsonl']",
+        ),
+        (
+            _edit("leader", False),
+            "recorder_header_invalid: no leader header for attention-DP rank(s) [0, 1], expected exactly one for "
+            "each of [0, 1]: the leaders are []",
+        ),
+        # Two leaders for rank 0, and so none for rank 1.
+        (
+            _edit_rank("ranks.attn_dp_rank", 0, rank=1),
+            "recorder_header_invalid: 2 leader headers for attention-DP rank 0, expected exactly one: "
+            "['sched-4100.jsonl', 'sched-4101.jsonl']",
+        ),
+        (
+            _edit_rank("ranks.attn_dp_rank", 2, rank=1),
+            "recorder_header_invalid: sched-4101.jsonl: attn_dp_rank is 2, expected one of [0, 1]",
+        ),
+        (
+            _edit_rank("ranks.attn_dp_rank", True, rank=1),
+            "recorder_header_invalid: sched-4101.jsonl: attn_dp_rank is true, expected one of [0, 1]",
+        ),
+        (
+            _edit_rank("ranks.attn_dp_rank", UNREADABLE, rank=1),
+            "rejected: the recorder could not read ranks.attn_dp_rank in sched-4101.jsonl: " + UNREADABLE["unreadable"],
+        ),
+        # The ranks disagree on a limit: each has its own pool and its own admission.
+        (
+            _edit_rank("limits.max_total_num_tokens", 1200, rank=1),
+            "rejected: scheduler processes disagree on max_total_num_tokens: [1184, 1200]",
+        ),
+        (
+            _edit_rank("limits.chunked_prefill_size", 48, rank=1),
+            "rejected: scheduler processes disagree on chunked_prefill_size: [96, 48]",
+        ),
+        (
+            _edit_rank("decode_graph_sizes", [1, 2, 4], rank=1),
+            "rejected: scheduler processes disagree on decode_graph_sizes: [[1, 2, 4, 8], [1, 2, 4]]",
+        ),
+        # The layout a scheduler reports is not the one the run was set up for.
+        (
+            _edit_rank("ranks.attn_dp_size", 3, rank=1),
+            "rejected: " + _OTHER_LAYOUT.format(size="3", enabled="true", planned=2),
+        ),
+        (
+            _edit("ranks.attn_dp_enabled", False),
+            "rejected: " + _OTHER_LAYOUT.format(size="2", enabled="false", planned=2),
+        ),
+        # Without SGLang's input blocker the ranks would not be released together.
+        (
+            _edit("checks.input_blocker", False),
+            "rejected: SGLANG_ENABLE_COLOCATED_BATCH_GEN must be set under DP attention (input_blocker=false); "
+            "the launcher sets it before it builds the engine",
+        ),
+        (
+            _edit_rank("checks.input_blocker", None, rank=1),
+            "rejected: SGLANG_ENABLE_COLOCATED_BATCH_GEN must be set under DP attention (input_blocker=null); "
+            "the launcher sets it before it builds the engine",
+        ),
+    ],
+)
+def test_a_header_that_does_not_fit_a_run_with_two_ranks_fails_the_run(tmp_path, edit, reason):
+    fake = _start(tmp_path, dp_size=2, edit_header=edit)
+    _assert_failed_before_the_grid(fake, reason)
+
+
+def test_headers_of_another_layout_than_the_run_was_set_up_for_are_refused_for_the_layout(tmp_path):
+    # FAKE: the engine has two attention-DP ranks and the run was set up for one. The two leaders are found
+    # first.
+    two_leaders = _start(tmp_path / "two", dp_size=2, **{"expected_scheduler_processes": 2}, execute=False)
+    one_rank = dataclasses.replace(two_leaders.settings, dp_size=1)
+    run = driver.BenchmarkRun(
+        one_rank, two_leaders.recorder_dir, started_at=0.0, clock=two_leaders.clock.read, sleep=two_leaders.clock.sleep
+    )
+    run.execute(two_leaders.engine, token_low=TOKEN_LOW, token_high=TOKEN_HIGH)
+    assert run.reason == (
+        "recorder_header_invalid: 2 leader header(s), expected exactly one: ['sched-4100.jsonl', 'sched-4101.jsonl']"
+    )
+
+    # One scheduler process that reports DP attention, with its input blocker, in a run set up for one rank:
+    # the run is refused for the layout, not for the blocker that goes with it.
+    def dp_header(index: int, header: dict) -> dict:
+        return _fake_header(header["pid"], 0, _limits(1), 1, dp_size=2, dp_rank=0)
+
+    fake = _start(tmp_path / "one", edit_header=dp_header)
+    _assert_failed_before_the_grid(fake, "rejected: " + _OTHER_LAYOUT.format(size="2", enabled="true", planned=1))
+
+    # A run set up for two ranks on an engine without DP attention has no leader for rank 1.
+    def plain_header(index: int, header: dict) -> dict:
+        return _fake_header(header["pid"], index, _limits(1), 2)
+
+    plain = _start(tmp_path / "plain", dp_size=2, edit_header=plain_header)
+    assert plain.run.reason == (
+        "recorder_header_invalid: no leader header for attention-DP rank(s) [1], expected exactly one for each of "
+        "[0, 1]: the leaders are ['sched-4100.jsonl']"
+    )
+
+
+def test_a_scheduler_process_without_a_request_socket_is_refused_under_dp_attention(tmp_path):
+    # FAKE: a third scheduler process, the second TP rank inside attention-DP rank 1. Attention TP above 1
+    # inside a rank is not supported.
+    fake = _start(
+        tmp_path, dp_size=2, expected_scheduler_processes=3, edit_header=_edit("ranks.tp_size", 3), execute=False
+    )
+    header = _fake_header(4102, 1, fake.limits, 3, dp_size=2, dp_rank=1)
+    (fake.recorder_dir / "sched-4102.jsonl").write_text(json.dumps(header) + "\n", encoding="utf-8")
+    fake.execute()
+
+    _assert_failed_before_the_grid(
+        fake,
+        "rejected: attention TP above 1 inside an attention-DP rank is not supported: ['sched-4102.jsonl'] hold "
+        "no request socket",
+    )
+
+
+# -- runs that do not complete
+
+
+def test_a_failed_run_with_two_ranks_writes_both_rank_files_and_no_merged_file(tmp_path):
+    victim = _victim(_plan_only(tmp_path, "decode", dp_size=2))
+    fake = _start(tmp_path, "decode", dp_size=2, faults={(victim.benchmark_id, "run", 0): "retraction"})
+
+    rid = _rank_rid(victim.benchmark_id, "run", 0, 1, victim.batch_size - 1)
+    on_disk = _assert_point_failed(
+        fake, victim, f"request_not_completed: {rid}: finish_type='length', completion_tokens=7 of 7, num_retractions=1"
+    )
+    assert sorted(path.name for path in fake.pod.glob("benchmark*")) == ["benchmark.json", "benchmark_dp1.json"]
+    # Both rank files keep the rows of the points before, each with the record of its own rank.
+    for rank, path in enumerate(fake.rank_paths()):
+        rows = json.loads(Path(path).read_text(encoding="utf-8"))["results"]
+        assert [row["fpms"][0]["dp_rank"] for row in rows] == [rank] * (victim.benchmark_id - 1)
+    assert on_disk["coverage"]["completed_points"] == victim.benchmark_id - 1
+
+
+def test_a_run_with_two_ranks_that_is_cut_short_by_the_deadline_is_partial_in_every_rank_file(tmp_path):
+    fake = _start(tmp_path, "decode", dp_size=2, faults={(3, "run", 0): "deadline"})
+
+    assert (fake.run.status, fake.run.reason) == ("partial", "timeout")
+    on_disk = _assert_rejected(fake, "partial")
+    assert on_disk["coverage"]["completed_points"] == 3
+    merged = json.loads((fake.pod / "benchmark_merged.json").read_text(encoding="utf-8"))
+    assert (merged["status"], merged["dp"]["source_ranks"]) == ("partial", [0, 1])
+
+
+def test_a_failure_recorded_before_execute_is_written_for_every_rank(tmp_path):
+    # The launcher records a refusal before the engine is built, when it already knows the number of ranks.
+    fake = _start(tmp_path, dp_size=2, execute=False)
+    fake.run.record_failure("rejected: FAKE refusal before the engine was built")
+
+    on_disk = _assert_rejected(fake, "failed")
+    assert (on_disk["error"], on_disk["grid_digest"]) == (
+        "rejected: FAKE refusal before the engine was built",
+        grid.grid_digest([]),
+    )
+    assert on_disk["producer"]["staging"] == "balanced_batch_call"
+    assert sorted(path.name for path in fake.pod.glob("benchmark*")) == ["benchmark.json", "benchmark_dp1.json"]
+
+
+# -- a run with one rank is the run it was, on the grid it had
+
+
+def _digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+# What a run with one rank sends and writes for a grid whose prefill new-token axis has no low end but 1, as
+# SHA-256 digests: of the calls (prompts, request ids and output tokens of every call, as compact JSON) and of
+# the rank file. They were typed in from runs of this file's fake engine against the driver as it stood before
+# it knew attention-DP ranks, with its record format set to 2. The generated grid had that axis then, and
+# ``_plan_without_the_low_end`` plans it again. For that grid a run with one rank therefore sends and writes
+# what it did then, byte for byte, apart from the format number in the producer block. A change that is meant
+# to alter what the driver sends or writes for a given grid retypes them. A change of the generated grid
+# belongs in ``ONE_RANK_DIGESTS``.
+ONE_RANK_DIGESTS_WITHOUT_LOW_END = {
+    ("seeded", "prefill", 1, 1): (
+        "6b24b27d78033d00d7e9d62930fbdf0a833ce54364cff0ee55f8b067588583c6",
+        "803b456339f98c20907e8b78864b487a1e614f6796a3046945cc2264f5b44ccb",
+    ),
+    ("seeded", "decode", 64, 1): (
+        "434d5f187ff06d2dfb6128094c89f21fcada6ff9c3d13f035040cfdff41639e7",
+        "bf9a4f6f613ab30b379a7dd48661965a287f39ff18057711b3194aa6cde658e9",
+    ),
+    ("seeded", "agg", 1, 2): (
+        "ddea84370f198be561d13bcc0a7290d09ae7f2b5bae6f936c811801cc3ae209f",
+        "4b672309209f788faa074dff6da17c9419e307f22f91f33b390626bb87fd5009",
+    ),
+    ("text", "prefill", 64, 1): (
+        "f96a88b7d6a05aeb77faf0227dca5a36f0b6889c35d2e8edab0426f621ec3bf5",
+        "dc5ca38070a83bd47c7579629132e14ac8fd38f2d8ac911b9245b82764e45133",
+    ),
+    ("text", "decode", 1, 2): (
+        "4864a00e60a507311f37bb42b4c8c4953b58792c901a571c3067ad595852aa53",
+        "e0b707fe419f81983f38b3073757c09ed1a8e092bec1411c426493b2cfdb12f1",
+    ),
+}
+
+# The same digests for the grid as it is generated now. Its prefill new-token axis holds the two sides of the
+# first step of the table (``grid.prefill_new_token_axis``): for the FAKE graph sizes, which start at 4 as
+# SGLang's default sizes do, two new tokens per request beside one. A run with a prefill block therefore plans
+# six points more with SMALL_CAPS, and a decode run plans what it did. The three pairs below were typed in from
+# runs of this file's fake engine against the driver that still gives the digests above. The test that says
+# what they stand for is
+# ``test_a_run_with_one_rank_differs_from_the_run_without_the_low_end_by_six_points``: it derives the rank file
+# from the file of the run without the low end, byte for byte, and holds every call against the calls of that
+# run.
+ONE_RANK_DIGESTS = {
+    **ONE_RANK_DIGESTS_WITHOUT_LOW_END,
+    ("seeded", "prefill", 1, 1): (
+        "c43aa4cc13f29e5d9bece7fc7411b83c5c031884e6bb806c4de50338d6220a2c",
+        "7f97c1bc9ce5fc721c925083d3dddde64a0e409c55be3fb67f86845e4f79f714",
+    ),
+    ("seeded", "agg", 1, 2): (
+        "547202b41c0ebecd341c0cd6b8ca1591c9b77f2e66803da03c1bf614ea5a6161",
+        "52908c815cc28b567cf72aa255b199c83fe9bf7fc4dadafa4629bbae5c9ed4d9",
+    ),
+    ("text", "prefill", 64, 1): (
+        "a5f97e540c5f241af923f2398fe5726f6b98bd5ce3566509b33b49eedffe1325",
+        "366e32ade9c2d0c42cb0ea06eef5cd0c866b5804d720f74b0c338dfc4dc4e4ad",
+    ),
+}
+
+
+def _plan_without_the_low_end(monkeypatch) -> None:
+    """Make the grid plan the prefill new-token axis without the two sides of its first step.
+
+    The low end of the axis is then 1 alone and the axis is the cut graph axis with 1 in front, as it was
+    before the two sides were added (``grid.prefill_new_token_axis``). The driver holds the grid module this
+    file holds, so the grid of a run and the grid a test plans beside it are both planned that way while the
+    patch lasts.
+    """
+    assert driver.grid is grid
+    monkeypatch.setattr(grid, "first_prefill_graph_tokens", lambda graph_sizes: None)
+
+
+def _one_rank_run(
+    tmp_path: Path, source: str, mode: str, page_size: int, processes: int
+) -> tuple[_FakeRun, list, bytes]:
+    """A complete run with one rank: the run, what it sent in every call and its rank file as it is on disk."""
+    start = _start_text if source == "text" else _start
+    fake = start(tmp_path, mode, page_size, processes=processes)
+    assert fake.run.status == "complete" and fake.settings.dp_size == 1
+
+    calls = [[call.prompts, call.rids, call.max_new_tokens] for call in fake.engine.calls]
+    written = fake.run.write()
+    assert written["paths"] == [str(fake.pod / "benchmark.json"), str(fake.pod / "benchmark_merged.json")]
+    # No response of the FAKE engine named a rank, and no batch line held token counts of ranks.
+    assert all(call.ranks == [0] * len(call.rids) for call in fake.engine.calls)
+    assert {line["global_num_tokens"] for line in fake.rank_lines(0)} == {None}
+    return fake, calls, Path(written["paths"][0]).read_bytes()
+
+
+def _one_rank_digests(calls: list, rank_file: bytes) -> tuple[str, str]:
+    return _digest(json.dumps(calls, separators=(",", ":")).encode()), _digest(rank_file)
+
+
+@pytest.mark.parametrize(
+    ("source", "mode", "page_size", "processes"), list(ONE_RANK_DIGESTS_WITHOUT_LOW_END), ids=lambda value: str(value)
+)
+def test_without_the_low_end_a_run_with_one_rank_sends_and_writes_what_it_did_before_attention_dp_ranks(
+    tmp_path, monkeypatch, source, mode, page_size, processes
+):
+    _plan_without_the_low_end(monkeypatch)
+    _fake, calls, rank_file = _one_rank_run(tmp_path, source, mode, page_size, processes)
+
+    assert _one_rank_digests(calls, rank_file) == ONE_RANK_DIGESTS_WITHOUT_LOW_END[(source, mode, page_size, processes)]
+
+
+@pytest.mark.parametrize(
+    ("source", "mode", "page_size", "processes"), list(ONE_RANK_DIGESTS), ids=lambda value: str(value)
+)
+def test_a_run_with_one_rank_sends_and_writes_what_is_pinned_for_the_grid_with_the_low_end(
+    tmp_path, source, mode, page_size, processes
+):
+    _fake, calls, rank_file = _one_rank_run(tmp_path, source, mode, page_size, processes)
+
+    assert _one_rank_digests(calls, rank_file) == ONE_RANK_DIGESTS[(source, mode, page_size, processes)]
+
+
+def _low_end_row(benchmark_id: int, batch: int, cached: int) -> dict:
+    """The row of a rank file for ``batch`` requests of two new tokens each, typed here key by key.
+
+    The time is the FAKE time of the one extend batch of the measured shot on rank 0.
+    """
+    point = {
+        "point_type": "prefill",
+        "benchmark_id": benchmark_id,
+        "total_prefill_tokens": 2 * batch,
+        "total_kv_read_tokens": cached * batch,
+        "batch_size": batch,
+        "sample_reasons": ["prefill_real_seed"] if cached else [],
+    }
+    fpm = {
+        "counter_id": benchmark_id,
+        "dp_rank": 0,
+        "wall_time": (FAKE_EXTEND_BASE_TICKS + 2 * batch) / TICKS_PER_SECOND,
+        "scheduled_requests": {
+            "num_prefill_requests": batch,
+            "sum_prefill_tokens": 2 * batch,
+            "sum_prefill_kv_tokens": cached * batch,
+            "num_decode_requests": 0,
+            "sum_decode_kv_tokens": 0,
+        },
+        "worker_id": FAKE_WORKER_ID,
+    }
+    return {"point": point, "kv_seed_regime": "real_prefix" if cached else "not_applicable", "fpms": [fpm]}
+
+
+def _one_rank_group(row: dict) -> dict:
+    """The iteration group that the rank file of a run with one rank holds beside a row, typed here key by key."""
+    (fpm,) = row["fpms"]
+    return {
+        "benchmark_id": row["point"]["benchmark_id"],
+        "point": row["point"],
+        "expected_dp_ranks": [0],
+        "complete": True,
+        "rank_results": [{"dp_rank": 0, "fpms": [fpm]}],
+        "wall_time": fpm["wall_time"],
+    }
+
+
+def _renumbered(entry: dict, benchmark_id: int) -> dict:
+    """A row or an iteration group of a rank file under another benchmark id, changed in every place that holds it."""
+    entry["point"]["benchmark_id"] = benchmark_id
+    if "benchmark_id" in entry:
+        entry["benchmark_id"] = benchmark_id
+    for holder in (entry, *entry.get("rank_results", ())):
+        for fpm in holder.get("fpms", ()):
+            fpm["counter_id"] = benchmark_id
+    return entry
+
+
+@pytest.mark.parametrize(
+    ("source", "mode", "page_size", "processes"),
+    [run for run in ONE_RANK_DIGESTS if run[1] != "decode"],
+    ids=lambda value: str(value),
+)
+def test_a_run_with_one_rank_differs_from_the_run_without_the_low_end_by_six_points(
+    tmp_path, monkeypatch, source, mode, page_size, processes
+):
+    """What stands behind the digests that the low end changed, shown on the two runs themselves."""
+    fake, _calls, rank_file = _one_rank_run(tmp_path / "with", source, mode, page_size, processes)
+    with monkeypatch.context() as patch:
+        _plan_without_the_low_end(patch)
+        old, _old_calls, old_file = _one_rank_run(tmp_path / "without", source, mode, page_size, processes)
+        old_points = old.built.points
+
+    # The six points, typed here: two requests and one request of two new tokens each, with the longest prefix,
+    # a middle one and none. A request of two new tokens can carry a prefix of up to I - 3 tokens in whole
+    # units of G: 425 tokens give 26 * 16 = 416 at page 1, and 809 give 12 * 64 = 768 at page 64. SMALL_CAPS
+    # keep the two ends and the middle of the prefixes 0, G, 2 G, 4 G and so on up to the longest.
+    longest, middle = {1: (416, 64), 64: (768, 256)}[page_size]
+    added = [(batch, 2, cached) for batch in (2, 1) for cached in (longest, middle, 0)]
+    shapes = [(point.batch_size, point.new_tokens, point.cached_tokens) for point in fake.built.points]
+    old_shapes = [(point.batch_size, point.new_tokens, point.cached_tokens) for point in old_points]
+    # They stand where the points of one new token stood, which follow them now with the same batch sizes and
+    # prefixes. Every other point is planned as it was, in the same order.
+    first = shapes.index(added[0])
+    assert shapes[first : first + 6] == added
+    assert shapes[first + 6 : first + 12] == [(batch, 1, cached) for batch, _new, cached in added]
+    assert shapes[:first] + shapes[first + 6 :] == old_shapes
+
+    # The rank file, derived from the file of the run without the low end: the rows and the groups of the six
+    # points go in, and the points after them count six higher.
+    derived = json.loads(old_file)
+    rows = [_low_end_row(first + 1 + index, batch, cached) for index, (batch, _new, cached) in enumerate(added)]
+    for name, entries in (("results", rows), ("iteration_groups", [_one_rank_group(row) for row in rows])):
+        before, after = derived[name][:first], derived[name][first:]
+        derived[name] = [
+            *before,
+            *entries,
+            *(_renumbered(entry, first + 7 + index) for index, entry in enumerate(after)),
+        ]
+    # The digest of a grid is SHA-256 over its numbered points in execution order, as compact JSON with sorted
+    # keys.
+    points = [row["point"] for row in derived["results"]]
+    derived["grid_digest"] = _digest(json.dumps(points, sort_keys=True, separators=(",", ":")).encode())
+    derived["coverage"].update(expected_points=len(points), completed_points=len(points))
+    # The content plan issued a seed prompt for every request with a prefix and, in each of the two shots, a
+    # shot of a slot for such a request and a prompt with a first token of its own for a request without a
+    # prefix. The run plans for those first tokens.
+    seeded = sum(batch for batch, _new, cached in added if cached)
+    unseeded = sum(batch for batch, _new, cached in added if not cached)
+    issued, need = derived["producer"]["content"]["issued"], derived["producer"]["first_token_need"]
+    issued["seed_prompts"] += seeded
+    issued["shots"] += 2 * seeded
+    issued["zero_cached_prompts"] += 2 * unseeded
+    need["zero_cached_prefill_prompts"] += 2 * unseeded
+    need["total"] += 2 * unseeded
+    # The FAKE time of the six points. The points before them stored every prefix, and a prompt is never found
+    # in the cache to its last token, so each request of a seed computes the last page of its prefix. A warm
+    # shot and a measured shot compute two tokens per request, and the FAKE engine takes longer for a warm shot.
+    ticks = 0
+    for batch, _new, cached in added:
+        if cached:
+            ticks += FAKE_EXTEND_BASE_TICKS + batch * page_size
+        ticks += 2 * (FAKE_EXTEND_BASE_TICKS + 2 * batch) + FAKE_WARM_SHOT_EXTRA_TICKS
+    derived["timing"]["benchmark_elapsed_seconds"] += ticks / TICKS_PER_SECOND
+    derived["timing"]["measured_iteration_seconds"] += sum(row["fpms"][0]["wall_time"] for row in rows)
+    assert json.loads(rank_file) == derived
+    # A rank file is the JSON text of its payload with the keys in the order they were written
+    # (sglbench_artifact.py), and every FAKE time is a whole number of ticks, so the sums above are exact: the
+    # derived file is the written one byte for byte.
+    assert json.dumps(derived, allow_nan=False).encode() == rank_file
+
+    # The calls. Those of the six points lie between the calls the run sent before: a seed for the four points
+    # with a prefix, and two shots for each of the six.
+    numbers = range(first + 1, first + 7)
+    kept = [call for call in fake.engine.calls if call.key[0] not in numbers]
+    assert len(fake.engine.calls) - len(kept) == 4 + 2 * 6
+    changed_shots = 0
+    for call, old_call in zip(kept, old.engine.calls, strict=True):
+        number, stage, attempt = call.key
+        old_number = number - 6 if number > first + 6 else number
+        assert (old_number, stage, attempt) == old_call.key
+        assert call.rids == [rid.replace(f"-p{old_number}-", f"-p{number}-") for rid in old_call.rids]
+        assert call.max_new_tokens == old_call.max_new_tokens
+        if first + 6 < number <= first + 12 and stage in ("warm", "meas"):
+            # A shot of a point of one new token. The six points took shots of its slots and prefix before it,
+            # or prompts without a prefix, so the prompt is the one it was up to the prefix and its one new
+            # token is another.
+            cached = shapes[number - 1][2]
+            for prompt, old_prompt in zip(call.prompts, old_call.prompts, strict=True):
+                assert len(prompt) == len(old_prompt) == cached + 1
+                assert prompt[:cached] == old_prompt[:cached] and prompt[cached] != old_prompt[cached]
+            changed_shots += 1
+        else:
+            assert call.prompts == old_call.prompts
+    assert changed_shots == 2 * 6
+    # The six points took the place of the points of one new token in the content of the run, whose numbers they
+    # have: each of their seeds is the seed that was sent under the number before, and each prompt of their
+    # shots is the prompt that was sent before and one token more.
+    for number in numbers:
+        for call, old_call in zip(fake.calls_of(number), old.calls_of(number), strict=True):
+            assert (call.key, call.rids, call.max_new_tokens) == (old_call.key, old_call.rids, 1)
+            more = 0 if call.key[1] == "seed" else 1
+            assert [prompt[: len(prompt) - more] for prompt in call.prompts] == old_call.prompts
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# What the KV pool takes from the generated prefill block
+# ---------------------------------------------------------------------------------------------------------------
+
+# The FAKE limits at page 1: I = 428, S = 1184. A request of n new tokens can carry a prefix up to 427 - n. Four
+# such requests must keep 4 * (k + n + 2) below 1184, so the pool ends their prefix at k + n <= 293; two requests
+# may reach 589, which the input limit ends first. The default caps plan batch 1, 2 and 4, or 3 where four
+# requests no longer fit a step; SMALL_CAPS plan batch 1 and 2. Typed here on its own. The new-token axis holds
+# 13 values: the low end 1 and 2, every FAKE graph size and the size plus one (4, 5, 8, 9, 16, 17, 32, 33, 64
+# and 65) and the chunk budget, 96. The two step budgets, 80 and 96 tokens, leave batch 1, 2 and 4 to the eight
+# values up to 17, batch 1, 2 and 3 to 32, batch 1 and 2 to 33 and batch 1 to 64, 65 and 96, which are
+# 8 * 3 + 3 + 2 + 3 = 32 pairs. The pool shortens the 8 pairs at batch 4 and the pair of n = 32 at batch 3, and
+# the longest batch of four, 4 * (425 + 2) = 1708 tokens, must stay below the pool.
+FAKE_POOL_CUT = grid.PoolCut(
+    pool_tokens=1184,
+    pairs=32,
+    dropped_pairs=0,
+    shortened_pairs=9,
+    whole_grid_pool_tokens=1709,
+    pool_sets_input_limit=False,
+)
+# The same when the low end of the new-token axis is 1 alone (``_plan_without_the_low_end``): the three pairs of
+# n = 2 are not planned, and the pool shortens the one at batch 4 among them. It is what the pool took before
+# the axis had the two sides of its first step.
+FAKE_POOL_CUT_WITHOUT_LOW_END = dataclasses.replace(FAKE_POOL_CUT, pairs=29, shortened_pairs=8)
+
+
+@pytest.mark.parametrize("mode", ["prefill", "agg"])
+def test_a_run_tells_what_the_kv_pool_takes_from_its_generated_prefill_block(tmp_path, mode):
+    fake = _start(tmp_path, mode, caps=grid.SampleCaps())
+
+    assert fake.run.status == "complete"
+    assert fake.run.prefill_pool_cut() == FAKE_POOL_CUT == grid.prefill_pool_cut(fake.limits, grid.SampleCaps())
+    # Asking changes nothing, and nothing of the answer is in the files.
+    written = fake.run.write()
+    assert fake.run.prefill_pool_cut() == FAKE_POOL_CUT
+    for path in written["paths"]:
+        assert "pool_cut" not in Path(path).read_text(encoding="utf-8")
+
+
+def test_a_run_with_two_ranks_tells_what_the_pool_of_one_rank_takes(tmp_path):
+    """The limits are those of one attention-DP rank, and so is the pool of the answer."""
+    fake = _start(tmp_path, "prefill", dp_size=2, caps=grid.SampleCaps())
+
+    assert fake.run.status == "complete" and fake.dp_size == 2
+    assert fake.run.prefill_pool_cut() == FAKE_POOL_CUT
+
+
+def test_without_the_low_end_a_run_tells_what_the_kv_pool_took_before(tmp_path, monkeypatch):
+    """The low end changes the answer by its own pairs and by nothing else."""
+    _plan_without_the_low_end(monkeypatch)
+    fake = _start(tmp_path, "prefill", caps=grid.SampleCaps())
+
+    assert fake.run.status == "complete"
+    assert not any(point.new_tokens == 2 for point in fake.built.points)
+    assert fake.run.prefill_pool_cut() == FAKE_POOL_CUT_WITHOUT_LOW_END
+
+
+def test_a_run_tells_nothing_about_a_pool_that_ends_no_axis_of_its_prefill_block(tmp_path):
+    # Before the grid exists.
+    assert _plan_only(tmp_path, "prefill", caps=grid.SampleCaps()).run.prefill_pool_cut() is None
+    # The same limits with caps that plan no batch above two.
+    small = _start(tmp_path / "small", "prefill")
+    assert small.run.status == "complete" and small.run.prefill_pool_cut() is None
+    # The default caps with the smallest pool that holds the whole grid.
+    roomy = _start(tmp_path / "roomy", "prefill", limits=_limits(1, max_total_num_tokens=1709), caps=grid.SampleCaps())
+    assert roomy.run.status == "complete" and roomy.run.prefill_pool_cut() is None
+    # A decode run: its block is not looked at.
+    decode = _start(tmp_path / "decode", "decode", caps=grid.SampleCaps())
+    assert decode.run.status == "complete" and decode.run.prefill_pool_cut() is None
+
+
+def test_a_run_with_a_points_manifest_tells_nothing_about_the_pool(tmp_path):
+    manifest = grid.parse_points_manifest(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "prefill": [{"batch_size": 4, "total_prefill_tokens": 16, "total_kv_read_tokens": 64}],
+                "decode": [],
+            }
+        )
+    )
+    fake = _start(tmp_path, "prefill", manifest=manifest, caps=grid.SampleCaps())
+
+    assert fake.run.status == "complete" and fake.built.source == "manifest"
+    assert grid.prefill_pool_cut(fake.limits, grid.SampleCaps()) == FAKE_POOL_CUT
+    assert fake.run.prefill_pool_cut() is None
+
+
+def test_a_run_whose_pool_leaves_no_prefill_point_fails_and_still_tells_what_the_pool_took(tmp_path):
+    # One request of one token needs 16 + 16 + 1 = 33 pool tokens at page 16, strictly below the pool.
+    limits = grid.Limits(16, 100, 32, 8, 512, 256)
+    fake = _start(tmp_path, "prefill", 16, limits=limits)
+
+    assert fake.run.status == "failed" and fake.built.missing_phases == ("prefill",)
+    cut = fake.run.prefill_pool_cut()
+    assert cut == grid.prefill_pool_cut(limits, SMALL_CAPS)
+    assert cut.dropped_pairs == cut.pairs > 0 and cut.shortened_pairs == 0
+
+
+def _execute_with_hook(fake: _FakeRun, hook) -> None:
+    low, high = fake.tokens
+    fake.run.execute(fake.engine, token_low=low, token_high=high, on_grid=hook)
+
+
+def test_the_grid_hook_is_called_once_when_the_grid_is_planned_and_before_any_request(tmp_path):
+    fake = _start(tmp_path, "prefill", caps=grid.SampleCaps(), execute=False)
+    seen = []
+
+    _execute_with_hook(fake, lambda: seen.append((fake.run.prefill_pool_cut(), len(fake.engine.calls))))
+
+    # The answer was there when the hook ran, and no request had been sent.
+    assert seen == [(FAKE_POOL_CUT, 0)]
+    assert fake.run.status == "complete" and len(fake.engine.calls) > 0
+
+
+def test_the_grid_hook_is_called_for_a_grid_that_misses_a_phase_and_not_when_no_grid_is_planned(tmp_path):
+    missing = _start(tmp_path / "missing", "prefill", 16, limits=grid.Limits(16, 100, 32, 8, 512, 256), execute=False)
+    seen = []
+    _execute_with_hook(missing, lambda: seen.append(missing.run.prefill_pool_cut()))
+    assert missing.run.status == "failed" and len(seen) == 1 and seen[0].dropped_pairs == seen[0].pairs
+
+    # A manifest point that does not fit: the grid cannot be planned, and the run is rejected before the hook.
+    bad = grid.parse_points_manifest(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "prefill": [{"batch_size": 4, "total_prefill_tokens": 16, "total_kv_read_tokens": 4000}],
+                "decode": [],
+            }
+        )
+    )
+    refused = _start(tmp_path / "refused", "prefill", manifest=bad, execute=False)
+    called = []
+    _execute_with_hook(refused, lambda: called.append(1))
+    assert refused.run.status == "failed" and refused.run.reason.startswith("rejected: ") and called == []
+    assert refused.run.prefill_pool_cut() is None
+
+
+def test_an_exception_of_the_grid_hook_is_a_failure_of_the_run(tmp_path):
+    fake = _start(tmp_path, "prefill", execute=False)
+
+    def hook():
+        raise RuntimeError("FAKE hook fault")
+
+    _execute_with_hook(fake, hook)
+
+    assert fake.run.status == "failed"
+    assert fake.run.reason == "internal_error: RuntimeError: FAKE hook fault"
+    assert fake.engine.calls == []

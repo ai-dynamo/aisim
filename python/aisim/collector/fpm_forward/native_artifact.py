@@ -876,24 +876,46 @@ def plan_is_moe(plan: object) -> bool | None:
 def _validate_sglang_moe_producer(cell: FPMCell, producer: object, path: Path) -> None:
     """Refuse an SGLang rank artifact whose pod did not run a MoE cell the way its plan describes it.
 
-    The rows of a cell take their labels from the plan: the parallel strategy, the tensor-parallel size and the
-    expert-parallel size are the cell's. The pod decides two things by itself (runtime/sglbench_launcher.py,
-    ``main``) and records them in the producer block: ``moe`` in ``_start_up_checks`` and ``tp_size`` in
-    ``_resolved_settings`` of that file, ``content`` in runtime/sglbench_driver.py, ``_own_producer_facts``:
+    The rows of a cell take their labels from the plan: the parallel strategy and the tensor-parallel,
+    data-parallel and expert-parallel sizes are the cell's. The pod decides two things by itself
+    (runtime/sglbench_launcher.py) and records them in the producer block: the sizes SGLang resolved
+    (``tp_size``, ``attn_dp_size`` and the ``moe`` block) are written by the launcher, ``content`` by
+    runtime/sglbench_driver.py, ``_own_producer_facts``:
 
     - the content. Without a content word the launcher sends dataset text only when the model config it loaded
       shows expert layers. A pod that finds none sends seeded token ids, whose routing to the experts is not
       that of text;
-    - the layout of the expert layers. The launcher accepts an expert-parallel size of 1 at any tensor-parallel
-      size, so a command that reached the pod without ``--ep-size`` runs every expert on every rank.
+    - the layout. Without DP attention the launcher accepts an expert-parallel size of 1 at any
+      tensor-parallel size, so a command that reached the pod without ``--ep-size`` runs every expert on every
+      rank. (Under DP attention the launcher requires ``ep_size == tp_size``.)
 
-    Either run completes and passes every other rule of this module. This rule holds them against the cell: the
-    content source must be dataset text, and the recorded tensor-parallel and expert-parallel sizes must be the
-    cell's. A pod that found no expert layers records no ``moe`` block and is refused here as well.
+    Each such run completes and passes every other rule of this module. This rule holds them against the cell:
+    the content source must be dataset text, and the three recorded sizes must be the ones SGLang resolves for
+    the cell. A pod that found no expert layers records no ``moe`` block and is refused here as well.
 
-    The two sizes are compared as they are for the cells planning admits for this backend today, which have one
-    data-parallel replica (planner.py, ``_require_sglang_launcher_cells``): SGLang's ``tp_size`` is then the
-    cell's ``tp`` and its ``ep_size`` the cell's ``moe_ep``. A cell with DP attention needs its own mapping.
+    The mapping, for the cells planning admits for this backend (planner.py,
+    ``_require_sglang_launcher_cells``). SGLang's ``tp_size`` counts every rank of the engine, so it is the
+    cell's ``tp`` times its ``dp``; its ``ep_size`` is the cell's ``moe_ep``; its ``attn_dp_size`` is the
+    cell's ``dp``. For the one-GPU cell and a TEP cell that is ``tp``, ``moe_ep`` and 1, and for a DEP cell of
+    D ranks it is D, D and D.
+
+    A pod that ran a DEP cell without ``--attn-dp-size``, or with the sizes of another GPU count, writes
+    another number of rank files and is refused before this rule, by the ``dp`` block rule of
+    ``validate_native_collection`` (``native DP metadata mismatch``). The third size is compared all the same,
+    so that the labels the launcher writes itself are not the only evidence: the ``dp`` block and the rank of
+    every forward-pass record are such labels, a pod that ran two tensor-parallel ranks under the labels of two
+    data-parallel ranks would pass every other rule, and ``attn_dp_size`` is what SGLang resolved.
+
+    A producer block without ``attn_dp_size`` counts as one rank: the launcher wrote no such key before it ran
+    DP attention, and a result file of that time is still the result of its one-GPU or TEP cell. For a DEP cell
+    such a file is refused, as it should be.
+
+    What ran (the collector README, "DEP cells", has the whole account): the mapping was read in SGLang's
+    source at v0.5.22 and v0.5.23 (``python/sglang/srt/runtime_context.py``, ``derive_attn_tp_size`` and
+    ``num_dp_ranks_of``). On 2026-11-18 this rule accepted the rank files of the DEP cells of two ranks that
+    the launcher wrote on H200 GPUs, the cells of a smoke grid at each release and the cells of the default
+    grid at v0.5.23, with the recorded sizes 2, 2 and 2. Its refusals have run in the tests only, on typed-in
+    files.
     """
     content = producer.get("content") if isinstance(producer, dict) else None
     source = content.get("source") if isinstance(content, dict) else None
@@ -903,14 +925,18 @@ def _validate_sglang_moe_producer(cell: FPMCell, producer: object, path: Path) -
             f"expected producer.content.source {_SGLANG_TEXT_CONTENT_SOURCE!r}, found {source!r}: {path}"
         )
     moe = producer.get("moe")
-    found = (producer.get("tp_size"), moe.get("ep_size") if isinstance(moe, dict) else None)
-    expected = (cell.topology.tp, cell.topology.moe_ep)
+    found = (
+        producer.get("tp_size"),
+        moe.get("ep_size") if isinstance(moe, dict) else None,
+        producer.get("attn_dp_size", 1),
+    )
+    expected = (cell.topology.tp * cell.topology.dp, cell.topology.moe_ep, cell.topology.dp)
     # ``type`` and not ``isinstance``: True equals 1, and a size is never a bool.
     if any(type(size) is not int for size in found) or found != expected:
         raise ValueError(
             "native SGLang rank artifact of a MoE plan did not run the layout of its cell: "
-            f"expected producer.tp_size {expected[0]} and producer.moe.ep_size {expected[1]}, "
-            f"found {found[0]!r} and {found[1]!r}: {path}"
+            f"expected producer.tp_size {expected[0]}, producer.moe.ep_size {expected[1]} and "
+            f"producer.attn_dp_size {expected[2]}, found {found[0]!r}, {found[1]!r} and {found[2]!r}: {path}"
         )
 
 

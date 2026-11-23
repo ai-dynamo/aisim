@@ -6,14 +6,16 @@
 
 """MoE cells of an SGLang self-benchmark collection, seen from the host.
 
-One packaged MoE model is planned with the TEP preset on one and two GPUs through the functions of the entry
-point, so its capability, the memory estimate of each topology and its backend policy are the ones a user
-gets. The cells are rendered by the real Generator and the real cell builder, a cluster double leaves the
-files of a launcher run, and the real validator, gate, row builder and table writer read them.
+One packaged MoE model is planned on one and two GPUs through the functions of the entry point, with the TEP
+preset or with the default preset, which also plans the DEP cell of two data-parallel ranks. Its capability,
+the memory estimate of each topology and its backend policy are therefore the ones a user gets. The cells are
+rendered by the real Generator and the real cell builder, a cluster double leaves the files of a launcher run,
+and the real validator, gate, row builder and table writer read them.
 
 No SGLang, no GPU and no cluster are involved, and a fixture counts every attempt to open a network
 connection. Every result file is a FAKE of ``test_fpm_sglbench_artifact.py``: its times were typed in and
-never measured, and the dataset it names was never read.
+never measured, and the dataset it names was never read. That holds for the two rank files of a DEP cell too:
+no launcher run with DP attention produced them.
 """
 
 from __future__ import annotations
@@ -74,14 +76,18 @@ FAKE_DATASET = {
 def _fake_producer(cell) -> dict:
     """The producer block of a text run of ``cell``, under the names the launcher and the driver write.
 
-    The host reads the release and, for a cell of a MoE plan, the content source and the two sizes
-    (``native_artifact._validate_sglang_moe_producer``). Every other value is FAKE and has no reader.
+    The host reads the release and, for a cell of a MoE plan, the content source and the three sizes
+    (``native_artifact._validate_sglang_moe_producer``). The sizes are the ones SGLang resolves for the cell:
+    its ``tp_size`` counts the ranks of every data-parallel rank. Every other value is FAKE and has no reader.
     """
-    return {
+    ranks = cell.topology.tp * cell.topology.dp
+    producer = {
         "sglang_version": POD_SGLANG_VERSION,
-        "tp_size": cell.topology.tp,
-        # One scheduler process per tensor-parallel rank.
-        "scheduler_processes": cell.topology.tp,
+        "tp_size": ranks,
+        "attn_dp_size": cell.topology.dp,
+        # One scheduler process per rank of the engine.
+        "scheduler_processes": ranks,
+        "staging": "one_batch_call" if cell.topology.dp == 1 else "balanced_batch_call",
         "expert_keys": {"num_experts": 128, "num_experts_per_tok": 8, "moe_intermediate_size": 768},
         "moe": {
             "ep_size": cell.topology.moe_ep,
@@ -102,6 +108,28 @@ def _fake_producer(cell) -> dict:
             },
         },
     }
+    if cell.topology.dp > 1:
+        producer["dp_attention"] = {
+            "local_control_broadcast": False,
+            "input_blocker": True,
+            "placement": "round_robin_checked",
+        }
+    return producer
+
+
+def _older_producer(cell, **sizes: int) -> dict:
+    """The producer block of the launcher before it could run DP attention: no ``attn_dp_size``.
+
+    Its ``staging`` is ``one_batch_call``, the one value that launcher wrote, and it has no ``dp_attention``.
+    ``sizes`` replace the two sizes such a launcher recorded.
+    """
+    producer = _fake_producer(cell)
+    for key in ("attn_dp_size", "dp_attention"):
+        producer.pop(key, None)
+    producer["staging"] = "one_batch_call"
+    producer["tp_size"] = sizes.get("tp_size", producer["tp_size"])
+    producer["moe"]["ep_size"] = sizes.get("ep_size", producer["moe"]["ep_size"])
+    return producer
 
 
 @pytest.fixture(autouse=True)
@@ -120,11 +148,16 @@ def _no_git_and_no_network(monkeypatch):
     assert attempts == []
 
 
-def _arguments(*extra: str, label: str = LABEL_WITH_TABLES) -> list[str]:
-    """What a user passes to ``python -m collector.fpm_forward`` for the MoE cells of one and two GPUs."""
+def _arguments(*extra: str, label: str = LABEL_WITH_TABLES, presets: tuple[str, ...] = ("tep",)) -> list[str]:
+    """What a user passes to ``python -m collector.fpm_forward`` for the MoE cells of one and two GPUs.
+
+    ``presets`` are the values of ``--fpm-parallel-presets``. Without one the option is left out and the
+    default preset applies, which plans the one-GPU cell, the DEP cell and the TEP cell.
+    """
     return [
         *("--backend", "sglang", "--model-path", MODEL, "--gpu", SYSTEM),
-        *("--fpm-max-gpus", "2", "--fpm-gpu-counts", "1", "2", "--fpm-parallel-presets", "tep"),
+        *("--fpm-max-gpus", "2", "--fpm-gpu-counts", "1", "2"),
+        *(("--fpm-parallel-presets", *presets) if presets else ()),
         *("--fpm-prefill-cudagraph-policy", "runtime"),
         *("--fpm-runtime-backend-version", POD_SGLANG_VERSION, "--fpm-backend-version", label),
         *("--generator-set", f"K8sConfig.k8s_image={FAKE_IMAGE}"),
@@ -132,9 +165,9 @@ def _arguments(*extra: str, label: str = LABEL_WITH_TABLES) -> list[str]:
     ]
 
 
-def _resolved(*extra: str, label: str = LABEL_WITH_TABLES):
+def _resolved(*extra: str, label: str = LABEL_WITH_TABLES, presets: tuple[str, ...] = ("tep",)):
     """The plan and the deployment inputs as the entry point resolves them (cli.py ``main``)."""
-    arguments = cli._parser().parse_args(_arguments(*extra, label=label))
+    arguments = cli._parser().parse_args(_arguments(*extra, label=label, presets=presets))
     case_plan = build_collection_case_plan(
         backend=arguments.backend,
         model_path=arguments.model_path,
@@ -151,18 +184,17 @@ def _cell(plan, phase: str, strategy: str):
     return cell
 
 
-def _launcher_files(cell) -> list[dict]:
-    """The rank artifacts a launcher run leaves for ``cell``: one data-parallel rank, whatever the TP size.
+def _launcher_files(cell, producer: dict | None = None) -> list[dict]:
+    """The rank artifacts a launcher run leaves for ``cell``: one per data-parallel rank, whatever the TP size.
 
     A decode artifact names the dataset in its kvwarm block, as a run with dataset text does. A prefill
-    artifact has no such block.
+    artifact has no such block. ``producer`` replaces the producer block of every rank.
     """
-    assert cell.topology.dp == 1
     phase = cell.workload_kind
-    keywords = {"producer": _fake_producer(cell)}
+    keywords = {"producer": _fake_producer(cell) if producer is None else producer}
     if phase == "decode":
         keywords["kvwarm_dataset"] = dict(FAKE_DATASET)
-    return _rank_artifacts(phase, _points(phase), dp=1, **keywords)
+    return _rank_artifacts(phase, _points(phase), dp=cell.topology.dp, **keywords)
 
 
 def _pod(root: Path, plan, cell) -> Path:
@@ -184,6 +216,18 @@ def _pod(root: Path, plan, cell) -> Path:
 def _collected(root: Path, plan, cell, payloads: list[dict]) -> dict:
     """Write ``payloads`` as the launcher does, into the pod folder of ``cell``. Returns the paths."""
     return artifact.write_artifacts(str(_pod(root, plan, cell) / "benchmark.json"), payloads)
+
+
+def _written_past_the_writer(root: Path, plan, cell, payloads: list[dict]) -> list[Path]:
+    """Write ``payloads`` under the names of the launcher's writer, which is not asked whether it would take them.
+
+    No merged file is written: the validator does not read one.
+    """
+    pod = _pod(root, plan, cell)
+    paths = [Path(artifact.rank_output_path(str(pod / "benchmark.json"), rank)) for rank in range(len(payloads))]
+    for rank_path, payload in zip(paths, payloads, strict=True):
+        artifact.atomic_write_json(str(rank_path), payload)
+    return paths
 
 
 def _validate(plan, cell, root: Path, **keywords):
@@ -271,19 +315,49 @@ def test_a_data_label_without_packaged_tables_leaves_the_estimate_unknown_and_th
     assert plan.sha256 != _resolved()[0].sha256
 
 
-def test_the_default_preset_of_the_moe_model_is_refused_with_the_preset_to_pass(monkeypatch, capsys):
+def test_the_default_preset_of_the_moe_model_plans_a_single_a_dep_and_a_tep_cell(monkeypatch, capsys):
     monkeypatch.setenv("COLLECTOR_MODEL_PATH", MODEL)
-    arguments = _arguments("--plan-only")
-    preset = arguments.index("--fpm-parallel-presets")
-    del arguments[preset : preset + 2]
+    arguments = _arguments("--plan-only", presets=())
+    assert "--fpm-parallel-presets" not in arguments
 
-    with pytest.raises(SystemExit) as refused:
-        cli.main(arguments)
+    assert cli.main(arguments) == 0
 
-    assert refused.value.code == 2
-    error = capsys.readouterr().err
-    assert "error: SGLang FPM collection does not support DP attention yet (topology {'tp': 1, 'pp': 1, " in error
-    assert "pass --fpm-parallel-presets tep to collect the tensor- and expert-parallel cells of a MoE model" in error
+    printed = json.loads(capsys.readouterr().out)
+    # Per phase: the one-GPU cell, then on two GPUs the DEP cell (one GPU and one expert-parallel rank per
+    # data-parallel rank) and the TEP cell.
+    per_phase = [
+        ("single", {"tp": 1, "pp": 1, "dp": 1, "moe_tp": 1, "moe_ep": 1, "cp": 1}),
+        ("dep", {"tp": 1, "pp": 1, "dp": 2, "moe_tp": 1, "moe_ep": 2, "cp": 1}),
+        ("tep", {"tp": 2, "pp": 1, "dp": 1, "moe_tp": 1, "moe_ep": 2, "cp": 1}),
+    ]
+    assert [(cell["workload_kind"], cell["parallel_strategy"], cell["topology"]) for cell in printed["cells"]] == [
+        (phase, strategy, topology) for phase in ("prefill", "decode") for strategy, topology in per_phase
+    ]
+    assert [(topology["strategy"], topology["dp"]) for topology in printed["topologies"]] == [
+        ("single", 1),
+        ("dep", 2),
+        ("tep", 1),
+    ]
+    # Memory admission estimated the three topologies for this backend and found each below the capacity of one
+    # GPU. A rank of either two-GPU cell holds half of the experts, so it needs less than the one-GPU cell.
+    admission = printed["topology_memory_admission"]
+    assert [(decision["topology"]["dp"], decision["disposition"]) for decision in admission] == [
+        (1, "admitted"),
+        (2, "admitted"),
+        (1, "admitted"),
+    ]
+    single, dep, tep = (decision["estimates"][0] for decision in admission)
+    for two_gpu_cell in (dep, tep):
+        assert 0 < two_gpu_cell["estimated_non_kv_bytes"] < single["estimated_non_kv_bytes"]
+    assert single["estimated_non_kv_bytes"] < single["gpu_capacity_bytes"]
+    assert (printed["counts"]["memory_rejected_topologies"], printed["counts"]["memory_unknown_topologies"]) == (0, 0)
+    identity = saved_plan_identity(printed)
+    assert (identity.backend, identity.sha256, len(identity.cells)) == ("sglang", printed["sha256"], 6)
+    # The one-GPU and the TEP cells are the cells of the plan with the TEP preset.
+    tep_plan, _overrides = _resolved()
+    assert {cell.cell_id for cell in tep_plan.cells} == {
+        cell["cell_id"] for cell in printed["cells"] if cell["parallel_strategy"] != "dep"
+    }
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -419,7 +493,7 @@ def test_a_tep_decode_result_without_an_eligible_kvwarm_block_is_refused(tmp_pat
 def test_the_files_of_one_data_parallel_rank_are_no_result_of_a_dep_cell(tmp_path):
     plan, _overrides = _resolved()
     tep = _cell(plan, "decode", "tep")
-    # The DEP cell of the same two GPUs, which planning refuses for this backend: two data-parallel ranks.
+    # The DEP cell of the same two GPUs, under the id of the TEP cell: two data-parallel ranks.
     dep = dataclasses.replace(
         tep, parallel_strategy="dep", topology=ParallelTopology(tp=1, pp=1, dp=2, moe_tp=1, moe_ep=2, cp=1)
     )
@@ -428,6 +502,130 @@ def test_the_files_of_one_data_parallel_rank_are_no_result_of_a_dep_cell(tmp_pat
     assert len(_validate(plan, tep, tmp_path).points) == len(_points("decode"))
     with pytest.raises(ValueError, match="native DP metadata mismatch"):
         _validate(plan, dep, tmp_path)
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_a_dep_result_of_two_ranks_is_accepted_and_gives_dep_rows_with_the_sizes_of_one_rank(tmp_path, phase):
+    plan, _overrides = _resolved(presets=())
+    cell = _cell(plan, phase, "dep")
+    assert cell.topology == ParallelTopology(tp=1, pp=1, dp=2, moe_tp=1, moe_ep=2, cp=1)
+    # The strategy for which the validator demands an eligible kvwarm block of a decode cell.
+    assert cell.parallel_strategy in KVWARM_STRATEGIES
+    payloads = _launcher_files(cell)
+    # One file per attention-DP rank. Each records the sizes SGLang resolves for the cell: both ranks in
+    # tp_size and ep_size, where the cell says tp 1 and dp 2.
+    assert [(payload["dp"]["rank"], payload["dp"]["size"]) for payload in payloads] == [(0, 2), (1, 2)]
+    for payload in payloads:
+        producer = payload["producer"]
+        assert (producer["tp_size"], producer["moe"]["ep_size"], producer["attn_dp_size"]) == (2, 2, 2)
+        assert producer["dp_attention"] == {
+            "local_control_broadcast": False,
+            "input_blocker": True,
+            "placement": "round_robin_checked",
+        }
+        assert producer["staging"] == "balanced_batch_call"
+    cell_dir = tmp_path / cell.cell_id
+
+    written = _collected(cell_dir, plan, cell, payloads)
+
+    # The names of the launcher's writer: rank 0 at the output path, rank 1 beside it, and the merged file.
+    assert [Path(name).name for name in written["rank_files"]] == ["benchmark.json", "benchmark_dp1.json"]
+    assert Path(written["merged_output_path"]).name == "benchmark_merged.json"
+    points = _points(phase)
+    collection = _validate(plan, cell, cell_dir)
+    assert collection.backend_version == POD_SGLANG_VERSION
+    assert [measurement.point for measurement in collection.points] == points
+    assert [measurement.kv_seed_regime for measurement in collection.points] == EXPECTED_REGIMES[phase]
+    # Each point has the time of both ranks, and each rank its own elapsed time.
+    assert [[rank for rank, _time in measurement.rank_wall_times] for measurement in collection.points] == [
+        [0, 1]
+    ] * len(points)
+    assert [rank for rank, _elapsed, _measured in collection.rank_timings] == [0, 1]
+    assert collection.kvwarm_meta == ({**EXPECTED_KVWARM, "dataset": FAKE_DATASET} if phase == "decode" else None)
+    # The gate accepts the same two rank files with their merged file.
+    gate = _gate(written["rank_files"], phase)
+    assert gate.returncode == GATE_ACCEPT, gate.stderr
+
+    rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+
+    assert len(rows) == len(points)
+    for row, point, measurement in zip(rows, points, collection.points, strict=True):
+        # The labels of the cell: DEP on two GPUs, one tensor-parallel rank in each of two data-parallel ranks.
+        assert (row["parallel_strategy"], row["tp"], row["pp"], row["dp"], row["moe_tp"], row["moe_ep"], row["cp"]) == (
+            "dep",
+            1,
+            1,
+            2,
+            1,
+            2,
+            1,
+        )
+        # The sizes of a row are those of ONE rank: the engine ran twice the batch and twice the tokens.
+        assert (row["workload_kind"], row["batch_size"]) == (phase, point["batch_size"])
+        assert (row["total_prefill_tokens"], row["total_kv_read_tokens"]) == (
+            point["total_prefill_tokens"],
+            point["total_kv_read_tokens"],
+        )
+        # The time of a row is the slower rank's. The FAKE times of the two ranks differ at every point.
+        times = [time for _rank, time in measurement.rank_wall_times]
+        assert min(times) < max(times)
+        assert row["latency_ms"] == max(times) * 1000.0
+        assert row["kv_seed_regime"] == ("real_kv" if phase == "decode" else "n/a")
+        assert (row["backend"], row["runtime_backend_version"], row["cell_id"]) == (
+            "sglang",
+            POD_SGLANG_VERSION,
+            cell.cell_id,
+        )
+        # No column says that the cell ran DP attention with the input blocker: that stays in the result file.
+        assert not [column for column in row if "attn" in column or "blocker" in column or "staging" in column]
+
+    # What the runner keeps in the checkpoint of the cell: the counts of the points and the two ranks.
+    summary = runner._runtime_collection_summary(cell, cell_dir / "raw", backend="sglang", is_moe=plan_is_moe(plan))
+    assert summary["measured_point_count"] == len(points)
+    timing = runner._runtime_timing_summary(cell_dir / "raw")
+    assert timing["runtime_rank_count"] == 2
+    # Every rank reports the sum of the slower rank's times, so the two files agree on it.
+    assert timing["measured_iteration_seconds"] == pytest.approx(
+        sum(max(time for _rank, time in measurement.rank_wall_times) for measurement in collection.points)
+    )
+
+
+def test_result_files_of_a_launcher_without_dp_attention_pass_for_their_cells_and_are_no_dep_result(tmp_path):
+    # A launcher of that time wrote no attention-DP size. Its files are still the results of its cells.
+    plan, _overrides = _resolved()
+    for phase in ("prefill", "decode"):
+        for strategy in ("single", "tep"):
+            cell = _cell(plan, phase, strategy)
+            cell_dir = tmp_path / cell.cell_id
+            payloads = _launcher_files(cell, _older_producer(cell))
+            assert "attn_dp_size" not in payloads[0]["producer"]
+            _collected(cell_dir, plan, cell, payloads)
+
+            assert len(_validate(plan, cell, cell_dir).points) == len(_points(phase))
+            rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+            assert {(row["parallel_strategy"], row["dp"]) for row in rows} == {(strategy, 1)}
+
+    # The DEP cell of the plan with the default preset. Two rank files with such a block are refused whatever
+    # two sizes the block holds: those SGLang resolves for the DEP cell, which are also those of the TEP cell
+    # of the same GPUs; those of the one-GPU cell; and the cell's own tp beside its moe_ep.
+    dep_plan, _overrides = _resolved(presets=())
+    for phase in ("prefill", "decode"):
+        dep = _cell(dep_plan, phase, "dep")
+        for name, sizes, found in (
+            ("as-recorded", {}, ("2", "2")),
+            ("one-rank", {"tp_size": 1, "ep_size": 1}, ("1", "1")),
+            ("the-cells-own-tp", {"tp_size": 1}, ("1", "2")),
+        ):
+            root = tmp_path / f"dep-{phase}-{name}"
+            payloads = _launcher_files(dep, _older_producer(dep, **sizes))
+            written = _collected(root, dep_plan, dep, payloads)
+
+            with pytest.raises(ValueError) as refused:
+                _validate(dep_plan, dep, root)
+
+            assert str(refused.value) == _dep_refusal(*found, "1") + written["rank_files"][0]
+            with pytest.raises(ValueError, match=re.escape(_dep_refusal(*found, "1"))):
+                aggregate_cell(dep_plan, dep, root, expected_attempt_id="attempt")
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -442,10 +640,12 @@ def _not_text(found: str) -> str:
     )
 
 
-def _not_the_layout(tp: int, ep: int, found_tp: str, found_ep: str) -> str:
+def _not_the_layout(tp: int, ep: int, found_tp: str, found_ep: str, *, dp: int = 1, found_dp: str = "1") -> str:
+    """The refusal of a layout. ``tp`` is SGLang's ``tp_size`` for the cell: every rank of the engine."""
     return (
         "native SGLang rank artifact of a MoE plan did not run the layout of its cell: "
-        f"expected producer.tp_size {tp} and producer.moe.ep_size {ep}, found {found_tp} and {found_ep}: "
+        f"expected producer.tp_size {tp}, producer.moe.ep_size {ep} and producer.attn_dp_size {dp}, "
+        f"found {found_tp}, {found_ep} and {found_dp}: "
     )
 
 
@@ -460,14 +660,21 @@ def _seeded_ids(producer: dict) -> None:
     producer["content"] = {"source": "seeded_token_ids", "seed": "0", "token_range": [1000, 2000], "issued": 7}
 
 
-def _sizes(tp_size: int, ep_size: int):
-    """The change that records these two sizes."""
+def _sizes(tp_size: int, ep_size: int, attn_dp_size: int | None = None):
+    """The change that records these sizes. Without ``attn_dp_size`` the recorded one stays."""
 
     def change(producer: dict) -> None:
         producer["tp_size"] = tp_size
         producer["moe"]["ep_size"] = ep_size
+        if attn_dp_size is not None:
+            producer["attn_dp_size"] = attn_dp_size
 
     return change
+
+
+def _dep_refusal(found_tp: str, found_ep: str, found_dp: str) -> str:
+    """The refusal of a layout for the DEP cell of two ranks, for which SGLang resolves 2, 2 and 2."""
+    return _not_the_layout(2, 2, found_tp, found_ep, dp=2, found_dp=found_dp)
 
 
 # name: (the strategy of the cell, the change to the producer block, the refusal)
@@ -519,6 +726,52 @@ DIFFERS_FROM_THE_CELL = {
     "a-bool": ("single", lambda producer: producer["moe"].update(ep_size=True), _not_the_layout(1, 1, "1", "True")),
     "a-float": ("tep", lambda producer: producer["moe"].update(ep_size=2.0), _not_the_layout(2, 2, "2", "2.0")),
     "a-string": ("tep", lambda producer: producer.update(tp_size="2"), _not_the_layout(2, 2, "'2'", "2")),
+    # The attention-DP size of a cell with one data-parallel rank must be 1. A pod of the TEP cell that ran DP
+    # attention ran another cell on the same GPUs.
+    "tep-run-with-dp-attention": (
+        "tep",
+        lambda producer: producer.update(attn_dp_size=2),
+        _not_the_layout(2, 2, "2", "2", found_dp="2"),
+    ),
+    "an-attention-dp-size-that-is-a-bool": (
+        "single",
+        lambda producer: producer.update(attn_dp_size=True),
+        _not_the_layout(1, 1, "1", "1", found_dp="True"),
+    ),
+    # Only a block without the key counts as one rank: a key without a size is no size.
+    "an-attention-dp-size-of-none": (
+        "tep",
+        lambda producer: producer.update(attn_dp_size=None),
+        _not_the_layout(2, 2, "2", "2", found_dp="None"),
+    ),
+    # The DEP cell of two ranks. SGLang's tp_size counts both ranks, so the sizes of the cell are 2, 2 and 2.
+    # The command reached the pod without --attn-dp-size: two tensor-parallel ranks of one scheduler group.
+    "dep-run-without-dp-attention": (
+        "dep",
+        lambda producer: producer.update(attn_dp_size=1),
+        _dep_refusal("2", "2", "1"),
+    ),
+    # A block without the key counts as one rank, so it is no result of a DEP cell.
+    "dep-without-an-attention-dp-size": (
+        "dep",
+        lambda producer: producer.pop("attn_dp_size"),
+        _dep_refusal("2", "2", "1"),
+    ),
+    "dep-without-the-expert-parallel-size": (
+        "dep",
+        lambda producer: producer["moe"].update(ep_size=1),
+        _dep_refusal("2", "1", "2"),
+    ),
+    # The sizes as vLLM writes them for the cell: one tensor-parallel rank in each data-parallel rank.
+    "dep-with-the-tensor-parallel-size-of-one-rank": (
+        "dep",
+        lambda producer: producer.update(tp_size=1),
+        _dep_refusal("1", "2", "2"),
+    ),
+    "dep-run-on-four-ranks": ("dep", _sizes(4, 4, 4), _dep_refusal("4", "4", "4")),
+    "dep-run-as-the-one-gpu-cell": ("dep", _sizes(1, 1, 1), _dep_refusal("1", "1", "1")),
+    "dep-with-attention-tp-inside-a-rank": ("dep", _sizes(4, 4, 2), _dep_refusal("4", "4", "2")),
+    "dep-with-a-float": ("dep", lambda producer: producer.update(attn_dp_size=2.0), _dep_refusal("2", "2", "2.0")),
 }
 
 
@@ -526,13 +779,17 @@ DIFFERS_FROM_THE_CELL = {
 @pytest.mark.parametrize("name", list(DIFFERS_FROM_THE_CELL))
 def test_a_moe_result_that_differs_from_its_cell_is_refused(tmp_path, phase, name):
     strategy, change, message = DIFFERS_FROM_THE_CELL[name]
-    plan, _overrides = _resolved()
+    # The DEP cell is a cell of the plan with the default preset.
+    plan, _overrides = _resolved(presets=()) if strategy == "dep" else _resolved()
     assert plan_is_moe(plan) is True
     cell = _cell(plan, phase, strategy)
-    (payload,) = _launcher_files(cell)
-    change(payload["producer"])
+    # One file per data-parallel rank, each with the same change.
+    payloads = _launcher_files(cell)
+    assert len(payloads) == cell.topology.dp
+    for payload in payloads:
+        change(payload["producer"])
     # Written past the launcher's own writer, which is not asked whether it would take the block.
-    artifact.atomic_write_json(str(_pod(tmp_path, plan, cell) / "benchmark.json"), payload)
+    _written_past_the_writer(tmp_path, plan, cell, payloads)
     refusal = "^" + re.escape(message)
 
     with pytest.raises(ValueError, match=refusal):
@@ -566,21 +823,29 @@ def test_the_comparison_names_the_file_it_refuses(tmp_path):
     assert str(refused.value) == _not_the_layout(2, 2, "2", "1") + str(path)
 
 
+# What the file of one rank of a DEP cell says differently from the file of the other rank.
+ONE_RANK_DIFFERS = {
+    "expert-parallel-size": (lambda producer: producer["moe"].update(ep_size=1), _dep_refusal("2", "1", "2")),
+    "attention-dp-size": (lambda producer: producer.update(attn_dp_size=1), _dep_refusal("2", "2", "1")),
+    "no-attention-dp-size": (lambda producer: producer.pop("attn_dp_size"), _dep_refusal("2", "2", "1")),
+    "tensor-parallel-size": (lambda producer: producer.update(tp_size=1), _dep_refusal("1", "2", "2")),
+}
+
+
 @pytest.mark.parametrize("faulty_rank", [0, 1])
-def test_every_rank_file_is_held_against_the_cell(tmp_path, faulty_rank):
-    plan, _overrides = _resolved()
-    tep = _cell(plan, "prefill", "tep")
-    # A cell of two data-parallel ranks, which planning refuses for this backend: the only way to two rank files.
-    cell = dataclasses.replace(tep, topology=dataclasses.replace(tep.topology, dp=2))
-    payloads = _rank_artifacts("prefill", _points("prefill"), dp=2, producer=_fake_producer(cell))
-    # The file of one rank says another expert-parallel size than the file of the other.
-    payloads[faulty_rank]["producer"]["moe"]["ep_size"] = 1
+@pytest.mark.parametrize("name", list(ONE_RANK_DIFFERS))
+def test_every_rank_file_is_held_against_the_cell(tmp_path, name, faulty_rank):
+    change, message = ONE_RANK_DIFFERS[name]
+    plan, _overrides = _resolved(presets=())
+    cell = _cell(plan, "prefill", "dep")
+    payloads = _launcher_files(cell)
+    change(payloads[faulty_rank]["producer"])
     written = _collected(tmp_path, plan, cell, payloads)
 
     with pytest.raises(ValueError) as refused:
         _validate(plan, cell, tmp_path)
 
-    assert str(refused.value) == _not_the_layout(2, 2, "2", "1") + written["rank_files"][faulty_rank]
+    assert str(refused.value) == message + written["rank_files"][faulty_rank]
     assert len(_validate(plan, cell, tmp_path, expected_moe=None).points) == len(_points("prefill"))
 
 
@@ -746,6 +1011,150 @@ def test_a_moe_campaign_renders_the_expert_parallel_size_and_publishes_single_an
     assert {row["model_path"] for row in rows} == {MODEL}
     # The table has no column for the content of the prompts.
     assert not [name for name in published.schema.names if "dataset" in name or "content" in name]
+
+
+def test_a_campaign_of_the_default_preset_renders_the_attention_dp_size_and_publishes_dep_rows(tmp_path, monkeypatch):
+    plan, generator_overrides = _resolved(presets=())
+    assert [(cell.workload_kind, cell.parallel_strategy) for cell in plan.cells] == [
+        (phase, strategy) for phase in ("prefill", "decode") for strategy in ("single", "dep", "tep")
+    ]
+    monkeypatch.setattr(runner, "KubernetesCellRunner", _fake_cluster(plan))
+
+    errors = runner.run_collection(
+        plan,
+        generator_overrides=generator_overrides,
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+        artifact_root=str(tmp_path / "artifacts"),
+        resume=False,
+        retry_failed=False,
+        database_root=str(tmp_path / "systems"),
+    )
+
+    assert errors == []
+    # Each cell was rendered by the Generator and the cell builder. A DEP cell carries the three sizes SGLang
+    # takes for it, and its pod left one rank file per data-parallel rank and the merged file.
+    root = tmp_path / "artifacts" / plan.sha256[:16]
+    expected_sizes = {
+        "single": ["--tp-size", "1"],
+        "tep": ["--tp-size", "2", "--ep-size", "2"],
+        "dep": ["--tp-size", "2", "--ep-size", "2", "--attn-dp-size", "2"],
+    }
+    for cell in plan.cells:
+        cell_dir = root / "cells" / cell.cell_id
+        (line,) = [
+            line for line in (cell_dir / "run.sh").read_text().splitlines() if line.startswith("engine_command=(")
+        ]
+        command = shlex.split(line[len("engine_command=(") : -1])
+        assert command[:2] == ["python3", "/tmp/fpm-bench/sglbench_launcher.py"]
+        assert (
+            command[command.index("--tp-size") : command.index("--kv-cache-dtype")]
+            == (expected_sizes[cell.parallel_strategy])
+        )
+        results = sorted(path.name for path in (cell_dir / "raw" / "pod-0").glob("benchmark*.json"))
+        if cell.parallel_strategy == "dep":
+            assert results == ["benchmark.json", "benchmark_dp1.json", "benchmark_merged.json"]
+        else:
+            assert results == ["benchmark.json", "benchmark_merged.json"]
+    # Every cell passed. The record of a cell counts its rank files.
+    checkpoint = json.loads((tmp_path / "checkpoints" / "fpm_forward.json").read_text())
+    assert {record["status"] for record in checkpoint["cells"].values()} == {"passed"}
+    assert {cell.parallel_strategy: checkpoint["cells"][cell.cell_id]["runtime_rank_count"] for cell in plan.cells} == {
+        "single": 1,
+        "tep": 1,
+        "dep": 2,
+    }
+    assert checkpoint["database"]["status"] == "passed"
+
+    # The table holds the rows of the six cells with their labels: a DEP row says tp 1 and dp 2.
+    table = tmp_path / "systems" / SYSTEM / "sglang" / LABEL_WITH_TABLES
+    rows = pq.read_table(table / "fpm_forward_perf.parquet").to_pylist()
+    assert len(rows) == 3 * (len(_points("prefill")) + len(_points("decode")))
+    labels = collections.Counter(
+        (
+            row["workload_kind"],
+            row["parallel_strategy"],
+            row["tp"],
+            row["dp"],
+            row["moe_tp"],
+            row["moe_ep"],
+            row["kv_seed_regime"],
+        )
+        for row in rows
+    )
+    assert labels == {
+        ("prefill", "single", 1, 1, 1, 1, "n/a"): len(_points("prefill")),
+        ("prefill", "dep", 1, 2, 1, 2, "n/a"): len(_points("prefill")),
+        ("prefill", "tep", 2, 1, 1, 2, "n/a"): len(_points("prefill")),
+        ("decode", "single", 1, 1, 1, 1, "real_kv"): len(_points("decode")),
+        ("decode", "dep", 1, 2, 1, 2, "real_kv"): len(_points("decode")),
+        ("decode", "tep", 2, 1, 1, 2, "real_kv"): len(_points("decode")),
+    }
+    # A DEP row carries the batch of one rank, as the points of the FAKE launcher run name it.
+    dep_decode = sorted(
+        (row for row in rows if (row["workload_kind"], row["parallel_strategy"]) == ("decode", "dep")),
+        key=lambda row: row["total_kv_read_tokens"],
+    )
+    assert [(row["batch_size"], row["total_kv_read_tokens"]) for row in dep_decode] == sorted(
+        ((point["batch_size"], point["total_kv_read_tokens"]) for point in _points("decode")),
+        key=lambda sizes: sizes[1],
+    )
+
+    # A resume reads the two rank files of a DEP cell again and takes them without a rerun.
+    dep = _cell(plan, "decode", "dep")
+    attempt_id = checkpoint["cells"][dep.cell_id]["attempt_id"]
+    checkpoint["cells"][dep.cell_id] = {"status": "interrupted", "attempt_id": attempt_id}
+    del checkpoint["database"]
+    (tmp_path / "checkpoints" / "fpm_forward.json").write_text(json.dumps(checkpoint))
+    monkeypatch.setattr(runner, "_render_cell", lambda *_a, **_k: pytest.fail("a resume ran a cell again"))
+
+    assert (
+        runner.run_collection(
+            plan,
+            generator_overrides=generator_overrides,
+            checkpoint_dir=str(tmp_path / "checkpoints"),
+            artifact_root=str(tmp_path / "artifacts"),
+            resume=True,
+            retry_failed=False,
+            database_root=str(tmp_path / "systems"),
+        )
+        == []
+    )
+
+    resumed = json.loads((tmp_path / "checkpoints" / "fpm_forward.json").read_text())
+    assert resumed["cells"][dep.cell_id]["status"] == "passed"
+    assert resumed["cells"][dep.cell_id]["artifact_recovery"]["original_status"] == "interrupted"
+    assert resumed["cells"][dep.cell_id]["runtime_rank_count"] == 2
+
+
+def test_a_campaign_whose_dep_pod_ran_without_dp_attention_fails_that_cell(tmp_path, monkeypatch):
+    plan, generator_overrides = _resolved(presets=())
+    # The pod of the DEP decode cell recorded one attention-DP rank. A launcher writes one rank file per rank
+    # it ran, so only a faulty launcher leaves two files with this block; the rule refuses them all the same.
+    faulty = _cell(plan, "decode", "dep")
+    without_dp_attention = {faulty.cell_id: lambda producer: producer.update(attn_dp_size=1)}
+    monkeypatch.setattr(runner, "KubernetesCellRunner", _fake_cluster(plan, without_dp_attention))
+
+    errors = runner.run_collection(
+        plan,
+        generator_overrides=generator_overrides,
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+        artifact_root=str(tmp_path / "artifacts"),
+        resume=False,
+        retry_failed=False,
+        database_root=str(tmp_path / "systems"),
+    )
+
+    result = tmp_path / "artifacts" / plan.sha256[:16] / "cells" / faulty.cell_id / "raw" / "pod-0" / "benchmark.json"
+    assert [(error["cell_id"], error["error_type"], error["error_message"]) for error in errors] == [
+        (faulty.cell_id, "ValueError", _dep_refusal("2", "2", "1") + str(result))
+    ]
+    checkpoint = json.loads((tmp_path / "checkpoints" / "fpm_forward.json").read_text())
+    assert {cell_id: record["status"] for cell_id, record in checkpoint["cells"].items()} == {
+        cell.cell_id: "failed" if cell is faulty else "passed" for cell in plan.cells
+    }
+    # No table is written for a campaign with a failed cell.
+    assert "database" not in checkpoint
+    assert not (tmp_path / "systems").exists()
 
 
 def test_a_campaign_whose_pod_sent_seeded_ids_for_a_moe_cell_fails_that_cell_and_publishes_nothing(

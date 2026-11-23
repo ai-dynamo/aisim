@@ -20,25 +20,31 @@ One simulated run goes through the three pod modules and then through AISim's tw
     validator          collector.fpm_forward.native_artifact.validate_native_collection
     gate               the Python text inside check_result_files() of runtime/fpm_exec.sh
 
-One test goes past the two checkers: it publishes a planned grid with AISim's own Python path
-(``aggregate_cell``, then ``write_formal_database``) and reads the table back through AISim's compiled reader.
+Two tests go past the two checkers: they publish a planned grid with AISim's own Python path
+(``aggregate_cell``, then ``write_formal_database``) and read the table back through AISim's compiled reader.
 One test of partial and failed runs does without them: both reject such an artifact on its envelope, so what
 the file carries beyond the envelope is compared with the complete run of the same grid.
 
 Everything that stands in for an engine is FAKE and is named so:
 
 - ``_FakeEngine`` is one ``PageCacheModel`` per attention-DP rank (the model of SGLang's prefix cache written
-  in ``test_fpm_sglbench_content.py``). Its cached-token counts are model results, not measurements.
+  in ``test_fpm_sglbench_content.py``) and a FAKE round robin that deals the requests of a call to the ranks
+  in turn. Its cached-token counts are model results, not measurements.
 - Every time value that goes into an artifact is FAKE. It comes from ``_fake_extend_seconds``,
-  ``_fake_decode_step_seconds``, ``_fake_reader_seconds``, ``_FakeClock`` or a ``FAKE_*`` constant, or it is
-  typed into the pod script, which cannot import this file. These values were typed in to exercise the
-  arithmetic and were never measured. The artifacts say so in ``producer``.
+  ``_fake_decode_step_seconds``, ``_fake_reader_seconds``, ``_fake_step_seconds``, ``_FakeClock`` or a
+  ``FAKE_*`` constant, or it is typed into the pod script, which cannot import this file. These values were
+  typed in to exercise the arithmetic and were never measured. The artifacts say so in ``producer``.
+- The rule by which ``_fake_step_seconds`` makes a prefill batch slow is SGLang's rule for running a batch
+  without a prefill graph, restated in ``_fake_runs_with_a_prefill_graph``. No engine ran it here.
 - ``_simulate_run`` is the simulated driver: test code in the place of the code that drives an engine. For a
   prefill point it sends the fake engine a seed (when the point has cached tokens), a warm shot and the
-  measured shot; for a decode point a seed and the run. A point that fails a validity check is staged once
-  more and ends the run when it fails again. The soft deadline is looked at between two points. Three of
-  these steps follow Dynamo's vLLM self-benchmark (``instrumented_scheduler.py`` at the revision in the header
-  of this file): the order seed, warm shot, measured shot of a cached prefill point
+  measured shot; for a decode point a seed and the run. Each of them is ONE call for all attention-DP ranks,
+  as the driver sends it: the prompts of every rank, ordered slot by slot and rank inside, with request ids
+  that carry the rank. The call names no rank; the fake engine places the requests and says where each ran,
+  and the simulated driver holds that against its plan. A point that fails a validity check is staged once
+  more, on all ranks, and ends the run when it fails again. The soft deadline is looked at between two
+  points. Three of these steps follow Dynamo's vLLM self-benchmark (``instrumented_scheduler.py`` at the
+  revision in the header of this file): the order seed, warm shot, measured shot of a cached prefill point
   (``_bench_realseed_stage_point``, ``_bench_realseed_pending_step``), the one re-stage of such a point after
   its measured shot missed the cache, and the deadline check before the next point
   (``_bench_stop_at_timeout_boundary``).
@@ -69,6 +75,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -172,9 +179,12 @@ def _small_limits(page_size: int, **overrides) -> grid.Limits:
 
 
 class _FakeEngine:
-    """Stands in for SGLang: one prefix-cache model per attention-DP rank, and nothing else.
+    """Stands in for SGLang: one prefix-cache model per attention-DP rank and a FAKE round robin.
 
-    A call is one batch: every request of the call is matched against the cache before any of them is stored.
+    A call is one batch: every request of the call is matched against the cache of its rank before any of them
+    is stored. A request names no rank. The fake deals the requests of a call to the ranks in turn, from where
+    the call before left off, as SGLang's DP controller deals requests that name none, and it says in its
+    answer where each request ran. With one rank every request runs on rank 0.
     """
 
     def __init__(self, page_size: int, dp_size: int) -> None:
@@ -185,15 +195,18 @@ class _FakeEngine:
         self.prompt_token_ids: set[int] = set()  # every token id of every prompt ever submitted
         # FAKE model output. Real output is vocabulary tokens, so the ids are drawn inside the plan's range.
         self._fake_output = random.Random(20261114)
+        self._next_rank = 0  # FAKE round robin: the rank the next request goes to
 
-    def generate(self, rank: int, request_ids: list[str], prompts: list[list[int]], output_tokens: int) -> list[int]:
-        """Submit one batch call to one rank; return the cached-token count of each request."""
+    def generate(self, request_ids: list[str], prompts: list[list[int]], output_tokens: int) -> list[tuple[int, int]]:
+        """Submit one batch call; return, for each request, the rank it ran on and its cached-token count."""
         assert len(request_ids) == len(prompts)
         self.request_ids.extend(request_ids)
         self.prompt_token_ids.update(token for prompt in prompts for token in prompt)
-        cache = self.caches[rank]
-        cached = [cache.cached(prompt) for prompt in prompts]
-        for prompt in prompts:
+        ranks = [(self._next_rank + index) % self.dp_size for index in range(len(prompts))]
+        self._next_rank = (self._next_rank + len(prompts)) % self.dp_size
+        cached = [self.caches[rank].cached(prompt) for rank, prompt in zip(ranks, prompts, strict=True)]
+        for rank, prompt in zip(ranks, prompts, strict=True):
+            cache = self.caches[rank]
             if output_tokens == grid.PREFILL_OUTPUT_TOKENS:
                 cache.finish_prefill(prompt)
             else:
@@ -201,7 +214,7 @@ class _FakeEngine:
                 # All but the last generated token have KV and reach the cache.
                 generated = [self._fake_output.randrange(TOKEN_LOW, TOKEN_HIGH) for _ in range(output_tokens - 1)]
                 cache.finish_decode(prompt, generated)
-        return cached
+        return list(zip(ranks, cached, strict=True))
 
     def fake_eviction(self) -> None:
         """FAKE fault: the engine needed room and dropped every unlocked cache entry, on every rank."""
@@ -250,6 +263,39 @@ def _fake_reader_seconds(point: dict) -> float:
     No two points of one phase share a value, so a value the reader hands back can only be the point's own row.
     """
     return 0.001 * point["benchmark_id"]
+
+
+# FAKE times, in seconds, of the reader test whose table has a step: a prefill batch that runs without a graph
+# and one that runs with a graph. They were typed in near what the docstring of ``prefill_new_token_axis`` in
+# sglbench_grid.py reports for one new token and for four on H200; nothing was measured here.
+FAKE_NO_GRAPH_SECONDS = 0.040
+FAKE_GRAPH_SECONDS = 0.005
+
+
+def _fake_runs_with_a_prefill_graph(total_new_tokens: int, graph_sizes: tuple[int, ...]) -> bool:
+    """SGLang's rule for the new tokens of one prefill batch, restated here without the grid module.
+
+    The batch is padded to the smallest captured size that holds its new tokens and runs with that graph only
+    when the size is at most twice those tokens; a batch above the largest size runs without a graph
+    (``_pad_to_bucket`` in python/sglang/srt/model_executor/runner/base_cuda_graph_runner.py, and
+    ``can_replay_locally`` with ``_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR = 2`` in prefill_cuda_graph_runner.py
+    beside it; these statements are the same at v0.5.22 and v0.5.23). The other conditions of
+    ``can_replay_locally``, which differ between the two, are left out.
+    """
+    holding = [size for size in graph_sizes if size >= total_new_tokens]
+    return bool(holding) and min(holding) <= 2 * total_new_tokens
+
+
+def _fake_step_seconds(point: dict, graph_sizes: tuple[int, ...]) -> float:
+    """FAKE time of a point in the reader test of the first step: slow without a prefill graph, fast with one.
+
+    A fast time grows by one microsecond with each new token of the batch, so two fast rows of different new
+    tokens differ and an answer between them can be told from both. Every decode point gets the fast time.
+    """
+    total_new_tokens = point["total_prefill_tokens"]
+    if point["point_type"] == "prefill" and not _fake_runs_with_a_prefill_graph(total_new_tokens, graph_sizes):
+        return FAKE_NO_GRAPH_SECONDS
+    return FAKE_GRAPH_SECONDS + 1e-6 * total_new_tokens
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -337,46 +383,75 @@ def _request_ids(point: grid.Point, stage: str, attempt: int, rank: int) -> list
     ]
 
 
+def _balanced(per_rank: list[list]) -> list:
+    """The items of every rank as one call: slot by slot and rank inside, so item ``i`` is of rank ``i mod D``."""
+    return [per_rank[rank][slot] for slot in range(len(per_rank[0])) for rank in range(len(per_rank))]
+
+
+def _send_to_every_rank(
+    engine: _FakeEngine, request_ids: list[list[str]], prompts: list[list[list[int]]], output_tokens: int
+) -> list[list[int]]:
+    """Send the requests of every rank as one balanced call; return the cached-token counts rank by rank.
+
+    ``request_ids`` and ``prompts`` hold one list per rank. The call names no rank, so the simulated driver
+    checks, as the driver does, that every request ran on the rank it was planned for.
+    """
+    size = engine.dp_size
+    answers = engine.generate(_balanced(request_ids), _balanced(prompts), output_tokens)
+    assert [ran_on for ran_on, _count in answers] == [index % size for index in range(len(answers))]
+    return [[count for _ran_on, count in answers[rank::size]] for rank in range(size)]
+
+
 def _stage_point(
     engine: _FakeEngine, plan: content.ContentPlan, point: grid.Point, attempt: int, evict: bool, observed: list
 ) -> str | None:
     """Stage and run one attempt of one point on every rank; return the failed check's reason, or ``None``.
 
     Prefill: seed (when k > 0), warm shot, measured shot. Decode: seed, measured run with the same prompts.
-    ``evict`` makes the fake engine drop its cache just before the measured call of this attempt.
+    Each is one call for all ranks. ``evict`` makes the fake engine drop its cache just before the measured
+    call of this attempt.
     """
     page = engine.page_size
+    ranks = range(engine.dp_size)
     batch, new, cached_or_context = point.batch_size, point.new_tokens, point.cached_tokens
     expected_cached = grid.expected_cached_tokens(point.phase, cached_or_context, page)
     expected_extend = grid.expected_extend_tokens(point.phase, new, cached_or_context, page)
-    reason = None
-    for rank in range(engine.dp_size):
-        timed = []
-        if point.phase == grid.PREFILL:
-            if cached_or_context > 0:
-                seeds = [plan.prefill_seed_prompt(rank, slot, cached_or_context) for slot in range(batch)]
-                engine.generate(rank, _request_ids(point, "seed", attempt, rank), seeds, grid.PREFILL_OUTPUT_TOKENS)
-            for stage in ("warm", "meas"):
-                if evict and stage == "meas":
-                    engine.fake_eviction()
-                prompts = [plan.prefill_prompt(rank, slot, cached_or_context, new) for slot in range(batch)]
-                counts = engine.generate(
-                    rank, _request_ids(point, stage, attempt, rank), prompts, grid.PREFILL_OUTPUT_TOKENS
-                )
-                timed.append((stage, prompts, counts))
-        else:
-            prompts = [plan.decode_prompt(rank, slot, cached_or_context) for slot in range(batch)]
-            engine.generate(rank, _request_ids(point, "seed", attempt, rank), prompts, grid.PREFILL_OUTPUT_TOKENS)
-            if evict:
+
+    def send(stage: str, prompts: list[list[list[int]]], output_tokens: int) -> list[list[int]]:
+        request_ids = [_request_ids(point, stage, attempt, rank) for rank in ranks]
+        return _send_to_every_rank(engine, request_ids, prompts, output_tokens)
+
+    # What was sent in the timed calls and what the engine reported for it, rank by rank.
+    timed: list[list] = [[] for _rank in ranks]
+    if point.phase == grid.PREFILL:
+        if cached_or_context > 0:
+            seeds = [
+                [plan.prefill_seed_prompt(rank, slot, cached_or_context) for slot in range(batch)] for rank in ranks
+            ]
+            send("seed", seeds, grid.PREFILL_OUTPUT_TOKENS)
+        for stage in ("warm", "meas"):
+            if evict and stage == "meas":
                 engine.fake_eviction()
-            run_prompts = [plan.decode_prompt(rank, slot, cached_or_context) for slot in range(batch)]
-            assert run_prompts == prompts  # the seed and the run use the same prompt
-            counts = engine.generate(
-                rank, _request_ids(point, "run", attempt, rank), prompts, grid.DECODE_OUTPUT_TOKENS
-            )
-            timed.append(("run", prompts, counts))
-        # The driver's validity checks, on what the engine reported for each timed request.
-        for stage, prompts, counts in timed:
+            prompts = [
+                [plan.prefill_prompt(rank, slot, cached_or_context, new) for slot in range(batch)] for rank in ranks
+            ]
+            counts = send(stage, prompts, grid.PREFILL_OUTPUT_TOKENS)
+            for rank in ranks:
+                timed[rank].append((stage, prompts[rank], counts[rank]))
+    else:
+        prompts = [[plan.decode_prompt(rank, slot, cached_or_context) for slot in range(batch)] for rank in ranks]
+        send("seed", prompts, grid.PREFILL_OUTPUT_TOKENS)
+        if evict:
+            engine.fake_eviction()
+        run_prompts = [[plan.decode_prompt(rank, slot, cached_or_context) for slot in range(batch)] for rank in ranks]
+        assert run_prompts == prompts  # the seed and the run use the same prompt
+        counts = send("run", prompts, grid.DECODE_OUTPUT_TOKENS)
+        for rank in ranks:
+            timed[rank].append(("run", prompts[rank], counts[rank]))
+    reason = None
+    for rank in ranks:
+        # The driver's validity checks, on what the engine reported for each timed request of the rank.
+        for stage, prompts, counts in timed[rank]:
             for slot, (prompt, count) in enumerate(zip(prompts, counts, strict=True)):
                 observed.append((point.benchmark_id, stage, attempt, rank, slot, count, len(prompt) - count))
                 if len(prompt) != expected_cached + expected_extend:
@@ -453,10 +528,10 @@ def _simulate_run(
     evictions = fake_evictions or {}
 
     # Global warm-up: one prompt per rank that belongs to no point (benchmark id 0) and finds nothing cached.
-    for rank in range(dp_size):
-        warm_up = plan.free_prompt(rank, WARMUP_PROMPT_TOKENS)
-        rid = content.request_id(FAKE_RUN_ID, 0, "free", 0, rank, 0)
-        assert engine.generate(rank, [rid], [warm_up], grid.PREFILL_OUTPUT_TOKENS) == [0]
+    # It is one call for all ranks, like every call after it, so the fake engine's round robin never shifts.
+    warm_up = [[plan.free_prompt(rank, WARMUP_PROMPT_TOKENS)] for rank in range(dp_size)]
+    warm_up_ids = [[content.request_id(FAKE_RUN_ID, 0, "free", 0, rank, 0)] for rank in range(dp_size)]
+    assert _send_to_every_rank(engine, warm_up_ids, warm_up, grid.PREFILL_OUTPUT_TOKENS) == [[0]] * dp_size
     clock.advance(FAKE_POINT_OVERHEAD_SECONDS)
 
     measurements: list[dict] = []
@@ -831,9 +906,12 @@ def test_a_point_that_recovers_on_its_one_restage_leaves_the_run_complete(tmp_pa
 
 @pytest.mark.parametrize("phase", PHASES)
 def test_a_capped_run_measures_the_lower_end_that_is_added_after_the_cap(tmp_path, phase):
-    # Both graph ladders start above 1 and both graph-driven axes are cut by their cap. The lower end 1 is put
-    # in front after the cut, so each of the two axes holds one value more than its cap, and the points at 1
-    # are planned points like any other: staged, timed, accepted and published.
+    # Both graph ladders start above 1 and both graph-driven axes are cut by their cap. The lower end is put on
+    # each axis after the cut and does not count against the cap. On the decode batch axis it is 1, so that axis
+    # holds one value more than its cap. On the prefill new-token axis it is 1 and 2, the two sides of the step
+    # below the smallest prefill graph size, 4: SGLang runs a batch of 2 new tokens with that graph and a batch
+    # of 1 without a graph. That axis holds two values more than its cap. The points of the lower end are
+    # planned points like any other: staged, timed, accepted and published.
     limits = _small_limits(16, decode_graph_sizes=(4, 8))
     caps = grid.SampleCaps(prefill_max_new_token_samples=4, decode_max_batch_size_samples=3)
     cell = _cell(phase=phase, dp=2, strategy="tp")
@@ -844,16 +922,17 @@ def test_a_capped_run_measures_the_lower_end_that_is_added_after_the_cap(tmp_pat
     points = run.built.points
     if phase == "prefill":
         # Graph axis up to the largest n, C = 96: 4, 5, 8, 9, 16, 17, 32, 33, 64, 65, 96. The cap of 4 keeps
-        # the two values above the largest graph size (65, 96) and both ends of the rest (4, 64).
+        # the two values above the largest graph size (65, 96) and both ends of the rest (4, 64). The lower
+        # end adds 1 and 2: the smallest graph size, 4, is at most twice the tokens of a batch from 2 tokens on.
         axis = sorted({point.new_tokens for point in points})
-        assert axis == [1, 4, 64, 65, 96] and len(axis) == caps.prefill_max_new_token_samples + 1
-        lower_end = [point for point in points if point.new_tokens == 1]
+        assert axis == [1, 2, 4, 64, 65, 96] and len(axis) == caps.prefill_max_new_token_samples + 2
+        lower_end = {value: [point for point in points if point.new_tokens == value] for value in (1, 2)}
     else:
         # Graph axis up to the largest batch, R = 9: 4, 5, 8, 9. The cap of 3 keeps 4, 8 and 9.
         axis = sorted({point.batch_size for point in points})
         assert axis == [1, 4, 8, 9] and len(axis) == caps.decode_max_batch_size_samples + 1
-        lower_end = [point for point in points if point.batch_size == 1]
-    assert len(lower_end) > 3 and run.restaged == []
+        lower_end = {1: [point for point in points if point.batch_size == 1]}
+    assert all(len(planned) > 3 for planned in lower_end.values()) and run.restaged == []
     assert [payload["status"] for payload in run.payloads] == ["complete", "complete"]
     written = artifact.write_artifacts(str(pod / "benchmark.json"), run.payloads)
 
@@ -1637,19 +1716,8 @@ READER_MODEL = "Qwen/Qwen3-0.6B"
 FAKE_READER_VERSION = "fake-sglbench-reader-test"
 
 
-@pytest.mark.parametrize("h200", [H200_PAGE_1, H200_PAGE_64], ids=["page-1", "page-64"])
-def test_default_h200_grid_published_with_fake_times_is_served_by_the_compiled_reader(tmp_path, monkeypatch, h200):
-    """Plan the default grid, write it with FAKE times, publish it with AISim's own Python path, and read it back.
-
-    The path is ``aggregate_cell`` and ``write_formal_database`` (collector/fpm_forward/database.py), then
-    ``PerfDatabase`` and ``EngineHandle.for_database``, loaded as tests/unit/sdk/test_fpm_forward.py loads them.
-    This is the one test that fails when an axis rule plans a table the reader cannot serve. It says nothing
-    about how close an interpolated answer is to an engine: the FAKE times have no shape.
-
-    The plan and its cells come from ``build_collection_plan`` with backend ``sglang``, so the rows carry the
-    identity a formal SGLang collection of this model gets on the host. The reader's operators are built on
-    their own from the same model, and the test fails when the two identities differ.
-    """
+def _default_h200_limits(h200: grid.Limits) -> grid.Limits:
+    """The limits of one of the two engine probe runs, with the graph sizes SGLang captures by default."""
     # H200_PAGE_1 and H200_PAGE_64 hold the six limits in the recorder headers of two runs of the engine probe,
     # benchmarks/evidence/collector/sglbench-engine-probe-20261113 (headers of v0522-q06-p1 and v0522-q06-p64):
     # SGLang v0.5.22, Qwen3-0.6B, TP 1, page size 1 and 64. No result file records the GPU model; the README of
@@ -1658,13 +1726,61 @@ def test_default_h200_grid_published_with_fake_times_is_served_by_the_compiled_r
     # generate_prefill_cuda_graph_batch_sizes return for a maximum of 256 and of 8192 in SGLang v0.5.22
     # (baa9befa381511cd4d56f83980951e5a45fffc6d) and v0.5.23 (297e54fd105e974cdf401e5b4d20253a22c16f90),
     # python/sglang/srt/arg_groups/cuda_graph_hook.py.
-    limits = dataclasses.replace(
+    return dataclasses.replace(
         h200,
         decode_graph_sizes=_ladder(H200_DECODE_GRAPH_ROWS),
         prefill_graph_sizes=_ladder(H200_PREFILL_GRAPH_ROWS),
     )
-    systems_root = tmp_path / "systems"
-    systems_root.mkdir()
+
+
+@dataclasses.dataclass
+class _FakeTable:
+    """What ``_publish_with_fake_times`` hands back: the planned grids, their FAKE times and the reader."""
+
+    grids: dict[str, grid.Grid]  # phase -> the planned grid
+    fake_ms: dict[tuple[str, int], float]  # (phase, benchmark id) -> the FAKE time in the published unit
+    op_specs: dict[str, dict[str, str]]  # phase -> interpolation mode -> the reader's operator list, as JSON
+    handle: EngineHandle
+
+    def reader_ms(self, phase: str, mode: str, batch: int, per_request: int, cached_per_request: int = 0) -> float:
+        """Ask the reader for one forward pass; it raises when it cannot answer.
+
+        ``per_request`` is the new tokens per request (prefill) or the context per request (decode); the
+        reader multiplies by the batch itself (crates/core/src/perfmodel/operators/fpm_forward.rs
+        ``FpmForwardOp::query``).
+        """
+        answer = self.handle.evaluate_ops_json(
+            self.op_specs[phase][mode],
+            is_context=phase == "prefill",
+            batch_size=batch,
+            s=per_request,
+            prefix=cached_per_request,
+        )
+        return answer[0][1]
+
+    def prefill_rows(self) -> dict[tuple[int, int, int], float]:
+        """The FAKE time of every prefill row, by batch size and new and cached tokens per request."""
+        return {
+            (point.batch_size, point.new_tokens, point.cached_tokens): self.fake_ms["prefill", point.benchmark_id]
+            for point in self.grids["prefill"].points
+        }
+
+
+def _publish_with_fake_times(
+    root: Path, monkeypatch, limits: grid.Limits, fake_seconds_of: Callable[[dict], float]
+) -> _FakeTable:
+    """Plan the default grid for ``limits``, write it with FAKE times, publish it under ``root``, open the reader.
+
+    The path is ``aggregate_cell`` and ``write_formal_database`` (collector/fpm_forward/database.py), then
+    ``PerfDatabase`` and ``EngineHandle.for_database``, loaded as tests/unit/sdk/test_fpm_forward.py loads them.
+    ``fake_seconds_of`` gives the FAKE time of a point from its artifact form.
+
+    The plan and its cells come from ``build_collection_plan`` with backend ``sglang``, so the rows carry the
+    identity a formal SGLang collection of this model gets on the host. The reader's operators are built on
+    their own from the same model, and the caller's test fails when the two identities differ.
+    """
+    systems_root = root / "systems"
+    systems_root.mkdir(parents=True)
     shutil.copy(Path(aisim_core.__file__).parent / "systems" / f"{READER_SYSTEM}.yaml", systems_root)
     # The plan of a formal SGLang collection of the model on one GPU: one TP 1 cell per phase. The runtime
     # version is the release of the FAKE pod, which publication compares with the provenance file of _pod.
@@ -1707,12 +1823,12 @@ def test_default_h200_grid_published_with_fake_times_is_served_by_the_compiled_r
         built = grid.build_grid(phase, limits)
         assert built.missing_phases == () and built.source == "generated"
         grids[phase] = built
-        cell_dir = tmp_path / "cells" / cell.cell_id
+        cell_dir = root / "cells" / cell.cell_id
         pod = _pod(cell_dir, cell)
         measurements = []
         fake_elapsed = 0.0
         for record in built.point_dicts():
-            fake_seconds = _fake_reader_seconds(record)
+            fake_seconds = fake_seconds_of(record)
             if phase == "prefill":
                 fpm = artifact.build_fpm(record, 0, fake_seconds)
             else:
@@ -1747,10 +1863,9 @@ def test_default_h200_grid_published_with_fake_times_is_served_by_the_compiled_r
             for row in cell_rows
         }
         assert published_identity == {reader_ops[phase]._match_identity}
-        # One row per planned point, in order, each with its own FAKE time: no two rows of a phase are equal.
+        # One row per planned point, in order, each with its own FAKE time.
         published = [row["latency_ms"] for row in cell_rows]
         assert published == [fake_ms[phase, point.benchmark_id] for point in built.points]
-        assert len(set(published)) == len(built.points)
         rows.extend(cell_rows)
     parquet_path, metadata_path, skipped_cells = write_formal_database(plan, rows, systems_root=systems_root / "data")
     # The table holds every planned point of both phases, in the directory the reader opens for this
@@ -1771,21 +1886,23 @@ def test_default_h200_grid_published_with_fake_times_is_served_by_the_compiled_r
         direct_spec = {"FpmForward": {**default_spec["FpmForward"], "interpolation": "direct"}}
         op_specs[phase] = {default_mode: json.dumps([default_spec]), "direct": json.dumps([direct_spec])}
 
-    def reader_ms(phase: str, mode: str, batch: int, per_request: int, cached_per_request: int = 0) -> float:
-        """Ask the reader for one forward pass; it raises when it cannot answer.
+    return _FakeTable(grids, fake_ms, op_specs, handle)
 
-        ``per_request`` is the new tokens per request (prefill) or the context per request (decode); the
-        reader multiplies by the batch itself (crates/core/src/perfmodel/operators/fpm_forward.rs
-        ``FpmForwardOp::query``).
-        """
-        answer = handle.evaluate_ops_json(
-            op_specs[phase][mode],
-            is_context=phase == "prefill",
-            batch_size=batch,
-            s=per_request,
-            prefix=cached_per_request,
-        )
-        return answer[0][1]
+
+@pytest.mark.parametrize("h200", [H200_PAGE_1, H200_PAGE_64], ids=["page-1", "page-64"])
+def test_default_h200_grid_published_with_fake_times_is_served_by_the_compiled_reader(tmp_path, monkeypatch, h200):
+    """Plan the default grid, write it with FAKE times, publish it with AISim's own Python path, and read it back.
+
+    The path is ``_publish_with_fake_times``. This is the one test that fails when an axis rule plans a table
+    the reader cannot serve. It says nothing about how close an interpolated answer is to an engine: the FAKE
+    times have no shape. The test after this one gives them one step.
+    """
+    limits = _default_h200_limits(h200)
+    table = _publish_with_fake_times(tmp_path, monkeypatch, limits, _fake_reader_seconds)
+    grids, fake_ms, op_specs, reader_ms = table.grids, table.fake_ms, table.op_specs, table.reader_ms
+    # No two points of a phase have the same FAKE time, so a value the reader hands back is the point's own row.
+    for phase, built in grids.items():
+        assert len({fake_ms[phase, point.benchmark_id] for point in built.points}) == len(built.points)
 
     # 1. Every planned point reads back its own FAKE time, in both modes. The reader hands a collected point
     #    back as it is stored (default mode: crates/core/src/perfmodel/perf_database/perf_interp.rs
@@ -1817,12 +1934,78 @@ def test_default_h200_grid_published_with_fake_times_is_served_by_the_compiled_r
         for batch in (6, 300):
             answered["decode", mode, batch] = reader_ms("decode", mode, batch, 1024)
     # A prefill step of one request with 1, 2 or 3 new tokens and nothing cached lies below the smallest
-    # prefill graph size, 4. Of the three only 1 was collected: the lower end the grid puts on the axis.
-    assert min(limits.prefill_graph_sizes) == 4 and new_tokens & {1, 2, 3} == {1}
+    # prefill graph size, 4. Of the three, 1 and 2 were collected: the low end the grid puts on the axis. 3 was
+    # not, and lies between the collected rows at 2 and 4.
+    assert min(limits.prefill_graph_sizes) == 4 and new_tokens & {1, 2, 3, 4} == {1, 2, 4}
     for mode in op_specs["prefill"]:
         for new in (1, 2, 3):
             answered["prefill", mode, new] = reader_ms("prefill", mode, 1, new)
     assert len(answered) == 10 and all(math.isfinite(value) for value in answered.values()), answered
+
+
+@pytest.mark.parametrize("h200", [H200_PAGE_1, H200_PAGE_64], ids=["page-1", "page-64"])
+def test_rows_at_the_low_end_keep_the_reader_off_the_line_from_a_batch_without_a_graph(tmp_path, monkeypatch, h200):
+    """What the low end of the prefill new-token axis is for, with FAKE times that have the first step in them.
+
+    A batch that SGLang runs without a prefill graph gets one slow FAKE time and every other batch a fast one
+    (``_fake_step_seconds``). With SGLang's default graph sizes only a batch of one new token runs without a
+    graph. The grid plans rows at 1 and at 2 new tokens, the two sides of that step, so the reader answers one
+    request of 2 new tokens with a collected fast row and one request of 3 between two fast rows.
+
+    The same FAKE times are then published on the grid as it was planned before the low end held the step,
+    with rows at 1 and 4: there the reader answers 2 and 3 new tokens on the line between the slow row and a
+    fast one, at several times the fast rows. Nothing here says what an engine does: the times are typed in,
+    and the rule that makes a batch slow is restated in this file.
+    """
+    limits = _default_h200_limits(h200)
+    sizes = limits.prefill_graph_sizes
+    slow_ms = FAKE_NO_GRAPH_SECONDS * 1000.0
+
+    def fake_seconds_of(record: dict) -> float:
+        return _fake_step_seconds(record, sizes)
+
+    # The first batch that runs with a graph, by the rule as this file restates it: 2 new tokens, padded to 4.
+    first_with_graph = next(tokens for tokens in itertools.count(1) if _fake_runs_with_a_prefill_graph(tokens, sizes))
+    assert (min(sizes), first_with_graph) == (4, 2)
+
+    table = _publish_with_fake_times(tmp_path / "now", monkeypatch, limits, fake_seconds_of)
+    modes = tuple(table.op_specs["prefill"])  # the reader's default interpolation mode and "direct"
+    assert len(modes) == 2 and "direct" in modes
+    rows = table.prefill_rows()
+    # Of all the batches the grid plans only the batch of one new token is slow, whatever it has cached: the
+    # FAKE table has one step, and it lies between 1 and 2 new tokens of one request.
+    assert {(batch, new) for (batch, new, _cached), fake in rows.items() if fake == slow_ms} == {(1, 1)}
+    # One request with nothing cached has rows at 1, 2 and 4 new tokens: the first slow, the other two fast.
+    assert sorted(new for batch, new, cached in rows if (batch, cached) == (1, 0) and new <= 4) == [1, 2, 4]
+    one, two, four = (rows[1, new, 0] for new in (1, 2, 4))
+    assert one == slow_ms and two < four < slow_ms / 7
+    for mode in modes:
+        # 1 and 2 new tokens: the collected rows themselves, the slow one and a fast one. 3 new tokens: half
+        # way between the two fast rows, where the reader's line between neighbouring rows of one batch size
+        # and one cached count puts it (default mode: ``SiteIndex::eval_curve``; direct mode:
+        # ``direct_curve_value``).
+        assert [table.reader_ms("prefill", mode, 1, new) for new in (1, 2)] == [one, two]
+        answer = table.reader_ms("prefill", mode, 1, 3)
+        assert two < answer < four and answer == pytest.approx((two + four) / 2, rel=1e-9)
+
+    # The grid as it was planned before: the low end was 1 alone. With the step switched off the grid plans
+    # every point it plans now except those of 2 new tokens per request, each with the FAKE time it has now,
+    # and the same decode block.
+    monkeypatch.setattr(grid, "first_prefill_graph_tokens", lambda graph_sizes: None)
+    before = _publish_with_fake_times(tmp_path / "before", monkeypatch, limits, fake_seconds_of)
+    rows_before = before.prefill_rows()
+    assert rows_before.items() < rows.items() and before.grids["decode"] == table.grids["decode"]
+    assert {new for _batch, new, _cached in set(rows) - set(rows_before)} == {2}
+    assert sorted(new for batch, new, cached in rows_before if (batch, cached) == (1, 0) and new <= 4) == [1, 4]
+    for mode in modes:
+        for new, times_the_answer_now in ((2, 5), (3, 3)):
+            # What the reader returned before the change: the point on the line between the slow row at 1 and
+            # the fast row at 4, more than 5 times the answer it gives now for 2 new tokens and more than 3
+            # times for 3.
+            on_the_line = one + (four - one) * (new - 1) / (4 - 1)
+            answer = before.reader_ms("prefill", mode, 1, new)
+            assert answer == pytest.approx(on_the_line, rel=1e-9)
+            assert answer > times_the_answer_now * table.reader_ms("prefill", mode, 1, new)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1935,7 +2118,7 @@ def test_pod_imports_all_three_modules_with_the_standard_library_only_and_its_fi
 
     argv = [str(RUNTIME), json.dumps(limits.as_dict()), phase, output_path, POD_SGLANG_VERSION, source]
     done = subprocess.run(
-        [sys.executable, "-I", "-S", "-c", _POD_SCRIPT, *argv],
+        [sys.executable, "-I", "-S", "-B", "-c", _POD_SCRIPT, *argv],
         capture_output=True,
         text=True,
         timeout=120,

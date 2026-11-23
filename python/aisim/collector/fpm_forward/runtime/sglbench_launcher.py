@@ -25,13 +25,17 @@ What ``main`` does, in this order
     1. Reads the clock. The soft deadline counts from here, so the engine build is inside it.
     2. Reads its own flags and variables. Every other flag goes to SGLang's own parser unchanged.
     3. Makes the run id and the run object, so that every later failure can be written as a failed artifact.
-    4. Installs its handlers for SIGTERM and SIGINT. Deletes its own old result files, the rank file and the
-       merged file, and nothing else. Creates the recorder directory and names it to the scheduler processes.
+    4. Installs its handlers for SIGTERM and SIGINT. Deletes its own old result files, the rank file of
+       every attention-DP rank and the merged file, and nothing else. Creates the recorder directory and
+       names it to the scheduler processes.
     5. Refuses an SGLang release that was not tested. Loads SGLang's plugins, parses and resolves SGLang's
        arguments, and refuses every setup the feasibility rules do not cover (``_RESOLVED_CHECKS``,
-       ``_check_sglang_environment``, the platform and the expert-parallel layout). The expert keys of the
-       model config decide where the prompts come from: dataset text for a model with expert layers, seeded
-       token ids for any other, unless ``DYN_BENCH_PREFILL_CONTENT`` says which (``ENV_PREFILL_CONTENT``).
+       ``_check_sglang_environment``, ``_check_dp_environment``, the platform, the expert-parallel layout
+       and the layout of DP attention). The expert keys of the model config decide where the prompts come
+       from: dataset text for a model with expert layers, seeded token ids for any other, unless
+       ``DYN_BENCH_PREFILL_CONTENT`` says which (``ENV_PREFILL_CONTENT``). For a run with several
+       attention-DP ranks it sets SGLANG_ENABLE_COLOCATED_BATCH_GEN in its own environment
+       (``_switch_on_input_blocker``).
     6. Writes the dump of the resolved arguments when ``--dump-config-to`` is given.
     7. For a text run: finds the dataset file (a local file, the cached file or a download), hashes it, parses
        it and takes its texts. This comes before the engine build, so a dataset that cannot be had costs
@@ -39,9 +43,11 @@ What ``main`` does, in this order
     8. Builds the engine with the recorder's scheduler entry.
     9. Takes the token range from the tokenizer. For a text run: reads how many token ids the model counts
        and turns texts into token ids with the served tokenizer until the text pool is large enough.
-    10. Runs the benchmark (``sglbench_driver.BenchmarkRun.execute``).
-    11. Always, also after a failure or a stop: shuts the engine down, writes the result files, prints the
-        outcome, stays alive for ``FINAL_WAIT_SECONDS`` and returns the exit code.
+    10. Runs the benchmark (``sglbench_driver.BenchmarkRun.execute``). Once the grid is planned, says when the
+        KV pool cut its generated prefill block (``_say_pool_cut``).
+    11. Always, also after a failure or a stop: shuts the engine down, writes the result files, says once more
+        what the KV pool cut, prints the outcome, stays alive for ``FINAL_WAIT_SECONDS`` and returns the exit
+        code.
 
 Exit codes
     0 complete; 64 rejected; 65 failed run; 66 soft deadline (partial artifact); 70 internal error. ``argparse``
@@ -49,7 +55,10 @@ Exit codes
     output path and one line ``[sglbench] FAILED: <reason>`` on stderr, unless the artifact cannot be written:
     an output path that names no file, or a directory that cannot be made or written to. The write error is
     then printed after the reason. An unknown value of ``DYN_BENCHMARK_MODE`` is refused with 64 and no
-    artifact, because an artifact needs the mode.
+    artifact, because an artifact needs the mode. The number of rank files is SGLang's resolved
+    ``attn_dp_size``, which the launcher takes over at the end of step 5. A run with several attention-DP
+    ranks that fails after that leaves a failed rank artifact for every rank; one that fails before it leaves
+    the one at the output path.
 
     A text run has no other content to fall back to. When its dataset cannot be had, gives no text, cannot be
     turned into token ids or is shorter than the longest prompt, the run fails with 65 and the reason
@@ -84,15 +93,19 @@ files under ``python/sglang`` at both tags::
     srt/arg_groups/fields/disagg.py          Disagg
     srt/arg_groups/fields/device.py          Device
     srt/arg_groups/parallel_hook.py          handle_context_parallelism, handle_deprecated_dp_attention,
-                                             handle_dwdp, handle_elastic_ep, handle_eplb_and_dispatch
-    srt/arg_groups/overrides.py              _a2a_ep_size
+                                             handle_data_parallelism, handle_dwdp, handle_elastic_ep,
+                                             handle_eplb_and_dispatch
+    srt/arg_groups/serving_hook.py           handle_load_balance_method
+    srt/arg_groups/overrides.py              _a2a_ep_size, _data_parallelism_defaults
     srt/arg_groups/moe_hook.py               handle_a2a_moe
     srt/arg_groups/validation_hook.py        check_server_args
     srt/arg_groups/kv_cache_hook.py          the RuntimeError and NotImplementedError a resolution step raises
-    srt/runtime_context.py                   attn_dp_enabled_of, PlatformContext, derive_parallel_widths
+    srt/runtime_context.py                   attn_dp_enabled_of, PlatformContext, derive_parallel_widths,
+                                             derive_attn_tp_size, derive_attention_ranks, num_dp_ranks_of
     srt/eplb/expert_location.py              ExpertLocationMetadata._init_common
     srt/layers/moe/fused_moe_triton/layer.py FusedMoE.__init__
-    srt/environ.py                           EnvField.get, EnvBool.parse, EnvInt.parse and six variables of Envs
+    srt/environ.py                           EnvField.get, EnvBool.parse, EnvInt.parse and eight variables of
+                                             Envs
     srt/utils/common.py                      get_bool_env_var, kill_process_tree, require_attn_tp_gather,
                                              require_mlp_sync
     srt/mem_cache/common.py                  match_kv_cache
@@ -102,8 +115,10 @@ files under ``python/sglang`` at both tags::
                                              _set_envs_and_config, _wait_for_scheduler_ready
     srt/managers/tokenizer_manager.py        TokenizerManager.__init__, auto_create_handle_loop,
                                              sigterm_watchdog, _handle_batch_request,
+                                             _should_use_batch_tokenization, _send_batch_request,
                                              _coalesce_streaming_chunks, SignalHandler
-    srt/managers/scheduler.py                Scheduler.__init__, init_chunked_prefill, init_schedule_policy,
+    srt/managers/scheduler.py                Scheduler.__init__, init_ipc_channels, init_chunked_prefill,
+                                             init_schedule_policy,
                                              init_req_max_new_tokens, init_watch_dog_memory_saver_input_blocker,
                                              maybe_init_scripted_scheduler_hook, update_running_batch,
                                              get_next_batch_to_run, get_num_allocatable_reqs,
@@ -114,7 +129,13 @@ files under ``python/sglang`` at both tags::
     srt/managers/min_free_slots_delayer.py   resolve_min_free_slots
     srt/managers/scheduler_components/recv_skipper.py   SchedulerRecvSkipper.maybe_create
     srt/managers/scheduler_components/output_streamer.py   _GenerationStreamAccumulator.accept
-    srt/managers/data_parallel_controller.py DataParallelController.dispatch_batch_generate
+    srt/managers/scheduler_components/dp_attn.py   should_skip_scheduler_all_gather,
+                                             prepare_mlp_sync_batch_raw, _update_gather_batch,
+                                             SchedulerDPAttnAdapter.maybe_convert_decode_to_extend
+    srt/managers/scheduler_input_blocker.py  SchedulerInputBlocker, input_blocker_guard_region
+    srt/managers/data_parallel_controller.py DataParallelController.__init__, init_dispatcher,
+                                             dispatch_batch_generate, round_robin_scheduler,
+                                             run_scheduler_process_with_init_pipe
     srt/mem_cache/kv_cache_builder.py        build_kv_cache
     srt/mem_cache/registry.py                create_tree_cache
 
@@ -141,6 +162,42 @@ of every one of them dropped nothing while it still left such ids out, and held 
 run with SGLang 0.5.23 after it began to keep them. A prompt that holds such an id, a download of the
 dataset, and every way in which a text run or the check of the expert-parallel layout fails, rest on the
 source and on the tests.
+
+With DP attention this launcher ran on engines on 2026-11-18, with SGLang 0.5.22 and 0.5.23 on two H200 GPUs:
+two-rank DEP cells of ``Qwen/Qwen1.5-MoE-A2.7B`` (``--tp-size 2 --ep-size 2 --attn-dp-size 2``, dataset text, page
+size 1, the launcher's defaults otherwise). Through AISim's collector each release ran a prefill cell and a
+decode cell of a smoke grid, six and four points. All four ran to a complete result with no point staged again.
+With SGLang 0.5.23 the two cells of the default grid ran through the collector as well, 2,892 and 857 points,
+none staged again, and their rows were published.
+The launcher admitted the layout and set SGLANG_ENABLE_COLOCATED_BATCH_GEN; both scheduler processes wrote a
+header as the leader of their rank, with the input blocker; the self-test passed with a pair of requests on
+each rank; and each cell left the file of rank 0, the file of rank 1 and the merged file, which the gate waited
+for and AISim's validator accepted with the recorded sizes ``tp_size`` 2, ``moe.ep_size`` 2 and ``attn_dp_size``
+2. With SGLang 0.5.23 the two cells also ran with ``--enable-dp-attention-local-control-broadcast`` on the
+launcher's own command, outside the collector, which has no input for that flag. Both ended with exit code 0
+and recorded ``local_control_broadcast: true``; their files were not put through the validator. The comments
+below call these "the runs of 2026-11-18".
+
+Not run on an engine under DP attention: more than four ranks, and four ranks in any cell but the prefill cell
+of the default grid, which ran on this file's own command and whose files were not validated (collector README,
+"DEP cells"); any refusal of such a setup
+(``_check_dp_attention``, ``_check_dp_environment``, seeded token ids); any failure of such a run (a request on
+another rank than planned, ranks out of step, a cache miss on one rank); a page size other than 1; a command
+that sets SGLang's ``--max-running-requests`` or ``--context-length``; local control broadcast with SGLang
+0.5.22; a model other than the one named. These rest on the source at both tags and on the tests. The test of
+``enable_tokenizer_batch_encode`` in ``_check_dp_attention`` was added after the runs; one more smoke of the two
+cells with SGLang 0.5.23 passed with it, the field being off.
+
+A spike of the same day ran stock SGLang at both releases with the same model and layout, in a script of its
+own that set SGLANG_ENABLE_COLOCATED_BATCH_GEN and sent SGLang's public batch call. The launcher did not run in
+it. The comments below say "the spike of 2026-11-18" where they rest on it alone. The files of the runs and of
+the spike are not kept in this repository.
+
+Every run named above planned its prefill points with the new-token axis as it was until 2026-11-23: 1 and the
+graph sizes, without the 2 that sglbench_grid.py ``prefill_new_token_axis`` puts on it now. The point counts
+above are those of that grid. With the 2 on the axis the two cells of the default grid ran through the collector
+once more on 2026-11-23, with SGLang 0.5.23: 3,347 and 857 points, none staged again, and
+every batch of one request with two new tokens ran with a captured graph on both ranks.
 
 The flags, their defaults and their ``DYN_*`` variables are those of Dynamo's vLLM worker, in the files and at
 the revision the header of this file names: ``backend_args.py`` (the flag declarations and their value rules)
@@ -169,7 +226,7 @@ import time
 import traceback
 import urllib.request
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, MutableMapping
 
 import sglbench_artifact as artifact
 import sglbench_compat as compat
@@ -229,6 +286,20 @@ DEFAULT_CONTENT_SEED = "0"
 # read it.
 # How to retire it: stop adding the flag when cumulative streaming is the path to measure.
 STREAMING_FLAG = "--incremental-streaming-output"
+
+# The three flags the launcher names in its lines about a prefill grid the KV pool cut (``_say_pool_cut``). It
+# only names them: it does not look for them on the command.
+# - SGLang's flag for the field ``mem_fraction_static`` (srt/arg_groups/fields/schedule.py): the share of a
+#   GPU's memory that the weights and the KV pool take together. The pool is what that share leaves after the
+#   weights (srt/mem_cache/kv_cache_configurator.py ``_profile_available_bytes``); without the flag SGLang
+#   works the share out itself (srt/arg_groups/memory_hook.py ``handle_gpu_memory_settings``).
+# - The plan flag from which AISim's collector writes the first (collector/fpm_forward/sglang_fpm_builder.py).
+# - SGLang's flag for the field ``max_total_tokens`` (the same file of fields): a cap on the pool in tokens,
+#   whatever the share (``_apply_token_constraints`` in kv_cache_configurator.py). A cell of the collector
+#   never carries it; a command typed by hand can.
+MEMORY_SHARE_FLAG = "--mem-fraction-static"
+PLAN_MEMORY_SHARE_FLAG = "--fpm-gpu-memory-utilization"
+POOL_TOKENS_FLAG = "--max-total-tokens"
 
 # The DYN_* variable that gives a flag its default when the flag is absent, by argparse destination. Flag
 # names, types, defaults and variables are those of Dynamo's vLLM worker (backend_args.py at the revision in
@@ -641,9 +712,40 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _result_paths(output_path: str) -> tuple[str, str]:
-    """The two files the launcher owns: the rank file and the merged file. Raises for a path that names none."""
-    rank_path = artifact.rank_output_path(output_path, driver.RANK)
+    """The file of attention-DP rank 0 and the merged file. Raises for a path that names none."""
+    rank_path = artifact.rank_output_path(output_path, 0)
     return rank_path, artifact.merged_output_path(rank_path)
+
+
+def _rank_file_frame(output_path: str) -> tuple[str, str]:
+    """``(head, tail)``: the file of an attention-DP rank ``r`` above 0 is named ``<head><r><tail>``.
+
+    Both parts are read off the names sglbench_artifact.py gives ranks 1 and 2, so that the rule for the name
+    of a rank file stays in that module alone. The two names differ in the rank only: what they share in
+    front of it is the head, and what follows it is the tail.
+    """
+    first, second = (os.path.basename(artifact.rank_output_path(output_path, rank)) for rank in (1, 2))
+    head = os.path.commonprefix([first, second])
+    return head, first[len(head) + 1 :]
+
+
+def _is_rank_file_name(name: str, head: str, tail: str) -> bool:
+    """Whether ``name`` is ``<head><digits><tail>``, the name of the file of some rank above 0."""
+    digits = name[len(head) : len(name) - len(tail)]
+    return name.startswith(head) and name.endswith(tail) and digits.isascii() and digits.isdigit()
+
+
+def _is_result_file(output_path: str, path: str) -> bool:
+    """Whether ``path`` is a result file of a run with this output path: a rank file of any rank or the merged file.
+
+    The number of attention-DP ranks is known only once SGLang has resolved its arguments, so every name of
+    the form of a rank file counts, whatever its rank.
+    """
+    absolute = os.path.abspath(path)
+    if absolute in {os.path.abspath(own) for own in _result_paths(output_path)}:
+        return True
+    beside = os.path.dirname(absolute) == os.path.dirname(os.path.abspath(output_path))
+    return beside and _is_rank_file_name(os.path.basename(absolute), *_rank_file_frame(output_path))
 
 
 def _refused_switches(flags: argparse.Namespace, environ: Mapping[str, str]) -> list[str]:
@@ -764,9 +866,8 @@ def _read_options(argv: list[str], environ: Mapping[str, str]) -> _Options:
         output_path = text_value("benchmark_output_path", DEFAULT_OUTPUT_PATH)
         output_source = "--benchmark-output-path"
     output_problem = None
-    result_paths: tuple[str, ...] = ()
     try:
-        result_paths = _result_paths(output_path)
+        _result_paths(output_path)
     except (TypeError, ValueError) as error:
         output_problem = f"{output_source} {output_path!r}: {error}"
 
@@ -774,7 +875,9 @@ def _read_options(argv: list[str], environ: Mapping[str, str]) -> _Options:
     if dump_config_to is not None:
         if not dump_config_to:
             problems.append("--dump-config-to must name a file")
-        elif os.path.abspath(dump_config_to) in {os.path.abspath(path) for path in result_paths}:
+        elif output_problem is None and _is_result_file(output_path, dump_config_to):
+            # The launcher deletes its old result files at its start and writes one rank file for every
+            # attention-DP rank at its end, so the dump must not have the name of any of them.
             problems.append(f"--dump-config-to {dump_config_to!r} is one of the result files of the run")
 
     # Dynamo reads the seed as text, "0" when unset. The content plan needs a non-empty UTF-8 string.
@@ -881,8 +984,9 @@ def _check_sglang_environment(environ: Mapping[str, str]) -> None:
     """Refuse variables of SGLang that change admission, caching or the steps of a run.
 
     Each is read in the scheduler processes, which inherit the launcher's environment, so the launcher can
-    test them before it builds anything. The scheduler side of two of them is tested again from the recorder
-    headers (``max_new_tokens_limit`` and ``input_blocker``, sglbench_driver.py).
+    test them before it builds anything. The scheduler side of one of them is tested again from the recorder
+    headers (``max_new_tokens_limit``, sglbench_driver.py). The variables whose meaning depends on the number
+    of attention-DP ranks are tested after resolution (``_check_dp_environment``).
 
     It must be given the live environment after SGLang was imported: the import rewrites variables under the
     legacy ``SGL_`` prefix (srt/environ.py ``_handle_deprecated_envs``).
@@ -911,12 +1015,58 @@ def _check_sglang_environment(environ: Mapping[str, str]) -> None:
     per_poll = _sglang_env_int(environ, "SGLANG_SCHEDULER_MAX_RECV_PER_POLL")
     if per_poll is not None and per_poll >= 0:
         raise _rejected(f"SGLANG_SCHEDULER_MAX_RECV_PER_POLL must be unset (got {per_poll})")
-    # srt/managers/scheduler.py ``Scheduler.init_watch_dog_memory_saver_input_blocker`` and
-    # srt/managers/tokenizer_manager.py ``TokenizerManager._handle_batch_request`` read this one with
-    # srt/utils/common.py ``get_bool_env_var``, which takes only true and 1 as true. It creates the input
-    # blocker, with one poll over all ranks in every scheduler step.
-    if environ.get("SGLANG_ENABLE_COLOCATED_BATCH_GEN", "").lower() in ("true", "1"):
-        raise _rejected("SGLANG_ENABLE_COLOCATED_BATCH_GEN must be unset without DP attention")
+
+
+# SGLang's variable that gives every scheduler process an input blocker.
+# srt/managers/scheduler.py ``Scheduler.init_watch_dog_memory_saver_input_blocker`` reads it once, when the
+# scheduler is built, and srt/managers/tokenizer_manager.py ``TokenizerManager._handle_batch_request`` reads
+# it again in every batch call. Both read it with srt/utils/common.py ``get_bool_env_var``, which takes only
+# true and 1 as true, in any letter case. The blocker asks all ranks in every scheduler step whether a release
+# is due (srt/managers/scheduler_input_blocker.py ``SchedulerInputBlocker``).
+ENV_INPUT_BLOCKER = "SGLANG_ENABLE_COLOCATED_BATCH_GEN"
+
+# Variables of SGLang that are refused in a run with several attention-DP ranks, with the reason. Both are
+# boolean variables of srt/environ.py ``Envs`` with the default false, and both change what the ranks do in a
+# common scheduler step, which is what the driver holds the ranks against each other by (sglbench_driver.py
+# ``BenchmarkRun._require_same_step``):
+# - the first makes a scheduler skip the exchange in which every rank tells the others what it runs in the
+#   step (srt/managers/scheduler_components/dp_attn.py ``should_skip_scheduler_all_gather``, used by
+#   ``prepare_mlp_sync_batch_raw``). SGLang sets it by itself for DWDP (srt/arg_groups/parallel_hook.py
+#   ``handle_dwdp``), which ``_RESOLVED_CHECKS`` refuses first;
+# - the second keeps a rank that decodes in its own mode while another rank extends
+#   (``SchedulerDPAttnAdapter.maybe_convert_decode_to_extend`` returns at once), and has the token counts of
+#   a step adjusted afterwards by a plan of its own (the comment in ``_update_gather_batch``). It is named
+#   for speculative decoding, which is refused as well, but the first effect does not ask for it.
+# Read in the source at both tags; neither was set in any run.
+_DP_REFUSED_VARIABLES = (
+    ("SGLANG_SCHEDULER_SKIP_ALL_GATHER", "the ranks would not tell each other what they run in a step"),
+    (
+        "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION",
+        "it changes what a rank runs in a step in which another rank extends",
+    ),
+)
+
+
+def _check_dp_environment(environ: Mapping[str, str], attn_dp_size: int) -> None:
+    """Refuse variables of SGLang whose meaning depends on the number of attention-DP ranks.
+
+    It runs after resolution, because only SGLang's resolved ``attn_dp_size`` says how many ranks there are,
+    and it must be given the live environment, as ``_check_sglang_environment`` must: resolution can set one
+    of these variables itself.
+
+    - One rank: ``ENV_INPUT_BLOCKER`` must not be on. Without DP attention the blocker would hold the
+      requests of a call back for nothing and add its question to every scheduler step. The driver tests the
+      scheduler side again from the recorder headers (``input_blocker``, sglbench_driver.py).
+    - Several ranks: the two variables of ``_DP_REFUSED_VARIABLES`` must not be on. ``ENV_INPUT_BLOCKER`` is
+      not tested then: the launcher sets it itself, whatever it was (``_switch_on_input_blocker``).
+    """
+    if attn_dp_size == 1:
+        if environ.get(ENV_INPUT_BLOCKER, "").lower() in ("true", "1"):
+            raise _rejected(f"{ENV_INPUT_BLOCKER} must be unset without DP attention")
+        return
+    for name, why in _DP_REFUSED_VARIABLES:
+        if _sglang_env_flag(environ, name):
+            raise _rejected(f"{name} must be unset under DP attention: {why}")
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -938,6 +1088,11 @@ def _int_at_most(limit: int) -> Callable[[object], bool]:
         return type(value) is int and value <= limit
 
     return accepts
+
+
+def _positive_int(value: object) -> bool:
+    """A test that accepts an int of at least 1 (``True`` is not ``1``)."""
+    return type(value) is int and value >= 1
 
 
 # The resolved fields of the expert layers that are written into the ``producer`` block of a model with expert
@@ -963,11 +1118,13 @@ _RESOLVED_CHECKS: tuple[tuple[str, Callable[[object], bool], str], ...] = (
     # ``Parallel``. The deprecated --enable-dp-attention is resolved into this field
     # (srt/arg_groups/parallel_hook.py ``handle_deprecated_dp_attention``). SGLang's own test,
     # srt/runtime_context.py ``attn_dp_enabled_of``, is ``attn_dp_size > 1 or ep_join_mode == "scale"``; the
-    # second half is refused with elastic EP below. One batch call cannot place its requests on several
-    # attention-DP ranks.
-    ("attn_dp_size", _only(1), "DP attention is not supported yet ({name}={v})"),
-    # ``Parallel``. Replicas run behind a controller that hands out the requests of a batch one by one
-    # (srt/managers/data_parallel_controller.py ``DataParallelController.dispatch_batch_generate``).
+    # second half is refused with elastic EP below. Only the type is tested here. Which layout a size above
+    # 1 is admitted for is tested once the model config was read (``_check_dp_attention``).
+    ("attn_dp_size", _positive_int, "attn_dp_size must be a positive int (got {v})"),
+    # ``Parallel``. Replicas are whole copies of the model behind a controller that hands out the requests
+    # of a batch one by one (srt/managers/data_parallel_controller.py
+    # ``DataParallelController.dispatch_batch_generate``). SGLang itself refuses them together with DP
+    # attention (srt/arg_groups/parallel_hook.py ``handle_data_parallelism``).
     ("dp_size", _only(1), "data-parallel replicas are not supported ({name}={v})"),
     # ``Parallel``. Pipeline parallelism runs another event loop (srt/managers/scheduler.py
     # ``_dispatch_event_loop_once``).
@@ -1160,6 +1317,105 @@ def _check_expert_parallel(view: object, experts: dict) -> None:
         raise _rejected(f"ep_size must be 1 or the TP size (ep_size={_shown(ep_size)}, tp_size={_shown(tp_size)})")
 
 
+# The start of the refusal of a DP-attention layout the benchmark does not cover.
+_DEP_ONLY_TEXT = (
+    "attn_dp_size={v} is supported only as the DEP layout of a model with expert layers "
+    "(tp_size == attn_dp_size and ep_size == tp_size)"
+)
+
+
+def _check_dp_attention(view: object, experts: dict) -> None:
+    """Refuse DP attention in any layout but the one the benchmark covers, and three settings inside it.
+
+    SGLang's ``attn_dp_size`` is the number of attention-DP ranks: data-parallel attention groups inside the
+    TP group, each with a scheduler of its own, while the feed-forward layers stay tensor parallel (the help
+    text of the field, srt/arg_groups/fields/parallel.py ``Parallel``). With a size of 1 there is no such
+    layout and nothing is tested here.
+
+    Above 1 the one layout that is admitted is the one AISim plans as ``dep`` for a model with expert layers:
+
+    - the model has expert layers;
+    - ``tp_size == attn_dp_size``. SGLang's ``tp_size`` counts the scheduler processes of all ranks together,
+      and a rank has ``tp_size // attn_dp_size`` of them (srt/runtime_context.py ``derive_attn_tp_size``,
+      with ``attn_cp_size`` 1, which ``_RESOLVED_CHECKS`` requires). So each rank is then one scheduler
+      process, with attention-TP rank 0 (``derive_attention_ranks``), and that process receives the requests
+      of its rank (srt/managers/scheduler.py ``Scheduler.init_ipc_channels``). A rank of several processes,
+      attention TP inside a DP rank, is not built: the driver takes every scheduler process for the leader
+      of a rank (sglbench_driver.py ``BenchmarkRun._check_headers``);
+    - ``ep_size == tp_size``: every rank holds its share of whole experts (``_check_expert_parallel``).
+
+    ``dp_size`` must be 1 as well, which ``_RESOLVED_CHECKS`` has tested by now. The refusal names every one
+    of the three that failed.
+
+    Inside that layout three more settings are tested:
+
+    - ``load_balance_method`` must have resolved to ``round_robin``. The DP controller then gives every
+      request that names no rank to the next rank in turn (srt/managers/data_parallel_controller.py
+      ``DataParallelController.__init__`` and ``round_robin_scheduler``), which is what places the requests
+      of a balanced call (sglbench_driver.py ``BenchmarkRun._stage``). ``auto``, the default, resolves to it
+      outside disaggregated serving (srt/arg_groups/serving_hook.py ``handle_load_balance_method``); the
+      other methods place a request by the load of the ranks or by a field of the request. The turn of a
+      request also depends on every request before it, so the launcher sends none of its own: the token
+      range and the text pool come from the tokenizer alone, and srt/entrypoints/engine.py holds no warm-up
+      request (the first call of every engine was placed from rank 0 on in the runs of 2026-11-18);
+    - ``enable_dp_lm_head`` must be False, its default (``Parallel``; srt/arg_groups/overrides.py
+      ``_data_parallelism_defaults`` forces False only with one rank). On, the output head is split inside
+      each rank and the gather across the ranks is left out (the help text of the field). The benchmark
+      covers the default only, and no cell is planned with the field on;
+    - ``enable_tokenizer_batch_encode`` must be False, its default (srt/arg_groups/fields/serving.py
+      ``Serving``). On, the tokenizer manager sends a list call as ONE batch message under DP attention too
+      (srt/managers/tokenizer_manager.py ``TokenizerManager._should_use_batch_tokenization`` and
+      ``_send_batch_request``), and that branch of ``TokenizerManager._handle_batch_request`` lies outside
+      the region in which SGLang puts its block and unblock messages around the requests of a call
+      (srt/managers/scheduler_input_blocker.py ``input_blocker_guard_region``). The DP controller still
+      deals the requests of the message to the ranks in turn
+      (``DataParallelController.dispatch_batch_generate``), but nothing holds them back: a rank can form a
+      batch from the requests it has got while the others are still on their way, and the ranks are not
+      released together. The driver would find such a call out of step (sglbench_driver.py
+      ``BenchmarkRun._require_same_step``); here the setup is refused by name before the model is loaded.
+      AISim's collector does not write the flag.
+
+    ``enable_dp_attention_local_control_broadcast`` is not tested: either value is accepted and recorded
+    (``_switch_on_input_blocker``).
+
+    Read in the source at both tags. In the runs of 2026-11-18 (module docstring) this function admitted
+    the cells' ``--tp-size 2 --ep-size 2 --attn-dp-size 2`` with SGLang 0.5.22 and 0.5.23, and both
+    scheduler processes were leaders of their rank. The spike of that day printed what SGLang resolves
+    that command to: ``attn_dp_size`` 2, ``dp_size`` 1, ``ep_size`` 2, ``load_balance_method``
+    ``round_robin`` and ``enable_dp_lm_head`` False. No refusal of this function was run on an engine, and
+    the test of ``enable_tokenizer_batch_encode`` was added after those runs.
+    """
+    size = _resolved(view, "attn_dp_size")
+    if _only(1)(size):
+        return
+    tp_size, ep_size = _resolved(view, "tp_size"), _resolved(view, "ep_size")
+    problems = []
+    if not experts:
+        problems.append("the model has no expert layers")
+    if not _only(size)(tp_size):
+        problems.append(f"tp_size={_shown(tp_size)}")
+    if not _only(tp_size)(ep_size):
+        problems.append(f"ep_size={_shown(ep_size)}")
+    if problems:
+        raise _rejected(f"{_DEP_ONLY_TEXT.format(v=_shown(size))}: {'; '.join(problems)}")
+    method = _resolved(view, "load_balance_method")
+    if not _only("round_robin")(method):
+        raise _rejected(
+            f"load_balance_method must be round_robin under DP attention (got {_shown(method)}); the requests "
+            "of a call are placed on the ranks in turn"
+        )
+    lm_head = _resolved(view, "enable_dp_lm_head")
+    if lm_head is not False:
+        raise _rejected(f"enable_dp_lm_head is not supported (enable_dp_lm_head={_shown(lm_head)})")
+    batch_encode = _resolved(view, "enable_tokenizer_batch_encode")
+    if batch_encode is not False:
+        raise _rejected(
+            f"enable_tokenizer_batch_encode must be off under DP attention (got {_shown(batch_encode)}); SGLang "
+            "then sends a call as one batch message outside its block region, so the ranks are not released "
+            "together"
+        )
+
+
 def _is_text_run(prefill_content: str | None, experts: dict) -> bool:
     """Whether the prompts of this run are dataset text. ``ENV_PREFILL_CONTENT`` says what each value means."""
     if prefill_content is None:
@@ -1178,9 +1434,13 @@ def _start_up_checks(sglang_argv: list[str], environ: Mapping[str, str], produce
 
     Returns ``(server_args, view, experts)``: SGLang's record, the view of its resolved values, and the
     expert keys of the model config. ``main`` decides from the keys where the prompts come from
-    (``_is_text_run``) and then tests the expert-parallel layout (``_check_expert_parallel``). Nothing is
-    built here, so a refused setup costs no model load. Resolution does probe the device and reads the model
-    config.
+    (``_is_text_run``) and then tests the expert-parallel layout (``_check_expert_parallel``) and the layout
+    of DP attention (``_check_dp_attention``). Nothing is built here, so a refused setup costs no model load.
+    Resolution does probe the device and reads the model config.
+
+    ``environ`` is the live environment of the process. It is read twice: before resolution for the variables
+    that mean the same in every layout, and after it for those whose meaning depends on the number of
+    attention-DP ranks.
     """
     # The release is tested first, so that an untested one is refused by name and not by a field it lacks.
     version = compat.sglang_version()
@@ -1203,6 +1463,8 @@ def _start_up_checks(sglang_argv: list[str], environ: Mapping[str, str], produce
     _check_sglang_environment(environ)
     view = _sglang_call("resolving its arguments", compat.resolve, server_args)
     _check_resolved(view)
+    # Only now is the number of attention-DP ranks known, and it is a positive int.
+    _check_dp_environment(environ, _resolved(view, "attn_dp_size"))
 
     # srt/runtime_context.py ``PlatformContext`` and srt/arg_groups/fields/device.py ``Device``. A ROCm build
     # also names its device "cuda", and SGLang has admission rules for AMD only
@@ -1237,19 +1499,88 @@ def _resolved_settings(view: object, producer: dict) -> dict:
     """The run settings that only SGLang's resolved arguments give.
 
     srt/entrypoints/engine.py ``Engine._launch_scheduler_processes`` starts one scheduler process for each
-    pipeline rank and each TP rank. Pipeline parallelism and every data-parallel layout are refused above, so
-    the number of scheduler processes is ``tp_size``. The two request caps stay None in SGLang unless the
-    operator sets them (srt/arg_groups/fields/schedule.py ``Schedule``); the driver compares them with the
-    largest batch once the grid exists.
+    pipeline rank and each TP rank. Pipeline parallelism and data-parallel replicas are refused above, so the
+    number of scheduler processes is ``tp_size``. That holds under DP attention too: ``tp_size`` is then the
+    number of TP ranks over all attention-DP ranks, and the engine starts one process for each of them itself,
+    through ``run_scheduler_process_with_init_pipe`` (srt/managers/data_parallel_controller.py), which calls
+    the launcher's scheduler entry in that process with ten positional arguments. The DP controller is one
+    more child process; it builds no scheduler, so it writes no recorder header and is not counted. Read in
+    the source at both tags. In the runs of 2026-11-18 (module docstring) the recorder's entry took those
+    ten arguments, and the driver found two headers at ``--tp-size 2 --ep-size 2 --attn-dp-size 2``, one from
+    the leader of each rank.
+
+    ``dp_size`` of the run is SGLang's resolved ``attn_dp_size``: the number of ranks every stage is sent to
+    and the number of rank files (sglbench_driver.py ``RunSettings``). It is also written into the
+    ``producer`` block, with 1 for a run without DP attention, where the host holds it against the cell
+    (native_artifact.py ``_validate_sglang_moe_producer``).
+
+    The two request caps stay None in SGLang unless the operator sets them (srt/arg_groups/fields/schedule.py
+    ``Schedule``); the driver compares them with the largest batch once the grid exists.
     """
     tp_size = _resolved(view, "tp_size")
     if type(tp_size) is not int or tp_size < 1:
         raise TypeError(f"SGLang's resolved tp_size is {tp_size!r}, not a positive int")
+    attn_dp_size = _resolved(view, "attn_dp_size")
+    if not _positive_int(attn_dp_size):
+        raise TypeError(f"SGLang's resolved attn_dp_size is {attn_dp_size!r}, not a positive int")
     producer["tp_size"] = tp_size
+    producer["attn_dp_size"] = attn_dp_size
     return {
         "expected_scheduler_processes": tp_size,
+        "dp_size": attn_dp_size,
         "prefill_max_requests": _resolved(view, "prefill_max_requests"),
         "max_queued_requests": _resolved(view, "max_queued_requests"),
+    }
+
+
+# What the ``producer`` block says about how the requests of a run with several attention-DP ranks reach
+# their ranks: SGLang's DP controller deals them out in turn, and the driver checks from every response that
+# each ran on its planned rank (sglbench_driver.py ``BenchmarkRun._check_placement``).
+PLACEMENT_ROUND_ROBIN_CHECKED = "round_robin_checked"
+
+
+def _switch_on_input_blocker(view: object, environ: MutableMapping[str, str], producer: dict) -> None:
+    """For a run with several attention-DP ranks: set ``ENV_INPUT_BLOCKER`` and record how the run is set up.
+
+    The variable is set to ``1`` in the launcher's own environment, whatever it was, before the engine is
+    built. The scheduler processes are started by the engine with ``spawn`` and inherit it, and each builds an
+    input blocker when it finds it on. The tokenizer manager, in the launcher's process, reads it in every
+    batch call and then puts a block and an unblock message around the requests of the call
+    (srt/managers/tokenizer_manager.py ``TokenizerManager._handle_batch_request``,
+    srt/managers/scheduler_input_blocker.py ``input_blocker_guard_region``). The driver tests from the
+    recorder headers that every scheduler process has the blocker (``input_blocker``, sglbench_driver.py).
+
+    Deviation note (SGLang's input blocker is switched on under DP attention).
+    What differs: ``sglang serve`` with DP attention has no input blocker unless the operator sets the
+    variable. Here it is always on, because it is what lets every rank form its batch from all its requests
+    of a call in one scheduler step. Dynamo's vLLM self-benchmark sets no variable of the engine for that:
+    each rank has a driver of its own inside its scheduler, and they meet at a barrier of that benchmark
+    (instrumented_scheduler.py ``_BenchmarkSynchronizer``), whose wait lies outside the timed step.
+    Direction of the error: none known for a prefill batch. A decode step can only get longer, by the
+    question the blocker asks all ranks in every step. The measured sizes are in the deviation note at
+    sglbench_driver.py ``BenchmarkRun._stage``, which is the home of this fact.
+    Sources: read at both tags. In the runs of 2026-11-18 (module docstring) the launcher set the variable
+    and both scheduler headers reported the blocker. That no header reports it without the variable was
+    seen in the spike of that day only.
+    How to retire it: when SGLang releases the requests of a call on all ranks in one step without a
+    question in every step.
+
+    ``enable_dp_attention_local_control_broadcast`` is recorded and decides nothing. On, SGLang sends
+    control messages to the leader of every rank and broadcasts them inside a rank; off, it broadcasts them
+    over all ranks in every scheduler step (the help text of the field, srt/arg_groups/fields/parallel.py
+    ``Parallel``). The block and unblock messages go to every rank in both cases
+    (srt/managers/data_parallel_controller.py ``DataParallelController.init_dispatcher``). The runs of
+    2026-11-18 placed and released their calls alike with the field off and, with SGLang 0.5.23 only, with
+    the field on. The spike of that day did so with stock SGLang at both releases.
+    """
+    broadcast = _resolved(view, "enable_dp_attention_local_control_broadcast")
+    if type(broadcast) is not bool:
+        raise TypeError(f"SGLang's resolved enable_dp_attention_local_control_broadcast is {broadcast!r}, not a bool")
+    environ[ENV_INPUT_BLOCKER] = "1"
+    producer["dp_attention"] = {
+        "local_control_broadcast": broadcast,
+        "input_blocker": True,
+        "placement": PLACEMENT_ROUND_ROBIN_CHECKED,
     }
 
 
@@ -1540,7 +1871,12 @@ def _build_text_pool(engine: object, texts: list[str], id_limit: int) -> content
 
 
 class _EngineAdapter:
-    """The engine as the driver sees it: ``generate(prompts, rids, max_new_tokens)``, one batch call."""
+    """The engine as the driver sees it: ``generate(prompts, rids, max_new_tokens)``, one batch call.
+
+    The call is the same with any number of attention-DP ranks. With several, the driver hands over the
+    prompts of all ranks in one list, and each answer names the rank its request ran on
+    (sglbench_compat.py ``generate_batch``).
+    """
 
     def __init__(self, engine: object, stops: _SignalStops) -> None:
         self._engine = engine
@@ -1608,14 +1944,36 @@ def _text_id_limit(engine: object) -> int:
 # ---------------------------------------------------------------------------------------------------------------
 
 
+def _old_outputs(output_path: str) -> list[str]:
+    """The result files an earlier run may have left: the file of rank 0, the merged file and, beside them,
+    every file with the name of the file of a rank above 0.
+
+    This runs before SGLang's arguments are resolved, so the number of ranks of this run is not known yet,
+    and an earlier run in the same directory may have had more of them. The directory is therefore listed
+    and every name of the form ``_rank_file_frame`` describes is taken, whatever its rank.
+    """
+    paths = list(_result_paths(output_path))
+    directory = os.path.dirname(os.path.abspath(output_path))
+    head, tail = _rank_file_frame(output_path)
+    try:
+        names = sorted(os.listdir(directory))
+    except FileNotFoundError:
+        names = []
+    paths.extend(os.path.join(directory, name) for name in names if _is_rank_file_name(name, head, tail))
+    return paths
+
+
 def _remove_old_outputs(output_path: str) -> None:
-    """Delete the rank file and the merged file of an earlier run, and nothing else.
+    """Delete the rank files and the merged file of an earlier run, and nothing else.
+
+    A rank file that was left behind would be read with the new ones: AISim's collector takes every
+    ``benchmark*.json`` under the results directory for a rank file of the cell.
 
     The results directory also holds files of the collector and of its gate (the provenance file, the points
     receipt, logs), which are not the launcher's. Under the gate nothing is found here: it refuses to start
     when a result file exists (collector/fpm_forward/runtime/fpm_exec.sh).
     """
-    for path in _result_paths(output_path):
+    for path in _old_outputs(output_path):
         try:
             os.unlink(path)
         except FileNotFoundError:
@@ -1643,6 +2001,71 @@ def _exit_code(status: str | None, reason: str | None) -> int:
     if reason is not None and reason.startswith(f"{driver.REASON_INTERNAL}: "):
         return EXIT_INTERNAL
     return EXIT_FAILED
+
+
+# What the launcher can say of a pool that is not above the model's context. The limits do not tell a pool
+# below the context from one equal to it (``PoolCut.pool_sets_input_limit``), so the line says "if".
+_POOL_NOT_ABOVE_CONTEXT = (
+    "the pool is not above the model's context: if it is below the context, SGLang took the input limit from the "
+    "pool, and a larger pool raises the input limit"
+)
+
+
+def _pool_cut_lines(cut: grid.PoolCut) -> list[str]:
+    """The launcher's two lines for a prefill grid the KV pool cut: what it took, and where a pool comes from."""
+    pool = f"the KV pool of one rank, {cut.pool_tokens} tokens,"
+    if cut.dropped_pairs or cut.shortened_pairs:
+        took = (
+            f"{pool} cuts the prefill grid: of the {cut.pairs} pairs of new tokens and batch size planned without "
+            f"the pool limit, pairs left out: {cut.dropped_pairs}, pairs that end at a shorter cached prefix: "
+            f"{cut.shortened_pairs}"
+        )
+        if cut.pool_sets_input_limit:
+            took += (
+                f"; with the present input limit a pool of {cut.whole_grid_pool_tokens} tokens holds the whole "
+                f"grid; {_POOL_NOT_ABOVE_CONTEXT} too, which can lengthen the grid"
+            )
+        else:
+            took += f"; a pool of {cut.whole_grid_pool_tokens} tokens holds the whole grid"
+    else:
+        # Nothing but the input limit: the planned grid is the one the other limits give, and one of them may
+        # be the pool itself.
+        took = (
+            f"{pool} cuts nothing from the prefill grid of the present input limit; {_POOL_NOT_ABOVE_CONTEXT}, "
+            "which can lengthen the grid"
+        )
+    lever = (
+        f"a larger pool needs a larger memory share (SGLang's {MEMORY_SHARE_FLAG}, which a plan of AISim's "
+        f"collector gives as {PLAN_MEMORY_SHARE_FLAG}), or a larger {POOL_TOKENS_FLAG} where the command gives one"
+    )
+    return [took, lever]
+
+
+def _say_pool_cut(run: driver.BenchmarkRun) -> None:
+    """Say when the KV pool, and no other limit, ends axes of the generated prefill grid. Raises no ``Exception``.
+
+    Such a run completes with a table that reaches less far than the other limits allow, and no result file
+    says so (sglbench_grid.py, above ``PoolCut``). It is said twice. Once when the grid is planned: the run then
+    has all its time before it, and a reader who has only the start of the log still finds it. And once more
+    just before the outcome, where a reader of the end of the log looks. The lines are for any generated prefill
+    or agg grid, with or without DP attention.
+    """
+    try:
+        cut = run.prefill_pool_cut()
+        lines = [] if cut is None else _pool_cut_lines(cut)
+    except Exception as error:
+        # A note about the grid must not change the outcome of the run, and neither must a fault that cannot
+        # be put into words.
+        try:
+            fault = _described(error)
+        except Exception:
+            fault = type(error).__name__
+        lines = [f"what the KV pool takes from the prefill grid could not be worked out: {fault}"]
+    for line in lines:
+        try:
+            _say(line)
+        except Exception:
+            return
 
 
 def _finish(run: driver.BenchmarkRun, engine: object | None, stops: _SignalStops, producer: dict) -> int:
@@ -1678,6 +2101,8 @@ def _finish(run: driver.BenchmarkRun, engine: object | None, stops: _SignalStops
         write_error = _described(error)
     status, reason = run.status, run.reason
 
+    # Once more, and before the outcome, so that the outcome stays the last thing the launcher prints.
+    _say_pool_cut(run)
     if write_error is not None:
         if status == artifact.STATUS_FAILED:
             _say(f"FAILED: {reason}")
@@ -1738,7 +2163,8 @@ def main(argv: list[str] | None = None) -> int:
         run_id=run_id,
         content_seed=options.content_seed,
         worker_id=options.worker_id,
-        # Provisional: these three come from SGLang's resolved arguments and are replaced after the checks.
+        # Provisional: these three come from SGLang's resolved arguments and are replaced after the checks,
+        # and so is the number of attention-DP ranks, which is 1 until then.
         expected_scheduler_processes=1,
         prefill_max_requests=None,
         max_queued_requests=None,
@@ -1781,7 +2207,16 @@ def main(argv: list[str] | None = None) -> int:
             settings = dataclasses.replace(settings, content_source=source)
             run = new_run(settings)
             _check_expert_parallel(view, experts)
-            run = new_run(dataclasses.replace(settings, **_resolved_settings(view, producer)))
+            _check_dp_attention(view, experts)
+            settings = dataclasses.replace(settings, **_resolved_settings(view, producer))
+            # From here on the run has one rank file for every attention-DP rank.
+            run = new_run(settings)
+            if settings.dp_size > 1:
+                _switch_on_input_blocker(view, os.environ, producer)
+                _say(
+                    f"DP attention with {settings.dp_size} ranks: {ENV_INPUT_BLOCKER} is set to 1 for the "
+                    "scheduler processes, and every call carries the same number of prompts for every rank"
+                )
             if options.dump_config_to is not None:
                 _dump_resolved_arguments(options, run_id, producer["sglang_version"], server_args)
 
@@ -1813,6 +2248,8 @@ def main(argv: list[str] | None = None) -> int:
                 token_high=token_high,
                 text_pool=pool,
                 dataset=dataset,
+                # ``run`` is the run this call belongs to: the name is not bound again after this point.
+                on_grid=lambda: _say_pool_cut(run),
             )
         finally:
             # From here on a signal is noted and no longer raised, so that what follows cannot be interrupted.

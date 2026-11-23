@@ -23,20 +23,21 @@ What it does
     - one header line, after the stock ``__init__`` has returned: which process this is, the admission limits
       the scheduler holds, the captured graph sizes, and the settings a reader tests before it trusts a run;
     - one batch line per call of ``process_batch_result``: the forward mode, the request ids, the launch time
-      SGLang stamped on the batch, and the time at which the output of the batch was on the host;
+      SGLang stamped on the batch, the time at which the output of the batch was on the host, and the token
+      counts of all attention-DP ranks in the step, as the batch holds them;
     - one fault line when a recorder step raised. A fault never stops a batch.
 
     A recorder that cannot open its log leaves a working scheduler and no header. A reader must refuse a run
     in which a scheduler process has no header, and must fail a run on any fault line.
 
-Log format 1
+Log format 2
     Directory: the value of ``AISIM_SGLBENCH_RECORDER_DIR``, which the launcher creates for each run. One file
     per scheduler process, ``sched-<pid>.jsonl``, created new (an existing file is never appended to), UTF-8,
     one compact JSON object per line, flushed after every line. The header is always the first line.
 
     Header::
 
-        {"type": "header", "format": 1, "pid": int, "class": str, "mro": [str, str, str], "sglang_version": str,
+        {"type": "header", "format": 2, "pid": int, "class": str, "mro": [str, str, str], "sglang_version": str,
          "leader": bool, "ranks": {...}, "limits": {...}, "decode_graph_sizes": [int, ...],
          "prefill_graph_sizes": [int, ...], "enable_overlap": bool, "checks": {...}}
 
@@ -48,11 +49,35 @@ Log format 1
 
         {"type": "batch", "seq": int, "forward_iter": int, "mode": str, "launch_ts": float,
          "run_return_ts": float | null, "out_ts": float, "copy_done": bool, "rids": [str, ...],
-         "extend_num_tokens": int | null, "prefix_lens": [int, ...] | null, "extend_lens": [int, ...] | null}
+         "extend_num_tokens": int | null, "prefix_lens": [int, ...] | null, "extend_lens": [int, ...] | null,
+         "global_num_tokens": [int, ...] | null}
 
     ``seq`` counts the batch lines of the file from 1. The three extend fields are written for mode ``EXTEND``
     only; a decode batch still carries the values of the extend batch its object came from. A batch whose
     values cannot be read as these types gets a fault line and no batch line.
+
+    Under DP attention SGLang can turn the decode batch of a rank into an extend batch before it runs it,
+    when another rank extends in the same step (dp_attn.py,
+    ``SchedulerDPAttnAdapter.maybe_convert_decode_to_extend``; srt/managers/schedule_batch.py,
+    ``ScheduleBatch.convert_decode_to_extend``). The line of such a batch says what the batch then is: mode
+    ``EXTEND``, ``extend_lens`` of 1 for every request, ``extend_num_tokens`` the number of requests and
+    ``prefix_lens`` what each request held before the step. Read in the source at both tags; no such batch
+    was seen on an engine.
+
+    ``global_num_tokens`` is ``batch.global_num_tokens`` as it is: null when SGLang holds none on the batch,
+    else a list of token counts. Where SGLang keeps the counts of all ranks on the batch (srt/utils/common.py
+    ``require_mlp_tp_gather``; true under DP attention when ``moe_dense_tp_size`` is unset, which the launcher
+    requires), the list has one number per attention-DP rank: the tokens that rank runs in this step (the
+    computed tokens of an extend batch, the requests of a decode batch, 0 for an idle rank). Every rank then
+    holds the same list for the same step (srt/managers/scheduler_components/dp_attn.py,
+    ``MLPSyncBatchInfo.all_gather`` and ``_update_gather_batch``). Otherwise the list is the one count of this
+    process. It is the only key format 2 adds to format 1; every other key is unchanged.
+
+    Idle batches. Under DP attention a rank with nothing to run is given an idle batch in every step in which
+    another rank has tokens (dp_attn.py, ``prepare_mlp_sync_batch_raw`` and
+    ``SchedulerDPAttnAdapter.get_idle_batch``). It goes through ``run_batch`` and ``process_batch_result``
+    like any batch (srt/managers/scheduler.py), so it gets a batch line: mode ``IDLE``, no request id, null
+    extend fields. Without DP attention no such line is written.
 
     Fault line: ``{"type": "fault", "where": "run_batch" | "process_batch_result", "error": str}``.
 
@@ -63,6 +88,12 @@ Times
     ``process_batch_result``, right after the wait on ``result.copy_done`` and before the stock method runs.
     Clocks of different scheduler processes are not comparable.
 
+Steps
+    ``forward_iter`` is the number ``Scheduler.run_batch`` gives a batch: a count of the batches this process
+    ran, idle ones included. Under DP attention every rank runs one batch in every step in which any rank has
+    tokens, so batches of one step carry the same number on every rank. That, and not a time, is what a
+    reader may hold against another process's log, together with ``global_num_tokens``.
+
 Checked against SGLang v0.5.22 (baa9befa381511cd4d56f83980951e5a45fffc6d) and
 v0.5.23 (297e54fd105e974cdf401e5b4d20253a22c16f90) of ``sgl-project/sglang`` (Apache-2.0), by reading these files
 under ``python/sglang`` at both tags::
@@ -72,9 +103,17 @@ under ``python/sglang`` at both tags::
                                          Scheduler.init_schedule_policy,
                                          Scheduler.init_watch_dog_memory_saver_input_blocker,
                                          Scheduler.run_batch, Scheduler.process_batch_result,
-                                         Scheduler.event_loop_normal, Scheduler.event_loop_overlap
+                                         Scheduler.event_loop_normal, Scheduler.event_loop_overlap,
+                                         Scheduler.get_next_batch_to_run
     srt/managers/schedule_batch.py       ScheduleBatch (fields), ScheduleBatch.prepare_for_extend,
-                                         ScheduleBatch.prepare_for_decode, ScheduleBatch.copy, Req.rid
+                                         ScheduleBatch.prepare_for_decode, ScheduleBatch.prepare_for_idle,
+                                         ScheduleBatch.convert_decode_to_extend, ScheduleBatch.copy, Req.rid
+    srt/managers/scheduler_components/dp_attn.py
+                                         MLPSyncBatchInfo.all_gather, MLPSyncBatchInfo.finalize_local,
+                                         _update_gather_batch, prepare_mlp_sync_batch_raw,
+                                         SchedulerDPAttnAdapter.maybe_prepare_mlp_sync_batch,
+                                         SchedulerDPAttnAdapter.maybe_convert_decode_to_extend,
+                                         SchedulerDPAttnAdapter.get_idle_batch
     srt/managers/utils.py                GenerationBatchResult.copy_done, GenerationBatchResult.copy_to_cpu,
                                          EmbeddingBatchResult.copy_done
     srt/managers/async_d2h_copy_worker.py  HostCopyDone.synchronize (v0.5.23 only)
@@ -84,12 +123,13 @@ under ``python/sglang`` at both tags::
     srt/managers/scheduler_components/ipc_channels.py  SchedulerIpcChannels.create
     srt/managers/schedule_policy.py      _IS_HIP
     srt/managers/tp_worker.py            TpModelWorker.model_runner, TpModelWorker.get_worker_info
-    srt/model_executor/forward_batch_info.py  ForwardMode (member names)
+    srt/model_executor/forward_batch_info.py  ForwardMode (member names), ForwardBatch.prepare_mlp_sync_batch
     srt/model_executor/model_runner.py   ModelRunner.init_cuda_graphs
     srt/model_executor/runner/decode_cuda_graph_runner.py   DecodeCudaGraphRunner.capture_bs
     srt/model_executor/runner/prefill_cuda_graph_runner.py  PrefillCudaGraphRunner.capture_num_tokens
     srt/model_executor/runner/eager_runner.py                EagerRunner
     srt/runtime_context.py               get_parallel, ParallelContext._read
+    srt/utils/common.py                  require_mlp_tp_gather, require_mlp_sync
     srt/arg_groups/fields/parallel.py    Parallel (field names)
     srt/plugins/__init__.py              load_plugins
     srt/plugins/hook_registry.py         HookRegistry.register, HookRegistry._apply_target, _propagate_patch,
@@ -105,6 +145,26 @@ process at TP 1 and two at TP 2 (check_1), and no result file of the folder hold
 This module itself ran on engines on 2026-11-16, in eight launches of sglbench_launcher.py with SGLang 0.5.22
 and 0.5.23 on H200 GPUs, at TP 1 and TP 2: every scheduler process wrote its header with every value readable,
 and no log holds a fault line. The files of those launches are not kept in this repository.
+
+Format 2 of this module ran on engines on 2026-11-18, under DP attention, in launches of sglbench_launcher.py
+with SGLang 0.5.22 and 0.5.23 on two H200 GPUs: two-rank DEP cells of ``Qwen/Qwen1.5-MoE-A2.7B``
+(``--tp-size 2 --ep-size 2 --attn-dp-size 2``). Each release ran a prefill cell and a decode cell of a smoke
+grid through AISim's collector, and SGLang 0.5.23 ran the two cells once more with
+``--enable-dp-attention-local-control-broadcast``. ``recorder_entry`` took the ten positional arguments SGLang
+passes there. Both scheduler processes wrote a header as the leader of their rank, with ``attn_dp_size`` 2 and
+the input blocker. In the collector's cells each rank wrote 32 batch lines (prefill) or 186 (decode); every
+line of one rank had a line of the other rank with the same ``forward_iter``, the same mode, as many requests
+and the same ``global_num_tokens`` of two equal entries, for extend and for decode batches. No log held a
+fault line: the driver fails a run on one, and every run was complete. No rank wrote a line of mode ``IDLE``.
+With SGLang 0.5.23 the two cells of the default grid ran through the collector as well (2,892 and 857 points).
+In the decode cell a rank without work wrote lines of mode ``IDLE``, 158 on rank 0 and 123 on rank 1, each
+without request ids and without a fault, for steps in which only the other rank ran a seed batch; their
+``global_num_tokens`` holds 0 for the idle rank.
+
+Not run on an engine in format 2: an engine without DP attention, where what ``global_num_tokens`` holds rests
+on the source; more than two ranks (the runs with four ranks used a copy of this file with a memory probe in
+it); a decode batch that SGLang turned into an extend batch. The files of the runs are not kept in this
+repository.
 
 No upstream function or block of source is copied. What follows SGLang and Dynamo is named in the header of this
 file and recorded in THIRD_PARTY_NOTICES.md. For this module that is SGLang alone.
@@ -122,7 +182,7 @@ import time
 # scheduler processes inherit it.
 ENV_RECORDER_DIR = "AISIM_SGLBENCH_RECORDER_DIR"
 
-RECORD_FORMAT = 1
+RECORD_FORMAT = 2
 
 # The name of the subclass. A reader compares the header's "class" with it. It is the only sign that the hook
 # was applied: SGLang logs a hook that failed to apply and builds the stock class instead
@@ -219,6 +279,7 @@ _CHECK_NAMES = (*_CHECK_VALUE_NAMES, *_CHECK_PRESENCE_NAMES, "pp_max_micro_batch
 # Each row was read in the source at both tags, in the files the module docstring lists:
 # - ``ScheduleBatch`` is the class of the batch that ``run_batch`` and ``process_batch_result`` get, and
 #   ``GenerationBatchResult`` and ``EmbeddingBatchResult`` are the two classes of the result;
+# - ``ScheduleBatch.global_num_tokens`` is a dataclass field with the default None at both tags;
 # - the three ``ForwardMode`` members are names that ``record_batch`` logs as "mode". It tests for ``EXTEND``
 #   itself, and the reader of the log tests for all three (sglbench_driver.py ``MODE_EXTEND``, ``MODE_DECODE``
 #   and ``MODE_IDLE``).
@@ -244,6 +305,7 @@ SGLANG_SEAM_NAMES = (
     ("sglang.srt.managers.schedule_batch", "ScheduleBatch.extend_num_tokens", "field"),
     ("sglang.srt.managers.schedule_batch", "ScheduleBatch.prefix_lens", "field"),
     ("sglang.srt.managers.schedule_batch", "ScheduleBatch.extend_lens", "field"),
+    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.global_num_tokens", "field"),
     ("sglang.srt.managers.utils", "GenerationBatchResult.copy_done", "field"),
     ("sglang.srt.managers.utils", "EmbeddingBatchResult.copy_done", "field"),
     ("sglang.srt.model_executor.forward_batch_info", "ForwardMode.EXTEND", "attribute"),
@@ -366,7 +428,9 @@ def _is_leader(scheduler) -> bool:
     # sglang/srt/managers/scheduler.py, Scheduler.init_ipc_channels: recv_from_tokenizer is the request socket
     # in the process with pp_rank, attn_tp_rank and attn_cp_rank all 0, and None in every other scheduler
     # process (sglang/srt/managers/scheduler_components/ipc_channels.py, SchedulerIpcChannels.create). Only
-    # that process receives requests and sends outputs; the others run the same batches.
+    # that process receives requests and sends outputs; the others run the same batches. The test does not
+    # name the attention-DP rank, so under DP attention every rank has one such process, which receives the
+    # requests of its rank; the header's "ranks" say which rank that is.
     return scheduler.recv_from_tokenizer is not None
 
 
@@ -534,7 +598,8 @@ class _RecorderLog:
         # extend_lens on as the SAME list objects the live batch holds. They still describe this batch
         # because SGLang only rebinds these two attributes to new lists (ScheduleBatch.prepare_for_extend,
         # mix_with_running, convert_decode_to_extend) and edits neither in place; read in the source at
-        # both tags.
+        # both tags. ``global_num_tokens`` is passed on as the same list object too, and is only ever rebound
+        # (see below).
         forward_iter = _whole_number(batch.forward_iter, "batch.forward_iter")
         run_return_ts = self._run_return.pop(forward_iter, None)
         # ScheduleBatch.forward_mode is a ForwardMode, an IntEnum (sglang/srt/model_executor/
@@ -560,6 +625,17 @@ class _RecorderLog:
             extend_lens = _whole_numbers(batch.extend_lens, "batch.extend_lens")
         else:
             extend_num_tokens = prefix_lens = extend_lens = None
+        # ScheduleBatch.global_num_tokens: None until SGLang's sync step has written it. That step runs in
+        # Scheduler.get_next_batch_to_run for every batch when the engine needs it (always under DP
+        # attention) and binds a new list: every rank's token count of the step from the all-gather, or the
+        # one count of this process (srt/managers/scheduler_components/dp_attn.py, _update_gather_batch with
+        # MLPSyncBatchInfo.all_gather and MLPSyncBatchInfo.finalize_local). An idle batch gets it the same
+        # way. The list is not edited in place: ForwardBatch.prepare_mlp_sync_batch pads a copy
+        # (srt/model_executor/forward_batch_info.py). Read in the source at both tags. The attribute is read
+        # plainly: a batch without it is a changed seam and becomes a fault line.
+        global_num_tokens = batch.global_num_tokens
+        if global_num_tokens is not None:
+            global_num_tokens = _whole_numbers(global_num_tokens, "batch.global_num_tokens")
 
         # Deviation from serving: a line is written and flushed between two scheduler steps.
         #   What differs: serving writes no file per batch. Here the scheduler thread reads the fields above,
@@ -588,6 +664,7 @@ class _RecorderLog:
                 "extend_num_tokens": extend_num_tokens,
                 "prefix_lens": prefix_lens,
                 "extend_lens": extend_lens,
+                "global_num_tokens": global_num_tokens,
             },
             separators=(",", ":"),
             allow_nan=False,

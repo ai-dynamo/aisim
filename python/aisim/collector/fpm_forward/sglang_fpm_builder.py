@@ -34,10 +34,37 @@ Where the flag names come from
         v0.5.23  https://github.com/sgl-project/sglang/tree/297e54fd105e974cdf401e5b4d20253a22c16f90
 
     A field is the flag of its name with dashes (``python/sglang/srt/arg_groups/arg_utils.py``). The fields
-    used here are ``model_path``, ``context_length`` and ``kv_cache_dtype`` (``model.py``), ``tp_size`` and
-    ``ep_size`` (``parallel.py``), ``mem_fraction_static``, ``max_running_requests``, ``chunked_prefill_size``
-    and ``max_prefill_tokens`` (``schedule.py``) and ``served_model_name`` (``serving.py``). No SGLang code is
-    copied.
+    used here are ``model_path``, ``context_length`` and ``kv_cache_dtype`` (``model.py``), ``tp_size``,
+    ``attn_dp_size`` and ``ep_size`` (``parallel.py``), ``mem_fraction_static``, ``max_running_requests``,
+    ``chunked_prefill_size`` and ``max_prefill_tokens`` (``schedule.py``) and ``served_model_name``
+    (``serving.py``). No SGLang code is copied.
+
+The sizes of a cell with data-parallel ranks (DEP)
+    vLLM counts tensor-parallel ranks inside one data-parallel rank, and SGLang counts every rank of the
+    engine: its ``tp_size`` is the width over all attention-DP ranks, and the width of attention inside one
+    rank is ``tp_size // attn_dp_size // attn_cp_size`` (``python/sglang/srt/runtime_context.py``
+    ``derive_attn_tp_size``, read at both tags). So a vLLM command with tensor-parallel size T and
+    data-parallel size D above 1 becomes ``--tp-size T*D``, ``--attn-dp-size D`` and, for vLLM's
+    expert-parallel switch, ``--ep-size T*D``. With D of 1 nothing changes: no ``--attn-dp-size`` is written
+    and the two other sizes are the text of T. Planning admits only T of 1 for such a cell (planner.py
+    ``_require_sglang_launcher_cells``), and the launcher refuses any other layout under DP attention.
+
+    The limits of one rank. vLLM gives every data-parallel rank the whole token budget and the whole request
+    cap of the cell, and SGLang divides its chunk size and its request cap by the attention-DP size. So for D
+    above 1 ``--max-num-batched-tokens B`` becomes ``--chunked-prefill-size B*D --max-prefill-tokens B``, and
+    ``--max-num-seqs N`` becomes ``--max-running-requests N*D`` (the note on the limits of one rank at
+    ``_TRANSLATION``, with what follows for the memory of the cell).
+
+    What ran (the collector README, "DEP cells", has the whole account): on 2026-11-18 the command this module
+    writes for the DEP cell of two ranks, ``--tp-size 2 --ep-size 2 --attn-dp-size 2`` and no token flag, ran
+    through the launcher at SGLang 0.5.22 and 0.5.23 on two H200 GPUs (Qwen/Qwen1.5-MoE-A2.7B, smoke grids,
+    one prefill and one decode cell per release). The cells of the default grid ran at 0.5.23 twice. The first
+    time the prefill command carried ``--chunked-prefill-size 8192 --max-prefill-tokens 8192``, as this module
+    wrote it then, and both ranks reported a chunk size of 4,096. The second time it carried what this module
+    writes now, ``--chunked-prefill-size 16384 --max-prefill-tokens 8192``, and both ranks reported 8,192 for
+    both. Not run on an engine: a command this module wrote for more than two ranks, and ``--fpm-max-num-seqs``
+    or ``--fpm-max-model-len`` on such a cell. The flags it writes for the prefill cell of four ranks ran on the
+    launcher's own command, outside the collector (the deviation note at the translation table).
 """
 
 from __future__ import annotations
@@ -106,6 +133,8 @@ _MIN_DEADLINE_SECONDS = 60
 
 _MODE_FLAG = "--benchmark-mode"
 _TENSOR_PARALLEL_FLAG = "--tensor-parallel-size"
+_DATA_PARALLEL_FLAG = "--data-parallel-size"
+_EXPERT_PARALLEL_SWITCH = "--enable-expert-parallel"
 _POINTS_FILE_FLAG = "--benchmark-points-file"
 _TOKEN_BUDGET_FLAG = "--max-num-batched-tokens"
 # The cap of the prefill new-token axis. An SGLang plan has the runtime graph policy, under which the vLLM
@@ -114,7 +143,10 @@ _TOKEN_BUDGET_FLAG = "--max-num-batched-tokens"
 # ``SampleCaps``). The axis holds distinct integers from 1 to the largest prefill size, which is at most the
 # chunk size (``largest_prefill_new_tokens``), and the cell sets the chunk size to the token budget. An axis
 # that is not longer than its cap is not cut (``limit_graph_axis``). So the token budget as the cap cuts
-# nothing, whatever sizes the engine captures. A cap below 2 is refused by ``SampleCaps``.
+# nothing, whatever sizes the engine captures. A cap below 2 is refused by ``SampleCaps``. Under DP attention
+# the cell writes the chunk size as the token budget times the attention-DP size, and the chunk size a rank
+# reports is the token budget again (the note on the limits of one rank at ``_TRANSLATION``), so the same
+# holds for a DEP cell.
 _NEW_TOKEN_CAP_FLAG = "--prefill-max-new-token-samples"
 _MIN_SAMPLE_CAP = 2
 
@@ -169,10 +201,27 @@ def _positive_int(flag: str, value: str) -> int:
     return int(value)
 
 
-def _one_rank(flag: str, value: str) -> str:
+def _one_pipeline_stage(flag: str, value: str) -> str:
     if value != "1":
-        raise _refused(f"{flag} {value}: the launcher runs one data-parallel replica and one pipeline stage")
+        raise _refused(f"{flag} {value}: the launcher runs one pipeline stage")
     return value
+
+
+def _attention_dp_size(flag: str, value: str) -> str | None:
+    """The attention-DP size for vLLM's data-parallel size, or None for one rank, which writes nothing."""
+    size = _positive_int(flag, value)
+    return None if size == 1 else str(size)
+
+
+def _data_parallel_backend(flag: str, value: str) -> None:
+    # The Generator adds this flag with the value mp to every vLLM command with more than one data-parallel
+    # rank, and accepts no other value there (src/aisim/generator/builders/fpm_builder.py
+    # ``build_fpm_artifacts``). It chooses how vLLM starts its data-parallel engine cores. SGLang has no such
+    # choice: the ranks of DP attention are scheduler processes of one engine. Another value would name a
+    # vLLM start-up this module has not looked at.
+    if value != "mp":
+        raise _refused(f"{flag} {value}: only mp, the value the Generator writes, is known")
+    return None
 
 
 def _kv_cache_dtype(flag: str, value: str) -> str:
@@ -229,6 +278,13 @@ class _Row:
     # For a switch that SGLang takes as a size: the vLLM flag whose written value it is written with. Its
     # flags follow the flags of that one directly, and a command in which that flag wrote nothing is refused.
     value_of: str | None = None
+    # For a number that SGLang counts over more ranks than vLLM does: the vLLM flag whose written value it is
+    # multiplied by. A command in which that flag wrote nothing leaves the value as the text it was.
+    times: str | None = None
+    # For a row with ``times`` that writes more than one flag: the flags that carry the product, when not all
+    # of them do. The others keep the value as it was. A row that another row names with ``value_of`` has
+    # none, so that its written value is one number.
+    times_writes: tuple[str, ...] | None = None
 
 
 def _unchanged(flag: str) -> _Row:
@@ -250,22 +306,91 @@ _DROPPED_SWITCH = _Row(takes_value=False)
 # on every system.
 # Direction of the error: not known.
 # How to retire it: a launcher that covers mixed chunk, and a plan option that carries the serving graph list.
+#
+# The limits of one rank under DP attention (the token budget and the request cap of a DEP cell).
+# vLLM gives every data-parallel rank of a DEP cell the whole --max-num-batched-tokens B and the whole
+# --max-num-seqs N, because each rank has its own scheduler with these limits. Under DP attention SGLang
+# divides two of its numbers by the attention-DP size D, on every system: the chunk of one prefill batch of a
+# rank becomes ``chunked_prefill_size // D`` (``python/sglang/srt/arg_groups/parallel_hook.py``
+# ``handle_data_parallelism``), and the running requests of one rank become ``max_running_requests // D``
+# (``python/sglang/srt/mem_cache/kv_cache_configurator.py`` ``resolve_max_num_reqs``; v0.5.23 keeps at least
+# 1). Both were read at both tags. So for D above 1 the cell writes B * D and N * D, and each rank gets B and
+# N, as a vLLM rank does. The other token bound of a prefill batch, --max-prefill-tokens, is not divided and
+# is written as B. The chunk bounds the new tokens of a rank's batch summed over its requests, not those of
+# one request (runtime/sglbench_grid.py ``prefill_unfit_reason``, the chunk budget). The launcher plans the
+# grid of a cell from the limits its schedulers report and never reads the written numbers back.
+# Run on H200 (the collector README, "DEP cells"): with ``--chunked-prefill-size 16384 --max-prefill-tokens
+# 8192`` both ranks of a two-rank engine reported 8,192 for both in the launcher's run of the default grid on
+# 2026-11-18, and the prefill table reached 8,192 new tokens for a rank. Before that, with 8,192 written and
+# with SGLang's default of 8,192, both ranks reported a chunk size of 4,096, in the launcher's runs and with
+# stock SGLang outside the launcher; there, four requests of 1,024 new tokens per rank ran as one extend
+# batch per rank, and with 1,025 each both ranks split alike into 4,096 and 4 tokens. The request cap of a
+# rank was not run with --max-running-requests set.
+#
+# Deviation note (SGLang sizes the static memory of a DEP cell for D times the token budget).
+# What differs: when no --mem-fraction-static is given, SGLang sets that share from the chunk size as it is
+# written, before it divides it: ``handle_gpu_memory_settings`` (``python/sglang/srt/arg_groups/
+# memory_hook.py``) comes before ``handle_data_parallelism`` in the order of ``python/sglang/srt/arg_groups/
+# pipeline.py``. It keeps memory of each GPU free in proportion to the chunk it sees, 1.5 MiB for each token,
+# and, with SGLang's defaults, never less than 10,240 MiB in all on a GPU of more than 60 GiB. Read at both
+# tags. For a DEP cell that chunk is B * D. With the default B of 8,192 the share for the weights and the KV
+# pool is then smaller than with B written, and smaller still with more ranks. Where all that SGLang keeps
+# free for B * D is still under the 10,240 MiB, the share is the same as with B written: by the formula on
+# H200, at two ranks for a B of 2,048 or less, and at four ranks for no B. Only the prefill cell is affected,
+# because a decode cell carries no token budget.
+# Measured on H200 on 2026-11-18 (Qwen/Qwen1.5-MoE-A2.7B, SGLang 0.5.23, B of 8,192; the collector README,
+# "DEP cells"; GB of 2^30 bytes, as SGLang prints them). With two ranks SGLang chose a share of 0.805 and the
+# KV pool of a rank held 529,112 tokens, against 0.892 and 594,583 tokens with B written as it is. With four
+# ranks it chose 0.574, and 389,686 tokens; SGLang's own reserve for decode graphs, larger at four ranks, is
+# part of that fall. Of the memory left after weights and pool a GPU used 3.8 of 26.7 GB at its sampled peak
+# at two ranks and 6.0 of 58.6 GB at four. The peak was while SGLang captured its graphs. While the benchmark
+# ran, the used memory rose by under 0.1 GB, and every prefill batch above one token ran a captured graph.
+# The 1.5 MiB for each token are room for a prefill forward without a graph, and no run held one of more than
+# one token. With a share given on the command the same grid ran: 0.95 at two ranks, and 0.90 at four ranks
+# with a pool of 635,112 tokens and 7.5 GB of each GPU left at the peak.
+# Direction of the error: none expected for a collected point, because the pool size does not enter a
+# forward; not measured. The pool bounds the cached and new tokens a rank's batch may hold, so a prefill grid
+# that reaches the pool ends earlier: pairs of new tokens and batch size are left out or end at a shorter
+# cached prefix, and the run still completes. The grid of those runs did not reach it: its largest batch held
+# 32,740 tokens, and a pool of 32,749 tokens holds the whole grid. With more ranks and larger weights the
+# share can leave the pool no memory at all; SGLang then refuses to start (read in
+# ``python/sglang/srt/mem_cache/kv_cache_configurator.py`` and
+# ``python/sglang/srt/model_executor/pool_configurator.py``, not run).
+# How it shows: the launcher prints two lines when the pool cut the generated prefill grid of a cell, DEP or
+# not (runtime/sglbench_launcher.py ``_say_pool_cut``; run in the unit tests only), and SGLang's refusal
+# names --mem-fraction-static itself.
+# How to retire it: give the plan --fpm-gpu-memory-utilization, which is written as --mem-fraction-static
+# and takes the place of SGLang's own sizing. The cell writes a share only when the plan gives one. The runs
+# above are of one small model, and too large a share leaves a larger model no room for its graphs.
 _TRANSLATION: dict[str, _Row] = {
     "--model": _Row(writes=("--model-path",)),
     "--served-model-name": _unchanged("--served-model-name"),
-    _TENSOR_PARALLEL_FLAG: _Row(writes=("--tp-size",)),
-    # SGLang's defaults are 1, and the launcher refuses any other resolved value.
-    "--pipeline-parallel-size": _Row(value=_one_rank),
-    "--data-parallel-size": _Row(value=_one_rank),
-    # vLLM's switch carries no size: it spreads the experts of a MoE model over the ranks of the engine, and a
-    # cell has one data-parallel replica, so those are its tensor-parallel ranks. SGLang takes the size
-    # (``ep_size`` in ``fields/parallel.py``, default 1), so the switch is written as --ep-size with the
-    # tensor-parallel size. AISim's generated SGLang serving deployment passes the same size under the alias
+    # The text of the value for one data-parallel rank; multiplied by the data-parallel size above that,
+    # because SGLang's ``tp_size`` is the width over all attention-DP ranks (module docstring).
+    _TENSOR_PARALLEL_FLAG: _Row(writes=("--tp-size",), times=_DATA_PARALLEL_FLAG),
+    # SGLang's default is 1, and the launcher refuses any other resolved value.
+    "--pipeline-parallel-size": _Row(value=_one_pipeline_stage),
+    # vLLM's data-parallel ranks of a DEP cell. In SGLang the same name is an alias of ``dp_size``, the number
+    # of whole replicas of the model (``fields/parallel.py``), which the launcher refuses above 1; the flag is
+    # never passed on. The cell is SGLang's DP attention: ``attn_dp_size`` attention groups inside one engine,
+    # one scheduler each, while the layers after attention stay parallel over all ranks (the help text of
+    # the field). AISim's generated SGLang serving deployment asks for the same layout with the deprecated
+    # pair ``--data-parallel-size D --enable-dp-attention`` (src/aisim/generator/rule_plugin/sglang.rule,
+    # backend_config_mapping.yaml), which SGLang turns into ``attn_dp_size = D`` and ``dp_size = 1`` at both
+    # tags (``python/sglang/srt/arg_groups/parallel_hook.py`` ``handle_deprecated_dp_attention``) and marks
+    # for removal (``python/sglang/srt/server_args.py``, the registration of ``--enable-dp-attention``). The
+    # cell writes the current flag. One rank writes nothing, so SGLang's default of 1 applies.
+    _DATA_PARALLEL_FLAG: _Row(writes=("--attn-dp-size",), value=_attention_dp_size),
+    "--data-parallel-backend": _Row(value=_data_parallel_backend),
+    # vLLM's switch carries no size: it spreads the experts of a MoE model over the ranks of the engine, which
+    # are its tensor-parallel ranks times its data-parallel ranks. SGLang takes the size (``ep_size`` in
+    # ``fields/parallel.py``, default 1), so the switch is written as --ep-size with the value --tp-size was
+    # written with. AISim's generated SGLang serving deployment passes the same size under the alias
     # --expert-parallel-size (backend_config_mapping.yaml, ``moe_expert_parallel_size``). The Generator sets
     # the switch only for an expert-parallel size above 1 (src/aisim/generator/rule_plugin/vllm.rule), so a
     # one-GPU MoE cell writes no --ep-size and runs with SGLang's default. No other MoE flag has a row:
-    # --kernel-config, --enable-eplb and --data-parallel-backend refuse the cell like any unknown flag.
-    "--enable-expert-parallel": _Row(writes=("--ep-size",), takes_value=False, value_of=_TENSOR_PARALLEL_FLAG),
+    # --kernel-config and --enable-eplb refuse the cell like any unknown flag.
+    _EXPERT_PARALLEL_SWITCH: _Row(writes=("--ep-size",), takes_value=False, value_of=_TENSOR_PARALLEL_FLAG),
     "--kv-cache-dtype": _Row(writes=("--kv-cache-dtype",), value=_kv_cache_dtype),
     # The same pair as the Generator's (backend_config_mapping.yaml, ``kv_cache_free_gpu_memory_fraction``).
     # The number is passed as it is. In SGLang it is the share of the memory that the weights and the KV pool
@@ -293,10 +418,18 @@ _TRANSLATION: dict[str, _Row] = {
     "--decode-max-batch-size-samples": _unchanged("--decode-max-batch-size-samples"),
     "--benchmark-timeout": _Row(writes=("--benchmark-timeout",), value=_launcher_deadline),
     "--max-model-len": _Row(writes=("--context-length",), value=_context_length),
-    # vLLM's token budget of one step. SGLang has two bounds for it: the chunk of one request and the new
-    # tokens of one prefill batch.
-    _TOKEN_BUDGET_FLAG: _Row(writes=("--chunked-prefill-size", "--max-prefill-tokens"), value=_token_budget),
-    "--max-num-seqs": _Row(writes=("--max-running-requests",)),
+    # vLLM's token budget of one step. SGLang has two bounds for it: the chunk of one prefill batch and the new
+    # tokens of one prefill batch. Under DP attention SGLang divides the first by the attention-DP size and
+    # not the second, so only the chunk is multiplied by that size (the note on the limits of one rank above).
+    _TOKEN_BUDGET_FLAG: _Row(
+        writes=("--chunked-prefill-size", "--max-prefill-tokens"),
+        value=_token_budget,
+        times=_DATA_PARALLEL_FLAG,
+        times_writes=("--chunked-prefill-size",),
+    ),
+    # vLLM's request cap of one data-parallel rank. SGLang divides its own by the attention-DP size (the same
+    # note), so it is multiplied by that size.
+    "--max-num-seqs": _Row(writes=("--max-running-requests",), times=_DATA_PARALLEL_FLAG),
 }
 
 
@@ -306,7 +439,9 @@ def _translate_command(tokens: list[str]) -> list[str]:
     A flag may carry its value as the next token or after ``=``. A flag that is given twice is refused: the
     Generator and the two parsers each read the last one, and this module would have to guess the same. What a
     row with ``value_of`` writes stands directly after the flags of the flag it names, wherever the switch
-    itself stands in the vLLM command.
+    itself stands in the vLLM command. A row with ``times`` is multiplied before that, so the switch is
+    written with the product. Of the flags such a row writes, those in its ``times_writes`` carry the product
+    and the others the value; without ``times_writes`` all of them carry the product.
     """
     if tuple(tokens[:3]) != _VLLM_COMMAND:
         raise _refused(f"the command starts with {shlex.join(tokens[:3])!r}, not with {shlex.join(_VLLM_COMMAND)!r}")
@@ -339,6 +474,24 @@ def _translate_command(tokens: list[str]) -> list[str]:
             written[flag] = [token for name in row.writes for token in (name, translated)]
             written_values[flag] = translated
 
+    if _DATA_PARALLEL_FLAG in written and _EXPERT_PARALLEL_SWITCH not in given:
+        # More than one data-parallel rank without vLLM's expert-parallel switch is a set of whole replicas of
+        # the model. No plan holds such a cell (a dense model has no data-parallel preset, and the DEP preset
+        # sets the switch), and the launcher admits DP attention only with one expert-parallel rank on each
+        # attention-DP rank.
+        raise _refused(
+            f"{_DATA_PARALLEL_FLAG} {given[_DATA_PARALLEL_FLAG]} without {_EXPERT_PARALLEL_SWITCH}: the launcher "
+            "runs data-parallel ranks only as DP attention with one expert-parallel rank on each"
+        )
+    for flag, row in _TRANSLATION.items():
+        if row.times is None or flag not in written or row.times not in written:
+            continue
+        value = written_values[flag]
+        product = str(_positive_int(flag, value) * int(written_values[row.times]))
+        multiplied = row.writes if row.times_writes is None else row.times_writes
+        written[flag] = [token for name in row.writes for token in (name, product if name in multiplied else value)]
+        if row.times_writes is None:
+            written_values[flag] = product
     for flag, row in _TRANSLATION.items():
         if row.value_of is None or flag not in given:
             continue

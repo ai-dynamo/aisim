@@ -15,6 +15,10 @@ the comments, enumerated by brute force, or taken from AISim's own code (the hos
 freezer and the artifact validator). The expected sample-cap defaults are the flag defaults of Dynamo's vLLM
 self-benchmark. Where a comment names the engine probe, it says what a result file of
 benchmarks/evidence/collector/sglbench-engine-probe-20261113 holds and what the case adds to that.
+
+The last test reads SGLang's source and runs none of it. It needs a local checkout of SGLang for each release
+the module names. ``AISIM_SGLBENCH_SGLANG_SOURCES`` names a folder that holds them as ``v<version>``, the variable
+and the layout of ``test_fpm_sglbench_preflight.py``; without it that test is skipped.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ import dataclasses
 import hashlib
 import itertools
 import json
+import os
 import random
 import subprocess
 import sys
@@ -107,7 +112,11 @@ def test_module_imports_in_a_bare_interpreter_and_plans_the_same_grid_there():
         "print(g.build_grid('agg', g.Limits(16, 1500, 39984, 40, 1024, 592, (1, 2, 4), (4, 8, 16))).digest)"
     )
     done = subprocess.run(
-        [sys.executable, "-I", "-S", "-c", code, str(RUNTIME)], capture_output=True, text=True, timeout=60, check=False
+        [sys.executable, "-I", "-S", "-B", "-c", code, str(RUNTIME)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
     )
     assert done.returncode == 0, done.stderr
     here = grid.build_grid("agg", grid.Limits(16, 1500, 39984, 40, 1024, 592, (1, 2, 4), (4, 8, 16)))
@@ -140,7 +149,10 @@ def test_module_header_docstring_and_first_statement():
         "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
         "# SPDX-FileCopyrightText: Copyright 2023-2026 SGLang Team",
         "# SPDX-License-Identifier: Apache-2.0",
-        "# The feasibility rules follow SGLang v0.5.22 and v0.5.23; see THIRD_PARTY_NOTICES.md.",
+        (
+            "# The feasibility rules and the first prefill graph step follow SGLang v0.5.22 and v0.5.23; "
+            "see THIRD_PARTY_NOTICES.md."
+        ),
         "# Source: https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d",
         "# Source: https://github.com/sgl-project/sglang/tree/297e54fd105e974cdf401e5b4d20253a22c16f90",
         (
@@ -1090,11 +1102,14 @@ def test_each_cap_changes_only_its_own_axis():
         points = grid.build_grid("agg", limits, dataclasses.replace(NO_CAPS, **overrides)).points
         return points, _axes(points)
 
-    # New-token cap: five values of the graph axis, both ends kept, and the 1 in front of them, which does not
-    # count against the cap (the prefill ladder starts at 4); batches and cached prefixes of the surviving n
-    # unchanged.
+    # New-token cap: five values of the graph axis, both ends kept, and in front of them the low end, 1 and 2,
+    # which does not count against the cap (the prefill ladder starts at 4, so a batch of two tokens is the
+    # first that runs with a graph). The graph axis has 17 values: both sides of the eight sizes 4 to 512, and
+    # the limit 592. The tail above 512 is [513, 592], 2 * 5 = 10 <= 17 values, so it is kept and three samples
+    # are left for the 15 values up to 512: indices 0, 7 and 14, the values 4, 33 and 512. Batches and cached
+    # prefixes of the surviving n are unchanged.
     points, axes = capped(prefill_max_new_token_samples=5)
-    assert len(axes["new"]) == 6 and axes["new"] <= full["new"]
+    assert sorted(axes["new"]) == [1, 2, 4, 33, 512, 513, 592] and axes["new"] <= full["new"]
     assert {min(axes["new"]), max(axes["new"])} == {min(full["new"]), max(full["new"])}
     assert axes["batches"] == {new: full["batches"][new] for new in axes["new"]}
     assert axes["cached"] == {key: value for key, value in full["cached"].items() if key[0] in axes["new"]}
@@ -1257,7 +1272,14 @@ def test_generated_axes_are_the_documented_candidates(page):
         return values
 
     n_limit, _ = _brute_largest(range(1, 1504), lambda new: _prefill_fits(limits, 1, new, 0))
-    assert sorted(axes["new"]) == sorted({1, *_dynamo_cudagraph_axis_points(limits.prefill_graph_sizes, n_limit)})
+    # The low end: 1 and both sides of the first step. The smallest prefill graph has 4 tokens, and a batch
+    # replays it when the 4 tokens are at most twice its own: the first such batch has 2 tokens.
+    smallest = min(limits.prefill_graph_sizes)
+    first = next(tokens for tokens in range(1, smallest + 1) if smallest <= 2 * tokens)
+    assert (smallest, first) == (4, 2)
+    graph_values = _dynamo_cudagraph_axis_points(limits.prefill_graph_sizes, n_limit)
+    assert sorted(axes["new"]) == sorted({1, first - 1, first, *graph_values})
+    assert len(axes["new"]) == len(graph_values) + 2
     for new in axes["new"]:
         b_max, _ = _brute_largest(range(1, 44), lambda batch: _prefill_fits(limits, batch, new, 0))
         assert sorted(axes["batches"][new]) == sorted({*doubling(1, b_max), b_max})
@@ -1317,7 +1339,8 @@ def test_graph_driven_axes_keep_their_unpadded_tail_under_a_cap():
     # New tokens: n_limit = I - 1 = 100. Graph axis: each size and its successor (2..41), 80, 100: 42 values.
     # The tail above the largest size is [41, 80, 100]; 3 * 5 = 15 <= 42, so it is kept whole and the other
     # five samples come from 2..40 (39 values): positions 0, 9.5, 19, 28.5, 38 round to indices 0, 10, 19, 29,
-    # 38. The ladder has no 1, so 1 is put in front after the cut: nine values under a cap of eight.
+    # 38. The ladder has no 1, so 1 is put in front after the cut: nine values under a cap of eight. A batch of
+    # one token already replays the smallest graph, of 2 tokens, so the low end of the axis is that 1 alone.
     assert grid.prefill_new_token_axis(limits, caps) == [1, 2, 12, 21, 31, 40, 41, 80, 100]
     # Decode batches: b_limit = R = 100 and the same ladder, so the same axis.
     assert grid.decode_batch_axis(limits, caps) == [1, 2, 12, 21, 31, 40, 41, 80, 100]
@@ -1399,11 +1422,13 @@ def test_cached_and_context_axes_are_empty_when_nothing_fits():
     assert grid.decode_context_axis(LIMITS_A, caps, 8)[0] == 4
 
 
-def test_prefill_new_token_axis_starts_at_one_and_the_one_does_not_count_against_the_cap():
+def test_prefill_new_token_axis_gets_its_low_end_after_the_cut_and_outside_the_cap():
     """AISim's reader refuses a query below the collected range, so 1 new token must be on the axis.
 
-    The 1 is put in front AFTER the cut. The collector host sizes the cap as the number of candidates of its
-    own mirror, which has no forced 1; with that cap nothing may be cut.
+    With prefill graphs the low end also holds both sides of the first step of the table: the largest batch
+    that runs without a graph and the smallest that runs with one. The low end is put on the axis AFTER the
+    cut. The collector host sizes the cap as the number of candidates of its own mirror, which has no low end;
+    with that cap nothing may be cut.
     """
     sizes = (4, 8, 16)
     limits = _limits(1, prefill_graph_sizes=sizes)
@@ -1411,23 +1436,26 @@ def test_prefill_new_token_axis_starts_at_one_and_the_one_does_not_count_against
     assert n_limit == 600  # the chunk budget
     mirror = list(_dynamo_cudagraph_axis_points(tuple(sizes), n_limit))
     assert mirror == [4, 5, 8, 9, 16, 17, 32, 64, 128, 256, 512, 600]
-    assert grid.prefill_new_token_axis(limits, NO_CAPS) == [1, *mirror]
+    # The smallest graph has 4 tokens. A batch of one token would be padded to four times its size and runs
+    # without a graph; a batch of two is padded to twice its size and runs with it. The low end is 1 and 2.
+    assert grid.prefill_new_token_axis(limits, NO_CAPS) == [1, 2, *mirror]
 
     def capped(cap, record=limits):
         return grid.prefill_new_token_axis(record, dataclasses.replace(NO_CAPS, prefill_max_new_token_samples=cap))
 
-    # The host-sized cap, 12: nothing is cut, and the axis holds cap + 1 values.
-    assert capped(len(mirror)) == [1, *mirror]
+    # The host-sized cap, 12: nothing is cut, and the axis holds cap + 2 values.
+    assert capped(len(mirror)) == [1, 2, *mirror]
     # Cap 2: the tail above 16 is 7 of the 12 values, too many to protect, so the cut is uniform: both ends.
-    assert capped(2) == [1, 4, 600]
+    assert capped(2) == [1, 2, 4, 600]
     # Cap 3: uniform again; positions 0, 5.5, 11 round to indices 0, 6, 11.
-    assert capped(3) == [1, 4, 32, 600]
+    assert capped(3) == [1, 2, 4, 32, 600]
     for cap in (2, 3, 5, 11):
-        assert capped(cap) == [1, *grid.limit_graph_axis(mirror, sizes, cap)]
-        assert len(capped(cap)) == cap + 1
+        assert capped(cap) == [1, 2, *grid.limit_graph_axis(mirror, sizes, cap)]
+        assert len(capped(cap)) == cap + 2
 
     # The default cap of 64 on a ladder long enough to be cut: the even sizes 2..200 give 2..201, 400, 800 and
-    # n_limit = I - 1 = 1000, 203 values. The first value is 1 and the rest is the cut graph axis.
+    # n_limit = I - 1 = 1000, 203 values. A batch of one token already runs with the smallest graph, of 2
+    # tokens, so the low end is 1 alone: the first value is 1 and the rest is the cut graph axis.
     even = tuple(range(2, 201, 2))
     long_ladder = grid.Limits(1, 1001, 1_000_000, 100, 4096, None, (), even)
     graph_values = grid.graph_axis(even, 1000)
@@ -1435,15 +1463,287 @@ def test_prefill_new_token_axis_starts_at_one_and_the_one_does_not_count_against
     axis = grid.prefill_new_token_axis(long_ladder, grid.SampleCaps())
     assert axis[0] == 1 and axis[1:] == grid.limit_graph_axis(graph_values, even, 64) and len(axis) == 65
 
-    # A ladder that contains 1, or no ladder (powers of two): 1 is on the graph axis already, nothing is added
-    # and a cut axis holds exactly cap values. Ladder (1, 2): 1, 2, 3, the doubling tail 4..512, and 600: 12
-    # values. Cap 3 is a uniform cut (the tail above 2 is 10 of the 12 values): indices 0, 6, 11.
+    # A ladder that contains 1, or no ladder (powers of two): 1 is on the graph axis already and there is no
+    # step below it, so nothing is added and a cut axis holds exactly cap values. Ladder (1, 2): 1, 2, 3, the
+    # doubling tail 4..512, and 600: 12 values. Cap 3 is a uniform cut (the tail above 2 is 10 of the 12
+    # values): indices 0, 6, 11.
     with_one = _limits(1, prefill_graph_sizes=(1, 2))
     assert grid.prefill_new_token_axis(with_one, NO_CAPS) == [1, 2, 3, 4, 8, 16, 32, 64, 128, 256, 512, 600]
     assert capped(2, with_one) == [1, 600]
     assert capped(3, with_one) == [1, 32, 600]
     assert grid.prefill_new_token_axis(_limits(1, graphs=False), NO_CAPS)[:3] == [1, 2, 4]
     assert capped(2, _limits(1, graphs=False)) == [1, 600]
+
+
+# The low end of the prefill new-token axis: 1 and, when prefill graphs are captured, both sides of the first
+# step. The tests below take the step from a test-side model of SGLang's replay rule, not from the module.
+
+
+def _runs_with_a_graph(tokens: int, sizes) -> bool:
+    """Whether SGLang runs a prefill batch of ``tokens`` new tokens with one of the captured ``sizes``.
+
+    A test-side model. The batch is padded to the smallest captured size that holds it, and it replays that
+    graph unless the padded size is more than twice its own tokens; a batch above the largest size has no
+    graph. ``sizes`` are ascending. The last test of this file reads the rule in SGLang's source
+    (``PrefillCudaGraphRunner.can_replay_locally`` and ``BaseCudaGraphRunner._pad_to_bucket``).
+    """
+    if tokens > sizes[-1]:
+        return False
+    padded = next(size for size in sizes if size >= tokens)
+    return padded <= 2 * tokens
+
+
+def _expected_low_end(sizes, n_limit: int) -> set[int]:
+    """The low end for ``n_limit``: 1 and both sides of the first step, the step found by trying every batch."""
+    values = {1}
+    captured = sorted({size for size in sizes if size >= 1})
+    if captured:
+        first = next(tokens for tokens in range(1, captured[0] + 1) if _runs_with_a_graph(tokens, captured))
+        values |= {first - 1, first}
+    return {value for value in values if 1 <= value <= n_limit}
+
+
+def _low_end_limits(page: int, n_limit: int, sizes) -> grid.Limits:
+    """Limits whose largest new-token count is ``n_limit`` at any page size: the input limit ends the axis."""
+    limits = grid.Limits(page, n_limit + 1, 100_000 * page, 8, 100_000, None, (), sizes)
+    assert grid.largest_prefill_new_tokens(limits) == n_limit
+    return limits
+
+
+@pytest.mark.parametrize(
+    ("sizes", "expected"),
+    [
+        # One token runs with a graph of 1 (nothing is padded) and with a graph of 2 (twice its size).
+        ((1, 2, 4), 1),
+        ((2, 4, 8), 1),
+        # A graph of 3 or of 4 is more than twice one token and at most twice two tokens.
+        ((3, 6), 2),
+        ((4, 8, 16), 2),
+        # A graph of 5: 5 > 2 * 2 and 5 <= 2 * 3. A graph of 7 or of 8 is more than 2 * 3 and at most 2 * 4.
+        ((5, 10), 3),
+        ((7,), 4),
+        ((8, 16), 4),
+        # Only the smallest size counts, in whatever order and however often it is given.
+        ((16, 4, 8, 4), 2),
+        # No graph size, or none that is at least 1: there is no first step.
+        ((), None),
+        ((0, -3), None),
+        # Entries below 1 are not sizes.
+        ((0, 4, -8), 2),
+        ((-1, 0, 1), 1),
+    ],
+)
+def test_first_prefill_graph_tokens_hand_worked(sizes, expected):
+    assert grid.first_prefill_graph_tokens(sizes) == expected
+    assert grid.first_prefill_graph_tokens(list(sizes)) == expected
+    assert grid.first_prefill_graph_tokens(iter(sizes)) == expected
+
+
+def test_first_prefill_graph_tokens_is_the_smallest_batch_that_runs_with_the_smallest_graph():
+    assert grid.PREFILL_GRAPH_PADDING_FACTOR == 2
+    for smallest in range(1, 300):
+        sizes = (smallest, 5 * smallest + 3)
+        first = grid.first_prefill_graph_tokens(sizes)
+        with_graph = [tokens for tokens in range(1, smallest + 1) if _runs_with_a_graph(tokens, sizes)]
+        # Every batch from ``first`` up to the size runs with the graph, and no smaller one does.
+        assert with_graph == list(range(first, smallest + 1)), smallest
+        assert 1 <= first <= smallest
+        # The size is at most twice ``first`` and more than twice ``first - 1``.
+        assert 2 * (first - 1) < smallest <= 2 * first
+    for bad in ((True,), (4.0,), ("4",), (None,), (4, 0.5)):
+        with pytest.raises(TypeError, match="graph size"):
+            grid.first_prefill_graph_tokens(bad)
+
+
+LOW_END_CASES = [
+    # (prefill graph sizes, n_limit, the axis without a cut, the axis under a cap of 2).
+    # Sizes from 1 or from 2: a batch of one token runs with the smallest graph, so the low end is 1 alone.
+    ((1, 2, 4), 1, [1], [1]),
+    ((1, 2, 4), 2, [1, 2], [1, 2]),
+    ((1, 2, 4), 3, [1, 2, 3], [1, 3]),  # the cut keeps the two ends of 1, 2, 3
+    ((1, 2, 4), 100, [1, 2, 3, 4, 5, 8, 16, 32, 64, 100], [1, 100]),
+    ((2, 4), 1, [1], [1]),
+    ((2, 4), 2, [1, 2], [1, 2]),
+    ((2, 4), 3, [1, 2, 3], [1, 2, 3]),  # the graph axis is 2, 3: nothing to cut, and 1 in front
+    ((2, 4), 100, [1, 2, 3, 4, 5, 8, 16, 32, 64, 100], [1, 2, 100]),
+    # Sizes from 3 or from 4: the first batch with a graph has 2 tokens, so the low end is 1 and 2.
+    ((3, 6), 1, [1], [1]),
+    ((3, 6), 2, [1, 2], [1, 2]),
+    ((3, 6), 3, [1, 2, 3], [1, 2, 3]),
+    ((3, 6), 100, [1, 2, 3, 4, 6, 7, 12, 24, 48, 96, 100], [1, 2, 3, 100]),
+    ((4, 8), 1, [1], [1]),
+    ((4, 8), 2, [1, 2], [1, 2]),
+    ((4, 8), 3, [1, 2, 3], [1, 2, 3]),  # the graph axis is the limit 3 alone
+    ((4, 8), 100, [1, 2, 4, 5, 8, 9, 16, 32, 64, 100], [1, 2, 4, 100]),
+    # Sizes from 5: the first batch with a graph has 3 tokens, so the low end is 1, 2 and 3.
+    ((5, 10), 1, [1], [1]),
+    ((5, 10), 2, [1, 2], [1, 2]),
+    ((5, 10), 3, [1, 2, 3], [1, 2, 3]),
+    ((5, 10), 100, [1, 2, 3, 5, 6, 10, 11, 20, 40, 80, 100], [1, 2, 3, 5, 100]),
+    # Sizes from 8: the first batch with a graph has 4 tokens, so the low end is 1, 3 and 4. With n_limit = 2
+    # the graph axis is that limit alone and neither side of the step is in range; with n_limit = 3 only 3 is.
+    ((8, 16), 1, [1], [1]),
+    ((8, 16), 2, [1, 2], [1, 2]),
+    ((8, 16), 3, [1, 3], [1, 3]),
+    ((8, 16), 100, [1, 3, 4, 8, 9, 16, 17, 32, 64, 100], [1, 3, 4, 8, 100]),
+    # No prefill graphs: the powers of two and the limit, which start at 1. There is no step and no low end.
+    ((), 1, [1], [1]),
+    ((), 2, [1, 2], [1, 2]),
+    ((), 3, [1, 2, 3], [1, 3]),
+    ((), 100, [1, 2, 4, 8, 16, 32, 64, 100], [1, 100]),
+]
+
+
+@pytest.mark.parametrize("page", [1, 64])
+@pytest.mark.parametrize(("sizes", "n_limit", "uncut", "cut_to_two"), LOW_END_CASES)
+def test_the_low_end_of_the_prefill_new_token_axis_hand_worked(sizes, n_limit, uncut, cut_to_two, page):
+    """The new-token axis counts tokens, not pages: the same values at page size 1 and at page size 64.
+
+    Under a cap of 2, the smallest one, every graph axis that is cut here is cut to its two ends, and the
+    low end is added to them: up to five values under a cap of two.
+    """
+    limits = _low_end_limits(page, n_limit, sizes)
+    assert grid.prefill_new_token_axis(limits, NO_CAPS) == uncut
+    smallest_cap = dataclasses.replace(NO_CAPS, prefill_max_new_token_samples=2)
+    assert grid.prefill_new_token_axis(limits, smallest_cap) == cut_to_two
+    # The same low end from the test-side model of SGLang's rule.
+    graph_values = grid.graph_axis(sizes, n_limit)
+    low_end = _expected_low_end(sizes, n_limit)
+    assert uncut == sorted({*graph_values, *low_end})
+    ends = graph_values if len(graph_values) <= 2 else [graph_values[0], graph_values[-1]]
+    assert cut_to_two == sorted({*ends, *low_end})
+    # Every value of the low end is planned: one request of that many new tokens, without a cached prefix.
+    for caps in (NO_CAPS, smallest_cap):
+        planned = set(_prefill_shapes(grid.build_grid("prefill", limits, caps).points))
+        assert {(1, new, 0) for new in low_end} <= planned
+
+
+@pytest.mark.parametrize("page", [1, 64])
+def test_the_low_end_never_counts_against_the_cap_and_the_axis_stays_ascending_and_in_range(page):
+    rng = random.Random(8100 + page)
+    added_counts = dict.fromkeys(range(4), 0)
+    for _ in range(3000):
+        sizes = tuple(sorted({rng.randint(1, 40) for _ in range(rng.randint(0, 6))}))
+        n_limit = rng.choice([1, 2, 3, rng.randint(1, 12), rng.randint(1, 300)])
+        cap = rng.choice([2, 3, rng.randint(2, 12), 10_000])
+        limits = _low_end_limits(page, n_limit, sizes)
+        axis = grid.prefill_new_token_axis(limits, dataclasses.replace(NO_CAPS, prefill_max_new_token_samples=cap))
+        graph_values = grid.graph_axis(sizes, n_limit)
+        cut = grid.limit_graph_axis(graph_values, sizes, cap)
+        low_end = _expected_low_end(sizes, n_limit)
+
+        # The axis is the cut graph axis and the low end, and nothing else.
+        assert set(axis) == {*cut, *low_end}, (sizes, n_limit, cap)
+        assert all(low < high for low, high in itertools.pairwise(axis)), (sizes, n_limit, cap)
+        assert axis[0] == 1 and axis[-1] == n_limit
+        # The cap is spent on the graph axis alone: the cut holds as many values as the cap allows, every one
+        # of them is on the axis, and the low end comes on top, with at most three values.
+        assert len(cut) == min(cap, len(graph_values))
+        added = len(axis) - len(cut)
+        assert added == len(low_end - set(cut)) <= 3
+        added_counts[added] += 1
+
+        # What the low end is for: the smallest batch that runs with a graph is a row, and so is the batch of
+        # one token less, the largest that runs without one.
+        if sizes and n_limit >= sizes[0]:
+            with_graph = [tokens for tokens in range(1, sizes[0] + 1) if _runs_with_a_graph(tokens, sizes)]
+            assert with_graph[0] in axis
+            assert with_graph[0] == 1 or with_graph[0] - 1 in axis
+    # The sample holds every number of added values, from none (the low end is on the graph axis) to three.
+    assert all(count > 20 for count in added_counts.values()), added_counts
+
+
+def test_the_low_end_switched_off_gives_the_earlier_axis_and_the_same_other_points(monkeypatch):
+    """The only difference from the axis without the two sides of the first step is whole groups of new tokens.
+
+    ``first_prefill_graph_tokens`` is the one switch: with it answering ``None`` the axis is the cut graph axis
+    with 1 in front, as it was before the two sides were added. Every point of that grid is a point of the
+    grid of today, in the same order, and the decode block is the same block.
+    """
+    records = [
+        (_limits(1), NO_CAPS),
+        (_limits(16), grid.SampleCaps()),
+        (_limits(64, chunked=False), grid.SampleCaps(prefill_max_new_token_samples=3)),
+        (_limits(16, prefill_graph_sizes=(8, 16, 32)), NO_CAPS),
+        (_limits(1, prefill_graph_sizes=(5, 10, 20)), grid.SampleCaps(prefill_max_new_token_samples=2)),
+    ]
+    for limits, caps in records:
+        now = grid.build_grid("agg", limits, caps)
+        axis = grid.prefill_new_token_axis(limits, caps)
+        with monkeypatch.context() as patch:
+            patch.setattr(grid, "first_prefill_graph_tokens", lambda sizes: None)
+            earlier = grid.build_grid("agg", limits, caps)
+            earlier_axis = grid.prefill_new_token_axis(limits, caps)
+            decode_only = grid.build_grid("decode", limits, caps)
+        cut = grid.limit_graph_axis(
+            grid.graph_axis(limits.prefill_graph_sizes, grid.largest_prefill_new_tokens(limits)),
+            limits.prefill_graph_sizes,
+            caps.prefill_max_new_token_samples,
+        )
+        assert earlier_axis == [1, *cut]
+        added = set(axis) - set(earlier_axis)
+        assert added == _expected_low_end(limits.prefill_graph_sizes, axis[-1]) - {1} and added
+        kept = [shape for shape in _prefill_shapes(now.points) if shape[1] not in added]
+        assert kept == _prefill_shapes(earlier.points)
+        assert {shape[1] for shape in _prefill_shapes(now.points)} - {shape[1] for shape in kept} == added
+        assert _decode_shapes(now.points) == _decode_shapes(earlier.points)
+        # The ids of the added points move every later id, so the digest of the grid changes with them. A
+        # decode-only grid holds no prefill point and is the same grid.
+        assert now.digest != earlier.digest
+        assert grid.build_grid("decode", limits, caps) == decode_only
+
+
+@pytest.mark.parametrize("page", [1, 3, 16, 64])
+def test_every_generated_prefill_point_fits_with_the_low_end_on_the_axis(page):
+    """Random small limits with a prefill ladder that starts between 1 and 9 tokens.
+
+    The oracle is the test-side model of one prefill pass. A low-end value is at most ``n_limit``, so one
+    request of that size without a prefix always fits; its larger batches and its prefixes go through the
+    same searches as those of every other value.
+    """
+    rng = random.Random(8200 + page)
+    cut_caps = grid.SampleCaps(prefill_max_new_token_samples=2, prefill_max_kv_read_token_samples=2)
+    seen = {"points": 0, "two_sided": 0, "empty": 0}
+    for _ in range(300):
+        smallest = rng.randint(1, 9)
+        sizes = tuple(smallest * factor for factor in (1, 2, 4, 8))
+        limits = dataclasses.replace(_random_limits(rng, page), prefill_graph_sizes=sizes)
+        n_limit, _ = _brute_largest(
+            range(1, limits.max_req_input_len + 4), lambda new: _prefill_fits(limits, 1, new, 0)
+        )
+        for caps in (NO_CAPS, grid.SampleCaps(), cut_caps):
+            built = grid.build_grid("prefill", limits, caps)  # a candidate that does not fit would raise here
+            shapes = _prefill_shapes(built.points)
+            if n_limit is None:
+                assert shapes == [] and built.missing_phases == ("prefill",)
+                seen["empty"] += 1
+                continue
+            low_end = _expected_low_end(sizes, n_limit)
+            new_values = {new for _batch, new, _cached in shapes}
+            assert low_end <= new_values and min(new_values) == 1 and max(new_values) == n_limit
+            assert {(1, new, 0) for new in low_end} <= set(shapes)
+            assert all(_one_pass_takes_all(limits, *shape) for shape in shapes), limits
+            assert len(set(shapes)) == len(shapes)
+            seen["points"] += len(shapes)
+            seen["two_sided"] += len(low_end) > 1
+    assert seen["points"] > 1000 and seen["two_sided"] > 50 and seen["empty"] > 5, seen
+
+
+def test_a_step_inside_the_graph_sizes_is_not_sampled():
+    """What the docstring of ``prefill_new_token_axis`` calls not sampled, pinned so that a change shows.
+
+    A batch just above a size is padded to the next size and runs without a graph when that is more than
+    twice its own tokens. After a size of 4 the first such size is 11: five tokens would be padded to 11.
+    The sizes 9 and 10 are more than twice 4 as well and leave no batch without a graph, so "more than the
+    factor times the size before it" is needed for such a step and is not enough for one.
+    """
+    assert all(_runs_with_a_graph(5, (4, after)) for after in range(5, 11))
+    sizes = (4, 11)
+    assert [tokens for tokens in range(1, 12) if not _runs_with_a_graph(tokens, sizes)] == [1, 5]
+    # Both sides of 4 and of 11, the doubling tail and the limit, with the low end 1 and 2 in front. The row
+    # at 5 runs without a graph and the next row, at 11, with one: the step between 5 and 6 has no row at 6.
+    axis = grid.prefill_new_token_axis(_low_end_limits(1, 100, sizes), NO_CAPS)
+    assert axis == [1, 2, 4, 5, 11, 12, 22, 44, 88, 100]
 
 
 def test_decode_batch_axis_starts_at_one_and_the_one_does_not_count_against_the_cap():
@@ -1482,6 +1782,38 @@ def test_decode_batch_axis_starts_at_one_and_the_one_does_not_count_against_the_
     # Every decode batch of the grid, the added 1 included, gets its points.
     built = grid.build_grid("decode", limits)
     assert sorted({point.batch_size for point in built.points}) == [1, 8, 9, 16, 17, 32, 40]
+
+
+def test_the_decode_block_does_not_depend_on_the_prefill_graph_sizes(monkeypatch):
+    """The two sides of the first step are a rule of the prefill new-token axis alone.
+
+    The decode batch axis gets 1 in front and nothing else, whatever the decode ladder starts at: the module
+    has the padding rule for prefill graphs only. And no prefill graph size, with or without a low end,
+    changes a decode point.
+    """
+    caps_list = (NO_CAPS, grid.SampleCaps(), dataclasses.replace(NO_CAPS, decode_max_batch_size_samples=3))
+    for decode_sizes, axis in (
+        # A decode ladder from 8: 1 and both sides of 8, with no row at 4 and none at 3.
+        ((8, 16), [1, 8, 9, 16, 17, 32, 40]),
+        ((5, 10), [1, 5, 6, 10, 11, 20, 40]),
+        ((1, 2, 4, 8, 12, 16, 24), [1, 2, 3, 4, 5, 8, 9, 12, 13, 16, 17, 24, 25, 40]),
+    ):
+        without_prefill_graphs = _limits(16, decode_graph_sizes=decode_sizes, prefill_graph_sizes=())
+        assert grid.decode_batch_axis(without_prefill_graphs, NO_CAPS) == axis
+        reference = {caps: grid.build_grid("decode", without_prefill_graphs, caps) for caps in caps_list}
+        for prefill_sizes in ((1, 2, 4), (2, 4), (3, 6), (4, 8, 16), (5, 10), (8, 16), (4, 8, 16, 32, 64, 128)):
+            limits = dataclasses.replace(without_prefill_graphs, prefill_graph_sizes=prefill_sizes)
+            for caps in caps_list:
+                assert grid.decode_batch_axis(limits, caps) == grid.decode_batch_axis(without_prefill_graphs, caps)
+                # A decode-only grid is the same grid, ids and digest included.
+                assert grid.build_grid("decode", limits, caps) == reference[caps]
+                # In agg mode the decode points are the same and only their ids follow the prefill block.
+                agg = grid.build_grid("agg", limits, caps)
+                assert _decode_shapes(agg.points) == _decode_shapes(reference[caps].points)
+                with monkeypatch.context() as patch:
+                    patch.setattr(grid, "first_prefill_graph_tokens", lambda sizes: None)
+                    assert grid.build_grid("decode", limits, caps) == reference[caps]
+                    assert _decode_shapes(grid.build_grid("agg", limits, caps).points) == _decode_shapes(agg.points)
 
 
 def test_prefill_batch_axis_keeps_the_first_values_not_the_largest():
@@ -1552,6 +1884,459 @@ def test_build_grid_rejects_bad_arguments():
     for axis_function in (grid.prefill_new_token_axis, grid.decode_batch_axis):
         with pytest.raises(TypeError, match="SampleCaps"):
             axis_function(limits, None)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# What the KV pool takes from the generated prefill block
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def test_pool_cut_hand_worked():
+    """Page 1, I = 20, R = 2, M = 1000, chunking off, no graphs, no caps; the cached unit is 16 tokens.
+
+    Without the pool: n is 1, 2, 4, 8, 16 and 19 (n < 20), each at batch 1 and 2, twelve pairs. A prefix of 16
+    tokens fits beside n = 1 and n = 2 only (k + n < 20).
+
+    With S = 36 the pool rule is b * (k + n + 2) < 36:
+      (n=1, b=2) and (n=2, b=2): the prefix 16 needs 38 and 40, the empty prefix fits: two pairs end shorter.
+      (n=16, b=2) and (n=19, b=2): 36 and 42 without a prefix: two pairs are left out.
+      Every pair at batch 1 keeps its prefix (at most 19 + 2 = 21, and 16 + 2 + 2 = 20).
+    The whole block needs 2 * (19 + 2) = 42 < S, so 43 tokens are the smallest pool that takes nothing.
+    """
+    without_pool = grid.Limits(1, 20, 1_000_000, 2, 1000, None)
+    assert grid.prefill_new_token_axis(without_pool, NO_CAPS) == [1, 2, 4, 8, 16, 19]
+    assert grid.prefill_pool_cut(without_pool, NO_CAPS) is None
+
+    cut = grid.prefill_pool_cut(grid.Limits(1, 20, 36, 2, 1000, None), NO_CAPS)
+    assert cut == grid.PoolCut(
+        pool_tokens=36,
+        pairs=12,
+        dropped_pairs=2,
+        shortened_pairs=2,
+        whole_grid_pool_tokens=43,
+        pool_sets_input_limit=False,
+    )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        cut.pairs = 0
+
+    # One token more and the pair of two requests of 16 tokens fits again: 2 * 18 = 36 < 37.
+    assert grid.prefill_pool_cut(grid.Limits(1, 20, 37, 2, 1000, None), NO_CAPS).dropped_pairs == 1
+    # At 42 only the pair of two requests of 19 tokens is left out, and at 43 nothing is taken.
+    assert grid.prefill_pool_cut(grid.Limits(1, 20, 42, 2, 1000, None), NO_CAPS) == grid.PoolCut(
+        42, 12, 1, 0, 43, False
+    )
+    assert grid.prefill_pool_cut(grid.Limits(1, 20, 43, 2, 1000, None), NO_CAPS) is None
+
+
+def test_pool_cut_when_the_pool_leaves_no_point():
+    # One request of one token needs 1 * (0 + 1 + 1 + 1) = 3 < S.
+    limits = grid.Limits(1, 20, 3, 2, 1000, None)
+    assert grid.build_grid("prefill", limits, NO_CAPS).missing_phases == ("prefill",)
+    assert grid.prefill_pool_cut(limits, NO_CAPS) == grid.PoolCut(
+        pool_tokens=3,
+        pairs=12,
+        dropped_pairs=12,
+        shortened_pairs=0,
+        whole_grid_pool_tokens=43,
+        pool_sets_input_limit=False,
+    )
+
+
+def test_pool_cut_counts_pairs_against_the_planned_block():
+    """A pair that fits the pool but has no point in the planned block is left out, not shortened.
+
+    Page 7, I = 33, S = 28, R = 1, M = 1, chunking off, and caps that keep four new-token values. Without the
+    pool the new-token axis is 1, 4, 8 and 32. The pool lowers the largest n to 14, and the cap then keeps
+    1, 2, 8 and 14: n = 4 fits the pool and is not planned, n = 32 does not fit.
+    """
+    limits = grid.Limits(7, 33, 28, 1, 1, None)
+    caps = grid.SampleCaps(prefill_max_new_token_samples=4, prefill_max_kv_read_token_samples=2)
+    far = dataclasses.replace(limits, max_total_num_tokens=7 * 10**6)
+    assert grid.prefill_new_token_axis(far, caps) == [1, 4, 8, 32]
+    assert grid.prefill_new_token_axis(limits, caps) == [1, 2, 8, 14]
+    assert grid.prefill_unfit_reason(limits, 1, 4, 0) is None
+
+    cut = grid.prefill_pool_cut(limits, caps)
+    assert (cut.pairs, cut.dropped_pairs) == (4, 2)
+    # The planned block holds two pairs that are not among the four: n = 2 and n = 14.
+    planned = {(point.new_tokens, point.batch_size) for point in grid.build_grid("prefill", limits, caps).points}
+    assert planned == {(1, 1), (2, 1), (8, 1), (14, 1)}
+
+
+# Caps that cut the new-token axis, so that a pool which lowers the largest n makes the cut pick other values.
+CUTTING_CAPS = grid.SampleCaps(
+    prefill_max_new_token_samples=3, prefill_max_kv_read_token_samples=2, prefix_max_batch_size_samples=3
+)
+
+
+@pytest.mark.parametrize("page", [1, 3, 16, 24, 64])
+@pytest.mark.parametrize(
+    "caps", [NO_CAPS, grid.SampleCaps(), CUTTING_CAPS], ids=["no_caps", "default_caps", "cutting_caps"]
+)
+def test_pool_cut_agrees_with_the_two_planned_blocks_on_small_limits(page, caps):
+    """The answer is checked against the planned blocks alone, with a pool far beyond the one the module uses.
+
+    The pairs are those of the block for a pool of a million pages. A pair without a point in the block of the
+    real pool is left out; a pair whose longest prefix there is shorter ends shorter. ``None`` is the answer
+    exactly when the two blocks are the same list of points and the input limit is not the pool less 6. The
+    pool the record names for the whole grid is tried: with it nothing is taken, and with one page less
+    something is. Half of the limits have prefill graph sizes, so that a cap cuts the new-token axis, and a
+    fifth have the input limit SGLang reports for a pool that is not above the context, down to a pool of 7
+    tokens at page 1, whose input limit of 1 admits no request.
+    """
+    rng = random.Random(7100 + page)
+    seen = {"none": 0, "dropped": 0, "shortened": 0, "input_limit": 0}
+    for _ in range(300):
+        limits = _random_limits(rng, page)
+        if rng.random() < 0.5:
+            limits = dataclasses.replace(limits, prefill_graph_sizes=(4, 8, 16, 32, 64))
+        if rng.random() < 0.2:
+            # A pool that is not above the context: SGLang then reports the pool less 6 as the input limit.
+            pool = page * rng.randint(-(-7 // page), 96 // page + 2)
+            limits = dataclasses.replace(limits, max_req_input_len=pool - 6, max_total_num_tokens=pool)
+        far = dataclasses.replace(limits, max_total_num_tokens=page * 1_000_000)
+        planned = grid.build_grid("prefill", limits, caps)
+        without_pool = grid.build_grid("prefill", far, caps)
+        cut = grid.prefill_pool_cut(limits, caps)
+        sets_input_limit = limits.max_req_input_len + 6 == limits.max_total_num_tokens
+
+        if planned.point_dicts() == without_pool.point_dicts() and not sets_input_limit:
+            assert cut is None, limits
+            seen["none"] += 1
+            continue
+
+        def longest(built):
+            reach = {}
+            for point in built.points:
+                pair = (point.new_tokens, point.batch_size)
+                reach[pair] = max(reach.get(pair, 0), point.cached_tokens)
+            return reach
+
+        wanted, kept = longest(without_pool), longest(planned)
+        dropped = [pair for pair in wanted if pair not in kept]
+        shortened = [pair for pair in wanted if pair in kept and kept[pair] < wanted[pair]]
+        assert (cut.pool_tokens, cut.pairs) == (limits.max_total_num_tokens, len(wanted)), limits
+        assert (cut.dropped_pairs, cut.shortened_pairs) == (len(dropped), len(shortened)), limits
+        assert cut.pool_sets_input_limit == sets_input_limit, limits
+        # The blocks differ exactly when a pair is left out or ends shorter.
+        assert bool(dropped or shortened) == (planned.point_dicts() != without_pool.point_dicts()), limits
+
+        # The pool the record names holds the whole block; one page less does not.
+        need = cut.whole_grid_pool_tokens
+        assert need % page == 0
+        enough = dataclasses.replace(limits, max_total_num_tokens=need)
+        assert grid.build_grid("prefill", enough, caps).point_dicts() == without_pool.point_dicts(), limits
+        if need > page:
+            short = dataclasses.replace(limits, max_total_num_tokens=need - page)
+            assert grid.build_grid("prefill", short, caps).point_dicts() != without_pool.point_dicts(), limits
+        if dropped or shortened:
+            assert need > limits.max_total_num_tokens, limits
+
+        seen["dropped"] += bool(dropped)
+        seen["shortened"] += bool(shortened)
+        seen["input_limit"] += sets_input_limit
+    # The sample holds every answer: nothing taken, pairs left out, pairs that end shorter, and a pool that
+    # also sets the input limit. A pool that leaves no point has its own test above.
+    assert all(count > 5 for count in seen.values()), seen
+
+
+@pytest.mark.parametrize("page", [1, 3, 16, 24, 64])
+def test_a_shortened_pair_is_one_whose_longest_fitting_prefix_is_shorter(page):
+    """Where the pool leaves the pairs of the block as they are, the reason function alone gives the count.
+
+    For each pair the longest cached prefix is found by trying every multiple of the cached unit, once with the
+    real pool and once with a pool of a million pages.
+    """
+    rng = random.Random(7300 + page)
+    unit = grid.cached_unit(page)
+    checked = 0
+    for _ in range(300):
+        limits = _random_limits(rng, page)
+        far = dataclasses.replace(limits, max_total_num_tokens=page * 1_000_000)
+        pairs = {(point.new_tokens, point.batch_size) for point in grid.build_grid("prefill", far, NO_CAPS).points}
+        planned_pairs = {
+            (point.new_tokens, point.batch_size) for point in grid.build_grid("prefill", limits, NO_CAPS).points
+        }
+        cut = grid.prefill_pool_cut(limits, NO_CAPS)
+        if cut is None or pairs != planned_pairs:
+            continue
+
+        def longest(record, batch, new):
+            prefixes = range(0, record.max_req_input_len + 2 * unit, unit)
+            return _brute_largest(prefixes, lambda cached: _prefill_fits(record, batch, new, cached))[0]
+
+        shorter = [pair for pair in pairs if longest(limits, pair[1], pair[0]) < longest(far, pair[1], pair[0])]
+        assert (cut.dropped_pairs, cut.shortened_pairs) == (0, len(shorter)), limits
+        checked += 1
+    assert checked > 5
+
+
+# The limits one rank reported in the DEP prefill cells of 2026-11-18 (Qwen1.5-MoE-A2.7B on H200 GPUs at SGLang
+# 0.5.23, 8,192 tokens for each rank), typed here from the rank files of those runs, and the two caps the cell's
+# command carried. The pool is the argument. The decode graph sizes are shortened to four; no number below
+# depends on them.
+MEASURED_PREFILL_GRAPH_SIZES = (
+    *range(4, 33, 4),
+    *range(48, 257, 16),
+    *range(288, 513, 32),
+    *range(576, 1025, 64),
+    *range(1280, 4097, 256),
+    *range(4608, 8193, 512),
+)
+MEASURED_CAPS = grid.SampleCaps(prefill_max_new_token_samples=8192, prefill_max_kv_read_token_samples=29)
+
+
+def _measured_limits(pool: int, **overrides) -> grid.Limits:
+    record = {
+        "page_size": 1,
+        "max_req_input_len": 8186,
+        "max_total_num_tokens": pool,
+        "max_running_requests": 4096,
+        "max_prefill_tokens": 8192,
+        "chunked_prefill_size": 8192,
+        "decode_graph_sizes": (1, 2, 4, 8),
+        "prefill_graph_sizes": MEASURED_PREFILL_GRAPH_SIZES,
+    }
+    record.update(overrides)
+    return grid.Limits(**record)
+
+
+def _measured_grid(pool: int) -> grid.Grid:
+    return grid.build_grid("prefill", _measured_limits(pool), MEASURED_CAPS)
+
+
+# The measured cells were collected with the earlier new-token axis, which had 1 in front of the graph sizes
+# and no 2: 116 values, 305 pairs and 3,314 points. The axis of today also holds 2, the first batch that runs
+# with a graph: 117 values, 308 pairs and 3,347 points. The tests below pin the grid of today and show, with
+# the low end switched off, that the grid of the measured cells is the same grid less the group of n = 2.
+MEASURED_EARLIER = {"new_values": 116, "pairs": 305, "points": 3314}
+MEASURED_TODAY = {"new_values": 117, "pairs": 308, "points": 3347}
+
+
+def _measured_counts(low_end) -> dict:
+    """New-token values, pairs and points of the measured prefill block, counted without the module's axes.
+
+    For a pool that ends no axis. The new-token axis is the low end, both sides of every graph size below
+    ``n_limit`` and ``n_limit`` itself, which is 8,185: the prompt must stay below the input limit of 8,186.
+    The chunk budget of 8,192 tokens holds ``8192 // n`` requests of ``n`` new tokens, and the batch axis is
+    the first three of the powers of two up to that number and the number itself: ``min(3, 8192 // n)`` batch
+    sizes. The cached prefixes of a pair are 0, the doublings of 16 and the longest one, the largest multiple
+    of 16 with ``k + n <= 8185``; there are at most 11 of them, below the cap of 29.
+    """
+    below = [size for size in MEASURED_PREFILL_GRAPH_SIZES if size < 8185]
+    new_values = sorted({*low_end, *below, *(size + 1 for size in below), 8185})
+    pairs = points = 0
+    for new in new_values:
+        longest = (8185 - new) // 16 * 16
+        prefixes = {0, longest, *(16 * 2**step for step in range(10) if 16 * 2**step <= longest)}
+        pairs += min(3, 8192 // new)
+        points += min(3, 8192 // new) * len(prefixes)
+    return {"new_values": len(new_values), "pairs": pairs, "points": points}
+
+
+def test_measured_grid_counts_follow_from_the_measured_limits():
+    assert len(MEASURED_PREFILL_GRAPH_SIZES) == 58
+    assert _measured_counts({1}) == MEASURED_EARLIER
+    assert _measured_counts({1, 2}) == MEASURED_TODAY
+    # n = 2 runs at the batch sizes 1, 2 and 4, each with 11 cached prefixes: 0, the nine doublings from 16
+    # to 4,096, and 8,176, the longest that keeps the prompt below the input limit.
+    assert MEASURED_TODAY["pairs"] == MEASURED_EARLIER["pairs"] + 3
+    assert MEASURED_TODAY["points"] == MEASURED_EARLIER["points"] + 3 * 11
+    assert len(grid.prefill_new_token_axis(_measured_limits(638_230), MEASURED_CAPS)) == 117
+    prefixes = [0, *(16 * 2**step for step in range(9)), 8176]
+    assert prefixes[-2:] == [4096, 8176] and len(prefixes) == 11
+    assert sorted(shape for shape in _prefill_shapes(_measured_grid(638_230).points) if shape[1] == 2) == [
+        (batch, 2, cached) for batch in (1, 2, 4) for cached in prefixes
+    ]
+
+
+@pytest.mark.parametrize("pool", [389_686, 529_112, 635_112, 638_230])
+def test_no_pool_of_the_measured_dep_cells_cut_the_prefill_grid(pool, monkeypatch):
+    """The pools of the four runs: two and four ranks, each with SGLang's own share and with a share given.
+
+    None of them cut the grid the cells were collected with, and none cuts the grid of today, which has the
+    33 points of n = 2 on top. The largest of those, four requests with a prefix of 8,176 tokens, needs
+    4 * (8,176 + 2 + 2) = 32,720 pool tokens.
+    """
+    today = _measured_grid(pool)
+    assert len(today.points) == 3347
+    assert grid.prefill_pool_cut(_measured_limits(pool), MEASURED_CAPS) is None
+
+    # As collected: without the two sides of the first step.
+    monkeypatch.setattr(grid, "first_prefill_graph_tokens", lambda sizes: None)
+    collected = _measured_grid(pool)
+    assert len(collected.points) == 3314
+    assert _prefill_shapes(collected.points) == [shape for shape in _prefill_shapes(today.points) if shape[1] != 2]
+    assert grid.prefill_pool_cut(_measured_limits(pool), MEASURED_CAPS) is None
+
+
+def test_the_smallest_pool_that_leaves_the_measured_grid_whole(monkeypatch):
+    """Four requests of 8,185 tokens need 4 * (8,185 + 2) = 32,748 pool tokens, strictly below the pool.
+
+    The 8,185 tokens are a cached prefix of 8,176 and 9 new tokens, or one of 8,160 and 25. One token less
+    and the grid still has its 3,347 points, so a point count does not show the cut: two pairs end at a
+    shorter cached prefix. The pool is the same for the grid the cells were collected with: the points of
+    n = 2 need less, 32,720 tokens at most.
+    """
+    assert grid.prefill_pool_cut(_measured_limits(32_749), MEASURED_CAPS) is None
+    cut = grid.prefill_pool_cut(_measured_limits(32_748), MEASURED_CAPS)
+    assert cut == grid.PoolCut(
+        pool_tokens=32_748,
+        pairs=308,
+        dropped_pairs=0,
+        shortened_pairs=2,
+        whole_grid_pool_tokens=32_749,
+        pool_sets_input_limit=False,
+    )
+    assert len(_measured_grid(32_748).points) == 3347
+    # The two pairs: four requests of 9 and of 25 new tokens lose their longest prefix.
+    lost = set(_prefill_shapes(_measured_grid(32_749).points)) - set(_prefill_shapes(_measured_grid(32_748).points))
+    assert sorted(lost) == [(4, 9, 8176), (4, 25, 8160)]
+
+    # As collected, without the two sides of the first step: the same pool, and the three pairs of n = 2 fewer.
+    monkeypatch.setattr(grid, "first_prefill_graph_tokens", lambda sizes: None)
+    assert grid.prefill_pool_cut(_measured_limits(32_749), MEASURED_CAPS) is None
+    assert grid.prefill_pool_cut(_measured_limits(32_748), MEASURED_CAPS) == dataclasses.replace(cut, pairs=305)
+    assert len(_measured_grid(32_748).points) == 3314
+
+
+def test_pool_cut_when_the_input_limit_admits_no_request():
+    """An input limit of 1 leaves both blocks empty. With a pool of 7 tokens that is still a record."""
+    for page, whole in ((1, 1), (7, 7)):
+        limits = grid.Limits(page, 1, 7, 2, 100, None)
+        assert grid.build_grid("prefill", limits, grid.SampleCaps()).missing_phases == ("prefill",)
+        assert grid.prefill_pool_cut(limits) == grid.PoolCut(
+            pool_tokens=7,
+            pairs=0,
+            dropped_pairs=0,
+            shortened_pairs=0,
+            whole_grid_pool_tokens=whole,
+            pool_sets_input_limit=True,
+        )
+    # The same input limit under a larger pool: the pool is above the context, and nothing is said.
+    assert grid.prefill_pool_cut(grid.Limits(1, 1, 8, 2, 100, None)) is None
+
+
+def test_a_pool_equal_to_the_context_gives_the_record_of_a_pool_below_it(monkeypatch):
+    """The measured engine has a context of 8,192, so I = 8,186 whatever the pool from 8,192 up.
+
+    A pool of exactly 8,192 tokens also gives I = S - 6, and the limits do not tell it from a pool below a
+    longer context. The record is the same kind, and here a pool of the 32,749 tokens it names does hold the
+    whole grid: the input limit stays where it is.
+
+    The counts. One request reaches the input limit before this pool, so the 117 pairs at batch 1 keep their
+    prefix. Of the 191 pairs at a larger batch two are left out, two requests of 4,096 new tokens
+    (2 * 4,098 = 8,196) and four of 2,048 (4 * 2,050 = 8,200), and the other 189 end shorter. The pairs of
+    n = 2 at the batch sizes 2 and 4 are two of them: without them the counts are 305 and 187.
+    """
+    assert MEASURED_TODAY["pairs"] - MEASURED_TODAY["new_values"] - 2 == 189
+    cut = grid.prefill_pool_cut(_measured_limits(8_192), MEASURED_CAPS)
+    assert cut == grid.PoolCut(
+        pool_tokens=8_192,
+        pairs=308,
+        dropped_pairs=2,
+        shortened_pairs=189,
+        whole_grid_pool_tokens=32_749,
+        pool_sets_input_limit=True,
+    )
+    planned = {(batch, new) for batch, new, _cached in _prefill_shapes(_measured_grid(8_192).points)}
+    wanted = {(batch, new) for batch, new, _cached in _prefill_shapes(_measured_grid(32_749).points)}
+    assert sorted(wanted - planned) == [(2, 4096), (4, 2048)]
+    assert grid.prefill_pool_cut(_measured_limits(32_749), MEASURED_CAPS) is None
+
+    monkeypatch.setattr(grid, "first_prefill_graph_tokens", lambda sizes: None)
+    assert MEASURED_EARLIER["pairs"] - MEASURED_EARLIER["new_values"] - 2 == 187
+    assert grid.prefill_pool_cut(_measured_limits(8_192), MEASURED_CAPS) == dataclasses.replace(
+        cut, pairs=305, shortened_pairs=187
+    )
+
+
+def test_a_pool_that_is_not_above_the_context_also_sets_the_input_limit(monkeypatch):
+    """SGLang reports an input limit of the pool less 6 when the pool is not above the model's context.
+
+    With a context of 40,960 and a pool of 30,000 the engine reports I = 29,994. The record says that the
+    input limit is the pool less 6: the block "without the pool" is planned for that I, so the 191 of 308 pairs
+    and the 119,981 tokens are for the grid of that input limit. A pool of 119,981 tokens would be above this
+    context and would raise the input limit to 40,954, which gives another, longer grid.
+
+    The counts. The new-token axis ends at the chunk budget of 8,192 here and has as many values and pairs as
+    the measured one. One request reaches the input limit before the pool, and every pair at a larger batch
+    ends shorter: 308 - 117 = 191. The largest point is four requests with a prompt of 29,993 tokens, which
+    hold 4 * (29,993 + 2) = 119,980 tokens. Without the pairs of n = 2 the counts are 305 and 189.
+    """
+    limits = _measured_limits(30_000, max_req_input_len=29_994)
+    assert grid.largest_prefill_new_tokens(limits) == 8192
+    assert len(grid.prefill_new_token_axis(limits, MEASURED_CAPS)) == MEASURED_TODAY["new_values"]
+    assert MEASURED_TODAY["pairs"] - MEASURED_TODAY["new_values"] == 191
+    cut = grid.prefill_pool_cut(limits, MEASURED_CAPS)
+    assert cut == grid.PoolCut(
+        pool_tokens=30_000,
+        pairs=308,
+        dropped_pairs=0,
+        shortened_pairs=191,
+        whole_grid_pool_tokens=119_981,
+        pool_sets_input_limit=True,
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(grid, "first_prefill_graph_tokens", lambda sizes: None)
+        assert MEASURED_EARLIER["pairs"] - MEASURED_EARLIER["new_values"] == 189
+        assert grid.prefill_pool_cut(limits, MEASURED_CAPS) == dataclasses.replace(cut, pairs=305, shortened_pairs=189)
+    # With batch 1 alone the pool rule never binds before the input limit, and the two blocks are the same
+    # list of points. The record is still given, because the input limit itself can come from the pool.
+    one_batch = dataclasses.replace(MEASURED_CAPS, prefix_max_batch_size_samples=1)
+    alone = grid.prefill_pool_cut(limits, one_batch)
+    assert (alone.dropped_pairs, alone.shortened_pairs, alone.pool_sets_input_limit) == (0, 0, True)
+    # One token of pool more, with the same reported input limit, and the pool is above the context.
+    assert grid.prefill_pool_cut(_measured_limits(30_001, max_req_input_len=29_994), one_batch) is None
+    assert grid._INPUT_LIMIT_BELOW_POOL == 6
+
+
+def test_pool_cut_follows_the_caps_and_takes_the_default_caps_for_none():
+    limits = grid.Limits(1, 20, 36, 2, 1000, None)
+    assert grid.prefill_pool_cut(limits) == grid.prefill_pool_cut(limits, grid.SampleCaps())
+    # With one batch size for every n the block holds batch 1 only, and no pair at batch 1 reaches the pool.
+    one_batch = dataclasses.replace(NO_CAPS, prefix_max_batch_size_samples=1)
+    assert grid.prefill_pool_cut(limits, one_batch) is None
+    assert grid.prefill_pool_cut(limits, NO_CAPS) is not None
+
+
+def test_pool_cut_takes_the_other_limits_as_they_are_and_leaves_the_record_alone():
+    limits = _limits(16, max_total_num_tokens=grid.floor_pages(2_000, 16))
+    before = limits.as_dict()
+    cut = grid.prefill_pool_cut(limits, NO_CAPS)
+    assert cut is not None and cut.pool_tokens == 2_000 // 16 * 16 and not cut.pool_sets_input_limit
+    assert limits.as_dict() == before
+    # The block without the pool is the block of the same record with any pool that no point reaches.
+    far_block = grid.build_grid("prefill", dataclasses.replace(limits, max_total_num_tokens=16 * 10**9), NO_CAPS)
+    assert cut.pairs == len({(point.new_tokens, point.batch_size) for point in far_block.points})
+    enough = dataclasses.replace(limits, max_total_num_tokens=cut.whole_grid_pool_tokens)
+    assert grid.build_grid("prefill", enough, NO_CAPS).point_dicts() == far_block.point_dicts()
+    assert grid.prefill_pool_cut(enough, NO_CAPS) is None
+
+
+def test_pool_cut_rejects_bad_arguments():
+    limits = _limits(16)
+    with pytest.raises(TypeError, match="Limits"):
+        grid.prefill_pool_cut(limits.as_dict())
+    with pytest.raises(TypeError, match="SampleCaps"):
+        grid.prefill_pool_cut(limits, {"prefix_max_batch_size_samples": 1})
+
+
+def test_the_decode_block_reaches_the_pool_with_the_default_request_cap_and_not_with_a_small_one():
+    """Why only the prefill block is reported.
+
+    With the largest pool of the measured cells and SGLang's request cap of 4,096, 256 decode requests can
+    hold a context of 2,488 tokens each, far below the input limit of 8,186: the pool ends the decode context
+    axis, while the prefill block of the same limits is untouched. With a request cap of 64 the largest decode
+    batch reaches the input limit, and the pool ends nothing.
+    """
+    limits = _measured_limits(638_230)
+    assert grid.largest_decode_context(limits, 256) == (638_230 - 1) // 256 - 1 - 7 + 3 == 2488
+    assert grid.largest_decode_context(limits, 256) < limits.max_req_input_len
+    assert grid.prefill_pool_cut(limits, MEASURED_CAPS) is None
+    capped = _measured_limits(638_230, max_running_requests=64)
+    assert grid.largest_decode_batch(capped) == 64
+    assert grid.largest_decode_context(capped, 64) == capped.max_req_input_len == 8186
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -2424,16 +3209,21 @@ def _ladder(rows) -> tuple[int, ...]:
 
 
 @pytest.mark.parametrize(
-    ("page", "pool", "first_prefill", "first_decode", "prefill_points_per_batch"),
+    ("page", "pool", "first_prefill", "first_decode", "points_per_batch_without_two", "prefixes_of_two"),
     [
         # Page 1. First prefill point: n = C = 8192, one request, k = floor16(40954 - 8192 - 1) = 32752.
         # First decode point: b = R = 4096, k = (1165357 // 4096) - 1 - 7 + 3 = 279.
-        (1, 1_165_358, (1, 8192, 32752), (4096, 279), {1: 909, 2: 784, 3: 42, 4: 658}),
+        # The cached prefixes of n = 2: 0, the twelve doublings from 16 to 32768, and
+        # floor16(40954 - 2 - 1) = 40944, 14 values under the default cap of 16.
+        (1, 1_165_358, (1, 8192, 32752), (4096, 279), {1: 909, 2: 784, 3: 42, 4: 658}, 14),
         # Page 64. k = floor64(32761) = 32704. Decode: floor64(284 - 64 - 7) + 3 = 192 + 3 = 195.
-        (64, 1_165_312, (1, 8192, 32704), (4096, 195), {1: 779, 2: 672, 3: 36, 4: 564}),
+        # The cached prefixes of n = 2: 0, the ten doublings from 64 to 32768, and floor64(40951) = 40896.
+        (64, 1_165_312, (1, 8192, 32704), (4096, 195), {1: 779, 2: 672, 3: 36, 4: 564}, 12),
     ],
 )
-def test_default_grid_for_the_engine_probe_limits(page, pool, first_prefill, first_decode, prefill_points_per_batch):
+def test_default_grid_for_the_engine_probe_limits(
+    page, pool, first_prefill, first_decode, points_per_batch_without_two, prefixes_of_two, monkeypatch
+):
     decode_sizes = _ladder(H200_DECODE_GRAPH_ROWS)
     prefill_sizes = _ladder(H200_PREFILL_GRAPH_ROWS)
     assert decode_sizes[:6] == (1, 2, 4, 8, 12, 16) and len(decode_sizes) == 36
@@ -2475,15 +3265,16 @@ def test_default_grid_for_the_engine_probe_limits(page, pool, first_prefill, fir
     assert max(point.cached_tokens for point in decode) == 40954 > decode[0].cached_tokens
 
     # New-token axis. The graph axis is both sides of the 58 graph sizes, of which the largest is the limit
-    # itself and has no successor: 115 candidates, cut to the default 64. The ladder starts at 4, so 1 is put
-    # in front after the cut: 65 values.
+    # itself and has no successor: 115 candidates, cut to the default 64. The ladder starts at 4, so a batch of
+    # one token runs without a graph and a batch of two with the graph of 4: the low end, 1 and 2, is put in
+    # front after the cut: 66 values.
     new_axis = grid.prefill_new_token_axis(limits, caps)
     uncut = grid.prefill_new_token_axis(limits, NO_CAPS)
     graph_values = grid.graph_axis(prefill_sizes, 8192)
-    assert len(graph_values) == 115 and uncut == [1, *graph_values]
-    assert uncut[:4] == [1, 4, 5, 8] and uncut[-2:] == [7681, 8192]
-    assert new_axis[0] == 1 and new_axis[1:] == grid.limit_graph_axis(graph_values, prefill_sizes, 64)
-    assert len(new_axis) == 65 and new_axis[-1] == 8192
+    assert len(graph_values) == 115 and uncut == [1, 2, *graph_values]
+    assert uncut[:5] == [1, 2, 4, 5, 8] and uncut[-2:] == [7681, 8192]
+    assert new_axis[:2] == [1, 2] and new_axis[2:] == grid.limit_graph_axis(graph_values, prefill_sizes, 64)
+    assert len(new_axis) == 66 and new_axis[-1] == 8192
     assert sorted({point.new_tokens for point in prefill}) == new_axis
 
     # Prefill batch axis: the first three of the powers of two and b_max. It is 1, 2, 4 wherever four requests
@@ -2497,22 +3288,179 @@ def test_default_grid_for_the_engine_probe_limits(page, pool, first_prefill, fir
     shapes = {}
     for new, batches in batches_of.items():
         shapes.setdefault(tuple(sorted(batches)), []).append(new)
-    assert {shape: len(values) for shape, values in shapes.items()} == {(1,): 9, (1, 2): 6, (1, 2, 3): 3, (1, 2, 4): 47}
+    # The 48 values with the batch sizes 1, 2 and 4 are n = 2 and the 47 that the axis without it has.
+    assert {shape: len(values) for shape, values in shapes.items()} == {(1,): 9, (1, 2): 6, (1, 2, 3): 3, (1, 2, 4): 48}
     assert sorted(shapes[(1, 2, 3)]) == [2049, 2305, 2561]
     assert [grid.largest_prefill_batch(limits, new) for new in (2048, 2049, 2561, 2817)] == [4, 3, 3, 2]
-    # The prefill batch sizes that occur, and the number of points at each.
+    # The points of n = 2: the batch sizes 1, 2 and 4, each with every cached prefix up to the input limit.
+    unit = grid.cached_unit(page)
+    longest = (40954 - 2 - 1) // unit * unit
+    prefixes = [0, *(unit * 2**step for step in range(12) if unit * 2**step <= longest), longest]
+    assert len(prefixes) == prefixes_of_two <= caps.prefill_max_kv_read_token_samples
+    assert sorted(shape for shape in _prefill_shapes(prefill) if shape[1] == 2) == [
+        (batch, 2, cached) for batch in (1, 2, 4) for cached in prefixes
+    ]
+    # The prefill batch sizes that occur, and the number of points at each: those of the axis without n = 2,
+    # and the points of n = 2 on top at the batch sizes 1, 2 and 4.
     points_per_batch = {}
     for point in prefill:
         points_per_batch[point.batch_size] = points_per_batch.get(point.batch_size, 0) + 1
-    assert points_per_batch == prefill_points_per_batch
+    assert points_per_batch == {
+        batch: count + (prefixes_of_two if batch in (1, 2, 4) else 0)
+        for batch, count in points_per_batch_without_two.items()
+    }
     # Decode batch axis: 9 small values, both sides of the 31 sizes from 16 to 256, the tail 512, 1024, 2048
     # and the running cap: 75 values, under the default cap of 128.
     batch_axis = grid.decode_batch_axis(limits, caps)
     assert len(batch_axis) == 75 and batch_axis[:9] == [1, 2, 3, 4, 5, 8, 9, 12, 13]
     assert batch_axis[-6:] == [256, 257, 512, 1024, 2048, 4096]
-    assert len(prefill) <= 65 * 3 * 16 and len(decode) <= 128 * 128  # what the default caps allow
+    assert len(prefill) <= 66 * 3 * 16 and len(decode) <= 128 * 128  # what the default caps allow
+
+    # Without the two sides of the first step the grid is the same grid less the group of n = 2: the axis of
+    # 65 values and the point counts that the probe limits had before the group was added.
+    with monkeypatch.context() as patch:
+        patch.setattr(grid, "first_prefill_graph_tokens", lambda sizes: None)
+        earlier = grid.build_grid("agg", limits)
+        assert len(grid.prefill_new_token_axis(limits, caps)) == 65
+    earlier_per_batch = {}
+    for batch, _new, _cached in _prefill_shapes(earlier.points):
+        earlier_per_batch[batch] = earlier_per_batch.get(batch, 0) + 1
+    assert earlier_per_batch == points_per_batch_without_two
+    assert _prefill_shapes(earlier.points) == [shape for shape in _prefill_shapes(prefill) if shape[1] != 2]
+    assert _decode_shapes(earlier.points) == _decode_shapes(decode)
 
     # Printed for reference (``pytest -s`` shows it): how many points the default caps plan for these limits.
     print(
         f"sglbench default grid, H200 limits, page size {page}: {len(prefill)} prefill and {len(decode)} decode points"
     )
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The first step of the prefill table, read in SGLang's source at each tested release
+# ---------------------------------------------------------------------------------------------------------------
+
+SOURCES_ENV = "AISIM_SGLBENCH_SGLANG_SOURCES"
+# The two releases the header of the module names. They are the ones the launcher accepts
+# (``TESTED_VERSIONS`` of sglbench_compat.py), which the test below reads in that file.
+SGLANG_RELEASES = ("0.5.22", "0.5.23")
+
+
+def _sglang_source(version: str, relative: str) -> ast.Module:
+    """One file of a local SGLang checkout, parsed and not run. Skips the test when the variable is unset."""
+    base = os.environ.get(SOURCES_ENV)
+    if not base:
+        pytest.skip(f"{SOURCES_ENV} is not set; it names a folder with one SGLang checkout per tested release")
+    path = Path(base) / f"v{version}" / "python/sglang" / relative
+    # A variable that is set and wrong is a mistake to show, not a reason to skip.
+    assert path.is_file(), f"{SOURCES_ENV} holds no checkout of SGLang {version} with {relative}"
+    return ast.parse(path.read_text(encoding="utf-8"))
+
+
+def _function(tree: ast.Module, name: str) -> ast.FunctionDef:
+    """The one function or method of that name in a parsed file."""
+    (found,) = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == name]
+    return found
+
+
+def _evaluated(node: ast.expr, names: dict):
+    """The value of an expression that is made of integers, the given names, ``+``, ``range`` and ``list``."""
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return node.value
+    if isinstance(node, ast.Name) and node.id in names:
+        return names[node.id]
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _evaluated(node.left, names) + _evaluated(node.right, names)
+    if isinstance(node, ast.Call) and not node.keywords and ast.unparse(node.func) in ("range", "list"):
+        arguments = [_evaluated(argument, names) for argument in node.args]
+        return range(*arguments) if ast.unparse(node.func) == "range" else list(*arguments)
+    raise AssertionError(f"SGLang's size list has an expression this test does not read: {ast.unparse(node)}")
+
+
+@pytest.mark.parametrize("version", SGLANG_RELEASES)
+def test_the_first_step_of_the_prefill_table_is_sglangs_rule_at_each_tested_release(version):
+    """What ``first_prefill_graph_tokens`` and the docstring of ``prefill_new_token_axis`` say about SGLang.
+
+    The padding factor is 2. ``can_replay_locally`` pads the batch to the smallest captured size that holds it
+    and refuses the graph when that size is above the batch's tokens times the factor. SGLang's default sizes
+    start at 4, so the first batch with a graph has 2 tokens, and from there to the largest size every batch
+    runs with a graph: the default sizes have no second step.
+    """
+    compat = ast.parse((RUNTIME / "sglbench_compat.py").read_text(encoding="utf-8"))
+    (tested,) = [
+        node.value
+        for node in compat.body
+        if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "TESTED_VERSIONS"
+    ]
+    assert ast.literal_eval(tested) == SGLANG_RELEASES
+
+    # The factor.
+    runner = _sglang_source(version, "srt/model_executor/runner/prefill_cuda_graph_runner.py")
+    (factor,) = [
+        node.value
+        for node in runner.body
+        if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR"
+    ]
+    assert ast.literal_eval(factor) == 2 == grid.PREFILL_GRAPH_PADDING_FACTOR
+
+    # The refusal. These are the last statements of ``can_replay_locally``: a batch that passed every check
+    # before them runs with a graph exactly when it is not above the largest size and the size it is padded
+    # to is at most its own tokens times the factor.
+    replay = _function(runner, "can_replay_locally")
+    assert [ast.unparse(statement) for statement in replay.body[-5:]] == [
+        "if num_tokens is None:\n    return True",
+        "if num_tokens > self.max_num_tokens:\n    return False",
+        "padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)",
+        "if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:\n    return False",
+        "return True",
+    ]
+    # The padded size is the smallest captured size that holds the batch. The prefill runner has no padding
+    # function of its own: it takes the one of its base class, on the sizes it sorted when it read them.
+    (runner_class,) = [
+        node for node in runner.body if isinstance(node, ast.ClassDef) and node.name == "PrefillCudaGraphRunner"
+    ]
+    assert [ast.unparse(base) for base in runner_class.bases] == ["BaseCudaGraphRunner"]
+    assert not any(isinstance(node, ast.FunctionDef) and node.name == "_pad_to_bucket" for node in ast.walk(runner))
+    base_runner = _sglang_source(version, "srt/model_executor/runner/base_cuda_graph_runner.py")
+    pad = _function(base_runner, "_pad_to_bucket")
+    assert [argument.arg for argument in pad.args.args] == ["raw_size", "buckets"]
+    assert [ast.unparse(statement) for statement in pad.body[-2:]] == [
+        "index = bisect.bisect_left(buckets, raw_size)",
+        "return buckets[index]",
+    ]
+    runner_source = ast.unparse(runner)
+    assert "self.capture_num_tokens = get_prefill_num_tokens_to_capture(capture_tokens)" in runner_source
+    assert "self.max_num_tokens = max(self.capture_num_tokens)" in runner_source
+    captured = _function(runner, "get_prefill_num_tokens_to_capture")
+    assert ast.unparse(captured.body[-1]).startswith("return sorted(")
+
+    # The default sizes. The function is a sum of ranges, cut at its argument; it is evaluated here, not run.
+    hook = _sglang_source(version, "srt/arg_groups/cuda_graph_hook.py")
+    generator = _function(hook, "generate_prefill_cuda_graph_batch_sizes")
+    assert [argument.arg for argument in generator.args.args] == ["max_bs"]
+    assert ast.get_docstring(generator) and len(generator.body) == 4
+    ladder, keep, result = generator.body[1:]
+    assert isinstance(ladder, ast.Assign) and ast.unparse(ladder.targets[0]) == "capture_sizes"
+    assert ast.unparse(keep) == "capture_sizes = [s for s in capture_sizes if s <= max_bs]"
+    assert ast.unparse(result) == "return capture_sizes"
+
+    def default_sizes(largest: int) -> list[int]:
+        return [size for size in _evaluated(ladder.value, {"max_bs": largest}) if size <= largest]
+
+    # The ladders this file types in by hand are the default sizes for a largest size of 8,192.
+    assert tuple(default_sizes(8192)) == MEASURED_PREFILL_GRAPH_SIZES == _ladder(H200_PREFILL_GRAPH_ROWS)
+    assert default_sizes(3) == []
+    # The largest sizes tried: 8,192 is that of the cells in this file, and the others lie on and between
+    # the rows of the ladder, from the first size up to 16,384.
+    for largest in (4, 7, 32, 100, 2048, 3000, 4096, 8192, 16384):
+        sizes = default_sizes(largest)
+        assert sizes == sorted(set(sizes)) and sizes[0] == 4 and sizes[-1] <= largest
+        # The first step: one token runs without a graph, two tokens run with the graph of 4.
+        assert grid.first_prefill_graph_tokens(sizes) == 2
+        assert not _runs_with_a_graph(1, sizes) and _runs_with_a_graph(2, sizes)
+        assert _expected_low_end(sizes, largest) == {1, 2}
+        # The claim of the docstring of ``prefill_new_token_axis``: no default size is more than the factor
+        # times the size before it ...
+        assert all(high <= grid.PREFILL_GRAPH_PADDING_FACTOR * low for low, high in itertools.pairwise(sizes))
+        # ... and, batch by batch, what the claim is for: from two tokens up to the largest size no batch
+        # runs without a graph, so the first step is the only one.
+        assert all(_runs_with_a_graph(tokens, sizes) for tokens in range(2, sizes[-1] + 1))
