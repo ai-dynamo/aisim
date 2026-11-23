@@ -54,7 +54,8 @@ ai-dynamo/aisim#435; this skill does not widen them.
   (`source_sha256`, `destination_sha256`) against the SHA-256 of the run's own tables. Writes to a public
   repository go through a Hugging Face PR revision, and private or sensitive data goes only to the internal
   mirror.
-- The library on this branch has no publish function and no `aisim data fetch` CLI. Stop at the
+- The library on this branch has no publish function (`aisim data fetch` only downloads and verifies selected
+  dataset files, see `docs/reference/cli.md`; it never uploads). Stop at the
   validated local bundle plus the gate output and give the user the exact upload step; upload only
   with explicit authorization, using their existing `huggingface-cli login` or `HF_TOKEN`
   (never print or store it).

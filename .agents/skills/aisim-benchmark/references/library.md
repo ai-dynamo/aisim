@@ -27,8 +27,9 @@ re-implementing it.
 | Dataset integrity | `aisim_core.data.check_dataset` (all indexed categories; E2E through `load_e2e`) |
 | System spec sync | `systems.check_published_systems`, `systems.publish_system_spec` |
 
-Not on this branch: a Hugging Face publish function and the `aisim data fetch`
-CLI. Do not call or imitate them; see the publish skill for what to do instead.
+Not on this branch: a Hugging Face publish function. Do not call or imitate one; see the publish skill for what
+to do instead. `aisim data fetch` exists and is supported: it downloads and verifies selected dataset files into
+the local cache (`aisim data fetch --help`, `docs/reference/cli.md`) and never uploads.
 
 Catalog accuracy fields summarize only complete records. `acc_prediction_fingerprint`
 is nullable for older catalogs and includes the selected record's predictor `code_version`,
