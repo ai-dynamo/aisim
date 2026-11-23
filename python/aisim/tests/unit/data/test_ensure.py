@@ -235,7 +235,13 @@ def test_environment_successor_alias_keeps_mapping_through_ensure(tmp_path, file
     from tests.unit.data.test_fetch_regressions import _successor_files
 
     transport = FakeTransport(_successor_files(files))
-    p = pin_from_environment({"AISIM_DATASET": f"{RETIRED_FPM_REPO}@main", "AISIM_DATA_CACHE": str(tmp_path / "cache")})
+    p = pin_from_environment(
+        {
+            "AISIM_DATASET": f"{RETIRED_FPM_REPO}@main",
+            "AISIM_DATA_CATEGORIES": "fpm",
+            "AISIM_DATA_CACHE": str(tmp_path / "cache"),
+        }
+    )
     result = ensure_data(CONFIG, p, transport=transport)
     assert result.datasets["fpm"]["repo"] == PUBLIC_REPO
     assert any(path.startswith("data/fpm/") for path in transport.opened)
@@ -667,7 +673,7 @@ def test_a_local_manifest_must_match_the_digest_the_catalog_records(tmp_path, fi
     for path, data in files.items():
         (root / path).parent.mkdir(parents=True, exist_ok=True)
         (root / path).write_bytes(data)
-    local = DataPin(local_root=root, cache_dir=tmp_path / "cache")
+    local = DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache")
     ensure_data(CONFIG, local)  # the published pair loads
     manifest = json.loads(files["fpm/m1/manifest.json"])
     manifest["provenance"] = {"edited": "after indexing"}
