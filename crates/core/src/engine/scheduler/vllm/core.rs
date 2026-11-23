@@ -2701,15 +2701,16 @@ impl VllmCore {
         // An aggregated rank holds the blocks only in a layout that
         // `GroupedPrefixRules::keeps_in_flight_hold` names: no
         // prefix-cacheable state group, or a prefix-cacheable full-attention
-        // group and every prefix-cacheable state block equal to the scheduler
-        // block. In another layout, at a pool of exactly vLLM's startup
-        // count, the hold can starve a request: it needs one more state block
-        // than the pool has while a step is in flight, preempts itself, and
-        // hits the same tokens in its next life. vLLM itself can starve the
-        // request there, and a replay that follows it does not end. So in
-        // such a layout an aggregated rank frees on the computed count, one
-        // step earlier than vLLM. A grouped prefill or decode rank keeps the
-        // hold in every layout.
+        // group and every prefix-cacheable block equal to the scheduler
+        // block. In a layout with a prefix-cacheable state block below the
+        // scheduler block, at a pool of exactly vLLM's startup count, vLLM's
+        // own scheduler starves a request: with the hold the request needs
+        // one more state block than the pool has while a step is in flight,
+        // preempts itself, and hits the same tokens in its next life, and a
+        // replay that follows it does not end. In every layout that loses the
+        // hold an aggregated rank frees on the computed count, one step
+        // earlier than vLLM. A grouped prefill or decode rank keeps the hold
+        // in every layout.
         let aggregated_hold = self.args.worker_type == WorkerType::Aggregated
             && self
                 .kv_manager

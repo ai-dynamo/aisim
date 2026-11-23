@@ -738,7 +738,12 @@ fn startup_pool_spec(
 /// A prefix-cacheable state group of `block`-token blocks, with a
 /// checkpoint count of 0 where the version takes one.
 fn cacheable_state(block: u64, version: &str) -> serde_json::Value {
-    let mut state = serde_json::json!({"name":"state", "kind":"state", "num_layers":1, "block_size_tokens":block, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":true});
+    named_cacheable_state("state", block, version)
+}
+
+/// [`cacheable_state`] with the group name `name`.
+fn named_cacheable_state(name: &str, block: u64, version: &str) -> serde_json::Value {
+    let mut state = serde_json::json!({"name":name, "kind":"state", "num_layers":1, "block_size_tokens":block, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":true});
     if version != "0.31.0" {
         state["prefill_checkpoint_blocks"] = 0.into();
     }
@@ -892,6 +897,107 @@ fn grouped_prefix_opted_out_attention_group_completes_at_the_startup_count_with_
             &[("q0", 60.0, 68, 1, 0), ("q1", 30.0, 70, 1, 0)],
         );
         assert_completes_without_readmission(spec, version);
+    }
+}
+
+#[test]
+fn grouped_prefix_two_state_groups_above_the_attention_block_complete_at_the_startup_count_with_async_scheduling()
+ {
+    // A full-attention group of 4-token blocks and two state groups of
+    // 16-token blocks, the hash block 4. The state blocks equal the scheduler
+    // block, but the full-attention block lies below it, so an aggregated
+    // rank frees the blocks of a step in flight on the computed count, one
+    // step earlier than vLLM. vLLM's startup count at max_model_len 79 is
+    // cdiv(79, 4) = 20 attention blocks and 2 blocks per state group, 24
+    // (v0.31 kv_cache_interface.py:1083-1094, v0.32 :1076-1082, v0.33
+    // :1135-1141). Three requests with a budget of 31 and 2 sequences: 47 + 32
+    // tokens at 0 ms, 69 + 1 at 10 ms and 78 + 1 at 20 ms, the first and the
+    // third sharing 6 prompt tokens. Every request completes. With the hold
+    // of vLLM the replay of the third request does not end. The cap of 10 s
+    // of simulated time bounds the run.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let groups = serde_json::json!([
+            {"name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":4, "page_size_bytes":64, "prefix_cacheable":true},
+            named_cacheable_state("state_0", 16, version),
+            named_cacheable_state("state_1", 16, version),
+        ]);
+        let spec = startup_pool_spec(
+            groups,
+            version,
+            4,
+            79,
+            31,
+            2,
+            24,
+            &[
+                ("q0", 0.0, 47, 32, 6),
+                ("q1", 10.0, 69, 1, 0),
+                ("q2", 20.0, 78, 1, 6),
+            ],
+        );
+        let report = run_within_60_s(spec);
+        assert_eq!(report.request_counts.completed_requests, 3, "{version}");
+    }
+}
+
+#[test]
+fn grouped_prefix_two_state_groups_of_32_above_the_attention_block_complete_at_the_startup_count_with_async_scheduling()
+ {
+    // A full-attention group of 8-token blocks and two state groups of
+    // 32-token blocks, the hash block 8: the full-attention block lies below
+    // the scheduler block of 32, so an aggregated rank frees on the computed
+    // count, one step earlier than vLLM. vLLM's startup count at
+    // max_model_len 224 is cdiv(224, 8) = 28 attention blocks and 2 blocks per
+    // state group, 32. Two requests with a budget of 63 and 3 sequences: 182
+    // + 9 tokens at 0 ms and 217 + 3 at 10 ms, which shares no prompt token
+    // with the first one (its first 142 tokens are the shared tokens of the
+    // helper, which the first request does not have). Both complete. With the hold of vLLM the replay of
+    // the second request does not end. The cap of 10 s of simulated time
+    // bounds the run.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let groups = serde_json::json!([
+            {"name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":8, "page_size_bytes":64, "prefix_cacheable":true},
+            named_cacheable_state("state_0", 32, version),
+            named_cacheable_state("state_1", 32, version),
+        ]);
+        let spec = startup_pool_spec(
+            groups,
+            version,
+            8,
+            224,
+            63,
+            3,
+            32,
+            &[("q0", 0.0, 182, 9, 0), ("q1", 10.0, 217, 3, 142)],
+        );
+        let report = run_within_60_s(spec);
+        assert_eq!(report.request_counts.completed_requests, 2, "{version}");
+    }
+}
+
+#[test]
+fn grouped_prefix_state_group_and_ring_without_attention_complete_at_the_startup_count_with_async_scheduling()
+ {
+    // A ring of 2 tokens and a prefix-cacheable state group of 2-token
+    // blocks, the hash block 2, max_model_len 10, a budget of 3 and 2
+    // sequences: the smallest pool that the configuration accepts is 3 pages,
+    // 1 ring block and 2 state blocks. One prompt of 7 tokens with 1 output
+    // token arrives at 0 ms. The layout has no prefix-cacheable full-attention
+    // group, so an aggregated rank frees on the computed count, one step
+    // earlier than vLLM, and the request completes without a preemption at
+    // 40 ms, as with one batch. With the hold of vLLM the replay of this
+    // request does not end. The cap of 10 s of simulated time bounds the run.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let groups = serde_json::json!([
+            {"name":"ring", "kind":"state", "num_layers":1, "block_size_tokens":2, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":false},
+            cacheable_state(2, version),
+        ]);
+        let spec = startup_pool_spec(groups, version, 2, 10, 3, 2, 3, &[("q0", 0.0, 7, 1, 3)]);
+        let report = run_within_60_s(spec);
+        assert_eq!(report.request_counts.completed_requests, 1, "{version}");
+        let record = record(&report, "q0");
+        assert_eq!(record.readmission_count, 0, "{version}");
+        assert_eq!(record.terminal_time_ms, 40.0, "{version}");
     }
 }
 

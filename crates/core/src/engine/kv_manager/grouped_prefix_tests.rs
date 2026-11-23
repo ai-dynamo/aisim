@@ -6158,10 +6158,10 @@ fn convolution_group_keeps_one_block_before_the_replay_boundary() {
 fn keeps_in_flight_hold_in_each_kind_of_layout() {
     // A layout without a prefix-cacheable state group keeps the hold. A
     // layout with one keeps it only if it has a prefix-cacheable
-    // full-attention group and every prefix-cacheable state block equals the
-    // scheduler block, the least common multiple of the blocks of all
-    // groups. Each layout lists its groups, its hash block, its scheduler
-    // block in the label, and the answer.
+    // full-attention group and every prefix-cacheable group has a block
+    // equal to the scheduler block, the least common multiple of the blocks
+    // of all groups. Each layout lists its groups, its hash block, its
+    // scheduler block in the label, and the answer.
     let opted_out = |name: &str, block: u32| {
         let mut group = attention(name, block, None);
         group.prefix_cacheable = Some(false);
@@ -6169,7 +6169,7 @@ fn keeps_in_flight_hold_in_each_kind_of_layout() {
     };
     let mut convolution = attention("conv", 8, Some(8));
     convolution.kind = FpmCacheKind::Convolution;
-    let cases: [(&str, Vec<FpmCacheGroup>, usize, bool); 16] = [
+    let cases: [(&str, Vec<FpmCacheGroup>, usize, bool); 21] = [
         (
             "no state group (8)",
             vec![attention("full_8", 8, None), attention("full_4", 4, None)],
@@ -6191,6 +6191,56 @@ fn keeps_in_flight_hold_in_each_kind_of_layout() {
         (
             "state block above the full-attention block (16)",
             vec![attention("full", 8, None), state("s", 16, true, false)],
+            8,
+            false,
+        ),
+        (
+            "two state blocks above the full-attention block (16)",
+            vec![
+                attention("full", 4, None),
+                state("s_0", 16, true, false),
+                state("s_1", 16, true, false),
+            ],
+            4,
+            false,
+        ),
+        (
+            "two full-attention groups and a state group at one block (8)",
+            vec![
+                attention("full_0", 8, None),
+                attention("full_1", 8, None),
+                state("s", 8, true, false),
+            ],
+            8,
+            true,
+        ),
+        (
+            "a window group at the state block (8)",
+            vec![
+                attention("full", 8, None),
+                attention("window", 8, Some(16)),
+                state("s", 8, true, false),
+            ],
+            8,
+            true,
+        ),
+        (
+            "a window group below the state block (8)",
+            vec![
+                attention("full", 8, None),
+                attention("window", 4, Some(8)),
+                state("s", 8, true, false),
+            ],
+            4,
+            false,
+        ),
+        (
+            "an opted-out full-attention group that divides the state block (8)",
+            vec![
+                attention("full", 8, None),
+                opted_out("full_4", 4),
+                state("s", 8, true, false),
+            ],
             8,
             true,
         ),
@@ -6302,10 +6352,17 @@ fn keeps_in_flight_hold_in_each_kind_of_layout() {
     // a full-attention group at the state block (8).
     let groups = vec![
         attention("full", 2, None),
-        convolution,
+        convolution.clone(),
         state("s", 2, true, false),
     ];
     assert!(!rules(&groups, 2).keeps_in_flight_hold());
+    // A convolution group at the full-attention and state block (8).
+    let groups = vec![
+        attention("full", 8, None),
+        convolution,
+        state("s", 8, true, false),
+    ];
+    assert!(rules(&groups, 8).keeps_in_flight_hold());
     // The GLM-5.3-Flash layout: MLA and four state groups of 2,176-token
     // blocks and a 4-token ring, so the scheduler block is 2,176, at the hash
     // block 2,176 and at a hash block of 4, with and without a checkpoint

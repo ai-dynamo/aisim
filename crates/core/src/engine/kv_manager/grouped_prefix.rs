@@ -385,7 +385,7 @@ impl GroupedPrefixRules {
             || (has_full_attention
                 && rules
                     .iter()
-                    .filter(|rule| rule.kind == GroupRuleKind::State)
+                    .filter(|rule| rule.cacheable)
                     .all(|rule| rule.block == scheduler_block));
         Ok(Self {
             groups: rules,
@@ -403,23 +403,33 @@ impl GroupedPrefixRules {
     /// Whether an aggregated rank holds the blocks of a step in flight, as
     /// vLLM does with async scheduling. A layout without a prefix-cacheable
     /// state group holds them. A layout with one holds them only if it has
-    /// a prefix-cacheable full-attention group and the block of every
-    /// prefix-cacheable state group equals the scheduler block, the least
-    /// common multiple of the blocks of all groups. A ring (a state group
-    /// with `prefix_cacheable: false`), a sliding-window group, a
-    /// convolution group and a full-attention group with
-    /// `prefix_cacheable: false` count only through the scheduler block.
+    /// a prefix-cacheable full-attention group and every prefix-cacheable
+    /// group (state, full-attention, sliding-window and convolution) has a
+    /// block equal to the scheduler block, the least common multiple of the
+    /// blocks of all groups. A ring (a state group with
+    /// `prefix_cacheable: false`) and a full-attention group with
+    /// `prefix_cacheable: false` count only through the scheduler block. In
+    /// every other layout an aggregated rank frees on the computed count,
+    /// one step earlier than vLLM.
     ///
-    /// The reason: without hits inside a block, a preempted request keeps
-    /// cache hits only up to a multiple of the scheduler block, so a state
-    /// group with a smaller block loses the progress inside that block. With
-    /// the hold, a request can then need one more state block than a pool of
-    /// vLLM's startup count has, preempt itself, and hit the same tokens in
-    /// its next life. vLLM itself can starve such a request, and a replay
-    /// that follows it does not end. A layout without a prefix-cacheable
-    /// full-attention group can starve a request in the same way. In every
-    /// other layout an aggregated rank frees on the computed count, one step
-    /// earlier than vLLM.
+    /// The reason for the rule: with one block size for every
+    /// prefix-cacheable group, every state boundary is a boundary of every
+    /// group that takes part in a cache hit, so a preempted request loses no
+    /// progress inside a block. The layouts that were compared with vLLM's
+    /// own scheduler have this form; the rule rests on that and on searches
+    /// of replays, not on an argument that covers every layout. In a layout
+    /// with a prefix-cacheable state block below the scheduler block, a
+    /// preempted request without hits inside a block keeps hits only up to
+    /// a multiple of the scheduler block. At a pool of exactly vLLM's startup
+    /// count, which reserves `2 + c` blocks per Mamba group (v0.31
+    /// `kv_cache_interface.py:1083-1094`, v0.32 `:1076-1082`, v0.33
+    /// `:1135-1141`), the hold on the processed count (v0.31
+    /// `kv_cache_manager.py:549-556`, v0.32 `:552-559`, v0.33 `:561-568`)
+    /// can then make the request need one more state block than the pool
+    /// has, preempt itself and hit the same tokens in its next life. vLLM's
+    /// own scheduler starves such a request, and a replay that follows it
+    /// does not end. In the other layouts that lose the hold, replay frees
+    /// one step earlier than vLLM.
     pub(crate) fn keeps_in_flight_hold(&self) -> bool {
         self.keeps_in_flight_hold
     }
