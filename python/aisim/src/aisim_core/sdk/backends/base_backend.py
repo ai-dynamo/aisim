@@ -2713,6 +2713,13 @@ class BaseBackend:
         # inner loop when the system is oom.
         b_list = [b for b in b_list_default if b <= max_batch_size]
         ctx_tokens_list = self._get_ctx_tokens_list_for_agg_sweep(isl_eff, ctx_stride, enable_chunked_prefill)
+        # run_agg rejects qualified single-slot visual chunks. Skip those
+        # budgets before pricing so a later budget can fit the fresh suffix.
+        min_visual_ctx_tokens = (
+            isl_eff - runtime_config.prefix
+            if isl_eff > isl and not _is_fpm_model(model) and _has_qualified_mamba(model)
+            else 0
+        )
 
         results_df = pd.DataFrame(columns=common.ColumnsAgg)
         results_dict_list: list[dict] = []
@@ -2721,6 +2728,8 @@ class BaseBackend:
         all_oom = True
         for b in b_list:
             for ctx_tokens in ctx_tokens_list:
+                if b == 1 and 0 < ctx_tokens < min_visual_ctx_tokens:
+                    continue
                 if b - np.ceil(ctx_tokens / isl_eff) < 0:  # allow b==1
                     break
 

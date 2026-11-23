@@ -199,3 +199,67 @@ def test_replacement_iterable_cannot_leave_an_old_graph_identity(graph_estimator
         setattr(model, name, values())
         assert estimate(model) > initial
     assert estimate(model) == estimate(cold)
+
+
+@pytest.mark.parametrize("raw_native", [False, True])
+@pytest.mark.parametrize("phase", ["context", "generation"])
+def test_operation_name_edit_cannot_reuse_warm_summary_or_handle(graph_estimator, monkeypatch, raw_native, phase):
+    import aisim_core
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.config import RuntimeConfig
+    from aisim_core.sdk.perf_database import get_database_view
+    from aisim_core.sdk.rust_engine_step import RustEngineUnsupportedError
+
+    model, estimate = graph_estimator
+    backend = get_backend("trtllm")
+    database = get_database_view("b200_sxm", "trtllm", "1.3.0rc20", database_mode="SOL", allow_unlisted_version=True)
+    monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+    ops = getattr(model, f"{phase}_ops")
+    if raw_native:
+        ops[0] = aisim_core.op_from_spec_json(ops[0]._spec_json())
+    runtime = RuntimeConfig(batch_size=1, isl=16, osl=2)
+    summary = backend.run_agg(model, database, runtime, ctx_tokens=16)
+    assert backend.run_agg(model, database, runtime, ctx_tokens=16) is summary
+    assert estimate(model) > 0  # warm the compiled handle too
+
+    scan = ops[0]
+    original_name = scan._name
+    scan._name = "context_attention (scaled)" if phase == "context" else "generation_attention"
+    cold = copy.deepcopy(model)
+    for graph in (cold, model):
+        with pytest.raises(RustEngineUnsupportedError, match="reserved attention name"):
+            estimate(graph)
+    # The identical workload must miss the summary cache; a new workload
+    # must also reject the edited spec instead of reusing the compiled handle.
+    for budget in (16, 8):
+        with pytest.raises(RustEngineUnsupportedError, match="reserved attention name"):
+            backend.run_agg(model, database, runtime, ctx_tokens=budget)
+    scan._name = original_name
+    assert backend.run_agg(model, database, runtime, ctx_tokens=16) is summary
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+def test_operation_scale_edit_reprices_a_warm_graph(graph_estimator, phase):
+    model, estimate = graph_estimator
+    before = estimate(model)
+    getattr(model, f"{phase}_ops")[0]._scale_factor *= 2
+    after = estimate(model)
+    assert after > before
+    assert after == estimate(copy.deepcopy(model))
+
+
+def test_native_family_setter_expires_a_memoized_graph_identity(graph_estimator):
+    from aisim_core.sdk import common, rust_engine_step
+    from aisim_core.sdk.operations import GEMM
+    from aisim_core.sdk.perf_database import get_database_view
+
+    model, estimate = graph_estimator
+    gemm = GEMM("extra_gemm", 1, 64, 64, common.GEMMQuantMode.bfloat16)
+    model.context_ops.append(gemm)
+    database = get_database_view("b200_sxm", "trtllm", "1.3.0rc20", database_mode="SOL", allow_unlisted_version=True)
+    before = estimate(model)
+    key = rust_engine_step.engine_identity(model, database)
+    gemm._scale_num_tokens = 2
+    assert rust_engine_step.engine_identity(model, database) != key
+    assert estimate(model) > before
+    assert estimate(model) == estimate(copy.deepcopy(model))

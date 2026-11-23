@@ -37,6 +37,8 @@
 //!   (`_CP_AWARE = False`) reject `seq_split > 1` at construction with the
 //!   retired base-class message shape.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use pyo3::exceptions::{PyNotImplementedError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
@@ -193,12 +195,23 @@ pub(crate) fn wrap_op(py: Python<'_>, op: Op) -> PyResult<Py<PyAny>> {
 /// Base class of every engine-backed op: owns the typed [`Op`] value.
 #[pyclass(subclass, name = "Operation", module = "aisim_core._native")]
 pub struct PyOperation {
-    pub(crate) inner: Op,
+    inner: Op,
 }
+
+// Python graph identities can be memoized without serializing every operation
+// on every query. Construction does not advance this clock; native setters do.
+// An edit conservatively expires other models' identity memos too, but their
+// unchanged serialized keys still reuse their compiled handles and summaries.
+static OPERATION_MUTATION_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 impl PyOperation {
     pub(crate) fn op(&self) -> &Op {
         &self.inner
+    }
+
+    fn op_mut(&mut self) -> &mut Op {
+        OPERATION_MUTATION_EPOCH.fetch_add(1, Ordering::Relaxed);
+        &mut self.inner
     }
 }
 
@@ -212,7 +225,7 @@ macro_rules! inner_accessor {
                 }
             }
             fn $name_mut(&mut self) -> PyResult<&mut $ty> {
-                match &mut self.inner {
+                match self.op_mut() {
                     Op::$variant(o) => Ok(o),
                     _ => Err(PyTypeError::new_err(concat!("not a ", $label, " op"))),
                 }
@@ -292,7 +305,7 @@ impl PyOperation {
         }
     }
     fn mla_module_mut(&mut self) -> PyResult<&mut MlaModuleOp> {
-        match &mut self.inner {
+        match self.op_mut() {
             Op::MlaModuleContext(o) | Op::MlaModuleGeneration(o) => Ok(o),
             _ => Err(PyTypeError::new_err("not an MLAModule op")),
         }
@@ -301,6 +314,12 @@ impl PyOperation {
 
 #[pymethods]
 impl PyOperation {
+    /// Private cache-invalidation clock, shared by shell and raw native ops.
+    #[staticmethod]
+    fn _mutation_epoch() -> u64 {
+        OPERATION_MUTATION_EPOCH.load(Ordering::Relaxed)
+    }
+
     /// Shim call-shape label (`None` on the base; each family overrides).
     /// Read by `OpShellKit._engine_query` and the composite phase walker
     /// (`overlap._infer_phase`), which sees Rust-wrapped children.
@@ -323,7 +342,7 @@ impl PyOperation {
 
     #[setter(_name)]
     fn set_name(&mut self, value: String) {
-        self.inner.set_name(value);
+        self.op_mut().set_name(value);
     }
 
     /// Repetition scaling for sequential draft forwards.
@@ -331,7 +350,7 @@ impl PyOperation {
     fn set_scale_factor(&mut self, value: f64) -> PyResult<()> {
         // Match the getter contract; composites and FPM have no scalar field.
         self.scale_factor()?;
-        self.inner.set_scale_factor(value);
+        self.op_mut().set_scale_factor(value);
         Ok(())
     }
 
@@ -1757,7 +1776,7 @@ impl PyMLAModule {
     fn set_is_context(mut slf: PyRefMut<'_, Self>, value: bool) -> PyResult<()> {
         let base = slf.as_super();
         let module = base.mla_module()?.clone();
-        base.inner = if value {
+        *base.op_mut() = if value {
             Op::MlaModuleContext(module)
         } else {
             Op::MlaModuleGeneration(module)
@@ -2067,7 +2086,7 @@ impl PyOperation {
         }
     }
     fn moe_dispatch_mut(&mut self) -> PyResult<&mut crate::operators::MoEDispatchOp> {
-        match &mut self.inner {
+        match self.op_mut() {
             Op::MoeDispatch(o) => Ok(o),
             _ => Err(PyTypeError::new_err("not a MoEDispatch op")),
         }
@@ -3640,7 +3659,7 @@ impl PyOperation {
         }
     }
     fn dsa_mut(&mut self) -> PyResult<&mut crate::operators::DsaModuleOp> {
-        match &mut self.inner {
+        match self.op_mut() {
             Op::DsaContext(o) | Op::DsaGeneration(o) => Ok(o),
             _ => Err(PyTypeError::new_err("not a DSA module op")),
         }
@@ -4046,7 +4065,7 @@ impl PyOperation {
         }
     }
     fn dsv4_mut(&mut self) -> PyResult<&mut crate::operators::Dsv4ModuleOp> {
-        match &mut self.inner {
+        match self.op_mut() {
             Op::Dsv4Context(o) | Op::Dsv4Generation(o) => Ok(o),
             _ => Err(PyTypeError::new_err("not a DSV4 attention module op")),
         }

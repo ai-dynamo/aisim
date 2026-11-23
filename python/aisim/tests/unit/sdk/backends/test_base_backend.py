@@ -1826,6 +1826,45 @@ def _qualified_scan_model(backend_name):
     return model
 
 
+@pytest.mark.parametrize("prefix,first_supported_budget", [(0, 4096), (3000, 1536)])
+def test_visual_qualified_sweep_reaches_a_budget_that_fits_the_suffix(monkeypatch, prefix, first_supported_budget):
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.perf_database import get_database_view
+
+    backend = get_backend("trtllm")
+    model = _qualified_scan_model("trtllm")
+    model.encoder_config = _vision_encoder_config()
+    database = get_database_view("b200_sxm", "trtllm", "1.3.0rc20", database_mode="SOL", allow_unlisted_version=True)
+    monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+    runtime = RuntimeConfig(
+        batch_size=1,
+        isl=3072,
+        prefix=prefix,
+        osl=2,
+        ttft=float("inf"),
+        tpot=float("inf"),
+        num_images_per_request=1,
+        num_image_tokens=1024,
+    )
+    with pytest.raises(ValueError, match="qualified Mamba with chunked visual prefill is unsupported"):
+        backend.run_agg(model, database, runtime, ctx_tokens=512)
+    calls = []
+    run_agg = backend.run_agg
+
+    def record_candidate(**kwargs):
+        calls.append(kwargs["ctx_tokens"])
+        return run_agg(**kwargs)
+
+    monkeypatch.setattr(backend, "run_agg", record_candidate)
+    summary = backend.find_best_agg_result_under_constraints(
+        model, database, runtime, max_batch_size=1, ctx_stride=512, enable_chunked_prefill=True, top_k=0
+    )
+    assert calls[0] == first_supported_budget
+    assert all(budget >= 4096 - prefix for budget in calls)
+    assert not summary.get_summary_df().empty
+    assert not summary.check_oom()
+
+
 @pytest.mark.parametrize("prefix", [0, 3000])
 def test_qualified_aggregate_caps_prefill_at_remaining_request_slots(monkeypatch, prefix):
     from aisim_core.sdk.backends.factory import get_backend

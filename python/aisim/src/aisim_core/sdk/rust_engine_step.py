@@ -28,6 +28,7 @@ from importlib import resources as pkg_resources
 from pathlib import Path
 from typing import Any
 
+from aisim_core._native import Operation
 from aisim_core.sdk.config import RuntimeConfig
 from aisim_core.sdk.performance_result import MoECommFallback, merge_moe_comm_fallbacks
 from aisim_core.sdk.step_estimate import StepEstimate
@@ -1835,6 +1836,8 @@ def engine_identity(model: Any, database: Any) -> str:
     this per-query path.
     Structural edits to either model operation list advance a shared revision;
     checking it keeps in-place graph edits from reusing a previous compilation.
+    Native spec setters advance a process-wide clock, including edits through
+    raw native objects. Check it in constant time rather than scanning the graph.
     """
     # The stored attributes behind ``get_default_database_mode`` and
     # ``transfer_policy``; reading them directly keeps the check near main's
@@ -1844,7 +1847,15 @@ def engine_identity(model: Any, database: Any) -> str:
     memo = getattr(model, "_aic_engine_identity_memo", None)
     revision = getattr(model, "_aic_op_list_revision", None)
     graph_version = revision[0] if revision is not None else None
-    if memo is not None and memo[0] is database and memo[1] is mode and memo[2] is policy and memo[4] == graph_version:
+    mutation_epoch = Operation._mutation_epoch()
+    if (
+        memo is not None
+        and memo[0] is database
+        and memo[1] is mode
+        and memo[2] is policy
+        and memo[4] == graph_version
+        and memo[5] == mutation_epoch
+    ):
         return memo[3]
     from aisim_core.sdk.engine import OpConversionError
 
@@ -1855,7 +1866,7 @@ def engine_identity(model: Any, database: Any) -> str:
         # Retry conversion on later calls; successful identities remain memoized.
         raise RustEngineUnsupportedError(str(exc)) from exc
     try:
-        model._aic_engine_identity_memo = (database, mode, policy, key, graph_version)
+        model._aic_engine_identity_memo = (database, mode, policy, key, graph_version, mutation_epoch)
     except (AttributeError, TypeError):
         pass  # slotted/frozen model objects: recompute per call
     return key
