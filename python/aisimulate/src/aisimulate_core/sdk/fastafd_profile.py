@@ -152,6 +152,8 @@ class FastAFDMoEStageProfile:
             for name in sorted(_COUNT_FIELDS):
                 if table.schema.field(name).type != pa.int64():
                     raise ValueError(f"FastAFD count column {name!r} must be signed INT64")
+            if table.schema.field("latency_ms").type not in (pa.float32(), pa.float64()):
+                raise ValueError("FastAFD latency_ms column must be FLOAT or DOUBLE")
             rows = table.to_pylist()
             if not rows:
                 raise ValueError("FastAFD profile entries must be a non-empty list")

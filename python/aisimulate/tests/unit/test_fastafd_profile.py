@@ -346,6 +346,28 @@ def test_rejects_non_int64_parquet_counts(tmp_path, column, encoding):
         FastAFDMoEStageProfile.load(path)
 
 
+def test_rejects_int64_parquet_latency(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    payload = _payload()
+    payload["entries"][0]["latency_ms"] = 12.0
+    profile = FastAFDMoEStageProfile.load(_write(tmp_path, payload))
+    path = tmp_path / "stage.parquet"
+    profile.write_parquet(path)
+    table = pq.read_table(path)
+    index = table.schema.get_field_index("latency_ms")
+    table = table.set_column(index, "latency_ms", table["latency_ms"].cast(pa.int64()))
+    pq.write_table(table, path)
+
+    with pytest.raises(ValueError, match="Cannot access Long as Float"):
+        RustForwardPassPerfModel.best_available(_canonical_config(path))
+    with pytest.raises(ValueError, match="latency_ms column must be FLOAT or DOUBLE"):
+        FastAFDMoEStageProfile.load(path)
+
+
 @pytest.mark.parametrize("location", ["direct", "symlink", "extensionless"])
 @pytest.mark.parametrize("profile_format", ["json", "parquet", "parquet-float"])
 @pytest.mark.parametrize("mode_field", ["estimation_mode", "forward_model"])

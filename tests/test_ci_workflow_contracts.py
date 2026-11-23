@@ -646,6 +646,16 @@ def _run_commands(job: dict) -> str:
     return "\n".join(step.get("run", "") for step in job["steps"])
 
 
+@pytest.mark.parametrize("job_id", [name for name, job in _workflow("ci.yml")["jobs"].items() if "container" in job])
+def test_production_ci_home_reaches_commands_before_setup(job_id):
+    job = _workflow("ci.yml")["jobs"][job_id]
+    assert job["env"]["HOME"] == _workflow("runner-canary.yml")["jobs"]["canary"]["env"]["HOME"]
+    preflight = job["steps"][0]
+    assert preflight["shell"] == "bash"
+    assert 'test "${HOME}" = /__w/aisim/aisim' in preflight["run"]
+    assert 'test -w "${HOME}"' in preflight["run"]
+
+
 def _run_resolve_step(script: str, event_name: str, old_ref: str, tmp_path: Path) -> dict[str, str]:
     output_path = tmp_path / f"{event_name}.out"
     output_path.unlink(missing_ok=True)
