@@ -62,7 +62,7 @@ impl AggRequestState {
         &mut self,
         uuid: Uuid,
         scheduler_id: usize,
-    ) -> Result<DirectRequest> {
+    ) -> Result<ReplayRequestPayload> {
         if self.phase != AggRequestPhase::QueuedAtRouter {
             bail!("offline replay expected queued request state for {uuid}");
         }
@@ -72,7 +72,7 @@ impl AggRequestState {
             .ok_or_else(|| anyhow!("offline replay missing queued request payload for {uuid}"))?;
         self.phase = AggRequestPhase::Running;
         self.scheduler_id = Some(scheduler_id);
-        Ok(request.into_direct_request())
+        Ok(request)
     }
 
     pub(crate) fn scheduler_id(&self) -> Option<usize> {

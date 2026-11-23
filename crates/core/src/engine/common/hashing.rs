@@ -103,6 +103,47 @@ pub(crate) fn block_hashes_with_salt<'a>(
     })
 }
 
+/// Hash complete engine blocks straight from validated repeat-encoded trace tokens.
+pub(crate) fn trace_block_hashes<'a>(
+    input_length: usize,
+    hash_ids: &'a [u32],
+    trace_block_size: usize,
+    block_size: usize,
+    cache_salt: Option<&str>,
+) -> impl Iterator<Item = BlockHash> + 'a {
+    let seed = cache_salt_seed(cache_salt);
+    let mut block = vec![0_u32; block_size];
+    // Consecutive engine blocks inside one trace block are identical.
+    let mut previous_run: Option<(u32, u64)> = None;
+    (0..input_length / block_size).map(move |index| {
+        let start = index * block_size;
+        let end = start + block_size;
+        let first_trace_block = start / trace_block_size;
+        if first_trace_block == (end - 1) / trace_block_size {
+            let token = hash_ids[first_trace_block];
+            if let Some((prior, hash)) = previous_run
+                && prior == token
+            {
+                return hash;
+            }
+            block.fill(token);
+            let hash = compute_block_hash_for_tokens(&block, seed);
+            previous_run = Some((token, hash));
+            return hash;
+        }
+
+        let mut position = start;
+        while position < end {
+            let trace_block = position / trace_block_size;
+            let run_end = ((trace_block + 1) * trace_block_size).min(end);
+            block[position - start..run_end - start].fill(hash_ids[trace_block]);
+            position = run_end;
+        }
+        previous_run = None;
+        compute_block_hash_for_tokens(&block, seed)
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn compute_block_hash_for_seq(
     tokens: &[Token],
