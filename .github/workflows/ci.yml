@@ -950,8 +950,8 @@ jobs:
     name: Engine Golden Regression
     needs: [fast-ci, select-full-ci]
     if: ${{ needs.select-full-ci.outputs.engine_golden_regression == 'true' }}
-    # Builds from source with no NVIDIA-internal dependency; the numerical
-    # sentinel step fetches its own baseline commit, so no full history.
+    # Builds from source with no NVIDIA-internal dependency; numerical
+    # sentinels use checked-in expected values, so no full history is needed.
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
