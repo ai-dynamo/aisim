@@ -1840,47 +1840,80 @@ def _producer_cells(tmp_path: Path) -> dict[str, tuple[FPMCell, Path]]:
     return cells
 
 
-def test_glm_cell_under_a_plan_with_a_global_warmup_is_refused_before_a_pair_is_written(tmp_path):
-    # The loader of a published pair reads a median row only with a global warm-up of 0, so a median row of this plan
-    # would make the whole pair unreadable. The single-sample label of a pair sealed with it has no such rule.
+@pytest.mark.parametrize("warmup", [1, 5, -1, False, 0.0], ids=["one", "five", "negative", "boolean", "zero-float"])
+def test_glm_cell_under_a_plan_with_a_global_warmup_is_refused_before_a_pair_is_written(tmp_path, warmup):
+    # The loader of a published pair reads a median row only with a global warm-up of the integer 0, so a median row of
+    # this plan would make the whole pair unreadable. The single-sample label of a pair sealed with it has no such rule.
     plan = _glm_plan()
-    plan.options = SimpleNamespace(warmup_iterations=5)
+    plan.options = SimpleNamespace(warmup_iterations=warmup)
     cell, cell_dir = _producer_cells(tmp_path)["prefill"]
     with pytest.raises(ValueError) as error:
         database.aggregate_cell(plan, cell, cell_dir, expected_attempt_id=ATTEMPT_ID)
     assert str(error.value) == (
-        f"{cell.cell_id} is a GLM-5.3-Flash producer cell under a plan with warmup_iterations=5, and its rows carry "
-        "measurement_policy='vllm_native_fpm_prefix_seed_median_v1', which requires a global warm-up of 0"
+        f"{cell.cell_id} is a GLM-5.3-Flash producer cell under a plan with warmup_iterations={warmup!r}, and its rows "
+        "carry measurement_policy='vllm_native_fpm_prefix_seed_median_v1', which requires a global warm-up of the "
+        "integer 0"
     )
     rows = database.aggregate_cell(plan, cell, cell_dir, expected_attempt_id=ATTEMPT_ID, median_policy=False)
-    assert {(row["measurement_policy"], row["global_warmup_iterations"]) for row in rows} == {
-        (database.SINGLE_SAMPLE_MEASUREMENT_POLICY, 5)
-    }
+    assert [(row["measurement_policy"], repr(row["global_warmup_iterations"])) for row in rows] == [
+        (database.SINGLE_SAMPLE_MEASUREMENT_POLICY, repr(warmup))
+    ] * len(rows)
 
 
-@pytest.mark.parametrize("median_policy", [True, False], ids=["median-label", "single-sample-label"])
-def test_glm_cell_with_power_window_artifacts_is_refused(tmp_path, monkeypatch, median_policy):
-    # The median label holds no power, and the power-window label names a single sample, so no label is true for the
-    # rows of a producer cell with a power window.
+def _powered_publication(monkeypatch, tmp_path, *, mode="native_graph_policy", measure_power=True):
+    """A cell whose validated collection holds power-window artifacts of ``mode``, and a plan with ``measure_power``."""
     cell = glm_cell("prefill")
     write_glm_rank(_pod(tmp_path, cell), glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED]))
     valid = _validate(tmp_path, cell)
     assert valid.execution_mode == "native_graph_policy"
     powered = replace(
         valid,
+        execution_mode=mode,
         artifact_schema_version=database.FPM_NATIVE_BENCHMARK_POWER_RESULT_SCHEMA_VERSION,
         points=tuple(replace(point, power_w=100.0) for point in valid.points),
     )
     plan = _glm_plan()
-    plan.options = SimpleNamespace(warmup_iterations=0, measure_power=True)
+    plan.options = SimpleNamespace(warmup_iterations=0, measure_power=measure_power)
     monkeypatch.setattr(database, "validate_native_collection", lambda *_args, **_kwargs: powered)
     monkeypatch.setattr(database, "extract_measurement_evidence", lambda *_args, **_kwargs: {})
+    return plan, cell
+
+
+@pytest.mark.parametrize("median_policy", [True, False], ids=["median-label", "single-sample-label"])
+def test_glm_cell_with_power_window_artifacts_is_refused(tmp_path, monkeypatch, median_policy):
+    # The median label holds no power, and the power-window label names a single sample, so no label is true for the
+    # rows of a producer cell with a power window.
+    plan, cell = _powered_publication(monkeypatch, tmp_path)
     with pytest.raises(ValueError) as error:
         database.aggregate_cell(plan, cell, tmp_path, expected_attempt_id=ATTEMPT_ID, median_policy=median_policy)
     assert str(error.value) == (
         f"{cell.cell_id} wrote power-window artifacts for a GLM-5.3-Flash producer cell, and no FPM measurement "
         "policy describes the rows of such a cell with a power window"
     )
+
+
+@pytest.mark.parametrize("median_policy", [True, False], ids=["median-label", "single-sample-label"])
+def test_glm_cell_with_power_window_artifacts_under_a_plan_without_measure_power_keeps_that_refusal(
+    tmp_path, monkeypatch, median_policy
+):
+    # A producer cell with power-window artifacts under a plan without measure_power holds two faults. The refusal of
+    # the plan runs first, so the cell reads its text.
+    plan, cell = _powered_publication(monkeypatch, tmp_path, measure_power=False)
+    with pytest.raises(ValueError) as error:
+        database.aggregate_cell(plan, cell, tmp_path, expected_attempt_id=ATTEMPT_ID, median_policy=median_policy)
+    assert str(error.value) == f"{cell.cell_id} wrote power-window artifacts under a plan without measure_power"
+
+
+@pytest.mark.parametrize("mode", [None, "eager"], ids=["no-execution-mode", "eager"])
+def test_powered_cell_of_another_mode_keeps_the_power_window_label(tmp_path, monkeypatch, mode):
+    # Only the mode of the GLM-5.3-Flash producer is refused with power-window artifacts. A cell without an execution
+    # mode and a cell of the audited mode eager keep the power-window label and its power.
+    plan, cell = _powered_publication(monkeypatch, tmp_path, mode=mode)
+    rows = database.aggregate_cell(plan, cell, tmp_path, expected_attempt_id=ATTEMPT_ID)
+    assert len(rows) == 2
+    assert {(row["measurement_policy"], row["power_w"]) for row in rows} == {
+        (database.POWER_WINDOW_MEASUREMENT_POLICY, 100.0)
+    }
 
 
 @pytest.mark.parametrize("order", ["median-first", "single-first"])

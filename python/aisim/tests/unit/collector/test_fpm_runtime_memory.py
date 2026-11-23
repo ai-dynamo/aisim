@@ -2605,6 +2605,28 @@ def test_glm_plan_selects_one_batch_size_with_the_parallel_presets(tmp_path):
     assert (_cells(plan), _largest_batches(plan)) == ([(4, "decode"), (4, "prefill")], (16, 16))
 
 
+def test_glm_batch_refusal_names_the_data_parallelism_of_two_deployments_at_one_tp(tmp_path):
+    # A pure-TP deployment at one GPU with 16 sequences and a dep deployment at four GPUs with 8 share TP 1 and differ
+    # in DP and expert parallelism. The TP filter leaves out the pure-TP deployment at four GPUs.
+    with pytest.raises(ValueError) as error:
+        _glm_plan(
+            tmp_path,
+            max_batch_size=16,
+            topology={"tp": 1, "dp": 1, "moe_tp": 1, "moe_ep": 1},
+            extra_deployments=[_second_deployment(8, tp=1, dp=4, moe_tp=1, moe_ep=4)],
+            gpus=(1, 4),
+            preset=("pure_tp", "dep"),
+            max_num_seqs=None,
+            max_prefill_batch_size=None,
+            tp_sizes=(1,),
+        )
+    assert str(error.value) == _batch_refusal(
+        "prefill",
+        "the accepted deployment at TP 1 (DP 1, MoE TP 1, MoE EP 1) holds 16, the accepted deployment at TP 1 (DP 4, "
+        "MoE TP 1, MoE EP 4) holds 8",
+    )
+
+
 def test_glm_plan_with_one_probed_batch_size_plans(tmp_path):
     # The other remedy: a new probe records one batch size, 8, for both deployments.
     plan = _two_batch_sizes(tmp_path, 8, 8)

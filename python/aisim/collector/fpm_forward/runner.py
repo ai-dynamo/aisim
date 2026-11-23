@@ -2355,7 +2355,9 @@ def _run_collection_impl(
     # checkpoint if it recovered a cell. Only a rerun schedules cluster work.
     # A plain resume reruns a cell that has no entry, or that is interrupted
     # or running and was not recovered; --resume-retry-failed also reruns a
-    # cell that failed or whose cleanup failed.
+    # cell that is failed and was not recovered, or whose cleanup failed. A
+    # recovered cell whose observation archive fails becomes failed and is
+    # not rerun in the same resume.
     if resume:
         for cell in target_cells:
             entry = checkpoint["cells"].get(cell.cell_id)
