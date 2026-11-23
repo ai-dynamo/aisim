@@ -754,9 +754,9 @@ def _check_paths(root: Path) -> None:
 def check_plan(request: SupportRequest, root: Path, *, allow_missing: bool = False) -> None:
     """Verify saved identity before collecting or reusing any local output.
 
-    A saved support-plan.json must equal one of four renderings of the saved request, and each generated file must
-    hold the bytes of that rendering, or may be absent with allow_missing: the plan of this planner, the same plan
-    under the older command name, and each of the two with the grouped replay cold, as an earlier planner wrote it.
+    A saved support-plan.json must equal one of four renderings of the saved request, and each generated file must hold
+    the bytes of that rendering, or may be absent with allow_missing: the plan of this planner, the same plan under the
+    older command and product name, and each of the two with the grouped replay cold, as an earlier planner wrote it.
     The text of fpm.prefix_caching_reason, the reason of a cold plan, is not compared: a rendering that holds the key
     takes the string of the saved plan, so only the presence of the key is compared, and a value that is not a string
     is refused. A cold rendering of a grouped profile keeps the string of the saved plan also when this planner

@@ -1546,6 +1546,7 @@ def test_model_config_init_names_the_warmup_flag_of_a_negative_count(tmp_path, c
     from .test_onboard_model_config import _files as _config_files
 
     source, resources = _config_files(tmp_path)
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as error:
         cli.main(_config_args(tmp_path / "request.yaml", source, resources, warmup_iterations=-1))
+    assert error.value.code == 2
     assert "  --warmup-iterations: Input should be greater than or equal to 0" in capsys.readouterr().err.splitlines()
