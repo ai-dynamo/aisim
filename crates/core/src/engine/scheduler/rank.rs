@@ -779,6 +779,7 @@ fn core_request(request: Request) -> DirectRequest {
         cache_salt: request.cache_salt.filter(|salt| !salt.is_empty()),
         images: request.images,
         kv_hint: request.kv_hint,
+        prompt_hashes: request.prompt_hashes,
     }
 }
 
@@ -1157,6 +1158,7 @@ mod tests {
                 embedding_bytes: 128,
             }],
             kv_hint: None,
+            prompt_hashes: None,
         };
         let command = |request| match worker_type {
             WorkerType::Aggregated => Command::Submit(request),
@@ -1336,6 +1338,7 @@ mod tests {
                     session_id: None,
                     images: Vec::new(),
                     kv_hint: None,
+                    prompt_hashes: None,
                 }),
                 CommandContext {
                     now_ms: 0.0,
@@ -1360,6 +1363,7 @@ mod tests {
                     session_id: None,
                     images: Vec::new(),
                     kv_hint: None,
+                    prompt_hashes: None,
                 }),
                 CommandContext {
                     now_ms: first_end_ms,
@@ -1507,6 +1511,7 @@ mod tests {
                     session_id: None,
                     images: Vec::new(),
                     kv_hint: None,
+                    prompt_hashes: None,
                 }),
                 CommandContext {
                     now_ms,
@@ -1555,6 +1560,7 @@ mod tests {
                         session_id: None,
                         images: Vec::new(),
                         kv_hint: None,
+                        prompt_hashes: None,
                     },
                 },
                 CommandContext {
@@ -1587,6 +1593,7 @@ mod tests {
                     session_id: None,
                     images: Vec::new(),
                     kv_hint: None,
+                    prompt_hashes: None,
                 }),
                 CommandContext {
                     now_ms: 0.0,
@@ -1723,6 +1730,7 @@ mod tests {
                         session_id: None,
                         images: Vec::new(),
                         kv_hint: None,
+                        prompt_hashes: None,
                     }),
                     CommandContext {
                         now_ms: 0.0,
@@ -1886,6 +1894,7 @@ mod tests {
                     session_id: None,
                     images: Vec::new(),
                     kv_hint: None,
+                    prompt_hashes: None,
                 }),
                 CommandContext {
                     now_ms: h2d_due_ms - 0.5,
@@ -1911,6 +1920,7 @@ mod tests {
                     session_id: None,
                     images: Vec::new(),
                     kv_hint: None,
+                    prompt_hashes: None,
                 }),
                 CommandContext {
                     now_ms: h2d_due_ms + 0.5,
@@ -1972,6 +1982,7 @@ mod tests {
                     session_id: None,
                     images: Vec::new(),
                     kv_hint: None,
+                    prompt_hashes: None,
                 }),
                 CommandContext {
                     now_ms: h2d_due_ms + 1.0,
@@ -2032,6 +2043,7 @@ mod tests {
                         session_id: None,
                         images: Vec::new(),
                         kv_hint: None,
+                        prompt_hashes: None,
                     }),
                     CommandContext {
                         now_ms,
@@ -2073,6 +2085,7 @@ mod tests {
                     session_id: None,
                     images: Vec::new(),
                     kv_hint: None,
+                    prompt_hashes: None,
                 }),
                 CommandContext {
                     now_ms: h2d_due_ms - 0.5,
@@ -2168,6 +2181,7 @@ mod tests {
                         session_id: None,
                         images: Vec::new(),
                         kv_hint: None,
+                        prompt_hashes: None,
                     },
                 },
                 CommandContext {
@@ -2240,6 +2254,7 @@ mod tests {
                         session_id: None,
                         images: Vec::new(),
                         kv_hint: None,
+                        prompt_hashes: None,
                     }),
                     CommandContext {
                         now_ms: 0.0,
@@ -2299,6 +2314,7 @@ mod tests {
                         session_id: None,
                         images: Vec::new(),
                         kv_hint: None,
+                        prompt_hashes: None,
                     },
                 },
                 CommandContext {
@@ -2395,6 +2411,7 @@ mod tests {
                         output_token_ids: None,
                         session_id: None,
                         kv_hint: None,
+                        prompt_hashes: None,
                     },
                 },
                 0.0,
@@ -2447,6 +2464,7 @@ mod tests {
                         output_token_ids: None,
                         session_id: None,
                         kv_hint: None,
+                        prompt_hashes: None,
                     },
                 },
                 now_ms,

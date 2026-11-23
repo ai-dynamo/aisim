@@ -101,6 +101,7 @@ fn raw_prefix_tokens(core: &VllmCore, tokens: Vec<u32>) -> usize {
         false,
         false,
         None,
+        None,
     );
     core.kv_manager
         .get_native_prefill_cost(&probe.sequence, &probe.lease)

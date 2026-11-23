@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::engine::PromptHashes;
 use crate::engine::common::hashing::{
     BlockHash, SequenceHash, XXH3_SEED, block_hashes, compute_block_hash_for_tokens,
     compute_next_sequence_hash,
@@ -145,6 +146,35 @@ impl RequestSequence {
         emit_token_ids: bool,
         planned_output_ids: Option<Vec<u32>>,
     ) -> (Self, Vec<BlockIdentity>) {
+        Self::with_prompt_hashes(
+            request_id,
+            tokens,
+            max_output_tokens,
+            output_capacity_hint,
+            block_size,
+            enable_prefix_caching,
+            retain_local_hashes,
+            emit_token_ids,
+            planned_output_ids,
+            None,
+        )
+    }
+
+    /// [`Self::new`] that takes the caller's hashes of the prompt's complete
+    /// blocks, when they cover it at `block_size`, instead of hashing them.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_prompt_hashes(
+        request_id: Uuid,
+        tokens: Vec<u32>,
+        max_output_tokens: usize,
+        output_capacity_hint: usize,
+        block_size: usize,
+        enable_prefix_caching: bool,
+        retain_local_hashes: bool,
+        emit_token_ids: bool,
+        planned_output_ids: Option<Vec<u32>>,
+        prompt_hashes: Option<&PromptHashes>,
+    ) -> (Self, Vec<BlockIdentity>) {
         assert!(block_size >= 2, "block_size must be at least two");
         let num_input_tokens = tokens.len();
         let output_capacity_hint = output_capacity_hint.min(max_output_tokens);
@@ -156,7 +186,18 @@ impl RequestSequence {
         let retain_local_hashes = retain_local_hashes && enable_prefix_caching;
 
         let mut identities = Vec::with_capacity(completion_blocks);
-        if enable_prefix_caching {
+        let prompt_hashes = prompt_hashes
+            .filter(|hashes| enable_prefix_caching && hashes.cover(&tokens, block_size));
+        if let Some(hashes) = prompt_hashes {
+            let pairs = hashes
+                .local_block_hashes
+                .iter()
+                .zip(&hashes.sequence_hashes);
+            identities.extend(pairs.map(|(&local_hash, &sequence_hash)| BlockIdentity {
+                sequence_hash: Some(sequence_hash),
+                local_hash: retain_local_hashes.then_some(local_hash),
+            }));
+        } else if enable_prefix_caching {
             let mut parent_hash = None;
             for local_hash in block_hashes(&tokens, block_size) {
                 let sequence_hash = parent_hash
@@ -483,6 +524,60 @@ mod tests {
             Some(compute_next_sequence_hash(first, second_local))
         );
         assert_ne!(identities[1].sequence_hash, Some(second_local));
+    }
+
+    #[test]
+    fn supplied_prompt_hashes_stand_in_for_hashing_only_when_they_cover_the_prompt() {
+        let tokens: Vec<u32> = (0..10).collect();
+        let (_, hashed) = sequence(tokens.clone(), 1, true, false, None);
+        let identities = |hashes: &PromptHashes| {
+            let prompt = tokens.clone();
+            RequestSequence::with_prompt_hashes(
+                Uuid::nil(),
+                prompt,
+                1,
+                1,
+                4,
+                true,
+                true,
+                false,
+                None,
+                Some(hashes),
+            )
+            .1
+        };
+        let supplied = PromptHashes {
+            block_size: 4,
+            local_block_hashes: hashed[..2].iter().filter_map(|id| id.local_hash).collect(),
+            sequence_hashes: hashed[..2]
+                .iter()
+                .filter_map(|id| id.sequence_hash)
+                .collect(),
+        };
+        assert!(supplied.cover(&tokens, 4));
+        assert_eq!(identities(&supplied), hashed);
+
+        // Hashes of another block size, of fewer blocks, or with a short chain are
+        // not this prompt's.
+        let other_block_size = PromptHashes {
+            block_size: 2,
+            local_block_hashes: vec![1, 2],
+            sequence_hashes: vec![1, 2],
+        };
+        let too_few = PromptHashes {
+            block_size: 4,
+            local_block_hashes: vec![1],
+            sequence_hashes: vec![1],
+        };
+        let short_chain = PromptHashes {
+            block_size: 4,
+            local_block_hashes: vec![1, 2],
+            sequence_hashes: vec![1],
+        };
+        for uncovered in [other_block_size, too_few, short_chain] {
+            assert!(!uncovered.cover(&tokens, 4));
+            assert_eq!(identities(&uncovered), hashed);
+        }
     }
 
     #[test]

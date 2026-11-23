@@ -11,6 +11,8 @@
 
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
+use crate::engine::PromptHashes;
+
 pub(crate) type BlockHash = u64;
 pub(crate) type SequenceHash = u64;
 pub(crate) type Token = u32;
@@ -101,6 +103,35 @@ pub(crate) fn block_hashes_with_salt<'a>(
         previous = Some((block, hash));
         hash
     })
+}
+
+impl PromptHashes {
+    /// Whether these hashes stand in for hashing every complete `block_size`
+    /// block of an unsalted prompt. Release builds check only their shape: the
+    /// caller vouches for the values.
+    pub(crate) fn cover(&self, tokens: &[Token], block_size: usize) -> bool {
+        let cover = self.block_size == block_size
+            && self.local_block_hashes.len() == tokens.len() / block_size
+            && self.sequence_hashes.len() == self.local_block_hashes.len();
+        debug_assert!(
+            !cover || self.matches(tokens),
+            "caller-supplied prompt hashes differ from the engine's"
+        );
+        cover
+    }
+
+    fn matches(&self, tokens: &[Token]) -> bool {
+        let mut parent = None;
+        block_hashes(tokens, self.block_size)
+            .zip(self.local_block_hashes.iter().zip(&self.sequence_hashes))
+            .all(|(local_hash, (&supplied_local, &supplied_sequence))| {
+                let sequence_hash = parent.map_or(local_hash, |parent| {
+                    compute_next_sequence_hash(parent, local_hash)
+                });
+                parent = Some(sequence_hash);
+                local_hash == supplied_local && sequence_hash == supplied_sequence
+            })
+    }
 }
 
 #[cfg(test)]

@@ -65,7 +65,7 @@ pub use protocol::{
     EncoderShape, ForwardPassMetrics, HostCacheMetrics, ImageSpec, KvBlock, KvEvent, KvEventData,
     KvEventDomain, KvEventTier, KvHintSource, LifecycleEvent, Metrics, Output,
     PassCompletionEffects, PassStartEffects, PrefixCacheLookupCounts, PressureEvent, PressureKind,
-    PressureState, Request, StoredBlocks, TtftMilestone,
+    PressureState, PromptHashes, Request, StoredBlocks, TtftMilestone,
 };
 pub use runtime::{Engine, EngineFactory};
 pub use scheduler::SchedulerRank;

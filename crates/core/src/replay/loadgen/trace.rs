@@ -498,6 +498,7 @@ impl TurnTrace {
             policy_class: self.policy_class.clone(),
             replay_context: None,
             images: self.images.clone(),
+            prompt_hashes: None,
         })
     }
 

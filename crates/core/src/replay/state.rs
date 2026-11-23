@@ -277,6 +277,10 @@ impl DisaggRequestState {
 
     pub(crate) fn start_decode(&mut self) {
         self.phase = DisaggPhase::RunningDecode;
+        // Both engines hold the request by now, so nothing reads its hashes again.
+        if let Some(request) = &mut self.original {
+            request.metadata_mut().prompt_hashes = None;
+        }
     }
 
     pub(crate) fn complete_decode(&mut self) {

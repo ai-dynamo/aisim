@@ -1456,6 +1456,7 @@ fn native_request(request: DirectRequest, kv_hint: Option<KvHintSource>) -> Resu
             .and_then(|context| context.session_id().map(str::to_owned)),
         images: request.images,
         kv_hint,
+        prompt_hashes: request.prompt_hashes,
     })
 }
 

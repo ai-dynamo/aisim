@@ -47,6 +47,7 @@ mod vllm {
             false,
             false,
             None,
+            None,
         )
     }
 
@@ -519,6 +520,7 @@ mod vllm {
             true,
             false,
             false,
+            None,
             None,
         );
         let mut collector = crate::engine::trace::TraceCollector::default();
@@ -1007,6 +1009,7 @@ mod trtllm {
             false,
             false,
             None,
+            None,
         );
         assert!(should_reject_for_model_len(&sequence, Some(8)));
     }
@@ -1040,6 +1043,7 @@ mod trtllm {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
     }
 

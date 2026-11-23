@@ -5961,6 +5961,7 @@ def test_simulation_dynamo_text_only_request_against_current_api(tmp_path, monke
         "            session_id: None,\n"
         "            cache_salt: None,\n"
         "            kv_hint: None,\n"
+        "            prompt_hashes: None,\n"
         "            // Modified by AISim CI: the pinned Dynamo request is text-only.\n"
         "            images: {\n"
         "                assert!(\n"
@@ -5987,7 +5988,7 @@ def test_simulation_dynamo_text_only_request_against_current_api(tmp_path, monke
         "path": request.path,
         "struct": "Request",
         "before_sha256": request.sha256,
-        "inserted_fields": ["session_id", "cache_salt", "images", "kv_hint"],
+        "inserted_fields": ["session_id", "cache_salt", "images", "kv_hint", "prompt_hashes"],
         "rejected_lifecycle_events": ["TtftMilestone"],
         "after_sha256": hashlib.sha256(expected.encode()).hexdigest(),
     }

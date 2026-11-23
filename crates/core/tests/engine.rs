@@ -616,6 +616,7 @@ fn submit_interval_request(
                     session_id: None,
                     images: Vec::new(),
                     kv_hint: None,
+                    prompt_hashes: None,
                 }),
             ),
             now_ms,
@@ -767,6 +768,7 @@ fn sglang_split_prefixes_remain_reusable_across_cache_pressure() {
                         session_id: None,
                         images: Vec::new(),
                         kv_hint: None,
+                        prompt_hashes: None,
                     }),
                 ),
                 now_ms,
@@ -824,6 +826,7 @@ fn sglang_prefill_packs_remaining_pages_and_completes_partial_chunks() {
                             session_id: None,
                             images: Vec::new(),
                             kv_hint: None,
+                            prompt_hashes: None,
                         }),
                     ),
                     now_ms,
@@ -1960,6 +1963,7 @@ fn native_images_require_sglang_even_with_vision_timing(
                     embedding_bytes: 128,
                 }],
                 kv_hint: None,
+                prompt_hashes: None,
             }),
         ),
         0.0,
@@ -2877,6 +2881,7 @@ fn submit_tokens(engine: &mut Engine, dp_rank: u32, id: u128, tokens: usize, out
                     session_id: None,
                     images: Vec::new(),
                     kv_hint: None,
+                    prompt_hashes: None,
                 }),
             ),
             0.0,
@@ -2907,6 +2912,34 @@ fn iteration_engine(
         .unwrap()
         .build(EngineIdentity::new(0), NonZeroU32::new(dp_size).unwrap())
         .unwrap()
+}
+
+/// Debug builds compare the prompt hashes an engine adopts with its own.
+#[cfg(debug_assertions)]
+#[rstest::rstest]
+#[should_panic(expected = "caller-supplied prompt hashes differ")]
+fn engines_check_the_prompt_hashes_they_adopt(
+    #[values(Backend::Vllm, Backend::Sglang)] backend: Backend,
+) {
+    let mut engine = iteration_engine(backend, 1, Arc::default(), |config| {
+        config.enable_prefix_caching = true;
+    });
+    let request = Request {
+        cache_salt: None,
+        request_id: Uuid::from_u128(1),
+        tokens: (0..8).collect(),
+        max_output_tokens: 1,
+        output_token_ids: None,
+        session_id: None,
+        images: Vec::new(),
+        kv_hint: None,
+        prompt_hashes: Some(aisim_core::engine::PromptHashes {
+            block_size: 4,
+            local_block_hashes: vec![1, 2],
+            sequence_hashes: vec![1, 2],
+        }),
+    };
+    let _ = engine.apply_command_effects(SchedulerCommand::new(0, Command::Submit(request)), 0.0);
 }
 
 #[rstest::rstest]

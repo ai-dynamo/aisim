@@ -423,6 +423,7 @@ fn flat_storage_capacity_is_bounded_by_realizable_output() {
             true,
             true,
             None,
+            None,
         );
         assert_eq!(request.max_output_tokens(), MAX_OUTPUT_TOKENS);
         let (token_capacity, lease_capacity) = request.native_storage_capacities();
@@ -2512,6 +2513,7 @@ mod core_behavior {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
 
         let mut collector = crate::engine::trace::TraceCollector::default();
@@ -2564,6 +2566,7 @@ mod core_behavior {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
         core.receive(DirectRequest {
             cache_salt: None,
@@ -2575,6 +2578,7 @@ mod core_behavior {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
 
         let mut collector = crate::engine::trace::TraceCollector::default();
@@ -2635,6 +2639,7 @@ mod core_behavior {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
         core.receive(DirectRequest {
             cache_salt: None,
@@ -2646,6 +2651,7 @@ mod core_behavior {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
 
         let mut collector = crate::engine::trace::TraceCollector::default();
@@ -2686,6 +2692,7 @@ mod core_behavior {
                 session_id: None,
                 images: Vec::new(),
                 kv_hint: None,
+                prompt_hashes: None,
             });
         }
 
@@ -2749,6 +2756,7 @@ mod core_behavior {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
 
         let mut collector = crate::engine::trace::TraceCollector::default();
@@ -2809,6 +2817,7 @@ mod core_behavior {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
 
         let mut collector = crate::engine::trace::TraceCollector::default();
@@ -2855,6 +2864,7 @@ mod core_behavior {
                 session_id: None,
                 images: Vec::new(),
                 kv_hint: None,
+                prompt_hashes: None,
             });
         }
 
@@ -2904,6 +2914,7 @@ mod core_behavior {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
         core.receive(DirectRequest {
             cache_salt: None,
@@ -2915,6 +2926,7 @@ mod core_behavior {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
         core.receive(DirectRequest {
             cache_salt: None,
@@ -2926,6 +2938,7 @@ mod core_behavior {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
 
         let mut collector = crate::engine::trace::TraceCollector::default();
@@ -3000,6 +3013,7 @@ mod core_behavior {
                 session_id: None,
                 images: Vec::new(),
                 kv_hint: None,
+                prompt_hashes: None,
             });
         }
 
@@ -3033,6 +3047,7 @@ mod core_behavior {
                 session_id: None,
                 images: Vec::new(),
                 kv_hint: None,
+                prompt_hashes: None,
             });
         }
 
@@ -3072,6 +3087,7 @@ mod core_behavior {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
         core.receive(DirectRequest {
             cache_salt: None,
@@ -3083,6 +3099,7 @@ mod core_behavior {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
 
         let mut collector = crate::engine::trace::TraceCollector::default();
@@ -3191,6 +3208,7 @@ mod core_behavior {
                 session_id: None,
                 images: Vec::new(),
                 kv_hint: None,
+                prompt_hashes: None,
             });
             core.execute_pass(&mut collector, 0.0);
             assert!(core.is_empty());
@@ -3205,6 +3223,7 @@ mod core_behavior {
                 session_id: None,
                 images: Vec::new(),
                 kv_hint: None,
+                prompt_hashes: None,
             });
             let pass = core.execute_pass(&mut collector, 1.0);
             let fpm = pass.fpm.expect("forward-pass metrics should be present");
@@ -3252,6 +3271,7 @@ mod forward_pass_metrics {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
 
         let mut collector = crate::engine::trace::TraceCollector::default();
@@ -3283,6 +3303,7 @@ mod forward_pass_metrics {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
 
         let mut collector = crate::engine::trace::TraceCollector::default();
@@ -3305,6 +3326,7 @@ mod forward_pass_metrics {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
 
         // Pass 2: r1 decode + r2 prefill (mixed batch)
@@ -3338,6 +3360,7 @@ mod forward_pass_metrics {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
 
         let mut collector = crate::engine::trace::TraceCollector::default();
@@ -3381,6 +3404,7 @@ mod forward_pass_metrics {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
 
         let mut collector = crate::engine::trace::TraceCollector::default();
@@ -3429,6 +3453,7 @@ mod forward_pass_metrics {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
         core.receive(DirectRequest {
             cache_salt: None,
@@ -3440,6 +3465,7 @@ mod forward_pass_metrics {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
 
         let mut collector = crate::engine::trace::TraceCollector::default();
@@ -3481,6 +3507,7 @@ mod forward_pass_metrics {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
         core.receive(DirectRequest {
             cache_salt: None,
@@ -3492,6 +3519,7 @@ mod forward_pass_metrics {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
 
         let mut collector = crate::engine::trace::TraceCollector::default();
@@ -3534,6 +3562,7 @@ mod forward_pass_metrics {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
 
         let mut collector = crate::engine::trace::TraceCollector::default();
@@ -3607,6 +3636,7 @@ mod forward_pass_metrics {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
 
         // Prefill r1 and decode a few tokens to build up KV
@@ -3625,6 +3655,7 @@ mod forward_pass_metrics {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            prompt_hashes: None,
         });
 
         // This pass should trigger preemption

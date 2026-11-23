@@ -18,7 +18,9 @@ use crate::engine::common::hashing::{
 };
 use crate::engine::common::kv_cache_trace;
 use crate::engine::common::protocols::KvEventPublishers;
-use crate::engine::{KvBlock, KvEvent, KvEventData, KvEventDomain, KvEventTier, StoredBlocks};
+use crate::engine::{
+    KvBlock, KvEvent, KvEventData, KvEventDomain, KvEventTier, PromptHashes, StoredBlocks,
+};
 use fixedbitset::FixedBitSet;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -129,6 +131,29 @@ impl RadixRequestLease {
     #[cfg(test)]
     pub(crate) fn page_capacity(&self) -> usize {
         self.pages.capacity()
+    }
+
+    /// Take the caller's hashes of the prompt's complete pages, leaving
+    /// [`Self::ensure_page_hashes`] none to compute. A salted request, or hashes
+    /// that do not cover the prompt at `page_size`, keep hashing here.
+    pub(crate) fn adopt_prompt_hashes(
+        &mut self,
+        hashes: &PromptHashes,
+        prompt: &[u32],
+        page_size: usize,
+    ) {
+        if self.cache_salt.is_none()
+            && self.page_hashes.is_empty()
+            && hashes.cover(prompt, page_size)
+        {
+            self.page_hashes.extend(
+                hashes
+                    .local_block_hashes
+                    .iter()
+                    .copied()
+                    .map(LocalBlockHash),
+            );
+        }
     }
 
     pub(crate) fn ensure_page_hashes(&mut self, token_ids: &[u32], page_size: usize) {
@@ -2628,6 +2653,28 @@ mod tests {
         assert_eq!(lease.page_hashes().as_ptr(), hash_storage);
         assert_eq!(lease.page_hashes.capacity(), hash_capacity);
         mgr.abort(lease);
+    }
+
+    #[test]
+    fn a_lease_adopts_prompt_hashes_only_for_its_own_unsalted_pages() {
+        let tokens: Vec<u32> = (0..10).collect();
+        let hashed = lease_with_hashes(&tokens, 4);
+        let supplied = PromptHashes {
+            block_size: 4,
+            local_block_hashes: hashed.page_hashes().iter().map(|hash| hash.0).collect(),
+            sequence_hashes: compute_seq_hash_for_block(hashed.page_hashes()),
+        };
+        let mut lease = RadixRequestLease::default();
+        lease.adopt_prompt_hashes(&supplied, &tokens, 4);
+        assert_eq!(lease.page_hashes(), hashed.page_hashes());
+
+        // A salt changes every page hash, and another page size has other pages.
+        let mut salted = RadixRequestLease::new(Some("tenant".to_string()));
+        salted.adopt_prompt_hashes(&supplied, &tokens, 4);
+        assert!(salted.page_hashes().is_empty());
+        let mut other_page_size = RadixRequestLease::default();
+        other_page_size.adopt_prompt_hashes(&supplied, &tokens, 2);
+        assert!(other_page_size.page_hashes().is_empty());
     }
 
     #[test]
