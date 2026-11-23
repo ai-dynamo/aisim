@@ -64,6 +64,7 @@ class WavePool:
         self.executor = None
         self.ready = None
         self.key = None
+        self.width = 0
 
     def start(self, key, size, factory, initializer):
         if self.executor is None:
@@ -75,6 +76,7 @@ class WavePool:
                 initargs=(factory, initializer, self.ready.name),
             )
             self.key = key
+            self.width = size
         return self.executor
 
     def close(self, *, interrupted=False):
@@ -84,6 +86,7 @@ class WavePool:
         finally:
             self.executor = None
             self.key = None
+            self.width = 0
             if self.ready is not None:
                 self.ready.cleanup()
                 self.ready = None
@@ -103,25 +106,25 @@ def evaluate_waves(specs, *, factory, initializer, evaluate, workers: int, timeo
         wave = pending[:capacity]
         while True:
             candidates = [specs[index] for index in wave]
-            key = reuse_key(candidates) if reuse_key is not None else None
-            if state.executor is not None and (key is None or key != state.key):
-                state.close()
             try:
                 plan = factory.admit_wave(candidates)
                 break
             except ResourceLimitError as exc:
-                # Idle workers count against live headroom. Retry the same wave cold
-                # before using a smaller wave or refusing a candidate.
-                if state.executor is not None:
-                    state.close()
-                    continue
                 if isinstance(exc, _SerialAdmissionRequired):
                     capacity = 1
                     wave = wave[:1]
                     awaiting_observation = True
                     continue
+                # Keep a matching smaller pool while probing narrower waves.
+                # If its own width cannot fit, retry the full request cold.
+                if state.executor is not None and (
+                    len(wave) <= state.width or reuse_key is None or reuse_key(candidates[: state.width]) != state.key
+                ):
+                    state.close()
+                    wave = pending[:capacity]
+                    continue
                 if len(wave) > 1:
-                    wave = wave[: max(1, len(wave) // 2)]
+                    wave = wave[: max(state.width, len(wave) // 2)]
                     continue
                 index = wave[0]
                 pending.remove(index)
@@ -130,6 +133,9 @@ def evaluate_waves(specs, *, factory, initializer, evaluate, workers: int, timeo
                 break
         if not wave:
             continue
+        key = reuse_key(candidates) if reuse_key is not None else None
+        if state.executor is not None and (state.width != len(wave) or state.key != key):
+            state.close()
         checkpoint("wave_admitted", plan)
         pending = pending[len(wave) :]
         for index in wave:

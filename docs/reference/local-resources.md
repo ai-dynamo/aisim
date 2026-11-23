@@ -85,13 +85,22 @@ budget at startup, then samples total owned RSS and live host headroom every
 are limited to one thread per worker. During recommendation evaluation, memory
 pressure triggers worker cleanup and retries unfinished candidates at lower
 parallelism, at most twice. The scheduler retains completed candidates and reaps
-interrupted workers before retrying. A native Weka sweep can keep healthy workers
-across waves when the workload, trace files, and worker count match. Reuse requires
-the native engine runner with `trace_graph_cache=True`. The `recommend` CLI enables
-this cache. Direct `Sweeper` callers can enable it on `EngineReplayRunnerFactory`.
-The scheduler admits each wave against live memory. If idle workers prevent admission, it reaps
-them and retries at the same width. If a retained worker dies, the scheduler
-retries unfinished work in a fresh pool. An error in the fresh pool propagates. Persistent pressure produces an explicit
+interrupted workers before retrying.
+
+For native Weka replays, `recommend` can reuse healthy workers when the workload,
+trace files, and admitted worker count match. To use this feature with `Sweeper`
+directly, wrap `EngineReplayRunnerFactory(trace_graph_cache=True)` in
+`GuardedRunnerFactory` and pass the wrapper as `runner_factory`. A raw engine
+factory skips resource admission. External factories and subclasses can opt in by
+implementing `wave_reuse_key(specs)`. Return the same key for compatible waves
+or `None` to release the workers.
+
+The scheduler admits each wave against live memory. If a narrower wave fits,
+the scheduler can reuse a matching pool at that width. If idle workers prevent
+admission at their own width, the scheduler releases them and retries. It also
+releases idle workers before each registered `on_round` callback.
+If a retained worker dies, the scheduler retries unfinished work in a fresh pool.
+An error in the fresh pool propagates. Persistent pressure produces an explicit
 `resource_limited` candidate and the sweep continues with other candidates.
 A sudden jump past the supervisor limit stops the entire execution tree.
 

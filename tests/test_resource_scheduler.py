@@ -593,6 +593,7 @@ def test_reuse_requires_same_native_weka_workload_and_width(monkeypatch, tmp_pat
     made = []
     admissions = []
     refuse_warm = False
+    width_limit = 2
     for path in ("a", "b"):
         (tmp_path / f"{path}.jsonl").touch()
 
@@ -607,6 +608,8 @@ def test_reuse_requires_same_native_weka_workload_and_width(monkeypatch, tmp_pat
 
     def admit(self, specs):
         admissions.append((len(specs), state.executor is not None))
+        if len(specs) > width_limit:
+            raise ResourceLimitError("insufficient headroom for requested width")
         if refuse_warm and state.executor is not None:
             raise ResourceLimitError("insufficient headroom with idle workers")
         return {}
@@ -615,7 +618,7 @@ def test_reuse_requires_same_native_weka_workload_and_width(monkeypatch, tmp_pat
     monkeypatch.setattr(scheduler, "close_pool", lambda pool: None)
     monkeypatch.setattr(GuardedRunnerFactory, "admit_wave", admit)
 
-    def run(*paths):
+    def run(*paths, workers=None):
         specs = [
             SimpleNamespace(
                 workload={
@@ -633,7 +636,7 @@ def test_reuse_requires_same_native_weka_workload_and_width(monkeypatch, tmp_pat
                 factory=factory,
                 initializer=_init,
                 evaluate=_evaluate,
-                workers=len(specs),
+                workers=workers or len(specs),
                 timeout=10,
                 pool_state=state,
             )
@@ -651,6 +654,12 @@ def test_reuse_requires_same_native_weka_workload_and_width(monkeypatch, tmp_pat
         assert run("b", "b") == [4, 4]
         assert run("a", "b") == [5, 5]
         assert state.executor is None
+        width_limit = 1
+        assert run(*("a",) * 6, workers=2) == [6] * 6
+        width_limit = 2
+        refuse_warm = True
+        assert run("a", "a") == [7, 7]
+        assert admissions[-3:] == [(2, True), (1, True), (2, False)]
     finally:
         state.close()
 
@@ -688,6 +697,24 @@ def test_ineligible_weka_workloads_have_no_pool_reuse_key(tmp_path, monkeypatch,
         monkeypatch.setattr(resources, "_trace_scan_identity", disappeared)
 
     assert factory.wave_reuse_key([SimpleNamespace(workload=workload)]) is None
+
+
+def test_external_engine_subclass_must_opt_in_to_worker_reuse(tmp_path):
+    from aisim.runner import EngineReplayRunnerFactory
+
+    class Plugin(EngineReplayRunnerFactory):
+        pass
+
+    class ReusablePlugin(Plugin):
+        def wave_reuse_key(self, specs):
+            return specs[0].workload["trace_path"]
+
+    trace = tmp_path / "trace.jsonl"
+    trace.touch()
+    specs = [SimpleNamespace(workload={"trace_format": "weka", "trace_path": str(trace)})]
+    for plugin, expected in [(Plugin, None), (ReusablePlugin, str(trace))]:
+        factory = GuardedRunnerFactory(plugin(trace_graph_cache=True), "external", ResourceConfig())
+        assert factory.wave_reuse_key(specs) == expected
 
 
 @pytest.mark.parametrize("pressure", [True, False], ids=["memory", "timeout"])

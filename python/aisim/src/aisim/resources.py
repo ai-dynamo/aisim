@@ -1251,14 +1251,13 @@ class GuardedRunnerFactory:
         return GuardedRunner(self.factory.create(worker_id), self.stack, self.policy, self.factory)
 
     def wave_reuse_key(self, specs):
-        """Only the native Weka runner opts into keeping a compiled trace across waves."""
+        """Return a key for compatible waves, or None to release workers after each wave."""
         from .runner import EngineReplayRunnerFactory
 
-        if (
-            not isinstance(self.factory, EngineReplayRunnerFactory)
-            or self.factory.runtime is not None
-            or not self.factory.trace_graph_cache
-        ):
+        if type(self.factory) is not EngineReplayRunnerFactory:
+            reuse_key = getattr(self.factory, "wave_reuse_key", None)
+            return reuse_key(specs) if callable(reuse_key) else None
+        if self.factory.runtime is not None or not self.factory.trace_graph_cache:
             return None
         workload = specs[0].workload
         if workload.get("trace_format") != "weka" or not (workload.get("trace_paths") or workload.get("trace_path")):

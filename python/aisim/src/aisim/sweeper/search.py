@@ -1920,6 +1920,8 @@ class Sweeper:
 
                 round_no += 1
                 if on_round is not None:
+                    if wave_pool is not None:
+                        wave_pool.close()
                     on_round(round_no, list(candidates))
                 exhausted = getattr(sampler, "exhausted", False)
                 if unique_this_round < round_target or exhausted:

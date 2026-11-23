@@ -760,7 +760,58 @@ class _ReusableFactory(_FakeRunnerFactory):
         self.peaks.append(peak_bytes)
 
 
-@pytest.mark.parametrize("exit_mode", ["completed", "interrupted", "dead-worker"])
+@pytest.mark.parametrize("guarded", [False, True], ids=["raw", "resource-guarded"])
+def test_direct_native_sweeper_uses_admitted_workers_only_with_guard(monkeypatch, guarded):
+    from aisim import resource_scheduler
+    from aisim.config.common import ResourceConfig
+    from aisim.resources import GuardedRunnerFactory
+    from aisim.runner import EngineReplayRunnerFactory
+    from aisim.sweeper.sampler import RandomBranchSampler
+
+    pc = _pc()
+    branch = BranchSpace(
+        deployment_mode="agg",
+        parallel_configs=(pc,),
+        supported_backends={pc: frozenset({"vllm"})},
+        knob_choices={"backend": ["vllm"], "agg_max_num_seqs": [256, 512, 768], "agg_max_num_batched_tokens": [8192]},
+    )
+    _stub(monkeypatch, branch)
+    runner = _FakeRunner()
+    pools = []
+
+    class Pool:
+        def __init__(self, *, max_workers, **kwargs):
+            pools.append(max_workers)
+
+        def submit(self, fn, spec):
+            future = Future()
+            future.set_result(search_mod._run_replay_detailed(spec, runner))
+            return future
+
+    monkeypatch.setattr(resource_scheduler, "ProcessPoolExecutor", Pool)
+    monkeypatch.setattr(resource_scheduler, "close_pool", lambda pool: None)
+    monkeypatch.setattr(EngineReplayRunnerFactory, "create", lambda self, worker_id: runner)
+    monkeypatch.setattr(GuardedRunnerFactory, "admit_wave", lambda self, specs: {})
+    factory = EngineReplayRunnerFactory(trace_graph_cache=True)
+    if guarded:
+        factory = GuardedRunnerFactory(factory, "engine", ResourceConfig())
+    config = _config()
+    config.workload.trace_format = "weka"
+    config.workload.trace_path = str(
+        Path(__file__).parents[1] / "e2e/configs/unified_cli/fixtures/traces/weka-two-plays.jsonl"
+    )
+    candidates = _run_sweep(
+        config,
+        runner_factory=factory,
+        sampler_factory=lambda branch, **kwargs: RandomBranchSampler(branch, seed=1),
+        show_progress=False,
+    )
+
+    assert len(candidates) == runner.calls == 3
+    assert pools == ([1] if guarded else [])
+
+
+@pytest.mark.parametrize("exit_mode", ["completed", "callback", "interrupted", "dead-worker"])
 def test_sweeper_reuses_and_reaps_admitted_workers(monkeypatch, tmp_path, exit_mode):
     from contextlib import nullcontext
 
@@ -771,14 +822,17 @@ def test_sweeper_reuses_and_reaps_admitted_workers(monkeypatch, tmp_path, exit_m
 
     class Sampler(_FakeSampler):
         def suggest(self, count):
+            if self.scored and exit_mode == "dead-worker":
+                (first,) = tmp_path.glob("*.replay-0")
+                psutil.Process(int(first.name.split(".")[0])).kill()
             return super().suggest(len(self.scored) + count)[-count:]
 
     abort = exit_mode == "interrupted"
 
     def on_round(round_number, candidates):
-        if round_number == 1 and exit_mode == "dead-worker":
-            (first,) = tmp_path.glob("*.replay-0")
-            psutil.Process(int(first.name.split(".")[0])).kill()
+        workers = list(tmp_path.glob("*.replay-0"))
+        assert len(workers) == round_number
+        assert all(not psutil.pid_exists(int(path.name.split(".")[0])) for path in workers)
         if round_number == 2 and abort:
             raise RuntimeError("stop after second wave")
 
@@ -788,7 +842,7 @@ def test_sweeper_reuses_and_reaps_admitted_workers(monkeypatch, tmp_path, exit_m
             runner_factory=factory,
             sampler_factory=Sampler,
             show_progress=False,
-            on_round=on_round,
+            on_round=on_round if exit_mode in {"callback", "interrupted"} else None,
         )
 
     pids = [int(path.name.split(".")[0]) for path in tmp_path.glob("*.replay-0")]
@@ -797,11 +851,13 @@ def test_sweeper_reuses_and_reaps_admitted_workers(monkeypatch, tmp_path, exit_m
     if exit_mode == "dead-worker":
         assert len(pids) == 2
         assert len(list(tmp_path.glob("*.closed"))) == 1
+    elif exit_mode in {"callback", "interrupted"}:
+        assert len(pids) == len(list(tmp_path.glob("*.closed"))) == 2
     else:
         (pid,) = pids
         assert (tmp_path / f"{pid}.replay-1").exists()
         assert 0 < factory.peaks[0] <= factory.peaks[1]
-        assert (tmp_path / f"{pid}.closed").exists() != abort
+        assert (tmp_path / f"{pid}.closed").exists()
 
 
 def _reap_test_pools(pools, workers):
