@@ -28,17 +28,24 @@ pub(crate) mod py_ops;
 // system_spec) with no AIC-domain knowledge. Top-level files (`config`,
 // `session`) and directories (`operators`, `perf_database`) carry the domain
 // logic the compiled `engine` executes.
+pub(crate) mod afd;
 pub(crate) mod common;
 pub(crate) mod config;
 pub mod engine;
 pub mod execution_profile;
 pub(crate) mod fpm;
 pub(crate) mod kd_tree;
+pub(crate) mod memo;
 pub mod memory;
 pub(crate) mod operators;
 pub(crate) mod perf_database;
 pub(crate) mod session;
 
+pub use afd::{
+    AfdPoolRole, AfdRoutingLocation,
+    pipeline::AfdPipelineLayout,
+    plan::{AfdExecutionPlan, AfdLayerTemplate, AfdPhasePlan},
+};
 pub use common::{AicError, enums::DatabaseMode, enums::EncoderParallel};
 pub use engine::spec::{EncoderImageShape, VisionSpec};
 pub use perf_database::fpm_forward::{FpmSeedTargetNormalization, FpmSeedTargetRow};
@@ -73,7 +80,7 @@ pub use fpm::{
 };
 pub use fpm::{
     FpmCacheBudget, FpmCacheBudgetAdjusted, FpmCacheBudgetRequest, FpmCacheGroup, FpmCacheKind,
-    FpmCacheLayout, FpmMambaCacheMode, FpmResourceConfig, FpmRuntimeMemoryConfig,
+    FpmCacheLayout, FpmMambaCache, FpmMambaCacheMode, FpmResourceConfig, FpmRuntimeMemoryConfig,
 };
 // Forward-pass metrics telemetry types and schema version, plus the
 // crate-internal validation helper. Re-exported at the crate root so existing
@@ -121,7 +128,7 @@ pub(crate) fn repo_relative(rel: &str) -> Option<PathBuf> {
 }
 
 /// Register the compatibility AIConfigurator API on the unified native
-/// `aisimulate._runtime` extension module.
+/// `aisim._runtime` extension module.
 #[cfg(feature = "python")]
 pub fn register_python(module: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
     py::register(module)

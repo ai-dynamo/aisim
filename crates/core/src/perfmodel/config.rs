@@ -130,10 +130,14 @@ pub const ENGINE_CONFIG_SCHEMA_VERSION: u32 = 1;
 //   price encoder calls through the canonical model. Claimed 21, 27 and 28 on
 //   its own branch while 21 through 28 landed; renumbered at merge (precedent:
 //   15, 18, 26).
-// - 30 (Kimi K3.1 DSA): DsaModuleOp carries an optional explicit sparse
+
+// - 30 (AFD): append four communication variants and the typed source-ordered
+//   pool execution plan; P2P fabric selectors and independent F-node width
+//   are part of the same positional wire-format change.
+// - 31 (Kimi K3.1 DSA): DsaModuleOp carries an optional explicit sparse
 //   attention backend/cache layout at its tail. JSON defaults preserve legacy
-//   operators; positional bincode payloads from v29 must be rejected.
-pub const ENGINE_SPEC_SCHEMA_VERSION: u32 = 30;
+//   operators; positional bincode payloads from v30 must be rejected.
+pub const ENGINE_SPEC_SCHEMA_VERSION: u32 = 31;
 
 /// Static engine identity and setup information carried by an
 /// [`crate::perfmodel::engine::spec::EngineSpec`].

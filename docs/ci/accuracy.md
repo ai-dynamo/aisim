@@ -14,6 +14,58 @@ User-facing coverage is described in [performance-model support](../perf-model/s
 and [Replay features](../replay/features.md). This page owns the jobs, provenance,
 publication, and notifications behind those views.
 
+## Public PR validation
+
+> **Planned.** The workflow described here (`.github/workflows/pr-validation.yml`)
+> is not in this tree; it lands with the governance PR. This tree ships only the
+> library entry points it calls (`aisim_core.data.validate`, `run` and `recheck`).
+> The text below is the intended behavior, not instructions to run today.
+
+`.github/workflows/pr-validation.yml` lets a maintainer validate a
+PR that relies on a public Hugging Face candidate. The contributor publishes the candidate as
+an HF PR revision and adds a request file (`aisim-pr-validation/v1`, default path
+`.aisim/pr-validation.json`) to the PR. It names the dataset repository, the full candidate
+commit SHA, the eval record path, configuration IDs, required case IDs and a download budget.
+
+Dispatch the workflow from `main` with the PR number and the head SHA you reviewed. It:
+
+1. checks that the dispatcher is a maintainer and that the PR head equals the dispatched SHA;
+2. reads only the request file from the PR head, through the API, as data. No PR code is
+   checked out or run, there are no secrets, and no Hugging Face token is present;
+3. fetches the selected evidence at the pinned dataset SHA through `data/fetch.py`;
+4. recomputes the evaluation with `verify_record`, using a predictor from the trusted checkout;
+5. writes a report and re-reads the PR head. A moved head fails the run.
+
+Required cases pass only when the record verifies and each case is in the truth table, not
+excluded and predicted. Accuracy (MAPE, coverage) is advisory and never changes the verdict.
+The report (`aisim-pr-validation-report/v1`) binds the PR head SHA (`code_sha`), the
+evaluator revision (trusted checkout SHA plus verifier version), the dataset SHA and the
+request digest. Changing any of them, including editing the request, invalidates it:
+
+```bash
+python -m aisim_core.data.validate recheck --pr-json PR.json --repo OWNER/NAME \
+  --request-file request.json --trusted-sha SHA --report report.json   # exit 1 when stale
+```
+
+A Hugging Face outage, rate limit or budget overrun gives an `error` verdict with the reason;
+other data is never substituted. The workflow's predictor factory defaults to
+`aisim_core.data.validate:no_predictor`, which fails closed until a trusted factory is
+registered, and the module only loads factories under `aisim_core.` or `aisim.`.
+
+### Candidate hygiene
+
+> **Planned.** `aisim_core.data.hygiene` is not in this tree; it lands with the
+> governance PR. Do not rely on these checks until then.
+
+`aisim_core.data.hygiene` holds the pure checks to run before a candidate reaches any
+workflow: `CandidatePolicy` lists the HF users who may create candidates (empty means nobody),
+file-count and size limits, allowed roots (`data/`, `catalog/`) and suffixes (`.parquet`,
+`.json`). It rejects path traversal, case-colliding paths, control files such as
+`.gitattributes`, symlinks, LFS pointers, executables and archives (even when renamed), Parquet
+files without `PAR1` magic, and JSON that is not strict, finite and small. Any error finding
+means the candidate is not fetched. Callers pass listings and byte samples, so the checks need
+no network.
+
 ## Prediction regression gate
 
 [The workflow](../../.github/workflows/prediction-regression-gate.yml) compares
@@ -36,7 +88,7 @@ A branch matrix runs at most two campaigns
 at once, with separate wheels, artifacts, and provenance. Main reuses a qualified
 amd64 wheel for its exact SHA when available, even while nightly staging waits for
 approval; otherwise it builds one. Each release builds its own wheel. Both the
-AISimulate replay and bundled legacy AIC baseline use their branch's wheel. Manual
+AISim replay and bundled legacy AIC baseline use their branch's wheel. Manual
 runs evaluate one explicit `main` or `release/*` SHA from the trusted main workflow.
 
 Campaign jobs use the configured `CI_JOB_CONTAINER_IMAGE`, Python 3.12, and
@@ -44,7 +96,7 @@ Campaign jobs use the configured `CI_JOB_CONTAINER_IMAGE`, Python 3.12, and
 snapshot manifest and observation Parquet files at the pinned commit. It verifies
 artifact sizes, hashes, schemas and identities before producing local tables.
 The evaluated wheel's baseline CLI and config adapter are selected from its own
-package layout: `aiconfigurator.*` on 0.12 releases or `aisimulate.*` after the
+package layout: `aiconfigurator.*` on 0.12 releases or `aisim.*` after the
 namespace migration. Ambiguous wheels with both baseline APIs are rejected.
 Baseline provenance records the selected API, adapter, and actual console entry point;
 the public summary retains that entry point. Wheel byte checks and imports run before downloading measurements.
@@ -64,10 +116,57 @@ retain resolved source evidence per shard. Actual concurrency depends on runner
 capacity (up to eight shard jobs across the two admitted branches).
 
 To inspect an encrypted artifact locally, set `HF_TOKEN` to the token used by
-that run, plus `GITHUB_REPOSITORY=ai-dynamo/aisimulate` and its `GITHUB_RUN_ID`.
+that run, plus `GITHUB_REPOSITORY=ai-dynamo/aisim` and its `GITHUB_RUN_ID`.
 Run `python scripts/e2e_accuracy/private_artifacts.py open DOWNLOADED_DIR OUTPUT_DIR`
 in the campaign environment. Token rotation requires a new complete workflow run;
 old ciphertext cannot be opened with the replacement token.
+
+### Trusted credentialed job
+
+The credentialed part of the campaign is a default-branch job, not a PR workflow.
+`E2E Accuracy Matrix` triggers only on `schedule` and `workflow_dispatch`, never on
+`pull_request`, `pull_request_target` or `workflow_run`, and `resolve` accepts only
+`refs/heads/main` or an exact maintainer-copied `pull-request/<n>` preview.
+
+- **Environments.** Jobs that hold `HF_READ_AISIM_INFX_CACHE` declare
+  `e2e-accuracy-private` (nightly and manual main runs) or `e2e-accuracy-preview`
+  (previews). The token stays read-only. A repository administrator protects the
+  private environment (deployment branch `main`, required reviewers as policy
+  decides). An environment secret overrides the repository secret, and encrypted
+  artifacts are keyed by that token: the `shards` and `agentx` jobs run in the
+  wheel-storage environment (`automated-release`, or `pr-wheel-staging` for
+  previews) while the jobs that seal or open the same artifacts run in the accuracy
+  environment. Every environment in one run must therefore resolve the same
+  `HF_READ_AISIM_INFX_CACHE` value; give the preview accuracy environment its own
+  token only if `pr-wheel-staging` carries that same token. A mismatch fails the
+  consuming job with an authentication error naming this secret.
+- **Code that sees the token.** Every step with the token runs `main`'s scripts,
+  checked out to `trusted/`, with a virtualenv (`trusted-venv`) built only from the
+  hash-pinned requirements. The evaluated checkout, the exact wheel and its build
+  never share a step, interpreter or environment variable with the token; the wheel
+  job holds no secret at all. The dataset pin comes from `main`'s
+  `.github/e2e-accuracy-dataset.json`, so a preview of a pin change is evaluated
+  after the pin lands on `main`.
+- **What PR-controlled code does see.** Preview evaluation runs the PR's wheel on
+  the decrypted measurement tables (data, not a credential). The shard job does not
+  restrict outbound network access, so that code can read the tables and could send
+  them off the runner in plaintext; no control in the workflow prevents that. Treat it
+  as the residual exposure of a maintainer-approved preview of one exact head. What the
+  workflow does guarantee is narrower: it uploads no private data unencrypted, and
+  preview results are never published. Evaluated-checkout requirements are installed
+  only after the last step that holds the token in the aggregation and qualification
+  jobs, so install-time code cannot reach it there.
+- **Data layout.** Measurements are read through `aisim_core.data`. The pin file
+  names the layout: `legacy-inferencex` (the default, today's cache) or `aisim-e2e/v1`
+  once the migrated dataset is published and the pin is changed.
+- **Publication.** Only the sanitized `e2e-accuracy-web-*` artifact reaches the
+  default-branch Pages build, which holds no secret and deploys through the
+  `github-pages` environment. The disclosure policy for aggregates derived from
+  private data (granularity, what is withheld) is not agreed yet; until it is, the
+  published granularity is the existing overview and must not be widened.
+
+[`tests/test_e2e_accuracy_trust.py`](../../tests/test_e2e_accuracy_trust.py) enforces
+these rules on the workflow files in the Pages checks.
 
 Complete campaigns upload sanitized `e2e-accuracy-web-<branch-key>` artifacts.
 Pages validates the branch's successful qualification job in the artifact's exact
@@ -79,6 +178,13 @@ incomplete campaigns cannot publish. A release selector may still show a histori
 snapshot until that release has a qualified campaign. See the
 [accuracy campaign contract](../../pages/e2e-accuracy/README.md)
 for pinned scheduler settings, measurement selection, and provenance.
+
+AgentX snapshots that lack silicon receipts required by the current contract
+are rejected and shown as failed refreshes. Pages can still deploy the other
+qualified results and documentation. Measured speculative acceptance comes from
+the point receipt or, when the receipt has none, from the point's own profile-phase
+acceptance series. Missing measured acceptance continues to fail AgentX evaluation;
+no default acceptance or partial cohort can qualify as a complete campaign.
 
 ### Weekly accuracy Slack report
 
@@ -95,12 +201,20 @@ See [setup, comparisons, and testing](#weekly-accuracy-report).
 ## FPM accuracy
 
 `FPM Accuracy Matrix` runs at 10:47 UTC daily and supports manual evaluation of
-an exact SHA on main or a release >= 0.12.0. It pins HF data once per campaign,
+an exact SHA on main or a release >= 0.12.0. It reads `main` of `ai-dynamo/aisim-data` (FPM under `data/fpm/`),
+pinned to one commit per campaign, so new data reaches the public FPM page with the next nightly run, or
+earlier through a manual dispatch. Configurations are selected from the catalog before any artifact is downloaded. It
 uses verified exact wheels, and evaluates FPM with KV warmup on/off and regression
 on CPU. Branch results remain in Actions artifacts for 90 days. Pages validates
 and publishes successful branch results independently; failed refreshes retain
 the prior qualified result. Accuracy is advisory, outside PR prediction campaigns
 and release staging gates. See [FPM details](../../pages/fpm-accuracy/README.md).
+
+Each configuration runs in a fresh worker process so native estimator and
+training state is released between configurations. A lost worker or an early
+dependency exit fails the campaign; partial results cannot qualify. Evaluators
+use the import namespaces and project layout shipped by each exact release wheel,
+including releases that predate the AISim package rename.
 
 Manual dispatch accepts optional `hf_revision`, a full 40-character dataset commit.
 Use it to evaluate a migrated dataset branch with compatible preview consumers
@@ -121,7 +235,7 @@ system. The command imports that installed native runtime; it must not prepend
 the source-only application package to Python's import path:
 
 ```bash
-python python/aisimulate/tools/support_matrix/generate_fpe_support_matrix.py \
+python python/aisim/tools/support_matrix/generate_fpe_support_matrix.py \
   --output-dir fpe-support-matrix/b200_sxm \
   --system b200_sxm \
   --forward-model op_level \
@@ -132,15 +246,15 @@ After all system shards finish, build the split CSV files consumed by the
 interactive page:
 
 ```bash
-python python/aisimulate/tools/support_matrix/build_fpe_support_matrix.py \
+python python/aisim/tools/support_matrix/build_fpe_support_matrix.py \
   fpe-support-matrix \
-  --output-dir python/aisimulate/src/aisimulate_core/systems/fpe_support_matrix
+  --output-dir python/aisim/src/aisim_core/systems/fpe_support_matrix
 ```
 
 Use filters and a deterministic topology cap for a focused smoke run:
 
 ```bash
-python python/aisimulate/tools/support_matrix/generate_fpe_support_matrix.py \
+python python/aisim/tools/support_matrix/generate_fpe_support_matrix.py \
   --output-dir fpe-support-matrix-smoke \
   --model Qwen/Qwen3-8B \
   --system b200_sxm \
@@ -293,15 +407,60 @@ The page links to the CI run and shows both tested source and probe tooling.
 
 To reproduce a release result, check out the recorded tooling commit at the
 workspace root and the recorded release source under `release-source/`.
-Download the run's `fpe-release-wheel-<version>` artifact into the workspace (preserving
-its `fpe-release-wheel/` directory and `fpe-release-shards.json`), install the
-release's locked environment and exact wheel as in the workflow. The matrix's
-per-cell command uses `release-source/python/aisimulate/.venv/bin/python`
+For a local restore, set `FPE_RELEASE` to the recorded release version,
+`FPE_SOURCE_SHA` to its full release source SHA, `FPE_TOOLING_SHA` to the full
+tooling SHA, and `FPE_RUN_ID` to the producing **Release branch nightly CI** run ID
+(not a local retry or a later consumer run). Obtain `WHEEL_STORAGE_URL` and
+`WHEEL_STORAGE_REPO` from that run's `automated-release` environment
+configuration, and supply an authorized read credential as `ARTIFACTORY_TOKEN`
+through your local secret manager or environment. Authenticate `gh` with access
+to the producing run; the GitHub token and Artifactory token are separate.
+
+Run the following from the tooling checkout root. It downloads the run's
+`fpe-release-wheel-<version>-manifest` Actions artifact, which contains only
+`wheel-manifest.json`, then invokes the transfer script directly:
+
+```bash
+set -euo pipefail
+
+gh run download "${FPE_RUN_ID:?}" --repo ai-dynamo/aisim \
+  --name "fpe-release-wheel-${FPE_RELEASE:?}-manifest" --dir release-wheel-manifest
+
+GITHUB_REPOSITORY=ai-dynamo/aisim \
+GITHUB_REPOSITORY_ID="$(gh api repos/ai-dynamo/aisim --jq .id)" \
+GITHUB_SHA="${FPE_TOOLING_SHA:?}" \
+GITHUB_RUN_ID="${FPE_RUN_ID:?}" \
+STORAGE_MODE=download \
+STORAGE_SCOPE=official \
+STORAGE_PR_NUMBER='' \
+STORAGE_NAME="fpe-release-wheel-${FPE_RELEASE:?}" \
+STORAGE_PATH=. \
+STORAGE_URL="${WHEEL_STORAGE_URL:?}" \
+STORAGE_REPO="${WHEEL_STORAGE_REPO:?}" \
+STORAGE_TOKEN="${ARTIFACTORY_TOKEN:?}" \
+STORAGE_RUN_ID="${FPE_RUN_ID:?}" \
+STORAGE_SOURCE_SHA="${FPE_SOURCE_SHA:?}" \
+STORAGE_ARCHITECTURE=amd64 \
+STORAGE_MANIFEST=release-wheel-manifest/wheel-manifest.json \
+python3 .github/actions/wheel-storage/transfer.py
+```
+
+The script from the recorded tooling commit restores `fpe-release-wheel/`
+(including the wheel and its provenance), `fpe-release-shards.json`, and
+`fpe-release-probes.json` into the workspace. It binds the release source,
+tooling commit, producer run, repository, and `amd64` architecture, reads the
+producer attempt from the manifest, and verifies each object's size and SHA-256
+before replacing local files. No `GITHUB_RUN_ATTEMPT` is needed for a download.
+Install the release's locked environment and exact restored wheel as in the
+workflow. The matrix's per-cell command uses the selected release source project's
+`.venv/bin/python` (`release-source/python/aisim` or `release-source/python/aisimulate`)
 directly to run the verified release wrapper with the recorded source, tooling,
 and branch. Each invocation requires a fresh `release-probe-harness/` directory;
 remove only that generated directory between reproductions. Raw shard reports
-and the wheel are retained for seven
-days; the smaller qualified web dataset is retained for 90 days.
+remain Actions artifacts for seven days, as does the completion manifest.
+Configure Artifactory retention for the handoff payload to at least seven days;
+the wheel payload is not retained in Actions. The smaller qualified web dataset
+is retained for 90 days.
 
 The deployed `data/fpe-support-matrix/branches.json` catalog lists available
 and unavailable branches. Main retains the existing data path, and release
@@ -378,7 +537,7 @@ the end of the main message.
 
 The E2E table has six columns: Branch, Overall, vLLM, SGLang, TRT-LLM, Coverage.
 Each accuracy cell is **TPOT%/TTFT% MAPE** (for example `24.32%/43.67%`)
-for AISimulate, not legacy AIC.
+for AISim, not legacy AIC.
 Main-message detail tables independently group by model and by GPU, within each branch,
 combining frameworks. They average successful point errors directly; they do
 not average already-aggregated MAPEs. Coverage is predicted / eligible points,
@@ -395,7 +554,7 @@ For each branch:
   evidence during this search. Without one, explicitly report an initial baseline.
 - Require identical measurement revision/content and evaluation-rule fingerprints.
   The rule fingerprint covers evaluator source and its branch workflow at the
-  producer revision, not the evaluated AISimulate package revision. The FPM
+  producer revision, not the evaluated AISim package revision. The FPM
   fingerprint includes `scripts/notifications/accuracy_digest.py`, which supplies its point
   codec. A change
   establishes a new baseline and reports comparison unavailable, not recovery.
@@ -429,7 +588,7 @@ GitHub Actions runs the notifier; the Slack app supplies its bot identity. No
 server, Event Subscriptions, Socket Mode, or slash commands are needed.
 
 At https://api.slack.com/apps, choose **Create New App > From scratch**, name it
-`AISimulate Daily`, and select the workspace containing the daily channel.
+`AISim Daily`, and select the workspace containing the daily channel.
 Under **OAuth & Permissions > Bot Token Scopes**, add:
 
 - `chat:write` to post the main message and replies.
@@ -442,7 +601,7 @@ Click **Install to Workspace** (or request workspace approval), then copy the
 installed app, reinstall it to apply the new permissions.
 
 In **#swdl-dynamo-aisim-daily**, open **Channel details > Integrations > Add apps**
-and add `AISimulate Daily`. Store its bot token only as repository
+and add `AISim Daily`. Store its bot token only as repository
 secret `SLACK_ACCURACY_BOT_TOKEN`. Configure repository variables:
 
 | Variable | Value |
@@ -504,3 +663,54 @@ A workflow dry run does not rerun predictors. Use the deterministic tests in
 `tests/fpm_accuracy/test_digest.py` to exercise regressions, coverage losses,
 changed datasets, missing runs, daylight-saving cutoffs, deduplication, and
 interrupted thread delivery without sending fake alarms to Slack.
+
+## Private mirror and promotion to the public dataset
+
+> **Planned.** The mirror validator (`aisim_core.data.mirror`), the promotion tool
+> (`aisim_core.data.promote`) and the mirror CI template
+> (`.github/mirror/aisim-data-internal-validate.yml`) are not in this tree; they land
+> with the governance PR. This section describes the intended design, not commands
+> that work today.
+
+`ai-dynamo/aisim-data-internal` has the same layout and schemas as the public
+dataset, for sensitive hardware and models. `ai-dynamo/aisim-infx-cache` stays a
+separate private cache in the same E2E layout and is never a promotion source.
+The mirror repository is not created by this repository; its definitions live here.
+
+**One validator.** `python -m aisim_core.data.mirror validate --root DIR
+--repo ID --profile mirror|public` (library: `validate_tree(root, repo=...,
+profile=...)`) checks indexes, manifests and hashes, E2E tables, evaluation records
+and their identity paths, snapshots, generated schema snapshots, catalog drift and
+file rules (paths, suffixes, symlinks, magic bytes). `--repo` defaults to
+`ai-dynamo/aisim-data-internal` and must equal `dataset_id` in `catalog/dataset.json`.
+The `public` profile adds the publication rules below. The mirror CI definition is
+`.github/mirror/aisim-data-internal-validate.yml`,
+a template to copy into the mirror repository. It checks out this repository at a
+pinned SHA (`AISIM_VALIDATOR_REF`), the same SHA the public dataset CI pins, uses no
+secrets, and prints the validator fingerprint.
+
+**Visibility and redaction.** `mirror/visibility.json` (`aisim-visibility/v1`, private
+only) labels a file or directory prefix `public`, `internal` or `restricted`; an
+unlabeled path is `internal`. Before a directory is labeled `public`, remove or replace
+with `[REDACTED]` the producer run URL (`producer_id`), image names and digests, patch
+references and credentials; omit logs, raw tool output and per-request tables.
+`check_publishable` fails on any of these. When the labeled bytes are a redaction, the
+entry's `original_sha256` records the original hash; it reaches only the private
+promotion ledger. InferenceX-derived data is published as aggregates only (the default
+disclosure decision): configurations and evaluation records built on it are not
+promotable, and a public page may show rows that pass `check_disclosure` (allowed
+fields only, at least five scored points per cell). `RedactionPolicy` holds each default.
+
+**Promotion.** Write a `PromotionRequest` (`aisim-promotion/v1`): target repo, the
+reviewed internal commit, the directories under `data/` or `eval/`, the requester and
+approvals. `python -m aisim_core.data.promote plan --source-root DIR --request FILE
+--policy FILE` prints the content digest and every blocker. Named reviewers, listed in
+a trusted policy file (`{"reviewers": [...], "min_approvals": 1}`, read from the default
+branch, not from the tree), approve that digest; the requester cannot approve, and any
+changed byte invalidates approvals. `apply` copies the files path-identically, never
+overwrites different content, regenerates the category indexes and catalog in the target,
+requires the `public` profile to pass there, and otherwise restores the target. It then
+writes `mirror/promotions/<digest>.json` in the private source. A selection must be
+closed: manifest artifacts, evaluation truth inputs and snapshot members are all in it,
+so a snapshot never spans private and public membership. Open the public change as an
+ordinary pull request with the regenerated catalog.

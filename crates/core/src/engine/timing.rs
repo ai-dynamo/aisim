@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -99,35 +99,51 @@ fn merge_reason_and_fallbacks(
     }
 }
 
-/// Validate one operation's values, reporting errors in this order.
+/// Validate one operation's values. Inlined into the per-operation loops; an
+/// invalid value calls out for its first error.
+#[inline]
 fn check_operation_values(
     name: &str,
     latency_ms: f64,
     energy_wms: Option<f64>,
     covered_latency_ms: f64,
 ) -> Result<()> {
-    ensure!(
-        latency_ms.is_finite() && latency_ms >= 0.0,
-        "timing evidence operation {:?} returned invalid latency {}ms",
+    if latency_ms.is_finite()
+        && latency_ms >= 0.0
+        && energy_wms.is_none_or(|energy| energy.is_finite() && energy >= 0.0)
+        && covered_latency_ms.is_finite()
+        && covered_latency_ms >= 0.0
+        && covered_latency_ms <= latency_ms
+    {
+        return Ok(());
+    }
+    Err(operation_values_error(
         name,
-        latency_ms
-    );
-    ensure!(
-        energy_wms.is_none_or(|energy| energy.is_finite() && energy >= 0.0),
-        "timing evidence operation {:?} returned invalid energy {:?}W-ms",
-        name,
-        energy_wms
-    );
-    ensure!(
-        covered_latency_ms.is_finite()
-            && covered_latency_ms >= 0.0
-            && covered_latency_ms <= latency_ms,
-        "timing evidence operation {:?} returned invalid covered latency {}ms for {}ms total",
-        name,
+        latency_ms,
+        energy_wms,
         covered_latency_ms,
-        latency_ms
-    );
-    Ok(())
+    ))
+}
+
+/// Names the first check, in order, that an invalid value fails.
+#[cold]
+#[inline(never)]
+fn operation_values_error(
+    name: &str,
+    latency_ms: f64,
+    energy_wms: Option<f64>,
+    covered_latency_ms: f64,
+) -> anyhow::Error {
+    if !(latency_ms.is_finite() && latency_ms >= 0.0) {
+        anyhow!("timing evidence operation {name:?} returned invalid latency {latency_ms}ms")
+    } else if !energy_wms.is_none_or(|energy| energy.is_finite() && energy >= 0.0) {
+        anyhow!("timing evidence operation {name:?} returned invalid energy {energy_wms:?}W-ms")
+    } else {
+        anyhow!(
+            "timing evidence operation {name:?} returned invalid covered latency \
+             {covered_latency_ms}ms for {latency_ms}ms total"
+        )
+    }
 }
 
 /// Validate one phase's totals, reporting errors in this order.
@@ -300,6 +316,7 @@ struct OperationValues {
 impl OperationValues {
     /// Validate one operation called `name`. Energy that is not positive is
     /// missing, so its latency is uncovered.
+    #[inline]
     fn new(
         name: &str,
         latency_ms: f64,
@@ -311,8 +328,9 @@ impl OperationValues {
         } else {
             0.0
         };
+        // A name that starts with a visible ASCII character is not blank; skip the trim.
         ensure!(
-            !name.trim().is_empty(),
+            name.as_bytes().first().is_some_and(u8::is_ascii_graphic) || !name.trim().is_empty(),
             "timing evidence operation name cannot be empty"
         );
         check_operation_values(name, latency_ms, energy_wms, covered_latency_ms)?;
@@ -500,8 +518,8 @@ impl ValidatedTimingPhase {
         Ok(Self(ValidatedEvidence::Slotted(phase)))
     }
 
-    /// Checked reference constructor for arbitrary operation layouts.
-    #[cfg(test)]
+    /// Checked constructor for providers with arbitrary operation layouts.
+    #[cfg(any(feature = "python", test))]
     pub(crate) fn from_operations(operations: Vec<TimingOperationEvidence>) -> Result<Self> {
         TimingPhaseEvidence::try_from_operations(operations)
             .map(|phase| Self(ValidatedEvidence::Named(phase)))
@@ -601,6 +619,8 @@ impl ValidatedTimingPhase {
 #[cfg(any(feature = "python", test))]
 pub(crate) struct TimingEvidenceAccumulator {
     summary: TimingEvidenceSummary,
+    pub(crate) iteration_wait_ms: f64,
+    pub(crate) phase_priced_wait_ms: f64,
     pending: Vec<OperationUpdate>,
     /// Accumulated operation index of each operation of a named update.
     indices: Vec<usize>,
@@ -1141,6 +1161,7 @@ pub enum TimingModelConfig {
     Fixed { prefill_ms: f64, decode_ms: f64 },
     /// Process-local provider loaded by a Runner or binding.
     External {
+        #[serde(deserialize_with = "deserialize_timing_provider")]
         provider: String,
         #[serde(default)]
         config: Value,
@@ -1207,6 +1228,11 @@ pub struct DecodeWork {
     pub kv_bound_tokens: usize,
     /// Per-request context lengths, in no particular order.
     pub lengths: Vec<usize>,
+    /// Tokens each request of `lengths` verifies in this forward, in the same
+    /// order: one plus the drafts the scheduler gave it, which the token
+    /// budget, the context limit or drafts not yet ready can make fewer than
+    /// `verify_width`.
+    pub widths: Vec<usize>,
     /// Tokens each request verifies in this forward: one plus the configured
     /// speculative (MTP) depth, or one without speculation.
     pub verify_width: usize,
@@ -1284,10 +1310,22 @@ pub(crate) fn predict_group_iteration_ms(
     Ok(Some(iteration))
 }
 
+/// Normalize the retired AFD name when loading saved descriptors.
+fn deserialize_timing_provider<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error> {
+    let provider = String::deserialize(deserializer)?;
+    Ok(if provider == "aic-afd" {
+        "afd".into()
+    } else {
+        provider
+    })
+}
+
 /// Runtime latency model injected at the engine boundary.
 ///
 /// Implementations may call AIC, interpolate profiler data, or use another
-/// provider without adding that dependency to `aisimulate-core`.
+/// provider without adding that dependency to `aisim-core`.
 pub trait TimingModel: Send + Sync {
     /// Validate actual (new tokens, cached prefix) pairs before a scheduler
     /// reduces them to means. Providers with nonlinear per-request execution
@@ -1379,15 +1417,33 @@ pub trait TimingModel: Send + Sync {
 
     /// Return typed evidence accumulated by this provider so far.
     ///
-    /// Latency-only providers retain the default `None`. In particular, the
-    /// built-in polynomial/fixed models and whole-model FPM timing do not
-    /// fabricate energy or coverage values.
+    /// Latency-only providers, including the built-in polynomial/fixed models,
+    /// retain the default `None`. Supported schema-v8 whole-model FPM timing
+    /// supplies component energy and coverage here; unsupported FPM paths do
+    /// not fabricate energy or coverage values.
     fn evidence_summary(&self) -> Option<TimingEvidenceSummary> {
         None
     }
 
-    /// Latency-only whole-model FPM evidence is separate from energy evidence.
-    /// It must not change the provider's existing power publication contract.
+    /// Operation-energy evidence and uncovered attention-DP wait. Iteration
+    /// wait is in provider time and phase-priced wait includes replay speedups.
+    fn power_evidence_summary(&self) -> Option<(TimingEvidenceSummary, f64, f64)> {
+        self.evidence_summary().map(|summary| (summary, 0.0, 0.0))
+    }
+
+    /// Whether the scheduler should supply wait for phase-priced group passes.
+    fn tracks_attention_dp_wait(&self) -> bool {
+        false
+    }
+
+    /// Record uncovered attention-DP wait in modeled milliseconds.
+    fn record_phase_priced_wait(&self, _wait_ms: f64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Return whole-model FPM query history for time and source diagnostics.
+    /// Power publication uses the component accumulator returned by
+    /// [`Self::evidence_summary`], independently of query-history capture.
     fn fpm_evidence_summary(&self) -> Option<TimingEvidenceSummary> {
         None
     }
@@ -1517,6 +1573,26 @@ pub(crate) fn modeled_duration_ms(raw_ms: f64, speedup_ratio: f64) -> Result<f64
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn external_provider_round_trip_normalizes_only_the_legacy_afd_name() {
+        for provider in ["afd", "aic-afd", "aic", "ais", "custom"] {
+            let mut saved = serde_json::json!({
+                "type": "external", "provider": provider,
+                "config": {"isl": 16, "osl": 128}
+            });
+            let config: TimingModelConfig = serde_json::from_value(saved.clone()).unwrap();
+            if provider == "aic-afd" {
+                saved["provider"] = serde_json::json!("afd");
+            }
+            let canonical = serde_json::to_value(&config).unwrap();
+            assert_eq!(canonical, saved);
+            assert_eq!(
+                serde_json::from_value::<TimingModelConfig>(canonical).unwrap(),
+                config
+            );
+        }
+    }
 
     #[test]
     fn provider_source_tags_preserve_known_and_unknown_values() {
@@ -1680,6 +1756,7 @@ pub(crate) mod tests {
                 mean_context_length: 9,
                 kv_bound_tokens: 1024,
                 lengths: vec![9, 9],
+                widths: vec![1, 1],
                 verify_width: 1,
             }),
         }
@@ -2040,6 +2117,32 @@ pub(crate) mod tests {
                     TimingEvidenceSource::Silicon,
                 )
                 .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn operation_checks_report_the_first_error_and_reject_blank_names() {
+        // The visible-ASCII shortcut leaves every other name to the trim.
+        for (name, blank) in [(" ", true), ("\u{a0}", true), (" gemm", false)] {
+            let rejected = OperationValues::new(name, 1.0, None, TimingEvidenceSource::Silicon)
+                .is_err_and(|e| e.to_string() == "timing evidence operation name cannot be empty");
+            assert_eq!(rejected, blank, "{name:?}");
+        }
+        // Latency is checked before energy, and energy before covered latency.
+        let nan = f64::NAN;
+        for (latency, energy, covered, error) in [
+            (nan, Some(nan), nan, Some("latency NaNms")),
+            (1.0, Some(-1.0), 2.0, Some("energy Some(-1.0)W-ms")),
+            (1.0, None, 2.0, Some("covered latency 2ms for 1ms total")),
+            (1.0, None, -1.0, Some("covered latency -1ms for 1ms total")),
+            (-0.0, Some(-0.0), -0.0, None),
+        ] {
+            assert_eq!(
+                check_operation_values("gemm", latency, energy, covered)
+                    .err()
+                    .map(|e| e.to_string()),
+                error.map(|e| format!("timing evidence operation \"gemm\" returned invalid {e}"))
             );
         }
     }

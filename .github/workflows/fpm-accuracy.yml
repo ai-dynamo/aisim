@@ -18,7 +18,7 @@ on:
         default: main
         type: string
       hf_revision:
-        description: Optional full HF dataset revision for a migration preview (defaults to main)
+        description: Optional full revision of ai-dynamo/aisim-data (defaults to main, the nightly policy)
         required: false
         type: string
 
@@ -34,7 +34,7 @@ concurrency:
 jobs:
   resolve:
     name: Resolve exact accuracy source
-    if: github.repository == 'ai-dynamo/aisimulate' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+    if: github.repository == 'ai-dynamo/aisim' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -62,7 +62,7 @@ jobs:
             }
             const requestedHf = process.env.HF_REVISION || 'main';
             if (requestedHf !== 'main' && !/^[0-9a-f]{40}$/.test(requestedHf)) throw new Error('HF revision must be a full commit SHA');
-            const hf = await fetch(`https://huggingface.co/api/datasets/nvidia/aisimulate-fpm-dataset/revision/${requestedHf}`);
+            const hf = await fetch(`https://huggingface.co/api/datasets/ai-dynamo/aisim-data/revision/${requestedHf}`);
             if (!hf.ok) throw new Error('Cannot resolve HF dataset revision');
             const hfRevision = (await hf.json()).sha;
             if (!/^[0-9a-f]{40}$/.test(hfRevision || '')) throw new Error('Invalid HF revision');
@@ -94,7 +94,7 @@ jobs:
                 const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
                   ...context.repo, run_id: run.id, per_page: 100,
                 });
-                if (artifacts.some(artifact => artifact.name === 'nightly-dist-amd64' && !artifact.expired)) {
+                if (artifacts.some(artifact => artifact.name === 'nightly-dist-amd64-manifest' && !artifact.expired)) {
                   nightlyRun = String(run.id);
                   break;
                 }
@@ -144,7 +144,8 @@ jobs:
       - name: Export latest pinned HF measurements
         env:
           HF_REVISION: ${{ needs.resolve.outputs.hf_revision }}
-          HF_HOME: ${{ runner.temp }}/hf-${{ needs.resolve.outputs.hf_revision }}
+          AISIM_DATA_CACHE: ${{ runner.temp }}/aisim-data-${{ needs.resolve.outputs.hf_revision }}
+          PYTHONPATH: python/aisim/src
         run: |
           python -m scripts.fpm_accuracy.prepare_fpm_measurements \
             --hf-revision "${HF_REVISION}" --evaluator-sha "${GITHUB_SHA}" \
@@ -166,6 +167,8 @@ jobs:
       max-parallel: 2
       matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
     uses: ./.github/workflows/fpm-accuracy-branch.yml
+    secrets:
+      ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
     permissions:
       contents: read
       actions: read

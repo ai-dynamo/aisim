@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // SPDX-License-Identifier: Apache-2.0
+// Copyright contributors to the vLLM project.
+// Part of a modified Rust simulation of the vLLM v0.29.0
+// (98dff2a81d747d1dba01a47f939f48c3526d4206) align-mode state cache.
+// Immutable sources and license: THIRD_PARTY_NOTICES.md.
 
 // Modified persistent speculative-capacity interface derived from vLLM:
 // https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_manager.py
@@ -9,7 +13,7 @@
 
 //! Scheduler-facing facade over the native vLLM-style G1 manager.
 //!
-//! AISimulate owns a single native G1 implementation. External tiers and
+//! AISim owns a single native G1 implementation. External tiers and
 //! provider selection are deliberately absent here.
 
 use uuid::Uuid;
@@ -18,12 +22,16 @@ use crate::engine::belady::BeladyOracle;
 use crate::engine::common::protocols::{KvEventPublishers, PrefillCost};
 use crate::engine::common::sequence::RequestSequence;
 
+use super::grouped_prefix::{AdmissionLimits, GroupedPrefixRules};
+use super::grouped_transfer::GroupedTransferRules;
 use super::vllm_backend::{
     BlockRequestLease, DecodeBlockReservation as VllmDecodeBlockReservation,
     DestinationReservation as VllmDestinationReservation,
     StoreSourceSnapshot as VllmStoreSourceSnapshot, VllmAcquire, VllmKvManager,
 };
-pub(crate) use super::vllm_backend::{NativeAllocation, SourceReleaseOrder, SourceReuseDependency};
+pub(crate) use super::vllm_backend::{
+    NativeAllocation, SourceReleaseOrder, SourceReuseDependency, StateHandoff,
+};
 use super::{AllocationRequirement, DestinationReservationMode, G1Acquire, GroupedKvPool};
 
 fn into_g1_acquire<T>(outcome: VllmAcquire<T>) -> G1Acquire<T> {
@@ -84,6 +92,33 @@ impl G1Manager {
         self.inner.grouped()
     }
 
+    pub(crate) fn set_grouped_prefix_rules(
+        &mut self,
+        rules: GroupedPrefixRules,
+        limits: AdmissionLimits,
+    ) {
+        self.inner.set_grouped_prefix_rules(rules, limits);
+    }
+
+    /// The rule table of a grouped cache with prefix caching on.
+    pub(crate) fn grouped_prefix_rules(&self) -> Option<&GroupedPrefixRules> {
+        self.inner.grouped_prefix_rules()
+    }
+
+    pub(crate) fn set_grouped_transfer_rules(&mut self, rules: GroupedTransferRules) {
+        self.inner.set_grouped_transfer_rules(rules);
+    }
+
+    /// The transfer rules of a grouped cache on a prefill or decode rank.
+    pub(crate) fn grouped_transfer(&self) -> Option<&GroupedTransferRules> {
+        self.inner.grouped_transfer()
+    }
+
+    /// The whole-prompt blocks of `known_tokens` without a prefix hit.
+    pub(crate) fn grouped_cold_admission_blocks(&self, known_tokens: usize) -> usize {
+        self.inner.grouped_cold_admission_blocks(known_tokens)
+    }
+
     pub(crate) fn set_belady_oracle(&mut self, oracle: BeladyOracle) {
         self.inner.set_belady_oracle(oracle);
     }
@@ -141,8 +176,17 @@ impl G1Manager {
         self.inner.state_cache_blocks()
     }
 
+    /// Blocks a request's state reserves, speculative scratch copies included.
+    pub(crate) fn state_reserved_blocks_per_request(&self) -> usize {
+        self.inner.state_reserved_blocks()
+    }
+
     pub(crate) fn begin_step(&mut self) {
         self.inner.begin_step();
+    }
+
+    pub(crate) fn release_grouped_copy_sources(&mut self) {
+        self.inner.release_grouped_copy_sources();
     }
 
     pub(crate) fn accepts_sequence_length(&self, tokens: usize) -> bool {
@@ -215,6 +259,15 @@ impl G1Manager {
     pub(crate) fn with_prefix_match_unit(mut self, unit: Option<usize>) -> Self {
         self.inner.configure_prefix_match_unit(unit);
         self
+    }
+
+    pub(crate) fn prefix_junction(
+        &self,
+        sequence: &RequestSequence,
+        lease: &BlockRequestLease,
+        cached_tokens: usize,
+    ) -> Option<usize> {
+        self.inner.prefix_junction(sequence, lease, cached_tokens)
     }
 
     pub(crate) fn allocate_native(
@@ -291,8 +344,29 @@ impl G1Manager {
         self.inner.preempt_lease(owner, lease);
     }
 
+    /// Free the grouped blocks that a completed source no longer needs.
+    pub(crate) fn release_skipped_blocks(
+        &mut self,
+        owner: Uuid,
+        lease: &mut BlockRequestLease,
+        computed: usize,
+    ) {
+        self.inner.release_skipped_blocks(owner, lease, computed);
+    }
+
     pub(crate) fn finish_native(&mut self, owner: Uuid, lease: BlockRequestLease) {
         self.inner.finish_lease(owner, lease);
+    }
+
+    /// The prefill cost of a request that `schedule_request` prices itself. A
+    /// grouped prefix cache keeps the hit on the lease for the allocation, so
+    /// it is searched once.
+    pub(crate) fn lookup_native_prefill_cost(
+        &self,
+        sequence: &RequestSequence,
+        lease: &mut BlockRequestLease,
+    ) -> PrefillCost {
+        self.inner.lookup_lease_prefill_cost(sequence, lease)
     }
 
     pub(crate) fn get_native_prefill_cost(
@@ -301,6 +375,15 @@ impl G1Manager {
         lease: &BlockRequestLease,
     ) -> PrefillCost {
         self.inner.get_lease_prefill_cost(sequence, lease)
+    }
+
+    /// See [`VllmKvManager::get_waiting_lease_prefill_cost`].
+    pub(crate) fn get_native_waiting_prefill_cost(
+        &self,
+        sequence: &RequestSequence,
+        lease: &mut BlockRequestLease,
+    ) -> PrefillCost {
+        self.inner.get_waiting_lease_prefill_cost(sequence, lease)
     }
 
     pub(crate) fn reserve_native_destination_at(
@@ -329,14 +412,43 @@ impl G1Manager {
         lease: &BlockRequestLease,
         g1_prefix_blocks: usize,
         transferred_suffix: &[crate::engine::common::hashing::SequenceHash],
+        restores_state: bool,
     ) -> G1Acquire<DestinationReservation> {
         into_g1_acquire(self.inner.reserve_external_prefix_lease(
             owner,
             lease,
             g1_prefix_blocks,
             transferred_suffix,
+            restores_state,
         ))
         .map(|inner| DestinationReservation { inner })
+    }
+
+    /// Queue newly published states for a host tier.
+    pub(crate) fn record_state_handoffs(&mut self) {
+        self.inner.record_state_handoffs();
+    }
+
+    pub(crate) fn take_state_handoffs(&mut self) -> Vec<StateHandoff> {
+        self.inner.take_state_handoffs()
+    }
+
+    pub(crate) fn take_state_handoffs_of(&mut self, owner: Uuid) -> Vec<StateHandoff> {
+        self.inner.take_state_handoffs_of(owner)
+    }
+
+    pub(crate) fn state_handoff_is_live(&self, handoff: &StateHandoff) -> bool {
+        self.inner.state_handoff_is_live(handoff)
+    }
+
+    pub(crate) fn attach_state_handoff_dependency(
+        &mut self,
+        handoff: &StateHandoff,
+        slots: &[usize],
+        dependency: SourceReuseDependency,
+    ) {
+        self.inner
+            .attach_state_handoff_dependency(handoff, slots, dependency);
     }
 
     pub(crate) fn native_destination_pending_dependencies(
@@ -372,8 +484,13 @@ impl G1Manager {
             .attach_store_source_dependency(owner, snapshot.inner, dependency);
     }
 
-    pub(crate) fn publish_host_pinned_event(&mut self, data: crate::engine::KvEventData) {
-        self.inner.publish_host_pinned_event(data);
+    pub(crate) fn publish_residency_event(
+        &mut self,
+        data: crate::engine::KvEventData,
+        tier: crate::engine::KvEventTier,
+        domain: crate::engine::KvEventDomain,
+    ) {
+        self.inner.publish_residency_event(data, tier, domain);
     }
 
     pub(crate) fn satisfy_native_source_dependency(
@@ -399,6 +516,10 @@ impl G1Manager {
     ) {
         self.inner
             .activate_destination_lease(owner, sequence, lease, reservation.inner);
+    }
+
+    pub(crate) fn cache_native_restored_window(&mut self, lease: &mut BlockRequestLease) {
+        self.inner.cache_restored_window(lease);
     }
 
     pub(crate) fn cancel_destination(&mut self, reservation: DestinationReservation) {

@@ -173,6 +173,7 @@ pub fn load_agentic_mooncake(path: &Path, legacy_trace_block_size: usize) -> Res
                     0.0
                 },
                 recorded_api_time_ms: None,
+                recorded_start_ms: None,
                 priority: raw.priority,
                 strict_priority: raw.strict_priority,
                 policy_class: raw.policy_class,
@@ -428,19 +429,29 @@ pub(super) fn synthesize_validated_trace_tokens(
     trace_block_size: usize,
 ) -> Vec<u32> {
     let mut tokens = Vec::with_capacity(input_length);
+    extend_validated_trace_tokens(&mut tokens, input_length, hash_ids, trace_block_size);
+    tokens
+}
+
+/// Appends the prompt `synthesize_validated_trace_tokens` would build, so a
+/// caller that owns the destination needs no intermediate vector.
+pub(super) fn extend_validated_trace_tokens(
+    tokens: &mut Vec<u32>,
+    input_length: usize,
+    hash_ids: &[u32],
+    trace_block_size: usize,
+) {
+    let mut remaining = input_length;
     for &hash_id in hash_ids {
-        let remaining = input_length - tokens.len();
-        tokens.extend(std::iter::repeat_n(
-            hash_id,
-            remaining.min(trace_block_size),
-        ));
-        if tokens.len() == input_length {
+        let block = remaining.min(trace_block_size);
+        tokens.extend(std::iter::repeat_n(hash_id, block));
+        remaining -= block;
+        if remaining == 0 {
             break;
         }
     }
 
-    debug_assert_eq!(tokens.len(), input_length);
-    tokens
+    debug_assert_eq!(remaining, 0);
 }
 
 fn trace_to_replay_hashes(
@@ -1546,6 +1557,16 @@ impl AgenticTraceBuilder {
                 raw.recorded_api_time_ms
             );
         }
+        if raw
+            .recorded_start_ms
+            .is_some_and(|start| !start.is_finite() || start < 0.0)
+        {
+            bail!(
+                "trace line {} has invalid recorded_start_ms {:?}",
+                line_idx + 1,
+                raw.recorded_start_ms
+            );
+        }
         for dependency in &raw.dependencies {
             if dependency.request_id.trim().is_empty() {
                 bail!(
@@ -1604,7 +1625,10 @@ impl AgenticTraceBuilder {
             hash_ids,
             not_before_ms: raw.not_before_ms,
             recorded_api_time_ms: raw.recorded_api_time_ms,
-            recorded_interval_ms: None,
+            recorded_interval_ms: raw
+                .recorded_start_ms
+                .map(|start| (start, raw.recorded_api_time_ms.map(|api| start + api))),
+            recorded_start_gates_frontier: raw.recorded_start_ms.is_some(),
             priority: raw.priority.unwrap_or(0),
             strict_priority: raw.strict_priority.unwrap_or(0),
             policy_class: raw.policy_class,
@@ -2021,6 +2045,7 @@ fn canonical_agentic_graph_digest(
                 not_before_ms,
                 recorded_api_time_ms,
                 recorded_interval_ms: _,
+                recorded_start_gates_frontier: _,
                 priority,
                 strict_priority,
                 policy_class,

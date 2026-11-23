@@ -13,11 +13,11 @@ from copy import deepcopy
 
 import pytest
 
-from aisimulate import _runtime
-from aisimulate.compiler import prediction_to_replay_spec
-from aisimulate.config import CorePredictionConfig
-from aisimulate.runner import EngineReplayRunnerFactory
-from aisimulate_core.sdk.utils import get_model_config_from_model_path
+from aisim import _runtime
+from aisim.compiler import prediction_to_replay_spec
+from aisim.config import CorePredictionConfig
+from aisim.runner import EngineReplayRunnerFactory
+from aisim_core.sdk.utils import get_model_config_from_model_path
 
 pytestmark = [pytest.mark.unit, pytest.mark.pre_merge, pytest.mark.gpu_0]
 
@@ -33,7 +33,9 @@ def k31_checkpoint(tmp_path):
     raw["architectures"] = ["KimiK31ForConditionalGeneration"]
     raw["model_type"] = "kimi_k31"
     raw["text_config"]["dsa_config"] = {
-        "dsa_layers": list(raw["text_config"]["linear_attn_config"]["full_attn_layers"]),
+        "dsa_layers": list(
+            raw["text_config"]["linear_attn_config"]["full_attn_layers"]
+        ),
         "index_topk": 2048,
         "index_head_dim": 128,
         "index_num_heads": 32,
@@ -98,20 +100,28 @@ class _WireCapture:
 
 @pytest.mark.parametrize("direct_native", [False, True])
 @pytest.mark.parametrize("host_offload", [False, True])
-def test_k31_replay_requires_state_even_with_fixed_token_geometry(k31_checkpoint, direct_native, host_offload):
+def test_k31_replay_requires_state_even_with_fixed_token_geometry(
+    k31_checkpoint, direct_native, host_offload
+):
     payload = _payload(k31_checkpoint)
     if host_offload:
-        payload["engine"]["workers"]["aggregated"]["kv_cache"]["host_offload"] = {"num_host_blocks": 100}
+        payload["engine"]["workers"]["aggregated"]["kv_cache"]["host_offload"] = {
+            "num_host_blocks": 100
+        }
     spec = _saved_spec(payload)
     if direct_native:
         capture = _WireCapture()
         EngineReplayRunnerFactory(runtime=capture).create(0).run(spec)
         # Actually execute the saved wire through Rust, bypassing the Python
         # materializer. The capture itself is not a validation result.
-        with pytest.raises(RuntimeError, match="requires explicit state_cache geometry"):
+        with pytest.raises(
+            RuntimeError, match="requires explicit state_cache geometry"
+        ):
             _runtime.run_replay_json(capture.payload)
     else:
-        with pytest.raises(RuntimeError, match="requires explicit state_cache geometry"):
+        with pytest.raises(
+            RuntimeError, match="requires explicit state_cache geometry"
+        ):
             EngineReplayRunnerFactory().create(0).run(spec)
 
 
@@ -139,7 +149,9 @@ def test_native_k3_fixed_blocks_require_manual_state(tmp_path, state_bytes):
     EngineReplayRunnerFactory(runtime=capture).create(0).run(spec)
     # Bypass Python's memory guard and execute the real native-only SOL path.
     if state_bytes is None:
-        with pytest.raises(RuntimeError, match="requires explicit state_cache geometry"):
+        with pytest.raises(
+            RuntimeError, match="requires explicit state_cache geometry"
+        ):
             _runtime.run_replay_json(capture.payload)
     else:
         metrics = json.loads(_runtime.run_replay_json(capture.payload))
@@ -153,10 +165,16 @@ def test_k31_manual_pd_transfer_charges_one_state_per_request(k31_checkpoint):
         worker = engine["workers"]["aggregated"]
         engine["mode"] = "disaggregated"
         engine["workers"] = {"prefill": worker, "decode": deepcopy(worker)}
-        engine["kv_transfer"] = {"bytes_per_token": "auto", "bandwidth_gb_per_second": 1e-6}
+        engine["kv_transfer"] = {
+            "bytes_per_token": "auto",
+            "bandwidth_gb_per_second": 1e-6,
+        }
         payload["traffic"]["stop"]["requests"] = 1
         spec = _saved_spec(payload)
-        assert spec.backend_deployment.prefill_engine_args["kv_transfer_bytes_per_token"] == TOKEN_BYTES
+        assert (
+            spec.backend_deployment.prefill_engine_args["kv_transfer_bytes_per_token"]
+            == TOKEN_BYTES
+        )
         result = EngineReplayRunnerFactory().create(0).run(spec).metrics
         assert result["completed_requests"] == 1
         return result["mean_ttft_ms"]
@@ -167,12 +185,16 @@ def test_k31_manual_pd_transfer_charges_one_state_per_request(k31_checkpoint):
 
 
 @pytest.mark.parametrize("conflict", [False, True])
-def test_k31_snapshot_controls_compile_and_restore_exact_identity(k31_checkpoint, tmp_path, conflict):
-    from aisimulate.compiler import _resolve_kv_bytes_per_token
-    from aisimulate_core.sdk import RustForwardPassPerfModel
+def test_k31_snapshot_controls_compile_and_restore_exact_identity(
+    k31_checkpoint, tmp_path, conflict
+):
+    from aisim.compiler import _resolve_kv_bytes_per_token
+    from aisim_core.sdk import RustForwardPassPerfModel
 
     payload = _payload(k31_checkpoint, state_bytes=2 * BLOCK_BYTES)
-    original_config = _saved_spec(payload).backend_deployment.agg_engine_args["timing_model"]["config"]
+    original_config = _saved_spec(payload).backend_deployment.agg_engine_args[
+        "timing_model"
+    ]["config"]
     original = RustForwardPassPerfModel.best_available(original_config)
     pinned = original.save_state_snapshot(tmp_path / "snapshot")
     engine = payload["engine"]
@@ -192,9 +214,9 @@ def test_k31_snapshot_controls_compile_and_restore_exact_identity(k31_checkpoint
     assert timing["kvcache_quant_mode"] == "fp8"
     assert timing["attention_backend"] == ("trtllm_mla" if conflict else "flashmla")
     config = CorePredictionConfig.model_validate(payload)
-    assert _resolve_kv_bytes_per_token(config.engine, config.engine.workers.aggregated, "auto", role="aggregated") == (
-        16_992 if conflict else TOKEN_BYTES
-    )
+    assert _resolve_kv_bytes_per_token(
+        config.engine, config.engine.workers.aggregated, "auto", role="aggregated"
+    ) == (16_992 if conflict else TOKEN_BYTES)
     if conflict:
         with pytest.raises(ValueError, match="attention_backend"):
             RustForwardPassPerfModel.best_available(timing)
@@ -212,16 +234,22 @@ def test_k31_snapshot_controls_compile_and_restore_exact_identity(k31_checkpoint
                 },
             }
         ]
-        assert restored.estimate_forward_pass_time_ms(rank) == original.estimate_forward_pass_time_ms(rank)
+        assert restored.estimate_forward_pass_time_ms(
+            rank
+        ) == original.estimate_forward_pass_time_ms(rank)
 
 
 @pytest.mark.parametrize("explicit_eplb", [None, False])
-def test_saved_eplb_true_reaches_native_restoration(k31_checkpoint, tmp_path, explicit_eplb):
-    from aisimulate_core.sdk import RustForwardPassPerfModel
+def test_saved_eplb_true_reaches_native_restoration(
+    k31_checkpoint, tmp_path, explicit_eplb
+):
+    from aisim_core.sdk import RustForwardPassPerfModel
 
     payload = _payload(k31_checkpoint, state_bytes=2 * BLOCK_BYTES)
     payload["engine"]["enable_eplb"] = True
-    original_config = _saved_spec(payload).backend_deployment.agg_engine_args["timing_model"]["config"]
+    original_config = _saved_spec(payload).backend_deployment.agg_engine_args[
+        "timing_model"
+    ]["config"]
     original = RustForwardPassPerfModel.best_available(original_config)
     pinned = original.save_state_snapshot(tmp_path / "eplb-snapshot")
     payload["engine"].update(
@@ -235,10 +263,17 @@ def test_saved_eplb_true_reaches_native_restoration(k31_checkpoint, tmp_path, ex
         payload["engine"].pop("enable_eplb")
     else:
         payload["engine"]["enable_eplb"] = explicit_eplb
-    timing = _saved_spec(payload).backend_deployment.agg_engine_args["timing_model"]["config"]
-    assert timing["enable_eplb"] is (explicit_eplb if explicit_eplb is not None else True)
+    timing = _saved_spec(payload).backend_deployment.agg_engine_args["timing_model"][
+        "config"
+    ]
+    assert timing["enable_eplb"] is (
+        explicit_eplb if explicit_eplb is not None else True
+    )
     if explicit_eplb is False:
         with pytest.raises(ValueError, match="enable_eplb"):
             RustForwardPassPerfModel.best_available(timing)
     else:
-        assert RustForwardPassPerfModel.best_available(timing).diagnostics()["readiness"] == "ready"
+        assert (
+            RustForwardPassPerfModel.best_available(timing).diagnostics()["readiness"]
+            == "ready"
+        )

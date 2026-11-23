@@ -16,7 +16,7 @@ python .github/codeowners/who_owns.py --codeowners CODEOWNERS --changed --base m
 
 # owners for specific paths
 python .github/codeowners/who_owns.py --codeowners CODEOWNERS \
-  crates/core/src/engine/runtime.rs src/aisimulate/sweeper/search.py
+  crates/core/src/engine/runtime.rs src/aisim/sweeper/search.py
 ```
 
 A line with more than one owner is co-ownership. Under GitHub's code-owner
@@ -34,7 +34,7 @@ review visibility without requiring one approval from every listed team.
 | `emit_codeowners.py` | Generates root `CODEOWNERS` and `CONTRIBUTORS.md` from policy inputs. |
 | `who_owns.py` | Reports the owners for paths or a branch diff. |
 | `test_codeowners.py` | Generic matcher, resolver, emitter, and validation tests. |
-| `test_aisimulate_policy.py` | AISimulate-specific routing contract. |
+| `test_aisim_policy.py` | AISim-specific routing contract. |
 
 ## Change Ownership
 
@@ -55,22 +55,29 @@ python -m pytest -c /dev/null .github/codeowners/test_*.py -q \
 
 ## How It Stays Correct
 
-The `codeowners` workflow runs on every pull request and main-branch push. It
-rejects shadow CODEOWNERS files, runs the shared and repository-specific tests,
-validates explicit path coverage, and fails when generated artifacts drift from
-their declarative sources.
+Fast CI's repository-policy job publishes the required `codeowners` check.
+It rejects shadow CODEOWNERS files, runs the shared and repository-specific
+tests, validates full-tree explicit path coverage, and fails when generated
+artifacts drift from their declarative sources. These commands are centralized
+in `scripts/ci/check_codeowners.sh`.
 
-The workflow makes policy problems visible. Repository rules must separately
+Every run checks the exact target revision. On pull requests, the job also
+checks GitHub's proposed merge whenever its contents differ from the PR head;
+identical trees reuse the passing head checks. This retains both validation
+contexts without a second ownership workflow. Infra and maintainer co-ownership
+protects the Fast CI workflow that now supplies this gate.
+
+The check makes policy problems visible. Repository rules must separately
 require the `codeowners` status check and code-owner review for those results to
 be merge-blocking.
 
 ## Migrated AIConfigurator Snapshot
 
-The full AIC source import preserves `python/aisimulate/.github/codeowners/` as
+The full AIC source import preserves `python/aisim/.github/codeowners/` as
 inactive provenance, but its generated `CODEOWNERS` file is not retained.
 GitHub only discovers CODEOWNERS at the repository root, `.github/`, or `docs/`,
 so the generated root file is the only active repository policy. The root
-policy routes changes to the preserved ownership tooling to AISimulate Infra
+policy routes changes to the preserved ownership tooling to AISim Infra
 plus maintainers to keep the active and historical policies from being
 confused. The DevOps team is not listed in the active policy and is never a
 required code-owner approver.

@@ -41,6 +41,10 @@ pub use replay::{ReplayReport, ReplaySpec, Replayer};
 // the explicit `ReplayEngineConfig` alias above.
 pub use perfmodel::EngineConfig;
 pub use perfmodel::{
+    AfdExecutionPlan, AfdLayerTemplate, AfdPhasePlan, AfdPipelineLayout, AfdPoolRole,
+    AfdRoutingLocation,
+};
+pub use perfmodel::{
     AicError, BackendKind, CorrectionConfig, CorrectionMode, DataType, DatabaseMode,
     ENGINE_CONFIG_SCHEMA_VERSION, ENGINE_SPEC_SCHEMA_VERSION, EncoderImageShape, EncoderParallel,
     EstimateSource, EstimationMode, EstimatorConfig, FPM_VERSION, ForwardPassFallbackPolicy,
@@ -91,7 +95,7 @@ pub use perfmodel::{
 // advanced APIs.
 #[allow(unused_imports)]
 pub(crate) use perfmodel::{
-    common, config, fpm, memory, operators, perf_database, repo_relative, session,
+    common, config, fpm, memo, memory, operators, perf_database, repo_relative, session,
     validate_forward_pass_metrics,
 };
 

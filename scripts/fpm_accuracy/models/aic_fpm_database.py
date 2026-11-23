@@ -19,6 +19,7 @@ import yaml
 
 from scripts.fpm_accuracy.contract import strict_json
 from scripts.fpm_accuracy.exceptions import ConfigurationError, DependencyError
+from scripts.release.package_identity import runtime_module
 
 
 class FpmArtifactSource(Protocol):
@@ -56,8 +57,12 @@ def prepare_aic_fpm_database(
     if not parquet_path.is_file() or not metadata_path.is_file():
         raise ConfigurationError(f"FPM artifact {artifact.artifact_id!r} is not materialized locally")
     metadata = _read_metadata(metadata_path)
-    if metadata.get("schema_version") == 7:
-        raise DependencyError("FPM schema v7 execution identity is not yet supported by the Gym worker adapter.")
+    schema_version = metadata.get("schema_version")
+    # Schema 8 carries the same execution identity as schema 7.
+    if type(schema_version) is int and schema_version >= 7:
+        raise DependencyError(
+            f"FPM schema v{schema_version} execution identity is not yet supported by the Gym worker adapter."
+        )
 
     metadata, recovered = _recover_reconstructed_metadata(metadata, artifact)
     recovery = None
@@ -218,10 +223,10 @@ def _read_metadata(path: Path) -> dict[str, Any]:
 
 def _prepare_system_overlay(systems_root: Path, engine_config: Mapping[str, Any]) -> Path:
     try:
-        from aisimulate_core.sdk import perf_database
+        perf_database = runtime_module("aisim_core.sdk.perf_database")
     except ImportError as exc:
         raise DependencyError(
-            "AISim FPM prediction requires aisimulate; install the AISim checkout in this environment"
+            "AISim FPM prediction requires aisim; install the AISim checkout in this environment"
         ) from exc
 
     system_name = str(engine_config["system_name"])
