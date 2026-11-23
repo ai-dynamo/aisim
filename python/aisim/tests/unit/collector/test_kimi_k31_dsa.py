@@ -158,6 +158,7 @@ def test_cli_generated_plan_keeps_native_ops_model_scoped(model_scoped):
     [
         ("SGLANG_DSA_FUSE_TOPK", "1"),
         ("SGLANG_DSA_TOPK_BROADCAST", "0"),
+        ("SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR", None),
         ("SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD", "2048"),
     ],
 )
@@ -172,21 +173,24 @@ def test_native_dispatch_setting_is_fixed_for_child_and_standalone(monkeypatch, 
     output = tmp_path / "dsa_generation_module_perf.txt"
 
     def launch(_command, **kwargs):
-        code = f"import os; from pathlib import Path; Path({str(output)!r}).write_text(os.environ[{variable!r}])"
+        code = (
+            f"import os; from pathlib import Path; Path({str(output)!r}).write_text(repr(os.environ.get({variable!r})))"
+        )
         return popen([sys.executable, "-c", code], **kwargs)
 
     monkeypatch.setattr(module.subprocess, "Popen", launch)
     case = ModuleCase(8192, 1, 96, "fp8", "bfloat16", "bfloat16", MODEL, 0)
     module._run_native_case(case, "cuda:0", output)
-    assert output.read_text() == expected
+    assert output.read_text() == repr(expected)
     assert os.environ.get(variable) == ambient
-    monkeypatch.setenv(variable, ambient or "0")
+    monkeypatch.setattr(module.os, "environ", dict(os.environ))
+    module.os.environ[variable] = ambient or "0"
 
     class RuntimeReached(Exception):
         pass
 
     def runtime():
-        assert os.environ[variable] == expected
+        assert os.environ.get(variable) == expected
         raise RuntimeReached
 
     monkeypatch.setattr(module, "_assert_runtime", runtime)
@@ -912,6 +916,8 @@ def test_native_fullnode_resumes_after_last_completed_case(monkeypatch, tmp_path
     ran = []
 
     def native(case, _device, filename):
+        with pytest.raises(RuntimeError, match="already has a publication owner"):
+            collect()
         ran.append(case)
         if len(ran) == 2:
             with Path(filename).open("a") as stream:
