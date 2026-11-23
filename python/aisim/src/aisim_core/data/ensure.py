@@ -661,6 +661,11 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
             "set AISIM_DATA_CONFIGURATION (DataPin.configuration_id) to choose one"
         )
     entry = entries[0]
+    if out.config.get("backend_version") is None and entry.identity.framework_version is not None:
+        # The one match fixes an omitted version, so the identity check and the returned configuration use it. An
+        # explicit version never reaches here with another one (the selection filters it) and several matches
+        # were refused above.
+        out.config["backend_version"] = entry.identity.framework_version
     cache = Cache(pin.cache_dir)
     output_dir = cache.root / "materialized" / source_key / entry.configuration_id
     try:
