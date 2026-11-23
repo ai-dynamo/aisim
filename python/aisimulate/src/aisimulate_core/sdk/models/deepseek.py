@@ -3,12 +3,13 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 
 import aisimulate_core.sdk.operations as ops
 from aisimulate_core.sdk import common
 from aisimulate_core.sdk.models.base import BaseModel, register_model
-from aisimulate_core.sdk.models.blocks.moe import MoEBlockShape
+from aisimulate_core.sdk.models.blocks.moe import MoEBlockShape, build_moe_block_ops
 from aisimulate_core.sdk.models.blocks.vit import build_encoder_ops
 from aisimulate_core.sdk.models.helpers import (
     _derive_num_moe_layers,
@@ -140,6 +141,51 @@ class DeepSeekModel(BaseModel):
         weights += self._num_moe_layers * (routed + self._num_shared_experts * shared + router)
         weights += (self._num_layers - self._num_moe_layers) * dense
         return weights
+
+    def _afd_ffn_memory_model(self, model_config):
+        """Reuse resolved metadata and build only the F-resident MoE weights.
+
+        FastAFD measures F timing externally. Its resource view must retain F
+        sharding and precision without imposing attention-head divisibility on
+        a pool which never runs attention.
+        """
+        from aisimulate_core.sdk.models.helpers import _apply_model_quant_defaults, _get_model_info
+
+        model = copy.copy(self)
+        model.config = copy.deepcopy(model_config)
+        _apply_model_quant_defaults(
+            model.config, _get_model_info(self.model_path).get("raw_config", {}), self.architecture, self._backend_name
+        )
+        model.config.resolve_moe_parallelism()
+        if model.config.moe_ep_size > self._num_experts:
+            raise ValueError(f"ep size cannot be larger than num_experts {self._num_experts}")
+        shape = MoEBlockShape(
+            hidden_size=self._hidden_size,
+            moe_inter_size=self._moe_inter_size,
+            topk=self._topk,
+            num_experts=self._num_experts,
+            # Match this model's existing homogeneous timing graph, including
+            # its single shared expert. This does not reinterpret moe_layers.
+            num_shared_experts=1,
+            num_moe_layers=self._num_layers,
+        )
+        block_ops = build_moe_block_ops(
+            "generation",
+            shape,
+            model.config,
+            model.config.moe_quant_mode,
+            self.config.workload_distribution,
+            scale_factor=self._num_layers * self._mtp_scale_factor,
+            backend_name=self._backend_name,
+            inference_phase="generation",
+            shared_gemm_quant_mode=self._shared_expert_quant_mode,
+        )
+        # These lists are private to the resource view. Never retain or query
+        # the original model's attention/encoder graph on F.
+        model.context_ops = block_ops
+        model.generation_ops = block_ops
+        model.encoder_ops = []
+        return model
 
     #: TRT-LLM large-EP decode PDL overlap discount, transcribed from the
     #: deleted ``TrtllmWideEPDeepSeekModel._pdl_factor`` (deepseek.py:604 at

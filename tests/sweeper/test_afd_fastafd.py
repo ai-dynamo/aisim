@@ -313,11 +313,15 @@ def fastafd_attention_sol(monkeypatch):
     monkeypatch.setattr(perf_database, "get_database_view", sol_view)
 
 
-def _kimi_request_and_profile(tmp_path, precision, *, moe_backend="megamoe"):
+def _kimi_request_and_profile(tmp_path, precision, *, moe_backend="megamoe", f_gpus=4):
     model = "moonshotai/Kimi-K2-Instruct"
-    entry = _entry(model_path=model, topology="64A4F", moe_layers=61, moe_precision=precision, moe_backend=moe_backend)
+    entry = _entry(
+        model_path=model, topology=f"64A{f_gpus}F", moe_layers=61, moe_precision=precision, moe_backend=moe_backend
+    )
     request = replace(
-        _request(_topology(n_f_nodes=1, f_moe_ep_size=4, num_experts=384)), model_name=model, max_seq_len=2048
+        _request(_topology(n_f_nodes=f_gpus // 4, f_moe_ep_size=f_gpus, num_experts=384)),
+        model_name=model,
+        max_seq_len=2048,
     )
     return request, _profile(tmp_path, [entry])
 
@@ -381,6 +385,49 @@ def test_builtin_fastafd_qualifies_selected_low_bit_f_memory(tmp_path, monkeypat
     attention = restored.estimate_fastafd_attention(isl=1024, osl=128, max_seq_len=2048)
     assert attention["provenance"]["memory"] == memory
     assert attention["attention_ms"] == provenance["components"]["attention_compute_ms"]
+
+
+@pytest.mark.parametrize("moe_backend", ["megamoe", "deepep_deepgemm"])
+@pytest.mark.parametrize("f_gpus", [4, 128])
+def test_builtin_fastafd_f_memory_without_unused_attention(
+    tmp_path, monkeypatch, fastafd_attention_sol, moe_backend, f_gpus
+):
+    """Kimi's 384 experts support EP128 although its 64 attention heads do not."""
+    from aisimulate.sdk import models
+
+    request, profile = _kimi_request_and_profile(tmp_path, "w4a8_mxfp4_mxfp8", moe_backend=moe_backend, f_gpus=f_gpus)
+    get_model = models.get_model
+    constructed = []
+
+    def attention_model_only(model_path, model_config, backend_name):
+        constructed.append(model_config.tp_size)
+        return get_model(model_path, model_config, backend_name)
+
+    monkeypatch.setattr(models, "get_model", attention_model_only)
+    (measurement,) = _provider(
+        tmp_path, AICAFDPerformanceModel(), profile_path=profile, moe_backend=moe_backend
+    ).measure(request)
+    assert constructed == [1], "F memory must not construct a second attention graph"
+    memory = measurement.provenance["attention"]["memory"]
+    assert memory["f_worker"]["kvcache"] == 0.0
+    assert memory["a_worker"]["kvcache"] > 0.0
+    # Existing homogeneous-layer accounting: three expert matrices per layer,
+    # 7168 x 2048 each, 384 routed experts at 4 bits and one shared at FP8,
+    # sharded across the F ranks. Router weights belong to A.
+    expected_weights = 61 * 3 * 7168 * 2048 * (384 / 2 + 1) / f_gpus / (1 << 30)
+    assert memory["f_worker"]["weights"] == pytest.approx(expected_weights)
+    assert measurement.ffn_ms == pytest.approx(STAGE_MS / (61 * 2))
+    assert measurement.provenance["config"]["afd"]["f_moe_ep_size"] == f_gpus
+    if f_gpus == 4:
+        # On a topology supported by full-model construction, compare every
+        # resource component against the previous F-graph path.
+        monkeypatch.delattr(models.DeepSeekModel, "_afd_ffn_memory_model")
+        (legacy,) = _provider(
+            tmp_path, AICAFDPerformanceModel(), profile_path=profile, moe_backend=moe_backend
+        ).measure(request)
+        assert legacy.provenance["attention"]["memory"] == memory
+        assert legacy.attention_ms == measurement.attention_ms
+        assert legacy.ffn_ms == measurement.ffn_ms
 
 
 def test_external_aic_attention_layer_count_must_match_the_selected_stage(tmp_path):

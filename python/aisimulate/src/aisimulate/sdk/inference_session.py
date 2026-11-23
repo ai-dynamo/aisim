@@ -1596,8 +1596,15 @@ class AFDInferenceSession:
     def _measure_attention_decode(self, runtime_config, *, max_seq_len):
         """A-only timing plus selected-precision memory, without F/comm queries."""
         from aisimulate.sdk.afd_partition import build_afd_ops_partition
+        from aisimulate.sdk.models import get_model
 
-        a_model, f_model = self._build_models()
+        a_model = get_model(self._model_path, copy.deepcopy(self._a_model_config), self._backend.name.value)
+        f_memory_model = getattr(a_model, "_afd_ffn_memory_model", None)
+        f_model = (
+            f_memory_model(self._f_model_config)
+            if f_memory_model is not None
+            else get_model(self._model_path, copy.deepcopy(self._f_model_config), self._backend.name.value)
+        )
         a_partition = build_afd_ops_partition(a_model, boundary_on_attn=True)
         f_partition = build_afd_ops_partition(f_model, boundary_on_attn=True)
         routers = list(self._router_ops(a_partition.ffn_ops))
