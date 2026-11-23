@@ -173,6 +173,23 @@ def test_k31_silicon_task_requires_selected_physical_lane(
             task._check_role_against_db("agg", **kwargs)
 
 
+def test_fpm_cell_precision_is_independent_of_context_op_precision(tmp_path, k31_config, monkeypatch):
+    from aisim.sdk.task_v2 import Task
+
+    task = Task(
+        model_path=_write_checkpoint(tmp_path, k31_config),
+        system_name="b300_sxm",
+        backend_name="sglang",
+        database_mode="SILICON",
+        attention_backend="flashmla",
+        fmha_quant_mode=common.FMHAQuantMode.fp8,
+        forward_model="fpm",
+    )
+    db = SimpleNamespace(supported_quant_mode={"dsa_context_module": ["bfloat16"]})
+    monkeypatch.setattr(Task, "_try_load_role_database", lambda self, role: db)
+    task._check_role_against_db("agg", validate_context=True, validate_generation=False)
+
+
 @pytest.mark.parametrize("backend", ["flashmla", "trtllm_mla", None])
 @pytest.mark.parametrize("fmha", [common.FMHAQuantMode.bfloat16, common.FMHAQuantMode.fp8])
 def test_k31_fp8_sol_task_does_not_require_measured_generation_dtype(tmp_path, k31_config, monkeypatch, backend, fmha):

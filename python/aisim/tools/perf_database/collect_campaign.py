@@ -127,18 +127,31 @@ def collect_image_tag(base_image: str) -> str:
     return f"aisim-collect:{name}"
 
 
-def dockerfile(base_image: str) -> str:
-    return (
+def dockerfile(base_image: str, model_path: str | None = None) -> str:
+    recipe = (
         f"FROM {base_image}\n"
         "# collector finalize deps the framework image does not ship (collector/helper.py finalize_perf_files)\n"
         f"RUN pip install --no-cache-dir {' '.join(FINALIZE_DEPS)}\n"
     )
 
+    if model_path == "moonshotai/Kimi-K3.1-Pro":
+        from collector.sglang.collect_kimi_k31_dsa_v1 import MODEL, MODEL_REVISION, TOKENIZER_FILES
 
-def build_image(base_image: str, *, network: str = "host", extra_build_args: list[str] | None = None) -> str:
+        files = ("config.json", *TOKENIZER_FILES)
+        fetch = (
+            "from huggingface_hub import hf_hub_download; "
+            f"[hf_hub_download({MODEL!r}, name, revision={MODEL_REVISION!r}) for name in {files!r}]"
+        )
+        recipe += f"RUN python3 -c {shlex.quote(fetch)}\n"
+    return recipe
+
+
+def build_image(
+    base_image: str, *, model_path: str | None = None, network: str = "host", extra_build_args: list[str] | None = None
+) -> str:
     tag = collect_image_tag(base_image)
     cmd = ["docker", "build", "--network", network, "-t", tag, "-f", "-", "."] + (extra_build_args or [])
-    subprocess.run(cmd, input=dockerfile(base_image), text=True, check=True)
+    subprocess.run(cmd, input=dockerfile(base_image, model_path), text=True, check=True)
     return tag
 
 
@@ -490,7 +503,9 @@ def main() -> int:
         )
     if args.cmd == "build-image":
         base = pinned_image(args.backend, args.op, args.model_path)
-        tag = build_image(base, extra_build_args=[f"--build-arg={a}" for a in args.build_arg])
+        tag = build_image(
+            base, model_path=args.model_path, extra_build_args=[f"--build-arg={a}" for a in args.build_arg]
+        )
         print(f"built {tag} from {base}")
         return 0
     plan = load_plan(args.plan.resolve())

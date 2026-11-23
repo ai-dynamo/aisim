@@ -46,6 +46,7 @@ __compat__ = "sglang==0.0.0.dev1+g41208373c.d20261104"
 
 MODEL = "moonshotai/Kimi-K3.1-Pro"
 MODEL_REVISION = "d9e99b0792a5e93b78ea9bea62a68167e36ddd9e"
+TOKENIZER_FILES = ("tokenizer_config.json", "tokenization_kimi.py", "encoding_k3.py", "tiktoken.model")
 ARCHITECTURE = "KimiK31ForConditionalGeneration"
 RUNTIME_VERSION = "0.0.0.dev1+g41208373c.d20261104"
 SOURCE_COMMIT = "afcd7d6b487a9cbe73e25941971b4cc107e6f9ae"
@@ -602,7 +603,7 @@ def main() -> None:
     os.environ.update(NATIVE_ENV)
     _assert_runtime()
     import torch
-    from huggingface_hub import hf_hub_download, snapshot_download
+    from huggingface_hub import hf_hub_download
     from sglang.srt.entrypoints.engine import _set_envs_and_config
     from sglang.srt.server_args import PortArgs, ServerArgs
 
@@ -612,14 +613,11 @@ def main() -> None:
     _check_capacity(case, args.phase, torch.cuda, first_gpu)
     config_path = hf_hub_download(MODEL, "config.json", revision=MODEL_REVISION)
     config = single_layer_config(json.loads(Path(config_path).read_text()))
-    tokenizer_path = snapshot_download(
-        MODEL,
-        revision=MODEL_REVISION,
-        # Native one_batch loads this checkpoint's TikTokenTokenizer even
-        # for synthetic token IDs. Its only local Python dependency is
-        # encoding_k3.py; both were inspected at this immutable revision.
-        allow_patterns=["tokenizer_config.json", "tokenization_kimi.py", "encoding_k3.py", "tiktoken.model"],
-    )
+    # Fetch each dependency by immutable revision. Enumerating a snapshot
+    # can require Hub access even when every required file is cached.
+    for filename in TOKENIZER_FILES:
+        hf_hub_download(MODEL, filename, revision=MODEL_REVISION)
+    tokenizer_path = str(Path(config_path).parent)
     with tempfile.TemporaryDirectory(prefix="kimi-k31-native-") as directory:
         Path(directory, "config.json").write_text(json.dumps(config))
         full_length = case.seq_len + case.prefix_len
