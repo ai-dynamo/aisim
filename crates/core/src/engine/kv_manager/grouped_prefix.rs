@@ -421,17 +421,23 @@ impl GroupedPrefixRules {
     /// form, so its replay keeps vLLM's hold. The rule is chosen for that,
     /// and the reason above is not an argument that covers every layout.
     /// In a layout with a prefix-cacheable state block below the scheduler
-    /// block, a preempted request without hits inside a block keeps hits
-    /// only up to a multiple of the scheduler block. At a pool of exactly
-    /// vLLM's startup count, which reserves `2 + c` blocks per Mamba group
-    /// (v0.31 `kv_cache_interface.py:1083-1094`, v0.32 `:1076-1082`, v0.33
-    /// `:1135-1141`), the hold on the processed count (v0.31
-    /// `kv_cache_manager.py:549-556`, v0.32 `:552-559`, v0.33 `:561-568`)
-    /// can then make the request need one more state block than the pool
-    /// has, preempt itself and hit the same tokens in its next life. vLLM's
-    /// own scheduler starves such a request, and a replay that follows it
-    /// does not end. In the other layouts that lose the hold, replay frees
-    /// one step earlier than vLLM.
+    /// block, at a pool of exactly vLLM's startup count, vLLM's rules can make
+    /// a request preempt itself with async scheduling. The startup count
+    /// reserves `2 + c` blocks per Mamba group (v0.31
+    /// `kv_cache_interface.py:1083-1094`, v0.32 `:1076-1082`, v0.33
+    /// `:1135-1141`), and vLLM frees a state block only when the processed
+    /// count, which leaves out the step in flight, has passed it (v0.31
+    /// `kv_cache_manager.py:549-556`,
+    /// `single_type_kv_cache_manager.py:1663-1675`; v0.32 `:552-559`,
+    /// `:1629-1641`; v0.33 `:561-568`, `:1645-1657`). So a chunk that is formed
+    /// behind a step in flight can need one more state block than the pool has;
+    /// vLLM refuses the allocation and preempts the request (v0.31
+    /// `kv_cache_manager.py:572-576`, `scheduler.py:771`, `:803-809`; v0.32
+    /// `:575-579`, `:802`, `:834-840`; v0.33 `:584-588`, `:938`, `:970-976`).
+    /// With the hold, replay does not complete such a request in the replay
+    /// tests of these layouts, so an aggregated rank does not hold the blocks
+    /// there. In the other layouts that lose the hold, replay frees one step
+    /// earlier than vLLM.
     pub(crate) fn keeps_in_flight_hold(&self) -> bool {
         self.keeps_in_flight_hold
     }

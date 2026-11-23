@@ -6111,10 +6111,10 @@ fn grouped_scheduler_tells_the_kv_manager_when_the_pass_before_is_in_flight() {
     // can count as a consumer (v0.31, v0.32 and v0.33 kv_transfer.py:11-12).
     // vLLM then pairs the hold on the processed count with a stop (v0.31
     // sched:175-181, :773-775, v0.32 sched:186-192, :804-806, v0.33
-    // sched:193-195, :940-942). Among prefill and decode ranks, replay models
-    // that stop on a grouped rank only, so a linear prefill or decode rank gets
-    // the computed count as its processed count, with a state cache and without
-    // one.
+    // sched:193-195, :940-942). Among prefill and decode ranks without a CPU
+    // tier, replay models that stop on a grouped rank only, so a linear prefill
+    // or decode rank gets the computed count as its processed count, with a
+    // state cache and without one.
     for (max_concurrent_batches, expected) in
         [(1, [false, false, false]), (2, [false, true, false])]
     {
@@ -7094,21 +7094,23 @@ fn grouped_prefill_rank_stops_a_source_behind_the_pass_in_flight_and_preempts_no
     // computes 11,999. With async scheduling its third chunk in a row has the
     // processed count 2,176, the count before the chunk in flight (v0.31
     // kv_cache_manager.py:549-556, v0.32 :552-559, v0.33 :561-568), so the
-    // blocks of index 0 stay and the chunk needs an attention block and 4
-    // running blocks with 4 blocks free. The allocation fails, the victim is
-    // the source itself, and the step in flight runs it. With a consumer
-    // connector vLLM does not preempt such a request: the running loop
-    // stops, the step schedules nothing, and the next `schedule()` call
-    // follows the outputs of the step in flight, has the processed count
-    // 4,352 and frees the blocks of index 0 first (v0.31 sched:175-181,
-    // :773-775, :2694-2698, v0.32 sched:186-192, :804-806, :2759-2763, v0.33
-    // sched:193-195, :940-942, :3077-3082). So every second pass from pass 2
-    // on schedules nothing and holds what the pass before it held: 4 such
-    // passes with a hash block of 2,176, and 5 with a hash block of 1,088,
-    // whose last chunks end at 11,968 and 11,999. No pass preempts. With a
-    // checkpoint block the pool of 19 holds three state blocks per group,
-    // and no pass stops. With one batch the processed count is the computed
-    // count, and no pass stops either.
+    // blocks of index 0 stay (v0.31 single:687-725, :1626-1675, v0.32 :672-710,
+    // :1592-1641, v0.33 :682-720, :1608-1657) and the chunk needs an attention
+    // block and 4 running blocks with 4 blocks free. The allocation fails, the
+    // victim is the source itself, and the step in flight runs it. With a
+    // consumer connector vLLM does not preempt such a request: the running loop
+    // stops, the step schedules nothing, and the next `schedule()` call follows
+    // the outputs of the step in flight, has the processed count 4,352 and
+    // frees the blocks of index 0 first (v0.31 sched:175-181, :773-775,
+    // :2694-2698, v0.32 sched:186-192, :804-806, :2759-2763, v0.33
+    // sched:193-195, :940-942, :3077-3082). So every second pass from pass 2 on
+    // schedules nothing and holds what the pass before it held: 4 such passes
+    // with a hash block of 2,176. With a hash block of 1,088 the last chunks of
+    // replay end at 11,968, the prompt's partial tail (v0.31 sched:482-487,
+    // v0.32 sched:517-525, v0.33 sched:622-631), and at 11,999, and replay has
+    // 5 such passes. No pass preempts. With a checkpoint block the pool of 19
+    // holds three state blocks per group, and no pass stops. With one batch the
+    // processed count is the computed count, and no pass stops either.
     for version in ["0.31.0", "0.32.0", "0.33.0"] {
         // Derived from the rules above, the same at v0.31.0, v0.32.0 and
         // v0.33.0: with a hash block of 2,176 vLLM's running loop stops in the
@@ -7139,7 +7141,8 @@ fn grouped_prefill_rank_stops_a_source_behind_the_pass_in_flight_and_preempts_no
         assert_eq!(retries, [2, 4, 6, 8, 10], "{version}");
         assert_eq!(preemptions, 0, "{version}");
 
-        // With one batch: no stop, no preemption, 2 state blocks per group.
+        // Replay with one batch: no stop, no preemption, 2 state blocks per
+        // group.
         for (hash, expected) in [
             (2176, vec![2176, 4352, 6528, 8704, 10_880, 11_999]),
             (1088, vec![2176, 4352, 6528, 8704, 10_880, 11_968, 11_999]),
@@ -7149,9 +7152,9 @@ fn grouped_prefill_rank_stops_a_source_behind_the_pass_in_flight_and_preempts_no
             assert_eq!((retries, preemptions), (Vec::new(), 0), "{version} {hash}");
         }
         if version != "0.31.0" {
-            // With a checkpoint block at v0.32.0 and v0.33.0: pool 19, no stop,
-            // no preemption, 3 state blocks per group, 6, 11, 16, 17, 18 and 19
-            // blocks in use.
+            // Replay with a checkpoint block at v0.32.0 and v0.33.0: pool 19,
+            // no stop, no preemption, 3 state blocks per group, 6, 11, 16, 17,
+            // 18 and 19 blocks in use.
             let (computed, peaks, retries, preemptions) =
                 lone_glm_source(version, true, 2176, 19, 2);
             assert_eq!(
@@ -7229,11 +7232,14 @@ fn grouped_decode_rank_stops_a_request_that_the_pass_in_flight_runs_and_preempts
  {
     // Two local requests of 6,000 tokens on a GLM decode rank of 17 pages with
     // a step budget of two blocks. R0 computes to 4,352, 6,000 and then one
-    // token per pass. R1 waits until its whole sequence fits and starts in pass
-    // 3 with 2,176 tokens. In pass 4 its second chunk crosses a state block
-    // boundary and needs an attention block and 4 running blocks with 3 blocks
-    // free, while the 8 blocks of R0 are still held. The victim is R1 itself,
-    // the last running request.
+    // token per pass. R1 waits until its whole sequence fits (v0.31 sched:1218
+    // with kv_cache_manager.py:519-536, v0.32 sched:1270 with :522-539, v0.33
+    // sched:1449 with :531-548) and starts in pass 3 with 2,176 tokens. In pass
+    // 4 its second chunk crosses a state block boundary and needs an attention
+    // block and 4 running blocks with 3 blocks free, while the 8 blocks of R0
+    // are still held (v0.31 single:687-725, :1626-1675, v0.32 :672-710,
+    // :1592-1641, v0.33 :682-720, :1608-1657). The victim is R1 itself, the
+    // last running request.
     //
     // With async scheduling pass 3 is in flight when pass 4 is formed, and it
     // ran R1. With a consumer connector vLLM does not preempt such a request:
@@ -7471,11 +7477,12 @@ fn linear_prefill_and_decode_ranks_preempt_a_request_that_the_pass_in_flight_run
     // running request, and pass 4 ran it. With a consumer connector and async
     // scheduling vLLM stops there (v0.31 sched:175-181, :773-775, v0.32
     // sched:186-192, :804-806, v0.33 sched:193-195, :940-942). Among prefill
-    // and decode ranks, replay models that stop on a grouped rank only, so a
-    // linear rank preempts Y in pass 5 with two batches as with one. An
-    // aggregated rank has no connector and preempts Y too. A state cache adds
-    // blocks to each request, so on its pool of 7 blocks a pass preempts Y
-    // earlier, and the passes of two batches are those of one batch there too.
+    // and decode ranks without a CPU tier, replay models that stop on a grouped
+    // rank only, so a linear rank preempts Y in pass 5 with two batches as with
+    // one. An aggregated rank has no connector and preempts Y too. A state
+    // cache adds blocks to each request, so on its pool of 7 blocks a pass
+    // preempts Y earlier, and the passes of two batches are those of one batch
+    // there too.
     for pool in ["linear", "state cache"] {
         for worker_type in [
             WorkerType::Prefill,
@@ -8325,7 +8332,8 @@ fn grouped_output_tokens_fill_cached_full_attention_blocks_that_the_next_turn_hi
                     assert_eq!(admissions, [(second, 64)], "{case}");
                     // cdiv(80, 32) = 3 blocks in each group, two of them the
                     // hit. vLLM's first allocation of turn 2 takes the same 3
-                    // blocks of its one group (derived from the rule).
+                    // blocks of its one group: the 2 hit blocks and 1 new block
+                    // of cdiv(80, 32) = 3.
                     assert_eq!(block_pool(&core).peak_active_blocks(), 3 * groups, "{case}");
                     drain_async_passes(&mut core, &mut now);
                     // The 80 computed tokens of turn 2 fill no third block:
@@ -8499,15 +8507,16 @@ fn grouped_glm_shaped_next_turn_gets_a_junction_where_output_tokens_filled_a_blo
     // 2,000 prompt tokens. With 400 output tokens they fill the
     // full-attention block that ends at 2,176, which gets its key (v0.31
     // kv_cache_manager.py:608-612, v0.32 :612-616, v0.33 :621-625). A Mamba
-    // group keeps no state at an output position under the default
-    // retention. Turn 2 repeats the 2,400 tokens and adds 100. Its
-    // full-attention lookup hits 2,176 tokens and its Mamba lookup none, so
-    // the hit is 0 and the junction 2,176 (v0.31 and v0.32
-    // kv_cache_manager.py:312-321, v0.33 :319-328). The prefill stops at the
-    // junction and each Mamba group publishes its state there. With 100 output
-    // tokens turn 1 fills no block, and turn 2 (2,200 tokens) gets no junction.
-    // One step computes 2,176 tokens at most here, so the first chunk of turn 2
-    // ends at 2,176 in both cases.
+    // group keeps no state at an output position under the default retention,
+    // which keeps a state only at the replay boundary and at a junction (v0.31
+    // single:1567-1624, v0.32 :1533-1590, v0.33 :1549-1606). Turn 2 repeats the
+    // 2,400 tokens and adds 100. Its full-attention lookup hits 2,176 tokens
+    // and its Mamba lookup none, so the hit is 0 and the junction 2,176 (v0.31
+    // and v0.32 kv_cache_manager.py:312-321, v0.33 :319-328). The prefill stops
+    // at the junction and each Mamba group publishes its state there. With 100
+    // output tokens turn 1 fills no block, and turn 2 (2,200 tokens) gets no
+    // junction. One step computes 2,176 tokens at most here, so the first chunk
+    // of turn 2 ends at 2,176 in both cases.
     for (version, checkpoint) in GLM_CORES {
         for batches in [1, 2] {
             // (output tokens of turn 1, cached blocks after turn 1, junction

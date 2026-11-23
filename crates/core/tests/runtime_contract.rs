@@ -654,13 +654,15 @@ fn grouped_prefix_state_block_below_the_attention_block_completes_at_the_startup
     // v0.33.0, with two batches and this pool a life of the second request that
     // has passed token 8 preempts itself (derived from the rules): it holds 2
     // attention blocks and 2 state blocks, the whole pool, so it is the only
-    // running request, and the block of a state that it has left goes only on
-    // the processed count (v0.31 kv_cache_manager.py:549-556, v0.32 :552-559,
-    // v0.33 :561-568), so a chunk behind its step in flight needs a third state
-    // block, 5 blocks in a pool of 4. In this layout replay frees that block on
-    // the computed count, one step earlier than vLLM, so both requests complete
-    // without a preemption, as they do in vLLM with one batch. The cap of 10 s
-    // of simulated time bounds the run.
+    // running request and the request that vLLM preempts (v0.31 sched:765-771,
+    // v0.32 :796-802, v0.33 :932-938), and the block of a state that it has
+    // left goes only on the processed count (v0.31 kv_cache_manager.py:549-556,
+    // single_type_kv_cache_manager.py:1626-1675, v0.32 :552-559, :1592-1641,
+    // v0.33 :561-568, :1608-1657), so a chunk behind its step in flight needs a
+    // third state block, 5 blocks in a pool of 4. In this layout replay frees
+    // that block on the computed count, one step earlier than vLLM, so both
+    // requests complete without a preemption, as they do in vLLM with one
+    // batch. The cap of 10 s of simulated time bounds the run.
     for (version, checkpoint) in [("0.31.0", None), ("0.32.0", Some(0)), ("0.33.0", Some(0))] {
         let mut first = request("first", 0.0, 8, 2);
         first.input_token_ids = Some([0].into_iter().chain(1_000_000..1_000_007).collect());
@@ -992,8 +994,9 @@ fn grouped_prefix_window_block_below_the_scheduler_block_completes_at_the_startu
     // convolution block lies below it, so the layout loses the hold: an
     // aggregated rank frees the blocks of a step in flight on the computed
     // count, one step earlier than vLLM, and the request completes without a
-    // preemption at 50 ms. With the hold the replay of this request does not
-    // end. The cap of 10 s of simulated time bounds the run.
+    // preemption at 50 ms. These values are replay's own. With the hold the
+    // replay of this request does not end. The cap of 10 s of simulated time
+    // bounds the run.
     for version in ["0.31.0", "0.32.0", "0.33.0"] {
         for (small, pages) in [
             (
@@ -1933,7 +1936,9 @@ fn grouped_destination_in_byte_mode_with_a_window_group_stops_where_vllm_stops()
     // Full attention, a window of 33 tokens and a state group of one block per
     // request, 16-token blocks and 100-byte pages, max_model_len 240, one
     // batch of 32 tokens and prefix caching off, so the window cap is
-    // cdiv(32 + 32, 16) + 1 = 5 blocks. Two distinct prompts of 161 tokens
+    // cdiv(32 + 32, 16) + 1 = 5 blocks (v0.31.0
+    // `vllm/v1/kv_cache_interface.py:859-866`, v0.32.0 `:878-885`, v0.33.0
+    // `:937-944`). Two distinct prompts of 161 tokens
     // end their prefills together, and each load of 160 tokens holds 10 + 2 +
     // 1 = 13 pages for 50 ms. With the loaded tokens computed, the reserve
     // that vLLM keeps for a held load counts the rest of its sequence with

@@ -1342,10 +1342,11 @@ fn decode_side_hit_floors_to_the_least_common_multiple_of_every_group_block() {
         // Blocks that are not multiples of each other: full attention 16
         // and a state group of 24 at a hash block of 8 have a scheduler
         // block of 48. The full-attention keys reach 80 and the state key
-        // lies at 48, so the local prefix is 80 and its floor 48: 3
-        // full-attention keys, and the state list of cdiv(48, 24) = 2
-        // entries keeps min(48 / 24, 2) = 2, so the state hit stays. The
-        // largest block, 24, would give 72.
+        // lies at 48, so the local prefix is 80, the full-attention hit
+        // when no group hits deeper (V31 and V32 mgr:356-369, v0.33
+        // mgr:363-378), and its floor 48: 3 full-attention keys, and the
+        // state list of cdiv(48, 24) = 2 entries keeps min(48 / 24, 2) = 2,
+        // so the state hit stays. The largest block, 24, would give 72.
         let groups = [attention("a", 16, None), state("s", 24, true, false)];
         let coordinator = with_limits(GroupedPrefixRules::new(&groups, 8, version).unwrap());
         assert_eq!(coordinator.rules().scheduler_block, 48, "{version:?}");
@@ -1378,9 +1379,9 @@ fn decode_side_hit_floors_to_the_least_common_multiple_of_every_group_block() {
         // full attention 16, a state group of 32 and a ring of 24 at a hash
         // block of 4 have a scheduler block of 96. The full-attention keys
         // reach 176 and the state key lies at 96, so the local prefix is
-        // 176 and its floor 96: 6 full-attention keys, and the state list
-        // of 3 entries keeps min(96 / 32, 3) = 3. The blocks of the
-        // prefix-cacheable groups alone, 16 and 32, would give 160.
+        // 176 by the same rule and its floor 96: 6 full-attention keys, and
+        // the state list of 3 entries keeps min(96 / 32, 3) = 3. The blocks of
+        // the prefix-cacheable groups alone, 16 and 32, would give 160.
         let groups = [
             attention("a", 16, None),
             state("s", 32, true, false),
@@ -5979,10 +5980,13 @@ fn full_attention_keys_of_several_groups_wait_for_the_scheduler_block() {
         // coord:1043-1044, v0.32.0 :1009-1010, v0.33.0 :1021-1022). A
         // full-attention group of 16 tokens and a ring of 4 tokens have a
         // scheduler block of 16. No state group has a block above the hash
-        // block of 4, so hits stay on multiples of 16, and a prompt of 22
-        // tokens caches 16 tokens: the full key 16 and no entry at the
-        // partial tail, 20. A longer prompt that shares the 22 tokens hits 16.
-        // These keys and this hit are derived from the rules above and from
+        // block of 4, and hits inside a block need a Mamba group with a block
+        // above the hash block (v0.31.0 coord:687-704, v0.32.0 coord:680-692
+        // and kv_cache_utils.py:750-771, v0.33.0 coord:690-702 and
+        // kv_cache_utils.py:762-783), so hits stay on multiples of 16, and a
+        // prompt of 22 tokens caches 16 tokens: the full key 16 and no entry at
+        // the partial tail, 20. A longer prompt that shares the 22 tokens hits
+        // 16. These keys and this hit are derived from the rules above and from
         // vLLM's lookup, which skips a group that is not prefix-cacheable
         // (v0.31.0 coord:748-749, v0.32.0 :719-720, v0.33.0 :729-730).
         let ringed = [attention("full", 16, None), state("ring", 4, false, false)];

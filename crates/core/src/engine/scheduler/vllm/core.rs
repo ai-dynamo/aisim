@@ -2706,14 +2706,25 @@ impl VllmCore {
         // group and every prefix-cacheable block equal to the scheduler
         // block. In a layout with a prefix-cacheable state block below the
         // scheduler block, at a pool of exactly vLLM's startup count, vLLM's
-        // own scheduler starves a request: with the hold the request needs
-        // one more state block than the pool has while a step is in flight,
-        // preempts itself, and hits the same tokens in its next life, and a
-        // replay that follows it does not end. In every layout that loses the
-        // hold an aggregated rank frees on the computed count, one step
-        // earlier than vLLM. An aggregated rank without those rules, such as
-        // one with prefix caching off, and a grouped prefill or decode rank
-        // keep the hold in every layout.
+        // rules can make a request preempt itself with async scheduling. The
+        // startup count reserves `2 + c` blocks per Mamba group (v0.31
+        // `kv_cache_interface.py:1083-1094`, v0.32 `:1076-1082`, v0.33
+        // `:1135-1141`), and vLLM frees a state block only when the processed
+        // count, which leaves out the step in flight, has passed it (v0.31
+        // `kv_cache_manager.py:549-556`,
+        // `single_type_kv_cache_manager.py:1663-1675`; v0.32 `:552-559`,
+        // `:1629-1641`; v0.33 `:561-568`, `:1645-1657`). So a chunk that is
+        // formed behind a step in flight can need one more state block than the
+        // pool has; vLLM refuses the allocation and preempts the request (v0.31
+        // `kv_cache_manager.py:572-576`, `scheduler.py:771`, `:803-809`; v0.32
+        // `:575-579`, `:802`, `:834-840`; v0.33 `:584-588`, `:938`,
+        // `:970-976`). With the hold, replay does not complete such a request
+        // in the replay tests of these layouts, so an aggregated rank does not
+        // hold the blocks there. In every layout that loses the hold an
+        // aggregated rank frees on the computed count, one step earlier than
+        // vLLM. An aggregated rank without those rules, such as one with prefix
+        // caching off, and a grouped prefill or decode rank keep the hold in
+        // every layout.
         let aggregated_hold = self.args.worker_type == WorkerType::Aggregated
             && self
                 .kv_manager
