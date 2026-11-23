@@ -90,6 +90,18 @@ def test_a_saved_source_never_replaces_the_roots_the_caller_named(monkeypatch, t
     assert res._ensure_dataset(named, None) == "ensured"  # a source the environment names overrides them
 
 
+@pytest.mark.parametrize("mode", ["auto", "op_level"])
+def test_a_saved_source_never_replaces_the_literal_default_roots(monkeypatch, mode):
+    # The literal token explicitly asks for the bundled tables, so the saved source must not replace them.
+    assert main(["init", "--on-demand", "--repo", REPO, "--revision", SHA]) == 0
+    seen = []
+    monkeypatch.setattr(ensure_mod, "ensure_data", lambda payload, pin: seen.append(payload) or "ensured")
+    for spelling in ("default", "Default"):
+        explicit = {"estimation_mode": mode, "system": "h200_sxm", "systems_paths": [spelling]}
+        assert res._ensure_dataset(explicit, None) is None and seen == []
+    assert res._ensure_dataset({"estimation_mode": mode, "system": "h200_sxm"}, None) == "ensured"
+
+
 def _sweeper_request(model, systems_paths=None, mode="op_level"):
     """The request the recommendation consumer builds; it expands unset roots to the default ones itself."""
     from aisim.sweeper.config import SearchSpace

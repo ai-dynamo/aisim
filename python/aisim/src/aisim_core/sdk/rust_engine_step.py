@@ -1054,6 +1054,9 @@ def _names_systems_paths(config: ForwardPassPerfModelConfig | Mapping[str, Any])
     they were set, outrank the source saved by ``aisim init``.
     """
     named = config.systems_paths if isinstance(config, ForwardPassPerfModelConfig) else config.get("systems_paths")
+    # The literal ``default`` token is an explicit request for the bundled tables, not an unset value.
+    if any(isinstance(entry, str) and entry.strip().lower() == "default" for entry in named or ()):
+        return True
     # An unset value expands to ``set_systems_paths``, then the environment variable, then the packaged roots.
     roots = _resolve_forward_pass_systems_paths(tuple(named or ()), require_directories=False)
     packaged = os.fspath(pkg_resources.files("aisim_core") / "systems")
