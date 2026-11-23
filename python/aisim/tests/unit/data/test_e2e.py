@@ -335,6 +335,43 @@ def test_aiperf_per_user_throughput_unit_spelling_converts():
     assert (row.status, row.value, row.unit) == ("valid", 42.0, "tokens/s/user")
 
 
+@pytest.mark.parametrize("observer", ["client", None])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_distinct_aiperf_throughput_statistics_reach_the_evaluator(tmp_path, observer, reverse):
+    import dataclasses
+
+    summary = _aiperf_summary(output_token_throughput={"unit": "tokens/second", "avg": 9600.0, "p50": 9000.0})
+    cfg = aiperf_to_configuration(summary, _aiperf_records(), _dev_body(), observation_id="dev:1", device_count=8)
+    dataset = load_e2e(tmp_path, write_configuration(tmp_path, cfg))
+    if reverse:
+        dataset = dataclasses.replace(dataset, metrics=list(reversed(dataset.metrics)))
+    (point,) = evaluation_points(dataset, observer=observer)
+    # Mean and median are different statistics of one observer: both survive, keyed by statistic.
+    assert point.metrics[("output_throughput:total", "mean")] == 9600.0
+    assert point.metrics[("output_throughput:total", "median")] == 9000.0
+    # The per-device value is the documented summary (``value``, else ``mean``): 9600 tokens/s over 8 devices.
+    assert point.per_device_throughput == {"output_throughput": 1200.0}
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_conflicting_per_device_sources_of_one_statistic_are_rejected_beside_other_statistics(tmp_path, reverse):
+    import dataclasses
+
+    dataset = load_e2e(tmp_path, write_configuration(tmp_path, _dev_config()))
+    rows = [
+        make_metric("dev:1", "output_throughput", "mean", 800.0, "tokens/s", normalization="total", device_count=8),
+        make_metric("dev:1", "output_throughput", "median", 790.0, "tokens/s", normalization="total", device_count=8),
+        make_metric("dev:1", "output_throughput", "mean", 120.0, "tokens/s", normalization="per_device"),
+    ]
+    ordered = rows[::-1] if reverse else rows
+    with pytest.raises(ValueError, match="ambiguous per-device throughput for output_throughput"):
+        evaluation_points(dataclasses.replace(dataset, metrics=ordered))
+    # Without the conflicting per-device mean only distinct statistics remain, which is accepted.
+    kept = [row for row in ordered if row.normalization == "total"]
+    (point,) = evaluation_points(dataclasses.replace(dataset, metrics=kept))
+    assert point.per_device_throughput == {"output_throughput": 100.0}
+
+
 def test_loader_rejects_tamper_and_wrong_schema(tmp_path):
     cfg = _dev_config()
     path = write_configuration(tmp_path, cfg)
