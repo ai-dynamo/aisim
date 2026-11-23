@@ -29,9 +29,7 @@ from aisim_core.ais_perf_model import AisPerfModelDeprecationWarning
 pytestmark = pytest.mark.unit
 
 # AISim still writes the old estimator fields into the configs it saves, so reading one back warns.
-reads_saved_config = pytest.mark.filterwarnings(
-    "ignore::aisim_core.ais_perf_model.AisPerfModelDeprecationWarning"
-)
+reads_saved_config = pytest.mark.filterwarnings("ignore::aisim_core.ais_perf_model.AisPerfModelDeprecationWarning")
 
 
 @pytest.fixture
@@ -95,9 +93,7 @@ def grouped_case(tmp_path, monkeypatch):
     }
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
-    (checkpoint / "config.json").write_text(
-        json.dumps({"architectures": ["UnregisteredWindowMoeForCausalLM"]})
-    )
+    (checkpoint / "config.json").write_text(json.dumps({"architectures": ["UnregisteredWindowMoeForCausalLM"]}))
     profile = {
         "schema_version": 1,
         "model": str(checkpoint),
@@ -113,9 +109,7 @@ def grouped_case(tmp_path, monkeypatch):
     }
     root = tmp_path / "systems"
     root.mkdir()
-    system = yaml.safe_load(
-        (Path(aisim_core.__file__).parent / "systems/h200_sxm.yaml").read_text()
-    )
+    system = yaml.safe_load((Path(aisim_core.__file__).parent / "systems/h200_sxm.yaml").read_text())
     # A deliberately tiny fake GPU creates meaningful byte pressure in CPU tests.
     system["gpu"]["mem_capacity"] = 4096
     (root / "h200_sxm.yaml").write_text(yaml.safe_dump(system))
@@ -231,9 +225,7 @@ def _mixed_profile(profile):
     resources["kv_bytes_per_token"] = 1
     resources.pop("cache_groups")
     # A full-only grouped deployment is valid beside a linear deployment.
-    profile["deployments"][1]["resources"]["cache_groups"] = profile["deployments"][1][
-        "resources"
-    ]["cache_groups"][:1]
+    profile["deployments"][1]["resources"]["cache_groups"] = profile["deployments"][1]["resources"]["cache_groups"][:1]
     return profile
 
 
@@ -279,11 +271,7 @@ def _with_prefix_evidence(profile, *, hash_block=64, version="0.31.0"):
     for deployment in profile["deployments"]:
         deployment["backend_version"] = version
         resources = deployment["resources"]
-        resources["cache_groups"] = [
-            group
-            for group in resources["cache_groups"]
-            if group["kind"] != "convolution"
-        ]
+        resources["cache_groups"] = [group for group in resources["cache_groups"] if group["kind"] != "convolution"]
         for name in (
             "weights_bytes",
             "activations_bytes",
@@ -304,9 +292,7 @@ def _with_prefix_evidence(profile, *, hash_block=64, version="0.31.0"):
             "hash_block_size_tokens": hash_block,
         }
         for group in resources["cache_groups"]:
-            group.update(
-                block_size_tokens=hash_block, page_size_bytes=64, prefix_cacheable=True
-            )
+            group.update(block_size_tokens=hash_block, page_size_bytes=64, prefix_cacheable=True)
             if group["kind"] == "state":
                 group["blocks_per_request"] = 1
                 if version in ("0.32.0", "0.33.0"):
@@ -320,9 +306,7 @@ def _prefix_caching_prediction(profile, root, version):
     raw["engine"]["backend_version"] = version
     # The rank runs at the probe's max_model_len. The Rust gate needs a pool for one prompt of max_model_len plus
     # the state blocks of one request: 16 + 13 + 2 = 31 of the 54 blocks at 1024 tokens.
-    raw["engine"]["context_length"] = profile["deployments"][0]["resources"][
-        "runtime_memory"
-    ]["max_model_len"]
+    raw["engine"]["context_length"] = profile["deployments"][0]["resources"]["runtime_memory"]["max_model_len"]
     raw["engine"]["workers"]["aggregated"]["kv_cache"]["prefix_caching"] = True
     raw["traffic"] = {
         "source": {
@@ -338,17 +322,13 @@ def _prefix_caching_prediction(profile, root, version):
 
 
 @pytest.mark.parametrize("unrelated", ["topology", "hardware", "version"])
-def test_mixed_profile_predict_preserves_selected_linear_prefix_cache(
-    grouped_case, tmp_path, unrelated
-):
+def test_mixed_profile_predict_preserves_selected_linear_prefix_cache(grouped_case, tmp_path, unrelated):
     profile, root = grouped_case
     profile = _mixed_profile(profile)
     if unrelated != "topology":
         profile["deployments"][1].update(tp=2, dp=1, moe_tp=2, moe_ep=1)
         profile["deployments"][1].update(
-            {"system": "h100_sxm"}
-            if unrelated == "hardware"
-            else {"backend_version": "0.25.2"}
+            {"system": "h100_sxm"} if unrelated == "hardware" else {"backend_version": "0.25.2"}
         )
     raw = _prediction(profile, root)
     raw["engine"]["workers"]["aggregated"]["kv_cache"]["prefix_caching"] = True
@@ -372,18 +352,11 @@ def test_mixed_profile_predict_preserves_selected_linear_prefix_cache(
     )
     report = json.loads((output / "prediction.json").read_text())
     assert report["completed_requests"] == 2
-    assert (
-        report["details"]["sections"]["memory"]["roles"]["aggregated"][
-            "total_kv_size_tokens"
-        ]
-        > 0
-    )
+    assert report["details"]["sections"]["memory"]["roles"]["aggregated"]["total_kv_size_tokens"] > 0
 
 
 @pytest.mark.parametrize("preset", [False, True])
-def test_mixed_profile_recommendation_preserves_pinned_linear_prefix_cache(
-    grouped_case, tmp_path, monkeypatch, preset
-):
+def test_mixed_profile_recommendation_preserves_pinned_linear_prefix_cache(grouped_case, tmp_path, monkeypatch, preset):
     from aisim.recommend import _run_recommendation, recommendation_to_sweeper
     from aisim.sweeper.search_space import enumerate_branches
 
@@ -393,9 +366,7 @@ def test_mixed_profile_recommendation_preserves_pinned_linear_prefix_cache(
     worker["kv_cache"]["prefix_caching"] = True
     worker["parallelism"]["preset"] = False
     if preset:
-        worker["parallelism"] = {
-            "preset": [{**worker["parallelism"], "replicas": 1, "pipeline": 1}]
-        }
+        worker["parallelism"] = {"preset": [{**worker["parallelism"], "replicas": 1, "pipeline": 1}]}
         worker["parallelism"]["preset"][0].pop("preset")
     raw["optimization"] = {"constraints": {"max_candidate_gpus": 2}}
     raw["optimizer"] = {"algorithm": "random", "max_trials": 1, "parallelism": 1}
@@ -450,9 +421,9 @@ def test_mixed_search_ignores_unreachable_grouped_deployments(grouped_case, filt
         grouped.update(tp=4, dp=1, moe_tp=1, moe_ep=4)
     elif filter_by in {"pin", "mode_pin"}:
         pinned = [{"tp": 2, "moe_tp": 2}]
-        raw[
-            "parallel_configs" if filter_by == "pin" else "parallel_configs_by_mode"
-        ] = pinned if filter_by == "pin" else {"agg": pinned}
+        raw["parallel_configs" if filter_by == "pin" else "parallel_configs_by_mode"] = (
+            pinned if filter_by == "pin" else {"agg": pinned}
+        )
     elif filter_by == "choices":
         raw["parallel_independent_by_mode"] = {"agg": {"tp": [2]}}
     else:
@@ -468,9 +439,7 @@ def test_mixed_search_ignores_unreachable_grouped_deployments(grouped_case, filt
 
 
 @pytest.mark.parametrize("placement", ["aggregated", "disaggregated", "heterogeneous"])
-def test_mixed_recommendation_linear_fixed_capacity_and_disaggregation(
-    grouped_case, placement
-):
+def test_mixed_recommendation_linear_fixed_capacity_and_disaggregation(grouped_case, placement):
     from aisim.recommend import recommendation_to_sweeper
     from aisim.sweeper.search_space import enumerate_branches
 
@@ -479,9 +448,7 @@ def test_mixed_recommendation_linear_fixed_capacity_and_disaggregation(
     # Unselected deployments must not reach resource-envelope validation either.
     raw["engine"]["fpm_profile"]["deployments"][1]["resources"]["max_num_tokens"] = 64
     worker = raw["engine"]["workers"]["aggregated"]
-    worker["kv_cache"].update(
-        prefix_caching=True, capacity={"type": "fixed", "blocks": 64}
-    )
+    worker["kv_cache"].update(prefix_caching=True, capacity={"type": "fixed", "blocks": 64})
     disaggregated = placement != "aggregated"
     if disaggregated:
         raw["engine"]["mode"] = "disaggregated"
@@ -502,15 +469,9 @@ def test_mixed_recommendation_linear_fixed_capacity_and_disaggregation(
     if placement == "heterogeneous":
         parallel = raw["engine"]["workers"]["prefill"]["parallelism"]
         parallel.pop("preset")
-        raw["engine"]["workers"]["prefill"]["parallelism"] = {
-            "preset": [{**parallel, "pipeline": 1}]
-        }
-    raw["optimization"] = {
-        "constraints": {"max_candidate_gpus": 4 if disaggregated else 2}
-    }
-    branches = enumerate_branches(
-        recommendation_to_sweeper(CoreRecommendationConfig.model_validate(raw))
-    )
+        raw["engine"]["workers"]["prefill"]["parallelism"] = {"preset": [{**parallel, "pipeline": 1}]}
+    raw["optimization"] = {"constraints": {"max_candidate_gpus": 4 if disaggregated else 2}}
+    branches = enumerate_branches(recommendation_to_sweeper(CoreRecommendationConfig.model_validate(raw)))
     assert len(branches) == 1
     assert len(branches[0].parallel_configs) == 1
     candidate = branches[0].parallel_configs[0]
@@ -530,10 +491,7 @@ def test_mixed_search_keeps_both_layouts_when_grouped_settings_are_supported(
         search_space=raw,
         workload=Workload(isl=1152, osl=4, concurrency=2, request_count=2),
     )
-    assert {
-        candidate.shape.tp
-        for candidate in enumerate_branches(config)[0].parallel_configs
-    } == {1, 2}
+    assert {candidate.shape.tp for candidate in enumerate_branches(config)[0].parallel_configs} == {1, 2}
 
 
 @pytest.mark.parametrize(
@@ -561,9 +519,7 @@ def test_mixed_search_keeps_both_layouts_when_grouped_settings_are_supported(
         ),
     ],
 )
-def test_mixed_search_rejects_reachable_grouped_unsupported_settings(
-    grouped_case, update, error
-):
+def test_mixed_search_rejects_reachable_grouped_unsupported_settings(grouped_case, update, error):
     from aisim.sweeper.config import SearchSpace
 
     profile, root = grouped_case
@@ -573,9 +529,7 @@ def test_mixed_search_rejects_reachable_grouped_unsupported_settings(
         SearchSpace.model_validate(raw)
 
 
-def test_public_recommendation_rejects_reachable_grouped_before_estimating(
-    grouped_case, tmp_path, monkeypatch, capsys
-):
+def test_public_recommendation_rejects_reachable_grouped_before_estimating(grouped_case, tmp_path, monkeypatch, capsys):
     from aisim.recommend import _run_recommendation
     from aisim_core.sdk import RustForwardPassPerfModel
 
@@ -605,30 +559,21 @@ def test_public_recommendation_rejects_reachable_grouped_before_estimating(
         )
     assert error.value.code == 2
     output = capsys.readouterr()
-    assert (
-        "grouped FPM cache requires agg_enable_prefix_caching=false"
-        in output.out + output.err
-    )
+    assert "grouped FPM cache requires agg_enable_prefix_caching=false" in output.out + output.err
 
 
 @pytest.mark.parametrize("dep", [False, True])
 @pytest.mark.parametrize("layout", ["mixed", "window_only", "full_only"])
-def test_public_predict_uses_group_bytes_with_tp_and_dep(
-    grouped_case, tmp_path, dep, layout
-):
+def test_public_predict_uses_group_bytes_with_tp_and_dep(grouped_case, tmp_path, dep, layout):
     profile, root = grouped_case
     if layout != "mixed":
         for deployment in profile["deployments"]:
             groups = deployment["resources"]["cache_groups"]
-            deployment["resources"]["cache_groups"] = (
-                groups[:1] if layout == "full_only" else groups[1:]
-            )
+            deployment["resources"]["cache_groups"] = groups[:1] if layout == "full_only" else groups[1:]
     raw = _prediction(profile, root, dep=dep)
     spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
     diagnostics = {}
-    lowered = materialize_aic_num_gpu_blocks(
-        spec.backend_deployment.agg_engine_args, memory_diagnostics=diagnostics
-    )
+    lowered = materialize_aic_num_gpu_blocks(spec.backend_deployment.agg_engine_args, memory_diagnostics=diagnostics)
     assert "num_gpu_blocks" not in lowered
     assert lowered["kv_cache_capacity_bytes"] == 3486  # floor(4096 * .9 - 200)
     assert lowered["kv_cache_groups"] == diagnostics["cache_groups"]
@@ -667,18 +612,12 @@ def test_public_predict_runs_with_a_state_group(grouped_case, tmp_path, dep):
     raw = _prediction(_with_state_group(profile), root, dep=dep)
     spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
     diagnostics = {}
-    lowered = materialize_aic_num_gpu_blocks(
-        spec.backend_deployment.agg_engine_args, memory_diagnostics=diagnostics
-    )
+    lowered = materialize_aic_num_gpu_blocks(spec.backend_deployment.agg_engine_args, memory_diagnostics=diagnostics)
     # The state group reaches the engine configuration with its block count. No other group has the key.
     assert lowered["kv_cache_groups"] == diagnostics["cache_groups"]
     groups = {group["name"]: group for group in lowered["kv_cache_groups"]}
     assert groups["state"] == {**_STATE_GROUP, "sliding_window": None}
-    assert all(
-        "blocks_per_request" not in group
-        for name, group in groups.items()
-        if name != "state"
-    )
+    assert all("blocks_per_request" not in group for name, group in groups.items() if name != "state")
     assert lowered["kv_cache_capacity_bytes"] == 3486
     # 2048 full-history + 656 sliding-window + 272 convolution + 128 state bytes (2 blocks of 64).
     assert diagnostics["request_peak_cache_bytes"] == 3104
@@ -705,16 +644,10 @@ def test_public_predict_runs_with_a_state_group(grouped_case, tmp_path, dep):
     assert memory["total_kv_size_tokens"] is None
 
 
-@pytest.mark.parametrize(
-    "architecture", ["KimiK31ForConditionalGeneration", "KimiLinearForCausalLM"]
-)
-@pytest.mark.parametrize(
-    "has_state", [False, True], ids=["attention-only", "with-state"]
-)
+@pytest.mark.parametrize("architecture", ["KimiK31ForConditionalGeneration", "KimiLinearForCausalLM"])
+@pytest.mark.parametrize("has_state", [False, True], ids=["attention-only", "with-state"])
 @pytest.mark.parametrize("dep", [False, True], ids=["tp", "attention-dp"])
-def test_kimi_fpm_alias_native_replay_requires_state_group(
-    grouped_case, architecture, has_state, dep
-):
+def test_kimi_fpm_alias_native_replay_requires_state_group(grouped_case, architecture, has_state, dep):
     from aisim import _runtime
     from aisim.runner import _materialize_engine_execution_spec
 
@@ -723,11 +656,9 @@ def test_kimi_fpm_alias_native_replay_requires_state_group(
     profile["architecture"] = architecture
     # Both spellings are legitimate collector identities: a decoder without
     # its own architecture inherits the multimodal wrapper's declaration.
-    decoder = (
-        {}
-        if architecture == "KimiK31ForConditionalGeneration"
-        else {"architectures": [architecture]}
-    )
+    decoder = {"num_hidden_layers": 93}
+    if architecture != "KimiK31ForConditionalGeneration":
+        decoder["architectures"] = [architecture]
     (Path(profile["model"]) / "config.json").write_text(
         json.dumps(
             {
@@ -738,9 +669,7 @@ def test_kimi_fpm_alias_native_replay_requires_state_group(
     )
     for deployment in profile["deployments"]:
         resources = deployment["resources"]
-        resources["cache_groups"] = [
-            group for group in resources["cache_groups"] if group["kind"] == "attention"
-        ]
+        resources["cache_groups"] = [group for group in resources["cache_groups"] if group["kind"] == "attention"]
         if has_state:
             resources["cache_groups"].append(dict(_STATE_GROUP))
         resources["provenance"] = (
@@ -750,25 +679,19 @@ def test_kimi_fpm_alias_native_replay_requires_state_group(
     public = CorePredictionConfig.model_validate(_prediction(profile, root, dep=dep))
     reloaded = CorePredictionConfig.model_validate_json(public.model_dump_json())
     spec = prediction_to_replay_spec(reloaded)
-    execution = _materialize_engine_execution_spec(
-        spec, trace_block_size=64, record_per_request=True
-    )
+    execution = _materialize_engine_execution_spec(spec, trace_block_size=64, record_per_request=True)
     rank = execution["spec"]["engine"]["rank"]
     config = rank["timing_model"]["config"]
     assert config["fpm_profile"]["architecture"] == architecture
     assert config["estimator_config"]["fpm_interpolation"]["method"] == "direct"
     assert rank.get("state_cache") is None
-    assert (
-        any(group["kind"] == "state" for group in rank["kv_cache_groups"]) is has_state
-    )
+    assert any(group["kind"] == "state" for group in rank["kv_cache_groups"]) is has_state
 
     # Execute the serialized wire in Rust: direct FPM has no KDA op graph,
     # so architecture validation must still prevent attention-only admission.
     wire = json.dumps(execution)
     if not has_state:
-        with pytest.raises(
-            RuntimeError, match="requires explicit state_cache geometry"
-        ):
+        with pytest.raises(RuntimeError, match="requires explicit state_cache geometry"):
             _runtime.run_replay_json(wire)
         return
 
@@ -779,17 +702,13 @@ def test_kimi_fpm_alias_native_replay_requires_state_group(
     assert report["fpm_query_coverage"]["status"] == "covered"
 
 
-def test_public_predict_does_not_clamp_logical_context_to_window(
-    grouped_case, tmp_path
-):
+def test_public_predict_does_not_clamp_logical_context_to_window(grouped_case, tmp_path):
     profile, root = grouped_case
     # Window-only allocation is bounded, but the first decode after the
     # prefill-emitted token must read all 1152 prompt KV tokens. A table ending
     # at 512 must fail, not shrink the logical context or physical byte budget.
     for deployment in profile["deployments"]:
-        deployment["resources"]["cache_groups"] = deployment["resources"][
-            "cache_groups"
-        ][1:]
+        deployment["resources"]["cache_groups"] = deployment["resources"]["cache_groups"][1:]
     _write_timings(root, profile, decode_ceiling=512)
     raw = _prediction(profile, root)
     raw["traffic"]["load"]["concurrency"] = 1
@@ -843,9 +762,7 @@ def test_grouped_recommendation_exports_a_runnable_prediction(
     assert cli.main(["recommend", "-c", str(path), "--output-dir", str(output)]) == 0
     exported_path = output / "recommendations/0001.yaml"
     exported = CorePredictionConfig.from_yaml(exported_path)
-    assert (
-        exported.engine.fpm_profile.deployments[0].resources.cache_layout == "grouped"
-    )
+    assert exported.engine.fpm_profile.deployments[0].resources.cache_layout == "grouped"
     assert exported.engine.workers.aggregated.kv_cache.prefix_caching is False
     assert (
         cli.main(
@@ -870,16 +787,12 @@ def test_grouped_recommendation_exports_a_runnable_prediction(
         ("dp_size", 2, "dp_size|topology"),
     ],
 )
-def test_native_grouped_rematerialization_checks_identity_and_budget(
-    grouped_case, field, value, error
-):
+def test_native_grouped_rematerialization_checks_identity_and_budget(grouped_case, field, value, error):
     from aisim import _runtime
     from aisim.runner import EngineReplayRunnerFactory
 
     profile, root = grouped_case
-    spec = prediction_to_replay_spec(
-        CorePredictionConfig.model_validate(_prediction(profile, root))
-    )
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(_prediction(profile, root)))
 
     class ChangedNativeInput:
         def run_replay_json(self, serialized):
@@ -903,9 +816,7 @@ def test_grouped_capacity_preserves_graph_reservation_and_rejects_fixed_blocks(
     grouped_case,
 ):
     profile, root = grouped_case
-    spec = prediction_to_replay_spec(
-        CorePredictionConfig.model_validate(_prediction(profile, root))
-    )
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(_prediction(profile, root)))
     args = deepcopy(spec.backend_deployment.agg_engine_args)
     args["cuda_graph_reserved_bytes"] = 1000
     args["timing_model"]["config"]["cuda_graph_reserved_bytes"] = 1000
@@ -916,9 +827,7 @@ def test_grouped_capacity_preserves_graph_reservation_and_rejects_fixed_blocks(
         materialize_aic_num_gpu_blocks(args)
 
 
-def test_grouped_topology_admission_uses_each_rank_byte_budget_before_collection(
-    grouped_case, monkeypatch
-):
+def test_grouped_topology_admission_uses_each_rank_byte_budget_before_collection(grouped_case, monkeypatch):
     from aisim_core.sdk import RustForwardPassPerfModel
 
     profile, root = grouped_case
@@ -1037,9 +946,7 @@ def test_grouped_state_group_adds_fixed_bytes_per_request(grouped_case):
         ({"host_offload": {"num_host_blocks": 64}}, "only HBM"),
     ],
 )
-def test_grouped_incompatible_cache_settings_fail_before_replay(
-    grouped_case, update, error
-):
+def test_grouped_incompatible_cache_settings_fail_before_replay(grouped_case, update, error):
     profile, root = grouped_case
     raw = _prediction(profile, root)
     raw["engine"]["workers"]["aggregated"]["kv_cache"].update(update)
@@ -1068,9 +975,7 @@ def test_grouped_unsupported_execution_modes_fail_before_replay(grouped_case, ch
     if changes.get("mode") == "disaggregated":
         worker = raw["engine"]["workers"].pop("aggregated")
         raw["engine"]["workers"] = {"prefill": deepcopy(worker), "decode": worker}
-    with pytest.raises(
-        ValidationError, match="grouped FPM cache supports only aggregated vLLM"
-    ):
+    with pytest.raises(ValidationError, match="grouped FPM cache supports only aggregated vLLM"):
         CorePredictionConfig.model_validate(raw)
 
 
@@ -1169,9 +1074,7 @@ def test_grouped_onboarding_profile_reaches_real_collector_preview_and_render(
     assert collector_cli.main([arg for arg in command if arg != "--plan-only"]) == 0
 
 
-def _plan_and_validate_weka(
-    profile, tmp_path, monkeypatch, *, dep=False, version="0.25.1", context_length=2048
-):
+def _plan_and_validate_weka(profile, tmp_path, monkeypatch, *, dep=False, version="0.25.1", context_length=2048):
     """Plan the onboarding of a grouped profile and replay a windowed Weka trace with validate-fpm.
 
     A shorter context, such as a probe's max_model_len, gets a workload and a second request that fit in it. The
@@ -1180,11 +1083,7 @@ def _plan_and_validate_weka(
     from aisim import supervision
 
     # The default workload of 1,024 input and 128 output tokens needs a context of 1,152 tokens.
-    workload = (
-        {}
-        if context_length >= 1152
-        else {"workload": {"input_tokens": 512, "output_tokens": 4}}
-    )
+    workload = {} if context_length >= 1152 else {"workload": {"input_tokens": 512, "output_tokens": 4}}
     second = min(1152, context_length - 64)
     request = SupportRequest.model_validate(
         {
@@ -1265,9 +1164,7 @@ def _plan_and_validate_weka(
 
 @reads_saved_config
 @pytest.mark.parametrize("dep", [False, True])
-def test_onboard_validation_replays_windowed_weka_with_full_context(
-    grouped_case, tmp_path, monkeypatch, dep
-):
+def test_onboard_validation_replays_windowed_weka_with_full_context(grouped_case, tmp_path, monkeypatch, dep):
     profile, _root = grouped_case
     _plan, output = _plan_and_validate_weka(profile, tmp_path, monkeypatch, dep=dep)
     validation = json.loads((output / "validation.json").read_text())
@@ -1282,27 +1179,19 @@ def test_onboard_validation_replays_windowed_weka_with_full_context(
 
 
 @pytest.mark.parametrize("profile_field", ["aic_fpm_profile", "fpm_profile"])
-def test_grouped_runner_capability_rejects_unsupported_stack(
-    grouped_case, profile_field
-):
+def test_grouped_runner_capability_rejects_unsupported_stack(grouped_case, profile_field):
     from aisim.runner import EngineReplayRunnerFactory
     from aisim.sweeper.replay import RunnerCapabilities
 
     profile, root = grouped_case
-    spec = prediction_to_replay_spec(
-        CorePredictionConfig.model_validate(_prediction(profile, root))
-    )
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(_prediction(profile, root)))
     with pytest.raises(ValueError, match="grouped FPM caches; use --stack engine"):
-        RunnerCapabilities(
-            supported_backend_topologies=(("vllm", "agg"),)
-        ).require_compatible(spec)
+        RunnerCapabilities(supported_backend_topologies=(("vllm", "agg"),)).require_compatible(spec)
     EngineReplayRunnerFactory().capabilities().require_compatible(spec)
     linear_spec = prediction_to_replay_spec(
         CorePredictionConfig.model_validate(_prediction(_mixed_profile(profile), root))
     )
-    RunnerCapabilities(
-        supported_backend_topologies=(("vllm", "agg"),)
-    ).require_compatible(linear_spec)
+    RunnerCapabilities(supported_backend_topologies=(("vllm", "agg"),)).require_compatible(linear_spec)
 
     from dataclasses import replace
 
@@ -1321,9 +1210,7 @@ def test_grouped_runner_capability_rejects_unsupported_stack(
             spec,
             backend_deployment=replace(spec.backend_deployment, agg_engine_args=flat),
         )
-        capabilities = RunnerCapabilities(
-            supported_backend_topologies=(("vllm", "agg"),)
-        )
+        capabilities = RunnerCapabilities(supported_backend_topologies=(("vllm", "agg"),))
         if grouped:
             with pytest.raises(ValueError, match="grouped FPM caches"):
                 capabilities.require_compatible(flat_spec)
@@ -1394,9 +1281,7 @@ def _prefix_search(profile, root, version):
         ),
     ],
 )
-def test_grouped_prefix_caching_needs_vllm_evidence_with_align_mode(
-    grouped_case, case, error
-):
+def test_grouped_prefix_caching_needs_vllm_evidence_with_align_mode(grouped_case, case, error):
     from aisim.sweeper.config import SearchSpace
 
     profile, root = grouped_case
@@ -1412,9 +1297,7 @@ def test_grouped_prefix_caching_needs_vllm_evidence_with_align_mode(
     for deployment in profile["deployments"]:
         resources = deployment["resources"]
         if case == "probe_without_prefix_caching":
-            resources["runtime_memory"].update(
-                enable_prefix_caching=False, mamba_cache_mode="none"
-            )
+            resources["runtime_memory"].update(enable_prefix_caching=False, mamba_cache_mode="none")
         elif case == "unmarked_group":
             del resources["cache_groups"][1]["prefix_cacheable"]
         elif case == "convolution_group":
@@ -1454,9 +1337,7 @@ def test_grouped_prefix_caching_replays_with_reuse(grouped_case, tmp_path, versi
     profile = _with_prefix_evidence(_with_state_group(profile), version=version)
     _write_timings(root, profile, version=version)
     raw = _prefix_caching_prediction(profile, root, version)
-    args = prediction_to_replay_spec(
-        CorePredictionConfig.model_validate(raw)
-    ).backend_deployment.agg_engine_args
+    args = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw)).backend_deployment.agg_engine_args
     assert (
         args["enable_prefix_caching"],
         args["prefix_match_unit"],
@@ -1496,9 +1377,7 @@ def test_grouped_prefix_caching_replays_with_reuse(grouped_case, tmp_path, versi
 )
 def test_grouped_prefix_caching_refuses_host_offload(grouped_case, version, host):
     profile, root = grouped_case
-    raw = _prefix_caching_prediction(
-        _with_prefix_evidence(profile, version=version), root, version
-    )
+    raw = _prefix_caching_prediction(_with_prefix_evidence(profile, version=version), root, version)
     CorePredictionConfig.model_validate(raw)
     raw["engine"]["workers"]["aggregated"]["kv_cache"]["host_offload"] = host
     with pytest.raises(ValidationError, match="only HBM"):
@@ -1507,14 +1386,10 @@ def test_grouped_prefix_caching_refuses_host_offload(grouped_case, version, host
 
 def test_grouped_prefix_caching_rank_takes_the_probe_hash_block(grouped_case):
     profile, root = grouped_case
-    raw = _prefix_caching_prediction(
-        _with_prefix_evidence(_with_state_group(profile)), root, "0.31.0"
-    )
+    raw = _prefix_caching_prediction(_with_prefix_evidence(_with_state_group(profile)), root, "0.31.0")
 
     def engine_args():
-        return prediction_to_replay_spec(
-            CorePredictionConfig.model_validate(raw)
-        ).backend_deployment.agg_engine_args
+        return prediction_to_replay_spec(CorePredictionConfig.model_validate(raw)).backend_deployment.agg_engine_args
 
     implicit = engine_args()
     raw["engine"]["workers"]["aggregated"]["kv_cache"]["prefix_match_unit"] = 64
@@ -1540,9 +1415,7 @@ def test_grouped_rank_without_prefix_caching_refuses_prefix_match_unit(grouped_c
     # A linear deployment keeps the text of a linear cache.
     raw = _prediction(_mixed_profile(profile), root)
     raw["engine"]["workers"]["aggregated"]["kv_cache"]["prefix_match_unit"] = 64
-    with pytest.raises(
-        ValidationError, match="prefix_match_unit currently requires state_cache"
-    ):
+    with pytest.raises(ValidationError, match="prefix_match_unit currently requires state_cache"):
         CorePredictionConfig.model_validate(raw)
 
 
@@ -1550,9 +1423,7 @@ def test_grouped_rank_without_prefix_caching_refuses_prefix_match_unit(grouped_c
     "hash_block,budget,refused",
     [(2176, 8190, True), (2176, 8192, False), (2174, 8192, True)],
 )
-def test_glm_grid_refuses_off_grid_units_and_budgets(
-    grouped_case, hash_block, budget, refused
-):
+def test_glm_grid_refuses_off_grid_units_and_budgets(grouped_case, hash_block, budget, refused):
     from aisim.sweeper.config import SearchSpace
 
     profile, root = grouped_case
@@ -1582,19 +1453,13 @@ def test_glm_grid_refuses_off_grid_units_and_budgets(
 
 
 @reads_saved_config
-def test_grouped_plan_keeps_prefix_caching_on_with_evidence_and_validation_cold(
-    grouped_case, tmp_path, monkeypatch
-):
+def test_grouped_plan_keeps_prefix_caching_on_with_evidence_and_validation_cold(grouped_case, tmp_path, monkeypatch):
     profile, _root = grouped_case
     profile = _with_prefix_evidence(profile)
     # Onboarding keeps the context within the probe's max_model_len (support/cli.py:317-320).
-    plan, output = _plan_and_validate_weka(
-        profile, tmp_path, monkeypatch, version="0.31.0", context_length=1024
-    )
+    plan, output = _plan_and_validate_weka(profile, tmp_path, monkeypatch, version="0.31.0", context_length=1024)
     for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
-        worker = yaml.safe_load((plan / name).read_text())["engine"]["workers"][
-            "aggregated"
-        ]
+        worker = yaml.safe_load((plan / name).read_text())["engine"]["workers"]["aggregated"]
         assert worker["kv_cache"]["prefix_caching"] is True
     validation = json.loads((output / "validation.json").read_text())
     assert validation["status"] == "covered"
@@ -1603,9 +1468,7 @@ def test_grouped_plan_keeps_prefix_caching_on_with_evidence_and_validation_cold(
     assert saved.engine.workers.aggregated.kv_cache.prefix_caching is False
 
 
-def test_cold_validation_drops_the_unit_that_only_prefix_caching_reads(
-    grouped_case, tmp_path, monkeypatch
-):
+def test_cold_validation_drops_the_unit_that_only_prefix_caching_reads(grouped_case, tmp_path, monkeypatch):
     from aisim.support.validation import _prediction_config
 
     profile, _root = grouped_case
@@ -1638,39 +1501,27 @@ def test_cold_validation_drops_the_unit_that_only_prefix_caching_reads(
     }
 
 
-def test_grouped_plan_without_the_probe_hash_block_stays_cold(
-    grouped_case, tmp_path, monkeypatch
-):
+def test_grouped_plan_without_the_probe_hash_block_stays_cold(grouped_case, tmp_path, monkeypatch):
     # Replay hashes prompts in blocks of the profile's hash block, so runtime memory without it is no evidence.
     profile, _root = grouped_case
     profile = _with_prefix_evidence(profile)
     for deployment in profile["deployments"]:
         del deployment["resources"]["runtime_memory"]["hash_block_size_tokens"]
-    plan, _output = _plan_and_validate_weka(
-        profile, tmp_path, monkeypatch, version="0.31.0", context_length=1024
-    )
+    plan, _output = _plan_and_validate_weka(profile, tmp_path, monkeypatch, version="0.31.0", context_length=1024)
     for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
-        worker = yaml.safe_load((plan / name).read_text())["engine"]["workers"][
-            "aggregated"
-        ]
+        worker = yaml.safe_load((plan / name).read_text())["engine"]["workers"]["aggregated"]
         assert worker["kv_cache"]["prefix_caching"] is False
 
 
 @pytest.mark.parametrize("version", ["0.30.0", "0.25.1"])
-def test_grouped_plan_on_an_unmodeled_vllm_version_stays_cold(
-    grouped_case, tmp_path, monkeypatch, version
-):
+def test_grouped_plan_on_an_unmodeled_vllm_version_stays_cold(grouped_case, tmp_path, monkeypatch, version):
     # Replay models grouped prefix caching for vLLM 0.31.0, 0.32.0 and 0.33.0 only, so a hand-made profile of another
     # version with evidence and markers plans the cold replay that it planned before.
     profile, _root = grouped_case
     profile = _with_prefix_evidence(profile, version=version)
-    plan, output = _plan_and_validate_weka(
-        profile, tmp_path, monkeypatch, version=version, context_length=1024
-    )
+    plan, output = _plan_and_validate_weka(profile, tmp_path, monkeypatch, version=version, context_length=1024)
     for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
-        worker = yaml.safe_load((plan / name).read_text())["engine"]["workers"][
-            "aggregated"
-        ]
+        worker = yaml.safe_load((plan / name).read_text())["engine"]["workers"]["aggregated"]
         assert worker["kv_cache"]["prefix_caching"] is False
     assert json.loads((output / "validation.json").read_text())["status"] == "covered"
 
@@ -1689,27 +1540,16 @@ def test_grouped_plan_that_fails_a_prefix_caching_requirement_stays_cold(
             resources["runtime_memory"]["mamba_cache_mode"] = "none"
         else:
             resources["cache_groups"].append(dict(_CONVOLUTION_GROUP))
-    plan, output = _plan_and_validate_weka(
-        profile, tmp_path, monkeypatch, version="0.31.0", context_length=1024
-    )
+    plan, output = _plan_and_validate_weka(profile, tmp_path, monkeypatch, version="0.31.0", context_length=1024)
     for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
-        worker = yaml.safe_load((plan / name).read_text())["engine"]["workers"][
-            "aggregated"
-        ]
+        worker = yaml.safe_load((plan / name).read_text())["engine"]["workers"]["aggregated"]
         assert worker["kv_cache"]["prefix_caching"] is False
     assert json.loads((output / "validation.json").read_text())["status"] == "covered"
-    assert (
-        json.loads((output / "prediction/prediction.json").read_text())[
-            "completed_requests"
-        ]
-        == 2
-    )
+    assert json.loads((output / "prediction/prediction.json").read_text())["completed_requests"] == 2
 
 
 @pytest.mark.parametrize("prefix_caching", [False, True])
-def test_grouped_sweeper_candidate_rank_takes_the_probe_hash_block(
-    grouped_case, prefix_caching
-):
+def test_grouped_sweeper_candidate_rank_takes_the_probe_hash_block(grouped_case, prefix_caching):
     from aisim.sweeper.config import SearchSpace
     from aisim.sweeper.deploy import build_backend_deployment
     from aisim.sweeper.parallel_enum import ParallelShape, ReplicaParallelConfig
@@ -1729,9 +1569,7 @@ def test_grouped_sweeper_candidate_rank_takes_the_probe_hash_block(
             "agg_max_num_batched_tokens": 128,
             "agg_max_num_seqs": 4,
         },
-        parallel_config=ReplicaParallelConfig(
-            ParallelShape(tp=2, dp=1, moe_tp=2, moe_ep=1), replicas=1
-        ),
+        parallel_config=ReplicaParallelConfig(ParallelShape(tp=2, dp=1, moe_tp=2, moe_ep=1), replicas=1),
     )
     args = build_backend_deployment(sample, backend_version="0.31.0").agg_engine_args
     if prefix_caching:
@@ -1746,9 +1584,7 @@ def test_grouped_sweeper_candidate_rank_takes_the_probe_hash_block(
 
 
 @reads_saved_config
-def test_grouped_prefix_caching_recommendation_replays_every_candidate(
-    grouped_case, tmp_path, monkeypatch
-):
+def test_grouped_prefix_caching_recommendation_replays_every_candidate(grouped_case, tmp_path, monkeypatch):
     from aisim.recommend import _run_recommendation
     from aisim.sweeper import SweepResult
     from aisim.sweeper.result import CandidateStatus
@@ -1768,9 +1604,7 @@ def test_grouped_prefix_caching_recommendation_replays_every_candidate(
     result = SweepResult.from_json((output / "recommendation.json").read_text())
     # Both topologies replay. A candidate that the Rust gate refused would be failed with "replay failed".
     assert len(result.candidates) == 2
-    assert all(
-        candidate.status is CandidateStatus.FEASIBLE for candidate in result.candidates
-    )
+    assert all(candidate.status is CandidateStatus.FEASIBLE for candidate in result.candidates)
     exported = CorePredictionConfig.from_yaml(output / "recommendations/0001.yaml")
     assert exported.engine.workers.aggregated.kv_cache.prefix_caching is True
 
@@ -1799,9 +1633,7 @@ def test_grouped_sweeper_checks_each_candidate_budget_before_replay(grouped_case
             "agg_max_num_batched_tokens": 8190,
             "agg_max_num_seqs": 4,
         },
-        parallel_config=ReplicaParallelConfig(
-            ParallelShape(tp=2, dp=1, moe_tp=2, moe_ep=1), replicas=1
-        ),
+        parallel_config=ReplicaParallelConfig(ParallelShape(tp=2, dp=1, moe_tp=2, moe_ep=1), replicas=1),
     )
     with pytest.raises(ValueError, match="max_batched_tokens that are multiples of 4"):
         build_backend_deployment(sample, backend_version="0.31.0")
@@ -1833,22 +1665,13 @@ def _onboarding_plan(profile, tmp_path, capsys, version, runtime_version=None):
         }
     )
     path = tmp_path / "request.yaml"
-    path.write_text(
-        yaml.safe_dump(
-            request.model_dump(mode="json", exclude_none=True), sort_keys=False
-        )
-    )
+    path.write_text(yaml.safe_dump(request.model_dump(mode="json", exclude_none=True), sort_keys=False))
     plan = tmp_path / "collection"
     capsys.readouterr()
-    assert (
-        cli.main(["onboard", "plan", "--config", str(path), "--output-dir", str(plan)])
-        == 0
-    )
+    assert cli.main(["onboard", "plan", "--config", str(path), "--output-dir", str(plan)]) == 0
     stderr = capsys.readouterr().err
     files = {
-        str(item.relative_to(plan)): item.read_bytes().replace(
-            str(tmp_path).encode(), b"<tmp>"
-        )
+        str(item.relative_to(plan)): item.read_bytes().replace(str(tmp_path).encode(), b"<tmp>")
         for item in sorted(plan.rglob("*"))
         if item.is_file()
     }
@@ -1891,30 +1714,22 @@ def test_grouped_plan_prints_no_prefix_caching_note_without_probe_prefix_caching
     profile = _with_prefix_evidence(_with_state_group(profile), version=version)
     if not probe_prefix_caching:
         for deployment in profile["deployments"]:
-            deployment["resources"]["runtime_memory"].update(
-                enable_prefix_caching=False, mamba_cache_mode="none"
-            )
+            deployment["resources"]["runtime_memory"].update(enable_prefix_caching=False, mamba_cache_mode="none")
     stderr, files = _onboarding_plan(profile, tmp_path, capsys, version)
     assert "prefix caching" not in stderr
-    worker = yaml.safe_load(files["predict/pilot.yaml"])["engine"]["workers"][
-        "aggregated"
-    ]
+    worker = yaml.safe_load(files["predict/pilot.yaml"])["engine"]["workers"]["aggregated"]
     assert worker["kv_cache"]["prefix_caching"] is probe_prefix_caching
 
 
 @reads_saved_config
 @pytest.mark.parametrize("label", ["0.31.0", "0.32.0", "custom-vllm"])
-def test_grouped_plan_decides_prefix_caching_by_the_observed_vllm_version(
-    grouped_case, tmp_path, capsys, label
-):
+def test_grouped_plan_decides_prefix_caching_by_the_observed_vllm_version(grouped_case, tmp_path, capsys, label):
     # `onboard probe-runtime` keeps an explicit dataset label and records the vLLM version that it observed as
     # runtime_framework_version. The evidence is that of vLLM 0.33.0, which has grouped rules, but the label differs
     # and replay would take the rules of the label. The plan stays cold, and the note names both versions.
     profile, _root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile), version=label)
-    stderr, files = _onboarding_plan(
-        profile, tmp_path, capsys, label, runtime_version="0.33.0"
-    )
+    stderr, files = _onboarding_plan(profile, tmp_path, capsys, label, runtime_version="0.33.0")
     assert stderr.strip() == _label_differs("0.33.0", label)
     for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
         worker = yaml.safe_load(files[name])["engine"]["workers"]["aggregated"]
@@ -1931,9 +1746,7 @@ def _label_differs(version, label):
 
 @reads_saved_config
 @pytest.mark.parametrize("label", ["custom-vllm", "0.33.0", "0.30.0"])
-def test_grouped_plan_with_modeled_evidence_under_another_label_is_cold(
-    grouped_case, tmp_path, capsys, label
-):
+def test_grouped_plan_with_modeled_evidence_under_another_label_is_cold(grouped_case, tmp_path, capsys, label):
     # The evidence is of vLLM 0.32.0, which has grouped rules, but replay would take the rules of the label. The plan
     # stays cold and says why, and so does the plan that the runtime resolution of collect-fpm writes.
     from aisim.support import versioning
@@ -1943,9 +1756,7 @@ def test_grouped_plan_with_modeled_evidence_under_another_label_is_cold(
     profile = _with_prefix_evidence(_with_state_group(profile), version=label)
     for name in ("observed", "label"):
         (tmp_path / name).mkdir()
-    stderr, files = _onboarding_plan(
-        profile, tmp_path / "observed", capsys, label, runtime_version="0.32.0"
-    )
+    stderr, files = _onboarding_plan(profile, tmp_path / "observed", capsys, label, runtime_version="0.32.0")
     assert stderr.strip() == _label_differs("0.32.0", label)
     for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
         worker = yaml.safe_load(files[name])["engine"]["workers"]["aggregated"]
@@ -1954,9 +1765,7 @@ def test_grouped_plan_with_modeled_evidence_under_another_label_is_cold(
     stderr, _files = _onboarding_plan(profile, tmp_path / "label", capsys, label)
     request = SupportRequest.from_yaml(tmp_path / "label" / "request.yaml")
     original = versioning.detect_runtime_versions
-    versioning.detect_runtime_versions = lambda deployment: {
-        "backend_version": "0.32.0"
-    }
+    versioning.detect_runtime_versions = lambda deployment: {"backend_version": "0.32.0"}
     try:
         resolved, root = versioning.resolve_runtime_request(
             request,
@@ -1966,9 +1775,7 @@ def test_grouped_plan_with_modeled_evidence_under_another_label_is_cold(
     finally:
         versioning.detect_runtime_versions = original
     assert resolved.identity.runtime_framework_version == "0.32.0"
-    worker = yaml.safe_load((root / "predict/pilot.yaml").read_text())["engine"][
-        "workers"
-    ]["aggregated"]
+    worker = yaml.safe_load((root / "predict/pilot.yaml").read_text())["engine"]["workers"]["aggregated"]
     assert worker["kv_cache"]["prefix_caching"] is False
 
 
@@ -2020,9 +1827,7 @@ def _plan_cold_like_an_earlier_planner(monkeypatch):
 
 def _prefix_caching_of(plan):
     return [
-        yaml.safe_load((plan / name).read_text())["engine"]["workers"]["aggregated"][
-            "kv_cache"
-        ]["prefix_caching"]
+        yaml.safe_load((plan / name).read_text())["engine"]["workers"]["aggregated"]["kv_cache"]["prefix_caching"]
         for name in ("predict/pilot.yaml", "recommend/pilot.yaml")
     ]
 
@@ -2040,9 +1845,7 @@ def test_grouped_plan_saved_cold_by_an_earlier_planner_still_verifies(
     profile = _with_prefix_evidence(profile, version=version)
     original = _plan_cold_like_an_earlier_planner(monkeypatch)
     # validate-fpm verifies the saved plan before its replay and after it, and returns 0 only when both pass.
-    plan, _output = _plan_and_validate_weka(
-        profile, tmp_path, monkeypatch, version=version, context_length=1024
-    )
+    plan, _output = _plan_and_validate_weka(profile, tmp_path, monkeypatch, version=version, context_length=1024)
     assert _prefix_caching_of(plan) == [False, False]
     config = plan / "request.yaml"
     request = SupportRequest.from_yaml(config)
@@ -2118,9 +1921,7 @@ def test_grouped_plan_saved_cold_refuses_any_other_change(
 
     profile, _root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile), version=version)
-    monkeypatch.setattr(
-        plan_module, "grouped_prefix_caching_requirements", _refuse_prefix_caching
-    )
+    monkeypatch.setattr(plan_module, "grouped_prefix_caching_requirements", _refuse_prefix_caching)
     _onboarding_plan(profile, tmp_path, capsys, version)
     monkeypatch.undo()
     plan = tmp_path / "collection"
@@ -2134,16 +1935,12 @@ def test_grouped_plan_saved_cold_refuses_any_other_change(
             # Prefix caching on in both pilots is the plan of the planner for a version with grouped rules. A vLLM
             # 0.30.0 profile has no grouped rules and plans cold under both planners, so there it is a rendering of
             # neither.
-            pilot["engine"]["workers"]["aggregated"]["kv_cache"]["prefix_caching"] = (
-                True
-            )
+            pilot["engine"]["workers"]["aggregated"]["kv_cache"]["prefix_caching"] = True
         # The hashes of the plan are written again, so only the comparison with the renderings can refuse it.
         data = yaml.safe_dump(pilot, sort_keys=False).encode()
         (plan / name).write_bytes(data)
         saved["generated_files_sha256"][name] = hashlib.sha256(data).hexdigest()
-    (plan / "support-plan.json").write_text(
-        json.dumps(saved, indent=2, sort_keys=True) + "\n"
-    )
+    (plan / "support-plan.json").write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n")
     request = SupportRequest.from_yaml(plan / "request.yaml")
     if not refused:
         plan_module.check_plan(request, plan)
@@ -2156,18 +1953,14 @@ def test_grouped_plan_saved_cold_refuses_any_other_change(
 
 
 @reads_saved_config
-def test_a_grouped_vllm_0330_plan_saved_cold_still_verifies(
-    grouped_case, tmp_path, capsys, monkeypatch
-):
+def test_a_grouped_vllm_0330_plan_saved_cold_still_verifies(grouped_case, tmp_path, capsys, monkeypatch):
     # Before replay had grouped rules for vLLM 0.33.0, the planner wrote this profile's plan cold, the same bytes as
     # the earlier planner writes.
     from aisim.support import plan as plan_module
 
     profile, _root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile), version="0.33.0")
-    monkeypatch.setattr(
-        plan_module, "grouped_prefix_caching_requirements", _refuse_prefix_caching
-    )
+    monkeypatch.setattr(plan_module, "grouped_prefix_caching_requirements", _refuse_prefix_caching)
     _onboarding_plan(profile, tmp_path, capsys, "0.33.0")
     monkeypatch.undo()
     plan = tmp_path / "collection"
@@ -2179,9 +1972,7 @@ def test_a_grouped_vllm_0330_plan_saved_cold_still_verifies(
     assert pilot.read_bytes() == before
     # A changed file of the saved plan is still refused.
     pilot.write_bytes(before.replace(b"prefix_caching: false", b"prefix_caching: true"))
-    with pytest.raises(
-        ValueError, match="was modified or missing; choose a new output directory"
-    ):
+    with pytest.raises(ValueError, match="was modified or missing; choose a new output directory"):
         plan_module.check_plan(request, plan)
     pilot.write_bytes(before)
     # `onboard plan --overwrite` writes the plan of the planner, which turns prefix caching on.
@@ -2216,23 +2007,17 @@ def test_a_version_without_rules_plans_the_same_bytes_under_the_earlier_planner(
     profile = _with_prefix_evidence(_with_state_group(profile), version=version)
     _stderr, files = _onboarding_plan(profile, tmp_path, capsys, version)
     (tmp_path / "collection").rename(tmp_path / "planner")
-    monkeypatch.setattr(
-        plan_module, "grouped_prefix_caching_requirements", _refuse_prefix_caching
-    )
+    monkeypatch.setattr(plan_module, "grouped_prefix_caching_requirements", _refuse_prefix_caching)
     _stderr, earlier = _onboarding_plan(profile, tmp_path, capsys, version)
     assert files == earlier
-    worker = yaml.safe_load(files["predict/pilot.yaml"])["engine"]["workers"][
-        "aggregated"
-    ]
+    worker = yaml.safe_load(files["predict/pilot.yaml"])["engine"]["workers"]["aggregated"]
     assert worker["kv_cache"]["prefix_caching"] is False
 
 
 @reads_saved_config
 @pytest.mark.parametrize("case", ["unmarked_group", "non_cacheable_window"])
 @pytest.mark.parametrize("version", ["0.31.0", "0.32.0", "0.33.0"])
-def test_the_marker_and_window_refusals_hold_on_each_version(
-    grouped_case, tmp_path, capsys, case, version
-):
+def test_the_marker_and_window_refusals_hold_on_each_version(grouped_case, tmp_path, capsys, case, version):
     from aisim.sweeper.config import SearchSpace
 
     error = {
@@ -2250,9 +2035,7 @@ def test_the_marker_and_window_refusals_hold_on_each_version(
             assert groups[1]["kind"] == "attention" and groups[1]["sliding_window"]
             groups[1]["prefix_cacheable"] = False
     with pytest.raises(ValidationError, match=error):
-        CorePredictionConfig.model_validate(
-            _prefix_caching_prediction(profile, root, version)
-        )
+        CorePredictionConfig.model_validate(_prefix_caching_prediction(profile, root, version))
     with pytest.raises(ValidationError, match=error):
         SearchSpace.model_validate(_prefix_search(profile, root, version))
     stderr, _files = _onboarding_plan(profile, tmp_path, capsys, version)
@@ -2261,31 +2044,23 @@ def test_the_marker_and_window_refusals_hold_on_each_version(
 
 
 @pytest.mark.parametrize("label,recorded", [("0.32.0", "0.33.0"), ("0.33.0", "0.32.0")])
-def test_grouped_prefix_caching_refuses_evidence_of_another_vllm_version(
-    grouped_case, label, recorded
-):
+def test_grouped_prefix_caching_refuses_evidence_of_another_vllm_version(grouped_case, label, recorded):
     # A profile that records the evidence of one vLLM version under the label of another cannot replay with the rules
     # of the label.
     from aisim.sweeper.config import SearchSpace
 
     profile, root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile), version=label)
-    CorePredictionConfig.model_validate(
-        _prefix_caching_prediction(profile, root, label)
-    )
+    CorePredictionConfig.model_validate(_prefix_caching_prediction(profile, root, label))
     SearchSpace.model_validate(_prefix_search(profile, root, label))
     for deployment in profile["deployments"]:
-        deployment["resources"]["runtime_memory"]["runtime_framework_version"] = (
-            recorded
-        )
+        deployment["resources"]["runtime_memory"]["runtime_framework_version"] = recorded
     error = (
         rf"grouped FPM cache prefix caching requires runtime_memory.runtime_framework_version \({recorded}\) to equal "
         rf"the deployment's backend_version \({label}\)"
     )
     with pytest.raises(ValidationError, match=error):
-        CorePredictionConfig.model_validate(
-            _prefix_caching_prediction(profile, root, label)
-        )
+        CorePredictionConfig.model_validate(_prefix_caching_prediction(profile, root, label))
     with pytest.raises(ValidationError, match=error):
         SearchSpace.model_validate(_prefix_search(profile, root, label))
     # With prefix caching off, the profile replays cold as before.
@@ -2310,9 +2085,7 @@ def test_grouped_prefix_caching_on_vllm_0330_refuses_a_prefill_schedule_interval
     profile, root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile), version=version)
     raw = _prefix_caching_prediction(profile, root, version)
-    raw["engine"]["workers"]["aggregated"]["scheduler"]["prefill_schedule_interval"] = (
-        interval
-    )
+    raw["engine"]["workers"]["aggregated"]["scheduler"]["prefill_schedule_interval"] = interval
     if not refused:
         CorePredictionConfig.model_validate(raw)
         return
@@ -2331,9 +2104,7 @@ def test_grouped_plan_with_recorded_evidence_of_another_version_is_cold(
     profile, _root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile), version=label)
     for deployment in profile["deployments"]:
-        deployment["resources"]["runtime_memory"]["runtime_framework_version"] = (
-            recorded
-        )
+        deployment["resources"]["runtime_memory"]["runtime_framework_version"] = recorded
     stderr, files = _onboarding_plan(profile, tmp_path, capsys, label)
     assert stderr.strip() == _label_differs(recorded, label)
     for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
@@ -2342,31 +2113,21 @@ def test_grouped_plan_with_recorded_evidence_of_another_version_is_cold(
 
 
 @reads_saved_config
-def test_grouped_vllm_0330_plan_with_an_unmarked_window_group_is_cold_without_a_note(
-    grouped_case, tmp_path, capsys
-):
+def test_grouped_vllm_0330_plan_with_an_unmarked_window_group_is_cold_without_a_note(grouped_case, tmp_path, capsys):
     # The probe import writes no prefix_cacheable for a group with a SlidingWindowMLASpec layer. The version has
     # rules and equals the label, so no note blames the version.
     profile, root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile), version="0.33.0")
     for deployment in profile["deployments"]:
-        window = next(
-            group
-            for group in deployment["resources"]["cache_groups"]
-            if group.get("sliding_window")
-        )
+        window = next(group for group in deployment["resources"]["cache_groups"] if group.get("sliding_window"))
         del window["prefix_cacheable"]
     stderr, files = _onboarding_plan(profile, tmp_path, capsys, "0.33.0")
     assert "prefix caching" not in stderr
     for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
         worker = yaml.safe_load(files[name])["engine"]["workers"]["aggregated"]
         assert worker["kv_cache"]["prefix_caching"] is False
-    with pytest.raises(
-        ValidationError, match="every cache group to declare prefix_cacheable"
-    ):
-        CorePredictionConfig.model_validate(
-            _prefix_caching_prediction(profile, root, "0.33.0")
-        )
+    with pytest.raises(ValidationError, match="every cache group to declare prefix_cacheable"):
+        CorePredictionConfig.model_validate(_prefix_caching_prediction(profile, root, "0.33.0"))
 
 
 def test_grouped_vllm_0330_profile_without_checkpoint_fields_is_refused_by_native_replay(
@@ -2382,9 +2143,7 @@ def test_grouped_vllm_0330_profile_without_checkpoint_fields_is_refused_by_nativ
         for group in deployment["resources"]["cache_groups"]:
             group.pop("prefill_checkpoint_blocks", None)
     _write_timings(root, profile, version="0.33.0")
-    config = CorePredictionConfig.model_validate(
-        _prefix_caching_prediction(profile, root, "0.33.0")
-    )
+    config = CorePredictionConfig.model_validate(_prefix_caching_prediction(profile, root, "0.33.0"))
     error = "kv_cache_groups with vllm_version=0.33.0 require prefill_checkpoint_blocks on every prefix-cacheable state"
     with pytest.raises(RuntimeError, match=error):
         EngineReplayRunnerFactory().create(0).run(prediction_to_replay_spec(config))
@@ -2453,9 +2212,7 @@ def _glm_shaped_profile(profile, version):
             "comm_overhead_bytes",
         ):
             resources.pop(name)
-        resources.update(
-            cache_groups=deepcopy(groups), max_num_tokens=8192, max_batch_size=4
-        )
+        resources.update(cache_groups=deepcopy(groups), max_num_tokens=8192, max_batch_size=4)
         resources["runtime_memory"] = {
             "kv_cache_bytes": 64 * _GLM_PAGE,
             "gpu_memory_utilization": 0.9,
@@ -2469,9 +2226,7 @@ def _glm_shaped_profile(profile, version):
 
 
 @pytest.mark.parametrize("version", ["0.31.0", "0.32.0", "0.33.0"])
-def test_glm_shaped_grouped_profile_replays_a_multi_turn_trace_with_hits(
-    grouped_case, tmp_path, monkeypatch, version
-):
+def test_glm_shaped_grouped_profile_replays_a_multi_turn_trace_with_hits(grouped_case, tmp_path, monkeypatch, version):
     # A trace has no known host memory peak, so the CLI replays it only in a supervised child. Model the
     # supervisor context of that child, as test_unified_cli.py does.
     monkeypatch.setenv(
@@ -2489,9 +2244,7 @@ def test_glm_shaped_grouped_profile_replays_a_multi_turn_trace_with_hits(
     )
     profile, root = grouped_case
     profile = _glm_shaped_profile(profile, version)
-    (Path(profile["model"]) / "config.json").write_text(
-        json.dumps({"architectures": [profile["architecture"]]})
-    )
+    (Path(profile["model"]) / "config.json").write_text(json.dumps({"architectures": [profile["architecture"]]}))
     import aisim_core
 
     # The real H200 memory holds the 64 GLM pages that the tiny fake GPU of grouped_case cannot.
@@ -2573,6 +2326,4 @@ def test_glm_shaped_grouped_profile_replays_a_multi_turn_trace_with_hits(
         10880,
         0,
     ]
-    assert report["prefix_cache_reused_ratio"] == pytest.approx(
-        (8704 + 10880) / (9000 + 13000 + 13100 + 8704)
-    )
+    assert report["prefix_cache_reused_ratio"] == pytest.approx((8704 + 10880) / (9000 + 13000 + 13100 + 8704))

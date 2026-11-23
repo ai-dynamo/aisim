@@ -45,11 +45,7 @@ def _config():
             "nextn_accepted": 1.25,
             "enable_chunked_prefill": True,
             **CONTROLS,
-            "workers": {
-                "aggregated": {
-                    "kv_cache": {"capacity": {"type": "fixed", "blocks": 128}}
-                }
-            },
+            "workers": {"aggregated": {"kv_cache": {"capacity": {"type": "fixed", "blocks": 128}}}},
         },
         "traffic": {
             "source": {
@@ -79,9 +75,7 @@ def test_prediction_preserves_controls_in_canonical_timing_and_runtime():
     assert rank["enable_chunked_prefill"] is True
     assert "aic_gemm_dtype" not in rank
     assert spec.workload["cached_prefix_tokens"] == 3
-    metadata = spec.backend_deployment.performance_model_metadata["aggregated"][
-        "config"
-    ]
+    metadata = spec.backend_deployment.performance_model_metadata["aggregated"]["config"]
     assert {name: metadata[name] for name in ENGINE_MODEL_CONTROL_FIELDS} == CONTROLS
     assert metadata["nextn"] == 2
 
@@ -98,9 +92,7 @@ def test_recommendation_candidate_round_trip_keeps_request_and_identity():
             "agg_max_num_batched_tokens": 8192,
             "agg_max_num_seqs": 256,
         },
-        parallel_config=ReplicaParallelConfig(
-            ParallelShape(tp=8, dp=1, moe_tp=1, moe_ep=8), replicas=1
-        ),
+        parallel_config=ReplicaParallelConfig(ParallelShape(tp=8, dp=1, moe_tp=1, moe_ep=8), replicas=1),
     )
     request = ForwardPassEstimatorResolver(space)._request(sample, "agg")
     identity = request.to_dict()
@@ -110,9 +102,7 @@ def test_recommendation_candidate_round_trip_keeps_request_and_identity():
     with pytest.raises(ValueError, match="require a resolved canonical"):
         build_backend_deployment(sample, backend_version="0.5.14")
     resolved = ForwardPassEstimatorSpec(config=identity)
-    deployment = build_backend_deployment(
-        sample, backend_version="0.5.14", forward_pass_estimators={"agg": resolved}
-    )
+    deployment = build_backend_deployment(sample, backend_version="0.5.14", forward_pass_estimators={"agg": resolved})
     spec = ReplaySpec(
         backend_deployment=deployment,
         workload=smart.workload.model_dump(mode="json"),
@@ -120,9 +110,7 @@ def test_recommendation_candidate_round_trip_keeps_request_and_identity():
     )
     predicted = _candidate_prediction(source, sample, spec, adapter_sections={})
     roundtrip = CorePredictionConfig.model_validate(predicted)
-    assert {
-        name: getattr(roundtrip.engine, name) for name in ENGINE_MODEL_CONTROL_FIELDS
-    } == CONTROLS
+    assert {name: getattr(roundtrip.engine, name) for name in ENGINE_MODEL_CONTROL_FIELDS} == CONTROLS
     assert roundtrip.engine.nextn == 2
     assert roundtrip.engine.nextn_accepted == 1.25
     assert roundtrip.traffic.source.cached_prefix_tokens == 3
@@ -144,9 +132,7 @@ def test_rejects_invalid_engine_request_controls(field, value):
         CorePredictionConfig.model_validate(raw)
 
 
-@pytest.mark.parametrize(
-    "field", ["enable_eplb", "moe_backend", "gemm_quant_mode", "nextn"]
-)
+@pytest.mark.parametrize("field", ["enable_eplb", "moe_backend", "gemm_quant_mode", "nextn"])
 def test_rejects_controls_on_custom_timing(field):
     raw = _config()
     raw["engine"] = {
@@ -169,9 +155,7 @@ def test_rejects_controls_on_custom_timing(field):
 @pytest.mark.parametrize("value", [-1, True, 1.5, 9])
 def test_exact_prefix_rejects_invalid_lengths(value):
     with pytest.raises(ValidationError):
-        Workload(
-            isl=8, osl=2, concurrency=1, request_count=2, cached_prefix_tokens=value
-        )
+        Workload(isl=8, osl=2, concurrency=1, request_count=2, cached_prefix_tokens=value)
 
 
 def test_exact_prefix_must_fit_shortest_random_input():
@@ -217,18 +201,8 @@ def test_kv_relative_capacity_cache_separates_model_controls(monkeypatch):
     )
     shape = ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1)
     try:
-        assert (
-            kv._per_rank_capacity_tokens(
-                shape, **common, model_controls=(("kvcache_quant_mode", "fp8"),)
-            )
-            == 128
-        )
-        assert (
-            kv._per_rank_capacity_tokens(
-                shape, **common, model_controls=(("kvcache_quant_mode", "bfloat16"),)
-            )
-            == 64
-        )
+        assert kv._per_rank_capacity_tokens(shape, **common, model_controls=(("kvcache_quant_mode", "fp8"),)) == 128
+        assert kv._per_rank_capacity_tokens(shape, **common, model_controls=(("kvcache_quant_mode", "bfloat16"),)) == 64
         assert len(calls) == 2
     finally:
         kv._per_rank_capacity_tokens.cache_clear()
@@ -246,9 +220,7 @@ def test_kv_relative_capacity_cache_separates_model_controls(monkeypatch):
 def test_core_rejects_invalid_identity_before_data_fallback(overrides):
     from aisim_core.sdk import RustForwardPassPerfModel
 
-    with pytest.raises(
-        (ValueError, RuntimeError), match="(wideep_num_slots|moe_backend|EPLB)"
-    ):
+    with pytest.raises((ValueError, RuntimeError), match="(wideep_num_slots|moe_backend|EPLB)"):
         RustForwardPassPerfModel.best_available(
             {
                 "model": "model",
@@ -265,17 +237,11 @@ def test_migration_example_parses_and_preserves_shared_prefix():
 
     import yaml
 
-    text = (
-        Path(__file__).parents[2] / "docs/aic-backward-compatibility/migration.md"
-    ).read_text()
+    text = (Path(__file__).parents[2] / "docs/aic-backward-compatibility/migration.md").read_text()
     example = (
-        text.split("### Preserve pinned engine and request controls", 1)[1]
-        .split("```yaml", 1)[1]
-        .split("```", 1)[0]
+        text.split("### Preserve pinned engine and request controls", 1)[1].split("```yaml", 1)[1].split("```", 1)[0]
     )
-    smart = recommendation_to_sweeper(
-        CoreRecommendationConfig.model_validate(yaml.safe_load(example))
-    )
+    smart = recommendation_to_sweeper(CoreRecommendationConfig.model_validate(yaml.safe_load(example)))
     assert smart.workload.cached_prefix_tokens == 256
     assert smart.search_space.kvcache_quant_mode == "fp8"
     assert smart.search_space.agg_gpu_memory_utilization == 0.85
@@ -304,42 +270,23 @@ def test_kv_transfer_bytes_honor_explicit_quantization(tmp_path):
     )
     # K+V, two KV heads per TP rank, width eight, two layers: 64 elements/token.
     kwargs = {"tp_size": 2, "pp_size": 1}
-    assert (
-        estimate_kv_bytes_per_token(
-            str(tmp_path), **kwargs, kvcache_quant_mode="bfloat16"
-        )
-        == 128
-    )
-    assert (
-        estimate_kv_bytes_per_token(str(tmp_path), **kwargs, kvcache_quant_mode="fp8")
-        == 64
-    )
+    assert estimate_kv_bytes_per_token(str(tmp_path), **kwargs, kvcache_quant_mode="bfloat16") == 128
+    assert estimate_kv_bytes_per_token(str(tmp_path), **kwargs, kvcache_quant_mode="fp8") == 64
 
 
 def test_kv_transfer_bytes_keep_fractional_nvfp4_width():
     from aisim.capacity import estimate_kv_bytes_per_token
 
     # Qwen3-8B: K+V * 8 KV heads * 36 layers * (128 // 2 + 128 // 16 = 72 bytes), as vLLM sizes it.
-    assert (
-        estimate_kv_bytes_per_token(
-            "Qwen/Qwen3-8B", tp_size=1, pp_size=1, kvcache_quant_mode="nvfp4"
-        )
-        == 41_472
-    )
+    assert estimate_kv_bytes_per_token("Qwen/Qwen3-8B", tp_size=1, pp_size=1, kvcache_quant_mode="nvfp4") == 41_472
 
 
-@pytest.mark.parametrize(
-    "model", ["deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-V4.1-Flash"]
-)
+@pytest.mark.parametrize("model", ["deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-V4.1-Flash"])
 def test_kv_transfer_bytes_refuse_nvfp4_for_latent_caches(model):
     from aisim.capacity import estimate_kv_bytes_per_token
 
-    with pytest.raises(
-        ValueError, match="nvfp4 KV cache is modeled only for standard K/V attention"
-    ):
-        estimate_kv_bytes_per_token(
-            model, tp_size=8, pp_size=1, kvcache_quant_mode="nvfp4"
-        )
+    with pytest.raises(ValueError, match="nvfp4 KV cache is modeled only for standard K/V attention"):
+        estimate_kv_bytes_per_token(model, tp_size=8, pp_size=1, kvcache_quant_mode="nvfp4")
 
 
 def test_memory_preflight_preserves_same_model_controls(monkeypatch):
@@ -410,9 +357,7 @@ def test_capacity_rejects_invalid_slots_before_delegate(slots, monkeypatch):
     [{"enable_eplb": True}, {"wideep_num_slots": 128}, {"moe_backend": "deepep_moe"}],
 )
 @pytest.mark.parametrize("is_moe", [False, True])
-def test_memory_cannot_drop_moe_controls_in_naive_fallback(
-    monkeypatch, controls, is_moe
-):
+def test_memory_cannot_drop_moe_controls_in_naive_fallback(monkeypatch, controls, is_moe):
     from aisim_core.sdk import memory, models
 
     monkeypatch.setattr(models, "check_is_moe", lambda _: is_moe)
@@ -456,15 +401,8 @@ def test_kv_quantization_auto_aliases_preserve_model_dtype(monkeypatch, alias):
         "aisimulate_core.sdk.utils._load_model_config_from_model_path",
         lambda *a, **k: {"architectures": ["LlamaForCausalLM"]},
     )
-    monkeypatch.setattr(
-        NaiveKVCacheEstimator, "from_hf_config", lambda *a, **k: estimator
-    )
-    assert (
-        estimate_kv_bytes_per_token(
-            "model", tp_size=1, pp_size=1, kvcache_quant_mode=alias
-        )
-        == 200
-    )
+    monkeypatch.setattr(NaiveKVCacheEstimator, "from_hf_config", lambda *a, **k: estimator)
+    assert estimate_kv_bytes_per_token("model", tp_size=1, pp_size=1, kvcache_quant_mode=alias) == 200
 
 
 @pytest.fixture
@@ -479,9 +417,7 @@ def k31_token_geometry_config(tmp_path):
     raw["architectures"] = ["KimiK31ForConditionalGeneration"]
     raw["model_type"] = "kimi_k31"
     raw["text_config"]["dsa_config"] = {
-        "dsa_layers": list(
-            raw["text_config"]["linear_attn_config"]["full_attn_layers"]
-        ),
+        "dsa_layers": list(raw["text_config"]["linear_attn_config"]["full_attn_layers"]),
         "index_topk": 2048,
         "index_head_dim": 128,
         "index_num_heads": 32,
@@ -495,12 +431,8 @@ def k31_token_geometry_config(tmp_path):
 
 
 @pytest.mark.parametrize("tp", [1, 2, 4, 8])
-@pytest.mark.parametrize(
-    "layout,expected", [("flashmla", 18_912), ("trtllm_mla", 16_992)]
-)
-def test_k31_token_geometry_uses_core_layout_without_fixed_state(
-    k31_token_geometry_config, tp, layout, expected
-):
+@pytest.mark.parametrize("layout,expected", [("flashmla", 18_912), ("trtllm_mla", 16_992)])
+def test_k31_token_geometry_uses_core_layout_without_fixed_state(k31_token_geometry_config, tp, layout, expected):
     from aisim.capacity import estimate_kv_bytes_per_token
 
     # 24 DSA layers: packed latent 656 (FlashMLA) / 576 (TRTLLM) bytes
@@ -532,9 +464,7 @@ def test_k31_token_geometry_rejects_ambiguous_layout(k31_token_geometry_config):
         )
 
 
-def test_k31_geometry_reuses_native_metadata_when_remote_fetch_fails(
-    monkeypatch, k31_token_geometry_config
-):
+def test_k31_geometry_reuses_native_metadata_when_remote_fetch_fails(monkeypatch, k31_token_geometry_config):
     import json
     from pathlib import Path
 
@@ -656,9 +586,7 @@ def test_optional_runner_must_advertise_new_request_capabilities():
     legacy = RunnerCapabilities(supported_backend_topologies=(("*", "*"),))
     with pytest.raises(ValueError, match="cached_prefix_tokens"):
         legacy.require_compatible(spec)
-    without_prefix = replace(
-        spec, workload={**spec.workload, "cached_prefix_tokens": 0}
-    )
+    without_prefix = replace(spec, workload={**spec.workload, "cached_prefix_tokens": 0})
     with pytest.raises(ValueError, match="engine model controls"):
         legacy.require_compatible(without_prefix)
     EngineReplayRunnerFactory().capabilities().require_compatible(spec)
@@ -683,9 +611,7 @@ def test_default_prediction_payload_remains_compatible_with_older_runners(moe_ba
     spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
     identity = spec.backend_deployment.agg_engine_args["timing_model"]["config"]
     assert not {"moe_backend", "enable_eplb", "wideep_num_slots"} & identity.keys()
-    RunnerCapabilities(supported_backend_topologies=(("*", "*"),)).require_compatible(
-        spec
-    )
+    RunnerCapabilities(supported_backend_topologies=(("*", "*"),)).require_compatible(spec)
 
 
 def test_memory_cannot_drop_attention_backend_in_naive_fallback(monkeypatch):
@@ -723,9 +649,7 @@ def test_memory_cannot_drop_attention_backend_in_naive_fallback(monkeypatch):
     ],
 )
 @pytest.mark.parametrize("prefix", ["", "aic_"])
-def test_inactive_nested_control_cannot_mask_active_flat_control(
-    name, inactive, active, prefix
-):
+def test_inactive_nested_control_cannot_mask_active_flat_control(name, inactive, active, prefix):
     from aisim.sweeper.replay import BackendDeploymentSpec, RunnerCapabilities
 
     spec = ReplaySpec(
@@ -742,9 +666,7 @@ def test_inactive_nested_control_cannot_mask_active_flat_control(
         goal={},
     )
     with pytest.raises(ValueError, match="engine model controls"):
-        RunnerCapabilities(
-            supported_backend_topologies=(("*", "*"),)
-        ).require_compatible(spec)
+        RunnerCapabilities(supported_backend_topologies=(("*", "*"),)).require_compatible(spec)
 
 
 def test_explicit_default_moe_backend_is_inactive_with_custom_timing():
@@ -775,9 +697,7 @@ def test_explicit_default_moe_backend_is_inactive_with_custom_timing():
             "agg_max_num_batched_tokens": 8192,
             "agg_max_num_seqs": 256,
         },
-        parallel_config=ReplicaParallelConfig(
-            ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), replicas=1
-        ),
+        parallel_config=ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), replicas=1),
     )
     sample["agg_num_gpu_blocks"] = 128
     deployment = build_backend_deployment(sample, backend_version="test")
@@ -826,18 +746,11 @@ def test_naive_auto_token_geometry_rejects_unrepresented_dcp(dcp):
 
     if dcp != 1:
         with pytest.raises(
-            ValueError, match="naive KV geometry.*decode context parallelism"
+            ValueError, match="auto KV geometry dcp_size=4 must divide tp_size=1 and not exceed KV-head replication=1"
         ):
-            estimate_kv_bytes_per_token(
-                "Qwen/Qwen3-32B", tp_size=1, pp_size=1, dcp_size=dcp
-            )
+            estimate_kv_bytes_per_token("Qwen/Qwen3-32B", tp_size=1, pp_size=1, dcp_size=dcp)
     else:
-        assert (
-            estimate_kv_bytes_per_token(
-                "Qwen/Qwen3-32B", tp_size=1, pp_size=1, dcp_size=dcp
-            )
-            > 0
-        )
+        assert estimate_kv_bytes_per_token("Qwen/Qwen3-32B", tp_size=1, pp_size=1, dcp_size=dcp) > 0
 
 
 def test_restored_unknown_estimator_widths_use_concrete_sample():
@@ -854,9 +767,7 @@ def test_restored_unknown_estimator_widths_use_concrete_sample():
             "attention_dp": "unknown",
         }
     )
-    actual = _kv_geometry_args(
-        sample, "agg", backend_version="0.5.21", estimator=estimator
-    )
+    actual = _kv_geometry_args(sample, "agg", backend_version="0.5.21", estimator=estimator)
     assert {
         key: actual[key]
         for key in (

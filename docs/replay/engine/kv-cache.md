@@ -915,6 +915,11 @@ profile, including the `KimiLinearForCausalLM` decoder architecture. A fitted
 estimator, including a restored snapshot, without either must retain readable
 checkpoint architecture metadata, or supply explicit state geometry. Replay reports an error if it
 cannot verify the architecture; renaming a checkpoint does not bypass the check.
+This also applies to non-Kimi fitted snapshots with explicit `capacity.blocks`.
+To migrate an existing snapshot, retain or restore its `config.json` at the
+saved model path (weights are unnecessary), or provide explicit manual state
+geometry under the vLLM G1 contract above. Restoring timing alone remains
+checkpoint-independent; it does not establish the cache resources for Replay.
 
 For DeepSeek V4, `state_cache: {}` follows vLLM's allocation. vLLM stores
 `fp8_ds_mla` KV and gives every cache group the same pool row, as wide as the

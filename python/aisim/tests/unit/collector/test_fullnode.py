@@ -385,11 +385,14 @@ def _run_with_real_checkpoint(
     failed_cases=(),
     resume=False,
     retry_failed=False,
+    run_error=False,
 ):
     calls = []
 
     def run_cases(*, perf_filename, limit, cases):
         calls.append(list(cases))
+        if run_error:
+            raise RuntimeError("launcher failed before producing a row")
         return {"succeeded": len(cases) - len(failed_cases), "failed": list(failed_cases)}
 
     monkeypatch.setitem(
@@ -430,6 +433,49 @@ def _run_with_real_checkpoint(
 def _checkpoint_sets(path):
     data = json.loads(path.read_text(encoding="utf-8"))
     return {key: set(data.get(key, [])) for key in ("done", "failed", "attempted")}
+
+
+def test_successful_retry_retains_run_diagnostic_without_unresolved_summary(monkeypatch, tmp_path):
+    cases = [{"shape": 1}]
+    errors, _, checkpoint = _run_with_real_checkpoint(monkeypatch, tmp_path, cases=cases, run_error=True)
+    assert errors[0]["error_type"] == "FullNodeCollectionFailure"
+    assert _checkpoint_sets(checkpoint)["failed"]
+
+    errors, calls, _ = _run_with_real_checkpoint(monkeypatch, tmp_path, cases=cases, resume=True, retry_failed=True)
+    assert calls == [cases]
+    assert errors == []
+    assert not _checkpoint_sets(checkpoint)["failed"]
+    diagnostic = checkpoint.with_name("errors_sglang.deepep_ll.json")
+    assert json.loads(diagnostic.read_text())[0]["error_message"] == "launcher failed before producing a row"
+    errors, calls, _ = _run_with_real_checkpoint(monkeypatch, tmp_path, cases=cases, resume=True)
+    assert errors == []
+    assert calls == []
+
+
+def test_optional_diagnostic_mirror_failure_keeps_measured_case_passed(monkeypatch, tmp_path):
+    log_dir = tmp_path / "unwritable-mirror"
+    monkeypatch.setenv("COLLECTOR_LOG_DIR", str(log_dir))
+    write_text = Path.write_text
+
+    def write(path, *args, **kwargs):
+        if path.parent == log_dir:
+            raise PermissionError("optional mirror unavailable")
+        return write_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", write)
+    cases = [{"shape": 1}, {"shape": 2}]
+    errors, calls, checkpoint = _run_with_real_checkpoint(monkeypatch, tmp_path, cases=cases, failed_cases=cases[:1])
+    assert calls == [cases]
+    assert len(errors) == 1
+    assert errors[0]["task_params"] == str(cases[0])
+    state = _checkpoint_sets(checkpoint)
+    assert len(state["done"]) == len(state["failed"]) == 1
+    assert state["done"].isdisjoint(state["failed"])
+    authoritative = json.loads(checkpoint.with_name("errors_sglang.deepep_ll.json").read_text())
+    assert authoritative == errors
+    errors, calls, _ = _run_with_real_checkpoint(monkeypatch, tmp_path, cases=cases, resume=True)
+    assert calls == []
+    assert len(errors) == 1  # The real failed case remains visible.
 
 
 def _finalize_pending_fullnode_event(tmp_path, checkpoint_path):

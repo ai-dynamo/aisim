@@ -25,12 +25,18 @@ def _dsa_bucket_view(tmp_path, rows, phase="context"):
     helper retired with the parsers; the rule is observed through which
     backend buckets a row's isl lands under — same fixture pattern as
     test_table_view_dsa_dsv4_shapes.py)."""
+    from aisim_core.sdk.engine_table_view import fetch_table_view
+
+    db = _dsa_bucket_database(tmp_path, rows, phase)
+    return fetch_table_view(db, f"_{phase}_dsa_module_data")
+
+
+def _dsa_bucket_database(tmp_path, rows, phase):
     import pyarrow as pa
     import pyarrow.parquet as pq
     import yaml
 
     from aisim.sdk.perf_database import PerfDatabase
-    from aisim_core.sdk.engine_table_view import fetch_table_view
 
     root = tmp_path / "systems"
     root.mkdir(exist_ok=True)
@@ -61,8 +67,7 @@ def _dsa_bucket_view(tmp_path, rows, phase="context"):
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.table({k: [r[k] for r in rows] for k in rows[0]}), path)
     # Synthetic bucket-classification rows intentionally omit Collector V3 sidecars.
-    db = PerfDatabase("h100_sxm", "sglang", "1.0.0", str(root), database_mode="HYBRID", strict_provenance=False)
-    return fetch_table_view(db, f"_{phase}_dsa_module_data")
+    return PerfDatabase("h100_sxm", "sglang", "1.0.0", str(root), database_mode="HYBRID", strict_provenance=False)
 
 
 def _dsa_bucket_row(ks: str, kv: str, isl: int) -> dict:
@@ -152,8 +157,50 @@ def test_k31_dense_kernel_rows_keep_the_observed_cache_layout(tmp_path, phase):
 def test_k31_measured_rows_require_one_native_fp8_cache_layout(tmp_path, phase, source, kv):
     row = _dsa_bucket_row(source, kv, 1024)
     row["architecture"] = "KimiK31ForConditionalGeneration"
-    with pytest.raises(RuntimeError, match="Kimi K3.1 DSA rows require FP8 KV"):
+    with pytest.raises(ValueError, match="invalid performance data: Kimi K3.1 DSA rows require FP8 KV"):
         _dsa_bucket_view(tmp_path, [row], phase)
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_k31_fallback_propagates_corrupt_metadata_but_allows_missing_coverage(tmp_path, phase, corrupt):
+    from aisim.sdk.operations import ContextDSAModule, FallbackOp, GenerationDSAModule, OverlapOp
+    from aisim_core.sdk.engine import EngineHandle
+
+    source = "sglang_dsa_kv_raw_fp8_kv_flashmla_packed_eager" if corrupt else "default"
+    row = _dsa_bucket_row(source, "fp8", 1024)
+    if corrupt:
+        row["architecture"] = "KimiK31ForConditionalGeneration"
+    # The missing-coverage control has valid legacy data but no K3.1 rows.
+    db = _dsa_bucket_database(tmp_path, [row], phase)
+    handle = EngineHandle.for_database(db, systems_path=str(tmp_path / "systems"))
+    kwargs = dict(architecture="KimiK31ForConditionalGeneration", attention_backend="flashmla")
+    primary = (
+        ContextDSAModule(
+            "dsa",
+            1.0,
+            32,
+            common.KVCacheQuantMode.fp8,
+            common.FMHAQuantMode.bfloat16,
+            common.GEMMQuantMode.bfloat16,
+            **kwargs,
+        )
+        if phase == "context"
+        else GenerationDSAModule("dsa", 1.0, 32, common.KVCacheQuantMode.fp8, common.GEMMQuantMode.bfloat16, **kwargs)
+    )
+    fallback = FallbackOp("fallback", primary=primary, fallback=[OverlapOp("empty", group_a=[], group_b=[])])
+
+    def query():
+        return handle.evaluate_ops_json(
+            "[" + fallback._spec_json() + "]", is_context=phase == "context", batch_size=1, s=1024
+        )
+
+    for _ in range(2):  # Also exercise the lazy loader's cached error clone.
+        if corrupt:
+            with pytest.raises(ValueError, match="invalid performance data: Kimi K3.1 DSA rows require FP8 KV"):
+                query()
+        else:
+            assert query()[0][1] == 0.0  # Empty fallback executes zero work.
 
 
 # --- B2: native DSV4 checkpoints remap to arch-specific MoE quant modes -----

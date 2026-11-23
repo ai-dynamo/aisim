@@ -20,9 +20,7 @@ BACKEND_VERSION = "1.3.0rc10"
 
 @pytest.mark.parametrize("backend", ["vllm", "sglang", "trtllm"])
 def test_deployment_preserves_context_limit_for_all_backends(backend):
-    deployment = _agg_deployment(
-        space=_space(context_length=4096), selection=_agg_selection(backend=backend)
-    )
+    deployment = _agg_deployment(space=_space(context_length=4096), selection=_agg_selection(backend=backend))
     assert deployment.agg_engine_args["max_model_len"] == 4096
 
 
@@ -43,9 +41,7 @@ def _agg_selection(**overrides) -> dict:
     return values
 
 
-AGG_MOE = ReplicaParallelConfig(
-    ParallelShape(tp=4, dp=1, moe_tp=1, moe_ep=4), replicas=2
-)
+AGG_MOE = ReplicaParallelConfig(ParallelShape(tp=4, dp=1, moe_tp=1, moe_ep=4), replicas=2)
 
 
 def _agg_deployment(*, space=None, selection=None, parallel_config=AGG_MOE):
@@ -116,9 +112,7 @@ def test_disagg_backend_deployment_preserves_both_roles():
         decode_max_num_batched_tokens=8192,
         decode_max_num_seqs=1024,
     )
-    sample = unroll_sample(
-        search_space=_space(), selection=selection, parallel_config=parallel
-    )
+    sample = unroll_sample(search_space=_space(), selection=selection, parallel_config=parallel)
 
     deployment = build_backend_deployment(sample, backend_version=BACKEND_VERSION)
 
@@ -148,9 +142,7 @@ def test_disagg_backend_deployment_preserves_both_roles():
         ("vllm", True, False, 2, None),
     ],
 )
-def test_disagg_deployment_lowers_only_the_sglang_decode_radix_cache(
-    backend, enabled, prefix_caching, nextn, expected
-):
+def test_disagg_deployment_lowers_only_the_sglang_decode_radix_cache(backend, enabled, prefix_caching, nextn, expected):
     shape = ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1)
     parallel = DisaggParallelConfig(
         prefill=ReplicaParallelConfig(shape, 1),
@@ -196,9 +188,7 @@ def test_disagg_deployment_lowers_only_the_sglang_decode_radix_cache(
         sample["prefill_max_num_batched_tokens"] = 2049
         sample["prefill_block_size"] = 16
         deployment = build_backend_deployment(sample, backend_version=BACKEND_VERSION)
-        assert deployment.prefill_engine_args["sglang"] == {
-            "chunked_prefill_size": 2048
-        }
+        assert deployment.prefill_engine_args["sglang"] == {"chunked_prefill_size": 2048}
         assert deployment.decode_engine_args.get("sglang") == expected
 
 
@@ -228,21 +218,14 @@ def test_disagg_backend_deployment_uses_role_hardware():
 
     assert deployment.prefill_engine_args["aic_system"] == "h200_sxm"
     assert deployment.decode_engine_args["aic_system"] == "gb200"
-    assert (
-        deployment.performance_model_metadata["prefill"]["config"]["system"]
-        == "h200_sxm"
-    )
-    assert (
-        deployment.performance_model_metadata["decode"]["config"]["system"] == "gb200"
-    )
+    assert deployment.performance_model_metadata["prefill"]["config"]["system"] == "h200_sxm"
+    assert deployment.performance_model_metadata["decode"]["config"]["system"] == "gb200"
     assert deployment.parallel_config["prefill_hardware_sku"] == "h200_sxm"
     assert deployment.parallel_config["decode_hardware_sku"] == "gb200"
 
 
 def test_dense_shape_omits_moe_sizes():
-    dense = ReplicaParallelConfig(
-        ParallelShape(tp=2, dp=1, moe_tp=1, moe_ep=1), replicas=1
-    )
+    dense = ReplicaParallelConfig(ParallelShape(tp=2, dp=1, moe_tp=1, moe_ep=1), replicas=1)
     engine = _agg_deployment(
         space=_space(model_name="example/dense"),
         parallel_config=dense,
@@ -287,9 +270,7 @@ def test_memory_fraction_uses_the_backend_native_field(backend, memory_field):
 
 
 def test_optional_backend_runtime_values_are_forwarded():
-    engine = _agg_deployment(
-        space=_space(startup_time=45.0, aic_nextn=2, nextn_accepted=1.5)
-    ).agg_engine_args
+    engine = _agg_deployment(space=_space(startup_time=45.0, aic_nextn=2, nextn_accepted=1.5)).agg_engine_args
 
     assert engine["startup_time"] == 45.0
     assert engine["aic_nextn"] == 2
@@ -302,9 +283,7 @@ def test_fixed_host_offload_descriptor_lowers_into_aggregated_engine_args():
         "d2h_bandwidth_gbps": 7.0,
         "h2d_bandwidth_gbps": 38.0,
     }
-    dense = ReplicaParallelConfig(
-        ParallelShape(tp=2, dp=1, moe_tp=1, moe_ep=1), replicas=1
-    )
+    dense = ReplicaParallelConfig(ParallelShape(tp=2, dp=1, moe_tp=1, moe_ep=1), replicas=1)
 
     engine = _agg_deployment(
         space=_space(
@@ -430,21 +409,12 @@ def test_auto_geometry_uses_resolved_source_identity(feature, monkeypatch):
     deployment = build_backend_deployment(
         sample,
         backend_version=BACKEND_VERSION,
-        forward_pass_estimators={
-            role: ForwardPassEstimatorSpec(config=config)
-            for role, config in configs.items()
-        },
+        forward_pass_estimators={role: ForwardPassEstimatorSpec(config=config) for role, config in configs.items()},
     )
 
-    field = (
-        "kv_transfer_bytes_per_token"
-        if feature == "transfer"
-        else "kv_cache_bytes_per_token"
-    )
+    field = "kv_transfer_bytes_per_token" if feature == "transfer" else "kv_cache_bytes_per_token"
     assert deployment.prefill_engine_args[field] == 100
-    assert deployment.decode_engine_args[field] == (
-        100 if feature == "transfer" else 200
-    )
+    assert deployment.decode_engine_args[field] == (100 if feature == "transfer" else 200)
     assert [identity["worker_type"] for _, identity in calls] == [
         "prefill",
         "prefill" if feature == "transfer" else "decode",
@@ -557,9 +527,7 @@ def test_scalar_geometry_rejects_incompatible_profile_layout(mismatch):
         )
 
 
-@pytest.mark.parametrize(
-    "roles", [(None,), ("prefill", "decode"), ("prefill", "decode", "aggregated")]
-)
+@pytest.mark.parametrize("roles", [(None,), ("prefill", "decode"), ("prefill", "decode", "aggregated")])
 @pytest.mark.parametrize("feature", ["transfer", "host_offload"])
 def test_disagg_auto_geometry_selects_matching_profile_role(roles, feature):
     profile = _role_geometry_profile(roles)
@@ -599,23 +567,13 @@ def test_disagg_auto_geometry_selects_matching_profile_role(roles, feature):
 
     deployment = build_backend_deployment(sample, backend_version="0.25.1")
 
-    field = (
-        "kv_transfer_bytes_per_token"
-        if feature == "transfer"
-        else "kv_cache_bytes_per_token"
-    )
+    field = "kv_transfer_bytes_per_token" if feature == "transfer" else "kv_cache_bytes_per_token"
     assert deployment.prefill_engine_args[field] == 512
-    assert deployment.decode_engine_args[field] == (
-        512 if feature == "transfer" or roles == (None,) else 1024
-    )
+    assert deployment.decode_engine_args[field] == (512 if feature == "transfer" or roles == (None,) else 1024)
 
 
-@pytest.mark.parametrize(
-    "roles,expected", [((None,), 512), (("prefill", "decode", "aggregated"), 2048)]
-)
-def test_agg_auto_host_offload_geometry_selects_aggregated_profile_role(
-    roles, expected
-):
+@pytest.mark.parametrize("roles,expected", [((None,), 512), (("prefill", "decode", "aggregated"), 2048)])
+def test_agg_auto_host_offload_geometry_selects_aggregated_profile_role(roles, expected):
     profile = _role_geometry_profile(roles)
     sample = unroll_sample(
         search_space=_space(
@@ -630,9 +588,7 @@ def test_agg_auto_host_offload_geometry_selects_aggregated_profile_role(
             agg_kv_bytes_per_token="auto",
         ),
         selection=_agg_selection(backend="vllm"),
-        parallel_config=ReplicaParallelConfig(
-            ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), 1
-        ),
+        parallel_config=ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), 1),
     )
 
     deployment = build_backend_deployment(sample, backend_version="0.25.1")
@@ -726,20 +682,14 @@ def test_fpm_forward_model_lowers_onto_the_engine_payload():
 
     assert engine["aic_forward_model"] == "fpm"
     assert "timing_model" not in engine
-    assert (
-        deployment.performance_model_metadata["aggregated"]["config"]["forward_model"]
-        == "fpm"
-    )
+    assert deployment.performance_model_metadata["aggregated"]["config"]["forward_model"] == "fpm"
 
 
 def test_op_level_forward_model_adds_no_engine_field():
     deployment = _agg_deployment()
 
     assert "aic_forward_model" not in deployment.agg_engine_args
-    assert (
-        deployment.performance_model_metadata["aggregated"]["config"]["forward_model"]
-        == "op_level"
-    )
+    assert deployment.performance_model_metadata["aggregated"]["config"]["forward_model"] == "op_level"
 
 
 def test_disagg_forward_model_is_lowered_per_role():
@@ -765,14 +715,8 @@ def test_disagg_forward_model_is_lowered_per_role():
 
     assert "aic_forward_model" not in deployment.prefill_engine_args
     assert deployment.decode_engine_args["aic_forward_model"] == "fpm"
-    assert (
-        deployment.performance_model_metadata["prefill"]["config"]["forward_model"]
-        == "op_level"
-    )
-    assert (
-        deployment.performance_model_metadata["decode"]["config"]["forward_model"]
-        == "fpm"
-    )
+    assert deployment.performance_model_metadata["prefill"]["config"]["forward_model"] == "op_level"
+    assert deployment.performance_model_metadata["decode"]["config"]["forward_model"] == "fpm"
 
 
 def test_fixed_timing_drops_the_forward_model_field(monkeypatch):
@@ -783,17 +727,12 @@ def test_fixed_timing_drops_the_forward_model_field(monkeypatch):
     )
     deployment = _agg_deployment(
         space=_space(agg_forward_model="fpm"),
-        selection=_agg_selection(
-            agg_timing_model={"type": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0}
-        ),
+        selection=_agg_selection(agg_timing_model={"type": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0}),
     )
 
     assert "aic_forward_model" not in deployment.agg_engine_args
     assert deployment.agg_engine_args["timing_model"]["type"] == "fixed"
-    assert (
-        deployment.performance_model_metadata["aggregated"]["config"]["forward_model"]
-        == "op_level"
-    )
+    assert deployment.performance_model_metadata["aggregated"]["config"]["forward_model"] == "op_level"
 
 
 @pytest.mark.parametrize("dcp", [1, 2, 4])
@@ -814,13 +753,9 @@ def test_non_kimi_host_offload_auto_kv_respects_dcp_stripes(tmp_path, dcp):
         )
     )
     sample = unroll_sample(
-        search_space=_space(
-            model_name=str(tmp_path), agg_native_host_offload={"num_host_blocks": 10}
-        ),
+        search_space=_space(model_name=str(tmp_path), agg_native_host_offload={"num_host_blocks": 10}),
         selection=_agg_selection(backend="vllm"),
-        parallel_config=ReplicaParallelConfig(
-            ParallelShape(tp=8, dp=1, moe_tp=8, moe_ep=1), replicas=1
-        ),
+        parallel_config=ReplicaParallelConfig(ParallelShape(tp=8, dp=1, moe_tp=8, moe_ep=1), replicas=1),
     )
     sample["dcp"] = dcp
     deployment = build_backend_deployment(sample, backend_version=BACKEND_VERSION)

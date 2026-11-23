@@ -128,35 +128,57 @@ def test_explicit_native_request_rejected_before_stock_route_filtering(phase):
     assert not any(entry["type"].startswith("kimi_k31_dsa_") for entry in ordinary)
 
 
-@pytest.mark.parametrize("ambient", [None, "0", "1"])
-def test_native_fusion_setting_is_fixed_for_child_and_standalone(monkeypatch, tmp_path, ambient):
+@pytest.mark.parametrize("model_scoped", [False, True])
+def test_cli_generated_plan_keeps_native_ops_model_scoped(monkeypatch, capsys, model_scoped):
+    import collect
+    from collector.version_resolver import build_collections
+
+    selection = ["--model-path", MODEL] if model_scoped else ["--model-cases-full"]
+    monkeypatch.setattr(sys, "argv", ["collect", "--backend", "sglang", "--plan-only", *selection])
+    collect.main()
+    ops = json.loads(capsys.readouterr().out)["ops"]
+    native = {f"kimi_k31_dsa_{phase}_module" for phase in ("context", "generation")}
+    if model_scoped:
+        assert set(ops) == native
+        collections = build_collections(REGISTRY, "sglang", RUNTIME_VERSION, ops)
+        assert {entry["type"] for entry in collections} == native
+    else:
+        assert native.isdisjoint(ops)
+        assert "gemm" in ops
+        assert build_collections(REGISTRY, "sglang", "0.5.21", ops)
+
+
+@pytest.mark.parametrize("ambient", [None, "0", "8192"])
+@pytest.mark.parametrize(
+    ("variable", "expected"),
+    [("SGLANG_DSA_FUSE_TOPK", "1"), ("SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD", "2048")],
+)
+def test_native_dispatch_setting_is_fixed_for_child_and_standalone(monkeypatch, tmp_path, ambient, variable, expected):
     import collector.sglang.collect_kimi_k31_dsa_v1 as module
 
     if ambient is None:
-        monkeypatch.delenv("SGLANG_DSA_FUSE_TOPK", raising=False)
+        monkeypatch.delenv(variable, raising=False)
     else:
-        monkeypatch.setenv("SGLANG_DSA_FUSE_TOPK", ambient)
+        monkeypatch.setenv(variable, ambient)
     popen = subprocess.Popen
     output = tmp_path / "dsa_generation_module_perf.txt"
 
     def launch(_command, **kwargs):
-        code = (
-            f"import os; from pathlib import Path; Path({str(output)!r}).write_text(os.environ['SGLANG_DSA_FUSE_TOPK'])"
-        )
+        code = f"import os; from pathlib import Path; Path({str(output)!r}).write_text(os.environ[{variable!r}])"
         return popen([sys.executable, "-c", code], **kwargs)
 
     monkeypatch.setattr(module.subprocess, "Popen", launch)
     case = ModuleCase(8192, 1, 96, "fp8", "bfloat16", "bfloat16", MODEL, 0)
     module._run_native_case(case, "cuda:0", output)
-    assert output.read_text() == "1"
-    assert os.environ.get("SGLANG_DSA_FUSE_TOPK") == ambient
-    monkeypatch.setenv("SGLANG_DSA_FUSE_TOPK", ambient or "0")
+    assert output.read_text() == expected
+    assert os.environ.get(variable) == ambient
+    monkeypatch.setenv(variable, ambient or "0")
 
     class RuntimeReached(Exception):
         pass
 
     def runtime():
-        assert os.environ["SGLANG_DSA_FUSE_TOPK"] == "1"
+        assert os.environ[variable] == expected
         raise RuntimeReached
 
     monkeypatch.setattr(module, "_assert_runtime", runtime)
@@ -201,6 +223,10 @@ def test_native_failure_restores_staging_existence_and_length(monkeypatch, tmp_p
     [
         ("tensor_parallel_sizes", [], "non-empty tensor_parallel_sizes"),
         ("kv_cache_dtypes", [], "non-empty kv_cache_dtypes"),
+        ("kv_cache_dtypes", ["bfloat16"], "requires FP8 KV"),
+        ("kv_cache_dtypes", ["fp8", "bfloat16"], "requires FP8 KV"),
+        ("compute_dtype", "float32", "requires BF16 compute and projections"),
+        ("gemm_type", "fp8", "requires BF16 compute and projections"),
         ("native_num_heads", 192, "requires native_num_heads=96"),
         ("tensor_parallel_sizes", [3], "invalid native Kimi K3.1 TP geometry"),
         ("tensor_parallel_sizes", [16], "invalid native Kimi K3.1 TP geometry"),
@@ -249,6 +275,10 @@ def test_native_registry_checks_full_runtime_before_queueing(monkeypatch, op, ve
     if version == RUNTIME_VERSION:
         require_kimi_k31_runtime(version, {op})
     else:
+        from collector.framework_manifest import resolve_op_runtime
+
+        stock = resolve_op_runtime("sglang", op).version
+        version = stock if version == "0.5.21" else version
         monkeypatch.setattr(importlib.metadata, "version", lambda _: version)
         monkeypatch.setattr(module, "collect_ops", lambda *_a, **_k: pytest.fail("queued pool cases"))
         import collector.fullnode
@@ -257,7 +287,7 @@ def test_native_registry_checks_full_runtime_before_queueing(monkeypatch, op, ve
             collector.fullnode, "collect_sglang_fullnode_op", lambda *_a, **_k: pytest.fail("queued native cases")
         )
         with pytest.raises(RuntimeError, match="native Kimi K3.1 requires exactly"):
-            module.collect_sglang(1, ops=[op], model_path=None if version == "0.5.21" else MODEL, sm_version=103)
+            module.collect_sglang(1, ops=[op], model_path=None if version == stock else MODEL, sm_version=103)
     # Other ops keep the shared public-version policy.
     require_kimi_k31_runtime("0.5.21+vendor", {"gemm"})
 

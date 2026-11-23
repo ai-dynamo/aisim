@@ -58,7 +58,13 @@ NATIVE_CASE_TIMEOUT_S = 3600
 # srt/layers/attention/dsa/utils.py::should_use_dsa_fused_topk selects the fused
 # index transformation for this eager, non-disaggregated native plan.
 # Keep the pinned serving default independent of the invoking shell.
-NATIVE_ENV = {"SGLANG_DSA_FUSE_TOPK": "1"}
+# The same revision's Envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD
+# defaults to 2048; DeepseekSparseAttnBackend uses it for dense short-prefill
+# attention. Preserve that serving dispatch as well as the fused top-k path.
+NATIVE_ENV = {
+    "SGLANG_DSA_FUSE_TOPK": "1",
+    "SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD": "2048",
+}
 
 
 def get_kimi_k31_dsa_context_test_cases():

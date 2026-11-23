@@ -455,7 +455,9 @@ class KVCacheEstimator:
         )
         rank_bytes_per_token = getattr(model, "get_kvcache_rank_bytes_per_token", None)
         kv_size_per_token_bytes = (
-            rank_bytes_per_token() if rank_bytes_per_token is not None else rank_bytes_per_sequence(1) - rank_bytes_per_sequence(0)
+            rank_bytes_per_token()
+            if rank_bytes_per_token is not None
+            else rank_bytes_per_sequence(1) - rank_bytes_per_sequence(0)
         )
 
         def tokens_from_kv_bytes(kv_budget_bytes: float) -> int:
@@ -693,7 +695,11 @@ class NaiveKVCacheEstimator:
         if hf_config.get("model_type") in ("kimi_k3", "kimi_k31") or (
             isinstance(architectures, (list, tuple))
             and any(
-                isinstance(architecture, str) and (architecture == "KimiLinearForCausalLM" or ARCHITECTURE_TO_MODEL_FAMILY.get(architecture) == "KIMIK3")
+                isinstance(architecture, str)
+                and (
+                    architecture == "KimiLinearForCausalLM"
+                    or ARCHITECTURE_TO_MODEL_FAMILY.get(architecture) == "KIMIK3"
+                )
                 for architecture in architectures
             )
         ):
@@ -711,7 +717,9 @@ class NaiveKVCacheEstimator:
         geometry_config = hf_config.get(text_key, hf_config) if text_key else hf_config
         estimator = cls(
             cls._geometry(geometry_config, parsed),
-            dtype_bytes=cls._dtype_bytes(geometry_config if geometry_config.get("torch_dtype") or geometry_config.get("dtype") else hf_config),
+            dtype_bytes=cls._dtype_bytes(
+                geometry_config if geometry_config.get("torch_dtype") or geometry_config.get("dtype") else hf_config
+            ),
             tp_size=tp_size,
             pp_size=pp_size,
             moe_ep_size=moe_ep_size,

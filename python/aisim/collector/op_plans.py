@@ -1604,6 +1604,10 @@ def _kimi_k31_dsa_expand(phase: str) -> Callable[[], list[ModuleCase]]:
             for field in ("tensor_parallel_sizes", "kv_cache_dtypes"):
                 if not model[field]:
                     raise ValueError(f"native Kimi K3.1 requires non-empty {field}")
+            if model["compute_dtype"] != "bfloat16" or model["gemm_type"] != "bfloat16":
+                raise ValueError("native Kimi K3.1 requires BF16 compute and projections")
+            if any(kv != "fp8" for kv in model["kv_cache_dtypes"]):
+                raise ValueError("native Kimi K3.1 requires FP8 KV")
             points = _long_context_points(phase, sweep, model["max_position_embeddings"])
             for tp in model["tensor_parallel_sizes"]:
                 if type(tp) is not int or tp <= 0 or heads % tp or heads // tp not in (96, 48, 24, 12):

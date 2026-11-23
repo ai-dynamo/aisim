@@ -223,6 +223,31 @@ def _kv_geometry_args(
     estimator: ForwardPassEstimatorSpec | None,
 ) -> dict[str, Any]:
     """Use the source role's resolved layout and topology for byte geometry."""
+    prefix = _role_prefix(role)
+    resolved = estimator.config if estimator is not None else {}
+    result = {
+        "tp_size": int(sample[f"{prefix}tp"]),
+        "pp_size": int(sample[f"{prefix}pp"]),
+        "moe_tp_size": int(sample[f"{prefix}moe_tp"]),
+        "moe_ep_size": int(sample[f"{prefix}moe_ep"]),
+        "attention_dp_size": int(sample[f"{prefix}attention_dp"]),
+        "cp_size": resolved.get("cp_size", sample.get(f"{prefix}cp")) or 1,
+        "dcp_size": resolved.get("dcp", sample.get(f"{prefix}dcp")) or 1,
+        "worker_type": "aggregated" if role == "agg" else role,
+        "system": resolved.get("system", _role_hardware_sku(sample, role)),
+        "backend": resolved.get("backend", sample["backend"]),
+        "backend_version": resolved.get("backend_version", backend_version),
+        "attention_backend": resolved.get("attention_backend", sample.get("attention_backend")),
+        "kvcache_quant_mode": resolved.get("kvcache_quant_mode", sample.get("kvcache_quant_mode")),
+    }
+    # Snapshot sentinels pin restoration identity, not physical cache geometry.
+    for name in ("attention_backend", "kvcache_quant_mode"):
+        if result[name] == "unknown":
+            result[name] = None
+    profile = resolved.get("fpm_profile", sample.get("fpm_profile"))
+    if profile is not None:
+        result["fpm_profile"] = profile
+    return result
 
 
 def _add_grouped_prefix_caching(payload: dict[str, Any], sample: dict[str, Any], *, backend_version: str) -> None:
@@ -260,36 +285,6 @@ def _add_grouped_prefix_caching(payload: dict[str, Any], sample: dict[str, Any],
     payload["vllm_version"] = deployment.backend_version
     # vLLM always sizes its pool with a model length, and the Rust gate refuses a rank without one.
     payload.setdefault("max_model_len", profile.context_length)
-
-
-def _profile_kv_args(sample: dict[str, Any], role: str, backend_version: str) -> dict[str, Any]:
-    if sample.get("fpm_profile") is None:
-        return {}
-    prefix = _role_prefix(role)
-    resolved = estimator.config if estimator is not None else {}
-    result = {
-        "tp_size": int(sample[f"{prefix}tp"]),
-        "pp_size": int(sample[f"{prefix}pp"]),
-        "moe_tp_size": int(sample[f"{prefix}moe_tp"]),
-        "moe_ep_size": int(sample[f"{prefix}moe_ep"]),
-        "attention_dp_size": int(sample[f"{prefix}attention_dp"]),
-        "cp_size": resolved.get("cp_size", sample.get(f"{prefix}cp")) or 1,
-        "dcp_size": resolved.get("dcp", sample.get(f"{prefix}dcp")) or 1,
-        "worker_type": "aggregated" if role == "agg" else role,
-        "system": resolved.get("system", _role_hardware_sku(sample, role)),
-        "backend": resolved.get("backend", sample["backend"]),
-        "backend_version": resolved.get("backend_version", backend_version),
-        "attention_backend": resolved.get("attention_backend", sample.get("attention_backend")),
-        "kvcache_quant_mode": resolved.get("kvcache_quant_mode", sample.get("kvcache_quant_mode")),
-    }
-    # Snapshot sentinels pin restoration identity, not physical cache geometry.
-    for name in ("attention_backend", "kvcache_quant_mode"):
-        if result[name] == "unknown":
-            result[name] = None
-    profile = resolved.get("fpm_profile", sample.get("fpm_profile"))
-    if profile is not None:
-        result["fpm_profile"] = profile
-    return result
 
 
 def _frontend_row(sample: dict[str, Any], role: str) -> dict[str, Any] | None:

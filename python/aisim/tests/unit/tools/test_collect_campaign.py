@@ -195,14 +195,14 @@ def test_build_image_uses_model_scoped_runtime(monkeypatch):
 
 
 @pytest.mark.parametrize("phase", ["context", "generation"])
-@pytest.mark.parametrize("model_path", [None, "moonshotai/Kimi-K3.1-Pro"])
 @pytest.mark.parametrize("case_filter", [None, ", 48, 'fp8',", ", 24, 'fp8',", ", 12, 'fp8',"])
 @pytest.mark.parametrize("mode", ["run", "finalize"])
-def test_k31_campaign_refuses_multi_gpu_cases_before_launch(
-    monkeypatch, tmp_path, phase, model_path, case_filter, mode
-):
+def test_k31_campaign_refuses_multi_gpu_cases_before_launch(monkeypatch, tmp_path, phase, case_filter, mode):
     c = _load()
-    shard = c.Shard(f"kimi_k31_dsa_{phase}_module", "native", case_filter=case_filter, model_path=model_path)
+    monkeypatch.setenv("COLLECTOR_MODEL_PATH", "other/model")
+    shard = c.Shard(
+        f"kimi_k31_dsa_{phase}_module", "native", case_filter=case_filter, model_path="moonshotai/Kimi-K3.1-Pro"
+    )
     plan = c.Plan("sglang", 103, (shard,))
     if mode == "finalize":
         directory = c.shard_dir(tmp_path / "out", shard)
@@ -219,6 +219,7 @@ def test_k31_campaign_refuses_multi_gpu_cases_before_launch(
             image_override=None,
             mode=mode,
         )
+    assert c.os.environ["COLLECTOR_MODEL_PATH"] == "other/model"
 
 
 @pytest.mark.parametrize("phase", ["context", "generation"])
@@ -226,6 +227,7 @@ def test_k31_campaign_preserves_tp1_shards(monkeypatch, tmp_path, phase):
     from types import SimpleNamespace
 
     c = _load()
+    monkeypatch.setenv("COLLECTOR_MODEL_PATH", "other/model")
     shard = c.Shard(
         f"kimi_k31_dsa_{phase}_module", "tp1", case_filter=", 96, 'fp8',", model_path="moonshotai/Kimi-K3.1-Pro"
     )
@@ -252,15 +254,17 @@ def test_k31_campaign_preserves_tp1_shards(monkeypatch, tmp_path, phase):
         == 0
     )
     assert len(commands) == 1
+    assert c.os.environ["COLLECTOR_MODEL_PATH"] == "other/model"
     assert commands[0][commands[0].index("--gpu") + 1] == "3"
     assert ", 96, 'fp8'," in c.collector_argv(plan, shard)
 
 
 @pytest.mark.parametrize("phase", ["context", "generation"])
 @pytest.mark.parametrize("mode", ["run", "finalize"])
-def test_k31_model_free_tp1_shard_is_rejected_before_launch(monkeypatch, tmp_path, phase, mode):
+@pytest.mark.parametrize("model_path", [None, "moonshotai/Kimi-K3.1-Pr"])
+def test_k31_noncanonical_shard_is_rejected_before_launch(monkeypatch, tmp_path, phase, mode, model_path):
     c = _load()
-    shard = c.Shard(f"kimi_k31_dsa_{phase}_module", "tp1", case_filter=", 96, 'fp8',")
+    shard = c.Shard(f"kimi_k31_dsa_{phase}_module", "tp1", case_filter=", 96, 'fp8',", model_path=model_path)
     plan = c.Plan("sglang", 103, (shard,))
     monkeypatch.setattr(c, "collector_ref", lambda _: pytest.fail("admission must precede launch preparation"))
     if mode == "finalize":
@@ -277,3 +281,25 @@ def test_k31_model_free_tp1_shard_is_rejected_before_launch(monkeypatch, tmp_pat
             image_override=None,
             mode=mode,
         )
+
+
+def test_model_pin_does_not_bypass_unknown_op_validation(monkeypatch):
+    from collector.sglang.collect_kimi_k31_dsa_v1 import MODEL
+
+    c = _load()
+    monkeypatch.setattr(c, "build_image", lambda *_a, **_k: pytest.fail("built image for unknown op"))
+    monkeypatch.setattr(
+        sys, "argv", ["collect_campaign", "build-image", "--backend", "sglang", "--op", "typo", "--model-path", MODEL]
+    )
+    with pytest.raises(KeyError, match="registry has no op"):
+        c.main()
+
+
+@pytest.mark.parametrize(
+    "backend,op", [("sglang", "gemm"), ("vllm", "gemm"), ("sglang", "kimi_k31_dsa_context_module")]
+)
+def test_unpinned_models_keep_family_or_default_image(backend, op):
+    from collector.framework_manifest import resolve_op_runtime
+
+    c = _load()
+    assert c.pinned_image(backend, op, "unlisted/model") == resolve_op_runtime(backend, op).image()

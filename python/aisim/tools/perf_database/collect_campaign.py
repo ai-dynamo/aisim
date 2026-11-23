@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -112,11 +113,12 @@ def pinned_image(backend: str, op: str, model_path: str | None = None) -> str:
     """The manifest-pinned image for (backend, op) — family pins included."""
     from collector.framework_manifest import _model_pinned_runtime, load_manifest, resolve_op_runtime
 
+    runtime = resolve_op_runtime(backend, op)
     if model_path is not None:
-        runtime = _model_pinned_runtime(load_manifest(), backend.lower(), model_path)
-        if runtime is not None:
-            return runtime.image()
-    return resolve_op_runtime(backend, op).image()
+        model_runtime = _model_pinned_runtime(load_manifest(), backend.lower(), model_path)
+        if model_runtime is not None:
+            return model_runtime.image()
+    return runtime.image()
 
 
 def collect_image_tag(base_image: str) -> str:
@@ -343,7 +345,20 @@ def _validate_shard_allocation(plan: Plan, shard: Shard) -> None:
     from collector.op_plans import plan as plan_cases
     from collector.sglang.collect_kimi_k31_dsa_v1 import MODEL, validate_case
 
-    cases = plan_cases(shard.op, plan.backend, plan.sm, include_long_context=shard.include_long_context).cases
+    if shard.model_path != MODEL:
+        raise SystemExit(
+            f"{shard.key}: native K3.1 shards require model_path: {MODEL} to select the pinned K3.1 runtime"
+        )
+    # Match collect.py's --model-path selection, independent of the host shell.
+    previous_model = os.environ.get("COLLECTOR_MODEL_PATH")
+    try:
+        os.environ["COLLECTOR_MODEL_PATH"] = shard.model_path
+        cases = plan_cases(shard.op, plan.backend, plan.sm, include_long_context=shard.include_long_context).cases
+    finally:
+        if previous_model is None:
+            os.environ.pop("COLLECTOR_MODEL_PATH", None)
+        else:
+            os.environ["COLLECTOR_MODEL_PATH"] = previous_model
     for case in cases:
         if shard.model_path and case.model_path != shard.model_path:
             continue
@@ -356,11 +371,6 @@ def _validate_shard_allocation(plan: Plan, shard: Shard) -> None:
                 "use collector/collect.py's full-node path (collector/fullnode.py) on a dedicated "
                 "allocation exposing the full TP group, or select only TP1 cases with case_filter"
             )
-    if shard.model_path is None:
-        raise SystemExit(
-            f"{shard.key}: native K3.1 shards require model_path: {MODEL} to select the pinned K3.1 runtime; "
-            "model-free shards select the default SGLang runtime"
-        )
 
 
 def run_campaign(

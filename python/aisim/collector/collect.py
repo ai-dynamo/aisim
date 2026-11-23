@@ -6547,6 +6547,11 @@ def main():
         planned_ops = case_plan.ops
         if args.ops is None:
             ops = planned_ops
+            if args.model_cases_full:
+                # The native preview runs only with its model-scoped pin, as
+                # declared in framework_manifest.yaml. A stock full run must
+                # not turn these into explicit native runtime requests.
+                ops = [op for op in ops if not op.startswith("kimi_k31_dsa_")]
         else:
             requested_ops = set(args.ops) - {FPM_FORWARD_OP}
             ops = [op for op in planned_ops if op in requested_ops]
