@@ -17,6 +17,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
+from aisim_core.data.fpm_layout import OTHER_CATEGORY_PREFIXES, PHYSICAL_PREFIX, storage_path
+
 Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 Category = Literal["op-latency", "fpm", "e2e", "eval", "systems"]
 Purpose = Literal[
@@ -206,7 +208,7 @@ def path_component(value: str) -> str:
     return value
 
 
-def _file(root: Path, relative: str) -> Path:
+def _plain_file(root: Path, relative: str) -> Path:
     path = root
     for part in PurePosixPath(_relative(relative)).parts:
         path = path / part
@@ -215,6 +217,20 @@ def _file(root: Path, relative: str) -> Path:
     if not path.is_file():
         raise ValueError(f"missing dataset artifact: {relative}")
     return path
+
+
+def _file(root: Path, relative: str) -> Path:
+    # Moved FPM manifests retain logical legacy keys. Resolve only storage locations; manifest bytes and
+    # configuration/case/observation identities stay untouched. Canonical category paths need no catalog read.
+    _relative(relative)
+    if (
+        relative.startswith("data/")
+        and not relative.startswith((PHYSICAL_PREFIX, *OTHER_CATEGORY_PREFIXES))
+        and (root / "catalog/dataset.json").exists()
+    ):
+        index = DatasetIndex.model_validate_json(_plain_file(root, "catalog/dataset.json").read_bytes())
+        relative = storage_path(relative, {name: ref.root for name, ref in index.categories.items()})
+    return _plain_file(root, relative)
 
 
 def _verify(root: Path, artifact: Artifact) -> Path:
@@ -277,8 +293,26 @@ def check_manifest(root: Path, path: str) -> Manifest:
     return manifest
 
 
-def check_dataset(root: Path) -> DatasetIndex:
-    """Verify shared discovery indexes and the manifests they reference."""
+def check_envelope(root: Path, path: str) -> Manifest:
+    """Check a manifest of a category with no offline checker here: its identity hash and every declared artifact.
+
+    The category's own validators check the content; this keeps a missing or altered artifact from passing.
+    """
+    root = Path(root)
+    manifest = Manifest.model_validate_json(_file(root, path).read_bytes())
+    if manifest.configuration_id != configuration_id(manifest.category, manifest.purpose, manifest.identity):
+        raise ValueError("configuration identity hash mismatch")
+    for artifact in manifest.artifacts:
+        _verify(root, artifact)
+    return manifest
+
+
+def check_dataset(root: Path, *, unchecked_categories: tuple[str, ...] = ()) -> DatasetIndex:
+    """Verify shared discovery indexes and the manifests they reference.
+
+    Manifests of ``unchecked_categories`` (categories with no offline checker here) get the envelope checks of
+    :func:`check_envelope` and the catalog identity comparison, but no category-specific checks.
+    """
     root = Path(root)
     index = DatasetIndex.model_validate_json(_file(root, "catalog/dataset.json").read_bytes())
     for category, reference in index.categories.items():
@@ -294,7 +328,8 @@ def check_dataset(root: Path) -> DatasetIndex:
                 raise ValueError("duplicate configuration ID")
             seen.add(entry.configuration_id)
             _verify(root, entry.manifest)
-            manifest = check_manifest(root, entry.manifest.path)
+            check = check_envelope if category in unchecked_categories else check_manifest
+            manifest = check(root, entry.manifest.path)
             if (manifest.category, manifest.configuration_id, manifest.identity, manifest.purpose) != (
                 category,
                 entry.configuration_id,

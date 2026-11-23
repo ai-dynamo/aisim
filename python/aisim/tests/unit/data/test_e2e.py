@@ -687,3 +687,196 @@ def test_inferencex_manifest_keeps_only_public_run_facts(tmp_path):
         | {"github_run_id": "987"}
     }
     assert ds.observations[0].producer_attempt == 2
+
+
+@pytest.mark.parametrize("tamper", [False, True])
+def test_provenance_decompresses_only_the_payload_that_passed_verification(tmp_path, monkeypatch, tamper):
+    from pathlib import Path
+
+    artifact, _ = store_provenance(tmp_path, "logs", ProvenanceFile("log", b"verified log", name="run"))
+    target = tmp_path / artifact.path
+    if tamper:
+        target.write_bytes(gzip.compress(b"bad bytes"))
+        with pytest.raises(ValueError, match="integrity mismatch"):
+            read_provenance(tmp_path, artifact)
+        return
+    real_read = Path.read_bytes
+    reads = []
+
+    def swap_after_read(self):
+        payload = real_read(self)
+        if self == target:
+            reads.append(self)
+            self.write_bytes(gzip.compress(b"unverified replacement"))
+        return payload
+
+    monkeypatch.setattr(Path, "read_bytes", swap_after_read)
+    assert read_provenance(tmp_path, artifact) == b"verified log"
+    assert reads == [target]
+
+
+@pytest.mark.parametrize("bad", ["/absolute", "../escape", "a/../../escape", "a\\escape"])
+def test_configuration_prefixes_and_provenance_names_are_preflighted(tmp_path, bad):
+    root = tmp_path / "new"
+    with pytest.raises(ValueError, match="relative path"):
+        write_configuration(root, _dev_config(), prefix=bad)
+    cfg = _dev_config()
+    cfg.provenance.append(ProvenanceFile("log", b"log", name=bad))
+    with pytest.raises(ValueError, match="relative path"):
+        write_configuration(root, cfg)
+    assert not root.exists()
+    with pytest.raises(ValueError, match="relative path"):
+        store_provenance(root, "safe", ProvenanceFile("log", b"log", name=bad))
+    assert not root.exists()
+
+
+def test_nested_writes_work_and_symlinked_destinations_cannot_escape(tmp_path):
+    members, kwargs = _snapshot_args("o1")
+    root = tmp_path / "root"
+    write_snapshot(root, "nested/snap.json", members, **kwargs)
+    assert read_snapshot(root, "nested/snap.json")[1] == members
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "linked").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        write_snapshot(root, "linked/snap.json", members, **kwargs)
+    assert list(outside.iterdir()) == []
+    cfg = _dev_config()
+    cfg.provenance.append(ProvenanceFile("log", b"log", name="nested/log"))
+    path = write_configuration(root, cfg, prefix="nested/data")
+    assert load_e2e(root, path).observations
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_aiperf_distinct_throughput_statistics_reach_the_evaluator(tmp_path, reverse):
+    summary = _aiperf_summary(output_token_throughput={"unit": "tokens/second", "avg": 9600.0, "p90": 11000.0})
+    cfg = aiperf_to_configuration(summary, [], _dev_body(), observation_id="dev:1", device_count=8)
+    if reverse:
+        cfg.metrics.reverse()
+    dataset = load_e2e(tmp_path, write_configuration(tmp_path, cfg))
+    (point,) = evaluation_points(dataset)
+    assert point.metrics[("output_throughput:total", "mean")] == 9600.0
+    assert point.metrics[("output_throughput:total", "p90")] == 11000.0
+    assert point.per_device_throughput == {"output_throughput": 1200.0}
+    # Equal evaluator keys remain ambiguous, even for the same observer.
+    throughput = next(row for row in dataset.metrics if row.metric == "output_throughput")
+    dataset.metrics.append(throughput.model_copy())
+    with pytest.raises(ValueError, match="reported by observers"):
+        evaluation_points(dataset)
+
+
+@pytest.mark.parametrize(
+    "statistics,expected", [(["value", "mean", "p90"], 100.0), (["p90"], 300.0), (["p90", "p99"], ValueError)]
+)
+def test_per_device_projection_selects_a_representative_statistic(tmp_path, statistics, expected):
+    cfg = _dev_config()
+    values = {"value": 400.0, "mean": 800.0, "p90": 1200.0, "p99": 1600.0}
+    cfg.metrics = [
+        make_metric("dev:1", "output_throughput", stat, values[stat], "tokens/s", normalization="total", device_count=4)
+        for stat in statistics
+    ]
+    dataset = load_e2e(tmp_path, write_configuration(tmp_path, cfg))
+    if expected is ValueError:  # no value/mean and several others: nothing representative to pick
+        with pytest.raises(ValueError, match="ambiguous per-device throughput"):
+            evaluation_points(dataset)
+        return
+    (point,) = evaluation_points(dataset)
+    assert point.metrics == {("output_throughput:total", stat): values[stat] for stat in statistics}
+    assert point.per_device_throughput == {"output_throughput": expected}
+
+
+def test_republishing_edited_requests_refreshes_the_snapshot_version(tmp_path):
+    from aisim_core.data.e2e import snapshot_id
+
+    cfg = _dev_config()
+
+    def publish():
+        manifest = write_configuration(tmp_path, cfg)
+        loaded = load_e2e(tmp_path, manifest)
+        observation = loaded.observations[0]
+        snapshot = write_snapshot(
+            tmp_path,
+            "republish.json",
+            [SnapshotMember.from_observation(observation, manifest)],
+            source_scope={"kind": "test"},
+            selection_policy="all",
+            completeness="complete",
+        )
+        return loaded, snapshot
+
+    first, initial = publish()
+    unchanged, repeated = publish()
+    assert first.requests[0].ttft_ms == unchanged.requests[0].ttft_ms == 100.0
+    assert first.observations[0].observation_sha256 == cfg.observations[0].observation_sha256
+    assert initial.snapshot_id == repeated.snapshot_id
+    cfg.requests[0].ttft_ms = 200.0
+    edited, corrected = publish()
+    assert edited.requests[0].ttft_ms == 200.0
+    assert edited.observations[0].record_sha256 == first.observations[0].record_sha256
+    assert corrected.snapshot_id != initial.snapshot_id
+    assert cfg.observations[0].observation_sha256 == first.observations[0].observation_sha256
+    # An explicitly refreshed version is retained on another identical publish.
+    cfg.observations[0].observation_sha256 = edited.observations[0].observation_sha256
+    refreshed, repeated = publish()
+    assert refreshed.observations[0].observation_sha256 == edited.observations[0].observation_sha256
+    assert repeated.snapshot_id == corrected.snapshot_id
+    _, members = read_snapshot(tmp_path, "republish.json")
+    assert snapshot_id(members, {"kind": "test"}, "all") == corrected.snapshot_id
+
+
+def test_aiperf_request_corrections_version_snapshots_without_changing_raw_audit(tmp_path):
+    import hashlib
+
+    from aisim_core.data.e2e import _canonical, snapshot_id
+
+    def convert(records):
+        return aiperf_to_configuration(_aiperf_summary(), records, _dev_body(), observation_id="dev:1", device_count=8)
+
+    before = convert(_aiperf_records())
+    records = _aiperf_records()
+    records[0]["metrics"]["time_to_first_token"]["value"] = 0.2
+    after = convert(records)
+    first, second = before.observations[0], after.observations[0]
+    raw_digest = hashlib.sha256(_canonical(_aiperf_summary())).hexdigest()
+    assert first.raw_record_sha256 == second.raw_record_sha256 == raw_digest
+    assert first.record_sha256 != second.record_sha256 and first.observation_sha256 != second.observation_sha256
+    ids = []
+    for index, cfg in enumerate((before, after)):
+        manifest = write_configuration(tmp_path, cfg)
+        observation = cfg.observations[0]
+        member = SnapshotMember(
+            configuration_id=observation.configuration_id,
+            observation_id=observation.observation_id,
+            record_sha256=observation.record_sha256,
+            manifest_path=manifest,
+        )  # legacy callers are also bound to the persisted observation version
+        snapshot = write_snapshot(
+            tmp_path,
+            f"snap-{index}.json",
+            [member],
+            source_scope={"kind": "test"},
+            selection_policy="all",
+            completeness="complete",
+        )
+        loaded = load_e2e(tmp_path, manifest)
+        assert read_raw_record(tmp_path, loaded, "dev:1") == _canonical(_aiperf_summary())
+        assert loaded.requests[0].ttft_ms == (100.0 if index == 0 else 200.0)
+        _, members = read_snapshot(tmp_path, f"snap-{index}.json")
+        assert members[0].observation_sha256 == observation.observation_sha256
+        explicit = SnapshotMember.from_observation(observation, manifest)
+        assert snapshot.snapshot_id == snapshot_id([explicit], {"kind": "test"}, "all")
+        ids.append(snapshot.snapshot_id)
+    assert ids[0] != ids[1]
+
+
+def test_legacy_snapshot_ids_remain_verifiable_without_the_additive_version_field():
+    import hashlib
+
+    from aisim_core.data.e2e import _canonical, snapshot_id
+
+    members, _ = _snapshot_args("o1")
+    legacy_members = [m.model_dump(exclude={"observation_sha256"}) for m in members]
+    legacy_id = hashlib.sha256(
+        _canonical({"members": legacy_members, "source_scope": {"kind": "k"}, "selection_policy": "p"})
+    ).hexdigest()
+    assert snapshot_id(members, {"kind": "k"}, "p") == legacy_id

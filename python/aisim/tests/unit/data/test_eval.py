@@ -311,3 +311,36 @@ def test_nonfinite_truth_and_unavailable_predictions_remain_excluded():
     )
     assert results.n_scored == 1 and results.mape_pct == 100.0
     assert {e.case_id for e in results.exclusions} == {"infinite", "nan", "missing", "unavailable"}
+
+
+def test_a_finite_pair_whose_residual_overflows_is_excluded_without_changing_finite_scores():
+    baseline = [("exact", 10.0, 10.0), ("ten-percent", 100.0, 110.0)]
+    got = compute_results([*baseline, ("overflowing-ratio", 1e-300, 1e300)])
+    reference = compute_results(baseline)
+    assert got.n_scored == reference.n_scored == 2 and got.mape_pct == reference.mape_pct == 5.0
+    assert got.residual_quantiles_pct == reference.residual_quantiles_pct
+    assert {e.case_id: e.reason for e in got.exclusions} == {"overflowing-ratio": "non-finite residual"}
+
+
+@pytest.mark.parametrize("mutate_results", [False, True])
+def test_verification_uses_a_private_record_snapshot_before_prediction(built, mutate_results):
+    root, record = built
+    original = record.model_copy(deep=True)
+    replacement = write_truth_table(root / "replacement.parquet", [("different", {"tokens": 1}, 999.0)])
+
+    def mutating_predict(inputs):
+        # A predictor may close over and mutate the caller's nested objects.
+        record.truth.artifacts[0].path = replacement.path
+        record.truth.artifacts[0].sha256 = replacement.sha256
+        record.truth.artifacts[0].bytes = replacement.bytes
+        if mutate_results:
+            record.results.mape_pct = -1.0
+        return _predict(inputs)
+
+    report = verify_record(record, root, mutating_predict, record.prediction.fingerprint)
+    assert report.ok, report.problems
+    assert report.record_id == original.record_id
+    assert report.recomputed.mape_pct == original.results.mape_pct
+    with pytest.raises(ValueError, match="different record content"):
+        attest(record, report)
+    assert attest(original, report).verification.verified_record_id == original.record_id

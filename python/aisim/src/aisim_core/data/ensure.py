@@ -32,7 +32,7 @@ module accepts, stores and prints no token.
 
 Environment (read by :func:`pin_from_environment`): ``AISIM_DATASET=<repo>@<revision>``
 (use a full commit SHA for offline reuse), ``AISIM_DATA_LOCAL``, ``AISIM_DATA_CATEGORIES``
-(default ``fpm``), ``AISIM_DATA_CONFIGURATION``, ``AISIM_DATA_MAX_BYTES``,
+(default ``op-latency``), ``AISIM_DATA_CONFIGURATION``, ``AISIM_DATA_MAX_BYTES``,
 ``AISIM_DATA_OFFLINE`` and ``AISIM_DATA_CACHE``.
 """
 
@@ -44,6 +44,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import tempfile
 from collections.abc import Callable, Mapping
@@ -56,6 +57,7 @@ import yaml
 from pydantic import ValidationError
 
 from aisim_core.data import CategoryIndex, DatasetIndex, Entry, _file, _verify
+from aisim_core.data.config import config_path, load_config, resolve_source
 from aisim_core.data.fetch import (
     DATASET_INDEX_PATH,
     BudgetExceededError,
@@ -157,11 +159,14 @@ class DataPin:
     repo: str | None = None
     revision: str | None = None  # full commit SHA recommended: it resolves with no network
     local_root: Path | None = None
-    categories: tuple[str, ...] = ("fpm",)
+    categories: tuple[str, ...] = ("op-latency",)
     configuration_id: str | None = None  # disambiguates several catalog matches
     max_bytes: int = DEFAULT_MAX_BYTES
     offline: bool = False
     cache_dir: Path | None = None
+    # Built from the source ``aisim init`` saved, not named by the caller or the environment. Such an ambient pin
+    # selects op-latency data only for runs that read operation tables (see ``rust_engine_step._ensure_dataset``).
+    saved_source: bool = False
 
     def __post_init__(self) -> None:
         if self.local_root is None and not (self.repo and self.revision):
@@ -191,11 +196,19 @@ class EnsuredData:
 
 
 def pin_from_environment(env: Mapping[str, str] | None = None) -> DataPin | None:
-    """Build a pin from ``AISIM_DATA*`` variables; ``None`` when none is set (the default)."""
+    """Build a pin from ``AISIM_DATA*`` variables, else the source saved by ``aisim init``.
+
+    ``None`` when neither names a source (the shipped default applies).
+    """
     env = os.environ if env is None else env
     spec, local = env.get("AISIM_DATASET"), env.get("AISIM_DATA_LOCAL")
+    from_saved = False
     if not spec and not local:
-        return None
+        saved = load_config(config_path(env))  # a corrupt saved config raises ConfigError
+        if not saved or not (saved.repo or saved.revision):
+            return None
+        spec = "{}@{}".format(*resolve_source(env=env, config=saved))  # same rules as ``data fetch``
+        from_saved = True
     repo = revision = None
     if spec:
         repo, sep, revision = spec.partition("@")
@@ -215,6 +228,7 @@ def pin_from_environment(env: Mapping[str, str] | None = None) -> DataPin | None
         local_root=Path(local) if local else None,
         configuration_id=env.get("AISIM_DATA_CONFIGURATION") or None,
         offline=env.get("AISIM_DATA_OFFLINE", "").lower() in {"1", "true", "yes"},
+        saved_source=from_saved,
         **kwargs,
     )
 
@@ -260,7 +274,8 @@ def _describe(selection: Selection) -> str:
 
 
 def _command(pin: DataPin, selection: Selection) -> str:
-    flags = [f"--category {selection.category}"]
+    """A ``aisim data fetch`` command that is valid for ``selection`` (it needs a selector)."""
+    flags = ["--category", selection.category]
     for flag, value in (
         ("--model", selection.model),
         ("--hardware", selection.hardware),
@@ -269,12 +284,20 @@ def _command(pin: DataPin, selection: Selection) -> str:
         ("--operation-family", selection.operation_family),
         ("--repo", pin.repo),
         ("--revision", pin.revision),
+        ("--cache-dir", pin.cache_dir),
     ):
         if value:
-            flags.append(f"{flag} {value}")
+            flags += [flag, str(value)]
     # One flag per ID: without them the command would download every matching entry, not the one the pin names.
-    flags.extend(f"--configuration {cid}" for cid in selection.configuration_ids)
-    return "aisim data fetch " + " ".join(flags)
+    for configuration_id in selection.configuration_ids:
+        flags += ["--configuration", configuration_id]
+    has_selector = selection.configuration_ids or selection.hardware
+    if selection.select_all or (selection.category == "op-latency" and not has_selector):
+        flags.append("--all")
+    # The command line does not apply the auto-download threshold to an explicit fetch unless
+    # AISIM_DATA_MAX_BYTES is set; --no-limit makes the command valid in both cases.
+    flags.append("--no-limit")
+    return shlex.join(["aisim", "data", "fetch", *flags])
 
 
 # --------------------------------------------------------------------------- ensure
@@ -487,9 +510,11 @@ def _version_policy(pin: DataPin, transport: Transport | None, out: EnsuredData)
         if path is None or not Path(path).is_file():
             raise MissingDataError(f"{where} publishes no {name}; the backend version cannot be resolved")
         document = yaml.safe_load(lookup_yaml(Path(path)))
+        if not isinstance(document, dict):
+            raise ValueError("version policy must be a mapping")
     except (LoaderError, ValueError, SelectionError) as exc:
         raise MissingDataError(f"cannot read the version policy of {where}: {exc}") from exc
-    return index, document if isinstance(document, dict) else {}
+    return index, document
 
 
 def _slot_version(system: str, backend: str, requested: str | None, versions, document: Mapping[str, Any]) -> str:
@@ -564,7 +589,8 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
     where = f"{pin.repo}@{revision}" if pin.local_root is None else str(root)
     if not entries:
         raise MissingDataError(
-            f"no {category} data for {_describe(selection)} in {where}; there is no fallback to other data",
+            f"no {category} data for {_describe(selection)} in {where}; there is no fallback to other data"
+            + _categories_hint(pin),
             selection=selection,
             source=where,
         )
@@ -622,6 +648,12 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
     }
 
 
+def _categories_hint(pin: DataPin) -> str:
+    return (
+        f"; this pin loads {', '.join(pin.categories)} (set AISIM_DATA_CATEGORIES to load other categories, e.g. fpm)"
+    )
+
+
 def _fetch_pinned(
     selection: Selection, pin: DataPin, transport: Transport | None, out: EnsuredData | None = None
 ) -> FetchResult:
@@ -655,7 +687,9 @@ def _fetch_pinned(
             ) from exc
     except SelectionError as exc:
         # Cached catalog exists but matches nothing: the answer is final for this revision.
-        raise MissingDataError(f"{exc} ({_describe(selection)} in {where})", selection=selection, source=where) from exc
+        raise MissingDataError(
+            f"{exc} ({_describe(selection)} in {where}){_categories_hint(pin)}", selection=selection, source=where
+        ) from exc
     try:
         # The auto-download allowance belongs to the whole pin: a donor fetched after the primary selection gets only
         # what the earlier fetches left.
@@ -671,7 +705,9 @@ def _fetch_pinned(
             already_downloaded=spent,
         ) from exc
     except SelectionError as exc:
-        raise MissingDataError(f"{exc} ({_describe(selection)} in {where})", selection=selection, source=where) from exc
+        raise MissingDataError(
+            f"{exc} ({_describe(selection)} in {where}){_categories_hint(pin)}", selection=selection, source=where
+        ) from exc
 
 
 def _materialization_is_intact(systems: Path, manifest) -> bool:

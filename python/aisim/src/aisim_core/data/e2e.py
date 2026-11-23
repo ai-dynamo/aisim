@@ -75,6 +75,7 @@ from aisim_core.data import (
     Manifest,
     _file,
     _relative,
+    _verified_bytes,
     _verify,
     configuration_id,
     path_component,
@@ -95,7 +96,7 @@ E2E_TABLE_SCHEMAS = (OBSERVATIONS_SCHEMA, METRICS_SCHEMA, REQUESTS_SCHEMA, SERIE
 PURPOSE = "e2e-configuration"
 # Minor version of the /v1 family. Bump when an optional field, column or registered name is added; a reader
 # of the same major accepts any minor and warns when a file is newer than it knows.
-SCHEMA_MINOR = 2
+SCHEMA_MINOR = 3
 
 # Canonical units. Latency statistics are milliseconds, throughput tokens/s.
 UNIT_MS = "ms"
@@ -426,6 +427,9 @@ class ObservationRow(_Record):
     # Minor 2: raw summary/record digest when record_sha256 binds a larger evidence revision.
     # Older observations use record_sha256 for both purposes.
     raw_record_sha256: Digest | None = None
+    # Minor 3: version of all persisted inputs of the observation (for AIPerf, the observation fields and its request
+    # rows), so a corrected request row changes snapshot membership while the raw audit digests stay put.
+    observation_sha256: Digest | None = None
     # Member of a raw-output bundle: byte range of this observation's record inside the uncompressed
     # bundle. Both null when the artifact holds exactly this observation's record.
     raw_offset: int | None = Field(default=None, ge=0)
@@ -520,6 +524,18 @@ class RequestRow(_Record):
     attrs: str | None = None  # canonical JSON text: think time, dependency IDs, worker ID, ...
 
 
+def _observation_sha256(observation: ObservationRow, requests: Sequence[RequestRow]) -> str:
+    """Version the observation and its persisted request rows, including extension fields."""
+    return _sha(
+        _canonical(
+            {
+                "observation": observation.model_dump(exclude={"observation_sha256"}),
+                "requests": [row.model_dump() for row in requests],
+            }
+        )
+    )
+
+
 class SeriesRow(_Record):
     """One interval of a server-side time series (running requests, KV use, ...).
 
@@ -542,7 +558,19 @@ class SnapshotMember(_Record):
     configuration_id: str = Field(pattern=r"^cfg-[0-9a-f]{64}$")
     observation_id: str = Field(min_length=1)
     record_sha256: Digest
+    observation_sha256: Digest | None = None
     manifest_path: str = Field(min_length=1)
+
+    @classmethod
+    def from_observation(cls, observation: ObservationRow, manifest_path: str) -> SnapshotMember:
+        """Bind membership to both the evidence revision and the complete observation version."""
+        return cls(
+            configuration_id=observation.configuration_id,
+            observation_id=observation.observation_id,
+            record_sha256=observation.record_sha256,
+            observation_sha256=observation.observation_sha256,
+            manifest_path=manifest_path,
+        )
 
 
 class SnapshotAcquisition(_Record):
@@ -768,6 +796,18 @@ def _gzip(data: bytes) -> bytes:
     return gzip.compress(data, compresslevel=6, mtime=0)  # fixed mtime keeps bytes deterministic
 
 
+def _provenance_path(directory: str, item: ProvenanceFile) -> tuple[str, str]:
+    """The artifact name and relative path of one provenance file; the name is validated like any output path.
+
+    The kind prefixes the stored file so a raw output and a log of one name keep distinct bytes. A name may be nested
+    but never leaves its provenance directory.
+    """
+    name = _relative(
+        item.name or f"{item.kind}-{(item.observation_id or _sha(item.data)[:12]).replace(':', '_').replace('/', '_')}"
+    )
+    return name, f"{directory}/provenance/{item.kind}-{name}.gz"
+
+
 def store_provenance(root: Path, directory: str, item: ProvenanceFile) -> tuple[Artifact, ProvenanceInfo]:
     """Write one compressed provenance artifact under ``root/directory/provenance/``.
 
@@ -785,12 +825,7 @@ def store_provenance(root: Path, directory: str, item: ProvenanceFile) -> tuple[
         kept = full[:LOG_EXCERPT_BYTES] + TRUNCATION_MARKER + full[-LOG_EXCERPT_BYTES:]
         truncated = True
     full_sha = _sha(full)
-    # The kind prefixes the stored file so a raw output and a log of one name keep distinct bytes. A name may be
-    # nested but never leaves its provenance directory.
-    name = _relative(
-        item.name or f"{item.kind}-{(item.observation_id or full_sha[:12]).replace(':', '_').replace('/', '_')}"
-    )
-    relative = f"{directory}/provenance/{item.kind}-{name}.gz"
+    name, relative = _provenance_path(directory, item)
     payload = _gzip(kept)
     path = _destination(Path(root), relative)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -823,7 +858,7 @@ def store_provenance(root: Path, directory: str, item: ProvenanceFile) -> tuple[
 
 def read_provenance(root: Path, artifact: Artifact) -> bytes:
     """Verified, decompressed content of a provenance artifact (the excerpt when truncated)."""
-    return gzip.decompress(_verify(Path(root), artifact).read_bytes())
+    return gzip.decompress(_verified_bytes(Path(root), artifact))
 
 
 def bundle_raw_records(records: Sequence[tuple[str, bytes]]) -> tuple[bytes, dict[str, tuple[int, int]]]:
@@ -1019,12 +1054,16 @@ def write_configuration(root: Path, data: E2eConfigurationData, *, prefix: str =
     ``prefix`` (e.g. ``"data"``) is prepended to the configuration directory, so
     every path stays relative to the dataset root. Artifacts use immutable generation paths; only the manifest
     is replaced. Older generations remain available for readers that already opened their manifests.
+    Existing observation versions are refreshed from the rows being published;
+    the caller's objects are left untouched. Legacy unversioned rows stay unversioned.
     """
     root = Path(root)
     body = data.body
     cid = body.configuration_id()
     directory = f"{_relative(prefix)}/{configuration_dir(body)}" if prefix else configuration_dir(body)
     _destination(root, f"{directory}/manifest.json")
+    for item in data.provenance:  # reject a bad provenance name before anything, the root included, is created
+        _destination(root, _provenance_path(directory, item)[1])
     if not data.observations:
         raise ValueError("a configuration needs at least one observation")
     known = {o.observation_id for o in data.observations}
@@ -1037,6 +1076,17 @@ def write_configuration(root: Path, data: E2eConfigurationData, *, prefix: str =
         stray = {r.observation_id for r in rows} - known
         if stray:
             raise ValueError(f"rows reference unknown observations: {sorted(stray)}")
+    requests_by_observation: dict[str, list[RequestRow]] = {}
+    for request in data.requests:
+        requests_by_observation.setdefault(request.observation_id, []).append(request)
+    observations = [
+        o.model_copy(
+            update={"observation_sha256": _observation_sha256(o, requests_by_observation.get(o.observation_id, []))}
+        )
+        if o.observation_sha256 is not None
+        else o
+        for o in data.observations
+    ]
     # Everything is built in a staging directory first: a failure after the tables (an oversize raw artifact, say)
     # must leave an existing configuration readable, so published files are replaced only once all succeeded.
     root.mkdir(parents=True, exist_ok=True)
@@ -1045,7 +1095,7 @@ def write_configuration(root: Path, data: E2eConfigurationData, *, prefix: str =
         # Published artifacts are immutable. Readers holding an older manifest keep its complete generation.
         generation = f"{directory}/generations/{uuid4().hex}"
         artifacts = [
-            _write_table(stage, generation, "observations", OBSERVATIONS_SCHEMA, data.observations, "e2e-observations"),
+            _write_table(stage, generation, "observations", OBSERVATIONS_SCHEMA, observations, "e2e-observations"),
             _write_table(stage, generation, "metrics", METRICS_SCHEMA, data.metrics, "e2e-metrics"),
         ]
         if data.requests:
@@ -1190,6 +1240,8 @@ def evaluation_points(dataset: E2eDataset, *, observer: str | None = None) -> li
     Client and server measurements of one metric are different timing boundaries and never mix: with
     ``observer`` only that observer's rows are used; without it a (metric, statistic) reported twice is
     ambiguous and raises ``ValueError`` instead of letting row order decide.
+    The per-device projection uses ``value``, then ``mean``, or a sole remaining statistic; every statistic stays
+    in ``metrics``. Several other statistics, or several sources at the chosen one, are ambiguous and raise.
     """
     metrics: dict[str, list[MetricRow]] = {}
     for row in dataset.metrics:
@@ -1256,8 +1308,33 @@ def evaluation_points(dataset: E2eDataset, *, observer: str | None = None) -> li
 
 
 def snapshot_id(members: Sequence[SnapshotMember], source_scope: Mapping[str, Any], selection_policy: str) -> str:
-    ordered = sorted((m.model_dump() for m in members), key=lambda m: (m["configuration_id"], m["observation_id"]))
+    # Omit absent additive fields so historical snapshot IDs remain verifiable.
+    ordered = sorted(
+        (m.model_dump(exclude_none=True) for m in members), key=lambda m: (m["configuration_id"], m["observation_id"])
+    )
     return _sha(_canonical({"members": ordered, "source_scope": source_scope, "selection_policy": selection_policy}))
+
+
+def _snapshot_observations(root: Path, manifest_path: str) -> dict[str, ObservationRow]:
+    """Read only verified observation metadata; snapshot binding never needs request tables or logs."""
+    manifest = Manifest.model_validate_json(_file(root, manifest_path).read_bytes())
+    body = body_from_manifest(manifest)
+    if (
+        manifest.category != "e2e"
+        or manifest.purpose != PURPOSE
+        or body.configuration_id() != manifest.configuration_id
+    ):
+        raise ValueError("snapshot requires an e2e configuration manifest")
+    artifacts = [a for a in manifest.artifacts if a.artifact_schema == OBSERVATIONS_SCHEMA and a.format == "parquet"]
+    if len(artifacts) != 1:
+        raise ValueError("snapshot requires exactly one observation table per configuration")
+    table = read_parquet(pa.BufferReader(_verified_bytes(root, artifacts[0])), OBSERVATIONS_SCHEMA)
+    rows = table_to_rows(OBSERVATIONS_SCHEMA, table)
+    if len({o.observation_id for o in rows}) != len(rows):
+        raise ValueError("duplicate observation_id")
+    if any(o.configuration_id != manifest.configuration_id for o in rows):
+        raise ValueError("snapshot observation belongs to another configuration")
+    return {o.observation_id: o for o in rows}
 
 
 def write_snapshot(
@@ -1278,6 +1355,27 @@ def write_snapshot(
     root = Path(root)
     _destination(root, path)
     directory = str(Path(path).parent)
+    # Bind members whose configuration manifest is present under ``root`` to the full version of that observation,
+    # also for callers that supplied only ``record_sha256``. External membership can be built with
+    # ``SnapshotMember.from_observation`` without copying the source artifacts here.
+    observed: dict[str, dict[str, ObservationRow]] = {}
+    bound = []
+    for member in members:
+        _relative(member.manifest_path)
+        if (root / member.manifest_path).is_file():
+            if member.manifest_path not in observed:
+                observed[member.manifest_path] = _snapshot_observations(root, member.manifest_path)
+            observation = observed[member.manifest_path].get(member.observation_id)
+            if observation is None:
+                raise ValueError(f"snapshot observation missing: {member.observation_id}")
+            actual = SnapshotMember.from_observation(observation, member.manifest_path)
+            if (member.configuration_id, member.record_sha256) != (actual.configuration_id, actual.record_sha256):
+                raise ValueError(f"snapshot observation differs: {member.observation_id}")
+            if member.observation_sha256 is not None and member.observation_sha256 != actual.observation_sha256:
+                raise ValueError(f"snapshot observation version differs: {member.observation_id}")
+            member = actual
+        bound.append(member)
+    members = bound
     ordered = sorted(members, key=lambda m: (m.configuration_id, m.observation_id))
     if len({m.observation_id for m in ordered}) != len(ordered):
         raise ValueError("duplicate observation in snapshot membership")
@@ -1820,6 +1918,7 @@ def aiperf_to_configuration(
             }
         )
     )
+    obs.observation_sha256 = _observation_sha256(obs, requests)
     return E2eConfigurationData(body, [obs], rows, requests, provenance)
 
 

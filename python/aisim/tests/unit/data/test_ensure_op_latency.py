@@ -874,6 +874,43 @@ def test_configuration_owner_discovery_and_fetch_share_one_allowance(two_familie
     assert warm.opened == []
 
 
+@pytest.mark.parametrize("policy", ["[]\n", "- malformed\n", "null\n", "42\n"])
+def test_non_mapping_version_policy_is_rejected(tree, tmp_path, policy):  # noqa: F811
+    import hashlib
+
+    published = tmp_path / "published"
+    _build(tree, published)
+    # A hash-consistent external dataset can embed malformed YAML even though our publisher rejects it.
+    # Exercise the consumer's untrusted-input boundary with the original Parquet schema and rows intact.
+    path = published / "data/op-latency/query_versions.parquet"
+    table = pq.read_table(path)
+    metadata = dict(table.schema.metadata)
+    metadata[b"aisim.source_yaml"] = policy.encode()
+    metadata[b"aisim.source_sha256"] = hashlib.sha256(policy.encode()).hexdigest().encode()
+    pq.write_table(table.replace_schema_metadata(metadata), path)
+    dataset_path = published / "catalog/dataset.json"
+    dataset = json.loads(dataset_path.read_text())
+    reference = dataset["categories"]["op-latency"]["index"]
+    index_path = published / reference["path"]
+    index = json.loads(index_path.read_text())
+    artifact = next(a for a in index["support"] if a["path"] == "data/op-latency/query_versions.parquet")
+    artifact.update(sha256=hashlib.sha256(path.read_bytes()).hexdigest(), bytes=path.stat().st_size)
+    index_path.write_text(json.dumps(index))
+    reference.update(sha256=hashlib.sha256(index_path.read_bytes()).hexdigest(), bytes=index_path.stat().st_size)
+    dataset_path.write_text(json.dumps(dataset))
+    config = {k: v for k, v in CONFIG.items() if k != "backend_version"}
+    with pytest.raises(MissingDataError, match="version policy must be a mapping"):
+        ensure_data(config, _pin(published, tmp_path))
+
+
+def test_valid_empty_policy_still_selects_the_latest_held_version(tree, tmp_path):  # noqa: F811
+    (tree / "query_versions.yaml").write_text("schema_version: 1\ndefaults: {}\noverrides: {}\n")
+    published = tmp_path / "published"
+    _build(tree, published)
+    config = {k: v for k, v in CONFIG.items() if k != "backend_version"}
+    assert ensure_data(config, _pin(published, tmp_path)).config["backend_version"] == "2.0"
+
+
 def test_an_exported_root_never_aliases_the_cached_tables(native_dataset, tmp_path):
     from aisim_core.data.materialize import materialize_systems_root
 

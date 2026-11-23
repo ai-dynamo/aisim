@@ -10,7 +10,8 @@ This is the internal library behind ``aisim data fetch`` (DEP #435,
   later read uses that SHA, so a moving ref can never mix revisions.
 * A selection is required. It must name configuration IDs or a hardware filter
   (plus a model for fpm/e2e/eval) and must match at least one catalog entry;
-  an empty selection is an error, never a whole-repository download.
+  an empty selection is an error, never a whole-repository download (``select_all`` is the
+  explicit, opt-in whole-category exception).
 * Files are verified (size, SHA-256, Parquet schema ID and row count) before
   they enter the cache. The cache is keyed by repo + commit + path and entries
   are renamed into place atomically, so an interrupted transfer leaves nothing
@@ -30,7 +31,7 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -48,6 +49,7 @@ from aisim_core.data import (
     _relative,
     configuration_id,
 )
+from aisim_core.data.fpm_layout import storage_path
 from aisim_core.data.parquet import read_parquet_schema_id
 from aisim_core.data.repos import resolve_ref
 
@@ -234,8 +236,13 @@ class Selection:
     # Additional exclusions only for published FPM library entries. Legacy execution-profile preparation
     # verifies every declared artifact, so it must fetch its auxiliary files too.
     library_exclude_roles: tuple[str, ...] = ()
+    # Whole-category selection (every matching entry, no identity filter required). The command line
+    # allows it for op-latency only; FPM, e2e and eval stay selective.
+    select_all: bool = False
 
     def validate(self) -> None:
+        if self.select_all:
+            return
         if not self.configuration_ids:
             if self.hardware is None:
                 raise SelectionError("selection needs configuration_ids or a hardware filter")
@@ -438,9 +445,9 @@ def _verify_file(local: Path, path: str, expected: PlannedFile) -> None:
 # --------------------------------------------------------------------------- plan
 
 
-def _ref(artifact: Artifact, role: str) -> PlannedFile:
+def _ref(artifact: Artifact, role: str, category_roots: Mapping[str, str] | None = None) -> PlannedFile:
     return PlannedFile(
-        path=artifact.path,
+        path=storage_path(artifact.path, category_roots or {}),
         bytes=artifact.bytes,
         sha256=artifact.sha256,
         role=role,
@@ -579,10 +586,12 @@ def plan(
     if raw is None:
         return out
     dataset = parse(DatasetIndex, raw, DATASET_INDEX_PATH)
+    category_roots = {name: ref.root for name, ref in dataset.categories.items()}
+
     reference = dataset.categories.get(selection.category)
     if reference is None:
         raise SelectionError(f"dataset has no {selection.category!r} category")
-    raw = planner.read(_ref(reference.index, "index"))
+    raw = planner.read(_ref(reference.index, "index", category_roots))
     if raw is None:
         return out
     index = parse(CategoryIndex, raw, reference.index.path)
@@ -592,9 +601,9 @@ def plan(
     if not entries:
         raise SelectionError("selection matched no catalog entries")
     for artifact in index.support:  # files every selection of the category needs, e.g. the op-latency lookups
-        planner._add(_ref(artifact, "artifact"))
+        planner._add(_ref(artifact, "artifact", category_roots))
     for entry in entries:
-        raw = planner.read(_ref(entry.manifest, "manifest"))
+        raw = planner.read(_ref(entry.manifest, "manifest", category_roots))
         if raw is None:
             continue
         manifest = parse(Manifest, raw, entry.manifest.path)
@@ -607,7 +616,7 @@ def plan(
             if artifact.role not in excluded and (
                 not prediction_only or artifact.role in ("fpm-library", "fpm-library-metadata")
             ):
-                planner._add(_ref(artifact, "artifact"))
+                planner._add(_ref(artifact, "artifact", category_roots))
     out.files.sort(key=lambda f: f.path)
     if offline:
         out.missing = sorted({*out.missing, *(f.path for f in out.files if not f.cached)})
@@ -627,6 +636,7 @@ def fetch(
     max_bytes: int | None = None,
     allow_over_budget: bool = False,
     offline: bool = False,
+    pinned_sha: str | None = None,
 ) -> FetchResult:
     """Resolve once, plan, enforce the budget, then download and verify.
 
@@ -634,12 +644,17 @@ def fetch(
     nothing); a larger plan raises :class:`BudgetExceededError` before any
     artifact transfer unless ``allow_over_budget`` is set. Offline with any
     file missing raises :class:`OfflineMissingError` listing every such file.
+    ``pinned_sha`` is a commit an earlier plan already resolved for ``revision``: it is used instead of resolving
+    the revision again, while ``repo`` and ``revision`` still select the source, so a retired repository's alias and
+    its path mapping apply to a commit that belongs to the successor.
     """
     if max_bytes is not None and max_bytes < 0:
         raise ValueError("max_bytes must be non-negative")
+    if pinned_sha is not None and not _FULL_SHA.fullmatch(pinned_sha):
+        raise RevisionError(f"pinned_sha must be a full 40-hex commit SHA, got {pinned_sha!r}")
     repo, revision, transport = _resolve_source(repo, revision, transport, selection.category)
     cache = cache or Cache()
-    sha = resolve_revision(transport, repo, revision, offline=offline)
+    sha = pinned_sha or resolve_revision(transport, repo, revision, offline=offline)
     result_plan = plan(
         selection,
         repo=repo,
@@ -718,7 +733,8 @@ def load_category_index(
     reference = dataset.categories.get(category)
     if reference is None:
         raise SelectionError(f"dataset has no {category!r} category")
-    index = parse(CategoryIndex, planner.read(_ref(reference.index, "index")), reference.index.path)
+    category_roots = {name: ref.root for name, ref in dataset.categories.items()}
+    index = parse(CategoryIndex, planner.read(_ref(reference.index, "index", category_roots)), reference.index.path)
     if index.category != category:
         raise IntegrityError(reference.index.path, f"category index names {index.category!r}, not {category!r}")
     return sha, index, dataset
@@ -748,7 +764,7 @@ def fetch_support(
         if _accounting is not None
         else FetchPlan(repo=repo, revision=sha, requested_revision=revision, offline=offline)
     )
-    sha, index, _ = load_category_index(
+    sha, index, dataset = load_category_index(
         category,
         repo=repo,
         revision=sha,
@@ -760,8 +776,9 @@ def fetch_support(
     )
     planner = _Planner(transport, cache, accounting, budget=max_bytes)
     paths: dict[str, Path] = {}
+    category_roots = {name: ref.root for name, ref in dataset.categories.items()}
     for artifact in index.support:
-        ref = _ref(artifact, "artifact")
+        ref = _ref(artifact, "artifact", category_roots)
         if planner.read(ref) is None:
             raise OfflineMissingError([ref.path])
         paths[ref.path] = cache.path_for(repo, sha, ref.path)

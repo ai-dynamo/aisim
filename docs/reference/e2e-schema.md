@@ -52,7 +52,7 @@ One canonical name per concept; stored data uses only canonical names (`b300_sxm
 | statistic | `mean`, `median`, `p90`, `std` | `p50` is an alias of `median` |
 | phase | `warmup`, `profile` | `preparation` is an alias of `warmup` |
 
-Check a directory before a pull request with [`aisim data check-names`](cli.md#check-canonical-names). A name that
+Check a directory before a pull request with [`aisim data validate`](cli.md#validate-dataset). A name that
 is not canonical is still stored, but it is reported with the canonical spelling to use, and consumers ignore it
 until the data is fixed. External contributors convert to canonical names first; the dataset's `AGENTS.md` and
 `CONTRIBUTING.md` instruct a contributor's agent to do it.
@@ -106,10 +106,17 @@ with no column yet).
 |---|---|---|
 | `record_sha256` | yes | Observation evidence revision, used by snapshot membership |
 | `raw_record_sha256` | no | Minor 2: digest of the raw record or summary when the evidence revision covers additional inputs; when absent, readers use `record_sha256` |
+| `observation_sha256` | no | Minor 3: version of the canonical observation fields (excluding the digest itself) and its persisted request rows in table order |
 
 The AIPerf converter binds the evidence revision to the summary, request records, observation metadata and log
 digest. Correcting a request changes snapshot membership even when the summary is unchanged. Raw-summary
 auditing uses `raw_record_sha256` separately.
+
+When present, `observation_sha256` is also part of snapshot membership (`SnapshotMember.observation_sha256`), and
+`write_snapshot` binds members whose configuration is available locally to the persisted observation. The
+configuration writer refreshes the digest from the rows it publishes, so edited requests change snapshot membership
+even when the raw summary is unchanged. Unversioned legacy observations and members keep their existing behavior
+and snapshot IDs.
 
 ### Metrics (`aisim-e2e-metrics/v1`)
 
@@ -121,7 +128,8 @@ explicit `missing` rows.
 
 The evaluator preserves throughput normalization and statistic in its full metrics map. Its per-device summary
 uses statistic `value`, then `mean`, then the sole available statistic. Multiple normalization sources at that
-statistic are ambiguous and rejected, so row order cannot choose between reported and derived throughput.
+statistic, or several other statistics with neither `value` nor `mean`, are ambiguous and rejected, so row order
+cannot choose between reported and derived throughput. Duplicate evaluator keys are rejected as well.
 
 ### Requests (`aisim-e2e-requests/v1`)
 

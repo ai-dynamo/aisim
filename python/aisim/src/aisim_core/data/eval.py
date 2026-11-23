@@ -391,7 +391,11 @@ def compute_results(
                 reason = "non-finite truth"
             excluded[case_id] = Exclusion(case_id=case_id, reason=reason)
             continue
-        errors.append((case_id, truth, predicted, (predicted - truth) / truth * 100.0))
+        residual = (predicted - truth) / truth * 100.0
+        if not math.isfinite(residual):
+            excluded[case_id] = Exclusion(case_id=case_id, reason="non-finite residual")
+            continue
+        errors.append((case_id, truth, predicted, residual))
     n_total = len(cases)
     n_scored = len(errors)
     if errors:
@@ -448,6 +452,9 @@ def verify_record(
     the record's. GPU-free and deterministic. ``truth_root`` is the directory
     that holds the truth artifacts by their ``path``.
     """
+    # The predictor is caller code and may mutate the original record, including nested fields.
+    # Bind all checks and the report ID to the same private pre-prediction snapshot.
+    record = record.model_copy(deep=True)
     problems: list[str] = []
     checked_id = record.record_id
     if current_fingerprint != record.prediction.fingerprint:

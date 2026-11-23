@@ -431,6 +431,16 @@ def _main(argv: Sequence[str] | None, cleanup: ExitStack) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(arguments)
+    if args.command in ("data", "fetch", "init"):
+        # Dataset commands download for minutes and need no execution supervision.
+        from .data_cli import run_data_command
+
+        if args.command != "data":
+            args.data_command = args.command
+        try:
+            return run_data_command(args)
+        except KeyboardInterrupt:
+            return 130
     if args.command == "onboard":
         from .support.cli import run_support_command
 

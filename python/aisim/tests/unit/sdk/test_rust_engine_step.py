@@ -209,7 +209,7 @@ def test_clear_all_op_caches_drops_engine_handles(_handle_cache_harness) -> None
     assert not rust_engine_step._ENGINE_HANDLE_CACHE
 
 
-def test_cached_engine_handle_mirrors_database_systems_root(_handle_cache_harness, monkeypatch) -> None:
+def test_cached_engine_handle_mirrors_database_systems_root(_handle_cache_harness, monkeypatch, tmp_path) -> None:
     """The compiled engine must resolve the system yaml from the root the
     paired database actually matched (multi-root ``--systems-paths``), not the
     process-wide env default; the env is only the fallback for duck-typed
@@ -233,6 +233,17 @@ def test_cached_engine_handle_mirrors_database_systems_root(_handle_cache_harnes
     del database.systems_root
     rust_engine_step._cached_engine_handle(model("fallback"), database)
     assert captured[-1] == "/env/root"
+
+    monkeypatch.delenv("AICONFIGURATOR_SYSTEMS_PATH")
+    systems_root = tmp_path / "systems"
+    systems_root.mkdir()
+    monkeypatch.setattr(
+        "aisim_core.sdk.perf_database.get_systems_paths",
+        lambda: [str(systems_root)],
+    )
+    rust_engine_step._cached_engine_handle(model("sdk-default"), database)
+    assert captured[-1] == str(systems_root)
+    assert "AICONFIGURATOR_SYSTEMS_PATH" not in os.environ
 
 
 def _dense_model() -> SimpleNamespace:
