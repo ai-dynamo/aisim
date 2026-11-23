@@ -243,6 +243,21 @@ mod tests {
     }
 
     #[test]
+    fn traffic_spec_deserializes_and_builds_a_workload() {
+        use aisim_core::replay::{
+            ReplayRuntimeInput, TrafficBuildOptions, TrafficSpec, build_traffic,
+        };
+
+        let spec: TrafficSpec = serde_json::from_value(serde_json::json!({
+            "source_type": "synthetic", "load_type": "concurrency",
+            "isl": 64, "osl": 8, "request_count": 3, "concurrency": 1
+        }))
+        .unwrap();
+        let built = build_traffic(spec, &TrafficBuildOptions::new(64)).unwrap();
+        assert!(matches!(built.input, ReplayRuntimeInput::Workload(_)));
+    }
+
+    #[test]
     fn afd_public_pipeline_layouts_construct_replay_topology() {
         use aisim_core::engine::{AfdAPoolConfig, AfdEngineConfig, AfdFPoolConfig};
         use aisim_core::{AfdPipelineLayout, AfdRoutingLocation};

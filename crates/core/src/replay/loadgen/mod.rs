@@ -52,7 +52,6 @@ pub use types::{
     TraceFileFormat, TurnTrace, ValidatedAgenticGraph, effective_replay_key,
     output_replay_id_annotation,
 };
-#[cfg(feature = "python")]
 pub(crate) use weka::load_weka_agentic_graph_cached;
 pub use weka::{
     WekaChatTemplate, WekaClient, WekaImportOptions, WekaImportSummary, WekaImporter,

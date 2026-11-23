@@ -1928,6 +1928,17 @@ def test_powered_fpm_replay_rejects_generic_speculation(schema8_fpm_config):
         _runtime.run_replay_json(json.dumps(execution))
 
 
+def test_materialize_runtime_traffic_keeps_native_fields_and_defaults_the_block_size(schema8_fpm_config):
+    from aisim.runner import materialize_runtime_traffic
+
+    config, _ = schema8_fpm_config
+    spec = prediction_to_replay_spec(config)
+    traffic = materialize_runtime_traffic(spec, trace_block_size=512)
+    assert traffic["source_type"] == spec.workload["source_type"]
+    assert traffic["trace_block_size"] == 512
+    assert set(traffic) <= set(spec.workload) | {"trace_block_size"}
+
+
 def test_schema7_fpm_replay_stays_latency_only(schema8_fpm_config, tmp_path):
     config, _ = schema8_fpm_config
     raw = config.model_dump(mode="json", exclude_none=True)
