@@ -1,0 +1,194 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 1
+op: moe
+description: Base collector v2 cases for moe.
+common_case_values:
+  moe:
+    token_counts:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    - 48
+    - 64
+    - 80
+    - 96
+    - 128
+    - 160
+    - 192
+    - 256
+    - 320
+    - 384
+    - 512
+    - 768
+    - 1024
+    - 1536
+    - 2048
+    - 3072
+    - 4096
+    - 6144
+    - 8192
+    - 12288
+    - 16384
+    - 32768
+    - 65536
+    tensor_parallel_sizes:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    expert_parallel_sizes:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    - 128
+    - 256
+    gpu_counts:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    - 128
+    - 256
+    token_expert_distributions:
+    - name: balanced
+      power_law_alpha: 0.0
+    - name: power_law
+      power_law_alpha: 1.01
+    - name: power_law
+      power_law_alpha: 1.2
+    constraints:
+    - tensor_parallel_size * expert_parallel_size == gpu_count
+    - expert_parallel_size <= num_experts
+    - num_experts % expert_parallel_size == 0
+    - inter_size % tensor_parallel_size == 0
+    - tensor_parallel_size < max_tp_exclusive when max_tp_exclusive is set
+    # The quant-mode axis every CUDA backend plans. A model row that declares
+    # quantization_modes plans only those (its checkpoint's quantization); a
+    # row that declares none plans every mode below. allowed_model_paths keeps
+    # a checkpoint-specific format to the models that ship it. A mode an SM or
+    # one backend cannot run is an entry in collector/skips.py.
+    quantization_modes:
+    - name: bfloat16
+    - name: fp8
+    - name: fp8_block
+    - name: int4_wo
+      allowed_model_paths:
+      - moonshotai/Kimi-K2.5
+      module_config:
+        group_size: 32
+    - name: nvfp4
+    - name: w4a16_mxfp4
+      allowed_model_paths:
+      - moonshotai/Kimi-K3
+      - openai/gpt-oss-20b
+      - openai/gpt-oss-120b
+    - name: w4a8_mxfp4_mxfp8
+      allowed_model_paths:
+      - deepseek-ai/DeepSeek-V4-Flash
+      - deepseek-ai/DeepSeek-V4-Pro
+      - moonshotai/Kimi-K3
+      - openai/gpt-oss-20b
+      - openai/gpt-oss-120b
+  moe_sglang:
+    backends:
+      default: {default: triton}
+      bfloat16: {default: triton}
+      fp8_block: {default: triton}
+      # SM100/103: pinned SGLang 0.5.14 serving auto-selects flashinfer_trtllm
+      # for Kimi K2/K2.5 INT4 (server_args.py:3736 -> CompressedTensorsMxInt4MoE).
+      # B200 hardware validation: Kimi-filtered moe pipeline run.
+      # SM89/SM90/SM120: the forcing block above sits under
+      # `if is_sm100_supported()` (server_args.py:3684), which is capability
+      # major == [10] exactly (utils/common.py:282) — so on SM89/90/120 the
+      # runner backend stays auto and get_moe_scheme falls through the
+      # flashinfer_trtllm/hip/triton gates to CompressedTensorsWNA16MoE
+      # (compressed_tensors.py:676-698), whose create_moe_runner
+      # unconditionally selects Marlin (compressed_tensors_wNa16_moe.py:412-416,
+      # min_capability 80 = Ampere+). No other server_args branch touches
+      # compressed-tensors int4 on these SMs (3787 is DeepseekV4-only, 5099
+      # modelopt_fp4-only). All at image source 49e384ce. SM89 hardware
+      # precedent: l40s 0.5.10 shipped 19,035 Marlin int4 moe rows.
+      int4_wo: {89: marlin, 90: marlin, 100: flashinfer_trtllm, 103: flashinfer_trtllm, 120: marlin}
+      # NVFP4 SM120: serving auto resolves to FLASHINFER_TRTLLM
+      # (modelopt_quant.py:2317-2323 — capability (12,0) is outside the
+      # (8,0)..(10,0) Marlin fallback), but the trtllm-gen batched FP4 GEMM
+      # has no SM120 kernel (RTX 6000 Pro probe
+      # trtllm_batched_gemm_runner.cu:286 "Error occurred when running
+      # GEMM"). flashinfer_cutlass is the only runnable high-level FusedMoE
+      # NVFP4 path on SM120 and requires the explicit
+      # --moe-runner-backend flashinfer_cutlass in serving.
+      nvfp4: {100: flashinfer_trtllm, 103: flashinfer_trtllm, 120: flashinfer_cutlass}
+      # SGLang 0.5.23 leaves SM89/SM90 GPT-OSS at EP>1 on auto, whose
+      # Mxfp4MoEMethod resolves to Triton (layers/quantization/mxfp4.py:
+      # 1443-1450); at EP1 it serves triton_kernel (arg_groups/model_overrides/
+      # gpt_oss.py:102-120), which the op plan's dispatch picks where this pin
+      # is Triton (collector/op_plans.py _sglang_moe_runner).
+      # SM100/103 select FlashInfer MXFP4 (arg_groups/model_overrides/
+      # gpt_oss.py:64-68). SM120 serves GPT-OSS as MXFP8 x MXFP4 (the w4a8 pin
+      # below), so collector/skips.py leaves the SM120 GPT-OSS W4A16 cases out
+      # and the SM120 pin here is not planned.
+      w4a16_mxfp4: {89: triton, 90: triton, 100: flashinfer_mxfp4, 103: flashinfer_mxfp4, 120: marlin}
+      # flashinfer_mxfp4 runs MXFP8 activations on the trtllm-gen leaf on
+      # SM100/103 and on the CUTLASS MXFP8 x MXFP4 kernel on SM120, where SGLang
+      # serves GPT-OSS (gpt_oss.py:69-74; mxfp4.py:426-427) and the DeepSeek-V4
+      # FP4 experts (model_overrides/deepseek_v4.py:75-88;
+      # mxfp4_flashinfer_cutlass_moe.py:36-44) on it.
+      w4a8_mxfp4_mxfp8: {100: flashinfer_mxfp4, 103: flashinfer_mxfp4, 120: flashinfer_mxfp4}
+  moe_vllm_xpu:
+    token_counts:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    - 48
+    - 64
+    - 80
+    - 96
+    - 128
+    - 160
+    - 192
+    - 256
+    - 320
+    - 384
+    - 512
+    - 768
+    - 1024
+    - 1536
+    - 2048
+    - 3072
+    - 4096
+    - 6144
+    - 8192
+    - 12288
+    - 16384
+    sweeps:
+      small:
+        tensor_parallel_sizes: [1, 2, 4, 8]
+        expert_parallel_sizes: [1, 2, 4, 8]
+        gpu_counts: [1, 2, 4, 8]
+      full:
+        tensor_parallel_sizes: [1, 2, 4, 8, 16, 32]
+        expert_parallel_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+        gpu_counts: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+    quantization_modes:
+    - name: bfloat16
+    - name: fp8
+      requires_runtime_feature: torch_fp8_e4m3fn
+    - name: w4a16_mxfp4
+      requires_model_quantization_config: true

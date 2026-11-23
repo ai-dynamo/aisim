@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-FileCopyrightText: Copyright 2023-2026 SGLang Team
 // SPDX-License-Identifier: Apache-2.0
+// Hybrid checkpoint contract adapted and modified from SGLang (Apache-2.0).
+// Copyright 2023-2026 SGLang Team.
+// Source: https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/python/sglang/srt/runtime_context.py
+// See THIRD_PARTY_NOTICES.md for the complete source list and modification scope.
 // Modified behavioral adaptation of SGLang v0.5.22; see THIRD_PARTY_NOTICES.md.
 // Source: https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
 
@@ -166,6 +170,7 @@ pub(crate) enum KvTransferTimingMode {
 /// Materialized SGLang controls used by the moved scheduler implementation.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SglangArgs {
+    pub mamba_cache: Option<crate::engine::SglangMambaCacheConfig>,
     pub hicache: Option<crate::engine::SglangHiCacheConfig>,
     pub schedule_policy: Option<String>,
     pub page_size: Option<usize>,
@@ -173,11 +178,13 @@ pub(crate) struct SglangArgs {
     pub chunked_prefill_size: Option<usize>,
     pub clip_max_new_tokens: Option<usize>,
     pub schedule_conservativeness: Option<f64>,
+    pub scheduler_select_time_ms: f64,
     pub vlm_cache_bytes: Option<u64>,
     pub host_loop: bool,
     pub disaggregation_decode_enable_radix_cache: bool,
     pub num_reserved_decode_tokens: Option<usize>,
     pub disaggregation_decode_extra_slots: Option<usize>,
+    pub swa_prefix_tails: Option<usize>,
     pub frontend: Option<FrontendConfig>,
 }
 
@@ -209,6 +216,9 @@ pub(crate) struct MockEngineArgs {
     /// `EngineConfig::max_concurrent_batches`.
     #[builder(default = "1")]
     pub max_concurrent_batches: usize,
+    /// `EngineConfig::launch`.
+    #[builder(default = "None")]
+    pub launch: Option<crate::engine::PassLaunchConfig>,
     #[builder(default = "true")]
     pub enable_prefix_caching: bool,
     #[builder(default = "true")]
@@ -217,6 +227,9 @@ pub(crate) struct MockEngineArgs {
     pub speedup_ratio: f64,
     #[builder(default = "1.0")]
     pub decode_speedup_ratio: f64,
+    /// Later pipeline stages a prefill forward still crosses after its pass retires (PP prefill).
+    #[builder(default = "0.0")]
+    pub pipeline_fill_passes: f64,
     #[builder(default = "WorkerType::Aggregated")]
     pub worker_type: WorkerType,
     #[builder(default = "Arc::new(PerfModel::Polynomial)")]
@@ -227,6 +240,9 @@ pub(crate) struct MockEngineArgs {
     pub aic_nextn_accept_rates: Option<String>,
     #[builder(default = "42")]
     pub aic_mtp_seed: u64,
+    /// MTP keeps vLLM's non-speculative prefix-cache rules.
+    #[builder(default = "false")]
+    pub disable_eagle_block_drop: bool,
     #[builder(default = "None")]
     pub kv_transfer_bytes_per_token: Option<usize>,
     #[builder(default = "None")]
@@ -235,6 +251,10 @@ pub(crate) struct MockEngineArgs {
     pub kv_cache_groups: Vec<crate::perfmodel::FpmCacheGroup>,
     #[builder(default = "None")]
     pub kv_cache_capacity_bytes: Option<u64>,
+    /// The vLLM release whose grouped-cache rules apply; see
+    /// `EngineConfig::vllm_version`.
+    #[builder(default = "None")]
+    pub vllm_version: Option<String>,
     #[builder(default = "None")]
     pub native_host_offload: Option<NativeHostOffloadConfig>,
     #[builder(default = "None")]

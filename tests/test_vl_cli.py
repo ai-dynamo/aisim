@@ -12,14 +12,18 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from aisimulate.capacity import materialize_aic_num_gpu_blocks
-from aisimulate.compiler import prediction_to_replay_spec
-from aisimulate.config.cli import CorePredictionConfig, CoreRecommendationConfig
-from aisimulate.config.vl import validate_vl_prediction_mapping
-from aisimulate.main import main
-from aisimulate.recommend import recommendation_to_sweeper
-from aisimulate.runner import EngineReplayRunnerFactory, InvalidRunnerError
-from aisimulate.sweeper import SweepResult
+from aisim.capacity import materialize_aic_num_gpu_blocks
+from aisim.compiler import prediction_to_replay_spec
+from aisim.config.cli import CorePredictionConfig, CoreRecommendationConfig
+from aisim.config.vl import validate_vl_prediction_mapping
+from aisim.main import main
+from aisim.recommend import recommendation_to_sweeper
+from aisim.runner import EngineReplayRunnerFactory, InvalidRunnerError
+from aisim.sweeper import SweepResult
+from aisim_core.ais_perf_model import AisPerfModelDeprecationWarning
+
+# AISim still writes the old estimator fields into the configs it saves, so reading one back warns.
+reads_saved_config = pytest.mark.filterwarnings("ignore::aisim_core.ais_perf_model.AisPerfModelDeprecationWarning")
 
 
 def _prediction():
@@ -74,11 +78,23 @@ def test_native_vl_lowering_targets_the_host_aware_sglang_rank(cache_mib):
     assert spec.workload["isl"] == 128  # placeholders are laid out by the workload driver
 
 
+def test_host_aware_rank_rounds_an_unaligned_chunk_to_whole_pages():
+    raw = _prediction()
+    worker = raw["engine"]["workers"]["aggregated"]
+    worker["scheduler"]["max_batched_tokens"] = 2049
+    worker["kv_cache"]["block_size"] = 16
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
+    args = spec.backend_deployment.agg_engine_args
+    assert args["sglang"]["host_loop"] is True
+    assert args["sglang"]["chunked_prefill_size"] == 2048
+
+
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("cache_mib", [0, 100])
 def test_native_vl_memory_detail_matches_schema(tmp_path, capsys, cache_mib):
     from jsonschema import Draft202012Validator
 
-    from aisimulate.detail import format_prediction_details
+    from aisim.detail import format_prediction_details
 
     raw = _prediction()
     worker = raw["engine"]["workers"]["aggregated"]
@@ -137,6 +153,7 @@ def test_vision_requires_an_image_workload():
         CorePredictionConfig.model_validate(raw)
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_native_vl_predict_reports_ttft_milestones(tmp_path, capsys):
     path = tmp_path / "predict.yaml"
     path.write_text(yaml.safe_dump(_prediction()))
@@ -183,6 +200,14 @@ def test_native_vl_predict_reports_ttft_milestones(tmp_path, capsys):
             < record["prefill_complete_ms"]
             <= record["first_token_ms"]
         )
+
+
+def test_host_aware_rank_keeps_the_swa_prefix_tail_bound():
+    raw = _prediction()
+    raw["engine"]["workers"]["aggregated"]["kv_cache"]["swa_prefix_tails"] = 100
+    args = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw)).backend_deployment.agg_engine_args
+    assert args["sglang"]["host_loop"] is True
+    assert args["sglang"]["swa_prefix_tails"] == 100
 
 
 def test_images_encode_on_the_language_worker_without_a_host_loop():
@@ -291,7 +316,7 @@ def test_host_profile_misses_fail_closed_with_the_collect_command(tmp_path, kind
     assert "has no row for" in message
     # The failure names the exact measurement that would add the row; a text-only
     # length is not part of it.
-    assert "-m aisimulate.vl.collect" in message and f"--frontend {frontend}" in message
+    assert "-m aisim.vl.collect" in message and f"--frontend {frontend}" in message
     count = 2 if kind == "count" else 1
     assert f"--images 448x448x{count} --encoding " + ("jpeg" if kind == "encoding" else "png") in message
     assert "--text-tokens" not in message
@@ -324,6 +349,7 @@ def _recommendation():
     return raw
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_native_vl_recommend_yaml_predict_roundtrip(tmp_path, capsys):
     recommendation = _recommendation()
     # A relative stop is resolved per candidate; the saved prediction must still be
@@ -354,7 +380,8 @@ def test_native_vl_recommend_yaml_predict_roundtrip(tmp_path, capsys):
     assert candidate.config["agg_frontend"]["stages"][0]["service_ms"] == 3.0
 
     saved = root / "recommendations" / "0001.yaml"
-    concrete = CorePredictionConfig.from_yaml(saved)
+    with pytest.warns(AisPerfModelDeprecationWarning):
+        concrete = CorePredictionConfig.from_yaml(saved)
     assert concrete.engine.workers.aggregated.host_loop is True
     assert concrete.engine.workers.aggregated.frontend.stages[0].service_ms == 3.0
     assert concrete.engine.workers.aggregated.vision.cache_mib == 100
@@ -390,6 +417,8 @@ def test_native_vl_recommend_yaml_predict_roundtrip(tmp_path, capsys):
         validate_vl_prediction_mapping(raw, spec)
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
+@reads_saved_config
 def test_profile_backed_recommendation_pins_the_resolved_stages(tmp_path, capsys):
     path = tmp_path / "table.json"
     path.write_text(json.dumps(_host_table()))
@@ -484,6 +513,8 @@ def test_rust_profiles_resolve_only_the_transports_the_tp_domain_uses(tmp_path):
     assert transports(4) == {"shm": 5.0}
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
+@reads_saved_config
 def test_text_only_host_tables_reach_predict_and_recommend_alike(tmp_path, capsys):
     raw = _prediction()
     del raw["traffic"]["source"]["images"]
@@ -536,9 +567,10 @@ def test_materialized_request_lists_reject_image_workloads():
         EngineReplayRunnerFactory().create(0).run(legacy)
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("mode", ["aggregated", "disaggregated"])
 def test_nested_rank_vision_replays_like_the_flat_worker(mode):
-    from aisimulate.runner import _materialize_engine_role
+    from aisim.runner import _materialize_engine_role
 
     raw = _prediction() if mode == "aggregated" else _disaggregated_prediction()
     spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
@@ -575,6 +607,7 @@ def _disaggregated_prediction():
     return raw
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_native_vl_disaggregated_prefill_hosts_the_loop_and_the_encoder(tmp_path, capsys):
     raw = _disaggregated_prediction()
     deployment = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw)).backend_deployment
@@ -621,6 +654,8 @@ def test_native_vl_schema_rejects_host_fields_on_the_decode_worker():
         CorePredictionConfig.model_validate(raw)
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
+@reads_saved_config
 def test_native_vl_disaggregated_recommend_keys_the_prefill_worker(tmp_path, capsys):
     raw = _disaggregated_prediction()
     for role in ("prefill", "decode"):
@@ -682,6 +717,7 @@ def _native_epd_prediction(table_path):
     return raw
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_native_encoder_pool_gates_the_language_worker(tmp_path, capsys):
     table = tmp_path / "table.json"
     table.write_text(json.dumps(_host_table()))
@@ -763,6 +799,7 @@ def test_native_encoder_pool_rejects_unsupported(kind, fragment):
         CorePredictionConfig.model_validate(raw)
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_native_encoder_pool_honors_the_pixel_budget(tmp_path):
     table = tmp_path / "table.json"
     table.write_text(json.dumps(_host_table()))
@@ -781,6 +818,7 @@ def test_native_encoder_pool_honors_the_pixel_budget(tmp_path):
     assert encoder.native.transfer_bytes_per_image < default.encoder.native.transfer_bytes_per_image
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_native_encoder_pool_recommend_yaml_predict_roundtrip(tmp_path, capsys):
     table = tmp_path / "table.json"
     table.write_text(json.dumps(_host_table()))
@@ -831,6 +869,7 @@ def test_native_encoder_pool_recommend_yaml_predict_roundtrip(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["encoder_latency_ms"] == report["encoder_latency_ms"]
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_native_encoder_pool_accepts_rate_loads(tmp_path, capsys):
     table = tmp_path / "table.json"
     table.write_text(json.dumps(_host_table()))
@@ -842,6 +881,7 @@ def test_native_encoder_pool_accepts_rate_loads(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["completed_requests"] == 4
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("case", ["constant_rate", "rate_relative_stop", "kv_capacity_fraction", "fixed_timing"])
 def test_prediction_mapping_accepts_the_scored_spellings(case):
     """The callback compares resolved execution meaning, not the compiler's derived keys."""

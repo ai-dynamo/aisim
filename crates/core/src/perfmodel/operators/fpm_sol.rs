@@ -761,13 +761,13 @@ mod tests {
     /// intra_node_bw 8.1e11, inter_node_bw 4e10 (systems/b200_sxm.yaml).
     fn spec() -> SystemSpec {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisimulate/src/aisimulate_core/systems/b200_sxm.yaml");
+            .join("../../python/aisim/src/aisim_core/systems/b200_sxm.yaml");
         SystemSpec::load(&root).expect("b200 spec")
     }
 
     fn db() -> PerfDatabase {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisimulate/src/aisimulate_core/systems");
+            .join("../../python/aisim/src/aisim_core/systems");
         PerfDatabase::load(&root, "b200_sxm", "vllm", "0.19.0").expect("db")
     }
 
@@ -844,7 +844,7 @@ mod tests {
         use crate::operators::{Dsv41MhcOp, Dsv41StageOp};
 
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisimulate/src/aisimulate_core/systems");
+            .join("../../python/aisim/src/aisim_core/systems");
         let db = PerfDatabase::load(&root, "gb200", "vllm", "0.19.0").expect("GB200 db");
         let leaf = Dsv41MhcOp {
             name: "mhc".into(),
@@ -887,8 +887,8 @@ mod tests {
 
     /// Python oracle:
     /// PYTHONPATH=aic-core/src python3 -c "
-    /// from aisimulate_core.sdk import perf_database, common
-    /// from aisimulate_core.sdk.operations.gemm import GEMM
+    /// from aisim_core.sdk import perf_database, common
+    /// from aisim_core.sdk.operations.gemm import GEMM
     /// view = perf_database.get_database_view('b200_sxm','vllm','0.19.0',database_mode='SOL',allow_missing_data=True)
     /// op = GEMM('qkv_gemm', 1.0, 4096, 4096, common.GEMMQuantMode.nvfp4)
     /// print(repr(float(op.query(view, x=8192.0, batch_size=4, beam_width=1, s=2048.0, prefix=0.0))))"
@@ -951,8 +951,8 @@ mod tests {
 
     /// Python oracle:
     /// PYTHONPATH=aic-core/src python3 -c "
-    /// from aisimulate_core.sdk import perf_database, common
-    /// from aisimulate_core.sdk.operations.attention import ContextAttention, GenerationAttention
+    /// from aisim_core.sdk import perf_database, common
+    /// from aisim_core.sdk.operations.attention import ContextAttention, GenerationAttention
     /// view = perf_database.get_database_view('b200_sxm','vllm','0.19.0',database_mode='SOL',allow_missing_data=True)
     /// op = ContextAttention('context_attention', 1.0, 48, 8, 128, kvcache_quant_mode=common.KVCacheQuantMode.fp8, fmha_quant_mode=common.FMHAQuantMode.bfloat16)
     /// print(repr(float(op.query(view, x=1, batch_size=4.0, beam_width=1, s=682.6666666666666, prefix=128.5))))"
@@ -1106,6 +1106,8 @@ mod tests {
             pp_size: 2,
             hidden_size: 6144,
             seq_split: 1,
+            span_gpus: None,
+            force_scale_out: false,
         };
         approx(
             p2p_sol(&p2p, &s, 8192.0),
@@ -1345,68 +1347,78 @@ mod tests {
     }
 
     #[test]
-    fn kimi_k31_fpm_sol_uses_the_selected_cache_layout() {
+    fn kimi_fpm_sol_rejects_unsupported_geometry_and_ambiguous_backend() {
         let d = db();
-        let mut prefill = Vec::new();
-        // TP8, one decode request with 4096 cached tokens: weights plus
-        // FP8 index history and 2048 selected latent entries. FlashMLA's
-        // entries are 656 bytes, TRTLLM's 576 bytes, a 163840-byte delta.
-        for (backend, expected_decode_ms) in
-            [("trtllm_mla", 0.098001920), ("flashmla", 0.098165760)]
-        {
-            let mut op = DsaModuleOp::new(
-                "attention",
-                12,
-                KvCacheQuantMode::Fp8,
-                FmhaQuantMode::Bfloat16,
-                GemmQuantMode::Bfloat16,
-                "KimiK31ForConditionalGeneration",
-                2048,
-            );
-            op.attention_backend = Some(backend.into());
-            approx(
-                op_sol_latency_ms(&Op::DsaGeneration(op.clone()), &d, 1.0, 1.0, 4096.0, 0.0)
-                    .unwrap(),
-                expected_decode_ms / 7.7,
-            );
-            prefill
-                .push(op_sol_latency_ms(&Op::DsaContext(op), &d, 64.0, 1.0, 64.0, 4096.0).unwrap());
-        }
-        assert!(
-            prefill[1] > prefill[0],
-            "prefill must retain the FlashMLA cache footprint"
-        );
-    }
-
-    #[test]
-    fn kimi_k31_fpm_sol_rejects_unqualified_backends_and_geometry() {
-        let d = db();
-        for (backend, kv, cp, dcp, fraction) in [
-            (None, KvCacheQuantMode::Fp8, 1, 1, 1.0),
-            (Some("unknown"), KvCacheQuantMode::Bfloat16, 1, 1, 1.0),
-            (Some("flashmla"), KvCacheQuantMode::Int8, 1, 1, 1.0),
-            (Some("flashmla"), KvCacheQuantMode::Fp8, 2, 1, 1.0),
-            (Some("flashmla"), KvCacheQuantMode::Fp8, 1, 2, 1.0),
-            (Some("flashmla"), KvCacheQuantMode::Fp8, 1, 1, 0.5),
-        ] {
-            let mut op = DsaModuleOp::new(
-                "attention",
-                12,
-                kv,
-                FmhaQuantMode::Bfloat16,
-                GemmQuantMode::Bfloat16,
-                "KimiK31ForConditionalGeneration",
-                2048,
-            );
-            op.attention_backend = backend.map(str::to_owned);
-            op.cp_size = cp;
-            op.dcp_size = dcp;
-            op.full_frac = fraction;
-            for op in [Op::DsaContext(op.clone()), Op::DsaGeneration(op)] {
+        let mut valid = glm_dsa_op("attention");
+        valid.architecture = "KimiK31ForConditionalGeneration".into();
+        valid.attention_backend = Some("flashmla".into());
+        for generation in [false, true] {
+            let evaluate = |op: DsaModuleOp| {
+                let op = if generation {
+                    Op::DsaGeneration(op)
+                } else {
+                    Op::DsaContext(op)
+                };
+                op_sol_latency_ms(&op, &d, 1.0, 1.0, 4096.0, 0.0)
+            };
+            assert!(evaluate(valid.clone()).unwrap() > 0.0);
+            for (cp, dcp, frac) in [(2, 1, 1.0), (1, 2, 1.0), (1, 1, 0.5)] {
+                let mut invalid = valid.clone();
+                invalid.cp_size = cp;
+                invalid.dcp_size = dcp;
+                invalid.full_frac = frac;
                 assert!(matches!(
-                    op_sol_latency_ms(&op, &d, 1.0, 1.0, 4096.0, 0.0),
+                    evaluate(invalid),
                     Err(AicError::InvalidEngineConfig(_))
                 ));
+            }
+            let mut ambiguous = valid.clone();
+            ambiguous.attention_backend = None;
+            assert!(matches!(
+                evaluate(ambiguous),
+                Err(AicError::InvalidEngineConfig(_))
+            ));
+        }
+    }
+
+    /// Hand ledger at TP8 (12 heads), BF16 weights, FP8 KV and one new token.
+    /// Both phases read 96,272,384 weight bytes and 9,216 gate IO bytes.
+    /// Decode reads 4096 * 132 index bytes and 2048 latent entries;
+    /// context at prefix=4095 reads the same index cache, 12 * 2048 latent
+    /// entries and 12 * 192 * 4 = 9,216 query IO bytes. Latent entries
+    /// occupy 656 bytes for FlashMLA, 576 for TRTLLM; BF16 uses 1152 for both.
+    #[test]
+    fn kimi_k31_fpm_sol_uses_backend_cache_layout_for_both_phases() {
+        let d = db();
+        for kv_quant in [KvCacheQuantMode::Fp8, KvCacheQuantMode::Bfloat16] {
+            for (backend, fp8_entry_bytes) in [("flashmla", 656.0), ("trtllm_mla", 576.0)] {
+                let mut op = DsaModuleOp::new(
+                    "attention",
+                    12,
+                    kv_quant,
+                    FmhaQuantMode::Bfloat16,
+                    GemmQuantMode::Bfloat16,
+                    "KimiK31ForConditionalGeneration",
+                    2048,
+                );
+                op.attention_backend = Some(backend.into());
+                let entry_bytes = if kv_quant == KvCacheQuantMode::Fp8 {
+                    fp8_entry_bytes
+                } else {
+                    1152.0
+                };
+                let common_bytes = 96_272_384.0 + 540_672.0 + 9_216.0;
+                approx(
+                    op_sol_latency_ms(&Op::DsaContext(op.clone()), &d, 1.0, 1.0, 1.0, 4095.0)
+                        .unwrap(),
+                    (common_bytes + 9_216.0 + 12.0 * 2048.0 * entry_bytes)
+                        / d.system_spec.gpu.mem_bw
+                        * 1000.0,
+                );
+                approx(
+                    op_sol_latency_ms(&Op::DsaGeneration(op), &d, 1.0, 1.0, 4096.0, 0.0).unwrap(),
+                    (common_bytes + 2048.0 * entry_bytes) / d.system_spec.gpu.mem_bw * 1000.0,
+                );
             }
         }
     }
@@ -1577,7 +1589,7 @@ mod tests {
     #[test]
     fn dsa_generation_fpm_sol_scopes_reuse_policy_by_backend() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisimulate/src/aisimulate_core/systems");
+            .join("../../python/aisim/src/aisim_core/systems");
         for (backend, version, expected) in [
             ("sglang", "0.5.14", 1.0842777257142857),
             ("trtllm", "1.3.0rc20", 78.0 * 0.019327371428571428),

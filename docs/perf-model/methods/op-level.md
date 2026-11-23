@@ -35,9 +35,9 @@ cross-shape or cross-precision transfer must retain its transfer provenance.
 
 ### Context-attention measurement boundaries
 
-TRT-LLM `torch_flow` context-attention rows produced by `1.3.0rc20` and
-`1.3.0rc29` time the attention forward with internal RoPE and both K/V-cache
-writes. The estimator therefore does not add separate RoPE or KV-write costs
+TRT-LLM `torch_flow` context-attention rows produced by `1.3.0rc20`,
+`1.3.0rc29` and `1.4.0rc2` time the attention forward with internal RoPE and
+both K/V-cache writes. The estimator therefore does not add separate RoPE or KV-write costs
 on top of these timings. Q/K normalization remains a separate estimate.
 
 This decision follows the stored framework, version, and selected kernel lane,
@@ -84,7 +84,7 @@ New profiles use version 2. The profile JSON has these fields:
 | `schema_version` | `2` for the common forward-pass API; `1` retains the legacy direct-phase contract. |
 | `basis` | The complete ordinary compiled `EngineSpec` used to qualify the profile. Both operation lists and every engine identity field must match the current compiler output; only `engine.systems_path` is excluded from comparison. |
 | `worker_type` | `prefill`, `decode`, or `aggregated`, matching the caller. `aggregated` requires version 2. |
-| `ops` | Replacement operations for the selected phase, or the prefill graph for `aggregated`, in execution order, using the existing externally tagged operation format. Resident weight bytes must match the original phase. |
+| `ops` | Replacement operations for the selected phase, or the prefill graph for `aggregated`, in execution order, using the existing externally tagged operation format. Resident weight bytes must match the original phase. Operation names are unique within an operation list, except that the DeepSeek-V4 CSA and HCA attention modules of a phase share its attention name. |
 | `generation_ops` | Required for `aggregated`; absent for other roles. Replacement decode graph, with resident weight bytes matching the original decode graph. |
 | `retained_files` | Bundle-relative `path`, lowercase `sha256`, and `size_bytes` for every required hardware YAML, source/version metadata file and retained operation table. |
 
@@ -188,9 +188,31 @@ does not upload or download profiles automatically.
 Public and private repositories use the same additive `catalog/dataset.json`
 contract (`aisim-dataset-index/v1`). Category entries reference hashed indexes;
 `aisim-category-index/v1` lists configuration identities and hashed manifests.
-Repository identity and authentication do not change the schema. Existing FPM
-catalogs remain accessible through an explicit `legacy-fpm` reference; their
-measurement protocols and historical paths are preserved.
+Repository identity and authentication do not change the schema.
+
+Catalog shards use `aisim-catalog/v2`, which adds `acc_prediction_fingerprint`
+to bind the latest accuracy to its prediction code, spec and profiles. New readers
+also accept v1 shards, returning null for the absent fingerprint. Older v1 readers
+reject v2 by its schema ID; rebuild catalogs with the upgraded writer to migrate.
+The published v1 schema remains unchanged.
+
+The coverage catalog normally crosses the models and frameworks found in the dataset.
+`build_catalog(expected_models=..., expected_frameworks=...)` can widen that universe;
+with `write=True` (the default), the builder saves the declaration in
+`catalog/coverage.json` (`aisim-catalog-coverage/v1`)
+so subsequent builds and mirror/public validation reproduce the same missing cells.
+With `write=False`, it returns rows without saving the declaration. The builder
+rejects projected coverage grids above 100,000 rows, including all hardware,
+before expanding model and framework combinations.
+
+| Coverage field | Contract |
+| --- | --- |
+| `schema_version` | `aisim-catalog-coverage/v1`. |
+| `expected_models` | Additional model IDs to include even without measured data. |
+| `expected_frameworks` | Additional framework IDs to include even without measured data. |
+
+Omitted builder arguments reuse the saved declaration; an explicit empty iterable clears that
+dimension. A missing declaration preserves the default universe. Invalid declarations fail validation.
 
 Operation tables live under
 `data/op-latency/<hardware>/<operation-family>/<framework>/<version>/`.
@@ -213,8 +235,8 @@ Use the shared Python API with an already downloaded local selection:
 
 ```python
 from pathlib import Path
-from aisimulate_core.datasets import check_manifest, prepare_execution_profile
-from aisimulate_core.sdk import RustForwardPassPerfModel
+from aisim_core.datasets import check_manifest, prepare_execution_profile
+from aisim_core.sdk import RustForwardPassPerfModel
 
 root = Path("/local/pinned-dataset")
 manifest = "metadata/execution-profiles/example/prefill.manifest.json"
@@ -295,11 +317,25 @@ distance: a weight-only mode therefore prefers the matching arithmetic family.
 MoE keeps its own historical profile-distance ordering. These tie-breaks are
 observable prediction semantics, not opportunities to sort data arbitrarily.
 
-`fp8_static` is composite: it needs the base FP8 and its overhead tables.
-Transfer reachability alone cannot admit it. Validation requires known
-precision profiles and the resolved transfer policy; a pure SILICON request
-still needs data. New precision support requires native profile
-levels, their exported Python reachability view, and tests described in [Extending](../extending.md).
+`fp8_static` has two paths. In SILICON, HYBRID and EMPIRICAL, if the GEMM table
+has `fp8_static` rows, AISim reads them and needs no `compute_scale` table.
+This includes rows that the shared layer takes from a sibling version. It
+subtracts `scale_matrix` only for a low-precision input. So a `fp8_static` row
+must time the forward pass of the layer on a BF16 input with a static
+activation scale: the static quantization plus the GEMM. A row that times the
+GEMM alone makes that subtraction wrong. When the table has `fp8_static` rows,
+those rows alone give the coverage of the mode, also for a shape that `fp8`
+rows cover. A shape too far from them is a coverage error in SILICON, and
+HYBRID gives the empirical estimate that it builds from them. Without
+`fp8_static` rows, `fp8_static` is composite: it needs the base FP8 and its
+overhead tables. Transfer reachability alone cannot admit it. On both paths,
+the list of supported GEMM modes contains `fp8_static` only when the
+`scale_matrix` table has `fp8` rows. Validation requires known precision
+profiles and the resolved transfer policy; a pure SILICON request still needs
+data. SOL and SOL_FULL always use the derived path with analytic GEMM and
+overhead values; neither mode reads GEMM or overhead tables, even when direct
+rows exist. New precision support requires native profile levels, their exported
+Python reachability view, and tests described in [Extending](../extending.md).
 
 ## Diagnostics and limits
 

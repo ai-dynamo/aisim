@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Build the pinned Dynamo replay adapter against one exact AISimulate checkout."""
+"""Build the pinned Dynamo replay adapter against one exact AISim checkout."""
 
 import argparse
 import hashlib
@@ -31,7 +31,7 @@ SPECULATION_DEPTH_OLD = """    let nextn = config
         .as_ref()
         .map_or(config.nextn, |spec| spec.num_speculative_tokens());
 """
-SPECULATION_DEPTH_NEW = """    // Modified by AISimulate CI: preserve the Ngram-only replay contract
+SPECULATION_DEPTH_NEW = """    // Modified by AISim CI: preserve the Ngram-only replay contract
     // across the enum-to-struct cost-configuration migration.
     let nextn = match config.speculation.as_ref() {
         None => config.nextn,
@@ -92,21 +92,22 @@ def patch_handoff_timing(core: Path, dynamo: Path) -> dict:
         "kv_bytes_per_token": "Option<usize>",
         "bandwidth_gb_s": "Option<f64>",
     }
-    if fields not in (legacy, legacy | {"state_bytes": "usize"}):
-        raise ValueError("unreviewed AISimulate handoff API; update the pinned adapter")
+    state_bytes = {"state_bytes": "usize"}
+    pipeline_fill = {"pipeline_fill_ms": "f64"}
+    if fields not in (legacy, legacy | state_bytes, legacy | state_bytes | pipeline_fill):
+        raise ValueError("unreviewed AISim handoff API; update the pinned adapter")
     patched = original
     if "state_bytes" in fields:
         anchor = b"        kv_bytes_per_token: timing.kv_bytes_per_token,\n"
         if original.count(anchor) != 1:
             raise ValueError("pinned handoff conversion anchor is not unique")
-        patched = original.replace(
-            anchor,
-            anchor
-            + (
-                b"        // Modified by AISimulate CI: this legacy DTO models token KV only.\n"
-                b"        state_bytes: 0,\n"
-            ),
-        )
+        added = b"        // Modified by AISim CI: this legacy DTO models token KV only.\n        state_bytes: 0,\n"
+        if "pipeline_fill_ms" in fields:
+            added += (
+                b"        // Modified by AISim CI: the pinned Dynamo has no pipeline-parallel prefill.\n"
+                b"        pipeline_fill_ms: 0.0,\n"
+            )
+        patched = original.replace(anchor, anchor + added)
         path.write_bytes(patched)
     return {
         "path": str(path.relative_to(dynamo)),
@@ -114,6 +115,7 @@ def patch_handoff_timing(core: Path, dynamo: Path) -> dict:
         "after_sha256": hashlib.sha256(patched).hexdigest(),
         "token_only_state_bytes": 0,
         "api_has_state_bytes": "state_bytes" in fields,
+        "api_has_pipeline_fill_ms": "pipeline_fill_ms" in fields,
     }
 
 
@@ -121,8 +123,8 @@ class LiteralSite(NamedTuple):
     path: str  # Dynamo source file containing the literal.
     sha256: str  # Reviewed content of that file at DYNAMO_REVISION.
     anchor: str  # Text that occurs once in the file and precedes the literal.
-    struct: str  # AISimulate struct built by the literal.
-    api: str  # AISimulate core source file that defines the struct.
+    struct: str  # AISim struct built by the literal.
+    api: str  # AISim core source file that defines the struct.
 
 
 # Compatibility adaptation of NVIDIA Dynamo's Apache-2.0 sources at DYNAMO_REVISION:
@@ -131,7 +133,7 @@ class LiteralSite(NamedTuple):
 # https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/replay/offline/entrypoints.rs
 # https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/replay/offline/extensions/kv_events/mod.rs
 # https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/bindings/python/rust/llm/replay.rs
-# Adds `field: None` for new optional AISimulate fields and empty images for the
+# Adds `field: None` for new optional AISim fields and empty images for the
 # pinned text-only Request; retain the recorded Weka client behavior.
 OPTIONAL_FIELD_LITERALS = (
     LiteralSite(
@@ -227,13 +229,13 @@ def _struct_fields(api_source: str, struct: str) -> dict[str, tuple[bool, str]]:
     """Map each field of ``pub struct <struct>`` to (plain ``pub``, type)."""
     matches = list(re.finditer(rf"\bpub struct {struct}\b\s*(?:<[^>{{]*>)?\s*\{{", api_source))
     if len(matches) != 1:
-        raise ValueError(f"expected one AISimulate `pub struct {struct}` with named fields, found {len(matches)}")
+        raise ValueError(f"expected one AISim `pub struct {struct}` with named fields, found {len(matches)}")
     start, end = _braced(api_source, matches[0].start())
     fields = {}
     for item in _top_level_items(api_source[start:end], angle=True):
         field = re.fullmatch(r"(pub(?:\s*\([^)]*\))?\s+)?(?:r#)?(\w+)\s*:\s*(.+)", item, re.DOTALL)
         if not field:
-            raise ValueError(f"cannot parse AISimulate {struct} field {item!r}")
+            raise ValueError(f"cannot parse AISim {struct} field {item!r}")
         fields[field[2]] = ((field[1] or "").strip() == "pub", re.sub(r"\s+", " ", field[3]))
     return fields
 
@@ -254,25 +256,31 @@ def _patch_literal(source: str, site: LiteralSite, struct_fields: dict) -> tuple
         present.append(field[1])
     stale = [name for name in present if name not in struct_fields]
     if stale:
-        raise ValueError(f"{site.path}: {site.struct} literal sets fields AISimulate no longer has: {stale}")
+        raise ValueError(f"{site.path}: {site.struct} literal sets fields AISim no longer has: {stale}")
     missing = [name for name in struct_fields if name not in present]
     defaults = {
         "ReplaySpec": {"encoder": ((True, "Option<EncoderSpec>"), "None")},
         "SyntheticTraceSpec": {"images": ((True, "Option<SyntheticImages>"), "None")},
-        "WekaImportOptions": {"client": ((True, "WekaClient"), "WekaImportOptions::default().client")},
+        "WekaImportOptions": {
+            "client": ((True, "WekaClient"), "WekaImportOptions::default().client"),
+            "chat_template": ((True, "Option<WekaChatTemplate>"), "None"),
+        },
         "SglangConfig": {
+            "mamba_cache": ((True, "Option<SglangMambaCacheConfig>"), "None"),
             "hicache": ((True, "Option<SglangHiCacheConfig>"), "None"),
             "host_loop": ((True, "bool"), "false"),
             "vlm_cache_bytes": ((True, "u64"), "SglangConfig::default().vlm_cache_bytes"),
             "disaggregation_decode_enable_radix_cache": ((True, "bool"), "false"),
             "num_reserved_decode_tokens": ((True, "usize"), "SglangConfig::default().num_reserved_decode_tokens"),
             "disaggregation_decode_extra_slots": ((True, "Option<usize>"), "None"),
+            "swa_prefix_tails": ((True, "Option<usize>"), "None"),
+            "scheduler_select_time_ms": ((True, "f64"), "SglangConfig::default().scheduler_select_time_ms"),
         },
     }.get(site.struct)
     if defaults is not None:
         unreviewed = [name for name in missing if name not in defaults or struct_fields[name] != defaults[name][0]]
         if unreviewed:
-            raise ValueError(f"{site.path}: unreviewed AISimulate {site.struct} fields: {unreviewed}")
+            raise ValueError(f"{site.path}: unreviewed AISim {site.struct} fields: {unreviewed}")
     empty_images = (
         site.struct == "Request" and "images" in missing and struct_fields["images"] == (True, "Vec<ImageSpec>")
     )
@@ -281,9 +289,7 @@ def _patch_literal(source: str, site: LiteralSite, struct_fields: dict) -> tuple
         name for name in optional if not (struct_fields[name][0] and _OPTION_TYPE.fullmatch(struct_fields[name][1]))
     ]
     if required and defaults is None:
-        raise ValueError(
-            f"{site.path}: AISimulate {site.struct} adds fields Dynamo must set (not `pub` Option): {required}"
-        )
+        raise ValueError(f"{site.path}: AISim {site.struct} adds fields Dynamo must set (not `pub` Option): {required}")
     if not missing:
         return source, []
     line_start = source.rindex("\n", 0, close) + 1
@@ -292,13 +298,13 @@ def _patch_literal(source: str, site: LiteralSite, struct_fields: dict) -> tuple
     indent = re.search(r"\n([ \t]*)\S", source[start - 1 : close])[1]
     inserted = ""
     if defaults is not None:
-        inserted = f"{indent}// Modified by AISimulate CI: retain the pinned text-only replay configuration.\n"
+        inserted = f"{indent}// Modified by AISim CI: retain the pinned text-only replay configuration.\n"
         inserted += "".join(f"{indent}{name}: {defaults[name][1]},\n" for name in missing)
     elif optional:
-        inserted = f"{indent}// Modified by AISimulate CI: Dynamo does not set these optional fields yet.\n"
+        inserted = f"{indent}// Modified by AISim CI: Dynamo does not set these optional fields yet.\n"
         inserted += "".join(f"{indent}{name}: None,\n" for name in optional)
     if empty_images:
-        inserted += f"{indent}// Modified by AISimulate CI: the pinned Dynamo request is text-only.\n"
+        inserted += f"{indent}// Modified by AISim CI: the pinned Dynamo request is text-only.\n"
         inserted += (
             f"{indent}images: {{\n"
             f"{indent}    assert!(\n"
@@ -315,13 +321,13 @@ def _patch_ttft_lifecycle(source: str, api: str) -> tuple[str, list[str]]:
     """The legacy Dynamo lifecycle DTO cannot represent host-loop milestones."""
     enums = list(re.finditer(r"\bpub enum LifecycleEvent\s*\{", api))
     if len(enums) != 1:
-        raise ValueError("expected one AISimulate LifecycleEvent enum")
+        raise ValueError("expected one AISim LifecycleEvent enum")
     start, end = _braced(api, enums[0].start())
     variants = {}
     for item in _top_level_items(api[start:end], angle=True):
         variant = re.fullmatch(r"(\w+)\s*\{(.*)\}", item, re.DOTALL)
         if not variant:
-            raise ValueError(f"unreviewed AISimulate lifecycle variant: {item}")
+            raise ValueError(f"unreviewed AISim lifecycle variant: {item}")
         variants[variant[1]] = re.sub(r"\s+", "", variant[2])
     legacy = {"SourceHeld", "DestinationReserved"}
     if set(variants) == legacy:
@@ -329,11 +335,11 @@ def _patch_ttft_lifecycle(source: str, api: str) -> tuple[str, list[str]]:
     if set(variants) != legacy | {"TtftMilestone"} or variants["TtftMilestone"] != (
         "request_id:Uuid,stage:TtftMilestone,at_ms:f64,"
     ):
-        raise ValueError("unreviewed AISimulate lifecycle API; update the pinned adapter")
+        raise ValueError("unreviewed AISim lifecycle API; update the pinned adapter")
     anchor = "        Ok(match event {\n"
     if source.count(anchor) != 1:
         raise ValueError("pinned Dynamo lifecycle conversion anchor is not unique")
-    arm = """            // Modified by AISimulate CI: host-loop/frontend events are unsupported.
+    arm = """            // Modified by AISim CI: host-loop/frontend events are unsupported.
             LifecycleEvent::TtftMilestone { request_id, stage, at_ms } => {
                 return Err(anyhow!(
                     "pinned Dynamo CI adapter does not support TTFT milestone {stage:?} for {request_id} at {at_ms}ms"
@@ -386,7 +392,7 @@ def patch_replay_engine_config(core: Path, dynamo: Path) -> dict:
         for struct in ("ReplayEngineConfig", "ReplayRoleConfig")
     ]
     if fields not in ([None, None], [(True, "u32"), (True, "u32")]):
-        raise ValueError("unreviewed AISimulate replay PCP API; update the pinned adapter")
+        raise ValueError("unreviewed AISim replay PCP API; update the pinned adapter")
     patched = original
     if fields[0] is not None:
         anchor = b"        num_gpu_blocks_is_explicit: Some(true),\n"
@@ -394,7 +400,7 @@ def patch_replay_engine_config(core: Path, dynamo: Path) -> dict:
             raise ValueError("pinned replay adapter must have four capacity anchors")
         patched = original.replace(
             anchor,
-            b"        // Modified by AISimulate CI: the pinned adapter has no PCP control.\n"
+            b"        // Modified by AISim CI: the pinned adapter has no PCP control.\n"
             b"        prefill_context_parallel_size: 1,\n" + anchor,
         )
     site = LiteralSite(
@@ -420,6 +426,255 @@ def patch_replay_engine_config(core: Path, dynamo: Path) -> dict:
     }
 
 
+def locked_pyo3_version(lock: Path) -> str:
+    """Return the pyo3 version that a source's Cargo.lock pins.
+
+    Only one package in a build may link `python`, so Dynamo's bindings and
+    the selected AISim core must use the same pyo3.
+    """
+    versions = re.findall(r'^name = "pyo3"\nversion = "([^"]+)"$', lock.read_text(), re.MULTILINE)
+    if len(versions) != 1:
+        raise ValueError(f"expected one locked pyo3 version in {lock}, found {versions}")
+    return versions[0]
+
+
+# Compatibility adaptation of NVIDIA Dynamo's Apache-2.0 Python bindings at DYNAMO_REVISION:
+# https://github.com/ai-dynamo/dynamo/tree/def3b79b15c266805540a678dd400aeb6ccada1d/lib/bindings/python
+# The pinned bindings use pyo3 0.23. When the selected AISim core uses pyo3 0.30,
+# these rewrites move the bindings to the pyo3 0.30 API without changing behavior.
+PYO3_BINDINGS = "lib/bindings/python"
+PYO3_BINDINGS_VERSION = "0.23."
+PYO3_030_DEPENDENCIES = (
+    ('pyo3 = { version = "0.23.4"', 'pyo3 = {{ version = "{version}"'),
+    ('pyo3-async-runtimes = { version = "0.23.0"', 'pyo3-async-runtimes = {{ version = "0.30.0"'),
+    ('pythonize = "0.23"', 'pythonize = "0.30"'),
+)
+# (pattern, replacement, sites across rust/**/*.rs): APIs that pyo3 0.30 removed.
+PYO3_030_RENAMES = (
+    (r"Python::with_gil\(", "Python::attach(", 77),
+    (r"\.allow_threads\(", ".detach(", 28),
+    (r"pyo3::prepare_freethreaded_python\(\)", "pyo3::Python::initialize()", 1),
+    # pyo3 downcasts only; anyhow's Error::downcast keeps its name.
+    (r"\.downcast::<((?:pyo3::types::)?Py(?:List|Bool|Int|Float|String|Dict))>\(\)", r".cast::<\1>()", 9),
+)
+# Files that use the `PyObject` alias, which pyo3 0.28 removed; lib.rs defines it.
+PYO3_030_PYOBJECT_FILES = (
+    "rust/backend.rs",
+    "rust/engine.rs",
+    "rust/http.rs",
+    "rust/llm/entrypoint.rs",
+    "rust/llm/frontend_routes.rs",
+    "rust/llm/kv.rs",
+    "rust/llm/kv/demand_driven.rs",
+    "rust/llm/local_model.rs",
+    "rust/llm/model_card.rs",
+    "rust/llm/replay.rs",
+    "rust/llm/routed_engine.rs",
+    "rust/prometheus_metrics.rs",
+    "rust/push_egress.rs",
+)
+# pyo3 0.30 no longer derives FromPyObject for Clone pyclasses. The bindings
+# take these classes by value, so they opt in with `from_py_object`.
+PYO3_030_BY_VALUE_CLASSES = {
+    "rust/backend.rs": ("DisaggregationMode", "LlmRegistration", "EngineConfig", "RuntimeConfig", "WorkerConfig"),
+    "rust/context.rs": ("Context",),
+    "rust/engine.rs": ("PythonAsyncEngine",),
+    "rust/http.rs": ("HttpAsyncEngine",),
+    "rust/lib.rs": ("RouterMode", "DistributedRuntime", "Endpoint", "ModelType", "ModelInput", "WorkerType"),
+    "rust/llm/entrypoint.rs": (
+        "EngineType",
+        "KvRouterConfig",
+        "AisPerfConfig",
+        "RouterConfig",
+        "EntrypointArgs",
+        "EngineConfig",
+    ),
+    "rust/llm/local_model.rs": ("RoutingConstraints", "ModelRuntimeConfig"),
+    "rust/llm/preprocessor.rs": ("MediaDecoder", "MediaFetcher"),
+    "rust/llm/replay.rs": ("ReasoningConfig", "SglangArgs", "TrtllmArgs", "MockEngineArgs"),
+    "rust/planner.rs": ("PlannerDecision",),
+}
+# (file, old, new, sites): changes that need the surrounding code. Anchors match
+# the text after PYO3_030_RENAMES.
+PYO3_030_EDITS = (
+    (
+        "rust/lib.rs",
+        "\nuse pyo3::IntoPyObjectExt;\n",
+        "\nuse pyo3::IntoPyObjectExt;\n\n/// pyo3 0.28 removed this alias.\n"
+        "pub(crate) type PyObject = pyo3::Py<pyo3::PyAny>;\n",
+        1,
+    ),
+    # FromPyObject gained an input lifetime and an error type in pyo3 0.27.
+    (
+        "rust/backend.rs",
+        "    T: for<'py> FromPyObject<'py>,\n{\n    let attr = match bound.getattr(name) {",
+        "    T: for<'py> FromPyObjectOwned<'py>,\n{\n    let attr = match bound.getattr(name) {",
+        1,
+    ),
+    (
+        "rust/backend.rs",
+        "    Ok(Some(attr.extract()?))\n",
+        "    Ok(Some(attr.extract::<T>().map_err(Into::into)?))\n",
+        1,
+    ),
+    (
+        "rust/python_payload.rs",
+        "    T: FromPyObject<'py>,\n{\n    optional_item(dict, name)?\n"
+        "        .map(|value| value.extract().map_err(|error| error.to_string()))",
+        "    T: FromPyObjectOwned<'py>,\n{\n    optional_item(dict, name)?\n"
+        "        .map(|value| {\n            value\n                .extract::<T>()\n"
+        "                .map_err(|error| Into::<PyErr>::into(error).to_string())\n        })",
+        1,
+    ),
+    (
+        "rust/lib.rs",
+        ".and_then(|repr_obj| repr_obj.extract::<Py<PyString>>(py))",
+        ".and_then(|repr_obj| repr_obj.extract::<Py<PyString>>(py).map_err(Into::into))",
+        1,
+    ),
+    # pyo3-async-runtimes 0.30 requires Send + 'static results.
+    (
+        "rust/lib.rs",
+        "    F: std::future::Future<Output = PyResult<T>> + Send + 'static,\n    T: for<'py> IntoPyObject<'py>,\n",
+        "    F: std::future::Future<Output = PyResult<T>> + Send + 'static,\n"
+        "    T: for<'py> IntoPyObject<'py> + Send + 'static,\n",
+        2,
+    ),
+    # pyo3 0.25 removed IntoPy.
+    (
+        "rust/lib.rs",
+        "                            #[allow(deprecated)]\n"
+        "                            let object = Python::attach(|py| object.into_py(py));\n",
+        "                            let object = Python::attach(|py| object.into_py_any(py))?;\n",
+        1,
+    ),
+    # pyo3 0.28 made modules declare free-threaded support by default; keep the GIL.
+    ("rust/lib.rs", "#[pymodule]\nfn _core(", "#[pymodule(gil_used = true)]\nfn _core(", 2),
+    # pyo3 0.24 converts PathBuf to pathlib.Path; these returned str before.
+    (
+        "rust/lib.rs",
+        "        LocalModel::fetch(&repo, ignore_weights)\n            .await\n            .map_err(to_pyerr)\n",
+        "        LocalModel::fetch(&repo, ignore_weights)\n            .await\n"
+        "            .map(std::path::PathBuf::into_os_string)\n            .map_err(to_pyerr)\n",
+        1,
+    ),
+    (
+        "rust/llm/replay.rs",
+        "    fn response_replay_trace_path(&self) -> Option<PathBuf> {\n"
+        "        self.inner.response_replay_trace_path.clone()\n",
+        "    fn response_replay_trace_path(&self) -> Option<std::ffi::OsString> {\n"
+        "        self.inner.response_replay_trace_path.clone().map(PathBuf::into_os_string)\n",
+        1,
+    ),
+)
+_COMMENT = re.compile(r"//[^\n]*")
+
+
+def _opt_in_from_py_object(text: str, rel: str, name: str) -> str:
+    lines = text.split("\n")
+    definition = re.compile(rf"\s*(pub(\([a-z]+\))? )?(struct|enum) {name}\b")
+    found = [index for index, line in enumerate(lines) if definition.match(line)]
+    if len(found) != 1:
+        raise ValueError(f"expected one definition of {name} in {rel}, found {len(found)}")
+    starts = [
+        index
+        for index in range(found[0] - 1, max(found[0] - 12, -1), -1)
+        if lines[index].lstrip().startswith("#[pyclass")
+    ]
+    if not starts:
+        raise ValueError(f"no #[pyclass] attribute above {name} in {rel}")
+    start = starts[0]
+    if lines[start].strip() == "#[pyclass]":
+        lines[start] = lines[start].replace("#[pyclass]", "#[pyclass(from_py_object)]")
+    elif lines[start].rstrip().endswith(")]"):
+        lines[start] = lines[start].rstrip()[:-2] + ", from_py_object)]"
+    else:
+        end = next((index for index in range(start, found[0]) if lines[index].strip() == ")]"), None)
+        if end is None:
+            raise ValueError(f"unrecognized #[pyclass] attribute above {name} in {rel}")
+        lines[end - 1] = lines[end - 1].rstrip().rstrip(",") + ",\n    from_py_object"
+    return "\n".join(lines)
+
+
+def _mark_modified(text: str, comment: str) -> str:
+    """Add the modification notice below a file's leading comment block."""
+    lines = text.split("\n")
+    header = 0
+    while header < len(lines) and lines[header].startswith(comment):
+        header += 1
+    lines.insert(header, f"{comment} Modified by AISim CI: moved from the pyo3 0.23 API to the pyo3 0.30 API.")
+    return "\n".join(lines)
+
+
+def patch_pyo3_bindings(source: Path, dynamo: Path) -> dict:
+    """Move the pinned Dynamo bindings to the selected core's pyo3, or leave them alone.
+
+    Every rewrite is staged and checked before any file is written.
+    """
+    version = locked_pyo3_version(source / "Cargo.lock")
+    if version.startswith(PYO3_BINDINGS_VERSION):
+        return {"core_pyo3": version, "files": []}
+    if not version.startswith("0.30."):
+        raise ValueError(f"no Dynamo bindings adaptation for pyo3 {version}")
+    bindings = dynamo / PYO3_BINDINGS
+    staged = {path: path.read_text() for path in sorted((bindings / "rust").rglob("*.rs"))}
+    manifest = bindings / "Cargo.toml"
+    staged[manifest] = manifest.read_text()
+    for old, new in PYO3_030_DEPENDENCIES:
+        if staged[manifest].count(old) != 1:
+            raise ValueError(f"pinned Dynamo bindings dependency anchor differs: {old}")
+        staged[manifest] = staged[manifest].replace(old, new.format(version=version))
+    for pattern, replacement, expected in PYO3_030_RENAMES:
+        total = 0
+        for path in staged:
+            if path.suffix == ".rs":
+                staged[path], count = re.subn(pattern, replacement, staged[path])
+                total += count
+        if total != expected:
+            raise ValueError(f"pinned Dynamo bindings have {total} sites for {pattern}, expected {expected}")
+    # The exact edits run after the renames, so their anchors use the new names.
+    for rel, old, new, expected in PYO3_030_EDITS:
+        path = bindings / rel
+        if staged[path].count(old) != expected:
+            raise ValueError(f"pinned Dynamo bindings anchor in {rel} differs: {old[:60]!r}")
+        staged[path] = staged[path].replace(old, new)
+    for rel in PYO3_030_PYOBJECT_FILES:
+        path = bindings / rel
+        text = staged[path]
+        first_use = re.search(r"^use ", text, re.MULTILINE)
+        if not re.search(r"\bPyObject\b", _COMMENT.sub("", text)) or first_use is None:
+            raise ValueError(f"pinned Dynamo bindings file no longer uses PyObject: {rel}")
+        staged[path] = text[: first_use.start()] + "use crate::PyObject;\n" + text[first_use.start() :]
+    unlisted = [
+        str(path.relative_to(bindings))
+        for path, text in staged.items()
+        if path.suffix == ".rs"
+        and path.relative_to(bindings).as_posix() not in PYO3_030_PYOBJECT_FILES
+        and path.relative_to(bindings).as_posix() != "rust/lib.rs"
+        and re.search(r"\bPyObject\b", _COMMENT.sub("", text))
+    ]
+    if unlisted:
+        raise ValueError(f"pinned Dynamo bindings use PyObject in unlisted files: {unlisted}")
+    for rel, names in PYO3_030_BY_VALUE_CLASSES.items():
+        path = bindings / rel
+        for name in names:
+            staged[path] = _opt_in_from_py_object(staged[path], rel, name)
+    records = []
+    for path, text in staged.items():
+        original = path.read_text()
+        if text != original:
+            text = _mark_modified(text, "#" if path.suffix == ".toml" else "//")
+            path.write_text(text)
+            records.append(
+                {
+                    "path": str(path.relative_to(dynamo)),
+                    "before_sha256": hashlib.sha256(original.encode()).hexdigest(),
+                    "after_sha256": hashlib.sha256(text.encode()).hexdigest(),
+                }
+            )
+    return {"core_pyo3": version, "files": records}
+
+
 def build(source: Path, dynamo: Path, output: Path) -> None:
     source, dynamo, output = source.resolve(), dynamo.resolve(), output.resolve()
     revision = subprocess.check_output(["git", "-C", str(dynamo), "rev-parse", "HEAD"], text=True).strip()
@@ -432,6 +687,7 @@ def build(source: Path, dynamo: Path, output: Path) -> None:
     literal_compatibility = patch_optional_literal_fields(core, dynamo)
     speculation_compatibility = patch_speculation_depth(dynamo)
     replay_compatibility = patch_replay_engine_config(core, dynamo)
+    pyo3_compatibility = patch_pyo3_bindings(source, dynamo)
     bindings = dynamo / "lib/bindings/python"
     for manifest, options in (
         (dynamo / "Cargo.toml", ""),
@@ -446,7 +702,7 @@ def build(source: Path, dynamo: Path, output: Path) -> None:
             flags=re.MULTILINE,
         )
         if count != 1:
-            raise ValueError(f"expected one AISimulate dependency in {manifest}")
+            raise ValueError(f"expected one AISim dependency in {manifest}")
         manifest.write_text(text)
     # Resolve the local core's dependency graph from Dynamo's existing lock.
     # Compilation stays locked to this resolved graph, which is saved below.
@@ -459,7 +715,7 @@ def build(source: Path, dynamo: Path, output: Path) -> None:
     )
     linked = [p["manifest_path"] for p in metadata["packages"] if p["name"] == package]
     if linked != [str(core / "Cargo.toml")]:
-        raise ValueError(f"Dynamo resolved a different AISimulate core: {linked}")
+        raise ValueError(f"Dynamo resolved a different AISim core: {linked}")
     subprocess.run(
         [
             sys.executable,
@@ -493,6 +749,7 @@ def build(source: Path, dynamo: Path, output: Path) -> None:
                 "literal_compatibility": literal_compatibility,
                 "speculation_compatibility": speculation_compatibility,
                 "replay_compatibility": replay_compatibility,
+                "pyo3_compatibility": pyo3_compatibility,
             },
             indent=2,
         )

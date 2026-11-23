@@ -16,16 +16,16 @@
 //! ALL of the work -- fraction + tolerance validation, HF-config parsing, the
 //! AIC backend memory model, the OfFree/OfTotal budget math, the naive heuristic
 //! fallback, AND the tolerance margin -- lives in
-//! `aisimulate.sdk.memory.estimate_kv_cache`. The Rust side:
+//! `aisim.sdk.memory.estimate_kv_cache`. The Rust side:
 //!
-//! 1. crosses into Python once (`with_gil → import → call estimate_kv_cache →
+//! 1. crosses into Python once (`attach → import → call estimate_kv_cache →
 //!    extract dict`), forwarding `tolerance_fraction` through;
 //! 2. rebuilds a [`KvCacheEstimate`] from that dict (including
 //!    `tolerance_adjusted`), with no math of its own.
 //!
 //! The two budget formulas (TRT-LLM free-fraction vs vLLM/SGLang total-fraction),
 //! the naive fallback, and the tolerance margin all live on the Python side; see
-//! the docstring of `aisimulate.sdk.memory.estimate_kv_cache`. The
+//! the docstring of `aisim.sdk.memory.estimate_kv_cache`. The
 //! [`KvCacheMemoryFraction`] enum still encodes the backend↔fraction XOR so the
 //! request shape is unambiguous; the variant is validated against
 //! `engine.backend` in Python.
@@ -223,7 +223,7 @@ impl std::error::Error for KvCacheEstimateError {}
 /// Estimate KV-cache memory (raw estimate + optional tolerance margin).
 ///
 /// Pure forwarder: crosses into Python once to compute the COMPLETE estimate. The
-/// Python `aisimulate.sdk.memory.estimate_kv_cache` does the backend↔fraction
+/// Python `aisim.sdk.memory.estimate_kv_cache` does the backend↔fraction
 /// and tolerance validation, the native AIC memory breakdown + budget math, the
 /// naive heuristic fallback, AND the tolerance margin (`tolerance_adjusted`); the
 /// Rust side rebuilds a [`KvCacheEstimate`] from the returned dict with no math
@@ -243,8 +243,8 @@ pub fn estimate_kv_cache(
 
 /// Cross into Python once to compute the complete estimate.
 ///
-/// Mirrors the `AicEngineBuilder` → `compile_engine` crossing: `with_gil →
-/// import aisimulate.sdk.memory → call estimate_kv_cache(...) → extract
+/// Mirrors the `AicEngineBuilder` → `compile_engine` crossing: `attach →
+/// import aisim.sdk.memory → call estimate_kv_cache(...) → extract
 /// the returned dict`. `tolerance_fraction` is forwarded; the Python fn applies
 /// the tolerance and returns `tolerance_adjusted` in the dict.
 #[cfg(feature = "python")]
@@ -256,8 +256,8 @@ fn fetch_python_estimate(
 
     let engine = &req.engine;
 
-    Python::with_gil(|py| -> PyResult<KvCacheEstimate> {
-        let engine_mod = py.import("aisimulate.sdk.memory")?;
+    Python::attach(|py| -> PyResult<KvCacheEstimate> {
+        let engine_mod = py.import("aisim.sdk.memory")?;
         let kwargs = estimate_kwargs(py, req)?;
         if engine.extra.contains_key("fpm_profile") {
             for (name, mode) in crate::py::fpm_profile_quantization(py, engine)? {
@@ -334,6 +334,9 @@ fn estimate_kwargs<'py>(
     // typed fields on the legacy Mocker request. Preserve explicit choices:
     // attention backend, in particular, determines the physical MLA KV layout.
     for name in ["attention_backend", "moe_backend", "comm_quant_mode"] {
+        if name == "moe_backend" && engine.extra.contains_key("fpm_profile") {
+            continue;
+        }
         if let Some(value) = engine.extra.get(name) {
             kwargs.set_item(name, value)?;
         }
@@ -496,7 +499,7 @@ mod tests {
     use super::*;
 
     // Tolerance validation + application and the native/naive budget math now
-    // live entirely in Python (`aisimulate.sdk.memory.estimate_kv_cache`),
+    // live entirely in Python (`aisim.sdk.memory.estimate_kv_cache`),
     // exercised by `tests/unit/sdk/test_memory_estimation.py` and the integration
     // parity test. The Rust side is a pure forwarder; the only pure-Rust unit
     // left here is the memory-fraction wire mapping. The dict round-trip
@@ -606,7 +609,7 @@ mod tests {
     fn profile_memory_preserves_exact_quantization_and_rejects_wire_conflicts() {
         use crate::DataType;
 
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         for (gemm_mode, weight_dtype, moe_mode, moe_dtype) in [
             ("fp8_block", DataType::Fp8Block, "nvfp4", DataType::Nvfp4),
             ("int8_wo", DataType::Int8, "nvfp4", DataType::Nvfp4),
@@ -643,11 +646,51 @@ mod tests {
                     }
                 }]
             }).to_string());
-            let estimate =
-                estimate_kv_cache(req.clone()).expect("profile precision must survive the wire");
-            assert_eq!(estimate.source, EstimateSource::Profile);
-            assert_eq!(estimate.total_kv_size_bytes, 600);
-            assert_eq!(estimate.total_kv_size_tokens, 60);
+            for backend in ["auto", "future_pinned_moe"] {
+                let mut profile: serde_json::Value =
+                    serde_json::from_str(&req.engine.extra["fpm_profile"]).unwrap();
+                profile["deployments"][0]["moe_backend"] = backend.into();
+                req.engine
+                    .extra
+                    .insert("fpm_profile".into(), profile.to_string());
+                req.engine
+                    .extra
+                    .insert("moe_backend".into(), backend.into());
+                req.engine
+                    .extra
+                    .insert("comm_quant_mode".into(), "half".into());
+                let estimate =
+                    estimate_kv_cache(req.clone()).expect("profile identity must survive the wire");
+                assert_eq!(estimate.source, EstimateSource::Profile);
+                assert_eq!(estimate.total_kv_size_bytes, 600);
+                assert_eq!(estimate.total_kv_size_tokens, 60);
+                req.engine
+                    .extra
+                    .insert("moe_backend".into(), "megamoe".into());
+                let error = estimate_kv_cache(req.clone())
+                    .expect_err("conflicting profile MoE backend must fail");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("FPM profile identity conflict: moe_backend"),
+                    "{error}"
+                );
+                req.engine
+                    .extra
+                    .insert("moe_backend".into(), backend.into());
+            }
+            req.engine
+                .extra
+                .insert("comm_quant_mode".into(), "fp8".into());
+            let error =
+                estimate_kv_cache(req.clone()).expect_err("conflicting comm mode must fail");
+            assert!(
+                error.to_string().contains("FPM profile identity conflict"),
+                "{error}"
+            );
+            req.engine
+                .extra
+                .insert("comm_quant_mode".into(), "half".into());
 
             req.engine.quantization.weight_dtype = Some(DataType::Bfloat16);
             let error = estimate_kv_cache(req).expect_err("a different wire dtype must fail");
@@ -664,8 +707,8 @@ mod tests {
         use pyo3::prelude::*;
         use pyo3::types::{PyDict, PyDictMethods};
 
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
             let out = PyDict::new(py);
             out.set_item("total_kv_size_tokens", py.None()).unwrap();
             let error = estimate_from_dict(out.as_any()).unwrap_err();
@@ -679,7 +722,7 @@ mod tests {
         use pyo3::prelude::*;
         use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods};
 
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let mut req = python_forwarding_request();
         req.engine.parallel.dcp_size = Some(4);
         req.engine.moe_kernel_source = Some("cutlass".into());
@@ -692,11 +735,7 @@ mod tests {
         ] {
             req.engine.extra.insert(name.into(), value.into());
         }
-        req.engine.extra.insert(
-            "fpm_profile".into(),
-            serde_json::json!({"model": "test-model"}).to_string(),
-        );
-        Python::with_gil(|py| -> PyResult<()> {
+        Python::attach(|py| -> PyResult<()> {
             let kwargs = estimate_kwargs(py, &req)?;
             assert_eq!(kwargs.get_item("dcp_size")?.unwrap().extract::<u32>()?, 4);
             assert_eq!(
@@ -712,6 +751,15 @@ mod tests {
                     .unwrap()
                     .extract::<String>()?,
                 "deepep_moe"
+            );
+            req.engine.extra.insert(
+                "fpm_profile".into(),
+                serde_json::json!({"model": "test-model"}).to_string(),
+            );
+            let kwargs = estimate_kwargs(py, &req)?;
+            assert!(
+                kwargs.get_item("moe_backend")?.is_none(),
+                "profile backend identity must not become a user override"
             );
             assert_eq!(
                 kwargs
@@ -790,14 +838,14 @@ mod tests {
         use pyo3::prelude::*;
         use pyo3::types::PyDictMethods;
 
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| -> PyResult<()> {
+        pyo3::Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
             // Exercise the real Python spec producer without perf data or a
             // remote model: the resolved config and empty op graph are enough
             // to test identity transport through the serialized Rust spec.
             let fixture = pyo3::types::PyModule::from_code(
                 py,
-                c"from types import SimpleNamespace\nfrom aisimulate_core.sdk.config import ModelConfig\nfrom aisimulate_core.sdk.engine import build_engine_spec_json\nconfig = ModelConfig(tp_size=8, dcp_size=4, attention_backend='flashmla', moe_backend='deepep_moe', moe_kernel_source='cutlass', enable_eplb=True, wideep_num_slots=128)\nmodel = SimpleNamespace(config=config, context_ops=[], generation_ops=[])\nspec = build_engine_spec_json(model, model_path='/local/renamed-checkpoint', system='test-system', backend='vllm', backend_version='test-version', kv_block_size=64, systems_path=None, nextn=0, database=SimpleNamespace(version='test-version'))\n",
+                c"from types import SimpleNamespace\nfrom aisim_core.sdk.config import ModelConfig\nfrom aisim_core.sdk.engine import build_engine_spec_json\nconfig = ModelConfig(tp_size=8, dcp_size=4, attention_backend='flashmla', moe_backend='deepep_moe', moe_kernel_source='cutlass', enable_eplb=True, wideep_num_slots=128)\nmodel = SimpleNamespace(config=config, context_ops=[], generation_ops=[])\nspec = build_engine_spec_json(model, model_path='/local/renamed-checkpoint', system='test-system', backend='vllm', backend_version='test-version', kv_block_size=64, systems_path=None, nextn=0, database=SimpleNamespace(version='test-version'))\n",
                 c"memory_identity_fixture.py", c"memory_identity_fixture",
             )?;
             let json: String = fixture.getattr("spec")?.extract()?;

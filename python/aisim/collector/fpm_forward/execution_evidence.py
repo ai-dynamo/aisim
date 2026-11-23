@@ -1,0 +1,763 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Inspect observed execution separately from requested benchmark settings."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import re
+import shlex
+from collections import Counter
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+import yaml
+
+from .config import resolve_archived_generator_overrides, semantic_generator_overrides, with_kv_warmup_defaults
+from .cpu_affinity import inspect_cpu_affinity
+from .native_artifact import NativeCollection, _rank_artifacts
+from .planner import FPMCell, FPMCollectionPlan, _canonical_hash
+from .runtime.fpm_memory_observer import EXECUTION_SUPPORTED_VERSIONS, audited_release
+from .runtime_memory import _dtype, _resolved_cache_dtype, _validate_graph, _validate_precision, _validate_revision
+
+_GRAPH_FIELDS = {"mode", "cudagraph_mode", "cudagraph_capture_sizes", "max_cudagraph_capture_size"}
+_CONFIG_TYPES = {
+    "model_config": {
+        "model": (str,),
+        "revision": (str, type(None)),
+        "dtype": (str,),
+        "quantization": (str, type(None)),
+        "max_model_len": (int,),
+        "enforce_eager": (bool,),
+    },
+    "cache_config": {
+        "cache_dtype": (str,),
+        "gpu_memory_utilization": (int, float),
+        "enable_prefix_caching": (bool,),
+        "kv_cache_memory_bytes": (int, type(None)),
+        "num_gpu_blocks_override": (int, type(None)),
+    },
+    "scheduler_config": {"max_num_batched_tokens": (int,), "max_num_seqs": (int,), "async_scheduling": (bool,)},
+    "parallel_config": {
+        "tensor_parallel_size": (int,),
+        "pipeline_parallel_size": (int,),
+        "data_parallel_size": (int,),
+        "data_parallel_size_local": (int,),
+        "data_parallel_external_lb": (bool,),
+        "enable_expert_parallel": (bool,),
+        "enable_eplb": (bool,),
+        "decode_context_parallel_size": (int,),
+        "prefill_context_parallel_size": (int,),
+    },
+    "kernel_config": {"moe_backend": (str,)},
+}
+
+
+class _MissingExecutionEvidence(ValueError):
+    pass
+
+
+def _deployment_hashes(overrides: dict[str, Any]) -> set[str]:
+    """Hashes a plan's generator_config_sha256 may take for these archived inputs.
+
+    The planner hashes the semantic form, which drops the declared Dynamo
+    version; schema-v11 plans hashed the warm-up-resolved inputs as launched.
+    """
+    return {
+        _canonical_hash(semantic_generator_overrides(overrides)),
+        _canonical_hash(semantic_generator_overrides(overrides, archive_environment=False)),
+        _canonical_hash(with_kv_warmup_defaults(overrides)),  # Historical schema-v11 launch hash.
+    }
+
+
+def _requested_scheduling(flags: dict[str, Any] | None) -> dict[str, Any]:
+    if flags is None:
+        return {"source": "unreported", "async_scheduling": None}
+    choices = [
+        name == "--async-scheduling" for name in flags if name in {"--async-scheduling", "--no-async-scheduling"}
+    ]
+    return {
+        "source": "generated_flag" if choices else "runtime_default",
+        "async_scheduling": choices[-1] if choices else None,
+    }
+
+
+def _effective_launch(plan: FPMCollectionPlan, cell_dir: Path) -> dict[str, Any]:
+    """Read the generator's literal argv array; never evaluate archived shell."""
+    try:
+        for name in ("fpm_env.sh", "collector-runtime-env.sh"):
+            (cell_dir / name).read_bytes()
+        deployment = json.loads((cell_dir.parent.parent / "generator-overrides.json").read_text())
+        request = json.loads((cell_dir / "generator-request.json").read_text())
+        script = (cell_dir / "run.sh").read_text()
+    except FileNotFoundError as error:
+        raise _MissingExecutionEvidence(f"frozen generated launch is missing: {error.filename}") from error
+    if not isinstance(deployment, dict):
+        raise ValueError("archived deployment inputs must be an object")
+    mount = deployment.get("K8sConfig", {})
+    if not isinstance(mount, dict):
+        raise ValueError("archived K8sConfig must be an object")
+    if plan.generator_config_sha256 not in _deployment_hashes(deployment):
+        # Historical literal-value hashes require the original caller values
+        # if a resumed campaign has upgraded its archive to references.
+        resolved = resolve_archived_generator_overrides(deployment)
+        if plan.generator_config_sha256 not in _deployment_hashes(resolved):
+            raise ValueError("archived deployment inputs differ from the source plan")
+    expected_model = plan.model_path
+    if mount.get("k8s_model_path_in_pvc"):
+        if not mount.get("k8s_pvc_mount_path"):
+            raise ValueError("checkpoint mount has no explicit container mount path")
+        expected_model = str(PurePosixPath(mount["k8s_pvc_mount_path"]) / mount["k8s_model_path_in_pvc"])
+    if not isinstance(request, dict):
+        raise ValueError("generated request must be an object")
+    service = request.get("ServiceConfig")
+    if not isinstance(service, dict):
+        raise ValueError("generated ServiceConfig must be an object")
+    if service.get("model_path") != expected_model:
+        raise ValueError("generated model path differs from the plan and its explicit checkpoint mount")
+    commands = re.findall(r"^engine_command=\((.*)\)$", script, re.MULTILINE)
+    if len(commands) != 1:
+        raise _MissingExecutionEvidence("frozen launch does not contain one literal generated engine_command array")
+    argv = shlex.split(commands[0])
+    if argv[:3] != ["python3", "-m", "dynamo.vllm"]:
+        raise _MissingExecutionEvidence("frozen launch uses an unsupported engine command")
+    # The current generator emits one shell-quoted token per argument. Read
+    # only these literal tokens, including argparse's --option=value form.
+    flags = {}
+    for index, token in enumerate(argv):
+        if not token.startswith("--"):
+            continue
+        name, separator, value = token.partition("=")
+        flags.pop(name, None)
+        flags[name] = (
+            value
+            if separator
+            else argv[index + 1]
+            if index + 1 < len(argv) and not argv[index + 1].startswith("--")
+            else True
+        )
+    actual_model = flags.get("--model")
+    if isinstance(actual_model, str) and ("$" in actual_model or "`" in actual_model):
+        raise _MissingExecutionEvidence("generated model path is not a literal runtime setting")
+    if actual_model != expected_model:
+        raise ValueError("generated engine model differs from the frozen plan and checkpoint mount")
+    return flags
+
+
+def _matches_pinned_hub_snapshot(
+    expected: str, model: dict[str, Any], revisions: set[Any], native_model: dict[str, Any] | None = None
+) -> bool:
+    """Recognize a resolved Hub cache identity, not an arbitrary local alias.
+
+    Offline vLLM can replace the Hub ID with its cached snapshot directory.
+    Require its full repository identity and immutable commit to agree with
+    both the source pins and the loaded config; this is not a weight hash.
+    """
+    if (
+        re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*/[A-Za-z0-9_][A-Za-z0-9._-]*", expected) is None
+        or "--" in expected
+        or ".." in expected
+        or any(part.endswith((".", "-", ".git")) for part in expected.split("/"))
+    ):
+        return False
+    observed = model["model"]
+    path = PurePosixPath(observed)
+    if path.anchor != "/" or str(path) != observed or ".." in path.parts or "\\" in observed or "\x00" in observed:
+        return False
+    if len(path.parts) < 4 or path.parts[-3:-1] != (f"models--{expected.replace('/', '--')}", "snapshots"):
+        return False
+    commit = path.name
+    if re.fullmatch(r"[0-9a-fA-F]{40}", commit) is None or not revisions:
+        return False
+    if any(
+        not isinstance(revision, str)
+        or re.fullmatch(r"[0-9a-fA-F]{40}", revision) is None
+        or revision.lower() != commit.lower()
+        for revision in revisions
+    ):
+        return False
+    loaded = model.get("loaded_config_commit_hash")
+    if loaded is not None:
+        return isinstance(loaded, str) and loaded.lower() == commit.lower()
+    # A local config without a commit hash does not establish Hub identity.
+    # The independently validated initialized worker must supply the actual
+    # loaded-config commit as well as matching every sidecar model field.
+    native_loaded = (native_model or {}).get("loaded_config_commit_hash")
+    return (
+        isinstance(native_loaded, str)
+        and native_loaded.lower() == commit.lower()
+        and all(key in native_model and native_model[key] == value for key, value in model.items())
+    )
+
+
+def _runtime_worker_evidence(
+    plan, cell, raw_root, collection, *, bundle=None, minimum_capacity=None, allow_staged=False
+):
+    """Bind canonical initialized-worker evidence to this exact native attempt."""
+    from .runtime_instrumentation import read_json
+    from .runtime_observations import validate_observation_phase
+
+    index_path = raw_root.parent.parent.parent / "runtime-observations.json"
+    if index_path.is_symlink():
+        raise ValueError("runtime model snapshot index cannot be a symlink")
+    if not index_path.exists():
+        raise _MissingExecutionEvidence("runtime model snapshot index is missing")
+    index = read_json(index_path)
+    name = plan.runtime_configuration
+    entry = index["configurations"][name]
+    attempt_id = entry["active_attempt_id"]
+    attempts = [item for item in entry["attempts"] if item["attempt_id"] == attempt_id]
+    if len(attempts) != 1:
+        raise ValueError("runtime model snapshot active attempt is missing or duplicated")
+    phase = attempts[0]["phases"][cell.workload_kind]
+    if not isinstance(phase, dict):
+        raise ValueError("runtime model snapshot selected phase must be an object")
+    if phase.get("cell_id") != cell.cell_id or phase.get("collector_attempt_id") != collection.collector_attempt_id:
+        raise ValueError("runtime model snapshot belongs to a different cell or native attempt")
+    if phase.get("status") not in ({"passed", "validating"} if allow_staged else {"passed"}):
+        raise ValueError("runtime model snapshot phase is not a passed collection attempt")
+    result = validate_observation_phase(
+        index_path,
+        name,
+        plan.runtime_launch,
+        phase=cell.workload_kind,
+        attempt_id=attempt_id,
+        expected_cell_id=cell.cell_id,
+        expected_collector_attempt_id=collection.collector_attempt_id,
+    )
+    if bundle is None:
+        bundle = plan.runtime_instrumentation
+    if (
+        result["status"] != "complete"
+        or result["provenance"]["bundle_sha256"] != bundle.sha256
+        or result["provenance"]["instrumentation"].get("import_binding") != "verified"
+    ):
+        raise ValueError("runtime model snapshot lacks complete matching instrumentation evidence")
+    if minimum_capacity is not None and result["resources"]["runtime_memory"]["kv_cache_bytes"] < minimum_capacity:
+        raise ValueError("K3.1 runtime usable capacity is smaller than the accepted bound; review new evidence")
+    models = {}
+    for artifact in result["provenance"]["artifacts"]:
+        worker = artifact["evidence"]
+        if worker["kind"] != "worker":
+            continue
+        rank = tuple(worker[key] for key in ("dp_rank", "tp_rank", "pp_rank"))
+        if rank in models:
+            raise ValueError("runtime model snapshot worker ranks are duplicated")
+        models[rank] = worker
+    return models, file_evidence(index_path)
+
+
+def _validate_native_attention_groups(groups, worker):
+    from .runtime_k31 import LAYOUT, validate_attention_assignments
+
+    cache = worker.get("cache", {})
+    if cache.get("allocation_layout") != LAYOUT:
+        return
+    # get_name() identities from the source files pinned by the K3.1 bundle.
+    # Execution records class names; native observations record get_name().
+    backends = {
+        "vllm.v1.attention.backends.mla.flashinfer_mla_sparse.FlashInferMLASparseTRTLLMBackend": (
+            "FLASHINFER_MLA_SPARSE"
+        ),
+        "vllm.v1.attention.backends.mla.flashmla_sparse.FlashMLASparseBackend": "FLASHMLA_SPARSE",
+        "vllm.models.kimi_k3.common.dsa_cache.KimiK3IndexerBackend": "DEEPSEEK_V32_INDEXER",
+        "vllm.models.kimi_k3.nvidia.kda_metadata.KimiK3KDAAttentionBackend": "KIMI_K3_KDA",
+    }
+    expected_layers = {(index, name) for index, group in enumerate(cache["groups"]) for name in group["layer_names"]}
+
+    def mapping(observed, *, native):
+        if not isinstance(observed, list) or not observed:
+            raise ValueError("native/execution attention group mapping is missing")
+        result = {}
+        for group in observed:
+            if not isinstance(group, dict):
+                raise ValueError("native/execution attention group mapping is malformed")
+            gid = group.get("group_id" if native else "kv_cache_group_id")
+            backend = group.get("backend" if native else "backend_class")
+            layers = group.get("layer_names")
+            if (
+                type(gid) is not int
+                or not isinstance(backend, str)
+                or not isinstance(layers, list)
+                or not layers
+                or any(not isinstance(name, str) or not name for name in layers)
+            ):
+                raise ValueError("native/execution attention group mapping is malformed")
+            backend = backends.get(backend, backend)
+            if backend not in backends.values():
+                raise ValueError("native/execution attention backend has no audited K3.1 mapping")
+            for name in layers:
+                key = (gid, name)
+                if key in result:
+                    raise ValueError("native/execution attention group layer mapping is duplicated")
+                result[key] = backend
+        if set(result) != expected_layers:
+            raise ValueError("native/execution attention groups differ from initialized cache layer mapping")
+        return result
+
+    native = validate_attention_assignments(worker)
+    if mapping(groups, native=False) != native:
+        raise ValueError("execution attention backends differ from the validated initialized worker")
+
+
+def _inspect_config(payload, cell, plan, flags, missing, failures, native_worker=None):
+    native_model = native_worker["resolved_config"]["model_config"] if native_worker is not None else None
+    config = payload.get("resolved_config")
+    if not isinstance(config, dict):
+        missing.append("resolved runtime configuration is unreported")
+        config = {}
+    valid = {}
+    for section, fields in _CONFIG_TYPES.items():
+        values = config.get(section)
+        if not isinstance(values, dict):
+            missing.append(f"runtime {section} is unreported")
+            continue
+        valid[section] = {}
+        for name, types in fields.items():
+            label = f"{section}.{name}"
+            if name not in values:
+                missing.append(f"runtime {label} is unreported")
+            elif type(values[name]) not in types or (isinstance(values[name], str) and not values[name]):
+                failures.append(f"runtime {label} has an invalid type or empty value")
+            elif type(values[name]) in (int, float) and (not math.isfinite(values[name]) or values[name] <= 0):
+                failures.append(f"runtime {label} must be positive and finite")
+            else:
+                valid[section][name] = values[name]
+    model, cache, parallel = (valid.get(key, {}) for key in ("model_config", "cache_config", "parallel_config"))
+    resolved_cache_dtype = None
+    if "dtype" in model and "cache_dtype" in cache:
+        try:
+            cache_config = config
+            if native_model is not None:
+                if config["model_config"].get("architectures") != native_model.get("architectures"):
+                    failures.append("runtime execution architecture differs from the validated initialized worker")
+                cache_config = {
+                    **config,
+                    "model_config": {**config["model_config"], "architectures": native_model.get("architectures")},
+                }
+            resolved_cache_dtype = _resolved_cache_dtype(cache_config, cell)
+        except ValueError as error:
+            failures.append(str(error))
+    if cache.get("gpu_memory_utilization", 1) > 1:
+        failures.append("runtime GPU memory utilization must not exceed one")
+    if parallel.get("data_parallel_size_local", 1) > parallel.get("data_parallel_size", 1):
+        failures.append("runtime local DP size exceeds global DP size")
+    expected = {
+        "model_config": {"enforce_eager": plan.options.enforce_eager},
+        "parallel_config": {
+            "tensor_parallel_size": cell.topology.tp,
+            "pipeline_parallel_size": cell.topology.pp,
+            "data_parallel_size": cell.topology.dp,
+            "decode_context_parallel_size": cell.topology.cp,
+            "prefill_context_parallel_size": 1,
+            "enable_expert_parallel": cell.topology.moe_ep > 1,
+            "enable_eplb": bool(cell.backend_policy.aic_fields.get("enable_eplb", False)),
+        },
+    }
+    if plan.options.vllm_max_model_len > 0:
+        expected["model_config"]["max_model_len"] = plan.options.vllm_max_model_len
+    if plan.options.gpu_memory_utilization is not None:
+        expected["cache_config"] = {"gpu_memory_utilization": plan.options.gpu_memory_utilization}
+    for section, fields in expected.items():
+        for name, value in fields.items():
+            if name in valid.get(section, {}) and valid[section][name] != value:
+                failures.append(f"runtime {section}.{name} differs from the frozen plan")
+    expected_revision = plan.fpm_profile.model_revision if plan.fpm_profile is not None else None
+    revisions = {value for value in (expected_revision, (flags or {}).get("--revision")) if value is not None}
+    launch_fields = {
+        "--model": ("model_config", "model", str),
+        "--max-model-len": ("model_config", "max_model_len", int),
+        "--gpu-memory-utilization": ("cache_config", "gpu_memory_utilization", float),
+        "--kv-cache-memory-bytes": ("cache_config", "kv_cache_memory_bytes", int),
+        "--num-gpu-blocks-override": ("cache_config", "num_gpu_blocks_override", int),
+        "--max-num-batched-tokens": ("scheduler_config", "max_num_batched_tokens", int),
+        "--max-num-seqs": ("scheduler_config", "max_num_seqs", int),
+        "--tensor-parallel-size": ("parallel_config", "tensor_parallel_size", int),
+        "--pipeline-parallel-size": ("parallel_config", "pipeline_parallel_size", int),
+        "--data-parallel-size": ("parallel_config", "data_parallel_size", int),
+        "--decode-context-parallel-size": ("parallel_config", "decode_context_parallel_size", int),
+        "--prefill-context-parallel-size": ("parallel_config", "prefill_context_parallel_size", int),
+        "--moe-backend": ("kernel_config", "moe_backend", str),
+    }
+    if flags is not None:
+        for name in ("kv_cache_memory_bytes", "num_gpu_blocks_override"):
+            if f"--{name.replace('_', '-')}" not in flags and cache.get(name) is not None:
+                failures.append(f"runtime cache_config.{name} differs from automatic generated cache sizing")
+        for flag, (section, name, convert) in launch_fields.items():
+            if flag not in flags or name not in valid.get(section, {}):
+                continue
+            raw = flags[flag]
+            if type(raw) is not str or "$" in raw or "`" in raw:
+                missing.append(f"generated {flag} is not a literal runtime setting")
+                continue
+            try:
+                value = convert(raw)
+            except ValueError:
+                failures.append(f"generated {flag} is not a valid runtime setting")
+                continue
+            if (flag == "--max-model-len" and value == -1) or (flag == "--moe-backend" and value == "auto"):
+                continue
+            if valid[section][name] != value:
+                if flag == "--model" and _matches_pinned_hub_snapshot(
+                    value, config["model_config"], revisions, native_model
+                ):
+                    continue
+                failures.append(f"runtime {section}.{name} differs from generated {flag}")
+        for flag, section, name in (
+            ("async-scheduling", "scheduler_config", "async_scheduling"),
+            ("enable-prefix-caching", "cache_config", "enable_prefix_caching"),
+            ("enforce-eager", "model_config", "enforce_eager"),
+        ):
+            choices = [key == f"--{flag}" for key in flags if key in {f"--{flag}", f"--no-{flag}"}]
+            if choices and name in valid.get(section, {}) and valid[section][name] != choices[-1]:
+                failures.append(f"runtime {section}.{name} differs from generated flags")
+        for flag, actual in (("--dtype", model.get("dtype")), ("--kv-cache-dtype", cache.get("cache_dtype"))):
+            if flag in flags and flags[flag] != "auto" and actual is not None and _dtype(actual) != _dtype(flags[flag]):
+                if flag == "--kv-cache-dtype" and resolved_cache_dtype == _dtype(flags[flag]):
+                    continue
+                failures.append(f"runtime precision differs from generated {flag}")
+        if "--quantization" in flags and "quantization" in model and model["quantization"] != flags["--quantization"]:
+            failures.append("runtime quantization differs from generated --quantization")
+    if not revisions:
+        missing.append("source has no pinned model revision")
+    raw_model = config.get("model_config")
+    loaded = raw_model.get("loaded_config_commit_hash") if isinstance(raw_model, dict) else None
+    if loaded is not None and (not isinstance(loaded, str) or re.fullmatch(r"[0-9a-fA-F]{40}", loaded) is None):
+        failures.append("runtime loaded model config commit hash is malformed")
+    for revision in revisions:
+        observed = model.get("revision")
+        immutable = isinstance(revision, str) and re.fullmatch(r"[0-9a-fA-F]{40}", revision) is not None
+        if observed == revision or (immutable and isinstance(loaded, str) and loaded.lower() == revision.lower()):
+            pass
+        elif observed is None:
+            missing.append(f"runtime model revision has no evidence for {revision!r}")
+        else:
+            failures.append("runtime model revision differs from the pinned source revision")
+        if immutable and isinstance(config.get("model_config"), dict):
+            try:
+                _validate_revision(config, revision)
+            except ValueError as error:
+                failures.append(str(error))
+    if resolved_cache_dtype is not None and resolved_cache_dtype != cell.kv_cache_dtype:
+        failures.append("runtime KV precision differs from the planned identity")
+    method = model.get("quantization")
+    quant = config.get("quantization_config")
+    if "quantization_config" not in config:
+        missing.append("runtime quantization_config is unreported")
+    elif "quantization" in model and "dtype" in model:
+        required = {"type"}
+        if method in {"modelopt", "modelopt_fp4"}:
+            required.add("quant_method")
+        elif method == "fp8":
+            required.update({"activation_scheme", "weight_block_size"})
+        if method is not None and quant is None:
+            failures.append("runtime quantization method contradicts its absent quantization configuration")
+        elif method is not None and (not isinstance(quant, dict) or not required.issubset(quant)):
+            missing.append("runtime quantization family configuration is incomplete")
+        elif method == "mxfp4" and native_worker is not None:
+            from .runtime_k31 import is_audited_runtime
+
+            if not is_audited_runtime(native_worker.get("runtime")):
+                missing.append("MXFP4 execution requires the exact audited initialized runtime")
+            elif any(
+                key not in native_model or native_model[key] != value for key, value in model.items()
+            ) or quant != native_worker["resolved_config"].get("quantization_config"):
+                failures.append("runtime MXFP4 execution differs from the validated initialized worker")
+            else:
+                try:
+                    _validate_precision(
+                        native_worker["resolved_config"], cell, evidence=native_worker.get("initialized_moe")
+                    )
+                except ValueError as error:
+                    failures.append(str(error))
+        elif method not in {None, "modelopt", "modelopt_fp4", "fp8"}:
+            missing.append(f"runtime quantization mapping is unaudited: {method}")
+        else:
+            try:
+                _validate_precision(config, cell)
+            except ValueError as error:
+                failures.append(str(error))
+    graphs = []
+    for label, graph in (
+        ("graph_config", payload.get("graph_config")),
+        ("compilation_config", config.get("compilation_config")),
+    ):
+        if not isinstance(graph, dict) or not _GRAPH_FIELDS.issubset(graph):
+            missing.append(f"runtime {label} is incomplete")
+            continue
+        if "enforce_eager" not in model or "max_num_batched_tokens" not in valid.get("scheduler_config", {}):
+            continue
+        try:
+            graphs.append(
+                _validate_graph(
+                    graph,
+                    eager=model["enforce_eager"],
+                    tokens=valid["scheduler_config"]["max_num_batched_tokens"],
+                    allow_unused_captures=True,
+                )
+            )
+        except ValueError as error:
+            failures.append(str(error))
+    if len(graphs) == 2 and graphs[0] != graphs[1]:
+        failures.append("worker graph_config contradicts its resolved_config.compilation_config")
+    if native_worker is not None:
+        native_config = native_worker["resolved_config"]
+        kernel = config.get("kernel_config")
+        native_kernel = native_config.get("kernel_config")
+        if (
+            not isinstance(kernel, dict)
+            or not isinstance(native_kernel, dict)
+            or kernel.get("moe_backend") != native_kernel.get("moe_backend")
+        ):
+            failures.append("runtime kernel_config.moe_backend differs from the validated initialized worker")
+        native_parallel = native_config["parallel_config"]
+        for name in _CONFIG_TYPES["parallel_config"]:
+            if name in parallel and (
+                type(native_parallel.get(name)) is not type(parallel[name]) or native_parallel[name] != parallel[name]
+            ):
+                failures.append(f"runtime parallel_config.{name} differs from the validated initialized worker")
+        local, global_size = (native_parallel.get(name) for name in ("data_parallel_size_local", "data_parallel_size"))
+        if type(local) is int and type(global_size) is int and local > global_size:
+            failures.append("initialized worker local DP size exceeds global DP size")
+        native_graph = _validate_graph(
+            native_config["compilation_config"],
+            eager=native_model["enforce_eager"],
+            tokens=native_config["scheduler_config"]["max_num_batched_tokens"],
+            allow_unused_captures=True,
+        )
+        if any(graph != native_graph for graph in graphs):
+            failures.append("runtime execution graph settings differ from the validated initialized worker")
+
+
+def file_evidence(path: Path) -> dict[str, Any]:
+    raw = path.read_bytes()
+    return {"path": str(path.resolve()), "sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw)}
+
+
+def inspect_execution_evidence(
+    cell: FPMCell, raw_root: Path, collection: NativeCollection, *, plan: FPMCollectionPlan, evidence_version: int = 2
+) -> dict[str, Any]:
+    """Require actual worker observations; native point expectations stay labelled.
+
+    The caller first validates native point/rank/timing integrity. Missing
+    execution observations leave qualification incomplete without invalidating
+    historical timing artifacts or manufacturing a requested backend identity.
+    """
+    if type(evidence_version) is not int or evidence_version not in {1, 2}:
+        raise ValueError("unsupported execution evidence version")
+    missing = []
+    failures = []
+    flags = None
+    try:
+        flags = _effective_launch(plan, raw_root.parent)
+    except _MissingExecutionEvidence as error:
+        missing.append(str(error))
+    except (ValueError, TypeError) as error:
+        failures.append(str(error))
+    actual_pin = getattr(plan, "runtime_backend_version", None)
+    if actual_pin is not None and collection.backend_version != actual_pin:
+        failures.append("observed backend version differs from the frozen plan")
+    release = audited_release(collection.backend_version, EXECUTION_SUPPORTED_VERSIONS)
+    workers = []
+    ranks = set()
+    snapshot_models = None
+    snapshot_source = None
+    snapshot_load_attempted = False
+    audited_runtime_ranks = set()
+    scheduling = {"requested": _requested_scheduling(flags), "observed_workers": []}
+    for path in sorted(raw_root.glob("**/fpm-execution-worker-*.json")):
+        payload = json.loads(path.read_text())
+        if not isinstance(payload, dict):
+            raise ValueError(f"runtime execution evidence must be an object: {path}")
+        provenance = payload.get("collector_provenance", {})
+        if not isinstance(provenance, dict):
+            raise ValueError(f"runtime execution collector_provenance must be an object: {path}")
+        if (
+            payload.get("schema_name") != "aisimulate_fpm_runtime_execution"
+            or payload.get("schema_version") != 1
+            or provenance.get("plan_sha256") != plan.sha256
+            or provenance.get("cell_id") != cell.cell_id
+            or provenance.get("attempt_id") != collection.collector_attempt_id
+            or payload.get("backend_version") != collection.backend_version
+        ):
+            raise ValueError(f"runtime execution evidence has a different plan, cell, attempt or version: {path}")
+        rank = tuple(payload.get(key) for key in ("dp_rank", "tp_rank", "pp_rank"))
+        if any(type(value) is not int or value < 0 for value in rank) or rank in ranks:
+            raise ValueError(f"runtime execution worker ranks are invalid or duplicated: {path}")
+        ranks.add(rank)
+        item = {**payload, "source": file_evidence(path)}
+        workers.append(item)
+        if payload.get("status") != "observed":
+            missing.append(f"worker {rank}: {payload.get('error', 'execution observation unresolved')}")
+            continue
+        if (
+            release is not None
+            and release != collection.backend_version
+            and payload.get("audited_backend_version") != release
+        ):
+            failures.append(f"runtime execution evidence was not checked against audited vLLM {release}: {path}")
+        groups = payload.get("attention_groups")
+        if (
+            not isinstance(groups, list)
+            or not groups
+            or any(
+                not isinstance(group, dict)
+                or not isinstance(group.get("backend_class"), str)
+                or not group["backend_class"]
+                or not isinstance(group.get("layer_names"), list)
+                or not group["layer_names"]
+                or any(not isinstance(name, str) or not name for name in group["layer_names"])
+                for group in groups
+            )
+        ):
+            failures.append(f"runtime attention group observation is malformed: {path}")
+        config = payload.get("resolved_config")
+        model = config.get("model_config", {}) if isinstance(config, dict) else {}
+        if not isinstance(model, dict):
+            model = {}
+        native_worker = None
+        if (
+            release is None
+            or model.get("quantization") == "mxfp4"
+            or (
+                flags is not None
+                and "--model" in flags
+                and model.get("model") != flags["--model"]
+                and model.get("loaded_config_commit_hash") is None
+            )
+        ):
+            try:
+                if not snapshot_load_attempted:
+                    snapshot_load_attempted = True
+                    bundle = getattr(plan, "runtime_instrumentation", None)
+                    if bundle is not None:
+                        snapshot_models, snapshot_source = _runtime_worker_evidence(
+                            plan, cell, raw_root, collection, bundle=bundle
+                        )
+                if snapshot_models is not None:
+                    native_worker = snapshot_models.get(rank)
+                    if native_worker is None:
+                        raise ValueError("runtime evidence is missing this execution worker rank")
+                    from .runtime_k31 import is_audited_runtime
+
+                    if (
+                        is_audited_runtime(native_worker.get("runtime"))
+                        and native_worker["runtime"]["version"] == collection.backend_version
+                    ):
+                        expected_runtime = dict(native_worker["runtime"])
+                        execution_runtime = payload.get("runtime")
+                        if isinstance(execution_runtime, dict) and "image" not in execution_runtime:
+                            expected_runtime.pop("image", None)
+                        if execution_runtime != expected_runtime:
+                            raise ValueError(
+                                "execution runtime source identity differs from the validated initialized worker"
+                            )
+                        audited_runtime_ranks.add(rank)
+                    item["runtime_observation_binding"] = snapshot_source
+                    _validate_native_attention_groups(groups, native_worker)
+            except _MissingExecutionEvidence as error:
+                missing.append(f"runtime model snapshot evidence: {error}")
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                failures.append(f"runtime model snapshot evidence: {error}")
+        _inspect_config(payload, cell, plan, flags, missing, failures, native_worker)
+        config = payload.get("resolved_config")
+        scheduler = config.get("scheduler_config") if isinstance(config, dict) else None
+        scheduling["observed_workers"].append(
+            {
+                "rank": list(rank),
+                "async_scheduling": scheduler.get("async_scheduling") if isinstance(scheduler, dict) else None,
+                "source": item["source"],
+            }
+        )
+    expected = {
+        (dp, tp, pp)
+        for dp in range(cell.topology.dp)
+        for tp in range(cell.topology.tp)
+        for pp in range(cell.topology.pp)
+    }
+    if release is None and audited_runtime_ranks != expected:
+        missing.append(f"execution configuration inspection is unaudited for {collection.backend_version}")
+    if ranks - expected:
+        raise ValueError("runtime execution observations contain unexpected worker ranks")
+    if ranks != expected:
+        missing.append(f"worker execution observations missing for ranks {sorted(expected - ranks)}")
+    modes = {
+        item["async_scheduling"] for item in scheduling["observed_workers"] if type(item["async_scheduling"]) is bool
+    }
+    if evidence_version == 2 and len(modes) > 1:
+        failures.append("workers disagree on effective async_scheduling")
+    scheduling["effective_async_scheduling"] = next(iter(modes)) if len(modes) == 1 else None
+    scheduling["status"] = (
+        "mismatch"
+        if len(modes) > 1
+        else "observed"
+        if len(scheduling["observed_workers"]) == len(expected)
+        and all(type(item["async_scheduling"]) is bool for item in scheduling["observed_workers"])
+        else "unestablished"
+    )
+    native_graphs = []
+    for path, payload in _rank_artifacts(raw_root):
+        native_graphs.append(
+            {"dp_rank": payload["dp"]["rank"], "config": payload.get("cudagraph"), "source": file_evidence(path)}
+        )
+        if not isinstance(payload.get("cudagraph"), dict):
+            missing.append(f"native graph configuration unreported for {path.name}")
+    regimes = Counter(measurement.kv_seed_regime or "unreported" for measurement in collection.points)
+    if "unreported" in regimes:
+        missing.append("per-point KV initialization regime is unreported")
+    cpu_nodes, cpu_manifest, cpu_geometry_missing, cpu_geometry_failure = None, None, None, None
+    if getattr(plan.options, "slurm_cpus_per_task", None) is not None:
+        from .runner import FPM_MANIFEST_FILENAME, _expected_nodes
+
+        manifest = raw_root.parent / FPM_MANIFEST_FILENAME
+        try:
+            cpu_manifest = file_evidence(manifest)
+            cpu_nodes = _expected_nodes(manifest)
+        except OSError as error:
+            cpu_geometry_missing = str(error)
+        except (TypeError, ValueError, KeyError, yaml.YAMLError) as error:
+            cpu_geometry_failure = str(error)
+    cpu = inspect_cpu_affinity(cell, raw_root, collection, plan=plan, expected_nodes=cpu_nodes)
+    cpu["launch_geometry_source"] = cpu_manifest
+    if cpu_geometry_missing is not None:
+        cpu["missing_evidence"].append(f"generated launch geometry: {cpu_geometry_missing}")
+    if cpu_geometry_failure is not None:
+        cpu["failures"].append(f"generated launch geometry: {cpu_geometry_failure}")
+        cpu["status"] = "failed"
+    if cpu["policy_required"]:
+        missing.extend(f"CPU affinity: {message}" for message in cpu["missing_evidence"])
+        failures.extend(f"CPU affinity: {message}" for message in cpu["failures"])
+    dispatch = "unreported"
+    if evidence_version == 2:
+        from .measurement_evidence import extract_measurement_evidence
+
+        measurements = extract_measurement_evidence(raw_root, collection)
+        missing.extend(f"measurement evidence: {reason}" for reason in measurements["reasons"])
+        for point in measurements["points"].values():
+            missing.extend(f"measurement evidence: {reason}" for reason in point["reasons"])
+        if measurements["warmup_evidence"]:
+            dispatch = (
+                "observed" if "observed_per_call_graph_dispatch" not in measurements["unobserved"] else "incomplete"
+            )
+    return {
+        "status": "failed" if failures else "incomplete" if missing else "qualified",
+        "missing_evidence": sorted(set(missing)),
+        "failures": sorted(set(failures)),
+        "observed_workers": workers,
+        "native_graph_config": native_graphs,
+        "kv_seed_regime_counts": dict(regimes),
+        "cpu_affinity": cpu,
+        **({"scheduling": scheduling} if evidence_version == 2 else {}),
+        "per_point_dispatch": dispatch,
+        "scope": "initialized attention backends and resolved graph configuration; "
+        + (
+            "per-sample native dispatch observations"
+            if dispatch == "observed"
+            else "no complete per-point dispatch trace"
+            if evidence_version == 2
+            else "no per-point dispatch trace"
+        ),
+    }

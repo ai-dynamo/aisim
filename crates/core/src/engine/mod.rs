@@ -1,5 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
+// Hybrid checkpoint contract adapted and modified from SGLang (Apache-2.0).
+// Copyright 2023-2026 SGLang Team.
+// Source: https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/python/sglang/srt/runtime_context.py
+// See THIRD_PARTY_NOTICES.md for the complete source list and modification scope.
 
 //! Runtime-neutral mock inference schedulers and attention-DP composition.
 
@@ -7,6 +11,7 @@ pub(crate) mod belady;
 mod cache;
 mod common;
 mod config;
+pub(crate) mod fitted_timing;
 pub(crate) mod g3_offload;
 pub mod generalized;
 mod handoff;
@@ -19,6 +24,7 @@ pub(crate) mod offload_transfer;
 mod protocol;
 mod runtime;
 mod scheduler;
+pub(crate) mod speculation;
 mod timing;
 mod trace;
 
@@ -34,29 +40,41 @@ pub(crate) use common::hashing::{
     block_hashes_with_salt, cache_salt_seed, compute_block_hash_for_tokens,
     compute_next_sequence_hash,
 };
+#[cfg(all(test, feature = "python"))]
+pub(crate) use common::protocols::{DirectRequest, MockEngineArgs};
 pub use common::running_mean::RunningMean;
 pub use common::speculative::normalize_conditional_accept_rates;
+pub use config::{AfdAPoolConfig, AfdEngineConfig, AfdFPoolConfig};
 pub use config::{
     Backend, EngineConfig, FrontendConfig, FrontendStage, G2Connector, G2Scope, G3OffloadConfig,
-    G3Scope, KvcrConfig, NativeHostOffloadConfig, PreemptionMode, SglangConfig,
-    SglangHiCacheConfig, SglangHiCacheWritePolicy, SglangSchedulePolicy, SlidingWindowStateConfig,
-    StateCacheConfig, TrtllmCapacityPolicy, TrtllmConfig, WorkerType,
+    G3Scope, KvcrConfig, KvcrG3Config, KvcrLocalG2Config, KvcrLocalG2Policy,
+    NativeHostOffloadConfig, PassLaunchConfig, PreemptionMode, SglangConfig, SglangHiCacheConfig,
+    SglangHiCacheWritePolicy, SglangMambaCacheConfig, SglangSchedulePolicy,
+    SlidingWindowStateConfig, StateCacheConfig, TrtllmCapacityPolicy, TrtllmConfig, WorkerType,
 };
+pub(crate) use config::{MAX_PIPELINE_FILL_PASSES, afd_total_gpus};
+pub use fitted_timing::FittedIterationTiming;
 pub use g3_offload::{G3IoStats, G3Stats};
 pub use handoff::{
     HandoffId, HandoffTransferTiming, TransferTimingMode, prefill_handoff_delay_ms,
     transfer_delay_ms,
 };
-pub use kvcr::{KvcrPullCounts, KvcrStats};
+pub use kvcr::{KvcrG3Stats, KvcrLocalG2Stats, KvcrPullCounts, KvcrStats};
 pub use protocol::{
     Admission, CacheTierAttribution, Command, CommandEffects, CommandResult, DecodeAcceptance,
     EncoderShape, ForwardPassMetrics, HostCacheMetrics, ImageSpec, KvBlock, KvEvent, KvEventData,
-    KvEventTier, KvHintSource, LifecycleEvent, Metrics, Output, PassCompletionEffects,
-    PassStartEffects, PrefixCacheLookupCounts, PressureEvent, PressureKind, PressureState, Request,
-    StoredBlocks, TtftMilestone,
+    KvEventDomain, KvEventTier, KvHintSource, LifecycleEvent, Metrics, Output,
+    PassCompletionEffects, PassStartEffects, PrefixCacheLookupCounts, PressureEvent, PressureKind,
+    PressureState, Request, StoredBlocks, TtftMilestone,
 };
 pub use runtime::{Engine, EngineFactory};
 pub use scheduler::SchedulerRank;
+#[cfg(all(test, feature = "python"))]
+pub(crate) use scheduler::VllmCore;
+#[cfg(feature = "python")]
+pub(crate) use scheduler::afd::timing::AfdTimingModel;
+#[cfg(test)]
+pub(crate) use scheduler::afd::timing::tests::provider_for as afd_timing_provider_for;
 #[cfg(all(test, feature = "python"))]
 pub(crate) use timing::tests::assert_phase_bits;
 pub use timing::{

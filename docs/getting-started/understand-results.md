@@ -9,7 +9,7 @@ Start with the [CLI tutorial](quickstart.md#predict-one-deployment) and retain
 per-request output when investigating a result:
 
 ```bash
-aisimulate predict --stack engine --config prediction.yaml \
+aisim predict --stack engine --config prediction.yaml \
   --capture-per-request --output-dir prediction-output
 ```
 
@@ -133,7 +133,7 @@ Encoder pools are not supported by this capture path. It uses ordinary replay,
 not the DP1-only detailed-artifact path.
 
 ```bash
-aisimulate predict --stack engine --config examples/cli/agentic-profile.yaml \
+aisim predict --stack engine --config examples/cli/agentic-profile.yaml \
   --capture-telemetry --telemetry-sample-interval-ms 1000 \
   --output-dir ./agentic-telemetry
 ```
@@ -172,7 +172,7 @@ The exports provide the following inputs for warmup and profiling views:
 | Request/conversation/lane timeline | Absolute request timestamps, lineage, lane, and lifecycle events; retain canceled/failed requests |
 | ISL/OSL, TTFT, E2E, interactivity | Request lengths and timing; `itl_ms` is per-request average token gap and is null with fewer than two delivered tokens |
 | Queue depth | `prefill_scheduler_metrics` / `decode_scheduler_metrics`: `running_requests`, `waiting_requests`, worker/rank; plus `router_pending_*_requests` |
-| KV use | Scheduler `active_blocks`, `inactive_blocks`, `total_blocks`, `active_cache_usage`, `physical_cache_usage`; grouped caches use `kv_cache_used_bytes` / `kv_cache_capacity_bytes` |
+| KV use | Scheduler `active_blocks`, `inactive_blocks`, `total_blocks`, `active_cache_usage`, `physical_cache_usage`; grouped caches use (`kv_cache_used_bytes` + `kv_cache_cached_bytes`) / `kv_cache_capacity_bytes`, and an absent `kv_cache_cached_bytes` counts as 0 |
 | Prefill/decode throughput | `traffic.committed_prefill_tokens` / `traffic.delivered_output_tokens`, divided by `traffic.duration_s` |
 | Prefix lookup reuse | Role interval `g1_prefix_cache_lookup`: `matched_tokens`, `queried_tokens`, `query_count`; actual retries count, even if admission later blocks |
 | Prompt token sources | `traffic.first_admission`: `hbm_reused_tokens`, `host_reused_tokens`, `uncached_tokens`; distinct from executed work and readmission recomputation |
@@ -216,7 +216,7 @@ Use `--export-html` to write an interactive, simulation-only `report.html` next
 to the normal prediction output:
 
 ```bash
-aisimulate predict --config examples/cli/agentic-profile.yaml \
+aisim predict --config examples/cli/agentic-profile.yaml \
   --export-html --output-dir ./agentic-dashboard
 ```
 
@@ -322,7 +322,7 @@ helper warms up requests; a fresh replay's startup/cache history can differ.
 Record the difference or align the measurement windows before attributing
 error to the performance model.
 
-Save the input YAML, concrete recommended YAML, AISimulate version/source SHA,
+Save the input YAML, concrete recommended YAML, AISim version/source SHA,
 wheel identity when applicable, `prediction.json`, per-request records, and
 the benchmark command/results. For recommendations also retain
 `recommendation.json`: it records failed attempts and the candidate IDs behind

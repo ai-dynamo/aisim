@@ -1,0 +1,198 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 1
+architecture: KimiK3ForConditionalGeneration
+model_path: moonshotai/Kimi-K3
+include_base: true
+base_ops:
+  - gemm
+description: >
+  Kimi-K3 hybrid KDA/MLA LatentMoE model-centric collection plan.
+  Text backbone (KimiLinearConfig): hidden 7168, 93 layers = 69 KDA linear
+  attention + 24 MLA full attention, layer 0 dense MLP; LatentMoE routes
+  896 experts (top-16, SiTU activation) in a 3584-wide latent space with
+  moe_intermediate_size 3072; MXFP4 routed-expert weights. The DSPARK draft
+  model (RadixArk/Kimi-K3-DSpark) is a 5-layer dense GQA transformer whose
+  attention shape is declared here because it serves inside the K3 engine.
+
+model_case_values:
+  # DSPARK draft model attention (RadixArk/Kimi-K3-DSpark): 64 query heads,
+  # 16 KV heads, head_dim 64, full attention. Target MLA layers are covered
+  # by the mla rows below; KDA layers by the kda rows.
+  attention:
+    - id: kimi_k3_dspark_draft_attention
+      model_path: moonshotai/Kimi-K3
+      num_attention_heads: 64
+      num_key_value_heads: 16
+      head_dim: 64
+      window_size: 0
+      tensor_parallel_sizes: [1, 2, 4, 8]
+    # vLLM 0.27.0's upstream K3 MLA is a real MLA lane (via
+    # vllm/models/kimi_k3/nvidia/mla.py MultiHeadLatentAttention ->
+    # get_attn_backend(use_mla=True)); aiconfigurator's kimi_k3 model
+    # prices its 24 full-attention layers against the module-level MLA
+    # tables with FallbackOp GQA fallback to THIS attention profile for
+    # systems without 96-head module rows (see mla_module section).
+    # Declared framework-agnostic (the generator has no framework-scoped
+    # attention profiles); the extra sglang expansion is interpolation
+    # support.
+    - id: kimi_k3_mla_as_attention
+      model_path: moonshotai/Kimi-K3
+      num_attention_heads: 96
+      num_key_value_heads: 96
+      head_dim: 128
+      window_size: 0
+      tensor_parallel_sizes: [1, 2, 4, 8]
+  moe:
+    # LatentMoE routed experts run in the 3584 latent space (not model
+    # hidden 7168): gate/up 3584->3072, down 3072->3584, SiTU activation.
+    - model_path: moonshotai/Kimi-K3
+      hidden_size: 3584
+      inter_size: 3072
+      topk: 16
+      num_experts: 896
+      # SGLang builds K3's experts with activation=config.hidden_act (situ) and
+      # the SiTU betas as gemm1_alpha / gemm1_clamp_limit
+      # (activation_situ_beta 4.0, activation_situ_linear_beta 25.0;
+      # models/kimi_k3.py:503-521 at v0.5.23).
+      sglang_moe_activation: situ
+      sglang_moe_gemm1_alpha: 4.0
+      sglang_moe_gemm1_clamp_limit: 25.0
+      sglang_moe_scoring_func: sigmoid
+      sglang_moe_routing_method_type: DeepSeekV3
+      sglang_moe_routed_scaling_factor: 1.0
+      sglang_moe_renormalize: true
+      sglang_moe_has_correction_bias: true
+      sglang_moe_num_expert_group: 1
+      sglang_moe_topk_group: 1
+      sglang_moe_backends:
+        # SGLang v0.5.23: K3's runner override picks flashinfer_mxfp4 on
+        # SM100/103/107 only (arg_groups/model_overrides/kimi_k3.py:172-190).
+        # Every other SM keeps auto, which Mxfp4MoEMethod resolves to the
+        # Triton runner (layers/quantization/mxfp4.py:1443-1450): it upcasts the
+        # MXFP4 experts to BF16 at load (:1115-1133; triton_kernels ships with
+        # sglang-kernel, kernels/aot/CMakeLists.txt:548-553) and applies SiTU
+        # from gemm1_alpha / gemm1_clamp_limit (moe_runner/triton.py:162-170,
+        # 208-215; triton_utils/fused_moe.py:825-834).
+        w4a16_mxfp4: {89: triton, 90: triton, 100: flashinfer_mxfp4, 103: flashinfer_mxfp4, 120: triton}
+        # On SM100/103 flashinfer_mxfp4 runs the default precision, MXFP8
+        # activations on the trtllm-gen leaf (fields/exec_.py:892-897,
+        # moe_runner/flashinfer_trtllm.py:1145-1166), so serving runs this
+        # label there and collector/skips.py leaves the W4A16 cases out. The
+        # base moe.yaml quant-mode axis gates this label to SM100 and newer;
+        # collector/skips.py leaves it out on SM120, where K3 runs BF16
+        # activations.
+        w4a8_mxfp4_mxfp8: {100: flashinfer_mxfp4, 103: flashinfer_mxfp4}
+      # Do not enroll K3 in the standalone DeepEP WideEP collectors.  The
+      # pinned vLLM 0.24.0 source predates K3 serving support, and the current
+      # vLLM/SGLang K3 expert-parallel serving path selects MegaMoE
+      # (deep_gemm_mega_moe / --moe-a2a-backend megamoe), whose fused
+      # A2A+GEMM path is not represented by the DeepEP communication table.
+      # A K3-scoped run activates moe only for sglang and vllm (no trtllm K3
+      # lane, review; see framework_specific_op_cases below). A
+      # full-plan run plans these cases on every backend like any other row.
+      quantization_modes: [w4a16_mxfp4, w4a8_mxfp4_mxfp8]
+  mla:
+    # K3 MLA: 96 heads, NoPE (rope slice projected/cached but positionless),
+    # plus an output gate handled as a standard GEMM. Kernel-shape-wise it is
+    # the DeepSeek MLA geometry, so the historical 128/64-head tables apply;
+    # declare the native 96-head profile for exact hits.
+    - model_path: moonshotai/Kimi-K3
+      num_heads: 96
+      q_lora_rank: 1536
+      kv_lora_rank: 512
+      qk_nope_head_dim: 128
+      qk_rope_head_dim: 64
+      v_head_dim: 128
+  kda:
+    # KDA structural tuple per attention-TP shard: 96 heads at TP1 shard to
+    # 48/24/12 local heads at TP2/4/8. Each row is one physical kernel shape
+    # (the persisted key is (d_model, num_k_heads, head_k_dim, num_v_heads,
+    # head_v_dim, d_conv)); num_k_heads == num_v_heads for KDA.
+    - model_path: moonshotai/Kimi-K3
+      d_model: 7168
+      d_conv: 4
+      num_k_heads: 96
+      head_k_dim: 128
+      num_v_heads: 96
+      head_v_dim: 128
+    - model_path: moonshotai/Kimi-K3
+      d_model: 7168
+      d_conv: 4
+      num_k_heads: 48
+      head_k_dim: 128
+      num_v_heads: 48
+      head_v_dim: 128
+    - model_path: moonshotai/Kimi-K3
+      d_model: 7168
+      d_conv: 4
+      num_k_heads: 24
+      head_k_dim: 128
+      num_v_heads: 24
+      head_v_dim: 128
+    - model_path: moonshotai/Kimi-K3
+      d_model: 7168
+      d_conv: 4
+      num_k_heads: 12
+      head_k_dim: 128
+      num_v_heads: 12
+      head_v_dim: 128
+
+framework_specific_model_case_values:
+  vllm:
+    # vLLM 0.27.0 upstream ships Kimi-K3's own MultiHeadLatentAttention
+    # (vllm/models/kimi_k3/nvidia/mla.py: get_attn_backend(use_mla=True)
+    # + MLAAttentionImpl over the 512+64 latent KV head). Price its cost via
+    # the module-level MLA tables; deliver the exact 96-head module identity
+    # (queries resolve native-nearest to the DeepSeek 128-head rows until
+    # these land).
+    mla_module:
+      - model_path: moonshotai/Kimi-K3
+        attention_type: mla
+        architecture: KimiK3ForConditionalGeneration
+        native_num_heads: 96
+        wideep_mla: false
+
+# moe is activated per-framework (NOT all_frameworks): K3 has no trtllm
+# serving lane, and an all-frameworks activation made a K3-scoped trtllm run
+# plan moe and expand it to zero cases with no logged drop
+# (case_authoring.md forbids silent zero expansions).
+framework_specific_op_cases:
+  vllm:
+    moe:
+      cases: all
+    kda:
+      cases: all
+    attention_context:
+      cases: all
+    attention_generation:
+      cases: all
+    mla_bmm_gen_pre:
+      cases: all
+    mla_bmm_gen_post:
+      cases: all
+    # vLLM 0.27.0's upstream K3 MLA is a real MLA lane; the kimi_k3 model
+    # prices its 24 full-attention layers against the module-level tables
+    # (FallbackOp GQA fallback stays for pre-collection systems).
+    mla_context_module:
+      cases: all
+    mla_generation_module:
+      cases: all
+  sglang:
+    moe:
+      cases: all
+    attention_context:
+      cases: all
+    attention_generation:
+      cases: all
+    mla_context:
+      cases: all
+    mla_generation:
+      cases: all
+    mla_bmm_gen_pre:
+      cases: all
+    mla_bmm_gen_post:
+      cases: all
+    kda:
+      cases: all

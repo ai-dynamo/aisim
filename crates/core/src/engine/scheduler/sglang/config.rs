@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-FileCopyrightText: Copyright 2023-2026 SGLang Team
 // SPDX-License-Identifier: Apache-2.0
+// Hybrid checkpoint contract adapted and modified from SGLang (Apache-2.0).
+// Copyright 2023-2026 SGLang Team.
+// Source: https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/python/sglang/srt/runtime_context.py
+// See THIRD_PARTY_NOTICES.md for the complete source list and modification scope.
 // Modified behavioral adaptation of SGLang v0.5.22; see THIRD_PARTY_NOTICES.md.
 // Source: https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
 
@@ -29,6 +33,7 @@ pub enum SchedulePolicy {
 }
 
 pub(super) struct SglangConfig {
+    pub(super) mamba_cache: Option<crate::engine::SglangMambaCacheConfig>,
     pub(super) schedule_policy: SchedulePolicy,
     pub(super) max_prefill_tokens: usize,
     pub(super) max_running_requests: usize,
@@ -37,6 +42,7 @@ pub(super) struct SglangConfig {
     pub(super) reserved_decode_tokens: usize,
     pub(super) chunked_prefill_size: usize,
     pub(super) prefill_decode_interval: usize,
+    pub(super) scheduler_select_time_ms: f64,
     pub(super) clip_max_new_tokens: usize,
     pub(super) init_new_token_ratio: f64,
     pub(super) min_new_token_ratio: f64,
@@ -44,6 +50,7 @@ pub(super) struct SglangConfig {
     pub(super) perf_model: Arc<PerfModel>,
     pub(super) speedup_ratio: f64,
     pub(super) decode_speedup_ratio: f64,
+    pub(super) pipeline_fill_passes: f64,
     pub(super) worker_type: WorkerType,
     pub(super) block_size: usize,
     pub(super) total_kv_tokens: usize,
@@ -133,8 +140,10 @@ impl SglangConfig {
             });
 
         Self {
+            mamba_cache: sglang.and_then(|s| s.mamba_cache),
             schedule_policy,
             prefill_decode_interval: args.prefill_decode_interval,
+            scheduler_select_time_ms: sglang.map_or(0.0, |s| s.scheduler_select_time_ms),
             max_running_requests,
             decode_request_slots: max_running_requests.saturating_add(extra_decode_slots),
             decode_metadata_slots: max_running_requests.saturating_mul(2),
@@ -156,6 +165,7 @@ impl SglangConfig {
             perf_model: args.perf_model.clone(),
             speedup_ratio: args.speedup_ratio,
             decode_speedup_ratio: args.decode_speedup_ratio,
+            pipeline_fill_passes: args.pipeline_fill_passes,
             worker_type: args.worker_type,
             block_size: args.block_size,
             total_kv_tokens,

@@ -5,14 +5,15 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 
-from aisimulate import resources
-from aisimulate.compiler import prediction_to_replay_spec
-from aisimulate.config import CorePredictionConfig
-from aisimulate.config.common import ResourceConfig
-from aisimulate.resources import (
+from aisim import resources
+from aisim.compiler import prediction_to_replay_spec
+from aisim.config import CorePredictionConfig
+from aisim.config.common import ResourceConfig
+from aisim.resources import (
     GB,
     MIB,
     HostResources,
@@ -22,8 +23,8 @@ from aisimulate.resources import (
     require_plan,
     workload_bounds,
 )
-from aisimulate.runner import EngineReplayRunnerFactory
-from aisimulate.sweeper.replay import ReplayOutputRequirements
+from aisim.runner import EngineReplayRunnerFactory
+from aisim.sweeper.replay import ReplayOutputRequirements
 
 
 def _request(input_length=64, output_length=1, *, hashes=None, timestamp=0.0):
@@ -381,6 +382,55 @@ def test_weka_cached_profile_inspection_rechecks_live_headroom(tmp_path, weka_pa
     assert limited.allocation_model == "agentic-profile-materialization-v1"
     assert limited.estimated_peak_bytes > 1
     assert len(weka_parses) == 1
+
+
+@pytest.mark.parametrize("input_tokens", [64, 32_000_000], ids=["worker-baseline", "trace-materialization"])
+def test_profile_wave_admission_partitions_headroom(tmp_path, monkeypatch, input_tokens):
+    workload = _workload(
+        _write_trace(tmp_path, _play([_request(input_tokens)])), agentic_profile={"duration_seconds": 1200}
+    )
+    spec = SimpleNamespace(workload=workload, concurrency=None)
+    host = HostResources(16 * GB, 12 * GB, 4)
+    monkeypatch.setattr(resources, "discover_host", lambda: host)
+    monkeypatch.setattr(resources, "_child_memory_bytes", lambda: 0)
+    # Use the real budget calculation with a fixed host, independent of the test process.
+    resolve = resources.resolve_budget
+    budget = resolve(ResourceConfig(memory_limit_gb=4, cpu_limit=4), host)
+    monkeypatch.setattr(resources, "resolve_budget", lambda *args: budget.copy())
+    factory = resources.GuardedRunnerFactory(EngineReplayRunnerFactory(), "engine", ResourceConfig())
+    with pytest.raises(ResourceLimitError):
+        factory.admit_wave([spec, spec])
+    monkeypatch.setenv("_AISIM_SUPERVISED_BUDGET", "{}")
+    wave = factory.admit_wave([spec, spec])
+    estimate = wave["candidates"][0]["estimate"]
+    assert estimate["estimated_peak_bytes"] is None
+    initial = estimate["materialization_peak_bytes"]
+    baseline = 512 * MIB + estimate["lower_bound_bytes"]
+    assert (initial > baseline) == (input_tokens == 32_000_000)
+    floor = max(initial, baseline)
+    assert wave["candidates"][0]["profile_worker_min_bytes"] == floor
+    assert wave["reserved_bytes"] == [floor, floor]
+    assert wave["profile_worker_rss_limit_bytes"] == wave["available_bytes"] // 2
+    assert factory.observed_peak(spec) is None
+
+    budget["memory_limit_bytes"] = budget["coordinator_memory_bytes"] + 2 * floor - 1
+    with pytest.raises(ResourceLimitError) as caught:
+        factory.admit_wave([spec, spec])
+    assert caught.value.plan["profile_worker_rss_limit_bytes"] == floor - 1
+    single = factory.admit_wave([spec])
+    assert "profile_worker_rss_limit_bytes" not in single
+    assert single["reserved_bytes"] == [baseline]
+    custom = resources.GuardedRunnerFactory(object(), "engine", ResourceConfig())
+    with pytest.raises(resources._SerialAdmissionRequired):
+        custom.admit_wave([spec, spec])
+    if initial > baseline:
+        budget["memory_limit_bytes"] = budget["coordinator_memory_bytes"] + initial - 1
+        with pytest.raises(ResourceLimitError, match="candidate exceeds the host memory budget") as caught:
+            factory.admit_wave([spec])
+        assert (
+            caught.value.plan["estimate"]["reason"]
+            == "initial profile trace materialization estimate exceeds live headroom"
+        )
 
 
 def test_weka_budget_limited_scans_are_not_cached(tmp_path, weka_parses):
