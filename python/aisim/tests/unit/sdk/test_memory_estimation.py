@@ -994,6 +994,15 @@ def test_naive_estimate_of_an_unknown_wrapper_reads_its_decoder(key):
     assert (named.architecture, named.geometry) == (name, flat.geometry)
 
 
+@pytest.mark.parametrize("nested", [False, True], ids=["flat", "decoder"])
+def test_naive_estimate_reads_a_dtype_that_is_no_string_as_the_default_width(nested):
+    # The width of a dtype that names no known type is 2 bytes, and so is the width of a value that is no string.
+    decoder = {**_UNKNOWN_DECODER, "torch_dtype": 5}
+    config = {"architectures": [_UNKNOWN_WRAPPER], **({"text_config": decoder} if nested else decoder)}
+    estimator = NaiveKVCacheEstimator.from_hf_config(config, tp_size=1, pp_size=1)
+    assert (estimator.dtype_bytes, estimator.kv_bytes_per_token()) == (2, _UNKNOWN_DECODER_KV_BYTES)
+
+
 def test_naive_estimate_reads_the_first_architecture_name_and_the_text_config_of_any_unknown_document():
     # Only the first name decides whether the architecture is known.
     flat = NaiveKVCacheEstimator.from_hf_config(

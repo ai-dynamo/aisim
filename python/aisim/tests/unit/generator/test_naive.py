@@ -4,6 +4,7 @@
 """Unit tests for generator naive module — nvbug 5941223."""
 
 import json
+import logging
 import re
 from unittest.mock import patch
 
@@ -244,6 +245,13 @@ class TestEstimateModelWeightBytes:
             "supported architecture LlamaForCausalLM: ValueError: Model config must define 'num_hidden_layers' or a "
             "parseable layer pattern."
         )
+
+    def test_logs_the_raw_config_estimator_as_the_step_after_a_failed_parse(self, tmp_path, caplog):
+        (tmp_path / "config.json").write_text(json.dumps({"architectures": ["LlamaForCausalLM"], "hidden_size": 128}))
+
+        with caplog.at_level(logging.INFO, logger="aisim.generator.naive"), pytest.raises(RuntimeError):
+            _estimate_model_weight_bytes(str(tmp_path))
+        assert f"Normalized model parsing failed for {tmp_path}; trying the raw-config estimator." in caplog.messages
 
     def test_estimates_an_unknown_wrapper_from_its_decoder(self, tmp_path):
         decoder = {

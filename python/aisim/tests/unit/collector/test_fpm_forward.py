@@ -1800,7 +1800,9 @@ def test_registered_wrapper_with_only_the_other_decoder_key_is_refused_by_every_
     problem = f"{wrapper} keeps its text decoder under {own}, but this config holds {held} and no {own}"
     with pytest.raises(ValueError) as intake:
         load_intake_config(path)
-    assert str(intake.value) == f"{problem}; supply its decoder config or a complete --fpm-profile"
+    assert (
+        str(intake.value) == f"{problem}; supply a config.json that holds the text decoder under the wrapper's own key"
+    )
     with pytest.raises(ValueError) as effective:
         _ = ResolvedModelConfig(document, source_kind="explicit", source_reference="test").effective_payload
     assert str(effective.value) == f"{problem}; supply one text decoder config"
@@ -1838,7 +1840,9 @@ def test_registered_wrapper_with_only_the_other_decoder_key_is_refused_before_it
     assert str(collector.value) == f"{problem}; supply one text decoder config"
     with pytest.raises(ValueError) as intake:
         load_intake_config(path)
-    assert str(intake.value) == f"{problem}; supply its decoder config or a complete --fpm-profile"
+    assert (
+        str(intake.value) == f"{problem}; supply a config.json that holds the text decoder under the wrapper's own key"
+    )
 
 
 def test_registered_wrapper_with_a_null_other_decoder_key_is_refused_before_the_key_is_read(tmp_path):
@@ -1854,7 +1858,9 @@ def test_registered_wrapper_with_a_null_other_decoder_key_is_refused_before_the_
     problem = f"{wrapper} keeps its text decoder under llm_config, but this config holds text_config and no llm_config"
     with pytest.raises(ValueError) as intake:
         load_intake_config(path)
-    assert str(intake.value) == f"{problem}; supply its decoder config or a complete --fpm-profile"
+    assert (
+        str(intake.value) == f"{problem}; supply a config.json that holds the text decoder under the wrapper's own key"
+    )
     with pytest.raises(ValueError) as effective:
         _ = ResolvedModelConfig(document, source_kind="explicit", source_reference="test").effective_payload
     assert str(effective.value) == f"{problem}; supply one text decoder config"

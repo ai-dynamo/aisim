@@ -236,7 +236,7 @@ def _estimate_model_weight_bytes(model_path: str, *, model_metadata: dict[str, A
         from aisim.sdk.memory import NaiveKVCacheEstimator
 
         logger.info(
-            "Normalized model parsing failed for %s; using raw config for naive sizing.",
+            "Normalized model parsing failed for %s; trying the raw-config estimator.",
             model_path,
         )
         logger.debug("Normalized parser error for %s: %s", model_path, e)

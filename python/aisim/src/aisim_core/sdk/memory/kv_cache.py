@@ -739,7 +739,8 @@ class NaiveKVCacheEstimator:
     @staticmethod
     def _dtype_bytes(hf_config: dict) -> int:
         """dtype byte width from ``torch_dtype``/``dtype``. Defaults to 2 (bf16)."""
-        dtype_str = (hf_config.get("torch_dtype") or hf_config.get("dtype") or "").lower()
+        value = hf_config.get("torch_dtype") or hf_config.get("dtype")
+        dtype_str = value.lower() if isinstance(value, str) else ""
         if dtype_str in ("float32", "fp32"):
             return 4
         if dtype_str in ("bfloat16", "float16", "bf16", "fp16", "half"):

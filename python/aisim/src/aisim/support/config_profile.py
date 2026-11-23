@@ -601,7 +601,7 @@ def load_model_config(path: str | Path) -> ModelConfig:
         )
     }
     if (problem := wrapper_key_problem(document)) is not None:
-        raise ValueError(f"{problem}; supply its decoder config or a complete --fpm-profile")
+        raise ValueError(f"{problem}; supply a config.json that holds the text decoder under the wrapper's own key")
     decoder_key = decoder_config_key(document)
     if decoder_key is not None:
         decoder = document[decoder_key]
