@@ -1865,6 +1865,11 @@ addresses two independent cache/sweep defects:
   scan to the reserved `context_attention (scaled)` name, and require the same
   rejection as a cold graph at both the old and a new workload. Scale and GEMM
   field edits also compare the repriced result with a cold copy.
+  Follow-up `2d873da1a173b0c9576f71bc67476955d6cb5bbc` resolves compiler-owned
+  attention lanes before taking the identity and skips equal-value lane writes.
+  This retains both first-summary reuse and negative-handle caching. Those
+  existing assertions initially failed under the new epoch and pass with the
+  preparation correction; neither assertion was changed.
 - An aggregate sweep skips the same single-request qualified visual chunks
   that `run_agg` rejects, before pricing or recording candidates. Direct calls
   retain that rejection. With effective ISL 4096, prefix 3000 and stride 512,
@@ -1922,7 +1927,7 @@ native build, a full-PR performance qualification or serving-accuracy evidence.
 #### Mutation-check host cost
 
 [`cache_identity_perf.py`](mamba-mixed-step-accounting/cache_identity_perf.py)
-compares the exact pinned `d32fb0aa` Python bridge with the `32d50c27` bridge,
+compares the exact pinned `d32fb0aa` Python bridge with the `2d873da1` bridge,
 on the same candidate native extension and model constructors. Restore only
 `aisim_core/sdk/rust_engine_step.py` from the pinned revision in another copy
 of the installed SDK. Run from the repository root:
@@ -1932,10 +1937,10 @@ python benchmarks/evidence/mamba-mixed-step-accounting/cache_identity_perf.py \
   BASE_SDK CANDIDATE_SDK OUT.json
 ```
 
-[cache-identity-perf-32d50c27.json](mamba-mixed-step-accounting/cache-identity-perf-32d50c27.json)
+[cache-identity-perf-2d873da1.json](mamba-mixed-step-accounting/cache-identity-perf-2d873da1.json)
 retains six alternating fresh-process rounds, identities, setup and first-query
 times, and all 7200 warm samples after 1000 warmups per cell. It requires equal
-predictions, native hashes and constructors, and different bridge hashes. Both
+predictions, native/compiler hashes and constructors, and different bridge hashes. Both
 models use vLLM 0.24.0, B200 SOL, TP1, effective ISL 4096, prefix 3000, OSL64,
 budget 512 and batch four; Nano is MTP3 and Qwen3-0.6B is the MTP0 control.
 The direct mixed call uses three decoders. Aggregate misses clear only the
@@ -1945,20 +1950,20 @@ warm medians, pinned bridge / corrected bridge, in microseconds:
 
 | Caller | Nano MTP3 | Qwen control |
 | --- | --- | --- |
-| SDK mixed step, warm native memo | 1.864 / 2.272 | 1.665 / 1.723 |
-| Aggregate summary miss | 322.333 / 317.990 | 105.170 / 99.412 |
-| Aggregate summary hit | 3.332 / 3.349 | 3.231 / 3.343 |
+| SDK mixed step, warm native memo | 1.855 / 1.899 | 1.633 / 1.712 |
+| Aggregate summary miss | 317.359 / 322.995 | 101.722 / 101.388 |
+| Aggregate summary hit | 3.245 / 3.316 | 3.167 / 3.289 |
 
-The direct Nano helper increases by 0.408 us (+21.9%); the Qwen helper by
-0.058 us (+3.5%). The identity check itself adds one atomic read/native call
+The direct Nano helper increases by 0.044 us (+2.4%); the Qwen helper by
+0.079 us (+4.8%). The identity check itself adds one atomic read/native call
 and one scalar comparison, independent of graph size, with one additional
 memo field and no graph scan or retained graph copy. An isolated six-pair,
 100,000-call `timeit` comparison of the exact old/new identity functions on
 the same warmed graph measured 0.128–0.152 / 0.157–0.184 us. The native epoch
-call alone was 0.015–0.016 us. Thus the direct helper delta should not all be
-attributed to the epoch read. Process-level timings also varied: Nano miss
-medians ranged 317–407 / 304–594 us, and occasional hit cells reached 7.8 us.
-An initial ten-warmup run was noisier; its logs remain in repair scratch.
+call alone was 0.015–0.016 us. Process-level timings also varied: Nano miss
+medians ranged 309–334 / 304–351 us, and one baseline control hit cell reached
+6.7 us. Initial runs before the lane-preparation correction were noisier and
+showed a larger Nano helper delta; their records remain in repair scratch.
 
 The constant-time check is necessary to observe edits through raw native
 setters; serializing every operation per query would scale with graph size,

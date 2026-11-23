@@ -26,7 +26,7 @@ def fingerprint(path):
 
 def worker(output):
     from aisim import _runtime
-    from aisim_core.sdk import config, rust_engine_step
+    from aisim_core.sdk import config, engine, rust_engine_step
     from aisim_core.sdk.backends.factory import get_backend
     from aisim_core.sdk.models import get_model, nemotron_h
     from aisim_core.sdk.perf_database import get_database_view
@@ -73,6 +73,7 @@ def worker(output):
         "bridge_path": str(Path(rust_engine_step.__file__).resolve()),
         "native_sha256": fingerprint(_runtime.__file__),
         "bridge_sha256": fingerprint(rust_engine_step.__file__),
+        "compiler_sha256": fingerprint(engine.__file__),
         "constructor_sha256": fingerprint(nemotron_h.__file__),
     }
     output.write_text(json.dumps(result))
@@ -113,6 +114,7 @@ def main():
             identities = [row["results"][label]["identity"] for label in ("baseline", "candidate")]
             assert identities[0]["native_sha256"] == identities[1]["native_sha256"]
             assert identities[0]["constructor_sha256"] == identities[1]["constructor_sha256"]
+            assert identities[0]["compiler_sha256"] == identities[1]["compiler_sha256"]
             assert identities[0]["bridge_sha256"] != identities[1]["bridge_sha256"]
             for model in ("nano", "qwen"):
                 for case in ("native_mixed", "aggregate_miss", "aggregate_hit"):
