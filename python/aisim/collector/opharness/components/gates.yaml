@@ -20,6 +20,8 @@ ungated:
   dsa_generation_module_skip_indexer: the sglang dsa_generation_module path without the indexer
   dsv4_csa_topk_calib: calibration helper, not a serving op
   dsv41_module: the native runner times TP ranks in spawned processes; probe.trace_case refuses it
+  kimi_k31_dsa_context_module: native gated DSA runs in spawned TP workers outside the in-process probe.trace_case capture
+  kimi_k31_dsa_generation_module: native gated DSA runs in spawned TP workers outside the in-process probe.trace_case capture
   kda:verify: the serving probe runs no speculative decoding
 gates:
 - gate: gemm_fp8block_DeepSeek-V3.2
