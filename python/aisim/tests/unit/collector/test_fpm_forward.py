@@ -1901,18 +1901,18 @@ def _gemma4_without_decoder_layers():
     [
         (
             {**_packaged_config("google--gemma-4-26B-A4B"), "vision_config": "x"},
-            "Gemma4ForConditionalGeneration is invalid: ValueError: Expected 'vision_config' to be a dict for "
+            "Gemma4ForConditionalGeneration: ValueError: Expected 'vision_config' to be a dict for "
             "architecture Gemma4ForConditionalGeneration, got str",
         ),
         (
             {**_packaged_config("meta-llama--Llama-4-Scout-17B-16E-Instruct"), "vision_config": {}},
-            "Llama4ForConditionalGeneration is invalid: ValueError: Llama 4 vision_config is missing required fields: "
+            "Llama4ForConditionalGeneration: ValueError: Llama 4 vision_config is missing required fields: "
             "hidden_size, num_hidden_layers, num_attention_heads, num_channels, intermediate_size, image_size, "
             "patch_size, pixel_shuffle_ratio, projector_input_dim, projector_output_dim, vision_output_dim",
         ),
         (
             _gemma4_without_decoder_layers(),
-            "Gemma4ForConditionalGeneration is invalid: ValueError: Model config must define 'num_hidden_layers' or "
+            "Gemma4ForConditionalGeneration: ValueError: Model config must define 'num_hidden_layers' or "
             "a parseable layer pattern.",
         ),
     ],
@@ -1927,7 +1927,7 @@ def test_render_refuses_a_registered_wrapper_that_the_parser_refuses_with_the_pa
     path.write_text(json.dumps(document))
     with pytest.raises(ValueError) as error:
         load_model_config(str(path)).parsed_payload()
-    assert str(error.value) == f"HF config of the supported architecture {problem}"
+    assert str(error.value) == f"the config parser refuses the HF config of the supported architecture {problem}"
     assert type(error.value.__cause__) is ValueError
 
 
@@ -2004,7 +2004,8 @@ def test_render_refuses_a_registered_architecture_for_each_error_class_of_the_pa
         load_model_config(str(path)).parsed_payload()
     assert type(error.value.__cause__) is cause
     assert str(error.value) == (
-        f"HF config of the supported architecture {architecture} is invalid: {cause.__name__}: {error.value.__cause__}"
+        f"the config parser refuses the HF config of the supported architecture {architecture}: {cause.__name__}: "
+        f"{error.value.__cause__}"
     )
 
 

@@ -131,7 +131,7 @@ class ResolvedModelConfig:
             # its encoder and processor fields.
             if architecture in ARCHITECTURE_TO_MODEL_FAMILY:
                 raise ValueError(
-                    f"HF config of the supported architecture {architecture} is invalid: "
+                    f"the config parser refuses the HF config of the supported architecture {architecture}: "
                     f"{type(error).__name__}: {error}"
                 ) from error
             if not isinstance(error, ValueError):

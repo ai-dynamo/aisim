@@ -696,7 +696,7 @@ class NaiveKVCacheEstimator:
         except Exception as error:
             if architecture in ARCHITECTURE_TO_MODEL_FAMILY:
                 raise ValueError(
-                    f"HF config of the supported architecture {architecture} is invalid: "
+                    f"the config parser refuses the HF config of the supported architecture {architecture}: "
                     f"{type(error).__name__}: {error}"
                 ) from error
             parsed = None  # unsupported arch (the fallback's target) -> raw-key read, of its decoder when nested

@@ -240,9 +240,9 @@ class TestEstimateModelWeightBytes:
         with pytest.raises(RuntimeError) as error:
             _estimate_model_weight_bytes(str(tmp_path))
         assert str(error.value) == (
-            f"Could not estimate model size for {str(tmp_path)!r}: HF config of the supported architecture "
-            "LlamaForCausalLM is invalid: ValueError: Model config must define 'num_hidden_layers' or a parseable "
-            "layer pattern."
+            f"Could not estimate model size for {str(tmp_path)!r}: the config parser refuses the HF config of the "
+            "supported architecture LlamaForCausalLM: ValueError: Model config must define 'num_hidden_layers' or a "
+            "parseable layer pattern."
         )
 
     def test_estimates_an_unknown_wrapper_from_its_decoder(self, tmp_path):

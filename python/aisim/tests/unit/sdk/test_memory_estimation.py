@@ -898,7 +898,7 @@ _UNKNOWN_DECODER_KV_BYTES = 1024
 _UNKNOWN_DECODER_WEIGHT_BYTES = 9_412_608
 _UNKNOWN_WRAPPER = "UnknownWrapperForConditionalGeneration"
 _NO_LAYERS_TEXT = (
-    "HF config of the supported architecture LlamaForCausalLM is invalid: ValueError: "
+    "the config parser refuses the HF config of the supported architecture LlamaForCausalLM: ValueError: "
     "Model config must define 'num_hidden_layers' or a parseable layer pattern."
 )
 
@@ -909,7 +909,8 @@ _NO_LAYERS_TEXT = (
         ({"architectures": ["LlamaForCausalLM"], "hidden_size": 128}, _NO_LAYERS_TEXT, ValueError),
         (
             {"architectures": ["LlamaForCausalLM"], "num_hidden_layers": 2},
-            "HF config of the supported architecture LlamaForCausalLM is invalid: KeyError: 'hidden_size'",
+            "the config parser refuses the HF config of the supported architecture LlamaForCausalLM: KeyError: "
+            "'hidden_size'",
             KeyError,
         ),
         ({"architectures": ["LlamaForCausalLM", "OtherForCausalLM"], "hidden_size": 128}, _NO_LAYERS_TEXT, ValueError),
@@ -921,6 +922,28 @@ def test_naive_estimate_of_a_known_architecture_fails_with_the_parser_message(co
         NaiveKVCacheEstimator.from_hf_config(config, tp_size=1, pp_size=1)
     assert str(error.value) == text
     assert type(error.value.__cause__) is cause
+
+
+def test_naive_estimate_names_the_parser_for_a_valid_folder_whose_config_the_parser_refuses(tmp_path):
+    from importlib import resources
+
+    from aisim_core.sdk.utils import _load_model_config_from_model_path, _parse_hf_config_json
+
+    # A Llama 4 folder in the form that the hub publishes keeps the image processor config in preprocessor_config.json.
+    # The op-level loader attaches that file, so the folder parses. The naive estimate reads config.json alone, and the
+    # parser refuses that config.
+    name = "meta-llama--Llama-4-Scout-17B-16E-Instruct_config.json"
+    document = json.loads(resources.files("aisim_core").joinpath("model_configs", name).read_text())
+    (tmp_path / "preprocessor_config.json").write_text(json.dumps(document.pop("image_processor_config")))
+    (tmp_path / "config.json").write_text(json.dumps(document))
+    parsed = _parse_hf_config_json(_load_model_config_from_model_path(str(tmp_path)))
+    assert parsed["architecture"] == "Llama4ForConditionalGeneration"
+    with pytest.raises(ValueError) as error:
+        NaiveKVCacheEstimator.from_model_path(str(tmp_path), tp_size=1, pp_size=1, allow_hf_config_download=False)
+    assert str(error.value) == (
+        "the config parser refuses the HF config of the supported architecture Llama4ForConditionalGeneration: "
+        "TypeError: Llama 4 config must preserve image_processor_config metadata or provide preprocessor_config.json"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1032,7 +1055,8 @@ def test_naive_estimate_refuses_a_malformed_text_config_of_a_registered_wrapper(
     with pytest.raises(ValueError) as error:
         NaiveKVCacheEstimator.from_hf_config(config, tp_size=1, pp_size=1)
     assert str(error.value).startswith(
-        "HF config of the supported architecture Qwen3_5MoeForConditionalGeneration is invalid: ValueError: "
+        "the config parser refuses the HF config of the supported architecture Qwen3_5MoeForConditionalGeneration: "
+        "ValueError: "
     )
 
 
