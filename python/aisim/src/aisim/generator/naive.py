@@ -230,9 +230,9 @@ def _estimate_model_weight_bytes(model_path: str, *, model_metadata: dict[str, A
 
     except ValueError as e:
         # The normalized AIC parser rejects architectures that AIC cannot model,
-        # but those are exactly the models that use naive config generation.
-        # Reuse the architecture-agnostic raw-config estimator so sizing remains
-        # available without weakening the native AIC support boundary.
+        # and those models use naive config generation. The raw-config estimator
+        # serves them. For an architecture that AIC models it raises with the
+        # parser's message, so an invalid config of a known model gets no size.
         from aisim.sdk.memory import NaiveKVCacheEstimator
 
         logger.info(

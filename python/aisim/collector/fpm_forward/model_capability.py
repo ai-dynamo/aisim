@@ -127,7 +127,8 @@ class ResolvedModelConfig:
             # that the native AIC parser does not know yet. Normalize their
             # frozen config with the architecture-agnostic estimator so render
             # stays offline and receives the same scalar shape as the native
-            # parser rather than re-resolving plan.model_path.
+            # parser rather than re-resolving plan.model_path. A config of a
+            # registered architecture that the parser refuses is refused here too.
             geometry = NaiveKVCacheEstimator.from_hf_config(
                 raw_config,
                 tp_size=1,

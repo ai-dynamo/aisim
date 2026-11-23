@@ -45,11 +45,13 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+from aisim_core.decoder_config import decoder_config_key, decoder_config_problem
 from aisim_core.sdk import perf_database
 from aisim_core.sdk.backends.factory import get_backend
-from aisim_core.sdk.common import DefaultHFModels
+from aisim_core.sdk.common import ARCHITECTURE_TO_MODEL_FAMILY, DefaultHFModels
 from aisim_core.sdk.config import validate_parallel_size
 from aisim_core.sdk.config_builders import apply_nextn, build_model_config, validate_moe_controls, validate_nextn
+from aisim_core.sdk.fpm_model_metadata import inherit_decoder_precision
 from aisim_core.sdk.fpm_profile import FpmModelProfile, load_fpm_profile
 from aisim_core.sdk.models import get_model
 from aisim_core.sdk.models.helpers import resolve_sglang_mla_compute, resolve_trtllm_mla_compute
@@ -649,10 +651,11 @@ class NaiveKVCacheEstimator:
     ) -> NaiveKVCacheEstimator:
         """Build from an HF ``config.json`` (local dir / pre-cached / optional download).
 
-        Supported architectures go through the normalized parse (which also unwraps
-        multimodal); unsupported architectures -- the fallback's real target -- read
-        the raw config keys directly. Raises ``ValueError`` when no config can be
-        obtained offline.
+        A config of a supported architecture goes through the normalized parse, which
+        also unwraps registered wrappers; a config that the parse refuses is refused
+        here with its message. A config of an unsupported architecture, the target of
+        this fallback, is read from its raw keys, through its text decoder when it
+        nests one. Raises ``ValueError`` when no config can be obtained offline.
         """
         hf_config = cls._load_config(model_path, allow_hf_config_download)
         if hf_config is None:
@@ -683,22 +686,35 @@ class NaiveKVCacheEstimator:
         This is the no-I/O counterpart to :meth:`from_model_path`. Callers that
         already loaded a config can reuse it without issuing a second HF request.
         """
+        architectures = hf_config.get("architectures") or []
+        if not isinstance(architectures, list) or not all(isinstance(name, str) for name in architectures):
+            raise ValueError(f"HF config architectures must be a list of strings, got {architectures!r}")
+        architecture = next(iter(architectures), None)
+        raw_config = hf_config
         try:
-            parsed = _parse_hf_config_json(hf_config)  # supported arch -> normalized parse
-        except Exception:
-            parsed = None  # unsupported arch (the fallback's target) -> raw-key read
+            parsed = _parse_hf_config_json(hf_config)  # supported arch -> normalized parse, or its refusal
+        except Exception as error:
+            if architecture in ARCHITECTURE_TO_MODEL_FAMILY:
+                raise ValueError(
+                    f"HF config of the supported architecture {architecture} is invalid: "
+                    f"{type(error).__name__}: {error}"
+                ) from error
+            parsed = None  # unsupported arch (the fallback's target) -> raw-key read, of its decoder when nested
+            key = decoder_config_key(hf_config)
+            if key is not None:
+                problem = decoder_config_problem(key, hf_config[key])
+                if problem is not None:
+                    raise ValueError(f"HF config: {problem}") from error
+                raw_config = inherit_decoder_precision(hf_config, hf_config[key])[0]
         estimator = cls(
-            cls._geometry(hf_config, parsed),
-            dtype_bytes=cls._dtype_bytes(hf_config),
+            cls._geometry(raw_config, parsed),
+            dtype_bytes=cls._dtype_bytes(raw_config),
             tp_size=tp_size,
             pp_size=pp_size,
             moe_ep_size=moe_ep_size,
             moe_tp_size=moe_tp_size,
         )
-        architectures = hf_config.get("architectures") or []
-        if not isinstance(architectures, list) or not all(isinstance(name, str) for name in architectures):
-            raise ValueError(f"HF config architectures must be a list of strings, got {architectures!r}")
-        estimator.architecture = next(iter(architectures), None)
+        estimator.architecture = architecture
         return estimator
 
     # ----------------------------- config -> geometry ----------------------------- #

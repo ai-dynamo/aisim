@@ -19,6 +19,7 @@ checkable parity assertion for the port.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -33,6 +34,7 @@ pytestmark = pytest.mark.unit
 pytest.importorskip("aisim_core")
 
 from aisim.sdk import memory
+from aisim.sdk.memory import NaiveKVCacheEstimator
 from aisim_core.sdk.models.helpers import _apply_model_quant_defaults
 
 _GIB = 1 << 30
@@ -876,6 +878,116 @@ def test_naive_fallback_unsupported_arch_uses_hf_aliases(monkeypatch):
 
     assert out["source"] == "naive_fallback"
     assert out["kv_size_per_token_bytes"] == 2 * 12 * 64 * 12 * 2
+
+
+_UNKNOWN_DECODER = {
+    "hidden_size": 256,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 8,
+    "num_key_value_heads": 2,
+    "intermediate_size": 1024,
+    "vocab_size": 1000,
+    "torch_dtype": "bfloat16",
+}
+
+
+@pytest.mark.parametrize(
+    ("config", "text"),
+    [
+        (
+            {"architectures": ["LlamaForCausalLM"], "hidden_size": 128},
+            "HF config of the supported architecture LlamaForCausalLM is invalid: ValueError: "
+            "Model config must define 'num_hidden_layers' or a parseable layer pattern.",
+        ),
+        (
+            {"architectures": ["LlamaForCausalLM"], "num_hidden_layers": 2},
+            "HF config of the supported architecture LlamaForCausalLM is invalid: KeyError: 'hidden_size'",
+        ),
+    ],
+    ids=["no-layers", "no-hidden-size"],
+)
+def test_naive_estimate_of_a_known_architecture_fails_with_the_parser_message(config, text):
+    with pytest.raises(ValueError) as error:
+        NaiveKVCacheEstimator.from_hf_config(config, tp_size=1, pp_size=1)
+    assert str(error.value) == text
+
+
+@pytest.mark.parametrize("key", ["text_config", "llm_config"])
+def test_naive_estimate_of_an_unknown_wrapper_reads_its_decoder(key):
+    name = "UnknownWrapperForConditionalGeneration"
+    flat = NaiveKVCacheEstimator.from_hf_config({**_UNKNOWN_DECODER, "architectures": [name]}, tp_size=1, pp_size=1)
+    # The wrapper's own fields describe another model. The estimate must not read them.
+    wrapper = {
+        "architectures": [name],
+        "hidden_size": 4096,
+        "num_hidden_layers": 48,
+        "num_attention_heads": 32,
+        "torch_dtype": "float32",
+        key: _UNKNOWN_DECODER,
+    }
+    nested = NaiveKVCacheEstimator.from_hf_config(wrapper, tp_size=1, pp_size=1)
+    assert nested.geometry == flat.geometry
+    assert nested.kv_bytes_per_token() == flat.kv_bytes_per_token()
+    assert nested.weight_bytes() == flat.weight_bytes()
+    assert (nested.architecture, nested.dtype_bytes) == (name, flat.dtype_bytes)
+    # The decoder names no dtype: the wrapper's applies.
+    decoder = {name_: value for name_, value in _UNKNOWN_DECODER.items() if name_ != "torch_dtype"}
+    inherited = NaiveKVCacheEstimator.from_hf_config(
+        {"architectures": [name], "torch_dtype": "float32", key: decoder}, tp_size=1, pp_size=1
+    )
+    assert inherited.dtype_bytes == 4
+
+
+@pytest.mark.parametrize(
+    ("config", "text"),
+    [
+        (
+            {"architectures": ["UnknownWrapperForConditionalGeneration"], "hidden_size": 256, "text_config": None},
+            "HF config: text_config must be a nonempty object describing one text decoder",
+        ),
+        (
+            {
+                "architectures": ["UnknownWrapperForConditionalGeneration"],
+                "text_config": {**_UNKNOWN_DECODER, "llm_config": _UNKNOWN_DECODER},
+            },
+            "HF config: ambiguous nested llm_config in text_config",
+        ),
+    ],
+    ids=["null-text-config", "nested-decoder"],
+)
+def test_naive_estimate_refuses_a_malformed_decoder_of_an_unknown_wrapper(config, text):
+    with pytest.raises(ValueError) as error:
+        NaiveKVCacheEstimator.from_hf_config(config, tp_size=1, pp_size=1)
+    assert str(error.value) == text
+
+
+def test_naive_estimate_refuses_a_malformed_text_config_of_a_registered_wrapper():
+    config = {"architectures": ["Qwen3_5MoeForConditionalGeneration"], "hidden_size": 256, "text_config": None}
+    with pytest.raises(ValueError) as error:
+        NaiveKVCacheEstimator.from_hf_config(config, tp_size=1, pp_size=1)
+    assert str(error.value).startswith(
+        "HF config of the supported architecture Qwen3_5MoeForConditionalGeneration is invalid: ValueError: "
+    )
+
+
+def test_no_packaged_model_config_reaches_the_naive_fallback():
+    from importlib import resources
+
+    from aisim_core.sdk.utils import _parse_hf_config_json
+
+    files = sorted(
+        path
+        for path in resources.files("aisim_core").joinpath("model_configs").iterdir()
+        if path.name.endswith("_config.json") and not path.name.endswith("_hf_quant_config.json")
+    )
+    refused = {}
+    for path in files:
+        try:
+            _parse_hf_config_json(json.loads(path.read_text()))
+        except Exception as error:
+            refused[path.name] = repr(error)
+    assert len(files) >= 97
+    assert refused == {}
 
 
 def test_naive_fallback_raises_without_config():
