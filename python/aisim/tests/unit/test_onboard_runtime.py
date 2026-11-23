@@ -3371,6 +3371,95 @@ def test_probe_execute_names_the_missing_observer_for_a_detected_patch_release(t
     assert preview["result"]["status"] == "pending_runtime_version"
 
 
+def _local_observer(source, target, version):
+    """A campaign-local copy of the fixture's observer bundle, labeled with ``version``."""
+    shutil.copytree(source, target)
+    manifest = json.loads((target / "manifest.yaml").read_text())
+    manifest["runtime"]["version"] = version
+    (target / "manifest.yaml").write_text(json.dumps(manifest))
+    return target / "manifest.yaml"
+
+
+def _probe_with_local_observer(tmp_path, monkeypatch, *, requested, detected):
+    from collector.fpm_forward import runner
+
+    from aisim.support import versioning
+
+    from .collector.test_fpm_runtime_probe import _SyntheticExecutor
+
+    checkpoint, index, _ = _campaign(tmp_path)
+    state = _load(checkpoint)
+    draft = copy.deepcopy(state.configurations["tp2"].draft_request)
+    draft["identity"]["framework_version"] = requested
+    save_checkpoint(
+        checkpoint,
+        patch={"configurations": {"tp2": {"draft_request": draft}}},
+        expected_revision=state.revision,
+        accept=[],
+    )
+    monkeypatch.setattr(versioning, "detect_runtime_versions", lambda *_: {"backend_version": detected})
+    executions = []
+    monkeypatch.setattr(runner, "_cell_runner", lambda p, c, _m, d: _SyntheticExecutor(p, c, d, executions))
+
+    def probe(version, output):
+        manifest = _local_observer(index.parent, tmp_path / f"observer-{output}", version)
+        status = cli.main(
+            [
+                "onboard",
+                "probe-runtime",
+                "--checkpoint",
+                str(checkpoint),
+                "--configuration",
+                "tp2",
+                "--output-dir",
+                str(tmp_path / output),
+                "--execute",
+                "--instrumentation",
+                str(manifest),
+            ]
+        )
+        return status, _load(checkpoint).configurations["tp2"].history[-1]["result"]
+
+    return probe, executions
+
+
+@pytest.mark.parametrize("bundle_version", ["0.33.0", "0.33.2", "0.33.1+cu130"])
+def test_probe_execute_refuses_a_local_observer_of_another_version_than_the_detected_one(
+    tmp_path, monkeypatch, bundle_version
+):
+    # The detected version equals the requested one, so the launch identity holds no runtime version.
+    probe, executions = _probe_with_local_observer(tmp_path, monkeypatch, requested="0.33.1", detected="0.33.1")
+
+    status, result = probe(bundle_version, "other-version")
+    assert status == 1
+    assert result["status"] == "failed"
+    assert result["diagnostics"] == [
+        f"instrumentation runtime version {bundle_version} differs from vLLM 0.33.1 detected in the target container; "
+        "provide campaign-local --instrumentation for vLLM 0.33.1"
+    ]
+    assert executions == []
+
+    # The remedy: a campaign-local observer of the detected version runs both phases.
+    status, result = probe("0.33.1", "detected-version")
+    assert status == 0
+    assert result["status"] == "completed"
+    assert executions == [("tp2", "prefill"), ("tp2", "decode")]
+
+
+def test_probe_execute_keeps_the_pin_text_when_the_launch_holds_the_detected_version(tmp_path, monkeypatch):
+    # The detected version differs from the requested one, so the launch identity holds it as its runtime version.
+    probe, executions = _probe_with_local_observer(tmp_path, monkeypatch, requested="0.33.1", detected="0.33.2")
+
+    status, result = probe("0.33.1", "requested-version")
+    assert status == 1
+    assert result["diagnostics"] == ["instrumentation runtime version does not match the requested pin"]
+    assert executions == []
+
+    status, result = probe("0.33.2", "detected-version")
+    assert status == 0
+    assert executions == [("tp2", "prefill"), ("tp2", "decode")]
+
+
 def test_mixed_known_and_pending_probe_preview_records_every_configuration(tmp_path, monkeypatch):
     from collector.fpm_forward import runner
 

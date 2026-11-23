@@ -894,10 +894,10 @@ def probe_runtime(
                 # historical bundle; this is not a claim of runtime detection.
                 version = identity["framework_version"]
             if version is None and detected_versions and name in detected_versions:
-                # A version that the caller detected in the target container and
-                # that equals the requested one is not in the launch identity. No
-                # bundle exists for it, or the line above had taken it, so the
-                # refusal below names the missing observer.
+                # The version that the caller detected in the target container,
+                # read only when neither source above gives one. When the selected
+                # configurations give one version in all and no bundle exists for
+                # it, the refusal below names the missing observer.
                 version = detected_versions[name]
             if version is None:
                 unresolved.append(name)
@@ -954,6 +954,18 @@ def probe_runtime(
                         configuration, facts["deployment"], root, resume=resume
                     )
                 plan = build_runtime_probe_plan(configuration, facts, bundle)
+                detected = (detected_versions or {}).get(configuration)
+                if detected is not None and bundle.manifest["runtime"]["version"] != detected:
+                    # The command of each launch compares the installed vLLM
+                    # version with the bundle version and stops on a difference
+                    # (runner._attempt_provenance_command). The detected version
+                    # is the installed version of the same image, so the same
+                    # comparison refuses here, before any launch.
+                    raise ValueError(
+                        f"instrumentation runtime version {bundle.manifest['runtime']['version']} differs from "
+                        f"vLLM {detected} detected in the target container; "
+                        f"provide campaign-local --instrumentation for vLLM {detected}"
+                    )
                 existing = index["configurations"].get(configuration)
                 if existing is not None and existing["launch"] != plan.launch:
                     raise ValueError("launch settings changed; use a fresh probe output directory")

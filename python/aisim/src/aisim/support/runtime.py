@@ -1110,8 +1110,10 @@ def run_runtime_command(args: argparse.Namespace) -> int:
                 detected[name] = actual
                 # Preserve old numeric launch identities when observation agrees.
                 # Custom labels carry a separate runtime pin into instrumentation.
-                # The detected version also goes to the probe beside the launches,
-                # so that a version without a bundled observer is named as such.
+                # The detected version also goes to the probe beside the launches.
+                # The probe reads it when the launch identity holds no runtime
+                # version and no bundle exists for the requested version, and it
+                # compares it with the instrumentation version before any launch.
                 if actual != launches[name]["identity"].get("framework_version"):
                     launches[name]["identity"]["runtime_framework_version"] = actual
                 if launches[name]["identity"].get("framework_version") is None:
