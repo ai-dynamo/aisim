@@ -558,15 +558,14 @@ fn grouped_prefix_lone_request_at_the_startup_count_is_a_livelock_with_async_sch
     }
 }
 
-/// An aggregated vLLM rank in block mode with a full-attention group, a ring
-/// and `states` prefix-cacheable state groups, all of `block`-token blocks
-/// except the 4-token ring, at a hash block equal to the block and a pool of
+/// An aggregated vLLM rank in block mode with a full-attention group, a
+/// 4-token ring when `ring` is set, and four prefix-cacheable state groups of
+/// `block`-token blocks, at a hash block equal to the block and a pool of
 /// `pages` pages.
 fn aggregated_state_spec(
     requests: Vec<ReplayRequest>,
     version: &str,
     block: u64,
-    states: usize,
     ring: bool,
     max_model_len: u64,
     budget: u64,
@@ -588,7 +587,7 @@ fn aggregated_state_spec(
     if ring {
         groups.push(serde_json::json!({"name":"ring", "kind":"state", "num_layers":1, "block_size_tokens":4, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":false}));
     }
-    for index in 0..states {
+    for index in 0..4 {
         let mut state = serde_json::json!({"name": format!("state_{index}"), "kind":"state", "num_layers":1, "block_size_tokens":block, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":true});
         if version != "0.31.0" {
             state["prefill_checkpoint_blocks"] = 0.into();
@@ -631,7 +630,7 @@ fn grouped_prefix_request_preempted_after_output_tokens_resumes_on_its_own_block
             let mut short = request("short", 26.0, 4, 1);
             short.input_token_ids = Some((2_000_000..2_000_004).collect());
             let mut spec =
-                aggregated_state_spec(vec![long, short], version, 4, 4, false, 44, 5, pages);
+                aggregated_state_spec(vec![long, short], version, 4, false, 44, 5, pages);
             spec.max_sim_time_ms = Some(10_000.0);
             let report = run_within_60_s(spec);
             assert_eq!(
@@ -673,7 +672,7 @@ fn grouped_prefix_request_preempted_after_output_tokens_is_preempted_as_often_as
         a.input_token_ids = Some((1_000_000..1_002_162).collect());
         let mut l = request("l", 13.0, 21_758, 30);
         l.input_token_ids = Some((2_000_000..2_021_758).collect());
-        let spec = aggregated_state_spec(vec![a, l], version, 2176, 4, true, 26_112, 2720, 29);
+        let spec = aggregated_state_spec(vec![a, l], version, 2176, true, 26_112, 2720, 29);
         let report = run_within_60_s(spec);
         assert_eq!(report.request_counts.completed_requests, 2, "{version}");
         assert_eq!(
