@@ -2468,7 +2468,7 @@ class Task:
             _check("moe", self._role_attr(role, "moe_quant_mode"), profile_transfer=True)
 
         # FMHA: only meaningful for context-using workers (agg, prefill).
-        if validate_context:
+        if validate_context and self.forward_model != "fpm":
             _check_attention([ctx for ctx, _gen in attention_op_pairs], self._role_attr(role, "fmha_quant_mode"))
 
         # KV cache: only meaningful for generation-using workers (agg, decode).

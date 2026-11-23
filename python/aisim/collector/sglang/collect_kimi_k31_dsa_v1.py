@@ -266,7 +266,13 @@ def _run_native_case(case, device, perf_filename):
                 stderr=subprocess.PIPE,
                 text=True,
                 start_new_session=True,
-                env={**os.environ, **NATIVE_ENV},
+                env={
+                    **os.environ,
+                    **NATIVE_ENV,
+                    "PYTHONPATH": os.pathsep.join(
+                        [str(Path(__file__).resolve().parents[2]), *filter(None, [os.environ.get("PYTHONPATH")])]
+                    ),
+                },
             ) as process,
         ):
             stderr = ""

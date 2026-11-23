@@ -9197,7 +9197,7 @@ mod tests {
 
     #[test]
     fn k31_fitted_replay_checks_local_checkpoint_after_snapshot_restore() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         for architecture in [
             "KimiK31ForConditionalGeneration",
             "KimiK3ForConditionalGeneration",
@@ -9244,8 +9244,10 @@ mod tests {
                 &mut role,
                 true,
                 ForwardPassWorkerType::Decode,
+                None,
                 false,
                 &mut Vec::new(),
+                &mut serde_json::Map::new(),
             )
             .err()
             .expect("state must be declared");
@@ -9264,8 +9266,10 @@ mod tests {
                 &mut role,
                 true,
                 ForwardPassWorkerType::Decode,
+                None,
                 false,
                 &mut Vec::new(),
+                &mut serde_json::Map::new(),
             )
             .unwrap();
         }
@@ -9273,7 +9277,7 @@ mod tests {
 
     #[test]
     fn fitted_replay_metadata_rejects_unverifiable_architecture_without_guessing_model_name() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         for (name, config, expected) in [
             (
@@ -9312,7 +9316,7 @@ mod tests {
 
     #[test]
     fn fitted_replay_metadata_returns_error_when_selected_decoder_is_missing() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.json"),

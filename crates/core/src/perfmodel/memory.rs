@@ -735,10 +735,6 @@ mod tests {
         ] {
             req.engine.extra.insert(name.into(), value.into());
         }
-        req.engine.extra.insert(
-            "fpm_profile".into(),
-            serde_json::json!({"model": "test-model"}).to_string(),
-        );
         Python::attach(|py| -> PyResult<()> {
             let kwargs = estimate_kwargs(py, &req)?;
             assert_eq!(kwargs.get_item("dcp_size")?.unwrap().extract::<u32>()?, 4);
@@ -842,14 +838,14 @@ mod tests {
         use pyo3::prelude::*;
         use pyo3::types::PyDictMethods;
 
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| -> PyResult<()> {
+        pyo3::Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
             // Exercise the real Python spec producer without perf data or a
             // remote model: the resolved config and empty op graph are enough
             // to test identity transport through the serialized Rust spec.
             let fixture = pyo3::types::PyModule::from_code(
                 py,
-                c"from types import SimpleNamespace\nfrom aisimulate_core.sdk.config import ModelConfig\nfrom aisimulate_core.sdk.engine import build_engine_spec_json\nconfig = ModelConfig(tp_size=8, dcp_size=4, attention_backend='flashmla', moe_backend='deepep_moe', moe_kernel_source='cutlass', enable_eplb=True, wideep_num_slots=128)\nmodel = SimpleNamespace(config=config, context_ops=[], generation_ops=[])\nspec = build_engine_spec_json(model, model_path='/local/renamed-checkpoint', system='test-system', backend='vllm', backend_version='test-version', kv_block_size=64, systems_path=None, nextn=0, database=SimpleNamespace(version='test-version'))\n",
+                c"from types import SimpleNamespace\nfrom aisim_core.sdk.config import ModelConfig\nfrom aisim_core.sdk.engine import build_engine_spec_json\nconfig = ModelConfig(tp_size=8, dcp_size=4, attention_backend='flashmla', moe_backend='deepep_moe', moe_kernel_source='cutlass', enable_eplb=True, wideep_num_slots=128)\nmodel = SimpleNamespace(config=config, context_ops=[], generation_ops=[])\nspec = build_engine_spec_json(model, model_path='/local/renamed-checkpoint', system='test-system', backend='vllm', backend_version='test-version', kv_block_size=64, systems_path=None, nextn=0, database=SimpleNamespace(version='test-version'))\n",
                 c"memory_identity_fixture.py", c"memory_identity_fixture",
             )?;
             let json: String = fixture.getattr("spec")?.extract()?;
