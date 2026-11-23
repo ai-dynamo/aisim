@@ -408,20 +408,32 @@ def _stored_dictionaries(array: pa.Array | pa.ChunkedArray) -> Iterator[pa.Array
     A dictionary keeps the values that no row references after filtering or slicing, and the Parquet writer
     stores the whole dictionary, so reading the visible rows (``to_pylist``) does not cover everything a file holds.
     """
+    for _, dictionary in _stored_dictionaries_at(array):
+        yield dictionary
+
+
+def _stored_dictionaries_at(
+    array: pa.Array | pa.ChunkedArray, fields: tuple[str, ...] = ()
+) -> Iterator[tuple[tuple[str, ...], pa.Array]]:
+    """:func:`_stored_dictionaries` with each dictionary's struct field names, from the column down.
+
+    The field names are the key context the credential rules need: an unused value stored for a ``password``
+    field must be judged as that field's value, not as a value of the top-level column.
+    """
     if isinstance(array, pa.ChunkedArray):
         for chunk in array.chunks:
-            yield from _stored_dictionaries(chunk)
+            yield from _stored_dictionaries_at(chunk, fields)
         return
     dtype = array.type
     if pa.types.is_dictionary(dtype):
-        yield array.dictionary
-        yield from _stored_dictionaries(array.dictionary)
+        yield fields, array.dictionary
+        yield from _stored_dictionaries_at(array.dictionary, fields)
     elif pa.types.is_struct(dtype):
         for index in range(dtype.num_fields):
-            yield from _stored_dictionaries(array.field(index))
+            yield from _stored_dictionaries_at(array.field(index), (*fields, dtype.field(index).name))
     elif pa.types.is_map(dtype):
-        yield from _stored_dictionaries(array.keys)
-        yield from _stored_dictionaries(array.items)
+        yield from _stored_dictionaries_at(array.keys, fields)
+        yield from _stored_dictionaries_at(array.items, fields)
     elif (
         pa.types.is_list(dtype)
         or pa.types.is_large_list(dtype)
@@ -429,13 +441,13 @@ def _stored_dictionaries(array: pa.Array | pa.ChunkedArray) -> Iterator[pa.Array
         or pa.types.is_list_view(dtype)
         or pa.types.is_large_list_view(dtype)
     ):
-        yield from _stored_dictionaries(array.values)
+        yield from _stored_dictionaries_at(array.values, fields)
     elif isinstance(array, pa.ExtensionArray):
-        yield from _stored_dictionaries(array.storage)
+        yield from _stored_dictionaries_at(array.storage, fields)
 
 
-def _file_dictionaries(path: Path, footer: pq.FileMetaData) -> list[tuple[str, pa.Array]]:
-    """Dictionaries stored in the file, as ``(top-level column, dictionary)``, whatever its Arrow schema says.
+def _file_dictionaries(path: Path, footer: pq.FileMetaData) -> list[tuple[str, tuple[str, ...], pa.Array]]:
+    """Dictionaries stored in the file, as ``(top-level column, struct fields, dictionary)``, whatever its schema says.
 
     A reader returns a plain string column unless the embedded Arrow schema names a dictionary, yet the dictionary
     page itself keeps every value its writer put there. Reading the dictionary-encoded byte-array columns with
@@ -453,7 +465,11 @@ def _file_dictionaries(path: Path, footer: pq.FileMetaData) -> list[tuple[str, p
         table = pq.ParquetFile(path, read_dictionary=list(encoded)).read()
     except pa.ArrowException as exc:  # unreadable pages cannot be vouched for; callers report a ValueError
         raise ValueError(f"cannot inspect the stored dictionaries of {path.name}: {exc}") from exc
-    return [(name, dictionary) for name in table.column_names for dictionary in _stored_dictionaries(table[name])]
+    return [
+        (name, fields, dictionary)
+        for name in table.column_names
+        for fields, dictionary in _stored_dictionaries_at(table[name])
+    ]
 
 
 def _check_table_text(table: pa.Table, rel: str, policy: RedactionPolicy, where: str, *, path: Path) -> list[Finding]:
@@ -520,24 +536,28 @@ def _check_table_text(table: pa.Table, rel: str, policy: RedactionPolicy, where:
         return value
 
     # Dictionaries kept by the table itself and by the stored file, by top-level column.
-    stored: dict[str, list[pa.Array]] = {}
+    stored: dict[str, list[tuple[tuple[str, ...], pa.Array]]] = {}
     for name in table.column_names:
-        stored.setdefault(name, []).extend(_stored_dictionaries(table[name]))
-    for name, dictionary in _file_dictionaries(path, footer):
-        stored.setdefault(name, []).append(dictionary)
+        stored.setdefault(name, []).extend(_stored_dictionaries_at(table[name]))
+    for name, fields, dictionary in _file_dictionaries(path, footer):
+        stored.setdefault(name, []).append((fields, dictionary))
     for name in table.column_names:
         column = table.column(name)
         values = [disclosure_value(value, column.type) for value in column.to_pylist()]
         found = scan_value({name: values}, policy, rel, f"{where} {name}")[:1] if values else []
         if not found:
             # Not a visible cell: a value left in a dictionary that filtering or slicing stopped referencing.
-            dictionary_values = [
-                disclosure_value(value, dictionary.type)
-                for dictionary in stored.get(name, ())
-                for value in dictionary.to_pylist()
-            ]
-            if dictionary_values:
-                found = scan_value({name: dictionary_values}, policy, rel, f"{where} {name} (stored dictionary)")[:1]
+            for fields, dictionary in stored.get(name, ()):
+                dictionary_values = [disclosure_value(value, dictionary.type) for value in dictionary.to_pylist()]
+                if not dictionary_values:
+                    continue
+                # Keep the struct field names as key context, so a stored ``password`` value is judged as one.
+                nested: Any = dictionary_values
+                for field in reversed(fields):
+                    nested = {field: nested}
+                found = scan_value({name: nested}, policy, rel, f"{where} {name} (stored dictionary)")[:1]
+                if found:
+                    break
         out.extend(found)
     return out
 

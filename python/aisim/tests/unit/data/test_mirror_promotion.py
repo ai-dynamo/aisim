@@ -1488,6 +1488,36 @@ def test_unused_dictionary_values_block_promotion_and_public_validation(tmp_path
     assert not (target / relative).exists()
 
 
+@pytest.mark.parametrize("options", [{}, {"store_schema": False}], ids=["arrow-schema", "plain-strings"])
+@pytest.mark.parametrize("field", ["password", "api_key", "authorization"])
+def test_an_unused_nested_credential_value_blocks_promotion_and_public_validation(tmp_path, options, field):
+    """The field name of a stored dictionary is key context: a plain password trips no token pattern by itself."""
+    unused = "synthetic-plain-password-123"
+    dictionary = pa.array([unused, "[REDACTED]", "[REDACTED]"]).dictionary_encode().slice(1)
+    column = pa.StructArray.from_arrays([dictionary], names=[field])
+    table = pa.table({"kernel_source": ["synthetic-kernel"] * 2, "latency_ms": [1.0, 2.0], "diagnostic": column})
+    assert unused not in json.dumps(table["diagnostic"].to_pylist())  # both visible rows only carry [REDACTED]
+    root, directory, relative = _op_mirror_table(tmp_path, table, **options)
+    assert validate_tree(root, repo=INTERNAL_REPO).ok
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
+    assert not plan.content_ok and not plan.ok
+    found = [f for f in plan.findings if f.code == "secret" and f.path == relative]
+    assert found and "column diagnostic (stored dictionary)" in found[0].message
+    assert any(f.code == "secret" and f.path == relative for f in validate_tree(root, profile="public").errors)
+    target = _target(tmp_path)
+    with pytest.raises(PromotionError):
+        apply_promotion(plan, root, target)
+    assert not (target / relative).exists()
+
+
+def test_stored_dictionaries_keep_their_struct_field_names():
+    inner = pa.array(["a", "b"]).dictionary_encode()
+    outer = pa.StructArray.from_arrays([pa.StructArray.from_arrays([inner], names=["password"])], names=["auth"])
+    seen = [(fields, d.to_pylist()) for fields, d in redaction._stored_dictionaries_at(pa.chunked_array([outer]))]
+    assert seen == [(("auth", "password"), ["a", "b"])]
+
+
 @pytest.mark.parametrize(("layout", "options"), DICTIONARY_LAYOUTS)
 def test_clean_dictionary_columns_are_promoted_with_their_unused_values(tmp_path, layout, options):
     root, directory, relative = _op_mirror_table(tmp_path, _dictionary_table(layout, "retired-benchmark"), **options)
