@@ -93,7 +93,7 @@ def _write_run(directory, scale, job):
         "tokenizer_class": "T",
         "workload_sha256": "w",
         "requests": 4,
-        "host": {"cpu_model": "cpu", "load_average_1m": 1.0, "slurm_job_id": job},
+        "host": {"cpu_model": "cpu", "load_average_1m": 1.0, "slurm_job_id": job, "hostname": f"node-{job}"},
     }
     (directory / "environment.json").write_text(json.dumps(env))
 
@@ -105,6 +105,7 @@ def test_merge_runs_takes_the_per_request_median_and_refuses_mismatches(tmp_path
     rows = [json.loads(line) for line in (tmp_path / "out" / "rows.jsonl").read_text().splitlines()]
     assert [row["encode_ms"] for row in rows] == [2.0, 4.0, 6.0, 8.0]
     assert environment["merged_runs"] == 3 and environment["host"]["slurm_job_ids"] == ["1", "2", "3"]
+    assert environment["host"]["hostnames"] == ["node-1", "node-2", "node-3"]
     other = json.loads((tmp_path / "c" / "environment.json").read_text())
     other["workload_sha256"] = "different"
     (tmp_path / "c" / "environment.json").write_text(json.dumps(other))
@@ -126,3 +127,29 @@ def test_ledger_entry_costs_plus_remainder_equal_the_allocation(tmp_path):
 
 def test_every_campaign_framework_has_an_adapter():
     assert set(adapters.ADAPTERS) == {"vllm", "sglang", "trtllm"}
+
+
+def test_internal_evidence_lists_the_host_record_and_job_records(tmp_path):
+    from collector.host_cpu.stage import _write_internal
+
+    from aisim_core.data.evidence import check_evidence
+
+    job = tmp_path / "campaign" / "vllm-1"
+    job.mkdir(parents=True)
+    for name in ("job.txt", "entries.txt", "sacct.txt"):
+        (job / name).write_text(f"{name} of job 7\n")
+    internal = tmp_path / "internal"
+    config_id = "cfg-" + "a" * 64
+    manifest = "data/host-cost/vllm/0.31.0/b300_sxm/qwen2/aisim-manifest.json"
+    _write_internal(internal, manifest, config_id, {"host": {"hostname": "node-7"}, "job_ids": ["7"]}, [job])
+    directory = "evidence/data/host-cost/vllm/0.31.0/b300_sxm/qwen2"
+    paths = [p.relative_to(internal).as_posix() for p in internal.rglob("*") if p.is_file()]
+    assert sorted(p.removeprefix(directory + "/") for p in paths) == [
+        "evidence-manifest.json",
+        "host.json",
+        "jobs/vllm-1/entries.txt",
+        "jobs/vllm-1/job.txt",
+        "jobs/vllm-1/sacct.txt",
+    ]
+    findings, _ = check_evidence(internal, paths)
+    assert not findings

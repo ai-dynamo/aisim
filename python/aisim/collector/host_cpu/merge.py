@@ -54,6 +54,7 @@ def merge_runs(run_dirs: Sequence[str | Path], output: str | Path) -> dict[str, 
     environment["merged_runs"] = len(runs)
     environment["host"] = {
         **hosts[0],
+        "hostnames": [host.get("hostname") for host in hosts],
         "slurm_job_ids": [host.get("slurm_job_id") for host in hosts],
         "load_average_1m": [host["load_average_1m"] for host in hosts],
     }

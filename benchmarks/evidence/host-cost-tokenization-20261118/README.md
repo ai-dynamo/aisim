@@ -16,7 +16,7 @@ chat template, tokenization, and for vLLM prefix-cache block hashing), fitted as
 | Gate | An entry needs r ≥ 0.98 and at most 5% of requests dropped as outliers; failures are recorded, not averaged in. Three B200 entries failed on two runs and passed after two more runs |
 
 Request paths are in [`request-path.md`](https://huggingface.co/datasets/ai-dynamo/aisim-data-internal/discussions/2); every fit is in [`fits.md`](https://huggingface.co/datasets/ai-dynamo/aisim-data-internal/discussions/2); the data is staged in
-[`dataset/`](https://huggingface.co/datasets/ai-dynamo/aisim-data/discussions/4) in `aisim-host-cost/v1` layout (`data/host-cost/<framework>/<version>/<system>/<tokenizer>/`).
+[`dataset/`](https://huggingface.co/datasets/ai-dynamo/aisim-data/discussions/6) in `aisim-host-cost/v1` layout (`data/host-cost/<framework>/<version>/<system>/<tokenizer>/`).
 
 ## GPU hours
 
@@ -89,5 +89,5 @@ The measured coefficient alone brings the point TTFT error under 10% on both lan
 The raw evidence (request-path audit, per-entry fits, cost ledger, Slurm job records, tokenizer manifest, cluster facts) and the
 84 staged entries were moved out of this repository, parked in two Hugging Face pull requests until #932 lands:
 
-- Public rows: https://huggingface.co/datasets/ai-dynamo/aisim-data/discussions/4
+- Public rows: https://huggingface.co/datasets/ai-dynamo/aisim-data/discussions/6
 - Private mirror and evidence (`evidence/data/host-cost/<framework>/<version>/`): https://huggingface.co/datasets/ai-dynamo/aisim-data-internal/discussions/2

@@ -5,7 +5,11 @@
 
 One configuration is one (framework, framework version, system, tokenizer) measurement on that system's
 host CPU. It stores one Parquet row per timed request (``aisim-host-cost/v1``) plus an envelope manifest
-that carries the host and software provenance, the regression, and the GPU time of the allocation.
+that carries the host CPU and software provenance, the regression, and the GPU time of the allocation.
+
+The manifest is public. It names the tokenizer by its Hugging Face repository and keeps only the host facts
+in :data:`PUBLIC_HOST_FACTS`; host names, scheduler job IDs, node load and local paths go to the internal
+record that :func:`internal_record` returns, which belongs under ``evidence/`` in ``aisim-data-internal``.
 
 Layout: ``data/host-cost/<framework>/<version>/<system>/<tokenizer>/{requests.parquet,aisim-manifest.json}``.
 """
@@ -13,6 +17,7 @@ Layout: ``data/host-cost/<framework>/<version>/<system>/<tokenizer>/{requests.pa
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -29,6 +34,9 @@ HOST_COST_SCHEMA = "aisim-host-cost/v1"
 CATEGORY = "host-cost"
 PURPOSE = "host-cost-profile"
 MANIFEST_NAME = "aisim-manifest.json"
+# Host facts a fit depends on and that identify no machine or job.
+PUBLIC_HOST_FACTS = ("cpu_model", "cpu_sockets", "cpu_threads", "affinity_cpus", "python", "tokenizers_parallelism")
+_HF_REPO = re.compile(r"^[A-Za-z0-9][\w.-]*/[\w.-]+$")
 
 
 class HostCostRow(BaseModel):
@@ -64,7 +72,7 @@ def entry_directory(framework: str, version: str, system: str, tokenizer: str, *
     return "/".join(part for part in (prefix.strip("/"), CATEGORY, framework, version, system, tokenizer) if part)
 
 
-def _identity(environment: Mapping[str, Any], system: str) -> Identity:
+def _identity(environment: Mapping[str, Any], system: str, model: str) -> Identity:
     host = environment["host"]
     settings = {
         "cpu_model": host["cpu_model"],
@@ -81,7 +89,7 @@ def _identity(environment: Mapping[str, Any], system: str) -> Identity:
         framework=environment["framework"],
         framework_version=environment["framework_version"],
         operation_family=None,
-        model=environment["model"],
+        model=model,
         effective_settings=settings,
         unresolved_identity=None,
     )
@@ -92,17 +100,26 @@ def write_entry(
     run_dir: str | Path,
     *,
     system: str,
+    model: str,
     gpu_time: GpuTime | None,
     prefix: str = "data",
     extra_provenance: Mapping[str, Any] | None = None,
 ) -> str:
-    """Write one harness run directory (rows.jsonl + environment.json) as a configuration; return the manifest path."""
+    """Write one harness run directory (rows.jsonl + environment.json) as a configuration; return the manifest path.
+
+    ``model`` is the Hugging Face repository the tokenizer files came from; the run's own ``model`` may be a local
+    path and is not published. ``gpu_time`` must not carry scheduler job IDs (see :func:`internal_record`).
+    """
+    if not _HF_REPO.fullmatch(model):
+        raise ValueError(f"model must be a Hugging Face repository ID such as 'org/name', not {model!r}")
+    if gpu_time is not None and "job_ids" in gpu_time.source:
+        raise ValueError("gpu_time.source carries job IDs; keep them in the internal record")
     root, run_dir = Path(root), Path(run_dir)
     environment = json.loads((run_dir / "environment.json").read_text())
     raw_rows = [json.loads(line) for line in (run_dir / "rows.jsonl").read_text().splitlines() if line.strip()]
     rows = [HostCostRow(**{k: v for k, v in row.items() if k != "hash_ms" or v is not None}) for row in raw_rows]
     fit = fit_rows([row.model_dump() for row in rows])
-    identity = _identity(environment, system)
+    identity = _identity(environment, system, model)
     directory = entry_directory(
         environment["framework"], environment["framework_version"], system, environment["tokenizer_key"], prefix=prefix
     )
@@ -124,8 +141,11 @@ def write_entry(
     )
     provenance: dict[str, Any] = {
         "host_cost": {
-            "environment": {k: v for k, v in environment.items() if k not in {"host", "schema"}},
-            "host": environment["host"],
+            "environment": {
+                **{k: v for k, v in environment.items() if k not in {"host", "schema", "model"}},
+                "model": model,
+            },
+            "host": {k: environment["host"].get(k) for k in PUBLIC_HOST_FACTS},
             "fit": {"components": list(QUEUED_COMPONENTS), **fit.to_json()},
             "gpu_time": gpu_time.model_dump(mode="json", by_alias=True) if gpu_time is not None else None,
             **dict(extra_provenance or {}),
@@ -147,6 +167,17 @@ def write_entry(
         json.dumps(manifest.model_dump(mode="json", by_alias=True), indent=2, sort_keys=True, allow_nan=False) + "\n"
     )
     return path
+
+
+def internal_record(run_dir: str | Path, *, job_ids: list[str]) -> dict[str, Any]:
+    """The cluster facts of one entry that the public manifest leaves out: host, jobs, load and tokenizer path."""
+    environment = json.loads((Path(run_dir) / "environment.json").read_text())
+    return {
+        "schema": "aisim-host-cost-internal/v1",
+        "tokenizer_path": environment["model"],
+        "host": environment["host"],
+        "job_ids": list(job_ids),
+    }
 
 
 def read_fit(manifest: Manifest) -> Fit:

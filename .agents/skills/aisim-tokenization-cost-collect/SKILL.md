@@ -48,13 +48,20 @@ record each job's id. `entries.txt` gives each entry's wall seconds for the ledg
 
 ## After the run
 
-1. Fit and store: `aisim_core.data.host_cost.write_entry(...)` writes the rows, the fit, the host
-   provenance and the GPU time. Reject an entry with fewer than 60 requests or r below 0.98 and record
-   it as failed; do not average it in.
-2. Ledger: `collector/host_cpu/ledger.py` combines `sacct` and `entries.txt`. Per-entry cost plus the
+1. Stage: `python -m collector.host_cpu.stage --campaign <dir> --output <public root> --evidence <reports>
+   --internal <internal root>` merges the runs, fits, gates and writes each entry. Rejected entries (fewer
+   than 60 requests, r below 0.98, more than 5% dropped) are recorded in `failed.md`, never averaged in.
+2. Keep cluster facts internal. The public entry names the tokenizer by its Hugging Face repository and
+   keeps only CPU facts; host names, Slurm job IDs, node load, local paths and the Slurm records go to
+   `evidence/<entry>/` under `--internal`, for `aisim-data-internal`. `write_entry` refuses a local path
+   as the model and job IDs in `gpu_time`.
+3. Ledger: `collector/host_cpu/ledger.py` combines `sacct` and `entries.txt`. Per-entry cost plus the
    unattributed remainder must equal the Slurm allocation. Record the grand total GPU-hours.
-3. Validate the staged tree with `aisim_core.data.mirror.validate_tree` and compare to the base tree.
-4. Keep run logs and the ledger under `benchmarks/evidence/`, never under `docs/`.
+4. Validate the public tree with `aisim_core.data.mirror.validate_tree(..., profile="public")`: the
+   redaction scan refuses host names, job IDs, node load and local paths. Validate the internal tree's
+   `evidence/` with `aisim_core.data.evidence.check_evidence`.
+5. Rows go to `aisim-data`; the run reports and Slurm records go to `aisim-data-internal`, never to
+   `docs/` or the public dataset.
 
 ## Using a result
 

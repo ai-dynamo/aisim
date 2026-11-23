@@ -8,21 +8,29 @@ Campaign layout (one directory per Slurm job, fetched from the cluster)::
     <campaign>/<system>/<framework>-<n>/{job.txt, entries.txt, sacct.txt, <framework>/<tokenizer>/...}
 
 Independent jobs of the same (system, framework) are merged per request (median) into one entry.
+
+The entries under ``--output`` are public. With ``--internal``, each entry also gets
+``evidence/<entry directory>/`` there: its host names, job IDs and node load (``host.json``) and its jobs'
+Slurm records, listed in an ``evidence-manifest.json``. That root belongs in ``aisim-data-internal``.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
+import shutil
 import tempfile
 from pathlib import Path
 
 from aisim_core.data import Manifest
+from aisim_core.data.evidence import EVIDENCE_MANIFEST, EVIDENCE_ROOT, EVIDENCE_SCHEMA
 from aisim_core.data.gpu_time import GpuTime
-from aisim_core.data.host_cost import read_fit, write_entry
+from aisim_core.data.host_cost import CATEGORY, internal_record, read_fit, write_entry
 from aisim_core.host_cost.fit import fit_rows
 
+from .config import TOKENIZER_MODELS
 from .ledger import JobCost, job_cost, read_entries, render_markdown
 from .merge import merge_runs
 
@@ -54,8 +62,42 @@ def _quality_failure(rows: list[dict]) -> str | None:
     return "; ".join(problems) or None
 
 
-def stage(campaign: Path, root: Path, evidence: Path, superseded: Path | None = None) -> list[str]:
-    """Write every entry under ``root`` and the ledger and fit table under ``evidence``; return manifest paths."""
+_JOB_RECORDS = ("job.txt", "entries.txt", "sacct.txt")
+
+
+def _write_internal(internal: Path, manifest_path: str, configuration_id: str, record: dict, jobs: list[Path]) -> None:
+    """Write the internal evidence of one public entry: its host record and its jobs' Slurm records."""
+    config_path = manifest_path.rsplit("/", 1)[0]
+    directory = internal / EVIDENCE_ROOT / config_path
+    if directory.exists():
+        shutil.rmtree(directory)
+    directory.mkdir(parents=True)
+    files = {"host.json": ("host-record", json.dumps(record, indent=2, sort_keys=True) + "\n")}
+    for job in jobs:
+        for name in _JOB_RECORDS:
+            files[f"jobs/{job.name}/{name}"] = ("slurm-job-record", (job / name).read_text())
+    artifacts = []
+    for rel, (kind, text) in sorted(files.items()):
+        target = directory / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = text.encode()
+        target.write_bytes(data)
+        artifacts.append({"path": rel, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data), "kind": kind})
+    manifest = {
+        "schema_version": EVIDENCE_SCHEMA,
+        "configuration_id": configuration_id,
+        "category": CATEGORY,
+        "config_path": config_path,
+        "artifacts": artifacts,
+    }
+    (directory / EVIDENCE_MANIFEST).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+
+def stage(
+    campaign: Path, root: Path, evidence: Path, superseded: Path | None = None, internal: Path | None = None
+) -> list[str]:
+    """Write every public entry under ``root``, its cluster records under ``internal``, and the ledger and fit
+    table under ``evidence``; return manifest paths."""
     manifests: list[str] = []
     failed: list[str] = []
     jobs: list[JobCost] = []
@@ -85,19 +127,21 @@ def stage(campaign: Path, root: Path, evidence: Path, superseded: Path | None = 
                 runs = [d / framework / tokenizer for d in dirs if (d / framework / tokenizer / "rows.jsonl").is_file()]
                 wall = 0.0
                 job_ids = []
+                job_dirs_used = []
                 for d in dirs:
                     for entry in read_entries(d / "entries.txt", system=system, gpu_count=1):
                         if entry.framework == framework and entry.tokenizer == tokenizer and entry.exit_status == 0:
                             wall += entry.wall_seconds
                             job_ids.append(_job_id(d))
+                            job_dirs_used.append(d)
                 gpu_time = GpuTime(
                     authority="measured",
                     gpu_type=GPU_TYPES[system],
                     gpu_count=1,
                     wall_seconds=wall,
+                    # Job IDs identify the cluster; they go to the internal record only.
                     source={
                         "source": "slurm",
-                        "job_ids": ",".join(job_ids),
                         "attribution": "entry wall time inside the job allocation, one GPU held",
                     },
                 )
@@ -108,8 +152,13 @@ def stage(campaign: Path, root: Path, evidence: Path, superseded: Path | None = 
                     if failure is not None:
                         failed.append(f"| {system} | {framework} | {tokenizer} | {len(runs)} | {failure} |")
                         continue
-                    manifests.append(write_entry(root, tmp, system=system, gpu_time=gpu_time))
-                manifest = Manifest.model_validate_json((root / manifests[-1]).read_bytes())
+                    manifests.append(
+                        write_entry(root, tmp, system=system, model=TOKENIZER_MODELS[tokenizer], gpu_time=gpu_time)
+                    )
+                    manifest = Manifest.model_validate_json((root / manifests[-1]).read_bytes())
+                    if internal is not None:
+                        record = internal_record(tmp, job_ids=job_ids)
+                        _write_internal(internal, manifests[-1], manifest.configuration_id, record, job_dirs_used)
                 fit = read_fit(manifest)
                 env = manifest.provenance["host_cost"]["environment"]
                 fit_rows_md.append(
@@ -146,10 +195,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True, help="dataset root to write data/host-cost/ under")
     parser.add_argument("--evidence", type=Path, required=True, help="directory for cost.md and fits.md")
     parser.add_argument(
+        "--internal", type=Path, help="aisim-data-internal root for each entry's host and Slurm job records"
+    )
+    parser.add_argument(
         "--superseded", type=Path, help="campaign-layout directory of runs whose cost is ledgered but not used"
     )
     args = parser.parse_args(argv)
-    manifests = stage(args.campaign, args.output, args.evidence, args.superseded)
+    manifests = stage(args.campaign, args.output, args.evidence, args.superseded, args.internal)
     print(f"{len(manifests)} entries written")
     return 0
 
