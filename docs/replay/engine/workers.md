@@ -431,8 +431,9 @@ which requests can be preempted:
   without a prefix-cacheable full-attention group: there it frees such a
   block when pass k+1 is formed, because vLLM can starve a request in such a
   layout at a pool of exactly its startup count (see the known differences
-  in [KV cache](kv-cache.md#other-cache-modes)). A prefill or decode worker frees such a block
-  when pass k+1 is formed, for the reason in the paragraph below the list. A
+  in [KV cache](kv-cache.md#other-cache-modes)). A
+  prefill or decode worker with a grouped cache does this too, in every
+  layout. A
   [state cache](kv-cache.md#state-cache) frees a previous state copy when pass
   k+1 is formed on every worker.
 - With a CPU tier (`kv_cache.host_offload`), vLLM does not free the blocks of a
@@ -441,11 +442,14 @@ which requests can be preempted:
   next pass instead.
 
 vLLM defers the same frees for a P/D connector that consumes KV (`kv_role`
-`kv_consumer` or `kv_both`). Replay does not model a P/D connector's role, so
-it applies the third rule only with a CPU tier. For the same reason a prefill
-or decode worker frees the blocks of the second rule when pass k+1 is formed:
-the longer hold without the stop of the third rule would preempt a request
-where vLLM waits one pass. These rules follow `Scheduler` and
+`kv_consumer` or `kv_both`). Replay does not model a P/D connector's role. It
+applies the third rule with a CPU tier. On a prefill or decode worker with a
+grouped cache it also does not preempt a request that the pass in flight
+runs, whatever the role of the connector, so also where vLLM runs a prefill
+worker as `kv_producer` and has no such rule (see
+[KV cache](kv-cache.md#other-cache-modes)). A prefill or decode worker with a
+linear cache and no CPU tier can preempt such a request. These rules follow
+`Scheduler` and
 `KVCacheManager.allocate_slots` in vLLM
 [v0.30.0](https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/v1/core/sched/scheduler.py)
 ([`kv_cache_manager.py`](https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/v1/core/kv_cache_manager.py)),

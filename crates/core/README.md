@@ -66,8 +66,10 @@ request's blocks for the pass after next. On an aggregated rank with cache
 groups it frees the blocks that a running request no longer needs one pass
 later, on vLLM's processed token count, except with prefix caching on in a
 layout with a prefix-cacheable state group whose block is below the
-scheduler block, or without a prefix-cacheable full-attention group. With a CPU tier it does not preempt a
-request that the pass in flight runs; see
+scheduler block, or without a prefix-cacheable full-attention group. A
+prefill or decode rank with cache groups frees them one pass later in every
+layout. With a CPU tier, or on a prefill or decode rank with cache groups,
+it does not preempt a request that the pass in flight runs; see
 [vLLM async scheduling](../../docs/replay/engine/workers.md#vllm-async-scheduling).
 `EngineConfig::launch` adds the engine loop's launch costs. A rank then holds
 each pass's outputs until the driver releases them through

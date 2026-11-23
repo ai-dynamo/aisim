@@ -516,10 +516,9 @@ whole sequence is larger than the pool is rejected. A window
 of `W` keeps the blocks covering the last `W - 1` processed tokens and all
 tokens up to the end of the scheduled forward. The processed tokens are the
 computed tokens less the tokens of the request's forward in flight. They equal
-the computed tokens with `async_scheduling: false`. On a prefill or decode
-worker replay uses the computed tokens with async scheduling too, where vLLM
-uses the processed tokens (see the known differences in
-[Replay KV cache](../replay/engine/kv-cache.md#other-cache-modes)). Expired completed pages are evicted before
+the computed tokens with `async_scheduling: false`. A prefill or decode
+worker uses the processed tokens with async scheduling too. Expired
+completed pages are evicted before
 subsequent forwards; temporary prefill pages remain charged through completion.
 Full-attention groups retain full history. A `state` group holds its
 `blocks_per_request` blocks from the request's first scheduled forward until the
@@ -599,9 +598,11 @@ With prefix caching on, replay keeps the blocks of all groups in one block pool:
   no prefix-cacheable full-attention group, an aggregated worker holds it
   for one step in both modes, one step less than vLLM (see the known
   differences in
-  [Replay KV cache](../replay/engine/kv-cache.md#other-cache-modes)). A prefill or decode worker holds it for one
-  step in both modes. After it writes past a state that it published inside
-  a block, it holds the published block until its next allocation. A ring
+  [Replay KV cache](../replay/engine/kv-cache.md#other-cache-modes)). A
+  prefill or decode worker holds it for two steps with a step in flight, in
+  every layout. After it writes past a state that it published inside a
+  block, it holds the published block to the end of that scheduling pass,
+  or as a previous block when the write also crosses a block boundary. A ring
   holds one block. [Replay KV cache](../replay/engine/kv-cache.md#other-cache-modes)
   describes the blocks of a hit and of a checkpoint.
 - A request releases its blocks tail first. With async scheduling, a finished
