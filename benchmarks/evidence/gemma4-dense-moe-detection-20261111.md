@@ -12,9 +12,10 @@ available in this checkout; these tables remain historical author-reported
 results, not verification of the current head. No GPU was run, and no
 performance data was added, re-collected, or re-fitted.
 
-The current review head is `d65e5b3966875af78b7c8144c9a85098a632f99f`, which
-merges `main` at `24d06d418db0ec4aee309e0e24770958c8fdea19`; see
-[Current head after the main merge](#current-head-d65e5b396-after-the-main-merge-2026-11-24)
+The current code head is `f9d44bcdc8f986d942b4a96ab3d7096bf420085a`, which
+merges `main` at `1e321d5848ffc09dc7686cbc819eaf3dc5f52eac`; later commits
+change only this document. See
+[Current head after the main merges](#current-head-f9d44bcdc-after-the-main-merges-2026-11-24)
 for the verification at that SHA. The pre-rebase head was
 `8f3a62e0fde729cf74db0b6b3551608338b367dd`, based on
 `0809faae9e543487dcf2142dc6afe2427a42f9bd`, where the classifier fix was
@@ -37,26 +38,37 @@ constant metrics through offline runner and performance-model doubles, so
 candidate scores are placeholders; only the selected shape set and the
 feasible/infeasible status are meaningful.
 
-## Current head `d65e5b396` after the main merge (2026-11-24)
+## Current head `f9d44bcdc` after the main merges (2026-11-24)
 
-The reviewed head is `d65e5b3966875af78b7c8144c9a85098a632f99f`.
-`bf527e451` merges `main` at `24d06d418db0ec4aee309e0e24770958c8fdea19` and
-reconciles one consumer with this branch: because the dense gate now raises
+The reviewed code head is `f9d44bcdc8f986d942b4a96ab3d7096bf420085a`; any
+later commit changes only this document. Two merges of `main` sit on top of
+the reviewed commits. `bf527e451` merges `main` at
+`24d06d418db0ec4aee309e0e24770958c8fdea19` and reconciles one consumer with
+this branch: because the dense gate now raises
 `InvalidEngineConfigurationError` (a `ValueError`) instead of an
 `AssertionError`, `fpe_support_matrix.classify_failure` matches the anchored
 diagnostic as `ValueError`, with `test_fpe_support_matrix.py` updated to
-match. `d65e5b396` then updates the sentinel workflow-contract test after the
-merge. Below the merge are the reviewed commits: `d4faab7fd` (classifier fix),
-`13ca8aa81` (this document), `45d70db42` (embedded bridge tests),
-`c63cd7668` (request-wide fallback regression and the CI enforcement flag),
-`31800b398` (non-integer expert metadata), `d0075f9bb` (host budget pin) and
-`b761646c0` (the Rust error mapping described next).
+match. `d65e5b396` then aligned the sentinel workflow-contract test.
+`f9d44bcdc` merges `main` at `1e321d584`, whose #976 had already adopted those
+same sentinel assertions, so the merge keeps main's version of
+`tests/test_ci_workflow_contracts.py` and the branch's own workflow edit
+reduces to the single `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1` line. Below the
+merges are the reviewed commits: `d4faab7fd` (classifier fix), `13ca8aa81`
+(this document), `45d70db42` (embedded bridge tests), `c63cd7668`
+(request-wide fallback regression and the CI enforcement flag), `31800b398`
+(non-integer expert metadata), `d0075f9bb` (host budget pin) and `b761646c0`
+(the Rust error mapping described next).
 
-Relative to the merged main the branch changes 26 files. Apart from the two
-reconciliation edits above, those paths match the `31800b398` blobs, and those
-match the pre-rebase `8f3a62e0` blobs except two explained differences: the
-bridge test (`Python::with_gil` to `Python::attach`, required by main's pyo3
-0.30.1 move in `ff726a1ca`) and `.github/workflows/ci.yml` (the single added
+Relative to `main` at `1e321d584` the branch changes 25 files: 2,048
+insertions against 58 deletions, of which this document accounts for 555.
+The branch's own edits are the reviewed commits above; the first merge also
+carries main's `5b6a8aca3` FPM-schema changes in
+`crates/core/src/perfmodel/fpm/model.rs` and
+`python/aisim/src/aisim_core/sdk/memory/kv_cache.py`, which combine with the
+branch hunks in those files. Two differences from the pre-rebase
+`8f3a62e0` blobs remain and are explained: the bridge test
+(`Python::with_gil` to `Python::attach`, required by main's pyo3 0.30.1 move in
+`ff726a1ca`) and `.github/workflows/ci.yml` (the single added
 `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1` line). `b761646c0` additionally changes
 `crates/core/src/perfmodel/memory.rs` and asserts the mapped variant in the
 bridge test.
@@ -88,7 +100,7 @@ miss keeps `Unsupported` with its model, backend, GPU SKU and reason intact.
 
 ### Verification at the current head
 
-Local run at `d65e5b396` on macOS arm64, Python 3.13.9, with the native
+Local run at `f9d44bcdc` on macOS arm64, Python 3.13.9, with the native
 extension rebuilt from this head's tree (`maturin develop --release`, the `pyproject.toml`
 `extension-module,jemalloc` features) so the interpreter and extension agree on
 `ENGINE_SPEC_SCHEMA_VERSION` (30 in this tree and on `main`; an extension built
@@ -96,20 +108,26 @@ from another branch with 31 fails unrelated `perfmodel::py` tests).
 
 | Verification | Tested commit | Result |
 | --- | --- | --- |
-| Targeted pytest selection from the 2026-11-18 command below | `d65e5b396` | 1,187 passed, 0 failed |
-| `cargo test -p aisim-core --features embed-python --lib perfmodel::` (covers `memory.rs` and the `fpm/model.rs` fallback policy test) | `d65e5b396` | 1,476 passed, 0 failed, 1 ignored |
-| `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1 cargo test -p aisim-core --features embed-python --test perfmodel_dense_gemma4_bridge` | `d65e5b396` | 5 passed; no skips |
-| `cargo fmt --all -- --check` | `d65e5b396` | clean |
+| Targeted pytest selection from the 2026-11-18 command below | `f9d44bcdc` | 1,187 passed, 0 failed |
+| `cargo test -p aisim-core --features embed-python --lib perfmodel::` (covers `memory.rs` and the `fpm/model.rs` fallback policy test) | `f9d44bcdc` | 1,476 passed, 0 failed, 1 ignored |
+| `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1 cargo test -p aisim-core --features embed-python --test perfmodel_dense_gemma4_bridge` | `f9d44bcdc` | 5 passed; no skips |
+| `cargo fmt --all -- --check` | `f9d44bcdc` | clean |
+| `tests/test_ci_workflow_contracts.py` with Fast CI's invocation | `f9d44bcdc` | 782 passed, 3 skipped, 5 failed for host-only reasons (see below) |
 
-The lib-suite total is higher than the 1,460 recorded at `b761646c0` because the
-merge added perf-model tests. These are local results, and the commit after
-`d65e5b396` changes only this document, not code. **No Full CI run exists for
-this head**; admission remains with the maintainer.
+The 5 workflow-contract failures are environmental, not merge regressions: the
+same five fail identically at `main` `1e321d584` in a clean worktree. One needs
+a Linux manylinux Python 3.12 root (`test_manylinux_bootstrap_exports_working_python_or_fails_before_build[None]`),
+and four need the `pip-licenses` distribution that this macOS dev venv does not
+install (`test_real_pip_licenses_enforces_the_policy`). The perf-model lib total
+is higher than the 1,460 recorded at `b761646c0` because main added tests.
+These are local results; the commits after `f9d44bcdc` change only this
+document. **No Full CI run exists for this head**; admission remains with the
+maintainer.
 
 ### Support-matrix artifacts at the current head
 
-Rebasing does not change the stale-row position, and this branch does not
-introduce those rows. [Support-matrix artifacts](#support-matrix-artifacts)
+Neither the rebase nor the two merges of `main` change the stale-row
+position, and this branch does not introduce those rows. [Support-matrix artifacts](#support-matrix-artifacts)
 below holds the per-file counts and the constraint that blocks regeneration:
 the 103 op-level FPE rows and the ten retired-version `FAIL` rows are
 byte-identical to `origin/main`, and neither a Gemma-only patch nor a
@@ -456,8 +474,9 @@ still fail for a real reason (`PERF_DATA_MISSING`, `SDK_UNREPRESENTABLE`,
 Inspection at `8f3a62e0` confirms all 103 FPE rows and ten retired-version
 CLI rows above still record `FAIL`. Neither set was regenerated by the local
 verification above. The same counts and byte-identical rows were re-checked at
-`d65e5b396` against the current `main` tip `1e321d584` (and earlier at
-`b761646c0` against `19d8a245a`): 103 dense-rejection FPE rows on both trees,
+`f9d44bcdc` against `main` `1e321d584` (and earlier at `d65e5b396` against
+`1e321d584` and at `b761646c0` against `19d8a245a`): 103 dense-rejection FPE
+rows on both trees,
 and the ten dense `FAIL` rows plus six `HW_INCOMPATIBLE` rows for
 `trtllm 1.3.0rc23` on both trees, so this branch neither adds nor clears any of
 them. There are 212 failed `trtllm 1.3.0rc23` rows across all models,
