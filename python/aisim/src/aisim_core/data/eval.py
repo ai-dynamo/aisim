@@ -34,7 +34,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from aisim_core.data import Artifact, Digest, Identity
 from aisim_core.data.gpu_time import Finding, GpuTime, check_gpu_time, gpu_time_ok
-from aisim_core.data.hygiene import CandidatePolicy, bounded_json_bytes
+from aisim_core.data.hygiene import CandidatePolicy, bounded_json_bytes, checked_path
 from aisim_core.data.parquet import read_parquet, write_parquet
 
 EVAL_SCHEMA_ID = "aisim-eval/v1"
@@ -342,7 +342,9 @@ def write_record(root: str | Path, record: EvalRecord, *, sidecars: Mapping[str,
 
 def _write_record(path: Path, record: EvalRecord, text: str, sidecars: Mapping[str, bytes]) -> Path:
     for relative, data in sidecars.items():
-        existing = path.parent / relative
+        # Every destination is checked before anything is staged or published: a symlinked component would send the
+        # file outside the dataset. Ordinary nested directories stay allowed.
+        existing = checked_path(path.parent, relative)
         if existing.exists() and existing.read_bytes() != data:
             raise FileExistsError(f"refusing to overwrite {existing} with different content")
     if path.exists():

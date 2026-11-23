@@ -640,3 +640,37 @@ def test_the_record_lock_is_exclusive_between_live_writers_of_one_directory(buil
     ):
         write_record(root, successor, sidecars=files)
     write_record(root, successor, sidecars=files)  # released on exit, however the holder leaves
+
+
+def _successor_declaring(record, relative):
+    payload = b'{"note": "nested sidecar"}'
+    digest = hashlib.sha256(payload).hexdigest()
+    artifact = Artifact(
+        artifact_id="findings",
+        path=relative,
+        role="findings",
+        format="json",
+        schema="findings/v1",
+        sha256=digest,
+        bytes=len(payload),
+    )
+    successor = record.model_copy(update={"findings": [artifact], "supersedes": record.record_id})
+    return successor, {relative: payload}
+
+
+def test_sidecars_cannot_follow_a_symlinked_directory_out_of_the_dataset(built, tmp_path):
+    root, record = built
+    directory = write_record(root, record).parent
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (directory / "linked").symlink_to(outside, target_is_directory=True)
+    successor, files = _successor_declaring(record, "linked/note.json")
+    with pytest.raises(ValueError, match="symlink"):
+        write_record(root, successor, sidecars=files)
+    assert list(outside.iterdir()) == []  # nothing was created outside the dataset
+    assert not record_path(root, successor).exists()  # and no record was published
+    assert _leftovers(directory) == []
+    # An ordinary nested directory is still supported.
+    nested, files = _successor_declaring(record, "nested/note.json")
+    path = write_record(root, nested, sidecars=files)
+    assert path.exists() and (directory / "nested/note.json").read_bytes() == files["nested/note.json"]
