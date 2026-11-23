@@ -839,8 +839,8 @@ Copyright contributors to the vLLM project. Licensed under Apache-2.0:
 https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/LICENSE
 
 This is a modified Python adaptation, restricted to no EAGLE, no speculative
-blocks, no hash lookahead tokens, no partial hash hits and no async
-scheduling. No upstream method body is copied. The identified upstream
+blocks, no hash lookahead tokens, no partial hash hits, no shared-prefix
+junction stop and no async scheduling. No upstream method body is copied. The identified upstream
 revision has no root NOTICE file. The repository's Apache-2.0 LICENSE supplies
 the license text, and no upstream source file is vendored.
 

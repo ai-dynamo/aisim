@@ -111,13 +111,14 @@ included, before the scheduler loads.
   `injected prompt hashes unavailable`, so its status is `incomplete` or
   `failed` and not `qualified`. Publication does not read that status.
   `aisim onboard validate-collection` does not finish on a GLM-5.3-Flash
-  campaign. It writes a first report whose execution gate is `incomplete`,
-  and then its interpolation holdout stops with `No FPM cell matches`: a
-  query that is built from an FPM profile carries no execution identity, and
-  the rows of a producer cell carry one. For the same reason `aisim predict`
-  and `aisim recommend` with the files of the onboarding plan do not read the
-  collected table, and `finalize --collection-report` has no report of such a
-  campaign to record. A query without a profile reads the published table.
+  campaign. It writes a first report whose execution gate is `incomplete` or
+  `failed`, and then its interpolation holdout stops with
+  `No FPM cell matches`: a query that is built from an FPM profile carries no
+  execution identity, and the rows of a producer cell carry one. For the same
+  reason `aisim predict` and `aisim recommend` with the files of the
+  onboarding plan do not read the collected table, and
+  `finalize --collection-report` has no report of such a campaign to record.
+  A query without a profile reads the published table.
 - A pinned revision needs the configuration of its own checkpoint. The
   producer accepts any other revision whose configuration equals the
   configuration of a pinned checkpoint. `DYN_FPM_TOKENIZER_REVISION` is the

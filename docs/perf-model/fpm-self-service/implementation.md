@@ -1808,6 +1808,9 @@ collecting repetitions; bounded subsets remain diagnostics. Imported historical
 tables without the required native evidence stay unqualified rather than
 acquiring a passing status from successful loading. See the
 [collection-quality procedure](#validate-collection-and-serving-accuracy).
+A campaign whose cells carry an execution identity, such as GLM-5.3-Flash,
+does not finish this command; see the
+[GLM-5.3-Flash page](../../glm53flash-fpm.md#vllm-producer).
 
 Keep the hardware/query-policy files and source manifest with the pair. Preserve
 both files together when copying or renaming them to the canonical filenames.

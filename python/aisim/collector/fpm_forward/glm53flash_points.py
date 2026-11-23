@@ -6,6 +6,11 @@
 The GLM-5.3-Flash producer (``runtime/glm53flash/glm53flash_prefix_scheduler.py``) measures an explicit point list
 only, and onboarding passes grid limits only. The planner freezes this list into the collection plan, so the plan
 hash covers it. The list keeps the shape of Dynamo's generic grid where the producer's rules allow it.
+
+``glm_align_stop`` and ``glm_point_blocks`` are modified adaptations of rules of vLLM v0.33.0
+(https://github.com/vllm-project/vllm/tree/4ba787ec9959e566d3b587a796dff07673324da5), Copyright contributors to the
+vLLM project, Apache-2.0. The comments in the two functions name the source files and lines, and
+THIRD_PARTY_NOTICES.md holds the entry.
 """
 
 from __future__ import annotations

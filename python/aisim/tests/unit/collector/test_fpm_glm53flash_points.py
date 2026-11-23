@@ -774,9 +774,9 @@ def test_smallest_cache_that_keeps_the_whole_tp4_list(alignment, counts):
     # The largest need of both lists is a prefill of 32 requests, each with up to 256 new tokens after a prefix of 60
     # hash blocks: ceil((60 * 2,176 + 256) / 2,176) = 61 attention blocks, the ring block and 2 blocks in each of the 4
     # KDA groups, the cached block of the prefix beside the running block. 32 * (61 + 1 + 8) = 2,240 blocks. These
-    # prefills hold no checkpoint block, so the list without one needs the same. vLLM 0.33.0's scheduler, run with the
-    # settings of the collector's launch, completed every prefill point of either list in one engine with 2,240 free
-    # blocks, and with 2,239 every point but these 7.
+    # prefills hold no checkpoint block, so the list without one needs the same. So 2,240 free blocks keep every
+    # prefill point of either list, and 2,239 drop these 7 and no other. _vllm_blocks cites the vLLM 0.33.0 lines that
+    # give these counts.
     def lists(pages):
         return glm_points(**_limits(kv_cache_bytes=PAGE * pages), checkpoint_alignment=alignment)
 
@@ -792,9 +792,8 @@ def test_smallest_cache_that_keeps_the_whole_tp4_list(alignment, counts):
 def test_smallest_cache_that_keeps_every_tp4_decode_point(alignment):
     # The largest decode need is 32 requests at a context of 65,536 tokens: ceil(65,537 / 2,176) = 31 attention blocks,
     # the ring block and 2 blocks in each of the 4 KDA groups, 32 * 40 = 1,280. 16 requests at 131,072 need
-    # 16 * (61 + 1 + 8) = 1,120. A decode request holds no checkpoint block. vLLM 0.33.0's scheduler, run with the
-    # settings of the collector's launch, completed the 81 decode points in one engine with 1,280 free blocks, and with
-    # 1,279 every point but this one.
+    # 16 * (61 + 1 + 8) = 1,120. A decode request holds no checkpoint block. So 1,280 free blocks keep the 81 decode
+    # points, and 1,279 drop this one and no other. _vllm_blocks cites the vLLM 0.33.0 lines that give these counts.
     def decode(pages):
         payload, dropped = glm_points(**_limits(kv_cache_bytes=PAGE * pages), checkpoint_alignment=alignment)
         return payload["decode"], dropped["decode"]["cache_capacity"]
