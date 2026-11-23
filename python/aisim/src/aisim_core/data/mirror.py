@@ -55,7 +55,7 @@ from pydantic import ValidationError
 from aisim_core.data import CategoryIndex, DatasetIndex, Manifest, _verify, check_manifest, configuration_id
 from aisim_core.data.catalog import CATALOG_DIR, COVERAGE_FILE, _write, build_catalog, catalog_files, known_system_specs
 from aisim_core.data.e2e import SNAPSHOT_SCHEMA, load_e2e, read_snapshot, verify_snapshot_members
-from aisim_core.data.eval import load_record, record_dir, record_paths
+from aisim_core.data.eval import TIER_RANK, load_record, record_dir, record_paths
 from aisim_core.data.evidence import EVIDENCE_ROOT, check_evidence
 from aisim_core.data.hygiene import (
     CandidateFile,
@@ -321,6 +321,16 @@ def _check_eval(root: Path, report: TreeReport, declared: set[str]) -> None:
     for (directory, _), (rel, record) in verified.items():
         if record.supersedes is not None and (directory, record.supersedes) not in verified:
             report.add("eval-predecessor-missing", "superseded record must be verified in the same directory", rel)
+        elif record.supersedes is not None:
+            # The successor hides its predecessor from the current view, so it must not rank below it (attest
+            # enforces the same order). A same-tier retry and an upgrade stay valid.
+            _, predecessor = verified[(directory, record.supersedes)]
+            if TIER_RANK[record.tier] < TIER_RANK[predecessor.tier]:
+                report.add(
+                    "eval-tier-downgrade",
+                    f"a {record.tier} record cannot supersede the {predecessor.tier} record {predecessor.record_id}",
+                    rel,
+                )
         if record.supersedes is not None:
             successors.setdefault((directory, record.supersedes), []).append((rel, record.record_id))
     # Two branches can each publish a valid successor of one record and then merge: both files stay, because their

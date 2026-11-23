@@ -4166,6 +4166,46 @@ def test_competing_eval_successors_of_one_record_are_reported(tmp_path):
     assert not report.ok
 
 
+def test_an_eval_successor_cannot_rank_below_its_predecessor(tmp_path):
+    from aisim_core.data.eval import VERIFIER_VERSION, GpuTime, current_records, load_record
+
+    root, manifests = _mirror(tmp_path)
+    first_path = _eval(root, [load_e2e(root, manifests[0]).manifest.configuration_id])
+    submitted = load_record(first_path)
+    measured = GpuTime(authority="measured", gpu_count=4, wall_seconds=1.0)
+
+    def successor(predecessor, tier, day):
+        update = {"supersedes": predecessor.record_id, "tier": tier, "created_at": f"2026-11-{day}T00:00:00Z"}
+        update["gpu_time"] = measured.model_dump()
+        update["verification"] = (
+            None
+            if tier == "submitted"
+            else {
+                "verifier_version": VERIFIER_VERSION,
+                "recomputed_fingerprint": predecessor.prediction.fingerprint,
+                "verified_record_id": predecessor.record_id,
+            }
+        )
+        return EvalRecord.model_validate({**predecessor.model_dump(by_alias=True), **update})
+
+    verified = successor(submitted, "verified", "08")
+    retry = successor(verified, "verified", "09")  # a same-tier retry
+    qualified = successor(retry, "qualified", "10")  # an upgrade
+    for record in (verified, retry, qualified):
+        write_record(root, record)
+    build_catalog(root)
+    assert validate_tree(root).ok, validate_tree(root).errors  # submitted -> verified -> verified -> qualified
+    directory = first_path.parent
+    # A downgrade names the qualified record as its predecessor and would hide it from the current view.
+    demoted = successor(qualified, "submitted", "11")
+    demoted_path = write_record(root, demoted)
+    report = validate_tree(root)
+    found = [f for f in report.errors if f.code == "eval-tier-downgrade"]
+    assert [f.path for f in found] == [demoted_path.relative_to(root).as_posix()]
+    assert qualified.record_id in found[0].message and "submitted" in found[0].message
+    assert not report.ok and [r.tier for r in current_records(directory)] == ["submitted"]
+
+
 @pytest.mark.parametrize("predecessor", ["valid", "missing", "invalid"])
 def test_eval_successor_requires_verified_local_predecessor(tmp_path, predecessor):
     from aisim_core.data.eval import load_record

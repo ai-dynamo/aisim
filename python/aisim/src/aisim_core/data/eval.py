@@ -50,7 +50,7 @@ REL_TOL = 1e-6
 
 Layer = Literal["op", "fpm", "e2e"]
 Tier = Literal["submitted", "verified", "qualified"]
-_TIER_RANK = {"submitted": 0, "verified": 1, "qualified": 2}
+TIER_RANK = {"submitted": 0, "verified": 1, "qualified": 2}  # the order attest and the mirror enforce
 
 
 class _Record(BaseModel):
@@ -696,7 +696,7 @@ def attest(record: EvalRecord, report: VerificationReport, tier: Tier = "verifie
         raise ValueError("verification report belongs to different record content")
     if tier == "submitted":
         raise ValueError("attest promotes to verified or qualified")
-    if _TIER_RANK.get(tier, len(_TIER_RANK)) < _TIER_RANK.get(record.tier, 0):
+    if TIER_RANK.get(tier, len(TIER_RANK)) < TIER_RANK.get(record.tier, 0):
         # The successor supersedes the record, so a lower tier would hide it from the current view.
         raise ValueError(f"cannot demote a {record.tier} record to {tier}")
     if record.status != "complete":
