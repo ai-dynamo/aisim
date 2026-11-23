@@ -6,9 +6,10 @@
 // async-scheduling batch queue, of the v0.29.0
 // (98dff2a81d747d1dba01a47f939f48c3526d4206) align-mode prefill split, of the
 // v0.30.0 (ced6857afa0ea7b2e3f0846a62e1394e90f15607) async block frees and of
-// the v0.31.0 (db9527a46873454610df6dbedf79a36d6bf1a7f6), v0.32.0
-// (5df63a7203cdb9328d824a27b682e77c7b9928be) and v0.33.0
-// (4ba787ec9959e566d3b587a796dff07673324da5) grouped KV rules;
+// the v0.31.0 (db9527a46873454610df6dbedf79a36d6bf1a7f6) and v0.32.0
+// (5df63a7203cdb9328d824a27b682e77c7b9928be) grouped KV rules and grouped KV
+// handoff rules and of the v0.33.0 (4ba787ec9959e566d3b587a796dff07673324da5)
+// grouped KV rules;
 // immutable sources and license: THIRD_PARTY_NOTICES.md.
 // MTP/G2 semantics additionally adapted from vLLM v0.32.0, commit
 // 5df63a7203cdb9328d824a27b682e77c7b9928be, vllm/v1/core/sched/scheduler.py
@@ -35,7 +36,8 @@ use crate::engine::common::utils::{
 use crate::engine::host_offload::{G2Binding, HostTierHandle};
 use crate::engine::kv_manager::AllocationRequirement;
 use crate::engine::kv_manager::{
-    AdmissionLimits, G1Manager, GroupedKvPool, GroupedPrefixRules, PrefixHashMemo, VllmRuleVersion,
+    AdmissionLimits, G1Manager, GroupedKvPool, GroupedPrefixRules, GroupedTransferRules,
+    PrefixHashMemo, VllmRuleVersion,
 };
 use crate::engine::kv_manager::{DestinationReservation, G1Acquire, NativeAllocation};
 use crate::engine::kv_manager::{mamba_prefill_checkpoint, state_boundaries};
@@ -727,7 +729,7 @@ pub(crate) struct VllmCore {
     pass_ran_work: bool,
     /// Requests that finished in the latest pass. vLLM frees their blocks when
     /// it processes that pass's outputs, after it has formed the next pass.
-    finished_in_flight: Vec<HeldVllmPrefill>,
+    finished_in_flight: Vec<DeferredFree>,
     /// Requests the pass in flight runs, when vLLM defers freeing their
     /// blocks until that pass ends: async scheduling with a CPU tier.
     in_flight_requests: Vec<Uuid>,
@@ -806,6 +808,14 @@ impl DecodeBatch {
 struct HeldVllmPrefill {
     request_id: Uuid,
     request: VllmRequestState,
+}
+
+/// A free that async scheduling defers until the next pass is formed.
+enum DeferredFree {
+    /// Every block of a finished request.
+    Request(HeldVllmPrefill),
+    /// The skipped blocks of a source that its finish held for a transfer.
+    HeldSource(Uuid),
 }
 
 struct ReservedVllmDecode {
@@ -1050,6 +1060,12 @@ impl VllmCore {
                     capacity_bytes,
                 ));
             }
+            if args.worker_type != WorkerType::Aggregated {
+                kv_manager.set_grouped_transfer_rules(
+                    GroupedTransferRules::new(&args.kv_cache_groups)
+                        .expect("validated grouped transfer rules"),
+                );
+            }
         }
         let mut kv_manager = kv_manager.with_prefix_match_unit(args.prefix_match_unit);
         let blocks_per_state = kv_manager.state_blocks_per_request();
@@ -1221,9 +1237,24 @@ impl VllmCore {
             self.kv_manager.grouped().is_none()
                 || matches!(
                     &command,
+                    SchedulerCommand::Submit(_)
+                        | SchedulerCommand::CancelRequest { .. }
+                        | SchedulerCommand::SubmitHandoffPrefill { .. }
+                        | SchedulerCommand::ReleaseSource { .. }
+                        | SchedulerCommand::CancelSource { .. }
+                ),
+            "grouped KV caches do not support destination handoff commands"
+        );
+        // An aggregated grouped rank builds no transfer rules, so it can
+        // neither truncate nor price a source.
+        anyhow::ensure!(
+            self.kv_manager.grouped().is_none()
+                || self.kv_manager.grouped_transfer().is_some()
+                || matches!(
+                    &command,
                     SchedulerCommand::Submit(_) | SchedulerCommand::CancelRequest { .. }
                 ),
-            "grouped KV caches support only cold aggregated requests, not KV handoff commands"
+            "grouped KV caches support KV handoff commands only on prefill and decode ranks"
         );
         let mutation_now_ms = command_now_ms.filter(|_| allow_destination_admission);
         match command {
@@ -1264,10 +1295,29 @@ impl VllmCore {
                 handoff_id,
                 mut request,
             } => {
+                anyhow::ensure!(
+                    self.kv_manager.grouped_transfer().is_none() || !request.tokens.is_empty(),
+                    "grouped KV sources require a nonempty prompt"
+                );
                 let uuid = request.uuid.unwrap_or_else(Uuid::new_v4);
                 request.uuid = Some(uuid);
                 self.validate_request_id(uuid)?;
                 self.source_holds.register(uuid, handoff_id)?;
+                if let Some(rules) = self.kv_manager.grouped_transfer() {
+                    // vLLM's prefill rank drops the last backoff tokens of the
+                    // prompt, which the decode rank recomputes (V31
+                    // `nixl/base_scheduler.py:409-436`, V32 `:405-435`).
+                    let tokens = rules.transfer_tokens(request.tokens.len());
+                    if tokens < request.tokens.len() {
+                        request.tokens.truncate(tokens);
+                        // The source samples once; the decode rank computes
+                        // the backed-off prompt token before generating more.
+                        request.max_output_tokens = request.max_output_tokens.min(1);
+                        if let Some(output_ids) = &mut request.output_token_ids {
+                            output_ids.truncate(1);
+                        }
+                    }
+                }
                 let admissible_from_pass =
                     self.first_pass_admitting_arrival(!allow_destination_admission);
                 let submitted = self
@@ -1726,7 +1776,7 @@ impl VllmCore {
         match self.source_holds.remove(handoff_id) {
             RemovedSource::Held(payload) => {
                 let request_id = payload.request_id;
-                self.cleanup_completed_prefill(payload);
+                self.free_held_source(payload);
                 self.bump_capacity_generation();
                 (true, Some(request_id))
             }
@@ -1744,7 +1794,7 @@ impl VllmCore {
         match self.source_holds.remove(handoff_id) {
             RemovedSource::Held(payload) => {
                 let request_id = payload.request_id;
-                self.cleanup_completed_prefill(payload);
+                self.free_held_source(payload);
                 self.bump_capacity_generation();
                 (true, Some(request_id))
             }
@@ -1758,6 +1808,15 @@ impl VllmCore {
 
     fn complete_source(&mut self, uuid: Uuid) {
         let transfer_timing = self.state.requests.get(&uuid).map(|request| {
+            if let Some(rules) = self.kv_manager.grouped_transfer() {
+                // The submission truncated the prompt to the transferred
+                // tokens. The timing counts their full-attention blocks.
+                return rules.handoff_transfer_timing(
+                    request.sequence.num_input_tokens(),
+                    self.args.kv_transfer_bandwidth,
+                    self.args.kv_transfer_timing_mode,
+                );
+            }
             prefill_handoff_transfer_timing(
                 request.sequence.num_input_tokens(),
                 self.args.kv_transfer_bandwidth,
@@ -1768,25 +1827,37 @@ impl VllmCore {
                 self.args.kv_transfer_timing_mode,
             )
         });
-        let request = self
+        let mut request = self
             .state
             .take_completed(&uuid)
             .expect("completed request must remain scheduler-owned");
+        // vLLM frees a finished request's blocks when it processes the pass's
+        // outputs; with async scheduling that comes after it has formed the
+        // next pass (V31 `engine/core.py:697`, `:740-755`, V32
+        // `engine/core.py:725`, `:768-783`).
+        let deferred = self.args.max_concurrent_batches > 1;
+        if !deferred && self.releases_skipped_blocks() {
+            self.kv_manager.release_skipped_blocks(
+                uuid,
+                &mut request.sequence.lease,
+                request.num_computed_tokens,
+            );
+        }
         let payload = HeldVllmPrefill {
             request_id: uuid,
             request,
         };
         match self.source_holds.complete_source(uuid, payload) {
-            // vLLM frees a finished request's blocks when it processes the
-            // pass's outputs; with async scheduling that comes after it has
-            // formed the next pass.
-            SourceCompletion::Release(payload) if self.args.max_concurrent_batches > 1 => {
-                self.finished_in_flight.push(payload);
+            SourceCompletion::Release(payload) if deferred => {
+                self.finished_in_flight.push(DeferredFree::Request(payload));
             }
             SourceCompletion::Release(payload) => {
                 self.cleanup_completed_prefill(payload);
             }
             SourceCompletion::Held { handoff_id } => {
+                // vLLM returns the transfer parameters with the outputs of
+                // this pass, so the hold starts here. With async scheduling
+                // its skipped blocks wait for the deferred free.
                 self.lifecycle_events
                     .push(SchedulerLifecycleEvent::SourceHeld {
                         handoff_id,
@@ -1794,6 +1865,9 @@ impl VllmCore {
                         transfer_timing: transfer_timing
                             .expect("completed source request must retain transfer timing"),
                     });
+                if deferred && self.releases_skipped_blocks() {
+                    self.finished_in_flight.push(DeferredFree::HeldSource(uuid));
+                }
             }
         }
         self.active_destination_handoffs.remove_request(uuid);
@@ -1812,12 +1886,70 @@ impl VllmCore {
             .finish_native(request_id, request.sequence.lease);
     }
 
-    fn free_finished(&mut self, finished: Vec<HeldVllmPrefill>) {
+    /// Whether an ending request frees its skipped blocks first. A grouped
+    /// prefill rank frees the skipped blocks of an ending request first, as
+    /// vLLM's `_free_request` runs `_connector_finished`, which frees them
+    /// before it hands the block table to the connector (V31
+    /// `sched:2650-2679`, `:2966-2974`, V32 `sched:2714-2744`,
+    /// `:3023-3031`).
+    fn releases_skipped_blocks(&self) -> bool {
+        self.args.worker_type == WorkerType::Prefill && self.kv_manager.grouped_transfer().is_some()
+    }
+
+    /// Free every block of a held source that is released or cancelled.
+    /// vLLM frees the skipped blocks of a source in `_connector_finished`
+    /// when it processes the outputs of the pass that completed it (V31
+    /// `sched:2171`, `:2966-2974`, V32 `sched:2230`, `:3023-3031`), and the
+    /// rest when the transfer ends (V31 `sched:3155-3158`, V32
+    /// `sched:3232-3235`). So the skipped blocks enter the free queue first in
+    /// every order of events. A source that leaves before its deferred free
+    /// frees them here and drops its queued entry, which a new source with
+    /// the same request ID would otherwise meet. After the deferred free, or
+    /// without async scheduling, the release frees nothing a second time.
+    fn free_held_source(&mut self, mut payload: HeldVllmPrefill) {
+        let request_id = payload.request_id;
+        self.finished_in_flight.retain(
+            |free| !matches!(free, DeferredFree::HeldSource(queued) if *queued == request_id),
+        );
+        if self.releases_skipped_blocks() {
+            self.kv_manager.release_skipped_blocks(
+                request_id,
+                &mut payload.request.sequence.lease,
+                payload.request.num_computed_tokens,
+            );
+        }
+        self.cleanup_completed_prefill(payload);
+    }
+
+    fn free_finished(&mut self, finished: Vec<DeferredFree>) {
         if finished.is_empty() {
             return;
         }
-        for payload in finished {
-            self.cleanup_completed_prefill(payload);
+        let releases_skipped_blocks = self.releases_skipped_blocks();
+        for free in finished {
+            match free {
+                DeferredFree::Request(mut payload) => {
+                    if releases_skipped_blocks {
+                        self.kv_manager.release_skipped_blocks(
+                            payload.request_id,
+                            &mut payload.request.sequence.lease,
+                            payload.request.num_computed_tokens,
+                        );
+                    }
+                    self.cleanup_completed_prefill(payload);
+                }
+                // A source that is released or cancelled before this free
+                // drops its entry in `free_held_source`.
+                DeferredFree::HeldSource(request_id) => {
+                    if let Some(payload) = self.source_holds.held_payload_mut(request_id) {
+                        self.kv_manager.release_skipped_blocks(
+                            request_id,
+                            &mut payload.request.sequence.lease,
+                            payload.request.num_computed_tokens,
+                        );
+                    }
+                }
+            }
         }
         self.bump_capacity_generation();
     }
