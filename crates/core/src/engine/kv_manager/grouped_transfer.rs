@@ -308,11 +308,11 @@ impl GroupedTransferRules {
     /// `local_full_blocks` full-attention blocks: the missing full-attention
     /// blocks and the fixed bytes. The decode rank pulls only the blocks that
     /// its prefix cache lacks (`nixl/pull_scheduler.py:149-156`, the same in
-    /// V31 and V32), and the state moves with every transfer that moves a
-    /// token (V31 `nixl/base_worker.py:3507-3528`, V32 `:3472-3492`). When
-    /// the decode rank holds every block, vLLM moves nothing
-    /// (`nixl/pull_scheduler.py:59-65`), but this formula still counts the
-    /// fixed bytes, as the handoff timing does.
+    /// V31, V32 and v0.33), and the state moves with every transfer that
+    /// moves a token (V31 `nixl/base_worker.py:3507-3528`, V32 `:3472-3492`,
+    /// v0.33 `:3810-3830`). When the decode rank holds every block, vLLM
+    /// moves nothing (V31, V32 and v0.33 `nixl/pull_scheduler.py:59-65`), but
+    /// this formula still counts the fixed bytes, as the handoff timing does.
     #[cfg(test)]
     pub(crate) fn payload_bytes(&self, transfer_tokens: usize, local_full_blocks: usize) -> u64 {
         let missing = self
@@ -327,9 +327,9 @@ impl GroupedTransferRules {
     /// `state_bytes` holds the fixed bytes. The destination reports its
     /// missing full-attention blocks in the same unit, as vLLM pulls only the
     /// blocks that the decode rank lacks (`nixl/pull_scheduler.py:149-156`,
-    /// the same in V31 and V32). So the delay is the `payload_bytes` over the
-    /// bandwidth in both timing modes. The struct comes from the builder of
-    /// the linear path, which also maps the mode.
+    /// the same in V31, V32 and v0.33). So the delay is the `payload_bytes`
+    /// over the bandwidth in both timing modes. The struct comes from the
+    /// builder of the linear path, which also maps the mode.
     pub(crate) fn handoff_transfer_timing(
         &self,
         transfer_tokens: usize,

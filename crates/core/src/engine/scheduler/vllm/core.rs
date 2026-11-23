@@ -1581,13 +1581,16 @@ impl VllmCore {
         // The same holds for what the loads in flight need, which vLLM also
         // sums again at each attempt (V31 `sched:1194-1204`, `:3032-3036`,
         // V32 `sched:1241-1251`, `:3088-3092`). The first pass of a load
-        // takes it out of that need with no move of the epoch, and the head
-        // can then fit. A state key that a step publishes is no hit in that
-        // step, and the next step start makes it a hit (V31
-        // `single:1726-1734`, `sched:603` with `single:2044-2045`,
-        // V32 `single:1688-1696`, `sched:632` with `single:2008-2009`). That
-        // can let the head fit with no other change, so a move of the
-        // coordinator's published epoch makes the head due too.
+        // takes it out of that need with no move of the epoch. Its blocks
+        // can evict the first copy of a key that the head hits while a
+        // request holds another copy, and the head can then fit. A state key
+        // that a step publishes is no hit in that step, and the next step
+        // start makes it a hit (V31 `single:1726-1734`, `sched:603` with
+        // `single:2044-2045`, V32 `single:1688-1696`, `sched:632` with
+        // `single:2008-2009`, v0.33 `single:1704-1712`, `sched:746` with
+        // `single:2025-2026`). That can let the head fit with no other
+        // change, so a move of the coordinator's published epoch makes the
+        // head due too.
         let epoch = self.kv_manager.grouped().map(GroupedKvPool::retry_epoch);
         // With no destination waiting, the need has no reader, so it is not
         // summed and counts as 0. A destination that enters the empty queue
@@ -2867,7 +2870,8 @@ impl VllmCore {
             // `waiting`, and applies to decode ranks with G2, in either scope.
             // A grouped decode rank serves them first too, as vLLM drains the
             // requests that hold KV blocks before the others (v0.31
-            // `sched:886-887`, v0.32 `sched:913-917`). A preempted request
+            // `sched:886-887`, v0.32 `sched:913-917`, v0.33
+            // `sched:1063-1067`). A preempted request
             // holds none, so it cannot block a loaded handoff there.
             // Native PRIORITY instead compares the two queue heads by
             // (priority, arrival); this engine models only FCFS and never

@@ -8271,20 +8271,26 @@ fn grouped_output_token_block_gets_its_key_in_the_pass_that_fills_it() {
     // output token (v0.31 engine/core.py:697, :740-755, v0.32
     // engine/core.py:725, :768-783, v0.33 engine/core.py:735, :778-793), so
     // `request.num_tokens` is one short and the block gets its key one step
-    // later: in the next `schedule()` call, or when vLLM processes the
-    // outputs of the filling step (v0.31 and v0.32
-    // sched/async_scheduler.py:73-77, v0.33 sched/scheduler.py:2407-2415). A
-    // request that vLLM admits in the filling step hits 32 tokens there.
-    // Replay gives the key in the filling pass with one batch and with two:
-    // a known difference from vLLM with async scheduling.
+    // later: in the request's next `allocate_slots` call if that call
+    // succeeds, or when vLLM processes the outputs of the filling step while
+    // the request still runs (v0.31 and v0.32
+    // sched/async_scheduler.py:73-77, v0.33 sched/scheduler.py:2407-2415).
+    // A request that is preempted in that next call gets neither: its
+    // allocation returns before the cache step (v0.31
+    // kv_cache_manager.py:574-576, v0.32 :577-579, v0.33 :586-588), and vLLM
+    // frees the block without the key. A request that vLLM admits in the
+    // filling step hits 32 tokens there.
+    // Replay gives the key in the filling pass with one batch and with two,
+    // also to a request that is preempted in the next pass: a known
+    // difference from vLLM with async scheduling.
     for version in ["0.31.0", "0.32.0", "0.33.0"] {
         for batches in [1usize, 2] {
             // 32 before the filling pass, 64 in it. With one batch vLLM's
             // scheduler, run on its own code, has the key at 64 when the
             // schedule() call that fills the block returns. With two batches
-            // vLLM has the key one step later, so a request that it admits
-            // in the filling step hits 32; replay's 64 is the difference
-            // named above.
+            // the row of pass 24 pins replay's 64, and vLLM's value there is
+            // 32: vLLM has the key one step later, so a request that it
+            // admits in the filling step hits 32.
             for (admitting_pass, hit) in [(23u64, 32), (24, 64)] {
                 let case = format!("{version} batches {batches} pass {admitting_pass}");
                 let mut core = batches_core(
@@ -8333,7 +8339,7 @@ fn grouped_resumed_request_hits_the_block_that_its_output_tokens_filled() {
     // tokens is
     // preempted with 66 computed tokens and 67 known tokens. Its blocks that
     // end at 32 and 64 stay cached, and its re-admission hits (67 - 1) / 32 *
-    // 32 = 64 tokens.
+    // 32 = 64 tokens. These values are derived from the rule.
     for version in ["0.31.0", "0.32.0", "0.33.0"] {
         for batches in [1, 2] {
             let case = format!("{version} batches {batches}");
@@ -8410,9 +8416,9 @@ fn grouped_glm_shaped_next_turn_gets_a_junction_where_output_tokens_filled_a_blo
     // group keeps no state at an output position under the default
     // retention. Turn 2 repeats the 2,400 tokens and adds 100. Its
     // full-attention lookup hits 2,176 tokens and its Mamba lookup none, so
-    // the hit is 0 and the junction 2,176 (v0.31, v0.32 and v0.33
-    // kv_cache_manager.py:312-321). The prefill stops at the junction and
-    // each Mamba group publishes its state there. With 100 output tokens
+    // the hit is 0 and the junction 2,176 (v0.31 and v0.32
+    // kv_cache_manager.py:312-321, v0.33 :319-328). The prefill stops at the
+    // junction and each Mamba group publishes its state there. With 100 output tokens
     // turn 1 fills no block, and turn 2 (2,200 tokens) gets no junction. One
     // step computes 2,176 tokens at most here, so the first chunk of turn 2
     // ends at 2,176 in both cases.
@@ -8681,7 +8687,7 @@ fn grouped_resumed_request_keeps_the_partial_tail_key_on_the_block_that_output_t
     // kv_cache_manager.py:312-321, v0.33 kv_cache_manager.py:319-328). Its
     // recompute fills the block that ends at 32 again, from a copy of the
     // hit block, and keeps a state at the junction. So the keys at 20 and at
-    // 32 stay in both groups.
+    // 32 stay in both groups. These values are derived from the rule.
     for version in ["0.31.0", "0.32.0", "0.33.0"] {
         for batches in [1, 2] {
             let case = format!("{version} batches {batches}");
@@ -8792,14 +8798,12 @@ fn grouped_block_that_output_tokens_fill_becomes_the_last_holder_of_the_tail_key
     // becomes the first block of the key at 60, and a lookup takes the first
     // block (v0.31.0 and v0.32.0 `:62-72`, v0.33.0 `:63-73`). At v0.31.0 Q0's
     // block is the only block with that key.
-    // vLLM's scheduler, run on its own code at v0.33.0 with one batch on
-    // these requests, shows the order: after Q1 the blocks of the key at 60
-    // are Q0's block and Q1's copy, after the step that fills Q0's block
-    // they are Q1's copy and Q0's block, and a later request with Q1's
-    // prompt hits through Q1's copy. Its first allocation then takes 6
-    // blocks: the two hit blocks, a copy block, the ring block, the state
-    // hit block and a new state block. No run exists at v0.31.0 or v0.32.0;
-    // the rule is the same there.
+    // So, derived from these rules: after Q1 the blocks of the key at 60 are
+    // Q0's block and Q1's copy, after the step that fills Q0's block they
+    // are Q1's copy and Q0's block, and a later request with Q1's prompt
+    // hits through Q1's copy. Its first allocation then takes 6 blocks: the
+    // two hit blocks, a copy block, the ring block, the state hit block and
+    // a new state block.
     for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let mut core = hash_below_block_core(version, 1);
         let mut now = 0.0;
@@ -8871,8 +8875,8 @@ fn grouped_request_counts_the_free_holder_of_a_tail_key_that_output_tokens_moved
     // v0.31.0 the first block of the key at 60 is Q0's block, which Q0 holds,
     // so Q2 needs 4 blocks and is admitted in pass 6. In both cases the pool
     // evicts no key that Q2 hits: the blocks that Q0 takes in pass 6 come
-    // from the free blocks without a key, and vLLM evicts there only the
-    // state at 32.
+    // from the free blocks without a key. The passes of the admissions are
+    // derived from these rules.
     for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let mut core = hash_below_block_core_of(version, 10);
         let mut now = 0.0;
@@ -9037,7 +9041,8 @@ fn grouped_output_token_blocks_of_a_finished_request_are_evicted_tail_first() {
     // blocks are evicted first (v0.31 kv_cache_manager.py:616-625, v0.32
     // :620-629, v0.33 :629-638). B needs cdiv(9, 4) = 3 blocks: the 2 free
     // ones and the oldest cached one, the block of A that ends at 12. The
-    // next turn of A (16 tokens) then hits 8 tokens.
+    // next turn of A (16 tokens) then hits 8 tokens. These values are derived
+    // from the rule.
     for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let mut full = group("full", 4, 8, None);
         full.prefix_cacheable = Some(true);
@@ -9080,7 +9085,7 @@ fn grouped_decode_rank_local_prefix_reaches_the_blocks_that_output_tokens_filled
     // decodes 30 tokens. The next turn has 80 tokens, cdiv(80, 32) = 3
     // blocks. Its local prefix is the 64 tokens of the two cached blocks
     // (v0.31 and v0.32 kv_cache_manager.py:346-351, v0.33 :352-358), so
-    // one block moves.
+    // one block moves. These values are derived from the rule.
     for version in ["0.31.0", "0.32.0", "0.33.0"] {
         for batches in [1, 2] {
             let case = format!("{version} batches {batches}");
@@ -9140,7 +9145,7 @@ fn grouped_prefill_rank_caches_no_block_that_its_sampled_token_fills() {
     // never computes. A source of 63 prompt tokens knows 64 tokens then, two
     // blocks of 32, with 63 computed: only the block that ends at 32 gets a
     // key (v0.31 kv_cache_manager.py:608-612, v0.32 :612-616, v0.33
-    // :621-625).
+    // :621-625). These values are derived from the rule.
     for version in ["0.31.0", "0.32.0", "0.33.0"] {
         for batches in [1, 2] {
             let case = format!("{version} batches {batches}");

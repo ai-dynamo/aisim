@@ -609,20 +609,18 @@ fn grouped_prefix_request_preempted_after_output_tokens_resumes_on_its_own_block
     // count (v0.31 kv_cache_manager.py:549-556, v0.32 :552-559, v0.33
     // :561-568), so a step of the long request after its first chunk needs
     // the hit block, the block before it and a new block in each state
-    // group. In pools of 19 to 22 blocks the long request is preempted after
-    // it has output tokens past the block that ends at 36, its replay
+    // group. In pools of 19 to 22 blocks replay preempts the long request
+    // after it has output tokens past the block that ends at 36, its replay
     // boundary. The block that ends at 40 holds prompt and output tokens.
-    // vLLM hashes output tokens (v0.31, v0.32 and v0.33 request.py:272-288)
-    // and caches that block when a step fills it (v0.31
-    // kv_cache_manager.py:608-612, v0.32 :612-616, v0.33 :621-625). So a
-    // resumed life has a junction at 40 (v0.31 and v0.32
-    // kv_cache_manager.py:312-318, v0.33 :319-325), keeps each state there,
-    // and the life after it hits 40. Run on its own scheduler code at v0.31.0
-    // and v0.33.0, vLLM completes every two-request run of larger blocks
-    // that reaches this state. No run of vLLM's scheduler exists for this
-    // small shape, so the test asserts only that both requests complete,
-    // well before the cap of 10 s of simulated time, and not how often the
-    // long request is preempted.
+    // vLLM hashes output tokens (v0.31, v0.32 and v0.33 request.py:272-288),
+    // and replay gives that block its key in the pass that fills it. With
+    // two batches vLLM gives the key only in the request's next
+    // `allocate_slots` call that succeeds (v0.31 kv_cache_manager.py:574-576
+    // and :608-612, v0.32 :577-579 and :612-616, v0.33 :586-588 and
+    // :621-625), so the lives of the long request can differ from vLLM's.
+    // The test pins only that the replay ends: both requests complete, well
+    // before the cap of 10 s of simulated time. It does not pin how often
+    // replay preempts either request.
     for version in ["0.31.0", "0.32.0", "0.33.0"] {
         for pages in 19..=22 {
             let mut long = request("long", 0.0, 38, 5);
@@ -699,10 +697,10 @@ fn grouped_prefix_request_preempted_after_output_tokens_is_preempted_as_often_as
     // 4-token ring and four state groups, max_model_len 26,112: vLLM's
     // startup count is 12 + 1 + 4 x 2 = 21 blocks, and the pool has 29. A
     // has 2,162 prompt tokens and 60 output tokens at 0 ms, L has 21,758
-    // prompt tokens and 30 output tokens at 13 ms, after the third pass.
-    // vLLM's scheduler, run on its own code at v0.31.0 and v0.33.0 with this
-    // layout and L added before its fourth engine step, preempts L three
-    // times and A never, and both complete:
+    // prompt tokens and 30 output tokens at 13 ms; replay admits L in its
+    // fifth pass, at 16 ms. With L added before vLLM's fifth engine step
+    // (counted from one), the rules below preempt L three times and A never,
+    // and both complete. These values are derived from the rules:
     // - L's prefill ends while A decodes. When A's step from 2,176 to 2,177
     //   tokens needs a new attention block and a new block in each state
     //   group, 5 blocks, and 4 are free, vLLM preempts L, the last running
@@ -719,7 +717,7 @@ fn grouped_prefix_request_preempted_after_output_tokens_is_preempted_as_often_as
     //   group keeps its state there (v0.31 and v0.32 single:506-531, v0.33
     //   single:508-535). It preempts itself as life 2 did.
     // - Life 4 hits 21,760 tokens and decodes to the end.
-    for version in ["0.31.0", "0.33.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let mut a = request("a", 0.0, 2162, 60);
         a.input_token_ids = Some((1_000_000..1_002_162).collect());
         let mut l = request("l", 13.0, 21_758, 30);
@@ -732,6 +730,64 @@ fn grouped_prefix_request_preempted_after_output_tokens_is_preempted_as_often_as
             [0, 3],
             "{version}"
         );
+    }
+}
+
+#[test]
+fn grouped_prefix_request_that_preempts_itself_after_its_output_tokens_fill_a_block_keeps_the_key()
+{
+    // GLM-shaped groups of 2,176-token blocks with the hash block 2,176, a
+    // 4-token ring and four state groups, max_model_len 6,528: vLLM's startup
+    // count is 3 + 1 + 4 x 2 = 12 blocks, and the pool has 16. F has 2,300
+    // prompt tokens and 300 output tokens at 0 ms, S has 2,170 prompt tokens
+    // and 30 output tokens at 50 ms. The values below are replay's, derived
+    // from its rule:
+    // - S's sixth output token fills the full-attention block that ends at
+    //   2,176, and replay gives that block its key in the pass that fills it,
+    //   with one batch and with two. S's step to 2,177 tokens needs a new
+    //   attention block and a new block in each state group, 5, and finds 3,
+    //   so S, the last running request, preempts itself (v0.31 sched:765-771,
+    //   v0.32 :796-802, v0.33 :932-938).
+    // - Life 2 hits 0 tokens with the junction 2,176, because no state group
+    //   holds a state at 2,176. Its chunk stops at the junction, each state
+    //   group keeps its state there, and S preempts itself as life 1 did.
+    // - Life 3 is admitted when F ends, hits 2,176 tokens and decodes to the
+    //   end.
+    // So replay readmits S twice with one batch and with two.
+    // With two batches vLLM preempts S once more. Its `allocate_slots`
+    // caches the blocks of min(computed + new, request.num_tokens) tokens
+    // (v0.31 kv_cache_manager.py:608-612, v0.32 :612-616, v0.33 :621-625),
+    // and `request.num_tokens` is one short while the sampled token of the
+    // step in flight is not appended. So the block that the sixth output
+    // token fills gets its key in S's next `allocate_slots` call, and only if
+    // that call succeeds: the capacity test returns before the cache step
+    // (v0.31 :574-576, v0.32 :577-579, v0.33 :586-588). The cache step of the
+    // processed outputs skips a request that is not running (v0.31 and
+    // v0.32 sched/async_scheduler.py:73-77, v0.33 sched/scheduler.py:2407-2415).
+    // S is preempted in exactly that next call, so vLLM frees the block
+    // without the key, and its life 2 hits 0 tokens with no junction. This
+    // test pins replay's value: replay does not model that the key is lost.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        for async_scheduling in [true, false] {
+            let case = format!("{version} async {async_scheduling}");
+            let mut f = request("f", 0.0, 2300, 300);
+            f.input_token_ids = Some((1_000_000..1_002_300).collect());
+            let mut s = request("s", 50.0, 2170, 30);
+            s.input_token_ids = Some((2_000_000..2_002_170).collect());
+            let mut spec = aggregated_state_spec(vec![f, s], version, 2176, true, 6528, 2720, 16);
+            if !async_scheduling {
+                spec.engine["rank"]["async_scheduling"] = false.into();
+            }
+            let report = run_within_60_s(spec);
+            assert_eq!(report.request_counts.completed_requests, 2, "{case}");
+            assert_eq!(
+                [record(&report, "f"), record(&report, "s")].map(|record| record.readmission_count),
+                [0, 2],
+                "{case}"
+            );
+            // The largest hit of S is the one of life 3.
+            assert_eq!(record(&report, "s").reused_input_tokens, 2176, "{case}");
+        }
     }
 }
 
@@ -1849,7 +1905,7 @@ fn grouped_decode_rank_waits_for_blocks_when_a_preempted_request_hits_its_own_bl
     // activation, at 181 ms, and h90 at 187 ms. The blocks of h84 are free
     // after the pass at 181 ms is formed, so the pass at 183 ms readmits h14
     // with its 16 cached tokens, and h14 emits its last five outputs from
-    // 185 to 193 ms.
+    // 185 to 193 ms. These times and counts are derived from the rules.
     let requests = [84u32, 90, 14]
         .iter()
         .enumerate()
@@ -1939,13 +1995,17 @@ fn grouped_decode_rank_readmits_a_request_whose_pool_lost_a_visible_key() {
     // always with 6 blocks in use. The first and the second time also have 5
     // cached blocks each, but one of the 4 visible keys left the pool
     // between them: the second turn takes the oldest cached block, the last
-    // copy of the key of g3 at 4,352 tokens. So g3 makes a third turn, as
-    // vLLM does. That turn has its junction at 2,176 tokens and caches 4
-    // more blocks, the states at the junction. The 4,412 tokens of g3 then
-    // hit 2,176 tokens. They need 2 new attention blocks and the hit block,
-    // the ring block, and a new block and the hit block in each of the 4
-    // state groups: 12 blocks, and 10 are free. So g3 waits. When g2 ends,
-    // the readmission of g3 hits 2,176 tokens.
+    // copy of the key of g3 at 4,352 tokens. So g3 makes a third turn. That
+    // turn has its junction at 2,176 tokens (v0.31 and v0.32
+    // `vllm/v1/core/kv_cache_manager.py:312-321`, v0.33 `:319-328`) and
+    // caches 4 more blocks, the states at the junction. The 4,412 tokens of
+    // g3 then hit 2,176 tokens. They need 2 new attention blocks and the hit
+    // block, the ring block, and a new block and the hit block in each of
+    // the 4 state groups: 12 blocks, and 10 are free (v0.31
+    // `vllm/v1/core/single_type_kv_cache_manager.py:261-268`, `:1813-1816`,
+    // v0.32 `:258-265`, `:1775-1778`, v0.33 `:259-266`, `:1792-1795`). So g3
+    // waits. When g2 ends, the readmission of g3 hits 2,176 tokens. These
+    // times and counts are derived from the rules.
     let requests = [
         (2178, 2500, 126.0),
         (6000, 50, 8.0),

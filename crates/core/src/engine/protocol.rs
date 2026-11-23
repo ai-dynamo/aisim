@@ -315,7 +315,10 @@ pub struct CacheTierAttribution {
 pub struct Admission {
     /// Admitted request.
     pub request_id: Uuid,
-    /// Prompt tokens reused from all KV-cache tiers.
+    /// Prompt tokens reused from all KV-cache tiers. For a readmission on a
+    /// rank with KV cache groups, the tokens of the request that the
+    /// admission served from the cache, which can include its own output
+    /// tokens.
     pub reused_input_tokens: usize,
     /// Tier provenance captured before a host-loaded prefix becomes G1.
     pub cache_tier_attribution: Option<CacheTierAttribution>,

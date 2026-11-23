@@ -1137,33 +1137,38 @@ impl GroupedPrefixCoordinator {
 
     /// The local prefix of a decode rank that loads a P/D handoff. The NIXL
     /// connector supports divergent hits (V31 `nixl/connector.py:80-82`, V32
-    /// `nixl/connector.py:83-85`), so the scheduler takes the local prefix
-    /// from `get_computed_blocks_for_connector` (V31 `sched:529-539`, V32
-    /// `sched:558-568`, `mgr:323-369`). Its rules, in order:
+    /// and v0.33 `nixl/connector.py:83-85`), so the scheduler takes the local
+    /// prefix from `get_computed_blocks_for_connector` (V31 `sched:529-539`,
+    /// V32 `sched:558-568`, v0.33 `sched:664-676`; V31 and V32
+    /// `mgr:323-369`, v0.33 `mgr:330-378`). Its rules, in order:
     ///
     /// 1. Without Mamba layers or without a full-attention group, the local
     ///    prefix is the hit that every group agrees on, which
-    ///    `find_longest_hit` finds (`mgr:346-351`). The Mamba layers are the
-    ///    prefix-cacheable state groups (`has_mamba_layers`, V31
-    ///    `iface:1568-1574`, V32 `iface:1563-1569`). The full-attention group
-    ///    is the first spec group (V31 `coord:781-788`, V32 `coord:752-759`).
+    ///    `find_longest_hit` finds (V31 and V32 `mgr:346-351`, v0.33
+    ///    `mgr:353-358`). The Mamba layers are the prefix-cacheable state
+    ///    groups (`has_mamba_layers`, V31 `iface:1568-1574`, V32
+    ///    `iface:1563-1569`, v0.33 `iface:1629-1635`). The full-attention
+    ///    group is the first spec group (V31 `coord:781-788`, V32
+    ///    `coord:752-759`, v0.33 `coord:762-769`).
     /// 2. Otherwise each spec group is looked up alone, capped at
-    ///    `num_tokens - 1` (`mgr:356-359`, V31 `coord:979-1011`, V32
-    ///    `coord:933-977`).
+    ///    `num_tokens - 1` (V31 and V32 `mgr:356-359`, v0.33 `mgr:363-368`;
+    ///    V31 `coord:979-1011`, V32 `coord:933-977`, v0.33
+    ///    `coord:943-987`).
     /// 3. If another group hits deeper than the full-attention group, the
-    ///    local prefix is again the hit that every group agrees on
-    ///    (`mgr:360-364`).
+    ///    local prefix is again the hit that every group agrees on (V31 and
+    ///    V32 `mgr:360-364`, v0.33 `mgr:369-373`).
     /// 4. Otherwise the local prefix is the full-attention hit, with a
-    ///    junction of 0, and each group keeps its own hit blocks
-    ///    (`mgr:366-369`).
+    ///    junction of 0, and each group keeps its own hit blocks (V31 and V32
+    ///    `mgr:366-369`, v0.33 `mgr:375-378`).
     /// 5. The scheduler floors the local prefix to the scheduler block before
-    ///    it asks the connector (V31 `sched:941-952`, V32 `sched:971-982`). A
-    ///    load that reaches past the local prefix truncates the hit blocks of
-    ///    every group to the floor (V31 `sched:974-985`, V32
-    ///    `sched:1007-1018`). Otherwise the scheduler keeps the sub-block tail
-    ///    and loads nothing (V31 `sched:986-992`, V32 `sched:1019-1025`). A
-    ///    Mamba list keeps `min(floor / B, len)` blocks (V31 `mgr:852-853`,
-    ///    V32 `mgr:826-827`).
+    ///    it asks the connector (V31 `sched:941-952`, V32 `sched:971-982`,
+    ///    v0.33 `sched:1131-1142`). A load that reaches past the local prefix
+    ///    truncates the hit blocks of every group to the floor (V31
+    ///    `sched:974-985`, V32 `sched:1007-1018`, v0.33 `sched:1167-1178`).
+    ///    Otherwise the scheduler keeps the sub-block tail and loads nothing
+    ///    (V31 `sched:986-992`, V32 `sched:1019-1025`, v0.33
+    ///    `sched:1179-1185`). A Mamba list keeps `min(floor / B, len)` blocks
+    ///    (V31 `mgr:852-853`, V32 `mgr:826-827`, v0.33 `mgr:835-836`).
     ///
     /// This finder always floors, so the decode rank loads the sub-block tail
     /// of a fine-grained hit again, also where vLLM keeps it. With a hash
@@ -1175,9 +1180,10 @@ impl GroupedPrefixCoordinator {
     ///
     /// Only the full-attention groups get hit blocks to pin. On a decode rank
     /// vLLM drops each group's hit blocks below its skipped tokens before it
-    /// touches them (V31 `single:295-316`, V32 `single:292-313`). A Mamba
-    /// group skips all but the last computed token (V31 `single:1990-1995`,
-    /// V32 `single:1954-1959`), so vLLM never holds a lagging state hit block,
+    /// touches them (V31 `single:295-316`, V32 `single:292-313`, v0.33
+    /// `single:293-314`). A Mamba group skips all but the last computed token
+    /// (V31 `single:1990-1995`, V32 `single:1954-1959`, v0.33
+    /// `single:1971-1976`), so vLLM never holds a lagging state hit block,
     /// though its two admission tests count it. So each state group with an
     /// own hit gets `GroupHitBlocks::DroppedState`, which the tests count and
     /// `pin_hit` skips. A state hit above the floor gets none, as the
@@ -2118,7 +2124,16 @@ impl GroupedPrefixCoordinator {
     /// Run the cache step of `computed_after` computed tokens: publish the
     /// blocks that vLLM caches at that count and apply the default retention
     /// (`single:476-560`, `single:864-880`, `single:1614-1622`,
-    /// `single:1658-1675`, v0.32 `single:2017-2066`).
+    /// `single:1658-1675`, v0.32 `single:2017-2066`). With two batches vLLM
+    /// caches a block that a sampled token fills one step later: in the
+    /// request's next `allocate_slots` call if that call succeeds (v0.31
+    /// `mgr:574-576` and `mgr:608-612`, v0.32 `mgr:577-579` and
+    /// `mgr:612-616`, v0.33 `mgr:586-588` and `mgr:621-625`), or, for a
+    /// request that still runs, when vLLM processes the outputs of the
+    /// filling step. Replay
+    /// publishes that block in the pass that fills it, and keeps it for a
+    /// request that is preempted in the next pass, where vLLM frees it
+    /// without its key.
     pub(crate) fn finalize(
         &mut self,
         pool: &mut GroupedBlockPool,

@@ -3354,6 +3354,38 @@ mod tests {
     }
 
     #[test]
+    fn grouped_block_moves_behind_its_first_key_only_when_a_block_end_key_follows_an_inside_key() {
+        // A block moves behind the other blocks of its first key only when
+        // its first key lies inside it and it gets a key at its end, as a
+        // block in vLLM does when it gets its full key
+        // (`grouped_block_that_gets_its_full_key_becomes_the_last_holder_of_its_other_key`).
+        // The pool keeps the order in the two other cases, which the cache step
+        // of a grouped prefix never makes: a second key inside a block whose
+        // first key lies inside it, and a second key at the end of a block
+        // whose first key is its full key.
+        let key = |hash| CacheKey::Grouped { group: 0, hash };
+        let inside = |offset| Some(KeyInBlock { first: 14, offset });
+        let mut pool = VllmBlockPool::new(3);
+        let mut reservation = reserve(&mut pool, &[], 1).reservation;
+        let partial = pool.allocate_private(&mut reservation);
+        pool.cancel(reservation);
+        assert!(pool.cache_private_key_at(partial, key(17), inside(12)));
+        let full = grouped_copy(&mut pool, 0, 18);
+        assert!(!pool.cache_grouped_alias(full, key(17), inside(12)));
+        let other = grouped_copy(&mut pool, 0, 18);
+        assert_eq!(grouped_key_copies(&pool, 17), [partial, full]);
+        assert_eq!(grouped_key_copies(&pool, 18), [full, other]);
+        // A second key inside the block whose first key lies inside it.
+        assert!(pool.cache_grouped_alias(partial, key(16), inside(8)));
+        assert_eq!(grouped_key_copies(&pool, 17), [partial, full]);
+        // A second key at the end of the block whose first key is its full
+        // key.
+        assert!(pool.cache_grouped_alias(full, key(20), None));
+        assert_eq!(grouped_key_copies(&pool, 18), [full, other]);
+        pool.assert_hash_index_consistent();
+    }
+
+    #[test]
     fn evicting_a_grouped_copy_removes_every_key_of_the_copy() {
         // vLLM evicts a block with every hash that it holds (v0.31.0
         // block_pool.py:593-612, :747, v0.32.0 :590-609, :744, v0.33.0
