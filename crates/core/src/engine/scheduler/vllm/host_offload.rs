@@ -4863,8 +4863,6 @@ mod tests {
         // seen it yet. A KV handoff destination then waits for capacity.
         // Cancelling the follow-up returns its destination blocks, so the
         // waiting destination must be retried and reserved at once.
-        use crate::engine::handoff::HandoffId;
-        use crate::engine::scheduler::{SchedulerCommand, SchedulerLifecycleEvent};
         let mut run = PollRun::new(G2Connector::OffloadingV032, 25.0, true, true);
         run.submit(3, (0..30).collect(), 2);
         let follow_up = Uuid::from_u128(3);
@@ -4875,6 +4873,31 @@ mod tests {
             run.step();
         }
         assert!(run.core.test_awaits_poll(follow_up));
+        check_cancel_retries_destination(&mut run, follow_up);
+    }
+
+    #[test]
+    fn cancelling_a_load_still_copying_after_its_issuing_pass_retries_a_destination() {
+        let mut run = PollRun::new(G2Connector::OffloadingV032, 8.0, false, true);
+        run.submit(9, (900..906).collect(), 2);
+        let start = run.now;
+        run.step();
+        run.submit_at(3, (0..30).collect(), 2, start + 20.0);
+        run.step();
+
+        // Request 9's last decode issued the restore. The connector starts
+        // the copy at the end of that pass, with no further pass to run.
+        let follow_up = Uuid::from_u128(3);
+        assert!(!run.core.is_ready());
+        assert!(run.core.test_has_host_load(follow_up));
+        assert!(!run.core.test_awaits_poll(follow_up));
+        assert_eq!(run.core.next_internal_deadline_ms(), Some(run.now + 8.0));
+        check_cancel_retries_destination(&mut run, follow_up);
+    }
+
+    fn check_cancel_retries_destination(run: &mut PollRun, follow_up: Uuid) {
+        use crate::engine::handoff::HandoffId;
+        use crate::engine::scheduler::{SchedulerCommand, SchedulerLifecycleEvent};
         let free = 16 - run.core.kv_manager.num_active_blocks();
         let handoff_id = HandoffId::from(Uuid::from_u128(40));
         let tokens = 4 * (free + 1);
