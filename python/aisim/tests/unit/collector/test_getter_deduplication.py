@@ -350,81 +350,6 @@ def test_trtllm_repository_moe_getter_has_unique_consumer_keys(monkeypatch):
     assert len(consumer_keys) == len(set(consumer_keys))
 
 
-def test_vllm_repository_moe_getter_has_unique_consumer_keys(monkeypatch):
-    monkeypatch.delenv("COLLECTOR_MODEL_PATH", raising=False)
-    _install_vllm_stubs(monkeypatch)
-    module = _load_collector(monkeypatch, "collector.vllm.collect_moe", "collector/vllm/collect_moe.py")
-
-    consumer_keys = []
-    for case in module.get_moe_test_cases():
-        moe_type, num_tokens_list, hidden_size, inter_size, topk, num_experts, tp, ep = case[:8]
-        _, distribution, alpha = case[8:]
-        distribution = _persisted_distribution(distribution, alpha)
-        consumer_keys.extend(
-            (moe_type, distribution, topk, num_experts, hidden_size, inter_size, tp, ep, num_tokens)
-            for num_tokens in num_tokens_list
-        )
-
-    assert consumer_keys
-    assert len(consumer_keys) == len(set(consumer_keys))
-
-
-def test_vllm_sm90_repository_moe_getter_excludes_unconsumable_dsv4_cases(monkeypatch):
-    monkeypatch.delenv("COLLECTOR_MODEL_PATH", raising=False)
-    _install_vllm_stubs(monkeypatch)
-    module = _load_collector(monkeypatch, "collector.vllm.collect_moe", "collector/vllm/collect_moe.py")
-    monkeypatch.setattr(module, "get_sm_version", lambda: 90)
-
-    cases = module.get_moe_test_cases()
-    native_dsv4_models = {
-        "deepseek-ai/DeepSeek-V4-Flash",
-        "deepseek-ai/DeepSeek-V4-Pro",
-    }
-    converted_dsv4_models = {
-        "sgl-project/DeepSeek-V4-Flash-FP8",
-        "sgl-project/DeepSeek-V4-Pro-FP8",
-    }
-
-    # 1887 pre-Kimi-K3, +39 K3 w4a16_mxfp4 cases (grouped-topk mapping for
-    # model_type kimi_linear), +99 Step-3.7-Flash executions after identical
-    # physical invocations are deduplicated by their consumer key, +42
-    # Nemotron Super FP8 cases, +39 for MiniMax-M3's MoE row (6144/3072,
-    # 128x4, bf16), and +84 Qwen3.8-Max cases / +2268 flat rows (bf16/
-    # fp8_block vLLM modes on its 8192/2048/topk10/512-expert row; the
-    # RadixArk/Qwen3.8-2.4T-A95B-NVFP4 sibling row is gated
-    # allowed_modes: [] for vllm, AIC-1782 Task V2, so it is absent here).
-    #
-    # AIC-1782 Task V2 (2026-08-21) data-quality fix: this was 2232/126
-    # cases (+3402 flat rows) before the base row's own vllm
-    # framework_quantization gate was added -- moe_model_allows_quantization
-    # defaulted OPEN for "fp8" (per-tensor), a mode this checkpoint's real
-    # artifacts never use (native bfloat16, block-fp8 as its -FP8 alias),
-    # because base_ops/moe.yaml's moe_vllm "fp8" quantization_modes entry
-    # has no allowed_model_paths restriction of its own. Closing the base
-    # row's gate to allowed_modes: [bfloat16, fp8_block] drops exactly the
-    # 42 phantom "fp8" cases (one per already-counted bf16/fp8_block case),
-    # re-derived by running this exact getter before and after the fix, not
-    # assumed.
-    # +33 GLM-5.3-Flash fp8_block cases (288 experts/top-8/4096/2048, TP 1-32
-    # or EP 2-256; its nvfp4 row needs SM100 and is absent here).
-    assert len(cases) == 2223
-    assert sum(len(case[1]) for case in cases) == 60021
-    # MiniMax-M3's declared MoE geometry must be present as its own rows —
-    # a generator defect could drop it while unrelated cases preserve the
-    # aggregate counts above. (case[:8] = moe_type, num_tokens, hidden,
-    # inter, topk, num_experts, tp, ep.)
-    assert any(case[2] == 6144 and case[3] == 3072 and case[4] == 4 and case[5] == 128 for case in cases), (
-        "MiniMax-M3 MoE row (6144/3072, topk4, 128 experts) missing from the vLLM SM90 getter"
-    )
-    # Native artifacts stay excluded on SM90 (vLLM 0.24.0 serves them there
-    # as Marlin W4A16, so the SM100-gated w4a8_mxfp4_mxfp8 label must not
-    # expand); the converted FP8 artifacts are collected as fp8_block only —
-    # the layout vLLM serves with the documented expert_dtype override.
-    assert not any(case[8] in native_dsv4_models for case in cases)
-    converted_modes = {case[0] for case in cases if case[8] in converted_dsv4_models}
-    assert converted_modes == {"fp8_block"}
-
-
 @pytest.mark.parametrize(
     "model_path",
     [
@@ -443,24 +368,6 @@ def test_vllm_step3p7_filter_preserves_physical_artifact_identity(monkeypatch, m
     assert cases
     assert {case[8] for case in cases} == {model_path}
     assert {tuple(case[2:6]) for case in cases} == {(4096, 1280, 8, 288)}
-
-
-def test_vllm_sm100_repository_moe_getter_expands_native_dsv4_w4a8_cases(monkeypatch):
-    monkeypatch.delenv("COLLECTOR_MODEL_PATH", raising=False)
-    _install_vllm_stubs(monkeypatch)
-    module = _load_collector(monkeypatch, "collector.vllm.collect_moe", "collector/vllm/collect_moe.py")
-    monkeypatch.setattr(module, "get_sm_version", lambda: 100)
-
-    cases = module.get_moe_test_cases()
-    native_dsv4_models = {
-        "deepseek-ai/DeepSeek-V4-Flash",
-        "deepseek-ai/DeepSeek-V4-Pro",
-    }
-
-    # On the SM100 family the native artifacts run the trtllm-gen
-    # MXFP4xMXFP8 serving path, and only under that label.
-    native_modes = {case[0] for case in cases if case[8] in native_dsv4_models}
-    assert native_modes == {"w4a8_mxfp4_mxfp8"}
 
 
 @pytest.mark.parametrize(

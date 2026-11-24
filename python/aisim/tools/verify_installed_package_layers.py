@@ -176,13 +176,13 @@ def _exercise_engine() -> None:
     from aisim_core.sdk.engine import EngineHandle
 
     engine = EngineHandle.compile(
-        "MiniMaxAI/MiniMax-M2.5",
+        "Qwen/Qwen3-30B-A3B",
         "b200_sxm",
         "vllm",
         backend_version="0.24.0",
-        tp_size=8,
+        tp_size=4,
         moe_tp_size=1,
-        moe_ep_size=8,
+        moe_ep_size=4,
     )
     prefill_ms = engine.predict_prefill_latency(1, 1024, 0)
     decode_ms = engine.predict_decode_latency(1, 1024, 2)
