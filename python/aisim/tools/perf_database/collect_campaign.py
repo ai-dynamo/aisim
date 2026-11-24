@@ -359,12 +359,11 @@ def run_shard(
         rc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT).returncode
         log.write(f"### {time.strftime('%FT%T')} exit={rc}\n")
     parquets = sorted(p.name for p in d.glob("*.parquet"))
-    if rc == 0 and _native_k31(plan.backend, shard.op):
-        if _native_phase_table(shard.op) not in parquets:
-            rc = 1
-            (d / "DONE").unlink(missing_ok=True)
-            with (d / "run.log").open("a") as log:
-                log.write("No native phase table was published. Inspect the checkpoint and case diagnostics.\n")
+    if rc == 0 and _native_k31(plan.backend, shard.op) and _native_phase_table(shard.op) not in parquets:
+        rc = 1
+        (d / "DONE").unlink(missing_ok=True)
+        with (d / "run.log").open("a") as log:
+            log.write("No native phase table was published. Inspect the checkpoint and case diagnostics.\n")
     if rc == 0:
         (d / "DONE").touch()
     _log(root, {"event": "end", "mode": mode, "shard": shard.key, "gpu": gpu, "exit": rc, "parquet": parquets})
@@ -429,9 +428,9 @@ def run_campaign(
     todo = []
     for s in plan.shards:
         st = shard_state(root, s, plan.backend)
-        if mode == "run" and (shard_dir(root, s) / "DONE").exists():
-            if st == "finalized" or not _native_k31(plan.backend, s.op):
-                continue
+        completed = st == "finalized" or (st == "done-no-parquet" and not _native_k31(plan.backend, s.op))
+        if mode == "run" and completed and (shard_dir(root, s) / "DONE").exists():
+            continue
         if mode == "finalize" and st != "done-no-parquet":
             continue
         checkpoint = shard_dir(root, s) / ".ckpt" / plan.backend / f"{plan.backend}.{s.op}.json"
