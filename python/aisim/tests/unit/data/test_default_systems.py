@@ -5,6 +5,7 @@
 
 import importlib.util
 import re
+import shutil
 import tomllib
 from pathlib import Path
 
@@ -63,7 +64,7 @@ def test_pin_file_names_a_full_commit_sha():
     assert re.fullmatch(r"[0-9a-f]{40}", pin["revision"])
 
 
-def test_composes_root_from_the_pinned_revision_and_reuses_it(published):
+def test_composes_root_from_the_pinned_revision_and_reuses_it(published, monkeypatch):
     transport = DirTransport(published)
     first = Path(ds.default_systems_path(transport=transport))
     assert (first / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet").is_file()
@@ -71,10 +72,21 @@ def test_composes_root_from_the_pinned_revision_and_reuses_it(published):
     assert (first / "h200_sxm.yaml").is_file()  # packaged specs travel with the data
     assert transport.opened
 
+    shutil.rmtree(first)  # only the root is gone: the downloaded dataset rebuilds it
     ds.clear_default_systems_cache()
     again = DirTransport(published)
     assert Path(ds.default_systems_path(transport=again)) == first
     assert again.opened == []  # warm cache: no network
+
+    ds.clear_default_systems_cache()  # as in a new process
+    monkeypatch.setattr(ds, "_ensure_tree", lambda *args: pytest.fail("planned and re-hashed the cached dataset"))
+    assert ds.default_systems_path() == str(first)
+
+
+def test_a_branch_revision_is_resolved_through_the_dataset(published, monkeypatch):
+    monkeypatch.setenv(ds.DATASET_ENV, "o/n@main")
+    root = Path(ds.default_systems_path(transport=DirTransport(published)))
+    assert root.name.startswith(f"o__n-{SHA}-")  # named by the commit, not by the branch
 
 
 def test_offline_with_cold_cache_fails_instead_of_falling_back(monkeypatch):
