@@ -798,6 +798,43 @@ def _workflow(name: str) -> dict:
         return yaml.load(handle, Loader=yaml.BaseLoader)
 
 
+def test_commit_authorship_rechecks_retargeted_history(tmp_path: Path) -> None:
+    workflow = _workflow("commit-authorship.yml")
+    assert set(workflow["on"]["pull_request"]["types"]) == {"opened", "synchronize", "reopened", "edited"}
+    job = workflow["jobs"]["commit-authorship"]
+    assert job["env"]["BASE_SHA"] == (
+        "${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}"
+    )
+    assert job["env"]["HEAD_SHA"] == (
+        "${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}"
+    )
+    command = next(step["run"] for step in job["steps"] if step.get("name") == "Check new commits")
+    checker = tmp_path / ".github" / "commit-policy" / "check.py"
+    checker.parent.mkdir(parents=True)
+    shutil.copyfile(REPOSITORY_ROOT / ".github" / "commit-policy" / "check.py", checker)
+    _git(tmp_path, "init", "--quiet")
+    main = _commit_file(tmp_path, "main.txt", "main\n")
+    _git(tmp_path, "commit", "--quiet", "--allow-empty", "--author=Codex <codex@openai.com>", "-m", "parent PR")
+    parent = _git(tmp_path, "rev-parse", "HEAD").stdout.strip()
+    head = _commit_file(tmp_path, "head.txt", "human child PR\n")
+    # Retarget the same head from the parent PR to main. The parent commit
+    # becomes newly included, so the workflow must run again with the new base.
+    for base, expected in ((parent, 0), (main, 1)):
+        result = subprocess.run(
+            ["bash", "-eo", "pipefail", "-c", command],
+            cwd=tmp_path,
+            env={**os.environ, "BASE_SHA": base, "HEAD_SHA": head},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == expected, result.stdout + result.stderr
+        if expected:
+            assert f"{parent}: forbidden AI attribution: author: Codex <codex@openai.com>" in result.stderr
+        else:
+            assert "Checked 1 commit(s): no known AI authorship found." in result.stdout
+
+
 def test_nvskills_request_events():
     assert _workflow("request-nvskills-ci.yml")["on"] == {
         "issue_comment": {"types": ["created"]},
