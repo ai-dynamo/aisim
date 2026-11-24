@@ -542,6 +542,23 @@ def test_context_attention_kernel_stub_matches_native_contract(namespace: str) -
 
 
 @pytest.mark.unit
+def test_fastafd_stage_stub_matches_native_contract() -> None:
+    root = importlib.resources.files("aisimulate_core")
+    stub = ast.parse((root / "_native.pyi").read_text(encoding="utf-8"))
+    model = next(
+        node for node in stub.body if isinstance(node, ast.ClassDef) and node.name == "RustForwardPassPerfModel"
+    )
+    method = next(
+        node for node in model.body if isinstance(node, ast.FunctionDef) and node.name == "estimate_fastafd_stage"
+    )
+    native_class = importlib.import_module("aisimulate_core").RustForwardPassPerfModel
+    parameters = inspect.signature(native_class.estimate_fastafd_stage).parameters
+    assert [arg.arg for arg in method.args.args] == list(parameters) == ["self", "batch"]
+    assert ast.unparse(method.args.args[1].annotation) == "int"
+    assert ast.unparse(method.returns) == "str"
+
+
+@pytest.mark.unit
 def test_static_phase_diagnostics_stub_matches_native_contract() -> None:
     root = importlib.resources.files("aisimulate_core")
     stub = ast.parse((root / "_native.pyi").read_text(encoding="utf-8"))

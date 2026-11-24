@@ -23,6 +23,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use parquet::basic::{ConvertedType, LogicalType, Type as PhysicalType};
 use parquet::file::reader::{ChunkReader, FileReader, SerializedFileReader};
 use parquet::record::{Row, RowAccessor};
 
@@ -148,6 +149,33 @@ impl<R: ChunkReader + 'static> PerfReader<R> {
     /// that are present in some perf-DB versions and absent in others.
     pub fn col_optional(&self, name: &str) -> Option<usize> {
         self.column_names.iter().position(|n| n == name)
+    }
+
+    /// A record's Long value can also represent a timestamp. Count columns
+    /// must have an integer descriptor, not merely an integer physical value.
+    pub(crate) fn require_signed_int64(&self, column: usize) -> Result<(), AicError> {
+        let descriptor = self
+            .file_reader
+            .metadata()
+            .file_metadata()
+            .schema_descr()
+            .column(column);
+        if descriptor.physical_type() != PhysicalType::INT64
+            || descriptor.logical_type_ref().is_some_and(|logical| {
+                !matches!(logical, LogicalType::Integer(integer) if integer.bit_width == 64 && integer.is_signed)
+            })
+            || !matches!(
+                descriptor.converted_type(),
+                ConvertedType::NONE | ConvertedType::INT_64
+            )
+        {
+            return Err(AicError::PerfDatabase(format!(
+                "FastAFD count column {:?} must be signed INT64 at {}",
+                descriptor.name(),
+                self.path.display()
+            )));
+        }
+        Ok(())
     }
 
     /// Iterate over every row. Errors are surfaced per-row so loaders can

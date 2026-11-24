@@ -434,6 +434,9 @@ impl FastAfdTable {
                 .iter()
                 .map(|name| reader.col(name))
                 .collect::<Result<Vec<_>, _>>()?;
+            for &column in &columns[4..=8] {
+                reader.require_signed_int64(column)?;
+            }
             let latency = reader.col("latency_ms")?;
             let metadata = reader.col("capture_json")?;
             let source = reader.col("source_json")?;
@@ -730,6 +733,15 @@ mod tests {
         float: bool,
         duplicate_latency: bool,
     ) -> bytes::Bytes {
+        parquet_snapshot_with_count_annotation(document, float, duplicate_latency, None)
+    }
+
+    fn parquet_snapshot_with_count_annotation(
+        document: &Value,
+        float: bool,
+        duplicate_latency: bool,
+        count_annotation: Option<(&str, &str)>,
+    ) -> bytes::Bytes {
         use parquet::data_type::{ByteArray, ByteArrayType, DoubleType, FloatType, Int64Type};
         use parquet::file::properties::WriterProperties;
         use parquet::file::writer::SerializedFileWriter;
@@ -768,7 +780,15 @@ mod tests {
                 } else {
                     "BINARY"
                 };
-                let logical_type = if value.is_string() { " (UTF8)" } else { "" };
+                let logical_type = if let Some((column, annotation)) = count_annotation
+                    && name == column
+                {
+                    annotation
+                } else if value.is_string() {
+                    " (UTF8)"
+                } else {
+                    ""
+                };
                 format!("REQUIRED {data_type} {name}{logical_type};")
             })
             .collect::<String>();
@@ -811,6 +831,49 @@ mod tests {
             group.close().unwrap();
         }
         writer.into_inner().unwrap().into()
+    }
+
+    #[test]
+    fn canonical_stage_validates_count_logical_types() {
+        let (file, config) = fixture();
+        for column in [
+            "logical_batch_per_source_rank",
+            "mtp_nextn",
+            "microbatches",
+            "moe_layers",
+            "routed_topk",
+        ] {
+            for annotation in [
+                "",
+                " (INTEGER(64,true))",
+                " (INT_64)",
+                " (TIMESTAMP(NANOS,false))",
+            ] {
+                std::fs::write(
+                    file.path(),
+                    parquet_snapshot_with_count_annotation(
+                        &fixture_document(),
+                        false,
+                        false,
+                        Some((column, annotation)),
+                    ),
+                )
+                .unwrap();
+                let model = ForwardPassPerfModel::best_available(config.clone());
+                if annotation.contains("TIMESTAMP") {
+                    let error = model.unwrap_err().to_string();
+                    assert!(error.contains(column), "{error}");
+                    assert!(error.contains("must be signed INT64"), "{error}");
+                    assert!(error.contains(file.path().to_str().unwrap()), "{error}");
+                } else {
+                    // Synthetic 12 ms / (three layers * two microbatches).
+                    assert_eq!(
+                        model.unwrap().estimate_fastafd_stage(128).unwrap().ffn_ms,
+                        2.0
+                    );
+                }
+            }
+        }
     }
 
     #[test]

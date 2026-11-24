@@ -469,21 +469,46 @@ def test_parquet_entries_and_digest_use_the_same_snapshot(tmp_path, monkeypatch)
 @pytest.mark.parametrize(
     "column", ["logical_batch_per_source_rank", "mtp_nextn", "microbatches", "moe_layers", "routed_topk"]
 )
-@pytest.mark.parametrize("encoding", ["int32", "uint32"])
+@pytest.mark.parametrize("encoding", ["int32", "uint32", "timestamp"])
 def test_rejects_non_int64_parquet_counts(tmp_path, column, encoding):
     import pyarrow as pa
     import pyarrow.parquet as pq
+
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+    from aisimulate_core.sdk.errors import PerfDataNotAvailableError
 
     profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload()))
     path = tmp_path / "stage.parquet"
     profile.write_parquet(path)
     table = pq.read_table(path)
     index = table.schema.get_field_index(column)
-    table = table.set_column(index, column, table[column].cast(getattr(pa, encoding)()))
+    data_type = pa.timestamp("ns") if encoding == "timestamp" else getattr(pa, encoding)()
+    table = table.set_column(index, column, table[column].cast(data_type))
     pq.write_table(table, path)
 
     with pytest.raises(ValueError, match=f"count column '{column}' must be signed INT64"):
         FastAFDMoEStageProfile.load(path)
+    with pytest.raises(PerfDataNotAvailableError, match=f'count column "{column}" must be signed INT64'):
+        RustForwardPassPerfModel.best_available(_canonical_config(path))
+
+
+@pytest.mark.parametrize("location", ["direct", "symlink", "extensionless"])
+def test_lfs_pointer_reports_recovery_before_format_dispatch(tmp_path, location):
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    target = tmp_path / "capture"
+    target.write_bytes(b"version https://git-lfs/spec/v1\noid sha256:" + b"a" * 64 + b"\nsize 1234\n")
+    path = tmp_path / "capture.parquet"
+    if location == "direct":
+        target.rename(path)
+    else:
+        path.symlink_to(target)
+        if location == "extensionless":
+            path = target
+    for load in (FastAFDMoEStageProfile.load, lambda p: RustForwardPassPerfModel.best_available(_canonical_config(p))):
+        with pytest.raises(ValueError, match="unresolved git-lfs pointer.*git lfs pull") as error:
+            load(path)
+        assert str(path.resolve()) in str(error.value)
 
 
 def test_rejects_int64_parquet_latency(tmp_path):

@@ -150,6 +150,7 @@ class FastAFDMoEStageProfile:
 
     @classmethod
     def _from_snapshot(cls, resolved: Path, raw: bytes) -> FastAFDMoEStageProfile:
+        _reject_lfs_pointer(resolved, raw)
         # A symlink's canonical target may have no suffix. Identify Parquet
         # from the captured bytes so saved canonical paths remain loadable.
         if raw.startswith(b"PAR1") or resolved.suffix == ".parquet":
@@ -289,6 +290,7 @@ def _native_profile_snapshot(path: str) -> tuple[bytes, str]:
     """
     resolved = Path(path)
     raw = resolved.read_bytes()
+    _reject_lfs_pointer(resolved, raw)
     digest = hashlib.sha256(raw).hexdigest()
     if raw.startswith(b"PAR1") or resolved.suffix == ".parquet":
         return raw, digest
@@ -296,6 +298,11 @@ def _native_profile_snapshot(path: str) -> tuple[bytes, str]:
     output = io.BytesIO()
     profile.write_parquet(output)
     return output.getvalue(), digest
+
+
+def _reject_lfs_pointer(path: Path, raw: bytes) -> None:
+    if raw.startswith(b"version https://git-lfs"):
+        raise ValueError(f"perf file is an unresolved git-lfs pointer: {path}; run `git lfs pull`")
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

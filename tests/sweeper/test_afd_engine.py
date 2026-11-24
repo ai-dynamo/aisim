@@ -3,6 +3,8 @@
 
 """Deterministic staged AFD foreground-pass tests."""
 
+import math
+
 import pytest
 
 from aisimulate.sweeper.afd_engine import (
@@ -107,6 +109,38 @@ def test_sampled_decode_with_one_microbatch_keeps_serial_cadence(pipeline_model)
     # Two layers, each serial unit averaging A=2 and F=2 ms: 8 ms total.
     assert result.step_latency_ms == pytest.approx(8.0)
     assert result.effective_pipeline_model is AFDPipelineModel.SERIAL
+
+
+@pytest.mark.parametrize("pipeline_model", ["optimistic", "conservative"])
+@pytest.mark.parametrize(
+    "attention_ms,ffn_ms,samples,expected_step",
+    [
+        (1.0, 1e307, ((1.0, 32),), 2e307),
+        (1e307, 1.0, ((1e307, 32),), 2e307),
+        (1.5e307, 1e307, ((1e307, 16), (2e307, 16)), 4e307),
+    ],
+)
+def test_sampled_cadence_stays_finite_before_repeat_normalization(
+    pipeline_model, attention_ms, ffn_ms, samples, expected_step
+):
+    times = _times(
+        attention_ms=attention_ms,
+        ffn_ms=ffn_ms,
+        a_to_f_ms=0.0,
+        f_to_a_ms=0.0,
+        num_layers=1,
+        decode_attention_samples=samples,
+    )
+    result = evaluate_afd_phase(
+        _topology(num_microbatches=2, pipeline_model=pipeline_model),
+        times,
+        input_length=128,
+        output_length=33,
+    )
+    # Two pipeline units: fill=A+F, then one weighted max(A,F) cycle.
+    assert math.isfinite(result.cycle_ms)
+    assert result.step_latency_ms == pytest.approx(expected_step)
+    assert result.tokens_per_second > 0.0
 
 
 def test_foreground_pass_expands_every_stage_and_matches_formula_boundary():

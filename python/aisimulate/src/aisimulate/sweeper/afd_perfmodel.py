@@ -78,7 +78,6 @@ class AFDLayerTimes:
         if not isinstance(self.decode_attention_samples, (tuple, list)):
             raise AFDInfeasible(AFDReasonCategory.INVALID_MEASUREMENT, "invalid decode attention samples")
         samples = []
-        attention_sum = overlap_sum = 0.0
         total_repeat = 0
         for sample in self.decode_attention_samples:
             if not isinstance(sample, (tuple, list)) or len(sample) != 2:
@@ -95,15 +94,26 @@ class AFDLayerTimes:
             ):
                 raise AFDInfeasible(AFDReasonCategory.INVALID_MEASUREMENT, "invalid decode attention sample")
             samples.append((float(ms), repeat))
-            attention_sum += ms * repeat
-            overlap_sum += max(ms, self.ffn_ms) * repeat
             total_repeat += repeat
+        attention_mean = overlap_mean = 0.0
+        if samples:
+            # Normalize before multiplying: a finite weighted mean must not
+            # overflow just because a sample is repeated many times.
+            try:
+                attention_mean = math.fsum(ms * (repeat / total_repeat) for ms, repeat in samples)
+                overlap_mean = math.fsum(max(ms, self.ffn_ms) * (repeat / total_repeat) for ms, repeat in samples)
+            except OverflowError as exc:
+                raise AFDInfeasible(
+                    AFDReasonCategory.INVALID_MEASUREMENT, "decode sample cadence must be finite"
+                ) from exc
+            if not math.isfinite(overlap_mean):
+                raise AFDInfeasible(AFDReasonCategory.INVALID_MEASUREMENT, "decode sample cadence must be finite")
         if samples and (
             phase is not AFDPhase.DECODE
             or self.a_to_f_ms != 0.0
             or self.f_to_a_ms != 0.0
             or not math.isclose(
-                attention_sum / total_repeat,
+                attention_mean,
                 self.attention_ms,
                 rel_tol=1e-9,
                 abs_tol=1e-12,
@@ -116,7 +126,7 @@ class AFDLayerTimes:
         object.__setattr__(self, "decode_attention_samples", tuple(samples))
         object.__setattr__(self, "_decode_sample_count", total_repeat)
         if samples:
-            object.__setattr__(self, "_decode_overlap_ms", overlap_sum / total_repeat)
+            object.__setattr__(self, "_decode_overlap_ms", overlap_mean)
 
 
 @dataclass(frozen=True)
