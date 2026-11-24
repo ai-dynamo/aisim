@@ -629,3 +629,36 @@ def test_native_dsa_capabilities_match_physical_bucket_and_gemm(systems_root, at
             context_fmha_supported_modes(db, "dsa_context_module", common.KVCacheQuantMode.fp8, **identity) == expected
         )
         assert dsa_generation_supported_modes(db, **identity) == expected
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+def test_b300_current_slot_retrieves_packaged_native_k31_sample(phase, monkeypatch):
+    from aisim_core.sdk.engine import EngineHandle, _ops_json
+    from aisim_core.sdk.operations.dsa import ContextDSAModule, GenerationDSAModule
+    from aisim_core.sdk.perf_database import get_database
+
+    monkeypatch.delenv("AIC_ALLOW_UNLISTED_VERSIONS", raising=False)
+    root = Path(__file__).resolve().parents[4] / "src/aisim_core/systems"
+    source = root / "data/b300_sxm/sparse_attention/sglang/0.0.0.dev1+g41208373c.d20261104"
+    rows = pq.read_table(source / f"dsa_{phase}_module_perf.parquet").to_pylist()
+    row = next(r for r in rows if r["batch_size"] == 1 and r["tp_size"] == 4)
+    db = get_database(
+        "b300_sxm", "sglang", "current", systems_paths=str(root), database_mode="SILICON", strict_provenance=True
+    )
+    engine = EngineHandle.for_database(db, systems_path=str(root))
+    args = ("k31", 1.0, row["num_heads"], common.KVCacheQuantMode.fp8)
+    options = {"architecture": row["architecture"], "attention_backend": "flashmla"}
+    context = phase == "context"
+    op = (
+        ContextDSAModule(*args, common.FMHAQuantMode.bfloat16, common.GEMMQuantMode.bfloat16, **options)
+        if context
+        else GenerationDSAModule(*args, common.GEMMQuantMode.bfloat16, **options)
+    )
+    result = engine.evaluate_ops_json(
+        _ops_json([op]),
+        is_context=context,
+        batch_size=1,
+        s=row["isl"] if context else row["isl"] + row["step"],
+        prefix=row["step"] if context else 0,
+    )[0]
+    assert (result[1], result[3]) == (row["latency"], "silicon")

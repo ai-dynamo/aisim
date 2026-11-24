@@ -109,6 +109,17 @@ def load_plan(path: Path) -> Plan:
     return Plan(backend=str(doc["backend"]), sm=int(doc["sm"]), shards=tuple(shards))
 
 
+def _native_k31(backend: str, op: str) -> bool:
+    return backend == "sglang" and op in ("kimi_k31_dsa_context_module", "kimi_k31_dsa_generation_module")
+
+
+def _require_native_model(op, model_path):
+    from collector.sglang.collect_kimi_k31_dsa_v1 import MODEL
+
+    if model_path != MODEL:
+        raise SystemExit(f"{op}: native K3.1 shards require model_path: {MODEL} to select the pinned K3.1 runtime")
+
+
 def pinned_image(backend: str, op: str, model_path: str | None = None) -> str:
     """The manifest-pinned image for (backend, op) — family pins included."""
     from collector.framework_manifest import _model_pinned_runtime, load_manifest, resolve_op_runtime
@@ -231,6 +242,7 @@ def docker_argv(
     shard_dir: Path,
     container_name: str,
     collector_ref: str,
+    mode: str = "run",
 ) -> list[str]:
     return [
         "docker",
@@ -244,6 +256,11 @@ def docker_argv(
         "16g",
         "-e",
         "CUDA_MPS_PIPE_DIRECTORY=/nonexistent-no-mps",
+        *(
+            ["-e", "COLLECTOR_K31_FINALIZE_ONLY=1"]
+            if mode == "finalize" and _native_k31(plan.backend, shard.op)
+            else []
+        ),
         "-e",
         "HF_HUB_OFFLINE=1",
         "-e",
@@ -314,6 +331,7 @@ def run_shard(
         shard_dir=d,
         container_name=name,
         collector_ref=collector_ref,
+        mode=mode,
     )
     _log(
         root,
@@ -348,20 +366,22 @@ def _free_gpu(busy: dict[int, subprocess.Popen | None], gpus: list[int]) -> int 
     return None
 
 
-def _validate_shard_allocation(plan: Plan, shard: Shard) -> None:
+def _validate_shard_allocation(plan: Plan, shard: Shard, *, finalize_checkpoint: Path | None = None) -> None:
     """Refuse a native TP group before launching a one-device container."""
-    if plan.backend != "sglang" or shard.op not in (
-        "kimi_k31_dsa_context_module",
-        "kimi_k31_dsa_generation_module",
-    ):
+    if not _native_k31(plan.backend, shard.op):
         return
     from collector.op_plans import plan as plan_cases
-    from collector.sglang.collect_kimi_k31_dsa_v1 import MODEL, validate_case
+    from collector.sglang.collect_kimi_k31_dsa_v1 import validate_case
+    from collector.sglang.registry import REGISTRY
 
-    if shard.model_path != MODEL:
-        raise SystemExit(
-            f"{shard.key}: native K3.1 shards require model_path: {MODEL} to select the pinned K3.1 runtime"
-        )
+    _require_native_model(shard.key, shard.model_path)
+    entry = next(entry for entry in REGISTRY if entry.op == shard.op)
+    if entry.unverified or plan.sm in entry.unverified_sms:
+        raise SystemExit(f"{shard.key}: registry marks the native op unverified on SM{plan.sm}")
+    if finalize_checkpoint is not None and finalize_checkpoint.is_file():
+        # The mounted collector checks every selected ID under the output lock
+        # before publication; this flag forbids it from launching missing work.
+        return
     # Match collect.py's --model-path selection, independent of the host shell.
     previous_model = os.environ.get("COLLECTOR_MODEL_PATH")
     try:
@@ -398,7 +418,8 @@ def run_campaign(
             continue
         if mode == "finalize" and st != "done-no-parquet":
             continue
-        _validate_shard_allocation(plan, s)
+        checkpoint = shard_dir(root, s) / ".ckpt" / plan.backend / f"{plan.backend}.{s.op}.json"
+        _validate_shard_allocation(plan, s, finalize_checkpoint=checkpoint if mode == "finalize" else None)
         todo.append(s)
     print(f"{mode}: {len(todo)}/{len(plan.shards)} shards on gpus {gpus}")
     ref = collector_ref(checkout)  # once, before any shard starts: every shard records the same commit
@@ -506,6 +527,8 @@ def main() -> int:
             mode=args.mode,
         )
     if args.cmd == "build-image":
+        if _native_k31(args.backend, args.op):
+            _require_native_model(args.op, args.model_path)
         base = pinned_image(args.backend, args.op, args.model_path)
         tag = build_image(
             base, model_path=args.model_path, extra_build_args=[f"--build-arg={a}" for a in args.build_arg]

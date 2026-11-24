@@ -234,6 +234,12 @@ def _collect_selected_cases(
     else:
         task_infos = raw_task_infos
 
+    if (
+        native
+        and os.environ.get("COLLECTOR_K31_FINALIZE_ONLY") == "1"
+        and not all(resume_tracker.has_passed(task["id"]) for task in raw_task_infos)
+    ):
+        raise RuntimeError("Native finalize-only requires a passed checkpoint for every selected case")
     error_path = Path(checkpoint_dir) / backend / f"errors_{full_name}.json"
     errors: list[dict] = []
     if resume_options and resume_options.get("resume") and error_path.exists():
