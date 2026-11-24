@@ -260,18 +260,19 @@ def _run_native_case(case, device, perf_filename, *, expected_sm=None):
         raise ValueError("native Kimi K3.1 does not support --measure_power; use latency-only collection")
     if perf_filename is None:
         raise ValueError("native Kimi K3.1 collection requires an output filename")
-    output = Path(perf_filename)
+    requested = Path(perf_filename)
+    phase = "context" if "context" in requested.name else "generation"
+    output = requested.resolve()
     with native_publication_lock(output) as lock_fd:
-        _run_owned_native_case(case, device, output, lock_fd, expected_sm)
+        _run_owned_native_case(case, device, output, lock_fd, expected_sm, phase)
 
 
-def _run_owned_native_case(case, device, output, lock_fd, expected_sm):
+def _run_owned_native_case(case, device, output, lock_fd, expected_sm, phase):
     writer_lock = Path(str(output) + ".lock")
     if writer_lock.exists():
         raise RuntimeError(f"native Kimi K3.1 output already has a writer lock: {writer_lock}")
     existed = output.exists()
     previous_size = output.stat().st_size if existed else 0
-    phase = "context" if "context" in output.name else "generation"
     validate_case(case, phase)
     # The generic executor's worker must not create children using fork after
     # CUDA initialization. A clean subprocess owns SGLang's spawned TP ranks.
@@ -288,7 +289,7 @@ def _run_owned_native_case(case, device, output, lock_fd, expected_sm):
                     "--phase",
                     phase,
                     "--output",
-                    str(output.resolve()),
+                    str(output),
                     "--device",
                     str(device),
                     "--publication-lock-fd",
@@ -635,7 +636,7 @@ def main() -> None:
     args = parser.parse_args()
     case = ModuleCase(*json.loads(args.case))
     tp = validate_case(case, args.phase)
-    output = Path(args.output)
+    output = Path(args.output).resolve()
     with native_publication_lock(output, args.publication_lock_fd):
         if args.publication_lock_fd is not None:
             _collect_native(args, case, tp)
