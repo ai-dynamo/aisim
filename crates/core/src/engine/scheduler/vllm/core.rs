@@ -2222,19 +2222,20 @@ impl VllmCore {
     /// with a host pool wait: their queues serve the handoffs and restores
     /// that own G1 blocks first, so the waiting request cannot keep them
     /// from finishing. A request that could not hold that token even alone
-    /// in G1 can never resume and is rejected: emission preempts it before
-    /// its sequence grows, so the cap on the known sequence does not see it.
+    /// in G1 can never resume and is rejected, also when a host load
+    /// restores it: emission preempts it before its sequence grows, so the
+    /// cap on the known sequence does not see it.
     fn resumed_without_emission_blocks(
         &self,
         uuid: Uuid,
         cost: &PrefillCost,
+        host_hit: bool,
     ) -> Option<AdmissionDecision> {
         if self.speculative_sampler.is_none() || self.native_mtp_depth.is_some() {
             return None;
         }
         let request = &self.state.requests[&uuid];
-        if request.status != RequestStatus::Preempted || request.sequence.num_allocated_tokens() > 0
-        {
+        if request.status != RequestStatus::Preempted {
             return None;
         }
         let remaining =
@@ -2251,6 +2252,13 @@ impl VllmCore {
         ) else {
             return None;
         };
+        // Its own tokens and the next one exceed G1 whatever restores them.
+        if request.sequence.current_known_blocks() + emitted > self.args.num_gpu_blocks {
+            return Some(AdmissionDecision::Reject);
+        }
+        if host_hit || request.sequence.num_allocated_tokens() > 0 {
+            return None;
+        }
         let free = self
             .args
             .num_gpu_blocks
@@ -2674,13 +2682,15 @@ impl VllmCore {
             // `waiting`, where a preempted request waits.
             // Native PRIORITY instead compares the two queue heads by
             // (priority, arrival); this engine models only FCFS and never
-            // reads request `priority`, so it has no PRIORITY branch.
+            // reads request `priority`, so it has no PRIORITY branch. A policy
+            // that never preempts keeps the order its requests arrived in.
             let pending_destination = matches!(
                 admission.stage_for(false),
                 AdmissionStage::PendingDestinationHead
             );
             let prefer_materialized = pending_destination
                 || (self.args.worker_type == WorkerType::Decode
+                    && policy::allows_preemption(scheduling_policy)
                     && self.state.has_materialized_waiting());
             let prioritize_connector_waiting = self.native_host_offload.is_some();
             // A connector waiter that holds no G1 can queue ahead of one that
@@ -3023,8 +3033,8 @@ impl VllmCore {
                 decision
             };
             let decision = match decision {
-                AdmissionDecision::Admit { prefill_cost } if host_hit.is_none() => self
-                    .resumed_without_emission_blocks(uuid, &prefill_cost)
+                AdmissionDecision::Admit { prefill_cost } => self
+                    .resumed_without_emission_blocks(uuid, &prefill_cost, host_hit.is_some())
                     .unwrap_or(AdmissionDecision::Admit { prefill_cost }),
                 decision => decision,
             };

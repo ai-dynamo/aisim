@@ -134,8 +134,10 @@ the prompt plus the requested outputs.
 vLLM refuses to start with a context limit its KV cache cannot hold. Replay
 accepts one, or none, and then treats the pool as the limit: a prompt longer
 than the pool is rejected at admission, and a request whose decode outgrows
-the pool is rejected once it has preempted itself and can never resume. A
-`context_length` within the pool ends generation at the limit instead.
+the pool is rejected once it has preempted itself and can never resume. With
+MTP the token a request samples next counts toward that, and so do the copies
+of a sliding-window state it resumes from. A `context_length` within the pool
+ends generation at the limit instead.
 
 ## Parallelism
 

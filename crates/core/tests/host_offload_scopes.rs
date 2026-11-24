@@ -14,7 +14,7 @@ use aisim_core::engine::{
 };
 use aisim_core::replay::{
     G2DomainStats, ReplayCaptureOptions, ReplayDeterminism, ReplayEngineFactory, ReplayReport,
-    ReplaySpec, Replayer,
+    ReplaySpec, ReplayTerminalStatus, Replayer,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -1058,4 +1058,28 @@ fn a_waiter_that_holds_g1_runs_before_one_that_must_wait(
     // loads its third over [141, 151).
     assert_eq!(terminal_ms(&report, "c"), 141.0);
     assert_eq!(terminal_ms(&report, "b"), 152.0);
+}
+
+/// Speculative emission takes the next token's blocks when it samples it. A
+/// request that outgrows G1 is rejected, and not resumed without end, also
+/// when a host load restores it each time it is preempted.
+#[test]
+fn a_host_load_does_not_resume_a_speculative_request_that_outgrew_g1() {
+    // 12 prompt tokens and 6 outputs: the 17th token needs a fifth block.
+    let pool = json!({"num_host_blocks": 16, "d2h_bandwidth_gbps": 0.001});
+    let mut rank = small_rank(4, 2, 16, json!({"native_host_offload": pool}));
+    canonical_mtp(&mut rank, 1);
+    let spec = json!({
+        "version": 1, "topology": disaggregated(1), "record_per_request": true,
+        "engine": {"rank": rank, "prefill": {"rank": rank}, "decode": {"rank": rank}},
+        "requests": token_ranges(&[("grows", 0.0, 1, 12, 6)]),
+        // A request that still resumed without end would run into this.
+        "max_sim_time_ms": 8_000.0,
+    });
+    let spec: ReplaySpec = serde_json::from_value(spec).unwrap();
+    let report = (Replayer::new(spec, timed_factory()).unwrap().run()).unwrap();
+    let ended = (report.per_request.iter())
+        .map(|record| record.terminal_status)
+        .collect::<Vec<_>>();
+    assert_eq!(ended, [ReplayTerminalStatus::Rejected]);
 }

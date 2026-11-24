@@ -2424,6 +2424,19 @@ mod destination_lifecycle {
         assert!(core.state.requests.is_empty());
         assert_eq!(core.kv_manager.num_active_blocks(), 0);
     }
+
+    /// TensorRT-LLM never preempts, so its decode rank keeps arrival order.
+    #[test]
+    fn a_trtllm_decode_rank_admits_in_arrival_order() {
+        let mut args = destination_args(EngineType::Trtllm, 8);
+        args.max_num_seqs = Some(1);
+        let mut core = VllmCore::new(args);
+        let first = core.receive(request(Uuid::from_u128(1), vec![1; 4], 1));
+        let handoff = reserve(&mut core, 2, 4, 1);
+        activate(&mut core, handoff);
+        let admitted = execute(&mut core, 0.0).admissions;
+        assert_eq!(admitted.iter().map(|a| a.uuid).collect::<Vec<_>>(), [first]);
+    }
 }
 
 mod core_behavior {
