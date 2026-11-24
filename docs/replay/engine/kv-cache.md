@@ -1395,8 +1395,8 @@ sub-block matching without an explicit full-state scratch count.
   after the load. A ring must be a `state` group with `blocks_per_request: 1`
   and `prefix_cacheable: false`. For a native pair, replay checks that the prefill and decode
   roles have identical `kv_cache_groups` and the same `vllm_version`, and
-  it runs the gate of each rank. It does not check equal tensor
-  parallelism, or the version that the profile records. P/D moves whole blocks of
+  it runs the gate of each rank. It also checks equal `tensor_parallel_size`,
+  but not the version that the profile records. P/D moves whole blocks of
   full-attention groups, the last blocks of window groups and one block of
   each state group.
   A grouped prefill worker refuses a request with an empty prompt, as vLLM
