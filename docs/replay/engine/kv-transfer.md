@@ -80,8 +80,8 @@ full-attention groups. With `destination_missing`, a decode worker that already
 caches a prefix of the prompt does not receive the full-attention blocks of
 that prefix again. The state moves with every transfer that moves at least one
 token.
-A request of zero input tokens owns no block on the prefill worker and moves
-no state block; vLLM refuses an empty prompt, see vLLM v0.31.0
+A grouped prefill worker refuses a request with an empty prompt, as vLLM
+refuses an empty prompt, see vLLM v0.31.0
 [`input_processor.py:516-517`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/engine/input_processor.py#L516-L517)
 and vLLM v0.32.0
 [`input_processor.py:565-566`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/input_processor.py#L565-L566).
