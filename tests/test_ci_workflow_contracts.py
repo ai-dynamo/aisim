@@ -838,6 +838,22 @@ def test_fast_ci_owns_static_and_workflow_contract_checks() -> None:
     assert jobs["readiness"]["if"] == "${{ always() }}"
 
 
+def test_fast_ci_verifies_bundled_radix_source_against_the_pinned_upstream() -> None:
+    from scripts.sync_sglang_radix_core import REVISION
+
+    jobs = _workflow("fast-ci.yml")["jobs"]
+    assert "rust-format" in jobs["readiness"]["needs"]
+    steps = jobs["rust-format"]["steps"]
+    upstream = next(step for step in steps if step.get("with", {}).get("repository") == "sgl-project/sglang")
+    assert upstream["with"]["ref"] == REVISION
+    assert upstream["with"]["persist-credentials"] == "false"
+    command = f"python3 scripts/sync_sglang_radix_core.py --source-checkout {upstream['with']['path']} --check"
+    verify = next(step for step in steps if step.get("run") == command)
+    assert steps.index(upstream) < steps.index(verify)
+    assert "if" not in upstream and "if" not in verify
+    assert not verify.get("continue-on-error", False)
+
+
 def test_expensive_workflows_are_reusable_full_ci_components() -> None:
     for filename in (
         "collector-check.yml",

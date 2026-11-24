@@ -190,6 +190,16 @@ jobs:
       - name: Verify exact target
         run: test "$(git rev-parse HEAD)" = "${TARGET_SHA}"
       - run: cargo fmt --all -- --check
+      - name: Check out pinned SGLang radix source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: sgl-project/sglang
+          ref: f0fda25fc95c357368b714f90a13a69c1b67f50a
+          path: .sglang-upstream
+          sparse-checkout: rust/sglang-radix-tree
+          persist-credentials: false
+      - name: Verify bundled SGLang radix source and local patch
+        run: python3 scripts/sync_sglang_radix_core.py --source-checkout .sglang-upstream --check
 
   # Full CI verifies this standalone run and each substantive job at the same
   # branch/SHA. No reusable Fast CI invocation is nested inside Full CI.

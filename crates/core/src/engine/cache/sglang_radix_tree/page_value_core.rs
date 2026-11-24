@@ -520,6 +520,7 @@ fn page_value_swa_window_validates_and_attaches_loaded_indices() {
         .is_err()
     );
     assert_eq!(tree.swa_evictable_size(), 0);
+    assert_eq!(tree.inspect_get_node_token_ids(anchor).unwrap(), key);
     tree.attach_swa_window(
         &key,
         Default::default(),
@@ -618,6 +619,10 @@ fn native_suffix_eviction_rejects_locked_or_unaligned_pages_before_mutation() {
         .is_err()
     );
     assert_eq!(tree.protected_size(), 4);
+    assert_eq!(
+        tree.inspect_get_node_token_ids(leaf).unwrap(),
+        vec![10, 20, 30, 40]
+    );
     tree.dec_lock_ref(leaf, &receipt.to_dec_params(), false)
         .unwrap();
     assert!(

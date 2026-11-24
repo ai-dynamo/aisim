@@ -747,8 +747,16 @@ impl RadixCache {
         page_keys: &[LocalBlockHash],
     ) -> (usize, NodeId, Vec<KvPageId>) {
         let key: PageKey = page_keys.to_vec().into();
+        self.match_prefix_key_and_lock(&key)
+    }
+
+    /// Match a capped view of the request's shared hash buffer without copying it.
+    pub(crate) fn match_prefix_key_and_lock(
+        &mut self,
+        key: &PageKey,
+    ) -> (usize, NodeId, Vec<KvPageId>) {
         let result = self.tree.match_prefix(&MatchPrefixParams {
-            key: &key,
+            key,
             namespace: KeyNamespaceRef::default(),
         });
         assert!(

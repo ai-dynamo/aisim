@@ -109,6 +109,8 @@ following local corrections to this pinned revision:
   access tick, and priority before and after each rejected continuation.
 - Assert that the read-only prefix probe preserves the compressed edge and its
   access tick immediately, before the mutating match control.
+- Assert rejected SWA attachment and locked suffix eviction leave the original
+  four-atom edge unsplit before retrying or releasing the lock.
 - Keep borrowed namespace fields private so their cached hash stays consistent.
 - Describe the bundled module as native-only.
 - Borrow child edge keys during removal and copy visible page slices directly
@@ -121,7 +123,8 @@ including split recency and whole-leaf LRU eviction, remain in use. The
 [two-leaf split comparison](../EVICTION_EVIDENCE.md#two-leaf-split-recency)
 records the legacy and native physical victims for a partial match and its
 full-match control. Upstream's
-native assertions are retained, with the rejected-rotation assertions strengthened.
+native assertions are retained, with rejected-rotation, SWA-attachment, and locked
+suffix-eviction assertions strengthened.
 Adoption removes an intermediate allocation;
 removal avoids a key allocation. Continuation validation compares the retained key atoms without allocating a
 path or adding another ancestor walk.

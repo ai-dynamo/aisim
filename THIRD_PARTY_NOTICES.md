@@ -157,7 +157,8 @@ These files are modified for module paths, a dependency alias, native-only
 build/test wiring, attribution headers, Rustfmt, and the local correctness and
 allocation corrections recorded in the patch. The bundled README maps each
 original path and documents every local correction; upstream native test
-assertions are retained, with rejected-rotation state assertions strengthened.
+assertions are retained, with rejected-rotation, SWA-attachment, and locked
+suffix-eviction state assertions strengthened.
 The bundled source is part of the existing
 `aisimulate-core` crate and the `aisimulate` wheel, not an additional artifact.
 

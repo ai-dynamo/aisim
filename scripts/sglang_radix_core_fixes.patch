@@ -464,7 +464,15 @@ and its LICENSE for provenance, the preserved license, and each local correction
      }
      params.rotation_base = Some(7);
      let accepted = tree.insert_suffix_from_node(anchor, 2, &params);
-@@ -509,6 +534,18 @@
+@@ -495,6 +520,7 @@
+         .is_err()
+     );
+     assert_eq!(tree.swa_evictable_size(), 0);
++    assert_eq!(tree.inspect_get_node_token_ids(anchor).unwrap(), key);
+     tree.attach_swa_window(
+         &key,
+         Default::default(),
+@@ -509,6 +535,18 @@
          vec![(0, 1), (3, 4)]
      );
      assert_eq!(tree.swa_evictable_size(), 2);
@@ -483,6 +491,17 @@ and its LICENSE for provenance, the preserved license, and each local correction
      assert_eq!(tree.evictable_size(), 4);
      assert_eq!(
          tree.collect_full_device_indices(anchor, tree.root_node_handle(None))
+@@ -581,6 +619,10 @@
+         .is_err()
+     );
+     assert_eq!(tree.protected_size(), 4);
++    assert_eq!(
++        tree.inspect_get_node_token_ids(leaf).unwrap(),
++        vec![10, 20, 30, 40]
++    );
+     tree.dec_lock_ref(leaf, &receipt.to_dec_params(), false)
+         .unwrap();
+     assert!(
 --- a/unified_lru_list.rs
 +++ b/unified_lru_list.rs
 @@ -524,8 +524,7 @@

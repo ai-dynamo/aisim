@@ -2882,15 +2882,21 @@ mod admission_validation_rollback {
         assert_eq!(pass.output_signals[0].uuid, running);
     }
 
-    #[test]
-    fn failed_partial_prefix_match_restores_radix_state_and_eviction_order() {
-        let mut core = SglangCore::new_with_kv_capture(test_args(32, 4, 32), 0);
-        core.receive(direct_request((0..8).collect(), 0));
-        core.try_execute_hidden_pass(0.0).unwrap();
-        core.receive(direct_request((100..108).collect(), 0));
-        core.try_execute_hidden_pass(1.0).unwrap();
-        let request = core.receive(direct_request((0..4).chain(50..58).collect(), 1));
-        core.drain_kv_events();
+    #[rstest::rstest]
+    fn failed_partial_prefix_match_restores_radix_state_and_eviction_order(
+        #[values(false, true)] evict_after_rollback: bool,
+    ) {
+        let fixture = || {
+            let mut core = SglangCore::new_with_kv_capture(test_args(32, 4, 32), 0);
+            core.receive(direct_request((0..8).collect(), 0));
+            core.try_execute_hidden_pass(0.0).unwrap();
+            core.receive(direct_request((100..108).collect(), 0));
+            core.try_execute_hidden_pass(1.0).unwrap();
+            let request = core.receive(direct_request((0..4).chain(50..58).collect(), 1));
+            core.drain_kv_events();
+            (core, request)
+        };
+        let (mut core, request) = fixture();
 
         // Own the saved arrays so the assertion does not share the live cache's
         // copy-on-write buffers. Compare topology and access counters as well as counts.
@@ -2913,9 +2919,7 @@ mod admission_validation_rollback {
                     ),
                 );
             }
-            let mut probe = cache.admission_checkpoint();
-            let eviction_order = probe.evict(probe.evictable_size()).1;
-            (nodes, eviction_order)
+            nodes
         };
         let state_before = radix_state(&core);
         let waiting_before = format!("{:?}", core.waiting);
@@ -2929,6 +2933,30 @@ mod admission_validation_rollback {
             assert_eq!(format!("{:?}", core.waiting), waiting_before);
             assert!(core.running.is_empty());
             assert!(core.drain_kv_events().is_empty());
+        }
+
+        if evict_after_rollback {
+            let (mut control, _) = fixture();
+            let evict_live = |core: &mut SglangCore| {
+                let cache = core.kv_manager.cache_mut();
+                let available_before = cache.available_tokens();
+                let mut removed = Vec::new();
+                // Exercise the live candidate index across both leaf removals.
+                for expected in [[0, 1], [2, 3]] {
+                    let (tokens, pages) = cache.evict(4);
+                    assert_eq!(tokens, 8);
+                    let pages = pages.iter().map(|page| page.index()).collect::<Vec<_>>();
+                    assert_eq!(pages, expected);
+                    removed.extend(pages);
+                }
+                let recovered = cache.available_tokens() - available_before;
+                assert_eq!(recovered, 16);
+                assert_eq!(cache.available_tokens(), cache.total_tokens());
+                assert_eq!(cache.evictable_size(), 0);
+                (removed, recovered)
+            };
+            assert_eq!(evict_live(&mut core), evict_live(&mut control));
+            return;
         }
 
         fail.store(false, Ordering::Relaxed);

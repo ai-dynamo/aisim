@@ -394,15 +394,18 @@ impl SglangKvManager {
         let page_size = self.cache.page_size();
         lease.ensure_page_hashes(token_ids, page_size);
         let materialized_hashes = lease.page_hashes_through(token_ids.len(), page_size);
-        let matchable_hashes =
-            &materialized_hashes[..(max_prefix_tokens.min(token_ids.len()) / page_size)];
         // Prefix matching can split, touch and lock radix nodes even when the
         // following capacity check rejects the allocation.
-        if self.enable_prefix_caching {
+        let (prefix_len, last_node, mut pages) = if self.enable_prefix_caching {
             self.checkpoint_admission();
-        }
-        let (prefix_len, last_node, mut pages) =
-            self.match_prefix_hashes_and_lock(matchable_hashes);
+            let key = PageKey::shared(
+                Arc::clone(&lease.page_hashes),
+                max_prefix_tokens.min(token_ids.len()) / page_size,
+            );
+            self.cache.match_prefix_key_and_lock(&key)
+        } else {
+            (0, self.cache.root(), Vec::new())
+        };
         let required_pages = token_ids.len().div_ceil(page_size) - prefix_len / page_size;
         let required_tokens = required_pages * page_size;
 
@@ -1977,6 +1980,29 @@ mod tests {
     }
 
     #[test]
+    fn cold_admission_reuses_prepared_lease_hashes() {
+        for prompt_len in [512, 8192] {
+            let mut mgr = SglangKvManager::new(16384, 4, KvEventPublishers::default(), 0);
+            let prompt = (0..prompt_len).collect::<Vec<_>>();
+            let mut lease = lease_with_hashes(&prompt, 4);
+            let buffer = lease.page_hashes().as_ptr();
+            PageKey::take_owned_key_atoms();
+
+            assert_eq!(
+                mgr.allocate_for_request_lease_capped(&prompt, &mut lease, prompt.len() - 1),
+                Some(0)
+            );
+            assert_eq!(PageKey::take_owned_key_atoms(), 0);
+            assert_eq!(lease.page_hashes().as_ptr(), buffer);
+            assert_eq!(Arc::strong_count(&lease.page_hashes), 1);
+            assert_eq!(lease.pages().len(), prompt.len() / 4);
+            assert_eq!(mgr.cache().protected_size(), 0);
+            assert!(mgr.abort(lease));
+            assert_eq!(mgr.cache().available_tokens(), 16384);
+        }
+    }
+
+    #[test]
     fn allocation_match_is_capped_like_sglang() {
         // A fully cached five-token prompt admitted with SGLang's `input_len - 1` cap reuses four
         // tokens and owns a fresh slot for the fifth: physical ownership and `cached_tokens`
@@ -1995,6 +2021,7 @@ mod tests {
         assert_eq!(lease.cached_tokens(), 4);
         assert_eq!(lease.len(), 5);
         assert_eq!(lease.pages().len(), 5);
+        assert_eq!(mgr.cache().protected_size(), 4);
         assert_eq!(available_before - mgr.cache().available_tokens(), 1);
         assert!(mgr.abort(lease));
     }
