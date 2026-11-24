@@ -632,13 +632,14 @@ def test_native_dsa_capabilities_match_physical_bucket_and_gemm(systems_root, at
 
 
 @pytest.mark.parametrize("phase", ["context", "generation"])
-def test_b300_current_slot_retrieves_packaged_native_k31_sample(phase, monkeypatch):
+def test_b300_current_slot_retrieves_pinned_native_k31_sample(phase, monkeypatch):
+    from aisim_core.data.default_systems import default_systems_path
     from aisim_core.sdk.engine import EngineHandle, _ops_json
     from aisim_core.sdk.operations.dsa import ContextDSAModule, GenerationDSAModule
     from aisim_core.sdk.perf_database import get_database
 
     monkeypatch.delenv("AIC_ALLOW_UNLISTED_VERSIONS", raising=False)
-    root = Path(__file__).resolve().parents[4] / "src/aisim_core/systems"
+    root = Path(default_systems_path())
     source = root / "data/b300_sxm/sparse_attention/sglang/0.0.0.dev1+g41208373c.d20261104"
     rows = pq.read_table(source / f"dsa_{phase}_module_perf.parquet").to_pylist()
     row = next(r for r in rows if r["batch_size"] == 1 and r["tp_size"] == 4)

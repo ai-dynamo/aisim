@@ -64,6 +64,9 @@ log and probe hashes are recorded in the original receipt. The follow-up's raw t
 receipts are retained under that evidence directory's `chunked-history/`;
 `derivation.json` and `merge-campaigns.py` record the exact disjoint union.
 
+The pre-migration [source Parquet files and collection metadata](https://github.com/ai-dynamo/aisim/tree/59aae7ff0239c0a914012cc7e9fcccac076b33d9/python/aisim/src/aisim_core/systems/data/b300_sxm/sparse_attention/sglang/0.0.0.dev1%2Bg41208373c.d20261104) preserve the exact byte hashes in the derivation receipt. The dataset publisher stamps Parquet schema metadata for distribution and audits the decoded Arrow rows against those source files.
+
+
 This is an explicitly filtered subset of the model's declared plan. A
 `complete` collection event means its attempted subset finished, with individual
 failures recorded in the standard collection summary; it does not mean every

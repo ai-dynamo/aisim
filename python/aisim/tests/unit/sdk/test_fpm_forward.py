@@ -2450,10 +2450,12 @@ def fpm_power_root(tmp_path):
     latency-only schema 6 or 7 when ``power_w`` is None, into a fresh systems root (the native
     loader caches pairs by path) and returns its ``PerfDatabase``.
     """
+    from aisim_core.data.default_systems import default_systems_path
     from aisim_core.sdk.rust_engine_step import _engine_handle_cache_clear
 
     template = tmp_path / "template"
-    packaged = Path(_CORE_SYSTEMS) / "data" / SYSTEM
+    # Operation tables are not packaged: copy them from the root composed from the pinned dataset.
+    packaged = Path(default_systems_path()) / "data" / SYSTEM
     for family in packaged.iterdir():
         source = family / BACKEND / _POWER_VERSION
         if source.is_dir():

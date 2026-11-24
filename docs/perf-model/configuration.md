@@ -166,8 +166,8 @@ estimator first, then the remaining estimators in the same global priority
 order. Each native mode tries the ordered `systems_paths` before moving to
 another estimator.
 Omitted roots preserve configured SDK discovery (or the systems-path environment
-override when the SDK uses its packaged default); an explicit `default` entry
-selects the packaged root.
+override when the SDK uses its default root, composed from the pinned op-latency
+dataset); an explicit `default` entry selects that default root.
 The resolved paths are shared by preflight, construction and capacity estimation.
 Selection occurs
 at construction; queries do not silently switch estimators on a data-domain error.
