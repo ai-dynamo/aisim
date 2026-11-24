@@ -208,6 +208,30 @@ def _source_inputs() -> set[str]:
     return inputs | _native_source_inputs()
 
 
+def _selected_data() -> dict:
+    """Identity of the op-latency data the replay reads: where the selected root came from and a digest of its bytes.
+
+    The default systems root is composed from an immutable dataset commit (or a local tree), so the evidence binds to
+    that source plus the digest of every operation file, never to a path in the source tree.
+    """
+    from aisim_core.data.default_systems import MARKER, default_systems_path
+
+    root = Path(default_systems_path())
+    source = json.loads((root / MARKER).read_text())
+    digest = hashlib.sha256()
+    count = 0
+    for path in sorted((root / "data").rglob("*")):
+        if path.is_file():
+            digest.update(f"{path.relative_to(root / 'data').as_posix()}\0{_sha256(path)}\0".encode())
+            count += 1
+    if not count:
+        raise ValueError("the selected op-latency data root holds no operation files")
+    return {
+        "source": {key: value for key, value in source.items() if key != "root"},
+        "content_sha256": digest.hexdigest(),
+    }
+
+
 def _write_build_snapshot(output: Path) -> dict:
     """Bind a built binary to a complete immutable copy of its source inputs."""
     from aisim import _runtime
@@ -230,6 +254,7 @@ def _write_build_snapshot(output: Path) -> dict:
             entry.mode = 0o644
             tar.addfile(entry, io.BytesIO(content))
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    data = _selected_data()
     manifest = {
         "source_kind": "workspace_snapshot",
         "workspace_dirty": workspace_dirty,
@@ -241,9 +266,8 @@ def _write_build_snapshot(output: Path) -> dict:
         "source_snapshot_sha256": _sha256(archive),
         "binary_sha256": _sha256(Path(_runtime.__file__)),
         "native_source_inventory_sha256": native_inventory,
-        "data_tree": subprocess.check_output(
-            ["git", "rev-parse", "HEAD:python/aisim/src/aisim_core/systems/data"], cwd=ROOT, text=True
-        ).strip(),
+        "data_source": data["source"],
+        "data_tree": data["content_sha256"],
     }
     output.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     _verified_build(output)
@@ -275,7 +299,7 @@ def _verified_build(manifest_path: Path) -> dict:
     from aisim import _runtime
 
     manifest = _load(manifest_path)
-    for field in ("source_commit", "source_tree", "binary_sha256", "source_files", "data_tree"):
+    for field in ("source_commit", "source_tree", "binary_sha256", "source_files", "data_source", "data_tree"):
         if not manifest.get(field):
             raise ValueError(f"build manifest missing {field}")
     if len(manifest["source_commit"]) != 40 or len(manifest["source_tree"]) != 40:
@@ -306,13 +330,10 @@ def _verified_build(manifest_path: Path) -> dict:
                 raise ValueError(f"source differs from immutable commit: {relative}")
     if _source_inputs() - manifest["source_files"].keys():
         raise ValueError("build manifest does not cover all runtime source inputs")
-    data_path = "python/aisim/src/aisim_core/systems/data"
-    if subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard", "--", data_path], cwd=ROOT):
-        raise ValueError("performance data has unrecorded files")
-    if subprocess.check_output(["git", "diff", "HEAD", "--", data_path], cwd=ROOT):
-        raise ValueError("performance data has unrecorded changes")
-    actual_tree = subprocess.check_output(["git", "rev-parse", f"HEAD:{data_path}"], cwd=ROOT, text=True).strip()
-    if actual_tree != manifest["data_tree"]:
+    data = _selected_data()
+    if data["source"] != manifest["data_source"]:
+        raise ValueError("performance data source differs from build manifest")
+    if data["content_sha256"] != manifest["data_tree"]:
         raise ValueError("performance data tree differs from build manifest")
     return {key: value for key, value in manifest.items() if key not in {"source_files", "source_git_dir"}}
 

@@ -12,7 +12,7 @@
 //! block pool, so that cached blocks stay until eviction.
 
 use crate::engine::cache::vllm_block_pool::{
-    BlockCopyId, BlockReservation, CacheKey, PrefixHit, VllmBlockPool,
+    BlockCopyId, BlockReservation, CacheKey, KeyInBlock, PrefixHit, VllmBlockPool,
 };
 use crate::engine::common::hashing::SequenceHash;
 use crate::perfmodel::{FpmCacheGroup, FpmCacheKind};
@@ -70,6 +70,11 @@ pub(crate) struct GroupedBlockLease {
     /// Whether the request has allocated once. The copy blocks of a partial
     /// hit come with the first allocation only.
     pub(crate) allocated: bool,
+    /// The token count below which a step of the request finds nothing to
+    /// allocate, publish or release, so that its `allocate` and `finalize`
+    /// can be skipped (see `GroupedPrefixRules::quiet_until`). 0 when the
+    /// next step has to run both.
+    pub(crate) quiet_until: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,7 +100,7 @@ pub(crate) enum GroupLease {
 }
 
 impl GroupLease {
-    fn live_copies(&self) -> usize {
+    pub(super) fn live_copies(&self) -> usize {
         match self {
             // The `None` copies lie exactly below `first_live`, so a count per
             // step does not scan the whole context.
@@ -224,6 +229,28 @@ impl GroupedBlockPool {
         let visible = self.pool.cache_private_key(id, key);
         self.retry_epoch += u64::from(visible);
         visible
+    }
+
+    /// [`Self::cache`] for a key that can lie inside a block of its group, at
+    /// `at`. A hit search finds such a key through [`Self::keys_in_block`] only.
+    pub(crate) fn cache_at(
+        &mut self,
+        id: BlockCopyId,
+        key: CacheKey,
+        at: Option<KeyInBlock>,
+    ) -> bool {
+        let visible = self.pool.cache_private_key_at(id, key, at);
+        self.retry_epoch += u64::from(visible);
+        visible
+    }
+
+    /// See [`VllmBlockPool::grouped_keys_in_block`].
+    pub(crate) fn keys_in_block(
+        &self,
+        group: u16,
+        first: SequenceHash,
+    ) -> impl DoubleEndedIterator<Item = u32> + '_ {
+        self.pool.grouped_keys_in_block(group, first)
     }
 
     pub(crate) fn release(&mut self, id: BlockCopyId) {
@@ -822,6 +849,31 @@ mod tests {
     }
 
     #[test]
+    fn block_mode_publish_inside_a_block_moves_the_retry_epoch_as_any_publish() {
+        // A waiting load is tried again when a key becomes visible, also a key
+        // inside a block, such as a state at the prompt's partial tail.
+        let key = |hash| CacheKey::Grouped { group: 0, hash };
+        let mut pool = GroupedKvPool::with_prefix_cache(three_groups(), 32, 8);
+        let blocks = pool.block_pool_mut().unwrap();
+        let mut reservation = blocks.reserve(&[], 2).unwrap();
+        let (at_end, inside) = (
+            blocks.take_private(&mut reservation),
+            blocks.take_private(&mut reservation),
+        );
+        blocks.cancel(reservation);
+        let start = pool.retry_epoch();
+        assert!(pool.block_pool_mut().unwrap().cache(at_end, key(10)));
+        let after_end = pool.retry_epoch();
+        let at = Some(KeyInBlock {
+            first: 7,
+            offset: 4,
+        });
+        assert!(pool.block_pool_mut().unwrap().cache_at(inside, key(11), at));
+        assert!(after_end > start);
+        assert_eq!(pool.retry_epoch() - after_end, after_end - start);
+    }
+
+    #[test]
     fn block_lease_counts_the_live_copies_of_every_group() {
         let mut pool = GroupedKvPool::with_prefix_cache(three_groups(), 64, 8);
         let blocks = pool.block_pool_mut().unwrap();
@@ -849,6 +901,7 @@ mod tests {
                     }),
                 ],
                 allocated: true,
+                quiet_until: 0,
             }),
             ..GroupedLease::default()
         };

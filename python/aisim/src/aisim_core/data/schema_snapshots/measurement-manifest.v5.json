@@ -1,0 +1,154 @@
+{
+  "$defs": {
+    "FpmMeasurementFile": {
+      "additionalProperties": true,
+      "description": "One file listed by a measurement manifest.",
+      "properties": {
+        "bytes": {
+          "minimum": 0,
+          "title": "Bytes",
+          "type": "integer"
+        },
+        "format": {
+          "title": "Format",
+          "type": "string"
+        },
+        "measurement_file_id": {
+          "title": "Measurement File Id",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "role": {
+          "anyOf": [
+            {
+              "enum": [
+                "truth",
+                "window",
+                "configuration"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "title": "Role"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "measurement_file_id",
+        "role",
+        "path",
+        "format",
+        "sha256",
+        "bytes"
+      ],
+      "title": "FpmMeasurementFile",
+      "type": "object"
+    },
+    "JsonValue": {}
+  },
+  "$id": "measurement-manifest/v5",
+  "additionalProperties": true,
+  "description": "``measurements/manifest.json`` (``measurement-manifest/v5``): the evaluation tier.",
+  "properties": {
+    "collection_runs": {
+      "items": {
+        "additionalProperties": {
+          "$ref": "#/$defs/JsonValue"
+        },
+        "type": "object"
+      },
+      "title": "Collection Runs",
+      "type": "array"
+    },
+    "files": {
+      "items": {
+        "$ref": "#/$defs/FpmMeasurementFile"
+      },
+      "minItems": 1,
+      "title": "Files",
+      "type": "array"
+    },
+    "framework": {
+      "title": "Framework",
+      "type": "string"
+    },
+    "framework_version": {
+      "title": "Framework Version",
+      "type": "string"
+    },
+    "manifest_version": {
+      "const": 5,
+      "title": "Manifest Version",
+      "type": "integer"
+    },
+    "measurement_artifact_id": {
+      "title": "Measurement Artifact Id",
+      "type": "string"
+    },
+    "measurement_protocol_id": {
+      "title": "Measurement Protocol Id",
+      "type": "string"
+    },
+    "model_id": {
+      "title": "Model Id",
+      "type": "string"
+    },
+    "model_revision": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Model Revision"
+    },
+    "parallelism": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Parallelism"
+    },
+    "system": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "System"
+    }
+  },
+  "required": [
+    "manifest_version",
+    "measurement_artifact_id",
+    "measurement_protocol_id",
+    "model_id",
+    "framework",
+    "framework_version",
+    "files"
+  ],
+  "title": "FpmMeasurementManifest",
+  "type": "object"
+}

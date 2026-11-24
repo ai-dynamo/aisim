@@ -26,13 +26,8 @@ concurrency:
 jobs:
   check:
     name: Check collector data
-    runs-on: prod-aisim-default-amd64-v1
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
-    container:
-      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
-      env:
-        HOME: /__w/aisim/aisim
-        USER: runner
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -48,6 +43,7 @@ jobs:
           python-version: "3.13"
       - name: Install AISim and development dependencies
         run: python -m pip install './python/aisim[dev]'
+      - uses: ./.github/actions/prefetch-op-latency-data
       - name: Check Collector V3 data invariants
         working-directory: python/aisim
         run: python tools/perf_database/check_collector_data.py
@@ -57,14 +53,9 @@ jobs:
 
   cross-backend-consistency:
     name: Perf data sanity (informational)
-    runs-on: prod-aisim-default-amd64-v1
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     continue-on-error: true
-    container:
-      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
-      env:
-        HOME: /__w/aisim/aisim
-        USER: runner
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -80,6 +71,10 @@ jobs:
           python-version: "3.13"
       - name: Install check dependencies
         run: python -m pip install pandas pyarrow numpy pyyaml 'tqdm>=4.0.0'
+      - name: Compose the op-latency systems root
+        uses: ./.github/actions/prefetch-op-latency-data
+        with:
+          github-env: "true"
       - name: Run cross-backend consistency checks
         working-directory: python/aisim
         run: |

@@ -131,6 +131,8 @@ struct UnpricedPass {
     selected_ms: f64,
     /// When the language-model forward starts: after the vision encoder.
     forward_start_ms: f64,
+    /// Already-scaled vision time, retained independently of absolute timestamps.
+    vision_ms: f64,
     prefill: Option<PrefillTotals>,
     decode: Option<DecodeShape>,
     /// When the pass ends regardless of its forward: under the host loop, when
@@ -1313,6 +1315,13 @@ impl SglangCore {
         // of forward telemetry and out of repeated pipeline stages.
         let scheduled_end_ms = forward_end_ms + scheduler_ms;
         let mut result = pass.result;
+        result.forward_time = forward_time;
+        // Vision runs before the language forward and belongs to the same
+        // active prefill evidence. Include its already-scaled time in rank
+        // wait accounting without adding it to the simulated timeline again.
+        if pass.vision_ms > 0.0 {
+            result.forward_time.prefill += modeled_duration(pass.vision_ms, 1.0)?;
+        }
         // When this pass's forward leaves stage 0, and its time per stage.
         let mut stage0 = Some((scheduled_end_ms, forward_ms));
         let host_launch = pass.launch.is_some();
@@ -1609,11 +1618,15 @@ impl SglangCore {
         let scheduled_decode_lens: Vec<u64> = if prefill_pass || skip_decode {
             Vec::new()
         } else {
-            self.running
-                .iter()
-                .filter(|req| req.pending_terminal || req.remaining_output_tokens() > 0)
-                .map(|req| req.current_sequence_len() as u64)
-                .collect()
+            // A filtered iterator has no lower size hint, so reserve the batch up front.
+            let mut lens = Vec::with_capacity(self.running.len());
+            lens.extend(
+                self.running
+                    .iter()
+                    .filter(|req| req.pending_terminal || req.remaining_output_tokens() > 0)
+                    .map(|req| req.current_sequence_len() as u64),
+            );
+            lens
         };
 
         // The prefill forward is priced later. Its first tokens take no time,
@@ -1645,6 +1658,7 @@ impl SglangCore {
         decode.end_ms += after_reclaim_ms - selected_ms;
         let selected_ms = after_reclaim_ms;
         if !prefill_pass {
+            committed_requests.reserve(decode.output_signals.len());
             // The decode step can retract requests before executing the batch.
             for signal in &decode.output_signals {
                 // Speculative bursts emit consecutive tokens for the same request.
@@ -1652,8 +1666,6 @@ impl SglangCore {
                     committed_requests.push(signal.uuid);
                 }
             }
-            committed_requests.sort_unstable();
-            committed_requests.dedup();
         }
         if let Some(host) = &mut self.host {
             // `retract_decode` marks a request before the previous forward's result is
@@ -1966,6 +1978,7 @@ impl SglangCore {
                 .host_deadline_ms()
                 .is_some_and(|deadline| deadline > now_ms);
         let result = EnginePassResult {
+            forward_time: ForwardTime::default(),
             committed_requests,
             // The forward's end is set when it is priced; `now_ms` holds its place.
             end_ms: now_ms,
@@ -2004,6 +2017,7 @@ impl SglangCore {
         self.unpriced = Some(UnpricedPass {
             selected_ms,
             forward_start_ms: decode.end_ms,
+            vision_ms,
             prefill,
             decode: decode_shape,
             end_ms,

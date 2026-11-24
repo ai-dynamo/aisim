@@ -315,6 +315,7 @@ def test_fast_and_full_ci_keep_their_cost_boundary() -> None:
     assert set(full_readiness["needs"]) == {
         "verify-target",
         "select-full-ci",
+        "op-latency-data",
         "application-test-wheel",
         "fast-ci",
         "platform-wheels",

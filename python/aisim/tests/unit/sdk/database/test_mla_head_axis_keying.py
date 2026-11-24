@@ -296,9 +296,9 @@ def test_kernel_views_reject_rows_without_num_heads(tmp_path, basename, attribut
 
 
 def _data_root() -> Path:
-    import aisim_core
+    from aisim_core.data.default_systems import default_systems_path
 
-    return Path(aisim_core.__file__).parent / "systems" / "data"
+    return Path(default_systems_path()) / "data"
 
 
 def test_shipped_mla_module_models_are_pinned():
@@ -355,6 +355,9 @@ def test_shipped_mla_kernel_tables_carry_num_heads():
 # [native][local] (same recipe as the MLA module tables above).
 _DSA_MODEL_NATIVE_HEADS = {
     "deepseek-ai/DeepSeek-V3.2": 128,
+    # The NVFP4 artifact of the same architecture: vLLM 0.32.0 DSA rows name the checkpoint
+    # whose self_attn projections they quantize.
+    "nvidia/DeepSeek-V3.2-NVFP4": 128,
     "zai-org/GLM-5": 64,
     "zai-org/GLM-5-FP8": 64,
     "nvidia/GLM-5-NVFP4": 64,

@@ -18,6 +18,12 @@
         "kda_9_layers": 9768960,
         "kda_8_layers": 9768960
       },
+      "bytes_per_block_provenance": {
+        "attention": "measured slope of bytes_per_rank against attention_blocks_moved",
+        "ring": "derived from connector regions; only the sum of ring and four KDA groups is measured",
+        "kda_9_layers": "derived from connector regions; only the sum of ring and four KDA groups is measured",
+        "kda_8_layers": "derived from connector regions; only the sum of ring and four KDA groups is measured"
+      },
       "region_sums": {
         "attention_block": "11 * 1,114,112 + 11 * 71,808 = 13,045,120",
         "ring_block": "all 22 regions = 13,045,120",
@@ -163,6 +169,12 @@
         "ring": 92288,
         "kda_9_layers": 9768960,
         "kda_8_layers": 9768960
+      },
+      "bytes_per_block_provenance": {
+        "attention": "measured slope of bytes_per_rank against attention_blocks_moved",
+        "ring": "derived from connector regions; only the sum of ring and four KDA groups is measured",
+        "kda_9_layers": "derived from connector regions; only the sum of ring and four KDA groups is measured",
+        "kda_8_layers": "derived from connector regions; only the sum of ring and four KDA groups is measured"
       },
       "region_sums": {
         "attention_block": "11 * 71,808 + 19 * 1,114,112 + 10 * 2,048 = 21,978,496",
