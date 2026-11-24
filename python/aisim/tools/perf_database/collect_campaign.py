@@ -301,7 +301,8 @@ def _native_phase_table(op: str) -> str:
 
 
 def _native_committed_table(directory: Path, shard: Shard, backend: str) -> bool:
-    """Require the phase's committed record and matching Parquet row count."""
+    """Require the phase's pinned runtime, committed record and Parquet row count."""
+    from collector.framework_manifest import _model_pinned_runtime, load_manifest
     from collector.provenance import validate_collection_meta_for_update
 
     table = Path(_native_phase_table(shard.op)).stem
@@ -311,7 +312,13 @@ def _native_committed_table(directory: Path, shard: Shard, backend: str) -> bool
     document = yaml.safe_load(sidecar.read_text())
     validate_collection_meta_for_update(document, tables_to_update={table})
     entry = document["tables"].get(table)
-    if entry is None or document["runtime"]["framework"] != backend:
+    expected_runtime = _model_pinned_runtime(load_manifest(), backend, shard.model_path)
+    if entry is None or expected_runtime is None:
+        return False
+    runtimes = [document["runtime"]]
+    runtimes.extend(event["runtime"] for event in entry.get("collections", []) if "runtime" in event)
+    # Public-version equality would admit a different native source build.
+    if any(runtime["framework"] != backend or runtime["version"] != expected_runtime.version for runtime in runtimes):
         return False
     # Reduced legacy summaries cannot attest this native table.
     if not (entry.get("collections") or entry.get("case_plan_hash")):
@@ -489,6 +496,10 @@ def run_campaign(
 
             checkpoint_available = ResumeCheckpoint.has_recoverable_checkpoint(checkpoint)
         if mode == "finalize" and st != "done-no-parquet":
+            if st == "incomplete-provenance":
+                raise SystemExit(
+                    f"{s.key}: incomplete-provenance; no recoverable publication can restore the native record"
+                )
             if st == "pending-publication" and not checkpoint_available:
                 raise SystemExit(f"{s.key}: publication recovery requires its native checkpoint")
             recoverable = st in ("started", "pending-publication") and checkpoint_available

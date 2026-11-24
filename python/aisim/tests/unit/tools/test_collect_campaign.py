@@ -606,6 +606,120 @@ def test_native_shard_done_requires_its_phase_table(tmp_path, monkeypatch, publi
     assert (out / ".ckpt").is_dir()
 
 
+@pytest.mark.parametrize("phase", ["context", "generation"])
+@pytest.mark.parametrize("version_kind", ["stock", "without-local", "different-local"])
+@pytest.mark.parametrize("runtime_location", ["document", "collection"])
+def test_native_publication_requires_exact_model_runtime(tmp_path, monkeypatch, phase, version_kind, runtime_location):
+    from types import SimpleNamespace
+
+    from collector.framework_manifest import resolve_op_runtime
+    from collector.provenance import validate_collection_meta_for_update
+    from collector.sglang.collect_kimi_k31_dsa_v1 import MODEL, RUNTIME_VERSION
+
+    c = _load()
+    shard = c.Shard(f"kimi_k31_dsa_{phase}_module", "tp1", case_filter=", 96, 'fp8',", model_path=MODEL)
+    plan = c.Plan("sglang", 103, (shard,))
+    out = c.shard_dir(tmp_path, shard)
+    out.mkdir(parents=True)
+    _publish_native_table(out, phase)
+    (out / "DONE").touch()
+    version = {
+        "stock": resolve_op_runtime(plan.backend, shard.op).version,
+        "without-local": RUNTIME_VERSION.split("+", 1)[0],
+        "different-local": RUNTIME_VERSION.split("+", 1)[0] + "+other",
+    }[version_kind]
+    assert version != RUNTIME_VERSION
+    runtime = {"framework": plan.backend, "version": version}
+    sidecar = out / "collection_meta.yaml"
+    document = yaml.safe_load(sidecar.read_text())
+    table = f"dsa_{phase}_module_perf"
+    if runtime_location == "document":
+        document["runtime"] = runtime
+    else:
+        document["schema_version"] = 2
+        event = {**document["tables"][table], "runtime": runtime}
+        document["tables"][table] = {"rows": 1, "status": "complete", "collections": [event]}
+    validate_collection_meta_for_update(document, tables_to_update={table})
+    sidecar.write_text(yaml.safe_dump(document))
+
+    assert c.shard_state(tmp_path, shard, plan.backend) == "incomplete-provenance"
+    commands = []
+    monkeypatch.setattr(c, "collector_ref", lambda _: "0" * 40)
+    monkeypatch.setattr(c, "image_digest", lambda _: "sha256:test")
+
+    def launch(argv):
+        commands.append(argv)
+        return SimpleNamespace(returncode=1, poll=lambda: 1, wait=lambda: 1)
+
+    monkeypatch.setattr(c.subprocess, "Popen", launch)
+    assert c.run_campaign(plan, root=tmp_path, gpus=[0], checkout=tmp_path, image_override="test", mode="run") == 1
+    assert len(commands) == 1  # A stale DONE must not skip the mismatched publication.
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+@pytest.mark.parametrize("checkpoint_state", ["absent", "closed"])
+@pytest.mark.parametrize("publication", ["valid", "missing-meta", "other-phase-meta", "wrong-rows", "wrong-runtime"])
+def test_finalize_reports_unrecoverable_native_provenance(
+    tmp_path, monkeypatch, capsys, phase, checkpoint_state, publication
+):
+    from collector.collect import ResumeCheckpoint
+    from collector.helper import create_test_case_id
+    from collector.op_plans import ModuleCase
+    from collector.sglang.collect_kimi_k31_dsa_v1 import MODEL, RUNTIME_VERSION
+
+    c = _load()
+    case = ModuleCase(4096, 1, 96, "fp8", "bfloat16", "bfloat16", MODEL, 0)
+    shard = c.Shard(f"kimi_k31_dsa_{phase}_module", "tp1", case_filter=str(case), model_path=MODEL)
+    plan = c.Plan("sglang", 103, (shard,))
+    out = c.shard_dir(tmp_path, shard)
+    out.mkdir(parents=True)
+    if checkpoint_state == "closed":
+        tracker = ResumeCheckpoint(
+            plan.backend,
+            f"{plan.backend}.{shard.op}",
+            "run_kimi_k31_dsa_fullnode",
+            str(out / ".ckpt"),
+            RUNTIME_VERSION,
+            103,
+        )
+        tracker.mark_passed(create_test_case_id(case, "run_kimi_k31_dsa_fullnode", f"{plan.backend}.{shard.op}"))
+        tracker.flush(force=True)
+        # A closed event's cumulative passes cannot attest staged rows.
+        (out / f"dsa_{phase}_module_perf.txt").write_text("closed event row\n")
+    _publish_native_table(out, phase)
+    (out / "DONE").touch()
+    sidecar = out / "collection_meta.yaml"
+    if publication == "missing-meta":
+        sidecar.unlink()
+    elif publication != "valid":
+        document = yaml.safe_load(sidecar.read_text())
+        table = f"dsa_{phase}_module_perf"
+        if publication == "other-phase-meta":
+            other_phase = "generation" if phase == "context" else "context"
+            document["tables"][f"dsa_{other_phase}_module_perf"] = document["tables"].pop(table)
+        elif publication == "wrong-rows":
+            document["tables"][table]["rows"] = 2
+        else:
+            document["runtime"]["version"] = "0.0.0.dev1+other"
+        sidecar.write_text(yaml.safe_dump(document))
+    before = {path: path.read_bytes() for path in out.rglob("*") if path.is_file()}
+    monkeypatch.setattr(c, "collector_ref", lambda _: "0" * 40)
+    monkeypatch.setattr(c, "image_digest", lambda _: pytest.fail("finalize must not inspect images"))
+    monkeypatch.setattr(c.subprocess, "Popen", lambda _: pytest.fail("finalize must not launch a worker"))
+
+    def finalize():
+        return c.run_campaign(plan, root=tmp_path, gpus=[0], checkout=tmp_path, image_override="test", mode="finalize")
+
+    if publication == "valid":
+        assert finalize() == 0
+    else:
+        with pytest.raises(SystemExit, match=rf"{shard.key}: incomplete-provenance.*no recoverable publication"):
+            finalize()
+        c.status(plan, tmp_path)
+        assert "incomplete-provenance" in capsys.readouterr().out
+    assert {path: path.read_bytes() for path in out.rglob("*") if path.is_file()} == before
+
+
 def test_finalize_rejects_empty_native_case_selection(tmp_path):
     c = _load()
     shard = c.Shard(
