@@ -101,6 +101,11 @@ not enable it.
 it. A runner must opt in before accepting a role with `kvcr.g3`, including
 support for serialized `Disk` residency events.
 
+`supports_telemetry` defaults to `False`; the built-in engine factory sets it
+to `True`. `run_prediction` calls `require_output_support(output_requirements)`
+before runner creation, so a stack without the flag refuses `capture_telemetry`
+before the replay starts.
+
 `require_compatible(spec)` checks versions and coarse combinations before
 execution. AgentX G2 additionally requires offline vLLM and static workers.
 `g3_offload` cannot be combined with AgentX G2; `kvcr.local_g2` and `kvcr.g3`

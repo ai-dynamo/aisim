@@ -30,6 +30,7 @@ HF dataset ──fetch──▶ local cache ──loader──▶ predictor inpu
   - No pin means a no-op.
   - A category named by the pin never falls back to packaged data.
 - `op-latency` composes every operation family for one system, backend and version, with the system specs, into one root.
+  A configuration ID resolves the conflict in its own family while retaining complementary families.
 - `fpm` selects one entry; several matches need `AISIM_DATA_CONFIGURATION`.
 - `materialize_systems_root` writes a self-contained root for Rust and other consumers that never run Python.
 
@@ -45,6 +46,25 @@ HF dataset ──fetch──▶ local cache ──loader──▶ predictor inpu
 | Pin a predictor to a dataset | `AISIM_DATASET=<repo>@<full SHA>`, or `AISIM_DATA_LOCAL=<dir>`; `AISIM_DATA_CATEGORIES` (default `fpm`) |
 
 Other environment variables: `AISIM_DATA_CONFIGURATION`, `AISIM_DATA_MAX_BYTES`, `AISIM_DATA_OFFLINE`, `AISIM_DATA_CACHE`.
+
+## Integrity and observation versions
+
+Moved FPM catalogs declare `data/fpm` as the category root. Embedded legacy `data/<rest>` keys resolve to
+`data/fpm/<rest>` for transport and local reads; their stored strings and identities remain unchanged. Historical
+catalogs that declare the old root retain their original paths. Resolution follows the pinned catalog, without
+falling back between old and new files.
+
+E2E schema minor 3 adds an optional `observation_sha256` to observations and snapshot members. AIPerf keeps
+`raw_record_sha256` as the raw-summary audit digest, `record_sha256` as the evidence revision, and uses
+`observation_sha256` for the full observation and request records. Use
+`SnapshotMember.from_observation(observation, manifest_path)` for external membership; `write_snapshot` also binds
+members to locally available observations, rejecting mismatched versions. Historical members without the new digest
+retain their snapshot IDs.
+
+AgentX bundles with different workload facts (including seed, dataset and timing boundary) cannot merge into one
+configuration. Differences already represented per observation, such as lane count, remain mergeable. Publication
+failures restore replaced files; an incomplete rollback raises and retains the staging directory named in the error
+for recovery. A changed calibrated system-spec value requires an explicit `fields` provenance update.
 
 ## Rules for changes
 

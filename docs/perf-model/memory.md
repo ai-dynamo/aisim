@@ -94,6 +94,10 @@ list and no scalar token rate. Existing linear profiles keep their serialized
 shape. Python exports `FpmCacheGroup` from `aisim.fpm_profile` and
 `aisim_core.fpm_profile`; Rust exports it from `aisim_core::perfmodel`.
 
+The resource fields `max_num_tokens` and `max_batch_size` are positive
+unsigned 32-bit integers, from 1 through 4,294,967,295. Each limits one
+attention-DP rank; their bounds match the native scheduler resource type.
+
 An explicit profile can use `cache_layout: unmodeled` when the runtime cache
 allocator has no AIS model, such as Mamba checkpoint retention.
 This layout requires observed `runtime_memory` and omits both
@@ -259,7 +263,8 @@ read `transfer_bytes_per_block`.
   version of the deployment. It is positive and at most 2^53, and it can be
   larger than `page_size_bytes`, because the connector reads a block in regions
   that layers of other groups can share. A hand-made profile may state it only
-  for a group whose transfer size has been measured.
+  for a group whose transfer size has been measured or identified by other
+  evidence for that group.
 
   To measure the full-attention value and the combined transfer size of the
   other groups, send two prompts of different length through a P/D pair, one at
@@ -275,10 +280,11 @@ read `transfer_bytes_per_block`.
 
   Per-group values for models with several state groups are not supported by
   this procedure or the current runtime probe. Leave `transfer_bytes_per_block`
-  unset for those groups until per-group transfer measurements or additional
-  runtime-observer evidence identifies the bytes read for each group on one TP
-  rank. Do not split the combined size evenly or use the page sizes as
-  substitutes.
+  unset for those groups until per-group transfer measurements, additional
+  runtime-observer evidence or another source, such as the regions that the
+  connector logs at start, read with the connector code, identifies the bytes
+  read for each group on one TP rank. Do not split the combined size evenly or
+  use the page sizes as substitutes.
 
   The probe import of a vLLM 0.33.0 record writes it for no group, because what
   the P/D connector of vLLM 0.33.0 reads for a block depends on
@@ -317,7 +323,7 @@ requires the native extension; it does not require GPU access or measured data.
 | --- | --- |
 | `total_gpu_capacity_bytes` | Positive rank-local GPU capacity. |
 | `memory_fraction_kind`, `memory_fraction_value` | `of_total` and the fraction of GPU memory available to the worker. |
-| `max_num_tokens`, `max_batch_size` | Positive rank-local scheduler limits within a declared envelope; exact recorded values for runtime memory. |
+| `max_num_tokens`, `max_batch_size` | Rank-local scheduler limits in `[1, 4294967295]` within a declared resource envelope with the same bounds; exact recorded values for runtime memory. |
 | `context_length` | Optional positive request bound, at most the profile context and runtime `max_model_len` when present; defaults to the profile context. |
 | `request_occupancy_tokens` | Optional positive logical request length within the selected context, for a separate steady decode footprint with one new token per forward pass. |
 | `cuda_graph_reserved_bytes` | Separate nonnegative reservation for declared memory; must be zero for runtime memory. |

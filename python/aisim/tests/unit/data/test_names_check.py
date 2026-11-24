@@ -1,14 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""``aisim data check-names``: non-canonical names are reported for every category, with the name to use."""
-
-import argparse
-import json
+"""``check_names``, the library behind ``aisim data validate``: non-canonical names, with the name to use."""
 
 import pytest
 
-from aisim.data_cli import run_check_names
+from aisim.data_validate import validate_local
 from aisim_core.data import Identity, Manifest, configuration_id
 from aisim_core.data.e2e import E2eConfigurationData, E2eManifestBody, ObservationRow, make_metric, write_configuration
 from aisim_core.data.names_check import check_names
@@ -99,17 +96,6 @@ def test_non_canonical_names_are_reported_with_the_canonical_spelling(tmp_path):
     assert by[("precision", "fp16")] == "float16"
 
 
-def test_cli_exit_status_and_json(tmp_path, capsys):
-    _e2e(tmp_path, hardware="B300")
-    assert run_check_names(argparse.Namespace(path=str(tmp_path))) == 1
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["ok"] is False and payload["findings"][0]["canonical"] == "b300_sxm"
-    clean = tmp_path / "clean"
-    clean.mkdir()
-    _e2e(clean)
-    assert run_check_names(argparse.Namespace(path=str(clean))) == 0
-
-
 @pytest.mark.parametrize("scope", ["root", "category-directory", "manifest-file"])
 def test_e2e_artifacts_resolve_from_the_dataset_root_whatever_is_checked(tmp_path, scope):
     manifest = _e2e(tmp_path, prefix="data", hardware="B300")  # artifact paths are dataset-root relative
@@ -123,12 +109,11 @@ def test_e2e_artifacts_resolve_from_the_dataset_root_whatever_is_checked(tmp_pat
     assert {(f.finding.kind, f.finding.value) for f in findings} == {("hardware", "B300")}
 
 
-def test_a_truncated_manifest_in_a_directory_is_an_error_like_the_file_checked_directly(tmp_path, capsys):
+def test_a_truncated_manifest_in_a_directory_is_an_error_like_the_file_checked_directly(tmp_path):
     manifest = _e2e(tmp_path)
     path = tmp_path / manifest
     path.write_text(path.read_text()[:40])  # truncated
     findings, errors = check_names(tmp_path)
     assert findings == [] and len(errors) == 1 and errors[0].startswith(manifest)
     assert check_names(path)[1], "checking the file directly reports an error too"
-    assert run_check_names(argparse.Namespace(path=str(tmp_path))) == 1  # the documented directory precheck fails
-    assert json.loads(capsys.readouterr().out)["ok"] is False
+    assert validate_local(tmp_path)["ok"] is False  # the documented directory precheck (`aisim data validate`) fails

@@ -3,7 +3,9 @@
 
 """AgentX bundles convert to aisim-e2e/v1 with canonical names and unchanged silicon statistics."""
 
+import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -121,6 +123,61 @@ def test_bundle_converts_with_canonical_names_and_lineage(tmp_path):
     assert data.series[0].metric == "running_requests" and data.series[0].end_ms == 1000.0
 
 
+def test_manifest_and_observed_tensor_parallel_must_agree(tmp_path):
+    path = _bundle(tmp_path, "mismatch")
+    _set_effective_parallelism(path, tensor_parallel_size=4)
+    with pytest.raises(AgentxBundleError, match="tensor_parallel=8.*tensor_parallel_size=4"):
+        agentx_bundle_to_configuration(path)
+    _set_effective_parallelism(path, tensor_parallel_size=8)
+    assert agentx_bundle_to_configuration(path).body.parallelism["aggregated"]["tp"] == 8
+    _set_effective_parallelism(path, pipeline_parallel_size=1)
+    assert agentx_bundle_to_configuration(path).body.parallelism["aggregated"]["tp"] == 8
+
+
+@pytest.mark.parametrize(
+    "name", ["manifest.json", "configuration.json", "workload.json", "features.json", "observations.json"]
+)
+def test_bundle_hashes_the_bytes_it_parses_even_if_a_file_is_replaced(tmp_path, monkeypatch, name):
+    from aisim_core.data import agentx_convert
+
+    path = _bundle(tmp_path, "snapshot")
+    before = agentx_bundle_to_configuration(path)
+    original = (path / name).read_bytes()
+    read_bytes = Path.read_bytes
+    make_body = agentx_convert._body
+    reads = []
+
+    def counting_read(file):
+        if file.parent == path:
+            reads.append(file.name)
+        return read_bytes(file)
+
+    def body_then_replace(*args):
+        body = make_body(*args)
+        # Replace a parsed input before the observation digest is calculated.
+        (path / name).write_bytes(original + b"\n")
+        return body
+
+    monkeypatch.setattr(Path, "read_bytes", counting_read)
+    monkeypatch.setattr(agentx_convert, "_body", body_then_replace)
+    during = agentx_bundle_to_configuration(path)
+    assert during == before
+    assert len(reads) == len(set(reads)) == 5
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    monkeypatch.setattr(agentx_convert, "_body", make_body)
+    assert agentx_bundle_to_configuration(path).observations[0].record_sha256 != before.observations[0].record_sha256
+
+
+@pytest.mark.parametrize("content", [None, b"null", b"{}"])
+def test_optional_features_keep_their_empty_bundle_behavior(tmp_path, content):
+    path = _bundle(tmp_path, "optional-features")
+    if content is None:
+        (path / "features.json").unlink()
+    else:
+        (path / "features.json").write_bytes(content)
+    assert agentx_bundle_to_configuration(path).body.ext["agentx/1"]["features"] == []
+
+
 def test_silicon_statistics_match_the_agentx_cohort_definition(tmp_path):
     data = agentx_bundle_to_configuration(_bundle(tmp_path, "qwen-weka-l4"))
     out = tmp_path / "out"
@@ -140,6 +197,41 @@ def test_bundles_with_one_serving_identity_merge_into_one_configuration(tmp_path
     assert len(configs) == 1
     assert [o.observation_id for o in configs[0].observations] == ["l1", "l4"]
     assert {o.concurrency for o in configs[0].observations} == {1, 4}
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_bundles_with_mixed_origins_cannot_share_a_manifest(tmp_path, reverse):
+    bundles = [_bundle(tmp_path, "official", category="agentx"), _bundle(tmp_path, "local")]
+    if reverse:
+        bundles.reverse()
+    with pytest.raises(AgentxBundleError, match="mixed origins"):
+        agentx_bundles_to_configurations(bundles)
+
+
+def test_same_origin_official_bundles_still_merge(tmp_path):
+    configs = agentx_bundles_to_configurations(
+        [_bundle(tmp_path, "o1", category="agentx"), _bundle(tmp_path, "o2", category="agentx")]
+    )
+    assert len(configs) == 1 and configs[0].body.origin == "official"
+    assert len(configs[0].observations) == 2
+
+
+@pytest.mark.parametrize("categories", [("self_collected", "agentx"), ("agentx", "self_collected")])
+def test_bundles_with_different_origins_cannot_merge(tmp_path, categories):
+    bundles = [
+        _bundle(tmp_path, f"l{lanes}", category=category, lanes=lanes) for lanes, category in enumerate(categories, 1)
+    ]
+    # Origin is provenance, not serving identity. Neither order may relabel the other origin's requests.
+    assert len({agentx_bundle_to_configuration(bundle).body.configuration_id() for bundle in bundles}) == 1
+    with pytest.raises(AgentxBundleError, match="cannot merge.*origins"):
+        agentx_bundles_to_configurations(bundles)
+
+
+def test_official_lanes_still_merge_and_preserve_their_provenance(tmp_path):
+    bundles = [_bundle(tmp_path, f"l{lanes}", category="agentx", lanes=lanes) for lanes in (1, 4)]
+    (merged,) = agentx_bundles_to_configurations(bundles)
+    assert merged.body.origin == "official"
+    assert {r.observation_id for r in merged.requests} == {"l1", "l4"}
 
 
 def test_official_bundle_without_reference_keys_records_a_lineage_gap(tmp_path):
@@ -328,3 +420,44 @@ def test_a_lineage_correction_changes_the_observation_revision_and_snapshot_id(t
         return snapshot_id([member], {"kind": "k"}, "p")
 
     assert snapshot(after) != snapshot(before)
+
+
+@pytest.mark.parametrize("features_present", [True, False])
+def test_bundle_hash_covers_the_bytes_parsed_once(tmp_path, monkeypatch, features_present):
+    path = _bundle(tmp_path, "read-once")
+    if not features_present:
+        (path / "features.json").unlink()
+    names = ("manifest.json", "configuration.json", "workload.json", "features.json", "observations.json")
+    original = {name: (path / name).read_bytes() for name in names if (path / name).exists()}
+    digest = hashlib.sha256()
+    for name, data in original.items():
+        digest.update(f"{name}\0{len(data)}\0".encode())
+        digest.update(data)
+    real_read = Path.read_bytes
+    reads = []
+
+    def replace_after_read(self):
+        reads.append(self.name)
+        data = real_read(self)
+        self.write_bytes(b"{}")
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", replace_after_read)
+    data = agentx_bundle_to_configuration(path)
+    assert data.body.settings["scheduler.max_num_seqs"].value == 64
+    assert data.observations[0].record_sha256 == digest.hexdigest()
+    assert reads == list(names)
+
+
+@pytest.mark.parametrize("field", ["seed", "context_limit", "boundary"])
+def test_merging_different_workload_facts_is_rejected(tmp_path, field):
+    first, second = _bundle(tmp_path, "first", lanes=1), _bundle(tmp_path, "second", lanes=8)
+    workload = json.loads((second / "workload.json").read_text())
+    if field == "boundary":
+        workload["variant"]["boundary"] = "different-boundary"
+    else:
+        params = workload["other_silicon_settings_and_observations"][0]["parameters"]
+        next(p for p in params if p["name"] == field)["value"] += 1
+    (second / "workload.json").write_text(json.dumps(workload))
+    with pytest.raises(AgentxBundleError, match="different workload"):
+        agentx_bundles_to_configurations([first, second])

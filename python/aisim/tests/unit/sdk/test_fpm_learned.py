@@ -6,6 +6,7 @@ from __future__ import annotations
 import gzip
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -201,6 +202,31 @@ def _stump_artifact() -> dict:
         },
         "metadata": {},
     }
+
+
+def test_learned_construction_needs_no_operation_data_on_a_cold_offline_host(tmp_path, monkeypatch):
+    """A learned artifact is self-contained: building from it must not compose or fetch the default dataset."""
+    native = pytest.importorskip("aisim_core._native")
+    if not hasattr(native.RustForwardPassPerfModel, "from_learned"):
+        pytest.skip("compiled extension predates the learned model")
+    from aisim_core.data.default_systems import clear_default_systems_cache, default_systems_path
+    from aisim_core.data.ensure import MissingDataError
+    from aisim_core.sdk import perf_database
+    from aisim_core.sdk.rust_engine_step import RustForwardPassPerfModel
+
+    monkeypatch.setenv("AISIM_DATA_OFFLINE", "1")
+    monkeypatch.setenv("AISIM_DATA_CACHE", str(tmp_path / "cold-cache"))
+    monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", "unset")
+    monkeypatch.delenv("AICONFIGURATOR_SYSTEMS_PATH")
+    monkeypatch.setattr(perf_database, "_SYSTEMS_PATHS", None)  # no set_systems_paths() override either
+    clear_default_systems_cache()
+    with pytest.raises(MissingDataError):  # the precondition: composing the default root would fail here
+        default_systems_path()
+
+    model = RustForwardPassPerfModel.from_learned(_stump_artifact())
+
+    assert model.estimate_forward_pass_time_ms([_decode_fpm(1, 50, 0.0)]) == pytest.approx(10.0)
+    assert "AICONFIGURATOR_SYSTEMS_PATH" not in os.environ
 
 
 @pytest.mark.parametrize("enabled", [False, True, None], ids=["disabled", "enabled", "default_hybrid"])

@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
+import json
+import os
 import shutil
 import sys
 
@@ -21,8 +23,75 @@ from aisim_core.data.catalog import (
 from aisim_core.data.eval import EvalRecord, PredictionIdentity, write_record
 from aisim_core.data.parquet import read_parquet_schema_id
 from aisim_core.data.systems import spec_sha256
+from tests.unit.data.test_fetch import _repin
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.mark.parametrize("failure", ["write", "replace"])
+def test_coverage_replacement_preserves_previous_declaration(tmp_path, monkeypatch, failure):
+    root, systems = tmp_path / "dataset", tmp_path / "systems"
+    systems.mkdir()
+    build_catalog(root, systems_dir=systems, expected_models=["original"], expected_frameworks=["vllm"])
+    path = root / "catalog/coverage.json"
+    before = path.read_bytes()
+    original = catalog_module.tempfile.NamedTemporaryFile
+
+    original_replace = catalog_module.os.replace
+    replacement_reached = []
+
+    def fail_replace(src, dst):
+        if dst == path:
+            replacement_reached.append(True)
+            raise OSError("synthetic replacement failure")
+        return original_replace(src, dst)
+
+    class BrokenWrite:
+        def __enter__(self):
+            self.handle = original("w", dir=path.parent, delete=False)
+            self.name = self.handle.name
+            return self
+
+        def write(self, value):
+            self.handle.write(value[:8])
+            raise OSError("synthetic partial write")
+
+        def __exit__(self, *args):
+            self.handle.close()
+
+    if failure == "write":
+        monkeypatch.setattr(catalog_module.tempfile, "NamedTemporaryFile", lambda *a, **kw: BrokenWrite())
+    else:
+        monkeypatch.setattr(catalog_module.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="synthetic"):
+        build_catalog(root, systems_dir=systems, expected_models=["replacement"])
+    if failure == "replace":
+        assert replacement_reached == [True]
+    assert path.read_bytes() == before
+    assert catalog_module.read_catalog_coverage(root).expected_models == ["original"]
+    assert not [p for p in path.parent.iterdir() if p.is_file() and p.name.startswith("tmp")]
+
+
+@pytest.mark.parametrize("hardware_count", [1, 2])
+def test_catalog_rejects_projected_grid_before_materializing_rows(tmp_path, monkeypatch, hardware_count):
+    monkeypatch.setattr(catalog_module, "known_system_specs", lambda _: {f"gpu{i}": NEW for i in range(hardware_count)})
+
+    def unexpected(*args):
+        pytest.fail("oversized grid reached row materialization")
+
+    monkeypatch.setattr(catalog_module, "_summarize", unexpected)
+    # The same dimensions fit on one hardware only; hardware must count too.
+    count = 1000 if hardware_count == 1 else 200
+    frameworks = 1000 if hardware_count == 1 else 200
+    with pytest.raises(ValueError, match="projected catalog grid.*limit"):
+        build_catalog(
+            tmp_path,
+            expected_models=[f"model{i}" for i in range(count)],
+            expected_frameworks=[f"framework{i}" for i in range(frameworks)],
+            write=False,
+        )
+    assert not (tmp_path / "catalog").exists()
+
 
 SPEC = {"gpu": {"flops": 1}, "node": {"gpus": 8}}
 NEW = spec_sha256(SPEC)
@@ -302,11 +371,91 @@ def test_a_manifest_edited_after_indexing_is_not_counted(dataset):
         build_catalog(root, systems_dir=systems)
 
 
+@pytest.mark.parametrize("field", ["identity", "category"])
+def test_catalog_rejects_a_digest_pinned_manifest_for_another_cell(dataset, field):
+    root, systems = dataset
+    path = "data/fpm/m0.json"
+    doc = json.loads((root / path).read_bytes())
+    if field == "identity":
+        doc["identity"]["hardware"] = "h100_sxm"
+    else:
+        doc["category"] = "e2e"
+    (root / path).write_text(json.dumps(doc))
+    index_path = root / "catalog/fpm.json"
+    index = json.loads(index_path.read_bytes())
+    index["entries"][0]["manifest"] = _file_artifact(root, path).model_dump(by_alias=True)
+    index_path.write_text(json.dumps(index))
+    dataset_path = root / "catalog/dataset.json"
+    document = json.loads(dataset_path.read_bytes())
+    document["categories"]["fpm"]["index"] = _file_artifact(root, "catalog/fpm.json").model_dump(by_alias=True)
+    dataset_path.write_text(json.dumps(document))
+    with pytest.raises(ValueError, match="catalog and manifest identity mismatch"):
+        build_catalog(root, systems_dir=systems)
+
+
 def test_a_category_index_edited_after_indexing_is_refused(dataset):
     root, systems = dataset
     index = root / "catalog/e2e.json"
     index.write_text(index.read_text() + "\n")
     with pytest.raises(ValueError, match="integrity mismatch"):
+        build_catalog(root, systems_dir=systems)
+
+
+@pytest.mark.parametrize("target", ["catalog/fpm.json", "data/fpm/m0.json"])
+def test_catalog_parses_the_bytes_that_passed_verification(dataset, monkeypatch, target):
+    root, systems = dataset
+    victim = root / target
+    original = victim.read_bytes()
+    changed = json.loads(original)
+    if target.startswith("catalog/"):
+        changed["entries"] = []
+    else:
+        changed["evidence_gaps"] = []
+    replacement = json.dumps(changed, separators=(",", ":")).encode()
+    replacement += b" " * (len(original) - len(replacement))
+    assert len(replacement) == len(original)
+    real_open = type(victim).open
+    replaced = False
+
+    def swap_after_open(path, *args, **kwargs):
+        nonlocal replaced
+        stream = real_open(path, *args, **kwargs)
+        if path == victim and not replaced and kwargs.get("mode", args[0] if args else "r") == "rb":
+            replaced = True
+            temporary = victim.with_suffix(".replacement")
+            with real_open(temporary, "wb") as out:
+                out.write(replacement)
+            os.replace(temporary, victim)
+        return stream
+
+    monkeypatch.setattr(type(victim), "open", swap_after_open)
+    rows = build_catalog(root, systems_dir=systems)
+    assert replaced
+    cell = _cell(rows, "fpm", QWEN, "b200_sxm")
+    assert cell.n_configs == 1 and cell.n_evidence_gaps == 2
+
+
+@pytest.mark.parametrize(
+    "field,value", [("identity", "h200_sxm"), ("purpose", "operation-tables"), ("category", "e2e")]
+)
+def test_catalog_rejects_digest_valid_manifest_identity_mismatches(dataset, field, value):
+    root, systems = dataset
+    files = {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*.json")}
+    path = "data/fpm/m0.json"
+    document = json.loads(files[path])
+    if field == "identity":
+        document[field]["hardware"] = value
+    else:
+        document[field] = value
+    files[path] = json.dumps(document).encode()
+    # Refresh both enclosing pins: digest integrity alone cannot establish identity equality.
+    index = json.loads(files["catalog/fpm.json"])
+    index["entries"][0]["manifest"] = _artifact(path, files[path]).model_dump(by_alias=True)
+    files["catalog/fpm.json"] = json.dumps(index).encode()
+    _repin(files, "catalog/fpm.json")
+    for name, data in files.items():
+        (root / name).write_bytes(data)
+    with pytest.raises(ValueError, match="catalog and manifest identity mismatch"):
         build_catalog(root, systems_dir=systems)
 
 
@@ -337,3 +486,81 @@ def test_a_manifest_beside_eval_records_is_not_loaded_as_a_record(dataset):
     victim.write_text(victim.read_text().replace("2026-11", "2027-01"))
     with pytest.raises(ValueError, match="content hash"):
         build_catalog(root, systems_dir=systems)
+
+
+def test_catalog_versions_preserve_v1_and_write_v2(tmp_path):
+    import pyarrow as pa
+    from pydantic import ValidationError
+
+    from aisim_core.data.catalog import CATALOG_SCHEMA_ID, CatalogRowV1
+    from aisim_core.data.parquet import ParquetSchemaError, read_parquet, write_parquet
+    from aisim_core.data.schemas import SCHEMA_MODELS
+
+    legacy = CatalogRowV1(
+        layer="e2e",
+        model="synthetic/model",
+        hardware="h100_sxm",
+        framework="vllm",
+        status="have",
+        n_configs=1,
+        n_evidence_gaps=0,
+        n_eval_records=0,
+    )
+    path = shard_path(tmp_path, "e2e", "h100_sxm")
+    write_parquet(pa.Table.from_pylist([legacy.model_dump()]), path, "aisim-catalog/v1")
+    row = Catalog(tmp_path).rows(hardware="h100_sxm", layer="e2e")[0]
+    assert row.acc_prediction_fingerprint is None
+    row.acc_prediction_fingerprint = "a" * 64
+    catalog_module._write(tmp_path, [row], {})
+    assert CATALOG_SCHEMA_ID == "aisim-catalog/v2"
+    assert read_parquet_schema_id(path) == CATALOG_SCHEMA_ID
+    assert Catalog(tmp_path).rows(hardware="h100_sxm", layer="e2e")[0] == row
+    with pytest.raises(ParquetSchemaError):
+        read_parquet(path, "aisim-catalog/v1")  # an older reader rejects the new version explicitly
+    with pytest.raises(ValidationError):
+        SCHEMA_MODELS["aisim-catalog/v1"].model_validate(row.model_dump())
+    assert "acc_prediction_fingerprint" not in SCHEMA_MODELS["aisim-catalog/v1"].model_fields
+
+
+@pytest.mark.parametrize("victim", ["catalog/fpm.json", "data/fpm/m0.json"])
+def test_catalog_uses_only_verified_bytes_after_a_replacement(dataset, monkeypatch, victim):
+    from collections import defaultdict
+
+    import aisim_core.data as data
+
+    root, _ = dataset
+    baseline = defaultdict(catalog_module._Cell)
+    catalog_module._read_indexed_cells(root, baseline)
+    original_bytes, original_verify = data._verified_bytes, data._verify
+    swapped = []
+
+    def swap(artifact):
+        if artifact.path != victim or swapped:
+            return
+        import json
+
+        path = root / victim
+        document = json.loads(path.read_bytes())
+        if victim.startswith("catalog/"):
+            document["entries"] = []
+        else:
+            document["evidence_gaps"] = [{"field": "unverified"}] * 7
+        path.write_text(json.dumps(document))
+        swapped.append(victim)
+
+    def verified_bytes(root_, artifact):
+        raw = original_bytes(root_, artifact)
+        swap(artifact)
+        return raw
+
+    def verify(root_, artifact):
+        path = original_verify(root_, artifact)
+        swap(artifact)
+        return path
+
+    monkeypatch.setattr(catalog_module, "_verified_bytes", verified_bytes)
+    monkeypatch.setattr(catalog_module, "_verify", verify, raising=False)
+    got = defaultdict(catalog_module._Cell)
+    catalog_module._read_indexed_cells(root, got)
+    assert swapped == [victim]
+    assert got == baseline

@@ -15,6 +15,7 @@ import pytest
 from aisim.sdk import common, rust_engine_step
 from aisim.sdk.config import ModelConfig, RuntimeConfig
 from aisim.sdk.performance_result import MoECommFallback
+from aisim_core.data.default_systems import default_systems_path
 
 pytestmark = pytest.mark.unit
 
@@ -209,7 +210,7 @@ def test_clear_all_op_caches_drops_engine_handles(_handle_cache_harness) -> None
     assert not rust_engine_step._ENGINE_HANDLE_CACHE
 
 
-def test_cached_engine_handle_mirrors_database_systems_root(_handle_cache_harness, monkeypatch) -> None:
+def test_cached_engine_handle_mirrors_database_systems_root(_handle_cache_harness, monkeypatch, tmp_path) -> None:
     """The compiled engine must resolve the system yaml from the root the
     paired database actually matched (multi-root ``--systems-paths``), not the
     process-wide env default; the env is only the fallback for duck-typed
@@ -233,6 +234,17 @@ def test_cached_engine_handle_mirrors_database_systems_root(_handle_cache_harnes
     del database.systems_root
     rust_engine_step._cached_engine_handle(model("fallback"), database)
     assert captured[-1] == "/env/root"
+
+    monkeypatch.delenv("AICONFIGURATOR_SYSTEMS_PATH")
+    systems_root = tmp_path / "systems"
+    systems_root.mkdir()
+    monkeypatch.setattr(
+        "aisim_core.sdk.perf_database.get_systems_paths",
+        lambda: [str(systems_root)],
+    )
+    rust_engine_step._cached_engine_handle(model("sdk-default"), database)
+    assert captured[-1] == str(systems_root)
+    assert "AICONFIGURATOR_SYSTEMS_PATH" not in os.environ
 
 
 def _dense_model() -> SimpleNamespace:
@@ -1443,7 +1455,7 @@ def _supported_fpm_validation_config() -> dict[str, object]:
 def test_nemotron_super_fp8_native_estimation_uses_packaged_moe_data() -> None:
     """Issue #1522: the exact deployed MoE key must estimate successfully.
 
-    HYBRID: vLLM ships no Mamba2 table, and SILICON readiness now reports that (AISIM-2194).
+    HYBRID: vLLM ships no Mamba2 table, and SILICON readiness now reports that.
     """
     pytest.importorskip("aisim_core")
     from aisim_core.sdk.rust_engine_step import RustForwardPassPerfModel
@@ -1527,7 +1539,6 @@ def test_nemotron_super_fp8_auto_degrades_to_hybrid_on_the_missing_mamba2_table(
     """AISIM-2194: the SILICON op_level candidate misses the Mamba2 table; auto rebuilds it in HYBRID."""
     pytest.importorskip("aisim_core")
     from dataclasses import replace
-    from importlib import resources
 
     from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
     from aisim_core.sdk.errors import PerfDataNotAvailableError
@@ -1558,9 +1569,11 @@ def test_nemotron_super_fp8_auto_degrades_to_hybrid_on_the_missing_mamba2_table(
         assert provenance["selected_estimation_mode"] == "op_level"
         assert provenance["requested_database_mode"] == "SILICON"
         assert provenance["selected_database_mode"] == "HYBRID"
-        packaged = str(resources.files("aisim_core") / "systems")
-        assert provenance["selected_systems_root"] == packaged
-        assert provenance["config"]["systems_paths"] == [packaged]
+        from aisim_core.data.default_systems import default_systems_path
+
+        default_root = default_systems_path()
+        assert provenance["selected_systems_root"] == default_root
+        assert provenance["config"]["systems_paths"] == [default_root]
         assert provenance["config"]["database_mode"] == "HYBRID"
         assert provenance["config"]["estimation_mode"] == "op_level"
         assert provenance["config"]["fallback_policy"] == "deny"
@@ -2045,7 +2058,7 @@ def test_wideep_mla_spec_emits_per_rank_heads_not_tp():
 
 # ---- Large-EP op graphs: native compilation (AIC-1601, PR 2.5) ----
 
-_SYSTEMS_DATA_ROOT = Path(__file__).resolve().parents[3] / "src/aisim_core/systems/data"
+_SYSTEMS_DATA_ROOT = Path(default_systems_path()) / "data"
 
 
 def test_large_ep_opspec_key_sets_match_the_rust_structs():
@@ -2657,11 +2670,9 @@ def test_decode_energy_bridge_preserves_error_taxonomy(monkeypatch, entrypoint, 
 
 @pytest.mark.integration
 def test_canonical_native_selection_retries_roots_and_pins_effective_configuration(tmp_path):
-    from importlib import resources
-
     from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
-    packaged = str(resources.files("aisim_core") / "systems")
+    packaged = default_systems_path()
     config = ForwardPassPerfModelConfig(
         model="Qwen/Qwen3-32B",
         system="h200_sxm",

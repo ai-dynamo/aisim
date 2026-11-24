@@ -34,6 +34,7 @@ from aisim.sweeper import (
 )
 from aisim.sweeper.config import Workload
 from aisim.sweeper.replay import REPLAY_SPEC_API_VERSION, RunnerCapabilities
+from aisim_core.data.default_systems import default_systems_path
 from aisim_core.sdk.deepseek_v41 import MODEL_PATH as DEEPSEEK_V41_MODEL_PATH
 from scripts.e2e_accuracy.source.replay import engine_args
 
@@ -227,6 +228,31 @@ def test_generic_speculation_requires_explicit_runner_capability(location, neste
     capabilities.require_compatible(spec)
     with pytest.raises(ValueError, match="generic speculation; use --stack engine"):
         replace(capabilities, supports_generic_speculation=False).require_compatible(spec)
+
+
+def test_telemetry_capability_keeps_existing_positional_arguments():
+    # RunnerCapabilities is public: an adapter passing the earlier fields positionally keeps their meaning.
+    default = RunnerCapabilities()
+    earlier = [
+        field.name for field in fields(RunnerCapabilities) if not field.kw_only and field.name != "supports_telemetry"
+    ]
+    changed = (
+        "supports_deferred_encoder_overlay",
+        "supports_mtp_host_offload",
+        "supports_agentic_primers_only",
+        "supports_kvcr_g3",
+    )
+    positional = RunnerCapabilities(*(True if name in changed else getattr(default, name) for name in earlier))
+    assert positional == replace(default, **dict.fromkeys(changed, True))
+    assert positional.supports_telemetry is False
+
+
+def test_engine_runner_factory_declares_telemetry_support():
+    telemetry = ReplayOutputRequirements(capture_telemetry=True)
+    capabilities = EngineReplayRunnerFactory().capabilities()
+    capabilities.require_output_support(telemetry)
+    with pytest.raises(ValueError, match="does not support replay telemetry"):
+        replace(capabilities, supports_telemetry=False).require_output_support(telemetry)
 
 
 @pytest.mark.parametrize("location", ["rank", "canonical"])
@@ -3629,7 +3655,7 @@ def test_direct_replay_resolves_aliases_in_the_effective_systems_root(monkeypatc
 
     from aisim_core.sdk import perf_database
 
-    bundled = Path(perf_database.__file__).resolve().parents[1] / "systems"
+    bundled = Path(default_systems_path())
     system = yaml.safe_load((bundled / "h200_sxm.yaml").read_text())
     system["data_dir"] = str(bundled / system["data_dir"])
     (tmp_path / "h200_sxm.yaml").write_text(yaml.safe_dump(system))

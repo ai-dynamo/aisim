@@ -1053,12 +1053,9 @@ fn moe_sol_latency_ms(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn b200_vllm_db() -> PerfDatabase {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("python/aisim/src/aisim_core/systems");
+        let root = crate::test_systems::path("");
         PerfDatabase::load(&root, "b200_sxm", "vllm", "0.19.0").expect("db loads")
     }
 
@@ -1084,9 +1081,7 @@ mod tests {
     }
 
     fn b200_trtllm_db() -> PerfDatabase {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("python/aisim/src/aisim_core/systems");
+        let root = crate::test_systems::path("");
         PerfDatabase::load(&root, "b200_sxm", "trtllm", "1.3.0rc20").expect("db loads")
     }
 
@@ -1500,9 +1495,7 @@ mod tests {
     /// ```
     #[test]
     fn moe_nvfp4_wo_ladder_matches_python_oracle() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("python/aisim/src/aisim_core/systems");
+        let root = crate::test_systems::path("");
         let db = PerfDatabase::load(&root, "h200_sxm", "vllm", "0.19.0")
             .expect("h200/vllm/0.19.0 db loads")
             .with_mode(

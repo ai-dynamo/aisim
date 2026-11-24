@@ -39,8 +39,8 @@ specializes the shared envelope (``aisim-artifact-manifest/v1``, category
   hash-linked from the manifest, tier 3, size-capped, with a redaction flag.
   A configuration with many observations stores its raw records in one
   ``raw-output-bundle`` (one record per line); each observation keeps the byte
-  range (``raw_offset``, ``raw_length``) and the SHA-256 (``record_sha256``) of
-  its own record, so every row stays individually auditable.
+  range (``raw_offset``, ``raw_length``) and the SHA-256 of its own record
+  (``raw_record_sha256``, falling back to ``record_sha256`` for older rows).
 
 All tables are Parquet+zstd written through :mod:`aisim_core.data.parquet`.
 Offline only; no network access.
@@ -59,15 +59,27 @@ import tempfile
 import types
 import typing
 import warnings
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
 import pyarrow as pa
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
-from aisim_core.data import Artifact, Digest, Identity, Manifest, _file, _verify, configuration_id
+from aisim_core.data import (
+    Artifact,
+    Digest,
+    Identity,
+    Manifest,
+    _file,
+    _relative,
+    _verified_bytes,
+    _verify,
+    configuration_id,
+    path_component,
+)
 from aisim_core.data.loaders import E2eLoader, E2eTables, LoaderError
 from aisim_core.data.names import NameFinding, canonical_name, canonical_unit, name_findings, normalize, split_framework
 from aisim_core.data.parquet import read_parquet, write_parquet
@@ -84,7 +96,7 @@ E2E_TABLE_SCHEMAS = (OBSERVATIONS_SCHEMA, METRICS_SCHEMA, REQUESTS_SCHEMA, SERIE
 PURPOSE = "e2e-configuration"
 # Minor version of the /v1 family. Bump when an optional field, column or registered name is added; a reader
 # of the same major accepts any minor and warns when a file is newer than it knows.
-SCHEMA_MINOR = 1
+SCHEMA_MINOR = 3
 
 # Canonical units. Latency statistics are milliseconds, throughput tokens/s.
 UNIT_MS = "ms"
@@ -328,7 +340,7 @@ def public_release_problems(body: E2eManifestBody) -> list[str]:
 
 
 _GITHUB_RUN = re.compile(
-    r"^https://github\.com/(?P<repo>[\w.-]+/[\w.-]+)/actions/runs/(?P<run>\d+)(?:/attempts/\d+)?/?$"
+    r"^https://github\.com/(?P<repo>[\w.-]+/[\w.-]+)/actions/runs/(?P<run>\d+)(?:/attempts/(?P<attempt>\d+))?/?$"
 )
 
 
@@ -340,6 +352,46 @@ def producer_run_id(run_url: str | None) -> str | None:
     """
     found = _GITHUB_RUN.match(run_url or "")
     return None if found is None else f"{found['repo']}#{found['run']}"
+
+
+def _public_producer_run(run_url: str | None, run: Mapping[str, Any]) -> tuple[str | None, dict[str, Any]]:
+    """Only public, typed run identity and freshness facts belong in a normalized manifest."""
+    found = _GITHUB_RUN.fullmatch(run_url or "")
+    if found is None:
+        return None, {}
+    attempt = run.get("run_attempt")
+    if attempt is None and found["attempt"] is not None:
+        attempt = int(found["attempt"])
+    if attempt is not None and (type(attempt) is not int or attempt < 1):
+        raise ValueError("producer run_attempt must be a positive integer")
+    if found["attempt"] is not None and attempt != int(found["attempt"]):
+        raise ValueError("producer run attempt differs from its URL")
+    public: dict[str, Any] = {"github_run_id": found["run"]}
+    if attempt is not None:
+        public["run_attempt"] = attempt
+    if re.fullmatch(r"[0-9a-f]{40}", str(run.get("head_sha", ""))):
+        public["head_sha"] = run["head_sha"]
+    # Fixed vocabularies and timestamp syntax prevent arbitrary metadata (URLs, host names, tokens) leaking
+    # through otherwise public fields. The raw producer response remains in private acquisition evidence.
+    if re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})", str(run.get("run_started_at", ""))
+    ):
+        public["run_started_at"] = run["run_started_at"]
+    if run.get("status") in ("queued", "in_progress", "completed", "waiting", "requested", "pending"):
+        public["status"] = run["status"]
+    if run.get("conclusion") in (
+        "success",
+        "failure",
+        "cancelled",
+        "skipped",
+        "timed_out",
+        "neutral",
+        "action_required",
+        "stale",
+        "startup_failure",
+    ):
+        public["conclusion"] = run["conclusion"]
+    return f"{producer_run_id(run_url)}/attempts/{attempt if attempt is not None else 'unknown'}", public
 
 
 class ObservationRow(_Record):
@@ -372,9 +424,14 @@ class ObservationRow(_Record):
     requests_failed: int | None = Field(default=None, ge=0)
     device_count: int | None = Field(default=None, ge=0)
     raw_artifact_id: str | None = None
+    # Minor 2: raw summary/record digest when record_sha256 binds a larger evidence revision.
+    # Older observations use record_sha256 for both purposes.
+    raw_record_sha256: Digest | None = None
+    # Minor 3: version of all persisted inputs of the observation (for AIPerf, the observation fields and its request
+    # rows), so a corrected request row changes snapshot membership while the raw audit digests stay put.
+    observation_sha256: Digest | None = None
     # Member of a raw-output bundle: byte range of this observation's record inside the uncompressed
-    # bundle. Both null when the artifact holds exactly this observation's record. ``record_sha256`` is
-    # always the hash of that record, so every row can be audited on its own.
+    # bundle. Both null when the artifact holds exactly this observation's record.
     raw_offset: int | None = Field(default=None, ge=0)
     raw_length: int | None = Field(default=None, ge=0)
     log_artifact_id: str | None = None
@@ -467,6 +524,18 @@ class RequestRow(_Record):
     attrs: str | None = None  # canonical JSON text: think time, dependency IDs, worker ID, ...
 
 
+def _observation_sha256(observation: ObservationRow, requests: Sequence[RequestRow]) -> str:
+    """Version the observation and its persisted request rows, including extension fields."""
+    return _sha(
+        _canonical(
+            {
+                "observation": observation.model_dump(exclude={"observation_sha256"}),
+                "requests": [row.model_dump() for row in requests],
+            }
+        )
+    )
+
+
 class SeriesRow(_Record):
     """One interval of a server-side time series (running requests, KV use, ...).
 
@@ -489,7 +558,19 @@ class SnapshotMember(_Record):
     configuration_id: str = Field(pattern=r"^cfg-[0-9a-f]{64}$")
     observation_id: str = Field(min_length=1)
     record_sha256: Digest
+    observation_sha256: Digest | None = None
     manifest_path: str = Field(min_length=1)
+
+    @classmethod
+    def from_observation(cls, observation: ObservationRow, manifest_path: str) -> SnapshotMember:
+        """Bind membership to both the evidence revision and the complete observation version."""
+        return cls(
+            configuration_id=observation.configuration_id,
+            observation_id=observation.observation_id,
+            record_sha256=observation.record_sha256,
+            observation_sha256=observation.observation_sha256,
+            manifest_path=manifest_path,
+        )
 
 
 class SnapshotAcquisition(_Record):
@@ -715,6 +796,18 @@ def _gzip(data: bytes) -> bytes:
     return gzip.compress(data, compresslevel=6, mtime=0)  # fixed mtime keeps bytes deterministic
 
 
+def _provenance_path(directory: str, item: ProvenanceFile) -> tuple[str, str]:
+    """The artifact name and relative path of one provenance file; the name is validated like any output path.
+
+    The kind prefixes the stored file so a raw output and a log of one name keep distinct bytes. A name may be nested
+    but never leaves its provenance directory.
+    """
+    name = _relative(
+        item.name or f"{item.kind}-{(item.observation_id or _sha(item.data)[:12]).replace(':', '_').replace('/', '_')}"
+    )
+    return name, f"{directory}/provenance/{item.kind}-{name}.gz"
+
+
 def store_provenance(root: Path, directory: str, item: ProvenanceFile) -> tuple[Artifact, ProvenanceInfo]:
     """Write one compressed provenance artifact under ``root/directory/provenance/``.
 
@@ -732,12 +825,12 @@ def store_provenance(root: Path, directory: str, item: ProvenanceFile) -> tuple[
         kept = full[:LOG_EXCERPT_BYTES] + TRUNCATION_MARKER + full[-LOG_EXCERPT_BYTES:]
         truncated = True
     full_sha = _sha(full)
-    name = item.name or f"{item.kind}-{(item.observation_id or full_sha[:12]).replace(':', '_').replace('/', '_')}"
-    relative = f"{directory}/provenance/{name}.gz"
+    name, relative = _provenance_path(directory, item)
     payload = _gzip(kept)
-    path = Path(root) / relative
+    path = _destination(Path(root), relative)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(payload)
+    with path.open("xb") as handle:  # duplicate destinations must never replace earlier staged bytes
+        handle.write(payload)
     artifact_id = f"{item.kind}:{name}"
     artifact = Artifact(
         artifact_id=artifact_id,
@@ -765,7 +858,7 @@ def store_provenance(root: Path, directory: str, item: ProvenanceFile) -> tuple[
 
 def read_provenance(root: Path, artifact: Artifact) -> bytes:
     """Verified, decompressed content of a provenance artifact (the excerpt when truncated)."""
-    return gzip.decompress(_verify(Path(root), artifact).read_bytes())
+    return gzip.decompress(_verified_bytes(Path(root), artifact))
 
 
 def bundle_raw_records(records: Sequence[tuple[str, bytes]]) -> tuple[bytes, dict[str, tuple[int, int]]]:
@@ -792,8 +885,8 @@ def bundle_raw_records(records: Sequence[tuple[str, bytes]]) -> tuple[bytes, dic
 def read_raw_records(root: Path, manifest: Manifest, observations: Iterable[ObservationRow]) -> dict[str, bytes]:
     """Verified raw record bytes by observation ID, decompressing each artifact once.
 
-    Each record is checked against the observation's ``record_sha256`` (and the artifact against its
-    manifest hash), so a bundled and a one-file-per-observation dataset read identically.
+    Each record is checked against ``raw_record_sha256`` when present, otherwise ``record_sha256``
+    (and the artifact against its manifest hash), so bundled and one-file-per-observation datasets read identically.
     """
     artifacts = {a.artifact_id: a for a in manifest.artifacts}
     infos = {p.artifact_id: p for p in body_from_manifest(manifest).provenance_artifacts}
@@ -819,7 +912,7 @@ def read_raw_records(root: Path, manifest: Manifest, observations: Iterable[Obse
             data = data[obs.raw_offset : obs.raw_offset + obs.raw_length]
         elif info.kind == "raw-output-bundle":
             raise LoaderError(f"observation {obs.observation_id} needs a record range in a bundle")
-        if _sha(data) != obs.record_sha256:
+        if _sha(data) != (obs.raw_record_sha256 or obs.record_sha256):
             raise LoaderError(f"raw record hash mismatch: {obs.observation_id}")
         out[obs.observation_id] = data
     return out
@@ -877,14 +970,15 @@ def configuration_dir(body: E2eManifestBody) -> str:
 
 
 def _write_table(root: Path, directory: str, name: str, schema_id: str, rows: Sequence[BaseModel], role: str):
+    path_component(name)
     relative = f"{directory}/{name}.parquet" if directory not in ("", ".") else f"{name}.parquet"
+    path = _destination(Path(root), relative)
     write_parquet(
         rows_to_table(schema_id, rows),
-        Path(root) / relative,
+        path,
         schema_id,
         extra_metadata={MINOR_METADATA_KEY.decode(): str(SCHEMA_MINOR)},
     )
-    path = Path(root) / relative
     return Artifact(
         artifact_id=name,
         path=relative,
@@ -897,30 +991,60 @@ def _write_table(root: Path, directory: str, name: str, schema_id: str, rows: Se
     )
 
 
+def _destination(root: Path, relative: str) -> Path:
+    """Validate a write destination before creating anything, including existing parent components."""
+    path = root
+    for part in _relative(relative).split("/"):
+        path = path / part
+        if path.is_symlink():
+            raise ValueError(f"symlink in output path: {relative}")
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise ValueError(f"output path leaves dataset root: {relative}")
+    return path
+
+
+class _PublicationRollbackError(OSError):
+    """Rollback was incomplete; the private staging directory must be retained for recovery."""
+
+
 def _publish_staged(stage: Path, root: Path, relatives: Sequence[str]) -> None:
     """Move staged files into ``root`` in order; if one move fails, restore every file already replaced.
 
-    The previous version of each file is kept as a hard link until all moves succeeded, so a failure in the middle
-    (a full disk on the second table) leaves the old manifest and the old tables it digests exactly as they were.
+    Existing files are backed up with hard links. Only successful replacements need restoration; every restoration
+    is attempted, and an incomplete rollback retains the stage for recovery. Configuration and snapshot writers
+    use fresh artifact paths, so only their final document switches a readable generation.
     """
+    if len(set(relatives)) != len(relatives):
+        raise ValueError("duplicate publication destination")
     done: list[tuple[Path, Path | None]] = []
+    for relative in relatives:
+        _destination(stage, relative)
+        _destination(root, relative)
     try:
         for relative in relatives:
-            destination = root / relative
+            destination = _destination(root, relative)
             destination.parent.mkdir(parents=True, exist_ok=True)
             backup = None
             if destination.exists():
                 backup = stage / ".previous" / relative
                 backup.parent.mkdir(parents=True, exist_ok=True)
                 os.link(destination, backup)
-            done.append((destination, backup))
             os.replace(stage / relative, destination)
-    except BaseException:
+            done.append((destination, backup))
+    except BaseException as exc:
+        problems = []
         for destination, backup in reversed(done):
-            if backup is not None:
-                os.replace(backup, destination)
-            else:
-                destination.unlink(missing_ok=True)
+            try:
+                if backup is not None:
+                    os.replace(backup, destination)
+                else:
+                    destination.unlink(missing_ok=True)
+            except OSError as rollback_error:
+                problems.append(f"{destination}: {rollback_error}")
+        if problems:
+            raise _PublicationRollbackError(
+                f"publication failed; recovery files retained at {stage}: {'; '.join(problems)}"
+            ) from exc
         raise
 
 
@@ -928,12 +1052,18 @@ def write_configuration(root: Path, data: E2eConfigurationData, *, prefix: str =
     """Write tables, provenance artifacts and the envelope manifest; return the manifest path.
 
     ``prefix`` (e.g. ``"data"``) is prepended to the configuration directory, so
-    every path stays relative to the dataset root.
+    every path stays relative to the dataset root. Artifacts use immutable generation paths; only the manifest
+    is replaced. Older generations remain available for readers that already opened their manifests.
+    Existing observation versions are refreshed from the rows being published;
+    the caller's objects are left untouched. Legacy unversioned rows stay unversioned.
     """
     root = Path(root)
     body = data.body
     cid = body.configuration_id()
-    directory = f"{prefix.strip('/')}/{configuration_dir(body)}" if prefix else configuration_dir(body)
+    directory = f"{_relative(prefix)}/{configuration_dir(body)}" if prefix else configuration_dir(body)
+    _destination(root, f"{directory}/manifest.json")
+    for item in data.provenance:  # reject a bad provenance name before anything, the root included, is created
+        _destination(root, _provenance_path(directory, item)[1])
     if not data.observations:
         raise ValueError("a configuration needs at least one observation")
     known = {o.observation_id for o in data.observations}
@@ -946,22 +1076,37 @@ def write_configuration(root: Path, data: E2eConfigurationData, *, prefix: str =
         stray = {r.observation_id for r in rows} - known
         if stray:
             raise ValueError(f"rows reference unknown observations: {sorted(stray)}")
+    requests_by_observation: dict[str, list[RequestRow]] = {}
+    for request in data.requests:
+        requests_by_observation.setdefault(request.observation_id, []).append(request)
+    observations = [
+        o.model_copy(
+            update={"observation_sha256": _observation_sha256(o, requests_by_observation.get(o.observation_id, []))}
+        )
+        if o.observation_sha256 is not None
+        else o
+        for o in data.observations
+    ]
     # Everything is built in a staging directory first: a failure after the tables (an oversize raw artifact, say)
     # must leave an existing configuration readable, so published files are replaced only once all succeeded.
     root.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=".e2e-stage-", dir=root))
     try:
+        # Published artifacts are immutable. Readers holding an older manifest keep its complete generation.
+        generation = f"{directory}/generations/{uuid4().hex}"
         artifacts = [
-            _write_table(stage, directory, "observations", OBSERVATIONS_SCHEMA, data.observations, "e2e-observations"),
-            _write_table(stage, directory, "metrics", METRICS_SCHEMA, data.metrics, "e2e-metrics"),
+            _write_table(stage, generation, "observations", OBSERVATIONS_SCHEMA, observations, "e2e-observations"),
+            _write_table(stage, generation, "metrics", METRICS_SCHEMA, data.metrics, "e2e-metrics"),
         ]
         if data.requests:
-            artifacts.append(_write_table(stage, directory, "requests", REQUESTS_SCHEMA, data.requests, "e2e-requests"))
+            artifacts.append(
+                _write_table(stage, generation, "requests", REQUESTS_SCHEMA, data.requests, "e2e-requests")
+            )
         if data.series:
-            artifacts.append(_write_table(stage, directory, "series", SERIES_SCHEMA, data.series, "e2e-series"))
+            artifacts.append(_write_table(stage, generation, "series", SERIES_SCHEMA, data.series, "e2e-series"))
         infos = list(body.provenance_artifacts)
         for item in data.provenance:
-            artifact, info = store_provenance(stage, directory, item)
+            artifact, info = store_provenance(stage, generation, item)
             artifacts.append(artifact)
             infos.append(info)
         body = body.model_copy(update={"provenance_artifacts": infos})
@@ -987,13 +1132,18 @@ def write_configuration(root: Path, data: E2eConfigurationData, *, prefix: str =
                 if ref is not None and ref not in artifact_ids:
                     raise ValueError(f"observation {o.observation_id} references unknown artifact {ref}")
         relative = f"{directory}/manifest.json"
-        (stage / relative).write_text(
+        _destination(stage, relative).parent.mkdir(parents=True, exist_ok=True)
+        _destination(stage, relative).write_text(
             json.dumps(manifest.model_dump(mode="json", by_alias=True), indent=2, sort_keys=True, allow_nan=False)
             + "\n"
         )
         _publish_staged(stage, root, [*(a.path for a in artifacts), relative])  # the manifest last
+    except _PublicationRollbackError:
+        stage = None  # keep every remaining backup, with its path in the exception
+        raise
     finally:
-        shutil.rmtree(stage, ignore_errors=True)
+        if stage is not None:
+            shutil.rmtree(stage, ignore_errors=True)
     return relative
 
 
@@ -1058,6 +1208,12 @@ def load_e2e(root: Path, manifest_path: str, *, config: Mapping[str, Any] | None
     info_ids = {p.artifact_id for p in body.provenance_artifacts}
     if info_ids - artifact_ids or {a.artifact_id for a in tables.manifest.artifacts if a.format == "gzip"} - info_ids:
         raise LoaderError("provenance artifacts and manifest body disagree")
+    for artifact in tables.manifest.artifacts:
+        if artifact.format == "gzip":  # tables are verified by the loader; provenance bytes must be too
+            try:
+                _verify(root, artifact)
+            except (ValueError, OSError) as exc:
+                raise LoaderError(f"provenance artifact {artifact.artifact_id} failed verification: {exc}") from exc
     return E2eDataset(tables, body, observations, metrics, requests, series)
 
 
@@ -1077,7 +1233,8 @@ class EvaluationPoint:
     metrics: dict[tuple[str, str], float]
     # (metric, statistic) pairs that are missing or invalid; never zero-filled.
     unavailable: frozenset[tuple[str, str]]
-    # Per-device tokens/s by throughput metric, normalized explicitly.
+    # Per-device throughput at statistic "value", else "mean", else the sole reported statistic.
+    # Conflicting normalization sources at that statistic are rejected, never chosen by row order.
     per_device_throughput: dict[str, float]
     # Which timing boundary (``client`` or ``server``) reported each ``metrics`` key (``None``: the row is silent).
     observers: dict[tuple[str, str], str | None] = field(default_factory=dict)
@@ -1089,6 +1246,8 @@ def evaluation_points(dataset: E2eDataset, *, observer: str | None = None) -> li
     Client and server measurements of one metric are different timing boundaries and never mix: with
     ``observer`` only that observer's rows are used; without it a (metric, statistic) reported twice is
     ambiguous and raises ``ValueError`` instead of letting row order decide.
+    The per-device projection uses ``value``, then ``mean``, or a sole remaining statistic; every statistic stays
+    in ``metrics``. Several other statistics, or several sources at the chosen one, are ambiguous and raise.
     """
     metrics: dict[str, list[MetricRow]] = {}
     for row in dataset.metrics:
@@ -1096,6 +1255,7 @@ def evaluation_points(dataset: E2eDataset, *, observer: str | None = None) -> li
     points = []
     for obs in dataset.observations:
         values, unavailable, device = {}, set(), {}
+        device_candidates: dict[str, list[MetricRow]] = {}
         reported: dict[tuple[str, str], str | None] = {}  # evaluator output key -> observer
         for row in metrics.get(obs.observation_id, []):
             if row.scope != "run" or (observer is not None and row.observer != observer):
@@ -1122,9 +1282,18 @@ def evaluation_points(dataset: E2eDataset, *, observer: str | None = None) -> li
                 if row.normalization == "total" and row.device_count is None and obs.device_count:
                     row = row.model_copy(update={"device_count": obs.device_count})
                 if row.normalization == "per_device" or (row.normalization == "total" and row.device_count):
-                    device[row.metric] = throughput_per_device(row)
+                    device_candidates.setdefault(row.metric, []).append(row)
             else:
                 values[key] = row.value
+        for metric, candidates in device_candidates.items():
+            statistics = {r.statistic for r in candidates}
+            chosen = next((s for s in ("value", "mean") if s in statistics), None)
+            if chosen is None and len(statistics) == 1:
+                chosen = next(iter(statistics))
+            selected = [r for r in candidates if r.statistic == chosen]
+            if len(selected) != 1:
+                raise ValueError(f"observation {obs.observation_id}: ambiguous per-device throughput for {metric}")
+            device[metric] = throughput_per_device(selected[0])
         points.append(
             EvaluationPoint(
                 obs.observation_id,
@@ -1145,8 +1314,33 @@ def evaluation_points(dataset: E2eDataset, *, observer: str | None = None) -> li
 
 
 def snapshot_id(members: Sequence[SnapshotMember], source_scope: Mapping[str, Any], selection_policy: str) -> str:
-    ordered = sorted((m.model_dump() for m in members), key=lambda m: (m["configuration_id"], m["observation_id"]))
+    # Omit absent additive fields so historical snapshot IDs remain verifiable.
+    ordered = sorted(
+        (m.model_dump(exclude_none=True) for m in members), key=lambda m: (m["configuration_id"], m["observation_id"])
+    )
     return _sha(_canonical({"members": ordered, "source_scope": source_scope, "selection_policy": selection_policy}))
+
+
+def _snapshot_observations(root: Path, manifest_path: str) -> dict[str, ObservationRow]:
+    """Read only verified observation metadata; snapshot binding never needs request tables or logs."""
+    manifest = Manifest.model_validate_json(_file(root, manifest_path).read_bytes())
+    body = body_from_manifest(manifest)
+    if (
+        manifest.category != "e2e"
+        or manifest.purpose != PURPOSE
+        or body.configuration_id() != manifest.configuration_id
+    ):
+        raise ValueError("snapshot requires an e2e configuration manifest")
+    artifacts = [a for a in manifest.artifacts if a.artifact_schema == OBSERVATIONS_SCHEMA and a.format == "parquet"]
+    if len(artifacts) != 1:
+        raise ValueError("snapshot requires exactly one observation table per configuration")
+    table = read_parquet(pa.BufferReader(_verified_bytes(root, artifacts[0])), OBSERVATIONS_SCHEMA)
+    rows = table_to_rows(OBSERVATIONS_SCHEMA, table)
+    if len({o.observation_id for o in rows}) != len(rows):
+        raise ValueError("duplicate observation_id")
+    if any(o.configuration_id != manifest.configuration_id for o in rows):
+        raise ValueError("snapshot observation belongs to another configuration")
+    return {o.observation_id: o for o in rows}
 
 
 def write_snapshot(
@@ -1165,7 +1359,29 @@ def write_snapshot(
     published last, so a rejected or failed replacement leaves the existing snapshot readable.
     """
     root = Path(root)
+    _destination(root, path)
     directory = str(Path(path).parent)
+    # Bind members whose configuration manifest is present under ``root`` to the full version of that observation,
+    # also for callers that supplied only ``record_sha256``. External membership can be built with
+    # ``SnapshotMember.from_observation`` without copying the source artifacts here.
+    observed: dict[str, dict[str, ObservationRow]] = {}
+    bound = []
+    for member in members:
+        _relative(member.manifest_path)
+        if (root / member.manifest_path).is_file():
+            if member.manifest_path not in observed:
+                observed[member.manifest_path] = _snapshot_observations(root, member.manifest_path)
+            observation = observed[member.manifest_path].get(member.observation_id)
+            if observation is None:
+                raise ValueError(f"snapshot observation missing: {member.observation_id}")
+            actual = SnapshotMember.from_observation(observation, member.manifest_path)
+            if (member.configuration_id, member.record_sha256) != (actual.configuration_id, actual.record_sha256):
+                raise ValueError(f"snapshot observation differs: {member.observation_id}")
+            if member.observation_sha256 is not None and member.observation_sha256 != actual.observation_sha256:
+                raise ValueError(f"snapshot observation version differs: {member.observation_id}")
+            member = actual
+        bound.append(member)
+    members = bound
     ordered = sorted(members, key=lambda m: (m.configuration_id, m.observation_id))
     if len({m.observation_id for m in ordered}) != len(ordered):
         raise ValueError("duplicate observation in snapshot membership")
@@ -1174,6 +1390,9 @@ def write_snapshot(
     root.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=".e2e-stage-", dir=root))
     try:
+        directory = (
+            f"{directory}/{stem}-generations/{uuid4().hex}" if directory != "." else f"{stem}-generations/{uuid4().hex}"
+        )
         member_artifact = _write_table(
             stage, directory, f"{stem}-members", SNAPSHOT_MEMBERS_SCHEMA, ordered, "e2e-snapshot-members"
         )
@@ -1201,27 +1420,42 @@ def write_snapshot(
             members=member_artifact,
             acquisition=acquisition_artifact,
         )
-        (stage / path).parent.mkdir(parents=True, exist_ok=True)
-        (stage / path).write_text(
+        _destination(stage, path).parent.mkdir(parents=True, exist_ok=True)
+        _destination(stage, path).write_text(
             json.dumps(snapshot.model_dump(mode="json", by_alias=True), indent=2, sort_keys=True) + "\n"
         )
         tables = [a.path for a in (member_artifact, acquisition_artifact) if a is not None]
         _publish_staged(stage, root, [*tables, path])  # the document last
+    except _PublicationRollbackError:
+        stage = None
+        raise
     finally:
-        shutil.rmtree(stage, ignore_errors=True)
+        if stage is not None:
+            shutil.rmtree(stage, ignore_errors=True)
     return snapshot
 
 
-def read_snapshot(root: Path, path: str) -> tuple[E2eInputSnapshot, list[SnapshotMember]]:
-    """Verify a snapshot document, its tables, counts and ID."""
+def read_snapshot(
+    root: Path, path: str, *, payload: Collection[str] | None = None
+) -> tuple[E2eInputSnapshot, list[SnapshotMember]]:
+    """Verify a snapshot document, its tables, counts and ID.
+
+    ``payload`` optionally lists the dataset payload files; a table outside it is refused before it is opened.
+    """
     root = Path(root)
     snapshot = E2eInputSnapshot.model_validate_json(_file(root, path).read_bytes())
+    for table in (snapshot.members, snapshot.acquisition):
+        if payload is not None and table is not None and table.path not in payload:
+            raise ValueError(f"snapshot table {table.path} must be a listed dataset payload file")
+    # Parse the bytes that passed the integrity check: a table replaced after it must not be read unverified.
     members = table_to_rows(
-        SNAPSHOT_MEMBERS_SCHEMA, read_parquet(_verify(root, snapshot.members), SNAPSHOT_MEMBERS_SCHEMA)
+        SNAPSHOT_MEMBERS_SCHEMA,
+        read_parquet(pa.BufferReader(_verified_bytes(root, snapshot.members)), SNAPSHOT_MEMBERS_SCHEMA),
     )
     if snapshot.acquisition is not None:
         table_to_rows(
-            SNAPSHOT_ACQUISITION_SCHEMA, read_parquet(_verify(root, snapshot.acquisition), SNAPSHOT_ACQUISITION_SCHEMA)
+            SNAPSHOT_ACQUISITION_SCHEMA,
+            read_parquet(pa.BufferReader(_verified_bytes(root, snapshot.acquisition)), SNAPSHOT_ACQUISITION_SCHEMA),
         )
     if snapshot.counts.get("observations") != len(members):
         raise ValueError("snapshot observation count mismatch")
@@ -1230,6 +1464,21 @@ def read_snapshot(root: Path, path: str) -> tuple[E2eInputSnapshot, list[Snapsho
     if snapshot.snapshot_id != snapshot_id(members, snapshot.source_scope, snapshot.selection_policy):
         raise ValueError("snapshot ID does not match its membership")
     return snapshot, members
+
+
+def verify_snapshot_members(root: Path, members: Sequence[SnapshotMember]) -> None:
+    """Verify that every member still reaches the exact observation it pins."""
+    by_path: dict[str, tuple[str, dict[str, str]]] = {}
+    for member in members:
+        if member.manifest_path not in by_path:
+            data = load_e2e(root, member.manifest_path)
+            by_path[member.manifest_path] = (
+                data.manifest.configuration_id,
+                {o.observation_id: o.record_sha256 for o in data.observations},
+            )
+        cid, observations = by_path[member.manifest_path]
+        if cid != member.configuration_id or observations.get(member.observation_id) != member.record_sha256:
+            raise ValueError(f"snapshot member does not match configuration contents: {member.observation_id}")
 
 
 # --------------------------------------------------------------------------- InferenceX converter
@@ -1261,6 +1510,11 @@ INFERENCEX_CONFIG_FIELDS = (
     "num_decode_gpu",
 )
 INFERENCEX_LATENCY_UNIT = "s"  # InferenceX reports latencies in seconds
+
+
+def is_inferencex_measurement(key: str) -> bool:
+    """True for a source ``metrics`` key that the converter reads as a latency, interactivity or throughput value."""
+    return bool(_IFX_LATENCY.match(key) or _IFX_INTERACTIVITY.match(key) or key in _IFX_THROUGHPUT)
 
 
 def _stat(name: str) -> str:
@@ -1319,6 +1573,17 @@ def inferencex_metrics(
             continue  # a parallelism degree: mapped by inferencex_metric_parallelism, kept in the raw artifact
         else:
             unmapped.append(key)
+    canonical = {}
+    unique = []
+    for row in rows:
+        key = (row.metric, row.statistic, row.scope, row.normalization, row.observer)
+        value = (row.status, row.value, row.unit, row.source_value)
+        if key in canonical and canonical[key] != value:
+            raise ValueError(f"{observation_id}: conflicting canonical metric {key}")
+        if key not in canonical:  # equal alias spellings (p99.9 and p99_9) are one reported value, not two
+            unique.append(row)
+        canonical[key] = value
+    rows = unique
     rows.extend(missing_required_metrics(observation_id, rows))
     return rows, unmapped
 
@@ -1357,6 +1622,13 @@ def _ifx_body(
     config: Mapping[str, Any], gaps: list[dict], metric_parallelism: Mapping[str, Mapping[str, int]] | None = None
 ) -> E2eManifestBody:
     disagg = bool(config["disagg"])
+    if not disagg and type(config.get("decode_num_workers")) is int and config["decode_num_workers"] == 0:
+        # The source uses zero for this irrelevant aggregated field. Preserve the
+        # original in source_config_json and record the normalization explicitly.
+        config = {**config, "decode_num_workers": 1}
+        gaps.append(
+            {"field": "workers.aggregated.num_workers", "reason": "source zero sentinel normalized to one replica"}
+        )
     roles = ("prefill", "decode") if disagg else ("decode",)
     # Aggregated InferenceX records carry the serving worker under the decode_* fields.
     parallelism: dict[str, dict[str, int]] = {}
@@ -1444,8 +1716,9 @@ def inferencex_to_configurations(
     fields without a canonical home (recipe fingerprint, upstream configuration
     record, unmapped metrics) are also typed observation columns. ``runs`` optionally
     maps a ``run_url`` to producer metadata (``head_sha``, ``run_attempt``,
-    ``run_started_at``, ``head_branch``, ...); it is kept verbatim under
-    ``source_fields["producer_runs"]`` because ordering and freshness decisions need it.
+    ``run_started_at``, ...). Public identity, status and freshness fields are kept under
+    ``source_fields["producer_runs"]``, keyed by normalized run ID and attempt; URLs and arbitrary metadata
+    remain outside the normalized manifest.
 
     Upstream source configurations (content hash ``hf:<sha256>``, kept per
     observation as ``source_config_id``) that differ only in run telemetry share one
@@ -1484,7 +1757,9 @@ def inferencex_to_configurations(
             extras = {k: v for k, v in (raw.get("metrics") or {}).items() if k not in mapped}
             run = runs.get(raw.get("run_url") or "", {})
             if run:
-                producer_runs[raw["run_url"]] = dict(run)
+                run_key, run = _public_producer_run(raw.get("run_url"), run)
+                if run_key is not None:
+                    producer_runs[run_key] = run
             members.append((oid, canonical))
             observations.append(
                 ObservationRow(
@@ -1522,6 +1797,7 @@ def inferencex_to_configurations(
             merged[cid] = E2eConfigurationData(body, observations, metrics, [], [])
             continue
         target = existing.body
+        target.evidence_gaps.extend(gap for gap in body.evidence_gaps if gap not in target.evidence_gaps)
         ids = set(target.source_fields.get("source_config_ids", [target.source_config_id]))  # type: ignore[arg-type]
         ids.add("hf:" + source_config)
         target.source_config_id = None
@@ -1667,6 +1943,7 @@ def aiperf_to_configuration(
         observation_id=observation_id,
         configuration_id=cid,
         record_sha256=_sha(summary_bytes),
+        raw_record_sha256=_sha(summary_bytes),
         source_kind="developer",
         producer_kind="aiperf",
         observer="client",
@@ -1686,6 +1963,18 @@ def aiperf_to_configuration(
         log_artifact_id=log_id,
         evidence_refs=[raw_id] + ([log_id] if log_id else []),
     )
+    obs.record_sha256 = _sha(
+        _canonical(
+            {
+                "observation": obs.model_dump(mode="json", exclude={"record_sha256"}),
+                "summary": summary,
+                "records": list(records),
+                "log_sha256": _sha(log) if log is not None else None,
+                "log_redacted": log_redacted,
+            }
+        )
+    )
+    obs.observation_sha256 = _observation_sha256(obs, requests)
     return E2eConfigurationData(body, [obs], rows, requests, provenance)
 
 
