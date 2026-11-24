@@ -1118,6 +1118,29 @@ def test_explicit_bindings_resolve_checkpoint_index_paths(split_collection, tmp_
     assert set(result["phases"]) == {"prefill", "decode"}
 
 
+def test_bound_phase_validates_and_records_one_index_snapshot(split_collection, monkeypatch):
+    request, bindings = split_collection
+    _review(request, bindings)
+    binding = bindings[0]
+    index = Path(binding["observations"]["path"])
+    original_read = Path.read_bytes
+    reads = 0
+
+    def replace_index(path):
+        nonlocal reads
+        data = original_read(path)
+        if path == index:
+            reads += 1
+            path.write_text("{}")
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", replace_index)
+    result = runtime.verify_collection_runtime_bindings(request, bindings)
+    assert reads == 1
+    assert binding["observations"] in result["inputs"]
+    assert result["phases"][binding["phase"]]["provenance"]["observations_index"] == binding["observations"]
+
+
 @pytest.mark.parametrize("change", ["mismatch", "escape", "symlink_escape", "symlink_file", "hash"])
 def test_runtime_index_path_resolution_preserves_binding_checks(split_collection, tmp_path, change):
     request, bindings = split_collection

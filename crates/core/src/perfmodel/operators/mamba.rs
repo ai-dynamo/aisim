@@ -558,7 +558,7 @@ impl KdaOp {
             // vLLM prefill cores: same chunked-scan byte model as chunk_kda.
             "chunk_kda_with_fused_gate" | "flashkda_fwd" => "chunk_kda",
             // vLLM fused decode = conv update + recurrence + gated norm.
-            "fused_kda_decode" => "fused_recurrent_kda_packed_decode",
+            "fused_kda_decode" => "kda_fused_decode",
             // vLLM chain-verify kernel: same traffic as the sglang verify op.
             "fused_recurrent_kda" => "fused_sigmoid_gating_delta_rule_update",
             other => other,
@@ -825,6 +825,7 @@ mod tests {
         // packed recurrence (plus the folded gated RMSNorm); its byte model
         // must equal the sum of the two constituent models (Python parity).
         let fused = kda_op("kda_fused_decode", "generation", 0);
+        let vllm = kda_op("fused_kda_decode", "generation", 0);
         let conv = kda_op("causal_conv1d_update", "generation", 0);
         let recurrence = kda_op("fused_recurrent_kda_packed_decode", "generation", 0);
         for b in [1.0, 8.0, 256.0] {
@@ -832,6 +833,7 @@ mod tests {
                 fused.sol_total_bytes(b, 0.0),
                 conv.sol_total_bytes(b, 0.0) + recurrence.sol_total_bytes(b, 0.0)
             );
+            assert_eq!(vllm.sol_total_bytes(b, 0.0), fused.sol_total_bytes(b, 0.0));
         }
     }
 

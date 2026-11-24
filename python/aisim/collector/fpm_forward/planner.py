@@ -811,6 +811,8 @@ def _k31_runtime_proof(proof: Any, launch: dict[str, Any], profile: FpmModelProf
     if result["status"] != "complete":
         raise ValueError("K3.1 onboarding native evidence is incomplete: " + "; ".join(result["diagnostics"]))
     native = result["provenance"]
+    if native["observations_index"]["sha256"] != covered[str(index.resolve())]:
+        raise ValueError("K3.1 onboarding observations index differs from the verified source artifact")
     # The index binds these files, but the onboarding wrapper must also retain
     # every source consumed by revalidation, including each worker rank.
     consumed = [*native["artifacts"], *native["launch_artifacts"], *native["runtime_artifacts"]]

@@ -287,6 +287,7 @@ def test_planner_prepares_one_checkpoint_snapshot_but_checks_each_rank(inputs, m
     from collector.fpm_forward import runtime_observations as observations
 
     original_load = observations._checkpoint_config
+    original_staged = observations._staged_checkpoint
     original_validate = observations._validate_record
     snapshots, workers = [], []
 
@@ -295,6 +296,11 @@ def test_planner_prepares_one_checkpoint_snapshot_but_checks_each_rank(inputs, m
         snapshots.append(snapshot)
         return snapshot
 
+    def staged(*args):
+        snapshot, fmha = original_staged(*args)
+        snapshots.append(snapshot)
+        return snapshot, fmha
+
     def validate(record, **kwargs):
         assert kwargs["checkpoint_config"] is snapshots[-1]
         if record["kind"] == "worker":
@@ -302,6 +308,7 @@ def test_planner_prepares_one_checkpoint_snapshot_but_checks_each_rank(inputs, m
         return original_validate(record, **kwargs)
 
     monkeypatch.setattr(observations, "_checkpoint_config", load)
+    monkeypatch.setattr(observations, "_staged_checkpoint", staged)
     monkeypatch.setattr(observations, "_validate_record", validate)
     assert bind(inputs).dtype.moe_quant_mode == "w4a8_mxfp4_mxfp8_trtllm"
     assert len(snapshots) == 2  # independent inline semantics and immutable-source validation
@@ -725,6 +732,21 @@ def test_canonical_onboarding_wrapper_revalidates_native_evidence(inputs):
     assert not original.is_relative_to(Path(wrapper["observations_index"]).parent)
     assert str(original) not in {ref["path"] for ref in wrapper["source_artifacts"]}
     assert bind(inputs) == expected
+
+
+def test_onboarding_wrapper_rejects_index_replaced_after_source_verification(inputs, monkeypatch):
+    index = Path(onboarding_wrapper(inputs)["observations_index"])
+    original_read = Path.read_bytes
+
+    def replace_index(path):
+        data = original_read(path)
+        if path == index:
+            path.write_bytes(data + b"\n")
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", replace_index)
+    with pytest.raises(ValueError, match="index differs from the verified source artifact"):
+        bind(inputs)
 
 
 @pytest.mark.parametrize("change", ["archive-bytes", "archive-digest", "original-bytes"])
