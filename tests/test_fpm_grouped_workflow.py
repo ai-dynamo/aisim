@@ -1798,7 +1798,16 @@ def test_grouped_heterogeneous_pd_search_keeps_only_valid_pairs(grouped_case):
     [{"prefill": False, "decode": False}, {"prefill": True, "decode": True}, {}],
     ids=["off", "on", "defaults"],
 )
-def test_grouped_sweeper_pd_candidate_ranks_take_the_vllm_version(grouped_case, prefix_caching):
+@pytest.mark.parametrize(
+    "contexts",
+    [
+        {},
+        {"context_length": 1024},
+        {"context_length": 1024, "prefill_context_length": 512, "decode_context_length": 768},
+    ],
+    ids=["profile-context", "shared-context", "role-context"],
+)
+def test_grouped_sweeper_pd_candidate_ranks_take_the_vllm_version(grouped_case, prefix_caching, contexts):
     from aisim.sweeper.config import SearchSpace
     from aisim.sweeper.deploy import build_backend_deployment
     from aisim.sweeper.parallel_enum import DisaggParallelConfig, ParallelShape, ReplicaParallelConfig
@@ -1811,6 +1820,7 @@ def test_grouped_sweeper_pd_candidate_ranks_take_the_vllm_version(grouped_case, 
         # A recommendation with a KV transfer lowers bytes_per_token "auto" into the search.
         "kv_transfer_bytes_per_token": "auto",
         "kv_transfer_bandwidth": 1.0,
+        **contexts,
     }
     # Without settings, the search keeps its defaults: prefix caching on prefill workers and off on decode workers.
     raw.pop("prefill_enable_prefix_caching")
@@ -1836,11 +1846,12 @@ def test_grouped_sweeper_pd_candidate_ranks_take_the_vllm_version(grouped_case, 
         assert "kv_transfer_bytes_per_token" not in args
         assert args["kv_transfer_timing_mode"] == "destination_missing"
         assert args["enable_prefix_caching"] is prefix_caching.get(role, defaults[role])
+        # Cold and prefix-cached ranks keep explicit contexts or fall back to the profile's.
+        assert args["max_model_len"] == contexts.get(f"{role}_context_length", contexts.get("context_length", 2048))
         if args["enable_prefix_caching"]:
-            # Without a search context length, the rank takes the profile's.
-            assert (args["prefix_match_unit"], args["max_model_len"]) == (64, 2048)
+            assert args["prefix_match_unit"] == 64
         else:
-            assert not {"prefix_match_unit", "max_model_len"} & args.keys()
+            assert "prefix_match_unit" not in args
 
 
 @reads_saved_config

@@ -122,19 +122,25 @@ returns `aisim.resources.ResourceEstimate` with `api_version=1`:
 - `request_count`: concrete count, or null when unresolved;
 - `input_token_bytes` and `lower_bound_bytes`: nonnegative integer bytes;
 - `estimated_peak_bytes`: positive integer bytes, or null when unqualified;
+- `materialization_peak_bytes`: estimated peak for initial trace materialization,
+  present only in native Weka profile estimates with a known initial peak and unknown total peak;
 - `reason`: explanation of unresolved dimensions.
 
 Qualified peaks reserve `estimated_peak_bytes` as returned. For an unknown peak,
 the built-in estimates reserve the 512 MiB worker baseline plus `lower_bound_bytes`;
 their lower bound covers arrays separately from process memory. External adapter
 v1 estimates retain the previous `max(512 MiB, lower_bound_bytes)` reservation,
-since their bounds may already include process memory. Initial and wave admission
-use the same reservation rule; wave admission also deducts live child RSS.
+since their bounds may already include process memory. Wave admission also deducts
+live child RSS. For a supervised native Weka profile, the worker count uses the
+larger of the materialization peak and the baseline plus the lower bound. The plan
+records this floor as `profile_worker_min_bytes`. A parallel wave reserves it per worker. A single candidate reserves the
+baseline plus the lower bound. If materialization alone exceeds headroom, admission
+reports `candidate exceeds the host memory budget`. The estimate gives the reason.
 
 For synthetic workloads, the built-in native-engine planning model,
 `engine-session-metadata-v2`, charges every turn 4,096 bytes plus 32 bytes per
 input and output token of that turn. This covers the turn's
-hash IDs, planned output IDs, its share of the session
+hash IDs, its share of the session
 transcript, and a prefix-cache index with one-token blocks. A turn retains only
 its own tokens. The 32-byte token allowance is multiplied by the number of
 independent worker/attention-DP caches, capped at the number of turns per pool
@@ -169,8 +175,16 @@ size cutoff. Native-engine Weka uses the peak model described below, including
 snapshot and warmup storage. Every other finite trace replay, including
 snapshots and warmup, uses the
 [array lower bound with an observed peak](#finite-trace-replays-lower-bound-and-observed-peak).
-Continuous profiles use the same array lower bound, but no observed peak: they
-run one at a time under supervision. A streaming parser still holds individual
+For continuous native Weka profiles, the sweep divides current memory headroom
+equally among the workers in each parallel wave. Each share must fit the initial
+trace materialization estimate and the 512 MiB worker baseline plus the array
+lower bound. The total peak stays unknown because replacement plays retain
+records. The scheduler samples each worker and its descendants during replay.
+If a worker exceeds its share or the host reports memory pressure, the scheduler
+keeps completed results and retries unfinished candidates one at a time under
+the whole-run memory guard. Allocations
+can outpace sampling. Other continuous trace profiles still run one at a time.
+A streaming parser still holds individual
 scalar strings; large values can exceed headroom before an array bound is
 available. The array bound does not cover that risk.
 Unknown allocation models can run one candidate at a time under runtime
@@ -178,8 +192,8 @@ supervision when their reservation fits available headroom. Known lower bounds
 still reject impossible workloads before allocation. The low-level Runner
 protocol itself remains an execution primitive.
 
-When wave admission encounters an unknown peak without an observation, it stops
-estimating the remaining candidates and signals serial execution directly. The
+For other unknown peaks without an observation, wave admission stops estimating
+the remaining candidates and signals serial execution directly. The
 scheduler keeps that limit, without repeated wave halving, until a completed
 replay has measured the trace of every candidate in the next wave; finite trace
 replays then return to the requested parallelism. A new batch may make one
@@ -223,12 +237,21 @@ and measures the peak from completed replays.
 The lower bound is the maximum of three allocation requirements: 8 bytes per
 source hash ID plus 4 bytes per authored output token where the loader holds
 every source hash array at once (Dynamo, Agentic Mooncake and Dynamo-stack
-Weka); 4 bytes per compact hash ID plus 4 bytes per planned output token in the
-prepared replay; and 4 bytes per token in the largest expanded input prompt.
+Weka); 4 bytes per compact hash ID plus 4 bytes per output token that the
+prepared replay holds; and 4 bytes per token in the largest array one dispatch
+creates, which is the largest expanded input prompt or the largest output drawn
+for one request.
 These stages are not added together. File bytes, lane count, configured block
 size and total logical input tokens do not multiply this bound. Snapshots,
 including warmup and profiles, omit the prompt term: they expand prompts only
 for selected plays after their cuts.
+
+The output tokens that the prepared replay holds depend on the trace kind. An
+agentic graph (Agentic Mooncake, agentic Dynamo and Dynamo-stack Weka) plans
+every request's output IDs before its first dispatch, so every output token
+counts. A session trace (Mooncake, Mooncake-delta, applied-compute agentic and
+standard Dynamo) holds only authored `output_token_ids` and draws the rest as it
+dispatches each request.
 
 The counters follow each format's loader:
 
@@ -239,10 +262,11 @@ The counters follow each format's loader:
   bound omits the source-hash term. A Mooncake or Mooncake-delta row without
   an input length is sized as its hash count times the configured block size,
   as the loader does.
-- Applied-compute agentic counts `num_turns + 1` requests per session and its
-  assistant and final response lengths. Each turn's prompt adds the previous
-  response and tool output, so the final cumulative prompt is the largest. The
-  loader synthesizes hashes, so the bound counts none.
+- Applied-compute agentic counts `num_turns + 1` requests per session. Each
+  turn's prompt adds the previous response and tool output, so the final
+  cumulative prompt is the largest; the largest assistant or final response is
+  the largest drawn output. The loader synthesizes hashes, so the bound counts
+  none.
 - Dynamo-stack Weka counts normal, streaming, and nested subagent requests in JSON, JSONL,
   and directories. Its graph has `ceil(input_length / block_size)` hashes per
   request, including generated hashes absent from the source. Inspection first
@@ -292,7 +316,7 @@ energy, or GPU capacity. Their provenance and qualification are:
 | Dynamo peak expansion | Twice the eager prompt bytes, plus 4,096 bytes per request and 16 bytes per output token. | These extra terms are policy headroom; they do not certify an adapter's peak RSS. |
 | Native Weka traces | Separate per-play import and replay phases; see below. | Uses the native importer/driver contracts, including real output arrays and synthesized hashes. Covers snapshot and warmup storage; Weka on the Dynamo stack uses the finite trace lower bound and observed peak instead. |
 | Process allowances | 256 MiB within the native Weka peak model; 512 MiB for other built-in worker reservations; coordinator RSS plus 256 MiB. | Engineering reserves, not calibrated platform-specific measurements. |
-| Finite trace arrays | Maximum of retained source `Vec<u64>` hashes plus authored `Vec<u32>` outputs, prepared `Vec<u32>` hash/output storage, and the largest `Vec<u32>` input prompt. Covers every finite trace format on both stacks except native-engine Weka, without file-size, block-size or lane multipliers. | Array widths are concrete. Other allocations, including importer temporary storage, are excluded: this is a lower bound, not a peak RSS estimate. Continuous profiles use it without an observed peak. |
+| Finite trace arrays | Maximum of retained source `Vec<u64>` hashes plus authored `Vec<u32>` outputs, prepared `Vec<u32>` hash/output storage, and the largest `Vec<u32>` input prompt or drawn output. Covers every finite trace format on both stacks except native-engine Weka, without file-size, block-size or lane multipliers. | Array widths are concrete. Other allocations, including importer temporary storage, are excluded: this is a lower bound, not a peak RSS estimate. Continuous profiles use it without an observed peak. |
 | Observed trace peaks | The largest `getrusage` high-water RSS of completed replays of the same trace, times 1.5. | Measured on the executing host and code, so it needs no recalibration when native allocations change. The first replay of a trace runs alone under supervision; the margin is policy headroom that sizes parallel waves only. |
 | Admission and recovery | The sum of candidate estimates must fit one live budget; observed pressure stops workers before bounded retry. | Budget/accounting invariants tested with bounded fixtures and real owned subprocesses. |
 
@@ -351,9 +375,10 @@ token, and 2 KiB per request. Prompts and output plans are built from it when
 each request is dispatched. Warmup
 adds 32 KiB of evidence allowance per selected request and per warmup request
 (ten per lane); its prompt buffers do not overlap profile buffers across the
-quiescent preparation barrier. Continuing agentic profiles still have unknown
-total peaks and require supervised serial execution because retained lifecycle
-evidence grows beyond the finite corpus.
+quiescent preparation barrier. Continuing profiles retain lifecycle evidence
+beyond the finite corpus. The estimate reports the initial peak as
+`materialization_peak_bytes` and leaves the total peak unknown. Each admitted
+parallel wave records its per-worker share as `profile_worker_rss_limit_bytes`.
 
 The four/eight-byte array element widths are concrete; the larger multipliers
 and baseline are planning headroom for copies, identifiers, hash maps, KV state,

@@ -1139,6 +1139,26 @@ def test_speculative_round_profile_rejects_implicit_or_mismatched_execution(spec
         _normalize(config)
 
 
+@pytest.mark.parametrize("resources", ["missing", "geometry", "declared", "observed"])
+def test_speculative_round_construction_requires_observed_memory(speculative_profile, resources):
+    deployment = speculative_profile["deployments"][0]
+    if resources == "missing":
+        deployment.pop("resources")
+    elif resources != "observed":
+        deployment["resources"].pop("runtime_memory")
+        if resources == "declared":
+            deployment["resources"].update(
+                weights_bytes=100, activations_bytes=20, runtime_overhead_bytes=30, comm_overhead_bytes=50
+            )
+    config = _request(speculative_profile, "direct", nextn=3)
+    if resources == "observed":
+        normalized = RustForwardPassPerfModel.normalize_config(config)
+        assert normalized["fpm_profile"]["deployments"][0]["resources"]["runtime_memory"]["kv_cache_bytes"] == 600
+    else:
+        with pytest.raises(ValueError, match="resources are pending|require observed runtime memory"):
+            RustForwardPassPerfModel.best_available(config)
+
+
 def test_speculative_round_memory_forwards_depth_and_uses_observed_pool(
     speculative_profile, profile_memory, monkeypatch
 ):

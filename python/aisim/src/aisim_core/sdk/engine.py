@@ -56,7 +56,7 @@ from aisim_core.sdk.errors import InvalidEngineConfigurationError as InvalidEngi
 from aisim_core.sdk.fpm_profile import (
     FpmDeploymentProfile,
     FpmModelProfile,
-    load_fpm_profile,
+    _load_fpm_timing_profile,
 )
 from aisim_core.sdk.models import get_model
 from aisim_core.sdk.models.helpers import (
@@ -555,7 +555,7 @@ def compile_engine(
             fpm_parquet_path = options_path
     except (ValueError, TypeError, KeyError) as exc:
         raise InvalidEngineConfigurationError(str(exc)) from exc
-    profile = load_fpm_profile(fpm_profile) if fpm_profile is not None else None
+    profile = _load_fpm_timing_profile(fpm_profile) if fpm_profile is not None else None
     if fpm_interpolation not in (None, "sol", "direct") or (profile is not None and fpm_interpolation is None):
         raise InvalidEngineConfigurationError("FPM compilation requires a resolved method from best_available(config)")
     if fpm_interpolation == "direct" and profile is None:
@@ -865,7 +865,7 @@ def _direct_fpm_spec_json(
                 "original_fmha_quant_mode": deployment.fmha_quant_mode if fpm_fmha_quant_mode is not None else None,
                 # Direct interpolation ignores this legacy operation field.
                 # Zero here is not an inferred resource or memory bound.
-                "weight_bytes": deployment.resources.weights_bytes or 0,
+                "weight_bytes": (deployment.resources.weights_bytes or 0) if deployment.resources is not None else 0,
                 "verify_width": 1,
                 "sol_ops": [],
                 "interpolation": "direct",

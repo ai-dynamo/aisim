@@ -30,6 +30,7 @@ reaches them through the public legacy and unified entry points.
 from __future__ import annotations
 
 import json
+import os
 import warnings
 from pathlib import Path
 
@@ -56,6 +57,21 @@ from .test_fpm_forward import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(autouse=True)
+def _keep_default_data_roots_from_leaking():
+    """The estimator's default setup writes these variables once per process, from the first systems root it
+    sees. A sweep against a temporary root would leave that root set for every later test in the worker."""
+    names = ("AICONFIGURATOR_SYSTEMS_PATH", "AICONFIGURATOR_MODEL_CONFIGS_PATH")
+    saved = {name: os.environ.get(name) for name in names}
+    yield
+    for name, value in saved.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
 
 # The shared ``write(model, power_w, rows=None) -> PerfDatabase`` fixture.
 fpm_power_root = test_fpm_forward.fpm_power_root

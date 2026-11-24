@@ -131,9 +131,11 @@ functional qualification of profile control, not complete AgentX parity or
 hardware performance accuracy. Long profiles retain lifecycle evidence and can
 use more host memory than a finite corpus replay. Resource admission still checks
 the initial trace, but does not use its finite size as a peak-memory estimate for
-the full profile. The CLI and guarded recommendation/Sweeper paths admit one
-profiled candidate at a time under live host-memory supervision. Low-level
-runner/native callers remain responsible for resource supervision. A run can stop
+the full profile. For native Weka profiles, the CLI and guarded `Sweeper` can
+admit parallel candidates when each worker has enough memory for initial trace
+materialization and its baseline plus the array lower bound. Other continuous
+profiles run one candidate at a time. See [host memory admission](../../reference/local-resources.md).
+Low-level runner/native callers remain responsible for resource supervision. A run can stop
 with `resource_limited` if it exhausts the host budget; choosing a duration does
 not reserve enough memory to guarantee completion.
 

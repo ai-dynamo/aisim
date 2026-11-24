@@ -162,8 +162,8 @@ estimator first, then the remaining estimators in the same global priority
 order. Each native mode tries the ordered `systems_paths` before moving to
 another estimator.
 Omitted roots preserve configured SDK discovery (or the systems-path environment
-override when the SDK uses its packaged default); an explicit `default` entry
-selects the packaged root.
+override when the SDK uses its default root, composed from the pinned op-latency
+dataset); an explicit `default` entry selects that default root.
 The resolved paths are shared by preflight, construction and capacity estimation.
 Selection occurs
 at construction; queries do not silently switch estimators on a data-domain error.
@@ -429,6 +429,75 @@ rejected; measured DCP profiles without `fpm_profile` retain their existing rout
 Profile/schema and precision conflicts fail before estimator fallback. Omitted precision fields are filled
 from the profile and preserved in the resolved canonical configuration.
 
+A published FPM library (`fpm/fpm_forward_perf.parquet`, schema `aic_fpm_forward_perf/v6`) may declare an
+optional `resources` block in its `fpm_forward_perf.metadata.json` sidecar. The block uses the deployment
+`resources` schema (`runtime_memory`, `cache_layout`, `cache_groups`, `mamba_cache`, `max_num_tokens`,
+`max_batch_size`, `provenance`). When the data library loads an entry it resolves each deployment's resources as
+the `fpm_profile` deployment's own `resources`, then the sidecar `resources`, then pending. The first block found
+is used whole, never merged field by field. Sidecar resources apply only when the selector matches the profile's
+model and deployment identity, including precision and implementation fields. A selector naming `worker_type`
+requires that same explicit deployment role; it cannot fill a shared deployment whose role is omitted or null.
+A sidecar with no selector applies to the single deployment the load requests; it never selects among several.
+A selector's `system`, `backend` and `backend_version` must equal the library's verified identity; a contradicting
+selector leaves the resources pending. In a library that holds several models, the selector must name `model_path`,
+otherwise the sidecar resources attach to no model.
+The selector and verified library identity must identify one distinct deployment. An absent or partial selector
+matching several deployments (for example, `tp: 1` matching both DEP4 and DEP8) leaves their resources pending.
+Supplying resources explicitly for one deployment does not disambiguate the sidecar evidence for the others.
+
+| FPM deployment field | Default | Behavior |
+| --- | --- | --- |
+| `fpm_profile.deployments[].resources_source` | `user` (omitted when serialized) | The data loader marks sidecar-derived blocks as `metadata`. A later library load re-resolves those blocks from its sidecar, including after a dataset repin. Set `user` when replacing a derived block with an explicit override. |
+
+The source tag survives profile and native configuration round trips. It is provenance, not part of the
+deployment identity; explicit user blocks keep precedence on every load.
+
+Pending means missing: a timing-only data load keeps the draft profile and reports pending resources. For plain
+autoregressive profiles, the draft constructs through `best_available` and answers timing queries; cache sizing,
+replay, and a load that requires resources fail with the fields to supply. A block with valid geometry but no
+`runtime_memory` or declared bytes still serves plain autoregressive timing queries; cache sizing and replay
+need the memory. Speculative-round profiles require resources with observed `runtime_memory` at
+`best_available` construction, even for timing queries; geometry alone or declared non-KV bytes do not suffice.
+Entries published without `resources` stay valid. Loading uses only the library and its sidecar and never reads
+`measurements/`.
+
+Libraries can aggregate several models and deployment cells on the declared system, backend and backend version.
+The collector's sidecar `model_paths` inventory, when present, must match the table's `model_path` values; the
+manifest's `identity.model` must occur in that verified column. Historical sidecars without an inventory use the
+table column as the model record. Validation and loading check this binding before staging; native selection
+then requires the exact model path and deployment-cell identity and never substitutes another model's curves.
+An explicit `coordinate_system` must be `iteration_totals_balanced_v1`; null is rejected. Historical reconstructed
+sidecars may omit it for verified row-contract recovery. Runtime-memory `runtime_framework_version` evidence may
+be omitted or null, but a supplied string must contain a non-whitespace character.
+
+The sidecar's `row_count`, selector topology degrees and repeat counts, and measurement-file `bytes` require
+JSON integer literals; `1.0`, strings and booleans are rejected. JSON Schema treats `1.0` as an integer,
+so schema validation alone is insufficient for publication. Run
+`aisim_core.data.fpm_checks.check_fpm_dataset(root, include_measurements=True)` before publishing: it uses the
+strict sidecar and measurement-manifest readers in addition to artifact integrity checks. It also binds the
+library rows to the entry: every row's `system`, `backend` and `backend_version` must equal the entry's, a
+declared `configuration_selector` must agree with the rows' recorded `dcp` (an unrecorded `dcp` is not DCP1, and a
+recorded one must be positive and divide `tp`), and a per-row `measurement_policy` requires the row
+`measurement_policy` and `measurement_repeats` columns with consistent values. Prediction-only checks
+leave evaluation files optional.
+
+A staging `output_dir` holds one library at a time: staging another library there replaces it, and a
+configuration returned for the earlier library then reads the new one. Give each library whose configuration stays
+in use its own `output_dir`. The staged root also carries `perf_data_reuse_manifest.yaml`, `query_versions.yaml` and
+`attention_lane_defaults.yaml` from the first source root that has each, so donor-backed operations price as they do
+through the source roots; a change to one of them restages the root. Directories that several source roots provide,
+such as a family directory, are merged, and the earlier root wins for a file both provide. Staging again repairs an
+installed root that lost a file, and a repin drops the generated library path and staged roots of an earlier pin
+whichever cache directory held them, keeping any path you set yourself. Under `ensure_data` each staging directory is
+keyed by the ordered source roots, the verified library pair, the contents of the copied definition and policy files
+and the links the build would make, so editing one in place, publishing a corrected pair under the same configuration ID,
+or a higher-priority root gaining a table at an existing path gives a new directory and leaves a configuration returned earlier reading the definition it was built from; the roots
+that key describes are the complete staging input.
+
+For library loads, `FpmData.resources` and `memory_pending` describe deployment zero. The loader does not select
+a worker or role: inspect `resources_by_deployment` and `memory_pending_by_deployment` in `fpm_profile.deployments`
+order for other deployments. Without a profile, readiness describes the requested configuration.
+
 Each deployment may declare `worker_type: prefill`, `decode`, or `aggregated`.
 The canonical construction request selects only the matching role's precision,
 scheduler envelope, cache geometry and memory evidence. Separate P/D deployments
@@ -479,7 +548,9 @@ follows the configured estimator ordering and policy.
   The corresponding top-level quant mode must remain unset. This selects null
   profile values exactly; it does not make precision matching a wildcard.
   `fpm_parquet_path` selects an external FPM parquet with its same-stem metadata
-  sidecar. Unknown fields are rejected.
+  sidecar. The op-level engine never reads a library, so it is compiled without this path, whether automatic search
+  selected it or it was named; the saved configuration keeps the path and rebuilds the same model.
+  Unknown fields are rejected.
 
 Sampling defaults to `bins_per_axis: [4, 4]` and `max_observations: 64` per
 logical store. Rectangular grids were already supported. Regression's
