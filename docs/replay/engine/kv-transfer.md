@@ -108,6 +108,13 @@ Backends order the handoff differently:
 TensorRT-LLM decode workers use `GUARANTEED_NO_EVICT` scheduling, which reserves
 room for the whole output while transferred KV is held.
 
+A vLLM decode worker admits the handoffs whose KV has arrived before a request
+it preempted, which holds no KV while it waits to recompute. vLLM keeps
+requests that received remote KV in a queue it schedules first
+(`skipped_waiting`, `kv_holding_waiting` from v0.31.0). Under speculative
+decoding the preempted request resumes once G1 also has room for its next
+token.
+
 The two roles may use different `attention_data` sizes. A request moves from one
 concrete prefill rank to one concrete decode rank. A trace request's
 `prefill_dp_rank` chooses the prefill rank; if omitted, its `dp_rank` is used

@@ -562,10 +562,20 @@ preempting a request whose store is in flight; a store prepared in that same
 pass delays the rank's next pass. A preempted request resumes once G1 has room
 for its tokens, its state and its next token; a shared pool, and a rank that
 offloads state checkpoints, keep the G1 blocks they copy until each copy
-completes, so their stores can delay that. The capacity guard above does not
-cover these workers: when G1 holds fewer than about two requests, a replay can
-end with a stall error or not terminate, with or without G2. Size G1 for
-several concurrent requests.
+completes, so their stores can delay that.
+
+A waiting request that holds no G1 does not keep one that does from running: a
+handoff whose KV arrived goes first, and a request that must wait for room
+yields to those whose G2 load has landed. vLLM schedules the requests that hold
+KV first (`kv_holding_waiting`, from v0.31.0). A small G1 therefore cannot
+leave the blocks a waiter needs with a request queued behind it. Two cases
+remain when G1 holds barely one request, both with MTP on prefill and decode
+workers. With G2, a load can take the block another request's next token needs,
+and the two requests then preempt each other in turn without completing. With a
+sliding-window state cache and no G2, a preempted request that hits its own
+cached prefix needs its tokens, two copies of its state and its next token at
+once, and the replay ends with a stall error when G1 is smaller than that. Size
+G1 for several concurrent requests.
 
 For shared pools, the report's `g2_domains` gives capacity and resident blocks.
 Workers that publish KV events report G2 changes with `"tier": "host_pinned"`;
