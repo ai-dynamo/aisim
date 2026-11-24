@@ -15,7 +15,10 @@ model_paths:
   - zai-org/GLM-5.2-FP8
   - nvidia/GLM-5.2-NVFP4
   # Release 0.14.0 omits GLM-5.3 runtime paths: their configs are not bundled.
-  # Shape-only MoE aliases below do not load checkpoint configs.
+  # Shape-only MoE aliases below do not load checkpoint configs. Targeting
+  # zai-org/GLM-5.3, zai-org/GLM-5.3-BF16 or nvidia/GLM-5.3-NVFP4 with
+  # --model-path also requires --model-architecture GlmMoeDsaForCausalLM:
+  # model-path discovery alone does not inspect the shape-only aliases.
 include_base: false
 description: >
   GLM-5 DSA/MoE model-centric collection plan.

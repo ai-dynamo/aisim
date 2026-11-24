@@ -940,6 +940,16 @@ def _infer_quant_modes_from_raw_config(
         # Only set overrides for quantized categories; unset modes fall through to the
         # global bfloat16 default in _apply_model_quant_defaults.
         quant_cfg = _get_language_quantization_config(raw_config) or {}
+        # Known dense architectures have no routed-expert category to infer.
+        # Hybrid families can contain either dense or MoE checkpoints, so also
+        # inspect their language-model expert counts. Architecture-free partial
+        # inputs retain strict inference rather than assuming they are dense.
+        family = common.ARCHITECTURE_TO_MODEL_FAMILY.get(architecture, architecture)
+        source = _moe_source_config({"raw_config": raw_config, "architecture": architecture})
+        has_routed_experts = family in _MOE_MODEL_FAMILIES or any(
+            source.get(key) for key in ("num_local_experts", "n_routed_experts", "moe_num_experts", "num_experts")
+        )
+        infer_moe = infer_moe and (family is None or has_routed_experts)
         for category, field, modes, needed in (
             ("attention", "gemm_quant_mode", common.GEMMQuantMode, infer_gemm),
             ("routing_experts", "moe_quant_mode", common.MoEQuantMode, infer_moe),

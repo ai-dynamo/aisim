@@ -152,6 +152,58 @@ def test_agg_explicit_quant_overrides_hf():
     assert t.kvcache_quant_mode == common.KVCacheQuantMode.fp8
 
 
+@pytest.mark.parametrize("entrypoint", ["task", "get_model"])
+@pytest.mark.parametrize("num_experts", [None, 0, 4])
+def test_compressed_tensors_only_requires_expert_targets_for_moe(tmp_path, entrypoint, num_experts):
+    checkpoint = {
+        "architectures": ["Qwen3MoeForCausalLM" if num_experts else "Qwen3ForCausalLM"],
+        "hidden_size": 128,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "intermediate_size": 256,
+        "vocab_size": 512,
+        "max_position_embeddings": 2048,
+        "quantization_config": {
+            "quant_method": "compressed-tensors",
+            "config_groups": {
+                "attention": {"targets": ["re:.*self_attn.*"], "weights": {"num_bits": 8, "type": "float"}}
+            },
+        },
+    }
+    if num_experts is not None:
+        checkpoint.update(
+            num_experts=num_experts, num_experts_per_tok=2 if num_experts else 0, moe_intermediate_size=128
+        )
+    (tmp_path / "config.json").write_text(json.dumps(checkpoint))
+
+    def load():
+        if entrypoint == "task":
+            task = Task(
+                model_path=str(tmp_path),
+                system_name="h200_sxm",
+                backend_name="trtllm",
+                backend_version="1.3.0rc29",
+            )
+            assert task.is_moe is False
+            model_config = task.build_model_config(role="agg")
+        else:
+            from aisim_core.sdk.config import ModelConfig
+
+            model_config = ModelConfig()
+        model = get_model(str(tmp_path), model_config, "trtllm")
+        assert model.context_ops and model.generation_ops
+        assert model_config.gemm_quant_mode == common.GEMMQuantMode.fp8
+        assert model_config.moe_quant_mode == common.MoEQuantMode.bfloat16
+
+    if num_experts:
+        with pytest.raises(ValueError, match="Missing compressed-tensors target group for routing_experts"):
+            load()
+    else:
+        load()
+
+
 @pytest.mark.parametrize("mode", ["agg", "disagg"])
 def test_explicit_compressed_tensors_modes_survive_task_resolution_and_yaml(tmp_path, mode):
     # Independent, tiny checkpoint geometry; only the metadata-inference path

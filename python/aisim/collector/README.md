@@ -80,6 +80,9 @@ Release 0.14.0 excludes `zai-org/GLM-5.3`, `zai-org/GLM-5.3-BF16`, and
 their local configs are no longer bundled. These artifacts have no full
 attention-module collection coverage in this release. Shape-only MoE aliases
 remain on the GLM-5.2 rows; they do not load the excluded configs.
+To target any of these three aliases, pass `--model-path <model ID>` together
+with `--model-architecture GlmMoeDsaForCausalLM --ops moe`. Discovery by
+`--model-path` alone does not inspect shape-only aliases.
 Retained GLM-5/5.1/5.2 runtime cases remain.
 The SGLang MLA/DSA module collector requires local bundled metadata and raises
 for a missing config instead of passing a raw model ID to SGLang. Its context
