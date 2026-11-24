@@ -4731,6 +4731,33 @@ def test_config_redaction_keeps_numeric_measurements_and_backend_markers(tmp_pat
     assert saved["engine_args"]["kernel_config"]["moe_backend"] == "triton"
 
 
+def test_private_fp8_value_preserves_the_declared_kimi_indexer_marker(tmp_path):
+    from collector.fpm_forward.config import archive_generator_overrides
+    from collector.fpm_forward.database import _validate_backend_markers
+    from collector.fpm_forward.private_inputs import sanitize_recovered_diagnostics
+
+    override = {"name": "PRIVATE_INPUT", "value": "fp8"}
+    archived = archive_generator_overrides({"K8sConfig": {"extra_env": [override]}})
+    assert archived["K8sConfig"]["extra_env"][0]["value_from_env"] == "PRIVATE_INPUT"
+    marker = "config.engine_args.attention_config.indexer_kv_dtype"
+    cell = SimpleNamespace(backend_policy=SimpleNamespace(expected_markers={marker: "fp8"}))
+    path = tmp_path / "raw" / "worker" / "resolved-config.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "config": {
+                    "engine_args": {"attention_config": {"indexer_kv_dtype": "fp8"}},
+                    "environment": {"PRIVATE_INPUT": "fp8"},
+                }
+            }
+        )
+    )
+    sanitize_recovered_diagnostics(tmp_path, archived, cell=cell, environment={"PRIVATE_INPUT": "fp8"})
+    _validate_backend_markers(cell, tmp_path)
+    assert json.loads(path.read_text())["config"]["environment"]["PRIVATE_INPUT"] == "<redacted>"
+
+
 def test_worker_repr_error_redacts_both_quote_characters(tmp_path, monkeypatch):
     from collector.fpm_forward.private_inputs import redact
 
