@@ -147,7 +147,13 @@ def test_kimi_k3_moe_remaps_to_w4a8_on_blackwell_only(monkeypatch):
         "_load_model_config_from_model_path",
         lambda path: {
             "architectures": ["KimiK3ForConditionalGeneration" if path.endswith("Kimi-K3") else "Other"],
-            "quant_algo": "mxfp4",
+            "quant_algo": "compressed-tensors",
+            "quantization_config": {
+                "quant_method": "compressed-tensors",
+                "format": "mxfp4-pack-quantized",
+                "config_groups": {"experts": {"weights": {"num_bits": 4, "type": "float"}}},
+                "ignore": ["self_attn", "mlp.shared_experts", "lm_head"],
+            },
         },
     )
     # Blackwell serving quantizes activations to mxfp8 (kimi-k3 branch
