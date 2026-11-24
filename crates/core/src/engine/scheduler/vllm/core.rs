@@ -2232,9 +2232,6 @@ impl VllmCore {
         if self.speculative_sampler.is_none() || self.native_mtp_depth.is_some() {
             return None;
         }
-        if self.native_host_offload.is_none() && self.args.worker_type != WorkerType::Decode {
-            return None;
-        }
         let request = &self.state.requests[&uuid];
         if request.status != RequestStatus::Preempted || request.sequence.num_allocated_tokens() > 0
         {
@@ -2261,12 +2258,18 @@ impl VllmCore {
         if resumed + emitted <= free {
             return None;
         }
-        let alone = request.sequence.current_known_blocks() + emitted;
-        Some(if alone > self.args.num_gpu_blocks {
-            AdmissionDecision::Reject
+        // Resume allocation also includes working state and prefill checkpoint
+        // blocks. Keep the known-token bound when active prefix reuse discounts
+        // that allocation, but never omit the state footprint from rejection.
+        let alone = request.sequence.current_known_blocks().max(resumed) + emitted;
+        if alone > self.args.num_gpu_blocks {
+            Some(AdmissionDecision::Reject)
+        } else if self.native_host_offload.is_some() || self.args.worker_type == WorkerType::Decode
+        {
+            Some(AdmissionDecision::Wait)
         } else {
-            AdmissionDecision::Wait
-        })
+            None
+        }
     }
 
     /// The blocks that host loads in flight and landed still need, and
@@ -5106,6 +5109,55 @@ mod waiting_queue_tests {
 mod state_cache_tests {
     use super::*;
     use crate::engine::{HandoffTransferTiming, StateCacheConfig};
+
+    #[rstest::rstest]
+    #[case::cannot_fit(6, true)]
+    #[case::state_headroom(8, false)]
+    fn speculative_resume_counts_state_checkpoint_blocks(
+        #[case] capacity: usize,
+        #[case] rejected: bool,
+    ) {
+        let mut config = args(capacity, true, Some(1));
+        config.worker_type = WorkerType::Decode;
+        config.max_num_batched_tokens = Some(8);
+        config.aic_nextn_accept_rates = Some("1".into());
+        config.prefix_match_unit = Some(4);
+        config.state_cache.as_mut().unwrap().prefill_checkpoint = true;
+        crate::engine::EngineConfig {
+            num_gpu_blocks: capacity,
+            block_size: config.block_size,
+            max_num_batched_tokens: 8,
+            worker_type: crate::engine::WorkerType::Decode,
+            aic_nextn: config.aic_nextn,
+            aic_nextn_accept_rates: config.aic_nextn_accept_rates.clone(),
+            kv_cache_bytes_per_token: config.kv_cache_bytes_per_token,
+            state_cache: config.state_cache,
+            prefix_match_unit: config.prefix_match_unit,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
+        let mut core = VllmCore::new(config);
+        let id = submit(&mut core, 91_250, 16, 1);
+        let mut terminal = Vec::new();
+        for _ in 0..8 {
+            let pass = step(&mut core);
+            terminal.extend(pass.output_signals.into_iter().filter(|s| s.completed));
+            if core.state.requests.is_empty() {
+                break;
+            }
+        }
+        // Four token blocks, a working state and an internal checkpoint fill
+        // six blocks. Emitting the first token needs another block. The
+        // six-block case preempts once, then must reject rather than wait
+        // forever; eight blocks also cover checkpoint preservation at emission.
+        assert_eq!(core.state.preemptions_total, u64::from(rejected));
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].uuid, id);
+        assert_eq!(terminal[0].rejected, rejected);
+        assert!(core.state.requests.is_empty());
+        assert_eq!(core.kv_manager.num_active_blocks(), 0);
+    }
 
     fn args(capacity: usize, prefix_caching: bool, nextn: Option<usize>) -> MockEngineArgs {
         MockEngineArgs::builder()

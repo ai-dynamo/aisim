@@ -2384,6 +2384,46 @@ mod destination_lifecycle {
         assert_eq!(ended, [true]);
         assert_eq!(core.kv_manager.num_active_blocks(), 0);
     }
+
+    #[rstest]
+    #[case::cannot_fit(4, true)]
+    #[case::exact_fit(5, false)]
+    fn speculative_prefill_emission_capacity(#[case] blocks: usize, #[case] rejected: bool) {
+        let mut config = args(WorkerType::Prefill);
+        config.num_gpu_blocks = blocks;
+        config.max_num_batched_tokens = Some(16);
+        config.aic_nextn = Some(1);
+        config.aic_nextn_accept_rates = Some("1".into());
+        crate::engine::EngineConfig {
+            num_gpu_blocks: blocks,
+            block_size: config.block_size,
+            max_num_batched_tokens: 16,
+            worker_type: crate::engine::WorkerType::Prefill,
+            aic_nextn: config.aic_nextn,
+            aic_nextn_accept_rates: config.aic_nextn_accept_rates.clone(),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
+        let mut core = VllmCore::new(config);
+        let id = core.receive(request(Uuid::from_u128(10_501), (0..16).collect(), 1));
+        let mut terminal = Vec::new();
+        for _ in 0..4 {
+            let pass = execute(&mut core, 0.0);
+            terminal.extend(pass.output_signals.into_iter().filter(|s| s.completed));
+            if core.state.requests.is_empty() {
+                break;
+            }
+        }
+        // The prompt needs four blocks, and its sampled token needs a fifth.
+        // Without that fifth block, the first pass preempts before emission.
+        assert_eq!(core.state.preemptions_total, u64::from(rejected));
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].uuid, id);
+        assert_eq!(terminal[0].rejected, rejected);
+        assert!(core.state.requests.is_empty());
+        assert_eq!(core.kv_manager.num_active_blocks(), 0);
+    }
 }
 
 mod core_behavior {
