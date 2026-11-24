@@ -82,6 +82,38 @@ def test_local_kimi_estimator_compiles_the_correct_moe_lane(local_kimi, system, 
     assert all(op["quant_mode"] == expected for op in moe_ops)
 
 
+@pytest.mark.parametrize("caller", ["compile_engine", "task"])
+def test_local_kimi_linear_targets_honor_explicit_gemm_mode(local_kimi, caller):
+    from aisim.sdk.task_v2 import Task
+
+    path, raw = local_kimi
+    quant = raw["quantization_config"]
+    quant["config_groups"]["experts"]["targets"] = ["Linear"]
+    quant["ignore"] = ["mlp.shared_experts", "lm_head"]
+    (path / "config.json").write_text(json.dumps(raw))
+
+    def build(**kwargs):
+        if caller == "compile_engine":
+            return compile_engine(str(path), "b200_sxm", "sglang", "current", **kwargs)
+        return Task(model_path=str(path), system_name="b200_sxm", backend_name="sglang", total_gpus=1, **kwargs)
+
+    # An inferred attention mode must still reject the unsupported MXFP4 lane.
+    with pytest.raises(ValueError, match="Unsupported compressed-tensors algorithm 'w4a16_mxfp4' for attention"):
+        build()
+
+    result = build(gemm_quant_mode="bfloat16")
+    if caller == "compile_engine":
+        spec = json.loads(_native.engine_spec_json_from_bincode(result))
+        assert spec["engine"]["weight_dtype"] == "bfloat16"
+        assert spec["engine"]["moe_dtype"] == "w4a8_mxfp4_mxfp8"
+        moe_ops = [op["Moe"] for op in spec["context_ops"] + spec["generation_ops"] if "Moe" in op]
+        assert moe_ops and all(op["quant_mode"] == "w4a8_mxfp4_mxfp8" for op in moe_ops)
+    else:
+        cfg = result.build_model_config(role="agg")
+        assert cfg.gemm_quant_mode is common.GEMMQuantMode.bfloat16
+        assert cfg.moe_quant_mode is common.MoEQuantMode.w4a8_mxfp4_mxfp8
+
+
 def test_local_and_hf_alias_resolve_the_same_moe_lane(local_kimi, monkeypatch):
     path, raw = local_kimi
     monkeypatch.setattr(utils, "_download_hf_config", lambda _: json.loads(json.dumps(raw)))

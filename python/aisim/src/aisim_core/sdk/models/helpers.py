@@ -1206,7 +1206,9 @@ def resolve_kimi_k3_moe_arch_mode(
     architecture = (raw.get("architectures") or [None])[0]
     if architecture != "KimiK3ForConditionalGeneration":
         return None
-    mode = _infer_quant_modes_from_raw_config(raw, architecture).get("moe_quant_mode")
+    # Only infer expert precision here. Callers own GEMM inference and know
+    # whether an explicit override makes attention metadata irrelevant.
+    mode = _infer_quant_modes_from_raw_config(raw, architecture, infer_gemm=False).get("moe_quant_mode")
     if mode is None and raw.get("quant_algo") == "compressed-tensors":
         quant_cfg = _get_language_quantization_config(raw) or {}
         _, ignored = parse_compressed_tensors_quant(quant_cfg, category="routing_experts")
