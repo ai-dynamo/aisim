@@ -3276,10 +3276,22 @@ fn architecture_requires_state_cache(architecture: &str) -> bool {
     )
 }
 
+/// Fitted timing does not describe persistent memory. Resolve ordinary decoder
+/// families from the SDK registry, including for third-party checkpoint paths.
+fn unregistered_replay_architecture(architecture: &str) -> Result<bool> {
+    Python::attach(|py| -> PyResult<bool> {
+        let families = py
+            .import("aisim_core.sdk.common")?
+            .getattr("ARCHITECTURE_TO_MODEL_FAMILY")?;
+        Ok(!families.cast::<PyDict>()?.contains(architecture)?)
+    })
+    .context("cannot resolve the checkpoint architecture in the SDK model registry")
+}
+
 /// Fitted estimators have no op graph. Reuse the SDK's cached checkpoint
 /// loader and shared decoder selection to resolve memory capability only;
 /// trainer metadata and the model's spelling are not architecture evidence.
-fn checkpoint_requires_state_cache(model_path: &str) -> Result<bool> {
+fn checkpoint_requires_state_cache(model_path: &str, fitted: bool) -> Result<bool> {
     let architectures = Python::attach(|py| -> PyResult<Vec<String>> {
         let document = py
             .import("aisim_core.sdk.utils")?
@@ -3344,9 +3356,17 @@ fn checkpoint_requires_state_cache(model_path: &str) -> Result<bool> {
         !architectures.is_empty(),
         "cannot verify replay cache architecture for {model_path:?}: checkpoint declares no architectures"
     );
-    Ok(architectures
+    if architectures
         .iter()
-        .any(|architecture| architecture_requires_state_cache(architecture)))
+        .any(|name| architecture_requires_state_cache(name))
+    {
+        return Ok(true);
+    }
+    if fitted {
+        // A nested decoder, when present, owns the text cache.
+        return unregistered_replay_architecture(&architectures[architectures.len() - 1]);
+    }
+    Ok(false)
 }
 
 /// Native replay is also callable without the Python runner. Enforce model
@@ -3381,9 +3401,9 @@ fn validate_aic_state_cache(
         }
     }
     bail!(
-        "Kimi hybrid/KDA replay requires explicit state_cache geometry (vLLM G1 only) \
+        "Recurrent and unregistered fitted decoders require explicit state_cache geometry (vLLM G1 only) \
          or a qualified grouped FPM memory profile containing per-request state; \
-         num_gpu_blocks and token-only KV capacity do not account for KDA state"
+         num_gpu_blocks and token-only KV capacity do not account for per-request state"
     )
 }
 
@@ -3507,6 +3527,7 @@ fn resolve_role_timing(
             launch.max_cudagraph_capture_size
         );
     }
+    let mut timing = AicTimingModel::build(&mut config, worker_type, role.rank.vision)?;
     let resources = if config.backend == "vllm" && config.pp == 1 {
         config.estimator_request(worker_type)?.fpm_resources()?
     } else {
@@ -3515,7 +3536,6 @@ fn resolve_role_timing(
     if let Some(resources) = &resources {
         resources.require_memory()?;
     }
-    let mut timing = AicTimingModel::build(&mut config, worker_type, role.rank.vision)?;
     // Direct FPM graphs are empty. Canonical construction has already checked
     // this profile architecture against checkpoint metadata, including the
     // KimiLinear decoder nested in the K3.1 multimodal checkpoint.
@@ -3530,6 +3550,7 @@ fn resolve_role_timing(
         .and_then(|model| model.native_engine());
     let requires_state_cache = if let Some(architecture) = profile_architecture {
         architecture_requires_state_cache(architecture)
+            || (timing.is_fitted() && unregistered_replay_architecture(architecture)?)
             || native
                 .as_ref()
                 .is_some_and(|engine| engine.requires_explicit_state_cache())
@@ -3543,7 +3564,7 @@ fn resolve_role_timing(
     } else {
         // A native graph can omit recurrent-state ops (notably K3's KDA
         // layers). A negative leaf predicate is not checkpoint evidence.
-        checkpoint_requires_state_cache(&config.model)?
+        checkpoint_requires_state_cache(&config.model, timing.is_fitted())?
     };
     validate_aic_state_cache(requires_state_cache, role, resources.as_ref())?;
     if let Some(fitted) = timing.fitted() {
@@ -9115,7 +9136,11 @@ mod tests {
         for blocks in [1, 2000] {
             role.rank.num_gpu_blocks = blocks;
             let error = validate_aic_state_cache(true, &role, None).unwrap_err();
-            assert!(error.to_string().contains("do not account for KDA state"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("do not account for per-request state")
+            );
             validate_aic_state_cache(false, &role, None).unwrap();
         }
         let mut resources: crate::perfmodel::fpm::FpmResourceConfig =
@@ -9200,6 +9225,79 @@ mod tests {
     }
 
     #[test]
+    fn fitted_snapshot_restores_grouped_state_for_replay() {
+        pyo3::Python::initialize();
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().to_str().unwrap();
+        let architecture = "KimiK3ForConditionalGeneration";
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::json!({"architectures": [architecture]}).to_string(),
+        )
+        .unwrap();
+        let worker = ForwardPassWorkerType::Decode;
+        let mut identity = ForwardPassPerfModelConfig::new(
+            model_path,
+            "b300_sxm",
+            crate::BackendKind::Vllm,
+            worker,
+        );
+        identity.estimation_mode = EstimationMode::FpmRegression;
+        identity.backend_version = Some("0.25.1".into());
+        identity.moe_tp_size = Some(1);
+        identity.moe_ep_size = Some(1);
+        identity.fpm_profile = Some(serde_json::from_value(serde_json::json!({
+            "schema_version":1, "model":model_path, "model_revision":"local-test",
+            "architecture":architecture, "context_length":4096, "num_experts":1,
+            "provenance":"Synthetic state-cache test fixture.",
+            "deployments":[{
+                "system":"b300_sxm", "backend":"vllm", "backend_version":"0.25.1",
+                "tp":1,"dp":1,"moe_tp":1,"moe_ep":1,"gemm_quant_mode":"nvfp4",
+                "moe_quant_mode":"nvfp4","fmha_quant_mode":"fp8","comm_quant_mode":"half",
+                "kv_cache_dtype":"fp8",
+                "resources":{"weights_bytes":100,"activations_bytes":20,"runtime_overhead_bytes":30,
+                    "comm_overhead_bytes":50,"max_num_tokens":8192,"max_batch_size":1024,
+                    "provenance":"Synthetic allocation.", "cache_layout":"grouped","cache_groups":[
+                    {"name":"kv","kind":"attention","num_layers":1,"block_size_tokens":16,"page_size_bytes":64},
+                    {"name":"state","kind":"state","num_layers":1,"block_size_tokens":16,"page_size_bytes":64,"blocks_per_request":1}
+                ]}
+            }]
+        })).unwrap());
+        let mut model = ForwardPassPerfModel::best_available(identity).unwrap();
+        model
+            .tune_with_fpms(&fitted_training_iterations(&[IterationKind::Decode], false))
+            .unwrap();
+        let saved = model
+            .save_state_snapshot(
+                &dir.path().join("snapshot"),
+                &crate::StateSnapshotOptions::default(),
+            )
+            .unwrap();
+        let mut config = serde_json::to_value(saved).unwrap();
+        config.as_object_mut().unwrap().remove("fpm_profile");
+        let mut role = ReplayRoleConfig::default();
+        role.rank.enable_prefix_caching = false;
+        role.rank.block_size = 16;
+
+        role.rank.timing_model = TimingModelConfig::External {
+            provider: "aic".into(),
+            config,
+        };
+        resolve_role_timing(
+            &mut role,
+            false,
+            worker,
+            None,
+            false,
+            &mut Vec::new(),
+            &mut serde_json::Map::new(),
+        )
+        .unwrap();
+        assert_eq!(role.rank.kv_cache_groups.len(), 2);
+        assert!(role.rank.kv_cache_capacity_bytes.unwrap() > 0);
+    }
+
+    #[test]
     fn k31_fitted_replay_checks_local_checkpoint_after_snapshot_restore() {
         pyo3::Python::initialize();
         for architecture in [
@@ -9256,7 +9354,9 @@ mod tests {
             .err()
             .expect("state must be declared");
             assert!(
-                error.to_string().contains("do not account for KDA state"),
+                error
+                    .to_string()
+                    .contains("do not account for per-request state"),
                 "{error:#}"
             );
             role.rank.kv_cache_bytes_per_token = Some(16);
@@ -9301,6 +9401,17 @@ mod tests {
                     "text_config": {"text_config": {"architectures": ["KimiLinearForCausalLM"]}}}),
                 None,
             ),
+            (
+                "custom-decoder",
+                serde_json::json!({"architectures": ["CustomDecoderForCausalLM"]}),
+                Some(true),
+            ),
+            (
+                "custom-wrapper",
+                serde_json::json!({"architectures": ["CustomWrapper"],
+                "text_config": {"architectures": ["Qwen3ForCausalLM"]}}),
+                Some(false),
+            ),
             ("missing-architecture", serde_json::json!({}), None),
         ] {
             let checkpoint = dir.path().join(name);
@@ -9310,7 +9421,7 @@ mod tests {
                 serde_json::to_vec(&config).unwrap(),
             )
             .unwrap();
-            let actual = checkpoint_requires_state_cache(checkpoint.to_str().unwrap());
+            let actual = checkpoint_requires_state_cache(checkpoint.to_str().unwrap(), true);
             if let Some(expected) = expected {
                 assert_eq!(actual.unwrap(), expected);
             } else {
@@ -9361,7 +9472,7 @@ mod tests {
                 )
                 .unwrap();
             module.setattr("decoder_config_key", inconsistent).unwrap();
-            let result = checkpoint_requires_state_cache(dir.path().to_str().unwrap());
+            let result = checkpoint_requires_state_cache(dir.path().to_str().unwrap(), true);
             module.setattr("decoder_config_key", original).unwrap();
             result.unwrap_err()
         });

@@ -287,6 +287,15 @@ pub(crate) fn relocate_snapshot_inputs(
         learned.checkpoint_path = None;
         return Ok(());
     };
+    // A fitted snapshot owns its memory profile. A caller may omit it, but
+    // an explicitly supplied profile must still pass the identity comparison.
+    if matches!(
+        config.estimation_mode,
+        EstimationMode::FpmRegression | EstimationMode::FpmLearned
+    ) && config.fpm_profile.is_none()
+    {
+        config.fpm_profile = identity.fpm_profile;
+    }
     let saved = identity.estimator_config;
     match manifest.kind {
         StateSnapshotKind::Native => {
