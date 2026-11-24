@@ -26,6 +26,7 @@ def _colocated(tokens, *, routing="balanced", stable=True, p50=12.0, correctness
         "system_label": "gb200",
         "measurement_boundary": "colocated MoE stage",
         "measurement_boundary_components": ["dispatch", "experts", "return", "combine"],
+        "measurement_timed_span": "all_moe_layers_and_microbatches",
         "primary_backend": "mega",
         "model_profile": _MODEL,
         "topology": {"ep_size": 8},
@@ -44,6 +45,7 @@ def _split(sequences):
         "system_label": "gb200",
         "measurement_boundary": "split AFD MoE stage",
         "measurement_boundary_components": ["dispatch", "experts", "return", "combine"],
+        "measurement_timed_span": "all_moe_layers_and_microbatches",
         "moe_backend": "megamoe",
         "model_profile": _MODEL,
         "topology": {"ag_size": 16, "eg_size": 8},
@@ -85,6 +87,7 @@ def test_builds_colocated_profile_and_skips_unqualified_results(tmp_path):
         "benchmark": "fastafd.megamoe-colocated-model-benchmark.v2",
         "boundary": "colocated MoE stage",
         "boundary_components": ["dispatch", "experts", "return", "combine"],
+        "timed_span": "all_moe_layers_and_microbatches",
     }
     entry = profile["entries"][0]
     assert entry["key"] == {
@@ -267,3 +270,20 @@ def test_builder_rejects_unverified_or_incompatible_boundary(tmp_path, component
     with pytest.raises(ValueError, match="boundary_components"):
         main([str(tmp_path), "--repository", _REPOSITORY, "--output", str(output)])
     assert not output.exists()
+
+
+@pytest.mark.parametrize("span", [None, "one_microbatch", "one_moe_layer", "", 1])
+@pytest.mark.parametrize("suffix", ["json", "parquet"])
+def test_builder_rejects_unverified_or_partial_timed_span_without_publication(tmp_path, span, suffix):
+    payload = _split(64)
+    if span is None:
+        del payload["measurement_timed_span"]
+    else:
+        payload["measurement_timed_span"] = span
+    _write(tmp_path, "capture.json", payload)
+    output = tmp_path / f"profile.{suffix}"
+    original = b"previous profile"
+    output.write_bytes(original)
+    with pytest.raises(ValueError, match="timed_span"):
+        main([str(tmp_path), "--repository", _REPOSITORY, "--output", str(output)])
+    assert output.read_bytes() == original

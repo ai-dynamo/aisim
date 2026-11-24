@@ -63,6 +63,7 @@ def _payload(entries=None):
             "benchmark": "fastafd.moe-m2n-model-benchmark.v2",
             "boundary": "split AFD MoE stage",
             "boundary_components": ["dispatch", "experts", "return", "combine"],
+            "timed_span": "all_moe_layers_and_microbatches",
         },
         "entries": [_entry()] if entries is None else entries,
     }
@@ -112,6 +113,7 @@ def test_exact_lookup_preserves_source_and_method(tmp_path):
     assert provenance["source_commit"] == _COMMIT
     assert provenance["benchmark"] == "fastafd.moe-m2n-model-benchmark.v2"
     assert provenance["boundary_components"] == ["dispatch", "experts", "return", "combine"]
+    assert provenance["timed_span"] == "all_moe_layers_and_microbatches"
     assert provenance["method"] == "cuda_event"
     assert provenance["source_tree_sha256"] == "c" * 64
     assert provenance["correctness"] is None
@@ -347,8 +349,8 @@ def test_measurement_sample_count_rejects_u64_overflow(tmp_path, suffix):
         RustForwardPassPerfModel.best_available(_canonical_config(path))
 
 
-@pytest.mark.parametrize("nested_leaves", [1, 2])
-def test_canonical_model_rejects_nested_parquet_before_positional_reads(tmp_path, nested_leaves):
+@pytest.mark.parametrize("nested_kind", ["struct", "struct_pair", "list", "map"])
+def test_inspection_and_canonical_model_agree_on_flat_parquet_schema(tmp_path, nested_kind):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -359,16 +361,58 @@ def test_canonical_model_rejects_nested_parquet_before_positional_reads(tmp_path
     path = tmp_path / "profile.parquet"
     profile.write_parquet(path)
     table = pq.read_table(path)
+    # An unused scalar column is valid, even when its literal name has a dot.
+    table = table.append_column("unused.scalar", pa.array([0.0]))
+    pq.write_table(table, path)
+    assert FastAFDMoEStageProfile.load(path).entries == profile.entries
+    estimate = RustForwardPassPerfModel.best_available(_canonical_config(path)).estimate_fastafd_stage(48)
+    assert estimate["stage"]["latency_ms"] == 16.7
     # Keep every key and provenance field ahead of the nested group, so their
     # reads still succeed. A two-leaf group shifts the latency leaf index onto
     # the neighboring 24 ms DOUBLE although the actual measurement is 16.7 ms.
     table = table.select([name for name in table.column_names if name != "latency_ms"] + ["latency_ms"])
-    nested = pa.array([{f"leaf_{i}": 0.0 for i in range(nested_leaves)}])
+    nested = {
+        "struct": pa.array([{"leaf": 0.0}]),
+        "struct_pair": pa.array([{"leaf": 0.0, "other": 0.0}]),
+        "list": pa.array([[0.0]]),
+        "map": pa.array([[("leaf", 0.0)]], type=pa.map_(pa.string(), pa.float64())),
+    }[nested_kind]
     table = table.add_column(len(table.column_names) - 1, "nested", nested)
     table = table.append_column("neighbor_ms", pa.array([24.0]))
     pq.write_table(table, path)
 
+    with pytest.raises(ValueError, match="flat parquet schema"):
+        FastAFDMoEStageProfile.load(path)
     with pytest.raises(PerfDataNotAvailableError, match="flat parquet schema"):
+        RustForwardPassPerfModel.best_available(_canonical_config(path))
+
+
+@pytest.mark.parametrize("span", [None, "one_microbatch", "one_moe_layer", 1])
+@pytest.mark.parametrize("suffix", ["json", "parquet"])
+def test_inspection_and_native_loading_require_complete_timed_span(tmp_path, span, suffix):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    payload = _payload()
+    if span is None:
+        del payload["source"]["timed_span"]
+    else:
+        payload["source"]["timed_span"] = span
+    if suffix == "json":
+        path = _write(tmp_path, payload)
+    else:
+        profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload()))
+        path = tmp_path / "profile.parquet"
+        profile.write_parquet(path)
+        table = pq.read_table(path)
+        index = table.schema.get_field_index("source_json")
+        table = table.set_column(index, "source_json", pa.array([json.dumps(payload["source"])]))
+        pq.write_table(table, path)
+    with pytest.raises(ValueError, match="timed_span"):
+        FastAFDMoEStageProfile.load(path)
+    with pytest.raises(ValueError, match="timed_span|invalid type"):
         RustForwardPassPerfModel.best_available(_canonical_config(path))
 
 

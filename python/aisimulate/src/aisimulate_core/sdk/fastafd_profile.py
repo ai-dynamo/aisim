@@ -61,6 +61,7 @@ class FastAFDProfileSource:
     benchmark: str
     boundary: str
     boundary_components: tuple[str, ...]
+    timed_span: str
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,7 @@ class FastAFDMoEStageMeasurement:
             "benchmark": self.source.benchmark,
             "boundary": self.source.boundary,
             "boundary_components": list(self.source.boundary_components),
+            "timed_span": self.source.timed_span,
             "model_profile": self.model_profile,
             "method": self.method,
             "method_version": self.method_version,
@@ -155,6 +157,8 @@ class FastAFDMoEStageProfile:
             import pyarrow.parquet as pq
 
             metadata = pq.read_metadata(pa.BufferReader(raw))
+            if any(pa.types.is_nested(field.type) for field in metadata.schema.to_arrow_schema()):
+                raise ValueError("expected a flat parquet schema (no nested fields)")
             for group in range(metadata.num_row_groups):
                 row_group = metadata.row_group(group)
                 for column in range(row_group.num_columns):
@@ -206,19 +210,24 @@ class FastAFDMoEStageProfile:
         if root["lookup_policy"] != "exact-only":
             raise ValueError("FastAFD profile lookup_policy must be 'exact-only'")
         origin = _object(
-            root["source"], {"repository", "commit", "benchmark", "boundary", "boundary_components"}, "source"
+            root["source"],
+            {"repository", "commit", "benchmark", "boundary", "boundary_components", "timed_span"},
+            "source",
         )
         # A complete stage includes the A-side combine and excludes the router,
         # which is charged separately by the attention provider. Never infer
         # this contract from the free-form provenance description.
         if origin["boundary_components"] != ["dispatch", "experts", "return", "combine"]:
             raise ValueError("source.boundary_components must be dispatch, experts, return, combine (no router)")
+        if origin["timed_span"] != "all_moe_layers_and_microbatches":
+            raise ValueError("source.timed_span must be all_moe_layers_and_microbatches")
         source = FastAFDProfileSource(
             repository=_text(origin["repository"], "source.repository"),
             commit=_digest(origin["commit"], _SHA1, "source.commit"),
             benchmark=_text(origin["benchmark"], "source.benchmark"),
             boundary=_text(origin["boundary"], "source.boundary"),
             boundary_components=tuple(origin["boundary_components"]),
+            timed_span=origin["timed_span"],
         )
         if not isinstance(root["entries"], list) or not root["entries"]:
             raise ValueError("FastAFD profile entries must be a non-empty list")

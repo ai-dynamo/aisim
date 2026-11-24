@@ -65,6 +65,7 @@ def build_profile(
             "benchmark": payload["schema"],
             "boundary": payload["measurement_boundary"],
             "boundary_components": payload.get("measurement_boundary_components"),
+            "timed_span": payload.get("measurement_timed_span"),
         }
         if source is None:
             source = current

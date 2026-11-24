@@ -169,6 +169,11 @@ class FastAFDMoEStagePerformanceModel:
     def _decode_samples(attention: AFDLayerTimes) -> tuple[tuple[float, int], ...]:
         raw = attention.provenance.get("decode_samples")
         if "decode_samples" not in attention.provenance:
+            if attention.decode_attention_samples:
+                raise _infeasible(
+                    "typed decode_attention_samples require decode_samples boundary components "
+                    "to recompose the FastAFD attention boundary"
+                )
             # Legacy/custom providers without a trace describe constant A time.
             return ()
         if not isinstance(raw, (list, tuple)) or not raw:

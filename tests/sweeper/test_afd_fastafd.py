@@ -89,6 +89,7 @@ def _profile(tmp_path, entries=None) -> str:
                     "benchmark": "fastafd.moe-m2n-model-benchmark.v2",
                     "boundary": "split AFD MoE stage",
                     "boundary_components": ["dispatch", "experts", "return", "combine"],
+                    "timed_span": "all_moe_layers_and_microbatches",
                 },
                 "entries": [_entry()] if entries is None else entries,
             }
@@ -1142,6 +1143,47 @@ def test_fastafd_rejects_invalid_or_inconsistent_sample_traces(tmp_path, trace, 
     attention = replace(attention, provenance={**attention.provenance, "decode_samples": trace})
     with pytest.raises(AFDInfeasible, match=match):
         _provider(tmp_path, SimpleNamespace(measure=lambda _: (attention,))).measure(_request(_topology()))
+
+
+def test_fastafd_rejects_typed_trace_without_boundary_samples(tmp_path):
+    request = replace(_request(_topology()), output_length=3)
+    components = {"attention_compute_ms": 1.75, "a_combine_ms": 0.25, "a_router_ms": 0.25}
+    attention = AFDLayerTimes(
+        phase="decode",
+        attention_ms=2.0,
+        ffn_ms=2.0,
+        a_to_f_ms=0.0,
+        f_to_a_ms=0.0,
+        num_layers=LAYERS,
+        provenance={"components": components},
+        decode_attention_samples=((1.0, 1), (3.0, 1)),
+    )
+    provider = SimpleNamespace(measure=lambda _: (attention,))
+    fastafd = _provider(tmp_path, provider)
+    with pytest.raises(AFDInfeasible, match="typed decode_attention_samples require decode_samples") as error:
+        fastafd.measure(request)
+    assert error.value.category is AFDReasonCategory.INVALID_MEASUREMENT
+
+    # Complete boundary evidence permits exact recomposition of each sample:
+    # subtract A-side combine, add router, then preserve the variable cadence.
+    attention = replace(
+        attention,
+        provenance={
+            "components": components,
+            "decode_samples": [
+                {"repeat": 1, "components": {**components, "attention_compute_ms": compute}} for compute in (0.75, 2.75)
+            ],
+        },
+    )
+    (measurement,) = fastafd.measure(request)
+    assert measurement.decode_attention_samples == ((1.0, 1), (3.0, 1))
+    assert measurement.attention_ms == 2.0
+
+    # A provider with neither representation explicitly describes constant A.
+    attention = replace(attention, decode_attention_samples=(), provenance={"components": components})
+    (measurement,) = fastafd.measure(request)
+    assert measurement.decode_attention_samples == ()
+    assert measurement.attention_ms == 2.0
 
 
 @pytest.mark.parametrize("repeats", [(32, 1), (32, 33)])

@@ -24,6 +24,8 @@ may be zero.
 Topology components in `ep<N>` and `<A>A<F>F` must also be positive u32 values.
 Supported Parquet compression codecs are UNCOMPRESSED, SNAPPY, and ZSTD.
 Python inspection rejects other codecs, including GZIP, before native estimation.
+Both entrypoints require a flat schema, including unused columns; nested structs,
+lists, and maps are rejected before row inspection.
 
 `FastAFDMoEStageProfile.load(path).write_parquet(output)` converts a validated
 legacy document without changing its measured values. Python's canonical model
@@ -50,7 +52,8 @@ Their `entries` tuple is read-only so cached exact lookups retain their identity
     "commit": "<40-character git commit>",
     "benchmark": "fastafd.megamoe-colocated-model-benchmark.v2",
     "boundary": "<the benchmark's own description of what the measured interval covers>",
-    "boundary_components": ["dispatch", "experts", "return", "combine"]
+    "boundary_components": ["dispatch", "experts", "return", "combine"],
+    "timed_span": "all_moe_layers_and_microbatches"
   },
   "entries": [
     {
@@ -98,16 +101,21 @@ visible as a tree that differs from the commit.
 | --- | --- | --- |
 | `boundary` | Nonempty description | Preserves the benchmark's own interval description as provenance. |
 | `boundary_components` | `["dispatch", "experts", "return", "combine"]` | Explicit ordered interval contract. Includes A-side combine and excludes the router, which attention charges separately. Missing or incompatible metadata is rejected before prediction. |
+| `timed_span` | `all_moe_layers_and_microbatches` | Each timed iteration covers every microbatch across every measured MoE layer of one decode step. Missing metadata or a partial span is rejected. Retained in stage provenance. |
 
 The description alone cannot establish the interval contract. Existing import
-documents without `boundary_components` must be annotated from verified capture
-evidence before conversion; do not infer coverage from `scope` or benchmark names.
+documents without `boundary_components` or `timed_span` must be annotated from
+verified capture evidence before conversion; do not infer coverage from `scope`,
+workload counts, or benchmark names.
 
 The `key` identifies the model, hardware, stage (`agg` for a colocated EP group,
 `afd` for an attention/FFN split), topology (`ep<N>` or `<A>A<F>F`), per-source-rank
 batch, MTP degree, microbatches, measured MoE layer count, top-k, MoE precision, and
 MoE backend. `latency_ms` is the p50 over `sample_count` timed iterations of the
-stage for all `moe_layers` layers of one decode step. `routing` records the expert
+stage for all `moe_layers` layers and all `microbatches` of one decode step.
+It must not be a per-microbatch or per-layer timer. Native estimation divides
+this complete interval by `moe_layers × microbatches` to obtain the per-layer,
+per-microbatch F-stage time. `routing` records the expert
 routing distribution the benchmark used; `cv_percent` is the dispersion of those
 iterations. `stable` is the benchmark's own stability gate and must be true;
 `correctness` is the matched-output check against a reference backend, `null` when
@@ -158,6 +166,12 @@ The designated output is excluded from input discovery, so the same command can
 replace a JSON profile inside the results directory. Other unsupported inputs fail.
 Raw results must include `measurement_boundary_components` with the exact ordered
 components above, in addition to the free-form `measurement_boundary` description.
+They must also include `measurement_timed_span: "all_moe_layers_and_microbatches"`;
+the builder copies it to `source.timed_span` and rejects missing or incompatible
+values. This metadata is a required capture assertion, not proof of measurement
+accuracy. Synthetic fixtures establish validation and normalization only. A real
+capture with multiple microbatches and its recorded benchmark tree are needed to
+verify the timer's actual coverage.
 For older captures, verify the measured interval from the recorded benchmark tree
 before annotating this metadata. The builder never assumes a complete boundary.
 The raw results, the benchmark revision, and the procedure stay with the profile so

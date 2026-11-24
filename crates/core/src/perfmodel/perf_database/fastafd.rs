@@ -193,6 +193,7 @@ struct Source {
     benchmark: String,
     boundary: String,
     boundary_components: Vec<String>,
+    timed_span: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -310,6 +311,11 @@ impl Document {
         if s.boundary_components != ["dispatch", "experts", "return", "combine"] {
             return Err(invalid(
                 "FastAFD boundary_components must be dispatch, experts, return, combine (no router)",
+            ));
+        }
+        if s.timed_span != "all_moe_layers_and_microbatches" {
+            return Err(invalid(
+                "FastAFD timed_span must be all_moe_layers_and_microbatches",
             ));
         }
         if !text(&s.repository)
@@ -542,7 +548,7 @@ impl FastAfdTable {
             ffn_ms: e.latency_ms / (f64::from(e.key.moe_layers) * f64::from(e.key.microbatches)),
             num_layers: e.key.moe_layers,
             stage: json!({"profile_path":self.path,"profile_sha256":self.sha256,"key":e.key,"latency_ms":e.latency_ms,
-                "provider":"fastafd","schema":"aisimulate.fastafd-moe-stage.v1","repository":s.repository,"source_commit":s.commit,"benchmark":s.benchmark,"boundary":s.boundary,"boundary_components":s.boundary_components,
+                "provider":"fastafd","schema":"aisimulate.fastafd-moe-stage.v1","repository":s.repository,"source_commit":s.commit,"benchmark":s.benchmark,"boundary":s.boundary,"boundary_components":s.boundary_components,"timed_span":s.timed_span,
                 "model_profile":e.model_profile,"method":c.method,"method_version":c.method_version,"statistic":c.statistic,"sample_count":c.sample_count,
                 "cv_percent":c.cv_percent,"routing":c.routing,"source_tree_sha256":c.source_tree_sha256,"raw_artifact":c.raw_artifact,"raw_sha256":c.raw_sha256,"correctness":e.validation.correctness}),
         })
@@ -560,7 +566,7 @@ mod tests {
         // Each of the six pipeline units therefore costs exactly 2 ms.
         let document = json!({
             "schema":"aisimulate.fastafd-moe-stage.v1", "lookup_policy":"exact-only",
-            "source":{"repository":"https://example.invalid/fixture","commit":"0".repeat(40),"benchmark":"synthetic","boundary":"complete stage","boundary_components":["dispatch","experts","return","combine"]},
+            "source":{"repository":"https://example.invalid/fixture","commit":"0".repeat(40),"benchmark":"synthetic","boundary":"complete stage","boundary_components":["dispatch","experts","return","combine"],"timed_span":"all_moe_layers_and_microbatches"},
             "entries":[{"key":{"model_path":"synthetic","system":"gb200","stage":"afd","topology":"4A8F","logical_batch_per_source_rank":128,"mtp_nextn":0,"microbatches":2,"moe_layers":3,"routed_topk":8,"moe_precision":"fp8","moe_backend":"megamoe"},
                 "latency_ms":12.0,"model_profile":"synthetic",
                 "measurement":{"scope":"complete_moe_stage","method":"synthetic","method_version":"1","statistic":"p50","sample_count":40,"cv_percent":0.5,"routing":"balanced","source_tree_sha256":"a".repeat(64),"raw_artifact":"fixture.json","raw_sha256":"b".repeat(64)},
@@ -619,6 +625,10 @@ mod tests {
         assert_eq!(estimate.ffn_ms, 2.0);
         assert_eq!(estimate.num_layers, 3);
         assert_eq!(estimate.stage["latency_ms"], 12.0);
+        assert_eq!(
+            estimate.stage["timed_span"],
+            "all_moe_layers_and_microbatches"
+        );
         assert_eq!(
             model.diagnostics().source,
             ForwardPassPerfSource::FastafdStage
@@ -890,6 +900,47 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn canonical_stage_requires_the_complete_timed_span() {
+        let (file, config) = fixture();
+        for span in [
+            None,
+            Some(json!("one_microbatch")),
+            Some(json!("one_moe_layer")),
+            Some(Value::Null),
+        ] {
+            let mut document = fixture_document();
+            if let Some(span) = span {
+                document["source"]["timed_span"] = span;
+            } else {
+                document["source"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("timed_span");
+            }
+            std::fs::write(file.path(), parquet_snapshot(&document)).unwrap();
+            let error = ForwardPassPerfModel::best_available(config.clone())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("timed_span") || error.contains("invalid type"),
+                "{error}"
+            );
+        }
+        std::fs::write(file.path(), parquet_snapshot(&fixture_document())).unwrap();
+        let estimate = ForwardPassPerfModel::best_available(config)
+            .unwrap()
+            .estimate_fastafd_stage(128)
+            .unwrap();
+        // Synthetic contract oracle: 12 ms covers 3 layers * 2 microbatches.
+        // This checks normalization, not an external benchmark's timed span.
+        assert_eq!(estimate.ffn_ms, 2.0);
+        assert_eq!(
+            estimate.stage["timed_span"],
+            "all_moe_layers_and_microbatches"
+        );
     }
 
     #[cfg(unix)]
