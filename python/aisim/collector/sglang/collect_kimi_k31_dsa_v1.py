@@ -206,7 +206,7 @@ def run_kimi_k31_dsa_worker(*args, device="cuda:0", perf_filename=None):
     _run_native_case(case, device, perf_filename)
 
 
-def run_kimi_k31_dsa_fullnode(*, perf_filename, limit=None, cases=None, expected_sm=None):
+def run_kimi_k31_dsa_fullnode(*, perf_filename, limit=None, cases=None, expected_sm=None, phase=None):
     """Own the visible TP group and report every selected case to fullnode.py.
 
     Cases execute sequentially in fresh subprocesses. The common full-node
@@ -225,7 +225,7 @@ def run_kimi_k31_dsa_fullnode(*, perf_filename, limit=None, cases=None, expected
     failure_details = {}
     for case in selected:
         try:
-            _run_native_case(case, "cuda:0", perf_filename, expected_sm=expected_sm)
+            _run_native_case(case, "cuda:0", perf_filename, expected_sm=expected_sm, phase=phase)
         except Exception as error:
             failure_details[str(case)] = {"error_type": type(error).__name__, "error_message": str(error)}
             logging.getLogger(__name__).exception("Native Kimi K3.1 full-node case failed: %s", case)
@@ -266,13 +266,14 @@ def _native_termination_handler():
             raise SystemExit(128 + signal.SIGTERM)
 
 
-def _run_native_case(case, device, perf_filename, *, expected_sm=None):
+def _run_native_case(case, device, perf_filename, *, expected_sm=None, phase=None):
     if os.environ.get("COLLECTOR_MEASURE_POWER", "false").lower() in ("1", "true", "yes", "on"):
         raise ValueError("native Kimi K3.1 does not support --measure_power; use latency-only collection")
     if perf_filename is None:
         raise ValueError("native Kimi K3.1 collection requires an output filename")
     requested = Path(perf_filename)
-    phase = "context" if "context" in requested.name else "generation"
+    if phase is None:
+        phase = "context" if "context" in requested.name else "generation"
     output = requested.resolve()
     with native_publication_lock(output) as lock_fd:
         _run_owned_native_case(case, device, output, lock_fd, expected_sm, phase)

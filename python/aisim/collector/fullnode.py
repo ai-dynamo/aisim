@@ -175,6 +175,8 @@ def collect_sglang_fullnode_op(
 
     native = op.startswith("kimi_k31_dsa_")
     output = Path(collection["perf_filename"])
+    if native:
+        output = output.resolve()
     with native_publication_lock(output) if native else nullcontext():
         return _collect_selected_cases(
             cases,
@@ -342,7 +344,14 @@ def _collect_selected_cases(
                 perf_filename=str(filename) if native else filename,
                 limit=None,
                 cases=[task_info["params"] for task_info in batch],
-                **({"expected_sm": sm_version} if native else {}),
+                **(
+                    {
+                        "expected_sm": sm_version,
+                        "phase": "context" if op == "kimi_k31_dsa_context_module" else "generation",
+                    }
+                    if native
+                    else {}
+                ),
             )
             if not isinstance(result, dict) or "failed" not in result:
                 raise RuntimeError(f"{full_name} runner must return a result containing its failed case list")
