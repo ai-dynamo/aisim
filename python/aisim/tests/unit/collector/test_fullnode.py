@@ -137,17 +137,18 @@ def test_fullnode_preserves_registry_maturity_gate_before_import(maturity, sm):
 
 @pytest.mark.parametrize("phase", ["context", "generation"])
 def test_native_sm121_maturity_gate_prevents_import_and_queueing(phase):
+    from collector.sglang.collect_kimi_k31_dsa_v1 import RUNTIME_VERSION
     from collector.sglang.registry import REGISTRY
     from collector.version_resolver import build_collections
 
     _Checkpoint.instances.clear()
     (collection,) = build_collections(
-        REGISTRY, "sglang", "0.0.0.dev1+g41208373c.d20261104", [f"kimi_k31_dsa_{phase}_module"]
+        REGISTRY, "sglang", RUNTIME_VERSION, [f"kimi_k31_dsa_{phase}_module"]
     )
     assert 103 not in collection["unverified_sms"]
     errors = fullnode.collect_sglang_fullnode_op(
         {**collection, "module": "must_not_import"},
-        runtime_version="0.0.0.dev1+g41208373c.d20261104",
+        runtime_version=RUNTIME_VERSION,
         limit=None,
         shuffle=False,
         shuffle_seed=42,

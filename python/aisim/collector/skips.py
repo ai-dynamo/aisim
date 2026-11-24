@@ -57,11 +57,12 @@ _MSA_MODULE_OPS = ["msa_context_module", "msa_generation_module"]
 _ATTENTION_OPS = ["attention_context", "attention_generation"]
 
 SKIPS: list[dict] = [
-    # The pinned native TP boundary is qualified only on B300 (SM103).
+    # The native launcher rejects all other physical SMs before spawning TP ranks
+    # (sglang/collect_kimi_k31_dsa_v1.py). Every case in that block would fail.
     {
         "backend": "sglang",
         "op": ["kimi_k31_dsa_context_module", "kimi_k31_dsa_generation_module"],
-        "sm_except": [103],
+        "sm_except": [90, 100, 103],
     },
     # Native K31 Gated DSA has one source-pinned SGLang implementation.
     # Other framework implementations require their own serving audit.

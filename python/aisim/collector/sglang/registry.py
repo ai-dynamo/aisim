@@ -12,11 +12,14 @@ from collector.registry_types import OpEntry, PerfFile, VersionRoute
 
 def require_kimi_k31_runtime(installed_version: str, requested_ops: set[str]) -> None:
     """The native preview requires its complete build identity before queueing."""
-    for entry in REGISTRY:
-        if entry.op.startswith("kimi_k31_dsa_") and entry.op in requested_ops:
-            expected = entry.versions[0].min_version
-            if installed_version != expected:
-                raise RuntimeError(f"native Kimi K3.1 requires exactly {expected}; found {installed_version}")
+    if not any(op.startswith("kimi_k31_dsa_") for op in requested_ops):
+        return
+    from collector.framework_manifest import platform_runtime_version
+    from collector.sglang.collect_kimi_k31_dsa_v1 import RUNTIME_VERSIONS
+
+    expected = platform_runtime_version({"platform_versions": RUNTIME_VERSIONS})
+    if installed_version != expected:
+        raise RuntimeError(f"native Kimi K3.1 requires exactly {expected}; found {installed_version}")
 
 
 REGISTRY: list[OpEntry] = [
@@ -26,9 +29,14 @@ REGISTRY: list[OpEntry] = [
         get_func="get_kimi_k31_dsa_context_test_cases",
         run_func="run_kimi_k31_dsa_fullnode",
         perf_filename=PerfFile.DSA_CONTEXT_MODULE,
-        # Native TP1/2/4 eager boundary verified on B300 (SM103). Other
-        # targeted architectures still require their own native GPU campaign.
-        unverified_sms=(80, 86, 89, 90, 100, 120, 121),
+        # Native eager TP1/2/4/8 coverage: SM90 H100/H200, SM100 B200/GB200,
+        # SM103 B300/GB300. Receipts relative to benchmarks/evidence/collector/
+        # kimi-k31-dsa-expanded-20261109/: x86/smoke/*/*/validation.json;
+        # ARM arm/gb200/{tp1,tp24,tp8}/summary.json and
+        # arm/gb300/tp1248/summary.json bind formal observations and smoke
+        # hashes. The original ARM smoke payloads are outside the tree.
+        # See that campaign's README.md and the initial B300 campaign.
+        unverified_sms=(80, 86, 89, 120, 121),
     ),
     OpEntry(
         op="kimi_k31_dsa_generation_module",
@@ -36,7 +44,7 @@ REGISTRY: list[OpEntry] = [
         get_func="get_kimi_k31_dsa_generation_test_cases",
         run_func="run_kimi_k31_dsa_fullnode",
         perf_filename=PerfFile.DSA_GENERATION_MODULE,
-        unverified_sms=(80, 86, 89, 90, 100, 120, 121),
+        unverified_sms=(80, 86, 89, 120, 121),
     ),
     OpEntry(
         op="dsv41_module",
