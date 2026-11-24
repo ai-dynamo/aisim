@@ -1603,6 +1603,13 @@ impl VllmCore {
     ) -> SchedulerCommandEffects {
         let mut effects = SchedulerCommandEffects::new(result);
         if result == SchedulerCommandResult::Applied {
+            // A cancellation between passes can remove the work for which the
+            // last boundary held finished blocks. Free them before the retry.
+            if let Some(now_ms) = mutation_now_ms
+                && self.load_poll()
+            {
+                self.free_finished_if_idle(now_ms);
+            }
             effects
                 .lifecycle_events
                 .extend(self.retry_pending_destinations_at(mutation_now_ms));
@@ -2277,16 +2284,22 @@ impl VllmCore {
             self.apply_host_progress(progress);
             self.settle_loads_in_empty_steps(now_ms);
         }
-        // With nothing to schedule, vLLM's next step is empty and it processes
-        // this pass's outputs at once. A destination waiting for capacity
-        // schedules nothing: it needs the blocks these outputs free. A CPU-tier
-        // restore due at the next decision is work for that decision, which
-        // vLLM decides before it processes these outputs.
+        self.free_finished_if_idle(now_ms);
+    }
+
+    // With nothing to schedule, vLLM's next step is empty and it processes
+    // the last pass's outputs at once. A destination waiting for capacity
+    // schedules nothing: it needs the blocks these outputs free. A restore
+    // due at the next decision is work for that decision.
+    fn free_finished_if_idle(&mut self, now_ms: f64) {
+        if self.finished_in_flight.is_empty() || self.has_schedulable_requests() {
+            return;
+        }
         let due_restore = self
             .pending_activations
             .iter()
             .any(|&(_, _, release)| release.is_due(self.passes_executed, now_ms));
-        if !self.has_schedulable_requests() && !due_restore {
+        if !due_restore {
             let finished = std::mem::take(&mut self.finished_in_flight);
             self.free_finished(finished);
         }

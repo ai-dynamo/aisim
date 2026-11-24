@@ -5035,8 +5035,7 @@ mod tests {
         assert!(run.core.is_drained(), "every restore and store completes");
     }
 
-    #[test]
-    fn a_due_restore_keeps_finished_blocks_until_its_decision() {
+    fn last_decode_with_due_restore(two_restores: bool) -> (PollRun, usize) {
         // The due-restore run with a last decode one pass later: A (request
         // 3) prefills at m+4 and decodes its last token at m+5. B (request 6)
         // is seen by A's prefill poll and is due at m+6. When m+5 ends, B is
@@ -5050,7 +5049,7 @@ mod tests {
             3.0,
             false,
             Some(PollRun::LAUNCH),
-            &[(1, 0..22), (5, 100..122)],
+            &[(1, 0..22), (5, 100..122), (7, 200..210)],
         );
         run.submit(9, (900..906).collect(), 10);
         for _ in 0..6 {
@@ -5060,15 +5059,30 @@ mod tests {
         run.submit(3, (0..22).collect(), 2);
         run.step();
         run.step();
-        run.submit(6, (100..122).collect(), 2);
-        while run.passes.len() < m + 6 {
+        if two_restores {
+            run.submit(6, (100..106).collect(), 2);
+            run.submit(8, (200..206).collect(), 2);
+        } else {
+            run.submit(6, (100..122).collect(), 2);
+        }
+        while run.passes.len() < m + 5 {
             run.step();
         }
         assert_eq!(admitted_in(&run, 3), Some(m + 4));
         assert_eq!(admitted_in(&run, 6), None, "B is due at m+6");
         assert!(run.core.test_awaits_poll(Uuid::from_u128(6)));
-        let held = run.core.kv_manager.num_active_blocks();
-        assert_eq!(held, 11, "A's finished blocks are still held");
+        (run, m)
+    }
+
+    #[test]
+    fn a_due_restore_keeps_finished_blocks_until_its_decision() {
+        let (mut run, m) = last_decode_with_due_restore(false);
+        run.step();
+        assert_eq!(
+            run.core.kv_manager.num_active_blocks(),
+            11,
+            "A's finished blocks are still held"
+        );
         run.step();
         assert_eq!(admitted_in(&run, 6), Some(m + 6));
         for _ in 0..16 {
@@ -5078,6 +5092,99 @@ mod tests {
             run.step();
         }
         assert!(run.core.is_drained(), "every restore and store completes");
+    }
+
+    #[test]
+    fn cancelling_the_last_due_restore_releases_finished_blocks_for_a_handoff() {
+        use crate::engine::handoff::HandoffId;
+        use crate::engine::scheduler::{SchedulerCommand, SchedulerLifecycleEvent};
+
+        for reserve_first in [false, true] {
+            let (mut run, _) = last_decode_with_due_restore(false);
+            run.step();
+            let handoff_id = HandoffId::from(Uuid::from_u128(40));
+            // Fourteen blocks fit only once both B's restore and A's finished
+            // request have released their blocks.
+            let reserve = SchedulerCommand::ReserveDestination {
+                handoff_id,
+                request: DirectRequest {
+                    tokens: (2000..2056).collect(),
+                    max_output_tokens: 1,
+                    uuid: Some(Uuid::from_u128(41)),
+                    ..Default::default()
+                },
+            };
+            let cancel = SchedulerCommand::CancelRequest {
+                request_id: Uuid::from_u128(6),
+            };
+            let [first, second] = if reserve_first {
+                [reserve, cancel]
+            } else {
+                [cancel, reserve]
+            };
+            let first = run
+                .core
+                .apply_command_effects_at(first, true, Some(run.now))
+                .unwrap();
+            assert!(first.lifecycle_events.is_empty());
+            let second = run
+                .core
+                .apply_command_effects_at(second, true, Some(run.now))
+                .unwrap();
+            assert!(
+                matches!(second.lifecycle_events.as_slice(),
+                    [SchedulerLifecycleEvent::DestinationReserved { handoff_id: id, .. }] if *id == handoff_id
+                ),
+                "reserve_first={reserve_first}: {:?}",
+                second.lifecycle_events
+            );
+        }
+    }
+
+    #[test]
+    fn cancelling_one_of_two_due_restores_keeps_finished_blocks_until_the_last_cancel() {
+        use crate::engine::scheduler::SchedulerCommand;
+
+        let (mut run, _) = last_decode_with_due_restore(true);
+        run.step();
+        for (id, remaining_blocks) in [(6, 7), (8, 0)] {
+            let request_id = Uuid::from_u128(id);
+            assert!(run.core.test_awaits_poll(request_id));
+            run.core
+                .apply_command_effects_at(
+                    SchedulerCommand::CancelRequest { request_id },
+                    true,
+                    Some(run.now),
+                )
+                .unwrap();
+            assert_eq!(run.core.kv_manager.num_active_blocks(), remaining_blocks);
+        }
+        assert!(!run.core.is_ready());
+        assert_eq!(run.core.next_internal_deadline_ms(), None);
+        assert!(run.core.is_drained());
+    }
+
+    #[test]
+    fn cancelling_a_due_restore_during_the_last_decode_waits_for_the_boundary() {
+        use crate::engine::scheduler::SchedulerCommand;
+
+        let (mut run, _) = last_decode_with_due_restore(false);
+        let pass = run
+            .core
+            .execute_pass(&mut TraceCollector::default(), run.now);
+        run.core
+            .apply_command_effects_at(
+                SchedulerCommand::CancelRequest {
+                    request_id: Uuid::from_u128(6),
+                },
+                false,
+                Some(run.now + 1.0),
+            )
+            .unwrap();
+        assert_eq!(run.core.kv_manager.num_active_blocks(), 6);
+        run.core.complete_engine_boundary(pass.end_ms);
+        assert_eq!(run.core.kv_manager.num_active_blocks(), 0);
+        assert!(run.core.is_drained());
     }
 
     #[test]
