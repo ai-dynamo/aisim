@@ -1352,8 +1352,8 @@ pub struct EngineConfig {
     pub prefill_decode_interval: usize,
     /// vLLM `--async-scheduling`. The engine then keeps a second batch queued
     /// behind the running one, which a request arriving at a busy engine
-    /// misses. `None` defaults to on, except with ngram drafts or MTP with
-    /// G2 and no recurrent state cache.
+    /// misses. Replay defaults to async scheduling unless it uses ngram drafts
+    /// or combines MTP and G2 host offload without a recurrent state cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub async_scheduling: Option<bool>,
     /// vLLM async scheduling's CPU launch costs: a pass's outputs leave once

@@ -361,11 +361,10 @@ that window. Behavior follows vLLM at commit
 ### vLLM async scheduling
 
 `async_scheduling` mirrors vLLM's `--async-scheduling` and
-`--no-async-scheduling`. Replay enables it by default and disables it for
-ngram drafts, as vLLM v0.28.0 does. Replay also requires synchronous
-scheduling for [MTP with G2 host offload](speculation.md#registered-schemes)
+`--no-async-scheduling`. Replay defaults to async scheduling unless it uses
+ngram drafts or combines [MTP and G2 host offload](speculation.md#registered-schemes)
 without a recurrent state cache. Both configurations reject an explicit
-`true`. vLLM v0.28.0 also turns async scheduling off for pooling models, some
+`true`. vLLM v0.28.0 turns async scheduling off for ngram drafts, pooling models, some
 speculative and executor settings and ROCm DeepEP DBO, so set it
 explicitly to match such a deployment.
 
@@ -491,7 +490,9 @@ otherwise.
 (`tensor`, `pipeline`, `attention_data` and `prefill_context` of 1): only then
 does vLLM run its uniprocess executor, which launches a pass inside the engine
 loop. With more GPUs its multiprocess executor returns a pass's outputs
-independently of the next launch. `launch` moves no pass. With
+independently of the next launch. `launch` keeps the same forward-time
+estimate for a given batch. It can change which pass admits an arrival or a
+CPU-tier restore, and a pass can wait for transfers before starting. With
 [response detokenization](README.md#detokenization), a pass's outputs start
 detokenizing when vLLM returns them. Only offline replay (`--stack engine`)
 releases the outputs a rank holds, so other runners reject `launch`. Behavior
@@ -568,9 +569,9 @@ batch's original completion time.
 
 Each check comes at the end of a launch, and only `launch` times launches, so
 the rule needs no setting of its own and applies only with `launch`. Without
-it, and with `offloading_v0_24`, a request can join the first pass decided
-after its copy ends, two or more passes earlier than vLLM. A rank-local pool
-with a sliding-window [state cache](kv-cache.md#state-cache) follows
+it, a request can join the first pass decided after its copy ends. A uniform
+token cache using `offloading_v0_24` keeps that behavior with `launch`. A
+rank-local pool with a sliding-window [state cache](kv-cache.md#state-cache) follows
 `offloading_v0_32` under either offloading name. With MTP and a CPU tier,
 launch timing requires a recurrent state cache and
 [`disable_eagle_block_drop: true`](speculation.md#prefix-caching). MTP with a

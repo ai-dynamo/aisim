@@ -174,8 +174,8 @@ class SchedulerPredictionConfig(StrictModel):
         default=None,
         description=(
             "vLLM only: model vLLM's --async-scheduling, under which an arrival at a busy engine misses the "
-            "batch vLLM has already queued. Replay enables it by default and disables it for ngram drafts. "
-            "Replay also requires synchronous scheduling for MTP with G2 host offload and no recurrent state cache."
+            "batch vLLM has already queued. Replay defaults to async scheduling unless it uses ngram drafts "
+            "or combines MTP and G2 host offload without a recurrent state cache."
         ),
     )
     load_balance_method: Literal["round_robin", "total_tokens"] = Field(
