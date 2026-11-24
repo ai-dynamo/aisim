@@ -1025,12 +1025,17 @@ fn an_engine_joining_a_warm_shared_pool_publishes_its_residency() {
     assert!(consumer.is_drained());
 }
 
-#[test]
-fn v0_32_admits_a_waiter_that_holds_g1_before_one_that_holds_none() {
+/// vLLM v0.32 schedules a waiter that holds G1 for a load before the others.
+/// The v0.24 rules keep the order of the first skip, and a waiter that must
+/// wait yields to one that holds G1.
+#[rstest::rstest]
+fn a_waiter_that_holds_g1_runs_before_one_that_must_wait(
+    #[values("offloading_v0_32", "offloading_v0_24")] connector: &str,
+) {
     // Six 4-token G1 blocks and enough G2 to keep every prompt; H2D moves a
     // 1 MB block in 10 ms.
     let mut rank = rank(json!({
-        "connector": "offloading_v0_32", "num_host_blocks": 16, "h2d_bandwidth_gbps": 0.1,
+        "connector": connector, "num_host_blocks": 16, "h2d_bandwidth_gbps": 0.1,
     }));
     rank["num_gpu_blocks"] = json!(6);
     let requests = trace(&[

@@ -2304,6 +2304,68 @@ mod destination_lifecycle {
         }
         assert!(destination.is_drained());
     }
+
+    /// A decode rank of four 4-token blocks. With `nextn`, every draft token
+    /// is accepted.
+    fn small_decode(nextn: Option<usize>) -> VllmCore {
+        let mut args = destination_args(EngineType::Vllm, 4);
+        args.aic_nextn = nextn;
+        args.aic_nextn_accept_rates = nextn.map(|nextn| vec!["1"; nextn].join(","));
+        VllmCore::new(args)
+    }
+
+    /// Reserve G1 for the handoff of request `id` and name it by that id.
+    fn reserve(core: &mut VllmCore, id: u128, prompt: usize, outputs: usize) -> HandoffId {
+        let (uuid, tokens) = (Uuid::from_u128(id), vec![id as u32; prompt]);
+        reserve_destination(core, HandoffId::from(uuid), uuid, &tokens, outputs).unwrap();
+        HandoffId::from(uuid)
+    }
+
+    /// Complete the KV transfer of a reserved handoff.
+    fn activate(core: &mut VllmCore, handoff_id: HandoffId) {
+        core.apply_command(SchedulerCommand::ActivateDestination { handoff_id })
+            .unwrap();
+    }
+
+    /// vLLM schedules `skipped_waiting`, the requests that received remote
+    /// KV, before `waiting`, where a preempted request waits. It resumes a
+    /// request only with room for its next token, which speculative emission
+    /// takes in the pass that samples it.
+    #[rstest]
+    fn a_preempted_request_waits_behind_the_handoffs_that_hold_g1(
+        #[values(None, Some(1))] nextn: Option<usize>,
+    ) {
+        let mut core = small_decode(nextn);
+        let (holder, grows) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        // `grows` holds two blocks and a later handoff in transfer the other
+        // two, so `grows` is preempted for its third.
+        let ready = reserve(&mut core, 2, 8, 6);
+        let in_transfer = reserve(&mut core, 1, 8, 1);
+        activate(&mut core, ready);
+        for _ in 0..2 {
+            if core.state.requests[&grows].num_preemptions == 0 {
+                execute(&mut core, 0.0);
+            }
+        }
+        assert_eq!(core.state.requests[&grows].num_preemptions, 1);
+        // Two free blocks do not hold what it needs to resume.
+        let waiting = execute(&mut core, 0.0);
+        assert!(waiting.admissions.is_empty() && waiting.pressure_events.is_empty());
+        // One-block handoffs pass it and leave no entries in the queue.
+        for id in 10..42 {
+            let passing = reserve(&mut core, id, 4, 1);
+            activate(&mut core, passing);
+            execute(&mut core, 0.0);
+        }
+        assert!(core.state.waiting.len() < 16);
+        // The handoff in transfer runs first once it completes, and leaves.
+        activate(&mut core, in_transfer);
+        for expected in [holder, grows] {
+            let pass = execute(&mut core, 0.0);
+            let admitted = pass.admissions.iter().map(|a| a.uuid).collect::<Vec<_>>();
+            assert_eq!(admitted, [expected]);
+        }
+    }
 }
 
 mod core_behavior {
