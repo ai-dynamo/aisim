@@ -1282,7 +1282,8 @@ class EnginePredictionConfig(EstimatorPolicyConfig):
         _validate_worker_hardware(modes={self.mode}, workers=self.workers)
         if self.tokenization is not None and (has_afd(self.workers) or self.workers.encoder is not None):
             raise ValueError("engine.tokenization requires token replay; AFD and analytical EPD are unsupported")
-        if self.extra_cpu_overhead is not None and (has_afd(self.workers) or self.workers.encoder is not None):
+        extra_cpu_overhead_active = self.extra_cpu_overhead is not None and self.extra_cpu_overhead.active
+        if extra_cpu_overhead_active and (has_afd(self.workers) or self.workers.encoder is not None):
             raise ValueError("engine.extra_cpu_overhead requires token replay; AFD and analytical EPD are unsupported")
         if (
             self.detokenization is not None
@@ -1290,7 +1291,7 @@ class EnginePredictionConfig(EstimatorPolicyConfig):
             and (has_afd(self.workers) or self.workers.encoder is not None)
         ):
             raise ValueError("engine.detokenization requires token replay; AFD and analytical EPD are unsupported")
-        if (self.tokenization is not None or self.extra_cpu_overhead is not None) and any(
+        if (self.tokenization is not None or extra_cpu_overhead_active) and any(
             worker is not None
             and not is_afd_worker(worker)
             and (worker.frontend is not None or worker.host_profile is not None)

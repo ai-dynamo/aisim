@@ -3888,6 +3888,54 @@ def test_prediction_compiler_carries_extra_cpu_overhead(extra, expected) -> None
     assert deployment.tokenization is None
 
 
+@pytest.mark.parametrize("mode", ["aggregated", "disaggregated"])
+@pytest.mark.parametrize("feature", ["frontend", "host_profile", "afd", "encoder"])
+@pytest.mark.parametrize(
+    ("extra", "rejected"),
+    [
+        (None, False),
+        ({}, False),
+        ({"base_ms": 0, "per_input_token_us": 0}, False),
+        ({"base_ms": 1}, True),
+        ({"per_input_token_us": 1}, True),
+    ],
+)
+def test_prediction_extra_cpu_overhead_exclusions_require_active_cost(mode, feature, extra, rejected) -> None:
+    host_role = "aggregated" if mode == "aggregated" else "prefill"
+    roles = ("aggregated",) if mode == "aggregated" else ("prefill", "decode")
+    workers = {role: {} for role in roles}
+    engine = {"model": "example/model", "hardware": "h200_sxm", "backend": "sglang", "mode": mode, "workers": workers}
+    raw = {"engine": engine}
+    if feature == "frontend":
+        workers[host_role]["frontend"] = {"stages": [{"service_ms": 3.0}]}
+    elif feature == "host_profile":
+        workers[host_role]["host_profile"] = {"path": "unused.json", "frontend": "python"}
+    elif feature == "afd":
+        engine["model"] = "Qwen/Qwen3-30B-A3B"
+        workers[host_role] = {"type": "afd", "afd": {"n_a_nodes": 1, "n_f_nodes": 1, "tp_a": 1, "a_batch_size": 8}}
+    else:
+        engine["model"] = "Qwen/Qwen3-VL-8B-Instruct"
+        workers["encoder"] = {}
+        raw["traffic"] = {
+            "source": {"type": "synthetic", "images": {"height": 448, "width": 448, "count": 1}},
+            "load": {"type": "concurrency", "concurrency": 1},
+            "stop": {"requests": 1},
+        }
+
+    baseline = CorePredictionConfig.model_validate(raw)
+    if extra is not None:
+        engine["extra_cpu_overhead"] = extra
+    if rejected:
+        with pytest.raises(ValidationError, match="engine.extra_cpu_overhead"):
+            CorePredictionConfig.model_validate(raw)
+    else:
+        prediction = CorePredictionConfig.model_validate(raw)
+        assert prediction.model_dump(exclude={"engine": {"extra_cpu_overhead"}}) == baseline.model_dump(
+            exclude={"engine": {"extra_cpu_overhead"}}
+        )
+        assert CorePredictionConfig.model_validate_json(prediction.model_dump_json()) == prediction
+
+
 @pytest.mark.parametrize(
     "tokenization",
     [
