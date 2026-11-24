@@ -357,20 +357,16 @@ def _resolve_local_model_path(model_id: str) -> str:
 
     Uses AIC's cached model configs from src/aisim_core/model_configs/
     so that the collection pipeline never needs HuggingFace network access.
-    The function patches model_type and architectures for sglang AutoConfig
-    compatibility and strips auto_map to prevent any remote code download.
+    The function normalizes legacy layer_types for sglang AutoConfig
+    compatibility and strips auto_map to prevent remote code downloads.
+    Model types, architectures and DSA-specific fields are preserved.
 
-    SGLang's AutoConfig.from_pretrained() doesn't recognize "deepseek_v32" or
-    "glm_moe_dsa" model types.  The workaround (matching sglang's own
-    _load_deepseek_v32_model approach) is to present these as "deepseek_v3".
-    DSA-specific fields (index_topk, index_head_dim, etc.) are preserved in
-    the config and sglang uses those for DSA detection via is_deepseek_nsa().
-
-    Falls back to the original HF model ID if local config is not found.
+    A missing local config raises before ServerArgs construction. Release
+    0.14.0 omits GLM-5.3 declarations whose configs are excluded from the bundle.
     """
     config_file = os.path.join(_MODEL_CONFIG_DIR, f"{model_id.replace('/', '--')}_config.json")
     if not os.path.exists(config_file):
-        return model_id
+        raise FileNotFoundError(f"Local model config required for {model_id}: {config_file}; no HuggingFace fallback")
 
     with open(config_file) as f:
         config = json.load(f)
@@ -545,18 +541,13 @@ def _model_max_position_embeddings(model_id: str) -> int | None:
     ``max_position=max_position_embeddings``) and to admit requests
     (``ServerArgs.context_length`` defaults to it).  Read from AIC's cached
     model config — the same file :func:`_resolve_local_model_path` loads — so
-    no HuggingFace network access is needed.  Returns ``None`` if unavailable
-    (caller then applies no context cap).
+    no HuggingFace network access is needed. A missing or corrupt config raises;
+    ``None`` means a readable config does not declare a context cap.
     """
     config_file = os.path.join(_MODEL_CONFIG_DIR, f"{model_id.replace('/', '--')}_config.json")
-    if not os.path.exists(config_file):
-        return None
-    try:
-        with open(config_file) as f:
-            value = json.load(f).get("max_position_embeddings")
-        return int(value) if value else None
-    except Exception:
-        return None
+    with open(config_file) as f:
+        value = json.load(f).get("max_position_embeddings")
+    return int(value) if value else None
 
 
 def _model_dsa_index_topk_freq(model_id: str) -> int:

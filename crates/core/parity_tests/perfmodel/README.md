@@ -87,8 +87,14 @@ golden diff carry the review).
 
 ### Post-freeze golden maintenance: `pin_goldens.py`
 
+From a clean checkout with a matching native build, the retained release
+0.14.0 cases below are valid refresh keys. Refresh only for an explained,
+reviewed modeling change:
+
 ```bash
-.venv/bin/python aic-core/rust/aiconfigurator-core/parity_tests/pin_goldens.py
+python crates/core/parity_tests/perfmodel/pin_goldens.py \
+  --refresh gpt-oss-20b-b200-trtllm-isl1024-osl2 \
+  qwen3-30b-a3b-b200-vllm-isl1024-osl2
 ```
 
 - **Default (append-only)**: pins records for matrix entries the fixtures
@@ -325,16 +331,15 @@ not independent silicon-accuracy qualification.
 
 #### Recorded refresh commands
 
-The following commands ran from the repository root at
+The historical refresh ran from the repository root at
 `36dcc8f3afe9e6e2e9de976737b6337fad8c4d74`, after rebuilding the native extension
 for that checkout. The pin script requires a clean input tree; reproduce a
-historical refresh in an isolated checkout of that revision.
+historical refresh in an isolated checkout of that revision. It passed
+`--refresh gpt-oss-20b-b200-trtllm-isl1024-osl2 nemotron-nas-b200-trtllm-isl1024-osl2`
+to `pin_goldens.py`. The Nemotron key is excluded from release 0.14.0; use the
+retained-key example above for the current matrices. The subsequent test was:
 
 ```bash
-python/aisim/.venv/bin/python crates/core/parity_tests/perfmodel/pin_goldens.py \
-  --refresh gpt-oss-20b-b200-trtllm-isl1024-osl2 \
-  nemotron-nas-b200-trtllm-isl1024-osl2
-
 python/aisim/.venv/bin/python -m pytest -q -p no:timeout \
   crates/core/parity_tests/perfmodel/test_compile_engine_parity.py
 ```

@@ -1780,8 +1780,8 @@ class TestParseCompressedTensorsQuant:
         "targets,weights,extra_group,message",
         [
             (None, {"num_bits": 8, "type": "float"}, None, "require non-empty targets"),
-            (["mlp.experts"], {"num_bits": 8, "type": "float"}, None, "Missing.*attention"),
-            (["self_attn"], {"num_bits": 8, "type": "float"}, None, "Missing.*routing_experts"),
+            ([r"re:.*mlp\.experts\..*"], {"num_bits": 8, "type": "float"}, None, "Missing.*attention"),
+            (["re:.*self_attn.*"], {"num_bits": 8, "type": "float"}, None, "Missing.*routing_experts"),
             (["Linear"], {"num_bits": 3, "type": "int"}, None, "Unsupported.*weights.*attention"),
             (["Linear"], {"num_bits": 4, "type": "float"}, None, "Unsupported.*w4a16_mxfp4.*attention"),
             (["Linear"], {"num_bits": 8, "type": "int"}, None, "Unsupported.*int8_wo.*routing_experts"),
@@ -1809,6 +1809,87 @@ class TestParseCompressedTensorsQuant:
             quant["config_groups"]["experts"] = extra_group
         with pytest.raises(ValueError, match=message):
             _infer_quant_modes_from_raw_config({"quant_algo": "compressed-tensors", "quantization_config": quant})
+
+    @pytest.mark.parametrize("target", ["self_attn", "mlp.experts", "mlp.shared_experts", "mlp.shared_expert"])
+    def test_bare_parent_targets_do_not_quantize_descendants(self, target):
+        from aisim.sdk.utils import parse_compressed_tensors_quant
+
+        quant = self._make_quant_config(8, "float")
+        quant["config_groups"]["group_0"]["targets"] = [target]
+        with pytest.raises(ValueError, match="Unsupported compressed-tensors target"):
+            parse_compressed_tensors_quant(quant, category="attention")
+
+    @pytest.mark.parametrize(
+        "target,category",
+        [
+            ("lm_head", "lm_head"),
+            ("re:.*self_attn.*", "attention"),
+            (r"re:.*mlp\.experts\..*", "routing_experts"),
+            (r"re:.*mlp\.shared_experts\..*", "shared_experts"),
+            (r"re:.*mlp\.shared_expert\..*", "shared_experts"),
+        ],
+    )
+    def test_complete_projection_targets_remain_supported(self, target, category):
+        from aisim.sdk.utils import parse_compressed_tensors_quant
+
+        quant = self._make_quant_config(8, "float")
+        quant["config_groups"]["group_0"]["targets"] = [target]
+        assert parse_compressed_tensors_quant(quant, category=category) == ("fp8", frozenset())
+
+    @pytest.mark.parametrize("unsupported", ["format", "target"])
+    def test_explicit_weight_modes_do_not_require_compressed_tensors_inference(self, unsupported):
+        from aisim.sdk.models import _apply_model_quant_defaults
+
+        quant = self._make_quant_config(4, "float")
+        quant["format"] = "nvfp4-pack-quantized" if unsupported == "format" else "mxfp4-pack-quantized"
+        if unsupported == "target":
+            quant["config_groups"]["group_0"]["targets"] = ["arbitrary.module"]
+        raw = {"quant_algo": "compressed-tensors", "quantization_config": quant, "kv_cache_quant_algo": "fp8"}
+        model_config = config.ModelConfig(
+            gemm_quant_mode=common.GEMMQuantMode.bfloat16,
+            moe_quant_mode=common.MoEQuantMode.nvfp4,
+        )
+
+        _apply_model_quant_defaults(model_config, raw, "Qwen3MoeForCausalLM", "trtllm")
+
+        assert model_config.gemm_quant_mode == common.GEMMQuantMode.bfloat16
+        assert model_config.moe_quant_mode == common.MoEQuantMode.nvfp4
+        assert model_config.kvcache_quant_mode == common.KVCacheQuantMode.fp8
+        assert model_config.fmha_quant_mode == common.FMHAQuantMode.fp8
+
+        for unset_field in ("gemm_quant_mode", "moe_quant_mode"):
+            setattr(model_config, unset_field, None)
+            with pytest.raises(ValueError, match="require format|Unsupported compressed-tensors target"):
+                _apply_model_quant_defaults(model_config, raw, "Qwen3MoeForCausalLM", "trtllm")
+            setattr(
+                model_config,
+                unset_field,
+                common.GEMMQuantMode.bfloat16 if unset_field == "gemm_quant_mode" else common.MoEQuantMode.nvfp4,
+            )
+
+    @pytest.mark.parametrize(
+        "bits,w_type,gemm,moe,expected_gemm,expected_moe",
+        [
+            (4, "float", common.GEMMQuantMode.bfloat16, None, "bfloat16", "w4a16_mxfp4"),
+            (8, "int", None, common.MoEQuantMode.bfloat16, "int8_wo", "bfloat16"),
+        ],
+    )
+    def test_only_unset_weight_category_needs_a_supported_sdk_mode(
+        self, bits, w_type, gemm, moe, expected_gemm, expected_moe
+    ):
+        from aisim.sdk.models import _apply_model_quant_defaults
+
+        quant = self._make_quant_config(bits, w_type)
+        quant["format"] = "mxfp4-pack-quantized"
+        model_config = config.ModelConfig(gemm_quant_mode=gemm, moe_quant_mode=moe)
+        _apply_model_quant_defaults(
+            model_config,
+            {"quant_algo": "compressed-tensors", "quantization_config": quant},
+            "Qwen3MoeForCausalLM",
+            "trtllm",
+        )
+        assert model_config.gemm_quant_mode == common.GEMMQuantMode[expected_gemm]
+        assert model_config.moe_quant_mode == common.MoEQuantMode[expected_moe]
 
     def test_redhat_dsv4_maps_block_fp8_attention_and_fp4_experts(self):
         """A declared packed DSV4 layout maps attention and experts independently."""

@@ -152,6 +152,54 @@ def test_agg_explicit_quant_overrides_hf():
     assert t.kvcache_quant_mode == common.KVCacheQuantMode.fp8
 
 
+@pytest.mark.parametrize("mode", ["agg", "disagg"])
+def test_explicit_compressed_tensors_modes_survive_task_resolution_and_yaml(tmp_path, mode):
+    # Independent, tiny checkpoint geometry; only the metadata-inference path
+    # is unsupported. Explicit SDK modes remain valid user choices.
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3ForCausalLM"],
+                "hidden_size": 128,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 32,
+                "intermediate_size": 256,
+                "vocab_size": 512,
+                "max_position_embeddings": 2048,
+                "quantization_config": {
+                    "quant_method": "compressed-tensors",
+                    "format": "nvfp4-pack-quantized",
+                    "config_groups": {"base": {"targets": ["Linear"], "weights": {"num_bits": 4, "type": "float"}}},
+                },
+            }
+        )
+    )
+    fields = {
+        "model_path": str(tmp_path),
+        "system_name": "h200_sxm",
+        "backend_name": "trtllm",
+        "backend_version": "1.3.0rc29",
+        "gemm_quant_mode": common.GEMMQuantMode.bfloat16,
+        "moe_quant_mode": common.MoEQuantMode.bfloat16,
+    }
+    prefixes = [""] if mode == "agg" else ["prefill_", "decode_"]
+    kwargs = {f"{prefix}{key}": value for prefix in prefixes for key, value in fields.items()}
+    task = Task(serving_mode=mode, **kwargs)
+    restored = Task.from_yaml(yaml.safe_load(task.to_yaml()))
+    for current in (task, restored):
+        for role in ["agg"] if mode == "agg" else ["prefill", "decode"]:
+            model_config = current.build_model_config(role=role)
+            assert model_config.gemm_quant_mode == common.GEMMQuantMode.bfloat16
+            assert model_config.moe_quant_mode == common.MoEQuantMode.bfloat16
+
+    # A disaggregated role that still needs a default must keep failing loudly.
+    del kwargs[f"{prefixes[-1]}gemm_quant_mode"]
+    with pytest.raises(ValueError, match="require format 'mxfp4-pack-quantized'"):
+        Task(serving_mode=mode, **kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Disagg construction
 # ---------------------------------------------------------------------------
@@ -1018,20 +1066,27 @@ def test_dsv4_nvfp4_exports_get_the_curated_hopper_rejection(model_path, replace
     assert replacement in str(exc.value)
 
 
-def test_dsv4_third_party_fp4_sglang_moe_remap_on_hopper():
-    """Third-party FP4-expert DSV4 checkpoints (e.g. RedHatAI) get the sglang
+def test_dsv4_third_party_fp4_sglang_moe_remap_on_hopper(tmp_path):
+    """Local native FP4-expert DSV4 checkpoints get the sglang
     MoE remap based on expert_dtype rather than hardcoded model paths.
     Hopper -> w4a16_mxfp4_cutlass; Blackwell -> w4a8_mxfp4_mxfp8_trtllm."""
+    from aisim.sdk.utils import _load_model_config_from_model_path
+
+    # Use a valid native-FP4 config under an unrelated local path. A live
+    # third-party NVFP4 export does not establish native MXFP4 execution.
+    raw = dict(_load_model_config_from_model_path("deepseek-ai/DeepSeek-V4-Flash"))
+    raw.pop("_name_or_path", None)
+    (tmp_path / "config.json").write_text(json.dumps(raw))
     hopper = Task(
         serving_mode="agg",
-        model_path="RedHatAI/DeepSeek-V4-Flash-NVFP4-FP8",
+        model_path=str(tmp_path),
         system_name="h200_sxm",
         backend_name="sglang",
     )
     assert hopper.moe_quant_mode == common.MoEQuantMode.w4a16_mxfp4_cutlass
     blackwell = Task(
         serving_mode="agg",
-        model_path="RedHatAI/DeepSeek-V4-Flash-NVFP4-FP8",
+        model_path=str(tmp_path),
         system_name="b200_sxm",
         backend_name="sglang",
     )
@@ -1064,6 +1119,10 @@ def test_dsv4_fp8_kvcache_enforced(model_path):
         model_path=model_path,
         system_name="b200_sxm",
         backend_name="trtllm",
+        # Isolate the native KV requirement from weight-format inference.
+        # The external NVFP4 compressed-tensors export needs explicit modes.
+        gemm_quant_mode=common.GEMMQuantMode.fp8_block,
+        moe_quant_mode=common.MoEQuantMode.nvfp4,
     )
     assert t.kvcache_quant_mode == common.KVCacheQuantMode.fp8
 

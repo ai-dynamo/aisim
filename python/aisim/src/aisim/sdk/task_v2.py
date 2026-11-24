@@ -1126,7 +1126,11 @@ class Task:
         self._gemm_quant_mode_explicit_by_role = {
             role: self._role_attr(role, "gemm_quant_mode") is not None for role in roles
         }
-        base = _infer_quant_modes_from_raw_config(self._raw_config)
+        base = _infer_quant_modes_from_raw_config(
+            self._raw_config,
+            infer_gemm=any(self._role_attr(role, "gemm_quant_mode") is None for role in roles),
+            infer_moe=any(self._role_attr(role, "moe_quant_mode") is None for role in roles),
+        )
 
         # GPT-OSS on Blackwell (trtllm): default MoE to w4a8_mxfp4_mxfp8 for higher
         # tensor-core throughput, unless moe_quant_mode was set explicitly.  Applied

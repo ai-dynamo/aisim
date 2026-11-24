@@ -151,7 +151,12 @@ def test_kimi_k3_moe_remaps_to_w4a8_on_blackwell_only(monkeypatch):
             "quantization_config": {
                 "quant_method": "compressed-tensors",
                 "format": "mxfp4-pack-quantized",
-                "config_groups": {"experts": {"weights": {"num_bits": 4, "type": "float"}}},
+                "config_groups": {
+                    "experts": {
+                        "targets": [r"re:.*mlp\.experts\..*"],
+                        "weights": {"num_bits": 4, "type": "float"},
+                    }
+                },
                 "ignore": ["self_attn", "mlp.shared_experts", "lm_head"],
             },
         },

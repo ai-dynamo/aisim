@@ -99,11 +99,9 @@ def test_bridge_prescribes_msa_only_for_m3_on_the_sm100_family(backend, model, s
     assert _msa_sparse_implementation(_FakeTask(backend, model, system)) == expected
 
 
-@pytest.mark.parametrize("architecture", ["MiniMaxM3ForCausalLM", "MiniMaxM3SparseForConditionalGeneration"])
-@pytest.mark.parametrize("system,expected", [("b200_sxm", "msa"), ("b300_sxm", "msa"), ("h200_sxm", None)])
-def test_local_msa_architectures_prescribe_and_render_implementation(tmp_path, architecture, system, expected):
-    from aisim.generator.module_bridge import _msa_sparse_implementation
-
+@pytest.fixture(params=["MiniMaxM3ForCausalLM", "MiniMaxM3SparseForConditionalGeneration"])
+def local_msa_model(tmp_path, request):
+    architecture = request.param
     # Independently authored geometry; no excluded checkpoint content is needed.
     (tmp_path / "config.json").write_text(
         json.dumps(
@@ -119,11 +117,18 @@ def test_local_msa_architectures_prescribe_and_render_implementation(tmp_path, a
             }
         )
     )
-    implementation = _msa_sparse_implementation(_FakeTask(model=str(tmp_path), system=system))
+    return str(tmp_path)
+
+
+@pytest.mark.parametrize("system,expected", [("b200_sxm", "msa"), ("b300_sxm", "msa"), ("h200_sxm", None)])
+def test_local_msa_architectures_prescribe_and_render_implementation(local_msa_model, system, expected):
+    from aisim.generator.module_bridge import _msa_sparse_implementation
+
+    implementation = _msa_sparse_implementation(_FakeTask(model=local_msa_model, system=system))
     assert implementation == expected
     model_params = {} if implementation is None else {"msa_sparse_implementation": implementation}
     params = _params(model_params)
-    params["ServiceConfig"]["model_path"] = str(tmp_path)
+    params["ServiceConfig"]["model_path"] = local_msa_model
     artifacts = generate_backend_artifacts(backend="trtllm", backend_version=_BACKEND_VERSION, params=params)
     engine = _engine_yaml(artifacts)
     if expected is None:
@@ -175,3 +180,15 @@ def test_algorithm_prescription_is_architecture_keyed_and_trtllm_only(backend, m
     from aisim.generator.module_bridge import _msa_sparse_algorithm
 
     assert _msa_sparse_algorithm(_FakeTask(backend, model, "h200_sxm")) == expected
+
+
+@pytest.mark.parametrize("system", ["b200_sxm", "h200_sxm"])
+def test_local_msa_architecture_prescribes_and_renders_algorithm(local_msa_model, system):
+    from aisim.generator.module_bridge import _msa_sparse_algorithm
+
+    algorithm = _msa_sparse_algorithm(_FakeTask(model=local_msa_model, system=system))
+    assert algorithm == "minimax_m3"
+    artifacts = generate_backend_artifacts(
+        backend="trtllm", backend_version=_RC29, params=_params({"msa_sparse_algorithm": algorithm})
+    )
+    assert _engine_yaml(artifacts)["sparse_attention_config"] == {"algorithm": "minimax_m3"}

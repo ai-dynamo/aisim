@@ -895,7 +895,13 @@ def _infer_mixed_precision_quant_modes(raw_config: dict, quant_dynamic: bool | N
     return overrides
 
 
-def _infer_quant_modes_from_raw_config(raw_config: dict, architecture: str | None = None) -> dict[str, object]:
+def _infer_quant_modes_from_raw_config(
+    raw_config: dict,
+    architecture: str | None = None,
+    *,
+    infer_gemm: bool = True,
+    infer_moe: bool = True,
+) -> dict[str, object]:
     quant_algo = raw_config.get("quant_algo")
     quant_dynamic = raw_config.get("quant_dynamic")
     kv_cache_algo = raw_config.get("kv_cache_quant_algo")
@@ -934,10 +940,14 @@ def _infer_quant_modes_from_raw_config(raw_config: dict, architecture: str | Non
         # Only set overrides for quantized categories; unset modes fall through to the
         # global bfloat16 default in _apply_model_quant_defaults.
         quant_cfg = _get_language_quantization_config(raw_config) or {}
-        for category, field, modes in (
-            ("attention", "gemm_quant_mode", common.GEMMQuantMode),
-            ("routing_experts", "moe_quant_mode", common.MoEQuantMode),
+        for category, field, modes, needed in (
+            ("attention", "gemm_quant_mode", common.GEMMQuantMode, infer_gemm),
+            ("routing_experts", "moe_quant_mode", common.MoEQuantMode, infer_moe),
         ):
+            # Explicit modes do not require a representable checkpoint default.
+            # Keep strict category validation whenever inference is needed.
+            if not needed:
+                continue
             algo, _ = parse_compressed_tensors_quant(quant_cfg, category=category)
             if algo is not None:
                 if algo not in modes.__members__:
@@ -1039,7 +1049,12 @@ def _apply_model_quant_defaults(
     fmha_was_unset = model_config.fmha_quant_mode is None
     moe_was_unset = model_config.moe_quant_mode is None
 
-    inferred = _infer_quant_modes_from_raw_config(raw_config, architecture)
+    inferred = _infer_quant_modes_from_raw_config(
+        raw_config,
+        architecture,
+        infer_gemm=model_config.gemm_quant_mode is None,
+        infer_moe=moe_was_unset,
+    )
     applied: list[str] = []
     for key, value in inferred.items():
         if getattr(model_config, key, None) is None:

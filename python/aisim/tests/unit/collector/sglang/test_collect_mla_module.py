@@ -270,6 +270,32 @@ class TestDsaSkipIndexer:
 
 @pytest.mark.unit
 class TestBuildModuleTestCases:
+    @pytest.mark.parametrize("model_path", ["zai-org/GLM-5.3", "zai-org/GLM-5.3-BF16", "nvidia/GLM-5.3-NVFP4"])
+    def test_excluded_configs_are_not_declared_or_forwarded_to_huggingface(self, model_path):
+        mod = _import_module()
+        specs = mod.get_mla_module_model_specs(attention_type="dsa", apply_model_filter=False)
+        assert model_path not in {spec.model_path for spec in specs}
+        with pytest.raises(FileNotFoundError, match="Local model config required"):
+            mod._resolve_local_model_path(model_path)
+        with pytest.raises(FileNotFoundError):
+            mod._model_max_position_embeddings(model_path)
+
+    def test_declared_dsa_configs_resolve_locally_with_context_caps(self):
+        mod = _import_module()
+        for spec in mod.get_mla_module_model_specs(attention_type="dsa", apply_model_filter=False):
+            local_path = Path(mod._resolve_local_model_path(spec.model_path))
+            config = json.loads((local_path / "config.json").read_text())
+            assert "auto_map" not in config
+            assert mod._model_max_position_embeddings(spec.model_path) == config["max_position_embeddings"]
+            assert config["max_position_embeddings"] > 0
+
+    def test_corrupt_context_config_does_not_remove_the_context_cap(self, tmp_path, monkeypatch):
+        mod = _import_module()
+        monkeypatch.setattr(mod, "_MODEL_CONFIG_DIR", str(tmp_path))
+        (tmp_path / "org--model_config.json").write_text("{invalid")
+        with pytest.raises(json.JSONDecodeError):
+            mod._model_max_position_embeddings("org/model")
+
     def test_glm52_local_config_uses_transformers_v5_layer_type(self):
         mod = _import_module()
 
@@ -318,9 +344,9 @@ class TestBuildModuleTestCases:
         model_paths = {case[6] for case in cases}
         # #1378 canonicalization: one DSA collection per (architecture,
         # DSA-gemm-type) group on the longest-context checkpoint, reused for the
-        # consumer-equivalent rest. GLM-5/5.1/5.2/5.3 share identical DSA geometry
+        # consumer-equivalent rest. GLM-5/5.1/5.2 share identical DSA geometry
         # (index_n_heads=32, index_head_dim=128, index_topk=2048, heads/dims/lora,
-        # max_position_embeddings all equal for 5.2/5.3) so GLM-5.2 (bf16) and
+        # with the longest max_position_embeddings on 5.2), so GLM-5.2 (bf16) and
         # GLM-5.2-FP8 (fp8_block) are canonical by YAML iteration order; GLM-5/5.1
         # and every NVFP4 checkpoint (which shares the bf16 DSA key) are reused.
         assert model_paths == {

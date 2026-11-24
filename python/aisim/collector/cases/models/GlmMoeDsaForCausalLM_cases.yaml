@@ -14,13 +14,8 @@ model_paths:
   - zai-org/GLM-5.2
   - zai-org/GLM-5.2-FP8
   - nvidia/GLM-5.2-NVFP4
-  # GLM-5.3: the plain zai-org repository is the FP8-block release and the
-  # BF16 weights carry the -BF16 suffix (no zai-org/GLM-5.3-FP8 exists).
-  # Do not spell the non-existent name here: the roster derives the coverage
-  # floor from repo mentions in these files.
-  - zai-org/GLM-5.3
-  - zai-org/GLM-5.3-BF16
-  - nvidia/GLM-5.3-NVFP4
+  # Release 0.14.0 omits GLM-5.3 runtime paths: their configs are not bundled.
+  # Shape-only MoE aliases below do not load checkpoint configs.
 include_base: false
 description: >
   GLM-5 DSA/MoE model-centric collection plan.
@@ -209,9 +204,6 @@ model_case_values:
         - zai-org/GLM-5.2
         - zai-org/GLM-5.2-FP8
         - nvidia/GLM-5.2-NVFP4
-        - zai-org/GLM-5.3-BF16
-        - zai-org/GLM-5.3
-        - nvidia/GLM-5.3-NVFP4
       attention_type: dsa
       native_num_heads: 64
       # Real tensor-parallel shards (model-correlated narrowing): per-rank

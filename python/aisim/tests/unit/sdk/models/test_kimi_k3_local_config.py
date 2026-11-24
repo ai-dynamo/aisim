@@ -238,7 +238,7 @@ def test_local_kimi_invalid_later_group_fails_in_either_order(local_kimi, expert
     del quant["format"]
     experts = quant["config_groups"]["experts"]
     experts["format"] = packed_format
-    attention = {"weights": {"num_bits": 8, "type": "float"}, "targets": ["self_attn"]}
+    attention = {"weights": {"num_bits": 8, "type": "float"}, "targets": ["re:.*self_attn.*"]}
     groups = [("experts", experts), ("attention", attention)]
     quant["config_groups"] = dict(groups if experts_first else reversed(groups))
     quant["ignore"] = ["mlp.shared_experts", "lm_head"]

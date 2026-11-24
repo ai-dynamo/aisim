@@ -1743,7 +1743,9 @@ def _compressed_tensors_target_categories(target: str) -> set[str]:
         "mlp.shared_expert": {"shared_experts"},
         "lm_head": {"lm_head"},
     }
-    if target in named:
+    # Bare names match an exact module/class, not all of its descendants.
+    # Only lm_head names a complete projection category on its own.
+    if target == "lm_head":
         return named[target]
     if target.startswith("re:"):
         try:
