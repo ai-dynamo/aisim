@@ -343,10 +343,15 @@ class KVCacheEstimator:
         the signal for the caller to fall back to the naive estimator.
         """
         if moe_tp_size is None and moe_ep_size is None:
-            # Preserve the historical TP-only default: an omitted pair carries
-            # no MoE layout to infer, and callers relied on this entry point
-            # selecting pure tensor parallelism.
-            resolved_moe_tp = resolved_moe_ep = 1
+            # No MoE layout was requested: use pure tensor parallelism at the
+            # attention width, which is what an omitted pair means for the
+            # engine's other entry points. Filling the pair with 1 is not a
+            # layout a MoE model can serve -- the width invariant is
+            # tp*dp*cp == moe_tp*moe_ep -- and the re-raise above makes that
+            # mismatch terminal instead of fallback-eligible. A dense model
+            # never reads these dims.
+            resolved_moe_tp = tp_size * attention_dp_size * cp_size
+            resolved_moe_ep = 1
         else:
             # Leave a single omitted dimension unset so ModelConfig infers it
             # from the attention width, as every other SDK path does. Filling

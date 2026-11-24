@@ -1237,20 +1237,47 @@ def test_estimate_kv_cache_infers_an_omitted_moe_dimension():
     assert out["source"] == "native"
 
 
-def test_estimate_kv_cache_keeps_the_tp_only_default_for_an_omitted_moe_pair():
-    # An omitted pair carries no layout to infer, so the historical pure-TP
-    # default (moe_tp_size=moe_ep_size=1) still applies. Pinned so the inference
-    # change above does not turn existing TP-only callers into errors.
-    out = memory.estimate_kv_cache(
+def test_estimate_kv_cache_defaults_an_omitted_moe_pair_to_pure_tensor_parallelism():
+    # An omitted pair means pure tensor parallelism at the attention width. It
+    # cannot mean moe_tp_size=moe_ep_size=1: at tp_size=4 that breaks the
+    # engine's tp*dp*cp == moe_tp*moe_ep invariant, and the request-wide
+    # re-raise makes the mismatch terminal where it used to reach the naive
+    # fallback.
+    kwargs = dict(
+        max_num_tokens=8192,
+        max_batch_size=256,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        tp_size=4,
+        gpu_memory_capacity_bytes_override=800 * _GIB,
+        allow_naive_fallback=True,
+    )
+    omitted = memory.estimate_kv_cache("deepseek-ai/DeepSeek-V3", "h200_sxm", "vllm", **kwargs)
+    explicit = memory.estimate_kv_cache(
         "deepseek-ai/DeepSeek-V3",
+        "h200_sxm",
+        "vllm",
+        moe_tp_size=4,
+        moe_ep_size=1,
+        **kwargs,
+    )
+    assert omitted["source"] == explicit["source"] == "native"
+    assert omitted["total_kv_size_tokens"] == explicit["total_kv_size_tokens"]
+
+
+def test_estimate_kv_cache_accepts_an_omitted_moe_pair_for_a_dense_checkpoint():
+    # Dense models never read the MoE dims, so resolving the pair must not turn
+    # an ordinary multi-GPU dense request into a MoE validation error.
+    out = memory.estimate_kv_cache(
+        "nvidia/Gemma-4-31B-IT-NVFP4",
         "h200_sxm",
         "vllm",
         max_num_tokens=8192,
         max_batch_size=256,
         memory_fraction_kind="of_total",
         memory_fraction_value=0.9,
-        tp_size=1,
-        gpu_memory_capacity_bytes_override=800 * _GIB,
+        tp_size=4,
+        gpu_memory_capacity_bytes_override=200 * _GIB,
         allow_naive_fallback=False,
     )
     assert out["source"] == "native"
