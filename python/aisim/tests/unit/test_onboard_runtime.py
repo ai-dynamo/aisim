@@ -2759,9 +2759,11 @@ def test_pending_probe_preview_then_execute_reuses_output_directory(tmp_path, mo
     assert preview["result"]["status"] == "pending_runtime_version"
     assert "report" not in preview
     monkeypatch.delenv("HF_TOKEN")
-    assert cli.main(command) == 1
+    assert cli.main([*command, "--execute"]) == 1
     assert not output.exists()
-    assert _load(checkpoint).configurations["tp2"].history[-1]["result"]["status"] == "pending_runtime_version"
+    failed = _load(checkpoint).configurations["tp2"].history[-1]["result"]
+    assert failed["status"] == "incomplete"
+    assert "HF_TOKEN requires the original value" in str(failed["diagnostics"])
     monkeypatch.setenv("HF_TOKEN", token)
 
     def detect(deployment):

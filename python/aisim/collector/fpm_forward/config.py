@@ -102,7 +102,7 @@ COLLECTION_CONTROL_NAMES = {
     "FPM_RESULT_WAIT_TIMEOUT_SECONDS",
     "FPM_FINALIZATION_TIMEOUT_SECONDS",
 }
-CONTENT_MODES = ("random", "sharegpt", "sharegpt_chain", "zeros")
+CONTENT_MODES = ("random", "sharegpt", "sharegpt_chain")
 
 
 def validate_collection_control(name, value):
@@ -189,6 +189,8 @@ def resolve_archived_generator_overrides(
         value = literals.get(name, (environment or {}).get(name, os.environ.get(name)))
         if value is None or hashlib.sha256(value.encode()).hexdigest() != item["value_sha256"]:
             raise ValueError(f"archived environment {name} requires the original value in the caller's environment")
+        if name in COLLECTION_CONTROL_NAMES:
+            validate_collection_control(name, value)
         item.clear()
         item.update(name=name, value=value)
     return resolved

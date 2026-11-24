@@ -1138,12 +1138,12 @@ def run_runtime_command(args: argparse.Namespace) -> int:
     if failed:
         result["status"] = "partial" if launches else "failed"
     report_reference = {"output_dir": str(output)}
-    if not pending_preview:
+    if not pending_preview and (launches or (output / "probe-plan.json").is_file()):
         output.mkdir(parents=True, exist_ok=True)
         path = output / f"onboarding-probe-{uuid.uuid4().hex}.json"
         path.write_text(_json(result))
         report_reference.update(report=str(path), sha256=_hash(path))
-    # Pending previews have no executable probe plan yet. Record their result
+    # Preflight failures and pending previews may precede any executable plan. Record their result
     # directly in the checkpoint without occupying the future probe directory.
     patches = {}
     for name in names:

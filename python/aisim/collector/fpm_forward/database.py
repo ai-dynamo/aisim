@@ -262,6 +262,15 @@ def require_k31_worker_evidence(plan, cell, raw_root, collection, *, allow_stage
         raise ValueError("K3.1 publication MoE precision differs from initialized workers")
 
 
+def is_kda_decode(plan, cell):
+    config = getattr(getattr(plan, "capability", None), "model_config", None)
+    return (
+        cell.workload_kind == "decode"
+        and config is not None
+        and config.effective_payload.get("linear_attn_config") is not None
+    )
+
+
 def require_kda_real_kv(plan, cell, collection):
     """All recurrent decode requires real history, including balanced-MoE TP.
 
@@ -274,8 +283,7 @@ def require_kda_real_kv(plan, cell, collection):
         for item in collection.points
     ):
         raise KdaSeedError("K3.1 prefill publication requires zero historical KV tokens")
-    config = getattr(getattr(plan, "capability", None), "model_config", None)
-    if cell.workload_kind != "decode" or config is None or config.effective_payload.get("linear_attn_config") is None:
+    if not is_kda_decode(plan, cell):
         return
     warmup = collection.kvwarm_meta
     if (

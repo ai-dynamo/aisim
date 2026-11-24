@@ -136,7 +136,7 @@ def _collection_controls(cells, deployment, probe_environment=()):
         if set(item) == {"name", "value_from_env", "value_sha256"} and item["value_from_env"] == name:
             # Older archives stored a digest even for public controls. Recover
             # recognized enum/default values or verify the original public input.
-            candidates = [os.environ.get(name), *CONTENT_MODES, "", "0", "1"]
+            candidates = [os.environ.get(name), *CONTENT_MODES, "zeros", "", "0", "1"]
             value = next(
                 (
                     v

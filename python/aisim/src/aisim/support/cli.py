@@ -58,8 +58,14 @@ from .topology import TopologySuggestions, suggest_topologies
 
 
 def _extra_env_argument(value: str):
+    def unique_fields(pairs):
+        fields = dict(pairs)
+        if len(fields) != len(pairs):
+            raise ValueError("duplicate object key in extra-env")
+        return fields
+
     try:
-        environment = json.loads(value)
+        environment = json.loads(value, object_pairs_hook=unique_fields)
         if not isinstance(environment, list):
             raise ValueError("extra-env must be a JSON list")
         return FPMDeployment(extra_env=environment).extra_env

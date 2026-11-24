@@ -425,7 +425,7 @@ def test_archived_controls_reject_malformed_deadlines_and_serving_changes(archiv
         runtime.collection_runtime_review(request, bindings[0])
 
 
-@pytest.mark.parametrize("collection_value", ["zeros", "random"])
+@pytest.mark.parametrize("collection_value", ["sharegpt", "random"])
 def test_probe_declared_content_control_must_match(split_collection, collection_value):
     from collector.fpm_forward.runtime_probe import probe_generator_overrides, validate_collection_probe_launch
 
@@ -434,7 +434,7 @@ def test_probe_declared_content_control_must_match(split_collection, collection_
     _, bindings = split_collection
     plan = load_repeatability_source(Path(bindings[0]["plan"]["path"]).parent)
     launch = plan.runtime_launch
-    declared = {"name": "DYN_BENCH_PREFILL_CONTENT", "value": "zeros"}
+    declared = {"name": "DYN_BENCH_PREFILL_CONTENT", "value": "sharegpt"}
     launch["deployment"]["extra_env"] = [declared]
     deployment = probe_generator_overrides(launch)
     deployment["K8sConfig"]["extra_env"][0]["value"] = collection_value
@@ -451,7 +451,7 @@ def test_probe_declared_content_control_must_match(split_collection, collection_
         generator_overrides=compared,
         phases=("prefill",),
     )
-    if collection_value == "zeros":
+    if collection_value == "sharegpt":
         validate_collection_probe_launch(launch, plan.runtime_instrumentation, **arguments)
     else:
         with pytest.raises(ValueError, match="deployment settings differ"):

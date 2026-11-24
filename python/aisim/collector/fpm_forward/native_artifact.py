@@ -87,6 +87,10 @@ def _validate_seed_regime(row: dict[str, Any], path: Path) -> str | None:
     return regime
 
 
+class KvWarmProtocolError(ValueError):
+    """The native decode receipt contradicts its required warm-up protocol."""
+
+
 def _validate_kvwarm_contract(cell: FPMCell, kvwarm: object, path: Path) -> dict[str, Any] | None:
     """Validate that engine protocol evidence matches the rendered strategy."""
 
@@ -97,7 +101,7 @@ def _validate_kvwarm_contract(cell: FPMCell, kvwarm: object, path: Path) -> dict
     requires_warm = cell.parallel_strategy in KVWARM_STRATEGIES
     if kvwarm is None:
         if requires_warm:
-            raise ValueError(
+            raise KvWarmProtocolError(
                 f"native decode result lacks required KV warm-up metadata for strategy "
                 f"{cell.parallel_strategy!r}: {path}"
             )
@@ -112,11 +116,11 @@ def _validate_kvwarm_contract(cell: FPMCell, kvwarm: object, path: Path) -> dict
     if not isinstance(warm_eligible, bool):
         raise TypeError(f"native kvwarm.warm_eligible must be a boolean: {path}")
     if warm_eligible and skip_reason is not None:
-        raise ValueError(f"native warm-eligible result must not declare kvwarm.skip_reason: {path}")
+        raise KvWarmProtocolError(f"native warm-eligible result must not declare kvwarm.skip_reason: {path}")
     if not warm_eligible and (not isinstance(skip_reason, str) or not skip_reason):
-        raise ValueError(f"native warm-ineligible result must declare a non-empty kvwarm.skip_reason: {path}")
+        raise KvWarmProtocolError(f"native warm-ineligible result must declare a non-empty kvwarm.skip_reason: {path}")
     if requires_warm and (not enabled or not warm_eligible):
-        raise ValueError(
+        raise KvWarmProtocolError(
             f"native KV warm-up protocol mismatch for strategy {cell.parallel_strategy!r}: "
             f"enabled={enabled!r}, skip_reason={skip_reason!r}: {path}"
         )

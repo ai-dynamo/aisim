@@ -2439,10 +2439,13 @@ def test_cleanup_failure_marks_passed_cell_retryable(monkeypatch, tmp_path, priv
     if diagnostic_failure:
         calls = 0
 
-        def sanitize(*args):
+        def sanitize(directory, *args, **kwargs):
             nonlocal calls
             calls += 1
             if calls > 1:
+                logs = directory / "logs"
+                logs.mkdir(exist_ok=True)
+                (logs / "unsafe.log").write_text("synthetic private diagnostic")
                 raise OSError("diagnostic rewrite denied")
 
         monkeypatch.setattr(fpm_runner, "redact_diagnostics", sanitize)
@@ -2468,6 +2471,7 @@ def test_cleanup_failure_marks_passed_cell_retryable(monkeypatch, tmp_path, priv
     assert record["status"] == "cleanup_failed"
     if diagnostic_failure:
         assert record["diagnostic_error"] == "diagnostic rewrite denied"
+        assert not (Path(record["artifact_dir"]) / "logs" / "unsafe.log").exists()
     if private_cleanup:
         assert record["private_cleanup_error"] == "private staging deletion denied"
         assert record["completed_at"] and "duration_seconds" in record
@@ -3564,6 +3568,34 @@ def test_user_extra_env_reaches_the_render_request_alongside_collector_identitie
     assert resolved["FPM_RUN_ID"] == cell.cell_id
 
 
+@pytest.mark.parametrize("name", ["FPM_NODE_RANK", "FPM_MASTER_ADDR", "FPM_LOCAL_GPU_COUNT"])
+def test_slurm_launcher_owned_environment_is_reserved(name):
+    cell = _cell()
+    plan = _plan(cell)
+    plan.options.executor = "slurm"
+    with pytest.raises(ValueError, match=f"{name} is owned by the Slurm launcher"):
+        _cell_generator_overrides(plan, cell, {"K8sConfig": {"extra_env": [{"name": name, "value": "1"}]}})
+
+
+@pytest.mark.parametrize(
+    ("name", "rejected"),
+    [
+        ("DYN_BENCH_PREFILL_CONTENT", "private-invalid-input"),
+        ("DYN_BENCH_PREFILL_CONTENT", "zeros"),
+        ("FPM_FINALIZATION_TIMEOUT_SECONDS", "private-invalid-input"),
+    ],
+)
+def test_direct_delivery_rejects_invalid_collection_controls(name, rejected):
+    from collector.fpm_forward.config import archive_generator_overrides, resolve_archived_generator_overrides
+
+    overrides = {"K8sConfig": {"extra_env": [{"name": name, "value": rejected}]}}
+    archived = archive_generator_overrides(overrides)
+    for inputs in (overrides, archived):
+        with pytest.raises(ValueError, match=name) as error:
+            resolve_archived_generator_overrides(inputs, environment={name: rejected})
+        assert rejected not in str(error.value)
+
+
 def test_user_extra_env_conflicting_with_collector_identity_fails_closed():
     cell = _cell()
     plan = _plan(cell)
@@ -4109,6 +4141,12 @@ def test_generated_finalization_budget_reaches_staged_collector(
     base = {"K8sConfig": {"k8s_image": "nvcr.io/nvidia/ai-dynamo/vllm-runtime:test"}}
     if budget is not None:
         base["K8sConfig"]["extra_env"] = [{"name": "FPM_FINALIZATION_TIMEOUT_SECONDS", "value": budget}]
+    invalid_budget = budget in ("", "0", "3601", "invalid")
+    if invalid_budget:
+        with pytest.raises(ValueError, match="collection control FPM_FINALIZATION_TIMEOUT_SECONDS"):
+            _render_cell(_plan(cell), cell, tmp_path, base)
+        del base["K8sConfig"]["extra_env"]
+        inherited = budget
     _render_cell(_plan(cell), cell, tmp_path, base)
     files = [tmp_path / name for name in ("fpm_env.sh", "collector-runtime-env.sh", "run.sh")]
 
@@ -4170,7 +4208,7 @@ def test_generated_finalization_budget_reaches_staged_collector(
         timeout=10,
         check=False,
     )
-    if budget in ("", "0", "3601", "invalid"):
+    if invalid_budget:
         assert completed.returncode == 2, completed.stderr
         assert "FPM_FINALIZATION_TIMEOUT_SECONDS must be an integer from 1 through 3600" in completed.stderr
         assert not completed.stdout
@@ -4325,11 +4363,16 @@ def test_k31_prefill_acceptance_and_recovery_require_zero_history(tmp_path, hist
 
 
 @pytest.mark.parametrize("status", ["passed", "failed"])
-@pytest.mark.parametrize("marker", ["kvwarm_fake_fallback", "kvwarm_real_kv"])
+@pytest.mark.parametrize("marker", ["kvwarm_fake_fallback", "kvwarm_real_kv", "disabled"])
 def test_kda_resume_retries_unpublishable_seed_and_keeps_real_state_passed(tmp_path, monkeypatch, status, marker):
     from .test_fpm_forward import _WARM_ELIGIBLE, _synthetic_decode_cell
 
-    _, cell, source = _synthetic_decode_cell(tmp_path, kvwarm=_WARM_ELIGIBLE, markers=(marker,), parallel_strategy="tp")
+    _, cell, source = _synthetic_decode_cell(
+        tmp_path,
+        kvwarm=_WARM_ELIGIBLE,
+        markers=("kvwarm_real_kv" if marker == "disabled" else marker,),
+        parallel_strategy="pure_tp" if marker == "disabled" else "tp",
+    )
     plan = _plan(cell)
     plan.capability.model_config = ResolvedModelConfig(
         {"linear_attn_config": {"num_heads": 12, "head_dim": 128}},
@@ -4340,6 +4383,10 @@ def test_kda_resume_retries_unpublishable_seed_and_keeps_real_state_passed(tmp_p
     cell_dir = artifact_root / plan.sha256[:16] / "smoke" / "cells" / cell.cell_id
     shutil.copytree(source, cell_dir)
     payload = json.loads((cell_dir / "raw/pod-0/benchmark.json").read_text())
+    if marker == "disabled":
+        (cell_dir / "raw/pod-0/benchmark.json").write_text(
+            json.dumps({**payload, "kvwarm": {**payload["kvwarm"], "enabled": False}})
+        )
     checkpoint_dir = tmp_path / "checkpoint"
     checkpoint_dir.mkdir()
     checkpoint_path = checkpoint_dir / "fpm_forward_smoke.json"
@@ -4411,7 +4458,7 @@ def test_kda_resume_retries_unpublishable_seed_and_keeps_real_state_passed(tmp_p
     )
     record = json.loads(checkpoint_path.read_text())["cells"][cell.cell_id]
     assert record["status"] == "passed"
-    assert attempts == ([True] if marker == "kvwarm_fake_fallback" else [])
+    assert attempts == ([True] if marker != "kvwarm_real_kv" else [])
     assert (record["attempt_id"] == "attempt") == (marker == "kvwarm_real_kv")
 
 
@@ -4663,17 +4710,24 @@ def test_config_redaction_keeps_numeric_measurements_and_backend_markers(tmp_pat
             {
                 "config": {
                     "engine_args": {"kernel_config": {"moe_backend": "triton"}},
-                    "environment": {"OMP_NUM_THREADS": "4"},
+                    "environment": {"OMP_NUM_THREADS": "4", "PRIVATE_INPUT": "triton"},
                     "max_model_len": 4096,
                 }
             }
         )
     )
-    redact_diagnostics(tmp_path, ("4",))
+    cell = SimpleNamespace(
+        backend_policy=SimpleNamespace(expected_markers={"config.engine_args.kernel_config.moe_backend": "triton"})
+    )
+    binary = raw / "bad-config.log"
+    binary.write_bytes(b"\xfftriton")
+    redact_diagnostics(tmp_path, ("4", "triton"), cell=cell)
+    assert not binary.exists()
     assert measured.read_bytes() == before
     saved = json.loads(config.read_text())["config"]
     assert saved["max_model_len"] == 4096
     assert saved["environment"]["OMP_NUM_THREADS"] == "<redacted>"
+    assert saved["environment"]["PRIVATE_INPUT"] == "<redacted>"
     assert saved["engine_args"]["kernel_config"]["moe_backend"] == "triton"
 
 

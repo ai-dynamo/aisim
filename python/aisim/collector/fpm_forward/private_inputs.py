@@ -13,6 +13,8 @@ import shutil
 import tempfile
 from pathlib import Path
 
+from aisim.fpm_contract import FPM_RESOLVED_CONFIG_GLOB
+
 from .config import archive_generator_overrides, resolve_archived_generator_overrides
 
 RECEIPT = ".private-delivery.json"
@@ -39,7 +41,7 @@ def redact(text, values):
     return text
 
 
-def redact_diagnostics(directory, values, *, update=None):
+def redact_diagnostics(directory, values, *, cell=None, update=None):
     """Sanitize retained text after exact transport verification, before archival."""
     if not values:
         return
@@ -57,6 +59,10 @@ def redact_diagnostics(directory, values, *, update=None):
                 try:
                     original = path.read_text()
                 except UnicodeDecodeError:
+                    if update is None:
+                        path.unlink()
+                    else:
+                        update(path, None)
                     continue
                 sanitized = redact(original, values)
                 if path.suffix == ".json":
@@ -65,14 +71,19 @@ def redact_diagnostics(directory, values, *, update=None):
                     except ValueError:
                         pass  # Preserve malformed diagnostic text, with secrets removed.
                     else:
+                        markers = {}
+                        if name == "raw" and path.match(FPM_RESOLVED_CONFIG_GLOB) and cell is not None:
+                            markers = {
+                                tuple(key.split(".")): val for key, val in cell.backend_policy.expected_markers.items()
+                            }
 
-                        def scrub(value):
+                        def scrub(value, location=()):
                             if isinstance(value, str):
-                                return redact(value, values)
+                                return value if markers.get(location) == value else redact(value, values)
                             if isinstance(value, list):
-                                return [scrub(item) for item in value]
+                                return [scrub(item, (*location, index)) for index, item in enumerate(value)]
                             if isinstance(value, dict):
-                                return {key: scrub(item) for key, item in value.items()}
+                                return {key: scrub(item, (*location, key)) for key, item in value.items()}
                             return value
 
                         redacted = scrub(payload)
@@ -86,7 +97,7 @@ def redact_diagnostics(directory, values, *, update=None):
                         update(path, sanitized.encode())
 
 
-def reclaim_delivery(cell_dir):
+def reclaim_delivery(cell_dir, *, update=None):
     """Call only after verified teardown of this cell's owned Slurm steps."""
     cell_dir = Path(cell_dir).resolve()
     receipt = cell_dir / RECEIPT
@@ -106,7 +117,10 @@ def reclaim_delivery(cell_dir):
         if path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077:
             raise ValueError("private Slurm delivery requires caller-owned mode 0700")
         shutil.rmtree(path)
-    receipt.unlink()
+    if update is None:
+        receipt.unlink()
+    else:
+        update(receipt, None)
 
 
 def discard_diagnostics(directory, *, keep=(), update=None):
@@ -146,7 +160,7 @@ def sanitize_recovered_diagnostics(directory, overrides, *, cell=None, environme
         finally:
             discard_diagnostics(directory, keep=retained, update=update)
     else:
-        redact_diagnostics(directory, private_values(resolved), update=update)
+        redact_diagnostics(directory, private_values(resolved), cell=cell, update=update)
 
 
 class SlurmDelivery:

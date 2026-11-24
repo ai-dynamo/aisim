@@ -1882,11 +1882,16 @@ def test_fpm_environment_values_remain_literal_on_both_executors(tmp_path):
     # Both the Kubernetes and Slurm collectors execute this same generated
     # run.sh. Concrete user env never goes through Kubernetes EnvVar expansion.
     assert "LITERAL" not in artifacts[FPM_MANIFEST_FILENAME]
-    exports = "\n".join(line for line in artifacts[FPM_RUN_SCRIPT_FILENAME].splitlines() if line.startswith("export "))
-    result = subprocess.run(
-        ["bash", "-c", exports + '\nprintf "%s" "$LITERAL"'],
+    report = tmp_path / "literal.txt"
+    engine = _write_fake_engine(
+        tmp_path,
+        'import os, pathlib\npathlib.Path(os.environ["FAKE_REPORT_PATH"]).write_text(os.environ["LITERAL"])',
+    )
+    subprocess.run(
+        ["bash", str(_write_runtime(tmp_path, artifacts))],
         check=True,
         capture_output=True,
-        text=True,
+        env=_clean_env(PYTHONPATH=str(engine), FAKE_REPORT_PATH=str(report)),
+        timeout=8,
     )
-    assert result.stdout == value
+    assert report.read_text() == value

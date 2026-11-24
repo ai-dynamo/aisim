@@ -3,6 +3,7 @@
 
 """Deployment startup inputs survive the public collection command."""
 
+import argparse
 import json
 import subprocess
 import traceback
@@ -172,8 +173,28 @@ def test_probe_fallback_does_not_format_exception_command(monkeypatch, failure):
         assert "CalledProcessError (returncode=1)" in str(error.value)
 
 
+@pytest.mark.parametrize("key", ["name", "value"])
+def test_duplicate_extra_env_fields_are_rejected_without_disclosing_values(key):
+    from aisimulate.support.cli import _extra_env_argument
+
+    value = '[{"name":"HF_HOME","value":"original","' + key + '":"sensitive-input"}]'
+    with pytest.raises(argparse.ArgumentTypeError, match="duplicate object key") as error:
+        _extra_env_argument(value)
+    assert "sensitive-input" not in str(error.value)
+
+
 @pytest.mark.parametrize(
-    "value", ["/cache/ascii", "/cache/😀", "/cache/𠮷", "/cache/\u0085separator", "/cache/\u2028separator\u2029"]
+    "value",
+    [
+        "/cache/ascii",
+        "/cache/\u007f",
+        "/cache/\u0080",
+        "/cache/\ufffe\uffff",
+        "/cache/😀",
+        "/cache/𠮷",
+        "/cache/\u0085separator",
+        "/cache/\u2028separator\u2029",
+    ],
 )
 def test_public_collection_environment_roundtrips_yaml_unicode(tmp_path, value):
     from collector.fpm_forward.entry import _inline_overrides

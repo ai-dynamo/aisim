@@ -376,7 +376,9 @@ class SlurmCellRunner:
     def collect(self, pods: list[str], *, require_benchmark: bool = True) -> None:
         from .private_inputs import redact_diagnostics
 
-        redact_diagnostics(self.cell_dir, getattr(self, "_private_values", ()))
+        redact_diagnostics(
+            self.cell_dir, getattr(self, "_private_values", ()), cell=getattr(self, "_diagnostic_cell", None)
+        )
         if require_benchmark and not any(
             list((self.cell_dir / "raw" / unit).glob(FPM_BENCHMARK_RESULT_GLOB)) for unit in pods
         ):

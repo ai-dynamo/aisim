@@ -197,7 +197,7 @@ def _runtime_worker_evidence(
     plan, cell, raw_root, collection, *, bundle=None, minimum_capacity=None, allow_staged=False
 ):
     """Bind canonical initialized-worker evidence to this exact native attempt."""
-    from .runtime_instrumentation import read_json
+    from .runtime_instrumentation import read_json_snapshot
     from .runtime_observations import validate_observation_phase
 
     index_path = raw_root.parent.parent.parent / "runtime-observations.json"
@@ -205,7 +205,8 @@ def _runtime_worker_evidence(
         raise ValueError("runtime model snapshot index cannot be a symlink")
     if not index_path.exists():
         raise _MissingExecutionEvidence("runtime model snapshot index is missing")
-    index = read_json(index_path)
+    snapshot = read_json_snapshot(index_path)
+    index, index_bytes = snapshot
     name = plan.runtime_configuration
     entry = index["configurations"][name]
     attempt_id = entry["active_attempt_id"]
@@ -224,6 +225,7 @@ def _runtime_worker_evidence(
         name,
         plan.runtime_launch,
         phase=cell.workload_kind,
+        _index_snapshot=snapshot,
         attempt_id=attempt_id,
         expected_cell_id=cell.cell_id,
         expected_collector_attempt_id=collection.collector_attempt_id,
@@ -247,7 +249,7 @@ def _runtime_worker_evidence(
         if rank in models:
             raise ValueError("runtime model snapshot worker ranks are duplicated")
         models[rank] = worker
-    return models, file_evidence(index_path)
+    return models, {**result["provenance"]["observations_index"], "size_bytes": len(index_bytes)}
 
 
 def _validate_native_attention_groups(groups, worker):

@@ -1148,6 +1148,7 @@ def probe_runtime(
                         manifest = worker_dir / runner.FPM_MANIFEST_FILENAME
                         resource = runner._cell_runner(plan, cell, manifest, phase_dir)
                         resource._private_values = sensitive_values
+                        resource._diagnostic_cell = cell
                         if plan.options.executor == "slurm":
                             resource.runtime_dir = worker_dir / "slurm-runtime"
                         resource.cleanup()
@@ -1176,7 +1177,7 @@ def probe_runtime(
                         )
                         resource.execute(pods)
                         resource.collect(pods, require_benchmark=False)
-                        redact_diagnostics(phase_dir, sensitive_values)
+                        redact_diagnostics(phase_dir, sensitive_values, cell=cell)
                     phase["status"] = "completed" if execute else "preview"
                 except KeyboardInterrupt:
                     phase["status"] = "interrupted"
@@ -1219,7 +1220,7 @@ def probe_runtime(
                             )
                     diagnostics_ok = True
                     try:
-                        redact_diagnostics(phase_dir, sensitive_values)
+                        redact_diagnostics(phase_dir, sensitive_values, cell=cell)
                     except Exception as error:
                         diagnostics_ok = False
                         try:

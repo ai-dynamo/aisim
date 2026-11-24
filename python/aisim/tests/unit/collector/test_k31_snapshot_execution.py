@@ -210,6 +210,26 @@ def test_snapshot_identity_uses_revalidated_same_attempt_worker(snapshot):
     assert execution_evidence._matches_pinned_hub_snapshot(public, model, {revision}, native)
 
 
+def test_runtime_index_provenance_uses_the_validated_snapshot(snapshot, monkeypatch):
+    plan, cell, raw, collection, path = snapshot
+    original = path.read_bytes()
+    read = Path.read_bytes
+    reads = 0
+
+    def replace_after_read(source):
+        nonlocal reads
+        data = read(source)
+        if source == path:
+            reads += 1
+            path.write_text("{}")
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", replace_after_read)
+    _, evidence = execution_evidence._runtime_worker_evidence(plan, cell, raw, collection)
+    assert reads == 1
+    assert evidence == {"path": str(path), "size_bytes": len(original), "sha256": hashlib.sha256(original).hexdigest()}
+
+
 def test_snapshot_identity_is_checked_on_the_validated_manifest(snapshot, monkeypatch):
     from collector.fpm_forward import runtime_observations
 

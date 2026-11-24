@@ -55,6 +55,7 @@ from .runtime_instrumentation import (
     contained_file,
     load_instrumentation,
     read_json,
+    read_json_snapshot,
     sha256_bytes,
     validate_sha256,
 )
@@ -1950,6 +1951,7 @@ def validate_observation_phase(
     launch: dict[str, Any],
     *,
     phase: str,
+    _index_snapshot: tuple[dict[str, Any], bytes] | None = None,
     attempt_id: str,
     expected_cell_id: str | None = None,
     expected_collector_attempt_id: str | None = None,
@@ -1962,7 +1964,7 @@ def validate_observation_phase(
     index_path = Path(index_path).absolute()
     if index_path.is_symlink():
         raise ValueError("runtime observation index cannot be a symlink")
-    index = read_json(index_path)
+    index, index_bytes = _index_snapshot if _index_snapshot is not None else read_json_snapshot(index_path)
     if index.get("schema_version") != INDEX_SCHEMA or not isinstance(index.get("configurations"), dict):
         raise ValueError("unsupported runtime observation index schema")
     result = _configuration(
@@ -1983,7 +1985,7 @@ def validate_observation_phase(
     )
     result["provenance"]["observations_index"] = {
         "path": str(index_path),
-        "sha256": sha256_bytes(index_path.read_bytes()),
+        "sha256": sha256_bytes(index_bytes),
     }
     result["resources"]["runtime_memory"]["provenance"] = canonical_json(result["provenance"])
     return result
@@ -2001,7 +2003,7 @@ def validate_observations(
     index_path = Path(index_path).absolute()
     if index_path.is_symlink():
         raise ValueError("runtime observation index cannot be a symlink")
-    index = read_json(index_path)
+    index, index_bytes = read_json_snapshot(index_path)
     if index.get("schema_version") != INDEX_SCHEMA or not isinstance(index.get("configurations"), dict):
         raise ValueError("unsupported runtime observation index schema")
     if not isinstance(expected_configurations, dict) or not expected_configurations:
@@ -2014,7 +2016,7 @@ def validate_observations(
             results[label] = _configuration(index_path.parent, label, index["configurations"][label], launch)
             results[label]["provenance"]["observations_index"] = {
                 "path": str(index_path),
-                "sha256": sha256_bytes(index_path.read_bytes()),
+                "sha256": sha256_bytes(index_bytes),
             }
             results[label]["resources"]["runtime_memory"]["provenance"] = canonical_json(results[label]["provenance"])
         except (ValueError, TypeError, KeyError, AttributeError, IndexError, OSError) as error:

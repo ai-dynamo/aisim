@@ -2082,7 +2082,7 @@ def test_probe_sanitization_failure_persists_terminal_phase(tmp_path, monkeypatc
             if cleanup_fails and executions:
                 raise OSError("teardown denied")
 
-    def sanitize(directory, values):
+    def sanitize(directory, values, *, cell=None):
         logs = Path(directory) / "logs"
         logs.mkdir(exist_ok=True)
         (logs / "unsafe.log").write_text("synthetic private diagnostic")

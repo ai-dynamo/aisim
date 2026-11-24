@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +71,12 @@ def _inline_overrides(items: list[str] | None) -> dict[str, Any]:
             if not isinstance(child, dict):
                 raise TypeError(f"conflicting --generator-set path: {dotted!r}")
             cursor = child
+        if keys == ["K8sConfig", "extra_env"]:
+            try:
+                cursor[keys[-1]] = json.loads(raw_value)
+                continue
+            except json.JSONDecodeError:
+                pass  # CLI callers can also supply the original YAML syntax.
         cursor[keys[-1]] = yaml.safe_load(raw_value)
     return payload
 

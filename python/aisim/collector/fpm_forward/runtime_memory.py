@@ -804,14 +804,16 @@ def validate_shared_pool_accounting(cache: dict[str, Any], scheduled: dict[str, 
     storages = cache.get("storages")
     if not isinstance(storages, list) or not storages:
         raise ValueError("runtime memory evidence lacks physical storage accounting")
+    if any(not isinstance(item, dict) for item in storages):
+        raise ValueError("runtime cache storage entries must be objects")
     keys = [(item.get("device"), item.get("pointer")) for item in storages]
     if (
-        len(keys) != len(set(keys))
-        or len({device for device, _pointer in keys}) != 1
-        or any(
+        any(
             not isinstance(device, str) or not device.startswith("cuda:") or type(pointer) is not int or pointer <= 0
             for device, pointer in keys
         )
+        or len(keys) != len(set(keys))
+        or len({device for device, _pointer in keys}) != 1
         or sum(_positive(item.get("size_bytes"), "storage bytes") for item in storages) != allocated
     ):
         raise ValueError("physical runtime cache storage accounting is inconsistent")

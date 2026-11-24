@@ -2481,7 +2481,7 @@ def test_archived_environment_resolves_for_replay_and_detects_drift(campaign, tm
         "K8sConfig": {
             "extra_env": [
                 {"name": "CUSTOM_AUTH", "value": token},
-                {"name": "DYN_BENCH_PREFILL_CONTENT", "value": "zeros"},
+                {"name": "DYN_BENCH_PREFILL_CONTENT", "value": "sharegpt"},
                 {"name": "FPM_FINALIZATION_TIMEOUT_SECONDS", "value": "600"},
             ]
         },

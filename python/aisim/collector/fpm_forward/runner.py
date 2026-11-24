@@ -60,10 +60,18 @@ from .glm53flash_points import (
     glm_measured_context,
     glm_smoke_subset,
 )
-from .native_artifact import COLLECTOR_PROVENANCE_FILENAME, validate_native_collection
+from .native_artifact import COLLECTOR_PROVENANCE_FILENAME, KvWarmProtocolError, validate_native_collection
 from .planner import FPMCell, FPMCollectionPlan
+from .private_inputs import (
+    RECEIPT,
+    discard_diagnostics,
+    private_values,
+    reclaim_delivery,
+    redact,
+    redact_diagnostics,
+    sanitize_recovered_diagnostics,
+)
 from .private_inputs import delivery_directory as new_delivery_directory
-from .private_inputs import private_values, reclaim_delivery, redact, redact_diagnostics, sanitize_recovered_diagnostics
 from .runtime.fpm_memory_observer import (
     EXECUTION_SUPPORTED_VERSIONS,
     MEMORY_SUPPORTED_VERSIONS,
@@ -1067,7 +1075,9 @@ class KubernetesCellRunner:
             (logs_dir / f"{pod}.container.log").write_text(
                 redact(logs.stdout + logs.stderr, getattr(self, "_private_values", ()))
             )
-        redact_diagnostics(self.cell_dir, getattr(self, "_private_values", ()))
+        redact_diagnostics(
+            self.cell_dir, getattr(self, "_private_values", ()), cell=getattr(self, "_diagnostic_cell", None)
+        )
         if require_benchmark and not benchmark_observed:
             raise RuntimeError("FPM cell result manifests contain no benchmark JSON files")
 
@@ -1629,7 +1639,14 @@ def _cell_generator_overrides(
             raise TypeError("K8sConfig.extra_env entries must be {name, value} mappings")
         name = item["name"]
         if (
-            name in {"FPM_SLURM_CPUS_PER_TASK", "FPM_SLURM_CPU_BIND"}
+            name
+            in {
+                "FPM_SLURM_CPUS_PER_TASK",
+                "FPM_SLURM_CPU_BIND",
+                "FPM_NODE_RANK",
+                "FPM_MASTER_ADDR",
+                "FPM_LOCAL_GPU_COUNT",
+            }
             and getattr(plan.options, "executor", None) == "slurm"
         ):
             raise ValueError(f"{name} is owned by the Slurm launcher")
@@ -2157,7 +2174,8 @@ def _recover_completed_attempt(
         )
         return None
 
-    if status == "running":
+    private_receipt = (cell_dir / RECEIPT).exists()
+    if status == "running" or private_receipt:
         # A persistent "running" status means the attempt's finally block
         # never ran: its Kubernetes teardown is unverified by construction
         # (the checkpoint is only rewritten AFTER cleanup), and once this
@@ -2186,7 +2204,11 @@ def _recover_completed_attempt(
                     # Keep structured failure metadata when the original private
                     # inputs needed to redact command output are unavailable.
                     resource._private_values = None
+            if private_receipt and not isinstance(resource, SlurmCellRunner):
+                raise ValueError("private Slurm receipt requires verified Slurm teardown")
             resource.cleanup()
+            if private_receipt:
+                reclaim_delivery(cell_dir, update=diagnostic_update)
         except Exception as error:
             logger.warning(
                 "FPM cell %s recovery refused: teardown of the abandoned workload failed: %s",
@@ -2364,7 +2386,7 @@ def _run_collection_impl(
         from .runtime_probe import record_collection_observations
 
         try:
-            from .database import _is_k31, _validate_backend_markers, require_k31_worker_evidence
+            from .database import _is_k31, _validate_backend_markers, require_k31_worker_evidence, require_kda_real_kv
 
             sanitize_recovered_diagnostics(root / "cells" / cell.cell_id, generator_overrides, cell=cell)
             validate_worker = record["status"] == "passed" and not formal_database_terminal and _is_k31(plan)
@@ -2394,6 +2416,7 @@ def _run_collection_impl(
                     collection = validate_native_collection(
                         cell, raw_root, expected_plan_sha256=plan.sha256, expected_attempt_id=record["attempt_id"]
                     )
+                    require_kda_real_kv(plan, cell, collection)
                     require_k31_worker_evidence(plan, cell, raw_root, collection, allow_staged=True)
                 except (OSError, KeyError, TypeError, ValueError) as error:
                     record.update(status="failed", error_type=type(error).__name__, error=str(error))
@@ -2429,11 +2452,20 @@ def _run_collection_impl(
     if getattr(plan.options, "executor", "kubernetes") == "slurm":
         for cell in target_cells:
             cell_dir = root / "cells" / cell.cell_id
-            if not (cell_dir / ".private-delivery.json").exists():
+            entry = checkpoint["cells"].get(cell.cell_id, {})
+            if not (cell_dir / RECEIPT).exists() and "private_cleanup_error" not in entry:
                 continue
             try:
                 _cell_runner(plan, cell, cell_dir / FPM_MANIFEST_FILENAME, cell_dir).cleanup()
                 reclaim_delivery(cell_dir)
+                if "private_cleanup_error" in entry:
+                    entry.pop("private_cleanup_error")
+                    if (
+                        entry.get("status") == "cleanup_failed"
+                        and not {"cleanup_error", "diagnostic_error"} & entry.keys()
+                    ):
+                        entry["status"] = "failed"
+                    _atomic_json(checkpoint_path, checkpoint)
             except Exception as error:
                 checkpoint["cells"][cell.cell_id] = {
                     **checkpoint["cells"].get(cell.cell_id, {}),
@@ -2557,9 +2589,12 @@ def _run_collection_impl(
                 )
             )
         except (OSError, TypeError, ValueError) as error:
-            from .database import KdaSeedError
+            from .database import KdaSeedError, is_kda_decode
 
-            if isinstance(error, KdaSeedError) and not formal_database_terminal:
+            if not formal_database_terminal and (
+                isinstance(error, KdaSeedError)
+                or (isinstance(error, KvWarmProtocolError) and is_kda_decode(plan, cell))
+            ):
                 entry.update(status="failed", error_type=type(error).__name__, error=str(error))
                 checkpoint_changed = True
             logger.warning(
@@ -2678,6 +2713,7 @@ def _run_collection_impl(
                 )
             resource = _cell_runner(plan, cell, manifest, cell_dir)
             resource._private_values = sensitive_values
+            resource._diagnostic_cell = cell
             if private_delivery and getattr(plan.options, "executor", "kubernetes") == "slurm":
                 resource.runtime_dir = worker_dir / "slurm-runtime"
             # A prior invocation may have left the same-named workload alive
@@ -2762,7 +2798,7 @@ def _run_collection_impl(
             phase_marks["execute_wall_s"] = round(time.monotonic() - mark, 3)
             mark = time.monotonic()
             resource.collect(pods)
-            redact_diagnostics(cell_dir, sensitive_values)
+            redact_diagnostics(cell_dir, sensitive_values, cell=cell)
             phase_marks["collect_s"] = round(time.monotonic() - mark, 3)
             _validate_points_receipts(plan, cell, cell_dir / "raw", attempt_id, smoke=smoke)
             runtime_collection = _runtime_collection_summary(
@@ -2848,10 +2884,14 @@ def _run_collection_impl(
                     )
             diagnostics_ok = True
             try:
-                redact_diagnostics(cell_dir, sensitive_values)
+                redact_diagnostics(cell_dir, sensitive_values, cell=cell)
             except Exception as error:
                 diagnostics_ok = False
                 record = checkpoint["cells"][cell.cell_id]
+                try:
+                    discard_diagnostics(cell_dir)
+                except OSError as cleanup_error:
+                    record["diagnostic_cleanup_error"] = redact(str(cleanup_error), sensitive_values)
                 if record.get("status") == "passed":
                     record["status"] = "failed"
                 record["diagnostic_error"] = redact(str(error), sensitive_values)

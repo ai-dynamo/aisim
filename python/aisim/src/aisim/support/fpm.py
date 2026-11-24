@@ -138,12 +138,7 @@ def fpm_cli_args(
                 else:
                     command.extend(("--generator-set", f"K8sConfig.k8s_image={json.dumps(value)}"))
             elif name == "extra_env":
-                encoded = (
-                    json.dumps(value, ensure_ascii=False)
-                    .replace("\u0085", "\\u0085")
-                    .replace("\u2028", "\\u2028")
-                    .replace("\u2029", "\\u2029")
-                )
+                encoded = json.dumps(value)
                 command.extend(("--generator-set", f"K8sConfig.extra_env={encoded}"))
             else:
                 prefix = "--fpm-slurm-" if name in {"cpus_per_task", "cpu_bind"} else "--"

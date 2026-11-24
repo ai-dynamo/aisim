@@ -45,6 +45,7 @@ from .native_artifact import (
     validate_native_collection,
 )
 from .planner import BackendPolicy, FPMCollectionPlan, _canonical_hash, _hash_stable_admission
+from .private_inputs import RECEIPT
 from .runner import (
     CHECKPOINT_SCHEMA,
     FPM_RECOVERABLE_STATUSES,
@@ -628,7 +629,8 @@ def _reconcile_diagnostic(attempt, files, cell_path):
         return
     name = pending["path"]
     relative = Path(name).relative_to(cell_path)
-    if (
+    receipt_deletion = relative == Path(RECEIPT) and pending["before"] is not None and pending["after"] is None
+    if not receipt_deletion and (
         ".." in relative.parts
         or len(relative.parts) < 2
         or relative.parts[0] not in {"raw", "logs"}
@@ -1291,7 +1293,9 @@ def run_repeatability(
                     "is unqualified for this campaign. Use the matching revision or collect a new source campaign. "
                     "Existing samples remain available for offline assessment."
                 )
-            delivery_overrides = resolve_archived_generator_overrides(generator_overrides)
+            # Check delivery credentials before allocating an attempt. The collector
+            # verifies the frozen identity and resolves references during rendering.
+            resolve_archived_generator_overrides(generator_overrides)
             directory = root / relative
             directory.mkdir(parents=True, exist_ok=False)
             attempt = {"directory": str(relative), "status": "running"}
@@ -1301,7 +1305,7 @@ def run_repeatability(
                 validating = False
                 errors = run_collection(
                     plan,
-                    generator_overrides=delivery_overrides,
+                    generator_overrides=generator_overrides,
                     checkpoint_dir=str(directory / "checkpoint"),
                     artifact_root=str(directory / "artifacts"),
                     resume=False,
