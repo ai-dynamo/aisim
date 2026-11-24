@@ -52,7 +52,8 @@ def test_build_identity_rejects_stale_input(tmp_path, monkeypatch, stale):
     manifest = {
         "source_commit": "a" * 40,
         "source_tree": "b" * 40,
-        "data_tree": "c" * 40,
+        "data_source": {"source": "hf", "repo": "ai-dynamo/aisim-data", "revision": "d" * 40},
+        "data_tree": "c" * 64,
         "binary_sha256": "wrong binary",
         "source_files": {"source.rs": parity._sha256(source)},
     }
@@ -216,11 +217,27 @@ def test_source_inventory_includes_untracked_runtime_inputs(tmp_path, monkeypatc
 
 
 @pytest.fixture
-def built_workspace(tmp_path, monkeypatch):
+def selected_data(tmp_path, monkeypatch):
+    """A stand-in for the composed op-latency root of an immutable dataset commit; nothing is downloaded."""
+    import aisim_core.data.default_systems as default_systems
+
+    root = tmp_path / "composed-systems"
+    (root / "data/h200_sxm/gemm/vllm/1.0").mkdir(parents=True)
+    (root / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet").write_bytes(b"table one")
+    (root / "data/h200_sxm/gemm/vllm/1.0/collection_meta.yaml").write_text("tables: {}\n")
+    marker = {"source": "hf", "repo": "ai-dynamo/aisim-data", "revision": "d" * 40}
+    (root / default_systems.MARKER).write_text(json.dumps(marker))
+    monkeypatch.setattr(default_systems, "default_systems_path", lambda **_: str(root))
+    return root
+
+
+@pytest.fixture
+def built_workspace(tmp_path, monkeypatch, selected_data):
     """A tiny Git checkout and extension whose identity was captured at build time."""
     import aisim
 
-    root = tmp_path.resolve()
+    root = (tmp_path / "workspace").resolve()
+    root.mkdir()
     contents = {
         ".gitignore": "runtime.so\n",
         "Cargo.toml": "workspace manifest",
@@ -230,7 +247,6 @@ def built_workspace(tmp_path, monkeypatch):
         "crates/core/src/lib.rs": "pub fn original() {}",
         "crates/core/src/obsolete.rs": "pub fn obsolete() {}",
         "python/aisim/src/aisim/current.py": "value = 1",
-        "python/aisim/src/aisim_core/systems/data/control.json": "{}",
     }
     for name, content in contents.items():
         path = root / name
@@ -326,4 +342,53 @@ def test_refresh_requires_recorded_native_identity(built_workspace, identity):
         manifest["native_source_inventory_sha256"] = identity
     output.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="missing or inconsistent native source identity; rebuild"):
+        parity._verified_build(output)
+
+
+def test_snapshot_binds_provenance_to_the_selected_dataset_without_reading_the_source_tree(built_workspace):
+    root, _ = built_workspace
+    assert not (root / "python/aisim/src/aisim_core/systems/data").exists()  # the checkout has no packaged data
+    output = root / "evidence/manifest.json"
+    manifest = parity._write_build_snapshot(output)  # a checkout without packaged data still snapshots
+    assert manifest["data_source"] == {"source": "hf", "repo": "ai-dynamo/aisim-data", "revision": "d" * 40}
+    assert len(manifest["data_tree"]) == 64
+    assert str(root) not in json.dumps(manifest["data_source"])
+    assert parity._verified_build(output)["data_tree"] == manifest["data_tree"]
+
+
+def test_verification_rejects_changed_or_added_dataset_content(built_workspace, selected_data):
+    root, _ = built_workspace
+    output = root / "evidence/manifest.json"
+    parity._write_build_snapshot(output)
+    table = selected_data / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet"
+    table.write_bytes(b"table two")
+    with pytest.raises(ValueError, match="performance data tree differs"):
+        parity._verified_build(output)
+    table.write_bytes(b"table one")
+    parity._verified_build(output)
+    (selected_data / "data/h200_sxm/gemm/vllm/1.0/extra_perf.parquet").write_bytes(b"added")
+    with pytest.raises(ValueError, match="performance data tree differs"):
+        parity._verified_build(output)
+
+
+def test_verification_rejects_a_different_dataset_commit_even_with_identical_bytes(built_workspace, selected_data):
+    import aisim_core.data.default_systems as default_systems
+
+    root, _ = built_workspace
+    output = root / "evidence/manifest.json"
+    parity._write_build_snapshot(output)
+    (selected_data / default_systems.MARKER).write_text(
+        json.dumps({"source": "hf", "repo": "ai-dynamo/aisim-data", "revision": "e" * 40})
+    )
+    with pytest.raises(ValueError, match="performance data source differs"):
+        parity._verified_build(output)
+
+
+def test_manifest_from_before_the_dataset_cutover_is_rejected(built_workspace):
+    root, _ = built_workspace
+    output = root / "evidence/manifest.json"
+    manifest = parity._write_build_snapshot(output)
+    del manifest["data_source"]
+    output.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="build manifest missing data_source"):
         parity._verified_build(output)

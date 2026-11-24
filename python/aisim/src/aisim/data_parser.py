@@ -132,7 +132,7 @@ def add_init_parser(subparsers: Any) -> None:
         "--on-demand",
         action="store_true",
         help="download nothing now; a run fetches only from a pinned source (--repo/--revision, AISIM_DATASET), "
-        "else it uses the packaged data (the default)",
+        "else it uses the default data (the dataset revision pinned in the release)",
     )
     group.add_argument("--hardware", metavar="H", help="download op data for one hardware platform now")
     _add_source_args(init)

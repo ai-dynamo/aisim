@@ -237,7 +237,8 @@ Native expectations live in `afd_execution_plan.json` and `afd_e2e.json` under
 [`crates/core/parity_tests/perfmodel/goldens/`](../../crates/core/parity_tests/perfmodel/goldens/).
 `gen_afd_spec_fixtures.py` rebuilds pool fixtures through the canonical compiler.
 `scripts/afd_parity.py refresh-e2e` and `refresh-layouts` require `--build-manifest`: an immutable source
-commit/tree, covered source-file hashes, loaded native-binary hash and data tree.
+commit/tree, covered source-file hashes, loaded native-binary hash, and the selected op-latency dataset
+(its source commit and a digest of every operation file in the composed root).
 It refuses unrecorded source/binary/data changes, retains generation identity per
 case, checks exact request/token/GPU counts, and replaces the fixture only after
 all selected cases succeed. Historical attribution is not current generation
