@@ -31,6 +31,9 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 def _measure_fastafd_attention(stage_config, *, isl, osl, prefix, max_seq_len):
     """Internal composition for the canonical, already selected stage model."""
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in (isl, osl)):
+        raise ValueError(f"isl and osl must be positive integers, got isl={isl}, osl={osl}")
+
     from aisimulate.sdk.backends.factory import get_backend
     from aisimulate.sdk.config_builders import apply_nextn, build_model_config
     from aisimulate.sdk.models import resolve_dsv4_moe_arch, resolve_nvfp4_for_system

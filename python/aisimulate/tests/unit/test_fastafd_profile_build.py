@@ -255,6 +255,44 @@ def test_repeated_build_excludes_only_designated_output(tmp_path):
     assert output.read_bytes() == original
 
 
+def test_output_cannot_replace_a_raw_capture(tmp_path):
+    raw = _write(tmp_path, "a.json", _split(64))
+    _write(tmp_path, "b.json", _split(128))
+    original = raw.read_bytes()
+    with pytest.raises(ValueError, match="output.*generated profile"):
+        main([str(tmp_path), "--repository", _REPOSITORY, "--output", str(raw)])
+    assert raw.read_bytes() == original
+
+
+def test_symlink_output_is_rejected_consistently(tmp_path):
+    _write(tmp_path, "capture.json", _split(64))
+    target = tmp_path / "profile.json"
+    args = [str(tmp_path), "--repository", _REPOSITORY, "--output", str(target)]
+    assert main(args) == 0
+    original = target.read_bytes()
+    output = tmp_path / "latest.json"
+    output.symlink_to(target.name)
+    for _ in range(2):
+        with pytest.raises(ValueError, match="output.*symlink"):
+            main([str(tmp_path), "--repository", _REPOSITORY, "--output", str(output)])
+        assert output.is_symlink()
+        assert target.read_bytes() == original
+
+
+@pytest.mark.parametrize("routing", [None, [], ["balanced"], {}, True, 1, "", "  "])
+@pytest.mark.parametrize("suffix", ["json", "parquet"])
+def test_malformed_routing_prevents_publication(tmp_path, routing, suffix):
+    results = tmp_path / "results"
+    _write(results, "a-valid.json", _colocated(48))
+    _write(results, "b-malformed.json", _colocated(96, routing=routing))
+    output = tmp_path / f"profile.{suffix}"
+    original = b"previous profile"
+    output.write_bytes(original)
+    with pytest.raises(ValueError, match="b-malformed.json: routing must be a non-empty string"):
+        main([str(results), "--repository", _REPOSITORY, "--output", str(output)])
+    assert output.read_bytes() == original
+
+
 @pytest.mark.parametrize(
     "components",
     [None, ["dispatch", "experts", "return"], ["router", "dispatch", "experts", "return", "combine"]],
@@ -276,14 +314,16 @@ def test_builder_rejects_unverified_or_incompatible_boundary(tmp_path, component
 @pytest.mark.parametrize("suffix", ["json", "parquet"])
 def test_builder_rejects_unverified_or_partial_timed_span_without_publication(tmp_path, span, suffix):
     payload = _split(64)
+    capture = _write(tmp_path, "capture.json", payload)
+    output = tmp_path / f"profile.{suffix}"
+    args = [str(tmp_path), "--repository", _REPOSITORY, "--output", str(output)]
+    assert main(args) == 0
+    original = output.read_bytes()
     if span is None:
         del payload["measurement_timed_span"]
     else:
         payload["measurement_timed_span"] = span
-    _write(tmp_path, "capture.json", payload)
-    output = tmp_path / f"profile.{suffix}"
-    original = b"previous profile"
-    output.write_bytes(original)
+    capture.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="timed_span"):
-        main([str(tmp_path), "--repository", _REPOSITORY, "--output", str(output)])
+        main(args)
     assert output.read_bytes() == original

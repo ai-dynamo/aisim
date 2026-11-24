@@ -143,6 +143,32 @@ def evaluate_afd_phase(
             f"topology phase={topology.phase.value!r} cannot evaluate measurement phase={times.phase.value!r}",
             provenance=topology.provenance(),
         )
+    if times.provenance.get("provider") == "fastafd":
+        stage = times.provenance.get("stage")
+        key = stage.get("key") if isinstance(stage, Mapping) else None
+        expected = {
+            "stage": "afd",
+            "topology": f"{topology.attention_gpus}A{topology.ffn_gpus}F",
+            "logical_batch_per_source_rank": topology.a_batch_size,
+            "microbatches": topology.num_microbatches,
+            "moe_layers": times.num_layers,
+        }
+        # A saved stage is normalized for exactly this geometry. Replaying
+        # another shape must not rescale the capture, or reopen its source.
+        if (
+            not isinstance(key, Mapping)
+            or any(key.get(name) != value for name, value in expected.items())
+            or times.phase is not AFDPhase.DECODE
+            or topology.tp_a != 1
+            or topology.f_moe_ep_size != topology.ffn_gpus
+            or not topology.boundary_on_attn
+            or topology.comm_overhead_factor != 1.0
+        ):
+            raise AFDInfeasible(
+                AFDReasonCategory.INVALID_MEASUREMENT,
+                "saved FastAFD stage key does not match the replay topology",
+                provenance={"stage_key": key, "replay_key": expected},
+            )
     if times.decode_attention_samples and times._decode_sample_count != max(output_length - 1, 1):
         raise AFDInfeasible(
             AFDReasonCategory.INVALID_MEASUREMENT,

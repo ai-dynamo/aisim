@@ -166,6 +166,9 @@ class FastAFDMoEStageProfile:
                     if codec not in _PARQUET_CODECS:
                         raise ValueError(f"unsupported FastAFD Parquet codec: {codec}")
             table = pq.read_table(pa.BufferReader(raw))
+            for name in ("capture_json", "source_json"):
+                if table.schema.field(name).type not in (pa.string(), pa.large_string()):
+                    raise ValueError(f"FastAFD metadata column {name!r} must be UTF-8 text")
             for name in sorted(_COUNT_FIELDS):
                 if table.schema.field(name).type != pa.int64():
                     raise ValueError(f"FastAFD count column {name!r} must be signed INT64")

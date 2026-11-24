@@ -46,7 +46,20 @@ def build_profile(
     """
 
     excluded = Path(output_path).resolve() if output_path is not None else None
-    files = sorted(path for path in Path(results_dir).glob("*.json") if excluded is None or path.resolve() != excluded)
+    files = sorted(Path(results_dir).glob("*.json"))
+    if excluded is not None:
+        inputs = []
+        for path in files:
+            if path.resolve() == excluded:
+                # An output inside the discovery directory is replaceable only
+                # when it is already a validated profile, never a raw capture.
+                try:
+                    FastAFDMoEStageProfile.load(path)
+                except (ValueError, KeyError, TypeError) as exc:
+                    raise ValueError(f"{path.name}: output must be an existing generated profile") from exc
+            else:
+                inputs.append(path)
+        files = inputs
     if not files:
         raise ValueError(f"no benchmark results in {results_dir}")
     summary: Counter[str] = Counter()
@@ -74,6 +87,8 @@ def build_profile(
         workload = payload["workload"]
         if not isinstance(payload["stable"], bool):
             raise ValueError(f"{path.name}: stable must be a boolean")
+        if not isinstance(workload["routing"], str) or not workload["routing"].strip():
+            raise ValueError(f"{path.name}: routing must be a non-empty string")
         if workload["routing"] != routing:
             summary["skipped_routing"] += 1
             continue
@@ -166,6 +181,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     output = Path(args.output)
+    if output.is_symlink():
+        raise ValueError("FastAFD output must not be a symlink")
     profile, summary = build_profile(
         args.results_dir, repository=args.repository, routing=args.routing, output_path=output
     )

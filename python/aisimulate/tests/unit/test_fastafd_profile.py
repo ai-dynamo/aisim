@@ -416,6 +416,31 @@ def test_inspection_and_native_loading_require_complete_timed_span(tmp_path, spa
         RustForwardPassPerfModel.best_available(_canonical_config(path))
 
 
+@pytest.mark.parametrize("column", ["capture_json", "source_json"])
+@pytest.mark.parametrize("encoding", ["binary", "string", "large_string"])
+def test_parquet_metadata_requires_utf8_for_inspection_and_native_loading(tmp_path, column, encoding):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload()))
+    path = tmp_path / "profile.parquet"
+    profile.write_parquet(path)
+    table = pq.read_table(path)
+    table = table.set_column(table.schema.get_field_index(column), column, table[column].cast(getattr(pa, encoding)()))
+    pq.write_table(table, path)
+    if encoding == "binary":
+        with pytest.raises(ValueError, match=rf"{column}.*UTF-8"):
+            FastAFDMoEStageProfile.load(path)
+        with pytest.raises(ValueError, match="(?i)string|str"):
+            RustForwardPassPerfModel.best_available(_canonical_config(path))
+    else:
+        assert FastAFDMoEStageProfile.load(path).entries == profile.entries
+        estimate = RustForwardPassPerfModel.best_available(_canonical_config(path)).estimate_fastafd_stage(48)
+        assert estimate["stage"]["latency_ms"] == 16.7
+
+
 def test_parquet_entries_and_digest_use_the_same_snapshot(tmp_path, monkeypatch):
     profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload()))
     path = tmp_path / "stage.parquet"

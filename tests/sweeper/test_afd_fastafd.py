@@ -414,6 +414,37 @@ def test_fastafd_rejects_undersized_sequence_limit_before_estimation(
             provider.measure(replace(request, max_seq_len=max_seq_len))
 
 
+@pytest.mark.parametrize("isl,osl", [(0, 128), (-1, 128), (1024, 0), (1024, -1)])
+@pytest.mark.parametrize("entrypoint", ["canonical", "adapter"])
+def test_fastafd_rejects_nonpositive_lengths_before_attention_setup(tmp_path, monkeypatch, isl, osl, entrypoint):
+    from aisimulate.sdk import perf_database
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    provider = _provider(tmp_path, AICAFDPerformanceModel())
+    request = _request(_topology())
+    _, config, _ = provider._select(request, LAYERS, 8)
+    model = RustForwardPassPerfModel.best_available(config)
+
+    def unexpected_database(*args, **kwargs):
+        pytest.fail("Invalid sequence lengths must fail before attention database/model setup")
+
+    monkeypatch.setattr(perf_database, "get_database_view", unexpected_database)
+    with pytest.raises(
+        ValueError if entrypoint == "canonical" else AFDInfeasible, match="isl and osl must be positive"
+    ):
+        if entrypoint == "canonical":
+            model.estimate_fastafd_attention(isl=isl, osl=osl)
+        else:
+            provider.measure(replace(request, input_length=isl, output_length=osl))
+
+
+def test_fastafd_one_token_decode_remains_valid(tmp_path, fastafd_attention_sol):
+    provider = _provider(tmp_path, AICAFDPerformanceModel())
+    (measurement,) = provider.measure(replace(_request(_topology()), output_length=1))
+    assert measurement.attention_ms > 0
+    assert sum(repeat for _, repeat in measurement.decode_attention_samples) == 1
+
+
 @pytest.mark.parametrize("max_seq_len", [None, 1152, 2048])
 def test_fastafd_sequence_limit_preserves_memory_and_uncomposed_attention(tmp_path, fastafd_attention_sol, max_seq_len):
     """Native SOL and real KV accounting; the adapter composes compute and router."""
@@ -1048,10 +1079,12 @@ def test_prediction_config_uses_builtin_attention_with_low_bit_f_pool(tmp_path, 
 
 
 def test_serial_decode_evaluates_the_replayed_profile_stage(tmp_path):
-    raw = _prediction(_profile(tmp_path))
+    profile = _profile(tmp_path)
+    raw = _prediction(profile)
     raw["engine"]["afd"]["pipeline_model"] = "serial"
     config = CorePredictionConfig.model_validate(raw)
     spec = prediction_to_replay_spec(config, afd_performance_model=_Attention())
+    Path(profile).unlink()
 
     # Exercise the runner's reconstruction of the serialized measurement and
     # topology before evaluating the complete decode step.
@@ -1065,6 +1098,52 @@ def test_serial_decode_evaluates_the_replayed_profile_stage(tmp_path):
 
     # 94 layers * 2 microbatches * 0.092 ms of A + 11.213456 ms of F.
     assert evaluation.step_latency_ms == pytest.approx(28.509456)
+    report = EngineReplayRunnerFactory().create(0).run(spec)
+    assert report.metrics["completed_requests"] == 32
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"num_microbatches": 3},
+        {"n_a_nodes": 8},
+        {"n_f_nodes": 4, "f_moe_ep_size": 16},
+        {"a_batch_size": 64},
+        {"tp_a": 2},
+        {"f_moe_ep_size": 4},
+        {"boundary_on_attn": False},
+    ],
+)
+def test_saved_fastafd_stage_rejects_changed_replay_topology_without_profile(tmp_path, changes):
+    profile = _profile(tmp_path)
+    raw = _prediction(profile)
+    raw["engine"]["afd"]["pipeline_model"] = "serial"
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw), afd_performance_model=_Attention())
+    deployment = spec.backend_deployment
+    saved = json.loads(json.dumps(deployment.performance_model_metadata))
+    deployment = replace(deployment, performance_model_metadata=saved)
+    (measurement,) = _afd_layer_measurements(deployment)
+    topology = _afd_topology(deployment)
+    # Matching saved measurements remain self-contained after capture removal.
+    Path(profile).unlink()
+    assert evaluate_afd_phase(
+        topology, measurement, input_length=1024, output_length=128
+    ).step_latency_ms == pytest.approx(28.509456)
+    changed = replace(topology, **changes)
+    with pytest.raises(AFDInfeasible, match="saved FastAFD stage.*replay topology"):
+        evaluate_afd_phase(changed, measurement, input_length=1024, output_length=128)
+    engine = AFDForegroundEngine(changed, (measurement,))
+    with pytest.raises(AFDInfeasible, match="saved FastAFD stage.*replay topology"):
+        engine.execute_pass(phase="decode", now_ms=0.0, input_length=1024, output_length=128)
+    assert engine.in_flight is None
+    parallel = {
+        **deployment.parallel_config,
+        "afd": {**deployment.parallel_config["afd"], **changes},
+    }
+    with pytest.raises(AFDInfeasible, match="saved FastAFD stage.*replay topology"):
+        EngineReplayRunnerFactory().create(0).run(
+            replace(spec, backend_deployment=replace(deployment, parallel_config=parallel))
+        )
 
 
 def _decode_reference(topology, samples, ffn_ms, output_length):
@@ -1271,6 +1350,34 @@ def test_fastafd_rejects_typed_trace_without_boundary_samples(tmp_path):
     (measurement,) = fastafd.measure(request)
     assert measurement.decode_attention_samples == ()
     assert measurement.attention_ms == 2.0
+
+
+@pytest.mark.parametrize(
+    "raw_samples",
+    [((2.0, 32), (2.0, 32)), ((2.0, 64),), ((1.0, 16), (3.0, 16)), ((3.0, 32), (1.0, 32))],
+)
+def test_fastafd_rejects_conflicting_typed_and_provenance_traces(tmp_path, raw_samples):
+    request = replace(_request(_topology()), output_length=65)
+    components = {"attention_compute_ms": 1.75, "a_combine_ms": 0.25, "a_router_ms": 0.25}
+    attention = AFDLayerTimes(
+        phase="decode",
+        attention_ms=2.0,
+        ffn_ms=2.0,
+        a_to_f_ms=0.0,
+        f_to_a_ms=0.0,
+        num_layers=LAYERS,
+        decode_attention_samples=((1.0, 32), (3.0, 32)),
+        provenance={
+            "components": components,
+            "decode_samples": [
+                {"repeat": repeat, "components": {**components, "attention_compute_ms": ms - 0.25}}
+                for ms, repeat in raw_samples
+            ],
+        },
+    )
+    provider = _provider(tmp_path, SimpleNamespace(measure=lambda _: (attention,)))
+    with pytest.raises(AFDInfeasible, match="typed decode_attention_samples.*decode_samples"):
+        provider.measure(request)
 
 
 @pytest.mark.parametrize("repeats", [(32, 1), (32, 33)])

@@ -181,7 +181,10 @@ class FastAFDMoEStagePerformanceModel:
         samples = []
         total_repeat = 0
         compute_sum = combine_sum = router_sum = 0.0
-        for sample in raw:
+        typed = attention.decode_attention_samples
+        if typed and len(typed) != len(raw):
+            raise _infeasible("typed decode_attention_samples must match provenance decode_samples")
+        for index, sample in enumerate(raw):
             if not isinstance(sample, Mapping):
                 raise _infeasible("invalid attention provider decode sample")
             repeat = sample.get("repeat")
@@ -205,6 +208,11 @@ class FastAFDMoEStagePerformanceModel:
                     raise _infeasible(f"decode sample {name} must be a finite non-negative number")
             if components["a_router_ms"] <= 0:
                 raise _infeasible("decode sample must include positive A-side router time")
+            if typed and (
+                typed[index][1] != repeat
+                or not math.isclose(typed[index][0], compute + combine, rel_tol=1e-9, abs_tol=1e-12)
+            ):
+                raise _infeasible("typed decode_attention_samples must match provenance decode_samples")
             samples.append((compute + components["a_router_ms"], repeat))
             total_repeat += repeat
             compute_sum += compute * repeat

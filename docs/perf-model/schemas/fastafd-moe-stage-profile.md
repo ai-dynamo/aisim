@@ -162,8 +162,11 @@ from one directory of raw benchmark results (one benchmark, one commit) into a
 profile. Results with another routing distribution (`--routing`, default
 `balanced`), an unstable timing, or a failed correctness check are skipped and
 counted. Repeated measurements of one key are an error; keep one run per directory.
-The designated output is excluded from input discovery, so the same command can
-replace a JSON profile inside the results directory. Other unsupported inputs fail.
+An existing designated output inside the results directory must validate as a
+generated profile before it is excluded from input discovery and replaced. A raw
+capture cannot be used as the output, and symlink outputs are rejected before
+discovery. Other unsupported inputs fail. Malformed routing values fail before
+filtering; only nonempty string routing labels can be counted as routing skips.
 Raw results must include `measurement_boundary_components` with the exact ordered
 components above, in addition to the free-form `measurement_boundary` description.
 They must also include `measurement_timed_span: "all_moe_layers_and_microbatches"`;

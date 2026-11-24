@@ -117,10 +117,15 @@ own measurement and memory-qualification contracts.
 Decode providers retain the KV samples and their repeat counts in
 `provenance.decode_samples`, including each sample's attention boundary
 components. FastAFD replaces the F stage and recomposes A for every sample.
+When a provider also supplies typed `decode_attention_samples`, each value and
+repeat count must match the provenance trace before boundary recomposition.
 The serialized measurement's `decode_attention_samples` contains the resulting
 `[attention_ms, repeat]` pairs; its headline A time is their weighted mean.
 The trace's repeat total must equal `max(output_length - 1, 1)` at evaluation,
 including serial replay. A saved trace cannot price a different decode length.
+The saved FastAFD stage key must also match the replay's pool sizes, per-A-rank
+batch, microbatch count, and layer count, with the supported TP, EP, and boundary
+settings. Matching saved measurements remain usable without reopening the profile.
 The pipeline maximum is evaluated before averaging the sampled cadence, so a
 decode trace that crosses between F-bound and A-bound does not undercount TPOT.
 Foreground intervals use the mean stage durations and sampled mean cadence.
@@ -130,7 +135,8 @@ provides `estimate_fastafd_attention(isl=..., osl=..., max_seq_len=...)` for a
 selected `fastafd_stage` identity. It returns attention compute as
 `attention_ms` and reports `a_router_ms` separately in `provenance.components`.
 The FastAFD adapter adds the router later; direct callers needing total A time
-must add both components. A configured `max_seq_len` must be at least `isl + osl`
+must add both components. Both `isl` and `osl` must be positive integers, including
+the supported one-token output case. A configured `max_seq_len` must be at least `isl + osl`
 so the KV allocation covers the full evaluated decode sequence.
 This widening describes the lower-level provider. Public AFD configuration
 rejects nonzero `engine.nextn`, including `nextn: 1` with `nextn_accepted: 1`,
