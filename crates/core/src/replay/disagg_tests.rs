@@ -1375,6 +1375,33 @@ fn prefill_truncates_the_output_plan_without_mutating_decode() {
 }
 
 #[test]
+fn a_request_releases_its_prompt_hashes_when_decode_starts() {
+    let request = DirectRequest {
+        tokens: vec![1; 8],
+        prompt_hashes: Some(crate::engine::PromptHashes {
+            block_size: 4,
+            local_block_hashes: vec![1, 2],
+            sequence_hashes: vec![1, 2],
+        }),
+        ..Default::default()
+    };
+    let mut state = DisaggRequestState::new(
+        ReplayRequestPayload::materialized(request),
+        0.0,
+        HandoffId::new(Uuid::from_u128(1)),
+        HandoffOrder::SourceFirst,
+        0.0,
+        None,
+        None,
+    );
+
+    let prefill = state.build_prefill_request().unwrap();
+    assert!(prefill.prompt_hashes.is_some());
+    state.start_decode();
+    assert!(state.original_request().unwrap().prompt_hashes.is_none());
+}
+
+#[test]
 fn decode_terminal_retains_handoff_until_deferred_cleanup_drains() {
     let request_shapes = [
         (6_755, 500),

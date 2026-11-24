@@ -1735,6 +1735,7 @@ impl VllmCore {
             self.retain_local_hashes,
             self.emit_token_ids,
             planned_output_ids,
+            request.prompt_hashes.as_ref(),
         );
         sequence.lease.session_id = request.session_id;
         if let (Some(unit), Some(tokens)) = (self.args.prefix_match_unit, prefix_tokens) {

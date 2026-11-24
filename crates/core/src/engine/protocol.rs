@@ -67,6 +67,20 @@ pub struct KvHintSource {
     pub dp_rank: u32,
 }
 
+/// Hashes of a prompt's complete blocks that the caller derived before submitting it.
+///
+/// `local_block_hashes[i]` is the unsalted hash of the `i`-th complete
+/// `block_size`-token block of [`Request::tokens`] and `sequence_hashes[i]`
+/// chains it to its predecessors, as `ReplayRequestHashes::from_tokens` derives
+/// them. Release builds check only the block size and the two lengths, so the
+/// values are trusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptHashes {
+    pub block_size: usize,
+    pub local_block_hashes: Vec<u64>,
+    pub sequence_hashes: Vec<u64>,
+}
+
 /// Runtime-neutral request accepted by the rank engine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
@@ -95,6 +109,11 @@ pub struct Request {
     /// `tokens`. Never the receiving rank itself. Engines without KVCR ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_hint: Option<KvHintSource>,
+    /// Optional hashes of `tokens` the caller already holds. The engine adopts
+    /// them instead of hashing the prompt when they cover every complete block
+    /// at its own block size and the request has no cache salt. Never serialized.
+    #[serde(skip)]
+    pub prompt_hashes: Option<PromptHashes>,
 }
 
 /// Commands supported by the standalone scheduler.

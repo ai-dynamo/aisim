@@ -878,6 +878,7 @@ fn serve_prompt(engine: &mut Engine, id: u128, now_ms: &mut f64) -> usize {
                     output_token_ids: None,
                     session_id: None,
                     kv_hint: None,
+                    prompt_hashes: None,
                 }),
             ),
             *now_ms,

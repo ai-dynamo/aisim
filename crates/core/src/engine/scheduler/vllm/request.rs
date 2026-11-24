@@ -3,6 +3,7 @@
 
 use uuid::Uuid;
 
+use crate::engine::PromptHashes;
 use crate::engine::common::sequence::RequestSequence;
 use crate::engine::kv_manager::BlockRequestLease;
 
@@ -24,8 +25,9 @@ impl RequestKvState {
         retain_local_hashes: bool,
         emit_token_ids: bool,
         planned_output_ids: Option<Vec<u32>>,
+        prompt_hashes: Option<&PromptHashes>,
     ) -> Self {
-        let (sequence, identities) = RequestSequence::new(
+        let (sequence, identities) = RequestSequence::with_prompt_hashes(
             owner,
             tokens,
             max_output_tokens,
@@ -35,6 +37,7 @@ impl RequestKvState {
             retain_local_hashes,
             emit_token_ids,
             planned_output_ids,
+            prompt_hashes,
         );
         Self {
             sequence,

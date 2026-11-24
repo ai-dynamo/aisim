@@ -1066,6 +1066,7 @@ fn lower_requests(
                     agentic: None,
                 }),
                 images: Vec::new(),
+                prompt_hashes: None,
             })
         })
         .collect::<ReplayResult<Vec<_>>>()?;

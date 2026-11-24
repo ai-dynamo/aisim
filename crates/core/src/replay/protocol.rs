@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::engine::ImageSpec;
+use crate::engine::{ImageSpec, PromptHashes};
 
 pub const AGENTIC_CONVERSATION_LINEAGE_SCHEMA_V1: &str =
     "aisimulate.agentic.conversation-lineage.v1";
@@ -150,6 +150,10 @@ pub struct DirectRequest {
     /// Image placeholders inside `tokens`; empty for text-only requests.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageSpec>,
+    /// The workload's dispatch hashes of `tokens`, for the engine that runs the
+    /// request. Never serialized.
+    #[serde(skip)]
+    pub prompt_hashes: Option<PromptHashes>,
 }
 
 fn is_zero_i32(value: &i32) -> bool {

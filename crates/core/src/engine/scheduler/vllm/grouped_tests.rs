@@ -2641,6 +2641,7 @@ fn grouped_prefix_copy_sources_leave_in_group_order_at_the_end_of_the_pass() {
                 false,
                 false,
                 None,
+                None,
             );
             probe.lease.configure_prefix_hashes(&tokens, 1088);
             core.kv_manager
@@ -3012,6 +3013,7 @@ fn waiting_probe(core: &VllmCore, id: u128, tokens: Vec<u32>) -> RequestKvState 
         true,
         false,
         false,
+        None,
         None,
     );
     probe

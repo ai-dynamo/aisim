@@ -10,6 +10,7 @@ use rustc_hash::FxHashSet;
 use uuid::Uuid;
 
 use super::ReplayMode;
+use crate::engine::PromptHashes;
 use crate::replay::ReplayTerminalStatus;
 use crate::replay::core::{
     AdmissionSource as CoreAdmissionSource, ReadyArrival, ReplayWorkloadSource,
@@ -24,6 +25,10 @@ use crate::replay::protocol::DirectRequest;
 
 #[doc(hidden)]
 pub trait ReplayAdmissionMetadata: Sized {
+    /// Whether [`Self::from_hashes`] reads its hashes. The engine takes a turn's
+    /// dispatch hashes, so admission copies them for metadata that does.
+    const READS_HASHES: bool = true;
+
     fn from_hashes(hashes: Option<ReplayRequestHashes>) -> Self;
     fn for_prefill(self) -> Self;
     fn max_output_tokens_override(&self) -> Option<usize>;
@@ -33,6 +38,8 @@ pub trait ReplayAdmissionMetadata: Sized {
 pub type NoReplayMetadata = ();
 
 impl ReplayAdmissionMetadata for () {
+    const READS_HASHES: bool = false;
+
     #[inline]
     fn from_hashes(_hashes: Option<ReplayRequestHashes>) -> Self {}
 
@@ -64,6 +71,25 @@ pub(crate) struct ReplayReadyArrival<Metadata> {
     pub(crate) replay_hashes: Option<ReplayRequestHashes>,
     pub(crate) session_id: Option<String>,
     pub(crate) turn_index: Option<usize>,
+}
+
+/// Share a turn's dispatch hashes: its request carries them to the engine, and
+/// placement metadata and replay artifacts each get a copy only if they read one.
+fn share_dispatch_hashes<Metadata: ReplayAdmissionMetadata>(
+    request: &mut ReplayRequestPayload,
+    hashes: Option<ReplayRequestHashes>,
+    engine_block_size: usize,
+    retain_artifact_hashes: bool,
+) -> (Metadata, Option<ReplayRequestHashes>) {
+    let copy_if = |read: bool| hashes.as_ref().filter(|_| read).cloned();
+    let metadata = Metadata::from_hashes(copy_if(Metadata::READS_HASHES));
+    let replay_hashes = copy_if(retain_artifact_hashes);
+    request.metadata_mut().prompt_hashes = hashes.map(|hashes| PromptHashes {
+        block_size: engine_block_size,
+        local_block_hashes: hashes.local_block_hashes,
+        sequence_hashes: hashes.sequence_hashes,
+    });
+    (metadata, replay_hashes)
 }
 
 impl<Metadata> ReplayReadyArrival<Metadata> {
@@ -565,15 +591,15 @@ impl<Metadata: ReplayAdmissionMetadata> AdmissionQueue<Metadata> {
             (ReplayMode::Trace, AdmissionSource::Workload { driver, .. }) => Ok(driver
                 .pop_ready_compact(now_ms, usize::MAX)
                 .into_iter()
-                .map(|ready| {
+                .map(|mut ready| {
                     let session_id = ready.emit_session_metadata.then_some(ready.session_id);
                     let turn_index = ready.emit_session_metadata.then_some(ready.turn_index);
-                    let replay_hashes = ready.replay_hashes;
-                    let (metadata_hashes, replay_hashes) = if retain_artifact_hashes {
-                        (replay_hashes.clone(), replay_hashes)
-                    } else {
-                        (replay_hashes, None)
-                    };
+                    let (metadata, replay_hashes) = share_dispatch_hashes(
+                        &mut ready.request,
+                        ready.replay_hashes,
+                        driver.engine_block_size(),
+                        retain_artifact_hashes,
+                    );
                     map(ReplayReadyArrival {
                         request: ready.request,
                         arrival_time_ms: ready.scheduled_ready_at_ms,
@@ -581,7 +607,7 @@ impl<Metadata: ReplayAdmissionMetadata> AdmissionQueue<Metadata> {
                         authored_request_id: ready.authored_request_id,
                         play_id: ready.play_id,
                         dispatched_at_ms: ready.dispatched_at_ms,
-                        metadata: Metadata::from_hashes(metadata_hashes),
+                        metadata,
                         replay_hashes,
                         session_id,
                         turn_index,
@@ -621,15 +647,15 @@ impl<Metadata: ReplayAdmissionMetadata> AdmissionQueue<Metadata> {
                 Ok(driver
                     .pop_ready_compact(now_ms, usize::MAX)
                     .into_iter()
-                    .map(|ready| {
+                    .map(|mut ready| {
                         let session_id = ready.emit_session_metadata.then_some(ready.session_id);
                         let turn_index = ready.emit_session_metadata.then_some(ready.turn_index);
-                        let replay_hashes = ready.replay_hashes;
-                        let (metadata_hashes, replay_hashes) = if retain_artifact_hashes {
-                            (replay_hashes.clone(), replay_hashes)
-                        } else {
-                            (replay_hashes, None)
-                        };
+                        let (metadata, replay_hashes) = share_dispatch_hashes(
+                            &mut ready.request,
+                            ready.replay_hashes,
+                            driver.engine_block_size(),
+                            retain_artifact_hashes,
+                        );
                         map(ReplayReadyArrival {
                             request: ready.request,
                             arrival_time_ms: now_ms,
@@ -637,7 +663,7 @@ impl<Metadata: ReplayAdmissionMetadata> AdmissionQueue<Metadata> {
                             authored_request_id: ready.authored_request_id,
                             play_id: ready.play_id,
                             dispatched_at_ms: ready.dispatched_at_ms,
-                            metadata: Metadata::from_hashes(metadata_hashes),
+                            metadata,
                             replay_hashes,
                             session_id,
                             turn_index,
@@ -1220,6 +1246,41 @@ mod trace_tests {
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].arrival_time_ms, 9.0);
         assert!(admission.is_drained());
+    }
+
+    #[test]
+    fn a_workload_turn_carries_its_dispatch_hashes() {
+        use crate::replay::loadgen::{SessionTrace, Trace, TurnTrace};
+
+        let trace = Trace {
+            block_size: 2,
+            sessions: vec![SessionTrace {
+                session_id: "a".into(),
+                first_arrival_timestamp_ms: Some(0.0),
+                turns: vec![TurnTrace {
+                    input_length: 5,
+                    max_output_tokens: 1,
+                    hash_ids: vec![10, 11, 12],
+                    ..Default::default()
+                }],
+            }],
+        };
+        let driver = WorkloadDriver::new_trace(trace, 2).unwrap();
+        let mut admission = AdmissionQueue::<()>::new_workload(driver, ReplayMode::Trace);
+
+        let mut ready = admission.drain_ready_compact(0.0, 0, false).unwrap();
+        let arrival = ready.pop().expect("the turn is due");
+        assert!(arrival.replay_hashes.is_none(), "no artifact reads a copy");
+        let request = arrival.request.into_direct_request();
+        let expected = ReplayRequestHashes::from_tokens(&request.tokens, 2);
+        assert_eq!(
+            request.prompt_hashes,
+            Some(PromptHashes {
+                block_size: 2,
+                local_block_hashes: expected.local_block_hashes,
+                sequence_hashes: expected.sequence_hashes,
+            })
+        );
     }
 }
 

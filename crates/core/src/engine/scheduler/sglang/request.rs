@@ -53,6 +53,9 @@ impl SglangRequest {
         kv_lease.request_id = uuid;
         kv_lease.session_id = req.session_id;
         kv_lease.reserve_completion(completion_tokens, block_size);
+        if let Some(hashes) = &req.prompt_hashes {
+            kv_lease.adopt_prompt_hashes(hashes, &sequence_tokens, block_size);
+        }
         kv_lease.ensure_page_hashes(&sequence_tokens, block_size);
 
         Self {

@@ -93,6 +93,8 @@ pub(crate) struct DirectRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageSpec>,
     pub kv_hint: Option<crate::engine::KvHintSource>,
+    #[serde(skip)]
+    pub prompt_hashes: Option<crate::engine::PromptHashes>,
 }
 
 impl DirectRequest {

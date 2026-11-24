@@ -172,6 +172,17 @@ unsalted; it inserts `None` rather than exposing salted routing through the
 older adapter. Supporting salted requests in a downstream adapter requires
 carrying the salt through its request and event conversions together.
 
+`Request::prompt_hashes` optionally carries `PromptHashes`: the block and
+sequence hashes of the prompt's complete blocks, as
+`ReplayRequestHashes::from_tokens` derives them. An engine adopts them instead
+of hashing the prompt if they are at its block size, cover every complete block
+and the request has no cache salt; otherwise it hashes the prompt itself.
+Release builds check only that shape, so the values are trusted. Replay carries
+a workload's dispatch hashes on `DirectRequest::prompt_hashes` to every engine
+that runs the request. Neither field is serialized; exhaustive `Request`
+literals use `prompt_hashes: None`, which the Dynamo compatibility builder
+inserts.
+
 Compositions consume neutral engine observations only when needed. Round-robin
 can skip KV event capture; Dynamo performs Router-specific conversion outside
 AISim core. Offline P/D decode routing is overlap-blind and does not require

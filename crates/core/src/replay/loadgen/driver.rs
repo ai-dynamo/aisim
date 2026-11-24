@@ -3010,6 +3010,7 @@ impl WorkloadDriver {
                         policy_class: turn.policy_class.clone(),
                         replay_context: replay_context.clone(),
                         images: turn.images.clone(),
+                        prompt_hashes: None,
                     };
                     deferred_request_with_hashes(
                         request_metadata,
@@ -3049,6 +3050,7 @@ impl WorkloadDriver {
                         policy_class: turn.policy_class.clone(),
                         replay_context,
                         images: turn.images.clone(),
+                        prompt_hashes: None,
                     });
                     (request, replay_hashes)
                 }
@@ -3630,6 +3632,11 @@ impl WorkloadDriver {
                 control.min(ready_session.ready_at_ms)
             }));
         }
+    }
+
+    /// Block size of every [`ReplayRequestHashes`] this driver hands out.
+    pub(crate) fn engine_block_size(&self) -> usize {
+        self.engine_block_size as usize
     }
 
     pub fn is_drained(&self) -> bool {
