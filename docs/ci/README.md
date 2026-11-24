@@ -231,6 +231,12 @@ all three substantive jobs plus its aggregate. The Fast checks are not rerun
 inside Full CI. A direct PR event and a trusted-copy push can each produce a
 separate Fast run; this preserves validation in both admission contexts.
 
+GitHub can report a completed Fast CI run before its final job's completion
+metadata is visible. Full CI waits for that metadata within the existing
+prerequisite timeout, checking the latest run and attempt again on each poll.
+It still requires every job to succeed on the exact commit; failed jobs,
+wrong-commit evidence, and incomplete evidence at the deadline block admission.
+
 
 ## Full CI
 

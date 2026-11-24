@@ -26,6 +26,10 @@ class GateError(RuntimeError):
     """The prerequisite has failed or cannot be verified."""
 
 
+class PendingJobs(GateError):
+    """The run has finished but its job completion metadata is still pending."""
+
+
 def github_api(endpoint: str) -> list[dict]:
     """Read every result page, preserving API errors as failures."""
     try:
@@ -67,11 +71,10 @@ def verify_jobs(pages: list[dict], sha: str) -> None:
     counts = Counter(job["name"] for job in jobs)
     if any(counts[name] != 1 for name in REQUIRED_JOBS):
         raise GateError("Fast CI did not execute exactly one of every required job")
-    if any(
-        job.get("head_sha") != sha or job.get("status") != "completed" or job.get("conclusion") != "success"
-        for job in jobs
-    ):
+    if any(job.get("head_sha") != sha or job.get("conclusion") not in {None, "success"} for job in jobs):
         raise GateError("Fast CI contains a failed, cancelled, skipped, incomplete, or wrong-commit job")
+    if any(job.get("status") != "completed" or job.get("conclusion") != "success" for job in jobs):
+        raise PendingJobs("Fast CI contains a failed, cancelled, skipped, incomplete, or wrong-commit job")
 
 
 def require_fast_ci(
@@ -108,17 +111,31 @@ def require_fast_ci(
                 raise GateError(f"Latest Fast CI run {run['id']} finished with {run.get('conclusion')}")
             attempt = run["run_attempt"]
             jobs_endpoint = f"repos/{repository}/actions/runs/{run['id']}/attempts/{attempt}/jobs?per_page=100"
-            verify_jobs(api(jobs_endpoint), sha)
-            # Do not accept an older success if a new run or rerun appeared
-            # while its jobs were being checked.
-            current = latest_run(api(runs_endpoint), sha, branch, event, repository)
-            if current and (current["id"], current["run_attempt"], current["status"], current.get("conclusion")) == (
-                run["id"],
-                attempt,
-                "completed",
-                "success",
-            ):
-                return run
+            try:
+                verify_jobs(api(jobs_endpoint), sha)
+            except PendingJobs:
+                # GitHub can publish a completed run before the last job's
+                # completion is visible through the attempt's jobs endpoint.
+                # Keep the original deadline and reselect the latest attempt.
+                print(
+                    f"Waiting for Fast CI job completion metadata for run {run['id']} (attempt {attempt})", flush=True
+                )
+            else:
+                # Do not accept an older success if a new run or rerun appeared
+                # while its jobs were being checked.
+                current = latest_run(api(runs_endpoint), sha, branch, event, repository)
+                if current and (
+                    current["id"],
+                    current["run_attempt"],
+                    current["status"],
+                    current.get("conclusion"),
+                ) == (
+                    run["id"],
+                    attempt,
+                    "completed",
+                    "success",
+                ):
+                    return run
         if clock() >= deadline:
             raise GateError(
                 f"No complete Fast CI evidence for {branch}@{sha} within {timeout:g}s. "
