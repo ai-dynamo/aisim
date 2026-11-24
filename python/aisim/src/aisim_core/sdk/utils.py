@@ -1735,8 +1735,10 @@ def parse_compressed_tensors_quant(
     Returns ``(base_algo, ignored_categories)`` where:
 
     - ``base_algo``: weight quantization algorithm (``"int4_wo"``, ``"int8_wo"``,
-      ``"fp8"``, ``"fp8_block"``), or ``None`` when the config carries no
-      quantization information.
+      ``"fp8"``, ``"fp8_block"``, ``"w4a16_mxfp4"``), or ``None`` when the
+      config carries no quantization information. Four-bit float weights require
+      ``mxfp4-pack-quantized`` in the group's ``format`` or the header default;
+      other or absent formats raise ``ValueError`` instead of guessing a lane.
     - ``ignored_categories``: frozenset of layer-category names excluded from
       quantization (i.e. remaining in float16/bfloat16).  Empty when nothing is
       ignored or when ``base_algo`` is ``None``.
@@ -1764,7 +1766,15 @@ def parse_compressed_tensors_quant(
                 block_structure = weights.get("block_structure")
                 base_algo = "fp8_block" if strategy == "block" or block_structure else "fp8"
             elif num_bits == 4 and "float" in w_type:
-                # MXFP4 packed weights (e.g. Kimi-K3 "mxfp4-pack-quantized"):
+                # A group's format overrides the checkpoint-wide default.
+                # Four-bit floats alone do not distinguish MXFP4 from NVFP4.
+                packed_format = group.get("format") or quantization_config.get("format")
+                if packed_format != "mxfp4-pack-quantized":
+                    raise ValueError(
+                        "4-bit float compressed-tensors weights require format "
+                        f"'mxfp4-pack-quantized'; got {packed_format!r}"
+                    )
+                # MXFP4 packed weights (e.g. Kimi-K3):
                 # W4A16 base lane; per-SM MoE kernel routing may upgrade the
                 # activation side (see operations/moe.py).
                 base_algo = "w4a16_mxfp4"

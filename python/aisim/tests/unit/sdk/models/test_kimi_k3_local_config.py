@@ -40,6 +40,7 @@ def local_kimi(tmp_path, monkeypatch):
         "linear_attn_config": {"kda_layers": [1, 3], "num_heads": 8, "head_dim": 32},
         "quantization_config": {
             "quant_method": "compressed-tensors",
+            "format": "mxfp4-pack-quantized",
             "config_groups": {"experts": {"weights": {"num_bits": 4, "type": "float"}}},
             "ignore": ["self_attn", "mlp.shared_experts", "lm_head"],
         },
@@ -131,11 +132,15 @@ def test_kimi_missing_precision_fails_and_explicit_mode_is_preserved(local_kimi,
     assert json.loads(_native.engine_spec_json_from_bincode(blob))["engine"]["moe_dtype"] == "bfloat16"
 
 
-def test_local_kimi_explicitly_unquantized_experts_keep_bfloat16(local_kimi):
+@pytest.mark.parametrize(
+    "selector",
+    ["mlp.experts", r"re:.*mlp\.experts\..*", r"re:.*mlp\.experts.*", "re:.*experts.*"],
+)
+def test_local_kimi_explicitly_unquantized_experts_keep_bfloat16(local_kimi, selector):
     from aisim.sdk.task_v2 import Task
 
     path, raw = local_kimi
-    raw["quantization_config"]["ignore"].append("mlp.experts")
+    raw["quantization_config"]["ignore"].append(selector)
     (path / "config.json").write_text(json.dumps(raw))
     blob = compile_engine(str(path), "b200_sxm", "sglang", "current")
     spec = json.loads(_native.engine_spec_json_from_bincode(blob))
@@ -144,6 +149,89 @@ def test_local_kimi_explicitly_unquantized_experts_keep_bfloat16(local_kimi):
     assert moe_ops and all(op["quant_mode"] == "bfloat16" for op in moe_ops)
     task = Task(model_path=str(path), system_name="b200_sxm", backend_name="sglang", total_gpus=1)
     assert task.build_model_config(role="agg").moe_quant_mode is common.MoEQuantMode.bfloat16
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        "model.layers.0.mlp.experts.0.down_proj",
+        "model.layers.0.mlp.experts",
+        "mlp.experts.0",
+        r"re:.*mlp\.experts\.0\..*",
+        r"re:.*mlp\.experts\..*\.down_proj",
+    ],
+)
+def test_local_kimi_partial_expert_exclusions_fail(local_kimi, selector):
+    from aisim.sdk.task_v2 import Task
+
+    path, raw = local_kimi
+    raw["quantization_config"]["ignore"].append(selector)
+    (path / "config.json").write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="partial or unrecognized routed-expert exclusions"):
+        compile_engine(str(path), "b200_sxm", "sglang", "current")
+    with pytest.raises(ValueError, match="partial or unrecognized routed-expert exclusions"):
+        Task(model_path=str(path), system_name="b200_sxm", backend_name="sglang", total_gpus=1)
+    blob = compile_engine(str(path), "b200_sxm", "sglang", "current", moe_quant_mode="bfloat16")
+    assert json.loads(_native.engine_spec_json_from_bincode(blob))["engine"]["moe_dtype"] == "bfloat16"
+    task = Task(
+        model_path=str(path),
+        system_name="b200_sxm",
+        backend_name="sglang",
+        total_gpus=1,
+        moe_quant_mode=common.MoEQuantMode.bfloat16,
+    )
+    assert task.build_model_config(role="agg").moe_quant_mode is common.MoEQuantMode.bfloat16
+
+
+@pytest.mark.parametrize("scope", ["root", "text_config"])
+@pytest.mark.parametrize("format_location", ["header", "group", "both", "group_override"])
+def test_local_kimi_packed_format_layouts(local_kimi, scope, format_location):
+    path, raw = local_kimi
+    quant = raw["quantization_config"]
+    if format_location != "header":
+        quant["config_groups"]["experts"]["format"] = "mxfp4-pack-quantized"
+    if format_location == "group":
+        del quant["format"]
+    elif format_location == "group_override":
+        quant["format"] = "pack-quantized"
+    if scope == "text_config":
+        raw["text_config"] = {key: raw.pop(key) for key in list(raw) if key != "architectures"}
+    (path / "config.json").write_text(json.dumps(raw))
+    loaded = utils._load_model_config_from_model_path(str(path))
+    assert utils._get_language_quantization_config(loaded) == quant
+    blob = compile_engine(str(path), "b200_sxm", "sglang", "current")
+    spec = json.loads(_native.engine_spec_json_from_bincode(blob))
+    assert spec["engine"]["moe_dtype"] == "w4a8_mxfp4_mxfp8"
+    moe_ops = [op["Moe"] for op in spec["context_ops"] + spec["generation_ops"] if "Moe" in op]
+    assert moe_ops and all(op["quant_mode"] == "w4a8_mxfp4_mxfp8" for op in moe_ops)
+
+
+@pytest.mark.parametrize("packed_format", ["nvfp4-pack-quantized", "pack-quantized", None])
+@pytest.mark.parametrize("format_location", ["header", "group_override"])
+def test_local_kimi_other_packed_formats_fail(local_kimi, packed_format, format_location):
+    from aisim.sdk.task_v2 import Task
+
+    path, raw = local_kimi
+    quant = raw["quantization_config"]
+    if format_location == "header":
+        quant["format"] = packed_format
+    else:
+        quant["config_groups"]["experts"]["format"] = packed_format
+        if packed_format is None:
+            del quant["format"]
+    (path / "config.json").write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="4-bit float.*require format 'mxfp4-pack-quantized'"):
+        compile_engine(str(path), "b200_sxm", "sglang", "current")
+    with pytest.raises(ValueError, match="4-bit float.*require format 'mxfp4-pack-quantized'"):
+        Task(model_path=str(path), system_name="b200_sxm", backend_name="sglang", total_gpus=1)
+
+
+def test_local_kimi_mxfp4_label_requires_packed_format_metadata(local_kimi):
+    path, raw = local_kimi
+    raw["quantization_config"] = {"quant_method": "mxfp4"}
+    (path / "config.json").write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="Kimi-K3 MXFP4 inference requires compressed-tensors format"):
+        compile_engine(str(path), "b200_sxm", "sglang", "current")
 
 
 def test_local_kimi_fp8_export_keeps_its_declared_precision(local_kimi):

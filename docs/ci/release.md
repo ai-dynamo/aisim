@@ -153,11 +153,28 @@ metadata in a neighboring `preprocessor_config.json`. AISim reads the neighborin
 file only when `image_processor_config` is omitted from `config.json`; do not
 set it to `null` when using that file. Parsing requires valid inline metadata or
 the neighboring file; a quantization sidecar does not replace processor metadata.
+The local `config.json` must also provide `projector_input_dim`,
+`projector_output_dim`, `vision_output_dim`, and `pixel_shuffle_ratio` in
+`vision_config`, alongside the tower dimensions. Supply these checkpoint-specific
+values explicitly if they are absent from the upstream configuration; processor
+metadata does not supply them. Parsing fails when any is missing. The projector
+dimensions must be positive integers, `projector_output_dim` must equal
+`vision_output_dim`, and `pixel_shuffle_ratio` must have an integral reciprocal
+whose square times `hidden_size` equals `intermediate_size`.
 
 Local Kimi-K3 configurations on Blackwell SGLang select the MXFP4/MXFP8 MoE
 profile from their architecture and expert quantization metadata, just like
 the Hugging Face checkpoint. Missing expert quantization metadata requires an
 explicit `moe_quant_mode`; the directory name does not establish precision.
+For compressed-tensors 4-bit float weights, the effective config-group `format`
+(falling back to the quantization header's `format`) must be
+`mxfp4-pack-quantized`; other or missing formats fail rather than selecting an
+MXFP4 profile. This metadata may live under `text_config.quantization_config`.
+Whole-expert exclusions (`mlp.experts`, `re:.*mlp\.experts\..*`,
+`re:.*mlp\.experts.*`, or `re:.*experts.*` in `ignore`) select BF16 MoE.
+Partial or unrecognized routed-expert exclusions require an explicit
+`moe_quant_mode`: AISim cannot infer a uniform precision from them and raises
+`ValueError` rather than silently modeling all experts as BF16.
 For `nvidia/Llama-3.1-70B-Instruct-FP8`, quantization must be declared inline
 or supplied in `hf_quant_config.json`. Local copies retaining that ID in
 `_name_or_path` receive the same validation. The upstream `config.json` instead

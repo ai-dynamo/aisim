@@ -2284,7 +2284,11 @@ class TestQwen3VLVisionEncoderParsing:
 
 
 @pytest.mark.parametrize("layout", ["inline", "neighbor", "missing"])
-def test_local_llama4_processor_layouts(tmp_path, layout):
+@pytest.mark.parametrize(
+    "missing_vision_field",
+    [None, "projector_input_dim", "projector_output_dim", "vision_output_dim", "pixel_shuffle_ratio"],
+)
+def test_local_llama4_processor_layouts(tmp_path, layout, missing_vision_field):
     # Independently authored miniature geometry tests local metadata loading,
     # without depending on the excluded Scout or Maverick bundled configs.
     raw = {
@@ -2317,8 +2321,13 @@ def test_local_llama4_processor_layouts(tmp_path, layout):
         raw["image_processor_config"] = processor
     elif layout == "neighbor":
         (tmp_path / "preprocessor_config.json").write_text(json.dumps(processor))
+    if missing_vision_field:
+        del raw["vision_config"][missing_vision_field]
     (tmp_path / "config.json").write_text(json.dumps(raw))
-    if layout == "missing":
+    if missing_vision_field:
+        with pytest.raises(ValueError, match=f"vision_config is missing required fields: {missing_vision_field}"):
+            get_model_config_from_model_path(str(tmp_path))
+    elif layout == "missing":
         with pytest.raises(TypeError, match="image_processor_config.*preprocessor_config.json"):
             get_model_config_from_model_path(str(tmp_path))
     else:

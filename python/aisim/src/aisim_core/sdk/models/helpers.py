@@ -1190,10 +1190,23 @@ def resolve_kimi_k3_moe_arch_mode(
         return None
     mode = _infer_quant_modes_from_raw_config(raw, architecture).get("moe_quant_mode")
     if mode is None and raw.get("quant_algo") == "compressed-tensors":
-        _, ignored = parse_compressed_tensors_quant(_get_language_quantization_config(raw))
+        quant_cfg = _get_language_quantization_config(raw) or {}
+        _, ignored = parse_compressed_tensors_quant(quant_cfg)
         if "routing_experts" in ignored:
-            # Explicitly unquantized experts have precision metadata even
-            # though quantized-mode inference intentionally leaves them unset.
+            # Categories detect mentions, not coverage. Only these whole-expert
+            # selectors establish uniform BF16 without expanding every layer,
+            # expert and projection or attempting general regex containment.
+            whole_expert_selectors = {
+                "mlp.experts",
+                r"re:.*mlp\.experts\..*",
+                r"re:.*mlp\.experts.*",
+                "re:.*experts.*",
+            }
+            if not any(pattern in whole_expert_selectors for pattern in quant_cfg.get("ignore") or []):
+                raise ValueError(
+                    "Kimi-K3 cannot infer uniform precision from partial or unrecognized routed-expert "
+                    "exclusions; use a whole-expert selector (mlp.experts) or an explicit moe_quant_mode"
+                )
             return common.MoEQuantMode.bfloat16
     if mode is None:
         raise ValueError(
@@ -1201,6 +1214,8 @@ def resolve_kimi_k3_moe_arch_mode(
             "config.json or hf_quant_config.json, or an explicit moe_quant_mode"
         )
     if mode == common.MoEQuantMode.w4a16_mxfp4:
+        if raw.get("quant_algo") != "compressed-tensors":
+            raise ValueError("Kimi-K3 MXFP4 inference requires compressed-tensors format 'mxfp4-pack-quantized'")
         return common.MoEQuantMode.w4a8_mxfp4_mxfp8
     return None
 
