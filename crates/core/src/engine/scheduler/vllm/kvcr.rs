@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 use super::g3_offload::HeldPrefix;
 use super::host_offload::{MAX_RESTORE_ROUNDS_WITHOUT_PROGRESS, RestoreRounds};
-use super::kvcr_g3::{Deposit, G3, PrefixTouch, Spill};
+use super::kvcr_g3::{Deposit, G3, HeldPlaces, PrefixTouch, Spill};
 use crate::engine::host_offload::{
     EvictionCursor, ExternalPlan, HostBlockKey, HostBlockMeta, HostEviction, HostLink, HostPolicy,
     HostTier, HostTierConfig, HostTierHandle, KvcrOrigin, Lookup, ReversedTouch, TransferId,
@@ -159,6 +159,8 @@ pub(super) struct StorePrefix {
     touched: usize,
     /// The disk ranking of the last completed copy of this prefix.
     disk_touch: Option<PrefixTouch>,
+    /// The blocks KVCR held when a store last aligned them for disk.
+    disk_held: HeldPlaces,
 }
 
 pub(super) type SharedStorePrefix = Arc<Mutex<StorePrefix>>;
@@ -280,8 +282,9 @@ impl LocalG2 {
                 break;
             };
             if now < deposit.deadline {
-                let key = (deposit.waiting.front()).expect("a queued deposit has a waiting block");
-                let (key, owner, deadline) = (*key, deposit.owner, deposit.deadline);
+                let block =
+                    (deposit.waiting.front()).expect("a queued deposit has a waiting block");
+                let ((key, place), owner, deadline) = (*block, deposit.owner, deposit.deadline);
                 let absent = tier.lookup(key) == Lookup::Miss;
                 // A deposit evicts neither its own blocks nor one a peer reads.
                 let kept =
@@ -302,7 +305,7 @@ impl LocalG2 {
                     let store = deposit.store;
                     // G2 has held the block since its store completed.
                     let meta = g2.meta(key);
-                    g3.enter_memory(key, meta);
+                    g3.enter_memory(key, place, meta);
                     let meta = meta.map(|meta| vec![meta.clone()]);
                     let reservation = tier.reserve_planned(LOCAL_G2_CLIENT, owner, plan, meta, now);
                     let last = fills.back().map_or(now, |copy| copy.ends.max(now));
@@ -377,7 +380,8 @@ impl LocalG2 {
                 if deposit.copied {
                     prefix.rerank(&mut tier, len);
                 }
-                g3.align(&prefix.keys[..len]);
+                let prefix = &mut *prefix;
+                g3.align(&prefix.keys, len, &mut prefix.disk_held);
             }
         }
     }
@@ -1009,11 +1013,16 @@ impl VllmKvcrAdapter {
         let mut registry = self.registry.lock().unwrap();
         let mut tier = local.tier.lock();
         let disk = local.g3.is_some();
+        // With disk, the place of each block in its request's keys, which
+        // the disk ranks of the requests sharing the block go by.
+        let places = (rerank.as_ref().filter(|_| disk))
+            .and_then(|(prefix, len)| places(&prefix.lock().unwrap().keys[..*len], keys));
         let mut waiting = VecDeque::new();
         let (mut plan, mut dropped) = (None::<ExternalPlan>, 0);
         let mut full = false;
-        for key in keys.iter().copied() {
+        for (index, key) in keys.iter().copied().enumerate() {
             if tier.lookup(key) == Lookup::Miss {
+                let place = places.as_ref().map(|places| places[index]);
                 if !full {
                     // A deposit evicts neither its own blocks nor one a peer
                     // reads. With disk it takes free slots only.
@@ -1022,11 +1031,11 @@ impl VllmKvcrAdapter {
                     let read = |key| registry.reads_local(self.rank, key);
                     full = !tier.plan_reserve_unless(plan, key, read);
                 }
-                if full && disk {
+                match &mut local.g3 {
                     // The block waits for a write to free a slot.
-                    waiting.push_back(key);
-                } else {
-                    dropped += u64::from(full);
+                    Some(_) if full => waiting.push_back((key, place)),
+                    Some(g3) => g3.enter_memory(key, place, g2.meta(key)),
+                    None => dropped += u64::from(full),
                 }
             }
         }
@@ -1042,11 +1051,6 @@ impl VllmKvcrAdapter {
         if let Some(plan) = plan.filter(|plan| !plan.reserved().is_empty()) {
             let blocks = plan.reserved().len();
             evicted = plan.victims().len();
-            if let Some(g3) = &mut local.g3 {
-                for key in plan.reserved() {
-                    g3.enter_memory(*key, g2.meta(*key));
-                }
-            }
             // The router identities G2 keeps while the rank publishes.
             let meta = (plan.reserved().iter())
                 .map(|key| g2.meta(*key).cloned())
@@ -1076,7 +1080,8 @@ impl VllmKvcrAdapter {
             let mut prefix = prefix.lock().unwrap();
             prefix.rerank(&mut tier, len);
             if let Some(g3) = &mut local.g3 {
-                g3.align(&prefix.keys[..len]);
+                let prefix = &mut *prefix;
+                g3.align(&prefix.keys, len, &mut prefix.disk_held);
             }
         }
         drop(tier);
@@ -1211,9 +1216,9 @@ impl VllmKvcrAdapter {
     ) {
         if let Some(local) = (self.local.as_mut()).filter(|local| local.lru && !keys.is_empty()) {
             let mut tier = local.tier.lock();
-            match shared {
-                Some(shared) => {
-                    let mut prefix = shared.lock().unwrap();
+            let mut prefix = shared.map(|shared| shared.lock().unwrap());
+            match &mut prefix {
+                Some(prefix) => {
                     prefix.extend(keys);
                     prefix.rerank(&mut tier, keys.len());
                 }
@@ -1221,7 +1226,10 @@ impl VllmKvcrAdapter {
             }
             // The finish ranks every block again, whoever ranked it last.
             if let Some(g3) = &mut local.g3 {
-                g3.touch(keys);
+                match prefix.as_deref_mut() {
+                    Some(prefix) => g3.touch(&prefix.keys, keys.len(), &mut prefix.disk_held),
+                    None => g3.touch(keys, keys.len(), &mut HeldPlaces::default()),
+                }
             }
         }
     }
@@ -1315,6 +1323,18 @@ fn rerank_prefix(tier: &mut HostTier, g3: Option<&mut G3>, prefix: Option<Rerank
             g3.touch_prefix(&keys[..len], disk_touch);
         }
     }
+}
+
+/// Where the request's `prefix` has each of a store's `keys`, which it has in
+/// that order up to its last block. `None` if it lacks one.
+fn places(prefix: &[HostBlockKey], keys: &[HostBlockKey]) -> Option<Vec<usize>> {
+    let mut places = vec![prefix.len(); keys.len()];
+    let mut end = prefix.len();
+    for (place, key) in places.iter_mut().zip(keys).rev() {
+        end = prefix[..end].iter().rposition(|other| other == key)?;
+        *place = end;
+    }
+    Some(places)
 }
 
 /// Milliseconds `bytes` take at `gbps` decimal GB/s; zero is unlimited.
@@ -2857,6 +2877,48 @@ mod tests {
                 adapter.local.as_ref().unwrap().tier.lock().lookup(*key) == Lookup::Hit
             }));
         }
+    }
+
+    #[test]
+    fn stores_that_wait_for_disk_probe_each_prompt_block_once() {
+        // Two blocks of KVCR memory; a write takes 1 ms and copies none.
+        let g3 = KvcrG3Config {
+            latency_to_first_byte_ms: 0.0,
+            write_bandwidth_gbps: 1.0,
+            ..KvcrG3Config::new(8)
+        };
+        let f = Fixture::with_g3(2, KvcrLocalG2Policy::Lru, 0.0, g3);
+        let (mut adapter, g2) = (f.adapter(), f.target.lock());
+        let keys = f.keys(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        // The request's G2 stores start before the first one is copied.
+        let (stores, mut request) = ([0..2, 2..5, 5..8, 4..5], None);
+        for (store, blocks) in stores.iter().enumerate() {
+            let store = TransferId::new(store as u64);
+            adapter.expect_store(store, &mut request, &keys[..blocks.end]);
+        }
+        for (store, blocks) in stores.into_iter().enumerate() {
+            let (store, now) = (TransferId::new(store as u64), 3.0 * store as f64);
+            adapter.store_local(&g2, f.owner, store, &keys[blocks], now);
+            // The second and third stores each write two blocks of the one
+            // before to disk for their first two. Their last finds no room,
+            // so the store ends without a copy and aligns the request's
+            // blocks. The fourth brings block 4 back, at a place those
+            // alignments cover.
+            adapter.advance_g3(&g2, now + 1.0);
+            adapter.advance_g3(&g2, now + 2.0);
+        }
+        adapter.align_local(request.as_ref(), &keys);
+        let held = [0, 1, 2, 3, 4, 5, 6].map(|key| kvcr_holds(&adapter, key));
+        assert_eq!(held[4].0, Lookup::Hit);
+        assert_eq!(
+            held.map(|(_, on_disk)| on_disk),
+            [true, true, true, true, false, false, true]
+        );
+        // Each alignment looks up only the keys no earlier one reached. For
+        // the others, and at the finish, the blocks that entered since are
+        // found at their places.
+        let g3 = adapter.local.as_ref().unwrap().g3.as_ref().unwrap();
+        assert_eq!(g3.probed_keys(), keys.len());
     }
 
     #[test]

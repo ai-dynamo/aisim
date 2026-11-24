@@ -23,12 +23,23 @@ from pathlib import Path
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DATA_ROOT = REPO_ROOT / "src" / "aisim_core" / "systems" / "data"
+# Set (tests, experiments) to sample a specific ``<systems root>/data`` tree. By default the gate samples the
+# systems root the SDK itself reads: AICONFIGURATOR_SYSTEMS_PATH, else the root composed from the pinned dataset.
+DATA_ROOT: Path | None = None
 MODEL_CONFIG_DIR = REPO_ROOT / "src" / "aisim_core" / "model_configs"
 
 # Non-engine data dirs living next to backend dirs in the data tree.
 NON_ENGINE_BACKENDS = {"nccl", "oneccl"}
 METADATA_FILES = {"SHARED_LAYER_REUSE.txt", "INCOMPLETE.txt", "reuse.yaml", "collection_meta.yaml"}
+
+
+def data_root() -> Path:
+    """``<systems root>/data`` for the revision under test; composes the pinned dataset on first use."""
+    if DATA_ROOT is not None:
+        return DATA_ROOT
+    from tools.perf_database.op_data_root import op_data_root
+
+    return op_data_root()
 
 
 def _dir_is_incomplete(path: str) -> bool:
@@ -168,7 +179,7 @@ def _version_dirs(system: str, backend: str) -> list[str]:
     """Data-carrying version dirs for (system, backend), merged across every
     family dir that contributes to that backend (e.g. gemm/vllm and moe/vllm
     both feed the "vllm" backend)."""
-    sys_dir = DATA_ROOT / system
+    sys_dir = data_root() / system
     if not sys_dir.is_dir():
         return []
     versions: set[str] = set()
@@ -202,11 +213,12 @@ def enumerate_combos(
     from aisim.sdk.perf_database import get_latest_database_version
 
     combos: list[Combo] = []
-    for system in sorted(os.listdir(DATA_ROOT)):
+    root = data_root()
+    for system in sorted(os.listdir(root)):
         if systems and system not in systems:
             continue
-        sys_dir = DATA_ROOT / system
-        if not sys_dir.is_dir() or not (DATA_ROOT.parent / f"{system}.yaml").exists():
+        sys_dir = root / system
+        if not sys_dir.is_dir() or not (root.parent / f"{system}.yaml").exists():
             continue
         for backend in sorted({b for b, _ in _iter_backend_dirs(sys_dir)}):
             if backends and backend not in backends:
