@@ -7,15 +7,16 @@
 """MoE cells of an SGLang self-benchmark collection, seen from the host.
 
 One packaged MoE model is planned on one and two GPUs through the functions of the entry point, with the TEP
-preset or with the default preset, which also plans the DEP cell of two data-parallel ranks. Its capability,
-the memory estimate of each topology and its backend policy are therefore the ones a user gets. The cells are
-rendered by the real Generator and the real cell builder, a cluster double leaves the files of a launcher run,
-and the real validator, gate, row builder and table writer read them.
+preset or with the default preset, which also plans the DEP cell of two data-parallel ranks and the pure TP
+cell of two tensor-parallel ranks. Its capability, the memory estimate of each topology and its backend policy
+are therefore the ones a user gets. The cells are rendered by the real Generator and the real cell builder, a
+cluster double leaves the files of a launcher run, and the real validator, gate, row builder and table writer
+read them.
 
 No SGLang, no GPU and no cluster are involved, and a fixture counts every attempt to open a network
 connection. Every result file is a FAKE of ``test_fpm_sglbench_artifact.py``: its times were typed in and
-never measured, and the dataset it names was never read. That holds for the two rank files of a DEP cell too:
-no launcher run with DP attention produced them.
+never measured, and the dataset it names was never read. That holds for the two rank files of a DEP cell and
+for the file of a pure TP cell too: no launcher run with DP attention or with pure TP produced them.
 """
 
 from __future__ import annotations
@@ -152,7 +153,7 @@ def _arguments(*extra: str, label: str = LABEL_WITH_TABLES, presets: tuple[str, 
     """What a user passes to ``python -m collector.fpm_forward`` for the MoE cells of one and two GPUs.
 
     ``presets`` are the values of ``--fpm-parallel-presets``. Without one the option is left out and the
-    default preset applies, which plans the one-GPU cell, the DEP cell and the TEP cell.
+    default preset applies, which plans the one-GPU cell, the DEP cell, the pure TP cell and the TEP cell.
     """
     return [
         *("--backend", "sglang", "--model-path", MODEL, "--gpu", SYSTEM),
@@ -259,12 +260,13 @@ def test_the_entry_point_freezes_a_moe_plan_with_a_single_and_a_tep_cell(monkeyp
         LABEL_WITH_TABLES,
         POD_SGLANG_VERSION,
     )
-    # The capability of the packaged config: a MoE model, for which this backend plans no pure TP.
+    # The capability of the packaged config: a MoE model, for which this backend plans pure TP too. The TEP
+    # preset of this plan leaves the pure TP cell out.
     capability = printed["capability"]
     assert (capability["architecture"], capability["is_moe"], capability["allow_pure_tp"]) == (
         "Qwen3MoeForCausalLM",
         True,
-        False,
+        True,
     )
     assert capability["model_config"]["source_kind"] == "aic_cache"
     # One cell per phase and GPU count: the one-GPU cell is "single", the two-GPU cell is "tep" with one
@@ -315,7 +317,7 @@ def test_a_data_label_without_packaged_tables_leaves_the_estimate_unknown_and_th
     assert plan.sha256 != _resolved()[0].sha256
 
 
-def test_the_default_preset_of_the_moe_model_plans_a_single_a_dep_and_a_tep_cell(monkeypatch, capsys):
+def test_the_default_preset_of_the_moe_model_plans_a_single_a_dep_a_pure_tp_and_a_tep_cell(monkeypatch, capsys):
     monkeypatch.setenv("COLLECTOR_MODEL_PATH", MODEL)
     arguments = _arguments("--plan-only", presets=())
     assert "--fpm-parallel-presets" not in arguments
@@ -324,10 +326,12 @@ def test_the_default_preset_of_the_moe_model_plans_a_single_a_dep_and_a_tep_cell
 
     printed = json.loads(capsys.readouterr().out)
     # Per phase: the one-GPU cell, then on two GPUs the DEP cell (one GPU and one expert-parallel rank per
-    # data-parallel rank) and the TEP cell.
+    # data-parallel rank), the pure TP cell (a slice of every expert on each tensor-parallel rank) and the TEP
+    # cell (one expert-parallel rank per tensor-parallel rank).
     per_phase = [
         ("single", {"tp": 1, "pp": 1, "dp": 1, "moe_tp": 1, "moe_ep": 1, "cp": 1}),
         ("dep", {"tp": 1, "pp": 1, "dp": 2, "moe_tp": 1, "moe_ep": 2, "cp": 1}),
+        ("pure_tp", {"tp": 2, "pp": 1, "dp": 1, "moe_tp": 2, "moe_ep": 1, "cp": 1}),
         ("tep", {"tp": 2, "pp": 1, "dp": 1, "moe_tp": 1, "moe_ep": 2, "cp": 1}),
     ]
     assert [(cell["workload_kind"], cell["parallel_strategy"], cell["topology"]) for cell in printed["cells"]] == [
@@ -336,28 +340,55 @@ def test_the_default_preset_of_the_moe_model_plans_a_single_a_dep_and_a_tep_cell
     assert [(topology["strategy"], topology["dp"]) for topology in printed["topologies"]] == [
         ("single", 1),
         ("dep", 2),
+        ("pure_tp", 1),
         ("tep", 1),
     ]
-    # Memory admission estimated the three topologies for this backend and found each below the capacity of one
-    # GPU. A rank of either two-GPU cell holds half of the experts, so it needs less than the one-GPU cell.
+    # Memory admission estimated the four topologies for this backend and found each below the capacity of one
+    # GPU. A rank of each two-GPU cell holds half of the expert weights, as half of the experts or as half of
+    # every expert, so it needs less than the one-GPU cell.
     admission = printed["topology_memory_admission"]
     assert [(decision["topology"]["dp"], decision["disposition"]) for decision in admission] == [
         (1, "admitted"),
         (2, "admitted"),
         (1, "admitted"),
+        (1, "admitted"),
     ]
-    single, dep, tep = (decision["estimates"][0] for decision in admission)
-    for two_gpu_cell in (dep, tep):
+    single, dep, pure_tp, tep = (decision["estimates"][0] for decision in admission)
+    for two_gpu_cell in (dep, pure_tp, tep):
         assert 0 < two_gpu_cell["estimated_non_kv_bytes"] < single["estimated_non_kv_bytes"]
     assert single["estimated_non_kv_bytes"] < single["gpu_capacity_bytes"]
     assert (printed["counts"]["memory_rejected_topologies"], printed["counts"]["memory_unknown_topologies"]) == (0, 0)
     identity = saved_plan_identity(printed)
-    assert (identity.backend, identity.sha256, len(identity.cells)) == ("sglang", printed["sha256"], 6)
+    assert (identity.backend, identity.sha256, len(identity.cells)) == ("sglang", printed["sha256"], 8)
     # The one-GPU and the TEP cells are the cells of the plan with the TEP preset.
     tep_plan, _overrides = _resolved()
     assert {cell.cell_id for cell in tep_plan.cells} == {
-        cell["cell_id"] for cell in printed["cells"] if cell["parallel_strategy"] != "dep"
+        cell["cell_id"] for cell in printed["cells"] if cell["parallel_strategy"] in ("single", "tep")
     }
+
+
+def test_the_pure_tp_preset_and_the_tep_and_dep_presets_share_out_the_cells_of_the_default_preset():
+    default_plan, _overrides = _resolved(presets=())
+
+    def cells_of_the_default_plan(*strategies: str) -> list:
+        return [cell for cell in default_plan.cells if cell.parallel_strategy in strategies]
+
+    # --fpm-parallel-presets pure_tp: the one-GPU cell and the pure TP cell of each phase.
+    pure_tp_plan, _overrides = _resolved(presets=("pure_tp",))
+    assert [(cell.workload_kind, cell.parallel_strategy) for cell in pure_tp_plan.cells] == [
+        (phase, strategy) for phase in ("prefill", "decode") for strategy in ("single", "pure_tp")
+    ]
+    assert list(pure_tp_plan.cells) == cells_of_the_default_plan("single", "pure_tp")
+    # --fpm-parallel-presets tep dep: every other cell, which is what the default preset planned before pure TP
+    # was admitted for this backend.
+    tep_and_dep_plan, _overrides = _resolved(presets=("tep", "dep"))
+    assert [(cell.workload_kind, cell.parallel_strategy) for cell in tep_and_dep_plan.cells] == [
+        (phase, strategy) for phase in ("prefill", "decode") for strategy in ("single", "dep", "tep")
+    ]
+    assert list(tep_and_dep_plan.cells) == cells_of_the_default_plan("single", "dep", "tep")
+    # The cells are the same cells under each choice of presets, with the same ids, and each choice is another
+    # plan.
+    assert len({default_plan.sha256, pure_tp_plan.sha256, tep_and_dep_plan.sha256}) == 3
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -465,6 +496,101 @@ def test_the_single_moe_decode_cell_and_the_tep_prefill_cell_give_rows_with_thei
             (row["parallel_strategy"], row["tp"], row["dp"], row["moe_tp"], row["moe_ep"], row["kv_seed_regime"])
             for row in rows
         } == {(strategy, tp, 1, 1, moe_ep, regime)}
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_a_pure_tp_result_with_one_expert_parallel_rank_is_accepted_and_gives_pure_tp_rows(tmp_path, phase):
+    plan, _overrides = _resolved(presets=())
+    cell = _cell(plan, phase, "pure_tp")
+    assert cell.topology == ParallelTopology(tp=2, pp=1, dp=1, moe_tp=2, moe_ep=1, cp=1)
+    # The strategy for which the validator demands an eligible kvwarm block of a decode cell.
+    assert cell.parallel_strategy in KVWARM_STRATEGIES
+    (payload,) = _launcher_files(cell)
+    # Two tensor-parallel ranks, one file set. The sizes SGLang resolves for a command with --tp-size 2 and no
+    # --ep-size: both ranks, one expert-parallel rank, which is its default, and one attention-DP rank.
+    assert (payload["dp"]["rank"], payload["dp"]["size"]) == (0, 1)
+    producer = payload["producer"]
+    assert (producer["tp_size"], producer["moe"]["ep_size"], producer["attn_dp_size"]) == (2, 1, 1)
+    assert (producer["staging"], "dp_attention" in producer) == ("one_batch_call", False)
+    cell_dir = tmp_path / cell.cell_id
+
+    written = _collected(cell_dir, plan, cell, [payload])
+
+    # The validator accepts the file set, and the gate accepts the same files.
+    points = _points(phase)
+    collection = _validate(plan, cell, cell_dir)
+    assert collection.backend_version == POD_SGLANG_VERSION
+    assert [measurement.point for measurement in collection.points] == points
+    assert [measurement.kv_seed_regime for measurement in collection.points] == EXPECTED_REGIMES[phase]
+    assert collection.kvwarm_meta == ({**EXPECTED_KVWARM, "dataset": FAKE_DATASET} if phase == "decode" else None)
+    gate = _gate(written["rank_files"], phase)
+    assert gate.returncode == GATE_ACCEPT, gate.stderr
+
+    rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+
+    assert len(rows) == len(points)
+    for row, point in zip(rows, points, strict=True):
+        # The labels of the cell: pure TP on two GPUs, where moe_tp is the tensor-parallel size and there is one
+        # expert-parallel rank. The TEP rows of the same GPUs differ from these in the two expert sizes.
+        assert (row["parallel_strategy"], row["tp"], row["pp"], row["dp"], row["moe_tp"], row["moe_ep"], row["cp"]) == (
+            "pure_tp",
+            2,
+            1,
+            1,
+            2,
+            1,
+            1,
+        )
+        # A decode row is real cached state, and a prefill row has the regime of every other MoE prefill row.
+        assert row["kv_seed_regime"] == ("real_kv" if phase == "decode" else "n/a")
+        assert (row["backend"], row["runtime_backend_version"], row["backend_version"]) == (
+            "sglang",
+            POD_SGLANG_VERSION,
+            LABEL_WITH_TABLES,
+        )
+        assert (row["model_path"], row["cell_id"], row["source_plan_sha256"]) == (MODEL, cell.cell_id, plan.sha256)
+        assert (row["workload_kind"], row["batch_size"]) == (phase, point["batch_size"])
+        assert (row["total_prefill_tokens"], row["total_kv_read_tokens"]) == (
+            point["total_prefill_tokens"],
+            point["total_kv_read_tokens"],
+        )
+        # The engine decided the four backend identity columns, as for every other cell of this backend.
+        assert (row["moe_backend"], row["attention_backend"], row["enable_wideep"], row["enable_eplb"]) == (
+            "auto",
+            "auto",
+            False,
+            False,
+        )
+    assert len({row["latency_ms"] for row in rows}) == len(rows)
+
+    # What the runner keeps in the checkpoint of the cell: the points, and one rank file.
+    summary = runner._runtime_collection_summary(cell, cell_dir / "raw", backend="sglang", is_moe=plan_is_moe(plan))
+    assert summary["measured_point_count"] == len(points)
+    assert runner._runtime_timing_summary(cell_dir / "raw")["runtime_rank_count"] == 1
+    if phase == "decode":
+        assert summary["native_kv_seed_regime_counts"] == {"real_kv": len(rows)}
+        assert summary["native_kvwarm"]["dataset"] == FAKE_DATASET
+
+
+def test_the_result_of_a_tep_cell_is_no_result_of_the_pure_tp_cell_of_the_same_gpus_and_the_reverse(tmp_path):
+    plan, _overrides = _resolved(presets=())
+    tep, pure_tp = _cell(plan, "decode", "tep"), _cell(plan, "decode", "pure_tp")
+    # Both cells have two tensor-parallel ranks and one data-parallel rank, so a pod of either leaves one rank
+    # file. Of what a file records, only the expert-parallel size says which layout ran.
+    assert (tep.topology.tp, tep.topology.dp) == (pure_tp.topology.tp, pure_tp.topology.dp) == (2, 1)
+    for ran, other, found_ep in ((tep, pure_tp, "2"), (pure_tp, tep, "1")):
+        root = tmp_path / ran.parallel_strategy
+        written = _collected(root, plan, ran, _launcher_files(ran))
+        # The other cell of the same GPUs, under the id of the cell that ran.
+        as_the_other = dataclasses.replace(ran, parallel_strategy=other.parallel_strategy, topology=other.topology)
+
+        assert len(_validate(plan, ran, root).points) == len(_points("decode"))
+        with pytest.raises(ValueError) as refused:
+            _validate(plan, as_the_other, root)
+
+        assert str(refused.value) == (
+            _not_the_layout(2, other.topology.moe_ep, "2", found_ep) + written["rank_files"][0]
+        )
 
 
 def test_a_tep_decode_result_without_an_eligible_kvwarm_block_is_refused(tmp_path):
@@ -698,7 +824,8 @@ DIFFERS_FROM_THE_CELL = {
     ),
     # Text was asked for by name in such a pod: the content is text, and no layout was recorded.
     "text-without-expert-layers": ("single", _no_expert_layers_found, _not_the_layout(1, 1, "1", "None")),
-    # The command reached the pod without --ep-size: every rank holds a slice of every expert.
+    # The command reached the pod without --ep-size: every rank holds a slice of every expert. That is the layout
+    # of the pure TP cell of the same GPUs, which the launcher accepts, and it is no result of the TEP cell.
     "tep-without-the-expert-parallel-size": (
         "tep",
         lambda producer: producer["moe"].update(ep_size=1),
@@ -772,6 +899,32 @@ DIFFERS_FROM_THE_CELL = {
     "dep-run-as-the-one-gpu-cell": ("dep", _sizes(1, 1, 1), _dep_refusal("1", "1", "1")),
     "dep-with-attention-tp-inside-a-rank": ("dep", _sizes(4, 4, 2), _dep_refusal("4", "4", "2")),
     "dep-with-a-float": ("dep", lambda producer: producer.update(attn_dp_size=2.0), _dep_refusal("2", "2", "2.0")),
+    # The pure TP cell of two GPUs, for which SGLang resolves 2, 1 and 1. The command reached the pod with the
+    # --ep-size of the TEP cell: one expert-parallel rank per tensor-parallel rank. The launcher accepts that
+    # layout too, so this comparison alone tells the two cells apart.
+    "pure-tp-run-with-the-expert-parallel-size-of-the-tep-cell": (
+        "pure_tp",
+        lambda producer: producer["moe"].update(ep_size=2),
+        _not_the_layout(2, 1, "2", "2"),
+    ),
+    "pure-tp-run-as-the-one-gpu-cell": ("pure_tp", _sizes(1, 1), _not_the_layout(2, 1, "1", "1")),
+    "pure-tp-run-on-four-ranks": ("pure_tp", _sizes(4, 1), _not_the_layout(2, 1, "4", "1")),
+    "pure-tp-with-the-sizes-of-the-dep-cell": (
+        "pure_tp",
+        _sizes(2, 2, 2),
+        _not_the_layout(2, 1, "2", "2", found_dp="2"),
+    ),
+    # A pod of the pure TP cell that found no expert layers. Its command has no --ep-size for which the launcher
+    # could refuse the run, so the pod runs it as the TP cell of a dense model: with seeded ids, or with text
+    # when text was asked for by name. The host refuses the files of both.
+    "seeded-ids-in-a-pure-tp-pod": ("pure_tp", _seeded_ids, _not_text("'seeded_token_ids'")),
+    "pure-tp-text-without-expert-layers": ("pure_tp", _no_expert_layers_found, _not_the_layout(2, 1, "2", "None")),
+    # True equals 1, the expert-parallel size this cell expects, and is no size.
+    "pure-tp-with-a-bool": (
+        "pure_tp",
+        lambda producer: producer["moe"].update(ep_size=True),
+        _not_the_layout(2, 1, "2", "True"),
+    ),
 }
 
 
@@ -779,8 +932,8 @@ DIFFERS_FROM_THE_CELL = {
 @pytest.mark.parametrize("name", list(DIFFERS_FROM_THE_CELL))
 def test_a_moe_result_that_differs_from_its_cell_is_refused(tmp_path, phase, name):
     strategy, change, message = DIFFERS_FROM_THE_CELL[name]
-    # The DEP cell is a cell of the plan with the default preset.
-    plan, _overrides = _resolved(presets=()) if strategy == "dep" else _resolved()
+    # The DEP cell and the pure TP cell are cells of the plan with the default preset.
+    plan, _overrides = _resolved(presets=()) if strategy in ("dep", "pure_tp") else _resolved()
     assert plan_is_moe(plan) is True
     cell = _cell(plan, phase, strategy)
     # One file per data-parallel rank, each with the same change.
@@ -859,6 +1012,41 @@ def test_a_producer_block_that_is_no_mapping_did_not_send_text(tmp_path, produce
         native_artifact._validate_sglang_moe_producer(_cell(plan, "decode", "tep"), producer, path)
 
     assert str(refused.value) == _not_text("None") + str(path)
+
+
+@pytest.mark.parametrize("ranks", [2, 4, 8])
+def test_the_recorded_expert_parallel_size_tells_a_pure_tp_result_from_a_tep_result_at_every_gpu_count(tmp_path, ranks):
+    # The plan of this suite ends at two GPUs, so the rule is called alone with the cells of a wider plan: the
+    # topologies the pure TP and the TEP preset give for this many GPUs.
+    plan, _overrides = _resolved(presets=())
+    pure_tp = dataclasses.replace(
+        _cell(plan, "decode", "pure_tp"),
+        topology=ParallelTopology(tp=ranks, pp=1, dp=1, moe_tp=ranks, moe_ep=1, cp=1),
+    )
+    tep = dataclasses.replace(
+        _cell(plan, "decode", "tep"), topology=ParallelTopology(tp=ranks, pp=1, dp=1, moe_tp=1, moe_ep=ranks, cp=1)
+    )
+    path = tmp_path / "benchmark.json"
+    # What a pod of each cell records: every rank in tp_size, one attention-DP rank, and the expert-parallel
+    # size of its layout, 1 for pure TP and the tensor-parallel size for TEP.
+    ran_pure_tp, ran_tep = _fake_producer(pure_tp), _fake_producer(tep)
+    assert (ran_pure_tp["tp_size"], ran_pure_tp["moe"]["ep_size"], ran_pure_tp["attn_dp_size"]) == (ranks, 1, 1)
+    assert (ran_tep["tp_size"], ran_tep["moe"]["ep_size"], ran_tep["attn_dp_size"]) == (ranks, ranks, 1)
+
+    # Each block is accepted for its own cell.
+    native_artifact._validate_sglang_moe_producer(pure_tp, ran_pure_tp, path)
+    native_artifact._validate_sglang_moe_producer(tep, ran_tep, path)
+    # Each is refused for the other cell of the same GPUs, and the refusal names the size that differs.
+    with pytest.raises(ValueError) as refused:
+        native_artifact._validate_sglang_moe_producer(pure_tp, ran_tep, path)
+    assert str(refused.value) == (
+        "native SGLang rank artifact of a MoE plan did not run the layout of its cell: "
+        f"expected producer.tp_size {ranks}, producer.moe.ep_size 1 and producer.attn_dp_size 1, "
+        f"found {ranks}, {ranks} and 1: {path}"
+    )
+    with pytest.raises(ValueError) as refused:
+        native_artifact._validate_sglang_moe_producer(tep, ran_pure_tp, path)
+    assert str(refused.value) == _not_the_layout(ranks, ranks, str(ranks), "1") + str(path)
 
 
 def test_the_text_source_the_validator_expects_is_the_one_the_content_plan_writes():
@@ -1013,10 +1201,12 @@ def test_a_moe_campaign_renders_the_expert_parallel_size_and_publishes_single_an
     assert not [name for name in published.schema.names if "dataset" in name or "content" in name]
 
 
-def test_a_campaign_of_the_default_preset_renders_the_attention_dp_size_and_publishes_dep_rows(tmp_path, monkeypatch):
+def test_a_campaign_of_the_default_preset_renders_the_sizes_of_each_layout_and_publishes_dep_and_pure_tp_rows(
+    tmp_path, monkeypatch
+):
     plan, generator_overrides = _resolved(presets=())
     assert [(cell.workload_kind, cell.parallel_strategy) for cell in plan.cells] == [
-        (phase, strategy) for phase in ("prefill", "decode") for strategy in ("single", "dep", "tep")
+        (phase, strategy) for phase in ("prefill", "decode") for strategy in ("single", "dep", "pure_tp", "tep")
     ]
     monkeypatch.setattr(runner, "KubernetesCellRunner", _fake_cluster(plan))
 
@@ -1032,13 +1222,17 @@ def test_a_campaign_of_the_default_preset_renders_the_attention_dp_size_and_publ
 
     assert errors == []
     # Each cell was rendered by the Generator and the cell builder. A DEP cell carries the three sizes SGLang
-    # takes for it, and its pod left one rank file per data-parallel rank and the merged file.
+    # takes for it, and its pod left one rank file per data-parallel rank and the merged file. A pure TP cell
+    # carries the tensor-parallel size alone, where the TEP cell of the same GPUs has the expert-parallel size
+    # after it: without --ep-size SGLang runs one expert-parallel rank, which is the pure TP layout.
     root = tmp_path / "artifacts" / plan.sha256[:16]
     expected_sizes = {
         "single": ["--tp-size", "1"],
+        "pure_tp": ["--tp-size", "2"],
         "tep": ["--tp-size", "2", "--ep-size", "2"],
         "dep": ["--tp-size", "2", "--ep-size", "2", "--attn-dp-size", "2"],
     }
+    rendered = set()
     for cell in plan.cells:
         cell_dir = root / "cells" / cell.cell_id
         (line,) = [
@@ -1050,25 +1244,32 @@ def test_a_campaign_of_the_default_preset_renders_the_attention_dp_size_and_publ
             command[command.index("--tp-size") : command.index("--kv-cache-dtype")]
             == (expected_sizes[cell.parallel_strategy])
         )
+        if cell.parallel_strategy == "pure_tp":
+            # Nowhere in the command of either phase, not only between the two flags above.
+            assert "--ep-size" not in command and "--attn-dp-size" not in command
+            rendered.add(cell.workload_kind)
         results = sorted(path.name for path in (cell_dir / "raw" / "pod-0").glob("benchmark*.json"))
         if cell.parallel_strategy == "dep":
             assert results == ["benchmark.json", "benchmark_dp1.json", "benchmark_merged.json"]
         else:
             assert results == ["benchmark.json", "benchmark_merged.json"]
+    assert rendered == {"prefill", "decode"}
     # Every cell passed. The record of a cell counts its rank files.
     checkpoint = json.loads((tmp_path / "checkpoints" / "fpm_forward.json").read_text())
     assert {record["status"] for record in checkpoint["cells"].values()} == {"passed"}
     assert {cell.parallel_strategy: checkpoint["cells"][cell.cell_id]["runtime_rank_count"] for cell in plan.cells} == {
         "single": 1,
+        "pure_tp": 1,
         "tep": 1,
         "dep": 2,
     }
     assert checkpoint["database"]["status"] == "passed"
 
-    # The table holds the rows of the six cells with their labels: a DEP row says tp 1 and dp 2.
+    # The table holds the rows of the eight cells with their labels: a DEP row says tp 1 and dp 2, and a pure
+    # TP row says moe_tp 2 and moe_ep 1 where a TEP row says moe_tp 1 and moe_ep 2.
     table = tmp_path / "systems" / SYSTEM / "sglang" / LABEL_WITH_TABLES
     rows = pq.read_table(table / "fpm_forward_perf.parquet").to_pylist()
-    assert len(rows) == 3 * (len(_points("prefill")) + len(_points("decode")))
+    assert len(rows) == 4 * (len(_points("prefill")) + len(_points("decode")))
     labels = collections.Counter(
         (
             row["workload_kind"],
@@ -1084,11 +1285,15 @@ def test_a_campaign_of_the_default_preset_renders_the_attention_dp_size_and_publ
     assert labels == {
         ("prefill", "single", 1, 1, 1, 1, "n/a"): len(_points("prefill")),
         ("prefill", "dep", 1, 2, 1, 2, "n/a"): len(_points("prefill")),
+        ("prefill", "pure_tp", 2, 1, 2, 1, "n/a"): len(_points("prefill")),
         ("prefill", "tep", 2, 1, 1, 2, "n/a"): len(_points("prefill")),
         ("decode", "single", 1, 1, 1, 1, "real_kv"): len(_points("decode")),
         ("decode", "dep", 1, 2, 1, 2, "real_kv"): len(_points("decode")),
+        ("decode", "pure_tp", 2, 1, 2, 1, "real_kv"): len(_points("decode")),
         ("decode", "tep", 2, 1, 1, 2, "real_kv"): len(_points("decode")),
     }
+    # The pure TP rows and the TEP rows of each phase carry the ids of two cells.
+    assert len({row["cell_id"] for row in rows if row["parallel_strategy"] in ("pure_tp", "tep")}) == 4
     # A DEP row carries the batch of one rank, as the points of the FAKE launcher run name it.
     dep_decode = sorted(
         (row for row in rows if (row["workload_kind"], row["parallel_strategy"]) == ("decode", "dep")),

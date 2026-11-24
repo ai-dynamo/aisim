@@ -4,9 +4,10 @@
 """Tests of ``sglang_fpm_builder.py``, the cell builder of the SGLang self-benchmark. No SGLang, no GPU, no pod.
 
 Every cell is rendered by the real ``runner._render_cell``, so by the real Generator, from a real collection
-plan: one dense model on two GPUs, or one MoE model with the TEP or the DEP preset on one and two GPUs. The
-plan is built as a vLLM plan and turned into an SGLang plan with ``dataclasses.replace``: the tests therefore
-need neither the planner's admission of ``sglang`` nor the runner's branch that calls the builder.
+plan: one dense model on two GPUs, or one MoE model with the TEP or the DEP preset on one and two GPUs, or with
+the pure TP and the TEP preset on two. The plan is built as a vLLM plan and turned into an SGLang plan with
+``dataclasses.replace``: the tests therefore need neither the planner's admission of ``sglang`` nor the runner's
+branch that calls the builder.
 
 What is FAKE is named so: the models (configs typed in here, no checkpoint), the image name, and the
 ``python3`` that one test puts first on ``PATH`` to see how ``run.sh`` starts its command. Nothing of the
@@ -364,6 +365,49 @@ def test_moe_cell_command(tmp_path, monkeypatch, phase, strategy, expected):
     options = launcher._read_options(command[2:], environment)
     assert (options.rejection, options.output_problem, options.mode) == (None, None, phase)
     engine_arguments = MOE_ENGINE.format(sizes="2 --ep-size 2" if strategy == "tep" else "1").split()
+    assert options.sglang_argv[: len(engine_arguments)] == engine_arguments
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_pure_tp_cell_command_has_the_tensor_parallel_size_and_no_expert_parallel_size(tmp_path, monkeypatch, phase):
+    # The pure TP cell and the TEP cell of the same two GPUs, in one plan.
+    plan = _sglang_plan(
+        tmp_path,
+        monkeypatch,
+        MOE_MODEL,
+        FAKE_MOE_MODEL_CONFIG,
+        fpm_gpu_counts=[2],
+        fpm_parallel_presets=["pure_tp", "tep"],
+    )
+    cell = _cell(plan, phase, "pure_tp")
+    assert cell.topology == ParallelTopology(tp=2, pp=1, dp=1, moe_tp=2, moe_ep=1, cp=1)
+    _render_vllm(plan, cell, tmp_path / "vllm")
+
+    _render(plan, cell, tmp_path / "sglang")
+    _render(plan, _cell(plan, phase, "tep"), tmp_path / "tep")
+
+    # The pure TP cell: the tensor-parallel size above 1 and no expert-parallel size after it, so SGLang's
+    # default of one expert-parallel rank applies and every rank holds a slice of every expert. No attention-DP
+    # size is written either.
+    command = _command(tmp_path / "sglang")
+    assert command == (MOE_PREFILL if phase == "prefill" else MOE_DECODE).format(sizes="2").split()
+    assert command[command.index("--tp-size") + 1] == "2"
+    assert "--ep-size" not in command and "--attn-dp-size" not in command
+    # What was translated is the Generator's own vLLM command of the cell: the three parallel sizes, and no
+    # expert-parallel switch, because the cell has one expert-parallel rank.
+    vllm = _command(tmp_path / "vllm")
+    sizes = f"--tensor-parallel-size {cell.topology.tp} --pipeline-parallel-size 1 --data-parallel-size 1".split()
+    start = vllm.index("--tensor-parallel-size")
+    assert vllm[start : start + 6] == sizes
+    assert "--enable-expert-parallel" not in vllm
+    # The command of the TEP cell is the same command with the expert-parallel size right after --tp-size.
+    after_tp_size = command.index("--tp-size") + 2
+    assert _command(tmp_path / "tep") == [*command[:after_tp_size], "--ep-size", "2", *command[after_tp_size:]]
+    # The launcher's own reader of flags takes the command and hands the one size to SGLang's parser.
+    environment = {"DYN_BENCH_KV_WARMUP": "on", "DYN_BENCH_PREFILL_REAL_SEED": "on"}
+    options = launcher._read_options(command[2:], environment)
+    assert (options.rejection, options.output_problem, options.mode) == (None, None, phase)
+    engine_arguments = MOE_ENGINE.format(sizes="2").split()
     assert options.sglang_argv[: len(engine_arguments)] == engine_arguments
 
 
@@ -1483,7 +1527,8 @@ def test_every_row_of_the_table_in_one_command():
             "--enable-expert-parallel --benchmark-mode decode --tensor-parallel-size=8",
             "--benchmark-mode decode --tp-size 8 --ep-size 8",
         ),
-        # Without the switch no size is written, and SGLang's default of one expert-parallel rank applies.
+        # Without the switch no size is written, and SGLang's default of one expert-parallel rank applies: the
+        # sizes of a dense TP cell and of a pure TP cell.
         ("--benchmark-mode decode --tensor-parallel-size 2", "--benchmark-mode decode --tp-size 2"),
         # The command of a DEP cell. --tp-size and --ep-size count the ranks of every data-parallel rank, the
         # data-parallel size is written as the attention-DP size in the place of the vLLM flag, and the
@@ -1927,6 +1972,36 @@ def test_ep_size_and_its_serving_alias_are_one_field_at_each_tested_release(vers
         if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "ep_size"
     }
     assert defaults == {"ep_size": 1}
+
+
+@pytest.mark.parametrize("version", compat.TESTED_VERSIONS)
+def test_sglang_gives_a_rank_a_slice_of_every_expert_without_the_expert_parallel_size_at_each_tested_release(version):
+    # What the note at the expert-parallel switch says of the command of a pure TP cell, --tp-size N alone.
+    files = _sglang_field_files(version)
+    context = ast.parse((files[0].parents[2] / "runtime_context.py").read_text())
+    functions = {node.name: ast.unparse(node) for node in ast.walk(context) if isinstance(node, ast.FunctionDef)}
+    # The number of ranks one expert is cut over, from the tensor-parallel size and two sizes that divide it.
+    assert "'moe_tp_size': tp_size // moe_ep_size // moe_dp_size" in functions["derive_parallel_widths"]
+    assert "moe_ep_size=cfg.ep_size" in functions["parallel_widths_of"]
+    assert "moe_dp_size=cfg.moe_dp_size" in functions["parallel_widths_of"]
+    # Both divisors are 1 unless a flag sets them, so the width is then the tensor-parallel size: pure TP.
+    (parallel,) = [path for path in files if path.name == "parallel.py"]
+    defaults = {
+        node.target.id: ast.literal_eval(node.value)
+        for node in ast.walk(ast.parse(parallel.read_text()))
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id in ("ep_size", "moe_dp_size")
+    }
+    assert defaults == {"ep_size": 1, "moe_dp_size": 1}
+    # The builder writes the first only for vLLM's expert-parallel switch, which the command of a pure TP cell
+    # does not have, and no row of its table writes the second under either of its names.
+    assert [flag for flag, row in builder._TRANSLATION.items() if "--ep-size" in row.writes] == [
+        "--enable-expert-parallel"
+    ]
+    declared = _declared_arguments([parallel])
+    assert declared["--moe-data-parallel-size"] is declared["--moe-dp-size"]
+    assert _written_flags().isdisjoint({"--moe-dp-size", "--moe-data-parallel-size"})
 
 
 @pytest.mark.parametrize("version", compat.TESTED_VERSIONS)

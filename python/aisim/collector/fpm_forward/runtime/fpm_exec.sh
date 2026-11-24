@@ -109,12 +109,61 @@ terminate_engine() {
   wait "$pid" 2>/dev/null || true
 }
 
+# The two filters that copy the engine output are children of this script and
+# read the engine's streams from two named pipes (see the launch below). A
+# filter ends by itself once the last process that holds its stream has gone,
+# which terminate_engine has seen to for the engine's process group. Wait for
+# both, so that the engine's last lines are in the log files and in the exec
+# stream before this script ends. The wait is bounded, because a process that
+# left the engine's group can keep a stream open, and a filter that is still
+# there after it is killed: it holds this script's own output streams. A
+# filter whose pipe no engine job ever opened has read nothing and is killed
+# without a wait.
+engine_stream_dir=""
+engine_stream_drain_seconds=10
+engine_stdout_filter_pid=""
+engine_stderr_filter_pid=""
+engine_job_started=0
+drain_engine_streams() {
+  local drain_deadline=$((SECONDS + engine_stream_drain_seconds))
+  local pid
+  local noted=0
+  for pid in "$engine_stdout_filter_pid" "$engine_stderr_filter_pid"; do
+    if [[ -z "$pid" ]]; then
+      continue
+    fi
+    while kill -0 "$pid" 2>/dev/null; do
+      if (( ! engine_job_started )); then
+        kill -KILL "$pid" 2>/dev/null || true
+        break
+      fi
+      if (( SECONDS >= drain_deadline )); then
+        if (( ! noted )); then
+          echo "An engine output filter did not end within ${engine_stream_drain_seconds}s; the copies of the engine output may lack their last lines" >&2
+          noted=1
+        fi
+        kill -KILL "$pid" 2>/dev/null || true
+        break
+      fi
+      sleep 0.2 2>/dev/null || sleep 1
+    done
+    wait "$pid" 2>/dev/null || true
+  done
+  engine_stdout_filter_pid=""
+  engine_stderr_filter_pid=""
+  if [[ -n "${engine_stream_dir}" ]]; then
+    rm -rf "${engine_stream_dir}" 2>/dev/null || true
+    engine_stream_dir=""
+  fi
+}
+
 cleanup() {
   local status=$?
   trap - EXIT INT TERM
   if [[ -n "${engine_pid:-}" ]]; then
     terminate_engine "$engine_pid"
   fi
+  drain_engine_streams
   if [[ -n "${etcd_pid}" ]] && kill -0 "${etcd_pid}" 2>/dev/null; then
     kill -TERM "${etcd_pid}" 2>/dev/null || true
     wait "${etcd_pid}" 2>/dev/null || true
@@ -396,12 +445,37 @@ PY
 # keep the complete output; only the exec stream drops progress-bar lines.
 # One awk per stream writes both copies so a dead stream reader cannot
 # SIGPIPE the file writer.
+#
+# Each awk is started by this script and reads a named pipe, so it is a child
+# of this script and not of the engine. An engine that kills its own process
+# tree, as SGLang does when a scheduler process fails and again when it shuts
+# down, would otherwise kill the two filters with whatever they still held:
+# a filter started by a process substitution on the engine's command line is
+# a descendant of the engine's process.
+#
+# The two pipes are in a folder of this script alone on this node. ${workdir}
+# is no place for them: the Slurm transport mounts one folder there for every
+# node of a cell, and each node's script would make and remove the same names.
+#
+# mawk, the awk of Debian and Ubuntu images, fills its buffer from a pipe
+# before it looks for lines, so its two copies run behind the engine and are
+# complete only once the stream has ended; the wait for the filters covers
+# that. Do not give it -W interactive to read a line at a time: mawk 1.3.4
+# then cut an SGLang line of 19 KB at 4096 bytes and passed nothing on after
+# it.
 engine_stream_noise='[0-9]+%[|]|[|] *[0-9]+/[0-9]+ [[]'
 engine_stream_filter='{ print > logfile; fflush(logfile); if ($0 !~ noise) { print; fflush() } }'
-bash "${workdir}/run.sh" \
-  > >(awk -v logfile=/results/engine.stdout.log -v noise="${engine_stream_noise}" "${engine_stream_filter}") \
-  2> >(awk -v logfile=/results/engine.stderr.log -v noise="${engine_stream_noise}" "${engine_stream_filter}" >&2) &
+engine_stream_dir="$(mktemp -d "${TMPDIR:-/tmp}/fpm-engine-streams.XXXXXX")"
+mkfifo "${engine_stream_dir}/stdout" "${engine_stream_dir}/stderr"
+awk -v logfile=/results/engine.stdout.log -v noise="${engine_stream_noise}" \
+  "${engine_stream_filter}" < "${engine_stream_dir}/stdout" &
+engine_stdout_filter_pid=$!
+awk -v logfile=/results/engine.stderr.log -v noise="${engine_stream_noise}" \
+  "${engine_stream_filter}" < "${engine_stream_dir}/stderr" >&2 &
+engine_stderr_filter_pid=$!
+bash "${workdir}/run.sh" > "${engine_stream_dir}/stdout" 2> "${engine_stream_dir}/stderr" &
 engine_pid=$!
+engine_job_started=1
 
 if (( fpm_is_follower )); then
   # Headless followers never write results and normally exit only when the

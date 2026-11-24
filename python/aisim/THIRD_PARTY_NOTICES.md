@@ -2896,25 +2896,36 @@ DEP cell, and repeats the choice names of the `kv_cache_dtype` field; it imports
 `python/aisim/tests/unit/collector/test_fpm_sglbench_{preflight,gate}.py`, types no SGLang
 name: it looks up the module, class, attribute and field names that `sglbench_compat.py`
 and `sglbench_recorder.py` list in `SGLANG_SEAM_NAMES`.
+`python/aisim/collector/fpm_forward/runtime/fpm_exec.sh` takes no code. Its comments say
+that SGLang kills the process tree of its engine when a scheduler process fails and again
+when the engine shuts down. The tests `python/aisim/tests/unit/collector/test_fpm_exec.py`
+and `python/aisim/tests/unit/collector/test_fpm_sglbench_gate.py` model that with a FAKE
+engine that lists and kills its own descendants, and the second repeats the short texts of
+two SGLang log lines.
 `python/aisim/collector/fpm_forward/native_artifact.py` holds the sizes a result file
 records against its cell under SGLang's meaning of `tp_size` and `attn_dp_size`, and
-`python/aisim/collector/README.md` describes SGLang's input blocker; both name SGLang
-files in prose only.
+`python/aisim/collector/README.md` describes SGLang's input blocker, its rules on the slice
+of an expert that one rank holds and how a failed engine build ends; both name SGLang files
+in prose only, and the README quotes short texts of SGLang messages.
 
 Upstream paths, under `python/sglang/`: `__init__.py`, `launch_server.py`, `version.py`
 and, under `srt/`,
 `server_args.py`, `environ.py`, `runtime_context.py`,
 `arg_groups/{arg_utils.py,kv_cache_hook.py,memory_hook.py,model_override_base.py,moe_hook.py,overrides.py,parallel_hook.py,pipeline.py,serving_hook.py,validation_hook.py}`,
 `arg_groups/fields/{device.py,disagg.py,exec_.py,memory.py,model.py,parallel.py,schedule.py,serving.py,spec.py}`,
+`arg_groups/model_overrides/qwen3_moe.py`,
 `configs/{model_config.py,step3_vl.py}`, `entrypoints/engine.py`, `eplb/expert_location.py`,
-`layers/moe/fused_moe_triton/layer.py`,
+`layers/linear.py`, `layers/moe/{ep_moe/layer.py,fused_moe_triton/layer.py}`,
+`layers/quantization/fp8.py`,
 `managers/{data_parallel_controller.py,detokenizer_manager.py,io_struct.py,min_free_slots_delayer.py,schedule_batch.py,schedule_policy.py,scheduler.py,scheduler_input_blocker.py,tokenizer_manager.py,tp_worker.py,utils.py}`,
 `managers/async_d2h_copy_worker.py` (v0.5.23 only),
 `managers/scheduler_components/{batch_result_processor.py,dp_attn.py,ipc_channels.py,metrics_reporter.py,output_streamer.py,recv_skipper.py,request_receiver.py}`,
 `mem_cache/{common.py,kv_cache_builder.py,kv_cache_configurator.py,kv_cache_dtype.py,registry.py}`,
 `model_executor/{forward_batch_info.py,model_runner.py,pool_configurator.py}`,
+`model_executor/model_runner_components/moe_ep_setup.py`,
 `model_executor/runner/{decode_cuda_graph_runner.py,eager_runner.py,prefill_cuda_graph_runner.py}`,
-`model_loader/utils.py`, `models/{dbrx.py,glm_image_vl.py,step3_vl.py}`,
+`model_loader/{loader.py,utils.py}`,
+`models/{dbrx.py,glm_image_vl.py,minimax_m2.py,qwen3_moe.py,step3_vl.py,step3p5.py,step3p7.py}`,
 `plugins/{__init__.py,hook_registry.py}`,
 `sampling/{sampling_params.py,watermarking/core.py}` and
 `utils/{common.py,poll_based_barrier.py,watchdog.py,hf_transformers/common.py}`.
@@ -2924,6 +2935,7 @@ https://github.com/sgl-project/sglang/blob/297e54fd105e974cdf401e5b4d20253a22c16
 
 No upstream function is copied and nothing is vendored. `test_fpm_sglang_builder.py`
 holds single expressions of `handle_data_parallelism`, `handle_deprecated_dp_attention`,
-`resolve_max_num_reqs` and `derive_attn_tp_size` as strings and compares them with a
-local checkout of each release when one is given. SGLang is not a dependency of AISim:
+`resolve_max_num_reqs`, `derive_attn_tp_size`, `derive_parallel_widths` and
+`parallel_widths_of` as strings and compares them with a local checkout of each release
+when one is given. SGLang is not a dependency of AISim:
 these files run inside an SGLang container, where SGLang is already installed.

@@ -199,6 +199,16 @@ above are those of that grid. With the 2 on the axis the two cells of the defaul
 once more on 2026-11-23, with SGLang 0.5.23: 3,347 and 857 points, none staged again, and
 every batch of one request with two new tokens ran with a captured graph on both ranks.
 
+Pure TP ran on engines on 2026-11-23, on two H200 GPUs, through AISim's collector: ``Qwen/Qwen1.5-MoE-A2.7B`` with
+``--tp-size 2`` and no ``--ep-size``, for which SGLang resolved ``ep_size`` 1 and ``moe_dp_size`` 1 at both
+releases. With SGLang 0.5.23 a prefill cell and a decode cell ran with a smoke grid (7 and 4 points) and with the
+default grid (3,347 and 890 points), none staged again; with SGLang 0.5.22 the two cells ran with a smoke grid.
+Each ran to a complete result with two scheduler processes, a leader and a follower, and AISim's validator
+accepted its files with the recorded sizes ``tp_size`` 2, ``moe.ep_size`` 1 and ``attn_dp_size`` 1. The row
+``moe_dp_size`` of ``_RESOLVED_CHECKS`` was added before these runs and passed in each of them, and in a smoke
+run of the DEP and the TEP cells with SGLang 0.5.23; its refusal has run in the tests only. Not run on an
+engine: pure TP on more than two GPUs or with another model. The files are not kept in this repository.
+
 The flags, their defaults and their ``DYN_*`` variables are those of Dynamo's vLLM worker, in the files and at
 the revision the header of this file names: ``backend_args.py`` (the flag declarations and their value rules)
 and ``instrumented_scheduler.py`` (the variables the benchmark reads by itself, ``uuid4().hex`` as the run id).
@@ -1159,6 +1169,13 @@ _RESOLVED_CHECKS: tuple[tuple[str, Callable[[object], bool], str], ...] = (
     # ``Parallel``. Set, it gives the dense MLP layers a TP size of their own, and the scheduler then gathers
     # and synchronises across ranks (srt/utils/common.py ``require_attn_tp_gather`` and ``require_mlp_sync``).
     ("moe_dense_tp_size", _only(None), "moe_dense_tp_size must not be set (got {v})"),
+    # ``Parallel``. SGLang derives the widths of the expert layers from three sizes,
+    # ``moe_tp_size = tp_size // ep_size // moe_dp_size`` (srt/runtime_context.py ``derive_parallel_widths``),
+    # and the artifact records the first two. Above 1, a run with ``ep_size`` 1 would give a TP rank a wider
+    # slice of every expert than its TP size says, under the record of the pure TP layout. SGLang's resolution
+    # refuses such a value with an assert while ``attn_cp_size`` is 1 (srt/arg_groups/parallel_hook.py
+    # ``handle_context_parallelism``). An assert is gone when Python runs with ``-O``; this test is not.
+    ("moe_dp_size", _only(1), "moe_dp_size must be 1 (got {v})"),
     # ``ExecMoe``. EPLB places the experts on the ranks anew every ``eplb_rebalance_num_iterations``
     # iterations (the help text of that field), and redundant experts add copies of experts to the ranks
     # (srt/eplb/expert_location.py ``ExpertLocationMetadata._init_common``). Where an expert runs would then
@@ -1303,10 +1320,10 @@ def _check_expert_parallel(view: object, experts: dict) -> None:
     waits for. A size between the two mixes the layouts, and AISim plans no cell for it. A model without
     expert layers has nothing the flag could spread, so any size but 1 is a mistake in its command.
 
-    ``moe_dp_size`` (``Parallel``) is not tested here. Both statements above need it to be 1, and SGLang's
-    resolution sees to that: it asserts ``moe_dp_size == 1`` whenever the value differs from ``attn_cp_size``
-    (srt/arg_groups/parallel_hook.py ``handle_context_parallelism``), and ``attn_cp_size`` must be 1
-    (``_RESOLVED_CHECKS``). The assert is SGLang's and is gone when Python runs with ``-O``.
+    Both statements above need ``moe_dp_size`` (``Parallel``) to be 1, which ``_RESOLVED_CHECKS`` has tested by
+    now. An ``ep_size`` of 1 at a TP size above 1 is the pure TP cell of a model with expert layers, and an
+    ``ep_size`` equal to the TP size is its TEP cell. This function is not told which of the two the cell is:
+    the host holds the recorded size against the cell (native_artifact.py, ``_validate_sglang_moe_producer``).
     """
     ep_size, tp_size = _resolved(view, "ep_size"), _resolved(view, "tp_size")
     if _only(1)(ep_size):

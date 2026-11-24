@@ -827,17 +827,21 @@ def _require_sglang_launcher_cells(
 ) -> None:
     """Refuse every cell the SGLang launcher cannot measure.
 
-    The launcher runs one engine with one pipeline stage. It measures three layouts: a dense model under
-    tensor parallelism; a model with expert layers whose experts are spread over the tensor-parallel ranks
-    (TEP); and such a model under DP attention with one GPU per attention-DP rank and one expert-parallel rank
-    on each (DEP). Each cell of a plan gets ``execution``, one of ``topologies`` and the strategy of that
-    topology, so these arguments cover the cells before any is built.
+    The launcher runs one engine with one pipeline stage. It measures four layouts: a dense model under
+    tensor parallelism; a model with expert layers where every tensor-parallel rank holds a slice of every
+    expert (pure TP); such a model whose experts are spread over the tensor-parallel ranks (TEP); and such a
+    model under DP attention with one GPU per attention-DP rank and one expert-parallel rank on each (DEP).
+    Each cell of a plan gets ``execution``, one of ``topologies`` and the strategy of that topology, so these
+    arguments cover the cells before any is built.
 
     What ran (the collector README, "DEP cells", has the whole account): on 2026-11-18 the DEP cells of two
     ranks of one MoE model (Qwen/Qwen1.5-MoE-A2.7B) were planned with the ``dep`` preset and collected on two
     H200 GPUs, with smoke grids at SGLang 0.5.22 and 0.5.23 and with the default grid at 0.5.23. No DEP cell of
     more than two ranks has been collected, and no DEP cell of another model; with four ranks only the launcher
-    command of a prefill cell ran, outside the collector.
+    command of a prefill cell ran, outside the collector. On 2026-11-23 the pure TP cells of two GPUs of the same
+    model were planned under the default preset and under the ``pure_tp`` preset and ran on two H200 GPUs, with
+    smoke grids at both releases and with the default grid at 0.5.23 (the collector README, "MoE cells"). No
+    pure TP cell of more than two GPUs or of another model has run.
     """
     if execution != LEGACY_EXECUTION_IDENTITY:
         # The launcher's artifact carries no execution_mode, which validate_native_collection demands of a cell
@@ -857,14 +861,14 @@ def _require_sglang_launcher_cells(
                 )
             continue
         if topology.dp > 1:
-            # The DEP preset, which the default preset "auto" plans for a MoE model beside TEP: strategy "dep"
-            # with one GPU and one expert-parallel rank per data-parallel rank. AISim's generated SGLang
-            # serving deployment runs it with DP attention (src/aisim/generator/rule_plugin/sglang.rule,
-            # ``enable_attention_dp``), and so does the cell: the cell builder writes the data-parallel size as
-            # SGLang's attention-DP size (sglang_fpm_builder.py), and the launcher writes one rank file per
-            # attention-DP rank. The launcher admits DP attention only with one scheduler process per rank, so
-            # a cell with tensor parallelism inside a data-parallel rank is refused here: that layout is not
-            # built.
+            # The DEP preset, which the default preset "auto" plans for a MoE model beside pure TP and TEP:
+            # strategy "dep" with one GPU and one expert-parallel rank per data-parallel rank. AISim's
+            # generated SGLang serving deployment runs it with DP attention
+            # (src/aisim/generator/rule_plugin/sglang.rule, ``enable_attention_dp``), and so does the cell: the
+            # cell builder writes the data-parallel size as SGLang's attention-DP size (sglang_fpm_builder.py),
+            # and the launcher writes one rank file per attention-DP rank. The launcher admits DP attention
+            # only with one scheduler process per rank, so a cell with tensor parallelism inside a
+            # data-parallel rank is refused here: that layout is not built.
             fixed_sizes = (topology.tp, topology.pp, topology.cp, topology.moe_tp)
             if any(size != 1 for size in fixed_sizes) or topology.moe_ep != topology.dp:
                 raise ValueError(
@@ -873,16 +877,23 @@ def _require_sglang_launcher_cells(
                     f"built); got topology {topology.to_dict()}"
                 )
             continue
-        # What is left for a MoE model is the TEP preset: strategy "tep" with one expert-parallel rank per
-        # tensor-parallel rank, or "single" for its one-GPU cell, where both sizes are 1. The cell builder
-        # writes that expert-parallel size as --ep-size (sglang_fpm_builder.py), and the launcher refuses a
-        # resolved ``ep_size`` that is neither 1 nor the tensor-parallel size. Pure TP (moe_tp above 1) is not
-        # planned for this backend (capabilities.py, ``allow_pure_tp``) and is refused here all the same.
-        fixed_sizes = (topology.pp, topology.cp, topology.moe_tp)
-        if any(size != 1 for size in fixed_sizes) or topology.moe_ep != topology.tp:
+        # What is left for a MoE model are the two layouts of one engine without DP attention, and "single" for
+        # its one-GPU cell, where every size is 1 and which is both. The TEP preset: strategy "tep" with one
+        # expert-parallel rank per tensor-parallel rank (moe_ep equal to tp, moe_tp 1). The cell builder writes
+        # that expert-parallel size as --ep-size (sglang_fpm_builder.py). The pure TP preset: strategy
+        # "pure_tp", where every tensor-parallel rank holds a slice of every expert (moe_tp equal to tp, moe_ep
+        # 1). Its command has no --ep-size, and SGLang's default of 1 is that layout. The launcher refuses a
+        # resolved ``ep_size`` that is neither 1 nor the tensor-parallel size, and the host holds the size it
+        # recorded against the cell (native_artifact.py, ``_validate_sglang_moe_producer``), which is what
+        # tells a result of the one layout from a result of the other. A layout with both expert sizes above 1
+        # is not built.
+        is_tep = topology.moe_tp == 1 and topology.moe_ep == topology.tp
+        is_pure_tp = topology.moe_ep == 1 and topology.moe_tp == topology.tp
+        if topology.pp != 1 or topology.cp != 1 or not (is_tep or is_pure_tp):
             raise ValueError(
-                "SGLang FPM collection supports the TEP and the DEP cells of a MoE model only; a cell without DP "
-                f"attention must have pp, cp and moe_tp of 1 and moe_ep equal to tp; got topology {topology.to_dict()}"
+                "SGLang FPM collection supports the TEP, the pure TP and the DEP cells of a MoE model only; a cell "
+                "without DP attention must have pp and cp of 1 and either moe_tp of 1 with moe_ep equal to tp (TEP) "
+                f"or moe_ep of 1 with moe_tp equal to tp (pure TP); got topology {topology.to_dict()}"
             )
 
 

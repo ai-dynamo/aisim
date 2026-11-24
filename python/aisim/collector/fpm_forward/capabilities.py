@@ -491,7 +491,10 @@ def resolve_model_capability(
     # pure TP is a backend capability rather than an attention-family
     # capability. Enumerate it for every MoE checkpoint; the target runtime
     # remains authoritative for exact topology and quantization alignment.
-    allow_pure_tp = is_moe and backend == "vllm"
+    # SGLang has the layout as well: with its default expert-parallel size of 1
+    # every tensor-parallel rank holds a slice of every expert, so --tp-size N
+    # alone is pure TP (sglang_fpm_builder.py, ``_EXPERT_PARALLEL_SWITCH``).
+    allow_pure_tp = is_moe and backend in ("vllm", "sglang")
     return ModelCapabilityProfile(
         architecture=architecture,
         model_family=model_family,

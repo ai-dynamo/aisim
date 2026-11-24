@@ -33,9 +33,11 @@ from .test_fpm_exec import (
     FPM_EXEC,
     _benchmark_result,
     _finalized_artifacts,
+    _install_holding_awk,
     _run,
     _setsid_run_script,
     _stage,
+    _tree_killing_engine_prelude,
     _write_executable,
 )
 
@@ -52,8 +54,10 @@ pytestmark = pytest.mark.unit
 SWITCH = "AISIMULATE_SGLBENCH_GATE"
 
 # Every command the gate runs: bash for run.sh, python3 for the preflight and the checker, awk for the two
-# engine streams, sleep for the polls, dirname and mkdir for the result folders, and rm and tail around etcd.
-GATE_COMMANDS = ("bash", "python3", "awk", "sleep", "dirname", "mkdir", "rm", "tail")
+# engine streams, mktemp and mkfifo for the folder of the two pipes the awks read and rm
+# to remove it, sleep for the polls and the wait for the awks, dirname and mkdir for the result folders, and
+# rm and tail around etcd, which a cell in the mode never starts.
+GATE_COMMANDS = ("bash", "python3", "awk", "mktemp", "mkfifo", "sleep", "dirname", "mkdir", "rm", "tail")
 
 ENGINE_EXITED = "Engine exited before writing all FPM benchmark outputs (rank, merged, and advertised worker probe)"
 ONE_NODE_ONLY = f"{SWITCH}=1 requires FPM_NODE_COUNT=1 and FPM_NODE_RANK=0"
@@ -238,6 +242,80 @@ def test_no_file_gives_the_status_the_launcher_ended_with(tmp_path, exit_code, k
     assert done.returncode == expected
     assert ENGINE_EXITED in done.stderr
     assert list(staged.results.glob("benchmark*")) == []
+
+
+def test_the_reason_of_a_launcher_that_sglang_kills_is_in_the_exec_stream_and_in_the_log(tmp_path):
+    """SGLang logs why a scheduler process failed and kills the launcher's process tree in the same moment, so
+    the launcher writes no reason of its own. What SGLang logged must still reach the exec stream, which the
+    collector records as the cell's error, and the log file that it copies. The filters here hold every line
+    until the launcher has gone, as mawk holds a block: a filter in the launcher's tree dies with what it holds."""
+
+    staged = _stage_cell(tmp_path)
+    _install_holding_awk(tmp_path)
+    lines = [
+        "[sglbench] SGLang 0.5.23: the start-up checks passed; building the engine",
+        "Scheduler hit an exception: Traceback (most recent call last):",
+        "ValueError: the reason SGLang gives for the end of the engine",
+        "Received sigquit from a child process. It usually means the child failed.",
+    ]
+    body = (
+        _tree_killing_engine_prelude()
+        + f"""import sys
+
+for line in {lines!r}:
+    print(line, file=sys.stderr)
+sys.stderr.flush()
+_kill_process_tree()
+"""
+    )
+    (staged.workdir / "run.sh").write_text(_setsid_run_script(tmp_path, body))
+
+    done = _run(staged)
+
+    assert done.returncode == 137, done.stderr
+    assert ENGINE_EXITED in done.stderr
+    for line in lines:
+        assert line in done.stderr
+    assert (staged.results / "engine.stderr.log").read_text().splitlines() == lines
+    assert list(staged.results.glob("benchmark*")) == []
+    assert list(staged.gate_tmp.iterdir()) == []
+
+
+def test_what_the_launcher_prints_after_the_engine_shutdown_is_in_the_exec_stream_and_in_the_log(tmp_path):
+    """SGLang's engine shutdown sends SIGKILL to every descendant of the launcher's process, and the launcher
+    writes its files and prints its outcome after that. A cell that passes must keep the outcome line. A
+    filter in the launcher's tree is dead by then, so the line has no reader and the print itself fails."""
+
+    staged = _stage_cell(tmp_path)
+    before = "[sglbench] SGLang 0.5.23: the start-up checks passed; building the engine"
+    after = f"[sglbench] complete: wrote {staged.benchmark_output}"
+    body = (
+        _tree_killing_engine_prelude()
+        + f"""import json
+import pathlib
+import sys
+import time
+
+print({before!r}, file=sys.stderr, flush=True)
+_kill_descendants()
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+for path, payload in json.loads({json.dumps(_complete_files(staged))!r}).items():
+    partial = path + ".tmp"
+    pathlib.Path(partial).write_text(json.dumps(payload))
+    os.replace(partial, path)
+print({after!r}, file=sys.stderr, flush=True)
+time.sleep(1)
+sys.exit({launcher.EXIT_COMPLETE})
+"""
+    )
+    (staged.workdir / "run.sh").write_text(_setsid_run_script(tmp_path, body))
+
+    done = _run(staged)
+
+    assert done.returncode == 0, done.stderr
+    assert before in done.stderr and after in done.stderr
+    assert (staged.results / "engine.stderr.log").read_text().splitlines() == [before, after]
+    assert list(staged.gate_tmp.iterdir()) == []
 
 
 @pytest.mark.parametrize(

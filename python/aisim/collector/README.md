@@ -300,8 +300,9 @@ attempts; a no-op resume writes no historical attempts.
 ### SGLang cells
 
 `--backend sglang`, on either route, collects cells from SGLang itself: the
-tensor-parallel cells of a dense model, and the one-GPU cell, the TEP cells
-and the DEP cells of an MoE model ([MoE cells](#moe-cells)). A cell starts
+tensor-parallel cells of a dense model, and the one-GPU cell, the pure TP
+cells, the TEP cells and the DEP cells of an MoE model
+([MoE cells](#moe-cells)). A cell starts
 `runtime/sglbench_launcher.py` in an SGLang image,
 with no Dynamo worker and no etcd. The launcher builds SGLang's engine in its
 own process, plans the points from the limits and CUDA graph sizes that engine
@@ -340,8 +341,8 @@ It may not give `--fpm-model-profile`, `--fpm-runtime-instrumentation`,
 (`--fpm-moe-backend`, `--fpm-attention-backend`, `--fpm-enable-wideep true`,
 `--fpm-enable-eplb true`). Planning also refuses a model with an FPM execution
 identity (DeepSeek V4.1, GLM-5.3-Flash) and, for an MoE model, every cell
-other than the one-GPU cell, the TEP cells and the DEP cells
-([MoE cells](#moe-cells)).
+other than the one-GPU cell, the pure TP cells, the TEP cells and the DEP
+cells ([MoE cells](#moe-cells)).
 Repeatability validation and the runtime probe remain vLLM only.
 
 An SGLang cell runs on one node. Planning does not know how many GPUs a node
@@ -383,7 +384,7 @@ graph sizes (`prefill_new_token_axis` in `runtime/sglbench_grid.py`), and
 the two values do not count against `--prefill-max-new-token-samples`.
 
 The 2 was added on 2026-11-23. Every cell named in this file, except the DEP
-cells collected that day, was collected before that, with an axis of 1, 4, 5,
+cells and the pure TP cells collected that day, was collected before that, with an axis of 1, 4, 5,
 8 and so on, and the point counts given for those cells are the counts of
 that grid. From such a table AISim's
 reader prices a prefill of 2 or 3 new tokens on the line between a row
@@ -395,13 +396,18 @@ so rank files of an earlier collection cannot be mixed with new ones, and
 its rows reach a table only in a root that does not hold the cell yet
 (first publisher wins). The rule is read from SGLang's source at both
 releases, and the unit tests publish a grid with typed-in times and read it
-back at 2 and 3 new tokens. On an engine the row has been collected once: the
-two formal DEP cells of `Qwen/Qwen1.5-MoE-A2.7B` at SGLang 0.5.23 on two H200
-GPUs, on 2026-11-23 ([DEP cells](#dep-cells)). One request of two new tokens
-on each rank took 8.2 to 8.8 ms there, as one of four new tokens did, and one
-of one new token 45 to 50 ms. SGLang's own batch lines show every batch of
-one request with two new tokens with a captured graph, and from that table
-the reader answers 8.3 ms for 2 and for 3 new tokens.
+back at 2 and 3 new tokens. On an engine the row has been collected with the
+default grid in two prefill cells of `Qwen/Qwen1.5-MoE-A2.7B` at SGLang
+0.5.23 on two H200 GPUs, both on 2026-11-23: the DEP cell
+([DEP cells](#dep-cells)) and the pure TP cell ([MoE cells](#moe-cells)). In
+the DEP cell one request of two new tokens on each rank took 8.2 to 8.8 ms,
+as one of four new tokens did, and one of one new token 45 to 50 ms. SGLang's
+own batch lines show every batch of one request with two new tokens with a
+captured graph, and from that table the reader answers 8.3 ms for 2 and for 3
+new tokens. In the pure TP cell one request of two new tokens took 5.1 to
+5.8 ms, one of four 4.9 to 6.1 ms and one of one new token 36 to 39 ms. Smoke
+grids held the row in the DEP, pure TP and TEP prefill cells at 0.5.23 and in
+the pure TP prefill cell at 0.5.22.
 
 An SGLang table carries these deviation notes. Each lives at the code that the
 item names. The first two are differences from AISim's generated SGLang
@@ -441,16 +447,34 @@ serving deployment, and the last two apply to DEP cells only
 
 #### MoE cells
 
-For an MoE model an SGLang plan holds three kinds of cell: the one-GPU cell
-(strategy `single`), the TEP cell (strategy `tep`), which has one
-data-parallel rank and one expert-parallel rank per tensor-parallel rank, and
-the DEP cell (strategy `dep`), which has one GPU and one expert-parallel rank
-per data-parallel rank and runs with SGLang's DP attention
-([DEP cells](#dep-cells)). The default preset `auto` plans a TEP and a DEP
-cell for every GPU count above 1, as it does for vLLM.
-`--fpm-parallel-presets tep` or `dep` plans one of the two. A plan of one GPU
-only holds the one-GPU cell under `auto`, `tep` and `dep` alike. The plan of
-one and two GPUs with the TEP preset:
+For an MoE model an SGLang plan holds four kinds of cell: the one-GPU cell
+(strategy `single`); the pure TP cell (strategy `pure_tp`), where every
+tensor-parallel rank holds a slice of every expert; the TEP cell (strategy
+`tep`), which has one data-parallel rank and one expert-parallel rank per
+tensor-parallel rank; and the DEP cell (strategy `dep`), which has one GPU and
+one expert-parallel rank per data-parallel rank and runs with SGLang's DP
+attention ([DEP cells](#dep-cells)). The default preset `auto` plans a pure
+TP, a TEP and a DEP cell for every GPU count above 1, as it does for vLLM.
+`--fpm-parallel-presets pure_tp`, `tep` or `dep` plans one of the three, and
+several presets can be given. A plan of one GPU only holds the one-GPU cell
+under `auto`, `pure_tp`, `tep` and `dep` alike.
+
+Pure TP was added to the SGLang plan on 2026-11-23, after TEP and DEP. `auto`
+planned 3, 5 and 7 cells per phase for `--fpm-max-gpus` 2, 4 and 8 before,
+and plans 4, 7 and 10 now when every cell fits the GPUs.
+`--fpm-parallel-presets tep dep` plans the earlier set of cells. A width
+filter binds only the presets that have its axis. Under `auto` an
+expert-parallel or a data-parallel filter (`--fpm-moe-ep-sizes`,
+`--fpm-dp-sizes`) therefore leaves the pure TP cells in the plan, as it does
+for vLLM; name the presets to get the plan such a filter gave before. The
+plan records whether pure TP is admitted, so the plan hash of every SGLang
+plan of an MoE model changed with it, also for a plan whose cells are the
+same: a campaign that was frozen before cannot be resumed. The ids of the
+earlier cells did not change, so a table that holds their rows keeps them
+(first publisher wins). Rows collected now carry the new plan hash in
+`source_plan_sha256`.
+
+The plan of one and two GPUs with the TEP preset:
 
 ```bash
 python3 -m collector.fpm_forward \
@@ -473,18 +497,27 @@ value it wrote for `--tp-size`, right after that flag. For a TEP cell that is
 the tensor-parallel size; for a DEP cell it is the number of data-parallel
 ranks ([DEP cells](#dep-cells)). This is the size AISim's generated SGLang
 serving deployment passes under SGLang's alias `--expert-parallel-size`. A
-one-GPU cell gets no `--ep-size`, and no other MoE flag has a translation. The
+one-GPU cell and a pure TP cell get no `--ep-size`. SGLang's expert-parallel
+size is then its default of 1, and SGLang gives every tensor-parallel rank a
+slice of every expert: the command of a pure TP cell of N GPUs is `--tp-size
+N` alone. AISim's generated SGLang serving deployment asks for the same
+layout with `--tensor-parallel-size N --expert-parallel-size 1`. No other MoE
+flag has a translation. The
 launcher then checks what SGLang resolved. It requires an expert-parallel size
-of 1 or of SGLang's `tp_size`, no all-to-all backend (`moe_a2a_backend` is
-`none`), no separate TP size for the dense MLP layers (`moe_dense_tp_size`),
-no EPLB and no redundant experts, and it refuses an expert-parallel size above
-1 for a model without expert layers. Pure TP, DP attention in any layout other
+of 1 or of SGLang's `tp_size`, a `moe_dp_size` of 1, no all-to-all backend
+(`moe_a2a_backend` is `none`), no separate TP size for the dense MLP layers
+(`moe_dense_tp_size`), no EPLB and no redundant experts, and it refuses an
+expert-parallel size above 1 for a model without expert layers. The launcher
+is not told which layout its cell is: a size of 1 and a size of `tp_size` both
+pass, and validation holds the recorded size against the cell (below). A
+layout with both expert sizes above 1, DP attention in any layout other
 than DEP, elastic EP, a model with hybrid sliding-window or state-space layers
 and a model with an FPM execution identity stay refused, each at its own step:
 
-- Planning refuses pure TP, an execution identity and every topology with more
-  than one data-parallel rank that is not DEP, for example tensor parallelism
-  inside a data-parallel rank. The message names the topology.
+- Planning refuses an execution identity and every topology that is none of
+  the four kinds of cell, for example tensor parallelism inside a
+  data-parallel rank, or an MoE tensor-parallel size and an expert-parallel
+  size that are both above 1. The message names the topology.
 - A cell whose vLLM command holds a flag without a translation is planned and
   refused when it is rendered, before a pod is scheduled. The cells of a
   `GlmMoeDsaForCausalLM` model are refused in this way (`--trust-remote-code`
@@ -507,6 +540,20 @@ and a model with an FPM execution identity stay refused, each at its own step:
   the expert-parallel size. This is read in SGLang's source at both releases
   and was not run. No packaged MoE model has a number of experts that 2, 4 or
   8 does not divide.
+- A pure TP cell of an MoE model whose cells are planned and rendered passes
+  the launcher's checks, and SGLang can still refuse it while it builds the
+  engine. Its rules are on the slice of an expert that one rank holds, which
+  is the expert's intermediate size divided by the GPU count. Its MoE layer
+  asserts that the GPU count divides the intermediate size; no packaged MoE
+  model has an expert intermediate size that 2, 4 or 8 does not divide. For
+  a checkpoint with block-wise FP8 weights the slice must also be a whole
+  number of weight blocks, and the packaged configs of five checkpoints
+  break that on 4 or on 8 GPUs. This is a known limitation of the default
+  preset.
+  [Pure TP cells that SGLang refuses to build](#pure-tp-cells-that-sglang-refuses-to-build)
+  names the checkpoints, says what a refused cell looks like and gives the
+  ways around it. The rules are read in SGLang's source at both releases, and
+  the block rule ran on an engine once.
 
 Which experts a token is sent to depends on the token, so the cells of an MoE
 model send dataset text. In such a run every prompt is text: the cached
@@ -604,8 +651,9 @@ Dynamo writes (`path`, `sha256`, `collection_pool`, `conversations`). The
 checkpoint keeps that block as `native_kvwarm` in the record of a decode cell.
 The published rows have no column for the content: `kv_seed_regime` says how
 the cached state was produced, not which tokens it holds. The rows of a TEP
-cell carry `parallel_strategy: tep` and the cell's `moe_ep`; those of a DEP
-cell are described under [DEP cells](#dep-cells).
+cell carry `parallel_strategy: tep` and the cell's `moe_ep`; those of a pure
+TP cell carry `parallel_strategy: pure_tp`, the cell's `moe_tp` and a `moe_ep`
+of 1; those of a DEP cell are described under [DEP cells](#dep-cells).
 
 The rows take those labels from the plan, so for a cell of an MoE plan
 validation holds what the pod recorded against the cell:
@@ -616,14 +664,16 @@ rank of the engine, so `producer.tp_size` must be the cell's `tp` times its
 `dp`. A producer block without `attn_dp_size` counts as 1: the launcher wrote
 no such key before it could run DP attention, and the result files of that
 time still pass for their one-GPU and TEP cells and are refused for a DEP
-cell. Two runs
+cell. For a pure TP cell of N GPUs the three sizes are N, 1 and 1, and for
+its TEP cell N, N and 1: the expert-parallel size is all that tells a result
+of the one from a result of the other. Two kinds of run
 complete in the pod and are refused by this comparison. A
 pod whose launcher finds no expert key in the model config (`EXPERT_KEYS`)
 sends seeded token ids unless `sharegpt_chain` is set, and records no
 `producer.moe` block. A
-command that reaches the pod without `--ep-size` runs with an expert-parallel
-size of 1, which the launcher accepts at any tensor-parallel size without DP
-attention. The cell
+command whose `--ep-size` does not fit its cell runs the other layout, which
+the launcher accepts without DP attention: the command of a TEP cell that
+reaches the pod without the flag, or that of a pure TP cell with it. The cell
 fails with `native SGLang rank artifact of a MoE plan did not send dataset
 text` or `... did not run the layout of its cell`. The comparison is made
 when a cell has run, when a resume looks at the files of a cell again, and
@@ -656,6 +706,216 @@ unit tests only. The DEP cells of that model on two GPUs have run with smoke
 grids at both releases; [DEP cells](#dep-cells) says what ran and what did
 not.
 
+The pure TP cells of that model on two GPUs ran on 2026-11-23, with the row
+of 2 new tokens: with the default grid at SGLang 0.5.23 (3,347 prefill and
+890 decode points, none staged again, rows published as `pure_tp`) and with
+smoke grids at both releases. Each cell ran `--tp-size 2` with a resolved
+expert-parallel size of 1 and passed validation with the recorded sizes 2, 1
+and 1. One smoke campaign at 0.5.23 used the default preset and held the DEP,
+the pure TP and the TEP cells of two GPUs. Held against the cells of the
+other two layouts, each of its results was refused by the comparison above.
+Not run to a result on an engine: a pure TP cell of more than two GPUs or of
+another model, and the default grid at 0.5.22. A cell that SGLang refuses to
+build ran once, on 2026-11-24 (next section).
+
+##### Pure TP cells that SGLang refuses to build
+
+This is a known limitation of the default preset, left as it is. For an MoE
+model that an SGLang plan admits, `auto` plans a pure TP cell on every GPU
+count above 1 that passes memory admission, and for a checkpoint with
+block-wise FP8 weights SGLang refuses to build some of those cells.
+One refused cell ran on GPUs on 2026-11-24: the pure TP prefill cell of
+`Qwen/Qwen3-30B-A3B-FP8` on four H200 GPUs at SGLang 0.5.23, through the
+collector in a smoke run. SGLang's server then ran alone in a pod of the
+same image and resources, with the cell's model path, `--tp-size 4` and
+KV-cache dtype. Two more things ran in a pod of that image on that day and
+are marked where they are used: a read of the published configs and a test
+of the gate's stream filter. Everything else in this section was read in
+the collector's code and in SGLang's source at 0.5.22 and 0.5.23, which
+agree, or run on a development machine without a GPU. No other cell of the
+checkpoints below has run in any layout.
+
+A config with `quantization_config.weight_block_size` marks such a
+checkpoint. It keeps one scale per block of a weight, 128 by 128 in the
+packaged configs below. A pure TP rank holds a slice of every expert, the
+expert's intermediate size divided by the GPU count, and SGLang requires the
+slice to be a whole number of blocks. A TEP or a DEP rank holds whole
+experts and passes this rule, and so does the one-GPU cell.
+
+| Checkpoint | Expert size | Slice on 2 GPUs | Slice on 4 | Slice on 8 |
+|---|---|---|---|---|
+| `Qwen/Qwen3-30B-A3B-FP8` | 768 | 384 | 192, refused | 96, refused |
+| `stepfun-ai/Step-3.7-Flash-FP8` | 1280 | 640 | 320, refused | 160, refused |
+| `Qwen/Qwen3-235B-A22B-FP8` | 1536 | 768 | 384 | 192, refused |
+| `MiniMaxAI/MiniMax-M2.5`, `MiniMaxAI/MiniMax-M2.7` | 1536 | 768 | 384 | 192, refused |
+
+The sizes and key names are those of the packaged configs, and the published
+configs held the same values on 2026-11-24. An entry without "refused" says
+that the slice passes this rule, not that the cell builds. Every other packaged MoE config with a
+weight block size passes the rule on 2, 4 and 8 GPUs.
+
+Two rows rest on more than the others:
+
+- `stepfun-ai/Step-3.7-Flash-FP8`. SGLang has no model class of the
+  architecture name in the packaged config. The published config names
+  `Step3p7ForConditionalGeneration`, which builds `Step3p5ForCausalLM`, and
+  has the packaged sizes. Unlike the packaged one it asks for remote code;
+  whether SGLang then needs it was not checked. SGLang lists that
+  architecture as a hybrid sliding-window model, which the launcher refuses
+  in every cell once the engine is built (above). No cell of this checkpoint
+  is therefore expected to collect at these releases, with or without a
+  filter. Its shared expert, a dense layer 1280 wide that SGLang cuts over
+  all tensor-parallel ranks when no all-to-all backend is set, may also
+  break SGLang's like rule for dense block-quantized layers in the TEP and
+  DEP cells on 4 and 8 GPUs; that was not settled.
+- The two MiniMax checkpoints. Their config asks for remote code, and a
+  collector cell has no flag for it. Whether such a cell loads the
+  checkpoint at all was not checked.
+
+SGLang has the rule in two places:
+
+- Its FP8 expert layer (`Fp8MoEMethod` in `layers/quantization/fp8.py`)
+  tests the slice while the model object is built, before a weight file is
+  read. For a slice of 192 its message is `The output_size of gate's and
+  up's weight = 192 is not divisible by weight quantization block_n = 128.`
+  This ran in the server run: on four H200 GPUs every rank raised it about
+  a minute after the server command started, and that pod had fetched only
+  the config and the tokenizer files by then.
+  On an NVIDIA GPU no environment variable switches this test off; its one
+  exemption needs an AMD build. Only the MoE runner backends
+  `flashinfer_trtllm` and `flashinfer_trtllm_routed` get past it, because
+  the MoE layer rounds the slice up to a multiple of 128 before the test.
+- `check_quantized_moe_compatibility` tests the slice again after the
+  weights are loaded. Its message begins `For quantized MoE models`. It
+  reads `moe_intermediate_size`, which the packaged MiniMax configs do not
+  have, so it returns early for those two checkpoints and only the first
+  rule tests them. `SGLANG_SHARED_EXPERT_TP1` switches this test off and
+  leaves the first. It also changes how SGLang places shared experts in
+  other models, and is not a way around.
+
+On a GPU of compute capability 10 with CUDA 12.8 or later, the B200 class,
+SGLang selects `flashinfer_trtllm` by itself for a `Qwen3MoeForCausalLM`
+checkpoint with FP8 weights when the runner backend is left at `auto` and no
+all-to-all backend is set, as in a collector cell. The two Qwen checkpoints
+then pass the first rule and are left to the second, which runs only after
+every rank has loaded its weights. What happens in between was not traced.
+
+What a refused cell looks like. Each line says what it rests on.
+
+- The prefill cell that ran failed after its pod had started, and took
+  243 s from its start to the deletion of its pod. The decode cell of a
+  refused GPU count builds the same engine and was not run.
+- In the server run SGLang raised in every scheduler process and logged the
+  traceback, and its handler logged `Received sigquit from a child process`
+  and killed the process tree. The server ended 63 s after it started. Read
+  in the code, the same happens in a cell, where the signalled process is
+  the launcher. The launcher therefore writes no reason line and no failed
+  result file, unlike its own refusals above. The cell that ran kept the
+  preflight file, the provenance file and the resolved configuration, and
+  no result file.
+- On Kubernetes the cell was recorded as `failed` with `remote_exit=137`.
+  With the gate as it was on that day, the recorded error and
+  `cells/<cell_id>/logs/<pod>.run.stderr.log` under the campaign's artifact
+  folder held three lines of the gate's output, joined into one line of
+  error text, and nothing of the engine: the shell's notice that `run.sh`
+  was `Killed`, `Engine did not stop within 30s; sending SIGKILL` and
+  `Engine exited before writing all FPM benchmark outputs`. The gate waits
+  those 30 seconds for what is left of the engine's process group. The
+  record of a Slurm cell was not read.
+- SGLang's message was in none of the kept files of that run, for two
+  reasons found in the gate as it was then. Its two `awk` filters, which
+  copy the engine's output to the log files and to the exec stream, were
+  started on the engine's command line and so were descendants of the
+  engine's process, and SGLang kills every descendant of that process when
+  it kills the process tree and again when the engine shuts down. And
+  `awk` is `mawk` in the SGLang image, which reads a pipe in blocks (a
+  test in that image showed it holding a line until its input ended), so
+  a killed filter took with it every line it still held. So the cell that
+  ran kept no engine line, the smoke cells of 2026-11-23 kept none, and
+  the formal cells of that day kept their engine log up to a multiple of
+  512 KiB, without the launcher's last lines.
+- The gate has since been changed. It starts the two filters itself, on two
+  named pipes in a temporary folder of its own, and waits up to 10 s for
+  them before it ends. The same cell was then run again on 2026-11-24. Its
+  `cells/<cell_id>/raw/<pod>/engine.stderr.log` held 202 lines: the
+  launcher's lines, SGLang's traceback from two ranks with the message
+  above, `Received sigquit from a child process` and SGLang's last line.
+  The recorded error and `<pod>.run.stderr.log` held the same lines, about
+  57 KB, most of it SGLang's two lines of server arguments of 19 KB each.
+  The cell was again recorded as `failed` with `remote_exit=137`.
+- `mawk` still reads in blocks, so in an image with `mawk` both copies run
+  behind the engine and are complete once the engine has gone. A first
+  form of the change gave `mawk` its `-W interactive`, which reads a line
+  at a time. In a cell that cut the line of server arguments at 4096 bytes
+  and kept nothing after it, so the option was removed. Not run with the
+  changed gate: a cell that passes, a vLLM cell, and a Slurm cell.
+- On that day the reason was read from SGLang's server alone: start it by
+  hand in a pod of the same image and GPU count, `python3 -m
+  sglang.launch_server` with the cell's `--model-path` and `--tp-size`, and
+  read its stderr. That stays the way for a cell collected before the
+  change. The launcher command of the cell's `run.sh` needs the staged
+  `runtime/sglbench_*.py` files, which are gone with the cell's pod.
+- The cell was not run again and its pod was deleted. The campaign that ran
+  held one cell, so this was read and not run: the other cells of a
+  campaign still run. Unless the campaign was started with
+  `--fpm-publish-partial`, it then publishes no table. In both cases it
+  returns a nonzero status, as the smoke campaign that ran did.
+
+Ways around it:
+
+- **Find it first.** A smoke run with `--limit` set to the number of cells
+  per phase builds every layout once, in its prefill cell, and never
+  publishes. A refused layout shows as a failed cell with
+  `remote_exit=137`. With the changed gate its recorded error holds
+  SGLang's message (above). The record of a cell
+  collected before the change does not name the reason: a pure TP cell that
+  fails with `remote_exit=137` on a GPU count that the table marks points
+  to it, and any other exception while SGLang builds the engine leaves the
+  same record, so confirm it with the server run above. Under the default
+  preset that number is 4, 7 or 10 for `--fpm-max-gpus` 2, 4 or 8 when
+  planning leaves no cell out for memory; `--plan-only` prints the cells.
+- **Plan without the refused cells.** Under the default preset
+  `--fpm-moe-tp-sizes` names the GPU counts whose pure TP cell stays in the
+  plan. The one-GPU, TEP and DEP cells are not touched. With
+  `--fpm-max-gpus 8`, `--fpm-moe-tp-sizes 2` leaves out the refused cells
+  of the first two rows of the table and `--fpm-moe-tp-sizes 2 4` those of
+  the other two. A value above `--fpm-max-gpus` is refused, and a value that
+  is no GPU count of the plan is accepted and keeps no pure TP cell. No
+  filter is needed when the maximum is below the first refused count.
+  `--fpm-parallel-presets tep dep` leaves out every pure TP cell, also the
+  ones SGLang builds. Naming the layout that is served, for example
+  `--fpm-parallel-presets tep --fpm-gpu-counts 4`, plans the prefill and the
+  decode cell of that layout alone.
+- **Publish what passed.** `--fpm-publish-partial` on the first run
+  publishes the passed cells at its end, with the refused ones under
+  `missing_cells`. After a formal campaign without it in which only these
+  cells failed, the same command with `--resume --fpm-publish-partial` runs
+  no cell again and publishes the passed cells. The status stays nonzero in
+  both cases. The resume needs what the first run used and left: the same
+  options, the same source revision (uncommitted changes to tracked files
+  count), the checkpoint folder and the artifact folder. Without the
+  checkpoint file `--resume` starts a new campaign and runs every cell.
+
+A filter makes another plan with another hash. A failed campaign cannot be
+resumed with a filter added, and a new campaign measures every cell again.
+A new campaign in the same `--checkpoint-dir` also replaces the checkpoint
+file of the failed one, so publish what passed first or give the new
+campaign its own folder.
+
+`--fpm-moe-tp-sizes` leaves out the refused pure TP cells and nothing else.
+Other cells that cannot run stay in the plan. Planning asks for a memory
+estimate under the data label (`--fpm-backend-version`). With the label
+0.5.22 or 0.5.23 there is none on `h200_sxm` and `b200_sxm`, the two systems
+planned for here, so the plan of a checkpoint that does not fit one GPU
+still holds the one-GPU cell; `--fpm-gpu-counts 2 4 8` leaves that out.
+
+Planning leaves the refused cells in on purpose. The rule belongs to the
+engine and to its release, and the collector does not turn a rule of AISim's
+model layer into a skipped cell (`memory_admission.py`): the engine that
+runs decides. AISim's model layer holds the same rule
+(`_validate_fp8_block_quantized_moe_config`) and refuses to model such a
+layout.
+
 ##### DEP cells
 
 A DEP cell has one GPU and one expert-parallel rank per data-parallel rank:
@@ -664,7 +924,8 @@ runs with SGLang's DP attention. One engine starts D scheduler processes, one
 per GPU. Each is an attention-DP rank: it schedules its own requests and runs
 attention on them, while the expert layers stay spread over all ranks. The
 default preset `auto` plans the cell for every GPU count above 1, and
-`--fpm-parallel-presets dep` plans it without the TEP cells. Planning refuses
+`--fpm-parallel-presets dep` plans it without the pure TP and the TEP cells.
+Planning refuses
 every other topology with more than one data-parallel rank and names it in
 the message; tensor parallelism inside a data-parallel rank is not built. A
 dense model has no such cell.
@@ -820,7 +1081,13 @@ Four things differ from serving or from the vLLM table of the same cell:
     GPU memory for the KV cache", which names `--mem-fraction-static` and a
     value, or with "Not enough memory. Please try to increase
     --mem-fraction-static." Read in SGLang's source at both releases; no
-    cell has failed this way.
+    cell has failed this way. SGLang raises it in a scheduler process, so
+    such a cell ends like a refused pure TP cell, with `remote_exit=137`
+    ([Pure TP cells that SGLang refuses to build](#pure-tp-cells-that-sglang-refuses-to-build)).
+    With the gate as changed on 2026-11-24 the message should then be among
+    the engine's lines in the recorded error and in `engine.stderr.log`,
+    as SGLang's refusal was in the cell that ran with that gate. This is
+    inferred from that cell and was not run.
   - The cell passes and its table reaches less far. The launcher plans only
     the points the pool holds, so the longest cached prefixes of the largest
     batches are missing, while the number of points can be the same. The
@@ -854,10 +1121,15 @@ Four things differ from serving or from the vLLM table of the same cell:
 
   Where to look. The collector keeps a copy of the cell's stderr as
   `engine.stderr.log` in the cell's `raw/` folder. In every formal cell of
-  the runs below that copy held the launcher's first lines and ended before
-  its last ones, and the smoke cells kept none of it. That is why the two
-  lines are printed when the grid is planned as well, early in the log. They
-  have not run in a collected cell.
+  the runs below, made with the gate as it was before 2026-11-24, that copy
+  held the launcher's first lines and ended before its last ones, and the
+  smoke cells kept none of it. The gate has since been changed to keep the
+  whole log
+  ([Pure TP cells that SGLang refuses to build](#pure-tp-cells-that-sglang-refuses-to-build));
+  one refused cell has run with it and no cell that passes. The two lines
+  are printed when the
+  grid is planned as well, early in the log. They have not run in a
+  collected cell.
 
   In either case give the campaign `--fpm-gpu-memory-utilization`, which the
   cell writes as `--mem-fraction-static`. 0.95 ran at two ranks and 0.90 at
@@ -1045,8 +1317,10 @@ on the other rank, the call of one prompt and local control broadcast at
 Not run on an engine:
 
 - the row of 2 new tokens per request, which the grid plans since
-  2026-11-23, in any cell but the DEP prefill cell of two ranks at 0.5.23:
-  a dense model, a one-GPU or TEP cell, 0.5.22, a smoke grid;
+  2026-11-23, with the default grid in any cell but the DEP and the pure TP
+  prefill cell of two GPUs at 0.5.23, and with any grid in a cell of a dense
+  model or a one-GPU cell (smoke grids held it in the DEP, pure TP and TEP
+  cells at 0.5.23 and in the pure TP cell at 0.5.22);
 - a DEP cell of more than four ranks, four ranks in a decode cell or
   through the collector, or a model other than `Qwen/Qwen1.5-MoE-A2.7B`;
 - a prefill grid that the KV pool cut, and with it the launcher's two lines

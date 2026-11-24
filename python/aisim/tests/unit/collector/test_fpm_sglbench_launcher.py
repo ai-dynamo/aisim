@@ -227,11 +227,11 @@ DRIVER_PRODUCER_KEYS = (
 # setup resolves to. Typed from the field files of SGLang at both tags (srt/arg_groups/fields: parallel.py,
 # schedule.py, memory.py, serving.py, exec_.py, spec.py, disagg.py, device.py); ``device`` and
 # ``prefill_decode_interval`` are None there and resolution fills them in. ``enable_nvidia_megakernel`` exists
-# at v0.5.23 only. The six fields of the expert layers have these defaults for every model (``ep_size`` and
-# ``moe_dense_tp_size`` in parallel.py, the other four in exec_.py ``ExecMoe``). The last four are read only
-# with ``attn_dp_size`` above 1 (three in parallel.py, ``enable_tokenizer_batch_encode`` in serving.py);
-# ``load_balance_method`` is ``auto`` there and resolution turns it into ``round_robin`` outside disaggregated
-# serving (srt/arg_groups/serving_hook.py).
+# at v0.5.23 only. The seven fields of the expert layers have these defaults for every model (``ep_size``,
+# ``moe_dense_tp_size`` and ``moe_dp_size`` in parallel.py, the other four in exec_.py ``ExecMoe``). The last
+# four are read only with ``attn_dp_size`` above 1 (three in parallel.py, ``enable_tokenizer_batch_encode`` in
+# serving.py); ``load_balance_method`` is ``auto`` there and resolution turns it into ``round_robin`` outside
+# disaggregated serving (srt/arg_groups/serving_hook.py).
 FAKE_RESOLVED_ARGUMENTS = {
     "nnodes": 1,
     "node_rank": 0,
@@ -249,6 +249,7 @@ FAKE_RESOLVED_ARGUMENTS = {
     "enable_elastic_expert_backup": False,
     "moe_a2a_backend": "none",
     "moe_dense_tp_size": None,
+    "moe_dp_size": 1,
     "enable_eplb": False,
     "ep_num_redundant_experts": 0,
     "ep_size": 1,
@@ -324,6 +325,7 @@ STAGE_S_REFUSALS = [
     ("enable_elastic_expert_backup", True, f"{_ELASTIC} (enable_elastic_expert_backup=true)"),
     ("moe_a2a_backend", "deepep", f"{_A2A} (moe_a2a_backend=deepep)"),
     ("moe_dense_tp_size", 1, "moe_dense_tp_size must not be set (got 1)"),
+    ("moe_dp_size", 2, "moe_dp_size must be 1 (got 2)"),
     ("enable_eplb", True, "EPLB is not supported (enable_eplb=true)"),
     ("ep_num_redundant_experts", 2, "redundant experts are not supported (ep_num_redundant_experts=2)"),
     ("speculative_algorithm", "EAGLE", f"{_SPEC} (speculative_algorithm=EAGLE)"),
@@ -401,6 +403,14 @@ STAGE_S_MORE_REFUSALS = [
     # SGLang itself allows 1 and the TP size; either gives the dense layers a TP size of their own.
     ("moe_dense_tp_size", 2, "moe_dense_tp_size must not be set (got 2)"),
     ("moe_dense_tp_size", 0, "moe_dense_tp_size must not be set (got 0)"),
+    # SGLang's resolution takes a size above 1 that divides the TP size when the attention context-parallel
+    # size is the same.
+    ("moe_dp_size", 4, "moe_dp_size must be 1 (got 4)"),
+    ("moe_dp_size", 0, "moe_dp_size must be 1 (got 0)"),
+    ("moe_dp_size", None, "moe_dp_size must be 1 (got null)"),
+    ("moe_dp_size", True, "moe_dp_size must be 1 (got true)"),
+    ("moe_dp_size", "1", "moe_dp_size must be 1 (got 1)"),
+    ("moe_dp_size", 1.0, "moe_dp_size must be 1 (got 1.0)"),
     ("enable_eplb", None, "EPLB is not supported (enable_eplb=null)"),
     ("enable_eplb", 0, "EPLB is not supported (enable_eplb=0)"),
     ("ep_num_redundant_experts", None, "redundant experts are not supported (ep_num_redundant_experts=null)"),
@@ -936,6 +946,7 @@ def _fake_sglang_modules(world: _FakeWorld) -> dict[str, types.ModuleType]:
         parser.add_argument("--model-path", required=True)
         parser.add_argument("--tp-size", type=int, default=1)
         parser.add_argument("--ep-size", type=int, default=1)
+        parser.add_argument("--moe-dp-size", type=int, default=1)
         parser.add_argument("--attn-dp-size", type=int, default=1)
         parser.add_argument("--enable-dp-attention-local-control-broadcast", action="store_true")
         parser.add_argument("--enable-dp-lm-head", action="store_true")
@@ -949,6 +960,7 @@ def _fake_sglang_modules(world: _FakeWorld) -> dict[str, types.ModuleType]:
         # The FAKE engine follows the flags, so a flag that does not reach this parser shows in the run.
         world.use(parsed.page_size, parsed.tp_size, parsed.attn_dp_size)
         world.resolved["ep_size"] = parsed.ep_size
+        world.resolved["moe_dp_size"] = parsed.moe_dp_size
         world.resolved["enable_dp_attention_local_control_broadcast"] = (
             parsed.enable_dp_attention_local_control_broadcast
         )
@@ -2082,6 +2094,13 @@ def _tep_cell(mode: str, tp_size: int = 2):
     """A cell of the tensor- and expert-parallel layout: ``tp_size`` GPUs, one expert group per GPU."""
     cell = _cell(phase=mode, dp=1, strategy="tep")
     topology = ParallelTopology(tp=tp_size, pp=1, dp=1, moe_tp=1, moe_ep=tp_size, cp=1)
+    return dataclasses.replace(cell, topology=topology)
+
+
+def _pure_tp_cell(mode: str, tp_size: int = 2):
+    """A cell of the pure tensor-parallel layout: ``tp_size`` GPUs, each with a slice of every expert."""
+    cell = _cell(phase=mode, dp=1, strategy="pure_tp")
+    topology = ParallelTopology(tp=tp_size, pp=1, dp=1, moe_tp=tp_size, moe_ep=1, cp=1)
     return dataclasses.replace(cell, topology=topology)
 
 
@@ -3313,7 +3332,7 @@ def test_other_values_of_the_resolved_arguments_that_pass(field, value):
 def test_every_field_the_launcher_tests_has_a_refused_value_here():
     tested = [name for name, _accepts, _text in launcher._RESOLVED_CHECKS]
     assert tested == [field for field, _value, _refusal in STAGE_S_REFUSALS]
-    assert len(set(tested)) == len(tested) == 46
+    assert len(set(tested)) == len(tested) == 47
     # The fields the launcher reads besides: the platform, the three run settings, the recorded field, the
     # expert-parallel size, which is tested against the TP size and the model, and the runner of the expert
     # layers, which is recorded for a model that has them.
@@ -3342,6 +3361,7 @@ def test_a_field_sglang_does_not_have_is_an_error_and_not_a_pass(field):
 _REFUSED_AT_LAUNCH = (
     "attn_dp_size",
     "moe_a2a_backend",
+    "moe_dp_size",
     "enable_eplb",
     "disable_radix_cache",
     "incremental_streaming_output",
@@ -5403,7 +5423,7 @@ def test_a_signal_while_the_texts_are_encoded_is_recorded_as_a_stop(tmp_path, mo
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# Models with expert layers: the expert-parallel layout
+# Models with expert layers: the layout of the expert layers
 # ---------------------------------------------------------------------------------------------------------------
 
 FAKE_EXPERTS = {"num_experts": 60, "num_experts_per_tok": 4, "moe_intermediate_size": 1408}
@@ -5411,11 +5431,39 @@ FAKE_EXPERTS = {"num_experts": 60, "num_experts_per_tok": 4, "moe_intermediate_s
 
 @pytest.mark.parametrize(
     ("ep_size", "tp_size", "experts"),
-    [(1, 1, {}), (1, 4, {}), (1, 1, FAKE_EXPERTS), (1, 2, FAKE_EXPERTS), (2, 2, FAKE_EXPERTS), (8, 8, FAKE_EXPERTS)],
+    [
+        (1, 1, {}),
+        (1, 4, {}),
+        (1, 1, FAKE_EXPERTS),
+        # The pure TP layout: every TP rank holds a slice of every expert.
+        (1, 2, FAKE_EXPERTS),
+        (1, 4, FAKE_EXPERTS),
+        (1, 8, FAKE_EXPERTS),
+        # The TEP layout: every TP rank holds whole experts, its share of them.
+        (2, 2, FAKE_EXPERTS),
+        (8, 8, FAKE_EXPERTS),
+    ],
 )
 def test_an_expert_parallel_size_of_one_or_of_the_tp_size_passes(ep_size, tp_size, experts):
     view = _FakeView({**FAKE_RESOLVED_ARGUMENTS, "ep_size": ep_size, "tp_size": tp_size})
     launcher._check_expert_parallel(view, experts)
+
+
+@pytest.mark.parametrize("tp_size", [2, 4, 8])
+def test_the_sizes_of_a_pure_tp_cell_pass_the_layout_checks_with_one_scheduler_process_for_each_tp_rank(tp_size):
+    # What SGLang resolves the command of a pure TP cell to: its ``--tp-size`` and the default of every other size.
+    view = _FakeView({**FAKE_RESOLVED_ARGUMENTS, "tp_size": tp_size})
+    assert (view.ep_size, view.moe_dp_size, view.attn_dp_size) == (1, 1, 1)
+
+    launcher._check_resolved(view)
+    launcher._check_expert_parallel(view, FAKE_EXPERTS)
+    launcher._check_dp_attention(view, FAKE_EXPERTS)
+
+    # The driver waits for a recorder header from each TP rank, and the run has one attention-DP rank.
+    producer: dict = {}
+    settings = launcher._resolved_settings(view, producer)
+    assert (settings["expected_scheduler_processes"], settings["dp_size"]) == (tp_size, 1)
+    assert producer == {"tp_size": tp_size, "attn_dp_size": 1}
 
 
 _EP_WITHOUT_EXPERTS = "expert parallelism needs a model with expert layers (ep_size={})"
@@ -5458,6 +5506,9 @@ def test_any_other_expert_parallel_size_is_refused(ep_size, tp_size, experts, re
         (FAKE_EXPERTS, {"ep_size": 2, "tp_size": 4}, _EP_NOT_TP.format(2, 4)),
         (FAKE_EXPERTS, {"moe_a2a_backend": "deepep"}, f"{_A2A} (moe_a2a_backend=deepep)"),
         (FAKE_EXPERTS, {"moe_dense_tp_size": 1}, "moe_dense_tp_size must not be set (got 1)"),
+        # The sizes of a pure TP cell, two TP ranks and an expert-parallel size of 1, with a MoE data-parallel
+        # size of 2 beside them: a TP rank would hold a wider slice of every expert than its TP size says.
+        (FAKE_EXPERTS, {"tp_size": 2, "moe_dp_size": 2}, "moe_dp_size must be 1 (got 2)"),
         (
             FAKE_EXPERTS,
             {"ep_num_redundant_experts": 4},
@@ -5647,6 +5698,122 @@ def test_end_to_end_a_model_with_expert_layers_and_expert_parallelism_passes_the
     assert f"texts went through {__name__}._FakeTokenizer in " in pool_line
 
 
+@pytest.mark.parametrize("tp_size", [2, 4])
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+def test_end_to_end_a_pure_tp_cell_of_a_model_with_expert_layers_passes_the_validator_and_the_gate(
+    tmp_path, monkeypatch, capsys, mode, tp_size
+):
+    # The cell AISim plans for this layout: ``tp_size`` GPUs, tensor parallel, each with a slice of every expert.
+    cell = _pure_tp_cell(mode, tp_size)
+    pod_dir = _pod(tmp_path, cell, sglang_version=FAKE_SGLANG_VERSION)
+
+    def prepare(world, _pod_dir):
+        world.experts = FAKE_EXPERTS
+
+    # The command of the cell holds ``--tp-size`` and no ``--ep-size``. No content word: the expert keys of the
+    # FAKE model config make this a text run.
+    launch = _launch_text(
+        tmp_path,
+        monkeypatch,
+        mode,
+        word=None,
+        tp_size=tp_size,
+        prepare=prepare,
+        pod=(cell, pod_dir),
+        real_compat=True,
+    )
+
+    _assert_no_module_of_the_benchmark_is_replaced()
+    topology = launch.cell.topology
+    assert (launch.cell.parallel_strategy, topology.tp, topology.moe_tp) == ("pure_tp", tp_size, tp_size)
+    assert (topology.moe_ep, topology.dp) == (1, 1)
+    # Exit code 0, and the gate and the validator without the plan's answer accept the files.
+    on_disk = _assert_accepted(launch)
+    world = launch.world
+    # ``--tp-size`` reached the FAKE parser as it was typed, and no ``--ep-size`` beside it.
+    assert world.sglang_argv == [*_fake_sglang_argv(1, tp_size), STREAMING_FLAG]
+    assert "--ep-size" not in world.sglang_argv
+    # One scheduler process for each TP rank, started as SGLang starts them without DP attention.
+    assert world.entry_calls == [(rank, rank, 0, None) for rank in range(tp_size)]
+
+    producer = on_disk["producer"]
+    assert set(producer) == {*LAUNCHER_PRODUCER_KEYS, *DRIVER_PRODUCER_KEYS, "name", "artifact_format"}
+    assert producer["expert_keys"] == FAKE_EXPERTS
+    # SGLang's default expert-parallel size of 1 is recorded: it is what tells this layout from the TEP one.
+    assert producer["moe"] == {
+        "ep_size": 1,
+        "moe_a2a_backend": "none",
+        "moe_runner_backend": "auto",
+        "moe_dense_tp_size": None,
+        "enable_eplb": False,
+    }
+    assert (producer["tp_size"], producer["attn_dp_size"], producer["scheduler_processes"]) == (tp_size, 1, tp_size)
+    kept = _fake_kept_texts(_fake_dataset_records())
+    assert producer["content"] == {
+        "source": "dataset_text_chains",
+        "seed": "0",
+        "token_range": FAKE_TOKEN_RANGE,
+        "issued": producer["content"]["issued"],
+        "dataset": launch.dataset,
+        "pool": _fake_pool_counts(kept),
+    }
+    if mode == "decode":
+        # The block the validator demands of a decode cell of this layout too, with the dataset in it.
+        assert on_disk["kvwarm"] == {
+            "enabled": True,
+            "warm_eligible": True,
+            "skip_reason": None,
+            "method": "radix_cache_seed",
+            "dataset": {key: launch.dataset[key] for key in ("path", "sha256", "collection_pool", "conversations")},
+        }
+        merged = json.loads(launch.merged_path.read_text(encoding="utf-8"))
+        assert merged["kvwarm"] == on_disk["kvwarm"]
+    else:
+        assert "kvwarm" not in on_disk
+
+    # The host holds the recorded sizes against the cell of a MoE plan and accepts them: N, 1 and 1.
+    collection = _held_against_the_moe_cell(launch)
+    assert [measurement.point for measurement in collection.points] == launch.planned().point_dicts()
+    if mode == "decode":
+        assert {measurement.kv_seed_regime for measurement in collection.points} == {"real_kv"}
+    assert launch.result_files() == ["benchmark.json", "benchmark_merged.json"]
+    assert _stderr_lines(capsys)[-1] == f"[sglbench] complete: wrote {launch.rank_path}, {launch.merged_path}"
+
+
+def test_end_to_end_a_moe_dp_size_above_one_beside_the_command_of_a_pure_tp_cell_is_refused(tmp_path, monkeypatch):
+    cell = _pure_tp_cell("decode")
+    pod_dir = _pod(tmp_path, cell, sglang_version=FAKE_SGLANG_VERSION)
+
+    def prepare(world, _pod_dir):
+        world.experts = FAKE_EXPERTS
+
+    # FAKE: the resolution of the FAKE package lets the size through. SGLang refuses it with an assert, which
+    # is gone when Python runs with -O.
+    launch = _launch_text(
+        tmp_path,
+        monkeypatch,
+        "decode",
+        word=None,
+        tp_size=2,
+        flags=["--moe-dp-size", "2"],
+        prepare=prepare,
+        pod=(cell, pod_dir),
+        real_compat=True,
+    )
+
+    _assert_no_module_of_the_benchmark_is_replaced()
+    world = launch.world
+    # The flag is SGLang's and reached its parser beside ``--tp-size 2``; no ``--ep-size`` did.
+    assert world.sglang_argv == ["--moe-dp-size", "2", *_fake_sglang_argv(1, 2), STREAMING_FLAG]
+    assert (world.resolved["tp_size"], world.resolved["ep_size"], world.resolved["moe_dp_size"]) == (2, 1, 2)
+    # SGLang would give the expert layers a TP size of 2 // 1 // 2, while the sizes the artifact records, a TP
+    # size of 2 and an expert-parallel size of 1, are those of the pure TP layout.
+    on_disk = _assert_failed_before_the_grid(launch, 64, "rejected: moe_dp_size must be 1 (got 2)")
+    # Refused once the arguments were resolved: the model config was not read and no engine was built.
+    assert world.events[-2:] == ["resolve_once", "sleep"] and "Engine" not in world.events
+    assert "expert_keys" not in on_disk["producer"] and "moe" not in on_disk["producer"]
+
+
 def test_end_to_end_seeded_ids_with_a_model_that_has_expert_layers_are_refused(tmp_path, monkeypatch):
     def prepare(world, _pod_dir):
         world.experts = FAKE_EXPERTS
@@ -5667,18 +5834,32 @@ _HOST_WANTS_THE_LAYOUT = (
     "native SGLang rank artifact of a MoE plan did not run the layout of its cell: "
     "expected producer.tp_size {}, producer.moe.ep_size {} and producer.attn_dp_size {}, found {}, {} and {}: "
 )
-# name: (GPUs of the cell, the size flags that reach the pod, the expert keys the pod finds, the content word,
-# what the host says when it holds the result against the cell of a MoE plan; None when it accepts)
+# name: (the strategy of the cell, its GPUs, the size flags that reach the pod, the expert keys the pod finds,
+# the content word, what the host says when it holds the result against the cell of a MoE plan; None when it
+# accepts)
 _RUNS_OF_A_MOE_CELL = {
-    "tep": (2, ["--ep-size", "2"], FAKE_EXPERTS, None, None),
-    "one-gpu": (1, [], FAKE_EXPERTS, None, None),
-    "one-gpu-with-the-text-word": (1, [], FAKE_EXPERTS, "sharegpt_chain", None),
-    # The command reached the pod without --ep-size, and the launcher takes an expert-parallel size of 1.
-    "tep-without-ep-size": (2, [], FAKE_EXPERTS, None, _HOST_WANTS_THE_LAYOUT.format(2, 2, 1, 2, 1, 1)),
+    "tep": ("tep", 2, ["--ep-size", "2"], FAKE_EXPERTS, None, None),
+    # The command of a pure TP cell has no --ep-size, and SGLang's expert-parallel size of 1 is its layout.
+    "pure-tp": ("pure_tp", 2, [], FAKE_EXPERTS, None, None),
+    "one-gpu": ("single", 1, [], FAKE_EXPERTS, None, None),
+    "one-gpu-with-the-text-word": ("single", 1, [], FAKE_EXPERTS, "sharegpt_chain", None),
+    # The command of a TEP cell reached the pod without --ep-size. The launcher is not told which layout its
+    # cell is and runs the pure TP layout to the end; the host finds the expert-parallel size of another cell.
+    "tep-without-ep-size": ("tep", 2, [], FAKE_EXPERTS, None, _HOST_WANTS_THE_LAYOUT.format(2, 2, 1, 2, 1, 1)),
+    # The other way round: the command of a pure TP cell reached the pod with the --ep-size of the TEP cell.
+    "pure-tp-with-ep-size": (
+        "pure_tp",
+        2,
+        ["--ep-size", "2"],
+        FAKE_EXPERTS,
+        None,
+        _HOST_WANTS_THE_LAYOUT.format(2, 1, 1, 2, 2, 1),
+    ),
     # The pod found no expert layers in the model config.
-    "no-experts-found": (1, [], {}, None, _HOST_WANTS_TEXT),
-    "no-experts-found-with-the-seeded-word": (1, [], {}, "random", _HOST_WANTS_TEXT),
+    "no-experts-found": ("single", 1, [], {}, None, _HOST_WANTS_TEXT),
+    "no-experts-found-with-the-seeded-word": ("single", 1, [], {}, "random", _HOST_WANTS_TEXT),
     "no-experts-found-with-the-text-word": (
+        "single",
         1,
         [],
         {},
@@ -5693,10 +5874,15 @@ _RUNS_OF_A_MOE_CELL = {
 def test_end_to_end_the_host_holds_what_the_launcher_recorded_against_the_cell_of_a_moe_plan(
     tmp_path, monkeypatch, mode, name
 ):
-    gpus, size_flags, experts, word, refusal = _RUNS_OF_A_MOE_CELL[name]
-    # The cells AISim plans for a model with expert layers: the one-GPU cell and the TEP cell.
-    cell = _tep_cell(mode, gpus) if gpus > 1 else _cell(phase=mode, dp=1, strategy="single")
-    assert (cell.topology.tp, cell.topology.moe_ep) == (gpus, gpus)
+    strategy, gpus, size_flags, experts, word, refusal = _RUNS_OF_A_MOE_CELL[name]
+    # The cells AISim plans for a model with expert layers without DP attention: the one-GPU cell, the TEP cell
+    # and the pure TP cell. The expert-parallel size is the GPU count in a TEP cell and 1 in the other two.
+    if strategy == "single":
+        cell = _cell(phase=mode, dp=1, strategy="single")
+    else:
+        cell = _tep_cell(mode, gpus) if strategy == "tep" else _pure_tp_cell(mode, gpus)
+    assert (cell.parallel_strategy, cell.topology.tp) == (strategy, gpus)
+    assert cell.topology.moe_ep == (gpus if strategy == "tep" else 1)
     pod_dir = _pod(tmp_path, cell, sglang_version=FAKE_SGLANG_VERSION)
 
     def prepare(world, _pod_dir):
@@ -6372,6 +6558,7 @@ def test_the_expert_parallel_size_is_tested_before_the_layout_of_dp_attention(tm
         # DWDP switches DP attention on by itself and is refused by name.
         ({"attn_dp_size": 2, "dwdp_size": 2}, "DWDP is not supported (dwdp_size=2)"),
         ({"attn_dp_size": 2, "moe_dense_tp_size": 1}, "moe_dense_tp_size must not be set (got 1)"),
+        ({"attn_dp_size": 2, "moe_dp_size": 2}, "moe_dp_size must be 1 (got 2)"),
         ({"attn_dp_size": 2, "moe_a2a_backend": "deepep"}, f"{_A2A} (moe_a2a_backend=deepep)"),
         ({"attn_dp_size": 2, "enable_eplb": True}, "EPLB is not supported (enable_eplb=true)"),
         (

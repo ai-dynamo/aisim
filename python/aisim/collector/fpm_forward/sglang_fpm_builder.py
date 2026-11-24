@@ -65,6 +65,10 @@ The sizes of a cell with data-parallel ranks (DEP)
     both. Not run on an engine: a command this module wrote for more than two ranks, and ``--fpm-max-num-seqs``
     or ``--fpm-max-model-len`` on such a cell. The flags it writes for the prefill cell of four ranks ran on the
     launcher's own command, outside the collector (the deviation note at the translation table).
+
+    On 2026-11-23 the command this module writes for the pure TP cell of two GPUs, ``--tp-size 2`` and no
+    ``--ep-size``, ran through the launcher on two H200 GPUs with the same model: smoke grids at SGLang 0.5.22
+    and 0.5.23 and the default grid at 0.5.23. Not run on an engine: a pure TP command for more than two GPUs.
 """
 
 from __future__ import annotations
@@ -388,8 +392,12 @@ _TRANSLATION: dict[str, _Row] = {
     # written with. AISim's generated SGLang serving deployment passes the same size under the alias
     # --expert-parallel-size (backend_config_mapping.yaml, ``moe_expert_parallel_size``). The Generator sets
     # the switch only for an expert-parallel size above 1 (src/aisim/generator/rule_plugin/vllm.rule), so a
-    # one-GPU MoE cell writes no --ep-size and runs with SGLang's default. No other MoE flag has a row:
-    # --kernel-config and --enable-eplb refuse the cell like any unknown flag.
+    # one-GPU MoE cell and a pure TP cell write no --ep-size and run with SGLang's default. For a pure TP
+    # cell that default is the layout: SGLang cuts every expert over ``tp_size // ep_size // moe_dp_size``
+    # ranks (its ``moe_tp_size``; ``python/sglang/srt/runtime_context.py`` ``derive_parallel_widths``,
+    # read at both tags), so --tp-size N alone gives every rank a slice of every expert. The serving
+    # deployment writes the same as --expert-parallel-size 1. No other MoE flag has a row: --kernel-config
+    # and --enable-eplb refuse the cell like any unknown flag.
     _EXPERT_PARALLEL_SWITCH: _Row(writes=("--ep-size",), takes_value=False, value_of=_TENSOR_PARALLEL_FLAG),
     "--kv-cache-dtype": _Row(writes=("--kv-cache-dtype",), value=_kv_cache_dtype),
     # The same pair as the Generator's (backend_config_mapping.yaml, ``kv_cache_free_gpu_memory_fraction``).

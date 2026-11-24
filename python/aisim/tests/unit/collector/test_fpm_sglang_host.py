@@ -157,7 +157,7 @@ def _moe_plan_inputs(tmp_path: Path, **overrides) -> dict:
         "model_path": MOE_MODEL,
         "model_architecture": "NewMoeDsaForCausalLM",
         "model_config_path": _config(tmp_path, MOE_CONFIG),
-        # --fpm-parallel-presets tep. The default preset of a MoE model also plans DEP cells.
+        # --fpm-parallel-presets tep. The default preset of a MoE model also plans DEP and pure TP cells.
         "options": _options(fpm_parallel_presets=["tep"]),
     }
     return _plan_inputs(tmp_path, **{**inputs, **overrides})
@@ -408,8 +408,9 @@ def test_the_engine_limits_an_sglang_cell_can_take_are_admitted(tmp_path):
 def test_a_moe_plan_with_the_tep_preset_is_frozen_with_a_single_and_a_tep_cell(tmp_path):
     plan = build_collection_plan(**_moe_plan_inputs(tmp_path))
 
-    # The capability of the checkpoint: expert layers, and no pure TP for this backend.
-    assert (plan.capability.is_moe, plan.capability.allow_pure_tp) == (True, False)
+    # The capability of the checkpoint: expert layers, for which this backend plans pure TP too. The TEP preset
+    # of this plan leaves the pure TP cells out.
+    assert (plan.capability.is_moe, plan.capability.allow_pure_tp) == (True, True)
     # One cell per phase and GPU count. The one-GPU cell of the TEP preset has the strategy "single" and one
     # expert-parallel rank; the two-GPU cell has one expert-parallel rank per tensor-parallel rank.
     assert [(cell.workload_kind, cell.parallel_strategy, cell.topology.to_dict()) for cell in plan.cells] == [
@@ -449,6 +450,58 @@ def test_a_moe_plan_with_the_tep_preset_is_frozen_with_a_single_and_a_tep_cell(t
     assert identity.cells == plan.cells
 
 
+@pytest.mark.parametrize(
+    ("backend", "model", "allowed"),
+    [("sglang", "moe", True), ("sglang", "dense", False), ("vllm", "moe", True), ("vllm", "dense", False)],
+    ids=["sglang-moe", "sglang-dense", "vllm-moe", "vllm-dense"],
+)
+def test_pure_tp_is_a_capability_of_a_moe_model_under_sglang_as_under_vllm(tmp_path, backend, model, allowed):
+    inputs = _moe_plan_inputs(tmp_path) if model == "moe" else _plan_inputs(tmp_path)
+
+    plan = build_collection_plan(**{**inputs, "backend": backend})
+
+    # Pure TP is a layout of expert layers. The capability admits it for a model that has them, under either
+    # backend, and for no dense model.
+    assert (plan.capability.is_moe, plan.capability.allow_pure_tp) == (model == "moe", allowed)
+    # The saved plan holds the capability, so the answer is part of the plan hash.
+    assert plan.to_dict()["capability"]["allow_pure_tp"] is allowed
+
+
+def test_a_moe_plan_with_the_pure_tp_preset_holds_the_one_gpu_cell_and_a_pure_tp_cell(tmp_path):
+    plan = build_collection_plan(**_moe_plan_inputs(tmp_path, options=_options(fpm_parallel_presets=["pure_tp"])))
+
+    # One cell per phase and GPU count. The two-GPU cell has the strategy "pure_tp": every tensor-parallel rank
+    # holds a slice of every expert, so moe_tp is the tensor-parallel size and there is one expert-parallel rank.
+    assert [(cell.workload_kind, cell.parallel_strategy, cell.topology.to_dict()) for cell in plan.cells] == [
+        (phase, strategy, {"tp": tp, "pp": 1, "dp": 1, "moe_tp": tp, "moe_ep": 1, "cp": 1})
+        for phase in ("prefill", "decode")
+        for strategy, tp in (("single", 1), ("pure_tp", 2))
+    ]
+    assert [topology_strategy(topology, is_moe=True) for topology in plan.topologies] == ["single", "pure_tp"]
+    assert [topology.total_gpus for topology in plan.topologies] == [1, 2]
+    assert {cell.execution_identity for cell in plan.cells} == {LEGACY_EXECUTION_IDENTITY}
+    # Memory admission looked at both topologies and dropped none (no estimate in this suite, _hermetic_plans).
+    assert [(decision.topology, decision.disposition) for decision in plan.topology_memory_admission] == [
+        (topology, "unknown") for topology in plan.topologies
+    ]
+    # The one backend policy is the automatic baseline, as for a TEP cell: no engine flag and no vLLM marker.
+    (policy,) = plan.backend_policies
+    assert (policy.policy_id, policy.generator_overrides, policy.expected_markers) == ("baseline_auto", {}, {})
+    assert all(cell.backend_policy == policy for cell in plan.cells)
+
+    # The saved form names the strategy and both expert sizes, and its reader rebuilds every cell.
+    saved = plan.to_dict()
+    assert [
+        (topology["strategy"], topology["tp"], topology["moe_tp"], topology["moe_ep"])
+        for topology in saved["topologies"]
+    ] == [("single", 1, 1, 1), ("pure_tp", 2, 2, 1)]
+    assert saved["counts"]["memory_rejected_topologies"] == 0
+    assert saved["point_generation"]["owner"] == "collector.fpm_forward.runtime.sglbench_launcher"
+    identity = saved_plan_identity(json.loads(json.dumps(saved)))
+    assert (identity.backend, identity.sha256) == ("sglang", plan.sha256)
+    assert identity.cells == plan.cells
+
+
 def test_the_cli_plans_a_moe_collection_with_the_tep_preset_and_with_the_default_preset(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("COLLECTOR_MODEL_PATH", MOE_MODEL)
     arguments = [
@@ -473,7 +526,8 @@ def test_the_cli_plans_a_moe_collection_with_the_tep_preset_and_with_the_default
     ]
     assert saved_plan_identity(printed).backend == "sglang"
 
-    # Without the preset the plan of a MoE model holds a DEP cell as well for every GPU count above 1.
+    # Without the preset the plan of a MoE model holds a DEP cell and a pure TP cell as well for every GPU count
+    # above 1.
     assert cli.main(arguments) == 0
 
     printed = json.loads(capsys.readouterr().out)
@@ -483,7 +537,7 @@ def test_the_cli_plans_a_moe_collection_with_the_tep_preset_and_with_the_default
     ] == [
         (phase, strategy, tp, dp)
         for phase in ("prefill", "decode")
-        for strategy, tp, dp in (("single", 1, 1), ("dep", 1, 2), ("tep", 2, 1))
+        for strategy, tp, dp in (("single", 1, 1), ("dep", 1, 2), ("pure_tp", 2, 1), ("tep", 2, 1))
     ]
     assert saved_plan_identity(printed).backend == "sglang"
 
@@ -511,26 +565,36 @@ def test_memory_admission_still_drops_a_moe_cell_that_does_not_fit(tmp_path, mon
     ]
 
 
-# What a preset plans per phase for the FAKE MoE model on one and two GPUs: (strategy, tp, dp, moe_ep).
-SINGLE_CELL, TEP_CELL, DEP_CELL = ("single", 1, 1, 1), ("tep", 2, 1, 2), ("dep", 1, 2, 2)
+# What a preset plans per phase for the FAKE MoE model on one and two GPUs: (strategy, tp, dp, moe_tp, moe_ep).
+SINGLE_CELL, TEP_CELL, DEP_CELL = ("single", 1, 1, 1, 1), ("tep", 2, 1, 1, 2), ("dep", 1, 2, 1, 2)
+PURE_TP_CELL = ("pure_tp", 2, 1, 2, 1)
 
 
 @pytest.mark.parametrize(
     ("presets", "per_phase"),
     [
-        # The default preset "auto" plans TEP and DEP for a MoE model, as it does for vLLM.
-        (None, [SINGLE_CELL, DEP_CELL, TEP_CELL]),
-        (["auto"], [SINGLE_CELL, DEP_CELL, TEP_CELL]),
+        # The default preset "auto" plans DEP, pure TP and TEP for a MoE model, as it does for vLLM.
+        (None, [SINGLE_CELL, DEP_CELL, PURE_TP_CELL, TEP_CELL]),
+        (["auto"], [SINGLE_CELL, DEP_CELL, PURE_TP_CELL, TEP_CELL]),
+        (["pure_tp", "tep", "dep"], [SINGLE_CELL, DEP_CELL, PURE_TP_CELL, TEP_CELL]),
+        # The two presets by name plan what the default preset planned before pure TP was admitted.
         (["tep", "dep"], [SINGLE_CELL, DEP_CELL, TEP_CELL]),
         (["dep"], [SINGLE_CELL, DEP_CELL]),
     ],
-    ids=["default", "auto", "tep-and-dep", "dep"],
+    ids=["default", "auto", "all-three", "tep-and-dep", "dep"],
 )
 def test_a_moe_plan_holds_a_dep_cell_under_the_default_preset_and_under_the_dep_preset(tmp_path, presets, per_phase):
     plan = build_collection_plan(**_moe_plan_inputs(tmp_path, options=_options(fpm_parallel_presets=presets)))
 
     assert [
-        (cell.workload_kind, cell.parallel_strategy, cell.topology.tp, cell.topology.dp, cell.topology.moe_ep)
+        (
+            cell.workload_kind,
+            cell.parallel_strategy,
+            cell.topology.tp,
+            cell.topology.dp,
+            cell.topology.moe_tp,
+            cell.topology.moe_ep,
+        )
         for cell in plan.cells
     ] == [(phase, *sizes) for phase in ("prefill", "decode") for sizes in per_phase]
     # The DEP cell: one GPU and one expert-parallel rank per data-parallel rank, and nothing else above 1.
@@ -546,25 +610,81 @@ def test_a_moe_plan_holds_a_dep_cell_under_the_default_preset_and_under_the_dep_
     # The saved form names the strategy, and its reader recomputes the hash and rebuilds every cell.
     saved = plan.to_dict()
     assert [
-        (topology["strategy"], topology["tp"], topology["dp"], topology["moe_ep"]) for topology in saved["topologies"]
+        (topology["strategy"], topology["tp"], topology["dp"], topology["moe_tp"], topology["moe_ep"])
+        for topology in saved["topologies"]
     ] == per_phase
     identity = saved_plan_identity(json.loads(json.dumps(saved)))
     assert (identity.backend, identity.sha256) == ("sglang", plan.sha256)
     assert identity.cells == plan.cells
 
 
+def _cell_ids(plan) -> dict[tuple[str, str], str]:
+    return {(cell.workload_kind, cell.parallel_strategy): cell.cell_id for cell in plan.cells}
+
+
 def test_a_dep_cell_is_another_cell_than_the_tep_cell_of_the_same_gpus_and_the_tep_plan_is_unchanged(tmp_path):
-    both = build_collection_plan(**_moe_plan_inputs(tmp_path, options=_options(fpm_parallel_presets=None)))
+    every_layout = build_collection_plan(**_moe_plan_inputs(tmp_path, options=_options(fpm_parallel_presets=None)))
     tep_only = build_collection_plan(**_moe_plan_inputs(tmp_path))
 
-    ids = {(cell.workload_kind, cell.parallel_strategy): cell.cell_id for cell in both.cells}
-    assert len(set(ids.values())) == 6
-    # The cells a TEP plan holds are the same cells in the plan of the default preset: admitting DEP gave
-    # them no new id. The plan is another plan, because it holds more topologies.
-    assert {(cell.workload_kind, cell.parallel_strategy): cell.cell_id for cell in tep_only.cells} == {
-        key: cell_id for key, cell_id in ids.items() if key[1] != "dep"
-    }
-    assert both.sha256 != tep_only.sha256
+    ids = _cell_ids(every_layout)
+    # Per phase the one-GPU cell and the three cells of two GPUs, each with an id of its own.
+    assert len(set(ids.values())) == 8
+    # The cells a TEP plan holds are the same cells in the plan of the default preset: admitting DEP and pure
+    # TP gave them no new id. The plan is another plan, because it holds more topologies.
+    assert _cell_ids(tep_only) == {key: cell_id for key, cell_id in ids.items() if key[1] in ("single", "tep")}
+    assert every_layout.sha256 != tep_only.sha256
+
+
+def test_a_pure_tp_cell_is_another_cell_than_the_tep_cell_of_the_same_gpus_and_the_other_cells_are_unchanged(tmp_path):
+    def plan(presets):
+        return build_collection_plan(**_moe_plan_inputs(tmp_path, options=_options(fpm_parallel_presets=presets)))
+
+    every_layout, pure_tp_only, tep_and_dep = plan(None), plan(["pure_tp"]), plan(["tep", "dep"])
+
+    # The pure TP cell and the TEP cell of two GPUs have the same tensor-parallel size. They differ in the two
+    # expert sizes, which are part of a cell id.
+    ids = _cell_ids(every_layout)
+    for phase in ("prefill", "decode"):
+        assert ids[(phase, "pure_tp")] != ids[(phase, "tep")]
+    # The cells of the pure TP preset are the same cells in the plan of the default preset.
+    assert _cell_ids(pure_tp_only) == {key: cell_id for key, cell_id in ids.items() if key[1] in ("single", "pure_tp")}
+    # The TEP and the DEP preset together plan every other cell of the default preset under the id it has
+    # there: the cell set the default preset had before pure TP was admitted. Each is another plan.
+    assert _cell_ids(tep_and_dep) == {key: cell_id for key, cell_id in ids.items() if key[1] != "pure_tp"}
+    assert len({every_layout.sha256, pure_tp_only.sha256, tep_and_dep.sha256}) == 3
+
+
+@pytest.mark.parametrize(("max_gpus", "cells_per_phase"), [(2, 4), (4, 7), (8, 10)])
+def test_the_default_preset_plans_a_dep_a_pure_tp_and_a_tep_cell_for_every_gpu_count_above_one(
+    tmp_path, max_gpus, cells_per_phase
+):
+    def plan(presets, **overrides):
+        options = _options(fpm_max_gpus=max_gpus, fpm_parallel_presets=presets)
+        return build_collection_plan(**_moe_plan_inputs(tmp_path, options=options, **overrides))
+
+    # The default GPU counts are the powers of two up to --fpm-max-gpus. For each count above 1, in the order of
+    # the plan: (strategy, tp, dp, moe_tp, moe_ep).
+    widths = [width for width in (2, 4, 8) if width <= max_gpus]
+    expected = [SINGLE_CELL]
+    for width in widths:
+        expected += [("dep", 1, width, 1, width), ("pure_tp", width, 1, width, 1), ("tep", width, 1, 1, width)]
+    by_default = _cells(plan(None))
+    for phase in ("prefill", "decode"):
+        assert [
+            (cell.parallel_strategy, cell.topology.tp, cell.topology.dp, cell.topology.moe_tp, cell.topology.moe_ep)
+            for cell in by_default[phase]
+        ] == expected
+        assert len(by_default[phase]) == cells_per_phase
+        assert {cell.topology.total_gpus for cell in by_default[phase]} == {1, *widths}
+    # The vLLM plan of the same inputs holds the same topologies in the same order.
+    assert plan(None, backend="vllm").topologies == plan(None).topologies
+
+    # One cell per phase and GPU count above 1 is the pure TP cell. Without them the cells are those of the TEP
+    # and the DEP preset together: 3, 5 and 7 per phase.
+    without_pure_tp = _cells(plan(["tep", "dep"]))
+    for phase in ("prefill", "decode"):
+        assert without_pure_tp[phase] == [cell for cell in by_default[phase] if cell.parallel_strategy != "pure_tp"]
+        assert len(without_pure_tp[phase]) == cells_per_phase - len(widths)
 
 
 def test_the_dep_preset_plans_a_cell_for_every_gpu_count_and_the_width_filter_picks_one(tmp_path):
@@ -581,22 +701,100 @@ def test_the_dep_preset_plans_a_cell_for_every_gpu_count_and_the_width_filter_pi
     assert strategies(fpm_max_gpus=4, fpm_parallel_presets=["dep"], fpm_dp_sizes=[4]) == [("dep", 4, 4)]
 
 
+def test_the_pure_tp_preset_plans_a_cell_for_every_gpu_count_and_either_width_filter_picks_one(tmp_path):
+    def strategies(**options):
+        plan = build_collection_plan(**_moe_plan_inputs(tmp_path, options=_options(**options)))
+        return [
+            (cell.parallel_strategy, cell.topology.tp, cell.topology.moe_tp, cell.topology.moe_ep)
+            for cell in _cells(plan)["decode"]
+        ]
+
+    assert strategies(fpm_max_gpus=8, fpm_parallel_presets=["pure_tp"]) == [
+        ("single", 1, 1, 1),
+        ("pure_tp", 2, 2, 1),
+        ("pure_tp", 4, 4, 1),
+        ("pure_tp", 8, 8, 1),
+    ]
+    # The width of a pure TP cell is its tensor-parallel size and its moe_tp, so either filter picks the cell.
+    for width_filter in ("fpm_tp_sizes", "fpm_moe_tp_sizes"):
+        assert strategies(fpm_max_gpus=4, fpm_parallel_presets=["pure_tp"], **{width_filter: [4]}) == [
+            ("pure_tp", 4, 4, 1)
+        ]
+
+
+def test_a_width_filter_under_the_default_preset_binds_only_the_presets_that_have_its_axis(tmp_path):
+    def strategies(**options):
+        plan = build_collection_plan(**_moe_plan_inputs(tmp_path, options=_options(**options)))
+        return [(cell.parallel_strategy, cell.topology.total_gpus) for cell in _cells(plan)["decode"]]
+
+    # Pure TP has no expert-parallel and no data-parallel axis, so a filter on one of them leaves the pure TP
+    # cells in the plan of the default preset, as it does for vLLM. An expert-parallel filter leaves the
+    # one-GPU cell in it as well.
+    assert strategies(fpm_max_gpus=4, fpm_moe_ep_sizes=[2]) == [
+        ("single", 1),
+        ("dep", 2),
+        ("pure_tp", 2),
+        ("tep", 2),
+        ("pure_tp", 4),
+    ]
+    assert strategies(fpm_max_gpus=4, fpm_dp_sizes=[2]) == [
+        ("single", 1),
+        ("dep", 2),
+        ("pure_tp", 2),
+        ("tep", 2),
+        ("pure_tp", 4),
+        ("tep", 4),
+    ]
+    # With the presets named, the same filter gives the plan it gave before the default preset held pure TP.
+    assert strategies(fpm_max_gpus=4, fpm_parallel_presets=["tep", "dep"], fpm_moe_ep_sizes=[2]) == [
+        ("dep", 2),
+        ("tep", 2),
+    ]
+    # The legacy axes of pure TP plan the cells of the pure TP preset.
+    assert strategies(fpm_max_gpus=4, fpm_parallel_axes=["tp", "moe_tp"]) == [
+        ("single", 1),
+        ("pure_tp", 2),
+        ("pure_tp", 4),
+    ]
+
+
+def test_the_tp_preset_of_a_moe_model_is_refused(tmp_path):
+    # Refused before the SGLang check: plain TP is a preset of a dense model only.
+    _refused(
+        tmp_path,
+        "MoE models use pure TP, TEP or DEP; plain TP is not an independent typical preset",
+        **_moe_plan_inputs(tmp_path, options=_options(fpm_parallel_presets=["tp"])),
+    )
+
+
+def test_a_capability_that_does_not_admit_pure_tp_still_refuses_the_preset(tmp_path, monkeypatch):
+    # FAKE capability: the one of the MoE checkpoint with pure TP not admitted, which is what capabilities.py
+    # gives a DeepSeek V4.1 checkpoint under this backend.
+    resolve = planner.resolve_model_capability
+
+    def without_pure_tp(**keywords):
+        return dataclasses.replace(resolve(**keywords), allow_pure_tp=False)
+
+    monkeypatch.setattr(planner, "resolve_model_capability", without_pure_tp)
+
+    # Planning asks the capability and not the backend: the preset is refused before the SGLang check.
+    _refused(
+        tmp_path,
+        "pure TP was requested, but the AIC model/runtime capability profile does not explicitly admit",
+        **_moe_plan_inputs(tmp_path, options=_options(fpm_parallel_presets=["pure_tp"])),
+    )
+    # The default preset then plans TEP and DEP alone.
+    plan = build_collection_plan(**_moe_plan_inputs(tmp_path, options=_options(fpm_parallel_presets=None)))
+    assert plan.capability.allow_pure_tp is False
+    assert [cell.parallel_strategy for cell in _cells(plan)["decode"]] == ["single", "dep", "tep"]
+
+
 @pytest.mark.parametrize(
-    ("presets", "message"),
-    [
-        # Refused before the SGLang check: pure TP is admitted for vLLM only, and plain TP for a dense model only.
-        (["pure_tp"], "pure TP was requested, but the AIC model/runtime capability profile does not explicitly admit"),
-        (["tp"], "MoE models use TEP or DEP; plain TP is not an independent typical preset"),
-    ],
-    ids=["pure-tp", "tp"],
+    "presets", [None, ["auto"], ["tep"], ["dep"], ["pure_tp"]], ids=["default", "auto", "tep", "dep", "pure-tp"]
 )
-def test_the_other_presets_of_a_moe_model_are_refused(tmp_path, presets, message):
-    _refused(tmp_path, message, **_moe_plan_inputs(tmp_path, options=_options(fpm_parallel_presets=presets)))
-
-
-@pytest.mark.parametrize("presets", [None, ["auto"], ["tep"], ["dep"]], ids=["default", "auto", "tep", "dep"])
 def test_a_one_gpu_plan_of_a_moe_model_holds_the_single_cell_under_these_presets(tmp_path, presets):
-    # On one GPU the TEP and the DEP preset give the same topology, so no preset plans a cell with DP attention.
+    # On one GPU the TEP, the DEP and the pure TP preset give the same topology, so no preset plans a cell with
+    # DP attention or with more than one rank.
     options = _options(fpm_max_gpus=1, fpm_parallel_presets=presets)
 
     plan = build_collection_plan(**_moe_plan_inputs(tmp_path, options=options))
@@ -653,6 +851,16 @@ def test_the_tep_preset_of_a_dense_model_is_still_refused(tmp_path):
     )
 
 
+def test_the_pure_tp_preset_of_a_dense_model_is_refused(tmp_path):
+    # Pure TP spreads expert layers, which a dense model does not have: its capability does not admit the preset.
+    assert build_collection_plan(**_plan_inputs(tmp_path)).capability.allow_pure_tp is False
+    _refused(
+        tmp_path,
+        r"dense models support only the TP typical preset, got \['pure_tp'\]",
+        options=_options(fpm_parallel_presets=["pure_tp"]),
+    )
+
+
 def test_a_model_with_an_execution_identity_is_refused(tmp_path, monkeypatch):
     # The identity DeepSeek V4.1 and GLM-5.3-Flash get: a config hash in the first column.
     identity = ("0" * 64, "full", "none", "text")
@@ -704,12 +912,56 @@ def test_the_dep_topologies_of_a_moe_model_are_admitted_and_those_of_a_dense_mod
     assert [topology_strategy(topology, is_moe=True) for topology in admitted] == ["dep", "dep", "dep"]
 
     planner._require_sglang_launcher_cells(**moe, topologies=admitted)
-    # Beside the one-GPU cell and the TEP cells, as the default preset plans them.
-    planner._require_sglang_launcher_cells(**moe, topologies=(_moe_topology(tp=1), *admitted, _moe_topology(tp=2)))
+    # Beside the one-GPU cell, a pure TP cell and a TEP cell, as the default preset plans them.
+    beside = (_moe_topology(tp=1), _moe_topology(tp=2, moe_tp=2, moe_ep=1), _moe_topology(tp=2))
+    planner._require_sglang_launcher_cells(**moe, topologies=(*beside, *admitted))
 
     # A dense model has no cell with more than one data-parallel rank.
     with pytest.raises(ValueError, match=r"supports tensor-parallel cells only .*got topology .*'dp': 2"):
         planner._require_sglang_launcher_cells(is_moe=False, execution=LEGACY_EXECUTION_IDENTITY, topologies=admitted)
+
+
+def test_the_pure_tp_topologies_of_a_moe_model_are_admitted_and_those_of_a_dense_model_are_not():
+    moe = {"is_moe": True, "execution": LEGACY_EXECUTION_IDENTITY}
+    # Every tensor-parallel rank holds a slice of every expert: moe_tp is the tensor-parallel size, and there
+    # is one expert-parallel rank, one data-parallel rank, one pipeline stage and no context parallelism.
+    admitted = tuple(_moe_topology(tp=tp, moe_tp=tp, moe_ep=1) for tp in (2, 4, 8))
+    assert [topology.to_dict() for topology in admitted] == [
+        {"tp": tp, "pp": 1, "dp": 1, "moe_tp": tp, "moe_ep": 1, "cp": 1} for tp in (2, 4, 8)
+    ]
+    assert [topology_strategy(topology, is_moe=True) for topology in admitted] == ["pure_tp", "pure_tp", "pure_tp"]
+
+    planner._require_sglang_launcher_cells(**moe, topologies=admitted)
+    # Beside the one-GPU cell, which is the pure TP shape and the TEP shape at once, and the TEP and the DEP cell
+    # of the same GPUs.
+    for tp, pure_tp in zip((2, 4, 8), admitted, strict=True):
+        same_gpus = (_moe_topology(tp=1), _moe_topology(tp=1, dp=tp, moe_ep=tp), pure_tp, _moe_topology(tp=tp))
+        planner._require_sglang_launcher_cells(**moe, topologies=same_gpus)
+
+    # A dense model has no expert layers to slice: the same topologies are refused for it.
+    with pytest.raises(ValueError, match=r"supports tensor-parallel cells only .*got topology .*'moe_tp': 2"):
+        planner._require_sglang_launcher_cells(is_moe=False, execution=LEGACY_EXECUTION_IDENTITY, topologies=admitted)
+
+
+def test_a_refused_topology_with_both_expert_sizes_above_one_is_named_in_the_refusal():
+    # A mixed layout: four tensor-parallel ranks as two expert-parallel groups of two. No preset plans it.
+    topology = ParallelTopology(tp=4, pp=1, dp=1, moe_tp=2, moe_ep=2, cp=1)
+
+    with pytest.raises(ValueError) as refused:
+        planner._require_sglang_launcher_cells(is_moe=True, execution=LEGACY_EXECUTION_IDENTITY, topologies=(topology,))
+
+    assert str(refused.value) == (
+        "SGLang FPM collection supports the TEP, the pure TP and the DEP cells of a MoE model only; a cell without "
+        "DP attention must have pp and cp of 1 and either moe_tp of 1 with moe_ep equal to tp (TEP) or moe_ep of 1 "
+        "with moe_tp equal to tp (pure TP); got topology "
+        "{'tp': 4, 'pp': 1, 'dp': 1, 'moe_tp': 2, 'moe_ep': 2, 'cp': 1}"
+    )
+
+
+# The end of the rule for a cell without DP attention, before the topology: it names the two layouts admitted.
+NEITHER_LAYOUT = (
+    r"either moe_tp of 1 with moe_ep equal to tp \(TEP\) or moe_ep of 1 with moe_tp equal to tp \(pure TP\)"
+)
 
 
 @pytest.mark.parametrize(
@@ -725,26 +977,57 @@ def test_the_dep_topologies_of_a_moe_model_are_admitted_and_those_of_a_dense_mod
         ({"tp": 1, "dp": 2, "moe_tp": 2, "moe_ep": 2}, r"moe_ep must equal dp; .*\); got topology .*'moe_tp': 2"),
         ({"tp": 1, "dp": 2, "moe_ep": 2, "pp": 2}, r"moe_ep must equal dp; .*\); got topology .*'pp': 2"),
         ({"tp": 1, "dp": 2, "moe_ep": 2, "cp": 2}, r"moe_ep must equal dp; .*\); got topology .*'cp': 2"),
-        # Without them: pure TP, an expert-parallel size that is not the tensor-parallel size, and the fixed axes.
-        ({"tp": 2, "moe_tp": 2, "moe_ep": 1}, r"moe_ep equal to tp; got topology .*'moe_tp': 2, 'moe_ep': 1"),
-        ({"tp": 2, "moe_ep": 1}, r"moe_ep equal to tp; got topology .*'tp': 2, .*'moe_ep': 1"),
-        ({"tp": 4, "moe_ep": 2}, r"moe_ep equal to tp; got topology .*'tp': 4, .*'moe_ep': 2"),
-        ({"tp": 1, "moe_ep": 2}, r"moe_ep equal to tp; got topology .*'tp': 1, .*'moe_ep': 2"),
-        ({"tp": 4, "moe_tp": 2, "moe_ep": 2}, r"moe_ep equal to tp; got topology .*'moe_tp': 2, 'moe_ep': 2"),
+        # DP attention with a slice of every expert on each rank, so moe_tp above 1 and one expert-parallel rank:
+        # with one GPU per data-parallel rank, and with attention TP inside a rank.
+        (
+            {"tp": 1, "dp": 2, "moe_tp": 2, "moe_ep": 1},
+            r"moe_ep must equal dp; .*\); got topology .*'tp': 1, .*'dp': 2, 'moe_tp': 2, 'moe_ep': 1",
+        ),
+        (
+            {"tp": 2, "dp": 2, "moe_tp": 2, "moe_ep": 1},
+            r"moe_ep must equal dp; .*\); got topology .*'tp': 2, .*'dp': 2, 'moe_tp': 2, 'moe_ep': 1",
+        ),
+        # Without them. Plain TP of a MoE model, where neither expert size is the tensor-parallel size, and an
+        # expert-parallel size that is neither 1 nor the tensor-parallel size.
+        ({"tp": 2, "moe_ep": 1}, rf"{NEITHER_LAYOUT}; got topology .*'tp': 2, .*'moe_tp': 1, 'moe_ep': 1"),
+        ({"tp": 4, "moe_ep": 2}, rf"{NEITHER_LAYOUT}; got topology .*'tp': 4, .*'moe_ep': 2"),
+        ({"tp": 1, "moe_ep": 2}, rf"{NEITHER_LAYOUT}; got topology .*'tp': 1, .*'moe_ep': 2"),
+        # A mixed layout, with both expert sizes above 1: their product is the tensor-parallel size.
+        ({"tp": 4, "moe_tp": 2, "moe_ep": 2}, rf"{NEITHER_LAYOUT}; got topology .*'moe_tp': 2, 'moe_ep': 2"),
         # The expert-parallel size is the tensor-parallel size, and only moe_tp is not 1.
-        ({"tp": 2, "moe_tp": 2}, r"moe_ep equal to tp; got topology .*'tp': 2, .*'moe_tp': 2, 'moe_ep': 2"),
-        ({"pp": 2}, r"moe_ep equal to tp; got topology .*'pp': 2"),
-        ({"cp": 2}, r"moe_ep equal to tp; got topology .*'cp': 2"),
+        ({"tp": 2, "moe_tp": 2}, rf"{NEITHER_LAYOUT}; got topology .*'tp': 2, .*'moe_tp': 2, 'moe_ep': 2"),
+        # One expert-parallel rank, and a moe_tp that is neither 1 nor the tensor-parallel size.
+        ({"tp": 4, "moe_tp": 2, "moe_ep": 1}, rf"{NEITHER_LAYOUT}; got topology .*'tp': 4, .*'moe_tp': 2, 'moe_ep': 1"),
+        ({"tp": 2, "moe_tp": 4, "moe_ep": 1}, rf"{NEITHER_LAYOUT}; got topology .*'tp': 2, .*'moe_tp': 4, 'moe_ep': 1"),
+        # The two fixed axes, on the TEP shape and on the pure TP shape.
+        ({"pp": 2}, rf"{NEITHER_LAYOUT}; got topology .*'pp': 2"),
+        ({"cp": 2}, rf"{NEITHER_LAYOUT}; got topology .*'cp': 2"),
+        (
+            {"tp": 2, "moe_tp": 2, "moe_ep": 1, "pp": 2},
+            rf"{NEITHER_LAYOUT}; got topology .*'pp': 2, .*'moe_tp': 2, 'moe_ep': 1",
+        ),
+        (
+            {"tp": 2, "moe_tp": 2, "moe_ep": 1, "cp": 2},
+            rf"{NEITHER_LAYOUT}; got topology .*'moe_tp': 2, 'moe_ep': 1, 'cp': 2",
+        ),
     ],
     ids=[
         *("dp-with-tp", "dp-with-tp-and-ep-of-dp", "dp-without-ep", "ep-above-dp", "ep-below-dp"),
-        *("dp-with-moe-tp", "dp-with-pp", "dp-with-cp"),
-        *("pure-tp", "no-ep", "ep-below-tp", "ep-above-tp", "mixed", "moe-tp-beside-ep", "pp", "cp"),
+        *("dp-with-moe-tp", "dp-with-pp", "dp-with-cp", "dp-with-moe-tp-and-no-ep", "dp-with-pure-tp"),
+        *("no-ep", "ep-below-tp", "ep-above-tp", "mixed", "moe-tp-beside-ep", "moe-tp-below-tp", "moe-tp-above-tp"),
+        *("pp", "cp", "pure-tp-with-pp", "pure-tp-with-cp"),
     ],
 )
 def test_every_other_topology_of_a_moe_model_is_refused(sizes, message):
     moe = {"is_moe": True, "execution": LEGACY_EXECUTION_IDENTITY}
-    admitted = (_moe_topology(tp=1), _moe_topology(tp=2), _moe_topology(tp=1, dp=2, moe_ep=2))
+    # The four kinds of cell planning admits: the one-GPU cell and, on two GPUs, TEP, pure TP and DEP.
+    admitted = (
+        _moe_topology(tp=1),
+        _moe_topology(tp=2),
+        _moe_topology(tp=2, moe_tp=2, moe_ep=1),
+        _moe_topology(tp=1, dp=2, moe_ep=2),
+    )
+    planner._require_sglang_launcher_cells(**moe, topologies=admitted)
 
     with pytest.raises(ValueError, match=message) as refused:
         planner._require_sglang_launcher_cells(**moe, topologies=(*admitted, _moe_topology(**sizes)))
@@ -756,8 +1039,9 @@ def test_every_other_topology_of_a_moe_model_is_refused(sizes, message):
         )
     else:
         assert str(refused.value).startswith(
-            "SGLang FPM collection supports the TEP and the DEP cells of a MoE model only; a cell without DP "
-            "attention must have pp, cp and moe_tp of 1 and moe_ep equal to tp; got topology {"
+            "SGLang FPM collection supports the TEP, the pure TP and the DEP cells of a MoE model only; a cell "
+            "without DP attention must have pp and cp of 1 and either moe_tp of 1 with moe_ep equal to tp (TEP) or "
+            "moe_ep of 1 with moe_tp equal to tp (pure TP); got topology {"
         )
 
 

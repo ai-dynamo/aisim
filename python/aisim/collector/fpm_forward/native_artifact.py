@@ -885,9 +885,12 @@ def _validate_sglang_moe_producer(cell: FPMCell, producer: object, path: Path) -
     - the content. Without a content word the launcher sends dataset text only when the model config it loaded
       shows expert layers. A pod that finds none sends seeded token ids, whose routing to the experts is not
       that of text;
-    - the layout. Without DP attention the launcher accepts an expert-parallel size of 1 at any
-      tensor-parallel size, so a command that reached the pod without ``--ep-size`` runs every expert on every
-      rank. (Under DP attention the launcher requires ``ep_size == tp_size``.)
+    - the layout. Without DP attention the launcher accepts two expert-parallel sizes at any tensor-parallel
+      size: 1, and the tensor-parallel size itself. The first is the layout of a pure TP cell, where every
+      rank holds a slice of every expert, and the second that of a TEP cell. The launcher is not told
+      which of the two its cell is, so a command whose ``--ep-size`` does not fit the cell (a TEP command that
+      reached the pod without the flag, a pure TP command with it) runs the other layout. (Under DP attention
+      the launcher requires ``ep_size == tp_size``.)
 
     Each such run completes and passes every other rule of this module. This rule holds them against the cell:
     the content source must be dataset text, and the three recorded sizes must be the ones SGLang resolves for
@@ -896,8 +899,9 @@ def _validate_sglang_moe_producer(cell: FPMCell, producer: object, path: Path) -
     The mapping, for the cells planning admits for this backend (planner.py,
     ``_require_sglang_launcher_cells``). SGLang's ``tp_size`` counts every rank of the engine, so it is the
     cell's ``tp`` times its ``dp``; its ``ep_size`` is the cell's ``moe_ep``; its ``attn_dp_size`` is the
-    cell's ``dp``. For the one-GPU cell and a TEP cell that is ``tp``, ``moe_ep`` and 1, and for a DEP cell of
-    D ranks it is D, D and D.
+    cell's ``dp``. For the one-GPU cell, a pure TP cell and a TEP cell that is ``tp``, ``moe_ep`` and 1: N, 1
+    and 1 for a pure TP cell of N GPUs and N, N and 1 for its TEP cell, so the second size alone tells the
+    two apart. For a DEP cell of D ranks it is D, D and D.
 
     A pod that ran a DEP cell without ``--attn-dp-size``, or with the sizes of another GPU count, writes
     another number of rank files and is refused before this rule, by the ``dp`` block rule of
@@ -914,8 +918,11 @@ def _validate_sglang_moe_producer(cell: FPMCell, producer: object, path: Path) -
     source at v0.5.22 and v0.5.23 (``python/sglang/srt/runtime_context.py``, ``derive_attn_tp_size`` and
     ``num_dp_ranks_of``). On 2026-11-18 this rule accepted the rank files of the DEP cells of two ranks that
     the launcher wrote on H200 GPUs, the cells of a smoke grid at each release and the cells of the default
-    grid at v0.5.23, with the recorded sizes 2, 2 and 2. Its refusals have run in the tests only, on typed-in
-    files.
+    grid at v0.5.23, with the recorded sizes 2, 2 and 2. On 2026-11-23 it accepted the rank files of the pure TP
+    cells of two GPUs with the recorded sizes 2, 1 and 1: the cells of a smoke grid at each release and the cells
+    of the default grid at v0.5.23. Inside a collection its refusals have run in the tests only, on typed-in
+    files. Called by hand on the rank files of one smoke campaign of the default preset at v0.5.23, it refused
+    each of the DEP, pure TP and TEP results for the cells of the other two layouts.
     """
     content = producer.get("content") if isinstance(producer, dict) else None
     source = content.get("source") if isinstance(content, dict) else None
