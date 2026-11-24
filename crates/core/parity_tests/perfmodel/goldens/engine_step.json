@@ -1083,12 +1083,14 @@
     }
   },
   "header": {
-    "case_count": 94,
+    "case_count": 43,
     "command": "python aic-core/rust/aiconfigurator-core/parity_tests/regenerate_goldens.py",
+    "count_scope": "Current retained cases and (case, surface) records, including error records.",
     "engine_step_backend": "python",
     "git_describe": "996917fb",
     "git_head": "996917fb71f5aa1a98e4b765cf1345e2ed056127",
-    "surface_count": 348,
+    "provenance_scope": "Original Python capture; later Rust refreshes are recorded per surface in post_freeze_pins.",
+    "surface_count": 157,
     "thread_caps": {
       "MKL_NUM_THREADS": "1",
       "NUMEXPR_NUM_THREADS": "1",

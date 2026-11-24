@@ -1,12 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Fused MoE-block wiring regressions for the remaining bundled MiMo config."""
+"""Fused MoE-block wiring for retained MiMo and synthetic local hybrid configs."""
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
+import aisim_core.sdk.operations as ops
 from aisim_core.sdk import config
 from aisim_core.sdk.models import get_model
 
@@ -40,7 +43,69 @@ def _dispatches(op_list):
     return [op for op in op_list if type(op).__name__ == "MoEDispatch"]
 
 
+@pytest.fixture
+def synthetic_hybrid(tmp_path):
+    """Independently authored dimensions; no excluded checkpoint contents."""
+
+    def write(num_experts):
+        model_dir = tmp_path / f"hybrid-{num_experts}"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["MiMoV2FlashForCausalLM"],
+                    "num_hidden_layers": 4,
+                    "hidden_size": 256,
+                    "num_attention_heads": 8,
+                    "num_key_value_heads": 2,
+                    "head_dim": 32,
+                    "intermediate_size": 512,
+                    "moe_intermediate_size": 128,
+                    "num_experts_per_tok": 2,
+                    "n_routed_experts": num_experts,
+                    "vocab_size": 512,
+                    "max_position_embeddings": 2048,
+                    "hybrid_layer_pattern": [1, 0, 1, 0],
+                    "moe_layer_freq": [1, 1, 0, 0],
+                    "sliding_window_size": 128,
+                }
+            )
+        )
+        return str(model_dir)
+
+    return write
+
+
+@pytest.fixture(params=["retained_mimo", "synthetic"])
+def hybrid_model_path(request, synthetic_hybrid):
+    return MIMO if request.param == "retained_mimo" else synthetic_hybrid(16)
+
+
 class TestHybridMoEBlocksViaBuilder:
+    @pytest.mark.parametrize("num_experts", [16, 128])
+    def test_synthetic_router_emission_boundary(self, synthetic_hybrid, num_experts):
+        """Routers exist below and at the old 128-expert gate, only on MoE spans."""
+        model = _build(synthetic_hybrid(num_experts))
+        for phase, op_list in (("context", model.context_ops), ("generation", model.generation_ops)):
+            routers = [op for op in op_list if "router_gemm" in op._name]
+            assert _names(routers) == [f"{phase}_global_router_gemm", f"{phase}_swa_router_gemm"]
+            for router in routers:
+                assert isinstance(router, ops.GEMM)
+                assert (router._n, router._k, router._scale_factor) == (num_experts, 256, 1)
+                assert router._quant_mode.name == "bfloat16"
+                index = op_list.index(router)
+                assert _names(op_list[index + 1 : index + 4]) == [
+                    router._name.replace("router_gemm", suffix)
+                    for suffix in ("moe_pre_dispatch", "moe", "moe_post_dispatch")
+                ]
+
+    def test_synthetic_moe_comm_backend_is_rejected(self, synthetic_hybrid):
+        with pytest.raises(ValueError, match="large-EP is not wired for the HYBRIDMOE family"):
+            _build(
+                synthetic_hybrid(16),
+                moe_comm_backend={"context": "deepep_ht", "generation": "deepep_ll"},
+            )
+
     def test_mimo_context_sequence_unchanged(self):
         """>=128-expert models already emitted the router: byte-identical emission."""
         model = _build(MIMO)
@@ -76,21 +141,21 @@ class TestHybridMoEBlocksViaBuilder:
             "context_p2p",
         ]
 
-    def test_dispatch_ops_stay_quant_agnostic(self):
+    def test_dispatch_ops_stay_quant_agnostic(self, hybrid_model_path):
         """Legacy hybrid dispatches never carried quant_mode; the builder's fused
         path always forwards it, so the family resets it on the returned ops
         (quant-aware dispatch modeling is a deliberate follow-up, not a rewire
         side effect)."""
-        model = _build(MIMO)
+        model = _build(hybrid_model_path)
         dispatches = _dispatches(model.context_ops) + _dispatches(model.generation_ops)
         assert len(dispatches) == 8  # (global + swa) x (pre + post) x (context + generation)
         assert all(op._quant_mode is None for op in dispatches)
 
-    def test_cp_mutations_land_on_builder_ops(self):
+    def test_cp_mutations_land_on_builder_ops(self, hybrid_model_path):
         """The post-hoc CP wiring mutates the builder-returned ops: prefill router/MoE
         get seq_split, dispatches get attn_cp_size; decode dispatches are re-routed
         to the decode-CP comm path (attn_cp_size + is_context=False)."""
-        model = _build(MIMO, tp_size=1, moe_ep_size=2, attention_dp_size=1, cp_size=2)
+        model = _build(hybrid_model_path, tp_size=1, moe_ep_size=2, attention_dp_size=1, cp_size=2)
         assert _op(model.context_ops, "context_global_router_gemm")._seq_split == 2
         assert _op(model.context_ops, "context_global_moe")._seq_split == 2
         context_dispatches = _dispatches(model.context_ops)

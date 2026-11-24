@@ -400,6 +400,9 @@ def main(argv: list[str] | None = None) -> int:
         pin_map = payload.setdefault(PIN_MAP_KEY, {})
         for key in pinned[filename]:
             pin_map[key] = {"engine": "rust", "git_head": _GIT_HEAD}
+        if filename == "engine_step.json":
+            payload["header"]["case_count"] = len(payload["cases"])
+            payload["header"]["surface_count"] = sum(len(surfaces) for surfaces in payload["cases"].values())
         path = GOLDEN_DIR / filename
         path.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n")
         _log(f"wrote {path} ({len(pinned[filename])} pinned records)")

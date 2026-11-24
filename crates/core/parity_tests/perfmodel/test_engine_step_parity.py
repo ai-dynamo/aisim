@@ -1547,6 +1547,21 @@ class TestGoldenComparisonGuards:
     The fixture on disk is never touched.
     """
 
+    def test_engine_step_inventory_and_pin_provenance(self) -> None:
+        golden = load_parity_golden("engine_step.json")
+        records = {f"{case_id}::{surface}" for case_id, surfaces in golden["cases"].items() for surface in surfaces}
+        expected = {
+            f"{param.id}::{surface}"
+            for params, surfaces in ENGINE_STEP_GOLDEN_MATRIX
+            for param in params
+            for surface in surfaces
+        }
+        assert records == expected
+        assert golden["header"]["case_count"] == len(golden["cases"])
+        # Each surface is one record, whether it contains values or an error.
+        assert golden["header"]["surface_count"] == len(records)
+        assert set(golden["post_freeze_pins"]) <= records
+
     def test_golden_comparison_detects_drift(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -1804,16 +1819,20 @@ def fpm_systems_root(tmp_path_factory):
 
 class TestRustEngineStepFpmParity:
     @pytest.mark.parametrize(
-        "batch,kv_tokens,expected_ms",
+        "worker_type,batch,prefill_tokens,kv_tokens,expected_ms",
         [
-            (1, 1025, 2.2),
-            (512, 65536, 11.0),
-            (513, 65536, 33.0),
-            (512, 163840, 11.5),
-            (513, 163840, 34.5),
+            ("prefill", 1, 1024, 0, 18.0),
+            ("prefill", 1, 768, 0, 14.0),  # halfway between the 10 and 18 ms fixture rows
+            ("decode", 1, 0, 1025, 2.2),
+            ("decode", 512, 0, 65536, 11.0),
+            ("decode", 513, 0, 65536, 33.0),
+            ("decode", 512, 0, 163840, 11.5),
+            ("decode", 513, 0, 163840, 34.5),
         ],
     )
-    def test_fpm_engine_selection_and_decode_capture_boundary(self, fpm_systems_root, batch, kv_tokens, expected_ms):
+    def test_fpm_engine_selection_and_phase_timing(
+        self, fpm_systems_root, worker_type, batch, prefill_tokens, kv_tokens, expected_ms
+    ):
         from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
         # Exercise the legacy forward_model boundary through the canonical API.
@@ -1836,19 +1855,28 @@ class TestRustEngineStepFpmParity:
                 "kv_cache_dtype": "fp8",
                 "forward_model": "fpm",
             },
-            "decode",
+            worker_type,
         )
         model = RustForwardPassPerfModel.best_available(cfg)
         try:
             assert model.diagnostics()["provenance"]["selected_estimation_mode"] == "fpm_interpolation"
-            # Exact fixture rows give 2.2, 11 and 33 ms. Halfway between
+            # Expected values come from _FPM_ROWS, independently of the engine.
+            # Exact decode fixture rows give 2.2, 11 and 33 ms. Halfway between
             # KV=65536 and 262144 gives (11+12)/2=11.5 ms on the captured
             # side and (33+36)/2=34.5 ms on the eager side. No cross-cliff
             # averaging is valid at batch=512/513.
             ranks = [
                 {
                     "version": 1,
-                    "scheduled_requests": {"num_decode_requests": batch, "sum_decode_kv_tokens": kv_tokens},
+                    "scheduled_requests": (
+                        {
+                            "num_prefill_requests": batch,
+                            "sum_prefill_tokens": prefill_tokens,
+                            "sum_prefill_kv_tokens": kv_tokens,
+                        }
+                        if worker_type == "prefill"
+                        else {"num_decode_requests": batch, "sum_decode_kv_tokens": kv_tokens}
+                    ),
                 }
             ]
             assert model.estimate_forward_pass_time_ms(ranks) == pytest.approx(expected_ms)
