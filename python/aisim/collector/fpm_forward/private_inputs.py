@@ -106,6 +106,18 @@ def reclaim_delivery(cell_dir):
     receipt.unlink()
 
 
+def discard_diagnostics(directory, *, keep=()):
+    """Remove logs and config dumps that could not be sanitized."""
+    for name in ("raw", "logs"):
+        root = Path(directory) / name
+        for path in root.rglob("*"):
+            if path in keep or not (path.is_symlink() or path.is_file()):
+                continue
+            if name == "raw" and path.suffix == ".json" and "config" not in path.name:
+                continue
+            path.unlink()
+
+
 def sanitize_recovered_diagnostics(directory, overrides, *, cell=None, environment=None):
     """Retain diagnostics only when all redaction values match their saved digests."""
     try:
@@ -116,18 +128,14 @@ def sanitize_recovered_diagnostics(directory, overrides, *, cell=None, environme
         from .database import _observed_backend_markers
         from .runner import _atomic_json
 
-        projections = _observed_backend_markers(cell, Path(directory)) if cell is not None else {}
-        for path, projection in projections.items():
-            _atomic_json(path, projection)
-        for name in ("raw", "logs"):
-            root = Path(directory) / name
-            for path in root.rglob("*") if root.exists() else ():
-                if path.is_file() and not path.is_symlink():
-                    if path in projections:
-                        continue
-                    if name == "raw" and path.suffix == ".json" and "config" not in path.name:
-                        continue
-                    path.unlink()
+        retained = set()
+        try:
+            projections = _observed_backend_markers(cell, Path(directory)) if cell is not None else {}
+            for path, projection in projections.items():
+                _atomic_json(path, projection)
+                retained.add(path)
+        finally:
+            discard_diagnostics(directory, keep=retained)
     else:
         redact_diagnostics(directory, private_values(resolved))
 

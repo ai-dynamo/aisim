@@ -65,7 +65,7 @@ def _fpm_kda_cache_dtype(deployment: FpmDeploymentProfile, field: str) -> str | 
             return dtype.removeprefix("torch.") if isinstance(dtype, str) else None
         return recorded[0] if recorded and recorded[0] is not None and all(d == recorded[0] for d in recorded) else None
 
-    runtime = deployment.resources.runtime_memory
+    runtime = deployment.resources.runtime_memory if deployment.resources is not None else None
     return from_provenance(runtime.provenance) if runtime is not None else None
 
 

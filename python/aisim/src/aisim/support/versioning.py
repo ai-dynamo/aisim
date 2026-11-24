@@ -32,12 +32,14 @@ def _redact_diagnostic(
     diagnostic: str, sensitive_values: tuple[str, ...], sensitive_names: tuple[str, ...] = ()
 ) -> str:
     variants: dict[str, bool] = {}
-    for value in sensitive_values:
+    for index, value in enumerate(sensitive_values):
         if not value:
             continue
+        name = sensitive_names[index] if index < len(sensitive_names) else None
+        public_flag = name in {"HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"} and value in {"0", "1"}
         for variant in (value, value.replace("$", "$$")):
             for encoded in (variant, repr(variant)[1:-1], json.dumps(variant)[1:-1]):
-                variants[encoded] = variants.get(encoded, False) or len(value) >= 8
+                variants[encoded] = variants.get(encoded, False) or not public_flag
     for value in sorted(variants, key=len, reverse=True):
         if variants[value]:
             diagnostic = diagnostic.replace(value, "<redacted>")

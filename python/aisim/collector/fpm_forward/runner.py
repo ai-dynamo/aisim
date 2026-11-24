@@ -2128,7 +2128,12 @@ def _recover_completed_attempt(
     """
 
     status = entry.get("status")
-    if status not in FPM_RECOVERABLE_STATUSES or "cleanup_error" in entry or "private_cleanup_error" in entry:
+    if (
+        status not in FPM_RECOVERABLE_STATUSES
+        or "cleanup_error" in entry
+        or "private_cleanup_error" in entry
+        or "diagnostic_error" in entry
+    ):
         return None
     cell_dir = root / "cells" / cell.cell_id
     try:

@@ -127,6 +127,14 @@ def test_short_environment_values_preserve_diagnostic_numbers():
     )
 
 
+def test_short_private_value_is_redacted_outside_environment_assignments():
+    from aisimulate.support.versioning import _redact_diagnostic
+
+    assert _redact_diagnostic("HF_TOKEN: xyz; rejected xyz", ("xyz",), ("HF_TOKEN",)) == (
+        "HF_TOKEN: <redacted>; rejected <redacted>"
+    )
+
+
 @pytest.mark.parametrize("separator", [":", ": ", ":  "])
 def test_short_credentials_redacted_in_json_diagnostics(separator):
     from aisimulate.support.versioning import _redact_diagnostic

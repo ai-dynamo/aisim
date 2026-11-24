@@ -36,7 +36,7 @@ from .entry import _load_generator_overrides
 from .model_capability import ResolvedModelConfig, load_model_config
 from .planner import FPMCell, _backend_policies, _canonical_hash
 from .private_inputs import delivery_directory as new_delivery_directory
-from .private_inputs import private_values, reclaim_delivery, redact, redact_diagnostics
+from .private_inputs import discard_diagnostics, private_values, reclaim_delivery, redact, redact_diagnostics
 from .runtime_instrumentation import contained_file, read_json, validate_sha256
 from .topology import enumerate_fpm_topologies, topology_strategy
 from .types import ParallelTopology
@@ -1220,6 +1220,10 @@ def probe_runtime(
                         redact_diagnostics(phase_dir, sensitive_values)
                     except Exception as error:
                         diagnostics_ok = False
+                        try:
+                            discard_diagnostics(phase_dir)
+                        except OSError as cleanup_error:
+                            phase["diagnostic_cleanup_error"] = redact(str(cleanup_error), sensitive_values)
                         phase["diagnostic_error"] = redact(str(error), sensitive_values)
                         if phase["status"] not in {"interrupted", "cleanup_failed"}:
                             phase["status"] = "failed"
@@ -1232,9 +1236,12 @@ def probe_runtime(
                         if diagnostics_ok:
                             phase["artifacts"] = _snapshot_probe_artifacts(root, phase_dir)
                     except (OSError, ValueError) as error:
-                        phase.update(status="failed", capture_error=str(error))
-                        result["status"] = "failed"
-                        result["diagnostics"].append(f"{cell.workload_kind} evidence capture: {error}")
+                        phase["capture_error"] = redact(str(error), sensitive_values)
+                        if phase["status"] not in {"interrupted", "cleanup_failed"}:
+                            phase["status"] = "failed"
+                        if result["status"] != "interrupted":
+                            result["status"] = "failed"
+                        result["diagnostics"].append(f"{cell.workload_kind} evidence capture: {phase['capture_error']}")
                     result["phases"][cell.workload_kind] = copy.deepcopy(phase)
                     if execute:
                         attempt["status"] = result["status"] if result["status"] != "completed" else "running"

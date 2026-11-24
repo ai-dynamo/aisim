@@ -2337,7 +2337,8 @@ def test_plain_resume_recovers_interrupted_attempt_without_rerun(monkeypatch, tm
     assert record["artifact_recovery"]["original_status"] == "interrupted"
 
 
-def test_recovery_rejects_entries_with_cleanup_error(tmp_path):
+@pytest.mark.parametrize("failed_step", ["cleanup_error", "diagnostic_error"])
+def test_recovery_requires_verified_cleanup_and_diagnostics(tmp_path, failed_step):
     cell = _cell()
     plan = _plan(cell)
     root = tmp_path / "artifacts" / plan.sha256[:16] / "smoke"
@@ -2355,13 +2356,11 @@ def test_recovery_rejects_entries_with_cleanup_error(tmp_path):
         "attempt_id": "attempt-1",
         "error_type": "RuntimeError",
         "error": "result copy was interrupted",
-        "cleanup_error": "kubectl delete timed out",
+        failed_step: "finalization failed",
     }
 
-    # Identical artifacts, but the unverified teardown quarantines the entry:
-    # only a rerun re-drives the verified deletion of the leaked resource.
     assert fpm_runner._recover_completed_attempt(plan, cell, root, entry) is None
-    del entry["cleanup_error"]
+    del entry[failed_step]
     recovered = fpm_runner._recover_completed_attempt(plan, cell, root, entry)
     assert recovered is not None and recovered["status"] == "passed"
 

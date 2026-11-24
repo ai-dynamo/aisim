@@ -2082,7 +2082,10 @@ def test_probe_sanitization_failure_persists_terminal_phase(tmp_path, monkeypatc
             if cleanup_fails and executions:
                 raise OSError("teardown denied")
 
-    def sanitize(*args):
+    def sanitize(directory, values):
+        logs = Path(directory) / "logs"
+        logs.mkdir(exist_ok=True)
+        (logs / "unsafe.log").write_text("synthetic private diagnostic")
         raise OSError("diagnostic rewrite denied")
 
     monkeypatch.setattr(runtime_probe, "redact_diagnostics", sanitize)
@@ -2100,6 +2103,7 @@ def test_probe_sanitization_failure_persists_terminal_phase(tmp_path, monkeypatc
     phase = index["configurations"]["tp4"]["attempts"][0]["phases"]["prefill"]
     assert phase["status"] == ("interrupted" if interrupt else "cleanup_failed" if cleanup_fails else "failed")
     assert phase["diagnostic_error"] == "diagnostic rewrite denied"
+    assert not list(output.rglob("unsafe.log"))
     assert phase["artifacts"] == []
     assert not list(output.rglob("evidence-*"))
     if cleanup_fails:
