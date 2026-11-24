@@ -184,9 +184,10 @@ def _with_timing(raw, timing):
 
 
 @pytest.mark.parametrize("mode", ["aggregated", "disaggregated"])
-@pytest.mark.parametrize("timing", ["fixed", "polynomial"])
+@pytest.mark.parametrize("timing", ["fixed", "polynomial", "default"])
 def test_ngram_turns_vllm_async_scheduling_off_for_every_timing_model(mode, timing):
     raw = _with_timing(_prediction(mode=mode), timing)
+    raw["engine"]["model"] = REPLAY_TARGET
     runtime = _RecordingRuntime()
     config = CorePredictionConfig.model_validate(raw)
     EngineReplayRunnerFactory(runtime=runtime).create(0).run(prediction_to_replay_spec(config))

@@ -1188,12 +1188,18 @@ def resolve_kimi_k3_moe_arch_mode(
     architecture = (raw.get("architectures") or [None])[0]
     if architecture != "KimiK3ForConditionalGeneration":
         return None
-    if not raw.get("quant_algo"):
+    mode = _infer_quant_modes_from_raw_config(raw, architecture).get("moe_quant_mode")
+    if mode is None and raw.get("quant_algo") == "compressed-tensors":
+        _, ignored = parse_compressed_tensors_quant(_get_language_quantization_config(raw))
+        if "routing_experts" in ignored:
+            # Explicitly unquantized experts have precision metadata even
+            # though quantized-mode inference intentionally leaves them unset.
+            return common.MoEQuantMode.bfloat16
+    if mode is None:
         raise ValueError(
             "Kimi-K3 on Blackwell SGLang requires expert quantization metadata in "
             "config.json or hf_quant_config.json, or an explicit moe_quant_mode"
         )
-    mode = _infer_quant_modes_from_raw_config(raw, architecture).get("moe_quant_mode")
     if mode == common.MoEQuantMode.w4a16_mxfp4:
         return common.MoEQuantMode.w4a8_mxfp4_mxfp8
     return None

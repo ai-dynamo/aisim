@@ -702,17 +702,13 @@ def test_prediction_spec_lowers_fpm_forward_model_into_canonical_timing() -> Non
     )
 
 
-@pytest.mark.parametrize(
-    "explicit_mode",
-    [
-        False,
-    ],
-)
+@pytest.mark.parametrize("explicit_mode", [False, True])
 def test_prediction_spec_omits_the_forward_model_rank_field_for_op_level(monkeypatch, explicit_mode: bool) -> None:
     from aisim_core.sdk import RustForwardPassPerfModel
 
     monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
     engine = _fpm_engine()
+    engine["model"] = "Qwen/Qwen3-8B"
     engine["backend_version"] = "0.24.0"  # A shipped op-level database, independent of external FPM data.
     engine["workers"]["aggregated"]["timing"] = {"type": "default"}
     if explicit_mode:

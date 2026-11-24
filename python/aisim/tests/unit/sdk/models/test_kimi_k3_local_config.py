@@ -115,14 +115,35 @@ def test_canonical_estimator_uses_local_checkpoint_precision(local_kimi, monkeyp
     assert compiled and all(spec["engine"]["moe_dtype"] == "w4a8_mxfp4_mxfp8" for spec in compiled)
 
 
-def test_kimi_missing_precision_fails_and_explicit_mode_is_preserved(local_kimi):
+@pytest.mark.parametrize("dense_only", [False, True], ids=["no_quantization", "dense_only_mixed_precision"])
+def test_kimi_missing_precision_fails_and_explicit_mode_is_preserved(local_kimi, dense_only):
     path, raw = local_kimi
     del raw["quantization_config"]
+    if dense_only:
+        raw["quantization_config"] = {
+            "quant_method": "mixed_precision",
+            "quantized_layers": {"model.layers.0.self_attn.q_proj": {"quant_algo": "FP8"}},
+        }
     (path / "config.json").write_text(json.dumps(raw))
     with pytest.raises(ValueError, match="requires expert quantization metadata"):
         compile_engine(str(path), "b200_sxm", "sglang", "current")
     blob = compile_engine(str(path), "b200_sxm", "sglang", "current", moe_quant_mode="bfloat16")
     assert json.loads(_native.engine_spec_json_from_bincode(blob))["engine"]["moe_dtype"] == "bfloat16"
+
+
+def test_local_kimi_explicitly_unquantized_experts_keep_bfloat16(local_kimi):
+    from aisim.sdk.task_v2 import Task
+
+    path, raw = local_kimi
+    raw["quantization_config"]["ignore"].append("mlp.experts")
+    (path / "config.json").write_text(json.dumps(raw))
+    blob = compile_engine(str(path), "b200_sxm", "sglang", "current")
+    spec = json.loads(_native.engine_spec_json_from_bincode(blob))
+    assert spec["engine"]["moe_dtype"] == "bfloat16"
+    moe_ops = [op["Moe"] for op in spec["context_ops"] + spec["generation_ops"] if "Moe" in op]
+    assert moe_ops and all(op["quant_mode"] == "bfloat16" for op in moe_ops)
+    task = Task(model_path=str(path), system_name="b200_sxm", backend_name="sglang", total_gpus=1)
+    assert task.build_model_config(role="agg").moe_quant_mode is common.MoEQuantMode.bfloat16
 
 
 def test_local_kimi_fp8_export_keeps_its_declared_precision(local_kimi):

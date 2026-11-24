@@ -149,8 +149,10 @@ The affected model IDs are MiniMaxAI MiniMax-M2.5/M2.7/M3 and their NVIDIA NVFP4
 
 For offline Llama 4 Scout and Maverick use, the local directory must contain
 `config.json` with inline `image_processor_config`, or supply the processor
-metadata in a neighboring `preprocessor_config.json`. Parsing requires one of
-these forms; a quantization sidecar does not replace the processor metadata.
+metadata in a neighboring `preprocessor_config.json`. AISim reads the neighboring
+file only when `image_processor_config` is omitted from `config.json`; do not
+set it to `null` when using that file. Parsing requires valid inline metadata or
+the neighboring file; a quantization sidecar does not replace processor metadata.
 
 Local Kimi-K3 configurations on Blackwell SGLang select the MXFP4/MXFP8 MoE
 profile from their architecture and expert quantization metadata, just like
@@ -158,9 +160,13 @@ the Hugging Face checkpoint. Missing expert quantization metadata requires an
 explicit `moe_quant_mode`; the directory name does not establish precision.
 For `nvidia/Llama-3.1-70B-Instruct-FP8`, quantization must be declared inline
 or supplied in `hf_quant_config.json`. Local copies retaining that ID in
-`_name_or_path` receive the same validation. Sidecar download errors propagate
-and can be retried; a 404 is optional only when the checkpoint does not require
-the sidecar to establish its precision.
+`_name_or_path` receive the same validation. The upstream `config.json` instead
+uses a training path in `_name_or_path`, so copying only that file does not
+trigger the local missing-sidecar check and may default to BF16. For offline
+use, copy both upstream `config.json` and `hf_quant_config.json` into the same
+directory, or declare equivalent FP8 metadata inline. Sidecar download errors
+propagate and can be retried; a 404 is optional only when the checkpoint does
+not require the sidecar to establish its precision.
 
 ### Configuration license approval gate
 
