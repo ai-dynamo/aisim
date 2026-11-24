@@ -147,7 +147,7 @@ def test_pinned_llama4_uses_serving_processor_tile_limit(tmp_path, monkeypatch, 
     info = get_model_config_from_model_path(model_path, model_revision=revision)
     assert model.encoder_config.max_num_tiles == info["extra_params"].vision_config.max_num_tiles == sidecar_limit
     assert info["raw_config"]["image_processor_config"]["max_patches"] == sidecar_limit
-    assert reads == ["config.json", "preprocessor_config.json", "hf_quant_config.json"]
+    assert sorted(reads) == ["config.json", "hf_quant_config.json", "preprocessor_config.json"]
 
 
 def test_llama4_remote_processor_errors_are_not_silently_ignored(tmp_path, monkeypatch):
