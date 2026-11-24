@@ -495,6 +495,9 @@ pub(super) struct VllmHostOffloadAdapter {
     /// formed synchronizes before vLLM launches that pass. Taken when the
     /// pass forms; see [`Self::take_launch_sync_ms`].
     launch_sync_ms: Option<f64>,
+    /// Offloading: D2H copies completed since the preceding pass formed.
+    /// A queued preemption can have been decided before its store ended.
+    completed_stores: FxHashMap<TransferId, f64>,
     /// SimpleCPU: the latest end of transfers issued before this pass.
     prior_transfer_end_ms: Option<f64>,
     /// Load poll: a completed load keeps its keys in `load_by_key` until the
@@ -598,6 +601,7 @@ impl VllmHostOffloadAdapter {
             load_keys_epoch: 0,
             compute_not_before_ms: 0.0,
             launch_sync_ms: None,
+            completed_stores: FxHashMap::default(),
             prior_transfer_end_ms: None,
             hold_load_keys: false,
             fences_at_submit: Vec::new(),
@@ -974,13 +978,17 @@ impl VllmHostOffloadAdapter {
         self.load_epoch += completed.len() as u64;
         for transfer in &completed {
             let CompletedTransfer::Store {
-                request_id: _,
+                at_ms,
                 transfer_id,
                 blocks,
+                ..
             } = transfer
             else {
                 continue;
             };
+            if self.hold_load_keys && !self.rules.preemption_waits_for_all {
+                self.completed_stores.insert(*transfer_id, *at_ms);
+            }
             if self.checkpoint_stores.remove(transfer_id) {
                 continue;
             }
@@ -1011,6 +1019,7 @@ impl VllmHostOffloadAdapter {
                     request_id,
                     transfer_id,
                     blocks,
+                    ..
                 } = transfer
                 {
                     kvcr.store_local(&tier, *request_id, *transfer_id, blocks, now_ms);
@@ -1657,7 +1666,10 @@ impl VllmHostOffloadAdapter {
                 }
             } else {
                 let store = request.latest_store;
-                let deadline = store.and_then(|store| tier.transfer_deadline(store));
+                let deadline = store.and_then(|store| {
+                    tier.transfer_deadline(store)
+                        .or_else(|| self.completed_stores.get(&store).copied())
+                });
                 // A preemption during speculative emission follows the pass's
                 // stores: this one is submitted at the pass boundary.
                 if deadline.is_none()
@@ -1774,11 +1786,16 @@ impl VllmHostOffloadAdapter {
         self.compute_not_before_ms.max(now_ms)
     }
 
-    /// SimpleCPU: when the pass being formed finishes the transfers its
-    /// preemptions synchronize before launch, if any. Unlike
-    /// [`Self::compute_not_before_ms`], this fences the pass's launch, and
-    /// thus its connector poll, not only its forward.
+    /// Earliest launch after the connector's blocking transfers. Offloading
+    /// waits for stores of a preempted request or a reused source block.
+    /// Its raw compute bound includes just these store deadlines. A queued
+    /// launch can otherwise precede the time at which replay forms the pass.
     pub(super) fn take_launch_sync_ms(&mut self) -> Option<f64> {
+        if self.hold_load_keys && !self.rules.preemption_waits_for_all {
+            // The next decision is no earlier than this pass's formation.
+            self.completed_stores.clear();
+            return (self.compute_not_before_ms > 0.0).then_some(self.compute_not_before_ms);
+        }
         self.launch_sync_ms.take()
     }
 
@@ -4120,6 +4137,33 @@ mod tests {
     }
 
     #[test]
+    fn offloading_preemption_flushes_only_its_own_completed_store() {
+        let mut adapter = connector_adapter(G2Connector::OffloadingV032, 2);
+        adapter.enable_load_poll();
+        let mut manager = G1Manager::new_with_caching(2, 4, KvEventPublishers::default(), 0, true);
+        let (_, _first_lease, mut first) = stored(
+            &mut adapter,
+            &mut manager,
+            Uuid::from_u128(1),
+            vec![1; 4],
+            0.0,
+        );
+        let (_, _peer_lease, _) = stored(
+            &mut adapter,
+            &mut manager,
+            Uuid::from_u128(2),
+            vec![2; 4],
+            0.0,
+        );
+        adapter.complete_engine_boundary(&mut manager, 0.0);
+        // By pass formation both stores have finished, at 1 and 2 ms.
+        adapter.advance(&mut manager, 3.0);
+        adapter.preempt_request(&mut first);
+        assert_eq!(adapter.take_launch_sync_ms(), Some(1.0));
+        assert!(adapter.completed_stores.is_empty());
+    }
+
+    #[test]
     fn simple_cpu_preemption_waits_for_every_transfer_in_flight() {
         // A preemption makes SimpleCPU's worker synchronize every transfer in
         // flight (worker.py `handle_preemptions`); the offloading connector
@@ -4202,8 +4246,9 @@ mod tests {
                 "load poll {load_poll}"
             );
         }
-        // Without SimpleCPU's synchronization there is no launch sync.
+        // Offloading flushes only the preempted request's own stores.
         let mut adapter = connector_adapter(G2Connector::OffloadingV032, 3);
+        adapter.enable_load_poll();
         submit(&mut adapter, [1, 2, 3, 4]);
         adapter.note_pass_start();
         let (_, _, mut preempted) = request(Uuid::nil(), vec![1, 2, 3, 4]);

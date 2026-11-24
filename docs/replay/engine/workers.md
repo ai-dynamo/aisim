@@ -532,7 +532,11 @@ The connector-specific copy timing is:
 - `offloading_v0_32`: each load is its own copy, which starts once the issuing
   pass's GPU work ends and the previous copy is done. Another request that
   needs the same blocks waits for the load until vLLM has seen the copy
-  finish.
+  finish. Before launching a pass that preempts a request or reuses a GPU
+  block still being copied to the CPU, vLLM waits for the affected stores.
+  Replay checks block reuse at pass formation. For a preempted request,
+  the wait also includes its store if it finishes between the queued
+  decision and pass formation. The connector poll follows that wait.
 - `simple_cpu_v0_32`: a copy thread copies the issuing pass's loads as one
   batch, from the end of that pass's launch, without waiting for its GPU work
   but after the previous batch; vLLM sees them finish together.

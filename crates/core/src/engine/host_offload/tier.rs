@@ -192,9 +192,10 @@ pub(crate) enum LoadOutcome {
 }
 
 /// Successful transfer completion returned to the framework adapter.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum CompletedTransfer {
     Store {
+        at_ms: f64,
         request_id: Uuid,
         transfer_id: TransferId,
         blocks: Vec<HostBlockKey>,
@@ -1811,6 +1812,7 @@ impl HostTier {
                 },
             });
             CompletedTransfer::Store {
+                at_ms,
                 request_id,
                 transfer_id,
                 blocks,

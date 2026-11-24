@@ -823,9 +823,8 @@ struct UnpricedPass {
     previous_in_flight: bool,
     /// Load poll: the index of the decision that formed this pass.
     poll_index: u64,
-    /// Load poll, SimpleCPU: a preemption in this pass synchronizes the
-    /// transfers in flight before vLLM launches it, so its connector poll
-    /// comes no earlier than they end.
+    /// Load poll: the connector waits for these transfers before launching
+    /// the pass, so its post-forward poll comes after the wait.
     launch_sync_ms: Option<f64>,
     /// `launch`: the scheduled work the launch cost depends on; `None` when
     /// the pass scheduled nothing or `launch` is unset.
@@ -2935,9 +2934,8 @@ impl VllmCore {
             } else {
                 pass.now_ms
             };
-            // A SimpleCPU preemption synchronizes the transfers in flight
-            // before vLLM launches the pass, so the launch, its post-forward
-            // poll and the next decision all follow that synchronization.
+            // A blocking connector transfer delays the launch, its
+            // post-forward poll and the next scheduling decision.
             let launch_start_ms = pass
                 .launch_sync_ms
                 .map_or(decision_ms, |sync_ms| decision_ms.max(sync_ms));

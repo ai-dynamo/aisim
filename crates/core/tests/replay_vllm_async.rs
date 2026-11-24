@@ -803,3 +803,69 @@ fn simple_cpu_preemption_delays_previous_outputs_and_the_next_pass_restore() {
         (Some(899.0), Some(1017.0))
     );
 }
+
+#[test]
+fn offloading_store_flush_precedes_the_connector_poll() {
+    let gbps = |ms_per_block: f64| 64.0 / (ms_per_block * 1e6);
+    let run = |arrival, h2d_ms| {
+        let mut config = polled_cpu_tier(10, gbps(h2d_ms));
+        config.native_host_offload = Some(
+            NativeHostOffloadConfig::new(64)
+                .with_bandwidths(gbps(34.0), gbps(h2d_ms))
+                .with_connector(G2Connector::OffloadingV032),
+        );
+        let report = run_tokens(
+            config,
+            vec![
+                tokens_request(1, (0..20).collect(), 1, 0.0),
+                tokens_request(2, (500..536).collect(), 1, 300.0),
+                tokens_request(3, (900..901).collect(), 24, 600.0),
+                tokens_request(5, (1900..1908).collect(), 24, 600.0),
+                tokens_request(4, (0..24).collect(), 2, arrival),
+            ],
+        );
+        let restored = record(&report, 4);
+        (
+            restored.first_admission_host_reused_input_tokens,
+            restored.first_admit_ms,
+            restored.last_token_ms,
+        )
+    };
+    // The arrival at 625 is after the 620 nominal launch but before the
+    // required D2H fence at 706. It joins the next pass and reuses 20
+    // tokens, with its 15 ms H2D ending at 831.
+    assert_eq!(run(625.0, 3.0), (Some(20), Some(884.0), Some(1004.0)));
+    // At 615 it joins that pass with either launch window. The restore ends
+    // at 866. Pass 8 waits for a D2H until 874, then polls. Its two-pass
+    // pipeline therefore admits the request in pass 10 at 894.
+    assert_eq!(run(615.0, 10.0), (Some(20), Some(894.0), Some(1014.0)));
+}
+
+#[test]
+fn offloading_preemption_waits_for_its_store_completed_after_the_decision() {
+    let gbps = |ms_per_block: f64| 64.0 / (ms_per_block * 1e6);
+    let mut config = polled_cpu_tier(9, gbps(6.0));
+    config.launch.as_mut().unwrap().decode_ms = 10.0;
+    config.native_host_offload = Some(
+        NativeHostOffloadConfig::new(64)
+            .with_bandwidths(gbps(7.0), gbps(6.0))
+            .with_connector(G2Connector::OffloadingV032),
+    );
+    let report = run_tokens(
+        config,
+        vec![
+            tokens_request(1, (0..1).collect(), 10, 0.0),
+            tokens_request(2, (100..115).collect(), 19, 0.0),
+            tokens_request(3, (300..305).collect(), 3, 121.0),
+        ],
+    );
+    // Pass 7 is decided at 250, while the preempted request's store is in
+    // flight. The store ends at 257, before replay forms the pass at 260.
+    // Its 10 ms launch ends at 267 and shifts subsequent decisions by 7 ms.
+    assert_eq!(record(&report, 1).last_token_ms, Some(297.0));
+    let second = record(&report, 2);
+    assert_eq!(
+        (second.readmission_count, second.last_token_ms),
+        (0, Some(490.0))
+    );
+}
