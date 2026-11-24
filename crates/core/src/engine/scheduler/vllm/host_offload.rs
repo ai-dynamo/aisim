@@ -1645,16 +1645,21 @@ impl VllmHostOffloadAdapter {
         let deadline = {
             let tier = self.host.read();
             if self.rules.preemption_waits_for_all {
-                let deadline = tier.last_deadline(self.host.id());
-                // The worker synchronizes before it launches the pass, so
-                // that pass's connector poll comes after the transfers in
-                // flight when the pass started. Loads this pass issues are
-                // submitted after its launch and do not extend that wait.
-                if let Some(sync_ms) = self.pass_start_last_deadline {
-                    self.launch_sync_ms =
-                        Some(self.launch_sync_ms.map_or(sync_ms, |at| at.max(sync_ms)));
+                if self.hold_load_keys {
+                    // Load poll: the worker synchronizes the transfers in
+                    // flight when the pass started before it launches the
+                    // pass; its launch, connector poll and forward follow.
+                    // Loads this pass issues are submitted after its launch
+                    // and copy from its launch end, so they extend neither.
+                    let sync_ms = self.pass_start_last_deadline;
+                    if let Some(sync_ms) = sync_ms {
+                        self.launch_sync_ms =
+                            Some(self.launch_sync_ms.map_or(sync_ms, |at| at.max(sync_ms)));
+                    }
+                    sync_ms
+                } else {
+                    tier.last_deadline(self.host.id())
                 }
-                deadline
             } else {
                 let store = request.latest_store;
                 let deadline = store.and_then(|store| tier.transfer_deadline(store));
@@ -4160,8 +4165,6 @@ mod tests {
         // before it launches the pass, so the sync covers only the first two:
         // the pass polls the connector no earlier than 2 ms. Its own transfer
         // is submitted after launch and must not delay that poll to 3 ms.
-        // The forward still waits for every transfer in flight.
-        let mut adapter = connector_adapter(G2Connector::SimpleCpuV032, 3);
         let mut submit = |adapter: &mut VllmHostOffloadAdapter, tokens: [u32; 4]| {
             let (_, _, host) = request(Uuid::nil(), tokens.to_vec());
             let StoreOutcome::Prepared { transfer_id, .. } =
@@ -4175,15 +4178,34 @@ mod tests {
             assert_eq!(adapter.host.lock().submit_prepared_stores(C, 0.0), 1);
             transfer_id
         };
-        let first = submit(&mut adapter, [1, 2, 3, 4]);
-        submit(&mut adapter, [5, 6, 7, 8]);
-        adapter.note_pass_start();
-        submit(&mut adapter, [9, 10, 11, 12]);
-        let (_, _, mut preempted) = request(Uuid::nil(), vec![1, 2, 3, 4]);
-        preempted.latest_store = Some(first);
-        adapter.preempt_request(&mut preempted);
-        assert_eq!(adapter.take_launch_sync_ms(), Some(2.0));
-        assert_eq!(adapter.compute_not_before_ms(0.0), 3.0);
+        // With load poll, the forward waits for the same two transfers; without
+        // it, the forward still waits for every transfer in flight and there
+        // is no launch sync, as before.
+        for (load_poll, launch_sync, compute_not_before) in
+            [(true, Some(2.0), 2.0), (false, None, 3.0)]
+        {
+            let mut adapter = connector_adapter(G2Connector::SimpleCpuV032, 3);
+            if load_poll {
+                adapter.enable_load_poll();
+            }
+            let first = submit(&mut adapter, [1, 2, 3, 4]);
+            submit(&mut adapter, [5, 6, 7, 8]);
+            adapter.note_pass_start();
+            submit(&mut adapter, [9, 10, 11, 12]);
+            let (_, _, mut preempted) = request(Uuid::nil(), vec![1, 2, 3, 4]);
+            preempted.latest_store = Some(first);
+            adapter.preempt_request(&mut preempted);
+            assert_eq!(
+                adapter.take_launch_sync_ms(),
+                launch_sync,
+                "load poll {load_poll}"
+            );
+            assert_eq!(
+                adapter.compute_not_before_ms(0.0),
+                compute_not_before,
+                "load poll {load_poll}"
+            );
+        }
         // Without SimpleCPU's synchronization there is no launch sync.
         let mut adapter = connector_adapter(G2Connector::OffloadingV032, 3);
         submit(&mut adapter, [1, 2, 3, 4]);

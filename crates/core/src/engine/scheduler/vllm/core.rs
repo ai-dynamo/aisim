@@ -3720,10 +3720,12 @@ impl VllmCore {
             .native_host_offload
             .as_ref()
             .map_or(now_ms, |adapter| adapter.compute_not_before_ms(now_ms));
+        let load_poll = self.load_poll();
         let launch_sync_ms = self
             .native_host_offload
             .as_mut()
-            .and_then(VllmHostOffloadAdapter::take_launch_sync_ms);
+            .and_then(VllmHostOffloadAdapter::take_launch_sync_ms)
+            .filter(|_| load_poll);
         // Emit the terminal signals for the requests the gate rejected above
         // (see the gate comment for why this can't be done inline).
         for uuid in rejected_uuids {
