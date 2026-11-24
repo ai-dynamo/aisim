@@ -2182,6 +2182,50 @@ class TestQwen3VLVisionEncoderParsing:
         assert result["extra_params"].deepstack_visual_indexes == (8, 17, 26)
 
 
+@pytest.mark.parametrize("layout", ["inline", "neighbor", "missing"])
+def test_local_llama4_processor_layouts(tmp_path, layout):
+    # Independently authored miniature geometry tests local metadata loading,
+    # without depending on the excluded Scout or Maverick bundled configs.
+    raw = {
+        "architectures": ["Llama4ForConditionalGeneration"],
+        "text_config": {
+            "num_hidden_layers": 2,
+            "hidden_size": 64,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "intermediate_size": 128,
+            "vocab_size": 256,
+            "max_position_embeddings": 1024,
+        },
+        "vision_config": {
+            "hidden_size": 32,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_channels": 3,
+            "intermediate_size": 128,
+            "image_size": 16,
+            "patch_size": 4,
+            "pixel_shuffle_ratio": 0.5,
+            "projector_input_dim": 128,
+            "projector_output_dim": 64,
+            "vision_output_dim": 64,
+        },
+    }
+    processor = {"max_patches": 4, "resize_to_max_canvas": False, "add_global_tile": True}
+    if layout == "inline":
+        raw["image_processor_config"] = processor
+    elif layout == "neighbor":
+        (tmp_path / "preprocessor_config.json").write_text(json.dumps(processor))
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    if layout == "missing":
+        with pytest.raises(TypeError, match="image_processor_config.*preprocessor_config.json"):
+            get_model_config_from_model_path(str(tmp_path))
+    else:
+        parsed = get_model_config_from_model_path(str(tmp_path))
+        assert parsed["raw_config"]["image_processor_config"] == processor
+        assert parsed["extra_params"].vision_config.max_num_tiles == 4
+
+
 def test_qwen3_vl_pixel_budget_follows_the_checkpoint_processor(tmp_path, caplog):
     checkpoint = tmp_path / "with-processor"
     checkpoint.mkdir()

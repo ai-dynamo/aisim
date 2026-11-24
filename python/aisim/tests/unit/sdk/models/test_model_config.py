@@ -854,6 +854,37 @@ class TestKVCacheElementsPerToken:
         assert model.model_family == expected_family
         assert model.get_kvcache_elements_per_token() == expected_elems
 
+    @pytest.mark.parametrize("tp", [1, 2])
+    def test_local_non_deepseek_mla_cache_is_not_sharded_by_tp(self, tmp_path, tp):
+        # Synthetic text-only geometry, independently authored rather than
+        # copied from a removed Kimi checkpoint. MLA stores 24 latent + 8
+        # rotary elements per layer on each rank: three layers need 96.
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["KimiK25ForConditionalGeneration"],
+                    "text_config": {
+                        "num_hidden_layers": 3,
+                        "hidden_size": 256,
+                        "num_attention_heads": 8,
+                        "num_key_value_heads": 8,
+                        "intermediate_size": 512,
+                        "moe_intermediate_size": 128,
+                        "num_experts_per_tok": 2,
+                        "n_routed_experts": 4,
+                        "kv_lora_rank": 24,
+                        "qk_rope_head_dim": 8,
+                        "v_head_dim": 32,
+                        "vocab_size": 512,
+                        "max_position_embeddings": 2048,
+                    },
+                }
+            )
+        )
+        model = self._build_model(str(tmp_path), tp, moe_tp_size=1, moe_ep_size=tp)
+        assert model.model_family == "KIMIK25"
+        assert model.get_kvcache_elements_per_token() == 96
+
     @pytest.mark.parametrize("tp,expected_elements", [(1, 4096), (2, 2048), (4, 2048)])
     @pytest.mark.parametrize("kv_dtype", [common.KVCacheQuantMode.fp8, common.KVCacheQuantMode.bfloat16])
     def test_nemotron_h_counts_only_attention_kv(self, tp, expected_elements, kv_dtype):

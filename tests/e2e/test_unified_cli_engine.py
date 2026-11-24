@@ -344,7 +344,7 @@ def test_agentx_replay_cli_table_and_help_identify_qualification(tmp_path: Path)
 @pytest.mark.parametrize(
     "config_path",
     (
-        *(path for path in _RECOMMEND_CASES if path.name != "08-heterogeneous-pd.yaml"),
+        *_RECOMMEND_CASES,
         _REPO_ROOT / "examples/cli/dynamo-deployment-recommend.yaml",
     ),
     ids=lambda path: path.stem,

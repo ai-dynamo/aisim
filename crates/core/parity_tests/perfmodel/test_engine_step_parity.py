@@ -1681,12 +1681,12 @@ class TestRustTypedErrorsAcrossFfi:
 
 
 # --------------------------------------------------------------------------- #
-# A synthetic FPM dataset proves that the retained Qwen SOL query needs no
-# op-level measurements. Its MiniMax row identity is test metadata only;
-# constructing the dataset never reads a MiniMax configuration.
+# A synthetic FPM dataset exercises whole-model timing and the decode capture
+# boundary without op-level measurements. All rows are independently authored
+# test data under a retained model identity, not measured serving performance.
 # --------------------------------------------------------------------------- #
 
-_FPM_MODEL = "MiniMaxAI/MiniMax-M2.5"
+_FPM_MODEL = "Qwen/Qwen3-30B-A3B"
 _FPM_VERSION = "0.24.0"
 # (workload_kind, batch, total_prefill, total_kv, latency_ms) — per-DP-rank
 # iteration totals, batch domains sized for the runtime points below.
@@ -1803,6 +1803,58 @@ def fpm_systems_root(tmp_path_factory):
 
 
 class TestRustEngineStepFpmParity:
+    @pytest.mark.parametrize(
+        "batch,kv_tokens,expected_ms",
+        [
+            (1, 1025, 2.2),
+            (512, 65536, 11.0),
+            (513, 65536, 33.0),
+            (512, 163840, 11.5),
+            (513, 163840, 34.5),
+        ],
+    )
+    def test_fpm_engine_selection_and_decode_capture_boundary(self, fpm_systems_root, batch, kv_tokens, expected_ms):
+        from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+
+        # Exercise the legacy forward_model boundary through the canonical API.
+        cfg = ForwardPassPerfModelConfig.from_legacy_engine_config(
+            {
+                "schema_version": 1,
+                "model_name": _FPM_MODEL,
+                "system_name": "b200_sxm",
+                "backend": "vllm",
+                "backend_version": _FPM_VERSION,
+                "systems_path": str(fpm_systems_root),
+                "tp_size": 2,
+                "pp_size": 1,
+                "attention_dp_size": 1,
+                "moe_tp_size": 1,
+                "moe_ep_size": 2,
+                "weight_dtype": "fp8_block",
+                "moe_dtype": "fp8_block",
+                "activation_dtype": "bfloat16",
+                "kv_cache_dtype": "fp8",
+                "forward_model": "fpm",
+            },
+            "decode",
+        )
+        model = RustForwardPassPerfModel.best_available(cfg)
+        try:
+            assert model.diagnostics()["provenance"]["selected_estimation_mode"] == "fpm_interpolation"
+            # Exact fixture rows give 2.2, 11 and 33 ms. Halfway between
+            # KV=65536 and 262144 gives (11+12)/2=11.5 ms on the captured
+            # side and (33+36)/2=34.5 ms on the eager side. No cross-cliff
+            # averaging is valid at batch=512/513.
+            ranks = [
+                {
+                    "version": 1,
+                    "scheduled_requests": {"num_decode_requests": batch, "sum_decode_kv_tokens": kv_tokens},
+                }
+            ]
+            assert model.estimate_forward_pass_time_ms(ranks) == pytest.approx(expected_ms)
+        finally:
+            model.close()
+
     def test_sol_does_not_require_op_tables(self, fpm_systems_root):
         from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 

@@ -8,7 +8,7 @@ traffic:
   stop: {requests: 6}
 engine:
   mode: disaggregated
-  model: meta-llama/Meta-Llama-3.1-8B
+  model: Qwen/Qwen3-8B
   hardware: h200_sxm
   backend: vllm
   backend_version: 0.24.0

@@ -82,6 +82,17 @@ def test_model_free_or_target_draft_schemes_reject_unused_checkpoint(kind, param
         resolve_speculation_config(SpeculationConfig(kind, params, **draft))
 
 
+@pytest.mark.parametrize("kind,params", [("unknown", {}), ("eagle3", {"unknown": 1})])
+def test_invalid_registry_identity_fails_before_checkpoint_loading(monkeypatch, kind, params):
+    def unexpected_load(*args):
+        pytest.fail("invalid scheme identity must not load a checkpoint")
+
+    monkeypatch.setattr(utils, "_load_model_config_from_model_path", unexpected_load)
+    monkeypatch.setattr(utils, "get_model_config_from_model_path", unexpected_load)
+    with pytest.raises(ValueError, match="Unknown"):
+        resolve_speculation_config(SpeculationConfig(kind, params, draft_model_path="unused/draft"))
+
+
 def test_learned_draft_retains_source_and_resolved_content_without_reloading(tmp_path, monkeypatch):
     checkpoint = tmp_path / "config.json"
     checkpoint.write_text(json.dumps(DRAFT_GEOMETRY))
