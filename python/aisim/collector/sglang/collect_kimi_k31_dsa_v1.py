@@ -67,6 +67,13 @@ HISTORY_CHUNK_TOKENS = 8192
 # One point includes cold native initialization and up to 1M tokens of history
 # preparation. Allow an hour for that setup, but never wait forever on a TP rank.
 NATIVE_CASE_TIMEOUT_S = 3600
+NATIVE_CLEANUP_TIMEOUT_S = 10
+
+
+class NativeAllocationFailure(SystemExit):
+    """A force-killed group still owns native resources; stop using this allocation."""
+
+
 # afcd srt/environ.py::Envs.SGLANG_DSA_FUSE_TOPK defaults to True;
 # srt/layers/attention/dsa/utils.py::should_use_dsa_fused_topk selects the fused
 # index transformation for this eager, non-disaggregated native plan.
@@ -299,9 +306,8 @@ def _run_owned_native_case(case, device, output, lock_fd, expected_sm, phase, to
     # The generic executor's worker must not create children using fork after
     # CUDA initialization. A clean subprocess owns SGLang's spawned TP ranks.
     try:
-        with (
-            _native_termination_handler() as own,
-            subprocess.Popen(
+        with _native_termination_handler() as own:
+            process = subprocess.Popen(
                 [
                     sys.executable,
                     "-m",
@@ -330,8 +336,7 @@ def _run_owned_native_case(case, device, output, lock_fd, expected_sm, phase, to
                         [str(Path(__file__).resolve().parents[2]), *filter(None, [os.environ.get("PYTHONPATH")])]
                     ),
                 },
-            ) as process,
-        ):
+            )
             own(process)
             stderr = ""
             try:
@@ -343,11 +348,18 @@ def _run_owned_native_case(case, device, output, lock_fd, expected_sm, phase, to
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                _, stderr = process.communicate()
+                try:
+                    _, stderr = process.communicate(timeout=NATIVE_CLEANUP_TIMEOUT_S)
+                except subprocess.TimeoutExpired as cleanup_error:
+                    raise NativeAllocationFailure(
+                        f"Native process group {process.pid} did not exit after SIGKILL; stop this allocation"
+                    ) from cleanup_error
                 if isinstance(error, subprocess.TimeoutExpired):
                     error.stderr = stderr
                 raise
             finally:
+                if process.stderr is not None:
+                    process.stderr.close()
                 if stderr:
                     sys.stderr.write(stderr)
             if process.returncode:
@@ -367,6 +379,8 @@ def _run_owned_native_case(case, device, output, lock_fd, expected_sm, phase, to
         writes_output = topology is None or topology[1] == 0
         if writes_output and (not output.is_file() or output.stat().st_size <= previous_size):
             raise RuntimeError("native K31 worker exited successfully without writing its result row")
+    except NativeAllocationFailure:
+        raise
     except BaseException:
         # Every process in the attempt has been killed and the launcher reaped.
         # log_perf uses an exclusive-create lock; only this attempt could have

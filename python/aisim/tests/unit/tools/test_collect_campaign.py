@@ -231,8 +231,8 @@ def test_k31_campaign_refuses_multi_gpu_cases_before_launch(monkeypatch, tmp_pat
 
 
 @pytest.mark.parametrize("phase", ["context", "generation"])
-@pytest.mark.parametrize("mode", ["run", "finalize"])
-def test_k31_campaign_preserves_tp1_shards(monkeypatch, tmp_path, phase, mode):
+@pytest.mark.parametrize("mode,transaction", [("run", False), ("finalize", False), ("finalize", True)])
+def test_k31_campaign_preserves_tp1_shards(monkeypatch, tmp_path, phase, mode, transaction):
     from types import SimpleNamespace
 
     c = _load()
@@ -247,6 +247,14 @@ def test_k31_campaign_preserves_tp1_shards(monkeypatch, tmp_path, phase, mode):
         checkpoint = c.shard_dir(tmp_path / "out", shard) / ".ckpt" / plan.backend / f"{plan.backend}.{shard.op}.json"
         checkpoint.parent.mkdir(parents=True)
         checkpoint.touch()
+        if transaction:
+            from collector.helper import SIDECAR_TRANSACTION_FILENAME
+
+            directory = c.shard_dir(tmp_path / "out", shard)
+            (directory / c._native_phase_table(shard.op)).touch()
+            (directory / SIDECAR_TRANSACTION_FILENAME).touch()
+            assert c.shard_state(tmp_path / "out", shard, plan.backend) == "pending-publication"
+
     commands = []
 
     def launch(argv):
@@ -376,3 +384,14 @@ def test_native_shard_done_requires_its_phase_table(tmp_path, monkeypatch, publi
     assert (rc == 0) == published
     assert (out / "DONE").exists() == published
     assert (out / ".ckpt").is_dir()
+
+
+def test_finalize_rejects_empty_native_case_selection(tmp_path):
+    c = _load()
+    shard = c.Shard(
+        "kimi_k31_dsa_generation_module", "empty", model_path="moonshotai/Kimi-K3.1-Pro", case_filter="missing-case"
+    )
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.touch()
+    with pytest.raises(SystemExit, match="no qualified native cases"):
+        c._validate_shard_allocation(c.Plan("sglang", 103, (shard,)), shard, finalize_checkpoint=checkpoint)

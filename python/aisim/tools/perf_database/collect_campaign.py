@@ -301,6 +301,11 @@ def shard_state(root: Path, shard: Shard, backend: str | None = None) -> str:
         return "pending"
     native = backend is not None and _native_k31(backend, shard.op)
     published = (d / _native_phase_table(shard.op)).is_file() if native else any(d.glob("*.parquet"))
+    if native:
+        from collector.helper import PERF_TRANSACTION_FILENAME, SIDECAR_TRANSACTION_FILENAME
+
+        if any((d / name).exists() for name in (PERF_TRANSACTION_FILENAME, SIDECAR_TRANSACTION_FILENAME)):
+            return "pending-publication"
     if published:
         return "finalized"
     if (d / "DONE").exists():
@@ -359,11 +364,11 @@ def run_shard(
         rc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT).returncode
         log.write(f"### {time.strftime('%FT%T')} exit={rc}\n")
     parquets = sorted(p.name for p in d.glob("*.parquet"))
-    if rc == 0 and _native_k31(plan.backend, shard.op) and _native_phase_table(shard.op) not in parquets:
+    if rc == 0 and _native_k31(plan.backend, shard.op) and shard_state(root, shard, plan.backend) != "finalized":
         rc = 1
         (d / "DONE").unlink(missing_ok=True)
         with (d / "run.log").open("a") as log:
-            log.write("No native phase table was published. Inspect the checkpoint and case diagnostics.\n")
+            log.write("Native phase publication is incomplete. Inspect the checkpoint and publication diagnostics.\n")
     if rc == 0:
         (d / "DONE").touch()
     _log(root, {"event": "end", "mode": mode, "shard": shard.key, "gpu": gpu, "exit": rc, "parquet": parquets})
@@ -400,6 +405,12 @@ def _validate_shard_allocation(plan: Plan, shard: Shard, *, finalize_checkpoint:
             os.environ.pop("COLLECTOR_MODEL_PATH", None)
         else:
             os.environ["COLLECTOR_MODEL_PATH"] = previous_model
+    cases = [
+        case
+        for case in cases
+        if (not shard.model_path or case.model_path == shard.model_path)
+        and (not shard.case_filter or shard.case_filter in str(case))
+    ]
     if not cases:
         raise SystemExit(f"{shard.key}: no qualified native cases on SM{plan.sm}")
     if finalize_checkpoint is not None and finalize_checkpoint.is_file():
@@ -407,10 +418,6 @@ def _validate_shard_allocation(plan: Plan, shard: Shard, *, finalize_checkpoint:
         # before publication; this flag forbids it from launching missing work.
         return
     for case in cases:
-        if shard.model_path and case.model_path != shard.model_path:
-            continue
-        if shard.case_filter and shard.case_filter not in str(case):
-            continue
         tp = validate_case(case)
         if tp > 1:
             raise SystemExit(
@@ -433,7 +440,11 @@ def run_campaign(
             continue
         checkpoint = shard_dir(root, s) / ".ckpt" / plan.backend / f"{plan.backend}.{s.op}.json"
         if mode == "finalize" and st != "done-no-parquet":
-            recoverable = st == "started" and _native_k31(plan.backend, s.op) and checkpoint.is_file()
+            if st == "pending-publication" and not checkpoint.is_file():
+                raise SystemExit(f"{s.key}: publication recovery requires its native checkpoint")
+            recoverable = (
+                st in ("started", "pending-publication") and _native_k31(plan.backend, s.op) and checkpoint.is_file()
+            )
             if not recoverable:
                 continue
         _validate_shard_allocation(plan, s, finalize_checkpoint=checkpoint if mode == "finalize" else None)
