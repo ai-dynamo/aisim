@@ -22,7 +22,6 @@ _COLLECTOR_DIR = str(Path(__file__).resolve().parents[3] / "collector")
 if _COLLECTOR_DIR not in sys.path:
     sys.path.insert(0, _COLLECTOR_DIR)
 
-import collect as collect_mod
 
 pytestmark = pytest.mark.unit
 
@@ -245,6 +244,7 @@ def test_runner_fails_closed_when_failure_list_is_missing(monkeypatch):
 
 
 def test_native_failure_summary_aggregates_by_consumer_group(monkeypatch, tmp_path):
+    import collect as collect_mod
     from collector.op_plans import ModuleCase
 
     model = "moonshotai/Kimi-K3.1-Pro"
@@ -303,6 +303,8 @@ def test_native_failure_summary_aggregates_by_consumer_group(monkeypatch, tmp_pa
 
 
 def test_replay_selects_full_node_cases_like_the_pool_ops(monkeypatch):
+    import collect as collect_mod
+
     cases = [{"shape": 0}, {"shape": 1}, {"shape": 2}]
     ran = []
 
@@ -355,6 +357,8 @@ def test_collect_sglang_passes_only_keywords_the_full_node_runner_accepts():
     import ast
     import inspect
 
+    import collect as collect_mod
+
     tree = ast.parse(Path(collect_mod.__file__).read_text(encoding="utf-8"))
     calls = [
         node
@@ -391,6 +395,8 @@ def _run_with_real_checkpoint(
     retry_failed=False,
     run_error=False,
 ):
+    import collect as collect_mod
+
     calls = []
 
     def run_cases(*, perf_filename, limit, cases):
@@ -483,6 +489,8 @@ def test_optional_diagnostic_mirror_failure_keeps_measured_case_passed(monkeypat
 
 
 def _finalize_pending_fullnode_event(tmp_path, checkpoint_path):
+    import collect as collect_mod
+
     pending = _checkpoint_sets(checkpoint_path)["attempted"]
     output_root = tmp_path / "out"
     output_root.mkdir()
@@ -601,6 +609,8 @@ def test_real_checkpoint_zero_work_preserves_pending_and_failure_marks_all_selec
 
 @pytest.mark.parametrize("sm", [103, None])
 def test_pool_unknown_sm_cannot_bypass_registry_gate(sm):
+    import collect as collect_mod
+
     errors = collect_mod.collect_ops(
         1,
         [{"name": "sglang", "type": "test", "module": "must_not_import", "unverified_sms": (103,)}],
