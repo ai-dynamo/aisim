@@ -2760,7 +2760,8 @@ def test_pending_probe_preview_then_execute_reuses_output_directory(tmp_path, mo
     assert "report" not in preview
     monkeypatch.delenv("HF_TOKEN")
     assert cli.main([*command, "--execute"]) == 1
-    assert not output.exists()
+    assert len(list(output.glob("onboarding-probe-*.json"))) == 1
+    assert not (output / "probe-plan.json").exists()
     failed = _load(checkpoint).configurations["tp2"].history[-1]["result"]
     assert failed["status"] == "incomplete"
     assert "HF_TOKEN requires the original value" in str(failed["diagnostics"])

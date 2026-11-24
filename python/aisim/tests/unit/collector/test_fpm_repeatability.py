@@ -2468,6 +2468,30 @@ def test_instrumentation_bundle_errors_are_scoped_to_workers_needing_evidence(ca
     assert any("instrumentation changed after planning" in failure for failure in result["failures"]) == needs_native
 
 
+def test_repeatability_preserves_frozen_public_control_reference_at_launch(campaign, tmp_path, monkeypatch):
+    from collector.fpm_forward.config import semantic_generator_overrides
+
+    plan, source, checkpoint = campaign
+    name, value = "DYN_BENCH_PREFILL_CONTENT", "sharegpt"
+    reference = {"name": name, "value_from_env": name, "value_sha256": hashlib.sha256(value.encode()).hexdigest()}
+    deployment = {"K8sConfig": {"extra_env": [reference]}}
+    monkeypatch.setenv(name, value)
+    plan = replace(
+        plan, generator_config_sha256=repeatability._canonical_hash(semantic_generator_overrides(deployment))
+    )
+    plan = repeatability._subset_plan(
+        plan, {"cell_id": plan.cells[0].cell_id, "benchmark_points": json.loads(plan.options.benchmark_points_json)}
+    )
+    _write_campaign(source, checkpoint, plan, generator_overrides=deployment)
+    calls = _fake_collector(monkeypatch)
+    inputs = repeatability.load_repeatability_deployment(source)
+    result = repeatability.run_repeatability(**_args((plan, source, checkpoint), tmp_path, generator_overrides=inputs))
+    assert result["status"] == "passed", result
+    assert len(calls) == 5
+    for sample, kwargs in calls:
+        assert sample.generator_config_sha256 in repeatability._deployment_hashes(kwargs["generator_overrides"])
+
+
 @pytest.mark.parametrize("historical", ["current", "literal", "semantic"])
 def test_archived_environment_resolves_for_replay_and_detects_drift(campaign, tmp_path, monkeypatch, historical):
     from collector.fpm_forward.config import archive_generator_overrides, semantic_generator_overrides

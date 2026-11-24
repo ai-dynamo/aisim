@@ -108,6 +108,8 @@ def _load_generator_overrides(args: argparse.Namespace) -> dict[str, Any]:
     if extra_env is not None:
         from .config import archive_generator_overrides
 
+        if not isinstance(extra_env, list) or any(not isinstance(entry, dict) for entry in extra_env):
+            raise TypeError("K8sConfig.extra_env must be a list of named environment entries")
         # Validate both literal entries and digest-bound archived references.
         # Preserve literals only in this in-memory delivery input.
         archive_generator_overrides(payload)

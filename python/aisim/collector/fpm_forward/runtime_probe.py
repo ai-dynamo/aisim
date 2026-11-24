@@ -958,6 +958,7 @@ def probe_runtime(
     execute: bool = False,
     resume: bool = False,
     private_environment: dict[str, Any] | None = None,
+    previous_reports: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Preview or capture all selected exact tuples; preserve every attempt."""
 
@@ -1006,8 +1007,15 @@ def probe_runtime(
             )
     bundle = load_instrumentation(instrumentation) if isinstance(instrumentation, (str, Path)) else instrumentation
     root = Path(output_dir).expanduser().resolve()
-    if root.exists() and any(root.iterdir()) and not (root / "probe-plan.json").exists():
-        raise ValueError("runtime probe output must be fresh or contain this probe's saved plan")
+    if root.exists() and not (root / "probe-plan.json").exists():
+        for path in root.iterdir():
+            if (
+                not re.fullmatch(r"onboarding-probe-[0-9a-f]{32}\.json", path.name)
+                or path.is_symlink()
+                or not path.is_file()
+                or (previous_reports or {}).get(str(path)) != hashlib.sha256(path.read_bytes()).hexdigest()
+            ):
+                raise ValueError("runtime probe output must be fresh or contain this probe's saved plan")
     root.mkdir(parents=True, exist_ok=True)
     results: dict[str, Any] = {}
     with _probe_lock(root), runner._sigterm_as_interrupt():

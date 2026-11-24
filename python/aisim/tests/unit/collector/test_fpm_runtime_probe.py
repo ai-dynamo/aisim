@@ -1655,10 +1655,10 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
     )
     assert token not in json.dumps(plan.to_dict())
 
-    def assert_private_artifacts():
+    def assert_private_artifacts(expected_remaining=0):
         remaining = [directory for directory in delivery_directories if directory.exists()]
         assert delivery_directories
-        assert len(remaining) == (1 if failure == "private_cleanup" and len(executions) == 2 else 0)
+        assert len(remaining) == expected_remaining
         for retained in artifact_root.rglob("*"):
             if retained.is_file():
                 assert token.encode() not in retained.read_bytes(), retained
@@ -1673,7 +1673,7 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
         return
 
     errors = runner.run_collection(plan, **kwargs)
-    assert_private_artifacts()
+    assert_private_artifacts(expected_remaining=int(failure == "private_cleanup"))
     checkpoint_path = checkpoint_dir / "fpm_forward.json"
     first = json.loads(checkpoint_path.read_text())
     prefill = next(c for c in plan.cells if c.workload_kind == "prefill")
@@ -1724,17 +1724,22 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
         assert "synthetic render failure before staging" in failed["error"]
         assert not (cell_dir / runtime_probe.CONTEXT_FILENAME).exists()
         monkeypatch.setattr(runner, "_render_cell", render)
-    assert runner.run_collection(plan, **{**kwargs, "resume": True, "retry_failed": True}) == []
+    assert runner.run_collection(plan, **{**kwargs, "resume": True, "retry_failed": failure != "private_cleanup"}) == []
     assert_private_artifacts()
     final = json.loads(checkpoint_path.read_text())
     assert all(item["status"] == "passed" for item in final["cells"].values())
-    assert final["cells"][prefill.cell_id]["attempt_id"] != original_id
+    retained = final["cells"][prefill.cell_id]
+    assert (retained["attempt_id"] == original_id) == (failure == "private_cleanup")
+    assert "private_cleanup_error" not in retained
     assert final["cells"][decode.cell_id]["attempt_id"] == first["cells"][decode.cell_id]["attempt_id"]
     history = json.loads((root / "runtime-observations.json").read_text())["configurations"][
         plan.runtime_configuration
     ]["attempts"][-1]["phase_attempts"]["prefill"]
     assert any(item["collector_attempt_id"] == original_id for item in history)
-    assert executions == [("tp4", "prefill"), ("tp4", "decode"), ("tp4", "prefill")]
+    expected = [("tp4", "prefill"), ("tp4", "decode")]
+    if failure != "private_cleanup":
+        expected.append(("tp4", "prefill"))
+    assert executions == expected
     assert "/__aisimulate_environment_reference__/HF_TOKEN/" in (cell_dir / "run.sh").read_text()
     if failure == "backend_markers":
         from collector.fpm_forward.config import archive_generator_overrides

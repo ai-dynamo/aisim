@@ -1129,6 +1129,15 @@ def run_runtime_command(args: argparse.Namespace) -> int:
             execute=args.execute,
             resume=args.resume,
             private_environment=private_environment,
+            previous_reports={
+                event["report"]: event["sha256"]
+                for name in names
+                for event in state.configurations[name].history
+                if event.get("event") == "runtime_probe"
+                and event.get("output_dir") == str(output)
+                and event.get("report")
+                and event.get("sha256")
+            },
         )
         if launches
         else {"status": "failed", "configurations": {}}
@@ -1138,12 +1147,12 @@ def run_runtime_command(args: argparse.Namespace) -> int:
     if failed:
         result["status"] = "partial" if launches else "failed"
     report_reference = {"output_dir": str(output)}
-    if not pending_preview and (launches or (output / "probe-plan.json").is_file()):
+    if not pending_preview:
         output.mkdir(parents=True, exist_ok=True)
         path = output / f"onboarding-probe-{uuid.uuid4().hex}.json"
         path.write_text(_json(result))
         report_reference.update(report=str(path), sha256=_hash(path))
-    # Preflight failures and pending previews may precede any executable plan. Record their result
+    # Pending previews have no executable probe plan yet. Record their result
     # directly in the checkpoint without occupying the future probe directory.
     patches = {}
     for name in names:
