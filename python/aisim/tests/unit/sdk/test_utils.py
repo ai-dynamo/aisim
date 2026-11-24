@@ -1513,7 +1513,7 @@ class TestKVCacheQuantInference:
         assert modes.get("gemm_quant_mode") == (common.GEMMQuantMode[gemm] if gemm else None)
         assert modes.get("moe_quant_mode") == (common.MoEQuantMode[moe] if moe else None)
 
-    @pytest.mark.parametrize("weight_algo", [None, "NVFP4"])
+    @pytest.mark.parametrize("weight_algo", [None, "FP8", "FP8_BLOCK", "NVFP4"])
     @pytest.mark.parametrize(
         "kv_fields,normalized_kv",
         [
@@ -1534,7 +1534,7 @@ class TestKVCacheQuantInference:
 
         assert raw.get("kv_cache_quant_algo") == normalized_kv
         if weight_algo:
-            assert modes["kvcache_quant_mode"] == common.KVCacheQuantMode.fp8
+            assert modes["kvcache_quant_mode"] == common.KVCacheQuantMode[normalized_kv or "fp8"]
             assert modes["fmha_quant_mode"] == common.FMHAQuantMode.fp8
         else:
             assert modes.get("kvcache_quant_mode") == (

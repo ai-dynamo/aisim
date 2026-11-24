@@ -2,7 +2,7 @@
   "schema": "disjoint-native-op-union/v1",
   "operation": "Arrow concatenation of disjoint immutable native rows; provenance.append_collection_event/render_collection_meta preserve all source events.",
   "original_git_commit": "e6b7c36d5c998037599544d75c644d5d690f3ab1",
-  "derivation_script_sha256": "2d1b1ecd1499f811de19db0399b127985b4c14a222457d2d12f800540d47b8d0",
+  "derivation_script_sha256": "6455fb21edbac19bcbc32e1deaf136d792eef7cd389115e0848195c5e82622d7",
   "invocation": [
     "python",
     "merge-campaigns.py",

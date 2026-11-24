@@ -265,6 +265,10 @@ def _run_native_case(case, device, perf_filename, *, expected_sm=None, phase=Non
         phase = "context" if "context" in requested.name else "generation"
     output = requested.resolve()
     with native_publication_lock(output) as lock_fd:
+        if output.with_name(f".{output.name}.pending").exists():
+            raise RuntimeError(
+                f"Pending native publication for {output}. Resume the full-node job or use a separate output."
+            )
         _run_owned_native_case(case, device, output, lock_fd, expected_sm, phase)
 
 
@@ -642,6 +646,10 @@ def main() -> None:
         if args.publication_lock_fd is not None:
             _collect_native(args, case, tp)
             return
+        if output.with_name(f".{output.name}.pending").exists():
+            raise RuntimeError(
+                f"Pending native publication for {output}. Resume the full-node job or use a separate output."
+            )
         if Path(f"{output}.lock").exists():
             raise RuntimeError(f"Native output already has a writer lock: {output}")
         with tempfile.TemporaryDirectory(dir=output.parent, prefix=f".{output.name}.stage-") as directory:

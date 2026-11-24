@@ -238,6 +238,31 @@ def test_standalone_shares_supervisor_lock(tmp_path, monkeypatch):
     assert calls == [str(output)]
 
 
+@pytest.mark.parametrize("sm", [90, 103, 107])
+def test_native_plan_lists_only_qualified_hardware(monkeypatch, sm):
+    monkeypatch.setenv("COLLECTOR_MODEL_PATH", MODEL)
+    for op in ("kimi_k31_dsa_context_module", "kimi_k31_dsa_generation_module"):
+        assert bool(plan(op, "sglang", sm).cases) == (sm == 103)
+
+
+def test_standalone_preserves_pending_fullnode_publication(monkeypatch, tmp_path):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as module
+
+    output = tmp_path / "generation.txt"
+    output.write_text("previous row")
+    receipt = tmp_path / ".generation.txt.pending"
+    receipt.write_text("outstanding full-node receipt")
+    case = ModuleCase(4096, 1, 96, "fp8", "bfloat16", "bfloat16", MODEL, 0)
+    monkeypatch.setattr(
+        sys, "argv", ["collector", "--case", json.dumps(list(case)), "--phase", "generation", "--output", str(output)]
+    )
+    for invoke in (module.main, lambda: module._run_native_case(case, "cuda:0", output)):
+        with pytest.raises(RuntimeError, match="Resume the full-node job"):
+            invoke()
+    assert receipt.read_text() == "outstanding full-node receipt"
+    assert output.read_text() == "previous row"
+
+
 @pytest.mark.parametrize("alias", [False, True])
 def test_supervisor_and_child_share_the_target_lock(tmp_path, monkeypatch, alias):
     import collector.sglang.collect_kimi_k31_dsa_v1 as module
