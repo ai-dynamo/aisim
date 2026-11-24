@@ -74,6 +74,9 @@ class NativeAllocationFailure(SystemExit):
 # attention. Preserve that serving dispatch as well as the fused top-k path.
 # Envs.SGLANG_MAX_KV_CHUNK_CAPACITY defaults to 128 * 1024; the backend
 # also requires total KV tokens to fit ForwardBatch.get_max_chunk_capacity().
+# Envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN defaults to False;
+# srt/models/deepseek_v2.py::DeepseekV2AttentionMLA._get_q_b_proj_quant_config
+# otherwise overrides KimiK3MLAAttention's BF16 q_b_proj with block-FP8.
 SKIP_SOFTMAX_ENV = "SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR"
 NATIVE_ENV = {
     "SGLANG_DSA_FUSE_TOPK": "1",
@@ -82,6 +85,7 @@ NATIVE_ENV = {
     "SGLANG_DSA_TOPK_BROADCAST": "0",
     "SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD": "2048",
     "SGLANG_MAX_KV_CHUNK_CAPACITY": "131072",
+    "SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN": "0",
 }
 
 

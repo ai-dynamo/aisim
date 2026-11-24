@@ -163,6 +163,7 @@ def test_cli_generated_plan_keeps_native_ops_model_scoped(model_scoped):
         ("SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR", None),
         ("SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD", "2048"),
         ("SGLANG_MAX_KV_CHUNK_CAPACITY", "131072"),
+        ("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN", "0"),
     ],
 )
 def test_native_dispatch_setting_is_fixed_for_child_and_standalone(monkeypatch, tmp_path, ambient, variable, expected):
