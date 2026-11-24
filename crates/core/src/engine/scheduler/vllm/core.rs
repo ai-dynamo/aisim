@@ -3001,6 +3001,9 @@ impl VllmCore {
             .as_ref()
             .is_some_and(VllmHostOffloadAdapter::admits_kv_holders_first);
         self.kv_manager.begin_step();
+        if let Some(adapter) = self.native_host_offload.as_mut() {
+            adapter.note_pass_start();
+        }
         self.state.compact_running();
         // With async scheduling vLLM forms this pass while the previous one
         // runs, and processes the previous pass's outputs only afterwards,
