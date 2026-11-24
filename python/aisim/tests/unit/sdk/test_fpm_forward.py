@@ -16,6 +16,7 @@ side of the module boundary.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import itertools
 import json
@@ -1926,6 +1927,33 @@ def test_powered_fpm_replay_rejects_generic_speculation(schema8_fpm_config):
     rank["timing_model"]["config"]["speculation"] = {"kind": "ngram", "params": {"num_speculative_tokens": 1}}
     with pytest.raises((ValueError, RuntimeError), match="ngram speculation requires op_level timing"):
         _runtime.run_replay_json(json.dumps(execution))
+
+
+def test_materialize_runtime_traffic_keeps_native_fields_and_defaults_the_block_size(schema8_fpm_config):
+    from aisim.runner import materialize_runtime_traffic
+
+    config, _ = schema8_fpm_config
+    spec = prediction_to_replay_spec(config)
+    traffic = materialize_runtime_traffic(spec, trace_block_size=512)
+    assert traffic["source_type"] == spec.workload["source_type"]
+    assert traffic["trace_block_size"] == 512
+    assert set(traffic) <= set(spec.workload) | {"trace_block_size"}
+
+
+def test_materialize_runtime_traffic_carries_a_spec_level_concurrency(schema8_fpm_config):
+    from aisim.runner import materialize_runtime_traffic
+
+    config, _ = schema8_fpm_config
+    spec = prediction_to_replay_spec(config)
+    workload = {key: value for key, value in spec.workload.items() if key != "concurrency"}
+    capped = dataclasses.replace(spec, workload=workload, concurrency=3)
+    assert materialize_runtime_traffic(capped, trace_block_size=512)["concurrency"] == 3
+    workload["concurrency"] = 5
+    assert materialize_runtime_traffic(capped, trace_block_size=512)["concurrency"] == 5
+    # An open-loop load keeps its arrival process: the cap stays out of the traffic.
+    del workload["concurrency"]
+    workload["load_type"] = "poisson"
+    assert "concurrency" not in materialize_runtime_traffic(capped, trace_block_size=512)
 
 
 def test_schema7_fpm_replay_stays_latency_only(schema8_fpm_config, tmp_path):
