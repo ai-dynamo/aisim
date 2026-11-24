@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 from collector.case_generator import without_models
-from collector.helper import collector_retained_path, create_test_case_id, native_publication_lock
+from collector.helper import _fsync_directory, collector_retained_path, create_test_case_id, native_publication_lock
 from collector.op_plans import OP_PLANS
 from collector.skips import filter_cases, models
 from collector.version_resolver import _check_compat
@@ -294,7 +294,9 @@ def _collect_selected_cases(
         else:
             stage.unlink(missing_ok=True)
         stage.with_name(f".{stage.name}.publication-lock").unlink(missing_ok=True)
+        _fsync_directory(output.parent)
         receipt.unlink()
+        _fsync_directory(output.parent)
 
     if native:
         if Path(f"{output}.lock").exists():
@@ -336,8 +338,12 @@ def _collect_selected_cases(
                     shutil.copyfile(output, filename)
                 transaction = {"task_id": batch[0]["id"], "stage": filename.name}
                 pending = receipt.with_suffix(".pending.tmp")
-                pending.write_text(json.dumps(transaction))
+                with pending.open("w") as stream:
+                    json.dump(transaction, stream)
+                    stream.flush()
+                    os.fsync(stream.fileno())
                 os.replace(pending, receipt)
+                _fsync_directory(output.parent)
             resume_tracker.mark_attempted_many(batch_ids.values())
             submitted.update(batch_ids.values())
             result = run_func(

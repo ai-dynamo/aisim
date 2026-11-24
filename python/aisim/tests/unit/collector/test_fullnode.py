@@ -59,6 +59,26 @@ def _logger():
     return SimpleNamespace(info=lambda *_args: None, warning=lambda *_args: None, exception=lambda *_args: None)
 
 
+@pytest.mark.parametrize("pending", [True, False])
+def test_finalization_excludes_inflight_native_publication(tmp_path, pending):
+    from contextlib import nullcontext
+
+    import collect
+    from collector.helper import native_publication_lock
+
+    root = tmp_path / "out"
+    root.mkdir()
+    output = root / "dsa_generation_module_perf.txt"
+    if pending:
+        output.with_name(f".{output.name}.pending").touch()
+    owner = nullcontext() if pending else native_publication_lock(output)
+    with owner, pytest.raises(RuntimeError, match="pending native publication|publication owner"):
+        collect._finalize_collector_outputs_transaction(
+            root, [output], {}, [], backend="sglang", checkpoint_dir=str(tmp_path / "checkpoint"), sm_version=103
+        )
+    assert not (root / "collection_meta.yaml").exists()
+
+
 def test_shape_index_selects_exact_case_before_limit(monkeypatch):
     cases = [{"shape": 0}, {"shape": 1}, {"shape": 2}]
     monkeypatch.setenv("DEEPEP_LL_SHAPE_INDEX", "2")
