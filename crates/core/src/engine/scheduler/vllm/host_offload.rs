@@ -495,10 +495,8 @@ pub(super) struct VllmHostOffloadAdapter {
     /// formed synchronizes before vLLM launches that pass. Taken when the
     /// pass forms; see [`Self::take_launch_sync_ms`].
     launch_sync_ms: Option<f64>,
-    /// SimpleCPU: when the transfers in flight as the current pass started
-    /// end; the pass's own loads are submitted after its launch, so a
-    /// preemption's pre-launch synchronization does not wait for them.
-    pass_start_last_deadline: Option<f64>,
+    /// SimpleCPU: the latest end of transfers issued before this pass.
+    prior_transfer_end_ms: Option<f64>,
     /// Load poll: a completed load keeps its keys in `load_by_key` until the
     /// scheduler releases it, as vLLM keeps them loading until it has seen
     /// the copy finish. The tier still unpins the load's G2 sources when the
@@ -600,7 +598,7 @@ impl VllmHostOffloadAdapter {
             load_keys_epoch: 0,
             compute_not_before_ms: 0.0,
             launch_sync_ms: None,
-            pass_start_last_deadline: None,
+            prior_transfer_end_ms: None,
             hold_load_keys: false,
             fences_at_submit: Vec::new(),
             observer: None,
@@ -1646,12 +1644,9 @@ impl VllmHostOffloadAdapter {
             let tier = self.host.read();
             if self.rules.preemption_waits_for_all {
                 if self.hold_load_keys {
-                    // Load poll: the worker synchronizes the transfers in
-                    // flight when the pass started before it launches the
-                    // pass; its launch, connector poll and forward follow.
-                    // Loads this pass issues are submitted after its launch
-                    // and copy from its launch end, so they extend neither.
-                    let sync_ms = self.pass_start_last_deadline;
+                    // The worker synchronizes prior transfers before launch.
+                    // This pass submits its own loads after launch.
+                    let sync_ms = self.prior_transfer_end_ms;
                     if let Some(sync_ms) = sync_ms {
                         self.launch_sync_ms =
                             Some(self.launch_sync_ms.map_or(sync_ms, |at| at.max(sync_ms)));
@@ -1787,11 +1782,12 @@ impl VllmHostOffloadAdapter {
         self.launch_sync_ms.take()
     }
 
-    /// SimpleCPU: note the transfers in flight as a pass starts, before it
-    /// issues any load; see [`Self::preempt_request`].
+    /// SimpleCPU: a transfer can finish between the decision and pass
+    /// formation. Include that completion alongside any outstanding copies,
+    /// before this pass issues its own loads.
     pub(super) fn note_pass_start(&mut self) {
-        self.pass_start_last_deadline = if self.rules.preemption_waits_for_all {
-            self.host.read().last_deadline(self.host.id())
+        self.prior_transfer_end_ms = if self.hold_load_keys && self.rules.preemption_waits_for_all {
+            self.host.read().last_transfer_end_ms(self.host.id())
         } else {
             None
         };

@@ -387,6 +387,8 @@ struct Client {
     pending_transfers: usize,
     /// Physically complete transfers the owner has not consumed yet.
     done: VecDeque<(f64, CompletedTransfer)>,
+    /// End of the last physical copy, retained after delivery.
+    last_completed_ms: Option<f64>,
     seen_epoch: u64,
     /// A completed store stays pinned until its owner hands it to G3.
     holds_completed_sources: bool,
@@ -515,6 +517,7 @@ impl HostTier {
                 prepared_stores: VecDeque::new(),
                 pending_transfers: 0,
                 done: VecDeque::new(),
+                last_completed_ms: None,
                 seen_epoch: self.completion_epoch,
                 holds_completed_sources: false,
                 retimes_loads: false,
@@ -1829,6 +1832,7 @@ impl HostTier {
             }
         };
         if let Some(state) = self.clients.get_mut(&client) {
+            state.last_completed_ms = Some(at_ms);
             state.done.push_back((at_ms, completed));
         }
     }
@@ -1902,6 +1906,13 @@ impl HostTier {
             .filter(|transfer| transfer.client == client)
             .filter_map(|transfer| transfer.deadline)
             .max_by(f64::total_cmp)
+    }
+
+    /// Latest end of this client's submitted copies on a private lane.
+    /// Pending deadlines lie at or after every physical completion.
+    pub(crate) fn last_transfer_end_ms(&self, client: u64) -> Option<f64> {
+        self.last_deadline(client)
+            .or(self.clients[&client].last_completed_ms)
     }
 
     pub(crate) fn has_transfer(&self, transfer_id: TransferId) -> bool {
@@ -3067,6 +3078,7 @@ pub(crate) mod tests {
                     blocks: vec![key(1)],
                 }]
             );
+            assert_eq!(tier.last_transfer_end_ms(C), Some(expected));
             assert_eq!(tier.deadline_count(), 0);
             assert_eq!(tier.next_deadline(C), None);
             assert_eq!(tier.pins(key(1)), 0);
@@ -3096,6 +3108,9 @@ pub(crate) mod tests {
             assert!(tier.cancel_load(C, load, 12.0, 13.0));
             assert!(!tier.cancel_load(C, load, 12.0, 13.0));
             assert_eq!(tier.transfer_deadline(load), None);
+            // Only the seed store completed. The cancelled load has no end
+            // for a subsequent synchronization to wait for.
+            assert_eq!(tier.last_transfer_end_ms(C), Some(0.0));
             assert_eq!(tier.deadline_count(), 0);
             assert_eq!(tier.next_deadline(C), None);
             assert_eq!(tier.pins(key(1)), 0);

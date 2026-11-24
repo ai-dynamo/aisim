@@ -535,12 +535,13 @@ The connector-specific copy timing is:
 - `simple_cpu_v0_32`: a copy thread copies the issuing pass's loads as one
   batch, from the end of that pass's launch, without waiting for its GPU work
   but after the previous batch; vLLM sees them finish together.
-- `simple_cpu_v0_32`, preemption: vLLM synchronizes the CPU-tier transfers in
-  flight before it launches a pass that preempts a request. Replay starts that
-  pass's launch and forward no earlier than the end of the transfers in flight
-  when the pass was formed; the loads the pass itself issues copy after its
-  launch and are not included. Its connector check, the return of the
-  previous pass's outputs and the next decision follow from that launch.
+- `simple_cpu_v0_32`, preemption: before launching a pass that preempts a
+  request, vLLM waits for transfers submitted by earlier passes. Replay
+  starts the launch and forward no earlier than the latest completion of
+  those transfers, including copies that finish between the scheduling
+  decision and pass formation. The pass submits its own loads after launch.
+  Its connector check, the return of the previous pass's outputs and the
+  next decision follow from that launch.
 - An engine that schedules nothing takes empty steps, each of which checks the
   connector. Replay prices them at zero, so such an engine sees a load when
   its copy ends. vLLM sleeps 1 ms after each empty step, so it schedules the
