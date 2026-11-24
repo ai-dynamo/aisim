@@ -278,6 +278,10 @@ shared:
     owners: [sweeper, maintainers]
   - glob: tests/sweeper/
     owners: [sweeper, maintainers]
+  - glob: tests/test_recommend_mtp.py
+    owners: [sweeper, maintainers]
+  - glob: tests/test_recommend_prefill_intervals.py
+    owners: [sweeper, maintainers]
   - glob: crates/core/src/replay/
     owners: [replay, maintainers]
   - glob: crates/core/examples/

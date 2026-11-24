@@ -225,6 +225,7 @@
 /python/aisim/pyproject.toml                           @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-mocker-codeowners @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
 /tests/test_agentx_curves.py                           @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
 /tests/test_agentx_inputs.py                           @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
+/tests/test_recommend_mtp.py                           @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/access-aisim-maintain
 /tests/test_shared_g2_cli.py                           @ai-dynamo/aisim-replay-codeowners @ai-dynamo/access-aisim-maintain
 /crates/core/tests/perfmodel/                          @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/access-aisim-maintain
 /tests/test_aiperf_metrics.py                          @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/access-aisim-maintain
@@ -305,6 +306,7 @@
 /python/aisim/tools/simulation_perf_gate/              @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
 /.github/workflows/request-nvskills-ci.yml             @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
 /python/aisim/src/aisim/resource_worker.py             @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/access-aisim-maintain
+/tests/test_recommend_prefill_intervals.py             @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/access-aisim-maintain
 /python/aisim/src/aisim/resource_scheduler.py          @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/access-aisim-maintain
 /python/aisim/.github/workflows/codeowners.yml         @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
 /tests/fixtures/aiperf_0.13.0_request_metrics.json     @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/access-aisim-maintain
