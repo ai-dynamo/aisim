@@ -41,6 +41,10 @@ def verified_model_configs(repo, revision, model_path):
     """
     from aisim_core.sdk.utils import _get_model_config_path
 
+    # Model loading prefers a local directory over bundled or overridden JSON.
+    # This benchmark only certifies the latter against the recorded Git tree.
+    if Path(model_path).is_dir():
+        raise ValueError(f"local model directory {model_path} cannot be certified as bundled inputs")
     resolved_root = _get_model_config_path()
     prefix = "python/aisim/src/aisim_core/model_configs/"
     names = [f"{model_path.replace('/', '--')}_{suffix}.json" for suffix in ("config", "hf_quant_config")]

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""An extra source file, untracked or ignored, must fail the revision check."""
+"""Reject extra sources and model inputs that differ from the recorded revision."""
 
 import hashlib
 import json
@@ -92,3 +92,32 @@ def test_resolved_model_config_matches_revision(tmp_path, monkeypatch, override)
     (resolved / "Qwen--Qwen3-0.6B_hf_quant_config.json").write_text("{}")
     with pytest.raises(ValueError, match="model configuration .* is absent"):
         verified_model_configs(tmp_path, "HEAD", model)
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_local_model_directory_cannot_certify_bundled_inputs(tmp_path, monkeypatch, override):
+    from aisim_core.sdk import utils
+
+    repo = Path(__file__).resolve().parents[3]
+    core = repo / "python/aisim/src/aisim_core"
+    model = "Qwen/Qwen3-0.6B"
+    monkeypatch.setattr(utils.pkg_resources, "files", lambda package: core)
+    monkeypatch.delenv("AICONFIGURATOR_MODEL_CONFIGS_PATH", raising=False)
+    if override:
+        monkeypatch.setenv("AICONFIGURATOR_MODEL_CONFIGS_PATH", str(core / "model_configs"))
+    monkeypatch.chdir(tmp_path)
+    # The bundled inputs match HEAD until a local directory shadows the ID.
+    evidence = verified_model_configs(repo, "HEAD", model)
+    config_path = evidence["files"]["Qwen--Qwen3-0.6B_config.json"]["resolved_path"]
+    local_config = json.loads(Path(config_path).read_text())
+    local_config["num_hidden_layers"] += 1
+    local = tmp_path / model
+    local.mkdir(parents=True)
+    (local / "config.json").write_text(json.dumps(local_config))
+    # Bypass the loader's cache, as in a fresh benchmark process. This valid
+    # config takes precedence over both installed and overridden bundled JSON.
+    loaded = utils._load_model_config_from_model_path.__wrapped__(model)
+    assert loaded["num_hidden_layers"] == local_config["num_hidden_layers"]
+    assert utils._parse_hf_config_json(loaded)["layers"] == local_config["num_hidden_layers"]
+    with pytest.raises(ValueError, match="local model directory"):
+        verified_model_configs(repo, "HEAD", model)
