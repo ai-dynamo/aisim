@@ -285,9 +285,8 @@ def test_plan_does_not_resolve_unknown_model_and_reloads_public_configs(tmp_path
 
 def test_memory_observation_versions_mirror_the_collector_observer():
     # The onboarding route keeps its own copy of the list because it must not import collector.
-    from collector.fpm_forward.runtime.fpm_memory_observer import MEMORY_SUPPORTED_VERSIONS
-
     from aisimulate.support.plan import MEMORY_OBSERVATION_VERSIONS
+    from collector.fpm_forward.runtime.fpm_memory_observer import MEMORY_SUPPORTED_VERSIONS
 
     assert MEMORY_OBSERVATION_VERSIONS == MEMORY_SUPPORTED_VERSIONS
 
