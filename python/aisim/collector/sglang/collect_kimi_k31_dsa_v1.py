@@ -77,16 +77,26 @@ class NativeAllocationFailure(SystemExit):
 # afcd srt/environ.py::Envs.SGLANG_DSA_FUSE_TOPK defaults to True;
 # srt/layers/attention/dsa/utils.py::should_use_dsa_fused_topk selects the fused
 # index transformation for this eager, non-disaggregated native plan.
+# Envs.SGLANG_OPT_USE_TOPK_V2 defaults to True; dsa/dsa_topk_backend.py::
+# DSATopKBackend.should_use_topk_v2 selects the v2 fused decode top-k path.
 # Keep the pinned serving default independent of the invoking shell.
 # The same revision's Envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD
 # defaults to 2048; DeepseekSparseAttnBackend uses it for dense short-prefill
 # attention. Preserve that serving dispatch as well as the fused top-k path.
+# Envs.SGLANG_MAX_KV_CHUNK_CAPACITY defaults to 128 * 1024; the backend
+# also requires total KV tokens to fit ForwardBatch.get_max_chunk_capacity().
+# Envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN defaults to False;
+# srt/models/deepseek_v2.py::DeepseekV2AttentionMLA._get_q_b_proj_quant_config
+# otherwise overrides KimiK3MLAAttention's BF16 q_b_proj with block-FP8.
 SKIP_SOFTMAX_ENV = "SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR"
 NATIVE_ENV = {
     "SGLANG_DSA_FUSE_TOPK": "1",
+    "SGLANG_OPT_USE_TOPK_V2": "1",
     "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH": "0",
     "SGLANG_DSA_TOPK_BROADCAST": "0",
     "SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD": "2048",
+    "SGLANG_MAX_KV_CHUNK_CAPACITY": "131072",
+    "SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN": "0",
 }
 
 
@@ -244,6 +254,7 @@ def run_kimi_k31_dsa_fullnode(*, perf_filename, limit=None, cases=None, expected
 def _native_termination_handler():
     process = None
     cancelled = False
+    allocation_failed = False
 
     def kill_group():
         if process is not None:
@@ -267,9 +278,14 @@ def _native_termination_handler():
     previous = signal.signal(signal.SIGTERM, terminate)
     try:
         yield own
+    except NativeAllocationFailure:
+        # Cleanup could not reap the allocation. Preserve this exception so
+        # the caller leaves the stage and writer lock with the live group.
+        allocation_failed = True
+        raise
     finally:
         signal.signal(signal.SIGTERM, previous)
-        if cancelled:
+        if cancelled and not allocation_failed:
             raise SystemExit(128 + signal.SIGTERM)
 
 

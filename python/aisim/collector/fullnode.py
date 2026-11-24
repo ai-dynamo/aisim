@@ -14,6 +14,7 @@ import random
 import shutil
 import tempfile
 import traceback
+import uuid
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
@@ -68,6 +69,83 @@ def select_cases(op: str, cases: list, limit: int | None) -> list:
     if limit is not None:
         return cases[:limit]
     return cases
+
+
+def bind_native_checkpoint(checkpoint_path: Path, output_root: Path, *, create: bool = False) -> str:
+    """Bind a producer namespace before using it, including across container mounts.
+
+    Both paths are relative to the checkpoint directory so relocating their
+    common mount does not change ownership. Anonymous existing checkpoints
+    cannot be attributed safely and require manual recovery.
+    """
+    from collector.collect import (
+        _atomic_write_previous_path,
+        _entry_state_at,
+        _locked_checkpoint_directory,
+        _validated_regular_file_at,
+    )
+
+    owner_path = checkpoint_path.with_suffix(".json.output-owner")
+    expected_root = os.path.relpath(output_root.resolve(), checkpoint_path.parent)
+    if create:
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    with _locked_checkpoint_directory(checkpoint_path) as locked:
+        directory_fd = locked.file_descriptor
+        if _entry_state_at(directory_fd, owner_path.name) is None:
+            existing = any(
+                _entry_state_at(directory_fd, path.name) is not None
+                for path in (checkpoint_path, _atomic_write_previous_path(checkpoint_path))
+            )
+            if not create or existing:
+                raise RuntimeError(
+                    f"Native checkpoint {checkpoint_path} has no output root owner; preserve it for recovery"
+                )
+            descriptor = os.open(
+                owner_path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd
+            )
+            with os.fdopen(descriptor, "w") as stream:
+                json.dump({"output_root": expected_root, "checkpoint_id": uuid.uuid4().hex}, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.fsync(directory_fd)
+        snapshot = _validated_regular_file_at(
+            directory_fd,
+            owner_path.name,
+            owner_path,
+            None,
+            context_path=checkpoint_path,
+            capture_contents=True,
+            kind="native checkpoint owner",
+        )
+        owner = json.loads(snapshot.contents)
+        if owner.get("output_root") != expected_root or not owner.get("checkpoint_id"):
+            raise RuntimeError(f"Native checkpoint {checkpoint_path} belongs to a different output root")
+        return owner["checkpoint_id"]
+
+
+def _read_native_receipt(receipt: Path, checkpoint_path: Path) -> dict:
+    transaction = json.loads(receipt.read_text())
+    owner = transaction.get("checkpoint")
+    relative_owner = transaction.get("checkpoint_relative")
+    matches = (
+        relative_owner == os.path.relpath(checkpoint_path, receipt.parent)
+        if relative_owner is not None
+        else owner == str(checkpoint_path)
+    )
+    if matches and relative_owner is not None:
+        checkpoint_id = bind_native_checkpoint(checkpoint_path, receipt.parent)
+        matches = transaction.get("checkpoint_id") == checkpoint_id
+    if not owner or not matches:
+        if not owner:
+            raise RuntimeError(
+                f"Pending native publication {receipt} has no owning checkpoint recorded; "
+                "preserve its receipt and stage and identify the original checkpoint before recovery"
+            )
+        raise RuntimeError(
+            f"Pending native publication {receipt} belongs to owning checkpoint {owner}, "
+            f"not {checkpoint_path}; resume the owning checkpoint with --resume"
+        )
+    return transaction
 
 
 def collect_sglang_fullnode_op(
@@ -230,11 +308,24 @@ def _collect_selected_cases(
         framework_version=runtime_version,
         sm_version=sm_version,
     )
+    receipt = output.with_name(f".{output.name}.pending")
+    if native and receipt.exists():
+        # Check ownership before loading or filtering the active checkpoint:
+        # another run's pass set cannot authorize promotion or deletion.
+        _read_native_receipt(receipt, resume_tracker._path)
+        if not (resume_options and resume_options.get("resume")):
+            raise RuntimeError(
+                f"Pending native publication {receipt} requires --resume with owning checkpoint {resume_tracker._path}"
+            )
+    checkpoint_id = bind_native_checkpoint(resume_tracker._path, output.parent, create=True) if native else None
     if resume_options and resume_options.get("resume"):
         resume_tracker.load_existing()
         task_infos = resume_tracker.filter_done(raw_task_infos, retry_failed=resume_options.get("retry_failed", False))
     else:
         task_infos = raw_task_infos
+
+    if native and resume_tracker.unfinished_attempt_ids() - {task["id"] for task in raw_task_infos}:
+        raise RuntimeError("Native resume must select every unfinished attempt before publication")
 
     if (
         native
@@ -271,32 +362,33 @@ def _collect_selected_cases(
     # A native worker can outlive a killed launcher. Give each attempt a
     # private staging file. Only the parent publishes its bytes, after the
     # checkpoint is durable. A receipt bridges the two atomic replacements.
-    receipt = output.with_name(f".{output.name}.pending")
-
     def finish_publication():
         if not receipt.exists():
             return
-        transaction = json.loads(receipt.read_text())
+        transaction = _read_native_receipt(receipt, resume_tracker._path)
         name = transaction["stage"]
         if Path(name).name != name or not name.startswith(f".{output.name}.stage-"):
             raise ValueError(f"invalid native staging filename in {receipt}")
         stage = output.with_name(name)
-        if resume_tracker.has_passed(transaction["task_id"]) and stage.exists():
-            if collector_retained_path(output).exists():
-                # Reuse the retained inode through the same publication protocol
-                # as the other collector writers after a closed event.
-                from collector.collect import _atomic_write_bytes
+        # A surviving child inherits this flock even after its launcher dies.
+        # Acquire it before changing any bytes or removing the recovery receipt.
+        with native_publication_lock(stage):
+            if resume_tracker.has_passed(transaction["task_id"]) and stage.exists():
+                if collector_retained_path(output).exists():
+                    # Reuse the retained inode through the same publication protocol
+                    # as the other collector writers after a closed event.
+                    from collector.collect import _atomic_write_bytes
 
-                _atomic_write_bytes(output, stage.read_bytes())
-                stage.unlink()
+                    _atomic_write_bytes(output, stage.read_bytes())
+                    stage.unlink()
+                else:
+                    os.replace(stage, output)
             else:
-                os.replace(stage, output)
-        else:
-            stage.unlink(missing_ok=True)
-        stage.with_name(f".{stage.name}.publication-lock").unlink(missing_ok=True)
-        _fsync_directory(output.parent)
-        receipt.unlink()
-        _fsync_directory(output.parent)
+                stage.unlink(missing_ok=True)
+            stage.with_name(f".{stage.name}.publication-lock").unlink(missing_ok=True)
+            _fsync_directory(output.parent)
+            receipt.unlink()
+            _fsync_directory(output.parent)
 
     if native:
         if Path(f"{output}.lock").exists():
@@ -336,7 +428,13 @@ def _collect_selected_cases(
                     filename = Path(tmp.name)
                 if output.exists():
                     shutil.copyfile(output, filename)
-                transaction = {"task_id": batch[0]["id"], "stage": filename.name}
+                transaction = {
+                    "task_id": batch[0]["id"],
+                    "stage": filename.name,
+                    "checkpoint": str(resume_tracker._path),
+                    "checkpoint_relative": os.path.relpath(resume_tracker._path, output.parent),
+                    "checkpoint_id": checkpoint_id,
+                }
                 pending = receipt.with_suffix(".pending.tmp")
                 with pending.open("w") as stream:
                     json.dump(transaction, stream)

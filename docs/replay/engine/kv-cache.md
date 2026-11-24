@@ -79,6 +79,8 @@ replica. Whether TP partitions or replicates token KV depends on the model;
 for example, Kimi K3.1 replicates its latent and indexer entries on each TP
 rank, while its KDA state is partitioned by attention heads.
 
+Replay of fitted timing for an unregistered text decoder uses the same state-cache admission as Kimi K3. Supply the decoder's own per-request state geometry for vLLM G1, or a qualified grouped FPM memory profile with a state group. A token KV limit alone cannot establish that the decoder has no recurrent state. A third-party checkpoint that identifies an ordinary registered decoder (for example, Qwen3) follows that decoder's existing memory rules.
+
 With `capacity.type: default`, the number of G1 blocks comes from the
 performance model's memory estimate, which applies `memory_fraction` the way
 each backend does. The backends differ in what they subtract before and after

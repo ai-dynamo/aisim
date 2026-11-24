@@ -152,15 +152,18 @@ def test_cli_generated_plan_keeps_native_ops_model_scoped(model_scoped):
         assert build_collections(REGISTRY, "sglang", "0.5.21", ops)
 
 
-@pytest.mark.parametrize("ambient", [None, "0", "1", "8192"])
+@pytest.mark.parametrize("ambient", [None, "0", "1", "512", "8192"])
 @pytest.mark.parametrize(
     ("variable", "expected"),
     [
         ("SGLANG_DSA_FUSE_TOPK", "1"),
+        ("SGLANG_OPT_USE_TOPK_V2", "1"),
         ("SGLANG_DSA_TOPK_BROADCAST", "0"),
         ("SGLANG_FP8_PAGED_MQA_LOGITS_TORCH", "0"),
         ("SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR", None),
         ("SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD", "2048"),
+        ("SGLANG_MAX_KV_CHUNK_CAPACITY", "131072"),
+        ("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN", "0"),
     ],
 )
 def test_native_dispatch_setting_is_fixed_for_child_and_standalone(monkeypatch, tmp_path, ambient, variable, expected):
@@ -249,6 +252,41 @@ def test_native_cleanup_deadline_stops_allocation(monkeypatch, tmp_path):
         native._run_native_case(case, "cuda:0", tmp_path / "stage")
     assert timeouts == [native.NATIVE_CASE_TIMEOUT_S, native.NATIVE_CLEANUP_TIMEOUT_S]
     assert pipe.closed
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_sigterm_cleanup_timeout_preserves_live_stage_and_writer_lock(monkeypatch, tmp_path, existing):
+    import io
+
+    import collector.sglang.collect_kimi_k31_dsa_v1 as native
+
+    stage = tmp_path / "stage"
+    writer_lock = Path(str(stage) + ".lock")
+    if existing:
+        stage.write_bytes(b"prior rows\n")
+    timeouts = []
+    original_handler = signal.getsignal(signal.SIGTERM)
+
+    def stalled(timeout):
+        timeouts.append(timeout)
+        if len(timeouts) == 1:
+            with stage.open("ab") as stream:
+                stream.write(b"unconfirmed row\n")
+            writer_lock.write_bytes(b"live writer")
+            os.kill(os.getpid(), signal.SIGTERM)
+        raise subprocess.TimeoutExpired("worker", timeout)
+
+    monkeypatch.setattr(
+        native.subprocess, "Popen", lambda *a, **kw: SimpleNamespace(pid=123, stderr=io.StringIO(), communicate=stalled)
+    )
+    monkeypatch.setattr(native.os, "killpg", lambda pid, sig: None)
+    case = ModuleCase(4096, 1, 96, "fp8", "bfloat16", "bfloat16", MODEL, 0)
+    with pytest.raises(native.NativeAllocationFailure, match="stop this allocation"):
+        native._run_native_case(case, "cuda:0", stage)
+    assert timeouts == [native.NATIVE_CASE_TIMEOUT_S, native.NATIVE_CLEANUP_TIMEOUT_S]
+    assert stage.read_bytes() == (b"prior rows\n" if existing else b"") + b"unconfirmed row\n"
+    assert writer_lock.read_bytes() == b"live writer"
+    assert signal.getsignal(signal.SIGTERM) == original_handler
 
 
 def test_physical_sm_validation_checks_every_selected_device():
@@ -1199,6 +1237,7 @@ def test_native_fullnode_resumes_after_last_completed_case(monkeypatch, tmp_path
     from collector.collect import ResumeCheckpoint
 
     cases = [ModuleCase(4096, 1, heads, "fp8", "bfloat16", "bfloat16", MODEL, 0) for heads in (96, 48)]
+    selected = cases
     output = tmp_path / "dsa_context_module_perf.txt"
     target = tmp_path / "physical-rows" if alias else output
     if alias:
@@ -1241,19 +1280,59 @@ def test_native_fullnode_resumes_after_last_completed_case(monkeypatch, tmp_path
             case_plan=None,
             sm_version=103,
             case_filters=None,
-            get_test_cases_for_model=lambda *_args: cases,
+            get_test_cases_for_model=lambda *_args: selected,
             resume_checkpoint_cls=ResumeCheckpoint,
             logger=logging.getLogger(__name__),
         )
 
     with pytest.raises(KeyboardInterrupt, match="during B"):
         collect()
-    checkpoint = json.loads(
-        (tmp_path / "checkpoint" / "sglang" / "sglang.kimi_k31_dsa_context_module.json").read_text()
-    )
+    checkpoint_path = tmp_path / "checkpoint" / "sglang" / "sglang.kimi_k31_dsa_context_module.json"
+    checkpoint_bytes = checkpoint_path.read_bytes()
+    checkpoint = json.loads(checkpoint_bytes)
     assert len(checkpoint["done"]) == 1
     assert not checkpoint["failed"]
     assert output.read_text().splitlines() == [str(cases[0])]
+    receipt = target.with_name(f".{target.name}.pending")
+    transaction = receipt.read_bytes()
+    stage = target.with_name(json.loads(transaction)["stage"])
+    stage_bytes = stage.read_bytes()
+    selected = cases[:1]
+    with pytest.raises(RuntimeError, match="select every unfinished attempt"):
+        collect()
+    assert receipt.read_bytes() == transaction
+    assert stage.read_bytes() == stage_bytes
+    assert checkpoint_path.read_bytes() == checkpoint_bytes
+    assert output.read_text().splitlines() == [str(cases[0])]
+    selected = cases
+
+    # Simulate the launcher dying while a child retains the inherited flock.
+    with module.native_publication_lock(stage) as fd:
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+            pass_fds=(fd,),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        assert child.stdout.readline().strip() == "ready"
+    try:
+        lock_path = stage.with_name(f".{stage.name}.publication-lock")
+        lock_inode = lock_path.stat().st_ino
+        with pytest.raises(RuntimeError, match="already has a publication owner"):
+            collect()
+        assert lock_path.stat().st_ino == lock_inode
+        assert receipt.read_bytes() == transaction
+        assert stage.read_bytes() == stage_bytes
+        assert checkpoint_path.read_bytes() == checkpoint_bytes
+        assert ran == cases
+    finally:
+        try:
+            child.communicate(timeout=10)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=10)
     monkeypatch.setenv("COLLECTOR_K31_FINALIZE_ONLY", "1")
     with pytest.raises(RuntimeError, match="passed checkpoint for every selected case"):
         collect()
