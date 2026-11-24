@@ -1633,11 +1633,36 @@ def test_complete_failed_native_observation_requires_cpu_recovery_without_replac
     assert attempt["postprocessing_attempts"][-1]["status"] == "failed"
     assert "cannot be replaced" in attempt["postprocessing_attempts"][-1]["error"]
 
-    def recover_with_context(*positional, generator_overrides):
+    def recover_with_context(*positional, generator_overrides, **kwargs):
         assert generator_overrides == args["generator_overrides"]
-        return recover(*positional, generator_overrides=generator_overrides)
+        return recover(*positional, generator_overrides=generator_overrides, **kwargs)
 
     monkeypatch.setattr(repeatability, "_recover_completed_attempt", recover_with_context)
+    interrupt_recovery = archived_auth and collector_status == "interrupted"
+    if interrupt_recovery:
+        report_path = args["output_dir"] / repeatability.REPORT_FILENAME
+        durable_reports = []
+        reconcile = repeatability._reconcile_diagnostic
+
+        def interrupt_after_unlink(attempt, files, cell_path):
+            intent = attempt.get("pending_diagnostic") or {}
+            if intent.get("path", "").endswith("recovery-config.json"):
+                durable_reports.append(report_path.read_bytes())
+                raise KeyboardInterrupt("interrupted after sanitization")
+            return reconcile(attempt, files, cell_path)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(repeatability, "_reconcile_diagnostic", interrupt_after_unlink)
+            with pytest.raises(KeyboardInterrupt, match="after sanitization"):
+                repeatability.run_repeatability(**args, resume=True, retry_failed=True)
+        # Emulate process loss before the outer finally can publish its report.
+        report_path.write_bytes(durable_reports[0])
+        native = next(args["output_dir"].rglob("benchmark-*.json"))
+        original_native = native.read_bytes()
+        native.write_bytes(original_native + b" ")
+        with pytest.raises(ValueError, match="attempt files changed"):
+            repeatability.run_repeatability(**args, resume=True, retry_failed=True)
+        native.write_bytes(original_native)
     if archived_auth:
         # Recovery completes with no token. Only the following new sample
         # needs auth, and fails before allocating a replacement attempt.
@@ -1653,7 +1678,8 @@ def test_complete_failed_native_observation_requires_cpu_recovery_without_replac
     assert all(point["raw_samples_seconds"][0] == 3 * point["source_wall_time_seconds"] for point in result["points"])
     assert all(point["sample_count"] == 5 and point["sample_cv"] > 0.05 for point in result["points"])
     attempt = result["samples"][cell_id][0]["attempts"][0]
-    assert [item["status"] for item in attempt["postprocessing_attempts"]] == ["failed", "passed"]
+    expected_retries = ["failed", "interrupted", "passed"] if interrupt_recovery else ["failed", "passed"]
+    assert [item["status"] for item in attempt["postprocessing_attempts"]] == expected_retries
     assert attempt["postprocessing_attempts"][-1]["artifact_recovery"]["original_status"] == collector_status
     assert all(len(sample["attempts"]) == 1 for sample in result["samples"][cell_id])
     assert checkpoint_path.read_bytes() == original_checkpoint

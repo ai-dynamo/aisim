@@ -39,7 +39,7 @@ def redact(text, values):
     return text
 
 
-def redact_diagnostics(directory, values):
+def redact_diagnostics(directory, values, *, update=None):
     """Sanitize retained text after exact transport verification, before archival."""
     if not values:
         return
@@ -80,7 +80,10 @@ def redact_diagnostics(directory, values):
                             continue
                         sanitized = json.dumps(redacted, ensure_ascii=False) + "\n"
                 if sanitized != original:
-                    path.write_text(sanitized)
+                    if update is None:
+                        path.write_text(sanitized)
+                    else:
+                        update(path, sanitized.encode())
 
 
 def reclaim_delivery(cell_dir):
@@ -106,7 +109,7 @@ def reclaim_delivery(cell_dir):
     receipt.unlink()
 
 
-def discard_diagnostics(directory, *, keep=()):
+def discard_diagnostics(directory, *, keep=(), update=None):
     """Remove logs and config dumps that could not be sanitized."""
     for name in ("raw", "logs"):
         root = Path(directory) / name
@@ -115,10 +118,13 @@ def discard_diagnostics(directory, *, keep=()):
                 continue
             if name == "raw" and path.suffix == ".json" and "config" not in path.name:
                 continue
-            path.unlink()
+            if update is None:
+                path.unlink()
+            else:
+                update(path, None)
 
 
-def sanitize_recovered_diagnostics(directory, overrides, *, cell=None, environment=None):
+def sanitize_recovered_diagnostics(directory, overrides, *, cell=None, environment=None, update=None):
     """Retain diagnostics only when all redaction values match their saved digests."""
     try:
         resolved = resolve_archived_generator_overrides(overrides, environment=environment)
@@ -132,12 +138,15 @@ def sanitize_recovered_diagnostics(directory, overrides, *, cell=None, environme
         try:
             projections = _observed_backend_markers(cell, Path(directory)) if cell is not None else {}
             for path, projection in projections.items():
-                _atomic_json(path, projection)
+                if update is None:
+                    _atomic_json(path, projection)
+                else:
+                    update(path, (json.dumps(projection, indent=2, sort_keys=True) + "\n").encode())
                 retained.add(path)
         finally:
-            discard_diagnostics(directory, keep=retained)
+            discard_diagnostics(directory, keep=retained, update=update)
     else:
-        redact_diagnostics(directory, private_values(resolved))
+        redact_diagnostics(directory, private_values(resolved), update=update)
 
 
 class SlurmDelivery:

@@ -12,9 +12,12 @@ No runtime scheduler implementation is copied or replaced here.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
+import os
 import statistics
+import tempfile
 from collections import Counter
 from dataclasses import fields, replace
 from pathlib import Path
@@ -47,6 +50,7 @@ from .runner import (
     _atomic_json,
     _cell_runner,
     _file_manifest,
+    _file_metadata,
     _recover_completed_attempt,
     _validate_points_receipts,
     run_collection,
@@ -616,10 +620,68 @@ def _retry_sample_cleanup(plan, selected, directory, attempt):
         attempt["files"] = _file_manifest(directory)
 
 
-def _retry_sample_postprocessing(plan, selected, directory, attempt, generator_overrides):
+def _reconcile_diagnostic(attempt, files, cell_path):
+    """Accept only the recorded preimage or the intended result of one atomic edit."""
+    pending = attempt.get("pending_diagnostic")
+    if pending is None:
+        return
+    name = pending["path"]
+    relative = Path(name).relative_to(cell_path)
+    if (
+        ".." in relative.parts
+        or len(relative.parts) < 2
+        or relative.parts[0] not in {"raw", "logs"}
+        or (relative.parts[0] == "raw" and relative.suffix == ".json" and "config" not in relative.name)
+    ):
+        raise ValueError("invalid repeatability diagnostic recovery path")
+    before, after = pending["before"], pending["after"]
+    if before is None or attempt["files"].get(name) != before or files.get(name) not in (before, after):
+        raise ValueError("repeatability diagnostic changed outside recovery")
+    if files.get(name) == after:
+        manifests = [(attempt["files"], name)]
+        if relative.parts[0] == "raw":
+            manifests.append((attempt["evidence"]["raw_files"], str(relative.relative_to("raw"))))
+        for manifest, key in manifests:
+            if after is None:
+                manifest.pop(key)
+            else:
+                manifest[key] = after
+        attempt["postprocessing_attempts"][-1].setdefault("diagnostic_changes", []).append(pending)
+    del attempt["pending_diagnostic"]
+
+
+def _retry_sample_postprocessing(plan, selected, directory, attempt, generator_overrides, root, report):
     """Validate salvaged artifacts without relaunching or rewriting their checkpoint."""
     recovery = {"status": "running"}
     attempt.setdefault("postprocessing_attempts", []).append(recovery)
+    cell_path = Path("artifacts") / plan.sha256[:16] / "cells" / selected["cell_id"]
+
+    def update(path, content):
+        name = str(path.relative_to(directory))
+        if "pending_diagnostic" in attempt:
+            raise ValueError("previous diagnostic edit was interrupted")
+        before = attempt["files"][name]
+        if _file_metadata(path) != before:
+            raise ValueError("repeatability diagnostic changed before recovery")
+        after = None if content is None else {"size": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+        if before == after:
+            return
+        attempt["pending_diagnostic"] = {"path": name, "before": before, "after": after}
+        _atomic_json(root / REPORT_FILENAME, report)
+        if content is None:
+            path.unlink()
+        else:
+            # Keep staging outside the immutable sample manifest. Only the
+            # sanitized bytes are staged, and replacement is atomic.
+            fd, stage = tempfile.mkstemp(dir=root, prefix=".redacted-")
+            try:
+                with os.fdopen(fd, "wb") as staging:
+                    staging.write(content)
+                os.replace(stage, path)
+            finally:
+                Path(stage).unlink(missing_ok=True)
+        _reconcile_diagnostic(attempt, {name: after}, cell_path)
+
     try:
         checkpoint = json.loads((directory / "checkpoint" / "fpm_forward.json").read_text())
         entry = dict(checkpoint["cells"][selected["cell_id"]])
@@ -631,6 +693,7 @@ def _retry_sample_postprocessing(plan, selected, directory, attempt, generator_o
             directory / "artifacts" / plan.sha256[:16],
             entry,
             generator_overrides=generator_overrides,
+            diagnostic_update=update,
         )
         if recovered is None:
             raise ValueError(
@@ -638,23 +701,8 @@ def _retry_sample_postprocessing(plan, selected, directory, attempt, generator_o
                 "and teardown before retrying recovery; the original GPU measurement cannot be replaced"
             )
         observed = _sample_evidence(plan, selected, directory)
-        recorded = attempt["evidence"]
-        original_files, new_files = recorded["raw_files"], observed["raw_files"]
-        # Sanitization may redact or discard existing diagnostic dumps. Native
-        # measurement files, execution identity, points and launch evidence stay exact.
-        if (
-            {**recorded, "raw_files": new_files} != observed
-            or new_files.keys() - original_files.keys()
-            or any(
-                new_files.get(name) != metadata
-                for name, metadata in original_files.items()
-                if Path(name).suffix == ".json" and "config" not in Path(name).name
-            )
-        ):
+        if observed != attempt["evidence"] or _file_manifest(directory) != attempt["files"]:
             raise ValueError("repeatability sample evidence changed during post-processing recovery")
-        if new_files != original_files:
-            recovery["original_raw_files"] = original_files
-            attempt["evidence"] = observed
         recovery.update(status="passed", artifact_recovery=recovered["artifact_recovery"])
         attempt["status"] = "passed"
     except (KeyboardInterrupt, SystemExit):
@@ -662,9 +710,6 @@ def _retry_sample_postprocessing(plan, selected, directory, attempt, generator_o
         raise
     except Exception as error:
         recovery.update(status="failed", error=f"{type(error).__name__}: {error}")
-    finally:
-        attempt.setdefault("postprocessing_file_history", []).append(attempt.get("files", {}))
-        attempt["files"] = _file_manifest(directory)
 
 
 def _comparison_status(comparisons: list[dict[str, Any]]) -> str:
@@ -1049,8 +1094,15 @@ def _validate_saved_samples(source, frozen, report, root):
                     raise ValueError("repeatability saved attempt directory is invalid")
                 if attempt.get("status") not in {"running", "interrupted", "failed", "passed"}:
                     raise ValueError("repeatability saved attempt status is invalid")
-                if attempt.get("files") is not None and _file_manifest(directory) != attempt["files"]:
-                    raise ValueError("repeatability attempt files changed")
+                if attempt.get("files") is not None:
+                    files = _file_manifest(directory)
+                    cell_path = Path("artifacts") / plan.sha256[:16] / "cells" / cell["cell_id"]
+                    _reconcile_diagnostic(attempt, files, cell_path)
+                    if files != attempt["files"]:
+                        raise ValueError("repeatability attempt files changed")
+                    retries = attempt.get("postprocessing_attempts", [])
+                    if retries and retries[-1]["status"] == "running":
+                        retries[-1]["status"] = "interrupted"
                 if attempt["status"] != "passed" and not attempt.get("evidence"):
                     continue
                 if attempt_index != len(sample["attempts"]):
@@ -1191,7 +1243,9 @@ def run_repeatability(
                             continue
                     if retry_failed and previous.get("failure_kind") == "postprocessing_failed":
                         try:
-                            _retry_sample_postprocessing(plan, selected, previous_dir, previous, generator_overrides)
+                            _retry_sample_postprocessing(
+                                plan, selected, previous_dir, previous, generator_overrides, root, report
+                            )
                         finally:
                             _summarize(frozen, report)
                             _save_report(root, report)
