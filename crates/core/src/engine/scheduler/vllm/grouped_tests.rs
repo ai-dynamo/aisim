@@ -2233,34 +2233,29 @@ fn grouped_prefill_rank_in_block_mode_readmits_a_held_request_when_a_held_source
         .unwrap();
         held_timing(&mut core);
         assert_eq!(block_pool(&core).active_blocks(), 2);
-        // A second source of 16 tokens with 3 output tokens, which the
-        // engine API accepts and Replay does not send. Pass 1 computes its
-        // 15 tokens in a full block and a state block and emits the first
-        // output token, and pass 2 computes that token and emits the
-        // second. The 17th token then needs a second full block and, past
+        // A second request of 15 tokens with 3 output tokens, sent as a
+        // plain request. Pass 1 computes its 15 tokens in a full block and a
+        // state block and emits the first output token, and pass 2 computes
+        // that token and emits the second. The 17th token then needs a second full block and, past
         // the block boundary, a new state block beside the previous one: 2
-        // blocks, and 1 is free. So the source preempts itself in pass 3.
+        // blocks, and 1 is free. So the request preempts itself in pass 3.
         // Its readmission in pass 4 counts 2 full blocks and a state block
         // for its 17 tokens and finds 3. It computes 16 tokens again, and
         // pass 5 preempts it with the same pool. From pass 6 on it waits.
-        let waiting = HandoffId::new(Uuid::from_u128(1654));
         let second = Uuid::from_u128(1653);
-        core.apply_command(SchedulerCommand::SubmitHandoffPrefill {
-            handoff_id: waiting,
-            request: DirectRequest {
-                tokens: (2000..2016).collect(),
-                max_output_tokens: 3,
-                ..source_request(1653, 0)
-            },
-        })
+        core.apply_command(SchedulerCommand::Submit(DirectRequest {
+            tokens: (2000..2015).collect(),
+            max_output_tokens: 3,
+            ..source_request(1653, 0)
+        }))
         .unwrap();
         assert_eq!(admitting_passes_at_0_ms(&mut core, 10), [1, 4], "{cancel}");
         assert_eq!(core.mocker_metrics().vllm_preemptions_total, 2);
         assert_eq!(block_pool(&core).active_blocks(), 2);
         // The held source is released or cancelled at the same time. The
-        // next pass at that time admits the second source, and the pass
+        // next pass at that time admits the second request, and the pass
         // after it computes the 17th token in 4 blocks, emits the third
-        // output token and holds the source.
+        // output token and finishes the request.
         let command = if cancel {
             SchedulerCommand::CancelSource {
                 handoff_id: blocker,
@@ -2284,10 +2279,10 @@ fn grouped_prefill_rank_in_block_mode_readmits_a_held_request_when_a_held_source
             "{cancel}"
         );
         assert_eq!(block_pool(&core).active_blocks(), 2);
-        assert!(!core.source_is_held(waiting));
+        assert_eq!(core.state.requests[&second].status, RequestStatus::Running);
         block_pool(&core).reset_peak_active_blocks();
         core.execute_pass(&mut trace, 0.0);
-        assert!(core.source_is_held(waiting), "{cancel}");
+        assert!(core.is_drained(), "{cancel}");
         assert_eq!(block_pool(&core).peak_active_blocks(), 4);
         assert_eq!(core.mocker_metrics().vllm_preemptions_total, 2);
     }
