@@ -308,3 +308,42 @@ def test_unpinned_models_keep_family_or_default_image(backend, op):
 
     c = _load()
     assert c.pinned_image(backend, op, "unlisted/model") == resolve_op_runtime(backend, op).image()
+
+
+@pytest.mark.parametrize("model", [None, "other/model"])
+def test_native_build_image_requires_canonical_model(model, monkeypatch):
+    c = _load()
+    argv = ["collector", "build-image", "--backend", "sglang", "--op", "kimi_k31_dsa_generation_module"]
+    monkeypatch.setattr(sys, "argv", argv + (["--model-path", model] if model else []))
+    with pytest.raises(SystemExit, match="require model_path"):
+        c.main()
+
+
+def test_native_shard_maturity_is_checked_before_scheduling():
+    c = _load()
+    shard = c.Shard("kimi_k31_dsa_generation_module", "one", model_path="moonshotai/Kimi-K3.1-Pro")
+    with pytest.raises(SystemExit, match="unverified on SM100"):
+        c._validate_shard_allocation(c.Plan("sglang", 100, (shard,)), shard)
+
+
+def test_finalize_admits_existing_checkpoint_with_worker_launch_disabled(tmp_path):
+    c = _load()
+    shard = c.Shard(
+        "kimi_k31_dsa_generation_module", "tp2", case_filter=", 48, 'fp8',", model_path="moonshotai/Kimi-K3.1-Pro"
+    )
+    plan = c.Plan("sglang", 103, (shard,))
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.touch()
+    c._validate_shard_allocation(plan, shard, finalize_checkpoint=checkpoint)
+    args = c.docker_argv(
+        plan,
+        shard,
+        image="test",
+        gpu=0,
+        checkout=tmp_path,
+        shard_dir=tmp_path,
+        container_name="finalize",
+        collector_ref="0" * 40,
+        mode="finalize",
+    )
+    assert "COLLECTOR_K31_FINALIZE_ONLY=1" in args

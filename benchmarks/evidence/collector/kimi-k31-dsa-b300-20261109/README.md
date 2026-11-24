@@ -54,7 +54,11 @@ All twelve cases subsequently passed using native Req continuations with at most
 native prefill; the final decode history, batch, module and ten-sample timing
 protocol are unchanged. A same-model 4096-token control produced identical KV
 slots, packed KV bytes, index-K bytes, decode inputs and decode logits between
-monolithic and chunked preparation. The follow-up's raw table, sidecar and
+monolithic and chunked preparation. Its own 1,024-token budget produced four chunks
+(1,024, 1,024, 1,024 and 1,023 history tokens) and three continuations.
+The two original diagnostic records are preserved in
+[the control log excerpt](chunked-history/equivalence-control.jsonl). The full
+log and probe hashes are recorded in the original receipt. The follow-up's raw table, sidecar and
 receipts are retained under that evidence directory's `chunked-history/`;
 `derivation.json` and `merge-campaigns.py` record the exact disjoint union.
 

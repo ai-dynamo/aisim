@@ -215,15 +215,65 @@ def test_standalone_shares_supervisor_lock(tmp_path, monkeypatch):
     import collector.sglang.collect_kimi_k31_dsa_v1 as module
 
     output = tmp_path / "rows"
-    monkeypatch.setattr(sys, "argv", ["collector", "--case", "[]", "--phase", "generation", "--output", str(output)])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "collector",
+            "--case",
+            json.dumps([4096, 1, 96, "fp8", "bfloat16", "bfloat16", MODEL, 0]),
+            "--phase",
+            "generation",
+            "--output",
+            str(output),
+        ],
+    )
     calls = []
-    monkeypatch.setattr(module, "_collect_native", lambda args: calls.append(args.output))
+    monkeypatch.setattr(module, "_collect_native", lambda args, *_: calls.append(args.output))
     with module.native_publication_lock(output) as fd:
         with pytest.raises(RuntimeError, match="publication owner"):
             module.main()
         sys.argv.extend(["--publication-lock-fd", str(fd)])
         module.main()
     assert calls == [str(output)]
+
+
+@pytest.mark.parametrize("fail_after_write", [False, True])
+def test_standalone_publishes_only_after_rank_join(tmp_path, monkeypatch, fail_after_write):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as module
+
+    output = tmp_path / "context.txt"
+    output.write_text("existing row\n")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "collector",
+            "--case",
+            json.dumps([4096, 1, 96, "fp8", "bfloat16", "bfloat16", MODEL, 0]),
+            "--phase",
+            "context",
+            "--output",
+            str(output),
+        ],
+    )
+
+    def ranks(args, *_):
+        assert Path(args.output) != output
+        with Path(args.output).open("a") as stream:
+            stream.write("new row\n")
+        assert output.read_text() == "existing row\n"
+        if fail_after_write:
+            raise RuntimeError("rank 1 failed after rank 0 wrote")
+
+    monkeypatch.setattr(module, "_collect_native", ranks)
+    if fail_after_write:
+        with pytest.raises(RuntimeError, match="rank 1 failed"):
+            module.main()
+        assert output.read_text() == "existing row\n"
+    else:
+        module.main()
+        assert output.read_text() == "existing row\nnew row\n"
 
 
 @pytest.mark.parametrize("existing", [False, True])
@@ -948,6 +998,9 @@ def test_native_fullnode_failure_reaches_persisted_artifact(monkeypatch, tmp_pat
         resume_checkpoint_cls=ResumeCheckpoint,
         logger=logging.getLogger(__name__),
     )
+    artifact = tmp_path / "checkpoint/sglang/errors_sglang.kimi_k31_dsa_context_module.json"
+    assert json.loads(artifact.read_text()) == errors
+    assert errors[0]["task_params"] == str(case)
     assert len(errors) == 1
     assert errors[0]["error_message"] == reason
     assert errors[0]["error_type"] == "RuntimeError"
@@ -1011,6 +1064,12 @@ def test_native_fullnode_resumes_after_last_completed_case(monkeypatch, tmp_path
     assert len(checkpoint["done"]) == 1
     assert not checkpoint["failed"]
     assert output.read_text().splitlines() == [str(cases[0])]
+    monkeypatch.setenv("COLLECTOR_K31_FINALIZE_ONLY", "1")
+    with pytest.raises(RuntimeError, match="passed checkpoint for every selected case"):
+        collect()
+    monkeypatch.delenv("COLLECTOR_K31_FINALIZE_ONLY")
+    assert collect() == []
+    monkeypatch.setenv("COLLECTOR_K31_FINALIZE_ONLY", "1")
     assert collect() == []
     assert ran == [cases[0], cases[1], cases[1]]
     assert output.read_text().splitlines() == list(map(str, cases))
@@ -1098,10 +1157,12 @@ def test_native_success_without_result_row_is_not_checkpointable(monkeypatch, tm
 
 
 @pytest.mark.parametrize("phase", ["context", "generation"])
-def test_native_input_draw_is_identical_despite_rank_local_rng(monkeypatch, phase):
+def test_native_input_draw_is_identical_despite_rank_local_rng(monkeypatch, request, phase):
     import collector.sglang.collect_kimi_k31_dsa_v1 as module
     import numpy as np
 
+    initial_state = np.random.get_state()
+    request.addfinalizer(lambda: np.random.set_state(initial_state))
     draws, checked = [], []
 
     def prepare(batch_size, length):

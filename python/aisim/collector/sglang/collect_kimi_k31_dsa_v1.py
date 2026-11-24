@@ -31,6 +31,7 @@ import importlib.metadata
 import json
 import logging
 import os
+import shutil
 import signal
 import statistics
 import subprocess
@@ -39,7 +40,7 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
-from collector.helper import get_sm_version, log_perf, native_publication_lock
+from collector.helper import collector_retained_path, get_sm_version, log_perf, native_publication_lock
 from collector.op_plans import ModuleCase, plan_cases
 
 __compat__ = "sglang==0.0.0.dev1+g41208373c.d20261104"
@@ -632,8 +633,30 @@ def main() -> None:
     parser.add_argument("--sm", type=int, default=103, help="expected physical CUDA compute capability")
     parser.add_argument("--publication-lock-fd", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
-    with native_publication_lock(Path(args.output), args.publication_lock_fd):
-        _collect_native(args)
+    case = ModuleCase(*json.loads(args.case))
+    tp = validate_case(case, args.phase)
+    output = Path(args.output)
+    with native_publication_lock(output, args.publication_lock_fd):
+        if args.publication_lock_fd is not None:
+            _collect_native(args, case, tp)
+            return
+        if Path(f"{output}.lock").exists():
+            raise RuntimeError(f"Native output already has a writer lock: {output}")
+        with tempfile.TemporaryDirectory(dir=output.parent, prefix=f".{output.name}.stage-") as directory:
+            stage = Path(directory, output.name)
+            if output.exists():
+                shutil.copyfile(output, stage)
+            previous_size = stage.stat().st_size if stage.exists() else 0
+            args.output = str(stage)
+            _collect_native(args, case, tp)
+            if not stage.exists() or stage.stat().st_size <= previous_size:
+                raise RuntimeError("standalone native ranks exited without appending a result row")
+            if collector_retained_path(output).exists():
+                from collector.collect import _atomic_write_bytes
+
+                _atomic_write_bytes(output, stage.read_bytes())
+            else:
+                os.replace(stage, output)
 
 
 def _check_device_sm(cuda, first_gpu, count, expected_sm):
@@ -644,9 +667,7 @@ def _check_device_sm(cuda, first_gpu, count, expected_sm):
             raise RuntimeError(f"cuda:{gpu} has SM{actual}, expected SM{expected_sm}")
 
 
-def _collect_native(args):
-    case = ModuleCase(*json.loads(args.case))
-    tp = validate_case(case, args.phase)
+def _collect_native(args, case, tp):
     os.environ.pop(SKIP_SOFTMAX_ENV, None)
     os.environ.update(NATIVE_ENV)
     _assert_runtime()
