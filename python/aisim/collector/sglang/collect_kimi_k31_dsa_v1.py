@@ -70,12 +70,15 @@ class NativeAllocationFailure(SystemExit):
 # The same revision's Envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD
 # defaults to 2048; DeepseekSparseAttnBackend uses it for dense short-prefill
 # attention. Preserve that serving dispatch as well as the fused top-k path.
+# Envs.SGLANG_MAX_KV_CHUNK_CAPACITY defaults to 128 * 1024; the backend
+# also requires total KV tokens to fit ForwardBatch.get_max_chunk_capacity().
 SKIP_SOFTMAX_ENV = "SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR"
 NATIVE_ENV = {
     "SGLANG_DSA_FUSE_TOPK": "1",
     "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH": "0",
     "SGLANG_DSA_TOPK_BROADCAST": "0",
     "SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD": "2048",
+    "SGLANG_MAX_KV_CHUNK_CAPACITY": "131072",
 }
 
 
@@ -233,6 +236,7 @@ def run_kimi_k31_dsa_fullnode(*, perf_filename, limit=None, cases=None, expected
 def _native_termination_handler():
     process = None
     cancelled = False
+    allocation_failed = False
 
     def kill_group():
         if process is not None:
@@ -256,9 +260,14 @@ def _native_termination_handler():
     previous = signal.signal(signal.SIGTERM, terminate)
     try:
         yield own
+    except NativeAllocationFailure:
+        # Cleanup could not reap the allocation. Preserve this exception so
+        # the caller leaves the stage and writer lock with the live group.
+        allocation_failed = True
+        raise
     finally:
         signal.signal(signal.SIGTERM, previous)
-        if cancelled:
+        if cancelled and not allocation_failed:
             raise SystemExit(128 + signal.SIGTERM)
 
 

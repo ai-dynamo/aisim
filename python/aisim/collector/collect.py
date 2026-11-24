@@ -1544,8 +1544,26 @@ class ResumeCheckpoint:
             logger.info(f"{self.module_name}: {', '.join(parts)}")
         return runnable
 
+    @staticmethod
+    def has_recoverable_checkpoint(path: Path) -> bool:
+        """Inspect the same atomic-replacement states that load_existing recovers."""
+        if not path.parent.exists():
+            return False
+        with _locked_checkpoint_directory(path) as locked:
+            canonical = _checkpoint_path_in_locked_directory(path, locked)
+            if not any(
+                _entry_state_at(locked.file_descriptor, name) is not None
+                for name in (canonical.name, _atomic_write_previous_path(canonical).name)
+            ):
+                return False
+            _effective_checkpoint_state_at(locked.file_descriptor, canonical, context_path=canonical, kind="checkpoint")
+        return True
+
+    def unfinished_attempt_ids(self) -> set[str]:
+        return self._attempted - self._done - self._failed
+
     def has_unfinished_attempts(self) -> bool:
-        return bool(self._attempted - self._done - self._failed)
+        return bool(self.unfinished_attempt_ids())
 
     def has_passed(self, task_id: str) -> bool:
         return task_id in self._done

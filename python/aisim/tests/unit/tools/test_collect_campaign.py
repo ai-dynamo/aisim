@@ -121,6 +121,38 @@ def test_image_is_the_manifest_pin_plus_finalize_deps():
     assert c.collect_image_tag(base).startswith("aisim-collect:")
 
 
+def test_digest_pins_have_distinct_build_and_campaign_tags(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    c = _load()
+    bases = [f"registry.example/{'long-repository-' * 6}:same@sha256:{digit * 64}" for digit in ("a", "b")]
+    builds = []
+    monkeypatch.setattr(c.subprocess, "run", lambda argv, **kwargs: builds.append((argv, kwargs["input"])))
+    tags = [c.build_image(base) for base in bases]
+    assert tags[0] != tags[1]
+    assert c.collect_image_tag(bases[0]) == tags[0]
+    assert all(len(tag.split(":", 1)[1]) <= 128 for tag in tags)
+    for (argv, recipe), tag, base in zip(builds, tags, bases, strict=True):
+        assert argv[argv.index("-t") + 1] == tag
+        assert recipe.startswith(f"FROM {base}\n")
+
+    shards = tuple(c.Shard("gemm", str(index), model_path=base) for index, base in enumerate(bases))
+    plan = c.Plan("sglang", 103, shards)
+    monkeypatch.setattr(c, "collector_ref", lambda _: "0" * 40)
+    monkeypatch.setattr(c, "pinned_image", lambda _backend, _op, model: model)
+    inspected, commands = [], []
+    monkeypatch.setattr(c, "image_digest", lambda image: inspected.append(image) or "sha256:present")
+
+    def launch(argv):
+        commands.append(argv)
+        return SimpleNamespace(returncode=0, poll=lambda: 0, wait=lambda: 0)
+
+    monkeypatch.setattr(c.subprocess, "Popen", launch)
+    assert c.run_campaign(plan, root=tmp_path, gpus=[0], checkout=tmp_path, image_override=None, mode="run") == 0
+    assert set(inspected) == set(tags)
+    assert [argv[argv.index("--image") + 1] for argv in commands] == tags
+
+
 def test_shard_state_reads_the_namespace(tmp_path):
     c = _load()
     plan = c.load_plan(_plan(tmp_path, [{"op": "gemm", "name": "bf16"}]))
@@ -363,6 +395,89 @@ def test_finalize_admits_existing_checkpoint_with_worker_launch_disabled(tmp_pat
         mode="finalize",
     )
     assert "COLLECTOR_K31_FINALIZE_ONLY=1" in args
+
+
+@pytest.mark.parametrize("mode", ["run", "finalize"])
+@pytest.mark.parametrize("interrupted", [False, True])
+@pytest.mark.parametrize("complete", [False, True])
+def test_campaign_recovers_tp_checkpoint_and_validates_all_selected_cases(
+    monkeypatch, tmp_path, mode, interrupted, complete
+):
+    import logging
+    from types import SimpleNamespace
+
+    from collector import fullnode
+    from collector.collect import ResumeCheckpoint, _atomic_write_previous_path
+    from collector.helper import atomic_write_reservation_path, create_test_case_id
+    from collector.op_plans import ModuleCase
+    from collector.sglang import collect_kimi_k31_dsa_v1 as native
+
+    c = _load()
+    shard = c.Shard("kimi_k31_dsa_context_module", "tp2", case_filter=", 48, 'fp8',", model_path=native.MODEL)
+    plan = c.Plan("sglang", 103, (shard,))
+    out = c.shard_dir(tmp_path, shard)
+    checkpoints = out / ".ckpt"
+    tracker = ResumeCheckpoint(
+        "sglang", "sglang." + shard.op, "run_kimi_k31_dsa_fullnode", str(checkpoints), native.RUNTIME_VERSION, 103
+    )
+    cases = [ModuleCase(length, 1, 48, "fp8", "bfloat16", "bfloat16", native.MODEL, 0) for length in (1024, 4096)]
+    for case in cases:
+        task_id = create_test_case_id(case, "run_kimi_k31_dsa_fullnode", "sglang." + shard.op)
+        tracker.mark_attempted(task_id)
+        if complete or case == cases[0]:
+            tracker.mark_passed(task_id)
+    tracker.flush(force=True)
+    original = tracker._path.read_bytes()
+    if interrupted:
+        tracker._path.rename(_atomic_write_previous_path(tracker._path))
+        atomic_write_reservation_path(tracker._path).write_bytes(b"incomplete replacement")
+    monkeypatch.setattr(c, "collector_ref", lambda _: "0" * 40)
+    monkeypatch.setattr(c, "image_digest", lambda _: "sha256:present")
+    commands = []
+
+    def launch(argv):
+        commands.append(argv)
+        return SimpleNamespace(returncode=0, poll=lambda: 0, wait=lambda: 0)
+
+    monkeypatch.setattr(c.subprocess, "Popen", launch)
+    assert c.run_campaign(plan, root=tmp_path, gpus=[0], checkout=tmp_path, image_override="test", mode=mode) == 0
+    assert len(commands) == 1
+    assert commands[0][commands[0].index("--mode") + 1] == "finalize"
+    assert tracker._path.exists() != interrupted  # admission is read-only
+    monkeypatch.setenv("COLLECTOR_K31_FINALIZE_ONLY", "1")
+    monkeypatch.setattr(native, "run_kimi_k31_dsa_fullnode", lambda **_: pytest.fail("must never launch TP work"))
+
+    def collect():
+        return fullnode.collect_sglang_fullnode_op(
+            {
+                "name": "sglang",
+                "type": shard.op,
+                "module": native.__name__,
+                "get_func": "get_kimi_k31_dsa_context_test_cases",
+                "run_func": "run_kimi_k31_dsa_fullnode",
+                "perf_filename": str(out / "dsa_context_module_perf.txt"),
+            },
+            runtime_version=native.RUNTIME_VERSION,
+            limit=None,
+            shuffle=False,
+            shuffle_seed=42,
+            backend="sglang",
+            resume_options={"checkpoint_dir": str(checkpoints), "resume": True},
+            model_path=native.MODEL,
+            case_plan=None,
+            sm_version=103,
+            case_filters=None,
+            get_test_cases_for_model=lambda *_: cases,
+            resume_checkpoint_cls=ResumeCheckpoint,
+            logger=logging.getLogger(__name__),
+        )
+
+    if complete:
+        assert collect() == []
+    else:
+        with pytest.raises(RuntimeError, match="passed checkpoint for every selected case"):
+            collect()
+    assert tracker._path.read_bytes() == original
 
 
 @pytest.mark.parametrize("published", [True, False])

@@ -45,6 +45,9 @@ class _Checkpoint:
     def has_passed(self, task_id):
         return task_id in self.passed
 
+    def unfinished_attempt_ids(self):
+        return set(self.attempted) - set(self.passed) - set(self.failed)
+
     def mark_passed(self, task_id):
         self.passed.append(task_id)
 

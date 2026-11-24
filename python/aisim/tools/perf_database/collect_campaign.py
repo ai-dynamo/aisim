@@ -46,6 +46,7 @@ into one table is the delivery step (playbook §8) and is out of scope here.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -135,6 +136,10 @@ def pinned_image(backend: str, op: str, model_path: str | None = None) -> str:
 def collect_image_tag(base_image: str) -> str:
     """Deterministic local tag for <base image> + finalize deps."""
     name = base_image.split("@", 1)[0].replace("/", "-").replace(":", "-")
+    if "@" in base_image:
+        # Bind the immutable base, including its digest. Bound the readable
+        # prefix so the Docker tag remains within its 128-character limit.
+        name = f"{name[:50]}-{hashlib.sha256(base_image.encode()).hexdigest()}"
     return f"aisim-collect:{name}"
 
 
@@ -383,10 +388,11 @@ def _free_gpu(busy: dict[int, subprocess.Popen | None], gpus: list[int]) -> int 
     return None
 
 
-def _validate_shard_allocation(plan: Plan, shard: Shard, *, finalize_checkpoint: Path | None = None) -> None:
-    """Refuse a native TP group before launching a one-device container."""
+def _validate_shard_allocation(plan: Plan, shard: Shard, *, finalize_checkpoint: Path | None = None) -> bool:
+    """Refuse a native TP group, or require checkpoint-only recovery (True)."""
     if not _native_k31(plan.backend, shard.op):
-        return
+        return False
+    from collector.collect import ResumeCheckpoint
     from collector.op_plans import plan as plan_cases
     from collector.sglang.collect_kimi_k31_dsa_v1 import validate_case
     from collector.sglang.registry import REGISTRY
@@ -413,18 +419,18 @@ def _validate_shard_allocation(plan: Plan, shard: Shard, *, finalize_checkpoint:
     ]
     if not cases:
         raise SystemExit(f"{shard.key}: no qualified native cases on SM{plan.sm}")
-    if finalize_checkpoint is not None and finalize_checkpoint.is_file():
+    required_gpus = max(validate_case(case) for case in cases)
+    if finalize_checkpoint is not None and ResumeCheckpoint.has_recoverable_checkpoint(finalize_checkpoint):
         # The mounted collector checks every selected ID under the output lock
         # before publication; this flag forbids it from launching missing work.
-        return
-    for case in cases:
-        tp = validate_case(case)
-        if tp > 1:
-            raise SystemExit(
-                f"{shard.key}: TP{tp} needs {tp} GPUs, but campaign shards expose one GPU; "
-                "use collector/collect.py's full-node path (collector/fullnode.py) on a dedicated "
-                "allocation exposing the full TP group, or select only TP1 cases with case_filter"
-            )
+        return required_gpus > 1
+    if required_gpus > 1:
+        raise SystemExit(
+            f"{shard.key}: TP{required_gpus} needs {required_gpus} GPUs, but campaign shards expose one GPU; "
+            "use collector/collect.py's full-node path (collector/fullnode.py) on a dedicated "
+            "allocation exposing the full TP group, or select only TP1 cases with case_filter"
+        )
+    return False
 
 
 def run_campaign(
@@ -433,21 +439,28 @@ def run_campaign(
     """GPU pool over the plan. mode=run: skip DONE shards; mode=finalize: only done-no-parquet shards."""
     root.mkdir(parents=True, exist_ok=True)
     todo = []
+    shard_modes = {}
     for s in plan.shards:
         st = shard_state(root, s, plan.backend)
         completed = st == "finalized" or (st == "done-no-parquet" and not _native_k31(plan.backend, s.op))
         if mode == "run" and completed and (shard_dir(root, s) / "DONE").exists():
             continue
         checkpoint = shard_dir(root, s) / ".ckpt" / plan.backend / f"{plan.backend}.{s.op}.json"
+        checkpoint_available = False
+        if _native_k31(plan.backend, s.op):
+            from collector.collect import ResumeCheckpoint
+
+            checkpoint_available = ResumeCheckpoint.has_recoverable_checkpoint(checkpoint)
         if mode == "finalize" and st != "done-no-parquet":
-            if st == "pending-publication" and not checkpoint.is_file():
+            if st == "pending-publication" and not checkpoint_available:
                 raise SystemExit(f"{s.key}: publication recovery requires its native checkpoint")
-            recoverable = (
-                st in ("started", "pending-publication") and _native_k31(plan.backend, s.op) and checkpoint.is_file()
-            )
+            recoverable = st in ("started", "pending-publication") and checkpoint_available
             if not recoverable:
                 continue
-        _validate_shard_allocation(plan, s, finalize_checkpoint=checkpoint if mode == "finalize" else None)
+        checkpoint_only = _validate_shard_allocation(
+            plan, s, finalize_checkpoint=checkpoint if mode == "finalize" or checkpoint_available else None
+        )
+        shard_modes[s.key] = "finalize" if checkpoint_only else mode
         todo.append(s)
     print(f"{mode}: {len(todo)}/{len(plan.shards)} shards on gpus {gpus}")
     ref = collector_ref(checkout)  # once, before any shard starts: every shard records the same commit
@@ -491,7 +504,7 @@ def run_campaign(
                 "--collector-ref",
                 ref,
                 "--mode",
-                mode,
+                shard_modes[s.key],
             ]
         )
     for p in busy.values():

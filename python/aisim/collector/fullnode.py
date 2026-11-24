@@ -236,6 +236,9 @@ def _collect_selected_cases(
     else:
         task_infos = raw_task_infos
 
+    if native and resume_tracker.unfinished_attempt_ids() - {task["id"] for task in raw_task_infos}:
+        raise RuntimeError("Native resume must select every unfinished attempt before publication")
+
     if (
         native
         and os.environ.get("COLLECTOR_K31_FINALIZE_ONLY") == "1"
@@ -281,22 +284,25 @@ def _collect_selected_cases(
         if Path(name).name != name or not name.startswith(f".{output.name}.stage-"):
             raise ValueError(f"invalid native staging filename in {receipt}")
         stage = output.with_name(name)
-        if resume_tracker.has_passed(transaction["task_id"]) and stage.exists():
-            if collector_retained_path(output).exists():
-                # Reuse the retained inode through the same publication protocol
-                # as the other collector writers after a closed event.
-                from collector.collect import _atomic_write_bytes
+        # A surviving child inherits this flock even after its launcher dies.
+        # Acquire it before changing any bytes or removing the recovery receipt.
+        with native_publication_lock(stage):
+            if resume_tracker.has_passed(transaction["task_id"]) and stage.exists():
+                if collector_retained_path(output).exists():
+                    # Reuse the retained inode through the same publication protocol
+                    # as the other collector writers after a closed event.
+                    from collector.collect import _atomic_write_bytes
 
-                _atomic_write_bytes(output, stage.read_bytes())
-                stage.unlink()
+                    _atomic_write_bytes(output, stage.read_bytes())
+                    stage.unlink()
+                else:
+                    os.replace(stage, output)
             else:
-                os.replace(stage, output)
-        else:
-            stage.unlink(missing_ok=True)
-        stage.with_name(f".{stage.name}.publication-lock").unlink(missing_ok=True)
-        _fsync_directory(output.parent)
-        receipt.unlink()
-        _fsync_directory(output.parent)
+                stage.unlink(missing_ok=True)
+            stage.with_name(f".{stage.name}.publication-lock").unlink(missing_ok=True)
+            _fsync_directory(output.parent)
+            receipt.unlink()
+            _fsync_directory(output.parent)
 
     if native:
         if Path(f"{output}.lock").exists():
