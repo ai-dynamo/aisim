@@ -16,7 +16,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from .resources import ResourceLimitError, _SerialAdmissionRequired
+from .resources import ResourceLimitError, _SerialAdmissionRequired, profile_worker_pressure
 from .supervision import checkpoint, close_pool, mark_execution_ready, terminate_pool
 
 try:
@@ -93,6 +93,7 @@ def evaluate_waves(specs, *, factory, initializer, evaluate, workers: int, timeo
                 break
         if not wave:
             continue
+        share = plan.get("profile_worker_rss_limit_bytes")
         checkpoint("wave_admitted", plan)
         pending = pending[len(wave) :]
         for index in wave:
@@ -168,6 +169,8 @@ def evaluate_waves(specs, *, factory, initializer, evaluate, workers: int, timeo
                 if not active:
                     break
                 pressure = factory.live_pressure()
+                if share is not None:
+                    pressure = profile_worker_pressure(pool._processes, share) or pressure
                 if pressure:
                     interrupted = InterruptedEvaluation("live memory pressure", True, pressure)
                     break
@@ -185,6 +188,8 @@ def evaluate_waves(specs, *, factory, initializer, evaluate, workers: int, timeo
                         retry.append(index)
                     else:
                         yield index, interrupted
+                if share is not None and interrupted.resource_limited:
+                    capacity = 1
                 checkpoint(
                     "wave_interrupted",
                     {"reason": interrupted.reason, "retry_candidates": retry, "next_parallelism": capacity},

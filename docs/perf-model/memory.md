@@ -111,6 +111,10 @@ list and no scalar token rate. Existing linear profiles keep their serialized
 shape. Python exports `FpmCacheGroup` from `aisim.fpm_profile` and
 `aisim_core.fpm_profile`; Rust exports it from `aisim_core::perfmodel`.
 
+The resource fields `max_num_tokens` and `max_batch_size` are positive
+unsigned 32-bit integers, from 1 through 4,294,967,295. Each limits one
+attention-DP rank; their bounds match the native scheduler resource type.
+
 An explicit profile can use `cache_layout: unmodeled` when the runtime cache
 allocator has no AIS model, such as Mamba checkpoint retention.
 This layout requires observed `runtime_memory` and omits both
@@ -413,7 +417,7 @@ requires the native extension; it does not require GPU access or measured data.
 | --- | --- |
 | `total_gpu_capacity_bytes` | Positive rank-local GPU capacity. |
 | `memory_fraction_kind`, `memory_fraction_value` | `of_total` and the fraction of GPU memory available to the worker. |
-| `max_num_tokens`, `max_batch_size` | Positive rank-local scheduler limits within a declared envelope; exact recorded values for runtime memory. |
+| `max_num_tokens`, `max_batch_size` | Rank-local scheduler limits in `[1, 4294967295]` within a declared resource envelope with the same bounds; exact recorded values for runtime memory. |
 | `context_length` | Optional positive request bound, at most the profile context and runtime `max_model_len` when present; defaults to the profile context. |
 | `request_occupancy_tokens` | Optional positive logical request length within the selected context, for a separate steady decode footprint with one new token per forward pass. |
 | `cuda_graph_reserved_bytes` | Separate nonnegative reservation for declared memory; must be zero for runtime memory. |

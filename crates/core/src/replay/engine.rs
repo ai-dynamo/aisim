@@ -217,8 +217,9 @@ impl ReplayEngineConfig {
                 }
             }
             ReplayTopology::Disaggregated { .. } => {
-                let [prefill, decode] =
-                    [WorkerStage::Prefill, WorkerStage::Decode].map(|stage| self.role(stage).rank);
+                let [prefill_role, decode_role] =
+                    [WorkerStage::Prefill, WorkerStage::Decode].map(|stage| self.role(stage));
+                let (prefill, decode) = (&prefill_role.rank, &decode_role.rank);
                 if prefill.g3_offload.is_some() || decode.g3_offload.is_some() {
                     return Err(ReplayError::InvalidSpec(
                         "g3_offload supports only aggregated replay".to_string(),
@@ -236,6 +237,16 @@ impl ReplayEngineConfig {
                 if prefill.kv_cache_groups != decode.kv_cache_groups {
                     return Err(ReplayError::InvalidSpec(
                         "kv_cache_groups must be identical on the prefill and decode roles"
+                            .to_string(),
+                    ));
+                }
+                // Grouped transfer bytes describe one TP rank; the handoff
+                // does not reshard the cache between different TP sizes.
+                if !prefill.kv_cache_groups.is_empty()
+                    && prefill_role.tensor_parallel_size != decode_role.tensor_parallel_size
+                {
+                    return Err(ReplayError::InvalidSpec(
+                        "grouped prefill and decode roles require equal tensor_parallel_size"
                             .to_string(),
                     ));
                 }

@@ -26,13 +26,16 @@ scheduler file of the `release/1.7.0` branch that `runtime-source-sha256.json`
 pins.
 
 The tables (`fpm_forward_perf.{parquet,metadata.json}`) are not stored in this
-repository. They are published in `nvidia/aisimulate-fpm-dataset`
-([GB300 discussion 15](https://huggingface.co/datasets/nvidia/aisimulate-fpm-dataset/discussions/15),
+repository. They are published in `ai-dynamo/aisim-data` under `data/fpm/`
+(moved byte-identically from the retired `nvidia/aisimulate-fpm-dataset`, where the review
+discussions remain:
+[GB300 discussion 15](https://huggingface.co/datasets/nvidia/aisimulate-fpm-dataset/discussions/15),
 [experimental B300 discussion 19](https://huggingface.co/datasets/nvidia/aisimulate-fpm-dataset/discussions/19),
 [GB200/B300/H200/H100 discussion 20](https://huggingface.co/datasets/nvidia/aisimulate-fpm-dataset/discussions/20)).
 [`hf_dataset.json`](../python/aisim/src/aisim_core/systems/profiles/glm53flash_fpm/hf_dataset.json)
-pins the 29 profiles to immutable dataset revision
-`dbfcdd9eb62ea733efbc3f0cbd78277f2960061a` and records each file's SHA-256.
+pins the 29 profiles to the immutable `ai-dynamo/aisim-data` revision it records
+(the files are the byte-identical successors of `nvidia/aisimulate-fpm-dataset@dbfcdd9eb62ea733efbc3f0cbd78277f2960061a`)
+and records each file's SHA-256.
 Profile keys are `<system>-<backend>-<fp8|nvfp4>-tp<N>` with system `gb300`,
 `gb200`, `b300`, `h200` or `h100`, for example `gb300-vllm-nvfp4-tp1` or
 `h100-sglang-fp8-tp8`. Pass the profile identity's `kv_cache_dtype` and

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import shutil
 from copy import deepcopy
-from importlib import resources
 from pathlib import Path
 
 import pytest
@@ -25,6 +24,7 @@ from aisim.runner import EngineReplayRunnerFactory
 from aisim.sweeper.config import SearchSpace
 from aisim.sweeper.forward_pass_estimator import ForwardPassEstimatorResolutionError, ForwardPassEstimatorResolver
 from aisim.sweeper.state_snapshot import SnapshotRole, _validate_fitted
+from aisim_core.data.default_systems import default_systems_path
 from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 from aisim_core.sdk.perf_database import resolve_query_version
 
@@ -561,7 +561,11 @@ def _planner(
         **overrides,
     }
     model = RustForwardPassPerfModel.best_available(ForwardPassPerfModelConfig(**fields))
-    reference = _native(worker, estimator_config={})
+    # The reference only shapes the synthetic observations. This tiny model's
+    # decode estimate is flat in batch and KV tokens to within table noise, and
+    # on the vLLM 0.32.0 tables the non-negative fit collapses to zero slopes
+    # (store never ready), so keep the collection the fixture was tuned on.
+    reference = _native(worker, estimator_config={}, backend_version="0.30.0")
     iterations = []
     for index in range(48):
         prefills, decodes = 1 + index % 4, 1 + index % 8
@@ -734,7 +738,7 @@ def test_an_aggregated_planner_regression_prices_prefill_decode_and_mixed_passes
     assert _replay(aliased).metrics["mean_tpot_ms"] == candidate.metrics["mean_tpot_ms"]
     # Roles that name no systems root resolve it on the engine's, here the
     # only root that defines the hardware.
-    packaged = Path(str(resources.files("aisim_core") / "systems"))
+    packaged = Path(default_systems_path())
     custom = tmp_path / "systems"
     custom.mkdir()
     for entry in packaged.iterdir():

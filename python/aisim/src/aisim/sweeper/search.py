@@ -1099,6 +1099,7 @@ def _score_prepared(
     sample_metrics = {
         OptimizationTarget.E2E_LATENCY: "num_e2e_latency_samples",
         OptimizationTarget.TTFT: "num_ttft_samples",
+        OptimizationTarget.THROUGHPUT_PER_USER: "num_tpot_samples",
     }
     for target in effective_targets:
         sample_metric = sample_metrics.get(target)
@@ -1119,6 +1120,13 @@ def _score_prepared(
                 if goal.is_pareto
                 else {"objective": observation_candidate.score}
             )
+            if target is OptimizationTarget.THROUGHPUT_PER_USER or (
+                goal.is_pareto and OptimizationTarget.THROUGHPUT_PER_USER in goal.resolved_pareto_objectives
+            ):
+                # A per-user objective with no TPOT samples carries no usable
+                # value, so the sampler gets observe_infeasible instead of a
+                # fabricated observation that reads as a mediocre real result.
+                observation_metrics = None
             sample_detail = "missing" if sample_count is None else f"{sample_count:g}"
             return _EvalResult(
                 candidate=None,

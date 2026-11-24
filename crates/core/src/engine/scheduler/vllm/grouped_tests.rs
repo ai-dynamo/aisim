@@ -633,6 +633,96 @@ fn grouped_aggregated_rank_refuses_source_commands() {
 }
 
 #[test]
+fn grouped_prefill_source_truncation_limits_the_output_budget() {
+    for version in ["0.31.0", "0.32.0"] {
+        for planned in [false, true] {
+            // A one-token prompt does not truncate and keeps both outputs.
+            for (prompt, expected_prompt, expected_outputs) in [(2177, 2176, 1), (1, 1, 2)] {
+                let mut core = pd_core(
+                    glm_transfer_groups(version, false),
+                    128 * GLM_PAGE,
+                    8192,
+                    WorkerType::Prefill,
+                    Some(1.0),
+                );
+                let handoff_id = HandoffId::new(Uuid::from_u128(1630));
+                core.apply_command(SchedulerCommand::SubmitHandoffPrefill {
+                    handoff_id,
+                    request: DirectRequest {
+                        max_output_tokens: 2,
+                        output_token_ids: planned.then(|| vec![90_000, 90_001]),
+                        ..source_request(1629, prompt)
+                    },
+                })
+                .unwrap();
+                let request = &core.state.requests[&Uuid::from_u128(1629)];
+                assert_eq!(request.sequence.num_input_tokens(), expected_prompt);
+                assert_eq!(request.sequence.max_output_tokens(), expected_outputs);
+                let first = core.try_execute_hidden_pass(0.0).unwrap();
+                assert_eq!(
+                    first
+                        .lifecycle_events
+                        .iter()
+                        .any(|event| matches!(event, SchedulerLifecycleEvent::SourceHeld { .. })),
+                    expected_outputs == 1,
+                    "{version} planned={planned} prompt={prompt}"
+                );
+                if expected_outputs > 1 {
+                    held_timing(&mut core);
+                }
+                core.apply_command(SchedulerCommand::ReleaseSource { handoff_id })
+                    .unwrap();
+                assert!(core.is_drained());
+                assert_eq!(core.kv_manager.grouped().unwrap().active_blocks(), 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn grouped_prefill_source_rejects_an_empty_prompt_before_registering_the_hold() {
+    for version in ["0.31.0", "0.32.0"] {
+        let mut core = pd_core(
+            glm_transfer_groups(version, false),
+            128 * GLM_PAGE,
+            8192,
+            WorkerType::Prefill,
+            Some(1.0),
+        );
+        let handoff_id = HandoffId::new(Uuid::from_u128(1632));
+        let error = core
+            .apply_command(SchedulerCommand::SubmitHandoffPrefill {
+                handoff_id,
+                request: DirectRequest {
+                    max_output_tokens: 0,
+                    ..source_request(1631, 0)
+                },
+            })
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "grouped KV sources require a nonempty prompt"
+        );
+        assert!(core.is_drained());
+        assert!(
+            core.try_execute_hidden_pass(0.0)
+                .unwrap()
+                .lifecycle_events
+                .is_empty()
+        );
+        assert_eq!(core.kv_manager.grouped().unwrap().active_blocks(), 0);
+        // The rejected command must leave both IDs available, and a single
+        // token still creates a valid source without backoff.
+        let timing = hold_grouped_source(&mut core, handoff_id, 1631, 1);
+        assert_eq!(timing.full_prompt_tokens, 1);
+        assert!(timing.state_bytes > 0);
+        core.apply_command(SchedulerCommand::ReleaseSource { handoff_id })
+            .unwrap();
+        assert!(core.is_drained());
+    }
+}
+
+#[test]
 fn grouped_decode_rank_refuses_source_commands() {
     // A decode rank has transfer rules but holds no source: only a prefill
     // rank frees the skipped blocks of a source that it holds.
@@ -1169,7 +1259,75 @@ fn grouped_prefill_source_takes_no_copy_of_a_state_published_at_its_end() {
         args.worker_type = WorkerType::Prefill;
         args.kv_transfer_bandwidth = Some(1.0);
         let mut core = VllmCore::new(args);
-        hold_grouped_source(&mut core, HandoffId::new(Uuid::from_u128(1_871)), 1_870, 49);
+        let handoff_id = HandoffId::new(Uuid::from_u128(1_871));
+        core.apply_command(SchedulerCommand::SubmitHandoffPrefill {
+            handoff_id,
+            request: source_request(1_870, 49),
+        })
+        .unwrap();
+        let first = core.try_execute_hidden_pass(0.0).unwrap();
+        let state_groups: Vec<_> = core
+            .args
+            .kv_cache_groups
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| {
+                group.kind == FpmCacheKind::State && group.prefix_cacheable == Some(true)
+            })
+            .map(|(index, _)| index as u16)
+            .collect();
+        if version == "0.32.0" {
+            assert!(first.lifecycle_events.is_empty(), "{version} case {index}");
+            let tail = 48 - core.args.prefix_match_unit.unwrap();
+            for _ in 0..8 {
+                if core.state.requests[&Uuid::from_u128(1_870)].num_computed_tokens == tail {
+                    break;
+                }
+                let pass = core.try_execute_hidden_pass(0.0).unwrap();
+                assert!(pass.lifecycle_events.is_empty(), "{version} case {index}");
+            }
+            assert_eq!(
+                core.state.requests[&Uuid::from_u128(1_870)].num_computed_tokens,
+                tail
+            );
+            let mut lease = BlockRequestLease::new(Uuid::nil(), Vec::new());
+            lease.configure_prefix_hashes(
+                &(0..48).collect::<Vec<u32>>(),
+                core.args.prefix_match_unit.unwrap(),
+            );
+            let hash = lease.prefix_hash_at(tail).unwrap();
+            for &group in &state_groups {
+                assert!(block_pool(&core).key_hit(group, hash).unwrap().is_active);
+            }
+            block_pool(&core).reset_peak_active_blocks();
+            held_timing(&mut core);
+            // The final chunk needs a new writable block in every state
+            // group while the published blocks are still active. This peak
+            // observes allocation before completion trims the old blocks.
+            assert_eq!(
+                block_pool(&core).peak_active_blocks(),
+                held + state_groups.len(),
+                "{version} case {index}"
+            );
+            for &group in &state_groups {
+                assert!(!block_pool(&core).key_hit(group, hash).unwrap().is_active);
+            }
+        } else if index < 2 {
+            assert!(
+                first
+                    .lifecycle_events
+                    .iter()
+                    .any(|event| matches!(event, SchedulerLifecycleEvent::SourceHeld { .. })),
+                "{version} case {index}"
+            );
+            assert_eq!(
+                block_pool(&core).peak_active_blocks(),
+                held,
+                "{version} case {index}"
+            );
+        } else {
+            held_timing(&mut core);
+        }
         assert_eq!(
             block_pool(&core).active_blocks(),
             held,
@@ -1321,9 +1479,7 @@ fn grouped_prefill_source_released_before_its_deferred_free_frees_every_block_on
             assert_eq!(blocks_besides(&core, x), 0, "{label}");
             async_step(&mut core, &mut now);
             assert_eq!(blocks_besides(&core, x), 0, "{label}");
-            while !core.is_drained() {
-                async_step(&mut core, &mut now);
-            }
+            drain_async(&mut core, &mut now, &label);
             assert_eq!(
                 core.kv_manager.grouped().unwrap().active_blocks(),
                 0,
@@ -1509,9 +1665,7 @@ fn grouped_prefill_rank_frees_the_boundary_hit_block_of_an_ending_request_with_i
             let mut now = 0.0;
             let rp: Vec<u32> = (44_000_000..44_004_400).collect();
             submit_tokens(&mut core, 1, rp.clone(), 1);
-            while !core.is_drained() {
-                async_step(&mut core, &mut now);
-            }
+            drain_async(&mut core, &mut now, &label);
             submit_tokens(&mut core, 2, (45_000_000..45_000_100).collect(), 8);
             let mut tokens = rp;
             tokens.extend(44_100_000..44_100_300);
@@ -2105,34 +2259,29 @@ fn grouped_prefill_rank_in_block_mode_readmits_a_held_request_when_a_held_source
         .unwrap();
         held_timing(&mut core);
         assert_eq!(block_pool(&core).active_blocks(), 2);
-        // A second source of 16 tokens with 3 output tokens, which the
-        // engine API accepts and Replay does not send. Pass 1 computes its
-        // 15 tokens in a full block and a state block and emits the first
-        // output token, and pass 2 computes that token and emits the
-        // second. The 17th token then needs a second full block and, past
+        // A second request of 15 tokens with 3 output tokens, sent as a
+        // plain request. Pass 1 computes its 15 tokens in a full block and a
+        // state block and emits the first output token, and pass 2 computes
+        // that token and emits the second. The 17th token then needs a second full block and, past
         // the block boundary, a new state block beside the previous one: 2
-        // blocks, and 1 is free. So the source preempts itself in pass 3.
+        // blocks, and 1 is free. So the request preempts itself in pass 3.
         // Its readmission in pass 4 counts 2 full blocks and a state block
         // for its 17 tokens and finds 3. It computes 16 tokens again, and
         // pass 5 preempts it with the same pool. From pass 6 on it waits.
-        let waiting = HandoffId::new(Uuid::from_u128(1654));
         let second = Uuid::from_u128(1653);
-        core.apply_command(SchedulerCommand::SubmitHandoffPrefill {
-            handoff_id: waiting,
-            request: DirectRequest {
-                tokens: (2000..2016).collect(),
-                max_output_tokens: 3,
-                ..source_request(1653, 0)
-            },
-        })
+        core.apply_command(SchedulerCommand::Submit(DirectRequest {
+            tokens: (2000..2015).collect(),
+            max_output_tokens: 3,
+            ..source_request(1653, 0)
+        }))
         .unwrap();
         assert_eq!(admitting_passes_at_0_ms(&mut core, 10), [1, 4], "{cancel}");
         assert_eq!(core.mocker_metrics().vllm_preemptions_total, 2);
         assert_eq!(block_pool(&core).active_blocks(), 2);
         // The held source is released or cancelled at the same time. The
-        // next pass at that time admits the second source, and the pass
+        // next pass at that time admits the second request, and the pass
         // after it computes the 17th token in 4 blocks, emits the third
-        // output token and holds the source.
+        // output token and finishes the request.
         let command = if cancel {
             SchedulerCommand::CancelSource {
                 handoff_id: blocker,
@@ -2156,10 +2305,10 @@ fn grouped_prefill_rank_in_block_mode_readmits_a_held_request_when_a_held_source
             "{cancel}"
         );
         assert_eq!(block_pool(&core).active_blocks(), 2);
-        assert!(!core.source_is_held(waiting));
+        assert_eq!(core.state.requests[&second].status, RequestStatus::Running);
         block_pool(&core).reset_peak_active_blocks();
         core.execute_pass(&mut trace, 0.0);
-        assert!(core.source_is_held(waiting), "{cancel}");
+        assert!(core.is_drained(), "{cancel}");
         assert_eq!(block_pool(&core).peak_active_blocks(), 4);
         assert_eq!(core.mocker_metrics().vllm_preemptions_total, 2);
     }
@@ -5117,13 +5266,7 @@ fn pool_run(mut core: VllmCore, producer: u32, hit: usize) -> (usize, usize, Vec
     let mut now = 0.0;
     let rp: Vec<u32> = (44_000_000..44_000_000 + producer).collect();
     submit_tokens(&mut core, 1, rp.clone(), 4);
-    for _ in 0..50 {
-        if core.is_drained() {
-            break;
-        }
-        async_step(&mut core, &mut now);
-    }
-    assert!(core.is_drained());
+    drain_async(&mut core, &mut now, "pool producer");
     let mut rc_tokens = rp;
     rc_tokens.extend(44_100_000..44_100_300);
     let rc = submit_tokens(&mut core, 2, rc_tokens, 4);
@@ -5206,6 +5349,40 @@ fn grouped_prefix_boundary_hit_holds_its_state_blocks_until_the_next_pass() {
                 "{version} on {blocks} blocks"
             );
         }
+    }
+}
+
+#[test]
+fn grouped_prefix_steps_that_the_kv_manager_skips_change_nothing() {
+    // The KV manager skips the block walks of a step below a lease's quiet
+    // position. Debug builds run them and assert that they change nothing.
+    // Each request here takes a step that a wrong position would skip.
+    let glm = |checkpoint, chunk, unit, version| {
+        prefix_core(glm_groups(checkpoint), 64 * GLM_PAGE, chunk, unit, version)
+    };
+    let mut window = group("window", 4, 8, Some(6));
+    window.prefix_cacheable = Some(true);
+    let cases = [
+        // Decode crosses a block boundary: the previous state block of the
+        // last chunk goes, the attention block completes, new blocks come.
+        (glm(false, 8192, 1088, "0.31.0"), 2170, 10),
+        // A prompt of one chunk decodes with its checkpoint block and no
+        // previous state block.
+        (glm(true, 8192, 2176, "0.33.0"), 5000, 4),
+        // A step budget below the block: the prefill advances inside a block
+        // that the request holds, and publishes at its tail, 5,440.
+        (glm(false, 512, 1088, "0.31.0"), 5600, 4),
+        // The prompt ends at its tail, so its running state block is
+        // published and the first decode step takes a fresh one.
+        (glm(false, 8192, 1088, "0.31.0"), 1088, 4),
+        // A window that is no multiple of the block retires a block inside
+        // the next one.
+        (prefix_core(vec![window], 9 * 8, 8, 4, "0.33.0"), 8, 8),
+    ];
+    for (mut core, prompt, output) in cases {
+        let request = submit(&mut core, 1, prompt, output);
+        let admissions = drain(&mut core, &mut TraceCollector::default(), &mut 0);
+        assert_eq!(admissions, vec![(request, 0)], "a {prompt}-token prompt");
     }
 }
 
@@ -5388,6 +5565,20 @@ fn async_step(core: &mut VllmCore, now_ms: &mut f64) -> crate::engine::scheduler
     core.complete_engine_boundary(result.end_ms);
     *now_ms = result.end_ms;
     result
+}
+
+fn drain_async(core: &mut VllmCore, now_ms: &mut f64, label: &str) {
+    for _ in 0..50 {
+        if core.is_drained() {
+            return;
+        }
+        async_step(core, now_ms);
+    }
+    assert!(
+        core.is_drained(),
+        "{label}: drain exceeded 50 passes; {} active blocks",
+        core.kv_manager.grouped().unwrap().active_blocks()
+    );
 }
 
 #[test]

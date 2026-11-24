@@ -290,6 +290,8 @@ def _add_grouped_prefix_caching(
         return
     profile, deployment = grouped
     payload["vllm_version"] = deployment.backend_version
+    # Cold ranks also size their pool with the profile context unless the search overrides it.
+    payload.setdefault("max_model_len", profile.context_length)
     if not payload["enable_prefix_caching"]:
         return
     # The search gate checks the largest budget of the domain. Each candidate is checked with its own, before replay.
@@ -304,8 +306,6 @@ def _add_grouped_prefix_caching(
         )
     except ValueError as exc:
         raise InfeasibleEngineSetting(str(exc)) from exc
-    # vLLM always sizes its pool with a model length, and the Rust gate refuses a rank without one.
-    payload.setdefault("max_model_len", profile.context_length)
 
 
 def _profile_kv_args(sample: dict[str, Any], role: str, backend_version: str) -> dict[str, Any]:
