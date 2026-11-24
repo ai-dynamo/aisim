@@ -243,6 +243,40 @@ def test_attention_provenance_snapshots_validated_components(tmp_path):
     assert type(components["attention_compute_ms"]) is float
 
 
+def test_attention_provenance_snapshots_reused_decode_trace(tmp_path):
+    class ReusingAttention(_Attention):
+        def __init__(self):
+            super().__init__()
+            self.trace = [{"repeat": 127, "components": dict(COMPONENTS)}]
+
+        def measure(self, request):
+            (measurement,) = super().measure(request)
+            return (
+                replace(
+                    measurement,
+                    attention_ms=self.components["attention_compute_ms"] + self.components["a_combine_ms"],
+                    provenance={**measurement.provenance, "decode_samples": self.trace},
+                ),
+            )
+
+    attention = ReusingAttention()
+    provider = _provider(tmp_path, attention)
+    (first,) = provider.measure(_request(_topology()))
+    saved_trace = first.provenance["attention"]["decode_samples"]
+    attention.trace[0]["components"]["attention_compute_ms"] = 0.19
+    attention.trace[0]["repeat"] = 1
+    attention.trace.append({"repeat": 126, "components": dict(attention.trace[0]["components"])})
+    attention.components = {**COMPONENTS, "attention_compute_ms": 0.19}
+
+    # Reusing the provider's nested objects cannot change the earlier evidence
+    # or its replay cadence. A second measurement describes the changed trace.
+    (second,) = provider.measure(_request(_topology()))
+    assert saved_trace == [{"repeat": 127, "components": COMPONENTS}]
+    assert first.decode_attention_samples == ((0.092, 127),)
+    assert second.decode_attention_samples == ((0.192, 1), (0.192, 126))
+    assert second.provenance["attention"]["decode_samples"] != saved_trace
+
+
 @pytest.mark.parametrize(
     "components",
     [None, ["dispatch", "experts", "return"], ["router", "dispatch", "experts", "return", "combine"]],
@@ -873,6 +907,40 @@ def test_prediction_config_attaches_the_profile_stage(tmp_path):
     assert attention.requests[0].topology.ffn_gpus == 8
 
 
+@pytest.mark.parametrize("alias", ["current", "previous", "next"])
+def test_prediction_pins_fastafd_alias_for_attention_and_companion(tmp_path, monkeypatch, alias):
+    from aisimulate_core.sdk import RustForwardPassPerfModel, perf_database
+
+    monkeypatch.setattr(perf_database, "get_version_slots", lambda *args, **kwargs: {alias: "0.5.14"})
+    attention = _Attention()
+    raw = _prediction(_profile(tmp_path))
+    raw["engine"]["backend_version"] = alias
+    raw["engine"]["workers"]["prefill"]["timing"] = {"type": "default"}
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw), afd_performance_model=attention)
+    deployment = spec.backend_deployment
+    assert deployment.backend_version == "0.5.14"
+    assert attention.requests[0].backend_version == "0.5.14"
+    (measurement,) = deployment.performance_model_metadata["afd"]["measurements"]
+    saved = json.loads(json.dumps(measurement["provenance"]["config"]))
+    assert saved["backend_version"] == "0.5.14"
+    assert deployment.prefill_engine_args["aic_backend_version"] == "0.5.14"
+    assert deployment.performance_model_metadata["prefill"]["config"]["backend_version"] == "0.5.14"
+    restored = RustForwardPassPerfModel.best_available(saved).estimate_fastafd_stage(128)
+    assert restored["ffn_ms"] == measurement["ffn_ms"]
+
+
+def test_prediction_rejects_unavailable_fastafd_version_alias_before_measurement(tmp_path, monkeypatch):
+    from aisimulate_core.sdk import perf_database
+
+    monkeypatch.setattr(perf_database, "get_version_slots", lambda *args, **kwargs: {"previous": "0.5.14"})
+    attention = _Attention()
+    raw = _prediction(_profile(tmp_path))
+    raw["engine"]["backend_version"] = "current"
+    with pytest.raises(ValueError, match="has no 'current' version"):
+        prediction_to_replay_spec(CorePredictionConfig.model_validate(raw), afd_performance_model=attention)
+    assert attention.requests == []
+
+
 def test_prediction_config_uses_builtin_attention_with_low_bit_f_pool(tmp_path, fastafd_attention_sol):
     request, profile = _kimi_request_and_profile(tmp_path, "w4a8_mxfp4_mxfp8")
     raw = _prediction(profile)
@@ -985,6 +1053,46 @@ def test_fastafd_crossing_trace_survives_replay_serialization(tmp_path, pipeline
     report = EngineReplayRunnerFactory().create(0).run(spec)
     assert report.metrics["mean_tpot_ms"] == pytest.approx(expected)
     assert report.metrics["completed_requests"] == 1
+
+
+@pytest.mark.parametrize("pipeline_model", ["optimistic", "conservative", "serial"])
+@pytest.mark.parametrize("output_length", [1, 2, 34, 67])
+def test_saved_fastafd_trace_rejects_different_replay_workload(tmp_path, pipeline_model, output_length):
+    raw = _prediction(_profile(tmp_path))
+    raw["engine"]["afd"]["pipeline_model"] = pipeline_model
+    raw["traffic"]["source"]["output_tokens"] = 66
+    attention = _Attention()
+    (source,) = attention.measure(_request(_topology()))
+    source = replace(
+        source,
+        provenance={
+            **source.provenance,
+            "decode_samples": [{"repeat": 65, "components": dict(COMPONENTS)}],
+        },
+    )
+    spec = prediction_to_replay_spec(
+        CorePredictionConfig.model_validate(raw),
+        afd_performance_model=SimpleNamespace(measure=lambda _: (source,)),
+    )
+    deployment = spec.backend_deployment
+    saved = json.loads(json.dumps(deployment.performance_model_metadata))
+    (measurement,) = _afd_layer_measurements(replace(deployment, performance_model_metadata=saved))
+    topology = _topology(pipeline_model=pipeline_model)
+    valid = evaluate_afd_phase(topology, measurement, input_length=1024, output_length=66)
+    assert valid.step_latency_ms > 0
+    engine = AFDForegroundEngine(topology, (measurement,))
+    with pytest.raises(AFDInfeasible, match="repeat total must equal the replay decode steps") as error:
+        engine.execute_pass(phase="decode", now_ms=0.0, input_length=1024, output_length=output_length)
+    assert error.value.provenance == {"covered_steps": 65, "expected_steps": max(output_length - 1, 1)}
+    assert engine.in_flight is None
+    runner = EngineReplayRunnerFactory().create(0)
+    changed = replace(spec, workload={**spec.workload, "osl": output_length})
+    if output_length > 1:
+        with pytest.raises(AFDInfeasible, match="repeat total must equal the replay decode steps"):
+            runner.run(changed)
+    else:
+        # A one-token replay runs prefill only, so it never consumes the trace.
+        assert runner.run(changed).metrics["completed_requests"] == 32
 
 
 @pytest.mark.parametrize("provider_path", ["attention_only", "cli"])

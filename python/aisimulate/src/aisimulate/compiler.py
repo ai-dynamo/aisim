@@ -353,6 +353,12 @@ def _afd_deployment(
         num_experts=facts.num_experts,
     )
     backend_version = engine.backend_version or resolve_backend_version(engine.hardware, engine.backend)
+    if profile_path is not None and backend_version in {"current", "previous", "next"}:
+        from aisimulate_core.sdk.perf_database import resolve_query_version
+
+        # Native stage construction requires a literal identity. Resolve public
+        # slot aliases before measuring A or building the companion worker.
+        backend_version = resolve_query_version(engine.hardware, engine.backend, backend_version)
     resolved_engine = engine.model_copy(update={"backend_version": backend_version})
     if profile_path is not None:
         # The precision selector belongs to the measured stage, not the

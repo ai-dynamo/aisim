@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -109,6 +110,12 @@ class FastAFDMoEStagePerformanceModel:
             raise _infeasible("the attention provider's layer count does not match the selected FastAFD stage")
         components = self._components(attention)
         decode_samples = self._decode_samples(attention)
+        attention_provenance = {
+            **dict(attention.provenance),
+            "components": {**attention.provenance["components"], **components},
+        }
+        if "decode_samples" in attention_provenance:
+            attention_provenance["decode_samples"] = deepcopy(attention_provenance["decode_samples"])
         if decode_samples:
             expected_steps = max(request.output_length - 1, 1)
             covered_steps = sum(repeat for _, repeat in decode_samples)
@@ -139,10 +146,7 @@ class FastAFDMoEStagePerformanceModel:
                     },
                     "stage": estimate["stage"],
                     "config": config,
-                    "attention": {
-                        **dict(attention.provenance),
-                        "components": {**attention.provenance["components"], **components},
-                    },
+                    "attention": attention_provenance,
                 },
             ),
         )

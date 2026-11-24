@@ -35,6 +35,7 @@ class AFDLayerTimes:
     # FastAFD includes transfers in F. Prepare its overlapped cadence once,
     # rather than rescanning the entire decode trace on every foreground pass.
     _decode_overlap_ms: float | None = field(init=False, default=None, repr=False)
+    _decode_sample_count: int = field(init=False, default=0, repr=False)
 
     def __post_init__(self) -> None:
         try:
@@ -113,6 +114,7 @@ class AFDLayerTimes:
                 "decode attention samples require decode without external transfers and must average to attention_ms",
             )
         object.__setattr__(self, "decode_attention_samples", tuple(samples))
+        object.__setattr__(self, "_decode_sample_count", total_repeat)
         if samples:
             object.__setattr__(self, "_decode_overlap_ms", overlap_sum / total_repeat)
 

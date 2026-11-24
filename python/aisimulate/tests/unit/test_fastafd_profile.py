@@ -117,6 +117,77 @@ def test_exact_lookup_preserves_source_and_method(tmp_path):
     assert provenance["correctness"] is None
 
 
+def test_entries_cannot_be_replaced_after_exact_index_is_built(tmp_path):
+    other = _entry()
+    other["key"]["microbatches"] = 3
+    profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload([_entry(), other])))
+    first, second = profile.entries
+    assert profile.require(first.key) is first
+    with pytest.raises(AttributeError):
+        profile.entries = (second, first)
+    assert profile.require(first.key) is first
+    assert profile.require(second.key) is second
+
+
+@pytest.mark.parametrize("codec", ["NONE", "SNAPPY", "ZSTD", "GZIP"])
+def test_parquet_codec_inspection_agrees_with_native_reader(tmp_path, codec):
+    import pyarrow.parquet as pq
+
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload()))
+    path = tmp_path / "profile.parquet"
+    profile.write_parquet(path)
+    table = pq.read_table(path)
+    # Compress just one column differently, so inspection must check every
+    # column rather than infer codec support from the first column alone.
+    pq.write_table(table, path, compression={"latency_ms": codec})
+    if codec == "GZIP":
+        with pytest.raises(ValueError, match="unsupported FastAFD Parquet codec: GZIP"):
+            FastAFDMoEStageProfile.load(path)
+        with pytest.raises(ValueError, match="(?i)gzip|flate2"):
+            RustForwardPassPerfModel.best_available(_canonical_config(path))
+    else:
+        assert FastAFDMoEStageProfile.load(path).entries == profile.entries
+        estimate = RustForwardPassPerfModel.best_available(_canonical_config(path)).estimate_fastafd_stage(48)
+        assert estimate["stage"]["latency_ms"] == 16.7
+
+
+@pytest.mark.parametrize("stage,topology", [("agg", "ep{}"), ("afd", "{}A8F"), ("afd", "16A{}F")])
+@pytest.mark.parametrize("value", [2**32 - 1, 2**32])
+@pytest.mark.parametrize("suffix", ["json", "parquet"])
+def test_topology_bounds_validate_every_row_before_selection(tmp_path, stage, topology, value, suffix):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    other = _entry()
+    other["key"].update(stage=stage, topology=topology.format(value))
+    if suffix == "json":
+        path = _write(tmp_path, _payload([_entry(), other]))
+    else:
+        profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload()))
+        path = tmp_path / "profile.parquet"
+        profile.write_parquet(path)
+        rows = pq.read_table(path).to_pylist()
+        rows.append({**rows[0], "stage": stage, "topology": other["key"]["topology"]})
+        pq.write_table(pa.Table.from_pylist(rows), path)
+
+    if value == 2**32:
+        with pytest.raises(ValueError, match=r"entry 1.key.topology.*4294967295"):
+            FastAFDMoEStageProfile.load(path)
+        # The valid first row is still an exact match. Native loading must
+        # reject the malformed neighboring row instead of selecting past it.
+        with pytest.raises(ValueError, match="unqualified FastAFD measurement|key.topology"):
+            RustForwardPassPerfModel.best_available(_canonical_config(path))
+    else:
+        profile = FastAFDMoEStageProfile.load(path)
+        assert profile.require(FastAFDMoEStageKey(**other["key"])).key.topology == other["key"]["topology"]
+        estimate = RustForwardPassPerfModel.best_available(_canonical_config(path)).estimate_fastafd_stage(48)
+        assert estimate["stage"]["key"]["topology"] == "16A8F"
+
+
 @pytest.mark.parametrize("field", ["repository", "commit", "benchmark", "boundary"])
 def test_parquet_writer_rejects_mixed_sources_before_overwriting(tmp_path, field):
     profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload()))

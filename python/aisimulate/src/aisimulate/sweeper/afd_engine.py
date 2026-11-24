@@ -143,6 +143,15 @@ def evaluate_afd_phase(
             f"topology phase={topology.phase.value!r} cannot evaluate measurement phase={times.phase.value!r}",
             provenance=topology.provenance(),
         )
+    if times.decode_attention_samples and times._decode_sample_count != max(output_length - 1, 1):
+        raise AFDInfeasible(
+            AFDReasonCategory.INVALID_MEASUREMENT,
+            "decode attention sample repeat total must equal the replay decode steps",
+            provenance={
+                "covered_steps": times._decode_sample_count,
+                "expected_steps": max(output_length - 1, 1),
+            },
+        )
 
     t_a = float(times.attention_ms)
     t_f = float(times.ffn_ms)

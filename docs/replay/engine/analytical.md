@@ -48,7 +48,7 @@ engine:
 | `engine.afd.pipeline_model` | `optimistic` | `{choices: [optimistic, conservative]}` | `optimistic`, `conservative` or `serial`. |
 | `engine.afd.comm_overhead_factor` | `1.0` | fixed | Positive factor on A/F communication. Must be `1.0` with `fastafd_profile_path`. |
 | `engine.afd.boundary_on_attn` | `true` | fixed | A/F boundary convention. |
-| `engine.afd.fastafd_profile_path` | `null` | Prediction only | Measured FastAFD split MoE stage; see [below](#measured-fastafd-moe-stage). Requires `phase: decode`, `tp_a: 1`, `f_moe_ep_size` equal to the F GPU count, and `boundary_on_attn: true`. |
+| `engine.afd.fastafd_profile_path` | `null` | Prediction only | Measured FastAFD split MoE stage; see [below](#measured-fastafd-moe-stage). Requires `phase: decode`, `tp_a: 1`, `f_moe_ep_size` equal to the F GPU count, and `boundary_on_attn: true`. Backend version aliases are pinned before measurement. |
 | `engine.afd.fastafd_moe_backend` | `null` | Prediction only | Required with `fastafd_profile_path`; `megamoe` or `deepep_deepgemm`. |
 | `engine.moe_quant_mode` | `null` | FastAFD prediction only | Exact profile `moe_precision` selector; required when otherwise matching entries differ in precision. Also qualifies F memory at the selected precision. Does not override attention or companion-worker timing. Unsupported for AFD without a FastAFD profile. |
 | `engine.afd.max_af_ratio`, `max_candidates` | `4.0`, `10000` | Recommend only | Bounds on the generated topology space. |
@@ -96,6 +96,9 @@ units as F, and A→F and F→A are zero. With a FastAFD profile,
 `comm_overhead_factor` must be `1.0`: communication is included in the measured
 stage and cannot be calibrated separately. Non-unit factors are rejected by
 both prediction configuration validation and the direct provider API.
+Public `engine.backend_version` slot aliases (`current`, `previous`, `next`)
+are resolved to a literal version before FastAFD stage construction. The A-side
+model and companion worker use that same pinned version; unavailable slots fail.
 A keeps the attention provider's
 A-side compute without its own combine term and adds the router, which FastAFD
 runs on the A side outside the measured stage. The attention provider must report
@@ -116,6 +119,8 @@ Decode providers retain the KV samples and their repeat counts in
 components. FastAFD replaces the F stage and recomposes A for every sample.
 The serialized measurement's `decode_attention_samples` contains the resulting
 `[attention_ms, repeat]` pairs; its headline A time is their weighted mean.
+The trace's repeat total must equal `max(output_length - 1, 1)` at evaluation,
+including serial replay. A saved trace cannot price a different decode length.
 The pipeline maximum is evaluated before averaging the sampled cadence, so a
 decode trace that crosses between F-bound and A-bound does not undercount TPOT.
 Foreground intervals use the mean stage durations and sampled mean cadence.

@@ -19,8 +19,9 @@ FastAFDStage = Literal["agg", "afd"]
 
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-_AFD_TOPOLOGY = re.compile(r"[1-9][0-9]*A[1-9][0-9]*F\Z")
-_AGG_TOPOLOGY = re.compile(r"ep[1-9][0-9]*\Z")
+_AFD_TOPOLOGY = re.compile(r"([1-9][0-9]*)A([1-9][0-9]*)F\Z")
+_AGG_TOPOLOGY = re.compile(r"ep([1-9][0-9]*)\Z")
+_PARQUET_CODECS = {"UNCOMPRESSED", "SNAPPY", "ZSTD"}
 _U32_MAX = 2**32 - 1
 _U64_MAX = 2**64 - 1
 _COUNT_FIELDS = {"logical_batch_per_source_rank", "mtp_nextn", "microbatches", "moe_layers", "routed_topk"}
@@ -126,13 +127,18 @@ class FastAFDMoEStageProfile:
         path: Path,
         profile_sha256: str,
     ) -> None:
-        self.entries = entries
+        self._entries = tuple(entries)
         self.source = source
         self.path = path
         self.profile_sha256 = profile_sha256
         self._key_index = None
-        if len({entry.key for entry in entries}) != len(entries):
+        if len({entry.key for entry in self.entries}) != len(self.entries):
             raise ValueError("duplicate FastAFD MoE stage key")
+
+    @property
+    def entries(self) -> tuple[FastAFDMoEStageMeasurement, ...]:
+        """Immutable measurements backing the exact lookup index."""
+        return self._entries
 
     @classmethod
     def load(cls, path: str | Path) -> FastAFDMoEStageProfile:
@@ -148,6 +154,13 @@ class FastAFDMoEStageProfile:
             import pyarrow as pa
             import pyarrow.parquet as pq
 
+            metadata = pq.read_metadata(pa.BufferReader(raw))
+            for group in range(metadata.num_row_groups):
+                row_group = metadata.row_group(group)
+                for column in range(row_group.num_columns):
+                    codec = row_group.column(column).compression
+                    if codec not in _PARQUET_CODECS:
+                        raise ValueError(f"unsupported FastAFD Parquet codec: {codec}")
             table = pq.read_table(pa.BufferReader(raw))
             for name in sorted(_COUNT_FIELDS):
                 if table.schema.field(name).type != pa.int64():
@@ -332,8 +345,11 @@ def _entry(value: Any, source: FastAFDProfileSource, index: int) -> FastAFDMoESt
     if stage not in {"agg", "afd"}:
         raise ValueError(f"{label}.key.stage is unsupported")
     topology = _text(fields["topology"], f"{label}.key.topology")
-    if (_AGG_TOPOLOGY if stage == "agg" else _AFD_TOPOLOGY).fullmatch(topology) is None:
+    topology_match = (_AGG_TOPOLOGY if stage == "agg" else _AFD_TOPOLOGY).fullmatch(topology)
+    if topology_match is None:
         raise ValueError(f"{label}.key.topology is invalid")
+    for component in topology_match.groups():
+        _key_integer(int(component), f"{label}.key.topology")
     key = FastAFDMoEStageKey(
         model_path=_text(fields["model_path"], f"{label}.key.model_path"),
         system=_text(fields["system"], f"{label}.key.system"),

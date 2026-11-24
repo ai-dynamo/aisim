@@ -21,6 +21,9 @@ capture metadata; selection and latency normalization run in Rust through the
 Both Python inspection and native loading reject other count encodings, including
 INT32 and UINT32. Counts must fit in an unsigned 32-bit value; only `mtp_nextn`
 may be zero.
+Topology components in `ep<N>` and `<A>A<F>F` must also be positive u32 values.
+Supported Parquet compression codecs are UNCOMPRESSED, SNAPPY, and ZSTD.
+Python inspection rejects other codecs, including GZIP, before native estimation.
 
 `FastAFDMoEStageProfile.load(path).write_parquet(output)` converts a validated
 legacy document without changing its measured values. Python's canonical model
@@ -34,6 +37,7 @@ includes both `config` and `stage` in its measurement provenance; persist both.
 Reconstruction loads the current artifact, while an existing model retains its
 original snapshot and digest. The Python profile objects expose raw data for
 inspection and conversion; production AFD timing does not use their lookup API.
+Their `entries` tuple is read-only so cached exact lookups retain their identity.
 
 ## Document
 
