@@ -113,7 +113,7 @@ jobs:
         run: bash scripts/ci/check_codeowners.sh
       - name: Check active workflow contracts
         run: |
-          python -m pytest -c /dev/null tests/test_ci_workflow_contracts.py tests/test_full_ci_fail_fast.py tests/test_artifactory_wheel_handoff.py tests/test_ci_qualification.py tests/test_release_fpe.py tests/test_fast_ci_policy.py -q \
+          python -m pytest -c /dev/null tests/test_ci_workflow_contracts.py tests/test_full_ci_fail_fast.py tests/test_artifactory_wheel_handoff.py tests/test_ci_qualification.py tests/test_release_fpe.py tests/test_fast_ci_policy.py scripts/ci/test_op_latency_handoff.py -q \
             -p no:cacheprovider \
             --override-ini="addopts=" \
             --override-ini="filterwarnings=error"
