@@ -74,3 +74,55 @@ Thread `PRRT_kwDOT0t9uc66hmrt` also requests these commands and results in the
 PR description. That publication step remains open: this repair has read-only
 GitHub access. A maintainer with PR-edit permission must copy the parity
 evidence into the description before resolving that thread.
+
+## Sequence-limit and attention-documentation follow-up
+
+Reverified on 2026-11-24 with the accompanying source, documentation, and
+regression-test changes on top of pinned head
+`07587182c7ea6027d78232f5718439cd57c28963`. The same Python, Rust, maturin,
+pytest, frozen dependencies, scratch-directory isolation, and two Cargo build
+jobs described above were used. No goldens, assertions, or timeouts changed.
+
+The installed mixed-project wheel was built from `python/aisimulate` with:
+
+```bash
+python -m maturin build --profile ci --locked --config 'profile.ci.inherits="release"' --config 'profile.ci.opt-level=2' --config 'profile.ci.lto=false' --config 'profile.ci.codegen-units=16' --auditwheel skip --out "$REPAIR_SCRATCH/wheel"
+uv pip install --python "$REPAIR_SCRATCH/venv/bin/python" --no-deps "$REPAIR_SCRATCH/wheel"/aisimulate-*.whl
+```
+
+Cargo reported the optimized `ci` profile. The imported wheel's
+`aisimulate/_runtime.abi3.so` SHA-256 was
+`0a146d5e1cb20d98f28172babb7041c111ef5bd76d842c11cd583fe6abeb4718`.
+The two parity commands above passed again: **305 passed in 72.09s** and
+**85 passed in 13.29s**, with no skips. Follow-up logs are
+`pr510-engine-parity.log` and `pr510-compile-parity.log` under `TMPDIR`.
+
+The targeted caller regressions also passed:
+
+```bash
+python -m pytest -q tests/sweeper/test_afd_fastafd.py tests/sweeper/test_afd_perfmodel.py tests/sweeper/test_afd_engine.py -p no:cacheprovider --basetemp "$TMPDIR/pytest-afd"
+```
+
+Result: **267 passed in 12.70s** (`pr510-afd.log`). New cases exercise the
+canonical model and FastAFD adapter, reject undersized sequence limits before
+timing or memory estimation, and preserve default, exact-fit, and larger KV
+allocations. Native SOL timing and real memory accounting verify the documented
+uncomposed attention return and the adapter's router addition. These are
+synthetic-profile regression checks, not measured serving-accuracy evidence.
+The guard adds constant work before model construction, with no retained state
+or change to valid-input numerical computation.
+
+Repository-wide Ruff lint and format checks, seven documentation-link unit
+tests, the 79-file documentation destination check, and `git diff --check`
+passed. The initial formatting check requested formatting of the new test;
+after formatting it, the full check passed (`pr510-initial-format.log` and
+`pr510-ruff-format.log`). An initial repository-root wheel command selected
+crate-only packaging and warned about its module name; it was never installed.
+The application-directory build reused the optimized native artifacts and
+produced the installed mixed-project wheel (`pr510-wheel-build.log` and
+`pr510-wheel-mixed.log`).
+
+The description-publication requirement for `PRRT_kwDOT0t9uc66hmrt` remains
+open. This worker has read-only GitHub access and cannot add these commands and
+results to the PR description. Threads `PRRT_kwDOT0t9uc66tXLC` and
+`PRRT_kwDOT0t9uc66tXLI` are covered by the fixes and targeted tests above.

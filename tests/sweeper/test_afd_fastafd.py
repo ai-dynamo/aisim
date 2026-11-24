@@ -387,6 +387,60 @@ def fastafd_attention_sol(monkeypatch):
     monkeypatch.setattr(perf_database, "get_database_view", sol_view)
 
 
+@pytest.mark.parametrize("max_seq_len", [512, 1151])
+@pytest.mark.parametrize("entrypoint", ["adapter", "canonical"])
+def test_fastafd_rejects_undersized_sequence_limit_before_estimation(
+    tmp_path, monkeypatch, fastafd_attention_sol, max_seq_len, entrypoint
+):
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    provider = _provider(tmp_path, AICAFDPerformanceModel())
+    request = _request(_topology())
+    if entrypoint == "canonical":
+        (baseline,) = provider.measure(request)
+        model = RustForwardPassPerfModel.best_available(baseline.provenance["config"])
+
+    def unexpected_estimation(*args, **kwargs):
+        pytest.fail("An undersized sequence limit must fail before timing or memory estimation")
+
+    monkeypatch.setattr(AFDInferenceSession, "_sum_latency", unexpected_estimation)
+    monkeypatch.setattr(AFDInferenceSession, "_estimate_a_memory_dict", unexpected_estimation)
+    message = rf"max_seq_len \({max_seq_len}\) must be at least isl \+ osl \(1152\)"
+    if entrypoint == "canonical":
+        with pytest.raises(ValueError, match=message):
+            model.estimate_fastafd_attention(isl=1024, osl=128, max_seq_len=max_seq_len)
+    else:
+        with pytest.raises(AFDInfeasible, match=message):
+            provider.measure(replace(request, max_seq_len=max_seq_len))
+
+
+@pytest.mark.parametrize("max_seq_len", [None, 1152, 2048])
+def test_fastafd_sequence_limit_preserves_memory_and_uncomposed_attention(tmp_path, fastafd_attention_sol, max_seq_len):
+    """Native SOL and real KV accounting; the adapter composes compute and router."""
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    request = replace(_request(_topology()), max_seq_len=max_seq_len)
+    (measurement,) = _provider(tmp_path, AICAFDPerformanceModel()).measure(request)
+    model = RustForwardPassPerfModel.best_available(measurement.provenance["config"])
+    attention = model.estimate_fastafd_attention(isl=1024, osl=128, max_seq_len=max_seq_len)
+    components = attention["provenance"]["components"]
+    assert attention["attention_ms"] == components["attention_compute_ms"]
+    assert components["a_router_ms"] > 0
+    assert measurement.attention_ms == pytest.approx(attention["attention_ms"] + components["a_router_ms"])
+    memory = attention["provenance"]["memory"]
+    assert memory == measurement.provenance["attention"]["memory"]
+    assert memory["a_worker"]["kvcache"] > 0
+    if max_seq_len is None:
+        explicit = model.estimate_fastafd_attention(isl=1024, osl=128, max_seq_len=1152)
+        assert explicit["provenance"]["memory"] == memory
+    elif max_seq_len > 1152:
+        minimum = model.estimate_fastafd_attention(isl=1024, osl=128, max_seq_len=1152)
+        # KV storage grows with the configured slot length, preserving headroom.
+        assert memory["a_worker"]["kvcache"] == pytest.approx(
+            minimum["provenance"]["memory"]["a_worker"]["kvcache"] * max_seq_len / 1152
+        )
+
+
 def test_canonical_fastafd_pins_attention_provenance_policy(tmp_path, monkeypatch, fastafd_attention_sol):
     """A saved non-strict policy overrides a stricter process environment."""
     from aisimulate.sdk import perf_database

@@ -1606,6 +1606,10 @@ class AFDInferenceSession:
         from aisimulate.sdk.afd_partition import build_afd_ops_partition
         from aisimulate.sdk.models import get_model
 
+        isl, osl = runtime_config.isl, runtime_config.osl
+        if max_seq_len is not None and max_seq_len < isl + osl:
+            raise ValueError(f"FastAFD max_seq_len ({max_seq_len}) must be at least isl + osl ({isl + osl})")
+
         a_model = get_model(self._model_path, copy.deepcopy(self._a_model_config), self._backend.name.value)
         f_memory_model = getattr(a_model, "_afd_ffn_memory_model", None)
         f_model = (
@@ -1618,7 +1622,6 @@ class AFDInferenceSession:
         routers = list(self._router_ops(a_partition.ffn_ops))
         num_layers = int(a_model._num_layers)
         _, a_batch, _, f_batch, _ = self._afd_batch_shape()
-        isl, osl = runtime_config.isl, runtime_config.osl
         total_ms = 0.0
         total_repeat = 0
         decode_samples = []

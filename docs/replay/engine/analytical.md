@@ -126,8 +126,12 @@ decode trace that crosses between F-bound and A-bound does not undercount TPOT.
 Foreground intervals use the mean stage durations and sampled mean cadence.
 Custom providers without a sample trace describe constant attention time.
 The canonical model returned by `RustForwardPassPerfModel.best_available` also
-exposes this composition as `estimate_fastafd_attention(isl=..., osl=...,
-max_seq_len=...)` for a selected `fastafd_stage` identity.
+provides `estimate_fastafd_attention(isl=..., osl=..., max_seq_len=...)` for a
+selected `fastafd_stage` identity. It returns attention compute as
+`attention_ms` and reports `a_router_ms` separately in `provenance.components`.
+The FastAFD adapter adds the router later; direct callers needing total A time
+must add both components. A configured `max_seq_len` must be at least `isl + osl`
+so the KV allocation covers the full evaluated decode sequence.
 This widening describes the lower-level provider. Public AFD configuration
 rejects nonzero `engine.nextn`, including `nextn: 1` with `nextn_accepted: 1`,
 before profile lookup. MTP profiles therefore cannot be selected through
