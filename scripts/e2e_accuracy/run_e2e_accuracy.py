@@ -39,6 +39,7 @@ from scripts.e2e_accuracy.build_e2e_accuracy_overview import (
 from scripts.e2e_accuracy.fetch_accuracy_measurements import MTP_POLICY, RESOLVED_POLICY, digest, validate_manifest
 from scripts.e2e_accuracy.hf_measurements import MTP_POLICY as HF_MTP_POLICY
 from scripts.e2e_accuracy.hf_measurements import POLICY as HF_POLICY
+from scripts.e2e_accuracy.hf_measurements import check_pinned_dataset, read_dataset
 from scripts.e2e_accuracy.source.cohort import select_points as select_resolved_points
 from scripts.e2e_accuracy.source.recipes.runtime_evidence import prepare_runtime_evidence
 from scripts.pages.build_pages_site import _accuracy_summary
@@ -415,7 +416,9 @@ def predict_point(point: dict) -> dict:
             )
         },
     }
-    row.update(measurement_chart_metrics(bench["metrics"], total_gpus))
+    row.update(
+        measurement_chart_metrics(bench["metrics"], total_gpus, decode_gpus=config.get("num_decode_gpu"))
+    )
     row.update(baseline_chart_metrics(baseline, total_gpus))
     row["configuration"] = {
         "backend_version": baseline.backend_version,
@@ -470,13 +473,19 @@ def optional_positive(value):
     return float(value) if positive(value) else None
 
 
-def measurement_chart_metrics(metrics, total_gpus):
+def measurement_chart_metrics(metrics, total_gpus, decode_gpus=None):
     e2e = optional_positive(metrics.get("mean_e2el"))
     total = metrics.get("tput_per_gpu")
     if not positive(total) and positive(metrics.get("total_token_throughput")):
         total = metrics["total_token_throughput"] / total_gpus
     output = metrics.get("output_tput_per_gpu")
-    if not positive(output) and positive(metrics.get("output_throughput")):
+    if positive(output) and decode_gpus and 0 < decode_gpus < total_gpus:
+        # perf-DB reports per-decode-GPU on disagg rows; re-express per total GPU
+        # so both sides of the accuracy chart share the same denominator. The
+        # fallback below already yields a per-total value, so it must not be
+        # rescaled.
+        output = output * decode_gpus / total_gpus
+    elif not positive(output) and positive(metrics.get("output_throughput")):
         output = metrics["output_throughput"] / total_gpus
     return {
         "silicon_e2e_ms": e2e * 1000 if e2e is not None else None,
@@ -586,7 +595,9 @@ def predict_resolved_point(point):
             mtp_acceptance_source=mtp["kind"],
         )
     total_gpus = row["aisimulate_total_gpus"]
-    row.update(measurement_chart_metrics(bench["metrics"], total_gpus))
+    row.update(
+        measurement_chart_metrics(bench["metrics"], total_gpus, decode_gpus=config.get("num_decode_gpu"))
+    )
     try:
         if config["spec_method"] == "mtp":
             row["aic_status"] = "unsupported"
@@ -769,6 +780,8 @@ def campaign(args) -> None:
         raise ValueError("invalid shard index/count")
     if shard_count > 1 and args.output.exists() and any(args.output.iterdir()):
         raise ValueError("shard output directory must be empty")
+    dataset = read_dataset(args.tables)
+    check_pinned_dataset(dataset, manifest)
     metadata = {
         "manifest": manifest,
         "identity": identity,
@@ -780,6 +793,7 @@ def campaign(args) -> None:
         "preview": preview,
         "configuration_mode": getattr(args, "configuration_mode", "verified"),
         "point_timeout": args.point_timeout,
+        "dataset": dataset,
         "dataset_sha256": digest(args.manifest),
         "measurement_sha256": digest(args.tables),
         "driver_sha256": driver_digest(),
@@ -989,6 +1003,9 @@ def publish_campaign(metadata, results, cohort_sha, started, output, run_attempt
         "status": "complete",
         "advisory": True,
     }
+    if metadata.get("dataset") is not None:
+        # Exact input identity: repository, commit and snapshot; reruns reuse these.
+        campaign_info["dataset"] = metadata["dataset"]
     if resolved:
         campaign_info["configuration"] = {
             "profile": "coverage-experiment/1" if metadata["configuration_mode"] == "estimated" else "verified",

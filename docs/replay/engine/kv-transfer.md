@@ -25,8 +25,10 @@ A native ReplaySpec or Sweeper search space whose prefill rank sets a positive
 YAML above always resolves the bytes. A rank with `kv_cache_groups` is the
 exception. It takes the bytes from its groups, and it refuses
 `kv_transfer_bytes_per_token`. The YAML leaves that field out for such a rank.
-A native ReplaySpec needs identical `kv_cache_groups` and the same
-`vllm_version` on its prefill and decode roles.
+A native ReplaySpec with grouped caches needs identical `kv_cache_groups`,
+the same `vllm_version`, and equal resolved `tensor_parallel_size` on its
+prefill and decode roles. Grouped handoffs do not reshard KV between TP sizes;
+linear pairs may still use different TP sizes.
 
 ## Transfer fields
 
@@ -84,8 +86,8 @@ a block of each full-attention group. No full-attention spec of vLLM 0.31.0,
 0.32.0 or 0.33.0 opts out of prefix caching. Only a profile that describes no
 deployment of these versions has such a group. The state moves with every
 transfer that moves at least one token.
-A request of zero input tokens owns no block on the prefill worker and moves
-no state block; vLLM refuses an empty prompt, see vLLM v0.31.0
+A grouped prefill worker refuses a request with an empty prompt, as vLLM
+refuses an empty prompt, see vLLM v0.31.0
 [`input_processor.py:516-517`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/engine/input_processor.py#L516-L517),
 vLLM v0.32.0
 [`input_processor.py:565-566`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/input_processor.py#L565-L566)

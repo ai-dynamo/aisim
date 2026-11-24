@@ -5,6 +5,7 @@
 import hashlib
 import io
 import json
+import os
 import posixpath
 import sys
 import zipfile
@@ -216,32 +217,46 @@ def test_reviewed_database_pin_overrides_current_slot_and_never_borrows_data(tmp
         # No get_latest_database_version: the reviewed pin must take precedence.
         "aisim.sdk.perf_database": SimpleNamespace(),
         "aisim.replay.dashboard": SimpleNamespace(),
+        # The predictor reads operation data from the default systems root; point it at the fixture
+        # instead of downloading the pinned dataset.
+        "aisim_core.data.default_systems": SimpleNamespace(default_systems_path=lambda: tmp_path / "systems"),
     }
-    monkeypatch.setattr(
-        agentx_predict,
-        "importlib",
-        SimpleNamespace(
-            import_module=modules.__getitem__,
-            resources=SimpleNamespace(files=lambda package: tmp_path),
-        ),
-    )
+    # predict() runs as its own process; here the opt-in it sets must not outlive the test.
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "0")
     monkeypatch.setattr(agentx_predict, "runtime_module", modules.__getitem__)
     missing = agentx_predict.predict(config, tmp_path)
     assert missing["reason"] == "database_unavailable"
     assert missing["prediction_backend_version"] == version
     assert not captured
+    # The pinned collection stays readable after newer collections take the query slots.
+    assert os.environ["AIC_ALLOW_UNLISTED_VERSIONS"] == "1"
 
-    def unavailable_resources(_):
-        raise ModuleNotFoundError("Older wheel has no core resources")
-
-    monkeypatch.setattr(agentx_predict.importlib.resources, "files", unavailable_resources)
-    assert agentx_predict.predict(config, tmp_path) == missing
-    monkeypatch.setattr(agentx_predict.importlib.resources, "files", lambda _: tmp_path)
     relative = (
         f"sparse_attention/sglang/{version}/dsa_generation_module_perf.parquet"
         if backend == "sglang"
         else f"attention/vllm/{version}/context_attention_perf.parquet"
     )
+
+    # A release wheel from before the dataset cutover (release/0.14.0) has no default_systems module and packages
+    # its operation tables, so the evaluator keeps reading those instead of reporting the database unavailable.
+    def without_default_systems(name):
+        if name == "aisim_core.data.default_systems":
+            raise ModuleNotFoundError("Older wheel has no default systems root")
+        return modules[name]
+
+    legacy = tmp_path / "legacy-wheel"
+    monkeypatch.setattr(agentx_predict, "runtime_module", without_default_systems)
+    monkeypatch.setattr(agentx_predict.importlib.resources, "files", lambda _: legacy)
+    assert agentx_predict.predict(config, tmp_path) == missing  # no tables there either
+    packaged = legacy / "systems/data/b300_sxm" / relative
+    packaged.parent.mkdir(parents=True)
+    packaged.write_bytes(b"packaged fixture data")
+    result = agentx_predict.predict(config, tmp_path)
+    assert result["reason"] == "replay_capability_unavailable"  # past the data check, stopped by the stub capability
+    assert captured[0]["engine"]["backend_version"] == version
+    captured.clear()
+
+    monkeypatch.setattr(agentx_predict, "runtime_module", modules.__getitem__)
     data = tmp_path / "systems/data/b300_sxm" / relative
     data.parent.mkdir(parents=True)
     data.write_bytes(b"fixture data")
@@ -271,6 +286,7 @@ def test_optional_wheel_feature_capabilities_report_unsupported(tmp_path, monkey
         if missing == "lookup"
         else SimpleNamespace(get_model_config_from_model_path=lambda _: {}),
         "aisim_core.sdk.common": SimpleNamespace(),
+        "aisim_core.data.default_systems": SimpleNamespace(default_systems_path=lambda: tmp_path / "systems"),
     }
 
     def import_module(name):
@@ -278,11 +294,6 @@ def test_optional_wheel_feature_capabilities_report_unsupported(tmp_path, monkey
             raise ModuleNotFoundError(name)
         return modules[name]
 
-    monkeypatch.setattr(
-        agentx_predict,
-        "importlib",
-        SimpleNamespace(import_module=import_module, resources=SimpleNamespace(files=lambda _: tmp_path)),
-    )
     monkeypatch.setattr(agentx_predict, "runtime_module", import_module)
     monkeypatch.setattr(agentx_predict, "asdict", lambda value: value)
     data = tmp_path / "systems/data/b300_sxm/attention/vllm/0.31.0/context_attention_perf.parquet"

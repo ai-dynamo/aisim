@@ -528,82 +528,87 @@ fn grouped_prefill_rank_holds_its_source_and_reports_block_unit_timing() {
 }
 
 #[test]
-fn grouped_empty_source_moves_no_state_and_delays_no_other_handoff() {
-    // A request of zero input tokens owns no block on the prefill rank, so
-    // its source moves no state block either.
-    let spec = disaggregated_grouped_spec(vec![
-        request("empty", 0.0, 0, 4),
-        request("full", 0.0, 1000, 4),
-    ]);
-    let rank = serde_json::from_value::<ReplayEngineConfig>(spec.engine.clone())
-        .unwrap()
-        .rank;
-    let mut prefill = EngineFactory::new(EngineConfig {
-        worker_type: WorkerType::Prefill,
-        ..rank
-    })
-    .unwrap()
-    .build(EngineIdentity::new(0), NonZeroU32::MIN)
-    .unwrap();
-    let source = Command::SubmitHandoffPrefill {
-        handoff_id: HandoffId::new(Uuid::from_u128(2)),
-        request: Request {
-            request_id: Uuid::from_u128(1),
-            tokens: Vec::new(),
-            max_output_tokens: 1,
-            output_token_ids: None,
-            session_id: None,
-            cache_salt: None,
-            images: Vec::new(),
-            kv_hint: None,
-        },
-    };
-    prefill
-        .apply_command_effects(SchedulerCommand::new(0, source), 0.0)
-        .unwrap();
-    let pass = prefill.execute_pass(0.0).unwrap().unwrap();
-    let completed = prefill.complete_pass(pass.pass_id, pass.end_ms).unwrap();
-    let effects = &completed.effects.by_rank[0].effects;
-    let timing = effects
-        .lifecycle_events
-        .iter()
-        .find_map(|event| match event {
-            LifecycleEvent::SourceHeld {
-                transfer_timing, ..
-            } => Some(*transfer_timing),
-            _ => None,
-        })
-        .expect("the prefill rank holds the empty source");
-    assert_eq!(effects.metrics.active_blocks, 0);
-    assert_eq!(timing.full_prompt_tokens, 0);
-    assert_eq!(timing.state_bytes, 0);
-    assert_eq!(timing.delay_ms(0), Some(0.0));
-
-    // Both sources are held after the first prefill pass of 10 ms. The
-    // 1,000-token request moves one full-attention block of 13,045,120 bytes
-    // and one block of each state group, 52,120,960 bytes: 65,166,080 bytes
-    // at 1 GB/s are 65.16608 ms. The empty request adds no bytes to the
-    // shared link, so the destination is activated at 10 + 65.16608 ms, as
-    // without the empty request.
-    let report = Replayer::new(spec, ReplayEngineFactory::new())
+fn grouped_pd_rejects_unequal_tensor_parallel_sizes() {
+    // Each role can inherit the shared TP size or supply its own descriptor.
+    for role in ["prefill", "decode"] {
+        let mut spec = disaggregated_grouped_spec(vec![request("tp-mismatch", 0.0, 1000, 4)]);
+        spec.engine["tensor_parallel_size"] = 4.into();
+        spec.engine[role] = serde_json::json!({
+            "rank": spec.engine["rank"].clone(), "tensor_parallel_size": 8
+        });
+        let error = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap_err();
+        assert!(matches!(error, ReplayError::InvalidSpec(_)));
+        assert_eq!(
+            error.to_string(),
+            "invalid replay spec: grouped prefill and decode roles require equal tensor_parallel_size",
+            "{role} TP override"
+        );
+    }
+    // Equal shared defaults must not hide different explicit role values.
+    let mut spec = disaggregated_grouped_spec(vec![request("tp-overrides", 0.0, 1000, 4)]);
+    for (role, tp) in [("prefill", 4), ("decode", 8)] {
+        spec.engine[role] = serde_json::json!({
+            "rank": spec.engine["rank"].clone(), "tensor_parallel_size": tp
+        });
+    }
+    let error = Replayer::new(spec, ReplayEngineFactory::new())
         .unwrap()
         .run()
-        .unwrap();
-    assert_eq!(report.request_counts.completed_requests, 2);
-    let record = |id: &str| {
-        report
-            .per_request
-            .iter()
-            .find(|record| record.request_id.as_deref() == Some(id))
+        .unwrap_err();
+    assert!(matches!(error, ReplayError::InvalidSpec(_)));
+    assert!(error.to_string().contains("equal tensor_parallel_size"));
+}
+
+#[test]
+fn grouped_pd_accepts_equal_tensor_parallel_sizes() {
+    for prefill_override in [false, true] {
+        for decode_override in [false, true] {
+            let mut spec = disaggregated_grouped_spec(vec![request("equal-tp", 0.0, 1000, 4)]);
+            spec.engine["tensor_parallel_size"] = 4.into();
+            for (role, override_tp) in [("prefill", prefill_override), ("decode", decode_override)]
+            {
+                if override_tp {
+                    spec.engine[role] = serde_json::json!({
+                        "rank": spec.engine["rank"].clone(), "tensor_parallel_size": 4
+                    });
+                }
+            }
+            let report = Replayer::new(spec, ReplayEngineFactory::new())
+                .unwrap()
+                .run()
+                .unwrap();
+            assert_eq!(report.request_counts.completed_requests, 1);
+            assert_eq!(report.request_counts.total_output_tokens, 4);
+            assert_eq!(report.committed_prefill_tokens, 1000);
+        }
+    }
+}
+
+#[test]
+fn linear_pd_accepts_unequal_tensor_parallel_sizes() {
+    for role in ["prefill", "decode"] {
+        let mut spec = aggregated_spec(
+            Backend::Vllm,
+            1,
+            0.0,
+            vec![request("linear-tp", 0.0, 32, 4)],
+        );
+        spec.topology = disaggregated_grouped_spec(Vec::new()).topology;
+        spec.engine["tensor_parallel_size"] = 4.into();
+        spec.engine[role] = serde_json::json!({
+            "rank": spec.engine["rank"].clone(), "tensor_parallel_size": 8
+        });
+        let report = Replayer::new(spec, ReplayEngineFactory::new())
             .unwrap()
-    };
-    let empty = record("empty");
-    assert_eq!(empty.source_held_ms, Some(10.0));
-    assert_eq!(empty.destination_activated_ms, empty.source_held_ms);
-    let full = record("full");
-    assert_eq!(full.source_held_ms, Some(10.0));
-    let activated = full.destination_activated_ms.unwrap();
-    assert!((activated - (10.0 + 65_166_080.0 / 1e6)).abs() < 1e-9);
+            .run()
+            .unwrap();
+        assert_eq!(report.request_counts.completed_requests, 1);
+        assert_eq!(report.request_counts.total_output_tokens, 4);
+        assert_eq!(report.committed_prefill_tokens, 32);
+    }
 }
 
 #[test]

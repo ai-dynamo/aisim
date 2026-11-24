@@ -697,7 +697,11 @@ impl ForwardPassPerfModelConfig {
             deployment
                 .get("resources")
                 .cloned()
-                .ok_or_else(|| invalid("FPM deployment requires resources"))?,
+                .ok_or_else(|| {
+                    invalid(
+                        "FPM resources are pending; supply cache_layout, max_num_tokens, max_batch_size, provenance, and kv_bytes_per_token (linear) or cache_groups (grouped) before cache sizing or replay",
+                    )
+                })?,
         )
         .map_err(|error| invalid(format!("FPM resource profile: {error}")))?;
         resources.validate()?;
@@ -765,7 +769,7 @@ impl ForwardPassPerfModelConfig {
         Ok(Some(binding))
     }
 
-    fn fpm_deployment(&self) -> Result<Option<&serde_json::Value>, AicError> {
+    pub(super) fn fpm_deployment(&self) -> Result<Option<&serde_json::Value>, AicError> {
         let Some(profile) = &self.fpm_profile else {
             return Ok(None);
         };

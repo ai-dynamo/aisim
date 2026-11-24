@@ -56,7 +56,7 @@ that is now the only layout on disk.
 Usage:
     python3 tools/perf_database/check_collector_data.py
     python3 tools/perf_database/check_collector_data.py \\
-        --data-root src/aisim_core/systems/data \\
+        --data-root <systems root>/data \\
         --catalog collector/op_backend_catalog.yaml
 
 Exit codes: 0 = every rule OK. 1 = at least one failure (printed, grouped by
@@ -78,8 +78,9 @@ from pathlib import Path
 # required (mirrors collect.py:1808). Harmless
 # under pytest, where pytest.ini's `pythonpath = .` already covers it.
 REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+for _path in (REPO_ROOT, Path(__file__).resolve().parent):  # the second serves the sibling op_data_root module
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 # aisim_core is pip-installed editable (pyproject.toml
 # [tool.uv.sources]), so it needs no sys.path help. Imported via the
@@ -92,13 +93,12 @@ from collector.op_catalog import (
     CATALOG_PATH,
     load_family_map,
 )
+from op_data_root import op_data_root
 
 from aisim.sdk.perf_database import (
     _load_collection_meta_yaml,
     _parse_reuse_yaml,
 )
-
-DATA_ROOT_DEFAULT = REPO_ROOT / "src" / "aisim_core" / "systems" / "data"
 
 REUSE_YAML = "reuse.yaml"
 COLLECTION_META_YAML = "collection_meta.yaml"
@@ -419,11 +419,16 @@ def render_report(results: dict[str, list[str]]) -> tuple[str, bool]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--data-root", type=Path, default=DATA_ROOT_DEFAULT, help="Root of the systems/data tree.")
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=None,
+        help="Root of the systems/data tree (default: the pinned op-latency dataset, see op_data_root.py).",
+    )
     parser.add_argument("--catalog", type=Path, default=CATALOG_PATH, help="Path to the op backend catalog yaml.")
     args = parser.parse_args(argv)
 
-    results = run_checks(args.data_root, args.catalog)
+    results = run_checks(op_data_root(args.data_root), args.catalog)
     report, failed = render_report(results)
     print(report)
     return 1 if failed else 0

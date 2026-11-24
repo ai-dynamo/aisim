@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import copy
 import functools
-import importlib.resources as pkg_resources
 import json
 import logging
 import os
@@ -25,7 +24,8 @@ from aisim_core.sdk.system_spec import SystemSpec
 databases_cache = defaultdict(lambda: defaultdict(lambda: defaultdict()))
 logger = logging.getLogger(__name__)
 
-_SYSTEMS_PATHS: list[str] = [os.fspath(pkg_resources.files("aisim_core") / "systems")]
+# ``None`` means "the default root", composed lazily from the pinned op-latency dataset on first use.
+_SYSTEMS_PATHS: list[str] | None = None
 
 # Ad-hoc probe shapes must fit the op-list FFI's u32 token count; comm shims
 # factor an element count into ``x * per_token_elements`` with both in range
@@ -91,20 +91,25 @@ _DATABASE_VERSION_METADATA_FILES = {
 }
 
 
+def _default_systems_path() -> str:
+    from aisim_core.data.default_systems import default_systems_path
+
+    return default_systems_path()
+
+
 def _normalize_systems_paths(raw_paths: str | Iterable[str] | None) -> list[str]:
-    default_path = os.fspath(pkg_resources.files("aisim_core") / "systems")
     if raw_paths is None:
-        return [default_path]
+        return [_default_systems_path()]
     if isinstance(raw_paths, str):
         entries = [part.strip() for part in raw_paths.split(",") if part.strip()]
     else:
         entries = [os.fspath(entry) for entry in raw_paths if entry is not None]
     if not entries:
-        return [default_path]
+        return [_default_systems_path()]
     resolved: list[str] = []
     for entry in entries:
         if str(entry).lower() == "default":
-            resolved.append(default_path)
+            resolved.append(_default_systems_path())
         else:
             resolved.append(os.fspath(entry))
     return resolved
@@ -129,6 +134,10 @@ def set_systems_paths(raw_paths: str | Iterable[str] | None) -> None:
             f"Invalid entries: {', '.join(invalid_paths)}"
         )
     _SYSTEMS_PATHS = resolved_paths
+    _drop_systems_caches()
+
+
+def _drop_systems_caches() -> None:
     _load_system_spec_from_paths.cache_clear()
     _cached_configured_database_view.cache_clear()
     from aisim_core.sdk.operations.base import clear_all_op_caches
@@ -136,7 +145,25 @@ def set_systems_paths(raw_paths: str | Iterable[str] | None) -> None:
     clear_all_op_caches()
 
 
+def explicit_systems_paths() -> list[str] | None:
+    """The roots this process holds now (an override or an earlier lookup), or ``None``; never composes the default."""
+    return None if _SYSTEMS_PATHS is None else list(_SYSTEMS_PATHS)
+
+
+def restore_systems_paths(previous: list[str] | None) -> None:
+    """Return to a state read earlier with ``explicit_systems_paths()``; ``None`` leaves the default unresolved."""
+    global _SYSTEMS_PATHS
+    if previous is not None:
+        set_systems_paths(previous)
+        return
+    _SYSTEMS_PATHS = None
+    _drop_systems_caches()
+
+
 def get_systems_paths() -> list[str]:
+    global _SYSTEMS_PATHS
+    if _SYSTEMS_PATHS is None:
+        _SYSTEMS_PATHS = [_default_systems_path()]
     return list(_SYSTEMS_PATHS)
 
 
@@ -429,8 +456,9 @@ def build_no_databases_message() -> str:
     """Build a concise error message for systems path/db validation failures."""
     resolved_paths = get_systems_paths()
     resolved_display = ", ".join(resolved_paths) if resolved_paths else "<none>"
-    default_path = os.fspath(pkg_resources.files("aisim_core") / "systems")
-    has_default = default_path in resolved_paths
+    from aisim_core.data.default_systems import resolved_default_systems_path
+
+    has_default = resolved_default_systems_path() in resolved_paths
 
     lines = [
         "No loadable performance databases found under --systems-paths.",
@@ -2346,15 +2374,24 @@ def _contains_quant_mode(data, quant_mode: common.GEMMQuantMode) -> bool:
 
 
 def _gemm_key_names(database) -> list[str]:
-    """Return GEMM modes, deriving static FP8 from dynamic FP8 plus overheads."""
-    names = set(_enum_key_names(getattr(database, "_gemm_data", None)))
+    """Return GEMM modes.
+
+    `fp8_static` comes from its own rows plus `scale_matrix`, or from dynamic FP8 plus both overhead tables.
+    The direct path also asks for `scale_matrix` `fp8` rows, although the Rust engine needs that table only for a
+    GEMM with a low-precision input: nearly every model has such a GEMM, so the listing asks for the table it needs.
+    """
+    gemm_data = getattr(database, "_gemm_data", None)
+    names = set(_enum_key_names(gemm_data))
     fp8_static_name = common.GEMMQuantMode.fp8_static.name
     names.discard(fp8_static_name)
-    if (
-        _contains_quant_mode(getattr(database, "_gemm_data", None), common.GEMMQuantMode.fp8)
+    has_scale_matrix = _contains_quant_mode(getattr(database, "_scale_matrix_data", None), common.GEMMQuantMode.fp8)
+    derived = (
+        _contains_quant_mode(gemm_data, common.GEMMQuantMode.fp8)
         and _contains_quant_mode(getattr(database, "_compute_scale_data", None), common.GEMMQuantMode.fp8)
-        and _contains_quant_mode(getattr(database, "_scale_matrix_data", None), common.GEMMQuantMode.fp8)
-    ):
+        and has_scale_matrix
+    )
+    direct = _contains_quant_mode(gemm_data, common.GEMMQuantMode.fp8_static) and has_scale_matrix
+    if derived or direct:
         names.add(fp8_static_name)
     return sorted(names)
 
