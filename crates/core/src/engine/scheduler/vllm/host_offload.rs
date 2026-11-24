@@ -495,8 +495,8 @@ pub(super) struct VllmHostOffloadAdapter {
     /// formed synchronizes before vLLM launches that pass. Taken when the
     /// pass forms; see [`Self::take_launch_sync_ms`].
     launch_sync_ms: Option<f64>,
-    /// Offloading: D2H copies completed since the preceding pass formed.
-    /// A queued preemption can have been decided before its store ended.
+    /// D2H copies completed since the preceding pass formed. A queued
+    /// decision may preempt their owner or restore into the freed capacity.
     completed_stores: FxHashMap<TransferId, f64>,
     /// SimpleCPU: the latest end of transfers issued before this pass.
     prior_transfer_end_ms: Option<f64>,
@@ -901,14 +901,19 @@ impl VllmHostOffloadAdapter {
         let mut tier = self.host.lock();
         // Only a private lane hands out G1 capacity that is still being
         // copied; a shared pool holds it until the copy completes.
-        let dependencies = kv_manager.native_destination_pending_dependencies(&reservation);
         let mut destination_free_ms = f64::NEG_INFINITY;
-        for dependency in dependencies {
-            assert!(kv_manager.is_native_source_dependency_pending(dependency));
-            let deadline = tier
-                .transfer_deadline(transfer_id(dependency))
-                .expect("pending source dependency must retain a submitted D2H");
-            destination_free_ms = destination_free_ms.max(deadline);
+        for dependency in reservation.fresh_source_reads() {
+            let store = transfer_id(dependency);
+            if kv_manager.is_native_source_dependency_pending(dependency) {
+                let deadline = tier
+                    .transfer_deadline(store)
+                    .expect("pending source dependency must retain a submitted D2H");
+                destination_free_ms = destination_free_ms.max(deadline);
+            } else if self.polls_simple_cpu_loads()
+                && let Some(&deadline) = self.completed_stores.get(&store)
+            {
+                destination_free_ms = destination_free_ms.max(deadline);
+            }
         }
         let not_before_ms = now_ms.max(destination_free_ms);
 
@@ -972,6 +977,7 @@ impl VllmHostOffloadAdapter {
         kv_manager: &mut G1Manager,
         now_ms: f64,
     ) -> HostTransferProgress {
+        let retain_source_read = self.polls_simple_cpu_loads();
         let mut tier = self.host.lock();
         let client = self.host.id();
         let (completed, mut completed_any) = tier.tick(client, now_ms);
@@ -986,13 +992,16 @@ impl VllmHostOffloadAdapter {
             else {
                 continue;
             };
-            if self.hold_load_keys && !self.rules.preemption_waits_for_all {
+            if self.hold_load_keys {
                 self.completed_stores.insert(*transfer_id, *at_ms);
             }
             if self.checkpoint_stores.remove(transfer_id) {
                 continue;
             }
-            assert!(kv_manager.satisfy_native_source_dependency(source_dependency(*transfer_id)));
+            assert!(kv_manager.satisfy_native_source_dependency(
+                source_dependency(*transfer_id),
+                retain_source_read,
+            ));
             if let Some(g3) = &mut self.g3 {
                 g3.store(&mut tier, blocks, now_ms);
             }
@@ -1782,6 +1791,10 @@ impl VllmHostOffloadAdapter {
         self.rules.polled_load_start
     }
 
+    fn polls_simple_cpu_loads(&self) -> bool {
+        self.hold_load_keys && self.rules.polled_load_start == Some(LoadCopyStart::LaunchEnd)
+    }
+
     pub(super) fn compute_not_before_ms(&self, now_ms: f64) -> f64 {
         self.compute_not_before_ms.max(now_ms)
     }
@@ -1791,9 +1804,9 @@ impl VllmHostOffloadAdapter {
     /// Its raw compute bound includes just these store deadlines. A queued
     /// launch can otherwise precede the time at which replay forms the pass.
     pub(super) fn take_launch_sync_ms(&mut self) -> Option<f64> {
+        // The next decision is no earlier than this pass's formation.
+        self.completed_stores.clear();
         if self.hold_load_keys && !self.rules.preemption_waits_for_all {
-            // The next decision is no earlier than this pass's formation.
-            self.completed_stores.clear();
             return (self.compute_not_before_ms > 0.0).then_some(self.compute_not_before_ms);
         }
         self.launch_sync_ms.take()

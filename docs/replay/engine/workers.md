@@ -540,7 +540,9 @@ The connector-specific copy timing is:
   decision and pass formation. The connector poll follows that wait.
 - `simple_cpu_v0_32`: a copy thread copies the issuing pass's loads as one
   batch, from the end of that pass's launch, without waiting for its GPU work
-  but after the previous batch; vLLM sees them finish together.
+  but after the previous batch; vLLM sees them finish together. If a store
+  held a destination GPU block past the launch, the batch also waits for
+  that store to finish before copying.
 - `simple_cpu_v0_32`, preemption: before launching a pass that preempts a
   request, vLLM waits for transfers submitted by earlier passes. Replay
   starts the launch and forward no earlier than the latest completion of

@@ -869,3 +869,39 @@ fn offloading_preemption_waits_for_its_store_completed_after_the_decision() {
         (0, Some(490.0))
     );
 }
+
+#[test]
+fn simple_cpu_restore_waits_for_the_store_that_held_its_gpu_destination() {
+    let gbps = |ms_per_block: f64| 64.0 / (ms_per_block * 1e6);
+    let run = |d2h_ms, h2d_ms, arrival| {
+        let mut config = polled_cpu_tier(8, gbps(h2d_ms));
+        config.native_host_offload = Some(
+            NativeHostOffloadConfig::new(128)
+                .with_bandwidths(gbps(d2h_ms), gbps(h2d_ms))
+                .with_connector(G2Connector::SimpleCpuV032),
+        );
+        let report = run_tokens(
+            config,
+            vec![
+                tokens_request(1, (0..8).collect(), 1, 0.0),
+                tokens_request(2, (500..528).collect(), 1, 300.0),
+                tokens_request(3, (1000..1004).collect(), 1, 600.0),
+                tokens_request(4, (1700..1704).collect(), 24, 600.0),
+                tokens_request(5, (0..10).collect(), 2, arrival),
+            ],
+        );
+        let restored = record(&report, 5);
+        assert_eq!(restored.first_admission_host_reused_input_tokens, Some(8));
+        (restored.first_admit_ms, restored.first_token_ms)
+    };
+    // Request 2's seven-block store runs from 400 to 680. Pass 5, decided
+    // at 620 and formed at 700, restores request 5 into two of those blocks.
+    // Its launch ends at 640, but the copy cannot start until 680 and ends
+    // at 704. The poll at 702 misses it. The following poll at 802 sees it,
+    // making the request schedulable two decisions later at 830.
+    assert_eq!(run(40.0, 12.0, 605.0), (Some(830.0), Some(940.0)));
+    // Here request 2's store ended at 519. An unrelated store ends at 727,
+    // but the selected blocks are ready when the launch ends at 722. Their
+    // copy ends at 728 and the poll at 732 sees it.
+    assert_eq!(run(17.0, 3.0, 710.0), (Some(760.0), Some(870.0)));
+}
