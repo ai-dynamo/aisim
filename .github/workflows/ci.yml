@@ -268,6 +268,52 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python scripts/ci/require_fast_ci.py
 
+  op-latency-data:
+    # Every Full CI job that reads operation tables needs the pinned dataset. Downloading it in each parallel job
+    # gets the runners rate limited by Hugging Face and the jobs time out, so it is downloaded once here and the
+    # others restore it from the artifact (see .github/actions/prefetch-op-latency-data).
+    name: Op-latency data
+    needs: [fast-ci, select-full-ci]
+    if: >-
+      ${{ needs.select-full-ci.outputs.rust == 'true' ||
+      needs.select-full-ci.outputs.rust_feature_modes == 'true' ||
+      needs.select-full-ci.outputs.public_api_rust == 'true' ||
+      needs.select-full-ci.outputs.application_tests == 'true' ||
+      needs.select-full-ci.outputs.python_compatibility == 'true' ||
+      needs.select-full-ci.outputs.engine_golden_regression == 'true' ||
+      needs.select-full-ci.outputs.collector_data == 'true' ||
+      needs.select-full-ci.outputs.readme_commands == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - name: Download the pinned op-latency dataset once for this run
+        env:
+          # A token lifts the anonymous rate limit; the dataset is public, so any valid read token works.
+          HF_TOKEN: ${{ secrets.HF_READ_AISIM_INFX_CACHE }}
+        run: |
+          python -m pip install --quiet pydantic pyarrow pyyaml huggingface_hub
+          archive="${RUNNER_TEMP}/op-latency-data.tar"
+          if ! python scripts/ci/op_latency_handoff.py pack --output "${archive}"; then
+            echo "::warning::The download with the read token failed; retrying anonymously"
+            env -u HF_TOKEN python scripts/ci/op_latency_handoff.py pack --output "${archive}"
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: op-latency-data
+          path: ${{ runner.temp }}/op-latency-data.tar
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
   platform-wheels:
     name: Platform Wheels
     needs: [fast-ci, select-full-ci]
@@ -278,7 +324,7 @@ jobs:
 
   collector-data:
     name: Collector Data
-    needs: [fast-ci, select-full-ci, verify-target]
+    needs: [fast-ci, select-full-ci, verify-target, op-latency-data]
     if: ${{ needs.select-full-ci.outputs.collector_data == 'true' }}
     uses: ./.github/workflows/collector-check.yml
     with:
@@ -340,7 +386,7 @@ jobs:
 
   rust:
     name: Rust (${{ matrix.arch }})
-    needs: [fast-ci, select-full-ci]
+    needs: [fast-ci, select-full-ci, op-latency-data]
     if: ${{ needs.select-full-ci.outputs.rust == 'true' }}
     strategy:
       fail-fast: false
@@ -359,11 +405,15 @@ jobs:
       - uses: ./.github/actions/setup-python-rust
         with:
           python-version: "3.12"
+      - name: Compose the op-latency systems root for Rust tests
+        uses: ./.github/actions/prefetch-op-latency-data
+        with:
+          github-env: "true"
       - run: cargo test --workspace
 
   rust-feature-modes:
     name: Rust feature modes
-    needs: [fast-ci, select-full-ci]
+    needs: [fast-ci, select-full-ci, op-latency-data]
     if: ${{ needs.select-full-ci.outputs.rust_feature_modes == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -392,6 +442,10 @@ jobs:
           wait "${package_pid}" || result=1
           wait "${rust_pid}" || result=1
           exit "${result}"
+      - name: Compose the op-latency systems root for Rust tests
+        uses: ./.github/actions/prefetch-op-latency-data
+        with:
+          github-env: "true"
       - name: Test with Python embedding enabled
         run: |
           export AIC_REQUIRE_EMBEDDED_ROUND_TRIP=1
@@ -401,7 +455,7 @@ jobs:
 
   public-api-rust:
     name: Public API Rust (${{ matrix.arch }})
-    needs: [fast-ci, select-full-ci]
+    needs: [fast-ci, select-full-ci, op-latency-data]
     if: ${{ needs.select-full-ci.outputs.public_api_rust == 'true' }}
     strategy:
       fail-fast: false
@@ -420,6 +474,10 @@ jobs:
       - uses: ./.github/actions/setup-python-rust
         with:
           python-version: "3.12"
+      - name: Compose the op-latency systems root for Rust tests
+        uses: ./.github/actions/prefetch-op-latency-data
+        with:
+          github-env: "true"
       - run: cargo test --manifest-path crates/tests/public-api/Cargo.toml
 
   application-wheel:
@@ -660,6 +718,8 @@ jobs:
       - run: python -m pip install --require-hashes -r scripts/release/requirements.txt
       - name: Build the application test wheel once
         run: python scripts/release/build_manylinux_wheel.py --output-dir application-test-dist
+      - name: Check the wheel stays under 100 MiB and packages no op data
+        run: python scripts/ci/measure_wheel_data.py --wheel application-test-dist/*.whl --max-wheel-mib 100
       - name: Check exact wheel configuration provenance
         run: |
           python scripts/ci/check_bundled_configs.py extract --check \
@@ -688,7 +748,7 @@ jobs:
   application-tests:
     environment: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && 'automated-release' || 'pr-wheel-staging' }}
     name: Application Tests (${{ matrix.arch }}, ${{ matrix.shard.suite }}, ${{ matrix.shard.group }})
-    needs: [fast-ci, select-full-ci, application-test-wheel]
+    needs: [fast-ci, select-full-ci, application-test-wheel, op-latency-data]
     if: ${{ needs.select-full-ci.outputs.application_tests == 'true' }}
     strategy:
       fail-fast: false
@@ -747,6 +807,7 @@ jobs:
           python -m pip install uv
           python -m uv pip install --system "${wheels[0]}[dev,learned]"
           echo "AISIM_TEST_WHEEL=${GITHUB_WORKSPACE}/${wheels[0]}" >> "${GITHUB_ENV}"
+      - uses: ./.github/actions/prefetch-op-latency-data
       - name: Run repository and package contracts
         if: matrix.shard.suite == 'contracts'
         run: |
@@ -949,7 +1010,7 @@ jobs:
 
   python-compatibility:
     name: Python ${{ matrix.python-version }} compatibility
-    needs: [fast-ci, select-full-ci]
+    needs: [fast-ci, select-full-ci, op-latency-data]
     if: ${{ needs.select-full-ci.outputs.python_compatibility == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -966,6 +1027,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install AISim and development dependencies
         run: python -m pip install './python/aisim[dev]'
+      - uses: ./.github/actions/prefetch-op-latency-data
       - name: Verify interpreter and dependency compatibility
         run: |
           python -m pip check
@@ -977,7 +1039,7 @@ jobs:
 
   engine-golden-regression:
     name: Engine Golden Regression
-    needs: [fast-ci, select-full-ci]
+    needs: [fast-ci, select-full-ci, op-latency-data]
     if: ${{ needs.select-full-ci.outputs.engine_golden_regression == 'true' }}
     # Builds from source with no NVIDIA-internal dependency; numerical
     # sentinels use checked-in expected values, so no full history is needed.
@@ -992,6 +1054,7 @@ jobs:
           python-version: "3.13"
       - name: Install AISim and development dependencies
         run: python -m pip install './python/aisim[dev]'
+      - uses: ./.github/actions/prefetch-op-latency-data
       - name: Run engine-step golden regression suite
         run: >-
           python -m pytest -q -rx -n 4
@@ -1077,7 +1140,7 @@ jobs:
       - run: release-smoke/bin/aiconfigurator version
 
   readme-commands:
-    needs: [verify-target, select-full-ci, fast-ci]
+    needs: [verify-target, select-full-ci, fast-ci, op-latency-data]
     if: ${{ needs.select-full-ci.outputs.readme_commands == 'true' }}
     uses: ./.github/workflows/readme-checks.yml
     permissions:
@@ -1095,6 +1158,7 @@ jobs:
       - verify-target
       - select-full-ci
       - fast-ci
+      - op-latency-data
       - platform-wheels
       - collector-data
       - prediction-regression
@@ -1157,6 +1221,14 @@ jobs:
                   invalid_outputs.append(f"{output}={selected!r}")
                   continue
               expected[job] = "success" if selected == "true" else "skipped"
+          # The data job runs exactly when one of the jobs that read operation tables does.
+          data_readers = (
+              "rust", "rust_feature_modes", "public_api_rust", "application_tests",
+              "python_compatibility", "engine_golden_regression", "collector_data", "readme_commands",
+          )
+          expected["op-latency-data"] = (
+              "success" if any(plan.get(output) == "true" for output in data_readers) else "skipped"
+          )
           failures = []
           summary = [
               f"### Full CI evidence for `{os.environ.get('GITHUB_SHA', 'local')}`",

@@ -91,7 +91,12 @@ def _dir_is_incomplete(path: str) -> bool:
 
 
 def _systems_data_root() -> str:
-    return os.path.join(REPO_ROOT, "src", "aisim_core", "systems", "data")
+    tools = os.path.join(REPO_ROOT, "tools", "perf_database")
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    from op_data_root import op_data_root
+
+    return str(op_data_root())
 
 
 def _legacy_data_dir(system: str, backend: str, backend_version: str) -> str:

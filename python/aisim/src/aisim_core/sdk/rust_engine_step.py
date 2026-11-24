@@ -21,7 +21,7 @@ import math
 import os
 import threading
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, fields
 from dataclasses import field as dataclass_field
 from importlib import resources as pkg_resources
@@ -260,14 +260,17 @@ class ForwardPassPerfModelConfig:
         )
         return cls(**json.loads(payload))
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, resolve_systems_paths: bool = True) -> dict[str, Any]:
+        """Wire form. ``resolve_systems_paths=False`` leaves an empty ``systems_paths`` for a dataset pin to fill."""
         payload = asdict(self)
         # Additive identity stays out of payloads that do not set it.
         for name in ("encoder_parallel", "deployment_limits", "afd_routing_location", "afd_pool_role"):
             if payload[name] is None:
                 payload.pop(name)
         payload["transfer_policy"] = _resolve_forward_pass_transfer_policy(self.transfer_policy)
-        if self.estimation_mode not in {"fpm_regression", "fpm_learned"} or self.systems_paths:
+        if resolve_systems_paths and (
+            self.estimation_mode not in {"fpm_regression", "fpm_learned"} or self.systems_paths
+        ):
             payload["systems_paths"] = _resolve_forward_pass_systems_paths(
                 self.systems_paths, require_directories=not _carries_state_snapshot(self.estimator_config)
             )
@@ -596,6 +599,8 @@ class RustForwardPassPerfModel:
         Iterations whose workload kind
         has no trained store return ``None``.
         """
+        # A learned artifact is self-contained: no operation tables are read, so the default dataset is neither
+        # resolved nor fetched here (a cold cache on an offline host must not break construction).
         _configure_default_data_roots()
         import aisim_core
 
@@ -1031,7 +1036,10 @@ def _ensure_dataset(config: ForwardPassPerfModelConfig | Mapping[str, Any], pin:
 
     if ensuring():  # the loader's own readiness check constructs a model from the prepared config
         return None
-    payload = config.to_dict() if isinstance(config, ForwardPassPerfModelConfig) else dict(config)
+    # Paths stay unresolved here: an empty list is for the pin to fill, not for the default dataset to answer first.
+    payload = (
+        config.to_dict(resolve_systems_paths=False) if isinstance(config, ForwardPassPerfModelConfig) else dict(config)
+    )
     if _carries_state_snapshot(payload.get("estimator_config")):
         return None  # a snapshot restores its own pinned inputs; a pin selecting other data would only conflict
     pin = pin if pin is not None else pin_from_environment()
@@ -1050,24 +1058,31 @@ def _names_systems_paths(config: ForwardPassPerfModelConfig | Mapping[str, Any])
     ``AICONFIGURATOR_SYSTEMS_PATH`` environment variable.
 
     Callers such as the Sweeper expand an unset ``systems_paths`` before construction, so the roots they hand over
-    may be that expansion rather than a choice. Only the packaged roots are a default: any other roots, however
+    may be that expansion rather than a choice. Only the default root is a default: any other roots, however
     they were set, outrank the source saved by ``aisim init``.
     """
     named = config.systems_paths if isinstance(config, ForwardPassPerfModelConfig) else config.get("systems_paths")
-    # The literal ``default`` token is an explicit request for the bundled tables, not an unset value.
+    # The literal ``default`` token is an explicit request for the default tables, not an unset value.
     if any(isinstance(entry, str) and entry.strip().lower() == "default" for entry in named or ()):
         return True
-    # An unset value expands to ``set_systems_paths``, then the environment variable, then the packaged roots.
-    roots = _resolve_forward_pass_systems_paths(tuple(named or ()), require_directories=False)
-    packaged = os.fspath(pkg_resources.files("aisim_core") / "systems")
-    # Default setup never writes this variable, so even an explicit packaged path is a caller choice.
-    return os.environ.get("AICONFIGURATOR_SYSTEMS_PATH") is not None or roots != [packaged]
+    # Default setup never writes this variable, so even an explicit default-root path is a caller choice.
+    if os.environ.get("AICONFIGURATOR_SYSTEMS_PATH") is not None:
+        return True
+    # An unset value expands to ``set_systems_paths`` or the default root. Compare without composing the default
+    # dataset: a saved source answers these runs, and offline hosts may have none cached.
+    if named:
+        roots = _resolve_forward_pass_systems_paths(tuple(named), require_directories=False)
+    else:
+        from aisim_core.sdk.perf_database import explicit_systems_paths
+
+        roots = explicit_systems_paths() or []
+    return bool(roots) and not _is_default_systems_roots(roots)
 
 
 def _forward_pass_config_json(config: ForwardPassPerfModelConfig | Mapping[str, Any]) -> str:
     payload = config.to_dict() if isinstance(config, ForwardPassPerfModelConfig) else dict(config)
     # ``to_dict`` already resolved a typed config's roots. Resolving them again would read an explicit ``default``
-    # (now the packaged path) as an expansion of unset roots and let AICONFIGURATOR_SYSTEMS_PATH replace it.
+    # (now the default root's path) as an expansion of unset roots and let AICONFIGURATOR_SYSTEMS_PATH replace it.
     if not isinstance(config, ForwardPassPerfModelConfig) and (
         payload.get("estimation_mode") not in {"fpm_regression", "fpm_learned"} or payload.get("systems_paths")
     ):
@@ -1112,23 +1127,48 @@ def _validate_worker_type(worker_type: str) -> str:
     return worker_type
 
 
-def _resolve_forward_pass_systems_paths(entries: tuple[str, ...], *, require_directories: bool = True) -> list[str]:
-    packaged = os.fspath(pkg_resources.files("aisim_core") / "systems")
-    if not entries:
-        from aisim_core.sdk.perf_database import get_systems_paths
+def _default_systems_root() -> str:
+    """The default systems root: composed (and, on a cold cache, fetched) from the pinned op-latency dataset on first
+    use. It is never the packaged ``aisim_core/systems`` directory, which holds no operation tables."""
+    from aisim_core.data.default_systems import default_systems_path
 
-        entries = tuple(get_systems_paths())
+    return default_systems_path()
+
+
+def _is_default_systems_roots(roots: Iterable[str]) -> bool:
+    """Whether ``roots`` are only the default root this process has already composed.
+
+    Never composes or downloads it: a root list that was not expanded from the default cannot equal a root this
+    process has not built, and a comparison must not make a custom root depend on the dataset cache.
+    """
+    from aisim_core.data.default_systems import resolved_default_systems_path
+
+    default = resolved_default_systems_path()
+    roots = tuple(roots)
+    return default is not None and bool(roots) and all(root == default for root in roots)
+
+
+def _resolve_forward_pass_systems_paths(entries: tuple[str, ...], *, require_directories: bool = True) -> list[str]:
     env_root = os.environ.get("AICONFIGURATOR_SYSTEMS_PATH")
-    # The packaged path alone can be a caller's expansion of unset roots; preserve the environment's choice. A literal
-    # ``default`` is an explicit request for the bundled data (the sweeper resolves it to the packaged path), so the
-    # environment variable never replaces it.
-    if env_root is not None and entries and all(entry == packaged for entry in entries):
+    if not entries:
+        from aisim_core.sdk import perf_database
+
+        # Unset roots follow the SDK's configured roots. With no override held, an environment root is used before
+        # the default dataset is composed (and, on a cold cache, fetched).
+        if env_root is not None and perf_database.explicit_systems_paths() is None:
+            entries = (env_root,)
+        else:
+            entries = tuple(perf_database.get_systems_paths())
+    if env_root is not None and _is_default_systems_roots(entries):
+        # The default root alone is a caller's expansion of unset roots; preserve the environment's choice. A literal
+        # ``default`` is an explicit request for the default data (the sweeper keeps the token), so it never equals
+        # the root and the environment variable never replaces it.
         entries = (env_root,)
     resolved: list[str] = []
     for entry in entries:
         if not isinstance(entry, str) or not entry.strip():
             raise ValueError("systems_paths entries must be nonempty strings")
-        path = packaged if entry.lower() == "default" else os.path.abspath(os.path.expanduser(entry))
+        path = _default_systems_root() if entry.lower() == "default" else os.path.abspath(os.path.expanduser(entry))
         if require_directories and not os.path.isdir(path):
             raise ValueError(f"forward-pass systems path is not a directory: {path}")
         if path not in resolved:
@@ -2148,7 +2188,8 @@ def _moe_quant_to_dtype(value: Any) -> str | None:
 
 def _configure_default_data_roots() -> None:
     # Pass default systems roots directly to the engine: persisting them in the environment would make
-    # a later best_available() mistake them for a caller choice and skip the saved init source.
+    # a later best_available() mistake them for a caller choice and skip the saved init source. This also keeps
+    # the default operation dataset from being composed (or fetched) before something needs it.
     if "AICONFIGURATOR_MODEL_CONFIGS_PATH" not in os.environ:
         model_configs_root = Path(str(pkg_resources.files("aisim_core") / "model_configs"))
         if model_configs_root.exists():

@@ -312,6 +312,23 @@ manual branch validation, launch standalone Fast CI first, as shown below.
 The gate reads Actions metadata with a read-only token; it does not dispatch
 another workflow or grant new release permissions.
 
+### Operation data
+
+Operation tables are not packaged; they come from the dataset revision pinned in
+`op_latency_pin.json`. Downloading that dataset (thousands of files) in every parallel
+Full CI job gets the runners rate limited by Hugging Face (HTTP 429) and the jobs time out,
+so one `Op-latency data` job downloads it once, with the read token in
+`HF_READ_AISIM_INFX_CACHE` and an anonymous retry, and uploads it as the `op-latency-data`
+artifact. It runs exactly when a job that reads operation tables is selected, and those jobs
+(`rust`, `rust-feature-modes`, `public-api-rust`, `application-tests`,
+`python-compatibility`, `engine-golden-regression`, `collector-data`, `readme-commands`) wait
+for it. The [prefetch action](../../.github/actions/prefetch-op-latency-data/action.yml)
+restores the artifact with
+[`op_latency_handoff.py`](../../scripts/ci/op_latency_handoff.py), then composes its systems
+root from the warm cache, verifying every file's hash; run outside Full CI, with no artifact,
+it downloads the dataset itself. `Full CI Success` requires the data job exactly when one of
+those jobs is selected.
+
 ### Component selection
 
 [The selector](../../scripts/ci/select_full_ci.py) uses the complete changed-file set
