@@ -713,6 +713,27 @@ impl RadixCache {
         compute_block_hash_for_seq(tokens, self.page_size)
     }
 
+    /// Keep the unmatched suffix's Belady age without changing native LRU.
+    /// The core reports the split during its existing walk; no extra scan or
+    /// copied page buffer is needed, even when the suffix is locked.
+    fn record_belady_split(&mut self, split: Option<(NodeId, i64)>) {
+        let (Some(belady), Some((node, access))) = (&mut self.belady, split) else {
+            return;
+        };
+        let idx = self.tree.arena.resolve(node).expect("live split suffix");
+        if let Some(&page) = self
+            .tree
+            .arena
+            .node(idx)
+            .device_value(FULL)
+            .as_slice()
+            .last()
+        {
+            // An earlier structural split may already carry an older age.
+            belady.retained_recency.entry(page).or_insert(access);
+        }
+    }
+
     #[cfg(test)]
     pub fn match_prefix(&mut self, key: &[u32]) -> (usize, NodeId) {
         let page_keys = self.page_hashes(key);
@@ -730,6 +751,7 @@ impl RadixCache {
             result.cache_actions.is_empty(),
             "Full-only device match unexpectedly produced cache actions"
         );
+        self.record_belady_split(result.unmatched_device_suffix);
         if let Some(belady) = &mut self.belady {
             // Only returned pages were accessed. An unmatched split suffix
             // receives a native LRU tick but keeps its Belady correction.
@@ -763,6 +785,7 @@ impl RadixCache {
             result.cache_actions.is_empty(),
             "Full-only device match unexpectedly produced cache actions"
         );
+        self.record_belady_split(result.unmatched_device_suffix);
         if let Some(belady) = &mut self.belady {
             // Only returned pages were accessed. An unmatched split suffix
             // receives a native LRU tick but keeps its Belady correction.
@@ -906,6 +929,7 @@ impl RadixCache {
                 track_adopted_ranges: false,
             },
         );
+        self.record_belady_split(result.unmatched_device_suffix);
         let last_node = result
             .last_device_node_id
             .expect("non-empty Full insert must end on a device node");
@@ -1158,17 +1182,21 @@ mod tests {
 
     #[rstest::rstest]
     fn scoped_review_belady_distinguishes_split_from_reached_suffix(
+        #[values(false, true)] prior_eviction: bool,
         #[values(false, true)] reach_suffix: bool,
         #[values(false, true)] checkpoint: bool,
         #[values("lookup", "locked_lookup", "insert")] access: &str,
     ) {
         let mut cache = RadixCache::new(4, 1);
         cache.set_belady_oracle(oracle_for_prompts(&[]));
-        let older = cache.page_pool.allocate(3).unwrap();
-        cache.insert(&[1, 2, 3], &older);
+        let older_key: &[u32] = if prior_eviction { &[1, 2, 3] } else { &[1, 2] };
+        let older = cache.page_pool.allocate(older_key.len()).unwrap();
+        cache.insert(older_key, &older);
         let newer = cache.page_pool.allocate(1).unwrap();
         cache.insert(&[9], &newer);
-        assert_eq!(cache.evict(1).1, vec![KvPageId(2)]);
+        if prior_eviction {
+            assert_eq!(cache.evict(1).1, vec![KvPageId(2)]);
+        }
         if checkpoint {
             cache = cache.admission_checkpoint();
         }
@@ -1200,7 +1228,7 @@ mod tests {
         }
         // Reaching only A1 must not make the unmatched A2 newer than B.
         let expected = if reach_suffix {
-            KvPageId(3)
+            KvPageId(newer[0])
         } else {
             KvPageId(1)
         };

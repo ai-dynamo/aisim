@@ -130,6 +130,9 @@ pub struct MatchResult<V: RadixValue> {
     /// Longest Full-KV prefix available on either device or host, independent
     /// of other components.
     pub full_kv_hit_length: usize,
+    /// Unmatched suffix created by a structural split, with its pre-access tick.
+    /// Observational metadata for adapter policies; native recency is unchanged.
+    pub unmatched_device_suffix: Option<(NodeId, i64)>,
     /// Actions for the controller to apply.
     pub cache_actions: Vec<CacheAction<V>>,
 }
@@ -195,6 +198,9 @@ pub struct InsertResult<V: RadixValue> {
     pub host_insert_dropped: bool,
     /// Incoming ranges retained by each component, in key-relative atom offsets.
     pub adopted_ranges: Option<HashMap<ComponentType, Vec<(usize, usize)>>>,
+    /// Unmatched suffix created by a structural split, with its pre-access tick.
+    /// Observational metadata for adapter policies; native recency is unchanged.
+    pub unmatched_device_suffix: Option<(NodeId, i64)>,
     /// Actions for the controller to apply.
     pub cache_actions: Vec<CacheAction<V>>,
 }
@@ -211,6 +217,7 @@ impl<V: RadixValue> Default for InsertResult<V> {
             inserted_host_node: None,
             host_insert_dropped: false,
             adopted_ranges: None,
+            unmatched_device_suffix: None,
             cache_actions: Vec::new(),
         }
     }
@@ -1372,8 +1379,9 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             best_match_device_value_len,
             full_kv_hit_length,
             action,
+            unmatched_device_suffix,
         ) = self.match_prefix_helper_(root_id, params.namespace, key, aligned_key_len);
-        self.match_post_processor_(
+        let mut result = self.match_post_processor_(
             params,
             root_id,
             value,
@@ -1382,7 +1390,9 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             best_match_device_value_len,
             full_kv_hit_length,
             action,
-        )
+        );
+        result.unmatched_device_suffix = unmatched_device_suffix;
+        result
     }
 
     /// Length of the longest device-resident Full-KV prefix of `key`, read-only:
@@ -1465,6 +1475,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         usize,
         usize,
         Option<CacheAction<V>>,
+        Option<(NodeId, i64)>,
     ) {
         // Non-HiCache mode has only device-resident matches, so the scheduler
         // device anchor follows the best match. In HiCache mode, host-backed
@@ -1479,6 +1490,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         let mut best_match_device_value_len = 0;
         let mut full_kv_hit_length = 0;
         let mut action: Option<CacheAction<V>> = None;
+        let mut unmatched_device_suffix = None;
         let separate_device_match = self.enable_hicache;
         let mut validators = Vec::with_capacity(self.components.len());
         let mut device_validators = if separate_device_match {
@@ -1550,6 +1562,9 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             let prefix_len = key.match_len(offset, &child.key, self.page_size);
             full_kv_hit_length += prefix_len;
             if prefix_len < child.key.atom_len() {
+                if child.has_device_value(FULL) {
+                    unmatched_device_suffix = Some((child.id, child.last_access_counter));
+                }
                 let (split_node_id, split_action) = self.split_node_(child_id, prefix_len);
                 node_id = split_node_id;
                 action = split_action;
@@ -1596,6 +1611,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             best_match_device_value_len,
             full_kv_hit_length,
             action,
+            unmatched_device_suffix,
         )
     }
 
@@ -1663,6 +1679,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             swa_host_hit_length: 0,
             swa_branching_seqlen: None,
             full_kv_hit_length,
+            unmatched_device_suffix: None,
             cache_actions: Vec::new(),
         };
         // Finalize Full first regardless of component registration order.
@@ -1702,6 +1719,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             full_kv_hit_length: 0,
             mamba_host_hit_length: 0,
             mamba_branching_seqlen: None,
+            unmatched_device_suffix: None,
             cache_actions: Vec::new(),
         }
     }
@@ -2005,6 +2023,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                     .swa_branching_seqlen
                     .is_some_and(|boundary| aligned_key_len >= boundary),
                 adopted_ranges: params.track_adopted_ranges.then(HashMap::new),
+                unmatched_device_suffix: None,
                 cache_actions: Vec::new(),
             };
             if aligned_key_len > 0
@@ -2022,6 +2041,15 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                     &mut result,
                     &mut prefix_actions,
                 );
+            }
+            if aligned_key_len > 0
+                && self.needs_backup_after_existing_insert_(prefix_node_idx)
+                && !prefix_actions.iter().any(|action| matches!(action,
+                    CacheAction::BackupKV(backup) if backup.node_ids.contains(&self.arena.node(prefix_node_idx).id)))
+            {
+                prefix_actions.push(CacheAction::BackupKV(self.build_backup_kv_action_(
+                    self.arena.node(prefix_node_idx), false,
+                )));
             }
             return Ok(InsertStepResult {
                 actions: prefix_actions,
@@ -2274,10 +2302,18 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             return;
         };
         let mut node_id = child_id;
+        let prior_access = self.arena.node(node_id).last_access_counter;
         self.touch_node_(node_id);
         let node = self.arena.node(node_id);
         let prefix_len = state.key.match_len(local_cursor, &node.key, self.page_size);
         if prefix_len < node.key.atom_len() {
+            if node.has_device_value(FULL) {
+                state
+                    .result
+                    .as_mut()
+                    .expect("insert result exists during the walk")
+                    .unmatched_device_suffix = Some((node.id, prior_access));
+            }
             let (split_node_id, action) = self.split_node_(node_id, prefix_len);
             node_id = split_node_id;
             if let Some(action) = action {
@@ -2491,6 +2527,10 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             return self.inc_hit_count_and_check_(target_node_id, state.chunked);
         }
 
+        self.needs_backup_after_existing_insert_(target_node_id)
+    }
+
+    fn needs_backup_after_existing_insert_(&self, target_node_id: NodeIdx_) -> bool {
         let node = self.arena.node(target_node_id);
         self.enable_hicache
             && node.backuped()
@@ -3994,6 +4034,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 mamba_exist: true,
                 swa_branch_inserted: false,
                 adopted_ranges: None,
+                unmatched_device_suffix: None,
                 cache_actions: Vec::new(),
             });
         }
@@ -4035,6 +4076,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             mamba_exist: false,
             swa_branch_inserted: false,
             adopted_ranges: None,
+            unmatched_device_suffix: None,
             cache_actions,
         };
         if matched_length == total_len {
@@ -4220,7 +4262,21 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             )
     }
 
+    /// Acknowledgments are keyed by anchor, so it may own only one pending
+    /// Full load-back. Rejected operations must not be acknowledged.
+    fn validate_load_back_not_pending_(
+        &self,
+        node_id: NodeIdx_,
+    ) -> Result<(), TreeCoreRuntimeError> {
+        let node = self.arena.node(node_id);
+        if node.load_back_pending_id == Some(node.id) {
+            return Err(TreeCoreRuntimeError::LoadBackAlreadyPending { node_id: node.id });
+        }
+        Ok(())
+    }
+
     /// Build the H->D load-back KV transfer plus per-component aux transfers.
+    /// An anchor with a pending Full load-back must be acknowledged before reuse.
     pub fn build_load_back_spec(
         &self,
         node_id: NodeId,
@@ -4234,6 +4290,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     > {
         let anchor_id = node_id;
         let node_id = self.arena.resolve(node_id)?;
+        self.validate_load_back_not_pending_(node_id)?;
         // Component hooks take primitives, not Req: extract its fields here.
         let mamba_pool_idx = req.and_then(|r| r.mamba_pool_idx.as_ref());
         let mut kv_transfers = self
@@ -4683,6 +4740,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     ) -> Result<Vec<CacheAction<V>>, TreeCoreRuntimeError> {
         let anchor_id = node_id;
         let node_id = self.arena.resolve(node_id)?;
+        self.validate_load_back_not_pending_(node_id)?;
         let loaded_node_indices = kv_xfer
             .nodes_to_load
             .iter()
@@ -5945,14 +6003,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     /// Whether the node is currently eligible as a Full device leaf.
     pub fn inspect_is_device_leaf(&self, node_id: NodeId) -> Result<bool, NodeAccessError> {
         let node_id = self.arena.resolve(node_id)?;
-        let node = self.arena.node(node_id);
-        if node.is_root() || node.evicted() || node.is_device_locked() {
-            return Ok(false);
-        }
-        Ok(!node
-            .children
-            .values()
-            .any(|&child_id| self.arena.has_device_value(child_id, FULL)))
+        Ok(self.is_evictable_device_leaf_(self.arena.node(node_id)))
     }
 
     /// Materialize every live tree node handle.

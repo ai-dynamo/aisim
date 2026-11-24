@@ -541,6 +541,11 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for FullComponent {
                             tree_core.inc_evictable_size(FULL, n_len);
                         }
                         tree_core.update_evictable_leaf_sets_(loaded_idx);
+                        if tree_core.evictable_device_leaves.contains(loaded_idx) {
+                            // A write-through restore may expose a victim after
+                            // an active Full walk built its candidate heap.
+                            tree_core.full_evict_device_heap_dirty = true;
+                        }
                         if let Some(parent) = tree_core.arena.node(loaded_idx).try_parent() {
                             tree_core.update_evictable_leaf_sets_(parent);
                         }

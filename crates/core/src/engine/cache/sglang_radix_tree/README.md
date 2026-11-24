@@ -47,6 +47,21 @@ The mechanical modifications are:
 After those adaptations, `scripts/sglang_radix_core_fixes.patch` applies the
 following local corrections to this pinned revision:
 
+- Apply the existing-target terminal backup predicate after empty continuations
+  adopt Mamba checkpoints. Emit only one backup for a retained anchor and keep
+  empty roots and already-backed checkpoints as no-backup cases.
+- Serialize Full load-backs per anchor, rejecting planning or commit while its
+  earlier Full source pin is pending. A rejected operation has no acknowledgment;
+  retry only after the owning operation is acknowledged.
+- Refresh an active Full eviction heap when a write-through restore exposes an
+  eligible leaf, and use the production eligibility predicate for inspection.
+- Report an unmatched split suffix's pre-access tick in match/insert results.
+  Belady records that tick at the physical tail, including on the first partial
+  access before any eviction; an actual suffix access clears the correction.
+  This adds constant-size result metadata without another traversal, copied
+  page buffer, or change to native LRU ticks or split behavior. Saved tail
+  corrections remain bounded by resident physical pages and are removed on
+  real accesses or physical frees.
 - Refresh an active Full eviction walk after load-back acknowledgments and
   final auxiliary host-lock releases expose eligible leaves. Keep normal
   eviction's incremental parent insertion.

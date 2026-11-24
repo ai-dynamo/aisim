@@ -756,6 +756,9 @@ pub enum TreeCoreRuntimeError {
         node_id: NodeId,
         component_type: ComponentType,
     },
+    /// The anchor already owns an unacknowledged Full load-back.
+    #[error("Full load-back already pending for node {node_id}")]
+    LoadBackAlreadyPending { node_id: NodeId },
     /// Full load-back no longer describes the planned host-to-device mapping.
     #[error("stale or malformed Full load-back spec for node {node_id}")]
     InvalidLoadBackSpec { node_id: NodeId },
