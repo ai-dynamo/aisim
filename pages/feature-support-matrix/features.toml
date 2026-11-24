@@ -186,7 +186,7 @@ detail = "Host memory pool across workers"
 doc = "replay/engine/kv-cache.md#g2-scope"
 # KVCR shares G2 through peer fetch; it rejects the cluster_shared pool scope.
 cells = ["limited", "not_supported", "not_supported", "limited:peer fetch", "na", "na"]
-note = "A shared pool needs matching geometry on every role. With canonical MTP, only prefill and decode workers take a shared pool. KVCR pulls need router hints (CLI traffic has none; KVCR-owned memory and disk, kvcr.local_g2 and kvcr.g3, work without), aggregated or P/D prefill pools, no g3_offload."
+note = "A shared pool needs matching geometry on every role. KVCR pulls need router hints (CLI traffic has none; KVCR-owned memory and disk, kvcr.local_g2 and kvcr.g3, work without), aggregated or P/D prefill pools, no g3_offload."
 
 [[sections.rows]]
 name = "G3 local"
@@ -275,7 +275,7 @@ name = "G2 host offload"
 doc = "replay/engine/kv-cache.md#agentic-g2"
 # crates/core/src/python.rs agentic host-offload checks.
 cells = ["limited", "not_supported", "not_supported"]
-note = "Static workers of any count and attention DP, local or shared pool; canonical MTP (local pool on an aggregated worker), MTP on a hybrid G2, or no speculation; no G3."
+note = "Static workers of any count and attention DP, local or shared pool; canonical MTP, MTP on a hybrid G2, or no speculation; no G3."
 
 [[sections.rows]]
 name = "G3 offload, KVCR"
