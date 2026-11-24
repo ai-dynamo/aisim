@@ -12,6 +12,7 @@ import json
 import logging
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -1334,6 +1335,51 @@ class TestHybridMoEModelBuilder:
 class TestGetModelConfigFromHFID:
     """Test getting model config from HuggingFace ID."""
 
+    @pytest.fixture(autouse=True)
+    def clear_config_caches(self):
+        utils._load_model_config_from_model_path.cache_clear()
+        get_model_config_from_model_path.cache_clear()
+        yield
+        utils._load_model_config_from_model_path.cache_clear()
+        get_model_config_from_model_path.cache_clear()
+
+    @pytest.fixture
+    def remote_checkpoint(self, monkeypatch):
+        """Synthetic metadata served through the real downloader, without network I/O."""
+        state = SimpleNamespace(
+            config={
+                "architectures": ["LlamaForCausalLM"],
+                "num_hidden_layers": 2,
+                "hidden_size": 256,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "intermediate_size": 512,
+                "vocab_size": 1024,
+                "max_position_embeddings": 2048,
+            },
+            sidecar=None,
+            error=None,
+            requests=[],
+        )
+
+        def fetch(request, *, timeout):
+            filename = request.full_url.rsplit("/", 1)[1]
+            state.requests.append(filename)
+            if filename == "config.json":
+                return io.BytesIO(json.dumps(state.config).encode())
+            assert filename == "hf_quant_config.json"
+            if state.error == "malformed":
+                return io.BytesIO(b"{")
+            if state.error is not None:
+                raise state.error
+            if state.sidecar is None:
+                raise HTTPError(request.full_url, 404, "Not Found", {}, None)
+            return io.BytesIO(json.dumps(state.sidecar).encode())
+
+        monkeypatch.setattr(utils, "_get_hf_auth_headers", lambda: {})
+        monkeypatch.setattr(utils.urllib.request, "urlopen", fetch)
+        return state
+
     @patch("aisim.sdk.utils._download_hf_json")
     @patch("aisim.sdk.utils._download_hf_config")
     def test_successful_download(self, mock_download, mock_download_quant):
@@ -1358,6 +1404,61 @@ class TestGetModelConfigFromHFID:
 
         assert result["architecture"] == "LlamaForCausalLM"  # architecture
         mock_download.assert_called_once_with(model_id)
+
+    @pytest.mark.parametrize("failure", ["timeout", "connection", "unauthorized", "server", "malformed"])
+    def test_sidecar_failure_is_not_cached_and_retry_recovers_fp8(self, remote_checkpoint, failure):
+        remote_checkpoint.error = {
+            "timeout": TimeoutError("sidecar timed out"),
+            "connection": URLError("connection reset"),
+            "unauthorized": HTTPError("https://example.invalid", 401, "Unauthorized", {}, None),
+            "server": HTTPError("https://example.invalid", 500, "Server Error", {}, None),
+            "malformed": "malformed",
+        }[failure]
+        model_id = "nvidia/Llama-3.1-70B-Instruct-FP8"
+        with pytest.raises(utils.HuggingFaceDownloadError, match="hf_quant_config.json"):
+            get_model_config_from_model_path(model_id)
+        assert utils._load_model_config_from_model_path.cache_info().currsize == 0
+        assert get_model_config_from_model_path.cache_info().currsize == 0
+
+        remote_checkpoint.error = None
+        remote_checkpoint.sidecar = {"quantization": {"quant_algo": "FP8", "kv_cache_quant_algo": "FP8"}}
+        result = get_model_config_from_model_path(model_id)
+        assert result["raw_config"]["quant_algo"] == "fp8"
+        from aisim.sdk.models import _infer_quant_modes_from_raw_config
+
+        modes = _infer_quant_modes_from_raw_config(result["raw_config"])
+        assert modes["gemm_quant_mode"] is common.GEMMQuantMode.fp8_static
+        assert modes["kvcache_quant_mode"] is common.KVCacheQuantMode.fp8
+        assert get_model_config_from_model_path(model_id) is result
+        assert remote_checkpoint.requests == ["config.json", "hf_quant_config.json"] * 2
+
+    def test_optional_sidecar_404_preserves_unquantized_config(self, remote_checkpoint):
+        result = get_model_config_from_model_path("acme/Synthetic-Unquantized")
+        assert result["architecture"] == "LlamaForCausalLM"
+        assert "quant_algo" not in result["raw_config"]
+
+    def test_required_sidecar_404_fails_without_caching(self, remote_checkpoint):
+        model_id = "nvidia/Llama-3.1-70B-Instruct-FP8"
+        with pytest.raises(ValueError, match="requires quantization metadata.*hf_quant_config.json"):
+            get_model_config_from_model_path(model_id)
+        assert utils._load_model_config_from_model_path.cache_info().currsize == 0
+        assert get_model_config_from_model_path.cache_info().currsize == 0
+        remote_checkpoint.sidecar = {"quantization": {"quant_algo": "FP8"}}
+        assert get_model_config_from_model_path(model_id)["raw_config"]["quant_algo"] == "fp8"
+
+    def test_required_sidecar_can_be_replaced_by_inline_precision(self, remote_checkpoint):
+        remote_checkpoint.config["quantization_config"] = {"quant_method": "fp8"}
+        result = get_model_config_from_model_path("nvidia/Llama-3.1-70B-Instruct-FP8")
+        assert result["raw_config"]["quant_algo"] == "fp8"
+
+    def test_local_identified_fp8_checkpoint_requires_precision(self, remote_checkpoint, tmp_path):
+        remote_checkpoint.config["_name_or_path"] = "nvidia/Llama-3.1-70B-Instruct-FP8"
+        (tmp_path / "config.json").write_text(json.dumps(remote_checkpoint.config))
+        with pytest.raises(ValueError, match="requires quantization metadata"):
+            get_model_config_from_model_path(str(tmp_path))
+        (tmp_path / "hf_quant_config.json").write_text(json.dumps({"quantization": {"quant_algo": "FP8"}}))
+        assert get_model_config_from_model_path(str(tmp_path))["raw_config"]["quant_algo"] == "fp8"
+        assert remote_checkpoint.requests == []
 
 
 class TestSafeMkdir:

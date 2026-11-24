@@ -152,6 +152,16 @@ For offline Llama 4 Scout and Maverick use, the local directory must contain
 metadata in a neighboring `preprocessor_config.json`. Parsing requires one of
 these forms; a quantization sidecar does not replace the processor metadata.
 
+Local Kimi-K3 configurations on Blackwell SGLang select the MXFP4/MXFP8 MoE
+profile from their architecture and expert quantization metadata, just like
+the Hugging Face checkpoint. Missing expert quantization metadata requires an
+explicit `moe_quant_mode`; the directory name does not establish precision.
+For `nvidia/Llama-3.1-70B-Instruct-FP8`, quantization must be declared inline
+or supplied in `hf_quant_config.json`. Local copies retaining that ID in
+`_name_or_path` receive the same validation. Sidecar download errors propagate
+and can be retried; a 404 is optional only when the checkpoint does not require
+the sidecar to establish its precision.
+
 ### Configuration license approval gate
 
 `python-compliance` now runs `scripts/ci/check_config_license_approvals.py` before installing dependencies in Full CI and every nightly architecture/Python job. Full CI's metadata-only license job uses GitHub-hosted Ubuntu 24.04, so license decisions do not wait for the dedicated native-build runner pool. Nightly architecture/Python checks retain their build environments. It applies even when a PR's wheel/test components are N/A. A failure blocks dependent wheel/staging jobs and `Full CI Success`; nightly publication also remains gated. The findings JSON is uploaded with `always()` as `config-license-approval` (nightlies append the architecture and Python version). There is no `continue-on-error` or legacy UNKNOWN exception in this approval gate.

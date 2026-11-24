@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Optional
 from aisim_core.sdk import common, config
 from aisim_core.sdk.utils import (
     _get_language_quantization_config,
+    _load_model_config_from_model_path,
     _normalize_quant_algo,
     get_model_config_from_model_path,
     parse_compressed_tensors_quant,
@@ -1175,13 +1176,25 @@ def resolve_kimi_k3_moe_arch_mode(
     ``w4a16_mxfp4`` label is already correct there, so this returns None and
     the HF auto-inference stands.
     """
-    if backend_name != "sglang":
-        return None
-    if model_path != "moonshotai/Kimi-K3":
+    if backend_name != "sglang" or not model_path:
         return None
     from aisim_core.sdk.perf_database import is_blackwell_system
 
-    if is_blackwell_system(system_name):
+    if not is_blackwell_system(system_name):
+        return None
+    # Use the cached checkpoint metadata, not its repository/directory name:
+    # a local copy and a remote checkpoint must select the same measured lane.
+    raw = _load_model_config_from_model_path(model_path)
+    architecture = (raw.get("architectures") or [None])[0]
+    if architecture != "KimiK3ForConditionalGeneration":
+        return None
+    if not raw.get("quant_algo"):
+        raise ValueError(
+            "Kimi-K3 on Blackwell SGLang requires expert quantization metadata in "
+            "config.json or hf_quant_config.json, or an explicit moe_quant_mode"
+        )
+    mode = _infer_quant_modes_from_raw_config(raw, architecture).get("moe_quant_mode")
+    if mode == common.MoEQuantMode.w4a16_mxfp4:
         return common.MoEQuantMode.w4a8_mxfp4_mxfp8
     return None
 

@@ -1166,7 +1166,7 @@ class Task:
                         self._role_attr(role, "backend_name"),
                         self.moe_backend,
                     )
-                    if arch_mode is None:
+                    if arch_mode is None and explicit is None:
                         arch_mode = resolve_kimi_k3_moe_arch_mode(
                             self._role_attr(role, "model_path"),
                             self._role_attr(role, "system_name"),

@@ -1960,22 +1960,27 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
     # Check if it's a local path
     if os.path.isdir(model_path):
         config = _attach_llama4_processor_config(_load_local_config(model_path), model_path)
-        return _attach_inferred_quant_fields(_attach_hf_quant_config(config, _load_local_quant_config(model_path)))
-
-    # Otherwise treat as HuggingFace path
-    if model_path in DefaultHFModels:
+        hf_quant_config = _load_local_quant_config(model_path)
+    elif model_path in DefaultHFModels:
         config = _attach_llama4_processor_config(_load_pre_downloaded_hf_config(model_path), model_path)
-        return _attach_inferred_quant_fields(
-            _attach_hf_quant_config(config, _load_pre_downloaded_hf_quant_config(model_path))
-        )
-
-    config = _attach_llama4_processor_config(_download_hf_config(model_path), model_path)
-    try:
+        hf_quant_config = _load_pre_downloaded_hf_quant_config(model_path)
+    else:
+        config = _attach_llama4_processor_config(_download_hf_config(model_path), model_path)
+        # Only an actual 404 means the optional sidecar is absent. Transport,
+        # access, and parse errors must propagate so incomplete configs cannot
+        # enter either model-config cache and a later retry can recover.
         hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False)
-    except Exception as exc:  # best-effort for optional quant config
-        logger.debug("Failed to download hf_quant_config.json for %s: %s", model_path, exc)
-        hf_quant_config = None
-    return _attach_inferred_quant_fields(_attach_hf_quant_config(config, hf_quant_config))
+
+    config = _attach_inferred_quant_fields(_attach_hf_quant_config(config, hf_quant_config))
+    sidecar_checkpoint = "nvidia/Llama-3.1-70B-Instruct-FP8"
+    if (model_path == sidecar_checkpoint or config.get("_name_or_path") == sidecar_checkpoint) and not config.get(
+        "quant_algo"
+    ):
+        raise ValueError(
+            f"{sidecar_checkpoint} requires quantization metadata: supply hf_quant_config.json "
+            "or declare quantization_config in config.json"
+        )
+    return config
 
 
 @cache
