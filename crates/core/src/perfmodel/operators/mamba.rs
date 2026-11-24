@@ -316,47 +316,48 @@ impl KdaOp {
         batch_size: f64,
         seq_len: f64,
     ) -> Result<f64, AicError> {
-        // The analytic byte model below is qualified only for FP32 recurrent
-        // state. vLLM's explicit BF16 override must not inherit that width.
-        // Its `auto` setting resolves to FP32 (KimiK3DeltaAttention.get_state_dtype
-        // -> MambaStateDtypeCalculator.kda_state_dtype at the audited runtime).
-        if !matches!(
-            self.recurrent_state_dtype.as_deref(),
-            Some("float32" | "auto")
-        ) {
+        // The profile binder resolves auto to float32 only for audited runtime
+        // evidence. An unresolved setting has no qualified state byte width.
+        if self.recurrent_state_dtype.as_deref() != Some("float32") {
             return Err(AicError::SolNotImplemented(format!(
                 "forward_model='fpm' KDA SOL requires observed float32 recurrent state; got {:?}; use direct interpolation",
                 self.recurrent_state_dtype
             )));
         }
-        if !matches!(
-            self.kernel_source.as_str(),
-            "causal_conv1d_fn_qkv3"
-                | "causal_conv1d_update"
-                | "chunk_kda"
-                | "chunk_kda_with_fused_gate"
-                | "flashkda_fwd"
-                | "fused_recurrent_kda_packed_decode"
-                | "fused_kda_decode"
-                | "fused_recurrent_kda"
-                | "fused_sigmoid_gating_delta_rule_update"
-                | "fused_kda_decode_mtp_dspark"
-                | "kda_fused_decode"
-        ) {
-            return Err(AicError::SolNotImplemented(format!(
-                "forward_model='fpm' KDA SOL has no byte model for kernel {:?}",
-                self.kernel_source
-            )));
-        }
-        let seq_len = match self.phase.as_str() {
-            "context" => seq_len,
-            "generation" => 0.0,
+        let kernel = self.kernel_source.as_str();
+        let (seq_len, supported) = match self.phase.as_str() {
+            "context" => (
+                seq_len,
+                matches!(
+                    kernel,
+                    "causal_conv1d_fn_qkv3"
+                        | "chunk_kda"
+                        | "chunk_kda_with_fused_gate"
+                        | "flashkda_fwd"
+                ),
+            ),
+            "generation" => (
+                0.0,
+                matches!(
+                    kernel,
+                    "causal_conv1d_update"
+                        | "fused_recurrent_kda_packed_decode"
+                        | "fused_kda_decode"
+                        | "kda_fused_decode"
+                ),
+            ),
             phase => {
                 return Err(AicError::SolNotImplemented(format!(
                     "forward_model='fpm' KDA SOL supports autoregressive context/generation, got {phase:?}"
                 )));
             }
         };
+        if !supported {
+            return Err(AicError::SolNotImplemented(format!(
+                "forward_model='fpm' KDA SOL has no byte model for kernel {kernel:?} in phase {:?}",
+                self.phase
+            )));
+        }
         Ok(
             self.sol_latency_ms_with(db, &self.kernel_source, batch_size, seq_len)
                 * self.scale_factor,
@@ -789,7 +790,13 @@ mod tests {
             ("generation", "fused_kda_decode"),
         ] {
             let mut op = kda_op(kernel, phase, 0);
-            for dtype in [None, Some("bfloat16"), Some("float16"), Some("invalid")] {
+            for dtype in [
+                None,
+                Some("bfloat16"),
+                Some("float16"),
+                Some("auto"),
+                Some("invalid"),
+            ] {
                 op.recurrent_state_dtype = dtype.map(str::to_owned);
                 let error = op.fpm_sol_latency_ms(&db, 2.0, 65.5).unwrap_err();
                 assert!(matches!(error, AicError::SolNotImplemented(_)));
@@ -797,8 +804,25 @@ mod tests {
             }
             op.recurrent_state_dtype = Some("float32".into());
             let fp32 = op.fpm_sol_latency_ms(&db, 2.0, 65.5).unwrap();
-            op.recurrent_state_dtype = Some("auto".into());
-            assert_eq!(op.fpm_sol_latency_ms(&db, 2.0, 65.5).unwrap(), fp32);
+            assert!(fp32 > 0.0);
+        }
+    }
+
+    #[test]
+    fn fpm_kda_sol_rejects_verify_only_and_cross_phase_kernels() {
+        let systems_root = crate::test_systems::path("");
+        let db = PerfDatabase::load(&systems_root, "gb300", "sglang", "0.5.14").unwrap();
+        for (phase, kernel) in [
+            ("generation", "fused_kda_decode_mtp_dspark"),
+            ("generation", "fused_recurrent_kda"),
+            ("generation", "fused_sigmoid_gating_delta_rule_update"),
+            ("context", "fused_kda_decode"),
+            ("generation", "flashkda_fwd"),
+        ] {
+            let error = kda_op(kernel, phase, 0)
+                .fpm_sol_latency_ms(&db, 1.0, 64.0)
+                .unwrap_err();
+            assert!(matches!(error, AicError::SolNotImplemented(_)));
         }
     }
 
@@ -833,7 +857,10 @@ mod tests {
                 fused.sol_total_bytes(b, 0.0),
                 conv.sol_total_bytes(b, 0.0) + recurrence.sol_total_bytes(b, 0.0)
             );
-            assert_eq!(vllm.sol_total_bytes(b, 0.0), fused.sol_total_bytes(b, 0.0));
+            // Per sequence: two FP32 16x128x128 states plus 5 BF16
+            // projections of 2048 elements = 2,117,632 bytes. A four-tap
+            // update reads five and writes one BF16 value on 3x2048 channels.
+            assert_eq!(vllm.sol_total_bytes(b, 0.0), b * (2_117_632.0 + 73_728.0));
         }
     }
 

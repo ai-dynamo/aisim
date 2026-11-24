@@ -1468,17 +1468,19 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(
                 # Independent hand ledger, in ms on H200 (HBM=4.8e12 B/s,
                 # link=450e9 B/s), summed from this fixture's graph geometry:
                 # batch        other ops          KDA       DSA FlashMLA / TRT
-                #   1       5.236040377777778    .02283072    .49082880 / .49000960
-                #   3       6.543375746666666    .06849216    .49763446 / .49599646
-                #   4       7.197043431111110    .09132288    .49768448 / .49604608
+                #   1       5.236040377777778    .02362560    .50655744 / .50573824
+                #   3       6.543375746666666    .07087680    .51336310 / .51172510
+                #   4       7.197043431111110    .09450240    .51341312 / .51177472
                 # Other ops sum memory-bound GEMMs (2*(b*n+b*k+n*k) bytes),
                 # routed MoE (0.5*(16*b*3584*2+16*b*3072*3/8
                 # +3584*3072*3/8*16*b) bytes per MoE layer), embedding/norm
                 # byte counts and ring allreduces (4*b*hidden*7/8/link seconds),
                 # with the model's layer multiplicities; PP1 costs zero.
-                # KDA: 69 layers * b*(10*1536+2*12*128*128*4) bytes / HBM.
-                # DSA: 24*(96272384+132*b*s+entry*b*min(s,2048)+9216*b)
-                # bytes / HBM, s=floor(4096/b), entry=656 (FlashMLA) or 576
+                # KDA: 69 layers * b*(10*1536+2*12*128*128*4+3*1536*6*2) bytes / HBM.
+                # The last term is the fused four-tap BF16 convolution update.
+                # DSA: 24*(96272384+3145728+132*b*s+entry*b*min(s,2048)+9216*b)
+                # bytes / HBM, including 3,145,728 absorbed-BMM weight bytes.
+                # s=floor(4096/b), entry=656 (FlashMLA) or 576
                 # (TRT). This extends the independent projection/cache ledger
                 # in perf_database/dsa.rs::kimi_k31_fp8_sol_uses_executed_cache_layout.
                 # All terms above convert seconds to ms with *1000.
@@ -1489,8 +1491,8 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(
                 # A plain latency interpolation, omitted KDA roofline, or a
                 # shared DSA cache layout cannot satisfy these values.
                 expected_transfer = {
-                    "flashmla": 15.947864475987338,
-                    "trtllm_mla": 15.947446285187084,
+                    "flashmla": 15.949110703911963,
+                    "trtllm_mla": 15.948693797344529,
                 }
                 assert transferred == pytest.approx(expected_transfer[attention_backend], rel=1e-10)
             # Direct interpolation never asks for a KDA roofline, even with
