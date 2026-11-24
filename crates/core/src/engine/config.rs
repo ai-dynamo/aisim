@@ -2284,11 +2284,6 @@ impl EngineConfig {
                     "native_host_offload with MTP requires async_scheduling=false"
                 );
                 ensure!(
-                    host_offload.scope == G2Scope::DpRankLocal
-                        || self.worker_type != WorkerType::Aggregated,
-                    "native_host_offload with aic_nextn on an aggregated worker requires dp_rank_local scope"
-                );
-                ensure!(
                     self.g3_offload.is_none(),
                     "native_host_offload with aic_nextn does not support g3_offload"
                 );
@@ -3861,15 +3856,6 @@ mod tests {
                     config.async_scheduling = Some(true);
                 },
                 "requires async_scheduling=false",
-            ),
-            (
-                |config| {
-                    set_canonical_mtp(config, 2);
-                    let host = config.native_host_offload.as_mut().unwrap();
-                    host.scope = G2Scope::ClusterShared;
-                    host.kv_layout_id = Some("test-layout".into());
-                },
-                "requires dp_rank_local scope",
             ),
             (
                 |config| {
