@@ -132,6 +132,22 @@ pub struct TrafficSpec {
     pub(crate) synthetic_arrival_speedup_ratio: Option<f64>,
 }
 
+impl TrafficSpec {
+    /// The simulated time at which the replay stops, when the traffic sets one.
+    pub fn max_sim_time_ms(&self) -> Option<f64> {
+        self.max_sim_time_ms
+    }
+
+    /// The trace files the traffic reads; empty for synthetic input.
+    pub fn trace_paths(&self) -> Vec<PathBuf> {
+        if self.trace_paths.is_empty() {
+            self.trace_path.iter().map(PathBuf::from).collect()
+        } else {
+            self.trace_paths.iter().map(PathBuf::from).collect()
+        }
+    }
+}
+
 /// Options the caller chooses when building a workload.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -143,6 +159,9 @@ pub struct TrafficBuildOptions {
     /// trace must also pass the driver's load-mode validation, such as a first
     /// arrival timestamp for every session under open-loop load.
     pub replay_hashes: bool,
+    /// The role and replica count whose KV capacity sizes a
+    /// `kv_capacity_fraction` load. Other load types ignore it.
+    pub kv_capacity: Option<(ReplayRoleConfig, usize)>,
 }
 
 impl TrafficBuildOptions {
@@ -150,7 +169,13 @@ impl TrafficBuildOptions {
         Self {
             engine_block_size,
             replay_hashes: true,
+            kv_capacity: None,
         }
+    }
+
+    pub fn with_kv_capacity(mut self, role: ReplayRoleConfig, replicas: usize) -> Self {
+        self.kv_capacity = Some((role, replicas));
+        self
     }
 
     pub fn without_replay_hashes(mut self) -> Self {
@@ -165,6 +190,10 @@ pub struct BuiltTraffic {
     pub input: ReplayRuntimeInput,
     /// The timestamp basis a Weka trace resolved to, for Weka input.
     pub weka_nested_timestamp_basis: Option<WekaResolvedTimestampBasis>,
+    /// The closed-loop cap the workload runs under: `replay_concurrency` for
+    /// a trace, otherwise `concurrency`, including one sized from KV capacity.
+    /// `None` for open-loop traffic.
+    pub max_in_flight: Option<usize>,
 }
 
 impl BuiltTraffic {
@@ -172,6 +201,7 @@ impl BuiltTraffic {
         Self {
             input,
             weka_nested_timestamp_basis: None,
+            max_in_flight: None,
         }
     }
 }
@@ -186,16 +216,7 @@ fn require_agentic_execution_model(traffic: &TrafficSpec) -> Result<&str> {
 }
 
 fn runtime_paths(traffic: &TrafficSpec) -> Result<Vec<PathBuf>> {
-    let mut paths = traffic
-        .trace_paths
-        .iter()
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    if paths.is_empty()
-        && let Some(path) = traffic.trace_path.as_deref()
-    {
-        paths.push(PathBuf::from(path));
-    }
+    let paths = traffic.trace_paths();
     ensure!(
         !paths.is_empty(),
         "trace traffic requires at least one path"
@@ -319,13 +340,13 @@ fn synthetic_images(traffic: &TrafficSpec) -> Result<Option<SyntheticImages>> {
 
 /// For `kv_capacity_fraction` load, converts the configured fraction of the
 /// role's KV capacity into a concurrency and stores it in `traffic`.
-pub fn resolve_kv_capacity_concurrency(
+fn resolve_kv_capacity_concurrency(
     traffic: &mut TrafficSpec,
     role: &ReplayRoleConfig,
     replicas: usize,
-) -> Result<Option<usize>> {
+) -> Result<()> {
     if traffic.load_type.as_deref() != Some("kv_capacity_fraction") {
-        return Ok(None);
+        return Ok(());
     }
     let ratio = traffic
         .kv_load_ratio
@@ -383,9 +404,8 @@ pub fn resolve_kv_capacity_concurrency(
         capacity > 0,
         "candidate KV capacity cannot hold one request"
     );
-    let concurrency = ((ratio * capacity as f64) as usize).max(1);
-    traffic.concurrency = Some(concurrency);
-    Ok(Some(concurrency))
+    traffic.concurrency = Some(((ratio * capacity as f64) as usize).max(1));
+    Ok(())
 }
 
 /// The driver for a trace of ordinary sessions: closed-loop when `concurrency`
@@ -473,7 +493,24 @@ fn build_agentic_driver(
 }
 
 /// Builds the replay input for `traffic`.
-pub fn build_traffic(traffic: TrafficSpec, options: &TrafficBuildOptions) -> Result<BuiltTraffic> {
+pub fn build_traffic(
+    mut traffic: TrafficSpec,
+    options: &TrafficBuildOptions,
+) -> Result<BuiltTraffic> {
+    if let Some((role, replicas)) = &options.kv_capacity {
+        resolve_kv_capacity_concurrency(&mut traffic, role, *replicas)?;
+    }
+    let max_in_flight = if traffic.source_type == "trace" {
+        traffic.replay_concurrency
+    } else {
+        traffic.concurrency
+    };
+    let mut built = build_workload(traffic, options)?;
+    built.max_in_flight = max_in_flight;
+    Ok(built)
+}
+
+fn build_workload(traffic: TrafficSpec, options: &TrafficBuildOptions) -> Result<BuiltTraffic> {
     let engine_block_size = options.engine_block_size;
     let replay_hashes = options.replay_hashes;
     ensure!(engine_block_size > 0, "engine block size must be positive");
@@ -634,6 +671,7 @@ pub fn build_traffic(traffic: TrafficSpec, options: &TrafficBuildOptions) -> Res
                     speedup,
                 )?),
                 weka_nested_timestamp_basis: Some(resolved_basis),
+                max_in_flight: None,
             });
         }
         if format == "dynamo" {
@@ -728,6 +766,15 @@ pub fn build_traffic(traffic: TrafficSpec, options: &TrafficBuildOptions) -> Res
     } else {
         1
     };
+    let isl = traffic.isl.context("synthetic traffic requires isl")?;
+    let osl = traffic.osl.context("synthetic traffic requires osl")?;
+    ensure!(isl > 0, "isl must be positive");
+    ensure!(osl > 0, "osl must be positive");
+    let inter_turn_delay_ms = traffic.inter_turn_delay_ms.unwrap_or(0.0);
+    ensure!(
+        inter_turn_delay_ms.is_finite() && inter_turn_delay_ms >= 0.0,
+        "inter_turn_delay_ms must be finite and non-negative"
+    );
     let cached_prefix_tokens = traffic.cached_prefix_tokens.unwrap_or(0);
     let images = synthetic_images(&traffic)?;
     let shared_prefix_ratio = traffic.shared_prefix_ratio.unwrap_or(0.0);
@@ -743,21 +790,22 @@ pub fn build_traffic(traffic: TrafficSpec, options: &TrafficBuildOptions) -> Res
         num_sessions: sessions,
         turns_per_session: turns,
         input_tokens: LengthSpec {
-            mean: traffic.isl.context("synthetic traffic requires isl")?,
+            mean: isl,
             stddev: 0.0,
         },
         output_tokens: LengthSpec {
-            mean: traffic.osl.context("synthetic traffic requires osl")?,
+            mean: osl,
             stddev: 0.0,
         },
         cached_prefix_tokens,
         shared_prefix_ratio,
         num_prefix_groups: traffic.num_prefix_groups.unwrap_or(0),
         first_turn_arrivals: synthetic_arrivals(&traffic)?,
-        inter_turn_delays: traffic
-            .inter_turn_delay_ms
-            .filter(|delay| *delay > 0.0)
-            .map_or(DelaySpec::None, DelaySpec::ConstantMs),
+        inter_turn_delays: if inter_turn_delay_ms > 0.0 {
+            DelaySpec::ConstantMs(inter_turn_delay_ms)
+        } else {
+            DelaySpec::None
+        },
         seed: 0,
         arrival_seed: traffic.arrival_seed.unwrap_or(42),
         images,
@@ -1141,5 +1189,64 @@ mod tests {
         assert_eq!(ready_at(&spec), [0.0, 1000.0, 2000.0]);
         spec["synthetic_arrival_speedup_ratio"] = 2.0.into();
         assert_eq!(ready_at(&spec), [0.0, 500.0, 1000.0]);
+    }
+
+    #[test]
+    fn built_traffic_reports_the_in_flight_cap_and_the_spec_its_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let trace = write_trace(&dir, &MOONCAKE_SESSION);
+        let build = |spec: serde_json::Value, options: TrafficBuildOptions| {
+            let spec: TrafficSpec = serde_json::from_value(spec).unwrap();
+            let inputs = (spec.max_sim_time_ms(), spec.trace_paths());
+            (build_traffic(spec, &options).unwrap().max_in_flight, inputs)
+        };
+        let options = || TrafficBuildOptions::new(64);
+        let mut synthetic = serde_json::json!({"source_type": "synthetic",
+            "load_type": "concurrency", "isl": 64, "osl": 8, "request_count": 3,
+            "concurrency": 3});
+        assert_eq!(
+            build(synthetic.clone(), options()),
+            (Some(3), (None, vec![]))
+        );
+        let open_loop = serde_json::json!({"source_type": "synthetic", "load_type": "poisson",
+            "request_rate": 2.0, "isl": 64, "osl": 8, "request_count": 3});
+        assert_eq!(build(open_loop, options()).0, None);
+        let replayed = serde_json::json!({"source_type": "trace", "load_type": "concurrency",
+            "trace_path": trace, "trace_format": "mooncake", "replay_concurrency": 2,
+            "max_sim_time_ms": 5.0});
+        assert_eq!(
+            build(replayed, options()),
+            (Some(2), (Some(5.0), vec![PathBuf::from(&trace)]))
+        );
+
+        // 2 replicas x 10 blocks x 16 tokens hold four requests of 64 + 8 / 2 tokens.
+        let mut role = ReplayRoleConfig::default();
+        role.rank.num_gpu_blocks = 10;
+        role.rank.block_size = 16;
+        synthetic["load_type"] = "kv_capacity_fraction".into();
+        synthetic["kv_load_ratio"] = 1.0.into();
+        let sized = options().with_kv_capacity(role, 2);
+        assert_eq!(build(synthetic, sized).0, Some(4));
+    }
+
+    #[test]
+    fn synthetic_lengths_and_turn_delays_are_validated() {
+        let base = serde_json::json!({"source_type": "synthetic-session",
+            "load_type": "concurrency", "isl": 64, "osl": 8, "request_count": 1,
+            "turns_per_session": 2, "concurrency": 1, "inter_turn_delay_ms": 0.0});
+        assert_eq!(replay(base.clone()).len(), 2);
+        for (field, value, message) in [
+            ("isl", serde_json::json!(0), "isl must be positive"),
+            ("osl", serde_json::json!(0), "osl must be positive"),
+            (
+                "inter_turn_delay_ms",
+                serde_json::json!(-1.0),
+                "inter_turn_delay_ms must be finite and non-negative",
+            ),
+        ] {
+            let mut spec = base.clone();
+            spec[field] = value;
+            assert!(replay_error(spec).contains(message), "{field}");
+        }
     }
 }

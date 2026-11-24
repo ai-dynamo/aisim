@@ -27,7 +27,7 @@ use crate::replay::{
     ReplayCaptureOptions, ReplayDeterminism, ReplayEngineConfig, ReplayEngineFactory,
     ReplayOperationPowerDiagnostics, ReplayPhasePowerDiagnostics, ReplayPowerDiagnostics,
     ReplayRoleConfig, ReplayRuntimeInput, ReplaySpec, ReplayTopology, Replayer, TracePowerStats,
-    TrafficBuildOptions, TrafficSpec, build_traffic, resolve_kv_capacity_concurrency,
+    TrafficBuildOptions, TrafficSpec, build_traffic,
 };
 use crate::{
     DeploymentLimits, EstimationMode, EstimatorConfig, ForwardPassFallbackPolicy,
@@ -2893,6 +2893,10 @@ fn cap_role_capacity_to_fpm_decode_domain(
     Ok(())
 }
 
+fn is_kv_capacity_load(traffic: Option<&TrafficSpec>) -> bool {
+    traffic.is_some_and(|traffic| traffic.load_type.as_deref() == Some("kv_capacity_fraction"))
+}
+
 fn aggregated_role(engine: &ReplayEngineConfig) -> ReplayRoleConfig {
     ReplayRoleConfig {
         dp_size: engine.dp_size,
@@ -4141,7 +4145,7 @@ fn replay_fpm_coverage(
 fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
     let (
         mut spec,
-        mut traffic,
+        traffic,
         capture_performance_diagnostics,
         determinism,
         serving_path,
@@ -4384,11 +4388,13 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
             engine_config.prefill_context_parallel_size = role.prefill_context_parallel_size;
             engine_config.num_gpu_blocks_is_explicit = role.num_gpu_blocks_is_explicit;
             engine_config.rank = role.rank;
-            if let Some(traffic) = traffic.as_mut()
-                && let ReplayTopology::Aggregated { workers } = &spec.topology
-                && let Some(concurrency) = resolve_kv_capacity_concurrency(
-                    traffic,
-                    &ReplayRoleConfig {
+            spec.engine = serde_json::to_value(&engine_config)
+                .context("serializing materialized native engine descriptor")?;
+            let sized_by_kv = is_kv_capacity_load(traffic.as_ref());
+            let mut options = TrafficBuildOptions::new(engine_config.rank.block_size);
+            if sized_by_kv && let ReplayTopology::Aggregated { workers } = &spec.topology {
+                options = options.with_kv_capacity(
+                    ReplayRoleConfig {
                         dp_size: engine_config.dp_size,
                         tensor_parallel_size: engine_config.tensor_parallel_size,
                         prefill_context_parallel_size: engine_config.prefill_context_parallel_size,
@@ -4396,15 +4402,14 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                         rank: engine_config.rank.clone(),
                     },
                     workers.initial_workers,
-                )?
-            {
-                spec.max_in_flight = Some(concurrency);
+                );
             }
-            spec.engine = serde_json::to_value(&engine_config)
-                .context("serializing materialized native engine descriptor")?;
             let built_input = traffic
-                .map(|traffic| build_traffic(traffic, &TrafficBuildOptions::new(engine_config.rank.block_size)))
+                .map(|traffic| build_traffic(traffic, &options))
                 .transpose()?;
+            if sized_by_kv && let Some(built) = &built_input {
+                spec.max_in_flight = built.max_in_flight;
+            }
             if let Some(built) = &built_input {
                 validate_public_agentic_engine(&built.input, &spec, &engine_config)?;
             }
@@ -4501,38 +4506,36 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
             prediction_provenance.insert("decode".into(), decode_provenance.unwrap_or_else(|| timing_provenance(&decode.rank.timing_model)));
             engine_config.prefill = Some(prefill);
             engine_config.decode = Some(decode);
-            if let Some(traffic) = traffic.as_mut()
-                && let ReplayTopology::Disaggregated { decode, .. } = &spec.topology
-                && let Some(concurrency) = resolve_kv_capacity_concurrency(
-                    traffic,
-                    engine_config
-                        .decode
-                        .as_ref()
-                        .expect("decode role was materialized"),
-                    decode.initial_workers,
-                )?
-            {
-                spec.max_in_flight = Some(concurrency);
-            }
             spec.engine = serde_json::to_value(&engine_config)
                 .context("serializing materialized native engine descriptor")?;
+            let sized_by_kv = is_kv_capacity_load(traffic.as_ref());
+            let mut options = TrafficBuildOptions::new(
+                engine_config
+                    .prefill
+                    .as_ref()
+                    .expect("prefill role was materialized")
+                    .rank
+                    .block_size,
+            );
+            if sized_by_kv && let ReplayTopology::Disaggregated { decode, .. } = &spec.topology {
+                options = options.with_kv_capacity(
+                    engine_config
+                        .decode
+                        .clone()
+                        .expect("decode role was materialized"),
+                    decode.initial_workers,
+                );
+            }
             let built_input = match trace_input {
-                Some(built) => Some(built),
-                None => traffic.map(|traffic| {
-                    build_traffic(
-                        traffic,
-                        &TrafficBuildOptions::new(
-                            engine_config
-                                .prefill
-                                .as_ref()
-                                .expect("prefill role was materialized")
-                                .rank
-                                .block_size,
-                        ),
-                    )
-                })
-                .transpose()?,
+                // A KV-sized load is resolved by the build below.
+                Some(built) if !sized_by_kv => Some(built),
+                _ => traffic
+                    .map(|traffic| build_traffic(traffic, &options))
+                    .transpose()?,
             };
+            if sized_by_kv && let Some(built) = &built_input {
+                spec.max_in_flight = built.max_in_flight;
+            }
             if let Some(built) = &built_input {
                 validate_public_agentic_engine(&built.input, &spec, &engine_config)?;
             }
@@ -7875,20 +7878,20 @@ mod tests {
         role.rank.kv_cache_capacity_bytes = Some(1000);
         cap_role_capacity_to_fpm_decode_domain(&mut role, Some(1), false).unwrap();
         assert_eq!(role.rank.kv_cache_capacity_bytes, Some(1000));
-        let mut traffic: TrafficSpec = serde_json::from_value(serde_json::json!({
+        let traffic: TrafficSpec = serde_json::from_value(serde_json::json!({
             "source_type":"synthetic", "load_type":"kv_capacity_fraction",
-            "kv_load_ratio":1.0, "isl":1152, "osl":4
+            "kv_load_ratio":1.0, "isl":1152, "osl":4, "request_count":1
         }))
         .unwrap();
+        let build = |role: &ReplayRoleConfig| {
+            let options = TrafficBuildOptions::new(64).with_kv_capacity(role.clone(), 2);
+            build_traffic(traffic.clone(), &options).map(|built| built.max_in_flight)
+        };
         // A 32-token window can straddle three 16-token pages (480 bytes).
         // Each rank holds two requests; three DP ranks and two replicas hold 12.
-        assert_eq!(
-            resolve_kv_capacity_concurrency(&mut traffic, &role, 2).unwrap(),
-            Some(12)
-        );
-        assert_eq!(traffic.concurrency, Some(12));
+        assert_eq!(build(&role).unwrap(), Some(12));
         role.rank.kv_cache_capacity_bytes = Some(479);
-        assert!(resolve_kv_capacity_concurrency(&mut traffic, &role, 2).is_err());
+        assert!(build(&role).is_err());
     }
 
     #[test]

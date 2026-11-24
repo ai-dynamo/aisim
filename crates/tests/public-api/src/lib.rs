@@ -253,8 +253,12 @@ mod tests {
             "isl": 64, "osl": 8, "request_count": 3, "concurrency": 1
         }))
         .unwrap();
-        let built = build_traffic(spec, &TrafficBuildOptions::new(64)).unwrap();
+        assert_eq!(spec.max_sim_time_ms(), None);
+        assert!(spec.trace_paths().is_empty());
+        let options = TrafficBuildOptions::new(64).with_kv_capacity(Default::default(), 1);
+        let built = build_traffic(spec, &options).unwrap();
         assert!(matches!(built.input, ReplayRuntimeInput::Workload(_)));
+        assert_eq!(built.max_in_flight, Some(1));
     }
 
     #[test]

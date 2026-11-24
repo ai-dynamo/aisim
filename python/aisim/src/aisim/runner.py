@@ -997,7 +997,10 @@ def _materialize_engine_execution_spec(
 def materialize_runtime_traffic(spec: ReplaySpec, *, trace_block_size: int) -> dict[str, JSONValue]:
     """Build the traffic payload the native workload builder deserializes.
 
-    The payload has no ``execution_model``, which agentic input requires.
+    The payload has no ``execution_model``, which agentic input requires. A
+    synthetic concurrency load without its own ``concurrency`` takes
+    ``spec.concurrency``, so the builder makes the closed-loop workload the spec
+    asks for. Rate-driven loads stay open-loop.
     """
 
     traffic = {
@@ -1008,6 +1011,9 @@ def materialize_runtime_traffic(spec: ReplaySpec, *, trace_block_size: int) -> d
         traffic.update(_image_traffic_fields(spec.backend_deployment, images))
     if traffic.get("trace_format") not in {"dynamo", "weka"}:
         traffic.setdefault("trace_block_size", trace_block_size)
+    closed_loop = traffic.get("source_type") != "trace" and traffic.get("load_type", "concurrency") == "concurrency"
+    if closed_loop and spec.concurrency is not None:
+        traffic.setdefault("concurrency", _positive_int(spec.concurrency, "concurrency"))
     return traffic
 
 
