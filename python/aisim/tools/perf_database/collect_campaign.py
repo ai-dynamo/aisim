@@ -309,7 +309,9 @@ def shard_state(root: Path, shard: Shard, backend: str | None = None) -> str:
     if native:
         from collector.helper import PERF_TRANSACTION_FILENAME, SIDECAR_TRANSACTION_FILENAME
 
-        if any((d / name).exists() for name in (PERF_TRANSACTION_FILENAME, SIDECAR_TRANSACTION_FILENAME)):
+        perf_filename = Path(_native_phase_table(shard.op)).with_suffix(".txt").name
+        pending_files = (PERF_TRANSACTION_FILENAME, SIDECAR_TRANSACTION_FILENAME, f".{perf_filename}.pending")
+        if any((d / name).exists() for name in pending_files):
             return "pending-publication"
     if published:
         return "finalized"

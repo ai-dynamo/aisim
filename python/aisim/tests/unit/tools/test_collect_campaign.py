@@ -480,6 +480,61 @@ def test_campaign_recovers_tp_checkpoint_and_validates_all_selected_cases(
     assert tracker._path.read_bytes() == original
 
 
+@pytest.mark.parametrize("phase", ["context", "generation"])
+@pytest.mark.parametrize("receipt_phase", [None, "context", "generation"])
+@pytest.mark.parametrize("mode", ["run", "finalize"])
+def test_campaign_recovers_pending_native_case_despite_older_parquet(monkeypatch, tmp_path, phase, receipt_phase, mode):
+    from types import SimpleNamespace
+
+    from collector.collect import ResumeCheckpoint
+    from collector.helper import create_test_case_id
+    from collector.op_plans import ModuleCase
+    from collector.sglang import collect_kimi_k31_dsa_v1 as native
+
+    c = _load()
+    case = ModuleCase(4096, 1, 96, "fp8", "bfloat16", "bfloat16", native.MODEL, 0)
+    shard = c.Shard(f"kimi_k31_dsa_{phase}_module", "tp1", case_filter=str(case), model_path=native.MODEL)
+    plan = c.Plan("sglang", 103, (shard,))
+    out = c.shard_dir(tmp_path, shard)
+    tracker = ResumeCheckpoint(
+        plan.backend,
+        f"{plan.backend}.{shard.op}",
+        "run_kimi_k31_dsa_fullnode",
+        str(out / ".ckpt"),
+        native.RUNTIME_VERSION,
+        plan.sm,
+    )
+    task_id = create_test_case_id(case, "run_kimi_k31_dsa_fullnode", f"{plan.backend}.{shard.op}")
+    tracker.mark_attempted(task_id)
+    tracker.mark_passed(task_id)
+    tracker.flush(force=True)
+    checkpoint_bytes = tracker._path.read_bytes()
+    (out / f"dsa_{phase}_module_perf.parquet").touch()
+    (out / "DONE").touch()
+    if receipt_phase is not None:
+        filename = f"dsa_{receipt_phase}_module_perf.txt"
+        stage = out / f".{filename}.stage-retry"
+        stage.write_text("recovered row\n")
+        (out / f".{filename}.pending").write_text(json.dumps({"task_id": task_id, "stage": stage.name}))
+    pending = receipt_phase == phase
+    assert c.shard_state(tmp_path, shard, plan.backend) == ("pending-publication" if pending else "finalized")
+
+    monkeypatch.setattr(c, "collector_ref", lambda _: "0" * 40)
+    monkeypatch.setattr(c, "image_digest", lambda _: "sha256:present")
+    commands = []
+
+    def launch(argv):
+        commands.append(argv)
+        return SimpleNamespace(returncode=0, poll=lambda: 0, wait=lambda: 0)
+
+    monkeypatch.setattr(c.subprocess, "Popen", launch)
+    assert c.run_campaign(plan, root=tmp_path, gpus=[0], checkout=tmp_path, image_override="test", mode=mode) == 0
+    assert len(commands) == int(pending)
+    if pending:
+        assert commands[0][commands[0].index("--mode") + 1] == mode
+    assert tracker._path.read_bytes() == checkpoint_bytes
+
+
 @pytest.mark.parametrize("published", [True, False])
 def test_native_shard_done_requires_its_phase_table(tmp_path, monkeypatch, published):
     from types import SimpleNamespace
