@@ -1578,6 +1578,9 @@ def test_complete_failed_native_observation_requires_cpu_recovery_without_replac
             path = Path(kwargs["checkpoint_dir"]) / "fpm_forward.json"
             checkpoint = json.loads(path.read_text())
             entry = checkpoint["cells"][cell_id]
+            if archived_auth:
+                raw = Path(kwargs["artifact_root"]) / plan.sha256[:16] / "cells" / cell_id / "raw"
+                (raw / "recovery-config.json").write_text(json.dumps({"value": token}))
             entry.update(status=collector_status, error_type="RuntimeError", error="log retrieval failed")
             if cleanup_error:
                 entry["cleanup_error"] = "teardown timed out"
@@ -1623,14 +1626,18 @@ def test_complete_failed_native_observation_requires_cpu_recovery_without_replac
     if archived_auth:
         monkeypatch.delenv("HF_TOKEN")
     recover = repeatability._recover_completed_attempt
-    monkeypatch.setattr(repeatability, "_recover_completed_attempt", lambda *_args: None)
+    monkeypatch.setattr(repeatability, "_recover_completed_attempt", lambda *_args, **_kwargs: None)
     result = repeatability.run_repeatability(**args, resume=True, retry_failed=True)
     attempt = result["samples"][cell_id][0]["attempts"][0]
     assert len(calls) == 1 and result["status"] == "incomplete"
     assert attempt["postprocessing_attempts"][-1]["status"] == "failed"
     assert "cannot be replaced" in attempt["postprocessing_attempts"][-1]["error"]
 
-    monkeypatch.setattr(repeatability, "_recover_completed_attempt", recover)
+    def recover_with_context(*positional, generator_overrides):
+        assert generator_overrides == args["generator_overrides"]
+        return recover(*positional, generator_overrides=generator_overrides)
+
+    monkeypatch.setattr(repeatability, "_recover_completed_attempt", recover_with_context)
     if archived_auth:
         # Recovery completes with no token. Only the following new sample
         # needs auth, and fails before allocating a replacement attempt.
@@ -1638,6 +1645,7 @@ def test_complete_failed_native_observation_requires_cpu_recovery_without_replac
             repeatability.run_repeatability(**args, resume=True, retry_failed=True)
         saved = json.loads((args["output_dir"] / repeatability.REPORT_FILENAME).read_text())
         assert saved["samples"][cell_id][0]["attempts"][0]["status"] == "passed"
+        assert not list(args["output_dir"].rglob("recovery-config.json"))
         assert len(calls) == 1
         monkeypatch.setenv("HF_TOKEN", token)
     result = repeatability.run_repeatability(**args, resume=True, retry_failed=True)

@@ -78,7 +78,7 @@ def _source(request: SupportRequest) -> dict[str, Any]:
     return source
 
 
-def _collection_controls(cells, deployment):
+def _collection_controls(cells, deployment, probe_environment=()):
     """Separate recorded collection controls for memory-only review, without editing plans."""
     from collector.fpm_forward.config import COLLECTION_CONTROL_NAMES, CONTENT_MODES, validate_collection_control
     from collector.fpm_forward.planner import BackendPolicy
@@ -122,6 +122,7 @@ def _collection_controls(cells, deployment):
     deployment = deepcopy(deployment)
     k8s = deployment.get("K8sConfig", {})
     environment = k8s.get("extra_env", [])
+    probe_entries = {item["name"]: item for item in probe_environment}
     retained, seen = [], set()
     if not isinstance(environment, list):
         raise ValueError("collection environment must be a list")
@@ -157,7 +158,15 @@ def _collection_controls(cells, deployment):
             raise ValueError(f"collection control {name} requires one literal string value")
         seen.add(name)
         validate_collection_control(name, value)
-        changes.extend(_differences({"missing": True}, value, "/collection_controls/environment/" + name))
+        if name in probe_entries:
+            expected = probe_entries[name]
+            # Preserve the probe representation for historical digest-bound controls.
+            if expected.get("value_sha256") == hashlib.sha256(value.encode()).hexdigest():
+                retained.append(expected)
+            else:
+                retained.append(item)
+        else:
+            changes.extend(_differences({"missing": True}, value, "/collection_controls/environment/" + name))
     if "extra_env" in k8s:
         k8s["extra_env"] = retained
     return tuple(compared_cells), deployment, changes
@@ -199,7 +208,9 @@ def _plan(request: SupportRequest, binding: dict[str, Any], source: dict[str, An
         raise ValueError("bound phase requires exactly one matching frozen collection cell")
     bundle = plan.runtime_instrumentation
     deployment = load_repeatability_deployment(path.parent)
-    compared_cells, compared_deployment, controls = _collection_controls(plan.cells, deployment)
+    compared_cells, compared_deployment, controls = _collection_controls(
+        plan.cells, deployment, launch["deployment"].get("extra_env") or ()
+    )
     validate_collection_probe_launch(
         launch,
         bundle,

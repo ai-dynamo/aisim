@@ -425,6 +425,39 @@ def test_archived_controls_reject_malformed_deadlines_and_serving_changes(archiv
         runtime.collection_runtime_review(request, bindings[0])
 
 
+@pytest.mark.parametrize("collection_value", ["zeros", "random"])
+def test_probe_declared_content_control_must_match(split_collection, collection_value):
+    from collector.fpm_forward.runtime_probe import probe_generator_overrides, validate_collection_probe_launch
+
+    from aisim.support.runtime_collection import _collection_controls
+
+    _, bindings = split_collection
+    plan = load_repeatability_source(Path(bindings[0]["plan"]["path"]).parent)
+    launch = plan.runtime_launch
+    declared = {"name": "DYN_BENCH_PREFILL_CONTENT", "value": "zeros"}
+    launch["deployment"]["extra_env"] = [declared]
+    deployment = probe_generator_overrides(launch)
+    deployment["K8sConfig"]["extra_env"][0]["value"] = collection_value
+    cells, compared, changes = _collection_controls(plan.cells, deployment, launch["deployment"]["extra_env"])
+    assert not changes
+    arguments = dict(
+        model_path=plan.model_path,
+        system=plan.system,
+        backend=plan.backend,
+        backend_version=plan.capability.aic_database_version,
+        cells=cells,
+        options=plan.options,
+        profile=plan.fpm_profile,
+        generator_overrides=compared,
+        phases=("prefill",),
+    )
+    if collection_value == "zeros":
+        validate_collection_probe_launch(launch, plan.runtime_instrumentation, **arguments)
+    else:
+        with pytest.raises(ValueError, match="deployment settings differ"):
+            validate_collection_probe_launch(launch, plan.runtime_instrumentation, **arguments)
+
+
 def test_legacy_launch_validation_remains_strict_on_collection_controls(archived_controls):
     from collector.fpm_forward.repeatability import load_repeatability_deployment
     from collector.fpm_forward.runtime_probe import validate_collection_probe_launch

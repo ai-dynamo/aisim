@@ -616,7 +616,7 @@ def _retry_sample_cleanup(plan, selected, directory, attempt):
         attempt["files"] = _file_manifest(directory)
 
 
-def _retry_sample_postprocessing(plan, selected, directory, attempt):
+def _retry_sample_postprocessing(plan, selected, directory, attempt, generator_overrides):
     """Validate salvaged artifacts without relaunching or rewriting their checkpoint."""
     recovery = {"status": "running"}
     attempt.setdefault("postprocessing_attempts", []).append(recovery)
@@ -625,14 +625,36 @@ def _retry_sample_postprocessing(plan, selected, directory, attempt):
         entry = dict(checkpoint["cells"][selected["cell_id"]])
         if attempt.get("cleanup_attempts") and attempt["cleanup_attempts"][-1]["status"] == "passed":
             entry.pop("cleanup_error", None)
-        recovered = _recover_completed_attempt(plan, plan.cells[0], directory / "artifacts" / plan.sha256[:16], entry)
+        recovered = _recover_completed_attempt(
+            plan,
+            plan.cells[0],
+            directory / "artifacts" / plan.sha256[:16],
+            entry,
+            generator_overrides=generator_overrides,
+        )
         if recovered is None:
             raise ValueError(
                 "CPU-only recovery could not validate the retained observation; inspect collector artifacts "
                 "and teardown before retrying recovery; the original GPU measurement cannot be replaced"
             )
-        if _sample_evidence(plan, selected, directory) != attempt["evidence"]:
+        observed = _sample_evidence(plan, selected, directory)
+        recorded = attempt["evidence"]
+        original_files, new_files = recorded["raw_files"], observed["raw_files"]
+        # Sanitization may redact or discard existing diagnostic dumps. Native
+        # measurement files, execution identity, points and launch evidence stay exact.
+        if (
+            {**recorded, "raw_files": new_files} != observed
+            or new_files.keys() - original_files.keys()
+            or any(
+                new_files.get(name) != metadata
+                for name, metadata in original_files.items()
+                if Path(name).suffix == ".json" and "config" not in Path(name).name
+            )
+        ):
             raise ValueError("repeatability sample evidence changed during post-processing recovery")
+        if new_files != original_files:
+            recovery["original_raw_files"] = original_files
+            attempt["evidence"] = observed
         recovery.update(status="passed", artifact_recovery=recovered["artifact_recovery"])
         attempt["status"] = "passed"
     except (KeyboardInterrupt, SystemExit):
@@ -1169,7 +1191,7 @@ def run_repeatability(
                             continue
                     if retry_failed and previous.get("failure_kind") == "postprocessing_failed":
                         try:
-                            _retry_sample_postprocessing(plan, selected, previous_dir, previous)
+                            _retry_sample_postprocessing(plan, selected, previous_dir, previous, generator_overrides)
                         finally:
                             _summarize(frozen, report)
                             _save_report(root, report)
