@@ -337,17 +337,23 @@ and its LICENSE for provenance, the preserved license, and each local correction
              Some(idx) if idx == self.idx => self.parent = None,
              found => panic!(
                  "detach_from_parent: parent {} has no child {} under key {:?} (found {:?})",
-@@ -739,6 +750,9 @@
+@@ -739,6 +750,15 @@
  #[allow(clippy::enum_variant_names)]
  #[derive(Debug, thiserror::Error)]
  pub enum TreeCoreRuntimeError {
++    /// A backup's staged host rows no longer cover its current device span.
++    #[error("stale or malformed {component_type:?} backup spec for node {node_id}")]
++    InvalidBackupSpec {
++        node_id: NodeId,
++        component_type: ComponentType,
++    },
 +    /// Full load-back no longer describes the planned host-to-device mapping.
 +    #[error("stale or malformed Full load-back spec for node {node_id}")]
 +    InvalidLoadBackSpec { node_id: NodeId },
      /// A public NodeId no longer names a live arena node.
      #[error(transparent)]
      NodeAccess(#[from] NodeAccessError),
-@@ -748,6 +762,12 @@
+@@ -748,6 +768,12 @@
      /// `resume_insert` called without a suspended insert.
      #[error("no in-flight insert")]
      NoInFlightInsert,
@@ -360,7 +366,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
      /// An arena slot beyond the arena's bounds — never allocated. `size` is the
      /// arena's current slot count, so valid ids are `0..size`.
      #[error("node access out of bounds: id {id} not in [0, {size})")]
-@@ -782,11 +802,20 @@
+@@ -782,11 +808,30 @@
      /// A host insert below a non-root anchor must remain in that anchor's namespace.
      #[error("insert_host namespace does not match non-root anchor {node_id}")]
      InsertHostNamespaceMismatch { node_id: NodeId },
@@ -369,6 +375,16 @@ and its LICENSE for provenance, the preserved license, and each local correction
 +    InsertHostHashCount {
 +        hash_count: usize,
 +        page_count: usize,
++    },
++    /// An empty digest cannot seed the next page's storage hash chain.
++    #[error("host insert page hash at index {page_index} is empty")]
++    InsertHostEmptyHash { page_index: usize },
++    #[error("host insert key length {key_len} is not aligned to page size {page_size}")]
++    InsertHostKeyNotPageAligned { key_len: usize, page_size: usize },
++    #[error("host insert has {value_len} host rows, expected at least {required_len}")]
++    InsertHostValueTooShort {
++        value_len: usize,
++        required_len: usize,
 +    },
      /// Continuation inserts must start at the exact page-aligned prefix boundary.
      #[error(
@@ -381,7 +397,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
      /// The retained prefix cannot extend beyond the aligned input key.
      #[error(
          "insert continuation prefix length {prefix_len} exceeds aligned key length {aligned_key_len}"
-@@ -804,6 +833,9 @@
+@@ -804,6 +849,9 @@
          node_prefix_len: usize,
          prefix_len: usize,
      },
@@ -391,7 +407,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
      /// A non-root continuation stays inside the anchor's namespace.
      #[error("insert continuation namespace does not match non-root anchor {node_id}")]
      InsertContinuationNamespaceMismatch { node_id: NodeId },
-@@ -817,6 +849,9 @@
+@@ -817,6 +865,9 @@
          value_len: usize,
          required_len: usize,
      },
@@ -442,7 +458,17 @@ and its LICENSE for provenance, the preserved license, and each local correction
 
      let prefix_key = vec![10, 20];
      let prefix = tree.match_prefix(&MatchPrefixParams {
-@@ -428,14 +446,21 @@
+@@ -284,7 +302,9 @@
+         .last_device_node_id;
+
+     // Per-step growth is chunked: no hit count moves, so nothing reaches the threshold.
++    let hits = tree.inspect_get_node_hit_count(anchor).unwrap();
+     let grown = continuation(&mut tree, anchor, &[10, 20, 50, 60], &[5, 6], true);
++    assert_eq!(tree.inspect_get_node_hit_count(anchor).unwrap(), hits);
+     assert!(backups(&grown).is_empty());
+
+     // Finishing a second request through the prefix is its second hit, which a
+@@ -428,14 +448,21 @@
      params.value = PageValue::from_vec(vec![3, 4]);
      params.prev_prefix_len = 2;
      params.rotation_base = Some(8);
@@ -464,7 +490,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
      }
      params.rotation_base = Some(7);
      let accepted = tree.insert_suffix_from_node(anchor, 2, &params);
-@@ -495,6 +520,7 @@
+@@ -495,6 +522,7 @@
          .is_err()
      );
      assert_eq!(tree.swa_evictable_size(), 0);
@@ -472,7 +498,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
      tree.attach_swa_window(
          &key,
          Default::default(),
-@@ -509,6 +535,18 @@
+@@ -509,6 +537,18 @@
          vec![(0, 1), (3, 4)]
      );
      assert_eq!(tree.swa_evictable_size(), 2);
@@ -491,7 +517,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
      assert_eq!(tree.evictable_size(), 4);
      assert_eq!(
          tree.collect_full_device_indices(anchor, tree.root_node_handle(None))
-@@ -581,6 +619,10 @@
+@@ -581,6 +621,10 @@
          .is_err()
      );
      assert_eq!(tree.protected_size(), 4);
@@ -980,10 +1006,16 @@ and its LICENSE for provenance, the preserved license, and each local correction
              return false;
          }
          if node.is_load_back_pending() {
-@@ -3834,6 +3960,13 @@
+@@ -3834,6 +3960,28 @@
          if !anchor.is_root() && anchor.namespace.as_ref() != namespace {
              return Err(TreeCoreRuntimeError::InsertHostNamespaceMismatch { node_id: anchor.id });
          }
++        if !total_len.is_multiple_of(self.page_size) {
++            return Err(TreeCoreRuntimeError::InsertHostKeyNotPageAligned {
++                key_len: total_len,
++                page_size: self.page_size,
++            });
++        }
 +        let page_count = total_len / self.page_size;
 +        if hash_value.len() != page_count {
 +            return Err(TreeCoreRuntimeError::InsertHostHashCount {
@@ -991,10 +1023,19 @@ and its LICENSE for provenance, the preserved license, and each local correction
 +                page_count,
 +            });
 +        }
++        if let Some(page_index) = hash_value.iter().position(String::is_empty) {
++            return Err(TreeCoreRuntimeError::InsertHostEmptyHash { page_index });
++        }
++        if host_value.len() < total_len {
++            return Err(TreeCoreRuntimeError::InsertHostValueTooShort {
++                value_len: host_value.len(),
++                required_len: total_len,
++            });
++        }
          self.touch_node_(node_id);
          if total_len == 0 {
              return Ok(InsertResult {
-@@ -4147,6 +4280,8 @@
+@@ -4147,6 +4295,8 @@
                  name: PoolName::Kv,
                  host_indices: Some(V::empty()),
                  nodes_to_load: Some(Vec::new()),
@@ -1003,7 +1044,96 @@ and its LICENSE for provenance, the preserved license, and each local correction
                  ..Default::default()
              };
              return Ok((empty_kv, HashMap::new()));
-@@ -4469,7 +4604,7 @@
+@@ -4389,9 +4539,14 @@
+         cache_actions: &mut Vec<CacheAction<V>>,
+         mut insert_result: Option<&mut InsertResult<V>>,
+         pool_storage_result: Option<&PoolTransferResult>,
+-    ) -> Result<(), NodeAccessError> {
++    ) -> Result<(), TreeCoreRuntimeError> {
+         let node_id = self.arena.resolve(node_id)?;
+         self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
++        if phase == CacheTransferPhase::BackupHost {
++            for (&component_type, transfers) in &comp_xfers {
++                self.validate_backup_transfers_(node_id, component_type, transfers)?;
++            }
++        }
+         if let Some(insert_result) = insert_result.as_deref() {
+             if let Some(last_device_node_id) = insert_result.last_device_node_id {
+                 self.arena.resolve(last_device_node_id)?;
+@@ -4415,15 +4570,71 @@
+         Ok(())
+     }
+
++    /// Validate staged backup spans before any component adopts host rows.
++    fn validate_backup_transfers_(
++        &self,
++        node_id: NodeIdx_,
++        component_type: ComponentType,
++        transfers: &[PoolTransfer<V>],
++    ) -> Result<(), TreeCoreRuntimeError> {
++        let invalid = || TreeCoreRuntimeError::InvalidBackupSpec {
++            node_id: self.arena.node(node_id).id,
++            component_type,
++        };
++        for transfer in transfers {
++            let Some(host_indices) = &transfer.host_indices else {
++                continue;
++            };
++            if component_type == FULL {
++                if host_indices.len() != self.arena.node(node_id).key.atom_len() {
++                    return Err(invalid());
++                }
++            } else if component_type == SWA {
++                let anchor = [self.arena.node(node_id).id];
++                let targets = transfer
++                    .nodes_to_load
++                    .as_deref()
++                    .filter(|ids| !ids.is_empty())
++                    .unwrap_or(&anchor);
++                let mut total = 0usize;
++                for &target in targets {
++                    let node = self.arena.node(self.arena.resolve(target)?);
++                    if !node.has_device_value(SWA) || node.has_host_value(SWA) {
++                        return Err(invalid());
++                    }
++                    total = total
++                        .checked_add(node.device_value_len(SWA))
++                        .ok_or_else(invalid)?;
++                }
++                if total != host_indices.len() {
++                    return Err(invalid());
++                }
++            }
++        }
++        Ok(())
++    }
++
+     /// Commit a successful backup to the node.
++    /// On error no rows are adopted. The caller must release its staged pool
++    /// allocations and build a fresh spec before retrying.
+     pub fn commit_backup(
+         &mut self,
+         node_id: NodeId,
+         host_indices: V,
+         comp_xfers: HashMap<ComponentType, Vec<PoolTransfer<V>>>,
+-    ) -> Result<(), NodeAccessError> {
++    ) -> Result<(), TreeCoreRuntimeError> {
+         let node_id = self.arena.resolve(node_id)?;
+         self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
++        if !host_indices.is_empty() && host_indices.len() != self.arena.node(node_id).key.atom_len()
++        {
++            return Err(TreeCoreRuntimeError::InvalidBackupSpec {
++                node_id: self.arena.node(node_id).id,
++                component_type: FULL,
++            });
++        }
++        for (&component_type, transfers) in &comp_xfers {
++            self.validate_backup_transfers_(node_id, component_type, transfers)?;
++        }
+         let mut cache_actions: Vec<CacheAction<V>> = Vec::new();
+         if !host_indices.is_empty() {
+             let kv_xfer = PoolTransfer {
+@@ -4469,7 +4680,7 @@
          device_indices: V,
          mut kv_xfer: PoolTransfer<V>,
          comp_xfers: HashMap<ComponentType, Vec<PoolTransfer<V>>>,
@@ -1012,7 +1142,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let anchor_id = node_id;
          let node_id = self.arena.resolve(node_id)?;
          let loaded_node_indices = kv_xfer
-@@ -4479,6 +4614,115 @@
+@@ -4479,6 +4690,127 @@
              .map(|&loaded_id| self.arena.resolve(loaded_id))
              .collect::<Result<Vec<_>, _>>()?;
          self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
@@ -1078,10 +1208,22 @@ and its LICENSE for provenance, the preserved license, and each local correction
 +        // when Full has no rows to restore. Check every destination and ordered
 +        // host source before any component adopts rows or publishes events.
 +        for (&component_type, transfers) in &comp_xfers {
++            // Mamba's first transfer materializes the anchor's tree checkpoint.
++            // Later transfers may copy into request-owned slots, but cannot
++            // stand in for the tree transfer consumed by the component hook.
++            if component_type == MAMBA
++                && transfers.first().and_then(|t| t.nodes_to_load.as_deref())
++                    != Some(&[anchor_id][..])
++            {
++                return Err(invalid());
++            }
 +            for transfer in transfers {
 +                let Some(node_ids) = &transfer.nodes_to_load else {
 +                    continue; // Request-owned Mamba CoW destination, not a tree slot.
 +                };
++                if component_type == MAMBA && node_ids.as_slice() != [anchor_id] {
++                    return Err(invalid());
++                }
 +                let counts = transfer.node_row_counts.as_deref().ok_or_else(invalid)?;
 +                if counts.len() != node_ids.len() {
 +                    return Err(invalid());
@@ -1128,7 +1270,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let mut cache_actions: Vec<CacheAction<V>> = Vec::new();
          kv_xfer.device_indices = Some(device_indices);
          let nodes_to_load = kv_xfer.nodes_to_load.clone();
-@@ -4547,6 +4791,9 @@
+@@ -4547,6 +4879,9 @@
                  self.arena.node_mut(idx).load_back_pending_id = None;
                  // The pin blocked leaf-set membership; re-evaluate it.
                  self.update_evictable_leaf_sets_(idx);
@@ -1138,7 +1280,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              }
              self.update_full_coexisting_host_tracking_(idx);
              node_id = self.arena.node(idx).try_parent();
-@@ -4709,8 +4956,12 @@
+@@ -4709,8 +5044,12 @@
              if node.write_through_pending_id == Some(ack_id) {
                  node.write_through_pending_id = None;
                  self.update_full_coexisting_host_tracking_(node_idx);
@@ -1153,7 +1295,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          }
          Ok(())
      }
-@@ -4829,6 +5080,11 @@
+@@ -4829,6 +5168,11 @@
          for &(child_id, pos, prefix_len) in &spans {
              if pos + prefix_len <= window_start {
                  continue;
@@ -1165,7 +1307,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              }
              if self.arena.has_device_value(child_id, SWA) {
                  return Err(format!(
-@@ -5833,6 +6089,12 @@
+@@ -5833,6 +6177,12 @@
          let last_device_node_idx = self.arena.resolve(result.last_device_node_id)?;
          self.arena.resolve(result.last_host_node_id)?;
          let best_match_node_idx = self.arena.resolve(result.best_match_node_id)?;
@@ -1178,7 +1320,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          Ok(self
              .component_by_type_(component_type)
              .finalize_match_result_in_tree_core(
-@@ -5843,6 +6105,7 @@
+@@ -5843,6 +6193,7 @@
                  params,
                  value_chunks,
                  best_value_len,

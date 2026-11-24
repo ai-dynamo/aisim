@@ -77,6 +77,13 @@ following local corrections to this pinned revision:
 - Validate SWA eviction-boundary alignment before inserting Full KV or events.
 - Reject host insertions with a page-hash count that differs from the key's
   page count before touching recency, splitting edges, or attaching host rows.
+- Reject unaligned host keys, empty page hashes, and host buffers too short for
+  the key before any mutation. Preserve imported parent hashes as chain seeds.
+- Preflight Full and SWA backup spans before any component adopts host rows.
+  Reject plans invalidated by an edge split; the caller releases rejected staged
+  pool allocations and rebuilds the spec before retrying.
+- Bind Mamba load-back's first tree transfer to the restore anchor, preserving
+  subsequent request-owned copies without treating them as tree destinations.
 - Preserve integer-first T-LRU arithmetic when it fits; convert positive
   history-plus-estimate overflow to finite floating-point arithmetic.
 - Defer demotion while device locks are held or device children have appeared,
@@ -109,6 +116,8 @@ following local corrections to this pinned revision:
   access tick, and priority before and after each rejected continuation.
 - Assert that the read-only prefix probe preserves the compressed edge and its
   access tick immediately, before the mutating match control.
+- Assert that chunked continuation leaves the retained anchor's hit count
+  unchanged, separately from finished-continuation backup actions.
 - Assert rejected SWA attachment and locked suffix eviction leave the original
   four-atom edge unsplit before retrying or releasing the lock.
 - Keep borrowed namespace fields private so their cached hash stays consistent.

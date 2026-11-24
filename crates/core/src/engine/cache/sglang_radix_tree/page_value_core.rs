@@ -302,7 +302,9 @@ fn finished_continuation_inserts_replay_hit_counts_and_write_through_on_the_pref
         .last_device_node_id;
 
     // Per-step growth is chunked: no hit count moves, so nothing reaches the threshold.
+    let hits = tree.inspect_get_node_hit_count(anchor).unwrap();
     let grown = continuation(&mut tree, anchor, &[10, 20, 50, 60], &[5, 6], true);
+    assert_eq!(tree.inspect_get_node_hit_count(anchor).unwrap(), hits);
     assert!(backups(&grown).is_empty());
 
     // Finishing a second request through the prefix is its second hit, which a

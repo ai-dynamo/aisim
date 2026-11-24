@@ -3960,11 +3960,26 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         if !anchor.is_root() && anchor.namespace.as_ref() != namespace {
             return Err(TreeCoreRuntimeError::InsertHostNamespaceMismatch { node_id: anchor.id });
         }
+        if !total_len.is_multiple_of(self.page_size) {
+            return Err(TreeCoreRuntimeError::InsertHostKeyNotPageAligned {
+                key_len: total_len,
+                page_size: self.page_size,
+            });
+        }
         let page_count = total_len / self.page_size;
         if hash_value.len() != page_count {
             return Err(TreeCoreRuntimeError::InsertHostHashCount {
                 hash_count: hash_value.len(),
                 page_count,
+            });
+        }
+        if let Some(page_index) = hash_value.iter().position(String::is_empty) {
+            return Err(TreeCoreRuntimeError::InsertHostEmptyHash { page_index });
+        }
+        if host_value.len() < total_len {
+            return Err(TreeCoreRuntimeError::InsertHostValueTooShort {
+                value_len: host_value.len(),
+                required_len: total_len,
             });
         }
         self.touch_node_(node_id);
@@ -4524,9 +4539,14 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         cache_actions: &mut Vec<CacheAction<V>>,
         mut insert_result: Option<&mut InsertResult<V>>,
         pool_storage_result: Option<&PoolTransferResult>,
-    ) -> Result<(), NodeAccessError> {
+    ) -> Result<(), TreeCoreRuntimeError> {
         let node_id = self.arena.resolve(node_id)?;
         self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
+        if phase == CacheTransferPhase::BackupHost {
+            for (&component_type, transfers) in &comp_xfers {
+                self.validate_backup_transfers_(node_id, component_type, transfers)?;
+            }
+        }
         if let Some(insert_result) = insert_result.as_deref() {
             if let Some(last_device_node_id) = insert_result.last_device_node_id {
                 self.arena.resolve(last_device_node_id)?;
@@ -4550,15 +4570,71 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         Ok(())
     }
 
+    /// Validate staged backup spans before any component adopts host rows.
+    fn validate_backup_transfers_(
+        &self,
+        node_id: NodeIdx_,
+        component_type: ComponentType,
+        transfers: &[PoolTransfer<V>],
+    ) -> Result<(), TreeCoreRuntimeError> {
+        let invalid = || TreeCoreRuntimeError::InvalidBackupSpec {
+            node_id: self.arena.node(node_id).id,
+            component_type,
+        };
+        for transfer in transfers {
+            let Some(host_indices) = &transfer.host_indices else {
+                continue;
+            };
+            if component_type == FULL {
+                if host_indices.len() != self.arena.node(node_id).key.atom_len() {
+                    return Err(invalid());
+                }
+            } else if component_type == SWA {
+                let anchor = [self.arena.node(node_id).id];
+                let targets = transfer
+                    .nodes_to_load
+                    .as_deref()
+                    .filter(|ids| !ids.is_empty())
+                    .unwrap_or(&anchor);
+                let mut total = 0usize;
+                for &target in targets {
+                    let node = self.arena.node(self.arena.resolve(target)?);
+                    if !node.has_device_value(SWA) || node.has_host_value(SWA) {
+                        return Err(invalid());
+                    }
+                    total = total
+                        .checked_add(node.device_value_len(SWA))
+                        .ok_or_else(invalid)?;
+                }
+                if total != host_indices.len() {
+                    return Err(invalid());
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Commit a successful backup to the node.
+    /// On error no rows are adopted. The caller must release its staged pool
+    /// allocations and build a fresh spec before retrying.
     pub fn commit_backup(
         &mut self,
         node_id: NodeId,
         host_indices: V,
         comp_xfers: HashMap<ComponentType, Vec<PoolTransfer<V>>>,
-    ) -> Result<(), NodeAccessError> {
+    ) -> Result<(), TreeCoreRuntimeError> {
         let node_id = self.arena.resolve(node_id)?;
         self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
+        if !host_indices.is_empty() && host_indices.len() != self.arena.node(node_id).key.atom_len()
+        {
+            return Err(TreeCoreRuntimeError::InvalidBackupSpec {
+                node_id: self.arena.node(node_id).id,
+                component_type: FULL,
+            });
+        }
+        for (&component_type, transfers) in &comp_xfers {
+            self.validate_backup_transfers_(node_id, component_type, transfers)?;
+        }
         let mut cache_actions: Vec<CacheAction<V>> = Vec::new();
         if !host_indices.is_empty() {
             let kv_xfer = PoolTransfer {
@@ -4676,10 +4752,22 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         // when Full has no rows to restore. Check every destination and ordered
         // host source before any component adopts rows or publishes events.
         for (&component_type, transfers) in &comp_xfers {
+            // Mamba's first transfer materializes the anchor's tree checkpoint.
+            // Later transfers may copy into request-owned slots, but cannot
+            // stand in for the tree transfer consumed by the component hook.
+            if component_type == MAMBA
+                && transfers.first().and_then(|t| t.nodes_to_load.as_deref())
+                    != Some(&[anchor_id][..])
+            {
+                return Err(invalid());
+            }
             for transfer in transfers {
                 let Some(node_ids) = &transfer.nodes_to_load else {
                     continue; // Request-owned Mamba CoW destination, not a tree slot.
                 };
+                if component_type == MAMBA && node_ids.as_slice() != [anchor_id] {
+                    return Err(invalid());
+                }
                 let counts = transfer.node_row_counts.as_deref().ok_or_else(invalid)?;
                 if counts.len() != node_ids.len() {
                     return Err(invalid());

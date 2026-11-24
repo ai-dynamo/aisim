@@ -750,6 +750,12 @@ pub struct NodeAccessError {
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, thiserror::Error)]
 pub enum TreeCoreRuntimeError {
+    /// A backup's staged host rows no longer cover its current device span.
+    #[error("stale or malformed {component_type:?} backup spec for node {node_id}")]
+    InvalidBackupSpec {
+        node_id: NodeId,
+        component_type: ComponentType,
+    },
     /// Full load-back no longer describes the planned host-to-device mapping.
     #[error("stale or malformed Full load-back spec for node {node_id}")]
     InvalidLoadBackSpec { node_id: NodeId },
@@ -807,6 +813,16 @@ pub enum TreeCoreRuntimeError {
     InsertHostHashCount {
         hash_count: usize,
         page_count: usize,
+    },
+    /// An empty digest cannot seed the next page's storage hash chain.
+    #[error("host insert page hash at index {page_index} is empty")]
+    InsertHostEmptyHash { page_index: usize },
+    #[error("host insert key length {key_len} is not aligned to page size {page_size}")]
+    InsertHostKeyNotPageAligned { key_len: usize, page_size: usize },
+    #[error("host insert has {value_len} host rows, expected at least {required_len}")]
+    InsertHostValueTooShort {
+        value_len: usize,
+        required_len: usize,
     },
     /// Continuation inserts must start at the exact page-aligned prefix boundary.
     #[error(
