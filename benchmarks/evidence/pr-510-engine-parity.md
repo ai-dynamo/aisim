@@ -126,3 +126,111 @@ The description-publication requirement for `PRRT_kwDOT0t9uc66hmrt` remains
 open. This worker has read-only GitHub access and cannot add these commands and
 results to the PR description. Threads `PRRT_kwDOT0t9uc66tXLC` and
 `PRRT_kwDOT0t9uc66tXLI` are covered by the fixes and targeted tests above.
+
+## Scoped capture and replay boundary repair
+
+Verified on 2026-11-24 against source/test correction
+`f8361f49f92b2c2e228e91be057642897ff80cf1`, descended from pinned head
+`5ea4120ebd294125506178b5243bf0d149c0ae82`. The accompanying evidence-only
+commit changes no executable code. Seven selected threads are covered:
+`PRRT_kwDOT0t9uc66t3g2`, `PRRT_kwDOT0t9uc66t3g6`,
+`PRRT_kwDOT0t9uc66t3g_`, `PRRT_kwDOT0t9uc66t3hD`,
+`PRRT_kwDOT0t9uc66t3hF`, `PRRT_kwDOT0t9uc66t3hJ`, and
+`PRRT_kwDOT0t9uc66t3hM`.
+
+The environment was Linux x86_64 under WSL2, Python 3.12.12, Rust 1.91.1,
+maturin 1.16.0, pytest 9.1.1, PyArrow 24.0.0, and NumPy 2.5.2. Dependencies
+came from `uv sync --project python/aisimulate --extra dev --frozen
+--no-install-project`, with `UV_PROJECT_ENVIRONMENT` pointing into this repair's
+scratch directory. The optimized mixed-project wheel was built from
+`python/aisimulate` with the `--profile ci` command in the preceding section,
+before any native verification. `CARGO_BUILD_JOBS=2` and all build/cache/temp
+directories remained in scratch. The imported `_runtime.abi3.so` SHA-256 was
+`57aa719e6013b924a7d5b31824302fed863f6dda2abfbd041d19efb0e747d43e`.
+All five edited Python modules were checked byte-for-byte against the installed
+wheel. Rust source, goldens, assertions, and timeouts were unchanged.
+
+With the scratch venv on PATH, the exact parity invocations were:
+
+```bash
+python -m pytest -q -rx -n 2 -c python/aisimulate/pytest.ini crates/core/parity_tests/perfmodel/test_engine_step_parity.py -p no:cacheprovider --basetemp "$TMPDIR/pytest-engine-parity"
+python -m pytest -q -rx -n 2 -c python/aisimulate/pytest.ini crates/core/parity_tests/perfmodel/test_compile_engine_parity.py -p no:cacheprovider --basetemp "$TMPDIR/pytest-compile-parity"
+```
+
+Results: **305 passed in 77.93s** and **85 passed in 11.94s**, without skips.
+Logs: `engine-parity.log` and `compile-parity.log` under `TMPDIR`.
+
+Final caller and import verification:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q python/aisimulate/tests/unit/test_fastafd_profile.py python/aisimulate/tests/unit/test_fastafd_profile_build.py tests/sweeper/test_afd_fastafd.py tests/sweeper/test_afd_perfmodel.py tests/sweeper/test_afd_engine.py tests/test_afd_runner.py -p no:cacheprovider --timeout=120 --basetemp "$TMPDIR/pytest-targeted-final"
+```
+
+Result: **652 passed in 15.01s** (`targeted.log`). This includes both inspection
+and native loading for binary/UTF-8 Parquet metadata, byte preservation of raw
+captures, repeated symlink rejection, invalid routing, positive sequence lengths,
+matching replay after source-profile deletion, changed replay geometry, and
+conflicting typed/provenance traces. Existing raw-only and matching typed traces
+remain valid. Restoring the pinned Python modules with the same native binary
+made the new negative regressions fail: **39 failed, 4 passed** (the passes are
+UTF-8 controls), recorded in `baseline-regressions.log`.
+
+Earlier attempts are preserved: `baseline-collection.log` used the application's
+pytest config for root sweeper tests and failed collection on its missing
+`gpu_0` marker; the rerun used the root config. `targeted-initial.log` contains
+645 passes and seven new test-setup failures: the fixtures serialized a provenance
+dictionary instead of the deployment topology schema. Correcting that setup,
+without weakening assertions, produced the passing final run. The timing-span
+publication regression now starts with a valid generated profile, preserving its
+original rejection and byte-preservation assertions under the new output guard.
+
+The replay guard compares a fixed five-field stage key and supported geometry;
+it neither reopens a profile nor scans decode samples per pass. Typed-trace
+validation adds comparisons within the existing preparation walk, with no new
+trace copy or retained state. A matched CLI comparison additionally measured
+the complete supervised `aisimulate predict --stack engine` call, including
+startup, preparation, replay, and report writing. It used identical installed
+dependencies/native binary and import hooks selecting the five Python modules
+from the exact baseline/candidate commits above. No build, test, or profiler ran
+concurrently with these measurements.
+
+Both fixtures used the test's synthetic Qwen3-235B stage, gb200/sglang, 94 layers,
+two microbatches, 64 A GPUs, eight F GPUs, a fixed prefill companion, ISL 1024,
+and explicit KV capacity 1152. The control completed one request with OSL 2;
+the longer case completed 32 with OSL 128. The initial control's default KV
+capacity was infeasible (`perf/preflight.log`); explicit sufficient capacity
+passed (`perf/preflight-fit.log`). This is synthetic-stage regression and host
+cost evidence, not measured serving accuracy.
+
+One alternating warmup pair preceded five measured alternating pairs per fixture:
+
+| Fixture | Baseline median seconds | Candidate median seconds | Five candidate/baseline ratios | Completed AFD passes / intervals |
+| --- | --- | --- | --- | --- |
+| Control | 3.4044 | 3.4052 | 0.9991, 1.0016, 1.0128, 0.9959, 1.0013 | 1 / 752 |
+| Longer replay | 5.6906 | 5.6912 | 1.0092, 1.0180, 0.9880, 0.9902, 1.0001 | 4064 / 3056128 |
+
+Every normalized `prediction.json` (all 24 warmup/measured invocations) matched
+within each fixture, including lifecycle counts and prediction metrics. Canonical
+JSON SHA-256 values were
+`0feaeaeda0a1ecc2d1f34f595fcc490422f7c39230ae204e909c6d84c9275b3d`
+(control) and
+`22f63d65b5560942178aac1ddddb15fa99762f287e1ae23eb8ec6d098835ae16`
+(longer replay). The small comparison detected no material integrated overhead;
+it is not a statistical performance qualification. Commands, frozen YAMLs,
+checksums, paired samples, and logs are retained under `TMPDIR/perf/`, with
+the comparison command `python "$TMPDIR/perf/compare.py"` and aggregate log
+`TMPDIR/perf-comparison.log`.
+
+Repository-wide Ruff lint/format, Python syntax compilation, Rust formatting,
+SPDX/packaged-legal checks, seven documentation-link tests, the 79-file
+documentation-destination check, and changed-line whitespace checks passed.
+The live PR still pointed at the pinned starting head and base `main` at final
+inspection. The workflow-runs API returned HTTP 403, so hosted workflow logs
+were unavailable; the readable current-head checks reported pre-existing DCO
+failures on eight commits by another author. No history was rewritten or
+attestation added for those commits.
+
+`PRRT_kwDOT0t9uc66hmrt` remains open solely for the explicitly requested
+PR-description publication. The live description still lacks the parity commands
+and results. A maintainer with PR-edit permission must copy them there; this
+read-only worker cannot complete that part of the request.
