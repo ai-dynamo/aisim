@@ -3401,7 +3401,7 @@ fn validate_aic_state_cache(
         }
     }
     bail!(
-        "Recurrent and unregistered fitted decoders require explicit state_cache geometry (vLLM G1 only) \
+        "Replay of a recurrent or unregistered fitted decoder requires explicit state_cache geometry (vLLM G1 only) \
          or a qualified grouped FPM memory profile containing per-request state; \
          num_gpu_blocks and token-only KV capacity do not account for per-request state"
     )
@@ -3527,15 +3527,24 @@ fn resolve_role_timing(
             launch.max_cudagraph_capture_size
         );
     }
-    let mut timing = AicTimingModel::build(&mut config, worker_type, role.rank.vision)?;
-    let resources = if config.backend == "vllm" && config.pp == 1 {
-        config.estimator_request(worker_type)?.fpm_resources()?
-    } else {
-        None
+    let memory_resources = |config: &AicTimingConfig| -> Result<_> {
+        if config.backend != "vllm" || config.pp != 1 || config.fpm_profile.is_none() {
+            return Ok(None);
+        }
+        let resources = config.estimator_request(worker_type)?.fpm_resources()?;
+        if let Some(resources) = &resources {
+            resources.require_memory()?;
+        }
+        Ok(resources)
     };
-    if let Some(resources) = &resources {
-        resources.require_memory()?;
-    }
+    // An explicitly supplied pending profile fails before timing data is loaded.
+    let declared_resources = memory_resources(&config)?;
+    let mut timing = AicTimingModel::build(&mut config, worker_type, role.rank.vision)?;
+    // An omitted profile can come from the fitted snapshot's pinned identity.
+    let resources = match declared_resources {
+        Some(resources) => Some(resources),
+        None => memory_resources(&config)?,
+    };
     // Direct FPM graphs are empty. Canonical construction has already checked
     // this profile architecture against checkpoint metadata, including the
     // KimiLinear decoder nested in the K3.1 multimodal checkpoint.
