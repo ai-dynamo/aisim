@@ -5354,12 +5354,11 @@ pub(crate) mod tests {
     #[test]
     fn generation_only_qualified_mamba_rejects_shared_token_overflow() {
         let engine = qualified_mamba_engine(3);
-        let mut spec = EngineSpec::new(
+        let spec = EngineSpec::new(
             fixture_engine_config(Some(3)),
             vec![Op::Elementwise(ElementwiseOp::new("norm", 2.0))],
             vec![qualified_mamba(false, 4)],
         );
-        spec.sol_ops.clear();
         let engine = Engine::build(spec, engine.db.clone()).unwrap();
         let requests = u32::MAX / 4;
         // Packed decode fits at 4_294_967_292, but eight more prefill
