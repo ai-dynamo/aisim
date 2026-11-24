@@ -208,7 +208,7 @@ FULL_MATRIX_TRIGGER_PATHS = [
     "python/aisim/tests/e2e/tools/test_sanity_check.py",
 ]
 DIFF_SCOPED_PATHS = [
-    "python/aisim/src/aisim_core/systems/data/gb200/gemm/trtllm/1.3.0rc20/gemm_perf.parquet",
+    # Operation tables are no longer packaged, so a data file is not a repository path to select on.
     "python/aisim/src/aisim_core/systems/gb200.yaml",
     "python/aisim/src/aisim/legacy_cli/main.py",
 ]

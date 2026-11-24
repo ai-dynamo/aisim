@@ -290,11 +290,18 @@ def shard_dir(root: Path, shard: Shard) -> Path:
     return root / shard.op / shard.name
 
 
-def shard_state(root: Path, shard: Shard) -> str:
+def _native_phase_table(op: str) -> str:
+    phase = "context" if op == "kimi_k31_dsa_context_module" else "generation"
+    return f"dsa_{phase}_module_perf.parquet"
+
+
+def shard_state(root: Path, shard: Shard, backend: str | None = None) -> str:
     d = shard_dir(root, shard)
     if not d.exists():
         return "pending"
-    if list(d.glob("*.parquet")):
+    native = backend is not None and _native_k31(backend, shard.op)
+    published = (d / _native_phase_table(shard.op)).is_file() if native else any(d.glob("*.parquet"))
+    if published:
         return "finalized"
     if (d / "DONE").exists():
         return "done-no-parquet"
@@ -352,13 +359,11 @@ def run_shard(
         rc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT).returncode
         log.write(f"### {time.strftime('%FT%T')} exit={rc}\n")
     parquets = sorted(p.name for p in d.glob("*.parquet"))
-    if rc == 0 and _native_k31(plan.backend, shard.op):
-        phase = "context" if shard.op == "kimi_k31_dsa_context_module" else "generation"
-        if f"dsa_{phase}_module_perf.parquet" not in parquets:
-            rc = 1
-            (d / "DONE").unlink(missing_ok=True)
-            with (d / "run.log").open("a") as log:
-                log.write("No native phase table was published. Inspect the checkpoint and case diagnostics.\n")
+    if rc == 0 and _native_k31(plan.backend, shard.op) and _native_phase_table(shard.op) not in parquets:
+        rc = 1
+        (d / "DONE").unlink(missing_ok=True)
+        with (d / "run.log").open("a") as log:
+            log.write("No native phase table was published. Inspect the checkpoint and case diagnostics.\n")
     if rc == 0:
         (d / "DONE").touch()
     _log(root, {"event": "end", "mode": mode, "shard": shard.key, "gpu": gpu, "exit": rc, "parquet": parquets})
@@ -422,8 +427,9 @@ def run_campaign(
     root.mkdir(parents=True, exist_ok=True)
     todo = []
     for s in plan.shards:
-        st = shard_state(root, s)
-        if mode == "run" and st in ("finalized", "done-no-parquet") and (shard_dir(root, s) / "DONE").exists():
+        st = shard_state(root, s, plan.backend)
+        completed = st == "finalized" or (st == "done-no-parquet" and not _native_k31(plan.backend, s.op))
+        if mode == "run" and completed and (shard_dir(root, s) / "DONE").exists():
             continue
         if mode == "finalize" and st != "done-no-parquet":
             continue
@@ -492,7 +498,7 @@ def status(plan: Plan, root: Path) -> None:
             last = next(
                 (ln for ln in reversed(tail) if "it/s" in ln or "s/it" in ln or "Completed" in ln or "exit=" in ln), ""
             )
-        print(f"{s.op:28s} {s.name:20s} {shard_state(root, s):16s} {last[:100]}")
+        print(f"{s.op:28s} {s.name:20s} {shard_state(root, s, plan.backend):16s} {last[:100]}")
 
 
 def main() -> int:

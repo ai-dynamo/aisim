@@ -1,4 +1,7 @@
 <!--
+
+The six systems' original Parquet files and collection metadata remain available at [the pre-migration revision](https://github.com/ai-dynamo/aisim/tree/8f4603379f1c9b8a846db7066c0c6306709cd834/python/aisimulate/src/aisimulate_core/systems/data). Dataset publication preserves the decoded measurements and records the Parquet schema stamping in its source audit.
+
 SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0
 -->

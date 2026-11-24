@@ -52,6 +52,7 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
+from op_data_root import op_data_root
 from perf_data_layout import iter_data_files
 
 logger = logging.getLogger(__name__)
@@ -384,7 +385,8 @@ def main() -> None:
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=Path("src/aisim_core/systems/data"),
+        default=None,
+        help="Root of the systems/data tree (default: the pinned op-latency dataset, see op_data_root.py).",
     )
     parser.add_argument("--registry", type=Path, default=Path("collector/op_backend_facts.yaml"))
     parser.add_argument("--backend-map", type=Path, default=Path("collector/kernel_source_backends.yaml"))
@@ -399,7 +401,8 @@ def main() -> None:
 
     logging.basicConfig(level=args.log_level.upper(), format="%(levelname)s %(message)s")
 
-    facts, axes_by_op = scan(args.data_root)
+    data_root = op_data_root(args.data_root)
+    facts, axes_by_op = scan(data_root)
     mappings = load_backend_map(args.backend_map)
     unmapped: set[tuple[str, str]] = set()
     by_op = _fact_entries(facts, axes_by_op, mappings, unmapped)
@@ -427,10 +430,10 @@ def main() -> None:
                 print(f"... and {len(failures) - 50} more")
             print(
                 f"\nFAIL: {len(drift)} drift differences, {len(problems)} catalog inconsistencies "
-                f"between {args.registry} and {args.data_root}"
+                f"between {args.registry} and {data_root}"
             )
             sys.exit(1)
-        print(f"OK: {args.registry} matches {args.data_root} ({total:,} fact slices)")
+        print(f"OK: {args.registry} matches {data_root} ({total:,} fact slices)")
         return
 
     if problems:

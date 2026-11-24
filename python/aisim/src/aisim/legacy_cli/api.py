@@ -1239,9 +1239,11 @@ def cli_estimate(
     from aisim.sdk.backends.factory import get_backend
     from aisim.sdk.models import get_model
     from aisim.sdk.perf_database import (
+        explicit_systems_paths,
         get_database_view,
         get_latest_database_version,
         get_systems_paths,
+        restore_systems_paths,
         set_systems_paths,
     )
 
@@ -1272,12 +1274,12 @@ def cli_estimate(
 
     active_systems_paths = None
     if systems_paths is not None:
-        previous_systems_paths = get_systems_paths()
+        previous_systems_paths = explicit_systems_paths()  # unresolved stays unresolved: no default dataset needed
         try:
             set_systems_paths(systems_paths)
             active_systems_paths = get_systems_paths()
         finally:
-            set_systems_paths(previous_systems_paths)
+            restore_systems_paths(previous_systems_paths)
 
     def _resolve_version_for(sys_name: str) -> str:
         resolved_version = backend_version

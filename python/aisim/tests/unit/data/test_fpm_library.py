@@ -1102,11 +1102,13 @@ def test_restaging_a_returned_configuration_never_links_through_its_own_root(roo
 
 
 def test_systems_paths_use_the_canonical_default_and_home_forms(monkeypatch, tmp_path):
+    from aisim_core.data.default_systems import default_systems_path
     from aisim_core.data.fpm_library import _stageable_roots
 
+    default = Path(default_systems_path()).resolve()  # composed before HOME moves, so the data cache stays the real one
     monkeypatch.setenv("HOME", str(tmp_path))
     roots = _stageable_roots(["default", "~/custom"], None)
-    assert roots[0].name == "systems" and roots[0].is_absolute() and roots[1] == tmp_path / "custom"
+    assert roots[0] == default and roots[0].is_absolute() and roots[1] == tmp_path / "custom"
     assert _stageable_roots(["~/custom", "/x"], tmp_path / "custom") == [Path("/x"), *_stageable_roots(None, None)]
 
 

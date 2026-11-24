@@ -364,6 +364,7 @@ def test_native_shard_done_requires_its_phase_table(tmp_path, monkeypatch, publi
     (out / ".ckpt").mkdir()
     (out / "DONE").touch()
     (out / ("dsa_generation_module_perf.parquet" if published else "other.parquet")).touch()
+    assert c.shard_state(tmp_path, shard, plan.backend) == ("finalized" if published else "done-no-parquet")
     monkeypatch.setattr(c, "image_digest", lambda _: "sha256:test")
     monkeypatch.setattr(c.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0))
     rc = c.run_shard(plan, shard, root=tmp_path, gpu=0, checkout=tmp_path, image="test", collector_ref="0" * 40)

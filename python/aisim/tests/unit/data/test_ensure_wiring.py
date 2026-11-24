@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from aisim.main import main
+from aisim_core.data import default_systems
 from aisim_core.data import ensure as ensure_mod
 from aisim_core.sdk import perf_database
 from aisim_core.sdk import rust_engine_step as res
@@ -29,7 +30,17 @@ def isolated_dataset_environment(monkeypatch, tmp_path):
             monkeypatch.delenv(name)
     monkeypatch.setenv("AISIM_DATA_CACHE", str(tmp_path / "cache"))
     monkeypatch.delenv("AICONFIGURATOR_SYSTEMS_PATH", raising=False)
-    monkeypatch.setattr(perf_database, "_SYSTEMS_PATHS", list(perf_database._SYSTEMS_PATHS))  # restored afterwards
+    monkeypatch.setattr(perf_database, "_SYSTEMS_PATHS", None)  # no override held; restored afterwards
+
+
+@pytest.fixture(autouse=True)
+def default_root(monkeypatch, tmp_path):
+    """A stand-in for the composed default systems root, so no test fetches or composes the pinned dataset."""
+    root = tmp_path / "default-systems"
+    root.mkdir()
+    monkeypatch.setattr(default_systems, "_resolved", {})
+    monkeypatch.setattr(default_systems, "_compose", lambda *args, **kwargs: root)
+    return str(root)
 
 
 def test_no_pin_does_not_touch_config(monkeypatch):
@@ -172,7 +183,7 @@ def test_the_recommendation_consumer_keeps_an_explicit_default_root_distinct_fro
     monkeypatch,
     mode,
 ):
-    """Both expand to the packaged root, but only the literal ``default`` outranks the saved source."""
+    """Both expand to the default root, but only the literal ``default`` outranks the saved source."""
     published, _, config = native_dataset
     transport = FakeTransport(_tree(published))
     monkeypatch.setattr("aisim_core.data.fetch.HfTransport", lambda: transport)
@@ -186,10 +197,9 @@ def test_the_recommendation_consumer_keeps_an_explicit_default_root_distinct_fro
     assert res._ensure_dataset(unset, None) == "ensured"
 
 
-def test_an_explicit_default_root_survives_native_serialization_with_an_environment_root(monkeypatch, tmp_path):
-    from importlib import resources
-
-    packaged = str(resources.files("aisim_core") / "systems")
+def test_an_explicit_default_root_survives_native_serialization_with_an_environment_root(
+    monkeypatch, tmp_path, default_root
+):
     environment = tmp_path / "environment"
     environment.mkdir()
     monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", str(environment))
@@ -200,27 +210,24 @@ def test_an_explicit_default_root_survives_native_serialization_with_an_environm
         )
         return json.loads(res._forward_pass_config_json(config))["systems_paths"]
 
-    # An explicit default is the bundled data even though the environment names other roots; unset roots follow it.
-    assert serialized(systems_paths=("default",)) == [packaged]
+    # An explicit default is the default data even though the environment names other roots; unset roots follow it.
+    assert serialized(systems_paths=("default",)) == [default_root]
     assert serialized() == [str(environment)]
     # The raw mapping form resolves once as well.
     mapping = {"estimation_mode": "op_level", "systems_paths": ["default"]}
-    assert json.loads(res._forward_pass_config_json(mapping))["systems_paths"] == [packaged]
+    assert json.loads(res._forward_pass_config_json(mapping))["systems_paths"] == [default_root]
 
 
-def test_request_roots_keep_the_configured_order_when_an_environment_root_is_set(monkeypatch, tmp_path):
-    from importlib import resources
-
+def test_request_roots_keep_the_configured_order_when_an_environment_root_is_set(monkeypatch, tmp_path, default_root):
     from aisim.sweeper.forward_pass_estimator import request_systems_paths
 
-    packaged = str(resources.files("aisim_core") / "systems")
     custom, environment = tmp_path / "custom", tmp_path / "environment"
     custom.mkdir()
     environment.mkdir()
     monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", str(environment))
-    configured = [packaged, "default", str(custom)]
+    configured = [default_root, "default", str(custom)]
     # The environment root replaces only an unset list; explicit entries stay in order, the token stays a token.
-    assert request_systems_paths(configured) == (packaged, "default", str(custom))
+    assert request_systems_paths(configured) == (default_root, "default", str(custom))
     assert request_systems_paths(["default", str(custom)]) == ("default", str(custom))
 
 
@@ -253,7 +260,7 @@ def test_configured_roots_outrank_the_saved_source_whether_or_not_the_request_na
     unnamed = {"estimation_mode": mode, "system": "h200_sxm", "backend": "vllm"}
     assert res._ensure_dataset(unnamed, None) is None
 
-    # Nothing configured: the packaged roots are a default, and the saved source applies again.
+    # Nothing configured: the default root is a default, and the saved source applies again.
     monkeypatch.delenv("AICONFIGURATOR_SYSTEMS_PATH", raising=False)
     perf_database.set_systems_paths(None)
     _, request = _sweeper_request(config.model, mode=mode)
@@ -288,12 +295,14 @@ def test_environment_root_reaches_prediction_for_packaged_only_paths(
     assert not transport.opened
 
 
-def test_a_literal_default_stays_the_bundled_data_when_the_environment_names_a_root(tmp_path, monkeypatch):
+def test_a_literal_default_stays_the_default_data_when_the_environment_names_a_root(
+    tmp_path, monkeypatch, default_root
+):
     perf_database.set_systems_paths(None)
-    packaged = perf_database.get_systems_paths()[0]
+    assert perf_database.get_systems_paths() == [default_root]
     monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", str(tmp_path))
-    assert res._resolve_forward_pass_systems_paths(("default",)) == [packaged]  # an explicit request for bundled data
-    assert res._resolve_forward_pass_systems_paths((packaged,)) == [str(tmp_path)]  # the expansion of unset roots
+    assert res._resolve_forward_pass_systems_paths(("default",)) == [default_root]  # an explicit request for it
+    assert res._resolve_forward_pass_systems_paths((default_root,)) == [str(tmp_path)]  # the expansion of unset roots
     assert res._resolve_forward_pass_systems_paths(()) == [str(tmp_path)]
 
 
