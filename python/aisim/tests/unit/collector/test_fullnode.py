@@ -30,6 +30,7 @@ class _Checkpoint:
     instances: ClassVar[list] = []
 
     def __init__(self, **_kwargs):
+        self._path = Path(_kwargs["checkpoint_dir"]).resolve() / _kwargs["backend"] / f"{_kwargs['module_name']}.json"
         self.passed = []
         self.failed = []
         self.attempted = []
@@ -723,3 +724,145 @@ def test_native_failure_records_survive_interruption_and_plain_resume(monkeypatc
     assert collect() == before
     assert calls == [cases[0], cases[1], cases[1]]
     assert collect() == before  # zero-work resumes retain exact records too
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+@pytest.mark.parametrize("passed", [False, True])
+@pytest.mark.parametrize("other_passed", [False, True])
+def test_native_pending_publication_requires_owning_checkpoint(monkeypatch, tmp_path, phase, passed, other_passed):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as native
+    from collector.collect import ResumeCheckpoint
+    from collector.helper import create_test_case_id
+    from collector.op_plans import ModuleCase
+
+    cases = [ModuleCase(4096, 1, heads, "fp8", "bfloat16", "bfloat16", native.MODEL, 0) for heads in (96, 48)]
+    op = f"kimi_k31_dsa_{phase}_module"
+    full_name = f"sglang.{op}"
+    run_func = "run_kimi_k31_dsa_fullnode"
+    output = tmp_path / f"{phase}.txt"
+    owner_dir = tmp_path / "checkpoint"
+    other_dir = tmp_path / "other-checkpoint"
+    calls = []
+    interrupted = False
+
+    class Checkpoint(ResumeCheckpoint):
+        def flush(self, force=False):
+            nonlocal interrupted
+            super().flush(force=force)
+            if passed and not interrupted and len(self._done) == len(cases):
+                interrupted = True
+                raise KeyboardInterrupt("stopped after checkpoint, before publication")
+
+    def run(*, cases, perf_filename, **kwargs):
+        nonlocal interrupted
+        calls.extend(cases)
+        with Path(perf_filename).open("a") as stream:
+            stream.write(str(cases[0]) + "\n")
+        if not passed and not interrupted and len(calls) == 2:
+            interrupted = True
+            raise KeyboardInterrupt("stopped before checkpoint")
+        return {"failed": []}
+
+    monkeypatch.setattr(native, run_func, run)
+
+    def collect(checkpoint_dir, *, resume=True):
+        return fullnode.collect_sglang_fullnode_op(
+            {
+                "name": "sglang",
+                "type": op,
+                "module": native.__name__,
+                "get_func": f"get_kimi_k31_dsa_{phase}_test_cases",
+                "run_func": run_func,
+                "perf_filename": str(output),
+            },
+            runtime_version=native.RUNTIME_VERSION,
+            limit=None,
+            shuffle=False,
+            shuffle_seed=42,
+            backend="sglang",
+            resume_options={"checkpoint_dir": str(checkpoint_dir), "resume": resume},
+            model_path=native.MODEL,
+            case_plan=None,
+            sm_version=103,
+            case_filters=None,
+            get_test_cases_for_model=lambda *_: cases,
+            resume_checkpoint_cls=Checkpoint,
+            logger=_logger(),
+        )
+
+    with pytest.raises(KeyboardInterrupt, match="stopped"):
+        collect(owner_dir)
+    receipt = output.with_name(f".{output.name}.pending")
+    transaction_bytes = receipt.read_bytes()
+    transaction = json.loads(transaction_bytes)
+    stage = output.with_name(transaction["stage"])
+    stage_bytes = stage.read_bytes()
+    checkpoint_path = owner_dir / "sglang" / f"{full_name}.json"
+    checkpoint_bytes = checkpoint_path.read_bytes()
+    assert output.read_text().splitlines() == [str(cases[0])]
+    assert stage.read_text().splitlines() == list(map(str, cases))
+    assert calls == cases
+
+    other = ResumeCheckpoint(
+        backend="sglang",
+        module_name=full_name,
+        run_func_name=run_func,
+        checkpoint_dir=str(other_dir),
+        framework_version=native.RUNTIME_VERSION,
+        sm_version=103,
+    )
+    if other_passed:
+        for case in cases:
+            task_id = create_test_case_id(case, run_func, full_name)
+            other.mark_attempted(task_id)
+            other.mark_passed(task_id)
+        other.flush(force=True)
+    other_bytes = other._path.read_bytes() if other._path.exists() else None
+
+    # Neither a missing pass nor a matching task ID in another checkpoint
+    # authorizes discarding or promoting this run's stage.
+    with pytest.raises(RuntimeError, match="owning checkpoint") as error:
+        collect(other_dir)
+    assert str(checkpoint_path) in str(error.value)
+    assert receipt.read_bytes() == transaction_bytes
+    assert stage.read_bytes() == stage_bytes
+    assert checkpoint_path.read_bytes() == checkpoint_bytes
+    assert (other._path.read_bytes() if other._path.exists() else None) == other_bytes
+    assert output.read_text().splitlines() == [str(cases[0])]
+    assert calls == cases
+
+    monkeypatch.setenv("COLLECTOR_K31_FINALIZE_ONLY", "1")
+    with pytest.raises(RuntimeError, match="owning checkpoint") as error:
+        collect(other_dir)
+    assert str(checkpoint_path) in str(error.value)
+    monkeypatch.delenv("COLLECTOR_K31_FINALIZE_ONLY")
+
+    # Starting fresh at the same path must not erase a pending passed case.
+    with pytest.raises(RuntimeError, match="--resume"):
+        collect(owner_dir, resume=False)
+    assert receipt.read_bytes() == transaction_bytes
+    assert stage.read_bytes() == stage_bytes
+    assert checkpoint_path.read_bytes() == checkpoint_bytes
+
+    # Older receipts cannot safely be attributed from matching case IDs alone.
+    transaction.pop("checkpoint")
+    receipt.write_text(json.dumps(transaction))
+    legacy_bytes = receipt.read_bytes()
+    with pytest.raises(RuntimeError, match="no owning checkpoint recorded"):
+        collect(owner_dir)
+    assert receipt.read_bytes() == legacy_bytes
+    assert stage.read_bytes() == stage_bytes
+    assert checkpoint_path.read_bytes() == checkpoint_bytes
+    receipt.write_bytes(transaction_bytes)
+
+    # Canonical aliases still identify the owner. Its passed stage is promoted;
+    # an uncheckpointed stage is discarded and only that case is recollected.
+    alias = tmp_path / "checkpoint-alias"
+    alias.symlink_to(owner_dir, target_is_directory=True)
+    if passed:
+        monkeypatch.setenv("COLLECTOR_K31_FINALIZE_ONLY", "1")
+    assert collect(alias) == []
+    assert calls == (cases if passed else [*cases, cases[1]])
+    assert output.read_text().splitlines() == list(map(str, cases))
+    assert not receipt.exists()
+    assert not stage.exists()

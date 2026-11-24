@@ -70,6 +70,22 @@ def select_cases(op: str, cases: list, limit: int | None) -> list:
     return cases
 
 
+def _read_native_receipt(receipt: Path, checkpoint_path: Path) -> dict:
+    transaction = json.loads(receipt.read_text())
+    owner = transaction.get("checkpoint")
+    if owner != str(checkpoint_path):
+        if not owner:
+            raise RuntimeError(
+                f"Pending native publication {receipt} has no owning checkpoint recorded; "
+                "preserve its receipt and stage and identify the original checkpoint before recovery"
+            )
+        raise RuntimeError(
+            f"Pending native publication {receipt} belongs to owning checkpoint {owner}, "
+            f"not {checkpoint_path}; resume the owning checkpoint with --resume"
+        )
+    return transaction
+
+
 def collect_sglang_fullnode_op(
     collection: dict,
     *,
@@ -230,6 +246,15 @@ def _collect_selected_cases(
         framework_version=runtime_version,
         sm_version=sm_version,
     )
+    receipt = output.with_name(f".{output.name}.pending")
+    if native and receipt.exists():
+        # Check ownership before loading or filtering the active checkpoint:
+        # another run's pass set cannot authorize promotion or deletion.
+        _read_native_receipt(receipt, resume_tracker._path)
+        if not (resume_options and resume_options.get("resume")):
+            raise RuntimeError(
+                f"Pending native publication {receipt} requires --resume with owning checkpoint {resume_tracker._path}"
+            )
     if resume_options and resume_options.get("resume"):
         resume_tracker.load_existing()
         task_infos = resume_tracker.filter_done(raw_task_infos, retry_failed=resume_options.get("retry_failed", False))
@@ -274,12 +299,10 @@ def _collect_selected_cases(
     # A native worker can outlive a killed launcher. Give each attempt a
     # private staging file. Only the parent publishes its bytes, after the
     # checkpoint is durable. A receipt bridges the two atomic replacements.
-    receipt = output.with_name(f".{output.name}.pending")
-
     def finish_publication():
         if not receipt.exists():
             return
-        transaction = json.loads(receipt.read_text())
+        transaction = _read_native_receipt(receipt, resume_tracker._path)
         name = transaction["stage"]
         if Path(name).name != name or not name.startswith(f".{output.name}.stage-"):
             raise ValueError(f"invalid native staging filename in {receipt}")
@@ -342,7 +365,11 @@ def _collect_selected_cases(
                     filename = Path(tmp.name)
                 if output.exists():
                     shutil.copyfile(output, filename)
-                transaction = {"task_id": batch[0]["id"], "stage": filename.name}
+                transaction = {
+                    "task_id": batch[0]["id"],
+                    "stage": filename.name,
+                    "checkpoint": str(resume_tracker._path),
+                }
                 pending = receipt.with_suffix(".pending.tmp")
                 with pending.open("w") as stream:
                     json.dump(transaction, stream)
