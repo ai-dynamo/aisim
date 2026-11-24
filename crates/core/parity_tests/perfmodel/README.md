@@ -51,6 +51,9 @@ uv run pytest -q aic-core/rust/aiconfigurator-core/parity_tests/test_compile_eng
 
 ## Golden Fixtures (captured at Gate 2, frozen at Gate 3)
 
+Release 0.14.0 excludes the regression cases that require its removed custom-license model configs, including their chunked-prefill and imbalance fixtures. Their case definitions, golden records and pinning populations are removed together. All retained numerical records and capture provenance remain unchanged; the historical refresh examples below describe excluded cases. Synthetic tests that do not read the removed configs remain.
+
+
 - `goldens/engine_step.json` — every (case, surface) pair in
   `ENGINE_STEP_GOLDEN_MATRIX`, as `{"values": {...}}` or (error-symmetry
   cases) `{"error": ExceptionClassName}` records.
