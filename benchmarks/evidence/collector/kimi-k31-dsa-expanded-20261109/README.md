@@ -41,7 +41,7 @@ their CRLF bytes; source events and original table columns survive the unions.
 The inventory records paths at collection time. To verify its 18 SHA-256 values,
 hash the original files at those paths in the [pre-migration revision](https://github.com/ai-dynamo/aisim/tree/8f4603379f1c9b8a846db7066c0c6306709cd834/python/aisimulate/src/aisimulate_core/systems/data).
 The dataset publication records schema stamping separately and preserves the decoded measurements.
-All campaign allocations have been released.
+The [scheduler accounting](allocation-accounting.json) records 315,762 allocated GPU-seconds for the expansion, including 2,952 on failed attempts. The source is Slurm allocation wall time multiplied by allocated GPUs. Per-phase GPU time and device-active time were not measured.
 
 The GB200 union explicitly migrates legacy schema-1 events to schema 2. The
 legacy integer-zero `classified_failures` key is omitted because schema 2 does

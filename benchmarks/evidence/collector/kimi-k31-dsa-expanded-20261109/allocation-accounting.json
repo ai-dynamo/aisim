@@ -1,0 +1,156 @@
+{
+  "scope": "GPU allocations for the 504-point expansion, including its recorded retries and cancellations. Earlier B300 TP1/2/4 collection is accounted separately.",
+  "source": "Slurm sacct -X allocation records, queried 2026-11-24 by job ID. ElapsedRaw is seconds. AllocTRES gres/gpu is the total across nodes. Step records are excluded. Scheduler CANCELLED can indicate manual release after successful collection.",
+  "allocated_gpu_s_by_outcome": {
+    "reported_rows": 312810,
+    "failed_attempt": 2952,
+    "cancelled_before_start": 0
+  },
+  "allocated_gpu_s": 315762,
+  "gpu_active_s": null,
+  "gpu_s_by_phase": {
+    "setup_load": null,
+    "warmup": null,
+    "measure": null,
+    "teardown": null
+  },
+  "phase_accounting": "The allocation records cover whole reservations; they do not report device activity or separate per-phase GPU durations.",
+  "allocations": [
+    {
+      "job_id": "5772422",
+      "system": "B200",
+      "state": "CANCELLED",
+      "elapsed_s": 2301,
+      "allocated_gpus": 8,
+      "allocated_gpu_s": 18408,
+      "outcome": "reported_rows"
+    },
+    {
+      "job_id": "5772967",
+      "system": "B200",
+      "state": "CANCELLED",
+      "elapsed_s": 2409,
+      "allocated_gpus": 2,
+      "allocated_gpu_s": 4818,
+      "outcome": "reported_rows"
+    },
+    {
+      "job_id": "5772423",
+      "system": "B300",
+      "state": "CANCELLED",
+      "elapsed_s": 2456,
+      "allocated_gpus": 8,
+      "allocated_gpu_s": 19648,
+      "outcome": "reported_rows"
+    },
+    {
+      "job_id": "8796932",
+      "system": "GB200",
+      "state": "FAILED",
+      "elapsed_s": 94,
+      "allocated_gpus": 8,
+      "allocated_gpu_s": 752,
+      "outcome": "failed_attempt"
+    },
+    {
+      "job_id": "8797284",
+      "system": "GB200",
+      "state": "FAILED",
+      "elapsed_s": 92,
+      "allocated_gpus": 8,
+      "allocated_gpu_s": 736,
+      "outcome": "failed_attempt"
+    },
+    {
+      "job_id": "8797564",
+      "system": "GB200",
+      "state": "CANCELLED",
+      "elapsed_s": 4790,
+      "allocated_gpus": 8,
+      "allocated_gpu_s": 38320,
+      "outcome": "reported_rows"
+    },
+    {
+      "job_id": "8798054",
+      "system": "GB200",
+      "state": "CANCELLED",
+      "elapsed_s": 0,
+      "allocated_gpus": 0,
+      "allocated_gpu_s": 0,
+      "outcome": "cancelled_before_start"
+    },
+    {
+      "job_id": "8798535",
+      "system": "GB200",
+      "state": "COMPLETED",
+      "elapsed_s": 5866,
+      "allocated_gpus": 8,
+      "allocated_gpu_s": 46928,
+      "outcome": "reported_rows"
+    },
+    {
+      "job_id": "8798536",
+      "system": "GB200",
+      "state": "COMPLETED",
+      "elapsed_s": 5246,
+      "allocated_gpus": 8,
+      "allocated_gpu_s": 41968,
+      "outcome": "reported_rows"
+    },
+    {
+      "job_id": "1684501",
+      "system": "GB300",
+      "state": "CANCELLED",
+      "elapsed_s": 0,
+      "allocated_gpus": 0,
+      "allocated_gpu_s": 0,
+      "outcome": "cancelled_before_start"
+    },
+    {
+      "job_id": "1684779",
+      "system": "GB300",
+      "state": "FAILED",
+      "elapsed_s": 72,
+      "allocated_gpus": 8,
+      "allocated_gpu_s": 576,
+      "outcome": "failed_attempt"
+    },
+    {
+      "job_id": "1685010",
+      "system": "GB300",
+      "state": "FAILED",
+      "elapsed_s": 111,
+      "allocated_gpus": 8,
+      "allocated_gpu_s": 888,
+      "outcome": "failed_attempt"
+    },
+    {
+      "job_id": "1685146",
+      "system": "GB300",
+      "state": "COMPLETED",
+      "elapsed_s": 9944,
+      "allocated_gpus": 8,
+      "allocated_gpu_s": 79552,
+      "outcome": "reported_rows"
+    },
+    {
+      "job_id": "3174260",
+      "system": "H100",
+      "state": "CANCELLED",
+      "elapsed_s": 3883,
+      "allocated_gpus": 8,
+      "allocated_gpu_s": 31064,
+      "outcome": "reported_rows"
+    },
+    {
+      "job_id": "3174259",
+      "system": "H200",
+      "state": "CANCELLED",
+      "elapsed_s": 4013,
+      "allocated_gpus": 8,
+      "allocated_gpu_s": 32104,
+      "outcome": "reported_rows"
+    }
+  ],
+  "accounting_basis": "measured scheduler allocation"
+}

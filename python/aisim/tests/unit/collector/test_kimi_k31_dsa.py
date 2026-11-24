@@ -128,6 +128,21 @@ def test_explicit_native_request_rejected_before_stock_route_filtering(phase):
     assert not any(entry["type"].startswith("kimi_k31_dsa_") for entry in ordinary)
 
 
+@pytest.mark.parametrize("machine", ["aarch64", "x86_64"])
+def test_native_executor_routes_the_platform_build(monkeypatch, machine):
+    from collector.sglang.collect_kimi_k31_dsa_v1 import RUNTIME_VERSIONS
+    from collector.version_resolver import build_collections
+
+    monkeypatch.setattr("platform.machine", lambda: machine)
+    ops = ["kimi_k31_dsa_context_module", "kimi_k31_dsa_generation_module"]
+    expected = RUNTIME_VERSIONS[machine]
+    assert require_collector_runtime("sglang", expected, requested_ops=set(ops), model_path=MODEL).version == expected
+    assert [entry["type"] for entry in build_collections(REGISTRY, "sglang", expected, ops)] == ops
+    for other in set(RUNTIME_VERSIONS.values()) - {expected}:
+        with pytest.raises(RuntimeError, match="requires exactly"):
+            build_collections(REGISTRY, "sglang", other, ops)
+
+
 @pytest.mark.parametrize("model_scoped", [False, True])
 def test_cli_generated_plan_keeps_native_ops_model_scoped(model_scoped):
     import collect
