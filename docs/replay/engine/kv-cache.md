@@ -1654,7 +1654,9 @@ sub-block matching without an explicit full-state scratch count.
   [KV transfer](kv-transfer.md) gives the transferred bytes.
 
   As in vLLM, a decode worker makes two tests to reserve a transferred
-  request. Its whole prompt must fit the free capacity. Its transferred blocks
+  request. Its whole prompt, less the blocks of its local prefix hit (see
+  below), must fit the free capacity. Hit blocks that no request holds count
+  too, as they are part of the free capacity. Its transferred blocks
   must also leave free what the prefills in flight still take to hold their
   known tokens. They include the other transferred requests, from their
   reservation until their first step allocates. They also include the local
