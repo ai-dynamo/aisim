@@ -1035,7 +1035,8 @@ impl VllmBlockPool {
             _ => panic!("state writes require an exclusively owned, unpinned copy"),
         };
         assert!(
-            self.copy_source_reuse(id).is_none(),
+            self.copy_source_reuse(id)
+                .is_none_or(|read| !self.is_source_reuse_dependency_pending(read.dependency)),
             "state copy has a pending reader"
         );
         self.remove_indexed_copy(hash, id);
@@ -2807,6 +2808,37 @@ mod tests {
             pool.release(owned);
             pool.assert_lru_consistent();
             assert_eq!(reserve(&mut pool, &[], 4).removed, removed, "{order:?}");
+        }
+    }
+
+    #[test]
+    fn state_privatization_waits_for_the_source_read_to_finish() {
+        for holds_sources in [true, false] {
+            let mut pool = VllmBlockPool::new(1);
+            if holds_sources {
+                pool.hold_pending_sources(SourceReleaseOrder::HeadFirst);
+            }
+            let mut blocks = reserve(&mut pool, &[], 1).reservation;
+            let id = pool.allocate_private(&mut blocks);
+            let key = CacheKey::State { prefix: 7, slot: 0 };
+            pool.cache_private_key(id, key);
+            let read = SourceReuseDependency::from_adapter_id(13);
+            pool.attach_source_reuse_dependency(&[id], read);
+            let premature = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pool.make_state_private(id);
+            }));
+            assert!(premature.is_err());
+            assert!(pool.holds_state_key(id, key));
+            assert!(pool.satisfy_source_reuse_dependency(read, holds_sources));
+            pool.make_state_private(id);
+            assert!(pool.is_private(id));
+            assert!(pool.key_hit(key).is_none());
+            assert!(pool.cache_private_key(id, CacheKey::State { prefix: 8, slot: 0 }));
+            pool.release(id);
+            let next = reserve(&mut pool, &[], 1).reservation;
+            assert_eq!(next.fresh_source_reads().collect::<Vec<_>>(), [read]);
+            assert!(pool.reservation_pending_dependencies(&next).is_empty());
+            pool.cancel(next);
         }
     }
 
