@@ -41,7 +41,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 from collector.framework_manifest import platform_runtime_version
@@ -76,6 +76,7 @@ NATIVE_CASE_TIMEOUT_S = 3600
 SKIP_SOFTMAX_ENV = "SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR"
 NATIVE_ENV = {
     "SGLANG_DSA_FUSE_TOPK": "1",
+    "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH": "0",
     "SGLANG_DSA_TOPK_BROADCAST": "0",
     "SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD": "2048",
 }
@@ -204,7 +205,7 @@ def run_kimi_k31_dsa_worker(*args, device="cuda:0", perf_filename=None):
     _run_native_case(case, device, perf_filename)
 
 
-def run_kimi_k31_dsa_fullnode(*, perf_filename, limit=None, cases=None):
+def run_kimi_k31_dsa_fullnode(*, perf_filename, limit=None, cases=None, expected_sm=None):
     """Own the visible TP group and report every selected case to fullnode.py.
 
     Cases execute sequentially in fresh subprocesses. The common full-node
@@ -223,7 +224,7 @@ def run_kimi_k31_dsa_fullnode(*, perf_filename, limit=None, cases=None):
     failure_details = {}
     for case in selected:
         try:
-            _run_native_case(case, "cuda:0", perf_filename)
+            _run_native_case(case, "cuda:0", perf_filename, expected_sm=expected_sm)
         except Exception as error:
             failure_details[str(case)] = {"error_type": type(error).__name__, "error_message": str(error)}
             logging.getLogger(__name__).exception("Native Kimi K3.1 full-node case failed: %s", case)
@@ -264,17 +265,17 @@ def _native_termination_handler():
             raise SystemExit(128 + signal.SIGTERM)
 
 
-def _run_native_case(case, device, perf_filename):
+def _run_native_case(case, device, perf_filename, *, expected_sm=None):
     if os.environ.get("COLLECTOR_MEASURE_POWER", "false").lower() in ("1", "true", "yes", "on"):
         raise ValueError("native Kimi K3.1 does not support --measure_power; use latency-only collection")
     if perf_filename is None:
         raise ValueError("native Kimi K3.1 collection requires an output filename")
     output = Path(perf_filename)
-    with native_publication_lock(output):
-        _run_owned_native_case(case, device, output)
+    with native_publication_lock(output) as lock_fd:
+        _run_owned_native_case(case, device, output, lock_fd, expected_sm)
 
 
-def _run_owned_native_case(case, device, output):
+def _run_owned_native_case(case, device, output, lock_fd, expected_sm):
     writer_lock = Path(str(output) + ".lock")
     if writer_lock.exists():
         raise RuntimeError(f"native Kimi K3.1 output already has a writer lock: {writer_lock}")
@@ -300,7 +301,11 @@ def _run_owned_native_case(case, device, output):
                     str(output.resolve()),
                     "--device",
                     str(device),
+                    "--publication-lock-fd",
+                    str(lock_fd),
+                    *(["--sm", str(expected_sm)] if expected_sm is not None else []),
                 ],
+                pass_fds=(lock_fd,),
                 stderr=subprocess.PIPE,
                 text=True,
                 start_new_session=True,
@@ -651,7 +656,22 @@ def main() -> None:
     parser.add_argument("--nnodes", type=int, default=1)
     parser.add_argument("--node-rank", type=int, default=0)
     parser.add_argument("--dist-init-addr")
+    parser.add_argument("--sm", type=int, choices=(90, 100, 103), help="expected physical CUDA compute capability")
+    parser.add_argument("--publication-lock-fd", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    with native_publication_lock(Path(args.output), args.publication_lock_fd) if args.node_rank == 0 else nullcontext():
+        _collect_native(args)
+
+
+def _check_device_sm(cuda, first_gpu, count, expected_sm):
+    for gpu in range(first_gpu, first_gpu + count):
+        major, minor = cuda.get_device_capability(gpu)
+        actual = major * 10 + minor
+        if actual != expected_sm:
+            raise RuntimeError(f"cuda:{gpu} has SM{actual}, expected SM{expected_sm}")
+
+
+def _collect_native(args):
     case = ModuleCase(*json.loads(args.case))
     tp = validate_case(case, args.phase)
     local_size = local_tp_size(tp, args.nnodes, args.node_rank)
@@ -671,6 +691,11 @@ def main() -> None:
             f"FIXME(kernel-limit): does not fit: native TP{tp} across {args.nnodes} nodes "
             f"requires {local_size} available GPUs per node"
         )
+    major, minor = torch.cuda.get_device_capability(first_gpu)
+    expected_sm = args.sm if args.sm is not None else major * 10 + minor
+    if expected_sm not in (90, 100, 103):
+        raise ValueError(f"native K3.1 collection requires a qualified GPU, got SM{expected_sm}")
+    _check_device_sm(torch.cuda, first_gpu, local_size, expected_sm)
     _check_capacity(case, args.phase, torch.cuda, first_gpu, local_size)
     config_path = hf_hub_download(MODEL, "config.json", revision=MODEL_REVISION)
     config = single_layer_config(json.loads(Path(config_path).read_text()))

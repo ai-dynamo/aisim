@@ -2049,7 +2049,7 @@ def _attach_llama4_processor_config(raw_config: dict, model_path: str) -> dict:
 
 
 @cache
-def _load_model_config_from_model_path(model_path: str) -> dict:
+def _load_model_config_from_model_path(model_path: str, *, include_processor: bool = True) -> dict:
     """
     Get model configuration from model path.
 
@@ -2069,17 +2069,23 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
     """
     # Check if it's a local path
     if os.path.isdir(model_path):
-        config = _attach_llama4_processor_config(_load_local_config(model_path), model_path)
+        config = _load_local_config(model_path)
+        if include_processor:
+            config = _attach_llama4_processor_config(config, model_path)
         return _attach_inferred_quant_fields(_attach_hf_quant_config(config, _load_local_quant_config(model_path)))
 
     # Otherwise treat as HuggingFace path
     if model_path in DefaultHFModels:
-        config = _attach_llama4_processor_config(_load_pre_downloaded_hf_config(model_path), model_path)
+        config = _load_pre_downloaded_hf_config(model_path)
+        if include_processor:
+            config = _attach_llama4_processor_config(config, model_path)
         return _attach_inferred_quant_fields(
             _attach_hf_quant_config(config, _load_pre_downloaded_hf_quant_config(model_path))
         )
 
-    config = _attach_llama4_processor_config(_download_hf_config(model_path), model_path)
+    config = _download_hf_config(model_path)
+    if include_processor:
+        config = _attach_llama4_processor_config(config, model_path)
     try:
         hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False)
     except Exception as exc:  # best-effort for optional quant config

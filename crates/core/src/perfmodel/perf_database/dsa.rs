@@ -1043,7 +1043,15 @@ pub(crate) fn dsa_context_sol(
     let sparse_attn_ops = 2 * num_heads * (attn_head_dim + kv_lora) * total_kv_pairs;
 
     // ── Memory (bytes) ──────────────────────────────────────────
-    let gemm_weight_elems = hidden * proj_out
+    // K3.1 reads absorbed K/V projection weights once per invocation.
+    // Legacy architecture ledgers retain their calibrated traffic model.
+    let absorbed_kv_weights = if dims.output_gate {
+        num_heads * kv_lora * (qk_nope + v_dim)
+    } else {
+        0
+    };
+    let gemm_weight_elems = absorbed_kv_weights
+        + hidden * proj_out
         + q_lora * num_heads * qk_head_dim
         + q_lora * indexer_heads * ihd
         + hidden * indexer_heads
@@ -1187,7 +1195,15 @@ pub(crate) fn dsa_generation_sol(
     let indexer_logits_ops = 2 * tokens * indexer_heads * ihd * s;
     let sparse_attn_ops = 2 * tokens * num_heads * (attn_head_dim + kv_lora) * effective_kv;
 
-    let gemm_weight_elems = hidden * proj_out
+    // K3.1 reads absorbed K/V projection weights once per invocation.
+    // Legacy architecture ledgers retain their calibrated traffic model.
+    let absorbed_kv_weights = if dims.output_gate {
+        num_heads * kv_lora * (qk_nope + v_dim)
+    } else {
+        0
+    };
+    let gemm_weight_elems = absorbed_kv_weights
+        + hidden * proj_out
         + q_lora * num_heads * qk_head_dim
         + q_lora * indexer_heads * ihd
         + hidden * indexer_heads
@@ -1733,8 +1749,9 @@ mod tests {
     /// + O 11,010,048 + gate 11,010,048 = 48,136,192.
     /// Absorbed KV BMMs add 3,145,728 FLOPs per token. At history 4096,
     /// one decode token adds 33,554,432 index-logit FLOPs and 53,477,376
-    /// sparse attention FLOPs. Memory: weights 96,272,384 + index 540,672
-    /// + sparse KV 2,359,296 + gate IO 9,216 = 99,181,568 bytes.
+    /// sparse attention FLOPs. Memory: projections 96,272,384 + absorbed
+    /// weights 3,145,728 + index 540,672
+    /// + sparse KV 2,359,296 + gate IO 9,216 = 102,327,296 bytes.
     #[test]
     fn kimi_k31_gated_dsa_roofline_matches_hand_ledger() {
         let mut spec = b200_sxm_spec();
@@ -1746,8 +1763,8 @@ mod tests {
         };
         let dims = dsa_dims("KimiK31ForConditionalGeneration");
         for (history, math_ms, mem_ms) in [
-            (4096, 0.186449920, 0.099181568),
-            (8192, 0.220004352, 0.099722240),
+            (4096, 0.186449920, 0.102327296),
+            (8192, 0.220004352, 0.102867968),
         ] {
             let got = dsa_generation_sol(
                 &spec,
@@ -1769,8 +1786,8 @@ mod tests {
         // s=4096; a cached-prefix extension has 2,097,152 pairs across b=2.
         // These also exercise gate work scaling with the NEW token count.
         for (batch, tokens, prefix, math_ms, mem_ms) in [
-            (1, 4096, 0, 708.964777984, 0.200622080),
-            (2, 512, 2048, 178.039816192, 0.172445696),
+            (1, 4096, 0, 708.964777984, 0.203767808),
+            (2, 512, 2048, 178.039816192, 0.175591424),
         ] {
             let got = dsa_context_sol(
                 &spec,
@@ -1804,7 +1821,7 @@ mod tests {
         // The decode ledger above keeps BF16 weights and a 540,672-byte
         // index history. Only the 2048 selected latent entries change:
         // TRTLLM 1,179,648 bytes; FlashMLA 1,343,488 bytes.
-        for (backend, expected_mem_ms) in [("trtllm", 0.098001920), ("flashmla_kv", 0.098165760)] {
+        for (backend, expected_mem_ms) in [("trtllm", 0.101147648), ("flashmla_kv", 0.101311488)] {
             let got = dsa_generation_sol(
                 &spec,
                 dsa_dims_for_backend("KimiK31ForConditionalGeneration", backend),

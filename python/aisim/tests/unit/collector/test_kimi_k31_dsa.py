@@ -158,6 +158,7 @@ def test_cli_generated_plan_keeps_native_ops_model_scoped(model_scoped):
     [
         ("SGLANG_DSA_FUSE_TOPK", "1"),
         ("SGLANG_DSA_TOPK_BROADCAST", "0"),
+        ("SGLANG_FP8_PAGED_MQA_LOGITS_TORCH", "0"),
         ("SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR", None),
         ("SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD", "2048"),
     ],
@@ -199,6 +200,30 @@ def test_native_dispatch_setting_is_fixed_for_child_and_standalone(monkeypatch, 
     )
     with pytest.raises(RuntimeReached):
         module.main()
+
+
+def test_physical_sm_validation_checks_every_selected_device():
+    from collector.sglang.collect_kimi_k31_dsa_v1 import _check_device_sm
+
+    cuda = SimpleNamespace(get_device_capability=lambda gpu: (10, 3) if gpu == 1 else (10, 0))
+    _check_device_sm(cuda, 1, 1, 103)
+    with pytest.raises(RuntimeError, match="cuda:2 has SM100, expected SM103"):
+        _check_device_sm(cuda, 1, 2, 103)
+
+
+def test_standalone_shares_supervisor_lock(tmp_path, monkeypatch):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as module
+
+    output = tmp_path / "rows"
+    monkeypatch.setattr(sys, "argv", ["collector", "--case", "[]", "--phase", "generation", "--output", str(output)])
+    calls = []
+    monkeypatch.setattr(module, "_collect_native", lambda args: calls.append(args.output))
+    with module.native_publication_lock(output) as fd:
+        with pytest.raises(RuntimeError, match="publication owner"):
+            module.main()
+        sys.argv.extend(["--publication-lock-fd", str(fd)])
+        module.main()
+    assert calls == [str(output)]
 
 
 @pytest.mark.parametrize("existing", [False, True])
@@ -637,10 +662,24 @@ def test_parent_only_sigterm_kills_native_group_and_rolls_back(tmp_path, during_
         "import subprocess, sys, time\n"
         "from pathlib import Path\n"
         "import collector.sglang.collect_kimi_k31_dsa_v1 as module\n"
+        "import signal\n"
+        "real_signal = signal.signal\n"
+        "def install(sig, handler):\n"
+        "    if not callable(handler): return real_signal(sig, handler)\n"
+        "    def observed(*args):\n"
+        "        handler(*args)\n"
+        f"        Path({str(tmp_path / 'handled')!r}).touch()\n"
+        "    return real_signal(sig, observed)\n"
+        "signal.signal = install\n"
         "real_popen = subprocess.Popen\n"
         "def launch(_command, **kwargs):\n"
         f"    child = real_popen([sys.executable, '-c', {launcher_code!r}], **kwargs)\n"
         f"    while {during_launch!r} and not Path({str(tmp_path / 'release')!r}).exists(): time.sleep(0.01)\n"
+        "    communicate = child.communicate\n"
+        "    def observed_communicate(*args, **kwargs):\n"
+        f"        Path({str(tmp_path / 'owned')!r}).touch()\n"
+        "        return communicate(*args, **kwargs)\n"
+        "    child.communicate = observed_communicate\n"
         "    return child\n"
         "module.subprocess.Popen = launch\n"
         f"case = module.ModuleCase(4096, 1, 48, 'fp8', 'bfloat16', 'bfloat16', {MODEL!r}, 0)\n"
@@ -657,7 +696,16 @@ def test_parent_only_sigterm_kills_native_group_and_rolls_back(tmp_path, during_
                 assert parent.poll() is None, "collector exited before native rank was ready"
                 time.sleep(0.01)
             # Send only to the collector PID, never its process group.
+            if not during_launch:
+                while not (tmp_path / "owned").exists():
+                    assert time.monotonic() < deadline
+                    time.sleep(0.01)
             os.kill(parent.pid, signal.SIGTERM)
+            if during_launch:
+                while not (tmp_path / "handled").exists():
+                    assert time.monotonic() < deadline
+                    time.sleep(0.01)
+                assert not (tmp_path / "owned").exists()
             (tmp_path / "release").touch()
             _, stderr = parent.communicate(timeout=30)
             assert parent.returncode == 128 + signal.SIGTERM, stderr
@@ -873,7 +921,7 @@ def test_native_fullnode_failure_reaches_persisted_artifact(monkeypatch, tmp_pat
     case = ModuleCase(4096, 1, 12, "fp8", "bfloat16", "bfloat16", MODEL, 0)
     reason = "FIXME(kernel-limit): does not fit: native TP8 requires 8 available GPUs"
 
-    def fail(*_args):
+    def fail(*_args, **_kwargs):
         raise RuntimeError(reason)
 
     monkeypatch.setattr(module, "_run_native_case", fail)
@@ -915,7 +963,8 @@ def test_native_fullnode_resumes_after_last_completed_case(monkeypatch, tmp_path
     output = tmp_path / "dsa_context_module_perf.txt"
     ran = []
 
-    def native(case, _device, filename):
+    def native(case, _device, filename, *, expected_sm):
+        assert expected_sm == 103
         with pytest.raises(RuntimeError, match="already has a publication owner"):
             collect()
         ran.append(case)
