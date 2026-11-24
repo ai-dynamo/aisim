@@ -170,6 +170,8 @@ For compressed-tensors 4-bit float weights, the effective config-group `format`
 (falling back to the quantization header's `format`) must be
 `mxfp4-pack-quantized`; other or missing formats fail rather than selecting an
 MXFP4 profile. This metadata may live under `text_config.quantization_config`.
+Every 4-bit float group is checked regardless of ordering, even after another
+group has established the base algorithm.
 Whole-expert exclusions (`mlp.experts`, `re:.*mlp\.experts\..*`,
 `re:.*mlp\.experts.*`, or `re:.*experts.*` in `ignore`) select BF16 MoE.
 Partial or unrecognized routed-expert exclusions require an explicit

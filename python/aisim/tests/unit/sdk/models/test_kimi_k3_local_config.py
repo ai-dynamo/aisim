@@ -226,6 +226,29 @@ def test_local_kimi_other_packed_formats_fail(local_kimi, packed_format, format_
         Task(model_path=str(path), system_name="b200_sxm", backend_name="sglang", total_gpus=1)
 
 
+@pytest.mark.parametrize("experts_first", [False, True])
+@pytest.mark.parametrize("packed_format", ["nvfp4-pack-quantized", "pack-quantized", None])
+def test_local_kimi_invalid_later_group_fails_in_either_order(local_kimi, experts_first, packed_format):
+    from aisim.sdk.task_v2 import Task
+
+    path, raw = local_kimi
+    quant = raw["quantization_config"]
+    del quant["format"]
+    experts = quant["config_groups"]["experts"]
+    experts["format"] = packed_format
+    attention = {"weights": {"num_bits": 8, "type": "float"}, "targets": ["self_attn"]}
+    groups = [("experts", experts), ("attention", attention)]
+    quant["config_groups"] = dict(groups if experts_first else reversed(groups))
+    quant["ignore"] = ["mlp.shared_experts", "lm_head"]
+    (path / "config.json").write_text(json.dumps(raw))
+    # Invalid FP4 formats must fail before selecting an FP8 expert profile,
+    # including when the FP8 attention group establishes the base algorithm.
+    with pytest.raises(ValueError, match="require format 'mxfp4-pack-quantized'"):
+        compile_engine(str(path), "b200_sxm", "sglang", "current")
+    with pytest.raises(ValueError, match="require format 'mxfp4-pack-quantized'"):
+        Task(model_path=str(path), system_name="b200_sxm", backend_name="sglang", total_gpus=1)
+
+
 def test_local_kimi_mxfp4_label_requires_packed_format_metadata(local_kimi):
     path, raw = local_kimi
     raw["quantization_config"] = {"quant_method": "mxfp4"}

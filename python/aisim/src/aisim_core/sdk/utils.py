@@ -1739,6 +1739,7 @@ def parse_compressed_tensors_quant(
       config carries no quantization information. Four-bit float weights require
       ``mxfp4-pack-quantized`` in the group's ``format`` or the header default;
       other or absent formats raise ``ValueError`` instead of guessing a lane.
+      Every group is checked, even after the base algorithm has been selected.
     - ``ignored_categories``: frozenset of layer-category names excluded from
       quantization (i.e. remaining in float16/bfloat16).  Empty when nothing is
       ignored or when ``base_algo`` is ``None``.
@@ -1750,21 +1751,22 @@ def parse_compressed_tensors_quant(
     if not isinstance(quantization_config, dict):
         return None, frozenset()
 
-    # Derive base algo from the first config_group's weight spec.
+    # Validate every group before exposing a single algorithm to the caller.
     base_algo: str | None = None
     for group in (quantization_config.get("config_groups") or {}).values():
+        group_algo: str | None = None
         weights = (group or {}).get("weights") or {}
         num_bits = weights.get("num_bits")
         w_type = str(weights.get("type", "")).lower()
         if isinstance(num_bits, int):
             if num_bits == 4 and "int" in w_type:
-                base_algo = "int4_wo"
+                group_algo = "int4_wo"
             elif num_bits == 8 and "int" in w_type:
-                base_algo = "int8_wo"
+                group_algo = "int8_wo"
             elif num_bits == 8 and "float" in w_type:
                 strategy = str(weights.get("strategy", "")).lower()
                 block_structure = weights.get("block_structure")
-                base_algo = "fp8_block" if strategy == "block" or block_structure else "fp8"
+                group_algo = "fp8_block" if strategy == "block" or block_structure else "fp8"
             elif num_bits == 4 and "float" in w_type:
                 # A group's format overrides the checkpoint-wide default.
                 # Four-bit floats alone do not distinguish MXFP4 from NVFP4.
@@ -1777,9 +1779,11 @@ def parse_compressed_tensors_quant(
                 # MXFP4 packed weights (e.g. Kimi-K3):
                 # W4A16 base lane; per-SM MoE kernel routing may upgrade the
                 # activation side (see operations/moe.py).
-                base_algo = "w4a16_mxfp4"
-        if base_algo:
-            break
+                group_algo = "w4a16_mxfp4"
+        # Preserve the first recognized base algorithm: architecture-specific
+        # callers may map attention and expert precision independently.
+        if base_algo is None:
+            base_algo = group_algo
 
     if base_algo is None:
         return None, frozenset()

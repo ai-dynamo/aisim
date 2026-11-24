@@ -1651,6 +1651,28 @@ class TestParseCompressedTensorsQuant:
         algo, _ = parse_compressed_tensors_quant(cfg)
         assert algo == "fp8_block"
 
+    @pytest.mark.parametrize("packed_format", ["nvfp4-pack-quantized", "pack-quantized", None])
+    def test_later_four_bit_group_must_also_declare_packed_format(self, packed_format):
+        from aisim.sdk.utils import parse_compressed_tensors_quant
+
+        cfg = self._make_quant_config(4, "float")
+        cfg["config_groups"]["group_0"]["format"] = "mxfp4-pack-quantized"
+        cfg["config_groups"]["group_1"] = {
+            "weights": {"num_bits": 4, "type": "float"},
+            "format": packed_format,
+        }
+        with pytest.raises(ValueError, match="require format 'mxfp4-pack-quantized'"):
+            parse_compressed_tensors_quant(cfg)
+
+    @pytest.mark.parametrize("num_bits,expected", [(4, "w4a16_mxfp4"), (8, "fp8")])
+    def test_multiple_groups_with_the_same_algorithm(self, num_bits, expected):
+        from aisim.sdk.utils import parse_compressed_tensors_quant
+
+        cfg = self._make_quant_config(num_bits, "float", ignore=["lm_head"])
+        cfg["format"] = "mxfp4-pack-quantized"
+        cfg["config_groups"]["group_1"] = {"weights": {"num_bits": num_bits, "type": "float"}}
+        assert parse_compressed_tensors_quant(cfg) == (expected, frozenset({"lm_head"}))
+
     # --- ignored_categories detection ---
 
     def test_no_ignore_empty_set(self):
@@ -1755,7 +1777,7 @@ class TestParseCompressedTensorsQuant:
         assert overrides.get("moe_quant_mode") == common.MoEQuantMode.int4_wo
 
     def test_redhat_dsv4_maps_block_fp8_attention_and_fp4_experts(self):
-        """The real RedHatAI DSV4 quant layout maps attention and experts independently."""
+        """A declared packed DSV4 layout maps attention and experts independently."""
         from aisim.sdk import common
         from aisim.sdk.models import _infer_quant_modes_from_raw_config
 
@@ -1777,6 +1799,7 @@ class TestParseCompressedTensorsQuant:
                     },
                     "group_1": {
                         "targets": ["re:.*ffn.*(gate|up|down)_proj$"],
+                        "format": "mxfp4-pack-quantized",
                         "weights": {
                             "num_bits": 4,
                             "type": "float",
