@@ -1,7 +1,5 @@
 <!--
 
-The six systems' original Parquet files and collection metadata remain available at [the pre-migration revision](https://github.com/ai-dynamo/aisim/tree/8f4603379f1c9b8a846db7066c0c6306709cd834/python/aisimulate/src/aisimulate_core/systems/data). Dataset publication preserves the decoded measurements and records the Parquet schema stamping in its source audit.
-
 SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0
 -->
@@ -40,9 +38,9 @@ checks the exact frozen case sets, and verifies that all columns of the earlier
 B300 rows remain unchanged. `x86/manifest.json` and `arm/manifest.json` bind the
 finite public evidence packages. Original raw CSV-formatted files preserve
 their CRLF bytes; source events and original table columns survive the unions.
-The inventory records paths at collection time. To verify it against this
-checkout, replace the prefix `python/aisimulate/src/aisimulate_core/systems/`
-with `python/aisim/src/aisim_core/systems/` and hash each file at that path.
+The inventory records paths at collection time. To verify its 18 SHA-256 values,
+hash the original files at those paths in the [pre-migration revision](https://github.com/ai-dynamo/aisim/tree/8f4603379f1c9b8a846db7066c0c6306709cd834/python/aisimulate/src/aisimulate_core/systems/data).
+The dataset publication records schema stamping separately and preserves the decoded measurements.
 All campaign allocations have been released.
 
 The GB200 union explicitly migrates legacy schema-1 events to schema 2. The
