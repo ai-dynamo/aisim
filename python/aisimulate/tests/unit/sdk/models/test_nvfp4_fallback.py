@@ -38,6 +38,28 @@ def test_nvfp4_unchanged_on_blackwell():
     assert mc.moe_quant_mode == common.MoEQuantMode.nvfp4
 
 
+@pytest.mark.parametrize("pinned_sm,default_sm", [(100, 90), (90, 100), (100, None)])
+def test_nvfp4_classification_uses_explicit_systems_roots(tmp_path, monkeypatch, pinned_sm, default_sm):
+    from aisimulate_core.sdk import perf_database
+
+    pinned = tmp_path / "pinned"
+    default = tmp_path / "default"
+    pinned.mkdir()
+    default.mkdir()
+    (pinned / "custom_sku.yaml").write_text(f"gpu:\n  sm_version: {pinned_sm}\n")
+    if default_sm is not None:
+        (default / "custom_sku.yaml").write_text(f"gpu:\n  sm_version: {default_sm}\n")
+    monkeypatch.setattr(perf_database, "_SYSTEMS_PATHS", [str(default)])
+    assert perf_database.is_blackwell_system("custom_sku", systems_paths=[str(pinned)]) is (pinned_sm >= 100)
+    assert perf_database.is_blackwell_system("custom_sku") is (default_sm is not None and default_sm >= 100)
+
+    mc = _model_config(gemm_quant_mode=common.GEMMQuantMode.nvfp4, moe_quant_mode=common.MoEQuantMode.nvfp4)
+    resolve_nvfp4_for_system(mc, "custom_sku", systems_paths=[str(pinned)])
+    suffix = "nvfp4" if pinned_sm >= 100 else "nvfp4_wo"
+    assert mc.gemm_quant_mode == common.GEMMQuantMode[suffix]
+    assert mc.moe_quant_mode == common.MoEQuantMode[suffix]
+
+
 def test_bfloat16_unchanged_on_hopper():
     mc = _model_config(
         gemm_quant_mode=common.GEMMQuantMode.bfloat16,

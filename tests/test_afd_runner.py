@@ -116,6 +116,28 @@ def test_factory_advertises_afd_only_after_executable_runner_exists():
         assert capabilities.supports_backend_topology(backend, "afd+pd")
 
 
+@pytest.mark.parametrize("phase,sampled", [("prefill", False), ("decode", False), ("decode", True)])
+@pytest.mark.parametrize("measured_isl", [None, 8, 16])
+def test_afd_replay_checks_recorded_input_length(phase, sampled, measured_isl):
+    spec = _spec(_topology())
+    measurements = spec.backend_deployment.performance_model_metadata["afd"]["measurements"]
+    for measurement in measurements:
+        if measurement["phase"] == phase:
+            if measured_isl is not None:
+                measurement["provenance"]["isl"] = measured_isl
+            if sampled:
+                measurement["decode_attention_samples"] = [[0.5, 1], [1.5, 1]]
+    runner = EngineReplayRunnerFactory().create(0)
+    if measured_isl == 16:
+        index = 0 if phase == "prefill" else 1
+        with pytest.raises(ValueError, match=f"AFD measurement {index} was recorded at isl=16, not replay isl=8"):
+            runner.run(spec)
+    else:
+        report = runner.run(spec)
+        assert report.metrics["completed_requests"] == 4.0
+        assert report.metrics["mean_tpot_ms"] > 0
+
+
 def test_pure_both_phase_afd_runs_without_native_aggregate_fallback():
     report = (
         EngineReplayRunnerFactory()

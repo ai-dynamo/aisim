@@ -14,7 +14,9 @@ import dataclasses
 import logging
 import re
 import warnings
+from collections.abc import Iterable
 from functools import cache
+from os import PathLike
 from typing import TYPE_CHECKING, Optional
 
 from aisimulate_core.sdk import common, config
@@ -954,6 +956,7 @@ def resolve_nvfp4_for_system(
     model_path: str | None = None,
     *,
     backend_name: str | None = None,
+    systems_paths: str | PathLike | Iterable[str] | None = None,
 ) -> None:
     """Remap native nvfp4 to weight-only nvfp4_wo on non-Blackwell systems.
 
@@ -970,7 +973,7 @@ def resolve_nvfp4_for_system(
     """
     from aisimulate_core.sdk.perf_database import is_blackwell_system
 
-    if is_blackwell_system(system_name):
+    if is_blackwell_system(system_name, systems_paths=systems_paths):
         return  # native FP4 TC — nvfp4 stays as-is
 
     gemm_q = model_config.gemm_quant_mode

@@ -74,7 +74,9 @@ def _measure_fastafd_attention(stage_config, *, isl, osl, prefix, max_seq_len):
     for model_config in (a_config, f_config):
         apply_nextn(model_config, stage_config["nextn"])
         resolve_dsv4_moe_arch(model_config, model_path, system_name=system, backend_name=backend_name)
-        resolve_nvfp4_for_system(model_config, system, model_path, backend_name=backend_name)
+        resolve_nvfp4_for_system(
+            model_config, system, model_path, backend_name=backend_name, systems_paths=stage_config["systems_paths"]
+        )
     session = AFDInferenceSession(model_path, a_config, f_config, database, get_backend(backend_name), topology)
     runtime = config.RuntimeConfig(
         isl=isl, osl=osl, prefix=prefix, batch_size=topology.n_a_workers * topology.a_batch_size

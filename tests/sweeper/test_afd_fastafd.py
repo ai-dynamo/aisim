@@ -522,6 +522,39 @@ def test_canonical_fastafd_pins_attention_data_roots(
         constrained.estimate_fastafd_attention(isl=1024, osl=128, max_seq_len=2048)
 
 
+@pytest.mark.parametrize("default_sm", [None, 90])
+def test_canonical_fastafd_pins_nvfp4_hardware_classification(tmp_path, monkeypatch, fastafd_attention_sol, default_sm):
+    from aisimulate.sdk import common, models, perf_database
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    profile = _profile(tmp_path, [_entry(moe_precision="nvfp4")])
+    (measurement,) = _provider(tmp_path, AICAFDPerformanceModel(), profile_path=profile).measure(_request(_topology()))
+    saved = json.loads(json.dumps(measurement.provenance["config"]))
+    model = RustForwardPassPerfModel.best_available(saved)
+    baseline = model.estimate_fastafd_attention(isl=1024, osl=128)
+
+    # The selected Blackwell spec stays in the saved roots. Process defaults
+    # either omit this SKU or classify the same name as Hopper.
+    default_root = tmp_path / "changed-default"
+    default_root.mkdir()
+    if default_sm is not None:
+        (default_root / f"{SYSTEM}.yaml").write_text(f"gpu:\n  sm_version: {default_sm}\n")
+    monkeypatch.setattr(perf_database, "_SYSTEMS_PATHS", [str(default_root)])
+    resolved_modes = []
+    resolve = models.resolve_nvfp4_for_system
+
+    def record_mode(model_config, *args, **kwargs):
+        resolve(model_config, *args, **kwargs)
+        resolved_modes.append(model_config.moe_quant_mode)
+
+    monkeypatch.setattr(models, "resolve_nvfp4_for_system", record_mode)
+    for candidate in (model, RustForwardPassPerfModel.best_available(saved)):
+        assert candidate.estimate_fastafd_attention(isl=1024, osl=128) == baseline
+    # Both F model configurations retain native FP4 rather than weight-only
+    # execution, even though default-root classification says otherwise.
+    assert resolved_modes[1::2] == [common.MoEQuantMode.nvfp4] * 2
+
+
 def _kimi_request_and_profile(tmp_path, precision, *, moe_backend="megamoe", f_gpus=4):
     model = "moonshotai/Kimi-K2-Instruct"
     entry = _entry(
