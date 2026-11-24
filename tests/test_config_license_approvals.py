@@ -537,20 +537,6 @@ def test_unknown_base_cannot_be_approved_after_export_provenance_is_fixed(tmp_pa
     assert not result["passed"] and "unknown_underlying_license" in result["problems"]
 
 
-def test_minimax_identified_base_still_requires_scoped_approval():
-    root = gate.provenance.ROOT
-    records = gate.load_review(root / gate.REVIEW)
-    entries = gate.provenance.inventory_entries(root / gate.provenance.INVENTORY)
-    selected = [r for r in records.values() if "nvidia--MiniMax-M2.5" in r["path"]]
-    assert len(selected) == 2
-    for item in selected:
-        assert item["underlying_licenses"] == ["LicenseRef-MiniMax-M2.5-Model"]
-        # Exercise missing approval independently of the committed decisions.
-        item["approval"] = {"status": "pending"}
-        result = gate.assess([entries[item["path"]]], records, root=root)[0]
-        assert result["problems"] == ["unapproved_license"]
-
-
 def test_cli_wheel_digest_survives_missing_review(licensed_source, tmp_path):
     root, config, _, _, _, _ = licensed_source
     wheel = tmp_path / "synthetic.whl"

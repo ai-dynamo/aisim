@@ -1047,27 +1047,6 @@ def test_image_geometry_follows_the_processor_pixel_budget():
         image_geometry("Qwen/Qwen3-8B", 1024, 1024)
 
 
-def test_image_geometry_keeps_llama4_tiles_as_separate_sequences():
-    from aisim_core.sdk.backends.base_backend import image_geometry
-
-    # 16 local 336px tiles plus the global tile; each tile is its own attention
-    # sequence of 576 patches (+CLS), and the prompt adds tile-structure tokens.
-    geometry = image_geometry("meta-llama/Llama-4-Scout-17B-16E-Instruct", 1024, 1024)
-    assert (geometry.sequences, geometry.patch_tokens, geometry.transformer_tokens) == (17, 576, 577)
-    assert geometry.output_tokens == 144
-    assert geometry.visual_tokens == 2467
-
-
-def test_image_geometry_rejects_families_the_replay_does_not_lay_out():
-    from aisim_core.sdk.backends.base_backend import image_geometry
-
-    # Gemma 4 sizes images from its soft-token budget and Kimi from its own patch
-    # limits: neither is a Qwen processor whose pixel budget could be supplied.
-    for model in ("google/gemma-4-26B-A4B", "moonshotai/Kimi-K3"):
-        with pytest.raises(ValueError, match="vision family is not supported by native VL replay"):
-            image_geometry(model, 1024, 1024)
-
-
 def test_video_frames_keep_the_stride_geometry_while_images_follow_the_pixel_budget():
     from aisim_core.sdk.utils import get_model_config_from_model_path, get_vision_encoder_config_from_model_info
 

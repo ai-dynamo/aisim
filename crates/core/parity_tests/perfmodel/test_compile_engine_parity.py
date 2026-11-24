@@ -11,11 +11,9 @@ Three surfaces:
    match the model's actual ``context_ops`` / ``generation_ops``. This is where
    a misnamed field or a wrong phase-pair tag would surface loudly.
 
-2. **Integration parity vs golden fixtures.** For a smoke subset of the
-   existing ``EngineStepParityCase``s — spanning all three backends (vllm +
-   sglang + trtllm) so backend-specific op-transfer divergences (the
-   ``MoEDispatch`` flavor split, trtllm comm quant, the SGLang/TRT-LLM
-   Fallback-MLA chain) are covered — compare the compiled-engine path against
+2. **Integration parity vs golden fixtures.** For the retained vLLM and
+   TRT-LLM smoke subset and the independent SGLang WideEP scenarios, compare
+   the compiled-engine path against
    the FROZEN Python ``BaseBackend`` reference in
    ``goldens/compile_engine.json`` (captured by the retired
    ``regenerate_goldens.py`` while the Python step path was alive; new
@@ -58,58 +56,28 @@ from aisim.sdk.models import get_model
 pytestmark = pytest.mark.integration
 
 
-# The subset deliberately spans ALL THREE backends. The full
-# `test_engine_step_parity.py` harness runs over vllm + sglang + trtllm;
-# validating only vllm here would leave backend-specific op-transfer fidelity
-# bugs (e.g. the `MoEDispatch` flavor split — trtllm emits `TrtllmAlltoall`,
-# sglang/vllm emit `CustomAllReduce` — trtllm comm quant, and the
-# SGLang/TRT-LLM-only Fallback-MLA chain) uncovered here.
-#
-# Cases drawn straight from `SMOKE_CASES` so this tracks the same matrix. All
-# compute (no error-symmetry cases), so every surface yields a real number.
-#
-#   vllm   : the original 5 b200_sxm/vllm cases (current slot). The former
-#            b200_sxm/vllm/0.22.0 POWER_CASES member was removed with the
-#            2026-08 prune (its gemm tables are gone; no engine-step-complete
-#            power identity remains). Per-op energy on current-slot goldens
-#            is well-typed zero; the energy MATH is anchored by the rust
-#            synthetic energy oracles instead.
-#   sglang : Kimi-K2.5 (Fallback-MLA + MoE) and MiniMax-M2.5 (MoE), both
-#            b200_sxm/sglang/0.5.10. SGLang's MoEDispatch flavor is the same
-#            `CustomAllReduce` else-branch as vllm; its distinct value is the
-#            Fallback-MLA path and the sglang perf tables.
-#   trtllm : gpt-oss-20b (MoE -> exercises the `TrtllmAlltoall` flavor +
-#            trtllm comm quant + trtllm MoE) and Nemotron-Super-49B (dense,
-#            CustomAllReduce-heavy), both b200_sxm/trtllm/current (1.3.0rc20). The MoE
-#            case is the load-bearing one: it is the only subset member that
-#            hits the trtllm dispatch-flavor branch.
+# Retained release subset: Qwen3 MoE on vLLM and GPT-OSS on TRT-LLM.
+# The removed MiniMax, Kimi and Llama-derived configs no longer have bundled
+# parity cases. SGLang remains covered by the independent WideEP scenarios
+# below and by the engine-step matrix. All retained subset cases compute
+# actual values against their original frozen references.
 _SUBSET_IDS_BY_BACKEND = {
     "vllm": [
-        "minimax-m25-b200-vllm-isl1024-osl2",
-        "kimi-k25-b200-vllm-isl1024-osl2",
-        "minimax-m25-b200-vllm-sampled-prefix",
-        "minimax-m27-b200-vllm-isl1024-osl2",
         "qwen3-30b-a3b-b200-vllm-isl1024-osl2",
-    ],
-    "sglang": [
-        "kimi-k25-b200-sglang-isl1024-osl2",
-        "minimax-m25-b200-sglang-isl1024-osl2",
     ],
     "trtllm": [
         "gpt-oss-20b-b200-trtllm-isl1024-osl2",
-        "nemotron-nas-b200-trtllm-isl1024-osl2",
     ],
 }
 
 # The B200 TRT-LLM current slot carries imported 1.3.0rc20 power data.
-# Require a nonzero energy comparison for both covered subset members so a
+# Require a nonzero energy comparison for the retained power subset so a
 # future all-zero golden refresh cannot make energy parity pass vacuously.
 _POWER_SUBSET_IDS = {
     "gpt-oss-20b-b200-trtllm-isl1024-osl2",
-    "nemotron-nas-b200-trtllm-isl1024-osl2",
 }
 
-# Preserve the per-backend ordering (vllm, then sglang, then trtllm) so the
+# Preserve the per-backend ordering (vllm, then trtllm) so the
 # parametrize ids group readably and the determinism sweep covers vllm first.
 _SUBSET_BY_ID = {p.id: p for p in [*SMOKE_CASES, *POWER_CASES]}
 _declared_ids = [cid for ids in _SUBSET_IDS_BY_BACKEND.values() for cid in ids]
@@ -299,20 +267,6 @@ def _assert_within(name: str, python_value: float, new_value: float, *, backend:
     )
 
 
-# Chunked-prefill shapes: shared by the parametrized test and the golden
-# pin path (pin_goldens.py) so the fixture keys track the test matrix.
-_CHUNKED_PREFILL_CASE_ID = "minimax-m25-b200-vllm-isl1024-osl2"
-_CHUNKED_PREFILL_SHAPES = [
-    (512, 4, 4096, 128, 0),  # chunked prefill: ctx_tokens < isl
-    (512, 4, 4096, 128, 256),  # chunked + cached prefix
-    (300, 7, 1000, 64, 100),  # ragged chunk + prefix + decode overlap
-]
-
-
-def _chunked_prefill_key(ctx_tokens: int, gen_tokens: int, isl: int, osl: int, prefix: int) -> str:
-    return f"chunked_prefill::ctx{ctx_tokens}_gen{gen_tokens}_isl{isl}_osl{osl}_prefix{prefix}::mixed_step"
-
-
 class TestCompileEngineStaticParity:
     @pytest.mark.parametrize("case", _SUBSET_CASES)
     def test_static_ctx_and_gen(self, case: EngineStepParityCase) -> None:
@@ -336,18 +290,6 @@ class TestCompileEngineMixedStepParity:
         new_val = handle.mixed_step_latency(case.isl, case.batch_size, case.isl, max(case.osl, 2), case.prefix)
         py_val = _case_reference(case, "mixed_step")
         _assert_within("mixed_step", py_val, new_val, backend=case.backend_name)
-
-    @pytest.mark.parametrize("ctx_tokens,gen_tokens,isl,osl,prefix", _CHUNKED_PREFILL_SHAPES)
-    def test_mixed_step_chunked_prefill(self, ctx_tokens, gen_tokens, isl, osl, prefix) -> None:
-        """Chunked prefill (ctx_tokens < isl) was the largest pre-rewrite
-        composition gap: Python queries context attention at the FULL per-req
-        isl then divides by ceil(isl/ctx), the old Rust queried the chunk
-        directly. The rewritten three-pass mirror must match exactly."""
-        case = _SUBSET_BY_ID[_CHUNKED_PREFILL_CASE_ID].values[0]
-        handle = _compile_handle(case)
-        new_val = handle.mixed_step_latency(ctx_tokens, gen_tokens, isl, osl, prefix)
-        py_val = _golden_reference(_chunked_prefill_key(ctx_tokens, gen_tokens, isl, osl, prefix))
-        _assert_within("mixed_step_chunked", py_val, new_val, backend=case.backend_name)
 
 
 class TestCompileEngineDecodeStepParity:
@@ -487,81 +429,6 @@ class TestCompileEnginePerOpParity:
                 f"{case_id} sits on a power-carrying identity but no golden op carried "
                 "energy_wms > 0 — the per-op energy comparison never executed"
             )
-
-
-# --------------------------------------------------------------------------- #
-# 2b. Imbalance-correction scale threading (session.rs used to hardcode 1.0).
-# --------------------------------------------------------------------------- #
-
-
-# Shared by the imbalance tests and the golden pin path.
-_IMBALANCE_CASE_ID = "minimax-m25-b200-vllm-isl1024-osl2"
-_IMBALANCE_CTX_SCALE = 1.3
-_IMBALANCE_GEN_SCALE = 0.85
-
-
-class TestImbalanceScaleParity:
-    """Non-1.0 seq/gen imbalance-correction scales must reproduce the frozen
-    Python numbers. Regression for the session.rs hardcode: the wire accepted
-    the scales but every RuntimeContext pinned them to 1.0, so any task
-    setting them diverged silently on the rust path."""
-
-    def _case(self) -> EngineStepParityCase:
-        return _SUBSET_BY_ID[_IMBALANCE_CASE_ID].values[0]
-
-    def test_static_scales_thread_through(self) -> None:
-        case = self._case()
-        handle = _compile_handle(case)
-        new_ctx, new_gen, _ = handle.run_static(
-            batch_size=case.batch_size,
-            isl=case.isl,
-            osl=max(case.osl, 2),
-            prefix=case.prefix,
-            seq_imbalance_correction_scale=_IMBALANCE_CTX_SCALE,
-            gen_seq_imbalance_correction_scale=_IMBALANCE_GEN_SCALE,
-            stride=1,
-        )
-        _assert_within(
-            "static_ctx@scale", _golden_reference("imbalance_scale::static_ctx"), new_ctx, backend=case.backend_name
-        )
-        _assert_within(
-            "static_gen@scale", _golden_reference("imbalance_scale::static_gen"), new_gen, backend=case.backend_name
-        )
-
-        # The scales must actually bite: a scaled run differs from unscaled.
-        base_ctx, base_gen, _ = handle.run_static(
-            batch_size=case.batch_size, isl=case.isl, osl=max(case.osl, 2), prefix=case.prefix, stride=1
-        )
-        assert new_ctx != base_ctx, "ctx scale did not affect the rust static path"
-        assert new_gen != base_gen, "gen scale did not affect the rust static path"
-
-    def test_mixed_and_decode_scales_thread_through(self) -> None:
-        case = self._case()
-        handle = _compile_handle(case)
-        new_mixed = handle.mixed_step_latency(
-            case.isl,
-            case.batch_size,
-            case.isl,
-            max(case.osl, 2),
-            case.prefix,
-            seq_imbalance_correction_scale=_IMBALANCE_CTX_SCALE,
-            gen_seq_imbalance_correction_scale=_IMBALANCE_GEN_SCALE,
-        )
-        new_decode = handle.decode_step_latency(
-            case.batch_size,
-            case.isl,
-            max(case.osl, 2),
-            gen_seq_imbalance_correction_scale=_IMBALANCE_GEN_SCALE,
-        )
-        _assert_within(
-            "mixed_step@scale", _golden_reference("imbalance_scale::mixed_step"), new_mixed, backend=case.backend_name
-        )
-        _assert_within(
-            "decode_step@scale",
-            _golden_reference("imbalance_scale::decode_step"),
-            new_decode,
-            backend=case.backend_name,
-        )
 
 
 # --------------------------------------------------------------------------- #

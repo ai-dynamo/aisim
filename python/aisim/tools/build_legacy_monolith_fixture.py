@@ -28,8 +28,8 @@ PAYLOAD_SOURCES = {
     "aiconfigurator/__init__.py": "src/aisim/__init__.py",
     "aiconfigurator/sdk/common.py": "src/aisim/sdk/common.py",
     "aiconfigurator/systems/h100_sxm.yaml": "src/aisim_core/systems/h100_sxm.yaml",
-    "aiconfigurator/model_configs/meta-llama--Meta-Llama-3.1-8B_config.json": (
-        "src/aisim_core/model_configs/meta-llama--Meta-Llama-3.1-8B_config.json"
+    "aiconfigurator/model_configs/Qwen--Qwen3-8B_config.json": (
+        "src/aisim_core/model_configs/Qwen--Qwen3-8B_config.json"
     ),
     "aiconfigurator_core/__init__.py": "src/aisim_core/__init__.py",
 }

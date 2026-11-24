@@ -2,11 +2,6 @@
   "schema_version": 1,
   "description": "Per-file provenance for bundled model configurations. Canonical license/copyright material remains in LICENSE and THIRD_PARTY_NOTICES.md.",
   "licenses": {
-    "LicenseRef-Qwen3.8-Max": {
-      "license_text_sha256": [
-        "397da6f971d6949a826ac2b87bab4a9bd6cc895c2fc83737bcc84f6d48e4a351"
-      ]
-    },
     "MIT": {
       "license_text_sha256": [
         "789377a8cfe3a67c77bd2bd9f9cb9b0142a9a905906c91bcaba52092a8d03169",
@@ -15,59 +10,9 @@
         "7c9b48b52decb9837c70f608678129e1ac79e056829c8d1e82e8cdd8aed562f8"
       ]
     },
-    "LicenseRef-Llama-4-Community": {
-      "license_text_sha256": [
-        "747b9ee8c0338f86a41799b6af9e7fdcce17cc8fb8b8b8d628f97bc68166710f"
-      ]
-    },
     "Apache-2.0": {
       "license_text_sha256": [
         "e23fff8569b293286854873c37cf51c72cdb13018ff50e0487517a8534524d37"
-      ]
-    },
-    "LicenseRef-GLM-5.3": {
-      "license_text_sha256": [
-        "4dd72e54620487ea94f094d711f210a547768220ae6347eec4323083c5efd7f1"
-      ]
-    },
-    "LicenseRef-GLM-5.3 AND LicenseRef-NVIDIA-Open-Model-Agreement": {
-      "license_text_sha256": [
-        "799db03d1d23633b94d4984ac08aed81e72d34ff8c83bba33124825388bf1ea5"
-      ]
-    },
-    "LicenseRef-OpenMDW-1.1": {
-      "license_text_sha256": [
-        "a413b175202f3bbe83675a74347beb4140a8b59655d827d608578a5a3371102f"
-      ]
-    },
-    "Apache-2.0 AND LicenseRef-MiniMax-M2.5-Model": {
-      "license_text_sha256": [
-        "afcfcb3aab51377faef0defdc8ae4499cc15efeedc0293f6fd9eb47de58e521b"
-      ]
-    },
-    "LicenseRef-MiniMax-M2.5-Model": {
-      "license_text_sha256": [
-        "be2c470faf49a31a57dc43322b85d7161a7781b8795b9fb69585b93adb971179"
-      ]
-    },
-    "Apache-2.0 AND LicenseRef-MiniMax-M2.7-Noncommercial": {
-      "license_text_sha256": [
-        "02863ccc6e457c24602ef7d0860f45934f7e69866c183d4bc21e0374ad62cb9a"
-      ]
-    },
-    "LicenseRef-MiniMax-M2.7-Noncommercial": {
-      "license_text_sha256": [
-        "ae0f00538d47e6894db9452498083b896a60676a26a06dbaa73a59d9aa7de2b9"
-      ]
-    },
-    "Apache-2.0 AND LicenseRef-MiniMax-M3-Community": {
-      "license_text_sha256": [
-        "9df48aec80f44b8f9027c0bcd13141201c04666aeeb9da6fbae25b4a5d48f9cd"
-      ]
-    },
-    "LicenseRef-MiniMax-M3-Community": {
-      "license_text_sha256": [
-        "a42faa56fb186ca55475fad45ddee0073da4fe0ad9db517676e4fad209a32029"
       ]
     },
     "Apache-2.0 AND MIT": {
@@ -76,158 +21,9 @@
         "0a3e345a54ab255dd511d35ac2404684ad8c60fdb8c1bab25356464d86afc226",
         "981d2ffffb81106c6970f9f6d7f96581b12c873e17e503e89de15d1c69e4ad60"
       ]
-    },
-    "Apache-2.0 AND LicenseRef-Llama-3.1-Community": {
-      "license_text_sha256": [
-        "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9"
-      ]
-    },
-    "LicenseRef-Llama-3.1-Community": {
-      "license_text_sha256": [
-        "f247b541404c402d906d71f47818179d4fe79d426f3a13514759680669f710a2"
-      ]
-    },
-    "Apache-2.0 AND LicenseRef-Kimi-K2-Instruct-Modified-MIT": {
-      "license_text_sha256": [
-        "93663f288a42860b69743a59ba301a2b7fc9e73792ab6d27e26225a183d90e5b"
-      ]
-    },
-    "LicenseRef-Kimi-K2-Instruct-Modified-MIT": {
-      "license_text_sha256": [
-        "7aadc2c3b398bd1801247b4baa24d353fc6c7a3ce4d52ed19122bded6e33d1fa"
-      ]
-    },
-    "Apache-2.0 AND LicenseRef-Kimi-K2.5-Modified-MIT": {
-      "license_text_sha256": [
-        "b9187cd88244972781dccb574056705994b92c3de30fd6500eaf25765dd70438"
-      ]
-    },
-    "LicenseRef-Kimi-K2.5-Modified-MIT": {
-      "license_text_sha256": [
-        "8b22e3918250a78292ec17e8b2596808318d044684e866719e9d8a1a928ea46d"
-      ]
-    },
-    "Apache-2.0 AND LicenseRef-Kimi-K3": {
-      "license_text_sha256": [
-        "a270c9a6e214d3f09f332a11ee6ef513292fac94a19928e913940f4d837e2a39"
-      ]
-    },
-    "LicenseRef-Kimi-K3": {
-      "license_text_sha256": [
-        "2867133c376aa3deb3a95732e30fa77a9dcc31686bdf9191f405de7e46e84652"
-      ]
-    },
-    "Apache-2.0 AND LicenseRef-Kimi-K2.6-Modified-MIT": {
-      "license_text_sha256": [
-        "a6c205937203b51cf56acfed485534b4a1a738faa09d510da3d571a3c75c2a36"
-      ]
-    },
-    "LicenseRef-Kimi-K2.6-Modified-MIT": {
-      "license_text_sha256": [
-        "941ddde5de6c074eac890c67856db540e48bd4653e34d4d9e38d1a9fae4344b8"
-      ]
-    },
-    "Apache-2.0 AND LicenseRef-Kimi-K2.7-Code-Modified-MIT": {
-      "license_text_sha256": [
-        "86c40b0e4d23e36595522ec3cd98d355518bfdbfeb53aa8d161139e93bf6e58c"
-      ]
-    },
-    "LicenseRef-Kimi-K2.7-Code-Modified-MIT": {
-      "license_text_sha256": [
-        "0bc1a42b295528b3d531d8bac9d831836c9b22bf43fc40733530da9186b753d8"
-      ]
-    },
-    "Apache-2.0 AND LicenseRef-Llama-3.3-Community": {
-      "license_text_sha256": [
-        "b5c7be2418fefa3283f75e19d8a85f6429f82035e15c4affe3a549469cc5669c"
-      ]
-    },
-    "LicenseRef-Llama-3.3-Community": {
-      "license_text_sha256": [
-        "1beaed4a9925af5f6d4d07eebcc351c2c59b00bbb3cdeac59d780adffadcfcdb"
-      ]
     }
   },
   "files": [
-    {
-      "path": "aisim_core/model_configs/MiniMaxAI--MiniMax-M2.5_config.json",
-      "sha256": "3ff405539448d89e911d14d7f22eefe92c11b1294b74c1d7a0d100eb1bdd644c",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/MiniMaxAI--MiniMax-M2.5_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/MiniMaxAI--MiniMax-M2.5_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-MiniMax-M2.5-Model",
-      "copyright_owner": "MiniMax",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "afcfcb3aab51377faef0defdc8ae4499cc15efeedc0293f6fd9eb47de58e521b"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "MiniMaxAI/MiniMax-M2.5",
-      "base_license": "LicenseRef-MiniMax-M2.5-Model",
-      "base_license_source": "https://huggingface.co/MiniMaxAI/MiniMax-M2.5/blob/2515a3ea0afec1dd22d0c7794b3a91557804d195/LICENSE-MODEL",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ],
-      "license_scope_note": "The pinned HF tree supplies LICENSE-MODEL with a redistribution grant. Its README points to an unavailable modified-MIT reference; the conservative recorded grant is LICENSE-MODEL, not standard MIT. Scoped approval remains pending."
-    },
-    {
-      "path": "aisim_core/model_configs/MiniMaxAI--MiniMax-M2.7_config.json",
-      "sha256": "697c30492781d55ac516011f937b5cdec045710b5b0c9ca39a6ea277785df9aa",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/MiniMaxAI--MiniMax-M2.7_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/MiniMaxAI--MiniMax-M2.7_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-MiniMax-M2.7-Noncommercial",
-      "copyright_owner": "MiniMax",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "02863ccc6e457c24602ef7d0860f45934f7e69866c183d4bc21e0374ad62cb9a"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "MiniMaxAI/MiniMax-M2.7",
-      "base_license": "LicenseRef-MiniMax-M2.7-Noncommercial",
-      "base_license_source": "https://huggingface.co/MiniMaxAI/MiniMax-M2.7/blob/0a6536713b0b03f3be97494e5cf8d22f668a3164/LICENSE",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
-    },
-    {
-      "path": "aisim_core/model_configs/MiniMaxAI--MiniMax-M3_config.json",
-      "sha256": "7726ac24cb99116b67275430374140fcebd0525e55869b80ce3acb53848bc636",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/MiniMaxAI--MiniMax-M3_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/MiniMaxAI--MiniMax-M3_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-MiniMax-M3-Community",
-      "copyright_owner": "MiniMax",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "9df48aec80f44b8f9027c0bcd13141201c04666aeeb9da6fbae25b4a5d48f9cd"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "MiniMaxAI/MiniMax-M3",
-      "base_license": "LicenseRef-MiniMax-M3-Community",
-      "base_license_source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/blob/d95e30cb912fe3021bb9c2ba66a8ce60b6c937a9/LICENSE",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
-    },
     {
       "path": "aisim_core/model_configs/Qwen--Qwen3-0.6B_config.json",
       "sha256": "660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd",
@@ -850,42 +646,6 @@
       ]
     },
     {
-      "path": "aisim_core/model_configs/Qwen--Qwen3.8-2.4T-A95B-FP8_config.json",
-      "sha256": "b7396b749964c6afb5387c58e6425db8628e85f8ae66739d284eb1c8f42c4d4e",
-      "origin": "upstream",
-      "source": {
-        "url": "https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8/blob/d2dc35658bcf77e66643428cb52e774cc3b5bd29/config.json",
-        "revision": "d2dc35658bcf77e66643428cb52e774cc3b5bd29",
-        "path": "config.json"
-      },
-      "license": "LicenseRef-Qwen3.8-Max",
-      "copyright_owner": "Qwen",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Qwen3.8-Max model configuration files",
-        "license_text_sha256": "397da6f971d6949a826ac2b87bab4a9bd6cc895c2fc83737bcc84f6d48e4a351"
-      }
-    },
-    {
-      "path": "aisim_core/model_configs/Qwen--Qwen3.8-2.4T-A95B_config.json",
-      "sha256": "4e3819548967e319ab435d044a3a331dbe3b078590ce822e9d74b79430533987",
-      "origin": "upstream",
-      "source": {
-        "url": "https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B/blob/207bd685a7e3696cfaff12ded7c6a7ea0f88c996/config.json",
-        "revision": "207bd685a7e3696cfaff12ded7c6a7ea0f88c996",
-        "path": "config.json"
-      },
-      "license": "LicenseRef-Qwen3.8-Max",
-      "copyright_owner": "Qwen",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Qwen3.8-Max model configuration files",
-        "license_text_sha256": "397da6f971d6949a826ac2b87bab4a9bd6cc895c2fc83737bcc84f6d48e4a351"
-      }
-    },
-    {
       "path": "aisim_core/model_configs/XiaomiMiMo--MiMo-7B-Base_config.json",
       "sha256": "3e0849e97570c2a9f6efa30b801f69a9943e7022fbba99381fd6003a3562c442",
       "origin": "upstream",
@@ -1079,133 +839,12 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "google/gemma-4-26B-A4B",
       "base_license": "Apache-2.0",
-      "base_license_source": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
+      "base_license_source": "https://huggingface.co/google/gemma-4-26B-A4B/blob/24548b62aa021d562695c04aaf7758a1ea47990b/README.md",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
-    },
-    {
-      "path": "aisim_core/model_configs/meta-llama--Llama-4-Maverick-17B-128E-Instruct_config.json",
-      "sha256": "39f9056ad8911d045fc44a9174e9b4acb8b42f9fc583dc92e62a9e107491bd18",
-      "origin": "upstream",
-      "source": {
-        "url": "https://huggingface.co/meta-llama/Llama-4-Maverick-17B-128E-Instruct/blob/73d14711bcc77c16df3470856949c3764056b617/config.json",
-        "revision": "73d14711bcc77c16df3470856949c3764056b617",
-        "path": "config.json"
-      },
-      "license": "LicenseRef-Llama-4-Community",
-      "copyright_owner": "Meta Platforms, Inc.",
-      "modified": true,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Meta Llama 4",
-        "license_text_sha256": "747b9ee8c0338f86a41799b6af9e7fdcce17cc8fb8b8b8d628f97bc68166710f",
-        "required_attribution": [
-          "Llama 4 is licensed under the Llama 4 Community License, Copyright \u00a9 Meta Platforms, Inc. All Rights Reserved."
-        ]
-      },
-      "modifications": "Configuration adapted for AISimulate; see the source revision and canonical attribution. Bundled bytes are pinned separately."
-    },
-    {
-      "path": "aisim_core/model_configs/meta-llama--Llama-4-Scout-17B-16E-Instruct_config.json",
-      "sha256": "5eda6f9bdb2bd6b6959455679f75c4c107ea763b3cce0f9e0c74091ca80d1906",
-      "origin": "upstream",
-      "source": {
-        "url": "https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct/blob/92f3b1597a195b523d8d9e5700e57e4fbb8f20d3/config.json",
-        "revision": "92f3b1597a195b523d8d9e5700e57e4fbb8f20d3",
-        "path": "config.json"
-      },
-      "license": "LicenseRef-Llama-4-Community",
-      "copyright_owner": "Meta Platforms, Inc.",
-      "modified": true,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Meta Llama 4",
-        "license_text_sha256": "747b9ee8c0338f86a41799b6af9e7fdcce17cc8fb8b8b8d628f97bc68166710f",
-        "required_attribution": [
-          "Llama 4 is licensed under the Llama 4 Community License, Copyright \u00a9 Meta Platforms, Inc. All Rights Reserved."
-        ]
-      },
-      "modifications": "Configuration adapted for AISimulate; see the source revision and canonical attribution. Bundled bytes are pinned separately."
-    },
-    {
-      "path": "aisim_core/model_configs/meta-llama--Meta-Llama-3.1-405B_config.json",
-      "sha256": "b75e46be030e920b46bc5e92de48554ce07937ced57b1b2fe1ba722cc94ffc76",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/meta-llama--Meta-Llama-3.1-405B_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/meta-llama--Meta-Llama-3.1-405B_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-Llama-3.1-Community",
-      "copyright_owner": "Meta Platforms, Inc.",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "meta-llama/Meta-Llama-3.1-405B",
-      "base_license": "LicenseRef-Llama-3.1-Community",
-      "base_license_source": "https://huggingface.co/meta-llama/Meta-Llama-3.1-8B/blob/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b/LICENSE",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
-    },
-    {
-      "path": "aisim_core/model_configs/meta-llama--Meta-Llama-3.1-70B_config.json",
-      "sha256": "5866f0abbb3050fd6948c0afde03651b2445a16480338ff01dc11d4a12ccd3f2",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/meta-llama--Meta-Llama-3.1-70B_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/meta-llama--Meta-Llama-3.1-70B_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-Llama-3.1-Community",
-      "copyright_owner": "Meta Platforms, Inc.",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "meta-llama/Meta-Llama-3.1-70B",
-      "base_license": "LicenseRef-Llama-3.1-Community",
-      "base_license_source": "https://huggingface.co/meta-llama/Meta-Llama-3.1-8B/blob/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b/LICENSE",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
-    },
-    {
-      "path": "aisim_core/model_configs/meta-llama--Meta-Llama-3.1-8B_config.json",
-      "sha256": "398adf8b93f20e64932517492099d4e471e36a1723b5bf4e1311638f6a13f909",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/meta-llama--Meta-Llama-3.1-8B_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/meta-llama--Meta-Llama-3.1-8B_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-Llama-3.1-Community",
-      "copyright_owner": "Meta Platforms, Inc.",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "meta-llama/Meta-Llama-3.1-8B",
-      "base_license": "LicenseRef-Llama-3.1-Community",
-      "base_license_source": "https://huggingface.co/meta-llama/Meta-Llama-3.1-8B/blob/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b/LICENSE",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
+      ],
+      "base_license_evidence": "The named base model card declares Apache-2.0 and links Google's Gemma 4 Apache-2.0 license page; this pinned model repository contains no standalone license file."
     },
     {
       "path": "aisim_core/model_configs/meta-models--Muse-Glimmer-30B_config.json",
@@ -1281,84 +920,6 @@
       ]
     },
     {
-      "path": "aisim_core/model_configs/moonshotai--Kimi-K2-Instruct_config.json",
-      "sha256": "17caf15bd0614a4580e066eec2f459f5b0b1372648e355e6d770305b092662ce",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/moonshotai--Kimi-K2-Instruct_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/moonshotai--Kimi-K2-Instruct_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-Kimi-K2-Instruct-Modified-MIT",
-      "copyright_owner": "Moonshot AI",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "93663f288a42860b69743a59ba301a2b7fc9e73792ab6d27e26225a183d90e5b"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "moonshotai/Kimi-K2-Instruct",
-      "base_license": "LicenseRef-Kimi-K2-Instruct-Modified-MIT",
-      "base_license_source": "https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/fd1984e2b7a3350dbf7305fe73a4ede25c14de50/LICENSE",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
-    },
-    {
-      "path": "aisim_core/model_configs/moonshotai--Kimi-K2.5_config.json",
-      "sha256": "1a8a4903e63893b0f5be0450a089cee4a36778900cafae913e0c21208b462ce0",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/moonshotai--Kimi-K2.5_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/moonshotai--Kimi-K2.5_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-Kimi-K2.5-Modified-MIT",
-      "copyright_owner": "Moonshot AI",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "b9187cd88244972781dccb574056705994b92c3de30fd6500eaf25765dd70438"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "moonshotai/Kimi-K2.5",
-      "base_license": "LicenseRef-Kimi-K2.5-Modified-MIT",
-      "base_license_source": "https://huggingface.co/moonshotai/Kimi-K2.5/blob/4d01dfe0332d63057c186e0b262165819efb6611/LICENSE",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
-    },
-    {
-      "path": "aisim_core/model_configs/moonshotai--Kimi-K3_config.json",
-      "sha256": "9710e121a58d03ac92c8d6da287a19541994319afbbe6d6202af001ffd379213",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/moonshotai--Kimi-K3_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/moonshotai--Kimi-K3_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-Kimi-K3",
-      "copyright_owner": "Moonshot AI",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "a270c9a6e214d3f09f332a11ee6ef513292fac94a19928e913940f4d837e2a39"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "moonshotai/Kimi-K3",
-      "base_license": "LicenseRef-Kimi-K3",
-      "base_license_source": "https://huggingface.co/moonshotai/Kimi-K3/blob/f831ab66814297da540d832a5235f8e904f29d06/LICENSE",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
-    },
-    {
       "path": "aisim_core/model_configs/nvidia--DeepSeek-V3.1-NVFP4_config.json",
       "sha256": "29b950edfbf0d38ebb921f2007fb01e5a63afe33d7e096cc546ad93868e2d0a4",
       "origin": "upstream",
@@ -1378,7 +939,7 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "deepseek-ai/DeepSeek-V3.1",
       "base_license": "MIT",
-      "base_license_source": "https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/LICENSE-CODE",
+      "base_license_source": "https://huggingface.co/deepseek-ai/DeepSeek-V3.1/blob/c0781d039fb7a1ba2abc4add0bdc293e92d2b8db/LICENSE",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
@@ -1404,7 +965,7 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "deepseek-ai/DeepSeek-V3.1",
       "base_license": "MIT",
-      "base_license_source": "https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/LICENSE-CODE",
+      "base_license_source": "https://huggingface.co/deepseek-ai/DeepSeek-V3.1/blob/c0781d039fb7a1ba2abc4add0bdc293e92d2b8db/LICENSE",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
@@ -1430,7 +991,7 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "deepseek-ai/DeepSeek-V3.2",
       "base_license": "MIT",
-      "base_license_source": "https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/LICENSE-CODE",
+      "base_license_source": "https://huggingface.co/deepseek-ai/DeepSeek-V3.2/blob/a7e62ac04ecb2c0a54d736dc46601c5606cf10a6/LICENSE",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
@@ -1456,7 +1017,7 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "deepseek-ai/DeepSeek-V3.2",
       "base_license": "MIT",
-      "base_license_source": "https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/LICENSE-CODE",
+      "base_license_source": "https://huggingface.co/deepseek-ai/DeepSeek-V3.2/blob/a7e62ac04ecb2c0a54d736dc46601c5606cf10a6/LICENSE",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
@@ -1482,7 +1043,7 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "deepseek-ai/DeepSeek-V4-Flash",
       "base_license": "MIT",
-      "base_license_source": "https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/LICENSE-CODE",
+      "base_license_source": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/LICENSE",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
@@ -1508,7 +1069,7 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "deepseek-ai/DeepSeek-V4-Flash",
       "base_license": "MIT",
-      "base_license_source": "https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/LICENSE-CODE",
+      "base_license_source": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/LICENSE",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
@@ -1534,7 +1095,7 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "deepseek-ai/DeepSeek-V4-Pro",
       "base_license": "MIT",
-      "base_license_source": "https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/LICENSE-CODE",
+      "base_license_source": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/b5968e9190ef611bbf34a7229255be88a0e937c1/LICENSE",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
@@ -1560,7 +1121,7 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "deepseek-ai/DeepSeek-V4-Pro",
       "base_license": "MIT",
-      "base_license_source": "https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/LICENSE-CODE",
+      "base_license_source": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/b5968e9190ef611bbf34a7229255be88a0e937c1/LICENSE",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
@@ -1692,7 +1253,7 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "zai-org/GLM-5.2",
       "base_license": "MIT",
-      "base_license_source": "https://huggingface.co/zai-org/GLM-5.1/blob/26e1bd6e011feb778d25ae34b09b07074139d92d/LICENSE",
+      "base_license_source": "https://huggingface.co/zai-org/GLM-5.2/blob/cf457fa734ab149ffef225f80893eb38c6ff5cdc/LICENSE",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
@@ -1718,7 +1279,7 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "zai-org/GLM-5.2",
       "base_license": "MIT",
-      "base_license_source": "https://huggingface.co/zai-org/GLM-5.1/blob/26e1bd6e011feb778d25ae34b09b07074139d92d/LICENSE",
+      "base_license_source": "https://huggingface.co/zai-org/GLM-5.2/blob/cf457fa734ab149ffef225f80893eb38c6ff5cdc/LICENSE",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
@@ -1771,50 +1332,6 @@
       "license_approval": "not asserted; see the separate release review ledger"
     },
     {
-      "path": "aisim_core/model_configs/nvidia--GLM-5.3-NVFP4_config.json",
-      "sha256": "b0b6b9ab922a82e3688bc39a4117bc443e106fcf88969ef48b3627778f4bdf7b",
-      "origin": "upstream",
-      "source": {
-        "url": "https://huggingface.co/nvidia/GLM-5.3-NVFP4/blob/e3b8f9f2fad29727dfa95e766c5cac18ea1414bf/config.json",
-        "revision": "e3b8f9f2fad29727dfa95e766c5cac18ea1414bf",
-        "path": "config.json"
-      },
-      "license": "LicenseRef-GLM-5.3 AND LicenseRef-NVIDIA-Open-Model-Agreement",
-      "copyright_owner": "NVIDIA CORPORATION & AFFILIATES",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "NVIDIA GLM-5.3-NVFP4 model configuration files",
-        "license_text_sha256": "799db03d1d23633b94d4984ac08aed81e72d34ff8c83bba33124825388bf1ea5",
-        "required_attribution": [
-          "NVIDIA CORPORATION & AFFILIATES",
-          "Z.AI"
-        ]
-      }
-    },
-    {
-      "path": "aisim_core/model_configs/nvidia--GLM-5.3-NVFP4_hf_quant_config.json",
-      "sha256": "13799d4fed353c20dde2264fbdd7f68a780b514782f8d80bba96ac5e44aa9bba",
-      "origin": "upstream",
-      "source": {
-        "url": "https://huggingface.co/nvidia/GLM-5.3-NVFP4/blob/e3b8f9f2fad29727dfa95e766c5cac18ea1414bf/hf_quant_config.json",
-        "revision": "e3b8f9f2fad29727dfa95e766c5cac18ea1414bf",
-        "path": "hf_quant_config.json"
-      },
-      "license": "LicenseRef-GLM-5.3 AND LicenseRef-NVIDIA-Open-Model-Agreement",
-      "copyright_owner": "NVIDIA CORPORATION & AFFILIATES",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "NVIDIA GLM-5.3-NVFP4 model configuration files",
-        "license_text_sha256": "799db03d1d23633b94d4984ac08aed81e72d34ff8c83bba33124825388bf1ea5",
-        "required_attribution": [
-          "NVIDIA CORPORATION & AFFILIATES",
-          "Z.AI"
-        ]
-      }
-    },
-    {
       "path": "aisim_core/model_configs/nvidia--Gemma-4-26B-A4B-NVFP4_config.json",
       "sha256": "4e379cc809c617a49179a49140f553a2d6a5ec538ed480832b0c54f6ace43d98",
       "origin": "upstream",
@@ -1835,11 +1352,12 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "google/gemma-4-26B-A4B-it",
       "base_license": "Apache-2.0",
-      "base_license_source": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
+      "base_license_source": "https://huggingface.co/google/gemma-4-26B-A4B-it/blob/4d7ae4984b7db7de8f8457170b3f1a419ee76d52/README.md",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
+      ],
+      "base_license_evidence": "The named base model card declares Apache-2.0 and links Google's Gemma 4 Apache-2.0 license page; this pinned model repository contains no standalone license file."
     },
     {
       "path": "aisim_core/model_configs/nvidia--Gemma-4-26B-A4B-NVFP4_hf_quant_config.json",
@@ -1862,11 +1380,12 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "google/gemma-4-26B-A4B-it",
       "base_license": "Apache-2.0",
-      "base_license_source": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
+      "base_license_source": "https://huggingface.co/google/gemma-4-26B-A4B-it/blob/4d7ae4984b7db7de8f8457170b3f1a419ee76d52/README.md",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
+      ],
+      "base_license_evidence": "The named base model card declares Apache-2.0 and links Google's Gemma 4 Apache-2.0 license page; this pinned model repository contains no standalone license file."
     },
     {
       "path": "aisim_core/model_configs/nvidia--Gemma-4-31B-IT-NVFP4_config.json",
@@ -1889,11 +1408,12 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "google/gemma-4-31B-it",
       "base_license": "Apache-2.0",
-      "base_license_source": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
+      "base_license_source": "https://huggingface.co/google/gemma-4-31B-it/blob/842da3794eaa0b77d5f08bae87a17459d91ff475/README.md",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
+      ],
+      "base_license_evidence": "The named base model card declares Apache-2.0 and links Google's Gemma 4 Apache-2.0 license page; this pinned model repository contains no standalone license file."
     },
     {
       "path": "aisim_core/model_configs/nvidia--Gemma-4-31B-IT-NVFP4_hf_quant_config.json",
@@ -1916,377 +1436,12 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "google/gemma-4-31B-it",
       "base_license": "Apache-2.0",
-      "base_license_source": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
-    },
-    {
-      "path": "aisim_core/model_configs/nvidia--Kimi-K2.5-NVFP4_config.json",
-      "sha256": "c375d7d566b6fa706ba46fec9ef938e829c5ba1accb20541d4f0c75dddefcd8f",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/nvidia--Kimi-K2.5-NVFP4_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/nvidia--Kimi-K2.5-NVFP4_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-Kimi-K2.5-Modified-MIT",
-      "copyright_owner": "Moonshot AI",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "b9187cd88244972781dccb574056705994b92c3de30fd6500eaf25765dd70438"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "moonshotai/Kimi-K2.5",
-      "base_license": "LicenseRef-Kimi-K2.5-Modified-MIT",
-      "base_license_source": "https://huggingface.co/moonshotai/Kimi-K2.5/blob/4d01dfe0332d63057c186e0b262165819efb6611/LICENSE",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
-    },
-    {
-      "path": "aisim_core/model_configs/nvidia--Kimi-K2.6-NVFP4_config.json",
-      "sha256": "af4c0fea7ec43d5438532eeef8daa9fcabbdf97ddedc9da2319aa675f68f51ff",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/nvidia--Kimi-K2.6-NVFP4_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/nvidia--Kimi-K2.6-NVFP4_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-Kimi-K2.6-Modified-MIT",
-      "copyright_owner": "Moonshot AI",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "a6c205937203b51cf56acfed485534b4a1a738faa09d510da3d571a3c75c2a36"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "moonshotai/Kimi-K2.6",
-      "base_license": "LicenseRef-Kimi-K2.6-Modified-MIT",
-      "base_license_source": "https://huggingface.co/moonshotai/Kimi-K2.6/blob/7eb5002f6aadc958aed6a9177b7ed26bb94011bb/LICENSE",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
-    },
-    {
-      "path": "aisim_core/model_configs/nvidia--Kimi-K2.6-NVFP4_hf_quant_config.json",
-      "sha256": "6ee4be1d46bf2b5204284b6641ed7bb5d9fc2fc7e8157a4eb06d5fe500dddc3a",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/nvidia--Kimi-K2.6-NVFP4_hf_quant_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/nvidia--Kimi-K2.6-NVFP4_hf_quant_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-Kimi-K2.6-Modified-MIT",
-      "copyright_owner": "Moonshot AI",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "a6c205937203b51cf56acfed485534b4a1a738faa09d510da3d571a3c75c2a36"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "moonshotai/Kimi-K2.6",
-      "base_license": "LicenseRef-Kimi-K2.6-Modified-MIT",
-      "base_license_source": "https://huggingface.co/moonshotai/Kimi-K2.6/blob/7eb5002f6aadc958aed6a9177b7ed26bb94011bb/LICENSE",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
-    },
-    {
-      "path": "aisim_core/model_configs/nvidia--Kimi-K2.7-Code-NVFP4_config.json",
-      "sha256": "b203b07a34c3462df0b30eea7c99cc31b3d682c365cacc75edb8823a0ab97758",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/nvidia--Kimi-K2.7-Code-NVFP4_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/nvidia--Kimi-K2.7-Code-NVFP4_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-Kimi-K2.7-Code-Modified-MIT",
-      "copyright_owner": "Moonshot AI",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "86c40b0e4d23e36595522ec3cd98d355518bfdbfeb53aa8d161139e93bf6e58c"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "moonshotai/Kimi-K2.7-Code",
-      "base_license": "LicenseRef-Kimi-K2.7-Code-Modified-MIT",
-      "base_license_source": "https://huggingface.co/moonshotai/Kimi-K2.7-Code/blob/74797c9c62378b951a1f6fcf5c4631024e9b8bef/LICENSE",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
-    },
-    {
-      "path": "aisim_core/model_configs/nvidia--Kimi-K2.7-Code-NVFP4_hf_quant_config.json",
-      "sha256": "4baf41307796a29aa0dc67de3ab33d590b9ad20bac5042b22dac842b3ecb766c",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/nvidia--Kimi-K2.7-Code-NVFP4_hf_quant_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/nvidia--Kimi-K2.7-Code-NVFP4_hf_quant_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-Kimi-K2.7-Code-Modified-MIT",
-      "copyright_owner": "Moonshot AI",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "86c40b0e4d23e36595522ec3cd98d355518bfdbfeb53aa8d161139e93bf6e58c"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "moonshotai/Kimi-K2.7-Code",
-      "base_license": "LicenseRef-Kimi-K2.7-Code-Modified-MIT",
-      "base_license_source": "https://huggingface.co/moonshotai/Kimi-K2.7-Code/blob/74797c9c62378b951a1f6fcf5c4631024e9b8bef/LICENSE",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
-    },
-    {
-      "path": "aisim_core/model_configs/nvidia--Llama-3.1-70B-Instruct-FP8_config.json",
-      "sha256": "cfd56137fa9c0632c022a322e8e19e4dcc0474e1b2f0c7d9f7cc64d212c9fd18",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/nvidia--Llama-3.1-70B-Instruct-FP8_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/nvidia--Llama-3.1-70B-Instruct-FP8_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-Llama-3.1-Community",
-      "copyright_owner": "Meta Platforms, Inc.",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "meta-llama/Llama-3.1-70B-Instruct",
-      "base_license": "LicenseRef-Llama-3.1-Community",
-      "base_license_source": "https://huggingface.co/meta-llama/Meta-Llama-3.1-8B/blob/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b/LICENSE",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
-    },
-    {
-      "path": "aisim_core/model_configs/nvidia--Llama-3.1-70B-Instruct-FP8_hf_quant_config.json",
-      "sha256": "8d26f1ffdd8b22de0f7b280923af5806dfaff6b0dc5aacc454782732cc0795dd",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/nvidia--Llama-3.1-70B-Instruct-FP8_hf_quant_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/nvidia--Llama-3.1-70B-Instruct-FP8_hf_quant_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-Llama-3.1-Community",
-      "copyright_owner": "Meta Platforms, Inc.",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "meta-llama/Llama-3.1-70B-Instruct",
-      "base_license": "LicenseRef-Llama-3.1-Community",
-      "base_license_source": "https://huggingface.co/meta-llama/Meta-Llama-3.1-8B/blob/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b/LICENSE",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
-    },
-    {
-      "path": "aisim_core/model_configs/nvidia--Llama-3_3-Nemotron-Super-49B-v1_config.json",
-      "sha256": "ea288aea647aa22e9a233aca6db14cd9ef0ee96773074dbf34cbcd9cc53a4747",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/nvidia--Llama-3_3-Nemotron-Super-49B-v1_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/nvidia--Llama-3_3-Nemotron-Super-49B-v1_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-Llama-3.3-Community",
-      "copyright_owner": "Meta Platforms, Inc.",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "b5c7be2418fefa3283f75e19d8a85f6429f82035e15c4affe3a549469cc5669c"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "meta-llama/Llama-3.3-70B-Instruct",
-      "base_license": "LicenseRef-Llama-3.3-Community",
-      "base_license_source": "https://github.com/meta-llama/llama-models/blob/c908f5b7bd2c2fbdd89a48f6bc252efd4ebc293f/models/llama3_3/LICENSE",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
-    },
-    {
-      "path": "aisim_core/model_configs/nvidia--MiniMax-M2.5-NVFP4_config.json",
-      "sha256": "c59bf551a0c315a6d8101afaf441fd53108792e997796e0e3e9cfe75903362fd",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/nvidia--MiniMax-M2.5-NVFP4_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/nvidia--MiniMax-M2.5-NVFP4_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-MiniMax-M2.5-Model",
-      "copyright_owner": "MiniMax",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "afcfcb3aab51377faef0defdc8ae4499cc15efeedc0293f6fd9eb47de58e521b"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "MiniMaxAI/MiniMax-M2.5",
-      "base_license": "LicenseRef-MiniMax-M2.5-Model",
-      "base_license_source": "https://huggingface.co/MiniMaxAI/MiniMax-M2.5/blob/2515a3ea0afec1dd22d0c7794b3a91557804d195/LICENSE-MODEL",
+      "base_license_source": "https://huggingface.co/google/gemma-4-31B-it/blob/842da3794eaa0b77d5f08bae87a17459d91ff475/README.md",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
       ],
-      "license_scope_note": "The pinned HF tree supplies LICENSE-MODEL with a redistribution grant. Its README points to an unavailable modified-MIT reference; the conservative recorded grant is LICENSE-MODEL, not standard MIT. Scoped approval remains pending."
-    },
-    {
-      "path": "aisim_core/model_configs/nvidia--MiniMax-M2.5-NVFP4_hf_quant_config.json",
-      "sha256": "253ea166454ff40d6a5387379973156c8bf9aee56e34d3d08e543925ab9f0b19",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/nvidia--MiniMax-M2.5-NVFP4_hf_quant_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/nvidia--MiniMax-M2.5-NVFP4_hf_quant_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-MiniMax-M2.5-Model",
-      "copyright_owner": "MiniMax",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "afcfcb3aab51377faef0defdc8ae4499cc15efeedc0293f6fd9eb47de58e521b"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "MiniMaxAI/MiniMax-M2.5",
-      "base_license": "LicenseRef-MiniMax-M2.5-Model",
-      "base_license_source": "https://huggingface.co/MiniMaxAI/MiniMax-M2.5/blob/2515a3ea0afec1dd22d0c7794b3a91557804d195/LICENSE-MODEL",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ],
-      "license_scope_note": "The pinned HF tree supplies LICENSE-MODEL with a redistribution grant. Its README points to an unavailable modified-MIT reference; the conservative recorded grant is LICENSE-MODEL, not standard MIT. Scoped approval remains pending."
-    },
-    {
-      "path": "aisim_core/model_configs/nvidia--MiniMax-M2.7-NVFP4_config.json",
-      "sha256": "24abe73e3a7d4d2e8e0d20ea13f322b8823a804e6598a4d0f7bfc0d0d367ea9d",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/nvidia--MiniMax-M2.7-NVFP4_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/nvidia--MiniMax-M2.7-NVFP4_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-MiniMax-M2.7-Noncommercial",
-      "copyright_owner": "MiniMax",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "02863ccc6e457c24602ef7d0860f45934f7e69866c183d4bc21e0374ad62cb9a"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "MiniMaxAI/MiniMax-M2.7",
-      "base_license": "LicenseRef-MiniMax-M2.7-Noncommercial",
-      "base_license_source": "https://huggingface.co/MiniMaxAI/MiniMax-M2.7/blob/0a6536713b0b03f3be97494e5cf8d22f668a3164/LICENSE",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
-    },
-    {
-      "path": "aisim_core/model_configs/nvidia--MiniMax-M2.7-NVFP4_hf_quant_config.json",
-      "sha256": "b8c904443b70ab92b6c6ca3b54081cbce84c60a215e50a6ed59e28a4dcc45d0e",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/nvidia--MiniMax-M2.7-NVFP4_hf_quant_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/nvidia--MiniMax-M2.7-NVFP4_hf_quant_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-MiniMax-M2.7-Noncommercial",
-      "copyright_owner": "MiniMax",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "02863ccc6e457c24602ef7d0860f45934f7e69866c183d4bc21e0374ad62cb9a"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "MiniMaxAI/MiniMax-M2.7",
-      "base_license": "LicenseRef-MiniMax-M2.7-Noncommercial",
-      "base_license_source": "https://huggingface.co/MiniMaxAI/MiniMax-M2.7/blob/0a6536713b0b03f3be97494e5cf8d22f668a3164/LICENSE",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
-    },
-    {
-      "path": "aisim_core/model_configs/nvidia--MiniMax-M3-NVFP4_config.json",
-      "sha256": "440d22038ffa0bcb93fa01e8d2d555e3840d939167c08eace81b9cce386fb117",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/nvidia--MiniMax-M3-NVFP4_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/nvidia--MiniMax-M3-NVFP4_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-MiniMax-M3-Community",
-      "copyright_owner": "MiniMax",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "9df48aec80f44b8f9027c0bcd13141201c04666aeeb9da6fbae25b4a5d48f9cd"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "MiniMaxAI/MiniMax-M3",
-      "base_license": "LicenseRef-MiniMax-M3-Community",
-      "base_license_source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/blob/d95e30cb912fe3021bb9c2ba66a8ce60b6c937a9/LICENSE",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
-    },
-    {
-      "path": "aisim_core/model_configs/nvidia--MiniMax-M3-NVFP4_hf_quant_config.json",
-      "sha256": "11581ca203bcd77dae53cc77b49392cb17545b097586249dfac12e093bfaa1ec",
-      "origin": "upstream",
-      "source": {
-        "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/aic-core/src/aiconfigurator_core/model_configs/nvidia--MiniMax-M3-NVFP4_hf_quant_config.json",
-        "revision": "c8aee02f0887547a334c3d6cd192c42757e4b40e",
-        "path": "aic-core/src/aiconfigurator_core/model_configs/nvidia--MiniMax-M3-NVFP4_hf_quant_config.json"
-      },
-      "license": "Apache-2.0 AND LicenseRef-MiniMax-M3-Community",
-      "copyright_owner": "MiniMax",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "9df48aec80f44b8f9027c0bcd13141201c04666aeeb9da6fbae25b4a5d48f9cd"
-      },
-      "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
-      "base_model": "MiniMaxAI/MiniMax-M3",
-      "base_license": "LicenseRef-MiniMax-M3-Community",
-      "base_license_source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/blob/d95e30cb912fe3021bb9c2ba66a8ce60b6c937a9/LICENSE",
-      "license_approval": "not asserted; see the separate release review ledger",
-      "additional_copyright_owners": [
-        "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
+      "base_license_evidence": "The named base model card declares Apache-2.0 and links Google's Gemma 4 Apache-2.0 license page; this pinned model repository contains no standalone license file."
     },
     {
       "path": "aisim_core/model_configs/nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-BF16_config.json",
@@ -2992,7 +2147,7 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "sgl-project/DeepSeek-V4-Flash-FP8",
       "base_license": "MIT",
-      "base_license_source": "https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/LICENSE-CODE",
+      "base_license_source": "https://huggingface.co/sgl-project/DeepSeek-V4-Flash-FP8/blob/ae01d80c06cdfe30581edfd0e1c5449dc7ed7f17/LICENSE",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
@@ -3018,7 +2173,7 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "sgl-project/DeepSeek-V4-Pro-FP8",
       "base_license": "MIT",
-      "base_license_source": "https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/LICENSE-CODE",
+      "base_license_source": "https://huggingface.co/sgl-project/DeepSeek-V4-Pro-FP8/blob/54eeff4ae56c7605c99bbb8b5fcd54412745fb5f/LICENSE",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
@@ -3169,7 +2324,7 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "zai-org/GLM-5.2-FP8",
       "base_license": "MIT",
-      "base_license_source": "https://huggingface.co/zai-org/GLM-5.1/blob/26e1bd6e011feb778d25ae34b09b07074139d92d/LICENSE",
+      "base_license_source": "https://huggingface.co/zai-org/GLM-5.2-FP8/blob/f33c6dc501ee5a2c7e35155653b1b1abbc320951/LICENSE",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
@@ -3195,32 +2350,11 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "zai-org/GLM-5.2",
       "base_license": "MIT",
-      "base_license_source": "https://huggingface.co/zai-org/GLM-5.1/blob/26e1bd6e011feb778d25ae34b09b07074139d92d/LICENSE",
+      "base_license_source": "https://huggingface.co/zai-org/GLM-5.2/blob/cf457fa734ab149ffef225f80893eb38c6ff5cdc/LICENSE",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
       ]
-    },
-    {
-      "path": "aisim_core/model_configs/zai-org--GLM-5.3-BF16_config.json",
-      "sha256": "ca8f2f47b07919a514c0ca223dc2ea2bc7445afaa5ac76c013a3784e096426ca",
-      "origin": "upstream",
-      "source": {
-        "url": "https://huggingface.co/zai-org/GLM-5.3-BF16/blob/abf42e6c0e53bc29a875511301e7b7fcd220315b/config.json",
-        "revision": "abf42e6c0e53bc29a875511301e7b7fcd220315b",
-        "path": "config.json"
-      },
-      "license": "LicenseRef-GLM-5.3",
-      "copyright_owner": "Z.AI",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "GLM-5.3 model configuration files",
-        "license_text_sha256": "4dd72e54620487ea94f094d711f210a547768220ae6347eec4323083c5efd7f1",
-        "required_attribution": [
-          "Z.AI"
-        ]
-      }
     },
     {
       "path": "aisim_core/model_configs/zai-org--GLM-5.3-Flash_config.json",
@@ -3244,27 +2378,6 @@
       "base_license": "MIT",
       "base_license_source": "https://huggingface.co/zai-org/GLM-5.3-Flash/blob/46a050bec13002ad29ee795c16e61cf4fa3c4a9c/LICENSE",
       "license_approval": "not asserted; see the separate release review ledger"
-    },
-    {
-      "path": "aisim_core/model_configs/zai-org--GLM-5.3_config.json",
-      "sha256": "3ac72612095574542f7fff847ada8e59d9199dd8af44bdf625d7e02615572e69",
-      "origin": "upstream",
-      "source": {
-        "url": "https://huggingface.co/zai-org/GLM-5.3/blob/ba32f8c19c8738e2c57c71798c601d477a7bf844/config.json",
-        "revision": "ba32f8c19c8738e2c57c71798c601d477a7bf844",
-        "path": "config.json"
-      },
-      "license": "LicenseRef-GLM-5.3",
-      "copyright_owner": "Z.AI",
-      "modified": false,
-      "notice": {
-        "file": "THIRD_PARTY_NOTICES.md",
-        "section": "GLM-5.3 model configuration files",
-        "license_text_sha256": "4dd72e54620487ea94f094d711f210a547768220ae6347eec4323083c5efd7f1",
-        "required_attribution": [
-          "Z.AI"
-        ]
-      }
     },
     {
       "path": "aisim_core/model_configs/zai-org--GLM-5_config.json",

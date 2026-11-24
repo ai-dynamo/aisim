@@ -138,9 +138,29 @@ def test_dsv4_native_checkpoints_remap_by_system_family():
     )
 
 
-def test_kimi_k3_moe_remaps_to_w4a8_on_blackwell_only():
+def test_kimi_k3_moe_remaps_to_w4a8_on_blackwell_only(monkeypatch):
+    from aisim.sdk.models import helpers
     from aisim.sdk.models.helpers import resolve_kimi_k3_moe_arch_mode
 
+    monkeypatch.setattr(
+        helpers,
+        "_load_model_config_from_model_path",
+        lambda path: {
+            "architectures": ["KimiK3ForConditionalGeneration" if path.endswith("Kimi-K3") else "Other"],
+            "quant_algo": "compressed-tensors",
+            "quantization_config": {
+                "quant_method": "compressed-tensors",
+                "format": "mxfp4-pack-quantized",
+                "config_groups": {
+                    "experts": {
+                        "targets": [r"re:.*mlp\.experts\..*"],
+                        "weights": {"num_bits": 4, "type": "float"},
+                    }
+                },
+                "ignore": ["self_attn", "mlp.shared_experts", "lm_head"],
+            },
+        },
+    )
     # Blackwell serving quantizes activations to mxfp8 (kimi-k3 branch
     # Mxfp4MoEMethod default precision); Hopper keeps the checkpoint's plain
     # W4A16 marlin lane, so the resolver stays silent there.
@@ -151,6 +171,16 @@ def test_kimi_k3_moe_remaps_to_w4a8_on_blackwell_only():
         assert resolve_kimi_k3_moe_arch_mode("moonshotai/Kimi-K3", system, "sglang") is None
     assert resolve_kimi_k3_moe_arch_mode("moonshotai/Kimi-K3", "b300_sxm", "vllm") is None
     assert resolve_kimi_k3_moe_arch_mode("moonshotai/Kimi-K2.5", "b300_sxm", "sglang") is None
+
+
+def test_kimi_moe_resolution_does_not_load_an_unset_model(monkeypatch):
+    from aisim.sdk.models import helpers
+
+    def unexpected_load(_):
+        pytest.fail("an unset model path has no checkpoint metadata to load")
+
+    monkeypatch.setattr(helpers, "_load_model_config_from_model_path", unexpected_load)
+    assert helpers.resolve_kimi_k3_moe_arch_mode("", "b200_sxm", "sglang") is None
 
 
 def test_dsv4_arch_remap_never_overrides_explicit_mode():

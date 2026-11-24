@@ -148,13 +148,8 @@ _UNRECOGNIZED = {
     "Qwen--Qwen3-VL-32B-Thinking": "Qwen3VLForConditionalGeneration",
     "Qwen--Qwen3-VL-235B-A22B-Instruct": "Qwen3VLMoeForConditionalGeneration",
     "Qwen--Qwen3-VL-30B-A3B-Instruct": "Qwen3VLMoeForConditionalGeneration",
-    "meta-llama--Llama-4-Maverick-17B-128E-Instruct": "Llama4ForConditionalGeneration",
-    "meta-llama--Llama-4-Scout-17B-16E-Instruct": "Llama4ForConditionalGeneration",
-    "MiniMaxAI--MiniMax-M3": "MiniMaxM3ForCausalLM",
-    "nvidia--MiniMax-M3-NVFP4": "MiniMaxM3SparseForCausalLM",
     "XiaomiMiMo--MiMo-7B-Base": "MiMoForCausalLM",
     "XiaomiMiMo--MiMo-V2-Flash": "MiMoV2FlashForCausalLM",
-    "nvidia--Llama-3_3-Nemotron-Super-49B-v1": "DeciLMForCausalLM",
 }
 # DeepSeek, Kimi K2 and GLM-5 MLA/DSA configs keep explicit cache accounting.
 _MLA = (
@@ -163,22 +158,15 @@ _MLA = (
     "deepseek-ai--DeepSeek-V3.2",
     "nvidia--DeepSeek-V3.1-NVFP4",
     "nvidia--DeepSeek-V3.2-NVFP4",
-    "moonshotai--Kimi-K2-Instruct",
-    "moonshotai--Kimi-K2.5",
-    "nvidia--Kimi-K2.5-NVFP4",
-    "nvidia--Kimi-K2.6-NVFP4",
-    "nvidia--Kimi-K2.7-Code-NVFP4",
     "zai-org--GLM-5",
     "zai-org--GLM-5-FP8",
     "zai-org--GLM-5.1",
     "zai-org--GLM-5.1-FP8",
     "zai-org--GLM-5.2",
     "zai-org--GLM-5.2-FP8",
-    "zai-org--GLM-5.3",
     "nvidia--GLM-5-NVFP4",
     "nvidia--GLM-5.1-NVFP4",
     "nvidia--GLM-5.2-NVFP4",
-    "nvidia--GLM-5.3-NVFP4",
 )
 
 
@@ -1937,21 +1925,6 @@ def test_bundled_modelopt_string_kv_scheme_preserves_usable_geometry():
     assert {"weights_bytes", "activations_bytes"}.isdisjoint(draft.resolved)
 
 
-def test_bundled_custom_layout_keeps_null_geometry_unresolved():
-    path = (
-        Path(__file__).parents[2] / "src/aisim_core/model_configs/nvidia--Llama-3_3-Nemotron-Super-49B-v1_config.json"
-    )
-    config = load_model_config(path)
-    draft = derive_profile(config, _request(), _runtime())
-    assert config.suggestions["architecture"] == "DeciLMForCausalLM"
-    assert config.suggestions["context_length"] == 131072
-    assert config.raw["intermediate_size"] is None
-    assert "intermediate_size" not in config.notes
-    assert "unrecognized architecture DeciLMForCausalLM" in draft.pending_runtime["cache_geometry"]
-    assert "num_experts" in draft.missing and "kv_bytes_per_token" not in draft.missing
-    assert {"weights_bytes", "activations_bytes"}.isdisjoint(draft.resolved)
-
-
 def test_selected_topology_and_context_must_match_structural_config(tmp_path):
     config = _config(tmp_path)
     with pytest.raises(ValueError, match="attention heads"):
@@ -1965,8 +1938,6 @@ def test_selected_topology_and_context_must_match_structural_config(tmp_path):
 @pytest.mark.parametrize(
     "filename,architecture,context,quant,kv",
     [
-        ("MiniMaxAI--MiniMax-M2.7_config.json", "MiniMaxM2ForCausalLM", 204800, "fp8_block", None),
-        ("nvidia--MiniMax-M2.7-NVFP4_config.json", "MiniMaxM2ForCausalLM", 196608, "nvfp4", "fp8"),
         ("zai-org--GLM-5.2_config.json", "GlmMoeDsaForCausalLM", 1048576, "bfloat16", None),
         ("nvidia--GLM-5.2-NVFP4_config.json", "GlmMoeDsaForCausalLM", 1048576, "nvfp4", "fp8"),
     ],

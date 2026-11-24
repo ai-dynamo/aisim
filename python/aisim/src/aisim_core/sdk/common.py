@@ -678,23 +678,11 @@ and this set via get_default_models()
 """
 DefaultHFModels = {
     "deepseek-ai/DeepSeek-V4.1-Flash",
-    # Llama 3.1 Models
-    "meta-llama/Meta-Llama-3.1-8B",
-    "meta-llama/Meta-Llama-3.1-70B",
-    "meta-llama/Meta-Llama-3.1-405B",
-    "nvidia/Llama-3.1-70B-Instruct-FP8",
     # DeepSeek R1
     "deepseek-ai/DeepSeek-R1",
     # DeepSeek V3/V3.1 Models
     "deepseek-ai/DeepSeek-V3",
     "nvidia/DeepSeek-V3.1-NVFP4",
-    # Kimi K2.5 Models
-    "moonshotai/Kimi-K2.5",
-    # Kimi K3
-    "moonshotai/Kimi-K3",
-    "nvidia/Kimi-K2.5-NVFP4",
-    "nvidia/Kimi-K2.6-NVFP4",
-    "nvidia/Kimi-K2.7-Code-NVFP4",
     # DeepSeek V3.2 / GLM-5 (DEEPSEEKV32 family)
     "deepseek-ai/DeepSeek-V3.2",
     "nvidia/DeepSeek-V3.2-NVFP4",
@@ -707,17 +695,6 @@ DefaultHFModels = {
     "zai-org/GLM-5.2",
     "zai-org/GLM-5.2-FP8",
     "nvidia/GLM-5.2-NVFP4",
-    # GLM-5.3: Z.AI ships the FP8-block weights under the plain repository
-    # and the BF16 weights under -BF16 (the reverse of the GLM-5.2 naming;
-    # no zai-org/GLM-5.3-FP8 repository exists). The zai-org bundles are
-    # unmodified copies of zai-org/GLM-5.3@ba32f8c1 and
-    # zai-org/GLM-5.3-BF16@abf42e6c (see THIRD_PARTY_NOTICES.md).
-    "zai-org/GLM-5.3",
-    "zai-org/GLM-5.3-BF16",
-    # Unmodified copy of nvidia/GLM-5.3-NVFP4@e3b8f9f2 (ModelOpt
-    # MIXED_PRECISION; unlisted attention and shared experts run BF16).
-    # See model_configs/GLM53_NVFP4_PROVENANCE.md.
-    "nvidia/GLM-5.3-NVFP4",
     # GLM-5.3-Flash: bundled configs are byte-identical to the pinned
     # checkpoint revisions in aisim_core.sdk.glm53flash.MODEL_REVISIONS.
     # Registration keeps resolution offline so live Hugging Face `main`
@@ -746,19 +723,9 @@ DefaultHFModels = {
     "Qwen/Qwen3-VL-32B-Instruct",
     "Qwen/Qwen3-VL-32B-Thinking",
     "Qwen/Qwen3-VL-235B-A22B-Instruct",
-    # MiniMax Models
-    "MiniMaxAI/MiniMax-M2.5",
-    "nvidia/MiniMax-M2.5-NVFP4",
-    "MiniMaxAI/MiniMax-M2.7",
-    "nvidia/MiniMax-M2.7-NVFP4",
-    "MiniMaxAI/MiniMax-M3",
-    "nvidia/MiniMax-M3-NVFP4",
     # GPT-OSS Models
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
-    # Llama 4 Models
-    "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-    "meta-llama/Llama-4-Maverick-17B-128E-Instruct",
     # Qwen3.5 Models
     "Qwen/Qwen3.5-27B",
     "Qwen/Qwen3.5-35B-A3B",
@@ -768,14 +735,10 @@ DefaultHFModels = {
     # Qwen 3.6 Models
     "nvidia/Qwen3.6-27B-NVFP4",
     "nvidia/Qwen3.6-35B-A3B-NVFP4",
-    # Qwen3.8-Max Models
-    "Qwen/Qwen3.8-2.4T-A95B",
-    "Qwen/Qwen3.8-2.4T-A95B-FP8",
     # MiMo Models
     "XiaomiMiMo/MiMo-V2-Flash",
     "XiaomiMiMo/MiMo-7B-Base",
     # NVIDIA Nemotron
-    "nvidia/Llama-3_3-Nemotron-Super-49B-v1",
     "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
@@ -808,9 +771,6 @@ RetiredSupportMatrixHFModels = frozenset(
         "zai-org/GLM-5.1",
         "zai-org/GLM-5.1-FP8",
         "nvidia/GLM-5.1-NVFP4",
-        "MiniMaxAI/MiniMax-M2.5",
-        "nvidia/MiniMax-M2.5-NVFP4",
-        "nvidia/Llama-3_3-Nemotron-Super-49B-v1",
         "nvidia/Nemotron-H-56B-Base-8K",
     }
 )

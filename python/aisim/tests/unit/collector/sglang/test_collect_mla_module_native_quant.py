@@ -22,7 +22,7 @@ pytestmark = pytest.mark.unit
 MODEL_ID = "org/m"
 # A checkpoint the cases YAML declares for DSA module collection. The case builders resolve their model
 # specs from that YAML, so an undeclared id such as MODEL_ID builds no cases for any export.
-GLM53_MODEL_ID = "nvidia/GLM-5.3-NVFP4"
+DECLARED_MODEL_ID = "nvidia/GLM-5.2-NVFP4"
 
 # Shape of nvidia/GLM-5.3-NVFP4: static per-tensor FP8 dense MLP in the leading
 # layers and NVFP4 routed experts. No attention module is listed, so attention
@@ -259,11 +259,11 @@ class TestMixedPrecisionExport:
     def test_hopper_case_builder_emits_no_dsa_context_cases_for_the_export(self, mod, tmp_path, monkeypatch):
         # Writing the export to tmp_path pins the MIXED_PRECISION shape whatever the bundled copy holds:
         # a top-level NVFP4 copy is dropped on Hopper with or without the mixed rule.
-        _write_mixed_export(tmp_path, GLM53_LANES, GLM53_MODEL_ID)
-        monkeypatch.setenv("COLLECTOR_MODEL_PATH", GLM53_MODEL_ID)
+        _write_mixed_export(tmp_path, GLM53_LANES, DECLARED_MODEL_ID)
+        monkeypatch.setenv("COLLECTOR_MODEL_PATH", DECLARED_MODEL_ID)
         # Without a spec for the id the builder returns [] for any export, so check that the id resolves.
         specs = mod.get_mla_module_model_specs(attention_type="dsa")
-        assert [spec.model_path for spec in specs] == [GLM53_MODEL_ID]
+        assert [spec.model_path for spec in specs] == [DECLARED_MODEL_ID]
         with patch.object(mod, "get_sm_version", return_value=90):
             assert mod._build_module_test_cases("dsa", "context") == []
 
@@ -383,11 +383,3 @@ class TestUnchangedExports:
 
     def test_no_files(self, mod):
         assert mod._model_native_gemm_quant(MODEL_ID) is None
-
-
-def test_bundled_glm53_nvfp4_export_selects_the_nvfp4_loader():
-    # Reads the bundled files, not tmp_path. The check passes on the pure-NVFP4 copy
-    # (top-level quant_algo NVFP4) through the top-level branch, and on the MIXED_PRECISION
-    # export only through the mixed rule.
-    mod = _import_module()
-    assert mod._model_native_gemm_quant("nvidia/GLM-5.3-NVFP4") == "nvfp4"

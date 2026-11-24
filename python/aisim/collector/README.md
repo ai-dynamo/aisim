@@ -75,6 +75,19 @@ to parquet under
 
 # Model-centric cases and healing runs
 
+Release 0.14.0 excludes `zai-org/GLM-5.3`, `zai-org/GLM-5.3-BF16`, and
+`nvidia/GLM-5.3-NVFP4` from the GLM attention-module runtime declarations because
+their local configs are no longer bundled. These artifacts have no full
+attention-module collection coverage in this release. Shape-only MoE aliases
+remain on the GLM-5.2 rows; they do not load the excluded configs.
+To target any of these three aliases, pass `--model-path <model ID>` together
+with `--model-architecture GlmMoeDsaForCausalLM --ops moe`. Discovery by
+`--model-path` alone does not inspect shape-only aliases.
+Retained GLM-5/5.1/5.2 runtime cases remain.
+The SGLang MLA/DSA module collector requires local bundled metadata and raises
+for a missing config instead of passing a raw model ID to SGLang. Its context
+cap helper also raises for missing or corrupt metadata.
+
 The model-centric case layer (introduced as "collector v2") is how collection
 coverage is declared, and it is unchanged under Collector V3 — V3 adds
 op-centric *management* on top (per-family runtime pins, provenance sidecars,

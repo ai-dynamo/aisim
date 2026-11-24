@@ -121,25 +121,6 @@ class TestCLIIntegration:
         assert args.nextn_accepted == 0.7
         mock_run_recommend.assert_called_once_with(args)
 
-    @patch("aisim.legacy_cli.main._run_recommend", side_effect=ValueError("nextn=7 requires acceptance"))
-    def test_cli_recommend_reports_acceptance_error_without_traceback(self, _mock_run_recommend, cli_parser):
-        args = cli_parser.parse_args(
-            [
-                "recommend",
-                "--model-path",
-                "moonshotai/Kimi-K3",
-                "--system",
-                "h200_sxm",
-                "--target-request-rate",
-                "10",
-                "--nextn",
-                "auto",
-            ]
-        )
-
-        with pytest.raises(SystemExit, match="Error: nextn=7 requires acceptance"):
-            cli_main(args)
-
     @patch("aisim.legacy_cli.main._execute_tasks")
     @patch("aisim.legacy_cli.main.build_default_tasks")
     def test_cli_main_success_flow(self, mock_build_default, mock_execute, sample_cli_args_with_save_dir):

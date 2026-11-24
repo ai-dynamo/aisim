@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Optional
 from aisim_core.sdk import common, config
 from aisim_core.sdk.utils import (
     _get_language_quantization_config,
+    _load_model_config_from_model_path,
     _normalize_quant_algo,
     get_model_config_from_model_path,
     parse_compressed_tensors_quant,
@@ -894,7 +895,13 @@ def _infer_mixed_precision_quant_modes(raw_config: dict, quant_dynamic: bool | N
     return overrides
 
 
-def _infer_quant_modes_from_raw_config(raw_config: dict, architecture: str | None = None) -> dict[str, object]:
+def _infer_quant_modes_from_raw_config(
+    raw_config: dict,
+    architecture: str | None = None,
+    *,
+    infer_gemm: bool = True,
+    infer_moe: bool = True,
+) -> dict[str, object]:
     quant_algo = raw_config.get("quant_algo")
     quant_dynamic = raw_config.get("quant_dynamic")
     kv_cache_algo = raw_config.get("kv_cache_quant_algo")
@@ -933,12 +940,29 @@ def _infer_quant_modes_from_raw_config(raw_config: dict, architecture: str | Non
         # Only set overrides for quantized categories; unset modes fall through to the
         # global bfloat16 default in _apply_model_quant_defaults.
         quant_cfg = _get_language_quantization_config(raw_config) or {}
-        base_algo, ignored = parse_compressed_tensors_quant(quant_cfg)
-        if base_algo:
-            if "attention" not in ignored:
-                overrides["gemm_quant_mode"] = getattr(common.GEMMQuantMode, base_algo)
-            if "routing_experts" not in ignored:
-                overrides["moe_quant_mode"] = getattr(common.MoEQuantMode, base_algo)
+        # Known dense architectures have no routed-expert category to infer.
+        # Hybrid families can contain either dense or MoE checkpoints, so also
+        # inspect their language-model expert counts. Architecture-free partial
+        # inputs retain strict inference rather than assuming they are dense.
+        family = common.ARCHITECTURE_TO_MODEL_FAMILY.get(architecture, architecture)
+        source = _moe_source_config({"raw_config": raw_config, "architecture": architecture})
+        has_routed_experts = family in _MOE_MODEL_FAMILIES or any(
+            source.get(key) for key in ("num_local_experts", "n_routed_experts", "moe_num_experts", "num_experts")
+        )
+        infer_moe = infer_moe and (family is None or has_routed_experts)
+        for category, field, modes, needed in (
+            ("attention", "gemm_quant_mode", common.GEMMQuantMode, infer_gemm),
+            ("routing_experts", "moe_quant_mode", common.MoEQuantMode, infer_moe),
+        ):
+            # Explicit modes do not require a representable checkpoint default.
+            # Keep strict category validation whenever inference is needed.
+            if not needed:
+                continue
+            algo, _ = parse_compressed_tensors_quant(quant_cfg, category=category)
+            if algo is not None:
+                if algo not in modes.__members__:
+                    raise ValueError(f"Unsupported compressed-tensors algorithm {algo!r} for {category}")
+                overrides[field] = modes[algo]
     elif quant_algo is not None:
         raise ValueError(f"Unsupported quant algorithm: {quant_algo}")
 
@@ -1035,7 +1059,12 @@ def _apply_model_quant_defaults(
     fmha_was_unset = model_config.fmha_quant_mode is None
     moe_was_unset = model_config.moe_quant_mode is None
 
-    inferred = _infer_quant_modes_from_raw_config(raw_config, architecture)
+    inferred = _infer_quant_modes_from_raw_config(
+        raw_config,
+        architecture,
+        infer_gemm=model_config.gemm_quant_mode is None,
+        infer_moe=moe_was_unset,
+    )
     applied: list[str] = []
     for key, value in inferred.items():
         if getattr(model_config, key, None) is None:
@@ -1175,13 +1204,48 @@ def resolve_kimi_k3_moe_arch_mode(
     ``w4a16_mxfp4`` label is already correct there, so this returns None and
     the HF auto-inference stands.
     """
-    if backend_name != "sglang":
-        return None
-    if model_path != "moonshotai/Kimi-K3":
+    if backend_name != "sglang" or not model_path:
         return None
     from aisim_core.sdk.perf_database import is_blackwell_system
 
-    if is_blackwell_system(system_name):
+    if not is_blackwell_system(system_name):
+        return None
+    # Use the cached checkpoint metadata, not its repository/directory name:
+    # a local copy and a remote checkpoint must select the same measured lane.
+    raw = _load_model_config_from_model_path(model_path)
+    architecture = (raw.get("architectures") or [None])[0]
+    if architecture != "KimiK3ForConditionalGeneration":
+        return None
+    # Only infer expert precision here. Callers own GEMM inference and know
+    # whether an explicit override makes attention metadata irrelevant.
+    mode = _infer_quant_modes_from_raw_config(raw, architecture, infer_gemm=False).get("moe_quant_mode")
+    if mode is None and raw.get("quant_algo") == "compressed-tensors":
+        quant_cfg = _get_language_quantization_config(raw) or {}
+        _, ignored = parse_compressed_tensors_quant(quant_cfg, category="routing_experts")
+        if "routing_experts" in ignored:
+            # Categories detect mentions, not coverage. Only these whole-expert
+            # selectors establish uniform BF16 without expanding every layer,
+            # expert and projection or attempting general regex containment.
+            whole_expert_selectors = {
+                "mlp.experts",
+                r"re:.*mlp\.experts\..*",
+                r"re:.*mlp\.experts.*",
+                "re:.*experts.*",
+            }
+            if not any(pattern in whole_expert_selectors for pattern in quant_cfg.get("ignore") or []):
+                raise ValueError(
+                    "Kimi-K3 cannot infer uniform precision from partial or unrecognized routed-expert "
+                    "exclusions; use a whole-expert selector (mlp.experts) or an explicit moe_quant_mode"
+                )
+            return common.MoEQuantMode.bfloat16
+    if mode is None:
+        raise ValueError(
+            "Kimi-K3 on Blackwell SGLang requires expert quantization metadata in "
+            "config.json or hf_quant_config.json, or an explicit moe_quant_mode"
+        )
+    if mode == common.MoEQuantMode.w4a16_mxfp4:
+        if raw.get("quant_algo") != "compressed-tensors":
+            raise ValueError("Kimi-K3 MXFP4 inference requires compressed-tensors format 'mxfp4-pack-quantized'")
         return common.MoEQuantMode.w4a8_mxfp4_mxfp8
     return None
 

@@ -183,49 +183,8 @@ def _compile_case_references(case) -> dict[str, float]:
 
 
 def _compile_scenario_references() -> dict[str, float]:
-    """The fixed-scenario reference keys (chunked prefill, imbalance scales,
-    WideEP), mirroring the corresponding test bodies."""
+    """The retained WideEP scenario references, mirroring their test bodies."""
     references: dict[str, float] = {}
-
-    chunk_case = compile_parity._SUBSET_BY_ID[compile_parity._CHUNKED_PREFILL_CASE_ID].values[0]
-    chunk_handle = compile_parity._compile_handle(chunk_case)
-    for ctx_tokens, gen_tokens, isl, osl, prefix in compile_parity._CHUNKED_PREFILL_SHAPES:
-        key = compile_parity._chunked_prefill_key(ctx_tokens, gen_tokens, isl, osl, prefix)
-        references[key] = float(chunk_handle.mixed_step_latency(ctx_tokens, gen_tokens, isl, osl, prefix))
-
-    imb_case = compile_parity._SUBSET_BY_ID[compile_parity._IMBALANCE_CASE_ID].values[0]
-    imb_handle = compile_parity._compile_handle(imb_case)
-    imb_osl = max(imb_case.osl, 2)
-    imb_ctx, imb_gen, _ = imb_handle.run_static(
-        batch_size=imb_case.batch_size,
-        isl=imb_case.isl,
-        osl=imb_osl,
-        prefix=imb_case.prefix,
-        seq_imbalance_correction_scale=compile_parity._IMBALANCE_CTX_SCALE,
-        gen_seq_imbalance_correction_scale=compile_parity._IMBALANCE_GEN_SCALE,
-        stride=1,
-    )
-    references["imbalance_scale::static_ctx"] = float(imb_ctx)
-    references["imbalance_scale::static_gen"] = float(imb_gen)
-    references["imbalance_scale::mixed_step"] = float(
-        imb_handle.mixed_step_latency(
-            imb_case.isl,
-            imb_case.batch_size,
-            imb_case.isl,
-            imb_osl,
-            imb_case.prefix,
-            seq_imbalance_correction_scale=compile_parity._IMBALANCE_CTX_SCALE,
-            gen_seq_imbalance_correction_scale=compile_parity._IMBALANCE_GEN_SCALE,
-        )
-    )
-    references["imbalance_scale::decode_step"] = float(
-        imb_handle.decode_step_latency(
-            imb_case.batch_size,
-            imb_case.isl,
-            imb_osl,
-            gen_seq_imbalance_correction_scale=compile_parity._IMBALANCE_GEN_SCALE,
-        )
-    )
 
     _m, _b, _d, sglang_spec = compile_parity._build_wideep_sglang()
     sglang_handle = compile_parity._handle_from_spec_json(sglang_spec)
@@ -295,10 +254,6 @@ def _engine_step_population() -> dict[tuple[str, str], object]:
 # key can never exist in one and not the other. Keep in lockstep with the
 # corresponding test classes in test_compile_engine_parity.py.
 _SCENARIO_KEYS = (
-    "imbalance_scale::static_ctx",
-    "imbalance_scale::static_gen",
-    "imbalance_scale::mixed_step",
-    "imbalance_scale::decode_step",
     "wideep_sglang::static_ctx",
     "wideep_sglang::static_gen",
     "wideep_sglang::mixed_step",
@@ -318,8 +273,6 @@ def _compile_reference_population() -> dict[str, object]:
         (case,) = param.values
         for metric in ("static_ctx", "static_gen", "mixed_step", "decode_step"):
             population[f"{param.id}::{metric}"] = ("case", case)
-    for ctx_tokens, gen_tokens, isl, osl, prefix in compile_parity._CHUNKED_PREFILL_SHAPES:
-        population[compile_parity._chunked_prefill_key(ctx_tokens, gen_tokens, isl, osl, prefix)] = ("scenario", None)
     for key in _SCENARIO_KEYS:
         population[key] = ("scenario", None)
     return population
@@ -447,6 +400,9 @@ def main(argv: list[str] | None = None) -> int:
         pin_map = payload.setdefault(PIN_MAP_KEY, {})
         for key in pinned[filename]:
             pin_map[key] = {"engine": "rust", "git_head": _GIT_HEAD}
+        if filename == "engine_step.json":
+            payload["header"]["case_count"] = len(payload["cases"])
+            payload["header"]["surface_count"] = sum(len(surfaces) for surfaces in payload["cases"].values())
         path = GOLDEN_DIR / filename
         path.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n")
         _log(f"wrote {path} ({len(pinned[filename])} pinned records)")

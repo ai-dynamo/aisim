@@ -731,14 +731,6 @@ def test_full_ci_owns_migrated_expensive_suites() -> None:
     assert "--ignore=tests/fpm_accuracy" not in contract_command
     assert "--ignore=tests/test_ci_workflow_contracts.py" in contract_command
 
-    recommendation_path = "tests/e2e/cli/test_cli_recommend.py"
-    recommendation_steps = [
-        step for step in jobs["application-tests"]["steps"] if recommendation_path in step.get("run", "")
-    ]
-    assert len(recommendation_steps) == 2
-    assert "-n auto" not in recommendation_steps[0]["run"]
-    assert f"--ignore={recommendation_path}" in recommendation_steps[1]["run"]
-
     build_marker_files = {
         path.relative_to(REPOSITORY_ROOT / "python" / "aisim").as_posix()
         for path in (REPOSITORY_ROOT / "python" / "aisim" / "tests").rglob("test_*.py")
@@ -828,7 +820,6 @@ def test_fast_ci_owns_static_and_workflow_contract_checks() -> None:
     policy_commands = _run_commands(jobs["policy"])
     static_commands = _run_commands(jobs["python-static"])
     assert "tests/test_ci_workflow_contracts.py" in policy_commands
-    assert "test_cli_recommend.py" in static_commands
     assert "ruff format --check" in static_commands
     assert "python -m compileall" in static_commands
     assert set(jobs["readiness"]["needs"]) == {

@@ -1727,16 +1727,68 @@ def _categorize_ignore_pattern(pattern: str) -> set[str]:
     return categories
 
 
+def _compressed_tensors_target_categories(target: str) -> set[str]:
+    """Recognize whole-category selectors, without guessing regex containment.
+
+    Coarse SDK modes cannot express arbitrary per-layer/per-projection targets.
+    In particular, merely mentioning ``experts`` in a negative lookahead or an
+    unrelated path is not proof that a selector quantizes routed experts.
+    """
+    if target == "Linear":
+        return {"attention", "routing_experts", "shared_experts", "dense_mlp", "lm_head"}
+    named = {
+        "self_attn": {"attention"},
+        "mlp.experts": {"routing_experts"},
+        "mlp.shared_experts": {"shared_experts"},
+        "mlp.shared_expert": {"shared_experts"},
+        "lm_head": {"lm_head"},
+    }
+    # Bare names match an exact module/class, not all of its descendants.
+    # Only lm_head names a complete projection category on its own.
+    if target == "lm_head":
+        return named[target]
+    if target.startswith("re:"):
+        try:
+            re.compile(target[3:])
+        except re.error as error:
+            raise ValueError(f"Invalid compressed-tensors target {target!r}: {error}") from error
+        # These forms cover all descendants of the named category. A literal
+        # or wildcard dot before the component is immaterial to category scope.
+        for module, categories in named.items():
+            escaped = re.escape(module)
+            for prefix in ("re:.*", "re:.*.", r"re:.*\."):
+                for suffix in (".*", r"\..*"):
+                    if target in (prefix + module + suffix, prefix + escaped + suffix):
+                        return categories
+        if target == "re:.*experts.*":
+            return {"routing_experts", "shared_experts"}
+        # Native DeepSeek-V4's complete projection groups use attn/ffn names.
+        if target == "re:.*attn.*(fused_wqa_wkv|wq_b|wo_a|wo_b)$":
+            return {"attention"}
+        if target == "re:.*ffn.*(gate|up|down)_proj$":
+            return {"routing_experts"}
+    raise ValueError(f"Unsupported compressed-tensors target {target!r}; use whole-category selectors")
+
+
 def parse_compressed_tensors_quant(
     quantization_config: dict | None,
+    *,
+    category: str | None = None,
 ) -> tuple[str | None, frozenset[str]]:
     """Parse a compressed-tensors ``quantization_config`` dict.
 
     Returns ``(base_algo, ignored_categories)`` where:
 
     - ``base_algo``: weight quantization algorithm (``"int4_wo"``, ``"int8_wo"``,
-      ``"fp8"``, ``"fp8_block"``), or ``None`` when the config carries no
-      quantization information.
+      ``"fp8"``, ``"fp8_block"``, ``"w4a16_mxfp4"``), or ``None`` when the
+      config carries no quantization information. Four-bit float weights require
+      ``mxfp4-pack-quantized`` in the group's ``format`` or the header default;
+      other or absent formats raise ``ValueError`` instead of guessing a lane.
+      Every group is checked. With ``category``, select only groups whose
+      targets cover that category (or the common ``Linear`` class). Missing
+      targets, missing category matches and conflicting algorithms fail closed.
+      Arbitrary per-module selectors cannot establish a uniform category mode
+      and are rejected. Without ``category``, all groups must agree on one algorithm.
     - ``ignored_categories``: frozenset of layer-category names excluded from
       quantization (i.e. remaining in float16/bfloat16).  Empty when nothing is
       ignored or when ``base_algo`` is ``None``.
@@ -1748,37 +1800,63 @@ def parse_compressed_tensors_quant(
     if not isinstance(quantization_config, dict):
         return None, frozenset()
 
-    # Derive base algo from the first config_group's weight spec.
-    base_algo: str | None = None
+    ignored: set[str] = set()
+    for pattern in quantization_config.get("ignore") or []:
+        ignored |= _categorize_ignore_pattern(pattern)
+
+    # This runs during checkpoint preparation, over the small config-group
+    # list; it never expands layers/experts or runs in an iteration query.
+    algos: set[str] = set()
     for group in (quantization_config.get("config_groups") or {}).values():
+        group_algo: str | None = None
         weights = (group or {}).get("weights") or {}
         num_bits = weights.get("num_bits")
         w_type = str(weights.get("type", "")).lower()
         if isinstance(num_bits, int):
             if num_bits == 4 and "int" in w_type:
-                base_algo = "int4_wo"
+                group_algo = "int4_wo"
             elif num_bits == 8 and "int" in w_type:
-                base_algo = "int8_wo"
+                group_algo = "int8_wo"
             elif num_bits == 8 and "float" in w_type:
                 strategy = str(weights.get("strategy", "")).lower()
                 block_structure = weights.get("block_structure")
-                base_algo = "fp8_block" if strategy == "block" or block_structure else "fp8"
+                group_algo = "fp8_block" if strategy == "block" or block_structure else "fp8"
             elif num_bits == 4 and "float" in w_type:
-                # MXFP4 packed weights (e.g. Kimi-K3 "mxfp4-pack-quantized"):
+                # A group's format overrides the checkpoint-wide default.
+                # Four-bit floats alone do not distinguish MXFP4 from NVFP4.
+                packed_format = group.get("format") or quantization_config.get("format")
+                if packed_format != "mxfp4-pack-quantized":
+                    raise ValueError(
+                        "4-bit float compressed-tensors weights require format "
+                        f"'mxfp4-pack-quantized'; got {packed_format!r}"
+                    )
+                # MXFP4 packed weights (e.g. Kimi-K3):
                 # W4A16 base lane; per-SM MoE kernel routing may upgrade the
                 # activation side (see operations/moe.py).
-                base_algo = "w4a16_mxfp4"
-        if base_algo:
-            break
+                group_algo = "w4a16_mxfp4"
+        if category is not None:
+            targets = (group or {}).get("targets")
+            if not isinstance(targets, list) or not targets or any(not isinstance(t, str) for t in targets):
+                raise ValueError("compressed-tensors config groups require non-empty targets for category inference")
+            categories: set[str] = set()
+            for target in targets:
+                categories |= _compressed_tensors_target_categories(target)
+            if category not in categories:
+                continue
+            if group_algo is None and category not in ignored:
+                raise ValueError(f"Unsupported compressed-tensors weights for {category}")
+        if group_algo is not None:
+            algos.add(group_algo)
 
-    if base_algo is None:
-        return None, frozenset()
-
-    ignored: set[str] = set()
-    for pattern in quantization_config.get("ignore") or []:
-        ignored |= _categorize_ignore_pattern(pattern)
-
-    return base_algo, frozenset(ignored)
+    if category in ignored:
+        return None, frozenset(ignored)
+    if len(algos) > 1:
+        raise ValueError(f"Ambiguous compressed-tensors algorithms for {category or 'all categories'}: {sorted(algos)}")
+    if category is not None and not algos:
+        raise ValueError(
+            f"Missing compressed-tensors target group for {category}; explicitly ignore unquantized categories"
+        )
+    return next(iter(algos), None), frozenset(ignored)
 
 
 def _normalize_kv_cache_algo(value: object) -> str | None:
@@ -1960,22 +2038,27 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
     # Check if it's a local path
     if os.path.isdir(model_path):
         config = _attach_llama4_processor_config(_load_local_config(model_path), model_path)
-        return _attach_inferred_quant_fields(_attach_hf_quant_config(config, _load_local_quant_config(model_path)))
-
-    # Otherwise treat as HuggingFace path
-    if model_path in DefaultHFModels:
+        hf_quant_config = _load_local_quant_config(model_path)
+    elif model_path in DefaultHFModels:
         config = _attach_llama4_processor_config(_load_pre_downloaded_hf_config(model_path), model_path)
-        return _attach_inferred_quant_fields(
-            _attach_hf_quant_config(config, _load_pre_downloaded_hf_quant_config(model_path))
-        )
-
-    config = _attach_llama4_processor_config(_download_hf_config(model_path), model_path)
-    try:
+        hf_quant_config = _load_pre_downloaded_hf_quant_config(model_path)
+    else:
+        config = _attach_llama4_processor_config(_download_hf_config(model_path), model_path)
+        # Only an actual 404 means the optional sidecar is absent. Transport,
+        # access, and parse errors must propagate so incomplete configs cannot
+        # enter either model-config cache and a later retry can recover.
         hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False)
-    except Exception as exc:  # best-effort for optional quant config
-        logger.debug("Failed to download hf_quant_config.json for %s: %s", model_path, exc)
-        hf_quant_config = None
-    return _attach_inferred_quant_fields(_attach_hf_quant_config(config, hf_quant_config))
+
+    config = _attach_inferred_quant_fields(_attach_hf_quant_config(config, hf_quant_config))
+    sidecar_checkpoint = "nvidia/Llama-3.1-70B-Instruct-FP8"
+    if (model_path == sidecar_checkpoint or config.get("_name_or_path") == sidecar_checkpoint) and not config.get(
+        "quant_algo"
+    ):
+        raise ValueError(
+            f"{sidecar_checkpoint} requires quantization metadata: supply hf_quant_config.json "
+            "or declare quantization_config in config.json"
+        )
+    return config
 
 
 @cache

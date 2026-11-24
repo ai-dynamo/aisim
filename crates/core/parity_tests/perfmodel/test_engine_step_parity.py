@@ -31,7 +31,6 @@ from aisim.legacy_cli.api import cli_estimate
 from aisim.sdk import common, config, errors, perf_database, rust_engine_step
 from aisim.sdk.backends.factory import get_backend
 from aisim.sdk.models import get_model
-from aisim.sdk.operations import util_empirical
 
 pytestmark = pytest.mark.integration
 
@@ -99,30 +98,6 @@ class EngineStepParityCase:
 # graph on another system is NOT coverage — data-grid diversity is the
 # support matrix's job. When adding a case, name the unique thing it pins.
 SMOKE_CASES = [
-    # Original 3 smoke cases (Phase 3).
-    pytest.param(
-        EngineStepParityCase(model_path="MiniMaxAI/MiniMax-M2.5"),
-        id="minimax-m25-b200-vllm-isl1024-osl2",
-    ),
-    pytest.param(
-        EngineStepParityCase(model_path="moonshotai/Kimi-K2.5"),
-        id="kimi-k25-b200-vllm-isl1024-osl2",
-    ),
-    pytest.param(
-        EngineStepParityCase(
-            model_path="MiniMaxAI/MiniMax-M2.5",
-            batch_size=2,
-            isl=2048,
-            osl=5,
-            prefix=256,
-        ),
-        id="minimax-m25-b200-vllm-sampled-prefix",
-    ),
-    # Phase 4 D1: extra MoE coverage on b200_sxm/vllm (anchored at the current slot).
-    pytest.param(
-        EngineStepParityCase(model_path="MiniMaxAI/MiniMax-M2.7"),
-        id="minimax-m27-b200-vllm-isl1024-osl2",
-    ),
     pytest.param(
         EngineStepParityCase(
             model_path="Qwen/Qwen3-30B-A3B",
@@ -138,41 +113,12 @@ SMOKE_CASES = [
         EngineStepParityCase(model_path="Qwen/Qwen3-32B"),
         id="qwen3-32b-b200-vllm-isl1024-osl2",
     ),
-    pytest.param(
-        EngineStepParityCase(model_path="meta-llama/Meta-Llama-3.1-8B"),
-        id="llama31-8b-b200-vllm-isl1024-osl2",
-    ),
     # Phase 4 D1: cross-system coverage on the smoke MiniMax model.
     # Phase 4 D4: DeepSeek-family coverage unlocked by the `Op::Overlap`
     # variant + `128 // tp_size` MLA head count fix.
     pytest.param(
         EngineStepParityCase(model_path="deepseek-ai/DeepSeek-R1"),
         id="deepseek-r1-b200-vllm-isl1024-osl2",
-    ),
-    # Phase 4 D4: cross-backend (SGLang non-DeepEP path) coverage.
-    pytest.param(
-        EngineStepParityCase(
-            model_path="MiniMaxAI/MiniMax-M2.5",
-            backend_name="sglang",
-        ),
-        id="minimax-m25-b200-sglang-isl1024-osl2",
-    ),
-    # Phase 4 D5: DeepSeek-family on SGLang, unlocked by the
-    # `Op::Fallback` variant that mirrors Python's `FallbackOp` (primary
-    # `MLAModule` -> granular `MlaBmm + ContextMla/GenerationMla + MlaBmm`
-    # chain when the module-level perf data is absent, which is the case
-    # for SGLang and TRT-LLM).
-    pytest.param(
-        EngineStepParityCase(
-            model_path="moonshotai/Kimi-K2.5",
-            backend_name="sglang",
-        ),
-        id="kimi-k25-b200-sglang-isl1024-osl2",
-    ),
-    # Phase 4 D6: NemotronNas (Puzzle / DeciLM per-block architecture).
-    pytest.param(
-        EngineStepParityCase(model_path="nvidia/Llama-3_3-Nemotron-Super-49B-v1"),
-        id="nemotron-nas-b200-vllm-isl1024-osl2",
     ),
     # Phase 4 D7-B: Qwen3.5 hybrid GDN + full-attention.
     pytest.param(
@@ -216,27 +162,6 @@ SMOKE_CASES = [
             backend_name="sglang",
         ),
         id="glm52-b200-sglang-isl1024-osl2",
-    ),
-    # Phase 4 D7-F: backend coverage for newly-ported families. The
-    # builders are backend-independent (the per-backend conditional
-    # `_attn_dp` / `_tp_allreduce` branches are handled inside each
-    # family's `build_*` function), but the perf-DB tables live in
-    # per-backend directories — these cases prove the same Rust
-    # builder matches Python on sglang and trtllm tables, not just
-    # vllm.
-    pytest.param(
-        EngineStepParityCase(
-            model_path="nvidia/Llama-3_3-Nemotron-Super-49B-v1",
-            backend_name="sglang",
-        ),
-        id="nemotron-nas-b200-sglang-isl1024-osl2",
-    ),
-    pytest.param(
-        EngineStepParityCase(
-            model_path="nvidia/Llama-3_3-Nemotron-Super-49B-v1",
-            backend_name="trtllm",
-        ),
-        id="nemotron-nas-b200-trtllm-isl1024-osl2",
     ),
     pytest.param(
         EngineStepParityCase(
@@ -306,29 +231,6 @@ SMOKE_CASES = [
         ),
         id="qwen3-235b-b200-sglang-adp8-etp4ep2",
     ),
-    # Phase 4 D7-G: shape-variation coverage. All previous cases run at
-    # `(batch=1, isl=1024, osl=2)` (plus one prefix variant). The four
-    # cases below sweep the four parity-sensitive shape directions, each
-    # placed on a different family + backend combination so a regression
-    # in one direction also implicates the family/backend it lands on:
-    #
-    #  - decode-heavy: short isl, long osl -> stresses gen-side seq
-    #    interpolation and per-step accumulation (MoE on vllm).
-    #  - prefill-heavy: long isl, short osl -> exercises context-attention
-    #    interp at the upper axis bound (dense on trtllm).
-    #  - prefix coverage: mid isl + large prefix -> MLA prefix correction
-    #    and prefix-slice picking (MLA family on vllm).
-    #  - larger batch: bs > 1 -> Mamba2 batch interpolation away from
-    #    bs=1 (state-space family on sglang); also bumps the agg/disagg
-    #    batch defaults so the bs effect actually reaches those pipelines.
-    pytest.param(
-        EngineStepParityCase(
-            model_path="MiniMaxAI/MiniMax-M2.5",
-            isl=128,
-            osl=64,
-        ),
-        id="minimax-m25-b200-vllm-shape-decode-heavy",
-    ),
     pytest.param(
         EngineStepParityCase(
             model_path="Qwen/Qwen3-32B",
@@ -372,12 +274,6 @@ SMOKE_CASES = [
             backend_name="trtllm",
         ),
         id="gpt-oss-20b-b200-trtllm-isl1024-osl2",
-    ),
-    # Phase 4 D7-C: Llama-4 Scout was originally a data-gap case, but the
-    # tracked perf data now gives it full numeric parity on all four surfaces.
-    pytest.param(
-        EngineStepParityCase(model_path="meta-llama/Llama-4-Scout-17B-16E-Instruct"),
-        id="llama4-scout-b200-vllm-isl1024-osl2",
     ),
     # DeepSeek-V4 Flash remains a data-gap case. Python errors with
     # `PerfDataNotAvailableError` because the perf DB doesn't ship the
@@ -441,42 +337,6 @@ SMOKE_CASES = [
         # multi-node custom-AR fan-out pricing (AIC-1808).
         id="qwen35-397b-a17b-gb200-sglang-0514-tp16-scan-coverage",
     ),
-    # Kimi-K3 (review Blocker 1 anchor): hybrid KDA + MLA LatentMoE. The
-    # case defaults (tp8/ep8) put KDA on the fused 12-head shard — the exact
-    # config the per-key kda_fused_decode routing and the exact-first mla_bmm
-    # routing serve, freezing the K3 engine-step numbers themselves (the
-    # donor-injection class of regression shifts BOTH engines through the
-    # shared serialized source chain, so only a committed anchor like this
-    # catches a silent shift in CI).
-    pytest.param(
-        EngineStepParityCase(
-            model_path="moonshotai/Kimi-K3",
-            system_name="b300_sxm",
-            backend_name="sglang",
-            backend_version="next",
-        ),
-        id="kimi-k3-b300-sglang-next-nospec",
-    ),
-    pytest.param(
-        EngineStepParityCase(
-            model_path="moonshotai/Kimi-K3",
-            backend_name="vllm",
-        ),
-        id="kimi-k3-b200-vllm-nospec",
-    ),
-    # DSPARK speculative case: nextn=7 -> verify width 8 (the fused CuTeDSL
-    # verify kernel's collected draft-width cap), crossing the fused verify
-    # reroute + conv fold-to-zero end-to-end.
-    pytest.param(
-        EngineStepParityCase(
-            model_path="moonshotai/Kimi-K3",
-            system_name="b300_sxm",
-            backend_name="sglang",
-            backend_version="next",
-            nextn=7,
-        ),
-        id="kimi-k3-b300-sglang-next-dspark-nextn7",
-    ),
     # Attention kernel-lane override coverage (AIC-1715/1716). The existing
     # qwen35-27b-b200-sglang-isl1024-osl2 current-slot case anchors the default
     # walk; this case pins trtllm_mha first on the same real multi-lane table.
@@ -490,94 +350,6 @@ SMOKE_CASES = [
             attention_backend="trtllm_mha",
         ),
         id="qwen35-27b-b200-sglang-lanes-trtllm-mha",
-    ),
-    # Qwen3.8-Max (Qwen3.5-family hybrid GDN + full-attention, 2.4T-A95B)
-    # on gb300/sglang/0.5.17 exercises the sparse 0.5.17 data identity:
-    # model-specific gemm/gdn/moe measurements with the approved shared-layer
-    # attention/communication/quantization tables. The native FP8 checkpoint
-    # needs tp=16 to fit its estimated weight footprint. Keep EP node-local
-    # on GB300's four-GPU node (the current engine rejects cross-node EP),
-    # while the wider aggregate batch exercises the IFB batch dimension at
-    # this model scale. 0.5.17 and vLLM 0.27.1 are data coordinates, not
-    # queryable slots (the fleet next is newer), so these cases opt into
-    # allow_unlisted_version and keep their sparse-data identity.
-    pytest.param(
-        EngineStepParityCase(
-            model_path="Qwen/Qwen3.8-2.4T-A95B-FP8",
-            system_name="gb300",
-            backend_name="sglang",
-            backend_version="0.5.17",
-            allow_unlisted_version=True,
-            tp_size=16,
-            moe_tp_size=4,
-            moe_ep_size=4,
-            agg_batch_size=32,
-            nextn=0,
-        ),
-        id="qwen38-max-gb300-sglang-0517-fp8-agg",
-    ),
-    # Simulation-only quantization override on the bf16 checkpoint. This
-    # covers the measured NVFP4 MoE rows and a non-trivial disaggregated
-    # node-local EP topology; it is not a declaration that the checkpoint has
-    # been validated for NVFP4 serving.
-    pytest.param(
-        EngineStepParityCase(
-            model_path="Qwen/Qwen3.8-2.4T-A95B",
-            system_name="gb300",
-            backend_name="sglang",
-            backend_version="0.5.17",
-            allow_unlisted_version=True,
-            moe_quant_mode="nvfp4",
-            moe_tp_size=2,
-            moe_ep_size=4,
-            disagg_prefill_num_workers=2,
-            disagg_decode_batch_size=8,
-            disagg_decode_num_workers=2,
-            nextn=0,
-        ),
-        id="qwen38-max-gb300-sglang-0517-nvfp4-disagg",
-    ),
-    # vLLM 0.27.1 sparse-data twin: model-specific GEMM/GDN/MoE silicon with
-    # attention, communication, and quantization supplied by the approved
-    # shared-layer chain. The native FP8 checkpoint needs TP16. The vLLM
-    # collector does not combine logical MoE TP and EP, so use its measured
-    # all-TP lane; the larger aggregate batch exercises the IFB surface.
-    pytest.param(
-        EngineStepParityCase(
-            model_path="Qwen/Qwen3.8-2.4T-A95B-FP8",
-            system_name="gb300",
-            backend_name="vllm",
-            backend_version="0.27.1",
-            allow_unlisted_version=True,
-            tp_size=16,
-            moe_tp_size=16,
-            moe_ep_size=1,
-            agg_batch_size=32,
-            nextn=0,
-        ),
-        id="qwen38-max-gb300-vllm-0271-fp8-agg",
-    ),
-    # The bf16 checkpoint needs two TP16 pipeline stages to satisfy the
-    # weight-memory bound. This is the second measured vLLM MoE lane and uses
-    # the same all-TP MoE topology with non-trivial disaggregated worker
-    # and decode-batch settings.
-    pytest.param(
-        EngineStepParityCase(
-            model_path="Qwen/Qwen3.8-2.4T-A95B",
-            system_name="gb300",
-            backend_name="vllm",
-            backend_version="0.27.1",
-            allow_unlisted_version=True,
-            tp_size=16,
-            pp_size=2,
-            moe_tp_size=16,
-            moe_ep_size=1,
-            disagg_prefill_num_workers=2,
-            disagg_decode_batch_size=8,
-            disagg_decode_num_workers=2,
-            nextn=0,
-        ),
-        id="qwen38-max-gb300-vllm-0271-bf16-disagg",
     ),
 ]
 
@@ -1297,23 +1069,6 @@ CP_CASES = [
         ),
         id="qwen3-235b-a22b-b200-sglang-cp8",
     ),
-    # MLA context-parallelism: Kimi is MLA with bfloat16 FMHA (collected on
-    # sglang), so it exercises the ContextMLA cp zigzag sharding. (DeepSeek-R1
-    # would need the uncollected fp8-FMHA context-MLA slice; DSA CP needs
-    # uncollected sparse mqa/topk tables — out of scope until collected.)
-    pytest.param(
-        EngineStepParityCase(
-            model_path="moonshotai/Kimi-K2.5",
-            system_name="b200_sxm",
-            backend_name="sglang",
-            tp_size=1,
-            attention_dp_size=1,
-            moe_tp_size=8,
-            moe_ep_size=1,
-            cp_size=8,
-        ),
-        id="kimi-k25-b200-sglang-cp8",
-    ),
 ]
 
 # DeepSeek-V4 CSA context-parallelism on a REUSE-carrying version (issue
@@ -1491,47 +1246,6 @@ class TestRustEngineHandleDatabasePolicyIdentity:
 # while making a silicon fallback (0.3-5% off) unmissable.
 HYBRID_PARITY_RTOL = 1e-4
 HYBRID_CASES = [
-    # xop + xshape: MiniMax-M3 is all-MoE + MSA sparse attention with NO own
-    # silicon data anywhere — MSA borrows DSA's util (xop, `msa.py`), the MoE
-    # shape borrows the nearest collected sibling (xshape, `moe.py`). Probed:
-    # static ctx/gen = 69.588/5.426 ms, tags {xop, xshape}.
-    pytest.param(
-        EngineStepParityCase(
-            model_path="MiniMaxAI/MiniMax-M3",
-            database_mode="HYBRID",
-        ),
-        id="minimax-m3-b200-vllm-hybrid-xop",
-    ),
-    # Same rescue on the sglang tables (DSA util source = sglang 0.5.14 data).
-    # Probed: 39.490/2.994 ms, tags {xop, xshape}.
-    pytest.param(
-        EngineStepParityCase(
-            model_path="MiniMaxAI/MiniMax-M3",
-            backend_name="sglang",
-            database_mode="HYBRID",
-        ),
-        id="minimax-m3-b200-sglang-hybrid-xop",
-    ),
-    # Transfer-policy gating: with xop disabled ("off" and "balanced" presets)
-    # MSA must raise EmpiricalNotImplementedError on BOTH engines
-    # (error-symmetry). Guards that the Rust port honours the policy at query
-    # time instead of always transferring.
-    pytest.param(
-        EngineStepParityCase(
-            model_path="MiniMaxAI/MiniMax-M3",
-            database_mode="HYBRID",
-            transfer_policy="off",
-        ),
-        id="minimax-m3-b200-vllm-hybrid-policy-off",
-    ),
-    pytest.param(
-        EngineStepParityCase(
-            model_path="MiniMaxAI/MiniMax-M3",
-            database_mode="HYBRID",
-            transfer_policy="balanced",
-        ),
-        id="minimax-m3-b200-vllm-hybrid-policy-balanced",
-    ),
     # xquant: forced MoE quant w4a16_mxfp4_cutlass is uncollected on
     # b200/vllm/0.24.0 but shares the (memory=0.5, compute=1) profile with
     # collected int4_wo / w4a16_mxfp4 — the ladder lands on the xquant tier.
@@ -1568,46 +1282,6 @@ HYBRID_CASES = [
         ),
         id="mimo-v2-flash-b200-vllm-hybrid-attn-xshape",
     ),
-    # HYBRID==SILICON invariance: Kimi-K2.5 on b200/vllm (current slot) is fully
-    # covered by silicon data (probed worst-provenance = silicon, no empirical
-    # tier fires). The hybrid layer must not perturb covered queries; this
-    # pins Rust-HYBRID == Python-HYBRID (== SILICON) on a collected config.
-    pytest.param(
-        EngineStepParityCase(
-            model_path="moonshotai/Kimi-K2.5",
-            database_mode="HYBRID",
-        ),
-        id="kimi-k25-b200-vllm-hybrid-invariant",
-    ),
-    # Full-model xprofile resolution: NVFP4 on Hopper has no collected GEMM
-    # or MoE tables, but under the default (aggressive) policy the GEMM
-    # quant-transfer ladder borrows across profiles (as does MoE's), so the
-    # whole HYBRID breakdown computes on both sides — value parity. (Before
-    # the GEMM ladder existed this case pinned the error-symmetric miss; the
-    # miss contract moved to the "balanced" case below.)
-    pytest.param(
-        EngineStepParityCase(
-            model_path="nvidia/MiniMax-M2.5-NVFP4",
-            system_name="h200_sxm",
-            database_mode="HYBRID",
-        ),
-        id="minimax-m25-nvfp4-h200-vllm-hybrid-xprofile",
-    ),
-    # Ladder miss (error-symmetry): with XPROFILE policy-disabled
-    # ("balanced" = xshape+xquant), NVFP4 GEMM (profile (0.5625, 4)) has no
-    # same-profile sibling anywhere in the h200/vllm tables (0.19-era probe;
-    # the golden pins the live behavior) — Python
-    # raises EmpiricalNotImplementedError; the Rust port must fail the same
-    # query point, never fabricate a SOL/constant value.
-    pytest.param(
-        EngineStepParityCase(
-            model_path="nvidia/MiniMax-M2.5-NVFP4",
-            system_name="h200_sxm",
-            database_mode="HYBRID",
-            transfer_policy="balanced",
-        ),
-        id="minimax-m25-nvfp4-h200-vllm-hybrid-balanced-miss",
-    ),
     # EMPIRICAL mode: every data-backed op answers SOL(query)/util from its
     # own collected slice — the broadest guard of the ported util math (grid
     # build, k=2 IDW in normalized log space, per-axis boundary clamp) across
@@ -1641,19 +1315,6 @@ HYBRID_CASES = [
     ),
     pytest.param(
         EngineStepParityCase(
-            model_path="moonshotai/Kimi-K2.5",
-            database_mode="EMPIRICAL",
-            # EMPIRICAL needs the version's OWN comm tables (custom_allreduce
-            # util grid); the 2026-10 campaign did not collect comm, so the
-            # estimator is pinned to the 0.24.0 data (follow-up: comm tables for
-            # the current versions).
-            backend_version="0.24.0",
-            allow_unlisted_version=True,
-        ),
-        id="kimi-k25-b200-vllm-empirical",
-    ),
-    pytest.param(
-        EngineStepParityCase(
             model_path="deepseek-ai/DeepSeek-V3.2",
             database_mode="EMPIRICAL",
             # EMPIRICAL needs the version's OWN comm tables (custom_allreduce
@@ -1684,19 +1345,6 @@ HYBRID_CASES = [
             allow_unlisted_version=True,
         ),
         id="glm5-b200-sglang-empirical",
-    ),
-    pytest.param(
-        EngineStepParityCase(
-            model_path="MiniMaxAI/MiniMax-M2.5",
-            database_mode="EMPIRICAL",
-            # EMPIRICAL needs the version's OWN comm tables (custom_allreduce
-            # util grid); the 2026-10 campaign did not collect comm, so the
-            # estimator is pinned to the 0.24.0 data (follow-up: comm tables for
-            # the current versions).
-            backend_version="0.24.0",
-            allow_unlisted_version=True,
-        ),
-        id="minimax-m25-b200-vllm-empirical",
     ),
     pytest.param(
         EngineStepParityCase(
@@ -1899,6 +1547,23 @@ class TestGoldenComparisonGuards:
     The fixture on disk is never touched.
     """
 
+    def test_engine_step_inventory_and_pin_provenance(self) -> None:
+        golden = load_parity_golden("engine_step.json")
+        case_ids = {param.id for params, _ in ENGINE_STEP_GOLDEN_MATRIX for param in params}
+        assert set(golden["cases"]) == case_ids
+        records = {f"{case_id}::{surface}" for case_id, surfaces in golden["cases"].items() for surface in surfaces}
+        expected = {
+            f"{param.id}::{surface}"
+            for params, surfaces in ENGINE_STEP_GOLDEN_MATRIX
+            for param in params
+            for surface in surfaces
+        }
+        assert records == expected
+        assert golden["header"]["case_count"] == len(golden["cases"])
+        # Each surface is one record, whether it contains values or an error.
+        assert golden["header"]["surface_count"] == len(records)
+        assert set(golden["post_freeze_pins"]) <= records
+
     def test_golden_comparison_detects_drift(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -2006,68 +1671,6 @@ class TestRustTypedErrorsAcrossFfi:
         message = str(excinfo.value)
         assert "perf database error" in message or "I/O error" in message, message
 
-    def test_missing_dtype_flops_raises_typed_missing_flops_error(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        # NVFP4 on Hopper: h200 has no fp4 hardware and its YAML defines no
-        # fp4_tc_flops, so the strict per-dtype resolver rejects the
-        # configuration at query entry (#1398) — before the HYBRID ladder
-        # (any transfer policy) is even consulted, which is why this vehicle
-        # can no longer pin #1455's balanced-policy ladder-miss contract
-        # (symmetric EmpiricalNotImplementedError coverage lives in the
-        # MSA/GDN HYBRID tests above). Rust raises
-        # `AicError::MissingSystemFlops`, which must surface as the sdk's
-        # MissingSystemFlopsError — the expected-CLI-error ValueError class —
-        # and NOT be classified as a plain perf-data miss.
-        _prepare_rust_core(monkeypatch)
-        case = EngineStepParityCase(
-            model_path="nvidia/MiniMax-M2.5-NVFP4",
-            system_name="h200_sxm",
-            database_mode="HYBRID",
-        )
-        with pytest.raises(errors.MissingSystemFlopsError) as excinfo:
-            _rust_static_breakdown(case)
-        message = str(excinfo.value)
-        assert "fp4_tc_flops" in message, message
-        # The AicError display prefix pins the raise to the rust side of the
-        # FFI (a Python-side raise would carry the sdk's own wording).
-        assert "missing system flops" in message, message
-        assert isinstance(excinfo.value, ValueError)
-        assert not perf_database.has_perf_data_not_available_cause(excinfo.value)
-
-    def test_silicon_missing_dtype_on_lazy_family_matches_python(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        # SILICON x missing-dtype on a lazily-loading table family (nvfp4
-        # MLA-BMM: h200 has no fp4_tc_flops). Both engines must classify this
-        # as MissingSystemFlopsError, NOT as a perf-data miss — the quadrant
-        # the original pins (SILICON with all dtypes present; HYBRID
-        # missing-dtype on an eager op) left uncovered until the flops
-        # resolution was hoisted before every load/key lookup.
-        _prepare_rust_core(monkeypatch)
-        case = EngineStepParityCase(model_path="nvidia/MiniMax-M2.5-NVFP4", system_name="h200_sxm")
-        with pytest.raises(errors.MissingSystemFlopsError) as excinfo:
-            _rust_static_breakdown(case)
-        assert "missing system flops" in str(excinfo.value), str(excinfo.value)
-        assert not perf_database.has_perf_data_not_available_cause(excinfo.value)
-        # Python classifies the same query point identically.
-        database = _case_database(case)
-        from aisim_core.sdk.engine import _evaluate_single_op
-        from aisim_core.sdk.operations.mla import MLABmm
-
-        with pytest.raises(errors.MissingSystemFlopsError):
-            # The retired query_mla_bmm shim's exact twin, through the
-            # single-op plumbing (the database's live SILICON view).
-            _evaluate_single_op(
-                database,
-                MLABmm("mla_bmm_query", 1.0, 16, common.GEMMQuantMode.nvfp4, True),
-                is_context=False,
-                batch_size=16,
-                s=1,
-            )
-
     def test_pre_sm89_fp8_kv_generation_returns_shipped_silicon(self) -> None:
         # a100_sxm ships 2,534 measured generation-MLA rows with fp8 KV
         # (trtllm/1.0.0): Ampere has no fp8 tensor cores — the decode kernel
@@ -2094,62 +1697,13 @@ class TestRustTypedErrorsAcrossFfi:
         assert abs(float(fp8_kv) - float(bf16_kv)) / float(bf16_kv) < 0.25
 
 
-class TestRustProvenanceCapture:
-    """FFI provenance contract: the compiled engine records
-    the empirical tier that fired (max-rank, mirroring Python's
-    `PROVENANCE_ORDER`) and the bridge forwards it into
-    `util_empirical.capture_provenance`, so support-matrix HYBRID_PASS tier
-    labelling works identically for rust-routed runs."""
-
-    def test_hybrid_xop_run_records_tier(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        # MiniMax-M3 HYBRID: MSA borrows DSA's util (xop) — the run's worst
-        # tier. Python probes record {xop, xshape}; the rust path must land on
-        # the same worst_provenance.
-        _prepare_rust_core(monkeypatch)
-        case = EngineStepParityCase(
-            model_path="MiniMaxAI/MiniMax-M3",
-            database_mode="HYBRID",
-            # xop-borrow coordinate pinned to the sglang 0.5.14 data: that
-            # drop ships no MSA module tables (they land at 0.5.16), so MSA
-            # borrows DSA's util — the xop tier this test pins. 0.5.21 (the
-            # current slot since the 2026-10 campaign) carries the MSA
-            # tables, so the coordinate is a raw data pin, not a slot.
-            backend_name="sglang",
-            backend_version="0.5.14",
-            allow_unlisted_version=True,
-        )
-        with util_empirical.capture_provenance() as tags:
-            metrics = _static_metrics(case)
-        assert not isinstance(metrics["total_ms"], _ErrorSentinel), repr(metrics)
-        assert util_empirical.worst_provenance(tags) == "xop", tags
-
-    def test_pure_silicon_run_records_nothing(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        # Fully-collected config on SILICON: no empirical path fires, so the
-        # capture stays empty and worst_provenance defaults to "silicon".
-        _prepare_rust_core(monkeypatch)
-        case = EngineStepParityCase(model_path="moonshotai/Kimi-K2.5")
-        with util_empirical.capture_provenance() as tags:
-            metrics = _static_metrics(case)
-        assert not isinstance(metrics["total_ms"], _ErrorSentinel), repr(metrics)
-        assert util_empirical.worst_provenance(tags) == "silicon", tags
-
-
 # --------------------------------------------------------------------------- #
-# forward_model="fpm": whole-model op parity over a synthetic dataset in a
-# temp systems root (no fpm_forward pair is checked in). Python resolves the
-# pair via `set_systems_paths`; the compiled spec carries the same root in
-# `engine.systems_path`, so the Rust `FpmForwardTable` reads the identical
-# file. Covers static_ctx / static_gen / mixed / genonly plus out-of-domain
-# error symmetry and the FpmForward op-transfer tags.
+# A synthetic FPM dataset exercises whole-model timing and the decode capture
+# boundary without op-level measurements. All rows are independently authored
+# test data under a retained model identity, not measured serving performance.
 # --------------------------------------------------------------------------- #
 
-_FPM_MODEL = "MiniMaxAI/MiniMax-M2.5"
+_FPM_MODEL = "Qwen/Qwen3-30B-A3B"
 _FPM_VERSION = "0.24.0"
 # (workload_kind, batch, total_prefill, total_kv, latency_ms) — per-DP-rank
 # iteration totals, batch domains sized for the runtime points below.
@@ -2173,10 +1727,12 @@ _FPM_ROWS = [
     ("decode", 512, 0, 4096, 10.0),
     ("decode", 512, 0, 65536, 11.0),
     ("decode", 512, 0, 262144, 12.0),
-    ("decode", 513, 0, 4096, 30.0),
+    # At KV=4096, neither eager curve covers the query, but captured batch
+    # 512 does. That cross-regime row must not rescue an eager coverage miss.
+    ("decode", 513, 0, 8192, 30.0),
     ("decode", 513, 0, 65536, 33.0),
     ("decode", 513, 0, 262144, 36.0),
-    ("decode", 1024, 0, 4096, 60.0),
+    ("decode", 1024, 0, 8192, 60.0),
     ("decode", 1024, 0, 65536, 66.0),
     ("decode", 1024, 0, 262144, 72.0),
 ]
@@ -2265,145 +1821,81 @@ def fpm_systems_root(tmp_path_factory):
         rust_engine_step._engine_handle_cache_clear()
 
 
-# Frozen Python-side references for the FPM parity class, captured from the
-# live Python FPM walk immediately before its deletion (Phase 2 PR-3) on the
-# deterministic synthetic fixture above — the same freeze-then-delete pattern
-# as the golden fixtures. This class sits outside ENGINE_STEP_GOLDEN_MATRIX
-# because its dataset is generated per-run (`_FPM_ROWS`), so the frozen
-# values live inline; string entries are expected exception kinds
-# (error-symmetry contract).
-_FPM_STATIC_FROZEN = {
-    ("static_ctx", 1, 1024, 1, 0): 18.0,
-    ("static_ctx", 1, 2048, 1, 1024): 21.0,
-    ("static_ctx", 2, 1500, 1, 0): 50.8046875,
-    ("static_ctx", 3, 1024, 1, 0): 51.37999771084165,
-    ("static_gen", 1, 1024, 2, 0): 2.2,
-    ("static_gen", 4, 1024, 2, 0): 4.5,
-    ("static_gen", 2, 1024, 2, 0): 2.8812035914364387,
-    ("static_gen", 4, 9_000_000, 2, 0): "PerfDataNotAvailableError",
-    ("static_ctx", 16, 256, 1, 0): 68.0,
-    ("static_ctx", 16, 320, 1, 256): "PerfDataNotAvailableError",
-}
-_FPM_MIXED_FROZEN = {
-    (1024, 4, 1024, 2): 18.562552704189983,
-    (512, 4, 1024, 2): 10.587744831848209,
-    # ctx_tokens == 0 raises at MixedStepInput construction on both engines.
-    (0, 4, 1024, 2): "ValueError",
-    (0, 600, 100, 2): "ValueError",
-    (1024, 0, 1024, 2): 18.0,
-    (4096, 0, 256, 1): 68.0,
-}
-_FPM_GENONLY_FROZEN = 4.5
-
-
-# Hybrid speculative fpm (verify-on-FPM): pinned when the config class
-# became reachable (AISim schema v18, FpmForwardOp.verify_width). The ngram scheme
-# is the pure verify-width channel (no draft ops): the decode query maps the
-# widened batch to the equivalent-AR point (tokens = c*w, total KV
-# unchanged) on the same synthetic fixture. Values pinned from the compiled
-# engine at introduction (append-only; there is no Python reference).
-_FPM_HYBRID_STATIC_GEN_FROZEN = 4.1246337890625  # (ngram k3, batch 1, isl 1024, osl 2)
-_FPM_HYBRID_MIXED_FROZEN = 18.187255859375  # (ctx 1024, gen 1, isl 1024, osl 2)
-
-
-class TestRustEngineStepFpmHybridParity:
-    """Hybrid (fpm target + speculative scheme) parity pins."""
-
-    def _build_ngram(self):
-        from aisim.sdk.config_builders import build_model_config
-        from aisim_core.sdk.speculation import SpeculationConfig
-
-        cfg = build_model_config(
-            tp_size=2,
-            pp_size=1,
-            attention_dp_size=1,
-            moe_tp_size=1,
-            moe_ep_size=2,
-            gemm_quant_mode="fp8_block",
-            moe_quant_mode="fp8_block",
-            kvcache_quant_mode="fp8",
-            fmha_quant_mode="bfloat16",
-            comm_quant_mode="half",
-            forward_model="fpm",
-        )
-        cfg.speculation = SpeculationConfig(kind="ngram", params={"num_speculative_tokens": 3})
-        model = get_model(_FPM_MODEL, cfg, "vllm")
-        database = _quiet_call(perf_database.get_database, "b200_sxm", "vllm", _FPM_VERSION)
-        return model, get_backend("vllm"), database
-
-    def test_hybrid_ngram_static_gen_pin(self, fpm_systems_root):
-        model, backend, database = self._build_ngram()
-        assert model.generation_ops[0]._verify_width == 4
-        rc = config.RuntimeConfig(batch_size=1, beam_width=1, isl=1024, osl=2)
-        summary = backend.run_static(model, database, rc, mode="static_gen")
-        value = sum(summary.get_generation_latency_dict().values())
-        if _FPM_HYBRID_STATIC_GEN_FROZEN is None:
-            print(f"\nPIN static_gen: {value!r}")
-        else:
-            allowed = max(abs(_FPM_HYBRID_STATIC_GEN_FROZEN) * PARITY_RTOL, 1e-9)
-            assert abs(value - _FPM_HYBRID_STATIC_GEN_FROZEN) <= allowed
-
-    def test_hybrid_ngram_mixed_pin(self, fpm_systems_root):
-        from aisim_core.sdk.backends.base_backend import MixedStepInput
-
-        model, backend, database = self._build_ngram()
-        rc = config.RuntimeConfig(batch_size=4, beam_width=1, isl=1024, osl=2)
-        est = backend.run_mixed(
-            model,
-            database,
-            rc,
-            MixedStepInput(context_tokens=1024, num_decode_requests=1),
-        )
-        value = est.latency_ms
-        if _FPM_HYBRID_MIXED_FROZEN is None:
-            print(f"\nPIN mixed: {value!r}")
-        else:
-            allowed = max(abs(_FPM_HYBRID_MIXED_FROZEN) * PARITY_RTOL, 1e-9)
-            assert abs(value - _FPM_HYBRID_MIXED_FROZEN) <= allowed
-
-
 class TestRustEngineStepFpmParity:
-    @pytest.mark.parametrize("database_mode", ["SILICON", "HYBRID"])
-    def test_auto_skips_absent_op_tables(self, fpm_systems_root, database_mode):
+    @pytest.mark.parametrize(
+        "worker_type,batch,prefill_tokens,kv_tokens,expected_ms",
+        [
+            ("prefill", 1, 1024, 0, 18.0),
+            ("prefill", 1, 768, 0, 14.0),  # halfway between the 10 and 18 ms fixture rows
+            ("decode", 1, 0, 1025, 2.2),
+            ("decode", 512, 0, 65536, 11.0),
+            ("decode", 513, 0, 65536, 33.0),
+            ("decode", 512, 0, 163840, 11.5),
+            ("decode", 513, 0, 163840, 34.5),
+            # KV interpolation gives 34.5/69 ms at eager batches 513/1024;
+            # batch 768 lies 255/511 of the way between those two rows.
+            ("decode", 768, 0, 163840, 34.5 + (69.0 - 34.5) * (768 - 513) / (1024 - 513)),
+            pytest.param("decode", 768, 0, 4096, None, id="decode-no-same-regime-bracket"),
+        ],
+    )
+    def test_fpm_engine_selection_and_phase_timing(
+        self, fpm_systems_root, worker_type, batch, prefill_tokens, kv_tokens, expected_ms
+    ):
         from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
-        cfg = ForwardPassPerfModelConfig(
-            model=_FPM_MODEL,
-            system="b200_sxm",
-            backend="vllm",
-            backend_version=_FPM_VERSION,
-            worker_type="decode",
-            tp=2,
-            moe_tp_size=1,
-            moe_ep_size=2,
-            gemm_quant_mode="fp8_block",
-            moe_quant_mode="fp8_block",
-            fmha_quant_mode="bfloat16",
-            kvcache_quant_mode="fp8",
-            comm_quant_mode="half",
-            systems_paths=(str(fpm_systems_root),),
-            database_mode=database_mode,
+        # Exercise the legacy forward_model boundary through the canonical API.
+        cfg = ForwardPassPerfModelConfig.from_legacy_engine_config(
+            {
+                "schema_version": 1,
+                "model_name": _FPM_MODEL,
+                "system_name": "b200_sxm",
+                "backend": "vllm",
+                "backend_version": _FPM_VERSION,
+                "systems_path": str(fpm_systems_root),
+                "tp_size": 2,
+                "pp_size": 1,
+                "attention_dp_size": 1,
+                "moe_tp_size": 1,
+                "moe_ep_size": 2,
+                "weight_dtype": "fp8_block",
+                "moe_dtype": "fp8_block",
+                "activation_dtype": "bfloat16",
+                "kv_cache_dtype": "fp8",
+                "forward_model": "fpm",
+            },
+            worker_type,
         )
+        assert cfg.estimation_mode == "fpm_interpolation"
         model = RustForwardPassPerfModel.best_available(cfg)
         try:
-            provenance = model.diagnostics()["provenance"]
-            assert provenance["selected_estimation_mode"] == "fpm_interpolation"
-            assert "gemm_perf.parquet" in provenance["selection_failures"][0]
-            # Exact measured fixture row: four decode requests, 4,100 total KV.
-            assert model.estimate_forward_pass_time_ms(
+            assert model.diagnostics()["provenance"]["selected_estimation_mode"] == "fpm_interpolation"
+            # Expected values come from _FPM_ROWS, independently of the engine.
+            # Exact decode fixture rows give 2.2, 11 and 33 ms. Halfway between
+            # KV=65536 and 262144 gives (11+12)/2=11.5 ms on the captured
+            # side and (33+36)/2=34.5 ms on the eager side. No cross-cliff
+            # averaging is valid at batch=512/513. At batch=768, KV=4096,
+            # neither eager bracket row covers the query, so it must fail.
+            ranks = [
                 {
                     "version": 1,
-                    "scheduled_requests": {"num_decode_requests": 4, "sum_decode_kv_tokens": 4100},
+                    "scheduled_requests": (
+                        {
+                            "num_prefill_requests": batch,
+                            "sum_prefill_tokens": prefill_tokens,
+                            "sum_prefill_kv_tokens": kv_tokens,
+                        }
+                        if worker_type == "prefill"
+                        else {"num_decode_requests": batch, "sum_decode_kv_tokens": kv_tokens}
+                    ),
                 }
-            ) == pytest.approx(4.5)
+            ]
+            if expected_ms is None:
+                with pytest.raises(errors.PerfDataNotAvailableError, match="bracket rows 513/1024 do not cover"):
+                    model.estimate_forward_pass_time_ms(ranks)
+            else:
+                assert model.estimate_forward_pass_time_ms(ranks) == pytest.approx(expected_ms)
         finally:
             model.close()
-        from dataclasses import replace
-
-        from aisim_core.sdk.errors import PerfDataNotAvailableError
-
-        with pytest.raises(PerfDataNotAvailableError, match="required op-level data unavailable"):
-            RustForwardPassPerfModel.best_available(replace(cfg, estimation_mode="op_level"))
 
     def test_sol_does_not_require_op_tables(self, fpm_systems_root):
         from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
@@ -2433,190 +1925,3 @@ class TestRustEngineStepFpmParity:
             )
         finally:
             model.close()
-
-    """forward_model='fpm' regression vs the frozen Python reference.
-
-    The Python FPM walk is gone (Phase 2 PR-3); the live side below is the
-    compiled engine (Op::FpmForward), compared against `_FPM_*_FROZEN`.
-    """
-
-    def _build(self):
-        from aisim.sdk.config_builders import build_model_config
-
-        cfg = build_model_config(
-            tp_size=2,
-            pp_size=1,
-            attention_dp_size=1,
-            moe_tp_size=1,
-            moe_ep_size=2,
-            gemm_quant_mode="fp8_block",
-            moe_quant_mode="fp8_block",
-            kvcache_quant_mode="fp8",
-            fmha_quant_mode="bfloat16",
-            comm_quant_mode="half",
-            forward_model="fpm",
-        )
-        model = get_model(_FPM_MODEL, cfg, "vllm")
-        database = _quiet_call(perf_database.get_database, "b200_sxm", "vllm", _FPM_VERSION)
-        return model, get_backend("vllm"), database
-
-    def _static(self, model, backend, database, mode, batch, isl, osl, prefix):
-        rc = config.RuntimeConfig(batch_size=batch, beam_width=1, isl=isl, osl=osl, prefix=prefix)
-
-        def thunk():
-            summary = backend.run_static(model, database, rc, mode=mode)
-            d = summary.get_context_latency_dict() if mode == "static_ctx" else summary.get_generation_latency_dict()
-            return sum(d.values())
-
-        return _safe_value(thunk)
-
-    @staticmethod
-    def _assert_frozen(frozen, rs, point):
-        if isinstance(frozen, str):
-            assert isinstance(rs, _ErrorSentinel) and rs.kind == frozen, (
-                f"{point}: expected symmetric {frozen}, got {rs!r}"
-            )
-            return
-        assert not isinstance(rs, _ErrorSentinel), f"{point}: frozen={frozen} but live raised {rs!r}"
-        allowed = max(abs(frozen) * PARITY_RTOL, 1e-9)
-        assert abs(rs - frozen) <= allowed, f"{point}: frozen={frozen} rs={rs} delta={abs(rs - frozen)}"
-
-    def test_fpm_arena_selects_the_fpm_engine(self, fpm_systems_root, monkeypatch):
-        # Review finding (#1461): from_native() dropped forward_model, so the
-        # FPM arena always compiled the op_level engine. A decode-only
-        # estimate hitting the fpm_forward table's exact row proves the
-        # whole-model engine was selected through the supported predictor API.
-        _prepare_rust_core(monkeypatch)
-        from aisim_core.sdk.rust_engine_step import RustForwardPassPerfModel
-
-        config = {
-            "schema_version": 1,
-            "model_name": _FPM_MODEL,
-            "system_name": "b200_sxm",
-            "backend": "vllm",
-            "backend_version": _FPM_VERSION,
-            "systems_path": str(fpm_systems_root),
-            "tp_size": 2,
-            "pp_size": 1,
-            "attention_dp_size": 1,
-            "moe_tp_size": 1,
-            "moe_ep_size": 2,
-            "weight_dtype": "fp8_block",
-            "moe_dtype": "fp8_block",
-            "activation_dtype": "bfloat16",
-            "kv_cache_dtype": "fp8",
-            "kv_block_size": None,
-            "nextn": None,
-            "forward_model": "fpm",
-        }
-        from aisim_core.sdk import ForwardPassPerfModelConfig
-
-        model = RustForwardPassPerfModel.best_available(
-            ForwardPassPerfModelConfig.from_legacy_engine_config(config, "aggregated")
-        )
-        decode_only = [
-            {
-                "version": 1,
-                "scheduled_requests": {
-                    "num_decode_requests": 1,
-                    "sum_decode_kv_tokens": 1025,
-                },
-            }
-        ]
-        ms = model.estimate_forward_pass_time_ms(decode_only)
-        assert ms == pytest.approx(2.2)  # exact fpm decode row (1, 1025)
-
-    def test_fpm_spec_tags(self, fpm_systems_root, monkeypatch):
-        _prepare_rust_core(monkeypatch)
-        import json as _json
-
-        from aisim.sdk import engine as sdk_engine
-
-        model, _backend, database = self._build()
-        spec = _json.loads(
-            _quiet_call(
-                sdk_engine.build_engine_spec_json,
-                model,
-                model_path=_FPM_MODEL,
-                system="b200_sxm",
-                backend="vllm",
-                backend_version=_FPM_VERSION,
-                kv_block_size=None,
-                systems_path=None,
-                nextn=0,
-                database=database,
-            )
-        )
-        (ctx_tag,) = spec["context_ops"][0].keys()
-        (gen_tag,) = spec["generation_ops"][0].keys()
-        assert (ctx_tag, gen_tag) == ("FpmForward", "FpmForward")
-        ctx_op = spec["context_ops"][0]["FpmForward"]
-        assert ctx_op["phase"] == "prefill"
-        assert spec["generation_ops"][0]["FpmForward"]["phase"] == "decode"
-        assert len(ctx_op["match_identity"]) == 19
-        assert ctx_op["match_identity"][-4:] == ["", "full", "none", "text"]
-        assert spec["generation_ops"][0]["FpmForward"]["match_identity"] == ctx_op["match_identity"]
-        assert ctx_op["sol_ops"], "sol_ops must carry the original granular list"
-
-    @pytest.mark.parametrize(
-        ("mode", "batch", "isl", "osl", "prefix"),
-        [
-            ("static_ctx", 1, 1024, 1, 0),  # exact prefill hit
-            ("static_ctx", 1, 2048, 1, 1024),  # exact cached-prefill hit
-            ("static_ctx", 2, 1500, 1, 0),  # in-curve lerp
-            ("static_ctx", 3, 1024, 1, 0),  # uncollected batch -> transfer (SOL)
-            ("static_gen", 1, 1024, 2, 0),  # exact decode hit (kv = isl+1)
-            ("static_gen", 4, 1024, 2, 0),  # exact decode hit at B=4
-            ("static_gen", 2, 1024, 2, 0),  # uncollected batch -> transfer (SOL)
-            ("static_gen", 4, 9_000_000, 2, 0),  # out of domain -> both error
-            (
-                "static_ctx",
-                16,
-                256,
-                1,
-                0,
-            ),  # above the batch ceiling -> pure clamp (kv/T = 0)
-            ("static_ctx", 16, 320, 1, 256),  # high KV pressure -> SOL-rescaled clamp
-        ],
-    )
-    def test_fpm_static_parity(self, fpm_systems_root, monkeypatch, mode, batch, isl, osl, prefix):
-        _prepare_rust_core(monkeypatch)
-        model, backend, database = self._build()
-        rs = self._static(model, backend, database, mode, batch, isl, osl, prefix)
-        frozen = _FPM_STATIC_FROZEN[(mode, batch, isl, osl, prefix)]
-        self._assert_frozen(frozen, rs, f"{mode} B={batch} isl={isl} prefix={prefix}")
-
-    @pytest.mark.parametrize(
-        ("ctx_tokens", "gen_tokens", "isl", "osl"),
-        [
-            (1024, 4, 1024, 2),  # mixed: prefill chunk + marginal decode
-            (512, 4, 1024, 2),  # partial chunk (chunk_scale > 1)
-            (0, 4, 1024, 2),  # gen-only keeps full decode
-            (0, 600, 100, 2),  # gen-only across the decode regime boundary (eager side)
-            (1024, 0, 1024, 2),  # prefill-only chunk
-            (
-                4096,
-                0,
-                256,
-                1,
-            ),  # 16 whole prefills: certified batch clamp to the ceiling
-        ],
-    )
-    def test_fpm_mixed_step_parity(self, fpm_systems_root, monkeypatch, ctx_tokens, gen_tokens, isl, osl):
-        _prepare_rust_core(monkeypatch)
-        model, backend, database = self._build()
-
-        rc = config.RuntimeConfig(batch_size=1, beam_width=1, isl=isl, osl=osl, prefix=0)
-        rs = _safe_value(
-            lambda: backend._get_mix_step_latency(model, database, rc, ctx_tokens, gen_tokens, isl, osl, 0)[0]
-        )
-        frozen = _FPM_MIXED_FROZEN[(ctx_tokens, gen_tokens, isl, osl)]
-        self._assert_frozen(frozen, rs, f"mixed ctx={ctx_tokens} gen={gen_tokens}")
-
-    def test_fpm_genonly_step_parity(self, fpm_systems_root, monkeypatch):
-        _prepare_rust_core(monkeypatch)
-        model, backend, database = self._build()
-
-        rc = config.RuntimeConfig(batch_size=1, beam_width=1, isl=1024, osl=2, prefix=0)
-        rs = _safe_value(lambda: backend._get_genonly_step_latency(model, database, rc, 4, 1023, 2)[0])
-        self._assert_frozen(_FPM_GENONLY_FROZEN, rs, "genonly gen=4")

@@ -25,11 +25,6 @@ configs:
     kwargs: {model_path: Qwen/Qwen3-32B, system_name: h200_sxm, backend_name: trtllm,
              mode: agg, tp_size: 4, batch_size: 256, isl: 4096, osl: 1024}
 
-  # --- agg context-budget scheduling under long input ---
-  - id: dense_agg_long_isl
-    kwargs: {model_path: meta-llama/Meta-Llama-3.1-70B, system_name: h200_sxm, backend_name: trtllm,
-             mode: agg, tp_size: 4, batch_size: 32, isl: 16384, osl: 512}
-
   # --- MoE agg with attention-DP + wide-EP layout ---
   - id: moe_agg_adp_wideep
     kwargs: {model_path: deepseek-ai/DeepSeek-R1, system_name: b200_sxm, backend_name: trtllm,
@@ -41,11 +36,6 @@ configs:
              batch_size: 64, isl: 4096, osl: 1024}
 
   # --- disagg rate matching (asymmetric prefill/decode worker pools) ---
-  - id: dense_disagg_ratematch
-    kwargs: {model_path: meta-llama/Meta-Llama-3.1-70B, system_name: h200_sxm, backend_name: trtllm,
-             mode: disagg, isl: 4096, osl: 1024,
-             prefill_tp_size: 4, prefill_batch_size: 4, prefill_num_workers: 1,
-             decode_tp_size: 4, decode_batch_size: 64, decode_num_workers: 2}
   - id: moe_disagg_wideep
     kwargs: {model_path: deepseek-ai/DeepSeek-R1, system_name: b200_sxm, backend_name: trtllm,
              mode: disagg, isl: 4096, osl: 1024,
@@ -90,14 +80,6 @@ configs:
              image_height: 672, image_width: 960, num_images: 1}
 
   # --- backend coverage for the agg scheduler variants ---
-  - id: vllm_dense_agg
-    kwargs: {model_path: meta-llama/Meta-Llama-3.1-70B, system_name: h200_sxm, backend_name: vllm,
-             mode: agg, tp_size: 4, batch_size: 64, isl: 4096, osl: 1024}
   - id: sglang_dense_agg
     kwargs: {model_path: Qwen/Qwen3-32B, system_name: h100_sxm, backend_name: sglang,
              mode: agg, tp_size: 4, batch_size: 64, isl: 4096, osl: 1024}
-
-  # --- memory feasibility boundary (expected to stay infeasible) ---
-  - id: oom_boundary_405b_tp1
-    kwargs: {model_path: meta-llama/Meta-Llama-3.1-405B, system_name: h100_sxm, backend_name: trtllm,
-             mode: agg, tp_size: 1, batch_size: 8, isl: 4096, osl: 512}

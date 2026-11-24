@@ -66,7 +66,7 @@ def dataset(tmp_path, monkeypatch, request):
     # A real Parquet artifact also retains the runtime version directory. The
     # replacement measured graph consumes no baseline GEMM/attention tables.
     pq.write_table(pa.table({"latency": [2.0, 5.0]}), systems / runtime_path)
-    model = "meta-llama/Meta-Llama-3.1-8B"
+    model = "Qwen/Qwen3-8B"
     if getattr(request, "param", "bundled") == "local":
         local = tmp_path / "local-model"
         local.mkdir()
@@ -141,7 +141,7 @@ def dataset(tmp_path, monkeypatch, request):
         framework="vllm",
         framework_version="1.0",
         operation_family=None,
-        model="meta-llama/Meta-Llama-3.1-8B",
+        model="Qwen/Qwen3-8B",
         effective_settings={"tp": 1},
         unresolved_identity=None,
     )

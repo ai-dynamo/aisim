@@ -12,6 +12,7 @@ import json
 import logging
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -1334,6 +1335,51 @@ class TestHybridMoEModelBuilder:
 class TestGetModelConfigFromHFID:
     """Test getting model config from HuggingFace ID."""
 
+    @pytest.fixture(autouse=True)
+    def clear_config_caches(self):
+        utils._load_model_config_from_model_path.cache_clear()
+        get_model_config_from_model_path.cache_clear()
+        yield
+        utils._load_model_config_from_model_path.cache_clear()
+        get_model_config_from_model_path.cache_clear()
+
+    @pytest.fixture
+    def remote_checkpoint(self, monkeypatch):
+        """Synthetic metadata served through the real downloader, without network I/O."""
+        state = SimpleNamespace(
+            config={
+                "architectures": ["LlamaForCausalLM"],
+                "num_hidden_layers": 2,
+                "hidden_size": 256,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "intermediate_size": 512,
+                "vocab_size": 1024,
+                "max_position_embeddings": 2048,
+            },
+            sidecar=None,
+            error=None,
+            requests=[],
+        )
+
+        def fetch(request, *, timeout):
+            filename = request.full_url.rsplit("/", 1)[1]
+            state.requests.append(filename)
+            if filename == "config.json":
+                return io.BytesIO(json.dumps(state.config).encode())
+            assert filename == "hf_quant_config.json"
+            if state.error == "malformed":
+                return io.BytesIO(b"{")
+            if state.error is not None:
+                raise state.error
+            if state.sidecar is None:
+                raise HTTPError(request.full_url, 404, "Not Found", {}, None)
+            return io.BytesIO(json.dumps(state.sidecar).encode())
+
+        monkeypatch.setattr(utils, "_get_hf_auth_headers", lambda: {})
+        monkeypatch.setattr(utils.urllib.request, "urlopen", fetch)
+        return state
+
     @patch("aisim.sdk.utils._download_hf_json")
     @patch("aisim.sdk.utils._download_hf_config")
     def test_successful_download(self, mock_download, mock_download_quant):
@@ -1358,6 +1404,61 @@ class TestGetModelConfigFromHFID:
 
         assert result["architecture"] == "LlamaForCausalLM"  # architecture
         mock_download.assert_called_once_with(model_id)
+
+    @pytest.mark.parametrize("failure", ["timeout", "connection", "unauthorized", "server", "malformed"])
+    def test_sidecar_failure_is_not_cached_and_retry_recovers_fp8(self, remote_checkpoint, failure):
+        remote_checkpoint.error = {
+            "timeout": TimeoutError("sidecar timed out"),
+            "connection": URLError("connection reset"),
+            "unauthorized": HTTPError("https://example.invalid", 401, "Unauthorized", {}, None),
+            "server": HTTPError("https://example.invalid", 500, "Server Error", {}, None),
+            "malformed": "malformed",
+        }[failure]
+        model_id = "nvidia/Llama-3.1-70B-Instruct-FP8"
+        with pytest.raises(utils.HuggingFaceDownloadError, match="hf_quant_config.json"):
+            get_model_config_from_model_path(model_id)
+        assert utils._load_model_config_from_model_path.cache_info().currsize == 0
+        assert get_model_config_from_model_path.cache_info().currsize == 0
+
+        remote_checkpoint.error = None
+        remote_checkpoint.sidecar = {"quantization": {"quant_algo": "FP8", "kv_cache_quant_algo": "FP8"}}
+        result = get_model_config_from_model_path(model_id)
+        assert result["raw_config"]["quant_algo"] == "fp8"
+        from aisim.sdk.models import _infer_quant_modes_from_raw_config
+
+        modes = _infer_quant_modes_from_raw_config(result["raw_config"])
+        assert modes["gemm_quant_mode"] is common.GEMMQuantMode.fp8_static
+        assert modes["kvcache_quant_mode"] is common.KVCacheQuantMode.fp8
+        assert get_model_config_from_model_path(model_id) is result
+        assert remote_checkpoint.requests == ["config.json", "hf_quant_config.json"] * 2
+
+    def test_optional_sidecar_404_preserves_unquantized_config(self, remote_checkpoint):
+        result = get_model_config_from_model_path("acme/Synthetic-Unquantized")
+        assert result["architecture"] == "LlamaForCausalLM"
+        assert "quant_algo" not in result["raw_config"]
+
+    def test_required_sidecar_404_fails_without_caching(self, remote_checkpoint):
+        model_id = "nvidia/Llama-3.1-70B-Instruct-FP8"
+        with pytest.raises(ValueError, match="requires quantization metadata.*hf_quant_config.json"):
+            get_model_config_from_model_path(model_id)
+        assert utils._load_model_config_from_model_path.cache_info().currsize == 0
+        assert get_model_config_from_model_path.cache_info().currsize == 0
+        remote_checkpoint.sidecar = {"quantization": {"quant_algo": "FP8"}}
+        assert get_model_config_from_model_path(model_id)["raw_config"]["quant_algo"] == "fp8"
+
+    def test_required_sidecar_can_be_replaced_by_inline_precision(self, remote_checkpoint):
+        remote_checkpoint.config["quantization_config"] = {"quant_method": "fp8"}
+        result = get_model_config_from_model_path("nvidia/Llama-3.1-70B-Instruct-FP8")
+        assert result["raw_config"]["quant_algo"] == "fp8"
+
+    def test_local_identified_fp8_checkpoint_requires_precision(self, remote_checkpoint, tmp_path):
+        remote_checkpoint.config["_name_or_path"] = "nvidia/Llama-3.1-70B-Instruct-FP8"
+        (tmp_path / "config.json").write_text(json.dumps(remote_checkpoint.config))
+        with pytest.raises(ValueError, match="requires quantization metadata"):
+            get_model_config_from_model_path(str(tmp_path))
+        (tmp_path / "hf_quant_config.json").write_text(json.dumps({"quantization": {"quant_algo": "FP8"}}))
+        assert get_model_config_from_model_path(str(tmp_path))["raw_config"]["quant_algo"] == "fp8"
+        assert remote_checkpoint.requests == []
 
 
 class TestSafeMkdir:
@@ -1550,6 +1651,28 @@ class TestParseCompressedTensorsQuant:
         algo, _ = parse_compressed_tensors_quant(cfg)
         assert algo == "fp8_block"
 
+    @pytest.mark.parametrize("packed_format", ["nvfp4-pack-quantized", "pack-quantized", None])
+    def test_later_four_bit_group_must_also_declare_packed_format(self, packed_format):
+        from aisim.sdk.utils import parse_compressed_tensors_quant
+
+        cfg = self._make_quant_config(4, "float")
+        cfg["config_groups"]["group_0"]["format"] = "mxfp4-pack-quantized"
+        cfg["config_groups"]["group_1"] = {
+            "weights": {"num_bits": 4, "type": "float"},
+            "format": packed_format,
+        }
+        with pytest.raises(ValueError, match="require format 'mxfp4-pack-quantized'"):
+            parse_compressed_tensors_quant(cfg)
+
+    @pytest.mark.parametrize("num_bits,expected", [(4, "w4a16_mxfp4"), (8, "fp8")])
+    def test_multiple_groups_with_the_same_algorithm(self, num_bits, expected):
+        from aisim.sdk.utils import parse_compressed_tensors_quant
+
+        cfg = self._make_quant_config(num_bits, "float", ignore=["lm_head"])
+        cfg["format"] = "mxfp4-pack-quantized"
+        cfg["config_groups"]["group_1"] = {"weights": {"num_bits": num_bits, "type": "float"}}
+        assert parse_compressed_tensors_quant(cfg) == (expected, frozenset({"lm_head"}))
+
     # --- ignored_categories detection ---
 
     def test_no_ignore_empty_set(self):
@@ -1653,8 +1776,123 @@ class TestParseCompressedTensorsQuant:
         assert overrides.get("gemm_quant_mode") == common.GEMMQuantMode.int4_wo
         assert overrides.get("moe_quant_mode") == common.MoEQuantMode.int4_wo
 
+    @pytest.mark.parametrize(
+        "targets,weights,extra_group,message",
+        [
+            (None, {"num_bits": 8, "type": "float"}, None, "require non-empty targets"),
+            ([r"re:.*mlp\.experts\..*"], {"num_bits": 8, "type": "float"}, None, "Missing.*attention"),
+            (["re:.*self_attn.*"], {"num_bits": 8, "type": "float"}, None, "Missing.*routing_experts"),
+            (["Linear"], {"num_bits": 3, "type": "int"}, None, "Unsupported.*weights.*attention"),
+            (["Linear"], {"num_bits": 4, "type": "float"}, None, "Unsupported.*w4a16_mxfp4.*attention"),
+            (["Linear"], {"num_bits": 8, "type": "int"}, None, "Unsupported.*int8_wo.*routing_experts"),
+            (
+                ["Linear"],
+                {"num_bits": 8, "type": "float"},
+                {"targets": [r"re:.*mlp\.experts\..*"], "weights": {"num_bits": 4, "type": "float"}},
+                "Ambiguous.*routing_experts",
+            ),
+            (["re:[self_attn"], {"num_bits": 8, "type": "float"}, None, "Invalid.*target"),
+            (["re:(?!.*experts).*self_attn.*"], {"num_bits": 8, "type": "float"}, None, "Unsupported.*target"),
+            (["model.layers.0.mlp.experts.0.down_proj"], {"num_bits": 8, "type": "float"}, None, "Unsupported.*target"),
+        ],
+    )
+    def test_category_inference_rejects_missing_ambiguous_and_incompatible_groups(
+        self, targets, weights, extra_group, message
+    ):
+        from aisim.sdk.models import _infer_quant_modes_from_raw_config
+
+        group = {"weights": weights}
+        if targets is not None:
+            group["targets"] = targets
+        quant = {"format": "mxfp4-pack-quantized", "config_groups": {"base": group}}
+        if extra_group is not None:
+            quant["config_groups"]["experts"] = extra_group
+        with pytest.raises(ValueError, match=message):
+            _infer_quant_modes_from_raw_config({"quant_algo": "compressed-tensors", "quantization_config": quant})
+
+    @pytest.mark.parametrize("target", ["self_attn", "mlp.experts", "mlp.shared_experts", "mlp.shared_expert"])
+    def test_bare_parent_targets_do_not_quantize_descendants(self, target):
+        from aisim.sdk.utils import parse_compressed_tensors_quant
+
+        quant = self._make_quant_config(8, "float")
+        quant["config_groups"]["group_0"]["targets"] = [target]
+        with pytest.raises(ValueError, match="Unsupported compressed-tensors target"):
+            parse_compressed_tensors_quant(quant, category="attention")
+
+    @pytest.mark.parametrize(
+        "target,category",
+        [
+            ("lm_head", "lm_head"),
+            ("re:.*self_attn.*", "attention"),
+            (r"re:.*mlp\.experts\..*", "routing_experts"),
+            (r"re:.*mlp\.shared_experts\..*", "shared_experts"),
+            (r"re:.*mlp\.shared_expert\..*", "shared_experts"),
+        ],
+    )
+    def test_complete_projection_targets_remain_supported(self, target, category):
+        from aisim.sdk.utils import parse_compressed_tensors_quant
+
+        quant = self._make_quant_config(8, "float")
+        quant["config_groups"]["group_0"]["targets"] = [target]
+        assert parse_compressed_tensors_quant(quant, category=category) == ("fp8", frozenset())
+
+    @pytest.mark.parametrize("unsupported", ["format", "target"])
+    def test_explicit_weight_modes_do_not_require_compressed_tensors_inference(self, unsupported):
+        from aisim.sdk.models import _apply_model_quant_defaults
+
+        quant = self._make_quant_config(4, "float")
+        quant["format"] = "nvfp4-pack-quantized" if unsupported == "format" else "mxfp4-pack-quantized"
+        if unsupported == "target":
+            quant["config_groups"]["group_0"]["targets"] = ["arbitrary.module"]
+        raw = {"quant_algo": "compressed-tensors", "quantization_config": quant, "kv_cache_quant_algo": "fp8"}
+        model_config = config.ModelConfig(
+            gemm_quant_mode=common.GEMMQuantMode.bfloat16,
+            moe_quant_mode=common.MoEQuantMode.nvfp4,
+        )
+
+        _apply_model_quant_defaults(model_config, raw, "Qwen3MoeForCausalLM", "trtllm")
+
+        assert model_config.gemm_quant_mode == common.GEMMQuantMode.bfloat16
+        assert model_config.moe_quant_mode == common.MoEQuantMode.nvfp4
+        assert model_config.kvcache_quant_mode == common.KVCacheQuantMode.fp8
+        assert model_config.fmha_quant_mode == common.FMHAQuantMode.fp8
+
+        for unset_field in ("gemm_quant_mode", "moe_quant_mode"):
+            setattr(model_config, unset_field, None)
+            with pytest.raises(ValueError, match="require format|Unsupported compressed-tensors target"):
+                _apply_model_quant_defaults(model_config, raw, "Qwen3MoeForCausalLM", "trtllm")
+            setattr(
+                model_config,
+                unset_field,
+                common.GEMMQuantMode.bfloat16 if unset_field == "gemm_quant_mode" else common.MoEQuantMode.nvfp4,
+            )
+
+    @pytest.mark.parametrize(
+        "bits,w_type,gemm,moe,expected_gemm,expected_moe",
+        [
+            (4, "float", common.GEMMQuantMode.bfloat16, None, "bfloat16", "w4a16_mxfp4"),
+            (8, "int", None, common.MoEQuantMode.bfloat16, "int8_wo", "bfloat16"),
+        ],
+    )
+    def test_only_unset_weight_category_needs_a_supported_sdk_mode(
+        self, bits, w_type, gemm, moe, expected_gemm, expected_moe
+    ):
+        from aisim.sdk.models import _apply_model_quant_defaults
+
+        quant = self._make_quant_config(bits, w_type)
+        quant["format"] = "mxfp4-pack-quantized"
+        model_config = config.ModelConfig(gemm_quant_mode=gemm, moe_quant_mode=moe)
+        _apply_model_quant_defaults(
+            model_config,
+            {"quant_algo": "compressed-tensors", "quantization_config": quant},
+            "Qwen3MoeForCausalLM",
+            "trtllm",
+        )
+        assert model_config.gemm_quant_mode == common.GEMMQuantMode[expected_gemm]
+        assert model_config.moe_quant_mode == common.MoEQuantMode[expected_moe]
+
     def test_redhat_dsv4_maps_block_fp8_attention_and_fp4_experts(self):
-        """The real RedHatAI DSV4 quant layout maps attention and experts independently."""
+        """A declared packed DSV4 layout maps attention and experts independently."""
         from aisim.sdk import common
         from aisim.sdk.models import _infer_quant_modes_from_raw_config
 
@@ -1676,6 +1914,7 @@ class TestParseCompressedTensorsQuant:
                     },
                     "group_1": {
                         "targets": ["re:.*ffn.*(gate|up|down)_proj$"],
+                        "format": "mxfp4-pack-quantized",
                         "weights": {
                             "num_bits": 4,
                             "type": "float",
@@ -2180,6 +2419,59 @@ class TestQwen3VLVisionEncoderParsing:
         cfg = {**_QWEN3VL_HF_CONFIG, "vision_config": vision_cfg}
         result = _parse_hf_config_json(cfg)
         assert result["extra_params"].deepstack_visual_indexes == (8, 17, 26)
+
+
+@pytest.mark.parametrize("layout", ["inline", "neighbor", "missing"])
+@pytest.mark.parametrize(
+    "missing_vision_field",
+    [None, "projector_input_dim", "projector_output_dim", "vision_output_dim", "pixel_shuffle_ratio"],
+)
+def test_local_llama4_processor_layouts(tmp_path, layout, missing_vision_field):
+    # Independently authored miniature geometry tests local metadata loading,
+    # without depending on the excluded Scout or Maverick bundled configs.
+    raw = {
+        "architectures": ["Llama4ForConditionalGeneration"],
+        "text_config": {
+            "num_hidden_layers": 2,
+            "hidden_size": 64,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "intermediate_size": 128,
+            "vocab_size": 256,
+            "max_position_embeddings": 1024,
+        },
+        "vision_config": {
+            "hidden_size": 32,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_channels": 3,
+            "intermediate_size": 128,
+            "image_size": 16,
+            "patch_size": 4,
+            "pixel_shuffle_ratio": 0.5,
+            "projector_input_dim": 128,
+            "projector_output_dim": 64,
+            "vision_output_dim": 64,
+        },
+    }
+    processor = {"max_patches": 4, "resize_to_max_canvas": False, "add_global_tile": True}
+    if layout == "inline":
+        raw["image_processor_config"] = processor
+    elif layout == "neighbor":
+        (tmp_path / "preprocessor_config.json").write_text(json.dumps(processor))
+    if missing_vision_field:
+        del raw["vision_config"][missing_vision_field]
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    if missing_vision_field:
+        with pytest.raises(ValueError, match=f"vision_config is missing required fields: {missing_vision_field}"):
+            get_model_config_from_model_path(str(tmp_path))
+    elif layout == "missing":
+        with pytest.raises(TypeError, match="image_processor_config.*preprocessor_config.json"):
+            get_model_config_from_model_path(str(tmp_path))
+    else:
+        parsed = get_model_config_from_model_path(str(tmp_path))
+        assert parsed["raw_config"]["image_processor_config"] == processor
+        assert parsed["extra_params"].vision_config.max_num_tiles == 4
 
 
 def test_qwen3_vl_pixel_budget_follows_the_checkpoint_processor(tmp_path, caplog):

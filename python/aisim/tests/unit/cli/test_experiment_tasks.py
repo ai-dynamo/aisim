@@ -66,30 +66,6 @@ def test_build_experiment_accepts_flat_v2_disagg():
     assert tasks["exp_disagg"].serving_mode == "disagg"
 
 
-def test_build_experiment_keeps_prefix_at_top_level():
-    tasks = build_experiment_tasks(
-        config={
-            "exps": ["exp_agg"],
-            "exp_agg": {
-                "mode": "patch",
-                "serving_mode": "agg",
-                "model_path": "nvidia/Kimi-K2.5-NVFP4",
-                "total_gpus": 8,
-                "system_name": "b200_sxm",
-                "backend_name": "trtllm",
-                "database_mode": "HYBRID",
-                "isl": 4000,
-                "osl": 1000,
-                "prefix": 1000,
-            },
-        }
-    )
-
-    task = tasks["exp_agg"]
-    assert task.prefix == 1000
-    assert task.database_mode == "HYBRID"
-
-
 def test_build_experiment_forwards_top_level_moe_backend():
     tasks = build_experiment_tasks(
         config={

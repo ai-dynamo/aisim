@@ -51,6 +51,16 @@ uv run pytest -q aic-core/rust/aiconfigurator-core/parity_tests/test_compile_eng
 
 ## Golden Fixtures (captured at Gate 2, frozen at Gate 3)
 
+Release 0.14.0 excludes the regression cases that require its removed custom-license model configs, including their chunked-prefill and imbalance fixtures. Their case definitions, golden records and pinning populations are removed together. All retained numerical records and capture provenance remain unchanged; the historical refresh examples below describe excluded cases. Synthetic tests that do not read the removed configs remain.
+
+In `engine_step.json`, the header counts describe the current retained cases and
+surfaces, including error records. The header's command, revision, engine and
+thread caps identify the original Python capture; `post_freeze_pins` identifies
+later Rust refreshes per surface. Pruning cases does not recapture any values or
+replace their historical provenance. The pinning script updates the counts when
+it adds records.
+
+
 - `goldens/engine_step.json` — every (case, surface) pair in
   `ENGINE_STEP_GOLDEN_MATRIX`, as `{"values": {...}}` or (error-symmetry
   cases) `{"error": ExceptionClassName}` records.
@@ -77,8 +87,14 @@ golden diff carry the review).
 
 ### Post-freeze golden maintenance: `pin_goldens.py`
 
+From a clean checkout with a matching native build, the retained release
+0.14.0 cases below are valid refresh keys. Refresh only for an explained,
+reviewed modeling change:
+
 ```bash
-.venv/bin/python aic-core/rust/aiconfigurator-core/parity_tests/pin_goldens.py
+python crates/core/parity_tests/perfmodel/pin_goldens.py \
+  --refresh gpt-oss-20b-b200-trtllm-isl1024-osl2 \
+  qwen3-30b-a3b-b200-vllm-isl1024-osl2
 ```
 
 - **Default (append-only)**: pins records for matrix entries the fixtures
@@ -315,16 +331,15 @@ not independent silicon-accuracy qualification.
 
 #### Recorded refresh commands
 
-The following commands ran from the repository root at
+The historical refresh ran from the repository root at
 `36dcc8f3afe9e6e2e9de976737b6337fad8c4d74`, after rebuilding the native extension
 for that checkout. The pin script requires a clean input tree; reproduce a
-historical refresh in an isolated checkout of that revision.
+historical refresh in an isolated checkout of that revision. It passed
+`--refresh gpt-oss-20b-b200-trtllm-isl1024-osl2 nemotron-nas-b200-trtllm-isl1024-osl2`
+to `pin_goldens.py`. The Nemotron key is excluded from release 0.14.0; use the
+retained-key example above for the current matrices. The subsequent test was:
 
 ```bash
-python/aisim/.venv/bin/python crates/core/parity_tests/perfmodel/pin_goldens.py \
-  --refresh gpt-oss-20b-b200-trtllm-isl1024-osl2 \
-  nemotron-nas-b200-trtllm-isl1024-osl2
-
 python/aisim/.venv/bin/python -m pytest -q -p no:timeout \
   crates/core/parity_tests/perfmodel/test_compile_engine_parity.py
 ```

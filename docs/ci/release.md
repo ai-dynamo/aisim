@@ -141,6 +141,59 @@ present must still match a catalog path/hash and its notices. A historical file
 with different or unrecorded bytes fails; backport its provenance rather than
 silently skipping the check.
 
+### Release 0.14.0 bundled-config scope
+
+The release excludes the 31 custom-license configuration and quantization JSON files previously covered by the scoped decisions in [PR #954](https://github.com/ai-dynamo/aisim/pull/954). The source tree and wheel contain 93 bundled configurations. Their provenance and license-review inventories exclude the removed files; the license gate and frozen legacy baseline remain enforced. Existing notices and redistribution credits are retained conservatively and do not establish that the removed files are still packaged.
+
+The affected model IDs are MiniMaxAI MiniMax-M2.5/M2.7/M3 and their NVIDIA NVFP4 exports; Qwen3.8-2.4T-A95B and its FP8 variant; Llama 4 Scout/Maverick, Meta-Llama-3.1 8B/70B/405B, NVIDIA Llama-3.1-70B-Instruct-FP8 and Llama-3_3-Nemotron-Super-49B-v1; Moonshot Kimi-K2-Instruct/K2.5/K3 and NVIDIA Kimi-K2.5/K2.6/K2.7-Code NVFP4; and Z.AI GLM-5.3/GLM-5.3-BF16 and NVIDIA GLM-5.3-NVFP4. These IDs are no longer bundled defaults. The existing loader can still read a user-supplied local configuration or retrieve an explicitly selected Hugging Face model; offline use requires supplying the configuration and any quantization sidecar locally. Architecture implementations and performance profiles remain available for that use. Release-branch regressions that read the removed configs, including the four MiniMax numerical sentinels, are removed; unrelated model cases and synthetic regression coverage remain. The release does not redistribute model weights.
+
+For offline Llama 4 Scout and Maverick use, the local directory must contain
+`config.json` with inline `image_processor_config`, or supply the processor
+metadata in a neighboring `preprocessor_config.json`. AISim reads the neighboring
+file only when `image_processor_config` is omitted from `config.json`; do not
+set it to `null` when using that file. Parsing requires valid inline metadata or
+the neighboring file; a quantization sidecar does not replace processor metadata.
+The local `config.json` must also provide `projector_input_dim`,
+`projector_output_dim`, `vision_output_dim`, and `pixel_shuffle_ratio` in
+`vision_config`, alongside the tower dimensions. Supply these checkpoint-specific
+values explicitly if they are absent from the upstream configuration; processor
+metadata does not supply them. Parsing fails when any is missing. The projector
+dimensions must be positive integers, `projector_output_dim` must equal
+`vision_output_dim`, and `pixel_shuffle_ratio` must have an integral reciprocal
+whose square times `hidden_size` equals `intermediate_size`.
+
+Local Kimi-K3 configurations on Blackwell SGLang select the MXFP4/MXFP8 MoE
+profile from their architecture and expert quantization metadata, just like
+the Hugging Face checkpoint. Missing expert quantization metadata requires an
+explicit `moe_quant_mode`; the directory name does not establish precision.
+For compressed-tensors 4-bit float weights, the effective config-group `format`
+(falling back to the quantization header's `format`) must be
+`mxfp4-pack-quantized`; other or missing formats fail rather than selecting an
+MXFP4 profile. This metadata may live under `text_config.quantization_config`.
+Every 4-bit float group is checked regardless of ordering. Group `targets`
+select attention and routed-expert algorithms independently; `Linear` targets
+both categories. Each non-ignored category must have a matching group with a
+supported algorithm. Missing targets, conflicting algorithms within a category,
+and category-incompatible algorithms fail explicitly. Thus FP8 attention and
+packed MXFP4 experts select the same modes in either config-group order.
+Use whole-category selectors, such as `re:.*self_attn.*` and
+`re:.*mlp\.experts\..*`; arbitrary per-layer/per-projection selectors cannot
+establish a uniform category mode and fail explicitly.
+Whole-expert exclusions (`mlp.experts`, `re:.*mlp\.experts\..*`,
+`re:.*mlp\.experts.*`, or `re:.*experts.*` in `ignore`) select BF16 MoE.
+Partial or unrecognized routed-expert exclusions require an explicit
+`moe_quant_mode`: AISim cannot infer a uniform precision from them and raises
+`ValueError` rather than silently modeling all experts as BF16.
+For `nvidia/Llama-3.1-70B-Instruct-FP8`, quantization must be declared inline
+or supplied in `hf_quant_config.json`. Local copies retaining that ID in
+`_name_or_path` receive the same validation. The upstream `config.json` instead
+uses a training path in `_name_or_path`, so copying only that file does not
+trigger the local missing-sidecar check and may default to BF16. For offline
+use, copy both upstream `config.json` and `hf_quant_config.json` into the same
+directory, or declare equivalent FP8 metadata inline. Sidecar download errors
+propagate and can be retried; a 404 is optional only when the checkpoint does
+not require the sidecar to establish its precision.
+
 ### Configuration license approval gate
 
 `python-compliance` now runs `scripts/ci/check_config_license_approvals.py` before installing dependencies in Full CI and every nightly architecture/Python job. Full CI's metadata-only license job uses GitHub-hosted Ubuntu 24.04, so license decisions do not wait for the dedicated native-build runner pool. Nightly architecture/Python checks retain their build environments. It applies even when a PR's wheel/test components are N/A. A failure blocks dependent wheel/staging jobs and `Full CI Success`; nightly publication also remains gated. The findings JSON is uploaded with `always()` as `config-license-approval` (nightlies append the architecture and Python version). There is no `continue-on-error` or legacy UNKNOWN exception in this approval gate.

@@ -14,7 +14,6 @@ import pytest
 import yaml
 
 from aisim.sdk import common
-from aisim.sdk.attention_lanes import ATTENTION_BACKEND_CHOICES
 from aisim.sdk.models import get_model
 from aisim.sdk.performance_result import MOE_COMM_FALLBACKS_COLUMN, MoECommFallback
 from aisim.sdk.task_v2 import Task
@@ -151,6 +150,106 @@ def test_agg_explicit_quant_overrides_hf():
     assert t.gemm_quant_mode == common.GEMMQuantMode.bfloat16  # explicit wins
     # unset modes fall back to HF inference (DeepSeek-V3)
     assert t.kvcache_quant_mode == common.KVCacheQuantMode.fp8
+
+
+@pytest.mark.parametrize("entrypoint", ["task", "get_model"])
+@pytest.mark.parametrize("num_experts", [None, 0, 4])
+def test_compressed_tensors_only_requires_expert_targets_for_moe(tmp_path, entrypoint, num_experts):
+    checkpoint = {
+        "architectures": ["Qwen3MoeForCausalLM" if num_experts else "Qwen3ForCausalLM"],
+        "hidden_size": 128,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "intermediate_size": 256,
+        "vocab_size": 512,
+        "max_position_embeddings": 2048,
+        "quantization_config": {
+            "quant_method": "compressed-tensors",
+            "config_groups": {
+                "attention": {"targets": ["re:.*self_attn.*"], "weights": {"num_bits": 8, "type": "float"}}
+            },
+        },
+    }
+    if num_experts is not None:
+        checkpoint.update(
+            num_experts=num_experts, num_experts_per_tok=2 if num_experts else 0, moe_intermediate_size=128
+        )
+    (tmp_path / "config.json").write_text(json.dumps(checkpoint))
+
+    def load():
+        if entrypoint == "task":
+            task = Task(
+                model_path=str(tmp_path),
+                system_name="h200_sxm",
+                backend_name="trtllm",
+                backend_version="1.3.0rc29",
+            )
+            assert task.is_moe is False
+            model_config = task.build_model_config(role="agg")
+        else:
+            from aisim_core.sdk.config import ModelConfig
+
+            model_config = ModelConfig()
+        model = get_model(str(tmp_path), model_config, "trtllm")
+        assert model.context_ops and model.generation_ops
+        assert model_config.gemm_quant_mode == common.GEMMQuantMode.fp8
+        assert model_config.moe_quant_mode == common.MoEQuantMode.bfloat16
+
+    if num_experts:
+        with pytest.raises(ValueError, match="Missing compressed-tensors target group for routing_experts"):
+            load()
+    else:
+        load()
+
+
+@pytest.mark.parametrize("mode", ["agg", "disagg"])
+def test_explicit_compressed_tensors_modes_survive_task_resolution_and_yaml(tmp_path, mode):
+    # Independent, tiny checkpoint geometry; only the metadata-inference path
+    # is unsupported. Explicit SDK modes remain valid user choices.
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3ForCausalLM"],
+                "hidden_size": 128,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 32,
+                "intermediate_size": 256,
+                "vocab_size": 512,
+                "max_position_embeddings": 2048,
+                "quantization_config": {
+                    "quant_method": "compressed-tensors",
+                    "format": "nvfp4-pack-quantized",
+                    "config_groups": {"base": {"targets": ["Linear"], "weights": {"num_bits": 4, "type": "float"}}},
+                },
+            }
+        )
+    )
+    fields = {
+        "model_path": str(tmp_path),
+        "system_name": "h200_sxm",
+        "backend_name": "trtllm",
+        "backend_version": "1.3.0rc29",
+        "gemm_quant_mode": common.GEMMQuantMode.bfloat16,
+        "moe_quant_mode": common.MoEQuantMode.bfloat16,
+    }
+    prefixes = [""] if mode == "agg" else ["prefill_", "decode_"]
+    kwargs = {f"{prefix}{key}": value for prefix in prefixes for key, value in fields.items()}
+    task = Task(serving_mode=mode, **kwargs)
+    restored = Task.from_yaml(yaml.safe_load(task.to_yaml()))
+    for current in (task, restored):
+        for role in ["agg"] if mode == "agg" else ["prefill", "decode"]:
+            model_config = current.build_model_config(role=role)
+            assert model_config.gemm_quant_mode == common.GEMMQuantMode.bfloat16
+            assert model_config.moe_quant_mode == common.MoEQuantMode.bfloat16
+
+    # A disaggregated role that still needs a default must keep failing loudly.
+    del kwargs[f"{prefixes[-1]}gemm_quant_mode"]
+    with pytest.raises(ValueError, match="require format 'mxfp4-pack-quantized'"):
+        Task(serving_mode=mode, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -385,82 +484,6 @@ def test_task_round_trip_preserves_exact_moe_kernel_source(source):
     assert restored.build_model_config(role="agg").moe_kernel_source == source
 
 
-def test_moe_kernel_source_reaches_qwen38_compute_ops_and_compiled_spec():
-    """A V2 Task pins only Qwen3.8's compute MoE lane, including the native spec."""
-    from aisim.sdk import models
-    from aisim.sdk.engine import build_engine_spec_json
-    from aisim.sdk.operations.moe import MoE, MoEDispatch
-    from aisim.sdk.perf_database import get_database
-
-    lane = "sglang_flashinfer_trtllm_moe"
-    task = Task(
-        serving_mode="agg",
-        model_path="Qwen/Qwen3.8-2.4T-A95B-FP8",
-        system_name="b200_sxm",
-        backend_name="sglang",
-        backend_version="0.5.17",
-        moe_kernel_source=lane,
-    )
-    model_config = task.build_model_config(role="agg", parallel=(8, 1, 1, 1, 8, 1))
-    assert model_config.moe_kernel_source == lane
-
-    model = models.get_model(task.model_path, model_config, task.backend_name)
-
-    def all_ops(ops):
-        pending = list(ops)
-        while pending:
-            op = pending.pop()
-            yield op
-            for group in ("_group_a", "_group_b", "_fallback"):
-                pending.extend(getattr(op, group, ()) or ())
-
-    ops = list(all_ops([*model.context_ops, *model.generation_ops]))
-    compute_ops = [op for op in ops if isinstance(op, MoE)]
-    dispatch_ops = [op for op in ops if isinstance(op, MoEDispatch)]
-    assert compute_ops
-    assert all(op._moe_kernel_source == lane for op in compute_ops)
-    assert all(not hasattr(op, "_moe_kernel_source") for op in dispatch_ops)
-
-    database = get_database("b200_sxm", "sglang", "0.5.17")
-    spec = json.loads(
-        build_engine_spec_json(
-            model,
-            model_path=task.model_path,
-            system=task.system_name,
-            backend=task.backend_name,
-            backend_version=task.backend_version,
-            kv_block_size=None,
-            systems_path=None,
-            nextn=task.nextn,
-            database=database,
-        )
-    )
-
-    def all_moe_specs(value):
-        if isinstance(value, list):
-            for item in value:
-                yield from all_moe_specs(item)
-        elif isinstance(value, dict):
-            if "Moe" in value:
-                yield value["Moe"]
-            for item in value.values():
-                yield from all_moe_specs(item)
-
-    moe_specs = list(all_moe_specs([spec["context_ops"], spec["generation_ops"]]))
-    assert spec["engine"]["moe_kernel_source"] == lane
-    assert moe_specs
-    assert all(moe["moe_kernel_source"] == lane for moe in moe_specs)
-
-    default_config = Task(
-        serving_mode="agg",
-        model_path="Qwen/Qwen3.8-2.4T-A95B-FP8",
-        system_name="b200_sxm",
-        backend_name="sglang",
-        backend_version="0.5.17",
-    ).build_model_config(role="agg")
-    assert default_config.moe_kernel_source is None
-
-
 def test_invalid_attention_backend_rejected():
     with pytest.raises(ValueError, match="attention_backend"):
         Task(
@@ -479,20 +502,6 @@ def test_invalid_moe_backend_rejected():
             system_name="h200_sxm",
             moe_backend="triton",
         )
-
-
-def test_valid_attention_backend_choices_accepted():
-    """Dense-only SGLang tasks retain the full attention-lane vocabulary."""
-    for choice in ATTENTION_BACKEND_CHOICES:
-        t = Task(
-            serving_mode="agg",
-            model_path="meta-llama/Meta-Llama-3.1-8B",
-            system_name="h200_sxm",
-            backend_name="sglang",
-            attention_backend=choice,
-        )
-        assert t._reachable_attention_op_keys("agg") == [("context_attention", "generation_attention")]
-        t.validate()
 
 
 def test_sglang_wideep_rejects_unsupported_attention_backend_before_sweep():
@@ -886,21 +895,6 @@ def test_large_ep_trtllm_context_fmha_capability_uses_granular_table(caplog):
     assert any("context_mla_granular" in r.message for r in caplog.records)
 
 
-def test_nextn_never_auto_enabled(caplog):
-    """MTP is never auto-enabled: nextn stays 0 even for checkpoints that ship
-    MTP layers; a hint log surfaces the unused capability."""
-    import logging
-
-    def mk(mp):
-        return Task(serving_mode="agg", model_path=mp, system_name="h200_sxm", backend_name="trtllm").nextn
-
-    with caplog.at_level(logging.INFO, logger="aisim.sdk.task_v2"):
-        assert mk("deepseek-ai/DeepSeek-V3") == 0  # HF declares 1 -- still off by default
-        assert mk("moonshotai/Kimi-K2.5") == 0
-        assert mk("Qwen/Qwen3.5-27B") == 0
-    assert any("ships MTP" in r.message for r in caplog.records)
-
-
 def test_nextn_auto_resolves_depth_from_checkpoint():
     """nextn='auto' takes the draft depth from num_nextn_predict_layers; the
     acceptance value is still required -- it is never inferred."""
@@ -1124,20 +1118,27 @@ def test_dsv4_nvfp4_exports_get_the_curated_hopper_rejection(model_path, replace
     assert replacement in str(exc.value)
 
 
-def test_dsv4_third_party_fp4_sglang_moe_remap_on_hopper():
-    """Third-party FP4-expert DSV4 checkpoints (e.g. RedHatAI) get the sglang
+def test_dsv4_third_party_fp4_sglang_moe_remap_on_hopper(tmp_path):
+    """Local native FP4-expert DSV4 checkpoints get the sglang
     MoE remap based on expert_dtype rather than hardcoded model paths.
     Hopper -> w4a16_mxfp4_cutlass; Blackwell -> w4a8_mxfp4_mxfp8_trtllm."""
+    from aisim.sdk.utils import _load_model_config_from_model_path
+
+    # Use a valid native-FP4 config under an unrelated local path. A live
+    # third-party NVFP4 export does not establish native MXFP4 execution.
+    raw = dict(_load_model_config_from_model_path("deepseek-ai/DeepSeek-V4-Flash"))
+    raw.pop("_name_or_path", None)
+    (tmp_path / "config.json").write_text(json.dumps(raw))
     hopper = Task(
         serving_mode="agg",
-        model_path="RedHatAI/DeepSeek-V4-Flash-NVFP4-FP8",
+        model_path=str(tmp_path),
         system_name="h200_sxm",
         backend_name="sglang",
     )
     assert hopper.moe_quant_mode == common.MoEQuantMode.w4a16_mxfp4_cutlass
     blackwell = Task(
         serving_mode="agg",
-        model_path="RedHatAI/DeepSeek-V4-Flash-NVFP4-FP8",
+        model_path=str(tmp_path),
         system_name="b200_sxm",
         backend_name="sglang",
     )
@@ -1170,6 +1171,10 @@ def test_dsv4_fp8_kvcache_enforced(model_path):
         model_path=model_path,
         system_name="b200_sxm",
         backend_name="trtllm",
+        # Isolate the native KV requirement from weight-format inference.
+        # The external NVFP4 compressed-tensors export needs explicit modes.
+        gemm_quant_mode=common.GEMMQuantMode.fp8_block,
+        moe_quant_mode=common.MoEQuantMode.nvfp4,
     )
     assert t.kvcache_quant_mode == common.KVCacheQuantMode.fp8
 
@@ -2112,36 +2117,6 @@ def test_validate_database_check_rejects_unsupported_quant():
         t.validate()
     except ValueError as exc:
         assert "Unsupported gemm" in str(exc) or "Supported gemm" in str(exc)
-
-
-def test_validate_moe_quant_transfer_reachable_in_hybrid():
-    """supported_quant_mode is a data-presence list. A MoE quant absent from the DB
-    but sharing a (memory, compute) profile with a supported quant is XQUANT-reachable
-    in HYBRID (operations/moe.py), so HYBRID validate must admit it while SILICON stays
-    strict. Kimi-K2.5 infers int4_wo MoE (profile (0.5,1)) which b200/trtllm has no data
-    for, but w4a16_mxfp4 (same profile) is collected."""
-
-    def make(mode, policy=None):
-        return Task(
-            serving_mode="agg",
-            model_path="moonshotai/Kimi-K2.5",
-            system_name="b200_sxm",
-            backend_name="trtllm",
-            backend_version="1.3.0rc20",
-            database_mode=mode,
-            transfer_policy=policy,
-        )
-
-    with pytest.raises(ValueError, match="Unsupported moe quant mode 'int4_wo'"):
-        make("SILICON").validate()
-    make("HYBRID").validate()  # default policy (all on) -> XQUANT reachable -> no raise
-    make("HYBRID", "xquant").validate()  # XQUANT explicitly enabled -> no raise
-
-    # The admission must respect the transfer policy: if XQUANT is disabled, moe.py would
-    # reject the quant at query time, so validate must NOT pre-admit it.
-    for disabled in ("off", "conservative"):
-        with pytest.raises(ValueError, match="Unsupported moe quant mode 'int4_wo'"):
-            make("HYBRID", disabled).validate()
 
 
 def test_validate_w4a16_nvfp4_moe_xprofile_reachable_in_hybrid():

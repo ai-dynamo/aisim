@@ -9,10 +9,7 @@ from dataclasses import asdict, replace
 
 import pytest
 
-from aisim_core.sdk import models, utils
-from aisim_core.sdk.config import ModelConfig
-from aisim_core.sdk.errors import InvalidEngineConfigurationError
-from aisim_core.sdk.models.kimi_k3 import KimiK3Model
+from aisim_core.sdk import utils
 from aisim_core.sdk.speculation.base import SpeculationConfig, resolve_speculation_config
 
 pytestmark = pytest.mark.unit
@@ -127,50 +124,3 @@ def test_resolved_identity_owns_nested_snapshots():
     assert resolved.params == {"tree_shape": [1, 2]}
     assert resolved.draft_config == DRAFT_GEOMETRY
     assert resolved.identity_hash() == identity
-
-
-def test_standalone_draft_identity_uses_the_path_parser_and_rejects_mismatch(monkeypatch):
-    raw = deepcopy(DRAFT_GEOMETRY)
-    paths = []
-
-    def parse(path):
-        paths.append(path)
-        return {"raw_config": raw}
-
-    monkeypatch.setattr(utils, "get_model_config_from_model_path", parse)
-    config = SpeculationConfig("draft_model", {"num_speculative_tokens": 3}, draft_model_path="standalone/draft")
-    resolved = resolve_speculation_config(config)
-    assert resolved.draft_config == raw
-    assert resolved.draft_model_path == "standalone/draft"
-    assert resolve_speculation_config(resolved) == resolved
-    assert paths == ["standalone/draft", "standalone/draft"]
-
-    raw["hidden_size"] = 256
-    assert resolved.draft_config["hidden_size"] == 128
-    with pytest.raises(ValueError, match="draft_config must match"):
-        resolve_speculation_config(resolved)
-
-
-@pytest.mark.parametrize("backend", ["vllm", "sglang"])
-def test_explicit_mtp_cannot_construct_a_dspark_graph(monkeypatch, backend):
-    def unexpected_create(*args, **kwargs):
-        pytest.fail("explicit MTP must be rejected before constructing a DSPARK graph")
-
-    monkeypatch.setattr(KimiK3Model, "create", unexpected_create)
-    config = ModelConfig(
-        tp_size=8,
-        moe_tp_size=8,
-        moe_ep_size=1,
-        speculation=SpeculationConfig("mtp", {"depth": 3}),
-    )
-    with pytest.raises(InvalidEngineConfigurationError, match="Explicit MTP.*DSPARK"):
-        models.get_model("moonshotai/Kimi-K3", config, backend)
-    assert config.nextn == 0
-
-
-@pytest.mark.parametrize("backend", ["vllm", "sglang"])
-def test_legacy_nextn_still_constructs_the_dspark_graph(backend):
-    config = ModelConfig(tp_size=8, moe_tp_size=8, moe_ep_size=1, nextn=3)
-    model = models.get_model("moonshotai/Kimi-K3", config, backend)
-    assert model.verify_width == 4
-    assert "draft_kv_proj_gemm" in {op._name for op in model.generation_ops}

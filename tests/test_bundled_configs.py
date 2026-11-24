@@ -403,11 +403,35 @@ def test_current_inventory_is_complete_and_does_not_relabel_unknowns():
     for entry in entries:
         if entry["origin"] == "legacy_unresolved":
             assert entry["license"] == "UNKNOWN"
-    qwen = [e for e in entries if "Qwen3.8" in e["path"]]
-    llama = [e for e in entries if "Llama-4-" in e["path"]]
-    assert len(qwen) == len(llama) == 2
-    assert {e["license"] for e in qwen} == {"LicenseRef-Qwen3.8-Max"}
-    assert {e["license"] for e in llama} == {"LicenseRef-Llama-4-Community"}
+    assert len(entries) == 93
+    assert all("LicenseRef" not in entry["license"] for entry in entries)
+
+
+def test_glm52_and_gemma4_base_license_evidence_identifies_the_named_model():
+    entries = checker.inventory_entries(checker.ROOT / checker.INVENTORY)
+    notices = (checker.ROOT / "THIRD_PARTY_NOTICES.md").read_text()
+    assert (checker.ROOT / "python/aisim/THIRD_PARTY_NOTICES.md").read_text() == notices
+    checked = 0
+    for entry in entries.values():
+        model = entry.get("base_model") or ""
+        if model not in {"zai-org/GLM-5.2", "zai-org/GLM-5.2-FP8"} and not model.startswith("google/gemma-4-"):
+            continue
+        source = entry["base_license_source"]
+        # The immediate predecessor's LICENSE and a sibling model's LICENSE
+        # cannot establish the named base model's grant.
+        assert re.fullmatch(
+            rf"https://huggingface.co/{re.escape(model)}/blob/[0-9a-f]{{40}}/(LICENSE|README.md)", source
+        )
+        assert source in notices
+        if model.startswith("google/"):
+            assert source.endswith("/README.md")
+            assert "no standalone license file" in entry["base_license_evidence"]
+            assert entry["base_license"] == "Apache-2.0"
+        else:
+            assert source.endswith("/LICENSE")
+            assert entry["base_license"] == "MIT"
+        checked += 1
+    assert checked == 9
 
 
 def test_packaged_deepseek_v3_notice_preserves_source_material_grants(tmp_path):
@@ -434,25 +458,6 @@ def test_packaged_deepseek_v3_notice_preserves_source_material_grants(tmp_path):
     assert entry["source"]["revision"] in notice
     assert "LICENSE-CODE" in notice and "LICENSE-MODEL" in notice
     assert "deepseek-ai--DeepSeek-V3_config.json" not in sections["DeepSeek model configuration files"]
-
-
-@pytest.mark.parametrize("missing_license", ["GLM-5.3 License", "NVIDIA Open Model Agreement"])
-def test_nvfp4_notice_requires_both_license_texts(tmp_path, missing_license):
-    name = "aisim_core/model_configs/nvidia--GLM-5.3-NVFP4_config.json"
-    entry = checker.inventory_entries(checker.ROOT / checker.INVENTORY)[name]
-    canonical = (checker.ROOT / "THIRD_PARTY_NOTICES.md").read_text()
-    section = entry["notice"]["section"]
-    pattern = r"^## " + re.escape(section) + r"\s*\n(.*?)(?=^## |\Z)"
-    body = re.search(pattern, canonical, re.M | re.S).group(1)
-    license_text = re.findall(r"```text\n(.*?)\n```", body, re.S)[0]
-    assert "GLM-5.3 License" in license_text and "NVIDIA Open Model Agreement" in license_text
-    (tmp_path / "THIRD_PARTY_NOTICES.md").write_text(canonical)
-    checker.check_notice(tmp_path, entry, None)
-    glm, agreement = license_text.split("NVIDIA Open Model Agreement\n", 1)
-    remaining = glm if missing_license == "NVIDIA Open Model Agreement" else "NVIDIA Open Model Agreement\n" + agreement
-    (tmp_path / "THIRD_PARTY_NOTICES.md").write_text(canonical.replace(license_text, remaining))
-    with pytest.raises(checker.InventoryError, match="complete license text"):
-        checker.check_notice(tmp_path, entry, None)
 
 
 def test_content_changes_change_osrb_identity(fixture, tmp_path):

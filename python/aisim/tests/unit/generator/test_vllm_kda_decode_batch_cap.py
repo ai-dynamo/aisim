@@ -12,7 +12,6 @@ ModelConfig.has_kda from both render paths (module_bridge, naive).
 import pytest
 
 from aisim.generator.rendering.rule_engine import apply_rule_plugins
-from aisim.generator.utils import model_has_kda
 
 pytestmark = pytest.mark.unit
 
@@ -54,9 +53,3 @@ def test_preserve_engine_limits_disables_the_cap():
     pv = _pv(True, batch=512, preserve=True)
     apply_rule_plugins(pv, backend="vllm")
     assert pv["params"]["agg"]["max_batch_size"] == 512
-
-
-def test_model_has_kda_reads_the_bundled_config():
-    assert model_has_kda("moonshotai/Kimi-K3") is True
-    assert model_has_kda("Qwen/Qwen3-8B") is False
-    assert model_has_kda("org/does-not-exist-anywhere") is False

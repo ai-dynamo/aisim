@@ -679,21 +679,6 @@ class TestCLIArgumentParsing:
         assert args.nextn == "auto"
         assert args.nextn_accepted == 0.7
 
-    def test_recommend_omitted_nextn_has_distinct_sentinel(self, cli_parser):
-        args = cli_parser.parse_args(
-            [
-                "recommend",
-                "--model-path",
-                "moonshotai/Kimi-K3",
-                "--system",
-                "h200_sxm",
-                "--target-request-rate",
-                "10",
-            ]
-        )
-
-        assert args.nextn is None
-
     def test_recommend_nextn_requires_explicit_acceptance(self, cli_parser):
         from aisim.legacy_cli.main import _resolve_and_validate_nextn
 

@@ -126,18 +126,6 @@ def test_model_graph_rejects_moe_kernel_source_without_a_compatible_operator(mod
         get_model(model_path, model_config, "sglang")
 
 
-def test_model_graph_rejects_source_when_layer_override_removes_all_moe_operators():
-    # Kimi-K3 has a dense first layer; its checkpoint metadata still declares MoE.
-    model_path = "moonshotai/Kimi-K3"
-    assert check_is_moe(model_path)
-    model_config = config.ModelConfig(
-        overwrite_num_layers=1, moe_tp_size=1, moe_ep_size=1, moe_kernel_source="missing_source"
-    )
-
-    with pytest.raises(InvalidEngineConfigurationError, match="moe_kernel_source.*no compatible MoE"):
-        get_model(model_path, model_config, "sglang")
-
-
 class TestSupportedModels:
     """Test default models configuration from support_matrix.csv."""
 
@@ -152,7 +140,6 @@ class TestSupportedModels:
         "hf_id",
         [
             "Qwen/Qwen3-32B",
-            "meta-llama/Meta-Llama-3.1-8B",
             "deepseek-ai/DeepSeek-V3",
             "deepseek-ai/DeepSeek-V4-Flash",
             "deepseek-ai/DeepSeek-V4-Pro",
@@ -164,8 +151,6 @@ class TestSupportedModels:
             "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16",
             "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8",
             "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
-            "Qwen/Qwen3.8-2.4T-A95B",
-            "Qwen/Qwen3.8-2.4T-A95B-FP8",
         ],
     )
     def test_specific_models_are_in_default_list(self, hf_id):
@@ -192,7 +177,6 @@ class TestSupportedModels:
         "hf_id,is_moe_expected",
         [
             ("Qwen/Qwen3-32B", False),
-            ("meta-llama/Meta-Llama-3.1-8B", False),
             ("deepseek-ai/DeepSeek-V3", True),
             ("deepseek-ai/DeepSeek-V3.2", True),
             ("deepseek-ai/DeepSeek-V4-Flash", True),
@@ -207,13 +191,12 @@ class TestSupportedModels:
             ("Qwen/Qwen3-VL-32B-Instruct", False),
             ("Qwen/Qwen3-VL-30B-A3B-Instruct", True),
             ("Qwen/Qwen3-VL-235B-A22B-Instruct", True),
-            # NemotronH: check hybrid_override_pattern for 'E' (MoE layers)
-            ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", True),  # Has 'E' in pattern
-            ("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8", True),  # Has 'E' in pattern
-            ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16", True),  # Has 'E' in derived pattern
-            ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8", True),  # Has 'E' in derived pattern
-            ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4", True),  # Has 'E' in derived pattern
-            ("nvidia/Nemotron-H-56B-Base-8K", False),  # No 'E' in pattern (only M, *, -)
+            ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", True),
+            ("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8", True),
+            ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16", True),
+            ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8", True),
+            ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4", True),
+            ("nvidia/Nemotron-H-56B-Base-8K", False),
         ],
     )
     def test_model_moe_detection(self, hf_id, is_moe_expected):
@@ -224,31 +207,6 @@ class TestSupportedModels:
 
 class TestMOEParallelismResolution:
     """Regression tests for SDK-side MoE parallelism defaults."""
-
-    def test_missing_moe_tp_size_is_inferred_for_minimax_nvfp4(self):
-        model_config = config.ModelConfig(
-            tp_size=1,
-            attention_dp_size=1,
-            moe_tp_size=None,
-            moe_ep_size=1,
-        )
-
-        model = get_model("nvidia/MiniMax-M2.7-NVFP4", model_config, backend_name="vllm")
-
-        assert model.model_family == "MOE"
-        assert model_config.moe_tp_size == 1
-        assert model_config.moe_ep_size == 1
-
-    def test_minimax_m3_builds_with_msa_and_moe(self):
-        """MiniMax-M3 registers as its own family and wires the MSA attention op + MoE."""
-        from aisim.sdk.operations.msa import ContextMSAModule
-
-        model_config = config.ModelConfig(tp_size=1, attention_dp_size=1, moe_tp_size=1, moe_ep_size=1)
-        model = get_model("MiniMaxAI/MiniMax-M3", model_config, backend_name="trtllm")
-        assert model.model_family == "MINIMAXM3"
-        ctx = {op._name: op for op in model.context_ops}
-        assert "context_attention" in ctx and "context_moe" in ctx
-        assert isinstance(ctx["context_attention"], ContextMSAModule)  # MSA, not plain attention
 
     def test_nemotron_h_mtp_scales_generation_only(self):
         """Nemotron-3 ships num_nextn_predict_layers=1; MTP must build (no assert) and
@@ -369,7 +327,6 @@ class TestHFModelSupport:
         "hf_id,expected_family",
         [
             ("Qwen/Qwen3-32B", "LLAMA"),
-            ("meta-llama/Meta-Llama-3.1-8B", "LLAMA"),
             ("deepseek-ai/DeepSeek-V3", "DEEPSEEK"),
             ("deepseek-ai/DeepSeek-V3.2", "DEEPSEEKV32"),
             ("deepseek-ai/DeepSeek-V4-Flash", "DEEPSEEKV4"),
@@ -397,7 +354,6 @@ class TestHFModelSupport:
         "hf_id,is_moe_expected",
         [
             ("Qwen/Qwen3-32B", False),
-            ("meta-llama/Meta-Llama-3.1-8B", False),
             ("deepseek-ai/DeepSeek-V3", True),
             ("deepseek-ai/DeepSeek-V3.2", True),
             ("deepseek-ai/DeepSeek-V4-Flash", True),
@@ -411,13 +367,12 @@ class TestHFModelSupport:
             ("Qwen/Qwen3-VL-32B-Instruct", False),
             ("Qwen/Qwen3-VL-30B-A3B-Instruct", True),
             ("Qwen/Qwen3-VL-235B-A22B-Instruct", True),
-            # NemotronH: is_moe depends on 'E' in hybrid_override_pattern
-            ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", True),  # Has 'E' (MoE layers)
-            ("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8", True),  # Has 'E' (MoE layers)
-            ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16", True),  # Has 'E' in derived pattern
-            ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8", True),  # Has 'E' in derived pattern
-            ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4", True),  # Has 'E' in derived pattern
-            ("nvidia/Nemotron-H-56B-Base-8K", False),  # No 'E' (Mamba + Attention + MLP only)
+            ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", True),
+            ("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8", True),
+            ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16", True),
+            ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8", True),
+            ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4", True),
+            ("nvidia/Nemotron-H-56B-Base-8K", False),
         ],
     )
     def test_hf_id_moe_detection(self, hf_id, is_moe_expected):
@@ -870,14 +825,6 @@ class TestKVCacheElementsPerToken:
     @pytest.mark.parametrize(
         "hf_id,tp,moe_kw,expected_family,expected_elems",
         [
-            # MLA path: 61 layers * (kv_lora_rank=512 + qk_rope_head_dim=64) = 35136
-            (
-                "nvidia/Kimi-K2.5-NVFP4",
-                4,
-                {"moe_tp_size": 2, "moe_ep_size": 2},
-                "KIMIK25",
-                35136,
-            ),
             (
                 "deepseek-ai/DeepSeek-V3",
                 4,
@@ -892,8 +839,6 @@ class TestKVCacheElementsPerToken:
                 "DEEPSEEKV32",
                 35136,
             ),
-            # GQA path: num_kv_heads_per_gpu * head_size * num_layers * 2
-            ("meta-llama/Meta-Llama-3.1-8B", 1, {}, "LLAMA", 8 * 128 * 32 * 2),
             ("Qwen/Qwen3-32B", 4, {}, "LLAMA", 2 * 128 * 64 * 2),
             (
                 "Qwen/Qwen3-30B-A3B",
@@ -908,6 +853,37 @@ class TestKVCacheElementsPerToken:
         model = self._build_model(hf_id, tp, **moe_kw)
         assert model.model_family == expected_family
         assert model.get_kvcache_elements_per_token() == expected_elems
+
+    @pytest.mark.parametrize("tp", [1, 2])
+    def test_local_non_deepseek_mla_cache_is_not_sharded_by_tp(self, tmp_path, tp):
+        # Synthetic text-only geometry, independently authored rather than
+        # copied from a removed Kimi checkpoint. MLA stores 24 latent + 8
+        # rotary elements per layer on each rank: three layers need 96.
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["KimiK25ForConditionalGeneration"],
+                    "text_config": {
+                        "num_hidden_layers": 3,
+                        "hidden_size": 256,
+                        "num_attention_heads": 8,
+                        "num_key_value_heads": 8,
+                        "intermediate_size": 512,
+                        "moe_intermediate_size": 128,
+                        "num_experts_per_tok": 2,
+                        "n_routed_experts": 4,
+                        "kv_lora_rank": 24,
+                        "qk_rope_head_dim": 8,
+                        "v_head_dim": 32,
+                        "vocab_size": 512,
+                        "max_position_embeddings": 2048,
+                    },
+                }
+            )
+        )
+        model = self._build_model(str(tmp_path), tp, moe_tp_size=1, moe_ep_size=tp)
+        assert model.model_family == "KIMIK25"
+        assert model.get_kvcache_elements_per_token() == 96
 
     @pytest.mark.parametrize("tp,expected_elements", [(1, 4096), (2, 2048), (4, 2048)])
     @pytest.mark.parametrize("kv_dtype", [common.KVCacheQuantMode.fp8, common.KVCacheQuantMode.bfloat16])
@@ -929,7 +905,6 @@ class TestKVCacheElementsPerToken:
     @pytest.mark.parametrize(
         "hf_id",
         [
-            "nvidia/Kimi-K2.5-NVFP4",
             "deepseek-ai/DeepSeek-V3",
             "deepseek-ai/DeepSeek-V3.2",
         ],
@@ -942,20 +917,6 @@ class TestKVCacheElementsPerToken:
         assert isinstance(extra, dict), f"{hf_id}: extra_params should be a dict"
         assert extra.get("kv_lora_rank") == 512, f"{hf_id}: kv_lora_rank not extracted"
         assert extra.get("qk_rope_head_dim") == 64, f"{hf_id}: qk_rope_head_dim not extracted"
-
-    def test_kimik25_does_not_use_gqa_branch(self):
-        """Direct regression for the original concurrency cap bug: with the
-        GQA branch, KIMIK25 would compute 16*112*61*2 = 218624 elems/token at
-        TP=4 (a ~6.2x overestimate). The MLA branch must produce 35136."""
-        model = self._build_model("nvidia/Kimi-K2.5-NVFP4", tp_size=4, moe_tp_size=2, moe_ep_size=2)
-        gqa_elems = (
-            ((model._num_kv_heads + model.config.tp_size - 1) // model.config.tp_size)
-            * model._head_size
-            * model._num_layers
-            * 2
-        )
-        assert gqa_elems != model.get_kvcache_elements_per_token()
-        assert model.get_kvcache_elements_per_token() == model._num_layers * (512 + 64)
 
 
 class TestGptOssHybridKVCache:
@@ -1114,9 +1075,8 @@ class TestGetKvcacheMaxTokens:
     @pytest.mark.parametrize(
         "hf_id,tp,moe_kw",
         [
-            ("meta-llama/Meta-Llama-3.1-8B", 1, {}),  # GQA, linear
-            ("Qwen/Qwen3-32B", 4, {}),  # GQA, linear
-            ("deepseek-ai/DeepSeek-V3.2", 4, {"moe_tp_size": 1, "moe_ep_size": 4}),  # MLA, linear
+            ("Qwen/Qwen3-32B", 4, {}),
+            ("deepseek-ai/DeepSeek-V3.2", 4, {"moe_tp_size": 1, "moe_ep_size": 4}),
         ],
     )
     def test_linear_models_invert_to_floor_division(self, hf_id, tp, moe_kw):
@@ -1217,8 +1177,6 @@ class TestQuantizationModes:
         [
             ("deepseek-ai/DeepSeek-V3", "trtllm"),
             ("deepseek-ai/DeepSeek-V3", "sglang"),
-            ("nvidia/Kimi-K2.5-NVFP4", "trtllm"),
-            ("nvidia/Kimi-K2.5-NVFP4", "sglang"),
         ],
     )
     def test_deepseek_v3_and_kimi_keep_fp8_fmha_for_supported_backends(self, hf_id, backend_name):
@@ -1464,15 +1422,6 @@ class TestDeepSeekTPAllReduce:
         )
         return models.get_model(hf_id, model_config, backend_name=backend)
 
-    def test_vllm_has_generation_tp_allreduce_scaled_by_2x_num_layers(self):
-        model = self._build("nvidia/Kimi-K2.5-NVFP4", "vllm", tp_size=4)
-        ar_ops = [op for op in model.generation_ops if op._name == "generation_tp_allreduce"]
-        assert len(ar_ops) == 1, "vLLM DeepSeekModel must emit one generation_tp_allreduce op"
-        ar = ar_ops[0]
-        assert ar._tp_size == 4
-        assert ar._h == model._hidden_size
-        assert ar._scale_factor == pytest.approx(2 * model._num_layers * model._mtp_scale_factor)
-
     def test_vllm_deepseek_v3_also_emits_tp_allreduce(self):
         # DEEPSEEK family (non-KIMIK25) goes through the create() fallback;
         # confirm backend_name is threaded so DS-V3 + vLLM also emits the op.
@@ -1484,25 +1433,6 @@ class TestDeepSeekTPAllReduce:
         assert len(gen_ar) == 1 and gen_ar[0]._tp_size == 4
         assert len(ctx_ar) == 1 and ctx_ar[0]._tp_size == 4
         assert model._vllm_head_size == 128
-
-    def test_vllm_has_context_tp_allreduce_scaled_by_2x_num_layers(self):
-        model = self._build("nvidia/Kimi-K2.5-NVFP4", "vllm", tp_size=4)
-        ar_ops = [op for op in model.context_ops if op._name == "context_tp_allreduce"]
-        assert len(ar_ops) == 1, "vLLM DeepSeekModel must emit one context_tp_allreduce op"
-        ar = ar_ops[0]
-        assert ar._tp_size == 4
-        assert ar._h == model._hidden_size
-        # context_ops are NOT mtp-scaled (matches the rest of context_ops).
-        assert ar._scale_factor == pytest.approx(2 * model._num_layers)
-
-    def test_vllm_tp1_keeps_op_but_query_is_zero(self):
-        # The op stays in the list for tp_size=1 (CustomAllReduce.query handles the
-        # short-circuit), so the model has uniform shape regardless of TP.
-        model = self._build("nvidia/Kimi-K2.5-NVFP4", "vllm", tp_size=1)
-        gen_ar = [op for op in model.generation_ops if op._name == "generation_tp_allreduce"]
-        ctx_ar = [op for op in model.context_ops if op._name == "context_tp_allreduce"]
-        assert len(gen_ar) == 1 and gen_ar[0]._tp_size == 1
-        assert len(ctx_ar) == 1 and ctx_ar[0]._tp_size == 1
 
     def test_trtllm_narrow_ep_does_not_emit_op(self):
         # Issue is scoped to vLLM; TRT-LLM narrow-EP path through DeepSeekModel
@@ -1772,45 +1702,6 @@ class TestMLAModuleQueryKeys:
                 return op._primary
         raise AssertionError("generation_mla_block not found")
 
-    def test_kimik25_uses_model_head_count(self):
-        module = self._generation_mla_module(
-            "nvidia/Kimi-K2.5-NVFP4", tp_size=1, dp_size=4, moe_tp_size=1, moe_ep_size=4
-        )
-        assert module._num_heads == 64
-
-    def test_kimik25_tp_shards_model_head_count(self):
-        module = self._generation_mla_module(
-            "nvidia/Kimi-K2.5-NVFP4", tp_size=4, dp_size=1, moe_tp_size=4, moe_ep_size=1
-        )
-        assert module._num_heads == 16
-
-    def test_kimik25_attention_excluded_uses_bf16_gemm_key(self):
-        module = self._generation_mla_module(
-            "nvidia/Kimi-K2.5-NVFP4", tp_size=1, dp_size=4, moe_tp_size=1, moe_ep_size=4
-        )
-        assert module._gemm_quant_mode == common.GEMMQuantMode.bfloat16
-
-    def test_kimik25_context_module_uses_same_keys(self):
-        # coderabbit: the context_mla_block key changed too — cover it.
-        model_config = config.ModelConfig(
-            tp_size=1,
-            pp_size=1,
-            attention_dp_size=4,
-            moe_tp_size=1,
-            moe_ep_size=4,
-            gemm_quant_mode=common.GEMMQuantMode.nvfp4,
-            moe_quant_mode=common.MoEQuantMode.nvfp4,
-            kvcache_quant_mode=common.KVCacheQuantMode.fp8,
-            fmha_quant_mode=common.FMHAQuantMode.bfloat16,
-        )
-        model = models.get_model("nvidia/Kimi-K2.5-NVFP4", model_config, backend_name="vllm")
-        for op in model.context_ops:
-            if getattr(op, "_name", "") == "context_mla_block":
-                assert op._primary._num_heads == 64
-                assert op._primary._gemm_quant_mode == common.GEMMQuantMode.bfloat16
-                return
-        raise AssertionError("context_mla_block not found")
-
     def test_v31_nvfp4_mixed_exclusion_bypasses_module_row(self):
         # DeepSeek-V3.1-NVFP4 excludes q/kv but keeps o_proj NVFP4: no
         # single-gemm_type module row matches that identity, so the model must
@@ -1843,29 +1734,6 @@ class TestMLAModuleQueryKeys:
         )
         assert module._num_heads == 32
         assert module._gemm_quant_mode == common.GEMMQuantMode.nvfp4
-
-    def test_kimik25_attention_weights_counted_at_bf16(self):
-        """Attention fallback GEMM weights follow the checkpoint dtype and the
-        model head count. Kimi-K2.5-NVFP4 keeps attention in BF16; per rank at
-        tp1: (q_a+kv_a 15.1M replicated + q_b 18.9M + kv_b 8.4M + o 58.7M)
-        x 61 layers x 2 bytes = 11.49 GiB (matches the vLLM load ledger)."""
-        model_config = config.ModelConfig(
-            tp_size=1,
-            pp_size=1,
-            attention_dp_size=4,
-            moe_tp_size=1,
-            moe_ep_size=4,
-            gemm_quant_mode=common.GEMMQuantMode.nvfp4,
-            moe_quant_mode=common.MoEQuantMode.nvfp4,
-            kvcache_quant_mode=common.KVCacheQuantMode.fp8,
-            fmha_quant_mode=common.FMHAQuantMode.bfloat16,
-        )
-        model = models.get_model("nvidia/Kimi-K2.5-NVFP4", model_config, backend_name="vllm")
-        for op in model.context_ops:
-            if getattr(op, "_name", "") == "context_mla_block":
-                assert op.get_weights() / (1 << 30) == pytest.approx(11.49, abs=0.05)
-                return
-        raise AssertionError("context_mla_block not found")
 
 
 class TestDSV32NVFP4AttentionExclusion:
@@ -2016,7 +1884,12 @@ class TestAttentionProjectionExclusions:
     @pytest.mark.parametrize("backend", ["vllm", "sglang", "trtllm"])
     @pytest.mark.parametrize("phase", ["context", "generation"])
     @pytest.mark.parametrize(
-        "model_path", ["zai-org/GLM-5-FP8", "zai-org/GLM-5.1-FP8", "zai-org/GLM-5.2-FP8", "zai-org/GLM-5.3"]
+        "model_path",
+        [
+            "zai-org/GLM-5-FP8",
+            "zai-org/GLM-5.1-FP8",
+            "zai-org/GLM-5.2-FP8",
+        ],
     )
     def test_native_glm_fp8_checkpoint_prices_block_fp8_projections(self, model_path, backend, phase):
         # quant_method fp8 with weight_block_size [128, 128]: without an
@@ -2071,131 +1944,6 @@ class TestBundledModelConfigsOffline:
         cfg = sdk_utils.get_model_config_from_model_path("nvidia/DeepSeek-V3.2-NVFP4")
         raw = cfg["raw_config"]
         assert raw.get("hf_quant_config"), "bundled hf_quant_config not attached"
-        sdk_utils._load_model_config_from_model_path.cache_clear()
-
-    def test_minimax_m3_nvfp4_bundle_resolves_mixed_precision_modes(self, monkeypatch):
-        """nvidia/MiniMax-M3-NVFP4 end-to-end: bundled MIXED_PRECISION metadata
-        resolves gemm=fp8_block (MXFP8 approximation, owner decision 2026-08-09),
-        moe=nvfp4 (routed experts), kv=bfloat16 (kv_cache_quant_algo null)."""
-        import aisim.sdk.utils as sdk_utils
-
-        def _no_network(*a, **k):
-            raise AssertionError("network path reached")
-
-        monkeypatch.setattr(sdk_utils, "_download_hf_config", _no_network, raising=False)
-        sdk_utils._load_model_config_from_model_path.cache_clear()
-
-        cfg = sdk_utils.get_model_config_from_model_path("nvidia/MiniMax-M3-NVFP4")
-        raw = cfg["raw_config"]
-        # The bundled NVFP4 config is the raw hub (VL-wrapper) form since
-        # upstream 90f7fc0f; the parser keeps the top-level architecture and
-        # unwraps the text fields.
-        assert cfg["architecture"] == "MiniMaxM3SparseForConditionalGeneration"
-        assert raw["quant_algo"] == "mixed_precision"
-        assert raw.get("kv_cache_quant_algo") is None
-
-        model_config = config.ModelConfig(tp_size=1, attention_dp_size=1, moe_tp_size=1, moe_ep_size=1)
-        model = get_model("nvidia/MiniMax-M3-NVFP4", model_config, backend_name="trtllm")
-
-        assert model.model_family == "MINIMAXM3"
-        assert model_config.gemm_quant_mode == common.GEMMQuantMode.fp8_block
-        assert model_config.moe_quant_mode == common.MoEQuantMode.nvfp4
-        assert model_config.kvcache_quant_mode == common.KVCacheQuantMode.bfloat16
-        assert model_config.fmha_quant_mode == common.FMHAQuantMode.bfloat16
-
-    @pytest.mark.parametrize(
-        "model_path,gemm,moe,kv",
-        [
-            # Z.AI publishes the FP8-block release under the plain name and the
-            # BF16 weights under the -BF16 suffix (GLM-5.2 used the reverse
-            # convention, and no zai-org/GLM-5.3-FP8 repository exists). The
-            # NVIDIA ModelOpt MIXED_PRECISION export lists FP8 dense layers 0-2
-            # and NVFP4 routed experts; its per-module modes are pinned in
-            # test_modelopt_mixed_precision_targets.py.
-            # The FP8 checkpoint declares no KV scheme; its fp8 KV mode is the
-            # backend default for fp8_block, not a checkpoint fact, so it is
-            # not asserted here.
-            ("zai-org/GLM-5.3", "fp8_block", "fp8_block", None),
-            ("zai-org/GLM-5.3-BF16", "bfloat16", "bfloat16", "bfloat16"),
-            ("nvidia/GLM-5.3-NVFP4", "fp8_static", "nvfp4", "fp8"),
-        ],
-    )
-    def test_glm53_bundles_resolve_checkpoint_quant_modes(self, monkeypatch, model_path, gemm, moe, kv):
-        """The GLM-5.3 bundles must be the real checkpoint configs, not GLM-5.2 copies."""
-        import aisim.sdk.utils as sdk_utils
-
-        def _no_network(*a, **k):
-            raise AssertionError("network path reached")
-
-        monkeypatch.setattr(sdk_utils, "_download_hf_config", _no_network, raising=False)
-        sdk_utils.get_model_config_from_model_path.cache_clear()
-        sdk_utils._load_model_config_from_model_path.cache_clear()
-        try:
-            cfg = sdk_utils.get_model_config_from_model_path(model_path)
-            assert cfg["architecture"] == "GlmMoeDsaForCausalLM"
-            model_config = config.ModelConfig(tp_size=8, moe_tp_size=1, moe_ep_size=8)
-            get_model(model_path, model_config, backend_name="sglang")
-        finally:
-            sdk_utils.get_model_config_from_model_path.cache_clear()
-            sdk_utils._load_model_config_from_model_path.cache_clear()
-
-        assert model_config.gemm_quant_mode == common.GEMMQuantMode[gemm]
-        assert model_config.moe_quant_mode == common.MoEQuantMode[moe]
-        if kv is not None:
-            assert model_config.kvcache_quant_mode == common.KVCacheQuantMode[kv]
-
-    def test_glm53_registered_identifiers_match_the_published_repositories(self):
-        assert "zai-org/GLM-5.3-BF16" in common.DefaultHFModels
-        assert "zai-org/GLM-5.3-FP8" not in common.DefaultHFModels
-
-    def test_qwen38max_loads_from_bundle_with_gdn_and_moe_fields(self, monkeypatch):
-        import aisim.sdk.utils as sdk_utils
-
-        def _no_network(*a, **k):
-            raise AssertionError("network path reached")
-
-        monkeypatch.setattr(sdk_utils, "_download_hf_config", _no_network, raising=False)
-        sdk_utils.get_model_config_from_model_path.cache_clear()
-        sdk_utils._load_model_config_from_model_path.cache_clear()
-        cfg = sdk_utils.get_model_config_from_model_path("Qwen/Qwen3.8-2.4T-A95B")
-        assert cfg["architecture"] == "Qwen3_5MoeForCausalLM"
-        assert cfg["n"] == 64
-        assert cfg["n_kv"] == 4
-        assert cfg["d"] == 256
-        assert cfg["vocab"] == 248320
-        extra = cfg["extra_params"]
-        assert (
-            extra.linear_num_key_heads,
-            extra.linear_key_head_dim,
-            extra.linear_num_value_heads,
-            extra.linear_value_head_dim,
-            extra.linear_conv_kernel_dim,
-        ) == (16, 128, 128, 128, 4)
-        assert (extra.num_experts, extra.topk, extra.moe_inter_size, extra.shared_expert_inter_size) == (
-            512,
-            10,
-            2048,
-            2048,
-        )
-        assert extra.layer_types.count("full_attention") == 23
-        assert extra.layer_types.count("linear_attention") == 69
-        sdk_utils.get_model_config_from_model_path.cache_clear()
-        sdk_utils._load_model_config_from_model_path.cache_clear()
-
-    def test_qwen38max_fp8_loads_from_bundle(self, monkeypatch):
-        import aisim.sdk.utils as sdk_utils
-
-        def _no_network(*a, **k):
-            raise AssertionError("network path reached")
-
-        monkeypatch.setattr(sdk_utils, "_download_hf_config", _no_network, raising=False)
-        sdk_utils.get_model_config_from_model_path.cache_clear()
-        sdk_utils._load_model_config_from_model_path.cache_clear()
-        cfg = sdk_utils.get_model_config_from_model_path("Qwen/Qwen3.8-2.4T-A95B-FP8")
-        quant_cfg = cfg["raw_config"]["quantization_config"]
-        assert quant_cfg["quant_method"] == "fp8"
-        assert quant_cfg["weight_block_size"] == [128, 128]
-        sdk_utils.get_model_config_from_model_path.cache_clear()
         sdk_utils._load_model_config_from_model_path.cache_clear()
 
 

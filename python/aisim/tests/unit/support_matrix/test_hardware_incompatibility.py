@@ -49,17 +49,6 @@ def test_fp8_model_is_allowed_when_system_advertises_fp8_support():
     assert incompatibility is None
 
 
-def test_fp8_model_is_allowed_for_b60_software_fallback_without_native_fp8_flops():
-    incompatibility = get_hardware_incompatibility(
-        model="nvidia/Llama-3.1-70B-Instruct-FP8",
-        system="b60",
-        backend="vllm",
-        system_spec={"gpu": {"bfloat16_tc_flops": 1}},
-    )
-
-    assert incompatibility is None
-
-
 def test_fp4_model_is_hardware_incompatible_without_fp4_support():
     incompatibility = get_hardware_incompatibility(
         model="nvidia/Qwen3-235B-A22B-NVFP4",
@@ -158,24 +147,6 @@ def test_run_single_test_propagates_hardware_preflight_failures(monkeypatch):
             "Unsupported gemm quant mode 'fp8_block' for system='rtx_pro_6000_server'",
         ),
         (
-            "nvidia/Kimi-K2.5-NVFP4",
-            "sglang",
-            "0.5.10",
-            "Unsupported moe quant mode 'nvfp4' for system='rtx_pro_6000_server'",
-        ),
-        (
-            "MiniMaxAI/MiniMax-M2.5",
-            "trtllm",
-            "1.3.0rc10",
-            "Unsupported moe quant mode 'fp8_block' for system='rtx_pro_6000_server'",
-        ),
-        (
-            "moonshotai/Kimi-K2.5",
-            "trtllm",
-            "1.3.0rc10",
-            "Unsupported moe quant mode 'int4_wo' for system='rtx_pro_6000_server'",
-        ),
-        (
             "deepseek-ai/DeepSeek-V4-Flash",
             "trtllm",
             "1.3.0rc10",
@@ -199,12 +170,6 @@ def test_run_single_test_propagates_hardware_preflight_failures(monkeypatch):
             "sglang",
             "0.5.14",
             "Failed to query context attention data for b=1, s=128.0, prefix=128.0",
-        ),
-        (
-            "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-            "trtllm",
-            "1.3.0rc20",
-            "Failed to query moe data for num_tokens=128.0, hidden_size=5120",
         ),
     ],
 )

@@ -26,7 +26,6 @@ pytestmark = pytest.mark.unit
     "model_path,layers,full_layers",
     [
         ("nvidia/GLM-5.2-NVFP4", 78, 21),
-        ("nvidia/GLM-5.3-NVFP4", 78, 21),
         ("deepseek-ai/DeepSeek-V3.2", 61, 61),
         ("nvidia/GLM-5-NVFP4", 78, 78),
     ],

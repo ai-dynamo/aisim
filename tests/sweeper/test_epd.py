@@ -798,15 +798,6 @@ def test_native_catalog_prechecks_memory_on_the_processor_geometry(monkeypatch, 
     assert [runtime.num_images_per_request for runtime in recorded] == images_per_part
 
 
-def test_native_catalog_refuses_other_vision_families_before_the_host_table(tmp_path):
-    search_space = _config().search_space.model_dump() | {
-        "model_name": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-        "encoder": _native_encoder(host_profile={"path": str(tmp_path / "absent.json"), "frontend": "python"}),
-    }
-    with pytest.raises(ValueError, match="native encoder pools price Qwen3-VL vision towers"):
-        resolve_encoder_catalog(_config(search_space=search_space))
-
-
 @pytest.mark.parametrize("modes", [["agg", "disagg"], ["disagg", "agg"], ["agg"]])
 def test_epd_native_search_preserves_available_modes(monkeypatch, caplog, modes):
     from aisim_core.sdk import perf_database
