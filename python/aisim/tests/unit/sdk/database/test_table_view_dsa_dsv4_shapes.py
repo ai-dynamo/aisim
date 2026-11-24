@@ -641,7 +641,10 @@ def test_b300_current_slot_retrieves_pinned_native_k31_sample(phase, monkeypatch
     monkeypatch.delenv("AIC_ALLOW_UNLISTED_VERSIONS", raising=False)
     root = Path(default_systems_path())
     source = root / "data/b300_sxm/sparse_attention/sglang/0.0.0.dev1+g41208373c.d20261104"
-    rows = pq.read_table(source / f"dsa_{phase}_module_perf.parquet").to_pylist()
+    sample = source / f"dsa_{phase}_module_perf.parquet"
+    if not sample.is_file():
+        pytest.skip(f"Native K3.1 sample for SGLang {source.name} is unavailable: {sample}")
+    rows = pq.read_table(sample).to_pylist()
     row = next(r for r in rows if r["batch_size"] == 1 and r["tp_size"] == 4)
     db = get_database(
         "b300_sxm", "sglang", "current", systems_paths=str(root), database_mode="SILICON", strict_provenance=True
