@@ -4994,6 +4994,44 @@ mod tests {
         assert!(run.core.is_drained(), "every restore and store completes");
     }
 
+    #[test]
+    fn a_simple_cpu_preemption_moves_the_launch_and_next_decision_after_its_sync() {
+        // Requests 9 and 8 decode sixteen tokens each in the 16-block G1
+        // while restore A (request 3) copies for 120 ms. The pass decided at
+        // 1320 preempts one of them, and SimpleCPU synchronizes the transfers
+        // in flight, until A's copy ends at 1365, before it launches that
+        // pass. The 5 ms decode launch therefore runs from 1365 to 1370, its
+        // forward from 1365 to 1375, and vLLM decides the next pass at 1370.
+        // Launching from the 1320 decision instead set the next decision at
+        // 1330, before the synchronization had ended, so a restore issued by
+        // the next pass could be timed as copying before it could start.
+        let mut run = PollRun::storing(
+            G2Connector::SimpleCpuV032,
+            120.0,
+            false,
+            Some(PollRun::LAUNCH),
+            &[(1, 0..22)],
+        );
+        run.submit(9, (900..912).collect(), 16);
+        run.submit(8, (800..812).collect(), 16);
+        run.step();
+        run.step();
+        run.submit(3, (0..22).collect(), 2);
+        for _ in 0..64 {
+            if run.core.is_empty() && !run.core.is_ready() {
+                break;
+            }
+            run.step();
+        }
+        let synchronized = run
+            .passes
+            .iter()
+            .find(|pass| pass.end_ms == 1375.0)
+            .expect("the preempting pass's forward waits for the synchronization");
+        assert_eq!(synchronized.previous_returned_ms, Some(1370.0));
+        assert!(run.core.is_drained(), "every restore and store completes");
+    }
+
     /// The pass that admitted `id`, if any.
     fn admitted_in(run: &PollRun, id: u128) -> Option<usize> {
         let uuid = Uuid::from_u128(id);

@@ -2935,10 +2935,16 @@ impl VllmCore {
             } else {
                 pass.now_ms
             };
+            // A SimpleCPU preemption synchronizes the transfers in flight
+            // before vLLM launches the pass, so the launch, its post-forward
+            // poll and the next decision all follow that synchronization.
+            let launch_start_ms = pass
+                .launch_sync_ms
+                .map_or(decision_ms, |sync_ms| decision_ms.max(sync_ms));
             let launch_end_ms = self.launch_end_ms(
                 &launch,
                 pass.launch_shape,
-                decision_ms,
+                launch_start_ms,
                 pass.compute_start_ms,
                 end_ms,
             );
@@ -2950,16 +2956,11 @@ impl VllmCore {
             } else {
                 launch_end_ms.max(pass.now_ms)
             };
-            // A SimpleCPU preemption flush runs before the launch, so the
-            // poll at its end sees every transfer the flush waited for.
-            let poll_ms = pass
-                .launch_sync_ms
-                .map_or(launch_end_ms, |sync_ms| launch_end_ms.max(sync_ms));
             self.advance_load_poll(
                 pass.poll_index,
                 pass.now_ms,
                 decision_ms,
-                poll_ms,
+                launch_end_ms,
                 gpu_end_ms,
                 pass.launch_shape.is_none() && !pass.previous_in_flight,
             );
