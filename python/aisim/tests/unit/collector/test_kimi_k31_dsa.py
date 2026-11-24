@@ -364,8 +364,8 @@ def test_standalone_bounds_rank_join_and_publishes_only_success(tmp_path, monkey
         code = (
             "import subprocess, sys\nfrom pathlib import Path\n"
             "import collector.sglang.collect_kimi_k31_dsa_v1 as module\n"
-            "def ranks(args, case, tp):\n"
-            "    assert tp == 2 and args.phase == 'context'\n"
+            "def ranks(args, case, tp, local_size):\n"
+            "    assert tp == local_size == 2 and args.phase == 'context'\n"
             "    assert args.device == 'cuda:1' and args.sm == 103\n"
             f"    assert Path(args.output) != Path({str(output)!r})\n"
             "    with Path(args.output).open('a') as stream: stream.write('new row\\n')\n"
