@@ -336,6 +336,7 @@ def _collect_selected_cases(
                 perf_filename=str(filename) if native else filename,
                 limit=None,
                 cases=[task_info["params"] for task_info in batch],
+                **({"expected_sm": sm_version} if native else {}),
             )
             if not isinstance(result, dict) or "failed" not in result:
                 raise RuntimeError(f"{full_name} runner must return a result containing its failed case list")

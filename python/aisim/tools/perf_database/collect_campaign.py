@@ -53,7 +53,7 @@ import shlex
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import yaml
@@ -387,7 +387,7 @@ def _validate_shard_allocation(plan: Plan, shard: Shard) -> None:
 
 
 def run_campaign(
-    plan: Plan, *, plan_path: Path, root: Path, gpus: list[int], checkout: Path, image_override: str | None, mode: str
+    plan: Plan, *, root: Path, gpus: list[int], checkout: Path, image_override: str | None, mode: str
 ) -> int:
     """GPU pool over the plan. mode=run: skip DONE shards; mode=finalize: only done-no-parquet shards."""
     root.mkdir(parents=True, exist_ok=True)
@@ -425,14 +425,16 @@ def run_campaign(
                 sys.executable,
                 __file__,
                 "_shard",
-                "--plan",
-                str(plan_path),
+                "--backend",
+                plan.backend,
+                "--sm",
+                str(plan.sm),
                 "--root",
                 str(root),
                 "--gpu",
                 str(g),
                 "--shard",
-                s.key,
+                json.dumps(asdict(s)),
                 "--checkout",
                 str(checkout),
                 "--image",
@@ -480,7 +482,9 @@ def main() -> int:
             p.add_argument("--checkout", type=Path, default=PKG_ROOT, help="python/aisim checkout to mount")
             p.add_argument("--image", default=None, help="override the manifest-derived collect image (A/B only)")
     h = sub.add_parser("_shard")  # internal: one shard in one container (spawned by run/finalize)
-    for flag in ("--plan", "--root", "--checkout"):
+    h.add_argument("--backend", required=True)
+    h.add_argument("--sm", required=True, type=int)
+    for flag in ("--root", "--checkout"):
         h.add_argument(flag, required=True, type=Path)
     h.add_argument("--gpu", required=True, type=int)
     h.add_argument("--shard", required=True)
@@ -489,8 +493,8 @@ def main() -> int:
     h.add_argument("--mode", required=True)
     args = ap.parse_args()
     if args.cmd == "_shard":
-        plan = load_plan(args.plan)
-        shard = next(s for s in plan.shards if s.key == args.shard)
+        shard = Shard(**json.loads(args.shard))
+        plan = Plan(backend=args.backend, sm=args.sm, shards=(shard,))
         return run_shard(
             plan,
             shard,
@@ -515,7 +519,6 @@ def main() -> int:
     gpus = [int(x) for x in args.gpus.split(",") if x.strip()]
     return run_campaign(
         plan,
-        plan_path=args.plan.resolve(),
         root=args.root.resolve(),
         gpus=gpus,
         checkout=args.checkout.resolve(),

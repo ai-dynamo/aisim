@@ -619,7 +619,7 @@ def estimate_kv_bytes_per_token(
     raw_config = (
         NaiveKVCacheEstimator._load_config(model_name, allow_hf_config_download=True)
         if Path(model_name).is_dir()
-        else _load_model_config_from_model_path(model_name)
+        else _load_model_config_from_model_path(model_name, include_processor=False)
     )
     if raw_config is None:
         raise ValueError(f"could not load checkpoint geometry for model {model_name!r}")
