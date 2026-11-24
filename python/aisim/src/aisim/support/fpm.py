@@ -353,7 +353,7 @@ def run_fpm(
                         "full collection requires usable prefill and decode readiness for this exact runtime/launch; "
                         "inspect --check-readiness and run --smoke --execute first"
                     )
-            if not recovery_only:
+            if not recovery_only and resolved[1].get("K8sConfig", {}).get("extra_env"):
                 from collector.fpm_forward.config import resolve_archived_generator_overrides
 
                 environment = {
