@@ -1,8 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import re
+import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -161,3 +164,105 @@ def test_advertised_default_worlds_expand_to_at_least_one_case(monkeypatch):
 
     for world in _default_gpu_list(SUBMIT_TRTLLM_ALLTOALL):
         assert ata.get_default_test_cases(world), f"trtllm alltoall default world {world} expanded to zero cases"
+
+
+def _run_collect_comm_with_fake_tools(
+    tmp_path: Path,
+    cuda_visible_devices: str | None,
+    *,
+    cuda_device_count: int = 0,
+    cuda_query_fails: bool = False,
+    expected_returncode: int = 0,
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    """Run collect_comm.sh with fake device counts and a recording torchrun."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "torchrun_calls.txt"
+    (bin_dir / "nvidia-smi").write_text("#!/bin/bash\nfor i in $(seq 8); do echo 'NVIDIA B300'; done\n")
+    (bin_dir / "torchrun").write_text(f'#!/bin/bash\necho "$1" >> "{calls}"\n')
+    for tool in bin_dir.iterdir():
+        tool.chmod(0o755)
+    (bin_dir / "python3").symlink_to(sys.executable)
+    query_body = "raise RuntimeError('CUDA count query failed')" if cuda_query_fails else f"return {cuda_device_count}"
+    (tmp_path / "torch.py").write_text(
+        f"from types import SimpleNamespace\ndef device_count():\n    {query_body}\n"
+        "cuda = SimpleNamespace(device_count=device_count)\n"
+    )
+
+    # Keep the active interpreter's runtime paths (for example LD_LIBRARY_PATH).
+    env = {**os.environ, "PATH": f"{bin_dir}:/usr/bin:/bin", "PYTHONPATH": str(tmp_path)}
+    env.pop("CUDA_VISIBLE_DEVICES", None)
+    if cuda_visible_devices is not None:
+        env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
+    result = subprocess.run(
+        ["bash", str(NETWORK_ROOT / "collect_comm.sh"), "--skip-nccl", "--all_reduce_backend", "vllm"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == expected_returncode, result.stdout + result.stderr
+    return result, calls.read_text().split() if calls.exists() else []
+
+
+def test_collect_comm_counts_all_gpus_without_cuda_visible_devices(tmp_path, monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "6")
+    result, calls = _run_collect_comm_with_fake_tools(tmp_path, None)
+    # BSD wc pads its count with spaces.
+    assert re.search(r"Found\s+8 GPUs\.", result.stdout)
+    assert calls == ["--nproc_per_node=2", "--nproc_per_node=4", "--nproc_per_node=8"]
+
+
+def test_collect_comm_honors_cuda_visible_devices(tmp_path):
+    # nvidia-smi lists every GPU on the node regardless of CUDA_VISIBLE_DEVICES;
+    # on a node shared with other jobs the collector must stay on its own GPUs.
+    result, calls = _run_collect_comm_with_fake_tools(tmp_path, "4,5,6,7", cuda_device_count=4)
+    assert re.search(r"Found\s+4 GPUs\.", result.stdout)
+    assert calls == ["--nproc_per_node=2", "--nproc_per_node=4"]
+
+
+def test_collect_comm_uses_effective_cuda_device_count(tmp_path):
+    # An invalid ordinal stops CUDA enumeration before later mask entries.
+    result, calls = _run_collect_comm_with_fake_tools(tmp_path, "0,1,-1,2", cuda_device_count=2)
+    assert re.search(r"Found\s+2 GPUs\.", result.stdout)
+    assert calls == ["--nproc_per_node=2"]
+
+
+def test_collect_comm_preserves_python_runtime_environment(tmp_path, monkeypatch):
+    # setup-python's shared interpreter needs LD_LIBRARY_PATH on ARM64 CI.
+    # Model that requirement even when the local interpreter has an rpath.
+    runtime_library_path = os.pathsep.join(
+        filter(None, (str(tmp_path / "python-lib"), os.environ.get("LD_LIBRARY_PATH")))
+    )
+    launcher = tmp_path / "python-with-runtime-env"
+    launcher.write_text(
+        f'#!/bin/bash\nif [[ "${{LD_LIBRARY_PATH:-}}" != {shlex.quote(runtime_library_path)} ]]; then\n'
+        "    echo 'Missing Python runtime library path' >&2\n"
+        "    exit 127\n"
+        "fi\n"
+        f'exec {shlex.quote(sys.executable)} "$@"\n'
+    )
+    launcher.chmod(0o755)
+    monkeypatch.setenv("LD_LIBRARY_PATH", runtime_library_path)
+    monkeypatch.setattr(sys, "executable", str(launcher))
+
+    result, calls = _run_collect_comm_with_fake_tools(tmp_path, "0,1", cuda_device_count=2)
+
+    assert re.search(r"Found\s+2 GPUs\.", result.stdout)
+    assert calls == ["--nproc_per_node=2"]
+
+
+@pytest.mark.parametrize(("cuda_visible_devices", "cuda_device_count"), [("", 0), ("6", 1)])
+def test_collect_comm_rejects_fewer_than_two_visible_gpus(tmp_path, cuda_visible_devices, cuda_device_count):
+    result, calls = _run_collect_comm_with_fake_tools(
+        tmp_path, cuda_visible_devices, cuda_device_count=cuda_device_count, expected_returncode=1
+    )
+    assert re.search(rf"Found\s+{cuda_device_count} GPUs\.", result.stdout)
+    assert "Error: single GPU detected." in result.stdout
+    assert calls == []
+
+
+def test_collect_comm_aborts_when_cuda_count_query_fails(tmp_path):
+    result, calls = _run_collect_comm_with_fake_tools(tmp_path, "4,5,6,7", cuda_query_fails=True, expected_returncode=1)
+    assert "RuntimeError: CUDA count query failed" in result.stderr
+    assert not re.search(r"Found\s+.* GPUs\.", result.stdout)
+    assert calls == []
