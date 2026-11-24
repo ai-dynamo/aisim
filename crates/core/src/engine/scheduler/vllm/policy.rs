@@ -18,7 +18,9 @@
 //! headroom are implementation details of those hooks, not separate schedulers.
 
 use crate::engine::common::protocols::{PrefillCost, SchedulingPolicy, WorkerType};
-use crate::engine::kv_manager::{AllocationRequirement, DestinationReservationMode, G1Manager};
+use crate::engine::kv_manager::{
+    AllocationRequirement, DestinationReservationMode, G1Manager, PrefillBudget,
+};
 #[cfg(test)]
 use crate::engine::kv_manager::{apply_mtp_prefix_recompute, apply_prefix_recompute};
 use crate::engine::scheduler::vllm::request::RequestKvState;
@@ -111,7 +113,7 @@ pub(super) trait PolicySequence {
         kv_manager: &G1Manager,
         cost: &PrefillCost,
         reserved_blocks: usize,
-        prefill_token_budget: usize,
+        prefill_token_budget: PrefillBudget,
     ) -> AllocationRequirement;
 }
 
@@ -153,11 +155,11 @@ impl PolicySequence for RequestKvState {
         kv_manager: &G1Manager,
         cost: &PrefillCost,
         reserved_blocks: usize,
-        prefill_token_budget: usize,
+        prefill_token_budget: PrefillBudget,
     ) -> AllocationRequirement {
         kv_manager.admission_requirement(
             &self.lease,
-            self.len(),
+            &self.sequence,
             cost,
             reserved_blocks,
             prefill_token_budget,
@@ -261,7 +263,7 @@ pub(super) struct WaitingAdmissionConfig {
     pub(super) num_gpu_blocks: usize,
     pub(super) block_size: usize,
     pub(super) mtp_enabled: bool,
-    pub(super) prefill_token_budget: usize,
+    pub(super) prefill_token_budget: PrefillBudget,
 }
 
 #[derive(Debug, Clone, Copy)]

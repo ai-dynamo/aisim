@@ -31,7 +31,9 @@ use super::vllm_backend::{
 pub(crate) use super::vllm_backend::{
     NativeAllocation, SourceReleaseOrder, SourceReuseDependency, StateHandoff,
 };
-use super::{AllocationRequirement, DestinationReservationMode, G1Acquire, GroupedKvPool};
+use super::{
+    AllocationRequirement, DestinationReservationMode, G1Acquire, GroupedKvPool, PrefillBudget,
+};
 
 fn into_g1_acquire<T>(outcome: VllmAcquire<T>) -> G1Acquire<T> {
     match outcome {
@@ -205,14 +207,14 @@ impl G1Manager {
     pub(crate) fn admission_requirement(
         &self,
         lease: &BlockRequestLease,
-        known_tokens: usize,
+        sequence: &RequestSequence,
         cost: &PrefillCost,
         reserved_blocks: usize,
-        prefill_token_budget: usize,
+        prefill_token_budget: PrefillBudget,
     ) -> AllocationRequirement {
         self.inner.admission_requirement(
             lease,
-            known_tokens,
+            sequence,
             cost,
             reserved_blocks,
             prefill_token_budget,

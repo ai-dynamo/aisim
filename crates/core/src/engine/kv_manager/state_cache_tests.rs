@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project.
 // Tests of a modified Rust simulation of the vLLM v0.29.0
-// (98dff2a81d747d1dba01a47f939f48c3526d4206) align-mode state cache.
+// (98dff2a81d747d1dba01a47f939f48c3526d4206) align-mode state cache and
+// 43b4aaea3e40e20ef53ce2bfecfa1b72060bf2b5 internal prefill checkpoints.
 // Immutable sources and license: THIRD_PARTY_NOTICES.md.
 
 //! Acceptance cases for the manual G1 token/state capacity model.
@@ -1342,6 +1343,128 @@ fn kda_exact_full_prompt_requires_an_actually_executed_replay_boundary() {
 }
 
 #[test]
+fn checkpoint_admission_matches_stepped_chunks_at_prefill_and_resume_boundaries() {
+    let mut manager = manager(64, 4, 1, true);
+    manager.configure_prefix_match_unit(Some(4));
+    manager.state_cache.as_mut().unwrap().prefill_checkpoint = true;
+    // Compare the constant-time admission projection with the actual sequence
+    // of scheduled chunks, including a smaller first-pass budget and junctions.
+    for drop in [false, true] {
+        manager.state_cache.as_mut().unwrap().speculative_blocks = usize::from(drop);
+        manager.state_cache.as_mut().unwrap().mtp_enabled = drop;
+        for prompt in [1, 4, 5, 8, 9, 12, 13] {
+            for known in [prompt, prompt + 1, prompt + 4, prompt + 8] {
+                for start in (0..known).step_by(4) {
+                    for junction in [None, Some(4), Some(8), Some(12)] {
+                        for total in [1, 3, 4, 5, 7, 8, 12] {
+                            for remaining in [1, total / 2 + 1, total] {
+                                let plan = StatePrefillConfig {
+                                    block_size: 4,
+                                    unit: 4,
+                                    token_budget: total,
+                                    prefill_checkpoint: true,
+                                    speculative_drop: drop,
+                                };
+                                let mut position = start;
+                                let mut budget = remaining;
+                                let mut checkpoint_end = None;
+                                while position < known {
+                                    let (tokens, exported) = plan.plan(
+                                        position,
+                                        prompt,
+                                        known,
+                                        (known - position).min(budget),
+                                        junction,
+                                    );
+                                    if exported.is_some() {
+                                        checkpoint_end = Some(position + tokens);
+                                    }
+                                    assert!(tokens > 0 || budget < total);
+                                    position += tokens;
+                                    budget = total;
+                                }
+                                assert_eq!(
+                                    manager.admission_checkpoint_end(
+                                        start,
+                                        prompt,
+                                        known,
+                                        junction,
+                                        PrefillBudget { total, remaining },
+                                    ),
+                                    checkpoint_end,
+                                    "prompt={prompt} known={known} start={start} junction={junction:?} total={total} remaining={remaining} drop={drop}",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn resumed_admission_reserves_the_first_prefill_checkpoint() {
+    for capacity in [8, 9, 10] {
+        let mut manager = manager(capacity, 64, 2, true);
+        manager.configure_prefix_match_unit(Some(64));
+        manager.state_cache.as_mut().unwrap().prefill_checkpoint = true;
+        let owner = Uuid::from_u128(920);
+        let (mut sequence, mut lease) = request(owner, 65, 64, true, 129);
+        let mut computed = 0;
+        // Build a real decode history, then preempt it at 193 known tokens.
+        for end in [64, 65] {
+            allocated(manager.allocate_lease(owner, &mut lease, end, 0));
+            manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, computed, end);
+            manager.begin_step();
+            computed = end;
+        }
+        while sequence.len() < 193 {
+            let end = sequence.len();
+            allocated(manager.allocate_lease(owner, &mut lease, end, 0));
+            manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, computed, end);
+            manager.begin_step();
+            computed = end;
+            let (_, opened_partial) = sequence.generate_token();
+            if opened_partial {
+                lease.append_partial();
+            }
+        }
+        manager.preempt_lease(owner, &mut lease);
+        clear_reclaimable_and_assert_empty(&mut manager);
+
+        // Model intervening cache pressure followed by a sibling that leaves
+        // only the first 64 tokens and their state reusable.
+        let parent = Uuid::from_u128(921);
+        let (mut seed, mut seed_lease) = request(parent, 65, 64, true, 0);
+        allocated(manager.allocate_lease(parent, &mut seed_lease, 64, 0));
+        manager.finalize_lease_computed_prefix(parent, &mut seed, &mut seed_lease, 0, 64);
+        manager.finish_lease(parent, seed_lease);
+        manager.begin_step();
+        let cost = manager.get_lease_prefill_cost(&sequence, &lease);
+        assert_eq!(cost.cached_tokens, 64);
+        // [64,192) reaches max(prompt,known-1) and exports checkpoint 128.
+        let requirement = manager.admission_requirement(&lease, &sequence, &cost, 0, 128.into());
+        if capacity == 8 {
+            assert_eq!(requirement, AllocationRequirement::Impossible);
+            assert_eq!(lease.allocated_tokens(), 0);
+        } else {
+            assert_eq!(requirement, AllocationRequirement::Blocks(9));
+            lease.set_prefill_checkpoint(Some(128));
+            allocated(manager.allocate_lease(owner, &mut lease, 192, 1));
+            assert_eq!(manager.num_active_blocks(), 9);
+            manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 64, 192);
+            manager.begin_step();
+            lease.set_prefill_checkpoint(None);
+            allocated(manager.allocate_lease(owner, &mut lease, 193, 0));
+            manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 192, 193);
+        }
+        manager.finish_lease(owner, lease);
+        clear_reclaimable_and_assert_empty(&mut manager);
+    }
+}
+
+#[test]
 fn kda_partial_restore_accounts_for_source_page_and_private_copy_atomically() {
     let mut manager = manager(5, 6, 1, true);
     manager.configure_prefix_match_unit(Some(2));
@@ -1360,7 +1483,7 @@ fn kda_partial_restore_accounts_for_source_page_and_private_copy_atomically() {
     let cost = manager.get_lease_prefill_cost(&query, &reader);
     assert_eq!(cost.cached_tokens, 16);
     assert_eq!(
-        manager.admission_requirement(&reader, 17, &cost, 0, usize::MAX),
+        manager.admission_requirement(&reader, &query, &cost, 0, usize::MAX.into()),
         AllocationRequirement::Impossible
     );
     let before = (manager.num_active_blocks(), manager.num_inactive_blocks());

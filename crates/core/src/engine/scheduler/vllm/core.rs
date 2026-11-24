@@ -38,7 +38,7 @@ use crate::engine::kv_manager::{
     AdmissionLimits, G1Manager, GroupedKvPool, GroupedPrefixRules, PrefixHashMemo, VllmRuleVersion,
 };
 use crate::engine::kv_manager::{DestinationReservation, G1Acquire, NativeAllocation};
-use crate::engine::kv_manager::{mamba_prefill_checkpoint, state_boundaries};
+use crate::engine::kv_manager::{PrefillBudget, StatePrefillConfig};
 use crate::engine::scheduler::queue_metrics::{QueueStats, QueuedLength};
 use crate::engine::scheduler::vllm::host_offload::{
     CompletedLoad, HostLookup, HostLookupHit, HostTransferProgress, StartLoad, StateKind,
@@ -2099,7 +2099,10 @@ impl VllmCore {
                 &self.kv_manager,
                 cost,
                 0,
-                self.args.max_num_batched_tokens.unwrap_or(usize::MAX),
+                self.args
+                    .max_num_batched_tokens
+                    .unwrap_or(usize::MAX)
+                    .into(),
             ),
             self.kv_manager.decode_requirement(
                 &request.sequence.lease,
@@ -2775,10 +2778,13 @@ impl VllmCore {
                                         num_gpu_blocks: self.args.num_gpu_blocks,
                                         block_size: self.args.block_size,
                                         mtp_enabled: self.eagle_block_drop(),
-                                        prefill_token_budget: self
-                                            .args
-                                            .max_num_batched_tokens
-                                            .unwrap_or(usize::MAX),
+                                        prefill_token_budget: PrefillBudget {
+                                            total: self
+                                                .args
+                                                .max_num_batched_tokens
+                                                .unwrap_or(usize::MAX),
+                                            remaining: token_budget,
+                                        },
                                     },
                                     &request.sequence,
                                     is_fresh,
@@ -3460,15 +3466,6 @@ impl VllmCore {
         self.args.aic_nextn.is_some() && !self.args.disable_eagle_block_drop
     }
 
-    /// Modified simulation of vLLM v0.29.0's align split. Copyright contributors to the vLLM project.
-    /// Source: https://github.com/vllm-project/vllm/blob/98dff2a81d747d1dba01a47f939f48c3526d4206/vllm/v1/core/sched/scheduler.py
-    /// A block-floored shared-prefix `junction`, recorded at admission, also
-    /// stops the chunk, as in that revision. With
-    /// `state_cache.prefill_checkpoint`, a final chunk that exports the prompt's
-    /// last full-block state from inside its forward (Mamba2's internal
-    /// checkpoint at vLLM 43b4aaea3e40e20ef53ce2bfecfa1b72060bf2b5) stops only
-    /// at a junction. Returns the chunk and the checkpoint its pass reserves.
-    /// See THIRD_PARTY_NOTICES.md; Apache-2.0.
     fn align_state_prefill(
         &self,
         start: usize,
@@ -3477,77 +3474,28 @@ impl VllmCore {
         desired: usize,
         junction: Option<usize>,
     ) -> (usize, Option<usize>) {
-        let Some(unit) = self.args.prefix_match_unit else {
+        let Some(unit) = self
+            .args
+            .prefix_match_unit
+            .filter(|_| self.args.enable_prefix_caching)
+        else {
             return (desired, None);
         };
-        let alignment = self.args.block_size;
-        let prefill_end = prompt.max(known.saturating_sub(1));
-        if !self.args.enable_prefix_caching || start >= prefill_end {
-            return (desired, None);
+        StatePrefillConfig {
+            block_size: self.args.block_size,
+            unit,
+            token_budget: self.args.max_num_batched_tokens.unwrap_or(usize::MAX),
+            prefill_checkpoint: self
+                .args
+                .state_cache
+                .is_some_and(|state| state.prefill_checkpoint),
+            speculative_drop: self
+                .args
+                .state_cache
+                .is_some_and(|state| state.num_speculative_states.is_some())
+                && !self.args.disable_eagle_block_drop,
         }
-        let native_mtp = self
-            .args
-            .state_cache
-            .is_some_and(|state| state.num_speculative_states.is_some())
-            && !self.args.disable_eagle_block_drop;
-        let prefill_checkpoint = self
-            .args
-            .state_cache
-            .is_some_and(|state| state.prefill_checkpoint);
-        let mut end = start + desired;
-        // vLLM decides on the unclipped chunk end.
-        let exports_checkpoint = prefill_checkpoint
-            && mamba_prefill_checkpoint(
-                start,
-                end,
-                prefill_end,
-                prefill_end,
-                unit,
-                alignment,
-                native_mtp,
-            )
-            .is_some();
-        if end < prefill_end {
-            let aligned = end / alignment * alignment;
-            // A block larger than the whole step budget must make progress
-            // using private state, then stop at the next reachable boundary.
-            if aligned > start
-                || alignment <= self.args.max_num_batched_tokens.unwrap_or(usize::MAX)
-            {
-                end = aligned;
-            }
-        }
-        // Match the state cache's replay boundary, including prompts that end on a full block.
-        let (last_full, resend_full, tail) = state_boundaries(prompt, alignment, unit, native_mtp);
-        let next = start.checked_add(alignment - start % alignment);
-        let stops = [
-            next.filter(|_| !start.is_multiple_of(alignment)),
-            Some(resend_full),
-            Some(last_full),
-            (last_full < tail && tail < prompt).then_some(tail),
-        ];
-        // A sub-block junction's state is not separately cacheable.
-        let junction = junction
-            .filter(|&junction| start < junction && junction < end)
-            .map(|junction| start + (junction - start) / alignment * alignment);
-        for stop in stops
-            .into_iter()
-            .filter(|_| !exports_checkpoint)
-            .chain([junction])
-            .flatten()
-        {
-            if start < stop && stop < end {
-                end = stop;
-            }
-        }
-        // The pass reserves the checkpoint of the chunk it schedules, keyed on
-        // its end; a junction stop short of the prompt leaves none.
-        let checkpoint = prefill_checkpoint
-            .then(|| {
-                mamba_prefill_checkpoint(start, end, prefill_end, end, unit, alignment, native_mtp)
-            })
-            .flatten();
-        (end.saturating_sub(start), checkpoint)
+        .plan(start, prompt, known, desired, junction)
     }
 
     #[allow(clippy::too_many_arguments)]

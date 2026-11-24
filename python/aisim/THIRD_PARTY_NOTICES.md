@@ -2701,6 +2701,7 @@ The internal prefill checkpoints in repository-root
 `crates/core/src/engine/kv_manager/{state_cache_manager,vllm_backend}.rs` and
 `crates/core/src/engine/scheduler/vllm/core.rs`, the
 `disable_eagle_block_drop` switch, and the tests in
+`crates/core/src/engine/kv_manager/state_cache_tests.rs` and
 `crates/core/src/engine/scheduler/vllm/hybrid_prefix_tests.rs` (which also cover
 the v0.29.0 junction rules above) adapt vLLM at commit
 `43b4aaea3e40e20ef53ce2bfecfa1b72060bf2b5`:
