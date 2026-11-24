@@ -422,7 +422,7 @@ def test_generic_speculation_fixed_capacity_error_identifies_scheme_and_role(rol
 
 
 @pytest.mark.parametrize("mode", ["fpm_interpolation", "fpm_regression"])
-@pytest.mark.parametrize("fallback", ["deny"])
+@pytest.mark.parametrize("fallback", ["allow", "deny"])
 @pytest.mark.parametrize(
     "speculation",
     [
@@ -435,6 +435,7 @@ def test_generic_speculation_fixed_capacity_error_identifies_scheme_and_role(rol
 def test_replay_preserves_canonical_estimator_selection(mode, fallback, speculation):
     raw = _prediction(timing="default")
     raw["engine"].update(
+        model=REPLAY_TARGET,
         estimation_mode=mode,
         fallback_policy=fallback,
         speculation=deepcopy(speculation),
