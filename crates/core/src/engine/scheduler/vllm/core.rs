@@ -823,6 +823,10 @@ struct UnpricedPass {
     previous_in_flight: bool,
     /// Load poll: the index of the decision that formed this pass.
     poll_index: u64,
+    /// Load poll, SimpleCPU: a preemption in this pass synchronizes the
+    /// transfers in flight before vLLM launches it, so its connector poll
+    /// comes no earlier than they end.
+    launch_sync_ms: Option<f64>,
     /// `launch`: the scheduled work the launch cost depends on; `None` when
     /// the pass scheduled nothing or `launch` is unset.
     launch_shape: Option<LaunchShape>,
@@ -2946,11 +2950,16 @@ impl VllmCore {
             } else {
                 launch_end_ms.max(pass.now_ms)
             };
+            // A SimpleCPU preemption flush runs before the launch, so the
+            // poll at its end sees every transfer the flush waited for.
+            let poll_ms = pass
+                .launch_sync_ms
+                .map_or(launch_end_ms, |sync_ms| launch_end_ms.max(sync_ms));
             self.advance_load_poll(
                 pass.poll_index,
                 pass.now_ms,
                 decision_ms,
-                launch_end_ms,
+                poll_ms,
                 gpu_end_ms,
                 pass.launch_shape.is_none() && !pass.previous_in_flight,
             );
@@ -3707,6 +3716,10 @@ impl VllmCore {
             .native_host_offload
             .as_ref()
             .map_or(now_ms, |adapter| adapter.compute_not_before_ms(now_ms));
+        let launch_sync_ms = self
+            .native_host_offload
+            .as_mut()
+            .and_then(VllmHostOffloadAdapter::take_launch_sync_ms);
         // Emit the terminal signals for the requests the gate rejected above
         // (see the gate comment for why this can't be done inline).
         for uuid in rejected_uuids {
@@ -3843,6 +3856,7 @@ impl VllmCore {
             retry_if_instant,
             previous_in_flight,
             poll_index,
+            launch_sync_ms,
             launch_shape,
             result,
         });

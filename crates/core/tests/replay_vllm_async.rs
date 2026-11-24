@@ -656,3 +656,54 @@ fn simple_cpu_copies_from_the_launch_end_and_offloading_from_the_pass_end() {
         (Some(780.0), Some(20))
     );
 }
+
+#[test]
+fn a_simple_cpu_preemption_polls_after_the_transfers_it_synchronizes() {
+    // A 10-block G1 with SimpleCPU copying five blocks in 80 ms. Requests 3
+    // and 5 decode long enough to preempt each other. A (request 4) loads
+    // request 1's prefix from the pass decided at 700, whose launch ends at
+    // 702: SimpleCPU copies from 702 to 782. The pass decided at 740 preempts
+    // a request, so SimpleCPU synchronizes every transfer in flight before it
+    // launches that pass: its forward waits until 782, and its poll, after
+    // the synchronization, sees A's copy. A is schedulable two decisions
+    // later, in the pass formed at 802. Polling at that pass's launch end
+    // without the synchronization, 742, misses the copy until the poll at
+    // 812, and A would wait until 822.
+    let mut config = polled_cpu_tier(10, 320.0 / (80.0 * 1e6));
+    config.native_host_offload = config
+        .native_host_offload
+        .map(|host| host.with_connector(G2Connector::SimpleCpuV032));
+    let report = run_tokens(
+        config,
+        vec![
+            tokens_request(1, (0..20).collect(), 1, 0.0),
+            tokens_request(2, (500..536).collect(), 1, 300.0),
+            tokens_request(3, (900..904).collect(), 24, 600.0),
+            tokens_request(5, (1900..1904).collect(), 24, 600.0),
+            tokens_request(4, (0..24).collect(), 2, 625.0),
+        ],
+    );
+    let restored = record(&report, 4);
+    assert_eq!(
+        (
+            restored.first_admit_ms,
+            restored.first_admission_host_reused_input_tokens
+        ),
+        (Some(802.0), Some(20))
+    );
+    assert!(
+        report
+            .per_request
+            .iter()
+            .map(|request| request.readmission_count)
+            .sum::<usize>()
+            > 0,
+        "the run preempts"
+    );
+    assert!(
+        report
+            .per_request
+            .iter()
+            .all(|request| request.output_length == request.requested_output_length)
+    );
+}

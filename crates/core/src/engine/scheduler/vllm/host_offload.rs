@@ -491,6 +491,10 @@ pub(super) struct VllmHostOffloadAdapter {
     /// Bumped whenever `load_by_key` changes.
     load_keys_epoch: u64,
     compute_not_before_ms: f64,
+    /// SimpleCPU: the end of the transfers a preemption in the pass being
+    /// formed synchronizes before vLLM launches that pass. Taken when the
+    /// pass forms; see [`Self::take_launch_sync_ms`].
+    launch_sync_ms: Option<f64>,
     /// Load poll: a completed load keeps its keys in `load_by_key` until the
     /// scheduler releases it, as vLLM keeps them loading until it has seen
     /// the copy finish. The tier still unpins the load's G2 sources when the
@@ -591,6 +595,7 @@ impl VllmHostOffloadAdapter {
             load_by_key: FxHashMap::default(),
             load_keys_epoch: 0,
             compute_not_before_ms: 0.0,
+            launch_sync_ms: None,
             hold_load_keys: false,
             fences_at_submit: Vec::new(),
             observer: None,
@@ -1635,7 +1640,14 @@ impl VllmHostOffloadAdapter {
         let deadline = {
             let tier = self.host.read();
             if self.rules.preemption_waits_for_all {
-                tier.last_deadline(self.host.id())
+                let deadline = tier.last_deadline(self.host.id());
+                // The worker synchronizes before it launches the pass, so
+                // that pass's connector poll comes after these transfers.
+                if let Some(deadline) = deadline {
+                    self.launch_sync_ms =
+                        Some(self.launch_sync_ms.map_or(deadline, |at| at.max(deadline)));
+                }
+                deadline
             } else {
                 let store = request.latest_store;
                 let deadline = store.and_then(|store| tier.transfer_deadline(store));
@@ -1753,6 +1765,14 @@ impl VllmHostOffloadAdapter {
 
     pub(super) fn compute_not_before_ms(&self, now_ms: f64) -> f64 {
         self.compute_not_before_ms.max(now_ms)
+    }
+
+    /// SimpleCPU: when the pass being formed finishes the transfers its
+    /// preemptions synchronize before launch, if any. Unlike
+    /// [`Self::compute_not_before_ms`], this fences the pass's launch, and
+    /// thus its connector poll, not only its forward.
+    pub(super) fn take_launch_sync_ms(&mut self) -> Option<f64> {
+        self.launch_sync_ms.take()
     }
 
     pub(super) fn next_deadline(&self) -> Option<f64> {
