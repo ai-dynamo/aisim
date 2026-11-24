@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections import Counter
 from pathlib import Path
 
 VERSION = "0.1.dev24216+g266e88c05"
@@ -354,6 +355,44 @@ def _validate_cache_inventory(cache, model_config):
         raise ValueError("K3.1 cache layers differ from the checkpoint decoder inventory")
 
 
+def _validate_packed_state_partition(groups):
+    """Check homogeneous KDA pages packed alongside one balanced, mixed-page attention bucket."""
+    attention_pages = Counter()
+    state_pages = set()
+    state_counts = []
+    attention_blocks = set()
+    for group in groups:
+        layers = group["layer_names"]
+        pages = [group.get("layer_specs", {}).get(name, group)["spec_page_size_bytes"] for name in layers]
+        if group["kind"] == "state":
+            state_counts.append(len(layers))
+            state_pages.update(pages)
+        else:
+            attention_blocks.add(group["block_size_tokens"])
+            attention_pages.update(pages)
+    if len(attention_blocks) != 1 or len(attention_pages) < 2 or len(state_pages) != 1:
+        return
+    repetitions = set(attention_pages.values())
+    if len(repetitions) != 1:
+        return
+    # The pinned block-outermost planner keeps this attention bucket whole.
+    # Its repeat count bounds the chunk size. The native objective minimizes
+    # unused layer slots and breaks ties in favor of the larger chunk.
+    attention_count = repetitions.pop()
+    states = sum(state_counts)
+    chunk = min(
+        range(attention_count, max(states, attention_count) + 1),
+        key=lambda size: ((-attention_count) % size + (-states) % size, -size),
+    )
+    page = _positive(state_pages.pop(), "state page bytes")
+    available_bytes = sum(size * count for size, count in attention_pages.items())
+    capacity = min(chunk, max(1, available_bytes // page))
+    groups_needed = (states + capacity - 1) // capacity
+    small, remainder = divmod(states, groups_needed)
+    if sorted(state_counts) != [small] * (groups_needed - remainder) + [small + 1] * remainder:
+        raise ValueError("K3.1 state group partition differs from native packed page geometry")
+
+
 def _validate_state_shapes(spec, config, model_config, conv_state_layout):
     # vLLM 266e88c05 KimiK3DeltaAttention.get_state_shape delegates to
     # MambaStateShapeCalculator.kda_state_shape. No speculation is admitted.
@@ -513,6 +552,7 @@ def validate_attention_assignments(worker, *, model_config=None, conv_state_layo
         raise ValueError("K3.1 native attention requires initialized MLA and DSA indexer layers")
     if model_config is not None:
         _validate_cache_inventory(cache, model_config)
+        _validate_packed_state_partition(cache["groups"])
     return observed
 
 

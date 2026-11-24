@@ -1032,6 +1032,61 @@ def test_import_rejects_worker_with_self_consistent_but_missing_configured_moe_l
         validate_observation_phase(path, "tp2", launch, phase="decode", attempt_id="attempt-001")
 
 
+def test_fmha_and_geometry_use_the_same_verified_checkpoint(tmp_path, monkeypatch):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+    phase = json.loads(path.read_text())["configurations"]["tp2"]["attempts"][0]["phases"]["decode"]
+    source = path.parent / Path(phase["launch_manifest"]["path"]).parent / "model-config.json"
+    original_read = Path.read_bytes
+    reads = 0
+
+    def replace_after_read(item):
+        nonlocal reads
+        data = original_read(item)
+        if item == source:
+            reads += 1
+            item.write_text("{}")
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", replace_after_read)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+    assert reads == 1
+    assert validate_observations(path, launches)["tp2"]["status"] == "incomplete"
+
+
+def test_phase_local_checkpoint_is_in_import_provenance(tmp_path, monkeypatch):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+    index = json.loads(path.read_text())
+    phase = index["configurations"]["tp2"]["attempts"][0]["phases"]["decode"]
+    phase["artifacts"] = [ref for ref in phase["artifacts"] if Path(ref["path"]).name != "model-config.json"]
+    path.write_text(json.dumps(index))
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+    name = str(Path(phase["launch_manifest"]["path"]).parent / "model-config.json")
+    artifacts = result["provenance"]["runtime_artifacts"]
+    assert [ref["sha256"] for ref in artifacts if ref["path"] == name] == [launches["tp2"]["model_config"]["sha256"]]
+    (path.parent / name).write_text("{}")
+    assert validate_observations(path, launches)["tp2"]["status"] == "incomplete"
+
+
+@pytest.mark.parametrize(("page", "sizes", "valid"), [(64, [2], True), (64, [1, 1], False), (256, [1, 1], True)])
+def test_state_partition_uses_attention_capacity(page, sizes, valid):
+    attention = {
+        "kind": "attention",
+        "layer_names": ["a", "b", "c", "d"],
+        "layer_specs": {
+            key: {"spec_page_size_bytes": width} for key, width in zip("abcd", [128, 64, 128, 64], strict=True)
+        },
+        "block_size_tokens": 64,
+    }
+    states = [{"kind": "state", "layer_names": list(range(size)), "spec_page_size_bytes": page} for size in sizes]
+    if valid:
+        runtime_k31._validate_packed_state_partition([attention, *states])
+    else:
+        with pytest.raises(ValueError, match="state group partition"):
+            runtime_k31._validate_packed_state_partition([attention, *states])
+
+
 def test_import_rejects_matching_worker_scheduler_omission_of_one_kda_group(tmp_path, monkeypatch):
     path, launches = _complete_fixture(tmp_path, monkeypatch)
 
@@ -1058,8 +1113,11 @@ def test_import_rejects_matching_worker_scheduler_omission_of_one_kda_group(tmp_
         else:
             cache["group_pool_ids"] = [cache["pool_id"]] * len(cache["groups"])
 
-    _mutate(path, split_kda_groups)
     assert validate_observations(path, launches)["tp2"]["status"] == "complete"
+    _mutate(path, split_kda_groups)
+    rejected = validate_observations(path, launches)["tp2"]
+    assert rejected["status"] == "incomplete"
+    assert "state group partition" in str(rejected["diagnostics"])
 
     def omit_group(record):
         cache = record["cache"]

@@ -37,7 +37,7 @@ from aisim_core.sdk.perf_database import load_system_spec
 from . import runtime_memory
 from .capabilities import checkpoint_fmha_quant_mode, has_checkpoint_fmha
 from .config import PrefillSamplingProfile, collection_phases
-from .model_capability import kimi_k31_native_attention_backend, load_model_config
+from .model_capability import ResolvedModelConfig, _attach_modelopt_sidecar, kimi_k31_native_attention_backend
 from .planner import BackendPolicy, FPMCell
 from .runtime.fpm_memory_observer import (
     _LEGACY_SPECS,
@@ -182,7 +182,7 @@ def _source_files(launch: dict[str, Any]) -> dict[str, str]:
     return source_files
 
 
-def _staged_checkpoint_fmha(root: Path, references: list[Any], launch: dict[str, Any], kv_cache_dtype: str) -> str:
+def _staged_checkpoint(root: Path, references: list[Any], launch: dict[str, Any], kv_cache_dtype: str):
     """The checkpoint-native FMHA label of the model configuration that a phase staged.
 
     The finalization recheck and the collection verifier validate saved evidence when the launch path can be gone, so
@@ -195,7 +195,7 @@ def _staged_checkpoint_fmha(root: Path, references: list[Any], launch: dict[str,
     for reference in references:
         name = PurePosixPath(reference["path"]).name
         if name in staged:
-            staged[name].append(_artifact(root, reference))
+            staged[name].append((contained_file(root, reference["path"]), validate_sha256(reference["sha256"], name)))
     if len(staged["model-config.json"]) != 1:
         raise ValueError(
             f"runtime phase must stage exactly one model-config.json, found {len(staged['model-config.json'])}"
@@ -211,10 +211,17 @@ def _staged_checkpoint_fmha(root: Path, references: list[Any], launch: dict[str,
         raise ValueError("declared hf_quant_config.json is not staged beside model-config.json")
     elif any(value != sources["hf_quant_config.json"] for _, value in staged["hf_quant_config.json"]):
         raise ValueError("staged hf_quant_config.json differs from its declared SHA-256")
-    config = load_model_config(launch["identity"]["model"], explicit_config_path=str(path)).effective_payload
+    raw = read_json(path, expected_sha256=digest)
+    payload = raw
+    if "hf_quant_config.json" in sources:
+        if len(staged["hf_quant_config.json"]) != 1:
+            raise ValueError("frozen phase has ambiguous model configuration sources: hf_quant_config.json")
+        quant = read_json(sidecar, expected_sha256=sources["hf_quant_config.json"])
+        payload = _attach_modelopt_sidecar(copy.deepcopy(raw), quant)
+    config = ResolvedModelConfig(payload, source_kind="explicit", source_reference=str(path)).effective_payload
     _attach_inferred_quant_fields(config)
     # The architecture as the runtime probe takes it.
-    return checkpoint_fmha_quant_mode(config, (config.get("architectures") or [None])[0], kv_cache_dtype)
+    return raw, checkpoint_fmha_quant_mode(config, (config.get("architectures") or [None])[0], kv_cache_dtype)
 
 
 def _validate_hardware(hardware: dict[str, Any], identity: dict[str, Any]) -> None:
@@ -287,14 +294,16 @@ def _matches_model_path(observed: Any, launch: dict[str, Any]) -> bool:
     )
 
 
-def _checkpoint_config(launch: dict[str, Any], *, root=None, references=None, phase_dir=None) -> dict[str, Any]:
+def _checkpoint_config(
+    launch: dict[str, Any], *, root=None, references=None, phase_dir=None, fallback_artifacts=None
+) -> dict[str, Any]:
     if root is None:
         from .runtime_probe import _model_config_bytes
 
         return json.loads(_model_config_bytes(launch["model_config"])["model-config.json"])
     config = launch["model_config"]
     contents = {}
-    for name, expected in {"model-config.json": config["sha256"], **config.get("source_files", {})}.items():
+    for name, expected in {"model-config.json": config["sha256"], **_source_files(launch)}.items():
         matches = [ref for ref in references if PurePosixPath(ref["path"]).name == name]
         if len(matches) > 1:
             raise ValueError(f"frozen phase has ambiguous model configuration sources: {name}")
@@ -304,7 +313,10 @@ def _checkpoint_config(launch: dict[str, Any], *, root=None, references=None, ph
         else:
             # Phase-local staged inputs are independently bound by the launch
             # hash even when absent from the observation artifact index.
-            path = contained_file(root, str((phase_dir / name).relative_to(root)))
+            relative = str((phase_dir / name).relative_to(root))
+            path = contained_file(root, relative)
+            if fallback_artifacts is not None:
+                fallback_artifacts.append({"path": relative, "sha256": expected})
         contents[name] = read_json(path, expected_sha256=expected)
     return contents["model-config.json"]
 
@@ -1733,13 +1745,18 @@ def _configuration(
                         {"path": str((launch_path.parent / name).relative_to(root)), "sha256": expected}
                     )
         # Only an AIC KV-cache mode other than bfloat16 reads the staged model configuration.
-        checkpoint_fmha = (
-            _staged_checkpoint_fmha(root, fmha_references, launch, cell.kv_cache_dtype)
-            if has_checkpoint_fmha(cell.kv_cache_dtype)
-            else None
-        )
-        for reference in references:
-            path, digest = _artifact(root, reference)
+        checkpoint_fmha = None
+        if has_checkpoint_fmha(cell.kv_cache_dtype):
+            checkpoint_config, checkpoint_fmha = _staged_checkpoint(root, fmha_references, launch, cell.kv_cache_dtype)
+        for reference in fmha_references:
+            if checkpoint_fmha is not None and PurePosixPath(reference["path"]).name in {
+                "model-config.json",
+                "hf_quant_config.json",
+            }:
+                # _staged_checkpoint verified these exact bytes before deriving both views.
+                path, digest = contained_file(root, reference["path"]), reference["sha256"]
+            else:
+                path, digest = _artifact(root, reference)
             if str(path.resolve()) in used_paths:
                 raise ValueError("duplicate runtime artifact path across ranks or phases")
             used_paths.add(str(path.resolve()))
@@ -1756,7 +1773,11 @@ def _configuration(
                 and record["cache"].get("allocation_layout") == LAYOUT
             ):
                 checkpoint_config = _checkpoint_config(
-                    launch, root=root, references=references, phase_dir=launch_path.parent
+                    launch,
+                    root=root,
+                    references=references,
+                    phase_dir=launch_path.parent,
+                    fallback_artifacts=runtime_artifacts,
                 )
             if not collector_phase and any(name in record for name in ("cell_id", "collector_attempt_id")):
                 raise ValueError("standalone runtime observation contains Collector binding fields")

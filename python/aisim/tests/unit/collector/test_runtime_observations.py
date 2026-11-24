@@ -3762,7 +3762,7 @@ def test_import_accepts_the_live_glm53flash_record_of_vllm_0330(tmp_path):
     assert result["provenance"]["launch"]["precision"]["fmha_quant_mode"] == "fp8"
     assert result["provenance"]["launch"]["precision"]["kvcache_quant_mode"] == "fp8"
     references = json.loads(path.read_text())["configurations"][label]["attempts"][0]["phases"]["prefill"]["artifacts"]
-    assert runtime_observations._staged_checkpoint_fmha(path.parent, references, launch, "fp8") == "fp8"
+    assert runtime_observations._staged_checkpoint(path.parent, references, launch, "fp8")[1] == "fp8"
 
 
 def test_import_refuses_the_live_glm53flash_record_declared_with_bfloat16_attention(tmp_path):
