@@ -238,11 +238,11 @@ def test_standalone_shares_supervisor_lock(tmp_path, monkeypatch):
     assert calls == [str(output)]
 
 
-@pytest.mark.parametrize("sm", [90, 103, 107])
+@pytest.mark.parametrize("sm", [89, 90, 100, 103, 107])
 def test_native_plan_lists_only_qualified_hardware(monkeypatch, sm):
     monkeypatch.setenv("COLLECTOR_MODEL_PATH", MODEL)
     for op in ("kimi_k31_dsa_context_module", "kimi_k31_dsa_generation_module"):
-        assert bool(plan(op, "sglang", sm).cases) == (sm == 103)
+        assert bool(plan(op, "sglang", sm).cases) == (sm in {90, 100, 103})
 
 
 def test_standalone_preserves_pending_fullnode_publication(monkeypatch, tmp_path):
