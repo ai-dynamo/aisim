@@ -9,9 +9,9 @@ use aisim_core::engine::{
     EngineConfig, G2Connector, NativeHostOffloadConfig, PassLaunchConfig, TimingModelConfig,
 };
 use aisim_core::replay::{
-    CURRENT_REPLAY_SPEC_VERSION, DirectRequest, PerRequestRecord, ReplayEngineConfig,
-    ReplayEngineFactory, ReplayReport, ReplayRuntimeInput, ReplaySpec, ReplayTopology, Replayer,
-    WorkerPoolSpec,
+    CURRENT_REPLAY_SPEC_VERSION, DirectRequest, PerRequestRecord, ReplayArtifactKvEventVisibility,
+    ReplayEngineConfig, ReplayEngineFactory, ReplayReport, ReplayRuntimeInput, ReplaySpec,
+    ReplayTopology, Replayer, WorkerPoolSpec,
 };
 use uuid::Uuid;
 
@@ -630,31 +630,66 @@ fn simple_cpu_copies_from_the_launch_end_and_offloading_from_the_pass_end() {
     // sees it, and A's pass starts at 780. Both reuse A's 20 host-tier
     // tokens.
     let five_blocks_in_50_ms = 320.0 / (50.0 * 1e6);
-    let first_admission = |connector| {
+    // A queued load retains its queue time when pass pricing resolves the
+    // copy end. Offloading prepares R's store before reporting the queue;
+    // SimpleCPU prepares R's store when the prefill has finished.
+    for (connector, admission_ms, expected_events) in [
+        (
+            G2Connector::SimpleCpuV032,
+            730.0,
+            [(600.0, Some(670.0)), (700.0, None)],
+        ),
+        (
+            G2Connector::OffloadingV032,
+            780.0,
+            [(600.0, None), (600.0, Some(750.0))],
+        ),
+    ] {
         let mut config = polled_cpu_tier(20, five_blocks_in_50_ms);
         config.native_host_offload = config
             .native_host_offload
             .map(|host| host.with_connector(connector));
-        let report = run_tokens(
-            config,
-            vec![
+        let (report, artifacts) = replay_requests(
+            ReplayEngineConfig {
+                rank: config,
+                ..Default::default()
+            },
+            [
                 tokens_request(1, (0..20).collect(), 1, 0.0),
                 tokens_request(2, (500..576).collect(), 1, 300.0),
                 tokens_request(3, (900..904).collect(), 12, 600.0),
                 tokens_request(4, (0..24).collect(), 2, 600.0),
-            ],
-        );
+            ]
+            .into(),
+        )
+        .run_with_artifacts(ReplayArtifactKvEventVisibility::Native)
+        .unwrap();
         let a = record(&report, 4);
-        (a.first_admit_ms, a.first_admission_host_reused_input_tokens)
-    };
-    assert_eq!(
-        first_admission(G2Connector::SimpleCpuV032),
-        (Some(730.0), Some(20))
-    );
-    assert_eq!(
-        first_admission(G2Connector::OffloadingV032),
-        (Some(780.0), Some(20))
-    );
+        assert_eq!(a.first_admit_ms, Some(admission_ms), "{connector:?}");
+        assert_eq!(a.first_admission_host_reused_input_tokens, Some(20));
+        let artifacts = serde_json::to_value(artifacts).unwrap();
+        let restoring = Uuid::from_u128(4).to_string();
+        let running = Uuid::from_u128(3).to_string();
+        let events: Vec<_> = artifacts["host_offload_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|record| {
+                let at = record["observed_at_ms"].as_f64().unwrap();
+                let event = &record["event"];
+                match event["event"].as_str().unwrap() {
+                    "load_queued" if record["request_id"] == restoring => {
+                        Some((at, Some(event["completes_at_ms"].as_f64().unwrap())))
+                    }
+                    "store_prepared" if record["request_id"] == running && at <= 700.0 => {
+                        Some((at, None))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(events, expected_events, "{connector:?}");
+    }
 }
 
 #[test]

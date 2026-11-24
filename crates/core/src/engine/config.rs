@@ -1191,7 +1191,8 @@ impl NativeHostOffloadConfig {
 /// pass's outputs leave once the next pass is launched, and a request joins the
 /// first pass decided after it arrives. With an `offloading_v0_32` or
 /// `simple_cpu_v0_32` CPU tier, a finished load is admitted only after vLLM
-/// (Model Runner V2) polls the connector.
+/// (Model Runner V2) polls the connector. With MTP and G2, launch timing
+/// requires a recurrent state cache and `disable_eagle_block_drop`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PassLaunchConfig {
@@ -1351,7 +1352,8 @@ pub struct EngineConfig {
     pub prefill_decode_interval: usize,
     /// vLLM `--async-scheduling`. The engine then keeps a second batch queued
     /// behind the running one, which a request arriving at a busy engine
-    /// misses. `None` selects vLLM's default: on, except with ngram drafts.
+    /// misses. `None` defaults to on, except with ngram drafts or MTP with
+    /// G2 and no recurrent state cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub async_scheduling: Option<bool>,
     /// vLLM async scheduling's CPU launch costs: a pass's outputs leave once
@@ -1360,6 +1362,8 @@ pub struct EngineConfig {
     /// A rank holds the outputs until the driver releases them through
     /// `GeneralizedMockerEngine::take_due_emissions`, as offline replay does;
     /// other drivers must leave this unset.
+    /// With `offloading_v0_32` or `simple_cpu_v0_32`, Model Runner V2 polls
+    /// for completed loads. See [`PassLaunchConfig`] for the MTP restriction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch: Option<PassLaunchConfig>,
     /// Whether complete blocks remain reusable after request release.

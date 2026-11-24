@@ -59,7 +59,7 @@ engine:
 | `workers.<role>.scheduler.prefill_decode_interval` | `0` | predict only | SGLang only. See [SGLang prefill/decode interval](#sglang-prefilldecode-interval). |
 | `workers.<role>.scheduler.scheduler_select_time_ms` | `0` | predict only | A positive cost requires the built-in engine, `backend: sglang`, `host_loop: false`, and no AFD on the worker. See [SGLang batch-selection cost](#sglang-batch-selection-cost). |
 | `workers.decode.scheduler.load_balance_method` | `round_robin` | predict only | SGLang PD decode only (`--load-balance-method`). `total_tokens` places a request on the attention-DP rank with the smallest scheduler token budget; `round_robin` takes ranks in turn. |
-| `workers.<role>.scheduler.async_scheduling` | vLLM's default: on, off with ngram drafts or MTP + G2 | predict only | vLLM only. Boolean. `true` is rejected with ngram drafts or MTP + G2. See [vLLM async scheduling](#vllm-async-scheduling). |
+| `workers.<role>.scheduler.async_scheduling` | On except with ngram drafts or MTP + G2 without a recurrent state cache | predict only | vLLM only. Boolean. Both exceptions require synchronous scheduling. See [vLLM async scheduling](#vllm-async-scheduling). |
 | `workers.aggregated.scheduler.launch` | Unset | predict only | vLLM only, with async scheduling, on one-GPU workers (`tensor`, `pipeline`, `attention_data` and `prefill_context` of 1) and `--stack engine`. `{decode_ms, piecewise_ms, eager_ms, max_cudagraph_capture_size, eager_queue_fraction}`: CPU launch costs measured on the deployment. Outputs leave once the next pass is launched, and an arrival joins the first pass decided after it. With an `offloading_v0_32` or `simple_cpu_v0_32` CPU tier, a finished load waits for vLLM Model Runner V2 to check the connector; V1 CPU-tier timing is not covered. See [CPU-tier loads](#vllm-cpu-tier-loads) and [vLLM pass launch](#vllm-pass-launch). |
 | `workers.{aggregated,prefill}.host_loop` | `false` | fixed | SGLang only; `aggregated` in aggregated mode, `prefill` in disaggregated mode. Each pass is one overlap-scheduler iteration. Implied by `frontend` and `host_profile`. See [SGLang host loop, frontend and vision](#sglang-host-loop-frontend-and-vision). |
 | `workers.{aggregated,prefill}.frontend` | Unset | fixed | Ordered `stages`, each `{workers, service_ms, concurrency_scale}`, plus optional `measured_for` (model, frontend, feature transport and image shape the stages were measured on). Exclusive with `host_profile`. Unset together with `host_profile`, a worker with images encodes them on the GPU and prices no frontend stage, so its TTFT starts at the scheduler. |
@@ -361,11 +361,12 @@ that window. Behavior follows vLLM at commit
 ### vLLM async scheduling
 
 `async_scheduling` mirrors vLLM's `--async-scheduling` and
-`--no-async-scheduling`. Unset, replay turns it on, except with ngram drafts
-or [MTP with G2 host offload](speculation.md#registered-schemes), which turn it
-off and reject an explicit `true`. vLLM v0.28.0 resolves the same default for the
-configurations replay models; it also turns async scheduling off for pooling
-models, some speculative and executor settings and ROCm DeepEP DBO, so set it
+`--no-async-scheduling`. Replay enables it by default and disables it for
+ngram drafts, as vLLM v0.28.0 does. Replay also requires synchronous
+scheduling for [MTP with G2 host offload](speculation.md#registered-schemes)
+without a recurrent state cache. Both configurations reject an explicit
+`true`. vLLM v0.28.0 also turns async scheduling off for pooling models, some
+speculative and executor settings and ROCm DeepEP DBO, so set it
 explicitly to match such a deployment.
 
 With async scheduling, a busy vLLM engine keeps two batches committed: one
@@ -557,6 +558,9 @@ scheduler activates the load after polling. vLLM keeps the source blocks
 pinned until it observes completion. This is an approximation under cache
 pressure: a competing store can evict the unpinned CPU blocks before the
 poll, so a later request may miss rather than wait for the existing load.
+Canceling one in-flight load in a SimpleCPU batch immediately releases its G2
+source pins and G1 destination reservation in replay. The other loads keep the
+batch's original completion time.
 
 Each check comes at the end of a launch, and only `launch` times launches, so
 the rule needs no setting of its own and applies only with `launch`. Without
@@ -564,9 +568,11 @@ it, and with `offloading_v0_24`, a request can join the first pass decided
 after its copy ends, two or more passes earlier than vLLM. A rank-local pool
 with a sliding-window [state cache](kv-cache.md#state-cache) follows
 `offloading_v0_32` under either offloading name. With MTP and a CPU tier,
-replay schedules synchronously unless the model has a recurrent state cache,
-so the rule reaches MTP only with one. vLLM v0.33.0 checks the connector
-before the draft model's pass under MTP; these profiles follow v0.32.0.
+launch timing requires a recurrent state cache and
+[`disable_eagle_block_drop: true`](speculation.md#prefix-caching). MTP with a
+uniform or sliding-window cache and a CPU tier uses synchronous scheduling.
+vLLM v0.33.0 checks the connector before the draft model's pass under MTP;
+these profiles follow v0.32.0.
 Behavior follows `ActiveKVConnector.post_forward` in vLLM
 [v0.32.0](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/kv_connector.py),
 called at the end of `GPUModelRunner.sample_tokens`; the scheduler's
