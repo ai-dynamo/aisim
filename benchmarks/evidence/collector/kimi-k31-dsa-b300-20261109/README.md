@@ -11,6 +11,8 @@ These tables measure the released Kimi Gated DSA module on NVIDIA B300 SXM6 AC
 real TP1/2/4 groups with 96/48/24 heads per rank. Job 5767295 allocated four
 GPUs on one NVL8 node; this is operator data, not a full-model run.
 
+Slurm recorded 3,569 elapsed seconds (59:29) for allocation 5767295, excluding queue time. The declared four-GPU allocation therefore accounts for 14,276 allocated GPU-seconds, including idle time. Active GPU-seconds and separate setup/load, warmup, measurement and teardown seconds are `null`. Slurm recorded failed steps 5767295.1 and 5767295.14 at 0 and 1 elapsed seconds respectively. The original case-failure and subsequent successful retry counts are reported separately below. Their GPU-second breakdown is `null` because the allocation-level record does not attribute GPU activity to cases.
+
 The measured boundary includes attention/indexer projections, sparse attention,
 output gate and output projection. Decoder normalization and TP reduction are
 outside the boundary. Native prefill establishes the complete KV and index-K
@@ -87,3 +89,5 @@ Runtime and model identity:
 The tables contain measurements and identifiers; they do not redistribute the
 checkpoint configuration, tokenizer code or model weights. Canonical source
 attribution for the collector is in the repository's `THIRD_PARTY_NOTICES.md`.
+
+The original receipt is preserved at commit `73903fb14b1d9a446f0fcc95fb3bf82c24937f3f`. The updated receipt reproduces the same output hashes and additionally verifies disjoint native generation keys after physical cache-layout selection and sequence-length normalization.
