@@ -8,7 +8,7 @@ import csv
 from pathlib import Path
 
 import pytest
-from tools.prediction_regression_gate import compare, grid
+from tools.prediction_regression_gate import compare, grid, run_tier2
 
 pytestmark = pytest.mark.unit
 
@@ -189,12 +189,13 @@ def test_relabels_must_be_one_to_one(tmp_path: Path) -> None:
         _compare_relabeled(tmp_path, PRE_RENAME, POST_RENAME, relabels={"org/a": "org/m", "org/b": "org/m"})
 
 
-def test_shipped_relabels_match_the_bundled_model_list() -> None:
+def test_shipped_relabels_and_tier2_models_match_the_bundled_model_list() -> None:
     bundled = set(grid.bundled_models())
     targets = set(compare.MODEL_RELABELS.values())
     assert len(targets) == len(compare.MODEL_RELABELS)
     assert targets <= bundled
     assert not (compare.MODEL_RELABELS.keys() - targets) & bundled
+    assert {case["kwargs"]["model_path"] for case in run_tier2.load_configs()} <= bundled
 
 
 # ---------------------------------------------------------------------------
