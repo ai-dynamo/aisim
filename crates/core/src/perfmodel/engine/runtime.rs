@@ -3738,7 +3738,7 @@ impl Engine {
         gen_seq_imbalance_correction_scale: f64,
     ) -> Result<Vec<PerOpValue>, AicError> {
         self.decode_step_per_op_impl(gen_tokens, isl, osl, gen_seq_imbalance_correction_scale)
-            .map(strip_per_op_metadata)
+            .map(|(entries, _)| strip_per_op_metadata(entries))
     }
 
     /// Metadata-bearing counterpart used only by the private PyO3 provenance
@@ -3749,7 +3749,7 @@ impl Engine {
         isl: u32,
         osl: u32,
         gen_seq_imbalance_correction_scale: f64,
-    ) -> Result<Vec<PerOpValueWithMetadata>, AicError> {
+    ) -> Result<(Vec<PerOpValueWithMetadata>, f64), AicError> {
         self.decode_step_per_op_impl(gen_tokens, isl, osl, gen_seq_imbalance_correction_scale)
     }
 
@@ -3759,12 +3759,13 @@ impl Engine {
         isl: u32,
         osl: u32,
         gen_seq_imbalance_correction_scale: f64,
-    ) -> Result<Vec<PerOpValueWithMetadata>, AicError> {
+    ) -> Result<(Vec<PerOpValueWithMetadata>, f64), AicError> {
         self.check_profile_phase(false)?;
         self.reject_full_round_surface("per-operation decode steps")?;
         let mut out = PerOpFold::new("generation");
+        let mut covered = 0.0;
         if gen_tokens == 0 {
-            return Ok(out.into_values());
+            return Ok((out.into_values(), covered));
         }
         let effective_batch = self.packed_decode_tokens(gen_tokens)?;
         let s = isl.max(1).saturating_add(osl.max(1) / 2).saturating_add(1);
@@ -3776,9 +3777,12 @@ impl Engine {
             s,
             gen_seq_imbalance_correction_scale,
             false,
-            |op, r| out.add(op, r),
+            |op, r| {
+                covered += covered_latency(&r);
+                out.add(op, r);
+            },
         )?;
-        Ok(out.into_values())
+        Ok((out.into_values(), covered))
     }
 
     /// Evaluate an index-addressed sublist of the compiled CONTEXT op list at
@@ -5141,6 +5145,63 @@ pub(crate) mod tests {
             vec![qualified_mamba(false, nextn + 1)],
         );
         Engine::build(spec, build_engine(None).db).unwrap()
+    }
+
+    #[test]
+    fn packed_mixed_step_rejects_token_sum_overflow() {
+        let engine = qualified_mamba_engine(0);
+        let metrics = |tokens| ForwardPassMetrics {
+            scheduled_requests: crate::ScheduledRequestMetrics {
+                num_prefill_requests: 1,
+                sum_prefill_tokens: tokens,
+                prefill_chunks: Some(vec![[1, tokens, 0]]),
+                num_decode_requests: 4,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // Each field and exact group is valid, but their combined token-major
+        // query is 2^32 + 1, which cannot be represented by RuntimeContext.
+        let invalid = metrics(0xffff_fffd);
+        crate::validate_forward_pass_metrics(&invalid).unwrap();
+        assert!(matches!(
+            engine.forward_pass_time_ms(&[invalid]),
+            Err(AicError::InvalidEngineConfig(message))
+                if message.contains("overflow the u32 mixed-step token count")
+        ));
+        assert!(
+            engine
+                .forward_pass_time_ms(&[metrics(u32::MAX - 4)])
+                .unwrap()
+                .is_finite()
+        );
+    }
+
+    #[test]
+    fn mixed_exact_prefill_rejects_zero_tokens_on_both_sides_of_the_mean_guard() {
+        let engine = qualified_mamba_engine(0);
+        for ctx_tokens in [1, 2] {
+            let error = crate::session::get_mix_step_ops(
+                &engine.context_ops,
+                &engine.generation_ops,
+                None,
+                None,
+                None,
+                &engine.db,
+                ctx_tokens,
+                1,
+                1,
+                2,
+                0,
+                0,
+                64,
+                1,
+                Some(&[[1, 0, 0], [1, ctx_tokens, 0]]),
+                |_, _, _, _, _, _| {},
+            )
+            .unwrap_err();
+            assert!(matches!(error, AicError::InvalidEngineConfig(_)));
+        }
     }
 
     #[test]
@@ -10912,6 +10973,25 @@ pub(crate) mod tests {
         assert!(
             (covered - expected).abs() < 1e-12,
             "{covered} vs {expected}"
+        );
+
+        // The single-step metadata endpoint must carry the same pre-fold
+        // coverage; Python cannot recover it from the positive folded energy.
+        let (decode, decode_covered) = engine
+            .decode_step_per_op_with_metadata(1, 2048, 2, 1.0)
+            .unwrap();
+        let row = decode.iter().find(|row| row.0 == "draft_dup").unwrap();
+        assert!(row.2 > 0.0 && decode_covered < row.1);
+        assert!((decode_covered - expected).abs() < 1e-12);
+        assert_eq!(
+            engine.decode_step_per_op(1, 2048, 2, 1.0).unwrap(),
+            strip_per_op_metadata(decode)
+        );
+        assert_eq!(
+            engine
+                .decode_step_per_op_with_metadata(0, 2048, 2, 1.0)
+                .unwrap(),
+            (vec![], 0.0)
         );
 
         let runtime = RuntimeConfig {

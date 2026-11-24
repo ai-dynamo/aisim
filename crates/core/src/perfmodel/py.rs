@@ -824,7 +824,8 @@ impl AicEngine {
 
     /// Internal metadata-bearing counterpart of `decode_step_per_op`; each
     /// fifth field is `None` or `(first_record, additional_records)` in
-    /// deterministic encounter order.
+    /// deterministic encounter order. Returns the entries and power-covered
+    /// latency summed per query before name folding.
     #[pyo3(signature = (gen_tokens, isl, osl, gen_seq_imbalance_correction_scale=1.0))]
     fn _decode_step_per_op_with_metadata(
         &self,
@@ -833,7 +834,7 @@ impl AicEngine {
         isl: u32,
         osl: u32,
         gen_seq_imbalance_correction_scale: f64,
-    ) -> PyResult<Vec<PerOpValueWithMetadata>> {
+    ) -> PyResult<(Vec<PerOpValueWithMetadata>, f64)> {
         self.inner.reset_provenance();
         py.allow_threads(|| {
             self.inner.decode_step_per_op_with_metadata(

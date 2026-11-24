@@ -492,13 +492,7 @@ def test_compute_ttft_single_request_counts_a_short_final_fpm_chunk(monkeypatch,
     assert ttft == pytest.approx(prefill_ms + 10 * 0.3)
 
 
-@pytest.mark.parametrize(
-    "forward_model,prefix,budget,expected",
-    [("fpm", 4088, 4096, 8), ("fpm", 3000, 2048, 1096), ("op_level", 0, 100000, 65536)],
-)
-def test_batched_ttft_caps_prefill_after_reserving_decode(monkeypatch, forward_model, prefix, budget, expected):
-    # Fifteen decoders leave one physical prefill slot. Its uncached suffix
-    # has 8 or 1096 tokens, even when the token budget could hold more suffixes.
+def _batched_ttft_prefill_after_reserving_decode(monkeypatch, forward_model, prefix, budget):
     backend = VLLMXPUBackend()
     backend._in_agg = True
     runtime = SimpleNamespace(isl=4096, osl=128, prefix=prefix, batch_size=16)
@@ -517,7 +511,22 @@ def test_batched_ttft_caps_prefill_after_reserving_decode(monkeypatch, forward_m
     monkeypatch.setattr(backend, "_get_genonly_step_latency", lambda *_: (1, 0, {}, {}, ()))
     monkeypatch.setattr(backend, "_own_cached_prefill_ms", lambda *_: 10)
     backend._compute_ttft(model, None, runtime, 16, 4096, 128, budget, prefix, **_ttft_kwargs())
-    assert seen == [(expected, 15)]
+    return seen
+
+
+@pytest.mark.parametrize("prefix,budget,expected", [(4088, 4096, 8), (3000, 2048, 1096)])
+def test_batched_fpm_ttft_caps_prefill_after_reserving_decode(monkeypatch, prefix, budget, expected):
+    # Fifteen decoders leave one physical prefill slot. Its uncached suffix
+    # has 8 or 1096 tokens, even when the token budget could hold more suffixes.
+    assert _batched_ttft_prefill_after_reserving_decode(monkeypatch, "fpm", prefix, budget) == [(expected, 15)]
+
+
+def test_batched_legacy_op_level_ttft_retains_mean_field_demand(monkeypatch):
+    # Unqualified op-level XPU retains its calibrated mean-field workload:
+    # full-prompt demand for all 16 requests, plus the concurrent decoders.
+    # This is not a physical one-prefill-slot schedule. FPM and qualified
+    # Mamba use their own slot-capped scheduling contracts.
+    assert _batched_ttft_prefill_after_reserving_decode(monkeypatch, "op_level", 0, 100000) == [(65536, 15)]
 
 
 @pytest.mark.parametrize("prefix", [0, 3000, 4088])

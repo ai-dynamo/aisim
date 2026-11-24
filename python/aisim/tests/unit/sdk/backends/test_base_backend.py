@@ -2043,3 +2043,51 @@ def test_fixed_native_decode_pass_keeps_folded_energy_and_coverage(monkeypatch):
     assert result["per_op_latency_ms"]["same_name"] == 3.0
     assert result["per_op_energy_wms"]["same_name"] == 30.0
     assert result["per_op_source"]["same_name"] == "silicon"
+
+
+@pytest.mark.parametrize(
+    "prefix,budget,old_activation,new_activation,old_total,new_total",
+    [
+        (3000, 2048, 0.156250, 0.083618, 62.542492, 62.469860),
+        (3000, 4096, 0.312500, 0.083618, 62.698742, 62.469860),
+        (3000, 8192, 0.312500, 0.083618, 62.698742, 62.469860),
+        (0, 2048, 0.156250, 0.156250, 62.542492, 62.542492),
+    ],
+)
+def test_legacy_aggregate_memory_matches_recorded_suffix_evidence(
+    prefix, budget, old_activation, new_activation, old_total, new_total
+):
+    # Historical values from mem-35e632cb.json and mem-1ea0211c.json.
+    # This unqualified Nano has 81,920 activation bytes/token; cached work
+    # changes from a budget-sized 2048/4096 tokens to the 1096-token suffix.
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.config import ModelConfig, RuntimeConfig
+    from aisim_core.sdk.inference_summary import InferenceSummary
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="HYBRID", allow_unlisted_version=True)
+    model = get_model(
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1),
+        "vllm",
+    )
+    backend = get_backend("vllm", "b200_sxm")
+    runtime = RuntimeConfig(batch_size=1, isl=4096, osl=64, prefix=prefix)
+    summary = backend.run_agg(model, database, runtime, ctx_tokens=budget)
+    current = summary.get_memory()
+    assert current["activations"] == pytest.approx(new_activation, abs=1e-6)
+    assert current["total"] == pytest.approx(new_total, abs=1e-6)
+    # Reconstruct only the old memory input, leaving latency prediction alone.
+    previous = backend._get_memory_usage(
+        model, database, 1, 1, 4096, 64, prefix=prefix, num_tokens=min(4096, budget), mtp_scaled_tokens=0
+    )
+    assert previous["activations"] == pytest.approx(old_activation, abs=1e-6)
+    assert previous["total"] == pytest.approx(old_total, abs=1e-6)
+    for key in ("weights", "kvcache", "nccl", "others"):
+        assert previous[key] == current[key]
+    capacity = database.system_spec["gpu"]["mem_capacity"]
+    old_summary = InferenceSummary(runtime)
+    old_summary.set_memory_and_check_oom(previous, capacity, **backend._oom_check_kwargs({}))
+    assert not old_summary.check_oom() and not summary.check_oom()
+    assert not old_summary.check_kv_cache_oom() and not summary.check_kv_cache_oom()

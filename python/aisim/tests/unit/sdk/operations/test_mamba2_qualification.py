@@ -17,6 +17,41 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.mark.parametrize(
+    "speculation,qualified",
+    [
+        ({"kind": "ngram", "params": {"num_speculative_tokens": 3}}, False),
+        ({"kind": "mtp", "params": {"depth": 3}}, True),
+    ],
+)
+def test_hybrid_rebuild_preserves_construction_time_mtp_qualification(speculation, qualified):
+    from aisim_core.sdk.config import ModelConfig
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.speculation.base import SpeculationConfig
+
+    model = get_model(
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1, speculation=SpeculationConfig(**speculation)),
+        "vllm",
+    )
+    assert model._nextn == 3  # Both schemes materialize the same verification width.
+
+    def specs():
+        return [
+            json.loads(op._spec_json())["Mamba2"]
+            for op in (*model.context_ops, *model.generation_ops)
+            if isinstance(op, ops.Mamba2Kernel)
+        ]
+
+    before = specs()
+    model.set_hybrid_config(copy.deepcopy(model._hybrid_config))
+    after = specs()
+    assert len(after) == 4
+    assert after == before
+    assert all((op["state_dtype"] != "unrecorded") == qualified for op in after)
+    assert [op["token_width"] for op in after] == ([1, 1, 4, 4] if qualified else [1, 1, 1, 1])
+
+
+@pytest.mark.parametrize(
     "mtp",
     [
         {"nextn": 1},

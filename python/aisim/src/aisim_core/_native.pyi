@@ -162,7 +162,7 @@ class AicEngine:
         isl: int,
         osl: int,
         gen_seq_imbalance_correction_scale: float = 1.0,
-    ) -> list[_PerOpValueWithMetadata]: ...
+    ) -> tuple[list[_PerOpValueWithMetadata], float]: ...
     def evaluate_context_ops(
         self,
         indices: list[int],

@@ -753,7 +753,15 @@ pub(crate) fn get_mix_step_ops<'a>(
     // produce the same `(full_s, prefix_correction)` Python applies.
     // For non-attention ops (GEMM, MoE, etc.) the prefix field is
     // ignored, so threading it through is harmless.
-    let effective_isl_combined = (ctx_tokens + gen_tokens).max(1);
+    let effective_isl_combined = ctx_tokens
+        .checked_add(gen_tokens)
+        .ok_or_else(|| {
+            AicError::InvalidEngineConfig(format!(
+                "{gen_tokens} decode tokens beside {ctx_tokens} prefill tokens \
+                 overflow the u32 mixed-step token count"
+            ))
+        })?
+        .max(1);
     let mut total = 0.0_f64;
     let mut memo = QueryMemo::new(context_plan, context_ops);
     for (index, op) in context_ops.iter().enumerate() {
@@ -777,7 +785,7 @@ pub(crate) fn get_mix_step_ops<'a>(
             let prefix = mamba_cached_prefix(op, prefix_per_req, combined_prefix > 0);
             let balanced = [[n - r, q, prefix], [r, q + 1, prefix]];
             for &[batch, tokens, prefix] in prefill_chunks.as_deref().unwrap_or(&balanced) {
-                if batch == 0 || tokens == 0 {
+                if batch == 0 {
                     continue;
                 }
                 let ctx = RuntimeContext {

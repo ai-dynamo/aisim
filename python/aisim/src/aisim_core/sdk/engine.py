@@ -1539,8 +1539,8 @@ class EngineHandle:
         isl: int,
         osl: int,
         gen_seq_imbalance_correction_scale: float = 1.0,
-    ) -> list[_PerOpValueWithMetadata]:
-        """Internal decode per-op stream with inline-first fallback metadata."""
+    ) -> tuple[list[_PerOpValueWithMetadata], float]:
+        """Internal decode per-op stream and coverage summed before name folding."""
         return self._engine._decode_step_per_op_with_metadata(
             int(gen_tokens), int(isl), int(osl), float(gen_seq_imbalance_correction_scale)
         )

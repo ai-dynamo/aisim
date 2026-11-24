@@ -1621,7 +1621,7 @@ def _estimate_decode_step_with_rust(
     """Retain native decode energy and covered latency for aggregate reporting."""
     handle = _cached_engine_handle(model, database)
     try:
-        entries = handle._decode_step_per_op_with_metadata(
+        entries, covered_latency_ms = handle._decode_step_per_op_with_metadata(
             int(gen_tokens),
             int(isl),
             int(osl),
@@ -1638,7 +1638,7 @@ def _estimate_decode_step_with_rust(
         per_op_energy_wms=energy,
         per_op_source=source,
         moe_comm_fallbacks=fallbacks,
-        covered_latency_ms=sum(entry[1] for entry in entries if entry[2] > 0),
+        covered_latency_ms=covered_latency_ms,
         num_decode_requests=gen_tokens,
     )
 
@@ -1890,9 +1890,19 @@ def _mamba_qualification_identity(model: Any) -> list[list[Any]]:
     Mamba2 op nested in a composite. It runs only when the memo misses.
     """
     # Lazy import: ``sdk.engine`` imports from this module at top level.
+    from aisim_core._native import FallbackOp, Mamba2Kernel, OverlapOp
     from aisim_core.sdk.engine import _as_engine_op
     from aisim_core.sdk.operations import FPMForwardOp
     from aisim_core.sdk.operations.base import Operation
+
+    if getattr(model, "_hybrid_config", None) is None and not any(
+        isinstance(op, (Mamba2Kernel, FPMForwardOp, FallbackOp, OverlapOp)) or type(op) is Operation
+        for ops_name in ("context_ops", "generation_ops")
+        for op in getattr(model, ops_name, ())
+    ):
+        # Base-wrapped native ops may hold staged children or TokenScale;
+        # ordinary typed leaves cannot contain Mamba and need no conversion.
+        return []
 
     entries = []
     for ops_name in ("context_ops", "generation_ops"):

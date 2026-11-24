@@ -66,7 +66,11 @@ existing XPU scaling heuristic. For a single text request, `run_agg` already
 sums its actual chunk prices and XPU TTFT uses that total directly.
 The aggregate scheduler reserves `nextn + 1` query-token slots per decoder from the full token capacity
 before capping prefill by the batch's demand. Whole-model FPM demand counts
-uncached tokens; op-level demand uses full prompt coordinates. The fitted XPU
+uncached tokens; op-level demand uses full prompt coordinates. Unqualified
+op-level graphs retain the calibrated mean-field demand for the whole batch,
+even beside concurrent decoders; that estimate is not a physical request-slot
+schedule. FPM and qualified Mamba prefill instead respect the request slots
+left after decode. The fitted XPU
 burst factor keeps its full-prompt denominator (`isl`), including for FPM:
 changing the query's token coordinates does not recalibrate the fit.
 Qualified Mamba mixed-step queries reject a partial prefill extend longer than

@@ -605,6 +605,71 @@ def test_non_mamba_hybrid_rebuild_refreshes_engine_identity(model_name):
     assert rust_engine_step.engine_identity(model, database) == key
 
 
+def test_plain_graph_identity_does_not_compile_operation_specs(monkeypatch):
+    from aisim_core.sdk import engine, operations
+    from aisim_core.sdk.models import get_model
+
+    def unexpected_conversion(_op):
+        pytest.fail("ordinary non-hybrid leaves need no qualification spec serialization")
+
+    monkeypatch.setattr(engine, "_as_engine_op", unexpected_conversion)
+    for _ in range(2):
+        model = get_model("Qwen/Qwen3-0.6B", ModelConfig(tp_size=1), "vllm")
+        assert rust_engine_step._mamba_qualification_identity(model) == []
+    # Also cover directly constructed native leaves, not just SDK shells.
+    import aisim_core
+
+    model = SimpleNamespace(
+        context_ops=[aisim_core.op_from_spec_json(operations.ElementWise("norm", 1, 8, 8, 1)._spec_json())]
+    )
+    assert rust_engine_step._mamba_qualification_identity(model) == []
+
+
+@pytest.mark.parametrize("composite", [False, True])
+def test_qualification_identity_keeps_native_and_nested_mamba(composite):
+    import aisim_core
+    from aisim_core.sdk import operations
+
+    scan = operations.Mamba2Kernel(
+        "context_scan",
+        1,
+        "mamba_chunk_scan_combined",
+        "context",
+        4096,
+        64,
+        64,
+        128,
+        4,
+        4,
+        128,
+        state_dtype="bfloat16",
+    )
+    native = aisim_core.op_from_spec_json(scan._spec_json())
+    op = operations.OverlapOp("context_nested", [native], []) if composite else native
+    model = SimpleNamespace(context_ops=[op])
+    identity = rust_engine_step._mamba_qualification_identity(model)
+    assert len(identity) == 1
+    assert '"Mamba2"' in identity[0][2]
+
+
+def test_decode_bridge_retains_native_coverage_of_a_folded_name(monkeypatch):
+    class Handle:
+        def _decode_step_per_op_with_metadata(self, *args, **kwargs):
+            # Native queries of 3 ms with power and 7 ms without power have
+            # already folded into one row. Positive folded energy covers 3 ms.
+            return [("shared", 10.0, 30.0, "mixed")], 3.0
+
+        def last_provenance(self):
+            return None
+
+    monkeypatch.setattr(rust_engine_step, "_cached_engine_handle", lambda *_: Handle())
+    result = rust_engine_step._estimate_decode_step_with_rust(None, None, gen_tokens=2, isl=64, osl=4)
+    assert result.latency_ms == 10.0
+    assert result.energy_wms == 30.0
+    assert result.per_op_latency_ms == {"shared": 10.0}
+    assert result.covered_latency_ms == 3.0
+
+
 def test_decode_step_breakdown_folds_per_op_entries(monkeypatch) -> None:
     """The decode bridge returns latency, energy, per-op data, and executed
     fallback provenance from ``EngineHandle.decode_step_per_op``."""
@@ -616,7 +681,7 @@ def test_decode_step_breakdown_folds_per_op_entries(monkeypatch) -> None:
             return [
                 ("generation_attention", 2.0, 20.0, "silicon"),
                 ("generation_mlp", 1.0, 4.0, "estimated", _GENERATION_FALLBACK_PAYLOAD),
-            ]
+            ], 3.0
 
         def last_provenance(self):
             return None
@@ -2467,7 +2532,7 @@ def test_shipped_gb200_ep32_node8_reports_executed_fallback_to_api_and_cli(cli_p
         assert not any(entry[4] is not None for entry in (*metadata_context_attention, *metadata_decode_attention))
 
         public_decode = handle.decode_step_per_op(1, 1024, 32)
-        metadata_decode = handle._decode_step_per_op_with_metadata(1, 1024, 32)
+        metadata_decode, _ = handle._decode_step_per_op_with_metadata(1, 1024, 32)
         assert all(len(entry) == 4 for entry in public_decode)
         assert {payload[0] for payload in _fallback_payloads(metadata_decode)} == {"generation"}
 
@@ -2694,7 +2759,7 @@ def test_mixed_energy_coverage_keeps_missing_contributions_with_repeated_names(m
 def test_decode_estimate_retains_energy_and_partial_coverage(monkeypatch):
     class Handle:
         def _decode_step_per_op_with_metadata(self, *args, **kwargs):
-            return [("covered", 3.0, 30.0, "silicon"), ("missing", 7.0, 0.0, "empirical")]
+            return [("covered", 3.0, 30.0, "silicon"), ("missing", 7.0, 0.0, "empirical")], 3.0
 
         def last_provenance(self):
             return None

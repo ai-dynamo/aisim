@@ -555,6 +555,17 @@ Values are in GiB:
 The activations scale with the tokens: `0.15625 * 1096 / 2048 = 0.083618`.
 Weights, KV cache and the other terms do not change.
 
+This activation correction intentionally applies to legacy, unqualified graphs
+too: the Nano model in this table has no MTP qualification. The regression
+`test_legacy_aggregate_memory_matches_recorded_suffix_evidence` checks these
+historical values through current `run_agg`, reconstructs the former memory
+input separately, and checks both OOM and KV-budget decisions. All four points
+fit the bundled B200 capacity before and after; neither decision changes.
+A capacity threshold between the old and new totals can intentionally change
+an OOM decision, because cached tokens no longer reserve live activations for
+work absent from the step. TensorRT-LLM's separate build-budget reservation
+continues to use `max_num_tokens`.
+
 [`fpm_caller.py`](mamba-mixed-step-accounting/fpm_caller.py) checks the FPM
 input through the compiled whole-model estimator. It builds a Qwen3-0.6B FPM
 model and a synthetic vLLM table with the FPM unit-test helpers, with one
