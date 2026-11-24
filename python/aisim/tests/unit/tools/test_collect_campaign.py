@@ -231,7 +231,8 @@ def test_k31_campaign_refuses_multi_gpu_cases_before_launch(monkeypatch, tmp_pat
 
 
 @pytest.mark.parametrize("phase", ["context", "generation"])
-def test_k31_campaign_preserves_tp1_shards(monkeypatch, tmp_path, phase):
+@pytest.mark.parametrize("mode", ["run", "finalize"])
+def test_k31_campaign_preserves_tp1_shards(monkeypatch, tmp_path, phase, mode):
     from types import SimpleNamespace
 
     c = _load()
@@ -242,6 +243,10 @@ def test_k31_campaign_preserves_tp1_shards(monkeypatch, tmp_path, phase):
     plan = c.Plan("sglang", 103, (shard,))
     monkeypatch.setattr(c, "collector_ref", lambda _: "0" * 40)
     monkeypatch.setattr(c, "image_digest", lambda _: "sha256:test")
+    if mode == "finalize":
+        checkpoint = c.shard_dir(tmp_path / "out", shard) / ".ckpt" / plan.backend / f"{plan.backend}.{shard.op}.json"
+        checkpoint.parent.mkdir(parents=True)
+        checkpoint.touch()
     commands = []
 
     def launch(argv):
@@ -256,7 +261,7 @@ def test_k31_campaign_preserves_tp1_shards(monkeypatch, tmp_path, phase):
             gpus=[3],
             checkout=tmp_path,
             image_override="test-image",
-            mode="run",
+            mode=mode,
         )
         == 0
     )

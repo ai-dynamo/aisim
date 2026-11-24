@@ -431,9 +431,11 @@ def run_campaign(
         completed = st == "finalized" or (st == "done-no-parquet" and not _native_k31(plan.backend, s.op))
         if mode == "run" and completed and (shard_dir(root, s) / "DONE").exists():
             continue
-        if mode == "finalize" and st != "done-no-parquet":
-            continue
         checkpoint = shard_dir(root, s) / ".ckpt" / plan.backend / f"{plan.backend}.{s.op}.json"
+        if mode == "finalize" and st != "done-no-parquet":
+            recoverable = st == "started" and _native_k31(plan.backend, s.op) and checkpoint.is_file()
+            if not recoverable:
+                continue
         _validate_shard_allocation(plan, s, finalize_checkpoint=checkpoint if mode == "finalize" else None)
         todo.append(s)
     print(f"{mode}: {len(todo)}/{len(plan.shards)} shards on gpus {gpus}")

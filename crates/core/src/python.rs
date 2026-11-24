@@ -3321,6 +3321,13 @@ fn checkpoint_requires_state_cache(model_path: &str) -> Result<bool> {
                     ))
                 })?
                 .cast_into::<PyDict>()?;
+            let problem: Option<String> = py
+                .import("aisim_core.decoder_config")?
+                .call_method1("nested_decoder_ambiguity", (&key, &decoder))?
+                .extract()?;
+            if let Some(message) = problem {
+                return Err(pyo3::exceptions::PyValueError::new_err(message));
+            }
             if let Some(value) = architecture(&decoder)? {
                 architectures.push(value);
             }
@@ -9287,6 +9294,12 @@ mod tests {
                 serde_json::json!({"architectures": ["UnknownWrapper"],
                 "text_config": {"architectures": ["KimiLinearForCausalLM"]}}),
                 Some(true),
+            ),
+            (
+                "ambiguous-nested",
+                serde_json::json!({"architectures": ["Qwen3ForCausalLM"],
+                    "text_config": {"text_config": {"architectures": ["KimiLinearForCausalLM"]}}}),
+                None,
             ),
             ("missing-architecture", serde_json::json!({}), None),
         ] {
