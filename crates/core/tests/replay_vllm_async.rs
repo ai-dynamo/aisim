@@ -707,3 +707,38 @@ fn a_simple_cpu_preemption_polls_after_the_transfers_it_synchronizes() {
             .all(|request| request.output_length == request.requested_output_length)
     );
 }
+
+#[test]
+fn simple_cpu_preemption_delays_previous_outputs_and_the_next_pass_restore() {
+    // Each four-token block is 64 B. D2H takes 7 ms per block and H2D 42 ms.
+    // The decode pass decided at 880 preempts and waits for request 3's D2H
+    // from 890 to 897. Its 2 ms launch ends at 899, when request 5's final
+    // token can be returned and the following pass can be decided.
+    // That pass launches until 901 and issues request 6's two-block restore.
+    // The copy ends at 985. The poll at 979 misses it, the poll at 989 sees
+    // it, and the pass two decisions later admits request 6 at 1017.
+    let h2d_gbps = 64.0 / (42.0 * 1e6);
+    let mut config = polled_cpu_tier(14, h2d_gbps);
+    config.native_host_offload = Some(
+        NativeHostOffloadConfig::new(64)
+            .with_bandwidths(64.0 / (7.0 * 1e6), h2d_gbps)
+            .with_connector(G2Connector::SimpleCpuV032),
+    );
+    let report = run_tokens(
+        config,
+        vec![
+            tokens_request(1, (0..20).collect(), 1, 0.0),
+            tokens_request(2, (500..552).collect(), 1, 300.0),
+            tokens_request(3, (900..912).collect(), 26, 600.0),
+            tokens_request(5, (1900..1911).collect(), 10, 600.0),
+            tokens_request(4, (0..12).collect(), 2, 615.0),
+            tokens_request(6, (500..511).collect(), 1, 865.0),
+        ],
+    );
+    let restored = record(&report, 6);
+    assert_eq!(restored.first_admission_host_reused_input_tokens, Some(8));
+    assert_eq!(
+        (record(&report, 5).last_token_ms, restored.first_admit_ms),
+        (Some(899.0), Some(1017.0))
+    );
+}
