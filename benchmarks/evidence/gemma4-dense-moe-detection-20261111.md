@@ -12,9 +12,9 @@ available in this checkout; these tables remain historical author-reported
 results, not verification of the current head. No GPU was run, and no
 performance data was added, re-collected, or re-fitted.
 
-The current code head is `396756274139fbc81dfdda901836e80f851de375`, which
-sits on the merge of `main` at `1e321d5848ffc09dc7686cbc819eaf3dc5f52eac`;
-later commits change only this document. See
+The current code head is `86dcd47962ab3145e5377ed336991dcb9ccc89fd`, which
+merges `main` at `29104f537634779690aa6721b93b39c4204d13cb`; later commits
+change only this document. See
 [Current head after the main merges](#current-head-after-the-main-merges-2026-11-24)
 for the verification at that SHA. The pre-rebase head was
 `8f3a62e0fde729cf74db0b6b3551608338b367dd`, based on
@@ -40,10 +40,10 @@ feasible/infeasible status are meaningful.
 
 ## Current head after the main merges (2026-11-24)
 
-The reviewed code head is `396756274139fbc81dfdda901836e80f851de375`; any
+The reviewed code head is `86dcd47962ab3145e5377ed336991dcb9ccc89fd`; any
 later commit changes only this document. It adds the omitted-MoE-dimension
-inference described below on top of two merges of `main`, which sit on top of
-the reviewed commits. `bf527e451` merges `main` at
+inference described below on top of three merges of `main`, which sit on top
+of the reviewed commits. `bf527e451` merges `main` at
 `24d06d418db0ec4aee309e0e24770958c8fdea19` and reconciles one consumer with
 this branch: because the dense gate now raises
 `InvalidEngineConfigurationError` (a `ValueError`) instead of an
@@ -53,15 +53,21 @@ match. `d65e5b396` then aligned the sentinel workflow-contract test.
 `f9d44bcdc` merges `main` at `1e321d584`, whose #976 had already adopted those
 same sentinel assertions, so the merge keeps main's version of
 `tests/test_ci_workflow_contracts.py` and the branch's own workflow edit
-reduces to the single `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1` line. Below the
-merges are the reviewed commits: `d4faab7fd` (classifier fix), `13ca8aa81`
+reduces to the single `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1` line.
+`86dcd4796` merges `main` at `29104f537`, which moves the op-latency tables to
+the pinned Hugging Face dataset (#857) and enforces human commit authorship
+(#1008). That merge is required, not cosmetic: the base branch's Fast CI
+workflow now runs `scripts/ci/test_op_latency_handoff.py`, a file that only
+exists after #857, so the workflow on the previous merge ref aborted with
+`ERROR: file or directory not found` before running any contract test. Below
+the merges are the reviewed commits: `d4faab7fd` (classifier fix), `13ca8aa81`
 (this document), `45d70db42` (embedded bridge tests), `c63cd7668`
 (request-wide fallback regression and the CI enforcement flag), `31800b398`
 (non-integer expert metadata), `d0075f9bb` (host budget pin) and `b761646c0`
 (the Rust error mapping described next).
 
-Relative to `main` at `1e321d584` the branch changes 25 files: 2,048
-insertions against 58 deletions, of which this document accounts for 555.
+Relative to `main` at `29104f537` the branch changes 26 files: 2,145
+insertions against 62 deletions, of which this document accounts for 595.
 The branch's own edits are the reviewed commits above; the first merge also
 carries main's `5b6a8aca3` FPM-schema changes in
 `crates/core/src/perfmodel/fpm/model.rs` and
@@ -118,33 +124,40 @@ the request now estimates natively instead of failing the width check.
 
 ### Verification at the current head
 
-Local run at `396756274` on macOS arm64, Python 3.13.9, with the native
+Local run at `86dcd4796` on macOS arm64, Python 3.13.9, with the native
 extension rebuilt from this head's tree (`maturin develop --release`, the `pyproject.toml`
 `extension-module,jemalloc` features) so the interpreter and extension agree on
 `ENGINE_SPEC_SCHEMA_VERSION` (30 in this tree and on `main`; an extension built
-from another branch with 31 fails unrelated `perfmodel::py` tests).
+from another branch with 31 fails unrelated `perfmodel::py` tests). The Rust
+suite also needs the composed systems root that #857 introduced:
+`python scripts/ci/compose_systems_root.py` prints it, and
+`AICONFIGURATOR_SYSTEMS_PATH` must name it, as Full CI's
+`prefetch-op-latency-data` action does. Without that variable the op-latency
+tables are absent and most `perfmodel::` tests fail for missing data rather
+than for a code defect. The Python selection took 12m29s on its first run after
+the merge because that dataset cache was cold; later runs reuse it.
 
 | Verification | Tested commit | Result |
 | --- | --- | --- |
-| Targeted pytest selection from the 2026-11-18 command below (includes the two new MoE-inference tests) | `396756274` | 1,189 passed, 0 failed |
-| `cargo test -p aisim-core --features embed-python --lib perfmodel::` (covers `memory.rs` and the `fpm/model.rs` fallback policy test) | `396756274` | 1,476 passed, 0 failed, 1 ignored |
-| `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1 cargo test -p aisim-core --features embed-python --test perfmodel_dense_gemma4_bridge` | `396756274` | 5 passed; no skips |
-| `cargo fmt --all -- --check` | `396756274` | clean |
-| `tests/test_ci_workflow_contracts.py` with Fast CI's invocation | `396756274` | 782 passed, 3 skipped, 5 failed for host-only reasons (see below) |
+| Targeted pytest selection from the 2026-11-18 command below (includes the two new MoE-inference tests) | `86dcd4796` | 1,189 passed, 0 failed |
+| `cargo test -p aisim-core --features embed-python --lib perfmodel::` (covers `memory.rs` and the `fpm/model.rs` fallback policy test) | `86dcd4796` | 1,476 passed, 0 failed, 1 ignored |
+| `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1 cargo test -p aisim-core --features embed-python --test perfmodel_dense_gemma4_bridge` | `86dcd4796` | 5 passed; no skips |
+| `cargo fmt --all -- --check` | `86dcd4796` | clean |
+| `tests/test_ci_workflow_contracts.py` and `scripts/ci/test_op_latency_handoff.py` with Fast CI's invocation | `86dcd4796` | 795 passed, 3 skipped, 5 failed for host-only reasons (see below) |
 
 The 5 workflow-contract failures are environmental, not merge regressions: the
-same five fail identically at `main` `1e321d584` in a clean worktree. One needs
+same five fail identically at `main` in a clean worktree. One needs
 a Linux manylinux Python 3.12 root (`test_manylinux_bootstrap_exports_working_python_or_fails_before_build[None]`),
 and four need the `pip-licenses` distribution that this macOS dev venv does not
 install (`test_real_pip_licenses_enforces_the_policy`). The perf-model lib total
 is higher than the 1,460 recorded at `b761646c0` because main added tests.
-These are local results; the commits after `396756274` change only this
+These are local results; the commits after `86dcd4796` change only this
 document. **No Full CI run exists for this head**; admission remains with the
 maintainer.
 
 ### Support-matrix artifacts at the current head
 
-Neither the rebase nor the two merges of `main` change the stale-row
+Neither the rebase nor the three merges of `main` change the stale-row
 position, and this branch does not introduce those rows. [Support-matrix artifacts](#support-matrix-artifacts)
 below holds the per-file counts and the constraint that blocks regeneration:
 the 103 op-level FPE rows and the ten retired-version `FAIL` rows are
@@ -494,9 +507,9 @@ still fail for a real reason (`PERF_DATA_MISSING`, `SDK_UNREPRESENTABLE`,
 Inspection at `8f3a62e0` confirms all 103 FPE rows and ten retired-version
 CLI rows above still record `FAIL`. Neither set was regenerated by the local
 verification above. The same counts and byte-identical rows were re-checked at
-`396756274` against `main` `1e321d584` (and earlier at `d65e5b396` and
-`f9d44bcdc` against `1e321d584`, and at `b761646c0` against `19d8a245a`): 103
-dense-rejection FPE
+`86dcd4796` against `main` `29104f537` (and earlier at `396756274`,
+`d65e5b396` and `f9d44bcdc` against `1e321d584`, and at `b761646c0` against
+`19d8a245a`): 103 dense-rejection FPE
 rows on both trees,
 and the ten dense `FAIL` rows plus six `HW_INCOMPATIBLE` rows for
 `trtllm 1.3.0rc23` on both trees, so this branch neither adds nor clears any of
