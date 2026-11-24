@@ -565,8 +565,8 @@ def estimate_kv_bytes_per_token(
     *,
     tp_size: int,
     pp_size: int,
-    moe_tp_size: int = 1,
-    moe_ep_size: int = 1,
+    moe_tp_size: int | None = None,
+    moe_ep_size: int | None = None,
     kvcache_quant_mode: str | None = None,
     fpm_profile: dict[str, Any] | None = None,
     worker_type: str = "aggregated",
@@ -599,8 +599,8 @@ def estimate_kv_bytes_per_token(
             tp_size=tp_size,
             pp_size=pp_size,
             attention_dp_size=attention_dp_size,
-            moe_tp_size=moe_tp_size,
-            moe_ep_size=moe_ep_size,
+            moe_tp_size=1 if moe_tp_size is None else moe_tp_size,
+            moe_ep_size=1 if moe_ep_size is None else moe_ep_size,
             cp_size=cp_size,
         )
         deployment.validate_overrides(kvcache_quant_mode=kvcache_quant_mode, attention_backend=attention_backend)
@@ -635,7 +635,10 @@ def estimate_kv_bytes_per_token(
             pp_size=pp_size,
             attention_dp_size=attention_dp_size,
             moe_tp_size=moe_tp_size,
-            moe_ep_size=moe_ep_size,
+            # Token geometry is independent of MoE placement. With no authored
+            # topology, use one EP rank and let the canonical resolver infer
+            # MoE TP from the complete attention width (TP * DP * CP).
+            moe_ep_size=1 if moe_tp_size is None and moe_ep_size is None else moe_ep_size,
             kvcache_quant_mode=kvcache_quant_mode,
             attention_backend=attention_backend,
             cp_size=cp_size,
@@ -652,8 +655,8 @@ def estimate_kv_bytes_per_token(
         raw_config,
         tp_size=tp_size,
         pp_size=pp_size,
-        moe_tp_size=moe_tp_size,
-        moe_ep_size=moe_ep_size,
+        moe_tp_size=1 if moe_tp_size is None else moe_tp_size,
+        moe_ep_size=1 if moe_ep_size is None else moe_ep_size,
     )
     if getattr(estimator, "architecture", None) == "DeepseekV4ForCausalLM":
         # The dense formula prices every layer's full BF16 KV (88 KiB/token for V4 Flash). V4 stores

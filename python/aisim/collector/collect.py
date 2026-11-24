@@ -1544,8 +1544,26 @@ class ResumeCheckpoint:
             logger.info(f"{self.module_name}: {', '.join(parts)}")
         return runnable
 
+    @staticmethod
+    def has_recoverable_checkpoint(path: Path) -> bool:
+        """Inspect the same atomic-replacement states that load_existing recovers."""
+        if not path.parent.exists():
+            return False
+        with _locked_checkpoint_directory(path) as locked:
+            canonical = _checkpoint_path_in_locked_directory(path, locked)
+            if not any(
+                _entry_state_at(locked.file_descriptor, name) is not None
+                for name in (canonical.name, _atomic_write_previous_path(canonical).name)
+            ):
+                return False
+            _effective_checkpoint_state_at(locked.file_descriptor, canonical, context_path=canonical, kind="checkpoint")
+        return True
+
+    def unfinished_attempt_ids(self) -> set[str]:
+        return self._attempted - self._done - self._failed
+
     def has_unfinished_attempts(self) -> bool:
-        return bool(self._attempted - self._done - self._failed)
+        return bool(self.unfinished_attempt_ids())
 
     def has_passed(self, task_id: str) -> bool:
         return task_id in self._done
@@ -3335,6 +3353,10 @@ def _load_selected_producer_checkpoint(
             f"{context}: staged table {staging_path} has no checkpoint for selected producer "
             f"{resume_tracker.module_name} at {checkpoint_path}"
         )
+    if collection["type"].startswith("kimi_k31_dsa_"):
+        from collector.fullnode import bind_native_checkpoint
+
+        bind_native_checkpoint(checkpoint_path, staging_path.parent)
     if staging_path.stem not in _registered_checkpoint_tables(resume_tracker._metadata, backend=backend):
         raise RuntimeError(
             f"{context}: checkpoint producer {resume_tracker.module_name} does not own staged table {staging_path}"

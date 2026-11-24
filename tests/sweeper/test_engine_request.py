@@ -432,7 +432,8 @@ def k31_token_geometry_config(tmp_path):
 
 @pytest.mark.parametrize("tp", [1, 2, 4, 8])
 @pytest.mark.parametrize("layout,expected", [("flashmla", 18_912), ("trtllm_mla", 16_992)])
-def test_k31_token_geometry_uses_core_layout_without_fixed_state(k31_token_geometry_config, tp, layout, expected):
+@pytest.mark.parametrize("moe", ["omitted", "tp", "ep", "explicit"])
+def test_k31_token_geometry_uses_core_layout_without_fixed_state(k31_token_geometry_config, tp, layout, expected, moe):
     from aisim.capacity import estimate_kv_bytes_per_token
 
     # 24 DSA layers: packed latent 656 (FlashMLA) / 576 (TRTLLM) bytes
@@ -442,13 +443,99 @@ def test_k31_token_geometry_uses_core_layout_without_fixed_state(k31_token_geome
             k31_token_geometry_config,
             tp_size=tp,
             pp_size=1,
-            moe_tp_size=tp,
+            **{
+                "omitted": {},
+                "tp": {"moe_tp_size": tp},
+                "ep": {"moe_ep_size": 1},
+                "explicit": {"moe_tp_size": 1, "moe_ep_size": tp},
+            }[moe],
             backend="sglang",
             kvcache_quant_mode="fp8",
             attention_backend=layout,
         )
         == expected
     )
+
+
+def test_k31_geometry_rejects_authored_moe_width_mismatch(k31_token_geometry_config):
+    from aisim.capacity import estimate_kv_bytes_per_token
+
+    with pytest.raises(ValueError, match="Parallelism width mismatch"):
+        estimate_kv_bytes_per_token(
+            k31_token_geometry_config,
+            tp_size=8,
+            pp_size=1,
+            moe_tp_size=1,
+            moe_ep_size=1,
+            kvcache_quant_mode="fp8",
+            attention_backend="flashmla",
+        )
+
+
+@pytest.mark.parametrize("layout", ["flashmla", "trtllm_mla"])
+def test_afd_auto_transfer_preserves_model_controls(monkeypatch, layout):
+    from pathlib import Path
+
+    import aisim.compiler as compiler
+    from aisim_core.sdk import perf_database
+
+    # K31 currently fails AFD's source-shape validation before this call. Use
+    # a supported MoE for the real compiler path; the K31 tests above check
+    # the backend-specific physical byte counts separately.
+    original = compiler.estimate_kv_bytes_per_token
+    estimates = []
+
+    def estimate(*args, **kwargs):
+        value = original(*args, **kwargs)
+        estimates.append((kwargs, value))
+        return value
+
+    monkeypatch.setattr(compiler, "estimate_kv_bytes_per_token", estimate)
+    raw = {
+        "engine": {
+            "mode": "disaggregated",
+            "model": "deepseek-ai/DeepSeek-V3",
+            "hardware": "h200_sxm",
+            "backend": "sglang",
+            "backend_version": "0.5.14",
+            "context_length": 2048,
+            "database_mode": "SOL",
+            "systems_paths": [str(Path(perf_database.__file__).parents[1] / "systems")],
+            "kvcache_quant_mode": "fp8",
+            "attention_backend": layout,
+            "kv_transfer": {"bytes_per_token": "auto", "bandwidth_gb_per_second": 50},
+            "workers": {
+                role: {
+                    "type": "afd",
+                    "afd": {
+                        "n_a_nodes": 1,
+                        "n_f_nodes": 1,
+                        "tp_a": 8,
+                        "a_batch_size": 8,
+                        "num_microbatches": 1,
+                    },
+                }
+                for role in ("prefill", "decode")
+            },
+        },
+        "traffic": {
+            "source": {"type": "synthetic", "input_tokens": 16, "output_tokens": 4},
+            "load": {"type": "concurrency", "concurrency": 1},
+            "stop": {"requests": 1},
+        },
+    }
+    config = CorePredictionConfig.model_validate(raw)
+    restored = CorePredictionConfig.model_validate_json(config.model_dump_json())
+    spec = prediction_to_replay_spec(restored)
+    assert len(estimates) == 1
+    controls, expected = estimates[0]
+    assert controls["attention_backend"] == layout
+    assert controls["kvcache_quant_mode"] == "fp8"
+    assert controls["tp_size"] == controls["moe_tp_size"] == 8
+    assert controls["moe_ep_size"] == 1
+    assert controls["backend"] == "sglang"
+    assert spec.backend_deployment.prefill_engine_args["kv_transfer_bytes_per_token"] == expected
+    assert spec.backend_deployment.decode_engine_args["kv_transfer_bytes_per_token"] == expected
 
 
 def test_k31_token_geometry_rejects_ambiguous_layout(k31_token_geometry_config):

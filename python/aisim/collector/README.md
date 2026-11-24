@@ -41,6 +41,17 @@ separate checkpoint/output roots for before/after cost experiments; changing a
 group's point list changes its existing task ID and can repeat its older points
 on resume, while preventing newly added points from being skipped.
 
+Native Kimi K3.1 checkpoints keep a `.json.output-owner` record beside each
+producer checkpoint. Keep it with the checkpoint when moving a shard: it binds
+the output root by relative path and gives pending publication receipts a stable
+checkpoint identity across container mounts. Reusing that checkpoint directory
+for a different output root is rejected before collection and finalization.
+An existing checkpoint without an owner record cannot be attributed safely;
+preserve its files for manual recovery, or start a new collection with fresh
+checkpoint and output roots. A campaign marks a native shard complete only when
+its phase Parquet has committed `collection_meta.yaml` provenance with a matching
+row count; a missing record remains incomplete even after a zero-work resume.
+
 See [the declaration fields](cases/README.md#optional-long-context-points) and
 [coverage rationale](cases/README.md#choosing-coverage). Collection-cost
 estimates count setup changes, point preparation, warmup/capture and timed
