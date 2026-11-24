@@ -1776,6 +1776,40 @@ class TestParseCompressedTensorsQuant:
         assert overrides.get("gemm_quant_mode") == common.GEMMQuantMode.int4_wo
         assert overrides.get("moe_quant_mode") == common.MoEQuantMode.int4_wo
 
+    @pytest.mark.parametrize(
+        "targets,weights,extra_group,message",
+        [
+            (None, {"num_bits": 8, "type": "float"}, None, "require non-empty targets"),
+            (["mlp.experts"], {"num_bits": 8, "type": "float"}, None, "Missing.*attention"),
+            (["self_attn"], {"num_bits": 8, "type": "float"}, None, "Missing.*routing_experts"),
+            (["Linear"], {"num_bits": 3, "type": "int"}, None, "Unsupported.*weights.*attention"),
+            (["Linear"], {"num_bits": 4, "type": "float"}, None, "Unsupported.*w4a16_mxfp4.*attention"),
+            (["Linear"], {"num_bits": 8, "type": "int"}, None, "Unsupported.*int8_wo.*routing_experts"),
+            (
+                ["Linear"],
+                {"num_bits": 8, "type": "float"},
+                {"targets": [r"re:.*mlp\.experts\..*"], "weights": {"num_bits": 4, "type": "float"}},
+                "Ambiguous.*routing_experts",
+            ),
+            (["re:[self_attn"], {"num_bits": 8, "type": "float"}, None, "Invalid.*target"),
+            (["re:(?!.*experts).*self_attn.*"], {"num_bits": 8, "type": "float"}, None, "Unsupported.*target"),
+            (["model.layers.0.mlp.experts.0.down_proj"], {"num_bits": 8, "type": "float"}, None, "Unsupported.*target"),
+        ],
+    )
+    def test_category_inference_rejects_missing_ambiguous_and_incompatible_groups(
+        self, targets, weights, extra_group, message
+    ):
+        from aisim.sdk.models import _infer_quant_modes_from_raw_config
+
+        group = {"weights": weights}
+        if targets is not None:
+            group["targets"] = targets
+        quant = {"format": "mxfp4-pack-quantized", "config_groups": {"base": group}}
+        if extra_group is not None:
+            quant["config_groups"]["experts"] = extra_group
+        with pytest.raises(ValueError, match=message):
+            _infer_quant_modes_from_raw_config({"quant_algo": "compressed-tensors", "quantization_config": quant})
+
     def test_redhat_dsv4_maps_block_fp8_attention_and_fp4_experts(self):
         """A declared packed DSV4 layout maps attention and experts independently."""
         from aisim.sdk import common

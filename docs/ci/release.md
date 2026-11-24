@@ -170,8 +170,15 @@ For compressed-tensors 4-bit float weights, the effective config-group `format`
 (falling back to the quantization header's `format`) must be
 `mxfp4-pack-quantized`; other or missing formats fail rather than selecting an
 MXFP4 profile. This metadata may live under `text_config.quantization_config`.
-Every 4-bit float group is checked regardless of ordering, even after another
-group has established the base algorithm.
+Every 4-bit float group is checked regardless of ordering. Group `targets`
+select attention and routed-expert algorithms independently; `Linear` targets
+both categories. Each non-ignored category must have a matching group with a
+supported algorithm. Missing targets, conflicting algorithms within a category,
+and category-incompatible algorithms fail explicitly. Thus FP8 attention and
+packed MXFP4 experts select the same modes in either config-group order.
+Use whole-category selectors, such as `re:.*self_attn.*` and
+`re:.*mlp\.experts\..*`; arbitrary per-layer/per-projection selectors cannot
+establish a uniform category mode and fail explicitly.
 Whole-expert exclusions (`mlp.experts`, `re:.*mlp\.experts\..*`,
 `re:.*mlp\.experts.*`, or `re:.*experts.*` in `ignore`) select BF16 MoE.
 Partial or unrecognized routed-expert exclusions require an explicit

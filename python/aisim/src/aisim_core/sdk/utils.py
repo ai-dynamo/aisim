@@ -1727,8 +1727,51 @@ def _categorize_ignore_pattern(pattern: str) -> set[str]:
     return categories
 
 
+def _compressed_tensors_target_categories(target: str) -> set[str]:
+    """Recognize whole-category selectors, without guessing regex containment.
+
+    Coarse SDK modes cannot express arbitrary per-layer/per-projection targets.
+    In particular, merely mentioning ``experts`` in a negative lookahead or an
+    unrelated path is not proof that a selector quantizes routed experts.
+    """
+    if target == "Linear":
+        return {"attention", "routing_experts", "shared_experts", "dense_mlp", "lm_head"}
+    named = {
+        "self_attn": {"attention"},
+        "mlp.experts": {"routing_experts"},
+        "mlp.shared_experts": {"shared_experts"},
+        "mlp.shared_expert": {"shared_experts"},
+        "lm_head": {"lm_head"},
+    }
+    if target in named:
+        return named[target]
+    if target.startswith("re:"):
+        try:
+            re.compile(target[3:])
+        except re.error as error:
+            raise ValueError(f"Invalid compressed-tensors target {target!r}: {error}") from error
+        # These forms cover all descendants of the named category. A literal
+        # or wildcard dot before the component is immaterial to category scope.
+        for module, categories in named.items():
+            escaped = re.escape(module)
+            for prefix in ("re:.*", "re:.*.", r"re:.*\."):
+                for suffix in (".*", r"\..*"):
+                    if target in (prefix + module + suffix, prefix + escaped + suffix):
+                        return categories
+        if target == "re:.*experts.*":
+            return {"routing_experts", "shared_experts"}
+        # Native DeepSeek-V4's complete projection groups use attn/ffn names.
+        if target == "re:.*attn.*(fused_wqa_wkv|wq_b|wo_a|wo_b)$":
+            return {"attention"}
+        if target == "re:.*ffn.*(gate|up|down)_proj$":
+            return {"routing_experts"}
+    raise ValueError(f"Unsupported compressed-tensors target {target!r}; use whole-category selectors")
+
+
 def parse_compressed_tensors_quant(
     quantization_config: dict | None,
+    *,
+    category: str | None = None,
 ) -> tuple[str | None, frozenset[str]]:
     """Parse a compressed-tensors ``quantization_config`` dict.
 
@@ -1739,7 +1782,11 @@ def parse_compressed_tensors_quant(
       config carries no quantization information. Four-bit float weights require
       ``mxfp4-pack-quantized`` in the group's ``format`` or the header default;
       other or absent formats raise ``ValueError`` instead of guessing a lane.
-      Every group is checked, even after the base algorithm has been selected.
+      Every group is checked. With ``category``, select only groups whose
+      targets cover that category (or the common ``Linear`` class). Missing
+      targets, missing category matches and conflicting algorithms fail closed.
+      Arbitrary per-module selectors cannot establish a uniform category mode
+      and are rejected. Without ``category``, all groups must agree on one algorithm.
     - ``ignored_categories``: frozenset of layer-category names excluded from
       quantization (i.e. remaining in float16/bfloat16).  Empty when nothing is
       ignored or when ``base_algo`` is ``None``.
@@ -1751,8 +1798,13 @@ def parse_compressed_tensors_quant(
     if not isinstance(quantization_config, dict):
         return None, frozenset()
 
-    # Validate every group before exposing a single algorithm to the caller.
-    base_algo: str | None = None
+    ignored: set[str] = set()
+    for pattern in quantization_config.get("ignore") or []:
+        ignored |= _categorize_ignore_pattern(pattern)
+
+    # This runs during checkpoint preparation, over the small config-group
+    # list; it never expands layers/experts or runs in an iteration query.
+    algos: set[str] = set()
     for group in (quantization_config.get("config_groups") or {}).values():
         group_algo: str | None = None
         weights = (group or {}).get("weights") or {}
@@ -1780,19 +1832,29 @@ def parse_compressed_tensors_quant(
                 # W4A16 base lane; per-SM MoE kernel routing may upgrade the
                 # activation side (see operations/moe.py).
                 group_algo = "w4a16_mxfp4"
-        # Preserve the first recognized base algorithm: architecture-specific
-        # callers may map attention and expert precision independently.
-        if base_algo is None:
-            base_algo = group_algo
+        if category is not None:
+            targets = (group or {}).get("targets")
+            if not isinstance(targets, list) or not targets or any(not isinstance(t, str) for t in targets):
+                raise ValueError("compressed-tensors config groups require non-empty targets for category inference")
+            categories: set[str] = set()
+            for target in targets:
+                categories |= _compressed_tensors_target_categories(target)
+            if category not in categories:
+                continue
+            if group_algo is None and category not in ignored:
+                raise ValueError(f"Unsupported compressed-tensors weights for {category}")
+        if group_algo is not None:
+            algos.add(group_algo)
 
-    if base_algo is None:
-        return None, frozenset()
-
-    ignored: set[str] = set()
-    for pattern in quantization_config.get("ignore") or []:
-        ignored |= _categorize_ignore_pattern(pattern)
-
-    return base_algo, frozenset(ignored)
+    if category in ignored:
+        return None, frozenset(ignored)
+    if len(algos) > 1:
+        raise ValueError(f"Ambiguous compressed-tensors algorithms for {category or 'all categories'}: {sorted(algos)}")
+    if category is not None and not algos:
+        raise ValueError(
+            f"Missing compressed-tensors target group for {category}; explicitly ignore unquantized categories"
+        )
+    return next(iter(algos), None), frozenset(ignored)
 
 
 def _normalize_kv_cache_algo(value: object) -> str | None:

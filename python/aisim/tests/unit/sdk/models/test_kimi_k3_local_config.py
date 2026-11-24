@@ -41,7 +41,9 @@ def local_kimi(tmp_path, monkeypatch):
         "quantization_config": {
             "quant_method": "compressed-tensors",
             "format": "mxfp4-pack-quantized",
-            "config_groups": {"experts": {"weights": {"num_bits": 4, "type": "float"}}},
+            "config_groups": {
+                "experts": {"weights": {"num_bits": 4, "type": "float"}, "targets": [r"re:.*mlp\.experts\..*"]}
+            },
             "ignore": ["self_attn", "mlp.shared_experts", "lm_head"],
         },
     }
@@ -247,6 +249,38 @@ def test_local_kimi_invalid_later_group_fails_in_either_order(local_kimi, expert
         compile_engine(str(path), "b200_sxm", "sglang", "current")
     with pytest.raises(ValueError, match="require format 'mxfp4-pack-quantized'"):
         Task(model_path=str(path), system_name="b200_sxm", backend_name="sglang", total_gpus=1)
+
+
+@pytest.mark.parametrize("experts_first", [False, True])
+def test_local_kimi_mixed_groups_keep_independent_attention_and_expert_precision(local_kimi, experts_first):
+    from aisim.sdk.task_v2 import Task
+    from aisim_core.sdk.models.helpers import _infer_quant_modes_from_raw_config
+
+    path, raw = local_kimi
+    quant = raw["quantization_config"]
+    experts = quant["config_groups"]["experts"]
+    attention = {"weights": {"num_bits": 8, "type": "float"}, "targets": ["re:.*self_attn.*"]}
+    groups = [("experts", experts), ("attention", attention)]
+    quant["config_groups"] = dict(groups if experts_first else reversed(groups))
+    quant["ignore"] = ["mlp.shared_experts", "lm_head"]
+    (path / "config.json").write_text(json.dumps(raw))
+
+    loaded = utils._load_model_config_from_model_path(str(path))
+    modes = _infer_quant_modes_from_raw_config(loaded)
+    assert modes["gemm_quant_mode"] is common.GEMMQuantMode.fp8
+    assert modes["moe_quant_mode"] is common.MoEQuantMode.w4a16_mxfp4
+
+    blob = compile_engine(str(path), "b200_sxm", "sglang", "current")
+    spec = json.loads(_native.engine_spec_json_from_bincode(blob))
+    assert spec["engine"]["weight_dtype"] == "fp8"
+    assert spec["engine"]["moe_dtype"] == "w4a8_mxfp4_mxfp8"
+    moe_ops = [op["Moe"] for op in spec["context_ops"] + spec["generation_ops"] if "Moe" in op]
+    assert moe_ops and all(op["quant_mode"] == "w4a8_mxfp4_mxfp8" for op in moe_ops)
+    cfg = Task(model_path=str(path), system_name="b200_sxm", backend_name="sglang", total_gpus=1).build_model_config(
+        role="agg"
+    )
+    assert cfg.gemm_quant_mode is common.GEMMQuantMode.fp8
+    assert cfg.moe_quant_mode is common.MoEQuantMode.w4a8_mxfp4_mxfp8
 
 
 def test_local_kimi_mxfp4_label_requires_packed_format_metadata(local_kimi):

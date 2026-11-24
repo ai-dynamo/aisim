@@ -407,6 +407,33 @@ def test_current_inventory_is_complete_and_does_not_relabel_unknowns():
     assert all("LicenseRef" not in entry["license"] for entry in entries)
 
 
+def test_glm52_and_gemma4_base_license_evidence_identifies_the_named_model():
+    entries = checker.inventory_entries(checker.ROOT / checker.INVENTORY)
+    notices = (checker.ROOT / "THIRD_PARTY_NOTICES.md").read_text()
+    assert (checker.ROOT / "python/aisim/THIRD_PARTY_NOTICES.md").read_text() == notices
+    checked = 0
+    for entry in entries.values():
+        model = entry.get("base_model") or ""
+        if model not in {"zai-org/GLM-5.2", "zai-org/GLM-5.2-FP8"} and not model.startswith("google/gemma-4-"):
+            continue
+        source = entry["base_license_source"]
+        # The immediate predecessor's LICENSE and a sibling model's LICENSE
+        # cannot establish the named base model's grant.
+        assert re.fullmatch(
+            rf"https://huggingface.co/{re.escape(model)}/blob/[0-9a-f]{{40}}/(LICENSE|README.md)", source
+        )
+        assert source in notices
+        if model.startswith("google/"):
+            assert source.endswith("/README.md")
+            assert "no standalone license file" in entry["base_license_evidence"]
+            assert entry["base_license"] == "Apache-2.0"
+        else:
+            assert source.endswith("/LICENSE")
+            assert entry["base_license"] == "MIT"
+        checked += 1
+    assert checked == 9
+
+
 def test_packaged_deepseek_v3_notice_preserves_source_material_grants(tmp_path):
     entries = checker.inventory_entries(checker.ROOT / checker.INVENTORY)
     name = "aisim_core/model_configs/deepseek-ai--DeepSeek-V3_config.json"

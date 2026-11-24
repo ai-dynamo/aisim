@@ -839,11 +839,12 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "google/gemma-4-26B-A4B",
       "base_license": "Apache-2.0",
-      "base_license_source": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
+      "base_license_source": "https://huggingface.co/google/gemma-4-26B-A4B/blob/24548b62aa021d562695c04aaf7758a1ea47990b/README.md",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
+      ],
+      "base_license_evidence": "The named base model card declares Apache-2.0 and links Google's Gemma 4 Apache-2.0 license page; this pinned model repository contains no standalone license file."
     },
     {
       "path": "aisim_core/model_configs/meta-models--Muse-Glimmer-30B_config.json",
@@ -1252,7 +1253,7 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "zai-org/GLM-5.2",
       "base_license": "MIT",
-      "base_license_source": "https://huggingface.co/zai-org/GLM-5.1/blob/26e1bd6e011feb778d25ae34b09b07074139d92d/LICENSE",
+      "base_license_source": "https://huggingface.co/zai-org/GLM-5.2/blob/cf457fa734ab149ffef225f80893eb38c6ff5cdc/LICENSE",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
@@ -1278,7 +1279,7 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "zai-org/GLM-5.2",
       "base_license": "MIT",
-      "base_license_source": "https://huggingface.co/zai-org/GLM-5.1/blob/26e1bd6e011feb778d25ae34b09b07074139d92d/LICENSE",
+      "base_license_source": "https://huggingface.co/zai-org/GLM-5.2/blob/cf457fa734ab149ffef225f80893eb38c6ff5cdc/LICENSE",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
@@ -1351,11 +1352,12 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "google/gemma-4-26B-A4B-it",
       "base_license": "Apache-2.0",
-      "base_license_source": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
+      "base_license_source": "https://huggingface.co/google/gemma-4-26B-A4B-it/blob/4d7ae4984b7db7de8f8457170b3f1a419ee76d52/README.md",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
+      ],
+      "base_license_evidence": "The named base model card declares Apache-2.0 and links Google's Gemma 4 Apache-2.0 license page; this pinned model repository contains no standalone license file."
     },
     {
       "path": "aisim_core/model_configs/nvidia--Gemma-4-26B-A4B-NVFP4_hf_quant_config.json",
@@ -1378,11 +1380,12 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "google/gemma-4-26B-A4B-it",
       "base_license": "Apache-2.0",
-      "base_license_source": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
+      "base_license_source": "https://huggingface.co/google/gemma-4-26B-A4B-it/blob/4d7ae4984b7db7de8f8457170b3f1a419ee76d52/README.md",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
+      ],
+      "base_license_evidence": "The named base model card declares Apache-2.0 and links Google's Gemma 4 Apache-2.0 license page; this pinned model repository contains no standalone license file."
     },
     {
       "path": "aisim_core/model_configs/nvidia--Gemma-4-31B-IT-NVFP4_config.json",
@@ -1405,11 +1408,12 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "google/gemma-4-31B-it",
       "base_license": "Apache-2.0",
-      "base_license_source": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
+      "base_license_source": "https://huggingface.co/google/gemma-4-31B-it/blob/842da3794eaa0b77d5f08bae87a17459d91ff475/README.md",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
+      ],
+      "base_license_evidence": "The named base model card declares Apache-2.0 and links Google's Gemma 4 Apache-2.0 license page; this pinned model repository contains no standalone license file."
     },
     {
       "path": "aisim_core/model_configs/nvidia--Gemma-4-31B-IT-NVFP4_hf_quant_config.json",
@@ -1432,11 +1436,12 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "google/gemma-4-31B-it",
       "base_license": "Apache-2.0",
-      "base_license_source": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
+      "base_license_source": "https://huggingface.co/google/gemma-4-31B-it/blob/842da3794eaa0b77d5f08bae87a17459d91ff475/README.md",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
-      ]
+      ],
+      "base_license_evidence": "The named base model card declares Apache-2.0 and links Google's Gemma 4 Apache-2.0 license page; this pinned model repository contains no standalone license file."
     },
     {
       "path": "aisim_core/model_configs/nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-BF16_config.json",
@@ -2319,7 +2324,7 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "zai-org/GLM-5.2-FP8",
       "base_license": "MIT",
-      "base_license_source": "https://huggingface.co/zai-org/GLM-5.1/blob/26e1bd6e011feb778d25ae34b09b07074139d92d/LICENSE",
+      "base_license_source": "https://huggingface.co/zai-org/GLM-5.2-FP8/blob/f33c6dc501ee5a2c7e35155653b1b1abbc320951/LICENSE",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"
@@ -2345,7 +2350,7 @@
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "zai-org/GLM-5.2",
       "base_license": "MIT",
-      "base_license_source": "https://huggingface.co/zai-org/GLM-5.1/blob/26e1bd6e011feb778d25ae34b09b07074139d92d/LICENSE",
+      "base_license_source": "https://huggingface.co/zai-org/GLM-5.2/blob/cf457fa734ab149ffef225f80893eb38c6ff5cdc/LICENSE",
       "license_approval": "not asserted; see the separate release review ledger",
       "additional_copyright_owners": [
         "NVIDIA CORPORATION & AFFILIATES (its own predecessor contributions only)"

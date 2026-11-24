@@ -934,12 +934,15 @@ def _infer_quant_modes_from_raw_config(raw_config: dict, architecture: str | Non
         # Only set overrides for quantized categories; unset modes fall through to the
         # global bfloat16 default in _apply_model_quant_defaults.
         quant_cfg = _get_language_quantization_config(raw_config) or {}
-        base_algo, ignored = parse_compressed_tensors_quant(quant_cfg)
-        if base_algo:
-            if "attention" not in ignored:
-                overrides["gemm_quant_mode"] = getattr(common.GEMMQuantMode, base_algo)
-            if "routing_experts" not in ignored:
-                overrides["moe_quant_mode"] = getattr(common.MoEQuantMode, base_algo)
+        for category, field, modes in (
+            ("attention", "gemm_quant_mode", common.GEMMQuantMode),
+            ("routing_experts", "moe_quant_mode", common.MoEQuantMode),
+        ):
+            algo, _ = parse_compressed_tensors_quant(quant_cfg, category=category)
+            if algo is not None:
+                if algo not in modes.__members__:
+                    raise ValueError(f"Unsupported compressed-tensors algorithm {algo!r} for {category}")
+                overrides[field] = modes[algo]
     elif quant_algo is not None:
         raise ValueError(f"Unsupported quant algorithm: {quant_algo}")
 
@@ -1191,7 +1194,7 @@ def resolve_kimi_k3_moe_arch_mode(
     mode = _infer_quant_modes_from_raw_config(raw, architecture).get("moe_quant_mode")
     if mode is None and raw.get("quant_algo") == "compressed-tensors":
         quant_cfg = _get_language_quantization_config(raw) or {}
-        _, ignored = parse_compressed_tensors_quant(quant_cfg)
+        _, ignored = parse_compressed_tensors_quant(quant_cfg, category="routing_experts")
         if "routing_experts" in ignored:
             # Categories detect mentions, not coverage. Only these whole-expert
             # selectors establish uniform BF16 without expanding every layer,

@@ -1959,6 +1959,16 @@ MiniMax M2.5's model card links an unavailable modified-MIT reference, while the
 - `LicenseRef-Kimi-K2.7-Code-Modified-MIT`: https://huggingface.co/moonshotai/Kimi-K2.7-Code/blob/74797c9c62378b951a1f6fcf5c4631024e9b8bef/LICENSE
 - `LicenseRef-Llama-3.3-Community`: https://github.com/meta-llama/llama-models/blob/c908f5b7bd2c2fbdd89a48f6bc252efd4ebc293f/models/llama3_3/LICENSE
 
+GLM-5.2 base-model license evidence (for the GLM-5.2 config and quantization records above) is its own MIT license, Copyright (c) 2026 Zhipu AI: https://huggingface.co/zai-org/GLM-5.2/blob/cf457fa734ab149ffef225f80893eb38c6ff5cdc/LICENSE . The GLM-5.2-FP8 model supplies its own identical MIT license: https://huggingface.co/zai-org/GLM-5.2-FP8/blob/f33c6dc501ee5a2c7e35155653b1b1abbc320951/LICENSE . The full MIT terms and Zhipu AI copyright already retained below also apply to these sources; the GLM-5.1 citation is evidence for GLM-5.1 only.
+
+Gemma 4 base-model evidence is the Apache-2.0 declaration in each named model's own immutable card:
+
+- `google/gemma-4-26B-A4B`: https://huggingface.co/google/gemma-4-26B-A4B/blob/24548b62aa021d562695c04aaf7758a1ea47990b/README.md
+- `google/gemma-4-26B-A4B-it`: https://huggingface.co/google/gemma-4-26B-A4B-it/blob/4d7ae4984b7db7de8f8457170b3f1a419ee76d52/README.md
+- `google/gemma-4-31B-it`: https://huggingface.co/google/gemma-4-31B-it/blob/842da3794eaa0b77d5f08bae87a17459d91ff475/README.md
+
+These pinned Gemma 4 repositories contain no standalone license file. Their cards link https://ai.google.dev/gemma/docs/gemma_4_license and explicitly identify Apache 2.0. The full Apache-2.0 text is retained in LICENSE. AIConfigurator references above identify the immediate configuration contribution source, not the base-model license grant. No license approval is asserted by these evidence corrections.
+
 ### Complete referenced terms
 
 Legal-text SHA256 `afcfcb3aab51377faef0defdc8ae4499cc15efeedc0293f6fd9eb47de58e521b` for `Apache-2.0 AND LicenseRef-MiniMax-M2.5-Model`:
