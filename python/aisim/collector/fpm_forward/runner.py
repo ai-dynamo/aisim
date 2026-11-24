@@ -2114,6 +2114,7 @@ def _recover_completed_attempt(
     entry: dict[str, Any],
     *,
     smoke: bool = False,
+    generator_overrides: dict | None = None,
 ) -> dict[str, Any] | None:
     """Recover a non-passed checkpoint cell whose salvaged artifacts are complete.
 
@@ -2179,6 +2180,12 @@ def _recover_completed_attempt(
                 error,
             )
             return None
+
+    try:
+        sanitize_recovered_diagnostics(cell_dir, generator_overrides or {}, cell=cell)
+    except (OSError, TypeError, ValueError) as error:
+        logger.warning("Diagnostic sanitization failed during recovery for %s (%s)", cell.cell_id, type(error).__name__)
+        return None
 
     recovered = dict(entry)
     original_error = {key: recovered.pop(key) for key in ("error_type", "error") if key in recovered}
@@ -2473,7 +2480,9 @@ def _run_collection_impl(
             entry = checkpoint["cells"].get(cell.cell_id)
             if not isinstance(entry, dict):
                 continue
-            recovered = _recover_completed_attempt(plan, cell, root, entry, smoke=smoke)
+            recovered = _recover_completed_attempt(
+                plan, cell, root, entry, smoke=smoke, generator_overrides=generator_overrides
+            )
             if recovered is None:
                 continue
             archived = archive_observations(cell, recovered)

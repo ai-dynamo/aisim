@@ -923,15 +923,17 @@ def _cleanup_previous_attempt(root: Path, plan, attempt: dict[str, Any]) -> None
         resource = runner._cell_runner(previous_plan, cell, manifest, phase_dir)
         from .private_inputs import sanitize_recovered_diagnostics
 
-        runner._salvage_artifacts(resource, cell.cell_id)
-        resource.cleanup()
-        reclaim_delivery(phase_dir)
-        sanitize_recovered_diagnostics(
-            phase_dir,
-            probe_generator_overrides(plan.launch),
-            cell=cell,
-            environment={item["name"]: item["value"] for item in plan._environment or [] if "value" in item},
-        )
+        try:
+            runner._salvage_artifacts(resource, cell.cell_id)
+            resource.cleanup()
+            reclaim_delivery(phase_dir)
+        finally:
+            sanitize_recovered_diagnostics(
+                phase_dir,
+                probe_generator_overrides(plan.launch),
+                cell=cell,
+                environment={item["name"]: item["value"] for item in plan._environment or [] if "value" in item},
+            )
         phase["recovery_artifacts"] = _snapshot_probe_artifacts(root, phase_dir)
 
 

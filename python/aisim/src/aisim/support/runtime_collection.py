@@ -7,13 +7,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
+import os
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
-
-from aisim.fpm_contract import FPM_FINALIZATION_TIMEOUT_ENV
 
 from .schema import SupportRequest
 
@@ -82,6 +80,7 @@ def _source(request: SupportRequest) -> dict[str, Any]:
 
 def _collection_controls(cells, deployment):
     """Separate recorded collection controls for memory-only review, without editing plans."""
+    from collector.fpm_forward.config import COLLECTION_CONTROL_NAMES, CONTENT_MODES, validate_collection_control
     from collector.fpm_forward.planner import BackendPolicy
 
     from aisim.generator.builders.fpm_builder import _benchmark_wait_timeout_seconds
@@ -123,16 +122,6 @@ def _collection_controls(cells, deployment):
     deployment = deepcopy(deployment)
     k8s = deployment.get("K8sConfig", {})
     environment = k8s.get("extra_env", [])
-    known = {
-        "DYN_BENCH_CONTENT_SEED",
-        "DYN_BENCH_PREFILL_CONTENT",
-        "DYN_BENCH_POOL_TAG",
-        "DYN_BENCH_GIANT_KV_THRESHOLD",
-        "DYN_BENCH_GIANT_KV_REPEATS",
-        "DYN_FORWARDPASS_METRIC_PORT",
-        "FPM_RESULT_WAIT_TIMEOUT_SECONDS",
-        FPM_FINALIZATION_TIMEOUT_ENV,
-    }
     retained, seen = [], set()
     if not isinstance(environment, list):
         raise ValueError("collection environment must be a list")
@@ -140,9 +129,24 @@ def _collection_controls(cells, deployment):
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
             raise ValueError("collection environment requires named entries")
         name = item["name"]
-        if name not in known:
+        if name not in COLLECTION_CONTROL_NAMES:
             retained.append(item)
             continue
+        if set(item) == {"name", "value_from_env", "value_sha256"} and item["value_from_env"] == name:
+            # Older archives stored a digest even for public controls. Recover
+            # recognized enum/default values or verify the original public input.
+            candidates = [os.environ.get(name), *CONTENT_MODES, "", "0", "1"]
+            value = next(
+                (
+                    v
+                    for v in candidates
+                    if v is not None and hashlib.sha256(v.encode()).hexdigest() == item["value_sha256"]
+                ),
+                None,
+            )
+            if value is None:
+                raise ValueError(f"historical collection control {name} requires the original value")
+            item = {"name": name, "value": value}
         value = item.get("value")
         if (
             name in seen
@@ -152,20 +156,7 @@ def _collection_controls(cells, deployment):
         ):
             raise ValueError(f"collection control {name} requires one literal string value")
         seen.add(name)
-        if name == "DYN_BENCH_PREFILL_CONTENT" and value not in {"random", "sharegpt", "sharegpt_chain", "zeros"}:
-            raise ValueError(f"collection control {name} has an unsupported content mode")
-        if name in {"DYN_BENCH_GIANT_KV_THRESHOLD", "DYN_BENCH_GIANT_KV_REPEATS"} and not re.fullmatch(
-            r"0|[1-9][0-9]*", value
-        ):
-            raise ValueError(f"collection control {name} must be a nonnegative integer")
-        if name in {"DYN_FORWARDPASS_METRIC_PORT", "FPM_RESULT_WAIT_TIMEOUT_SECONDS", FPM_FINALIZATION_TIMEOUT_ENV}:
-            maximum = {
-                "DYN_FORWARDPASS_METRIC_PORT": 65535,
-                "FPM_RESULT_WAIT_TIMEOUT_SECONDS": 43200,
-                FPM_FINALIZATION_TIMEOUT_ENV: 3600,
-            }[name]
-            if not re.fullmatch(r"[1-9][0-9]*", value) or len(value) > len(str(maximum)) or int(value) > maximum:
-                raise ValueError(f"collection control {name} must be an integer from 1 through {maximum}")
+        validate_collection_control(name, value)
         changes.extend(_differences({"missing": True}, value, "/collection_controls/environment/" + name))
     if "extra_env" in k8s:
         k8s["extra_env"] = retained

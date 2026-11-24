@@ -399,6 +399,12 @@ def test_formal_plan_uses_observed_precision_and_keeps_final_launch_validation(i
     assert calls == [True]
     assert plan.cells and {cell.moe_quant_mode for cell in plan.cells} == {"w4a8_mxfp4_mxfp8_trtllm"}
     assert plan.runtime_instrumentation.sha256 == inputs["runtime_instrumentation"].sha256
+    from collector.fpm_forward.runtime_memory import saved_plan_identity
+
+    saved = saved_plan_identity(plan.to_dict())
+    assert saved.runtime_instrumentation.sha256 == plan.runtime_instrumentation.sha256
+    assert saved.runtime_launch == plan.runtime_launch
+    assert saved.deployment_profile(saved.cells[0]) == plan.deployment_profile(plan.cells[0])
     if inputs["runtime_launch"]["worker_type"] == "prefill":
         from collector.fpm_forward import runner
 

@@ -10,7 +10,7 @@ import hashlib
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +18,7 @@ from aisim_core.sdk.fpm_identity import EXECUTION_COLUMNS, LEGACY_EXECUTION_IDEN
 
 from .model_capability import ResolvedModelConfig, kimi_k31_native_attention_backend
 from .native_artifact import COLLECTOR_PROVENANCE_FILENAME, validate_native_collection
-from .planner import BackendPolicy, FPMCell, _canonical_hash
+from .planner import BackendPolicy, CollectionEvidence, FPMCell, _canonical_hash
 from .runtime.fpm_memory_observer import (
     _LEGACY_SPECS,
     _MAMBA_SPEC,
@@ -190,6 +190,7 @@ class _SavedOptions:
     benchmark_points_json: str | None
     # Saved (and hashed) only when enabled, so plans without the key read False.
     measure_power: bool = False
+    worker_type: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,7 +205,7 @@ class _SavedCapability:
 
 
 @dataclass(frozen=True, slots=True)
-class SavedCollectionIdentity:
+class SavedCollectionIdentity(CollectionEvidence):
     """The verified plan fields used by native aggregation and commit validation."""
 
     backend: str
@@ -217,6 +218,8 @@ class SavedCollectionIdentity:
     cells: tuple[FPMCell, ...]
     backend_version: str | None = None
     runtime_backend_version: str | None = None
+    _runtime_observation_json: str | None = field(default=None, repr=False)
+    _fpm_profile_json: str | None = field(default=None, repr=False)
 
 
 def saved_plan_identity(payload: dict[str, Any]) -> SavedCollectionIdentity:
@@ -230,6 +233,10 @@ def saved_plan_identity(payload: dict[str, Any]) -> SavedCollectionIdentity:
         )
     points = payload["options"].get("benchmark_points")
     return SavedCollectionIdentity(
+        _runtime_observation_json=json.dumps(payload["runtime_observation"])
+        if payload.get("runtime_observation")
+        else None,
+        _fpm_profile_json=json.dumps(payload["fpm_profile"]) if payload.get("fpm_profile") else None,
         backend=payload["backend"],
         model_path=payload["model_path"],
         system=payload["system"],
@@ -238,6 +245,7 @@ def saved_plan_identity(payload: dict[str, Any]) -> SavedCollectionIdentity:
         backend_version=payload.get("backend_version"),
         runtime_backend_version=payload.get("runtime_backend_version"),
         options=_SavedOptions(
+            worker_type=payload["options"].get("worker_type"),
             warmup_iterations=payload["options"]["global_warmup_iterations"],
             benchmark_points_json=json.dumps(points["payload"]) if points is not None else None,
             measure_power=payload["options"].get("measure_power") is True,

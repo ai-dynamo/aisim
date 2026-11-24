@@ -38,7 +38,7 @@ def _redact_diagnostic(
         name = sensitive_names[index] if index < len(sensitive_names) else None
         public_flag = name in {"HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"} and value in {"0", "1"}
         for variant in (value, value.replace("$", "$$")):
-            for encoded in (variant, repr(variant)[1:-1], json.dumps(variant)[1:-1]):
+            for encoded in (variant, repr(variant)[1:-1], json.dumps(variant)[1:-1], shlex.quote(variant)):
                 variants[encoded] = variants.get(encoded, False) or not public_flag
     for value in sorted(variants, key=len, reverse=True):
         if variants[value]:

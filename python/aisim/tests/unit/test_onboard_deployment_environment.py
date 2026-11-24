@@ -135,6 +135,15 @@ def test_short_private_value_is_redacted_outside_environment_assignments():
     )
 
 
+def test_shell_quoted_private_value_is_redacted():
+    import shlex
+
+    from aisimulate.support.versioning import _redact_diagnostic
+
+    value = "synthetic'quote"
+    assert _redact_diagnostic(shlex.quote(value), (value,), ("CUSTOM_AUTH",)) == "<redacted>"
+
+
 @pytest.mark.parametrize("separator", [":", ": ", ":  "])
 def test_short_credentials_redacted_in_json_diagnostics(separator):
     from aisimulate.support.versioning import _redact_diagnostic

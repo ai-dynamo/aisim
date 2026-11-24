@@ -92,6 +92,38 @@ def semantic_generator_overrides(overrides: dict[str, Any], *, archive_environme
     return normalized
 
 
+COLLECTION_CONTROL_NAMES = {
+    "DYN_BENCH_CONTENT_SEED",
+    "DYN_BENCH_PREFILL_CONTENT",
+    "DYN_BENCH_POOL_TAG",
+    "DYN_BENCH_GIANT_KV_THRESHOLD",
+    "DYN_BENCH_GIANT_KV_REPEATS",
+    "DYN_FORWARDPASS_METRIC_PORT",
+    "FPM_RESULT_WAIT_TIMEOUT_SECONDS",
+    "FPM_FINALIZATION_TIMEOUT_SECONDS",
+}
+CONTENT_MODES = ("random", "sharegpt", "sharegpt_chain", "zeros")
+
+
+def validate_collection_control(name, value):
+    if not isinstance(value, str) or any(ord(char) < 32 for char in value):
+        raise ValueError(f"collection control {name} requires one literal string value")
+    if name == "DYN_BENCH_PREFILL_CONTENT" and value not in CONTENT_MODES:
+        raise ValueError(f"collection control {name} has an unsupported content mode")
+    if name in {"DYN_BENCH_GIANT_KV_THRESHOLD", "DYN_BENCH_GIANT_KV_REPEATS"} and not re.fullmatch(
+        r"0|[1-9][0-9]*", value
+    ):
+        raise ValueError(f"collection control {name} must be a nonnegative integer")
+    if name in {"DYN_FORWARDPASS_METRIC_PORT", "FPM_RESULT_WAIT_TIMEOUT_SECONDS", "FPM_FINALIZATION_TIMEOUT_SECONDS"}:
+        maximum = {
+            "DYN_FORWARDPASS_METRIC_PORT": 65535,
+            "FPM_RESULT_WAIT_TIMEOUT_SECONDS": 43200,
+            "FPM_FINALIZATION_TIMEOUT_SECONDS": 3600,
+        }[name]
+        if not re.fullmatch(r"[1-9][0-9]*", value) or len(value) > len(str(maximum)) or int(value) > maximum:
+            raise ValueError(f"collection control {name} must be an integer from 1 through {maximum}")
+
+
 def archive_generator_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
     """Archive environment references and digests instead of caller credentials.
 
@@ -129,6 +161,13 @@ def archive_generator_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
             if item["name"] in {"FPM_READINESS_TIMEOUT_SECONDS", "FPM_FINALIZATION_TIMEOUT_SECONDS"}:
                 value = item["value"]
                 public = bool(re.fullmatch(r"[1-9][0-9]*", value)) and len(value) <= 4 and int(value) <= 3600
+            if item["name"] in COLLECTION_CONTROL_NAMES:
+                try:
+                    validate_collection_control(item["name"], item["value"])
+                except ValueError:
+                    pass  # Retain invalid inputs as digests until binding rejects them.
+                else:
+                    public = True
             if not public:
                 value = item.pop("value")
                 item.update(value_from_env=item["name"], value_sha256=hashlib.sha256(value.encode()).hexdigest())

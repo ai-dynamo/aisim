@@ -247,7 +247,7 @@ def require_k31_worker_evidence(plan, cell, raw_root, collection, *, allow_stage
     if bundle is None or plan.runtime_launch is None:
         raise ValueError("K3.1 publication requires source-bound observed MoE precision")
     deployment = plan.deployment_profile(cell)
-    if deployment is None or deployment.resources.runtime_memory is None:
+    if deployment is None or deployment.resources is None or deployment.resources.runtime_memory is None:
         raise ValueError("K3.1 publication requires a reviewed runtime capacity bound")
     workers, _ = _runtime_worker_evidence(
         plan,

@@ -2411,6 +2411,7 @@ def test_archived_environment_resolves_for_replay_and_detects_drift(campaign, tm
         "K8sConfig": {
             "extra_env": [
                 {"name": "CUSTOM_AUTH", "value": token},
+                {"name": "DYN_BENCH_PREFILL_CONTENT", "value": "zeros"},
                 {"name": "FPM_FINALIZATION_TIMEOUT_SECONDS", "value": "600"},
             ]
         },
@@ -2443,6 +2444,7 @@ def test_archived_environment_resolves_for_replay_and_detects_drift(campaign, tm
         _, bound, changes = _collection_controls(plan.cells, repeatability.load_repeatability_deployment(source))
         assert bound["K8sConfig"]["extra_env"][0]["name"] == "CUSTOM_AUTH"
         assert any("FPM_FINALIZATION_TIMEOUT_SECONDS" in item["field"] for item in changes)
+        assert any("DYN_BENCH_PREFILL_CONTENT" in item["field"] for item in changes)
     with pytest.raises(ValueError, match="requires the original value"):
         repeatability.load_repeatability_deployment(source, resolve_environment=True)
     monkeypatch.setenv("CUSTOM_AUTH", token + "changed")

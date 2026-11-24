@@ -541,26 +541,10 @@ class FPMCell:
         }
 
 
-@dataclass(frozen=True, slots=True)
-class FPMCollectionPlan:
-    backend: str
-    model_path: str
-    system: str
-    aic_revision: str
-    generator_config_sha256: str
-    options: FPMCollectionOptions
-    capability: ModelCapabilityProfile
-    dtype_profile: ResolvedDTypeProfile
-    topologies: tuple[ParallelTopology, ...]
-    topology_memory_admission: tuple[TopologyMemoryDecision, ...]
-    backend_policies: tuple[BackendPolicy, ...]
-    cells: tuple[FPMCell, ...]
-    sha256: str
-    _fpm_profile_json: str | None = field(default=None, repr=False)
-    _runtime_observation_json: str | None = field(default=None, repr=False)
-    runtime_backend_version: str | None = None
-    backend_version: str | None = None
-    _legacy_runtime_memory_policy_json: str | None = field(default=None, repr=False)
+class CollectionEvidence:
+    """Read the frozen profile and instrumentation shared by live and saved plans."""
+
+    __slots__ = ()
 
     @property
     def runtime_instrumentation(self):
@@ -604,6 +588,28 @@ class FPMCollectionPlan:
             cp_size=cell.topology.cp,
             worker_type=self.options.worker_type or "aggregated",
         )
+
+
+@dataclass(frozen=True, slots=True)
+class FPMCollectionPlan(CollectionEvidence):
+    backend: str
+    model_path: str
+    system: str
+    aic_revision: str
+    generator_config_sha256: str
+    options: FPMCollectionOptions
+    capability: ModelCapabilityProfile
+    dtype_profile: ResolvedDTypeProfile
+    topologies: tuple[ParallelTopology, ...]
+    topology_memory_admission: tuple[TopologyMemoryDecision, ...]
+    backend_policies: tuple[BackendPolicy, ...]
+    cells: tuple[FPMCell, ...]
+    sha256: str
+    _fpm_profile_json: str | None = field(default=None, repr=False)
+    _runtime_observation_json: str | None = field(default=None, repr=False)
+    runtime_backend_version: str | None = None
+    backend_version: str | None = None
+    _legacy_runtime_memory_policy_json: str | None = field(default=None, repr=False)
 
     def to_dict(self) -> dict[str, object]:
         prefill_sampling = self.options.prefill_sampling.to_dict()
