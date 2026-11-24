@@ -769,8 +769,7 @@ mod tests {
 
     #[test]
     fn fpm_kda_sol_rejects_unknown_kernels() {
-        let systems_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisim/src/aisim_core/systems");
+        let systems_root = crate::test_systems::path("");
         let db = PerfDatabase::load(&systems_root, "gb300", "sglang", "0.5.14").unwrap();
         for phase in ["context", "generation"] {
             let error = kda_op("unknown_kda", phase, 0)
@@ -783,8 +782,7 @@ mod tests {
 
     #[test]
     fn fpm_kda_sol_rejects_non_fp32_and_unrecorded_recurrent_state() {
-        let systems_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisim/src/aisim_core/systems");
+        let systems_root = crate::test_systems::path("");
         let db = PerfDatabase::load(&systems_root, "gb300", "sglang", "0.5.14").unwrap();
         for (phase, kernel) in [
             ("context", "flashkda_fwd"),
