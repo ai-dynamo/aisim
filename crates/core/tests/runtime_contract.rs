@@ -526,6 +526,90 @@ fn grouped_prefill_rank_holds_its_source_and_reports_block_unit_timing() {
 }
 
 #[test]
+fn grouped_pd_rejects_unequal_tensor_parallel_sizes() {
+    // Each role can inherit the shared TP size or supply its own descriptor.
+    for role in ["prefill", "decode"] {
+        let mut spec = disaggregated_grouped_spec(vec![request("tp-mismatch", 0.0, 1000, 4)]);
+        spec.engine["tensor_parallel_size"] = 4.into();
+        spec.engine[role] = serde_json::json!({
+            "rank": spec.engine["rank"].clone(), "tensor_parallel_size": 8
+        });
+        let error = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap_err();
+        assert!(matches!(error, ReplayError::InvalidSpec(_)));
+        assert_eq!(
+            error.to_string(),
+            "invalid replay spec: grouped prefill and decode roles require equal tensor_parallel_size",
+            "{role} TP override"
+        );
+    }
+    // Equal shared defaults must not hide different explicit role values.
+    let mut spec = disaggregated_grouped_spec(vec![request("tp-overrides", 0.0, 1000, 4)]);
+    for (role, tp) in [("prefill", 4), ("decode", 8)] {
+        spec.engine[role] = serde_json::json!({
+            "rank": spec.engine["rank"].clone(), "tensor_parallel_size": tp
+        });
+    }
+    let error = Replayer::new(spec, ReplayEngineFactory::new())
+        .unwrap()
+        .run()
+        .unwrap_err();
+    assert!(matches!(error, ReplayError::InvalidSpec(_)));
+    assert!(error.to_string().contains("equal tensor_parallel_size"));
+}
+
+#[test]
+fn grouped_pd_accepts_equal_tensor_parallel_sizes() {
+    for prefill_override in [false, true] {
+        for decode_override in [false, true] {
+            let mut spec = disaggregated_grouped_spec(vec![request("equal-tp", 0.0, 1000, 4)]);
+            spec.engine["tensor_parallel_size"] = 4.into();
+            for (role, override_tp) in [("prefill", prefill_override), ("decode", decode_override)]
+            {
+                if override_tp {
+                    spec.engine[role] = serde_json::json!({
+                        "rank": spec.engine["rank"].clone(), "tensor_parallel_size": 4
+                    });
+                }
+            }
+            let report = Replayer::new(spec, ReplayEngineFactory::new())
+                .unwrap()
+                .run()
+                .unwrap();
+            assert_eq!(report.request_counts.completed_requests, 1);
+            assert_eq!(report.request_counts.total_output_tokens, 4);
+            assert_eq!(report.committed_prefill_tokens, 1000);
+        }
+    }
+}
+
+#[test]
+fn linear_pd_accepts_unequal_tensor_parallel_sizes() {
+    for role in ["prefill", "decode"] {
+        let mut spec = aggregated_spec(
+            Backend::Vllm,
+            1,
+            0.0,
+            vec![request("linear-tp", 0.0, 32, 4)],
+        );
+        spec.topology = disaggregated_grouped_spec(Vec::new()).topology;
+        spec.engine["tensor_parallel_size"] = 4.into();
+        spec.engine[role] = serde_json::json!({
+            "rank": spec.engine["rank"].clone(), "tensor_parallel_size": 8
+        });
+        let report = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(report.request_counts.completed_requests, 1);
+        assert_eq!(report.request_counts.total_output_tokens, 4);
+        assert_eq!(report.committed_prefill_tokens, 32);
+    }
+}
+
+#[test]
 fn grouped_and_linear_roles_cannot_pair_in_one_handoff() {
     // A grouped rank counts the handoff in full-attention blocks and a linear
     // rank in tokens, so a grouped prefill rank with a linear decode rank, or

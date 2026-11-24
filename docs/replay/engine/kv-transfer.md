@@ -25,8 +25,10 @@ A native ReplaySpec or Sweeper search space whose prefill rank sets a positive
 YAML above always resolves the bytes. A rank with `kv_cache_groups` is the
 exception. It takes the bytes from its groups, and it refuses
 `kv_transfer_bytes_per_token`. The YAML leaves that field out for such a rank.
-A native ReplaySpec needs identical `kv_cache_groups` and the same
-`vllm_version` on its prefill and decode roles.
+A native ReplaySpec with grouped caches needs identical `kv_cache_groups`,
+the same `vllm_version`, and equal resolved `tensor_parallel_size` on its
+prefill and decode roles. Grouped handoffs do not reshard KV between TP sizes;
+linear pairs may still use different TP sizes.
 
 ## Transfer fields
 
