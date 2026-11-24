@@ -28,12 +28,13 @@ def _publish_native_table(directory, phase):
     import pyarrow as pa
     import pyarrow.parquet as pq
     from collector.provenance import render_collection_meta
+    from collector.sglang.collect_kimi_k31_dsa_v1 import RUNTIME_VERSION
 
     table = f"dsa_{phase}_module_perf"
     pq.write_table(pa.table({"latency": [1.0]}), directory / f"{table}.parquet")
     (directory / "collection_meta.yaml").write_bytes(
         render_collection_meta(
-            {"framework": "sglang", "version": "0.0.0.dev1+g41208373c.d20261104"},
+            {"framework": "sglang", "version": RUNTIME_VERSION},
             {
                 table: {
                     "collector_ref": "0" * 40,
