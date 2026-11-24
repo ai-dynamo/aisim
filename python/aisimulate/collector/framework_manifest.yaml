@@ -178,6 +178,7 @@ frameworks:
       "nvidia/GLM-5.3-Flash-NVFP4": *glm53flash_vllm_runtime
   vllm_npu:
     base_framework: vllm
+    source_repo: "https://github.com/vllm-project/vllm-ascend.git"
     data_backend: vllm
     notes: >
       Huawei Ascend NPU (vllm-ascend) collector runtime, separate from stock

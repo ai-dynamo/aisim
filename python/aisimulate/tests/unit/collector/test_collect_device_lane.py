@@ -113,6 +113,25 @@ def test_npu_host_selects_the_npu_lane(monkeypatch):
     assert [collection["module"] for collection in observed["collections"]] == ["collector.vllm.collect_gemm_npu"]
 
 
+def test_cli_rejects_npu_model_ops_before_collection(tmp_path, monkeypatch):
+    from collector import version_resolver
+
+    case_file = tmp_path / "model_cases.yaml"
+    case_file.write_text("model_path: fake/model\ninclude_base: false\nmodel_ops: [gemm, attention_context]\n")
+    monkeypatch.setattr(collect_mod, "_cuda_available", lambda: False)
+    monkeypatch.setattr(collect_mod, "_npu_available", lambda: True)
+    monkeypatch.setattr(
+        version_resolver, "build_collections", lambda *a, **k: pytest.fail("collection started before validation")
+    )
+    monkeypatch.setattr(sys, "argv", ["collect.py", "--backend", "vllm", "--model-cases", str(case_file), "--profile"])
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("COLLECTOR_LOG_DIR", str(tmp_path / "logs"))
+    _stub_vllm_ascend_version(monkeypatch)
+
+    with pytest.raises(ValueError, match="vllm_npu registry.*attention_context"):
+        collect_mod.main()
+
+
 def test_npu_lane_refuses_to_run_without_vllm_ascend(monkeypatch):
     """Fail closed: the lane never falls back to the base vLLM version."""
     with pytest.raises(RuntimeError, match="vllm-ascend is not installed"):

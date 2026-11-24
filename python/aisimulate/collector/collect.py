@@ -6596,8 +6596,21 @@ def main():
         else:
             os.environ.pop("COLLECTOR_MODEL_PATH", None)
 
+        collector_framework = None
+        # Match collect_vllm's CUDA -> NPU precedence before validating model
+        # ops. CPU-only planning and FPM campaigns do not probe local devices.
+        if (
+            args.backend == "vllm"
+            and not args.plan_only
+            and not fpm_requested
+            and not _cuda_available()
+            and _npu_available()
+        ):
+            collector_framework = "vllm_npu"
+
         case_plan = build_collection_case_plan(
             backend=args.backend,
+            collector_framework=collector_framework,
             model_path=args.model_path,
             model_architecture=args.model_architecture,
             gpu_type=args.gpu,

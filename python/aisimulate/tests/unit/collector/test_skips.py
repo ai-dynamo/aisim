@@ -11,7 +11,6 @@ from collector import case_generator, skips
 from collector.model_cases import _backend_registry_ops, build_collection_case_plan
 from collector.op_plans import OP_PLANS, plan
 from collector.skips import SKIPS, case_dtypes, filter_cases
-from collector.vllm.registry import REGISTRY_NPU
 
 pytestmark = pytest.mark.unit
 
@@ -130,8 +129,7 @@ def test_malformed_entries_are_rejected(entries, message):
 
 
 def test_entries_name_known_backends_ops_and_case_files():
-    backends = {backend: _backend_registry_ops(backend) for backend in ("sglang", "trtllm", "vllm")}
-    backends["vllm_npu"] = {entry.op for entry in REGISTRY_NPU}
+    backends = {backend: _backend_registry_ops(backend) for backend in ("sglang", "trtllm", "vllm", "vllm_npu")}
     ops = set().union(*backends.values())
     architectures = {
         yaml.safe_load(path.read_text()).get("architecture")

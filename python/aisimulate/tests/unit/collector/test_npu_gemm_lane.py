@@ -51,6 +51,7 @@ def test_manifest_pins_the_vllm_ascend_runtime_identity():
     runtime = get_collector_runtime("vllm_npu")
 
     assert runtime.framework == "vllm_npu"
+    assert runtime.source_repo == "https://github.com/vllm-project/vllm-ascend.git"
     # The version axis is the vllm-ascend release, not base vLLM.
     assert runtime.version == "0.30.0rc2"
     assert runtime.images == {"default": IMAGE}
