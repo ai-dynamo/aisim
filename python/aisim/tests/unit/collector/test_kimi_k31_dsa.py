@@ -622,11 +622,16 @@ def test_native_exception_kills_launcher_and_tp_children(exception_type, monkeyp
             assert raised.value is error
         assert children[0].poll() is not None
         assert output.read_text() == "previous successful row\n"
-        try:
-            status = psutil.Process(int(rank_pid.read_text())).status()
-        except psutil.NoSuchProcess:
-            status = None
-        assert status in (None, psutil.STATUS_ZOMBIE)
+        # Linux can reap the launcher before its SIGKILLed rank finishes exiting.
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                if psutil.Process(int(rank_pid.read_text())).status() == psutil.STATUS_ZOMBIE:
+                    break
+            except psutil.NoSuchProcess:
+                break
+            assert time.monotonic() < deadline, "TP rank survived process-group termination"
+            time.sleep(0.01)
         assert "native cancellation diagnostic" in capfd.readouterr().err
     finally:
         # A regression must not leave the test's real process group running.
@@ -1318,6 +1323,7 @@ def test_native_main_rejects_invalid_rendezvous_before_runtime_lookup(monkeypatc
 def test_native_main_wires_platform_launch_and_offline_tokenizer(monkeypatch, tmp_path, config, nodes, rank):
     from collector.sglang import collect_kimi_k31_dsa_v1 as native
 
+    sm = {(1, 0): 90, (2, 0): 100, (2, 1): 103}[nodes, rank]
     config_path = tmp_path / "checkpoint-config.json"
     config_path.write_text(json.dumps(config))
     tokenizer = str(config_path.parent)
@@ -1366,7 +1372,11 @@ def test_native_main_wires_platform_launch_and_offline_tokenizer(monkeypatch, tm
     # serving-framework install. The real single_layer_config still executes.
     modules = {
         "torch": SimpleNamespace(
-            cuda=SimpleNamespace(device_count=lambda: 1 + 8 // nodes, mem_get_info=memory),
+            cuda=SimpleNamespace(
+                device_count=lambda: 1 + 8 // nodes,
+                mem_get_info=memory,
+                get_device_capability=lambda _device: divmod(sm, 10),
+            ),
             multiprocessing=SimpleNamespace(spawn=spawn),
         ),
         "huggingface_hub": SimpleNamespace(
@@ -1378,9 +1388,14 @@ def test_native_main_wires_platform_launch_and_offline_tokenizer(monkeypatch, tm
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setattr(native, "_assert_runtime", lambda: None)
-    options = ["--device", "cuda:1"]
+    options = ["--device", "cuda:1", "--sm", str(sm)]
     if nodes > 1:
         options += ["--nnodes", str(nodes), "--node-rank", str(rank), "--dist-init-addr", "master:1234"]
     monkeypatch.setattr(sys, "argv", _native_main_argv(tmp_path) + options)
-    native.main()
+    if rank:
+        # Other hosts can share the leader's output directory; only global rank zero writes.
+        with native.native_publication_lock(tmp_path / "perf.txt"):
+            native.main()
+    else:
+        native.main()
     assert calls == ["config.json", *native.TOKENIZER_FILES, "resolve", "environment", "ports", "spawn"]
