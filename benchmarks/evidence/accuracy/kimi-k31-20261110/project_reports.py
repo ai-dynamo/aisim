@@ -96,8 +96,9 @@ def main():
 
     def read(relative):
         path = args.accuracy_root / relative
-        original_hashes[relative] = sha(path)
-        return json.loads(path.read_text())
+        payload = path.read_bytes()
+        original_hashes[relative] = hashlib.sha256(payload).hexdigest()
+        return json.loads(payload)
 
     op = read("full-truth-v4/full-op-accuracy.json")
     freeze = read("full-truth-v4/prediction-freeze-v4-final.json")
@@ -177,6 +178,7 @@ def main():
     emit_points(args.output / "op-full-model.csv", "op_based", op_points)
 
     phases = []
+    phase_thresholds = {}
     for phase in ("prefill", "decode"):
         report_name = f"fpm-holdout-v6-{phase}/accuracy-summary.json"
         if not (args.accuracy_root / report_name).exists():
@@ -184,7 +186,11 @@ def main():
         report = read(report_name)
         canonical_name = f"fpm-holdout-v6-{phase}/interpolation-validation.json"
         canonical = read(canonical_name)
-        selection = read(f"fpm-holdout-v6-{phase}/holdout-plan.json")
+        plan_name = f"fpm-holdout-v6-{phase}/holdout-plan.json"
+        selection = read(plan_name)
+        if original_hashes[plan_name] != canonical["artifacts"]["holdout_plan"]["sha256"]:
+            raise ValueError(f"{phase} holdout plan differs from the scored report")
+        phase_thresholds[phase] = selection["policy"]["max_p95_relative_error"]
         sampling_name = f"fpm-native-sampling-v6-{phase}.json"
         sampling = read(sampling_name)
         assert report["canonical_report_sha256"] == original_hashes[canonical_name]
@@ -235,7 +241,8 @@ def main():
                 }
             ),
             "canonical_report_sha256": original_hashes[canonical_name],
-            "holdout_plan_sha256": report["source_sha256"]["plan"],
+            "holdout_plan_sha256": original_hashes[plan_name],
+            "source_plan_sha256": report["source_sha256"]["plan"],
             "source_hashes": pick(
                 report["source_sha256"],
                 (
@@ -381,8 +388,7 @@ def main():
         for phase in phases:
             public_phase = json.loads((args.output / f"fpm-{phase}.json").read_text())
             if public_phase["canonical_status"] != "passed":
-                phase_plan = read(f"fpm-holdout-v6-{phase}/holdout-plan.json")
-                threshold = 100 * phase_plan["policy"]["max_p95_relative_error"]
+                threshold = 100 * phase_thresholds[phase]
                 failures.append(
                     f"{phase} P95 APE is {public_phase['summary']['p95_ape_percent']:.4f}% "
                     f"against the original {threshold:g}% gate"

@@ -26,7 +26,8 @@
     "2d218e9699a1cf1348d40efae72c1df87b1bcbb3a403b89e6f087fa5b267453f"
   ],
   "canonical_report_sha256": "e71b19da84eac7cf244e0c23e8e8acf7bc661db836a28e97740f56f9c16afde1",
-  "holdout_plan_sha256": "2ca88f8b66f7c4ead15a4cbe607f42e2a9aa7480dbaca43da181ffbc53dc3388",
+  "holdout_plan_sha256": "311ec9ed8d9578d871c0dd1e8d8b4d70ff0415f24ea6eab6d35f4e0b42a71375",
+  "source_plan_sha256": "2ca88f8b66f7c4ead15a4cbe607f42e2a9aa7480dbaca43da181ffbc53dc3388",
   "source_hashes": {
     "request": "03bc4629ae69b609fef95b2efb8986f5feae2e6900544d8c5aa105220982e055",
     "execution_evidence": "469a3f4b1422725430ef83d2f6fc2bc3a888fec09a6a0bfacc5d09ad431c66cf",
