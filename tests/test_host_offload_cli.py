@@ -1366,6 +1366,37 @@ def test_auto_text_kv_ignores_malformed_vision_metadata_and_rereads_local_config
     assert estimate_kv_bytes_per_token(str(tmp_path), **kwargs) == 2048 * local_heads
 
 
+def test_remote_text_kv_loads_no_llama4_processor(monkeypatch):
+    from copy import deepcopy
+
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk import utils
+
+    model = "example/llama4-text-kv"
+    raw = deepcopy(utils._load_pre_downloaded_hf_config("meta-llama/Llama-4-Scout-17B-16E-Instruct"))
+    raw.pop("image_processor_config")
+    raw["text_config"].update(
+        hidden_size=1024,
+        num_attention_heads=8,
+        num_key_value_heads=2,
+        num_hidden_layers=4,
+        head_dim=128,
+        no_rope_layers=[0, 0, 0, 0],
+    )
+
+    def fetch(_model, filename, **_kwargs):
+        if filename == "preprocessor_config.json":
+            raise TimeoutError("processor service unavailable")
+        assert filename == "hf_quant_config.json"
+        return None
+
+    monkeypatch.setattr(utils, "_download_hf_config", lambda _: raw)
+    monkeypatch.setattr(utils, "_download_hf_json", fetch)
+    assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1, kvcache_quant_mode="bfloat16") == 4096
+    with pytest.raises(TimeoutError, match="processor service unavailable"):
+        utils._load_model_config_from_model_path(model)
+
+
 @pytest.mark.parametrize("authored", [None, False, True])
 @pytest.mark.parametrize("saved_eplb", [False, True])
 @pytest.mark.parametrize("roundtrip", [False, True])

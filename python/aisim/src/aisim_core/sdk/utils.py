@@ -2108,12 +2108,18 @@ def _attach_llama4_processor_config(raw_config: dict, model_path: str, *, model_
     return raw_config
 
 
-def _load_model_config_from_model_path(model_path: str, *, model_revision: str | None = None) -> dict:
-    return _load_resolved_model_config(_resolved_model_source(model_path), model_revision=model_revision)
+def _load_model_config_from_model_path(
+    model_path: str, *, model_revision: str | None = None, include_processor: bool = True
+) -> dict:
+    return _load_resolved_model_config(
+        _resolved_model_source(model_path), model_revision=model_revision, include_processor=include_processor
+    )
 
 
 @cache
-def _load_resolved_model_config(model_path: str, *, model_revision: str | None = None) -> dict:
+def _load_resolved_model_config(
+    model_path: str, *, model_revision: str | None = None, include_processor: bool = True
+) -> dict:
     """
     Get model configuration from model path.
 
@@ -2134,7 +2140,10 @@ def _load_resolved_model_config(model_path: str, *, model_revision: str | None =
     model_path = os.path.expanduser(model_path)
     # Check if it's a local path
     if Path(model_path).is_absolute():
-        config = _attach_llama4_processor_config(_load_local_config(model_path), model_path)
+        config = _load_local_config(model_path)
+        if include_processor:
+            config = _attach_llama4_processor_config(config, model_path)
+
         return _attach_inferred_quant_fields(_attach_hf_quant_config(config, _load_local_quant_config(model_path)))
 
     if model_revision is not None:
@@ -2145,7 +2154,9 @@ def _load_resolved_model_config(model_path: str, *, model_revision: str | None =
         config = _load_pinned_checkpoint_config(model_path, model_revision)
         if not isinstance(config, dict):
             raise ValueError("checkpoint config.json must be an object")
-        config = _attach_llama4_processor_config(copy.deepcopy(config), model_path, model_revision=model_revision)
+        config = copy.deepcopy(config)
+        if include_processor:
+            config = _attach_llama4_processor_config(config, model_path, model_revision=model_revision)
         hf_quant_config = _download_hf_json(
             model_path, "hf_quant_config.json", raise_on_404=False, revision=model_revision
         )
@@ -2153,12 +2164,16 @@ def _load_resolved_model_config(model_path: str, *, model_revision: str | None =
 
     # Otherwise treat as HuggingFace path
     if model_path in DefaultHFModels:
-        config = _attach_llama4_processor_config(_load_pre_downloaded_hf_config(model_path), model_path)
+        config = _load_pre_downloaded_hf_config(model_path)
+        if include_processor:
+            config = _attach_llama4_processor_config(config, model_path)
         return _attach_inferred_quant_fields(
             _attach_hf_quant_config(config, _load_pre_downloaded_hf_quant_config(model_path))
         )
 
-    config = _attach_llama4_processor_config(_download_hf_config(model_path), model_path)
+    config = _download_hf_config(model_path)
+    if include_processor:
+        config = _attach_llama4_processor_config(config, model_path)
     try:
         hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False)
     except Exception as exc:  # best-effort for optional quant config

@@ -1382,7 +1382,8 @@ mod tests {
     }
 
     /// Hand ledger at TP8 (12 heads), BF16 weights, FP8 KV and one new token.
-    /// Both phases read 96,272,384 weight bytes and 9,216 gate IO bytes.
+    /// Both phases read 96,272,384 projection and 3,145,728 absorbed KV
+    /// weight bytes plus 9,216 gate IO bytes.
     /// Decode reads 4096 * 132 index bytes and 2048 latent entries;
     /// context at prefix=4095 reads the same index cache, 12 * 2048 latent
     /// entries and 12 * 192 * 4 = 9,216 query IO bytes. Latent entries
@@ -1407,7 +1408,7 @@ mod tests {
                 } else {
                     1152.0
                 };
-                let common_bytes = 96_272_384.0 + 540_672.0 + 9_216.0;
+                let common_bytes = 96_272_384.0 + 3_145_728.0 + 540_672.0 + 9_216.0;
                 approx(
                     op_sol_latency_ms(&Op::DsaContext(op.clone()), &d, 1.0, 1.0, 1.0, 4095.0)
                         .unwrap(),

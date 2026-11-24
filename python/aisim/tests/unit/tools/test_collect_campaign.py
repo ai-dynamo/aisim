@@ -168,7 +168,6 @@ def test_campaign_images_are_keyed_by_shard_model(monkeypatch, tmp_path):
     assert (
         c.run_campaign(
             plan,
-            plan_path=tmp_path / "plan.yaml",
             root=tmp_path / "out",
             gpus=[0],
             checkout=tmp_path,
@@ -177,6 +176,13 @@ def test_campaign_images_are_keyed_by_shard_model(monkeypatch, tmp_path):
         )
         == 0
     )
+    (tmp_path / "plan.yaml").write_text("changed after admission")
+    captured = []
+    monkeypatch.setattr(c, "run_shard", lambda plan, shard, **kwargs: captured.append((plan.sm, shard)) or 0)
+    for command in commands:
+        monkeypatch.setattr(sys, "argv", command[1:])
+        assert c.main() == 0
+    assert captured == [(103, shard) for shard in shards]
     assert [cmd[cmd.index("--image") + 1] for cmd in commands] == ["image-one", "image-two"]
 
 
@@ -186,12 +192,14 @@ def test_build_image_uses_model_scoped_runtime(monkeypatch):
     c = _load()
     op = "kimi_k31_dsa_context_module"
     seen = []
-    monkeypatch.setattr(c, "build_image", lambda base, **_kwargs: seen.append(base) or "built")
+    monkeypatch.setattr(
+        c, "build_image", lambda base, *, model_path, **_kwargs: seen.append((base, model_path)) or "built"
+    )
     monkeypatch.setattr(
         sys, "argv", ["collect_campaign", "build-image", "--backend", "sglang", "--op", op, "--model-path", MODEL]
     )
     assert c.main() == 0
-    assert seen == [c.pinned_image("sglang", op, MODEL)]
+    assert seen == [(c.pinned_image("sglang", op, MODEL), MODEL)]
 
 
 @pytest.mark.parametrize("phase", ["context", "generation"])
@@ -212,7 +220,6 @@ def test_k31_campaign_refuses_multi_gpu_cases_before_launch(monkeypatch, tmp_pat
     with pytest.raises(SystemExit, match=r"one GPU.*collector/collect.py.*full-node"):
         c.run_campaign(
             plan,
-            plan_path=tmp_path / "plan.yaml",
             root=tmp_path / "out",
             gpus=[0, 1, 2, 3],
             checkout=tmp_path,
@@ -244,7 +251,6 @@ def test_k31_campaign_preserves_tp1_shards(monkeypatch, tmp_path, phase):
     assert (
         c.run_campaign(
             plan,
-            plan_path=tmp_path / "plan.yaml",
             root=tmp_path / "out",
             gpus=[3],
             checkout=tmp_path,
@@ -274,7 +280,6 @@ def test_k31_noncanonical_shard_is_rejected_before_launch(monkeypatch, tmp_path,
     with pytest.raises(SystemExit, match=r"model_path: moonshotai/Kimi-K3.1-Pro.*pinned K3.1 runtime"):
         c.run_campaign(
             plan,
-            plan_path=tmp_path / "plan.yaml",
             root=tmp_path / "out",
             gpus=[0],
             checkout=tmp_path,
