@@ -34,7 +34,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC
 from pathlib import Path
@@ -332,11 +332,15 @@ class ModelFileCache:
         directory = self.repo_dir(repo) / sha
         path = directory / filename
         try:
-            return "hit", json.loads(path.read_bytes())
+            data = json.loads(path.read_bytes())
         except FileNotFoundError:
             pass
         except (OSError, ValueError) as exc:
             logger.warning("Ignoring unreadable cached %s (%s); it will be downloaded again", path, exc)
+        else:
+            if not isinstance(data, dict):
+                raise HuggingFaceDownloadError(f"Cached {path} must contain a JSON object")
+            return "hit", data
         if (directory / f"{filename}.absent").is_file():
             return "absent", None
         return "miss", None
@@ -420,6 +424,7 @@ class ModelFiles:
         sha = self.sha
         state, data = self.cache.read(self.repo, sha, filename)
         if state == "hit":
+            self._record_pin()
             return data, "cached"
         if state == "miss":
             if self.offline:
@@ -433,17 +438,19 @@ class ModelFiles:
                     raise HuggingFaceDownloadError(
                         f"Failed to download {self.repo}'s {filename} from HuggingFace: not valid JSON ({exc})"
                     ) from exc
+                if not isinstance(data, dict):
+                    raise HuggingFaceDownloadError(f"{self.repo}'s {filename} must contain a JSON object")
                 self.cache.write(self.repo, sha, filename, raw)
                 self._record_pin()
                 return data, "fetched"
             self.cache.mark_absent(self.repo, sha, filename)
-            self._record_pin()
         if required:
             raise HuggingFaceHTTPError(
                 f"Failed to download {self.repo}'s {filename} from HuggingFace: the repository has no {filename} "
                 f"at commit {sha} (HTTP 404). URL: {HF_ENDPOINT}/{self.repo}/raw/{sha}/{filename}",
                 404,
             )
+        self._record_pin()
         return None, "absent"
 
 
@@ -489,7 +496,7 @@ class PrefetchEntry:
 
     ``status``: ``bundled`` (AISim ships its config, nothing to fetch), ``cached`` (already complete), ``fetched``
     (downloaded now), ``skipped`` (gated, denied or not found: a warning, not a failure), ``failed`` (rate limit,
-    network or server error) or ``missing`` (offline and not cached).
+    network/server error, invalid metadata or missing required processor) or ``missing`` (offline and not cached).
     """
 
     model: str
@@ -507,14 +514,15 @@ def prefetch_model(
     *,
     revision: str | None = None,
     bundled: Iterable[str] = (),
-    extra_files: Callable[[dict], Sequence[str]] = lambda _config: (),
+    extra_files: Callable[[dict], dict[str, bool]] = lambda _config: {},
     transport: ModelFileTransport | None = None,
     cache: ModelFileCache | None = None,
     offline: bool | None = None,
     refresh: bool = False,
 ) -> PrefetchEntry:
     """Cache every metadata file AISim reads for ``model``: ``config.json``, ``hf_quant_config.json`` and the
-    ``extra_files`` its config calls for (the loader's own file list). Never raises for a per-model problem."""
+    ``extra_files`` its config calls for (the loader's own file-to-requiredness plan).
+    Never raises for a per-model problem."""
     if revision is None and model in set(bundled):
         return PrefetchEntry(model, "bundled")
     entry = PrefetchEntry(model, "cached")
@@ -525,8 +533,14 @@ def prefetch_model(
         config, source = files.get("config.json")
         entry.revision = files.sha
         entry.files["config.json"] = source
-        for name in dict.fromkeys(("hf_quant_config.json", *extra_files(config if isinstance(config, dict) else {}))):
-            entry.files[name] = files.get(name, required=False)[1]
+        for name, required in {"hf_quant_config.json": False, **extra_files(config)}.items():
+            try:
+                entry.files[name] = files.get(name, required=required)[1]
+            except HuggingFaceHTTPError as exc:
+                if required and exc.status == 404:
+                    entry.files[name] = "absent"
+                    raise HuggingFaceDownloadError(f"Incomplete model config cache: {exc}") from exc
+                raise
     except ModelFileMissingError as exc:
         entry.status, entry.reason = "missing", str(exc)
     except HuggingFaceHTTPError as exc:

@@ -996,6 +996,39 @@ def test_fetch_model_config_offline_reports_what_is_not_cached(run):
     assert "aisim data fetch --category model-config" in err
 
 
+@pytest.mark.parametrize("command", ["fetch", "init"])
+def test_model_prefetch_honors_the_offline_environment_without_constructing_a_transport(run, monkeypatch, command):
+    if command == "init":
+        # Populate only the operation data, leaving the model cache cold.
+        assert run("init", "--all", "--no-models", "--revision", SHA)[0] == 0
+    monkeypatch.setenv("AISIM_DATA_OFFLINE", "1")
+    monkeypatch.setattr(hf_model_files, "make_transport", lambda: pytest.fail("offline built a model transport"))
+    if command == "init":
+        status, out, _ = run("init", "--all", "--revision", SHA)
+        result = json.loads(out)["model_configs"]
+        assert status == 0  # init warns for missing models
+    else:
+        status, out, _ = run("fetch", "--category", "model-config", "--model", ALPHA)
+        result = json.loads(out)
+        assert status == 1
+    assert result["offline"] and result["counts"]["missing"] > 0 and run.hub.calls == []
+
+
+def test_fetch_model_config_fails_when_a_required_llama4_processor_is_absent(run, monkeypatch):
+    monkeypatch.setattr(
+        run.hub,
+        "read_file",
+        lambda repo, sha, filename: (
+            b'{"architectures": ["Llama4ForConditionalGeneration"]}' if filename == "config.json" else None
+        ),
+    )
+    status, out, err = run("fetch", "--category", "model-config", "--model", ALPHA)
+    result = json.loads(out)
+    assert status == 1 and result["counts"] == {"failed": 1}
+    assert result["models"][0]["files"]["preprocessor_config.json"] == "absent"
+    assert "Incomplete" in err and "preprocessor_config.json" in err
+
+
 @pytest.mark.parametrize(
     ("argv", "message"),
     [

@@ -1463,7 +1463,7 @@ class TestGetModelConfigFromHFID:
         result = get_model_config_from_model_path(model_id)
 
         assert result["architecture"] == "LlamaForCausalLM"  # architecture
-        mock_download.assert_called_once_with(model_id)
+        mock_download.assert_called_once_with(model_id, files=mock_download_quant.call_args.kwargs["files"])
 
 
 class TestSafeMkdir:

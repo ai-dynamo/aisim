@@ -127,6 +127,25 @@ def test_refresh_resolves_the_branch_again_and_keeps_the_old_commit_cached(cache
     assert hf.load_model_json(MODEL, "config.json", transport=FakeTransport(), cache=cache) == newer
 
 
+def test_refresh_persists_a_new_pin_even_when_the_commit_is_already_cached(cache):
+    hf.load_model_json(MODEL, "config.json", transport=FakeTransport(), cache=cache)
+    newer = {**CONFIG, "hidden_size": 8192}
+    moved = FakeTransport(files={(MODEL, SHA_B, "config.json"): blob(newer)}, refs={(MODEL, "main"): SHA_B})
+    hf.load_model_json(MODEL, "config.json", revision=SHA_B, transport=moved, cache=cache)
+    moved.calls.clear()
+    assert hf.load_model_json(MODEL, "config.json", transport=moved, cache=cache, refresh=True) == newer
+    assert moved.calls == [("resolve", MODEL, "main")]
+    assert cache.pinned(MODEL, "main") == SHA_B
+    assert hf.load_model_json(MODEL, "config.json", cache=cache, offline=True) == newer
+
+
+@pytest.mark.parametrize("revision", ["main", SHA_A])
+def test_reading_a_pinned_or_explicit_commit_does_not_rewrite_refs(cache, monkeypatch, revision):
+    hf.load_model_json(MODEL, "config.json", transport=FakeTransport(), cache=cache)
+    monkeypatch.setattr(cache, "pin", lambda *args: pytest.fail("unexpected ref write"))
+    assert hf.load_model_json(MODEL, "config.json", revision=revision, cache=cache, offline=True) == CONFIG
+
+
 def test_a_full_sha_needs_no_resolution_and_is_not_recorded_as_a_ref(cache):
     fake = FakeTransport()
     assert hf.load_model_json(MODEL, "config.json", revision=SHA_A, transport=fake, cache=cache) == CONFIG
@@ -176,8 +195,17 @@ def test_a_required_file_the_repository_lacks_raises_a_404(cache):
     with pytest.raises(hf.HuggingFaceHTTPError, match="no config.json") as caught:
         hf.load_model_json(MODEL, "config.json", transport=fake, cache=cache)
     assert caught.value.status == 404
-    with pytest.raises(hf.HuggingFaceHTTPError):  # the absence is cached: still an error, now without the network
-        hf.load_model_json(MODEL, "config.json", transport=FakeTransport(), cache=cache)
+    assert cache.pinned(MODEL, "main") is None
+    assert cache.read(MODEL, SHA_A, "config.json") == ("absent", None)
+    fake.calls.clear()
+    with pytest.raises(hf.HuggingFaceHTTPError):  # resolve again, but reuse this commit's cached absence
+        hf.load_model_json(MODEL, "config.json", transport=fake, cache=cache)
+    assert fake.calls == [("resolve", MODEL, "main")]
+    assert cache.pinned(MODEL, "main") is None
+    fake.refs[(MODEL, "main")] = SHA_B
+    fake.files[(MODEL, SHA_B, "config.json")] = blob(CONFIG)
+    assert hf.load_model_json(MODEL, "config.json", transport=fake, cache=cache) == CONFIG
+    assert cache.pinned(MODEL, "main") == SHA_B
 
 
 def test_a_corrupt_cache_entry_is_downloaded_again(cache, caplog):
@@ -193,6 +221,23 @@ def test_an_answer_that_is_not_json_is_an_error_and_is_not_cached(cache):
     with pytest.raises(hf.HuggingFaceDownloadError, match="not valid JSON"):
         hf.load_model_json(MODEL, "config.json", transport=fake, cache=cache)
     assert not (cache.root / "acme" / "Fake-Model" / SHA_A / "config.json").exists()
+
+
+@pytest.mark.parametrize("value", [None, [], "metadata", 1, True])
+@pytest.mark.parametrize("filename", ["config.json", "hf_quant_config.json", "preprocessor_config.json"])
+@pytest.mark.parametrize("cached", [False, True])
+def test_non_object_metadata_is_rejected_even_for_optional_files(cache, value, filename, cached):
+    raw = blob(value)
+    if cached:
+        cache.write(MODEL, SHA_A, filename, raw)
+    fake = FakeTransport(files={(MODEL, SHA_A, filename): raw})
+    with pytest.raises(hf.HuggingFaceDownloadError, match=f"{filename}.*JSON object"):
+        hf.load_model_json(MODEL, filename, required=False, transport=fake, cache=cache)
+    assert cache.pinned(MODEL, "main") is None
+    if cached:
+        assert fake.reads == []
+    else:
+        assert cache.read(MODEL, SHA_A, filename) == ("miss", None)
 
 
 @pytest.mark.parametrize("repo", ["../evil", "a/b/c", "/abs/path", "", "a/..", "has space/x"])
@@ -340,6 +385,69 @@ def test_a_missing_quant_file_is_tolerated(transport):
     )
 
 
+def test_null_quantization_metadata_stops_the_runtime_loader(transport):
+    transport.files[(MODEL, SHA_A, "hf_quant_config.json")] = b"null"
+    with pytest.raises(hf.HuggingFaceDownloadError, match="hf_quant_config.json.*JSON object"):
+        utils.get_model_config_from_model_path(MODEL)
+
+
+@pytest.mark.parametrize("warm_raw_cache", [False, True])
+@pytest.mark.parametrize(
+    "bundled_model",
+    [
+        "nvidia/Llama-3.1-70B-Instruct-FP8",
+        "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+        "nvidia/Kimi-K2.5-NVFP4",
+        "Qwen/Qwen3-VL-8B-Instruct",
+    ],
+)
+def test_runtime_uses_one_commit_when_a_concurrent_prefetch_moves_the_pin(
+    cache, monkeypatch, bundled_model, warm_raw_cache
+):
+    raw = copy.deepcopy(utils._load_pre_downloaded_hf_config(bundled_model))
+    processor = raw.pop("image_processor_config", {})
+    model = "acme/Consistent-" + bundled_model.split("/")[1]
+    fake = FakeTransport(refs={(model, "main"): SHA_A})
+    for sha, quant in [(SHA_A, "NVFP4"), (SHA_B, "FP8")]:
+        fake.files.update(
+            {
+                (model, sha, "config.json"): blob(raw),
+                (model, sha, "hf_quant_config.json"): blob({"quantization": {"quant_algo": quant}}),
+                (model, sha, "preprocessor_config.json"): blob(
+                    processor if sha == SHA_A else {**processor, "max_patches": 64, "max_pixels": 65536}
+                ),
+                (model, sha, "video_preprocessor_config.json"): blob({} if sha == SHA_A else {"max_patches": 64}),
+            }
+        )
+        assert (
+            hf.prefetch_model(
+                model, revision=sha, transport=fake, cache=cache, extra_files=utils.model_files_to_cache
+            ).status
+            == "fetched"
+        )
+    cache.pin(model, "main", SHA_A)
+    monkeypatch.setattr(hf, "default_cache_root", lambda: cache.root)
+    expected = copy.deepcopy(utils.get_model_config_from_model_path(model))
+    utils.get_model_config_from_model_path.cache_clear()
+    if warm_raw_cache:
+        cache.pin(model, "main", SHA_B)
+    else:
+        utils._load_model_config_from_model_path.cache_clear()
+        read = hf.ModelFileCache.read
+
+        def move_pin_after_config_read(self, repo, sha, filename):
+            answer = read(self, repo, sha, filename)
+            if filename == "config.json":
+                self.pin(repo, "main", SHA_B)
+            return answer
+
+        monkeypatch.setattr(hf.ModelFileCache, "read", move_pin_after_config_read)
+    actual = utils.get_model_config_from_model_path(model)
+    assert actual == expected
+    assert actual["raw_config"]["hf_quant_config"]["quantization"]["quant_algo"] == "NVFP4"
+    assert cache.pinned(model, "main") == SHA_B
+
+
 @pytest.mark.parametrize(
     ("bundled_model", "extra"),
     [
@@ -419,6 +527,32 @@ def test_prefetch_with_a_failing_optional_file_is_failed_not_cached_as_complete(
     assert entry.status == "failed" and "503" in entry.reason
     retry = hf.prefetch_model(MODEL, transport=FakeTransport(), cache=cache)
     assert retry.status == "fetched" and retry.files == {"config.json": "cached", "hf_quant_config.json": "absent"}
+
+
+def test_prefetch_reports_a_missing_required_llama4_processor_as_incomplete(cache):
+    raw = {"architectures": ["Llama4ForConditionalGeneration"]}
+    fake = FakeTransport(files={(MODEL, SHA_A, "config.json"): blob(raw)})
+    for offline in (False, True):
+        entry = hf.prefetch_model(
+            MODEL, transport=fake, cache=cache, offline=offline, extra_files=utils.model_files_to_cache
+        )
+        assert entry.status == "failed"
+        assert entry.files["preprocessor_config.json"] == "absent"
+        assert "Incomplete" in entry.reason and "preprocessor_config.json" in entry.reason
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"architectures": ["Llama4ForConditionalGeneration"], "image_processor_config": {}},
+        {"architectures": ["KimiK3ForConditionalGeneration"]},
+        {"architectures": ["Qwen3VLForConditionalGeneration"]},
+    ],
+)
+def test_prefetch_preserves_supported_processor_absence(cache, raw):
+    fake = FakeTransport(files={(MODEL, SHA_A, "config.json"): blob(raw)})
+    entry = hf.prefetch_model(MODEL, transport=fake, cache=cache, extra_files=utils.model_files_to_cache)
+    assert entry.status == "fetched" and entry.files["hf_quant_config.json"] == "absent"
 
 
 def test_prefetch_never_raises_for_one_model(cache):

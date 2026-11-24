@@ -36,6 +36,7 @@ from aisim_core.sdk.common import (
 )
 from aisim_core.sdk.hf_model_files import (
     HuggingFaceDownloadError,  # noqa: F401  (re-exported: callers import it from here)
+    ModelFiles,
     load_model_json,
 )
 from aisim_core.sdk.hf_model_files import hf_auth_headers as _get_hf_auth_headers  # noqa: F401
@@ -411,17 +412,26 @@ def safe_mkdir(target_path: str, exist_ok: bool = True) -> Path:
         raise ValueError(f"Failed to create directory: {e}") from e
 
 
-def _download_hf_json(hf_id: str, filename: str, *, raise_on_404: bool = True, revision: str = "main") -> dict | None:
+def _download_hf_json(
+    hf_id: str,
+    filename: str,
+    *,
+    raise_on_404: bool = True,
+    revision: str = "main",
+    files: ModelFiles | None = None,
+) -> dict | None:
     """Load and parse a JSON file of a HuggingFace model repo, from the AISim data cache when it is there.
 
     ``revision`` (a branch, tag or commit SHA) is resolved to one commit that the cache records, so later runs read
     the same commit; pass a full commit SHA to pin it explicitly. ``AISIM_DATA_OFFLINE=1`` never opens a
     connection (see :mod:`aisim_core.sdk.hf_model_files`).
     """
+    if files is not None:
+        return files.get(filename, required=raise_on_404)[0]
     return load_model_json(hf_id, filename, revision=revision, required=raise_on_404)
 
 
-def _download_hf_config(hf_id: str) -> dict:
+def _download_hf_config(hf_id: str, *, files: ModelFiles | None = None) -> dict:
     """
     Download a HuggingFace config.json file from the HuggingFace API.
 
@@ -434,7 +444,7 @@ def _download_hf_config(hf_id: str) -> dict:
     Raises:
         HuggingFaceDownloadError: If the HuggingFace API returns an error
     """
-    return _download_hf_json(hf_id, "config.json", raise_on_404=True) or {}
+    return _download_hf_json(hf_id, "config.json", raise_on_404=True, files=files) or {}
 
 
 def _parse_nemotron_block_configs(block_configs: list[dict]) -> list[BlockConfig]:
@@ -1916,7 +1926,7 @@ def _attach_hf_quant_config(raw_config: dict, hf_quant_config: dict | None) -> d
     return raw_config
 
 
-def _attach_llama4_processor_config(raw_config: dict, model_path: str) -> dict:
+def _attach_llama4_processor_config(raw_config: dict, model_path: str, *, files: ModelFiles | None = None) -> dict:
     """Load Llama 4's separate processor metadata, retaining bundled inline configs."""
     if (raw_config.get("architectures") or [None])[0] != "Llama4ForConditionalGeneration":
         return raw_config
@@ -1929,7 +1939,7 @@ def _attach_llama4_processor_config(raw_config: dict, model_path: str) -> dict:
         processor_path = _get_model_config_path() / f"{model_path.replace('/', '--')}_preprocessor_config.json"
         processor_config = _load_json_with_infinity(processor_path) if processor_path.exists() else None
     else:
-        processor_config = _download_hf_json(model_path, "preprocessor_config.json", raise_on_404=False)
+        processor_config = _download_hf_json(model_path, "preprocessor_config.json", raise_on_404=False, files=files)
     if processor_config is not None:
         raw_config["image_processor_config"] = processor_config
     return raw_config
@@ -1957,6 +1967,7 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
     # Check if it's a local path
     if os.path.isdir(model_path):
         config = _attach_llama4_processor_config(_load_local_config(model_path), model_path)
+        config = _attach_processor_config(config, model_path)
         return _attach_inferred_quant_fields(_attach_hf_quant_config(config, _load_local_quant_config(model_path)))
 
     # Otherwise treat as HuggingFace path
@@ -1966,11 +1977,15 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
             _attach_hf_quant_config(config, _load_pre_downloaded_hf_quant_config(model_path))
         )
 
-    config = _attach_llama4_processor_config(_download_hf_config(model_path), model_path)
+    # One session keeps config, quantization and processor metadata on the same commit even when a concurrent
+    # prefetch refreshes the on-disk branch pin between reads.
+    files = ModelFiles(model_path)
+    config = _attach_llama4_processor_config(_download_hf_config(model_path, files=files), model_path, files=files)
     # hf_quant_config.json is optional, but only in the sense that the repository may not have it (HTTP 404). Any other
     # failure (rate limit, timeout, server error) must stop the run: continuing would drop the quantization metadata
     # and silently change the prediction.
-    hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False)
+    hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False, files=files)
+    config = _attach_processor_config(config, model_path, files=files)
     return _attach_inferred_quant_fields(_attach_hf_quant_config(config, hf_quant_config))
 
 
@@ -1978,22 +1993,54 @@ _KIMI_PROCESSOR_ARCHITECTURES = ("KimiK25ForConditionalGeneration", "KimiK3ForCo
 _QWEN_VL_PROCESSOR_ARCHITECTURES = ("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration")
 
 
-def model_files_to_cache(raw_config: dict) -> tuple[str, ...]:
+def model_files_to_cache(raw_config: dict) -> dict[str, bool]:
     """The Hugging Face files, besides ``config.json``, that loading a non-bundled model with this config reads.
 
     ``aisim init`` and ``aisim data fetch --category model-config`` cache exactly these, so an offline run finds
     everything the loader asks for: the optional quantization metadata for every model, and the processor files of
-    the multimodal families that consume them.
+    the multimodal families that consume them. Each value indicates whether the file is required at runtime.
     """
     architecture = (raw_config.get("architectures") or [None])[0]
-    files = ["hf_quant_config.json"]
+    files = {"hf_quant_config.json": False}
     if architecture == "Llama4ForConditionalGeneration" and "image_processor_config" not in raw_config:
-        files.append("preprocessor_config.json")
+        files["preprocessor_config.json"] = True
     elif architecture in _KIMI_PROCESSOR_ARCHITECTURES:
-        files += ["preprocessor_config.json", "video_preprocessor_config.json"]
+        files.update({"preprocessor_config.json": False, "video_preprocessor_config.json": False})
     elif architecture in _QWEN_VL_PROCESSOR_ARCHITECTURES:
-        files.append("preprocessor_config.json")
-    return tuple(files)
+        files["preprocessor_config.json"] = False
+    return files
+
+
+def _attach_processor_config(raw_config: dict, model_path: str, *, files: ModelFiles | None = None) -> dict:
+    """Attach Kimi and Qwen3-VL processor metadata using the model load's commit-scoped session."""
+    architecture = (raw_config.get("architectures") or [None])[0]
+    kimi = architecture in _KIMI_PROCESSOR_ARCHITECTURES
+    qwen_vl = architecture in _QWEN_VL_PROCESSOR_ARCHITECTURES
+    if (kimi or qwen_vl) and model_path not in DefaultHFModels:
+        # Only Kimi and Qwen3-VL consume these processor files. Bundled
+        # checkpoints use the pinned processor defaults; local/downloaded
+        # checkpoints may override them with the original media_proc_cfg or
+        # native HF layout. Qwen's per-clip video budget is not modeled.
+        processor = {}
+        processor_files = [("preprocessor_config.json", None)]
+        if kimi:
+            processor_files.append(("video_preprocessor_config.json", "video_processor"))
+        for filename, key in processor_files:
+            if os.path.isdir(model_path):
+                path = Path(model_path) / filename
+                data = _load_json_with_infinity(path) if path.is_file() else None
+            else:
+                data = _download_hf_json(model_path, filename, raise_on_404=False, files=files)
+            if data is not None:
+                if not isinstance(data, dict):
+                    family = "Kimi" if kimi else "Qwen3-VL"
+                    raise ValueError(f"{family} {filename} must be an object")
+                if key is None:
+                    processor.update(data)
+                else:
+                    processor[key] = data
+        raw_config = {**raw_config, "preprocessor_config": processor}
+    return raw_config
 
 
 @cache
@@ -2009,33 +2056,6 @@ def get_model_config_from_model_path(model_path: str) -> dict:
         Quantization metadata retains its original root or text_config scope.
     """
     raw_config = _load_model_config_from_model_path(model_path)
-    architecture = (raw_config.get("architectures") or [None])[0]
-    kimi = architecture in _KIMI_PROCESSOR_ARCHITECTURES
-    qwen_vl = architecture in _QWEN_VL_PROCESSOR_ARCHITECTURES
-    if (kimi or qwen_vl) and model_path not in DefaultHFModels:
-        # Only Kimi and Qwen3-VL consume these processor files. Bundled
-        # checkpoints use the pinned processor defaults; local/downloaded
-        # checkpoints may override them with the original media_proc_cfg or
-        # native HF layout. Qwen's per-clip video budget is not modeled.
-        processor = {}
-        files = [("preprocessor_config.json", None)]
-        if kimi:
-            files.append(("video_preprocessor_config.json", "video_processor"))
-        for filename, key in files:
-            if os.path.isdir(model_path):
-                path = Path(model_path) / filename
-                data = _load_json_with_infinity(path) if path.is_file() else None
-            else:
-                data = _download_hf_json(model_path, filename, raise_on_404=False)
-            if data is not None:
-                if not isinstance(data, dict):
-                    family = "Kimi" if kimi else "Qwen3-VL"
-                    raise ValueError(f"{family} {filename} must be an object")
-                if key is None:
-                    processor.update(data)
-                else:
-                    processor[key] = data
-        raw_config = {**raw_config, "preprocessor_config": processor}
     parsed = _parse_hf_config_json(raw_config)
     if parsed["architecture"] == "DeepseekV4ForCausalLM" and model_path not in common.DEEPSEEK_V4_HF_MODELS:
         supported = ", ".join(sorted(common.DEEPSEEK_V4_HF_MODELS))

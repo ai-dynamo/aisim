@@ -160,7 +160,7 @@ class TestMistral3ConfigParsing:
         assert _MODEL_PATH not in common.DefaultHFModels
         downloaded = []
 
-        def download_config(model_id):
+        def download_config(model_id, **kwargs):
             downloaded.append(model_id)
             return _raw_config()
 

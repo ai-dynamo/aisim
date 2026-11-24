@@ -259,7 +259,7 @@ def prefetch_model_configs(
     from aisim_core.sdk.utils import model_files_to_cache
 
     cache = _model_config_cache(args)
-    offline = bool(args.offline) or dry_run
+    offline = bool(args.offline) or hf_model_files.offline_requested() or dry_run
     transport = None if offline else hf_model_files.make_transport()
     if not offline and models:
         sys.stderr.write(f"{_NAME}: fetching {len(models)} model config(s) from Hugging Face into {cache.root}\n")

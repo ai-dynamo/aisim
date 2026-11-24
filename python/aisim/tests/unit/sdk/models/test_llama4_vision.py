@@ -53,7 +53,7 @@ def test_llama4_loads_separate_processor_metadata(
     else:
         model_path = f"test/{tmp_path.name}"
 
-        def download(hf_id, filename, *, raise_on_404=True):
+        def download(hf_id, filename, *, raise_on_404=True, files=None):
             assert hf_id == model_path
             requested_files.append(filename)
             return {"config.json": raw, "preprocessor_config.json": processor}.get(filename)
@@ -124,9 +124,9 @@ def test_llama4_standard_processor_defaults(tmp_path):
 def test_llama4_remote_processor_errors_are_not_silently_ignored(tmp_path, monkeypatch):
     raw = deepcopy(get_model_config_from_model_path(LLAMA4_MODEL_IDS[0])["raw_config"])
     raw.pop("image_processor_config")
-    monkeypatch.setattr(utils_module, "_download_hf_config", lambda _: raw)
+    monkeypatch.setattr(utils_module, "_download_hf_config", lambda _, **kwargs: raw)
 
-    def download(hf_id, filename, *, raise_on_404=True):
+    def download(hf_id, filename, *, raise_on_404=True, files=None):
         assert filename == "preprocessor_config.json"
         raise utils_module.HuggingFaceDownloadError("processor access denied")
 

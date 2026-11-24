@@ -126,7 +126,7 @@ their own token.
 
 | Behavior | Detail |
 |---|---|
-| Cache | A file is stored after a successful download and read before any network call, keyed by repository and commit. A file the repository does not have (HTTP 404) is recorded too, so it is not requested again. |
+| Cache | A metadata file must contain a JSON object. It is stored after a successful download and read before any network call, keyed by repository and commit. A file the repository does not have (HTTP 404) is recorded too, so it is not requested again. |
 | Pinned revision | `main` (or any branch or tag) is resolved to a commit SHA once. The SHA is recorded in the cache and every later run of that model reads the same commit, so a moving branch never changes a prediction. `aisim data fetch --category model-config --model ID --refresh` resolves it again. Pass `--revision` (a branch, tag or SHA) with one `--model` to choose another commit; a model pinned by an FPM profile (`model_revision`) always uses that commit. |
 | Offline | With `AISIM_DATA_OFFLINE=1` AISim never connects. A model that is not cached fails with a `missing-data` error that names the file and the command that fetches it. |
 | Rate limits | HTTP 429 and the transient 500, 502, 503 and 504 are retried, up to 5 tries. AISim waits the `Retry-After` the server sends, else 1, 2, 4 and 8 seconds. A `Retry-After` above 60 seconds is reported instead of waited for. The final error names the token options: `HF_TOKEN`, `aisim init` and `hf auth login`. |
@@ -153,9 +153,13 @@ AISIM_DATA_OFFLINE=1 aisim predict ...                    # later, with no netwo
 | `bundled` | AISim ships this model's config; nothing to fetch. | none |
 | `cached` | Everything AISim reads for the model is already cached. | none |
 | `fetched` | Downloaded now. | none |
-| `skipped` | Gated, denied (HTTP 401 or 403) or not found (HTTP 404). A warning on stderr names the model and the fix. | none |
-| `failed` | A rate limit that persisted, a network error or a server error. A warning names the reason. | `data fetch` exits `1`; `init` still exits `0` and the model downloads when a run needs it |
+| `skipped` | Gated, denied (HTTP 401 or 403) or missing `config.json` (HTTP 404). A warning on stderr names the model and the fix. | none |
+| `failed` | A rate limit that persisted, a network or server error, invalid metadata, or a missing required processor file. A warning names the reason. | `data fetch` exits `1`; `init` still exits `0` and the model downloads when a run needs it |
 | `missing` | `--offline` and not cached. | `data fetch` exits `1` |
+
+Llama 4 requires `preprocessor_config.json` unless `config.json` contains inline `image_processor_config`.
+Its absence makes prefetch incomplete. Missing quantization metadata and optional Kimi/Qwen3-VL processor files
+remain supported when the repository confirms their absence with HTTP 404.
 
 `--dry-run` makes no request and reports `to-fetch` for what is not cached. `--repo`, `--hardware`, `--framework`,
 `--framework-version`, `--operation-family`, `--all` and `--configuration` do not apply to `model-config` and exit `2`.

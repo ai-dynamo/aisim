@@ -587,7 +587,7 @@ def test_checkpoint_processor_limits_reach_runtime(tmp_path, monkeypatch, remote
         }
     if remote:
         path = f"synthetic-kimi-k3/processor-{tmp_path.name}"
-        monkeypatch.setattr(utils_module, "_download_hf_config", lambda model_path: raw)
+        monkeypatch.setattr(utils_module, "_download_hf_config", lambda model_path, **kwargs: raw)
         monkeypatch.setattr(
             utils_module, "_download_hf_json", lambda model_path, filename, **kwargs: files.get(filename)
         )
@@ -695,7 +695,7 @@ def test_loaded_native_side_override_cannot_change_other_processor_default(
         files["video_preprocessor_config.json"] = video_processor
     if remote:
         path = f"synthetic-kimi/native-side-default-{tmp_path.name}"
-        monkeypatch.setattr(utils_module, "_download_hf_config", lambda model_path: raw)
+        monkeypatch.setattr(utils_module, "_download_hf_config", lambda model_path, **kwargs: raw)
         monkeypatch.setattr(
             utils_module, "_download_hf_json", lambda model_path, filename, **kwargs: files.get(filename)
         )
