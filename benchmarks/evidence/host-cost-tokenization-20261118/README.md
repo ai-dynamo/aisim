@@ -90,4 +90,4 @@ The raw evidence (request-path audit, per-entry fits, cost ledger, Slurm job rec
 84 staged entries were moved out of this repository, parked in two Hugging Face pull requests until #932 lands:
 
 - Public rows: https://huggingface.co/datasets/ai-dynamo/aisim-data/discussions/6
-- Private mirror and evidence (`evidence/data/host-cost/<framework>/<version>/`): https://huggingface.co/datasets/ai-dynamo/aisim-data-internal/discussions/2
+- Private evidence only (`evidence/data/host-cost/<framework>/<version>/`): https://huggingface.co/datasets/ai-dynamo/aisim-data-internal/discussions/2
