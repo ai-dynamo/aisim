@@ -20,6 +20,8 @@ from aisim_core.sdk.fpm_profile import FpmModelProfile, load_fpm_profile
 
 pytestmark = pytest.mark.unit
 
+PROFILE_REVISION = "a" * 40
+
 
 @pytest.fixture
 def checkpoint_configs(monkeypatch):
@@ -38,7 +40,7 @@ def checkpoint_configs(monkeypatch):
     }
 
     def download(model, filename, *, revision, raise_on_404=True):
-        assert revision == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        assert revision == PROFILE_REVISION
         if filename == "config.json":
             return copy.deepcopy(configs[model])
         assert filename == "hf_quant_config.json"
@@ -57,7 +59,7 @@ def profile_dict(checkpoint_configs):
     return {
         "schema_version": 1,
         "model": "test/unknown-decoder",
-        "model_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "model_revision": PROFILE_REVISION,
         "architecture": "UnregisteredDecoderForCausalLM",
         "context_length": 4096,
         "num_experts": 64,

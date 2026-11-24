@@ -42,6 +42,7 @@ from aisim_core.data.schemas import SCHEMA_MODELS, check_snapshots, render_snaps
 from aisim_core.sdk import RustForwardPassPerfModel, engine, memory
 from aisim_core.sdk.fpm_profile import _require_forward_pass_profile_memory, load_fpm_profile
 from tests.unit.sdk.test_fpm_profile import (  # noqa: F401
+    PROFILE_REVISION,
     _fail_graph,
     _request,
     _write_external_profile_pair,
@@ -580,7 +581,7 @@ def test_resources_without_profile_require_the_selected_topology(root, profile, 
         ("enable_wideep", False, True),
         ("enable_eplb", False, True),
         ("model_path", "MiniMaxAI/MiniMax-M2.7", "other/model"),
-        ("model_revision", "profile-test-fixture-v1", "other-revision"),
+        ("model_revision", PROFILE_REVISION, "b" * 40),
     ],
 )
 def test_resources_only_fill_profiles_matching_selector(root, profile, tmp_path, field, matching, different):
