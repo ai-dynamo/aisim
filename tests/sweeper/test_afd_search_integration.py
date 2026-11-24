@@ -1505,7 +1505,7 @@ def test_common_afd_timing_and_search_domains_survive_saved_prediction():
     )
     restored = prediction_to_replay_spec(CorePredictionConfig.model_validate(saved))
     restored_meta = restored.backend_deployment.performance_model_metadata["aggregated"]
-    assert restored.backend_deployment.agg_engine_args["max_num_seqs"] == sample["agg_max_num_seqs"]
+    assert restored.backend_deployment.agg_engine_args["max_num_seqs"] == suggestion.selection["agg_max_num_seqs"]
     assert restored_meta["quant"] == meta["quant"]
     assert restored_meta["estimator"]["database_mode"] == "SOL"
 
