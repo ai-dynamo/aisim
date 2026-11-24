@@ -1308,7 +1308,7 @@ class TestMOEModelFP8BlockQuantizationValidation:
         ],
     )
     @patch("aisim.sdk.models._get_model_info")
-    @patch("aisim.sdk.utils._load_model_config_from_model_path")
+    @patch("aisim_core.sdk.models.moe._load_model_config_from_model_path")
     def test_fp8_block_quantization_validation(
         self,
         mock_load_config,
