@@ -266,7 +266,7 @@ def _native_termination_handler():
             raise SystemExit(128 + signal.SIGTERM)
 
 
-def _run_native_case(case, device, perf_filename, *, expected_sm=None, phase=None):
+def _run_native_case(case, device, perf_filename, *, expected_sm=None, phase=None, topology=None):
     if os.environ.get("COLLECTOR_MEASURE_POWER", "false").lower() in ("1", "true", "yes", "on"):
         raise ValueError("native Kimi K3.1 does not support --measure_power; use latency-only collection")
     if perf_filename is None:
@@ -280,10 +280,16 @@ def _run_native_case(case, device, perf_filename, *, expected_sm=None, phase=Non
             raise RuntimeError(
                 f"Pending native publication for {output}. Resume the full-node job or use a separate output."
             )
-        _run_owned_native_case(case, device, output, lock_fd, expected_sm, phase)
+        _run_owned_native_case(case, device, output, lock_fd, expected_sm, phase, topology)
 
 
-def _run_owned_native_case(case, device, output, lock_fd, expected_sm, phase):
+def _run_owned_native_case(case, device, output, lock_fd, expected_sm, phase, topology=None):
+    launch_args = []
+    if topology is not None:
+        nnodes, node_rank, address = topology
+        launch_args = ["--nnodes", str(nnodes), "--node-rank", str(node_rank)]
+        if address:
+            launch_args.extend(["--dist-init-addr", address])
     writer_lock = Path(str(output) + ".lock")
     if writer_lock.exists():
         raise RuntimeError(f"native Kimi K3.1 output already has a writer lock: {writer_lock}")
@@ -308,6 +314,7 @@ def _run_owned_native_case(case, device, output, lock_fd, expected_sm, phase):
                     str(output),
                     "--device",
                     str(device),
+                    *launch_args,
                     "--publication-lock-fd",
                     str(lock_fd),
                     *(["--sm", str(expected_sm)] if expected_sm is not None else []),
@@ -357,7 +364,8 @@ def _run_owned_native_case(case, device, output, lock_fd, expected_sm, phase):
                 raise RuntimeError(f"native K31 worker exited {process.returncode}: {stderr[-2000:]}")
         # The full-node route owns this output exclusively. A successful process
         # must have appended its row before the orchestrator checkpoints success.
-        if not output.is_file() or output.stat().st_size <= previous_size:
+        writes_output = topology is None or topology[1] == 0
+        if writes_output and (not output.is_file() or output.stat().st_size <= previous_size):
             raise RuntimeError("native K31 worker exited successfully without writing its result row")
     except BaseException:
         # Every process in the attempt has been killed and the launcher reaped.
@@ -668,13 +676,19 @@ def main() -> None:
     args = parser.parse_args()
     case = ModuleCase(*json.loads(args.case))
     tp = validate_case(case, args.phase)
-    if args.node_rank != 0:
-        _collect_native(args, case, tp)
+    local_size = local_tp_size(tp, args.nnodes, args.node_rank)
+    if args.nnodes > 1 and not args.dist_init_addr:
+        raise ValueError("multi-node collection requires the same --dist-init-addr on every node")
+    topology = (args.nnodes, args.node_rank, args.dist_init_addr)
+    if args.node_rank != 0 and args.publication_lock_fd is None:
+        with tempfile.TemporaryDirectory(prefix="kimi-k31-follower-") as directory:
+            stage = Path(directory, Path(args.output).name)
+            _run_native_case(case, args.device, stage, expected_sm=args.sm, phase=args.phase, topology=topology)
         return
     output = Path(args.output).resolve()
     with native_publication_lock(output, args.publication_lock_fd):
         if args.publication_lock_fd is not None:
-            _collect_native(args, case, tp)
+            _collect_native(args, case, tp, local_size)
             return
         if output.with_name(f".{output.name}.pending").exists():
             raise RuntimeError(
@@ -687,7 +701,7 @@ def main() -> None:
             if output.exists():
                 shutil.copyfile(output, stage)
             previous_size = stage.stat().st_size if stage.exists() else 0
-            _run_native_case(case, args.device, stage, expected_sm=args.sm, phase=args.phase)
+            _run_native_case(case, args.device, stage, expected_sm=args.sm, phase=args.phase, topology=topology)
             if not stage.exists() or stage.stat().st_size <= previous_size:
                 raise RuntimeError("standalone native ranks exited without appending a result row")
             if collector_retained_path(output).exists():
@@ -706,10 +720,7 @@ def _check_device_sm(cuda, first_gpu, count, expected_sm):
             raise RuntimeError(f"cuda:{gpu} has SM{actual}, expected SM{expected_sm}")
 
 
-def _collect_native(args, case, tp):
-    local_size = local_tp_size(tp, args.nnodes, args.node_rank)
-    if args.nnodes > 1 and not args.dist_init_addr:
-        raise ValueError("multi-node collection requires the same --dist-init-addr on every node")
+def _collect_native(args, case, tp, local_size):
     os.environ.pop(SKIP_SOFTMAX_ENV, None)
     os.environ.update(NATIVE_ENV)
     _assert_runtime()

@@ -312,9 +312,9 @@ def test_standalone_publishes_only_after_rank_join(tmp_path, monkeypatch, fail_a
         ],
     )
 
-    def ranks(case, device, stage, *, expected_sm, phase):
+    def ranks(case, device, stage, *, expected_sm, phase, topology):
         assert stage != output
-        assert (device, expected_sm, phase) == ("cuda:0", 103, "context")
+        assert (device, expected_sm, phase, topology) == ("cuda:0", None, "context", (1, 0, None))
         with stage.open("a") as stream:
             stream.write("new row\n")
         assert output.read_text() == "existing row\n"
@@ -1520,7 +1520,7 @@ def test_native_main_wires_platform_launch_and_offline_tokenizer(monkeypatch, tm
             assert Path(output).name == "perf.txt" and Path(output).parent != tmp_path
             Path(output).write_text("rank zero row")
         else:
-            assert Path(output) == tmp_path / "perf.txt"
+            assert Path(output).name == "perf.txt" and Path(output).parent != tmp_path
 
         calls.append("spawn")
 
@@ -1548,6 +1548,15 @@ def test_native_main_wires_platform_launch_and_offline_tokenizer(monkeypatch, tm
     if nodes > 1:
         options += ["--nnodes", str(nodes), "--node-rank", str(rank), "--dist-init-addr", "master:1234"]
     monkeypatch.setattr(sys, "argv", _native_main_argv(tmp_path) + options)
+
+    def supervise(case, device, stage, *, expected_sm, phase, topology):
+        assert topology == (nodes, rank, "master:1234" if nodes > 1 else None)
+        assert expected_sm == sm and stage != tmp_path / "perf.txt"
+        with native.native_publication_lock(stage) as lock_fd, monkeypatch.context() as child:
+            child.setattr(sys, "argv", [*sys.argv, "--output", str(stage), "--publication-lock-fd", str(lock_fd)])
+            native.main()
+
+    monkeypatch.setattr(native, "_run_native_case", supervise)
     if rank:
         # Other hosts can share the leader's output directory; only global rank zero writes.
         with native.native_publication_lock(tmp_path / "perf.txt"):
