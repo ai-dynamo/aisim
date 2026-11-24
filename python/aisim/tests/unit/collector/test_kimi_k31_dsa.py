@@ -128,6 +128,21 @@ def test_explicit_native_request_rejected_before_stock_route_filtering(phase):
     assert not any(entry["type"].startswith("kimi_k31_dsa_") for entry in ordinary)
 
 
+@pytest.mark.parametrize("machine", ["aarch64", "x86_64"])
+def test_native_executor_routes_the_platform_build(monkeypatch, machine):
+    from collector.sglang.collect_kimi_k31_dsa_v1 import RUNTIME_VERSIONS
+    from collector.version_resolver import build_collections
+
+    monkeypatch.setattr("platform.machine", lambda: machine)
+    ops = ["kimi_k31_dsa_context_module", "kimi_k31_dsa_generation_module"]
+    expected = RUNTIME_VERSIONS[machine]
+    assert require_collector_runtime("sglang", expected, requested_ops=set(ops), model_path=MODEL).version == expected
+    assert [entry["type"] for entry in build_collections(REGISTRY, "sglang", expected, ops)] == ops
+    for other in set(RUNTIME_VERSIONS.values()) - {expected}:
+        with pytest.raises(RuntimeError, match="requires exactly"):
+            build_collections(REGISTRY, "sglang", other, ops)
+
+
 @pytest.mark.parametrize("model_scoped", [False, True])
 def test_cli_generated_plan_keeps_native_ops_model_scoped(model_scoped):
     import collect
@@ -325,11 +340,11 @@ def test_standalone_shares_supervisor_lock(tmp_path, monkeypatch):
     assert calls == [str(output)]
 
 
-@pytest.mark.parametrize("sm", [90, 103, 107])
+@pytest.mark.parametrize("sm", [89, 90, 100, 103, 107])
 def test_native_plan_lists_only_qualified_hardware(monkeypatch, sm):
     monkeypatch.setenv("COLLECTOR_MODEL_PATH", MODEL)
     for op in ("kimi_k31_dsa_context_module", "kimi_k31_dsa_generation_module"):
-        assert bool(plan(op, "sglang", sm).cases) == (sm == 103)
+        assert bool(plan(op, "sglang", sm).cases) == (sm in {90, 100, 103})
 
 
 def test_standalone_preserves_pending_fullnode_publication(monkeypatch, tmp_path):
@@ -425,8 +440,8 @@ def test_standalone_bounds_rank_join_and_publishes_only_success(tmp_path, monkey
         code = (
             "import subprocess, sys\nfrom pathlib import Path\n"
             "import collector.sglang.collect_kimi_k31_dsa_v1 as module\n"
-            "def ranks(args, case, tp):\n"
-            "    assert tp == 2 and args.phase == 'context'\n"
+            "def ranks(args, case, tp, local_size):\n"
+            "    assert tp == local_size == 2 and args.phase == 'context'\n"
             "    assert args.device == 'cuda:1' and args.sm == 103\n"
             f"    assert Path(args.output) != Path({str(output)!r})\n"
             "    with Path(args.output).open('a') as stream: stream.write('new row\\n')\n"
@@ -588,7 +603,7 @@ def test_native_registry_checks_full_runtime_before_queueing(monkeypatch, op, ve
         monkeypatch.setattr(
             collector.fullnode, "collect_sglang_fullnode_op", lambda *_a, **_k: pytest.fail("queued native cases")
         )
-        with pytest.raises(RuntimeError, match="native Kimi K3.1 requires exactly"):
+        with pytest.raises(RuntimeError, match="requires exactly"):
             module.collect_sglang(1, ops=[op], model_path=None if version == stock else MODEL, sm_version=103)
     # Other ops keep the shared public-version policy.
     from collector.framework_manifest import require_collector_runtime, resolve_op_runtime
@@ -621,7 +636,7 @@ def test_stock_runtime_cannot_select_native_preview_collector():
         assert "@sha256:" in runtime.image()
         assert entry.run_func == "run_kimi_k31_dsa_fullnode"
         assert not entry.unverified
-        assert set(entry.unverified_sms) == {80, 86, 89, 90, 100, 120, 121}
+        assert set(entry.unverified_sms) == {80, 86, 89, 120, 121}
         assert resolve_module(entry, runtime.version) == "collector.sglang.collect_kimi_k31_dsa_v1"
         assert resolve_module(entry, get_collector_runtime("sglang").version) is None
         assert _check_compat(f"sglang=={RUNTIME_VERSION}", RUNTIME_VERSION)
@@ -890,11 +905,16 @@ def test_native_exception_kills_launcher_and_tp_children(exception_type, monkeyp
             assert raised.value is error
         assert children[0].poll() is not None
         assert output.read_text() == "previous successful row\n"
-        try:
-            status = psutil.Process(int(rank_pid.read_text())).status()
-        except psutil.NoSuchProcess:
-            status = None
-        assert status in (None, psutil.STATUS_ZOMBIE)
+        # Linux can reap the launcher before its SIGKILLed rank finishes exiting.
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                if psutil.Process(int(rank_pid.read_text())).status() == psutil.STATUS_ZOMBIE:
+                    break
+            except psutil.NoSuchProcess:
+                break
+            assert time.monotonic() < deadline, "TP rank survived process-group termination"
+            time.sleep(0.01)
         assert "native cancellation diagnostic" in capfd.readouterr().err
     finally:
         # A regression must not leave the test's real process group running.
@@ -1588,3 +1608,150 @@ def test_native_output_lock_owned_before_attempt_is_preserved(monkeypatch, tmp_p
     with pytest.raises(RuntimeError, match="already has a writer lock"):
         run_kimi_k31_dsa_worker(*case, perf_filename=output)
     assert lock.read_text() == "other writer"
+
+
+@pytest.mark.parametrize(
+    ("tp", "nodes", "rank", "expected"), [(1, 1, 0, 1), (4, 1, 0, 4), (8, 2, 0, 4), (8, 2, 1, 4), (8, 4, 3, 2)]
+)
+def test_native_tp_layout_preserves_global_group_and_local_devices(tp, nodes, rank, expected):
+    from collector.sglang.collect_kimi_k31_dsa_v1 import local_tp_size
+
+    assert local_tp_size(tp, nodes, rank) == expected
+    ranks = [node * expected + local for node in range(nodes) for local in range(expected)]
+    assert ranks == list(range(tp))
+
+
+@pytest.mark.parametrize(("nodes", "rank"), [(0, 0), (3, 0), (2, -1), (2, 2)])
+def test_native_tp_layout_rejects_incomplete_groups(nodes, rank):
+    from collector.sglang.collect_kimi_k31_dsa_v1 import local_tp_size
+
+    with pytest.raises(ValueError, match="divide evenly"):
+        local_tp_size(8, nodes, rank)
+
+
+def _native_main_argv(tmp_path):
+    case = ModuleCase(4096, 1, 12, "fp8", "bfloat16", "bfloat16", MODEL, 0)
+    return [
+        "collect_kimi_k31_dsa_v1",
+        "--case",
+        json.dumps(case),
+        "--phase",
+        "context",
+        "--output",
+        str(tmp_path / "perf.txt"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        (["--nnodes", "2"], "requires the same --dist-init-addr"),
+        (["--nnodes", "2", "--node-rank", "-1", "--dist-init-addr", "master:1234"], "valid node ranks"),
+        (["--nnodes", "2", "--node-rank", "2", "--dist-init-addr", "master:1234"], "valid node ranks"),
+        (["--node-rank", "1"], "valid node ranks"),
+    ],
+)
+def test_native_main_rejects_invalid_rendezvous_before_runtime_lookup(monkeypatch, tmp_path, options, message):
+    from collector.sglang import collect_kimi_k31_dsa_v1 as native
+
+    monkeypatch.setattr(sys, "argv", _native_main_argv(tmp_path) + options)
+    monkeypatch.setattr(native, "_assert_runtime", lambda: pytest.fail("invalid launch reached runtime lookup"))
+    with pytest.raises(ValueError, match=message):
+        native.main()
+
+
+@pytest.mark.parametrize(("nodes", "rank"), [(1, 0), (2, 0), (2, 1)])
+def test_native_main_wires_platform_launch_and_offline_tokenizer(monkeypatch, tmp_path, config, nodes, rank):
+    from collector.sglang import collect_kimi_k31_dsa_v1 as native
+
+    sm = {(1, 0): 90, (2, 0): 100, (2, 1): 103}[nodes, rank]
+    config_path = tmp_path / "checkpoint-config.json"
+    config_path.write_text(json.dumps(config))
+    tokenizer = str(config_path.parent)
+    calls = []
+
+    def hf_hub_download(model, filename, *, revision):
+        assert (model, revision) == (MODEL, native.MODEL_REVISION)
+        calls.append(filename)
+        return str(tmp_path / filename) if filename != "config.json" else str(config_path)
+
+    def memory(device):
+        assert 1 <= device < 1 + 8 // nodes
+        return 2**40, 2**40
+
+    class ServerArgs(SimpleNamespace):
+        def resolve_once(self):
+            # main() must write the single-layer config before native setup.
+            with open(self.model_path + "/config.json") as file:
+                assert json.load(file) == single_layer_config(config)
+            assert self.tokenizer_path == tokenizer
+            assert (self.tp_size, self.nnodes, self.node_rank) == (8, nodes, rank)
+            assert self.dist_init_addr == ("master:1234" if nodes > 1 else None)
+            calls.append("resolve")
+
+    ports = object()
+
+    def set_envs(server_args):
+        assert isinstance(server_args, ServerArgs)
+        calls.append("environment")
+
+    def init_ports(server_args):
+        assert isinstance(server_args, ServerArgs)
+        calls.append("ports")
+        return ports
+
+    def spawn(function, *, args, nprocs, join):
+        server_args, actual_ports, case_values, phase, output, first_gpu = args
+        assert function is native._rank_main
+        assert isinstance(server_args, ServerArgs)
+        assert actual_ports is ports
+        assert native.validate_case(ModuleCase(*case_values)) == 8
+        assert (phase, first_gpu, nprocs, join) == ("context", 1, 8 // nodes, True)
+        if rank == 0:
+            assert Path(output).name == "perf.txt" and Path(output).parent != tmp_path
+            Path(output).write_text("rank zero row")
+        else:
+            assert Path(output).name == "perf.txt" and Path(output).parent != tmp_path
+
+        calls.append("spawn")
+
+    # Exercise parsing and orchestration without GPUs, model downloads, or a
+    # serving-framework install. The real single_layer_config still executes.
+    modules = {
+        "torch": SimpleNamespace(
+            cuda=SimpleNamespace(
+                device_count=lambda: 1 + 8 // nodes,
+                mem_get_info=memory,
+                get_device_capability=lambda _device: divmod(sm, 10),
+            ),
+            multiprocessing=SimpleNamespace(spawn=spawn),
+        ),
+        "huggingface_hub": SimpleNamespace(
+            hf_hub_download=hf_hub_download,
+        ),
+        "sglang.srt.entrypoints.engine": SimpleNamespace(_set_envs_and_config=set_envs),
+        "sglang.srt.server_args": SimpleNamespace(ServerArgs=ServerArgs, PortArgs=SimpleNamespace(init_new=init_ports)),
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(native, "_assert_runtime", lambda: None)
+    options = ["--device", "cuda:1", "--sm", str(sm)]
+    if nodes > 1:
+        options += ["--nnodes", str(nodes), "--node-rank", str(rank), "--dist-init-addr", "master:1234"]
+    monkeypatch.setattr(sys, "argv", _native_main_argv(tmp_path) + options)
+
+    def supervise(case, device, stage, *, expected_sm, phase, topology):
+        assert topology == (nodes, rank, "master:1234" if nodes > 1 else None)
+        assert expected_sm == sm and stage != tmp_path / "perf.txt"
+        with native.native_publication_lock(stage) as lock_fd, monkeypatch.context() as child:
+            child.setattr(sys, "argv", [*sys.argv, "--output", str(stage), "--publication-lock-fd", str(lock_fd)])
+            native.main()
+
+    monkeypatch.setattr(native, "_run_native_case", supervise)
+    if rank:
+        # Other hosts can share the leader's output directory; only global rank zero writes.
+        with native.native_publication_lock(tmp_path / "perf.txt"):
+            native.main()
+    else:
+        native.main()
+    assert calls == ["config.json", *native.TOKENIZER_FILES, "resolve", "environment", "ports", "spawn"]

@@ -357,13 +357,33 @@ per op, always. `families:` overrides require the op catalog
 (`op_backend_catalog.yaml`); without it, family-scoped pins fail closed rather
 than silently falling back to `default`.
 
+Runtime specifications (under `default`, `families`, or model-scoped `models`
+overrides) support these fields:
+
+| Field | Behavior |
+| --- | --- |
+| `version` | Required exact package version; must also occur among `platform_versions` values when that map is present. |
+| `images` | Required image variants, including `default`; public references require an index digest. |
+| `platform_versions` | Optional nonempty map from CPU machine name to exact package build, for platform children of the same pinned image index. |
+| `source_commit` | Immutable full 40-character lowercase Git SHA; required with `platform_versions`. |
+
+For example, Kimi K3.1's model override selects distinct exact SGLang builds
+for `x86_64` and `aarch64`, both bound to the same audited source commit and
+image index. `platform_runtime_version` selects by `platform.machine()`;
+`AMD64` and `arm64` normalize to `x86_64` and `aarch64`. An unlisted machine
+fails closed instead of using `version`. These aliases permit CPU-only planning;
+native Kimi K3.1 execution still requires Linux.
+
 WideEP runtimes (`wideep_sglang`, `wideep_trtllm`) are flattened into peer
 framework entries rather than nested under a `wideep:` key, so the same
 per-op resolution logic applies uniformly. Each WideEP entry adds
 `base_framework` (the stock framework it forks from), `data_backend` (which
 table namespace its output is written under), and `collector_dir`.
-`collect.py` requires the exact public version for a run and rejects
-mixed-pin selections across ops.
+`collect.py` uses `require_collector_runtime` to check the resolved pin. When
+the pin includes a PEP 440 local build suffix (`+...`), the complete installed
+version must equal it, including that suffix, using PEP 440 equality. A pin
+without local metadata requires the same public version but permits local
+CUDA/XPU wheel suffixes. It rejects mixed-pin selections across ops.
 
 Image digests are policy, not decoration: the rule is syntactic — any image
 reference containing `/` must be pinned with `@sha256:<64 hex>`; only bare

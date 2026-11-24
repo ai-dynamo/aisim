@@ -19,8 +19,12 @@ Deviation: this initial lane explicitly configures eager serving. Its rows
 carry an ``_eager`` kernel_source suffix. Native graph replay/overlap can change
 latency in either direction; qualification must compare graph serving before
 removing this note or claiming default-serving prediction accuracy. The
-registry admits SM103 after native B300 TP1/2/4 boundary validation; other
-targeted SMs remain unverified.
+registry admits SM90 (H100/H200), SM100 (B200/GB200), and SM103 (B300/GB300)
+after native TP1/2/4/8 collection. The campaign README at
+benchmarks/evidence/collector/kimi-k31-dsa-expanded-20261109/README.md links
+x86 smoke and ARM formal receipts; ARM summaries bind the original smoke
+payloads by hash, but those payloads are outside the tree. Grace TP8 uses
+two four-GPU hosts within one NVLink fabric. Other topologies need their own smoke.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ import importlib.metadata
 import json
 import logging
 import os
+import platform
 import shutil
 import signal
 import statistics
@@ -40,16 +45,22 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
+from collector.framework_manifest import platform_runtime_version
 from collector.helper import collector_retained_path, get_sm_version, log_perf, native_publication_lock
 from collector.op_plans import ModuleCase, plan_cases
-
-__compat__ = "sglang==0.0.0.dev1+g41208373c.d20261104"
 
 MODEL = "moonshotai/Kimi-K3.1-Pro"
 MODEL_REVISION = "d9e99b0792a5e93b78ea9bea62a68167e36ddd9e"
 TOKENIZER_FILES = ("tokenizer_config.json", "tokenization_kimi.py", "encoding_k3.py", "tiktoken.model")
 ARCHITECTURE = "KimiK31ForConditionalGeneration"
-RUNTIME_VERSION = "0.0.0.dev1+g41208373c.d20261104"
+# Exact package builds of the same audited official source/image index. Keep
+# this startup guard independent of externally supplied runtime manifests.
+RUNTIME_VERSIONS = {
+    "x86_64": "0.0.0.dev1+g41208373c.d20261104",
+    "aarch64": "0.0.0.dev1+ge79de62d2.d20261104",
+}
+RUNTIME_VERSION = platform_runtime_version({"platform_versions": RUNTIME_VERSIONS})
+__compat__ = f"sglang=={RUNTIME_VERSION}"
 SOURCE_COMMIT = "afcd7d6b487a9cbe73e25941971b4cc107e6f9ae"
 NATIVE_HEADS = 96
 HISTORY_CHUNK_TOKENS = 8192
@@ -278,7 +289,7 @@ def _native_termination_handler():
             raise SystemExit(128 + signal.SIGTERM)
 
 
-def _run_native_case(case, device, perf_filename, *, expected_sm=None, phase=None):
+def _run_native_case(case, device, perf_filename, *, expected_sm=None, phase=None, topology=None):
     if os.environ.get("COLLECTOR_MEASURE_POWER", "false").lower() in ("1", "true", "yes", "on"):
         raise ValueError("native Kimi K3.1 does not support --measure_power; use latency-only collection")
     if perf_filename is None:
@@ -292,10 +303,16 @@ def _run_native_case(case, device, perf_filename, *, expected_sm=None, phase=Non
             raise RuntimeError(
                 f"Pending native publication for {output}. Resume the full-node job or use a separate output."
             )
-        _run_owned_native_case(case, device, output, lock_fd, expected_sm, phase)
+        _run_owned_native_case(case, device, output, lock_fd, expected_sm, phase, topology)
 
 
-def _run_owned_native_case(case, device, output, lock_fd, expected_sm, phase):
+def _run_owned_native_case(case, device, output, lock_fd, expected_sm, phase, topology=None):
+    launch_args = []
+    if topology is not None:
+        nnodes, node_rank, address = topology
+        launch_args = ["--nnodes", str(nnodes), "--node-rank", str(node_rank)]
+        if address:
+            launch_args.extend(["--dist-init-addr", address])
     writer_lock = Path(str(output) + ".lock")
     if writer_lock.exists():
         raise RuntimeError(f"native Kimi K3.1 output already has a writer lock: {writer_lock}")
@@ -319,6 +336,7 @@ def _run_owned_native_case(case, device, output, lock_fd, expected_sm, phase):
                     str(output),
                     "--device",
                     str(device),
+                    *launch_args,
                     "--publication-lock-fd",
                     str(lock_fd),
                     *(["--sm", str(expected_sm)] if expected_sm is not None else []),
@@ -374,7 +392,8 @@ def _run_owned_native_case(case, device, output, lock_fd, expected_sm, phase):
                 raise RuntimeError(f"native K31 worker exited {process.returncode}: {stderr[-2000:]}")
         # The full-node route owns this output exclusively. A successful process
         # must have appended its row before the orchestrator checkpoints success.
-        if not output.is_file() or output.stat().st_size <= previous_size:
+        writes_output = topology is None or topology[1] == 0
+        if writes_output and (not output.is_file() or output.stat().st_size <= previous_size):
             raise RuntimeError("native K31 worker exited successfully without writing its result row")
     except NativeAllocationFailure:
         raise
@@ -395,6 +414,8 @@ def _run_owned_native_case(case, device, output, lock_fd, expected_sm, phase):
 
 
 def _assert_runtime() -> None:
+    if platform.system() != "Linux":
+        raise RuntimeError("native Kimi K3.1 collection requires Linux; CPU-only planning remains available")
     version = importlib.metadata.version("sglang")
     if version != RUNTIME_VERSION:
         raise RuntimeError(f"native Kimi K3.1 requires exactly {RUNTIME_VERSION}; found {version}")
@@ -538,13 +559,24 @@ def validate_forward_batch(batch, case: ModuleCase, phase: str) -> dict:
     return receipt
 
 
-def _rank_main(rank, server_args, port_args, case_values, phase, output, first_gpu):
+def local_tp_size(tp: int, nnodes: int, node_rank: int) -> int:
+    """Match native one_batch.main's contiguous, equal per-node TP groups."""
+    if nnodes < 1 or tp % nnodes or not 0 <= node_rank < nnodes:
+        raise ValueError("native TP must divide evenly across valid node ranks")
+    return tp // nnodes
+
+
+def _rank_main(local_rank, server_args, port_args, case_values, phase, output, first_gpu):
     import torch
     from sglang.benchmark.one_batch import _init_process_global_configs, load_model
     from sglang.srt.runtime_context import SpawnRanks, publish, spawn_world_rank
 
     case = ModuleCase(*case_values)
-    gpu = first_gpu + rank
+    # Pinned one_batch.main maps each node's local GPU ordinal separately from
+    # its global TP rank. NVL systems expose four GPUs per physical host.
+    local_size = local_tp_size(validate_case(case), server_args.nnodes, server_args.node_rank)
+    rank = server_args.node_rank * local_size + local_rank
+    gpu = first_gpu + local_rank
     torch.cuda.set_device(gpu)
     publish(
         server_args,
@@ -635,7 +667,7 @@ def _rank_main(rank, server_args, port_args, case_values, phase, output, first_g
         torch.distributed.destroy_process_group()
 
 
-def _check_capacity(case: ModuleCase, phase: str, cuda, first_gpu: int) -> None:
+def _check_capacity(case: ModuleCase, phase: str, cuda, first_gpu: int, local_size: int | None = None) -> None:
     """Refuse a proven non-fit before native model/pool allocation.
 
     MLAKVPool's packed latent (656 B) and DSA index-K (128 B + FP32
@@ -651,7 +683,7 @@ def _check_capacity(case: ModuleCase, phase: str, cuda, first_gpu: int) -> None:
     history_forward_tokens = min(history_tokens, max(HISTORY_CHUNK_TOKENS, case.batch_size))
     forward_tokens = max(case.batch_size * (case.seq_len if phase == "context" else 1), history_forward_tokens)
     required = cache_bytes + forward_tokens * 7168 * 2
-    for gpu in range(first_gpu, first_gpu + validate_case(case)):
+    for gpu in range(first_gpu, first_gpu + (validate_case(case) if local_size is None else local_size)):
         free, _total = cuda.mem_get_info(gpu)
         if required > free:
             raise RuntimeError(
@@ -666,15 +698,27 @@ def main() -> None:
     parser.add_argument("--phase", choices=("context", "generation"), required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--sm", type=int, default=103, help="expected physical CUDA compute capability")
+    parser.add_argument("--nnodes", type=int, default=1)
+    parser.add_argument("--node-rank", type=int, default=0)
+    parser.add_argument("--dist-init-addr")
+    parser.add_argument("--sm", type=int, choices=(90, 100, 103), help="expected physical CUDA compute capability")
     parser.add_argument("--publication-lock-fd", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
     case = ModuleCase(*json.loads(args.case))
     tp = validate_case(case, args.phase)
+    local_size = local_tp_size(tp, args.nnodes, args.node_rank)
+    if args.nnodes > 1 and not args.dist_init_addr:
+        raise ValueError("multi-node collection requires the same --dist-init-addr on every node")
+    topology = (args.nnodes, args.node_rank, args.dist_init_addr)
+    if args.node_rank != 0 and args.publication_lock_fd is None:
+        with tempfile.TemporaryDirectory(prefix="kimi-k31-follower-") as directory:
+            stage = Path(directory, Path(args.output).name)
+            _run_native_case(case, args.device, stage, expected_sm=args.sm, phase=args.phase, topology=topology)
+        return
     output = Path(args.output).resolve()
     with native_publication_lock(output, args.publication_lock_fd):
         if args.publication_lock_fd is not None:
-            _collect_native(args, case, tp)
+            _collect_native(args, case, tp, local_size)
             return
         if output.with_name(f".{output.name}.pending").exists():
             raise RuntimeError(
@@ -688,7 +732,7 @@ def main() -> None:
                 shutil.copyfile(output, stage)
             # Supervise the private stage too: a stalled TP join must release
             # the public output lock without publishing any of the attempt.
-            _run_native_case(case, args.device, stage, expected_sm=args.sm, phase=args.phase)
+            _run_native_case(case, args.device, stage, expected_sm=args.sm, phase=args.phase, topology=topology)
             if collector_retained_path(output).exists():
                 from collector.collect import _atomic_write_bytes
 
@@ -705,7 +749,7 @@ def _check_device_sm(cuda, first_gpu, count, expected_sm):
             raise RuntimeError(f"cuda:{gpu} has SM{actual}, expected SM{expected_sm}")
 
 
-def _collect_native(args, case, tp):
+def _collect_native(args, case, tp, local_size):
     os.environ.pop(SKIP_SOFTMAX_ENV, None)
     os.environ.update(NATIVE_ENV)
     _assert_runtime()
@@ -715,12 +759,17 @@ def _collect_native(args, case, tp):
     from sglang.srt.server_args import PortArgs, ServerArgs
 
     first_gpu = int(args.device.rsplit(":", 1)[-1])
-    if first_gpu + tp > torch.cuda.device_count():
-        raise RuntimeError(f"FIXME(kernel-limit): does not fit: native TP{tp} requires {tp} available GPUs")
-    if args.sm != 103:
-        raise ValueError(f"native K3.1 collection requires qualified SM103, got SM{args.sm}")
-    _check_device_sm(torch.cuda, first_gpu, tp, args.sm)
-    _check_capacity(case, args.phase, torch.cuda, first_gpu)
+    if first_gpu < 0 or first_gpu + local_size > torch.cuda.device_count():
+        raise RuntimeError(
+            f"FIXME(kernel-limit): does not fit: native TP{tp} across {args.nnodes} nodes "
+            f"requires {local_size} available GPUs per node"
+        )
+    major, minor = torch.cuda.get_device_capability(first_gpu)
+    expected_sm = args.sm if args.sm is not None else major * 10 + minor
+    if expected_sm not in (90, 100, 103):
+        raise ValueError(f"native K3.1 collection requires a qualified GPU, got SM{expected_sm}")
+    _check_device_sm(torch.cuda, first_gpu, local_size, expected_sm)
+    _check_capacity(case, args.phase, torch.cuda, first_gpu, local_size)
     config_path = hf_hub_download(MODEL, "config.json", revision=MODEL_REVISION)
     config = single_layer_config(json.loads(Path(config_path).read_text()))
     # Fetch each dependency by immutable revision. Enumerating a snapshot
@@ -739,6 +788,9 @@ def _collect_native(args, case, tp):
             load_format="dummy",
             dtype="bfloat16",
             tp_size=tp,
+            nnodes=args.nnodes,
+            node_rank=args.node_rank,
+            dist_init_addr=args.dist_init_addr,
             trust_remote_code=True,
             disable_radix_cache=True,
             disable_cuda_graph=True,
@@ -759,7 +811,7 @@ def _collect_native(args, case, tp):
         torch.multiprocessing.spawn(
             _rank_main,
             args=(server_args, ports, list(case), args.phase, args.output, first_gpu),
-            nprocs=tp,
+            nprocs=local_size,
             join=True,
         )
 

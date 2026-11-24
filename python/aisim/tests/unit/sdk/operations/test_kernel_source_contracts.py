@@ -144,6 +144,19 @@ def test_k31_dense_kernel_rows_keep_the_observed_cache_layout(tmp_path, phase):
         assert leaf["latency"] == expected
 
 
+def test_k31_hopper_fa3_prefill_keeps_flashmla_packed_cache_bucket(tmp_path):
+    # FA3 executes dense prefill, but the native H100/H200 cache is FlashMLA.
+    architecture = "KimiK31ForConditionalGeneration"
+    row = _dsa_bucket_row("sglang_dsa_dense_mha_fa3_kv_flashmla_packed_eager", "fp8", 1024)
+    row.update(architecture=architecture, latency=7.0)
+    view = _dsa_bucket_view(tmp_path, [row], "context")
+    table = view[common.FMHAQuantMode.bfloat16][common.KVCacheQuantMode.fp8][common.GEMMQuantMode.bfloat16][
+        architecture
+    ]
+    assert set(table) == {"flashmla_kv"}
+    assert table["flashmla_kv"][32][0][1024][1]["latency"] == 7.0
+
+
 @pytest.mark.parametrize("phase", ["context", "generation"])
 @pytest.mark.parametrize(
     ("source", "kv"),

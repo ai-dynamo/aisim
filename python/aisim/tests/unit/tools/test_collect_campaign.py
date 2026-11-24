@@ -28,12 +28,13 @@ def _publish_native_table(directory, phase):
     import pyarrow as pa
     import pyarrow.parquet as pq
     from collector.provenance import render_collection_meta
+    from collector.sglang.collect_kimi_k31_dsa_v1 import RUNTIME_VERSION
 
     table = f"dsa_{phase}_module_perf"
     pq.write_table(pa.table({"latency": [1.0]}), directory / f"{table}.parquet")
     (directory / "collection_meta.yaml").write_bytes(
         render_collection_meta(
-            {"framework": "sglang", "version": "0.0.0.dev1+g41208373c.d20261104"},
+            {"framework": "sglang", "version": RUNTIME_VERSION},
             {
                 table: {
                     "collector_ref": "0" * 40,
@@ -395,8 +396,8 @@ def test_native_build_image_requires_canonical_model(model, monkeypatch):
 def test_native_shard_maturity_is_checked_before_scheduling():
     c = _load()
     shard = c.Shard("kimi_k31_dsa_generation_module", "one", model_path="moonshotai/Kimi-K3.1-Pro")
-    with pytest.raises(SystemExit, match="unverified on SM100"):
-        c._validate_shard_allocation(c.Plan("sglang", 100, (shard,)), shard)
+    with pytest.raises(SystemExit, match="unverified on SM120"):
+        c._validate_shard_allocation(c.Plan("sglang", 120, (shard,)), shard)
 
 
 def test_finalize_admits_existing_checkpoint_with_worker_launch_disabled(tmp_path):
