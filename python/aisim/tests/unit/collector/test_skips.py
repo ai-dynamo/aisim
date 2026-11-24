@@ -119,7 +119,7 @@ def test_model_entries_name_a_whole_model_or_one_op(monkeypatch):
         ([{}], "non-empty dict"),
         ([{"dtype": []}], "must not be empty"),
         ([{"dtype": "fp8", "sm": ["89"]}], "SM versions"),
-        ([{"backend": "trtllm", "model": "A", "dtype": "fp8"}], "may name only backend, op and sm"),
+        ([{"backend": "trtllm", "model": "A", "dtype": "fp8"}], "may name only run selectors"),
         ([{"backend": "trtllm", "model": ["A", 1]}], "case-file architectures"),
     ],
 )
