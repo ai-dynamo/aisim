@@ -1,6 +1,6 @@
 ---
 name: aisim-cpu-overhead-collect
-description: Collect the host-CPU time a serving deployment spends on each request before the engine, which replay models as CPU overhead. Covers the queued tokenizer cost (engine.tokenization, from the host-cost harness). Use when collecting or refreshing CPU-overhead data for vLLM, SGLang or TRT-LLM on a host CPU, or when TTFT is predicted too fast by a roughly constant fraction even at one lane; not for GPU kernel or step timing, response detokenization or replay accuracy campaigns as a whole.
+description: Collect the host-CPU time a serving deployment spends on each request before the engine, which replay models as CPU overhead. Covers the queued tokenizer cost (engine.tokenization, from the host-cost harness) and the unqueued request-path cost (engine.extra_cpu_overhead, from client TTFT minus engine time at one lane). Use when collecting or refreshing CPU-overhead data for vLLM, SGLang or TRT-LLM on a host CPU, or when TTFT is predicted too fast by a roughly constant fraction even at one lane; not for GPU kernel or step timing, response detokenization or replay accuracy campaigns as a whole.
 license: Apache-2.0
 ---
 
@@ -17,6 +17,9 @@ prices it in front of the engine, separately from the forward-pass model:
 | Part | Replay field | Behaviour | How to collect |
 |---|---|---|---|
 | Tokenizer (chat template, encode, prefix-cache hashing) | `engine.tokenization` | Queued: a tokenizer server with `workers` workers | [references/tokenizer.md](references/tokenizer.md) |
+| Everything else on the request path (HTTP receive, parsing, input processing, first-chunk work) | `engine.extra_cpu_overhead` | Unqueued: every request pays it whatever the load | [references/unqueued.md](references/unqueued.md) |
+
+Collect the tokenizer first: the unqueued measurement subtracts its slope.
 
 This skill does not authorize a GPU allocation beyond the campaign's recorded plan, an upload or a
 dataset publish. Ask before spending more.
