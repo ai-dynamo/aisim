@@ -3,6 +3,7 @@
 """tools/perf_database/collect_campaign.py — the invariants a hand-rolled launcher drifted on (sm120)."""
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -262,7 +263,9 @@ def test_k31_campaign_preserves_tp1_shards(monkeypatch, tmp_path, phase):
     assert len(commands) == 1
     assert c.os.environ["COLLECTOR_MODEL_PATH"] == "other/model"
     assert commands[0][commands[0].index("--gpu") + 1] == "3"
-    assert ", 96, 'fp8'," in c.collector_argv(plan, shard)
+    submitted = c.Shard(**json.loads(commands[0][commands[0].index("--shard") + 1]))
+    assert submitted == shard
+    assert ", 96, 'fp8'," in c.collector_argv(plan, submitted)
 
 
 @pytest.mark.parametrize("phase", ["context", "generation"])
@@ -347,3 +350,23 @@ def test_finalize_admits_existing_checkpoint_with_worker_launch_disabled(tmp_pat
         mode="finalize",
     )
     assert "COLLECTOR_K31_FINALIZE_ONLY=1" in args
+
+
+@pytest.mark.parametrize("published", [True, False])
+def test_native_shard_done_requires_its_phase_table(tmp_path, monkeypatch, published):
+    from types import SimpleNamespace
+
+    c = _load()
+    shard = c.Shard("kimi_k31_dsa_generation_module", "tp1", model_path="moonshotai/Kimi-K3.1-Pro")
+    plan = c.Plan("sglang", 103, (shard,))
+    out = c.shard_dir(tmp_path, shard)
+    out.mkdir(parents=True)
+    (out / ".ckpt").mkdir()
+    (out / "DONE").touch()
+    (out / ("dsa_generation_module_perf.parquet" if published else "other.parquet")).touch()
+    monkeypatch.setattr(c, "image_digest", lambda _: "sha256:test")
+    monkeypatch.setattr(c.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0))
+    rc = c.run_shard(plan, shard, root=tmp_path, gpu=0, checkout=tmp_path, image="test", collector_ref="0" * 40)
+    assert (rc == 0) == published
+    assert (out / "DONE").exists() == published
+    assert (out / ".ckpt").is_dir()

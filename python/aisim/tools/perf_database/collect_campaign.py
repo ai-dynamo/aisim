@@ -352,6 +352,13 @@ def run_shard(
         rc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT).returncode
         log.write(f"### {time.strftime('%FT%T')} exit={rc}\n")
     parquets = sorted(p.name for p in d.glob("*.parquet"))
+    if rc == 0 and _native_k31(plan.backend, shard.op):
+        phase = "context" if shard.op == "kimi_k31_dsa_context_module" else "generation"
+        if f"dsa_{phase}_module_perf.parquet" not in parquets:
+            rc = 1
+            (d / "DONE").unlink(missing_ok=True)
+            with (d / "run.log").open("a") as log:
+                log.write("No native phase table was published. Inspect the checkpoint and case diagnostics.\n")
     if rc == 0:
         (d / "DONE").touch()
     _log(root, {"event": "end", "mode": mode, "shard": shard.key, "gpu": gpu, "exit": rc, "parquet": parquets})
@@ -378,10 +385,6 @@ def _validate_shard_allocation(plan: Plan, shard: Shard, *, finalize_checkpoint:
     entry = next(entry for entry in REGISTRY if entry.op == shard.op)
     if entry.unverified or plan.sm in entry.unverified_sms:
         raise SystemExit(f"{shard.key}: registry marks the native op unverified on SM{plan.sm}")
-    if finalize_checkpoint is not None and finalize_checkpoint.is_file():
-        # The mounted collector checks every selected ID under the output lock
-        # before publication; this flag forbids it from launching missing work.
-        return
     # Match collect.py's --model-path selection, independent of the host shell.
     previous_model = os.environ.get("COLLECTOR_MODEL_PATH")
     try:
@@ -392,6 +395,12 @@ def _validate_shard_allocation(plan: Plan, shard: Shard, *, finalize_checkpoint:
             os.environ.pop("COLLECTOR_MODEL_PATH", None)
         else:
             os.environ["COLLECTOR_MODEL_PATH"] = previous_model
+    if not cases:
+        raise SystemExit(f"{shard.key}: no qualified native cases on SM{plan.sm}")
+    if finalize_checkpoint is not None and finalize_checkpoint.is_file():
+        # The mounted collector checks every selected ID under the output lock
+        # before publication; this flag forbids it from launching missing work.
+        return
     for case in cases:
         if shard.model_path and case.model_path != shard.model_path:
             continue

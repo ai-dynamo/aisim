@@ -143,7 +143,7 @@ def test_entries_name_known_backends_ops_and_case_files():
 
 def test_case_keys_exist_on_the_op_plans_they_name():
     for entry in SKIPS:
-        keys = set(entry) - {"backend", "op", "sm", "model", "dtype", "dispatch"}
+        keys = set(entry) - {"backend", "op", "sm", "sm_except", "model", "dtype", "dispatch"}
         for op in _listed(entry.get("op", [])):
             case_type = OP_PLANS[op].case_type if op in OP_PLANS else None
             for key in keys if case_type is not None else ():

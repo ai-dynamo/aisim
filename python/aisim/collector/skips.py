@@ -6,6 +6,7 @@
 An entry in ``SKIPS`` skips a case when every key matches:
 
 - ``backend``, ``op`` and ``sm``: the run;
+- ``sm_except``: any explicitly selected SM outside the listed set;
 - ``model``: the ``architecture`` of the case file a model row comes from;
 - ``dtype``: the case's dtype or quant mode;
 - ``dispatch``: a kernel the op plan picks for the backend; the entry leaves
@@ -13,9 +14,9 @@ An entry in ``SKIPS`` skips a case when every key matches:
 - any other key: the case field (or property) of that name.
 
 A list matches any of its values; a callable is a predicate on the value. An
-entry without ``sm`` applies on every SM. A ``model`` entry drops that file's
+entry without either SM selector applies on every SM. A ``model`` entry drops that file's
 rows before cases are merged, so a shape another model also needs is still
-collected; besides ``model`` it may name only ``backend``, ``op`` and ``sm``.
+collected; besides ``model`` it may name only run selectors.
 
 Add an entry only when the cases would be mismeasured, would hang, would fail
 as a whole block, or come from a model the backend cannot serve. Write the
@@ -56,10 +57,12 @@ _MSA_MODULE_OPS = ["msa_context_module", "msa_generation_module"]
 _ATTENTION_OPS = ["attention_context", "attention_generation"]
 
 SKIPS: list[dict] = [
-    # Native K31 uses DSAAttnBackend._forward_flashmla_kv ->
-    # sgl_kernel.flash_mla.flash_mla_with_kvcache (SM90/SM100), or SM90 FA3
-    # short prefill; sglang srt/layers/attention/dsa_backend.py.
-    {"backend": "sglang", "op": ["kimi_k31_dsa_context_module", "kimi_k31_dsa_generation_module"], "sm": [80, 86, 89]},
+    # The pinned native TP boundary is qualified only on B300 (SM103).
+    {
+        "backend": "sglang",
+        "op": ["kimi_k31_dsa_context_module", "kimi_k31_dsa_generation_module"],
+        "sm_except": [103],
+    },
     # Native K31 Gated DSA has one source-pinned SGLang implementation.
     # Other framework implementations require their own serving audit.
     {"backend": ["vllm", "trtllm"], "op": ["kimi_k31_dsa_context_module", "kimi_k31_dsa_generation_module"]},
@@ -501,7 +504,7 @@ SKIPS: list[dict] = [
     },
 ]
 
-_RUN_KEYS = frozenset(("backend", "op", "sm"))
+_RUN_KEYS = frozenset(("backend", "op", "sm", "sm_except"))
 _MISSING = object()
 
 # Case attribute names that carry a dtype or quant mode.
@@ -521,11 +524,12 @@ def _check(skips: list[dict]) -> None:
         if "model" in entry:
             extra = sorted(set(entry) - _RUN_KEYS - {"model"})
             if extra:
-                raise ValueError(f"{where}: a model entry may name only backend, op and sm besides model, not {extra}")
+                raise ValueError(f"{where}: a model entry may name only run selectors besides model, not {extra}")
             if not all(isinstance(model, str) for model in _values(entry["model"])):
                 raise ValueError(f"{where}.model must name case-file architectures")
-        if "sm" in entry and not all(type(sm) is int for sm in _values(entry["sm"])):
-            raise ValueError(f"{where}.sm must be SM versions")
+        for key in ("sm", "sm_except"):
+            if key in entry and not all(type(sm) is int for sm in _values(entry[key])):
+                raise ValueError(f"{where}.{key} must be SM versions")
 
 
 def _values(want) -> list:
@@ -540,6 +544,8 @@ def _matches(want, value) -> bool:
 
 def _applies(entry: dict, backend: str | None, op: str | None, sm: int | None) -> bool:
     """Whether an entry's run keys match this backend, op and SM."""
+    if "sm_except" in entry and (sm is None or _matches(entry["sm_except"], sm)):
+        return False
     for key, value in (("backend", backend), ("op", op), ("sm", sm)):
         if key in entry and (value is None or not _matches(entry[key], value)):
             return False

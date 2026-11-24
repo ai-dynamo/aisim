@@ -23,30 +23,35 @@ assert metas[0]["runtime"] == metas[1]["runtime"]
 name = "dsa_generation_module_perf"
 parts = [pq.read_table(path / f"{name}.parquet") for path in (original, chunked)]
 assert parts[0].schema == parts[1].schema
-keys = []
-for part in parts:
-    keys.append(
-        {
-            tuple(
-                row[k]
-                for k in (
-                    "architecture",
-                    "num_heads",
-                    "batch_size",
-                    "isl",
-                    "step",
-                    "tp_size",
-                    "kv_cache_dtype",
-                    "mla_dtype",
-                    "gemm_type",
-                    "kernel_source",
-                )
-            )
-            for row in part.to_pylist()
-        }
+
+
+def consumer_key(row):
+    # This union contains only native B300 K3.1 FP8 generation rows. Bind
+    # their physical cache layout exactly as dsa_kernel_source_buckets does.
+    source = row["kernel_source"]
+    if row["architecture"] != "KimiK31ForConditionalGeneration" or row["kv_cache_dtype"] != "fp8":
+        raise ValueError("unexpected architecture or KV dtype in the native union")
+    layouts = {"_kv_flashmla_packed": "flashmla_kv", "_kv_raw_fp8": "trtllm"}
+    markers = [marker for marker in layouts if marker in source]
+    if len(markers) != 1 or not source.endswith(markers[0] + "_eager"):
+        raise ValueError(f"ambiguous native cache layout: {source}")
+    return (
+        row["architecture"],
+        row["mla_dtype"],
+        row["kv_cache_dtype"],
+        row["gemm_type"],
+        "skip_indexer" in row["op_name"],
+        layouts[markers[0]],
+        row["num_heads"],
+        row["batch_size"],
+        row["isl"] + row["step"],
     )
-assert len(keys[0]) == parts[0].num_rows and len(keys[1]) == parts[1].num_rows
-assert not keys[0] & keys[1], "measurement keys overlap; no implicit replacement permitted"
+
+
+counts = Counter(consumer_key(row) for part in parts for row in part.to_pylist())
+collisions = [key for key, count in counts.items() if count > 1]
+if collisions:
+    raise ValueError(f"generation consumer keys overlap: {collisions!r}")
 combined = pa.concat_tables(parts)
 pq.write_table(combined, output / f"{name}.parquet", compression="zstd")
 roundtrip = pq.read_table(output / f"{name}.parquet")
@@ -99,7 +104,7 @@ manifest = {
         }
     ],
     "validation": {
-        "disjoint_consumer_keys": True,
+        "disjoint_consumer_keys": not collisions,
         "exact_all_column_row_union": True,
         "generation_rows": combined.num_rows,
         "context_rows": pq.read_metadata(output / "dsa_context_module_perf.parquet").num_rows,
