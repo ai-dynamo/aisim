@@ -760,6 +760,11 @@ fn build_workload(traffic: TrafficSpec, options: &TrafficBuildOptions) -> Result
         "trace_shared_prefix_ratio and trace_num_prefix_groups require \
          applied_compute_agentic input"
     );
+    ensure!(
+        traffic.load_type.as_deref() != Some("kv_capacity_fraction")
+            || traffic.concurrency.is_some(),
+        "kv_capacity_fraction load requires TrafficBuildOptions::with_kv_capacity"
+    );
     let sessions = concrete_session_count(&traffic)?;
     let turns = if is_session {
         traffic.turns_per_session.unwrap_or(4)
@@ -1226,7 +1231,10 @@ mod tests {
         synthetic["load_type"] = "kv_capacity_fraction".into();
         synthetic["kv_load_ratio"] = 1.0.into();
         let sized = options().with_kv_capacity(role, 2);
-        assert_eq!(build(synthetic, sized).0, Some(4));
+        assert_eq!(build(synthetic.clone(), sized).0, Some(4));
+        // Without a role to size it from, the fraction is not silently dropped.
+        synthetic.as_object_mut().unwrap().remove("concurrency");
+        assert!(replay_error(synthetic).contains("requires TrafficBuildOptions::with_kv_capacity"));
     }
 
     #[test]
