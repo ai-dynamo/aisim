@@ -1549,6 +1549,8 @@ class TestGoldenComparisonGuards:
 
     def test_engine_step_inventory_and_pin_provenance(self) -> None:
         golden = load_parity_golden("engine_step.json")
+        case_ids = {param.id for params, _ in ENGINE_STEP_GOLDEN_MATRIX for param in params}
+        assert set(golden["cases"]) == case_ids
         records = {f"{case_id}::{surface}" for case_id, surfaces in golden["cases"].items() for surface in surfaces}
         expected = {
             f"{param.id}::{surface}"
@@ -1725,10 +1727,12 @@ _FPM_ROWS = [
     ("decode", 512, 0, 4096, 10.0),
     ("decode", 512, 0, 65536, 11.0),
     ("decode", 512, 0, 262144, 12.0),
-    ("decode", 513, 0, 4096, 30.0),
+    # At KV=4096, neither eager curve covers the query, but captured batch
+    # 512 does. That cross-regime row must not rescue an eager coverage miss.
+    ("decode", 513, 0, 8192, 30.0),
     ("decode", 513, 0, 65536, 33.0),
     ("decode", 513, 0, 262144, 36.0),
-    ("decode", 1024, 0, 4096, 60.0),
+    ("decode", 1024, 0, 8192, 60.0),
     ("decode", 1024, 0, 65536, 66.0),
     ("decode", 1024, 0, 262144, 72.0),
 ]
@@ -1828,6 +1832,10 @@ class TestRustEngineStepFpmParity:
             ("decode", 513, 0, 65536, 33.0),
             ("decode", 512, 0, 163840, 11.5),
             ("decode", 513, 0, 163840, 34.5),
+            # KV interpolation gives 34.5/69 ms at eager batches 513/1024;
+            # batch 768 lies 255/511 of the way between those two rows.
+            ("decode", 768, 0, 163840, 34.5 + (69.0 - 34.5) * (768 - 513) / (1024 - 513)),
+            pytest.param("decode", 768, 0, 4096, None, id="decode-no-same-regime-bracket"),
         ],
     )
     def test_fpm_engine_selection_and_phase_timing(
@@ -1857,6 +1865,7 @@ class TestRustEngineStepFpmParity:
             },
             worker_type,
         )
+        assert cfg.estimation_mode == "fpm_interpolation"
         model = RustForwardPassPerfModel.best_available(cfg)
         try:
             assert model.diagnostics()["provenance"]["selected_estimation_mode"] == "fpm_interpolation"
@@ -1864,7 +1873,8 @@ class TestRustEngineStepFpmParity:
             # Exact decode fixture rows give 2.2, 11 and 33 ms. Halfway between
             # KV=65536 and 262144 gives (11+12)/2=11.5 ms on the captured
             # side and (33+36)/2=34.5 ms on the eager side. No cross-cliff
-            # averaging is valid at batch=512/513.
+            # averaging is valid at batch=512/513. At batch=768, KV=4096,
+            # neither eager bracket row covers the query, so it must fail.
             ranks = [
                 {
                     "version": 1,
@@ -1879,7 +1889,11 @@ class TestRustEngineStepFpmParity:
                     ),
                 }
             ]
-            assert model.estimate_forward_pass_time_ms(ranks) == pytest.approx(expected_ms)
+            if expected_ms is None:
+                with pytest.raises(errors.PerfDataNotAvailableError, match="bracket rows 513/1024 do not cover"):
+                    model.estimate_forward_pass_time_ms(ranks)
+            else:
+                assert model.estimate_forward_pass_time_ms(ranks) == pytest.approx(expected_ms)
         finally:
             model.close()
 
