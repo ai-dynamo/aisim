@@ -15,7 +15,82 @@ import logging
 import os
 import warnings
 
-from helper import cuda_context_error, get_device_module, get_device_str
+try:
+    from helper import (
+        EXIT_CODE_OPS_NOT_IN_PLAN,
+        EXIT_CODE_RESTART,
+        PERF_TRANSACTION_FILENAME,
+        SIDECAR_STAGING_FILENAME,
+        SIDECAR_TRANSACTION_FILENAME,
+        LockedOutputRoot,
+        PerfFileAttestation,
+        PerfFinalizationInfo,
+        PerfPublication,
+        WorkerRestartSignal,
+        _rename_noreplace,
+        _rename_noreplace_at,
+        atomic_write_reservation_path,
+        cleanup_atomic_write_reservations,
+        cleanup_perf_publication_artifacts,
+        cleanup_unjournaled_perf_preparations,
+        collector_retained_path,
+        create_test_case_id,
+        cuda_context_error,
+        finalize_perf_files,
+        find_perf_csv_outputs,
+        get_device_module,
+        get_device_str,
+        perf_finalization_lifecycle,
+        perf_merge_locks,
+        perf_preparation_cleanup_path,
+        perf_preparation_path,
+        perf_transaction_artifact_paths,
+        restore_perf_publications,
+        save_error_report,
+        set_worker_heartbeat,
+        setup_logging,
+        setup_signal_handlers,
+        validate_restored_perf_publications,
+    )
+except ModuleNotFoundError as error:
+    if error.name != "helper" or not __package__:
+        raise
+    from .helper import (
+        EXIT_CODE_OPS_NOT_IN_PLAN,
+        EXIT_CODE_RESTART,
+        PERF_TRANSACTION_FILENAME,
+        SIDECAR_STAGING_FILENAME,
+        SIDECAR_TRANSACTION_FILENAME,
+        LockedOutputRoot,
+        PerfFileAttestation,
+        PerfFinalizationInfo,
+        PerfPublication,
+        WorkerRestartSignal,
+        _rename_noreplace,
+        _rename_noreplace_at,
+        atomic_write_reservation_path,
+        cleanup_atomic_write_reservations,
+        cleanup_perf_publication_artifacts,
+        cleanup_unjournaled_perf_preparations,
+        collector_retained_path,
+        create_test_case_id,
+        cuda_context_error,
+        finalize_perf_files,
+        find_perf_csv_outputs,
+        get_device_module,
+        get_device_str,
+        perf_finalization_lifecycle,
+        perf_merge_locks,
+        perf_preparation_cleanup_path,
+        perf_preparation_path,
+        perf_transaction_artifact_paths,
+        restore_perf_publications,
+        save_error_report,
+        set_worker_heartbeat,
+        setup_logging,
+        setup_signal_handlers,
+        validate_restored_perf_publications,
+    )
 
 
 def setup_warning_filters():
@@ -88,40 +163,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from inspect import Parameter, signature
 from pathlib import Path
-
-from helper import (
-    EXIT_CODE_OPS_NOT_IN_PLAN,
-    EXIT_CODE_RESTART,
-    PERF_TRANSACTION_FILENAME,
-    SIDECAR_STAGING_FILENAME,
-    SIDECAR_TRANSACTION_FILENAME,
-    LockedOutputRoot,
-    PerfFileAttestation,
-    PerfFinalizationInfo,
-    PerfPublication,
-    WorkerRestartSignal,
-    _rename_noreplace,
-    _rename_noreplace_at,
-    atomic_write_reservation_path,
-    cleanup_atomic_write_reservations,
-    cleanup_perf_publication_artifacts,
-    cleanup_unjournaled_perf_preparations,
-    collector_retained_path,
-    create_test_case_id,
-    finalize_perf_files,
-    find_perf_csv_outputs,
-    perf_finalization_lifecycle,
-    perf_merge_locks,
-    perf_preparation_cleanup_path,
-    perf_preparation_path,
-    perf_transaction_artifact_paths,
-    restore_perf_publications,
-    save_error_report,
-    set_worker_heartbeat,
-    setup_logging,
-    setup_signal_handlers,
-    validate_restored_perf_publications,
-)
 
 # Module logger. ``setup_logging`` (main / workers) installs the configured
 # collector logger; until then this is the bare library logger so in-process
@@ -6015,7 +6056,11 @@ def _write_collector_provenance(
                 staging_path = output_root / staging_path
             staging_by_table.setdefault(table, staging_path)
 
-    module_failure_names = {e["module"] for e in run_errors if e.get("error_type") == "ModuleCollectionFailure"}
+    module_failure_names = {
+        e["module"]
+        for e in run_errors
+        if e.get("error_type") in {"ModuleCollectionFailure", "FullNodeCollectionFailure"}
+    }
     checkpoint_root = _checkpoint_backend_root(checkpoint_dir, backend)
     collector_hash = provenance.collector_hash(_REPO_ROOT)
     collector_ref = _git_collector_ref(_REPO_ROOT)

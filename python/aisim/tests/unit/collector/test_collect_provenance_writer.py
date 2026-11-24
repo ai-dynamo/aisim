@@ -3597,7 +3597,8 @@ def test_status_complete_with_recorded_case_failures(tmp_path):
     assert table["case_plan_hash"] == provenance.case_plan_hash(["case-a", "case-b"])
 
 
-def test_status_partial_when_module_collection_failure_recorded(tmp_path):
+@pytest.mark.parametrize("failure", ["ModuleCollectionFailure", "FullNodeCollectionFailure"])
+def test_status_partial_when_module_collection_failure_recorded(tmp_path, failure):
     """Even with zero unresolved checkpoint failures, a ModuleCollectionFailure
     for this table's producing module (design §5: "op failed before running a
     single case") forces status: partial."""
@@ -3608,7 +3609,7 @@ def test_status_partial_when_module_collection_failure_recorded(tmp_path):
     checkpoint_dir = tmp_path / "checkpoint"
     _write_checkpoint(checkpoint_dir, done=["case-a"], failed=[])
 
-    run_errors = [{"module": FULL_NAME, "error_type": "ModuleCollectionFailure"}]
+    run_errors = [{"module": FULL_NAME, "error_type": failure}]
 
     collect_mod._write_collector_provenance(
         output_root,
