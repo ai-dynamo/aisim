@@ -2173,7 +2173,20 @@ def _recover_completed_attempt(
             )
             return None
         try:
-            _cell_runner(plan, cell, manifest, cell_dir).cleanup()
+            resource = _cell_runner(plan, cell, manifest, cell_dir)
+            from .slurm import SlurmCellRunner
+
+            if isinstance(resource, SlurmCellRunner):
+                resource._diagnostic_update = diagnostic_update
+                try:
+                    resource._private_values = private_values(
+                        resolve_archived_generator_overrides(generator_overrides or {})
+                    )
+                except ValueError:
+                    # Keep structured failure metadata when the original private
+                    # inputs needed to redact command output are unavailable.
+                    resource._private_values = None
+            resource.cleanup()
         except Exception as error:
             logger.warning(
                 "FPM cell %s recovery refused: teardown of the abandoned workload failed: %s",

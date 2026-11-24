@@ -68,6 +68,13 @@ class SlurmCellRunner:
         self.owner_path = self.cell_dir.parent / ".slurm-owners" / f"{self.step_name}.json"
         self.hosts: list[str] = []
 
+    def _write_transport_failure(self, path, text):
+        writer = getattr(self, "_diagnostic_update", None)
+        if writer is None:
+            path.write_text(text)
+        else:
+            writer(path, text.encode())
+
     def _command(self, args: list[str], *, timeout: float = 60, check: bool = True):
         from .runner import _run_command
 
@@ -86,8 +93,11 @@ class SlurmCellRunner:
                         output = output.decode(errors="replace")
                     from .private_inputs import redact
 
-                    (logs / f"{stream}.log").write_text(redact(output, getattr(self, "_private_values", ())))
-                (logs / "failure.json").write_text(
+                    values = getattr(self, "_private_values", ())
+                    if values is not None:
+                        self._write_transport_failure(logs / f"{stream}.log", redact(output, values))
+                self._write_transport_failure(
+                    logs / "failure.json",
                     json.dumps(
                         {
                             "executable": Path(args[0]).name,
@@ -97,7 +107,7 @@ class SlurmCellRunner:
                         },
                         sort_keys=True,
                     )
-                    + "\n"
+                    + "\n",
                 )
             except OSError as log_error:
                 error.add_note(f"Could not preserve Slurm failure streams: {log_error}")

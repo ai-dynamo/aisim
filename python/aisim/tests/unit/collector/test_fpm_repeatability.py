@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import statistics
+import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -1638,6 +1639,39 @@ def test_complete_failed_native_observation_requires_cpu_recovery_without_replac
         return recover(*positional, generator_overrides=generator_overrides, **kwargs)
 
     monkeypatch.setattr(repeatability, "_recover_completed_attempt", recover_with_context)
+    retry_slurm = collector_status == "running"
+    if retry_slurm:
+        from collector.fpm_forward.slurm import SlurmCellRunner
+
+        def slurm_runner(_plan, _cell, manifest, cell_dir):
+            return SlurmCellRunner(manifest, cell_dir, image="test-image", mounts=(), total_gpus=1)
+
+        with monkeypatch.context() as scoped:
+            scoped.setenv("SLURM_JOB_ID", "12345")
+            scoped.setattr(runner, "_cell_runner", slurm_runner)
+            scoped.setattr(runner, "_expected_nodes", lambda _: 1)
+
+            def unavailable(args, **_kwargs):
+                assert args[0] == "squeue"
+                raise subprocess.CalledProcessError(1, args, stderr="scheduler unavailable")
+
+            scoped.setattr(runner, "_run_command", unavailable)
+            failed = repeatability.run_repeatability(**args, resume=True, retry_failed=True)
+            assert failed["samples"][cell_id][0]["attempts"][0]["status"] != "passed"
+            failure = next(args["output_dir"].rglob("transport-failures/*/failure.json"))
+            assert json.loads(failure.read_text())["executable"] == "squeue"
+            assert (failure.parent / "stderr.log").is_file() == (not archived_auth)
+            native = next(args["output_dir"].rglob("benchmark-*.json"))
+            original = native.read_bytes()
+            native.write_bytes(original + b" ")
+            with pytest.raises(ValueError, match="attempt files changed"):
+                repeatability.run_repeatability(**args, resume=True, retry_failed=True)
+            native.write_bytes(original)
+            assert len(calls) == 1
+        monkeypatch.setattr(runner, "_cell_runner", slurm_runner)
+        monkeypatch.setattr(runner, "_expected_nodes", lambda _: 1)
+        monkeypatch.setenv("SLURM_JOB_ID", "12345")
+        monkeypatch.setattr(runner, "_run_command", lambda *_a, **_k: SimpleNamespace(stdout=""))
     interrupt_recovery = archived_auth and collector_status == "interrupted"
     if interrupt_recovery:
         report_path = args["output_dir"] / repeatability.REPORT_FILENAME
@@ -1679,6 +1713,8 @@ def test_complete_failed_native_observation_requires_cpu_recovery_without_replac
     assert all(point["sample_count"] == 5 and point["sample_cv"] > 0.05 for point in result["points"])
     attempt = result["samples"][cell_id][0]["attempts"][0]
     expected_retries = ["failed", "interrupted", "passed"] if interrupt_recovery else ["failed", "passed"]
+    if retry_slurm:
+        expected_retries.insert(1, "failed")
     assert [item["status"] for item in attempt["postprocessing_attempts"]] == expected_retries
     assert attempt["postprocessing_attempts"][-1]["artifact_recovery"]["original_status"] == collector_status
     assert all(len(sample["attempts"]) == 1 for sample in result["samples"][cell_id])

@@ -16,6 +16,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import statistics
 import tempfile
 from collections import Counter
@@ -635,7 +636,11 @@ def _reconcile_diagnostic(attempt, files, cell_path):
     ):
         raise ValueError("invalid repeatability diagnostic recovery path")
     before, after = pending["before"], pending["after"]
-    if before is None or attempt["files"].get(name) != before or files.get(name) not in (before, after):
+    if before is None and not re.fullmatch(
+        r"logs/transport-failures/[0-9a-f]{32}/(stdout\.log|stderr\.log|failure\.json)", relative.as_posix()
+    ):
+        raise ValueError("unexpected new repeatability diagnostic")
+    if attempt["files"].get(name) != before or files.get(name) not in (before, after):
         raise ValueError("repeatability diagnostic changed outside recovery")
     if files.get(name) == after:
         manifests = [(attempt["files"], name)]
@@ -660,8 +665,8 @@ def _retry_sample_postprocessing(plan, selected, directory, attempt, generator_o
         name = str(path.relative_to(directory))
         if "pending_diagnostic" in attempt:
             raise ValueError("previous diagnostic edit was interrupted")
-        before = attempt["files"][name]
-        if _file_metadata(path) != before:
+        before = attempt["files"].get(name)
+        if (_file_metadata(path) if path.exists() else None) != before:
             raise ValueError("repeatability diagnostic changed before recovery")
         after = None if content is None else {"size": len(content), "sha256": hashlib.sha256(content).hexdigest()}
         if before == after:
