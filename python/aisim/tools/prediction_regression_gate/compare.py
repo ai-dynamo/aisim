@@ -43,12 +43,7 @@ BLOCKING_CATEGORIES = {"REGRESSION"}
 # introduced ones, so it goes inert once the rename reaches the base and its
 # entries can then be deleted. A new side that lacks an identifier the table
 # maps onto is rejected, so an incomplete snapshot cannot hide behind the rename.
-MODEL_RELABELS: dict[str, str] = {
-    # AISIM-2124: zai-org/GLM-5.3 is Z.AI's FP8 release and the BF16 one is
-    # zai-org/GLM-5.3-BF16; there is no zai-org/GLM-5.3-FP8.
-    "zai-org/GLM-5.3-FP8": "zai-org/GLM-5.3",
-    "zai-org/GLM-5.3": "zai-org/GLM-5.3-BF16",
-}
+MODEL_RELABELS: dict[str, str] = {}
 
 
 @dataclass
