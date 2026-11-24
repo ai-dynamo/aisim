@@ -656,11 +656,9 @@ def main() -> None:
             stage = Path(directory, output.name)
             if output.exists():
                 shutil.copyfile(output, stage)
-            previous_size = stage.stat().st_size if stage.exists() else 0
-            args.output = str(stage)
-            _collect_native(args, case, tp)
-            if not stage.exists() or stage.stat().st_size <= previous_size:
-                raise RuntimeError("standalone native ranks exited without appending a result row")
+            # Supervise the private stage too: a stalled TP join must release
+            # the public output lock without publishing any of the attempt.
+            _run_native_case(case, args.device, stage, expected_sm=args.sm, phase=args.phase)
             if collector_retained_path(output).exists():
                 from collector.collect import _atomic_write_bytes
 

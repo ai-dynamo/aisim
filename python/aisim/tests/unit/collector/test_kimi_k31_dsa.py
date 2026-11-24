@@ -173,15 +173,17 @@ def test_native_dispatch_setting_is_fixed_for_child_and_standalone(monkeypatch, 
     popen = subprocess.Popen
     output = tmp_path / "dsa_generation_module_perf.txt"
 
-    def launch(_command, **kwargs):
-        code = (
-            f"import os; from pathlib import Path; Path({str(output)!r}).write_text(repr(os.environ.get({variable!r})))"
-        )
+    def launch(command, **kwargs):
+        stage = command[command.index("--output") + 1]
+        code = f"import os; from pathlib import Path; Path({stage!r}).write_text(repr(os.environ.get({variable!r})))"
         return popen([sys.executable, "-c", code], **kwargs)
 
     monkeypatch.setattr(module.subprocess, "Popen", launch)
     case = ModuleCase(8192, 1, 96, "fp8", "bfloat16", "bfloat16", MODEL, 0)
-    module._run_native_case(case, "cuda:0", output)
+    monkeypatch.setattr(
+        sys, "argv", ["collector", "--case", json.dumps(list(case)), "--phase", "generation", "--output", str(output)]
+    )
+    module.main()
     assert output.read_text() == repr(expected)
     assert os.environ.get(variable) == ambient
     monkeypatch.setattr(module.os, "environ", dict(os.environ))
@@ -195,11 +197,10 @@ def test_native_dispatch_setting_is_fixed_for_child_and_standalone(monkeypatch, 
         raise RuntimeReached
 
     monkeypatch.setattr(module, "_assert_runtime", runtime)
-    monkeypatch.setattr(
-        sys, "argv", ["collector", "--case", json.dumps(list(case)), "--phase", "generation", "--output", str(output)]
-    )
-    with pytest.raises(RuntimeReached):
-        module.main()
+    with module.native_publication_lock(output) as fd:
+        sys.argv.extend(["--publication-lock-fd", str(fd)])
+        with pytest.raises(RuntimeReached):
+            module.main()
 
 
 def test_physical_sm_validation_checks_every_selected_device():
@@ -290,42 +291,118 @@ def test_supervisor_and_child_share_the_target_lock(tmp_path, monkeypatch, alias
     assert output.is_symlink() == alias
 
 
-@pytest.mark.parametrize("fail_after_write", [False, True])
-def test_standalone_publishes_only_after_rank_join(tmp_path, monkeypatch, fail_after_write):
+@pytest.mark.skipif(os.name != "posix", reason="native SGLang TP workers use POSIX process groups")
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("outcome", ["success", "rank_failure", "timeout"])
+def test_standalone_bounds_rank_join_and_publishes_only_success(tmp_path, monkeypatch, existing, outcome):
     import collector.sglang.collect_kimi_k31_dsa_v1 as module
+    import psutil
 
-    output = tmp_path / "context.txt"
-    output.write_text("existing row\n")
+    # An arbitrary basename ensures the explicit context phase is forwarded.
+    output = tmp_path / "rows.txt"
+    initial = "existing row\n" if existing else ""
+    if existing:
+        output.write_text(initial)
+    rank_pid = tmp_path / "rank.pid"
+    release = tmp_path / "release"
+    rank_code = (
+        "import os, time\nfrom pathlib import Path\n"
+        f"Path({str(rank_pid)!r}).write_text(str(os.getpid()))\n"
+        f"while not Path({str(release)!r}).exists(): time.sleep(0.01)\n"
+    )
     monkeypatch.setattr(
         sys,
         "argv",
         [
             "collector",
             "--case",
-            json.dumps([4096, 1, 96, "fp8", "bfloat16", "bfloat16", MODEL, 0]),
+            json.dumps([4096, 1, 48, "fp8", "bfloat16", "bfloat16", MODEL, 0]),
             "--phase",
             "context",
             "--output",
             str(output),
+            "--device",
+            "cuda:1",
+            "--sm",
+            "103",
         ],
     )
+    popen = subprocess.Popen
+    children = []
+    attempt_outcome = outcome
 
-    def ranks(args, *_):
-        assert Path(args.output) != output
-        with Path(args.output).open("a") as stream:
-            stream.write("new row\n")
-        assert output.read_text() == "existing row\n"
-        if fail_after_write:
-            raise RuntimeError("rank 1 failed after rank 0 wrote")
+    def launch(command, **kwargs):
+        rank_pid.unlink(missing_ok=True)
+        release.unlink(missing_ok=True)
+        # Exercise the real child entrypoint and inherited stage lock, replacing
+        # only GPU measurement with a writer and a rank whose join can stall.
+        code = (
+            "import subprocess, sys\nfrom pathlib import Path\n"
+            "import collector.sglang.collect_kimi_k31_dsa_v1 as module\n"
+            "def ranks(args, case, tp):\n"
+            "    assert tp == 2 and args.phase == 'context'\n"
+            "    assert args.device == 'cuda:1' and args.sm == 103\n"
+            f"    assert Path(args.output) != Path({str(output)!r})\n"
+            "    with Path(args.output).open('a') as stream: stream.write('new row\\n')\n"
+            f"    rank = subprocess.Popen([sys.executable, '-c', {rank_code!r}])\n"
+            "    rank.wait()\n"
+            f"    if {attempt_outcome == 'rank_failure'!r}: raise RuntimeError('rank 1 failed after rank 0 wrote')\n"
+            "module._collect_native = ranks\nmodule.main()\n"
+        )
+        child = popen([sys.executable, "-c", code, *command[3:]], **kwargs)
+        children.append(child)
+        deadline = time.monotonic() + 30
+        while not rank_pid.exists() or not rank_pid.read_text().strip():
+            assert time.monotonic() < deadline, "TP rank did not start"
+            assert child.poll() is None, "native launcher exited before starting its rank"
+            time.sleep(0.01)
+        assert child.poll() is None
+        assert output.exists() == existing
+        if existing:
+            assert output.read_text() == initial
+        with pytest.raises(RuntimeError, match="publication owner"), module.native_publication_lock(output):
+            pass
+        if attempt_outcome != "timeout":
+            release.touch()
+        # Start the execution deadline after interpreter/rank startup.
+        monkeypatch.setattr(module, "NATIVE_CASE_TIMEOUT_S", 0.1 if attempt_outcome == "timeout" else 30)
+        return child
 
-    monkeypatch.setattr(module, "_collect_native", ranks)
-    if fail_after_write:
-        with pytest.raises(RuntimeError, match="rank 1 failed"):
+    monkeypatch.setattr(module.subprocess, "Popen", launch)
+    monkeypatch.setattr(module, "_collect_native", lambda *_: pytest.fail("standalone bypassed supervision"))
+    try:
+        if outcome == "success":
             module.main()
-        assert output.read_text() == "existing row\n"
-    else:
-        module.main()
-        assert output.read_text() == "existing row\nnew row\n"
+        else:
+            error, message = (
+                (subprocess.TimeoutExpired, "timed out") if outcome == "timeout" else (RuntimeError, "rank 1 failed")
+            )
+            with pytest.raises(error, match=message):
+                module.main()
+            assert output.exists() == existing
+            if existing:
+                assert output.read_text() == initial
+        assert all(child.poll() is not None for child in children)
+        try:
+            status = psutil.Process(int(rank_pid.read_text())).status()
+        except psutil.NoSuchProcess:
+            status = None
+        assert status in (None, psutil.STATUS_ZOMBIE)
+        assert not list(tmp_path.glob(".rows.txt.stage-*"))
+        with module.native_publication_lock(output):
+            pass
+        if outcome != "success":
+            # A retry must acquire the same output and publish exactly one row.
+            attempt_outcome = "success"
+            module.main()
+        assert output.read_text() == initial + "new row\n"
+    finally:
+        for child in children:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait(timeout=5)
 
 
 @pytest.mark.parametrize("existing", [False, True])
