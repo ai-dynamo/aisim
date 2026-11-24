@@ -2366,6 +2366,24 @@ mod destination_lifecycle {
             assert_eq!(admitted, [expected]);
         }
     }
+
+    /// vLLM refuses to start with a `max_model_len` its KV cache cannot
+    /// hold, so no request outgrows it there. Speculative emission preempts
+    /// the request one token short of outgrowing the pool.
+    #[rstest]
+    fn a_request_that_outgrows_g1_is_rejected(#[values(None, Some(1))] nextn: Option<usize>) {
+        let mut core = small_decode(nextn);
+        // 9 prompt tokens and 9 outputs need five blocks.
+        let ready = reserve(&mut core, 1, 9, 9);
+        activate(&mut core, ready);
+        let ended = (0..24)
+            .flat_map(|_| execute(&mut core, 0.0).output_signals)
+            .filter(|signal| signal.completed)
+            .map(|signal| signal.rejected)
+            .collect::<Vec<_>>();
+        assert_eq!(ended, [true]);
+        assert_eq!(core.kv_manager.num_active_blocks(), 0);
+    }
 }
 
 mod core_behavior {

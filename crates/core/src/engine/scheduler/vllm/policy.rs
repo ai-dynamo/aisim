@@ -424,19 +424,20 @@ pub(super) fn decide_waiting_admission_with_adjusted_cost<'a, S: PolicySequence 
         mtp_enabled: _,
     } = config;
 
-    if is_fresh {
-        match policy {
-            SchedulingPolicy::Vllm => {
-                // Total worker KV remains a fallback one-time admission cap
-                // when max_model_len is unset or larger than the KV pool.
-                if sequence.current_known_blocks() > num_gpu_blocks {
-                    return AdmissionDecision::Reject;
-                }
+    match policy {
+        // Total worker KV remains a fallback admission cap when max_model_len
+        // is unset or larger than the KV pool. It also ends a request that
+        // was preempted after its decode outgrew the pool: vLLM refuses to
+        // start with a max_model_len the pool cannot hold, so no such request
+        // exists there, and here it could never be admitted again.
+        SchedulingPolicy::Vllm => {
+            if sequence.current_known_blocks() > num_gpu_blocks {
+                return AdmissionDecision::Reject;
             }
-            SchedulingPolicy::TrtllmGuaranteedNoEvict => {
-                if sequence.to_completion_blocks() > num_gpu_blocks {
-                    return AdmissionDecision::Reject;
-                }
+        }
+        SchedulingPolicy::TrtllmGuaranteedNoEvict => {
+            if is_fresh && sequence.to_completion_blocks() > num_gpu_blocks {
+                return AdmissionDecision::Reject;
             }
         }
     }

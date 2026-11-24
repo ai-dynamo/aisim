@@ -2221,7 +2221,9 @@ impl VllmCore {
     /// stores of a shared pool hold the blocks. Only a decode rank and a rank
     /// with a host pool wait: their queues serve the handoffs and restores
     /// that own G1 blocks first, so the waiting request cannot keep them
-    /// from finishing.
+    /// from finishing. A request that could not hold that token even alone
+    /// in G1 can never resume and is rejected: emission preempts it before
+    /// its sequence grows, so the cap on the known sequence does not see it.
     fn resumed_without_emission_blocks(
         &self,
         uuid: Uuid,
@@ -2259,7 +2261,12 @@ impl VllmCore {
         if resumed + emitted <= free {
             return None;
         }
-        Some(AdmissionDecision::Wait)
+        let alone = request.sequence.current_known_blocks() + emitted;
+        Some(if alone > self.args.num_gpu_blocks {
+            AdmissionDecision::Reject
+        } else {
+            AdmissionDecision::Wait
+        })
     }
 
     /// The blocks that host loads in flight and landed still need, and
