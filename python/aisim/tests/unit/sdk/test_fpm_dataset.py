@@ -268,7 +268,7 @@ def test_copied_system_yaml_is_verified_on_cache_reuse(dataset, packaged_dataset
     assert len(calls) == 2
 
 
-@pytest.mark.parametrize("mutation", ["missing", "escape", "collision"])
+@pytest.mark.parametrize("mutation", ["missing", "escape", "collision", "nested"])
 def test_invalid_packaged_system_fails_before_download(dataset, packaged_dataset, tmp_path, mutation):
     path, manifest, bodies, calls, cache = dataset
     source = packaged_dataset / "gb300.yaml"
@@ -279,16 +279,28 @@ def test_invalid_packaged_system_fails_before_download(dataset, packaged_dataset
         outside.write_bytes(bodies["gb300.yaml"])
         source.unlink()
         source.symlink_to(outside)
-    else:
+    else:  # a target equal to, or beneath, the YAML that materialization writes from the installed system
         manifest["profiles"]["gb300-full"]["files"].append(
             {
                 "path": "archive/gb300.yaml",
-                "target": "gb300.yaml",
+                "target": "gb300.yaml" if mutation == "collision" else "gb300.yaml/extra",
                 "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
             }
         )
         path.write_text(json.dumps(manifest))
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="packaged_system" if mutation in {"collision", "nested"} else None):
+        fpm_dataset.materialize_fpm_profile(path, "gb300-full", cache_dir=cache)
+    assert not calls
+    assert not cache.exists()
+
+
+def test_a_file_target_inside_another_file_target_fails_before_download(dataset):
+    path, manifest, _, calls, cache = dataset
+    manifest["profiles"]["gb300-full"]["files"].append(
+        {"path": "archive/extra", "target": "gb300.yaml/extra", "sha256": "0" * 64}
+    )
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="inside another file target"):
         fpm_dataset.materialize_fpm_profile(path, "gb300-full", cache_dir=cache)
     assert not calls
     assert not cache.exists()
@@ -440,3 +452,14 @@ def test_shipped_profiles_reference_installed_systems():
                 assert table.is_relative_to(data_dir), (row, data_dir, table)
                 # The native loader expects <data_dir>/<backend>/<version>/<table>.
                 assert len(table.relative_to(data_dir).parts) == 3, (row, table)
+
+
+def test_pending_pin_refuses_to_download_but_cached_use_is_unaffected(dataset):
+    path, manifest, _, calls, cache = dataset
+    manifest["revision"] = fpm_dataset.PENDING_REVISION
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="pending placeholder"):
+        fpm_dataset.materialize_fpm_profile(path, "gb300-full", cache_dir=cache)
+    assert calls == []
+    with pytest.raises(FileNotFoundError):
+        fpm_dataset.materialize_fpm_profile(path, "gb300-full", cache_dir=cache, local_files_only=True)
