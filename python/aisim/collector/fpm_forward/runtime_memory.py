@@ -10,15 +10,15 @@ import hashlib
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from aisim_core.sdk.fpm_identity import EXECUTION_COLUMNS, LEGACY_EXECUTION_IDENTITY
 
-from .model_capability import ResolvedModelConfig
+from .model_capability import ResolvedModelConfig, kimi_k31_native_attention_backend
 from .native_artifact import COLLECTOR_PROVENANCE_FILENAME, validate_native_collection
-from .planner import BackendPolicy, FPMCell, _canonical_hash
+from .planner import BackendPolicy, CollectionEvidence, FPMCell, _canonical_hash
 from .runtime.fpm_memory_observer import (
     _LEGACY_SPECS,
     _MAMBA_SPEC,
@@ -55,6 +55,10 @@ _MAMBA_ALL_UNMODELED = "mamba_cache_mode all is not modeled; run the probe with 
 
 def _hybrid_evidence(cache: Any) -> bool:
     """A hybrid record holds the spec of every layer in ``layer_specs``; a plain record holds none."""
+    from .runtime_k31 import LAYOUT
+
+    if isinstance(cache, dict) and cache.get("allocation_layout") == LAYOUT:
+        return False  # The source-pinned Kimi importer owns this layout.
     groups = cache.get("groups") if isinstance(cache, dict) else None
     return isinstance(groups, list) and any(isinstance(group, dict) and "layer_specs" in group for group in groups)
 
@@ -186,6 +190,7 @@ class _SavedOptions:
     benchmark_points_json: str | None
     # Saved (and hashed) only when enabled, so plans without the key read False.
     measure_power: bool = False
+    worker_type: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,7 +205,7 @@ class _SavedCapability:
 
 
 @dataclass(frozen=True, slots=True)
-class SavedCollectionIdentity:
+class SavedCollectionIdentity(CollectionEvidence):
     """The verified plan fields used by native aggregation and commit validation."""
 
     backend: str
@@ -213,6 +218,8 @@ class SavedCollectionIdentity:
     cells: tuple[FPMCell, ...]
     backend_version: str | None = None
     runtime_backend_version: str | None = None
+    _runtime_observation_json: str | None = field(default=None, repr=False)
+    _fpm_profile_json: str | None = field(default=None, repr=False)
 
 
 def saved_plan_identity(payload: dict[str, Any]) -> SavedCollectionIdentity:
@@ -226,6 +233,10 @@ def saved_plan_identity(payload: dict[str, Any]) -> SavedCollectionIdentity:
         )
     points = payload["options"].get("benchmark_points")
     return SavedCollectionIdentity(
+        _runtime_observation_json=json.dumps(payload["runtime_observation"])
+        if payload.get("runtime_observation")
+        else None,
+        _fpm_profile_json=json.dumps(payload["fpm_profile"]) if payload.get("fpm_profile") else None,
         backend=payload["backend"],
         model_path=payload["model_path"],
         system=payload["system"],
@@ -234,6 +245,7 @@ def saved_plan_identity(payload: dict[str, Any]) -> SavedCollectionIdentity:
         backend_version=payload.get("backend_version"),
         runtime_backend_version=payload.get("runtime_backend_version"),
         options=_SavedOptions(
+            worker_type=payload["options"].get("worker_type"),
             warmup_iterations=payload["options"]["global_warmup_iterations"],
             benchmark_points_json=json.dumps(points["payload"]) if points is not None else None,
             measure_power=payload["options"].get("measure_power") is True,
@@ -266,14 +278,38 @@ def _dtype(value: Any) -> str:
     }.get(value, value)
 
 
-def _resolved_cache_dtype(config: dict[str, Any]) -> str:
+def _resolved_cache_dtype(config: dict[str, Any], cell: FPMCell) -> str:
     value = config["cache_config"].get("cache_dtype")
+    if config["model_config"].get("architectures") == ["KimiK31ForConditionalGeneration"]:
+        # vllm/vllm-openai:kimi-k31, amd64 manifest
+        # sha256:88175ddf4f59944ccbb24c6b60c1bc535a160be3c4f09a3b08702c5e301a599e:
+        # model_executor/models/config.py::KimiK3ForConditionalGenerationConfig
+        # resolves these two native layouts. Keep the observed storage identity
+        # intact; only the public precision comparison uses the common fp8 name.
+        native = kimi_k31_native_attention_backend(
+            "KimiK31ForConditionalGeneration", cell.backend_policy.aic_fields.get("attention_backend")
+        )
+        attention = config.get("attention_config")
+        if (
+            native is None
+            or not isinstance(attention, dict)
+            or attention.get("backend") != native
+            or attention.get("indexer_kv_dtype") != "fp8"
+            or cell.kv_cache_dtype != "fp8"
+        ):
+            raise ValueError(
+                "Kimi K3.1 runtime precision requires the selected native attention backend and FP8 indexer"
+            )
+        expected = ("fp8_ds_mla",) if native == "FLASHMLA_SPARSE" else ("fp8", "fp8_e4m3")
+        if value not in expected:
+            raise ValueError("Kimi K3.1 runtime KV precision/layout differs from the selected native attention backend")
+        return "fp8"
     if value == "auto":
         value = config["model_config"].get("dtype")
     return _dtype(value)
 
 
-def _validate_precision(config: dict[str, Any], cell: FPMCell) -> None:
+def _validate_precision(config: dict[str, Any], cell: FPMCell, *, evidence=None, scheduler=False) -> None:
     """Check audited quantization families without assigning every layer a dtype.
 
     vLLM 4bdc8a788d2e2ce9165d552b3d4d8b72604626bf:
@@ -287,10 +323,25 @@ def _validate_precision(config: dict[str, Any], cell: FPMCell) -> None:
     if "quantization" not in model or "quantization_config" not in config or base not in {"bfloat16", "half"}:
         raise ValueError("runtime memory weight precision evidence is incomplete or unsupported")
     gemm, moe = None, None
-    if method is None and quant is None:
+    prefix = "vllm.model_executor.layers.quantization."
+    if model.get("architectures") == ["KimiK31ForConditionalGeneration"]:
+        if method != "mxfp4" or not isinstance(quant, dict) or quant.get("type") != prefix + "mxfp4.Mxfp4Config":
+            raise ValueError("K3.1 runtime weight precision requires audited MXFP4 method and quantization class")
+        # The pinned image's quantization/mxfp4.py::Mxfp4MoEMethod and
+        # fused_moe/oracle/mxfp4.py::make_mxfp4_moe_quant_config can select
+        # MXFP8/FP4 activations despite BF16 model inputs. The config class
+        # establishes weight format, not the initialized expert arithmetic.
+        from .runtime_k31 import moe_precision
+
+        gemm = base  # Mxfp4Config.get_quant_method leaves LinearBase unquantized.
+        # Schedulers have no model. Every worker must independently attest
+        # the initialized precision before rank-complete import succeeds.
+        moe = "w4a8_mxfp4_mxfp8_trtllm" if scheduler else moe_precision(evidence)
+        if cell.gemm_quant_mode != base or cell.moe_quant_mode != moe:
+            raise ValueError("K3.1 initialized MoE weight precision differs from the planned GEMM/MoE identity")
+    elif method is None and quant is None:
         gemm = moe = base
     elif isinstance(quant, dict):
-        prefix = "vllm.model_executor.layers.quantization."
         if method == "modelopt_fp4" and quant.get("type") == prefix + "modelopt.ModelOptNvFp4Config":
             if quant.get("quant_method") == "NVFP4":
                 gemm = moe = "nvfp4"
@@ -474,14 +525,22 @@ def _validate_config(
     if parallel.get("enable_eplb", False) is not False:
         raise ValueError("runtime memory with expert load balancing is unsupported")
     expected_backend = cell.backend_policy.aic_fields.get("moe_backend")
-    if (
-        expected_backend not in (None, "auto")
-        and (config.get("kernel_config") or {}).get("moe_backend") != expected_backend
-    ):
-        raise ValueError("runtime memory MoE backend differs from the planned identity")
-    if _resolved_cache_dtype(config) != cell.kv_cache_dtype:
+    if expected_backend not in (None, "auto"):
+        kernel = config.get("kernel_config")
+        if not isinstance(kernel, dict):
+            raise ValueError("runtime memory evidence lacks a kernel_config object")
+        if kernel.get("moe_backend") != expected_backend:
+            raise ValueError("runtime memory MoE backend differs from the planned identity")
+    if _resolved_cache_dtype(config, cell) != cell.kv_cache_dtype:
         raise ValueError("runtime memory KV precision differs from the planned identity")
-    _validate_precision(config, cell)
+    from .runtime_k31 import is_audited_runtime
+
+    _validate_precision(
+        config,
+        cell,
+        evidence=payload.get("initialized_moe"),
+        scheduler=payload.get("kind") == "scheduler" and is_audited_runtime(payload.get("runtime")),
+    )
     _validate_no_offload(payload, config)
     config["compilation_config"] = _validate_graph(
         config.get("compilation_config"),
@@ -570,7 +629,13 @@ def _spec_classes(group: dict[str, Any], names: list[str], hybrid: bool) -> list
     return classes
 
 
-def _normalized_groups(cache: dict[str, Any], scheduler_cache: dict[str, Any], page_bytes: int) -> list[dict[str, Any]]:
+def _normalized_groups(
+    cache: dict[str, Any], scheduler_cache: dict[str, Any], page_bytes: int, *, context: int | None = None
+) -> list[dict[str, Any]]:
+    from .runtime_k31 import LAYOUT, normalize_groups
+
+    if cache.get("allocation_layout") == LAYOUT or scheduler_cache.get("allocation_layout") == LAYOUT:
+        return normalize_groups(cache, scheduler_cache, page_bytes, context=context)
     raw_groups = cache.get("groups")
     scheduler_groups = scheduler_cache.get("groups")
     if not isinstance(raw_groups, list) or not raw_groups or not isinstance(scheduler_groups, list):
@@ -739,14 +804,16 @@ def validate_shared_pool_accounting(cache: dict[str, Any], scheduled: dict[str, 
     storages = cache.get("storages")
     if not isinstance(storages, list) or not storages:
         raise ValueError("runtime memory evidence lacks physical storage accounting")
+    if any(not isinstance(item, dict) for item in storages):
+        raise ValueError("runtime cache storage entries must be objects")
     keys = [(item.get("device"), item.get("pointer")) for item in storages]
     if (
-        len(keys) != len(set(keys))
-        or len({device for device, _pointer in keys}) != 1
-        or any(
+        any(
             not isinstance(device, str) or not device.startswith("cuda:") or type(pointer) is not int or pointer <= 0
             for device, pointer in keys
         )
+        or len(keys) != len(set(keys))
+        or len({device for device, _pointer in keys}) != 1
         or sum(_positive(item.get("size_bytes"), "storage bytes") for item in storages) != allocated
     ):
         raise ValueError("physical runtime cache storage accounting is inconsistent")
@@ -900,7 +967,11 @@ def resolve_runtime_resources(
         count = accounting["num_blocks"]
         free = accounting["initial_free_blocks"]
         allocated = accounting["allocated_cache_bytes"]
-        groups = _normalized_groups(cache, scheduled, allocated // count)
+        from .runtime_k31 import LAYOUT
+
+        if cache.get("allocation_layout") == LAYOUT:
+            raise ValueError("K3.1 native layouts require the source-bound runtime observation importer")
+        groups = _normalized_groups(cache, scheduled, allocated // count, context=expected_context_length)
         # _normalized_groups accepts a state group on any runtime, so this collection path refuses every state group.
         if any(group["kind"] == "state" for group in groups):
             raise ValueError("runtime memory cache kind is unsupported")

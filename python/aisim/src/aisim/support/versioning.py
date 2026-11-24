@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import subprocess
 import uuid
+from functools import partial
 from pathlib import Path
 
 from .schema import FPMDeployment, SupportRequest
@@ -25,19 +28,74 @@ print("AISIM_RUNTIME_VERSION=" + json.dumps(result, sort_keys=True))
 """
 
 
-def _run(command: list[str], *, payload: str | None = None) -> str:
+def _redact_diagnostic(
+    diagnostic: str, sensitive_values: tuple[str, ...], sensitive_names: tuple[str, ...] = ()
+) -> str:
+    variants: dict[str, bool] = {}
+    for index, value in enumerate(sensitive_values):
+        if not value:
+            continue
+        name = sensitive_names[index] if index < len(sensitive_names) else None
+        public_flag = name in {"HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"} and value in {"0", "1"}
+        for variant in (value, value.replace("$", "$$")):
+            for encoded in (variant, repr(variant)[1:-1], json.dumps(variant)[1:-1], shlex.quote(variant)):
+                variants[encoded] = variants.get(encoded, False) or not public_flag
+    for value in sorted(variants, key=len, reverse=True):
+        if variants[value]:
+            diagnostic = diagnostic.replace(value, "<redacted>")
+        elif sensitive_names:
+            names = "|".join(re.escape(name) for name in sensitive_names)
+            diagnostic = re.sub(
+                r"(\b(?:" + names + r")[=]['\"]?)" + re.escape(value) + r"(?=$|[\s'\",}\]])",
+                r"\1<redacted>",
+                diagnostic,
+            )
+            diagnostic = re.sub(
+                r'("value"\s*:\s*)' + re.escape(json.dumps(value)),
+                r'\1"<redacted>"',
+                diagnostic,
+            )
+    return diagnostic
+
+
+def _run(
+    command: list[str],
+    *,
+    payload: str | None = None,
+    sensitive_values: tuple[str, ...] = (),
+    sensitive_names: tuple[str, ...] = (),
+) -> str:
     try:
         result = subprocess.run(command, input=payload, text=True, capture_output=True, timeout=300, check=True)
     except (OSError, subprocess.SubprocessError) as exc:
-        diagnostic = getattr(exc, "stderr", None) or str(exc)
-        raise ValueError(f"collection image runtime version detection failed: {diagnostic}") from exc
-    return result.stdout
+        diagnostic = getattr(exc, "stderr", None) or (
+            f"{type(exc).__name__} (returncode={getattr(exc, 'returncode', None)})"
+        )
+        if isinstance(diagnostic, bytes):
+            diagnostic = diagnostic.decode(errors="replace")
+        diagnostic = _redact_diagnostic(diagnostic, sensitive_values, sensitive_names)
+    else:
+        return result.stdout
+    # Raise outside the handler: subprocess errors retain the full command
+    # and potentially the manifest in stderr, even as a suppressed context.
+    raise ValueError(f"collection image runtime version detection failed: {diagnostic}") from None
 
 
 def detect_runtime_versions(deployment: FPMDeployment) -> dict[str, str]:
     """Read package metadata in the target image without loading a model/GPU."""
     if deployment.image is None:
         raise ValueError("runtime version detection requires --image for the actual collection container")
+    if any("value_from_env" in item for item in deployment.extra_env or ()):
+        from collector.fpm_forward.config import resolve_archived_generator_overrides
+
+        names = {item["name"] for item in deployment.extra_env}
+        resolved = resolve_archived_generator_overrides({"K8sConfig": {"extra_env": deployment.extra_env}})
+        deployment = deployment.model_copy(
+            update={"extra_env": [item for item in resolved["K8sConfig"]["extra_env"] if item["name"] in names]}
+        )
+    sensitive_values = tuple(item["value"] for item in deployment.extra_env or ())
+    sensitive_names = tuple(item["name"] for item in deployment.extra_env or ())
+    run = partial(_run, sensitive_values=sensitive_values, sensitive_names=sensitive_names)
     if deployment.executor == "slurm":
         if not os.environ.get("SLURM_JOB_ID"):
             raise ValueError("runtime version detection requires a caller-owned Slurm allocation")
@@ -52,7 +110,13 @@ def detect_runtime_versions(deployment: FPMDeployment) -> dict[str, str]:
         ]
         if deployment.container_mount:
             command.append("--container-mounts=" + ",".join(deployment.container_mount))
-        output = _run([*command, "python3", "-c", _PROBE])
+        environment = "".join(
+            f"export {item['name']}={shlex.quote(item['value'])}\n" for item in deployment.extra_env or ()
+        )
+        output = run(
+            [*command, "bash", "-c", "set -e; source /dev/stdin; exec python3 -c " + shlex.quote(_PROBE)],
+            payload=environment,
+        )
     else:
         name = "ais-fpm-version-" + uuid.uuid4().hex[:12]
         namespace = deployment.namespace or "default"
@@ -73,16 +137,76 @@ def detect_runtime_versions(deployment: FPMDeployment) -> dict[str, str]:
                 ],
             },
         }
+        if deployment.extra_env:
+            manifest["spec"]["containers"][0]["env"] = [
+                {**item, "value": item["value"].replace("$", "$$")} for item in deployment.extra_env
+            ]
+        prefix = ["kubectl", "--namespace", namespace]
+        if deployment.model_cache:
+            # Collection mounts the entire PVC; the optional third component
+            # selects the model directory within it, not a volume subPath.
+            parts = deployment.model_cache.split(":")
+            # A GPU-free probe must never become a delayed-binding PVC's
+            # first consumer. The collection workload must establish its
+            # GPU/volume topology before this metadata-only Pod can mount it.
+            claim = json.loads(run([*prefix, "get", "pvc", parts[0], "-o", "json"]))
+            if claim.get("status", {}).get("phase") != "Bound" or not claim.get("spec", {}).get("volumeName"):
+                raise ValueError(
+                    "runtime version probe requires a model-cache PVC already bound for the collection GPU topology; "
+                    "initialize it with the collection workload before probing"
+                )
+            modes = claim.get("spec", {}).get("accessModes", [])
+            if "ReadWriteMany" not in modes:
+                if modes != ["ReadWriteOnce"]:
+                    raise ValueError("runtime version probe requires a ReadWriteMany or ReadWriteOnce model-cache PVC")
+                # RWO shares a volume only within one node. Retain the live
+                # consumer's node while leaving normal volume topology checks
+                # to the scheduler. RWOP cannot share a live consumer at all.
+                pods = json.loads(run([*prefix, "get", "pods", "-o", "json"]))["items"]
+                consumers = [
+                    pod
+                    for pod in pods
+                    if pod.get("status", {}).get("phase") not in {"Succeeded", "Failed"}
+                    and any(
+                        volume.get("persistentVolumeClaim", {}).get("claimName") == parts[0]
+                        for volume in pod.get("spec", {}).get("volumes", [])
+                    )
+                ]
+                nodes = {pod.get("spec", {}).get("nodeName") for pod in consumers}
+                if nodes and (None in nodes or len(nodes) != 1):
+                    raise ValueError(
+                        "runtime version probe cannot establish one node for the ReadWriteOnce PVC consumers"
+                    )
+                if nodes:
+                    manifest["spec"]["affinity"] = {
+                        "nodeAffinity": {
+                            "requiredDuringSchedulingIgnoredDuringExecution": {
+                                "nodeSelectorTerms": [
+                                    {
+                                        "matchFields": [
+                                            {"key": "metadata.name", "operator": "In", "values": sorted(nodes)}
+                                        ]
+                                    }
+                                ]
+                            }
+                        }
+                    }
+            manifest["spec"]["volumes"] = [{"name": "model-cache", "persistentVolumeClaim": {"claimName": parts[0]}}]
+            manifest["spec"]["containers"][0]["volumeMounts"] = [
+                {
+                    "name": "model-cache",
+                    "mountPath": parts[1] if len(parts) > 1 and parts[1] else "/workspace/model_cache",
+                }
+            ]
         if deployment.image_pull_secret:
             manifest["spec"]["imagePullSecrets"] = [{"name": deployment.image_pull_secret}]
-        prefix = ["kubectl", "--namespace", namespace]
         created = False
         try:
-            _run([*prefix, "create", "-f", "-"], payload=json.dumps(manifest))
+            run([*prefix, "create", "-f", "-"], payload=json.dumps(manifest))
             created = True
             # Waiting for termination covers both success and a missing package.
             try:
-                _run(
+                run(
                     [
                         *prefix,
                         "wait",
@@ -93,7 +217,7 @@ def detect_runtime_versions(deployment: FPMDeployment) -> dict[str, str]:
                 )
             except ValueError as wait_error:
                 try:
-                    status = json.loads(_run([*prefix, "get", "pod", name, "-o", "json"])).get("status", {})
+                    status = json.loads(run([*prefix, "get", "pod", name, "-o", "json"])).get("status", {})
                     containers = status.get("initContainerStatuses", []) + status.get("containerStatuses", [])
                     problems = [item.get("state", {}).get("waiting", {}) for item in containers]
                     problems.extend(item for item in status.get("conditions", []) if item.get("status") == "False")
@@ -105,16 +229,18 @@ def detect_runtime_versions(deployment: FPMDeployment) -> dict[str, str]:
                 except (AttributeError, TypeError, ValueError):
                     detail = ""
                 if detail:
+                    detail = _redact_diagnostic(detail, sensitive_values, sensitive_names)
                     raise ValueError(f"{wait_error}; pod status: {detail}") from wait_error
                 raise
-            output = _run([*prefix, "logs", name])
-            status = json.loads(_run([*prefix, "get", "pod", name, "-o", "json"]))
+            output = run([*prefix, "logs", name])
+            status = json.loads(run([*prefix, "get", "pod", name, "-o", "json"]))
             terminated = status["status"]["containerStatuses"][0]["state"]["terminated"]
             if terminated["exitCode"] != 0:
-                raise ValueError(f"collection image runtime version detection failed: {output.strip()}")
+                diagnostic = _redact_diagnostic(output.strip(), sensitive_values, sensitive_names)
+                raise ValueError(f"collection image runtime version detection failed: {diagnostic}")
         finally:
             if created:
-                _run([*prefix, "delete", "pod", name, "--ignore-not-found", "--wait=false"])
+                run([*prefix, "delete", "pod", name, "--ignore-not-found", "--wait=false"])
     markers = (_MARKER, "AISIMULATE_RUNTIME_VERSION=")
     lines = [line[len(marker) :] for line in output.splitlines() for marker in markers if line.startswith(marker)]
     if len(lines) != 1:
@@ -130,7 +256,14 @@ def detect_runtime_versions(deployment: FPMDeployment) -> dict[str, str]:
 
 
 def _deployment_identity(deployment: FPMDeployment | None) -> dict:
-    return (deployment or FPMDeployment()).model_dump(mode="json", exclude_none=True, exclude={"dynamo_version"})
+    payload = (deployment or FPMDeployment()).model_dump(mode="json", exclude_none=True, exclude={"dynamo_version"})
+    if "extra_env" in payload:
+        from collector.fpm_forward.config import archive_generator_overrides
+
+        names = {item["name"] for item in payload["extra_env"]}
+        archived = archive_generator_overrides({"K8sConfig": {"extra_env": payload["extra_env"]}})
+        payload["extra_env"] = [item for item in archived["K8sConfig"]["extra_env"] if item["name"] in names]
+    return payload
 
 
 def runtime_deployment(deployment: FPMDeployment | None, output_dir: str | Path) -> FPMDeployment | None:
@@ -155,9 +288,13 @@ def runtime_deployment(deployment: FPMDeployment | None, output_dir: str | Path)
     frozen = FPMDeployment.model_validate(value["deployment"])
     if deployment is not None:
         selected = deployment.model_dump(exclude_none=True, exclude_defaults=True, exclude={"dynamo_version"})
-        for key, item in selected.items():
-            if frozen.model_dump()[key] != item:
+        supplied_identity = _deployment_identity(deployment)
+        frozen_identity = _deployment_identity(frozen)
+        for key in selected:
+            if frozen_identity.get(key) != supplied_identity[key]:
                 raise ValueError("collection deployment differs from the runtime version probe; use a fresh plan")
+        if "extra_env" in selected:
+            frozen = frozen.model_copy(update={"extra_env": deployment.extra_env})
     if deployment is not None and deployment.dynamo_version is not None:
         frozen = frozen.model_copy(update={"dynamo_version": deployment.dynamo_version})
     return frozen
@@ -181,7 +318,9 @@ def bound_runtime_request(
     value = json.loads(binding.read_text())
     if value.get("source_request_id") != request_id(request):
         raise ValueError("runtime version binding belongs to a different registration")
-    if deployment is not None and value.get("deployment") != _deployment_identity(deployment):
+    if deployment is not None and _deployment_identity(
+        FPMDeployment.model_validate(value["deployment"])
+    ) != _deployment_identity(deployment):
         raise ValueError("collection deployment differs from the runtime version probe; use a fresh plan")
     resolved_root = root / "runtime-resolved"
     if resolved_root.is_symlink():

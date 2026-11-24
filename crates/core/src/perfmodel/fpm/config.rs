@@ -658,7 +658,7 @@ impl ForwardPassPerfModelConfig {
         {
             self.speculation = None;
         }
-        let registered = if self.fpm_profile.is_some() {
+        let (registered, supports_sol) = if self.fpm_profile.is_some() {
             self.estimator_config
                 .fpm_interpolation
                 .validate_profile_options()?;
@@ -682,6 +682,14 @@ impl ForwardPassPerfModelConfig {
             #[cfg(feature = "python")]
             {
                 let facts = crate::py::validate_forward_pass_profile(&self)?;
+                if self.estimation_mode == EstimationMode::FpmInterpolation
+                    && self.estimator_config.fpm_interpolation.method
+                        == super::FpmInterpolationMethod::Sol
+                {
+                    if let Some(reason) = facts.unsupported_sol_reason {
+                        return Err(invalid_config(&reason));
+                    }
+                }
                 self.fpm_profile = Some(facts.profile);
                 self.gemm_quant_mode = Some(facts.gemm_quant_mode);
                 self.moe_quant_mode = Some(facts.moe_quant_mode);
@@ -700,21 +708,41 @@ impl ForwardPassPerfModelConfig {
                 {
                     self.fpm_resources()?;
                 }
-                Some(facts.registered)
+                // Auto must have a roofline for the observed state precision.
+                // Preserve explicit SOL's measured-hit/query-time contract:
+                // unsupported KDA transfer still fails at the operator boundary.
+                let supports_sol = facts.supports_sol
+                    && (self.estimator_config.fpm_interpolation.method
+                        != super::FpmInterpolationMethod::Auto
+                        || facts.supports_sol_state);
+                (Some(facts.registered), Some(supports_sol))
             }
             #[cfg(not(feature = "python"))]
             return Err(invalid_config(
                 "FPM profile validation requires the python feature",
             ));
         } else {
-            None
+            (None, None)
         };
-        self.estimator_config.fpm_interpolation.method = self
-            .estimator_config
-            .fpm_interpolation
-            .method
-            .resolve(registered)?;
-        if self.estimator_config.fpm_interpolation.method == super::FpmInterpolationMethod::Direct
+        self.estimator_config.fpm_interpolation.method =
+            self.estimator_config.fpm_interpolation.method.resolve(
+                if self.estimation_mode != EstimationMode::FpmInterpolation
+                    && self.estimator_config.fpm_interpolation.method
+                        == super::FpmInterpolationMethod::Sol
+                {
+                    // The op-level candidate does not use this roofline.
+                    // Auto validates it if selection reaches FPM compilation.
+                    None
+                } else {
+                    supports_sol
+                },
+            )?;
+        // An unused inner method cannot restrict op-level timing, including
+        // after normalized configuration round trips. Automatic selection
+        // checks this again at the direct compiler boundary if it attempts FPM.
+        if self.estimation_mode == EstimationMode::FpmInterpolation
+            && self.estimator_config.fpm_interpolation.method
+                == super::FpmInterpolationMethod::Direct
             && self.database_mode != DatabaseMode::Silicon
         {
             return Err(invalid_config(
@@ -2260,6 +2288,51 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("deployment_limits.context_length must be a positive integer")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "embed-python")]
+    fn explicit_profile_accepts_text_only_but_rejects_unrecorded_quantization() {
+        pyo3::Python::initialize();
+        let checkpoint = tempfile::tempdir().unwrap();
+        std::fs::write(
+            checkpoint.path().join("config.json"),
+            r#"{"architectures":["TestDecoderForCausalLM"]}"#,
+        )
+        .unwrap();
+        let model = checkpoint.path().to_str().unwrap();
+        let mut cfg = config(serde_json::json!({
+            "model": model, "system": "test_gpu", "backend_version": "0.27.0",
+            "estimation_mode": "fpm_interpolation",
+            "fpm_profile": {
+                "schema_version": 1, "model": model, "model_revision": "test-v1",
+                "architecture": "TestDecoderForCausalLM", "context_length": 4096,
+                "num_experts": 1, "provenance": "Synthetic validation fixture",
+                "deployments": [{
+                    "system": "test_gpu", "backend": "vllm", "backend_version": "0.27.0",
+                    "tp": 1, "dp": 1, "moe_tp": 1, "moe_ep": 1,
+                    "gemm_quant_mode": "bfloat16", "moe_quant_mode": "bfloat16",
+                    "fmha_quant_mode": "bfloat16", "comm_quant_mode": "half", "kv_cache_dtype": "fp8",
+                    "resources": {
+                        "weights_bytes": 100, "activations_bytes": 20, "runtime_overhead_bytes": 30,
+                        "comm_overhead_bytes": 10, "cache_layout": "linear", "kv_bytes_per_token": 10,
+                        "max_num_tokens": 4096, "max_batch_size": 32,
+                        "provenance": "Synthetic rank-local resource fixture"
+                    }
+                }]
+            },
+            "estimator_config": {"fpm_interpolation": {"text_only": true}}
+        }));
+        cfg.clone().resolve().unwrap();
+        cfg.estimator_config
+            .fpm_interpolation
+            .unrecorded_quant_modes = vec![super::super::UnrecordedFpmQuantMode::Fmha];
+        assert!(
+            cfg.resolve()
+                .unwrap_err()
+                .to_string()
+                .contains("fpm_profile does not support unrecorded_quant_modes")
         );
     }
 

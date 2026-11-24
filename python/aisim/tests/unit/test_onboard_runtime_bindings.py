@@ -425,6 +425,39 @@ def test_archived_controls_reject_malformed_deadlines_and_serving_changes(archiv
         runtime.collection_runtime_review(request, bindings[0])
 
 
+@pytest.mark.parametrize("collection_value", ["sharegpt", "random"])
+def test_probe_declared_content_control_must_match(split_collection, collection_value):
+    from collector.fpm_forward.runtime_probe import probe_generator_overrides, validate_collection_probe_launch
+
+    from aisim.support.runtime_collection import _collection_controls
+
+    _, bindings = split_collection
+    plan = load_repeatability_source(Path(bindings[0]["plan"]["path"]).parent)
+    launch = plan.runtime_launch
+    declared = {"name": "DYN_BENCH_PREFILL_CONTENT", "value": "sharegpt"}
+    launch["deployment"]["extra_env"] = [declared]
+    deployment = probe_generator_overrides(launch)
+    deployment["K8sConfig"]["extra_env"][0]["value"] = collection_value
+    cells, compared, changes = _collection_controls(plan.cells, deployment, launch["deployment"]["extra_env"])
+    assert not changes
+    arguments = dict(
+        model_path=plan.model_path,
+        system=plan.system,
+        backend=plan.backend,
+        backend_version=plan.capability.aic_database_version,
+        cells=cells,
+        options=plan.options,
+        profile=plan.fpm_profile,
+        generator_overrides=compared,
+        phases=("prefill",),
+    )
+    if collection_value == "sharegpt":
+        validate_collection_probe_launch(launch, plan.runtime_instrumentation, **arguments)
+    else:
+        with pytest.raises(ValueError, match="deployment settings differ"):
+            validate_collection_probe_launch(launch, plan.runtime_instrumentation, **arguments)
+
+
 def test_legacy_launch_validation_remains_strict_on_collection_controls(archived_controls):
     from collector.fpm_forward.repeatability import load_repeatability_deployment
     from collector.fpm_forward.runtime_probe import validate_collection_probe_launch
@@ -548,6 +581,23 @@ def _change_records(binding, change):
             ref["sha256"] = _ref(path)["sha256"]
 
     _change_index(binding, apply)
+
+
+@pytest.mark.parametrize("identity", ["cell_id", "collector_attempt_id"])
+def test_onboarding_rejects_worker_from_another_native_retry(split_collection, identity):
+    request, bindings = split_collection
+    _review(request, bindings)
+    # The phase and launch manifest still name successful retry B. The saved,
+    # digest-matching worker evidence below belongs to A under the same parent.
+    assert runtime.verify_collection_runtime_bindings(request, bindings)["status"] == "complete"
+
+    def stale_worker(record):
+        if record["kind"] == "worker":
+            record[identity] = "previous-native-attempt-A"
+
+    _change_records(bindings[0], stale_worker)
+    with pytest.raises(ValueError, match=identity + " mismatch"):
+        runtime.verify_collection_runtime_bindings(request, bindings)
 
 
 @pytest.mark.parametrize(
@@ -1066,6 +1116,29 @@ def test_explicit_bindings_resolve_checkpoint_index_paths(split_collection, tmp_
 
     assert result["status"] == "complete"
     assert set(result["phases"]) == {"prefill", "decode"}
+
+
+def test_bound_phase_validates_and_records_one_index_snapshot(split_collection, monkeypatch):
+    request, bindings = split_collection
+    _review(request, bindings)
+    binding = bindings[0]
+    index = Path(binding["observations"]["path"])
+    original_read = Path.read_bytes
+    reads = 0
+
+    def replace_index(path):
+        nonlocal reads
+        data = original_read(path)
+        if path == index:
+            reads += 1
+            path.write_text("{}")
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", replace_index)
+    result = runtime.verify_collection_runtime_bindings(request, bindings)
+    assert reads == 1
+    assert binding["observations"] in result["inputs"]
+    assert result["phases"][binding["phase"]]["provenance"]["observations_index"] == binding["observations"]
 
 
 @pytest.mark.parametrize("change", ["mismatch", "escape", "symlink_escape", "symlink_file", "hash"])

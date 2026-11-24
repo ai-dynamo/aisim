@@ -1217,6 +1217,326 @@ def test_text_only_kimi_profile_preserves_encoder_weights_and_dcp_identity():
     assert resident == prefill.get_weights() + sum(op.get_weights() for op in model.encoder_ops)
 
 
+@pytest.mark.parametrize("attention_backend", ["flashmla", "trtllm_mla"])
+@pytest.mark.parametrize(
+    "state_dtype,conv_dtype",
+    [
+        ("float32", "bfloat16"),
+        ("auto", "bfloat16"),
+        ("unaudited_auto", "bfloat16"),
+        ("bfloat16", "bfloat16"),
+        (None, "bfloat16"),
+        ("float32", "float32"),
+    ],
+)
+@pytest.mark.parametrize("provenance_kind", ["probe", "collection", "finalized", "finalized_references"])
+@pytest.mark.parametrize("model_location", ["local", "hub"])
+def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(
+    tmp_path, monkeypatch, attention_backend, state_dtype, conv_dtype, provenance_kind, model_location
+):
+    # Extend the repository's K3 fixture with independently declared sparse
+    # geometry. Neither this config nor the synthetic timing anchors are a
+    # redistributed K3.1 checkpoint or a measurement/qualification claim.
+    from copy import deepcopy
+
+    from aisimulate.sdk.utils import get_model_config_from_model_path
+
+    raw = deepcopy(get_model_config_from_model_path("moonshotai/Kimi-K3")["raw_config"])
+    raw["architectures"] = ["KimiK31ForConditionalGeneration"]
+    raw["text_config"]["dsa_config"] = {
+        "dsa_layers": list(raw["text_config"]["linear_attn_config"]["full_attn_layers"]),
+        "index_topk": 2048,
+        "index_head_dim": 128,
+        "index_num_heads": 32,
+        "index_rope_dim": 0,
+        "index_k_norm_type": "layernorm",
+        "index_topk_freq": 1,
+        "index_skip_topk_offset": 1,
+    }
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(json.dumps(raw))
+    if model_location == "hub":
+        from aisimulate_core.sdk import fpm_profile, utils
+
+        checkpoint = "test/pinned-k31"
+        fpm_profile._load_pinned_checkpoint_config.cache_clear()
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+        def pinned_download(model, filename, *, revision="main", raise_on_404=True):
+            assert model == checkpoint
+            assert revision == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", (
+                "graph construction read an unpinned/default revision"
+            )
+            if filename == "config.json":
+                return deepcopy(raw)
+            if filename == "preprocessor_config.json":
+                return {"patch_limit_on_one_side": 384}
+            return None
+
+        monkeypatch.setattr(utils, "_download_hf_json", pinned_download)
+        # Processor loading has its own assertion; the timing fixture below
+        # remains language-only and does not depend on encoder execution.
+        parsed = get_model_config_from_model_path(checkpoint, model_revision="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        assert parsed["extra_params"].vision_config.max_patches_per_side == 384
+    systems = tmp_path / "systems"
+    systems.mkdir()
+    shutil.copyfile(Path(_CORE_SYSTEMS) / f"{SYSTEM}.yaml", systems / f"{SYSTEM}.yaml")
+    identity = {
+        "tp": "8",
+        "moe_tp": "8",
+        "moe_ep": "1",
+        "fmha_quant_mode": "bfloat16",
+        "moe_quant_mode": "w4a16_mxfp4",
+        "kv_cache_dtype": "fp8",
+        "attention_backend": attention_backend,
+    }
+    rows = [
+        _row("prefill", 1, 128, 0, 7.0, model_path=str(checkpoint), identity=identity),
+        _row("decode", 1, 0, 128, 3.0, model_path=str(checkpoint), identity=identity),
+        _row("decode", 1, 0, 512, 5.0, model_path=str(checkpoint), identity=identity),
+        _row("decode", 1, 0, 4096, 9.0, model_path=str(checkpoint), identity=identity),
+        _row("decode", 4, 0, 512, 10.0, model_path=str(checkpoint), identity=identity),
+        _row("decode", 4, 0, 4096, 18.0, model_path=str(checkpoint), identity=identity),
+    ]
+    parquet = _write_pair(str(tmp_path / "measured"), rows)
+    # Same envelope as the native probe and the final collection importer;
+    # values are synthetic declarations, not hardware observations.
+    state_provenance = {
+        "runtime": json.loads(
+            (Path(__file__).parents[3] / "collector/fpm_forward/runtime/vllm-kimi-k31.example.json").read_text()
+        )["runtime"],
+        "runtime_settings": {"cache_config": {"mamba_cache_dtype": conv_dtype, "mamba_ssm_cache_dtype": state_dtype}},
+    }
+    if state_dtype == "unaudited_auto":
+        state_provenance["runtime_settings"]["cache_config"]["mamba_ssm_cache_dtype"] = "auto"
+        # Keep the reported version, but alter the actual runtime's source map.
+        state_provenance["runtime"]["source_files"]["vllm/model_executor/models/config.py"] = "0" * 64
+    if provenance_kind == "collection":
+        state_provenance = {
+            "source": "bound_collection_phases",
+            "phases": {"prefill": state_provenance, "decode": state_provenance},
+        }
+    profile = {
+        "schema_version": 1,
+        "model": str(checkpoint),
+        "model_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "architecture": "KimiLinearForCausalLM",
+        "context_length": 4096,
+        "num_experts": 896,
+        "provenance": "Synthetic backend-identity fixture; timing and memory are not hardware evidence.",
+        "deployments": [
+            {
+                "system": SYSTEM,
+                "backend": BACKEND,
+                "backend_version": VERSION,
+                "tp": 8,
+                "dp": 1,
+                "moe_tp": 8,
+                "moe_ep": 1,
+                "gemm_quant_mode": "bfloat16",
+                "moe_quant_mode": "w4a16_mxfp4",
+                "fmha_quant_mode": "bfloat16",
+                "comm_quant_mode": "half",
+                "kv_cache_dtype": "fp8",
+                "attention_backend": attention_backend,
+                "resources": {
+                    "cache_layout": "linear",
+                    "kv_bytes_per_token": 1,
+                    "max_num_tokens": 128,
+                    "max_batch_size": 4,
+                    # Synthetic runtime settings, not native measurement or
+                    # a live-state accuracy claim. Memory is not queried here.
+                    "runtime_memory": {
+                        "kv_cache_bytes": 1024,
+                        "gpu_memory_utilization": 0.8,
+                        "max_model_len": 4096,
+                        "provenance": json.dumps(state_provenance),
+                    },
+                    "provenance": "Synthetic timing and dtype fixture; memory is not queried.",
+                },
+            }
+        ],
+    }
+    if provenance_kind.startswith("finalized"):
+        from aisimulate.support.finalization import _merge_resources
+
+        # Exercise the real finalizer's output, including its source-reference
+        # form, rather than constructing a lookalike provenance envelope.
+        observation = deepcopy(profile["deployments"][0]["resources"])
+        observation.pop("kv_bytes_per_token")
+        group = {
+            "name": "synthetic-state",
+            "kind": "state",
+            "num_layers": 1,
+            "block_size_tokens": 4096,
+            "page_size_bytes": 1024,
+            "blocks_per_request": 1,
+        }
+        observation.update(cache_layout="grouped", cache_groups=[group])
+        evidence = {
+            **state_provenance,
+            "artifacts": [
+                {
+                    "path": "synthetic-worker.json",
+                    "sha256": "a" * 64,
+                    "evidence": {"kind": "worker", "cache": {"groups": [group]}},
+                }
+            ],
+        }
+        observation["runtime_memory"]["provenance"] = json.dumps(evidence)
+        profile["deployments"][0]["resources"] = _merge_resources(
+            [observation, deepcopy(observation)], {}, source_references=provenance_kind == "finalized_references"
+        )
+    config = ForwardPassPerfModelConfig(
+        model=str(checkpoint),
+        system=SYSTEM,
+        backend=BACKEND,
+        backend_version=VERSION,
+        worker_type="aggregated",
+        tp=8,
+        moe_tp_size=8,
+        moe_ep_size=1,
+        estimation_mode="fpm_interpolation",
+        fallback_policy="deny",
+        fpm_profile=profile,
+        systems_paths=(str(systems),),
+        estimator_config={"fpm_interpolation": {"method": "sol", "text_only": True, "fpm_parquet_path": parquet}},
+    )
+    if conv_dtype == "float32" or state_dtype == "unaudited_auto":
+        diagnostic = (
+            "FP32 convolution state; .*'direct' or 'auto'" if conv_dtype == "float32" else "SOL interpolation requires"
+        )
+        with pytest.raises(ValueError, match=diagnostic):
+            RustForwardPassPerfModel.best_available(config)
+        from dataclasses import replace
+
+        config = replace(
+            config,
+            estimator_config={"fpm_interpolation": {"method": "auto", "text_only": True, "fpm_parquet_path": parquet}},
+        )
+    model = RustForwardPassPerfModel.best_available(config)
+    try:
+        resolved = model.diagnostics()["provenance"]["config"]
+        assert resolved["attention_backend"] == attention_backend
+        assert resolved["estimator_config"]["fpm_interpolation"]["text_only"] is True
+        restored = RustForwardPassPerfModel.best_available(ForwardPassPerfModelConfig(**resolved))
+        try:
+            for predictor in (model, restored):
+                assert predictor.estimate_forward_pass_time_ms(
+                    {
+                        "scheduled_requests": {
+                            "num_prefill_requests": 1,
+                            "sum_prefill_tokens": 128,
+                        }
+                    }
+                ) == pytest.approx(7.0)
+                assert predictor.estimate_forward_pass_time_ms(
+                    {
+                        "scheduled_requests": {
+                            "num_decode_requests": 1,
+                            "sum_decode_kv_tokens": 128,
+                        }
+                    }
+                ) == pytest.approx(3.0)
+                # Same-batch interpolation stays on the measured curve.
+                estimate = predictor.estimate_forward_pass_time_ms(
+                    {
+                        "scheduled_requests": {
+                            "num_decode_requests": 1,
+                            "sum_decode_kv_tokens": 256,
+                        }
+                    }
+                )
+                assert 3.0 < estimate < 5.0
+                # Batch 3 has no measured curve or adjacent capture-rung pair.
+                # Transfer utilization from batches 1 and 4 at total KV=4096:
+                # their per-request contexts (4096 and 1024) straddle top-k.
+                # This requires KDA SOL and distinguishes native DSA layouts.
+                transfer_metrics = [{"scheduled_requests": {"num_decode_requests": 3, "sum_decode_kv_tokens": 4096}}]
+                if conv_dtype == "float32" or state_dtype == "unaudited_auto":
+                    assert resolved["estimator_config"]["fpm_interpolation"]["method"] == "direct"
+                    # Linear interpolation between measured B1=9ms and B4=18ms.
+                    assert predictor.estimate_forward_pass_time_ms(transfer_metrics) == pytest.approx(15.0)
+                    continue
+                if state_dtype not in {"float32", "auto"}:
+                    with pytest.raises(PerfDataNotAvailableError, match="KDA SOL requires observed float32"):
+                        predictor.estimate_forward_pass_time_ms(transfer_metrics)
+                    continue
+                transferred = predictor.estimate_forward_pass_time_ms(transfer_metrics)
+                # Independent hand ledger, in ms on H200 (HBM=4.8e12 B/s,
+                # link=450e9 B/s), summed from this fixture's graph geometry:
+                # batch        other ops          KDA       DSA FlashMLA / TRT
+                #   1       5.236040377777778    .02362560    .50655744 / .50573824
+                #   3       6.543375746666666    .07087680    .51336310 / .51172510
+                #   4       7.197043431111110    .09450240    .51341312 / .51177472
+                # Other ops sum memory-bound GEMMs (2*(b*n+b*k+n*k) bytes),
+                # routed MoE (0.5*(16*b*3584*2+16*b*3072*3/8
+                # +3584*3072*3/8*16*b) bytes per MoE layer), embedding/norm
+                # byte counts and ring allreduces (4*b*hidden*7/8/link seconds),
+                # with the model's layer multiplicities; PP1 costs zero.
+                # KDA: 69 layers * b*(10*1536+2*12*128*128*4+3*1536*6*2) bytes / HBM.
+                # The last term is the fused four-tap BF16 convolution update.
+                # DSA: 24*(96272384+3145728+132*b*s+entry*b*min(s,2048)+9216*b)
+                # bytes / HBM, including 3,145,728 absorbed-BMM weight bytes.
+                # s=floor(4096/b), entry=656 (FlashMLA) or 576
+                # (TRT). This extends the independent projection/cache ledger
+                # in perf_database/dsa.rs::kimi_k31_fp8_sol_uses_executed_cache_layout.
+                # All terms above convert seconds to ms with *1000.
+                # Let S_b be the row sum. Transfer utilization, not latency:
+                # w_i=1/((log2(i)-log2(3))**2+1e-12), i in {1,4};
+                # result=S_3*(w_1+w_4)/(w_1*S_1/9+w_4*S_4/18).
+                # The 9/18 ms anchors are synthetic input, separate from SOL.
+                # A plain latency interpolation, omitted KDA roofline, or a
+                # shared DSA cache layout cannot satisfy these values.
+                expected_transfer = {
+                    "flashmla": 15.949110703911963,
+                    "trtllm_mla": 15.948693797344529,
+                }
+                assert transferred == pytest.approx(expected_transfer[attention_backend], rel=1e-10)
+            # Direct interpolation never asks for a KDA roofline, even with
+            # explicit BF16 or absent runtime dtype evidence.
+            resolved["estimator_config"]["fpm_interpolation"]["method"] = "direct"
+            direct = RustForwardPassPerfModel.best_available(ForwardPassPerfModelConfig(**resolved))
+            try:
+                assert direct.estimate_forward_pass_time_ms(
+                    [{"scheduled_requests": {"num_decode_requests": 1, "sum_decode_kv_tokens": 256}}]
+                ) == pytest.approx(3.0 + 2.0 / 3.0)
+            finally:
+                direct.close()
+            resolved["estimator_config"]["fpm_interpolation"]["method"] = "auto"
+            automatic = RustForwardPassPerfModel.best_available(ForwardPassPerfModelConfig(**resolved))
+            try:
+                expected_method = "sol" if state_dtype in {"float32", "auto"} and conv_dtype == "bfloat16" else "direct"
+                auto_config = automatic.diagnostics()["provenance"]["config"]
+                assert auto_config["estimator_config"]["fpm_interpolation"]["method"] == expected_method
+                # Missing/BF16 state still admits an unmeasured query through
+                # direct interpolation, without invoking the KDA roofline.
+                if expected_method == "direct":
+                    # Linear interpolation between measured B1=9ms and B4=18ms.
+                    assert automatic.estimate_forward_pass_time_ms(transfer_metrics) == pytest.approx(15.0)
+            finally:
+                automatic.close()
+        finally:
+            restored.close()
+    finally:
+        model.close()
+
+
+@pytest.mark.parametrize("dtype", [None, "float32", "bfloat16"])
+def test_kda_recurrent_dtype_survives_native_pickle_and_spec_roundtrip(dtype):
+    import pickle
+
+    import aisimulate_core
+    from aisimulate_core.sdk.operations import KDAKernel
+
+    op = KDAKernel("kda", 1, "flashkda_fwd", "context", 4096, 16, 128, 16, 128, 4, recurrent_state_dtype=dtype)
+    for restored in (pickle.loads(pickle.dumps(op)), aisimulate_core.op_from_spec_json(op._spec_json())):
+        assert restored._recurrent_state_dtype == dtype
+        assert json.loads(restored._spec_json())["Kda"]["recurrent_state_dtype"] == dtype
+
+
 @pytest.fixture
 def kimi_fpm_profile(tmp_path, request):
     from aisim_core.sdk import ForwardPassPerfModelConfig
@@ -1274,6 +1594,95 @@ def kimi_fpm_profile(tmp_path, request):
             "correction": {"enabled": False},
         },
     )
+
+
+def test_kimi_k3_unmeasured_batch_uses_direct_interpolation(tmp_path):
+    from aisimulate.sdk.utils import get_model_config_from_model_path
+
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(
+        json.dumps(get_model_config_from_model_path("moonshotai/Kimi-K3")["raw_config"])
+    )
+    identity = {
+        "tp": "8",
+        "moe_tp": "8",
+        "moe_ep": "1",
+        "fmha_quant_mode": "bfloat16",
+        "moe_quant_mode": "w4a16_mxfp4",
+        "kv_cache_dtype": "fp8",
+        "attention_backend": "FLASHINFER_MLA",
+    }
+    parquet = _write_pair(
+        str(tmp_path / "systems" / "data" / SYSTEM / BACKEND / VERSION),
+        [_row("prefill", 1, 128, 0, 7.0, model_path=str(checkpoint), identity=identity)]
+        + [
+            _row("decode", batch, 0, 128, latency, model_path=str(checkpoint), identity=identity)
+            for batch, latency in [(1, 3.0), (4, 9.0)]
+        ],
+    )
+    profile = {
+        "schema_version": 1,
+        "model": str(checkpoint),
+        "model_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "architecture": "KimiLinearForCausalLM",
+        "context_length": 4096,
+        "num_experts": 896,
+        "provenance": "Synthetic K3 interpolation fixture; no hardware qualification.",
+        "deployments": [
+            {
+                "system": SYSTEM,
+                "backend": BACKEND,
+                "backend_version": VERSION,
+                "tp": 8,
+                "dp": 1,
+                "moe_tp": 8,
+                "moe_ep": 1,
+                "gemm_quant_mode": "bfloat16",
+                "moe_quant_mode": "w4a16_mxfp4",
+                "fmha_quant_mode": "bfloat16",
+                "comm_quant_mode": "half",
+                "kv_cache_dtype": "fp8",
+                "attention_backend": "FLASHINFER_MLA",
+                "resources": {
+                    "cache_layout": "linear",
+                    "kv_bytes_per_token": 1,
+                    "max_num_tokens": 128,
+                    "max_batch_size": 4,
+                    "provenance": "Synthetic timing-only fixture; memory unresolved and not queried.",
+                },
+            }
+        ],
+    }
+    systems = tmp_path / "systems"
+    systems.mkdir(exist_ok=True)
+    shutil.copyfile(Path(_CORE_SYSTEMS) / f"{SYSTEM}.yaml", systems / f"{SYSTEM}.yaml")
+    config = ForwardPassPerfModelConfig(
+        model=str(checkpoint),
+        system=SYSTEM,
+        backend=BACKEND,
+        backend_version=VERSION,
+        systems_paths=(str(systems),),
+        worker_type="aggregated",
+        tp=8,
+        moe_tp_size=8,
+        moe_ep_size=1,
+        estimation_mode="fpm_interpolation",
+        fallback_policy="deny",
+        fpm_profile=profile,
+        estimator_config={"fpm_interpolation": {"text_only": True, "fpm_parquet_path": parquet}},
+    )
+    model = RustForwardPassPerfModel.best_available(config)
+    try:
+        method = model.diagnostics()["provenance"]["config"]["estimator_config"]["fpm_interpolation"]["method"]
+        assert method == "direct"
+        # Synthetic measured batches 1=3 ms and 4=9 ms: direct linear
+        # interpolation at batch 3 gives 3 + (3-1)/(4-1)*(9-3) = 7 ms.
+        assert model.estimate_forward_pass_time_ms(
+            [{"scheduled_requests": {"num_decode_requests": 3, "sum_decode_kv_tokens": 128}}]
+        ) == pytest.approx(7.0)
+    finally:
+        model.close()
 
 
 @pytest.mark.parametrize("kimi_fpm_profile", [None, 1, 8], indirect=True)

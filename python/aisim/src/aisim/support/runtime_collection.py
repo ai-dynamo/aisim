@@ -7,13 +7,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
+import os
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
-
-from aisim.fpm_contract import FPM_FINALIZATION_TIMEOUT_ENV
 
 from .schema import SupportRequest
 
@@ -25,19 +23,20 @@ def _file(path: str | Path, *, model_config: bool = False) -> dict[str, str]:
     return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
-def _read(reference: dict[str, str], *, plan: bool = False) -> tuple[Path, dict[str, Any]]:
-    from collector.fpm_forward.runtime_instrumentation import read_json, validate_sha256
+def _read(reference: dict[str, str], *, plan: bool = False) -> tuple[Path, dict[str, Any], bytes]:
+    from collector.fpm_forward.runtime_instrumentation import read_json_snapshot, validate_sha256
     from collector.fpm_forward.runtime_memory import validate_saved_plan
 
     path = Path(reference["path"]).absolute()
-    actual = _file(path)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"runtime evidence must be a regular file: {path}")
     validate_sha256(reference["sha256"], "bound collection plan" if plan else "bound runtime evidence")
-    document = read_json(path)
+    document, raw = read_json_snapshot(path)
     if plan:
         validate_saved_plan(document)
-    if (document["sha256"] if plan else actual["sha256"]) != reference["sha256"]:
+    if (document["sha256"] if plan else hashlib.sha256(raw).hexdigest()) != reference["sha256"]:
         raise ValueError(f"bound {'plan' if plan else 'artifact'} hash mismatch: {path}")
-    return path, document
+    return path, document, raw
 
 
 def checkpoint_observation_index(checkpoint_path: Path, checkpoint: dict[str, Any]) -> Path:
@@ -80,8 +79,9 @@ def _source(request: SupportRequest) -> dict[str, Any]:
     return source
 
 
-def _collection_controls(cells, deployment):
+def _collection_controls(cells, deployment, probe_environment=()):
     """Separate recorded collection controls for memory-only review, without editing plans."""
+    from collector.fpm_forward.config import COLLECTION_CONTROL_NAMES, CONTENT_MODES, validate_collection_control
     from collector.fpm_forward.planner import BackendPolicy
 
     from aisim.generator.builders.fpm_builder import _benchmark_wait_timeout_seconds
@@ -123,16 +123,7 @@ def _collection_controls(cells, deployment):
     deployment = deepcopy(deployment)
     k8s = deployment.get("K8sConfig", {})
     environment = k8s.get("extra_env", [])
-    known = {
-        "DYN_BENCH_CONTENT_SEED",
-        "DYN_BENCH_PREFILL_CONTENT",
-        "DYN_BENCH_POOL_TAG",
-        "DYN_BENCH_GIANT_KV_THRESHOLD",
-        "DYN_BENCH_GIANT_KV_REPEATS",
-        "DYN_FORWARDPASS_METRIC_PORT",
-        "FPM_RESULT_WAIT_TIMEOUT_SECONDS",
-        FPM_FINALIZATION_TIMEOUT_ENV,
-    }
+    probe_entries = {item["name"]: item for item in probe_environment}
     retained, seen = [], set()
     if not isinstance(environment, list):
         raise ValueError("collection environment must be a list")
@@ -140,9 +131,24 @@ def _collection_controls(cells, deployment):
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
             raise ValueError("collection environment requires named entries")
         name = item["name"]
-        if name not in known:
+        if name not in COLLECTION_CONTROL_NAMES:
             retained.append(item)
             continue
+        if set(item) == {"name", "value_from_env", "value_sha256"} and item["value_from_env"] == name:
+            # Older archives stored a digest even for public controls. Recover
+            # recognized enum/default values or verify the original public input.
+            candidates = [os.environ.get(name), *CONTENT_MODES, "zeros", "", "0", "1"]
+            value = next(
+                (
+                    v
+                    for v in candidates
+                    if v is not None and hashlib.sha256(v.encode()).hexdigest() == item["value_sha256"]
+                ),
+                None,
+            )
+            if value is None:
+                raise ValueError(f"historical collection control {name} requires the original value")
+            item = {"name": name, "value": value}
         value = item.get("value")
         if (
             name in seen
@@ -152,21 +158,16 @@ def _collection_controls(cells, deployment):
         ):
             raise ValueError(f"collection control {name} requires one literal string value")
         seen.add(name)
-        if name == "DYN_BENCH_PREFILL_CONTENT" and value not in {"random", "sharegpt", "sharegpt_chain", "zeros"}:
-            raise ValueError(f"collection control {name} has an unsupported content mode")
-        if name in {"DYN_BENCH_GIANT_KV_THRESHOLD", "DYN_BENCH_GIANT_KV_REPEATS"} and not re.fullmatch(
-            r"0|[1-9][0-9]*", value
-        ):
-            raise ValueError(f"collection control {name} must be a nonnegative integer")
-        if name in {"DYN_FORWARDPASS_METRIC_PORT", "FPM_RESULT_WAIT_TIMEOUT_SECONDS", FPM_FINALIZATION_TIMEOUT_ENV}:
-            maximum = {
-                "DYN_FORWARDPASS_METRIC_PORT": 65535,
-                "FPM_RESULT_WAIT_TIMEOUT_SECONDS": 43200,
-                FPM_FINALIZATION_TIMEOUT_ENV: 3600,
-            }[name]
-            if not re.fullmatch(r"[1-9][0-9]*", value) or len(value) > len(str(maximum)) or int(value) > maximum:
-                raise ValueError(f"collection control {name} must be an integer from 1 through {maximum}")
-        changes.extend(_differences({"missing": True}, value, "/collection_controls/environment/" + name))
+        validate_collection_control(name, value)
+        if name in probe_entries:
+            expected = probe_entries[name]
+            # Preserve the probe representation for historical digest-bound controls.
+            if expected.get("value_sha256") == hashlib.sha256(value.encode()).hexdigest():
+                retained.append(expected)
+            else:
+                retained.append(item)
+        else:
+            changes.extend(_differences({"missing": True}, value, "/collection_controls/environment/" + name))
     if "extra_env" in k8s:
         k8s["extra_env"] = retained
     return tuple(compared_cells), deployment, changes
@@ -176,7 +177,7 @@ def _plan(request: SupportRequest, binding: dict[str, Any], source: dict[str, An
     from collector.fpm_forward.repeatability import load_repeatability_deployment, load_repeatability_source
     from collector.fpm_forward.runtime_probe import validate_collection_probe_launch
 
-    path, saved = _read(binding["plan"], plan=True)
+    path, saved, _ = _read(binding["plan"], plan=True)
     if path.name != "collection-plan.json":
         raise ValueError("bound runtime plan must be the archived collection-plan.json")
     plan = load_repeatability_source(path.parent)
@@ -208,7 +209,9 @@ def _plan(request: SupportRequest, binding: dict[str, Any], source: dict[str, An
         raise ValueError("bound phase requires exactly one matching frozen collection cell")
     bundle = plan.runtime_instrumentation
     deployment = load_repeatability_deployment(path.parent)
-    compared_cells, compared_deployment, controls = _collection_controls(plan.cells, deployment)
+    compared_cells, compared_deployment, controls = _collection_controls(
+        plan.cells, deployment, launch["deployment"].get("extra_env") or ()
+    )
     validate_collection_probe_launch(
         launch,
         bundle,
@@ -313,14 +316,14 @@ def _evidence(index: Path, result: dict[str, Any]) -> list[dict[str, str]]:
     from collector.fpm_forward.runtime_instrumentation import contained_file
 
     provenance = result["provenance"]
-    paths = [index]
+    paths = []
     for field in ("artifacts", "launch_artifacts", "runtime_artifacts"):
         paths.extend(contained_file(index.parent, ref["path"]) for ref in provenance[field])
     instrumentation = provenance["instrumentation"]
     manifest = contained_file(index.parent, instrumentation["manifest"])
     paths.append(manifest)
     paths.extend(contained_file(manifest.parent, name) for name in instrumentation["files"])
-    return [_file(path) for path in paths]
+    return [provenance["observations_index"], *(_file(path) for path in paths)]
 
 
 def verify_collection_runtime_bindings(request: SupportRequest, bindings: list[dict[str, Any]]) -> dict[str, Any]:
@@ -344,8 +347,8 @@ def verify_collection_runtime_bindings(request: SupportRequest, bindings: list[d
     for binding, plan_path, plan, cell, bundle, _ in verified:
         phase = binding["phase"]
         try:
-            checkpoint_path, checkpoint = _read(binding["checkpoint"])
-            index, document = _read(binding["observations"])
+            checkpoint_path, checkpoint, _ = _read(binding["checkpoint"])
+            index, document, index_bytes = _read(binding["observations"])
             if not index.resolve().is_relative_to(plan_path.parent.resolve()):
                 raise ValueError("runtime observation index escapes the frozen collection directory")
             if (
@@ -366,7 +369,14 @@ def verify_collection_runtime_bindings(request: SupportRequest, bindings: list[d
             ):
                 raise ValueError("runtime phase does not match the successful native cell attempt")
             result = validate_observation_phase(
-                index, plan.runtime_configuration, plan.runtime_launch, phase=phase, attempt_id=binding["attempt_id"]
+                index,
+                plan.runtime_configuration,
+                plan.runtime_launch,
+                phase=phase,
+                attempt_id=binding["attempt_id"],
+                _index_snapshot=(document, index_bytes),
+                expected_cell_id=cell.cell_id,
+                expected_collector_attempt_id=binding["collector_attempt_id"],
             )
             if result["provenance"]["bundle_sha256"] != bundle.sha256:
                 raise ValueError("runtime observation bundle differs from the frozen plan")
@@ -424,7 +434,7 @@ def verify_collection_runtime_bindings(request: SupportRequest, bindings: list[d
             result["binding"] = deepcopy(binding)
             result["compatibility"] = {"status": "compatible", "runtime_settings_differences": settings_diff}
             phases[phase] = result
-            inputs.extend([_file(plan_path), _file(checkpoint_path), *_evidence(index, result)])
+            inputs.extend([_file(plan_path), dict(binding["checkpoint"]), *_evidence(index, result)])
             inputs.extend(_file(bundle.root / name) for name in bundle.files)
             inputs.extend([_file(bundle.manifest_path), _file(plan_path.parent / "generator-overrides.json")])
             config = plan.runtime_launch["model_config"]

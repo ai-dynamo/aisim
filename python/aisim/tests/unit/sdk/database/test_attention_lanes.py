@@ -243,11 +243,11 @@ def _route_lane_density_through_the_stub(monkeypatch):
     monkeypatch.setattr(_etv, "fetch_attention_lane_density", _fetch)
 
 
-def test_engine_spec_schema_version_includes_kimi_k31():
-    """The Kimi K3.1 layout follows AFD v30."""
+def test_engine_spec_schema_version_includes_kda_recurrent_dtype():
+    """KDA recurrent dtype extends the positional op payload (schema 32)."""
     from aisim.sdk import engine
 
-    assert engine.ENGINE_SPEC_SCHEMA_VERSION == 31
+    assert engine.ENGINE_SPEC_SCHEMA_VERSION == 32
 
 
 def test_lanes_outside_the_known_vocabulary_stay_reachable():

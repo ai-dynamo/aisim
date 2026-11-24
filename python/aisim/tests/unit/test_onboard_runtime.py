@@ -21,6 +21,7 @@ import aisim.main as cli
 from aisim.support.checkpoint import _load, report, save_checkpoint
 from aisim.support.schema import SupportRequest
 
+from .collector.test_fpm_runtime_probe import shared_private_delivery_root  # noqa: F401
 from .collector.test_runtime_observations import observation_fixture
 
 pytestmark = [
@@ -2727,9 +2728,16 @@ def test_pending_probe_preview_then_execute_reuses_output_directory(tmp_path, mo
     state = _load(checkpoint)
     draft = copy.deepcopy(state.configurations["tp2"].draft_request)
     draft["identity"]["framework_version"] = label
+    token = 'synthetic-private-"detection"-$746'
+    environment = [{"name": "HF_TOKEN", "value": token}, {"name": "HF_HOME", "value": "/runtime/hf-cache"}]
+    monkeypatch.setenv("HF_TOKEN", token)
+    monkeypatch.setenv("HF_HOME", "/runtime/hf-cache")
     save_checkpoint(
         checkpoint,
-        patch={"configurations": {"tp2": {"draft_request": draft}}},
+        patch={
+            "inputs": {"collection_deployment": {"extra_env": environment}},
+            "configurations": {"tp2": {"draft_request": draft}},
+        },
         expected_revision=state.revision,
         accept=[],
     )
@@ -2750,7 +2758,21 @@ def test_pending_probe_preview_then_execute_reuses_output_directory(tmp_path, mo
     preview = _load(checkpoint).configurations["tp2"].history[-1]
     assert preview["result"]["status"] == "pending_runtime_version"
     assert "report" not in preview
-    monkeypatch.setattr(versioning, "detect_runtime_versions", lambda *_: {"backend_version": "0.27.0"})
+    monkeypatch.delenv("HF_TOKEN")
+    assert cli.main([*command, "--execute"]) == 1
+    assert len(list(output.glob("onboarding-probe-*.json"))) == 1
+    assert not (output / "probe-plan.json").exists()
+    failed = _load(checkpoint).configurations["tp2"].history[-1]["result"]
+    assert failed["status"] == "incomplete"
+    assert "HF_TOKEN requires the original value" in str(failed["diagnostics"])
+    monkeypatch.setenv("HF_TOKEN", token)
+
+    def detect(deployment):
+        for entry in environment:
+            assert entry in deployment.extra_env
+        return {"backend_version": "0.27.0"}
+
+    monkeypatch.setattr(versioning, "detect_runtime_versions", detect)
     executions = []
     monkeypatch.setattr(runner, "_cell_runner", lambda p, c, _m, d: _SyntheticExecutor(p, c, d, executions))
 
@@ -2761,6 +2783,64 @@ def test_pending_probe_preview_then_execute_reuses_output_directory(tmp_path, mo
     assert observed["launch"]["identity"]["framework_version"] == (label or "0.27.0")
     assert cli.main([*command, "--execute", "--resume"]) == 0
     assert len(executions) == 2
+    for path in output.rglob("*"):
+        if path.is_file():
+            assert token.encode() not in path.read_bytes(), path
+            assert json.dumps(token)[1:-1].encode() not in path.read_bytes(), path
+
+
+@pytest.mark.parametrize("value", [None, "changed"])
+def test_pending_probe_version_detection_reports_unresolved_environment(tmp_path, monkeypatch, capsys, value):
+    from aisim.support import versioning
+
+    checkpoint, _, _ = _campaign(tmp_path)
+    state = _load(checkpoint)
+    draft = copy.deepcopy(state.configurations["tp2"].draft_request)
+    draft["identity"]["framework_version"] = None
+    save_checkpoint(
+        checkpoint,
+        patch={
+            "inputs": {
+                "collection_deployment": {
+                    "extra_env": [
+                        {
+                            "name": "HF_TOKEN",
+                            "value_from_env": "HF_TOKEN",
+                            "value_sha256": hashlib.sha256(b"original").hexdigest(),
+                        }
+                    ]
+                }
+            },
+            "configurations": {"tp2": {"draft_request": draft}},
+        },
+        expected_revision=state.revision,
+        accept=[],
+    )
+    if value is None:
+        monkeypatch.delenv("HF_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("HF_TOKEN", value)
+    monkeypatch.setattr(versioning, "detect_runtime_versions", lambda *_: pytest.fail("unresolved environment"))
+    output = tmp_path / "unresolved"
+    assert (
+        cli.main(
+            [
+                "onboard",
+                "probe-runtime",
+                "--checkpoint",
+                str(checkpoint),
+                "--configuration",
+                "tp2",
+                "--output-dir",
+                str(output),
+                "--execute",
+            ]
+        )
+        == 1
+    )
+    result = json.loads(capsys.readouterr().out)
+    assert "archived environment HF_TOKEN requires the original value" in str(result)
+    assert not (output / "probe-plan.json").exists()
 
 
 def test_mixed_known_and_pending_probe_preview_records_every_configuration(tmp_path, monkeypatch):
@@ -3094,3 +3174,176 @@ def test_a_memory_revision_of_an_original_with_a_wrong_marker_is_refused(tmp_pat
     groups[0]["prefix_cacheable"] = not marked[0]["prefix_cacheable"]
     with pytest.raises(ValueError, match="memory revision changed non-capacity onboarding inputs"):
         _verify_memory_revision(SupportRequest.model_validate(payload), request, {})
+
+
+@pytest.mark.parametrize("known_version", [True, False])
+def test_first_public_probe_delivers_literal_token_without_export(tmp_path, monkeypatch, known_version):
+    from collector.fpm_forward import runner
+
+    from aisim.support import versioning
+
+    from .collector.test_fpm_runtime_probe import _SyntheticExecutor
+
+    checkpoint, _, _ = _campaign(tmp_path)
+    state = _load(checkpoint)
+    draft = copy.deepcopy(state.configurations["tp2"].draft_request)
+    if not known_version:
+        draft["identity"]["framework_version"] = None
+    token = "synthetic-unexported-first-probe-746"
+    environment = [{"name": "HF_TOKEN", "value": token}]
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    save_checkpoint(
+        checkpoint,
+        patch={
+            "inputs": {"collection_deployment": {"extra_env": environment}},
+            "configurations": {"tp2": {"draft_request": draft}},
+        },
+        expected_revision=state.revision,
+        accept=[],
+    )
+    delivered = []
+
+    def detect(deployment):
+        assert all(entry in deployment.extra_env for entry in environment)
+        return {"backend_version": "0.27.0"}
+
+    class Executor(_SyntheticExecutor):
+        def stage(self, pods, files):
+            super().stage(pods, files)
+            assert runner.shlex.quote(token) in self.files["run.sh"].read_text()
+            delivered.append(self.cell.workload_kind)
+
+    monkeypatch.setattr(versioning, "detect_runtime_versions", detect)
+    monkeypatch.setattr(runner, "_cell_runner", lambda p, c, m, d: Executor(p, c, d, []))
+    output = tmp_path / "first-probe"
+    assert (
+        cli.main(
+            [
+                "onboard",
+                "probe-runtime",
+                "--checkpoint",
+                str(checkpoint),
+                "--configuration",
+                "tp2",
+                "--output-dir",
+                str(output),
+                "--execute",
+            ]
+        )
+        == 0
+    )
+    assert delivered == ["prefill", "decode"]
+    for artifact in output.rglob("*"):
+        if artifact.is_file():
+            assert token.encode() not in artifact.read_bytes(), artifact
+
+
+def test_probe_backed_plan_command_roundtrips_private_extra_env(tmp_path, capsys, monkeypatch):
+    from aisim.support import runtime
+
+    from .collector.test_runtime_observations import _replace_launch
+
+    original = observation_fixture
+    token = "synthetic-generated-command-746"
+    environment = [{"name": "HF_TOKEN", "value": token}, {"name": "VLLM_SSM_CONV_STATE_LAYOUT", "value": "DS"}]
+
+    def with_environment(*args, **kwargs):
+        index, launches = original(*args, **kwargs)
+        for name, launch in launches.items():
+            launch["deployment"]["extra_env"] = environment
+            launches[name] = normalize_probe_launch(launch)
+        _replace_launch(index, launches)
+        return index, launches
+
+    monkeypatch.setattr(sys.modules[__name__], "observation_fixture", with_environment)
+    _, _, request, files = _imported(tmp_path, capsys, capacity_multiplier=10)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    root = tmp_path / "collection"
+    assert (
+        cli.main(["onboard", "plan", "--config", files["request"], "--output-dir", str(root), "--format", "json"]) == 0
+    )
+    command = json.loads((root / "commands.json").read_text())["fpm_run_local"]
+    encoded = command[command.index("--extra-env") + 1]
+    assert token not in encoded and "value_sha256" in encoded
+    parsed = cli.build_parser().parse_args(command[1:])
+    assert parsed.extra_env == json.loads(encoded)
+    from aisim.support.schema import FPMDeployment
+
+    deployment = FPMDeployment(
+        **{key: getattr(parsed, key) for key in FPMDeployment.model_fields if getattr(parsed, key, None) is not None}
+    )
+    flags, _ = runtime.runtime_collection_inputs(request, deployment)
+    assert "--fpm-runtime-launch" in flags
+
+
+def test_mixed_probe_environment_keeps_supplied_literal_for_version_detection(tmp_path, monkeypatch, capsys):
+    from collector.fpm_forward.config import archive_generator_overrides, resolve_archived_generator_overrides
+
+    from aisim.support import runtime
+
+    checkpoint, _, _ = _campaign(tmp_path)
+    token = "synthetic-archived-hub-token"
+    archived = archive_generator_overrides({"K8sConfig": {"extra_env": [{"name": "HF_TOKEN", "value": token}]}})[
+        "K8sConfig"
+    ]["extra_env"]
+    archived = [item for item in archived if item["name"] == "HF_TOKEN"]
+    environment = [*archived, {"name": "PYTHONPATH", "value": "/runtime/wheel"}]
+    state = _load(checkpoint)
+    save_checkpoint(
+        checkpoint,
+        patch={"inputs": {"collection_deployment": {"extra_env": environment}}},
+        expected_revision=state.revision,
+        accept=[],
+    )
+    monkeypatch.setenv("HF_TOKEN", token)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    private = {}
+    _, launch, _ = runtime.checkpoint_launch(_load(checkpoint), "tp2", checkpoint, private_environment=private)
+    assert private["tp2"] == environment
+    assert all("value_from_env" in item for item in launch["deployment"]["extra_env"])
+    resolved = resolve_archived_generator_overrides({"K8sConfig": {"extra_env": private["tp2"]}})
+    assert {"name": "PYTHONPATH", "value": "/runtime/wheel"} in resolved["K8sConfig"]["extra_env"]
+
+
+def test_invalid_deployment_credentials_are_absent_from_errors_and_reports(tmp_path, capsys):
+    from pydantic import ValidationError
+
+    from aisim.support.schema import FPMDeployment
+
+    secret = "synthetic-malformed-credential"
+    environment = [{"name": "HF-TOKEN", "value": secret}]
+    with pytest.raises(ValidationError) as error:
+        FPMDeployment(extra_env=environment)
+    assert secret not in str(error.value)
+    checkpoint, _, _ = _campaign(tmp_path)
+    state = _load(checkpoint)
+    save_checkpoint(
+        checkpoint,
+        patch={"inputs": {"collection_deployment": {"extra_env": environment}}},
+        expected_revision=state.revision,
+        accept=[],
+    )
+    output = tmp_path / "probe-errors"
+    command = [
+        "onboard",
+        "probe-runtime",
+        "--checkpoint",
+        str(checkpoint),
+        "--configuration",
+        "tp2",
+        "--output-dir",
+        str(output),
+    ]
+    assert cli.main(command) == 1
+    captured = capsys.readouterr()
+    assert secret not in captured.out + captured.err
+    assert secret not in json.dumps(_load(checkpoint).configurations["tp2"].history)
+    reports = list(output.glob("onboarding-probe-*.json"))
+    assert reports and all(secret not in path.read_text() for path in reports)
+    option = [*command, "--extra-env"]
+    assert cli.build_parser().parse_args([*option, "[]"]).extra_env == []
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args([*option, json.dumps(environment)])
+    diagnostic = capsys.readouterr().err
+    assert "extra_env requires unique" in diagnostic
+    assert secret not in diagnostic

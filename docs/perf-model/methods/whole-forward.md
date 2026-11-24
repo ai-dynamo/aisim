@@ -14,6 +14,81 @@ Use [FPM self-service](../fpm-self-service/README.md) to prepare, review, collec
 or import a profile. The existing [implementation guide](../fpm-self-service/implementation.md)
 owns artifact validation, publication, checkpoints, and recovery.
 
+## KDA hybrid models
+
+Kimi-K3.1-Pro uses recurrent KDA layers alongside sparse attention. Its FPM
+collection uses the native-runtime capability, with an explicit model profile
+or `--fpm-backend-version`; an existing MLA or DSA operation table does not
+qualify its whole-forward runtime. Checkpoint-native precision on this route
+does not require new operation-level timing tables first.
+
+For autoregressive text inference, select the existing `text_only` FPM option
+and leave speculative decoding disabled. The whole-forward SOL transfer uses
+the original model graph, including the KDA byte model and its fractional
+prefill coordinates. Exact measured hits retain their recorded latency before
+online correction (or when correction is disabled). Enabled correction can
+change the public estimate. This does not establish support for visual inputs
+or KDA speculative verification.
+
+FP8 collection requires `--fpm-attention-backend=flashmla` or `trtllm_mla`.
+For the K3.1 vLLM runtime these request `FLASHMLA_SPARSE` and
+`FLASHINFER_MLA_SPARSE`, respectively, with FP8 indexer keys. The model-facing
+name stays in the measured cell identity; resolved runtime configuration must
+attest the native enum. SOL transfer uses that same explicit selection for the
+656-byte or 576-byte latent cache layout. An `auto` label cannot establish
+which layout was executed.
+For `trtllm_mla`, initialized attention groups must also attest the resolved
+`trtllm` launcher. A `prims_ts` launcher reporting the same backend enum cannot
+publish under that timing identity.
+
+Every decode point must report native `real_kv` seeding. A balanced MoE router
+or synthetic KV allocation does not establish the request's recurrent state.
+This real-state requirement applies to all KDA decode models, including
+non-K3.1 balanced-MoE TP cells and recovery from archived attempts; approved
+warm-up skips do not exempt their decode points.
+Only zero-history prefill with prefix caching disabled is supported; cached
+prefill with historical KV remains unsupported even with `real_prefix` seeding.
+These checks retain the native protocol evidence; they do not inspect recurrent
+tensors or establish numerical correctness. A compatible serving image,
+successful native-state smoke, measured graph behavior, matching timing/memory
+artifacts and independent accuracy validation are still required for each
+deployment. No K3 measurements are relabelled as K3.1-Pro data.
+An offline Hub snapshot alias must match the repository and immutable revision
+pins and a loaded-config commit hash. If an execution sidecar omits that hash,
+the independently bound initialized worker must supply it. Local configs with
+no loaded-config commit cannot establish a Hub snapshot alias from their path
+or matching model fields alone; an explicitly accepted local model path retains
+its existing exact-path and config-artifact checks. These checks do not hash weights.
+
+The collector policies and evidence checks are preliminary integration work.
+They include a source-bound K3.1 adapter pinned to vLLM
+`0.1.dev24216+g266e88c05` for native KDA state and observed FP8 indexer cache;
+unknown cache representations are rejected. This does not qualify the adapter
+for a deployment. A pinned native image, an adapter checked
+against that image, real checkpoint state, complete rank evidence and measured
+rows remain necessary before publishing a K3.1 FPM profile. MXFP4 weight
+configuration alone cannot attest W4A16 execution: the native MoE backend may
+quantize activations, so its initialized arithmetic must also be observed. For a K3.1 decoder
+profile using its registered multimodal wrapper, request `text_only=True`
+explicitly to compile the language graph; omitting it preserves existing
+`method="auto"` selection. Kimi-K3 profiles retain direct interpolation because
+their MLA fallback graph does not support SOL transfer. Encoder-resident weights
+are not silently removed.
+
+KDA SOL transfer currently supports FP32 recurrent state only. Profile compilation
+carries `mamba_ssm_cache_dtype` from the imported runtime memory provenance into
+the analytical graph; `auto` resolves to FP32 only when the provenance contains
+the audited runtime's exact version and source digest map. A literal profile
+`backend_version` alone cannot establish the effective dtype; unaudited `auto`
+state uses direct interpolation.
+Finalized profiles retain this precision through their per-cell provenance.
+With BF16 state or missing dtype evidence, `method: auto` selects direct
+interpolation. An explicit `method: sol` still raises `SolNotImplemented`
+when a query needs KDA SOL, rather than charging four bytes for a BF16 element.
+Exact measured hits and measured-only `method: direct` interpolation do not
+need this roofline. Physical page padding and cache capacity never determine
+the recurrent element width.
+
 ## Hybrid FPM/OP deprecation and migration
 
 The legacy `forward_model="fpm"` route that combines an autoregressive target

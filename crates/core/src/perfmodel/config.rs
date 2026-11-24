@@ -137,7 +137,9 @@ pub const ENGINE_CONFIG_SCHEMA_VERSION: u32 = 1;
 // - 31 (Kimi K3.1 DSA): DsaModuleOp carries an optional explicit sparse
 //   attention backend/cache layout at its tail. JSON defaults preserve legacy
 //   operators; positional bincode payloads from v30 must be rejected.
-pub const ENGINE_SPEC_SCHEMA_VERSION: u32 = 31;
+// - 32 (KDA FPM state precision): KdaOp carries the observed recurrent dtype.
+//   Legacy JSON leaves FPM state precision unrecorded; v31 bincode is rejected.
+pub const ENGINE_SPEC_SCHEMA_VERSION: u32 = 32;
 
 /// Static engine identity and setup information carried by an
 /// [`crate::perfmodel::engine::spec::EngineSpec`].

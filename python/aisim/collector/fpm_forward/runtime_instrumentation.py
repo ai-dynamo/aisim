@@ -89,15 +89,22 @@ def _yaml_mapping(loader: _UniqueSafeLoader, node: yaml.MappingNode) -> dict[str
 _UniqueSafeLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _yaml_mapping)
 
 
-def read_json(path: Path) -> dict[str, Any]:
+def read_json_snapshot(path: Path, *, expected_sha256: str | None = None) -> tuple[dict[str, Any], bytes]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique_pairs)
+        content = path.read_bytes()
+        if expected_sha256 is not None and sha256_bytes(content) != expected_sha256:
+            raise ValueError("runtime artifact hash mismatch")
+        value = json.loads(content.decode("utf-8"), object_pairs_hook=_unique_pairs)
         canonical_json(value)
     except (OSError, UnicodeError, TypeError, RecursionError, ValueError) as error:
         raise ValueError(f"invalid JSON artifact {path}: {error}") from error
     if not isinstance(value, dict):
         raise ValueError(f"JSON artifact must be an object: {path}")
-    return value
+    return value, content
+
+
+def read_json(path: Path, *, expected_sha256: str | None = None) -> dict[str, Any]:
+    return read_json_snapshot(path, expected_sha256=expected_sha256)[0]
 
 
 @dataclass(frozen=True, slots=True)

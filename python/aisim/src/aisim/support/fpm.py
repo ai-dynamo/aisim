@@ -137,6 +137,9 @@ def fpm_cli_args(
                     command.extend(("--fpm-slurm-container-image", value))
                 else:
                     command.extend(("--generator-set", f"K8sConfig.k8s_image={json.dumps(value)}"))
+            elif name == "extra_env":
+                encoded = json.dumps(value)
+                command.extend(("--generator-set", f"K8sConfig.extra_env={encoded}"))
             else:
                 prefix = "--fpm-slurm-" if name in {"cpus_per_task", "cpu_bind"} else "--"
                 command.extend((prefix + name.replace("_", "-"), str(value)))
@@ -311,7 +314,15 @@ def run_fpm(
             # A prediction profile can be valid for historical timings while
             # its precision is incompatible with a new native campaign.
             _resolve_execution(command)
-        print(shlex.join(command))
+        preview = list(command)
+        for index, argument in enumerate(preview):
+            if argument.startswith("K8sConfig.extra_env="):
+                environment = json.loads(argument.split("=", 1)[1])
+                # Redact every user value: arbitrary environment names can carry credentials.
+                preview[index] = "K8sConfig.extra_env=" + json.dumps(
+                    [{**entry, "value": "<redacted>"} for entry in environment]
+                )
+        print(shlex.join(preview))
         return 0
     check_plan(request, root)
     from .runtime import runtime_probe_manifest, verify_collection_runtime, verify_runtime_acceptance
@@ -342,6 +353,15 @@ def run_fpm(
                         "full collection requires usable prefill and decode readiness for this exact runtime/launch; "
                         "inspect --check-readiness and run --smoke --execute first"
                     )
+            if not recovery_only and resolved[1].get("K8sConfig", {}).get("extra_env"):
+                from collector.fpm_forward.config import resolve_archived_generator_overrides
+
+                environment = {
+                    item["name"]: item["value"]
+                    for item in (deployment.extra_env if deployment else []) or []
+                    if "value" in item
+                }
+                resolved = (frozen, resolve_archived_generator_overrides(resolved[1], environment=environment))
             errors = run_resolved(args, resolved)
             status = collector_status = 1 if errors else 0
             if errors:

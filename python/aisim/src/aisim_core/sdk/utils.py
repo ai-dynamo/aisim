@@ -11,6 +11,7 @@
 # from vLLM (Apache-2.0), copyright contributors to the vLLM project:
 # https://github.com/vllm-project/vllm/blob/ee0da84ab9e04ac7610e28580af62c365e898389/vllm/model_executor/models/mistral3.py
 
+import copy
 import importlib.resources as pkg_resources
 import json
 import logging
@@ -459,6 +460,27 @@ def _download_hf_json(hf_id: str, filename: str, *, raise_on_404: bool = True, r
         raise HuggingFaceDownloadError(f"Failed to download {hf_id}'s {filename} from HuggingFace: {e}") from e
 
 
+def _resolve_hf_revision(model: str, revision: str) -> str:
+    """Bind a Hub alias once; full commit IDs and local checkpoints need no lookup."""
+    return _revision_for_resolved_source(_resolved_model_source(model), revision)
+
+
+def _revision_for_resolved_source(model: str, revision: str) -> str:
+    if re.fullmatch(r"[0-9a-fA-F]{40}", revision) or Path(model).is_absolute():
+        return revision
+    url = f"https://huggingface.co/api/models/{model}/revision/{quote(revision, safe='')}"
+    try:
+        request = urllib.request.Request(url, headers=_get_hf_auth_headers())
+        with urllib.request.urlopen(request, timeout=30) as response:
+            metadata = json.load(response)
+            commit = metadata.get("sha") if isinstance(metadata, dict) else None
+    except (OSError, ValueError) as error:
+        raise HuggingFaceDownloadError(f"Cannot resolve checkpoint revision for {model!r}") from error
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise HuggingFaceDownloadError(f"Hub did not return an immutable checkpoint revision for {model!r}")
+    return commit
+
+
 def _download_hf_config(hf_id: str) -> dict:
     """
     Download a HuggingFace config.json file from the HuggingFace API.
@@ -564,6 +586,8 @@ def _qwen_pixel_bounds(processor_cfg: dict | None) -> tuple[int, int]:
         return QWEN3_VL_PIXEL_BOUNDS
     if any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in bounds):
         raise ValueError(f"Qwen preprocessor pixel budget must be positive integers, got {bounds!r}")
+    if bounds[0] > bounds[1]:
+        raise ValueError(f"Qwen preprocessor pixel budget requires min_pixels <= max_pixels, got {bounds!r}")
     return bounds
 
 
@@ -632,6 +656,13 @@ def _kimi_processor_limits(processor_cfg: dict | None, vision_cfg: dict) -> dict
     media = processor_cfg.get("media_proc_cfg", processor_cfg)
     if not isinstance(media, dict):
         raise ValueError("Kimi media_proc_cfg must be an object")
+    if (
+        media is not processor_cfg
+        and "max_patches" in processor_cfg
+        and ("in_patch_limit" in media or "max_patches" in media)
+        and processor_cfg["max_patches"] != media.get("in_patch_limit", media.get("max_patches"))
+    ):
+        raise ValueError("Kimi processor has conflicting inline and sidecar image-patch limits")
     video = processor_cfg.get("video_processor", {})
     if not isinstance(video, dict):
         raise ValueError("Kimi video processor config must be an object")
@@ -647,18 +678,27 @@ def _kimi_processor_limits(processor_cfg: dict | None, vision_cfg: dict) -> dict
             raise ValueError("Kimi processor size requires identical max_height and max_width")
         return positive_int(size.get("max_height"), "size.max_height")
 
-    side = positive_int(media.get("patch_limit_on_one_side", side_limit(media, 512)), "patch_limit_on_one_side")
+    image_default_side = side_limit(processor_cfg, 512)
+    side = positive_int(
+        media.get("patch_limit_on_one_side", side_limit(media, image_default_side)), "patch_limit_on_one_side"
+    )
     # Legacy Moonshot settings share one limit across image and video;
     # native Transformers processors each independently default to 512.
+    for settings in (processor_cfg, media):
+        if "size" in settings and side_limit(settings, side) != side:
+            raise ValueError("Kimi processor has conflicting explicit image side limits")
     video_default_side = side if "patch_limit_on_one_side" in media else 512
     if side_limit(video, video_default_side) != side:
         raise ValueError("Kimi image and video processor side limits must match")
-    for settings in (media, video):
+    for settings in (processor_cfg, media, video):
         if settings.get("do_resize", True) is not True:
             raise ValueError("Kimi processor do_resize=False is not modeled")
         if positive_int(settings.get("patch_size", vision_cfg["patch_size"]), "patch_size") != vision_cfg["patch_size"]:
             raise ValueError("Kimi processor patch_size must match vision_config")
-        merge = settings.get("merge_kernel_size", settings.get("merge_size", 2))
+        # A legacy media_proc_cfg container is not a second image processor.
+        # Check any explicit sidecar geometry without inventing defaults for it.
+        merge_default = media.get("merge_kernel_size", media.get("merge_size", 2)) if settings is processor_cfg else 2
+        merge = settings.get("merge_kernel_size", settings.get("merge_size", merge_default))
         if positive_int(merge, "merge_size") != vision_cfg.get("merge_kernel_size", [2, 2])[0]:
             raise ValueError("Kimi processor merge_size must match vision_config")
     for name in ("fixed_output_tokens", "in_patch_limit_video", "max_num_frames_each_video"):
@@ -671,7 +711,10 @@ def _kimi_processor_limits(processor_cfg: dict | None, vision_cfg: dict) -> dict
         raise ValueError("Kimi processor temporal chunk size must be 4")
     return {
         "resize_mode": "kimi",
-        "image_max_patches": positive_int(media.get("in_patch_limit", media.get("max_patches", 16384)), "max_patches"),
+        "image_max_patches": positive_int(
+            media.get("in_patch_limit", media.get("max_patches", processor_cfg.get("max_patches", 16384))),
+            "max_patches",
+        ),
         "video_max_patches": positive_int(
             media.get("in_patch_limit_each_frame", video.get("max_patches", 4096)), "video max_patches"
         ),
@@ -1952,7 +1995,9 @@ def _infer_quantization_fields(raw_config: dict) -> dict[str, object]:
 
     quant_algo = _normalize_quant_algo(
         hf_quant_section.get("quant_algo")
+        or hf_quant_section.get("quantization_algo")
         or quant_cfg.get("quant_algo")
+        or quant_cfg.get("quantization_algo")
         or quant_cfg.get("quant_method")
         or quant_cfg.get("quantization_method")
     )
@@ -2022,34 +2067,59 @@ def _attach_hf_quant_config(raw_config: dict, hf_quant_config: dict | None) -> d
     if not hf_quant_config:
         return raw_config
     raw_config["hf_quant_config"] = hf_quant_config
-    if "quantization_config" not in raw_config:
+    nested = raw_config.get("text_config")
+    if "quantization_config" not in raw_config and not (isinstance(nested, dict) and "quantization_config" in nested):
         normalized = _normalize_hf_quant_config(hf_quant_config)
         if normalized:
+            section = hf_quant_config.get("quantization", {})
+            if "exclude_modules" in section:
+                producer = hf_quant_config.get("producer")
+                if not isinstance(producer, dict) or producer.get("name") != "modelopt":
+                    raise ValueError("ModelOpt vision exclusions require producer.name=modelopt")
+                normalized = {**section, **normalized, "quant_method": "modelopt", "ignore": section["exclude_modules"]}
             raw_config["quantization_config"] = normalized
     return raw_config
 
 
-def _attach_llama4_processor_config(raw_config: dict, model_path: str) -> dict:
-    """Load Llama 4's separate processor metadata, retaining bundled inline configs."""
+def _attach_llama4_processor_config(raw_config: dict, model_path: str, *, model_revision: str | None = None) -> dict:
+    """Load Llama 4 processor metadata from the same pinned checkpoint."""
     if (raw_config.get("architectures") or [None])[0] != "Llama4ForConditionalGeneration":
         return raw_config
-    if "image_processor_config" in raw_config:
+    if "image_processor_config" in raw_config and model_revision is None:
         return raw_config
-    if os.path.isdir(model_path):
+    if Path(model_path).is_absolute():
         processor_path = Path(model_path) / "preprocessor_config.json"
         processor_config = _load_json_with_infinity(processor_path) if processor_path.exists() else None
-    elif model_path in DefaultHFModels:
+    elif model_revision is None and model_path in DefaultHFModels:
         processor_path = _get_model_config_path() / f"{model_path.replace('/', '--')}_preprocessor_config.json"
         processor_config = _load_json_with_infinity(processor_path) if processor_path.exists() else None
     else:
-        processor_config = _download_hf_json(model_path, "preprocessor_config.json", raise_on_404=False)
+        processor_config = _download_hf_json(
+            model_path,
+            "preprocessor_config.json",
+            raise_on_404=False,
+            **({"revision": model_revision} if model_revision else {}),
+        )
     if processor_config is not None:
+        # A pinned serving processor loads preprocessor_config.json, rather
+        # than the model's inline image_processor_config. Keep bundled inline
+        # metadata as a fallback when there is no separate processor file.
         raw_config["image_processor_config"] = processor_config
     return raw_config
 
 
+def _load_model_config_from_model_path(
+    model_path: str, *, model_revision: str | None = None, include_processor: bool = True
+) -> dict:
+    return _load_resolved_model_config(
+        _resolved_model_source(model_path), model_revision=model_revision, include_processor=include_processor
+    )
+
+
 @cache
-def _load_model_config_from_model_path(model_path: str, *, include_processor: bool = True) -> dict:
+def _load_resolved_model_config(
+    model_path: str, *, model_revision: str | None = None, include_processor: bool = True
+) -> dict:
     """
     Get model configuration from model path.
 
@@ -2067,14 +2137,31 @@ def _load_model_config_from_model_path(model_path: str, *, include_processor: bo
         ValueError: If the model config cannot be found
         HuggingFaceDownloadError: If fetching from HuggingFace fails
     """
+    model_path = os.path.expanduser(model_path)
     if include_processor:
-        config = _load_model_config_from_model_path(model_path, include_processor=False)
-        return _attach_llama4_processor_config(dict(config), model_path)
+        config = _load_resolved_model_config(model_path, model_revision=model_revision, include_processor=False)
+        processor_revision = None if Path(model_path).is_absolute() else model_revision
+        return _attach_llama4_processor_config(dict(config), model_path, model_revision=processor_revision)
 
     # Check if it's a local path
-    if os.path.isdir(model_path):
+    if Path(model_path).is_absolute():
         config = _load_local_config(model_path)
+
         return _attach_inferred_quant_fields(_attach_hf_quant_config(config, _load_local_quant_config(model_path)))
+
+    if model_revision is not None:
+        from aisim_core.sdk.fpm_profile import _load_pinned_checkpoint_config
+
+        # Use the same immutable config as profile eligibility, including for
+        # models with bundled configs whose source revision is not recorded.
+        config = _load_pinned_checkpoint_config(model_path, model_revision)
+        if not isinstance(config, dict):
+            raise ValueError("checkpoint config.json must be an object")
+        config = copy.deepcopy(config)
+        hf_quant_config = _download_hf_json(
+            model_path, "hf_quant_config.json", raise_on_404=False, revision=model_revision
+        )
+        return _attach_inferred_quant_fields(_attach_hf_quant_config(config, hf_quant_config))
 
     # Otherwise treat as HuggingFace path
     if model_path in DefaultHFModels:
@@ -2092,8 +2179,24 @@ def _load_model_config_from_model_path(model_path: str, *, include_processor: bo
     return _attach_inferred_quant_fields(_attach_hf_quant_config(config, hf_quant_config))
 
 
+def get_model_config_from_model_path(model_path: str, *, model_revision: str | None = None) -> dict:
+    """Resolve moving Hub aliases before consulting immutable metadata caches."""
+    model_path = _resolved_model_source(model_path)
+    if model_revision is not None:
+        model_revision = _revision_for_resolved_source(model_path, model_revision)
+    return _get_model_config_from_resolved_path(os.path.expanduser(model_path), model_revision=model_revision)
+
+
+def _resolved_model_source(model_path: str) -> str:
+    """Separate absolute local identities from Hub IDs before cache lookup."""
+    path = Path(model_path).expanduser()
+    if path.exists() or path.is_absolute() or model_path.startswith(("./", "../", "~")):
+        return str(path.absolute())
+    return model_path
+
+
 @cache
-def get_model_config_from_model_path(model_path: str) -> dict:
+def _get_model_config_from_resolved_path(model_path: str, *, model_revision: str | None = None) -> dict:
     """
     Get model configuration from model path and parse it into model configuration parameters.
 
@@ -2104,7 +2207,7 @@ def get_model_config_from_model_path(model_path: str) -> dict:
         dict: Model configuration parameters and raw config under "raw_config".
         Quantization metadata retains its original root or text_config scope.
     """
-    raw_config = _load_model_config_from_model_path(model_path)
+    raw_config = _load_resolved_model_config(model_path, model_revision=model_revision)
     architecture = (raw_config.get("architectures") or [None])[0]
     kimi = architecture in (
         "KimiK25ForConditionalGeneration",
@@ -2112,26 +2215,39 @@ def get_model_config_from_model_path(model_path: str) -> dict:
         "KimiK31ForConditionalGeneration",
     )
     qwen_vl = architecture in ("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration")
-    if (kimi or qwen_vl) and model_path not in DefaultHFModels:
+    if (kimi or qwen_vl) and (model_revision is not None or model_path not in DefaultHFModels):
         # Only Kimi and Qwen3-VL consume these processor files. Bundled
         # checkpoints use the pinned processor defaults; local/downloaded
         # checkpoints may override them with the original media_proc_cfg or
         # native HF layout. Qwen's per-clip video budget is not modeled.
-        processor = {}
+        processor = raw_config.get("preprocessor_config", {})
+        if not isinstance(processor, dict):
+            raise ValueError("checkpoint preprocessor_config must be an object")
+        processor = dict(processor)
         files = [("preprocessor_config.json", None)]
         if kimi:
             files.append(("video_preprocessor_config.json", "video_processor"))
         for filename, key in files:
-            if os.path.isdir(model_path):
+            if Path(model_path).is_absolute():
                 path = Path(model_path) / filename
                 data = _load_json_with_infinity(path) if path.is_file() else None
             else:
-                data = _download_hf_json(model_path, filename, raise_on_404=False)
+                data = _download_hf_json(
+                    model_path, filename, raise_on_404=False, **({"revision": model_revision} if model_revision else {})
+                )
             if data is not None:
                 if not isinstance(data, dict):
                     family = "Kimi" if kimi else "Qwen3-VL"
                     raise ValueError(f"{family} {filename} must be an object")
                 if key is None:
+                    if qwen_vl and isinstance(data.get("size"), dict):
+                        # Sidecar bounds supersede inline bounds across the two
+                        # native formats, independently for each endpoint.
+                        for legacy, native in (("min_pixels", "shortest_edge"), ("max_pixels", "longest_edge")):
+                            if native in data["size"]:
+                                processor.pop(legacy, None)
+                        if isinstance(processor.get("size"), dict):
+                            data = {**data, "size": {**processor["size"], **data["size"]}}
                     processor.update(data)
                 else:
                     processor[key] = data
@@ -2152,6 +2268,10 @@ def get_model_config_from_model_path(model_path: str) -> dict:
     )
     parsed["raw_config"] = raw_config
     return parsed
+
+
+_load_model_config_from_model_path.cache_clear = _load_resolved_model_config.cache_clear
+get_model_config_from_model_path.cache_clear = _get_model_config_from_resolved_path.cache_clear
 
 
 class ListFlowDumper(yaml.SafeDumper):

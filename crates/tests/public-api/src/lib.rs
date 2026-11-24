@@ -238,7 +238,8 @@ mod tests {
         // v29: EngineSpec carries the optional vision section (SGLang VL host loop).
         // v30: append native AFD communication ops and source-ordered pool plan.
         // v31: DsaModuleOp carries the physical attention backend identity.
-        assert_eq!(ENGINE_SPEC_SCHEMA_VERSION, 31);
+        // v32: KdaOp carries recurrent_state_dtype.
+        assert_eq!(ENGINE_SPEC_SCHEMA_VERSION, 32);
         assert_eq!(FPM_VERSION, 1);
         assert_eq!(ForwardPassMetrics::default().version, FPM_VERSION);
     }

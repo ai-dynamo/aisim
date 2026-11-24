@@ -191,12 +191,12 @@ def _plan(cell: FPMCell):
     )
 
 
-def _native_payload(*, phase: str, rank: int, dp: int, run_id: str = "run") -> dict:
+def _native_payload(*, phase: str, rank: int, dp: int, run_id: str = "run", prefill_history: int = 128) -> dict:
     point = {
         "point_type": phase,
         "benchmark_id": 1,
         "total_prefill_tokens": 257 if phase == "prefill" else 0,
-        "total_kv_read_tokens": 128,
+        "total_kv_read_tokens": prefill_history if phase == "prefill" else 128,
         "batch_size": 4,
         "expected_cudagraph_mode": "PIECEWISE" if phase == "prefill" else "FULL",
         "expected_capture_size": 272 if phase == "prefill" else 4,
@@ -206,7 +206,7 @@ def _native_payload(*, phase: str, rank: int, dp: int, run_id: str = "run") -> d
     scheduled = {
         "num_prefill_requests": 4 if phase == "prefill" else 0,
         "sum_prefill_tokens": 257 if phase == "prefill" else 0,
-        "sum_prefill_kv_tokens": 128 if phase == "prefill" else 0,
+        "sum_prefill_kv_tokens": prefill_history if phase == "prefill" else 0,
         "num_decode_requests": 0 if phase == "prefill" else 4,
         "sum_decode_kv_tokens": 0 if phase == "prefill" else 128,
     }
@@ -572,8 +572,11 @@ def test_prepare_attempt_clears_results_and_writes_runtime_provenance(tmp_path):
     )
 
     assert calls[0][1][:2] == ["find", "/results"]
-    assert calls[1][1][:2] == ["python3", "-c"]
-    payload = json.loads(calls[1][1][3])
+    assert calls[1][1][:2] == ["bash", "-c"]
+    assert "source /tmp/fpm-bench/collector-runtime-env.sh" in calls[1][1][2]
+    command = calls[1][1][4:]
+    assert command[:2] == ["python3", "-c"]
+    payload = json.loads(command[3])
     assert payload == {
         "schema_name": "aic_fpm_collector_provenance",
         "schema_version": 1,
@@ -581,7 +584,118 @@ def test_prepare_attempt_clears_results_and_writes_runtime_provenance(tmp_path):
         "plan_sha256": "plan-sha",
         "attempt_id": "attempt-1",
     }
-    assert calls[1][1][4] == "collector-provenance.json"
+    assert command[4] == "collector-provenance.json"
+
+
+@pytest.mark.parametrize("overlay_variable", ["PYTHONPATH", "PYTHONUSERBASE"])
+@pytest.mark.parametrize("overlay,drift", [(False, False), (True, False), (True, True)])
+def test_kubernetes_detection_and_preparation_use_same_runtime_environment(
+    tmp_path, monkeypatch, overlay, drift, overlay_variable
+):
+    from aisim.support import versioning
+    from aisim.support.schema import FPMDeployment
+
+    image_site, overlay_site = tmp_path / "image-site", tmp_path / "overlay $(OVERLAY_ROOT) $$ site"
+    for site, version in ((image_site, "0.28.0+image"), (overlay_site, "0.28.0+overlay")):
+        package_site = (
+            site
+            if overlay_variable == "PYTHONPATH"
+            else site / f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
+        )
+        metadata = package_site / f"vllm-{version}.dist-info" / "METADATA"
+        metadata.parent.mkdir(parents=True)
+        metadata.write_text(f"Name: vllm\nVersion: {version}\n")
+    deployment = FPMDeployment(
+        image="synthetic:image",
+        extra_env=[
+            {"name": "OVERLAY_ROOT", "value": "expanded-wrong-path"},
+            {"name": overlay_variable, "value": str(overlay_site)},
+        ]
+        if overlay
+        else None,
+    )
+    image_env = {key: value for key, value in os.environ.items() if not key.startswith("PYTHON")}
+    image_env[overlay_variable] = str(image_site)
+    image_env.pop("PYTHONNOUSERSITE", None)
+    base_python = sys._base_executable
+    probe_output = ""
+
+    def probe_transport(command, *, payload=None, sensitive_values=(), sensitive_names=()):
+        nonlocal probe_output
+        if payload is not None:
+            container = json.loads(payload)["spec"]["containers"][0]
+            env = dict(image_env)
+            for item in container.get("env", []):
+                value = item["value"]
+                if item["name"] == overlay_variable:
+                    assert value == str(overlay_site).replace("$", "$$")
+                import re
+
+                env[item["name"]] = re.sub(
+                    r"\$\$|\$\(([A-Za-z_][A-Za-z0-9_]*)\)",
+                    lambda match: "$" if match[0] == "$$" else env.get(match[1], match[0]),
+                    value,
+                )
+            probe_output = subprocess.run(
+                [base_python, *container["command"][1:]], env=env, capture_output=True, text=True, check=True
+            ).stdout
+        if "logs" in command:
+            return probe_output
+        if "get" in command:
+            return json.dumps({"status": {"containerStatuses": [{"state": {"terminated": {"exitCode": 0}}}]}})
+        return ""
+
+    monkeypatch.setattr(versioning, "_run", probe_transport)
+    detected = versioning.detect_runtime_versions(deployment)
+    expected = "0.28.0+overlay" if overlay else "0.28.0+image"
+    assert detected["backend_version"] == expected
+
+    cell_dir, results = tmp_path / "cell", tmp_path / "results"
+    cell_dir.mkdir()
+    results.mkdir()
+    cell = _cell()
+    _render_cell(
+        _plan(cell),
+        cell,
+        cell_dir,
+        {"K8sConfig": {"k8s_image": deployment.image, "extra_env": deployment.extra_env or []}},
+    )
+    workload = fpm_runner._workload_document(fpm_runner._manifest_documents(cell_dir / "k8s_deploy.yaml"))
+    assert workload["kind"] == "Pod"
+    assert "env" not in workload["spec"]["containers"][0]
+
+    monkeypatch.setattr(fpm_runner, "REMOTE_WORKDIR", str(cell_dir))
+    monkeypatch.setattr(fpm_runner, "FPM_RESULTS_DIR", str(results))
+    runner = _runner(cell_dir)
+
+    def exec_transport(_pod, command, *, timeout):
+        if drift:
+            env_file = cell_dir / "collector-runtime-env.sh"
+            env_file.write_text(env_file.read_text().replace(str(overlay_site), str(image_site)))
+        command = [base_python if arg == "python3" else arg for arg in command]
+        return subprocess.run(command, env=image_env, capture_output=True, text=True, check=True, timeout=timeout)
+
+    runner._exec_checked = exec_transport
+    if drift:
+        with pytest.raises(subprocess.CalledProcessError, match="non-zero exit status") as error:
+            runner.prepare_attempt(
+                ["pod-0"],
+                cell_id=cell.cell_id,
+                plan_sha256="plan-sha",
+                attempt_id="attempt-1",
+                runtime_backend_version=detected["backend_version"],
+            )
+        assert "FPM observed runtime changed" in error.value.stderr
+        return
+    runner.prepare_attempt(
+        ["pod-0"],
+        cell_id=cell.cell_id,
+        plan_sha256="plan-sha",
+        attempt_id="attempt-1",
+        runtime_backend_version=detected["backend_version"],
+    )
+    provenance = json.loads((results / "collector-provenance.json").read_text())
+    assert provenance["runtime"]["backend_version"] == expected
 
 
 def test_passed_checkpoint_requires_attempt_identity():
@@ -1627,7 +1741,9 @@ def test_run_collection_stages_owned_runtime_files(monkeypatch, tmp_path, pendin
 
     errors = run_collection(
         plan,
-        generator_overrides={},
+        generator_overrides={
+            "K8sConfig": {"extra_env": [{"name": "HF_TOKEN", "value": "synthetic-private-credential"}]}
+        },
         checkpoint_dir=str(checkpoint_dir),
         artifact_root=str(tmp_path / "artifacts"),
         resume=False,
@@ -1638,6 +1754,14 @@ def test_run_collection_stages_owned_runtime_files(monkeypatch, tmp_path, pendin
     )
 
     assert errors == []
+    archived = next((tmp_path / "artifacts").rglob("generator-overrides.json")).read_text()
+    assert "synthetic-private-credential" not in archived
+    entry = json.loads(archived)["K8sConfig"]["extra_env"][0]
+    assert entry == {
+        "name": "HF_TOKEN",
+        "value_from_env": "HF_TOKEN",
+        "value_sha256": hashlib.sha256(b"synthetic-private-credential").hexdigest(),
+    }
     assert events.count("execute") == 1
     # One verified delete BEFORE apply (workload names are deterministic, so a
     # fresh checkpoint proves nothing about the cluster) and one after.
@@ -1661,7 +1785,7 @@ def test_run_collection_stages_owned_runtime_files(monkeypatch, tmp_path, pendin
     assert "database" not in checkpoint
 
 
-def _staged_run(monkeypatch, root: Path, plan, *, smoke: bool):
+def _staged_run(monkeypatch, root: Path, plan, *, smoke: bool, overrides=None):
     """Run every cell of ``plan`` on an in-process cluster.
 
     Return the names that each cell stages, the point-list receipt that each cell records after execution, and the
@@ -1720,7 +1844,7 @@ def _staged_run(monkeypatch, root: Path, plan, *, smoke: bool):
     )
     errors = run_collection(
         plan,
-        generator_overrides={},
+        generator_overrides=overrides or {},
         checkpoint_dir=str(root / "checkpoints"),
         artifact_root=str(root / "artifacts"),
         resume=False,
@@ -1808,8 +1932,8 @@ def test_run_collection_stages_the_smoke_of_a_prefill_role_glm_plan(monkeypatch,
 def test_formal_glm_run_stages_the_full_point_list(monkeypatch, tmp_path):
     from .test_fpm_runtime_memory import _probe_backed_glm_plan
 
-    plan, _overrides = _probe_backed_glm_plan(tmp_path)
-    staged, receipts, checkpoint = _staged_run(monkeypatch, tmp_path / "run", plan, smoke=False)
+    plan, overrides = _probe_backed_glm_plan(tmp_path)
+    staged, receipts, checkpoint = _staged_run(monkeypatch, tmp_path / "run", plan, smoke=False, overrides=overrides)
 
     full = plan.options.benchmark_points_json.encode()
     full_sha256 = hashlib.sha256(full).hexdigest()
@@ -2213,7 +2337,8 @@ def test_plain_resume_recovers_interrupted_attempt_without_rerun(monkeypatch, tm
     assert record["artifact_recovery"]["original_status"] == "interrupted"
 
 
-def test_recovery_rejects_entries_with_cleanup_error(tmp_path):
+@pytest.mark.parametrize("failed_step", ["cleanup_error", "diagnostic_error"])
+def test_recovery_requires_verified_cleanup_and_diagnostics(tmp_path, failed_step):
     cell = _cell()
     plan = _plan(cell)
     root = tmp_path / "artifacts" / plan.sha256[:16] / "smoke"
@@ -2231,18 +2356,18 @@ def test_recovery_rejects_entries_with_cleanup_error(tmp_path):
         "attempt_id": "attempt-1",
         "error_type": "RuntimeError",
         "error": "result copy was interrupted",
-        "cleanup_error": "kubectl delete timed out",
+        failed_step: "finalization failed",
     }
 
-    # Identical artifacts, but the unverified teardown quarantines the entry:
-    # only a rerun re-drives the verified deletion of the leaked resource.
     assert fpm_runner._recover_completed_attempt(plan, cell, root, entry) is None
-    del entry["cleanup_error"]
+    del entry[failed_step]
     recovered = fpm_runner._recover_completed_attempt(plan, cell, root, entry)
     assert recovered is not None and recovered["status"] == "passed"
 
 
-def test_cleanup_failure_marks_passed_cell_retryable(monkeypatch, tmp_path):
+@pytest.mark.parametrize("private_cleanup", [False, True])
+@pytest.mark.parametrize("diagnostic_failure", [False, True])
+def test_cleanup_failure_marks_passed_cell_retryable(monkeypatch, tmp_path, private_cleanup, diagnostic_failure):
     cell = _cell()
     plan = _plan(cell)
 
@@ -2282,7 +2407,7 @@ def test_cleanup_failure_marks_passed_cell_retryable(monkeypatch, tmp_path):
             # fails the cell before any work); only the post-run teardown
             # raises, which is the state this test pins.
             FakeResource.cleanup_calls += 1
-            if FakeResource.cleanup_calls > 1:
+            if FakeResource.cleanup_calls > 1 and not private_cleanup:
                 raise RuntimeError("owned pod remains")
 
     monkeypatch.setattr(fpm_runner, "_render_cell", render_cell)
@@ -2300,9 +2425,36 @@ def test_cleanup_failure_marks_passed_cell_retryable(monkeypatch, tmp_path):
     checkpoint_dir = tmp_path / "checkpoints"
     checkpoint_dir.mkdir()
 
+    delivery = tmp_path / "private-staging"
+    if private_cleanup:
+        delivery.mkdir()
+
+        def cleanup():
+            raise OSError("private staging deletion denied")
+
+        monkeypatch.setattr(
+            fpm_runner, "new_delivery_directory", lambda *a: SimpleNamespace(name=str(delivery), cleanup=cleanup)
+        )
+
+    if diagnostic_failure:
+        calls = 0
+
+        def sanitize(directory, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                logs = directory / "logs"
+                logs.mkdir(exist_ok=True)
+                (logs / "unsafe.log").write_text("synthetic private diagnostic")
+                raise OSError("diagnostic rewrite denied")
+
+        monkeypatch.setattr(fpm_runner, "redact_diagnostics", sanitize)
+
     errors = run_collection(
         plan,
-        generator_overrides={},
+        generator_overrides={"K8sConfig": {"extra_env": [{"name": "HF_TOKEN", "value": "synthetic-token"}]}}
+        if private_cleanup
+        else {},
         checkpoint_dir=str(checkpoint_dir),
         artifact_root=str(tmp_path / "artifacts"),
         resume=False,
@@ -2311,11 +2463,21 @@ def test_cleanup_failure_marks_passed_cell_retryable(monkeypatch, tmp_path):
         cell_limit=1,
     )
 
-    assert [error["classification"] for error in errors] == ["resource_cleanup_failed"]
+    assert [error["classification"] for error in errors] == [
+        "private_cleanup_failed" if private_cleanup else "resource_cleanup_failed"
+    ] + (["diagnostic_sanitization_failed"] if diagnostic_failure else [])
     checkpoint = json.loads((checkpoint_dir / "fpm_forward_smoke.json").read_text())
     record = checkpoint["cells"][cell.cell_id]
     assert record["status"] == "cleanup_failed"
-    assert record["cleanup_error"] == "owned pod remains"
+    if diagnostic_failure:
+        assert record["diagnostic_error"] == "diagnostic rewrite denied"
+        assert not (Path(record["artifact_dir"]) / "logs" / "unsafe.log").exists()
+    if private_cleanup:
+        assert record["private_cleanup_error"] == "private staging deletion denied"
+        assert record["completed_at"] and "duration_seconds" in record
+        assert (tmp_path / "artifacts/plan-sha/smoke/run-manifest.json").exists()
+    else:
+        assert record["cleanup_error"] == "owned pod remains"
     assert "smoke" not in checkpoint
 
 
@@ -3406,6 +3568,34 @@ def test_user_extra_env_reaches_the_render_request_alongside_collector_identitie
     assert resolved["FPM_RUN_ID"] == cell.cell_id
 
 
+@pytest.mark.parametrize("name", ["FPM_NODE_RANK", "FPM_MASTER_ADDR", "FPM_LOCAL_GPU_COUNT"])
+def test_slurm_launcher_owned_environment_is_reserved(name):
+    cell = _cell()
+    plan = _plan(cell)
+    plan.options.executor = "slurm"
+    with pytest.raises(ValueError, match=f"{name} is owned by the Slurm launcher"):
+        _cell_generator_overrides(plan, cell, {"K8sConfig": {"extra_env": [{"name": name, "value": "1"}]}})
+
+
+@pytest.mark.parametrize(
+    ("name", "rejected"),
+    [
+        ("DYN_BENCH_PREFILL_CONTENT", "private-invalid-input"),
+        ("DYN_BENCH_PREFILL_CONTENT", "zeros"),
+        ("FPM_FINALIZATION_TIMEOUT_SECONDS", "private-invalid-input"),
+    ],
+)
+def test_direct_delivery_rejects_invalid_collection_controls(name, rejected):
+    from collector.fpm_forward.config import archive_generator_overrides, resolve_archived_generator_overrides
+
+    overrides = {"K8sConfig": {"extra_env": [{"name": name, "value": rejected}]}}
+    archived = archive_generator_overrides(overrides)
+    for inputs in (overrides, archived):
+        with pytest.raises(ValueError, match=name) as error:
+            resolve_archived_generator_overrides(inputs, environment={name: rejected})
+        assert rejected not in str(error.value)
+
+
 def test_user_extra_env_conflicting_with_collector_identity_fails_closed():
     cell = _cell()
     plan = _plan(cell)
@@ -3916,14 +4106,16 @@ def test_startup_environment_activates_the_runtime_adapter_before_preflight(tmp_
             directory = tmp_path / kind / phase
             directory.mkdir(parents=True)
             fpm_runner._write_runtime_environment(directory, _cell_generator_overrides(plan, cell, {}))
-            # The default and V4.1 files are the ones from before the GLM-5.3-Flash adapter.
-            assert (directory / fpm_runner.RUNTIME_ENV_FILENAME).read_text().splitlines() == [
-                "# Generated Collector startup environment; engine settings remain in run.sh.",
-                *lines,
-                "export FPM_READINESS_TIMEOUT_SECONDS=900",
-                "export DYN_BENCH_KV_WARMUP=on",
-                "export DYN_BENCH_PREFILL_REAL_SEED=on",
-            ]
+            startup = (directory / fpm_runner.RUNTIME_ENV_FILENAME).read_text().splitlines()
+            assert set(lines) <= set(startup)
+            assert f"export FPM_RUN_ID={cell.cell_id}" in startup
+            assert "export DYN_FPM_BENCHMARK_OUTPUT_PATH=/results/benchmark.json" in startup
+            assert "export FPM_READINESS_TIMEOUT_SECONDS=900" in startup
+            assert "export DYN_BENCH_KV_WARMUP=on" in startup
+            assert "export DYN_BENCH_PREFILL_REAL_SEED=on" in startup
+            for other, other_lines in adapter_lines.items():
+                if other != kind:
+                    assert not set(other_lines).difference(lines).intersection(startup)
 
 
 @pytest.mark.parametrize("transport", ["kubernetes", "slurm"])
@@ -3949,6 +4141,12 @@ def test_generated_finalization_budget_reaches_staged_collector(
     base = {"K8sConfig": {"k8s_image": "nvcr.io/nvidia/ai-dynamo/vllm-runtime:test"}}
     if budget is not None:
         base["K8sConfig"]["extra_env"] = [{"name": "FPM_FINALIZATION_TIMEOUT_SECONDS", "value": budget}]
+    invalid_budget = budget in ("", "0", "3601", "invalid")
+    if invalid_budget:
+        with pytest.raises(ValueError, match="collection control FPM_FINALIZATION_TIMEOUT_SECONDS"):
+            _render_cell(_plan(cell), cell, tmp_path, base)
+        del base["K8sConfig"]["extra_env"]
+        inherited = budget
     _render_cell(_plan(cell), cell, tmp_path, base)
     files = [tmp_path / name for name in ("fpm_env.sh", "collector-runtime-env.sh", "run.sh")]
 
@@ -4010,7 +4208,7 @@ def test_generated_finalization_budget_reaches_staged_collector(
         timeout=10,
         check=False,
     )
-    if budget in ("", "0", "3601", "invalid"):
+    if invalid_budget:
         assert completed.returncode == 2, completed.stderr
         assert "FPM_FINALIZATION_TIMEOUT_SECONDS must be an integer from 1 through 3600" in completed.stderr
         assert not completed.stdout
@@ -4111,3 +4309,489 @@ def test_nested_llm_config_checkpoint_reaches_the_parsed_metadata_and_the_render
     assert request["ModelConfig"]["is_moe"] is True
     assert request["ModelConfig"]["required_tp"] == 1
     assert "--model private-org/pod-only-omni" in (cell_dir / "run.sh").read_text()
+
+
+def test_checkpoint_metadata_uses_already_audited_bundle_without_reopening_source():
+    from collector.fpm_forward import runtime_k31
+
+    cell = _cell(phase="decode", strategy="tep")
+    base = _plan(cell)
+    base.capability.architecture = "KimiK31ForConditionalGeneration"
+    runtime = json.loads((Path(runtime_k31.__file__).parent / "runtime/vllm-kimi-k31.example.json").read_text())[
+        "runtime"
+    ]
+
+    class FrozenPlan:
+        def __getattr__(self, name):
+            if name == "runtime_instrumentation":
+                raise AssertionError("metadata reopened the original source bundle")
+            return getattr(base, name)
+
+    assert _configured_sampling_metadata(
+        FrozenPlan(), cell, smoke=False, bundle=SimpleNamespace(manifest={"runtime": runtime})
+    ) == {"decode_prefix_caching": "disabled"}
+
+
+@pytest.mark.parametrize("history", [0, 128])
+def test_k31_prefill_acceptance_and_recovery_require_zero_history(tmp_path, history):
+    cell = _cell(phase="prefill")
+    plan = _plan(cell)
+    plan.capability.architecture = "KimiK31ForConditionalGeneration"
+    raw = tmp_path / "cells" / cell.cell_id / "raw" / "pod-0"
+    raw.mkdir(parents=True)
+    payload = _native_payload(phase="prefill", rank=0, dp=1, prefill_history=history)
+    path = raw / "benchmark.json"
+    path.write_text(json.dumps(payload))
+    before = path.read_bytes()
+    _write_provenance(
+        raw / "collector-provenance.json", cell_id=cell.cell_id, plan_sha256=plan.sha256, attempt_id="attempt"
+    )
+    if history:
+        from collector.fpm_forward.database import KdaSeedError
+
+        with pytest.raises(KdaSeedError, match="zero historical KV"):
+            _runtime_collection_summary(cell, raw.parent, plan=plan)
+    else:
+        assert _runtime_collection_summary(cell, raw.parent, plan=plan)["measured_point_count"] == 1
+    recovered = fpm_runner._recover_completed_attempt(
+        plan, cell, tmp_path, {"status": "failed", "attempt_id": "attempt"}
+    )
+    assert (recovered is None) == bool(history)
+    if not history:
+        assert recovered["status"] == "passed"
+    assert path.read_bytes() == before  # rejection never rewrites retained truth
+
+
+@pytest.mark.parametrize("status", ["passed", "failed"])
+@pytest.mark.parametrize("marker", ["kvwarm_fake_fallback", "kvwarm_real_kv", "disabled"])
+def test_kda_resume_retries_unpublishable_seed_and_keeps_real_state_passed(tmp_path, monkeypatch, status, marker):
+    from .test_fpm_forward import _WARM_ELIGIBLE, _synthetic_decode_cell
+
+    _, cell, source = _synthetic_decode_cell(
+        tmp_path,
+        kvwarm=_WARM_ELIGIBLE,
+        markers=("kvwarm_real_kv" if marker == "disabled" else marker,),
+        parallel_strategy="pure_tp" if marker == "disabled" else "tp",
+    )
+    plan = _plan(cell)
+    plan.capability.model_config = ResolvedModelConfig(
+        {"linear_attn_config": {"num_heads": 12, "head_dim": 128}},
+        source_kind="test",
+        source_reference="synthetic KDA state",
+    )
+    artifact_root = tmp_path / "campaign"
+    cell_dir = artifact_root / plan.sha256[:16] / "smoke" / "cells" / cell.cell_id
+    shutil.copytree(source, cell_dir)
+    payload = json.loads((cell_dir / "raw/pod-0/benchmark.json").read_text())
+    if marker == "disabled":
+        (cell_dir / "raw/pod-0/benchmark.json").write_text(
+            json.dumps({**payload, "kvwarm": {**payload["kvwarm"], "enabled": False}})
+        )
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    checkpoint_path = checkpoint_dir / "fpm_forward_smoke.json"
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "schema": fpm_runner.CHECKPOINT_SCHEMA,
+                "plan_sha256": plan.sha256,
+                "cells": {cell.cell_id: {"status": status, "attempt_id": "attempt"}},
+            }
+        )
+    )
+    attempts = []
+
+    def render(*args, **kwargs):
+        attempts.append(True)
+        directory = args[2]
+        (directory / "k8s_deploy.yaml").write_text("apiVersion: v1\nkind: Pod\nmetadata:\n  name: cell\n")
+        for name in ("run.sh", "fpm_env.sh", "collector-runtime-env.sh"):
+            (directory / name).write_text("#!/bin/sh\n")
+
+    class Resource:
+        def __init__(self, *_args):
+            pass
+
+        def cleanup(self):
+            pass
+
+        def apply(self):
+            pass
+
+        def wait_ready(self, *_args):
+            return ["pod-0"]
+
+        def stage(self, *_args):
+            pass
+
+        def prepare_attempt(self, _pods, **kwargs):
+            self.identity = kwargs
+
+        def execute(self, *_args):
+            pass
+
+        def collect(self, *_args, **kwargs):
+            raw = cell_dir / "raw/pod-0"
+            raw.mkdir(parents=True, exist_ok=True)
+            # The fresh synthetic attempt supplies publishable state evidence.
+            (raw / "benchmark.json").write_text(json.dumps(payload).replace("kvwarm_fake_fallback", "kvwarm_real_kv"))
+            _write_provenance(
+                raw / "collector-provenance.json",
+                cell_id=cell.cell_id,
+                plan_sha256=plan.sha256,
+                attempt_id=self.identity["attempt_id"],
+            )
+
+    monkeypatch.setattr(fpm_runner, "_render_cell", render)
+    monkeypatch.setattr(fpm_runner, "KubernetesCellRunner", Resource)
+    assert (
+        run_collection(
+            plan,
+            generator_overrides={},
+            checkpoint_dir=str(checkpoint_dir),
+            artifact_root=str(artifact_root),
+            resume=True,
+            retry_failed=True,
+            smoke=True,
+        )
+        == []
+    )
+    record = json.loads(checkpoint_path.read_text())["cells"][cell.cell_id]
+    assert record["status"] == "passed"
+    assert attempts == ([True] if marker != "kvwarm_real_kv" else [])
+    assert (record["attempt_id"] == "attempt") == (marker == "kvwarm_real_kv")
+
+
+@pytest.mark.parametrize("missing_rank", [None, 0, 1])
+def test_k31_native_exact_context_is_required_on_every_decode_rank(tmp_path, missing_rank):
+    cell = _cell(phase="decode", dp=2)
+    plan = _plan(cell)
+    plan.capability.architecture = "KimiK31ForConditionalGeneration"
+    plan.capability.model_config = ResolvedModelConfig(
+        {"linear_attn_config": {}}, source_kind="test", source_reference="synthetic KDA"
+    )
+    for rank in range(2):
+        raw = tmp_path / str(rank)
+        raw.mkdir()
+        _write_provenance(raw / "collector-provenance.json", cell_id=cell.cell_id)
+        payload = _native_payload(phase="decode", rank=rank, dp=2)
+        payload["kvwarm"] = {"enabled": True, "warm_eligible": True, "skip_reason": None}
+        if rank != missing_rank:
+            payload["kvwarm"]["initialization_strategy"] = "native_exact_context"
+
+        def stamp(value):
+            if isinstance(value, dict):
+                if "point_type" in value:
+                    value["sample_reasons"] = ["kvwarm_real_kv"]
+                for item in value.values():
+                    stamp(item)
+            elif isinstance(value, list):
+                for item in value:
+                    stamp(item)
+
+        stamp(payload)
+        (raw / "benchmark.json").write_text(json.dumps(payload))
+    if missing_rank is None:
+        assert _runtime_collection_summary(cell, tmp_path, plan=plan)["measured_point_count"] == 1
+    else:
+        with pytest.raises(ValueError, match="KDA decode publication requires real_kv"):
+            _runtime_collection_summary(cell, tmp_path, plan=plan)
+    # Older KDA models retain their existing envelope contract.
+    plan.capability.architecture = "OtherKdaModel"
+    assert _runtime_collection_summary(cell, tmp_path, plan=plan)["measured_point_count"] == 1
+
+
+@pytest.mark.parametrize("history", [0, 128])
+@pytest.mark.parametrize("status", ["passed", "failed"])
+def test_k31_prefill_resume_retries_historical_kv_and_retains_zero_history(tmp_path, monkeypatch, history, status):
+    cell = _cell(phase="prefill")
+    plan = _plan(cell)
+    plan.capability.architecture = "KimiK31ForConditionalGeneration"
+    root = tmp_path / "artifacts" / plan.sha256[:16] / "smoke"
+    raw = root / "cells" / cell.cell_id / "raw" / "pod-0"
+    raw.mkdir(parents=True)
+    payload = _native_payload(phase="prefill", rank=0, dp=1, prefill_history=history)
+    (raw / "benchmark.json").write_text(json.dumps(payload))
+    _write_provenance(
+        raw / "collector-provenance.json", cell_id=cell.cell_id, plan_sha256=plan.sha256, attempt_id="original"
+    )
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    checkpoint_path = checkpoint_dir / "fpm_forward_smoke.json"
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "schema": fpm_runner.CHECKPOINT_SCHEMA,
+                "plan_sha256": plan.sha256,
+                "cells": {cell.cell_id: {"status": status, "attempt_id": "original"}},
+            }
+        )
+    )
+    # This CPU fixture tests retry admission, independently of the existing
+    # source-bound worker/instrumentation qualification tests.
+    monkeypatch.setattr(fpm_runner, "_require_k31_execution_inputs", lambda _: None)
+    attempts = []
+
+    def render(*args, **kwargs):
+        attempts.append(True)
+        raise RuntimeError("synthetic retry admitted; no GPU launch")
+
+    monkeypatch.setattr(fpm_runner, "_render_cell", render)
+    errors = run_collection(
+        plan,
+        generator_overrides={},
+        checkpoint_dir=str(checkpoint_dir),
+        artifact_root=str(tmp_path / "artifacts"),
+        resume=True,
+        retry_failed=True,
+        smoke=True,
+    )
+    record = json.loads(checkpoint_path.read_text())["cells"][cell.cell_id]
+    assert attempts == ([True] if history else [])
+    assert record["status"] == ("failed" if history else "passed")
+    assert bool(errors) == bool(history)
+    if not history:
+        assert record["attempt_id"] == "original"
+
+
+def test_real_renderer_archives_environment_digest_and_delivers_runtime_value(tmp_path):
+    import hashlib
+    import subprocess
+
+    token = 'synthetic-"private"-$746'
+    cell = _cell(dp=4)
+    _render_cell(_plan(cell), cell, tmp_path, {"K8sConfig": {"extra_env": [{"name": "HF_TOKEN", "value": token}]}})
+    saved = json.loads((tmp_path / "generator-request.json").read_text())
+    entry = next(item for item in saved["K8sConfig"]["extra_env"] if item["name"] == "HF_TOKEN")
+    assert entry == {
+        "name": "HF_TOKEN",
+        "value_from_env": "HF_TOKEN",
+        "value_sha256": hashlib.sha256(token.encode()).hexdigest(),
+    }
+    # Inspect the engine script's literal shell export through Bash, without
+    # starting the benchmark or evaluating other generated launch commands.
+    line = next(line for line in (tmp_path / "run.sh").read_text().splitlines() if line.startswith("export HF_TOKEN="))
+    result = subprocess.run(
+        ["bash", "-c", line + '\nprintf %s "$HF_TOKEN"'], check=True, text=True, capture_output=True
+    )
+    assert result.stdout == token
+
+
+def test_pythonhome_is_rejected_before_fpm_startup_artifacts(tmp_path):
+    cell = _cell(dp=4)
+    with pytest.raises(ValueError, match="PYTHONHOME"):
+        _render_cell(
+            _plan(cell), cell, tmp_path, {"K8sConfig": {"extra_env": [{"name": "PYTHONHOME", "value": "/alternate"}]}}
+        )
+    assert not (tmp_path / "fpm_env.sh").exists()
+    assert not (tmp_path / "run.sh").exists()
+
+
+@pytest.mark.parametrize("archived", [False, True])
+def test_collection_checks_deployment_identity_before_writing_or_scheduling(tmp_path, monkeypatch, archived):
+    from collector.fpm_forward.config import archive_generator_overrides, semantic_generator_overrides
+    from collector.fpm_forward.planner import _canonical_hash
+
+    plan = _plan(_cell())
+    accepted = {"K8sConfig": {"extra_env": [{"name": "OMP_NUM_THREADS", "value": "4"}]}}
+    plan.generator_config_sha256 = _canonical_hash(semantic_generator_overrides(accepted))
+    changed = {"K8sConfig": {"extra_env": [{"name": "OMP_NUM_THREADS", "value": "8"}]}}
+    monkeypatch.setattr(fpm_runner, "_render_cell", lambda *_a, **_k: pytest.fail("scheduled a changed deployment"))
+    with pytest.raises(ValueError, match="differ from the frozen collection plan"):
+        run_collection(
+            plan,
+            generator_overrides=archive_generator_overrides(changed) if archived else changed,
+            checkpoint_dir=str(tmp_path / "checkpoint"),
+            artifact_root=str(tmp_path / "artifacts"),
+            resume=False,
+            retry_failed=False,
+        )
+    assert not (tmp_path / "artifacts").exists()
+    assert not (tmp_path / "checkpoint").exists()
+    # Matching references pass identity verification without replay credentials.
+    overrides = archive_generator_overrides(accepted) if archived else accepted
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+
+    def identity_accepted(_plan):
+        raise RuntimeError("identity accepted")
+
+    monkeypatch.setattr(fpm_runner, "_require_k31_execution_inputs", identity_accepted)
+    with pytest.raises(RuntimeError, match="identity accepted"):
+        run_collection(
+            plan,
+            generator_overrides=overrides,
+            checkpoint_dir=str(tmp_path / "checkpoint"),
+            artifact_root=str(tmp_path / "artifacts"),
+            resume=False,
+            retry_failed=False,
+        )
+
+
+@pytest.mark.parametrize("failure", [False, True])
+@pytest.mark.parametrize("token", ['synthetic-private-"worker-stream"', "private-\"both'-quotes"])
+def test_kubernetes_worker_streams_redact_configured_private_values(tmp_path, monkeypatch, failure, token):
+    resource = _runner(tmp_path)
+    resource._private_values = (token,)
+
+    def run(pod, timeout):
+        if failure:
+            raise RuntimeError("worker stderr " + token)
+        return pod, subprocess.CompletedProcess([], 0, "stdout " + token, "stderr " + token)
+
+    resource._run_pod = run
+    if failure:
+        with pytest.raises(RuntimeError, match="worker stderr <redacted>"):
+            resource.execute(["pod-0"])
+    else:
+        resource.execute(["pod-0"])
+    logs = list((tmp_path / "logs").glob("*.log"))
+    assert logs
+    assert all(token not in path.read_text() and "<redacted>" in path.read_text() for path in logs)
+
+
+@pytest.mark.parametrize("teardown_fails", [False, True])
+def test_collection_reclaims_private_slurm_receipt_after_verified_teardown(tmp_path, monkeypatch, teardown_fails):
+    from collector.fpm_forward.private_inputs import RECEIPT, SlurmDelivery
+
+    cell = _cell()
+    plan = _plan(cell)
+    plan.options.executor = "slurm"
+    plan.options.slurm_cpus_per_task = 8
+    plan.options.slurm_cpu_bind = "cores"
+    artifacts = tmp_path / "artifacts"
+    directory = artifacts / plan.sha256[:16] / "smoke/cells" / cell.cell_id
+    directory.mkdir(parents=True)
+    (directory / "k8s_deploy.yaml").write_text("synthetic owned Slurm identity")
+    monkeypatch.setenv("AISIMULATE_PRIVATE_DELIVERY_ROOT", str(tmp_path / "shared-private-delivery"))
+    abandoned = SlurmDelivery(artifacts, directory)
+    private_path = Path(abandoned.name)
+    (private_path / "run.sh").write_text("synthetic private delivery")
+    events = []
+
+    def cleanup():
+        events.append("teardown")
+        assert private_path.exists() == (len(events) == 1 or teardown_fails)
+        if teardown_fails:
+            raise RuntimeError("owned Slurm step remains")
+
+    def render(*args, **kwargs):
+        events.append("render")
+        assert not private_path.exists()
+        raise RuntimeError("synthetic stop after verified reclaim")
+
+    monkeypatch.setattr(fpm_runner, "_cell_runner", lambda *args: SimpleNamespace(cleanup=cleanup))
+    monkeypatch.setattr(fpm_runner, "_render_cell", render)
+    errors = run_collection(
+        plan,
+        generator_overrides={},
+        checkpoint_dir=str(tmp_path / "checkpoint"),
+        artifact_root=str(artifacts),
+        resume=False,
+        retry_failed=False,
+        smoke=True,
+    )
+    assert errors
+    assert private_path.exists() == teardown_fails
+    assert (directory / RECEIPT).exists() == teardown_fails
+    assert events == (["teardown"] if teardown_fails else ["teardown", "teardown", "render"])
+
+
+def test_config_redaction_keeps_numeric_measurements_and_backend_markers(tmp_path):
+    from collector.fpm_forward.private_inputs import redact_diagnostics
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    measured = raw / "benchmark.json"
+    measured.write_text(json.dumps({"latency_ms": 0.044, "batch_size": 4}))
+    before = measured.read_bytes()
+    config = raw / "resolved-config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "config": {
+                    "engine_args": {"kernel_config": {"moe_backend": "triton"}},
+                    "environment": {"OMP_NUM_THREADS": "4", "PRIVATE_INPUT": "triton"},
+                    "max_model_len": 4096,
+                }
+            }
+        )
+    )
+    cell = SimpleNamespace(
+        backend_policy=SimpleNamespace(expected_markers={"config.engine_args.kernel_config.moe_backend": "triton"})
+    )
+    binary = raw / "bad-config.log"
+    binary.write_bytes(b"\xfftriton")
+    redact_diagnostics(tmp_path, ("4", "triton"), cell=cell)
+    assert not binary.exists()
+    assert measured.read_bytes() == before
+    saved = json.loads(config.read_text())["config"]
+    assert saved["max_model_len"] == 4096
+    assert saved["environment"]["OMP_NUM_THREADS"] == "<redacted>"
+    assert saved["environment"]["PRIVATE_INPUT"] == "<redacted>"
+    assert saved["engine_args"]["kernel_config"]["moe_backend"] == "triton"
+
+
+def test_private_fp8_value_preserves_the_declared_kimi_indexer_marker(tmp_path):
+    from collector.fpm_forward.config import archive_generator_overrides
+    from collector.fpm_forward.database import _validate_backend_markers
+    from collector.fpm_forward.private_inputs import sanitize_recovered_diagnostics
+
+    override = {"name": "PRIVATE_INPUT", "value": "fp8"}
+    archived = archive_generator_overrides({"K8sConfig": {"extra_env": [override]}})
+    assert archived["K8sConfig"]["extra_env"][0]["value_from_env"] == "PRIVATE_INPUT"
+    marker = "config.engine_args.attention_config.indexer_kv_dtype"
+    cell = SimpleNamespace(backend_policy=SimpleNamespace(expected_markers={marker: "fp8"}))
+    path = tmp_path / "raw" / "worker" / "resolved-config.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "config": {
+                    "engine_args": {"attention_config": {"indexer_kv_dtype": "fp8"}},
+                    "environment": {"PRIVATE_INPUT": "fp8"},
+                }
+            }
+        )
+    )
+    sanitize_recovered_diagnostics(tmp_path, archived, cell=cell, environment={"PRIVATE_INPUT": "fp8"})
+    _validate_backend_markers(cell, tmp_path)
+    assert json.loads(path.read_text())["config"]["environment"]["PRIVATE_INPUT"] == "<redacted>"
+
+
+def test_worker_repr_error_redacts_both_quote_characters(tmp_path, monkeypatch):
+    from collector.fpm_forward.private_inputs import redact
+
+    token = "synthetic-'both\"-quotes\\secret"
+    resource = _runner(tmp_path)
+    resource._private_values = (token,)
+    resource._kubectl = lambda *a, **kw: subprocess.CompletedProcess([], 1, "", "worker stderr " + token)
+    resource._run_pod = lambda pod, timeout: resource._exec_checked(pod, ["worker"], timeout=timeout)
+    with pytest.raises(RuntimeError) as error:
+        resource.execute(["pod-0"])
+    diagnostics = str(error.value) + (tmp_path / "logs/pod-0.run.stderr.log").read_text()
+    for encoded in (token, repr(token)[1:-1], json.dumps(token)[1:-1]):
+        assert encoded not in diagnostics
+    assert "<redacted>" in diagnostics
+    assert redact(token, (token,)) == "<redacted>"
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_slurm_private_delivery_requires_explicit_shared_root(tmp_path, monkeypatch, configured):
+    from collector.fpm_forward.private_inputs import RECEIPT, SlurmDelivery
+
+    campaign = tmp_path / "campaign"
+    cell = campaign / "cell"
+    cell.mkdir(parents=True)
+    root = tmp_path / "shared"
+    monkeypatch.delenv("AISIMULATE_PRIVATE_DELIVERY_ROOT", raising=False)
+    if not configured:
+        with pytest.raises(ValueError, match="requires AISIMULATE_PRIVATE_DELIVERY_ROOT"):
+            SlurmDelivery(campaign, cell)
+        assert not (cell / RECEIPT).exists()
+        return
+    monkeypatch.setenv("AISIMULATE_PRIVATE_DELIVERY_ROOT", str(root))
+    delivery = SlurmDelivery(campaign, cell)
+    assert Path(delivery.name).parent == root
+    assert root.stat().st_mode & 0o777 == 0o700
+    delivery.cleanup()
+    assert not Path(delivery.name).exists()

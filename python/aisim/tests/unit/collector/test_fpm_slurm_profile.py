@@ -22,6 +22,7 @@ from .test_fpm_cpu_affinity import _snapshot
 from .test_fpm_profile_collection import _argv, _plan, _profile, no_models_or_timing_data  # noqa: F401
 from .test_fpm_runner import _native_payload
 from .test_fpm_runtime_memory import _initialized
+from .test_fpm_runtime_probe import shared_private_delivery_root  # noqa: F401
 
 pytestmark = pytest.mark.unit
 
@@ -153,6 +154,11 @@ class _SyntheticSlurm:
             assert raw.name == f"node{rank:04d}"
             assert "FPM_MASTER_ADDR=node-a" in args
             command = args[args.index("/usr/bin/env") + 6 :]
+            if command[:2] == ["bash", "-c"]:
+                assert command[3] == "fpm-attempt-provenance"
+                assert "source /tmp/fpm-bench/collector-runtime-env.sh" in command[2]
+                assert (stage / "collector-runtime-env.sh").is_file()
+                command = command[4:]
             if command[:2] == ["python3", "-c"]:
                 # Interpret the actual preparation program with the Pyxis /results mount mapped locally.
                 with self.patch.context() as patch:

@@ -56,6 +56,7 @@ from aisim_core.sdk.errors import InvalidEngineConfigurationError as InvalidEngi
 from aisim_core.sdk.fpm_profile import (
     FpmDeploymentProfile,
     FpmModelProfile,
+    _fpm_kda_state_dtype,
     _load_fpm_timing_profile,
 )
 from aisim_core.sdk.models import get_model
@@ -165,8 +166,10 @@ from aisim_core.sdk.rust_engine_step import (
 #   independent F-node width.
 # - 31 (Kimi K3.1 DSA): DsaModuleOp records the sparse attention backend and
 #   cache layout. Legacy JSON defaults apply; v30 binary specs require recompilation.
+# - 32 (KDA FPM state precision): observed recurrent dtype appended to KdaOp.
 # Single owner: the Rust crate constant. Python re-exports it for
 # diagnostics/tests instead of declaring a twin to keep in sync.
+# Schema 30 adds P2P fabric selectors and independent AFD F-node width.
 ENGINE_SPEC_SCHEMA_VERSION = aisim_core.engine_spec_schema_version()
 ENGINE_CONFIG_SCHEMA_VERSION = 1
 
@@ -180,6 +183,36 @@ class OpConversionError(RuntimeError):
 # --------------------------------------------------------------------------- #
 # Op -> wire. Ops are Rust objects; conversion is delegated to the engine.
 # --------------------------------------------------------------------------- #
+
+
+def _bind_fpm_kda_state_dtype(spec: dict, deployment: FpmDeploymentProfile) -> None:
+    """Carry the selected deployment's recorded state precision into SOL ops.
+
+    The runtime observation importer retains the complete resolved cache
+    configuration in runtime_memory.provenance. Missing evidence remains
+    unknown; the Rust SOL boundary decides which precisions it can price.
+    """
+    kda_ops = []
+
+    def collect(value):
+        if isinstance(value, list):
+            for child in value:
+                collect(child)
+        elif isinstance(value, dict):
+            if "Kda" in value:
+                kda_ops.append(value["Kda"])
+            else:
+                for child in value.values():
+                    collect(child)
+
+    collect(spec["context_ops"])
+    collect(spec["generation_ops"])
+    if not kda_ops:
+        return
+
+    dtype = _fpm_kda_state_dtype(deployment)
+    for op in kda_ops:
+        op["recurrent_state_dtype"] = dtype
 
 
 def _fpm_spec_dict(op: FPMForwardOp) -> dict:
@@ -746,7 +779,11 @@ def compile_engine(
     ):
         resolve_trtllm_mla_compute(model_config, model_path, backend, load_system_spec(system, systems_path))
     if afd_pool_role is None:
-        model = get_model(model_path, model_config, backend)
+        model = (
+            get_model(model_path, model_config, backend, model_revision=profile.model_revision)
+            if profile is not None
+            else get_model(model_path, model_config, backend)
+        )
     else:
         from aisim_core.sdk.models.afd import build_afd_model
 
@@ -799,6 +836,8 @@ def compile_engine(
         )
         if deployment.worker_type is not None:
             spec["engine"]["extra"]["worker_type"] = worker_type
+        if forward_model == "fpm":
+            _bind_fpm_kda_state_dtype(spec, deployment)
         spec_json = json.dumps(spec)
 
     return bytes(aisim_core.engine_spec_bincode_from_json(spec_json))
@@ -822,7 +861,9 @@ def _direct_fpm_spec_json(
 ) -> str:
     """Build whole-forward timing operations from metadata, without a graph."""
     if _database_mode_name(None, database_mode) != "SILICON":
-        raise ValueError("direct FPM interpolation requires database_mode='SILICON'; it has no analytical SOL model")
+        raise InvalidEngineConfigurationError(
+            "direct FPM interpolation requires database_mode='SILICON'; it has no analytical SOL model"
+        )
     identity = deployment.match_identity()
     execution = deployment.execution_profile
     if execution is not None:

@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import statistics
+import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -1562,8 +1564,9 @@ def test_complete_measurement_survives_later_collection_error_and_is_not_replace
     ("collector_status", "cleanup_error"),
     [("failed", False), ("interrupted", False), ("running", False), ("failed", True)],
 )
+@pytest.mark.parametrize("archived_auth", [False, True])
 def test_complete_failed_native_observation_requires_cpu_recovery_without_replacement(
-    campaign, tmp_path, monkeypatch, collector_status, cleanup_error
+    campaign, tmp_path, monkeypatch, collector_status, cleanup_error, archived_auth
 ):
     calls = _fake_collector(monkeypatch, factors=[3, 1, 1, 1, 1])
     collect = repeatability.run_collection
@@ -1576,6 +1579,9 @@ def test_complete_failed_native_observation_requires_cpu_recovery_without_replac
             path = Path(kwargs["checkpoint_dir"]) / "fpm_forward.json"
             checkpoint = json.loads(path.read_text())
             entry = checkpoint["cells"][cell_id]
+            if archived_auth:
+                raw = Path(kwargs["artifact_root"]) / plan.sha256[:16] / "cells" / cell_id / "raw"
+                (raw / "recovery-config.json").write_text(json.dumps({"value": token}))
             entry.update(status=collector_status, error_type="RuntimeError", error="log retrieval failed")
             if cleanup_error:
                 entry["cleanup_error"] = "teardown timed out"
@@ -1587,6 +1593,23 @@ def test_complete_failed_native_observation_requires_cpu_recovery_without_replac
 
     monkeypatch.setattr(repeatability, "run_collection", fail_after_native_collection)
     args = _args(campaign, tmp_path)
+    if archived_auth:
+        from collector.fpm_forward.config import archive_generator_overrides, semantic_generator_overrides
+
+        token = 'synthetic-"recovery"-credential'
+        original_plan, source, checkpoint = campaign
+        deployment = {"K8sConfig": {"extra_env": [{"name": "HF_TOKEN", "value": token}]}}
+        original_plan = replace(
+            original_plan,
+            generator_config_sha256=repeatability._canonical_hash(semantic_generator_overrides(deployment)),
+        )
+        original_plan = repeatability._subset_plan(
+            original_plan,
+            {"cell_id": cell_id, "benchmark_points": json.loads(original_plan.options.benchmark_points_json)},
+        )
+        _write_campaign(source, checkpoint, original_plan, generator_overrides=deployment)
+        args.update(source_plan=original_plan, generator_overrides=archive_generator_overrides(deployment))
+        monkeypatch.setenv("HF_TOKEN", token)
     if collector_status == "interrupted":
         with pytest.raises(KeyboardInterrupt, match="artifacts were copied"):
             repeatability.run_repeatability(**args)
@@ -1601,21 +1624,98 @@ def test_complete_failed_native_observation_requires_cpu_recovery_without_replac
     checkpoint_path = Path(calls[0][1]["checkpoint_dir"]) / "fpm_forward.json"
     original_checkpoint = checkpoint_path.read_bytes()
 
+    if archived_auth:
+        monkeypatch.delenv("HF_TOKEN")
     recover = repeatability._recover_completed_attempt
-    monkeypatch.setattr(repeatability, "_recover_completed_attempt", lambda *_args: None)
+    monkeypatch.setattr(repeatability, "_recover_completed_attempt", lambda *_args, **_kwargs: None)
     result = repeatability.run_repeatability(**args, resume=True, retry_failed=True)
     attempt = result["samples"][cell_id][0]["attempts"][0]
     assert len(calls) == 1 and result["status"] == "incomplete"
     assert attempt["postprocessing_attempts"][-1]["status"] == "failed"
     assert "cannot be replaced" in attempt["postprocessing_attempts"][-1]["error"]
 
-    monkeypatch.setattr(repeatability, "_recover_completed_attempt", recover)
+    def recover_with_context(*positional, generator_overrides, **kwargs):
+        assert generator_overrides == args["generator_overrides"]
+        return recover(*positional, generator_overrides=generator_overrides, **kwargs)
+
+    monkeypatch.setattr(repeatability, "_recover_completed_attempt", recover_with_context)
+    retry_slurm = collector_status == "running"
+    if retry_slurm:
+        from collector.fpm_forward.slurm import SlurmCellRunner
+
+        def slurm_runner(_plan, _cell, manifest, cell_dir):
+            return SlurmCellRunner(manifest, cell_dir, image="test-image", mounts=(), total_gpus=1)
+
+        with monkeypatch.context() as scoped:
+            scoped.setenv("SLURM_JOB_ID", "12345")
+            scoped.setattr(runner, "_cell_runner", slurm_runner)
+            scoped.setattr(runner, "_expected_nodes", lambda _: 1)
+
+            def unavailable(args, **_kwargs):
+                assert args[0] == "squeue"
+                raise subprocess.CalledProcessError(1, args, stderr="scheduler unavailable")
+
+            scoped.setattr(runner, "_run_command", unavailable)
+            failed = repeatability.run_repeatability(**args, resume=True, retry_failed=True)
+            assert failed["samples"][cell_id][0]["attempts"][0]["status"] != "passed"
+            failure = next(args["output_dir"].rglob("transport-failures/*/failure.json"))
+            assert json.loads(failure.read_text())["executable"] == "squeue"
+            assert (failure.parent / "stderr.log").is_file() == (not archived_auth)
+            native = next(args["output_dir"].rglob("benchmark-*.json"))
+            original = native.read_bytes()
+            native.write_bytes(original + b" ")
+            with pytest.raises(ValueError, match="attempt files changed"):
+                repeatability.run_repeatability(**args, resume=True, retry_failed=True)
+            native.write_bytes(original)
+            assert len(calls) == 1
+        monkeypatch.setattr(runner, "_cell_runner", slurm_runner)
+        monkeypatch.setattr(runner, "_expected_nodes", lambda _: 1)
+        monkeypatch.setenv("SLURM_JOB_ID", "12345")
+        monkeypatch.setattr(runner, "_run_command", lambda *_a, **_k: SimpleNamespace(stdout=""))
+    interrupt_recovery = archived_auth and collector_status == "interrupted"
+    if interrupt_recovery:
+        report_path = args["output_dir"] / repeatability.REPORT_FILENAME
+        durable_reports = []
+        reconcile = repeatability._reconcile_diagnostic
+
+        def interrupt_after_unlink(attempt, files, cell_path):
+            intent = attempt.get("pending_diagnostic") or {}
+            if intent.get("path", "").endswith("recovery-config.json"):
+                durable_reports.append(report_path.read_bytes())
+                raise KeyboardInterrupt("interrupted after sanitization")
+            return reconcile(attempt, files, cell_path)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(repeatability, "_reconcile_diagnostic", interrupt_after_unlink)
+            with pytest.raises(KeyboardInterrupt, match="after sanitization"):
+                repeatability.run_repeatability(**args, resume=True, retry_failed=True)
+        # Emulate process loss before the outer finally can publish its report.
+        report_path.write_bytes(durable_reports[0])
+        native = next(args["output_dir"].rglob("benchmark-*.json"))
+        original_native = native.read_bytes()
+        native.write_bytes(original_native + b" ")
+        with pytest.raises(ValueError, match="attempt files changed"):
+            repeatability.run_repeatability(**args, resume=True, retry_failed=True)
+        native.write_bytes(original_native)
+    if archived_auth:
+        # Recovery completes with no token. Only the following new sample
+        # needs auth, and fails before allocating a replacement attempt.
+        with pytest.raises(ValueError, match="requires the original value"):
+            repeatability.run_repeatability(**args, resume=True, retry_failed=True)
+        saved = json.loads((args["output_dir"] / repeatability.REPORT_FILENAME).read_text())
+        assert saved["samples"][cell_id][0]["attempts"][0]["status"] == "passed"
+        assert not list(args["output_dir"].rglob("recovery-config.json"))
+        assert len(calls) == 1
+        monkeypatch.setenv("HF_TOKEN", token)
     result = repeatability.run_repeatability(**args, resume=True, retry_failed=True)
     assert len(calls) == 5 and result["new_population"]["status"] == "unstable"
     assert all(point["raw_samples_seconds"][0] == 3 * point["source_wall_time_seconds"] for point in result["points"])
     assert all(point["sample_count"] == 5 and point["sample_cv"] > 0.05 for point in result["points"])
     attempt = result["samples"][cell_id][0]["attempts"][0]
-    assert [item["status"] for item in attempt["postprocessing_attempts"]] == ["failed", "passed"]
+    expected_retries = ["failed", "interrupted", "passed"] if interrupt_recovery else ["failed", "passed"]
+    if retry_slurm:
+        expected_retries.insert(1, "failed")
+    assert [item["status"] for item in attempt["postprocessing_attempts"]] == expected_retries
     assert attempt["postprocessing_attempts"][-1]["artifact_recovery"]["original_status"] == collector_status
     assert all(len(sample["attempts"]) == 1 for sample in result["samples"][cell_id])
     assert checkpoint_path.read_bytes() == original_checkpoint
@@ -2329,3 +2429,149 @@ def test_measurement_evidence_refuses_a_producer_artifact_that_reports_less_evid
     if change is not _drop_protocol:
         with pytest.raises(ValueError, match=r"^measurement_protocol\.producer must be absent"):
             extract_measurement_evidence(root, replace(collection, execution_mode=None))
+
+
+@pytest.mark.parametrize("model_config", [None, []])
+def test_instrumented_execution_rejects_non_object_model_config(campaign, monkeypatch, model_config):
+    plan, source, _ = campaign
+    monkeypatch.setattr(type(plan), "runtime_instrumentation", property(lambda _plan: object()))
+    cell = plan.cells[0]
+    raw = source / "cells" / cell.cell_id / "raw"
+    workers = [json.loads(path.read_text()) for path in raw.glob("**/fpm-execution-worker-*.json")]
+    snapshot = {tuple(worker[key] for key in ("dp_rank", "tp_rank", "pp_rank")): worker for worker in workers}
+    monkeypatch.setattr(execution_evidence, "_runtime_worker_evidence", lambda *a, **kw: (snapshot, {}))
+    _mutate_workers(source, lambda payload: payload["resolved_config"].update(model_config=model_config))
+    collection = validate_native_collection(cell, raw, expected_plan_sha256=plan.sha256, expected_attempt_id="source")
+
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+
+    assert result["status"] == "incomplete"
+    assert "runtime model_config is unreported" in result["missing_evidence"]
+    assert not result["failures"]
+
+
+@pytest.mark.parametrize("needs_native", [False, True])
+def test_instrumentation_bundle_errors_are_scoped_to_workers_needing_evidence(campaign, monkeypatch, needs_native):
+    plan, source, _ = campaign
+
+    def changed_bundle(_plan):
+        raise ValueError("instrumentation changed after planning")
+
+    monkeypatch.setattr(type(plan), "runtime_instrumentation", property(changed_bundle))
+    if needs_native:
+        _mutate_workers(source, lambda payload: payload["resolved_config"]["model_config"].update(quantization="mxfp4"))
+    cell = plan.cells[0]
+    raw = source / "cells" / cell.cell_id / "raw"
+    collection = validate_native_collection(cell, raw, expected_plan_sha256=plan.sha256, expected_attempt_id="source")
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    assert result["status"] == ("failed" if needs_native else "qualified")
+    assert any("instrumentation changed after planning" in failure for failure in result["failures"]) == needs_native
+
+
+def test_repeatability_preserves_frozen_public_control_reference_at_launch(campaign, tmp_path, monkeypatch):
+    from collector.fpm_forward.config import semantic_generator_overrides
+
+    plan, source, checkpoint = campaign
+    name, value = "DYN_BENCH_PREFILL_CONTENT", "sharegpt"
+    reference = {"name": name, "value_from_env": name, "value_sha256": hashlib.sha256(value.encode()).hexdigest()}
+    deployment = {"K8sConfig": {"extra_env": [reference]}}
+    monkeypatch.setenv(name, value)
+    plan = replace(
+        plan, generator_config_sha256=repeatability._canonical_hash(semantic_generator_overrides(deployment))
+    )
+    plan = repeatability._subset_plan(
+        plan, {"cell_id": plan.cells[0].cell_id, "benchmark_points": json.loads(plan.options.benchmark_points_json)}
+    )
+    _write_campaign(source, checkpoint, plan, generator_overrides=deployment)
+    calls = _fake_collector(monkeypatch)
+    inputs = repeatability.load_repeatability_deployment(source)
+    result = repeatability.run_repeatability(**_args((plan, source, checkpoint), tmp_path, generator_overrides=inputs))
+    assert result["status"] == "passed", result
+    assert len(calls) == 5
+    for sample, kwargs in calls:
+        assert sample.generator_config_sha256 in repeatability._deployment_hashes(kwargs["generator_overrides"])
+
+
+@pytest.mark.parametrize("historical", ["current", "literal", "semantic"])
+def test_archived_environment_resolves_for_replay_and_detects_drift(campaign, tmp_path, monkeypatch, historical):
+    from collector.fpm_forward.config import archive_generator_overrides, semantic_generator_overrides
+
+    from aisim.support.runtime_collection import _collection_controls
+
+    plan, source, checkpoint = campaign
+    token = 'synthetic-private-"credential"-$746'
+    overrides = {
+        "generator_dynamo_version": "1.3.0",
+        "K8sConfig": {
+            "extra_env": [
+                {"name": "CUSTOM_AUTH", "value": token},
+                {"name": "DYN_BENCH_PREFILL_CONTENT", "value": "sharegpt"},
+                {"name": "FPM_FINALIZATION_TIMEOUT_SECONDS", "value": "600"},
+            ]
+        },
+    }
+    if historical == "literal":
+        normalized = with_kv_warmup_defaults(overrides)
+    else:
+        normalized = semantic_generator_overrides(overrides, archive_environment=historical == "current")
+    plan = replace(plan, generator_config_sha256=repeatability._canonical_hash(normalized))
+    plan = repeatability._subset_plan(
+        plan, {"cell_id": plan.cells[0].cell_id, "benchmark_points": json.loads(plan.options.benchmark_points_json)}
+    )
+    _write_campaign(source, checkpoint, plan, generator_overrides=overrides)
+    archive = archive_generator_overrides(overrides)
+    path = source / "generator-overrides.json"
+    path.write_text(json.dumps(archive))
+    entry = next(
+        item for item in json.loads(path.read_text())["K8sConfig"]["extra_env"] if item["name"] == "CUSTOM_AUTH"
+    )
+    assert entry == {
+        "name": "CUSTOM_AUTH",
+        "value_from_env": "CUSTOM_AUTH",
+        "value_sha256": hashlib.sha256(token.encode()).hexdigest(),
+    }
+    assert repeatability._deployment_hashes(archive) & repeatability._deployment_hashes(overrides)
+    monkeypatch.delenv("CUSTOM_AUTH", raising=False)
+    if historical == "current":
+        assert repeatability.load_repeatability_deployment(source) == archive
+        # The binding path inspects public collection controls without auth.
+        _, bound, changes = _collection_controls(plan.cells, repeatability.load_repeatability_deployment(source))
+        assert bound["K8sConfig"]["extra_env"][0]["name"] == "CUSTOM_AUTH"
+        assert any("FPM_FINALIZATION_TIMEOUT_SECONDS" in item["field"] for item in changes)
+        assert any("DYN_BENCH_PREFILL_CONTENT" in item["field"] for item in changes)
+    with pytest.raises(ValueError, match="requires the original value"):
+        repeatability.load_repeatability_deployment(source, resolve_environment=True)
+    monkeypatch.setenv("CUSTOM_AUTH", token + "changed")
+    with pytest.raises(ValueError, match="requires the original value"):
+        repeatability.load_repeatability_deployment(source, resolve_environment=True)
+    monkeypatch.setenv("CUSTOM_AUTH", token)
+    resolved = repeatability.load_repeatability_deployment(source, resolve_environment=True)
+    assert resolved == with_kv_warmup_defaults(overrides)
+    handed_off = repeatability.load_repeatability_deployment(source)
+    assert plan.generator_config_sha256 in repeatability._deployment_hashes(handed_off)
+    if historical != "current":
+        assert handed_off == resolved
+
+    calls = _fake_collector(monkeypatch)
+    report = repeatability.run_repeatability(
+        **_args((plan, source, checkpoint), tmp_path, generator_overrides=handed_off)
+    )
+    assert report["status"] == "passed", report
+    assert calls
+
+    _, compared, _ = _collection_controls(plan.cells, resolved)
+    assert compared["K8sConfig"]["extra_env"][0] == {"name": "CUSTOM_AUTH", "value": token}
+    # Inspection needs no access to the caller's credentials, but still checks
+    # the frozen reference/digest representation against the plan.
+    if historical == "current":
+        monkeypatch.delenv("CUSTOM_AUTH")
+    cell = plan.cells[0]
+    raw = source / "cells" / cell.cell_id / "raw"
+    collection = validate_native_collection(cell, raw, expected_plan_sha256=plan.sha256, expected_attempt_id="source")
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    assert result["status"] == "qualified", result
+    archive["K8sConfig"]["k8s_image"] = "changed:image"
+    path.write_text(json.dumps(archive))
+    monkeypatch.setenv("CUSTOM_AUTH", token)
+    with pytest.raises(ValueError, match="differ from the source plan"):
+        repeatability.load_repeatability_deployment(source)

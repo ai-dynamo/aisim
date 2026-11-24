@@ -121,6 +121,35 @@ def test_llama4_standard_processor_defaults(tmp_path):
     assert BaseBackend._visual_context_tokens(model, RuntimeConfig(image_height=336, image_width=672)) == 437
 
 
+@pytest.mark.parametrize("sidecar_limit", [8, 16])
+def test_pinned_llama4_uses_serving_processor_tile_limit(tmp_path, monkeypatch, sidecar_limit):
+    from aisimulate_core.sdk import fpm_profile
+
+    raw = deepcopy(get_model_config_from_model_path(LLAMA4_MODEL_IDS[0])["raw_config"])
+    assert raw["image_processor_config"]["max_patches"] == 16
+    model_path, revision = f"synthetic-llama4/{tmp_path.name}", "b" * 40
+    reads = []
+
+    def download(hf_id, filename, *, revision, raise_on_404=True):
+        assert hf_id == model_path and revision == "b" * 40
+        reads.append(filename)
+        if filename == "config.json":
+            return deepcopy(raw)
+        if filename == "preprocessor_config.json":
+            assert not raise_on_404
+            return {"image_processor_type": "Llama4ImageProcessorFast", "max_patches": sidecar_limit}
+        assert filename == "hf_quant_config.json"
+        return None
+
+    fpm_profile._load_pinned_checkpoint_config.cache_clear()
+    monkeypatch.setattr(utils_module, "_download_hf_json", download)
+    model = get_model(model_path, _model_config(), "trtllm", model_revision=revision)
+    info = get_model_config_from_model_path(model_path, model_revision=revision)
+    assert model.encoder_config.max_num_tiles == info["extra_params"].vision_config.max_num_tiles == sidecar_limit
+    assert info["raw_config"]["image_processor_config"]["max_patches"] == sidecar_limit
+    assert sorted(reads) == ["config.json", "hf_quant_config.json", "preprocessor_config.json"]
+
+
 def test_llama4_remote_processor_errors_are_not_silently_ignored(tmp_path, monkeypatch):
     raw = deepcopy(get_model_config_from_model_path(LLAMA4_MODEL_IDS[0])["raw_config"])
     raw.pop("image_processor_config")

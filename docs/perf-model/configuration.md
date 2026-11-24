@@ -84,6 +84,7 @@ identities must be quoted to preserve their exact spelling:
 | --- | --- | --- |
 | `model` | Required | String model name or path; write a numeric identifier as `model: "123"`. |
 | `backend_version` | `null` | Optional string version; write `backend_version: "0.10"` to preserve the trailing zero. |
+| `fpm_profile.model_revision` | Required with a profile | Checkpoint revision. A Hub alias is resolved to one immutable commit before eligibility validation; the resolved commit is saved and used for all metadata reads and replay. Full commit IDs and local paths require no Hub resolution. |
 | `attention_backend` | absent | Runtime attention selector. Kimi K3.1 accepts `flashmla` or `trtllm_mla`; FP8 KV requires one of these explicit physical cache layouts. The theoretical BF16 mode also permits the default; the pinned native runtime requires FP8 KV. |
 | `system`, `backend_version`, `tp`, `pp`, `attention_dp`, `moe_tp_size`, `moe_ep_size`, `gemm_quant_mode`, `moe_quant_mode`, `fmha_quant_mode`, `kvcache_quant_mode`, `comm_quant_mode`, `attention_backend` | As above | With `estimation_mode` `fpm_regression` or `fpm_learned`, each may be the literal `"unknown"` for a fact the saver did not know. Every other mode, a `fallback_policy` other than `deny` and an `fpm_profile` reject it. The integer fields accept only the string spelling. |
 | `deployment_limits` | absent | Optional mapping of the calibrated deployment's `num_gpus` (GPUs of one worker, `tp * pp * attention_dp`), `max_num_batched_tokens`, `max_num_seqs`, `max_kv_tokens` (KV capacity of one attention-DP rank, in tokens) and `context_length`. Each is a positive integer or `"unknown"`; an omitted entry is `"unknown"`. Absent, it is omitted from the serialized configuration. Accepted in every mode. |
@@ -373,10 +374,16 @@ fields report their nested paths. The supported namespaces are:
   (5), `factor_bounds` (min 0.5, max 2.0), and the existing `max_num_tokens`
   (8192), `max_batch_size` (512), and `max_kv_tokens` (2000000) fixed-policy ranges.
 - `fpm_interpolation.method`: `auto` (default), `sol`, or `direct`. Rust selects
-  SOL for a registered architecture, or direct interpolation for a verified
-  architecture without a registered class when a profile is supplied. Without
-  a profile, auto retains SOL. Explicit SOL requires a registered analytical
-  model; direct requires a profile and also supports registered architectures.
+  SOL for a registered architecture with supported SOL rooflines, or direct
+  interpolation for other verified profile architectures. Qwen3.5 profiles,
+  including text-only wrapper profiles, use direct interpolation because their
+  GDN graph has no SOL roofline. Without a profile, auto retains SOL. Explicit
+  SOL requires a supported registered analytical model; direct requires a
+  profile and also supports registered architectures. K3.1 SOL requires observed
+  BF16 convolution state. With that graph, explicit `sol` can construct a model
+  with BF16 or unrecorded recurrent state and serve measured hits, but a query
+  needing KDA SOL transfer fails unless effective FP32 recurrence is established.
+  Inner `auto` selects `direct` when FP32 recurrence is not established.
 - `fpm_interpolation.collect_coverage`: `false` (default). Opt in to bounded
   evidence from actual direct-FPM lookups, as described below. It requires
   explicit `estimation_mode: fpm_interpolation`, resolved `method: direct`, and
@@ -519,6 +526,10 @@ mismatched declarations fail explicitly. This check reads configuration only:
 no weights or analytical graph are required. An architecture with verified
 metadata remains valid for direct interpolation without a registered analytical
 class. Schema-only profile and application configuration parsing remain lightweight.
+For remote profiles, construction resolves an alias once and retains its immutable
+commit in `fpm_profile.model_revision`. Architecture, quantization and processor
+metadata are read at that commit, including after saving and reloading the model.
+An already supplied full commit ID requires no separate Hub-resolution request.
 
 For measured-only timing, pass `estimation_mode="fpm_interpolation"`,
 `fallback_policy="deny"`, and

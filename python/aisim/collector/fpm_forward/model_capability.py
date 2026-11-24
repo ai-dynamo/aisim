@@ -43,6 +43,20 @@ _ATTENTION_SOURCE_OPS = {
 }
 
 
+def kimi_k31_native_attention_backend(architecture: str | None, backend: str | None) -> str | None:
+    """Map an explicit K3.1 cache-layout policy to its native vLLM backend.
+
+    Source: vllm/vllm-openai:kimi-k31 amd64 manifest
+    sha256:88175ddf4f59944ccbb24c6b60c1bc535a160be3c4f09a3b08702c5e301a599e,
+    model_executor/models/config.py::KimiK3ForConditionalGenerationConfig
+    and v1/attention/backends/registry.py. This mapping does not attest a
+    runtime build, its hybrid memory adapter, or successful GPU collection.
+    """
+    if architecture != "KimiK31ForConditionalGeneration":
+        return None
+    return {"flashmla": "FLASHMLA_SPARSE", "trtllm_mla": "FLASHINFER_MLA_SPARSE"}.get(backend)
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class ResolvedModelConfig:
     """Immutable model-config evidence used to derive and hash an FPM plan."""
@@ -112,8 +126,11 @@ class ResolvedModelConfig:
         raw_config = _attach_inferred_quant_fields(self.effective_payload)
         parser_config = raw_config
         architecture = (raw_config.get("architectures") or [None])[0]
-        text_key = MULTIMODAL_TEXT_CONFIG_KEY.get(architecture)
         source = self.payload
+        wrapper = (source.get("architectures") or [None])[0]
+        if wrapper in MULTIMODAL_TEXT_CONFIG_KEY:
+            architecture = wrapper
+        text_key = MULTIMODAL_TEXT_CONFIG_KEY.get(architecture)
         if text_key and isinstance(source.get(text_key), dict):
             # Registered wrapper parsers require their original encoder and
             # processor context, but read model geometry from the decoder.

@@ -203,6 +203,60 @@ def _check_release(payload: dict[str, Any], audited: tuple[str, ...], refusal: s
             raise ValueError(f"installed vLLM {version} does not match audited vLLM {release}: {problem}")
 
 
+def _installed_file(name: str) -> Path:
+    package, *parts = name.split("/")
+    module = importlib.import_module(package)
+    paths = [Path(root).joinpath(*parts) for root in module.__path__]
+    found = [path for path in paths if path.is_file()]
+    if len(found) != 1:
+        raise ValueError(f"runtime source path must resolve uniquely: {name}")
+    return found[0]
+
+
+def _runtime_source(payload: dict, pinned: dict, version: str) -> None:
+    """Observe and validate the imported runtime against its exact source manifest."""
+    actual_version = importlib.metadata.version("vllm")
+    build = importlib.import_module("vllm._version")
+    commit = getattr(build, "__commit_id__", None)
+    observed = payload["runtime"] = {
+        "framework": "vllm",
+        "version": actual_version,
+        "source_revision": pinned["source_revision"],
+        "source_files": {},
+    }
+    payload["source_identity"] = {"vllm_commit_id": commit, "source_revision_basis": "declared source and file hashes"}
+    errors = []
+    if actual_version != version or pinned["version"] != version:
+        errors.append(f"adapter requires vLLM {version}; installed={actual_version}, manifest={pinned['version']}")
+    # Wheels may omit a VCS identifier. The exact inspected source files remain
+    # mandatory; when a wheel supplies an identifier, it must also agree.
+    if len(pinned["source_revision"]) == 64:
+        # Preview wheels need not publish a full Git commit. Bind their complete
+        # inspected source map by SHA-256 instead of inventing a Git revision.
+        source_digest = hashlib.sha256(
+            json.dumps(pinned["source_files"], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        if source_digest != pinned["source_revision"]:
+            errors.append("source-map SHA-256 contradicts source revision")
+        payload["source_identity"]["source_revision_basis"] = "SHA-256 of canonical source file hash map"
+        if commit is not None and str(commit) not in actual_version:
+            errors.append("installed VCS identifier contradicts exact wheel version")
+    elif commit is not None:
+        short = str(commit).removeprefix("g")
+        if len(short) < 7 or not pinned["source_revision"].startswith(short):
+            errors.append(f"installed vLLM commit {commit!r} contradicts source revision")
+    for name, expected in pinned["source_files"].items():
+        try:
+            digest = hashlib.sha256(_installed_file(name).read_bytes()).hexdigest()
+            observed["source_files"][name] = digest
+            if digest != expected:
+                errors.append(f"runtime source hash differs: {name}")
+        except (OSError, ValueError, AttributeError, ImportError) as error:
+            errors.append(f"runtime source {name}: {error}")
+    if errors:
+        raise ValueError("; ".join(errors))
+
+
 RESULTS_DIR = Path("/results")
 _SPEC_MODULE = "vllm.v1.kv_cache_interface."
 _UNIFORM_SPEC = _SPEC_MODULE + "UniformTypeKVCacheSpecs"
@@ -264,6 +318,7 @@ _CONFIG_FIELDS = {
     ),
     "compilation_config": ("mode", "cudagraph_mode", "cudagraph_capture_sizes", "max_cudagraph_capture_size"),
     "kernel_config": ("moe_backend",),
+    "attention_config": ("backend", "indexer_kv_dtype"),
 }
 
 
@@ -474,7 +529,9 @@ def _execution_destination() -> tuple[Path, dict[str, Any]]:
     return directory, binding
 
 
-def observe_execution(worker: Any, *, dp_rank: int, tp_rank: int, pp_rank: int) -> None:
+def observe_execution(
+    worker: Any, *, dp_rank: int, tp_rank: int, pp_rank: int, audited_version: str | None = None
+) -> None:
     """Record selected backend objects after initialization, outside timed forwards.
 
     This original adapter reads AttentionGroup.backend/layer_names populated by
@@ -512,11 +569,22 @@ def observe_execution(worker: Any, *, dp_rank: int, tp_rank: int, pp_rank: int) 
         "per_point_dispatch": "unreported",
     }
     try:
-        _check_release(
-            payload,
-            EXECUTION_SUPPORTED_VERSIONS,
-            f"execution observation requires audited vLLM {EXECUTION_SUPPORTED_VERSIONS}",
-        )
+        native_k31 = audited_version == payload["backend_version"] == "0.1.dev24216+g266e88c05"
+        if native_k31:
+            imported = getattr(importlib.import_module("vllm"), "__version__", None)
+            if imported != payload["backend_version"]:
+                raise ValueError(
+                    f"vLLM package metadata reports {payload['backend_version']}, but the imported vllm package "
+                    f"reports {imported or 'no version'}"
+                )
+            manifest = json.loads(Path(os.environ["AISIMULATE_RUNTIME_INSTRUMENTATION"]).read_text())
+            _runtime_source(payload, manifest["runtime"], audited_version)
+        else:
+            _check_release(
+                payload,
+                EXECUTION_SUPPORTED_VERSIONS,
+                f"execution observation requires audited vLLM {EXECUTION_SUPPORTED_VERSIONS}",
+            )
         groups = []
         for cache_groups in worker.model_runner.attn_groups:
             for group in cache_groups:
@@ -635,6 +703,9 @@ def execution_config(config: Any, *, hybrid_evidence: bool = False) -> dict[str,
         if getattr(config, section, None) is not None
     }
     hf_config = getattr(config.model_config, "hf_config", None)
+    architectures = getattr(hf_config, "architectures", None)
+    if architectures is not None:
+        result["model_config"]["architectures"] = _json_value(architectures)
     if hf_config is not None and hasattr(hf_config, "_commit_hash"):
         if hf_config._commit_hash is not None:
             result["model_config"]["loaded_config_commit_hash"] = hf_config._commit_hash

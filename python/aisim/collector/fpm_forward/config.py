@@ -10,6 +10,8 @@ import copy
 import hashlib
 import json
 import math
+import os
+import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -83,24 +85,138 @@ PARALLEL_AXES = ("tp", "pp", "dp", "moe_tp", "moe_ep", "cp")
 PARALLEL_PRESETS = ("auto", "tp", "tep", "dep", "pure_tp")
 
 
-def semantic_generator_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
+def semantic_generator_overrides(overrides: dict[str, Any], *, archive_environment: bool = True) -> dict[str, Any]:
     """Freeze launch settings without treating declared versions as compatibility."""
-    normalized = with_kv_warmup_defaults(overrides)
+    normalized = archive_generator_overrides(overrides) if archive_environment else with_kv_warmup_defaults(overrides)
     normalized.pop("generator_dynamo_version", None)
     return normalized
+
+
+COLLECTION_CONTROL_NAMES = {
+    "DYN_BENCH_CONTENT_SEED",
+    "DYN_BENCH_PREFILL_CONTENT",
+    "DYN_BENCH_POOL_TAG",
+    "DYN_BENCH_GIANT_KV_THRESHOLD",
+    "DYN_BENCH_GIANT_KV_REPEATS",
+    "DYN_FORWARDPASS_METRIC_PORT",
+    "FPM_RESULT_WAIT_TIMEOUT_SECONDS",
+    "FPM_FINALIZATION_TIMEOUT_SECONDS",
+}
+CONTENT_MODES = ("random", "sharegpt", "sharegpt_chain")
+
+
+def validate_collection_control(name, value):
+    if not isinstance(value, str) or any(ord(char) < 32 for char in value):
+        raise ValueError(f"collection control {name} requires one literal string value")
+    if name == "DYN_BENCH_PREFILL_CONTENT" and value not in CONTENT_MODES:
+        raise ValueError(f"collection control {name} has an unsupported content mode")
+    if name in {"DYN_BENCH_GIANT_KV_THRESHOLD", "DYN_BENCH_GIANT_KV_REPEATS"} and not re.fullmatch(
+        r"0|[1-9][0-9]*", value
+    ):
+        raise ValueError(f"collection control {name} must be a nonnegative integer")
+    if name in {"DYN_FORWARDPASS_METRIC_PORT", "FPM_RESULT_WAIT_TIMEOUT_SECONDS", "FPM_FINALIZATION_TIMEOUT_SECONDS"}:
+        maximum = {
+            "DYN_FORWARDPASS_METRIC_PORT": 65535,
+            "FPM_RESULT_WAIT_TIMEOUT_SECONDS": 43200,
+            "FPM_FINALIZATION_TIMEOUT_SECONDS": 3600,
+        }[name]
+        if not re.fullmatch(r"[1-9][0-9]*", value) or len(value) > len(str(maximum)) or int(value) > maximum:
+            raise ValueError(f"collection control {name} must be an integer from 1 through {maximum}")
+
+
+def archive_generator_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
+    """Archive environment references and digests instead of caller credentials.
+
+    Validated public controls remain literal. Every other environment value is
+    supplied again by name for replay; its digest freezes the original input.
+    The same representation is used for plan hashing and artifact inspection,
+    which do not require access to replay credentials.
+    """
+    archived = with_kv_warmup_defaults(overrides)
+    environment = archived["K8sConfig"]["extra_env"]
+    if not isinstance(environment, list):
+        raise ValueError("archived environment must be a list")
+    names = set()
+    for item in environment:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("name"), str)
+            or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", item["name"])
+            or item["name"] in names
+        ):
+            raise ValueError("archived environment requires unique valid names")
+        names.add(item["name"])
+        if "value_from_env" in item:
+            if (
+                set(item) != {"name", "value_from_env", "value_sha256"}
+                or item["value_from_env"] != item["name"]
+                or not isinstance(item["value_sha256"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", item["value_sha256"])
+            ):
+                raise ValueError("invalid archived environment reference")
+        else:
+            if set(item) != {"name", "value"} or not isinstance(item["value"], str):
+                raise ValueError("archived environment requires literal string values")
+            public = item["name"] in {*FPM_KV_WARMUP_DEFAULTS, "VLLM_SSM_CONV_STATE_LAYOUT"}
+            if item["name"] in {"FPM_READINESS_TIMEOUT_SECONDS", "FPM_FINALIZATION_TIMEOUT_SECONDS"}:
+                value = item["value"]
+                public = bool(re.fullmatch(r"[1-9][0-9]*", value)) and len(value) <= 4 and int(value) <= 3600
+            if item["name"] in COLLECTION_CONTROL_NAMES:
+                try:
+                    validate_collection_control(item["name"], item["value"])
+                except ValueError:
+                    pass  # Retain invalid inputs as digests until binding rejects them.
+                else:
+                    public = True
+            if not public:
+                value = item.pop("value")
+                item.update(value_from_env=item["name"], value_sha256=hashlib.sha256(value.encode()).hexdigest())
+    return archived
+
+
+def resolve_archived_generator_overrides(
+    overrides: dict[str, Any], *, environment: dict[str, str] | None = None
+) -> dict[str, Any]:
+    """Resolve archived references without revealing missing or changed values."""
+    resolved = archive_generator_overrides(overrides)
+    literals = {
+        item["name"]: item["value"] for item in overrides.get("K8sConfig", {}).get("extra_env") or [] if "value" in item
+    }
+    for item in resolved["K8sConfig"]["extra_env"]:
+        if "value_from_env" not in item:
+            continue
+        name = item["value_from_env"]
+        value = literals.get(name, (environment or {}).get(name, os.environ.get(name)))
+        if value is None or hashlib.sha256(value.encode()).hexdigest() != item["value_sha256"]:
+            raise ValueError(f"archived environment {name} requires the original value in the caller's environment")
+        if name in COLLECTION_CONTROL_NAMES:
+            validate_collection_control(name, value)
+        item.clear()
+        item.update(name=name, value=value)
+    return resolved
 
 
 def with_kv_warmup_defaults(overrides: dict[str, Any]) -> dict[str, Any]:
     """Resolve declared warm-up switches without replacing explicit choices."""
 
     resolved = copy.deepcopy(overrides)
+    if not isinstance(resolved, dict):
+        raise ValueError("archived deployment inputs must be an object")
     k8s = resolved.setdefault("K8sConfig", {})
+    if not isinstance(k8s, dict):
+        raise ValueError("archived K8sConfig must be an object")
     environment = k8s.setdefault("extra_env", [])
     if environment is None:
         environment = k8s["extra_env"] = []
+    if not isinstance(environment, list):
+        raise ValueError("archived environment must be a list")
     declared = set()
     for item in environment:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            raise ValueError("archived environment requires named entries")
         name = item["name"]
+        if name == "VLLM_SSM_CONV_STATE_LAYOUT" and item.get("value") not in ("SD", "DS"):
+            raise ValueError(f"{name} must be a literal SD or DS")
         if name in FPM_KV_WARMUP_DEFAULTS:
             value = item.get("value")
             if not isinstance(value, str) or value.lower() not in {"on", "1", "true", "off", "0", "false"}:

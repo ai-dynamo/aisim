@@ -298,9 +298,72 @@ pub struct KdaOp {
     /// Verify-phase token width (speculative block size + 1). Python sends
     /// `op._draft_tokens`; 0 outside verify.
     pub draft_tokens: i64,
+    /// Resolved recurrent cache dtype for FPM SOL. Profile compilation fills
+    /// this from runtime observations. None means unrecorded, including legacy
+    /// JSON; the op-level FP32 contract is unchanged. Never infer it from padding.
+    #[serde(default)]
+    pub recurrent_state_dtype: Option<String>,
 }
 
 impl KdaOp {
+    /// Analytic KDA latency for whole-forward SOL transfer. Keep fractional
+    /// prefill lengths: FPM back-maps total tokens divided by request count.
+    /// This uses the same byte model as the op-level estimate, without probing
+    /// silicon tables or selecting a different kernel from their contents.
+    pub(crate) fn fpm_sol_latency_ms(
+        &self,
+        db: &PerfDatabase,
+        batch_size: f64,
+        seq_len: f64,
+    ) -> Result<f64, AicError> {
+        // The profile binder resolves auto to float32 only for audited runtime
+        // evidence. An unresolved setting has no qualified state byte width.
+        if self.recurrent_state_dtype.as_deref() != Some("float32") {
+            return Err(AicError::SolNotImplemented(format!(
+                "forward_model='fpm' KDA SOL requires observed float32 recurrent state; got {:?}; use direct interpolation",
+                self.recurrent_state_dtype
+            )));
+        }
+        let kernel = self.kernel_source.as_str();
+        let (seq_len, supported) = match self.phase.as_str() {
+            "context" => (
+                seq_len,
+                matches!(
+                    kernel,
+                    "causal_conv1d_fn_qkv3"
+                        | "chunk_kda"
+                        | "chunk_kda_with_fused_gate"
+                        | "flashkda_fwd"
+                ),
+            ),
+            "generation" => (
+                0.0,
+                matches!(
+                    kernel,
+                    "causal_conv1d_update"
+                        | "fused_recurrent_kda_packed_decode"
+                        | "fused_kda_decode"
+                        | "kda_fused_decode"
+                ),
+            ),
+            phase => {
+                return Err(AicError::SolNotImplemented(format!(
+                    "forward_model='fpm' KDA SOL supports autoregressive context/generation, got {phase:?}"
+                )));
+            }
+        };
+        if !supported {
+            return Err(AicError::SolNotImplemented(format!(
+                "forward_model='fpm' KDA SOL has no byte model for kernel {kernel:?} in phase {:?}",
+                self.phase
+            )));
+        }
+        Ok(
+            self.sol_latency_ms_with(db, &self.kernel_source, batch_size, seq_len)
+                * self.scale_factor,
+        )
+    }
+
     pub fn query(
         &self,
         db: &PerfDatabase,
@@ -496,7 +559,7 @@ impl KdaOp {
             // vLLM prefill cores: same chunked-scan byte model as chunk_kda.
             "chunk_kda_with_fused_gate" | "flashkda_fwd" => "chunk_kda",
             // vLLM fused decode = conv update + recurrence + gated norm.
-            "fused_kda_decode" => "fused_recurrent_kda_packed_decode",
+            "fused_kda_decode" => "kda_fused_decode",
             // vLLM chain-verify kernel: same traffic as the sglang verify op.
             "fused_recurrent_kda" => "fused_sigmoid_gating_delta_rule_update",
             other => other,
@@ -701,6 +764,65 @@ mod tests {
             num_v_heads: 16,
             head_v_dim: 128,
             draft_tokens,
+            recurrent_state_dtype: Some("float32".into()),
+        }
+    }
+
+    #[test]
+    fn fpm_kda_sol_rejects_unknown_kernels() {
+        let systems_root = crate::test_systems::path("");
+        let db = PerfDatabase::load(&systems_root, "gb300", "sglang", "0.5.14").unwrap();
+        for phase in ["context", "generation"] {
+            let error = kda_op("unknown_kda", phase, 0)
+                .fpm_sol_latency_ms(&db, 2.0, 65.5)
+                .unwrap_err();
+            assert!(matches!(error, AicError::SolNotImplemented(_)));
+            assert!(error.to_string().contains("unknown_kda"));
+        }
+    }
+
+    #[test]
+    fn fpm_kda_sol_rejects_non_fp32_and_unrecorded_recurrent_state() {
+        let systems_root = crate::test_systems::path("");
+        let db = PerfDatabase::load(&systems_root, "gb300", "sglang", "0.5.14").unwrap();
+        for (phase, kernel) in [
+            ("context", "flashkda_fwd"),
+            ("generation", "fused_kda_decode"),
+        ] {
+            let mut op = kda_op(kernel, phase, 0);
+            for dtype in [
+                None,
+                Some("bfloat16"),
+                Some("float16"),
+                Some("auto"),
+                Some("invalid"),
+            ] {
+                op.recurrent_state_dtype = dtype.map(str::to_owned);
+                let error = op.fpm_sol_latency_ms(&db, 2.0, 65.5).unwrap_err();
+                assert!(matches!(error, AicError::SolNotImplemented(_)));
+                assert!(error.to_string().contains("float32 recurrent state"));
+            }
+            op.recurrent_state_dtype = Some("float32".into());
+            let fp32 = op.fpm_sol_latency_ms(&db, 2.0, 65.5).unwrap();
+            assert!(fp32 > 0.0);
+        }
+    }
+
+    #[test]
+    fn fpm_kda_sol_rejects_verify_only_and_cross_phase_kernels() {
+        let systems_root = crate::test_systems::path("");
+        let db = PerfDatabase::load(&systems_root, "gb300", "sglang", "0.5.14").unwrap();
+        for (phase, kernel) in [
+            ("generation", "fused_kda_decode_mtp_dspark"),
+            ("generation", "fused_recurrent_kda"),
+            ("generation", "fused_sigmoid_gating_delta_rule_update"),
+            ("context", "fused_kda_decode"),
+            ("generation", "flashkda_fwd"),
+        ] {
+            let error = kda_op(kernel, phase, 0)
+                .fpm_sol_latency_ms(&db, 1.0, 64.0)
+                .unwrap_err();
+            assert!(matches!(error, AicError::SolNotImplemented(_)));
         }
     }
 
@@ -727,6 +849,7 @@ mod tests {
         // packed recurrence (plus the folded gated RMSNorm); its byte model
         // must equal the sum of the two constituent models (Python parity).
         let fused = kda_op("kda_fused_decode", "generation", 0);
+        let vllm = kda_op("fused_kda_decode", "generation", 0);
         let conv = kda_op("causal_conv1d_update", "generation", 0);
         let recurrence = kda_op("fused_recurrent_kda_packed_decode", "generation", 0);
         for b in [1.0, 8.0, 256.0] {
@@ -734,6 +857,10 @@ mod tests {
                 fused.sol_total_bytes(b, 0.0),
                 conv.sol_total_bytes(b, 0.0) + recurrence.sol_total_bytes(b, 0.0)
             );
+            // Per sequence: two FP32 16x128x128 states plus 5 BF16
+            // projections of 2048 elements = 2,117,632 bytes. A four-tap
+            // update reads five and writes one BF16 value on 3x2048 channels.
+            assert_eq!(vllm.sol_total_bytes(b, 0.0), b * (2_117_632.0 + 73_728.0));
         }
     }
 

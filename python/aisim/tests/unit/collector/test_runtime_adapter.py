@@ -881,7 +881,11 @@ def _fake_campaign(
             staged = directory / "model-config.json"
             staged.write_bytes(model_config_path.read_bytes())
             artifacts.append({**reference(staged), "kind": "runtime-artifact"})
-        attempt["phases"][phase] = {"launch_manifest": reference(context_path), "artifacts": artifacts}
+        attempt["phases"][phase] = {
+            "status": "completed",
+            "launch_manifest": reference(context_path),
+            "artifacts": artifacts,
+        }
         (tmp_path / "observations.json").write_text(json.dumps(index))
         return [json.loads(path.read_text()) for path in paths]
 

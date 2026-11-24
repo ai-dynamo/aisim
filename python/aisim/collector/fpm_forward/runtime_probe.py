@@ -16,7 +16,7 @@ import shutil
 import uuid
 import zipfile
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -24,10 +24,19 @@ from aisim.fpm_advisory import prefill_graph_advisory
 
 from . import runner
 from .capabilities import checkpoint_fmha_quant_mode, has_checkpoint_fmha
-from .config import FPM_WARMUP_ITERATIONS, FPMCollectionOptions, collection_phases, semantic_generator_overrides
+from .config import (
+    FPM_WARMUP_ITERATIONS,
+    FPMCollectionOptions,
+    archive_generator_overrides,
+    collection_phases,
+    resolve_archived_generator_overrides,
+    semantic_generator_overrides,
+)
 from .entry import _load_generator_overrides
 from .model_capability import ResolvedModelConfig, load_model_config
 from .planner import FPMCell, _backend_policies, _canonical_hash
+from .private_inputs import delivery_directory as new_delivery_directory
+from .private_inputs import discard_diagnostics, private_values, reclaim_delivery, redact, redact_diagnostics
 from .runtime_instrumentation import contained_file, read_json, validate_sha256
 from .topology import enumerate_fpm_topologies, topology_strategy
 from .types import ParallelTopology
@@ -60,6 +69,7 @@ class RuntimeProbePlan:
     cells: tuple[FPMCell, ...]
     runtime_instrumentation: Any
     sha256: str
+    _environment: list[dict[str, str]] | None = field(default=None, repr=False, compare=False)
 
     @property
     def launch(self) -> dict[str, Any]:
@@ -202,6 +212,16 @@ def normalize_probe_launch(value: dict[str, Any], *, allow_pending_version: bool
             raise ValueError("CPU deployment options require the Slurm executor")
         if type(cpus) is not int or cpus < 1 or binding not in {"cores", "none"}:
             raise ValueError("Slurm CPU policy requires positive cpus_per_task and cpu_bind cores or none")
+    if deployment.get("extra_env") is not None:
+        # Keep the public KDA layout input readable by offline validation.
+        original = deployment["extra_env"]
+        archived = archive_generator_overrides({"K8sConfig": {"extra_env": original}})["K8sConfig"]["extra_env"]
+        by_name = {item["name"]: item for item in original}
+        deployment["extra_env"] = [
+            by_name.get(item["name"], item) if item["name"] == "VLLM_SSM_CONV_STATE_LAYOUT" else item
+            for item in archived
+            if item["name"] in by_name
+        ]
     return launch
 
 
@@ -228,14 +248,16 @@ def _model_config_bytes(config: dict[str, Any]) -> dict[str, bytes]:
     return contents
 
 
-def probe_generator_overrides(launch: dict[str, Any]) -> dict[str, Any]:
+def probe_generator_overrides(launch: dict[str, Any], *, resolve_environment: bool = False) -> dict[str, Any]:
     """Translate the existing deployment options through their shared parser."""
 
     deployment = launch["deployment"]
     image = deployment["image"]
     args = argparse.Namespace(
         generator_config=None,
-        generator_set=[f"K8sConfig.k8s_image={json.dumps(image)}"],
+        generator_set=[
+            f"K8sConfig.k8s_image={json.dumps(image)}",
+        ],
         generator_dynamo_version=deployment.get("dynamo_version"),
         generated_config_version=None,
         namespace=deployment.get("namespace"),
@@ -243,7 +265,9 @@ def probe_generator_overrides(launch: dict[str, Any]) -> dict[str, Any]:
         image_pull_secret=deployment.get("image_pull_secret"),
         model_cache=deployment.get("model_cache"),
     )
-    return _load_generator_overrides(args)
+    overrides = _load_generator_overrides(args)
+    overrides.setdefault("K8sConfig", {})["extra_env"] = copy.deepcopy(deployment.get("extra_env") or [])
+    return resolve_archived_generator_overrides(overrides) if resolve_environment else overrides
 
 
 def build_runtime_probe_plan(configuration: str, facts: dict[str, Any], bundle: Any) -> RuntimeProbePlan:
@@ -263,19 +287,59 @@ def build_runtime_probe_plan(configuration: str, facts: dict[str, Any], bundle: 
     _model_config_bytes(launch["model_config"])
     config = model.effective_payload
     architecture = (config.get("architectures") or [None])[0]
+    if (model.payload.get("architectures") or [])[:1] == ["KimiK31ForConditionalGeneration"]:
+        architecture = "KimiK31ForConditionalGeneration"
+    k31_listed = any(
+        "KimiK31ForConditionalGeneration" in (candidate.get("architectures") or [])
+        for candidate in (model.payload, config)
+    )
+    if k31_listed and any(len(candidate.get("architectures") or []) > 1 for candidate in (model.payload, config)):
+        raise ValueError("Kimi K3.1 runtime probing requires single-entry architecture lists for wrapper and decoder")
+    if k31_listed and (model.payload.get("architectures") or []) != ["KimiK31ForConditionalGeneration"]:
+        raise ValueError("Kimi K3.1 requires the K3.1 top-level architecture identity")
     if not isinstance(architecture, str) or not architecture:
         raise ValueError("runtime probe model config requires an architecture")
     from aisim.sdk.models.helpers import _infer_quant_modes_from_raw_config
     from aisim.sdk.utils import _attach_inferred_quant_fields
 
     inferred = _infer_quant_modes_from_raw_config(_attach_inferred_quant_fields(config), architecture)
+    # K3.1's MXFP4 checkpoint describes expert weights only. The audited
+    # Mxfp4MoEMethod selects activation quantization after loading, so the
+    # source-bound probe may request its precise TRTLLM MXFP8 candidate.
+    # Every initialized layer is independently checked by the observer/importer;
+    # this exception is permission to probe, never evidence of execution.
+    from .runtime_k31 import is_audited_runtime
+
+    k31_native = architecture == "KimiK31ForConditionalGeneration" and is_audited_runtime(bundle.manifest["runtime"])
+    if architecture == "KimiK31ForConditionalGeneration" and not k31_native:
+        raise ValueError("K3.1 runtime probing requires an audited instrumentation bundle")
+    if k31_native:
+        if launch.get("worker_type") not in {"prefill", "decode"}:
+            raise ValueError("K3.1 native state probing requires an independent prefill or decode worker")
+        compute_dtype = {"bfloat16": "bfloat16", "float16": "half", "half": "half"}.get(
+            config.get("dtype") or config.get("torch_dtype")
+        )
+        if compute_dtype is None or precision["fmha_quant_mode"] != compute_dtype:
+            raise ValueError(
+                "K3.1 native probe requires FMHA precision matching the supported checkpoint compute dtype"
+            )
+        if precision["moe_quant_mode"] != "w4a8_mxfp4_mxfp8_trtllm":
+            raise ValueError("K3.1 native probe requires the initialized TRTLLM MXFP4/MXFP8 candidate")
+        if precision["kvcache_quant_mode"] != "fp8" or precision["attention_backend"] not in {
+            "trtllm_mla",
+            "flashmla",
+        }:
+            raise ValueError("K3.1 native probe requires explicit sparse MLA and FP8 cache")
+        if precision["attention_backend"] == "flashmla" and compute_dtype != "bfloat16":
+            raise ValueError("K3.1 FLASHMLA_SPARSE requires a bfloat16 checkpoint")
     for name in ("gemm_quant_mode", "moe_quant_mode"):
         actual = getattr(inferred.get(name), "name", inferred.get(name))
         if actual is None:
             actual = {"bfloat16": "bfloat16", "float16": "half", "half": "half"}.get(
                 config.get("dtype") or config.get("torch_dtype")
             )
-        if actual != precision[name]:
+        native_activation_candidate = k31_native and name == "moe_quant_mode" and actual == "w4a16_mxfp4"
+        if actual != precision[name] and not native_activation_candidate:
             raise ValueError(f"precision.{name}={precision[name]!r} does not match checkpoint-native {actual!r}")
     # Collection labels FMHA with the checkpoint-native mode of an AIC KV-cache mode other than bfloat16, and the import
     # accepts only that label, so another label is refused here, before any GPU work.
@@ -328,7 +392,7 @@ def build_runtime_probe_plan(configuration: str, facts: dict[str, Any], bundle: 
     admitted = enumerate_fpm_topologies(backend="vllm", is_moe=is_moe, options=options, allow_pure_tp=True)
     if topology not in admitted:
         raise ValueError(f"collector does not admit exact topology {topology.to_dict()}")
-    policy = _backend_policies(options, {}, backend="vllm")[0]
+    policy = _backend_policies(options, {}, backend="vllm", architecture=architecture)[0]
     sha256 = _canonical_hash({"launch": launch, "bundle_sha256": bundle.sha256})
     cells = tuple(
         FPMCell(
@@ -355,6 +419,7 @@ def build_runtime_probe_plan(configuration: str, facts: dict[str, Any], bundle: 
         cells,
         bundle,
         sha256,
+        copy.deepcopy(facts.get("deployment", {}).get("extra_env")),
     )
 
 
@@ -522,23 +587,37 @@ def record_collection_observations(
             raise ValueError("formal collection saved runtime context does not match its attempt")
 
     history = attempt["phase_attempts"].setdefault(cell.workload_kind, [])
+    context = cell_dir / CONTEXT_FILENAME
+    if context.is_file():
+        verify_context(context)
+    elif status in {"passed", "validating"}:
+        raise ValueError("formal collection passed attempt requires its saved runtime context")
+    if status not in {"passed", "validating"}:
+        for previous in history:
+            if previous["collector_attempt_id"] == cell_attempt_id:
+                previous["status"] = status
     for previous in reversed(history):
-        if previous["collector_attempt_id"] != cell_attempt_id or previous["status"] != status or status != "passed":
+        if (
+            previous["collector_attempt_id"] != cell_attempt_id
+            or status not in {"passed", "validating"}
+            or previous["status"] not in {"passed", "validating"}
+            or previous.get("launch_manifest") is None
+        ):
             continue
-        if previous.get("launch_manifest") is not None:
-            verify_context(_verified_artifact(root, previous["launch_manifest"]))
-        elif status == "passed":
-            raise ValueError("formal collection passed attempt requires its saved runtime context")
+        saved_context = _verified_artifact(root, previous["launch_manifest"])
+        verify_context(saved_context)
+        if saved_context.read_bytes() != context.read_bytes():
+            continue
+        saved_artifacts = []
         for artifact in previous["artifacts"]:
-            _verified_artifact(root, artifact)
+            path = _verified_artifact(root, artifact)
+            saved_artifacts.append({**artifact, "path": str(path.relative_to(saved_context.parent))})
+        if saved_artifacts != observation_artifacts(cell_dir, cell_dir):
+            continue
         phase = previous
+        phase["status"] = status
         break
     else:
-        context = cell_dir / CONTEXT_FILENAME
-        if context.is_file():
-            verify_context(context)
-        elif status == "passed":
-            raise ValueError("formal collection passed attempt requires its saved runtime context")
         snapshot = root / "runtime-observations" / parent_attempt_id / cell.workload_kind / cell_attempt_id
         # A host can die after copying files and before committing the index.
         # Preserve that unindexed directory and publish a new complete snapshot.
@@ -842,8 +921,19 @@ def _cleanup_previous_attempt(root: Path, plan, attempt: dict[str, Any]) -> None
         verified.append((cell, phase, phase_dir, manifest))
     for cell, phase, phase_dir, manifest in verified:
         resource = runner._cell_runner(previous_plan, cell, manifest, phase_dir)
-        runner._salvage_artifacts(resource, cell.cell_id)
-        resource.cleanup()
+        from .private_inputs import sanitize_recovered_diagnostics
+
+        try:
+            runner._salvage_artifacts(resource, cell.cell_id)
+            resource.cleanup()
+            reclaim_delivery(phase_dir)
+        finally:
+            sanitize_recovered_diagnostics(
+                phase_dir,
+                probe_generator_overrides(plan.launch),
+                cell=cell,
+                environment={item["name"]: item["value"] for item in plan._environment or [] if "value" in item},
+            )
         phase["recovery_artifacts"] = _snapshot_probe_artifacts(root, phase_dir)
 
 
@@ -867,6 +957,8 @@ def probe_runtime(
     output_dir: str | Path,
     execute: bool = False,
     resume: bool = False,
+    private_environment: dict[str, Any] | None = None,
+    previous_reports: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Preview or capture all selected exact tuples; preserve every attempt."""
 
@@ -915,8 +1007,15 @@ def probe_runtime(
             )
     bundle = load_instrumentation(instrumentation) if isinstance(instrumentation, (str, Path)) else instrumentation
     root = Path(output_dir).expanduser().resolve()
-    if root.exists() and any(root.iterdir()) and not (root / "probe-plan.json").exists():
-        raise ValueError("runtime probe output must be fresh or contain this probe's saved plan")
+    if root.exists() and not (root / "probe-plan.json").exists():
+        for path in root.iterdir():
+            if (
+                not re.fullmatch(r"onboarding-probe-[0-9a-f]{32}\.json", path.name)
+                or path.is_symlink()
+                or not path.is_file()
+                or (previous_reports or {}).get(str(path)) != hashlib.sha256(path.read_bytes()).hexdigest()
+            ):
+                raise ValueError("runtime probe output must be fresh or contain this probe's saved plan")
     root.mkdir(parents=True, exist_ok=True)
     results: dict[str, Any] = {}
     with _probe_lock(root), runner._sigterm_as_interrupt():
@@ -940,7 +1039,10 @@ def probe_runtime(
                     facts["deployment"] = resolve_probe_cpu_policy(
                         configuration, facts["deployment"], root, resume=resume
                     )
-                plan = build_runtime_probe_plan(configuration, facts, bundle)
+                delivery_facts = copy.deepcopy(facts)
+                if private_environment is not None and private_environment.get(configuration) is not None:
+                    delivery_facts["deployment"]["extra_env"] = private_environment[configuration]
+                plan = build_runtime_probe_plan(configuration, delivery_facts, bundle)
                 existing = index["configurations"].get(configuration)
                 if existing is not None and existing["launch"] != plan.launch:
                     raise ValueError("launch settings changed; use a fresh probe output directory")
@@ -1022,10 +1124,18 @@ def probe_runtime(
                 phase_dir.mkdir()
                 phase = attempt["phases"][cell.workload_kind] = {"status": "running", "artifacts": []}
                 resource = None
+                delivery_directory = None
+                sensitive_values = ()
                 try:
-                    runner._render_cell(plan, cell, phase_dir, probe_generator_overrides(plan.launch))
+                    delivery = plan.launch
+                    if plan._environment is not None:
+                        delivery["deployment"]["extra_env"] = plan._environment
+                    sensitive_values = private_values(probe_generator_overrides(delivery))
+                    runner._render_cell(
+                        plan, cell, phase_dir, probe_generator_overrides(delivery), resolve_environment=False
+                    )
                     context = launch_context(plan, cell, configuration=configuration, attempt_id=attempt_id)
-                    extras = stage_runtime_instrumentation(frozen, phase_dir, context)
+                    stage_runtime_instrumentation(frozen, phase_dir, context)
                     phase["launch_manifest"] = {
                         "path": str((phase_dir / CONTEXT_FILENAME).relative_to(root)),
                         **runner._file_metadata(phase_dir / CONTEXT_FILENAME),
@@ -1034,8 +1144,21 @@ def probe_runtime(
                     phase["generator_request"] = str(phase_dir / "generator-request.json")
                     if execute:
                         runner._atomic_json(index_path, index)
-                        manifest = phase_dir / runner.FPM_MANIFEST_FILENAME
+                        # Concrete credentials exist only in private, temporary
+                        # worker staging. Retained renders contain references.
+                        # Pyxis bind mounts need the campaign's shared storage;
+                        # the login node's default temporary directory may be local.
+                        delivery_directory = new_delivery_directory(root, phase_dir, plan.options.executor)
+                        worker_dir = Path(delivery_directory.name)
+                        runner._render_cell(plan, cell, worker_dir, probe_generator_overrides(delivery))
+                        worker_extras = stage_runtime_instrumentation(frozen, worker_dir, context)
+                        runner._atomic_json(index_path, index)
+                        manifest = worker_dir / runner.FPM_MANIFEST_FILENAME
                         resource = runner._cell_runner(plan, cell, manifest, phase_dir)
+                        resource._private_values = sensitive_values
+                        resource._diagnostic_cell = cell
+                        if plan.options.executor == "slurm":
+                            resource.runtime_dir = worker_dir / "slurm-runtime"
                         resource.cleanup()
                         resource.apply()
                         pods = resource.wait_ready(runner._expected_nodes(manifest))
@@ -1043,13 +1166,13 @@ def probe_runtime(
                         resource.stage(
                             pods,
                             [
-                                phase_dir / runner.FPM_RUN_SCRIPT_FILENAME,
-                                phase_dir / runner.FPM_ENV_FILENAME,
-                                phase_dir / runner.RUNTIME_ENV_FILENAME,
+                                worker_dir / runner.FPM_RUN_SCRIPT_FILENAME,
+                                worker_dir / runner.FPM_ENV_FILENAME,
+                                worker_dir / runner.RUNTIME_ENV_FILENAME,
                                 runtime / "fpm_exec.sh",
                                 runtime / "preflight.py",
                                 *([runtime / "fpm_memory_observer.py"] if plan.options.executor == "slurm" else []),
-                                *extras,
+                                *worker_extras,
                             ],
                         )
                         resource.prepare_attempt(
@@ -1062,6 +1185,7 @@ def probe_runtime(
                         )
                         resource.execute(pods)
                         resource.collect(pods, require_benchmark=False)
+                        redact_diagnostics(phase_dir, sensitive_values, cell=cell)
                     phase["status"] = "completed" if execute else "preview"
                 except KeyboardInterrupt:
                     phase["status"] = "interrupted"
@@ -1070,25 +1194,65 @@ def probe_runtime(
                         runner._salvage_artifacts(resource, cell.cell_id)
                     raise
                 except Exception as error:
-                    phase.update(status="failed", error=str(error), error_type=type(error).__name__)
+                    phase.update(
+                        status="failed", error=redact(str(error), sensitive_values), error_type=type(error).__name__
+                    )
                     result["status"] = "failed"
-                    result["diagnostics"].append(f"{cell.workload_kind}: {error}")
+                    result["diagnostics"].append(f"{cell.workload_kind}: {redact(str(error), sensitive_values)}")
                     if resource is not None:
                         runner._salvage_artifacts(resource, cell.cell_id)
                 finally:
+                    teardown_ok = resource is None
                     if resource is not None:
                         try:
                             resource.cleanup()
+                            teardown_ok = True
                         except Exception as error:
-                            phase.update(status="cleanup_failed", cleanup_error=str(error))
+                            phase.update(cleanup_error=redact(str(error), sensitive_values))
+                            if phase["status"] != "interrupted":
+                                phase["status"] = "cleanup_failed"
                             result["status"] = "failed"
-                            result["diagnostics"].append(f"{cell.workload_kind} cleanup: {error}")
+                            result["diagnostics"].append(
+                                f"{cell.workload_kind} cleanup: {redact(str(error), sensitive_values)}"
+                            )
+                    if delivery_directory is not None and teardown_ok:
+                        try:
+                            delivery_directory.cleanup()
+                        except Exception as error:
+                            phase.update(private_cleanup_error=redact(str(error), sensitive_values))
+                            if phase["status"] != "interrupted":
+                                phase["status"] = "cleanup_failed"
+                            result["status"] = "failed"
+                            result["diagnostics"].append(
+                                f"{cell.workload_kind} delivery cleanup: {redact(str(error), sensitive_values)}"
+                            )
+                    diagnostics_ok = True
                     try:
-                        phase["artifacts"] = _snapshot_probe_artifacts(root, phase_dir)
+                        redact_diagnostics(phase_dir, sensitive_values, cell=cell)
+                    except Exception as error:
+                        diagnostics_ok = False
+                        try:
+                            discard_diagnostics(phase_dir)
+                        except OSError as cleanup_error:
+                            phase["diagnostic_cleanup_error"] = redact(str(cleanup_error), sensitive_values)
+                        phase["diagnostic_error"] = redact(str(error), sensitive_values)
+                        if phase["status"] not in {"interrupted", "cleanup_failed"}:
+                            phase["status"] = "failed"
+                        if result["status"] != "interrupted":
+                            result["status"] = "failed"
+                        result["diagnostics"].append(
+                            f"{cell.workload_kind} diagnostic sanitization: {phase['diagnostic_error']}"
+                        )
+                    try:
+                        if diagnostics_ok:
+                            phase["artifacts"] = _snapshot_probe_artifacts(root, phase_dir)
                     except (OSError, ValueError) as error:
-                        phase.update(status="failed", capture_error=str(error))
-                        result["status"] = "failed"
-                        result["diagnostics"].append(f"{cell.workload_kind} evidence capture: {error}")
+                        phase["capture_error"] = redact(str(error), sensitive_values)
+                        if phase["status"] not in {"interrupted", "cleanup_failed"}:
+                            phase["status"] = "failed"
+                        if result["status"] != "interrupted":
+                            result["status"] = "failed"
+                        result["diagnostics"].append(f"{cell.workload_kind} evidence capture: {phase['capture_error']}")
                     result["phases"][cell.workload_kind] = copy.deepcopy(phase)
                     if execute:
                         attempt["status"] = result["status"] if result["status"] != "completed" else "running"

@@ -549,6 +549,14 @@ def test_public_slurm_collect_to_finalize_preserves_frozen_deployment(tmp_path, 
         assert mounts.startswith("/cache:/cache,/models:/models,")
         raw = Path(next(value.rsplit(":", 1)[0] for value in mounts.split(",") if value.endswith(":/results")))
         command = args[args.index("/usr/bin/env") + 6 :]
+        if command[:2] == ["bash", "-c"]:
+            assert command[2:4] == [
+                "set -e; if [[ -f /tmp/fpm-bench/collector-runtime-env.sh ]]; then "
+                'source /tmp/fpm-bench/collector-runtime-env.sh; fi; exec "$@"',
+                "fpm-attempt-provenance",
+            ]
+            command = command[4:]
+            assert command[:2] == ["python3", "-c"]
         if command[:2] == ["python3", "-c"]:
             with monkeypatch.context() as patch:
                 patch.setattr(sys, "argv", ["-c", *command[3:]])

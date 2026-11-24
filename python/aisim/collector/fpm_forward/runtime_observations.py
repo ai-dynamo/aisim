@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import copy
 import itertools
+import json
 import math
 import re
 from importlib.resources import files
@@ -36,7 +37,7 @@ from aisim_core.sdk.perf_database import load_system_spec
 from . import runtime_memory
 from .capabilities import checkpoint_fmha_quant_mode, has_checkpoint_fmha
 from .config import PrefillSamplingProfile, collection_phases
-from .model_capability import load_model_config
+from .model_capability import ResolvedModelConfig, _attach_modelopt_sidecar, kimi_k31_native_attention_backend
 from .planner import BackendPolicy, FPMCell
 from .runtime.fpm_memory_observer import (
     _LEGACY_SPECS,
@@ -54,6 +55,7 @@ from .runtime_instrumentation import (
     contained_file,
     load_instrumentation,
     read_json,
+    read_json_snapshot,
     sha256_bytes,
     validate_sha256,
 )
@@ -180,7 +182,7 @@ def _source_files(launch: dict[str, Any]) -> dict[str, str]:
     return source_files
 
 
-def _staged_checkpoint_fmha(root: Path, references: list[Any], launch: dict[str, Any], kv_cache_dtype: str) -> str:
+def _staged_checkpoint(root: Path, references: list[Any], launch: dict[str, Any], kv_cache_dtype: str):
     """The checkpoint-native FMHA label of the model configuration that a phase staged.
 
     The finalization recheck and the collection verifier validate saved evidence when the launch path can be gone, so
@@ -193,7 +195,7 @@ def _staged_checkpoint_fmha(root: Path, references: list[Any], launch: dict[str,
     for reference in references:
         name = PurePosixPath(reference["path"]).name
         if name in staged:
-            staged[name].append(_artifact(root, reference))
+            staged[name].append((contained_file(root, reference["path"]), validate_sha256(reference["sha256"], name)))
     if len(staged["model-config.json"]) != 1:
         raise ValueError(
             f"runtime phase must stage exactly one model-config.json, found {len(staged['model-config.json'])}"
@@ -209,10 +211,17 @@ def _staged_checkpoint_fmha(root: Path, references: list[Any], launch: dict[str,
         raise ValueError("declared hf_quant_config.json is not staged beside model-config.json")
     elif any(value != sources["hf_quant_config.json"] for _, value in staged["hf_quant_config.json"]):
         raise ValueError("staged hf_quant_config.json differs from its declared SHA-256")
-    config = load_model_config(launch["identity"]["model"], explicit_config_path=str(path)).effective_payload
+    raw = read_json(path, expected_sha256=digest)
+    payload = raw
+    if "hf_quant_config.json" in sources:
+        if len(staged["hf_quant_config.json"]) != 1:
+            raise ValueError("frozen phase has ambiguous model configuration sources: hf_quant_config.json")
+        quant = read_json(sidecar, expected_sha256=sources["hf_quant_config.json"])
+        payload = _attach_modelopt_sidecar(copy.deepcopy(raw), quant)
+    config = ResolvedModelConfig(payload, source_kind="explicit", source_reference=str(path)).effective_payload
     _attach_inferred_quant_fields(config)
     # The architecture as the runtime probe takes it.
-    return checkpoint_fmha_quant_mode(config, (config.get("architectures") or [None])[0], kv_cache_dtype)
+    return raw, checkpoint_fmha_quant_mode(config, (config.get("architectures") or [None])[0], kv_cache_dtype)
 
 
 def _validate_hardware(hardware: dict[str, Any], identity: dict[str, Any]) -> None:
@@ -285,6 +294,33 @@ def _matches_model_path(observed: Any, launch: dict[str, Any]) -> bool:
     )
 
 
+def _checkpoint_config(
+    launch: dict[str, Any], *, root=None, references=None, phase_dir=None, fallback_artifacts=None
+) -> dict[str, Any]:
+    if root is None:
+        from .runtime_probe import _model_config_bytes
+
+        return json.loads(_model_config_bytes(launch["model_config"])["model-config.json"])
+    config = launch["model_config"]
+    contents = {}
+    for name, expected in {"model-config.json": config["sha256"], **_source_files(launch)}.items():
+        matches = [ref for ref in references if PurePosixPath(ref["path"]).name == name]
+        if len(matches) > 1:
+            raise ValueError(f"frozen phase has ambiguous model configuration sources: {name}")
+        if matches:
+            path, digest = _artifact(root, matches[0])
+            _same(digest, expected, f"frozen model configuration source {name}")
+        else:
+            # Phase-local staged inputs are independently bound by the launch
+            # hash even when absent from the observation artifact index.
+            relative = str((phase_dir / name).relative_to(root))
+            path = contained_file(root, relative)
+            if fallback_artifacts is not None:
+                fallback_artifacts.append({"path": relative, "sha256": expected})
+        contents[name] = read_json(path, expected_sha256=expected)
+    return contents["model-config.json"]
+
+
 def _validate_record(
     record: dict[str, Any],
     *,
@@ -293,6 +329,8 @@ def _validate_record(
     binding: dict[str, str],
     cell: FPMCell,
     checkpoint_fmha: str | None,
+    checkpoint_config: dict[str, Any] | None = None,
+    formal_collection: bool = False,
 ) -> dict[str, Any]:
     """Validate one rank record of a phase.
 
@@ -328,7 +366,16 @@ def _validate_record(
     kind = record.get("kind")
     if kind not in {"worker", "scheduler"}:
         raise ValueError("runtime observation requires worker or scheduler role")
+    from .runtime_k31 import LAYOUT, is_audited_runtime
+
+    cache = record.get("cache")
+    if not isinstance(cache, dict):
+        raise ValueError("runtime observation cache must be an object")
+    if cache.get("allocation_layout") == LAYOUT and not is_audited_runtime(record.get("runtime")):
+        raise ValueError("K3.1 native cache mapping requires the exact audited runtime source map")
     lifecycle = record.get("lifecycle", {})
+    if not isinstance(lifecycle, dict):
+        raise ValueError("runtime observation lifecycle must be an object")
     if lifecycle.get("cache_initialized") is not True:
         raise ValueError("cache initialization lifecycle evidence is missing")
     if kind == "worker":
@@ -339,6 +386,8 @@ def _validate_record(
         ):
             raise ValueError("worker warmup and graph capture completion evidence is missing")
         hardware = record.get("hardware", {})
+        if not isinstance(hardware, dict):
+            raise ValueError("runtime observation hardware must be an object")
         _validate_hardware(hardware, launch["identity"])
         total = _positive(hardware.get("total_memory_bytes"), "hardware memory bytes")
         if _positive(record["cache"]["available_cache_bytes"], "profiled cache allowance") > total:
@@ -346,6 +395,14 @@ def _validate_record(
     elif lifecycle.get("measurement") != "scheduler_initialized":
         raise ValueError("scheduler initialization lifecycle evidence is missing")
     collection = launch["collection"]
+    native_layout = record["cache"].get("allocation_layout") == LAYOUT
+    observed_config = record.get("resolved_config", {})
+    observed_model = observed_config.get("model_config", {}) if isinstance(observed_config, dict) else {}
+    native_architecture = isinstance(observed_model, dict) and observed_model.get("architectures") == [
+        "KimiK31ForConditionalGeneration"
+    ]
+    if native_layout and not native_architecture:
+        raise ValueError("K3.1 native cache mapping requires the observed KimiK31ForConditionalGeneration architecture")
     config = runtime_memory._validate_config(
         record,
         cell,
@@ -354,6 +411,30 @@ def _validate_record(
         sequences=collection["max_num_seqs"],
         fraction=float(collection["gpu_memory_utilization"]),
     )
+    if native_architecture:
+        if not is_audited_runtime(record.get("runtime")) or record["cache"].get("allocation_layout") != LAYOUT:
+            raise ValueError("K3.1 initialization requires the exact audited runtime and native cache mapping")
+        if (
+            config["cache_config"].get("enable_prefix_caching") is not False
+            or config["cache_config"].get("mamba_cache_mode") != "none"
+        ):
+            raise ValueError("K3.1 initialization requires native mamba none and prefix caching disabled")
+        if (formal_collection or binding.get("collector_attempt_id") is not None) and config["cache_config"].get(
+            "mamba_ssm_cache_dtype"
+        ) not in {"auto", "float32"}:
+            # Formal collection renders --mamba-ssm-cache-dtype float32.
+            # Standalone observations may still describe verified BF16 state.
+            # The native tensor checks independently bind auto to effective FP32.
+            raise ValueError("K3.1 formal collection requires effective float32 recurrent state")
+        if kind == "worker":
+            from .runtime_k31 import moe_precision
+
+            # Use the hash-bound checkpoint config, independently of the
+            # worker's model-tree enumeration. All downstream consumers
+            # revalidate this record before admitting its precision evidence.
+            if checkpoint_config is None:
+                checkpoint_config = _checkpoint_config(launch)
+            moe_precision(record.get("initialized_moe"), model_config=checkpoint_config)
     if launch["identity"]["model_kind"] == "moe":
         parallel = config["parallel_config"]
         enabled = parallel["enable_expert_parallel"]
@@ -384,6 +465,7 @@ def _validate_record(
     if revision not in (model.get("revision"), model.get("loaded_config_commit_hash")):
         raise ValueError("observed model revision differs from the selected model")
     runtime_memory._validate_revision(config, revision)
+    _validate_attention_backend(record, launch, config)
     observed = runtime_memory._dtype(model.get("dtype"))
     if checkpoint_fmha is None:
         if cell.fmha_quant_mode not in {"half", "bfloat16"} or observed != cell.fmha_quant_mode:
@@ -437,10 +519,65 @@ def _validate_record(
         if "cudagraph_capture_sizes" in graph_settings:
             graph_settings.setdefault("max_cudagraph_capture_size", max(graph_settings["cudagraph_capture_sizes"]))
         runtime_memory.validate_requested_graph(record, config, graph_settings)
-    requested_backend = launch["precision"].get("attention_backend", "auto")
-    if requested_backend not in (None, "auto") and record.get("attention_backend") != requested_backend:
-        raise ValueError("runtime observation lacks the selected attention backend evidence")
+    if native_layout and kind == "worker":
+        from .runtime_k31 import validate_attention_assignments
+
+        environment = {
+            item["name"]: item["value"]
+            for item in launch["deployment"].get("extra_env") or ()
+            if item["name"] == "VLLM_SSM_CONV_STATE_LAYOUT" and "value" in item
+        }
+        validate_attention_assignments(
+            record,
+            model_config=checkpoint_config,
+            conv_state_layout=environment.get("VLLM_SSM_CONV_STATE_LAYOUT", "SD"),
+        )
     return config
+
+
+def _validate_attention_backend(record: dict, launch: dict, config: dict) -> None:
+    """Bind public policy to observed native names without changing row identity."""
+    requested = launch["precision"].get("attention_backend", "auto")
+    if requested in (None, "auto"):
+        return
+    architectures = config.get("model_config", {}).get("architectures")
+    architecture = architectures[0] if isinstance(architectures, list) and len(architectures) == 1 else None
+    native = kimi_k31_native_attention_backend(architecture, requested)
+    if native is None:
+        if record.get("attention_backend") != requested:
+            raise ValueError("runtime observation lacks the selected attention backend evidence")
+        return
+    attention = config.get("attention_config", {})
+    if attention.get("backend") != native or attention.get("indexer_kv_dtype") != "fp8":
+        raise ValueError("runtime observation lacks the selected native K3.1 attention configuration")
+    # Pinned FlashMLASparseBackend.supported_dtypes contains only BF16.
+    if native == "FLASHMLA_SPARSE" and runtime_memory._dtype(config.get("model_config", {}).get("dtype")) != "bfloat16":
+        raise ValueError("native K3.1 FlashMLA requires BF16 compute")
+    # Schedulers record resolved configuration; only workers own initialized
+    # attention groups. Rank-complete worker evidence is required by the importer.
+    if record.get("kind") == "scheduler":
+        return
+    # Pinned sparse backend supports_compute_capability contracts: FlashInfer
+    # TRTLLM requires SM10x; FlashMLA supports SM9x and SM10x. Only workers
+    # own GPUs and emit hardware observations.
+    sm = record.get("hardware", {}).get("sm")
+    supported_majors = {10} if native == "FLASHINFER_MLA_SPARSE" else {9, 10}
+    if type(sm) is not int or sm // 10 not in supported_majors:
+        raise ValueError("selected native K3.1 attention backend does not support the observed GPU SM")
+    observed = record.get("attention_backend")
+    names = [observed] if isinstance(observed, str) else observed
+    # The pinned image's get_name() implementations report these auxiliary
+    # KDA/indexer groups alongside DSA; neither is an alternative DSA backend.
+    auxiliary = {"KIMI_K3_KDA", "DEEPSEEK_V32_INDEXER"}
+    if (
+        not isinstance(names, list)
+        or not names
+        or any(not isinstance(name, str) for name in names)
+        or len(names) != len(set(names))
+        or native not in names
+        or set(names) - {native} - auxiliary
+    ):
+        raise ValueError("runtime observation lacks the selected native K3.1 attention backend evidence")
 
 
 def _validate_import_binding(record: dict, expected: dict, bundle: InstrumentationBundle) -> None:
@@ -807,9 +944,19 @@ def _layer_strided_views(
 
 
 def _physical_views(
-    cache: dict[str, Any], scheduled: dict[str, Any], precision: str, runtime_version: str
+    cache: dict[str, Any],
+    scheduled: dict[str, Any],
+    precision: str,
+    runtime_version: str,
+    *,
+    context: int | None = None,
+    sequences: int | None = None,
+    metadata_builders: int = 1,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    _same(cache.get("semantics"), _SEMANTICS, "supported allocation semantics")
+    from .runtime_k31 import LAYOUT
+
+    semantics = {**_SEMANTICS, "retention": "full_or_state"} if cache.get("allocation_layout") == LAYOUT else _SEMANTICS
+    _same(cache.get("semantics"), semantics, "supported allocation semantics")
     accounting = runtime_memory.validate_shared_pool_accounting(cache, scheduled)
     count, page = accounting["num_blocks"], accounting["page_size_bytes"]
     pool = _text(cache.get("pool_id"), "pool identity")
@@ -828,7 +975,35 @@ def _physical_views(
     # A vLLM 0.33.0 scheduler reserves only the null block (runtime/instrumentation/observer.py _reservations).
     if hybrid and reserved != [scheduled["null_block_id"]]:
         raise ValueError("additional initialized reservations lack an audited permanent-reservation mapping")
-    groups = runtime_memory._normalized_groups(cache, scheduled, page)
+    groups = runtime_memory._normalized_groups(cache, scheduled, page, context=context)
+    from .runtime_k31 import LAYOUT, validate_views
+
+    if cache.get("allocation_layout") == LAYOUT:
+        if reserved != [scheduled["null_block_id"]]:
+            raise ValueError("K3.1 native scheduler permits only the singleton null-block reservation")
+        for group in cache["groups"]:
+            if (
+                group.get("pool_id") != pool
+                or group.get("extra_retained_tokens") != 0
+                or group.get("attention_chunk_size") is not None
+            ):
+                raise ValueError("K3.1 cache group pool or retention is unsupported")
+        validate_views(
+            cache, precision, count, page, context=context, sequences=sequences, metadata_builders=metadata_builders
+        )
+        # Pinned vLLM kv_cache_interface.py::max_memory_usage_bytes and
+        # kv_cache_utils.py::check_enough_kv_cache_memory_available sum demand
+        # once per shared-pool group. Uniform specs share a block table;
+        # non-speculative Mamba mode none retains one page per request.
+        demand = sum(
+            group["blocks_per_request"]
+            if group["kind"] == "state"
+            else (context + group["block_size_tokens"] - 1) // group["block_size_tokens"]
+            for group in groups
+        )
+        if accounting["initial_free_blocks"] < demand:
+            raise ValueError(f"K3.1 native pool cannot hold one request at the reviewed context: needs {demand} blocks")
+        return groups, accounting
     layer_groups = {}
     for group_id, group in enumerate(cache["groups"]):
         # _normalized_groups accepts every table class, but vLLM 0.27.0 and 0.28.0 records hold only the legacy ones.
@@ -1453,6 +1628,14 @@ def _mode_free(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def _runtime_settings(config: dict[str, Any]) -> dict[str, Any]:
+    """Compare complete validated settings, excluding phase-local prefix caching."""
+    return {
+        **config,
+        "cache_config": {key: value for key, value in config["cache_config"].items() if key != "enable_prefix_caching"},
+    }
+
+
 def _configuration(
     root: Path,
     label: str,
@@ -1461,6 +1644,7 @@ def _configuration(
     *,
     phase: str | None = None,
     attempt_id: str | None = None,
+    collector_binding: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     _same(saved.get("launch"), launch, "reviewed configuration launch")
     ranks = expected_ranks(launch["topology"])
@@ -1485,10 +1669,16 @@ def _configuration(
     _same(bundle.sha256, attempt["bundle"].get("sha256"), "instrumentation bundle hash")
     if not bundle.manifest.get("source_notes") or not bundle.manifest["runtime"].get("source_files"):
         raise ValueError("runtime source mapping requires hashed source_notes and runtime.source_files")
+    bulk_import = phase is None
     # Reuse the memory observer's audited releases and patch-release policy. This route also supports the exact
     # campaign-local 0.28.0 adapter audited in runtime/instrumentation/vllm-0.28.0.md, which uses shared slots.
     runtime_version = bundle.manifest["runtime"]["version"]
     release = audited_release(runtime_version, (*MEMORY_SUPPORTED_VERSIONS, "0.28.0"))
+    from .runtime_k31 import is_audited_runtime
+
+    is_k31_runtime = is_audited_runtime(bundle.manifest["runtime"])
+    if is_k31_runtime:
+        release = runtime_version
     if release is None:
         raise ValueError(f"runtime observation import requires audited vLLM; the bundle names vLLM {runtime_version}")
     phases = attempt.get("phases", {})
@@ -1505,13 +1695,33 @@ def _configuration(
     geometry_differences: list[str] = []
     used_paths: set[str] = set()
     for phase in required_phases:
+        checkpoint_config = None
         result = phases[phase]
+        collector_phase = all(
+            isinstance(result.get(key), str) and result[key] for key in ("cell_id", "collector_attempt_id")
+        )
+        if any(key in result for key in ("cell_id", "collector_attempt_id")) and not collector_phase:
+            raise ValueError("Collector phase requires both cell_id and collector_attempt_id")
+        expected_status = "passed" if collector_phase else "completed"
+        if bulk_import and result.get("status") != expected_status:
+            raise ValueError(
+                f"{phase} runtime probe phase status is {result.get('status')!r}, expected {expected_status}"
+            )
         binding = {"attempt_id": active, "configuration": label, "phase": phase, "bundle_sha256": bundle.sha256}
         launch_path, digest = _artifact(root, result["launch_manifest"])
-        context = read_json(launch_path)
+        context = read_json(launch_path, expected_sha256=digest)
         if context.get("schema_version") != LAUNCH_SCHEMA:
             raise ValueError("unsupported runtime launch manifest schema")
         for name, value in {**binding, "launch": launch, "expected_ranks": ranks}.items():
+            _same(context.get(name), value, f"launch manifest {name}")
+        for name, value in (
+            {key: result[key] for key in ("cell_id", "collector_attempt_id")} if collector_phase else {}
+        ).items():
+            _same(context.get(name), value, f"launch manifest {name}")
+        if not collector_phase and any(name in context for name in ("cell_id", "collector_attempt_id")):
+            raise ValueError("standalone phase includes Collector identities in its launch manifest")
+        for name, value in (collector_binding or {}).items():
+            _same(result.get(name), value, f"selected phase {name}")
             _same(context.get(name), value, f"launch manifest {name}")
         launch_artifacts.append({**result["launch_manifest"], "sha256": digest})
         import_binding = context.get("instrumentation_binding")
@@ -1521,23 +1731,68 @@ def _configuration(
         references = result.get("artifacts")
         if not isinstance(references, list):
             raise ValueError("runtime phase is missing its artifact manifest")
+        fmha_references = references
+        if is_k31_runtime and has_checkpoint_fmha(cell.kv_cache_dtype):
+            # Historical Kimi archives bind phase-local config files through
+            # the launch hashes, even when the artifact index lists only ranks.
+            fmha_references = list(references)
+            for name, expected in {
+                "model-config.json": launch["model_config"]["sha256"],
+                **_source_files(launch),
+            }.items():
+                if not any(PurePosixPath(ref["path"]).name == name for ref in references):
+                    fmha_references.append(
+                        {"path": str((launch_path.parent / name).relative_to(root)), "sha256": expected}
+                    )
         # Only an AIC KV-cache mode other than bfloat16 reads the staged model configuration.
-        checkpoint_fmha = (
-            _staged_checkpoint_fmha(root, references, launch, cell.kv_cache_dtype)
-            if has_checkpoint_fmha(cell.kv_cache_dtype)
-            else None
-        )
-        for reference in references:
-            path, digest = _artifact(root, reference)
+        checkpoint_fmha = None
+        if has_checkpoint_fmha(cell.kv_cache_dtype):
+            checkpoint_config, checkpoint_fmha = _staged_checkpoint(root, fmha_references, launch, cell.kv_cache_dtype)
+        for reference in fmha_references:
+            if checkpoint_fmha is not None and PurePosixPath(reference["path"]).name in {
+                "model-config.json",
+                "hf_quant_config.json",
+            }:
+                # _staged_checkpoint verified these exact bytes before deriving both views.
+                path, digest = contained_file(root, reference["path"]), reference["sha256"]
+            else:
+                path, digest = _artifact(root, reference)
             if str(path.resolve()) in used_paths:
                 raise ValueError("duplicate runtime artifact path across ranks or phases")
             used_paths.add(str(path.resolve()))
             if reference.get("kind") != "observation":
                 runtime_artifacts.append(copy.deepcopy(reference))
                 continue
-            record = read_json(path)
+            record = read_json(path, expected_sha256=digest)
+            from .runtime_k31 import LAYOUT
+
+            if (
+                checkpoint_config is None
+                and record.get("kind") == "worker"
+                and isinstance(record.get("cache"), dict)
+                and record["cache"].get("allocation_layout") == LAYOUT
+            ):
+                checkpoint_config = _checkpoint_config(
+                    launch,
+                    root=root,
+                    references=references,
+                    phase_dir=launch_path.parent,
+                    fallback_artifacts=runtime_artifacts,
+                )
+            if not collector_phase and any(name in record for name in ("cell_id", "collector_attempt_id")):
+                raise ValueError("standalone runtime observation contains Collector binding fields")
             config = _validate_record(
-                record, launch=launch, bundle=bundle, binding=binding, cell=cell, checkpoint_fmha=checkpoint_fmha
+                record,
+                launch=launch,
+                bundle=bundle,
+                binding={
+                    **binding,
+                    **({key: result[key] for key in ("cell_id", "collector_attempt_id")} if collector_phase else {}),
+                    **(collector_binding or {}),
+                },
+                cell=cell,
+                checkpoint_config=checkpoint_config,
+                checkpoint_fmha=checkpoint_fmha,
             )
             if import_binding is not None:
                 _validate_import_binding(record, import_binding, bundle)
@@ -1594,13 +1849,20 @@ def _configuration(
             raise ValueError(f"{phase} worker/scheduler rank evidence is incomplete")
         phase_geometry = None
         for (dp, tp), worker in sorted(workers.items()):
+            from .runtime_k31 import metadata_builder_count
+
             scheduler = schedulers[dp]
             runtime_memory._validate_scheduler_config(worker, scheduler)
             groups, accounting = _physical_views(
                 worker["cache"],
                 scheduler["cache"],
-                runtime_memory._resolved_cache_dtype(worker["resolved_config"]),
+                runtime_memory._resolved_cache_dtype(worker["resolved_config"], cell),
                 release,
+                context=launch["collection"]["max_model_len"],
+                sequences=launch["collection"]["max_num_seqs"],
+                metadata_builders=metadata_builder_count(worker["resolved_config"])
+                if worker["cache"].get("kernel_block_views")
+                else 1,
             )
             geometry = [
                 {key: value for key, value in group.items() if key != "pool_id"} for group in worker["cache"]["groups"]
@@ -1710,7 +1972,10 @@ def validate_observation_phase(
     launch: dict[str, Any],
     *,
     phase: str,
+    _index_snapshot: tuple[dict[str, Any], bytes] | None = None,
     attempt_id: str,
+    expected_cell_id: str | None = None,
+    expected_collector_attempt_id: str | None = None,
 ) -> dict[str, Any]:
     """Validate one explicitly bound active phase; does not qualify a serving role.
 
@@ -1720,7 +1985,7 @@ def validate_observation_phase(
     index_path = Path(index_path).absolute()
     if index_path.is_symlink():
         raise ValueError("runtime observation index cannot be a symlink")
-    index = read_json(index_path)
+    index, index_bytes = _index_snapshot if _index_snapshot is not None else read_json_snapshot(index_path)
     if index.get("schema_version") != INDEX_SCHEMA or not isinstance(index.get("configurations"), dict):
         raise ValueError("unsupported runtime observation index schema")
     result = _configuration(
@@ -1730,10 +1995,18 @@ def validate_observation_phase(
         launch,
         phase=phase,
         attempt_id=_text(attempt_id, "selected phase attempt identity"),
+        collector_binding={
+            key: value
+            for key, value in {
+                "cell_id": expected_cell_id,
+                "collector_attempt_id": expected_collector_attempt_id,
+            }.items()
+            if value is not None
+        },
     )
     result["provenance"]["observations_index"] = {
         "path": str(index_path),
-        "sha256": sha256_bytes(index_path.read_bytes()),
+        "sha256": sha256_bytes(index_bytes),
     }
     result["resources"]["runtime_memory"]["provenance"] = canonical_json(result["provenance"])
     return result
@@ -1751,7 +2024,7 @@ def validate_observations(
     index_path = Path(index_path).absolute()
     if index_path.is_symlink():
         raise ValueError("runtime observation index cannot be a symlink")
-    index = read_json(index_path)
+    index, index_bytes = read_json_snapshot(index_path)
     if index.get("schema_version") != INDEX_SCHEMA or not isinstance(index.get("configurations"), dict):
         raise ValueError("unsupported runtime observation index schema")
     if not isinstance(expected_configurations, dict) or not expected_configurations:
@@ -1764,7 +2037,7 @@ def validate_observations(
             results[label] = _configuration(index_path.parent, label, index["configurations"][label], launch)
             results[label]["provenance"]["observations_index"] = {
                 "path": str(index_path),
-                "sha256": sha256_bytes(index_path.read_bytes()),
+                "sha256": sha256_bytes(index_bytes),
             }
             results[label]["resources"]["runtime_memory"]["provenance"] = canonical_json(results[label]["provenance"])
         except (ValueError, TypeError, KeyError, AttributeError, IndexError, OSError) as error:

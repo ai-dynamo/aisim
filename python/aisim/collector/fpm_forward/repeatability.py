@@ -12,9 +12,13 @@ No runtime scheduler implementation is copied or replaced here.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
+import os
+import re
 import statistics
+import tempfile
 from collections import Counter
 from dataclasses import fields, replace
 from pathlib import Path
@@ -24,7 +28,11 @@ from aisim.fpm_contract import FPM_MANIFEST_FILENAME
 
 from . import planner
 from .capabilities import ModelCapabilityProfile, ResolvedDTypeProfile
-from .config import FPMCollectionOptions
+from .config import (
+    FPMCollectionOptions,
+    archive_generator_overrides,
+    resolve_archived_generator_overrides,
+)
 from .execution_evidence import _deployment_hashes, file_evidence, inspect_execution_evidence
 from .measurement_evidence import compare_measurements, extract_measurement_evidence
 from .memory_admission import DTypeMemoryEstimate, TopologyMemoryDecision
@@ -37,12 +45,14 @@ from .native_artifact import (
     validate_native_collection,
 )
 from .planner import BackendPolicy, FPMCollectionPlan, _canonical_hash, _hash_stable_admission
+from .private_inputs import RECEIPT
 from .runner import (
     CHECKPOINT_SCHEMA,
     FPM_RECOVERABLE_STATUSES,
     _atomic_json,
     _cell_runner,
     _file_manifest,
+    _file_metadata,
     _recover_completed_attempt,
     _validate_points_receipts,
     run_collection,
@@ -60,7 +70,9 @@ class _IncompleteSample(ValueError):
     pass
 
 
-def load_repeatability_deployment(source_campaign_dir: str | Path) -> dict[str, Any]:
+def load_repeatability_deployment(
+    source_campaign_dir: str | Path, *, resolve_environment: bool = False
+) -> dict[str, Any]:
     """Load the archived effective deployment inputs and verify their plan hash."""
     root = Path(source_campaign_dir).expanduser().resolve()
     path = root / "generator-overrides.json"
@@ -76,8 +88,19 @@ def load_repeatability_deployment(source_campaign_dir: str | Path) -> dict[str, 
         raise ValueError("archived deployment inputs must be an object")
     if not isinstance(overrides.get("K8sConfig", {}), dict):
         raise ValueError("archived K8sConfig must be an object")
-    if saved["generator_config_sha256"] not in _deployment_hashes(overrides):
-        raise ValueError("archived deployment inputs differ from the source plan")
+    archive_generator_overrides(overrides)  # Validate before inspecting entry fields.
+    references = any("value_from_env" in item for item in overrides.get("K8sConfig", {}).get("extra_env", []) or [])
+    hashes = _deployment_hashes(overrides)
+    # A resumed historical plan can retain its original literal-value hash
+    # while its archive is upgraded to references. Reconstruct that hash only
+    # with verified caller values; never trust a hash declared by the archive.
+    if saved["generator_config_sha256"] not in hashes:
+        resolved = resolve_archived_generator_overrides(overrides) if references else overrides
+        if saved["generator_config_sha256"] not in _deployment_hashes(resolved):
+            raise ValueError("archived deployment inputs differ from the source plan")
+        return resolved
+    if references and resolve_environment:
+        return resolve_archived_generator_overrides(overrides)
     return overrides
 
 
@@ -599,22 +622,93 @@ def _retry_sample_cleanup(plan, selected, directory, attempt):
         attempt["files"] = _file_manifest(directory)
 
 
-def _retry_sample_postprocessing(plan, selected, directory, attempt):
+def _reconcile_diagnostic(attempt, files, cell_path):
+    """Accept only the recorded preimage or the intended result of one atomic edit."""
+    pending = attempt.get("pending_diagnostic")
+    if pending is None:
+        return
+    name = pending["path"]
+    relative = Path(name).relative_to(cell_path)
+    receipt_deletion = relative == Path(RECEIPT) and pending["before"] is not None and pending["after"] is None
+    if not receipt_deletion and (
+        ".." in relative.parts
+        or len(relative.parts) < 2
+        or relative.parts[0] not in {"raw", "logs"}
+        or (relative.parts[0] == "raw" and relative.suffix == ".json" and "config" not in relative.name)
+    ):
+        raise ValueError("invalid repeatability diagnostic recovery path")
+    before, after = pending["before"], pending["after"]
+    if before is None and not re.fullmatch(
+        r"logs/transport-failures/[0-9a-f]{32}/(stdout\.log|stderr\.log|failure\.json)", relative.as_posix()
+    ):
+        raise ValueError("unexpected new repeatability diagnostic")
+    if attempt["files"].get(name) != before or files.get(name) not in (before, after):
+        raise ValueError("repeatability diagnostic changed outside recovery")
+    if files.get(name) == after:
+        manifests = [(attempt["files"], name)]
+        if relative.parts[0] == "raw":
+            manifests.append((attempt["evidence"]["raw_files"], str(relative.relative_to("raw"))))
+        for manifest, key in manifests:
+            if after is None:
+                manifest.pop(key)
+            else:
+                manifest[key] = after
+        attempt["postprocessing_attempts"][-1].setdefault("diagnostic_changes", []).append(pending)
+    del attempt["pending_diagnostic"]
+
+
+def _retry_sample_postprocessing(plan, selected, directory, attempt, generator_overrides, root, report):
     """Validate salvaged artifacts without relaunching or rewriting their checkpoint."""
     recovery = {"status": "running"}
     attempt.setdefault("postprocessing_attempts", []).append(recovery)
+    cell_path = Path("artifacts") / plan.sha256[:16] / "cells" / selected["cell_id"]
+
+    def update(path, content):
+        name = str(path.relative_to(directory))
+        if "pending_diagnostic" in attempt:
+            raise ValueError("previous diagnostic edit was interrupted")
+        before = attempt["files"].get(name)
+        if (_file_metadata(path) if path.exists() else None) != before:
+            raise ValueError("repeatability diagnostic changed before recovery")
+        after = None if content is None else {"size": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+        if before == after:
+            return
+        attempt["pending_diagnostic"] = {"path": name, "before": before, "after": after}
+        _atomic_json(root / REPORT_FILENAME, report)
+        if content is None:
+            path.unlink()
+        else:
+            # Keep staging outside the immutable sample manifest. Only the
+            # sanitized bytes are staged, and replacement is atomic.
+            fd, stage = tempfile.mkstemp(dir=root, prefix=".redacted-")
+            try:
+                with os.fdopen(fd, "wb") as staging:
+                    staging.write(content)
+                os.replace(stage, path)
+            finally:
+                Path(stage).unlink(missing_ok=True)
+        _reconcile_diagnostic(attempt, {name: after}, cell_path)
+
     try:
         checkpoint = json.loads((directory / "checkpoint" / "fpm_forward.json").read_text())
         entry = dict(checkpoint["cells"][selected["cell_id"]])
         if attempt.get("cleanup_attempts") and attempt["cleanup_attempts"][-1]["status"] == "passed":
             entry.pop("cleanup_error", None)
-        recovered = _recover_completed_attempt(plan, plan.cells[0], directory / "artifacts" / plan.sha256[:16], entry)
+        recovered = _recover_completed_attempt(
+            plan,
+            plan.cells[0],
+            directory / "artifacts" / plan.sha256[:16],
+            entry,
+            generator_overrides=generator_overrides,
+            diagnostic_update=update,
+        )
         if recovered is None:
             raise ValueError(
                 "CPU-only recovery could not validate the retained observation; inspect collector artifacts "
                 "and teardown before retrying recovery; the original GPU measurement cannot be replaced"
             )
-        if _sample_evidence(plan, selected, directory) != attempt["evidence"]:
+        observed = _sample_evidence(plan, selected, directory)
+        if observed != attempt["evidence"] or _file_manifest(directory) != attempt["files"]:
             raise ValueError("repeatability sample evidence changed during post-processing recovery")
         recovery.update(status="passed", artifact_recovery=recovered["artifact_recovery"])
         attempt["status"] = "passed"
@@ -623,9 +717,6 @@ def _retry_sample_postprocessing(plan, selected, directory, attempt):
         raise
     except Exception as error:
         recovery.update(status="failed", error=f"{type(error).__name__}: {error}")
-    finally:
-        attempt.setdefault("postprocessing_file_history", []).append(attempt.get("files", {}))
-        attempt["files"] = _file_manifest(directory)
 
 
 def _comparison_status(comparisons: list[dict[str, Any]]) -> str:
@@ -1010,8 +1101,15 @@ def _validate_saved_samples(source, frozen, report, root):
                     raise ValueError("repeatability saved attempt directory is invalid")
                 if attempt.get("status") not in {"running", "interrupted", "failed", "passed"}:
                     raise ValueError("repeatability saved attempt status is invalid")
-                if attempt.get("files") is not None and _file_manifest(directory) != attempt["files"]:
-                    raise ValueError("repeatability attempt files changed")
+                if attempt.get("files") is not None:
+                    files = _file_manifest(directory)
+                    cell_path = Path("artifacts") / plan.sha256[:16] / "cells" / cell["cell_id"]
+                    _reconcile_diagnostic(attempt, files, cell_path)
+                    if files != attempt["files"]:
+                        raise ValueError("repeatability attempt files changed")
+                    retries = attempt.get("postprocessing_attempts", [])
+                    if retries and retries[-1]["status"] == "running":
+                        retries[-1]["status"] = "interrupted"
                 if attempt["status"] != "passed" and not attempt.get("evidence"):
                     continue
                 if attempt_index != len(sample["attempts"]):
@@ -1152,7 +1250,9 @@ def run_repeatability(
                             continue
                     if retry_failed and previous.get("failure_kind") == "postprocessing_failed":
                         try:
-                            _retry_sample_postprocessing(plan, selected, previous_dir, previous)
+                            _retry_sample_postprocessing(
+                                plan, selected, previous_dir, previous, generator_overrides, root, report
+                            )
                         finally:
                             _summarize(frozen, report)
                             _save_report(root, report)
@@ -1193,6 +1293,9 @@ def run_repeatability(
                     "is unqualified for this campaign. Use the matching revision or collect a new source campaign. "
                     "Existing samples remain available for offline assessment."
                 )
+            # Check delivery credentials before allocating an attempt. The collector
+            # verifies the frozen identity and resolves references during rendering.
+            resolve_archived_generator_overrides(generator_overrides)
             directory = root / relative
             directory.mkdir(parents=True, exist_ok=False)
             attempt = {"directory": str(relative), "status": "running"}

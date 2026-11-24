@@ -41,6 +41,7 @@ class SlurmCellRunner:
         from .runner import _expected_nodes
 
         self.cell_dir = cell_dir.resolve()
+        self.runtime_dir = self.cell_dir / "slurm-runtime"
         self.node_count = _expected_nodes(manifest)
         if total_gpus % self.node_count:
             raise ValueError("FPM GPUs must divide evenly across Slurm nodes")
@@ -67,6 +68,13 @@ class SlurmCellRunner:
         self.owner_path = self.cell_dir.parent / ".slurm-owners" / f"{self.step_name}.json"
         self.hosts: list[str] = []
 
+    def _write_transport_failure(self, path, text):
+        writer = getattr(self, "_diagnostic_update", None)
+        if writer is None:
+            path.write_text(text)
+        else:
+            writer(path, text.encode())
+
     def _command(self, args: list[str], *, timeout: float = 60, check: bool = True):
         from .runner import _run_command
 
@@ -83,8 +91,13 @@ class SlurmCellRunner:
                     output = getattr(error, stream, None) or ""
                     if isinstance(output, bytes):
                         output = output.decode(errors="replace")
-                    (logs / f"{stream}.log").write_text(output)
-                (logs / "failure.json").write_text(
+                    from .private_inputs import redact
+
+                    values = getattr(self, "_private_values", ())
+                    if values is not None:
+                        self._write_transport_failure(logs / f"{stream}.log", redact(output, values))
+                self._write_transport_failure(
+                    logs / "failure.json",
                     json.dumps(
                         {
                             "executable": Path(args[0]).name,
@@ -94,7 +107,7 @@ class SlurmCellRunner:
                         },
                         sort_keys=True,
                     )
-                    + "\n"
+                    + "\n",
                 )
             except OSError as log_error:
                 error.add_note(f"Could not preserve Slurm failure streams: {log_error}")
@@ -233,7 +246,7 @@ class SlurmCellRunner:
         return [f"node{rank:04d}" for rank in range(len(self.hosts))]
 
     def stage(self, pods: list[str], files: list[Path]) -> None:
-        stage = self.cell_dir / "slurm-runtime"
+        stage = self.runtime_dir
         stage.mkdir(exist_ok=True)
         for path in files:
             shutil.copy2(path, stage / path.name)
@@ -245,7 +258,7 @@ class SlurmCellRunner:
         rank = self.pods().index(unit)
         mounts = [
             *self.mounts,
-            f"{self.cell_dir / 'slurm-runtime'}:/tmp/fpm-bench",
+            f"{self.runtime_dir}:/tmp/fpm-bench",
             f"{self.cell_dir / 'raw' / unit}:/results",
         ]
         if any("\n" in mount or "," in mount for mount in mounts):
@@ -293,7 +306,7 @@ class SlurmCellRunner:
         expected_backend_version: str | None = None,
         runtime_backend_version: str | None = None,
     ) -> None:
-        from .runner import _attempt_provenance_command
+        from .runner import RUNTIME_ENV_FILENAME, _attempt_provenance_command
 
         command = _attempt_provenance_command(
             cell_id=cell_id,
@@ -302,6 +315,16 @@ class SlurmCellRunner:
             expected_backend_version=expected_backend_version,
             runtime_backend_version=runtime_backend_version,
         )
+        # Match fpm_exec.sh: startup settings must select the runtime before
+        # Python imports package metadata, including a staged PYTHONPATH overlay.
+        command = [
+            "bash",
+            "-c",
+            f"set -e; if [[ -f /tmp/fpm-bench/{RUNTIME_ENV_FILENAME} ]]; then "
+            f'source /tmp/fpm-bench/{RUNTIME_ENV_FILENAME}; fi; exec "$@"',
+            "fpm-attempt-provenance",
+            *command,
+        ]
         for unit in pods:
             self._exec(unit, command, timeout=300)
 
@@ -319,10 +342,14 @@ class SlurmCellRunner:
                     output = getattr(error, stream, None) or ""
                     if isinstance(output, bytes):
                         output = output.decode(errors="replace")
-                    (logs / f"{unit}.{stream}.log").write_text(output)
+                    from .private_inputs import redact
+
+                    (logs / f"{unit}.{stream}.log").write_text(redact(output, getattr(self, "_private_values", ())))
                 raise
-            (logs / f"{unit}.stdout.log").write_text(result.stdout)
-            (logs / f"{unit}.stderr.log").write_text(result.stderr)
+            from .private_inputs import redact
+
+            (logs / f"{unit}.stdout.log").write_text(redact(result.stdout, getattr(self, "_private_values", ())))
+            (logs / f"{unit}.stderr.log").write_text(redact(result.stderr, getattr(self, "_private_values", ())))
 
         scope = CommandScope()
         pool = ThreadPoolExecutor(max_workers=len(pods))
@@ -347,6 +374,11 @@ class SlurmCellRunner:
         return _file_manifest(self.cell_dir / "raw" / unit)
 
     def collect(self, pods: list[str], *, require_benchmark: bool = True) -> None:
+        from .private_inputs import redact_diagnostics
+
+        redact_diagnostics(
+            self.cell_dir, getattr(self, "_private_values", ()), cell=getattr(self, "_diagnostic_cell", None)
+        )
         if require_benchmark and not any(
             list((self.cell_dir / "raw" / unit).glob(FPM_BENCHMARK_RESULT_GLOB)) for unit in pods
         ):

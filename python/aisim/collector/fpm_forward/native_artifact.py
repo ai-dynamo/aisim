@@ -87,6 +87,10 @@ def _validate_seed_regime(row: dict[str, Any], path: Path) -> str | None:
     return regime
 
 
+class KvWarmProtocolError(ValueError):
+    """The native decode receipt contradicts its required warm-up protocol."""
+
+
 def _validate_kvwarm_contract(cell: FPMCell, kvwarm: object, path: Path) -> dict[str, Any] | None:
     """Validate that engine protocol evidence matches the rendered strategy."""
 
@@ -97,7 +101,7 @@ def _validate_kvwarm_contract(cell: FPMCell, kvwarm: object, path: Path) -> dict
     requires_warm = cell.parallel_strategy in KVWARM_STRATEGIES
     if kvwarm is None:
         if requires_warm:
-            raise ValueError(
+            raise KvWarmProtocolError(
                 f"native decode result lacks required KV warm-up metadata for strategy "
                 f"{cell.parallel_strategy!r}: {path}"
             )
@@ -112,11 +116,11 @@ def _validate_kvwarm_contract(cell: FPMCell, kvwarm: object, path: Path) -> dict
     if not isinstance(warm_eligible, bool):
         raise TypeError(f"native kvwarm.warm_eligible must be a boolean: {path}")
     if warm_eligible and skip_reason is not None:
-        raise ValueError(f"native warm-eligible result must not declare kvwarm.skip_reason: {path}")
+        raise KvWarmProtocolError(f"native warm-eligible result must not declare kvwarm.skip_reason: {path}")
     if not warm_eligible and (not isinstance(skip_reason, str) or not skip_reason):
-        raise ValueError(f"native warm-ineligible result must declare a non-empty kvwarm.skip_reason: {path}")
+        raise KvWarmProtocolError(f"native warm-ineligible result must declare a non-empty kvwarm.skip_reason: {path}")
     if requires_warm and (not enabled or not warm_eligible):
-        raise ValueError(
+        raise KvWarmProtocolError(
             f"native KV warm-up protocol mismatch for strategy {cell.parallel_strategy!r}: "
             f"enabled={enabled!r}, skip_reason={skip_reason!r}: {path}"
         )
@@ -135,6 +139,8 @@ class NativeCollection:
     # None only for artifacts predating the kvwarm-enabled runtime.
     kvwarm_meta: dict[str, Any] | None = None
     input_provenance: dict[str, Any] | None = None
+    # Retain every rank's strategy: the first envelope cannot attest its peers.
+    kvwarm_initialization_strategies: tuple[str | None, ...] = ()
     # Envelope schema shared by every rank artifact; 3 carries power blocks.
     artifact_schema_version: int = FPM_NATIVE_BENCHMARK_RESULT_SCHEMA_VERSION
     # The execution mode of the producer contract that the frozen cell selected: "eager" for DeepSeek V4.1,
@@ -884,6 +890,7 @@ def validate_native_collection(
     run_identity: tuple[str, str] | None = None
     kvwarm_meta: dict[str, Any] | None = None
     kvwarm_seen: object = _KVWARM_UNSEEN
+    initialization_strategies = []
     checkpoint_evidence: list[object] = []
     input_provenance: dict[str, Any] | None = None
     execution_mode: str | None = None
@@ -984,6 +991,7 @@ def validate_native_collection(
         # (warm_eligible/skip_reason) must agree across DP ranks -- they
         # describe one shared measurement protocol, not per-rank state.
         kvwarm = _validate_kvwarm_contract(cell, payload.get("kvwarm"), path)
+        initialization_strategies.append(kvwarm.get("initialization_strategy") if kvwarm else None)
         kvwarm_regime = (
             None if kvwarm is None else (kvwarm.get("enabled"), kvwarm.get("warm_eligible"), kvwarm.get("skip_reason"))
         )
@@ -1148,6 +1156,7 @@ def validate_native_collection(
         runtime_grid_digest=run_identity[1],
         kvwarm_meta=kvwarm_meta,
         input_provenance=input_provenance,
+        kvwarm_initialization_strategies=tuple(initialization_strategies),
         artifact_schema_version=schema_version,
         execution_mode=execution_mode,
     )

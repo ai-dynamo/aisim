@@ -1990,6 +1990,7 @@ mod tests {
             num_v_heads: 32,
             head_v_dim: 128,
             draft_tokens: 0,
+            recurrent_state_dtype: None,
         })
     }
 

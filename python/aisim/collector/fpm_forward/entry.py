@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +71,12 @@ def _inline_overrides(items: list[str] | None) -> dict[str, Any]:
             if not isinstance(child, dict):
                 raise TypeError(f"conflicting --generator-set path: {dotted!r}")
             cursor = child
+        if keys == ["K8sConfig", "extra_env"]:
+            try:
+                cursor[keys[-1]] = json.loads(raw_value)
+                continue
+            except json.JSONDecodeError:
+                pass  # CLI callers can also supply the original YAML syntax.
         cursor[keys[-1]] = yaml.safe_load(raw_value)
     return payload
 
@@ -98,13 +105,14 @@ def _load_generator_overrides(args: argparse.Namespace) -> dict[str, Any]:
             f"{sorted(unsupported_k8s)}"
         )
     extra_env = raw_k8s.get("extra_env")
-    if extra_env is not None and (
-        not isinstance(extra_env, list)
-        or not all(
-            isinstance(item, dict) and isinstance(item.get("name"), str) and "value" in item for item in extra_env
-        )
-    ):
-        raise TypeError("K8sConfig.extra_env must be a list of {name, value} mappings")
+    if extra_env is not None:
+        from .config import archive_generator_overrides
+
+        if not isinstance(extra_env, list) or any(not isinstance(entry, dict) for entry in extra_env):
+            raise TypeError("K8sConfig.extra_env must be a list of named environment entries")
+        # Validate both literal entries and digest-bound archived references.
+        # Preserve literals only in this in-memory delivery input.
+        archive_generator_overrides(payload)
     if args.generator_dynamo_version:
         payload["generator_dynamo_version"] = args.generator_dynamo_version
     if args.generated_config_version:

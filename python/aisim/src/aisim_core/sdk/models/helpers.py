@@ -21,7 +21,10 @@ from typing import TYPE_CHECKING, Optional
 from aisim_core.sdk import common, config
 from aisim_core.sdk.utils import (
     _get_language_quantization_config,
+    _get_model_config_from_resolved_path,
     _normalize_quant_algo,
+    _resolved_model_source,
+    _revision_for_resolved_source,
     get_model_config_from_model_path,
     parse_compressed_tensors_quant,
 )
@@ -613,8 +616,15 @@ def validate_trtllm_large_ep(
         )
 
 
+def _get_model_info(model_path: str, *, model_revision: str | None = None) -> dict:
+    model_path = _resolved_model_source(model_path)
+    if model_revision is not None:
+        model_revision = _revision_for_resolved_source(model_path, model_revision)
+    return _get_resolved_model_info(model_path, model_revision=model_revision)
+
+
 @cache
-def _get_model_info(model_path: str) -> dict:
+def _get_resolved_model_info(model_path: str, *, model_revision: str | None = None) -> dict:
     """
     Get model configuration info from model path.
 
@@ -628,10 +638,17 @@ def _get_model_info(model_path: str) -> dict:
     """
     # Shallow-copy: get_model_config_from_model_path is @cache'd, so mutating
     # its return value would poison every other caller's dict.
-    info = dict(get_model_config_from_model_path(model_path))
+    info = dict(
+        _get_model_config_from_resolved_path(model_path, model_revision=model_revision)
+        if model_revision is not None
+        else get_model_config_from_model_path(model_path)
+    )
     info["num_shared_experts"] = _derive_num_shared_experts(info)
     info["num_moe_layers"] = _derive_num_moe_layers(info)
     return info
+
+
+_get_model_info.cache_clear = _get_resolved_model_info.cache_clear
 
 
 def _moe_source_config(info: dict) -> dict:

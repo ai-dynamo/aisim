@@ -10,8 +10,6 @@ CPU import use the manifest, never this module. No model or timing code is run.
 from __future__ import annotations
 
 import hashlib
-import importlib
-import importlib.metadata
 import json
 import logging
 import os
@@ -29,48 +27,9 @@ def _json(value: Any) -> Any:
     return legacy._json_value(value)
 
 
-def _installed_file(name: str) -> Path:
-    package, *parts = name.split("/")
-    module = importlib.import_module(package)
-    paths = [Path(root).joinpath(*parts) for root in module.__path__]
-    found = [path for path in paths if path.is_file()]
-    if len(found) != 1:
-        raise ValueError(f"runtime source path must resolve uniquely: {name}")
-    return found[0]
-
-
 def _runtime(payload: dict, manifest: dict, version: str) -> None:
-    actual_version = importlib.metadata.version("vllm")
-    build = importlib.import_module("vllm._version")
-    commit = getattr(build, "__commit_id__", None)
-    pinned = manifest["runtime"]
-    observed = payload["runtime"] = {
-        "framework": "vllm",
-        "version": actual_version,
-        "source_revision": pinned["source_revision"],
-        "source_files": {},
-        "image": payload["launch"]["deployment"]["image"],
-    }
-    payload["source_identity"] = {"vllm_commit_id": commit, "source_revision_basis": "declared source and file hashes"}
-    errors = []
-    if actual_version != version or pinned["version"] != version:
-        errors.append(f"adapter requires vLLM {version}; installed={actual_version}, manifest={pinned['version']}")
-    # Wheels may omit a VCS identifier. The exact inspected source files remain
-    # mandatory; when a wheel supplies an identifier, it must also agree.
-    if commit is not None:
-        short = str(commit).removeprefix("g")
-        if len(short) < 7 or not pinned["source_revision"].startswith(short):
-            errors.append(f"installed vLLM commit {commit!r} contradicts source revision")
-    for name, expected in pinned["source_files"].items():
-        try:
-            digest = hashlib.sha256(_installed_file(name).read_bytes()).hexdigest()
-            observed["source_files"][name] = digest
-            if digest != expected:
-                errors.append(f"runtime source hash differs: {name}")
-        except (OSError, ValueError, AttributeError, ImportError) as error:
-            errors.append(f"runtime source {name}: {error}")
-    if errors:
-        raise ValueError("; ".join(errors))
+    legacy._runtime_source(payload, manifest["runtime"], version)
+    payload["runtime"]["image"] = payload["launch"]["deployment"]["image"]
 
 
 def _loaded_config(owner: Any, payload: dict) -> None:
@@ -142,6 +101,13 @@ def _resolved(owner: Any, *, hybrid_evidence: bool = False) -> dict:
     for key in ("hf_config_path", "hf_overrides", "config_format"):
         if hasattr(config.model_config, key):
             value["model_config"][key] = _json(getattr(config.model_config, key))
+    for key in ("mamba_cache_mode", "mamba_cache_dtype", "mamba_ssm_cache_dtype", "mamba_block_size"):
+        if hasattr(config.cache_config, key):
+            value["cache_config"][key] = _json(getattr(config.cache_config, key))
+    # The pinned V2 runner creates one metadata builder per effective ubatch.
+    for key in ("use_ubatching", "num_ubatches"):
+        if hasattr(config.parallel_config, key):
+            value["parallel_config"][key] = _json(getattr(config.parallel_config, key))
     return value
 
 
@@ -154,7 +120,7 @@ def _worker_cache(owner: Any) -> dict:
     return cache
 
 
-def _raw_cache(config: Any, *, hybrid_evidence: bool = False) -> dict:
+def _raw_cache(config: Any, *, hybrid_evidence: bool = False, kimi_k31: bool = False) -> dict:
     fields = (
         "block_size",
         "storage_block_size",
@@ -187,19 +153,39 @@ def _raw_cache(config: Any, *, hybrid_evidence: bool = False) -> dict:
     # raises NotImplementedError (kv_cache_interface.py:251-252, :1291-1389). The layer specs of its
     # cache group record the value of each layer (fpm_memory_observer._layer_spec).
     uniform_fields = tuple(key for key in fields if key != "tokens_per_state")
+    if kimi_k31:
+        fields += (
+            "shapes",
+            "dtypes",
+            "state_content_size_bytes",
+            "mamba_cache_mode",
+            "num_speculative_blocks",
+            "num_prefill_checkpoint_blocks",
+            "prefill_checkpoint_alignment",
+        )
+        tensor_fields += ("layers", "layer_stride", "host_resident")
+
+    def spec_fields(spec):
+        name = legacy._class_name(spec)
+        if kimi_k31 and name == "vllm.v1.kv_cache_interface.UniformTypeKVCacheSpecs":
+            # The pinned K3.1 kv_cache_interface.UniformTypeKVCacheSpecs
+            # exposes child specs and an aggregate page size. Its inherited
+            # state_content_size_bytes property is abstract, not optional.
+            return {
+                "spec_type": name,
+                "block_size": spec.block_size,
+                "page_size_bytes": spec.page_size_bytes,
+                "kv_cache_specs": {key: spec_fields(child) for key, child in spec.kv_cache_specs.items()},
+            }
+        keys = uniform_fields if name == legacy._UNIFORM_SPEC else fields
+        return {"spec_type": name, **{key: _json(getattr(spec, key)) for key in keys if hasattr(spec, key)}}
+
     record = {
         "num_blocks": config.num_blocks,
         "groups": [
             {
                 "layer_names": list(group.layer_names),
-                "spec_type": legacy._class_name(group.kv_cache_spec),
-                **{
-                    key: _json(getattr(group.kv_cache_spec, key))
-                    for key in (
-                        uniform_fields if legacy._class_name(group.kv_cache_spec) == legacy._UNIFORM_SPEC else fields
-                    )
-                    if hasattr(group.kv_cache_spec, key)
-                },
+                **spec_fields(group.kv_cache_spec),
             }
             for group in config.kv_cache_groups
         ],
@@ -467,7 +453,9 @@ def _semantics(owner: Any, payload: dict) -> None:
     semantics = payload["cache"]["semantics"] = {
         "allocation": "shared_block_pool",
         "storage": "hbm",
-        "retention": "full_or_window",
+        "retention": "full_or_state"
+        if payload["cache"].get("allocation_layout") == "kimi-k31-block-outer/v1"
+        else "full_or_window",
         "prefix_reuse": False,
         "offload": (
             offload["offload_backend"] != "auto"
@@ -528,6 +516,7 @@ def observe(
     payload = {
         "schema_version": "aisimulate-runtime-observation/v1",
         **{key: context[key] for key in ("attempt_id", "configuration", "phase", "bundle_sha256", "launch")},
+        **{key: context[key] for key in ("cell_id", "collector_attempt_id") if key in context},
         "identity": context["launch"]["identity"],
         "kind": kind,
         "dp_rank": dp_rank,
@@ -571,20 +560,34 @@ def observe(
     capture("model_config_sha256", lambda: _loaded_config(owner, payload))
     capture("resolved_config", lambda: payload.update(resolved_config=_resolved(owner, hybrid_evidence=hybrid)))
     pool_id = f"dp{dp_rank}-shared-pool"
+    native_k31 = version == "0.1.dev24216+g266e88c05"
+    if native_k31:
+        from . import kimi_k31
     if kind == "worker":
         capture("hardware", lambda: payload.update(hardware=_hardware(owner, payload["identity"]["gpu"])))
         capture("effective_offloader", lambda: payload.update(effective_offloader=legacy._offloader_type()))
         if hasattr(owner, "_fpm_initial_compilation_config"):
             payload["initial_compilation_config"] = owner._fpm_initial_compilation_config
-        if hybrid:
+        if native_k31:
+            capture("cache", lambda: payload.update(cache=kimi_k31.worker_memory(owner)))
+            capture("initialized_moe", lambda: payload.update(initialized_moe=kimi_k31.initialized_moe(owner)))
+        elif hybrid:
             capture("cache", lambda: payload.update(cache=legacy.worker_memory(owner, hybrid_evidence=True)))
         else:
             capture("cache", lambda: payload.update(cache=_worker_cache(owner)))
         config = getattr(getattr(owner, "model_runner", None), "kv_cache_config", None)
     else:
         config = cache_config
-        capture("cache", lambda: payload.update(cache=legacy.scheduler_memory(owner, config, hybrid_evidence=hybrid)))
-    capture("raw_cache_config", lambda: payload.update(raw_cache_config=_raw_cache(config, hybrid_evidence=hybrid)))
+        if native_k31:
+            capture("cache", lambda: payload.update(cache=kimi_k31.scheduler_memory(owner, config)))
+        else:
+            capture(
+                "cache", lambda: payload.update(cache=legacy.scheduler_memory(owner, config, hybrid_evidence=hybrid))
+            )
+    capture(
+        "raw_cache_config",
+        lambda: payload.update(raw_cache_config=_raw_cache(config, hybrid_evidence=hybrid, kimi_k31=native_k31)),
+    )
     if "cache" in payload:
         cache = payload["cache"]
         cache["pool_id"] = pool_id
@@ -593,10 +596,16 @@ def observe(
         capture("cache.groups", lambda: _groups(cache, config, version, pool_id))
         if kind == "worker":
             capture("cache.semantics", lambda: _semantics(owner, payload))
-            capture(
-                "cache.layer_tensors",
-                lambda: _layer_views(owner, cache, manifest["runtime"]["source_files"], version),
-            )
+            if native_k31:
+                capture(
+                    "cache.layer_tensors",
+                    lambda: kimi_k31.attention_groups(owner, cache, manifest["runtime"]["source_files"]),
+                )
+            else:
+                capture(
+                    "cache.layer_tensors",
+                    lambda: _layer_views(owner, cache, manifest["runtime"]["source_files"], version),
+                )
             if "attention_groups" in cache:
                 payload["attention_groups"] = cache.pop("attention_groups")
                 names = cache.pop("attention_backends")
@@ -610,7 +619,13 @@ def observe(
             legacy.RESULTS_DIR = directory
             capture(
                 "execution_evidence",
-                lambda: legacy.observe_execution(owner, dp_rank=dp_rank, tp_rank=tp_rank, pp_rank=pp_rank),
+                lambda: legacy.observe_execution(
+                    owner,
+                    dp_rank=dp_rank,
+                    tp_rank=tp_rank,
+                    pp_rank=pp_rank,
+                    audited_version=version if native_k31 else None,
+                ),
             )
         finally:
             legacy.RESULTS_DIR = previous

@@ -38,7 +38,6 @@ from aisim.fpm_contract import (
     FPM_CELL_LABEL,
     FPM_ENGINE_BENCHMARK_OUTPUT_ENV,
     FPM_ENV_FILENAME,
-    FPM_FINALIZATION_TIMEOUT_ENV,
     FPM_MANIFEST_FILENAME,
     FPM_POWER_MIN_WINDOW_S,
     FPM_POWER_WINDOW_FLAG,
@@ -49,7 +48,11 @@ from aisim.fpm_contract import (
     fpm_workload_node_count,
 )
 
-from .config import FPM_KV_WARMUP_DEFAULTS, with_kv_warmup_defaults
+from .config import (
+    archive_generator_overrides,
+    resolve_archived_generator_overrides,
+    with_kv_warmup_defaults,
+)
 from .glm53flash_points import (
     GLM_ARCHITECTURE,
     GLM_POINTS_ORIGIN,
@@ -57,8 +60,18 @@ from .glm53flash_points import (
     glm_measured_context,
     glm_smoke_subset,
 )
-from .native_artifact import COLLECTOR_PROVENANCE_FILENAME, validate_native_collection
+from .native_artifact import COLLECTOR_PROVENANCE_FILENAME, KvWarmProtocolError, validate_native_collection
 from .planner import FPMCell, FPMCollectionPlan
+from .private_inputs import (
+    RECEIPT,
+    discard_diagnostics,
+    private_values,
+    reclaim_delivery,
+    redact,
+    redact_diagnostics,
+    sanitize_recovered_diagnostics,
+)
+from .private_inputs import delivery_directory as new_delivery_directory
 from .runtime.fpm_memory_observer import (
     EXECUTION_SUPPORTED_VERSIONS,
     MEMORY_SUPPORTED_VERSIONS,
@@ -786,6 +799,16 @@ class KubernetesCellRunner:
             expected_backend_version=expected_backend_version,
             runtime_backend_version=runtime_backend_version,
         )
+        # The keepalive Pod has no engine environment. Apply the staged
+        # startup inputs before Python observes metadata, as fpm_exec.sh does.
+        runtime_env = shlex.quote(f"{REMOTE_WORKDIR}/{RUNTIME_ENV_FILENAME}")
+        command = [
+            "bash",
+            "-c",
+            f'set -e; if [[ -f {runtime_env} ]]; then source {runtime_env}; fi; exec "$@"',
+            "fpm-attempt-provenance",
+            *command,
+        ]
         for pod in pods:
             self._exec_checked(
                 pod,
@@ -978,11 +1001,16 @@ class KubernetesCellRunner:
                 try:
                     _, completed = future.result()
                 except Exception as error:
-                    (logs_dir / f"{pod}.run.stderr.log").write_text(str(error) + "\n")
-                    failures.append((pod, str(error)))
+                    diagnostic = redact(str(error), getattr(self, "_private_values", ()))
+                    (logs_dir / f"{pod}.run.stderr.log").write_text(diagnostic + "\n")
+                    failures.append((pod, diagnostic))
                     continue
-                (logs_dir / f"{pod}.run.stdout.log").write_text(completed.stdout)
-                (logs_dir / f"{pod}.run.stderr.log").write_text(completed.stderr)
+                (logs_dir / f"{pod}.run.stdout.log").write_text(
+                    redact(completed.stdout, getattr(self, "_private_values", ()))
+                )
+                (logs_dir / f"{pod}.run.stderr.log").write_text(
+                    redact(completed.stderr, getattr(self, "_private_values", ()))
+                )
         except BaseException as error:
             # An interrupt lands here while worker threads sit in kubectl
             # waits they cannot be signalled out of; kill the children first
@@ -1044,7 +1072,12 @@ class KubernetesCellRunner:
                 check=False,
                 timeout=120,
             )
-            (logs_dir / f"{pod}.container.log").write_text(logs.stdout + logs.stderr)
+            (logs_dir / f"{pod}.container.log").write_text(
+                redact(logs.stdout + logs.stderr, getattr(self, "_private_values", ()))
+            )
+        redact_diagnostics(
+            self.cell_dir, getattr(self, "_private_values", ()), cell=getattr(self, "_diagnostic_cell", None)
+        )
         if require_benchmark and not benchmark_observed:
             raise RuntimeError("FPM cell result manifests contain no benchmark JSON files")
 
@@ -1281,6 +1314,16 @@ def _cell_generator_overrides(
     smoke: bool = False,
 ) -> dict[str, Any]:
     points = _cell_points(plan, cell, smoke=smoke)
+    k31_native_state = _kimi_k31_native_state(plan)
+    # Dynamo 17628144, InstrumentedScheduler._bench_materialize_prefill_candidate:
+    # nonzero historical KV requires prefix lookup. This source-bound
+    # baseline retains private Mamba state with prefix caching disabled.
+    if (
+        k31_native_state
+        and points is not None
+        and any(point["total_kv_read_tokens"] != 0 for point in json.loads(points[0])["prefill"])
+    ):
+        raise ValueError("K3.1 mamba none prefill requires total_kv_read_tokens=0 in every explicit point")
     enforce_eager = bool(getattr(plan.options, "enforce_eager", False))
     unsupported_base = set(base) - {"K8sConfig", "generator_dynamo_version"}
     if unsupported_base:
@@ -1408,6 +1451,26 @@ def _cell_generator_overrides(
         scheduler_args.extend(["--max-num-seqs", str(max_num_seqs)])
     model_args = []
     architecture = getattr(getattr(plan, "capability", None), "architecture", None)
+    if k31_native_state:
+        role = getattr(plan.options, "worker_type", None)
+        if role not in {"prefill", "decode"} or cell.workload_kind != role:
+            raise ValueError("K3.1 native state collection requires an independent prefill or decode worker")
+        # vLLM image 88175ddf (amd64) / 52b79356 (arm64), KimiK3DeltaAttention
+        # and MambaSpec: none retention owns one private state per request.
+        # Dynamo 17628144 InstrumentedScheduler._kvwarm_warm_eligible computes
+        # that state through native_exact_context without a prefix-cache hit.
+        # Its _bench_prefill_kv_read_points returns [0] when prefix caching is
+        # disabled; _bench_step_prefill injects ordinary new requests at KV=0.
+        model_args.extend(
+            [
+                "--trust-remote-code",
+                "--language-model-only",
+                "--mamba-cache-mode",
+                "none",
+                "--mamba-ssm-cache-dtype",
+                "float32",
+            ]
+        )
     if architecture == "DeepseekV41ForCausalLM":
         if plan.options.decoder_replay:
             raise NotImplementedError("vLLM DeepSeek-V4.1 true decoder replay is not verified")
@@ -1575,6 +1638,20 @@ def _cell_generator_overrides(
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
             raise TypeError("K8sConfig.extra_env entries must be {name, value} mappings")
         name = item["name"]
+        if (
+            name
+            in {
+                "FPM_SLURM_CPUS_PER_TASK",
+                "FPM_SLURM_CPU_BIND",
+                "FPM_NODE_RANK",
+                "FPM_MASTER_ADDR",
+                "FPM_LOCAL_GPU_COUNT",
+            }
+            and getattr(plan.options, "executor", None) == "slurm"
+        ):
+            raise ValueError(f"{name} is owned by the Slurm launcher")
+        if name == "PYTHONHOME":
+            raise ValueError("K8sConfig.extra_env does not support PYTHONHOME; use the image's Python prefix")
         existing = resolved_env.get(name)
         if existing is not None and existing != item:
             raise ValueError(f"conflicting FPM environment value for {name}")
@@ -1600,11 +1677,29 @@ def _cell_generator_overrides(
     if isinstance(readiness, bool) or not re.fullmatch(r"[1-9][0-9]*", str(readiness)) or int(readiness) > 3600:
         raise ValueError(f"{READINESS_TIMEOUT_ENV} must be an integer from 1 through 3600")
     resolved_env[READINESS_TIMEOUT_ENV] = {"name": READINESS_TIMEOUT_ENV, "value": str(readiness)}
+    if (
+        k31_native_state
+        and cell.workload_kind == "decode"
+        and resolved_env.get("DYN_BENCH_KV_WARMUP", {}).get("value", "on").lower() in {"off", "0", "false"}
+    ):
+        raise ValueError("formal K3.1 decode requires DYN_BENCH_KV_WARMUP enabled")
     merged.setdefault("K8sConfig", {})["extra_env"] = list(resolved_env.values())
     merged = with_kv_warmup_defaults(merged)
 
     policy_args = ((policy.get("params") or {}).get("agg") or {}).get("extra_cli_args") or []
-    policy_flags = {str(argument).split("=", 1)[0].split(" ", 1)[0] for argument in policy_args}
+    # vLLM's FlexibleArgumentParser accepts underscores in option names too.
+    policy_flags = {str(argument).split("=", 1)[0].split(" ", 1)[0].replace("_", "-") for argument in policy_args}
+    if k31_native_state and policy_flags & {
+        "--mamba-cache-mode",
+        "--mamba-ssm-cache-dtype",
+        "--mamba-cache-dtype",
+        "--speculative-config",
+        "--no-language-model-only",
+        "--enable-prefix-caching",
+    }:
+        raise ValueError(
+            "backend policy cannot change K3.1 observed private state, prefix caching or speculation settings"
+        )
     if instrumentation is not None and "--revision" in policy_flags:
         raise ValueError("backend policy cannot override the runtime probe's selected model revision")
     if (observe_memory or observe_execution) and "--worker-cls" in policy_flags:
@@ -1616,21 +1711,17 @@ def _cell_generator_overrides(
     if observe_memory and "--mamba-cache-mode" in policy_flags:
         # The prefix-caching setting selects the Mamba mode (vLLM 0.33.0 models/config.py:763-787).
         raise ValueError("backend policy cannot select the Mamba cache mode for runtime memory observation")
-    if observe_memory and any(
-        str(argument).split("=", 1)[0].split(" ", 1)[0] == "--async-scheduling" for argument in policy_args
-    ):
+    if observe_memory and "--async-scheduling" in policy_flags:
         raise ValueError("runtime memory collection requires synchronous scheduling in both phases")
-    if gpu_memory_utilization is not None and any(
-        str(argument).split("=", 1)[0].split(" ", 1)[0] == "--gpu-memory-utilization" for argument in policy_args
-    ):
+    if gpu_memory_utilization is not None and "--gpu-memory-utilization" in policy_flags:
         raise ValueError("backend policy cannot override --fpm-gpu-memory-utilization with extra CLI arguments")
     if cell.workload_kind == "prefill" and profile.cudagraph_policy == "runtime":
         graph_options = ("--compilation-config", "--cudagraph-capture-sizes", "--max-cudagraph-capture-size")
-        if any(str(argument).split("=", 1)[0] in graph_options for argument in policy_args):
+        if policy_flags.intersection(graph_options):
             raise ValueError("runtime prefill CUDA-graph policy cannot use backend capture overrides")
-    if any(str(arg).split("=", 1)[0] in {"--enforce-eager", "--no-enforce-eager"} for arg in policy_args):
+    if policy_flags & {"--enforce-eager", "--no-enforce-eager"}:
         raise ValueError("eager execution must be supplied through --fpm-enforce-eager")
-    if any(str(arg).split("=", 1)[0] == "--benchmark-points-file" for arg in policy_args):
+    if "--benchmark-points-file" in policy_flags:
         raise ValueError("benchmark points must be supplied through --fpm-benchmark-points-file")
     if any(str(arg).split("=", 1)[0] == FPM_POWER_WINDOW_FLAG for arg in policy_args):
         raise ValueError("the power window must be supplied through --fpm-measure-power")
@@ -1638,15 +1729,9 @@ def _cell_generator_overrides(
     if measure_power and not smoke:
         scheduler_args.extend([FPM_POWER_WINDOW_FLAG, str(FPM_POWER_MIN_WINDOW_S)])
     if cell.workload_kind == "decode":
-        prefix_caching = _decode_prefix_caching_mode(plan, cell)
-        policy_disables = any(
-            str(argument) == "--no-enable-prefix-caching" or str(argument).startswith("--no-enable-prefix-caching=")
-            for argument in policy_args
-        )
-        policy_enables = any(
-            str(argument) == "--enable-prefix-caching" or str(argument).startswith("--enable-prefix-caching=")
-            for argument in policy_args
-        )
+        prefix_caching = _decode_prefix_caching_mode(plan, cell, native_state=k31_native_state)
+        policy_disables = "--no-enable-prefix-caching" in policy_flags
+        policy_enables = "--enable-prefix-caching" in policy_flags
         if prefix_caching == "enabled" and policy_disables:
             if cell.parallel_strategy in KVWARM_STRATEGIES:
                 raise ValueError(
@@ -1663,6 +1748,8 @@ def _cell_generator_overrides(
         workload_args = () if prefix_caching == "enabled" else _FPM_VLLM_DECODE_FAKE_KV_ARGS
     else:
         workload_args = _FPM_VLLM_PREFILL_ARGS
+        if k31_native_state:
+            workload_args = (*workload_args, "--no-enable-prefix-caching")
     resolved_args = [*_FPM_VLLM_RUNTIME_ARGS, *workload_args, *model_args, *policy_args]
     has_benchmark_timeout = any(
         str(argument) == "--benchmark-timeout" or str(argument).startswith("--benchmark-timeout=")
@@ -1684,13 +1771,45 @@ def _cell_generator_overrides(
     return merged
 
 
-def _decode_prefix_caching_mode(plan: FPMCollectionPlan, cell: FPMCell) -> str:
+_UNRESOLVED_BUNDLE = object()
+
+
+def _kimi_k31_native_state(plan, bundle=_UNRESOLVED_BUNDLE) -> bool:
+    capability = getattr(plan, "capability", None)
+    config = getattr(getattr(capability, "model_config", None), "payload", {})
+    if getattr(capability, "architecture", None) != "KimiK31ForConditionalGeneration" and (
+        config.get("architectures") or []
+    )[:1] != ["KimiK31ForConditionalGeneration"]:
+        return False
+    if bundle is _UNRESOLVED_BUNDLE:
+        bundle = getattr(plan, "runtime_instrumentation", None)
+    if bundle is None:
+        return False
+    from .runtime_k31 import is_audited_runtime
+
+    return is_audited_runtime(bundle.manifest["runtime"])
+
+
+def _require_k31_execution_inputs(plan: FPMCollectionPlan) -> None:
+    from .database import _is_k31
+
+    if _is_k31(plan) and (not _kimi_k31_native_state(plan) or plan.runtime_launch is None):
+        raise ValueError("K3.1 execution requires an audited instrumentation bundle and accepted runtime launch")
+
+
+def _decode_prefix_caching_mode(
+    plan: FPMCollectionPlan, cell: FPMCell, *, bundle=_UNRESOLVED_BUNDLE, native_state: bool | None = None
+) -> str:
     """Return the rendering/checkpoint policy for one decode cell of a probe or collection plan.
 
     A GLM-5.3-Flash plan keeps prefix caching in every strategy, because its producer seeds real KV through it. Other
     models follow the strategy rule.
     """
 
+    if native_state is None:
+        native_state = _kimi_k31_native_state(plan, bundle)
+    if native_state:
+        return "disabled"
     architecture = getattr(getattr(plan, "capability", None), "architecture", None)
     if architecture == GLM_ARCHITECTURE or cell.parallel_strategy in KVWARM_STRATEGIES:
         return "enabled"
@@ -1702,6 +1821,7 @@ def _configured_sampling_metadata(
     cell: FPMCell,
     *,
     smoke: bool,
+    bundle=_UNRESOLVED_BUNDLE,
 ) -> dict[str, int | str | None]:
     points = _cell_points(plan, cell, smoke=smoke)
     if points is not None:
@@ -1724,7 +1844,7 @@ def _configured_sampling_metadata(
         # Derive checkpoint evidence from the same predicate used to
         # render the engine flags. _cell_generator_overrides rejects policy
         # arguments that conflict with this resolved protocol.
-        return {"decode_prefix_caching": _decode_prefix_caching_mode(plan, cell)}
+        return {"decode_prefix_caching": _decode_prefix_caching_mode(plan, cell, bundle=bundle)}
     if smoke:
         payload: dict[str, int | str | None] = {"prefill_max_new_token_samples": 2}
         if plan.options.prefill_sampling.cudagraph_policy == "runtime":
@@ -1746,33 +1866,14 @@ def _configured_sampling_metadata(
 
 
 def _write_runtime_environment(cell_dir: Path, overrides: dict[str, Any]) -> None:
-    # Generator owns run.sh and fpm_env.sh. Mirror only startup inputs through
-    # this Collector-owned file: run.sh cannot export settings back to its
-    # parent runtime, and Slurm does not inherit a Kubernetes Pod environment.
-    names = {
-        *FPM_KV_WARMUP_DEFAULTS,
-        READINESS_TIMEOUT_ENV,
-        FPM_FINALIZATION_TIMEOUT_ENV,
-        POWER_WINDOW_REQUIRED_ENV,
-        "PYTHONPATH",
-        "DYN_FPM_DSV41_REAL_KV",
-        # Preflight checks the GLM-5.3-Flash scheduler activation only under its flag, and the scheduler import
-        # through the producer's sitecustomize.py requires the prefix-seed flag.
-        "DYN_FPM_GLM53FLASH_REAL_KV",
-        "DYN_FPM_GLM53FLASH_PREFIX_SEED",
-        "DYN_FPM_INPUT_TEXT",
-        "DYN_FPM_TOKENIZER_REVISION",
-        "AISIMULATE_RUNTIME_CONTEXT",
-        "AISIMULATE_RUNTIME_INSTRUMENTATION",
-        "AISIMULATE_RUNTIME_OBSERVATION_DIR",
-    }
-    lines = ["# Generated Collector startup environment; engine settings remain in run.sh."]
+    # Preparation, version detection and the engine must see identical caller
+    # inputs, including package discovery controls such as PYTHONUSERBASE.
+    lines = ["# Generated Collector deployment environment."]
     for item in overrides["K8sConfig"]["extra_env"]:
-        if item["name"] in names:
-            value = item.get("value")
-            if not isinstance(value, str):
-                raise ValueError(f"Collector startup environment {item['name']} requires a literal string")
-            lines.append(f"export {item['name']}={shlex.quote(value)}")
+        value = item.get("value")
+        if not isinstance(value, str):
+            raise ValueError(f"Collector startup environment {item['name']} requires a literal string")
+        lines.append(f"export {item['name']}={shlex.quote(value)}")
     (cell_dir / RUNTIME_ENV_FILENAME).write_text("\n".join(lines) + "\n")
 
 
@@ -1783,15 +1884,31 @@ def _render_cell(
     generator_overrides: dict[str, Any],
     *,
     smoke: bool = False,
+    resolve_environment: bool = True,
 ) -> dict[str, Any]:
     from aisim.generator.api import generate_from_request
     from aisim.generator.naive import build_naive_generator_params
     from aisim.generator.request import from_legacy_params
 
+    rendering = (
+        resolve_archived_generator_overrides(generator_overrides)
+        if resolve_environment
+        else archive_generator_overrides(generator_overrides)
+    )
+    references = {}
+    if not resolve_environment:
+        for item in rendering["K8sConfig"]["extra_env"]:
+            if "value_from_env" in item:
+                name = item["name"]
+                references[name] = copy.deepcopy(item)
+                item.clear()
+                item.update(
+                    name=name, value=f"/__aisimulate_environment_reference__/{name}/{references[name]['value_sha256']}"
+                )
     overrides = _cell_generator_overrides(
         plan,
         cell,
-        generator_overrides,
+        rendering,
         smoke=smoke,
     )
     # A Dynamo release is provenance, not collection compatibility or template
@@ -1831,7 +1948,13 @@ def _render_cell(
     if errors:
         raise ValueError(f"invalid GeneratorRequest for {cell.cell_id}: {errors}")
     artifacts = generate_from_request(request, output_dir=str(cell_dir))
-    _atomic_json(cell_dir / "generator-request.json", params)
+    # Scripts deliver concrete environment values to the worker. Retained
+    # request evidence uses digest-bound inputs, like the campaign archive.
+    archived = archive_generator_overrides(params)
+    archived["K8sConfig"]["extra_env"] = [
+        references.get(item["name"], item) for item in archived["K8sConfig"]["extra_env"]
+    ]
+    _atomic_json(cell_dir / "generator-request.json", archived)
     _write_runtime_environment(cell_dir, overrides)
     return artifacts
 
@@ -1862,6 +1985,7 @@ def _runtime_collection_summary(
     *,
     expected_plan_sha256: str | None = None,
     expected_attempt_id: str | None = None,
+    plan=None,
 ) -> dict[str, Any]:
     """Return auditable unique-axis counts from a validated native grid."""
 
@@ -1871,6 +1995,10 @@ def _runtime_collection_summary(
         expected_plan_sha256=expected_plan_sha256,
         expected_attempt_id=expected_attempt_id,
     )
+    if plan is not None:
+        from .database import require_kda_real_kv
+
+        require_kda_real_kv(plan, cell, collection)
     points = tuple(measurement.point for measurement in collection.points)
     summary = {
         "measured_point_count": len(points),
@@ -2003,6 +2131,8 @@ def _recover_completed_attempt(
     entry: dict[str, Any],
     *,
     smoke: bool = False,
+    generator_overrides: dict | None = None,
+    diagnostic_update=None,
 ) -> dict[str, Any] | None:
     """Recover a non-passed checkpoint cell whose salvaged artifacts are complete.
 
@@ -2017,7 +2147,12 @@ def _recover_completed_attempt(
     """
 
     status = entry.get("status")
-    if status not in FPM_RECOVERABLE_STATUSES or "cleanup_error" in entry:
+    if (
+        status not in FPM_RECOVERABLE_STATUSES
+        or "cleanup_error" in entry
+        or "private_cleanup_error" in entry
+        or "diagnostic_error" in entry
+    ):
         return None
     cell_dir = root / "cells" / cell.cell_id
     try:
@@ -2028,6 +2163,7 @@ def _recover_completed_attempt(
             cell_dir / "raw",
             expected_plan_sha256=plan.sha256,
             expected_attempt_id=attempt_id,
+            plan=plan,
         )
     except (OSError, TypeError, ValueError) as error:
         logger.info(
@@ -2038,7 +2174,8 @@ def _recover_completed_attempt(
         )
         return None
 
-    if status == "running":
+    private_receipt = (cell_dir / RECEIPT).exists()
+    if status == "running" or private_receipt:
         # A persistent "running" status means the attempt's finally block
         # never ran: its Kubernetes teardown is unverified by construction
         # (the checkpoint is only rewritten AFTER cleanup), and once this
@@ -2054,7 +2191,24 @@ def _recover_completed_attempt(
             )
             return None
         try:
-            _cell_runner(plan, cell, manifest, cell_dir).cleanup()
+            resource = _cell_runner(plan, cell, manifest, cell_dir)
+            from .slurm import SlurmCellRunner
+
+            if isinstance(resource, SlurmCellRunner):
+                resource._diagnostic_update = diagnostic_update
+                try:
+                    resource._private_values = private_values(
+                        resolve_archived_generator_overrides(generator_overrides or {})
+                    )
+                except ValueError:
+                    # Keep structured failure metadata when the original private
+                    # inputs needed to redact command output are unavailable.
+                    resource._private_values = None
+            if private_receipt and not isinstance(resource, SlurmCellRunner):
+                raise ValueError("private Slurm receipt requires verified Slurm teardown")
+            resource.cleanup()
+            if private_receipt:
+                reclaim_delivery(cell_dir, update=diagnostic_update)
         except Exception as error:
             logger.warning(
                 "FPM cell %s recovery refused: teardown of the abandoned workload failed: %s",
@@ -2062,6 +2216,12 @@ def _recover_completed_attempt(
                 error,
             )
             return None
+
+    try:
+        sanitize_recovered_diagnostics(cell_dir, generator_overrides or {}, cell=cell, update=diagnostic_update)
+    except (OSError, TypeError, ValueError) as error:
+        logger.warning("Diagnostic sanitization failed during recovery for %s (%s)", cell.cell_id, type(error).__name__)
+        return None
 
     recovered = dict(entry)
     original_error = {key: recovered.pop(key) for key in ("error_type", "error") if key in recovered}
@@ -2181,6 +2341,13 @@ def _run_collection_impl(
     publish_partial: bool = False,
     publish_database: bool = True,
 ) -> list[dict[str, object]]:
+    from .execution_evidence import _deployment_hashes
+
+    if (expected := getattr(plan, "generator_config_sha256", None)) is not None and expected not in _deployment_hashes(
+        generator_overrides
+    ):
+        raise ValueError("execution deployment inputs differ from the frozen collection plan")
+    _require_k31_execution_inputs(plan)
     # A user list has no smoke subset. A generated list has one, under the same plan hash.
     if (
         smoke
@@ -2194,7 +2361,10 @@ def _run_collection_impl(
         root /= "smoke"
     root.mkdir(parents=True, exist_ok=True)
     _atomic_json(root / "collection-plan.json", plan.to_dict())
-    _atomic_json(root / "generator-overrides.json", with_kv_warmup_defaults(generator_overrides))
+    archived_overrides = archive_generator_overrides(generator_overrides)
+    sensitive_values = private_values(generator_overrides)
+    _atomic_json(root / "generator-overrides.json", archived_overrides)
+    private_delivery = any("value_from_env" in item for item in archived_overrides["K8sConfig"]["extra_env"])
     checkpoint_name = "fpm_forward_smoke.json" if smoke else "fpm_forward.json"
     checkpoint_path = Path(checkpoint_dir).expanduser().resolve() / checkpoint_name
     checkpoint = _load_checkpoint(checkpoint_path, plan, resume)
@@ -2216,6 +2386,17 @@ def _run_collection_impl(
         from .runtime_probe import record_collection_observations
 
         try:
+            from .database import _is_k31, _validate_backend_markers, require_k31_worker_evidence, require_kda_real_kv
+
+            sanitize_recovered_diagnostics(root / "cells" / cell.cell_id, generator_overrides, cell=cell)
+            validate_worker = record["status"] == "passed" and not formal_database_terminal and _is_k31(plan)
+            rejected = False
+            if validate_worker:
+                try:
+                    _validate_backend_markers(cell, root / "cells" / cell.cell_id)
+                except (OSError, KeyError, TypeError, ValueError) as error:
+                    record.update(status="failed", error_type=type(error).__name__, error=str(error))
+                    rejected = True
             observation_index = record_collection_observations(
                 plan,
                 root,
@@ -2223,11 +2404,30 @@ def _run_collection_impl(
                 cell,
                 record["attempt_id"],
                 root / "cells" / cell.cell_id,
-                record["status"],
+                "validating" if validate_worker and not rejected else record["status"],
             )
             checkpoint["runtime_observations"] = str(observation_index)
             record.pop("observation_error", None)
-            return True
+            if rejected:
+                return False
+            if validate_worker:
+                try:
+                    raw_root = root / "cells" / cell.cell_id / "raw"
+                    collection = validate_native_collection(
+                        cell, raw_root, expected_plan_sha256=plan.sha256, expected_attempt_id=record["attempt_id"]
+                    )
+                    require_kda_real_kv(plan, cell, collection)
+                    require_k31_worker_evidence(plan, cell, raw_root, collection, allow_staged=True)
+                except (OSError, KeyError, TypeError, ValueError) as error:
+                    record.update(status="failed", error_type=type(error).__name__, error=str(error))
+                    record_collection_observations(
+                        plan, root, observation_attempt_id, cell, record["attempt_id"], raw_root.parent, "failed"
+                    )
+                    logger.warning("Rejecting archived K3.1 worker evidence for %s: %s", cell.cell_id, error)
+                    return False
+                record_collection_observations(
+                    plan, root, observation_attempt_id, cell, record["attempt_id"], raw_root.parent, "passed"
+                )
         except Exception as error:
             record["status"] = "failed"
             record["observation_error"] = str(error)
@@ -2242,11 +2442,48 @@ def _run_collection_impl(
                 }
             )
             return False
+        return True
 
     runtime_exec = Path(__file__).resolve().parent / "runtime" / "fpm_exec.sh"
     runtime_preflight = Path(__file__).resolve().parent / "runtime" / "preflight.py"
     adapter = _ADAPTER_DIRS.get(getattr(getattr(plan, "capability", None), "architecture", None))
     target_cells = plan.cells[: (cell_limit or (1 if smoke else len(plan.cells)))]
+
+    if getattr(plan.options, "executor", "kubernetes") == "slurm":
+        for cell in target_cells:
+            cell_dir = root / "cells" / cell.cell_id
+            entry = checkpoint["cells"].get(cell.cell_id, {})
+            if not (cell_dir / RECEIPT).exists() and "private_cleanup_error" not in entry:
+                continue
+            try:
+                _cell_runner(plan, cell, cell_dir / FPM_MANIFEST_FILENAME, cell_dir).cleanup()
+                reclaim_delivery(cell_dir)
+                if "private_cleanup_error" in entry:
+                    entry.pop("private_cleanup_error")
+                    if (
+                        entry.get("status") == "cleanup_failed"
+                        and not {"cleanup_error", "diagnostic_error"} & entry.keys()
+                    ):
+                        entry["status"] = "failed"
+                    _atomic_json(checkpoint_path, checkpoint)
+            except Exception as error:
+                checkpoint["cells"][cell.cell_id] = {
+                    **checkpoint["cells"].get(cell.cell_id, {}),
+                    "status": "cleanup_failed",
+                    "cleanup_error": redact(str(error), sensitive_values),
+                    "artifact_dir": str(cell_dir),
+                }
+                errors.append(
+                    {
+                        "module": "fpm_forward",
+                        "cell_id": cell.cell_id,
+                        "error_type": type(error).__name__,
+                        "error_message": redact(str(error), sensitive_values),
+                        "classification": "resource_cleanup_failed",
+                    }
+                )
+                observation_archive_failed.add(cell.cell_id)
+                _atomic_json(checkpoint_path, checkpoint)
 
     formal_database_terminal = False
     database_entry = checkpoint.get("database")
@@ -2289,7 +2526,9 @@ def _run_collection_impl(
             entry = checkpoint["cells"].get(cell.cell_id)
             if not isinstance(entry, dict):
                 continue
-            recovered = _recover_completed_attempt(plan, cell, root, entry, smoke=smoke)
+            recovered = _recover_completed_attempt(
+                plan, cell, root, entry, smoke=smoke, generator_overrides=generator_overrides
+            )
             if recovered is None:
                 continue
             archived = archive_observations(cell, recovered)
@@ -2329,14 +2568,15 @@ def _run_collection_impl(
         # This refresh only polishes checkpoint metadata for cells whose
         # results were already validated and published; raw artifacts that
         # are no longer readable (disk reclaimed, resume from a different
-        # working directory) must not abort the whole resume and never
-        # demote the cell's passed status.
+        # working directory) must not abort resume or demote passed cells.
+        # A proven publication rejection is different: an unpublished KDA
+        # attempt without real state must be retryable rather than stuck passed.
         try:
             metadata = {
                 "total_gpus": cell.topology.total_gpus,
                 "point_source": "dynamo_native_self_benchmark",
                 "global_warmup_iterations": plan.options.warmup_iterations,
-                **_configured_sampling_metadata(plan, cell, smoke=smoke),
+                **_configured_sampling_metadata(plan, cell, smoke=smoke, bundle=instrumentation),
                 **_runtime_timing_summary(root / "cells" / cell.cell_id / "raw"),
             }
             metadata.update(
@@ -2345,9 +2585,18 @@ def _run_collection_impl(
                     root / "cells" / cell.cell_id / "raw",
                     expected_plan_sha256=plan.sha256,
                     expected_attempt_id=_required_attempt_id(entry, cell.cell_id),
+                    plan=plan,
                 )
             )
         except (OSError, TypeError, ValueError) as error:
+            from .database import KdaSeedError, is_kda_decode
+
+            if not formal_database_terminal and (
+                isinstance(error, KdaSeedError)
+                or (isinstance(error, KvWarmProtocolError) and is_kda_decode(plan, cell))
+            ):
+                entry.update(status="failed", error_type=type(error).__name__, error=str(error))
+                checkpoint_changed = True
             logger.warning(
                 "Skipping metadata refresh for passed FPM cell %s: %s",
                 cell.cell_id,
@@ -2390,7 +2639,7 @@ def _run_collection_impl(
                     checkpoint["cells"][cell.cell_id] = {
                         **previous,
                         "status": "cleanup_failed",
-                        "cleanup_error": str(error),
+                        "cleanup_error": redact(str(error), sensitive_values),
                         "artifact_dir": str(cell_dir),
                     }
                     errors.append(
@@ -2411,6 +2660,10 @@ def _run_collection_impl(
         if instrumentation is not None and previous.get("attempt_id") and not archive_observations(cell, previous):
             _atomic_json(checkpoint_path, checkpoint)
             continue
+        if instrumentation is not None:
+            from .runtime_probe import CONTEXT_FILENAME
+
+            (cell_dir / CONTEXT_FILENAME).unlink(missing_ok=True)
         for stale_dir in (cell_dir / "raw", cell_dir / "logs"):
             if stale_dir.exists():
                 shutil.rmtree(stale_dir)
@@ -2431,29 +2684,38 @@ def _run_collection_impl(
             "total_gpus": cell.topology.total_gpus,
             "point_source": "dynamo_native_self_benchmark",
             "global_warmup_iterations": plan.options.warmup_iterations,
-            **_configured_sampling_metadata(plan, cell, smoke=smoke),
         }
         checkpoint["cells"][cell.cell_id] = base_record
         _atomic_json(checkpoint_path, checkpoint)
         resource = None
+        delivery_directory = None
         try:
-            _render_cell(
-                plan,
-                cell,
-                cell_dir,
-                generator_overrides,
-                smoke=smoke,
-            )
-            manifest = cell_dir / FPM_MANIFEST_FILENAME
-            run_script = cell_dir / FPM_RUN_SCRIPT_FILENAME
-            env_script = cell_dir / FPM_ENV_FILENAME
-            runtime_env = cell_dir / RUNTIME_ENV_FILENAME
+            base_record.update(_configured_sampling_metadata(plan, cell, smoke=smoke, bundle=instrumentation))
+            _atomic_json(checkpoint_path, checkpoint)
+            worker_dir = cell_dir
+            if private_delivery:
+                _render_cell(plan, cell, cell_dir, generator_overrides, smoke=smoke, resolve_environment=False)
+                # Retain only digest references. Pyxis staging must share the
+                # campaign filesystem, while the directory remains private.
+                delivery_directory = new_delivery_directory(
+                    Path(artifact_root), cell_dir, getattr(plan.options, "executor", "kubernetes")
+                )
+                worker_dir = Path(delivery_directory.name)
+            _render_cell(plan, cell, worker_dir, generator_overrides, smoke=smoke)
+            manifest = worker_dir / FPM_MANIFEST_FILENAME
+            run_script = worker_dir / FPM_RUN_SCRIPT_FILENAME
+            env_script = worker_dir / FPM_ENV_FILENAME
+            runtime_env = worker_dir / RUNTIME_ENV_FILENAME
             if not manifest.exists() or not run_script.exists() or not env_script.exists() or not runtime_env.exists():
                 raise RuntimeError(
                     f"Generator FPM target did not emit {FPM_MANIFEST_FILENAME}, "
                     f"{FPM_ENV_FILENAME}, {FPM_RUN_SCRIPT_FILENAME}, and {RUNTIME_ENV_FILENAME}"
                 )
             resource = _cell_runner(plan, cell, manifest, cell_dir)
+            resource._private_values = sensitive_values
+            resource._diagnostic_cell = cell
+            if private_delivery and getattr(plan.options, "executor", "kubernetes") == "slurm":
+                resource.runtime_dir = worker_dir / "slurm-runtime"
             # A prior invocation may have left the same-named workload alive
             # (cleanup timeout, killed collector host) even when THIS
             # checkpoint has no record of the cell: workload names derive
@@ -2479,6 +2741,8 @@ def _run_collection_impl(
                 context["collector_attempt_id"] = attempt_id
                 context["cell_id"] = cell.cell_id
                 instrumentation_files = stage_runtime_instrumentation(instrumentation, cell_dir, context)
+                if private_delivery:
+                    instrumentation_files = stage_runtime_instrumentation(instrumentation, worker_dir, context)
             resource.stage(
                 pods,
                 [
@@ -2534,11 +2798,13 @@ def _run_collection_impl(
             phase_marks["execute_wall_s"] = round(time.monotonic() - mark, 3)
             mark = time.monotonic()
             resource.collect(pods)
+            redact_diagnostics(cell_dir, sensitive_values, cell=cell)
             phase_marks["collect_s"] = round(time.monotonic() - mark, 3)
             _validate_points_receipts(plan, cell, cell_dir / "raw", attempt_id, smoke=smoke)
             runtime_collection = _runtime_collection_summary(
                 cell,
                 cell_dir / "raw",
+                plan=plan,
                 expected_plan_sha256=plan.sha256,
                 expected_attempt_id=attempt_id,
             )
@@ -2568,40 +2834,82 @@ def _run_collection_impl(
                 "status": "failed",
                 "artifact_dir": str(cell_dir),
                 "error_type": type(error).__name__,
-                "error": str(error),
+                "error": redact(str(error), sensitive_values),
             }
             errors.append(
                 {
                     "module": "fpm_forward",
                     "cell_id": cell.cell_id,
                     "error_type": type(error).__name__,
-                    "error_message": str(error),
+                    "error_message": redact(str(error), sensitive_values),
                     "classification": "campaign_cell_failed",
                 }
             )
         finally:
+            teardown_ok = resource is None
             if resource is not None:
                 try:
                     resource.cleanup()
+                    teardown_ok = True
                 except Exception as cleanup_error:
                     record = checkpoint["cells"][cell.cell_id]
                     if record.get("status") == "passed":
                         record["status"] = "cleanup_failed"
-                    checkpoint["cells"][cell.cell_id]["cleanup_error"] = str(cleanup_error)
+                    checkpoint["cells"][cell.cell_id]["cleanup_error"] = redact(str(cleanup_error), sensitive_values)
                     errors.append(
                         {
                             "module": "fpm_forward",
                             "cell_id": cell.cell_id,
                             "error_type": type(cleanup_error).__name__,
-                            "error_message": str(cleanup_error),
+                            "error_message": redact(str(cleanup_error), sensitive_values),
                             "classification": "resource_cleanup_failed",
                         }
                     )
+            if delivery_directory is not None and teardown_ok:
+                try:
+                    delivery_directory.cleanup()
+                except Exception as cleanup_error:
+                    record = checkpoint["cells"][cell.cell_id]
+                    if record.get("status") == "passed":
+                        record["status"] = "cleanup_failed"
+                    record["private_cleanup_error"] = redact(str(cleanup_error), sensitive_values)
+                    errors.append(
+                        {
+                            "module": "fpm_forward",
+                            "cell_id": cell.cell_id,
+                            "error_type": type(cleanup_error).__name__,
+                            "error_message": redact(str(cleanup_error), sensitive_values),
+                            "classification": "private_cleanup_failed",
+                        }
+                    )
+            diagnostics_ok = True
+            try:
+                redact_diagnostics(cell_dir, sensitive_values, cell=cell)
+            except Exception as error:
+                diagnostics_ok = False
+                record = checkpoint["cells"][cell.cell_id]
+                try:
+                    discard_diagnostics(cell_dir)
+                except OSError as cleanup_error:
+                    record["diagnostic_cleanup_error"] = redact(str(cleanup_error), sensitive_values)
+                if record.get("status") == "passed":
+                    record["status"] = "failed"
+                record["diagnostic_error"] = redact(str(error), sensitive_values)
+                observation_archive_failed.add(cell.cell_id)
+                errors.append(
+                    {
+                        "module": "fpm_forward",
+                        "cell_id": cell.cell_id,
+                        "error_type": type(error).__name__,
+                        "error_message": record["diagnostic_error"],
+                        "classification": "diagnostic_sanitization_failed",
+                    }
+                )
             record = checkpoint["cells"][cell.cell_id]
             record["collector_phase_seconds"] = dict(phase_marks)
             record["completed_at"] = _utc_now()
             record["duration_seconds"] = round(time.monotonic() - cell_started, 3)
-            if instrumentation is not None:
+            if instrumentation is not None and diagnostics_ok:
                 archive_observations(cell, record)
             run_attempts.append(_run_manifest_attempt(cell, record))
             _atomic_json(checkpoint_path, checkpoint)

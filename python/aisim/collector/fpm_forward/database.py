@@ -78,28 +78,45 @@ def _dotted_get(payload: object, path: str) -> object:
     return value
 
 
-def _validate_backend_markers(cell: FPMCell, cell_dir: Path) -> None:
+def _observed_backend_markers(cell: FPMCell, cell_dir: Path) -> dict[Path, dict]:
+    """Project verified diagnostic values onto the declared marker paths."""
+    projections = {}
     expected = cell.backend_policy.expected_markers
     if not expected:
-        return
+        return projections
     paths = sorted((cell_dir / "raw").glob(f"**/{FPM_RESOLVED_CONFIG_GLOB}"))
     if not paths:
         raise ValueError(f"backend policy {cell.backend_policy.policy_id} requires resolved-config evidence")
     for path in paths:
         payload = json.loads(path.read_text())
-        mismatches = {}
+        projection = {}
+        mismatches = []
         for marker_path, marker_value in expected.items():
             try:
                 actual = _dotted_get(payload, marker_path)
             except KeyError:
-                actual = "<missing>"
+                mismatches.append(marker_path)
+                continue
             # Markers are declared as strings while the resolved config keeps
             # native JSON types (enable_eplb: true vs expected "True");
             # compare canonical string forms so a type gap is not a mismatch.
             if str(actual) != str(marker_value):
-                mismatches[marker_path] = {"actual": actual, "expected": marker_value}
+                mismatches.append(marker_path)
+                continue
+            target = projection
+            *parents, leaf = marker_path.split(".")
+            for parent in parents:
+                target = target.setdefault(parent, {})
+            target[leaf] = actual
         if mismatches:
             raise ValueError(f"backend marker mismatch in {path}: {mismatches}")
+
+        projections[path] = projection
+    return projections
+
+
+def _validate_backend_markers(cell: FPMCell, cell_dir: Path) -> None:
+    _observed_backend_markers(cell, cell_dir)
 
 
 def _full_attention_group(group: object) -> bool:
@@ -206,6 +223,94 @@ def _dense_synthetic_kv_eligible(
     return bool(artifacts)
 
 
+class KdaSeedError(ValueError):
+    """A completed native attempt has unsupported recurrent-state history."""
+
+
+def _is_k31(plan) -> bool:
+    capability = getattr(plan, "capability", None)
+    model_config = getattr(capability, "model_config", None)
+    return getattr(capability, "architecture", None) == "KimiK31ForConditionalGeneration" or (
+        model_config is not None
+        and (model_config.payload.get("architectures") or [])[:1] == ["KimiK31ForConditionalGeneration"]
+    )
+
+
+def require_k31_worker_evidence(plan, cell, raw_root, collection, *, allow_staged=False) -> None:
+    """Require the publication evidence before a cell becomes terminal passed."""
+    if not _is_k31(plan):
+        return
+    from .execution_evidence import _runtime_worker_evidence
+    from .runtime_k31 import moe_precision
+
+    bundle = plan.runtime_instrumentation
+    if bundle is None or plan.runtime_launch is None:
+        raise ValueError("K3.1 publication requires source-bound observed MoE precision")
+    deployment = plan.deployment_profile(cell)
+    if deployment is None or deployment.resources is None or deployment.resources.runtime_memory is None:
+        raise ValueError("K3.1 publication requires a reviewed runtime capacity bound")
+    workers, _ = _runtime_worker_evidence(
+        plan,
+        cell,
+        raw_root,
+        collection,
+        bundle=bundle,
+        minimum_capacity=deployment.resources.runtime_memory.kv_cache_bytes,
+        allow_staged=allow_staged,
+    )
+    if any(moe_precision(worker.get("initialized_moe")) != cell.moe_quant_mode for worker in workers.values()):
+        raise ValueError("K3.1 publication MoE precision differs from initialized workers")
+
+
+def is_kda_decode(plan, cell):
+    config = getattr(getattr(plan, "capability", None), "model_config", None)
+    return (
+        cell.workload_kind == "decode"
+        and config is not None
+        and config.effective_payload.get("linear_attn_config") is not None
+    )
+
+
+def require_kda_real_kv(plan, cell, collection):
+    """All recurrent decode requires real history, including balanced-MoE TP.
+
+    Protocol-approved topology skips remain publishable only for models/phases
+    without this request-specific recurrent-state requirement. Recovery uses
+    this same guard before accepting retained artifacts.
+    """
+    if _is_k31(plan) and any(
+        item.point["point_type"] == "prefill" and int(item.point["total_kv_read_tokens"]) != 0
+        for item in collection.points
+    ):
+        raise KdaSeedError("K3.1 prefill publication requires zero historical KV tokens")
+    if not is_kda_decode(plan, cell):
+        return
+    warmup = collection.kvwarm_meta
+    if (
+        warmup is None
+        or warmup.get("enabled") is not True
+        or warmup.get("warm_eligible") is not True
+        or warmup.get("skip_reason")
+        or any(
+            not isinstance(reasons := item.point.get("sample_reasons"), list)
+            or not all(isinstance(reason, str) for reason in reasons)
+            or "kvwarm_real_kv" not in reasons
+            or "kvwarm_fake_fallback" in reasons
+            or "prefill_fake_prefix" in reasons
+            or "prefill_real_seed" in reasons
+            for item in collection.points
+        )
+        or (
+            _is_k31(plan)
+            and (
+                not collection.kvwarm_initialization_strategies
+                or any(strategy != "native_exact_context" for strategy in collection.kvwarm_initialization_strategies)
+            )
+        )
+    ):
+        raise KdaSeedError("KDA decode publication requires real_kv seeding of the request's recurrent state")
+
+
 def aggregate_cell(
     plan: FPMCollectionPlan,
     cell: FPMCell,
@@ -232,6 +337,7 @@ def aggregate_cell(
         expected_plan_sha256=plan.sha256,
         expected_attempt_id=expected_attempt_id,
     )
+    require_kda_real_kv(plan, cell, collection)
     if collection.execution_mode == "native_graph_policy":
         # Raises on a malformed or contradictory record. A gap that the reader reports, such as prompt hashes that
         # the producer does not write, does not refuse publication.
@@ -245,8 +351,10 @@ def aggregate_cell(
         if deployment is not None
         else getattr(plan, "backend_version", None) or collection.backend_version
     )
+    require_k31_worker_evidence(plan, cell, cell_dir / "raw", collection)
     capability = plan.capability
-
+    model_config = getattr(capability, "model_config", None)
+    has_kda_state = model_config is not None and model_config.effective_payload.get("linear_attn_config") is not None
     selected = select_native_measurements(collection, cell_id=cell.cell_id)
 
     # KV seed regime (schema v6 additive column): a per-row RECORD of the
@@ -293,8 +401,11 @@ def aggregate_cell(
         if kvwarm_meta is None:
             return "legacy"
         skip_reason = kvwarm_meta.get("skip_reason")
-        if skip_reason in approved_skip_reasons:
+        if skip_reason in approved_skip_reasons and not (has_kda_state and phase == "decode"):
             return f"skip:{skip_reason}"
+        reasons = point.get("sample_reasons") or []
+        if has_kda_state and phase == "decode" and {"prefill_fake_prefix", "prefill_real_seed"}.intersection(reasons):
+            raise KdaSeedError("KDA decode publication cannot carry a prefill seed stamp")
         if "kvwarm_real_kv" in reasons:
             if skip_reason:
                 raise ValueError(f"native point reports real KV under warm-up skip_reason={skip_reason!r}")

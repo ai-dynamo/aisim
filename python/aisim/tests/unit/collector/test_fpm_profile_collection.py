@@ -1106,10 +1106,19 @@ def test_profile_version_label_is_independent_of_observed_runtime(
     monkeypatch.setattr(importlib.metadata, "version", package_version)
 
     def execute(_pod, command, timeout):
-        if command[:2] == ["python3", "-c"]:
-            with monkeypatch.context() as patch:
-                patch.setattr(sys, "argv", ["-c", *command[3:]])
-                exec(command[2], {})
+        if command[0] == "find":
+            return
+        # Preparation applies the same staged startup environment as the
+        # benchmark before reading runtime metadata inside the keepalive Pod.
+        assert command[:2] == ["bash", "-c"]
+        assert f"source {runner.REMOTE_WORKDIR}/{runner.RUNTIME_ENV_FILENAME}" in command[2]
+        assert 'exec "$@"' in command[2]
+        assert command[3] == "fpm-attempt-provenance"
+        command = command[4:]
+        assert command[:2] == ["python3", "-c"]
+        with monkeypatch.context() as patch:
+            patch.setattr(sys, "argv", ["-c", *command[3:]])
+            exec(command[2], {})
 
     resource._exec_checked = execute
     arguments = dict(

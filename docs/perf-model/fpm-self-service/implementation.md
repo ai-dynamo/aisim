@@ -1124,7 +1124,7 @@ For a model without an analytical class, create a JSON or YAML FPM profile and p
 | Profile fields | Required meaning |
 | --- | --- |
 | `schema_version` | Integer `1`. |
-| `model`, `model_revision`, `architecture` | Exact timing model identity, pinned checkpoint revision, and architecture identifier matching the checkpoint configuration. An analytical model class is optional for direct interpolation. |
+| `model`, `model_revision`, `architecture` | Exact timing model identity, pinned checkpoint revision used for both validation and analytical graph metadata, and architecture identifier matching the checkpoint configuration. An analytical model class is optional for direct interpolation. |
 | `context_length`, `num_experts`, `provenance` | Declared context limit, routed expert count (`0` for dense), and how the metadata was obtained. |
 | `deployments` | One or more exact deployment records, with one precision/resource identity per hardware/runtime/full parallel tuple. |
 | Deployment `system`, `backend`, `backend_version` | GPU system, `vllm`, and the exact backend identity label selected by onboarding. Custom strings are allowed; this label is distinct from the observed runtime package version. `backend_version: null` is allowed while collection identity awaits the target-image probe; publication and simulation require the resolved label. |
@@ -1141,13 +1141,17 @@ for standalone FPM timing queries; cache sizing and replay reject it.
 Onboarding neither infers nor plans with either layout. See
 [memory accounting](../memory.md#observed-mamba-align-pools).
 
-All resource bytes are **per rank**, and must bound every rank. Scheduler envelope limits are also per attention-DP rank; they are not the summed batch and token totals used by the worker's FPM timing query. Do not copy TP resource values into DEP/TEP merely because GPU counts match. Include all non-KV storage, including quantization overheads. Overhead fields exclude the separate `kv_cache.capacity.cuda_graph_reserved_bytes` reservation. Profiles carry explicit quantization identity; `text_only` and `unrecorded_quant_modes` overrides are rejected on this route. Requests above the declared scheduler envelope fail explicitly. Collection validates both prefill and explicit decode batch limits against that envelope before launching workers.
+All resource bytes are **per rank**, and must bound every rank. Scheduler envelope limits are also per attention-DP rank; they are not the summed batch and token totals used by the worker's FPM timing query. Do not copy TP resource values into DEP/TEP merely because GPU counts match. Include all non-KV storage, including quantization overheads. Overhead fields exclude the separate `kv_cache.capacity.cuda_graph_reserved_bytes` reservation. Profiles carry explicit quantization identity; `unrecorded_quant_modes` overrides are rejected on the `fpm_profile` route. `text_only` is accepted to permit language timing for a multimodal architecture, while retaining encoder weights; it supplies no vision execution timing. Requests above the declared scheduler envelope fail explicitly. Collection validates both prefill and explicit decode batch limits against that envelope before launching workers.
 
 For complete legacy declarations, automatic KV admission subtracts these non-KV bounds and CUDA graph reservation from the configured fraction of GPU memory. Linear cache divides the remainder by its declared bytes per token; grouped cache passes the shared byte budget and group pages to the native allocator. `context_length: max` uses the profile limit. Keep `bytes_per_token: auto` for profile resources; grouped profiles reject explicit scalar rates and block-count capacities. These operations need a hardware specification and profile, but no FPM timing files or model graph. The [canonical cache-budget API](../memory.md#fpm-profile-cache-groups-and-byte-budgets) returns grouped `total_kv_size_bytes` and `request_peak_cache_bytes`; scalar `total_kv_size_tokens` and `kv_size_per_token_bytes` are null. `estimate_num_gpu_blocks` rejects grouped profiles.
 
 The declared checkpoint revision is preserved for review and replay. Existing FPM tables may not pin a checkpoint revision; supplying one in a profile does not prove that the historical measurements came from that exact revision. Record that limitation in `provenance` when validating existing data.
 
 Ordinary FPM model construction reads `config.json` from the local checkpoint or the declared remote `model_revision` and verifies the profile's architecture against the checkpoint's text-model architecture before selecting interpolation. Missing or malformed architecture metadata and mismatched names fail explicitly. This verification loads no weights and constructs no analytical model graph. A verified architecture without a registered analytical class remains valid for direct interpolation. Schema-only parsing and onboarding request creation do not require this runtime metadata check.
+
+When analytical compilation is selected, remote model configuration, optional
+quantization sidecars and processor metadata use that same `model_revision`.
+Bundled or default-ref metadata cannot override the pinned graph configuration.
 
 ## Plan, preview, and explicitly execute
 
@@ -1543,6 +1547,56 @@ Both probe preview/execution and `onboard import-observations` automatically upd
 
 An onboarding agent should investigate and author a campaign-local adapter when no compatible bundled adapter exists. Inspect the exact pinned source and relevant vendor patches, document the field mappings, and test them through the runtime's extension classes. Use the existing authorized campaign scope to preview and execute; ask only for missing access, unresolved user choices, or a resource/runtime constraint requiring a decision. Neither an upstream adapter merge nor a runtime downgrade is required to use a local bundle. A runtime with unsupported cache semantics still needs an explicit limitation or a separately supported representation.
 
+### Kimi K3.1 first-prefill and decode probes
+
+The source-pinned K3.1 adapter accepts independent `prefill` and `decode`
+configurations. Both use Mamba cache mode `none`, FP32 recurrent state,
+disabled prefix caching, and no speculation. Each role requires its own
+initialized-rank observations and native measurement evidence. Aggregated
+collection remains unsupported by this adapter.
+
+Import checks native KDA state dtypes against the resolved cache settings:
+`mamba_cache_dtype: auto` follows the model dtype for convolution, and
+`mamba_ssm_cache_dtype: auto` requires FP32 recurrence. Explicit BF16 recurrence
+is accepted only for standalone observations with matching spec and tensor
+evidence. Formal collection and imports bound to a Collector attempt require
+effective FP32 recurrence. CUDA FP8 indexer
+kernel views require the pinned backend's 64-token kernel blocks, including
+when a larger manager block is subdivided.
+
+For prefill, the supported scope is **historical KV = 0**: new requests whose
+entire scheduled prompt is computed in the measured forward pass. At pinned
+[Dynamo `17628144dc33c9d5916b08789f9d317924217dad`](https://github.com/ai-dynamo/dynamo/blob/17628144dc33c9d5916b08789f9d317924217dad/components/src/dynamo/vllm/instrumented_scheduler.py#L3892),
+`_bench_prefill_kv_read_points` returns only `[0]` when prefix caching is
+disabled. `_bench_generate_prefill_grid` retains native new-token and batch
+axes and native feasibility checks. The zero-KV branch of
+[`_bench_step_prefill`](https://github.com/ai-dynamo/dynamo/blob/17628144dc33c9d5916b08789f9d317924217dad/components/src/dynamo/vllm/instrumented_scheduler.py#L5488)
+enqueues ordinary new requests through `_bench_inject_prefill`, without
+prefix staging or synthetic cached blocks. Native timing, warm-up, scheduling
+and point-admission checks are unchanged. The measured token count, batch and
+historical KV must still match the requested coordinate.
+
+Use `worker_type: prefill` in an independent onboarding configuration, or
+`--fpm-worker-type prefill` for formal collection with its accepted runtime
+profile and launch. The renderer supplies `--mamba-cache-mode none`,
+`--mamba-ssm-cache-dtype float32` and `--no-enable-prefix-caching`.
+The ordinary `--fpm-max-prefill-isl` and `--fpm-max-prefill-batch-size`
+controls bound the native token/batch axes. Probe sampling retains the native
+two-endpoint limits; `--prefill-max-kv-read-token-samples=1` is invalid and is
+not how the KV axis is restricted. `DYN_BENCH_PREFILL_REAL_SEED=on` remains
+enabled; the zero-KV path does not enter that branch.
+
+An optional `--fpm-benchmark-points-file` uses the existing explicit-point
+interface, and every prefill entry must have `total_kv_read_tokens: 0`.
+Any nonzero prefill entry is rejected, including one in a file also containing
+decode points. No point is removed or relabeled. Native zero-KV prefill
+evidence is `not_applicable` for seeding and publishes as `n/a`; it does not
+establish cached or continued prefill support. These source conclusions permit
+a bounded probe, not a claim that the selected hardware has passed it.
+The frozen bundle's original notes describe its first decode-only candidate;
+this section records the subsequently audited zero-KV prefill extension without
+changing that bundle's bytes or source identity.
+
 ### Save the launch inputs in the existing checkpoint
 
 `--configuration` selects checkpoint keys; the name never implies topology. The command reads each configuration's `draft_request.identity/search/collection` and fills absent facts from shared or per-configuration `inputs`. Conflicting facts are rejected. An incomplete draft is allowed. For inputs without a profile, supply these fields:
@@ -1555,9 +1609,92 @@ An onboarding agent should investigate and author a campaign-local adapter when 
 | `precision` | `gemm_quant_mode`, `moe_quant_mode`, `fmha_quant_mode`, `kv_cache_dtype`, and `comm_quant_mode`; optional selected backends and `enable_wideep`/`enable_eplb`. A complete existing profile can supply this exact precision identity. For an `fp8` KV cache, `fmha_quant_mode` is the checkpoint-native mode that the collector resolves, for example `fp8` for an FP8 or NVFP4 checkpoint, and the probe preview and the import refuse another label. For a `bfloat16` or `half` KV cache, `fmha_quant_mode` is the compute dtype, `bfloat16` or `half`, which the import checks against the observed model dtype. |
 | Collection fields | `max_num_tokens`, `max_batch_size`, `gpu_memory_utilization`, `prefill_cudagraph_policy`, an explicit capture size only with `explicit` policy, and `warmup_iterations`. Missing scheduler/fraction values use the documented 8,192/256/0.90 defaults. A missing `warmup_iterations` keeps the collector default of 5. Fresh inputs use runtime capture policy; saved legacy drafts retain their policy. |
 | `collection_deployment` | Existing executor/image/model-cache/mount/transport options. `container_mount` is a list. Explicit deployment flags override and save the selected configurations' deployment choices. |
+| `collection_deployment.extra_env` | Unique literal `{name, value}` environment entries for runtime probes and formal collection. `PYTHONHOME` is rejected to preserve the image's Python prefix. Campaign deployment archives retain environment references and value digests, except validated public warm-up, finalization-timeout and KDA-layout controls; new launches require matching caller environment values. Version detection, Collector provenance and the engine receive the same environment. The generated `collect-fpm --extra-env` option accepts a JSON list of these entries. |
 | `resource_overrides` | Per-configuration metadata assumptions, if required for the model. Cache geometry can remain absent at probe entry. |
 
 Save source research and outstanding questions after each meaningful finding with `onboard checkpoint`, using its current revision. Register the local bundle files and source notes as input artifacts; do not put independent configurations' byte bounds into shared inputs. Probe and import also register their results, but they do not observe or save the agent's investigation automatically.
+
+For an audited runtime assembled from mounted dependencies, `collection_deployment.extra_env`
+accepts unique literal `{name, value}` entries through the existing Generator environment
+interface. These entries remain part of the frozen launch and formal collection settings,
+and apply to package-version detection in the selected Kubernetes container.
+The campaign's `generator-overrides.json` and retained `generator-request.json` store each caller entry as
+`{name, value_from_env: name, value_sha256}` rather than retaining its value.
+Replay resolves these references from the caller's environment and rejects missing
+or changed values before launch. Recovery from retained measurements does not resolve
+credentials unless another worker must launch. The public KV warm-up switches and
+`FPM_FINALIZATION_TIMEOUT_SECONDS` remain literal; the timeout must be an integer
+string from 1 through 3,600, without leading zeros, signs or whitespace.
+Probe plans, collection launch contexts, observation records/indexes and resource
+provenance also retain references and digests; the public `VLLM_SSM_CONV_STATE_LAYOUT`
+setting must be literal `SD` or `DS` for offline KDA validation; omission retains
+the runtime default `SD`. Reviewing a reference-bound plan does
+not require replay credentials. Historical literal hashes still require the
+original values when they must be reconstructed for verification.
+Plan hashes cover the references and digests; historical literal archives remain
+readable. Generated execution manifests still contain the environment required by
+the runtime and must be handled as credentials when applicable. Runtime probe
+previews and retained probe evidence contain references only. Execution renders
+concrete values in private temporary worker staging, removed after verified teardown.
+Private Slurm worker staging requires `AISIMULATE_PRIVATE_DELIVERY_ROOT` to explicitly select
+caller-owned mode-0700 shared storage outside the campaign tree. The caller must
+choose a path readable at the same location on the compute nodes; a campaign's
+parent directory may be local to the submit host, so there is no default. A receipt
+binds abandoned staging to its cell. Resume
+reclaims it only after verified teardown of the owned Slurm steps; failed teardown
+retains the private files for recovery. Retained worker diagnostics and raw config
+dumps redact private environment values before evidence archival.
+All configured entries, including `PYTHONUSERBASE`, `PYTHONPATH`, `PATH` and Hub settings,
+reach version detection and the Collector's startup checks before the engine starts. Record mounted source
+and binary hashes alongside the image identity; environment declarations do not qualify them.
+Kubernetes and Slurm apply the same configured environment to all three steps. `PYTHONHOME` is rejected at
+the deployment and Collector rendering boundaries so benchmark startup cannot
+select an interpreter different from preparation and version detection.
+The GPU-free Kubernetes version probe requires a model-cache PVC already bound
+for the collection workload. It supports `ReadWriteMany` and `ReadWriteOnce`.
+For `ReadWriteOnce`, it lists live claim consumers and constrains the probe to
+their node; unplaced or conflicting consumers are rejected before Pod creation.
+An unused claim retains normal scheduler placement. Other access modes,
+including `ReadWriteOncePod`, are rejected. For a Pending `WaitForFirstConsumer` claim, launch a
+separate cache-initialization Pod or Job before `collect-fpm --execute`: collection
+performs version detection before launching its GPU workload, so it cannot bind
+the claim itself. For example, save this as `cache-init.yaml`, substitute your
+namespace, claim and accepted image, and copy the intended GPU workload's node
+selectors, affinity and tolerations into `spec` before applying it:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fpm-cache-init
+  namespace: YOUR_NAMESPACE
+spec:
+  restartPolicy: Never
+  containers:
+    - name: init
+      image: YOUR_ACCEPTED_IMAGE
+      command: ["sh", "-c", "mkdir -p /models/hf"]
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+      volumeMounts:
+        - name: model-cache
+          mountPath: /models
+  volumes:
+    - name: model-cache
+      persistentVolumeClaim:
+        claimName: YOUR_MODEL_PVC
+```
+
+```bash
+kubectl apply -f cache-init.yaml
+kubectl -n YOUR_NAMESPACE wait --for=jsonpath='{.status.phase}'=Bound pvc/YOUR_MODEL_PVC --timeout=300s
+kubectl -n YOUR_NAMESPACE wait --for=jsonpath='{.status.phase}'=Succeeded pod/fpm-cache-init --timeout=300s
+kubectl -n YOUR_NAMESPACE delete pod fpm-cache-init
+```
+
+Confirm the claim has a `spec.volumeName`, then run collection. The version probe
+refuses to become the claim's first consumer.
 
 ### Choose or author the instrumentation bundle
 

@@ -738,3 +738,84 @@ def test_kimi_rust_runtime_preserves_replicated_projector_work_and_weights(video
         )
     assert "encoder_dp_all_gather" in summaries[0].get_encoder_latency_dict()
     assert summaries[1].get_encoder_latency_dict()["encoder_ar_1"] > 0
+
+
+@pytest.mark.parametrize("remote", [False, True])
+@pytest.mark.parametrize("inline,sidecar", [(16384, 8192), (8192, 8192)])
+def test_mixed_kimi_processor_layout_rejects_conflicting_patch_limits(tmp_path, monkeypatch, remote, inline, sidecar):
+    from aisimulate_core.sdk import utils as utils_module
+
+    raw = deepcopy(get_model_config_from_model_path("moonshotai/Kimi-K2.5")["raw_config"])
+    raw["preprocessor_config"] = {"media_proc_cfg": {"in_patch_limit": inline}}
+    files = {"config.json": raw, "preprocessor_config.json": {"max_patches": sidecar}}
+    if remote:
+        model_path = f"synthetic-kimi/mixed-patch-limits-{tmp_path.name}"
+        monkeypatch.setattr(utils_module, "_download_hf_config", lambda model_path: raw)
+        monkeypatch.setattr(
+            utils_module, "_download_hf_json", lambda model_path, filename, **kwargs: files.get(filename)
+        )
+    else:
+        for name, contents in files.items():
+            (tmp_path / name).write_text(json.dumps(contents))
+        model_path = str(tmp_path)
+    if inline != sidecar:
+        with pytest.raises(ValueError, match="conflicting inline and sidecar image-patch limits"):
+            get_model_config_from_model_path(model_path)
+    else:
+        parsed = get_model_config_from_model_path(model_path)
+        assert parsed["encoder_config"].image_max_patches == sidecar
+
+
+@pytest.mark.parametrize("resize", [True, False])
+@pytest.mark.parametrize("inline_limit", [None, 8192])
+def test_mixed_kimi_processor_validates_sidecar_image_settings(tmp_path, resize, inline_limit):
+    raw = deepcopy(get_model_config_from_model_path("moonshotai/Kimi-K2.5")["raw_config"])
+    media = {"patch_limit_on_one_side": 512}
+    if inline_limit is not None:
+        media["in_patch_limit"] = inline_limit
+    raw["preprocessor_config"] = {"media_proc_cfg": media}
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    (tmp_path / "preprocessor_config.json").write_text(json.dumps({"max_patches": 8192, "do_resize": resize}))
+    if not resize:
+        with pytest.raises(ValueError, match="do_resize=False"):
+            get_model_config_from_model_path(str(tmp_path))
+    else:
+        assert get_model_config_from_model_path(str(tmp_path))["encoder_config"].image_max_patches == 8192
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("exclusions", [[], ["vision_tower.*", "mm_projector.*"]])
+def test_kimi_sidecar_preserves_language_scope_and_model_exclusions(tmp_path, nested, exclusions):
+    raw = deepcopy(get_model_config_from_model_path("moonshotai/Kimi-K2.5")["raw_config"])
+    raw.pop("quantization_config", None)
+    if nested:
+        raw["text_config"]["quantization_config"] = {"quant_method": "fp8"}
+    else:
+        raw["text_config"].pop("quantization_config", None)
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    (tmp_path / "hf_quant_config.json").write_text(
+        json.dumps(
+            {"producer": {"name": "modelopt"}, "quantization": {"quant_algo": "FP8", "exclude_modules": exclusions}}
+        )
+    )
+    if not nested and not exclusions:
+        with pytest.raises(ValueError, match="does not explicitly exclude both"):
+            get_model_config_from_model_path(str(tmp_path))
+    else:
+        parsed = get_model_config_from_model_path(str(tmp_path))
+        assert parsed["encoder_config"] is not None
+        if nested:
+            assert "quantization_config" not in parsed["raw_config"]
+        else:
+            assert parsed["raw_config"]["quantization_config"]["ignore"] == exclusions
+
+
+def test_mixed_kimi_layout_uses_matching_explicit_sidecar_sizes(tmp_path):
+    raw = deepcopy(get_model_config_from_model_path("moonshotai/Kimi-K2.5")["raw_config"])
+    raw["preprocessor_config"] = {"media_proc_cfg": {"in_patch_limit": 8192}}
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    for name in ("preprocessor_config.json", "video_preprocessor_config.json"):
+        (tmp_path / name).write_text(json.dumps({"size": {"max_height": 16, "max_width": 16}}))
+    encoder = get_model_config_from_model_path(str(tmp_path))["encoder_config"]
+    assert encoder.max_patches_per_side == 16
+    assert encoder.image_max_patches == 8192

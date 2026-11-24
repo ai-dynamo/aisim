@@ -20,24 +20,38 @@ from aisim_core.sdk.fpm_profile import FpmModelProfile, load_fpm_profile
 
 pytestmark = pytest.mark.unit
 
+PROFILE_REVISION = "a" * 40
+
 
 @pytest.fixture
 def checkpoint_configs(monkeypatch):
+    from aisim_core.sdk.models.helpers import _get_model_info
+
     fpm_profile._load_pinned_checkpoint_config.cache_clear()
+    _get_model_info.cache_clear()
+    utils.get_model_config_from_model_path.cache_clear()
+    utils._load_model_config_from_model_path.cache_clear()
     configs = {
         "test/unknown-decoder": {"architectures": ["UnregisteredDecoderForCausalLM"]},
-        "nvidia/GLM-5.2-NVFP4": {"architectures": ["GlmMoeDsaForCausalLM"]},
-        "MiniMaxAI/MiniMax-M2.7": {"architectures": ["MiniMaxM2ForCausalLM"]},
+        # Reuse bundled metadata as synthetic pinned Hub responses. Both
+        # eligibility and real graph compilation must consume these bytes.
+        "nvidia/GLM-5.2-NVFP4": utils._load_pre_downloaded_hf_config("nvidia/GLM-5.2-NVFP4"),
+        "MiniMaxAI/MiniMax-M2.7": utils._load_pre_downloaded_hf_config("MiniMaxAI/MiniMax-M2.7"),
     }
 
-    def download(model, filename, *, revision):
-        assert filename == "config.json"
-        assert revision == "profile-test-fixture-v1"
-        return copy.deepcopy(configs[model])
+    def download(model, filename, *, revision, raise_on_404=True):
+        assert revision == PROFILE_REVISION
+        if filename == "config.json":
+            return copy.deepcopy(configs[model])
+        assert filename == "hf_quant_config.json"
+        return None
 
     monkeypatch.setattr(utils, "_download_hf_json", download)
     yield configs
     fpm_profile._load_pinned_checkpoint_config.cache_clear()
+    _get_model_info.cache_clear()
+    utils.get_model_config_from_model_path.cache_clear()
+    utils._load_model_config_from_model_path.cache_clear()
 
 
 @pytest.fixture
@@ -45,7 +59,7 @@ def profile_dict(checkpoint_configs):
     return {
         "schema_version": 1,
         "model": "test/unknown-decoder",
-        "model_revision": "profile-test-fixture-v1",
+        "model_revision": PROFILE_REVISION,
         "architecture": "UnregisteredDecoderForCausalLM",
         "context_length": 4096,
         "num_experts": 64,
@@ -213,6 +227,151 @@ def test_profile_architecture_matches_collector_text_config_view(profile_dict, c
         "text_config": {"architectures": [profile_dict["architecture"]]},
     }
     assert _normalize(_request(profile_dict))["estimator_config"]["fpm_interpolation"]["method"] == "direct"
+
+
+@pytest.mark.parametrize("text_only", [None, False, True])
+@pytest.mark.parametrize("state_dtype", ["float32", "auto", "bfloat16", None])
+@pytest.mark.parametrize(
+    "wrapper, text_method",
+    [
+        ("KimiK25ForConditionalGeneration", "direct"),
+        ("KimiK3ForConditionalGeneration", "direct"),
+        ("KimiK31ForConditionalGeneration", "sol"),
+    ],
+)
+def test_kimi_wrapper_sol_requires_supported_graph_and_explicit_text_scope(
+    profile_dict, checkpoint_configs, text_only, text_method, wrapper, state_dtype
+):
+    profile_dict["architecture"] = "KimiLinearForCausalLM"
+    checkpoint_configs[profile_dict["model"]] = {
+        "architectures": [wrapper, "OtherModel"],
+        "text_config": {"architectures": [profile_dict["architecture"]]},
+    }
+    if state_dtype is not None:
+        resources = profile_dict["deployments"][0]["resources"]
+        for key in ("weights_bytes", "activations_bytes", "runtime_overhead_bytes", "comm_overhead_bytes"):
+            resources.pop(key)
+        resources["runtime_memory"] = {
+            "kv_cache_bytes": 1024,
+            "gpu_memory_utilization": 0.8,
+            "max_model_len": 4096,
+            "provenance": json.dumps(
+                {
+                    "runtime": json.loads(
+                        (
+                            Path(__file__).parents[3] / "collector/fpm_forward/runtime/vllm-kimi-k31.example.json"
+                        ).read_text()
+                    )["runtime"],
+                    "runtime_settings": {
+                        "cache_config": {"mamba_cache_dtype": "bfloat16", "mamba_ssm_cache_dtype": state_dtype}
+                    },
+                }
+            ),
+        }
+    request = _request(profile_dict)
+    if text_only is not None:
+        request["estimator_config"]["fpm_interpolation"]["text_only"] = text_only
+    expected = text_method if text_only is True else "direct"
+    if wrapper == "KimiK31ForConditionalGeneration" and state_dtype not in {"float32", "auto"}:
+        expected = "direct"
+    assert _normalize(request)["estimator_config"]["fpm_interpolation"]["method"] == expected
+
+
+@pytest.mark.parametrize(
+    "wrapper,decoder",
+    [
+        ("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"),
+        ("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"),
+    ],
+)
+@pytest.mark.parametrize("wrapper_profile", [False, True])
+def test_text_only_qwen35_rejects_sol_before_graph_construction(
+    profile_dict, checkpoint_configs, monkeypatch, wrapper, decoder, wrapper_profile
+):
+    profile_dict["architecture"] = wrapper if wrapper_profile else decoder
+    checkpoint_configs[profile_dict["model"]] = {
+        "architectures": [wrapper],
+        "text_config": {"num_hidden_layers": 6} if wrapper_profile else {"architectures": [decoder]},
+    }
+    monkeypatch.setattr(engine, "compile_engine", _fail_graph)
+    request = _request(profile_dict)
+    controls = request["estimator_config"]["fpm_interpolation"]
+    controls["text_only"] = True
+    for method in ("auto", "direct"):
+        controls["method"] = method
+        assert _normalize(request)["estimator_config"]["fpm_interpolation"]["method"] == "direct"
+    controls["method"] = "sol"
+    for entry_point in (RustForwardPassPerfModel.normalize_config, RustForwardPassPerfModel.best_available):
+        with pytest.raises(ValueError, match="SOL interpolation requires a registered analytical model class"):
+            entry_point(request)
+
+
+@pytest.mark.parametrize("wrapper_profile", [False, True])
+@pytest.mark.parametrize("moe", [False, True])
+def test_text_only_qwen35_queries_unmeasured_point_with_direct_interpolation(
+    profile_dict, checkpoint_configs, monkeypatch, tmp_path, wrapper_profile, moe
+):
+    stem = "Qwen3_5Moe" if moe else "Qwen3_5"
+    profile_dict["architecture"] = stem + ("ForConditionalGeneration" if wrapper_profile else "ForCausalLM")
+    profile_dict["deployments"][0]["system"] = "h200_sxm"
+    checkpoint_configs[profile_dict["model"]] = {
+        "architectures": [stem + "ForConditionalGeneration"],
+        "text_config": {"num_hidden_layers": 6}
+        if wrapper_profile
+        else {"architectures": [profile_dict["architecture"]]},
+    }
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
+    monkeypatch.setattr(engine, "get_model", _fail_graph)
+    parquet = _write_external_profile_pair(profile_dict, tmp_path)
+    request = _request(profile_dict)
+    request["estimator_config"]["fpm_interpolation"].update(text_only=True, fpm_parquet_path=str(parquet))
+    model = RustForwardPassPerfModel.best_available(request)
+    try:
+        resolved = model.diagnostics()["provenance"]["config"]
+        assert resolved["estimator_config"]["fpm_interpolation"]["method"] == "direct"
+        assert _normalize(resolved) == resolved
+        # The synthetic decode anchors at KV=1 and KV=64 are both 3 ms;
+        # KV=32 must interpolate without trying the unsupported GDN SOL path.
+        assert model.estimate_forward_pass_time_ms(
+            [{"scheduled_requests": {"num_decode_requests": 1, "sum_decode_kv_tokens": 32}}]
+        ) == pytest.approx(3.0)
+    finally:
+        model.close()
+
+
+def test_text_only_kimi25_uses_direct_at_unmeasured_batch_and_rejects_sol(
+    profile_dict, checkpoint_configs, monkeypatch, tmp_path
+):
+    profile_dict["architecture"] = "DeepseekV3ForCausalLM"
+    profile_dict["deployments"][0]["system"] = "h200_sxm"
+    checkpoint_configs[profile_dict["model"]] = {
+        "architectures": ["KimiK25ForConditionalGeneration"],
+        "text_config": {"architectures": [profile_dict["architecture"]]},
+    }
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
+    monkeypatch.setattr(engine, "get_model", _fail_graph)
+    parquet = _write_external_profile_pair(
+        profile_dict,
+        tmp_path,
+        decode_points=[(1, 4, 3.0), (1, 64, 3.0), (4, 4, 6.0), (4, 256, 6.0)],
+    )
+    request = _request(profile_dict)
+    controls = request["estimator_config"]["fpm_interpolation"]
+    controls.update(text_only=True, fpm_parquet_path=str(parquet))
+    model = RustForwardPassPerfModel.best_available(request)
+    try:
+        resolved = model.diagnostics()["provenance"]["config"]
+        assert resolved["estimator_config"]["fpm_interpolation"]["method"] == "direct"
+        # Batch 2 is unmeasured; interpolate the synthetic 3/6 ms batch 1/4 curves.
+        assert model.estimate_forward_pass_time_ms(
+            [{"scheduled_requests": {"num_decode_requests": 2, "sum_decode_kv_tokens": 32}}]
+        ) == pytest.approx(4.0)
+    finally:
+        model.close()
+    controls["method"] = "sol"
+    for entry_point in (RustForwardPassPerfModel.normalize_config, RustForwardPassPerfModel.best_available):
+        with pytest.raises(ValueError, match="SOL interpolation requires a registered analytical model class"):
+            entry_point(request)
 
 
 @pytest.mark.parametrize("wrapper", ["NemotronH_Omni_Reasoning_V3", "InternVLChatModel"])
@@ -661,7 +820,8 @@ def test_registered_build_failure_is_not_direct_fallback(profile_dict, monkeypat
     monkeypatch.setattr(engine, "_literal_backend_version", lambda _s, _b, version, *_args: version)
     observed = []
 
-    def broken_model(_path, config, _backend):
+    def broken_model(_path, config, _backend, *, model_revision):
+        assert model_revision == profile_dict["model_revision"]
         observed.append(config.fmha_quant_mode.name)
         raise RuntimeError("registered model has an unrelated implementation error")
 
@@ -1915,7 +2075,7 @@ def test_saved_profile_compiler_controls_merge_with_caller_options(native_profil
     assert controls["features"]["attention_kv_weight"] == 7
 
 
-def _write_external_profile_pair(profile, directory, *, prefill_points=None):
+def _write_external_profile_pair(profile, directory, *, prefill_points=None, decode_points=None):
     """Generate routing/identity evidence; these synthetic rows are not silicon data."""
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -1925,21 +2085,23 @@ def _write_external_profile_pair(profile, directory, *, prefill_points=None):
     rows = [
         {
             **identity,
-            "cell_id": f"synthetic-{phase}-{kv}",
+            "cell_id": f"synthetic-{phase}-{batch}-{kv}",
             "model_path": profile["model"],
             "weight_quantization": "synthetic",
             "workload_kind": phase,
             "partition_policy": "balanced_v1",
-            "batch_size": 1,
+            "batch_size": batch,
             "total_prefill_tokens": tokens,
             "total_kv_read_tokens": kv,
             "latency_ms": latency,
             "kv_seed_regime": "real_kv",
         }
-        for phase, tokens, kv, latency in [
-            *[("prefill", *point) for point in (prefill_points or [(1, 0, 2.0)])],
-            ("decode", 0, 1, 3.0),
-            ("decode", 0, 64, 3.0),
+        for phase, batch, tokens, kv, latency in [
+            *[("prefill", 1, *point) for point in (prefill_points or [(1, 0, 2.0)])],
+            *[
+                ("decode", batch, 0, kv, latency)
+                for batch, kv, latency in (decode_points or [(1, 1, 3.0), (1, 64, 3.0)])
+            ],
         ]
     ]
     path = directory / "synthetic-profile.parquet"
@@ -2236,8 +2398,9 @@ def test_registered_glm_auto_retains_sol_with_explicit_fp8_fmha(profile_dict, mo
     real_get_model = engine.get_model
     built_models = []
 
-    def record_model(*args):
-        model = real_get_model(*args)
+    def record_model(*args, **kwargs):
+        assert kwargs["model_revision"] == profile_dict["model_revision"]
+        model = real_get_model(*args, **kwargs)
         built_models.append(model)
         return model
 
@@ -2692,7 +2855,14 @@ def test_registered_profile_outer_auto_keeps_op_level_priority_with_inner_direct
     assert provenance["config"]["estimator_config"]["fpm_interpolation"]["method"] == "direct"
 
 
-@pytest.mark.parametrize("options", [{"text_only": True}, {"unrecorded_quant_modes": ["fmha"]}])
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"unrecorded_quant_modes": ["fmha"]},
+        {"unrecorded_quant_modes": ["comm"]},
+        {"text_only": True, "unrecorded_quant_modes": ["fmha"]},
+    ],
+)
 def test_profile_rejects_unsupported_fpm_options_at_canonical_and_compile_boundaries(profile_dict, options):
     config = _request(profile_dict, "direct")
     config["estimator_config"] = {"fpm_interpolation": {"method": "direct", **options}}
@@ -2742,3 +2912,270 @@ def test_profile_memory_wire_attention_identity(profile_dict, native_profile_con
             assert wire["extra"]["attention_backend"] == profile_backend
         modes = _quantization_from_engine_config(json.dumps(wire))
         assert modes["kvcache_quant_mode"] == profile_dict["deployments"][0]["kv_cache_dtype"]
+
+
+@pytest.mark.parametrize("architecture", ["NemotronHForCausalLM", "NemotronH_Omni_Reasoning_V3"])
+@pytest.mark.parametrize("text_only", [False, True])
+def test_nemotron_mamba_graph_uses_direct_interpolation_and_rejects_sol(
+    profile_dict, checkpoint_configs, monkeypatch, tmp_path, architecture, text_only
+):
+    profile_dict["architecture"] = architecture
+    profile_dict["deployments"][0]["system"] = "h200_sxm"
+    checkpoint_configs[profile_dict["model"]] = {"architectures": [architecture]}
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
+    monkeypatch.setattr(engine, "get_model", _fail_graph)
+    parquet = _write_external_profile_pair(profile_dict, tmp_path)
+    request = _request(profile_dict)
+    controls = request["estimator_config"]["fpm_interpolation"]
+    controls.update(text_only=text_only, fpm_parquet_path=str(parquet))
+    model = RustForwardPassPerfModel.best_available(request)
+    try:
+        resolved = model.diagnostics()["provenance"]["config"]
+        assert resolved["estimator_config"]["fpm_interpolation"]["method"] == "direct"
+        assert model.estimate_forward_pass_time_ms(
+            [{"scheduled_requests": {"num_decode_requests": 1, "sum_decode_kv_tokens": 32}}]
+        ) == pytest.approx(3.0)
+    finally:
+        model.close()
+    controls["method"] = "sol"
+    for entry_point in (RustForwardPassPerfModel.normalize_config, RustForwardPassPerfModel.best_available):
+        with pytest.raises(ValueError, match="SOL interpolation requires a registered analytical model class"):
+            entry_point(request)
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForCausalLM",
+        "NemotronHForCausalLM",
+        "KimiK25ForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
+    ],
+)
+@pytest.mark.parametrize("mode", ["op_level", "auto"])
+def test_registered_profile_without_sol_keeps_op_level_candidate(
+    profile_dict, checkpoint_configs, monkeypatch, architecture, mode
+):
+    profile_dict["architecture"] = architecture
+    checkpoint_configs[profile_dict["model"]] = {"architectures": [architecture]}
+    attempts = []
+
+    def unavailable(*args, **kwargs):
+        attempts.append(kwargs["forward_model"])
+        raise RuntimeError("synthetic op database unavailable after compilation was selected")
+
+    monkeypatch.setattr(engine, "compile_engine", unavailable)
+    request = _request(profile_dict, estimation_mode=mode, fallback_policy="deny")
+    resolved = _normalize(request)
+    assert resolved["estimator_config"]["fpm_interpolation"]["method"] == "direct"
+    if mode == "op_level":
+        with pytest.raises(ValueError, match="synthetic op database unavailable"):
+            RustForwardPassPerfModel.best_available(request)
+        assert attempts == ["op_level"]
+    else:
+        model = RustForwardPassPerfModel.best_available(request)
+        assert attempts == ["op_level", "fpm"]
+        assert model.diagnostics()["provenance"]["selected_estimation_mode"] == "fpm_regression"
+        model.close()
+    request["estimator_config"]["fpm_interpolation"]["method"] = "sol"
+    resolved = _normalize(request)
+    assert resolved["estimator_config"]["fpm_interpolation"]["method"] == "sol"
+    assert _normalize(json.loads(json.dumps(resolved))) == resolved
+    attempts.clear()
+    message = "synthetic op database unavailable" if mode == "op_level" else "SOL interpolation requires"
+    with pytest.raises(ValueError, match=message):
+        RustForwardPassPerfModel.best_available(request)
+    assert attempts == ["op_level"]
+    request["estimation_mode"] = "fpm_interpolation"
+    with pytest.raises(ValueError, match="SOL interpolation requires"):
+        _normalize(request)
+
+
+@pytest.mark.parametrize(
+    "recorded,expected", [(["auto", "float32"], "float32"), (["float32", "bfloat16"], None), (["float32", None], None)]
+)
+@pytest.mark.parametrize("kind", ["collection", "finalized"])
+def test_kda_effective_recurrent_dtype_requires_unanimous_evidence(profile_dict, recorded, expected, kind):
+    resources = profile_dict["deployments"][0]["resources"]
+    for key in ("weights_bytes", "activations_bytes", "runtime_overhead_bytes", "comm_overhead_bytes"):
+        resources.pop(key)
+    runtime = json.loads(
+        (Path(__file__).parents[3] / "collector/fpm_forward/runtime/vllm-kimi-k31.example.json").read_text()
+    )["runtime"]
+    evidence = [
+        {"runtime": runtime, "runtime_settings": {"cache_config": {"mamba_ssm_cache_dtype": dtype}}}
+        for dtype in recorded
+    ]
+    if kind == "collection":
+        provenance = {
+            "source": "bound_collection_phases",
+            "phases": dict(zip(("prefill", "decode"), evidence, strict=True)),
+        }
+    else:
+        provenance = {"cell_observations": [{"runtime_memory": {"provenance": json.dumps(item)}} for item in evidence]}
+    resources["runtime_memory"] = {
+        "kv_cache_bytes": 1024,
+        "gpu_memory_utilization": 0.8,
+        "max_model_len": 4096,
+        "provenance": json.dumps(provenance),
+    }
+    deployment = load_fpm_profile(profile_dict).deployments[0]
+    assert fpm_profile._fpm_kda_state_dtype(deployment) == expected
+
+
+@pytest.mark.parametrize("identity", ["audited", "absent", "version", "source_revision", "source_files"])
+def test_kda_auto_state_requires_runtime_identity_not_profile_version(profile_dict, checkpoint_configs, identity):
+    from collector.fpm_forward.runtime_k31 import VERSION
+
+    profile_dict["architecture"] = "KimiK31ForConditionalGeneration"
+    checkpoint_configs[profile_dict["model"]] = {"architectures": [profile_dict["architecture"]]}
+    deployment = profile_dict["deployments"][0]
+    deployment["backend_version"] = VERSION
+    resources = deployment["resources"]
+    for key in ("weights_bytes", "activations_bytes", "runtime_overhead_bytes", "comm_overhead_bytes"):
+        resources.pop(key)
+    runtime = json.loads(
+        (Path(__file__).parents[3] / "collector/fpm_forward/runtime/vllm-kimi-k31.example.json").read_text()
+    )["runtime"]
+    if identity == "version":
+        runtime["version"] = "0.0.0+unaudited"
+    elif identity == "source_revision":
+        runtime["source_revision"] = "0" * 64
+    elif identity == "source_files":
+        runtime["source_files"]["vllm/model_executor/models/config.py"] = "0" * 64
+    evidence = {
+        "runtime_settings": {"cache_config": {"mamba_cache_dtype": "bfloat16", "mamba_ssm_cache_dtype": "auto"}}
+    }
+    if identity != "absent":
+        evidence["runtime"] = runtime
+    resources["runtime_memory"] = {
+        "kv_cache_bytes": 1024,
+        "gpu_memory_utilization": 0.8,
+        "max_model_len": 4096,
+        "provenance": json.dumps(evidence),
+    }
+    request = _request(profile_dict)
+    request["backend_version"] = VERSION
+    facts = json.loads(fpm_profile._validate_forward_pass_profile(json.dumps({**request, "pp": 1})))
+    assert facts["supports_sol"] is (identity == "audited")
+    assert facts["supports_sol_state"] is (identity == "audited")
+    assert _normalize(request)["estimator_config"]["fpm_interpolation"]["method"] == (
+        "sol" if identity == "audited" else "direct"
+    )
+
+
+@pytest.mark.parametrize("mode", ["op_level", "auto", "fpm_interpolation"])
+def test_explicit_sol_with_unsupported_convolution_only_restricts_fpm(
+    profile_dict, checkpoint_configs, monkeypatch, mode
+):
+    profile_dict["architecture"] = "KimiK31ForConditionalGeneration"
+    checkpoint_configs[profile_dict["model"]] = {"architectures": [profile_dict["architecture"]]}
+    resources = profile_dict["deployments"][0]["resources"]
+    for key in ("weights_bytes", "activations_bytes", "runtime_overhead_bytes", "comm_overhead_bytes"):
+        resources.pop(key)
+    resources["runtime_memory"] = {
+        "kv_cache_bytes": 1024,
+        "gpu_memory_utilization": 0.8,
+        "max_model_len": 4096,
+        "provenance": json.dumps(
+            {"runtime_settings": {"cache_config": {"mamba_cache_dtype": "float32", "mamba_ssm_cache_dtype": "float32"}}}
+        ),
+    }
+    request = _request(profile_dict, "sol", estimation_mode=mode)
+    if mode == "fpm_interpolation":
+        with pytest.raises(ValueError, match="K3.1 SOL does not support FP32 convolution state"):
+            _normalize(request)
+        return
+    resolved = _normalize(request)
+    assert resolved["estimator_config"]["fpm_interpolation"]["method"] == "sol"
+    assert _normalize(json.loads(json.dumps(resolved))) == resolved
+    attempts = []
+
+    def unavailable(*args, **kwargs):
+        attempts.append(kwargs["forward_model"])
+        raise RuntimeError("synthetic op database unavailable")
+
+    monkeypatch.setattr(engine, "compile_engine", unavailable)
+    message = "synthetic op database unavailable" if mode == "op_level" else "FP32 convolution state"
+    with pytest.raises(ValueError, match=message):
+        RustForwardPassPerfModel.best_available(request)
+    assert attempts == ["op_level"]
+
+
+def test_op_level_sol_database_does_not_validate_unused_auto_direct(profile_dict, checkpoint_configs, monkeypatch):
+    profile_dict["architecture"] = "Qwen3_5MoeForCausalLM"
+    checkpoint_configs[profile_dict["model"]] = {"architectures": [profile_dict["architecture"]]}
+    attempts = []
+
+    def unavailable(*args, **kwargs):
+        attempts.append(kwargs["forward_model"])
+        raise RuntimeError("synthetic op-level compiler reached")
+
+    monkeypatch.setattr(engine, "compile_engine", unavailable)
+    request = _request(profile_dict, estimation_mode="op_level", fallback_policy="deny", database_mode="SOL")
+    resolved = _normalize(request)
+    assert resolved["estimator_config"]["fpm_interpolation"]["method"] == "direct"
+    assert _normalize(resolved) == resolved
+    with pytest.raises(ValueError, match="synthetic op-level compiler reached"):
+        RustForwardPassPerfModel.best_available(request)
+    assert attempts == ["op_level"]
+    with pytest.raises(ValueError, match="synthetic op-level compiler reached"):
+        RustForwardPassPerfModel.best_available(resolved)
+    assert attempts == ["op_level", "op_level"]
+    request["estimation_mode"] = "fpm_interpolation"
+    for method in ("auto", "direct"):
+        request["estimator_config"]["fpm_interpolation"]["method"] = method
+        with pytest.raises(ValueError, match="direct FPM interpolation requires database_mode='SILICON'"):
+            _normalize(request)
+
+
+def test_auto_direct_invalid_database_does_not_fall_back_to_regression(profile_dict):
+    # An unregistered architecture skips op-level. Auto must propagate the
+    # direct candidate's configuration error instead of returning regression.
+    request = _request(profile_dict, database_mode="SOL", estimation_mode="auto")
+    with pytest.raises(ValueError, match="direct FPM interpolation requires database_mode='SILICON'"):
+        RustForwardPassPerfModel.best_available(request)
+
+
+def test_profile_alias_is_resolved_once_and_persisted_before_eligibility(profile_dict, checkpoint_configs, monkeypatch):
+    import io
+
+    profile_dict["model_revision"] = "release-candidate"
+    commits = iter(["a" * 40, "b" * 40])
+    resolutions = []
+    reads = []
+
+    def hub_info(request, **kwargs):
+        resolutions.append(request.full_url)
+        return io.BytesIO(json.dumps({"sha": next(commits)}).encode())
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", hub_info)
+
+    def download(model, filename, *, revision, raise_on_404=True):
+        reads.append((filename, revision))
+        return copy.deepcopy(checkpoint_configs[model]) if filename == "config.json" else None
+
+    monkeypatch.setattr(utils, "_download_hf_json", download)
+    resolved = _normalize(_request(profile_dict))
+    assert resolved["fpm_profile"]["model_revision"] == "a" * 40
+    assert _normalize(resolved) == resolved
+    utils._load_model_config_from_model_path(
+        profile_dict["model"], model_revision=resolved["fpm_profile"]["model_revision"]
+    )
+    assert len(resolutions) == 1
+    assert resolutions[0].endswith("/revision/release-candidate")
+    # A fresh request observes an advancing alias; it cannot reuse commit A's
+    # cached eligibility metadata under the alias with B's sidecars.
+    second = _normalize(_request(profile_dict))
+    assert second["fpm_profile"]["model_revision"] == "b" * 40
+    utils._load_model_config_from_model_path(
+        profile_dict["model"], model_revision=second["fpm_profile"]["model_revision"]
+    )
+    assert len(resolutions) == 2
+    assert reads == [
+        ("config.json", "a" * 40),
+        ("hf_quant_config.json", "a" * 40),
+        ("config.json", "b" * 40),
+        ("hf_quant_config.json", "b" * 40),
+    ]

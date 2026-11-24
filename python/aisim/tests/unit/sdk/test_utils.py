@@ -2372,3 +2372,226 @@ def test_combined_ignore_patterns_preserve_expert_bank_exclusion(pattern):
     from aisim_core.sdk.utils import _categorize_ignore_pattern
 
     assert "routing_experts" in _categorize_ignore_pattern(pattern)
+
+
+@pytest.mark.parametrize(
+    "sidecar,bounds",
+    [
+        (None, (131072, 1048576)),
+        ({"min_pixels": 3136, "max_pixels": 1003520}, (3136, 1003520)),
+        ({"size": {"shortest_edge": 3136, "longest_edge": 1003520}}, (3136, 1003520)),
+    ],
+)
+def test_pinned_hub_processor_sidecar_and_inline_fallback(monkeypatch, sidecar, bounds):
+    from copy import deepcopy
+
+    from aisim_core.sdk import fpm_profile
+
+    model, revision = "test/pinned-qwen-vl", "c" * 40
+    raw = deepcopy(_QWEN3VL_HF_CONFIG)
+    raw["preprocessor_config"] = {"min_pixels": 131072, "max_pixels": 1048576}
+    reads = []
+
+    def download(hf_id, filename, *, revision, raise_on_404=True):
+        assert hf_id == model and revision == "c" * 40
+        reads.append(filename)
+        if filename == "config.json":
+            return deepcopy(raw)
+        if filename == "preprocessor_config.json":
+            assert not raise_on_404
+            return deepcopy(sidecar)  # None is the downloader's HTTP-404 result.
+        assert filename == "hf_quant_config.json"
+        return None
+
+    fpm_profile._load_pinned_checkpoint_config.cache_clear()
+    utils._load_model_config_from_model_path.cache_clear()
+    utils.get_model_config_from_model_path.cache_clear()
+    monkeypatch.setattr(utils, "_download_hf_json", download)
+    parsed = utils.get_model_config_from_model_path(model, model_revision=revision)
+    assert (parsed["extra_params"].min_pixels, parsed["extra_params"].max_pixels) == (
+        bounds[0],
+        bounds[1],
+    )
+    assert reads == ["config.json", "hf_quant_config.json", "preprocessor_config.json"]
+
+
+@pytest.mark.parametrize("sidecar", [{"shortest_edge": 3136}, {"shortest_edge": 3136, "longest_edge": 1003520}])
+def test_qwen_processor_sidecar_preserves_unspecified_inline_size_endpoint(tmp_path, sidecar):
+    raw = {**_QWEN3VL_HF_CONFIG, "preprocessor_config": {"size": {"shortest_edge": 131072, "longest_edge": 1048576}}}
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    (tmp_path / "preprocessor_config.json").write_text(json.dumps({"size": sidecar}))
+    parsed = get_model_config_from_model_path(str(tmp_path))["extra_params"]
+    assert (parsed.min_pixels, parsed.max_pixels) == (3136, sidecar.get("longest_edge", 1048576))
+
+
+def test_local_checkpoint_tilde_reads_config_and_processor(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(json.dumps(_QWEN3VL_HF_CONFIG))
+    (checkpoint / "preprocessor_config.json").write_text(json.dumps({"min_pixels": 3136, "max_pixels": 1003520}))
+    monkeypatch.setattr(utils, "_download_hf_json", lambda *_, **__: pytest.fail("local checkpoint used Hub"))
+    relative = utils.get_model_config_from_model_path("~/checkpoint", model_revision="a" * 40)
+    absolute = utils.get_model_config_from_model_path(str(checkpoint), model_revision="a" * 40)
+    assert relative == absolute
+    assert (relative["extra_params"].min_pixels, relative["extra_params"].max_pixels) == (3136, 1003520)
+
+
+@pytest.mark.parametrize("model_info", [False, True])
+def test_moving_hub_alias_resolves_before_metadata_caches(monkeypatch, model_info):
+    from copy import deepcopy
+
+    from aisim_core.sdk import fpm_profile
+    from aisim_core.sdk.models import helpers
+
+    commits = iter(["a" * 40, "b" * 40])
+
+    def resolve(model, revision):
+        return next(commits) if revision == "release-candidate" else revision
+
+    def download(model, filename, *, revision, **kwargs):
+        if filename != "config.json":
+            return None
+        raw = deepcopy(_QWEN3VL_HF_CONFIG)
+        raw["text_config"]["hidden_size"] = 4096 if revision == "a" * 40 else 8192
+        raw["vision_config"]["out_hidden_size"] = raw["text_config"]["hidden_size"]
+        return raw
+
+    monkeypatch.setattr(utils, "_revision_for_resolved_source", resolve)
+    monkeypatch.setattr(helpers, "_revision_for_resolved_source", resolve)
+    monkeypatch.setattr(utils, "_download_hf_json", download)
+    utils.get_model_config_from_model_path.cache_clear()
+    utils._load_model_config_from_model_path.cache_clear()
+    helpers._get_model_info.cache_clear()
+    fpm_profile._load_pinned_checkpoint_config.cache_clear()
+    load = helpers._get_model_info if model_info else utils.get_model_config_from_model_path
+    first = load("test/moving-qwen", model_revision="release-candidate")
+    second = load("test/moving-qwen", model_revision="release-candidate")
+    pinned = load("test/moving-qwen", model_revision="a" * 40)
+    assert first["hidden_size"] == pinned["hidden_size"] == 4096
+    assert second["hidden_size"] == 8192
+
+
+@pytest.mark.parametrize("metadata", [[], [["sha", "a" * 40]], None, "revision", 5])
+def test_hub_revision_rejects_non_object_metadata(monkeypatch, metadata):
+    monkeypatch.setattr(utils.urllib.request, "urlopen", lambda *_, **__: io.BytesIO(json.dumps(metadata).encode()))
+    with pytest.raises(utils.HuggingFaceDownloadError, match="immutable checkpoint revision"):
+        utils._resolve_hf_revision("synthetic/non-object-revision", "main")
+
+
+@pytest.mark.parametrize("payload", [[], [["architectures", ["LlamaForCausalLM"]]], None])
+def test_pinned_config_requires_json_object(monkeypatch, payload):
+    from aisim_core.sdk import fpm_profile
+
+    monkeypatch.setattr(fpm_profile, "_load_pinned_checkpoint_config", lambda *_: payload)
+    utils._load_model_config_from_model_path.cache_clear()
+    with pytest.raises(ValueError, match="config.json must be an object"):
+        utils.get_model_config_from_model_path("synthetic/non-object-config", model_revision="a" * 40)
+
+
+@pytest.mark.parametrize("model_info", [False, True])
+def test_local_to_hub_source_switch_does_not_reuse_cached_geometry(tmp_path, monkeypatch, model_info):
+    from copy import deepcopy
+
+    from aisim_core.sdk.models import helpers
+
+    monkeypatch.chdir(tmp_path)
+    checkpoint = tmp_path / "org/model"
+    checkpoint.mkdir(parents=True)
+    raw = deepcopy(_QWEN3VL_HF_CONFIG)
+    (checkpoint / "config.json").write_text(json.dumps(raw))
+    load = helpers._get_model_info if model_info else utils.get_model_config_from_model_path
+    before = load("org/model", model_revision="b" * 40)
+    (checkpoint / "config.json").unlink()
+    checkpoint.rmdir()
+    raw["text_config"]["num_hidden_layers"] += 7
+    monkeypatch.setattr(
+        utils, "_download_hf_json", lambda _, filename, **__: deepcopy(raw) if filename == "config.json" else None
+    )
+    after = load("org/model", model_revision="b" * 40)
+    assert after["layers"] == before["layers"] + 7
+
+
+def test_qwen_partial_sidecar_cannot_invert_pixel_budget(tmp_path):
+    raw = {**_QWEN3VL_HF_CONFIG, "preprocessor_config": {"size": {"shortest_edge": 131072, "longest_edge": 1048576}}}
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    (tmp_path / "preprocessor_config.json").write_text(json.dumps({"size": {"shortest_edge": 2097152}}))
+    with pytest.raises(ValueError, match="min_pixels <= max_pixels"):
+        get_model_config_from_model_path(str(tmp_path))
+
+
+@pytest.mark.parametrize("spelling", ["quant_algo", "quantization_algo"])
+@pytest.mark.parametrize("exclusions", [False, True])
+def test_modelopt_sidecar_algorithm_survives_framework_override(tmp_path, spelling, exclusions):
+    raw = dict(_QWEN3VL_HF_CONFIG)
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    quant = {spelling: "NVFP4"}
+    if exclusions:
+        quant["exclude_modules"] = ["lm_head"]
+    (tmp_path / "hf_quant_config.json").write_text(
+        json.dumps({"quantization": quant, "producer": {"name": "modelopt"}})
+    )
+    parsed = get_model_config_from_model_path(str(tmp_path))
+    assert parsed["raw_config"]["quant_algo"] == "nvfp4"
+    from aisim_core.sdk.models import _infer_quant_modes_from_raw_config
+
+    assert _infer_quant_modes_from_raw_config(parsed["raw_config"])["gemm_quant_mode"] == common.GEMMQuantMode.nvfp4
+    if exclusions:
+        assert parsed["raw_config"]["quantization_config"]["quant_method"] == "modelopt"
+
+
+@pytest.mark.parametrize("source", ["~/missing-checkpoint", "./missing-checkpoint", "../missing-checkpoint"])
+def test_missing_explicit_checkpoint_never_uses_hub(tmp_path, monkeypatch, source):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(utils, "_download_hf_json", lambda *a, **kw: pytest.fail("local path reached Hub"))
+    monkeypatch.setattr(utils, "_download_hf_config", lambda *a, **kw: pytest.fail("local path reached Hub"))
+    with pytest.raises(ValueError, match="config.json not found at"):
+        get_model_config_from_model_path(source, model_revision="a" * 40)
+
+
+def test_pinned_processor_ignores_local_directory_created_during_download(tmp_path, monkeypatch):
+    from copy import deepcopy
+
+    from aisim_core.sdk import fpm_profile
+
+    monkeypatch.chdir(tmp_path)
+    source = "synthetic/racing-qwen"
+    revision = "c" * 40
+    raw = deepcopy(_QWEN3VL_HF_CONFIG)
+
+    def load(model, commit):
+        assert (model, commit) == (source, revision)
+        directory = tmp_path / source
+        directory.mkdir(parents=True)
+        (directory / "preprocessor_config.json").write_text("[]")
+        return raw
+
+    monkeypatch.setattr(fpm_profile, "_load_pinned_checkpoint_config", load)
+    monkeypatch.setattr(utils, "_download_hf_json", lambda *args, **kwargs: None)
+    parsed = utils.get_model_config_from_model_path(source, model_revision=revision)
+    parsed["raw_config"]["text_config"]["hidden_size"] = -1
+    assert raw["text_config"]["hidden_size"] == _QWEN3VL_HF_CONFIG["text_config"]["hidden_size"]
+
+
+@pytest.mark.parametrize("inline", [[], None, ""])
+def test_qwen_rejects_invalid_inline_processor(tmp_path, inline):
+    raw = {**_QWEN3VL_HF_CONFIG, "preprocessor_config": inline}
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="preprocessor_config must be an object"):
+        utils.get_model_config_from_model_path(str(tmp_path))
+
+
+@pytest.mark.parametrize("producer", [None, {"name": "other"}])
+def test_quant_exclusions_require_modelopt_identity(producer):
+    sidecar = {"quantization": {"quant_algo": "NVFP4", "exclude_modules": ["*"]}, "producer": producer}
+    with pytest.raises(ValueError, match="producer.name=modelopt"):
+        utils._attach_hf_quant_config({}, sidecar)
+
+
+def test_kimi_image_processor_rejects_conflicting_explicit_side_limits():
+    with pytest.raises(ValueError, match="conflicting explicit image side limits"):
+        utils._kimi_processor_limits(
+            {"media_proc_cfg": {"patch_limit_on_one_side": 512}, "size": {"max_height": 16, "max_width": 16}},
+            {"patch_size": 14},
+        )

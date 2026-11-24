@@ -18,6 +18,12 @@ from .test_fpm_profile_collection import no_models_or_timing_data  # noqa: F401
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_models_or_timing_data")]
 
 
+@pytest.fixture(autouse=True)
+def shared_private_delivery_root(tmp_path, monkeypatch):
+    # Synthetic executors see this caller-selected shared-storage stand-in.
+    monkeypatch.setenv("AISIMULATE_PRIVATE_DELIVERY_ROOT", str(tmp_path / "shared-private-delivery"))
+
+
 def _inputs(tmp_path, *, graph_policy="runtime"):
     config = tmp_path / "config.json"
     config.write_text(
@@ -1215,3 +1221,1020 @@ def test_pending_probe_launch_validates_other_facts_before_runtime_resolution(tm
     launch["topology"]["tp"] = 0
     with pytest.raises(ValueError, match="topology.tp"):
         normalize_probe_launch(launch, allow_pending_version=True)
+
+
+def _k31_native_probe_inputs(tmp_path):
+    from collector.fpm_forward import runtime_probe
+
+    from .test_fpm_forward import _kimi_k31_config
+
+    launch, manifest, marker = _inputs(tmp_path)
+    config, _ = _kimi_k31_config(tmp_path)
+    launch["model_config"] = {"path": str(config), "sha256": hashlib.sha256(config.read_bytes()).hexdigest()}
+    launch["worker_type"] = "decode"
+    launch["identity"].update(model="example/k31", framework_version="0.1.dev24216+g266e88c05")
+    launch["topology"].update(tp=8, moe_tp=8, moe_ep=1)
+    launch["precision"].update(
+        moe_quant_mode="w4a8_mxfp4_mxfp8_trtllm", kvcache_quant_mode="fp8", attention_backend="trtllm_mla"
+    )
+    packaged = Path(runtime_probe.__file__).parent / "runtime/vllm-kimi-k31.example.json"
+    document = json.loads(manifest.read_text())
+    document["runtime"] = json.loads(packaged.read_text())["runtime"]
+    manifest.write_text(json.dumps(document))
+    return launch, manifest, marker
+
+
+@pytest.mark.parametrize("worker_type", ["prefill", "decode"])
+@pytest.mark.parametrize("fmha", ["fp8", "half", "bfloat16"])
+def test_k31_probe_rejects_fmha_without_checkpoint_compute_mapping(tmp_path, worker_type, fmha):
+    from collector.fpm_forward import runtime_probe
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+
+    launch, manifest, marker = _k31_native_probe_inputs(tmp_path)
+    launch["worker_type"] = worker_type
+    launch["precision"]["fmha_quant_mode"] = fmha
+    if fmha == "bfloat16":
+        plan = runtime_probe.build_runtime_probe_plan("k31", launch, load_instrumentation(manifest))
+        assert plan.cells[0].fmha_quant_mode == "bfloat16"
+        assert plan.cells[0].kv_cache_dtype == "fp8"
+    else:
+        with pytest.raises(ValueError, match="FMHA precision matching the supported checkpoint compute dtype"):
+            runtime_probe.build_runtime_probe_plan("k31", launch, load_instrumentation(manifest))
+    assert not marker.exists()
+
+
+def test_k31_probe_binds_native_activation_candidate_and_private_decode_state(tmp_path):
+    from collector.fpm_forward import runner, runtime_probe
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+
+    launch, manifest, _ = _k31_native_probe_inputs(tmp_path)
+    plan = runtime_probe.build_runtime_probe_plan("k31-decode", launch, load_instrumentation(manifest))
+    assert plan.capability.architecture == "KimiK31ForConditionalGeneration"
+    assert len(plan.cells) == 1
+    cell = plan.cells[0]
+    assert cell.moe_quant_mode == "w4a8_mxfp4_mxfp8_trtllm"
+    request = runner._cell_generator_overrides(plan, cell, {})
+    args = request["params"]["agg"]["extra_cli_args"]
+    assert args[args.index("--mamba-cache-mode") + 1] == "none"
+    assert args[args.index("--mamba-ssm-cache-dtype") + 1] == "float32"
+    assert args.count("--no-enable-prefix-caching") == 1
+    assert "--language-model-only" in args
+    assert "--trust-remote-code" in args
+    assert json.loads(args[args.index("--attention-config") + 1]) == {
+        "backend": "FLASHINFER_MLA_SPARSE",
+        "indexer_kv_dtype": "fp8",
+    }
+    assert runner._configured_sampling_metadata(plan, cell, smoke=True)["decode_prefix_caching"] == "disabled"
+
+
+def test_probe_deployment_environment_reaches_startup_and_engine(tmp_path):
+    from aisimulate.support.schema import FPMDeployment
+    from collector.fpm_forward import runner, runtime_probe
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+
+    launch, manifest, _ = _inputs(tmp_path)
+    environment = [
+        {"name": "PYTHONPATH", "value": "/runtime/dynamo:/runtime/wheel"},
+        {"name": "PYTHONNOUSERSITE", "value": "1"},
+        {"name": "PYTHONUSERBASE", "value": "/runtime/userbase"},
+        {"name": "HF_HOME", "value": "/runtime/hf"},
+        {"name": "HF_HUB_OFFLINE", "value": "1"},
+        {"name": "TRANSFORMERS_OFFLINE", "value": "1"},
+    ]
+    launch["deployment"] = FPMDeployment(**launch["deployment"], extra_env=environment).model_dump(exclude_none=True)
+    plan = runtime_probe.build_runtime_probe_plan("custom-runtime", launch, load_instrumentation(manifest))
+    overrides = runner._cell_generator_overrides(plan, plan.cells[0], runtime_probe.probe_generator_overrides(launch))
+    assert all(item in overrides["K8sConfig"]["extra_env"] for item in environment)
+    runner._write_runtime_environment(tmp_path, overrides)
+    startup = (tmp_path / runner.RUNTIME_ENV_FILENAME).read_text()
+    for item in environment:
+        assert f"export {item['name']}={item['value']}" in startup
+
+
+@pytest.mark.parametrize("worker_type", ["aggregated", None])
+def test_k31_private_state_probe_requires_an_independent_role(tmp_path, worker_type):
+    from collector.fpm_forward import runtime_probe
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+
+    launch, manifest, _ = _k31_native_probe_inputs(tmp_path)
+    launch["worker_type"] = worker_type
+    with pytest.raises(ValueError, match="independent prefill or decode"):
+        runtime_probe.build_runtime_probe_plan("k31", launch, load_instrumentation(manifest))
+
+
+def test_k31_prefill_probe_preserves_native_sampling_with_prefix_caching_disabled(tmp_path):
+    from collector.fpm_forward import runner, runtime_probe
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+
+    launch, manifest, _ = _k31_native_probe_inputs(tmp_path)
+    launch["worker_type"] = "prefill"
+    plan = runtime_probe.build_runtime_probe_plan("k31-prefill", launch, load_instrumentation(manifest))
+    assert [cell.workload_kind for cell in plan.cells] == ["prefill"]
+    overrides = runner._cell_generator_overrides(plan, plan.cells[0], {})
+    args = overrides["params"]["agg"]["extra_cli_args"]
+    assert args[args.index("--benchmark-mode") + 1] == "prefill"
+    assert args[args.index("--mamba-cache-mode") + 1] == "none"
+    assert args[args.index("--mamba-ssm-cache-dtype") + 1] == "float32"
+    assert args.count("--no-enable-prefix-caching") == 1
+    assert args.count("--no-async-scheduling") == 1
+    assert "--enable-prefix-caching" not in args
+    assert "--benchmark-points-file" not in args
+    for flag in (
+        "--prefill-max-new-token-samples",
+        "--prefill-max-kv-read-token-samples",
+        "--prefix-max-batch-size-samples",
+    ):
+        assert args[args.index(flag) + 1] == "2"
+    environment = {entry["name"]: entry["value"] for entry in overrides["K8sConfig"]["extra_env"]}
+    assert environment["DYN_BENCH_PREFILL_REAL_SEED"] == "on"
+
+
+@pytest.mark.parametrize("worker_type", ["prefill", "decode"])
+@pytest.mark.parametrize("historical_kv", [0, 128])
+def test_k31_explicit_points_require_zero_historical_kv_for_every_prefill(tmp_path, worker_type, historical_kv):
+    from dataclasses import replace
+
+    from collector.fpm_forward import runner, runtime_probe
+    from collector.fpm_forward.config import _freeze_benchmark_points
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+
+    launch, manifest, _ = _k31_native_probe_inputs(tmp_path)
+    launch["worker_type"] = worker_type
+    plan = runtime_probe.build_runtime_probe_plan("k31", launch, load_instrumentation(manifest))
+    points = {
+        "schema_version": 1,
+        "prefill": [
+            {"batch_size": 1, "total_prefill_tokens": 128, "total_kv_read_tokens": 0},
+            {"batch_size": 2, "total_prefill_tokens": 512, "total_kv_read_tokens": historical_kv},
+        ],
+        "decode": [{"batch_size": 1, "total_kv_read_tokens": 128}],
+    }
+    points_path = tmp_path / "points.json"
+    points_path.write_text(json.dumps(points))
+    canonical, digest = _freeze_benchmark_points(str(points_path))
+    plan = replace(
+        plan,
+        options=replace(plan.options, benchmark_points_json=canonical, benchmark_points_sha256=digest),
+    )
+    if historical_kv:
+        with pytest.raises(ValueError, match="total_kv_read_tokens=0 in every explicit point"):
+            runner._cell_generator_overrides(plan, plan.cells[0], {})
+    else:
+        overrides = runner._cell_generator_overrides(plan, plan.cells[0], {})
+        args = overrides["params"]["agg"]["extra_cli_args"]
+        assert args.count("--benchmark-points-file") == 1
+        assert args[args.index("--benchmark-points-file") + 1].endswith("/benchmark-points.json")
+        assert runner._frozen_points(plan) == canonical
+
+
+@pytest.mark.parametrize("worker_type", ["prefill", "decode"])
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--enable-prefix-caching",
+        "--enable-prefix-caching=true",
+        "--enable_prefix_caching",
+        "--enable_prefix_caching=true",
+    ],
+)
+def test_k31_native_state_policy_cannot_reenable_prefix_caching(tmp_path, worker_type, flag):
+    from dataclasses import replace
+
+    from collector.fpm_forward import runner, runtime_probe
+    from collector.fpm_forward.planner import BackendPolicy
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+
+    launch, manifest, _ = _k31_native_probe_inputs(tmp_path)
+    launch["worker_type"] = worker_type
+    plan = runtime_probe.build_runtime_probe_plan("k31", launch, load_instrumentation(manifest))
+    cell = replace(
+        plan.cells[0], backend_policy=BackendPolicy("test", {"params": {"agg": {"extra_cli_args": [flag]}}}, {})
+    )
+    with pytest.raises(ValueError, match="cannot change K3.1 observed private state, prefix caching"):
+        runner._cell_generator_overrides(plan, cell, {})
+
+
+@pytest.mark.parametrize(
+    "flag,message",
+    [
+        ("--mamba_ssm_cache_dtype=bfloat16", "cannot change K3.1"),
+        ("--mamba_cache_dtype=float32", "cannot change K3.1"),
+        ("--mamba_cache_mode=align", "cannot change K3.1"),
+        ("--speculative_config={}", "cannot change K3.1"),
+        ("--no_language_model_only", "cannot change K3.1"),
+        ("--worker_cls=OtherWorker", "observer worker class"),
+        ("--scheduler_cls=OtherScheduler", "observer scheduler class"),
+        ("--kv_cache_memory_bytes=1234", "automatic cache sizing"),
+        ("--num_gpu_blocks_override=123", "automatic cache sizing"),
+        ("--async_scheduling", "requires synchronous scheduling"),
+        ("--gpu_memory_utilization=0.5", "cannot override --fpm-gpu-memory-utilization"),
+        ("--enforce_eager", "eager execution must be supplied"),
+        ("--benchmark_points_file=other.json", "benchmark points must be supplied"),
+    ],
+)
+def test_runtime_observation_policy_guards_accept_parser_option_spellings(tmp_path, flag, message):
+    from dataclasses import replace
+
+    from collector.fpm_forward import runner, runtime_probe
+    from collector.fpm_forward.planner import BackendPolicy
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+
+    launch, manifest, _ = _k31_native_probe_inputs(tmp_path)
+    plan = runtime_probe.build_runtime_probe_plan("k31", launch, load_instrumentation(manifest))
+    cell = replace(
+        plan.cells[0], backend_policy=BackendPolicy("test", {"params": {"agg": {"extra_cli_args": [flag]}}}, {})
+    )
+    with pytest.raises(ValueError, match=message):
+        runner._cell_generator_overrides(plan, cell, {})
+
+
+@pytest.mark.parametrize("worker_type", ["prefill", "decode"])
+def test_k31_activation_candidate_requires_exact_source_map(tmp_path, worker_type):
+    from collector.fpm_forward import runtime_probe
+    from collector.fpm_forward.runtime_instrumentation import freeze_instrumentation, load_instrumentation
+
+    launch, manifest, _ = _k31_native_probe_inputs(tmp_path)
+    launch["worker_type"] = worker_type
+    frozen = freeze_instrumentation(load_instrumentation(manifest), tmp_path / "changed-runtime")
+    changed = frozen.manifest
+    changed["runtime"]["source_files"][next(iter(changed["runtime"]["source_files"]))] = "f" * 64
+    frozen.manifest_path.write_text(json.dumps(changed))
+    bundle = load_instrumentation(frozen.manifest_path)
+    with pytest.raises(ValueError, match="requires an audited instrumentation bundle"):
+        runtime_probe.build_runtime_probe_plan("k31", launch, bundle)
+
+
+def test_probe_environment_roundtrip_preserves_supplementary_unicode(tmp_path):
+    from collector.fpm_forward.runtime_probe import probe_generator_overrides
+
+    launch, _, _ = _inputs(tmp_path)
+    environment = [{"name": "HF_HOME", "value": "/cache/𠮷"}]
+    launch["deployment"]["extra_env"] = environment
+    resolved = probe_generator_overrides(launch)
+    assert resolved["K8sConfig"]["extra_env"] == environment
+    assert resolved["K8sConfig"]["extra_env"][0]["value"].encode("utf-8") == b"/cache/\xf0\xa0\xae\xb7"
+
+
+@pytest.mark.parametrize("location", ["wrapper", "decoder"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_k31_probe_rejects_multiple_architectures_before_launch(tmp_path, location, reverse):
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+    from collector.fpm_forward.runtime_probe import build_runtime_probe_plan
+
+    launch, manifest, marker = _k31_native_probe_inputs(tmp_path)
+    path = Path(launch["model_config"]["path"])
+    config = json.loads(path.read_text())
+    target = config if location == "wrapper" else config["text_config"]
+    target["architectures"] = ["KimiK31ForConditionalGeneration", "KimiK3ForConditionalGeneration"]
+    if reverse:
+        target["architectures"].reverse()
+        if location == "wrapper":
+            config["text_config"].pop("architectures", None)
+        else:
+            config["architectures"] = ["KimiK3ForConditionalGeneration"]
+    path.write_text(json.dumps(config))
+    launch["model_config"]["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="single-entry architecture lists"):
+        build_runtime_probe_plan("k31", launch, load_instrumentation(manifest))
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+@pytest.mark.parametrize("warmup", [None, "on", "off", "OFF", "0", "false"])
+def test_k31_disabled_decode_warmup_rejected_before_scheduling(tmp_path, role, warmup):
+    from collector.fpm_forward import runner, runtime_probe
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+
+    launch, manifest, marker = _k31_native_probe_inputs(tmp_path)
+    launch["worker_type"] = role
+    plan = runtime_probe.build_runtime_probe_plan("k31", launch, load_instrumentation(manifest))
+    base = {"K8sConfig": {"extra_env": [{"name": "DYN_BENCH_KV_WARMUP", "value": warmup}]}} if warmup else {}
+    if role == "decode" and (warmup or "").lower() in {"off", "0", "false"}:
+        with pytest.raises(ValueError, match="requires DYN_BENCH_KV_WARMUP enabled"):
+            runner._cell_generator_overrides(plan, plan.cells[0], base)
+    else:
+        rendered = runner._cell_generator_overrides(plan, plan.cells[0], base)
+        actual = {item["name"]: item["value"] for item in rendered["K8sConfig"]["extra_env"]}
+        assert actual["DYN_BENCH_KV_WARMUP"] == (warmup or "on")
+    assert not marker.exists()
+
+
+def test_k31_decode_rendering_uses_one_native_state_resolution(tmp_path):
+    from collector.fpm_forward import runner, runtime_probe
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+
+    launch, manifest, _ = _k31_native_probe_inputs(tmp_path)
+    base = runtime_probe.build_runtime_probe_plan("k31", launch, load_instrumentation(manifest))
+
+    # Other rendering paths legitimately read the bundle to configure the
+    # observer; isolate the duplicate decode-policy resolution itself.
+    from unittest.mock import patch
+
+    original = runner._kimi_k31_native_state
+    calls = []
+
+    def resolve(plan, *args, **kwargs):
+        calls.append(True)
+        return original(plan, *args, **kwargs)
+
+    with patch.object(runner, "_kimi_k31_native_state", resolve):
+        rendered = runner._cell_generator_overrides(base, base.cells[0], {})
+    assert len(calls) == 1
+    assert "--no-enable-prefix-caching" in rendered["params"]["agg"]["extra_cli_args"]
+
+
+@pytest.mark.parametrize(
+    "failure", ["worker_evidence", "backend_markers", "before_staging", "private_cleanup", "worker_interrupt"]
+)
+def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path, monkeypatch, failure):
+    from collector.fpm_forward import cli, database, entry, runner, runtime_probe
+    from collector.model_cases import build_collection_case_plan
+
+    from .test_fpm_runner import _native_payload
+
+    argv, extra, launch = _formal_cli_inputs(tmp_path)
+    token = "synthetic-secret-746-runtime"
+    environment = [{"name": "HF_TOKEN", "value": token}]
+    launch["deployment"]["extra_env"] = environment
+    if failure == "backend_markers":
+        # Use a supported explicit policy to require a resolved-config sidecar.
+        launch["precision"]["moe_backend"] = "triton"
+        profile_path = Path(argv[argv.index("--fpm-model-profile") + 1])
+        profile = json.loads(profile_path.read_text())
+        profile["deployments"][0]["moe_backend"] = "triton"
+        profile_path.write_text(json.dumps(profile))
+        argv.extend(["--fpm-moe-backend", "triton"])
+    Path(extra[extra.index("--fpm-runtime-launch") + 1]).write_text(json.dumps(launch))
+    argv.extend(["--generator-set", "K8sConfig.extra_env=" + json.dumps(environment)])
+    args = cli._parser().parse_args([*argv, *extra])
+    cases = build_collection_case_plan(backend="vllm", model_path=args.model_path, gpu_type=args.gpu)
+    plan, overrides = entry.resolve_inputs(args, cases)
+    executions = []
+    rejected = set()
+    delivery_directories = []
+
+    class NativeExecutor(_SyntheticExecutor):
+        def stage(self, pods, files):
+            super().stage(pods, files)
+            delivery = self.files["run.sh"].parent
+            assert delivery != self.cell_dir
+            assert delivery.stat().st_mode & 0o777 == 0o700
+            assert runner.shlex.quote(token) in self.files["run.sh"].read_text()
+            from collector.fpm_forward.slurm import SlurmCellRunner
+
+            SlurmCellRunner.stage(self, pods, files)
+            assert self.runtime_dir.parent == delivery
+            assert not delivery.is_relative_to(self.cell_dir.parent.parent)
+            assert runner.shlex.quote(token) in (self.runtime_dir / "run.sh").read_text()
+            delivery_directories.append(delivery)
+
+        def execute(self, pods):
+            super().execute(pods)
+            raw = self.cell_dir / "raw" / pods[0]
+            provenance = {
+                "schema_name": "aic_fpm_collector_provenance",
+                "schema_version": 1,
+                "cell_id": self.cell.cell_id,
+                "plan_sha256": plan.sha256,
+                "attempt_id": self.identity["attempt_id"],
+                "runtime": {"backend": "vllm", "backend_version": "0.28.0"},
+            }
+            (raw / "collector-provenance.json").write_text(json.dumps(provenance))
+            payload = _native_payload(phase=self.cell.workload_kind, rank=0, dp=1, prefill_history=0)
+            (raw / "benchmark.json").write_text(json.dumps(payload))
+            (raw / "raw-config-private.json").write_text(json.dumps({"environment": {"HF_TOKEN": token}}))
+            if failure == "backend_markers" and len(executions) != 1:
+                (raw / "resolved-config-native.json").write_text(
+                    json.dumps({"config": {"engine_args": {"kernel_config": {"moe_backend": "triton"}}}})
+                )
+            if failure == "worker_evidence" and len(executions) == 1:
+                rejected.add(self.identity["attempt_id"])
+
+    monkeypatch.setattr(runner, "_cell_runner", lambda p, c, m, d: NativeExecutor(p, c, d, executions))
+    from collector.fpm_forward import private_inputs
+
+    cleanup = private_inputs.SlurmDelivery.cleanup
+    cleanup_failed = False
+
+    def cleanup_delivery(delivery):
+        nonlocal cleanup_failed
+        if failure == "private_cleanup" and len(executions) == 1 and not cleanup_failed:
+            cleanup_failed = True
+            raise OSError("synthetic private staging deletion failure")
+        cleanup(delivery)
+
+    monkeypatch.setattr(private_inputs.SlurmDelivery, "cleanup", cleanup_delivery)
+    # Isolate cell lifecycle from model-specific native inventory. The actual
+    # archived-worker validator has a separate real-envelope regression.
+    monkeypatch.setattr(database, "_is_k31", lambda plan: True)
+    # The synthetic model above exercises both phases in one campaign, unlike
+    # K3.1's independent workers. Its entry requirements are covered separately
+    # by the profileless K3.1 execution rejection and native rendering tests.
+    monkeypatch.setattr(runner, "_require_k31_execution_inputs", lambda plan: None)
+
+    def qualify(plan, cell, raw, collection, *, allow_staged=False):
+        index = json.loads((raw.parent.parent.parent / "runtime-observations.json").read_text())
+        active = index["configurations"][plan.runtime_configuration]["attempts"][-1]["phases"][cell.workload_kind]
+        assert active["collector_attempt_id"] == collection.collector_attempt_id
+        assert allow_staged and active["status"] == "validating"
+        if failure == "worker_interrupt":
+            raise KeyboardInterrupt
+        if collection.collector_attempt_id in rejected:
+            raise ValueError("synthetic unresolved worker evidence")
+
+    monkeypatch.setattr(database, "require_k31_worker_evidence", qualify)
+    artifact_root = tmp_path / "collection"
+    checkpoint_dir = tmp_path / "checkpoint"
+    kwargs = dict(
+        generator_overrides=overrides,
+        checkpoint_dir=str(checkpoint_dir),
+        artifact_root=str(artifact_root),
+        resume=False,
+        retry_failed=False,
+        publish_database=False,
+    )
+    assert token not in json.dumps(plan.to_dict())
+
+    def assert_private_artifacts(expected_remaining=0):
+        remaining = [directory for directory in delivery_directories if directory.exists()]
+        assert delivery_directories
+        assert len(remaining) == expected_remaining
+        for retained in artifact_root.rglob("*"):
+            if retained.is_file():
+                assert token.encode() not in retained.read_bytes(), retained
+
+    if failure == "worker_interrupt":
+        with pytest.raises(KeyboardInterrupt):
+            runner.run_collection(plan, **kwargs)
+        saved = json.loads(next(artifact_root.rglob("runtime-observations.json")).read_text())
+        attempt = saved["configurations"][plan.runtime_configuration]["attempts"][-1]
+        assert attempt["status"] == "incomplete"
+        assert attempt["phases"]["prefill"]["status"] == "validating"
+        return
+
+    errors = runner.run_collection(plan, **kwargs)
+    assert_private_artifacts(expected_remaining=int(failure == "private_cleanup"))
+    checkpoint_path = checkpoint_dir / "fpm_forward.json"
+    first = json.loads(checkpoint_path.read_text())
+    prefill = next(c for c in plan.cells if c.workload_kind == "prefill")
+    decode = next(c for c in plan.cells if c.workload_kind == "decode")
+    original_id = first["cells"][prefill.cell_id]["attempt_id"]
+    assert first["cells"][decode.cell_id]["status"] == "passed"
+    root = artifact_root / plan.sha256[:16]
+    cell_dir = root / "cells" / prefill.cell_id
+    if failure in {"worker_evidence", "backend_markers"}:
+        assert errors and first["cells"][prefill.cell_id]["status"] == "failed"
+        message = (
+            "synthetic unresolved worker evidence"
+            if failure == "worker_evidence"
+            else "requires resolved-config evidence"
+        )
+        assert message in first["cells"][prefill.cell_id]["error"]
+        observation = json.loads((root / "runtime-observations.json").read_text())
+        attempt = observation["configurations"][plan.runtime_configuration]["attempts"][-1]
+        assert attempt["status"] == "incomplete"
+        assert attempt["phases"]["prefill"]["status"] == "failed"
+        assert all(item["status"] == "failed" for item in attempt["phase_attempts"]["prefill"])
+    elif failure == "private_cleanup":
+        record = first["cells"][prefill.cell_id]
+        assert errors and record["status"] == "cleanup_failed"
+        assert record["private_cleanup_error"] == "synthetic private staging deletion failure"
+        assert record["completed_at"] and record["duration_seconds"] >= 0
+        observation = json.loads((root / "runtime-observations.json").read_text())
+        phase = observation["configurations"][plan.runtime_configuration]["attempts"][-1]["phases"]["prefill"]
+        assert phase["status"] == "cleanup_failed" and phase["artifacts"]
+        assert (root / "run-manifest.json").exists()
+    else:
+        assert errors == []
+        first["cells"][prefill.cell_id]["status"] = "failed"
+        checkpoint_path.write_text(json.dumps(first))
+        # Retain an already archived launch, but incomplete native timings
+        # prevent zero-work recovery of the deliberately failed old attempt.
+        (cell_dir / "raw/synthetic-node/benchmark.json").unlink()
+        render = runner._render_cell
+
+        def fail_render(*args, **kwargs):
+            raise OSError("synthetic render failure before staging")
+
+        monkeypatch.setattr(runner, "_render_cell", fail_render)
+        assert runner.run_collection(plan, **{**kwargs, "resume": True, "retry_failed": True})
+        assert_private_artifacts()
+        failed = json.loads(checkpoint_path.read_text())["cells"][prefill.cell_id]
+        assert failed["status"] == "failed" and "observation_error" not in failed
+        assert "synthetic render failure before staging" in failed["error"]
+        assert not (cell_dir / runtime_probe.CONTEXT_FILENAME).exists()
+        monkeypatch.setattr(runner, "_render_cell", render)
+    assert runner.run_collection(plan, **{**kwargs, "resume": True, "retry_failed": failure != "private_cleanup"}) == []
+    assert_private_artifacts()
+    final = json.loads(checkpoint_path.read_text())
+    assert all(item["status"] == "passed" for item in final["cells"].values())
+    retained = final["cells"][prefill.cell_id]
+    assert (retained["attempt_id"] == original_id) == (failure == "private_cleanup")
+    assert "private_cleanup_error" not in retained
+    assert final["cells"][decode.cell_id]["attempt_id"] == first["cells"][decode.cell_id]["attempt_id"]
+    history = json.loads((root / "runtime-observations.json").read_text())["configurations"][
+        plan.runtime_configuration
+    ]["attempts"][-1]["phase_attempts"]["prefill"]
+    assert any(item["collector_attempt_id"] == original_id for item in history)
+    expected = [("tp4", "prefill"), ("tp4", "decode")]
+    if failure != "private_cleanup":
+        expected.append(("tp4", "prefill"))
+    assert executions == expected
+    assert "/__aisimulate_environment_reference__/HF_TOKEN/" in (cell_dir / "run.sh").read_text()
+    if failure == "backend_markers":
+        from collector.fpm_forward.config import archive_generator_overrides
+
+        monkeypatch.delenv("HF_TOKEN", raising=False)
+        for config in (root / "cells").rglob("resolved-config-native.json"):
+            payload = json.loads(config.read_text())
+            payload["unrelated_private_value"] = token
+            config.write_text(json.dumps(payload))
+        recovery = {**kwargs, "generator_overrides": archive_generator_overrides(overrides), "resume": True}
+        assert runner.run_collection(plan, **recovery) == []
+        index_path = root / "runtime-observations.json"
+        before = index_path.read_bytes()
+        assert runner.run_collection(plan, **recovery) == []
+        assert index_path.read_bytes() == before
+        assert len(executions) == 3
+        for cell in plan.cells:
+            database._validate_backend_markers(cell, root / "cells" / cell.cell_id)
+        assert_private_artifacts()
+
+
+@pytest.mark.parametrize("transport", ["slurm", "kubernetes"])
+@pytest.mark.parametrize("fail_runtime", [False, True])
+def test_probe_keeps_credentials_out_of_launch_evidence_and_delivers_to_runtime(
+    tmp_path, monkeypatch, transport, fail_runtime
+):
+    from collector.fpm_forward import runner, runtime_probe
+
+    launch, manifest, _ = _inputs(tmp_path)
+    if transport == "kubernetes":
+        launch["deployment"] = {"executor": "kubernetes", "image": launch["deployment"]["image"]}
+    token = 'synthetic-"private"-$746'
+    environment = [
+        {"name": "HF_TOKEN", "value": token},
+        {"name": "VLLM_SSM_CONV_STATE_LAYOUT", "value": "DS"},
+        {"name": "FPM_READINESS_TIMEOUT_SECONDS", "value": "1200"},
+    ]
+    launch["deployment"]["extra_env"] = environment
+    delivered = []
+    staging = []
+    node_local = tmp_path / "node-local-tmp"
+    node_local.mkdir()
+    from collector.fpm_forward import private_inputs
+
+    monkeypatch.setattr(private_inputs.tempfile, "tempdir", str(node_local))
+
+    class Executor(_SyntheticExecutor):
+        def stage(self, pods, files):
+            if transport == "slurm":
+                from collector.fpm_forward.slurm import SlurmCellRunner
+
+                SlurmCellRunner.stage(self, pods, files)
+                staging.append(self.runtime_dir)
+                # Pyxis bind mounts must remain on the campaign's shared
+                # filesystem even when the login node's default tmp is local.
+                assert not self.runtime_dir.is_relative_to(output)
+                assert self.runtime_dir.parent.stat().st_mode & 0o777 == 0o700
+                assert runner.shlex.quote(token) in (self.runtime_dir / "run.sh").read_text()
+            self.staged_scripts = {path.name: path.read_text() for path in files if path.suffix == ".sh"}
+            super().stage(pods, files)
+
+        def execute(self, pods):
+            saved = json.loads((self.cell_dir / "generator-request.json").read_text())
+            auth = next(item for item in saved["K8sConfig"]["extra_env"] if item["name"] == "HF_TOKEN")
+            assert auth == {
+                "name": "HF_TOKEN",
+                "value_from_env": "HF_TOKEN",
+                "value_sha256": hashlib.sha256(token.encode()).hexdigest(),
+            }
+            script = self.staged_scripts["run.sh"]
+            assert runner.shlex.quote(token) in script
+            delivered.append(self.cell.workload_kind)
+            super().execute(pods)
+            raw = self.cell_dir / "raw" / pods[0]
+            (raw / "resolved-config-synthetic.json").write_text(
+                json.dumps(
+                    {
+                        "config": {
+                            "engine_args": {"kernel_config": {"moe_backend": "triton"}},
+                            "environment": {"HF_TOKEN": token},
+                        }
+                    }
+                )
+            )
+            logs = self.cell_dir / "logs"
+            logs.mkdir(exist_ok=True)
+            (logs / "synthetic.stderr.log").write_text("worker context " + token)
+            if fail_runtime:
+                raise RuntimeError("synthetic worker failure after staging " + token)
+
+    monkeypatch.setattr(runner, "_cell_runner", lambda p, c, m, d: Executor(p, c, d, []))
+    output = tmp_path / "probe"
+
+    def assert_archived(value):
+        if isinstance(value, dict):
+            assert value.get("value") != token
+            if value.get("name") == "HF_TOKEN":
+                assert value == {
+                    "name": "HF_TOKEN",
+                    "value_from_env": "HF_TOKEN",
+                    "value_sha256": hashlib.sha256(token.encode()).hexdigest(),
+                }
+            for item in value.values():
+                assert_archived(item)
+        elif isinstance(value, list):
+            for item in value:
+                assert_archived(item)
+        elif isinstance(value, str):
+            assert token not in value
+
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    offline = runtime_probe.probe_runtime(
+        {"tp4": runtime_probe.normalize_probe_launch(launch)},
+        instrumentation=manifest,
+        output_dir=output,
+        execute=False,
+    )
+    assert offline["status"] == "preview"
+    assert_archived(offline)
+
+    def assert_files_archived():
+        for path in output.rglob("*"):
+            if path.is_file():
+                contents = path.read_bytes()
+                assert token.encode() not in contents, path
+                assert json.dumps(token)[1:-1].encode() not in contents, path
+                assert runner.shlex.quote(token).encode() not in contents, path
+                if path.suffix == ".json":
+                    assert_archived(json.loads(contents))
+
+    assert_files_archived()
+    for execute in (False, True):
+        report = runtime_probe.probe_runtime(
+            {"tp4": launch}, instrumentation=manifest, output_dir=output, execute=execute
+        )
+        expected = "failed" if fail_runtime else "completed"
+        assert report["status"] == (expected if execute else "preview"), report
+        assert_archived(report)
+        assert_files_archived()
+    for phase in ("prefill", "decode"):
+        sidecars = list(output.glob(f"attempts/*/*/{phase}/evidence-*/raw/**/resolved-config-synthetic.json"))
+        assert len(sidecars) == 1, (phase, sidecars)
+        assert json.loads(sidecars[0].read_text())["config"]["engine_args"]["kernel_config"]["moe_backend"] == "triton"
+        assert "<redacted>" in sidecars[0].read_text()
+    assert delivered == ["prefill", "decode"]
+    assert len(staging) == (2 if transport == "slurm" else 0)
+    assert all(not directory.exists() for directory in staging)
+    assert not list(output.glob("aisimulate-probe-delivery-*"))
+    assert not list(node_local.iterdir())
+
+    saved = json.loads((output / "probe-plan.json").read_text())
+    frozen = saved["configurations"]["tp4"]
+    assert (
+        next(item for item in frozen["deployment"]["extra_env"] if item["name"] == "VLLM_SSM_CONV_STATE_LAYOUT")[
+            "value"
+        ]
+        == "DS"
+    )
+    assert runtime_probe.normalize_probe_launch(frozen) == frozen
+
+
+@pytest.mark.parametrize("layout", ["DS", "SD", None])
+def test_probe_layout_is_literal_for_offline_validation(tmp_path, monkeypatch, layout):
+    from collector.fpm_forward import runtime_probe
+
+    launch, _, _ = _inputs(tmp_path)
+    if layout is not None:
+        launch["deployment"]["extra_env"] = [{"name": "VLLM_SSM_CONV_STATE_LAYOUT", "value": layout}]
+    normalized = runtime_probe.normalize_probe_launch(launch)
+    assert runtime_probe.normalize_probe_launch(normalized) == normalized
+    if layout is None:
+        return
+    assert normalized["deployment"]["extra_env"] == launch["deployment"]["extra_env"]
+    monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", layout)
+    launch["deployment"]["extra_env"] = [
+        {
+            "name": "VLLM_SSM_CONV_STATE_LAYOUT",
+            "value_from_env": "VLLM_SSM_CONV_STATE_LAYOUT",
+            "value_sha256": hashlib.sha256(layout.encode()).hexdigest(),
+        }
+    ]
+    with pytest.raises(ValueError, match="must be a literal SD or DS"):
+        runtime_probe.normalize_probe_launch(launch)
+
+
+def test_k31_probe_rejects_unaudited_bundle_before_generic_precision_checks(tmp_path):
+    from collector.fpm_forward import runtime_probe
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+
+    launch, _, marker = _k31_native_probe_inputs(tmp_path)
+    (tmp_path / "unaudited").mkdir()
+    _, unaudited_manifest, _ = _inputs(tmp_path / "unaudited")
+    with pytest.raises(ValueError, match="requires an audited instrumentation bundle"):
+        runtime_probe.build_runtime_probe_plan("k31", launch, load_instrumentation(unaudited_manifest))
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("dtype,accepted", [("float16", False), ("bfloat16", True)])
+def test_k31_flashmla_checkpoint_dtype_is_checked_before_launch(tmp_path, dtype, accepted):
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+    from collector.fpm_forward.runtime_probe import build_runtime_probe_plan
+
+    launch, manifest, marker = _k31_native_probe_inputs(tmp_path)
+    model = Path(launch["model_config"]["path"])
+    config = json.loads(model.read_text())
+    config["text_config"]["torch_dtype"] = dtype
+    config["text_config"]["dtype"] = dtype
+    model.write_text(json.dumps(config))
+    launch["model_config"]["sha256"] = hashlib.sha256(model.read_bytes()).hexdigest()
+    launch["precision"].update(
+        attention_backend="flashmla",
+        fmha_quant_mode="half" if dtype == "float16" else "bfloat16",
+        gemm_quant_mode="half" if dtype == "float16" else "bfloat16",
+    )
+    if accepted:
+        assert build_runtime_probe_plan("k31", launch, load_instrumentation(manifest)).cells
+    else:
+        with pytest.raises(ValueError, match="FLASHMLA_SPARSE requires a bfloat16 checkpoint"):
+            build_runtime_probe_plan("k31", launch, load_instrumentation(manifest))
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("conflicting", [False, True])
+def test_k31_probe_rejects_conflicting_singleton_outer_identity(tmp_path, conflicting):
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+    from collector.fpm_forward.runtime_probe import build_runtime_probe_plan
+
+    launch, manifest, _ = _k31_native_probe_inputs(tmp_path)
+    model = Path(launch["model_config"]["path"])
+    config = json.loads(model.read_text())
+    config["architectures"] = ["OtherModel" if conflicting else "KimiK31ForConditionalGeneration"]
+    config["text_config"]["architectures"] = [
+        "KimiK31ForConditionalGeneration" if conflicting else "KimiK3ForConditionalGeneration"
+    ]
+    model.write_text(json.dumps(config))
+    launch["model_config"]["sha256"] = hashlib.sha256(model.read_bytes()).hexdigest()
+    if conflicting:
+        with pytest.raises(ValueError, match="top-level architecture identity"):
+            build_runtime_probe_plan("k31", launch, load_instrumentation(manifest))
+    else:
+        assert build_runtime_probe_plan("k31", launch, load_instrumentation(manifest)).cells
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_private_probe_cleanup_failure_persists_phase_and_preserves_interrupt(tmp_path, monkeypatch, interrupt):
+    from types import SimpleNamespace
+
+    from collector.fpm_forward import runner, runtime_probe
+
+    launch, manifest, _ = _inputs(tmp_path)
+    launch["deployment"]["extra_env"] = [{"name": "HF_TOKEN", "value": "synthetic-private-cleanup"}]
+    directories = []
+
+    def delivery(*args):
+        path = tmp_path / f"private-{len(directories)}"
+        path.mkdir()
+        directories.append(path)
+
+        def cleanup():
+            raise OSError("private deletion denied")
+
+        return SimpleNamespace(name=str(path), cleanup=cleanup)
+
+    class Executor(_SyntheticExecutor):
+        def execute(self, pods):
+            super().execute(pods)
+            if interrupt:
+                raise KeyboardInterrupt
+
+    monkeypatch.setattr(runtime_probe, "new_delivery_directory", delivery)
+    monkeypatch.setattr(runner, "_cell_runner", lambda p, c, m, d: Executor(p, c, d, []))
+    output = tmp_path / "probe"
+    if interrupt:
+        with pytest.raises(KeyboardInterrupt):
+            runtime_probe.probe_runtime({"tp4": launch}, instrumentation=manifest, output_dir=output, execute=True)
+    else:
+        report = runtime_probe.probe_runtime({"tp4": launch}, instrumentation=manifest, output_dir=output, execute=True)
+        assert report["status"] == "failed", report
+    index = json.loads((output / "observations.json").read_text())
+    phase = index["configurations"]["tp4"]["attempts"][0]["phases"]["prefill"]
+    assert phase["status"] == ("interrupted" if interrupt else "cleanup_failed")
+    assert phase["private_cleanup_error"] == "private deletion denied"
+    assert phase["artifacts"]
+
+
+def test_slurm_resume_reclaims_abandoned_private_staging_only_after_teardown(tmp_path, monkeypatch):
+    from collector.fpm_forward import runner, runtime_probe
+    from collector.fpm_forward.private_inputs import RECEIPT
+
+    launch, manifest, _ = _inputs(tmp_path)
+    launch["deployment"]["extra_env"] = [{"name": "HF_TOKEN", "value": "synthetic-abandoned-staging"}]
+    blocked = True
+    staged = []
+    executions = []
+
+    class Executor(_SyntheticExecutor):
+        def stage(self, pods, files):
+            super().stage(pods, files)
+            staged.append(self.files["run.sh"].parent)
+
+        def execute(self, pods):
+            super().execute(pods)
+            if blocked:
+                raise KeyboardInterrupt
+
+        def cleanup(self):
+            if blocked and executions:
+                raise RuntimeError("Slurm step still running")
+
+    monkeypatch.setattr(runner, "_cell_runner", lambda p, c, m, d: Executor(p, c, d, executions))
+    monkeypatch.setattr(runner, "_salvage_artifacts", lambda *args: None)
+    output = tmp_path / "probe"
+    with pytest.raises(KeyboardInterrupt):
+        runtime_probe.probe_runtime({"tp4": launch}, instrumentation=manifest, output_dir=output, execute=True)
+    old = staged[0]
+    assert old.exists() and not old.is_relative_to(output)
+    receipt = next(output.rglob(RECEIPT))
+    failed = runtime_probe.probe_runtime(
+        {"tp4": launch}, instrumentation=manifest, output_dir=output, execute=True, resume=True
+    )
+    assert failed["status"] == "failed" and old.exists() and receipt.exists()
+    blocked = False
+    report = runtime_probe.probe_runtime(
+        {"tp4": launch}, instrumentation=manifest, output_dir=output, execute=True, resume=True
+    )
+    assert report["status"] == "completed", report
+    assert not old.exists() and not receipt.exists()
+    assert all(not path.exists() for path in staged)
+
+
+@pytest.mark.parametrize("interrupt,cleanup_fails", [(False, False), (True, False), (False, True)])
+def test_probe_sanitization_failure_persists_terminal_phase(tmp_path, monkeypatch, interrupt, cleanup_fails):
+    from collector.fpm_forward import runner, runtime_probe
+
+    launch, manifest, _ = _inputs(tmp_path)
+    executions = []
+
+    class Executor(_SyntheticExecutor):
+        def execute(self, pods):
+            super().execute(pods)
+            if interrupt:
+                raise KeyboardInterrupt
+
+        def cleanup(self):
+            if cleanup_fails and executions:
+                raise OSError("teardown denied")
+
+    def sanitize(directory, values, *, cell=None):
+        logs = Path(directory) / "logs"
+        logs.mkdir(exist_ok=True)
+        (logs / "unsafe.log").write_text("synthetic private diagnostic")
+        raise OSError("diagnostic rewrite denied")
+
+    monkeypatch.setattr(runtime_probe, "redact_diagnostics", sanitize)
+    monkeypatch.setattr(runner, "_cell_runner", lambda p, c, m, d: Executor(p, c, d, executions))
+    monkeypatch.setattr(runner, "_salvage_artifacts", lambda *a: None)
+    output = tmp_path / "probe"
+    if interrupt:
+        with pytest.raises(KeyboardInterrupt):
+            runtime_probe.probe_runtime({"tp4": launch}, instrumentation=manifest, output_dir=output, execute=True)
+    else:
+        result = runtime_probe.probe_runtime({"tp4": launch}, instrumentation=manifest, output_dir=output, execute=True)
+        assert result["status"] == "failed"
+        assert "diagnostic sanitization" in str(result)
+    index = json.loads((output / "observations.json").read_text())
+    phase = index["configurations"]["tp4"]["attempts"][0]["phases"]["prefill"]
+    assert phase["status"] == ("interrupted" if interrupt else "cleanup_failed" if cleanup_fails else "failed")
+    assert phase["diagnostic_error"] == "diagnostic rewrite denied"
+    assert not list(output.rglob("unsafe.log"))
+    assert phase["artifacts"] == []
+    assert not list(output.rglob("evidence-*"))
+    if cleanup_fails:
+        assert phase["cleanup_error"] == "teardown denied"
+
+
+def test_probe_indexes_phase_before_private_render_interruption(tmp_path, monkeypatch):
+    from collector.fpm_forward import runner, runtime_probe
+    from collector.fpm_forward.private_inputs import RECEIPT
+
+    launch, manifest, _ = _inputs(tmp_path)
+    launch["deployment"]["extra_env"] = [{"name": "HF_TOKEN", "value": "synthetic-render-interrupt"}]
+    original = runner._render_cell
+    output = tmp_path / "probe"
+    private_paths = []
+
+    def render(plan, cell, directory, *args, **kwargs):
+        original(plan, cell, directory, *args, **kwargs)
+        if kwargs.get("resolve_environment", True):
+            saved = json.loads((output / "observations.json").read_text())
+            phase = saved["configurations"]["tp4"]["attempts"][-1]["phases"][cell.workload_kind]
+            assert phase["status"] == "running"
+            assert phase["launch_manifest"] and phase["resource_manifest"]
+            private_paths.append(Path(directory))
+            # Model a host loss: no catch/finally runs after this render.
+            raise SystemExit("synthetic host loss")
+
+    # SystemExit is still subject to finally in-process, so leave delivery for
+    # resume as an abruptly killed process would, then use the saved running index.
+    monkeypatch.setattr(runner, "_render_cell", render)
+    from collector.fpm_forward import private_inputs
+
+    cleanup = private_inputs.SlurmDelivery.cleanup
+    monkeypatch.setattr(private_inputs.SlurmDelivery, "cleanup", lambda self: None)
+    with pytest.raises(SystemExit):
+        runtime_probe.probe_runtime({"tp4": launch}, instrumentation=manifest, output_dir=output, execute=True)
+    assert private_paths[0].exists()
+    monkeypatch.setattr(private_inputs.SlurmDelivery, "cleanup", cleanup)
+    monkeypatch.setattr(runner, "_render_cell", original)
+    monkeypatch.setattr(runner, "_cell_runner", lambda p, c, m, d: _SyntheticExecutor(p, c, d, []))
+    report = runtime_probe.probe_runtime(
+        {"tp4": launch}, instrumentation=manifest, output_dir=output, execute=True, resume=True
+    )
+    assert report["status"] == "completed", report
+    assert not private_paths[0].exists()
+    assert not list(output.glob("attempts/*/*/prefill/" + RECEIPT))
+
+
+@pytest.mark.parametrize("credential", ["matching", "missing", "changed"])
+def test_kubernetes_recovery_sanitizes_salvaged_diagnostics(tmp_path, monkeypatch, credential):
+    from collector.fpm_forward import runner, runtime_probe
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+
+    launch, manifest, _ = _inputs(tmp_path)
+    token = "synthetic-salvaged-credential"
+    launch["deployment"] = {
+        "executor": "kubernetes",
+        "image": "synthetic:image",
+        "extra_env": [{"name": "HF_TOKEN", "value": token}],
+    }
+
+    class Executor(_SyntheticExecutor):
+        def execute(self, pods):
+            super().execute(pods)
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(runner, "_cell_runner", lambda p, c, m, d: Executor(p, c, d, []))
+    monkeypatch.setattr(runner, "_salvage_artifacts", lambda *args: None)
+    output = tmp_path / "probe"
+    with pytest.raises(KeyboardInterrupt):
+        runtime_probe.probe_runtime({"tp4": launch}, instrumentation=manifest, output_dir=output, execute=True)
+    index = json.loads((output / "observations.json").read_text())
+    entry = index["configurations"]["tp4"]
+    attempt = entry["attempts"][0]
+    if credential == "matching":
+        monkeypatch.setenv("HF_TOKEN", token)
+    elif credential == "changed":
+        monkeypatch.setenv("HF_TOKEN", "wrong-original-value")
+    else:
+        monkeypatch.delenv("HF_TOKEN", raising=False)
+
+    def salvage(resource, cell_id):
+        raw = resource.cell_dir / "raw/recovered"
+        raw.mkdir(parents=True)
+        (raw / "resolved-config-private.json").write_text(json.dumps({"environment": {"HF_TOKEN": token}}))
+        (raw / "benchmark.json").write_text('{"latency_ms": 1.25}')
+        logs = resource.cell_dir / "logs"
+        logs.mkdir(exist_ok=True)
+        (logs / "recovered.log").write_text(token)
+
+    monkeypatch.setattr(runner, "_salvage_artifacts", salvage)
+    plan = runtime_probe.build_runtime_probe_plan("tp4", entry["launch"], load_instrumentation(manifest))
+    runtime_probe._cleanup_previous_attempt(output, plan, attempt)
+    references = attempt["phases"]["prefill"]["recovery_artifacts"]
+    assert any(ref["path"].endswith("recovered/benchmark.json") for ref in references)
+    configs = [ref for ref in references if ref["path"].endswith("resolved-config-private.json")]
+    assert bool(configs) == (credential == "matching")
+    for path in output.rglob("*"):
+        if path.is_file():
+            assert token.encode() not in path.read_bytes(), path
+
+
+def test_slurm_delivery_removes_private_directory_on_receipt_failure(tmp_path, monkeypatch):
+    from collector.fpm_forward import private_inputs, runner
+
+    private = tmp_path / "private"
+    monkeypatch.setenv("AISIMULATE_PRIVATE_DELIVERY_ROOT", str(private))
+
+    def fail(*args):
+        raise OSError("receipt failed")
+
+    monkeypatch.setattr(runner, "_atomic_json", fail)
+    campaign = tmp_path / "campaign"
+    with pytest.raises(OSError, match="receipt failed"):
+        private_inputs.SlurmDelivery(campaign, campaign / "cell")
+    assert list(private.iterdir()) == []
+
+
+@pytest.mark.parametrize("name", ["FPM_SLURM_CPUS_PER_TASK", "FPM_SLURM_CPU_BIND"])
+def test_slurm_rejects_deployment_environment_overriding_launcher(tmp_path, name):
+    from collector.fpm_forward import runner, runtime_probe
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+
+    launch, manifest, _ = _inputs(tmp_path)
+    assert launch["deployment"]["executor"] == "slurm"
+    plan = runtime_probe.build_runtime_probe_plan("custom", launch, load_instrumentation(manifest))
+    overrides = {"K8sConfig": {"extra_env": [{"name": name, "value": "32"}]}}
+    with pytest.raises(ValueError, match="owned by the Slurm launcher"):
+        runner._cell_generator_overrides(plan, plan.cells[0], overrides)

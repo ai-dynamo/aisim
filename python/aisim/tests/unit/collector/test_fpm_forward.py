@@ -23,6 +23,7 @@ from collector.fpm_forward.config import (
     FPMCollectionOptions,
     PrefillSamplingProfile,
     add_fpm_arguments,
+    archive_generator_overrides,
     reject_fpm_arguments_without_fpm,
 )
 from collector.fpm_forward.database import (
@@ -1207,6 +1208,82 @@ def test_packaged_recurrent_state_configs_get_no_attention_template(
     _assert_native_runtime(capability, reasons, is_moe=is_moe)
 
 
+def _kimi_k31_config(tmp_path):
+    # Reuse the repository's K3 fixture and declare only the independent K3.1
+    # geometry facts; do not bundle the differently licensed Pro checkpoint.
+    config = json.loads((_MODEL_CONFIGS / "moonshotai--Kimi-K3_config.json").read_text())
+    config["architectures"] = ["KimiK31ForConditionalGeneration"]
+    text = config["text_config"]
+    text["quantization_config"] = {
+        "quant_method": "compressed-tensors",
+        "config_groups": {"experts": {"weights": {"num_bits": 4, "type": "float"}}},
+        "ignore": ["self_attn", r"re:.*routed_expert_(up|down)_proj.*"],
+    }
+    text["dsa_config"] = {
+        "dsa_layers": list(text["linear_attn_config"]["full_attn_layers"]),
+        "index_topk": 2048,
+        "index_head_dim": 128,
+        "index_num_heads": 32,
+        "index_rope_dim": 0,
+        "index_k_norm_type": "layernorm",
+        "index_topk_freq": 1,
+        "index_skip_topk_offset": 1,
+    }
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    return path, text
+
+
+def test_kimi_k31_nested_dsa_keeps_native_runtime_without_op_data(tmp_path, monkeypatch):
+    path, text = _kimi_k31_config(tmp_path)
+    _forbid_templates_and_timing_data(monkeypatch)
+    capability = _layout_capability(path, native=True, has_model_cases=True)
+    _assert_native_runtime(capability, "recurrent-state field linear_attn_config", is_moe=True)
+    assert capability.model_config.payload["architectures"] == ["KimiK31ForConditionalGeneration"]
+    assert capability.model_config.effective_payload["dsa_config"] == text["dsa_config"]
+    assert capability.dtype.moe_quant_mode == "w4a16_mxfp4"
+    assert capability.dtype.gemm_quant_mode == "bfloat16"
+    # An explicit runtime/profile is required even when the model's op cases
+    # are registered; its hybrid state is never represented by an MLA table.
+    with pytest.raises(ValueError, match="--fpm-model-profile or --fpm-backend-version"):
+        _layout_capability(path, native=False, has_model_cases=True)
+
+
+@pytest.mark.parametrize("backend,native", [("flashmla", "FLASHMLA_SPARSE"), ("trtllm_mla", "FLASHINFER_MLA_SPARSE")])
+def test_kimi_k31_fpm_attention_policy_pins_native_backend_and_row_identity(tmp_path, backend, native):
+    path, _ = _kimi_k31_config(tmp_path)
+    kwargs = dict(
+        backend="vllm",
+        model_path=str(path.parent),
+        model_config_path=str(path),
+        system="b200_sxm",
+        selected_ops=set(),
+        has_model_cases=False,
+        generator_overrides={},
+        collector_config={"aic_database_version": "0.1.dev24216+g266e88c05"},
+    )
+    with pytest.raises(ValueError, match="requires --fpm-attention-backend"):
+        build_collection_plan(**kwargs, options=FPMCollectionOptions.from_args(_args(fpm_kv_cache_dtypes=["fp8"])))
+    plan = build_collection_plan(
+        **kwargs,
+        options=FPMCollectionOptions.from_args(_args(fpm_kv_cache_dtypes=["fp8"], fpm_attention_backend=backend)),
+    )
+    assert len(plan.cells) == 6
+    assert {(cell.workload_kind, cell.parallel_strategy) for cell in plan.cells} == {
+        (phase, strategy) for phase in ("prefill", "decode") for strategy in ("dep", "pure_tp", "tep")
+    }
+    for cell in plan.cells:
+        policy = cell.backend_policy
+        assert backend_identity_columns(policy)["attention_backend"] == backend
+        args = policy.generator_overrides["params"]["agg"]["extra_cli_args"]
+        assert args[0] == "--attention-config"
+        assert json.loads(args[1]) == {"backend": native, "indexer_kv_dtype": "fp8"}
+        assert policy.expected_markers == {
+            "config.engine_args.attention_config.backend": f"AttentionBackendEnum.{native}",
+            "config.engine_args.attention_config.indexer_kv_dtype": "fp8",
+        }
+
+
 _ENTRY_ERROR = "layer_types entries must be nonempty strings"
 # Config intake's message for a layer count field that is not an integer of at least 1.
 _COUNT_ERROR = "{field} must be an integer >=1, not a boolean, float or numeric string"
@@ -2307,6 +2384,119 @@ def test_native_aggregation_preserves_iteration_totals(tmp_path):
     assert "prefix_length" not in rows[0]
 
 
+@pytest.mark.parametrize("architectures", [["KimiK31ForConditionalGeneration"], None, [], ["OtherModel"]])
+@pytest.mark.parametrize("decoder", [None, "KimiK3ForConditionalGeneration"])
+def test_k31_zero_history_prefill_cannot_publish_checkpoint_inferred_precision(tmp_path, architectures, decoder):
+    _, _, cell_dir = _synthetic_plan_and_cell(tmp_path)
+    config_path, _ = _kimi_k31_config(tmp_path)
+    config = json.loads(config_path.read_text())
+    if architectures is None:
+        config.pop("architectures")
+    else:
+        config["architectures"] = architectures
+    if architectures != ["KimiK31ForConditionalGeneration"]:
+        config["text_config"]["architectures"] = ["KimiK31ForConditionalGeneration"]
+    elif decoder is not None:
+        config["text_config"]["architectures"] = [decoder]
+    config_path.write_text(json.dumps(config))
+
+    def build():
+        return build_collection_plan(
+            backend="vllm",
+            model_path=str(tmp_path),
+            model_config_path=str(config_path),
+            system="b200_sxm",
+            selected_ops=set(),
+            has_model_cases=False,
+            collector_config={"aic_database_version": "0.1.dev24216+g266e88c05"},
+            options=FPMCollectionOptions.from_args(
+                _args(
+                    fpm_gpu_counts=[2],
+                    fpm_tp_sizes=[1],
+                    fpm_dp_sizes=[2],
+                    fpm_moe_tp_sizes=[1],
+                    fpm_moe_ep_sizes=[2],
+                    fpm_kv_cache_dtypes=["fp8"],
+                    fpm_attention_backend="flashmla",
+                )
+            ),
+        )
+
+    if architectures != ["KimiK31ForConditionalGeneration"]:
+        with pytest.raises(ValueError, match="top-level architecture identity"):
+            build()
+        return
+    plan = build()
+
+    cell = next(cell for cell in plan.cells if cell.workload_kind == "prefill")
+    assert cell.moe_quant_mode == "w4a16_mxfp4"
+    assert plan.fpm_profile is None and plan.runtime_instrumentation is None
+    for path in (cell_dir / "raw").glob("**/benchmark*.json"):
+        provenance_path = path.parent / "collector-provenance.json"
+        _write_provenance(provenance_path, cell_id=cell.cell_id, plan_sha256=plan.sha256)
+        provenance = json.loads(provenance_path.read_text())
+        provenance["runtime"]["backend_version"] = plan.capability.aic_database_version
+        provenance_path.write_text(json.dumps(provenance))
+        (path.parent / "resolved-config-native.json").write_text(
+            json.dumps(
+                {
+                    "config": {
+                        "engine_args": {
+                            "attention_config": {
+                                "backend": "AttentionBackendEnum.FLASHMLA_SPARSE",
+                                "indexer_kv_dtype": "fp8",
+                            }
+                        }
+                    }
+                }
+            )
+        )
+        payload = json.loads(path.read_text())
+
+        def zero_history(value):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key in {"total_kv_read_tokens", "sum_prefill_kv_tokens"}:
+                        value[key] = 0
+                    else:
+                        zero_history(item)
+            elif isinstance(value, list):
+                for item in value:
+                    zero_history(item)
+
+        zero_history(payload)
+        path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="publication requires source-bound observed MoE precision"):
+        aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+
+
+@pytest.mark.parametrize("location", ["wrapper", "decoder"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_k31_collection_rejects_multiple_architectures(tmp_path, location, reverse):
+    config_path, _ = _kimi_k31_config(tmp_path)
+    config = json.loads(config_path.read_text())
+    target = config if location == "wrapper" else config["text_config"]
+    target["architectures"] = ["KimiK31ForConditionalGeneration", "KimiK3ForConditionalGeneration"]
+    if reverse:
+        target["architectures"].reverse()
+        if location == "wrapper":
+            config["text_config"].pop("architectures", None)
+        else:
+            config["architectures"] = ["KimiK3ForConditionalGeneration"]
+    config_path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="Kimi K3.1 FPM collection requires single-entry architecture lists"):
+        build_collection_plan(
+            backend="vllm",
+            model_path=str(tmp_path),
+            model_config_path=str(config_path),
+            system="b200_sxm",
+            selected_ops=set(),
+            has_model_cases=False,
+            collector_config={"aic_database_version": "0.1.dev24216+g266e88c05"},
+            options=FPMCollectionOptions.from_args(_args(fpm_kv_cache_dtypes=["fp8"])),
+        )
+
+
 def test_native_aggregation_rejects_rank_grid_drift(tmp_path):
     plan, cell, cell_dir = _synthetic_plan_and_cell(tmp_path)
     second_rank = next((cell_dir / "raw" / "pod-1").glob("benchmark*.json"))
@@ -2693,6 +2883,28 @@ def test_detected_layout_publishes_real_prefix_and_uncached_prefill(tmp_path, re
     assert [(row["total_kv_read_tokens"], row["kv_seed_regime"]) for row in rows] == [(kv_tokens, "n/a")]
 
 
+@pytest.mark.parametrize("k31", [False, True])
+@pytest.mark.parametrize("kv_tokens", [0, 128])
+def test_k31_publication_rejects_archived_prefill_history(tmp_path, monkeypatch, k31, kv_tokens):
+    from collector.fpm_forward import database
+
+    plan, cell, cell_dir = _seeded_prefill_cell(tmp_path, "real_prefix" if kv_tokens else None, kv_tokens=kv_tokens)
+    plan.capability.template_id = GENERIC_RUNTIME_TEMPLATE_ID
+    plan.capability.architecture = "KimiK31ForConditionalGeneration" if k31 else "OtherModel"
+    # Worker qualification is covered independently. A worker that would pass
+    # cannot qualify unsupported prefix history; the shared acceptance guard
+    # now rejects it before the worker audit (and during cell recovery).
+    accepted = []
+    monkeypatch.setattr(database, "require_k31_worker_evidence", lambda *args: accepted.append(True))
+    if k31 and kv_tokens:
+        with pytest.raises(ValueError, match="K3.1 prefill publication requires zero historical KV tokens"):
+            aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+    else:
+        rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+        assert [row["total_kv_read_tokens"] for row in rows] == [kv_tokens]
+    assert accepted == ([] if k31 and kv_tokens else [True])
+
+
 _WARM_ELIGIBLE = {"enabled": True, "warm_eligible": True, "skip_reason": None}
 _DENSE_LABEL = {"enabled": True, "warm_eligible": False, "skip_reason": "dense_model_content_insensitive"}
 
@@ -2723,6 +2935,67 @@ def test_detected_layout_decode_keeps_the_existing_classification(tmp_path, kvwa
     plan.capability.is_moe = False
     rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
     assert {row["kv_seed_regime"] for row in rows} == {regime}
+
+
+@pytest.mark.parametrize(
+    "kvwarm,marker",
+    [
+        (_WARM_ELIGIBLE, "kvwarm_fake_fallback"),
+        (
+            {"enabled": True, "warm_eligible": False, "skip_reason": "moe_tp_balanced_by_construction"},
+            "kvwarm_fake_fallback",
+        ),
+        (_DENSE_LABEL, "kvwarm_fake_fallback"),
+        (None, None),
+    ],
+)
+def test_kda_decode_cannot_publish_fake_recurrent_state(tmp_path, kvwarm, marker):
+    plan, cell, cell_dir = _synthetic_decode_cell(tmp_path, kvwarm=kvwarm, markers=(marker,), parallel_strategy="tp")
+    plan.capability.model_config = ResolvedModelConfig(
+        {"text_config": {"linear_attn_config": {"num_heads": 12, "head_dim": 128}}},
+        source_kind="test",
+        source_reference="synthetic KDA geometry",
+    )
+    plan.capability.is_moe = True
+    with pytest.raises(ValueError, match="KDA decode publication requires real_kv"):
+        aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+
+
+def test_kda_decode_preserves_real_seed_evidence(tmp_path):
+    plan, cell, cell_dir = _synthetic_decode_cell(
+        tmp_path, kvwarm=_WARM_ELIGIBLE, markers=("kvwarm_real_kv",), parallel_strategy="tp"
+    )
+    plan.capability.model_config = ResolvedModelConfig(
+        {"text_config": {"linear_attn_config": {"num_heads": 12, "head_dim": 128}}},
+        source_kind="test",
+        source_reference="synthetic KDA geometry",
+    )
+    rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+    assert [row["kv_seed_regime"] for row in rows] == ["real_kv"]
+    assert rows[0]["latency_ms"] == 10.0  # Fixture's measured 0.01 seconds, unchanged.
+
+
+@pytest.mark.parametrize("damage", ["disabled", "contradictory"])
+def test_kda_decode_rejects_real_stamp_without_unambiguous_warmup(tmp_path, damage):
+    warmup = dict(_WARM_ELIGIBLE)
+    markers = ("kvwarm_real_kv",)
+    if damage == "disabled":
+        warmup["enabled"] = False
+    plan, cell, cell_dir = _synthetic_decode_cell(tmp_path, kvwarm=warmup, markers=markers, parallel_strategy="tp")
+    if damage == "contradictory":
+        artifact = cell_dir / "raw/pod-0/benchmark.json"
+        payload = json.loads(artifact.read_text())
+        # Both stamps on the same point, with no row-level seed regime.
+        for point in (payload["results"][0]["point"], payload["iteration_groups"][0]["point"]):
+            point["sample_reasons"].append("kvwarm_fake_fallback")
+        artifact.write_text(json.dumps(payload))
+    plan.capability.model_config = ResolvedModelConfig(
+        {"text_config": {"linear_attn_config": {"num_heads": 12, "head_dim": 128}}},
+        source_kind="test",
+        source_reference="synthetic KDA geometry",
+    )
+    with pytest.raises(ValueError, match="KDA decode publication requires real_kv"):
+        aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
 
 
 def test_native_validation_rejects_cross_rank_kvwarm_disagreement(tmp_path):
@@ -4104,3 +4377,162 @@ def test_formal_database_preserves_runtime_provenance_when_legacy_row_sorts_firs
     ]
     write_formal_database(plan, [incoming], systems_root=root)
     assert pq.read_table(parquet).to_pylist() == published
+
+
+@pytest.mark.parametrize("marker", ["kvwarm_fake_fallback", "kvwarm_real_kv"])
+@pytest.mark.parametrize("approved_skip", [False, True])
+def test_kda_attempt_seed_rejection_stays_retryable(tmp_path, monkeypatch, marker, approved_skip):
+    from collector.fpm_forward import runner
+
+    plan, cell, cell_dir = _synthetic_decode_cell(
+        tmp_path,
+        kvwarm=(
+            {"enabled": True, "warm_eligible": False, "skip_reason": "moe_tp_balanced_by_construction"}
+            if approved_skip
+            else _WARM_ELIGIBLE
+        ),
+        markers=(marker,),
+        parallel_strategy="tp",
+    )
+    plan.capability.model_config = ResolvedModelConfig(
+        {"text_config": {"linear_attn_config": {"num_heads": 12, "head_dim": 128}}},
+        source_kind="test",
+        source_reference="synthetic KDA geometry",
+    )
+    # Use the ordinary campaign layout so both recovery and resume read the
+    # same retained native bytes; no GPU runner is invoked in this test.
+    root = tmp_path / "campaign" / plan.sha256[:16] / "smoke"
+    target = root / "cells" / cell.cell_id
+    import shutil
+
+    shutil.copytree(cell_dir, target)
+    raw = target / "raw"
+    before = {p.relative_to(raw): p.read_bytes() for p in raw.rglob("*") if p.is_file()}
+    entry = {"status": "failed", "attempt_id": "attempt"}
+    recovered = runner._recover_completed_attempt(plan, cell, root, entry)
+    if marker == "kvwarm_fake_fallback" or approved_skip:
+        assert recovered is None
+        with pytest.raises(ValueError, match="KDA decode publication requires real_kv"):
+            runner._runtime_collection_summary(cell, raw, plan=plan, expected_attempt_id="attempt")
+    else:
+        assert recovered["status"] == "passed"
+    assert before == {p.relative_to(raw): p.read_bytes() for p in raw.rglob("*") if p.is_file()}
+
+
+@pytest.mark.parametrize("outer", [None, []])
+def test_k31_planning_rejects_null_outer_architecture(tmp_path, outer):
+    path, _ = _kimi_k31_config(tmp_path)
+    config = json.loads(path.read_text())
+    config["architectures"] = outer
+    config["text_config"]["architectures"] = ["KimiK31ForConditionalGeneration"]
+    path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="top-level architecture identity"):
+        build_collection_plan(
+            backend="vllm",
+            model_path=str(tmp_path),
+            model_config_path=str(path),
+            system="b200_sxm",
+            selected_ops=set(),
+            has_model_cases=False,
+            collector_config={"aic_database_version": "0.1.dev24216+g266e88c05"},
+            options=FPMCollectionOptions.from_args(
+                _args(fpm_kv_cache_dtypes=["fp8"], fpm_attention_backend="flashmla")
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "reasons",
+    [
+        "not_kvwarm_real_kv",
+        {"kvwarm_real_kv": True},
+        ["kvwarm_real_kv", 1],
+        ["kvwarm_real_kv"],
+        ["kvwarm_real_kv", "capture"],
+        ["kvwarm_real_kv", "prefill_fake_prefix"],
+        ["kvwarm_real_kv", "prefill_real_seed"],
+    ],
+)
+def test_kda_seed_requires_a_list_of_exact_string_stamps(tmp_path, reasons):
+    plan, cell, cell_dir = _synthetic_decode_cell(
+        tmp_path, kvwarm=_WARM_ELIGIBLE, markers=("kvwarm_real_kv",), parallel_strategy="tp"
+    )
+    plan.capability.model_config = ResolvedModelConfig(
+        {"linear_attn_config": {}}, source_kind="test", source_reference="synthetic KDA"
+    )
+    path = cell_dir / "raw/pod-0/benchmark.json"
+    payload = json.loads(path.read_text())
+    payload["results"][0]["point"]["sample_reasons"] = reasons
+    payload["iteration_groups"][0]["point"]["sample_reasons"] = reasons
+    path.write_text(json.dumps(payload))
+    if reasons in (["kvwarm_real_kv"], ["kvwarm_real_kv", "capture"]):
+        assert aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")[0]["kv_seed_regime"] == "real_kv"
+    else:
+        with pytest.raises(ValueError, match="KDA decode publication requires real_kv"):
+            aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+
+
+@pytest.mark.parametrize("smoke", [False, True])
+def test_profileless_k31_can_plan_but_cannot_execute(tmp_path, monkeypatch, smoke):
+    from collector.fpm_forward import runner
+
+    path, _ = _kimi_k31_config(tmp_path)
+    plan = build_collection_plan(
+        backend="vllm",
+        model_path=str(path.parent),
+        model_config_path=str(path),
+        system="b200_sxm",
+        selected_ops=set(),
+        has_model_cases=False,
+        generator_overrides={},
+        collector_config={"aic_database_version": "0.1.dev24216+g266e88c05"},
+        options=FPMCollectionOptions.from_args(_args(fpm_kv_cache_dtypes=["fp8"], fpm_attention_backend="flashmla")),
+    )
+    assert plan.cells and plan.runtime_instrumentation is None
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("profile-less K3.1 execution reached rendering or scheduling")
+
+    monkeypatch.setattr(runner, "_render_cell", unexpected)
+    monkeypatch.setattr(runner, "KubernetesCellRunner", unexpected)
+    monkeypatch.setattr(runner, "_cell_generator_overrides", unexpected)
+    with pytest.raises(ValueError, match="audited instrumentation bundle and accepted runtime launch"):
+        runner.run_collection(
+            plan,
+            generator_overrides={},
+            checkpoint_dir=str(tmp_path / "checkpoint"),
+            artifact_root=str(tmp_path / "artifacts"),
+            resume=False,
+            retry_failed=False,
+            smoke=smoke,
+        )
+    assert not (tmp_path / "artifacts").exists()
+
+
+@pytest.mark.parametrize("environment", [[{}], [None], [1], "invalid", {"name": "CUSTOM_AUTH"}])
+def test_archive_rejects_malformed_environment_with_value_error(environment):
+    with pytest.raises(ValueError, match="environment"):
+        archive_generator_overrides({"K8sConfig": {"extra_env": environment}})
+
+
+def test_archive_missing_and_null_environment_are_equivalent():
+    assert archive_generator_overrides({}) == archive_generator_overrides({"K8sConfig": {"extra_env": None}})
+
+
+def test_k31_collection_rejects_conflicting_singleton_wrapper(tmp_path):
+    config_path, _ = _kimi_k31_config(tmp_path)
+    config = json.loads(config_path.read_text())
+    config["architectures"] = ["OtherModel"]
+    config["text_config"]["architectures"] = ["KimiK31ForConditionalGeneration"]
+    config_path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="top-level architecture identity"):
+        build_collection_plan(
+            backend="vllm",
+            model_path=str(tmp_path),
+            model_config_path=str(config_path),
+            system="b200_sxm",
+            selected_ops=set(),
+            has_model_cases=False,
+            collector_config={"aic_database_version": "0.1.dev24216+g266e88c05"},
+            options=FPMCollectionOptions.from_args(_args(fpm_kv_cache_dtypes=["fp8"])),
+        )

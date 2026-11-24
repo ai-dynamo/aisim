@@ -342,14 +342,31 @@ def test_supplied_profile_version_is_preserved_or_requires_explicit_selection(
 
 
 @pytest.mark.parametrize("executor", ["kubernetes", "slurm"])
-def test_metadata_probe_targets_selected_container_without_gpu_requests(tmp_path, monkeypatch, executor):
+@pytest.mark.parametrize(
+    "environment",
+    [
+        None,
+        [],
+        [{"name": "OVERLAY", "value": "/runtime"}, {"name": "PYTHONPATH", "value": "$(OVERLAY)/wheel"}],
+        [
+            {"name": "PYTHONPATH", "value": "/runtime/deps"},
+            {"name": "LITERAL", "value": "a b;$HOME`echo no`\nnext"},
+        ],
+    ],
+)
+def test_metadata_probe_targets_selected_container_without_gpu_requests(tmp_path, monkeypatch, executor, environment):
     from aisim.support import versioning
 
     deployment = FPMDeployment(
         executor=executor,
         image="registry.example.invalid/benchmark:fixture",
+        extra_env=environment,
         **(
-            {"namespace": "synthetic-probe", "image_pull_secret": "synthetic-secret"}
+            {
+                "namespace": "synthetic-probe",
+                "image_pull_secret": "synthetic-secret",
+                "model_cache": "runtime:/runtime:checkpoint",
+            }
             if executor == "kubernetes"
             else {}
         ),
@@ -358,10 +375,15 @@ def test_metadata_probe_targets_selected_container_without_gpu_requests(tmp_path
     calls = []
     result = {"backend_version": "0.28.0+runtime", "dynamo_version": "custom-dynamo"}
 
-    def run(command, *, payload=None):
+    def run(command, *, payload=None, sensitive_values=(), sensitive_names=()):
+        assert sensitive_values == tuple(item["value"] for item in environment or ())
         calls.append((command, payload))
         if command[0] == "srun" or "logs" in command:
             return "AISIMULATE_RUNTIME_VERSION=" + json.dumps(result) + "\n"
+        if "pvc" in command:
+            return json.dumps(
+                {"status": {"phase": "Bound"}, "spec": {"volumeName": "synthetic-pv", "accessModes": ["ReadWriteMany"]}}
+            )
         if "get" in command:
             return json.dumps({"status": {"containerStatuses": [{"state": {"terminated": {"exitCode": 0}}}]}})
         return ""
@@ -372,12 +394,25 @@ def test_metadata_probe_targets_selected_container_without_gpu_requests(tmp_path
         assert len(calls) == 1
         assert f"--container-image={deployment.image}" in calls[0][0]
         assert "--gpus=0" in calls[0][0]
+        import shlex
+
+        assert calls[0][1] == "".join(
+            f"export {item['name']}={shlex.quote(item['value'])}\n" for item in environment or ()
+        )
+        assert "source /dev/stdin" in calls[0][0][-1]
     else:
         manifest = json.loads(next(payload for _, payload in calls if payload is not None))
         assert manifest["metadata"]["namespace"] == deployment.namespace
         assert manifest["spec"]["imagePullSecrets"] == [{"name": deployment.image_pull_secret}]
         container = manifest["spec"]["containers"][0]
         assert container["image"] == deployment.image
+        assert container.get("env", []) == [
+            {**item, "value": item["value"].replace("$", "$$")} for item in environment or ()
+        ]
+        assert manifest["spec"]["volumes"] == [
+            {"name": "model-cache", "persistentVolumeClaim": {"claimName": "runtime"}}
+        ]
+        assert container["volumeMounts"] == [{"name": "model-cache", "mountPath": "/runtime"}]
         assert "nvidia.com/gpu" not in container["resources"].get("requests", {})
         assert any("delete" in command for command, _ in calls)
 
@@ -531,7 +566,7 @@ def test_probe_subprocess_missing_package_exits_with_runtime_error(monkeypatch, 
     def run(command, **kwargs):
         observed_commands.append(command)
         assert command[0] == "srun"
-        return original_run([sys.executable, "-c", synthetic_runtime + command[-1]], **kwargs)
+        return original_run([sys.executable, "-c", synthetic_runtime + versioning._PROBE], **kwargs)
 
     monkeypatch.setattr(versioning.subprocess, "run", run)
     with pytest.raises(ValueError, match="runtime version detection failed.*", check=lambda exc: "vllm" in str(exc)):
@@ -867,7 +902,7 @@ def test_metadata_probe_reports_pod_startup_failure_before_cleanup(monkeypatch, 
 
     calls = []
 
-    def run(command, *, payload=None):
+    def run(command, *, payload=None, sensitive_values=(), sensitive_names=()):
         calls.append(command)
         if "wait" in command:
             raise ValueError("synthetic wait timeout")
@@ -885,3 +920,125 @@ def test_metadata_probe_reports_pod_startup_failure_before_cleanup(monkeypatch, 
     assert diagnostic in str(failure.value)
     assert any("get" in command for command in calls)
     assert "delete" in calls[-1]
+
+
+@pytest.mark.parametrize(
+    "model_cache,mount", [(None, None), ("cache", "/workspace/model_cache"), ("cache::model", "/workspace/model_cache")]
+)
+def test_runtime_version_probe_mounts_whole_model_pvc(monkeypatch, model_cache, mount):
+    from aisim.support import versioning
+
+    manifests = []
+
+    def run(command, *, payload=None, sensitive_values=(), sensitive_names=()):
+        if payload:
+            manifests.append(json.loads(payload))
+        if "logs" in command:
+            return 'AISIMULATE_RUNTIME_VERSION={"backend_version": "0.28.0+overlay"}\n'
+        if "pvc" in command:
+            return json.dumps(
+                {"status": {"phase": "Bound"}, "spec": {"volumeName": "synthetic-pv", "accessModes": ["ReadWriteMany"]}}
+            )
+        if "get" in command:
+            return json.dumps({"status": {"containerStatuses": [{"state": {"terminated": {"exitCode": 0}}}]}})
+        return ""
+
+    monkeypatch.setattr(versioning, "_run", run)
+    result = versioning.detect_runtime_versions(
+        FPMDeployment(
+            image="synthetic:image",
+            model_cache=model_cache,
+            extra_env=[{"name": "PYTHONPATH", "value": "/workspace/model_cache/deps"}],
+        )
+    )
+    assert result["backend_version"] == "0.28.0+overlay"
+    spec = manifests[0]["spec"]
+    if mount:
+        assert spec["volumes"][0]["persistentVolumeClaim"]["claimName"] == "cache"
+        assert spec["containers"][0]["volumeMounts"] == [{"name": "model-cache", "mountPath": mount}]
+    else:
+        assert "volumes" not in spec and "volumeMounts" not in spec["containers"][0]
+
+
+@pytest.mark.parametrize("status", ["Pending", "Lost", "Bound"])
+def test_version_probe_refuses_to_be_first_consumer_of_model_pvc(monkeypatch, status):
+    from aisim.support import versioning
+
+    calls = []
+
+    def run(command, *, payload=None, sensitive_values=(), sensitive_names=()):
+        calls.append(command)
+        assert "pvc" in command
+        # Bound without volumeName is also insufficient.
+        return json.dumps({"status": {"phase": status}, "spec": {}})
+
+    monkeypatch.setattr(versioning, "_run", run)
+    with pytest.raises(ValueError, match="already bound for the collection GPU topology"):
+        versioning.detect_runtime_versions(FPMDeployment(image="fixture:image", model_cache="cache"))
+    assert len(calls) == 1
+    assert "create" not in calls[0]
+
+
+@pytest.mark.parametrize(
+    "modes,consumer_nodes,valid",
+    [
+        (["ReadWriteMany"], ["node-a"], True),
+        (["ReadWriteOnce"], ["node-a"], True),
+        (["ReadWriteOnce"], ["node-a", "node-a"], True),
+        (["ReadWriteOnce"], [], True),
+        (["ReadWriteOnce"], [None], False),
+        (["ReadWriteOnce"], ["node-a", "node-b"], False),
+        (["ReadWriteOncePod"], ["node-a"], False),
+        (["ReadOnlyMany"], [], False),
+        ([], [], False),
+    ],
+)
+def test_version_probe_honors_model_cache_access_mode(monkeypatch, modes, consumer_nodes, valid):
+    from aisim.support import versioning
+
+    manifests = []
+
+    def run(command, *, payload=None, sensitive_values=(), sensitive_names=()):
+        if "pvc" in command:
+            return json.dumps({"status": {"phase": "Bound"}, "spec": {"volumeName": "pv", "accessModes": modes}})
+        if "pods" in command:
+            pods = [
+                {
+                    "spec": {"nodeName": node, "volumes": [{"persistentVolumeClaim": {"claimName": "cache"}}]},
+                    "status": {"phase": "Running" if node else "Pending"},
+                }
+                for node in consumer_nodes
+            ]
+            # Finished consumers and unrelated live claims cannot constrain placement.
+            pods.extend(
+                [
+                    {"spec": {"nodeName": "other", "volumes": [{"persistentVolumeClaim": {"claimName": "other"}}]}},
+                    {
+                        "spec": {"nodeName": "old", "volumes": [{"persistentVolumeClaim": {"claimName": "cache"}}]},
+                        "status": {"phase": "Succeeded"},
+                    },
+                ]
+            )
+            return json.dumps({"items": pods})
+        if payload:
+            manifests.append(json.loads(payload))
+        if "logs" in command:
+            return 'AISIMULATE_RUNTIME_VERSION={"backend_version":"fixture-version"}\n'
+        if "get" in command:
+            return json.dumps({"status": {"containerStatuses": [{"state": {"terminated": {"exitCode": 0}}}]}})
+        return ""
+
+    monkeypatch.setattr(versioning, "_run", run)
+    deployment = FPMDeployment(image="fixture:image", model_cache="cache")
+    if not valid:
+        with pytest.raises(ValueError, match="ReadWrite"):
+            versioning.detect_runtime_versions(deployment)
+        assert manifests == []
+        return
+    assert versioning.detect_runtime_versions(deployment) == {"backend_version": "fixture-version"}
+    spec = manifests[0]["spec"]
+    if modes == ["ReadWriteOnce"] and consumer_nodes:
+        terms = spec["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"]
+        assert terms == [{"matchFields": [{"key": "metadata.name", "operator": "In", "values": ["node-a"]}]}]
+    else:
+        assert "affinity" not in spec
