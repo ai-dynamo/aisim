@@ -633,8 +633,8 @@
     },
     {
       "path": "tools/merge_formal_tables.py",
-      "sha256": "f1d60e80493cb6a96d1c74ac58540ac6b1312c9f8938bf753988bb2fbcdb8d8f",
-      "bytes": 3791
+      "sha256": "c02bbaf8300d4167c00d5bdd6d1d4a27bcdd27e8aacb5873665e0ce465c2c4a7",
+      "bytes": 3408
     },
     {
       "path": "tools/verify_native_rows.py",
