@@ -4447,6 +4447,16 @@ mod tests {
                 "launch requires vLLM async_scheduling",
             ),
             (
+                |config| {
+                    config.kv_cache_bytes_per_token = Some(128);
+                    config.native_host_offload = Some(
+                        NativeHostOffloadConfig::new(8).with_connector(G2Connector::OffloadingV032),
+                    );
+                    set_canonical_mtp(config, 2);
+                },
+                "launch requires vLLM async_scheduling",
+            ),
+            (
                 |config| config.worker_type = WorkerType::Decode,
                 "launch is supported only on aggregated workers",
             ),

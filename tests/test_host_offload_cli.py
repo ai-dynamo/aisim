@@ -193,6 +193,24 @@ def test_canonical_mtp_host_config_preserves_composition_limits(change, error) -
 
 
 @pytest.mark.usefixtures("raw_data_coordinates")
+def test_canonical_mtp_host_rejects_launch_without_a_recurrent_state_cache() -> None:
+    engine = _mtp_host_engine()
+    worker = engine["workers"]["aggregated"]
+    worker["kv_cache"]["host_offload"]["connector"] = "offloading_v0_32"
+    worker["scheduler"]["launch"] = {
+        "decode_ms": 2,
+        "piecewise_ms": 5,
+        "eager_ms": 10,
+        "max_cudagraph_capture_size": 512,
+        "eager_queue_fraction": 0.4,
+    }
+    # Once the rank's state layout is known, the runner selects synchronous scheduling for this uniform G2.
+    config = CorePredictionConfig.model_validate({"engine": engine})
+    with pytest.raises(RuntimeError, match="launch requires vLLM async_scheduling"):
+        EngineReplayRunnerFactory().create(0).run(prediction_to_replay_spec(config))
+
+
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_canonical_mtp_host_config_takes_attention_dp() -> None:
     engine = _mtp_host_engine()
     engine["workers"]["aggregated"]["parallelism"]["attention_data"] = 2
