@@ -1105,13 +1105,12 @@ configuration, packed metrics and data fingerprint are in
 The op-level convention remains context **including** the current token;
 `telem.py` is not a whole-model FPM past-only-KV input.
 
-For the host-cost check, the baseline is the pinned starting head
-`3fb31295a29497869bef1a2b0081bb36aab9e13a`, and the candidate is `70f971d4`.
-Both native extensions used Rust 1.91.1, release optimization level 3,
-`CARGO_PROFILE_RELEASE_LTO=false`,
-`CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`, `CARGO_BUILD_JOBS=2`, and features
-`extension-module,jemalloc`. This bounded build profile avoided the container's
-memory limit. Python was 3.12.12 on Linux x86_64, Intel i9-14900K, with a
+For the refreshed host-cost check, the baseline is
+`3fb31295a29497869bef1a2b0081bb36aab9e13a`, and the corrective source is
+`4e940e38d2ba667c2905e5d5453b28110cb881d1`. Both native extensions used Rust
+1.91.1, release optimization level 3, thin LTO, one codegen unit,
+`CARGO_BUILD_JOBS=2`, and features `extension-module,jemalloc`. Python was
+3.12.12 on Linux x86_64, Intel i9-14900K, with a
 5 GiB container memory limit. The native embedded source inventories were
 verified against each exact commit, including dereferenced tracked symlinks.
 The report records their source and binary hashes.
@@ -1128,28 +1127,41 @@ python repair_replay_perf.py PYTHON BASE_SDK 6 OUT.json
 It calls `PYTHON -m aisim predict --stack engine` in six balanced build-order
 rounds. Each case completes 1000 synthetic requests of 2048 input and 32 output
 tokens at concurrency 64, with 512 cached-prefix tokens, a 4096-token scheduler
-budget and 64 request slots. Full configurations and raw rounds are in
-[`repair-replay-70f971d4.json`](mamba-mixed-step-accounting/repair-replay-70f971d4.json).
+budget and 64 request slots. Full configurations, verified build identities,
+the driver command and raw rounds are in
+[`repair-replay-4e940e38.json`](mamba-mixed-step-accounting/repair-replay-4e940e38.json).
 Nano uses a test-only BF16 width-one constructor shim, as `telem.py` does;
 the driver asserts that the child actually constructed qualified operations.
-That comparison did not activate qualification in built-in production defaults.
+Each Nano run records eight shim calls in the simulation process and zero
+in its supervisor, retaining both identities. The baseline constructor
+accepts both qualification kwargs, and both builds complete with the shim.
+This fixture does not change built-in production defaults.
 Qwen3-0.6B is the control. The fixed capacity, TP/DP/MoE parallelism, backend/version and
 all workload inputs are shared between builds.
 
+The earlier
+[`repair-replay-70f971d4.json`](mamba-mixed-step-accounting/repair-replay-70f971d4.json)
+is explicitly superseded: its driver hash differed and its recorded shim
+counts were all zero. Its qualification and host-cost claims are withdrawn;
+the following numbers come only from the refreshed, verified run. No source
+or native build changes occur between the corrective source and the evidence
+commit that adds these reports.
+
 | Case | Full CLI median (baseline to candidate) | Native `wall_time_ms` median | Peak RSS median |
 | --- | --- | --- | --- |
-| Qualified Nano | 3.183 to 3.147 s | 96.334 to 89.327 ms | 308.9 to 318.9 MiB |
-| Qwen3-0.6B control | 2.956 to 2.903 s | 97.289 to 97.935 ms | 258.5 to 259.2 MiB |
+| Qualified Nano | 3.158 to 3.201 s | 86.315 to 84.930 ms | 296.6 to 297.3 MiB |
+| Qwen3-0.6B control | 2.995 to 2.993 s | 93.317 to 89.421 ms | 258.4 to 277.0 MiB |
 
 Full CLI timing includes startup, model construction, report aggregation and
 serialization. Native `wall_time_ms` has the narrower Replay boundary described
 in the performance skill: it excludes model construction and final evidence
 aggregation. RSS is the supervisor's peak observed process-tree memory. Nano's
-RSS ranges overlap (299.5–320.3 versus 299.9–320.5 MiB), as do the runtime
-ranges; these samples do not demonstrate a material host-runtime regression.
+RSS ranges overlap (296.1–310.7 versus 296.0–304.8 MiB). CLI ranges are
+3.038–3.318 versus 3.026–3.271 s, and native ranges are
+83.082–88.576 versus 80.438–85.906 ms. These samples do not demonstrate a material host-runtime regression.
 They do not establish a speedup or a universal overhead bound. Every run
 completed all input and output tokens. Nano's modeled mean TTFT changes from
-56.580465 to 56.869976 ms, and TPOT from 24.988958 to 25.072246 ms as the
+56.580465 to 56.870103 ms, and TPOT from 24.988958 to 25.072246 ms as the
 actual chunk/prefix groups replace balanced coordinates. The control's
 modeled results are identical. These are functional and cost checks, not
 silicon accuracy qualification.
@@ -1304,24 +1316,44 @@ python canonical_mtp_perf.py PYTHON BASE_SDK 6 OUT.json REPO BASE_REV CANDIDATE_
 It runs `PYTHON -m aisim predict --stack engine` in six balanced build-order
 rounds. Nano uses canonical `nextn: 3`, `nextn_accepted: 2.2`, FP32 state;
 Qwen3-0.6B without MTP is the control. Each case completes 1000 requests,
-2,048,000 input tokens and 32,000 output tokens. Configuration, build hashes
-and all rounds are in
+2,048,000 input tokens and 32,000 output tokens. Configuration, verified
+Python revisions, build hashes, host identity, exact CLI commands and all
+rounds are in
 [canonical-mtp-perf.json](mamba-mixed-step-accounting/canonical-mtp-perf.json).
+The [compressed companion](mamba-mixed-step-accounting/canonical-mtp-perf.requests.json.gz)
+contains all 24,000 raw request records, bound to each result by SHA256. The
+report also records the companion's checksum. The retained-sample regression
+recomputes the completion/token totals and mean TTFT/TPOT from those records.
+
+This refresh compares Python baseline `22a3fec3c24613fd68cf056a83ede789bd74cf8d`
+with corrective source `4e940e38d2ba667c2905e5d5453b28110cb881d1`. Both use
+the latter's optimized native extension; it isolates the Python constructor
+integration, rather than comparing two complete historical builds. Before
+each run the driver verifies both complete imported Python source trees
+against the recorded Git revisions. Linux x86_64, Intel i9-14900K, Python
+3.12.12 and the matched native build settings above apply. This is CPU simulation of
+B200, not an accelerator measurement. The following values replace the
+earlier report without raw samples.
 
 | Case | Full CLI median seconds | Native `wall_time_ms` median | Peak RSS median MiB |
 | --- | --- | --- | --- |
-| Nano MTP3 | 2.930 / 2.933 | 80.685 / 81.544 | 291.7 / 296.4 |
-| Qwen control | 2.775 / 2.726 | 91.778 / 89.744 | 259.1 / 250.6 |
+| Nano MTP3 | 3.237 / 3.244 | 85.639 / 84.072 | 297.3 / 297.0 |
+| Qwen control | 3.097 / 3.110 | 89.770 / 89.711 | 269.7 / 261.1 |
 
-Nano CLI ranges were 2.893–2.968 / 2.898–3.003 seconds. Native time ranges
-were 78.862–80.987 / 80.090–82.833 ms. Full CLI timing includes startup,
+Nano CLI ranges were 3.146–4.008 / 3.148–3.271 seconds. Native time ranges
+were 79.185–88.047 / 80.769–85.187 ms. Full CLI timing includes startup,
 construction and output serialization. Native time covers the interval in
 `Replayer::run_inner` through collector finalization and excludes model
 construction and final aggregation. Predicted Nano mean TTFT changes from
 444.293 to 463.764 ms and TPOT from 9.070 to 9.473 ms as state and checkpoint
 accounting becomes reachable. Every control serving metric is unchanged.
-These bounded host timings show no material avoidable overhead in this
-constructor integration; they are not serving-accuracy measurements.
+The timing ranges overlap and do not establish a speedup or an overhead
+bound. They show no material host-cost regression in this constructor
+integration and are not serving-accuracy measurements.
+
+The canonical driver's untimed preflight verifies imported Python sources.
+It repeats that verification at child shutdown, so full CLI time includes
+the shutdown checks in both builds; native `wall_time_ms` excludes them.
 
 ### Diagnostic and aggregate model limits
 
@@ -2025,6 +2057,12 @@ To reproduce `xpu_scoped_repair.py --candidate-revision REV`, first check out
 `REV` and reinstall that revision's SDK into the selected interpreter. The
 driver compares the imported backend bytes with that commit. A current
 installation cannot reproduce an older revision merely by passing its SHA.
+
+The refreshed [XPU width fixture](mamba-mixed-step-accounting/scoped-xpu-4e940e38.json)
+records all five backend stub returns and the fixed `_compute_ttft` inputs.
+Its token counts and mixed latency come from native SOL queries; its TTFT
+combines that result with the recorded synthetic constants. It is neither a
+complete historical replay nor a host-cost or accuracy measurement.
 
 ### Scoped review correction
 

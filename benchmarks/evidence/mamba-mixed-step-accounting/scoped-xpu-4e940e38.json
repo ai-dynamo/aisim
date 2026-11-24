@@ -1,0 +1,92 @@
+{
+  "candidate": "4e940e38d2ba667c2905e5d5453b28110cb881d1",
+  "candidate_sources_sha256": {
+    "python/aisim/src/aisim_core/sdk/backends/base_backend.py": "49404c805232cbdb50ed58dd1c993fe5bfd888f2e73d8ada8a0a439800d77bbe",
+    "python/aisim/src/aisim_core/sdk/backends/vllm_backend_xpu.py": "32d6bc407f8207bc6d52acaf9a954c337389192c8412da19efdcb98ba567c0f0"
+  },
+  "driver_sha256": "9b46d1a196cd12c09c4ad5731a3f96ff994c7bf08a130fd599b911d209094241",
+  "baseline": "25c424119adaa47ad6c748d982719384e8a16b04",
+  "native_extension_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+  "workload": {
+    "system": "b200_sxm",
+    "backend": "vllm",
+    "backend_version": "0.24.0",
+    "database_mode": "SOL",
+    "gpu_mem_bw_bytes_per_second": 7700000000000,
+    "isl": 4096,
+    "osl": 64,
+    "batch": 4,
+    "layers": 1
+  },
+  "kind": "native SOL accounting predictions, not silicon accuracy or host performance",
+  "comparison_boundary": "baseline XPU Python class versus candidate class, both using the candidate native engine",
+  "reproduction_command": "python benchmarks/evidence/mamba-mixed-step-accounting/scoped_xpu_width.py --candidate-revision 4e940e38d2ba667c2905e5d5453b28110cb881d1 OUT.json",
+  "fixture": {
+    "stub_returns": {
+      "_max_kv_slots": 100,
+      "_mix_step_gen_tokens": 2,
+      "_effective_decode_bs": 4,
+      "_get_genonly_step_latency": [
+        1.0,
+        0.0,
+        {},
+        {},
+        []
+      ],
+      "_decode_tpot_ms": 1.5
+    },
+    "compute_ttft_inputs": {
+      "prefill_step_ms": 0,
+      "genonly_step_latency_ms": 1,
+      "encoder_latency_ms": 0,
+      "steps_to_finish_ctx": 4,
+      "decode_iterations": 63
+    },
+    "native_fields": [
+      "prefill_tokens",
+      "decode_query_tokens",
+      "mixed_latency_ms"
+    ],
+    "derived_with_stubs": [
+      "ttft_ms"
+    ]
+  },
+  "cases": [
+    {
+      "prefix": 0,
+      "budget": 514,
+      "decoders": 2,
+      "width": 4,
+      "before": {
+        "prefill_tokens": 512,
+        "decode_query_tokens": 8,
+        "mixed_latency_ms": 0.003025853506493506,
+        "ttft_ms": 0.43498884088462564
+      },
+      "after": {
+        "prefill_tokens": 506,
+        "decode_query_tokens": 8,
+        "mixed_latency_ms": 0.0030097953246753244,
+        "ttft_ms": 0.43721010221964446
+      }
+    },
+    {
+      "prefix": 3000,
+      "budget": 514,
+      "decoders": 2,
+      "width": 4,
+      "before": {
+        "prefill_tokens": 512,
+        "decode_query_tokens": 8,
+        "mixed_latency_ms": 0.003025853506493506,
+        "ttft_ms": 0.4131098895712664
+      },
+      "after": {
+        "prefill_tokens": 506,
+        "decode_query_tokens": 8,
+        "mixed_latency_ms": 0.0030097953246753244,
+        "ttft_ms": 0.4131098895712664
+      }
+    }
+  ]
+}

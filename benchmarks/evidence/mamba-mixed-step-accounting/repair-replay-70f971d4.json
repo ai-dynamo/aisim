@@ -536,5 +536,10 @@
    "cgroup_memory_bytes": 5368709120
   }
  },
- "command": "python benchmarks/evidence/mamba-mixed-step-accounting/repair_replay_perf.py PYTHON BASE_SDK 6 OUT.json"
+ "command": "python benchmarks/evidence/mamba-mixed-step-accounting/repair_replay_perf.py PYTHON BASE_SDK 6 OUT.json",
+ "evidence_status": {
+  "status": "superseded; not qualification evidence",
+  "reason": "The recorded driver hash differs from the committed driver and all stored Nano shim call counts are zero. The earlier qualification and performance claims are withdrawn.",
+  "replacement": "repair-replay-4e940e38.json"
+ }
 }
