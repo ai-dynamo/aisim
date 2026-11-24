@@ -1669,6 +1669,103 @@ def test_run_agg_visual_fpm_keeps_uncached_step_count(
     assert group.per_op_energy_wms["visual_attention"] == pytest.approx(400.0)
 
 
+@pytest.mark.parametrize("fresh_tokens", [2000, 2192])
+@pytest.mark.parametrize("xpu", [False, True])
+def test_batched_fpm_visual_overlay_preserves_fractional_requests(
+    backend, model, database, monkeypatch, fresh_tokens, xpu
+):
+    from aisim.sdk.backends import base_backend as base_backend_module
+
+    if xpu:
+        from aisim_core.sdk.backends.vllm_backend_xpu import VLLMXPUBackend
+
+        backend = VLLMXPUBackend()
+        monkeypatch.setattr(backend, "_max_kv_slots", lambda *a, **k: 100)
+        monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+        # Isolate aggregate overlay accounting from XPU's calibrated TTFT
+        # queries, which add their own independently scheduled overlays.
+        monkeypatch.setattr(backend, "_compute_ttft", lambda *a, **k: 1.0)
+    model.forward_model = "fpm"
+    model.encoder_config = _vision_encoder_config()
+    model.visual_context_ops = [_StaticOp("visual_attention", 1.0, 100.0)]
+    # Admit two prefills alongside two decoders; isolate the native visual
+    # pricing seam with a deliberately nonlinear batch price (batch squared).
+    monkeypatch.setattr(backend, "_mix_step_gen_tokens", lambda *_: 2)
+    monkeypatch.setattr(backend, "_get_genonly_step_estimate", lambda *_: StepEstimate(0.0, 0.0))
+    monkeypatch.setattr(
+        base_backend_module,
+        "estimate_mixed_step_breakdown_with_rust",
+        lambda *a, **kw: {
+            "latency_ms": 5.0,
+            "energy_wms": 0.0,
+            "component_latency_ms": {"shared_non_attention": 5.0},
+            "component_energy_wms": {},
+            "per_op_latency_ms": {"fpm": 5.0},
+            "per_op_source": {"fpm": "silicon"},
+            "moe_comm_fallbacks": (),
+        },
+    )
+    batches = []
+
+    def visual_phase(_model, _database, _runtime, batch):
+        batches.append(batch)
+        return (
+            {"visual_attention": float(batch**2)},
+            {"visual_attention": float(100 * batch**2)},
+            {"visual_attention": "silicon"},
+        )
+
+    monkeypatch.setattr(backend, "_run_visual_context_phase", visual_phase)
+    # The aggregate accepts prompt capacity: 4096 + 904 -> 2000 fresh
+    # tokens, or two full 4096-token prompts -> 2192 fresh tokens.
+    budget = 4096 + fresh_tokens - 1096 if fresh_tokens < 2192 else 8192
+    if xpu:
+        budget += 2  # Reserve the two width-one decoders before translation.
+    summary = backend.run_agg(
+        model,
+        database,
+        RuntimeConfig(
+            batch_size=4,
+            isl=3072,
+            prefix=3000,
+            osl=64,
+            num_images_per_request=1,
+            num_image_tokens=1024,
+            engine_step_backend="rust",
+        ),
+        ctx_tokens=budget,
+    )
+    steps = summary.get_step_estimates()["scheduling"]["num_mix_steps"]
+    # The representative query holds 1 + 904/1096 requests, or exactly 2.
+    # A mixture of batch 1 and 2 prices 1 + 3*904/1096 ms (not 4 ms).
+    fraction = (fresh_tokens - 1096) / 1096
+    assert steps * ((1 - fraction) + 2 * fraction) == pytest.approx(4)
+    expected = steps * (1 + 3 * fraction)
+    group = summary.get_aggregate_energy_breakdown()["mix_step"]
+    assert group.per_op_latency_ms["visual_attention"] == pytest.approx(expected)
+    assert group.per_op_energy_wms["visual_attention"] == pytest.approx(100 * expected)
+    assert group.covered_latency_ms == pytest.approx(expected)
+    assert batches == ([1, 2] if fresh_tokens == 2000 else [2])
+    # A public scheduled query has ceil(fresh/suffix) real requests. It must
+    # retain the native batch-two overlay rather than aggregate weighting.
+    direct = backend.run_mixed(
+        model,
+        database,
+        RuntimeConfig(
+            batch_size=4,
+            isl=3072,
+            prefix=3000,
+            osl=64,
+            num_images_per_request=1,
+            num_image_tokens=1024,
+            engine_step_backend="rust",
+        ),
+        MixedStepInput(fresh_tokens, 2),
+    )
+    assert direct.per_op_latency_ms["visual_attention"] == pytest.approx(4.0)
+    assert batches[-1] == 2
+
+
 @pytest.mark.parametrize("native_op", [False, True])
 @pytest.mark.parametrize("phase", ["context", "generation"])
 @pytest.mark.parametrize("prefix", [0, 3000])
@@ -1759,6 +1856,13 @@ def test_qualified_mamba_aggregate_translates_capacity_before_native_validation(
     assert mixed.per_op_latency_ms["norm"] == pytest.approx(
         (new_tokens + mixed.num_decode_query_tokens) * 2 / bw * 1000
     )
+    # Capacity translation must also reweight the complete aggregate: four
+    # uncached suffixes, each with one state read/write, irrespective of how
+    # many prefills fit the representative query.
+    scheduling = summary.get_step_estimates()["scheduling"]
+    assert scheduling["num_mix_steps"] == 4 / prefills
+    group = summary.get_aggregate_energy_breakdown()["mix_step"]
+    assert group.per_op_latency_ms["context_scan"] == pytest.approx((4 * 1096 * 18_560 + 4 * 2_097_152) / bw * 1000)
     # Public scheduled input keeps the strict boundary instead of silently
     # converting the same invalid shape as if it were scheduler capacity.
     with pytest.raises(ValueError, match="partial prefill extend"):

@@ -392,6 +392,61 @@ def test_direct_run_mixed_estimates_the_scheduled_step_as_given(monkeypatch) -> 
     assert captured["step"] == step
 
 
+@pytest.mark.parametrize("width", [1, 4])
+@pytest.mark.parametrize("budget", [1, 4, 5, 8, 9, 100])
+def test_agg_decode_admission_fits_packed_tokens(monkeypatch, width, budget):
+    backend = VLLMXPUBackend()
+    captured = {}
+    _capture_mixed_step(monkeypatch, captured)
+    rc = SimpleNamespace(isl=100, osl=100, prefix=0, batch_size=16)
+    backend.run_agg(
+        MagicMock(_nextn=width - 1),
+        MagicMock(),
+        rc,
+        step=MixedStepInput(context_tokens=budget, num_decode_requests=50),
+    )
+    scheduled = captured["step"]
+    assert scheduled.num_decode_requests == min(3, max(1, round(budget / 2)), (budget - 1) // width)
+    assert scheduled.context_tokens >= 1
+    assert scheduled.context_tokens + scheduled.num_decode_requests * width == budget
+
+
+@pytest.mark.parametrize("budget,decoders", [(4, 0), (5, 1), (8, 1), (9, 2)])
+def test_agg_decode_admission_prices_the_native_scheduled_work(monkeypatch, budget, decoders):
+    from aisim_core.sdk.config import ModelConfig, RuntimeConfig
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.operations import ElementWise
+    from aisim_core.sdk.perf_database import get_database_view
+    from aisim_core.sdk.speculation import SpeculationConfig
+
+    backend = VLLMXPUBackend()
+    model = get_model(
+        "Qwen/Qwen3-0.6B",
+        ModelConfig(
+            tp_size=1,
+            moe_tp_size=1,
+            moe_ep_size=1,
+            speculation=SpeculationConfig(kind="ngram", params={"num_speculative_tokens": 3}),
+        ),
+        "vllm",
+    )
+    model.context_ops = [ElementWise("norm", 1, 1, 0)]
+    model.generation_ops = [ElementWise("norm", 1, 1, 0)]
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL")
+    monkeypatch.setattr(backend, "_max_kv_slots", lambda *a, **k: 100)
+    backend._in_agg = True
+    estimate = backend.run_mixed(
+        model, database, RuntimeConfig(batch_size=4, isl=100, osl=100), MixedStepInput(budget, 3)
+    )
+    assert estimate.num_decode_requests == decoders
+    assert estimate.num_decode_query_tokens == 4 * decoders
+    assert estimate.context_tokens == budget - 4 * decoders
+    # This synthetic norm moves two bytes for each scheduled token. The real
+    # native query must price exactly the admitted prefill + decode width.
+    expected_ms = budget * 2 / database.system_spec["gpu"]["mem_bw"] * 1000
+    assert estimate.per_op_latency_ms["norm"] == pytest.approx(expected_ms)
+
+
 def test_prefill_heavy_boundary_prices_decode_steps() -> None:
     # ceil(isl*b/ctx) >= osl: base prices no decode-only steps (0 ms); the XPU blend must still price them.
     from aisim.legacy_cli.api import cli_estimate

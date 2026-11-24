@@ -22,8 +22,13 @@ class MixedStepInput:
     full prompt tokens:
     ``context_tokens // isl`` complete requests of the effective ``isl``
     tokens, prefix included. A nonzero remainder adds one partial request,
-    and an exact multiple of ``isl`` has none. A qualified Mamba op caps that
-    partial request at ``isl - prefix`` new tokens. The budget is not the
+    and an exact multiple of ``isl`` has none. For a qualified Mamba prefill op,
+    the partial request must not exceed ``isl - prefix`` new tokens; direct
+    ``run_mixed`` calls reject an oversized remainder. Only ``run_agg``
+    translates scheduler capacity by capping the remainder before submitting
+    the scheduled step. For example, at ``isl=4096`` and ``prefix=3000``,
+    direct ``context_tokens=2048`` is invalid, while aggregate capacity 2048
+    schedules 1096 tokens. The budget is not the
     count of newly scheduled tokens after prefix-cache hits. A whole-model FPM
     instead reads ``context_tokens`` as new tokens. If the budget holds at
     least one request's ``isl - prefix`` new tokens, it derives

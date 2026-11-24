@@ -1782,6 +1782,7 @@ class BaseBackend:
         step: MixedStepInput,
         *,
         _decode_ops=None,
+        _aggregate_visual_requests: bool = False,
     ) -> StepEstimate:
         """Estimate one scheduled mixed prefill/decode forward pass.
 
@@ -1833,17 +1834,31 @@ class BaseBackend:
             visual_request_tokens = isl - prefix if _is_fpm_model(model) else isl
             visual_batch = int(np.ceil(step.context_tokens / visual_request_tokens))
             visual_scale = float(np.ceil(visual_request_tokens / step.context_tokens))
-            visual_latency, visual_energy, visual_source = self._run_visual_context_phase(
-                model,
-                database,
-                runtime_config,
-                visual_batch,
-            )
-            visual_latency = {name: value / visual_scale for name, value in visual_latency.items()}
-            visual_energy = {name: value / visual_scale for name, value in visual_energy.items()}
+            visual_batches = [(visual_batch, 1.0)]
+            if _aggregate_visual_requests and step.context_tokens > visual_request_tokens:
+                full, remainder = divmod(step.context_tokens, visual_request_tokens)
+                if remainder:
+                    # Match the aggregate's fractional request count with a
+                    # mixture of integer native queries. Each batch retains
+                    # its own price; overlay cost need not be linear in batch.
+                    fraction = remainder / visual_request_tokens
+                    visual_batches = [(full, 1.0 - fraction), (full + 1, fraction)]
+            visual_latency, visual_energy, visual_source = defaultdict(float), defaultdict(float), {}
+            visual_covered_ms = 0.0
+            for batch, weight in visual_batches:
+                latencies, energies, sources = self._run_visual_context_phase(model, database, runtime_config, batch)
+                for name, value in latencies.items():
+                    scaled = value / visual_scale * weight
+                    visual_latency[name] += scaled
+                    visual_energy[name] += energies[name] / visual_scale * weight
+                    if energies[name] > 0:
+                        visual_covered_ms += scaled
+                    source = sources[name]
+                    previous = visual_source.get(name, source)
+                    visual_source[name] = source if source == previous else "mixed"
             visual_latency_total = sum(visual_latency.values())
             visual_energy_total = sum(visual_energy.values())
-            covered_latency_ms += sum(value for name, value in visual_latency.items() if visual_energy[name] > 0)
+            covered_latency_ms += visual_covered_ms
             latency_ms += visual_latency_total
             energy_wms += visual_energy_total
             component_latency_ms["context_attention"] = (
@@ -2016,6 +2031,14 @@ class BaseBackend:
             )
         else:
             step = self._schedule_qualified_mamba_prefill(model, runtime_config, step)
+        if (
+            _is_fpm_model(model)
+            and runtime_config.batch_size > 1
+            and self._has_visual_context_work(model, runtime_config)
+        ):
+            # Only aggregate mean-field weights contain fractional requests.
+            # Direct scheduled FPM calls retain ceil(new tokens / suffix).
+            return self.run_mixed(model, database, runtime_config, step, _aggregate_visual_requests=True)
         return self.run_mixed(model, database, runtime_config, step)
 
     def _schedule_qualified_mamba_prefill(self, model, runtime_config, step: MixedStepInput) -> MixedStepInput:

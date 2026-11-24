@@ -1350,6 +1350,61 @@ the past-only request for this diagnostic or authorize a separate migration
 of the packed contract and all callers. The requested subtraction is left
 unapplied.
 
+`PRRT_kwDOT0t9uc66vgSP`: qualified draft scans in a whole-model FPM aggregate
+still inherit the target's fractional mean-field schedule. At batch 4,
+ISL 4096, prefix 3000 and a 2000-fresh-token query, that schedule weights two
+state pairs by `4384 / 2000`, or 4.384 state pairs. A densely packed stream
+would instead have piece lengths `[1096, 904]`, `[192, 1096, 712]`, `[384]`,
+requiring six state pairs. The current aggregate does not describe that
+stream's three target queries or heterogeneous cached prefixes. A maintainer
+must choose whether to replace the target's mean-field schedule with stream
+queries, or retain it and define a separate stream correction for qualified
+draft operations. This repair does not silently select either modeling
+contract. The native per-query draft scan correction remains intact.
+
+### Fractional visual overlays and packed XPU admission
+
+The repair based on `7df29a6519595ac33a181e620375bd92e4f5ecf5` addresses
+`PRRT_kwDOT0t9uc66w65v` by matching the visual overlay's expected request count
+to the FPM aggregate. A query with `1 + 904/1096` fresh-token requests now
+mixes native visual prices at batches 1 and 2 with weights `192/1096` and
+`904/1096`. Multiplying by `4384/2000` mixed steps accounts for exactly four
+requests. Each integer batch keeps its own native price; cost is not assumed
+linear. The aggregate regression uses a deliberately nonlinear synthetic
+price of batch squared: total overlay latency falls from 8.768 to 7.616 ms,
+and its 100 W energy from 876.8 to 761.6 W-ms. At 2192 fresh tokens the
+two-request price and 8 ms aggregate are unchanged. These are orchestration
+fixtures, not silicon measurements. Only fractional visual FPM aggregate
+queries add a second native overlay call; work and retained evidence remain
+O(visual ops). Direct scheduled queries retain whole overlay requests.
+
+For `PRRT_kwDOT0t9uc66w653`, XPU aggregate admission now caps decoders at
+`floor((total_budget - 1) / (nextn + 1))`, in addition to the existing
+occupancy and KV limits. It can admit zero decoders and always leaves a
+positive prefill budget. For example, capacity 8 admits one width-four
+decoder and four prefill tokens, instead of pricing twelve decode tokens
+and a fabricated one-token prefill. A real native SOL norm fixture checks
+that the engine prices exactly the admitted token total. The additional
+admission arithmetic is constant time and does not change direct scheduled
+`run_mixed` calls. `MixedStepInput` now also documents the existing native
+oversized-remainder rejection separately from aggregate capacity trimming
+(`PRRT_kwDOT0t9uc66w66I`).
+
+Verification used Python 3.12.12 and a Rust 1.91.1 optimized wheel, built
+with `maturin build --release --locked --auditwheel skip`, the repository's
+thin-LTO release profile, `extension-module,jemalloc` and two Cargo jobs.
+The six scoped backend/FPM/Mamba/single-oracle modules passed **610 tests**;
+both required parity modules passed **390 tests**, with unchanged goldens.
+The capacity-translation regression also checks total work for the already
+corrected `PRRT_kwDOT0t9uc66w5Cj`: four 1096-token suffixes and four state
+pairs, for either representative prefill batch size. Full Python lint/format,
+source/legal policy, syntax compilation and the evidence page's links pass.
+An earlier concurrent run had two FPM replay checks return `resource_limited`
+while Rust compiled; the serial 610-test rerun passed with normal memory
+admission, assertions and timeouts intact. Initial formatter, system-Python
+documentation-dependency and wrong-directory wheel-repack attempts were
+corrected. Attempt logs remain in this repair run's scratch directory.
+
 ### Scoped review corrections after `0cfbdb55`
 
 Exact `prefill_chunks` now coalesce equal `(new tokens, prefix)` shapes

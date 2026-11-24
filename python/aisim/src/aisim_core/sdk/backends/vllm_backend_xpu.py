@@ -374,12 +374,19 @@ class VLLMXPUBackend(VLLMBackend):
             if step.num_decode_requests > cap:
                 step = replace(step, num_decode_requests=cap)
 
+        # Admission already reduces occupancy to the available capacity. Apply
+        # the same rule to packed tokens, keeping at least one prefill token.
+        width = model._nextn + 1
+        decode_cap = (step.context_tokens - 1) // width
+        if step.num_decode_requests > decode_cap:
+            step = replace(step, num_decode_requests=decode_cap)
+
         # total budget -> prefill tokens: subtract the reserved decode slots.
         request_tokens = isl
         if getattr(model, "forward_model", "op_level") == "fpm":
             request_tokens = max(1, isl - int(runtime_config.prefix or 0))
         demand = max(1, int(getattr(runtime_config, "batch_size", 1) or 1)) * request_tokens
-        budget = max(1, step.context_tokens - step.num_decode_requests * (model._nextn + 1))
+        budget = step.context_tokens - step.num_decode_requests * width
         if getattr(model, "forward_model", "op_level") == "fpm" and runtime_config.batch_size > 1:
             budget = self._fpm_aggregate_prefill_tokens(
                 budget,
@@ -389,4 +396,10 @@ class VLLMXPUBackend(VLLMBackend):
             )
         step = replace(step, context_tokens=max(1, min(demand, budget)))
         step = self._schedule_qualified_mamba_prefill(model, runtime_config, step)
+        if (
+            getattr(model, "forward_model", "op_level") == "fpm"
+            and runtime_config.batch_size > 1
+            and self._has_visual_context_work(model, runtime_config)
+        ):
+            return super().run_mixed(model, database, runtime_config, step, _aggregate_visual_requests=True)
         return super().run_mixed(model, database, runtime_config, step)
