@@ -83,6 +83,7 @@ def test_native_tp_route_uses_common_limit_without_collective_shape_selector(mon
 
 @pytest.fixture(autouse=True)
 def isolated_collector_workdir(monkeypatch, tmp_path):
+    monkeypatch.delenv("COLLECTOR_LOG_DIR", raising=False)
     monkeypatch.chdir(tmp_path)
 
 

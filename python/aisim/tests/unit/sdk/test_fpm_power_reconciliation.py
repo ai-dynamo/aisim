@@ -473,12 +473,17 @@ def test_unified_recommend_publishes_powered_fpm(powered_engine_config):
 
 
 def test_replay_of_restored_regression_role_keeps_power_unsupported(tmp_path):
+    from dataclasses import replace
+
     from aisim import _runtime
     from aisim_core.sdk import RustForwardPassPerfModel
 
     from .test_fpm_state_snapshot import _regression_config, _stream
 
-    model = RustForwardPassPerfModel.best_available(_regression_config())
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(json.dumps({"architectures": ["Qwen3ForCausalLM"]}))
+    model = RustForwardPassPerfModel.best_available(replace(_regression_config(), model=str(checkpoint)))
     model.tune_with_fpms(_stream(7, 400))
     saved = model.save_state_snapshot(tmp_path / "regression")
     restored = RustForwardPassPerfModel.best_available(state_snapshot=tmp_path / "regression")

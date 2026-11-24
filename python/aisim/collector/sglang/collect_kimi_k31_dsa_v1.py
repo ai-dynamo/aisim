@@ -657,8 +657,7 @@ def main() -> None:
             if output.exists():
                 shutil.copyfile(output, stage)
             previous_size = stage.stat().st_size if stage.exists() else 0
-            args.output = str(stage)
-            _collect_native(args, case, tp)
+            _run_native_case(case, args.device, stage, expected_sm=args.sm, phase=args.phase)
             if not stage.exists() or stage.stat().st_size <= previous_size:
                 raise RuntimeError("standalone native ranks exited without appending a result row")
             if collector_retained_path(output).exists():

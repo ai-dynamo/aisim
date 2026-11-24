@@ -198,8 +198,10 @@ def test_native_dispatch_setting_is_fixed_for_child_and_standalone(monkeypatch, 
     monkeypatch.setattr(
         sys, "argv", ["collector", "--case", json.dumps(list(case)), "--phase", "generation", "--output", str(output)]
     )
-    with pytest.raises(RuntimeReached):
-        module.main()
+    with module.native_publication_lock(output) as lock_fd:
+        sys.argv.extend(["--publication-lock-fd", str(lock_fd)])
+        with pytest.raises(RuntimeReached):
+            module.main()
 
 
 def test_physical_sm_validation_checks_every_selected_device():
@@ -310,15 +312,16 @@ def test_standalone_publishes_only_after_rank_join(tmp_path, monkeypatch, fail_a
         ],
     )
 
-    def ranks(args, *_):
-        assert Path(args.output) != output
-        with Path(args.output).open("a") as stream:
+    def ranks(case, device, stage, *, expected_sm, phase):
+        assert stage != output
+        assert (device, expected_sm, phase) == ("cuda:0", 103, "context")
+        with stage.open("a") as stream:
             stream.write("new row\n")
         assert output.read_text() == "existing row\n"
         if fail_after_write:
             raise RuntimeError("rank 1 failed after rank 0 wrote")
 
-    monkeypatch.setattr(module, "_collect_native", ranks)
+    monkeypatch.setattr(module, "_run_native_case", ranks)
     if fail_after_write:
         with pytest.raises(RuntimeError, match="rank 1 failed"):
             module.main()
@@ -326,6 +329,31 @@ def test_standalone_publishes_only_after_rank_join(tmp_path, monkeypatch, fail_a
     else:
         module.main()
         assert output.read_text() == "existing row\nnew row\n"
+
+
+def test_standalone_recovers_retained_output_from_package_entrypoint(tmp_path):
+    package = Path(__file__).resolve().parents[3]
+    output = tmp_path / "result"
+    script = """
+import json, sys
+from pathlib import Path
+from collector.sglang import collect_kimi_k31_dsa_v1 as native
+
+out = Path(sys.argv[1])
+native.collector_retained_path(out).write_bytes(b"prior")
+native._run_native_case = lambda case, device, stage, **options: stage.write_bytes(b"measured")
+sys.argv = ["native", "--phase", "context", "--output", str(out), "--case",
+            json.dumps([4096, 1, 96, "fp8", "bfloat16", "bfloat16", native.MODEL, 0])]
+native.main()
+assert out.read_bytes() == b"measured"
+"""
+    subprocess.run(
+        [sys.executable, "-c", script, str(output)],
+        cwd=package,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join([str(package), str(package / "src")])},
+        check=True,
+        timeout=30,
+    )
 
 
 @pytest.mark.parametrize("existing", [False, True])
@@ -428,7 +456,10 @@ def test_native_registry_checks_full_runtime_before_queueing(monkeypatch, op, ve
         with pytest.raises(RuntimeError, match="native Kimi K3.1 requires exactly"):
             module.collect_sglang(1, ops=[op], model_path=None if version == stock else MODEL, sm_version=103)
     # Other ops keep the shared public-version policy.
-    require_kimi_k31_runtime("0.5.21+vendor", {"gemm"})
+    from collector.framework_manifest import require_collector_runtime, resolve_op_runtime
+
+    stock = resolve_op_runtime("sglang", "gemm")
+    assert require_collector_runtime("sglang", stock.version + "+vendor", requested_ops={"gemm"}) == stock
 
 
 def test_existing_dsa_key_represents_complete_decode_history():
