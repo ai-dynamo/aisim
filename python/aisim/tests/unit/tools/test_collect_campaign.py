@@ -481,9 +481,14 @@ def test_campaign_recovers_tp_checkpoint_and_validates_all_selected_cases(
 
 
 @pytest.mark.parametrize("phase", ["context", "generation"])
-@pytest.mark.parametrize("receipt_phase", [None, "context", "generation"])
+@pytest.mark.parametrize(
+    ("receipt_phase", "staged_event"),
+    [(None, None), ("context", None), ("generation", None), (None, "open"), (None, "closed")],
+)
 @pytest.mark.parametrize("mode", ["run", "finalize"])
-def test_campaign_recovers_pending_native_case_despite_older_parquet(monkeypatch, tmp_path, phase, receipt_phase, mode):
+def test_campaign_recovers_pending_native_case_despite_older_parquet(
+    monkeypatch, tmp_path, phase, receipt_phase, staged_event, mode
+):
     from types import SimpleNamespace
 
     from collector.collect import ResumeCheckpoint
@@ -505,18 +510,21 @@ def test_campaign_recovers_pending_native_case_despite_older_parquet(monkeypatch
         plan.sm,
     )
     task_id = create_test_case_id(case, "run_kimi_k31_dsa_fullnode", f"{plan.backend}.{shard.op}")
-    tracker.mark_attempted(task_id)
+    if staged_event != "closed":
+        tracker.mark_attempted(task_id)
     tracker.mark_passed(task_id)
     tracker.flush(force=True)
     checkpoint_bytes = tracker._path.read_bytes()
     (out / f"dsa_{phase}_module_perf.parquet").touch()
     (out / "DONE").touch()
+    if staged_event is not None:
+        (out / f"dsa_{phase}_module_perf.txt").write_text("recovered row\n")
     if receipt_phase is not None:
         filename = f"dsa_{receipt_phase}_module_perf.txt"
         stage = out / f".{filename}.stage-retry"
         stage.write_text("recovered row\n")
         (out / f".{filename}.pending").write_text(json.dumps({"task_id": task_id, "stage": stage.name}))
-    pending = receipt_phase == phase
+    pending = receipt_phase == phase or staged_event == "open"
     assert c.shard_state(tmp_path, shard, plan.backend) == ("pending-publication" if pending else "finalized")
 
     monkeypatch.setattr(c, "collector_ref", lambda _: "0" * 40)

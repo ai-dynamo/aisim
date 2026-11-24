@@ -157,6 +157,7 @@ def test_cli_generated_plan_keeps_native_ops_model_scoped(model_scoped):
     ("variable", "expected"),
     [
         ("SGLANG_DSA_FUSE_TOPK", "1"),
+        ("SGLANG_OPT_USE_TOPK_V2", "1"),
         ("SGLANG_DSA_TOPK_BROADCAST", "0"),
         ("SGLANG_FP8_PAGED_MQA_LOGITS_TORCH", "0"),
         ("SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR", None),

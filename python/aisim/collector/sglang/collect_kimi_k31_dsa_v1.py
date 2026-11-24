@@ -66,6 +66,8 @@ class NativeAllocationFailure(SystemExit):
 # afcd srt/environ.py::Envs.SGLANG_DSA_FUSE_TOPK defaults to True;
 # srt/layers/attention/dsa/utils.py::should_use_dsa_fused_topk selects the fused
 # index transformation for this eager, non-disaggregated native plan.
+# Envs.SGLANG_OPT_USE_TOPK_V2 defaults to True; dsa/dsa_topk_backend.py::
+# DSATopKBackend.should_use_topk_v2 selects the v2 fused decode top-k path.
 # Keep the pinned serving default independent of the invoking shell.
 # The same revision's Envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD
 # defaults to 2048; DeepseekSparseAttnBackend uses it for dense short-prefill
@@ -75,6 +77,7 @@ class NativeAllocationFailure(SystemExit):
 SKIP_SOFTMAX_ENV = "SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR"
 NATIVE_ENV = {
     "SGLANG_DSA_FUSE_TOPK": "1",
+    "SGLANG_OPT_USE_TOPK_V2": "1",
     "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH": "0",
     "SGLANG_DSA_TOPK_BROADCAST": "0",
     "SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD": "2048",

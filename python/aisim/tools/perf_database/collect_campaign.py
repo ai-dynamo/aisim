@@ -313,6 +313,18 @@ def shard_state(root: Path, shard: Shard, backend: str | None = None) -> str:
         pending_files = (PERF_TRANSACTION_FILENAME, SIDECAR_TRANSACTION_FILENAME, f".{perf_filename}.pending")
         if any((d / name).exists() for name in pending_files):
             return "pending-publication"
+        if (d / perf_filename).is_file():
+            from collector.collect import ResumeCheckpoint, _checkpoint_case_ids, _checkpoint_snapshot
+
+            checkpoint = d / ".ckpt" / backend / f"{backend}.{shard.op}.json"
+            if ResumeCheckpoint.has_recoverable_checkpoint(checkpoint):
+                # The per-case receipt is removed before common finalization.
+                # Only passes in the still-open provenance event own staged
+                # rows; cumulative passes in a closed checkpoint do not.
+                snapshot = _checkpoint_snapshot(checkpoint, None, context_path=checkpoint, capture_contents=True)
+                state = json.loads(snapshot.contents)
+                if _checkpoint_case_ids(state, "done") & _checkpoint_case_ids(state, "attempted"):
+                    return "pending-publication"
     if published:
         return "finalized"
     if (d / "DONE").exists():
