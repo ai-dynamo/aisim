@@ -27,13 +27,7 @@ use crate::replay::{
     ReplayCaptureOptions, ReplayDeterminism, ReplayEngineConfig, ReplayEngineFactory,
     ReplayOperationPowerDiagnostics, ReplayPhasePowerDiagnostics, ReplayPowerDiagnostics,
     ReplayRoleConfig, ReplayRuntimeInput, ReplaySpec, ReplayTopology, Replayer, TracePowerStats,
-    loadgen::{
-        AgenticProfileOptions, AgenticSnapshotOptions, AgenticWarmupPolicy, ArrivalSpec, DelaySpec,
-        DynamoRequestTrace, LengthSpec, SyntheticImages, SyntheticTraceSpec, Trace,
-        ValidatedAgenticGraph, WekaChatTemplate, WekaClient, WekaImportOptions,
-        WekaNestedTimestampBasis, WekaResolvedTimestampBasis, WorkloadDriver,
-        load_agentic_mooncake, load_weka_agentic_graph_cached,
-    },
+    TrafficBuildOptions, TrafficSpec, build_traffic,
 };
 use crate::{
     DeploymentLimits, EstimationMode, EstimatorConfig, ForwardPassFallbackPolicy,
@@ -182,7 +176,7 @@ struct ConfiguredSpecOnly {
 struct ConfiguredExecutionPayload {
     spec: ReplaySpec,
     #[serde(default)]
-    traffic: Option<Box<RuntimeTraffic>>,
+    traffic: Option<Box<TrafficSpec>>,
     #[serde(default)]
     capture_performance_diagnostics: bool,
     #[serde(default)]
@@ -237,121 +231,7 @@ struct ServingPath {
     detokenization: Option<DetokenizationPayload>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RuntimeTraffic {
-    source_type: String,
-    /// Configured deployment model used to time every agentic request. Source
-    /// model labels remain provenance on the validated graph.
-    #[serde(default)]
-    execution_model: Option<String>,
-    #[serde(default)]
-    load_type: Option<String>,
-    #[serde(default)]
-    trace_path: Option<String>,
-    #[serde(default)]
-    trace_paths: Vec<String>,
-    #[serde(default)]
-    trace_format: Option<String>,
-    #[serde(default)]
-    trace_block_size: Option<usize>,
-    #[serde(default)]
-    weka_nested_timestamp_basis: Option<WekaNestedTimestampBasis>,
-    #[serde(default)]
-    weka_client: Option<WekaClient>,
-    #[serde(default)]
-    weka_chat_template: Option<WekaChatTemplate>,
-    /// Keep the loaded Weka graph for later runs in this process (sweeps).
-    #[serde(default)]
-    trace_graph_cache: bool,
-    #[serde(default)]
-    arrival_speedup_ratio: Option<f64>,
-    #[serde(default)]
-    replay_concurrency: Option<usize>,
-    #[serde(default)]
-    agentic_lanes: Option<usize>,
-    #[serde(default)]
-    agentic_snapshot: Option<AgenticSnapshotOptions>,
-    #[serde(default)]
-    agentic_warmup: bool,
-    #[serde(default)]
-    agentic_warmup_policy: AgenticWarmupPolicy,
-    #[serde(default)]
-    agentic_profile: Option<AgenticProfileOptions>,
-    #[serde(default)]
-    isl: Option<usize>,
-    #[serde(default)]
-    osl: Option<usize>,
-    #[serde(default)]
-    cached_prefix_tokens: Option<usize>,
-    // Fixed per-request image workload resolved by the Python geometry layer.
-    #[serde(default)]
-    image_count: Option<usize>,
-    #[serde(default)]
-    image_visual_tokens: Option<usize>,
-    #[serde(default)]
-    image_sequences: Option<u32>,
-    #[serde(default)]
-    image_patch_tokens: Option<u32>,
-    #[serde(default)]
-    image_transformer_tokens: Option<u32>,
-    #[serde(default)]
-    image_output_tokens: Option<u32>,
-    #[serde(default)]
-    image_embedding_bytes: Option<u64>,
-    #[serde(default)]
-    image_identity_pool: Option<u64>,
-    #[serde(default)]
-    request_count: Option<usize>,
-    #[serde(default)]
-    turns_per_session: Option<usize>,
-    #[serde(default)]
-    shared_prefix_ratio: Option<f64>,
-    #[serde(default)]
-    num_prefix_groups: Option<usize>,
-    #[serde(default)]
-    inter_turn_delay_ms: Option<f64>,
-    #[serde(default)]
-    request_rate: Option<f64>,
-    #[serde(default)]
-    arrival_interval_ms: Option<f64>,
-    #[serde(default)]
-    arrival_seed: Option<u64>,
-    #[serde(default)]
-    concurrency: Option<usize>,
-    // Fields consumed by the Python-side optimizer before execution.
-    #[serde(default)]
-    num_request_ratio: Option<f64>,
-    #[serde(default)]
-    kv_load_ratio: Option<serde_json::Value>,
-    #[serde(default)]
-    max_sim_time_ms: Option<f64>,
-}
-
-struct BuiltRuntimeInput {
-    input: ReplayRuntimeInput,
-    weka_nested_timestamp_basis: Option<WekaResolvedTimestampBasis>,
-}
-
-impl BuiltRuntimeInput {
-    fn without_weka_basis(input: ReplayRuntimeInput) -> Self {
-        Self {
-            input,
-            weka_nested_timestamp_basis: None,
-        }
-    }
-}
-
 const AGENTIC_MODEL_PROJECTION_POLICY: &str = "project_to_configured_target";
-
-fn require_agentic_execution_model(traffic: &RuntimeTraffic) -> Result<&str> {
-    traffic
-        .execution_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .context("agentic execution requires a configured target model")
-}
 
 fn validate_public_agentic_engine(
     input: &ReplayRuntimeInput,
@@ -3013,6 +2893,10 @@ fn cap_role_capacity_to_fpm_decode_domain(
     Ok(())
 }
 
+fn is_kv_capacity_load(traffic: Option<&TrafficSpec>) -> bool {
+    traffic.is_some_and(|traffic| traffic.load_type.as_deref() == Some("kv_capacity_fraction"))
+}
+
 fn aggregated_role(engine: &ReplayEngineConfig) -> ReplayRoleConfig {
     ReplayRoleConfig {
         dp_size: engine.dp_size,
@@ -3683,516 +3567,6 @@ fn afd_derived_kv_blocks(
     Ok(total_tokens as usize)
 }
 
-fn runtime_paths(traffic: &RuntimeTraffic) -> Result<Vec<PathBuf>> {
-    let mut paths = traffic
-        .trace_paths
-        .iter()
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    if paths.is_empty()
-        && let Some(path) = traffic.trace_path.as_deref()
-    {
-        paths.push(PathBuf::from(path));
-    }
-    ensure!(
-        !paths.is_empty(),
-        "trace traffic requires at least one path"
-    );
-    Ok(paths)
-}
-
-/// The largest trace block that divides both the cached prefix and the
-/// engine's scheduler block (the engine block when there is no prefix).
-/// Requests then share exactly the engine blocks inside the prefix, as with
-/// one-token trace blocks, without one hash ID per token. Grouped prefixes are
-/// sized in whole trace blocks, so they keep one-token blocks with a cached
-/// prefix. The driver still hashes prompts at `engine_block_size`.
-fn synthetic_trace_block_size(
-    cached_prefix_tokens: usize,
-    shared_prefix_ratio: f64,
-    engine_block_size: usize,
-) -> usize {
-    if cached_prefix_tokens > 0 && shared_prefix_ratio > 0.0 {
-        return 1;
-    }
-    let (mut a, mut b) = (engine_block_size, cached_prefix_tokens);
-    while b != 0 {
-        (a, b) = (b, a % b);
-    }
-    a
-}
-
-fn synthetic_arrivals(traffic: &RuntimeTraffic) -> Result<ArrivalSpec> {
-    match traffic.load_type.as_deref().unwrap_or("concurrency") {
-        "concurrency" | "kv_capacity_fraction" => Ok(ArrivalSpec::Burst),
-        "poisson" => {
-            let qps = traffic
-                .request_rate
-                .context("poisson traffic requires request_rate")?;
-            ensure!(
-                qps.is_finite() && qps > 0.0,
-                "request_rate must be positive"
-            );
-            Ok(ArrivalSpec::PoissonQps { qps })
-        }
-        "constant_rate" => {
-            let qps = if let Some(qps) = traffic.request_rate {
-                qps
-            } else {
-                let interval = traffic
-                    .arrival_interval_ms
-                    .context("constant_rate traffic requires an interval or rate")?;
-                ensure!(
-                    interval.is_finite() && interval > 0.0,
-                    "arrival_interval_ms must be positive"
-                );
-                1_000.0 / interval
-            };
-            ensure!(
-                qps.is_finite() && qps > 0.0,
-                "request_rate must be positive"
-            );
-            Ok(ArrivalSpec::ConstantQps { qps })
-        }
-        other => Err(anyhow!("unsupported synthetic load type {other:?}")),
-    }
-}
-
-fn concrete_session_count(traffic: &RuntimeTraffic) -> Result<usize> {
-    if let Some(count) = traffic.request_count {
-        ensure!(count > 0, "request_count must be positive");
-        return Ok(count);
-    }
-    let ratio = traffic
-        .num_request_ratio
-        .context("synthetic traffic requires request_count or num_request_ratio")?;
-    ensure!(
-        ratio.is_finite() && ratio > 0.0,
-        "num_request_ratio must be positive"
-    );
-    let load = traffic
-        .concurrency
-        .map(|value| value as f64)
-        .or(traffic.request_rate)
-        .or_else(|| {
-            traffic
-                .arrival_interval_ms
-                .filter(|value| *value > 0.0)
-                .map(|value| 1_000.0 / value)
-        })
-        .context("relative synthetic stop requires a concrete load")?;
-    Ok(((ratio * load).round() as usize).max(1))
-}
-
-/// Per-request image workload declared by the Python traffic payload, if any.
-fn synthetic_images(traffic: &RuntimeTraffic) -> Result<Option<SyntheticImages>> {
-    let Some(count) = traffic.image_count else {
-        return Ok(None);
-    };
-    Ok(Some(SyntheticImages {
-        count,
-        visual_tokens: traffic
-            .image_visual_tokens
-            .context("image traffic requires image_visual_tokens")?,
-        encoder: crate::engine::EncoderShape {
-            sequences: traffic
-                .image_sequences
-                .context("image traffic requires image_sequences")?,
-            patch_tokens: traffic
-                .image_patch_tokens
-                .context("image traffic requires image_patch_tokens")?,
-            transformer_tokens: traffic
-                .image_transformer_tokens
-                .context("image traffic requires image_transformer_tokens")?,
-            output_tokens: traffic
-                .image_output_tokens
-                .context("image traffic requires image_output_tokens")?,
-        },
-        embedding_bytes: traffic
-            .image_embedding_bytes
-            .context("image traffic requires image_embedding_bytes")?,
-        identity_pool: traffic.image_identity_pool,
-    }))
-}
-
-fn resolve_kv_capacity_concurrency(
-    traffic: &mut RuntimeTraffic,
-    role: &ReplayRoleConfig,
-    replicas: usize,
-) -> Result<Option<usize>> {
-    if traffic.load_type.as_deref() != Some("kv_capacity_fraction") {
-        return Ok(None);
-    }
-    let ratio = traffic
-        .kv_load_ratio
-        .as_ref()
-        .and_then(serde_json::Value::as_f64)
-        .context("kv_capacity_fraction requires one concrete ratio")?;
-    ensure!(
-        ratio.is_finite() && ratio > 0.0,
-        "KV load ratio must be positive"
-    );
-    let isl = traffic.isl.context("KV load requires isl")?;
-    let osl = traffic.osl.context("KV load requires osl")?;
-    let visual_tokens = synthetic_images(traffic)?.map_or(Some(0), |images| {
-        images.count.checked_mul(images.visual_tokens)
-    });
-    let expected_tokens = visual_tokens
-        .and_then(|visual_tokens| isl.checked_add(visual_tokens))
-        .and_then(|tokens| tokens.checked_add(osl / 2))
-        .context("KV-load expected token count overflow")?;
-    ensure!(
-        expected_tokens > 0,
-        "KV load requires positive token lengths"
-    );
-    let capacity = if !role.rank.kv_cache_groups.is_empty() {
-        let request_bytes = role
-            .rank
-            .kv_cache_groups
-            .iter()
-            .try_fold(0u64, |sum, group| {
-                sum.checked_add(group.peak_request_bytes(expected_tokens as u64, 1)?)
-                    .context("grouped KV request bytes overflow")
-            })?;
-        let per_rank = role
-            .rank
-            .kv_cache_capacity_bytes
-            .context("grouped KV load requires byte capacity")?
-            / request_bytes;
-        usize::try_from(per_rank)?
-            .checked_mul(role.dp_size as usize)
-            .and_then(|value| value.checked_mul(replicas))
-            .context("aggregate grouped KV concurrency overflow")?
-    } else {
-        let per_rank_tokens = role
-            .rank
-            .num_gpu_blocks
-            .checked_mul(role.rank.block_size)
-            .context("KV capacity overflow")?;
-        let total_tokens = per_rank_tokens
-            .checked_mul(role.dp_size as usize)
-            .and_then(|value| value.checked_mul(replicas))
-            .context("aggregate KV capacity overflow")?;
-        total_tokens / expected_tokens
-    };
-    ensure!(
-        capacity > 0,
-        "candidate KV capacity cannot hold one request"
-    );
-    let concurrency = ((ratio * capacity as f64) as usize).max(1);
-    traffic.concurrency = Some(concurrency);
-    Ok(Some(concurrency))
-}
-
-fn build_agentic_driver(
-    graph: ValidatedAgenticGraph,
-    traffic: &RuntimeTraffic,
-    engine_block_size: usize,
-    speedup: f64,
-) -> Result<WorkloadDriver> {
-    if let Some(options) = &traffic.agentic_snapshot {
-        let lanes = traffic
-            .agentic_lanes
-            .context("agentic_snapshot requires positive agentic_lanes")?;
-        // Sample recorded time before applying speedup to remaining timers.
-        let prepared = graph.into_prepared_snapshots(lanes, options.clone())?;
-        let mut driver = if traffic.agentic_warmup {
-            WorkloadDriver::new_agentic_warmup_with_policy(
-                prepared,
-                engine_block_size,
-                true,
-                speedup,
-                traffic.agentic_warmup_policy,
-                traffic
-                    .agentic_profile
-                    .as_ref()
-                    .map_or(10_000.0, |profile| profile.global_idle_cap_seconds * 1000.0),
-            )
-        } else {
-            WorkloadDriver::new_agentic_snapshots(prepared, engine_block_size, true, speedup)
-        }?;
-        if let Some(profile) = &traffic.agentic_profile {
-            driver.enable_agentic_profile(profile.clone())?;
-        }
-        Ok(driver)
-    } else {
-        WorkloadDriver::new_agentic_trace_with_options(
-            graph.normalize_starts().speed_up_timing(speedup)?,
-            engine_block_size,
-            true,
-            traffic.agentic_lanes,
-        )
-    }
-}
-
-fn build_runtime_input(
-    traffic: RuntimeTraffic,
-    engine_block_size: usize,
-) -> Result<BuiltRuntimeInput> {
-    ensure!(engine_block_size > 0, "engine block size must be positive");
-    ensure!(
-        traffic.agentic_warmup_policy != AgenticWarmupPolicy::LiveTrajectoryV1
-            || (traffic.agentic_warmup && traffic.agentic_profile.is_some()),
-        "live_trajectory_v1 requires agentic_warmup and agentic_profile"
-    );
-    ensure!(
-        traffic.agentic_warmup_policy != AgenticWarmupPolicy::PrimersOnly || traffic.agentic_warmup,
-        "primers_only requires agentic_warmup"
-    );
-    if let Some(profile) = &traffic.agentic_profile {
-        profile.validate()?;
-        ensure!(
-            traffic.agentic_snapshot.is_some(),
-            "agentic_profile requires agentic_snapshot"
-        );
-        ensure!(
-            traffic.max_sim_time_ms.is_none(),
-            "agentic_profile cannot be combined with max virtual time"
-        );
-    }
-    ensure!(
-        !traffic.agentic_warmup || traffic.agentic_snapshot.is_some(),
-        "agentic_warmup requires agentic_snapshot"
-    );
-    if traffic.agentic_snapshot.is_some() {
-        ensure!(
-            traffic.source_type == "trace"
-                && traffic.load_type.as_deref() == Some("trace_timestamps")
-                && traffic.agentic_lanes.is_some_and(|lanes| lanes > 0)
-                && traffic.replay_concurrency.is_none(),
-            "agentic_snapshot requires trace_timestamps agentic input with positive agentic_lanes"
-        );
-    }
-    ensure!(
-        traffic.source_type == "trace" || traffic.agentic_lanes.is_none(),
-        "agentic_lanes requires agentic trace input"
-    );
-    ensure!(
-        traffic.source_type == "trace" || traffic.weka_nested_timestamp_basis.is_none(),
-        "weka_nested_timestamp_basis requires Weka trace input"
-    );
-    ensure!(
-        traffic.weka_client.is_none()
-            || (traffic.source_type == "trace" && traffic.trace_format.as_deref() == Some("weka")),
-        "weka_client requires Weka trace input"
-    );
-    ensure!(
-        traffic.source_type == "trace" || traffic.weka_chat_template.is_none(),
-        "weka_chat_template requires Weka trace input"
-    );
-    if traffic.source_type == "trace" {
-        let paths = runtime_paths(&traffic)?;
-        let trace_block_size = traffic.trace_block_size.unwrap_or(512);
-        let format = traffic.trace_format.as_deref().unwrap_or("mooncake");
-        let speedup = traffic.arrival_speedup_ratio.unwrap_or(1.0);
-        ensure!(
-            format == "weka" || traffic.weka_nested_timestamp_basis.is_none(),
-            "weka_nested_timestamp_basis requires Weka input"
-        );
-        ensure!(
-            format == "weka" || traffic.weka_chat_template.is_none(),
-            "weka_chat_template requires Weka input"
-        );
-        ensure!(
-            traffic.agentic_lanes != Some(0),
-            "agentic_lanes must be greater than 0"
-        );
-        if traffic.agentic_lanes.is_some() {
-            ensure!(
-                matches!(format, "weka" | "agentic_mooncake" | "dynamo"),
-                "agentic_lanes requires weka, agentic_mooncake, or agentic Dynamo input"
-            );
-        }
-        if format == "agentic_mooncake" {
-            require_agentic_execution_model(&traffic)?;
-            ensure!(
-                traffic.load_type.as_deref() == Some("trace_timestamps"),
-                "agentic_mooncake requires trace_timestamps load"
-            );
-            ensure!(
-                traffic.max_sim_time_ms.is_none(),
-                "agentic trace does not support max virtual time"
-            );
-            ensure!(
-                paths.len() == 1,
-                "agentic_mooncake requires exactly one path"
-            );
-            ensure!(
-                traffic.replay_concurrency.is_none(),
-                "agentic_mooncake does not support concurrency load"
-            );
-            let trace = load_agentic_mooncake(&paths[0], trace_block_size)?;
-            return Ok(BuiltRuntimeInput::without_weka_basis(
-                ReplayRuntimeInput::Workload(build_agentic_driver(
-                    trace,
-                    &traffic,
-                    engine_block_size,
-                    speedup,
-                )?),
-            ));
-        }
-        if format == "weka" {
-            require_agentic_execution_model(&traffic)?;
-            ensure!(
-                traffic.load_type.as_deref() == Some("trace_timestamps"),
-                "weka requires trace_timestamps load"
-            );
-            ensure!(
-                traffic.max_sim_time_ms.is_none(),
-                "Weka agentic trace does not support max virtual time"
-            );
-            ensure!(paths.len() == 1, "weka requires exactly one path");
-            ensure!(
-                traffic.replay_concurrency.is_none(),
-                "Weka agentic trace does not support concurrency load"
-            );
-            let requested_basis = traffic.weka_nested_timestamp_basis.unwrap_or_default();
-            let (trace, resolved_basis, _cache_hit) = load_weka_agentic_graph_cached(
-                &paths[0],
-                traffic.trace_block_size,
-                WekaImportOptions {
-                    nested_timestamp_basis: requested_basis,
-                    client: traffic.weka_client.unwrap_or_default(),
-                    chat_template: traffic.weka_chat_template,
-                },
-                traffic.trace_graph_cache,
-            )?;
-            return Ok(BuiltRuntimeInput {
-                input: ReplayRuntimeInput::Workload(build_agentic_driver(
-                    trace,
-                    &traffic,
-                    engine_block_size,
-                    speedup,
-                )?),
-                weka_nested_timestamp_basis: Some(resolved_basis),
-            });
-        }
-        if format == "dynamo" {
-            let loaded =
-                DynamoRequestTrace::from_request_trace_files(&paths, traffic.trace_block_size)?;
-            let driver = match loaded {
-                DynamoRequestTrace::Standard(trace) => {
-                    ensure!(
-                        traffic.agentic_lanes.is_none(),
-                        "agentic_lanes requires an agentic Dynamo trace"
-                    );
-                    let trace = trace.normalize_session_starts()?.speed_up_timing(speedup)?;
-                    match traffic.replay_concurrency {
-                        Some(cap) => {
-                            WorkloadDriver::new_concurrency(trace, engine_block_size, cap)?
-                        }
-                        None => WorkloadDriver::new_trace(trace, engine_block_size)?,
-                    }
-                }
-                DynamoRequestTrace::Agentic(trace) => {
-                    require_agentic_execution_model(&traffic)?;
-                    ensure!(
-                        traffic.replay_concurrency.is_none(),
-                        "agentic Dynamo trace does not support concurrency load"
-                    );
-                    ensure!(
-                        traffic.max_sim_time_ms.is_none(),
-                        "agentic Dynamo trace does not support max virtual time"
-                    );
-                    build_agentic_driver(trace, &traffic, engine_block_size, speedup)?
-                }
-            };
-            return Ok(BuiltRuntimeInput::without_weka_basis(
-                ReplayRuntimeInput::Workload(driver),
-            ));
-        }
-        ensure!(
-            paths.len() == 1,
-            "trace format {format:?} requires exactly one path"
-        );
-        let mut trace = match format {
-            "mooncake" | "mooncake-delta" => Trace::from_mooncake(&paths[0], trace_block_size)?,
-            "applied_compute_agentic" => {
-                Trace::from_applied_compute_agentic(&paths[0], trace_block_size, 0.0, 0)?
-            }
-            other => return Err(anyhow!("unsupported trace format {other:?}")),
-        };
-        trace = trace.normalize_session_starts()?.speed_up_timing(speedup)?;
-        let delta = format == "mooncake-delta";
-        let concurrency = traffic.replay_concurrency;
-        let driver = match (concurrency, delta) {
-            (Some(cap), true) => {
-                WorkloadDriver::new_concurrency_accumulating_deltas(trace, engine_block_size, cap)?
-            }
-            (Some(cap), false) => WorkloadDriver::new_concurrency(trace, engine_block_size, cap)?,
-            (None, true) => {
-                WorkloadDriver::new_trace_accumulating_deltas(trace, engine_block_size)?
-            }
-            (None, false) => WorkloadDriver::new_trace(trace, engine_block_size)?,
-        };
-        return Ok(BuiltRuntimeInput::without_weka_basis(
-            ReplayRuntimeInput::Workload(driver),
-        ));
-    }
-
-    ensure!(
-        matches!(
-            traffic.source_type.as_str(),
-            "synthetic" | "synthetic-session"
-        ),
-        "unsupported synthetic source type {:?}",
-        traffic.source_type
-    );
-    let sessions = concrete_session_count(&traffic)?;
-    let turns = if traffic.source_type == "synthetic-session" {
-        traffic.turns_per_session.unwrap_or(4)
-    } else {
-        1
-    };
-    let cached_prefix_tokens = traffic.cached_prefix_tokens.unwrap_or(0);
-    let images = synthetic_images(&traffic)?;
-    let shared_prefix_ratio = traffic.shared_prefix_ratio.unwrap_or(0.0);
-    let trace = Trace::synthetic(SyntheticTraceSpec {
-        // Image placeholder spans stay token-exact on a one-token trace block; the
-        // driver still hashes them at `engine_block_size` when it constructs
-        // replay requests.
-        block_size: if images.is_some() {
-            1
-        } else {
-            synthetic_trace_block_size(cached_prefix_tokens, shared_prefix_ratio, engine_block_size)
-        },
-        num_sessions: sessions,
-        turns_per_session: turns,
-        input_tokens: LengthSpec {
-            mean: traffic.isl.context("synthetic traffic requires isl")?,
-            stddev: 0.0,
-        },
-        output_tokens: LengthSpec {
-            mean: traffic.osl.context("synthetic traffic requires osl")?,
-            stddev: 0.0,
-        },
-        cached_prefix_tokens,
-        shared_prefix_ratio,
-        num_prefix_groups: traffic.num_prefix_groups.unwrap_or(0),
-        first_turn_arrivals: synthetic_arrivals(&traffic)?,
-        inter_turn_delays: traffic
-            .inter_turn_delay_ms
-            .filter(|delay| *delay > 0.0)
-            .map_or(DelaySpec::None, DelaySpec::ConstantMs),
-        seed: 0,
-        arrival_seed: traffic.arrival_seed.unwrap_or(42),
-        images,
-    })?;
-    let cap = traffic.concurrency;
-    let accumulate = traffic.source_type == "synthetic-session";
-    let driver = match (cap, accumulate) {
-        (Some(cap), true) => {
-            WorkloadDriver::new_concurrency_accumulating_deltas(trace, engine_block_size, cap)?
-        }
-        (Some(cap), false) => WorkloadDriver::new_concurrency(trace, engine_block_size, cap)?,
-        (None, true) => WorkloadDriver::new_trace_accumulating_deltas(trace, engine_block_size)?,
-        (None, false) => WorkloadDriver::new_trace(trace, engine_block_size)?,
-    };
-    Ok(BuiltRuntimeInput::without_weka_basis(
-        ReplayRuntimeInput::Workload(driver),
-    ))
-}
-
 fn run_with_input(
     spec: ReplaySpec,
     factory: ReplayEngineFactory,
@@ -4771,7 +4145,7 @@ fn replay_fpm_coverage(
 fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
     let (
         mut spec,
-        mut traffic,
+        traffic,
         capture_performance_diagnostics,
         determinism,
         serving_path,
@@ -5014,11 +4388,13 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
             engine_config.prefill_context_parallel_size = role.prefill_context_parallel_size;
             engine_config.num_gpu_blocks_is_explicit = role.num_gpu_blocks_is_explicit;
             engine_config.rank = role.rank;
-            if let Some(traffic) = traffic.as_mut()
-                && let ReplayTopology::Aggregated { workers } = &spec.topology
-                && let Some(concurrency) = resolve_kv_capacity_concurrency(
-                    traffic,
-                    &ReplayRoleConfig {
+            spec.engine = serde_json::to_value(&engine_config)
+                .context("serializing materialized native engine descriptor")?;
+            let sized_by_kv = is_kv_capacity_load(traffic.as_ref());
+            let mut options = TrafficBuildOptions::new(engine_config.rank.block_size);
+            if sized_by_kv && let ReplayTopology::Aggregated { workers } = &spec.topology {
+                options = options.with_kv_capacity(
+                    ReplayRoleConfig {
                         dp_size: engine_config.dp_size,
                         tensor_parallel_size: engine_config.tensor_parallel_size,
                         prefill_context_parallel_size: engine_config.prefill_context_parallel_size,
@@ -5026,15 +4402,14 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                         rank: engine_config.rank.clone(),
                     },
                     workers.initial_workers,
-                )?
-            {
-                spec.max_in_flight = Some(concurrency);
+                );
             }
-            spec.engine = serde_json::to_value(&engine_config)
-                .context("serializing materialized native engine descriptor")?;
             let built_input = traffic
-                .map(|traffic| build_runtime_input(traffic, engine_config.rank.block_size))
+                .map(|traffic| build_traffic(traffic, &options))
                 .transpose()?;
+            if sized_by_kv && let Some(built) = &built_input {
+                spec.max_in_flight = built.max_in_flight;
+            }
             if let Some(built) = &built_input {
                 validate_public_agentic_engine(&built.input, &spec, &engine_config)?;
             }
@@ -5072,7 +4447,7 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                     )
             }) {
                 let traffic = traffic.as_ref().expect("trace traffic was checked");
-                let built = build_runtime_input(traffic.clone(), prefill.rank.block_size)?;
+                let built = build_traffic(traffic.clone(), &TrafficBuildOptions::new(prefill.rank.block_size))?;
                 if let ReplayRuntimeInput::Workload(driver) = &built.input
                     && driver.is_agentic()
                 {
@@ -5131,36 +4506,36 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
             prediction_provenance.insert("decode".into(), decode_provenance.unwrap_or_else(|| timing_provenance(&decode.rank.timing_model)));
             engine_config.prefill = Some(prefill);
             engine_config.decode = Some(decode);
-            if let Some(traffic) = traffic.as_mut()
-                && let ReplayTopology::Disaggregated { decode, .. } = &spec.topology
-                && let Some(concurrency) = resolve_kv_capacity_concurrency(
-                    traffic,
-                    engine_config
-                        .decode
-                        .as_ref()
-                        .expect("decode role was materialized"),
-                    decode.initial_workers,
-                )?
-            {
-                spec.max_in_flight = Some(concurrency);
-            }
             spec.engine = serde_json::to_value(&engine_config)
                 .context("serializing materialized native engine descriptor")?;
+            let sized_by_kv = is_kv_capacity_load(traffic.as_ref());
+            let mut options = TrafficBuildOptions::new(
+                engine_config
+                    .prefill
+                    .as_ref()
+                    .expect("prefill role was materialized")
+                    .rank
+                    .block_size,
+            );
+            if sized_by_kv && let ReplayTopology::Disaggregated { decode, .. } = &spec.topology {
+                options = options.with_kv_capacity(
+                    engine_config
+                        .decode
+                        .clone()
+                        .expect("decode role was materialized"),
+                    decode.initial_workers,
+                );
+            }
             let built_input = match trace_input {
-                Some(built) => Some(built),
-                None => traffic.map(|traffic| {
-                    build_runtime_input(
-                        traffic,
-                        engine_config
-                            .prefill
-                            .as_ref()
-                            .expect("prefill role was materialized")
-                            .rank
-                            .block_size,
-                    )
-                })
-                .transpose()?,
+                // A KV-sized load is resolved by the build below.
+                Some(built) if !sized_by_kv => Some(built),
+                _ => traffic
+                    .map(|traffic| build_traffic(traffic, &options))
+                    .transpose()?,
             };
+            if sized_by_kv && let Some(built) = &built_input {
+                spec.max_in_flight = built.max_in_flight;
+            }
             if let Some(built) = &built_input {
                 validate_public_agentic_engine(&built.input, &spec, &engine_config)?;
             }
@@ -5868,107 +5243,6 @@ mod tests {
     }
 
     #[test]
-    fn cached_prefix_trace_blocks_share_the_same_engine_blocks_as_one_token_blocks() {
-        let engine_block_size = 64;
-        // Number each request's engine-block sequence hashes in first-seen
-        // order, so traces with different token values compare by sharing.
-        let shared_blocks = |cached_prefix_tokens, shared_prefix_ratio, block_size| {
-            let trace = Trace::synthetic(SyntheticTraceSpec {
-                block_size,
-                num_sessions: 3,
-                turns_per_session: 1,
-                input_tokens: LengthSpec {
-                    mean: 1000,
-                    stddev: 0.0,
-                },
-                output_tokens: LengthSpec {
-                    mean: 1,
-                    stddev: 0.0,
-                },
-                cached_prefix_tokens,
-                shared_prefix_ratio,
-                // Three sessions in two groups put at least two in one group.
-                num_prefix_groups: 2,
-                first_turn_arrivals: ArrivalSpec::Burst,
-                inter_turn_delays: DelaySpec::None,
-                seed: 0,
-                arrival_seed: 42,
-                images: None,
-            })
-            .unwrap();
-            let mut ids = std::collections::HashMap::new();
-            trace
-                .sessions
-                .iter()
-                .map(|session| {
-                    let tokens = session.turns[0].synthesize_tokens(block_size).unwrap();
-                    crate::replay::loadgen::ReplayRequestHashes::from_tokens(
-                        &tokens,
-                        engine_block_size as u32,
-                    )
-                    .sequence_hashes
-                    .into_iter()
-                    .map(|hash| {
-                        let next = ids.len();
-                        *ids.entry(hash).or_insert(next)
-                    })
-                    .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>()
-        };
-        for (cached_prefix_tokens, shared_prefix_ratio, expected_block_size) in
-            [(512, 0.0, 64), (500, 0.0, 4), (0, 0.0, 64), (512, 0.72, 1)]
-        {
-            let block_size = synthetic_trace_block_size(
-                cached_prefix_tokens,
-                shared_prefix_ratio,
-                engine_block_size,
-            );
-            assert_eq!(block_size, expected_block_size);
-            assert_eq!(
-                shared_blocks(cached_prefix_tokens, shared_prefix_ratio, block_size),
-                shared_blocks(cached_prefix_tokens, shared_prefix_ratio, 1),
-                "cached_prefix_tokens={cached_prefix_tokens} \
-                 shared_prefix_ratio={shared_prefix_ratio}"
-            );
-        }
-    }
-
-    #[test]
-    fn warmup_requires_a_boolean_and_seeded_snapshot_at_the_native_boundary() {
-        let base = serde_json::json!({
-            "source_type": "trace", "load_type": "trace_timestamps",
-            "trace_path": "unused", "trace_format": "weka", "agentic_lanes": 1,
-        });
-        assert!(
-            !serde_json::from_value::<RuntimeTraffic>(base.clone())
-                .unwrap()
-                .agentic_warmup
-        );
-        for invalid in [
-            serde_json::Value::Null,
-            serde_json::json!(0),
-            serde_json::json!(1),
-            serde_json::json!("true"),
-            serde_json::json!({}),
-        ] {
-            let mut traffic = base.clone();
-            traffic["agentic_warmup"] = invalid;
-            assert!(serde_json::from_value::<RuntimeTraffic>(traffic).is_err());
-        }
-        let mut traffic = base;
-        traffic["agentic_warmup"] = serde_json::json!(true);
-        let traffic = serde_json::from_value::<RuntimeTraffic>(traffic).unwrap();
-        assert!(
-            build_runtime_input(traffic, 64)
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("agentic_warmup requires agentic_snapshot")
-        );
-    }
-
-    #[test]
     fn profile_options_are_opt_in_and_strict_at_the_native_boundary() {
         let base = serde_json::json!({
             "source_type": "trace", "load_type": "trace_timestamps",
@@ -5976,14 +5250,14 @@ mod tests {
             "agentic_snapshot": {"seed": 42},
         });
         assert!(
-            serde_json::from_value::<RuntimeTraffic>(base.clone())
+            serde_json::from_value::<TrafficSpec>(base.clone())
                 .unwrap()
                 .agentic_profile
                 .is_none()
         );
         let mut traffic = base.clone();
         traffic["agentic_profile"] = serde_json::json!({});
-        let profile = serde_json::from_value::<RuntimeTraffic>(traffic.clone())
+        let profile = serde_json::from_value::<TrafficSpec>(traffic.clone())
             .unwrap()
             .agentic_profile
             .unwrap();
@@ -5999,7 +5273,7 @@ mod tests {
             serde_json::json!({"unexpected": 1}),
         ] {
             traffic["agentic_profile"] = invalid;
-            assert!(serde_json::from_value::<RuntimeTraffic>(traffic.clone()).is_err());
+            assert!(serde_json::from_value::<TrafficSpec>(traffic.clone()).is_err());
         }
         for invalid in [
             serde_json::json!({"duration_seconds": 0}),
@@ -6009,9 +5283,9 @@ mod tests {
             serde_json::json!({"global_idle_cap_seconds": 0}),
         ] {
             traffic["agentic_profile"] = invalid;
-            let traffic = serde_json::from_value::<RuntimeTraffic>(traffic.clone()).unwrap();
+            let traffic = serde_json::from_value::<TrafficSpec>(traffic.clone()).unwrap();
             assert!(
-                build_runtime_input(traffic, 64)
+                build_traffic(traffic, &TrafficBuildOptions::new(64))
                     .err()
                     .unwrap()
                     .to_string()
@@ -6033,9 +5307,9 @@ mod tests {
             let mut traffic = base.clone();
             traffic["agentic_profile"] = serde_json::json!({});
             traffic[field] = value;
-            let traffic = serde_json::from_value::<RuntimeTraffic>(traffic).unwrap();
+            let traffic = serde_json::from_value::<TrafficSpec>(traffic).unwrap();
             assert!(
-                build_runtime_input(traffic, 64)
+                build_traffic(traffic, &TrafficBuildOptions::new(64))
                     .err()
                     .unwrap()
                     .to_string()
@@ -6081,45 +5355,6 @@ mod tests {
                 .to_string()
                 .contains("image traffic cannot be combined with an encoder pool")
         );
-    }
-
-    #[test]
-    fn snapshot_options_are_strict_at_the_native_json_boundary() {
-        let base = serde_json::json!({
-            "source_type": "trace", "load_type": "trace_timestamps",
-            "trace_path": "unused", "trace_format": "weka", "agentic_lanes": 1,
-        });
-        for invalid in [
-            serde_json::json!({}),
-            serde_json::json!({"seed": true}),
-            serde_json::json!({"seed": -1}),
-            serde_json::json!({"seed": 1.0}),
-            serde_json::json!({"seed": "42"}),
-            serde_json::json!({"seed": 42, "extra": 0}),
-        ] {
-            let mut traffic = base.clone();
-            traffic["agentic_snapshot"] = invalid;
-            assert!(serde_json::from_value::<RuntimeTraffic>(traffic).is_err());
-        }
-        for (field, invalid) in [
-            ("source_type", serde_json::json!("synthetic")),
-            ("load_type", serde_json::json!("concurrency")),
-            ("agentic_lanes", serde_json::json!(0)),
-            ("agentic_lanes", serde_json::Value::Null),
-            ("replay_concurrency", serde_json::json!(1)),
-        ] {
-            let mut traffic = base.clone();
-            traffic["agentic_snapshot"] = serde_json::json!({"seed": u64::MAX});
-            traffic[field] = invalid;
-            let traffic = serde_json::from_value::<RuntimeTraffic>(traffic).unwrap();
-            assert!(
-                build_runtime_input(traffic, 64)
-                    .err()
-                    .unwrap()
-                    .to_string()
-                    .contains("agentic_snapshot requires")
-            );
-        }
     }
 
     #[test]
@@ -6895,10 +6130,7 @@ mod tests {
         config.tp = 16;
         config.moe_tp_size = Some(4);
         config.moe_ep_size = Some(4);
-        config.systems_paths = vec![
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../python/aisim/src/aisim_core/systems"),
-        ];
+        config.systems_paths = vec![crate::test_systems::path("")];
         let mut native =
             AicTimingModel::build(&mut config, ForwardPassWorkerType::Aggregated, false).unwrap();
         native.diagnostic_model = None;
@@ -8643,20 +7875,20 @@ mod tests {
         role.rank.kv_cache_capacity_bytes = Some(1000);
         cap_role_capacity_to_fpm_decode_domain(&mut role, Some(1), false).unwrap();
         assert_eq!(role.rank.kv_cache_capacity_bytes, Some(1000));
-        let mut traffic: RuntimeTraffic = serde_json::from_value(serde_json::json!({
+        let traffic: TrafficSpec = serde_json::from_value(serde_json::json!({
             "source_type":"synthetic", "load_type":"kv_capacity_fraction",
-            "kv_load_ratio":1.0, "isl":1152, "osl":4
+            "kv_load_ratio":1.0, "isl":1152, "osl":4, "request_count":1
         }))
         .unwrap();
+        let build = |role: &ReplayRoleConfig| {
+            let options = TrafficBuildOptions::new(64).with_kv_capacity(role.clone(), 2);
+            build_traffic(traffic.clone(), &options).map(|built| built.max_in_flight)
+        };
         // A 32-token window can straddle three 16-token pages (480 bytes).
         // Each rank holds two requests; three DP ranks and two replicas hold 12.
-        assert_eq!(
-            resolve_kv_capacity_concurrency(&mut traffic, &role, 2).unwrap(),
-            Some(12)
-        );
-        assert_eq!(traffic.concurrency, Some(12));
+        assert_eq!(build(&role).unwrap(), Some(12));
         role.rank.kv_cache_capacity_bytes = Some(479);
-        assert!(resolve_kv_capacity_concurrency(&mut traffic, &role, 2).is_err());
+        assert!(build(&role).is_err());
     }
 
     #[test]
@@ -10797,10 +10029,7 @@ mod tests {
         }
         config.estimation_mode = Some(EstimationMode::OpLevel);
         config.kv_block_size = Some(16);
-        config.systems_paths = vec![
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../python/aisim/src/aisim_core/systems"),
-        ];
+        config.systems_paths = vec![crate::test_systems::path("")];
         let mut timing =
             AicTimingModel::build(&mut config, ForwardPassWorkerType::Aggregated, false).unwrap();
         timing.diagnostic_model = None;
@@ -11990,8 +11219,7 @@ mod tests {
         use crate::perfmodel::fpm::ForwardPassPerfOptions;
         pyo3::Python::initialize();
         let db = crate::perf_database::PerfDatabase::load(
-            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../python/aisim/src/aisim_core/systems"),
+            &crate::test_systems::path(""),
             "h200_sxm",
             "sglang",
             "0.5.6.post2",
