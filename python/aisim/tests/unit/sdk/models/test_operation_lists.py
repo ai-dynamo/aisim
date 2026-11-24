@@ -201,6 +201,39 @@ def test_replacement_iterable_cannot_leave_an_old_graph_identity(graph_estimator
     assert estimate(model) == estimate(cold)
 
 
+@pytest.mark.parametrize("phase", ["context", "generation"])
+def test_phase_replacement_invalidates_an_in_flight_identity(graph_estimator, monkeypatch, phase):
+    from aisim_core.sdk import rust_engine_step
+
+    model, estimate = graph_estimator
+    name = f"{phase}_ops"
+    replacement = [*getattr(model, name), _extra_scan(model, phase, "extra_scan")]
+    cold = copy.deepcopy(model)
+    setattr(cold, name, replacement)
+    initial = estimate(model)
+    config_json = rust_engine_step._engine_config_json
+    snapshots = []
+
+    def replace_after_snapshot(graph, database):
+        key = config_json(graph, database)
+        if graph is model and not snapshots:
+            snapshots.append(key)
+            # Reproduce replacement after the old graph has been read but
+            # before engine_identity publishes its memo, without thread timing.
+            setattr(model, name, replacement)
+        return key
+
+    monkeypatch.setattr(rust_engine_step, "_engine_config_json", replace_after_snapshot)
+    del model._aic_engine_identity_memo
+    # The in-flight query may use the old snapshot. Later queries must price
+    # the installed graph, even though the old memo was published after the swap.
+    assert estimate(model) == initial
+    assert len(snapshots) == 1
+    actual = estimate(model)
+    assert actual > initial
+    assert actual == estimate(cold)
+
+
 @pytest.mark.parametrize("raw_native", [False, True])
 @pytest.mark.parametrize("phase", ["context", "generation"])
 def test_operation_name_edit_cannot_reuse_warm_summary_or_handle(graph_estimator, monkeypatch, raw_native, phase):

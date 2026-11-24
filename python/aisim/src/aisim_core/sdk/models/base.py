@@ -261,6 +261,7 @@ class BaseModel:
             return
         replacement = _OperationList(value, self._aic_op_list_revision)
         self.__dict__["context_ops"] = replacement
+        self._aic_op_list_revision[0] += 1
         # Materialization may estimate the old graph before installation.
         self.__dict__.pop("_aic_engine_identity_memo", None)
 
@@ -274,6 +275,7 @@ class BaseModel:
             return
         replacement = _OperationList(value, self._aic_op_list_revision)
         self.__dict__["generation_ops"] = replacement
+        self._aic_op_list_revision[0] += 1
         # Materialization may estimate the old graph before installation.
         self.__dict__.pop("_aic_engine_identity_memo", None)
 
