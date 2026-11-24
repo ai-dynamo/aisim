@@ -228,6 +228,29 @@ assert out.read_bytes() == b"measured"
     )
 
 
+def test_native_cleanup_deadline_stops_allocation(monkeypatch, tmp_path):
+    import io
+
+    import collector.sglang.collect_kimi_k31_dsa_v1 as native
+
+    timeouts = []
+
+    def stalled(timeout):
+        timeouts.append(timeout)
+        raise subprocess.TimeoutExpired("worker", timeout)
+
+    pipe = io.StringIO()
+    monkeypatch.setattr(
+        native.subprocess, "Popen", lambda *a, **kw: SimpleNamespace(pid=123, stderr=pipe, communicate=stalled)
+    )
+    monkeypatch.setattr(native.os, "killpg", lambda pid, sig: None)
+    case = ModuleCase(4096, 1, 96, "fp8", "bfloat16", "bfloat16", MODEL, 0)
+    with pytest.raises(native.NativeAllocationFailure, match="stop this allocation"):
+        native._run_native_case(case, "cuda:0", tmp_path / "stage")
+    assert timeouts == [native.NATIVE_CASE_TIMEOUT_S, native.NATIVE_CLEANUP_TIMEOUT_S]
+    assert pipe.closed
+
+
 def test_physical_sm_validation_checks_every_selected_device():
     from collector.sglang.collect_kimi_k31_dsa_v1 import _check_device_sm
 

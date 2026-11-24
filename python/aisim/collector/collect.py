@@ -15,46 +15,7 @@ import logging
 import os
 import warnings
 
-try:
-    from helper import (
-        EXIT_CODE_OPS_NOT_IN_PLAN,
-        EXIT_CODE_RESTART,
-        PERF_TRANSACTION_FILENAME,
-        SIDECAR_STAGING_FILENAME,
-        SIDECAR_TRANSACTION_FILENAME,
-        LockedOutputRoot,
-        PerfFileAttestation,
-        PerfFinalizationInfo,
-        PerfPublication,
-        WorkerRestartSignal,
-        _rename_noreplace,
-        _rename_noreplace_at,
-        atomic_write_reservation_path,
-        cleanup_atomic_write_reservations,
-        cleanup_perf_publication_artifacts,
-        cleanup_unjournaled_perf_preparations,
-        collector_retained_path,
-        create_test_case_id,
-        cuda_context_error,
-        finalize_perf_files,
-        find_perf_csv_outputs,
-        get_device_module,
-        get_device_str,
-        perf_finalization_lifecycle,
-        perf_merge_locks,
-        perf_preparation_cleanup_path,
-        perf_preparation_path,
-        perf_transaction_artifact_paths,
-        restore_perf_publications,
-        save_error_report,
-        set_worker_heartbeat,
-        setup_logging,
-        setup_signal_handlers,
-        validate_restored_perf_publications,
-    )
-except ModuleNotFoundError as error:
-    if error.name != "helper" or not __package__:
-        raise
+if __package__:
     from .helper import (
         EXIT_CODE_OPS_NOT_IN_PLAN,
         EXIT_CODE_RESTART,
@@ -79,6 +40,45 @@ except ModuleNotFoundError as error:
         find_perf_csv_outputs,
         get_device_module,
         get_device_str,
+        native_publication_lock,
+        perf_finalization_lifecycle,
+        perf_merge_locks,
+        perf_preparation_cleanup_path,
+        perf_preparation_path,
+        perf_transaction_artifact_paths,
+        restore_perf_publications,
+        save_error_report,
+        set_worker_heartbeat,
+        setup_logging,
+        setup_signal_handlers,
+        validate_restored_perf_publications,
+    )
+else:
+    from helper import (
+        EXIT_CODE_OPS_NOT_IN_PLAN,
+        EXIT_CODE_RESTART,
+        PERF_TRANSACTION_FILENAME,
+        SIDECAR_STAGING_FILENAME,
+        SIDECAR_TRANSACTION_FILENAME,
+        LockedOutputRoot,
+        PerfFileAttestation,
+        PerfFinalizationInfo,
+        PerfPublication,
+        WorkerRestartSignal,
+        _rename_noreplace,
+        _rename_noreplace_at,
+        atomic_write_reservation_path,
+        cleanup_atomic_write_reservations,
+        cleanup_perf_publication_artifacts,
+        cleanup_unjournaled_perf_preparations,
+        collector_retained_path,
+        create_test_case_id,
+        cuda_context_error,
+        finalize_perf_files,
+        find_perf_csv_outputs,
+        get_device_module,
+        get_device_str,
+        native_publication_lock,
         perf_finalization_lifecycle,
         perf_merge_locks,
         perf_preparation_cleanup_path,
@@ -6259,7 +6259,25 @@ def _finalize_collector_outputs_transaction(
     sm_version: int | None,
 ) -> list[Path]:
     _require_separate_checkpoint_root(output_root, checkpoint_dir, backend)
-    with perf_finalization_lifecycle(output_root) as locked_output_root:
+    native_outputs = {
+        (output_root / collection["perf_filename"]).resolve()
+        for collection in (provenance_ctx.get("collections") or ())
+        if collection.get("type") in {"kimi_k31_dsa_context_module", "kimi_k31_dsa_generation_module"}
+    }
+    # A shared table can also be finalized by another producer of that table.
+    native_outputs.update(
+        path.resolve()
+        for path in staging_paths
+        if path.name in {"dsa_context_module_perf.txt", "dsa_generation_module_perf.txt"}
+    )
+    with contextlib.ExitStack() as locks:
+        for output in sorted(native_outputs):
+            if output.parent != output_root.resolve():
+                raise RuntimeError(f"Native finalization output is outside its root: {output}")
+            locks.enter_context(native_publication_lock(output))
+            if output.with_name(f".{output.name}.pending").exists():
+                raise RuntimeError(f"Resume the pending native publication for {output} before finalization")
+        locked_output_root = locks.enter_context(perf_finalization_lifecycle(output_root))
         return _finalize_collector_outputs_transaction_locked(
             locked_output_root.path,
             staging_paths,
