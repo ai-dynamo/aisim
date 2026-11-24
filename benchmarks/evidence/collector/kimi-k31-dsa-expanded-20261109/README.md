@@ -38,6 +38,10 @@ checks the exact frozen case sets, and verifies that all columns of the earlier
 B300 rows remain unchanged. `x86/manifest.json` and `arm/manifest.json` bind the
 finite public evidence packages. Original raw CSV-formatted files preserve
 their CRLF bytes; source events and original table columns survive the unions.
+Both portable union tools validate the K3.1 query coordinates before writing each table.
+Generation uses total sequence length. The native FP8 cache layout and skip-indexer
+flag distinguish rows that query separate grids. The recorded historical script digests
+identify the [original derivation tools](https://github.com/ai-dynamo/aisim/tree/27fce20ee92c27e883454c4924a4f6c97ce60bd8/benchmarks/evidence/collector/kimi-k31-dsa-expanded-20261109).
 The inventory records paths at collection time. To verify its 18 SHA-256 values,
 hash the original files at those paths in the [pre-migration revision](https://github.com/ai-dynamo/aisim/tree/8f4603379f1c9b8a846db7066c0c6306709cd834/python/aisimulate/src/aisimulate_core/systems/data).
 The dataset publication records schema stamping separately and preserves the decoded measurements.

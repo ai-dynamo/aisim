@@ -264,8 +264,8 @@
     },
     {
       "path": "tools/merge_formal_tables.py",
-      "bytes": 6363,
-      "sha256": "f59bafc6b26c292be2e3e0e467df6d0e2108581bf71a52aa0b83c4eba1f1313a"
+      "bytes": 5975,
+      "sha256": "11604bbd2ebbddf72dfcb83edd543b4520207637e02b4bcb078747d75d77418d"
     },
     {
       "path": "tools/verify_arm_current_slot.py",

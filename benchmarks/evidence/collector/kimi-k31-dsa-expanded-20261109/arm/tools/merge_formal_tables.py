@@ -6,6 +6,7 @@ import argparse
 import copy
 import hashlib
 import json
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -14,7 +15,10 @@ import pyarrow.parquet as pq
 import yaml
 from collector.provenance import append_collection_event, render_collection_meta, validate_collection_meta_for_update
 
-from aisimulate_core.sdk.perf_database import _load_collection_meta_yaml
+from aisim_core.sdk.perf_database import _load_collection_meta_yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from consumer_keys import validate_union
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--output", type=Path, required=True)
@@ -62,28 +66,7 @@ for name in names:
     indexes = [i for i, m in enumerate(metas) if name in m["tables"]]
     parts = [pq.read_table(args.sources[i] / f"{name}.parquet") for i in indexes]
     assert all(t.schema == parts[0].schema for t in parts)
-    seen = set()
-    for part in parts:
-        keys = {
-            tuple(
-                row[k]
-                for k in (
-                    "architecture",
-                    "num_heads",
-                    "batch_size",
-                    "isl",
-                    "step",
-                    "tp_size",
-                    "kv_cache_dtype",
-                    "mla_dtype",
-                    "gemm_type",
-                    "kernel_source",
-                )
-            )
-            for row in part.to_pylist()
-        }
-        assert len(keys) == part.num_rows and not keys & seen, "overlapping measurement keys"
-        seen.update(keys)
+    validate_union(parts, name)
     combined = pa.concat_tables(parts)
     target = args.output / f"{name}.parquet"
     pq.write_table(combined, target, compression="zstd")
@@ -140,6 +123,7 @@ receipt = {
         "strict_sdk_schema_reader_passed": True,
         "disjoint_measurement_keys": True,
     },
+    "consumer_keys_sha256": hashlib.sha256((Path(__file__).resolve().parents[2] / "consumer_keys.py").read_bytes()).hexdigest(),
     "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
 }
 args.receipt.write_text(json.dumps(receipt, indent=2) + "\n")
