@@ -1034,16 +1034,21 @@ def test_native_fullnode_failure_reaches_persisted_artifact(monkeypatch, tmp_pat
     assert errors[0]["classification"] == "kernel_limit"
 
 
-def test_native_fullnode_resumes_after_last_completed_case(monkeypatch, tmp_path):
+@pytest.mark.parametrize("alias", [False, True])
+def test_native_fullnode_resumes_after_last_completed_case(monkeypatch, tmp_path, alias):
     import collector.sglang.collect_kimi_k31_dsa_v1 as module
     from collector import fullnode
     from collector.collect import ResumeCheckpoint
 
     cases = [ModuleCase(4096, 1, heads, "fp8", "bfloat16", "bfloat16", MODEL, 0) for heads in (96, 48)]
     output = tmp_path / "dsa_context_module_perf.txt"
+    target = tmp_path / "physical-rows" if alias else output
+    if alias:
+        output.symlink_to(target)
     ran = []
 
-    def native(case, _device, filename, *, expected_sm):
+    def native(case, _device, filename, *, expected_sm, phase):
+        assert phase == "context"
         assert expected_sm == 103
         with pytest.raises(RuntimeError, match="already has a publication owner"):
             collect()
@@ -1099,7 +1104,8 @@ def test_native_fullnode_resumes_after_last_completed_case(monkeypatch, tmp_path
     monkeypatch.setenv("COLLECTOR_K31_FINALIZE_ONLY", "1")
     assert collect() == []
     assert ran == [cases[0], cases[1], cases[1]]
-    assert output.read_text().splitlines() == list(map(str, cases))
+    assert output.is_symlink() == alias
+    assert target.read_text().splitlines() == list(map(str, cases))
 
 
 @pytest.mark.parametrize("failure", ["runner", "result", "flush"])
