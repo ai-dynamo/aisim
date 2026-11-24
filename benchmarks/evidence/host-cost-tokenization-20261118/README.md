@@ -81,7 +81,7 @@ The measured coefficient alone brings the point TTFT error under 10% on both lan
 ## Reproduce
 
 `slurm/collect.sbatch` (one job per system), `collector.host_cpu.stage` (merge, gate, GPU time, ledger), see the
-[`aisim-tokenization-cost-collect`](../../../.agents/skills/aisim-tokenization-cost-collect/SKILL.md) skill. Per-job metadata
+[`aisim-cpu-overhead-collect`](../../../.agents/skills/aisim-cpu-overhead-collect/references/tokenizer.md) skill. Per-job metadata
 (`job.txt`, `entries.txt`, `sacct.txt`) is in [`jobs/`](jobs/).
 
 ## Where the evidence lives

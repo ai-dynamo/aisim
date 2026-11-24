@@ -1,29 +1,22 @@
----
-name: aisim-tokenization-cost-collect
-description: Measure how much host-CPU time a serving framework spends turning a chat request into engine input (JSON, validation, chat template, tokenization, prefix-cache hashing), fit per-input-token cost per tokenizer and host CPU, and record the GPU-hours spent. Use when collecting or refreshing tokenization-cost data for vLLM, SGLang or TRT-LLM, or measuring a user's own host; not for GPU kernel timing, HTTP or client delay, or replay accuracy campaigns.
-license: Apache-2.0
----
-
 <!--
 SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Collect tokenization cost
+# Queued tokenizer cost
 
 Produce `host-cost` entries: per-request component times for one
 (framework, framework version, system, tokenizer) on that system's host CPU, plus the
 regression `base_ms + per_input_token_us × tokens`. The harness is `collector/host_cpu/`; the
 fit is `aisim_core.host_cost.fit`; storage is the `host-cost` category
-(`aisim_core.data.host_cost`). This skill does not authorize a GPU allocation beyond the
-campaign's recorded plan, an upload, or a dataset publish. Ask before spending more.
+(`aisim_core.data.host_cost`).
 
 ## What is measured, and what is not
 
 - The harness runs the framework's own request code from its pinned image (never a reimplementation),
   on a real chat payload set shared by every tokenizer so tokenizers see the same text.
 - Queued replay cost is `template + encode + hash` (`engine.tokenization`). `json` and `validate` are
-  recorded but not fitted; they belong to the unqueued overhead, which is a separate collection.
+  recorded but not fitted; they belong to the unqueued overhead, which is collected separately.
 - Idle single-thread cost only. Contention under load is not measured. Say so in any report.
 - A GPU is held only because the host CPU must be the serving node's. The measurement uses no GPU kernels.
 

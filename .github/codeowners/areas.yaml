@@ -170,9 +170,9 @@ shared:
     owners: [replay, forward-pass-engine, infra, maintainers]
   - glob: .claude/skills/aisim-agentx-collect
     owners: [replay, forward-pass-engine, infra, maintainers]
-  - glob: .agents/skills/aisim-tokenization-cost-collect/
+  - glob: .agents/skills/aisim-cpu-overhead-collect/
     owners: [forward-pass-engine, replay, maintainers]
-  - glob: .claude/skills/aisim-tokenization-cost-collect
+  - glob: .claude/skills/aisim-cpu-overhead-collect
     owners: [forward-pass-engine, replay, maintainers]
   - glob: .agents/skills/aisim-agentx-gap-debug/
     owners: [replay, forward-pass-engine, maintainers]

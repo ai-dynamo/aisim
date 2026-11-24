@@ -11,7 +11,7 @@ system's host CPU. The harness (`collector/host_cpu/`) runs the framework's own 
 image and times each step of a real chat request body: JSON parse, request validation, chat-template render,
 encode, and (vLLM only) prefix-cache block hashing. It needs no GPU kernels; a GPU is held only because the
 host CPU must be the serving node's. Collect with the
-[`aisim-tokenization-cost-collect`](../../.agents/skills/aisim-tokenization-cost-collect/SKILL.md) skill.
+[`aisim-cpu-overhead-collect`](../../.agents/skills/aisim-cpu-overhead-collect/references/tokenizer.md) skill.
 
 ## Layout
 
