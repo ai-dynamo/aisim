@@ -169,6 +169,10 @@ def env(monkeypatch, tmp_path):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("AISIM_DATA_CACHE", str(cache))
     monkeypatch.setattr("aisim_core.data.config.PIN_FILE", tmp_path / "absent-pin.json")
+    # No Hugging Face credential, and no real prompt or login: a test that expects one overrides these.
+    monkeypatch.setattr(data_cli, "_hf_token", lambda: None)
+    monkeypatch.setattr(data_cli, "_read_token", lambda: pytest.fail("unexpected token prompt"))
+    monkeypatch.setattr(data_cli, "_save_token", lambda token: pytest.fail("unexpected token save"))
     return cache
 
 
@@ -187,7 +191,9 @@ def run(monkeypatch, tmp_path, capsys, env):
     return _run
 
 
-def _tty(monkeypatch, answer=""):
+def _tty(monkeypatch, answer="", token=""):
+    """A terminal: ``answer`` is what the mode question reads; ``token`` what the hidden token prompt returns."""
+
     class Stdin:
         def isatty(self):
             return True
@@ -195,7 +201,15 @@ def _tty(monkeypatch, answer=""):
         def readline(self):
             return answer
 
+    def read_token():
+        if isinstance(token, type) and issubclass(token, BaseException):
+            raise token()
+        if callable(token):  # pytest.fail: this test expects no prompt
+            token("unexpected token prompt")
+        return token
+
     monkeypatch.setattr(sys, "stdin", Stdin())
+    monkeypatch.setattr(data_cli, "_read_token", read_token)
 
 
 # ------------------------------------------------------------------ parser and fetch defaults
@@ -386,6 +400,77 @@ def test_init_prompt(run, monkeypatch, answer, mode):
 def test_init_prompt_eof_does_not_loop(run, monkeypatch):
     _tty(monkeypatch, "")
     assert run("init")[0] == 2
+
+
+def _record_saved_tokens(monkeypatch):
+    saved = []
+    monkeypatch.setattr(data_cli, "_save_token", saved.append)
+    return saved
+
+
+def test_init_with_a_token_uses_it_without_asking(run, monkeypatch):
+    monkeypatch.setattr(data_cli, "_hf_token", lambda: "hf_secret")
+    _tty(monkeypatch, "2\n", token=pytest.fail)  # a prompt would call this and fail the test
+    status, out, err = run("init", "--revision", SHA)
+    assert status == 0 and "Using your Hugging Face token" in err and "No Hugging Face token" not in err
+    assert "hf_secret" not in out + err and load_config().mode == "on-demand"
+
+
+def test_init_without_a_token_or_terminal_explains_the_rate_limit(run):
+    status, out, err = run("init", "--on-demand")
+    assert status == 0 and json.loads(out)["mode"] == "on-demand"  # stdout stays one JSON object
+    assert "rate limited" in err and "HF_TOKEN" in err and "hf auth login" in err
+
+
+def test_init_offers_to_save_a_token_and_keeps_it_out_of_output_and_config(run, monkeypatch):
+    saved = _record_saved_tokens(monkeypatch)
+    _tty(monkeypatch, "2\n", token="  hf_secret \n")
+    status, out, err = run("init", "--revision", SHA)
+    assert status == 0 and saved == ["hf_secret"]
+    assert "rate limited" in err and "Token saved" in err
+    assert "hf_secret" not in out + err
+    assert "hf_secret" not in config_path().read_text()
+
+
+@pytest.mark.parametrize("token", ["", "   ", EOFError])
+def test_init_enter_or_closed_input_skips_the_token(run, monkeypatch, token):
+    saved = _record_saved_tokens(monkeypatch)
+    _tty(monkeypatch, "2\n", token=token)
+    status, _, err = run("init", "--revision", SHA)
+    assert status == 0 and saved == [] and "Token saved" not in err and load_config().mode == "on-demand"
+
+
+def test_init_rejected_token_continues_without_echoing_it(run, monkeypatch):
+    def reject(token):
+        raise RuntimeError(f"401 Unauthorized for {token}")  # a library message may carry the token
+
+    monkeypatch.setattr(data_cli, "_save_token", reject)
+    _tty(monkeypatch, token="hf_secret")
+    status, out, err = run("init", "--on-demand")
+    assert status == 0 and "not saved (RuntimeError)" in err and "hf_secret" not in out + err
+    assert load_config().mode == "on-demand"
+
+
+def test_init_offline_skips_the_token_step(run, monkeypatch):
+    _tty(monkeypatch, token=pytest.fail)  # a prompt would call this and fail the test
+    status, _, err = run("init", "--on-demand", "--offline")
+    assert status == 0 and "Hugging Face token" not in err
+
+
+def test_saving_a_token_goes_through_hugging_face_login_and_never_writes_stdout(monkeypatch, capsys):
+    import huggingface_hub
+
+    calls = []
+
+    def noisy_login(token=None, **kwargs):
+        calls.append((token, kwargs))
+        print("Login successful")
+
+    monkeypatch.setattr(huggingface_hub, "login", noisy_login)
+    data_cli._save_token("hf_secret")
+    captured = capsys.readouterr()
+    assert calls == [("hf_secret", {"add_to_git_credential": False})]
+    assert captured.out == "" and "Login successful" in captured.err
 
 
 def test_init_flags_are_mutually_exclusive(run):

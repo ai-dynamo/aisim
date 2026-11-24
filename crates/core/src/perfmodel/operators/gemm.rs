@@ -621,14 +621,11 @@ fn scale_matrix_empirical(
 mod tests {
     use super::*;
     use crate::common::enums::TransferPolicy;
-    use std::path::PathBuf;
 
     const REPO_ROOT_HINT: &str = env!("CARGO_MANIFEST_DIR");
 
     fn b200_vllm_db() -> PerfDatabase {
-        let systems_root = PathBuf::from(REPO_ROOT_HINT)
-            .join("../..")
-            .join("python/aisim/src/aisim_core/systems");
+        let systems_root = crate::test_systems::path("");
         PerfDatabase::load(&systems_root, "b200_sxm", "vllm", "0.24.0").expect("db must load")
     }
 
@@ -772,9 +769,7 @@ mod tests {
 
     #[test]
     fn w4a16_nvfp4_uses_xprofile_only_in_hybrid() {
-        let systems_root = PathBuf::from(REPO_ROOT_HINT)
-            .join("../..")
-            .join("python/aisim/src/aisim_core/systems");
+        let systems_root = crate::test_systems::path("");
         let mut db = PerfDatabase::load(&systems_root, "h200_sxm", "trtllm", "1.3.0rc20")
             .expect("database must load");
 
@@ -851,9 +846,7 @@ mod tests {
     }
 
     fn h200_vllm_db() -> PerfDatabase {
-        let systems_root = PathBuf::from(REPO_ROOT_HINT)
-            .join("../..")
-            .join("python/aisim/src/aisim_core/systems");
+        let systems_root = crate::test_systems::path("");
         PerfDatabase::load(&systems_root, "h200_sxm", "vllm", "0.24.0").expect("db must load")
     }
 
