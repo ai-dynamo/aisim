@@ -139,6 +139,67 @@ def test_forward_perf_selects_before_allocating_the_benchmark_runner():
     assert "${BASE_SRC}/python/aisimulate/tools/forward_perf_gate/run.py" in _run_commands(compare)
 
 
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="Cargo is required to check configuration isolation")
+@pytest.mark.parametrize("image_cargo_home", [None, "image-cargo"])
+def test_forward_perf_isolates_cargo_config_and_preserves_download_caches(tmp_path, image_cargo_home):
+    steps = _workflow("performance.yml")["jobs"]["compare"]["steps"]
+    isolate = steps[0]
+    assert isolate["name"] == "Isolate benchmark Cargo configuration"
+    checkout = tmp_path / "checkout"
+    source_home = tmp_path / image_cargo_home if image_cargo_home else checkout / ".cargo"
+    source_home.mkdir(parents=True)
+    # A global head-only rustflag would invalidate even the base build.
+    (source_home / "config.toml").write_text('[build]\nrustflags = ["--cfg", "head_only"]\n')
+    for cache in ("registry", "git"):
+        (source_home / cache).mkdir()
+        (source_home / cache / "cached-download").write_text(cache)
+    runner_temp = tmp_path / "runner-temp"
+    output = tmp_path / "github-env"
+    env = {
+        **os.environ,
+        "HOME": str(checkout),
+        "RUNNER_TEMP": str(runner_temp),
+        "GITHUB_RUN_ID": "123",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "GITHUB_ENV": str(output),
+    }
+    env.pop("CARGO_HOME", None)
+    if image_cargo_home:
+        env["CARGO_HOME"] = str(source_home)
+    subprocess.run(["bash", "-euc", isolate["run"]], env=env, check=True)
+    key, value = output.read_text().strip().split("=", 1)
+    assert key == "CARGO_HOME"
+    isolated_home = Path(value)
+    assert isolated_home.is_relative_to(runner_temp)
+    assert not (isolated_home / "config.toml").exists()
+    for cache in ("registry", "git"):
+        assert (isolated_home / cache / "cached-download").read_text() == cache
+
+    for revision in ("base", "head"):
+        crate = runner_temp / revision
+        (crate / "src").mkdir(parents=True)
+        (crate / "Cargo.toml").write_text(f'[package]\nname = "{revision}"\nversion = "0.1.0"\nedition = "2021"\n')
+        (crate / "src/main.rs").write_text('#[cfg(head_only)]\ncompile_error!("head config leaked");\nfn main() {}\n')
+        # First prove that the inherited global configuration contaminates this build.
+        contaminated = subprocess.run(
+            ["cargo", "check", "--offline"],
+            cwd=crate,
+            env={**env, "CARGO_HOME": str(source_home), "CARGO_TARGET_DIR": str(crate / "target")},
+            capture_output=True,
+            text=True,
+        )
+        assert contaminated.returncode != 0
+        assert "head config leaked" in contaminated.stderr
+        subprocess.run(
+            ["cargo", "check", "--offline"],
+            cwd=crate,
+            env={**env, "CARGO_HOME": value, "CARGO_TARGET_DIR": str(crate / "target")},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
 def test_forward_perf_validates_the_pr_controller_without_replacing_the_base_comparison():
     steps = _workflow("performance.yml")["jobs"]["compare"]["steps"]
     revisions = next(step for step in steps if step.get("id") == "revisions")
