@@ -38,7 +38,7 @@ def resolve_systems_paths(configured: list[str] | None, *, require_directories: 
 def request_systems_paths(configured: list[str] | None) -> tuple[str, ...]:
     """Roots for a forward-pass request: ``resolve_systems_paths`` plus a preserved explicit ``default``.
 
-    Unset roots and the literal ``default`` expand to the same packaged root, but only the literal token is a
+    Unset roots and the literal ``default`` expand to the same default root, but only the literal token is a
     choice that outranks the source saved by ``aisim init``. The token is resolved again when the native
     configuration is built, so keeping it in the request only keeps that choice visible.
     """
@@ -47,7 +47,7 @@ def request_systems_paths(configured: list[str] | None) -> tuple[str, ...]:
     resolved = resolve_systems_paths(configured)
     if not any(isinstance(entry, str) and entry.strip().lower() == "default" for entry in entries):
         return resolved
-    # Resolve each entry next to the token, never alone: a lone packaged path is read as an expansion of unset roots
+    # Resolve each entry next to the token, never alone: a lone default-root path is read as an expansion of unset roots
     # and swapped for AICONFIGURATOR_SYSTEMS_PATH, which would move it ahead of the explicit custom roots.
     return tuple(
         dict.fromkeys(

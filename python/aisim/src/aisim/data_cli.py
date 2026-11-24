@@ -191,6 +191,8 @@ def run_init(args: argparse.Namespace) -> int:
                 "database now), --on-demand (download when a run needs it) or --hardware H (one platform now)"
             )
         mode = _prompt_mode()
+    if not args.offline:
+        _hf_token_step()
     path = config_path(cache_dir=args.cache_dir)
     saved = load_config(path)
     repo, revision = args.repo, args.revision
@@ -216,6 +218,63 @@ def run_init(args: argparse.Namespace) -> int:
     save_config(config, path)  # saved only after the download succeeded
     _emit(payload)
     return 0
+
+
+_TOKEN_URL = "https://huggingface.co/settings/tokens"
+
+
+def _hf_token() -> str | None:
+    """The credential ``huggingface_hub`` would send: ``HF_TOKEN`` or a saved login."""
+    from huggingface_hub import get_token
+
+    return get_token()
+
+
+def _read_token() -> str:
+    import getpass
+
+    return getpass.getpass("Paste a token to save it (input is hidden), or press Enter to continue without one: ")
+
+
+def _save_token(token: str) -> None:
+    """Save through Hugging Face's own login, so every Hugging Face tool and later AISim downloads use it."""
+    import contextlib
+
+    from huggingface_hub import login
+
+    with contextlib.redirect_stdout(sys.stderr):  # login narrates on stdout, which carries only our JSON
+        login(token=token, add_to_git_credential=False)
+
+
+def _hf_token_step() -> None:
+    """Before any download: use an existing Hugging Face token, or explain the rate limit and offer to save one.
+
+    The token never enters AISim's config, logs or output; it goes only to Hugging Face's own token store.
+    """
+    out = sys.stderr
+    if _hf_token():
+        out.write("Using your Hugging Face token: authenticated downloads have much higher rate limits.\n")
+        return
+    out.write(
+        "No Hugging Face token found. Anonymous downloads are rate limited (HTTP 429): the op database is\n"
+        "thousands of files and can stall for minutes. A free read-only token avoids this:\n"
+        f"  {_TOKEN_URL}\n"
+    )
+    if not sys.stdin.isatty():
+        out.write("Set HF_TOKEN or run `hf auth login` to use one; continuing without it.\n")
+        return
+    try:
+        token = _read_token().strip()
+    except EOFError:  # input closed: same as pressing Enter
+        return
+    if not token:
+        return
+    try:
+        _save_token(token)
+    except Exception as exc:  # a rejected token or no network: the download still works anonymously
+        out.write(f"The token was not saved ({type(exc).__name__}); continuing without it.\n")
+        return
+    out.write("Token saved to your Hugging Face login; AISim and other Hugging Face tools will use it.\n")
 
 
 def _prompt_mode() -> str:

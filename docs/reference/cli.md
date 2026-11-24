@@ -40,7 +40,7 @@ typed JSON error (`{"error": code, "message": ...}`) on stderr.
 aisim data fetch --dry-run                    # plan the whole op-latency database
 aisim data fetch                              # download it (same as --category op-latency --all)
 aisim fetch --hardware h200_sxm --framework vllm
-aisim data fetch --category fpm --model Qwen/Qwen3-32B --hardware h200_sxm
+aisim data fetch --category fpm --model MiniMaxAI/MiniMax-M2.7 --hardware h200_sxm
 ```
 
 With no arguments, `fetch` downloads the whole op-latency database. FPM, e2e and eval data are never part of
@@ -80,7 +80,7 @@ usage, and `1` for revision, transfer, integrity or offline failures.
 |---|---|
 | `aisim init --all` | Download the whole op-latency database now and save `all`. |
 | `aisim init --hardware H` | Download op data for one hardware platform now and save `hardware`. |
-| `aisim init --on-demand` | Download nothing now. A run downloads data only from a pinned source: `--repo`/`--revision` saved with this choice, or `AISIM_DATASET`. With neither, runs use the op data packaged with AISim. |
+| `aisim init --on-demand` | Download nothing now. A run downloads data only from a pinned source: `--repo`/`--revision` saved with this choice, or `AISIM_DATASET`. With neither, runs use the default op data: the dataset revision pinned in the release (see [Default operation data](#default-operation-data)). |
 
 `--repo`, `--revision`, `--cache-dir`, `--offline` and `--no-limit` behave as for `fetch`. The choice is saved
 only after the download succeeds (`--all` and `--hardware` also save the repository and revision they downloaded, so
@@ -88,6 +88,19 @@ runs select that data), in `config.json` in the cache root: `~/.cache/aisim/conf
 `XDG_CACHE_HOME`), or `$AISIM_DATA_CACHE/config.json` when `AISIM_DATA_CACHE` is set. No file means on-demand.
 Precedence is flag, then environment variable, then config file, then shipped default; the config never
 overrides an environment variable.
+
+<a id="hugging-face-token"></a>
+
+Before any download, `init` checks for a Hugging Face token (`HF_TOKEN`, or a login saved by `hf auth login`).
+Anonymous downloads are rate limited (HTTP 429), and the op-latency database is thousands of files, so a first
+download without a token can stall for minutes. When no token is found, `init` says so on stderr and, in a
+terminal, offers a hidden prompt: paste a free read-only token from <https://huggingface.co/settings/tokens>, or
+press Enter to continue anonymously. A pasted token is validated and saved by Hugging Face's own login, so every
+Hugging Face tool and later AISim downloads use it, including the `config.json` AISim fetches for a model it does not
+bundle; it is never written to AISim's config, logs or output. The lookup order is `HF_TOKEN`, then
+`HUGGING_FACE_HUB_TOKEN`, then the saved login (`$HF_HOME/token`), then anonymous requests;
+`HF_HUB_DISABLE_IMPLICIT_TOKEN=1` skips all three. Without a
+terminal `init` only prints the notice, so scripts set `HF_TOKEN`. `--offline` skips the step.
 
 `aisim data status` prints the pin, the cache path and size on disk, the saved init mode, and for every cached
 revision its size and how many files of the whole op-latency database are cached or missing (computed offline).
@@ -172,12 +185,12 @@ loads, the run fails with a missing-data error that names this variable; it neve
 A source saved by `aisim init` is a default for runs that read operation tables and name no roots. A
 configuration with `estimation_mode` `fpm_interpolation`, `fpm_regression` or `fpm_learned`, or one that sets its
 own `systems_paths` in any mode (`auto` reads FPM tables from them as a fallback), keeps its data. Roots set with
-`set_systems_paths` or `AICONFIGURATOR_SYSTEMS_PATH` count as your own too; only the packaged roots, which the
-Sweeper fills in when you set none, do not. Name the source with
+`set_systems_paths` or `AICONFIGURATOR_SYSTEMS_PATH` count as your own too; only the default root, which the
+Sweeper fills in when you set none, does not. Name the source with
 `AISIM_DATASET` or a pin to apply it to the configurations that keep their data.
 `AICONFIGURATOR_SYSTEMS_PATH` also supplies the root when `systems_paths` is unset or holds only the expanded
-packaged path. A literal `default` (the bundled data) and explicit custom `systems_paths` retain their precedence
-over the environment variable.
+default root. A literal `default` (the default operation data) and explicit custom `systems_paths` retain their
+precedence over the environment variable.
 
 An `op-latency` pin composes all matching operation families with the packaged system specs and support
 files into one systems root. That root replaces `systems_paths` for construction: a missing operation
@@ -203,23 +216,33 @@ records, also for a local root.
 
 <a id="non-python-consumers"></a>
 
-### Operation data for consumers without the Python data library
+### Default operation data
+
+Operation tables are not in the wheel. The default `systems/` root is composed on first use from the Hugging Face
+dataset revision pinned in `aisim_core/data/op_latency_pin.json` (a full commit SHA that ships with the
+release): every `op-latency` entry is downloaded into the data cache, hash-verified, and written next to the
+packaged specs, profiles and version tables as one root that later processes reuse. The first use downloads about
+235 MB, under the 256 MiB auto-download threshold (files are fetched concurrently); a warm cache makes no
+network request. Missing, corrupt or offline-uncached data raises `missing-data`; there is no packaged fallback.
+
+| Setting | Effect |
+|---|---|
+| `systems_paths`, `AICONFIGURATOR_SYSTEMS_PATH` | Use that root directly; nothing is downloaded. |
+| `AISIM_OP_LATENCY_DATASET=<owner>/<name>@<full SHA>` | Read another revision instead of the pin. |
+| `AISIM_OP_LATENCY_LOCAL=<dir>` | Compose the root from a local dataset-layout directory (no network). |
+| `AISIM_DATA_OFFLINE=1`, `AISIM_DATA_CACHE`, `AISIM_DATA_MAX_BYTES` | Forbid downloads, move the cache, change the auto-download threshold (default 256 MiB). |
+
+Prefetch or air-gap by running any prediction once while connected, then copy the cache directory and set
+`AISIM_DATA_OFFLINE=1 AISIM_DATA_CACHE=<copy>`.
 
 Rust `perf_database` users, sweeper and planner embeddings and Rust tests read a `systems/` directory
-(`systems_paths`, `AICONFIGURATOR_SYSTEMS_PATH`) and never run the data library. Today that directory is the
-packaged `aisim_core/systems`. Once production operation data leaves the wheel, prepare a root in Python
-once and point the consumer at it:
+(`systems_paths`, `AICONFIGURATOR_SYSTEMS_PATH`) and never run the data library. Compose a root in Python once and
+point them at it:
 
 ```python
-from aisim_core.data.ensure import DataPin
-from aisim_core.data.materialize import materialize_systems_root
+from aisim_core.data.default_systems import default_systems_path
 
-root = materialize_systems_root(
-    {"system": "b200_sxm", "backend": "vllm", "backend_version": "0.24.0"},
-    DataPin(repo="OWNER/NAME", revision="<40-hex-sha>", offline=True, cache_dir="./aisim-cache"),
-    "./systems-root",
-)
-# root.env == {"AICONFIGURATOR_SYSTEMS_PATH": "./systems-root"}; pass root.root as `systems_paths` / `systems_path`.
+root = default_systems_path()  # then: export AICONFIGURATOR_SYSTEMS_PATH=$root
 ```
 
 The root holds the packaged specs and support files plus copies of the verified pinned `data/` tables (never hard links,
@@ -227,13 +250,11 @@ so editing the root cannot change the cache); it never mixes in packaged tables.
 
 | Consumer | Preparation |
 |---|---|
-| Python code that builds the model with `best_available` | Automatic through the pin; `data fetch` only prefetches. |
-| `aisim predict`, `recommend` and `replay` runs | Read `systems_paths` / `AICONFIGURATOR_SYSTEMS_PATH`, not the pin: pass a prepared root. |
-| Sweeper, planner, Python embedding of the Rust engine | Pass `systems_paths` or set `AICONFIGURATOR_SYSTEMS_PATH` to the prepared root. |
+| Python predict/recommend/replay | Automatic on first use (above). |
+| Sweeper, planner, Python embedding of the Rust engine | Automatic through `get_systems_paths()`, or pass `systems_paths` / `AICONFIGURATOR_SYSTEMS_PATH`. |
 | Rust `perf_database` crate users | Same root as `systems_paths`/`DataRoots`; no Python at run time. |
-| Rust tests (about 38 files resolve the in-tree `systems/` directory) | Prepare a root before `cargo test` and route the sites through one resolver; a Phase 6 task. |
-| Air-gapped hosts | Prefetch with a full-SHA pin, copy the cache, run with `AISIM_DATA_OFFLINE=1`. |
-| `pip install` users | A wheel without op data needs one `data fetch` (or the automatic first-use download below the size threshold) per system and framework. |
+| Rust tests | `export AICONFIGURATOR_SYSTEMS_PATH="$(python scripts/ci/compose_systems_root.py)"` before `cargo test`; tests locate data through `crate::test_systems::path`. |
+| Air-gapped hosts | Prefetch once, copy the cache, run with `AISIM_DATA_OFFLINE=1`. |
 
 <a id="common-options"></a>
 

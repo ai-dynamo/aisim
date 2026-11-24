@@ -2633,6 +2633,23 @@ def test_active_workflows_do_not_call_nested_inert_github_assets() -> None:
         assert "./python/aisim/.github/" not in path.read_text(encoding="utf-8")
 
 
+DATA_READER_JOBS = (
+    "rust",
+    "rust-feature-modes",
+    "public-api-rust",
+    "application-tests",
+    "python-compatibility",
+    "engine-golden-regression",
+    "collector-data",
+    "readme-commands",
+)
+
+
+def _op_latency_data_result(plan: dict[str, str]) -> str:
+    """The data job runs exactly when a job that reads operation tables is selected."""
+    return "success" if any(plan.get(job.replace("-", "_")) == "true" for job in DATA_READER_JOBS) else "skipped"
+
+
 def _run_full_ci_aggregate(
     results: dict[str, str],
     plan: dict[str, str],
@@ -2640,6 +2657,7 @@ def _run_full_ci_aggregate(
 ) -> subprocess.CompletedProcess[str]:
     aggregate = _workflow("ci.yml")["jobs"]["readiness"]
     script = aggregate["steps"][0]["run"]
+    results = {"op-latency-data": _op_latency_data_result(plan), **results}
     needs = {name: {"result": result, "outputs": {}} for name, result in results.items()}
     return subprocess.run(
         ["bash", "-c", script],
@@ -2845,6 +2863,58 @@ def test_full_ci_aggregate_accepts_only_explicit_na_results() -> None:
     unexpected_unselected_job = _run_full_ci_aggregate(results, plan)
     assert unexpected_unselected_job.returncode != 0
     assert "rust=success, expected skipped" in unexpected_unselected_job.stdout
+
+
+def test_full_ci_aggregate_requires_the_data_job_exactly_when_a_reader_is_selected() -> None:
+    plan = dict.fromkeys(COMPONENTS, "false")
+    plan["application_test_wheel"] = "true"
+    plan["application_tests"] = "true"
+    results = {
+        "verify-target": "success",
+        "select-full-ci": "success",
+        "fast-ci": "success",
+        "python-compliance": "success",
+        "license-crate-inventory": "success",
+        "license-evidence": "success",
+        **{c.replace("_", "-"): ("success" if plan[c] == "true" else "skipped") for c in COMPONENTS},
+    }
+    assert _run_full_ci_aggregate(results, plan).returncode == 0
+    skipped = _run_full_ci_aggregate({**results, "op-latency-data": "skipped"}, plan)
+    assert skipped.returncode != 0 and "op-latency-data=skipped, expected success" in skipped.stdout
+
+    nothing_selected = dict.fromkeys(COMPONENTS, "false")
+    idle = {**results, "application-tests": "skipped", "application-test-wheel": "skipped"}
+    assert _run_full_ci_aggregate(idle, nothing_selected).returncode == 0
+    unexpected = _run_full_ci_aggregate({**idle, "op-latency-data": "success"}, nothing_selected)
+    assert unexpected.returncode != 0 and "op-latency-data=success, expected skipped" in unexpected.stdout
+
+
+def test_jobs_that_read_operation_data_wait_for_the_single_download() -> None:
+    """Parallel jobs that each download the dataset get rate limited by Hugging Face and time out."""
+    jobs = _workflow("ci.yml")["jobs"]
+    readers = {
+        name
+        for name, job in jobs.items()
+        if "prefetch-op-latency-data" in json.dumps(job) or "compose_systems_root" in json.dumps(job)
+    } | {"collector-data", "readme-commands"}  # reusable workflows that compose the dataset
+    assert readers == set(DATA_READER_JOBS)
+    producer = jobs["op-latency-data"]
+    for name in readers:
+        assert "op-latency-data" in jobs[name]["needs"], name
+        assert f"needs.select-full-ci.outputs.{name.replace('-', '_')} == 'true'" in producer["if"], name
+    assert "op-latency-data" in jobs["readiness"]["needs"]
+
+    # The artifact the consumers restore is the one the producer uploads, under the name and file they expect.
+    (upload,) = [s for s in producer["steps"] if s.get("uses", "").startswith("actions/upload-artifact@")]
+    assert upload["with"]["name"] == "op-latency-data"
+    assert upload["with"]["path"] == "${{ runner.temp }}/op-latency-data.tar"
+    action = yaml.safe_load((ACTION_ROOT / "prefetch-op-latency-data/action.yml").read_text())
+    restore, compose = action["runs"]["steps"]
+    assert restore["uses"].startswith("actions/download-artifact@") and restore["with"]["name"] == "op-latency-data"
+    assert restore["continue-on-error"] is True  # a standalone run falls back to downloading the dataset itself
+    assert "op-latency-data/op-latency-data.tar" in compose["run"]
+    assert "op_latency_handoff.py unpack" in compose["run"] and "compose_systems_root.py" in compose["run"]
+    assert "op_latency_handoff.py pack" in _run_commands(producer)
 
 
 def test_full_ci_aggregate_rejects_missing_selection_output() -> None:
@@ -4741,6 +4811,7 @@ def test_missing_license_evidence_blocks_even_documentation_only_full_ci(job):
     for component in COMPONENTS:
         results[component.replace("_", "-")] = "skipped"
     results["application-test-wheel"] = "skipped"
+    results["op-latency-data"] = "skipped"  # no job that reads operation tables is selected
     assert _run_full_ci_aggregate(results, plan).returncode == 0
     results[job] = "skipped"
     failed = _run_full_ci_aggregate(results, plan)
@@ -6764,3 +6835,18 @@ def test_release_output_checks_embedded_identity_and_scripts(tmp_path, monkeypat
     else:
         with pytest.raises(AssertionError):
             release_artifacts.verify_output(output, version, version)
+
+
+def test_standalone_composition_steps_install_the_download_transport():
+    """compose_systems_root.py needs the Hugging Face transport, and these steps never install AISim itself."""
+    documents = [yaml.safe_load(path.read_text()) for path in sorted(WORKFLOW_ROOT.glob("*.yml"))]
+    documents += [yaml.safe_load(path.read_text()) for path in sorted(ACTION_ROOT.glob("*/action.yml"))]
+    steps = [
+        step for document in documents for job in (document.get("jobs") or {}).values() for step in job.get("steps", [])
+    ]
+    steps += [step for document in documents for step in (document.get("runs") or {}).get("steps", [])]
+    composing = [step["run"] for step in steps if "compose_systems_root.py" in step.get("run", "")]
+    assert composing
+    for run in composing:
+        before = run.split("compose_systems_root.py")[0]
+        assert re.search(r"pip install[^\n]*\bhuggingface_hub\b", before), run
