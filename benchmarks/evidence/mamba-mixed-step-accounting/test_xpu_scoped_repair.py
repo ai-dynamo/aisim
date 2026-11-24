@@ -21,7 +21,10 @@ def test_fingerprint_binds_imported_source(tmp_path, monkeypatch):
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
-    with pytest.raises(ValueError, match="imported candidate backend differs from checkout"):
+    with pytest.raises(
+        ValueError,
+        match="imported candidate backend differs from checkout: .*check out .*reinstall its SDK",
+    ):
         verified_candidate_hash(module.Backend, checkout)
     # An installed copy with identical content is valid; its imported bytes
     # are what the accepted fingerprint describes.

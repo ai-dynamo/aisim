@@ -393,13 +393,14 @@ def test_mixed_and_decode_helpers_pass_raw_step_args(monkeypatch) -> None:
             mixed_calls.append((args, kwargs))
             return 8.5
 
-        def _mixed_step_breakdown_per_op_with_metadata(self, *args, **kwargs):
+        def _mixed_step_breakdown_per_op_with_decode_coverage(self, *args, **kwargs):
             breakdown_calls.append((args, kwargs))
             return (
                 [("context_mlp", 5.0, 50.0, "estimated", _CONTEXT_FALLBACK_PAYLOAD)],
                 [("context_attention", 2.0, 20.0, "silicon")],
                 [("generation_attention", 1.5, 15.0, "silicon")],
                 8.5,
+                1.5,
             )
 
         def decode_step_latency(self, *args, **kwargs):
@@ -481,12 +482,13 @@ def test_mixed_step_breakdown_bridge_shapes_missing_attention_passes(monkeypatch
     the Python branch's default ``"silicon"`` source."""
 
     class _FakeHandle:
-        def _mixed_step_breakdown_per_op_with_metadata(self, *args, **kwargs):
+        def _mixed_step_breakdown_per_op_with_decode_coverage(self, *args, **kwargs):
             return (
                 [("qkv_gemm", 3.0, 30.0, "silicon"), ("mlp", 2.0, 0.0, "empirical")],
                 [("context_attention", 4.0, 8.0, "empirical")],
                 [],  # no decode requests scheduled: pass 3 is absent
                 7.0,
+                0.0,
             )
 
         def last_provenance(self):
@@ -536,13 +538,14 @@ def test_mixed_step_breakdown_bridge_shapes_missing_attention_passes(monkeypatch
 )
 def test_mixed_display_alias_preserves_literal_rows(monkeypatch, native, public, decode):
     class Handle:
-        def _mixed_step_breakdown_per_op_with_metadata(self, *args, **kwargs):
+        def _mixed_step_breakdown_per_op_with_decode_coverage(self, *args, **kwargs):
             row = [(native, 2.0, 20.0, "silicon")]
             return (
                 [(public, 3.0, 30.0, "estimated"), (f"{public} (operation)", 5.0, 50.0, "silicon")],
                 [] if decode else row,
                 row if decode else [],
                 10.0,
+                2.0 if decode else 0.0,
             )
 
         def last_provenance(self):
@@ -2735,8 +2738,8 @@ def test_default_config_wideep_mla_spec_survives_the_real_bincode_decode():
 
 def test_mixed_energy_coverage_keeps_missing_contributions_with_repeated_names(monkeypatch):
     class Handle:
-        def _mixed_step_breakdown_per_op_with_metadata(self, *args, **kwargs):
-            return ([("draft", 3.0, 30.0, "silicon")], [("draft", 7.0, 0.0, "missing")], [], 3.0)
+        def _mixed_step_breakdown_per_op_with_decode_coverage(self, *args, **kwargs):
+            return ([("draft", 3.0, 30.0, "silicon")], [("draft", 7.0, 0.0, "missing")], [], 3.0, 0.0)
 
         def last_provenance(self):
             return None

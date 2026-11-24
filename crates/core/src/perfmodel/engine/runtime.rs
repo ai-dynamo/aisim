@@ -173,7 +173,7 @@ pub(crate) type StaticPerOpValuesWithCoverage = (
 
 /// Per-op values for the shared, context-attention, and decode-attention
 /// buckets returned by the metadata-bearing mixed-step evaluation, plus the
-/// step's power-covered latency. Coverage follows
+/// step's power-covered latency and its decode-only subtotal. Coverage follows
 /// [`StaticPerOpValuesWithCoverage`]: each query result counts when its own
 /// energy is positive, before the name fold, because a qualified Mamba op
 /// folds several prefill queries into one row.
@@ -181,6 +181,7 @@ pub(crate) type MixedStepPerOpValuesWithMetadata = (
     Vec<PerOpValueWithMetadata>,
     Vec<PerOpValueWithMetadata>,
     Vec<PerOpValueWithMetadata>,
+    f64,
     f64,
 );
 
@@ -2788,7 +2789,15 @@ impl Engine {
                          overflow the u32 count of qualified Mamba shared ops"
                     ))
                 })?,
-            None => u32::try_from(combined - u64::from(prefix1)).unwrap_or(u32::MAX),
+            None => match u32::try_from(combined - u64::from(prefix1)) {
+                Ok(tokens) => tokens,
+                Err(_) if self.mix_plan.qualified_decode_mamba => {
+                    return Err(AicError::InvalidEngineConfig(
+                        "qualified Mamba shared tokens overflow the u32 count".into(),
+                    ));
+                }
+                Err(_) => u32::MAX,
+            },
         };
         let mut shared_non_attention = 0.0;
         // Prefill-only, like context attention, but never amortized over chunks.
@@ -3570,7 +3579,7 @@ impl Engine {
         seq_imbalance_correction_scale: f64,
         gen_seq_imbalance_correction_scale: f64,
     ) -> Result<(Vec<PerOpValue>, Vec<PerOpValue>, Vec<PerOpValue>), AicError> {
-        let (shared, context_attention, decode_attention, _) = self
+        let (shared, context_attention, decode_attention, _, _) = self
             .mixed_step_breakdown_per_op_impl(
                 ctx_tokens,
                 gen_tokens,
@@ -3671,6 +3680,7 @@ impl Engine {
                 Vec::new(),
                 dec_attn.into_values(),
                 shared_covered + dec_covered,
+                dec_covered,
             ));
         }
         let mut shared = PerOpFold::new("context");
@@ -3684,7 +3694,7 @@ impl Engine {
             .map(Op::name)
             .collect();
         // Covered latency: unamortized, then context rows the scale divides.
-        let (mut covered, mut amortized_covered) = (0.0, 0.0);
+        let (mut covered, mut amortized_covered, mut decode_covered) = (0.0, 0.0, 0.0);
         self.mixed_step_breakdown_with(
             ctx_tokens,
             gen_tokens,
@@ -3702,7 +3712,11 @@ impl Engine {
                     MixedPass::ContextAttention => (&mut ctx_attn, &mut covered),
                     MixedPass::DecodeAttention => (&mut dec_attn, &mut covered),
                 };
-                *sum += covered_latency(&r);
+                let query_covered = covered_latency(&r);
+                *sum += query_covered;
+                if matches!(pass, MixedPass::DecodeAttention) {
+                    decode_covered += query_covered;
+                }
                 out.add(op, r);
             },
         )?;
@@ -3726,6 +3740,7 @@ impl Engine {
             ctx_attn,
             dec_attn.into_values(),
             covered + amortized_covered,
+            decode_covered,
         ))
     }
 
@@ -5334,6 +5349,28 @@ pub(crate) mod tests {
                 assert!(result.is_ok(), "{result:?}");
             }
         }
+    }
+
+    #[test]
+    fn generation_only_qualified_mamba_rejects_shared_token_overflow() {
+        let engine = qualified_mamba_engine(3);
+        let mut spec = EngineSpec::new(
+            fixture_engine_config(Some(3)),
+            vec![Op::Elementwise(ElementwiseOp::new("norm", 2.0))],
+            vec![qualified_mamba(false, 4)],
+        );
+        spec.sol_ops.clear();
+        let engine = Engine::build(spec, engine.db.clone()).unwrap();
+        let requests = u32::MAX / 4;
+        // Packed decode fits at 4_294_967_292, but eight more prefill
+        // positions do not. Three positions reach the exact boundary.
+        assert!(
+            engine
+                .mixed_step_breakdown(3, requests, 8, 2, 0, 1.0, 1.0)
+                .is_ok()
+        );
+        let result = engine.mixed_step_breakdown(8, requests, 8, 2, 0, 1.0, 1.0);
+        assert!(matches!(result, Err(AicError::InvalidEngineConfig(m)) if m.contains("overflow")));
     }
 
     #[test]
@@ -8644,7 +8681,7 @@ pub(crate) mod tests {
         });
         let spec = EngineSpec::new(config, vec![composite], vec![generation; 3]);
         let engine = Engine::from_spec_bytes(&spec.to_bincode().unwrap(), &systems_root()).unwrap();
-        let (shared, prefill, decode, _) = engine
+        let (shared, prefill, decode, _, _) = engine
             .mixed_step_breakdown_per_op_with_metadata(1, 1, 2, 2, 0, 1.0, 1.0)
             .unwrap();
         assert!(shared.is_empty());
@@ -10963,9 +11000,10 @@ pub(crate) mod tests {
         );
         let expected = queries[1].latency_ms;
 
-        let (_, _, decode, covered) = engine
+        let (_, _, decode, covered, decode_covered) = engine
             .mixed_step_breakdown_per_op_with_metadata(2048, 1, 2048, 2, 0, 1.0, 1.0)
             .unwrap();
+        assert!((decode_covered - expected).abs() < 1e-12);
         let row = decode.iter().find(|row| row.0 == "draft_dup").unwrap();
         assert!((row.1 - queries[0].latency_ms - queries[1].latency_ms).abs() < 1e-12);
         assert!(row.2 > 0.0);

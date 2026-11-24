@@ -5,6 +5,9 @@
 
 Usage from the repository root:
     python benchmarks/evidence/mamba-mixed-step-accounting/xpu_scoped_repair.py OUT.json
+For historical --candidate-revision results, first check out that revision and
+reinstall its SDK into the selected interpreter. The imported candidate must
+match that revision; a current checkout cannot reproduce historical sources.
 The baseline class is read from the pinned commit; the candidate is imported.
 The base mixed-step seam records the shapes handed to native pricing and
 returns 1 ms/launch + .01 ms/new prefill token + .1 ms/decode request.
@@ -38,7 +41,10 @@ def verified_candidate_hash(backend_class, expected_source, *, revision=None):
         else Path(expected_source).read_bytes()
     )
     if imported_bytes != expected_bytes:
-        raise ValueError(f"imported candidate backend differs from checkout: {imported_source}")
+        raise ValueError(
+            f"imported candidate backend differs from checkout: {imported_source}; "
+            f"check out {revision or 'the expected checkout'} and reinstall its SDK before rerunning"
+        )
     return hashlib.sha256(imported_bytes).hexdigest()
 
 
@@ -71,8 +77,18 @@ def main():
         "cases": [],
     }
     for prefix, budget in [(3000, 2048), (4088, 4096), (0, 2048)]:
-        case = {"batch": 16, "isl": 4096, "prefix": prefix, "osl": 128, "budget": budget, "decode": 15}
-        for name, cls in [("before", baseline.VLLMXPUBackend), ("after", VLLMXPUBackend)]:
+        case = {
+            "batch": 16,
+            "isl": 4096,
+            "prefix": prefix,
+            "osl": 128,
+            "budget": budget,
+            "decode": 15,
+        }
+        for name, cls in [
+            ("before", baseline.VLLMXPUBackend),
+            ("after", VLLMXPUBackend),
+        ]:
             backend = cls()
             backend._in_agg = True
             backend._visual_context_tokens = lambda *_: 0

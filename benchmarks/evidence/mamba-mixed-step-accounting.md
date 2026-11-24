@@ -704,20 +704,16 @@ Commit `62293977` prices that remainder as one request capped at
 
 Commit `b2b489d999e97749c2932c3f91b1dddb544c81a8` spreads the telemetry prefill
 token sum over the observed request count. Before it, an uneven sum added a
-request. The shapes above divide evenly, so they do not change. A same-host check
-of `686275e7` against `b2b489d9` changed only qualified uneven shapes. On vLLM,
-one step had `num_prefill_requests: 2`, `sum_prefill_tokens: 17` and
-`num_decode_requests: 1`. Its latency went from 5.860174 to 5.853910 ms. Before
-the fix, the two prefills that total 17 tokens priced as two requests of 8
-tokens and one request of 1 token. After it, they price as one request of 9
-tokens and one of 8. The difference, 0.006264 ms, matches one FP16 state pair
-(2 MiB) for each of 23 Mamba layers at 7.7e12 B/s (0.0062642 ms) to the six
-decimals shown. All other shapes were identical.
-These two latencies are transcribed observations. Their full vLLM configuration,
-metrics payload and command were not saved, so they cannot be reproduced. The
-reproducible check is `qualified_mamba_mixed_steps_preserve_prefill_and_decode_shapes`.
-It prices `num_prefill_requests: 2` and `sum_prefill_tokens: 17` against
-17 token rows plus 2 state pairs, never 3.
+request. The shapes above divide evenly, so they do not change.
+The reproducible check is
+`qualified_mamba_mixed_steps_preserve_prefill_and_decode_shapes`: it prices
+`num_prefill_requests: 2` and `sum_prefill_tokens: 17` against 17 token rows
+plus 2 state pairs, never 3. Its synthetic oracle has 18,560 activation
+bytes/token and a 1 MiB state; the prefill scan transfers
+`17 * 18,560 + 2 * 2 * 1,048,576 = 4,509,824` bytes. The historical vLLM
+latency observations previously transcribed here lacked their full inputs
+and are withdrawn as numerical evidence. They are not used to establish
+this correction.
 
 ### Scoped exact-total and shared-token corrections
 
@@ -1302,7 +1298,7 @@ The native replay driver
 uses no constructor shim. Run:
 
 ```bash
-python canonical_mtp_perf.py PYTHON BASE_SDK 6 OUT.json
+python canonical_mtp_perf.py PYTHON BASE_SDK 6 OUT.json REPO BASE_REV CANDIDATE_REV
 ```
 
 It runs `PYTHON -m aisim predict --stack engine` in six balanced build-order
@@ -1327,40 +1323,22 @@ accounting becomes reachable. Every control serving metric is unchanged.
 These bounded host timings show no material avoidable overhead in this
 constructor integration; they are not serving-accuracy measurements.
 
-### Outstanding scoped evidence requests
+### Diagnostic and aggregate model limits
 
-`PRRT_kwDOT0t9uc646BMF`: the historical 5.860174 / 5.853910 ms observations
-still lack their original full vLLM configuration, KV payload and command.
-The original inputs were not retained, as recorded in the request-count
-section. The new canonical tests and reports do not reconstruct those
-observations. Their author must supply the original artifacts, or a
-maintainer must decide whether to withdraw those numerical claims. No input
-has been guessed to reproduce them.
+The packed op-level diagnostic in `telem.py` uses 32800 KV tokens for
+32 rows at sequence length 1025. Its consumer divides by the row count and
+does not add a current token. A past-only convention would require a
+coordinated telemetry-contract migration; whole-model FPM uses that distinct
+convention already.
 
-`PRRT_kwDOT0t9uc648T5i`: changing `telem.py` to 32768 would change its
-op-level context to 1024. In the current real consumer,
-`operation_rank_latency_ms` divides the packed sum by the row count and
-`generation_op_runtime` passes that value directly as `s`; neither adds one.
-Both pure and mixed telemetry with 32800 match a direct native attention
-query at 1025: 0.083305473875 ms. Native queries at 1024 and 1026 give
-0.083297342865 and 0.083315422792 ms respectively. This verifies the existing
-packed convention independently of Mamba's context-insensitive scan. The
-past-only convention belongs to whole-model FPM. A maintainer must withdraw
-the past-only request for this diagnostic or authorize a separate migration
-of the packed contract and all callers. The requested subtraction is left
-unapplied.
-
-`PRRT_kwDOT0t9uc66vgSP`: qualified draft scans in a whole-model FPM aggregate
-still inherit the target's fractional mean-field schedule. At batch 4,
-ISL 4096, prefix 3000 and a 2000-fresh-token query, that schedule weights two
-state pairs by `4384 / 2000`, or 4.384 state pairs. A densely packed stream
-would instead have piece lengths `[1096, 904]`, `[192, 1096, 712]`, `[384]`,
-requiring six state pairs. The current aggregate does not describe that
-stream's three target queries or heterogeneous cached prefixes. A maintainer
-must choose whether to replace the target's mean-field schedule with stream
-queries, or retain it and define a separate stream correction for qualified
-draft operations. This repair does not silently select either modeling
-contract. The native per-query draft scan correction remains intact.
+Qualified draft scans in a whole-model FPM aggregate still inherit the
+target's fractional mean-field schedule. At batch 4, ISL 4096, prefix 3000
+and a 2000-fresh-token query, that schedule weights two state pairs by
+`4384 / 2000`, or 4.384 state pairs. A densely packed stream instead has
+piece lengths `[1096, 904]`, `[192, 1096, 712]`, `[384]` and six state
+pairs. Modeling that stream requires a contract decision between target
+stream queries and a separate draft correction. The existing per-query
+draft correction does not claim stream-level accounting.
 
 ### Fractional visual overlays and packed XPU admission
 
@@ -2039,3 +2017,30 @@ and only tests eligible budgets; nonvisual graphs do not scan qualifications.
 Native Replay's scheduler and iteration execution are unchanged, and the
 canonical compiled model does not re-enter this Python identity check on each
 query. These measurements cover SDK caller cost, not serving prediction accuracy.
+
+
+### Reproducing historical XPU comparisons
+
+To reproduce `xpu_scoped_repair.py --candidate-revision REV`, first check out
+`REV` and reinstall that revision's SDK into the selected interpreter. The
+driver compares the imported backend bytes with that commit. A current
+installation cannot reproduce an older revision merely by passing its SHA.
+
+### Scoped review correction
+
+Completed qualified prefills now use full-prompt coordinates at the native
+boundary. With batch 4, ISL 4096, prefix 3000 and a 2048-token budget, each
+1096-token suffix completes one request. Four iterations therefore pay four
+whole-request attention queries, matching the 4096-budget run, while Mamba
+still transfers four suffixes and four state pairs. Previously those queries
+were divided by `ceil(4096/1096) = 4`, charging only one attention query in
+total. `test_completed_qualified_prefill_retains_whole_request_attention`
+checks latency, iteration counts and TTFT at budgets 1096, 2048 and 4096.
+
+The private mixed-step metadata additionally retains native decode covered
+latency before folding names. Replacing a shortened decode pass uses that
+subtotal, so a powered query sharing a name with an unpowered query never
+turns the latter into covered work. This adds one scalar accumulator per
+decode pass and no retained per-request state. The completed-prefill fix
+changes query coordinates without adding native calls; count reporting and
+list alias preservation add constant-time work only.

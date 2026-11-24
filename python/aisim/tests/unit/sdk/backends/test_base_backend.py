@@ -1807,7 +1807,7 @@ def test_run_agg_rejects_chunked_visual_qualified_mamba(
 
 
 @pytest.mark.parametrize("xpu", [False, True])
-@pytest.mark.parametrize("budget,scheduled,new_tokens,prefills", [(2048, 1096, 1096, 1), (6000, 5192, 2192, 2)])
+@pytest.mark.parametrize("budget,scheduled,new_tokens,prefills", [(2048, 4096, 1096, 1), (6000, 8192, 2192, 2)])
 def test_qualified_mamba_aggregate_translates_capacity_before_native_validation(
     monkeypatch, xpu, budget, scheduled, new_tokens, prefills
 ):
@@ -1984,6 +1984,8 @@ def test_qualified_aggregate_caps_prefill_at_remaining_request_slots(monkeypatch
     mixed = summary.get_step_estimates()["mixed"]
     assert mixed.num_decode_requests == 1
     assert mixed.context_tokens == 4096
+    row = summary.get_result_dict()
+    assert (row["num_ctx_reqs"], row["num_gen_reqs"], row["gen_tokens"]) == (1, 1, 1)
     bw = database.system_spec["gpu"]["mem_bw"]
     scan_ms = ((4096 - prefix) * 18_560 + 2_097_152) / bw * 1000
     assert mixed.per_op_latency_ms["context_scan"] == pytest.approx(scan_ms)
@@ -2122,11 +2124,12 @@ def test_fixed_native_decode_pass_keeps_folded_energy_and_coverage(monkeypatch):
     # advances, but a different decode request keeps its original 3 ms / 30
     # W-ms price. A zero-energy 5 ms op stays outside power coverage.
     handle = SimpleNamespace(
-        _mixed_step_breakdown_per_op_with_metadata=lambda *a, **k: (
+        _mixed_step_breakdown_per_op_with_decode_coverage=lambda *a, **k: (
             [("shared", 2.0, 20.0, "silicon"), ("uncovered", 5.0, 0.0, "sol")],
             [("context_scan", 1.0, 10.0, "silicon")],
             [("same_name", 0.25, 2.5, "sol")],
             3.25,
+            0.25,
         )
     )
     monkeypatch.setattr(rust_engine_step, "_cached_engine_handle", lambda *_: handle)
@@ -2139,7 +2142,7 @@ def test_fixed_native_decode_pass_keeps_folded_energy_and_coverage(monkeypatch):
         isl=3512,
         osl=64,
         prefix=3000,
-        _decode_ops=[("same_name", 3.0, 30.0, "silicon")],
+        _decode_ops=([("same_name", 3.0, 30.0, "silicon")], 3.0),
     )
     assert result["latency_ms"] == 11.0
     assert result["energy_wms"] == 60.0
@@ -2195,3 +2198,66 @@ def test_legacy_aggregate_memory_matches_recorded_suffix_evidence(
     old_summary.set_memory_and_check_oom(previous, capacity, **backend._oom_check_kwargs({}))
     assert not old_summary.check_oom() and not summary.check_oom()
     assert not old_summary.check_kv_cache_oom() and not summary.check_kv_cache_oom()
+
+
+@pytest.mark.parametrize("budget", [1096, 2048, 4096])
+def test_completed_qualified_prefill_retains_whole_request_attention(monkeypatch, budget):
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+
+    model = _qualified_scan_model("vllm")
+    attention = get_model("Qwen/Qwen3-0.6B", ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1), "vllm")
+    model.context_ops += [op for op in attention.context_ops if op._name == "context_attention"]
+    backend = get_backend("vllm")
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL")
+    monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+    runtime = RuntimeConfig(batch_size=4, isl=4096, prefix=3000, osl=64)
+    reference = backend.run_mixed(model, database, runtime, MixedStepInput(4096, 3))
+    summary = backend.run_agg(model, database, runtime, ctx_tokens=budget)
+    scheduling = summary.get_step_estimates()["scheduling"]
+    assert scheduling["num_mix_steps"] == 4
+    assert summary.get_step_estimates()["mixed"].context_tokens == 4096
+    expected = 4 * reference.per_op_latency_ms["context_attention (scaled)"]
+    assert expected > 0
+    group = summary.get_aggregate_energy_breakdown()["mix_step"]
+    # Four completed requests each pay the full attention A, not A/ceil(4096/1096).
+    assert group.per_op_latency_ms["context_attention (scaled)"] == pytest.approx(expected)
+    full = backend.run_agg(model, database, runtime, ctx_tokens=4096)
+    assert summary.get_result_dict()["ttft"] == pytest.approx(full.get_result_dict()["ttft"])
+
+
+def test_fixed_decode_coverage_uses_native_subtotals_before_name_fold(monkeypatch):
+    from aisim_core.sdk import rust_engine_step
+
+    # 10 powered + 5 unpowered ms fold to 15 ms with positive energy.
+    # The original decode shape is 10 powered + 15 unpowered ms. Coverage
+    # remains 10 ms although the folded latency grows by 10 ms.
+    handle = SimpleNamespace(
+        _mixed_step_breakdown_per_op_with_decode_coverage=lambda *a, **k: (
+            [],
+            [],
+            [("same_name", 15.0, 100.0, "mixed")],
+            10.0,
+            10.0,
+        )
+    )
+    monkeypatch.setattr(rust_engine_step, "_cached_engine_handle", lambda *_: handle)
+    monkeypatch.setattr(rust_engine_step, "_note_rust_provenance", lambda *_: None)
+    captured = rust_engine_step.estimate_mixed_step_breakdown_with_rust(
+        None, None, ctx_tokens=512, gen_tokens=1, isl=3512, osl=64, prefix=3000, _capture_decode_ops=True
+    )
+    assert captured["_decode_ops"][1] == 10.0
+    values = rust_engine_step.estimate_mixed_step_breakdown_with_rust(
+        None,
+        None,
+        ctx_tokens=512,
+        gen_tokens=1,
+        isl=3512,
+        osl=64,
+        prefix=3000,
+        _decode_ops=([("same_name", 25.0, 100.0, "mixed")], 10.0),
+    )
+    assert values["latency_ms"] == 25.0
+    assert values["energy_wms"] == 100.0
+    assert values["covered_latency_ms"] == 10.0

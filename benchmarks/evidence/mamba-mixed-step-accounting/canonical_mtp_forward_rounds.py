@@ -18,7 +18,10 @@ from pathlib import Path
 
 def collect_rounds(baseline_sdk, candidate_sdk, driver=None):
     driver = Path(driver or Path(__file__).with_name("canonical_mtp_forward.py")).resolve()
-    sdks = {"baseline": Path(baseline_sdk).resolve(), "candidate": Path(candidate_sdk).resolve()}
+    sdks = {
+        "baseline": Path(baseline_sdk).resolve(),
+        "candidate": Path(candidate_sdk).resolve(),
+    }
     rounds = []
     with tempfile.TemporaryDirectory() as temporary:
         for index in range(6):
@@ -26,7 +29,10 @@ def collect_rounds(baseline_sdk, candidate_sdk, driver=None):
             record = {"order": order, "results": {}}
             for label in order:
                 output = Path(temporary) / f"round-{index + 1}-{label}.json"
-                env = os.environ | {"PYTHONPATH": str(sdks[label]), "AIC_ALLOW_UNLISTED_VERSIONS": "1"}
+                env = os.environ | {
+                    "PYTHONPATH": str(sdks[label]),
+                    "AIC_ALLOW_UNLISTED_VERSIONS": "1",
+                }
                 # A new interpreter owns each model/data cache. Never import
                 # either SDK into this controller's process.
                 subprocess.run([sys.executable, str(driver), str(output)], env=env, check=True)
@@ -37,7 +43,7 @@ def collect_rounds(baseline_sdk, candidate_sdk, driver=None):
                         raise ValueError(f"{label}: {key} imported outside selected SDK: {loaded}")
                 record["results"][label] = result
             rounds.append(record)
-    return {"rounds": rounds}
+    return {"rounds": rounds, "env_overrides": {"AIC_ALLOW_UNLISTED_VERSIONS": "1"}}
 
 
 def main():

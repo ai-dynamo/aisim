@@ -54,5 +54,9 @@
    "run_agg_mix_step_ms": 22.0,
    "run_agg_ttft_ms": 44.4
   }
+ },
+ "evidence_status": {
+  "status": "superseded",
+  "reason": "Historical record has no verified source revision or native extension identity; do not use as revision-bound evidence. Use fpm-d462dab8.json for historical provenance-bearing evidence."
  }
 }

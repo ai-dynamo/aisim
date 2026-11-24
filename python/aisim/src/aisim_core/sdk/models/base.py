@@ -257,6 +257,8 @@ class BaseModel:
 
     @context_ops.setter
     def context_ops(self, value):
+        if value is self.__dict__.get("context_ops"):
+            return
         replacement = _OperationList(value, self._aic_op_list_revision)
         self.__dict__["context_ops"] = replacement
         # Materialization may estimate the old graph before installation.
@@ -268,6 +270,8 @@ class BaseModel:
 
     @generation_ops.setter
     def generation_ops(self, value):
+        if value is self.__dict__.get("generation_ops"):
+            return
         replacement = _OperationList(value, self._aic_op_list_revision)
         self.__dict__["generation_ops"] = replacement
         # Materialization may estimate the old graph before installation.

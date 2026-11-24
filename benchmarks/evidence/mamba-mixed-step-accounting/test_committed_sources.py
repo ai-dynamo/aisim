@@ -16,7 +16,15 @@ from committed_sources import require_committed, verified_model_configs
 
 
 def _repo(tmp_path):
-    git = ["git", "-C", str(tmp_path), "-c", "user.name=t", "-c", "user.email=t@example.com"]
+    git = [
+        "git",
+        "-C",
+        str(tmp_path),
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.com",
+    ]
     subprocess.run(git[:3] + ["init", "-q"], check=True)
     package = tmp_path / "pkg"
     package.mkdir()
@@ -121,3 +129,42 @@ def test_local_model_directory_cannot_certify_bundled_inputs(tmp_path, monkeypat
     assert utils._parse_hf_config_json(loaded)["layers"] == local_config["num_hidden_layers"]
     with pytest.raises(ValueError, match="local model directory"):
         verified_model_configs(repo, "HEAD", model)
+
+
+@pytest.mark.parametrize("edit", ["changed", "extra", "missing"])
+def test_package_inventory_rejects_different_loaded_sources(tmp_path, edit):
+    from types import SimpleNamespace
+
+    from committed_sources import package_inventory, verify_imported_packages
+
+    git = [
+        "git",
+        "-C",
+        str(tmp_path),
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.com",
+    ]
+    subprocess.run(git[:3] + ["init", "-q"], check=True)
+    modules = []
+    for package in ("aisim", "aisim_core"):
+        root = tmp_path / "python/aisim/src" / package
+        root.mkdir(parents=True)
+        (root / "__init__.py").write_text("VERSION = 1\n")
+        modules.append(SimpleNamespace(__name__=package, __file__=str(root / "__init__.py")))
+    subprocess.run(git + ["add", "."], check=True)
+    subprocess.run(git + ["commit", "-q", "-m", "fixture"], check=True)
+    inventory = package_inventory(tmp_path, "HEAD")
+    verified = verify_imported_packages(inventory, modules)
+    assert len(verified["revision"]) == 40
+    assert verified["revision"] == inventory["revision"]
+    root = Path(modules[0].__file__).parent
+    if edit == "changed":
+        (root / "__init__.py").write_text("VERSION = 2\n")
+    elif edit == "extra":
+        (root / "extra.py").write_text("EXTRA = True\n")
+    else:
+        (root / "__init__.py").unlink()
+    with pytest.raises(ValueError, match="imported packages do not match"):
+        verify_imported_packages(inventory, modules)

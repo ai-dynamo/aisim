@@ -751,11 +751,18 @@ def test_batched_ttft_prices_native_uncached_chunks(
     prompt_budget = budget - 2 * width
     full, partial = divmod(prompt_budget, 4096)
     scheduled = prompt_budget if generation_only else full * 4096 + min(partial, 4096 - prefix)
-    assert calls[0] == (4096, prefix, scheduled, 2)
+    # A completed qualified suffix uses whole-prompt coordinates so its
+    # attention is not divided by a fictitious chunk count. Generation-only
+    # qualification retains legacy prefill coordinates.
+    scheduled_coordinate = 4096 if not generation_only and scheduled == 4096 - prefix else scheduled
+    assert calls[0] == (4096, prefix, scheduled_coordinate, 2)
     assert estimates[0].num_decode_query_tokens == 2 * width
     # Uncached prefill plus packed decode stays within the scheduler capacity.
-    assert (scheduled - full * prefix) + 2 * width <= budget
-    assert calls[1:] == [(isl, past, isl, 2) for isl, past in chunks]
+    assert (scheduled_coordinate - (scheduled_coordinate // 4096) * prefix) + 2 * width <= budget
+    # Once the admitted step already represents a completed prompt, XPU can
+    # reuse it for own-prefill TTFT instead of issuing the same native query.
+    expected_chunks = [] if scheduled_coordinate != scheduled else chunks
+    assert calls[1:] == [(isl, past, isl, 2) for isl, past in expected_chunks]
     assert (runtime.isl, runtime.prefix, runtime.batch_size) == (4096, prefix, 4)
 
 
@@ -765,3 +772,21 @@ def test_speculative_xpu_ttft_reserves_packed_decode_width_for_every_native_chun
     # cached suffix 1096 -> 506 + 506 + 84; cold prompt -> eight 506 + 48.
     chunks = [(min(4096, past + 506), past) for past in range(prefix, 4096, 506)]
     test_batched_ttft_prices_native_uncached_chunks(monkeypatch, "burst", prefix, 514, chunks, False, False, nextn=3)
+
+
+def test_aggregate_scheduling_reports_admitted_xpu_decoders(monkeypatch):
+    from aisim_core.sdk.config import ModelConfig, RuntimeConfig
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+
+    backend = VLLMXPUBackend()
+    model = get_model("Qwen/Qwen3-0.6B", ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1), "vllm")
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL")
+    monkeypatch.setattr(backend, "_max_kv_slots", lambda *a, **k: 1)
+    monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+    summary = backend.run_agg(model, database, RuntimeConfig(batch_size=4, isl=4096, osl=64), ctx_tokens=512)
+    estimates = summary.get_step_estimates()
+    scheduling, mixed = estimates["scheduling"], estimates["mixed"]
+    assert mixed.num_decode_requests == 1
+    assert scheduling["mix_decode_requests"] == mixed.num_decode_requests
+    assert scheduling["mix_decode_query_tokens"] == mixed.num_decode_query_tokens == 1

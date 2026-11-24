@@ -21,7 +21,12 @@ import sys
 import tempfile
 from pathlib import Path
 
-root, rounds, out, builds = Path(sys.argv[1]).resolve(), int(sys.argv[2]), sys.argv[3], sys.argv[4:]
+root, rounds, out, builds = (
+    Path(sys.argv[1]).resolve(),
+    int(sys.argv[2]),
+    sys.argv[3],
+    sys.argv[4:],
+)
 if rounds <= 0:
     sys.exit(f"ROUNDS must be positive, got {rounds}")
 sys.path.insert(0, str(root / builds[0] / "src/python/aisim"))
@@ -38,6 +43,8 @@ def selected(model_id):
 
 
 cases = [c for c in expand_cases() if selected(c["model_id"]) and c["database_mode"] in modes]
+if not cases:
+    sys.exit(f"No cases match HOST_PERF_MODELS={prefixes!r} HOST_PERF_MODES={modes!r}")
 res = {b: {} for b in builds}
 orders = []
 worker_runs = []
@@ -45,11 +52,22 @@ for r in range(rounds):
     order = builds[r % len(builds) :] + builds[: r % len(builds)]
     orders.append(order)
     for b in order:
-        request = {"protocol_version": 2, "revision": b, "cases": cases, "warmup": 10, "iterations": 100}
+        request = {
+            "protocol_version": 2,
+            "revision": b,
+            "cases": cases,
+            "warmup": 10,
+            "iterations": 100,
+        }
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(request, f)
         proc = subprocess.run(
-            [str(root / b / "venv/bin/python"), "tools/forward_perf_gate/worker.py", "--request", f.name],
+            [
+                str(root / b / "venv/bin/python"),
+                "tools/forward_perf_gate/worker.py",
+                "--request",
+                f.name,
+            ],
             cwd=root / b / "src/python/aisim",
             capture_output=True,
             text=True,

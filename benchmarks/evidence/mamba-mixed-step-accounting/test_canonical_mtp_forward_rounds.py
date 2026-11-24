@@ -26,8 +26,12 @@ def test_rounds_use_fresh_interpreters_and_selected_sdk(tmp_path, monkeypatch):
     # A stale ambient SDK selection must not leak into either child.
     monkeypatch.setenv("PYTHONPATH", "/unused/installed/sdk")
     result = collect_rounds(*sdks, driver=driver)
+    assert result["env_overrides"] == {"AIC_ALLOW_UNLISTED_VERSIONS": "1"}
     rounds = result["rounds"]
-    assert [r["order"] for r in rounds] == [["baseline", "candidate"], ["candidate", "baseline"]] * 3
+    assert [r["order"] for r in rounds] == [
+        ["baseline", "candidate"],
+        ["candidate", "baseline"],
+    ] * 3
     records = [r["results"][label] for r in rounds for label in r["order"]]
     assert len({r["pid"] for r in records}) == 12
     assert all(r["counter"] == 1 for r in records)

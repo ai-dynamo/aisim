@@ -54,5 +54,9 @@
    "run_agg_mix_step_ms": 22.0,
    "run_agg_ttft_ms": 44.4
   }
+ },
+ "evidence_status": {
+  "status": "pre-correction baseline; unverified build",
+  "reason": "Historical run_agg values use the old caller (cached mixed step 30 ms, TTFT 52.4 ms). No source or native build provenance was retained; this is not corrected-caller or current-head evidence."
  }
 }

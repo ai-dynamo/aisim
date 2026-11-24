@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import pytest
+
 
 def test_retains_complete_responses_for_every_rotated_round(tmp_path, monkeypatch):
     cases = [{"case_id": "fixture", "model_id": "qwen3-32b", "database_mode": "SILICON"}]
@@ -69,3 +71,25 @@ def test_retains_complete_responses_for_every_rotated_round(tmp_path, monkeypatc
     # Every worker succeeded, but their predictions differ. That does not
     # establish the correctness or equivalence of either revision.
     assert result["output_equivalence"]["status"] == "not_checked"
+
+
+@pytest.mark.parametrize("variable,value", [("HOST_PERF_MODELS", "missing"), ("HOST_PERF_MODES", "missing")])
+def test_empty_selection_exits_with_selector_reason_before_workers(tmp_path, monkeypatch, variable, value):
+    module = ModuleType("tools.forward_perf_gate.cases")
+    module.expand_cases = lambda: [{"model_id": "qwen3-32b", "database_mode": "SILICON"}]
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.delenv("HOST_PERF_MODELS", raising=False)
+    monkeypatch.delenv("HOST_PERF_MODES", raising=False)
+    monkeypatch.setenv(variable, value)
+    driver = Path(__file__).with_name("host_perf.py")
+    output = tmp_path / "out.json"
+    monkeypatch.setattr(sys, "argv", [str(driver), str(tmp_path), "2", str(output), "base", "head"])
+    monkeypatch.setattr(sys, "path", sys.path.copy())
+
+    def worker(*args, **kwargs):
+        pytest.fail("no worker may start for an empty selection")
+
+    monkeypatch.setattr("subprocess.run", worker)
+    with pytest.raises(SystemExit, match="No cases match HOST_PERF_MODELS=.*HOST_PERF_MODES="):
+        runpy.run_path(str(driver), run_name="__main__")
+    assert not output.exists()

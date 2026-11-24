@@ -873,3 +873,30 @@ def test_qualified_scan_rejects_reserved_attention_names(monkeypatch, reserved):
                 "database_mode": common.DatabaseMode.HYBRID.name,
             }
         )
+
+
+def test_generation_only_qualification_rejects_shared_u32_overflow():
+    from aisim_core.sdk.config import ModelConfig
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+    from aisim_core.sdk.rust_engine_step import estimate_mixed_step_latency_with_rust
+
+    model = get_model(
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1, nextn=3),
+        "vllm",
+    )
+    model.context_ops = [ops.ElementWise("norm", 1, 1, 0)]
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL")
+    requests = (2**32 - 1) // 4
+
+    def estimate(tokens):
+        return estimate_mixed_step_latency_with_rust(
+            model, database, ctx_tokens=tokens, gen_tokens=requests, isl=8, osl=2, prefix=0
+        )
+
+    # 4_294_967_292 packed decode positions fit; three more reach u32::MAX.
+    # Eight prefill positions must reject, never silently saturate the norm.
+    assert estimate(3) > 0
+    with pytest.raises(ValueError, match="shared tokens overflow"):
+        estimate(8)

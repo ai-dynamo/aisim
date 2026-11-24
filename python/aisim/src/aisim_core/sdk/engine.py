@@ -1521,6 +1521,34 @@ class EngineHandle:
             float(gen_seq_imbalance_correction_scale),
         )
 
+    def _mixed_step_breakdown_per_op_with_decode_coverage(
+        self,
+        ctx_tokens: int,
+        gen_tokens: int,
+        isl: int,
+        osl: int,
+        prefix: int = 0,
+        seq_imbalance_correction_scale: float = 1.0,
+        gen_seq_imbalance_correction_scale: float = 1.0,
+    ) -> tuple[
+        list[_PerOpValueWithMetadata],
+        list[_PerOpValueWithMetadata],
+        list[_PerOpValueWithMetadata],
+        float,
+        float,
+    ]:
+        """Internal mixed-step per-op stream with inline-first fallback metadata,
+        plus total and decode-only covered latency, decided before name folding."""
+        return self._engine._mixed_step_breakdown_per_op_with_decode_coverage(
+            int(ctx_tokens),
+            int(gen_tokens),
+            int(isl),
+            int(osl),
+            int(prefix),
+            float(seq_imbalance_correction_scale),
+            float(gen_seq_imbalance_correction_scale),
+        )
+
     def decode_step_per_op(
         self,
         gen_tokens: int,

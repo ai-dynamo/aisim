@@ -1466,8 +1466,8 @@ def estimate_mixed_step_breakdown_with_rust(
     """
     handle = _cached_engine_handle(model, database)
     try:
-        shared_ops, ctx_attn_ops, decode_attn_ops, covered_latency_ms = (
-            handle._mixed_step_breakdown_per_op_with_metadata(
+        shared_ops, ctx_attn_ops, decode_attn_ops, covered_latency_ms, decode_covered_ms = (
+            handle._mixed_step_breakdown_per_op_with_decode_coverage(
                 int(ctx_tokens),
                 int(gen_tokens),
                 int(isl),
@@ -1485,10 +1485,10 @@ def estimate_mixed_step_breakdown_with_rust(
         # Aggregate chunks advance one request's prefix. Other requests keep
         # their original decode KV lengths. Reuse their native pass entries
         # before name folding, including energy, sources, and fallback metadata.
-        covered_latency_ms += sum(entry[1] for entry in _decode_ops if entry[2] > 0) - sum(
-            entry[1] for entry in decode_attn_ops if entry[2] > 0
-        )
-        decode_attn_ops = _decode_ops
+        original_decode_ops, original_decode_covered_ms = _decode_ops
+        covered_latency_ms += original_decode_covered_ms - decode_covered_ms
+        decode_attn_ops = original_decode_ops
+        decode_covered_ms = original_decode_covered_ms
 
     shared_latency, shared_energy, _, _ = _fold_per_op(shared_ops)
     ctx_latency, ctx_energy, _, _ = _fold_per_op(ctx_attn_ops)
@@ -1546,7 +1546,7 @@ def estimate_mixed_step_breakdown_with_rust(
         "moe_comm_fallbacks": fallbacks,
     }
     if _capture_decode_ops:
-        result["_decode_ops"] = decode_attn_ops
+        result["_decode_ops"] = (decode_attn_ops, decode_covered_ms)
     return result
 
 

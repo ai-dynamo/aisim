@@ -263,3 +263,26 @@ def test_native_family_setter_expires_a_memoized_graph_identity(graph_estimator)
     # scale_num_tokens divides the shared GEMM's token count.
     assert estimate(model) < before
     assert estimate(model) == estimate(copy.deepcopy(model))
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+@pytest.mark.parametrize("operation", ["add", "multiply"])
+def test_property_augmented_assignment_keeps_installed_list(graph_estimator, phase, operation):
+    model, estimate = graph_estimator
+    ops = getattr(model, f"{phase}_ops")
+    before = estimate(model)
+    if phase == "context":
+        if operation == "add":
+            model.context_ops += [_extra_scan(model, phase, "first_extra")]
+        else:
+            model.context_ops *= 2
+    elif operation == "add":
+        model.generation_ops += [_extra_scan(model, phase, "first_extra")]
+    else:
+        model.generation_ops *= 2
+    assert getattr(model, f"{phase}_ops") is ops
+    augmented = estimate(model)
+    assert augmented > before
+    ops.append(_extra_scan(model, phase, "later_extra"))
+    assert estimate(model) > augmented
+    assert estimate(model) == estimate(copy.deepcopy(model))

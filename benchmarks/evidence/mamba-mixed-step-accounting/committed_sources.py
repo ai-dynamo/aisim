@@ -22,7 +22,18 @@ def require_committed(repo, revision, paths):
         {Path(os.path.relpath(os.path.abspath(os.path.join(repo, path)), repo)).as_posix() for path in paths}
     )
     tree = subprocess.run(
-        ["git", "-C", repo, "ls-tree", "-r", "--name-only", "-z", revision, "--", *relative],
+        [
+            "git",
+            "-C",
+            repo,
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "-z",
+            revision,
+            "--",
+            *relative,
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -49,7 +60,17 @@ def verified_model_configs(repo, revision, model_path):
     prefix = "python/aisim/src/aisim_core/model_configs/"
     names = [f"{model_path.replace('/', '--')}_{suffix}.json" for suffix in ("config", "hf_quant_config")]
     tracked = subprocess.check_output(
-        ["git", "-C", str(repo), "ls-tree", "-r", "--name-only", revision, "--", *[prefix + n for n in names]],
+        [
+            "git",
+            "-C",
+            str(repo),
+            "ls-tree",
+            "-r",
+            "--name-only",
+            revision,
+            "--",
+            *[prefix + n for n in names],
+        ],
         text=True,
     ).splitlines()
     files = {}
@@ -69,4 +90,63 @@ def verified_model_configs(repo, revision, model_path):
             "resolved_path": str(resolved),
             "sha256": hashlib.sha256(committed).hexdigest(),
         }
-    return {"override": os.environ.get("AICONFIGURATOR_MODEL_CONFIGS_PATH"), "files": files}
+    return {
+        "override": os.environ.get("AICONFIGURATOR_MODEL_CONFIGS_PATH"),
+        "files": files,
+    }
+
+
+def package_inventory(repo, revision):
+    """Hash committed Python package bytes, including the complete file set."""
+    import io
+    import tarfile
+
+    revision = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "--verify", f"{revision}^{{commit}}"],
+        text=True,
+    ).strip()
+    prefix = "python/aisim/src/"
+    archive = subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "archive",
+            revision,
+            prefix + "aisim",
+            prefix + "aisim_core",
+        ]
+    )
+    files = {}
+    with tarfile.open(fileobj=io.BytesIO(archive)) as tree:
+        for member in tree:
+            if member.isfile() and member.name.endswith(".py"):
+                files[member.name.removeprefix(prefix)] = hashlib.sha256(tree.extractfile(member).read()).hexdigest()
+    if not files:
+        raise ValueError(f"no package sources at {revision}")
+    return {"revision": revision, "files": files}
+
+
+def verify_imported_packages(inventory, modules):
+    """Reject edited, extra or missing Python sources in either loaded package."""
+    loaded = {}
+    roots = {}
+    for module in modules:
+        root = Path(module.__file__).resolve().parent
+        roots[module.__name__] = str(root)
+        for path in root.rglob("*.py"):
+            name = module.__name__ + "/" + path.relative_to(root).as_posix()
+            loaded[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    if loaded != inventory["files"]:
+        raise ValueError(f"imported packages do not match {inventory['revision']}")
+    return {
+        "revision": inventory["revision"],
+        "package_paths": roots,
+        "python_sources_sha256": hashlib.sha256(json_bytes(loaded)).hexdigest(),
+    }
+
+
+def json_bytes(value):
+    import json
+
+    return json.dumps(value, sort_keys=True).encode()

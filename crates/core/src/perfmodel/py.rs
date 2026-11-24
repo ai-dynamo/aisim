@@ -799,6 +799,48 @@ impl AicEngine {
                 gen_seq_imbalance_correction_scale,
             )
         })
+        .map(|(shared, context, decode, covered, _)| (shared, context, decode, covered))
+        .map_err(aic_to_py)
+    }
+
+    /// Internal metadata-bearing counterpart of `mixed_step_breakdown_per_op`;
+    /// each fifth field is `None` or `(first_record, additional_records)` in
+    /// deterministic encounter order. The fourth value is the step's
+    /// power-covered latency; the fifth is its decode-only subtotal.
+    /// Both are decided per query before the name fold.
+    #[pyo3(signature = (ctx_tokens, gen_tokens, isl, osl, prefix=0,
+                        seq_imbalance_correction_scale=1.0,
+                        gen_seq_imbalance_correction_scale=1.0))]
+    #[allow(clippy::too_many_arguments)]
+    fn _mixed_step_breakdown_per_op_with_decode_coverage(
+        &self,
+        py: Python<'_>,
+        ctx_tokens: u32,
+        gen_tokens: u32,
+        isl: u32,
+        osl: u32,
+        prefix: u32,
+        seq_imbalance_correction_scale: f64,
+        gen_seq_imbalance_correction_scale: f64,
+    ) -> PyResult<(
+        Vec<PerOpValueWithMetadata>,
+        Vec<PerOpValueWithMetadata>,
+        Vec<PerOpValueWithMetadata>,
+        f64,
+        f64,
+    )> {
+        self.inner.reset_provenance();
+        py.allow_threads(|| {
+            self.inner.mixed_step_breakdown_per_op_with_metadata(
+                ctx_tokens,
+                gen_tokens,
+                isl,
+                osl,
+                prefix,
+                seq_imbalance_correction_scale,
+                gen_seq_imbalance_correction_scale,
+            )
+        })
         .map_err(aic_to_py)
     }
 

@@ -15,6 +15,7 @@ import importlib.util
 import json
 import platform
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -53,19 +54,39 @@ def measure(backend, model, database, runtime):
     }
 
 
+def verify_source(path, revision):
+    source = "python/aisim/src/aisim_core/sdk/backends/base_backend.py"
+    revision = subprocess.check_output(["git", "rev-parse", "--verify", f"{revision}^{{commit}}"], text=True).strip()
+    expected = subprocess.check_output(["git", "show", f"{revision}:{source}"])
+    if Path(path).read_bytes() != expected:
+        raise ValueError(f"backend source {path} does not match {revision}")
+    return revision
+
+
 def main():
     baseline_path, baseline_sha, candidate_sha, output = sys.argv[1:]
+    baseline_sha = verify_source(baseline_path, baseline_sha)
+    candidate_sha = verify_source(sys.modules[BaseBackend.__module__].__file__, candidate_sha)
     spec = importlib.util.spec_from_file_location("scoped_aggregate_baseline", baseline_path)
     baseline = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(baseline)
     results = {}
     for label, model_path, nextn, prefix in (
         ("mtp_prefix3072", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", 3, 3072),
-        ("mtp_prefix3000_tail72", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", 3, 3000),
+        (
+            "mtp_prefix3000_tail72",
+            "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+            3,
+            3000,
+        ),
         ("mtp_cold_control", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", 3, 0),
         ("non_mamba_control", "Qwen/Qwen3-0.6B", 0, 3072),
     ):
-        model = get_model(model_path, config.ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1, nextn=nextn), "vllm")
+        model = get_model(
+            model_path,
+            config.ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1, nextn=nextn),
+            "vllm",
+        )
         database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL")
         assert database is not None
         candidate = get_backend("vllm")
@@ -74,7 +95,11 @@ def main():
             (type(candidate),),
             {
                 name: getattr(baseline.BaseBackend, name)
-                for name in ("run_agg", "_run_agg_mixed_step", "_schedule_qualified_mamba_prefill")
+                for name in (
+                    "run_agg",
+                    "_run_agg_mixed_step",
+                    "_schedule_qualified_mamba_prefill",
+                )
             },
         )()
         backends = {"baseline": original, "candidate": candidate}
@@ -102,7 +127,13 @@ def main():
         predictions = {side: samples[side][-1]["prediction"] for side in backends}
         if label.endswith("control"):
             assert predictions["baseline"] == predictions["candidate"]
-        results[label] = {"model": model_path, "nextn": nextn, "prefix": prefix, "rounds": rounds, **predictions}
+        results[label] = {
+            "model": model_path,
+            "nextn": nextn,
+            "prefix": prefix,
+            "rounds": rounds,
+            **predictions,
+        }
     Path(output).write_text(
         json.dumps(
             {

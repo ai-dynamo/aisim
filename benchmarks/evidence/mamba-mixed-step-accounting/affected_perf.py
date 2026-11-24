@@ -13,12 +13,27 @@ perf gate's measure_cold_and_warm. OUT.json holds each round's order and maps
 build -> case -> per-round cold, warm median, raw warm samples and returned value.
 """
 
+import inspect
 import json
 import os
 import statistics
 import subprocess
 import sys
 from pathlib import Path
+
+
+def qualifying_constructor(constructor, qualify):
+    """Inject qualification only when this build's native signature accepts it."""
+    parameters = inspect.signature(constructor).parameters
+    supported = {"state_dtype", "token_width"} <= parameters.keys()
+
+    def wrapped(name, scale, kernel, phase, *args, **kwargs):
+        if qualify["on"] and supported:
+            kwargs.setdefault("state_dtype", "bfloat16")
+            kwargs.setdefault("token_width", 1)
+        return constructor(name, scale, kernel, phase, *args, **kwargs)
+
+    return wrapped
 
 
 def worker(src):
@@ -29,12 +44,7 @@ def worker(src):
     import aisim_core.sdk.models.nemotron_h as nh
 
     real, real_ops, qualify = nh.ops.Mamba2Kernel, nh.ops, {"on": False}
-
-    def wrapped(name, scale, kernel, phase, *args, **kw):
-        if qualify["on"]:
-            kw.setdefault("state_dtype", "bfloat16")
-            kw.setdefault("token_width", 1)
-        return real(name, scale, kernel, phase, *args, **kw)
+    wrapped = qualifying_constructor(real, qualify)
 
     class _Shim:
         def __getattr__(self, n):
@@ -45,7 +55,10 @@ def worker(src):
     from aisim_core.sdk import config as sdk_config
     from aisim_core.sdk.models import get_model
     from aisim_core.sdk.perf_database import get_database
-    from aisim_core.sdk.rust_engine_step import RustForwardPassPerfModel, _cached_engine_handle
+    from aisim_core.sdk.rust_engine_step import (
+        RustForwardPassPerfModel,
+        _cached_engine_handle,
+    )
 
     def fpm_model(model, qualified):
         qualify["on"] = qualified
@@ -72,7 +85,14 @@ def worker(src):
         return _cached_engine_handle(get_model(model, mc, "trtllm"), db)
 
     def packed(requests, tokens):
-        return [{"scheduled_requests": {"num_prefill_requests": requests, "sum_prefill_tokens": tokens}}]
+        return [
+            {
+                "scheduled_requests": {
+                    "num_prefill_requests": requests,
+                    "sum_prefill_tokens": tokens,
+                }
+            }
+        ]
 
     nano, qwen = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "Qwen/Qwen3-32B"
     cases = {}
@@ -117,7 +137,10 @@ def worker(src):
         )
     ]
     root = tempfile.mkdtemp()
-    shutil.copy(os.path.join(t._CORE_SYSTEMS, f"{t.SYSTEM}.yaml"), os.path.join(root, f"{t.SYSTEM}.yaml"))
+    shutil.copy(
+        os.path.join(t._CORE_SYSTEMS, f"{t.SYSTEM}.yaml"),
+        os.path.join(root, f"{t.SYSTEM}.yaml"),
+    )
     t._write_pair(os.path.join(root, "data", t.SYSTEM, t.BACKEND, t.VERSION), rows)
     fh = _cached_engine_handle(fm, PerfDatabase(t.SYSTEM, t.BACKEND, t.VERSION, systems_root=root))
     fh._mixed_step_breakdown_per_op_with_metadata(256, 1, 512, 2, 256)  # prime
@@ -140,7 +163,12 @@ if __name__ == "__main__":
     if sys.argv[1] == "--worker":
         worker(sys.argv[2])
         sys.exit()
-    root, rounds, out, builds = Path(sys.argv[1]).resolve(), int(sys.argv[2]), sys.argv[3], sys.argv[4:]
+    root, rounds, out, builds = (
+        Path(sys.argv[1]).resolve(),
+        int(sys.argv[2]),
+        sys.argv[3],
+        sys.argv[4:],
+    )
     if rounds <= 0:
         sys.exit(f"ROUNDS must be positive, got {rounds}")
     res, orders = {b: {} for b in builds}, []
@@ -149,7 +177,12 @@ if __name__ == "__main__":
         orders.append(order)
         for b in order:
             proc = subprocess.run(
-                [str(root / b / "venv/bin/python"), os.path.abspath(__file__), "--worker", str(root / b / "src")],
+                [
+                    str(root / b / "venv/bin/python"),
+                    os.path.abspath(__file__),
+                    "--worker",
+                    str(root / b / "src"),
+                ],
                 cwd=root / b,
                 capture_output=True,
                 text=True,
@@ -165,4 +198,7 @@ if __name__ == "__main__":
         json.dump({"orders": orders, "results": res}, f, indent=1)
     for name in res[builds[0]]:
         cells = [res[b][name] for b in builds]
-        print(name, *(f"{statistics.median(c['warm']):.2f}/{statistics.median(c['cold']):.1f}" for c in cells))
+        print(
+            name,
+            *(f"{statistics.median(c['warm']):.2f}/{statistics.median(c['cold']):.1f}" for c in cells),
+        )

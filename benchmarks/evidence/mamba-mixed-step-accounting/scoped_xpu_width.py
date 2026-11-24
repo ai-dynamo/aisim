@@ -49,17 +49,32 @@ source = "python/aisim/src/aisim_core/sdk/backends/vllm_backend_xpu.py"
 old = ModuleType("baseline_xpu")
 exec(
     compile(
-        subprocess.check_output(["git", "show", f"{baseline}:{source}"], text=True), f"{baseline}:{source}", "exec"
+        subprocess.check_output(["git", "show", f"{baseline}:{source}"], text=True),
+        f"{baseline}:{source}",
+        "exec",
     ),
     old.__dict__,
 )
 database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL", allow_unlisted_version=True)
 model = get_model(
-    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1, nextn=3), "vllm"
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+    ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1, nextn=3),
+    "vllm",
 )
 model.context_ops = [
     Mamba2Kernel(
-        "context_scan", 1, "mamba_chunk_scan_combined", "context", 4096, 64, 64, 128, 4, 8, 128, state_dtype="float16"
+        "context_scan",
+        1,
+        "mamba_chunk_scan_combined",
+        "context",
+        4096,
+        64,
+        64,
+        128,
+        4,
+        8,
+        128,
+        state_dtype="float16",
     )
 ]
 model.generation_ops = [
@@ -103,6 +118,24 @@ result = {
         "python benchmarks/evidence/mamba-mixed-step-accounting/scoped_xpu_width.py "
         f"--candidate-revision {candidate} OUT.json"
     ),
+    "fixture": {
+        "stub_returns": {
+            "_max_kv_slots": 100,
+            "_mix_step_gen_tokens": 2,
+            "_effective_decode_bs": 4,
+            "_get_genonly_step_latency": [1.0, 0.0, {}, {}, []],
+            "_decode_tpot_ms": 1.5,
+        },
+        "compute_ttft_inputs": {
+            "prefill_step_ms": 0,
+            "genonly_step_latency_ms": 1,
+            "encoder_latency_ms": 0,
+            "steps_to_finish_ctx": 4,
+            "decode_iterations": 63,
+        },
+        "native_fields": ["prefill_tokens", "decode_query_tokens", "mixed_latency_ms"],
+        "derived_with_stubs": ["ttft_ms"],
+    },
     "cases": [],
 }
 for prefix in (0, 3000):

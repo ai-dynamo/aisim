@@ -2048,7 +2048,12 @@ class BaseBackend:
             if isl > runtime_config.prefix:
                 prefill_slots = max(1, runtime_config.batch_size - step.num_decode_requests)
                 full, partial = divmod(min(step.context_tokens, prefill_slots * isl), isl)
-                step = dataclasses.replace(step, context_tokens=full * isl + min(partial, isl - runtime_config.prefix))
+                suffix = isl - runtime_config.prefix
+                # A completed suffix uses whole-prompt coordinates, so native
+                # attention is charged once rather than amortized over chunks.
+                if partial >= suffix:
+                    full, partial = full + 1, 0
+                step = dataclasses.replace(step, context_tokens=full * isl + partial)
         return step
 
     def _average_agg_text_chunks(self, model, database, runtime_config, chunk_tokens, num_decode_requests=0):
@@ -2323,15 +2328,20 @@ class BaseBackend:
                 num_mix_steps_for_tpot_calc = self._tpot_mix_steps(num_mix_steps)
         # FPM prices fresh-token requests, rather than ceil(input budget/isl).
         # Save the executed counts before an averaged query loses its coordinate.
-        fpm_request_counts = None
+        scheduled_request_counts = None
         if _is_fpm_model(model) and isl > prefix:
-            fpm_request_counts = (
+            scheduled_request_counts = (
                 (1, 0)
                 if b == 1
                 else (
                     math.ceil(mix_step_estimate.context_tokens / (isl - prefix)),
                     mix_step_estimate.num_decode_requests,
                 )
+            )
+        if qualified_prefill:
+            scheduled_request_counts = (
+                math.ceil(mix_step_estimate.context_tokens / isl),
+                mix_step_estimate.num_decode_requests,
             )
         # Native FPM may also average several uncached chunks inside one
         # run_mixed call. Neither kind of mean is a single query coordinate.
@@ -2447,7 +2457,7 @@ class BaseBackend:
         if b == 1:
             num_ctx_requests = 1
             num_gen_requests = 1
-        reported_ctx_requests, reported_gen_requests = fpm_request_counts or (num_ctx_requests, num_gen_requests)
+        reported_ctx_requests, reported_gen_requests = scheduled_request_counts or (num_ctx_requests, num_gen_requests)
 
         # correct output_throughput and concurrency for attention dp (global batch)
         scale_factor = model.config.pp_size * model.config.attention_dp_size
@@ -2639,7 +2649,7 @@ class BaseBackend:
             "decode_iterations": decode_iterations,
             "mix_context_token_budget": float(ctx_tokens),
             **({} if averages_mixed_shapes else {"mix_context_tokens": float(mix_step_estimate.context_tokens)}),
-            "mix_decode_requests": float(num_mix_gen_tokens),
+            "mix_decode_requests": float(mix_step_estimate.num_decode_requests),
             "mix_decode_query_tokens": float(mix_step_estimate.num_decode_query_tokens),
         }
         if speculative_scheduling:

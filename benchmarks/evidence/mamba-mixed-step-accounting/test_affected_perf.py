@@ -41,3 +41,22 @@ def test_retains_warm_samples_for_every_rotated_round(tmp_path, monkeypatch):
         assert saved["warm"] == [statistics.median(samples) for samples in saved["warm_samples_us"]]
         assert saved["cold"] == [row["cold_us"] for row in expected]
         assert saved["value"] == [row["value"] for row in expected]
+
+
+def test_shim_calls_old_and_new_native_signatures():
+    from affected_perf import qualifying_constructor
+
+    def old(name, scale, kernel, phase):
+        return name, scale, kernel, phase
+
+    def new(name, scale, kernel, phase, *, state_dtype="unrecorded", token_width=1):
+        return state_dtype, token_width
+
+    qualify = {"on": True}
+    arguments = ("scan", 1, "selective_state_update", "generation")
+    assert qualifying_constructor(old, qualify)(*arguments) == arguments
+    wrapped = qualifying_constructor(new, qualify)
+    assert wrapped(*arguments) == ("bfloat16", 1)
+    assert wrapped(*arguments, state_dtype="float16", token_width=4) == ("float16", 4)
+    qualify["on"] = False
+    assert wrapped(*arguments) == ("unrecorded", 1)
