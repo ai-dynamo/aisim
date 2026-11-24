@@ -23,6 +23,31 @@ def _load():
     return mod
 
 
+def _publish_native_table(directory, phase):
+    """Synthetic committed publication; no GPU measurement evidence."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from collector.provenance import render_collection_meta
+
+    table = f"dsa_{phase}_module_perf"
+    pq.write_table(pa.table({"latency": [1.0]}), directory / f"{table}.parquet")
+    (directory / "collection_meta.yaml").write_bytes(
+        render_collection_meta(
+            {"framework": "sglang", "version": "0.0.0.dev1+g41208373c.d20261104"},
+            {
+                table: {
+                    "collector_ref": "0" * 40,
+                    "collector_hash": "sha256:" + "1" * 64,
+                    "case_plan_hash": "sha256:" + "2" * 64,
+                    "collected_at": "2026-11-24",
+                    "rows": 1,
+                    "status": "complete",
+                }
+            },
+        )
+    )
+
+
 def _plan(tmp_path, shards):
     p = tmp_path / "plan.yaml"
     p.write_text(yaml.safe_dump({"backend": "vllm", "sm": 120, "shards": shards}))
@@ -420,6 +445,7 @@ def test_campaign_recovers_tp_checkpoint_and_validates_all_selected_cases(
     tracker = ResumeCheckpoint(
         "sglang", "sglang." + shard.op, "run_kimi_k31_dsa_fullnode", str(checkpoints), native.RUNTIME_VERSION, 103
     )
+    fullnode.bind_native_checkpoint(tracker._path, out, create=True)
     cases = [ModuleCase(length, 1, 48, "fp8", "bfloat16", "bfloat16", native.MODEL, 0) for length in (1024, 4096)]
     for case in cases:
         task_id = create_test_case_id(case, "run_kimi_k31_dsa_fullnode", "sglang." + shard.op)
@@ -515,7 +541,7 @@ def test_campaign_recovers_pending_native_case_despite_older_parquet(
     tracker.mark_passed(task_id)
     tracker.flush(force=True)
     checkpoint_bytes = tracker._path.read_bytes()
-    (out / f"dsa_{phase}_module_perf.parquet").touch()
+    _publish_native_table(out, phase)
     (out / "DONE").touch()
     if staged_event is not None:
         (out / f"dsa_{phase}_module_perf.txt").write_text("recovered row\n")
@@ -543,8 +569,8 @@ def test_campaign_recovers_pending_native_case_despite_older_parquet(
     assert tracker._path.read_bytes() == checkpoint_bytes
 
 
-@pytest.mark.parametrize("published", [True, False])
-def test_native_shard_done_requires_its_phase_table(tmp_path, monkeypatch, published):
+@pytest.mark.parametrize("publication", ["valid", "missing-phase", "missing-meta", "other-phase-meta", "wrong-rows"])
+def test_native_shard_done_requires_its_phase_table(tmp_path, monkeypatch, publication):
     from types import SimpleNamespace
 
     c = _load()
@@ -554,13 +580,29 @@ def test_native_shard_done_requires_its_phase_table(tmp_path, monkeypatch, publi
     out.mkdir(parents=True)
     (out / ".ckpt").mkdir()
     (out / "DONE").touch()
-    (out / ("dsa_generation_module_perf.parquet" if published else "other.parquet")).touch()
-    assert c.shard_state(tmp_path, shard, plan.backend) == ("finalized" if published else "done-no-parquet")
+    _publish_native_table(out, "generation")
+    if publication == "missing-phase":
+        (out / "dsa_generation_module_perf.parquet").rename(out / "other.parquet")
+    elif publication == "missing-meta":
+        (out / "collection_meta.yaml").unlink()
+    elif publication in ("other-phase-meta", "wrong-rows"):
+        sidecar = out / "collection_meta.yaml"
+        doc = yaml.safe_load(sidecar.read_text())
+        if publication == "other-phase-meta":
+            doc["tables"]["dsa_context_module_perf"] = doc["tables"].pop("dsa_generation_module_perf")
+        else:
+            doc["tables"]["dsa_generation_module_perf"]["rows"] = 2
+        sidecar.write_text(yaml.safe_dump(doc))
+    expected = {
+        "valid": "finalized",
+        "missing-phase": "done-no-parquet",
+    }.get(publication, "incomplete-provenance")
+    assert c.shard_state(tmp_path, shard, plan.backend) == expected
     monkeypatch.setattr(c, "image_digest", lambda _: "sha256:test")
     monkeypatch.setattr(c.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0))
     rc = c.run_shard(plan, shard, root=tmp_path, gpu=0, checkout=tmp_path, image="test", collector_ref="0" * 40)
-    assert (rc == 0) == published
-    assert (out / "DONE").exists() == published
+    assert (rc == 0) == (publication == "valid")
+    assert (out / "DONE").exists() == (publication == "valid")
     assert (out / ".ckpt").is_dir()
 
 

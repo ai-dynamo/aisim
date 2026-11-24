@@ -300,6 +300,27 @@ def _native_phase_table(op: str) -> str:
     return f"dsa_{phase}_module_perf.parquet"
 
 
+def _native_committed_table(directory: Path, shard: Shard, backend: str) -> bool:
+    """Require the phase's committed record and matching Parquet row count."""
+    from collector.provenance import validate_collection_meta_for_update
+
+    table = Path(_native_phase_table(shard.op)).stem
+    sidecar = directory / "collection_meta.yaml"
+    if not sidecar.is_file():
+        return False
+    document = yaml.safe_load(sidecar.read_text())
+    validate_collection_meta_for_update(document, tables_to_update={table})
+    entry = document["tables"].get(table)
+    if entry is None or document["runtime"]["framework"] != backend:
+        return False
+    # Reduced legacy summaries cannot attest this native table.
+    if not (entry.get("collections") or entry.get("case_plan_hash")):
+        return False
+    import pyarrow.parquet as pq
+
+    return entry["rows"] > 0 and pq.read_metadata(directory / f"{table}.parquet").num_rows == entry["rows"]
+
+
 def shard_state(root: Path, shard: Shard, backend: str | None = None) -> str:
     d = shard_dir(root, shard)
     if not d.exists():
@@ -325,8 +346,10 @@ def shard_state(root: Path, shard: Shard, backend: str | None = None) -> str:
                 state = json.loads(snapshot.contents)
                 if _checkpoint_case_ids(state, "done") & _checkpoint_case_ids(state, "attempted"):
                     return "pending-publication"
-    if published:
+    if published and (not native or _native_committed_table(d, shard, backend)):
         return "finalized"
+    if native and published:
+        return "incomplete-provenance"
     if (d / "DONE").exists():
         return "done-no-parquet"
     if (d / ".ckpt").exists():

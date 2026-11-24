@@ -3353,6 +3353,10 @@ def _load_selected_producer_checkpoint(
             f"{context}: staged table {staging_path} has no checkpoint for selected producer "
             f"{resume_tracker.module_name} at {checkpoint_path}"
         )
+    if collection["type"].startswith("kimi_k31_dsa_"):
+        from collector.fullnode import bind_native_checkpoint
+
+        bind_native_checkpoint(checkpoint_path, staging_path.parent)
     if staging_path.stem not in _registered_checkpoint_tables(resume_tracker._metadata, backend=backend):
         raise RuntimeError(
             f"{context}: checkpoint producer {resume_tracker.module_name} does not own staged table {staging_path}"

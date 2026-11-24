@@ -582,13 +582,10 @@ def _roles_with_afd_deployment(engine, *, workload):
                     engine.model,
                     tp_size=worker.afd.tp_a,
                     pp_size=1,
-                    moe_tp_size=1,
+                    moe_tp_size=worker.afd.tp_a,
                     moe_ep_size=1,  # KV belongs to one A replica, independently of F-pool EP.
-                    kvcache_quant_mode=(
-                        worker.timing.kvcache_quant_mode
-                        if worker.timing is not None and worker.timing.kvcache_quant_mode is not None
-                        else engine.kvcache_quant_mode
-                    ),
+                    backend=engine.backend,
+                    **_kv_geometry_controls(engine, worker),
                 )
             )
         else:
@@ -1224,6 +1221,22 @@ def _swa_prefix_tails(engine: EnginePredictionConfig, worker: WorkerPredictionCo
     return 4 * worker.scheduler.max_sequences
 
 
+def _kv_geometry_controls(engine, worker) -> dict[str, str | None]:
+    """Use the same authored/restored dtype and layout for every KV consumer."""
+    from .sweeper.state_snapshot import saved_snapshot_config
+
+    controls = worker.timing.estimator_config if worker.timing is not None else None
+    saved = saved_snapshot_config(controls if controls is not None else engine.estimator_config)
+
+    def control(name: str) -> str | None:
+        value = _worker_model_control(engine, worker, name, saved)
+        # Unknown is an exact restoration identity, not a physical KV dtype
+        # or layout. Geometry may still derive those from checkpoint metadata.
+        return None if value == "unknown" else value
+
+    return {name: control(name) for name in ("attention_backend", "kvcache_quant_mode")}
+
+
 def _resolve_kv_bytes_per_token(
     engine: EnginePredictionConfig,
     worker: WorkerPredictionConfig,
@@ -1234,17 +1247,6 @@ def _resolve_kv_bytes_per_token(
     if configured != "auto":
         return configured
     parallel = worker.parallelism
-    from .sweeper.state_snapshot import saved_snapshot_config
-
-    controls = worker.timing.estimator_config
-    saved = saved_snapshot_config(controls if controls is not None else engine.estimator_config)
-
-    def control(name: str) -> str | None:
-        value = _worker_model_control(engine, worker, name, saved)
-        # Unknown is an exact restoration identity, not a physical KV dtype
-        # or layout. Geometry may still derive those from checkpoint metadata.
-        return None if value == "unknown" else value
-
     return estimate_kv_bytes_per_token(
         engine.model,
         tp_size=parallel.tensor,
@@ -1254,7 +1256,6 @@ def _resolve_kv_bytes_per_token(
         backend=engine.backend,
         backend_version=engine.backend_version,
         attention_dp_size=parallel.attention_data,
-        attention_backend=control("attention_backend"),
         cp_size=_prefill_cp(parallel),
         dcp_size=_decode_cp(parallel),
         **(
@@ -1266,7 +1267,7 @@ def _resolve_kv_bytes_per_token(
             if engine.fpm_profile is not None
             else {}
         ),
-        kvcache_quant_mode=control("kvcache_quant_mode"),
+        **_kv_geometry_controls(engine, worker),
     )
 
 

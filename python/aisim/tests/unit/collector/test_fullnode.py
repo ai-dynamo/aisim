@@ -729,12 +729,17 @@ def test_native_failure_records_survive_interruption_and_plain_resume(monkeypatc
 @pytest.mark.parametrize("phase", ["context", "generation"])
 @pytest.mark.parametrize("passed", [False, True])
 @pytest.mark.parametrize("other_passed", [False, True])
-def test_native_pending_publication_requires_owning_checkpoint(monkeypatch, tmp_path, phase, passed, other_passed):
+@pytest.mark.parametrize("relocated", [False, True])
+def test_native_pending_publication_requires_owning_checkpoint(
+    monkeypatch, tmp_path, phase, passed, other_passed, relocated
+):
     import collector.sglang.collect_kimi_k31_dsa_v1 as native
     from collector.collect import ResumeCheckpoint
     from collector.helper import create_test_case_id
     from collector.op_plans import ModuleCase
 
+    tmp_path = tmp_path / "host-output"
+    tmp_path.mkdir()
     cases = [ModuleCase(4096, 1, heads, "fp8", "bfloat16", "bfloat16", native.MODEL, 0) for heads in (96, 48)]
     op = f"kimi_k31_dsa_{phase}_module"
     full_name = f"sglang.{op}"
@@ -857,6 +862,15 @@ def test_native_pending_publication_requires_owning_checkpoint(monkeypatch, tmp_
 
     # Canonical aliases still identify the owner. Its passed stage is promoted;
     # an uncheckpointed stage is discarded and only that case is recollected.
+    if relocated:
+        # The same mounted tree has a new absolute prefix, as in host -> /out.
+        mounted = tmp_path.with_name("container-output")
+        tmp_path.rename(mounted)
+        tmp_path = mounted
+        output = mounted / output.name
+        receipt = mounted / receipt.name
+        stage = mounted / stage.name
+        owner_dir = mounted / "checkpoint"
     alias = tmp_path / "checkpoint-alias"
     alias.symlink_to(owner_dir, target_is_directory=True)
     if passed:
@@ -866,3 +880,101 @@ def test_native_pending_publication_requires_owning_checkpoint(monkeypatch, tmp_
     assert output.read_text().splitlines() == list(map(str, cases))
     assert not receipt.exists()
     assert not stage.exists()
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_native_checkpoint_cannot_authorize_another_output_root(tmp_path, resume):
+    from collector.collect import ResumeCheckpoint, _preflight_collector_finalization_inputs
+    from collector.op_plans import ModuleCase
+    from collector.sglang import collect_kimi_k31_dsa_v1 as native
+
+    op = "kimi_k31_dsa_generation_module"
+    full_name = f"sglang.{op}"
+    run_name = "run_kimi_k31_dsa_fullnode"
+    checkpoint_dir = tmp_path / "shared-checkpoint"
+    roots = [tmp_path / name for name in ("owner", "other")]
+    for root in roots:
+        root.mkdir()
+    calls = []
+
+    def run(*, perf_filename, **kwargs):
+        calls.append(perf_filename)
+        Path(perf_filename).write_text("latency\n1.0\n")
+        return {"failed": []}
+
+    def collect(root):
+        return fullnode._collect_selected_cases(
+            [ModuleCase(4096, 1, 96, "fp8", "bfloat16", "bfloat16", native.MODEL, 0)],
+            op,
+            full_name,
+            run,
+            run_name,
+            root / "dsa_generation_module_perf.txt",
+            True,
+            "sglang",
+            native.RUNTIME_VERSION,
+            103,
+            {"checkpoint_dir": str(checkpoint_dir), "resume": resume},
+            ResumeCheckpoint,
+            _logger(),
+        )
+
+    assert collect(roots[0]) == []
+    checkpoint = checkpoint_dir / "sglang" / f"{full_name}.json"
+    original = checkpoint.read_bytes()
+    with pytest.raises(RuntimeError, match="different output root"):
+        collect(roots[1])
+    assert len(calls) == 1
+    assert checkpoint.read_bytes() == original
+
+    assert not list(roots[1].iterdir())
+
+    # Even a staged table with matching case IDs cannot borrow the producer's
+    # checkpoint during common finalization, bypassing the full-node launcher.
+    for root in roots:
+        stage = root / "dsa_generation_module_perf.txt"
+        stage.write_text("latency\n1.0\n")
+        collection = {
+            "name": "sglang",
+            "type": op,
+            "run_func": run_name,
+            "perf_filename": str(stage),
+        }
+        context = {"installed_version": native.RUNTIME_VERSION, "collections": [collection]}
+        if root == roots[0]:
+            producers, _ = _preflight_collector_finalization_inputs(
+                root, [stage], context, backend="sglang", checkpoint_dir=str(checkpoint_dir), sm_version=103
+            )
+            assert checkpoint in producers
+        else:
+            with pytest.raises(RuntimeError, match="different output root"):
+                _preflight_collector_finalization_inputs(
+                    root, [stage], context, backend="sglang", checkpoint_dir=str(checkpoint_dir), sm_version=103
+                )
+    assert checkpoint.read_bytes() == original
+
+
+def test_native_receipt_rejects_different_checkpoint_with_same_relative_path(tmp_path):
+    roots = [tmp_path / name for name in ("producer", "unrelated")]
+    for root in roots:
+        root.mkdir()
+    checkpoints = [root / ".ckpt" / "sglang" / "native.json" for root in roots]
+    owner_ids = [
+        fullnode.bind_native_checkpoint(path, root, create=True) for path, root in zip(checkpoints, roots, strict=True)
+    ]
+    for checkpoint in checkpoints:
+        checkpoint.write_text(json.dumps({"done": ["same-task"], "attempted": ["same-task"]}))
+    receipt = roots[1] / ".native.txt.pending"
+    receipt.write_text(
+        json.dumps(
+            {
+                "checkpoint": str(checkpoints[0]),
+                "checkpoint_relative": ".ckpt/sglang/native.json",
+                "checkpoint_id": owner_ids[0],
+                "task_id": "same-task",
+            }
+        )
+    )
+    assert owner_ids[0] != owner_ids[1]
+    with pytest.raises(RuntimeError, match="owning checkpoint"):
+        fullnode._read_native_receipt(receipt, checkpoints[1])

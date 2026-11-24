@@ -14,6 +14,7 @@ import random
 import shutil
 import tempfile
 import traceback
+import uuid
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
@@ -70,10 +71,71 @@ def select_cases(op: str, cases: list, limit: int | None) -> list:
     return cases
 
 
+def bind_native_checkpoint(checkpoint_path: Path, output_root: Path, *, create: bool = False) -> str:
+    """Bind a producer namespace before using it, including across container mounts.
+
+    Both paths are relative to the checkpoint directory so relocating their
+    common mount does not change ownership. Anonymous existing checkpoints
+    cannot be attributed safely and require manual recovery.
+    """
+    from collector.collect import (
+        _atomic_write_previous_path,
+        _entry_state_at,
+        _locked_checkpoint_directory,
+        _validated_regular_file_at,
+    )
+
+    owner_path = checkpoint_path.with_suffix(".json.output-owner")
+    expected_root = os.path.relpath(output_root.resolve(), checkpoint_path.parent)
+    if create:
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    with _locked_checkpoint_directory(checkpoint_path) as locked:
+        directory_fd = locked.file_descriptor
+        if _entry_state_at(directory_fd, owner_path.name) is None:
+            existing = any(
+                _entry_state_at(directory_fd, path.name) is not None
+                for path in (checkpoint_path, _atomic_write_previous_path(checkpoint_path))
+            )
+            if not create or existing:
+                raise RuntimeError(
+                    f"Native checkpoint {checkpoint_path} has no output root owner; preserve it for recovery"
+                )
+            descriptor = os.open(
+                owner_path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd
+            )
+            with os.fdopen(descriptor, "w") as stream:
+                json.dump({"output_root": expected_root, "checkpoint_id": uuid.uuid4().hex}, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.fsync(directory_fd)
+        snapshot = _validated_regular_file_at(
+            directory_fd,
+            owner_path.name,
+            owner_path,
+            None,
+            context_path=checkpoint_path,
+            capture_contents=True,
+            kind="native checkpoint owner",
+        )
+        owner = json.loads(snapshot.contents)
+        if owner.get("output_root") != expected_root or not owner.get("checkpoint_id"):
+            raise RuntimeError(f"Native checkpoint {checkpoint_path} belongs to a different output root")
+        return owner["checkpoint_id"]
+
+
 def _read_native_receipt(receipt: Path, checkpoint_path: Path) -> dict:
     transaction = json.loads(receipt.read_text())
     owner = transaction.get("checkpoint")
-    if owner != str(checkpoint_path):
+    relative_owner = transaction.get("checkpoint_relative")
+    matches = (
+        relative_owner == os.path.relpath(checkpoint_path, receipt.parent)
+        if relative_owner is not None
+        else owner == str(checkpoint_path)
+    )
+    if matches and relative_owner is not None:
+        checkpoint_id = bind_native_checkpoint(checkpoint_path, receipt.parent)
+        matches = transaction.get("checkpoint_id") == checkpoint_id
+    if not owner or not matches:
         if not owner:
             raise RuntimeError(
                 f"Pending native publication {receipt} has no owning checkpoint recorded; "
@@ -255,6 +317,7 @@ def _collect_selected_cases(
             raise RuntimeError(
                 f"Pending native publication {receipt} requires --resume with owning checkpoint {resume_tracker._path}"
             )
+    checkpoint_id = bind_native_checkpoint(resume_tracker._path, output.parent, create=True) if native else None
     if resume_options and resume_options.get("resume"):
         resume_tracker.load_existing()
         task_infos = resume_tracker.filter_done(raw_task_infos, retry_failed=resume_options.get("retry_failed", False))
@@ -369,6 +432,8 @@ def _collect_selected_cases(
                     "task_id": batch[0]["id"],
                     "stage": filename.name,
                     "checkpoint": str(resume_tracker._path),
+                    "checkpoint_relative": os.path.relpath(resume_tracker._path, output.parent),
+                    "checkpoint_id": checkpoint_id,
                 }
                 pending = receipt.with_suffix(".pending.tmp")
                 with pending.open("w") as stream:
