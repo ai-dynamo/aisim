@@ -34,6 +34,7 @@ from aisim.sweeper import (
 )
 from aisim.sweeper.config import Workload
 from aisim.sweeper.replay import REPLAY_SPEC_API_VERSION, RunnerCapabilities
+from aisim_core.data.default_systems import default_systems_path
 from aisim_core.sdk.deepseek_v41 import MODEL_PATH as DEEPSEEK_V41_MODEL_PATH
 from scripts.e2e_accuracy.source.replay import engine_args
 
@@ -227,6 +228,31 @@ def test_generic_speculation_requires_explicit_runner_capability(location, neste
     capabilities.require_compatible(spec)
     with pytest.raises(ValueError, match="generic speculation; use --stack engine"):
         replace(capabilities, supports_generic_speculation=False).require_compatible(spec)
+
+
+def test_telemetry_capability_keeps_existing_positional_arguments():
+    # RunnerCapabilities is public: an adapter passing the earlier fields positionally keeps their meaning.
+    default = RunnerCapabilities()
+    earlier = [
+        field.name for field in fields(RunnerCapabilities) if not field.kw_only and field.name != "supports_telemetry"
+    ]
+    changed = (
+        "supports_deferred_encoder_overlay",
+        "supports_mtp_host_offload",
+        "supports_agentic_primers_only",
+        "supports_kvcr_g3",
+    )
+    positional = RunnerCapabilities(*(True if name in changed else getattr(default, name) for name in earlier))
+    assert positional == replace(default, **dict.fromkeys(changed, True))
+    assert positional.supports_telemetry is False
+
+
+def test_engine_runner_factory_declares_telemetry_support():
+    telemetry = ReplayOutputRequirements(capture_telemetry=True)
+    capabilities = EngineReplayRunnerFactory().capabilities()
+    capabilities.require_output_support(telemetry)
+    with pytest.raises(ValueError, match="does not support replay telemetry"):
+        replace(capabilities, supports_telemetry=False).require_output_support(telemetry)
 
 
 @pytest.mark.parametrize("location", ["rank", "canonical"])
@@ -456,6 +482,7 @@ def test_native_replay_rejects_malformed_canonical_speculation(speculation, entr
             materialize_engine_launch_config("vllm", "0.24.0", {}, deployment.agg_engine_args, "aggregated")
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("accept_rates", [None, "", "  ", "1,0.5"])
 @pytest.mark.parametrize("explicit_depth", [False, True])
 def test_native_canonical_speculation_requires_authored_acceptance(accept_rates, explicit_depth):
@@ -514,6 +541,7 @@ def test_runner_canonical_mtp_g2_rejects_unsupported_cache_compositions(field, v
         )
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize(
     "backend,speculation",
     [
@@ -558,6 +586,7 @@ def test_public_runner_rejects_generic_trtllm_in_both_representations(location):
     assert runtime.execution_spec is None
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_native_canonical_speculation_rejects_trtllm_without_restricting_legacy():
     from aisim import _runtime
 
@@ -801,6 +830,7 @@ def test_agentic_g2_accepts_multiple_replicas(nested_rank, scopes, field, value)
         (("cluster_shared",), "num_workers", 1.5),
         (("dp_rank_local",), "num_workers", True),
         (("dp_rank_local", "cluster_shared"), "num_prefill_workers", 0),
+        ((None, "cluster_shared"), "num_decode_workers", True),
     ],
 )
 def test_agentic_g2_rejects_invalid_worker_counts(nested_rank, scopes, field, value):
@@ -808,6 +838,21 @@ def test_agentic_g2_rejects_invalid_worker_counts(nested_rank, scopes, field, va
     spec = replace(spec, backend_deployment=replace(spec.backend_deployment, **{field: value}))
     with pytest.raises(ValueError, match=f"{field} to be a positive integer"):
         EngineReplayRunnerFactory().capabilities().require_compatible(spec)
+
+
+@pytest.mark.parametrize("nested_rank", [False, True])
+@pytest.mark.parametrize(
+    "scopes,field",
+    [
+        (("dp_rank_local", None), "num_prefill_workers"),
+        ((None, "cluster_shared"), "num_decode_workers"),
+        (("cluster_shared", "cluster_shared"), "num_decode_workers"),
+    ],
+)
+def test_agentic_g2_accepts_several_workers_per_pd_role(nested_rank, scopes, field):
+    spec = _agentic_g2_spec(scopes=scopes, nested_rank=nested_rank)
+    spec = replace(spec, backend_deployment=replace(spec.backend_deployment, **{field: 3}))
+    EngineReplayRunnerFactory().capabilities().require_compatible(spec)
 
 
 @pytest.mark.parametrize("nested_rank", [False, True])
@@ -1425,6 +1470,56 @@ def test_runner_preserves_native_host_offload_rank_config():
     assert rank["kv_transfer_bytes_per_token"] == 333
     assert rank["kv_cache_bytes_per_token"] == 131_072
     assert rank["native_host_offload"] == engine_args["native_host_offload"]
+
+
+def _wait_power_prediction(**worker: object) -> dict:
+    return {
+        "engine": {
+            "mode": "aggregated",
+            "model": "Qwen/Qwen3-0.6B",
+            "hardware": "h200_sxm",
+            "backend": "vllm",
+            "context_length": 4096,
+            "workers": {
+                "aggregated": {
+                    **worker,
+                    "kv_cache": {"capacity": {"type": "fixed", "blocks": 128}},
+                    "timing": {"type": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0},
+                }
+            },
+        }
+    }
+
+
+def _native_rank(config: CorePredictionConfig) -> dict:
+    runtime = RecordingRuntime()
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(prediction_to_replay_spec(config))
+    execution = runtime.execution_spec.get("spec", runtime.execution_spec)
+    return execution["engine"]["rank"]
+
+
+def test_prediction_wait_power_reaches_native_role_after_round_trip():
+    config = CorePredictionConfig.model_validate(_wait_power_prediction(wait_power_w=60))
+    restored = CorePredictionConfig.model_validate_json(config.model_dump_json(exclude_unset=True))
+    assert _native_rank(restored)["wait_power_w"] == 60.0
+
+
+def test_unset_wait_power_is_omitted_from_native_role():
+    config = CorePredictionConfig.model_validate(_wait_power_prediction())
+    assert "wait_power_w" not in _native_rank(config)
+
+
+@pytest.mark.parametrize("watts", [-1.0, math.nan, math.inf, "60"])
+def test_wait_power_rejects_negative_non_finite_or_string_watts(watts):
+    with pytest.raises(ValidationError, match="wait_power_w"):
+        CorePredictionConfig.model_validate(_wait_power_prediction(wait_power_w=watts))
+
+
+def test_afd_workers_do_not_accept_wait_power():
+    from aisim.config.engine import AFDWorkerPredictionConfig
+
+    assert "wait_power_w" not in AFDWorkerPredictionConfig.model_fields
+    assert AFDWorkerPredictionConfig.model_config.get("extra") == "forbid"
 
 
 def test_public_host_offload_config_reaches_native_execution_rank():
@@ -3467,16 +3562,19 @@ def test_workload_driver_rejects_length_sampler_before_native_execution(source_t
 
 
 @pytest.mark.parametrize("layout", ["flat", "null_flat", "canonical", "canonical_none", "canonical_fallback", "nested"])
-@pytest.mark.parametrize("version", ["", "next", "literal_next"])
+@pytest.mark.parametrize("version", ["", "alias", "literal"])
 def test_direct_replay_capacity_uses_the_resolved_timing_version(monkeypatch, tmp_path, layout, version):
     from aisim import _runtime
     from aisim_core.sdk import perf_database
 
     slots = perf_database.get_version_slots("h200_sxm", "vllm")
-    expected = slots["next" if version == "literal_next" else version or "current"]
-    if version == "literal_next":
-        version = expected
-    assert slots["next"] != slots["current"]
+    # A slot other than current, so capacity falling back to the default
+    # version is visible: next while the fleet has a development version,
+    # otherwise previous (next then resolves to current).
+    other = "next" if slots["next"] != slots["current"] else "previous"
+    assert slots[other] != slots["current"]
+    expected = slots[other] if version else slots["current"]
+    version = {"": "", "alias": other, "literal": expected}[version]
     phase = "python"
     consumed_versions = {"python": [], "native": []}
     get_database = perf_database.get_database
@@ -3557,7 +3655,7 @@ def test_direct_replay_resolves_aliases_in_the_effective_systems_root(monkeypatc
 
     from aisim_core.sdk import perf_database
 
-    bundled = Path(perf_database.__file__).resolve().parents[1] / "systems"
+    bundled = Path(default_systems_path())
     system = yaml.safe_load((bundled / "h200_sxm.yaml").read_text())
     system["data_dir"] = str(bundled / system["data_dir"])
     (tmp_path / "h200_sxm.yaml").write_text(yaml.safe_dump(system))

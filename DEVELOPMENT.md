@@ -47,6 +47,20 @@ To activate the environment:
 source python/aisim/.venv/bin/activate
 ```
 
+### Operation data for Rust tests
+
+Operation tables are not in the repository. Python tests fetch the pinned Hugging Face dataset on first use. Rust
+tests read a systems directory instead; compose it once and export it before `cargo test`
+(about 180 MB downloaded to the data cache on the first run):
+
+```bash
+export AICONFIGURATOR_SYSTEMS_PATH="$(python scripts/ci/compose_systems_root.py)"
+cargo test --workspace
+```
+
+Rust tests locate data through `crate::test_systems::path`; spec YAML files always come from the in-tree packaged
+directory.
+
 ### 3. Install Pre-Commit Hooks
 
 ```bash
@@ -75,6 +89,14 @@ mirrored.
 If you are using VS Code or one of its forks (e.g. Cursor), you can install the [Ruff extension](https://marketplace.visualstudio.com/items?itemName=charliermarsh.ruff) which will highlight linting issues in your editor. You can also configure your editor to auto-apply formatting when saving files using the instructions [here](https://marketplace.visualstudio.com/items?itemName=charliermarsh.ruff#:~:text=Taken%20together%2C%20you%20can%20configure%20Ruff%20to%20format%2C%20fix%2C%20and%20organize%20imports%20on%2Dsave%20via%20the%20following%20settings.json%3A).
 
 ## Development Workflow
+
+### Coding agent instructions
+
+The root [AGENTS.md](AGENTS.md) holds repository guidance. The
+[scheduler](crates/core/src/engine/scheduler/vllm/AGENTS.md) and
+[replay](crates/core/src/replay/AGENTS.md) add rules for those directories.
+Each `CLAUDE.md` imports the `AGENTS.md` beside it for Claude Code.
+Edit the shared instructions in `AGENTS.md`.
 
 ### Code Style and Linting
 
@@ -124,7 +146,9 @@ python scripts/ci/check_documentation_links.py
 
 It checks inline/image links and reference definitions in the root README,
 development/contribution guides, `docs/`, the application README, and
-`python/aisim/docs/`. It uses Markdown parsing to ignore code examples and HTML
+`python/aisim/docs/`. It also checks `REVIEW.md`, scoped `AGENTS.md` and
+`CLAUDE.md` files, and Markdown in the project and package skill directories
+and package Claude rules. It uses Markdown parsing to ignore code examples and HTML
 comments. Diagnostics point to the containing Markdown block. Remote URLs,
 heading anchors, and HTML links require separate review. Run the actual
 documented commands when their behavior changes; link checks do not validate
@@ -145,6 +169,9 @@ python -m pytest -c python/aisim/pytest.ini \
 The [CI guide](docs/ci/README.md) explains the Fast/Full/Nightly workflows, code review,
 the complete application test inventory, and manual coverage exceptions. The
 local marker subset above does not reproduce all Full CI validation.
+
+On macOS, pass `-p no:timeout` if pytest-timeout's `SIGALRM` triggers a crash
+reporter dialog. Keep the timeout enabled when running CI.
 
 ## Data Collection (Advanced)
 

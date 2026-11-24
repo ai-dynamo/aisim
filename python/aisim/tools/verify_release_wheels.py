@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import zipfile
@@ -29,6 +30,8 @@ PAYLOAD_SUFFIXES = {
     ".yaml",
 }
 LEGAL_FILES = ("LICENSE", "THIRD_PARTY_NOTICES.md")
+OP_LATENCY_PIN = "aisim_core/data/op_latency_pin.json"
+OP_DATA_PREFIX = "aisim_core/systems/data/"
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -89,6 +92,25 @@ def _one_wheel(dist_dir: Path, pattern: str) -> Path:
     if len(matches) != 1:
         raise RuntimeError(f"expected one wheel matching {pattern!r}, found {[path.name for path in matches]}")
     return matches[0]
+
+
+def _verify_op_latency_contract(wheel: Path, names: set[str]) -> None:
+    """Operation tables come from the pinned dataset: the wheel carries the pin and none of the tables."""
+    packaged = sorted(name for name in names if name.startswith(OP_DATA_PREFIX) and not name.endswith("/"))
+    if packaged:
+        raise RuntimeError(
+            f"{wheel.name}: operation data must come from the pinned dataset, not the wheel: {packaged[:5]}"
+        )
+    if OP_LATENCY_PIN not in names:
+        raise RuntimeError(f"{wheel.name}: missing the op-latency dataset pin {OP_LATENCY_PIN}")
+    with zipfile.ZipFile(wheel) as archive:
+        try:
+            pin = json.loads(archive.read(OP_LATENCY_PIN))
+            repo, revision = pin["repo_id"], pin["revision"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError(f"{wheel.name}: {OP_LATENCY_PIN} must name repo_id and revision") from exc
+    if not isinstance(repo, str) or not repo or not re.fullmatch(r"[0-9a-f]{40}", str(revision)):
+        raise RuntimeError(f"{wheel.name}: {OP_LATENCY_PIN} must pin a repository and a full commit SHA")
 
 
 def _verify_legal_files(wheel: Path) -> None:
@@ -196,15 +218,13 @@ def _verify_wheel(wheel: Path, expected_payload: set[str]) -> set[str]:
         "unified native extension": any(
             name.startswith("aisim/_runtime.") and name.endswith((".so", ".pyd")) for name in payload
         ),
-        "nested performance data": any(
-            name.startswith("aisim_core/systems/data/") and name.endswith(".parquet") for name in payload
-        ),
         "Rust SBOM": any(".dist-info/sboms/" in name and name.endswith(".json") for name in names),
     }
     failed = [label for label, passed in checks.items() if not passed]
     if failed:
         raise RuntimeError(f"{wheel.name}: missing {', '.join(failed)}")
 
+    _verify_op_latency_contract(wheel, names)
     _verify_legal_files(wheel)
 
     requirements = metadata.get_all("Requires-Dist", [])
@@ -226,7 +246,7 @@ def main() -> int:
     wheel = _one_wheel(args.dist_dir, "aisim-*.whl")
     payload = _verify_wheel(wheel, _source_payloads())
     _verify_rust_crate_package()
-    print(f"Verified unified {wheel.name}: {len(payload)} application, SDK, data, and native payload files")
+    print(f"Verified unified {wheel.name}: {len(payload)} application, SDK, dataset-pin, and native payload files")
     return 0
 
 

@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-FileCopyrightText: Copyright 2023-2026 SGLang Team
 // SPDX-License-Identifier: Apache-2.0
+// Hybrid checkpoint contract adapted and modified from SGLang (Apache-2.0).
+// Copyright 2023-2026 SGLang Team.
+// Source: https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/python/sglang/srt/runtime_context.py
+// See THIRD_PARTY_NOTICES.md for the complete source list and modification scope.
 // Modified behavioral adaptation of SGLang v0.5.22; see THIRD_PARTY_NOTICES.md.
 // Source: https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
 
@@ -54,6 +58,8 @@ pub struct SchedulerRank {
     /// decode speedup is 1, so the shared duration takes one speedup. With
     /// another decode speedup, every rank keeps its own phase pricing.
     group_pricing: bool,
+    phase_priced_forward_ns: u128,
+    tracks_attention_dp_wait: bool,
     /// When the scheduled pass started, until it is resolved.
     scheduled_at_ms: Option<f64>,
     /// vLLM `launch`: outputs the engine loop has not returned yet.
@@ -112,13 +118,15 @@ impl SchedulerRank {
     }
 
     /// Pull hinted prefixes from peer ranks' G2. Returns this rank's own G2,
-    /// or `None` for an engine without KVCR.
+    /// or `None` for an engine without KVCR. A G2 block holds the KV of one
+    /// of the rank's `gpus_per_rank` GPUs.
     pub(crate) fn set_kvcr(
         &mut self,
         registry: crate::engine::kvcr::SharedKvcrRegistry,
         rank: KvHintSource,
-    ) -> Option<HostTierHandle> {
-        self.core.set_kvcr(registry, rank)
+        gpus_per_rank: usize,
+    ) -> Option<anyhow::Result<HostTierHandle>> {
+        self.core.set_kvcr(registry, rank, gpus_per_rank)
     }
 
     pub(crate) fn set_host_offload_observer(&mut self, observer: Arc<dyn HostOffloadObserver>) {
@@ -188,12 +196,16 @@ impl SchedulerRank {
                 capture_kv_events,
             )),
         };
+        let tracks_attention_dp_wait =
+            identity.dp_size.get() > 1 && timing.tracks_attention_dp_wait();
         Ok(Self {
             core,
             handoff_requests: HashMap::new(),
             timing,
             dp_rank: identity.dp_rank,
             group_pricing: config.decode_speedup_ratio == 1.0,
+            phase_priced_forward_ns: 0,
+            tracks_attention_dp_wait,
             scheduled_at_ms: None,
             held_outputs: config.launch.map(|_| HeldOutputs::default()),
         })
@@ -409,6 +421,18 @@ impl RankEngine for SchedulerRank {
             .context("external iteration prediction failed")
     }
 
+    fn tracks_attention_dp_wait(&self) -> bool {
+        self.tracks_attention_dp_wait
+    }
+
+    fn phase_priced_forward_ns(&self) -> u128 {
+        self.phase_priced_forward_ns
+    }
+
+    fn record_phase_priced_wait(&self, wait_ms: f64) -> Result<()> {
+        self.timing.record_phase_priced_wait(wait_ms)
+    }
+
     fn resolve_pass(
         &mut self,
         iteration: Option<&IterationMs>,
@@ -418,6 +442,10 @@ impl RankEngine for SchedulerRank {
             .take()
             .ok_or_else(|| anyhow!("scheduler rank has no scheduled pass to resolve"))?;
         let pass = self.core.resolve_pass(iteration)?;
+        if self.tracks_attention_dp_wait && iteration.is_none() {
+            self.phase_priced_forward_ns =
+                pass.forward_time.prefill.as_nanos() + pass.forward_time.decode.as_nanos();
+        }
         let end_ms = pass.end_ms;
         let end_without_selection_ms = pass.end_without_selection_ms;
         let previous_returned_ms = pass.previous_returned_ms;
@@ -665,6 +693,7 @@ fn core_args(config: &EngineConfig, timing: Arc<dyn TimingModel>) -> MockEngineA
         kv_cache_bytes_per_token: config.kv_cache_bytes_per_token,
         kv_cache_groups: config.kv_cache_groups.clone(),
         kv_cache_capacity_bytes: config.kv_cache_capacity_bytes,
+        vllm_version: config.vllm_version.clone(),
         native_host_offload: config.resolved_host_offload(),
         state_cache: config.state_cache,
         prefix_match_unit: config.prefix_match_unit,
@@ -678,6 +707,7 @@ fn core_args(config: &EngineConfig, timing: Arc<dyn TimingModel>) -> MockEngineA
             PreemptionMode::Fifo => CorePreemptionMode::Fifo,
         },
         sglang: Some(SglangArgs {
+            mamba_cache: config.sglang.mamba_cache,
             hicache: config.sglang.hicache,
             schedule_policy: Some(
                 match config.sglang.schedule_policy {
@@ -838,6 +868,7 @@ fn map_metrics(metrics: MockerMetrics) -> Metrics {
         total_blocks: metrics.total_blocks,
         kv_cache_used_bytes: metrics.kv_cache_used_bytes,
         kv_cache_capacity_bytes: metrics.kv_cache_capacity_bytes,
+        kv_cache_cached_bytes: metrics.kv_cache_cached_bytes,
         cache_usage: metrics.gpu_cache_usage_perc,
         physical_cache_usage: metrics.physical_gpu_cache_usage_perc,
         running_requests: metrics.running_requests,

@@ -1089,6 +1089,7 @@ def _score_prepared(
     sample_metrics = {
         OptimizationTarget.E2E_LATENCY: "num_e2e_latency_samples",
         OptimizationTarget.TTFT: "num_ttft_samples",
+        OptimizationTarget.THROUGHPUT_PER_USER: "num_tpot_samples",
     }
     for target in effective_targets:
         sample_metric = sample_metrics.get(target)
@@ -1109,6 +1110,13 @@ def _score_prepared(
                 if goal.is_pareto
                 else {"objective": observation_candidate.score}
             )
+            if target is OptimizationTarget.THROUGHPUT_PER_USER or (
+                goal.is_pareto and OptimizationTarget.THROUGHPUT_PER_USER in goal.resolved_pareto_objectives
+            ):
+                # A per-user objective with no TPOT samples carries no usable
+                # value, so the sampler gets observe_infeasible instead of a
+                # fabricated observation that reads as a mediocre real result.
+                observation_metrics = None
             sample_detail = "missing" if sample_count is None else f"{sample_count:g}"
             return _EvalResult(
                 candidate=None,
@@ -1271,6 +1279,8 @@ class Sweeper:
         goal = config.goal
         capabilities = runner_factory.capabilities()
         capabilities.require_replay_spec_version(REPLAY_SPEC_API_VERSION)
+        # Each candidate's runner check would only mark it failed, so refuse unsupported warmup once here.
+        capabilities.require_agentic_warmup_policy(config.workload.agentic_warmup_policy)
         encoder_catalog = None
         output_requirements = self._output_requirements
         language_replays: dict[str, _ReplayEvaluation] | None = None

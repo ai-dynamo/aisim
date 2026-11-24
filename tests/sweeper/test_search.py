@@ -1367,6 +1367,7 @@ class _ParetoRunner(_FakeRunner):
         throughput, per_user = _PARETO_POINTS[spec.concurrency]
         return ReplayReport(
             metrics={
+                "num_tpot_samples": 3.0,
                 "output_throughput_tok_s": throughput,
                 "mean_output_token_throughput_per_user": per_user,
                 "gpu_hours": 1.0,
@@ -1730,6 +1731,78 @@ def test_aiperf_objective_separates_missing_samples_from_invalid_values(monkeypa
         assert all(
             c.reason.startswith("runner contract violation:") and "is invalid" in c.reason for c in result.candidates
         )
+
+
+def test_per_user_objective_with_no_tpot_samples_feeds_infeasible_not_observe(monkeypatch):
+    branch = _branch(_pc())
+    _stub(monkeypatch, branch)
+    seen = {}
+
+    def sampler_factory(branch, study_id, objectives=None):
+        seen["sampler"] = _FakeSampler(branch, study_id, objectives)
+        return seen["sampler"]
+
+    class NoTpotRunner(_FakeRunner):
+        def run(self, spec: ReplaySpec) -> ReplayReport:
+            self.calls += 1
+            self.specs.append(spec)
+            return ReplayReport(
+                metrics={
+                    "completed_requests": 1.0,
+                    "num_tpot_samples": 0.0,
+                    "output_throughput_tok_s": 256.0,
+                    "gpu_hours": 1.0,
+                }
+            )
+
+    config = _config(candidates_per_round=1).model_copy(update={"goal": OptimizationGoal(target="throughput_per_user")})
+    result = Sweeper(
+        runner_factory=_FakeRunnerFactory(runner=NoTpotRunner()),
+        sampler_factory=sampler_factory,
+        show_progress=False,
+    ).run(config, top_n=None)
+
+    # Canonical result: typed infeasible with NO_SAMPLES, no candidate produced.
+    assert result.candidates
+    assert {(c.status.value, c.reason_category.value) for c in result.candidates} == {("infeasible", "no_samples")}
+    assert all("throughput_per_user objective has no qualifying samples" in c.reason for c in result.candidates)
+    # The sampler must see observe_infeasible, never a fabricated observe() metric.
+    assert all(item[0] == "infeasible" for item in seen["sampler"].scored)
+
+
+def test_pareto_with_per_user_and_no_tpot_samples_feeds_infeasible_not_observe(monkeypatch):
+    branch = _branch(_pc())
+    _stub(monkeypatch, branch)
+    seen = {}
+
+    def sampler_factory(branch, study_id, objectives=None):
+        seen["sampler"] = _FakeSampler(branch, study_id, objectives)
+        return seen["sampler"]
+
+    class NoTpotRunner(_FakeRunner):
+        def run(self, spec: ReplaySpec) -> ReplayReport:
+            self.calls += 1
+            self.specs.append(spec)
+            return ReplayReport(
+                metrics={
+                    "completed_requests": 1.0,
+                    "num_tpot_samples": 0.0,
+                    "output_throughput_tok_s": 256.0,
+                    "gpu_hours": 1.0,
+                }
+            )
+
+    # Default Pareto pair is (throughput_per_gpu, throughput_per_user).
+    config = _config(candidates_per_round=1).model_copy(update={"goal": OptimizationGoal(target="pareto")})
+    result = Sweeper(
+        runner_factory=_FakeRunnerFactory(runner=NoTpotRunner()), sampler_factory=sampler_factory, show_progress=False
+    ).run(config, top_n=None)
+
+    assert result.candidates
+    assert {(c.status.value, c.reason_category.value) for c in result.candidates} == {("infeasible", "no_samples")}
+    assert all("throughput_per_user objective has no qualifying samples" in c.reason for c in result.candidates)
+    # The per-user member of the Pareto vector is unusable, so no observe() feedback.
+    assert all(item[0] == "infeasible" for item in seen["sampler"].scored)
 
 
 @pytest.mark.parametrize("strict", [False, True])

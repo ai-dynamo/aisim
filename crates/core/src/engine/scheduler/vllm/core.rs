@@ -4,8 +4,12 @@
 // Modified Rust simulation of vLLM b3563fc65ae0f5359802593d78e7ea097e1fed31
 // scheduling contracts, of the v0.28.0 (2cf0a6915ce544dc493a0990f2ea38d81601128a)
 // async-scheduling batch queue, of the v0.29.0
-// (98dff2a81d747d1dba01a47f939f48c3526d4206) align-mode prefill split and of the
-// v0.30.0 (ced6857afa0ea7b2e3f0846a62e1394e90f15607) async block frees;
+// (98dff2a81d747d1dba01a47f939f48c3526d4206) align-mode prefill split, of the
+// v0.30.0 (ced6857afa0ea7b2e3f0846a62e1394e90f15607) async block frees and of
+// the v0.31.0 (db9527a46873454610df6dbedf79a36d6bf1a7f6) and v0.32.0
+// (5df63a7203cdb9328d824a27b682e77c7b9928be) grouped KV rules and grouped KV
+// handoff rules and of the v0.33.0 (4ba787ec9959e566d3b587a796dff07673324da5)
+// grouped KV rules;
 // immutable sources and license: THIRD_PARTY_NOTICES.md.
 // MTP/G2 semantics additionally adapted from vLLM v0.32.0, commit
 // 5df63a7203cdb9328d824a27b682e77c7b9928be, vllm/v1/core/sched/scheduler.py
@@ -32,10 +36,12 @@ use crate::engine::common::utils::{
 use crate::engine::config::LoadCopyStart;
 use crate::engine::host_offload::{G2Binding, HostTierHandle, TransferId};
 use crate::engine::kv_manager::AllocationRequirement;
-use crate::engine::kv_manager::{DestinationReservation, G1Acquire, NativeAllocation};
 use crate::engine::kv_manager::{
-    G1Manager, GroupedKvPool, mamba_prefill_checkpoint, state_boundaries,
+    AdmissionLimits, G1Manager, GroupedKvPool, GroupedPrefixRules, GroupedTransferRules,
+    PrefixHashMemo, VllmRuleVersion,
 };
+use crate::engine::kv_manager::{DestinationReservation, G1Acquire, NativeAllocation};
+use crate::engine::kv_manager::{mamba_prefill_checkpoint, state_boundaries};
 use crate::engine::scheduler::queue_metrics::{QueueStats, QueuedLength};
 use crate::engine::scheduler::vllm::host_offload::{
     CompletedLoad, HostLookup, HostLookupHit, HostTransferProgress, LoadTiming, StartLoad,
@@ -705,6 +711,9 @@ pub(crate) struct VllmCore {
     g1_prefix_cache_lookup: Option<crate::engine::PrefixCacheLookupCounts>,
     retain_local_hashes: bool,
     emit_token_ids: bool,
+    /// The `prefix_match_unit` hashes of the prompt spans this engine has
+    /// hashed twice, under prefix caching.
+    prefix_hash_memo: Option<PrefixHashMemo>,
     native_host_offload: Option<VllmHostOffloadAdapter>,
     /// A host transfer completed while destinations were deferred.
     destination_retry_ready: bool,
@@ -721,8 +730,8 @@ pub(crate) struct VllmCore {
     pass_ran_work: bool,
     /// Requests that finished in the latest pass. vLLM frees their blocks when
     /// it processes that pass's outputs, after it has formed the next pass.
-    finished_in_flight: Vec<HeldVllmPrefill>,
-    /// Requests the pass in flight runs, sorted, when vLLM defers freeing their
+    finished_in_flight: Vec<DeferredFree>,
+    /// Requests the pass in flight runs, when vLLM defers freeing their
     /// blocks until that pass ends: async scheduling with a CPU tier.
     in_flight_requests: Vec<Uuid>,
     /// `launch`: when vLLM decides the pass after the latest one, if that pass
@@ -871,6 +880,14 @@ struct HeldVllmPrefill {
     request: VllmRequestState,
 }
 
+/// A free that async scheduling defers until the next pass is formed.
+enum DeferredFree {
+    /// Every block of a finished request.
+    Request(HeldVllmPrefill),
+    /// The skipped blocks of a source that its finish held for a transfer.
+    HeldSource(Uuid),
+}
+
 struct ReservedVllmDecode {
     request: VllmRequestState,
     kv: DestinationReservation,
@@ -936,11 +953,12 @@ impl VllmCore {
         &mut self,
         registry: crate::engine::kvcr::SharedKvcrRegistry,
         rank: KvHintSource,
-    ) -> HostTierHandle {
+        gpus_per_rank: usize,
+    ) -> anyhow::Result<HostTierHandle> {
         self.native_host_offload
             .as_mut()
             .expect("KVCR requires G2")
-            .set_kvcr(registry, rank)
+            .set_kvcr(registry, rank, gpus_per_rank)
     }
 
     pub(crate) fn set_host_offload_observer(
@@ -1039,6 +1057,11 @@ impl VllmCore {
                 .as_ref()
                 .is_some_and(|host| host.scope == G2Scope::ClusterShared);
         let emit_token_ids = args.emit_kv_token_ids;
+        // Without prefix caching a block identity is random and names no prefix.
+        let prefix_hash_memo = args
+            .prefix_match_unit
+            .filter(|_| args.enable_prefix_caching)
+            .and_then(|unit| PrefixHashMemo::new(unit, args.block_size));
         let eagle_block_drop = args.aic_nextn.is_some() && !args.disable_eagle_block_drop;
         let speculative_sampler = args.aic_nextn.map(|nextn| {
             let rates =
@@ -1071,8 +1094,50 @@ impl VllmCore {
             args.state_cache,
             args.kv_cache_bytes_per_token,
             eagle_block_drop,
-        )
-        .with_prefix_match_unit(args.prefix_match_unit);
+        );
+        if !args.kv_cache_groups.is_empty() {
+            let capacity_bytes = args
+                .kv_cache_capacity_bytes
+                .expect("validated grouped cache capacity");
+            if args.enable_prefix_caching {
+                let unit = args
+                    .prefix_match_unit
+                    .expect("validated grouped prefix_match_unit");
+                let version = args
+                    .vllm_version
+                    .as_deref()
+                    .and_then(VllmRuleVersion::parse)
+                    .expect("validated vllm_version");
+                let rules = GroupedPrefixRules::new(&args.kv_cache_groups, unit, version)
+                    .expect("validated grouped prefix rules");
+                kv_manager.set_grouped_cache(GroupedKvPool::with_prefix_cache(
+                    args.kv_cache_groups.clone(),
+                    capacity_bytes,
+                    args.kv_cache_groups[0].page_size_bytes,
+                ));
+                kv_manager.set_grouped_prefix_rules(
+                    rules,
+                    AdmissionLimits {
+                        max_in_flight_tokens: args
+                            .max_concurrent_batches
+                            .saturating_mul(args.max_num_batched_tokens.unwrap_or(usize::MAX)),
+                        max_model_len: args.max_model_len.expect("validated max_model_len"),
+                    },
+                );
+            } else {
+                kv_manager.set_grouped_cache(GroupedKvPool::new(
+                    args.kv_cache_groups.clone(),
+                    capacity_bytes,
+                ));
+            }
+            if args.worker_type != WorkerType::Aggregated {
+                kv_manager.set_grouped_transfer_rules(
+                    GroupedTransferRules::new(&args.kv_cache_groups)
+                        .expect("validated grouped transfer rules"),
+                );
+            }
+        }
+        let mut kv_manager = kv_manager.with_prefix_match_unit(args.prefix_match_unit);
         let blocks_per_state = kv_manager.state_blocks_per_request();
         if let Some(adapter) = native_host_offload.as_mut()
             && blocks_per_state > 0
@@ -1095,13 +1160,6 @@ impl VllmCore {
             .and_then(VllmHostOffloadAdapter::store_source_hold)
         {
             kv_manager.hold_native_store_sources(order);
-        }
-        if !args.kv_cache_groups.is_empty() {
-            kv_manager.set_grouped_cache(GroupedKvPool::new(
-                args.kv_cache_groups.clone(),
-                args.kv_cache_capacity_bytes
-                    .expect("validated grouped cache capacity"),
-            ));
         }
         // MTP over one uniform token cache, on any worker type.
         let uniform_mtp_depth =
@@ -1137,6 +1195,7 @@ impl VllmCore {
             g1_prefix_cache_lookup: None,
             retain_local_hashes,
             emit_token_ids,
+            prefix_hash_memo,
             native_host_offload,
             destination_retry_ready: false,
             wave_step: 0,
@@ -1305,9 +1364,24 @@ impl VllmCore {
             self.kv_manager.grouped().is_none()
                 || matches!(
                     &command,
+                    SchedulerCommand::Submit(_)
+                        | SchedulerCommand::CancelRequest { .. }
+                        | SchedulerCommand::SubmitHandoffPrefill { .. }
+                        | SchedulerCommand::ReleaseSource { .. }
+                        | SchedulerCommand::CancelSource { .. }
+                ),
+            "grouped KV caches do not support destination handoff commands"
+        );
+        // An aggregated grouped rank builds no transfer rules, so it can
+        // neither truncate nor price a source.
+        anyhow::ensure!(
+            self.kv_manager.grouped().is_none()
+                || self.kv_manager.grouped_transfer().is_some()
+                || matches!(
+                    &command,
                     SchedulerCommand::Submit(_) | SchedulerCommand::CancelRequest { .. }
                 ),
-            "grouped KV caches support only cold aggregated requests, not KV handoff commands"
+            "grouped KV caches support KV handoff commands only on prefill and decode ranks"
         );
         let mutation_now_ms = command_now_ms.filter(|_| allow_destination_admission);
         match command {
@@ -1348,10 +1422,29 @@ impl VllmCore {
                 handoff_id,
                 mut request,
             } => {
+                anyhow::ensure!(
+                    self.kv_manager.grouped_transfer().is_none() || !request.tokens.is_empty(),
+                    "grouped KV sources require a nonempty prompt"
+                );
                 let uuid = request.uuid.unwrap_or_else(Uuid::new_v4);
                 request.uuid = Some(uuid);
                 self.validate_request_id(uuid)?;
                 self.source_holds.register(uuid, handoff_id)?;
+                if let Some(rules) = self.kv_manager.grouped_transfer() {
+                    // vLLM's prefill rank drops the last backoff tokens of the
+                    // prompt, which the decode rank recomputes (V31
+                    // `nixl/base_scheduler.py:409-436`, V32 `:405-435`).
+                    let tokens = rules.transfer_tokens(request.tokens.len());
+                    if tokens < request.tokens.len() {
+                        request.tokens.truncate(tokens);
+                        // The source samples once; the decode rank computes
+                        // the backed-off prompt token before generating more.
+                        request.max_output_tokens = request.max_output_tokens.min(1);
+                        if let Some(output_ids) = &mut request.output_token_ids {
+                            output_ids.truncate(1);
+                        }
+                    }
+                }
                 let admissible_from_pass =
                     self.first_pass_admitting_arrival(!allow_destination_admission);
                 let submitted = self
@@ -1717,7 +1810,7 @@ impl VllmCore {
     }
 
     fn make_request_state(
-        &self,
+        &mut self,
         request: DirectRequest,
         status: RequestStatus,
         waiting_order: u64,
@@ -1772,7 +1865,12 @@ impl VllmCore {
         );
         sequence.lease.session_id = request.session_id;
         if let (Some(unit), Some(tokens)) = (self.args.prefix_match_unit, prefix_tokens) {
-            sequence.lease.configure_prefix_hashes(&tokens, unit);
+            match &mut self.prefix_hash_memo {
+                Some(memo) => sequence
+                    .lease
+                    .configure_prefix_hashes_memoized(&tokens, memo),
+                None => sequence.lease.configure_prefix_hashes(&tokens, unit),
+            }
         }
         let host_offload = self.native_host_offload.as_ref().map(|adapter| {
             Box::new(VllmHostRequestState::new(
@@ -1805,7 +1903,7 @@ impl VllmCore {
         match self.source_holds.remove(handoff_id) {
             RemovedSource::Held(payload) => {
                 let request_id = payload.request_id;
-                self.cleanup_completed_prefill(payload);
+                self.free_held_source(payload);
                 self.bump_capacity_generation();
                 (true, Some(request_id))
             }
@@ -1823,7 +1921,7 @@ impl VllmCore {
         match self.source_holds.remove(handoff_id) {
             RemovedSource::Held(payload) => {
                 let request_id = payload.request_id;
-                self.cleanup_completed_prefill(payload);
+                self.free_held_source(payload);
                 self.bump_capacity_generation();
                 (true, Some(request_id))
             }
@@ -1837,6 +1935,15 @@ impl VllmCore {
 
     fn complete_source(&mut self, uuid: Uuid) {
         let transfer_timing = self.state.requests.get(&uuid).map(|request| {
+            if let Some(rules) = self.kv_manager.grouped_transfer() {
+                // The submission truncated the prompt to the transferred
+                // tokens. The timing counts their full-attention blocks.
+                return rules.handoff_transfer_timing(
+                    request.sequence.num_input_tokens(),
+                    self.args.kv_transfer_bandwidth,
+                    self.args.kv_transfer_timing_mode,
+                );
+            }
             prefill_handoff_transfer_timing(
                 request.sequence.num_input_tokens(),
                 self.args.kv_transfer_bandwidth,
@@ -1847,25 +1954,37 @@ impl VllmCore {
                 self.args.kv_transfer_timing_mode,
             )
         });
-        let request = self
+        let mut request = self
             .state
             .take_completed(&uuid)
             .expect("completed request must remain scheduler-owned");
+        // vLLM frees a finished request's blocks when it processes the pass's
+        // outputs; with async scheduling that comes after it has formed the
+        // next pass (V31 `engine/core.py:697`, `:740-755`, V32
+        // `engine/core.py:725`, `:768-783`).
+        let deferred = self.args.max_concurrent_batches > 1;
+        if !deferred && self.releases_skipped_blocks() {
+            self.kv_manager.release_skipped_blocks(
+                uuid,
+                &mut request.sequence.lease,
+                request.num_computed_tokens,
+            );
+        }
         let payload = HeldVllmPrefill {
             request_id: uuid,
             request,
         };
         match self.source_holds.complete_source(uuid, payload) {
-            // vLLM frees a finished request's blocks when it processes the
-            // pass's outputs; with async scheduling that comes after it has
-            // formed the next pass.
-            SourceCompletion::Release(payload) if self.args.max_concurrent_batches > 1 => {
-                self.finished_in_flight.push(payload);
+            SourceCompletion::Release(payload) if deferred => {
+                self.finished_in_flight.push(DeferredFree::Request(payload));
             }
             SourceCompletion::Release(payload) => {
                 self.cleanup_completed_prefill(payload);
             }
             SourceCompletion::Held { handoff_id } => {
+                // vLLM returns the transfer parameters with the outputs of
+                // this pass, so the hold starts here. With async scheduling
+                // its skipped blocks wait for the deferred free.
                 self.lifecycle_events
                     .push(SchedulerLifecycleEvent::SourceHeld {
                         handoff_id,
@@ -1873,6 +1992,9 @@ impl VllmCore {
                         transfer_timing: transfer_timing
                             .expect("completed source request must retain transfer timing"),
                     });
+                if deferred && self.releases_skipped_blocks() {
+                    self.finished_in_flight.push(DeferredFree::HeldSource(uuid));
+                }
             }
         }
         self.active_destination_handoffs.remove_request(uuid);
@@ -1891,12 +2013,70 @@ impl VllmCore {
             .finish_native(request_id, request.sequence.lease);
     }
 
-    fn free_finished(&mut self, finished: Vec<HeldVllmPrefill>) {
+    /// Whether an ending request frees its skipped blocks first. A grouped
+    /// prefill rank frees the skipped blocks of an ending request first, as
+    /// vLLM's `_free_request` runs `_connector_finished`, which frees them
+    /// before it hands the block table to the connector (V31
+    /// `sched:2650-2679`, `:2966-2974`, V32 `sched:2714-2744`,
+    /// `:3023-3031`).
+    fn releases_skipped_blocks(&self) -> bool {
+        self.args.worker_type == WorkerType::Prefill && self.kv_manager.grouped_transfer().is_some()
+    }
+
+    /// Free every block of a held source that is released or cancelled.
+    /// vLLM frees the skipped blocks of a source in `_connector_finished`
+    /// when it processes the outputs of the pass that completed it (V31
+    /// `sched:2171`, `:2966-2974`, V32 `sched:2230`, `:3023-3031`), and the
+    /// rest when the transfer ends (V31 `sched:3155-3158`, V32
+    /// `sched:3232-3235`). So the skipped blocks enter the free queue first in
+    /// every order of events. A source that leaves before its deferred free
+    /// frees them here and drops its queued entry, which a new source with
+    /// the same request ID would otherwise meet. After the deferred free, or
+    /// without async scheduling, the release frees nothing a second time.
+    fn free_held_source(&mut self, mut payload: HeldVllmPrefill) {
+        let request_id = payload.request_id;
+        self.finished_in_flight.retain(
+            |free| !matches!(free, DeferredFree::HeldSource(queued) if *queued == request_id),
+        );
+        if self.releases_skipped_blocks() {
+            self.kv_manager.release_skipped_blocks(
+                request_id,
+                &mut payload.request.sequence.lease,
+                payload.request.num_computed_tokens,
+            );
+        }
+        self.cleanup_completed_prefill(payload);
+    }
+
+    fn free_finished(&mut self, finished: Vec<DeferredFree>) {
         if finished.is_empty() {
             return;
         }
-        for payload in finished {
-            self.cleanup_completed_prefill(payload);
+        let releases_skipped_blocks = self.releases_skipped_blocks();
+        for free in finished {
+            match free {
+                DeferredFree::Request(mut payload) => {
+                    if releases_skipped_blocks {
+                        self.kv_manager.release_skipped_blocks(
+                            payload.request_id,
+                            &mut payload.request.sequence.lease,
+                            payload.request.num_computed_tokens,
+                        );
+                    }
+                    self.cleanup_completed_prefill(payload);
+                }
+                // A source that is released or cancelled before this free
+                // drops its entry in `free_held_source`.
+                DeferredFree::HeldSource(request_id) => {
+                    if let Some(payload) = self.source_holds.held_payload_mut(request_id) {
+                        self.kv_manager.release_skipped_blocks(
+                            request_id,
+                            &mut payload.request.sequence.lease,
+                            payload.request.num_computed_tokens,
+                        );
+                    }
+                }
+            }
         }
         self.bump_capacity_generation();
     }
@@ -2652,8 +2832,11 @@ impl VllmCore {
             metrics.total_blocks = 0;
             metrics.kv_cache_used_bytes = Some(pool.used_bytes());
             metrics.kv_cache_capacity_bytes = Some(pool.capacity_bytes());
+            metrics.kv_cache_cached_bytes = pool.block_pool().map(|_| pool.cached_bytes());
             metrics.gpu_cache_usage_perc = pool.used_bytes() as f64 / pool.capacity_bytes() as f64;
-            metrics.physical_gpu_cache_usage_perc = metrics.gpu_cache_usage_perc;
+            // Cached blocks that no request holds stay resident.
+            metrics.physical_gpu_cache_usage_perc =
+                (pool.used_bytes() + pool.cached_bytes()) as f64 / pool.capacity_bytes() as f64;
         }
         metrics
     }
@@ -2725,6 +2908,7 @@ impl VllmCore {
         };
         let end_ms = forward_time.end_ms(pass.compute_start_ms);
         let mut result = pass.result;
+        result.forward_time = forward_time;
         result.end_ms = end_ms;
         // `launch`: vLLM returns the previous pass's outputs, then decides the
         // next pass, once it has launched this pass and the previous pass has
@@ -3186,6 +3370,7 @@ impl VllmCore {
                                 raw_prefill_cost
                                     .as_ref()
                                     .expect("fresh admission must retain its G1 lookup"),
+                                self.kv_manager.grouped_prefix_rules().is_some(),
                             ) {
                                 decision
                             } else {
@@ -3312,6 +3497,7 @@ impl VllmCore {
                         grouped_minimum_forward_bytes = self
                             .kv_manager
                             .grouped()
+                            .filter(|pool| pool.block_pool().is_none())
                             .zip(self.state.requests.get(&uuid))
                             .and_then(|(pool, request)| {
                                 let known_tokens = request.sequence.len();
@@ -3447,6 +3633,13 @@ impl VllmCore {
             }
         }
 
+        // vLLM keeps the copy sources of a prefix hit inside a block in use
+        // until the end of `schedule()`, so no later request of the step can
+        // take them (vllm/v1/core/sched/scheduler.py v0.31.0 1434-1442,
+        // v0.32.0 1474-1482, v0.33.0 1698-1706). Replay releases them here,
+        // once per pass.
+        self.kv_manager.release_grouped_copy_sources();
+
         if !defer_prefills && !preempted_any {
             // Queued arrivals are not waiting for scheduler capacity.
             self.prefill_capacity_bound =
@@ -3557,8 +3750,6 @@ impl VllmCore {
                 committed_requests.push(signal.uuid);
             }
         }
-        committed_requests.sort_unstable();
-        committed_requests.dedup();
         if self.args.max_concurrent_batches > 1 {
             self.pass_ran_work = !committed_requests.is_empty();
             if self.native_host_offload.is_some() {
@@ -3604,6 +3795,7 @@ impl VllmCore {
             }),
         };
         let result = EnginePassResult {
+            forward_time: ForwardTime::default(),
             committed_requests,
             // The forward's end and the retry it implies are set when it is
             // priced; `now_ms` holds their place.
@@ -3779,7 +3971,7 @@ impl VllmCore {
         // vLLM does not free the blocks of a request the pass in flight runs
         // until that pass ends (async scheduling with a CPU tier), so it does
         // not preempt such a request: the allocation stops instead.
-        if self.in_flight_requests.binary_search(&selected).is_ok() {
+        if self.in_flight_requests.contains(&selected) {
             return None;
         }
         let state_before = self.pressure_state();
@@ -4012,17 +4204,22 @@ impl VllmCore {
         preempted_any: &mut bool,
         pressure_at_ms: f64,
     ) -> anyhow::Result<ScheduleOutcome> {
+        // Read before the request is borrowed mutably for its grouped lookup.
+        let eagle_block_drop = self.eagle_block_drop();
         let request = self
             .state
             .requests
-            .get(&uuid)
+            .get_mut(&uuid)
             .unwrap_or_else(|| panic!("schedule_request: {uuid} missing from state.requests"));
         request.debug_assert_invariants(uuid);
         let cached_prefix_tokens = if request.num_computed_tokens == 0 {
             match prefill_cost {
                 Some(cost) => cost.cached_tokens,
                 None => {
-                    let cost = request.sequence.prefill_cost(&self.kv_manager);
+                    let cost = self.kv_manager.lookup_native_prefill_cost(
+                        &request.sequence.sequence,
+                        &mut request.sequence.lease,
+                    );
                     if request.sequence.sequence.enable_prefix_caching()
                         && let Some(counts) = &mut self.g1_prefix_cache_lookup
                     {
@@ -4032,7 +4229,7 @@ impl VllmCore {
                         .resolve_prefill_cost(
                             self.args.scheduling_policy(),
                             request.sequence.len(),
-                            self.eagle_block_drop(),
+                            eagle_block_drop,
                             !policy::generation_complete(
                                 &request.sequence,
                                 self.args.max_model_len,
@@ -4045,6 +4242,7 @@ impl VllmCore {
         } else {
             0
         };
+        let request = &self.state.requests[&uuid];
         let effective_computed_before = request.num_computed_tokens + cached_prefix_tokens;
         let prompt_len = request.sequence.num_input_tokens();
         let prompt_before = effective_computed_before.min(prompt_len);
@@ -4103,14 +4301,28 @@ impl VllmCore {
         // Recorded at the waiting lookup (see the admission loop).
         let junction = request.sequence.lease.junction();
         let (desired_tokens, prefill_checkpoint) = mtp.map_or_else(
-            || {
-                self.align_state_prefill(
+            || match self.kv_manager.grouped_prefix_rules() {
+                // The grouped rule table owns the split of its vLLM version. A
+                // grouped rank has no state cache, so no prefill checkpoint of
+                // the state cache.
+                Some(rules) => (
+                    rules.align_split(
+                        effective_computed_before,
+                        prompt_len,
+                        request.sequence.len(),
+                        remaining_known_tokens.min(*token_budget),
+                        request.sequence.lease.grouped_junction(),
+                        self.args.max_num_batched_tokens.unwrap_or(usize::MAX),
+                    ),
+                    None,
+                ),
+                None => self.align_state_prefill(
                     effective_computed_before,
                     prompt_len,
                     request.sequence.len(),
                     remaining_known_tokens.min(*token_budget),
                     junction,
-                )
+                ),
             },
             |work| (work.query_tokens, None),
         );
@@ -4133,20 +4345,41 @@ impl VllmCore {
                 work.known_end
             });
         if let Some(pool) = self.kv_manager.grouped() {
-            let required = pool
-                .required_bytes(effective_computed_before, desired_computed_after)
-                .ok_or_else(|| anyhow::anyhow!("grouped KV forward byte calculation overflowed"))?;
-            anyhow::ensure!(
-                required <= pool.capacity_bytes(),
-                "request {uuid} grouped KV forward needs {required} bytes for {desired_tokens} scheduled tokens after {effective_computed_before} computed tokens, exceeding the entire {}-byte cache pool{}; reduce max_num_batched_tokens or increase cache memory",
-                pool.capacity_bytes(),
-                match pool.fixed_request_bytes() {
-                    0 => String::new(),
-                    fixed => format!(
-                        "; the fixed state blocks of one request take {fixed} bytes of this pool"
-                    ),
-                }
-            );
+            if let Some(blocks) = pool.block_pool() {
+                let required = pool
+                    .projected_blocks(effective_computed_before, desired_computed_after)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("grouped KV forward block calculation overflowed")
+                    })?;
+                anyhow::ensure!(
+                    required <= blocks.capacity_blocks(),
+                    "request {uuid} grouped KV forward needs {required} blocks for {desired_tokens} scheduled tokens after {effective_computed_before} computed tokens, exceeding the entire {}-block cache pool{}; reduce max_num_batched_tokens or increase cache memory",
+                    blocks.capacity_blocks(),
+                    match pool.fixed_request_blocks() {
+                        0 => String::new(),
+                        fixed => format!(
+                            "; the fixed state blocks of one request take {fixed} blocks of this pool"
+                        ),
+                    }
+                );
+            } else {
+                let required = pool
+                    .required_bytes(effective_computed_before, desired_computed_after)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("grouped KV forward byte calculation overflowed")
+                    })?;
+                anyhow::ensure!(
+                    required <= pool.capacity_bytes(),
+                    "request {uuid} grouped KV forward needs {required} bytes for {desired_tokens} scheduled tokens after {effective_computed_before} computed tokens, exceeding the entire {}-byte cache pool{}; reduce max_num_batched_tokens or increase cache memory",
+                    pool.capacity_bytes(),
+                    match pool.fixed_request_bytes() {
+                        0 => String::new(),
+                        fixed => format!(
+                            "; the fixed state blocks of one request take {fixed} bytes of this pool"
+                        ),
+                    }
+                );
+            }
         }
         let mut actual_computed_after = desired_computed_after;
         let host_offload_enabled = self.native_host_offload.is_some();
@@ -4236,6 +4469,10 @@ impl VllmCore {
             // FIFO admission cannot evict running work for speculative capacity.
             if from_waiting && mtp.is_some() {
                 return Ok(ScheduleOutcome::Blocked);
+            }
+            if from_waiting && !policy::waiting_allocation_may_preempt(&self.kv_manager) {
+                actual_computed_after = effective_computed_before;
+                break;
             }
             let Some(preempted) = self.policy_preempt(pressure_at_ms) else {
                 actual_computed_after = effective_computed_before;

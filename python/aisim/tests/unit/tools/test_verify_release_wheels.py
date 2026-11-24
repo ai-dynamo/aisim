@@ -163,3 +163,73 @@ def test_release_verifier_rejects_removed_import_packages(verifier, tmp_path, pa
         )
     with pytest.raises(RuntimeError, match="removed legacy import packages"):
         verifier._verify_wheel(wheel, set())
+
+
+PIN = '{"repo_id": "ai-dynamo/aisim-data", "revision": "' + "a" * 40 + '"}'
+
+
+def _release_wheel(tmp_path, verifier, *, pin=PIN, extra=()):
+    """A wheel with the whole required payload, legal files, native marker and SBOM; operation data only as asked."""
+    wheel = tmp_path / "aisim-1.2.0-py3-none-any.whl"
+    for name in verifier.LEGAL_FILES:
+        (tmp_path / name).write_text(f"canonical {name}\n")
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for name in (
+            "aisim/__init__.py",
+            "aisim_core/__init__.py",
+            "aisim/legacy_cli/main.py",
+            "aisim/generator/api.py",
+            "aisim/sdk/config_adapter/schemas/estimate-request-v1.schema.json",
+            "aisim_core/_native.py",
+            "aisim_core/_native.pyi",
+            "aisim_core/model_configs/meta-llama--Meta-Llama-3.1-8B_config.json",
+            "aisim_core/sdk/engine.py",
+            "aisim_core/systems/h100_sxm.yaml",
+            "aisim/_runtime.abi3.so",
+            "aisim-1.2.0.dist-info/sboms/core.cdx.json",
+            *extra,
+        ):
+            archive.writestr(name, "")
+        if pin is not None:
+            archive.writestr("aisim_core/data/op_latency_pin.json", pin)
+        archive.writestr("aisim-1.2.0.dist-info/METADATA", "Metadata-Version: 2.1\nName: aisim\nVersion: 1.2.0\n")
+        for name in verifier.LEGAL_FILES:
+            archive.writestr(f"aisim-1.2.0.dist-info/licenses/{name}", (tmp_path / name).read_bytes())
+    return wheel
+
+
+def test_release_verifier_accepts_a_wheel_with_the_pin_and_no_operation_data(verifier, monkeypatch, tmp_path):
+    wheel = _release_wheel(tmp_path, verifier)
+    monkeypatch.setattr(verifier, "PACKAGE_ROOT", tmp_path)
+    assert "aisim_core/data/op_latency_pin.json" in verifier._verify_wheel(wheel, set())
+
+
+def test_release_verifier_rejects_packaged_operation_data(verifier, monkeypatch, tmp_path):
+    wheel = _release_wheel(tmp_path, verifier, extra=["aisim_core/systems/data/h200_sxm/gemm/vllm/1/gemm_perf.parquet"])
+    monkeypatch.setattr(verifier, "PACKAGE_ROOT", tmp_path)
+    with pytest.raises(RuntimeError, match="must come from the pinned dataset"):
+        verifier._verify_wheel(wheel, set())
+
+
+def test_release_verifier_requires_the_op_latency_pin(verifier, monkeypatch, tmp_path):
+    wheel = _release_wheel(tmp_path, verifier, pin=None)
+    monkeypatch.setattr(verifier, "PACKAGE_ROOT", tmp_path)
+    with pytest.raises(RuntimeError, match="missing the op-latency dataset pin"):
+        verifier._verify_wheel(wheel, set())
+
+
+@pytest.mark.parametrize(
+    "pin",
+    [
+        "not json",
+        "[]",
+        '{"repo_id": "o/n"}',
+        '{"repo_id": "o/n", "revision": "main"}',
+        '{"repo_id": "", "revision": "' + "a" * 40 + '"}',
+    ],
+)
+def test_release_verifier_rejects_a_pin_that_is_not_a_repository_and_full_sha(verifier, monkeypatch, tmp_path, pin):
+    wheel = _release_wheel(tmp_path, verifier, pin=pin)
+    monkeypatch.setattr(verifier, "PACKAGE_ROOT", tmp_path)
+    with pytest.raises(RuntimeError, match="op_latency_pin.json must"):
+        verifier._verify_wheel(wheel, set())

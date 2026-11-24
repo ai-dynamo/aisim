@@ -40,8 +40,10 @@ pub enum FpmCacheKind {
 /// can be more than the bytes of the group's own layers. Its
 /// `block_size_tokens` is the block size of vLLM's state spec, as the runtime
 /// probe records it: the Mamba block (the scheduler block in `align` mode,
-/// `max_model_len` in mode `none`) or the ring block. Sizing and replay do not
-/// read it yet.
+/// `max_model_len` in mode `none`) or the ring block. Sizing and replay with
+/// prefix caching off do not read it. Grouped prefix caching reads it as the
+/// Mamba block of `align` mode, and every group's block enters the scheduler
+/// block, the least common multiple of the group blocks.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FpmCacheGroup {
@@ -65,9 +67,9 @@ pub struct FpmCacheGroup {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocks_per_request: Option<u32>,
     /// Whether vLLM's manager for this group takes part in prefix caching. A
-    /// ring spec does not. Replay with prefix caching on needs it on every
-    /// group, and does not read it yet. `None` in a profile imported before
-    /// this field existed.
+    /// ring spec does not. A rank with `kv_cache_groups` and
+    /// `enable_prefix_caching` refuses a group that leaves it unset. `None`
+    /// in a profile imported before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_cacheable: Option<bool>,
     /// The bytes that vLLM's P/D connector reads for one block of this group in
@@ -303,8 +305,11 @@ pub enum FpmMambaCacheMode {
 /// non-KV memory limit or a capacity that can be scaled to another setting.
 ///
 /// The three optional prefix-caching fields record the settings that the probe
-/// ran with. They are evidence only: selection, sizing and replay do not read
-/// them, and the simulated deployment decides prefix caching.
+/// ran with. Selection and sizing do not read them. Grouped prefix caching
+/// needs `enable_prefix_caching` true and `hash_block_size_tokens`, and replay
+/// then hashes prompts in blocks of `hash_block_size_tokens`. Replay models grouped prefix caching
+/// for vLLM 0.31.0, 0.32.0 and 0.33.0 only. For a linear profile, the simulated
+/// deployment decides prefix caching.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FpmRuntimeMemoryConfig {
@@ -604,7 +609,11 @@ impl ForwardPassPerfModelConfig {
             deployment
                 .get("resources")
                 .cloned()
-                .ok_or_else(|| invalid("FPM deployment requires resources"))?,
+                .ok_or_else(|| {
+                    invalid(
+                        "FPM resources are pending; supply cache_layout, max_num_tokens, max_batch_size, provenance, and kv_bytes_per_token (linear) or cache_groups (grouped) before cache sizing or replay",
+                    )
+                })?,
         )
         .map_err(|error| invalid(format!("FPM resource profile: {error}")))?;
         resources.validate()?;
@@ -672,7 +681,7 @@ impl ForwardPassPerfModelConfig {
         Ok(Some(binding))
     }
 
-    fn fpm_deployment(&self) -> Result<Option<&serde_json::Value>, AicError> {
+    pub(super) fn fpm_deployment(&self) -> Result<Option<&serde_json::Value>, AicError> {
         let Some(profile) = &self.fpm_profile else {
             return Ok(None);
         };
@@ -1773,8 +1782,9 @@ mod tests {
                 .unwrap();
             }
         }
-        // A transfer size above the page of the group is valid: the field
-        // allows bytes beyond the page.
+        // The measured bytes that vLLM 0.32.0 reads for one attention block of
+        // GLM-5.3-Flash at TP 4, against the page of 13,045,120 bytes of the
+        // hand-made vLLM 0.31.0 profile (benchmarks/evidence/nixl-pd-transfer-bytes-20261115/).
         FpmCacheGroup {
             page_size_bytes: 13_045_120,
             transfer_bytes_per_block: Some(21_978_496),

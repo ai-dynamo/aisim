@@ -15,6 +15,7 @@ import yaml
 from aisim._legacy import plugin_entry_points
 
 from . import __version__
+from .data_parser import add_data_parser
 from .detail import parse_detail_sections
 from .package_identity import DISTRIBUTION, program_name
 from .perf_model_cli import add_perf_model_parser
@@ -48,7 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     for command in ("predict", "recommend"):
         child = subparsers.add_parser(command)
-        child.add_argument("-c", "--config", required=True)
+        child.add_argument("-c", "--config", required=True, help="input YAML or JSON file (.json)")
         child.add_argument("--stack", default="engine")
         child.add_argument(
             "--set",
@@ -124,21 +125,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_support_parser(subparsers)
     add_perf_model_parser(subparsers)
+    add_data_parser(subparsers)
     return parser
 
 
 def _load_mapping(path: str) -> dict[str, Any]:
+    from .config.ais_perf_model import reject_repeated_keys
+    from .config.common import load_config_with_text
+
     source = Path(path)
     try:
-        text = source.read_text(encoding="utf-8")
-        value = yaml.safe_load(text)
-    except OSError as exc:
-        raise _CliConfigError(f"could not read configuration {source}: {exc}") from exc
-    except yaml.YAMLError as exc:
-        raise _CliConfigError(f"malformed YAML in {source}: {exc}") from exc
-    if not isinstance(value, dict):
-        raise _CliConfigError(f"configuration {source} must contain one YAML mapping")
-    from .config.ais_perf_model import reject_repeated_keys
+        value, text = load_config_with_text(source)
+    except ValueError as exc:
+        raise _CliConfigError(str(exc)) from exc
 
     # A predict and a recommend config keep ais_perf_model in the same section, so one kind checks both.
     reject_repeated_keys(text, "predict", source)

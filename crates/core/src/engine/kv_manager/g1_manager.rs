@@ -22,6 +22,8 @@ use crate::engine::belady::BeladyOracle;
 use crate::engine::common::protocols::{KvEventPublishers, PrefillCost};
 use crate::engine::common::sequence::RequestSequence;
 
+use super::grouped_prefix::{AdmissionLimits, GroupedPrefixRules};
+use super::grouped_transfer::GroupedTransferRules;
 use super::vllm_backend::{
     BlockRequestLease, DecodeBlockReservation as VllmDecodeBlockReservation,
     DestinationReservation as VllmDestinationReservation,
@@ -90,6 +92,33 @@ impl G1Manager {
         self.inner.grouped()
     }
 
+    pub(crate) fn set_grouped_prefix_rules(
+        &mut self,
+        rules: GroupedPrefixRules,
+        limits: AdmissionLimits,
+    ) {
+        self.inner.set_grouped_prefix_rules(rules, limits);
+    }
+
+    /// The rule table of a grouped cache with prefix caching on.
+    pub(crate) fn grouped_prefix_rules(&self) -> Option<&GroupedPrefixRules> {
+        self.inner.grouped_prefix_rules()
+    }
+
+    pub(crate) fn set_grouped_transfer_rules(&mut self, rules: GroupedTransferRules) {
+        self.inner.set_grouped_transfer_rules(rules);
+    }
+
+    /// The transfer rules of a grouped cache on a prefill or decode rank.
+    pub(crate) fn grouped_transfer(&self) -> Option<&GroupedTransferRules> {
+        self.inner.grouped_transfer()
+    }
+
+    /// The whole-prompt blocks of `known_tokens` without a prefix hit.
+    pub(crate) fn grouped_cold_admission_blocks(&self, known_tokens: usize) -> usize {
+        self.inner.grouped_cold_admission_blocks(known_tokens)
+    }
+
     pub(crate) fn set_belady_oracle(&mut self, oracle: BeladyOracle) {
         self.inner.set_belady_oracle(oracle);
     }
@@ -154,6 +183,10 @@ impl G1Manager {
 
     pub(crate) fn begin_step(&mut self) {
         self.inner.begin_step();
+    }
+
+    pub(crate) fn release_grouped_copy_sources(&mut self) {
+        self.inner.release_grouped_copy_sources();
     }
 
     pub(crate) fn accepts_sequence_length(&self, tokens: usize) -> bool {
@@ -311,8 +344,29 @@ impl G1Manager {
         self.inner.preempt_lease(owner, lease);
     }
 
+    /// Free the grouped blocks that a completed source no longer needs.
+    pub(crate) fn release_skipped_blocks(
+        &mut self,
+        owner: Uuid,
+        lease: &mut BlockRequestLease,
+        computed: usize,
+    ) {
+        self.inner.release_skipped_blocks(owner, lease, computed);
+    }
+
     pub(crate) fn finish_native(&mut self, owner: Uuid, lease: BlockRequestLease) {
         self.inner.finish_lease(owner, lease);
+    }
+
+    /// The prefill cost of a request that `schedule_request` prices itself. A
+    /// grouped prefix cache keeps the hit on the lease for the allocation, so
+    /// it is searched once.
+    pub(crate) fn lookup_native_prefill_cost(
+        &self,
+        sequence: &RequestSequence,
+        lease: &mut BlockRequestLease,
+    ) -> PrefillCost {
+        self.inner.lookup_lease_prefill_cost(sequence, lease)
     }
 
     pub(crate) fn get_native_prefill_cost(
@@ -430,8 +484,13 @@ impl G1Manager {
             .attach_store_source_dependency(owner, snapshot.inner, dependency);
     }
 
-    pub(crate) fn publish_host_pinned_event(&mut self, data: crate::engine::KvEventData) {
-        self.inner.publish_host_pinned_event(data);
+    pub(crate) fn publish_residency_event(
+        &mut self,
+        data: crate::engine::KvEventData,
+        tier: crate::engine::KvEventTier,
+        domain: crate::engine::KvEventDomain,
+    ) {
+        self.inner.publish_residency_event(data, tier, domain);
     }
 
     pub(crate) fn satisfy_native_source_dependency(

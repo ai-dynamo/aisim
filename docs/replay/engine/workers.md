@@ -43,6 +43,7 @@ engine:
 | `workers.<role>.hardware` | `engine.hardware` | fixed | Ordinary workers: `prefill` and `decode` in disaggregated mode only. AFD: fallback for both A/F pools in any role, overridden by explicit pool hardware. One concrete system identifier; `auto` is rejected for ordinary role overrides. |
 | `workers.<role>.context_length` | `engine.context_length` | fixed | Positive token limit. Recommendation accepts it for `prefill` and `decode` and for every AFD role; ordinary aggregated recommendations use `engine.context_length`. See [Context limits](#context-limits). |
 | `workers.<role>.startup_seconds` | `0` | fixed | Nonnegative. Delay before a worker added during the run becomes ready. Initial workers are ready at time zero. |
+| `workers.<role>.wait_power_w` | Unset | predict only | Finite nonnegative watts per GPU for in-pass attention-DP wait. Not accepted on AFD workers. See [attention-DP wait power](#attention-dp-wait-power). |
 | `workers.<role>.parallelism.preset` | Not applicable | `default` | Recommend only. `default` searches the generated parallelism space; a list pins candidate shapes; `false` or `{}` disables presets so the individual fields below define the space. See [search space](../../sweeper/search-space.md). |
 | `workers.<role>.parallelism.replicas` | `1` | Searched | Number of workers in this role. |
 | `workers.<role>.parallelism.tensor` | `1` | Searched | Attention tensor parallelism. |
@@ -75,6 +76,30 @@ do not support image workloads. AFD workers themselves do not accept these field
 
 A backend-specific scheduler field set to a non-default value on another
 backend fails validation.
+
+SGLang's checkpoint-aware `sglang.mamba_cache` is a separate
+[native Replay option](kv-cache.md#native-sglang-mamba-checkpoints), not a field
+under this Python worker schema. It requires an aggregated worker with
+attention DP, prefill context parallelism and pipeline parallelism all equal
+to one. Python prediction YAML and deployment generation do not enable it.
+
+## Attention-DP wait power
+
+Set `engine.workers.<role>.wait_power_w` to an assumed draw per GPU while
+a rank waits on peers inside a forward pass. For example:
+
+```yaml
+engine:
+  workers:
+    aggregated:
+      wait_power_w: 60
+```
+
+Use `aisim predict --stack engine --detail energy` to see estimated
+`step_power_w` and total `attention_dp_wait_ms`. Prefill and decode roles
+can each use a different assumption. AFD workers (`type: afd`) do not accept
+this field. A role with wait and no configured watts
+makes the step estimate unavailable. See the [power contract](../../perf-model/power.md).
 
 ## Context limits
 
@@ -297,7 +322,13 @@ release, so waiting sources may be blocked even when no prefill is running.
 `prefill_schedule_interval: N` admits prefill work only on every `N`-th pass of
 an attention-DP group. It mirrors vLLM's `prefill_schedule_interval`, which
 keeps decode steps balanced across DP ranks. It has an effect only when
-`attention_data` is above 1.
+`attention_data` is above 1. vLLM 0.33.0 also applies the interval without
+data parallelism, and it gives a dense DP rank its own cadence; see vLLM
+v0.33.0 [`scheduler.py:396-425`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L396-L425)
+and [`:780-791`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L780-L791).
+Replay does not model that. A grouped FPM cache with prefix caching on vLLM
+0.33.0 refuses an interval above 1. Where replay accepts the interval, it
+applies it only for `attention_data` above 1.
 
 ```yaml
 engine:

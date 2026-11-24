@@ -31,6 +31,7 @@ from aisim.sweeper.model_hw import parallel_configs_for
 from aisim.sweeper.replay import ReplaySpec
 from aisim.sweeper.sample import unroll_sample
 from aisim_core.ais_perf_model import AisPerfModelDeprecationWarning
+from aisim_core.data.default_systems import default_systems_path
 
 pytestmark = pytest.mark.unit
 
@@ -112,12 +113,11 @@ def timing_systems(profile, tmp_path, monkeypatch):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    import aisim_core
     from aisim_core.sdk.fpm_profile import load_fpm_profile
 
     root = tmp_path / "systems"
     root.mkdir()
-    packaged = Path(aisim_core.__file__).parent / "systems"
+    packaged = Path(default_systems_path())
     (root / "h200_sxm.yaml").write_bytes((packaged / "h200_sxm.yaml").read_bytes())
     rows = []
     for index, deployment in enumerate(load_fpm_profile(profile).deployments):
@@ -520,7 +520,10 @@ def test_speculative_round_prediction_preserves_progress_identity_and_observed_c
     assert rank["timing_model"]["config"]["fpm_profile"]["deployments"][0]["execution_profile"] == execution
     assert report.metrics["completed_requests"] == 2
     assert report.metrics["mean_ttft_ms"] == pytest.approx(7.0)
-    records = report.metadata["native_report"]["per_request"]
+    native = report.metadata["native_report"]
+    assert native["power_w"] is None
+    assert native["power_coverage"] is None
+    records = native["per_request"]
     assert len(records) == 2
     for record in records:
         assert record["output_length"] == 7

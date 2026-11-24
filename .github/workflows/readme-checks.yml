@@ -56,6 +56,10 @@ jobs:
         run: |
           python -m pytest -c /dev/null -p no:cacheprovider scripts/readme/test_readme_commands.py scripts/readme/test_readme_report.py
           python scripts/readme/check_readme_commands.py --validate
+      - name: Prefetch the pinned op-latency data
+        # The README predictions would otherwise download the whole dataset inside a command
+        # that times out after 180 s, and an unauthenticated runner is rate limited.
+        uses: ./.github/actions/prefetch-op-latency-data
       - name: Execute README commands
         env:
           PROFILE: ${{ matrix.profile }}
@@ -154,17 +158,20 @@ jobs:
           RC_JOB_IMAGE: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
         run: |
           wheelhouse="${RUNNER_TEMP}/dynamo-rc-wheels"
+          evidence="${RUNNER_TEMP}/rc-build-environment.json"
           echo "AISIM_RC_WHEELHOUSE=${wheelhouse}" >> "${GITHUB_ENV}"
+          echo "AISIM_RC_EVIDENCE=${evidence}" >> "${GITHUB_ENV}"
           echo "RC_STORAGE_REPO=${RC_STORAGE_REPO}" >> "${GITHUB_ENV}"
           echo "RC_STORAGE_URL=${RC_STORAGE_URL}" >> "${GITHUB_ENV}"
           echo "RC_JOB_IMAGE=${RC_JOB_IMAGE}" >> "${GITHUB_ENV}"
-          python scripts/ci/readme_rc_wheels.py prepare --directory "$wheelhouse"
+          python scripts/ci/readme_rc_wheels.py prepare --directory "$wheelhouse" --evidence "$evidence"
       - name: Preserve RC build-input and runner evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: readme-rc-build-inputs
           path: |
             ${{ env.AISIM_RC_WHEELHOUSE }}/rc-build-inputs.json
+            ${{ env.AISIM_RC_EVIDENCE }}
             ${{ runner.temp }}/rc-runner-environment.txt
           overwrite: true
           if-no-files-found: error
