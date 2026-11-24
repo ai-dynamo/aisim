@@ -427,6 +427,7 @@ def native_publication_lock(output: Path, inherited_fd: int | None = None):
     # Keep the inode stable across attempts. Closing the descriptor after an
     # exception or process death releases ownership without stale-lock guessing.
     output.parent.mkdir(parents=True, exist_ok=True)
+    output = output.resolve()
     path = output.with_name(f".{output.name}.publication-lock")
     with path.open("a+b") if inherited_fd is None else os.fdopen(os.dup(inherited_fd), "a+b") as lock:
         if not os.path.samestat(os.fstat(lock.fileno()), path.stat()):

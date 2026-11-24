@@ -238,6 +238,33 @@ def test_standalone_shares_supervisor_lock(tmp_path, monkeypatch):
     assert calls == [str(output)]
 
 
+@pytest.mark.parametrize("alias", [False, True])
+def test_supervisor_and_child_share_the_target_lock(tmp_path, monkeypatch, alias):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as module
+
+    target = tmp_path / "rows.txt"
+    output = tmp_path / "generation.txt" if alias else target
+    if alias:
+        output.symlink_to(target)
+    popen = subprocess.Popen
+
+    def launch(command, **kwargs):
+        child_path = command[command.index("--output") + 1]
+        fd = int(command[command.index("--publication-lock-fd") + 1])
+        assert child_path == str(target)
+        code = (
+            "from pathlib import Path\nfrom collector.helper import native_publication_lock\n"
+            f"path = Path({child_path!r})\nwith native_publication_lock(path, {fd}): path.write_text('measured')"
+        )
+        return popen([sys.executable, "-c", code], **kwargs)
+
+    monkeypatch.setattr(module.subprocess, "Popen", launch)
+    case = ModuleCase(4096, 1, 96, "fp8", "bfloat16", "bfloat16", MODEL, 0)
+    module._run_native_case(case, "cuda:0", output)
+    assert output.read_text() == "measured"
+    assert output.is_symlink() == alias
+
+
 @pytest.mark.parametrize("fail_after_write", [False, True])
 def test_standalone_publishes_only_after_rank_join(tmp_path, monkeypatch, fail_after_write):
     import collector.sglang.collect_kimi_k31_dsa_v1 as module
