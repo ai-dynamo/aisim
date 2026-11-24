@@ -101,7 +101,8 @@ def test_local_kimi_linear_targets_honor_explicit_gemm_mode(local_kimi, caller):
     with pytest.raises(ValueError, match="Unsupported compressed-tensors algorithm 'w4a16_mxfp4' for attention"):
         build()
 
-    result = build(gemm_quant_mode="bfloat16")
+    explicit_gemm = "bfloat16" if caller == "compile_engine" else common.GEMMQuantMode.bfloat16
+    result = build(gemm_quant_mode=explicit_gemm)
     if caller == "compile_engine":
         spec = json.loads(_native.engine_spec_json_from_bincode(result))
         assert spec["engine"]["weight_dtype"] == "bfloat16"
