@@ -260,6 +260,13 @@ re-estimates it from the survivors. Fully idle workers reset it; queued or
 transfer-held work does not. A skipped decode waiting for an in-flight
 completion neither retracts requests nor decays the ratio.
 
+The output budget in these checks is the request's requested maximum, as
+SGLang reserves room for `max_new_tokens`. A Rust API request that carries
+exact output tokens and a larger `max_output_tokens` stops generating at the
+exact tokens, while admission, the running reservation, the retraction
+estimate and decode preallocation keep using `max_output_tokens`. Workload
+files require the two to be equal, so they are unaffected.
+
 ### SGLang computed KV at completion
 
 Sampling an output token does not compute that token's KV. Prefill commits

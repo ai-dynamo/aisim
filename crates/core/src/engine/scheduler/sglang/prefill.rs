@@ -53,7 +53,7 @@ pub(super) fn get_new_batch_prefill(
         .iter()
         .map(|req| {
             let remaining_output = req
-                .remaining_output_tokens()
+                .remaining_budget_tokens()
                 .min(config.clip_max_new_tokens);
             remaining_output as f64 * new_token_ratio
         })
@@ -137,7 +137,7 @@ pub(super) fn get_new_batch_prefill(
             let remaining_total = capacity as f64 - total_offset;
             let whole_request_tokens = (extend_input + host_tokens) as f64
                 + req
-                    .remaining_output_tokens()
+                    .remaining_budget_tokens()
                     .min(config.clip_max_new_tokens) as f64
                 + config.block_size as f64;
             if first_admission && whole_request_tokens >= remaining_total {
@@ -170,7 +170,7 @@ pub(super) fn get_new_batch_prefill(
             let output_reserve = if chunk_tokens < extend_input {
                 0
             } else {
-                req.max_output_tokens.min(config.clip_max_new_tokens)
+                req.budget_max_output_tokens.min(config.clip_max_new_tokens)
             };
 
             if host_tokens > 0 {
