@@ -70,8 +70,11 @@ def main() -> None:
         report["record_sha256"] = hashlib.sha256(overlays[LIFECYCLE_RECORD]).hexdigest()
     if not lifecycle:
         report["scenarios_sha256"] = hashlib.sha256(overlays[SCENARIOS]).hexdigest()
+    revisions = {
+        side: git("rev-parse", "--verify", f"{getattr(args, side)}^{{commit}}") for side in ("baseline", "candidate")
+    }
     for side in ("baseline", "candidate"):
-        revision = git("rev-parse", "--verify", f"{getattr(args, side)}^{{commit}}")
+        revision = revisions[side]
         snapshot = work / side
         snapshot.mkdir()
         archive = work / f"{side}.tar"

@@ -123,7 +123,24 @@ and its LICENSE for provenance, the preserved license, and each local correction
                      ..Default::default()
                  }])
              }
-@@ -503,6 +541,14 @@
+@@ -471,9 +509,16 @@
+                 if let Some(transfer) = transfers.first()
+                     && let Some(host_indices) = &transfer.host_indices
+                 {
++                    let was_device_leaf = tree_core.evictable_device_leaves.contains(node_id);
+                     tree_core
+                         .arena
+                         .set_host_value(node_id, FULL, host_indices.copy_for_adoption());
++                    // A usable Full backup permits demotion even while an
++                    // auxiliary host receipt keeps the anchor alive.
++                    tree_core.update_evictable_leaf_sets_(node_id);
++                    if !was_device_leaf && tree_core.evictable_device_leaves.contains(node_id) {
++                        tree_core.full_evict_device_heap_dirty = true;
++                    }
+                 }
+             }
+             CacheTransferPhase::LoadBack => {
+@@ -503,6 +548,14 @@
                              tree_core.inc_evictable_size(FULL, n_len);
                          }
                          tree_core.update_evictable_leaf_sets_(loaded_idx);
@@ -151,7 +168,24 @@ and its LICENSE for provenance, the preserved license, and each local correction
          MambaComponent {
              // A donated checkpoint must land on both the model's chunk grid and
              // a radix-node boundary. `params.page_size` is already widened by DCP.
-@@ -145,8 +149,9 @@
+@@ -114,6 +118,16 @@
+             LRURefreshPhase::MatchEnd => {
+                 if tree_core.arena.has_device_value(node_id, MAMBA) {
+                     tree_core.device_lru_list_mut(MAMBA).reset_node_mru(node_id);
++                    // A match can move the saved victim behind other candidates.
++                    // Preserve incremental walking unless that victim moved.
++                    if tree_core.component_state(MAMBA).is_evict_device_ongoing
++                        && tree_core.component_state(MAMBA).evict_device_cursor == Some(node_id)
++                    {
++                        let cursor = tree_core
++                            .device_lru_list(MAMBA)
++                            .get_lru_no_lock(&tree_core.arena);
++                        tree_core.component_state_mut(MAMBA).evict_device_cursor = cursor;
++                    }
+                 }
+             }
+             LRURefreshPhase::InsertEnd => {}
+@@ -145,8 +159,9 @@
          _params: &MatchPrefixParams<'_, K>,
          _value_chunks: &[V],
          _best_value_len: usize,
@@ -162,7 +196,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
 
          // Full KV may extend beyond the latest reusable Mamba state. The branching
          // point is the last checkpoint-grid-aligned position within the Full-KV hit
-@@ -184,14 +189,14 @@
+@@ -184,14 +199,14 @@
          if is_new_leaf {
              tree_core
                  .arena
@@ -179,7 +213,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              let tick = tree_core.arena.get_and_bump_access_counter();
              tree_core.arena.node_mut(node_id).last_access_counter = tick;
              self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);
-@@ -371,9 +376,12 @@
+@@ -371,9 +386,12 @@
              "finish the pending internal Mamba eviction before advancing"
          );
          let mut cursor = tree_core.component_state(MAMBA).evict_device_cursor;
@@ -195,7 +229,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              cursor = tree_core
                  .device_lru_list(MAMBA)
                  .get_lru_no_lock(&tree_core.arena);
-@@ -557,6 +565,7 @@
+@@ -557,6 +575,7 @@
                          name: PoolName::Mamba,
                          host_indices: Some(host_value.shallow_clone()),
                          nodes_to_load: Some(vec![node.id]),
@@ -784,6 +818,18 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let tick = self.arena.get_and_bump_access_counter();
          let node = self.arena.node_mut(node_id);
          node.last_access_counter = tick;
+@@ -1728,10 +1778,10 @@
+         if node.evicted() || chunked {
+             return false;
+         }
++        node.hit_count += 1;
+         if self.is_write_back {
+             return false;
+         }
+-        node.hit_count += 1;
+
+         if self.enable_external_cache_linker {
+             return Self::needs_external_linker_offload_(node)
 @@ -1767,8 +1817,15 @@
      /// root first: access tick and LRU refresh, priority floor, hit count, and the
      /// write-through backup trigger, at O(depth) cost. A chunked insert never bumps
@@ -885,7 +931,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          }
          self.validate_insert_anchor_(prefix_node_idx, prefix_len, params)?;
          if aligned_key_len > 0
-@@ -1942,23 +2009,51 @@
+@@ -1942,23 +2009,52 @@
          let mut prefix_actions = Vec::new();
          self.visit_retained_prefix_(prefix_node_idx, params, &mut prefix_actions);
          if aligned_key_len == prefix_len {
@@ -900,9 +946,10 @@ and its LICENSE for provenance, the preserved license, and each local correction
 +                // The empty root never adopts a donation. An existing retained
 +                // checkpoint also leaves the extra slot with the caller.
 +                mamba_exist: true,
-+                swa_branch_inserted: params
-+                    .swa_branching_seqlen
-+                    .is_some_and(|boundary| aligned_key_len >= boundary),
++                swa_branch_inserted: self.try_component_by_type_(SWA).is_some()
++                    && params
++                        .swa_branching_seqlen
++                        .is_some_and(|boundary| aligned_key_len >= boundary),
 +                adopted_ranges: params.track_adopted_ranges.then(HashMap::new),
 +                unmatched_device_suffix: None,
 +                cache_actions: Vec::new(),
@@ -953,7 +1000,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              });
          }
          // The walk owns only [prefix_len, aligned_key_len); the ragged tail and
-@@ -1966,6 +2061,7 @@
+@@ -1966,6 +2062,7 @@
          self.ongoing_insert_walk_state = Some(InsertWalkState {
              phase: InsertPhase::Walk,
              node_id: prefix_node_idx,
@@ -961,7 +1008,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              key: K::from(params.key.as_ref()[prefix_len..aligned_key_len].to_vec()),
              key_offset: prefix_len,
              aligned_key_len,
-@@ -1983,6 +2079,7 @@
+@@ -1983,6 +2080,7 @@
              total_prefix_length: prefix_len,
              is_new_leaf: false,
              target_node_id: None,
@@ -969,7 +1016,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              result: Some(InsertResult {
                  total_len: aligned_key_len,
                  adopted_ranges: params.track_adopted_ranges.then(HashMap::new),
-@@ -2008,7 +2105,8 @@
+@@ -2008,7 +2106,8 @@
      /// bumps its hit count, which is where write-through backups originate. A
      /// non-chunked continuation replays that root first so LRU, LFU/SLRU, and
      /// write-through behavior match a root insert. Chunked inserts never bump hit
@@ -979,7 +1026,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
      fn visit_retained_prefix_(
          &mut self,
          anchor: NodeIdx_,
-@@ -2090,10 +2188,42 @@
+@@ -2090,10 +2189,42 @@
      }
 
      /// Fallible variant of [`Self::resume_insert`].
@@ -1025,7 +1072,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          Ok(self.advance_insert_())
      }
 
-@@ -2172,10 +2302,18 @@
+@@ -2172,10 +2303,18 @@
              return;
          };
          let mut node_id = child_id;
@@ -1044,7 +1091,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              let (split_node_id, action) = self.split_node_(node_id, prefix_len);
              node_id = split_node_id;
              if let Some(action) = action {
-@@ -2185,6 +2323,7 @@
+@@ -2185,6 +2324,7 @@
          {
              let node = self.arena.node_mut(node_id);
              node.priority = node.priority.max(state.priority);
@@ -1052,7 +1099,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          }
 
          let params = InsertParams {
-@@ -2326,6 +2465,7 @@
+@@ -2326,6 +2466,7 @@
              state.node_id
          };
          state.target_node_id = Some(target_node_id);
@@ -1060,7 +1107,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
 
          // Finalize: let each component attach its data to the target node.
          // e.g. Mamba attaches mamba_value to the leaf node
-@@ -2336,7 +2476,7 @@
+@@ -2336,7 +2477,7 @@
              .as_mut()
              .expect("insert result exists during commit");
          result.prefix_len = state.total_prefix_length;
@@ -1069,7 +1116,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let params = InsertParams {
              rotation_base: state.rotation_base,
              key: &state.key,
-@@ -2387,6 +2527,10 @@
+@@ -2387,6 +2528,10 @@
              return self.inc_hit_count_and_check_(target_node_id, state.chunked);
          }
 
@@ -1080,7 +1127,27 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let node = self.arena.node(target_node_id);
          self.enable_hicache
              && node.backuped()
-@@ -2963,13 +3107,18 @@
+@@ -2614,6 +2759,9 @@
+
+         self.update_evictable_leaf_sets_(new_node_id);
+         self.update_evictable_leaf_sets_(parent_id);
++        if self.evictable_device_leaves.contains(new_node_id) {
++            self.full_evict_device_heap_dirty = true;
++        }
+         self.record_store_event_(new_node_id, StorageMedium::Gpu, session_id);
+         new_node_id
+     }
+@@ -2637,6 +2785,9 @@
+             self.inc_evictable_size(FULL, tokens);
+         }
+         self.update_evictable_leaf_sets_(node_id);
++        if self.evictable_device_leaves.contains(node_id) {
++            self.full_evict_device_heap_dirty = true;
++        }
+         self.update_full_coexisting_host_tracking_(node_id);
+         if let Some(parent_id) = self.arena.node(node_id).try_parent() {
+             self.update_evictable_leaf_sets_(parent_id);
+@@ -2963,13 +3114,18 @@
              .values()
              .copied()
              .collect();
@@ -1099,7 +1166,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          }
          for &desc_id in descendants.iter().rev() {
              {
-@@ -2991,12 +3140,17 @@
+@@ -2991,12 +3147,17 @@
              );
              self.remove_leaf_from_parent_(desc_id);
          }
@@ -1117,7 +1184,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          Ok((true, result))
      }
 
-@@ -3178,7 +3332,7 @@
+@@ -3178,7 +3339,7 @@
      ) -> Result<EvictionStepResult<V>, TreeCoreRuntimeError> {
          let node_id = self.arena.resolve(node_id)?;
          let mut result = EvictionStepResult::default();
@@ -1126,7 +1193,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          if self.arena.node(node_id).is_load_back_pending() {
              return Ok(result);
          }
-@@ -3190,6 +3344,12 @@
+@@ -3190,6 +3351,12 @@
                      evicted: node.evicted(),
                      backuped: node.backuped(),
                  });
@@ -1139,7 +1206,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              }
          }
          self.demote_(
-@@ -3494,6 +3654,12 @@
+@@ -3494,6 +3661,12 @@
              return false;
          }
          if node.is_device_locked() {
@@ -1152,7 +1219,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              return false;
          }
          if node.is_load_back_pending() {
-@@ -3834,6 +4000,33 @@
+@@ -3834,6 +4007,33 @@
          if !anchor.is_root() && anchor.namespace.as_ref() != namespace {
              return Err(TreeCoreRuntimeError::InsertHostNamespaceMismatch { node_id: anchor.id });
          }
@@ -1186,7 +1253,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          self.touch_node_(node_id);
          if total_len == 0 {
              return Ok(InsertResult {
-@@ -3846,6 +4039,7 @@
+@@ -3846,6 +4046,7 @@
                  mamba_exist: true,
                  swa_branch_inserted: false,
                  adopted_ranges: None,
@@ -1194,7 +1261,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
                  cache_actions: Vec::new(),
              });
          }
-@@ -3887,6 +4081,7 @@
+@@ -3887,6 +4088,7 @@
              mamba_exist: false,
              swa_branch_inserted: false,
              adopted_ranges: None,
@@ -1202,7 +1269,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              cache_actions,
          };
          if matched_length == total_len {
-@@ -4072,7 +4267,21 @@
+@@ -4072,7 +4274,21 @@
              )
      }
 
@@ -1224,7 +1291,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
      pub fn build_load_back_spec(
          &self,
          node_id: NodeId,
-@@ -4086,6 +4295,7 @@
+@@ -4086,6 +4302,7 @@
      > {
          let anchor_id = node_id;
          let node_id = self.arena.resolve(node_id)?;
@@ -1232,7 +1299,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          // Component hooks take primitives, not Req: extract its fields here.
          let mamba_pool_idx = req.and_then(|r| r.mamba_pool_idx.as_ref());
          let mut kv_transfers = self
-@@ -4147,6 +4357,8 @@
+@@ -4147,6 +4364,8 @@
                  name: PoolName::Kv,
                  host_indices: Some(V::empty()),
                  nodes_to_load: Some(Vec::new()),
@@ -1241,7 +1308,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
                  ..Default::default()
              };
              return Ok((empty_kv, HashMap::new()));
-@@ -4389,9 +4601,14 @@
+@@ -4389,9 +4608,14 @@
          cache_actions: &mut Vec<CacheAction<V>>,
          mut insert_result: Option<&mut InsertResult<V>>,
          pool_storage_result: Option<&PoolTransferResult>,
@@ -1257,7 +1324,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          if let Some(insert_result) = insert_result.as_deref() {
              if let Some(last_device_node_id) = insert_result.last_device_node_id {
                  self.arena.resolve(last_device_node_id)?;
-@@ -4415,15 +4632,78 @@
+@@ -4415,15 +4639,78 @@
          Ok(())
      }
 
@@ -1337,7 +1404,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let mut cache_actions: Vec<CacheAction<V>> = Vec::new();
          if !host_indices.is_empty() {
              let kv_xfer = PoolTransfer {
-@@ -4469,9 +4749,10 @@
+@@ -4469,9 +4756,10 @@
          device_indices: V,
          mut kv_xfer: PoolTransfer<V>,
          comp_xfers: HashMap<ComponentType, Vec<PoolTransfer<V>>>,
@@ -1349,7 +1416,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let loaded_node_indices = kv_xfer
              .nodes_to_load
              .iter()
-@@ -4479,6 +4760,127 @@
+@@ -4479,6 +4767,127 @@
              .map(|&loaded_id| self.arena.resolve(loaded_id))
              .collect::<Result<Vec<_>, _>>()?;
          self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
@@ -1477,7 +1544,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let mut cache_actions: Vec<CacheAction<V>> = Vec::new();
          kv_xfer.device_indices = Some(device_indices);
          let nodes_to_load = kv_xfer.nodes_to_load.clone();
-@@ -4547,6 +4949,9 @@
+@@ -4547,6 +4956,9 @@
                  self.arena.node_mut(idx).load_back_pending_id = None;
                  // The pin blocked leaf-set membership; re-evaluate it.
                  self.update_evictable_leaf_sets_(idx);
@@ -1487,7 +1554,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              }
              self.update_full_coexisting_host_tracking_(idx);
              node_id = self.arena.node(idx).try_parent();
-@@ -4709,8 +5114,12 @@
+@@ -4709,8 +5121,12 @@
              if node.write_through_pending_id == Some(ack_id) {
                  node.write_through_pending_id = None;
                  self.update_full_coexisting_host_tracking_(node_idx);
@@ -1502,7 +1569,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          }
          Ok(())
      }
-@@ -4829,6 +5238,11 @@
+@@ -4829,6 +5245,11 @@
          for &(child_id, pos, prefix_len) in &spans {
              if pos + prefix_len <= window_start {
                  continue;
@@ -1514,7 +1581,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              }
              if self.arena.has_device_value(child_id, SWA) {
                  return Err(format!(
-@@ -5601,14 +6015,7 @@
+@@ -5601,14 +6022,7 @@
      /// Whether the node is currently eligible as a Full device leaf.
      pub fn inspect_is_device_leaf(&self, node_id: NodeId) -> Result<bool, NodeAccessError> {
          let node_id = self.arena.resolve(node_id)?;
@@ -1530,7 +1597,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
      }
 
      /// Materialize every live tree node handle.
-@@ -5833,6 +6240,12 @@
+@@ -5833,6 +6247,12 @@
          let last_device_node_idx = self.arena.resolve(result.last_device_node_id)?;
          self.arena.resolve(result.last_host_node_id)?;
          let best_match_node_idx = self.arena.resolve(result.best_match_node_id)?;
@@ -1543,7 +1610,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          Ok(self
              .component_by_type_(component_type)
              .finalize_match_result_in_tree_core(
-@@ -5843,6 +6256,7 @@
+@@ -5843,6 +6263,7 @@
                  params,
                  value_chunks,
                  best_value_len,

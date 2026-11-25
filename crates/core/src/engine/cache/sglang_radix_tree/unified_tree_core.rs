@@ -1778,10 +1778,10 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         if node.evicted() || chunked {
             return false;
         }
+        node.hit_count += 1;
         if self.is_write_back {
             return false;
         }
-        node.hit_count += 1;
 
         if self.enable_external_cache_linker {
             return Self::needs_external_linker_offload_(node)
@@ -2019,9 +2019,10 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 // The empty root never adopts a donation. An existing retained
                 // checkpoint also leaves the extra slot with the caller.
                 mamba_exist: true,
-                swa_branch_inserted: params
-                    .swa_branching_seqlen
-                    .is_some_and(|boundary| aligned_key_len >= boundary),
+                swa_branch_inserted: self.try_component_by_type_(SWA).is_some()
+                    && params
+                        .swa_branching_seqlen
+                        .is_some_and(|boundary| aligned_key_len >= boundary),
                 adopted_ranges: params.track_adopted_ranges.then(HashMap::new),
                 unmatched_device_suffix: None,
                 cache_actions: Vec::new(),
@@ -2758,6 +2759,9 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
 
         self.update_evictable_leaf_sets_(new_node_id);
         self.update_evictable_leaf_sets_(parent_id);
+        if self.evictable_device_leaves.contains(new_node_id) {
+            self.full_evict_device_heap_dirty = true;
+        }
         self.record_store_event_(new_node_id, StorageMedium::Gpu, session_id);
         new_node_id
     }
@@ -2781,6 +2785,9 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             self.inc_evictable_size(FULL, tokens);
         }
         self.update_evictable_leaf_sets_(node_id);
+        if self.evictable_device_leaves.contains(node_id) {
+            self.full_evict_device_heap_dirty = true;
+        }
         self.update_full_coexisting_host_tracking_(node_id);
         if let Some(parent_id) = self.arena.node(node_id).try_parent() {
             self.update_evictable_leaf_sets_(parent_id);

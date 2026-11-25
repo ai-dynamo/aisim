@@ -509,9 +509,16 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for FullComponent {
                 if let Some(transfer) = transfers.first()
                     && let Some(host_indices) = &transfer.host_indices
                 {
+                    let was_device_leaf = tree_core.evictable_device_leaves.contains(node_id);
                     tree_core
                         .arena
                         .set_host_value(node_id, FULL, host_indices.copy_for_adoption());
+                    // A usable Full backup permits demotion even while an
+                    // auxiliary host receipt keeps the anchor alive.
+                    tree_core.update_evictable_leaf_sets_(node_id);
+                    if !was_device_leaf && tree_core.evictable_device_leaves.contains(node_id) {
+                        tree_core.full_evict_device_heap_dirty = true;
+                    }
                 }
             }
             CacheTransferPhase::LoadBack => {

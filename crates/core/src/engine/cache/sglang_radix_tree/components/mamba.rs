@@ -118,6 +118,16 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for MambaComponent {
             LRURefreshPhase::MatchEnd => {
                 if tree_core.arena.has_device_value(node_id, MAMBA) {
                     tree_core.device_lru_list_mut(MAMBA).reset_node_mru(node_id);
+                    // A match can move the saved victim behind other candidates.
+                    // Preserve incremental walking unless that victim moved.
+                    if tree_core.component_state(MAMBA).is_evict_device_ongoing
+                        && tree_core.component_state(MAMBA).evict_device_cursor == Some(node_id)
+                    {
+                        let cursor = tree_core
+                            .device_lru_list(MAMBA)
+                            .get_lru_no_lock(&tree_core.arena);
+                        tree_core.component_state_mut(MAMBA).evict_device_cursor = cursor;
+                    }
                 }
             }
             LRURefreshPhase::InsertEnd => {}

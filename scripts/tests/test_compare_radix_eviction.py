@@ -28,6 +28,7 @@ class CompareRadixTests(unittest.TestCase):
         corrupt_observation=False,
         extra_observation=False,
         missing_observation=False,
+        advance_head=False,
     ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -106,15 +107,28 @@ class CompareRadixTests(unittest.TestCase):
                     self.assertEqual((kwargs["cwd"] / relative).read_bytes(), contents, f"{side}: {relative}")
                     # A deterministic edit during each simulated Cargo build.
                     (checkout / relative).write_bytes(f"edited during {side}\n".encode())
+                if advance_head and side == "baseline":
+                    (checkout / module).write_text("// changed module\n")
+                    git("add", ".")
+                    git(
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.invalid",
+                        "commit",
+                        "--quiet",
+                        "-m",
+                        "advance during baseline build",
+                    )
                 Path(kwargs["env"]["AISIM_EVICTION_EVIDENCE_OUTPUT"]).write_text(json.dumps(observations))
                 return subprocess.CompletedProcess(command, 0)
 
             argv = [
                 "compare_radix_eviction.py",
                 "--baseline",
-                revision,
+                "HEAD" if advance_head else revision,
                 "--candidate",
-                revision,
+                "HEAD" if advance_head else revision,
                 "--work-dir",
                 str(work),
                 "--probe",
@@ -136,6 +150,11 @@ class CompareRadixTests(unittest.TestCase):
 
             self.assertEqual(builds, ["baseline", "candidate"])
             report = json.loads((work / "comparison.json").read_text())
+            if advance_head:
+                self.assertNotEqual(git("rev-parse", "HEAD"), revision)
+            for side in builds:
+                self.assertEqual(report[side]["commit"], revision)
+                self.assertEqual((work / side / module).read_bytes().splitlines()[0], b"// original module")
             self.assertEqual(report["probe_sha256"], hashlib.sha256(overlays[probe]).hexdigest())
             if not lifecycle:
                 self.assertEqual(report["scenarios_sha256"], hashlib.sha256(overlays[compare.SCENARIOS]).hexdigest())
@@ -146,6 +165,11 @@ class CompareRadixTests(unittest.TestCase):
 
     def test_selection_overlays_stay_frozen_during_builds(self):
         self.check_frozen_overlays("selection")
+
+    def test_both_head_revisions_stay_frozen_during_builds(self):
+        for mode in ("selection", "lifecycle"):
+            with self.subTest(mode=mode):
+                self.check_frozen_overlays(mode, advance_head=True)
 
     def test_lifecycle_rejects_a_changed_recorded_removal_hash(self):
         self.check_frozen_overlays("lifecycle", corrupt_record=True)

@@ -53,8 +53,10 @@ following local corrections to this pinned revision:
 - Serialize Full load-backs per anchor, rejecting planning or commit while its
   earlier Full source pin is pending. A rejected operation has no acknowledgment;
   retry only after the owning operation is acknowledged.
-- Refresh an active Full eviction heap when a write-through restore exposes an
-  eligible leaf, and use the production eligibility predicate for inspection.
+- Refresh an active Full eviction heap when a resumed insert, device restore,
+  or Full backup with a live auxiliary host receipt exposes an eligible leaf.
+  Refresh backup eligibility through both commit entrypoints, and use the
+  production eligibility predicate for inspection.
 - Report an unmatched split suffix's pre-access tick in match/insert results.
   Belady records that tick at the physical tail, including on the first partial
   access before any eviction; an actual suffix access clears the correction.
@@ -70,7 +72,11 @@ following local corrections to this pinned revision:
 - Rebuild Full eviction candidates after accesses and final device-lock releases,
   including buried MRU priority improvements, and recheck popped priorities. Preserve skipped Full host and
   SWA early-release lock receipts. Revalidate saved Mamba/SWA device cursors
-  against newly acquired component locks before taking values.
+  against newly acquired component locks before taking values. Reselect the
+  Mamba cursor when a match moves its saved victim to MRU, preserving the
+  incremental walk when other nodes are matched.
+- Count resident, non-chunked insert hits for LFU in write-back mode while
+  keeping write-through backup scheduling disabled for that mode.
 - Reject zero Mamba chunk sizes, copy donated Mamba slots for adoption, and
   compare SWA continuation boundaries against the complete insert length.
 - Reject missing Mamba donations and donations with other than one slot before
@@ -83,7 +89,8 @@ following local corrections to this pinned revision:
   and write-back leaves can still request a backup, without deleting the anchor.
 - Validate continuation key content in release builds during the existing
   ancestor walk, return retained-prefix backup actions for empty suffixes, and
-  report reached SWA branch boundaries for those empty continuations.
+  report reached SWA branch boundaries for those empty continuations only when
+  SWA is registered.
 - Keep stable cursor and commit-target handles for suspended insert walks.
   Reject resumption before mutation if eviction deleted either node, including
   when another node has reused its arena slot.

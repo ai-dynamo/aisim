@@ -1988,6 +1988,32 @@ fn scoped_review_empty_swa_continuation_reports_reached_boundaries() {
 }
 
 #[test]
+fn scoped_review_empty_continuation_reports_a_branch_only_with_swa() {
+    for with_swa in [false, true] {
+        let mut tree = Core::new(
+            CacheInitParams {
+                swa_sliding_window_size: with_swa.then_some(2),
+                ..Default::default()
+            },
+            if with_swa {
+                vec![FULL, SWA]
+            } else {
+                vec![FULL]
+            },
+        );
+        let key = vec![10, 20];
+        let anchor = insert(&mut tree, key.clone(), &[1, 2]);
+        let mut p = params(&key, &[]);
+        p.prev_prefix_len = 2;
+        p.swa_branching_seqlen = Some(2);
+        let result = tree.insert_suffix_from_node(anchor, 2, &p);
+        assert_eq!(result.swa_branch_inserted, with_swa);
+        assert_eq!(result.last_device_node_id, Some(anchor));
+        tree.try_sanity_check(&[], &[]).unwrap();
+    }
+}
+
+#[test]
 fn early_swa_release_honors_skip_and_releases_acquired_mamba() {
     let mut tree = Core::new(
         CacheInitParams {
@@ -2481,6 +2507,157 @@ fn mru_walk_refreshes_buried_improvements_before_selecting() {
         let (victim, _) = tree.evict_device_next_node(FULL, &HashMap::new());
         assert_eq!(victim, Some(if touch_a { a } else { b }));
         tree.evict_device_end(FULL);
+        tree.try_sanity_check(&[], &[]).unwrap();
+    }
+}
+
+#[test]
+fn scoped_review_mamba_walk_uses_current_lru_after_a_match() {
+    for touch_a in [false, true] {
+        let mut tree = Core::new(
+            CacheInitParams {
+                mamba_cache_chunk_size: Some(1),
+                ..Default::default()
+            },
+            vec![FULL, MAMBA],
+        );
+        let a_key = vec![10, 20];
+        let mut p = params(&a_key, &[1, 2]);
+        p.mamba_value = Some(PageValue::from_vec(vec![100]));
+        let a = tree.insert(&p).last_device_node_id.unwrap();
+        let b_key = vec![30, 40];
+        let mut p = params(&b_key, &[3, 4]);
+        p.mamba_value = Some(PageValue::from_vec(vec![101]));
+        let b = tree.insert(&p).last_device_node_id.unwrap();
+        tree.evict_device_start(MAMBA, 1);
+        if touch_a {
+            tree.match_prefix(&MatchPrefixParams {
+                key: &a_key,
+                namespace: Default::default(),
+            });
+        }
+        let (victim, _) = tree.evict_device_next_node(MAMBA, &HashMap::new());
+        let expected = if touch_a { b } else { a };
+        assert_eq!(victim, Some(expected));
+        let (_, step) = tree.evict_device_leaf(expected, false).unwrap();
+        assert_eq!(
+            step.device_frees[&MAMBA][0].as_slice(),
+            &[if touch_a { 101 } else { 100 }]
+        );
+        tree.evict_device_end(MAMBA);
+        tree.try_sanity_check(&[], &[]).unwrap();
+    }
+}
+
+#[test]
+fn scoped_review_write_back_lfu_counts_hits_without_scheduling_backups() {
+    for write_back in [false, true] {
+        let mut tree = Core::new(
+            CacheInitParams {
+                enable_hicache: true,
+                is_write_back: write_back,
+                eviction_policy: "lfu".into(),
+                write_through_threshold: 2,
+                ..Default::default()
+            },
+            vec![FULL],
+        );
+        let key = vec![10, 20];
+        let a = insert(&mut tree, key.clone(), &[1, 2]);
+        for _ in 0..2 {
+            let result = tree.insert(&params(&key, &[3, 4]));
+            assert_eq!(
+                result
+                    .cache_actions
+                    .iter()
+                    .any(|a| matches!(a, CacheAction::BackupKV(_))),
+                !write_back
+            );
+        }
+        assert_eq!(tree.inspect_get_node_hit_count(a).unwrap(), 3);
+        let b = insert(&mut tree, vec![30, 40], &[5, 6]);
+        tree.evict_device_start(FULL, 1);
+        assert_eq!(
+            tree.evict_device_next_node(FULL, &HashMap::new()).0,
+            Some(b)
+        );
+        tree.evict_device_end(FULL);
+        tree.try_sanity_check(&[], &[]).unwrap();
+    }
+}
+
+#[test]
+fn scoped_review_resumed_insert_refreshes_the_active_full_walk() {
+    let mut tree = Core::new(
+        CacheInitParams {
+            enable_hicache: true,
+            write_through_threshold: 2,
+            ..Default::default()
+        },
+        vec![FULL],
+    );
+    let parent = insert(&mut tree, vec![10, 20], &[1, 2]);
+    let key = vec![10, 20, 30, 40];
+    let step = tree.begin_insert(&params(&key, &[3, 4, 5, 6]));
+    assert!(step.result.is_none());
+    assert!(step.actions.iter().any(|action| matches!(action,
+        CacheAction::BackupKV(backup) if backup.node_ids == vec![parent])));
+    // A failed backup adopts no rows. Starting eviction while the insert is
+    // suspended snapshots the parent, before the suffix leaf exists.
+    tree.evict_device_start(FULL, 1);
+    let result = tree.try_resume_insert().unwrap().result.unwrap();
+    let leaf = result.last_device_node_id.unwrap();
+    assert_ne!(leaf, parent);
+    assert_eq!(
+        tree.evict_device_next_node(FULL, &HashMap::new()).0,
+        Some(leaf)
+    );
+    let (_, step) = tree.evict_device_leaf(leaf, false).unwrap();
+    assert_eq!(step.device_frees[&FULL][0].as_slice(), &[5, 6]);
+    tree.evict_device_end(FULL);
+    tree.try_sanity_check(&[], &[]).unwrap();
+}
+
+#[test]
+fn scoped_review_full_backup_refreshes_eligibility_with_a_live_host_receipt() {
+    for generic_entrypoint in [false, true] {
+        let mut tree = Core::new(
+            CacheInitParams {
+                enable_hicache: true,
+                mamba_cache_chunk_size: Some(1),
+                ..Default::default()
+            },
+            vec![FULL, MAMBA],
+        );
+        let key = vec![10, 20];
+        let mut p = params(&key, &[1, 2]);
+        p.mamba_value = Some(PageValue::from_vec(vec![100]));
+        let leaf = tree.insert(&p).last_device_node_id.unwrap();
+        let receipt = tree.inc_host_lock_ref(leaf).unwrap();
+        assert!(receipt.skipped_lock_components.contains(FULL));
+        tree.evict_device_start(FULL, 1);
+        assert_eq!(tree.evict_device_next_node(FULL, &HashMap::new()).0, None);
+        commit_staged_backup(
+            &mut tree,
+            leaf,
+            vec![101, 102],
+            HashMap::new(),
+            generic_entrypoint,
+        )
+        .unwrap();
+        let nodes = tree.mark_write_through_pending(vec![leaf], leaf).unwrap();
+        tree.finish_write_through(nodes, leaf).unwrap();
+        assert_eq!(
+            tree.evict_device_next_node(FULL, &HashMap::new()).0,
+            Some(leaf)
+        );
+        let (backup, step) = tree.evict_device_leaf(leaf, false).unwrap();
+        assert!(backup.is_none());
+        assert_eq!(step.device_frees[&FULL][0].as_slice(), &[1, 2]);
+        tree.evict_device_end(FULL);
+        assert!(tree.arena.resolve(leaf).is_ok());
+        tree.dec_host_lock_ref(leaf, &receipt.to_dec_params())
+            .unwrap();
         tree.try_sanity_check(&[], &[]).unwrap();
     }
 }
