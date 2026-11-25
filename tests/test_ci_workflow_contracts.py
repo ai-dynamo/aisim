@@ -6874,39 +6874,18 @@ def test_release_output_checks_embedded_identity_and_scripts(tmp_path, monkeypat
             release_artifacts.verify_output(output, version, version)
 
 
-@pytest.mark.parametrize(
-    ("workflow", "job", "step", "interpreters", "consumer"),
-    [
-        (
-            "simulation-performance.yml",
-            "build",
-            "Build exact revision",
-            ['"${RUNNER_TEMP}/callback-venv/bin/python"'],
-            "check_dynamo_callback.py",
-        ),
-        ("simulation-performance.yml", "compare", "Verify and install both artifacts", ['"${venv}/bin/python"'], None),
-        (
-            "performance.yml",
-            "compare",
-            "Build and install both revisions",
-            ['"${BASE_VENV}/bin/python"', '"${HEAD_VENV}/bin/python"'],
-            None,
-        ),
-    ],
-)
-def test_performance_jobs_fetch_each_revisions_pinned_data_before_benchmarking(
-    workflow, job, step, interpreters, consumer
-):
+def test_performance_jobs_fetch_each_revisions_pinned_data_before_benchmarking():
     """The gates run offline or under a worker timeout, so every installed revision fetches its own pin first."""
-    steps = _workflow(workflow)["jobs"][job]["steps"]
-    names = [candidate.get("name") for candidate in steps]
-    run = steps[names.index(step)]["run"]
-    for interpreter in interpreters:
-        assert f"{interpreter} scripts/performance/prefetch_op_latency.py" in run
-    if consumer is None:
-        assert names.index(step) < names.index("Run paired benchmark")
-    else:
-        assert run.index("prefetch_op_latency.py") < run.index(consumer)
+    prefetch = '/bin/python" scripts/performance/prefetch_op_latency.py'
+    simulation = _workflow("simulation-performance.yml")["jobs"]
+    for job, consumers, count in (
+        (simulation["build"], "check_dynamo_callback.py source dynamo", 1),
+        (simulation["compare"], "simulation_perf_gate/run.py", 1),  # one loop over both environments
+        (_workflow("performance.yml")["jobs"]["compare"], "forward_perf_gate/run.py", 2),
+    ):
+        commands = _run_commands(job)
+        assert commands.count(prefetch) == count
+        assert commands.rindex(prefetch) < commands.index(consumers)
 
 
 def test_standalone_composition_steps_install_the_download_transport():
