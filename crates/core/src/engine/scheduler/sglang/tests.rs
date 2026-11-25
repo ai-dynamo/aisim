@@ -7538,6 +7538,59 @@ mod requested_max_budget {
         assert_eq!(waiting.len(), 1 - admitted);
     }
 
+    /// Loading a retracted request's prompt back from the host cache needs room for what it may
+    /// still generate, not for its whole requested maximum: SGLang's load-back counts
+    /// `min(max_new_tokens - len(output_ids), reserve)`.
+    ///
+    /// A 64-token pool with nothing on the device. The request's 12-token prompt is on the
+    /// host only; it has 8 of 12 planned outputs and was retracted. It loads 12 tokens,
+    /// recomputes its 8 outputs and may generate its requested maximum - 8 more, so the load
+    /// needs 12 + 8 + (maximum - 8) + 4 = maximum + 16 free tokens. Counting the whole maximum
+    /// would need maximum + 24, which no pool state can give once the maximum is above 40, and
+    /// the request would wait at the head of the queue for ever.
+    #[rstest::rstest]
+    #[case::fits_either_way(40)] // 56 <= 64, and 64 <= 64 by the whole maximum
+    #[case::one_more(41)] // 57 <= 64, although the whole maximum would need 65
+    #[case::the_engine_limit(47)] // 64 - 12 - 4 - 1 = 47: 63 <= 64
+    fn a_retracted_request_loads_its_host_prefix_within_its_remaining_budget(
+        #[case] requested_max: usize,
+    ) {
+        let config = SglangConfig::from_args(&test_args(64 / PAGE, PAGE, 64));
+        let mut manager = SglangKvManager::new(64, PAGE, KvEventPublishers::default(), 0);
+        manager.enable_hicache(
+            crate::engine::SglangHiCacheConfig {
+                d2h_bandwidth_gbps: 0.0,
+                h2d_bandwidth_gbps: 1.0,
+                ..crate::engine::SglangHiCacheConfig::new(16)
+            },
+            1_000_000,
+        );
+        let tokens = prompt(1, 12);
+        let cached = manager.allocate_for_request(&tokens).unwrap();
+        manager.finish(&tokens, cached.lease);
+        manager.complete_host_boundary(0.0);
+        manager.evict(12);
+        assert_eq!(manager.cache().available_tokens(), 64);
+
+        let mut request = queued(1, 12, 12, requested_max);
+        generate(&mut request, 8);
+        request.retracted = true;
+        let mut waiting = WaitingQueue::from([request]);
+        let result = get_new_batch_prefill(
+            &mut waiting,
+            &mut manager,
+            &config,
+            0.7,
+            &[],
+            false,
+            Some(0),
+        );
+        assert_eq!(result.can_run.len(), 1);
+        assert!(waiting.is_empty());
+        assert_eq!(result.admissions[0].reused_input_tokens, 12);
+        assert_eq!(result.prefill_fpm[0].tokens_computed, 8);
+    }
+
     /// `PrefillAdder._update_prefill_budget`: an admitted request reserves its prompt, a page
     /// and its whole `max_new_tokens` against the requests behind it.
     ///

@@ -174,9 +174,12 @@ pub(super) fn get_new_batch_prefill(
             };
 
             if host_tokens > 0 {
+                // SGLang's load-back counts `min(max_new_tokens - len(output_ids), reserve)`:
+                // a retracted request's sequence already holds its generated outputs.
+                let load_reserve = output_reserve.min(req.remaining_budget_tokens());
                 let required = host_tokens
                     + ceil_to_block(chunk_tokens, config.block_size)
-                    + output_reserve
+                    + load_reserve
                     + config.block_size;
                 match kv_manager.load_host_prefix(
                     &req.kv_lease,
