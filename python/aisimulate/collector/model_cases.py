@@ -398,6 +398,7 @@ def build_collection_case_plan(
     *,
     backend: str,
     collector_framework: str | None = None,
+    requested_ops: list[str] | None = None,
     model_path: str | None = None,
     model_architecture: str | None = None,
     gpu_type: str | None = None,
@@ -408,8 +409,10 @@ def build_collection_case_plan(
 ) -> CollectionCasePlan:
     """Build a model-aware op plan, validating against the selected device lane.
 
-    ``backend`` selects the model's YAML sections; ``collector_framework`` can
-    narrow registry validation to a device-specific runtime such as vllm_npu.
+    ``backend`` selects and validates the model's YAML sections.
+    ``collector_framework`` additionally checks device-lane support, limited to
+    ``requested_ops`` when supplied. This runtime subset does not narrow the
+    returned plan; the executor applies it.
     """
     base_path = Path(base_cases_path).expanduser().resolve() if base_cases_path else BASE_OP_CASES_DIR
     base_data_files = _load_base_case_files(base_path)
@@ -432,13 +435,18 @@ def build_collection_case_plan(
     # registry downstream, and unmatched names silently collect nothing —
     # a typo would look like a clean run for the intended benchmark. Fail
     # loudly here instead, symmetric with the base_ops validation above.
-    registry_backend = collector_framework or backend
-    registry_ops = _backend_registry_ops(registry_backend)
+    registry_ops = _backend_registry_ops(backend)
     if registry_ops is not None:
         unknown = selected - registry_ops
         if unknown:
+            raise ValueError(f"Model case files declare ops unknown to the {backend} registry: {sorted(unknown)}")
+
+    if collector_framework and collector_framework != backend:
+        lane_ops = _backend_registry_ops(collector_framework)
+        selected_for_run = selected if requested_ops is None else selected.intersection(requested_ops)
+        if lane_ops is not None and (unknown := selected_for_run - lane_ops):
             raise ValueError(
-                f"Model case files declare ops unknown to the {registry_backend} registry: {sorted(unknown)}"
+                f"Model case files declare ops unknown to the {collector_framework} registry: {sorted(unknown)}"
             )
 
     resolved_sm_version = resolve_sm_version(gpu_type=gpu_type, sm_version=sm_version)

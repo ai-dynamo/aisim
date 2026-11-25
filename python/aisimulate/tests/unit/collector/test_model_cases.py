@@ -1338,6 +1338,34 @@ def test_npu_plan_accepts_gemm(tmp_path):
     assert plan.ops == ["gemm"]
 
 
+@pytest.mark.parametrize("full", [False, True])
+def test_npu_plan_validates_only_requested_ops_against_device_lane(full):
+    plan = build_collection_case_plan(
+        backend="vllm",
+        collector_framework="vllm_npu",
+        model_path=None if full else "Qwen/Qwen3-0.6B",
+        full=full,
+        requested_ops=["gemm"],
+    )
+
+    # Keep the model declaration intact; the executor applies its runtime subset.
+    assert plan.has_op("gemm")
+    assert plan.has_op("attention_context")
+
+
+def test_npu_subset_still_validates_unrequested_declarations(tmp_path):
+    case_file = tmp_path / "model_cases.yaml"
+    case_file.write_text("include_base: false\nmodel_ops: [gemm, attention_contxt_typo]\n")
+
+    with pytest.raises(ValueError, match="vllm registry.*attention_contxt_typo"):
+        build_collection_case_plan(
+            backend="vllm",
+            collector_framework="vllm_npu",
+            model_cases_path=str(case_file),
+            requested_ops=["gemm"],
+        )
+
+
 def test_dsv4_plan_only_uses_backend_specific_case_plan():
     model_path = "deepseek-ai/DeepSeek-V4-Pro"
     expected_ops = build_collection_case_plan(backend="sglang", model_path=model_path).ops

@@ -6611,6 +6611,7 @@ def main():
         case_plan = build_collection_case_plan(
             backend=args.backend,
             collector_framework=collector_framework,
+            requested_ops=args.ops,
             model_path=args.model_path,
             model_architecture=args.model_architecture,
             gpu_type=args.gpu,

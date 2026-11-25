@@ -18,6 +18,7 @@ field existed.
 import importlib.metadata
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -113,7 +114,8 @@ def test_npu_host_selects_the_npu_lane(monkeypatch):
     assert [collection["module"] for collection in observed["collections"]] == ["collector.vllm.collect_gemm_npu"]
 
 
-def test_cli_rejects_npu_model_ops_before_collection(tmp_path, monkeypatch):
+@pytest.mark.parametrize("ops", [[], ["--ops", "attention_context"], ["--ops", "gemm", "attention_context"]])
+def test_cli_rejects_npu_model_ops_before_collection(tmp_path, monkeypatch, ops):
     from collector import version_resolver
 
     case_file = tmp_path / "model_cases.yaml"
@@ -123,13 +125,51 @@ def test_cli_rejects_npu_model_ops_before_collection(tmp_path, monkeypatch):
     monkeypatch.setattr(
         version_resolver, "build_collections", lambda *a, **k: pytest.fail("collection started before validation")
     )
-    monkeypatch.setattr(sys, "argv", ["collect.py", "--backend", "vllm", "--model-cases", str(case_file), "--profile"])
+    monkeypatch.setattr(
+        sys, "argv", ["collect.py", "--backend", "vllm", "--model-cases", str(case_file), "--profile", *ops]
+    )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("COLLECTOR_LOG_DIR", str(tmp_path / "logs"))
     _stub_vllm_ascend_version(monkeypatch)
 
     with pytest.raises(ValueError, match="vllm_npu registry.*attention_context"):
         collect_mod.main()
+
+
+@pytest.mark.parametrize("model_args", [["--model-path", "Qwen/Qwen3-0.6B"], ["--model-cases-full"]])
+def test_cli_npu_gemm_subset_reaches_only_npu_gemm_collection(tmp_path, monkeypatch, model_args):
+    from collector import skips
+
+    monkeypatch.setattr(collect_mod, "_cuda_available", lambda: False)
+    monkeypatch.setattr(collect_mod, "_npu_available", lambda: True)
+    monkeypatch.setattr(skips, "detect_sm_version", lambda: None)
+    monkeypatch.setattr(collect_mod, "_LOGGER_CONFIGURED", True)
+    monkeypatch.setattr(
+        sys, "argv", ["collect.py", "--backend", "vllm", *model_args, "--ops", "gemm", "--profile", "--limit", "1"]
+    )
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "logs").mkdir()
+    monkeypatch.setenv("COLLECTOR_LOG_DIR", str(tmp_path / "logs"))
+    # Track environment keys main() updates so each invocation stays isolated.
+    for name in ("COLLECTOR_MODEL_PATH", "COLLECTOR_MEASURE_POWER", "PYTHONWARNINGS"):
+        monkeypatch.setenv(name, os.environ.get(name, ""))
+    for name in ("AIS_SM", "AIC_SM"):
+        monkeypatch.delenv(name, raising=False)
+    _stub_vllm_ascend_version(monkeypatch)
+    observed = []
+
+    def fake_collect_ops(num_processes, collections, version, **kwargs):
+        observed.append((collections, version, kwargs["collector_framework"]))
+        return []
+
+    monkeypatch.setattr(collect_mod, "collect_ops", fake_collect_ops)
+    collect_mod.main()
+
+    assert len(observed) == 1
+    collections, version, framework = observed[0]
+    assert version == "0.30.0rc2"
+    assert framework == "vllm_npu"
+    assert [collection["module"] for collection in collections] == ["collector.vllm.collect_gemm_npu"]
 
 
 def test_npu_lane_refuses_to_run_without_vllm_ascend(monkeypatch):
