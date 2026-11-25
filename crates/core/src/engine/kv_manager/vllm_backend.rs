@@ -2204,13 +2204,18 @@ impl VllmKvManager {
                 // window group at its admission blocks (V32 `single:213-226`,
                 // V31 `:216-229`), so replay can count more there. Grouped
                 // replay has no speculative tokens.
-                grouped_lease.first_pass_need = coordinator.allocation_blocks(
+                // Activation publishes a loaded partial state before the
+                // first pass. Budget its copy now, before another load can
+                // consume that block; activation will recount the same need.
+                grouped_lease.first_pass_need = (coordinator.allocation_blocks(
                     &block_lease,
                     prompt,
                     transfer,
                     prompt,
                     self.step,
-                ) as u64;
+                ) + coordinator
+                    .destination_state_copy_blocks(lease, prompt, transfer))
+                    as u64;
                 grouped_lease.block_lease = Some(block_lease);
                 (
                     grouped_lease,

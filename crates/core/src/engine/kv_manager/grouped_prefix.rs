@@ -420,6 +420,14 @@ impl GroupedPrefixRules {
         }
     }
 
+    /// Whether finalization keeps a state at a hash boundary inside its block.
+    fn keeps_partial_state(&self, prompt: usize, tokens: usize, block: usize) -> bool {
+        self.alignment == self.hash_block
+            && self.hash_block < block
+            && !tokens.is_multiple_of(block)
+            && tokens == self.partial_tail(prompt)
+    }
+
     /// The checkpoint position of a prefill that ends at `prefill_end`, in
     /// units of the hit alignment (v0.32 `single:1745-1749`, `iface:1110-1122`).
     pub(crate) fn checkpoint_position(&self, prefill_end: usize) -> usize {
@@ -1236,6 +1244,34 @@ impl GroupedPrefixCoordinator {
         )
     }
 
+    /// The extra first-pass blocks for states that activation will publish
+    /// inside their fresh running blocks. Other retained state positions are
+    /// block-aligned and cannot add a producer copy. Count without publishing
+    /// keys or copying the lease, so reservation remains atomic.
+    pub(crate) fn destination_state_copy_blocks(
+        &self,
+        request: &BlockRequestLease,
+        prompt: usize,
+        loaded_tokens: usize,
+    ) -> usize {
+        // Keep the modeled one-token load behavior: it transfers the whole
+        // prompt and only counts the copy once activation publishes it.
+        if loaded_tokens >= prompt || request.prefix_hash_at(loaded_tokens).is_none() {
+            return 0;
+        }
+        self.rules
+            .groups
+            .iter()
+            .filter(|rule| {
+                rule.cacheable
+                    && rule.kind == GroupRuleKind::State
+                    && self
+                        .rules
+                        .keeps_partial_state(prompt, loaded_tokens, rule.block)
+            })
+            .count()
+    }
+
     /// The blocks that the first allocation of a request takes for its tokens
     /// up to `target`, counting inactive hit blocks again: vLLM's second test
     /// in `allocate_slots`, on the chunk and without the admission cap of a
@@ -1781,7 +1817,6 @@ impl GroupedPrefixCoordinator {
                     }
                 }
                 (GroupRuleKind::State, GroupLease::State(state)) => {
-                    let tail = rules.partial_tail(prompt);
                     // The tail inside a block is kept only with hits inside a
                     // block. Without them vLLM rounds the cached length down
                     // to the scheduler block (v0.31 `coord:796-806`, v0.32
@@ -1791,10 +1826,7 @@ impl GroupedPrefixCoordinator {
                     // `single:2124`). A kept tail makes the next write take a
                     // fresh block.
                     let kept = computed_after == rules.replay_boundary(prompt, block)
-                        || (rules.alignment == rules.hash_block
-                            && rules.hash_block < block
-                            && !tail.is_multiple_of(block)
-                            && computed_after == tail)
+                        || rules.keeps_partial_state(prompt, computed_after, block)
                         || junction.is_some_and(|junction| {
                             computed_after == rules.block_floor(junction, block)
                         });

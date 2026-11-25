@@ -2087,8 +2087,11 @@ fn grouped_destination_counts_the_copy_of_a_state_loaded_to_its_partial_tail() {
         recurrent.prefix_cacheable = Some(true);
         recurrent.transfer_bytes_per_block = Some(100);
         recurrent.prefill_checkpoint_blocks = Some(0);
-        let mut args = prefix_core(vec![full, recurrent], 16 * 100, 8192, 4, version).args;
+        // A single load still fits with exactly the four blocks its first
+        // pass needs, including the projected copy.
+        let mut args = prefix_core(vec![full, recurrent], 4 * 100, 8192, 4, version).args;
         args.worker_type = WorkerType::Decode;
+        args.max_model_len = Some(64);
         let mut core = VllmCore::new(args);
         let handoff_id = HandoffId::new(Uuid::from_u128(1977));
         assert_eq!(
@@ -2096,7 +2099,7 @@ fn grouped_destination_counts_the_copy_of_a_state_loaded_to_its_partial_tail() {
             Some(2),
             "{version}"
         );
-        assert_eq!(core.kv_manager.grouped_inflight_need(), 0, "{version}");
+        assert_eq!(core.kv_manager.grouped_inflight_need(), 1, "{version}");
         activate(&mut core, handoff_id);
         assert_eq!(block_pool(&core).active_blocks(), 3, "{version}");
         assert_eq!(core.kv_manager.grouped_inflight_need(), 1, "{version}");
@@ -3007,6 +3010,68 @@ fn grouped_destination_with_a_local_prefix_inside_a_block_takes_no_copy_source()
         let pass = async_step(&mut core, &mut now);
         assert_eq!(pass.output_signals.len(), 1, "{version}");
         assert_eq!(block_pool(&core).peak_active_blocks(), 5, "{version}");
+    }
+}
+
+#[test]
+fn grouped_destination_keeps_room_for_the_copy_published_by_activation() {
+    // Each cold 21-token prompt loads 20 tokens into two attention blocks
+    // and one state block. Activation publishes the state inside its block,
+    // so the first pass takes a fourth block. In a six-block pool the second
+    // load must wait and leave room for the first pass's state copy.
+    for version in ["0.31.0", "0.32.0"] {
+        for max_concurrent_batches in [1, 2] {
+            let label = format!("{version} {max_concurrent_batches}");
+            let mut groups = full_and_state_transfer_groups();
+            if version == "0.32.0" {
+                groups[1].prefill_checkpoint_blocks = Some(0);
+            }
+            let mut args = prefix_core(groups, 600, 8192, 4, version).args;
+            args.worker_type = WorkerType::Decode;
+            args.max_model_len = Some(64);
+            args.max_concurrent_batches = max_concurrent_batches;
+            let mut core = VllmCore::new(args);
+            let a = HandoffId::new(Uuid::from_u128(2101));
+            let b = HandoffId::new(Uuid::from_u128(2102));
+            assert_eq!(
+                reserve_grouped(&mut core, a, pd_request(1101, 21, 2)),
+                Some(2),
+                "{label}"
+            );
+            let second = DirectRequest {
+                tokens: (1000..1021).collect(),
+                ..pd_request(1102, 0, 2)
+            };
+            assert_eq!(reserve_grouped(&mut core, b, second), None, "{label}");
+            assert_eq!(block_pool(&core).active_blocks(), 3, "{label}");
+            activate(&mut core, a);
+            assert_eq!(core.kv_manager.grouped_inflight_need(), 1, "{label}");
+            assert!(core.retry_pending_destinations().is_empty(), "{label}");
+            let mut now = 0.0;
+            let pass = async_step(&mut core, &mut now);
+            assert_eq!(pass.output_signals.len(), 1, "{label}");
+            assert_eq!(pass.output_signals[0].uuid, Uuid::from_u128(1101));
+            assert_eq!(core.kv_manager.grouped_inflight_need(), 0, "{label}");
+            let mut completed = 0;
+            let mut second_reserved = false;
+            for _ in 0..12 {
+                let pass = async_step(&mut core, &mut now);
+                assert_eq!(pass.mocker_metrics.vllm_preemptions_total, 0, "{label}");
+                completed += pass.output_signals.iter().filter(|o| o.completed).count();
+                if reserved_units(&core.retry_pending_destinations(), b).is_some() {
+                    assert!(!second_reserved, "{label}");
+                    second_reserved = true;
+                    activate(&mut core, b);
+                }
+                if core.is_drained() {
+                    break;
+                }
+            }
+            assert!(second_reserved, "{label}");
+            assert_eq!(completed, 2, "{label}");
+            assert!(core.is_drained(), "{label}");
+            assert_eq!(block_pool(&core).active_blocks(), 0, "{label}");
+        }
     }
 }
 

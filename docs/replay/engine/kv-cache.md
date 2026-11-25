@@ -1415,7 +1415,9 @@ sub-block matching without an explicit full-state scratch count.
   request. Its whole prompt must fit the free capacity. Its transferred blocks
   must also leave free what the first steps of the other transferred requests
   in flight still take. A request is in flight from its reservation until its
-  first step allocates. vLLM also keeps free what a local prefill in progress
+  first step allocates. For multi-token prompts in block mode, replay budgets
+  the copy of a state that activation will publish inside its block before
+  admitting another transfer. vLLM also keeps free what a local prefill in progress
   still needs, such as the recompute of a preempted request, but replay does
   not. For a sliding-window group, vLLM applies its admission cap to what a
   first step takes, and replay counts every block of that step. The first
