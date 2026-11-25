@@ -50,8 +50,11 @@ config = {
     "database_mode": "HYBRID",
 }
 model = RustForwardPassPerfModel.best_available(config)
-# Packed op-level decode convention: num_decode_requests = B * (nextn + 1),
-# sum_decode_kv_tokens = num_decode_requests * s (s = context incl. current token).
+# This config selects op_level: its packed decode consumer uses the mean KV
+# count directly as the attention length, without adding the current token.
+# Thus 8 requests at width 4 and length 1025 need 32 rows and 32800 KV tokens.
+# The past-only convention (32768 here) belongs to whole-model FPM estimators;
+# applying it to this diagnostic would price length 1024 instead of 1025.
 B, S = 8, 1025
 decode = {"num_decode_requests": B * (NEXTN + 1), "sum_decode_kv_tokens": B * (NEXTN + 1) * S}
 cases = {

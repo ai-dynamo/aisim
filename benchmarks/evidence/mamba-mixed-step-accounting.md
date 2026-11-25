@@ -1362,6 +1362,13 @@ The packed op-level diagnostic in `telem.py` uses 32800 KV tokens for
 does not add a current token. A past-only convention would require a
 coordinated telemetry-contract migration; whole-model FPM uses that distinct
 convention already.
+The native regression `op_level_packed_decode_kv_includes_current_token`
+checks both pure decode and a mixed step at 32 packed rows, using explicit
+attention queries at sequence lengths 1024, 1025 and 1026 as coordinate
+references. It uses a synthetic SOL system without downloaded tables and
+distinguishes both off-by-one alternatives. This verifies input translation,
+not prediction accuracy. The diagnostic's inputs and historical outputs
+remain unchanged.
 
 Qualified draft scans in a whole-model FPM aggregate still inherit the
 target's fractional mean-field schedule. At batch 4, ISL 4096, prefix 3000

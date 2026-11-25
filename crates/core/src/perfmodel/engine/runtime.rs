@@ -10644,6 +10644,66 @@ pub(crate) mod tests {
         assert!((ms - expected).abs() < 1e-9, "got {ms}, want {expected}");
     }
 
+    #[test]
+    fn op_level_packed_decode_kv_includes_current_token() {
+        use crate::perf_database::energy_test_fixtures::write_energy_systems_root;
+
+        // No downloaded tables: compare the packed-input dispatch against an
+        // explicit attention query at the intended sequence length. This tests
+        // input coordinates, not the attention operator's numerical formula.
+        let root = tempfile::tempdir().unwrap();
+        write_energy_systems_root(root.path());
+        let mut db = PerfDatabase::load(root.path(), "testsys", "vllm", "1.0").unwrap();
+        db.database_mode = DatabaseMode::Sol;
+        let mut config = fixture_engine_config(Some(3));
+        config.database_mode = DatabaseMode::Sol;
+        let generation = generation_ops();
+        let attention = generation[1].clone();
+        let engine = Engine::build(
+            EngineSpec::new(config, context_ops(), generation),
+            Arc::new(db),
+        )
+        .unwrap();
+        // telem.py's 8 logical requests verify 4 tokens each. Its 32800 KV
+        // tokens already include each packed row's current token. The packed
+        // consumer must neither add 1 nor apply the verification width again.
+        let expected = |length| {
+            attention
+                .query(
+                    &engine.db,
+                    &generation_op_runtime(32, 1, length, 1.0, 0, None),
+                )
+                .unwrap()
+                .latency_ms
+        };
+        let intended = expected(1025);
+        assert_ne!(intended, expected(1024));
+        assert_ne!(intended, expected(1026));
+        for prefills in [0, 1] {
+            for length in [1024, 1025, 1026] {
+                let metrics = ForwardPassMetrics {
+                    scheduled_requests: crate::ScheduledRequestMetrics {
+                        num_prefill_requests: prefills,
+                        sum_prefill_tokens: prefills * 2048,
+                        num_decode_requests: 32,
+                        sum_decode_kv_tokens: 32 * length,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let estimate = engine
+                    .forward_pass_estimate(&[metrics], true, None)
+                    .unwrap();
+                let decode = estimate.ranks[0]
+                    .operations
+                    .iter()
+                    .find(|op| op.name == "generation_attention")
+                    .unwrap();
+                assert_eq!(decode.latency_ms, expected(length));
+            }
+        }
+    }
+
     /// The FPM rank dispatch queries RAW iteration totals — the tables'
     /// native coordinate system — not the op-level per-request averages,
     /// which floor-divide away up to (n - 1) tokens per axis.
