@@ -3,13 +3,13 @@
 
 use std::collections::VecDeque;
 
-use aisimulate_core::engine::{Backend, EngineConfig, TimingModelConfig};
-use aisimulate_core::replay::loadgen::{
+use aisim_core::engine::{Backend, EngineConfig, SglangConfig, TimingModelConfig};
+use aisim_core::replay::loadgen::{
     AGENTIC_MOONCAKE_SCHEMA, AGENTIC_MOONCAKE_VERSION, AgenticHashIdScope, AgenticMooncakeHeader,
     AgenticMooncakeRow, AgenticProfileOptions, AgenticSnapshotOptions, AgenticSourceProvenance,
     PreparedAgenticSnapshots, ValidatedAgenticGraph, WorkloadDriver,
 };
-use aisimulate_core::replay::{
+use aisim_core::replay::{
     CURRENT_REPLAY_SPEC_VERSION, DirectRequest, PerRequestRecord, ReplayEngineConfig,
     ReplayEngineFactory, ReplayError, ReplayReport, ReplayRuntimeInput, ReplaySpec,
     ReplayTerminalStatus, ReplayTopology, Replayer, WorkerPoolSpec,
@@ -27,6 +27,10 @@ fn engine(backend: Backend) -> ReplayEngineConfig {
             num_gpu_blocks: 64,
             max_num_seqs: 4,
             max_num_batched_tokens: 64,
+            sglang: SglangConfig {
+                num_reserved_decode_tokens: 0,
+                ..SglangConfig::default()
+            },
             timing_model: TimingModelConfig::Fixed {
                 prefill_ms: 1.0,
                 decode_ms: 1.0,
@@ -422,5 +426,60 @@ fn agentic_warmup_waits_for_requests_being_tokenized() {
         assert!(phases.failure_reason.is_none(), "{phases:?}");
         // The preparation request finished only after its tokenization.
         assert!(phases.finished_at_ms.unwrap() > 5.0, "{phases:?}");
+    }
+}
+
+#[test]
+fn extra_cpu_overhead_delays_every_request_without_queueing() {
+    for backend in BACKENDS {
+        for disagg in [false, true] {
+            let report = Replayer::new(spec(backend, disagg, 1, None), ReplayEngineFactory::new())
+                .unwrap()
+                .with_runtime_input(ReplayRuntimeInput::Requests(burst()))
+                .with_extra_cpu_overhead(5.0, 0.25)
+                .unwrap()
+                .run()
+                .unwrap();
+            let (long, short) = (record(&report, LONG), record(&report, SHORT));
+            // Both requests arrive together and neither waits for the other.
+            assert_eq!(long.tokenized_ms, Some(5.0 + 0.25 * 64.0), "{backend:?}");
+            assert_eq!(short.tokenized_ms, Some(5.0 + 0.25 * 4.0), "{backend:?}");
+            assert_eq!(long.first_admit_ms.unwrap() >= 21.0, true);
+        }
+    }
+}
+
+#[test]
+fn extra_cpu_overhead_composes_with_a_queued_tokenizer() {
+    let report = Replayer::new(
+        spec(Backend::Vllm, false, 1, None),
+        ReplayEngineFactory::new(),
+    )
+    .unwrap()
+    .with_runtime_input(ReplayRuntimeInput::Requests(burst()))
+    .with_extra_cpu_overhead(10.0, 0.0)
+    .unwrap()
+    .with_tokenization(1, 1.0, 0.5)
+    .unwrap()
+    .run()
+    .unwrap();
+    // The tokenizer is busy until 33 ms (long), then serves the short request
+    // for 3 ms; each then waits 10 ms of unqueued overhead.
+    assert_eq!(record(&report, LONG).tokenized_ms, Some(43.0));
+    assert_eq!(record(&report, SHORT).tokenized_ms, Some(46.0));
+}
+
+#[test]
+fn invalid_extra_cpu_overhead_is_rejected() {
+    for (base_ms, per_input_token_ms) in [(-1.0, 0.0), (0.0, f64::NAN), (f64::INFINITY, 0.0)] {
+        assert!(
+            Replayer::new(
+                spec(Backend::Vllm, false, 1, None),
+                ReplayEngineFactory::new()
+            )
+            .unwrap()
+            .with_extra_cpu_overhead(base_ms, per_input_token_ms)
+            .is_err()
+        );
     }
 }

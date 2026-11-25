@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project.
 // Modified Rust simulation of vLLM b3563fc65ae0f5359802593d78e7ea097e1fed31
-// scheduling contracts; immutable sources and license: THIRD_PARTY_NOTICES.md.
+// scheduling contracts and of the v0.31.0
+// (db9527a46873454610df6dbedf79a36d6bf1a7f6) and v0.32.0
+// (5df63a7203cdb9328d824a27b682e77c7b9928be) grouped KV rules;
+// immutable sources and license: THIRD_PARTY_NOTICES.md.
+// MTP slot/admission rules additionally adapted from vLLM v0.32.0, commit
+// 5df63a7203cdb9328d824a27b682e77c7b9928be, vllm/v1/core/sched/scheduler.py
+// and vllm/v1/core/kv_cache_manager.py; see THIRD_PARTY_NOTICES.md.
 
 //! Engine-specific policy for the shared vLLM/TRT-LLM scheduler core.
 //!
@@ -16,6 +22,80 @@ use crate::engine::kv_manager::{AllocationRequirement, DestinationReservationMod
 #[cfg(test)]
 use crate::engine::kv_manager::{apply_mtp_prefix_recompute, apply_prefix_recompute};
 use crate::engine::scheduler::vllm::request::RequestKvState;
+
+/// The native speculative lifecycle is vLLM-specific. TRT keeps its existing
+/// no-evict/burst policy even though it shares the scheduling core.
+pub(super) fn native_mtp_depth(policy: SchedulingPolicy, nextn: Option<usize>) -> Option<usize> {
+    match policy {
+        SchedulingPolicy::Vllm => nextn,
+        SchedulingPolicy::TrtllmGuaranteedNoEvict => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct MtpWork {
+    pub(super) query_tokens: usize,
+    pub(super) known_end: usize,
+    pub(super) slot_end: usize,
+    pub(super) valid_drafts: usize,
+}
+
+/// Synchronous, single-module MTP query and allocation boundaries. Padding is
+/// physical work, but its invalid (-1 in upstream) drafts cannot be accepted.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn plan_mtp_work(
+    known: usize,
+    computed: usize,
+    pending_drafts: usize,
+    nextn: usize,
+    requires_logits: bool,
+    budget: usize,
+    max_model_len: Option<usize>,
+    pad_waiting_decode: bool,
+) -> Option<MtpWork> {
+    let limit = max_model_len.unwrap_or(usize::MAX);
+    let nextn = if requires_logits { nextn } else { 0 };
+    let pad = requires_logits
+        && pad_waiting_decode
+        && known.saturating_sub(computed) == 1
+        && computed.saturating_add(nextn + 2) <= limit;
+    if pad && budget < nextn + 1 {
+        return None;
+    }
+    let wanted = if pad {
+        nextn + 1
+    } else {
+        known
+            .saturating_add(pending_drafts)
+            .saturating_sub(computed)
+    };
+    let query_tokens = wanted.min(budget).min(
+        limit
+            .saturating_sub(computed)
+            .saturating_sub(usize::from(requires_logits)),
+    );
+    let end = computed.saturating_add(query_tokens);
+    Some(MtpWork {
+        query_tokens,
+        known_end: end.min(known),
+        slot_end: end.saturating_add(nextn).min(limit),
+        valid_drafts: if pad { 0 } else { end.saturating_sub(known) },
+    })
+}
+
+/// Upstream's inflight admission guard deliberately does not re-clamp the
+/// speculative allowance after limiting the known context to max_model_len.
+pub(super) fn inflight_footprint_blocks(
+    known: usize,
+    max_model_len: Option<usize>,
+    nextn: Option<usize>,
+    block_size: usize,
+) -> usize {
+    known
+        .min(max_model_len.unwrap_or(usize::MAX))
+        .saturating_add(nextn.map_or(0, |k| 1 + 2 * k))
+        .div_ceil(block_size)
+}
 
 pub(super) trait PolicySequence {
     fn len(&self) -> usize;
@@ -84,17 +164,54 @@ pub(super) enum AdmissionDecision {
     Reject,
 }
 
-/// Grouped cold-cache admission uses the pending forward's physical bytes.
-/// Logical prompt length remains independent of bounded cache residency.
+/// Grouped admission. In byte mode (prefix caching off) the pending
+/// forward's physical bytes decide, and logical prompt length remains
+/// independent of bounded cache residency. With `whole_prompt` (prefix
+/// caching on) the blocks of the whole prompt decide, as vLLM's
+/// `allocate_slots` does by default (`mgr:519-536`). Only a prompt whose
+/// blocks do not fit the empty pool is rejected.
 pub(super) fn decide_grouped_waiting_admission<S: PolicySequence>(
     sequence: &S,
     kv_manager: &G1Manager,
     token_budget: usize,
     enable_chunked_prefill: bool,
     prefill_cost: &PrefillCost,
+    whole_prompt: bool,
 ) -> Option<AdmissionDecision> {
     let pool = kv_manager.grouped()?;
     let required_tokens = sequence.len();
+    if whole_prompt {
+        let blocks = pool.block_pool().expect("block mode");
+        let capacity = blocks.capacity_blocks();
+        // A prompt whose blocks never fit the pool is never admitted. The test
+        // leaves the hit out: the copy and inactive blocks of a hit depend on
+        // the cache, which changes while the request waits.
+        if kv_manager.grouped_cold_admission_blocks(required_tokens) > capacity {
+            return Some(AdmissionDecision::Reject);
+        }
+        // Without chunked prefill, vLLM compares the tokens after the prefix
+        // hit with the budget (v0.31 `sched:1084`, `:1115-1121`, v0.32
+        // `sched:1129`, `:1160-1167`).
+        if token_budget == 0 || (!enable_chunked_prefill && prefill_cost.new_tokens > token_budget)
+        {
+            return Some(AdmissionDecision::Wait);
+        }
+        // Inactive cached blocks are evictable, so only active blocks count
+        // against the request. Contention keeps FIFO and never preempts. A
+        // hit that needs more blocks than the pool waits too. vLLM searches
+        // the hit again at the next step (v0.31 `sched:930-937`,
+        // `:1223-1230`, v0.32 `sched:960-967`, `:1275-1282`), and running
+        // requests can evict the hit blocks in between.
+        return Some(
+            if prefill_cost.new_blocks > capacity - blocks.active_blocks() {
+                AdmissionDecision::Wait
+            } else {
+                AdmissionDecision::Admit {
+                    prefill_cost: prefill_cost.clone(),
+                }
+            },
+        );
+    }
     // A known context whose smallest possible final forward cannot fit will
     // never be admitted, regardless of chunking or competing requests.
     let minimum = pool.required_bytes(required_tokens.saturating_sub(1), required_tokens);
@@ -118,6 +235,16 @@ pub(super) fn decide_grouped_waiting_admission<S: PolicySequence>(
             prefill_cost: prefill_cost.clone(),
         })
     }
+}
+
+/// Whether a waiting request whose allocation fails may preempt running
+/// work. With grouped prefix caching it may not: admission tests the blocks
+/// of the whole prompt, and the allocation then tests the blocks of the
+/// chunk, as vLLM's `allocate_slots` does (`mgr:519-576`). A waiting request
+/// that fails either test stays queued, because vLLM stops its waiting loop
+/// there (v0.31 `sched:1223-1230`, v0.32 `sched:1275-1282`).
+pub(super) fn waiting_allocation_may_preempt(kv_manager: &G1Manager) -> bool {
+    kv_manager.grouped_prefix_rules().is_none()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -258,11 +385,43 @@ pub(super) fn decide_waiting_admission_with_cost<'a, S: PolicySequence + 'a>(
     handoff_reserved_blocks: impl FnOnce() -> usize,
     raw_prefill_cost: PrefillCost,
 ) -> AdmissionDecision {
+    let adjusted = kv_manager.resolve_prefill_cost(
+        config.policy,
+        sequence.len(),
+        config.mtp_enabled,
+        !generation_complete(sequence, None),
+        raw_prefill_cost,
+    );
+    decide_waiting_admission_with_adjusted_cost(
+        config,
+        sequence,
+        is_fresh,
+        running,
+        kv_manager,
+        reserved_request_blocks,
+        inflight_prefill_reserved_blocks,
+        handoff_reserved_blocks,
+        adjusted,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn decide_waiting_admission_with_adjusted_cost<'a, S: PolicySequence + 'a>(
+    config: WaitingAdmissionConfig,
+    sequence: &S,
+    is_fresh: bool,
+    running: impl Iterator<Item = &'a S>,
+    kv_manager: &G1Manager,
+    reserved_request_blocks: usize,
+    inflight_prefill_reserved_blocks: usize,
+    handoff_reserved_blocks: impl FnOnce() -> usize,
+    raw_prefill_cost: PrefillCost,
+) -> AdmissionDecision {
     let WaitingAdmissionConfig {
         policy,
         num_gpu_blocks,
         block_size,
-        mtp_enabled,
+        mtp_enabled: _,
     } = config;
 
     if is_fresh {
@@ -282,13 +441,7 @@ pub(super) fn decide_waiting_admission_with_cost<'a, S: PolicySequence + 'a>(
         }
     }
 
-    let prefill_cost = kv_manager.resolve_prefill_cost(
-        policy,
-        sequence.len(),
-        mtp_enabled,
-        !generation_complete(sequence, None),
-        raw_prefill_cost,
-    );
+    let prefill_cost = raw_prefill_cost;
     let available = match policy {
         SchedulingPolicy::Vllm => num_gpu_blocks
             .saturating_sub(kv_manager.num_active_blocks())

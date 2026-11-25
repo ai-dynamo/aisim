@@ -362,6 +362,21 @@ pub trait RankEngine: Sized {
         Ok(None)
     }
 
+    /// Whether phase-priced passes contribute to attention-DP power evidence.
+    fn tracks_attention_dp_wait(&self) -> bool {
+        false
+    }
+
+    /// Modeled forward duration of the just resolved phase-priced pass.
+    fn phase_priced_forward_ns(&self) -> u128 {
+        0
+    }
+
+    /// Record the phase-priced group's uncovered wait with its shared provider.
+    fn record_phase_priced_wait(&self, _wait_ms: f64) -> Result<()> {
+        Ok(())
+    }
+
     /// Finish the pass retained by an unpriced [`Self::schedule_pass`]:
     /// `iteration` is the group's shared price, or `None` for the rank's own.
     fn resolve_pass(
@@ -378,6 +393,13 @@ pub trait RankEngine: Sized {
         end_ms: f64,
     ) -> Result<Self::PassCompletionEffects>;
 
+    /// This rank's contribution to the group boundary reported in idle-rank
+    /// forward telemetry. An implementation may exclude separately priced
+    /// host time while retaining it in the actual pass boundary.
+    fn idle_telemetry_end_ms(&self, _pending: &Self::PendingPass, end_ms: f64) -> f64 {
+        end_ms
+    }
+
     /// Cross the shared completion boundary without a rank-local pass.
     ///
     /// Attention-DP ranks that had no work when a sibling pass started still
@@ -392,6 +414,17 @@ pub trait RankEngine: Sized {
         _end_ms: f64,
     ) -> Result<Option<Self::PassCompletionEffects>> {
         Ok(None)
+    }
+
+    /// Like `complete_idle_group_pass`, with a separate modeled end time for
+    /// forward telemetry. Scheduling effects still advance to `end_ms`.
+    fn complete_idle_group_pass_with_telemetry(
+        &mut self,
+        started_at_ms: f64,
+        end_ms: f64,
+        _telemetry_end_ms: f64,
+    ) -> Result<Option<Self::PassCompletionEffects>> {
+        self.complete_idle_group_pass(started_at_ms, end_ms)
     }
 
     /// Earliest deadline for independently modeled internal work.
@@ -413,4 +446,19 @@ pub trait RankEngine: Sized {
 
     /// Whether this rank owns no request, pass, or internal work.
     fn is_drained(&self) -> bool;
+
+    /// Earliest time at which outputs held past their pass's completion leave
+    /// the rank. Unlike internal deadlines it is not masked by a pass in flight:
+    /// vLLM returns a pass's outputs while the next pass runs. A command can set
+    /// an emission at its own time, so drivers read this after commands too.
+    /// The default holds none.
+    fn next_emission_ms(&self) -> Option<f64> {
+        None
+    }
+
+    /// Release the held outputs due at `now_ms` as completion effects that
+    /// carry only outputs.
+    fn take_due_emissions(&mut self, _now_ms: f64) -> Result<Option<Self::PassCompletionEffects>> {
+        Ok(None)
+    }
 }

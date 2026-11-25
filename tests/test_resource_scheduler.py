@@ -8,9 +8,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from aisimulate.config.common import ResourceConfig
-from aisimulate.resource_scheduler import InterruptedEvaluation, evaluate_waves
-from aisimulate.resources import (
+from aisim.config.common import ResourceConfig
+from aisim.resource_scheduler import InterruptedEvaluation, evaluate_waves
+from aisim.resources import (
     GB,
     GuardedRunnerFactory,
     HostResources,
@@ -68,7 +68,7 @@ def test_admission_splits_waves_and_skips_only_oversized_candidates():
 def test_checkpoint_failure_stops_before_workers_without_reclassifying_candidates(
     monkeypatch,
 ):
-    from aisimulate import resource_scheduler as scheduler
+    from aisim import resource_scheduler as scheduler
 
     factory = _BudgetFactory()
     failure = ResourceLimitError("execution evidence exceeds the bounded checkpoint budget")
@@ -97,6 +97,85 @@ def test_checkpoint_failure_stops_before_workers_without_reclassifying_candidate
     assert factory.admitted == [[0, 1]]
 
 
+@pytest.mark.parametrize(
+    "host_pressure,child_rss", [(False, 21), (True, 20), (True, 21)], ids=["worker", "host", "both"]
+)
+def test_profile_pressure_retries_only_unfinished_work_serially(monkeypatch, host_pressure, child_rss):
+    from concurrent.futures import Future
+    from unittest.mock import Mock
+
+    from aisim import resource_scheduler as scheduler
+    from aisim import resources
+
+    submitted = []
+    terminated = []
+
+    class Factory(_BudgetFactory):
+        def admit_wave(self, specs):
+            plan = super().admit_wave(specs)
+            return plan | ({"profile_worker_rss_limit_bytes": 100} if len(specs) > 1 else {})
+
+        def live_pressure(self):
+            return {"host_available_bytes": 1} if host_pressure else None
+
+    class Pool:
+        def __init__(self, *, max_workers, **kwargs):
+            self.width = max_workers
+            self._processes = {123: object()}
+
+        def submit(self, fn, spec):
+            index = spec["id"]
+            submitted.append((self.width, index))
+            future = Future()
+            if self.width == 1 or index == 0:
+                future.set_result(index)
+            return future
+
+    monkeypatch.setattr(scheduler, "ProcessPoolExecutor", Pool)
+    monkeypatch.setattr(scheduler, "terminate_pool", terminated.append)
+    monkeypatch.setattr(scheduler, "close_pool", lambda pool: None)
+    monkeypatch.setattr(
+        resources.psutil, "Process", lambda pid: SimpleNamespace(memory_info=lambda: SimpleNamespace(rss=80))
+    )
+    monkeypatch.setattr(resources, "_child_memory_bytes", lambda parent: child_rss)
+    interrupt = Mock(wraps=InterruptedEvaluation)
+    monkeypatch.setattr(scheduler, "InterruptedEvaluation", interrupt)
+    factory = Factory(capacity=8)
+    specs = [{"id": i, "cost": 1} for i in range(8)]
+    results = dict(evaluate_waves(specs, factory=factory, initializer=_init, evaluate=_evaluate, workers=8, timeout=10))
+    assert results == {i: i for i in range(8)}
+    assert submitted == [(8, i) for i in range(8)] + [(1, i) for i in range(1, 8)]
+    pressure = (
+        {"worker_pid": 123, "worker_rss_bytes": 101, "worker_rss_limit_bytes": 100}
+        if child_rss > 20
+        else {"host_available_bytes": 1}
+    )
+    interrupt.assert_called_once_with("live memory pressure", True, pressure)
+    assert len(terminated) == 1
+
+
+def test_profile_worker_pressure_counts_a_live_child():
+    import subprocess
+    import sys
+
+    import psutil
+
+    from aisim.resources import profile_worker_pressure
+
+    worker = psutil.Process()
+    with subprocess.Popen(
+        [sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    ) as child:
+        assert child.stdout.readline() == b"ready\n"
+        child_rss = psutil.Process(child.pid).memory_info().rss
+        limit = worker.memory_info().rss + child_rss // 2
+        pressure = profile_worker_pressure([worker.pid], limit)
+        assert pressure["worker_pid"] == worker.pid
+        assert pressure["worker_rss_bytes"] > pressure["worker_rss_limit_bytes"] == limit
+
+
 def test_resource_retries_are_bounded_and_preserve_completed_work():
     factory = _BudgetFactory()
     specs = [{"id": 0, "cost": 1}, {"id": 1, "cost": 1, "refuse": True}]
@@ -123,7 +202,7 @@ class _EstimateFactory:
 
 
 def test_whole_wave_reserves_sum_against_one_live_snapshot(monkeypatch):
-    from aisimulate import resources
+    from aisim import resources
 
     monkeypatch.setattr(resources, "discover_host", lambda: HostResources(16 * GB, 9 * GB, 8))
     factory = GuardedRunnerFactory(_EstimateFactory(), "custom", ResourceConfig())
@@ -140,7 +219,7 @@ def test_whole_wave_reserves_sum_against_one_live_snapshot(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _cold_trace_scan_cache():
-    from aisimulate import resources
+    from aisim import resources
 
     resources._clear_trace_scan_cache()
     yield
@@ -160,8 +239,8 @@ def test_unknown_peak_runs_serially_until_a_replay_is_observed(tmp_path, monkeyp
     from concurrent.futures import Future
     from pathlib import Path
 
-    from aisimulate import resource_scheduler as scheduler
-    from aisimulate import resources
+    from aisim import resource_scheduler as scheduler
+    from aisim import resources
 
     trace = tmp_path / "requests.jsonl"
     trace.write_text('{"input_length":4,"output_length":1,"hash_ids":[1]}\n')
@@ -171,7 +250,7 @@ def test_unknown_peak_runs_serially_until_a_replay_is_observed(tmp_path, monkeyp
         )
         for i in range(8)
     ]
-    monkeypatch.setenv("_AISIMULATE_SUPERVISED_BUDGET", "{}")
+    monkeypatch.setenv("_AISIM_SUPERVISED_BUDGET", "{}")
     monkeypatch.setattr(resources, "discover_host", lambda: HostResources(32 * GB, 16 * GB, 8))
     monkeypatch.setattr(
         resources,
@@ -263,8 +342,8 @@ def test_unknown_peak_runs_serially_until_a_replay_is_observed(tmp_path, monkeyp
 
 
 def test_unknown_peak_over_budget_retries_serially_without_workers(tmp_path, monkeypatch):
-    from aisimulate import resource_scheduler as scheduler
-    from aisimulate import resources
+    from aisim import resource_scheduler as scheduler
+    from aisim import resources
 
     trace = tmp_path / "requests.jsonl"
     trace.write_text('{"input_length":4,"output_length":1000000000000,"hash_ids":[1]}\n')
@@ -272,7 +351,7 @@ def test_unknown_peak_over_budget_retries_serially_without_workers(tmp_path, mon
         SimpleNamespace(workload={"trace_path": str(trace), "trace_format": "agentic_mooncake"}, concurrency=None)
         for _ in range(8)
     ]
-    monkeypatch.setenv("_AISIMULATE_SUPERVISED_BUDGET", "{}")
+    monkeypatch.setenv("_AISIM_SUPERVISED_BUDGET", "{}")
     monkeypatch.setattr(resources, "discover_host", lambda: HostResources(32 * GB, 16 * GB, 8))
     monkeypatch.setattr(
         resources,
@@ -321,7 +400,7 @@ def test_unknown_peak_over_budget_retries_serially_without_workers(tmp_path, mon
 def test_live_pressure_retries_only_unfinished_work_after_cleanup(monkeypatch):
     from concurrent.futures import Future
 
-    from aisimulate import resource_scheduler as scheduler
+    from aisim import resource_scheduler as scheduler
 
     alive = []
     waves = []
@@ -395,7 +474,7 @@ def test_readiness_counts_actual_workers_when_the_pool_reuses_one(monkeypatch):
     from concurrent.futures import Future
     from pathlib import Path
 
-    from aisimulate import resource_scheduler as scheduler
+    from aisim import resource_scheduler as scheduler
 
     elapsed = [0.0]
     finished = Future()
@@ -453,7 +532,7 @@ def test_sibling_finished_during_a_yield_pause_is_not_reported_timed_out(monkeyp
     from concurrent.futures import Future
     from pathlib import Path
 
-    from aisimulate import resource_scheduler as scheduler
+    from aisim import resource_scheduler as scheduler
 
     future0 = Future()
     future1 = Future()
@@ -524,7 +603,7 @@ def test_multiple_siblings_finishing_across_successive_yield_pauses_are_drained(
     from concurrent.futures import Future
     from pathlib import Path
 
-    from aisimulate import resource_scheduler as scheduler
+    from aisim import resource_scheduler as scheduler
 
     future0, future1, future2 = Future(), Future(), Future()
 

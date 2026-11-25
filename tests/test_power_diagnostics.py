@@ -7,8 +7,9 @@ import json
 
 import pytest
 
-from aisimulate.output import format_prediction_stdout
-from aisimulate.replay.reporting import format_power_diagnostics
+from aisim.detail import energy_diagnostics
+from aisim.output import format_prediction_stdout
+from aisim.replay.reporting import format_power_diagnostics
 
 
 def _diagnostics() -> dict:
@@ -106,6 +107,48 @@ def test_power_diagnostics_json_stdout_keeps_complete_operation_evidence() -> No
     assert operations[0]["status"] == "missing"
 
 
+def test_step_power_detail_preserves_active_metrics() -> None:
+    diagnostics = _diagnostics()
+    diagnostics.update(
+        publication_status="available",
+        power_w=400.0,
+        power_coverage=1.0,
+        attention_dp_wait_ms=4.0,
+        step_power_w=230.0,
+        phases=[diagnostics["phases"][1]],
+    )
+    detail = energy_diagnostics({"power_diagnostics": diagnostics})
+    assert detail["power_w"] == 400.0
+    assert detail["power_coverage"] == 1.0
+    assert detail["attention_dp_wait_ms"] == 4.0
+    assert detail["step_power_w"] == 230.0
+    assert "Attention-DP wait: 4.00 ms across ranks. Step power: 230.00 W" in format_power_diagnostics(detail)
+
+
+def test_step_power_without_wait_watts_renders_unavailable() -> None:
+    diagnostics = _diagnostics()
+    diagnostics.update(
+        publication_status="available",
+        power_w=400.0,
+        power_coverage=1.0,
+        attention_dp_wait_ms=4.0,
+        step_power_w=None,
+        phases=[diagnostics["phases"][1]],
+    )
+    detail = energy_diagnostics({"power_diagnostics": diagnostics})
+    assert detail["power_w"] == 400.0
+    assert detail["step_power_w"] is None
+    assert "Attention-DP wait: 4.00 ms across ranks. Step power: N/A" in format_power_diagnostics(detail)
+
+
+def test_wait_line_is_absent_when_wait_is_not_tracked() -> None:
+    diagnostics = _diagnostics()
+    diagnostics.update(publication_status="available", power_w=400.0, power_coverage=1.0)
+    diagnostics.pop("attention_dp_wait_ms", None)
+    diagnostics.pop("step_power_w", None)
+    assert "Attention-DP wait" not in format_power_diagnostics(diagnostics)
+
+
 def test_unsupported_diagnostics_explain_missing_provider_evidence() -> None:
     rendered = format_power_diagnostics(
         {
@@ -122,7 +165,7 @@ def test_unsupported_diagnostics_explain_missing_provider_evidence() -> None:
 
 @pytest.mark.parametrize("value", [True, False, float("nan"), float("inf"), float("-inf")])
 def test_invalid_measurements_are_unavailable_and_sort_last(value):
-    from aisimulate.replay.reporting import (
+    from aisim.replay.reporting import (
         _format_energy,
         _format_latency,
         _format_percent,
@@ -139,7 +182,7 @@ def test_invalid_measurements_are_unavailable_and_sort_last(value):
 
 
 def test_compatibility_diagnostics_remain_visible_with_other_details() -> None:
-    from aisimulate.output import format_prediction_stdout
+    from aisim.output import format_prediction_stdout
 
     diagnostics = {
         "publication_status": "unsupported",
@@ -156,11 +199,11 @@ def test_compatibility_diagnostics_remain_visible_with_other_details() -> None:
             details={"schema_version": "1.0", "sections": sections, "skipped": {}},
             power_diagnostics=diagnostics,
         )
-        assert rendered.count("AISimulate active forward-pass energy diagnostics (per GPU)") == 1
+        assert rendered.count("AISim active forward-pass energy diagnostics (per GPU)") == 1
 
 
 def _energy_detail_payload():
-    from aisimulate.detail import build_prediction_details
+    from aisim.detail import build_prediction_details
 
     return build_prediction_details({"power_diagnostics": _diagnostics()}, ("energy",))
 
@@ -206,7 +249,7 @@ def test_energy_schema_requires_a_reason_when_energy_is_skipped(skipped, valid):
     ],
 )
 def test_energy_publication_status_matches_nullable_watts(level, status, watts, valid):
-    from aisimulate.detail import energy_diagnostics
+    from aisim.detail import energy_diagnostics
 
     payload = _energy_detail_payload()
     diagnostics = payload["sections"]["energy"]["diagnostics"]
@@ -230,7 +273,7 @@ def test_energy_publication_status_matches_nullable_watts(level, status, watts, 
 
 @pytest.mark.parametrize("phases", [None, {}, "invalid", [None]])
 def test_energy_export_rejects_malformed_phase_containers(phases):
-    from aisimulate.detail import energy_diagnostics
+    from aisim.detail import energy_diagnostics
 
     diagnostics = _diagnostics()
     diagnostics["phases"] = phases
@@ -262,7 +305,7 @@ def test_energy_export_rejects_malformed_phase_containers(phases):
     ],
 )
 def test_energy_publication_status_matches_coverage(level, status, coverage, valid):
-    from aisimulate.detail import energy_diagnostics
+    from aisim.detail import energy_diagnostics
 
     payload = _energy_detail_payload()
     diagnostics = payload["sections"]["energy"]["diagnostics"]

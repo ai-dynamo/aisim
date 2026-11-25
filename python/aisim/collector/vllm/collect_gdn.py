@@ -1,0 +1,598 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""vLLM 0.24.0 Qwen3.5 Gated DeltaNet collector.
+
+The collector times the two production core operations separately. Prefill
+uses vLLM's ``ChunkGatedDeltaRule`` so its default resolver selects the real
+FlashInfer or Triton/FLA backend for the current GPU. Decode uses vLLM's packed
+recurrent kernel. Both phases use the production packed-QKV convolution width.
+Input/output projection GEMMs remain covered by the GEMM collector.
+"""
+
+# Audited against vLLM v0.32.0 (from v0.30.0): every import and all ten
+# GDNAttentionMetadata fields this collector passes are unchanged. Prefill backend
+# selection is unchanged on CUDA (SM90 FlashInfer; SM100/103/120 FlashInfer when
+# head_k_dim == 128 on CUDA 13; SM89 Triton/FLA; qwen_gdn_linear_attn.py:93-195),
+# but FlashInfer 0.7.0.post1 rewrote its GDN prefill kernels and the FLA Triton
+# chunk kernels moved off tl.make_block_ptr, so prefill-core rows are re-collected.
+# Earlier audits are git history.
+__compat__ = "vllm==0.32.0"
+
+import gc
+import os
+from types import SimpleNamespace
+
+import torch
+from collector.helper import benchmark_with_power, get_sm_version, log_perf
+from collector.op_plans import plan_cases
+from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import ChunkGatedDeltaRule
+from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+from vllm.third_party.flash_linear_attention.ops import (
+    fused_recurrent_gated_delta_rule_packed_decode,
+)
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
+from vllm.version import __version__ as vllm_version
+
+aic_debug = int(os.getenv("aic_gdn_debug", "0"))  # noqa: SIM112
+
+
+def get_gdn_test_cases():
+    return plan_cases("gdn", "vllm", get_sm_version())
+
+
+def run_gdn_context_benchmark(
+    d_model: int,
+    d_conv: int,
+    num_k_heads: int,
+    head_k_dim: int,
+    num_v_heads: int,
+    head_v_dim: int,
+    batch_size_list: list[int],
+    seq_len_list: list[int],
+    model_name: str,
+    perf_filename: str,
+    device: str = "cuda:0",
+):
+    """Benchmark the production packed-QKV convolution and prefill GDN op."""
+    device = torch.device(device)
+    torch.cuda.set_device(device)
+    torch.set_default_device(device)
+
+    dtype = torch.bfloat16
+    key_dim = num_k_heads * head_k_dim
+    value_dim = num_v_heads * head_v_dim
+    conv_dim = 2 * key_dim + value_dim
+
+    # ChunkGatedDeltaRule owns vLLM's production backend resolver. The only
+    # model field consulted by the default resolver is linear_key_head_dim.
+    vllm_config = VllmConfig()
+    vllm_config.model_config = SimpleNamespace(hf_text_config=SimpleNamespace(linear_key_head_dim=head_k_dim))
+    with set_current_vllm_config(vllm_config):
+        chunk_gdn = ChunkGatedDeltaRule()
+    prefill_backend = chunk_gdn.gdn_prefill_backend
+
+    if aic_debug:
+        print(
+            f"GDN Context: d_model={d_model}, conv_dim={conv_dim}, "
+            f"num_k_heads={num_k_heads}, head_k_dim={head_k_dim}, "
+            f"num_v_heads={num_v_heads}, head_v_dim={head_v_dim}, "
+            f"prefill_backend={prefill_backend}"
+        )
+
+    conv_weight = torch.randn(conv_dim, d_conv, dtype=dtype, device=device)
+    # Qwen3.5 constructs this depthwise convolution with bias=False.
+    conv_bias = None
+
+    for batch_size in batch_size_list:
+        for seq_len in seq_len_list:
+            if aic_debug:
+                print(f"  Benchmarking batch_size={batch_size}, seq_len={seq_len}")
+
+            num_warmups = 3
+            num_runs = 10
+            num_tokens = batch_size * seq_len
+            common_log_data = {
+                "phase": "context",
+                "batch_size": batch_size,
+                "seq_len": seq_len,
+                "num_tokens": num_tokens,
+                "d_model": d_model,
+                "d_conv": d_conv,
+                "num_k_heads": num_k_heads,
+                "head_k_dim": head_k_dim,
+                "num_v_heads": num_v_heads,
+                "head_v_dim": head_v_dim,
+                "model_name": model_name,
+            }
+            query_start_loc_cpu = torch.arange(
+                0,
+                num_tokens + 1,
+                seq_len,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            query_start_loc = query_start_loc_cpu.to(device)
+            # Serving precomputes this metadata once in the attention builder
+            # and passes it into every layer's causal_conv1d_fn call. Omitting
+            # it takes the non-serving branch, which performs D2H/NumPy/list
+            # setup inside every timed invocation. Keep the collector on the
+            # pinned vLLM 0.24.0 serving path:
+            # vllm/v1/attention/backends/gdn_attn.py:505-516 and
+            # vllm/v1/attention/backends/utils.py:1066-1113 @ ee0da84ab.
+            nums_dict, batch_ptr, token_chunk_offset_ptr = compute_causal_conv1d_metadata(
+                query_start_loc_cpu,
+                device=device,
+            )
+            conv_metadata = GDNAttentionMetadata(
+                num_prefills=batch_size,
+                num_prefill_tokens=num_tokens,
+                num_decodes=0,
+                num_decode_tokens=0,
+                num_spec_decodes=0,
+                num_spec_decode_tokens=0,
+                num_actual_tokens=num_tokens,
+                nums_dict=nums_dict,
+                batch_ptr=batch_ptr,
+                token_chunk_offset_ptr=token_chunk_offset_ptr,
+            )
+
+            # Production prefill applies the depthwise convolution to packed
+            # QKV, not only to K. Fresh prompts have no initial conv state.
+            conv_input = torch.randn(num_tokens, conv_dim, dtype=dtype, device=device).transpose(0, 1)
+            # Serving stores conv state in the SD layout and hands the
+            # stride-aware conv kernels a transposed (dim, width-1) view
+            # (vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+            # 1393-1397); match its strides.
+            conv_state = torch.zeros(
+                batch_size + 1,
+                d_conv - 1,
+                conv_dim,
+                dtype=dtype,
+                device=device,
+            ).transpose(-1, -2)
+            # State slot zero is vLLM's null block and is intentionally never
+            # assigned to a live request.
+            cache_indices = torch.arange(1, batch_size + 1, dtype=torch.int32, device=device)
+            has_initial_state = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+            def run_conv1d(_conv_input=conv_input, _conv_state=conv_state):
+                causal_conv1d_fn(
+                    _conv_input,
+                    conv_weight,
+                    conv_bias,
+                    _conv_state,
+                    query_start_loc,
+                    cache_indices=cache_indices,
+                    has_initial_state=has_initial_state,
+                    activation="silu",
+                    metadata=conv_metadata,
+                )
+
+            run_conv1d()
+            torch.cuda.synchronize()
+            with benchmark_with_power(
+                device=device,
+                kernel_func=run_conv1d,
+                num_warmups=num_warmups,
+                num_runs=num_runs,
+                # Production launches this op eagerly but back-to-back in a deep
+                # queue, so the row must hold GPU service time; a sync-bounded
+                # eager loop would time the launch envelope instead.
+                repeat_n=10,
+            ) as results:
+                log_perf(
+                    item_list=[{**common_log_data, "latency": results["latency_ms"]}],
+                    framework="vLLM",
+                    version=vllm_version,
+                    device_name=torch.cuda.get_device_name(device),
+                    op_name="gdn",
+                    kernel_source="causal_conv1d_fn",
+                    perf_filename=perf_filename,
+                    power_stats=results["power_stats"],
+                )
+
+            # Release the packed convolution input before allocating Q/K/V for
+            # the scan; the largest full-collection points otherwise hold both
+            # large representations at once.
+            del run_conv1d, conv_input, conv_state
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            # fused_post_conv_prep produces these packed, batch-flattened
+            # tensors in production and performs Q/K normalization itself.
+            q = torch.nn.functional.normalize(
+                torch.randn(
+                    1,
+                    num_tokens,
+                    num_k_heads,
+                    head_k_dim,
+                    dtype=dtype,
+                    device=device,
+                ),
+                dim=-1,
+            )
+            k = torch.nn.functional.normalize(
+                torch.randn(
+                    1,
+                    num_tokens,
+                    num_k_heads,
+                    head_k_dim,
+                    dtype=dtype,
+                    device=device,
+                ),
+                dim=-1,
+            )
+            v = torch.randn(1, num_tokens, num_v_heads, head_v_dim, dtype=dtype, device=device)
+            g = torch.nn.functional.logsigmoid(
+                torch.randn(
+                    1,
+                    num_tokens,
+                    num_v_heads,
+                    dtype=torch.float32,
+                    device=device,
+                )
+            )
+            beta = torch.sigmoid(
+                torch.randn(
+                    1,
+                    num_tokens,
+                    num_v_heads,
+                    dtype=torch.float32,
+                    device=device,
+                )
+            )
+            # FP32 recurrent state matches serving: Qwen3.5 checkpoints pin
+            # mamba_ssm_dtype=float32 (vllm/model_executor/models/config.py:853-878).
+            # Qwen3.5-only contract; revisit if other GDN models join.
+            gdn_state = torch.zeros(
+                batch_size,
+                num_v_heads,
+                head_v_dim,
+                head_k_dim,
+                dtype=torch.float32,
+                device=device,
+            )
+
+            # FIXME(kernel-limit): on SM120, every GDN context group raises a
+            # deterministic illegal memory access inside vLLM's chunked
+            # gated-delta-rule prefill kernel (chunk.py:61 ->
+            # chunk_delta_h.py:309 -> index.py:36-40 prepare_chunk_offsets
+            # same relative call chain and byte-identical
+            # prepare_chunk_offsets body at chunk.py:61 ->
+            # chunk_delta_h.py:309 -> index.py:36-40 -- relocated from
+            # vllm.model_executor.layers.fla.ops to
+            # vllm.third_party.flash_linear_attention.ops at 0.27.1,
+            # re-verified present at both versions) at its
+            # largest num_tokens sub-points (~1M total tokens;
+            # smaller sub-points record normally) — reproduced in isolation
+            # on a clean RTX PRO 6000 Blackwell GPU at 0.24.0; all 8 Qwen3.5
+            # GDN model groups affected (SM90/SM100 pass). Same family on
+            # SM89 (L40S): 6 of 8 context groups IMA (reproduced in
+            # isolation on a clean GPU, rows through 1.05M tokens recorded
+            # first); the two smallest-model groups (0.8B, 2B) instead hit
+            # device-capacity OOM at their largest sub-points on 46 GB.
+            # Generation passes. Serving
+            # fails identically. NOT re-tested on hardware at 0.27.1 (no GPU
+            # in this environment) -- the cited kernel chain is confirmed
+            # present and source-unchanged, so the claim is not dangling, but
+            # the bug reproduction itself is unconfirmed at this version.
+            # 27.1 GPU run.
+            # RE-VERIFIED on hardware at 0.30.0, SM89 (L40, clean GPU, container per op):
+            # a 40-case --shuffle sample of the gdn op failed 21 tasks, 17 of them CUDA faults
+            # (9 illegal memory access + 8 SIGABRT) in this same chunked prefill at the large-token
+            # sub-points, 3 a grid-y guard this collector wrongly raised (the packed decode splits
+            # its grid above B*HV=65535, fused_recurrent.py:453-456), 1 capacity OOM.
+            def run_gdn_scan(_q=q, _k=k, _v=v, _g=g, _beta=beta, _state=gdn_state):
+                chunk_gdn(
+                    q=_q,
+                    k=_k,
+                    v=_v,
+                    g=_g,
+                    beta=_beta,
+                    initial_state=_state,
+                    output_final_state=True,
+                    cu_seqlens=query_start_loc,
+                    use_qk_l2norm_in_kernel=False,
+                )
+
+            run_gdn_scan()
+            torch.cuda.synchronize()
+            with benchmark_with_power(
+                device=device,
+                kernel_func=run_gdn_scan,
+                num_warmups=num_warmups,
+                num_runs=num_runs,
+                repeat_n=10,
+            ) as results:
+                log_perf(
+                    item_list=[{**common_log_data, "latency": results["latency_ms"]}],
+                    framework="vLLM",
+                    version=vllm_version,
+                    device_name=torch.cuda.get_device_name(device),
+                    op_name="gdn",
+                    kernel_source=f"chunk_gated_delta_rule_{prefill_backend}",
+                    perf_filename=perf_filename,
+                    power_stats=results["power_stats"],
+                )
+
+            del run_gdn_scan, q, k, v, g, beta, gdn_state
+            gc.collect()
+            torch.cuda.empty_cache()
+
+
+def run_gdn_generation_benchmark(
+    d_model: int,
+    d_conv: int,
+    num_k_heads: int,
+    head_k_dim: int,
+    num_v_heads: int,
+    head_v_dim: int,
+    batch_size_list: list[int],
+    model_name: str,
+    perf_filename: str,
+    device: str = "cuda:0",
+):
+    """Benchmark packed-QKV convolution and packed recurrent decode."""
+    device = torch.device(device)
+    torch.cuda.set_device(device)
+    torch.set_default_device(device)
+
+    dtype = torch.bfloat16
+    key_dim = num_k_heads * head_k_dim
+    value_dim = num_v_heads * head_v_dim
+    conv_dim = 2 * key_dim + value_dim
+
+    if aic_debug:
+        print(
+            f"GDN Generation: d_model={d_model}, conv_dim={conv_dim}, "
+            f"num_k_heads={num_k_heads}, head_k_dim={head_k_dim}, "
+            f"num_v_heads={num_v_heads}, head_v_dim={head_v_dim}"
+        )
+
+    conv_weight = torch.randn(conv_dim, d_conv, dtype=dtype, device=device)
+    conv_bias = None
+    a_log = torch.zeros(num_v_heads, dtype=torch.float32, device=device)
+    dt_bias = torch.zeros(num_v_heads, dtype=dtype, device=device)
+
+    for batch_size in batch_size_list:
+        if aic_debug:
+            print(f"  Benchmarking batch_size={batch_size}")
+
+        num_warmups = 3
+        num_runs = 10
+        common_log_data = {
+            "phase": "generation",
+            "batch_size": batch_size,
+            "seq_len": 1,
+            "num_tokens": batch_size,
+            "d_model": d_model,
+            "d_conv": d_conv,
+            "num_k_heads": num_k_heads,
+            "head_k_dim": head_k_dim,
+            "num_v_heads": num_v_heads,
+            "head_v_dim": head_v_dim,
+            "model_name": model_name,
+        }
+
+        conv_input = torch.randn(batch_size, conv_dim, dtype=dtype, device=device)
+        # SD-layout state with a transposed view, matching serving strides
+        # (see the context-phase note).
+        conv_state = torch.randn(
+            batch_size + 1,
+            d_conv - 1,
+            conv_dim,
+            dtype=dtype,
+            device=device,
+        ).transpose(-1, -2)
+        state_indices = torch.arange(1, batch_size + 1, dtype=torch.int32, device=device)
+
+        def run_conv1d_update(_conv_input=conv_input, _conv_state=conv_state):
+            return causal_conv1d_update(
+                _conv_input,
+                _conv_state,
+                conv_weight,
+                conv_bias,
+                activation="silu",
+                conv_state_indices=state_indices,
+                validate_data=True,
+            )
+
+        mixed_qkv = run_conv1d_update()
+        torch.cuda.synchronize()
+        with benchmark_with_power(
+            device=device,
+            kernel_func=run_conv1d_update,
+            num_warmups=num_warmups,
+            num_runs=num_runs,
+            repeat_n=10,
+        ) as results:
+            log_perf(
+                item_list=[{**common_log_data, "latency": results["latency_ms"]}],
+                framework="vLLM",
+                version=vllm_version,
+                device_name=torch.cuda.get_device_name(device),
+                op_name="gdn",
+                kernel_source="causal_conv1d_update",
+                perf_filename=perf_filename,
+                power_stats=results["power_stats"],
+            )
+
+        del run_conv1d_update, conv_input, conv_state
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # The production non-spec decode fast path feeds packed convolution
+        # output directly to this recurrent kernel: GDN decode routes to
+        # _forward_core_decode_non_spec, which calls
+        # fused_recurrent_gated_delta_rule_packed_decode with
+        # scale=head_k_dim**-0.5 and use_qk_l2norm_in_kernel=True
+        # (vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:1374,
+        # 1684), gated by VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
+        # which defaults to True (vllm/envs.py:132).
+        a = torch.randn(batch_size, num_v_heads, dtype=dtype, device=device)
+        b = torch.randn(batch_size, num_v_heads, dtype=dtype, device=device)
+        # FP32 recurrent state matches serving (see the context-phase note).
+        gdn_state = torch.randn(
+            batch_size + 1,
+            num_v_heads,
+            head_v_dim,
+            head_k_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        out = torch.empty(
+            batch_size,
+            1,
+            num_v_heads,
+            head_v_dim,
+            dtype=dtype,
+            device=device,
+        )
+
+        def run_gdn_update(
+            _mixed_qkv=mixed_qkv,
+            _a=a,
+            _b=b,
+            _state=gdn_state,
+            _out=out,
+        ):
+            fused_recurrent_gated_delta_rule_packed_decode(
+                mixed_qkv=_mixed_qkv,
+                a=_a,
+                b=_b,
+                A_log=a_log,
+                dt_bias=dt_bias,
+                scale=head_k_dim**-0.5,
+                initial_state=_state,
+                out=_out,
+                ssm_state_indices=state_indices,
+                use_qk_l2norm_in_kernel=True,
+            )
+
+        run_gdn_update()
+        torch.cuda.synchronize()
+        with benchmark_with_power(
+            device=device,
+            kernel_func=run_gdn_update,
+            num_warmups=num_warmups,
+            num_runs=num_runs,
+            repeat_n=10,
+        ) as results:
+            log_perf(
+                item_list=[{**common_log_data, "latency": results["latency_ms"]}],
+                framework="vLLM",
+                version=vllm_version,
+                device_name=torch.cuda.get_device_name(device),
+                op_name="gdn",
+                kernel_source="fused_recurrent_gated_delta_rule_packed_decode",
+                perf_filename=perf_filename,
+                power_stats=results["power_stats"],
+            )
+
+        del run_gdn_update, mixed_qkv, a, b, gdn_state, out
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def run_gdn_torch(
+    phase: str,
+    d_model: int,
+    d_conv: int,
+    num_k_heads: int,
+    head_k_dim: int,
+    num_v_heads: int,
+    head_v_dim: int,
+    batch_size_list: list[int],
+    seq_len_list: list[int] | None,
+    model_name: str,
+    *,
+    perf_filename: str,
+    device: str = "cuda:0",
+):
+    """Route one collector-v2 GDN case to its phase implementation."""
+    if phase == "context":
+        if seq_len_list is None:
+            raise ValueError("context GDN cases require seq_len_list")
+        run_gdn_context_benchmark(
+            d_model=d_model,
+            d_conv=d_conv,
+            num_k_heads=num_k_heads,
+            head_k_dim=head_k_dim,
+            num_v_heads=num_v_heads,
+            head_v_dim=head_v_dim,
+            batch_size_list=batch_size_list,
+            seq_len_list=seq_len_list,
+            model_name=model_name,
+            perf_filename=perf_filename,
+            device=device,
+        )
+    elif phase == "generation":
+        run_gdn_generation_benchmark(
+            d_model=d_model,
+            d_conv=d_conv,
+            num_k_heads=num_k_heads,
+            head_k_dim=head_k_dim,
+            num_v_heads=num_v_heads,
+            head_v_dim=head_v_dim,
+            batch_size_list=batch_size_list,
+            model_name=model_name,
+            perf_filename=perf_filename,
+            device=device,
+        )
+    else:
+        raise ValueError(f"Unknown phase: {phase}")
+
+
+if __name__ == "__main__":
+    from collector.registry_types import PerfFile
+
+    print(f"GDN Collector - vLLM {vllm_version}")
+    print(f"SM Version: {get_sm_version()}")
+    print(f"Device: {torch.cuda.get_device_name()}")
+    print()
+
+    test_cases = get_gdn_test_cases()
+    print(f"Total test cases: {len(test_cases)}")
+
+    for i, test_case in enumerate(test_cases):
+        (
+            phase,
+            d_model,
+            d_conv,
+            num_k_heads,
+            head_k_dim,
+            num_v_heads,
+            head_v_dim,
+            batch_size_list,
+            seq_len_list,
+            model_name,
+        ) = test_case
+
+        print(f"\n[{i + 1}/{len(test_cases)}] {model_name} - {phase}")
+        print(
+            f"  d_model={d_model}, num_k_heads={num_k_heads}, head_k_dim={head_k_dim}, "
+            f"num_v_heads={num_v_heads}, head_v_dim={head_v_dim}, d_conv={d_conv}"
+        )
+
+        if phase == "context":
+            print(f"  batch_sizes={batch_size_list}")
+            print(f"  seq_lens={seq_len_list}")
+        else:
+            print(f"  batch_sizes={batch_size_list}")
+
+        run_gdn_torch(
+            phase=phase,
+            d_model=d_model,
+            d_conv=d_conv,
+            num_k_heads=num_k_heads,
+            head_k_dim=head_k_dim,
+            num_v_heads=num_v_heads,
+            head_v_dim=head_v_dim,
+            batch_size_list=batch_size_list,
+            seq_len_list=seq_len_list,
+            model_name=model_name,
+            perf_filename=PerfFile.GDN,
+        )

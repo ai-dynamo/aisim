@@ -1,5 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2023-2024 SGLang Team
 // SPDX-License-Identifier: Apache-2.0
+// Cache-salt behavior adapted from SGLang v0.5.22; see THIRD_PARTY_NOTICES.md.
+// Source: https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -9,7 +12,8 @@ use uuid::Uuid;
 
 use super::trace::synthesize_validated_trace_tokens;
 use crate::engine::{
-    ImageSpec, XXH3_SEED, block_hashes, compute_block_hash_for_tokens, compute_next_sequence_hash,
+    ImageSpec, block_hashes_with_salt, cache_salt_seed, compute_block_hash_for_tokens,
+    compute_next_sequence_hash,
 };
 use crate::replay::protocol::DirectRequest;
 
@@ -184,6 +188,11 @@ pub struct AgenticMooncakeRow {
     /// configured engine timing model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded_api_time_ms: Option<f64>,
+    /// Source-recorded start offset of a request that `not_before_ms` does not
+    /// hold to the recorded clock. A snapshot reads it for the cut and for the
+    /// request's timer after the cut; replay does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_start_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -258,6 +267,11 @@ pub struct AgenticNode {
     // recorded request starts. Excluded from the canonical graph contract.
     #[serde(skip)]
     pub(super) recorded_interval_ms: Option<(f64, Option<f64>)>,
+    // The recorded start still holds this request when it resumes after a
+    // snapshot cut with its causal predecessor in history. Excluded like the
+    // interval.
+    #[serde(skip)]
+    pub(super) recorded_start_gates_frontier: bool,
     pub(super) priority: i32,
     pub(super) strict_priority: u32,
     pub(super) policy_class: Option<String>,
@@ -476,9 +490,9 @@ pub enum SessionPartitionSpec {
     RoundRobin { num_partitions: usize },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ReplayRequestHashes {
-    /// Token-only hashes for complete engine blocks.
+    /// Local hashes for complete engine blocks, including any cache salt.
     ///
     /// These remain raw identities here; a Dynamo placement adapter converts
     /// them to `LocalBlockHash` at its API boundary.
@@ -491,13 +505,51 @@ impl ReplayRequestHashes {
     /// Materialize stable replay block identities without importing a concrete
     /// Router implementation or its wire types.
     pub fn from_tokens(tokens: &[u32], engine_block_size: u32) -> Self {
+        Self::from_tokens_with_cache_salt(tokens, engine_block_size, None)
+    }
+
+    /// Hash an SGLang prompt in the same cache namespace as the native engine.
+    /// Empty salt is equivalent to absent; unsalted identities stay unchanged.
+    pub fn from_tokens_with_cache_salt(
+        tokens: &[u32],
+        engine_block_size: u32,
+        cache_salt: Option<&str>,
+    ) -> Self {
         if engine_block_size == 0 {
             return Self::from_local_block_hashes(Vec::new());
         }
-        Self::from_local_block_hashes(block_hashes(tokens, engine_block_size as usize).collect())
+        Self::from_local_block_hashes(
+            block_hashes_with_salt(tokens, engine_block_size as usize, cache_salt).collect(),
+        )
     }
 
-    /// Equal to [`Self::from_tokens`] over the prompt that
+    /// Extend hashes that cover a prefix of `tokens` to all of its complete
+    /// blocks. Equal to [`Self::from_tokens`] over `tokens`: a block's local
+    /// hash reads only its own tokens and a sequence hash only its parent, so
+    /// appending tokens never changes a hash that is already here.
+    pub(crate) fn extend_from_tokens(&mut self, tokens: &[u32], engine_block_size: u32) {
+        let block_size = engine_block_size as usize;
+        if block_size == 0 {
+            return;
+        }
+        let new_tokens = &tokens[self.local_block_hashes.len() * block_size..];
+        let new_blocks = new_tokens.len() / block_size;
+        self.local_block_hashes.reserve(new_blocks);
+        self.sequence_hashes.reserve(new_blocks);
+        for block_hash in block_hashes_with_salt(new_tokens, block_size, None) {
+            let sequence_hash = self
+                .sequence_hashes
+                .last()
+                .copied()
+                .map_or(block_hash, |parent| {
+                    compute_next_sequence_hash(parent, block_hash)
+                });
+            self.local_block_hashes.push(block_hash);
+            self.sequence_hashes.push(sequence_hash);
+        }
+    }
+
+    /// Equal to [`Self::from_tokens_with_cache_salt`] over the prompt that
     /// `synthesize_validated_trace_tokens` would build, without materializing
     /// it: token `p` of that prompt is `hash_ids[p / trace_block_size]`.
     pub(crate) fn from_trace_blocks(
@@ -505,6 +557,7 @@ impl ReplayRequestHashes {
         hash_ids: &[u32],
         trace_block_size: usize,
         engine_block_size: u32,
+        cache_salt: Option<&str>,
     ) -> Self {
         let block_size = engine_block_size as usize;
         if block_size == 0 {
@@ -513,9 +566,10 @@ impl ReplayRequestHashes {
         if trace_block_size == 0 || hash_ids.len().saturating_mul(trace_block_size) < input_length {
             let tokens =
                 synthesize_validated_trace_tokens(input_length, hash_ids, trace_block_size);
-            return Self::from_tokens(&tokens, engine_block_size);
+            return Self::from_tokens_with_cache_salt(&tokens, engine_block_size, cache_salt);
         }
 
+        let seed = cache_salt_seed(cache_salt);
         let mut block = vec![0_u32; block_size];
         // Consecutive engine blocks inside one trace block are identical.
         let mut previous_run: Option<(u32, u64)> = None;
@@ -532,7 +586,7 @@ impl ReplayRequestHashes {
                         return hash;
                     }
                     block.fill(token);
-                    let hash = compute_block_hash_for_tokens(&block, XXH3_SEED);
+                    let hash = compute_block_hash_for_tokens(&block, seed);
                     previous_run = Some((token, hash));
                     return hash;
                 }
@@ -545,7 +599,7 @@ impl ReplayRequestHashes {
                     position = run_end;
                 }
                 previous_run = None;
-                compute_block_hash_for_tokens(&block, XXH3_SEED)
+                compute_block_hash_for_tokens(&block, seed)
             })
             .collect();
         Self::from_local_block_hashes(local_block_hashes)
@@ -667,19 +721,22 @@ impl ReplayRequestPayload {
     /// a deferred prompt.
     pub(crate) fn replay_hashes(&self, engine_block_size: u32) -> ReplayRequestHashes {
         match self {
-            Self::Materialized(request) => {
-                ReplayRequestHashes::from_tokens(&request.tokens, engine_block_size)
-            }
+            Self::Materialized(request) => ReplayRequestHashes::from_tokens_with_cache_salt(
+                &request.tokens,
+                engine_block_size,
+                request.cache_salt.as_deref(),
+            ),
             Self::Deferred {
+                request_metadata,
                 input_length,
                 hash_ids,
                 trace_block_size,
-                ..
             } => ReplayRequestHashes::from_trace_blocks(
                 *input_length,
                 hash_ids,
                 *trace_block_size,
                 engine_block_size,
+                request_metadata.cache_salt.as_deref(),
             ),
         }
     }

@@ -5,22 +5,23 @@
 
 import json
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import yaml
 from pydantic import ValidationError
 
-from aisimulate import EngineReplayRunnerFactory, ReplayOutputRequirements
-from aisimulate.compiler import prediction_to_replay_spec
-from aisimulate.config import CorePredictionConfig, CoreRecommendationConfig
-from aisimulate.config.engine import NgramSpeculationConfig
-from aisimulate.main import main
-from aisimulate.recommend import recommendation_to_sweeper
-from aisimulate.sweeper.config import SearchSpace
+from aisim import EngineReplayRunnerFactory, ReplayOutputRequirements
+from aisim.compiler import prediction_to_replay_spec
+from aisim.config import CorePredictionConfig, CoreRecommendationConfig
+from aisim.config.engine import NgramSpeculationConfig
+from aisim.main import main
+from aisim.recommend import recommendation_to_sweeper
+from aisim.sweeper.config import SearchSpace
 
 # Reuse the SDK's attributed checkpoint fixtures for actual draft cost graphs.
-from python.aisimulate.tests.unit.sdk.speculation.test_dense_draft_schemes import REPLAY_SCHEMES, REPLAY_TARGET
+from python.aisim.tests.unit.sdk.speculation.test_dense_draft_schemes import REPLAY_SCHEMES, REPLAY_TARGET
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SPEC = {"kind": "ngram", "num_speculative_tokens": 2, "acceptance_rates": [1.0, 1.0], "seed": 42}
@@ -183,6 +184,7 @@ def _with_timing(raw, timing):
     return raw
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("mode", ["aggregated", "disaggregated"])
 @pytest.mark.parametrize("timing", ["fixed", "polynomial", "default"])
 def test_ngram_turns_vllm_async_scheduling_off_for_every_timing_model(mode, timing):
@@ -198,6 +200,28 @@ def test_ngram_turns_vllm_async_scheduling_off_for_every_timing_model(mode, timi
     config = CorePredictionConfig.model_validate(raw)
     with pytest.raises(ValueError, match="does not support async scheduling with ngram"):
         EngineReplayRunnerFactory(runtime=_RecordingRuntime()).create(0).run(prediction_to_replay_spec(config))
+
+
+def test_ngram_rejects_launch_before_turning_async_scheduling_off():
+    launch = {
+        "decode_ms": 5.0,
+        "piecewise_ms": 50.0,
+        "eager_ms": 150.0,
+        "max_cudagraph_capture_size": 512,
+        "eager_queue_fraction": 0.4,
+    }
+    raw = _prediction()
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
+    deployment = spec.backend_deployment
+    deployment = replace(deployment, agg_engine_args={**deployment.agg_engine_args, "launch": launch})
+    with pytest.raises(ValueError, match="launch requires async scheduling, which vLLM turns off with ngram"):
+        EngineReplayRunnerFactory(runtime=_RecordingRuntime()).create(0).run(
+            replace(spec, backend_deployment=deployment)
+        )
+
+    raw["engine"]["workers"]["aggregated"]["scheduler"]["launch"] = launch
+    with pytest.raises(ValidationError, match="scheduler.launch requires async scheduling, which vLLM turns off"):
+        CorePredictionConfig.model_validate(raw)
 
 
 def _busy_arrival(tmp_path, *, speculation=True, async_scheduling=None):
@@ -241,8 +265,9 @@ def test_ngram_admits_a_busy_engine_arrival_at_the_next_pass(tmp_path):
     assert _busy_arrival(tmp_path, speculation=False) == 30.0
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_native_aic_compiles_ngram_cost_without_mtp_draft_layers(monkeypatch):
-    from aisimulate_core.sdk import engine
+    from aisim_core.sdk import engine
 
     calls = []
     original = engine.compile_engine
@@ -270,8 +295,9 @@ def test_native_aic_compiles_ngram_cost_without_mtp_draft_layers(monkeypatch):
     assert calls and all(call["speculation"] == _COST and call["nextn"] == 0 for call in calls)
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_canonical_estimator_round_trip_preserves_prompt_lookup_cost():
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     config = ForwardPassPerfModelConfig(
         model="meta-llama/Meta-Llama-3.1-8B",
@@ -295,7 +321,7 @@ def test_canonical_estimator_round_trip_preserves_prompt_lookup_cost():
 
 @pytest.mark.parametrize("mode", ["fpm_interpolation", "fpm_regression"])
 def test_canonical_prompt_lookup_rejects_unsupported_estimators_without_fallback(mode):
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     with pytest.raises(ValueError, match="ngram speculation requires op_level timing"):
         RustForwardPassPerfModel.best_available(
@@ -379,8 +405,8 @@ def test_lower_level_sweeper_rejects_legacy_mtp_combination():
     ],
 )
 def test_ngram_sweeper_ignores_inactive_roles_until_selected(mode, inactive_role, field, value, error):
-    from aisimulate.sweeper.parallel_enum import DisaggParallelConfig, ParallelShape, ReplicaParallelConfig
-    from aisimulate.sweeper.sample import unroll_sample
+    from aisim.sweeper.parallel_enum import DisaggParallelConfig, ParallelShape, ReplicaParallelConfig
+    from aisim.sweeper.sample import unroll_sample
 
     inactive_key = f"{inactive_role}_{field}"
     values = {
@@ -410,7 +436,7 @@ def test_ngram_sweeper_ignores_inactive_roles_until_selected(mode, inactive_role
 
 
 def test_generator_does_not_silently_drop_prompt_lookup():
-    from aisimulate.generator.request import SweeperCandidateError, from_sweeper_candidate
+    from aisim.generator.request import SweeperCandidateError, from_sweeper_candidate
 
     with pytest.raises(SweeperCandidateError, match="ngram deployment generation is unsupported"):
         from_sweeper_candidate({"config": {"speculation": _SPEC}})
@@ -434,6 +460,7 @@ def test_native_progress_clamps_final_burst(output_tokens):
     assert report.metrics["mean_e2e_latency_ms"] == pytest.approx(1 + rounds)
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_ngram_rejection_still_pays_target_verification_cost():
     raw = _prediction(timing="default", rates=(0.0, 1.0))
     speculative = _run(raw)
@@ -481,16 +508,45 @@ def test_generic_speculation_fixed_capacity_error_identifies_scheme_and_role(rol
         CorePredictionConfig.model_validate(raw)
 
 
-@pytest.mark.parametrize("mode", ["fpm_interpolation", "fpm_regression"])
+_MTP = {"kind": "mtp", "params": {"depth": 2}, "expected_accepted_tokens": 1.5}
+
+
+@pytest.mark.usefixtures("raw_data_coordinates")
+def test_cold_mtp_regression_with_allowed_fallback_requires_a_fit():
+    raw = _prediction(timing="default")
+    raw["engine"].update(
+        estimation_mode="fpm_regression",
+        fallback_policy="allow",
+        speculation=deepcopy(_MTP),
+    )
+    with pytest.raises(ValueError, match="fpm_regression estimator is not ready: no workload store has a usable fit"):
+        _run(raw)
+
+    raw["engine"]["estimation_mode"] = "op_level"
+    report = _run(raw)
+    assert report.metrics["completed_requests"] == 1
+    assert report.metadata["prediction_provenance"]["aggregated"]["estimator"] == "op_level"
+
+
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("fallback", ["allow", "deny"])
 @pytest.mark.parametrize(
-    "speculation",
+    ("mode", "speculation"),
     [
-        {"kind": "mtp", "params": {"depth": 2}, "expected_accepted_tokens": 1.5},
-        _SPEC,
-        {**_COST, "expected_accepted_tokens": 1.5},
+        # A vLLM fpm_regression times an MTP scheme instead; see test_recommend_state_snapshot.py.
+        ("fpm_interpolation", _MTP),
+        ("fpm_interpolation", _SPEC),
+        ("fpm_regression", _SPEC),
+        ("fpm_interpolation", {**_COST, "expected_accepted_tokens": 1.5}),
+        ("fpm_regression", {**_COST, "expected_accepted_tokens": 1.5}),
     ],
-    ids=["mtp", "ngram", "generic_ngram"],
+    ids=[
+        "interpolation-mtp",
+        "interpolation-ngram",
+        "regression-ngram",
+        "interpolation-generic_ngram",
+        "regression-generic_ngram",
+    ],
 )
 def test_replay_preserves_canonical_estimator_selection(mode, fallback, speculation):
     raw = _prediction(timing="default")
@@ -567,6 +623,7 @@ def _agentic_rows(raw):
     return rows
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize(
     "target,backend",
     [("nvidia/GLM-5.2-NVFP4", "vllm"), ("nvidia/GLM-5.2-NVFP4", "sglang"), ("deepseek-ai/DeepSeek-V4-Pro", "sglang")],
@@ -580,6 +637,7 @@ def test_mtp_retains_target_cost_and_legacy_weka_progress(tmp_path, target, back
         assert _agentic_rows(raw) == rows
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("backend,topology", [("vllm", "aggregated"), ("sglang", "disaggregated")])
 def test_eagle_chain_replays_dag_short_tail_and_seeded_lifecycle(tmp_path, backend, topology):
     raw = _agentic_prediction(tmp_path, REPLAY_SCHEMES[2], backend=backend, topology=topology)

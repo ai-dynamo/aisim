@@ -6,9 +6,9 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use aisimulate_core::engine::{Backend, EngineConfig, TimingModel, TimingModelConfig};
-use aisimulate_core::replay::loadgen::ReplayRequestPayload;
-use aisimulate_core::replay::{
+use aisim_core::engine::{Backend, EngineConfig, SglangConfig, TimingModel, TimingModelConfig};
+use aisim_core::replay::loadgen::ReplayRequestPayload;
+use aisim_core::replay::{
     AggregatedRoundRobinPlacement, AuthoredKvHints, NoEngineEvents, NoReplayMetadata, Placement,
     PlacementEffects, PlacementPolicy, PoolRoundRobinPlacement, ProviderSpec, ReplayAdapters,
     ReplayCaptureOptions, ReplayComposition, ReplayDeterminism, ReplayEngineConfig,
@@ -26,6 +26,7 @@ fn request(
     output_tokens: usize,
 ) -> ReplayRequest {
     ReplayRequest {
+        cache_salt: None,
         id: id.to_string(),
         arrival_time_ms,
         input_tokens,
@@ -52,6 +53,10 @@ fn aggregated_spec(
         block_size: 4,
         max_num_seqs: 4,
         max_num_batched_tokens: 64,
+        sglang: SglangConfig {
+            num_reserved_decode_tokens: 0,
+            ..SglangConfig::default()
+        },
         timing_model: TimingModelConfig::Fixed {
             prefill_ms: 10.0,
             decode_ms: 2.0,
@@ -168,6 +173,174 @@ fn grouped_cache_replay_emits_physical_bytes_without_scalar_block_capacity() {
             .iter()
             .all(|row| row.kv_cache_used_bytes == Some(0))
     );
+}
+
+#[test]
+fn grouped_prefix_cache_replay_reports_reuse() {
+    // The hand-made page of the attention layers. The byte values below are
+    // multiples of it, not the 13,516,800-byte block row of a vLLM 0.32.0 pool.
+    const GLM_PAGE: u64 = 13_045_120;
+    for (version, checkpoint) in [("0.31.0", None), ("0.32.0", Some(0)), ("0.33.0", Some(0))] {
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let turn_one: Vec<u32> = (0..9000).collect();
+        let mut turn_two = turn_one.clone();
+        turn_two.extend(100_000..104_000);
+        let mut first = request("turn-1", 0.0, turn_one.len(), 4);
+        first.input_token_ids = Some(turn_one);
+        let mut second = request("turn-2", 1_000.0, turn_two.len(), 4);
+        second.input_token_ids = Some(turn_two);
+        let mut spec = aggregated_spec(Backend::Vllm, 1, 0.0, vec![first, second]);
+        let rank = &mut spec.engine["rank"];
+        rank["enable_prefix_caching"] = true.into();
+        rank["prefix_match_unit"] = 2176.into();
+        rank["vllm_version"] = version.into();
+        rank["max_model_len"] = 131_072.into();
+        rank["max_num_batched_tokens"] = 8192.into();
+        rank["kv_cache_capacity_bytes"] = (74 * GLM_PAGE).into();
+        let mut groups = vec![
+            serde_json::json!({"name":"mla", "kind":"attention", "num_layers":22, "block_size_tokens":2176, "page_size_bytes":GLM_PAGE, "prefix_cacheable":true}),
+            serde_json::json!({"name":"kpool_tail", "kind":"state", "num_layers":11, "block_size_tokens":4, "page_size_bytes":GLM_PAGE, "blocks_per_request":1, "prefix_cacheable":false}),
+        ];
+        for i in 0..4 {
+            let mut group = serde_json::json!({"name":format!("kda_{i}"), "kind":"state", "num_layers":4, "block_size_tokens":2176, "page_size_bytes":GLM_PAGE, "blocks_per_request":1, "prefix_cacheable":true});
+            if let Some(blocks) = checkpoint {
+                group["prefill_checkpoint_blocks"] = blocks.into();
+            }
+            groups.push(group);
+        }
+        rank["kv_cache_groups"] = serde_json::Value::Array(groups);
+        let report = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .with_telemetry_observer(
+                1.0,
+                Box::new(RecordingTelemetryObserver {
+                    samples: Arc::clone(&samples),
+                }),
+            )
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(report.request_counts.completed_requests, 2, "{version}");
+        // The second turn reuses 8,704 of its 13,000 prompt tokens.
+        let expected_ratio = 8704.0 / (9000.0 + 13_000.0);
+        assert!(
+            (report.prefix_cache_reused_ratio - expected_ratio).abs() < 1e-9,
+            "{version}: {}",
+            report.prefix_cache_reused_ratio
+        );
+        let samples = samples.lock().unwrap();
+        let mut saw_cached_bytes = false;
+        for sample in samples.iter() {
+            for row in &sample.decode_scheduler_metrics {
+                assert_eq!(row.total_blocks, 0);
+                assert_eq!(row.kv_cache_capacity_bytes, Some(74 * GLM_PAGE));
+                let cached = row
+                    .kv_cache_cached_bytes
+                    .expect("block mode reports cached bytes");
+                assert_eq!(cached % GLM_PAGE, 0);
+                saw_cached_bytes |= cached > 0;
+                let emitted = serde_json::to_value(row).unwrap();
+                assert_eq!(emitted["kv_cache_cached_bytes"], cached);
+            }
+        }
+        assert!(saw_cached_bytes, "{version}");
+        // Between the turns no request holds a block, and the eight cached
+        // blocks of the first turn stay.
+        assert!(
+            samples
+                .iter()
+                .flat_map(|sample| &sample.decode_scheduler_metrics)
+                .any(|row| row.kv_cache_used_bytes == Some(0)
+                    && row.kv_cache_cached_bytes == Some(8 * GLM_PAGE)),
+            "{version}"
+        );
+    }
+}
+
+#[test]
+fn grouped_prefix_cache_replays_the_vllm_0330_probe_groups() {
+    // The cache groups that the import of the live GLM-5.3-Flash TP 4 record
+    // of vLLM 0.33.0 writes (fixture `glm53flash_vllm_0330_probe`), in the
+    // order of the record: four KDA state groups with one prefill checkpoint
+    // block at alignment 16, the MLA attention group and the ring. One pool
+    // block is 13,516,800 bytes, the pool holds 13,696 blocks and
+    // max_model_len is 1,048,576.
+    const PAGE: u64 = 13_516_800;
+    let turn_one: Vec<u32> = (0..9000).collect();
+    let mut turn_two = turn_one.clone();
+    turn_two.extend(100_000..104_000);
+    let mut first = request("turn-1", 0.0, turn_one.len(), 4);
+    first.input_token_ids = Some(turn_one);
+    let mut second = request("turn-2", 1_000.0, turn_two.len(), 4);
+    second.input_token_ids = Some(turn_two);
+    let mut spec = aggregated_spec(Backend::Vllm, 1, 0.0, vec![first, second]);
+    let rank = &mut spec.engine["rank"];
+    rank["enable_prefix_caching"] = true.into();
+    rank["prefix_match_unit"] = 2176.into();
+    rank["vllm_version"] = "0.33.0".into();
+    rank["max_model_len"] = 1_048_576.into();
+    rank["max_num_batched_tokens"] = 8192.into();
+    rank["kv_cache_capacity_bytes"] = (13_696 * PAGE).into();
+    let mut groups = Vec::new();
+    for (index, layers) in [9, 9, 8, 8].into_iter().enumerate() {
+        groups.push(serde_json::json!({"name": format!("runtime_group_{index}"), "kind": "state", "num_layers": layers, "block_size_tokens": 2176, "page_size_bytes": PAGE, "blocks_per_request": 1, "prefix_cacheable": true, "prefill_checkpoint_blocks": 1, "prefill_checkpoint_alignment": 16}));
+    }
+    groups.push(serde_json::json!({"name": "runtime_group_4", "kind": "attention", "num_layers": 22, "block_size_tokens": 2176, "page_size_bytes": PAGE, "prefix_cacheable": true}));
+    groups.push(serde_json::json!({"name": "runtime_group_5", "kind": "state", "num_layers": 11, "block_size_tokens": 4, "page_size_bytes": PAGE, "blocks_per_request": 1, "prefix_cacheable": false}));
+    rank["kv_cache_groups"] = serde_json::Value::Array(groups);
+    let report = Replayer::new(spec, ReplayEngineFactory::new())
+        .unwrap()
+        .run()
+        .unwrap();
+    assert_eq!(report.request_counts.completed_requests, 2);
+    // Turn one keeps its checkpoint at (9000 - 1) / 2176 * 2176 = 8704, and
+    // turn two reuses those 8,704 of its 13,000 prompt tokens.
+    let expected_ratio = 8704.0 / (9000.0 + 13_000.0);
+    assert!(
+        (report.prefix_cache_reused_ratio - expected_ratio).abs() < 1e-9,
+        "{}",
+        report.prefix_cache_reused_ratio
+    );
+}
+
+#[test]
+fn grouped_prefix_hit_above_the_pool_is_a_livelock() {
+    // The geometry of grouped_prefix_hit_that_needs_more_blocks_than_the_pool_waits
+    // in grouped_tests.rs. vLLM's startup check counts no block of a hit
+    // inside a block, so five blocks validate for a max_model_len of 34. The
+    // second prompt hits 12 tokens inside a block and then needs seven
+    // blocks. vLLM keeps it waiting, and with nothing running nothing evicts
+    // the hit blocks. Replay reports the livelock and drops no request.
+    for (version, checkpoint) in [("0.31.0", None), ("0.32.0", Some(0)), ("0.33.0", Some(0))] {
+        let mut first = request("first", 0.0, 13, 1);
+        first.input_token_ids = Some((0..13).collect());
+        let mut second = request("second", 1_000.0, 33, 1);
+        second.input_token_ids = Some((0..33).collect());
+        let mut spec = aggregated_spec(Backend::Vllm, 1, 0.0, vec![first, second]);
+        let rank = &mut spec.engine["rank"];
+        rank["enable_prefix_caching"] = true.into();
+        rank["prefix_match_unit"] = 4.into();
+        rank["vllm_version"] = version.into();
+        rank["max_model_len"] = 34.into();
+        rank["kv_cache_capacity_bytes"] = (5 * 64).into();
+        let mut state = serde_json::json!({"name":"state", "kind":"state", "num_layers":1, "block_size_tokens":16, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":true});
+        if let Some(blocks) = checkpoint {
+            state["prefill_checkpoint_blocks"] = blocks.into();
+        }
+        rank["kv_cache_groups"] = serde_json::json!([
+            {"name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":16, "page_size_bytes":64, "prefix_cacheable":true},
+            state,
+        ]);
+        let error = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "replay invariant violated: offline replay detected an effect-free zero-duration pass with 1 in-flight requests remaining",
+            "{version}"
+        );
+    }
 }
 
 #[test]
@@ -342,7 +515,7 @@ fn replay_accept_length_ignores_overlapping_prefill_and_rejection() {
             .per_request
             .iter()
             .filter(|request| request.terminal_status
-                == aisimulate_core::replay::ReplayTerminalStatus::Rejected)
+                == aisim_core::replay::ReplayTerminalStatus::Rejected)
             .count(),
         1
     );
@@ -599,6 +772,7 @@ fn telemetry_heartbeats_do_not_advance_agg_through_a_capped_idle_gap() {
 }
 
 struct GeneralRoundRobinComposition {
+    session_affinity: bool,
     scaling: Option<Box<dyn ReplayScalingPolicy>>,
     scaling_construction_error: Option<&'static str>,
 }
@@ -608,6 +782,7 @@ impl GeneralRoundRobinComposition {
         Self {
             scaling: None,
             scaling_construction_error: None,
+            session_affinity: false,
         }
     }
 
@@ -615,6 +790,7 @@ impl GeneralRoundRobinComposition {
         Self {
             scaling: Some(Box::new(scaling)),
             scaling_construction_error: None,
+            session_affinity: false,
         }
     }
 
@@ -622,6 +798,7 @@ impl GeneralRoundRobinComposition {
         Self {
             scaling: None,
             scaling_construction_error: Some(message),
+            session_affinity: false,
         }
     }
 }
@@ -637,7 +814,8 @@ impl ReplayComposition for GeneralRoundRobinComposition {
         dp_size: u32,
         topology: Vec<WorkerTopology>,
     ) -> anyhow::Result<Self::AggregatedPlacement> {
-        Ok(AggregatedRoundRobinPlacement::new(dp_size, topology))
+        Ok(AggregatedRoundRobinPlacement::new(dp_size, topology)
+            .with_session_affinity(self.session_affinity))
     }
 
     fn create_disaggregated_placements(
@@ -648,8 +826,10 @@ impl ReplayComposition for GeneralRoundRobinComposition {
         decode_topology: Vec<WorkerTopology>,
     ) -> anyhow::Result<(Self::DisaggregatedPlacement, Self::DisaggregatedPlacement)> {
         Ok((
-            PoolRoundRobinPlacement::new(prefill_topology),
-            PoolRoundRobinPlacement::new(decode_topology),
+            PoolRoundRobinPlacement::new(prefill_topology)
+                .with_session_affinity(self.session_affinity),
+            PoolRoundRobinPlacement::new(decode_topology)
+                .with_session_affinity(self.session_affinity),
         ))
     }
 
@@ -698,10 +878,10 @@ impl PlacementPolicy<ReplayRequestPayload> for FailingPlacement {
         };
         let decision = if self.selected && (!self.committed || self.queue_on_clock) {
             self.pending.push(placement);
-            aisimulate_core::replay::PlacementDecision::Queued
+            aisim_core::replay::PlacementDecision::Queued
         } else {
             self.selected = true;
-            aisimulate_core::replay::PlacementDecision::Immediate(placement)
+            aisim_core::replay::PlacementDecision::Immediate(placement)
         };
         Ok(PlacementEffects {
             decision,
@@ -1239,14 +1419,14 @@ impl PlacementPolicy<ReplayRequestPayload> for ReleaseOnTopologyCallbacks {
             .push_back(request.metadata().uuid.expect("test request UUID"));
         if self.place_immediately {
             return Ok(PlacementEffects {
-                decision: aisimulate_core::replay::PlacementDecision::Immediate(
+                decision: aisim_core::replay::PlacementDecision::Immediate(
                     self.release_next(self.stable_scheduler_id).pop().unwrap(),
                 ),
                 released: Vec::new(),
             });
         }
         Ok(PlacementEffects {
-            decision: aisimulate_core::replay::PlacementDecision::Queued,
+            decision: aisim_core::replay::PlacementDecision::Queued,
             released: Vec::new(),
         })
     }
@@ -1703,6 +1883,180 @@ fn round_robin_session_affinity_routes_turns_through_the_public_replayer() {
             .map(|record| record.decode_worker_idx)
             .collect();
         assert_eq!(workers, expected);
+    }
+}
+
+#[test]
+fn total_tokens_placement_balances_the_decode_pool_through_the_public_replayer() {
+    // One long request and two short ones overlap. Round-robin alternates decode
+    // workers; `total_tokens` keeps both short requests off the loaded worker.
+    for (config, expected) in [
+        (serde_json::Value::Null, vec![Some(0), Some(1), Some(0)]),
+        (
+            serde_json::json!({"load_balance_method": "total_tokens"}),
+            vec![Some(0), Some(1), Some(1)],
+        ),
+    ] {
+        let requests = vec![
+            request("long", 0.0, 32, 16),
+            request("short-1", 1.0, 4, 2),
+            request("short-2", 2.0, 4, 2),
+        ];
+        let mut spec = aggregated_spec(Backend::Sglang, 1, 0.0, requests);
+        spec.topology = ReplayTopology::Disaggregated {
+            prefill: WorkerPoolSpec::default(),
+            decode: WorkerPoolSpec {
+                initial_workers: 2,
+                startup_delay_ms: 0.0,
+            },
+            handoff_latency_ms: 0.0,
+        };
+        spec.adapters.placement.config = config;
+        let report = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(report.request_counts.completed_requests, 3);
+        let mut records: Vec<_> = report.per_request.iter().collect();
+        records.sort_by(|a, b| a.arrival_time_ms.total_cmp(&b.arrival_time_ms));
+        let workers: Vec<_> = records
+            .iter()
+            .map(|record| record.decode_worker_idx)
+            .collect();
+        assert_eq!(workers, expected);
+    }
+}
+
+#[rstest::rstest]
+fn session_affinity_survives_pool_retirement_and_growth(
+    #[values(Backend::Vllm, Backend::Sglang)] backend: Backend,
+    #[values(WorkerPool::Agg, WorkerPool::Prefill, WorkerPool::Decode)] pool: WorkerPool,
+    #[values(false, true)] busy: bool,
+) {
+    struct RetireThenGrow {
+        pool: WorkerPool,
+        retirement_at_ms: f64,
+        retired: bool,
+    }
+
+    impl ReplayScalingPolicy for RetireThenGrow {
+        fn initial_tick_ms(&mut self) -> anyhow::Result<f64> {
+            Ok(self.retirement_at_ms)
+        }
+
+        fn on_tick(
+            &mut self,
+            _snapshot: ReplayScalingSnapshot,
+        ) -> anyhow::Result<ReplayScalingDecision> {
+            let target = if self.retired { 2 } else { 1 };
+            let decision = ReplayScalingDecision {
+                target_prefill: (self.pool == WorkerPool::Prefill).then_some(target),
+                target_decode: (self.pool != WorkerPool::Prefill).then_some(target),
+                next_tick_ms: (!self.retired).then_some(600.0),
+            };
+            self.retired = true;
+            Ok(decision)
+        }
+    }
+
+    let retirement_at_ms = if !busy {
+        300.0
+    } else if pool == WorkerPool::Decode {
+        112.0
+    } else {
+        105.0
+    };
+    let requests = [
+        ("a", 0.0),
+        ("b", 100.0),
+        ("b", 400.0),
+        ("a", 500.0),
+        ("b", 700.0),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, (session, arrival))| {
+        let mut req = request(&format!("turn-{i}"), arrival, 12, 3);
+        req.session_id = Some(session.into());
+        req.prefill_dp_rank = (pool != WorkerPool::Agg).then_some(1);
+        req.dp_rank = Some(1);
+        req
+    })
+    .collect();
+    let mut spec = aggregated_spec(backend, 2, 0.0, requests);
+    spec.engine["dp_size"] = 2.into();
+    if pool != WorkerPool::Agg {
+        spec.topology = ReplayTopology::Disaggregated {
+            prefill: WorkerPoolSpec {
+                initial_workers: 2,
+                startup_delay_ms: 0.0,
+            },
+            decode: WorkerPoolSpec {
+                initial_workers: 2,
+                startup_delay_ms: 0.0,
+            },
+            handoff_latency_ms: 1.0,
+        };
+        let rank = spec.engine["rank"].clone();
+        spec.engine["prefill"] = serde_json::json!({"dp_size": 2, "rank": rank});
+        spec.engine["decode"] = serde_json::json!({"dp_size": 3, "rank": rank});
+    }
+    let mut composition = GeneralRoundRobinComposition::with_scaling(RetireThenGrow {
+        pool,
+        retirement_at_ms,
+        retired: false,
+    });
+    composition.session_affinity = true;
+    let report = Replayer::with_composition(spec, ReplayEngineFactory::new(), composition)
+        .unwrap()
+        .with_capture_options(ReplayCaptureOptions {
+            capture_lifecycle_evidence: true,
+            ..ReplayCaptureOptions::default()
+        })
+        .run()
+        .unwrap();
+
+    assert_eq!(report.request_counts.completed_requests, 5);
+    assert_eq!(report.request_counts.total_output_tokens, 15);
+    assert_eq!(report.per_request.len(), 5);
+    let retirement = report
+        .runtime_evidence
+        .lifecycle_operations
+        .iter()
+        .find(|operation| operation.pool == pool && operation.at_ms == retirement_at_ms)
+        .unwrap();
+    assert_eq!(
+        retirement.state_after_batch.draining,
+        if busy { vec![1] } else { vec![] }
+    );
+    if busy {
+        // B's first turn is the only request on worker 1 at scale-down.
+        let request = &report.per_request[1];
+        assert_eq!(request.request_id.as_deref(), Some("turn-1"));
+        assert!(request.first_admit_ms.unwrap() <= retirement_at_ms);
+        assert!(retirement_at_ms < request.terminal_time_ms);
+    }
+    for (i, record) in report.per_request.iter().enumerate() {
+        assert_eq!(
+            record.routing_history.len(),
+            if pool == WorkerPool::Agg { 1 } else { 2 }
+        );
+        for placement in &record.routing_history {
+            let affected_pool = match placement.pool {
+                ReplayRequestPool::Agg => WorkerPool::Agg,
+                ReplayRequestPool::Prefill => WorkerPool::Prefill,
+                ReplayRequestPool::Decode => WorkerPool::Decode,
+            } == pool;
+            // Only B's retired pool must repin; surviving pins remain stable,
+            // including after a fresh worker joins at 600 ms.
+            let expected_worker = if affected_pool {
+                [0, 1, 0, 0, 0][i]
+            } else {
+                [0, 1, 1, 0, 1][i]
+            };
+            assert_eq!(placement.logical_worker_id, Some(expected_worker));
+            assert_eq!(placement.dp_rank, Some(1));
+        }
     }
 }
 

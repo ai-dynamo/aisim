@@ -24,6 +24,7 @@ pub type Engine = GeneralizedMockerEngine<SchedulerRank>;
 /// factory, which then shares the provider across all attention-DP ranks.
 #[derive(Clone)]
 pub struct EngineFactory {
+    // Runtime-only value; the serializable replay descriptor retains the declaration.
     config: EngineConfig,
     timing: Arc<dyn TimingModel>,
     belady_oracle: Option<BeladyOracle>,
@@ -31,9 +32,14 @@ pub struct EngineFactory {
 }
 
 impl EngineFactory {
+    #[cfg(test)]
+    pub(crate) fn config(&self) -> &EngineConfig {
+        &self.config
+    }
+
     /// Construct a factory for a built-in timing model.
     pub fn new(config: EngineConfig) -> Result<Self> {
-        config.validate()?;
+        let config = config.into_runtime_config()?;
         let timing = config.built_in_timing_model()?;
         Ok(Self {
             config,
@@ -45,7 +51,7 @@ impl EngineFactory {
 
     /// Construct a factory with a process-local timing provider.
     pub fn with_timing_model(config: EngineConfig, timing: Arc<dyn TimingModel>) -> Result<Self> {
-        config.validate()?;
+        let config = config.into_runtime_config()?;
         Ok(Self {
             config,
             timing,
@@ -84,11 +90,23 @@ impl EngineFactory {
     pub(crate) fn can_have_internal_deadlines(&self) -> bool {
         // G3 also uses the native host-offload adapter and requires it during validation.
         // Frontend stages deliver parked requests to the scheduler inbox between passes.
-        self.config.native_host_offload.is_some() || self.config.frontend.is_some()
+        self.config.native_host_offload.is_some()
+            || self.config.sglang.hicache.is_some()
+            || self.config.frontend.is_some()
+    }
+
+    /// Whether ranks built by this factory can hold outputs past their pass
+    /// (vLLM `launch`).
+    pub(crate) fn can_hold_outputs(&self) -> bool {
+        self.config.launch.is_some()
     }
 
     /// Build one scheduler/KV/timing rank with an explicit identity.
     pub fn build_rank(&self, identity: RankIdentity) -> Result<SchedulerRank> {
+        anyhow::ensure!(
+            self.config.sglang.mamba_cache.is_none() || identity.dp_size.get() == 1,
+            "sglang.mamba_cache currently requires dp_size=1"
+        );
         let seed_offset = engine_seed_offset(identity)?;
         let mut rank = SchedulerRank::new_with_g2(
             identity,
@@ -105,8 +123,149 @@ impl EngineFactory {
 
     /// Build a single-rank or attention-DP logical engine.
     pub fn build(&self, identity: EngineIdentity, dp_size: NonZeroU32) -> Result<Engine> {
+        anyhow::ensure!(
+            self.config.sglang.mamba_cache.is_none() || dp_size.get() == 1,
+            "sglang.mamba_cache currently requires dp_size=1"
+        );
         GeneralizedMockerEngine::new_with_rank_factory(identity, dp_size, |rank_identity| {
             self.build_rank(rank_identity)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::TimingModelConfig;
+
+    #[test]
+    fn mamba_cache_dp_size_validation_covers_both_factory_entry_points() {
+        for cache_enabled in [false, true] {
+            let mut config: EngineConfig = serde_json::from_value(serde_json::json!({
+                "backend": "sglang",
+                "block_size": 64,
+                "enable_prefix_caching": true
+            }))
+            .unwrap();
+            if cache_enabled {
+                config.sglang.mamba_cache = Some(crate::engine::SglangMambaCacheConfig {
+                    prefill_checkpoint_interval: 64,
+                    decode_checkpoint_interval: 256,
+                    max_states: 16,
+                });
+            }
+            let factory = EngineFactory::new(config).unwrap();
+            for size in [1, 2] {
+                let dp_size = NonZeroU32::new(size).unwrap();
+                let identity = EngineIdentity::new(0);
+                let engine = factory.build(identity, dp_size);
+                if cache_enabled && size > 1 {
+                    assert_eq!(
+                        engine.err().unwrap().to_string(),
+                        "sglang.mamba_cache currently requires dp_size=1"
+                    );
+                } else {
+                    assert!(engine.is_ok());
+                }
+                for dp_rank in 0..size {
+                    let rank = factory.build_rank(identity.rank(dp_rank, dp_size));
+                    if cache_enabled && size > 1 {
+                        assert_eq!(
+                            rank.err().unwrap().to_string(),
+                            "sglang.mamba_cache currently requires dp_size=1"
+                        );
+                    } else {
+                        assert!(rank.is_ok());
+                    }
+                }
+            }
+        }
+    }
+
+    fn afd_declaration(window: Option<usize>) -> EngineConfig {
+        serde_json::from_value(serde_json::json!({
+            "backend": "sglang", "max_model_len": window,
+            "afd": {
+                "a_pool": {"system": "h200_sxm", "a_tp_size": 1, "n_a_nodes": 1, "batch_size_per_a_replica": 18},
+                "f_pool": {"system": "h200_sxm", "f_moe_ep_size": 8, "n_f_nodes": 1},
+                "gpus_per_node": 8, "num_microbatches": 3,
+                "comm_overhead_factor": 1.0
+            },
+            "timing_model": {"type": "external", "provider": "afd", "config": {"isl": 16, "osl": 128}}
+        })).unwrap()
+    }
+
+    #[test]
+    fn afd_runtime_limit_does_not_replace_the_serialized_declaration() {
+        let timing = EngineConfig::default().built_in_timing_model().unwrap();
+        // Some(144) and None resolve to the same scheduler cap but retain
+        // different memory reservations, even after saving and reloading.
+        for window in [None, Some(144), Some(2048)] {
+            let declaration = afd_declaration(window);
+            let saved = serde_json::to_value(&declaration).unwrap();
+            let factory =
+                EngineFactory::with_timing_model(declaration.clone(), Arc::clone(&timing)).unwrap();
+            assert_eq!(factory.config.max_model_len, Some(window.unwrap_or(144)));
+            assert_eq!(serde_json::to_value(&declaration).unwrap(), saved);
+            let restored: EngineConfig = serde_json::from_value(saved.clone()).unwrap();
+            assert_eq!(restored.max_model_len, window);
+            let factory = EngineFactory::with_timing_model(restored, Arc::clone(&timing)).unwrap();
+            assert_eq!(factory.config.max_model_len, Some(window.unwrap_or(144)));
+            assert_eq!(serde_json::to_value(&declaration).unwrap(), saved);
+        }
+    }
+
+    #[test]
+    fn legacy_afd_provider_preserves_the_runtime_window_and_explicit_limits() {
+        let timing = EngineConfig::default().built_in_timing_model().unwrap();
+        for window in [None, Some(144), Some(2048)] {
+            let mut saved = serde_json::to_value(afd_declaration(window)).unwrap();
+            saved["timing_model"]["provider"] = serde_json::json!("aic-afd");
+            let restored: EngineConfig = serde_json::from_value(saved).unwrap();
+            assert_eq!(restored.max_model_len, window);
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap()["timing_model"]["provider"],
+                "afd"
+            );
+            let factory = EngineFactory::with_timing_model(restored, Arc::clone(&timing)).unwrap();
+            assert_eq!(factory.config.max_model_len, Some(window.unwrap_or(144)));
+        }
+        // Process-local callers may still construct the legacy name directly.
+        let mut config = afd_declaration(None);
+        if let TimingModelConfig::External { provider, .. } = &mut config.timing_model {
+            *provider = "aic-afd".into();
+        }
+        assert_eq!(
+            EngineFactory::with_timing_model(config, timing)
+                .unwrap()
+                .config
+                .max_model_len,
+            Some(144)
+        );
+    }
+
+    #[test]
+    fn afd_runtime_limit_rejects_invalid_workload_windows() {
+        for workload in [
+            serde_json::json!({"isl": 0, "osl": 128}),
+            serde_json::json!({"isl": 16, "osl": 0}),
+            serde_json::json!({"isl": 16}),
+            serde_json::json!({"isl": -1, "osl": 128}),
+            serde_json::json!({"isl": u64::from(u32::MAX) + 1, "osl": 128}),
+        ] {
+            let mut declaration = afd_declaration(None);
+            declaration.timing_model = TimingModelConfig::External {
+                provider: "afd".into(),
+                config: workload,
+            };
+            let timing = EngineConfig::default().built_in_timing_model().unwrap();
+            assert!(EngineFactory::with_timing_model(declaration, timing).is_err());
+        }
+    }
+
+    #[test]
+    fn ordinary_runtime_keeps_an_undeclared_limit_unbounded() {
+        let factory = EngineFactory::new(EngineConfig::default()).unwrap();
+        assert_eq!(factory.config.max_model_len, None);
     }
 }

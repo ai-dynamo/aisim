@@ -123,6 +123,10 @@ impl<T> Default for SourceHolds<T> {
 }
 
 impl<T> SourceHolds<T> {
+    pub(crate) fn held_len(&self) -> usize {
+        self.held_prefills.len()
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         debug_assert_eq!(self.pending_by_request.len(), self.pending_by_handoff.len());
         debug_assert_eq!(self.held_prefills.len(), self.held_by_request.len());
@@ -167,6 +171,14 @@ impl<T> SourceHolds<T> {
         let previous = self.held_by_request.insert(request_id, handoff_id);
         debug_assert!(previous.is_none());
         SourceCompletion::Held { handoff_id }
+    }
+
+    /// The payload of a held source.
+    pub(crate) fn held_payload_mut(&mut self, request_id: Uuid) -> Option<&mut T> {
+        let handoff_id = self.held_by_request.get(&request_id)?;
+        self.held_prefills
+            .get_mut(handoff_id)
+            .map(|(_, payload)| payload)
     }
 
     pub(crate) fn remove(&mut self, handoff_id: HandoffId) -> RemovedSource<T> {

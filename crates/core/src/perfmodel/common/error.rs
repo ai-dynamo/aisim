@@ -14,6 +14,9 @@ use thiserror::Error;
 /// All errors surfaced by the Rust core.
 #[derive(Debug, Error)]
 pub enum AicError {
+    /// A recognized feature that cannot execute; never an estimator coverage miss.
+    #[error("{0}")]
+    NotImplemented(String),
     #[error(
         "unsupported schema version for {kind}: got {got}, expected {expected}; recompile with this engine"
     )]
@@ -44,6 +47,11 @@ pub enum AicError {
     /// numerical resolver errors retain their separate error paths.
     #[error("perf database error: {0}")]
     InterpolationCoverage(String),
+    /// A linear-attention operation (Mamba2, GDN, KDA) has no SILICON rows for a kernel it
+    /// needs: the table is missing, empty, or without that kernel. Missing perf data for every
+    /// consumer; auto selection additionally rebuilds the op_level candidate in HYBRID.
+    #[error("perf database error: {0}")]
+    LinearAttentionDataMissing(String),
     /// Malformed or incompatible measured data is never a coverage miss.
     /// HYBRID and regression fallbacks must propagate this error.
     #[error("invalid performance data: {0}")]
@@ -109,6 +117,7 @@ impl AicError {
             Self::PerfDatabase(_)
                 | Self::FpmQueryUnsupported(_)
                 | Self::InterpolationCoverage(_)
+                | Self::LinearAttentionDataMissing(_)
                 | Self::Io { .. }
         )
     }

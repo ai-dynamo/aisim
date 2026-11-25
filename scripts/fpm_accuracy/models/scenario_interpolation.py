@@ -12,6 +12,7 @@ from typing import Any
 
 from scripts.fpm_accuracy.contract import strict_json
 from scripts.fpm_accuracy.exceptions import ConfigurationError, DependencyError
+from scripts.release.package_identity import runtime_module
 
 _IDENTITY = {
     "model": "model_path",
@@ -124,10 +125,10 @@ def configure_scenario_interpolation(request: Any, artifact: Any, prepared: Any)
 def is_interpolation_support_miss(error: Exception) -> bool:
     """Recognize only typed, explicit domain misses; retain native capability errors."""
     try:
-        from aisimulate_core.sdk.errors import PerfDataNotAvailableError
+        perf_data_error = runtime_module("aisim_core.sdk.errors").PerfDataNotAvailableError
     except ImportError:
         return False
-    if not isinstance(error, PerfDataNotAvailableError):
+    if not isinstance(error, perf_data_error):
         return False
     message = str(error)
     # A failed analytical operation after a table miss is a native capability

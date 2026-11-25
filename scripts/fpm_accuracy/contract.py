@@ -11,8 +11,11 @@ import re
 from datetime import datetime
 from pathlib import PurePosixPath
 
-REPO = "ai-dynamo/aisimulate"
-HF_REPO = "nvidia/aisimulate-fpm-dataset"
+REPO = "ai-dynamo/aisim"
+# The unified public dataset (FPM files under data/fpm/). Summaries of earlier campaigns name the retired repository.
+HF_REPO = "ai-dynamo/aisim-data"
+LEGACY_HF_REPO = "nvidia/aisimulate-fpm-dataset"
+HF_REPOS = (HF_REPO, LEGACY_HF_REPO)
 # Evaluations before the learned method publish LEGACY_METHODS; both remain valid.
 LEGACY_METHODS = ("warmup", "nowarmup", "regression")
 METHODS = (*LEGACY_METHODS, "learned")
@@ -48,7 +51,7 @@ def text(value):
     require(isinstance(value, str) and 0 < len(value) <= 1024, "invalid public text")
     require(not any(ord(ch) < 32 for ch in value), "control characters in public text")
     require(
-        not any(fragment in value.lower() for fragment in ("gitlab-master", "slack.com", "linear.app", "file://")),
+        not any(fragment in value.lower() for fragment in ("gitlab", "slack.com", "linear.app", "file://")),
         "internal provenance",
     )
 
@@ -99,7 +102,7 @@ def validate_summary(summary):
     for name in ("commit_sha", "hf_revision", "evaluator_sha"):
         sha(snapshot[name])
     sha(snapshot["wheel_sha256"], 64)
-    require(snapshot["hf_repo"] == HF_REPO and snapshot["complete"] is True, "incomplete campaign")
+    require(snapshot["hf_repo"] in HF_REPOS and snapshot["complete"] is True, "incomplete campaign")
     for name in ("run_id", "run_attempt"):
         require(
             isinstance(snapshot[name], str) and re.fullmatch(r"[1-9][0-9]*", snapshot[name]), "invalid run identity"
@@ -141,6 +144,8 @@ def validate_summary(summary):
                 and all(isinstance(name, str) and name for name in collection["datasets"]),
                 "invalid datasets",
             )
+            for name in collection["datasets"]:
+                text(name)
             for field in ("run_count", "unattributed_measurements"):
                 require(type(collection[field]) is int and collection[field] >= 0, "invalid collection count")
             if "serving_layouts" in collection:

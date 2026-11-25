@@ -10,6 +10,8 @@ provenance:
     - Rust changes include compiled Python, collector installation, prediction, parity, and release consumers.
     - Collector and performance-data changes include their prediction and parity consumers.
     - Unknown, dependency, test-configuration, and CI-contract changes run every component.
+    - Application tests, wheel verification, and the release-artifact contract all consume the application test wheel build.
+    - A main push that main has moved past within the debounce builds, verifies, and stages its wheel; the newest main commit runs every component.
 
 cases:
   - id: documentation
@@ -18,23 +20,25 @@ cases:
     selected: [readme_commands]
 
   - id: python-application
-    paths: [python/aisimulate/src/aisimulate/traffic.py]
+    paths: [python/aisim/src/aisim/traffic.py]
     run_all: false
     selected:
       - readme_commands
       - platform_wheels
+      - application_test_wheel
       - application_wheel
       - application_tests
       - python_compatibility
       - release_artifact_contract
 
   - id: prediction
-    paths: [python/aisimulate/src/aisimulate/generator/base.py]
+    paths: [python/aisim/src/aisim/generator/base.py]
     run_all: false
     selected:
       - readme_commands
       - platform_wheels
       - prediction_regression
+      - application_test_wheel
       - application_wheel
       - application_tests
       - python_compatibility
@@ -42,13 +46,14 @@ cases:
       - release_artifact_contract
 
   - id: collector-data
-    paths: [python/aisimulate/src/aisimulate_core/systems/data/b200/op.parquet]
+    paths: [python/aisim/src/aisim_core/systems/data/b200/op.parquet]
     run_all: false
     selected:
       - readme_commands
       - platform_wheels
       - collector_data
       - prediction_regression
+      - application_test_wheel
       - application_wheel
       - application_tests
       - python_compatibility
@@ -66,6 +71,7 @@ cases:
       - rust
       - rust_feature_modes
       - public_api_rust
+      - application_test_wheel
       - application_wheel
       - application_tests
       - python_compatibility
@@ -84,6 +90,7 @@ cases:
       - rust
       - rust_feature_modes
       - public_api_rust
+      - application_test_wheel
       - application_wheel
       - application_tests
       - python_compatibility
@@ -96,6 +103,7 @@ cases:
     selected:
       - readme_commands
       - platform_wheels
+      - application_test_wheel
       - application_wheel
       - application_tests
       - python_compatibility
@@ -104,12 +112,12 @@ cases:
   - id: application-test
     paths: [tests/test_runner.py]
     run_all: false
-    selected: [application_tests]
+    selected: [application_test_wheel, application_tests]
 
   - id: executable-example
     paths: [examples/sweeper/run_sweep.py]
     run_all: false
-    selected: [application_tests]
+    selected: [application_test_wheel, application_tests]
 
   - id: rename-across-boundaries
     paths: [docs/old-name.md, crates/core/src/replay/new_name.rs]
@@ -122,6 +130,7 @@ cases:
       - rust
       - rust_feature_modes
       - public_api_rust
+      - application_test_wheel
       - application_wheel
       - application_tests
       - python_compatibility
@@ -129,7 +138,7 @@ cases:
       - release_artifact_contract
 
   - id: python-test-configuration
-    paths: [python/aisimulate/pytest.ini]
+    paths: [python/aisim/pytest.ini]
     run_all: true
 
   - id: ci-contract
@@ -148,3 +157,10 @@ cases:
     paths: [README.md]
     force_all: true
     run_all: true
+
+  - id: superseded-main-commit
+    paths: []
+    force_all: true
+    superseded: true
+    run_all: false
+    selected: [application_test_wheel, application_wheel]

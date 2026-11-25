@@ -711,11 +711,19 @@ impl Glm53MhcOp {
             self.hidden_size,
             &anchor,
         ) {
-            Ok(row) => Ok(PerformanceResult::with_energy(
+            Ok(Some(row)) => Ok(PerformanceResult::with_energy(
                 row.latency / sites,
                 row.energy / sites,
                 Source::Silicon,
             )),
+            // No message for this miss: without GLM rows, HYBRID takes this
+            // arm on every site of every rank walk.
+            Ok(None) if db.database_mode == DatabaseMode::Hybrid => Ok(analytical),
+            Ok(None) => Err(AicError::PerfDatabase(format!(
+                "GLM-5.3-Flash mHC has no {MHC_ARCHITECTURE} rows for role {} at {}",
+                self.role,
+                db.data_root.display()
+            ))),
             Err(err) if db.database_mode == DatabaseMode::Hybrid && err.is_missing_perf_data() => {
                 Ok(analytical)
             }
@@ -1125,7 +1133,6 @@ impl Glm53PrimitiveOp {
 pub(crate) mod tests {
     use super::*;
     use crate::common::enums::TransferPolicy;
-    use std::path::PathBuf;
 
     pub(crate) fn attention(kind: &str) -> Glm53AttentionOp {
         Glm53AttentionOp {
@@ -1153,8 +1160,7 @@ pub(crate) mod tests {
         }
     }
     fn db(mode: DatabaseMode) -> PerfDatabase {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisimulate/src/aisimulate_core/systems");
+        let root = crate::test_systems::path("");
         PerfDatabase::load(&root, "gb300", "sglang", "0.5.14")
             .unwrap()
             .with_mode(mode, TransferPolicy::ALL)
@@ -1162,7 +1168,7 @@ pub(crate) mod tests {
     #[test]
     fn ascend_950dt_rejects_unverified_fp32_throughput() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisimulate/src/aisimulate_core/systems/ascend_950dt.yaml");
+            .join("../../python/aisim/src/aisim_core/systems/ascend_950dt.yaml");
         let spec = SystemSpec::load(&path).unwrap();
         for kind in ["kda", "sparse_mla"] {
             let error = attention(kind)
@@ -1805,8 +1811,7 @@ pub(crate) mod tests {
         ops: &[Glm53AttentionOp],
     ) {
         use crate::perf_database::energy_test_fixtures::{Col, write_parquet};
-        let systems = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisimulate/src/aisimulate_core/systems");
+        let systems = crate::test_systems::path("");
         let yaml = format!("{system}.yaml");
         std::fs::copy(systems.join(&yaml), root.join(&yaml)).unwrap();
         let dir = root
@@ -1969,8 +1974,7 @@ pub(crate) mod tests {
     fn vllm_cached_one_token_extend_uses_the_decode_kda_rows() {
         use crate::perf_database::energy_test_fixtures::{Col, write_parquet};
         let root = tempfile::tempdir().unwrap();
-        let systems = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisimulate/src/aisimulate_core/systems");
+        let systems = crate::test_systems::path("");
         std::fs::copy(systems.join("gb300.yaml"), root.path().join("gb300.yaml")).unwrap();
         // Context rows: prefill pair at seq 2/4, decode-path pair at seq 1
         // (as collect_kda.py publishes them), batch 1/2, 32 local heads.
@@ -2053,8 +2057,7 @@ pub(crate) mod tests {
         use crate::perf_database::energy_test_fixtures::{Col, write_parquet};
         const RUNTIME: &str = "0.31.0";
         let root = tempfile::tempdir().unwrap();
-        let systems = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisimulate/src/aisimulate_core/systems");
+        let systems = crate::test_systems::path("");
         std::fs::copy(systems.join("gb300.yaml"), root.path().join("gb300.yaml")).unwrap();
         let dir = root.path().join("data/gb300/mhc/vllm").join(RUNTIME);
         std::fs::create_dir_all(&dir).unwrap();

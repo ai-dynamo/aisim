@@ -9,13 +9,16 @@ mod lineage;
 mod phase;
 mod profile;
 mod snapshot;
-mod steppable;
 mod trace;
 mod types;
 mod weka;
+#[cfg(any(feature = "python", test))]
+mod weka_lengths;
 
 use rand::Rng;
 use rand::rngs::StdRng;
+use rand_chacha::ChaCha12Rng;
+use rand08::{RngCore, SeedableRng};
 
 pub use driver::{
     AGENTIC_LIFECYCLE_SCHEMA_V1, AgenticLifecycleEvent, AgenticLifecycleEventKind,
@@ -35,7 +38,6 @@ pub use snapshot::{
     AgenticSnapshotEvidence, AgenticSnapshotOptions, AgenticSnapshotRequest,
     AgenticSnapshotSelection, PreparedAgenticSnapshots,
 };
-pub use steppable::{EngineEvent, StepOutcome, SteppableAgg, SteppableEngine, SteppableReplay};
 pub use trace::{AgenticGraphBuilder, load_agentic_mooncake, validate_trace_files};
 #[doc(hidden)]
 pub use types::CompactReadyTurn;
@@ -50,13 +52,14 @@ pub use types::{
     TraceFileFormat, TurnTrace, ValidatedAgenticGraph, effective_replay_key,
     output_replay_id_annotation,
 };
-#[cfg(feature = "python")]
 pub(crate) use weka::load_weka_agentic_graph_cached;
 pub use weka::{
-    WekaImportOptions, WekaImportSummary, WekaImporter, WekaNestedTimestampBasis,
-    WekaResolvedTimestampBasis, load_weka_agentic_graph, load_weka_agentic_graph_with_options,
-    load_weka_agentic_rows, stream_weka_agentic_rows,
+    WekaChatTemplate, WekaClient, WekaImportOptions, WekaImportSummary, WekaImporter,
+    WekaNestedTimestampBasis, WekaResolvedTimestampBasis, load_weka_agentic_graph,
+    load_weka_agentic_graph_with_options, load_weka_agentic_rows, stream_weka_agentic_rows,
 };
+#[cfg(feature = "python")]
+pub(crate) use weka_lengths::scan_weka_requests;
 
 pub(super) const SYNTHETIC_OUTPUT_SEED: u64 = 0xD37A_0A7E_5EED;
 
@@ -70,6 +73,27 @@ pub(super) fn planned_output_token_ids(
             .map(|_| output_rng.random::<u32>())
             .collect()
     })
+}
+
+/// The ids `planned_output_token_ids` draws from a fresh `SYNTHETIC_OUTPUT_SEED`
+/// generator, readable at any draw offset: `StdRng` is ChaCha12, whose stream
+/// can be entered at any word.
+#[derive(Debug)]
+pub(super) struct SyntheticOutputStream(ChaCha12Rng);
+
+impl SyntheticOutputStream {
+    pub(super) fn new() -> Self {
+        Self(ChaCha12Rng::seed_from_u64(SYNTHETIC_OUTPUT_SEED))
+    }
+
+    /// The `len` ids that follow `offset` earlier draws.
+    pub(super) fn ids_at(&mut self, offset: u64, len: usize) -> Vec<u32> {
+        // Turns dispatched in planning order read straight through.
+        if self.0.get_word_pos() != u128::from(offset) {
+            self.0.set_word_pos(u128::from(offset));
+        }
+        (0..len).map(|_| self.0.next_u32()).collect()
+    }
 }
 
 #[cfg(test)]

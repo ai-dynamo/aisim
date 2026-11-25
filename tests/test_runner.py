@@ -6,25 +6,25 @@
 import json
 import math
 import pickle
-from dataclasses import replace
+from dataclasses import fields, replace
 
 import pytest
 from pydantic import ValidationError
 
-import aisimulate
-from aisimulate import capacity as aic
-from aisimulate.cli_args import build_parser
-from aisimulate.compiler import prediction_to_replay_spec
-from aisimulate.config.cli import CorePredictionConfig
-from aisimulate.config.traffic import SyntheticSource
-from aisimulate.replay.config import ReplayCliConfig, ReplayOutputConfig
-from aisimulate.runner import (
+import aisim
+from aisim import capacity as aic
+from aisim.cli_args import build_parser
+from aisim.compiler import prediction_to_replay_spec
+from aisim.config.cli import CorePredictionConfig
+from aisim.config.traffic import SyntheticSource
+from aisim.replay.config import ReplayCliConfig, ReplayOutputConfig
+from aisim.runner import (
     EngineReplayRunner,
     EngineReplayRunnerFactory,
     InvalidRunnerError,
     _materialize_engine_role,
 )
-from aisimulate.sweeper import (
+from aisim.sweeper import (
     AdapterReplaySpec,
     BackendDeploymentSpec,
     ReplayOutputRequirements,
@@ -32,8 +32,10 @@ from aisimulate.sweeper import (
     ReplaySpec,
     RuntimeHookSpec,
 )
-from aisimulate.sweeper.config import Workload
-from aisimulate_core.sdk.deepseek_v41 import MODEL_PATH as DEEPSEEK_V41_MODEL_PATH
+from aisim.sweeper.config import Workload
+from aisim.sweeper.replay import REPLAY_SPEC_API_VERSION, RunnerCapabilities
+from aisim_core.data.default_systems import default_systems_path
+from aisim_core.sdk.deepseek_v41 import MODEL_PATH as DEEPSEEK_V41_MODEL_PATH
 from scripts.e2e_accuracy.source.replay import engine_args
 
 pytestmark = [
@@ -92,6 +94,8 @@ def _engine_args(*, role="aggregated", backend="vllm", timing=None):
         "aic_attention_dp_size": 1,
         "block_size": 4,
         "num_gpu_blocks": 16,
+        # These toy pools cannot hold SGLang's default 512-token decode reserve.
+        **({"sglang": {"num_reserved_decode_tokens": 0}} if backend == "sglang" else {}),
         "timing_model": timing or {"type": "fixed", "prefill_ms": 2.0, "decode_ms": 1.0},
     }
 
@@ -114,8 +118,35 @@ def _spec(*, deployment=None, workload=None, goal=None, concurrency=None, adapte
 
 
 def test_public_namespace_exports_engine_runner_contract():
-    assert aisimulate.EngineReplayRunner is EngineReplayRunner
-    assert aisimulate.EngineReplayRunnerFactory is EngineReplayRunnerFactory
+    assert aisim.EngineReplayRunner is EngineReplayRunner
+    assert aisim.EngineReplayRunnerFactory is EngineReplayRunnerFactory
+
+
+def test_ordinary_null_rank_uses_flat_role_fields_through_runner():
+    args = {**_engine_args(), "rank": None}
+    deployment = BackendDeploymentSpec(
+        deployment_mode="agg", backend="vllm", backend_version="test", agg_engine_args=args, num_workers=1
+    )
+    assert deployment.afd_roles == ()
+    runtime = RecordingRuntime()
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(_spec(deployment=deployment))
+    rank = runtime.execution_spec["engine"]["rank"]
+    assert rank["block_size"] == 4
+    assert rank["num_gpu_blocks"] == 16
+    assert rank["timing_model"] == {"type": "fixed", "prefill_ms": 2.0, "decode_ms": 1.0}
+
+
+@pytest.mark.parametrize("rank", [[], 0, "afd"])
+def test_malformed_rank_is_rejected_by_runner(rank):
+    deployment = BackendDeploymentSpec(
+        deployment_mode="agg",
+        backend="vllm",
+        backend_version="test",
+        agg_engine_args={"rank": rank},
+        num_workers=1,
+    )
+    with pytest.raises(ValueError, match="rank config must be a mapping"):
+        EngineReplayRunnerFactory(runtime=RecordingRuntime()).create(0).run(_spec(deployment=deployment))
 
 
 def test_legacy_replay_config_preserves_execution_mode() -> None:
@@ -140,6 +171,7 @@ def test_factory_is_pickleable_and_advertises_engine_only_capabilities():
     factory = pickle.loads(pickle.dumps(EngineReplayRunnerFactory()))
     capabilities = factory.capabilities()
 
+    assert capabilities.replay_spec_api_version == REPLAY_SPEC_API_VERSION
     assert capabilities.supports_backend_topology("vllm", "agg")
     assert capabilities.supports_backend_topology("sglang", "disagg")
     assert capabilities.supports_backend_topology("trtllm", "disagg")
@@ -155,6 +187,25 @@ def test_factory_is_pickleable_and_advertises_engine_only_capabilities():
     assert capabilities.supports_agentic_speculative_decoding
     assert capabilities.supports_generic_speculation
     assert capabilities.agentic_qualification == "functional_only"
+
+
+def test_v1_runner_accepts_current_ordinary_replay_and_rejects_api_two():
+    spec = ReplaySpec(
+        backend_deployment=BackendDeploymentSpec(
+            deployment_mode="agg",
+            backend="sglang",
+            backend_version="test",
+            num_workers=1,
+            agg_engine_args={"worker_type": "aggregated"},
+        ),
+        workload={},
+        goal={},
+    )
+    assert not spec.backend_deployment.has_afd
+    capabilities = RunnerCapabilities(replay_spec_api_version=1, supported_backend_topologies=(("sglang", "agg"),))
+    capabilities.require_compatible(spec)
+    with pytest.raises(ValueError, match="ReplaySpec API version 2 is incompatible with runner version 1"):
+        capabilities.require_compatible(replace(spec, api_version=2))
 
 
 @pytest.mark.parametrize("location", ["rank", "canonical"])
@@ -177,6 +228,209 @@ def test_generic_speculation_requires_explicit_runner_capability(location, neste
     capabilities.require_compatible(spec)
     with pytest.raises(ValueError, match="generic speculation; use --stack engine"):
         replace(capabilities, supports_generic_speculation=False).require_compatible(spec)
+
+
+def test_telemetry_capability_keeps_existing_positional_arguments():
+    # RunnerCapabilities is public: an adapter passing the earlier fields positionally keeps their meaning.
+    default = RunnerCapabilities()
+    earlier = [
+        field.name for field in fields(RunnerCapabilities) if not field.kw_only and field.name != "supports_telemetry"
+    ]
+    changed = (
+        "supports_deferred_encoder_overlay",
+        "supports_mtp_host_offload",
+        "supports_agentic_primers_only",
+        "supports_kvcr_g3",
+    )
+    positional = RunnerCapabilities(*(True if name in changed else getattr(default, name) for name in earlier))
+    assert positional == replace(default, **dict.fromkeys(changed, True))
+    assert positional.supports_telemetry is False
+
+
+def test_engine_runner_factory_declares_telemetry_support():
+    telemetry = ReplayOutputRequirements(capture_telemetry=True)
+    capabilities = EngineReplayRunnerFactory().capabilities()
+    capabilities.require_output_support(telemetry)
+    with pytest.raises(ValueError, match="does not support replay telemetry"):
+        replace(capabilities, supports_telemetry=False).require_output_support(telemetry)
+
+
+@pytest.mark.parametrize("location", ["rank", "canonical"])
+@pytest.mark.parametrize("nested_rank", [False, True])
+def test_mtp_host_offload_requires_explicit_composition_capability(location, nested_rank):
+    args = _engine_args()
+    selection = {"kind": "mtp", "params": {"depth": 2}, "expected_accepted_tokens": 1.5}
+    if location == "rank":
+        args["speculation"] = selection
+    else:
+        args["timing_model"] = {"type": "external", "provider": "aic", "config": {"speculation": selection}}
+    args["native_host_offload"] = {"num_host_blocks": 16}
+    spec = _spec(
+        deployment=BackendDeploymentSpec(
+            deployment_mode="agg",
+            backend="vllm",
+            backend_version="test",
+            agg_engine_args={"rank": args} if nested_rank else args,
+            num_workers=1,
+        )
+    )
+    engine = EngineReplayRunnerFactory().capabilities()
+    engine.require_compatible(spec)
+    consumer = replace(engine, supports_mtp_host_offload=False)
+    with pytest.raises(ValueError, match="MTP with host offload; use --stack engine"):
+        consumer.require_compatible(spec)
+    # Support for either feature alone must not imply support for their composition.
+    offload = args.pop("native_host_offload")
+    consumer.require_compatible(spec)
+    args["native_host_offload"] = offload
+    if location == "rank":
+        args.pop("speculation")
+    else:
+        args["timing_model"]["config"].pop("speculation")
+    consumer.require_compatible(spec)
+
+
+@pytest.mark.parametrize("location,name", [("rank", "aic_nextn"), ("rank", "nextn"), ("canonical", "nextn")])
+@pytest.mark.parametrize("nested_rank", [False, True])
+@pytest.mark.parametrize("supports_composition", [False, True])
+def test_host_offload_rejects_legacy_depth_during_capability_preflight(
+    location, name, nested_rank, supports_composition
+):
+    args = _engine_args()
+    args["native_host_offload"] = {"num_host_blocks": 16}
+    if location == "rank":
+        controls = args
+    else:
+        args["timing_model"] = {"type": "external", "provider": "aic", "config": {}}
+        controls = args["timing_model"]["config"]
+    controls[name] = 2
+    spec = _spec(
+        deployment=BackendDeploymentSpec(
+            deployment_mode="agg",
+            backend="vllm",
+            backend_version="test",
+            agg_engine_args={"rank": args} if nested_rank else args,
+            num_workers=1,
+        )
+    )
+    capabilities = replace(EngineReplayRunnerFactory().capabilities(), supports_mtp_host_offload=supports_composition)
+    with pytest.raises(ValueError, match="requires canonical mtp speculation"):
+        capabilities.require_compatible(spec)
+    # Disabled legacy depth and legacy speculation without G2 remain compatible.
+    controls[name] = 0
+    capabilities.require_compatible(spec)
+    controls[name] = 2
+    args.pop("native_host_offload")
+    capabilities.require_compatible(spec)
+
+
+@pytest.mark.parametrize("name", ["aic_nextn", "nextn"])
+@pytest.mark.parametrize("nested_rank", [False, True])
+@pytest.mark.parametrize("cache_mode", ["g1", "g2", "state"])
+def test_runner_zero_legacy_depth_executes_as_disabled(name, nested_rank, cache_mode):
+    args = _engine_args()
+    if cache_mode == "g2":
+        args.update(kv_cache_bytes_per_token=1024, native_host_offload={"num_host_blocks": 16})
+    elif cache_mode == "state":
+        args.update(kv_cache_bytes_per_token=1024, state_cache={"bytes_per_request": 1500}, prefix_match_unit=1)
+    if nested_rank:
+        materialized = _materialize_engine_role("vllm", "test", {}, args, "aggregated")
+        args = {key: materialized[key] for key in ("rank", "dp_size", "tensor_parallel_size")}
+    rank = args.get("rank", args)
+    spec = _spec(
+        deployment=BackendDeploymentSpec(
+            deployment_mode="agg", backend="vllm", backend_version="test", agg_engine_args=args, num_workers=1
+        )
+    )
+    runner = EngineReplayRunnerFactory().create(0)
+    baseline = runner.run(spec)
+    rank[name] = 0
+    disabled = runner.run(spec)
+    assert rank[name] == 0  # Materialization must not rewrite the caller's spec.
+    assert disabled.metrics["completed_requests"] == 1
+    assert disabled.metrics["total_output_tokens"] == 2
+    for metric in ("mean_e2e_latency_ms", "mean_ttft_ms", "mean_tpot_ms", "output_throughput_tok_s"):
+        assert disabled.metrics[metric] == baseline.metrics[metric]
+    # Positive legacy depth remains forbidden with G2 or sub-block state cache.
+    rank[name] = 2
+    if cache_mode == "g2":
+        with pytest.raises(ValueError, match="requires canonical mtp speculation"):
+            runner.run(spec)
+    elif cache_mode == "state":
+        with pytest.raises(ValueError, match="sub-block prefix_match_unit does not support speculative decoding"):
+            runner.run(spec)
+    else:
+        rank["aic_nextn_accept_rates"] = "1,0.5"
+        assert runner.run(spec).metrics["completed_requests"] == 1
+
+
+@pytest.mark.parametrize(
+    "controls,message",
+    [
+        ({"aic_nextn": 0, "nextn": 0}, "duplicates aic_nextn"),
+        ({"aic_nextn": 0, "nextn": 2}, "duplicates aic_nextn"),
+        ({"aic_nextn": False}, "aic_nextn must be a positive integer"),
+        ({"nextn": 0.0}, "aic_nextn must be a positive integer"),
+        (
+            {"nextn": 0, "speculation": {"kind": "mtp", "params": {"depth": 2}, "expected_accepted_tokens": 1}},
+            "speculation cannot be combined with legacy",
+        ),
+        (
+            {
+                "nextn": 0,
+                "timing_model": {"type": "external", "provider": "aic", "config": {"nextn": 2}},
+            },
+            "aic_nextn=0 conflicts with timing_model.config.nextn",
+        ),
+        (
+            {
+                "nextn": 0,
+                "timing_model": {
+                    "type": "external",
+                    "provider": "aic",
+                    "config": {"speculation": {"kind": "mtp", "params": {"depth": 2}}},
+                },
+            },
+            "aic_nextn must be a positive integer",
+        ),
+    ],
+)
+def test_runner_disabled_depth_normalization_preserves_input_validation(controls, message):
+    args = {**_engine_args(), **controls}
+    spec = _spec(
+        deployment=BackendDeploymentSpec(
+            deployment_mode="agg", backend="vllm", backend_version="test", agg_engine_args=args, num_workers=1
+        )
+    )
+    with pytest.raises(ValueError, match=message):
+        EngineReplayRunnerFactory().create(0).run(spec)
+
+
+@pytest.mark.parametrize("mode", ["op_level", "fpm_interpolation"])
+def test_runner_rejects_mtp_with_a_duplicate_timing_nextn(mode):
+    args = {
+        "backend": "vllm",
+        "block_size": 4,
+        "num_gpu_blocks": 16,
+        "speculation": {"kind": "mtp", "params": {"depth": 2}, "expected_accepted_tokens": 1},
+        "timing_model": {
+            "type": "external",
+            "provider": "aic",
+            "config": {
+                "model": "Qwen/Qwen3-8B",
+                "system": "h200_sxm",
+                "backend": "vllm",
+                "backend_version": "0.24.0",
+                "worker_type": "aggregated",
+                "estimation_mode": mode,
+                "nextn": 2,
+            },
+        },
+    }
+    # Even an equal legacy depth is ambiguous alongside a scheme. The adapter
+    # must reject it instead of silently discarding the speculative cost.
+    with pytest.raises(ValueError, match="speculation conflicts with timing_model.config.nextn"):
+        _materialize_engine_role("vllm", "0.24.0", {}, {"rank": args}, "aggregated")
 
 
 def _canonical_speculation_deployment(speculation, *, backend="vllm"):
@@ -218,7 +472,7 @@ def test_agentic_capabilities_allow_disabled_canonical_speculation():
 )
 @pytest.mark.parametrize("entrypoint", ["replay", "launch"])
 def test_native_replay_rejects_malformed_canonical_speculation(speculation, entrypoint):
-    from aisimulate.runner import materialize_engine_launch_config
+    from aisim.runner import materialize_engine_launch_config
 
     deployment = _canonical_speculation_deployment(speculation)
     with pytest.raises(ValueError, match="speculation.*must be a mapping"):
@@ -228,6 +482,7 @@ def test_native_replay_rejects_malformed_canonical_speculation(speculation, entr
             materialize_engine_launch_config("vllm", "0.24.0", {}, deployment.agg_engine_args, "aggregated")
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("accept_rates", [None, "", "  ", "1,0.5"])
 @pytest.mark.parametrize("explicit_depth", [False, True])
 def test_native_canonical_speculation_requires_authored_acceptance(accept_rates, explicit_depth):
@@ -246,6 +501,47 @@ def test_native_canonical_speculation_requires_authored_acceptance(accept_rates,
             runner.run(spec)
 
 
+@pytest.mark.parametrize("location", ["rank", "canonical"])
+@pytest.mark.parametrize("scope", ["dp_rank_local", "cluster_shared"])
+def test_runner_canonical_mtp_g2_retains_local_scope_limit(location, scope):
+    deployment = _canonical_speculation_deployment({"kind": "mtp", "params": {"depth": 2}})
+    args = dict(deployment.agg_engine_args)
+    args.update(kv_cache_bytes_per_token=250_000, native_host_offload={"num_host_blocks": 16, "scope": scope})
+    if location == "rank":
+        args["speculation"] = {**args["timing_model"]["config"].pop("speculation"), "expected_accepted_tokens": 1.5}
+    else:
+        args.update(aic_nextn_accept_rates="1,0.5", aic_mtp_seed=42)
+    runtime = RecordingRuntime()
+    runner = EngineReplayRunnerFactory(runtime=runtime).create(0)
+    spec = _spec(deployment=replace(deployment, agg_engine_args=args))
+    if scope == "cluster_shared":
+        with pytest.raises(ValueError, match="scope=dp_rank_local"):
+            runner.run(spec)
+        assert runtime.execution_spec is None
+    else:
+        runner.run(spec)
+        rank = runtime.execution_spec["engine"]["rank"]
+        assert rank["native_host_offload"] == args["native_host_offload"]
+        assert rank["timing_model"]["config"]["speculation"] == {"kind": "mtp", "params": {"depth": 2}}
+
+
+@pytest.mark.parametrize("field,value", [("g3_offload", {"num_g3_blocks": 16}), ("enable_prefix_caching", False)])
+def test_runner_canonical_mtp_g2_rejects_unsupported_cache_compositions(field, value):
+    deployment = _canonical_speculation_deployment({"kind": "mtp", "params": {"depth": 2}})
+    args = {
+        **deployment.agg_engine_args,
+        "kv_cache_bytes_per_token": 250_000,
+        "native_host_offload": {"num_host_blocks": 16},
+        "aic_nextn_accept_rates": "1,0.5",
+        field: value,
+    }
+    with pytest.raises(ValueError, match="uniform G1/G2 without G3"):
+        EngineReplayRunnerFactory(runtime=RecordingRuntime()).create(0).run(
+            _spec(deployment=replace(deployment, agg_engine_args=args))
+        )
+
+
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize(
     "backend,speculation",
     [
@@ -270,7 +566,7 @@ def test_public_runner_infers_canonical_depth_without_duplicate_rank_input(backe
     assert inferred.metrics["total_output_tokens"] == 16
     for metric in ("mean_e2e_latency_ms", "mean_ttft_ms", "mean_tpot_ms", "output_throughput_tok_s"):
         assert inferred.metrics[metric] == explicit.metrics[metric]
-    with pytest.raises(RuntimeError, match="aic_nextn conflicts with resolved speculative depth 2"):
+    with pytest.raises(RuntimeError, match="canonical speculative depth conflicts with scheduler aic_nextn"):
         runner.run(replace(spec, backend_deployment=replace(deployment, agg_engine_args={**args, "aic_nextn": 1})))
 
 
@@ -290,8 +586,9 @@ def test_public_runner_rejects_generic_trtllm_in_both_representations(location):
     assert runtime.execution_spec is None
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_native_canonical_speculation_rejects_trtllm_without_restricting_legacy():
-    from aisimulate import _runtime
+    from aisim import _runtime
 
     deployment = _canonical_speculation_deployment({"kind": "mtp", "params": {"depth": 2}})
     args = {**deployment.agg_engine_args, "aic_nextn": 2, "aic_nextn_accept_rates": "1,0.5"}
@@ -319,7 +616,7 @@ def test_native_canonical_speculation_rejects_trtllm_without_restricting_legacy(
 
 @pytest.mark.parametrize("backend", ["vllm", "trtllm"])
 def test_native_replay_rejects_unsupported_images_without_restricting_text(backend):
-    from aisimulate import _runtime
+    from aisim import _runtime
 
     payload = {
         "spec": {
@@ -364,7 +661,7 @@ def test_native_replay_rejects_unsupported_images_without_restricting_text(backe
 
 @pytest.mark.parametrize("failure", ["download", "validation"])
 def test_native_replay_preserves_checkpoint_failure_classification(monkeypatch, failure):
-    from aisimulate_core.sdk import engine, utils
+    from aisim_core.sdk import engine, utils
 
     path = "test-fixture/unavailable-draft"
     attempted_paths = []
@@ -470,9 +767,30 @@ def _agentic_g2_spec(*, scopes=("dp_rank_local",), nested_rank=False, trace_form
         if prefill is not None or decode is not None
     ],
 )
-def test_agentic_g2_capability_accepts_static_vllm_dp1_roles(trace_format, nested_rank, scopes):
+def test_agentic_g2_capability_accepts_static_vllm_roles(trace_format, nested_rank, scopes):
     spec = _agentic_g2_spec(scopes=scopes, nested_rank=nested_rank, trace_format=trace_format)
     EngineReplayRunnerFactory().capabilities().require_compatible(spec)
+
+
+@pytest.mark.parametrize("nested_rank", [False, True])
+@pytest.mark.parametrize("location", ["rank", "canonical"])
+def test_agentic_g2_capability_takes_canonical_mtp(nested_rank, location):
+    spec = _agentic_g2_spec(nested_rank=nested_rank)
+    args = spec.backend_deployment.agg_engine_args
+    rank = args.get("rank", args)
+    if location == "rank":
+        rank["speculation"] = {"kind": "mtp", "params": {"depth": 2}, "expected_accepted_tokens": 1.5}
+    else:
+        rank["timing_model"] = {
+            "type": "external",
+            "provider": "aic",
+            "config": {"speculation": {"kind": "mtp", "params": {"depth": 2}}},
+        }
+        rank["aic_nextn_accept_rates"] = "1,0.5"
+    capabilities = EngineReplayRunnerFactory().capabilities()
+    capabilities.require_compatible(spec)
+    with pytest.raises(ValueError, match="speculative decoding disabled"):
+        replace(capabilities, supports_agentic_speculative_decoding=False).require_compatible(spec)
 
 
 @pytest.mark.parametrize("nested_rank", [False, True])
@@ -492,24 +810,55 @@ def test_agentic_g2_runner_capability_remains_explicit(nested_rank, scopes, work
     "scopes,field,value",
     [
         (("dp_rank_local",), "num_workers", 2),
-        (("cluster_shared",), "num_workers", 0),
-        (("dp_rank_local",), "num_workers", True),
+        (("cluster_shared",), "num_workers", 2),
         (("dp_rank_local", None), "num_prefill_workers", 2),
-        ((None, "cluster_shared"), "num_decode_workers", 2),
-        (("dp_rank_local", "cluster_shared"), "num_prefill_workers", 0),
+        ((None, "cluster_shared"), "num_decode_workers", 3),
     ],
 )
-def test_agentic_g2_rejects_unqualified_worker_counts(nested_rank, scopes, field, value):
+def test_agentic_g2_accepts_multiple_replicas(nested_rank, scopes, field, value):
     spec = _agentic_g2_spec(scopes=scopes, nested_rank=nested_rank)
     spec = replace(spec, backend_deployment=replace(spec.backend_deployment, **{field: value}))
-    with pytest.raises(ValueError, match="one aggregated worker or one prefill and one decode"):
+    EngineReplayRunnerFactory().capabilities().require_compatible(spec)
+
+
+@pytest.mark.parametrize("nested_rank", [False, True])
+@pytest.mark.parametrize(
+    "scopes,field,value",
+    [
+        (("cluster_shared",), "num_workers", 0),
+        (("dp_rank_local",), "num_workers", -1),
+        (("cluster_shared",), "num_workers", 1.5),
+        (("dp_rank_local",), "num_workers", True),
+        (("dp_rank_local", "cluster_shared"), "num_prefill_workers", 0),
+        ((None, "cluster_shared"), "num_decode_workers", True),
+    ],
+)
+def test_agentic_g2_rejects_invalid_worker_counts(nested_rank, scopes, field, value):
+    spec = _agentic_g2_spec(scopes=scopes, nested_rank=nested_rank)
+    spec = replace(spec, backend_deployment=replace(spec.backend_deployment, **{field: value}))
+    with pytest.raises(ValueError, match=f"{field} to be a positive integer"):
         EngineReplayRunnerFactory().capabilities().require_compatible(spec)
+
+
+@pytest.mark.parametrize("nested_rank", [False, True])
+@pytest.mark.parametrize(
+    "scopes,field",
+    [
+        (("dp_rank_local", None), "num_prefill_workers"),
+        ((None, "cluster_shared"), "num_decode_workers"),
+        (("cluster_shared", "cluster_shared"), "num_decode_workers"),
+    ],
+)
+def test_agentic_g2_accepts_several_workers_per_pd_role(nested_rank, scopes, field):
+    spec = _agentic_g2_spec(scopes=scopes, nested_rank=nested_rank)
+    spec = replace(spec, backend_deployment=replace(spec.backend_deployment, **{field: 3}))
+    EngineReplayRunnerFactory().capabilities().require_compatible(spec)
 
 
 @pytest.mark.parametrize("nested_rank", [False, True])
 @pytest.mark.parametrize("offload_role", ["prefill", "decode"])
 @pytest.mark.parametrize("dp_source", ["dp_size", "aic_attention_dp_size", "timing", "parallel_config"])
-def test_agentic_g2_checks_dp_on_role_without_offload(nested_rank, offload_role, dp_source):
+def test_agentic_g2_accepts_dp_on_role_without_offload(nested_rank, offload_role, dp_source):
     scopes = ("cluster_shared", None) if offload_role == "prefill" else (None, "dp_rank_local")
     spec = _agentic_g2_spec(scopes=scopes, nested_rank=nested_rank)
     other_role = "decode" if offload_role == "prefill" else "prefill"
@@ -521,8 +870,7 @@ def test_agentic_g2_checks_dp_on_role_without_offload(nested_rank, offload_role,
         spec.backend_deployment.parallel_config[f"{other_role}_attention_dp"] = 2
     else:
         args[dp_source] = 2
-    with pytest.raises(ValueError, match="attention DP=1 on every role"):
-        EngineReplayRunnerFactory().capabilities().require_compatible(spec)
+    EngineReplayRunnerFactory().capabilities().require_compatible(spec)
 
 
 @pytest.mark.parametrize("nested_rank", [False, True])
@@ -580,12 +928,12 @@ def test_agentic_g2_rejects_backend_online_and_scaling():
         capabilities.require_compatible(replace(spec, adapters={"planner": AdapterReplaySpec(runtime_hooks=(hook,))}))
 
 
-@pytest.mark.parametrize("value", [True, 0, 2, "1"])
-def test_agentic_g2_requires_typed_dp1(value):
+@pytest.mark.parametrize("value", [True, 0, "1"])
+def test_agentic_g2_runner_rejects_an_untyped_attention_dp(value):
     spec = _agentic_g2_spec(nested_rank=True)
     spec.backend_deployment.agg_engine_args["dp_size"] = value
-    with pytest.raises(ValueError, match="attention DP=1"):
-        EngineReplayRunnerFactory().capabilities().require_compatible(spec)
+    with pytest.raises(ValueError, match="dp_size"):
+        EngineReplayRunnerFactory(runtime=RecordingRuntime()).create(0).run(spec)
 
 
 def test_agentic_g2_preserves_disabled_speculation_default_in_canonical_timing():
@@ -599,7 +947,7 @@ def test_agentic_g2_preserves_disabled_speculation_default_in_canonical_timing()
     capabilities = EngineReplayRunnerFactory().capabilities()
     capabilities.require_compatible(spec)
     identity["nextn"] = 1
-    with pytest.raises(ValueError, match="speculative decoding disabled"):
+    with pytest.raises(ValueError, match="requires canonical mtp speculation"):
         capabilities.require_compatible(spec)
 
 
@@ -805,6 +1153,14 @@ def test_prediction_compiler_carries_weka_agentic_lanes() -> None:
                     "paths": ["weka-corpus"],
                     "format": "weka",
                     "nested_timestamp_basis": "relative",
+                    "client": "agentx",
+                    "chat_template": {
+                        "request_tokens": 16,
+                        "user_tokens": 5,
+                        "assistant_tokens": 8,
+                        "tail_tokens": 8,
+                        "append_tail_tokens": 1,
+                    },
                 },
                 "load": {
                     "type": "trace_timestamps",
@@ -827,6 +1183,14 @@ def test_prediction_compiler_carries_weka_agentic_lanes() -> None:
     assert workload["arrival_speedup_ratio"] == 2.0
     assert workload["agentic_lanes"] == 3
     assert workload["weka_nested_timestamp_basis"] == "relative"
+    assert workload["weka_client"] == "agentx"
+    assert workload["weka_chat_template"] == {
+        "request_tokens": 16,
+        "user_tokens": 5,
+        "assistant_tokens": 8,
+        "tail_tokens": 8,
+        "append_tail_tokens": 1,
+    }
 
 
 @pytest.mark.parametrize("backend", ["vllm", "sglang"])
@@ -968,6 +1332,42 @@ def test_disaggregated_agentic_checks_actual_aic_timing_model(trace_format, role
             },
             "must be 'auto', 'absolute', or 'relative'",
         ),
+        (
+            {"source_type": "trace", "trace_format": "mooncake", "weka_client": "agentx"},
+            "weka_client requires Weka input",
+        ),
+        (
+            {"source_type": "trace", "trace_format": "weka", "weka_client": "aiperf"},
+            "must be 'recorded' or 'agentx'",
+        ),
+        (
+            {
+                "source_type": "trace",
+                "trace_format": "mooncake",
+                "weka_chat_template": {
+                    "request_tokens": 1,
+                    "user_tokens": 1,
+                    "assistant_tokens": 1,
+                    "tail_tokens": 1,
+                    "append_tail_tokens": 1,
+                },
+            },
+            "weka_chat_template requires Weka input",
+        ),
+        (
+            {
+                "source_type": "trace",
+                "trace_format": "weka",
+                "weka_chat_template": {
+                    "request_tokens": -1,
+                    "user_tokens": 1,
+                    "assistant_tokens": 1,
+                    "tail_tokens": 1,
+                    "append_tail_tokens": 1,
+                },
+            },
+            "greater than or equal to 0",
+        ),
     ],
 )
 def test_engine_capability_rejects_invalid_agentic_lane_controls(workload: dict, message: str) -> None:
@@ -1072,6 +1472,56 @@ def test_runner_preserves_native_host_offload_rank_config():
     assert rank["native_host_offload"] == engine_args["native_host_offload"]
 
 
+def _wait_power_prediction(**worker: object) -> dict:
+    return {
+        "engine": {
+            "mode": "aggregated",
+            "model": "Qwen/Qwen3-0.6B",
+            "hardware": "h200_sxm",
+            "backend": "vllm",
+            "context_length": 4096,
+            "workers": {
+                "aggregated": {
+                    **worker,
+                    "kv_cache": {"capacity": {"type": "fixed", "blocks": 128}},
+                    "timing": {"type": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0},
+                }
+            },
+        }
+    }
+
+
+def _native_rank(config: CorePredictionConfig) -> dict:
+    runtime = RecordingRuntime()
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(prediction_to_replay_spec(config))
+    execution = runtime.execution_spec.get("spec", runtime.execution_spec)
+    return execution["engine"]["rank"]
+
+
+def test_prediction_wait_power_reaches_native_role_after_round_trip():
+    config = CorePredictionConfig.model_validate(_wait_power_prediction(wait_power_w=60))
+    restored = CorePredictionConfig.model_validate_json(config.model_dump_json(exclude_unset=True))
+    assert _native_rank(restored)["wait_power_w"] == 60.0
+
+
+def test_unset_wait_power_is_omitted_from_native_role():
+    config = CorePredictionConfig.model_validate(_wait_power_prediction())
+    assert "wait_power_w" not in _native_rank(config)
+
+
+@pytest.mark.parametrize("watts", [-1.0, math.nan, math.inf, "60"])
+def test_wait_power_rejects_negative_non_finite_or_string_watts(watts):
+    with pytest.raises(ValidationError, match="wait_power_w"):
+        CorePredictionConfig.model_validate(_wait_power_prediction(wait_power_w=watts))
+
+
+def test_afd_workers_do_not_accept_wait_power():
+    from aisim.config.engine import AFDWorkerPredictionConfig
+
+    assert "wait_power_w" not in AFDWorkerPredictionConfig.model_fields
+    assert AFDWorkerPredictionConfig.model_config.get("extra") == "forbid"
+
+
 def test_public_host_offload_config_reaches_native_execution_rank():
     runtime = RecordingRuntime()
     public = CorePredictionConfig.model_validate(
@@ -1159,12 +1609,12 @@ engine:
         return 321
 
     monkeypatch.setattr(aic, "estimate_num_gpu_blocks", estimate)
-    import aisimulate_core
-    from aisimulate_core.sdk import RustForwardPassPerfModel
+    import aisim_core
+    from aisim_core.sdk import RustForwardPassPerfModel
 
     class Estimator:
         def __init__(self, config):
-            self.config = json.loads(aisimulate_core.RustForwardPassPerfModel.normalize_config(json.dumps(config)))
+            self.config = json.loads(aisim_core.RustForwardPassPerfModel.normalize_config(json.dumps(config)))
             self.config.update(backend_version="0.24.0", estimation_mode="op_level", fallback_policy="deny")
 
         def diagnostics(self):
@@ -1234,6 +1684,42 @@ engine:
     assert public.engine.workers.aggregated is not None
     assert getattr(public.engine.workers.aggregated.scheduler, field) == value
     assert runtime.execution_spec["spec"]["engine"]["rank"][field] == value
+
+
+def test_public_scheduler_launch_reaches_native_execution_rank(tmp_path):
+    launch = {
+        "decode_ms": 5.0,
+        "piecewise_ms": 50.0,
+        "eager_ms": 150.0,
+        "max_cudagraph_capture_size": 512,
+        "eager_queue_fraction": 0.4,
+    }
+    path = tmp_path / "prediction.yaml"
+    path.write_text(
+        f"""\
+engine:
+  mode: aggregated
+  model: example/model
+  hardware: h200_sxm
+  backend: vllm
+  context_length: 4096
+  workers:
+    aggregated:
+      scheduler:
+        launch: {json.dumps(launch)}
+      kv_cache:
+        block_size: 16
+        capacity: {{type: fixed, blocks: 128}}
+      timing: {{type: fixed, prefill_ms: 1.0, decode_ms: 1.0}}
+""",
+        encoding="utf-8",
+    )
+    runtime = RecordingRuntime()
+    public = CorePredictionConfig.from_yaml(path)
+
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(prediction_to_replay_spec(public))
+
+    assert runtime.execution_spec["spec"]["engine"]["rank"]["launch"] == launch
 
 
 def test_runner_materializes_aic_capacity_before_native_execution(monkeypatch):
@@ -1334,6 +1820,188 @@ def test_runner_rejects_decode_pipeline_parallelism_before_prefill_capacity(monk
     )
     with pytest.raises(ValueError, match="does not support pipeline parallelism for decode"):
         EngineReplayRunnerFactory(runtime=RecordingRuntime()).create(0).run(_spec(deployment=deployment))
+
+
+@pytest.mark.parametrize("role", ["aggregated", "decode"])
+def test_sglang_pipeline_parallelism_is_only_for_prefill(monkeypatch, role):
+    _forbid_capacity(monkeypatch)
+    args = {**_engine_args(role=role, backend="sglang"), "aic_pp_size": 2}
+    with pytest.raises(ValueError, match=f"does not support pipeline parallelism for {role}"):
+        _materialize_engine_role("sglang", "test", {}, args, role)
+    aic.reject_pipeline_parallelism("prefill", 2, backend="sglang")
+
+
+@pytest.mark.parametrize("source", ["deployment", "flat"])
+def test_sglang_prefill_pipeline_needs_an_aic_timing_model(monkeypatch, source):
+    # Fixed and polynomial timing price one stage, so a PP width would be dropped.
+    _forbid_capacity(monkeypatch)
+    args = _engine_args(role="prefill", backend="sglang")
+    parallel = {"prefill_pp": 4} if source == "deployment" else {}
+    if source == "flat":
+        args["aic_pp_size"] = 4
+    with pytest.raises(ValueError, match="requires an AIC timing model, not .fixed. timing"):
+        _materialize_engine_role("sglang", "test", parallel, args, "prefill")
+
+
+def test_sglang_prefill_pipeline_width_reaches_the_default_aic_timing(monkeypatch):
+    _forbid_capacity(monkeypatch)
+    args = _engine_args(role="prefill", backend="sglang")
+    args.pop("timing_model")
+    # The deployment width is the timing width when the rank does not state one.
+    rank = _materialize_engine_role("sglang", "test", {"prefill_pp": 4}, args, "prefill")["rank"]
+    assert rank["timing_model"]["config"]["pp"] == 4
+    with pytest.raises(ValueError, match="prefill pipeline widths conflict"):
+        _materialize_engine_role("sglang", "test", {"prefill_pp": 4}, {**args, "aic_pp_size": 2}, "prefill")
+    # A nested rank that states no width inherits it inside the rank.
+    outer = ("worker_type", "engine_type", "aic_backend", "aic_model_path", "aic_system")
+    nested = {key: args[key] for key in outer}
+    nested["rank"] = {key: value for key, value in args.items() if key not in outer}
+    rank = _materialize_engine_role("sglang", "test", {"prefill_pp": 4}, nested, "prefill")["rank"]
+    assert rank["timing_model"]["config"]["pp"] == 4
+
+
+def test_sglang_prefill_timing_only_pipeline_width_sizes_capacity(monkeypatch):
+    calls = []
+
+    def estimate(**kwargs):
+        calls.append(kwargs)
+        return 321
+
+    monkeypatch.setattr(aic, "estimate_num_gpu_blocks", estimate)
+    args = _engine_args(role="prefill", backend="sglang")
+    args.pop("num_gpu_blocks")
+    for name in ("pp", "pp_size"):
+        calls.clear()
+        timing = {"type": "external", "provider": "aic", "config": {name: 4}}
+        # The timing width is the only one stated: capacity and timing read the same topology.
+        rank = _materialize_engine_role("sglang", "test", {}, {**args, "timing_model": timing}, "prefill")["rank"]
+        assert [call["pp_size"] for call in calls] == [4]
+        assert rank["num_gpu_blocks"] == 321
+        assert rank["timing_model"]["config"][name] == 4
+        assert "aic_pp_size" not in rank
+
+
+@pytest.mark.parametrize("source", ["deployment", "flat"])
+def test_sglang_prefill_pipeline_rejects_an_unknown_timing_width(monkeypatch, source):
+    # Native replay runs an unknown width as one stage, so a wider role would be priced as PP1.
+    _forbid_capacity(monkeypatch)
+    args = _engine_args(role="prefill", backend="sglang")
+    args.pop("num_gpu_blocks")
+    args["timing_model"] = {"type": "external", "provider": "aic", "config": {"pp": "unknown"}}
+    parallel = {"prefill_pp": 4} if source == "deployment" else {}
+    if source == "flat":
+        args["aic_pp_size"] = 4
+    with pytest.raises(ValueError, match="requires a timing model that records its pipeline width"):
+        _materialize_engine_role("sglang", "test", parallel, args, "prefill")
+
+
+@pytest.mark.parametrize("width", [[4], 4.0, "4", True])
+def test_sglang_prefill_pipeline_width_must_be_a_positive_integer(monkeypatch, width):
+    _forbid_capacity(monkeypatch)
+    args = _engine_args(role="prefill", backend="sglang")
+    args.pop("timing_model")
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        _materialize_engine_role("sglang", "test", {"prefill_pp": 4}, {**args, "aic_pp_size": width}, "prefill")
+
+
+@pytest.mark.parametrize("mode", ["aggregated", "disaggregated"])
+def test_sglang_prediction_lowers_measured_scheduler_selection_cost(mode):
+    costs = {"aggregated": 1.5} if mode == "aggregated" else {"prefill": 1.5, "decode": 2.5}
+    config = CorePredictionConfig.model_validate(
+        {
+            "engine": {
+                "backend": "sglang",
+                "model": "synthetic",
+                "hardware": "h200_sxm",
+                "mode": mode,
+                "workers": {
+                    role: {
+                        "scheduler": {"scheduler_select_time_ms": cost},
+                        "kv_cache": {"capacity": {"type": "fixed", "blocks": 64}},
+                        "timing": {"type": "fixed", "prefill_ms": 7, "decode_ms": 2},
+                    }
+                    for role, cost in costs.items()
+                },
+            }
+        }
+    )
+    deployment = prediction_to_replay_spec(config).backend_deployment
+    for role, cost in costs.items():
+        role_args = getattr(deployment, f"{'agg' if role == 'aggregated' else role}_engine_args")
+        assert role_args["sglang"]["scheduler_select_time_ms"] == cost
+
+
+def test_sglang_pd_prefill_compiles_pipeline_stages():
+    config = CorePredictionConfig.model_validate(
+        {
+            "engine": {
+                "mode": "disaggregated",
+                "backend": "sglang",
+                "model": "sglang-pd-smoke",
+                "hardware": "h200_sxm",
+                "context_length": 4096,
+                "workers": {
+                    "prefill": {
+                        "parallelism": {"pipeline": 4},
+                        "kv_cache": {"block_size": 64, "capacity": {"type": "fixed", "blocks": 64}},
+                    },
+                    "decode": {
+                        "kv_cache": {"block_size": 64, "capacity": {"type": "fixed", "blocks": 64}},
+                        "timing": {"type": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0},
+                    },
+                },
+            },
+            "traffic": {
+                "source": {"type": "synthetic", "input_tokens": 128, "output_tokens": 1},
+                "load": {"type": "concurrency", "concurrency": 1},
+                "stop": {"requests": 1},
+            },
+        }
+    )
+    deployment = prediction_to_replay_spec(config).backend_deployment
+    assert deployment.parallel_config["prefill_pp"] == 4
+    assert deployment.prefill_engine_args["timing_model"]["config"]["pp"] == 4
+    # Fixed timing prices one stage, so the compiler rejects the width before sizing any role.
+    fixed = config.model_dump(mode="json", exclude_unset=True)
+    fixed["engine"]["workers"]["prefill"]["timing"] = {"type": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0}
+    with pytest.raises(ValueError, match="pipeline parallelism on prefill requires an AIC timing model"):
+        prediction_to_replay_spec(CorePredictionConfig.model_validate(fixed))
+
+
+def test_public_sglang_pd_prefill_pipeline_replays_with_aic_timing():
+    """The public config, AIC timing from the bundled data and the native engine price PP prefill."""
+
+    def replay(pipeline):
+        kv_cache = {"block_size": 64, "capacity": {"type": "fixed", "blocks": 4096}}
+        config = CorePredictionConfig.model_validate(
+            {
+                "engine": {
+                    "mode": "disaggregated",
+                    "backend": "sglang",
+                    "model": "meta-llama/Meta-Llama-3.1-70B",
+                    "hardware": "h200_sxm",
+                    "context_length": 32768,
+                    "workers": {
+                        "prefill": {"parallelism": {"pipeline": pipeline}, "kv_cache": kv_cache},
+                        "decode": {"kv_cache": kv_cache},
+                    },
+                },
+                "traffic": {
+                    # Several prefill chunks, one request at a time.
+                    "source": {"type": "synthetic", "input_tokens": 20000, "output_tokens": 4},
+                    "load": {"type": "concurrency", "concurrency": 1},
+                    "stop": {"requests": 4},
+                },
+            }
+        )
+        return EngineReplayRunnerFactory().create(0).run(prediction_to_replay_spec(config)).metrics
+
+    single, piped = replay(1), replay(4)
+    assert (single["completed_requests"], piped["completed_requests"]) == (4, 4)
+    assert (single["prefill_gpus_per_worker"], piped["prefill_gpus_per_worker"]) == (1, 4)
+    # Passes retire at the per-stage rate, and the last chunk still crosses the other three stages.
+    assert single["mean_ttft_ms"] / 4 < piped["mean_ttft_ms"] < single["mean_ttft_ms"]
+    assert piped["mean_itl_ms"] == pytest.approx(single["mean_itl_ms"])
 
 
 def test_runner_rejects_nested_inferred_capacity_when_fixed_timing_discards_reservation():
@@ -1881,7 +2549,7 @@ def test_direct_replay_normalizes_both_version_aliases_without_mutating_input():
     )
     EngineReplayRunnerFactory(runtime=runtime).create(0).run(_spec(deployment=deployment))
     actual = runtime.execution_spec["engine"]["rank"]["timing_model"]["config"]["backend_version"]
-    from aisimulate_core.sdk.perf_database import resolve_query_version
+    from aisim_core.sdk.perf_database import resolve_query_version
 
     assert actual == resolve_query_version("h200_sxm", "vllm", "current")
     assert timing["config"]["backend_version"] == "current"
@@ -2199,7 +2867,7 @@ def test_runner_rejects_unknown_forward_model(value):
 @pytest.mark.parametrize("replay", [False, True])
 @pytest.mark.parametrize("worker_policy", [None, "SILICON", "SOL"])
 def test_public_replay_keeps_decoder_profile_and_database_policy(replay, worker_policy, monkeypatch):
-    from aisimulate_core.sdk.rust_engine_step import RustForwardPassPerfModel
+    from aisim_core.sdk.rust_engine_step import RustForwardPassPerfModel
 
     class ReadyEstimator:
         def __init__(self, config):
@@ -2282,7 +2950,7 @@ def test_replay_policy_alias_requires_a_boolean(field):
 
 
 def test_memory_detail_reuses_capacity_calculation_without_changing_execution(monkeypatch):
-    from aisimulate_core.sdk import memory
+    from aisim_core.sdk import memory
 
     calls = []
     estimate = {
@@ -2409,15 +3077,15 @@ engine:
         return 321
 
     monkeypatch.setattr(aic, "estimate_num_gpu_blocks", estimate)
-    import aisimulate_core
-    from aisimulate_core.sdk import RustForwardPassPerfModel
+    import aisim_core
+    from aisim_core.sdk import RustForwardPassPerfModel
 
     requested = []
 
     class Estimator:
         def __init__(self, config):
             requested.append(config)
-            self.config = json.loads(aisimulate_core.RustForwardPassPerfModel.normalize_config(json.dumps(config)))
+            self.config = json.loads(aisim_core.RustForwardPassPerfModel.normalize_config(json.dumps(config)))
             self.config.update(backend_version="0.24.0", estimation_mode="op_level", fallback_policy="deny")
 
         def diagnostics(self):
@@ -2453,9 +3121,9 @@ def test_native_report_memory_error_becomes_host_resource_failure(monkeypatch):
     class HostResourceError(RuntimeError):
         pass
 
-    resources = ModuleType("aisimulate.resources")
+    resources = ModuleType("aisim.resources")
     resources.ResourceLimitError = HostResourceError
-    monkeypatch.setitem(sys.modules, "aisimulate.resources", resources)
+    monkeypatch.setitem(sys.modules, "aisim.resources", resources)
 
     class LimitedRuntime:
         def run_replay_json(self, payload):
@@ -2487,14 +3155,14 @@ def test_native_report_memory_error_becomes_host_resource_failure(monkeypatch):
     ],
 )
 def test_runner_rejects_invalid_power_publication(watts, coverage):
-    from aisimulate.runner import _normalize_engine_replay_report
+    from aisim.runner import _normalize_engine_replay_report
 
     with pytest.raises(InvalidRunnerError):
         _normalize_engine_replay_report({"power_w": watts, "power_coverage": coverage}, include_native_report=False)
 
 
 def test_runner_rejects_overflowing_ordinary_metric():
-    from aisimulate.runner import _normalize_engine_replay_report
+    from aisim.runner import _normalize_engine_replay_report
 
     with pytest.raises(InvalidRunnerError, match="output_throughput_tok_s.*not finite"):
         _normalize_engine_replay_report({"output_throughput_tok_s": 10**400}, include_native_report=False)
@@ -2688,7 +3356,14 @@ def test_agentic_profile_capability_is_explicit() -> None:
         )
 
 
-def test_live_agentic_warmup_requires_explicit_runner_capability_and_reaches_native():
+@pytest.mark.parametrize(
+    "policy,capability,unsupported",
+    [
+        ("live_trajectory_v1", "supports_agentic_live_warmup", "live agentic warmup"),
+        ("primers_only", "supports_agentic_primers_only", "primers-only agentic warmup"),
+    ],
+)
+def test_agentic_warmup_policy_requires_its_own_runner_capability_and_reaches_native(policy, capability, unsupported):
     workload = {
         "source_type": "trace",
         "load_type": "trace_timestamps",
@@ -2698,15 +3373,75 @@ def test_live_agentic_warmup_requires_explicit_runner_capability_and_reaches_nat
         "agentic_snapshot": {"seed": 42},
         "agentic_warmup": True,
         "agentic_profile": {},
-        "agentic_warmup_policy": "live_trajectory_v1",
+        "agentic_warmup_policy": policy,
     }
     capabilities = EngineReplayRunnerFactory().capabilities()
-    assert capabilities.supports_agentic_live_warmup
-    with pytest.raises(ValueError, match="does not support live agentic warmup"):
-        replace(capabilities, supports_agentic_live_warmup=False).require_compatible(_spec(workload=workload))
+    assert getattr(capabilities, capability)
+    # The other policy's capability alone does not admit this policy.
+    with pytest.raises(ValueError, match=f"does not support {unsupported}"):
+        replace(capabilities, **{capability: False}).require_compatible(_spec(workload=workload))
+    if policy == "primers_only":
+        with pytest.raises(ValueError, match="primers_only requires agentic_warmup"):
+            capabilities.require_compatible(_spec(workload={**workload, "agentic_warmup": False}))
     runtime = RecordingRuntime()
     EngineReplayRunnerFactory(runtime=runtime).create(0).run(_spec(workload=workload))
-    assert runtime.execution_spec["traffic"]["agentic_warmup_policy"] == "live_trajectory_v1"
+    assert runtime.execution_spec["traffic"]["agentic_warmup_policy"] == policy
+
+
+def test_primers_only_capability_keeps_existing_positional_arguments():
+    # RunnerCapabilities is public: an adapter passing the earlier fields positionally keeps their meaning.
+    default = RunnerCapabilities()
+    earlier = [field.name for field in fields(RunnerCapabilities) if not field.kw_only]
+    positional = RunnerCapabilities(
+        *(True if name == "supports_weka_client" else getattr(default, name) for name in earlier)
+    )
+    assert positional == replace(default, supports_weka_client=True)
+
+
+def test_weka_client_requires_explicit_runner_capability_and_reaches_native():
+    workload = {
+        "source_type": "trace",
+        "load_type": "trace_timestamps",
+        "trace_path": "corpus",
+        "trace_format": "weka",
+        "agentic_lanes": 1,
+        "weka_client": "agentx",
+    }
+    capabilities = EngineReplayRunnerFactory().capabilities()
+    assert capabilities.supports_weka_client
+    unsupported = replace(capabilities, supports_weka_client=False)
+    with pytest.raises(ValueError, match="does not support weka_client 'agentx'"):
+        unsupported.require_compatible(_spec(workload=workload))
+    # Every runner replays the recorded timing.
+    unsupported.require_compatible(_spec(workload={**workload, "weka_client": "recorded"}))
+    runtime = RecordingRuntime()
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(_spec(workload=workload))
+    assert runtime.execution_spec["traffic"]["weka_client"] == "agentx"
+
+
+def test_weka_chat_template_requires_explicit_runner_capability_and_reaches_native():
+    template = {
+        "request_tokens": 16,
+        "user_tokens": 5,
+        "assistant_tokens": 8,
+        "tail_tokens": 8,
+        "append_tail_tokens": 1,
+    }
+    workload = {
+        "source_type": "trace",
+        "load_type": "trace_timestamps",
+        "trace_path": "corpus",
+        "trace_format": "weka",
+        "agentic_lanes": 1,
+        "weka_chat_template": template,
+    }
+    capabilities = EngineReplayRunnerFactory().capabilities()
+    assert capabilities.supports_weka_chat_template
+    with pytest.raises(ValueError, match="does not support weka_chat_template"):
+        replace(capabilities, supports_weka_chat_template=False).require_compatible(_spec(workload=workload))
+    runtime = RecordingRuntime()
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(_spec(workload=workload))
+    assert runtime.execution_spec["traffic"]["weka_chat_template"] == template
 
 
 @pytest.mark.parametrize("sampler", ["numpy_random_state", "python_random"])
@@ -2827,16 +3562,19 @@ def test_workload_driver_rejects_length_sampler_before_native_execution(source_t
 
 
 @pytest.mark.parametrize("layout", ["flat", "null_flat", "canonical", "canonical_none", "canonical_fallback", "nested"])
-@pytest.mark.parametrize("version", ["", "next", "literal_next"])
+@pytest.mark.parametrize("version", ["", "alias", "literal"])
 def test_direct_replay_capacity_uses_the_resolved_timing_version(monkeypatch, tmp_path, layout, version):
-    from aisimulate import _runtime
-    from aisimulate_core.sdk import perf_database
+    from aisim import _runtime
+    from aisim_core.sdk import perf_database
 
     slots = perf_database.get_version_slots("h200_sxm", "vllm")
-    expected = slots["next" if version == "literal_next" else version or "current"]
-    if version == "literal_next":
-        version = expected
-    assert slots["next"] != slots["current"]
+    # A slot other than current, so capacity falling back to the default
+    # version is visible: next while the fleet has a development version,
+    # otherwise previous (next then resolves to current).
+    other = "next" if slots["next"] != slots["current"] else "previous"
+    assert slots[other] != slots["current"]
+    expected = slots[other] if version else slots["current"]
+    version = {"": "", "alias": other, "literal": expected}[version]
     phase = "python"
     consumed_versions = {"python": [], "native": []}
     get_database = perf_database.get_database
@@ -2900,6 +3638,7 @@ def test_direct_replay_capacity_uses_the_resolved_timing_version(monkeypatch, tm
         "estimator": "op_level",
         "timing_source": "aic",
         "data_version": expected,
+        "database_mode": "SILICON",
         "data_identity": None,
         "data_version_unavailable_reason": None,
     }
@@ -2914,9 +3653,9 @@ def test_direct_replay_resolves_aliases_in_the_effective_systems_root(monkeypatc
 
     import yaml
 
-    from aisimulate_core.sdk import perf_database
+    from aisim_core.sdk import perf_database
 
-    bundled = Path(perf_database.__file__).resolve().parents[1] / "systems"
+    bundled = Path(default_systems_path())
     system = yaml.safe_load((bundled / "h200_sxm.yaml").read_text())
     system["data_dir"] = str(bundled / system["data_dir"])
     (tmp_path / "h200_sxm.yaml").write_text(yaml.safe_dump(system))
@@ -3127,6 +3866,77 @@ def test_prediction_compiler_carries_tokenization(tokenization, expected) -> Non
 
 
 @pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        (None, None),
+        ({}, None),
+        ({"base_ms": 0, "per_input_token_us": 0}, None),
+        ({"base_ms": 30, "per_input_token_us": 0.25}, {"base_ms": 30.0, "per_input_token_ms": 0.00025}),
+        ({"per_input_token_us": 2}, {"base_ms": 0.0, "per_input_token_ms": 0.002}),
+    ],
+)
+def test_prediction_compiler_carries_extra_cpu_overhead(extra, expected) -> None:
+    prediction = _tokenization_prediction(None)
+    if extra is not None:
+        prediction = CorePredictionConfig.model_validate(
+            {"engine": {**prediction.engine.model_dump(mode="json", exclude_none=True), "extra_cpu_overhead": extra}}
+        )
+
+    deployment = prediction_to_replay_spec(prediction).backend_deployment
+
+    assert deployment.extra_cpu_overhead == (pytest.approx(expected) if expected else None)
+    assert deployment.tokenization is None
+
+
+@pytest.mark.parametrize("mode", ["aggregated", "disaggregated"])
+@pytest.mark.parametrize("feature", ["frontend", "host_profile", "afd", "encoder"])
+@pytest.mark.parametrize(
+    ("extra", "rejected"),
+    [
+        (None, False),
+        ({}, False),
+        ({"base_ms": 0, "per_input_token_us": 0}, False),
+        ({"base_ms": 1}, True),
+        ({"per_input_token_us": 1}, True),
+    ],
+)
+def test_prediction_extra_cpu_overhead_exclusions_require_active_cost(mode, feature, extra, rejected) -> None:
+    host_role = "aggregated" if mode == "aggregated" else "prefill"
+    roles = ("aggregated",) if mode == "aggregated" else ("prefill", "decode")
+    workers = {role: {} for role in roles}
+    engine = {"model": "example/model", "hardware": "h200_sxm", "backend": "sglang", "mode": mode, "workers": workers}
+    raw = {"engine": engine}
+    if feature == "frontend":
+        workers[host_role]["frontend"] = {"stages": [{"service_ms": 3.0}]}
+    elif feature == "host_profile":
+        workers[host_role]["host_profile"] = {"path": "unused.json", "frontend": "python"}
+    elif feature == "afd":
+        engine["model"] = "Qwen/Qwen3-30B-A3B"
+        workers[host_role] = {"type": "afd", "afd": {"n_a_nodes": 1, "n_f_nodes": 1, "tp_a": 1, "a_batch_size": 8}}
+    else:
+        engine["model"] = "Qwen/Qwen3-VL-8B-Instruct"
+        workers["encoder"] = {}
+        raw["traffic"] = {
+            "source": {"type": "synthetic", "images": {"height": 448, "width": 448, "count": 1}},
+            "load": {"type": "concurrency", "concurrency": 1},
+            "stop": {"requests": 1},
+        }
+
+    baseline = CorePredictionConfig.model_validate(raw)
+    if extra is not None:
+        engine["extra_cpu_overhead"] = extra
+    if rejected:
+        with pytest.raises(ValidationError, match="engine.extra_cpu_overhead"):
+            CorePredictionConfig.model_validate(raw)
+    else:
+        prediction = CorePredictionConfig.model_validate(raw)
+        assert prediction.model_dump(exclude={"engine": {"extra_cpu_overhead"}}) == baseline.model_dump(
+            exclude={"engine": {"extra_cpu_overhead"}}
+        )
+        assert CorePredictionConfig.model_validate_json(prediction.model_dump_json()) == prediction
+
+
+@pytest.mark.parametrize(
     "tokenization",
     [
         {"workers": 0, "base_ms": 1},
@@ -3143,7 +3953,7 @@ def test_prediction_rejects_invalid_tokenization(tokenization) -> None:
 
 
 def test_recommendation_rejects_tokenization() -> None:
-    from aisimulate.config.engine import EngineRecommendationConfig
+    from aisim.config.engine import EngineRecommendationConfig
 
     with pytest.raises(ValidationError, match="tokenization"):
         EngineRecommendationConfig.model_validate(
@@ -3182,7 +3992,7 @@ def test_engine_runner_omits_tokenization_when_unset() -> None:
 
 
 def test_tokenization_requires_capability_and_offline_replay() -> None:
-    from aisimulate.sweeper import RunnerCapabilities
+    from aisim.sweeper import RunnerCapabilities
 
     deployment = _tokenization_deployment({"workers": 1, "base_ms": 1.0, "per_input_token_ms": 0.0}, 1)
     spec = _spec(deployment=deployment)
@@ -3215,13 +4025,59 @@ def test_native_replay_tokenizes_on_the_placed_worker() -> None:
 
 
 def test_canonical_replay_spec_json_omits_unset_tokenization() -> None:
-    from aisimulate.sweeper.replay import canonical_json
+    from aisim.sweeper.replay import canonical_json
 
     unset = json.loads(canonical_json(_spec()))
     assert "tokenization" not in unset["backend_deployment"]
     tokenization = {"workers": 1, "base_ms": 1.0, "per_input_token_ms": 0.0}
     configured = json.loads(canonical_json(_spec(deployment=_tokenization_deployment(tokenization))))
     assert configured["backend_deployment"]["tokenization"] == tokenization
+
+
+def _extra_overhead_deployment(extra: dict, tokenization: dict | None = None) -> BackendDeploymentSpec:
+    return replace(_tokenization_deployment(tokenization or {}, 1), tokenization=tokenization, extra_cpu_overhead=extra)
+
+
+def test_engine_runner_sends_extra_cpu_overhead_in_the_execution_envelope() -> None:
+    runtime = RecordingRuntime()
+    extra = {"base_ms": 29.5, "per_input_token_ms": 0.000245}
+
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(_spec(deployment=_extra_overhead_deployment(extra)))
+
+    assert runtime.execution_spec["extra_cpu_overhead"] == extra
+    assert "tokenization" not in runtime.execution_spec
+
+
+def test_extra_cpu_overhead_requires_capability_and_offline_replay() -> None:
+    from aisim.sweeper import RunnerCapabilities
+
+    spec = _spec(deployment=_extra_overhead_deployment({"base_ms": 1.0, "per_input_token_ms": 0.0}))
+    with pytest.raises(ValueError, match="does not support engine.extra_cpu_overhead"):
+        RunnerCapabilities(supported_backend_topologies=(("*", "*"),)).require_compatible(spec)
+    engine = EngineReplayRunnerFactory(runtime=RecordingRuntime()).capabilities()
+    engine.require_compatible(spec)
+    with pytest.raises(ValueError, match="offline"):
+        replace(engine, supported_execution_modes=("offline", "online")).require_compatible(
+            replace(spec, execution_mode="online")
+        )
+
+
+def test_native_replay_delays_requests_by_the_extra_cpu_overhead_without_queueing() -> None:
+    report = (
+        EngineReplayRunnerFactory()
+        .create(0)
+        .run(
+            _spec(deployment=_extra_overhead_deployment({"base_ms": 3.0, "per_input_token_ms": 0.5})),
+            output_requirements=ReplayOutputRequirements(include_raw_report=True, capture_per_request=True),
+        )
+    )
+
+    (record,) = report.metadata["native_report"]["per_request"]
+    # 3 ms + 0.5 ms x 8 input tokens, counted from arrival.
+    assert record["arrival_time_ms"] == 0.0
+    assert record["tokenized_ms"] == 7.0
+    assert record["first_admit_ms"] == 7.0
+    assert record["ttft_ms"] > 7.0
 
 
 def _detokenization_prediction(detokenization: dict | None = None) -> CorePredictionConfig:
@@ -3274,14 +4130,14 @@ def test_prediction_rejects_invalid_detokenization(detokenization) -> None:
 
 
 def test_zero_detokenization_costs_are_the_same_as_omitting_detokenization() -> None:
-    from aisimulate.config.engine import DetokenizationConfig
+    from aisim.config.engine import DetokenizationConfig
 
     assert not DetokenizationConfig(workers=4).active
     assert DetokenizationConfig(per_output_us=1).active
 
 
 def test_recommendation_rejects_detokenization() -> None:
-    from aisimulate.config.engine import EngineRecommendationConfig
+    from aisim.config.engine import EngineRecommendationConfig
 
     with pytest.raises(ValidationError, match="detokenization"):
         EngineRecommendationConfig.model_validate(
@@ -3315,7 +4171,7 @@ def test_engine_runner_sends_detokenization_in_the_execution_envelope() -> None:
 
 
 def test_detokenization_requires_capability_and_offline_replay() -> None:
-    from aisimulate.sweeper import RunnerCapabilities
+    from aisim.sweeper import RunnerCapabilities
 
     detokenization = {"workers": 1, "base_ms": 1.0, "per_output_ms": 0.0}
     spec = _spec(deployment=_detokenization_deployment(detokenization, 1))
@@ -3329,10 +4185,37 @@ def test_detokenization_requires_capability_and_offline_replay() -> None:
         )
 
 
+def test_scheduler_launch_requires_capability_and_offline_replay() -> None:
+    from aisimulate.sweeper import RunnerCapabilities
+
+    launch = {
+        "decode_ms": 5.0,
+        "piecewise_ms": 50.0,
+        "eager_ms": 150.0,
+        "max_cudagraph_capture_size": 512,
+        "eager_queue_fraction": 0.4,
+    }
+    deployment = replace(_detokenization_deployment(None, 1), agg_engine_args=_engine_args() | {"launch": launch})
+    spec = _spec(deployment=deployment)
+    with pytest.raises(ValueError, match="does not support scheduler.launch"):
+        RunnerCapabilities(supported_backend_topologies=(("*", "*"),)).require_compatible(spec)
+    engine = EngineReplayRunnerFactory(runtime=RecordingRuntime()).capabilities()
+    engine.require_compatible(spec)
+    with pytest.raises(ValueError, match="offline"):
+        replace(engine, supported_execution_modes=("offline", "online")).require_compatible(
+            replace(spec, execution_mode="online")
+        )
+
+
 def test_detokenization_rejects_afd() -> None:
     engine = EngineReplayRunnerFactory(runtime=RecordingRuntime()).capabilities()
     detokenization = {"workers": 1, "base_ms": 1.0, "per_output_ms": 0.0}
-    afd = replace(_detokenization_deployment(detokenization, 1), deployment_mode="afd")
+    deployment = _detokenization_deployment(detokenization, 1)
+    afd = replace(
+        deployment,
+        agg_engine_args={**deployment.agg_engine_args, "afd": {}},
+        parallel_config={"aggregated": {"schema_version": 2}},
+    )
     with pytest.raises(ValueError, match="engine.detokenization is unsupported for AFD"):
         engine.require_compatible(_spec(deployment=afd))
 
@@ -3397,3 +4280,19 @@ def test_prediction_compile_rejects_pipeline_parallelism_before_capacity(monkeyp
         engine["mode"] = "disaggregated"
     with pytest.raises(ValueError, match=f"does not support pipeline parallelism for {role}"):
         prediction_to_replay_spec(CorePredictionConfig.model_validate({"engine": engine}))
+
+
+def test_native_summary_supplies_every_aiperf_selector():
+    from aisim.aiperf_metrics import AIPerfMetric, metric_value
+
+    report = EngineReplayRunnerFactory().create(0).run(_spec(goal={"target": "output_token_throughput_per_user.p50"}))
+    # Fixed timing: 2 ms prefill, one 1 ms decode, one completed request.
+    expected = {
+        "time_to_first_token": 2,
+        "request_latency": 3,
+        "inter_token_latency": 1,
+        "output_token_throughput_per_user": 1000,
+    }
+    for metric in AIPerfMetric:
+        assert metric_value(report.metrics, metric) == expected[metric.value.rsplit(".", 1)[0]], metric
+    assert "native_report" not in report.metadata

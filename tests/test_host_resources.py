@@ -14,11 +14,11 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-import aisimulate.main as cli
-import aisimulate.resources as resources
-from aisimulate.config import CorePredictionConfig, CoreRecommendationConfig
-from aisimulate.config.common import ResourceConfig, split_config_sections
-from aisimulate.resources import (
+import aisim.main as cli
+import aisim.resources as resources
+from aisim.config import CorePredictionConfig, CoreRecommendationConfig
+from aisim.config.common import ResourceConfig, split_config_sections
+from aisim.resources import (
     GB,
     GuardedRunnerFactory,
     HostResources,
@@ -52,7 +52,7 @@ def _supervised(monkeypatch, memory_limit_bytes=8 * GB):
     monkeypatch.setattr(resources.psutil.Process, "memory_info", lambda self: SimpleNamespace(rss=64 * resources.MIB))
     monkeypatch.setattr(resources, "_child_memory_bytes", lambda: 0)
     monkeypatch.setenv(
-        "_AISIMULATE_SUPERVISED_BUDGET",
+        "_AISIM_SUPERVISED_BUDGET",
         json.dumps(
             {
                 "supervisor_pid": os.getpid(),
@@ -217,6 +217,397 @@ def test_native_estimate_is_distinct_from_eager_dynamo():
     assert engine.allocation_model != dynamo.allocation_model
     assert engine.input_token_bytes == 10 * 100 * 4
     assert dynamo.input_token_bytes == 1000 * 100 * 4
+    # Single requests carry no session history, so their charge is unchanged.
+    assert engine.estimated_peak_bytes == resources.WORKER_BASELINE_BYTES + 1000 * (4096 + 32 * 105) + 10 * 100 * 4
+
+
+def test_session_estimate_charges_each_turn_once_and_history_per_active_session():
+    workload = {"request_count": 6144, "turns_per_session": 10, "isl": 4096, "osl": 256, "concurrency": 32}
+    estimate = estimate_workload(workload, stack="engine")
+    turn, history = 4096 + 256, 9 * (4096 + 256)
+    retained, carried = 6144 * 10 * (4096 + 32 * turn), 32 * history + 4 * (history + 4096)
+    assert estimate.allocation_model == "engine-session-metadata-v2"
+    assert estimate.input_token_bytes == 32 * (history + 4096) * 4
+    assert estimate.lower_bound_bytes == 4 * 256  # One request's output IDs, drawn at dispatch.
+    assert estimate.estimated_peak_bytes == resources.WORKER_BASELINE_BYTES + retained + 32 * carried
+    # Without a session cap, every session may carry its history at once.
+    uncapped = estimate_workload({**workload, "concurrency": None}, stack="engine")
+    assert uncapped.estimated_peak_bytes - estimate.estimated_peak_bytes == (6144 - 32) * carried
+
+
+@pytest.mark.parametrize("field", ["session_cache_copies", "session_cache_pools"])
+def test_session_cache_estimates_reject_zero_counts(field):
+    workload = {"request_count": 100, "turns_per_session": 10, "isl": 100, "osl": 5, field: 0}
+    with pytest.raises(ValueError, match="session cache copies must be positive"):
+        estimate_workload(workload, stack="engine")
+
+
+def test_session_caches_retain_completed_sessions_across_workers():
+    workload = {"request_count": 6144, "turns_per_session": 10, "isl": 4096, "osl": 256, "concurrency": 32}
+    single = estimate_workload(workload, stack="engine")
+    replicated = estimate_workload({**workload, "session_cache_copies": 6}, stack="engine")
+    # Completed sessions can remain cached, so charge all sessions, not just
+    # the 32 active ones. Replication does not copy their live prompt buffers.
+    extra = 6144 * 10 * 32 * (4096 + 256) * 5
+    assert replicated.estimated_peak_bytes - single.estimated_peak_bytes == extra
+    assert replicated.input_token_bytes == single.input_token_bytes
+    serial = estimate_workload({**workload, "session_cache_copies": 6}, stack="engine", concurrency=1)
+    assert replicated.estimated_peak_bytes - serial.estimated_peak_bytes == 31 * (
+        32 * 9 * (4096 + 256) + 4 * (9 * (4096 + 256) + 4096)
+    )
+    # A session cannot visit more independent caches than it has turns.
+    capped = estimate_workload({**workload, "session_cache_copies": 10}, stack="engine")
+    assert capped == estimate_workload({**workload, "session_cache_copies": 1000}, stack="engine")
+    # Each turn visits both pools in P/D; do not cap their combined copies
+    # at the turn count of a single pool.
+    disagg = estimate_workload({**workload, "session_cache_copies": 1000, "session_cache_pools": 2}, stack="engine")
+    assert disagg.estimated_peak_bytes - capped.estimated_peak_bytes == 6144 * 10 * 32 * (4096 + 256) * 10
+    single_turn = {**workload, "turns_per_session": 1}
+    assert estimate_workload(single_turn, stack="engine") == estimate_workload(
+        {**single_turn, "session_cache_copies": 1000, "session_cache_pools": 2}, stack="engine"
+    )
+
+
+@pytest.mark.parametrize("disaggregated", [False, True])
+def test_session_replication_reaches_initial_replay_and_wave_admission(monkeypatch, host, disaggregated):
+    from aisim.sweeper.replay import BackendDeploymentSpec, ReplaySpec
+
+    raw = _config()
+    raw.pop("optimization")
+    raw.pop("optimizer")
+    raw["engine"]["context_length"] = 65536
+    raw["traffic"] = {
+        "source": {
+            "type": "synthetic-session",
+            "new_input_tokens_per_turn": 4096,
+            "output_tokens_per_turn": 256,
+            "session": {"turns": 10},
+        },
+        "load": {"type": "concurrency", "concurrency": 32},
+        "stop": {"sessions": 100},
+    }
+    if disaggregated:
+        raw["engine"]["mode"] = "disaggregated"
+        raw["engine"]["workers"] = {
+            "prefill": {"parallelism": {"replicas": 2}},
+            "decode": {"parallelism": {"replicas": 2, "attention_data": 2}},
+        }
+        deployment = BackendDeploymentSpec(
+            deployment_mode="disagg",
+            backend="vllm",
+            backend_version="test",
+            num_prefill_workers=2,
+            num_decode_workers=2,
+            prefill_engine_args={"aic_attention_dp_size": 1},
+            decode_engine_args={"dp_size": 2},
+        )
+    else:
+        raw["engine"]["workers"] = {"aggregated": {"parallelism": {"replicas": 3, "attention_data": 2}}}
+        deployment = BackendDeploymentSpec(
+            deployment_mode="agg",
+            backend="vllm",
+            backend_version="test",
+            num_workers=3,
+            agg_engine_args={"aic_attention_dp_size": 2},
+        )
+    config = CorePredictionConfig.model_validate(raw)
+    bounds = workload_bounds(config)
+    assert bounds["session_cache_copies"] == 6
+    monkeypatch.setattr(resources, "discover_host", lambda: host)
+    expected = cli._resource_plan(SimpleNamespace(stack="engine"), config, None)
+    workload = {
+        key: value for key, value in bounds.items() if key not in {"session_cache_copies", "session_cache_pools"}
+    }
+    original = dict(workload)
+    spec = ReplaySpec(backend_deployment=deployment, workload=workload, goal={}, concurrency=32)
+    assert guard_replay(spec, stack="engine")["estimate"] == expected["estimate"]
+    factory = GuardedRunnerFactory(object(), "engine", ResourceConfig())
+    assert factory.admit_wave([spec])["candidates"][0]["estimate"] == expected["estimate"]
+    assert spec.workload == original
+    # A budget between the single-cache and replicated estimates must refuse
+    # this candidate through both replay entry points before materialization.
+    single = estimate_workload(workload, stack="engine").estimated_peak_bytes
+    peak = expected["estimate"]["estimated_peak_bytes"]
+    factory = replace(factory, policy=ResourceConfig(memory_limit_gb=(single + peak) / 2 / GB))
+    assert build_plan(workload, stack="engine", host=host, policy=factory.policy)["status"] == "admitted"
+    with resources.resource_policy(factory.policy), pytest.raises(ResourceLimitError):
+        guard_replay(spec, stack="engine")
+    with pytest.raises(ResourceLimitError):
+        factory.admit_wave([spec])
+
+
+@pytest.mark.parametrize("recommendation", [False, True])
+@pytest.mark.parametrize("wide_role", ["prefill", "decode"])
+def test_session_admission_caps_asymmetric_cache_pools_separately(monkeypatch, recommendation, wide_role):
+    from aisim.sweeper.replay import BackendDeploymentSpec, ReplaySpec
+
+    raw = _config()
+    raw["engine"].update(mode="disaggregated", context_length=65536)
+    raw["engine"]["workers"] = {
+        "prefill": {"parallelism": {"replicas": 1, "attention_data": 1}},
+        "decode": {"parallelism": {"replicas": 1, "attention_data": 1}},
+    }
+    raw["traffic"] = {
+        "source": {
+            "type": "synthetic-session",
+            "new_input_tokens_per_turn": 4096,
+            "output_tokens_per_turn": 256,
+            "session": {"turns": 10},
+        },
+        "load": {"type": "concurrency", "concurrency": 32},
+        "stop": {"sessions": 1000},
+    }
+    raw["execution"] = {"resources": {"memory_limit_gb": 20}}
+    if recommendation:
+        for worker in raw["engine"]["workers"].values():
+            worker["parallelism"]["preset"] = False
+        shape = {"replicas": 1, "tensor": 1, "pipeline": 1, "attention_data": 1, "moe_tensor": 1, "moe_expert": 1}
+        raw["engine"]["workers"][wide_role]["parallelism"] = {
+            "preset": [shape, {**shape, "replicas": 16, "attention_data": 2}]
+        }
+        config = CoreRecommendationConfig.model_validate(raw)
+    else:
+        raw.pop("optimization")
+        raw.pop("optimizer")
+        raw["engine"]["workers"][wide_role]["parallelism"] = {"replicas": 16, "attention_data": 2}
+        config = CorePredictionConfig.model_validate(raw)
+    host = HostResources(128 * GB, 93 * GB, 24)
+    monkeypatch.setattr(resources, "discover_host", lambda: host)
+    monkeypatch.setattr(resources, "_child_memory_bytes", lambda: 0)
+    bounds = workload_bounds(config)
+    assert bounds["session_cache_copies"] == 11  # min(10, 1) + min(10, 32)
+    assert bounds["session_cache_pools"] == 2
+    deployment = BackendDeploymentSpec(
+        deployment_mode="disagg",
+        backend="vllm",
+        backend_version="test",
+        num_prefill_workers=16 if wide_role == "prefill" else 1,
+        num_decode_workers=16 if wide_role == "decode" else 1,
+        prefill_engine_args={"dp_size": 2 if wide_role == "prefill" else 1},
+        decode_engine_args={"dp_size": 2 if wide_role == "decode" else 1},
+    )
+    workload = {
+        key: value for key, value in bounds.items() if key not in {"session_cache_copies", "session_cache_pools"}
+    }
+    original = deepcopy(workload)
+    spec = ReplaySpec(backend_deployment=deployment, workload=workload, goal={}, concurrency=32)
+    # The 11-copy policy estimate fits a 20 GB budget; capping the combined
+    # 33-cache fleet at 20 copies incorrectly rejects this workload.
+    expected_peak = (
+        resources.WORKER_BASELINE_BYTES
+        + 1000 * 10 * (4096 + 11 * 32 * 4352)
+        + 32 * (32 * 9 * 4352 + 4 * (9 * 4352 + 4096))
+    )
+    policy = ResourceConfig(memory_limit_gb=20)
+    with resources.resource_policy(policy):
+        initial = cli._resource_plan(SimpleNamespace(stack="engine"), config, None)
+        replay = guard_replay(spec, stack="engine")
+    wave = GuardedRunnerFactory(object(), "engine", policy).admit_wave([spec])
+    assert initial["status"] == replay["status"] == wave["status"] == "admitted"
+    assert initial["estimate"] == replay["estimate"] == wave["candidates"][0]["estimate"]
+    assert initial["estimate"]["estimated_peak_bytes"] == expected_peak
+    assert spec.workload == original
+
+
+@pytest.mark.parametrize("recommendation", [False, True])
+@pytest.mark.parametrize("explicit_parallelism", [False, True])
+@pytest.mark.parametrize("afd_role", ["aggregated", "prefill", "decode"])
+def test_session_afd_turn_bound_reaches_initial_and_candidate_admission(
+    monkeypatch, host, afd_role, explicit_parallelism, recommendation
+):
+    from aisim.sweeper.replay import BackendDeploymentSpec, ReplaySpec
+
+    raw = _config()
+    if recommendation:
+        # AFD uses its own attention topology. Even a GPU budget below the
+        # turn count must preserve the replay guard's per-pool turn bound.
+        gpus = 2 if afd_role == "aggregated" else 3
+        raw["optimization"]["constraints"] = {"min_candidate_gpus": gpus, "max_candidate_gpus": gpus}
+    else:
+        raw.pop("optimization")
+        raw.pop("optimizer")
+    raw["engine"]["backend"] = "sglang"
+    topology = {"tp_a": 1, "a_batch_size": 8}
+    if not recommendation:
+        topology.update(n_a_nodes=1, n_f_nodes=1)
+    workers = {afd_role: {"type": "afd", "afd": topology}}
+    if explicit_parallelism:
+        workers[afd_role]["parallelism"] = {"replicas": 1, **({"preset": False} if recommendation else {})}
+    args = {"agg_engine_args" if afd_role == "aggregated" else f"{afd_role}_engine_args": {"afd": {}}}
+    if afd_role != "aggregated":
+        raw["engine"]["mode"] = "disaggregated"
+        companion = "decode" if afd_role == "prefill" else "prefill"
+        workers[companion] = {"parallelism": {"replicas": 1}}
+        if recommendation:
+            workers[companion]["parallelism"].update(preset=False, attention_data=1)
+        args[f"{companion}_engine_args"] = {"dp_size": 1}
+    raw["engine"]["workers"] = workers
+    raw["traffic"] = {
+        "source": {
+            "type": "synthetic-session",
+            "new_input_tokens_per_turn": 16,
+            "output_tokens_per_turn": 4,
+            "session": {"turns": 10},
+        },
+        "load": {"type": "concurrency", "concurrency": 32},
+        "stop": {"sessions": 100},
+    }
+    config_type = CoreRecommendationConfig if recommendation else CorePredictionConfig
+    config = config_type.model_validate(raw)
+    if not explicit_parallelism:
+        assert getattr(config.engine.workers, afd_role).parallelism is None
+    bounds = workload_bounds(config)
+    copies = 10 if afd_role == "aggregated" else 11
+    assert bounds["session_cache_copies"] == copies
+    deployment = BackendDeploymentSpec(
+        deployment_mode="agg" if afd_role == "aggregated" else "disagg",
+        backend="sglang",
+        backend_version="test",
+        num_workers=1 if afd_role == "aggregated" else 0,
+        num_prefill_workers=0 if afd_role == "aggregated" else 1,
+        num_decode_workers=0 if afd_role == "aggregated" else 1,
+        **args,
+    )
+    workload = {
+        key: value for key, value in bounds.items() if key not in {"session_cache_copies", "session_cache_pools"}
+    }
+    spec = ReplaySpec(backend_deployment=deployment, workload=workload, goal={}, concurrency=32)
+    assert resources._replay_resource_workload(spec, "engine")["session_cache_copies"] == copies
+    monkeypatch.setattr(resources, "discover_host", lambda: host)
+    monkeypatch.setattr(resources, "_child_memory_bytes", lambda: 0)
+    initial = cli._resource_plan(SimpleNamespace(stack="engine"), config, None)
+    replay = guard_replay(spec, stack="engine")
+    wave = GuardedRunnerFactory(object(), "engine", ResourceConfig()).admit_wave([spec])
+    assert initial["status"] == replay["status"] == wave["status"] == "admitted"
+    assert initial["estimate"] == replay["estimate"] == wave["candidates"][0]["estimate"]
+    expected = estimate_workload(
+        {**workload, "session_cache_copies": copies, "session_cache_pools": len(workers)}, stack="engine"
+    )
+    assert initial["estimate"]["estimated_peak_bytes"] == expected.estimated_peak_bytes
+
+
+def test_session_recommendation_bounds_cache_replicas_by_gpu_budget():
+    raw = _config()
+    raw["traffic"]["source"] = {
+        "type": "synthetic-session",
+        "new_input_tokens_per_turn": 16,
+        "output_tokens_per_turn": 4,
+        "session": {"turns": 10},
+    }
+    raw["traffic"]["stop"] = {"sessions": 100}
+    bounds = workload_bounds(CoreRecommendationConfig.model_validate(raw))
+    assert bounds["session_cache_copies"] == 10
+    assert estimate_workload(bounds, stack="engine") == estimate_workload(
+        {**bounds, "session_cache_copies": 10}, stack="engine"
+    )
+    raw["optimization"]["constraints"] = {"min_candidate_gpus": 8, "max_candidate_gpus": 8}
+    assert workload_bounds(CoreRecommendationConfig.model_validate(raw))["session_cache_copies"] == 8
+    raw["engine"]["workers"]["aggregated"]["parallelism"] = {
+        "preset": False,
+        "replicas": {"choices": [1, 3]},
+        "attention_data": 2,
+    }
+    assert workload_bounds(CoreRecommendationConfig.model_validate(raw))["session_cache_copies"] == 6
+    raw["engine"]["workers"]["aggregated"]["parallelism"] = {
+        "preset": [{"replicas": 1, "tensor": 1, "pipeline": 1, "attention_data": 1, "moe_tensor": 1, "moe_expert": 1}],
+    }
+    pinned = workload_bounds(CoreRecommendationConfig.model_validate(raw))
+    assert pinned["session_cache_copies"] == 1
+    plan = build_plan(
+        {**pinned, "request_count": 6144, "isl": 4096, "osl": 256},
+        stack="engine",
+        host=HostResources(128 * GB, 93 * GB, 24),
+    )
+    assert plan["status"] == "admitted"
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("identity_field", ["attention_dp", "attention_dp_size"])
+def test_session_admission_counts_dp_inferred_from_timing_identity(monkeypatch, host, nested, identity_field):
+    from aisim.sweeper.replay import BackendDeploymentSpec, ReplaySpec
+
+    rank = {"timing_model": {"type": "external", "provider": "aic", "config": {identity_field: 3}}}
+    deployment = BackendDeploymentSpec(
+        deployment_mode="agg",
+        backend="vllm",
+        backend_version="test",
+        num_workers=2,
+        agg_engine_args={"rank": rank} if nested else rank,
+    )
+    workload = {"request_count": 100, "turns_per_session": 10, "isl": 4096, "osl": 256, "concurrency": 32}
+    spec = ReplaySpec(backend_deployment=deployment, workload=workload, goal={}, concurrency=32)
+    monkeypatch.setattr(resources, "discover_host", lambda: host)
+    expected = estimate_workload({**workload, "session_cache_copies": 6}, stack="engine")
+    plan = guard_replay(spec, stack="engine")
+    assert plan["estimate"]["estimated_peak_bytes"] == expected.estimated_peak_bytes
+    # Inferred DP reserves the same memory as an explicitly authored width.
+    explicit = replace(deployment, agg_engine_args={**deployment.agg_engine_args, "dp_size": 3})
+    assert guard_replay(replace(spec, backend_deployment=explicit), stack="engine") == plan
+
+
+@pytest.mark.parametrize("wide_role", ["aggregated", "prefill", "decode"])
+def test_session_admission_counts_wider_dp_from_parallel_config(monkeypatch, host, wide_role):
+    from aisim.sweeper.replay import BackendDeploymentSpec, ReplaySpec
+
+    aggregated = wide_role == "aggregated"
+    args = (
+        {"agg_engine_args": {"dp_size": 1}}
+        if aggregated
+        else {
+            "prefill_engine_args": {"dp_size": 1},
+            "decode_engine_args": {"dp_size": 1},
+        }
+    )
+    prefix = "" if aggregated else f"{wide_role}_"
+    deployment = BackendDeploymentSpec(
+        deployment_mode="agg" if aggregated else "disagg",
+        backend="vllm",
+        backend_version="test",
+        num_workers=2 if aggregated else 0,
+        num_prefill_workers=0 if aggregated else (2 if wide_role == "prefill" else 1),
+        num_decode_workers=0 if aggregated else (2 if wide_role == "decode" else 1),
+        parallel_config={f"{prefix}attention_dp": 3},
+        **args,
+    )
+    workload = {"request_count": 100, "turns_per_session": 10, "isl": 4096, "osl": 256, "concurrency": 32}
+    spec = ReplaySpec(backend_deployment=deployment, workload=workload, goal={}, concurrency=32)
+    original = dict(workload)
+    copies, pools = (6, 1) if aggregated else (7, 2)
+    assert resources._replay_resource_workload(spec, "engine")["session_cache_copies"] == copies
+    expected = estimate_workload(
+        {**workload, "session_cache_copies": copies, "session_cache_pools": pools}, stack="engine"
+    )
+    monkeypatch.setattr(resources, "discover_host", lambda: host)
+    monkeypatch.setattr(resources, "_child_memory_bytes", lambda: 0)
+    replay = guard_replay(spec, stack="engine")
+    wave = GuardedRunnerFactory(object(), "engine", ResourceConfig()).admit_wave([spec])
+    assert replay["status"] == wave["status"] == "admitted"
+    assert replay["estimate"] == wave["candidates"][0]["estimate"]
+    assert replay["estimate"]["estimated_peak_bytes"] == expected.estimated_peak_bytes
+    narrow = replace(deployment, parallel_config={})
+    narrow_plan = guard_replay(replace(spec, backend_deployment=narrow), stack="engine")
+    assert narrow_plan["estimate"]["estimated_peak_bytes"] < expected.estimated_peak_bytes
+    assert spec.workload == original
+
+
+def test_long_sessions_fit_a_workstation_budget():
+    # This workload peaks near 2.2 GB RSS; v1 charged every turn for its
+    # whole session and estimated 86 GB against this 83.7 GB budget.
+    workstation = HostResources(128 * GB, 93 * GB, 24)
+    workload = {
+        "source_type": "synthetic-session",
+        "request_count": 6144,
+        "turns_per_session": 10,
+        "isl": 4096,
+        "osl": 256,
+        "concurrency": 32,
+    }
+    plan = build_plan(workload, stack="engine", host=workstation)
+    assert plan["status"] == "admitted"
+    assert plan["estimate"]["estimated_peak_bytes"] < 10 * GB
+    longer = build_plan({**workload, "turns_per_session": 100}, stack="engine", host=workstation)
+    assert longer["status"] == "resource_limited"
+    assert longer["estimate"]["estimated_peak_bytes"] > longer["budget"]["memory_limit_bytes"]
 
 
 def test_plugin_estimate_is_versioned(host):
@@ -226,6 +617,23 @@ def test_plugin_estimate_is_versioned(host):
 
     with pytest.raises(ResourceLimitError, match="incompatible"):
         build_plan({}, stack="custom", factory=BadFactory(), host=host)
+
+
+def test_session_cache_accounting_preserves_external_estimator_workload(host):
+    workload = {"request_count": 100, "turns_per_session": 10, "isl": 100, "osl": 5}
+
+    class Factory:
+        def estimate_host_resources(self, received, *, concurrency):
+            assert received == workload
+            return ResourceEstimate("adapter-session-v1", 100, 0, 0, resources.WORKER_BASELINE_BYTES)
+
+    plan = build_plan(
+        {**workload, "session_cache_copies": 6, "session_cache_pools": 2},
+        stack="dynamo",
+        host=host,
+        factory=Factory(),
+    )
+    assert plan["estimate"]["allocation_model"] == "adapter-session-v1"
 
 
 def test_execution_section_is_core_and_roundtrips():
@@ -266,9 +674,9 @@ def test_cli_blocks_before_runner_creation(tmp_path, monkeypatch, host, command)
 
 
 def test_recommendation_applies_slots_without_changing_suggestion_batches(monkeypatch):
-    import aisimulate.recommend as recommendation
-    import aisimulate.sweeper.search as search
-    from aisimulate.output_adapter import OUTPUT_ADAPTER_API_VERSION, RecommendationOutputCallbacks
+    import aisim.recommend as recommendation
+    import aisim.sweeper.search as search
+    from aisim.output_adapter import OUTPUT_ADAPTER_API_VERSION, RecommendationOutputCallbacks
 
     raw = _config()
     raw["traffic"]["load"]["concurrency"] = 8
@@ -318,9 +726,9 @@ def test_recommendation_applies_slots_without_changing_suggestion_batches(monkey
 
 
 def test_recommendation_passes_isolated_workload_context_to_subscribers(monkeypatch):
-    import aisimulate.recommend as recommendation
-    import aisimulate.sweeper.search as search
-    from aisimulate.output_adapter import OUTPUT_ADAPTER_API_VERSION, RecommendationOutputCallbacks
+    import aisim.recommend as recommendation
+    import aisim.sweeper.search as search
+    from aisim.output_adapter import OUTPUT_ADAPTER_API_VERSION, RecommendationOutputCallbacks
 
     raw = _config()
     raw["traffic"]["load"]["concurrency"] = 8
@@ -382,9 +790,9 @@ def test_recommendation_passes_isolated_workload_context_to_subscribers(monkeypa
 
 @pytest.mark.parametrize("failure", [False, True], ids=["success", "failure"])
 def test_recommendation_dispatches_terminal_output_callbacks(monkeypatch, failure):
-    import aisimulate.recommend as recommendation
-    import aisimulate.sweeper.search as search
-    from aisimulate.output_adapter import OUTPUT_ADAPTER_API_VERSION, RecommendationOutputCallbacks
+    import aisim.recommend as recommendation
+    import aisim.sweeper.search as search
+    from aisim.output_adapter import OUTPUT_ADAPTER_API_VERSION, RecommendationOutputCallbacks
 
     config = CoreRecommendationConfig.model_validate(_config())
     monkeypatch.setattr(recommendation, "resolve_budget", lambda *a, **kw: {"cpu_limit": 2})
@@ -460,9 +868,9 @@ def test_recommendation_dispatches_terminal_output_callbacks(monkeypatch, failur
 
 @pytest.mark.parametrize("event", ["on_candidate", "on_round", "on_complete"])
 def test_recommendation_reports_progress_callback_failures_to_failure_hook(monkeypatch, event):
-    import aisimulate.recommend as recommendation
-    import aisimulate.sweeper.search as search
-    from aisimulate.output_adapter import (
+    import aisim.recommend as recommendation
+    import aisim.sweeper.search as search
+    from aisim.output_adapter import (
         OUTPUT_ADAPTER_API_VERSION,
         OutputAdapterExecutionError,
         RecommendationOutputCallbacks,
@@ -519,13 +927,14 @@ def test_recommendation_reports_progress_callback_failures_to_failure_hook(monke
     assert failures == [raised.value]
 
 
-def test_recommendation_preserves_error_and_attempts_all_failure_hooks(monkeypatch):
+@pytest.mark.parametrize("entrypoint", ["api", "cli"])
+def test_recommendation_preserves_error_and_attempts_all_failure_hooks(monkeypatch, tmp_path, capsys, entrypoint):
     import threading
 
-    import aisimulate.recommend as recommendation
-    import aisimulate.sweeper.search as search
-    from aisimulate.output_adapter import OUTPUT_ADAPTER_API_VERSION, RecommendationOutputCallbacks
-    from aisimulate.resource_worker import _exception_message
+    import aisim.recommend as recommendation
+    import aisim.sweeper.search as search
+    from aisim.output_adapter import OUTPUT_ADAPTER_API_VERSION, RecommendationOutputCallbacks
+    from aisim.resource_worker import _exception_message
 
     config = CoreRecommendationConfig.model_validate(_config())
     monkeypatch.setattr(recommendation, "resolve_budget", lambda *a, **kw: {"cpu_limit": 2})
@@ -592,25 +1001,37 @@ def test_recommendation_preserves_error_and_attempts_all_failure_hooks(monkeypat
             raise search_error
 
     monkeypatch.setattr(search, "Sweeper", CaptureSweeper)
+    adapters = {"first": FailingCleanupAdapter(), "publisher": PublisherAdapter()}
 
     try:
-        with pytest.raises(RuntimeError, match="ORIGINAL_SEARCH_FAILURE") as raised:
-            recommendation._run_recommendation(
-                config,
-                stack="engine",
-                runner_factory=object(),
-                output_configs={"first": {}, "publisher": {}},
-                output_adapters={
-                    "first": FailingCleanupAdapter(),
-                    "publisher": PublisherAdapter(),
-                },
+        if entrypoint == "api":
+            with pytest.raises(RuntimeError, match="ORIGINAL_SEARCH_FAILURE") as raised:
+                recommendation._run_recommendation(
+                    config,
+                    stack="engine",
+                    runner_factory=object(),
+                    output_configs={"first": {}, "publisher": {}},
+                    output_adapters=adapters,
+                )
+            assert raised.value is search_error
+            message = _exception_message(raised.value)
+        else:
+            monkeypatch.setattr(cli, "resolve_runner_factory", lambda _: object())
+            monkeypatch.setattr(cli, "resolve_output_adapters", lambda _: adapters)
+            monkeypatch.setattr(
+                recommendation,
+                "run_recommendation",
+                lambda config, **kwargs: recommendation._run_recommendation(config, output_adapters=adapters, **kwargs),
             )
+            path = tmp_path / "recommend.yaml"
+            path.write_text(yaml.safe_dump({**_config(), "first": {}, "publisher": {}}))
+            assert cli.main(["recommend", "-c", str(path), "--output", "first", "--output", "publisher"]) == 1
+            message = capsys.readouterr().err.removeprefix("aisim recommend failed: ")
     finally:
         stop.set()
         for publisher in publishers:
             publisher.join(timeout=1)
 
-    assert raised.value is search_error
     assert events == [
         ("publisher_started",),
         ("first_failure", search_error),
@@ -619,7 +1040,6 @@ def test_recommendation_preserves_error_and_attempts_all_failure_hooks(monkeypat
         ("publisher_joined",),
     ]
     assert all(not publisher.is_alive() for publisher in publishers)
-    message = _exception_message(raised.value)
     assert message.startswith("RuntimeError: ORIGINAL_SEARCH_FAILURE")
     assert "first" in message
     assert "on_failure" in message
@@ -627,9 +1047,9 @@ def test_recommendation_preserves_error_and_attempts_all_failure_hooks(monkeypat
 
 
 def test_recommendation_sweep_workers_keep_loaded_trace_graphs(monkeypatch):
-    import aisimulate.recommend as recommendation
-    import aisimulate.sweeper.search as search
-    from aisimulate.runner import EngineReplayRunnerFactory
+    import aisim.recommend as recommendation
+    import aisim.sweeper.search as search
+    from aisim.runner import EngineReplayRunnerFactory
 
     raw = _config()
     raw["traffic"]["load"]["concurrency"] = 8
@@ -653,7 +1073,7 @@ def test_recommendation_sweep_workers_keep_loaded_trace_graphs(monkeypatch):
 
 
 def test_resource_refusal_is_not_a_failed_replay_observation():
-    from aisimulate.sweeper.search import _run_replay_detailed
+    from aisim.sweeper.search import _run_replay_detailed
 
     class Refuse:
         def run(self, spec):
@@ -683,6 +1103,36 @@ def test_cgroup_namespace_root_and_v1_quota(tmp_path, host):
     assert actual.total_memory_bytes == 4 * GB
     assert actual.available_memory_bytes == 3 * GB
     assert actual.cpu_count == 0.5
+
+
+@pytest.mark.parametrize(
+    "membership,mount,limit,usage,stat",
+    [
+        ("0::/job", "cgroup2 cgroup rw", "memory.max", "memory.current", f"anon {GB}\ninactive_file {5 * GB}\n"),
+        (
+            "1:memory:/job",
+            "cgroup cgroup rw,memory",
+            "memory.limit_in_bytes",
+            "memory.usage_in_bytes",
+            # v1 usage is hierarchical, like its total_ counters.
+            f"inactive_file 0\ntotal_rss {GB}\ntotal_inactive_file {5 * GB}\n",
+        ),
+    ],
+    ids=["v2", "v1"],
+)
+def test_cgroup_usage_excludes_inactive_page_cache(tmp_path, host, membership, mount, limit, usage, stat):
+    proc = tmp_path / "proc"
+    (proc / "self").mkdir(parents=True)
+    (proc / "self/cgroup").write_text(f"{membership}\n")
+    (proc / "self/mountinfo").write_text(f"42 30 0:27 / /sys/fs/cgroup rw - {mount}\n")
+    root = tmp_path / "sys/fs/cgroup"
+    (root / "job").mkdir(parents=True)
+    (root / limit).write_text(str(8 * GB))
+    (root / usage).write_text(str(7 * GB))
+    (root / "memory.stat").write_text(stat)
+    assert constrain_to_cgroups(host, proc=proc, root=tmp_path).available_memory_bytes == 6 * GB
+    (root / "memory.stat").unlink()
+    assert constrain_to_cgroups(host, proc=proc, root=tmp_path).available_memory_bytes == GB
 
 
 def test_error_diagnostic_preserves_existing_output(tmp_path, monkeypatch, host):
@@ -771,7 +1221,7 @@ def test_trace_inspection_streams_large_documents_and_records(tmp_path, host, mo
     monkeypatch.setattr(resources.json, "loads", lambda _: pytest.fail("must not materialize entire JSON records"))
     estimate = estimate_workload({"trace_path": str(trace), "trace_format": "mooncake"}, stack="engine")
     assert estimate.request_count == 60
-    assert estimate.lower_bound_bytes == 4 * 60  # Sixty planned u32 outputs; ignored arrays add nothing.
+    assert estimate.lower_bound_bytes == 4 * 2  # One expanded two-token prompt; ignored arrays add nothing.
 
 
 @pytest.mark.parametrize("trace_format", ["mooncake", "mooncake-delta"])
@@ -786,13 +1236,23 @@ def test_mooncake_traces_bound_compact_arrays_and_observe_their_peak(tmp_path, t
     assert estimate.allocation_model == resources.OBSERVED_TRACE_MODEL
     assert estimate.estimated_peak_bytes is None  # Measured from a completed replay instead.
     assert estimate.request_count == 5
-    if trace_format == "mooncake":
-        # Rows convert u64 source hashes one at a time, so only the compact
-        # hashes, planned outputs and one expanded prompt are unavoidable.
-        assert estimate.lower_bound_bytes == max(4 * (11 + 50), 4 * 192)
-    else:
-        # Delta setup synthesizes every prompt and plans every output.
-        assert estimate.lower_bound_bytes == 4 * (4 * 100 + 192 + 50)
+    # Rows convert u64 source hashes one at a time, so only the compact
+    # hashes, one request's drawn outputs and one expanded prompt are unavoidable.
+    assert estimate.lower_bound_bytes == max(4 * 11, 4 * 10, 4 * 192)
+
+
+@pytest.mark.parametrize("trace_format", ["mooncake", "mooncake-delta"])
+def test_session_traces_bound_outputs_by_authored_ids_and_the_largest_draw(tmp_path, trace_format):
+    trace = tmp_path / "trace.jsonl"
+    workload = {"trace_path": str(trace), "trace_block_size": 1, "trace_format": trace_format}
+    row = {"input_length": 1, "output_length": 30, "hash_ids": [1]}
+    trace.write_text((json.dumps(row) + "\n") * 5)
+    # The driver draws a request's output IDs when it dispatches that request,
+    # so one request's 30 outputs are unavoidable, not all 150.
+    assert estimate_workload(workload, stack="engine").lower_bound_bytes == 4 * 30
+    trace.write_text((json.dumps({**row, "output_token_ids": list(range(30))}) + "\n") * 5)
+    # Authored IDs load with the trace and stay beside the compact hashes.
+    assert estimate_workload(workload, stack="engine").lower_bound_bytes == 4 * (5 + 150)
 
 
 def test_applied_compute_counts_turns_and_responses(tmp_path):
@@ -803,14 +1263,15 @@ def test_applied_compute_counts_turns_and_responses(tmp_path):
         "assistant_response_length": [5, 7],
         "tool_call_output_length": [11, 13],
         "tool_call_latency": [0.1, 0.2],
-        "final_assistant_response_length": 9,
+        "final_assistant_response_length": 400,
     }
     trace.write_text((json.dumps(row) + "\n") * 2)
     estimate = estimate_workload({"trace_path": str(trace), "trace_format": "applied_compute_agentic"}, stack="engine")
     assert estimate.allocation_model == resources.OBSERVED_TRACE_MODEL
     assert estimate.request_count == 6  # Each session replays num_turns + 1 requests.
-    # The final prompt adds both responses and tool outputs to the initial prompt.
-    assert estimate.lower_bound_bytes == max(4 * 2 * (5 + 7 + 9), 4 * (300 + 5 + 7 + 11 + 13))
+    # The final response is drawn at dispatch. It exceeds the final prompt, which
+    # adds both responses and tool outputs to the initial prompt.
+    assert estimate.lower_bound_bytes == max(4 * 400, 4 * (300 + 5 + 7 + 11 + 13))
 
 
 def test_applied_compute_tool_output_grows_the_final_prompt(tmp_path, host, monkeypatch):
@@ -925,7 +1386,7 @@ def test_finite_agentic_lanes_share_compact_trace_and_require_supervision(
         documents = [header, *rows]
     trace.write_text("\n".join(json.dumps(row) for row in documents) + "\n")
     base = {"trace_path": str(trace), "trace_format": trace_format, "trace_block_size": 1048576}
-    monkeypatch.delenv("_AISIMULATE_SUPERVISED_BUDGET", raising=False)
+    monkeypatch.delenv("_AISIM_SUPERVISED_BUDGET", raising=False)
     for lanes in (1, 32, 128, 512):
         plan = build_plan({**base, "agentic_lanes": lanes}, stack=stack, host=host)
         assert plan["estimate"]["estimated_peak_bytes"] is None
@@ -965,7 +1426,7 @@ def test_finite_agentic_lanes_share_compact_trace_and_require_supervision(
 def test_native_weka_keeps_qualified_parallel_admission(tmp_path, host, monkeypatch):
     trace = tmp_path / "play.json"
     trace.write_text(json.dumps({"block_size": 4, "requests": [{"t": 0, "type": "s", "in": 4, "out": 1}]}))
-    monkeypatch.delenv("_AISIMULATE_SUPERVISED_BUDGET", raising=False)
+    monkeypatch.delenv("_AISIM_SUPERVISED_BUDGET", raising=False)
     monkeypatch.setattr(resources, "discover_host", lambda: host)
     monkeypatch.setattr(resources, "_child_memory_bytes", lambda: 0)
     factory = GuardedRunnerFactory(object(), "engine", ResourceConfig())
@@ -1079,7 +1540,7 @@ def test_unknown_peak_wave_reserves_arrays_after_child_rss(monkeypatch, host, ex
 @pytest.mark.parametrize("warmup", [False, True])
 @pytest.mark.parametrize("trace_format", ["agentic_mooncake", "weka", "dynamo"])
 def test_snapshot_warmup_and_profile_use_the_finite_trace_bound(tmp_path, monkeypatch, host, warmup, trace_format):
-    from aisimulate.recommend import recommendation_to_sweeper
+    from aisim.recommend import recommendation_to_sweeper
 
     trace = tmp_path / "agentic.jsonl"
     if trace_format == "weka":
@@ -1136,6 +1597,7 @@ def test_weka_counts_nested_requests_and_generated_hashes(tmp_path, layout):
             {
                 "type": "subagent",
                 "total_tokens": 10**12,
+                "in": "ignored",
                 "requests": [
                     {"type": "s", "in": 9, "out": 3, "hash_ids": [9]},
                 ],
@@ -1158,6 +1620,26 @@ def test_weka_counts_nested_requests_and_generated_hashes(tmp_path, layout):
     # ceil(5/4) + ceil(4/4) + ceil(9/4) = six u64 hashes per play.
     assert estimate.lower_bound_bytes == 48 * copies
     assert estimate.estimated_peak_bytes is None
+
+
+@pytest.mark.parametrize(
+    "plays,reason",
+    [
+        ([{"block_size": 4}, {"block_size": 8}], "Weka corpus mixes block sizes"),
+        ([{}, {"block_size": 4}], "Weka trace requires a positive block_size"),
+        ([{"block_size": 4, "requests": [{"type": "n", "in": 4, "out": -1}]}, {}], "nonnegative integers"),
+    ],
+)
+def test_weka_corpus_validation_has_no_qualified_estimate(tmp_path, plays, reason):
+    # Files are inspected in path order; the first one supplies the block size.
+    paths = [tmp_path / "a.json", tmp_path / "b.json"]
+    for path, play in zip(paths, plays, strict=True):
+        play.setdefault("requests", [{"type": "s", "in": 4, "out": 1}])
+        path.write_text(json.dumps(play))
+    workload = {"trace_paths": [str(path) for path in paths], "trace_format": "weka"}
+    estimate = estimate_workload(workload, stack="dynamo")
+    assert estimate.allocation_model == "trace-unqualified-v1"
+    assert reason in estimate.reason
 
 
 @pytest.mark.parametrize("compressed", [False, True])
@@ -1186,16 +1668,17 @@ def test_agentic_dynamo_counts_only_loaded_request_events(tmp_path, compressed):
 
 def test_standard_dynamo_observes_its_peak_and_rejects_mixed_context(tmp_path):
     path = tmp_path / "requests.jsonl"
-    row = _dynamo_row(contextual=False)
-    path.write_text(json.dumps(row) + "\n")
+    row = _dynamo_row(contextual=False, output_tokens=40)
+    path.write_text((json.dumps(row) + "\n") * 2)
     # Neither the configured block size nor file bytes expand the bound.
     workload = {"trace_path": str(path), "trace_format": "dynamo", "trace_block_size": 512}
     estimate = estimate_workload(workload, stack="engine")
     assert estimate.allocation_model == resources.OBSERVED_TRACE_MODEL
     assert estimate.estimated_peak_bytes is None
-    assert estimate.request_count == 1
-    # Two retained u64 hashes, compact hashes plus three outputs, or one 8-token prompt.
-    assert estimate.lower_bound_bytes == max(8 * 2, 4 * (2 + 3), 4 * 8)
+    assert estimate.request_count == 2
+    # A standard trace replays as sessions: one request's 40 drawn outputs
+    # outweigh four retained u64 hashes and an 8-token prompt.
+    assert estimate.lower_bound_bytes == 4 * 40
     for rows in ([row, _dynamo_row("agent")], [_dynamo_row("agent"), row]):
         path.write_text("\n".join(map(json.dumps, rows)))
         with pytest.raises(ResourceLimitError, match="cannot mix requests with and without agent_context"):
@@ -1370,7 +1853,11 @@ def test_added_agentic_formats_reject_oversized_arrays(
     else:
         row = _dynamo_row(input_length=input_length, output_tokens=output_length)
     # A parser failure after this object would hide the bound if inspection continued.
-    source.write_text(json.dumps(row) + "\nnot JSON")
+    text = json.dumps(row) + "\nnot JSON"
+    if trace_format == "weka":
+        # Inside the same play, so the native scan must stop at the oversized request.
+        text = json.dumps(row).removesuffix("]}") + ", not JSON"
+    source.write_text(text)
     plan = build_plan({"trace_path": str(source), "trace_format": trace_format}, stack=stack, host=host)
     assert plan["status"] == "resource_limited"
     assert plan["estimate"]["lower_bound_bytes"] >= 4 * 10**12
@@ -1378,7 +1865,7 @@ def test_added_agentic_formats_reject_oversized_arrays(
 
 
 def test_unsupervised_refusal_keeps_the_estimate_reason(tmp_path, monkeypatch, host):
-    monkeypatch.delenv("_AISIMULATE_SUPERVISED_BUDGET", raising=False)
+    monkeypatch.delenv("_AISIM_SUPERVISED_BUDGET", raising=False)
     path = tmp_path / "invalid.jsonl"
     path.write_text(json.dumps({"input_tokens": -1}))
     for workload, detail in [
@@ -1396,8 +1883,8 @@ def test_unsupervised_refusal_keeps_the_estimate_reason(tmp_path, monkeypatch, h
 
 
 @pytest.mark.parametrize("profile", [{}, {"duration_seconds": 86400}])
-def test_profile_resource_admission_requires_supervision_and_one_worker(tmp_path, host, monkeypatch, profile):
-    from aisimulate.recommend import recommendation_to_sweeper
+def test_profile_without_a_native_runner_requires_supervision_and_one_worker(tmp_path, host, monkeypatch, profile):
+    from aisim.recommend import recommendation_to_sweeper
 
     trace = tmp_path / "play.json"
     trace.write_text(
@@ -1427,7 +1914,7 @@ def test_profile_resource_admission_requires_supervision_and_one_worker(tmp_path
     assert bounds["agentic_profile"]["duration_seconds"] == profile.get("duration_seconds", 3600)
     finite = {key: value for key, value in bounds.items() if key != "agentic_profile"}
     assert build_plan(finite, stack="engine", host=host, requested_parallelism=4)["effective_parallelism"] == 4
-    monkeypatch.delenv("_AISIMULATE_SUPERVISED_BUDGET", raising=False)
+    monkeypatch.delenv("_AISIM_SUPERVISED_BUDGET", raising=False)
     unmonitored = build_plan(bounds, stack="engine", host=host, requested_parallelism=4)
     assert unmonitored["status"] == "resource_limited"
     assert unmonitored["estimate"]["estimated_peak_bytes"] is None
@@ -1435,7 +1922,7 @@ def test_profile_resource_admission_requires_supervision_and_one_worker(tmp_path
     assert unmonitored["estimate"]["reason"] in unmonitored["reason"]
 
     # The recommendation compiler's concrete workload reaches both the per-run
-    # guard and whole-wave admission; profile estimates must not admit a pool.
+    # guard and whole-wave admission. An unspecified runner stays serial.
     smart = recommendation_to_sweeper(config)
     spec = SimpleNamespace(workload=smart.workload.model_dump(mode="python", exclude_none=True), concurrency=None)
     monkeypatch.setattr(resources, "discover_host", lambda: host)

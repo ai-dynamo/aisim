@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project.
 // Modified Rust simulation of vLLM b3563fc65ae0f5359802593d78e7ea097e1fed31
@@ -562,9 +563,9 @@ fn speculative_batch_drains_zero_output_before_emitting_tokens() {
 }
 
 #[rstest]
-#[case::prefill_survives_retraction(3, true)]
-#[case::decode_retraction_is_not_committed(4, false)]
-fn speculative_retraction_preserves_only_executed_work(
+#[case::waiting_reservation_defers_before_prefill(3, true)]
+#[case::decode_growth_preemption_is_not_committed(4, false)]
+fn speculative_capacity_commits_only_scheduled_work(
     #[case] blocks: usize,
     #[case] prefill_pass: bool,
 ) {
@@ -601,7 +602,18 @@ fn speculative_retraction_preserves_only_executed_work(
         let second = core.execute_pass(&mut collector, first.end_ms);
         core.execute_pass(&mut collector, second.end_ms)
     };
-    assert_eq!(core.state.requests[&retracted].num_preemptions, 1);
+    assert_eq!(
+        core.state.requests[&retracted].num_preemptions,
+        usize::from(!prefill_pass)
+    );
+    if prefill_pass {
+        let waiting = &core.state.requests[&retracted];
+        assert_eq!(waiting.status, RequestStatus::Waiting);
+        assert_eq!(waiting.num_computed_tokens, 0);
+        assert_eq!(waiting.sequence.lease.physical_owned_block_count(), 0);
+        assert_eq!(core.kv_manager.num_active_blocks(), 2);
+        assert_eq!(pass.fpm.as_ref().unwrap().num_prefill_requests, 1);
+    }
     assert!(
         pass.output_signals
             .iter()
@@ -613,7 +625,7 @@ fn speculative_retraction_preserves_only_executed_work(
             .all(|signal| signal.uuid != retracted)
     );
     assert!(pass.committed_requests.contains(&survivor));
-    assert_eq!(pass.committed_requests.contains(&retracted), prefill_pass);
+    assert!(!pass.committed_requests.contains(&retracted));
 }
 
 mod speculative_scheduling {
@@ -846,6 +858,18 @@ mod speculative_scheduling {
                 break;
             }
             let pass = core.execute_pass(&mut collector, now);
+            if passes.len() == 4 {
+                // All three owners hold four blocks after pass 4. On pass 5,
+                // request 2 needs five (11 computed + 4 query + 3 lookahead =
+                // 18 slots), so request 3 releases its four before sampling.
+                let [pressure] = pass.pressure_events.as_slice() else {
+                    panic!("pass 5 must preempt exactly one owner before sampling");
+                };
+                assert_eq!(pressure.request_id, Uuid::from_u128(3));
+                assert_eq!(pressure.request_active_blocks_before, 4);
+                assert_eq!(pressure.state_before.active_blocks, 12);
+                assert_eq!(pressure.state_after.active_blocks, 8);
+            }
             accepted += pass.decode_acceptance.accepted_tokens;
             forwards += pass.decode_acceptance.forwards;
             // One entry per request burst: id, tokens emitted, then `!` if it completed.
@@ -877,8 +901,11 @@ mod speculative_scheduling {
         );
         assert_eq!(
             passes.join(" "),
-            "1:1,2:1 1:1,2:2,3:1 1:1,2:1,3:3 1:2,2:2,3:3 1:4!,2:4,3:1 2:2,3:1 2:2!,3:2,4:1 \
-             3:2,4:1 3:2,4:1,5:1 3:1,4:2 3:1,4:1 3:3!,4:1!,5:1 5:2 5:2 5:3,6:1 5:3!,6:2 6:1!"
+            // Native MTP owns the pending query plus future draft slots before
+            // sampling. On pass 5, request 3 loses its reservation and is not
+            // sampled; this deliberately changes the legacy draw-order golden.
+            "1:1,2:1 1:1,2:2,3:1 1:1,2:1,3:3 1:2,2:2,3:3 1:4!,2:4 2:1 2:2,3:1 2:1!,3:3 \
+             3:2,4:1 3:2,4:1 3:2,4:1,5:1 3:1,4:2 3:1,4:1 3:1!,4:1! 5:1 5:3 5:2,6:1 5:2,6:3! 5:1 5:2!"
         );
     }
 
@@ -937,6 +964,10 @@ mod speculative_scheduling {
                 .kv_cache_bytes_per_token(Some(16))
                 .state_cache(Some(crate::engine::StateCacheConfig {
                     bytes_per_request: 16,
+                    sliding_window: None,
+                    num_speculative_states: None,
+                    prefill_checkpoint: false,
+                    junction_checkpoints: false,
                 }))
                 .build()
                 .unwrap(),
@@ -1242,18 +1273,31 @@ mod mixed_pass_timing {
 
 mod async_scheduling_admission {
     use super::*;
+    use crate::engine::NativeHostOffloadConfig;
+    use crate::engine::generalized::SameTimestampRetry;
 
     fn core(max_concurrent_batches: usize) -> VllmCore {
+        core_with_cache(max_concurrent_batches, 64, false)
+    }
+
+    /// `num_gpu_blocks` 4-token blocks, with or without a CPU tier.
+    fn core_with_cache(
+        max_concurrent_batches: usize,
+        num_gpu_blocks: usize,
+        cpu_tier: bool,
+    ) -> VllmCore {
         VllmCore::new(
             MockEngineArgs::builder()
                 .block_size(4)
-                .num_gpu_blocks(64)
+                .num_gpu_blocks(num_gpu_blocks)
                 .max_num_batched_tokens(Some(64))
                 .max_num_seqs(Some(8))
                 .enable_chunked_prefill(true)
-                .enable_prefix_caching(false)
+                .enable_prefix_caching(cpu_tier)
                 .speedup_ratio(0.0)
                 .max_concurrent_batches(max_concurrent_batches)
+                .kv_cache_bytes_per_token(Some(16))
+                .native_host_offload(cpu_tier.then(|| NativeHostOffloadConfig::new(64)))
                 .build()
                 .unwrap(),
         )
@@ -1262,8 +1306,18 @@ mod async_scheduling_admission {
     /// Submit as replay does: mid-pass while a pass is in flight, otherwise at
     /// a pass boundary, before the next pass starts.
     fn arrive(core: &mut VllmCore, id: u128, output: usize, pass_in_flight: bool) -> Uuid {
+        arrive_with_prompt(core, id, 8, output, pass_in_flight)
+    }
+
+    fn arrive_with_prompt(
+        core: &mut VllmCore,
+        id: u128,
+        prompt: usize,
+        output: usize,
+        pass_in_flight: bool,
+    ) -> Uuid {
         let request = DirectRequest {
-            tokens: vec![id as u32; 8],
+            tokens: vec![id as u32; prompt],
             max_output_tokens: output,
             uuid: Some(Uuid::from_u128(id)),
             ..Default::default()
@@ -1377,6 +1431,101 @@ mod async_scheduling_admission {
         assert!(core.state.running.is_empty());
         let arrivals = [arrive(&mut core, 2, 4, true), arrive(&mut core, 3, 4, true)];
         assert_eq!(passes_before_admission(&mut core, &arrivals), [0, 0]);
+    }
+
+    /// Run one pass at `now_ms` and its completion, and move `now_ms` to its end.
+    fn step(core: &mut VllmCore, now_ms: &mut f64) -> crate::engine::scheduler::EnginePassResult {
+        let mut collector = crate::engine::trace::TraceCollector::default();
+        let result = core.execute_pass(&mut collector, *now_ms);
+        core.complete_engine_boundary(result.end_ms);
+        *now_ms = result.end_ms;
+        result
+    }
+
+    /// The pass that admits W (16 tokens), which arrives while pass 0 runs and
+    /// fits only in the 7 blocks of R (24 tokens). R finishes in pass 1, and X
+    /// keeps the engine busy.
+    fn pass_admitting_w(max_concurrent_batches: usize) -> usize {
+        let mut core = core_with_cache(max_concurrent_batches, 10, false);
+        let mut now = 0.0;
+        arrive_with_prompt(&mut core, 1, 8, 40, false);
+        let r = arrive_with_prompt(&mut core, 2, 24, 2, false);
+        step(&mut core, &mut now);
+        let w = arrive_with_prompt(&mut core, 3, 16, 2, true);
+        let finished = step(&mut core, &mut now);
+        assert!(
+            finished
+                .output_signals
+                .iter()
+                .any(|signal| signal.uuid == r && signal.completed)
+        );
+        (2..8)
+            .find(|_| {
+                step(&mut core, &mut now)
+                    .admissions
+                    .iter()
+                    .any(|admission| admission.uuid == w)
+            })
+            .expect("W is admitted")
+    }
+
+    #[test]
+    fn blocks_a_request_frees_in_pass_k_first_serve_pass_k_plus_2() {
+        // vLLM frees a finished request's blocks when it processes the pass's
+        // outputs, which with async scheduling follows committing the next pass.
+        assert_eq!(pass_admitting_w(1), 2);
+        assert_eq!(pass_admitting_w(2), 3);
+    }
+
+    #[test]
+    fn an_empty_decision_frees_the_pass_in_flight_and_decides_again() {
+        // Without X nothing runs in pass 2: vLLM's step is empty, so it
+        // processes pass 1 at once and admits W in the next step. The empty
+        // step runs no forward, so it carries no forward-pass snapshot.
+        let mut core = core_with_cache(2, 10, false);
+        let mut now = 0.0;
+        arrive_with_prompt(&mut core, 2, 24, 2, false);
+        step(&mut core, &mut now);
+        let w = arrive_with_prompt(&mut core, 3, 16, 2, true);
+        step(&mut core, &mut now);
+        let empty = step(&mut core, &mut now);
+        assert!(empty.admissions.is_empty());
+        assert_eq!(empty.same_timestamp_retry, SameTimestampRetry::Retry);
+        assert!(empty.fpm.is_none());
+        let admitting = step(&mut core, &mut now);
+        assert_eq!(admitting.admissions[0].uuid, w);
+        assert!(admitting.fpm.is_some());
+    }
+
+    #[test]
+    fn a_request_the_pass_in_flight_runs_is_not_preempted_with_a_cpu_tier() {
+        // A (8 tokens) and B (4 tokens) fill the 3 blocks in pass 0. In pass 1
+        // A's next token needs a block that only preempting B, the newest
+        // request, frees. With a CPU tier vLLM defers freeing B's blocks until
+        // pass 0 ends, so it does not preempt B: A waits, and that empty step
+        // lets vLLM process pass 0 and preempt B in the next.
+        let mut core = core_with_cache(2, 3, true);
+        let mut now = 0.0;
+        let a = arrive_with_prompt(&mut core, 1, 8, 4, false);
+        arrive_with_prompt(&mut core, 2, 4, 4, false);
+        step(&mut core, &mut now);
+        let blocked = step(&mut core, &mut now);
+        assert!(blocked.output_signals.is_empty());
+        assert_eq!(blocked.same_timestamp_retry, SameTimestampRetry::Retry);
+        assert_eq!(core.state.preemptions_total, 0);
+        let resumed = step(&mut core, &mut now);
+        assert_eq!(core.state.preemptions_total, 1);
+        assert!(resumed.output_signals.iter().any(|signal| signal.uuid == a));
+
+        // Without a CPU tier vLLM frees B's blocks at once and preempts it.
+        let mut core = core_with_cache(2, 3, false);
+        let mut now = 0.0;
+        let a = arrive_with_prompt(&mut core, 1, 8, 4, false);
+        arrive_with_prompt(&mut core, 2, 4, 4, false);
+        step(&mut core, &mut now);
+        let decoded = step(&mut core, &mut now);
+        assert_eq!(core.state.preemptions_total, 1);
+        assert!(decoded.output_signals.iter().any(|signal| signal.uuid == a));
     }
 }
 
@@ -2354,6 +2503,7 @@ mod core_behavior {
         let uuid = Uuid::from_u128(0xA11CE);
         let planned = vec![101, 202, 303];
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: vec![1, 2],
             max_output_tokens: planned.len(),
             output_token_ids: Some(planned.clone()),
@@ -2405,6 +2555,7 @@ mod core_behavior {
         let r1 = Uuid::from_u128(1);
         let r2 = Uuid::from_u128(2);
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: (0..8).collect(),
             max_output_tokens: 2,
             output_token_ids: None,
@@ -2415,6 +2566,7 @@ mod core_behavior {
             kv_hint: None,
         });
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: (100..108).collect(),
             max_output_tokens: 2,
             output_token_ids: None,
@@ -2474,6 +2626,7 @@ mod core_behavior {
         let r1 = Uuid::from_u128(1);
         let r2 = Uuid::from_u128(2);
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: (0..8).collect(),
             max_output_tokens: 2,
             output_token_ids: None,
@@ -2484,6 +2637,7 @@ mod core_behavior {
             kv_hint: None,
         });
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: (100..108).collect(),
             max_output_tokens: 2,
             output_token_ids: None,
@@ -2523,6 +2677,7 @@ mod core_behavior {
         let r2 = Uuid::from_u128(202);
         for (uuid, tokens) in [(r1, vec![1; 4]), (r2, vec![2; 4])] {
             core.receive(DirectRequest {
+                cache_salt: None,
                 tokens,
                 max_output_tokens: 1,
                 output_token_ids: None,
@@ -2585,6 +2740,7 @@ mod core_behavior {
             .unwrap();
         let mut core = VllmCore::new(args);
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: vec![1; 8],
             max_output_tokens: 1,
             output_token_ids: None,
@@ -2606,11 +2762,45 @@ mod core_behavior {
         assert_eq!(signal.handoff_delay_ms, Some(8.0));
     }
 
+    /// A prefill worker's first token comes from its prefill forward, so its
+    /// pass prices no decode work, with or without speculation.
+    #[rstest]
+    #[case::plain(None)]
+    #[case::speculative(Some(1))]
+    fn prefill_worker_prices_no_decode_work(#[case] nextn: Option<usize>) {
+        let mut core = VllmCore::new(
+            MockEngineArgs::builder()
+                .block_size(4)
+                .num_gpu_blocks(8)
+                .max_num_batched_tokens(Some(8))
+                .max_num_seqs(Some(1))
+                .enable_chunked_prefill(true)
+                .worker_type(crate::engine::common::protocols::WorkerType::Prefill)
+                .aic_nextn(nextn)
+                .aic_nextn_accept_rates(nextn.map(|_| "1".into()))
+                .speedup_ratio(0.0)
+                .build()
+                .unwrap(),
+        );
+        core.receive(DirectRequest {
+            tokens: vec![1; 8],
+            max_output_tokens: 2,
+            uuid: Some(Uuid::from_u128(82)),
+            ..Default::default()
+        });
+
+        let work = core.schedule_pass(None, 0.0).unwrap();
+
+        assert!(work.prefill.is_some());
+        assert_eq!(work.decode, None);
+    }
+
     #[test]
     fn test_first_token_can_arrive_on_prompt_completion_pass() {
         let mut core = VllmCore::new(make_args());
         let uuid = Uuid::from_u128(11);
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: (0..8).collect(),
             max_output_tokens: 2,
             output_token_ids: None,
@@ -2656,6 +2846,7 @@ mod core_behavior {
         let r2 = Uuid::from_u128(2);
         for (uuid, range) in [(r1, 0u32..8u32), (r2, 100u32..108u32)] {
             core.receive(DirectRequest {
+                cache_salt: None,
                 tokens: range.collect(),
                 max_output_tokens: 8,
                 output_token_ids: None,
@@ -2704,6 +2895,7 @@ mod core_behavior {
         let blocked = Uuid::from_u128(2);
         let follower = Uuid::from_u128(3);
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: (0..16).collect(),
             max_output_tokens: 1,
             output_token_ids: None,
@@ -2714,6 +2906,7 @@ mod core_behavior {
             kv_hint: None,
         });
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: (100..112).collect(),
             max_output_tokens: 1,
             output_token_ids: None,
@@ -2724,6 +2917,7 @@ mod core_behavior {
             kv_hint: None,
         });
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: (200..204).collect(),
             max_output_tokens: 1,
             output_token_ids: None,
@@ -2797,6 +2991,7 @@ mod core_behavior {
         let follower = Uuid::from_u128(2);
         for (uuid, range) in [(oversized, 0u32..20u32), (follower, 100u32..104u32)] {
             core.receive(DirectRequest {
+                cache_salt: None,
                 tokens: range.collect(),
                 max_output_tokens: 1,
                 output_token_ids: None,
@@ -2829,6 +3024,7 @@ mod core_behavior {
         let mut core = VllmCore::new(make_args());
         for uuid in [Uuid::from_u128(1), Uuid::from_u128(2)] {
             core.receive(DirectRequest {
+                cache_salt: None,
                 tokens: (0..8).collect(),
                 max_output_tokens: 2,
                 output_token_ids: None,
@@ -2867,6 +3063,7 @@ mod core_behavior {
         let short = Uuid::from_u128(1);
         let long = Uuid::from_u128(2);
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: (0..4).collect(),
             max_output_tokens: 5,
             output_token_ids: None,
@@ -2877,6 +3074,7 @@ mod core_behavior {
             kv_hint: None,
         });
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: (100..104).collect(),
             max_output_tokens: 8,
             output_token_ids: None,
@@ -2914,7 +3112,7 @@ mod core_behavior {
     }
 
     #[test]
-    fn test_mtp_releases_unused_block_reservations() {
+    fn test_mtp_retains_rejected_draft_capacity_until_completion() {
         let args = MockEngineArgs::builder()
             .block_size(2)
             .num_gpu_blocks(8)
@@ -2938,23 +3136,35 @@ mod core_behavior {
         let mut collector = crate::engine::trace::TraceCollector::default();
         let pass = core.execute_pass(&mut collector, 0.0);
         assert_eq!(pass.output_signals.len(), 1);
-        // Exercise an actual verification round, not just the draft-free
-        // prefill output. Rejected drafts must not retain their reservation.
+        assert_eq!(core.kv_manager.num_active_blocks(), 3);
+        // Rejection rolls back computed tokens while retaining physical slots
+        // for the next forward. Completion must release the complete lease.
         let pass = core.execute_pass(&mut collector, pass.end_ms);
         assert_eq!(pass.output_signals.len(), 1);
         assert_eq!(
             core.kv_manager.num_active_blocks(),
-            3,
-            "the block reserved only for rejected drafts must be released"
+            4,
+            "rejected draft capacity remains owned by the running request"
         );
         let request = core.state.requests.get(&uuid).unwrap();
         assert_eq!(request.sequence.generated_tokens(), 2);
         assert_eq!(request.sequence.len() - request.num_computed_tokens, 1);
+        let mut now = pass.end_ms;
+        for _ in 0..3 {
+            let pass = core.execute_pass(&mut collector, now);
+            assert_eq!(pass.output_signals.len(), 1);
+            now = pass.end_ms;
+        }
+        assert!(core.is_empty());
+        assert_eq!(core.kv_manager.num_active_blocks(), 0);
     }
 
     #[test]
     fn test_mtp_recomputes_last_prefix_cache_block() {
-        fn second_request_admission_reuse(mtp_enabled: bool) -> (usize, u64, u64) {
+        fn second_request_admission_reuse(
+            mtp_enabled: bool,
+            disable_eagle_block_drop: bool,
+        ) -> (usize, u64, u64) {
             let mut builder = MockEngineArgs::builder()
                 .block_size(4)
                 .num_gpu_blocks(16)
@@ -2965,12 +3175,14 @@ mod core_behavior {
             if mtp_enabled {
                 builder = builder
                     .aic_nextn(Some(1))
-                    .aic_nextn_accept_rates(Some("1".to_string()));
+                    .aic_nextn_accept_rates(Some("1".to_string()))
+                    .disable_eagle_block_drop(disable_eagle_block_drop);
             }
             let mut core = VllmCore::new(builder.build().unwrap());
             let mut collector = crate::engine::trace::TraceCollector::default();
 
             core.receive(DirectRequest {
+                cache_salt: None,
                 tokens: (0..8).collect(),
                 max_output_tokens: 1,
                 output_token_ids: None,
@@ -2984,6 +3196,7 @@ mod core_behavior {
             assert!(core.is_empty());
 
             core.receive(DirectRequest {
+                cache_salt: None,
                 tokens: (0..12).collect(),
                 max_output_tokens: 1,
                 output_token_ids: None,
@@ -3002,8 +3215,10 @@ mod core_behavior {
             )
         }
 
-        assert_eq!(second_request_admission_reuse(false), (8, 4, 8));
-        assert_eq!(second_request_admission_reuse(true), (4, 8, 4));
+        assert_eq!(second_request_admission_reuse(false, false), (8, 4, 8));
+        assert_eq!(second_request_admission_reuse(true, false), (4, 8, 4));
+        // vLLM's `disable_eagle_block_drop` keeps the last matched block.
+        assert_eq!(second_request_admission_reuse(true, true), (8, 4, 8));
     }
 }
 
@@ -3028,6 +3243,7 @@ mod forward_pass_metrics {
     fn test_fpm_single_prefill_request() {
         let mut core = VllmCore::new(fpm_args());
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: (0..8).collect(),
             max_output_tokens: 1,
             output_token_ids: None,
@@ -3058,6 +3274,7 @@ mod forward_pass_metrics {
         // r1: 4-token prompt, 3 output tokens
         let r1 = Uuid::from_u128(1);
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: (0..4).collect(),
             max_output_tokens: 3,
             output_token_ids: None,
@@ -3079,6 +3296,7 @@ mod forward_pass_metrics {
         // r2: 4-token prompt arriving while r1 is decoding
         let r2 = Uuid::from_u128(2);
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: (100..104).collect(),
             max_output_tokens: 3,
             output_token_ids: None,
@@ -3111,6 +3329,7 @@ mod forward_pass_metrics {
         // Request with 4-token prompt and 1 output token — completes in 1 pass
         let r1 = Uuid::from_u128(1);
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: (0..4).collect(),
             max_output_tokens: 1,
             output_token_ids: None,
@@ -3153,6 +3372,7 @@ mod forward_pass_metrics {
 
         let r1 = Uuid::from_u128(1);
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: (0..4).collect(),
             max_output_tokens: 2,
             output_token_ids: None,
@@ -3200,6 +3420,7 @@ mod forward_pass_metrics {
         let r1 = Uuid::from_u128(1);
         let r2 = Uuid::from_u128(2);
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: (0..8).collect(),
             max_output_tokens: 1,
             output_token_ids: None,
@@ -3210,6 +3431,7 @@ mod forward_pass_metrics {
             kv_hint: None,
         });
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: (100..108).collect(),
             max_output_tokens: 1,
             output_token_ids: None,
@@ -3250,6 +3472,7 @@ mod forward_pass_metrics {
 
         // Two prefill requests with different prompt lengths
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: (0..4).collect(), // prompt_len = 4
             max_output_tokens: 1,
             output_token_ids: None,
@@ -3260,6 +3483,7 @@ mod forward_pass_metrics {
             kv_hint: None,
         });
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: (100..112).collect(), // prompt_len = 12
             max_output_tokens: 1,
             output_token_ids: None,
@@ -3301,6 +3525,7 @@ mod forward_pass_metrics {
         let mut core = VllmCore::new(args);
 
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: (0..16).collect(),
             max_output_tokens: 2,
             output_token_ids: None,
@@ -3373,6 +3598,7 @@ mod forward_pass_metrics {
 
         // r1: 4-token prompt, long output (stays running)
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: (0..4).collect(),
             max_output_tokens: 20,
             output_token_ids: None,
@@ -3390,6 +3616,7 @@ mod forward_pass_metrics {
 
         // r2: another request that will compete for KV
         core.receive(DirectRequest {
+            cache_salt: None,
             tokens: (100..116).collect(), // 16 tokens — will pressure KV
             max_output_tokens: 5,
             output_token_ids: None,

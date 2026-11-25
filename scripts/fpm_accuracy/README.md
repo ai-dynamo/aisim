@@ -2,7 +2,8 @@
 
 Development-only evaluation code adapted from NVIDIA AISim FPM Gym at
 `e8221729db2802e822f6919fd68bc2941743385b`:
-https://gitlab-master.nvidia.com/dl/ai-dynamo/aisim-fpm-gym/-/tree/e8221729db2802e822f6919fd68bc2941743385b/src/aisim_fpm
+[Public migrated source](https://github.com/ai-dynamo/aisim/tree/4acab657e054b0ac135599b3a5206899cf831c3e/scripts/fpm_accuracy).
+This is the modified public copy, not a mirror of the predecessor revision.
 
 Licensed under Apache-2.0 with maintainer-confirmed migration permission.
 See the root THIRD_PARTY_NOTICES.md and LICENSE.
@@ -49,10 +50,27 @@ The evaluator never substitutes an older regression policy. Resolved native
 diagnostics retain the complete estimator configuration, and each public result
 records the evaluator commit. Historical results keep their original policy.
 
-Hub cache loading supports repository-local blobs and the marked cache-wide
-shared blob store used by huggingface-hub 1.32. Manifest hashes still bind the
-measurement and FPM bytes; arbitrary symlink targets outside these stores are
-rejected. Local dataset checkouts retain their strict root boundary. Catalogs,
+## Dataset access (unified `ai-dynamo/aisim-data`)
+
+Campaigns read `ai-dynamo/aisim-data` at `main`, resolved to one commit SHA per campaign (nightly job, or a manual run with an
+explicit `hf_revision`). New data reaches the public FPM page with the next nightly run, or earlier through a manual run.
+`HfDataset.from_hub` uses the shared library (`aisim_core.data`, bound to this checkout by `evaluator_library.py`, so
+an older wheel under test never supplies it): it reads `catalog/dataset.json` and `catalog/fpm/index.json`, selects
+configurations (`--model`, `--hardware`, `--configuration`; all current ones by default), and only then fetches the selected
+envelopes' files, hash-verified, into `AISIM_DATA_CACHE`. Artifacts of role `fpm-provenance` (source archives and logs, 75 % of the
+FPM bytes) are not read by any evaluation and are not fetched. Trust chain: dataset index, category index, envelope
+`aisim-manifest.json`, legacy `manifest.json`, then the measurement and FPM hashes it names, as before.
+
+The moved files still embed the legacy `data/<model>/...` spelling, so `configuration_path`, the configuration identity
+(`configuration_path@snapshot_id`) and observation IDs keep their pre-move values, and `HfDataset` maps them to the physical
+`data/fpm/<rest>` path when reading files and building links. Case IDs do not keep them: `_case_id()` hashes the dataset
+repository and revision, so every case ID changes across the repository move (and with any revision change). To compare
+results across the move, join the old and new runs on the configuration identity and observation ID, never on the case ID. The legacy `catalog/index.json` layout is still read for
+checkouts that have no `catalog/dataset.json`. Historical snapshots are not in the default index; explicit history reads need
+the local tree (`HfDataset.from_local`).
+Pins of the other consumers (profiles, recipes) are set in one step by `scripts/ci/set_fpm_dataset_pin.py`.
+
+Local dataset checkouts retain their strict root boundary. Catalogs,
 configuration and measurement manifests, and FPM sidecars share the strict
 public-contract JSON parser: duplicate keys (including nested keys) and
 non-finite constants fail even when the pinned bytes match their hashes.
@@ -61,8 +79,10 @@ Daily campaigns load only current configuration snapshots, including all their
 eligible FPM variants and hash-verified measurement evidence. Unrelated archived
 snapshots do not gate the current overview. Explicit history reads still require
 the recorded manifest hashes and validate all historical snapshots; their cache
-is separate from current campaign membership. Optional override files retain
-full-catalog selector validation, including historical bindings.
+is separate from current campaign membership. Optional override selectors are
+validated against current snapshots first, so current-only overrides do not
+require archived files. Selectors absent from the current snapshots still require
+full-catalog validation, including the local files for historical bindings.
 
 Schema v7 FPM pairs retain hash, row-count, base-configuration, and internal
 sidecar/Parquet consistency validation. Selector flags must be booleans, the
@@ -116,7 +136,8 @@ campaign checks the wheel hash and runs `pip check` after both installs.
 
 The files under `dashboard/` adapt the corresponding
 `src/aisim_fpm/dashboard/{data,measurement_heatmaps,visualization,visualization_diagnostics}.py`
-from [Gym commit f934c030afc3a03cb04d8f3ff4709194f7445c98](https://gitlab-master.nvidia.com/dl/ai-dynamo/aisim-fpm-gym/-/tree/f934c030afc3a03cb04d8f3ff4709194f7445c98).
+from Gym revision `f934c030afc3a03cb04d8f3ff4709194f7445c98`; see the
+[public dashboard migration](https://github.com/ai-dynamo/aisim/tree/379d33493610e9adf234374a84bee3be74ccecb8/scripts/fpm_accuracy/dashboard).
 Copyright NVIDIA CORPORATION & AFFILIATES; Apache-2.0, under the existing
 maintainer-confirmed migration permission. Imports were renamed, unused data
 contracts and the GitLab publication helper removed, and publication moved to

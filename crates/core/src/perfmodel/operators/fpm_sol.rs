@@ -744,7 +744,6 @@ fn moe_dispatch_sol(op: &MoEDispatchOp, spec: &SystemSpec, x: f64) -> Result<f64
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     use crate::common::enums::{
         CommQuantMode, FmhaQuantMode, GemmQuantMode, KvCacheQuantMode, MoeQuantMode,
@@ -753,14 +752,12 @@ mod tests {
     /// The b200_sxm spec: mem_bw 7.7e12, bf16 2.25e15, fp8 4.5e15, fp4 9e15,
     /// intra_node_bw 8.1e11, inter_node_bw 4e10 (systems/b200_sxm.yaml).
     fn spec() -> SystemSpec {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisimulate/src/aisimulate_core/systems/b200_sxm.yaml");
+        let root = crate::test_systems::path("b200_sxm.yaml");
         SystemSpec::load(&root).expect("b200 spec")
     }
 
     fn db() -> PerfDatabase {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisimulate/src/aisimulate_core/systems");
+        let root = crate::test_systems::path("");
         PerfDatabase::load(&root, "b200_sxm", "vllm", "0.19.0").expect("db")
     }
 
@@ -775,8 +772,7 @@ mod tests {
     fn v41_stage_roofline_retains_fractional_tokens_and_bounds_only_prefill() {
         use crate::operators::{Dsv41MhcOp, Dsv41StageOp};
 
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisimulate/src/aisimulate_core/systems");
+        let root = crate::test_systems::path("");
         let db = PerfDatabase::load(&root, "gb200", "vllm", "0.19.0").expect("GB200 db");
         let leaf = Dsv41MhcOp {
             name: "mhc".into(),
@@ -819,8 +815,8 @@ mod tests {
 
     /// Python oracle:
     /// PYTHONPATH=aic-core/src python3 -c "
-    /// from aisimulate_core.sdk import perf_database, common
-    /// from aisimulate_core.sdk.operations.gemm import GEMM
+    /// from aisim_core.sdk import perf_database, common
+    /// from aisim_core.sdk.operations.gemm import GEMM
     /// view = perf_database.get_database_view('b200_sxm','vllm','0.19.0',database_mode='SOL',allow_missing_data=True)
     /// op = GEMM('qkv_gemm', 1.0, 4096, 4096, common.GEMMQuantMode.nvfp4)
     /// print(repr(float(op.query(view, x=8192.0, batch_size=4, beam_width=1, s=2048.0, prefix=0.0))))"
@@ -883,8 +879,8 @@ mod tests {
 
     /// Python oracle:
     /// PYTHONPATH=aic-core/src python3 -c "
-    /// from aisimulate_core.sdk import perf_database, common
-    /// from aisimulate_core.sdk.operations.attention import ContextAttention, GenerationAttention
+    /// from aisim_core.sdk import perf_database, common
+    /// from aisim_core.sdk.operations.attention import ContextAttention, GenerationAttention
     /// view = perf_database.get_database_view('b200_sxm','vllm','0.19.0',database_mode='SOL',allow_missing_data=True)
     /// op = ContextAttention('context_attention', 1.0, 48, 8, 128, kvcache_quant_mode=common.KVCacheQuantMode.fp8, fmha_quant_mode=common.FMHAQuantMode.bfloat16)
     /// print(repr(float(op.query(view, x=1, batch_size=4.0, beam_width=1, s=682.6666666666666, prefix=128.5))))"
@@ -1038,6 +1034,8 @@ mod tests {
             pp_size: 2,
             hidden_size: 6144,
             seq_split: 1,
+            span_gpus: None,
+            force_scale_out: false,
         };
         approx(
             p2p_sol(&p2p, &s, 8192.0),
@@ -1441,8 +1439,7 @@ mod tests {
     /// The serving backend selects the policy even with an explicit reuse fraction.
     #[test]
     fn dsa_generation_fpm_sol_scopes_reuse_policy_by_backend() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisimulate/src/aisimulate_core/systems");
+        let root = crate::test_systems::path("");
         for (backend, version, expected) in [
             ("sglang", "0.5.14", 1.0842777257142857),
             ("trtllm", "1.3.0rc20", 78.0 * 0.019327371428571428),

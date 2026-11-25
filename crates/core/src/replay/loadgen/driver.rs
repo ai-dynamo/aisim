@@ -25,8 +25,8 @@ use super::profile::{
     AgenticIdleShift, AgenticProfileOptions, AgenticProfileReport, AgenticProfileState,
 };
 use super::trace::{
-    synthesize_validated_trace_tokens, validate_synthesizable_prompt,
-    validate_synthesizable_prompt_len,
+    extend_validated_trace_tokens, synthesize_validated_trace_tokens,
+    validate_synthesizable_prompt, validate_synthesizable_prompt_len,
 };
 use super::types::{
     AgenticDependency, AgenticDependencyRelation, AgenticDependencyTrigger, AgenticGraphIdentity,
@@ -35,7 +35,7 @@ use super::types::{
 };
 use super::{
     AgenticPlaySnapshot, AgenticReplayContext, AgenticSnapshotEvidence, PreparedAgenticSnapshots,
-    SYNTHETIC_OUTPUT_SEED, planned_output_token_ids,
+    SYNTHETIC_OUTPUT_SEED, SyntheticOutputStream, planned_output_token_ids,
 };
 use crate::engine::ImageSpec;
 use crate::engine::belady::{SequenceHash, input_sequence_hashes};
@@ -45,7 +45,8 @@ use crate::replay::protocol::{
 };
 
 pub const AGENTIC_LIFECYCLE_SCHEMA_V1: &str = "aisimulate.agentic.lifecycle.v1";
-const AGENTIC_LIFECYCLE_DIGEST_DOMAIN_V1: &[u8] = b"aisimulate-agentic-lifecycle-v1\0";
+// AISim namespace: this intentionally changes the legacy transcript fingerprint.
+const AGENTIC_LIFECYCLE_DIGEST_DOMAIN_V1: &[u8] = b"aisim-agentic-lifecycle-v1\0";
 
 /// Output progress for one request inside a same-timestamp feedback batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +160,14 @@ struct AgenticState {
     completion_dependents: Vec<Vec<AgenticDependentEdge>>,
     node_to_play: Vec<usize>,
     plays: Vec<AgenticPlayState>,
+    // Nodes in `Ready` per play. An agentic node holds a scheduled timer
+    // exactly while it is `Ready`, so profile control can ask whether a play
+    // has a pending timer without walking the play's nodes.
+    ready_nodes: Vec<usize>,
+    // Set whenever a play's client work finishes, and cleared once the
+    // profile has replaced every finished lane play. While it is clear no
+    // active profile play is client-finished, so lane scans can be skipped.
+    finished_unscanned: bool,
     lanes: Vec<AgenticLaneState>,
     // Finite lane replay draws from one source-ordered queue whenever a slot
     // becomes free. Slot assignment must follow admission, not source modulo.
@@ -191,7 +200,7 @@ struct AgenticDependentEdge {
 /// predecessor already ran, even while a join or replay barrier still gates it.
 /// Without causal edges, as for the first request of a detected chain, any
 /// pending barrier or join stands in for the spawn.
-fn waits_on_live_work(
+pub(super) fn waits_on_live_work(
     dependencies: &[AgenticDependency],
     pending: impl Fn(&AgenticDependency) -> bool,
 ) -> bool {
@@ -298,6 +307,9 @@ struct SessionRuntime {
     session_id: String,
     turns: Vec<TurnRuntime>,
     cumulative_tokens: Vec<u32>,
+    // Replay hashes of `cumulative_tokens`' complete blocks as of the last
+    // dispatch, so each turn hashes only the blocks it adds.
+    cumulative_hashes: ReplayRequestHashes,
     next_turn_index: usize,
     next_ready_at_ms: Option<f64>,
     in_flight: Option<Uuid>,
@@ -305,9 +317,9 @@ struct SessionRuntime {
 
 #[derive(Debug)]
 enum PromptTokens {
-    // Full-prompt traces stay in their compact on-disk representation until
-    // dispatch. Delta-cumulative traces remain eager because later turns append
-    // generated output to already-materialized session history.
+    // Trace prompts stay in their compact on-disk representation until
+    // dispatch. A delta-cumulative turn is then synthesized straight into its
+    // session history, the only place its tokens are read from.
     Deferred {
         input_length: usize,
         hash_ids: Vec<u32>,
@@ -319,7 +331,6 @@ enum PromptTokens {
         source_index: usize,
         slot: u64,
     },
-    Materialized(Vec<u32>),
 }
 
 impl PromptTokens {
@@ -336,7 +347,6 @@ impl PromptTokens {
             Self::Deferred { input_length, .. } | Self::Snapshot { input_length, .. } => {
                 *input_length
             }
-            Self::Materialized(tokens) => tokens.len(),
         }
     }
 
@@ -346,18 +356,9 @@ impl PromptTokens {
                 input_length,
                 hash_ids,
             } => (*input_length, std::mem::take(hash_ids)),
-            Self::Snapshot { .. } | Self::Materialized(_) => {
-                unreachable!("full-prompt turns must retain their deferred representation")
+            Self::Snapshot { .. } => {
+                unreachable!("trace turns must retain their deferred representation")
             }
-        }
-    }
-
-    fn materialized(&self) -> &[u32] {
-        match self {
-            Self::Deferred { .. } | Self::Snapshot { .. } => {
-                unreachable!("delta-cumulative prompts are materialized during driver setup")
-            }
-            Self::Materialized(tokens) => tokens,
         }
     }
 }
@@ -386,6 +387,9 @@ struct TurnRuntime {
     prompt_tokens: PromptTokens,
     max_output_tokens: usize,
     output_token_ids: Option<Vec<u32>>,
+    // A trace turn without authored ids records where its ids sit in the
+    // synthetic output stream and draws them at dispatch.
+    output_stream_offset: Option<u64>,
     delay_after_previous_ms: f64,
     priority: i32,
     strict_priority: u32,
@@ -397,11 +401,14 @@ struct TurnRuntime {
     deterministic_request_id: Option<Uuid>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct InFlightTurn {
     session_index: usize,
     turn_index: usize,
     emitted_output_tokens: usize,
+    // A delta turn's plan moves here at dispatch so each output token is
+    // checked from this entry alone. Full-prompt turns leave it empty.
+    planned_output_tokens: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -556,6 +563,8 @@ impl AgenticState {
                 root_node,
                 self.ready_after_ms[root_node],
                 &mut self.node_states,
+                &mut self.ready_nodes,
+                &self.node_to_play,
                 sessions,
                 ready_sessions,
             );
@@ -572,6 +581,8 @@ impl AgenticState {
         Self::release_edges(
             &self.dispatch_dependents[source_node],
             &mut self.node_states,
+            &mut self.ready_nodes,
+            &self.node_to_play,
             &mut self.remaining_dependencies,
             &mut self.ready_after_ms,
             sessions,
@@ -591,6 +602,8 @@ impl AgenticState {
         Self::release_edges(
             &self.completion_dependents[source_node],
             &mut self.node_states,
+            &mut self.ready_nodes,
+            &self.node_to_play,
             &mut self.remaining_dependencies,
             &mut self.ready_after_ms,
             sessions,
@@ -604,6 +617,8 @@ impl AgenticState {
     fn release_edges(
         edges: &[AgenticDependentEdge],
         node_states: &mut [AgenticNodeState],
+        ready_nodes: &mut [usize],
+        node_to_play: &[usize],
         remaining_dependencies: &mut [usize],
         ready_after_ms: &mut [f64],
         sessions: &mut [SessionRuntime],
@@ -631,6 +646,8 @@ impl AgenticState {
                 target,
                 ready_after_ms[target],
                 node_states,
+                ready_nodes,
+                node_to_play,
                 sessions,
                 ready_sessions,
             );
@@ -641,6 +658,8 @@ impl AgenticState {
         node_index: usize,
         ready_at_ms: f64,
         node_states: &mut [AgenticNodeState],
+        ready_nodes: &mut [usize],
+        node_to_play: &[usize],
         sessions: &mut [SessionRuntime],
         ready_sessions: &mut BinaryHeap<ReadySession>,
     ) {
@@ -652,6 +671,7 @@ impl AgenticState {
             return;
         }
         node_states[node_index] = AgenticNodeState::Ready;
+        ready_nodes[node_to_play[node_index]] += 1;
         session.next_ready_at_ms = Some(ready_at_ms);
         ready_sessions.push(ReadySession {
             ready_at_ms,
@@ -663,6 +683,7 @@ impl AgenticState {
     fn on_node_emitted(&mut self, node_index: usize, now_ms: f64) {
         debug_assert_eq!(self.node_states[node_index], AgenticNodeState::Ready);
         self.node_states[node_index] = AgenticNodeState::Emitted;
+        self.ready_nodes[self.node_to_play[node_index]] -= 1;
         let play = &mut self.plays[self.node_to_play[node_index]];
         play.pending_terminals += 1;
         play.emitted_in_flight += 1;
@@ -749,6 +770,9 @@ impl AgenticState {
                             self.node_states[pending_node],
                             AgenticNodeState::Blocked | AgenticNodeState::Ready
                         ) {
+                            if self.node_states[pending_node] == AgenticNodeState::Ready {
+                                self.ready_nodes[play_index] -= 1;
+                            }
                             self.node_states[pending_node] = AgenticNodeState::Skipped;
                             let session = &mut sessions[pending_node];
                             session.next_ready_at_ms = None;
@@ -797,6 +821,11 @@ impl AgenticState {
     // Client retirement can follow the final server cleanup when a profile
     // cutoff censors delayed work. Check both transitions, recording settlement
     // only once and only after every emitted request has released server state.
+    fn mark_client_finished(&mut self, play_index: usize) {
+        self.plays[play_index].client_finished = true;
+        self.finished_unscanned = true;
+    }
+
     fn finish_play_if_quiescent(&mut self, play_index: usize, now_ms: f64) {
         let play = &mut self.plays[play_index];
         if !play.quiescent
@@ -826,7 +855,7 @@ impl AgenticState {
         if self.plays[play_index].client_finished {
             return;
         }
-        self.plays[play_index].client_finished = true;
+        self.mark_client_finished(play_index);
         let Some(lane_index) = self.plays[play_index].lane_index else {
             return;
         };
@@ -917,6 +946,7 @@ pub struct WorkloadDriver {
     agentic_profile: Option<AgenticProfileState>,
     agentic_speedup: f64,
     sessions: Vec<SessionRuntime>,
+    output_stream: SyntheticOutputStream,
     in_flight: FxHashMap<Uuid, InFlightTurn>,
     agentic_settling: FxHashMap<Uuid, usize>,
     ready_sessions: BinaryHeap<ReadySession>,
@@ -1056,6 +1086,9 @@ impl WorkloadDriver {
             let mut censored = 0;
             for (index, node) in state.node_states.iter_mut().enumerate() {
                 if matches!(node, AgenticNodeState::Blocked | AgenticNodeState::Ready) {
+                    if *node == AgenticNodeState::Ready {
+                        state.ready_nodes[state.node_to_play[index]] -= 1;
+                    }
                     *node = AgenticNodeState::Censored;
                     self.sessions[index].next_ready_at_ms = None;
                     self.sessions[index].next_turn_index = self.sessions[index].turns.len();
@@ -1065,7 +1098,7 @@ impl WorkloadDriver {
             }
             for play_index in 0..state.plays.len() {
                 if state.plays[play_index].pending_terminals == 0 {
-                    state.plays[play_index].client_finished = true;
+                    state.mark_client_finished(play_index);
                     state.finish_play_if_quiescent(play_index, now_ms);
                 }
             }
@@ -1073,37 +1106,46 @@ impl WorkloadDriver {
             self.agentic_profile.as_mut().unwrap().never_issued_requests += censored;
             return Ok(true);
         }
-        let mut progressed = false;
-        // Iterating lanes, rather than terminal feedback arrival order, makes
-        // simultaneous replacement source selection deterministic.
-        let active = self.agentic_profile.as_ref().unwrap().active_plays.clone();
-        for (lane, play_index) in active.into_iter().enumerate() {
-            let SchedulingPolicy::Agentic(state) = &self.policy else {
-                unreachable!()
-            };
-            if state.plays[play_index].client_finished {
-                self.append_agentic_profile_play(lane, now_ms)?;
-                progressed = true;
-            }
+        let lanes = self.agentic_profile.as_ref().unwrap().active_plays.len();
+        // Only a client-finished play needs replacing, so lanes are scanned
+        // only after some play has finished. Lane order, rather than terminal
+        // feedback arrival order, makes simultaneous replacement source
+        // selection deterministic. A replacement rewrites only its own lane.
+        let SchedulingPolicy::Agentic(state) = &self.policy else {
+            unreachable!()
+        };
+        let finished_lanes: Vec<usize> = if state.finished_unscanned {
+            let active = &self.agentic_profile.as_ref().unwrap().active_plays;
+            (0..lanes)
+                .filter(|&lane| state.plays[active[lane]].client_finished)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut progressed = !finished_lanes.is_empty();
+        for lane in finished_lanes {
+            self.append_agentic_profile_play(lane, now_ms)?;
         }
+        let SchedulingPolicy::Agentic(state) = &mut self.policy else {
+            unreachable!()
+        };
+        state.finished_unscanned = false;
         // Both watchdogs shift only currently scheduled workload timers. Future
         // causal delays are created on their dependency event without warping
-        // engine, router, transfer or timeout clocks.
-        let (tree_cap, global_cap, tree_idle, global_idle) = {
+        // engine, router, transfer or timeout clocks. Shifting timers changes
+        // neither the active plays nor their idle stamps.
+        let (tree_cap, global_cap, global_idle) = {
             let profile = self.agentic_profile.as_ref().unwrap();
             (
                 profile.options.tree_idle_cap_seconds * 1000.0,
                 profile.options.global_idle_cap_seconds * 1000.0,
-                profile
-                    .active_plays
-                    .iter()
-                    .map(|&play| (play, profile.tree_idle_since_ms[play]))
-                    .collect::<Vec<_>>(),
                 profile.global_idle_since_ms,
             )
         };
-        for (play, idle_since) in tree_idle {
-            if idle_since.is_some_and(|idle| now_ms >= idle + tree_cap) {
+        for lane in 0..lanes {
+            let profile = self.agentic_profile.as_ref().unwrap();
+            let play = profile.active_plays[lane];
+            if profile.tree_idle_since_ms[play].is_some_and(|idle| now_ms >= idle + tree_cap) {
                 progressed |= self.shift_agentic_timers(Some(play), now_ms);
             }
         }
@@ -1269,6 +1311,7 @@ impl WorkloadDriver {
             .completion_dependents
             .extend(added.completion_dependents);
         state.node_to_play.extend(added.node_to_play);
+        state.ready_nodes.extend(added.ready_nodes);
         state.plays.extend(added.plays);
         self.agentic_snapshots
             .as_mut()
@@ -1412,46 +1455,56 @@ impl WorkloadDriver {
         let SchedulingPolicy::Agentic(state) = &self.policy else {
             unreachable!()
         };
-        if profile
-            .active_plays
-            .iter()
-            .any(|&play| state.plays[play].client_finished)
-        {
-            return Some(
-                profile
+        // Every finished active play is replaced before the flag is cleared.
+        debug_assert!(
+            state.finished_unscanned
+                || profile
                     .active_plays
                     .iter()
-                    .filter_map(|&index| {
-                        let play = &state.plays[index];
-                        play.client_finished
-                            .then_some(play.max_terminal_ms.unwrap_or(profile.last_advanced_ms))
-                    })
-                    .min_by(f64::total_cmp)
-                    .unwrap()
-                    .max(profile.last_advanced_ms),
-            );
-        }
-        let mut next = cutoff;
-        for index in profile
-            .active_plays
-            .iter()
-            .flat_map(|&play| state.plays[play].nodes.iter())
-            .copied()
+                    .all(|&index| !state.plays[index].client_finished)
+        );
+        if state.finished_unscanned
+            && let Some(finished_ms) = profile
+                .active_plays
+                .iter()
+                .filter_map(|&index| {
+                    let play = &state.plays[index];
+                    play.client_finished
+                        .then_some(play.max_terminal_ms.unwrap_or(profile.last_advanced_ms))
+                })
+                .min_by(f64::total_cmp)
         {
-            if self.sessions[index].next_ready_at_ms.is_none() {
-                continue;
-            }
-            if let Some(idle) = profile.tree_idle_since_ms[state.node_to_play[index]] {
-                next = next.min(
-                    (idle + profile.options.tree_idle_cap_seconds * 1000.0)
-                        .max(profile.last_advanced_ms),
-                );
-            }
-            if let Some(idle) = profile.global_idle_since_ms {
-                next = next.min(
-                    (idle + profile.options.global_idle_cap_seconds * 1000.0)
-                        .max(profile.last_advanced_ms),
-                );
+            return Some(finished_ms.max(profile.last_advanced_ms));
+        }
+        // A pending timer contributes only its play's tree-idle deadline and the
+        // global one, so each play is checked once, not request by request.
+        let idle_deadline = |since: Option<f64>, cap_seconds: f64| {
+            since.map(|idle| (idle + cap_seconds * 1000.0).max(profile.last_advanced_ms))
+        };
+        let pending = |play: usize| {
+            let pending = state.ready_nodes[play] > 0;
+            debug_assert_eq!(
+                pending,
+                state.plays[play]
+                    .nodes
+                    .iter()
+                    .any(|&index| self.sessions[index].next_ready_at_ms.is_some()),
+                "ready-node count must match the play's scheduled timers"
+            );
+            pending
+        };
+        let global = idle_deadline(
+            profile.global_idle_since_ms,
+            profile.options.global_idle_cap_seconds,
+        );
+        let mut next = cutoff;
+        for &play in &profile.active_plays {
+            let tree = idle_deadline(
+                profile.tree_idle_since_ms[play],
+                profile.options.tree_idle_cap_seconds,
+            );
+            if (tree.is_some() || global.is_some()) && pending(play) {
+                next = [tree, global].into_iter().flatten().fold(next, f64::min);
             }
         }
         Some(next)
@@ -2081,6 +2134,7 @@ impl WorkloadDriver {
                         },
                         max_output_tokens: source.max_output_tokens,
                         output_token_ids: None,
+                        output_stream_offset: None,
                         delay_after_previous_ms: 0.0,
                         priority: source.priority,
                         strict_priority: source.strict_priority,
@@ -2090,6 +2144,7 @@ impl WorkloadDriver {
                         deterministic_request_id: Some(snapshot.request_uuid(source_index)?),
                     }],
                     cumulative_tokens: Vec::new(),
+                    cumulative_hashes: ReplayRequestHashes::default(),
                     next_turn_index: 0,
                     next_ready_at_ms: None,
                     in_flight: None,
@@ -2120,7 +2175,9 @@ impl WorkloadDriver {
             dispatch_dependents,
             completion_dependents,
             node_to_play,
+            ready_nodes: vec![0; agentic_plays.len()],
             plays: agentic_plays,
+            finished_unscanned: false,
             lanes: Vec::new(),
             next_pending_play: 0,
             lifecycle: Vec::new(),
@@ -2135,6 +2192,8 @@ impl WorkloadDriver {
                     root_node,
                     state.ready_after_ms[root_node],
                     &mut state.node_states,
+                    &mut state.ready_nodes,
+                    &state.node_to_play,
                     &mut sessions,
                     &mut ready_sessions,
                 );
@@ -2157,6 +2216,7 @@ impl WorkloadDriver {
             agentic_profile: None,
             agentic_speedup: speedup,
             sessions,
+            output_stream: SyntheticOutputStream::new(),
             in_flight: FxHashMap::default(),
             agentic_settling: FxHashMap::default(),
             ready_sessions,
@@ -2405,6 +2465,7 @@ impl WorkloadDriver {
                     prompt_tokens,
                     max_output_tokens: node.max_output_tokens,
                     output_token_ids,
+                    output_stream_offset: None,
                     delay_after_previous_ms: 0.0,
                     priority: node.priority,
                     strict_priority: node.strict_priority,
@@ -2414,6 +2475,7 @@ impl WorkloadDriver {
                     deterministic_request_id: Some(deterministic_request_id),
                 }],
                 cumulative_tokens: Vec::new(),
+                cumulative_hashes: ReplayRequestHashes::default(),
                 next_turn_index: 0,
                 next_ready_at_ms: None,
                 in_flight: None,
@@ -2462,7 +2524,9 @@ impl WorkloadDriver {
             dispatch_dependents,
             completion_dependents,
             node_to_play,
+            ready_nodes: vec![0; plays.len()],
             plays,
+            finished_unscanned: false,
             lanes,
             next_pending_play,
             lifecycle: Vec::new(),
@@ -2477,6 +2541,8 @@ impl WorkloadDriver {
                         root_node,
                         state.ready_after_ms[root_node],
                         &mut state.node_states,
+                        &mut state.ready_nodes,
+                        &state.node_to_play,
                         &mut sessions,
                         &mut ready_sessions,
                     );
@@ -2507,6 +2573,7 @@ impl WorkloadDriver {
             agentic_profile: None,
             agentic_speedup: 1.0,
             sessions,
+            output_stream: SyntheticOutputStream::new(),
             in_flight: FxHashMap::default(),
             agentic_settling: FxHashMap::default(),
             ready_sessions,
@@ -2527,7 +2594,7 @@ impl WorkloadDriver {
             u32::try_from(engine_block_size).context("engine_block_size does not fit in u32")?;
         let trace_block_size = trace.block_size;
         let is_concurrency = matches!(&policy, SchedulingPolicy::Concurrency(_));
-        let mut output_rng = StdRng::seed_from_u64(SYNTHETIC_OUTPUT_SEED);
+        let mut next_output_offset = 0_u64;
         let sessions: Vec<SessionRuntime> = trace
             .sessions
             .into_iter()
@@ -2537,41 +2604,36 @@ impl WorkloadDriver {
                 } else {
                     Some(session.first_arrival_timestamp_ms.unwrap_or(0.0))
                 };
-                let turns = session
+                // Collecting `Result`s has no length hint, so a one-turn session
+                // would start with room for four turns.
+                let mut turns = Vec::with_capacity(session.turns.len());
+                session
                     .turns
                     .into_iter()
                     .map(|mut turn| -> Result<TurnRuntime> {
-                        let prompt_tokens = match prompt_mode {
-                            PromptMode::Full => PromptTokens::deferred(
-                                turn.input_length,
-                                std::mem::take(&mut turn.hash_ids),
-                                trace_block_size,
-                            )?,
-                            PromptMode::DeltaCumulative => {
-                                // Image spans index the turn's own prompt, not the
-                                // session history the cumulative request carries.
-                                if !turn.images.is_empty() {
-                                    bail!(
-                                        "accumulating session deltas does not support image turns"
-                                    );
-                                }
-                                PromptTokens::Materialized(
-                                    turn.synthesize_tokens(trace_block_size)?,
-                                )
-                            }
-                        };
-                        let output_token_ids = Some(planned_output_token_ids(
-                            turn.output_token_ids,
-                            turn.max_output_tokens,
-                            &mut output_rng,
-                        ));
+                        // Image spans index the turn's own prompt, not the
+                        // session history the cumulative request carries.
+                        if prompt_mode == PromptMode::DeltaCumulative && !turn.images.is_empty() {
+                            bail!("accumulating session deltas does not support image turns");
+                        }
+                        let prompt_tokens = PromptTokens::deferred(
+                            turn.input_length,
+                            std::mem::take(&mut turn.hash_ids),
+                            trace_block_size,
+                        )?;
+                        let mut output_stream_offset = None;
+                        if turn.output_token_ids.is_none() {
+                            output_stream_offset = Some(next_output_offset);
+                            next_output_offset += turn.max_output_tokens as u64;
+                        }
                         Ok(TurnRuntime {
                             request_id: None,
                             play_id: None,
                             prompt_tokens,
                             replay_key: turn.replay_key,
                             max_output_tokens: turn.max_output_tokens,
-                            output_token_ids,
+                            output_token_ids: turn.output_token_ids,
+                            output_stream_offset,
                             delay_after_previous_ms: turn.delay_after_previous_ms,
                             priority: turn.priority,
                             strict_priority: turn.strict_priority,
@@ -2581,7 +2643,10 @@ impl WorkloadDriver {
                             deterministic_request_id: None,
                         })
                     })
-                    .collect::<Result<Vec<_>>>()?;
+                    .try_for_each(|turn| -> Result<()> {
+                        turns.push(turn?);
+                        Ok(())
+                    })?;
                 let cumulative_capacity = if prompt_mode == PromptMode::DeltaCumulative {
                     turns
                         .iter()
@@ -2590,7 +2655,7 @@ impl WorkloadDriver {
                                 + turn
                                     .output_token_ids
                                     .as_ref()
-                                    .map_or(0, |output| output.len())
+                                    .map_or(turn.max_output_tokens, Vec::len)
                         })
                         .sum()
                 } else {
@@ -2600,6 +2665,7 @@ impl WorkloadDriver {
                     session_id: session.session_id,
                     turns,
                     cumulative_tokens: Vec::with_capacity(cumulative_capacity),
+                    cumulative_hashes: ReplayRequestHashes::default(),
                     next_turn_index: 0,
                     next_ready_at_ms,
                     in_flight: None,
@@ -2633,6 +2699,7 @@ impl WorkloadDriver {
             agentic_profile: None,
             agentic_speedup: 1.0,
             sessions,
+            output_stream: SyntheticOutputStream::new(),
             in_flight: FxHashMap::default(),
             agentic_settling: FxHashMap::default(),
             ready_sessions,
@@ -2865,6 +2932,10 @@ impl WorkloadDriver {
             };
             let session = &mut self.sessions[session_index];
             let turn = &mut session.turns[turn_index];
+            if let Some(offset) = turn.output_stream_offset {
+                turn.output_token_ids =
+                    Some(self.output_stream.ids_at(offset, turn.max_output_tokens));
+            }
             let replay_context = turn
                 .request_id
                 .as_ref()
@@ -2920,6 +2991,7 @@ impl WorkloadDriver {
                             (input_length, hash_ids, turn.output_token_ids.take())
                         };
                     let request_metadata = DirectRequest {
+                        cache_salt: None,
                         tokens: Vec::new(),
                         max_output_tokens: if live_warmup {
                             1
@@ -2948,14 +3020,21 @@ impl WorkloadDriver {
                     )
                 }
                 PromptMode::DeltaCumulative => {
-                    session
-                        .cumulative_tokens
-                        .extend_from_slice(turn.prompt_tokens.materialized());
+                    let (input_length, hash_ids) = turn.prompt_tokens.take_deferred();
+                    extend_validated_trace_tokens(
+                        &mut session.cumulative_tokens,
+                        input_length,
+                        &hash_ids,
+                        self.trace_block_size,
+                    );
                     let request_tokens = session.cumulative_tokens.clone();
                     let replay_hashes = self.include_replay_hashes.then(|| {
-                        ReplayRequestHashes::from_tokens(&request_tokens, self.engine_block_size)
+                        let hashes = &mut session.cumulative_hashes;
+                        hashes.extend_from_tokens(&request_tokens, self.engine_block_size);
+                        hashes.clone()
                     });
                     let request = ReplayRequestPayload::materialized(DirectRequest {
+                        cache_salt: None,
                         tokens: request_tokens,
                         max_output_tokens: turn.max_output_tokens,
                         output_token_ids: turn.output_token_ids.clone(),
@@ -2974,6 +3053,13 @@ impl WorkloadDriver {
                     (request, replay_hashes)
                 }
             };
+            let planned_output_tokens = match self.prompt_mode {
+                PromptMode::Full => Vec::new(),
+                PromptMode::DeltaCumulative => turn
+                    .output_token_ids
+                    .take()
+                    .expect("delta turns must have planned output tokens"),
+            };
             session.in_flight = Some(request_uuid);
             session.next_ready_at_ms = None;
             self.in_flight.insert(
@@ -2982,6 +3068,7 @@ impl WorkloadDriver {
                     session_index,
                     turn_index,
                     emitted_output_tokens: 0,
+                    planned_output_tokens,
                 },
             );
             let ready = CompactReadyTurn {
@@ -3056,15 +3143,10 @@ impl WorkloadDriver {
         }
         let in_flight = self
             .in_flight
-            .get(&request_uuid)
-            .copied()
+            .get_mut(&request_uuid)
             .ok_or_else(|| anyhow!("unknown workload request output for {request_uuid}"))?;
 
-        let turn = &self.sessions[in_flight.session_index].turns[in_flight.turn_index];
-        let planned_output_tokens = turn
-            .output_token_ids
-            .as_ref()
-            .expect("delta turns must have planned output tokens");
+        let planned_output_tokens = &in_flight.planned_output_tokens;
         let expected_token = planned_output_tokens
             .get(in_flight.emitted_output_tokens)
             .ok_or_else(|| {
@@ -3081,10 +3163,6 @@ impl WorkloadDriver {
             );
         }
 
-        let in_flight = self
-            .in_flight
-            .get_mut(&request_uuid)
-            .expect("validated in-flight request must still exist");
         in_flight.emitted_output_tokens = in_flight
             .emitted_output_tokens
             .checked_add(1)
@@ -3327,7 +3405,7 @@ impl WorkloadDriver {
             if state.plays[play_index].pending_terminals == 0 {
                 profile.tree_idle_since_ms[play_index] = Some(now_ms);
                 if profile.cutoff {
-                    state.plays[play_index].client_finished = true;
+                    state.mark_client_finished(play_index);
                     state.finish_play_if_quiescent(play_index, now_ms);
                 }
             }
@@ -3368,8 +3446,8 @@ impl WorkloadDriver {
         &self,
         request_uuid: Uuid,
         outcome: TurnOutcome,
-    ) -> Result<Option<InFlightTurn>> {
-        let Some(in_flight) = self.in_flight.get(&request_uuid).copied() else {
+    ) -> Result<Option<&InFlightTurn>> {
+        let Some(in_flight) = self.in_flight.get(&request_uuid) else {
             return match outcome {
                 TurnOutcome::Completed | TurnOutcome::Rejected | TurnOutcome::Failed => Err(
                     anyhow!("unknown workload request completion for {request_uuid}"),
@@ -3430,16 +3508,6 @@ impl WorkloadDriver {
             return Ok(None);
         };
         let session = &self.sessions[in_flight.session_index];
-        let turn = &session.turns[in_flight.turn_index];
-        let completed_output_tokens = (outcome == TurnOutcome::Completed
-            && self.prompt_mode == PromptMode::DeltaCumulative)
-            .then(|| {
-                let planned_output_tokens = turn
-                    .output_token_ids
-                    .as_ref()
-                    .expect("delta turns must have planned output tokens");
-                planned_output_tokens[..in_flight.emitted_output_tokens].to_vec()
-            });
         let (next_turn_index, next_ready_at_ms, session_ended) = match outcome {
             TurnOutcome::Completed | TurnOutcome::Rejected => {
                 let next_turn_index = in_flight
@@ -3455,7 +3523,8 @@ impl WorkloadDriver {
             TurnOutcome::Cancelled | TurnOutcome::Failed => (session.turns.len(), None, true),
         };
 
-        self.in_flight
+        let in_flight = self
+            .in_flight
             .remove(&request_uuid)
             .expect("validated in-flight request must still exist");
         let session = &mut self.sessions[in_flight.session_index];
@@ -3464,11 +3533,15 @@ impl WorkloadDriver {
         session.next_ready_at_ms = next_ready_at_ms;
         if session_ended {
             session.cumulative_tokens = Vec::new();
+            session.cumulative_hashes = ReplayRequestHashes::default();
         }
         if next_ready_at_ms.is_some()
-            && let Some(output_tokens) = completed_output_tokens
+            && outcome == TurnOutcome::Completed
+            && self.prompt_mode == PromptMode::DeltaCumulative
         {
-            session.cumulative_tokens.extend(output_tokens);
+            session.cumulative_tokens.extend_from_slice(
+                &in_flight.planned_output_tokens[..in_flight.emitted_output_tokens],
+            );
         }
         if let Some(ready_at_ms) = next_ready_at_ms {
             self.ready_sessions.push(ReadySession {
@@ -3767,9 +3840,7 @@ mod tests {
             .iter()
             .map(|session| match &session.turns[0].prompt_tokens {
                 PromptTokens::Deferred { hash_ids, .. } => hash_ids.clone(),
-                PromptTokens::Snapshot { .. } | PromptTokens::Materialized(_) => {
-                    panic!("agentic prompts stay deferred")
-                }
+                PromptTokens::Snapshot { .. } => panic!("agentic prompts stay deferred"),
             })
             .collect();
         assert_eq!(
@@ -4018,6 +4089,7 @@ mod tests {
                 .iter()
                 .all(|turn| matches!(turn.prompt_tokens, PromptTokens::Deferred { .. }))
         }));
+        assert_eq!(driver.sessions[1].turns.capacity(), 1);
 
         let ready = driver.pop_ready(0.0, 1);
         assert_eq!(ready.len(), 1);
@@ -4045,19 +4117,6 @@ mod tests {
             assert!(request.materialized_tokens().is_none());
             assert_eq!(request.into_direct_request().tokens, vec![1, 2]);
         }
-    }
-
-    #[test]
-    fn delta_cumulative_prompts_remain_materialized_during_setup() {
-        let driver =
-            WorkloadDriver::new_concurrency_accumulating_deltas(two_session_trace(), 1, 1).unwrap();
-
-        assert!(driver.sessions.iter().all(|session| {
-            session
-                .turns
-                .iter()
-                .all(|turn| matches!(turn.prompt_tokens, PromptTokens::Materialized(_)))
-        }));
     }
 
     #[test]
@@ -4416,6 +4475,43 @@ mod tests {
     }
 
     #[test]
+    fn output_ids_drawn_at_dispatch_follow_trace_order() {
+        let trace = Trace {
+            block_size: 1,
+            sessions: [
+                (2.0, 70, None),
+                (3.0, 2, Some(vec![7, 8])),
+                (0.0, 5, None),
+                (1.0, 130, None),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(
+                |(index, (arrival, max_output_tokens, output_token_ids))| SessionTrace {
+                    session_id: format!("s{index}"),
+                    first_arrival_timestamp_ms: Some(arrival),
+                    turns: vec![TurnTrace {
+                        input_length: 1,
+                        max_output_tokens,
+                        output_token_ids,
+                        hash_ids: vec![index as u32],
+                        ..Default::default()
+                    }],
+                },
+            )
+            .collect(),
+        };
+        // The single-turn path draws every plan up front, in trace order.
+        let planned = trace.to_single_turn_requests().unwrap();
+
+        let mut driver = WorkloadDriver::new_trace(trace, 1).unwrap();
+        for (at_ms, index) in [(0.0, 2), (1.0, 3), (2.0, 0), (3.0, 1)] {
+            let request = driver.pop_ready(at_ms, usize::MAX).pop().unwrap().request;
+            assert_eq!(request.output_token_ids, planned[index].output_token_ids);
+        }
+    }
+
+    #[test]
     fn accumulating_delta_mode_rejects_image_turns() {
         let trace = Trace {
             block_size: 4,
@@ -4494,11 +4590,18 @@ mod tests {
         let first = driver.pop_ready(0.0, usize::MAX);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].request.tokens, vec![10, 10, 10, 10, 11, 11]);
+        let rehashed = |t: &ReadyTurn| ReplayRequestHashes::from_tokens(&t.request.tokens, 4);
+        assert_eq!(first[0].replay_hashes, Some(rehashed(&first[0])));
         assert_eq!(first[0].request.output_token_ids, Some(vec![20, 21]));
         assert_eq!(first[0].request.priority, 3);
         assert_eq!(first[0].request.strict_priority, 4);
+        let request_uuid = first[0].request_uuid;
+        let error = driver.on_output_token(request_uuid, 21).unwrap_err();
+        assert!(error.to_string().contains("at position 0, expected 20"));
         driver.on_output_token(first[0].request_uuid, 20).unwrap();
         driver.on_output_token(first[0].request_uuid, 21).unwrap();
+        let error = driver.on_output_token(request_uuid, 22).unwrap_err();
+        assert!(error.to_string().contains("more than 2 planned"));
         driver.on_complete(first[0].request_uuid, 10.0).unwrap();
 
         let second = driver.pop_ready(15.0, usize::MAX);
@@ -4507,8 +4610,13 @@ mod tests {
             second[0].request.tokens,
             vec![10, 10, 10, 10, 11, 11, 20, 21, 12, 12, 12]
         );
+        // The second engine block spans turn 1's input and its emitted output.
+        assert_eq!(second[0].replay_hashes, Some(rehashed(&second[0])));
         assert_eq!(second[0].request.priority, -2);
         assert_eq!(second[0].request.strict_priority, 7);
+        // Dispatch leaves a turn's prompt only in the session history.
+        let (_, hash_ids) = driver.sessions[0].turns[0].prompt_tokens.take_deferred();
+        assert!(hash_ids.is_empty());
     }
 
     #[test]
@@ -4684,6 +4792,7 @@ mod tests {
                 .find(|s| s.session_id == "10")
                 .unwrap();
             assert_eq!(ended_session.cumulative_tokens.capacity(), 0);
+            assert!(ended_session.cumulative_hashes.sequence_hashes.is_empty());
             driver.on_complete(surviving.request_uuid, 2.0).unwrap();
             assert!(!driver.is_drained());
             assert_eq!(driver.next_ready_time_ms(), Some(7.0));
@@ -4807,6 +4916,15 @@ mod tests {
         assert_eq!(identity.lane_id.as_deref(), Some("lane:0"));
         assert_eq!(identity.root_id.as_deref(), Some("root"));
         assert_eq!(identity.parent_id, None);
+    }
+
+    #[test]
+    fn empty_lifecycle_digest_is_pinned_to_the_aisim_namespace() {
+        // Independent BLAKE3 of the AISim domain tag and an empty JSONL stream.
+        assert_eq!(
+            AgenticLifecycleTranscript::default().digest().unwrap(),
+            "449fd6f4d2ab59a94dbc232f45d5dc6024fbf1ea9b88045a5944c38b7784d325"
+        );
     }
 
     #[test]
@@ -6105,6 +6223,93 @@ mod tests {
         );
     }
 
+    /// Per-play ready counts, checked against the `Ready` nodes and
+    /// scheduled timers they stand in for.
+    fn ready_counts(driver: &WorkloadDriver) -> Vec<usize> {
+        let SchedulingPolicy::Agentic(state) = &driver.policy else {
+            panic!("profile drivers are agentic")
+        };
+        assert_eq!(state.ready_nodes.len(), state.plays.len());
+        for (index, play) in state.plays.iter().enumerate() {
+            let ready = play
+                .nodes
+                .iter()
+                .filter(|&&node| state.node_states[node] == AgenticNodeState::Ready)
+                .count();
+            let timers = play
+                .nodes
+                .iter()
+                .filter(|&&node| driver.sessions[node].next_ready_at_ms.is_some())
+                .count();
+            assert_eq!(
+                (state.ready_nodes[index], ready),
+                (timers, timers),
+                "play {index}"
+            );
+        }
+        state.ready_nodes.clone()
+    }
+
+    #[test]
+    fn profile_ready_counts_follow_dispatch_failure_replacement_and_cutoff() {
+        let mut spawned = profile_row("a-spawned", "a", 0.0);
+        spawned.dependencies = vec![dependency(
+            "a-root",
+            AgenticDependencyTrigger::Dispatch,
+            5.0,
+            AgenticDependencyRelation::Spawn,
+        )];
+        let mut continuation = profile_row("a-next", "a", 0.0);
+        continuation.dependencies = vec![dependency(
+            "a-root",
+            AgenticDependencyTrigger::Completion,
+            0.0,
+            AgenticDependencyRelation::Sequence,
+        )];
+        let mut driver = profile_driver(
+            vec![
+                profile_row("a-root", "a", 0.0),
+                spawned,
+                continuation,
+                profile_row("b-root", "b", 0.0),
+            ],
+            1,
+            AgenticProfileOptions {
+                duration_seconds: 0.100,
+                ..Default::default()
+            },
+        );
+        assert_eq!(ready_counts(&driver), vec![1]);
+
+        // Dispatching the root moves its count to the spawned child's timer.
+        driver.advance_agentic_profile(0.0).unwrap();
+        let root = driver.pop_ready(0.0, usize::MAX);
+        assert_eq!(root.len(), 1);
+        assert_eq!(ready_counts(&driver), vec![1]);
+        assert_eq!(driver.next_ready_time_ms(), Some(5.0));
+
+        // A failed root skips the scheduled child and the blocked continuation,
+        // which finishes the play's client work.
+        driver
+            .on_causal_terminal(root[0].request_uuid, 1.0, ReplayTerminalStatus::Failed)
+            .unwrap();
+        assert_eq!(ready_counts(&driver), vec![0]);
+        assert_eq!(driver.next_ready_time_ms(), Some(1.0));
+
+        // Replacement clears the flag and brings the new play's ready root.
+        assert!(driver.advance_agentic_profile(1.0).unwrap());
+        assert_eq!(ready_counts(&driver), vec![0, 1]);
+        let SchedulingPolicy::Agentic(state) = &driver.policy else {
+            unreachable!()
+        };
+        assert!(!state.finished_unscanned);
+        assert_eq!(driver.next_ready_time_ms(), Some(1.0));
+
+        // The admission cutoff censors the unissued replacement root.
+        assert!(driver.advance_agentic_profile(100.0).unwrap());
+        assert_eq!(ready_counts(&driver), vec![0, 0]);
+    }
+
     #[test]
     fn profile_report_accepts_grace_response_and_keeps_admission_duration_separate() {
         let mut driver = profile_driver(
@@ -6229,6 +6434,42 @@ mod tests {
                 .windows(2)
                 .all(|events| events[0].ordinal + 1 == events[1].ordinal)
         );
+    }
+
+    #[test]
+    fn profile_idle_deadline_comes_from_the_idle_play_with_a_pending_timer() {
+        // Idle play "a" waits on a child past its tree-idle cap; play "b" is in
+        // flight, so neither it nor the global guard sets a deadline.
+        let mut child = profile_row("a-child", "a", 500_000.0);
+        child.session_id = "child".into();
+        child.dependencies = vec![dependency(
+            "a-root",
+            AgenticDependencyTrigger::Completion,
+            499_000.0,
+            AgenticDependencyRelation::Spawn,
+        )];
+        let rows = vec![
+            profile_row("a-root", "a", 0.0),
+            child,
+            profile_row("b-root", "b", 0.0),
+        ];
+        let options = AgenticProfileOptions::default();
+        let tree_cap_ms = options.tree_idle_cap_seconds * 1000.0;
+        let mut driver = profile_driver(rows, 2, options);
+        let roots = driver.pop_ready(0.0, 2);
+        let a_root = roots
+            .iter()
+            .find(|ready| ready.authored_request_id.as_deref() == Some("a-root"))
+            .unwrap();
+        driver
+            .on_causal_terminal(
+                a_root.request_uuid,
+                1_000.0,
+                ReplayTerminalStatus::Completed,
+            )
+            .unwrap();
+        driver.advance_agentic_profile(1_000.0).unwrap();
+        assert_eq!(driver.next_ready_time_ms(), Some(1_000.0 + tree_cap_ms));
     }
 
     #[test]

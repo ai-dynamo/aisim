@@ -28,7 +28,7 @@ Three surfaces:
    source) from ``goldens/per_op.json`` — the Gate-3 precondition that per-op
    values cross the FFI with real op names.
 
-These tests require the maturin-built ``aisimulate_core`` extension.
+These tests require the maturin-built ``aisim_core`` extension.
 """
 
 from __future__ import annotations
@@ -51,9 +51,9 @@ from test_engine_step_parity import (
     load_parity_golden,
 )
 
-from aisimulate.sdk import config, engine, perf_database
-from aisimulate.sdk.backends.factory import get_backend
-from aisimulate.sdk.models import get_model
+from aisim.sdk import config, engine, perf_database
+from aisim.sdk.backends.factory import get_backend
+from aisim.sdk.models import get_model
 
 pytestmark = pytest.mark.integration
 
@@ -80,7 +80,7 @@ pytestmark = pytest.mark.integration
 #            Fallback-MLA path and the sglang perf tables.
 #   trtllm : gpt-oss-20b (MoE -> exercises the `TrtllmAlltoall` flavor +
 #            trtllm comm quant + trtllm MoE) and Nemotron-Super-49B (dense,
-#            CustomAllReduce-heavy), both b200_sxm/trtllm/current (1.3.0rc20). The MoE
+#            CustomAllReduce-heavy), both b200_sxm/trtllm/current. The MoE
 #            case is the load-bearing one: it is the only subset member that
 #            hits the trtllm dispatch-flavor branch.
 _SUBSET_IDS_BY_BACKEND = {
@@ -591,15 +591,16 @@ def _build_wideep_sglang():
     ``wideep_sglang`` goldens exercise measured DeepEP expert compute alongside
     the new LL communication model.
     """
-    from aisimulate.sdk import common
+    from aisim.sdk import common
 
     database = _quiet(
         perf_database.get_database,
         _WIDEEP_SGLANG_SYSTEM,
         "sglang",
         _WIDEEP_SGLANG_VERSION,
-        # Current-slot primary data plus approved cross-version donors for
-        # the large-EP tables form the production H200 query shape.
+        # This version's primary data plus approved cross-version donors for
+        # the large-EP tables; a frozen data coordinate outside the slots.
+        allow_unlisted_version=True,
     )
     assert database is not None, f"missing shipped {_WIDEEP_SGLANG_SYSTEM}/sglang/{_WIDEEP_SGLANG_VERSION} database"
     compute_eps = database.moe_expert_compute_coverage(
@@ -642,15 +643,16 @@ def _build_wideep_sglang():
 
 def _build_gb200_wideep_sglang():
     """Runnable GB200 Stage-1 DeepEP config for parity and golden capture."""
-    from aisimulate.sdk import common
+    from aisim.sdk import common
 
     database = _quiet(
         perf_database.get_database,
         _GB200_WIDEEP_SGLANG_SYSTEM,
         "sglang",
         _GB200_WIDEEP_SGLANG_VERSION,
-        # Current-slot primary data plus approved cross-version donors for
-        # the large-EP tables form the production GB200 query shape.
+        # This version's primary data plus approved cross-version donors for
+        # the large-EP tables; a frozen data coordinate outside the slots.
+        allow_unlisted_version=True,
     )
     assert database is not None, (
         f"missing shipped {_GB200_WIDEEP_SGLANG_SYSTEM}/sglang/{_GB200_WIDEEP_SGLANG_VERSION} database"
@@ -695,9 +697,9 @@ def _build_gb200_wideep_sglang():
 
 
 def _handle_from_spec_json(spec_json: str) -> engine.EngineHandle:
-    import aisimulate_core
+    import aisim_core
 
-    return engine.EngineHandle(bytes(aisimulate_core.engine_spec_bincode_from_json(spec_json)))
+    return engine.EngineHandle(bytes(aisim_core.engine_spec_bincode_from_json(spec_json)))
 
 
 class TestWideEpDeepEpParity:
@@ -824,9 +826,10 @@ class TestGb200WideEpDeepEpParity:
 def _build_wideep_trtllm():
     """(model, backend, database, spec_json) for the TRT-LLM WideEP config;
     shared by the parity test (handle side) and the golden capture."""
-    from aisimulate.sdk import common
+    from aisim.sdk import common
 
-    database = _quiet(perf_database.get_database, "gb200", "trtllm", "1.3.0rc20")
+    # A frozen data coordinate outside the queryable slots.
+    database = _quiet(perf_database.get_database, "gb200", "trtllm", "1.3.0rc20", allow_unlisted_version=True)
     if database is None:
         pytest.skip("no perf database for gb200/trtllm/1.3.0rc20")
     model_config = config.ModelConfig(

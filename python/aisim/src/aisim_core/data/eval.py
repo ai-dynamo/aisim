@@ -1,0 +1,754 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""``aisim-eval/v1`` evaluation records, prediction fingerprint and verifier.
+
+An eval record stores a prediction's accuracy against recorded truth. It is
+immutable and content-addressed: the record ID is the SHA-256 of its canonical
+JSON, the file is named by that ID, and a newer record *supersedes* an older one
+by naming its ID; nothing is overwritten. Prediction is deterministic and needs
+no GPU, so :func:`verify_record` recomputes the prediction side from the
+recorded truth table and checks the claimed numbers. Only ``verified`` and
+``qualified`` records should feed defaults and gates.
+
+The verifier takes a ``predict`` callable so this module never constructs a
+performance model; callers build one through the canonical
+``best_available`` interface and pass it in. Offline only.
+"""
+
+import hashlib
+import json
+import math
+import os
+import re
+import tempfile
+import threading
+import time
+from collections.abc import Callable, Collection, Mapping
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Literal
+
+import pyarrow as pa
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+
+from aisim_core.data import Artifact, Digest, Identity
+from aisim_core.data.gpu_time import Finding, GpuTime, check_gpu_time, gpu_time_ok
+from aisim_core.data.hygiene import CandidatePolicy, bounded_json_bytes, checked_path
+from aisim_core.data.parquet import read_parquet, write_parquet
+
+EVAL_SCHEMA_ID = "aisim-eval/v1"
+TRUTH_SCHEMA_ID = "aisim-eval-truth/v1"
+TRUTH_COLUMNS = ("case_id", "inputs_json", "truth_value")
+FINGERPRINT_VERSION = 1
+VERIFIER_VERSION = "1"
+QUANTILES = (0.5, 0.9, 0.99)
+WORST_N = 10
+# Metrics are rounded before comparison so platform float noise never decides.
+ROUND_DIGITS = 9
+REL_TOL = 1e-6
+
+Layer = Literal["op", "fpm", "e2e"]
+Tier = Literal["submitted", "verified", "qualified"]
+TIER_RANK = {"submitted": 0, "verified": 1, "qualified": 2}  # the order attest and the mirror enforce
+
+
+class _Record(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, populate_by_name=True)
+
+
+# --- prediction identity ----------------------------------------------------
+
+
+class PredictionIdentity(_Record):
+    """What produced the predictions. ``fingerprint`` is derived, never trusted."""
+
+    code_path: str = Field(min_length=1)  # e.g. "fpm_interpolation"; never a PR head SHA
+    code_version: str | None = None  # release or tag of the perf-model code path
+    data_pins: dict[str, Digest]  # input name -> SHA-256 (profiles, tables)
+    spec_sha256: Digest
+    fingerprint: Digest
+
+    @classmethod
+    def build(
+        cls, code_path: str, data_pins: Mapping[str, str], spec_sha256: str, code_version: str | None = None
+    ) -> "PredictionIdentity":
+        fp = prediction_fingerprint(code_path, data_pins, spec_sha256, code_version)
+        return cls(
+            code_path=code_path,
+            code_version=code_version,
+            data_pins=dict(sorted(data_pins.items())),
+            spec_sha256=spec_sha256,
+            fingerprint=fp,
+        )
+
+    @model_validator(mode="after")
+    def fingerprint_matches(self):
+        expected = prediction_fingerprint(self.code_path, self.data_pins, self.spec_sha256, self.code_version)
+        if self.fingerprint != expected:
+            raise ValueError("prediction fingerprint does not match its components")
+        return self
+
+
+def prediction_fingerprint(
+    code_path: str, data_pins: Mapping[str, str], spec_sha256: str, code_version: str | None = None
+) -> str:
+    """SHA-256 over code path, data pins and system spec hash (not a commit SHA).
+
+    Unrelated commits leave it unchanged, so recorded evidence stays valid and
+    an agent can skip a comparison that already exists.
+    """
+    payload = {
+        "version": FINGERPRINT_VERSION,
+        "code_path": code_path,
+        "code_version": code_version,
+        "data_pins": dict(sorted(data_pins.items())),
+        "spec_sha256": spec_sha256,
+    }
+    return hashlib.sha256(_canonical(payload).encode()).hexdigest()
+
+
+# --- truth identity ---------------------------------------------------------
+
+
+class TruthIdentity(_Record):
+    layer: Layer
+    snapshot_id: str | None = None
+    configuration_ids: list[str] = Field(min_length=1)
+    identity: Identity
+    artifacts: list[Artifact] = Field(min_length=1)  # truth inputs, incl. the truth table
+    truth_table_artifact_id: str  # which artifact is the Parquet truth table
+
+    @model_validator(mode="after")
+    def table_listed(self):
+        if self.truth_table_artifact_id not in {a.artifact_id for a in self.artifacts}:
+            raise ValueError("truth_table_artifact_id is not among artifacts")
+        return self
+
+
+# --- results, assumptions, cost ----------------------------------------------
+
+
+class Outlier(_Record):
+    case_id: str
+    truth: float
+    predicted: float
+    rel_error_pct: float  # signed (predicted - truth) / truth * 100
+
+
+class Exclusion(_Record):
+    case_id: str
+    reason: str = Field(min_length=1)
+
+
+class Results(_Record):
+    n_total: int = Field(ge=0)
+    n_scored: int = Field(ge=0)
+    mape_pct: float | None  # null when nothing was scored
+    residual_quantiles_pct: dict[str, float] | None  # of signed relative error
+    worst_n: list[Outlier]
+    coverage: float | None  # n_scored / n_total
+    exclusions: list[Exclusion]
+    # Kept apart on purpose; unknown stays null.
+    collection_quality: dict[str, JsonValue] | None = None
+    resolved_memory: dict[str, JsonValue] | None = None
+    replay_coverage: dict[str, JsonValue] | None = None
+
+
+class Assumption(_Record):
+    name: str = Field(min_length=1)
+    value: JsonValue
+    status: Literal["verified", "estimated"]
+    kind: Literal["truth", "calibration"]
+
+
+class SimulationCost(_Record):
+    wall_seconds: float | None = Field(default=None, ge=0)
+    gpu_seconds: float = Field(default=0.0, ge=0)  # prediction needs no GPU
+
+
+class Producer(_Record):
+    kind: Literal["agent", "human", "ci"]
+    name: str = Field(min_length=1)
+    skill: str | None = None
+    skill_version: str | None = None
+    evaluator_revision: str = Field(min_length=1)
+
+
+class Verification(_Record):
+    verifier_version: str
+    recomputed_fingerprint: Digest
+    verified_record_id: Digest  # the submitted record this attests
+
+
+class EvalRecord(_Record):
+    schema_version: Literal["aisim-eval/v1"]
+    prediction: PredictionIdentity
+    truth: TruthIdentity
+    results: Results
+    assumptions: list[Assumption]
+    gpu_time: GpuTime | None = None  # absent is missing, not zero; see check_record_gpu_time
+    simulation_cost: SimulationCost
+    producer: Producer
+    tier: Tier
+    status: Literal["complete", "partial", "failed"] = "complete"
+    status_reason: str | None = None  # required for partial/failed; kept, never dropped
+    supersedes: Digest | None = None
+    verification: Verification | None = None
+    created_at: str  # RFC 3339 UTC, supplied by the caller for reproducible tests
+    findings: list[Artifact] = Field(default_factory=list)  # linked artifacts
+
+    @model_validator(mode="after")
+    def consistent(self):
+        if self.status != "complete" and not self.status_reason:
+            raise ValueError("partial and failed records need status_reason")
+        if self.tier != "submitted" and self.verification is None:
+            raise ValueError(f"tier {self.tier!r} requires a verification block")
+        if self.verification and self.verification.recomputed_fingerprint != self.prediction.fingerprint:
+            raise ValueError("verification fingerprint differs from the record's prediction fingerprint")
+        errors = [f.message for f in check_record_gpu_time(self) if f.severity == "error"]
+        if errors:
+            raise ValueError(f"qualified record needs gpu_time: {errors[0]}")
+        return self
+
+    @property
+    def record_id(self) -> str:
+        return record_id(self)
+
+
+def check_record_gpu_time(record: EvalRecord) -> list[Finding]:
+    """``gpu_time`` findings: errors for qualified records, warnings otherwise (archival)."""
+    return check_gpu_time(record.gpu_time, "qualification" if record.tier == "qualified" else "archival")
+
+
+# --- content addressing and storage -----------------------------------------
+
+
+def _canonical(payload) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
+def record_id(record: EvalRecord) -> str:
+    """SHA-256 of the canonical JSON of the whole record."""
+    return hashlib.sha256(_canonical(record.model_dump(by_alias=True, mode="json")).encode()).hexdigest()
+
+
+def _label(value: str) -> str:
+    return value.replace("/", "--")
+
+
+def _component(value: str) -> str:
+    """One directory name derived from an identity field; never lets the path leave the root."""
+    label = _label(value)
+    if label in ("", ".", "..") or "\\" in label or "\0" in label:
+        raise ValueError(f"identity value cannot be a path component: {value!r}")
+    return label
+
+
+def parallelism_label(identity: Identity) -> str:
+    """Readable path label, e.g. ``tp4-ep8``; ``unspecified`` when unknown."""
+    if not identity.parallelism:
+        return "unspecified"
+    roles = identity.parallelism
+    if len(roles) == 1:
+        dims = next(iter(roles.values()))
+        return "-".join(f"{k}{v}" for k, v in dims.items()) or "tp1"
+    return "_".join(f"{r}-" + ("-".join(f"{k}{v}" for k, v in d.items()) or "tp1") for r, d in roles.items())
+
+
+def record_dir(root: str | Path, identity: Identity) -> Path:
+    """``eval/<model>/<hardware>/<framework>/<version>/<parallelism>/`` (op: ``<hardware>/<family>/``)."""
+    base = Path(root) / "eval"
+    if identity.model is None:
+        return base / _component(identity.hardware) / _component(identity.operation_family or "unspecified")
+    return (
+        base
+        / _component(identity.model)
+        / _component(identity.hardware)
+        / _component(identity.framework)
+        / _component(identity.framework_version)
+        / _component(parallelism_label(identity))
+    )
+
+
+def record_path(root: str | Path, record: EvalRecord) -> Path:
+    return record_dir(root, record.truth.identity) / f"{record.record_id}.json"
+
+
+_RECORD_LOCK_WAIT_SECONDS = 30.0
+# Every writer must lock the same file, so the location cannot come from the environment (TMPDIR, TEMP, TMP): two
+# writers with different values would lock different files and could both publish a successor of one record.
+_LOCK_DIRECTORY = "/tmp" if os.path.isdir("/tmp") else tempfile.gettempdir()
+_THREAD_LOCK = threading.Lock()
+
+
+@contextmanager
+def _record_lock(directory: Path):
+    """Serialize writers of one record directory across processes and threads on this host.
+
+    The lock is an advisory ``flock`` that the operating system drops when its holder exits, however it exits, so a
+    killed writer never blocks the next one. Its backing file lives in ``/tmp`` (not the environment's temporary
+    directory, which writers may set differently), keyed by the directory's real path, so nothing is left in the
+    dataset (the mirror validator rejects stray files there).
+    """
+    try:
+        import fcntl
+    except ImportError:  # no flock (Windows): writers of one process still serialize
+        with _THREAD_LOCK:
+            yield
+        return
+    name = hashlib.sha256(os.path.realpath(directory).encode("utf-8")).hexdigest()
+    lock = Path(_LOCK_DIRECTORY) / f"aisim-eval-records-{name}.lock"
+    # Read-only and not following links: flock needs no write access, so users who share a directory share the lock.
+    fd = os.open(lock, os.O_RDONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o666)
+    try:
+        deadline = time.monotonic() + _RECORD_LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise ValueError(f"another record writer is publishing into {directory}") from exc
+                time.sleep(0.01)
+        yield
+    finally:
+        os.close(fd)  # closing releases the lock; the file stays, empty, for the next writer
+
+
+def write_record(root: str | Path, record: EvalRecord, *, sidecars: Mapping[str, bytes] | None = None) -> Path:
+    """Write a record by content address. Never overwrites different content.
+
+    A superseding record must name an existing record in the same directory with no other successor.
+    Writing identical content again is a no-op.
+
+    ``sidecars`` maps the path of each linked artifact the record declares (a findings file, which may be named by
+    its hash) to its bytes. They are checked against the declared size and digest and published under the same lock
+    as the record, from staged copies that record discovery cannot see. A hash-named file written beside the
+    records by hand is a record candidate until some record declares it, and a competing writer then reads it as a
+    corrupt record, so two successors of one predecessor cannot both be prepared that way.
+    """
+    path = record_path(root, record)
+    text = json.dumps(record.model_dump(by_alias=True, mode="json"), indent=2, sort_keys=True, allow_nan=False) + "\n"
+    if len(text.encode("utf-8")) > CandidatePolicy().max_json_bytes:
+        raise ValueError(f"JSON exceeds the {CandidatePolicy().max_json_bytes}-byte limit")
+    declared = {a.path: a for a in [*record.truth.artifacts, *record.findings]}
+    for relative, data in (sidecars or {}).items():
+        artifact = declared.get(relative)
+        if artifact is None:
+            raise ValueError(f"sidecar {relative!r} is not an artifact of the record")
+        if len(data) != artifact.bytes or hashlib.sha256(data).hexdigest() != artifact.sha256:
+            raise ValueError(f"sidecar {relative!r} differs from its declared size or digest")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _record_lock(path.parent):
+        return _write_record(path, record, text, dict(sidecars or {}))
+
+
+def _write_record(path: Path, record: EvalRecord, text: str, sidecars: Mapping[str, bytes]) -> Path:
+    for relative, data in sidecars.items():
+        # Every destination is checked before anything is staged or published: a symlinked component would send the
+        # file outside the dataset. Ordinary nested directories stay allowed.
+        existing = checked_path(path.parent, relative)
+        if existing.exists() and existing.read_bytes() != data:
+            raise FileExistsError(f"refusing to overwrite {existing} with different content")
+    if path.exists():
+        if load_record(path) != record:
+            raise FileExistsError(f"refusing to overwrite {path} with different content")
+        _publish_sidecars(path.parent, sidecars, _stage_sidecars(path.parent, sidecars))  # a retry completes them
+        return path
+    if record.supersedes is not None:
+        predecessor = path.parent / f"{record.supersedes}.json"
+        if not predecessor.is_file():
+            raise ValueError(f"superseded record {record.supersedes} not found next to the new record")
+        load_record(predecessor)
+        # The new record is not on disk yet, so its own sidecars (written first) are declared by it.
+        declared = {path.parent / a.path for a in [*record.truth.artifacts, *record.findings]}
+        for existing in _load_all(path.parent, declared):
+            if existing.supersedes == record.supersedes:
+                raise ValueError(f"superseded record {record.supersedes} already has successor {existing.record_id}")
+    staged = _stage_sidecars(path.parent, sidecars)
+    created = False
+    try:
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            os.link(tmp, path)  # fails if another writer created it first
+            created = True
+        except FileExistsError:
+            if load_record(path) != record:
+                raise
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+    except BaseException:
+        for staged_copy in staged.values():
+            staged_copy.unlink(missing_ok=True)
+        raise
+    # The record goes first: it declares its sidecars, so discovery never sees an undeclared hash-named file. If a
+    # sidecar then fails to publish, the record is withdrawn with the sidecars this call linked, so the directory
+    # returns to its state before the call: no successor can be accepted on top of a record whose declared files
+    # are missing, and the whole write can simply be retried.
+    try:
+        _publish_sidecars(path.parent, sidecars, staged)
+    except BaseException:
+        if created:
+            path.unlink(missing_ok=True)
+        raise
+    return path
+
+
+def _stage_sidecars(directory: Path, sidecars: Mapping[str, bytes]) -> dict[str, Path]:
+    """Complete copies of the sidecars under names that discovery ignores (dot-prefixed, never a record name)."""
+    staged: dict[str, Path] = {}
+    try:
+        for relative, data in sidecars.items():
+            target = directory / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+            staged[relative] = Path(tmp)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+    except BaseException:
+        for tmp in staged.values():
+            tmp.unlink(missing_ok=True)
+        raise
+    return staged
+
+
+def _publish_sidecars(directory: Path, sidecars: Mapping[str, bytes], staged: Mapping[str, Path]) -> None:
+    """Link the staged sidecars; on a failure, remove the ones this call linked (an existing identical one stays)."""
+    linked: list[Path] = []
+    try:
+        for relative, tmp in staged.items():
+            try:
+                os.link(tmp, directory / relative)
+                linked.append(directory / relative)
+            except FileExistsError:
+                if (directory / relative).read_bytes() != sidecars[relative]:
+                    raise
+    except BaseException:
+        for path in linked:
+            path.unlink(missing_ok=True)
+        raise
+    finally:
+        for tmp in staged.values():
+            tmp.unlink(missing_ok=True)
+
+
+def load_record(path: str | Path) -> EvalRecord:
+    """Load a record and check its file name equals its content hash.
+
+    The read is bounded (the shared structured-JSON limit), so discovering records among large unrelated
+    JSON files never reads them whole; an oversized file is refused with a ``ValueError``.
+    """
+    path = Path(path)
+    record = EvalRecord.model_validate_json(bounded_json_bytes(path))
+    if path.stem != record.record_id:
+        raise ValueError(f"{path.name}: file name does not match record content hash {record.record_id}")
+    return record
+
+
+def superseded_ids(directory: str | Path) -> set[str]:
+    return {r.supersedes for r in _load_all(directory) if r.supersedes}
+
+
+def current_records(directory: str | Path) -> list[EvalRecord]:
+    """Records no other record supersedes (the current view)."""
+    records = _load_all(directory)
+    gone = {r.supersedes for r in records if r.supersedes}
+    return [r for r in records if r.record_id not in gone]
+
+
+_RECORD_FILENAME = re.compile(r"^[0-9a-f]{64}\.json$")
+
+
+def record_files(directory: str | Path) -> list[Path]:
+    """The content-addressed record files of a directory; manifests and other JSON beside them are not records.
+
+    A content-addressed name that a valid record declares as one of its own artifacts (a findings file may be
+    named by its hash) is that record's sidecar, not a record. Any other such name that fails to load stays listed,
+    so its corrupt content is rejected by the caller instead of being skipped.
+    """
+    return _record_files(directory, frozenset())
+
+
+def _record_files(directory: str | Path, extra_declared: Collection[Path]) -> list[Path]:
+    candidates = sorted(p for p in Path(directory).glob("*.json") if _RECORD_FILENAME.fullmatch(p.name))
+    records: set[Path] = set()
+    declared: set[Path] = set(extra_declared)
+    for path in candidates:
+        try:
+            record = load_record(path)
+        except (OSError, ValueError):
+            continue  # only an explicit artifact declaration can exclude this file
+        records.add(path)
+        declared.update(path.parent / a.path for a in [*record.truth.artifacts, *record.findings])
+    return [p for p in candidates if p in records or p not in declared]
+
+
+def record_paths(directory: str | Path, *, recursive: bool = False) -> list[Path]:
+    """Discover records separately from their declared JSON sidecars.
+
+    Undeclared JSON is still a record candidate, so malformed records fail in the
+    caller. A successfully loaded record is never hidden by an artifact reference.
+    """
+    root = Path(directory)
+    paths = sorted(root.rglob("*.json") if recursive else root.glob("*.json"))
+    records: set[Path] = set()
+    artifacts: set[Path] = set()
+    for path in paths:
+        try:
+            record = load_record(path)
+        except (OSError, ValueError):
+            continue  # only an explicit artifact declaration can exclude this file
+        records.add(path)
+        artifacts.update(path.parent / a.path for a in [*record.truth.artifacts, *record.findings])
+    return [p for p in paths if p in records or p not in artifacts]
+
+
+def _load_all(directory: str | Path, extra_declared: Collection[Path] = ()) -> list[EvalRecord]:
+    # Corrupt content at a valid record filename is still rejected by load_record.
+    return [load_record(p) for p in _record_files(directory, extra_declared)]
+
+
+# --- truth table and metrics ------------------------------------------------
+
+
+def write_truth_table(path: str | Path, rows: list[tuple[str, Mapping[str, JsonValue], float | None]]) -> Artifact:
+    """Write the Parquet truth table and return its Artifact (path = file name)."""
+    table = pa.table(
+        {
+            "case_id": pa.array([r[0] for r in rows], pa.string()),
+            "inputs_json": pa.array([_canonical(dict(r[1])) for r in rows], pa.string()),
+            "truth_value": pa.array([r[2] for r in rows], pa.float64()),
+        }
+    )
+    path = write_parquet(table, path, TRUTH_SCHEMA_ID)
+    data = path.read_bytes()
+    return Artifact(
+        artifact_id="truth-table",
+        path=path.name,
+        role="truth-table",
+        format="parquet",
+        schema=TRUTH_SCHEMA_ID,
+        sha256=hashlib.sha256(data).hexdigest(),
+        bytes=len(data),
+        rows=len(rows),
+    )
+
+
+def _quantile(sorted_values: list[float], q: float) -> float:
+    pos = (len(sorted_values) - 1) * q
+    lo, hi = math.floor(pos), math.ceil(pos)
+    return sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * (pos - lo)
+
+
+def compute_results(
+    cases: list[tuple[str, float | None, float | None]],
+    exclusions: list[Exclusion] | None = None,
+    **separate_fields: dict[str, JsonValue] | None,
+) -> Results:
+    """Score ``(case_id, truth, predicted)`` rows. Rows lacking either value are excluded.
+
+    Pure and deterministic; used by both the producer and the verifier.
+    """
+    excluded = {e.case_id: e for e in exclusions or []}
+    errors: list[tuple[str, float, float, float]] = []
+    for case_id, truth, predicted in cases:
+        if case_id in excluded:
+            continue
+        if (
+            truth is None
+            or not math.isfinite(truth)
+            or predicted is None
+            or not math.isfinite(predicted)
+            or not truth > 0
+        ):
+            reason = "missing truth" if truth is None else "missing prediction"
+            if truth is not None and predicted is not None and math.isfinite(predicted):
+                reason = "non-positive truth"
+            if truth is not None and not math.isfinite(truth):
+                reason = "non-finite truth"
+            excluded[case_id] = Exclusion(case_id=case_id, reason=reason)
+            continue
+        residual = (predicted - truth) / truth * 100.0
+        if not math.isfinite(residual):
+            excluded[case_id] = Exclusion(case_id=case_id, reason="non-finite residual")
+            continue
+        errors.append((case_id, truth, predicted, residual))
+    n_total = len(cases)
+    n_scored = len(errors)
+    if errors:
+        mape = round(sum(abs(e[3]) for e in errors) / n_scored, ROUND_DIGITS)
+        signed = sorted(e[3] for e in errors)
+        quantiles = {f"p{round(q * 100)}": round(_quantile(signed, q), ROUND_DIGITS) for q in QUANTILES}
+    else:
+        mape, quantiles = None, None
+    worst = sorted(errors, key=lambda e: (-abs(e[3]), e[0]))[:WORST_N]
+    return Results(
+        n_total=n_total,
+        n_scored=n_scored,
+        mape_pct=mape,
+        residual_quantiles_pct=quantiles,
+        worst_n=[
+            Outlier(case_id=c, truth=t, predicted=p, rel_error_pct=round(r, ROUND_DIGITS)) for c, t, p, r in worst
+        ],
+        coverage=round(n_scored / n_total, ROUND_DIGITS) if n_total else None,
+        exclusions=sorted(excluded.values(), key=lambda e: e.case_id),
+        **separate_fields,
+    )
+
+
+# --- verifier ---------------------------------------------------------------
+
+
+class VerificationReport(BaseModel):
+    ok: bool
+    problems: list[str]
+    record_id: Digest | None = None  # content actually checked, including claims and predictor identity
+    recomputed: Results | None = None
+    # The checked truth rows: case_id -> canonical JSON of that case's inputs, from the bytes that passed the digest
+    # check. Consumers that need per-case facts (required cases) use this, never a second read of the table.
+    case_inputs: dict[str, str] = Field(default_factory=dict)
+
+
+def _close(a: float | None, b: float | None) -> bool:
+    if a is None or b is None:
+        return a is b
+    return math.isclose(a, b, rel_tol=REL_TOL, abs_tol=1e-6)
+
+
+def verify_record(
+    record: EvalRecord,
+    truth_root: str | Path,
+    predict: Callable[[Mapping[str, JsonValue]], float | None],
+    current_fingerprint: str,
+) -> VerificationReport:
+    """Recompute the prediction side from recorded truth and compare claimed numbers.
+
+    ``predict`` maps one truth row's inputs to a predicted value (None when the
+    model cannot predict). ``current_fingerprint`` is the fingerprint of the
+    predictor the caller built; recomputation is only meaningful when it equals
+    the record's. GPU-free and deterministic. ``truth_root`` is the directory
+    that holds the truth artifacts by their ``path``.
+    """
+    # The predictor is caller code and may mutate the original record, including nested fields.
+    # Bind all checks and the report ID to the same private pre-prediction snapshot.
+    record = record.model_copy(deep=True)
+    problems: list[str] = []
+    checked_id = record.record_id
+    if current_fingerprint != record.prediction.fingerprint:
+        return VerificationReport(
+            record_id=record.record_id, ok=False, problems=["predictor fingerprint differs from the record's"]
+        )
+    table_art = next(a for a in record.truth.artifacts if a.artifact_id == record.truth.truth_table_artifact_id)
+    path = Path(truth_root) / table_art.path
+    if not path.is_file():
+        return VerificationReport(
+            record_id=record.record_id, ok=False, problems=[f"truth table missing: {table_art.path}"]
+        )
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != table_art.sha256 or len(data) != table_art.bytes:
+        return VerificationReport(
+            record_id=record.record_id, ok=False, problems=["truth table hash or size differs from record"]
+        )
+    # Decode the bytes the digest covered, not a second read of the path (it could be replaced in between).
+    table = read_parquet(pa.BufferReader(data), TRUTH_SCHEMA_ID)
+    if tuple(table.column_names) != TRUTH_COLUMNS:
+        return VerificationReport(
+            record_id=record.record_id, ok=False, problems=[f"truth table columns {table.column_names}"]
+        )
+    ids = table.column("case_id").to_pylist()
+    if len(set(ids)) != len(ids):
+        return VerificationReport(record_id=record.record_id, ok=False, problems=["duplicate case_id in truth table"])
+    truths = table.column("truth_value").to_pylist()
+    cases = []
+    case_inputs: dict[str, str] = {}
+    for case_id, inputs_json, truth in zip(ids, table.column("inputs_json").to_pylist(), truths, strict=True):
+        try:
+            inputs = json.loads(inputs_json)
+        except (TypeError, ValueError):
+            inputs = None
+        if not isinstance(inputs, Mapping):
+            # A data defect in the truth table is a failed verification, never an exception for the caller.
+            return VerificationReport(
+                record_id=record.record_id,
+                ok=False,
+                problems=[f"truth row {case_id!r} has no valid inputs_json object"],
+            )
+        case_inputs[case_id] = json.dumps(inputs, sort_keys=True, separators=(",", ":"))
+        cases.append((case_id, truth, predict(inputs)))
+    # Derive exclusions from the checked truth and this predictor. A producer cannot remove a valid error
+    # from the aggregate by labeling its case excluded.
+    got = compute_results(cases)
+    excluded_ids = {e.case_id for e in got.exclusions}
+    unjustified = [e.case_id for e in record.results.exclusions if e.case_id not in excluded_ids]
+    if unjustified:
+        problems.append(f"exclusions not justified by recomputation: {unjustified[:3]}")
+    claimed = record.results
+    for name in ("n_total", "n_scored"):
+        if getattr(got, name) != getattr(claimed, name):
+            problems.append(f"{name}: claimed {getattr(claimed, name)}, recomputed {getattr(got, name)}")
+    for name in ("mape_pct", "coverage"):
+        if not _close(getattr(got, name), getattr(claimed, name)):
+            problems.append(f"{name}: claimed {getattr(claimed, name)}, recomputed {getattr(got, name)}")
+    gq, cq = got.residual_quantiles_pct, claimed.residual_quantiles_pct
+    if (gq is None) != (cq is None) or (gq and (gq.keys() != cq.keys() or not all(_close(gq[k], cq[k]) for k in gq))):
+        problems.append(f"residual_quantiles_pct: claimed {cq}, recomputed {gq}")
+    if [o.case_id for o in got.worst_n] != [o.case_id for o in claimed.worst_n]:
+        problems.append("worst_n case ordering differs from recomputation")
+    elif not all(
+        _close(a.truth, b.truth) and _close(a.predicted, b.predicted) and _close(a.rel_error_pct, b.rel_error_pct)
+        for a, b in zip(got.worst_n, claimed.worst_n, strict=True)
+    ):
+        problems.append("worst_n values differ from recomputation")
+    return VerificationReport(
+        ok=not problems, problems=problems, record_id=checked_id, recomputed=got, case_inputs=case_inputs
+    )
+
+
+def attest(record: EvalRecord, report: VerificationReport, tier: Tier = "verified") -> EvalRecord:
+    """Build the superseding record that promotes a successfully verified one.
+
+    The original is untouched; the new record has its own content hash.
+    """
+    if not report.ok:
+        raise ValueError(f"cannot promote a record that failed verification: {report.problems}")
+    if report.record_id != record.record_id:
+        raise ValueError("verification report belongs to different record content")
+    if tier == "submitted":
+        raise ValueError("attest promotes to verified or qualified")
+    if TIER_RANK.get(tier, len(TIER_RANK)) < TIER_RANK.get(record.tier, 0):
+        # The successor supersedes the record, so a lower tier would hide it from the current view.
+        raise ValueError(f"cannot demote a {record.tier} record to {tier}")
+    if record.status != "complete":
+        raise ValueError("only complete records can be promoted")
+    doc = record.model_dump(by_alias=True)
+    doc.update(
+        tier=tier,
+        supersedes=record.record_id,
+        verification={
+            "verifier_version": VERIFIER_VERSION,
+            "recomputed_fingerprint": record.prediction.fingerprint,
+            "verified_record_id": record.record_id,
+        },
+    )
+    return EvalRecord.model_validate(doc)
+
+
+__all__ = [
+    "EVAL_SCHEMA_ID",
+    "EvalRecord",
+    "GpuTime",
+    "attest",
+    "check_record_gpu_time",
+    "compute_results",
+    "current_records",
+    "gpu_time_ok",
+    "load_record",
+    "prediction_fingerprint",
+    "record_id",
+    "verify_record",
+    "write_record",
+    "write_truth_table",
+]

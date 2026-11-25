@@ -1,5 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2023-2024 SGLang Team
 // SPDX-License-Identifier: Apache-2.0
+// Cache-salt behavior adapted from SGLang v0.5.22; see THIRD_PARTY_NOTICES.md.
+// Source: https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
 
 //! Commands and effects exchanged with one scheduler rank.
 
@@ -81,6 +84,10 @@ pub struct Request {
     /// Optional session attribution; does not affect scheduling or cache identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// SGLang cache namespace; empty is equivalent to absent. Other backends
+    /// reject nonempty salts before accepting the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_salt: Option<String>,
     /// Image placeholders inside `tokens`, in prompt order; empty for text-only requests.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageSpec>,
@@ -181,7 +188,7 @@ pub enum TtftMilestone {
 pub struct KvBlock {
     /// Sequence-aware block hash.
     pub block_hash: u64,
-    /// Token-only local block hash.
+    /// Local block hash, including the request's cache namespace when present.
     pub tokens_hash: u64,
     /// Token IDs retained only when explicitly configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -207,6 +214,9 @@ pub struct StoredBlocks {
     /// Session of the request making these blocks visible, not exclusive ownership.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Namespace used to derive these blocks' identities; absent for unsalted requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_salt: Option<String>,
 }
 
 /// Runtime-neutral KV event payload.
@@ -226,14 +236,39 @@ pub enum KvEventTier {
     /// Device (G1) KV cache. Omitted from serialized events.
     #[default]
     Device,
-    /// The native G2 host cache reachable by the publishing rank: its private
-    /// `dp_rank_local` cache or a `cluster_shared` pool.
+    /// Host memory. In the worker domain, the native G2 host cache reachable
+    /// by the publishing rank: its private `dp_rank_local` cache or a
+    /// `cluster_shared` pool. In the cache-owner domain, the rank's
+    /// KVCR-owned memory (`kvcr.local_g2`).
     HostPinned,
+    /// The rank's KVCR-owned disk cache (`kvcr.g3`), in the cache-owner domain.
+    Disk,
 }
 
 impl KvEventTier {
     fn is_device(&self) -> bool {
         *self == Self::Device
+    }
+}
+
+/// Who owns the cache whose residency a [`KvEvent`] describes, apart from
+/// its [`KvEventTier`]: Dynamo's `ResidencyDomain`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KvEventDomain {
+    /// The engine worker's own cache: G1 or its G2. Omitted from serialized
+    /// events.
+    #[default]
+    Worker,
+    /// A cache owner beside the worker, which serves the publishing rank and
+    /// its peers on its own: the rank's KVCR store (`kvcr.local_g2`,
+    /// `kvcr.g3`).
+    CacheOwner,
+}
+
+impl KvEventDomain {
+    fn is_worker(&self) -> bool {
+        *self == Self::Worker
     }
 }
 
@@ -249,6 +284,9 @@ pub struct KvEvent {
     /// Residency tier; absent means [`KvEventTier::Device`].
     #[serde(default, skip_serializing_if = "KvEventTier::is_device")]
     pub tier: KvEventTier,
+    /// Residency domain; absent means [`KvEventDomain::Worker`].
+    #[serde(default, skip_serializing_if = "KvEventDomain::is_worker")]
+    pub domain: KvEventDomain,
 }
 
 /// First-admission provenance for prompt tokens reused across cache tiers.
@@ -353,6 +391,9 @@ pub struct Metrics {
     pub kv_cache_used_bytes: Option<u64>,
     /// Physical grouped-cache capacity; absent for the legacy linear pool.
     pub kv_cache_capacity_bytes: Option<u64>,
+    /// Cached grouped-cache bytes that no request holds; present only with
+    /// grouped prefix caching.
+    pub kv_cache_cached_bytes: Option<u64>,
     /// Byte occupancy for grouped caches; otherwise `active_blocks / total_blocks`.
     pub cache_usage: f64,
     /// Physical resident fraction. This includes inactive reusable vLLM blocks
@@ -517,6 +558,7 @@ pub struct PassCompletionEffects {
 #[doc(hidden)]
 pub struct PendingPass {
     pub(crate) started_at_ms: f64,
+    pub(crate) end_without_selection_ms: Option<f64>,
     pub(crate) effects: PassCompletionEffects,
 }
 

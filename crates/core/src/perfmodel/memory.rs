@@ -16,16 +16,16 @@
 //! ALL of the work -- fraction + tolerance validation, HF-config parsing, the
 //! AIC backend memory model, the OfFree/OfTotal budget math, the naive heuristic
 //! fallback, AND the tolerance margin -- lives in
-//! `aisimulate.sdk.memory.estimate_kv_cache`. The Rust side:
+//! `aisim.sdk.memory.estimate_kv_cache`. The Rust side:
 //!
-//! 1. crosses into Python once (`with_gil → import → call estimate_kv_cache →
+//! 1. crosses into Python once (`attach → import → call estimate_kv_cache →
 //!    extract dict`), forwarding `tolerance_fraction` through;
 //! 2. rebuilds a [`KvCacheEstimate`] from that dict (including
 //!    `tolerance_adjusted`), with no math of its own.
 //!
 //! The two budget formulas (TRT-LLM free-fraction vs vLLM/SGLang total-fraction),
 //! the naive fallback, and the tolerance margin all live on the Python side; see
-//! the docstring of `aisimulate.sdk.memory.estimate_kv_cache`. The
+//! the docstring of `aisim.sdk.memory.estimate_kv_cache`. The
 //! [`KvCacheMemoryFraction`] enum still encodes the backend↔fraction XOR so the
 //! request shape is unambiguous; the variant is validated against
 //! `engine.backend` in Python.
@@ -223,7 +223,7 @@ impl std::error::Error for KvCacheEstimateError {}
 /// Estimate KV-cache memory (raw estimate + optional tolerance margin).
 ///
 /// Pure forwarder: crosses into Python once to compute the COMPLETE estimate. The
-/// Python `aisimulate.sdk.memory.estimate_kv_cache` does the backend↔fraction
+/// Python `aisim.sdk.memory.estimate_kv_cache` does the backend↔fraction
 /// and tolerance validation, the native AIC memory breakdown + budget math, the
 /// naive heuristic fallback, AND the tolerance margin (`tolerance_adjusted`); the
 /// Rust side rebuilds a [`KvCacheEstimate`] from the returned dict with no math
@@ -243,8 +243,8 @@ pub fn estimate_kv_cache(
 
 /// Cross into Python once to compute the complete estimate.
 ///
-/// Mirrors the `AicEngineBuilder` → `compile_engine` crossing: `with_gil →
-/// import aisimulate.sdk.memory → call estimate_kv_cache(...) → extract
+/// Mirrors the `AicEngineBuilder` → `compile_engine` crossing: `attach →
+/// import aisim.sdk.memory → call estimate_kv_cache(...) → extract
 /// the returned dict`. `tolerance_fraction` is forwarded; the Python fn applies
 /// the tolerance and returns `tolerance_adjusted` in the dict.
 #[cfg(feature = "python")]
@@ -256,8 +256,8 @@ fn fetch_python_estimate(
 
     let engine = &req.engine;
 
-    Python::with_gil(|py| -> PyResult<KvCacheEstimate> {
-        let engine_mod = py.import("aisimulate.sdk.memory")?;
+    Python::attach(|py| -> PyResult<KvCacheEstimate> {
+        let engine_mod = py.import("aisim.sdk.memory")?;
         let kwargs = estimate_kwargs(py, req)?;
         if engine.extra.contains_key("fpm_profile") {
             for (name, mode) in crate::py::fpm_profile_quantization(py, engine)? {
@@ -473,7 +473,7 @@ mod tests {
     use super::*;
 
     // Tolerance validation + application and the native/naive budget math now
-    // live entirely in Python (`aisimulate.sdk.memory.estimate_kv_cache`),
+    // live entirely in Python (`aisim.sdk.memory.estimate_kv_cache`),
     // exercised by `tests/unit/sdk/test_memory_estimation.py` and the integration
     // parity test. The Rust side is a pure forwarder; the only pure-Rust unit
     // left here is the memory-fraction wire mapping. The dict round-trip
@@ -583,7 +583,7 @@ mod tests {
     fn profile_memory_preserves_exact_quantization_and_rejects_wire_conflicts() {
         use crate::DataType;
 
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         for (gemm_mode, weight_dtype, moe_mode, moe_dtype) in [
             ("fp8_block", DataType::Fp8Block, "nvfp4", DataType::Nvfp4),
             ("int8_wo", DataType::Int8, "nvfp4", DataType::Nvfp4),
@@ -641,8 +641,8 @@ mod tests {
         use pyo3::prelude::*;
         use pyo3::types::{PyDict, PyDictMethods};
 
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
             let out = PyDict::new(py);
             out.set_item("total_kv_size_tokens", py.None()).unwrap();
             let error = estimate_from_dict(out.as_any()).unwrap_err();
@@ -656,13 +656,13 @@ mod tests {
         use pyo3::prelude::*;
         use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods};
 
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let mut req = python_forwarding_request();
         req.engine.extra.insert(
             "fpm_profile".into(),
             serde_json::json!({"model": "test-model"}).to_string(),
         );
-        Python::with_gil(|py| -> PyResult<()> {
+        Python::attach(|py| -> PyResult<()> {
             let kwargs = estimate_kwargs(py, &req)?;
             assert_eq!(
                 kwargs
