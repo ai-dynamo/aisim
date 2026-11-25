@@ -238,7 +238,9 @@ without materializing the Cartesian product. Exhausting a finite space ends the 
 before `max_trials`; the summary says so.
 
 For `min_gpus`, both algorithms use this coverage order with the smallest legal GPU counts
-first; the Bayesian samplers do not otherwise favor small shapes. Once a candidate qualifies with
+first, including across prefill-interval and other conditional arms; a larger topology in one
+arm cannot hide a smaller legal preset in another. The Bayesian samplers do not otherwise
+favor small shapes. Once a candidate qualifies with
 `n` provisioned GPUs (including any encoder pool), backend/topology pairs whose topology alone
 needs more than `n` GPUs are not suggested or retried again, across every conditional arm of the
 branch, and the remaining budget revisits scheduler/workload knobs within that bound. Pairs
