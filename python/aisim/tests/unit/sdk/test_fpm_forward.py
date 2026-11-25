@@ -978,8 +978,10 @@ class TestFPMStaticAndMixed:
         # Two requests each need 1096 fresh tokens. XPU reserves one decode
         # token: budget 1096 queries a 1095-token chunk then a one-token tail;
         # budget 1097 fits one suffix. Synthetic native rows price these at
-        # 12/4 ms plus a 3-2=1 ms marginal decoder. Mixed FPM energy is
-        # deliberately unavailable (AISIM-1973 D10). Powered decode-only
+        # 12/4 ms plus a 3-2=1 ms marginal decoder. Schema-eight energy
+        # prices prefills at 300 W and the marginal decoder at 450 W:
+        # four chunks * ((12+4)/2 * 300 + 450) = 11400 W-ms, or
+        # two chunks * (12 * 300 + 450) = 8100 W-ms. Decode-only
         # steps cost 3 ms * 450 W: zero or two such steps, hence 0/2700 W-ms.
         rows = [
             _row("prefill", 1, tokens, past, ms, model_path=model.model_path, identity=identity)
@@ -1000,7 +1002,7 @@ class TestFPMStaticAndMixed:
         assert scheduling["mix_step_latency_ms"] == pytest.approx(step_ms)
         groups = summary.get_aggregate_energy_breakdown()
         assert groups["mix_step"].latency_ms == pytest.approx(2 * chunks * step_ms)
-        assert groups["mix_step"].energy_wms == 0.0
+        assert groups["mix_step"].energy_wms == pytest.approx(11400.0 if chunks == 2 else 8100.0)
         assert groups["genonly_step"].energy_wms == pytest.approx(decode_energy)
 
     @pytest.mark.parametrize(

@@ -5879,7 +5879,10 @@ pub(crate) mod tests {
             vec![qualified_mamba(false, 4)],
         );
         spec.engine.database_mode = DatabaseMode::Sol;
-        let engine = Engine::build(spec.clone(), build_engine(None).db).unwrap();
+        let mut db = Arc::try_unwrap(build_engine(None).db)
+            .unwrap_or_else(|_| panic!("test database is shared"));
+        db.database_mode = DatabaseMode::Sol;
+        let engine = Engine::build(spec.clone(), Arc::new(db)).unwrap();
         let (shared, _, _) = engine
             .mixed_step_breakdown_per_op(140, 2, 100, 8, 60, 1.0, 1.0)
             .unwrap();
@@ -9195,10 +9198,17 @@ pub(crate) mod tests {
         });
         let spec = EngineSpec::new(config, vec![composite], vec![generation; 3]);
         let engine = Engine::from_spec_bytes(&spec.to_bincode().unwrap(), &systems_root()).unwrap();
-        let (shared, prefill, decode, _, _) = engine
+        let (shared, prefill, decode, covered, _) = engine
             .mixed_step_breakdown_per_op_with_metadata(1, 1, 2, 2, 0, 1.0, 1.0)
             .unwrap();
-        assert_eq!(covered_latency_ms, None);
+        let expected_covered: f64 = shared
+            .iter()
+            .chain(&prefill)
+            .chain(&decode)
+            .filter(|row| row.2 > 0.0)
+            .map(|row| row.1)
+            .sum();
+        assert_eq!(covered, expected_covered);
         assert!(shared.is_empty());
         for (rows, phase) in [(&prefill, "context"), (&decode, "generation")] {
             assert_eq!(rows.len(), 1);

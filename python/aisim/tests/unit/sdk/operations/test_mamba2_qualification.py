@@ -904,5 +904,5 @@ def test_generation_only_qualification_rejects_shared_u32_overflow():
     # 4_294_967_292 packed decode positions fit; three more reach u32::MAX.
     # Eight prefill positions must reject, never silently saturate the norm.
     assert estimate(3) > 0
-    with pytest.raises(ValueError, match="shared tokens overflow"):
+    with pytest.raises(ValueError, match="decode tokens beside the new prefill tokens overflow"):
         estimate(8)

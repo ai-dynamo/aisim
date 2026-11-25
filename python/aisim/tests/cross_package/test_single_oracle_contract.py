@@ -100,6 +100,11 @@ OPERATIONS_DEF_INVENTORY = {
     "base.py": frozenset(
         {
             "OpShellKit._cache_key",
+            # Version the Python-owned draft-width marker using the native
+            # mutation clock. These accessors compute no performance values.
+            "OpShellKit._draft_token_width",
+            "OpShellKit._draft_token_width.deleter",
+            "OpShellKit._draft_token_width.setter",
             "OpShellKit._engine_query",
             "OpShellKit._engine_query_is_context",
             "OpShellKit._engine_query_plan",

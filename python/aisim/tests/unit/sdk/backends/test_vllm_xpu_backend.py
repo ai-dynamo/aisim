@@ -814,11 +814,11 @@ def test_batched_ttft_prices_native_uncached_chunks(
     assert ttft == pytest.approx(expected, rel=1e-9)
     prompt_budget = budget - 2 * width
     full, partial = divmod(prompt_budget, 4096)
-    scheduled = prompt_budget if generation_only else full * 4096 + min(partial, 4096 - prefix)
+    scheduled = full * 4096 + min(partial, 4096 - prefix)
     # A completed qualified suffix uses whole-prompt coordinates so its
-    # attention is not divided by a fictitious chunk count. Generation-only
-    # qualification retains legacy prefill coordinates.
-    scheduled_coordinate = 4096 if not generation_only and scheduled == 4096 - prefix else scheduled
+    # attention is not divided by a fictitious chunk count. Qualification in
+    # either phase selects the same bounded prefill coordinates.
+    scheduled_coordinate = 4096 if scheduled == 4096 - prefix else scheduled
     assert calls[0] == (4096, prefix, scheduled_coordinate, 2)
     assert estimates[0].num_decode_query_tokens == 2 * width
     # Uncached prefill plus packed decode stays within the scheduler capacity.

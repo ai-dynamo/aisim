@@ -2059,7 +2059,7 @@ class BaseBackend:
                 raise _UnsupportedVisualMambaPrefill(
                     "qualified Mamba with chunked visual prefill is unsupported in run_agg"
                 )
-        if not _is_fpm_model(model) and _has_qualified_mamba(model, phases=("context_ops",)):
+        if not _is_fpm_model(model) and _has_qualified_mamba(model):
             isl = runtime_config.isl + self._visual_context_tokens(model, runtime_config)
             if isl > runtime_config.prefix:
                 prefill_slots = max(1, runtime_config.batch_size - step.num_decode_requests)
@@ -2243,7 +2243,7 @@ class BaseBackend:
         ttft_ctx_tokens = ctx_tokens
         ttft_steps_to_finish_ctx = steps_to_finish_ctx
         prefill_chunks = None
-        qualified_prefill = b > 1 and not _is_fpm_model(model) and _has_qualified_mamba(model, phases=("context_ops",))
+        qualified_prefill = b > 1 and not _is_fpm_model(model) and _has_qualified_mamba(model)
         num_mix_steps = num_genonly_steps = 0
         num_mix_steps_for_tpot_calc = 0  # correction for tpot calc only
         if b > 1:

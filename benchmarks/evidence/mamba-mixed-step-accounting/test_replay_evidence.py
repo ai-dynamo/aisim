@@ -19,7 +19,17 @@ def test_canonical_replay_samples_match_report():
     companion = ROOT / report["raw_requests"]["path"]
     assert hashlib.sha256(companion.read_bytes()).hexdigest() == report["raw_requests"]["sha256"]
     raw = json.loads(gzip.decompress(companion.read_bytes()))
-    assert report["driver_sha256"] == hashlib.sha256((ROOT / "canonical_mtp_perf.py").read_bytes()).hexdigest()
+    # This historical evidence predates only the ambient-input guard. Recover
+    # its exact source bytes; any further driver change must still fail this
+    # digest check rather than silently relabel the recorded measurements.
+    driver = (ROOT / "canonical_mtp_perf.py").read_bytes()
+    guard = (
+        b'if "AICONFIGURATOR_MODEL_CONFIGS_PATH" in os.environ:\n'
+        b'    sys.exit("AICONFIGURATOR_MODEL_CONFIGS_PATH must be unset for canonical provenance")\n'
+    )
+    assert driver.count(guard) == 1
+    recorded_driver = driver.replace(guard, b"", 1)
+    assert report["driver_sha256"] == hashlib.sha256(recorded_driver).hexdigest()
     assert report["host"]["cpu"] and report["host"]["machine"] and report["host"]["python"]
     assert report["env_overrides"] == {"AIC_ALLOW_UNLISTED_VERSIONS": "1"}
     assert len(report["rounds"]) == 6

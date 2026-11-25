@@ -78,13 +78,21 @@ def _model_config(speculation=None) -> ModelConfig:
     )
 
 
-def _fake_model(nextn: int = 0, spec_scheme=None, speculation=None):
+def _fake_model(nextn: int = 0, spec_scheme=None, speculation=None, *, native_ops=False):
     model = SimpleNamespace()
     model.model_path = "test-model"
     model._nextn = nextn
     model.encoder_ops = []
     model.context_ops = [_RecordingOp("context_attention", 11.0)]
     model.generation_ops = [_RecordingOp("generation_attention", 2.0)]
+    if native_ops:
+        # Identity includes the compiled graph. Use independently allocated,
+        # serializable ops to test content equality, rather than unsupported
+        # recording doubles whose identities deliberately include object ids.
+        from aisim_core.sdk.operations import ElementWise
+
+        model.context_ops = [ElementWise("context_attention", 1, 11, 0)]
+        model.generation_ops = [ElementWise("generation_attention", 1, 2, 0)]
     model.get_resident_weights_bytes = lambda: sum(op.get_weights() for op in model.context_ops)
     model.get_additional_activation_bytes = lambda num_tokens: 0.0
     model.config = _model_config(speculation=speculation)
@@ -141,11 +149,12 @@ class _FakeDraftScheme(NullScheme):
 @pytest.mark.unit
 class TestGoldenEquivalence:
     def test_legacy_and_explicit_mtp_share_engine_state(self):
-        legacy = _fake_model(nextn=2)  # spec_scheme derived: MTPScheme(2)
+        legacy = _fake_model(nextn=2, native_ops=True)  # spec_scheme derived: MTPScheme(2)
         explicit = _fake_model(
             nextn=2,
             spec_scheme=MTPScheme(depth=2),
             speculation=SpeculationConfig(kind="mtp", params={"depth": 2}),
+            native_ops=True,
         )
 
         # Materialization must be a no-op for MTP: the legacy nextn contract
@@ -311,11 +320,12 @@ class TestMemoryAndRouting:
 
     def test_engine_identity_keyed_by_speculation_config(self):
         db = _database()
-        plain = _fake_model(nextn=0)
+        plain = _fake_model(nextn=0, native_ops=True)
         eagle = _fake_model(
             nextn=0,
             spec_scheme=NullScheme(),  # identity comes from the config, not the scheme object
             speculation=SpeculationConfig(kind="eagle3", params={"num_speculative_tokens": 5}),
+            native_ops=True,
         )
         # Same widths, different speculation content -> different engines.
         assert _engine_config_json(plain, db) != _engine_config_json(eagle, db)
@@ -325,6 +335,7 @@ class TestMemoryAndRouting:
             nextn=0,
             spec_scheme=NullScheme(),
             speculation=SpeculationConfig(kind="eagle3", params={"num_speculative_tokens": 5}),
+            native_ops=True,
         )
         assert _engine_config_json(eagle, db) == _engine_config_json(eagle2, db)
         payload = json.loads(_engine_config_json(eagle, db))

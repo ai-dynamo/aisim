@@ -707,7 +707,7 @@ def test_native_decode_bridge_retains_coverage_of_folded_powered_pair():
     from aisim_core.sdk.perf_database import get_database_view
 
     model = get_model("Qwen/Qwen3-0.6B", ModelConfig(tp_size=1), "vllm")
-    database = get_database_view("b200_sxm", "vllm", "0.22.0", database_mode="HYBRID")
+    database = get_database_view("b200_sxm", "vllm", "0.22.0", database_mode="HYBRID", allow_unlisted_version=True)
     # The checked-in vLLM attention row carries measured power; the norm's
     # empirical estimate has none. Calibrate repetitions with independent
     # single-op native queries to obtain the requested exact 3/7 ms split.
@@ -717,10 +717,11 @@ def test_native_decode_bridge_retains_coverage_of_folded_powered_pair():
     model.context_ops = []
     model.generation_ops = [powered, unpowered]
     handle = rust_engine_step._cached_engine_handle(model, database)
-    queries = handle.evaluate_generation_ops([0, 1], batch_size=8, s=2050)
-    assert queries[0][2] > 0 and queries[1][2] == 0
-    powered._scale_factor *= 3.0 / queries[0][1]
-    unpowered._scale_factor *= 7.0 / queries[1][1]
+    powered_query = handle.evaluate_generation_ops([0], batch_size=8, s=2050)[0]
+    unpowered_query = handle.evaluate_generation_ops([1], batch_size=8, s=2050)[0]
+    assert powered_query[2] > 0 and unpowered_query[2] == 0
+    powered._scale_factor *= 3.0 / powered_query[1]
+    unpowered._scale_factor *= 7.0 / unpowered_query[1]
     result = rust_engine_step._estimate_decode_step_with_rust(model, database, gen_tokens=8, isl=2048, osl=2)
     assert result.latency_ms == pytest.approx(10.0)
     assert result.covered_latency_ms == pytest.approx(3.0)

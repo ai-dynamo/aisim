@@ -9569,7 +9569,9 @@ mod tests {
         // detailed route. Both must satisfy these values independently.
         for capture in [false, true] {
             for _ in 0..2 {
-                let priced = timing.price_iteration(pricing, &queries, capture).unwrap();
+                let priced = timing
+                    .price_iteration(pricing, &queries, capture, &[])
+                    .unwrap();
                 assert!(close(priced.total_ms, 25.5), "{}", priced.total_ms);
                 assert!(close(priced.wait_ms, 40.5), "{}", priced.wait_ms);
                 assert_eq!(priced.estimate.is_some(), capture);

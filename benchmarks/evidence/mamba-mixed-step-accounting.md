@@ -2082,3 +2082,83 @@ turns the latter into covered work. This adds one scalar accumulator per
 decode pass and no retained per-request state. The completed-prefill fix
 changes query coordinates without adding native calls; count reporting and
 list alias preservation add constant-time work only.
+
+### November 25 scoped review repair
+
+The scoped correction starts at `c97486d4a4331aa926c0fcd994d686a0b2f671b9`
+and integrates main `2fa6dc1b9c51c3c698103b261c803712188760e3`.
+The additional boundary cases establish these independently explained results:
+
+- Batch two, ISL 16, OSL 8 and verification width four at total budget four
+  admit no mixed decoders. All seven remaining decode iterations run after
+  prefill; the aggregate no longer charges zero generation work.
+- At cold prefill budget 4097, a width-four decoder leaves 4093 fresh slots.
+  The native anchors are `(4093, prefix 0)` and `(3, prefix 4093)`, priced by
+  invented exact FPM rows at 22 and 6 ms. Their mean is 14 ms. Width one
+  completes all 4096 tokens in one chunk at the same budget.
+- Qualification in either phase selects the bounded prefill split. For
+  ISL 100, prefix 60, capacity 140 and two width-four decoders, shared work
+  covers 40 + 40 + 8 = 88 positions. A scheduled partial extend of 50
+  tokens is rejected because the suffix has only 40. Aggregate capacity
+  is normalized before pricing, including generation-only qualification;
+  the earlier generation-only legacy-coordinate control is superseded.
+- A native powered 3 ms attention query and unpowered 7 ms norm with the
+  same name fold to 10 ms, while native coverage remains 3 ms through the
+  Python bridge. Separate native single-op queries calibrate repetitions;
+  the coverage scalar is not supplied by a fake.
+
+Replay rejects non-unit `decode_speedup_ratio` for qualified prefill graphs
+at construction. The AR regression checks rejection independently of MTP's
+existing restriction, and checks the unit-ratio price of heterogeneous
+one-token and sixteen-token chunks against 17 activation transfers and two
+physical state transfers. Invalid qualified recurrent-state dimensions fail
+validation, and the unused balanced group at `u32::MAX` cannot overflow.
+
+Cache invalidation still uses a constant-time native epoch check on warm
+queries. Draft-width assignment/deletion advances that clock only when the
+marker changes. Iterable graph edits advance the list revision for each
+installed item, retaining linear edit cost and a final invalidation on failure;
+only self-extension needs a snapshot. These edits happen during graph changes,
+not unchanged predictions. Aggregate count/provenance fixes add scalar work
+per summary miss. Extending qualified capacity normalization to the generation
+phase scans that phase during scheduling, retains no additional graph copy,
+and avoids pricing invalid partial chunks. These are source-level cost bounds,
+not new host-speed or serving-accuracy measurements.
+
+The timing driver now performs all 200 cache-hit calls even with optimized
+Python, and the canonical replay driver rejects ambient model-config overrides
+before collecting provenance. Historical replay samples retain their original
+hashes: their audit reconstructs the exact pre-guard driver bytes and verifies
+the recorded digest, rather than relabeling the old measurement as a new run.
+
+Validation used Python 3.12.12 and Rust 1.91.1. The optimized wheel was built
+before native parity with `maturin build --profile ci --locked`, inheriting
+release optimization with LTO disabled and 16 codegen units to fit the 5 GiB
+container. Its 277 embedded native-source digests and installed SDK Python
+files match the corrected source. Native SHA256:
+`071c11c4d74d08ecdffb8de9def9e8296ba880f37f67f1643ae77087f191105a`.
+
+The seven affected SDK modules and evidence tests passed all 817 cases.
+Both required parity modules plus the single-oracle contract passed all 400
+cases without changing numerical goldens. Rust `cargo test --lib --locked
+--features embed-python mamba` passed 72 cases with overflow checks enabled;
+the merged mixed-composite coverage and powered FPM evidence regressions each
+passed separately. Ruff, formatting, documentation links, packaged legal
+files and copyright checks passed.
+
+All data stayed local. Explicit historical-version SDK tests used tables
+archived from the starting commit. Parity used main's last committed tables
+at `1e321d5848ffc09dc7686cbc819eaf3dc5f52eac`, before their externalization,
+converted with the repository's local publisher and verified offline loader.
+This includes the updated vLLM 0.32.0, SGLang 0.5.23 and TRT-LLM 1.4.0rc2
+coordinates that main's goldens require. No model weights were downloaded.
+
+Earlier attempts are retained in repair scratch: concurrent native builds
+exceeded memory; a first collection attempted the unavailable external data
+endpoint; stale merged fixtures and interfaces failed before correction;
+and parity against the starting commit's older data drifted. The final
+optimized build, offline fixtures and passing reruns above supersede those
+attempts. The source inventory explicitly lists the three draft-width marker
+accessors: they invalidate cache identity and compute no performance values.
+Local verification does not replace Full CI, fresh reviews or technical
+reapproval after a Full CI failure.

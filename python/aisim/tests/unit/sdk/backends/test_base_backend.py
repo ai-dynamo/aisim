@@ -514,7 +514,7 @@ def test_run_agg_with_osl_one_does_not_divide_by_zero(
     )
 
     row = summary.get_summary_df().iloc[0]
-    assert row["tpot"] > 0.0
+    assert row["tpot"] == 0.0  # no generated tokens after the prefill token
     assert row["tokens/s/user"] == 0.0
 
 
@@ -1264,6 +1264,8 @@ def test_run_agg_retains_schedule_weighted_energy_for_publication(
     mixed = StepEstimate(
         latency_ms=10.0,
         energy_wms=9000.0,
+        context_tokens=8,
+        num_decode_requests=1,
         covered_latency_ms=9.0,
         per_op_latency_ms={"gemm": 9.0, "missing": 1.0},
         per_op_energy_wms={"gemm": 9000.0, "missing": 0.0},
@@ -1875,7 +1877,7 @@ def test_qualified_mamba_aggregate_translates_capacity_before_native_validation(
         backend.run_mixed(model, database, runtime, MixedStepInput(budget, 2))
 
 
-def test_generation_only_mamba_qualification_keeps_legacy_prefill_coordinates(backend):
+def test_generation_only_mamba_qualification_uses_bounded_prefill_coordinates(backend):
     from aisim_core.sdk.models import get_model
     from aisim_core.sdk.operations import ElementWise, Mamba2Kernel
     from aisim_core.sdk.perf_database import get_database_view
@@ -1902,10 +1904,13 @@ def test_generation_only_mamba_qualification_keeps_legacy_prefill_coordinates(ba
     ]
     runtime = RuntimeConfig(batch_size=4, isl=100, prefix=60, osl=128)
     mixed = backend._run_agg_mixed_step(model, database, runtime, MixedStepInput(150, 2))
-    # Only a qualified context scan selects the strict native prefill split.
-    # Legacy context work retains 150 - 60 = 90 new tokens plus two decoders.
-    assert mixed.context_tokens == 150
-    assert mixed.per_op_latency_ms["norm"] == pytest.approx(92 * 2 / database.system_spec["gpu"]["mem_bw"] * 1000)
+    # Both phases select the strict split. Aggregate capacity 150 completes
+    # two 40-token suffixes, encoded as two whole 100-token prompts, plus
+    # two decoders: exactly 82 new positions, never 92 from an overlong chunk.
+    assert mixed.context_tokens == 200
+    assert mixed.per_op_latency_ms["norm"] == pytest.approx(82 * 2 / database.system_spec["gpu"]["mem_bw"] * 1000)
+    with pytest.raises(ValueError, match="partial prefill extend"):
+        backend.run_mixed(model, database, runtime, MixedStepInput(150, 2))
 
 
 def _qualified_scan_model(backend_name):
@@ -1985,7 +1990,7 @@ def test_batched_visual_mamba_sweep_continues_after_xpu_decode_reservation(monke
     model = _qualified_scan_model("vllm")
     if phase == "generation":
         # The unsupported visual chunk contract also covers decode-only
-        # qualification; the prefill phase then keeps its legacy coordinates.
+        # qualification, including the native prefill-coordinate bound.
         from aisim_core.sdk.operations import Mamba2Kernel
 
         model.context_ops = []
