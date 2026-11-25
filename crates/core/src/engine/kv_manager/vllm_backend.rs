@@ -597,6 +597,10 @@ struct GroupedDestinationBlocks {
 }
 
 impl DestinationReservation {
+    pub(crate) fn fresh_source_reads(&self) -> impl Iterator<Item = SourceReuseDependency> + '_ {
+        self.pool.fresh_source_reads()
+    }
+
     /// The transferable prompt of a linear cache in tokens, or the missing
     /// full-attention blocks of a grouped cache, as its timing counts blocks.
     pub(crate) fn transferable_prompt_tokens(&self, block_size: usize) -> usize {
@@ -2428,8 +2432,10 @@ impl VllmKvManager {
     pub(crate) fn satisfy_source_reuse_dependency(
         &mut self,
         dependency: SourceReuseDependency,
+        retain_source_read: bool,
     ) -> bool {
-        self.pool.satisfy_source_reuse_dependency(dependency)
+        self.pool
+            .satisfy_source_reuse_dependency(dependency, retain_source_read)
     }
 
     pub(crate) fn is_source_reuse_dependency_pending(
@@ -3909,7 +3915,7 @@ mod tests {
                 .is_some(),
             "a new store may follow the compute fenced behind the old reader"
         );
-        assert!(manager.satisfy_source_reuse_dependency(dependency));
+        assert!(manager.satisfy_source_reuse_dependency(dependency, false));
         assert!(
             manager
                 .snapshot_store_sources(owner, &lease, &[0])
@@ -3957,7 +3963,7 @@ mod tests {
 
         manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 0, 4);
         manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 4, 8);
-        assert!(manager.satisfy_source_reuse_dependency(dependency));
+        assert!(manager.satisfy_source_reuse_dependency(dependency, false));
         assert!(manager.pool.prefix_hit(9).is_some());
         assert!(manager.pool.prefix_hit(10).is_some());
     }
@@ -4128,7 +4134,7 @@ mod tests {
         );
         manager.finish_lease(owner, lease);
         assert_eq!(manager.num_active_blocks(), 0);
-        assert!(manager.satisfy_source_reuse_dependency(dependency));
+        assert!(manager.satisfy_source_reuse_dependency(dependency, false));
     }
 
     #[test]
@@ -4155,7 +4161,7 @@ mod tests {
         manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 0, 8);
         assert!(manager.pool.prefix_hit(2).is_some());
         manager.finish_lease(owner, lease);
-        assert!(manager.satisfy_source_reuse_dependency(dependency));
+        assert!(manager.satisfy_source_reuse_dependency(dependency, false));
     }
 
     #[test]
