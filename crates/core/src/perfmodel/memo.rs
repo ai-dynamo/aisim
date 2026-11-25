@@ -3,8 +3,7 @@
 
 //! The one result memo of forward-pass pricing.
 //!
-//! Every pricing result cache is a [`Memo`], entered only through
-//! [`Memo::get_or_price`], so all of them keep one contract:
+//! Keyed memos and indexed slots share one pricing contract:
 //!
 //! - An entry is a pure function of its key. The owner keys on everything
 //!   the pricing reads, and owns the memo for as long as that holds.
@@ -21,7 +20,7 @@
 use std::cell::Cell;
 use std::fmt::Debug;
 use std::hash::Hash;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use quick_cache::sync::{Cache, DefaultLifecycle};
 use quick_cache::{DefaultHashBuilder, Equivalent, OptionsBuilder, UnitWeighter};
@@ -78,6 +77,53 @@ pub(crate) struct OnThread;
 impl NoteProvenance for OnThread {
     fn note_provenance(&self, tier: ProvenanceTier) {
         note_on_thread(tier);
+    }
+}
+
+/// A slot whose owner already resolved the key. A failed price leaves it empty.
+#[derive(Debug, Default)]
+pub(crate) struct MemoSlot<V>(OnceLock<(V, ProvenanceTier)>);
+
+impl<V: Debug> MemoSlot<V> {
+    pub(crate) fn get_or_price<E: Debug>(
+        &self,
+        notes: &impl NoteProvenance,
+        price: impl FnOnce() -> Result<V, E>,
+    ) -> Result<&V, E> {
+        if let Some((value, tier)) = self.0.get() {
+            reuse(value, *tier, notes, true, price);
+            return Ok(value);
+        }
+        let (result, tier) = attribute(price);
+        let value = result?;
+        let (stored, stored_tier) = self.0.get_or_init(|| (value, tier));
+        // A concurrent miss can win the slot while this thread is pricing.
+        if *stored_tier > tier {
+            notes.note_provenance(*stored_tier);
+        }
+        Ok(stored)
+    }
+}
+
+fn reuse<V: Debug, E: Debug>(
+    value: &V,
+    tier: ProvenanceTier,
+    notes: &impl NoteProvenance,
+    verify_hits: bool,
+    price: impl FnOnce() -> Result<V, E>,
+) {
+    #[cfg(debug_assertions)]
+    if verify_hits {
+        let repriced = price();
+        assert!(
+            matches!(&repriced, Ok(repriced) if format!("{repriced:?}") == format!("{value:?}")),
+            "a memo hit prices as {repriced:?}, not its stored {value:?}"
+        );
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = (value, verify_hits, price);
+    if tier != ProvenanceTier::Silicon {
+        notes.note_provenance(tier);
     }
 }
 
@@ -210,19 +256,7 @@ where
         (value, tier): (V, ProvenanceTier),
         price: impl FnOnce() -> Result<V, E>,
     ) -> V {
-        #[cfg(debug_assertions)]
-        if self.verify_hits {
-            let repriced = price();
-            assert!(
-                matches!(&repriced, Ok(repriced) if format!("{repriced:?}") == format!("{value:?}")),
-                "a memo hit prices as {repriced:?}, not its stored {value:?}"
-            );
-        }
-        #[cfg(not(debug_assertions))]
-        let _ = price;
-        if tier != ProvenanceTier::Silicon {
-            notes.note_provenance(tier);
-        }
+        reuse(&value, tier, notes, self.verify_hits, price);
         value
     }
 
@@ -319,6 +353,38 @@ mod tests {
                 (Ok(2.0), Some(ProvenanceTier::XShape))
             );
         }
+    }
+
+    #[test]
+    fn indexed_slot_retries_errors_and_replays_the_successful_tier() {
+        let slot = MemoSlot::default();
+        let notes = Recorder::default();
+        assert!(slot.get_or_price(&notes, || Err("missing")).is_err());
+        let first = slot
+            .get_or_price(&notes, noting(ProvenanceTier::XShape, 2.0))
+            .unwrap();
+        let hit = slot.get_or_price(&notes, || Ok::<_, String>(2.0)).unwrap();
+        assert!(std::ptr::eq(first, hit));
+        assert_eq!(notes.0.get(), Some(ProvenanceTier::XShape));
+    }
+
+    #[test]
+    fn concurrent_slot_miss_notes_the_winning_price_tier() {
+        let slot = MemoSlot::default();
+        let notes = Recorder::default();
+        let value = slot.get_or_price(&notes, || {
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    slot.get_or_price(&OnThread, noting(ProvenanceTier::XOp, 2.0))
+                        .unwrap()
+                });
+            });
+            Ok::<_, String>(2.0)
+        });
+        assert_eq!(
+            (value, notes.0.get()),
+            (Ok(&2.0), Some(ProvenanceTier::XOp))
+        );
     }
 
     #[test]
