@@ -1034,7 +1034,8 @@ pub(crate) struct ConnectorRules {
     pub(crate) preemption_waits_for_all: bool,
     /// The scheduler admits a waiting request that holds G1 for a load
     /// before every other waiter (`kv_holding_waiting`). Otherwise skipped
-    /// requests keep the order of their first skip (`skipped_waiting`).
+    /// requests keep the order of their first skip (`skipped_waiting`), and
+    /// one that must wait for room yields to those that hold G1 for a load.
     pub(crate) admits_kv_holders_first: bool,
 }
 
