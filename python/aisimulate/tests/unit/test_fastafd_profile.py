@@ -120,6 +120,64 @@ def test_exact_lookup_preserves_source_and_method(tmp_path):
     assert provenance["correctness"] is None
 
 
+@pytest.mark.parametrize("padding", [" ", "\x1c", "\x1d", "\x1e", "\x1f", "\u00a0"])
+@pytest.mark.parametrize("field", ["model_path", "system", "stage", "topology", "moe_precision", "moe_backend"])
+def test_key_trimming_agrees_for_inspection_and_canonical_estimation(tmp_path, padding, field):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    payload = _payload()
+    expected_key = FastAFDMoEStageKey(**payload["entries"][0]["key"])
+    raw_value = f"{padding}{getattr(expected_key, field)}{padding}"
+    payload["entries"][0]["key"][field] = raw_value
+    json_path = _write(tmp_path, payload)
+    profile = FastAFDMoEStageProfile.load(json_path)
+    parquet_path = tmp_path / "stage.parquet"
+    profile.write_parquet(parquet_path)
+    table = pq.read_table(parquet_path)
+    # Preserve the raw padded key in direct Parquet input, before either
+    # loader has a chance to normalize it.
+    table = table.set_column(table.schema.get_field_index(field), field, pa.array([raw_value]))
+    pq.write_table(table, parquet_path)
+
+    for path in (json_path, parquet_path):
+        inspected = FastAFDMoEStageProfile.load(path).require(expected_key)
+        assert inspected.key == expected_key
+        # JSON follows the legacy-to-Parquet conversion; Parquet goes straight
+        # to Rust. Both must select the same unpadded key as Python inspection.
+        estimate = RustForwardPassPerfModel.best_available(_canonical_config(path)).estimate_fastafd_stage(48)
+        assert FastAFDMoEStageKey(**estimate["stage"]["key"]) == expected_key
+        assert estimate["stage"]["latency_ms"] == inspected.latency_ms == 16.7
+
+
+def test_parquet_writer_preserves_direct_integer_latency_through_canonical_estimator(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload()))
+    # Direct construction accepts an integer latency. This synthetic complete
+    # stage has six pipeline units (3 layers x 2 microbatches), each costing 2 ms.
+    measurement = replace(profile.entries[0], latency_ms=12, key=replace(profile.entries[0].key, moe_layers=3))
+    direct = FastAFDMoEStageProfile(
+        (measurement,), source=profile.source, path=profile.path, profile_sha256=profile.profile_sha256
+    )
+    path = tmp_path / "stage.parquet"
+    direct.write_parquet(path)
+
+    schema = pq.read_schema(path)
+    assert schema.field("latency_ms").type == pa.float64()
+    for field in ("logical_batch_per_source_rank", "mtp_nextn", "microbatches", "moe_layers", "routed_topk"):
+        assert schema.field(field).type == pa.int64()
+    assert FastAFDMoEStageProfile.load(path).entries == (measurement,)
+    estimate = RustForwardPassPerfModel.best_available(_canonical_config(path, moe_layers=3)).estimate_fastafd_stage(48)
+    assert estimate["stage"]["latency_ms"] == 12.0
+    assert estimate["ffn_ms"] == 2.0
+
+
 def test_entries_cannot_be_replaced_after_exact_index_is_built(tmp_path):
     other = _entry()
     other["key"]["microbatches"] = 3

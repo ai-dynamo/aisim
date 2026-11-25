@@ -12,7 +12,9 @@ missing measurement is an error, not an estimate.
 The Rust table loader reads the eleven `key` fields below as individual columns:
 identity strings as UTF-8 and count columns (`logical_batch_per_source_rank`,
 `mtp_nextn`, `microbatches`, `moe_layers`, `routed_topk`) as signed INT64, plus a floating-point
-`latency_ms` (Parquet FLOAT or DOUBLE; FLOAT is widened to f64).
+`latency_ms` (Parquet FLOAT or DOUBLE; FLOAT is widened to f64). The Python writer
+always emits DOUBLE latency and signed INT64 count columns, including when a
+directly constructed measurement has an integer-valued latency.
 `source_json` contains the source object; `capture_json` contains
 exactly `model_profile`, `measurement`, and `validation` from the JSON entry.
 The source must be identical for all rows. These JSON columns preserve raw
@@ -22,6 +24,8 @@ Both Python inspection and native loading reject other count encodings, includin
 INT32 and UINT32. Counts must fit in an unsigned 32-bit value; only `mtp_nextn`
 may be zero.
 Topology components in `ep<N>` and `<A>A<F>F` must also be positive u32 values.
+Both loaders trim leading and trailing whitespace from key text using Python's
+`str.strip()` rule: Unicode White_Space plus ASCII separators U+001C–U+001F.
 Supported Parquet compression codecs are UNCOMPRESSED, SNAPPY, and ZSTD.
 Python inspection rejects other codecs, including GZIP, before native estimation.
 Both entrypoints require a flat schema, including unused columns; nested structs,

@@ -268,7 +268,25 @@ class FastAFDMoEStageProfile:
                     "source_json": json.dumps(asdict(self.source), sort_keys=True),
                 }
             )
-        pq.write_table(pa.Table.from_pylist(rows), path)
+        schema = pa.schema(
+            [
+                ("model_path", pa.string()),
+                ("system", pa.string()),
+                ("stage", pa.string()),
+                ("topology", pa.string()),
+                ("logical_batch_per_source_rank", pa.int64()),
+                ("mtp_nextn", pa.int64()),
+                ("microbatches", pa.int64()),
+                ("moe_layers", pa.int64()),
+                ("routed_topk", pa.int64()),
+                ("moe_precision", pa.string()),
+                ("moe_backend", pa.string()),
+                ("latency_ms", pa.float64()),
+                ("capture_json", pa.string()),
+                ("source_json", pa.string()),
+            ]
+        )
+        pq.write_table(pa.Table.from_pylist(rows, schema=schema), path)
 
     def find(self, key: FastAFDMoEStageKey) -> FastAFDMoEStageMeasurement | None:
         import aisimulate_core

@@ -267,7 +267,13 @@ impl Document {
         // Match the legacy import's text normalization at the data boundary.
         fn trim(values: &mut [&mut String]) {
             for value in values {
-                **value = value.trim().to_owned();
+                // Python str.strip() includes these four ASCII separators in
+                // addition to Unicode White_Space (Rust's is_whitespace).
+                **value = value
+                    .trim_matches(|c: char| {
+                        c.is_whitespace() || matches!(c, '\u{001c}'..='\u{001f}')
+                    })
+                    .to_owned();
             }
         }
         let s = &mut self.source;
@@ -655,6 +661,37 @@ mod tests {
         let error = model.tune_with_fpms(&[]).unwrap_err();
         assert!(matches!(error, AicError::InvalidEngineConfig(_)));
         assert!(error.to_string().contains("cannot be tuned"));
+    }
+
+    #[test]
+    fn canonical_stage_normalizes_python_whitespace() {
+        let (file, config) = fixture();
+        let expected_key = fixture_document()["entries"][0]["key"].clone();
+        for padding in [
+            ' ', '\u{001c}', '\u{001d}', '\u{001e}', '\u{001f}', '\u{00a0}',
+        ] {
+            for field in [
+                "model_path",
+                "system",
+                "stage",
+                "topology",
+                "moe_precision",
+                "moe_backend",
+            ] {
+                let mut document = fixture_document();
+                document["entries"][0]["key"][field] = json!(format!(
+                    "{padding}{}{padding}",
+                    expected_key[field].as_str().unwrap()
+                ));
+                std::fs::write(file.path(), parquet_snapshot(&document)).unwrap();
+                let estimate = ForwardPassPerfModel::best_available(config.clone())
+                    .unwrap()
+                    .estimate_fastafd_stage(128)
+                    .unwrap();
+                assert_eq!(estimate.stage["key"], expected_key);
+                assert_eq!(estimate.ffn_ms, 2.0);
+            }
+        }
     }
 
     #[test]
