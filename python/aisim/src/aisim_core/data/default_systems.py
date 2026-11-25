@@ -10,7 +10,7 @@ Operation tables are no longer packaged. The default systems root is composed on
    makes no network call, a cold one downloads and hash-verifies),
 2. write one ``systems/`` root next to it with :func:`~aisim_core.data.op_tree.load_op_latency_tree`, which
    also copies the packaged specs, profiles and version tables,
-3. return that root; later processes reuse it.
+3. return that root; later processes reuse it without reading the dataset cache again.
 
 Overrides, all explicit and never silently replaced by other data:
 
@@ -135,6 +135,7 @@ def _compose(
     transport: Transport | None,
 ) -> Path:
     cache = Cache(cache_dir)
+    tree: Path | None = None
     if local is not None:
         tree = Path(local)
         index = tree / "catalog" / "dataset.json"
@@ -143,12 +144,16 @@ def _compose(
         name = "local-" + hashlib.sha256(index.read_bytes()).hexdigest()[:16]
         source = {"source": "local", "root": local}
     else:
-        tree, sha = _ensure_tree(repo, revision, cache, offline, max_bytes, transport)
+        sha = revision
+        if not _FULL_SHA.fullmatch(revision):  # a branch or tag: only the dataset knows its commit
+            tree, sha = _ensure_tree(repo, revision, cache, offline, max_bytes, transport)
         name = f"{repo.replace('/', '__')}-{sha}"
         source = {"source": "hf", "repo": repo, "revision": sha}
     destination = cache.root / "systems" / f"{name}-{_specs_fingerprint()}"
     if (destination / MARKER).is_file():
         return destination
+    if tree is None:  # a full commit SHA names its root, so the dataset is fetched and verified only to build it
+        tree, _ = _ensure_tree(repo, revision, cache, offline, max_bytes, transport)
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(dir=destination.parent, prefix=".compose-")) / "systems"
     try:
