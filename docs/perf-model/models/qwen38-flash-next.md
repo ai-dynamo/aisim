@@ -138,13 +138,24 @@ The campaign measured `h200_sxm` QSA-module, GEMM, MoE and GDN rows for BF16
 and FP8 on both backends. They are staged under
 [`benchmarks/evidence/collector/qwen38-c3.5/`](../../../benchmarks/evidence/collector/qwen38-c3.5/README.md)
 and are not in this tree: operation data lives in the pinned
-`ai-dynamo/aisim-data` dataset. Once a dataset revision carries the rows and
-[`op_latency_pin.json`](../../../python/aisim/src/aisim_core/data/op_latency_pin.json)
-is raised to it, SILICON resolves for BF16 and FP8 on both backends and HYBRID
-combines those measurements with SOL contributions. Until then SILICON and
-HYBRID raise the typed data miss, and EMPIRICAL fails closed for the same
-reason: there is no measured QSA utility, and the M3-calibrated DSA transfer
-must not be borrowed for another architecture (`operators/msa.rs` enforces it).
+`ai-dynamo/aisim-data` dataset. Paths differ by backend because the rows are
+keyed by the version they were collected on:
+
+- SGLang 0.5.21 is a queryable version (`previous`), so once a dataset revision
+  carries the rows and
+  [`op_latency_pin.json`](../../../python/aisim/src/aisim_core/data/op_latency_pin.json)
+  is raised to it, SILICON resolves for BF16 and FP8 and HYBRID combines those
+  measurements with SOL contributions.
+- vLLM 0.31.0 is outside the dataset's slots (`current` 0.32.0, `previous`
+  0.30.0), so publishing the rows is not enough: a query at 0.31.0 still
+  raises `UnlistedQueryVersionError` unless the caller sets
+  `AIC_ALLOW_UNLISTED_VERSIONS=1`, until 0.31.0 is promoted into a slot or the
+  lane is recollected on 0.32.0.
+
+Until those conditions hold SILICON and HYBRID raise the typed data miss, and
+EMPIRICAL fails closed for the same reason: there is no measured QSA utility,
+and the M3-calibrated DSA transfer must not be borrowed for another
+architecture (`operators/msa.rs` enforces it).
 
 The QSA module prices the checkpoint's fused halves itself: the MSA op's
 projection formula (Q, K+V, O, indexer-Q) carries two extra widths

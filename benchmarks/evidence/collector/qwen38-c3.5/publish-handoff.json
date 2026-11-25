@@ -1,0 +1,333 @@
+{
+  "architecture": "Qwen4ExpForConditionalGeneration",
+  "audit": {
+    "by_hash_basis": {
+      "arrow-rows": 1996,
+      "embedded-source": 2,
+      "file-bytes": 1206
+    },
+    "checked": 3204,
+    "ok": true,
+    "problems": [],
+    "unmapped_destinations": [],
+    "unmapped_sources": []
+  },
+  "build": {
+    "converted_tables": 1998,
+    "copied_files": 1206,
+    "declared_reuse_resolved": 56,
+    "files": 3204,
+    "manifests": 1188,
+    "published_bytes": 244545037,
+    "skipped": 0,
+    "source_bytes": 239266718,
+    "source_map": "data/op-latency/source_map.parquet"
+  },
+  "bundle": {
+    "bytes": 244545037,
+    "catalog_files": 18,
+    "data_files": 4393,
+    "files": 4411,
+    "sha256": "e3af85b31631e0bfaeb7bc366ffa67576a3a1ca63d6b330b2b7f02ec37066367",
+    "sha256_method": "sha256 over sorted '<relative path>\\0<sha256(file)>\\n' lines"
+  },
+  "bundle_caveats": {
+    "consequence": "uploading the bundle category tree as-is rewrites all 1998 converted tables and all 1188 manifests, and drops the commit lineage from the manifests; it is valid but noisy",
+    "manifest_source_commit": null,
+    "published_manifest_source_commit": "dbff10b4c32bdcd808356f4110e4b0c5fae134d4",
+    "reencoded_tables": 1998,
+    "reencoded_tables_detail": "1996 measurement tables (1993 carried over plus 3 new) and the two lookup tables derived from perf_data_reuse_manifest.yaml and query_versions.yaml",
+    "regenerated_manifests": 1188,
+    "sample_byte_delta": {
+      "bundle_bytes": 515774,
+      "content": "row-identical (audit hash basis arrow-rows)",
+      "path": "data/op-latency/h200_sxm/gemm/vllm/0.32.0/gemm_perf.parquet",
+      "published_bytes": 515920
+    },
+    "what_it_is_not": "the upload payload; build re-converts every parquet source, so unchanged tables are re-encoded, and the composed root has no git history to stamp",
+    "what_the_bundle_is": "a verification render of the merge: the category tree the publisher emits from a composed root, gate-checked so the merged rows and the derived catalog are known consistent"
+  },
+  "catalog": {
+    "delta_vs_base": {
+      "catalog/dataset.json": {
+        "action": "do not upload the bundle copy; update the existing file's categories.op-latency.index to the new catalog/op-latency.json bytes/sha256, or re-derive it with build_catalog over a checkout that has all three categories",
+        "base_categories": [
+          "e2e",
+          "fpm",
+          "op-latency"
+        ],
+        "bundle_categories": [
+          "op-latency"
+        ]
+      },
+      "catalog/op-latency-reuse.parquet": {
+        "bytes": 11361,
+        "sha256": "de322d6b0b3920a8461543f0d8c3b4740d784a84d8a3eaa72d0f589bb4ea731e",
+        "unchanged": true
+      },
+      "catalog/op-latency.json": {
+        "base": {
+          "bytes": 1217171,
+          "sha256": "68d2121bee26"
+        },
+        "bundle": {
+          "bytes": 1219223,
+          "sha256": "649bbe23723ebc038a07d74711d659a098085ed24e62b541a5a21549bab9bac9"
+        }
+      },
+      "catalog/op-latency/h200_sxm.parquet": {
+        "base": {
+          "bytes": 6423,
+          "sha256": "1406f9e9fb89"
+        },
+        "bundle": {
+          "bytes": 6423,
+          "sha256": "4b44d29058b7ab3f3b4c31883066942c63d30690ee29c7f2874721d54b207fc6"
+        }
+      },
+      "catalog/systems.parquet": {
+        "bytes": 1780,
+        "sha256": "de5d75ebb84ae701d3cbdb0307484c49404ca2cc72c7e128b1f5b08cd3900bd6",
+        "unchanged": true
+      },
+      "note": "base values read from ai-dynamo/aisim-data@c231f32b"
+    },
+    "op_latency_index": {
+      "bytes": 1219223,
+      "path": "catalog/op-latency.json",
+      "sha256": "649bbe23723ebc038a07d74711d659a098085ed24e62b541a5a21549bab9bac9"
+    },
+    "tree_sha256": "84f82db0571a9241d0a9c77300e6096482fa7467cbe8b1b8d70aa905e576a215"
+  },
+  "cells": {
+    "data/op-latency/h200_sxm/gemm/sglang/0.5.21": {
+      "campaign_rows": 1924,
+      "files": 3,
+      "identity_key_overlap": 0,
+      "pre_merge_rows": 103970,
+      "rows": 105894,
+      "sha256": "47ab482fe6f1bd1888070966d6db5c27d1805bbe9bb17b8e1dc518eded0e8100",
+      "status": "merged",
+      "table": "gemm/sglang/0.5.21/gemm_perf.parquet"
+    },
+    "data/op-latency/h200_sxm/gemm/vllm/0.31.0": {
+      "campaign_rows": 1924,
+      "files": 3,
+      "identity_key_overlap": 0,
+      "pre_merge_rows": 109742,
+      "rows": 111666,
+      "sha256": "27326afad611ed5b1a60d2742bff936ad0bb1a01d4f77f2602d141d719ce2367",
+      "status": "merged",
+      "table": "gemm/vllm/0.31.0/gemm_perf.parquet"
+    },
+    "data/op-latency/h200_sxm/linear_attention/sglang/0.5.21": {
+      "campaign_rows": 944,
+      "files": 3,
+      "identity_key_overlap": 0,
+      "pre_merge_rows": 9977,
+      "rows": 10921,
+      "sha256": "f586c3a0ba568801de489252f4835832ff189b0b3a9736c854338c72a24c5b09",
+      "status": "merged",
+      "table": "linear_attention/sglang/0.5.21/gdn_perf.parquet"
+    },
+    "data/op-latency/h200_sxm/linear_attention/vllm/0.31.0": {
+      "campaign_rows": 984,
+      "files": 3,
+      "identity_key_overlap": 0,
+      "pre_merge_rows": 0,
+      "rows": 984,
+      "sha256": "7f4e3a74e17ee3cda0449ea27ccb5d9e5d9b59da0748d82f0f03cd27edbf27f2",
+      "status": "new",
+      "table": "linear_attention/vllm/0.31.0/gdn_perf.parquet"
+    },
+    "data/op-latency/h200_sxm/moe/sglang/0.5.21": {
+      "campaign_rows": 3564,
+      "files": 3,
+      "identity_key_overlap": 0,
+      "pre_merge_rows": 111942,
+      "rows": 115506,
+      "sha256": "aa5cf99d61c52dbe7fb7b9b431472d31bad44440421d0dfa1e194bef6c405883",
+      "status": "merged",
+      "table": "moe/sglang/0.5.21/moe_perf.parquet"
+    },
+    "data/op-latency/h200_sxm/moe/vllm/0.31.0": {
+      "campaign_rows": 2025,
+      "files": 3,
+      "identity_key_overlap": 0,
+      "pre_merge_rows": 891,
+      "rows": 2916,
+      "sha256": "771957e1c934cf8c37522462193bf68eb74c915bf96cf479b836b090f7c6ab14",
+      "status": "merged",
+      "table": "moe/vllm/0.31.0/moe_perf.parquet"
+    },
+    "data/op-latency/h200_sxm/msa/sglang/0.5.21": {
+      "campaign_rows": 740,
+      "files": 4,
+      "identity_key_overlap": 0,
+      "pre_merge_rows": 1841,
+      "rows": 2581,
+      "sha256": "273f180b04287c8c78340f1538fb12c66bba0bc488592cd986012b08bb584bea",
+      "status": "merged",
+      "table": "msa/sglang/0.5.21/msa_generation_module_perf.parquet"
+    },
+    "data/op-latency/h200_sxm/msa/vllm/0.31.0": {
+      "campaign_rows": 736,
+      "files": 4,
+      "identity_key_overlap": 0,
+      "pre_merge_rows": 0,
+      "rows": 736,
+      "sha256": "c5df4ce2e4e569b0d06c9f1a31443c53841cd84ee6e3c751f2e1637b3261744e",
+      "status": "new",
+      "table": "msa/vllm/0.31.0/msa_generation_module_perf.parquet"
+    }
+  },
+  "dataset": {
+    "base_revision": "c231f32bf3510fcd1addfe613d14619a79a4c24e",
+    "current_main_at_handoff": "787f7178d96ccc8f468442e3ed96e640c0a83e54",
+    "pin_file": "python/aisim/src/aisim_core/data/op_latency_pin.json",
+    "repo_id": "ai-dynamo/aisim-data",
+    "upstream_drift_since_base": "two files added (assets/aisim-data-intro.png, assets/directory-layout.png), none removed, data/op-latency byte-identical"
+  },
+  "decisions": [
+    {
+      "bundle_as_built": "slots unchanged",
+      "id": "vllm-version-slot",
+      "options": [
+        "leave the slots unchanged: the vLLM QSA rows ship but are reachable only with AIC_ALLOW_UNLISTED_VERSIONS=1, which matches the current tree",
+        "set vllm previous: 0.31.0 and drop 0.30.0, mirroring sglang 0.5.23/0.5.21 and trtllm 1.4.0rc2/1.3.0rc29; this changes queryability for every vLLM family, not only Qwen",
+        "recollect the Qwen vLLM lane on 0.32.0, the only option that needs no shared slot change"
+      ],
+      "owner": "maintainer",
+      "question": "Does the revision that carries these rows also promote vllm 0.31.0 into a query slot?"
+    }
+  ],
+  "file_accounting": {
+    "base_system_files": 4389,
+    "equals_data_files": 4393,
+    "equals_system_files": 4390,
+    "minus_unmanaged_aux_files": 6,
+    "plus_new_cell_files": 7,
+    "plus_root_parquet": 3,
+    "unmanaged_aux_files": [
+      "data/op-latency/b200_sxm/README.md",
+      "data/op-latency/b200_sxm/power_upstream/context_attention.parquet.source",
+      "data/op-latency/b200_sxm/power_upstream/generation_attention.parquet.source",
+      "data/op-latency/b200_sxm/vllm-0.25.0-collection-report.json",
+      "data/op-latency/b200_sxm/vllm-0.25.0-collection.md",
+      "data/op-latency/b200_sxm/vllm-0.25.0-failures.json.gz"
+    ],
+    "unmanaged_aux_note": "system-level files outside <system>/<family>/<backend>/<version>/; the builder neither rebuilds nor removes them, and an upload leaves them in place"
+  },
+  "hardware": "h200_sxm",
+  "model": "Qwen/Qwen3.8-Flash-Next",
+  "post_merge": {
+    "order": "pin bump cannot precede the dataset revision: CI downloads the pinned tree",
+    "pin_bump": "raise revision in python/aisim/src/aisim_core/data/op_latency_pin.json to the merged dataset revision",
+    "unblocks": "SILICON/HYBRID resolution for the Qwen4ExpForConditionalGeneration QSA slice (sglang 0.5.21 immediately; vllm 0.31.0 only once it is a queryable version)"
+  },
+  "public_profile": {
+    "by_code": {
+      "image-digest": 37,
+      "image-name": 3507,
+      "internal-host": 1,
+      "orphan-file": 2,
+      "patch-reference": 4
+    },
+    "conclusion": "the public disclosure profile is not satisfied by the published dataset revision itself, so this is a promotion/redaction prerequisite (documented as planned in docs/ci/accuracy.md), not a defect introduced by these rows",
+    "errors": 3551,
+    "ok": false,
+    "scope": "dataset-wide; the pinned revision fails the public profile in every system and family, and each of the eight cells here contributes 4 image-name findings from the same image/image_digest sidecar fields every other cell carries"
+  },
+  "schema": "aisim-publish-handoff/v1",
+  "scope": {
+    "category": "op-latency",
+    "what_it_is_not": "a whole dataset revision: catalog/dataset.json in the dataset also names the e2e and fpm categories, and the builder emits a single-category index",
+    "what_this_bundle_is": "the data/op-latency/ category tree plus that category's catalog artifacts (index, per-system shards, reuse table, systems coverage)"
+  },
+  "sources": {
+    "campaign_files": "10 tables and 8 sidecars from eb183db59 (C3.3 QSA, C3.4 GEMM/MoE/GDN)",
+    "dataset_tree": "ai-dynamo/aisim-data@c231f32b data/op-latency (4392 files, 1188 of them per-leaf manifests), composed into a systems root (3197 files) by default_systems_path",
+    "reuse_manifest": "the dataset perf_data_reuse_manifest.yaml plus 5 additive Qwen groups (0 removals, 25 added lines)",
+    "source_commit_null_reason": "the composed root is a scratch build input, not a git checkout; per-file provenance is data/op-latency/source_map.parquet (source_git_blob, source_sha256)"
+  },
+  "stage": "C3.5",
+  "status": "candidate-built-not-uploaded",
+  "upload": {
+    "blockers": [
+      "no write access to ai-dynamo/aisim-data (NVIDIA-owned)",
+      "the dataset license is pending OSRB (AISIM-2311/AISIM-2312: do not redistribute until it is set)",
+      "the public profile fails on the base revision itself, so promotion requires the redaction step first",
+      "the publisher has no post-cutover provenance mode: run from a checkout it stamps that checkout's commit, run from a composed root it stamps null"
+    ],
+    "channels": [
+      {
+        "blocker": "no main commit carries that layout since #857, so the checkout has to come from the maintainer's own history or their post-cutover publish flow",
+        "id": "provenance-preserving",
+        "preferred": true,
+        "steps": [
+          "apply the 18 payload files and the five reuse groups in a checkout that carries python/aisim/src/aisim_core/systems/data/",
+          "run tools/perf_database/publish_op_latency_tree.py build --out <dir> so the manifests stamp a real source_commit",
+          "upload <dir>/data/op-latency, <dir>/catalog/op-latency.json and <dir>/catalog/op-latency",
+          "update catalog/dataset.json categories.op-latency.index to the uploaded catalog/op-latency.json bytes/sha256, keeping the e2e and fpm references"
+        ]
+      },
+      {
+        "cost": "rewrites all 1998 converted tables (1996 measurement plus 2 lookup) and 1188 manifests (row-identical) and sets provenance.source_commit null in every regenerated manifest",
+        "id": "one-off-bundle-upload",
+        "preferred": false,
+        "steps": [
+          "hf upload ai-dynamo/aisim-data <bundle>/data/op-latency data/op-latency --repo-type dataset --create-pr",
+          "hf upload ai-dynamo/aisim-data <bundle>/catalog/op-latency.json catalog/op-latency.json --repo-type dataset --create-pr",
+          "hf upload ai-dynamo/aisim-data <bundle>/catalog/op-latency catalog/op-latency --repo-type dataset --create-pr",
+          "update catalog/dataset.json categories.op-latency.index to the uploaded catalog/op-latency.json bytes/sha256, keeping the e2e and fpm references"
+        ]
+      }
+    ],
+    "command_note": "Hugging Face opens the pull request as a refs/pr/N revision inside the source repository, so write access to ai-dynamo/aisim-data is required; a fork does not work. hf upload only adds or overwrites, so the six system-level auxiliary files under b200_sxm/ stay in place.",
+    "do_not_upload": [
+      "catalog/dataset.json from the bundle (single-category index; the dataset copy names e2e, fpm and op-latency)",
+      "catalog/op-latency-reuse.parquet and catalog/systems.parquet are byte-identical to the base, so re-uploading them is a no-op"
+    ],
+    "payload": {
+      "campaign_files": {
+        "composition": "10 merged tables and 8 collection_meta.yaml sidecars",
+        "count": 18,
+        "location": "eb183db59:python/aisim/src/aisim_core/systems/data/h200_sxm/<family>/<backend>/<version>/",
+        "new_detail": "3 tables and 2 sidecars under msa/vllm/0.31.0/ and linear_attention/vllm/0.31.0/",
+        "new_files": 5,
+        "replaced_files": 13
+      },
+      "note": "the bundle's tables are a re-encoding of these files, not a different measurement",
+      "reuse_groups": {
+        "count": 5,
+        "kernels": [
+          "sglang_qwen4exp_qsa_prefill_triton",
+          "sglang_qwen4exp_qsa_prefill_triton_ck",
+          "vllm_qwen4exp_qsa_prefill_triton",
+          "sglang_qwen4exp_qsa_decode_fa4_cute_varlen",
+          "vllm_qwen4exp_qsa_decode_triton"
+        ],
+        "location": "perf_data_reuse_manifest.yaml (additive; 0 removals, 25 added lines)"
+      }
+    }
+  },
+  "version_slots": {
+    "detail": "Slots are the pinned dataset's own state (identical in the in-tree systems/query_versions.yaml); `next` derives to `current` because no newer version has data. sglang 0.5.21 is `previous`, so publishing the tables and raising the pin is enough. vllm 0.31.0 is outside both slots (current 0.32.0, previous 0.30.0), so a default query still raises UnlistedQueryVersionError until 0.31.0 is promoted into a slot or the caller sets AIC_ALLOW_UNLISTED_VERSIONS=1 (the only escape hatch; there is no CLI flag).",
+    "probe": {
+      "call": "get_database_view('h200_sxm', <backend>, <version>, database_mode='SILICON')",
+      "result": "vllm 0.31.0 raised UnlistedQueryVersionError; vllm 0.32.0, sglang 0.5.21 and sglang 0.5.23 returned a view"
+    },
+    "sglang": {
+      "collected": "0.5.21",
+      "current": "0.5.23",
+      "previous": "0.5.21",
+      "queryable_after_publish": true
+    },
+    "vllm": {
+      "collected": "0.31.0",
+      "current": "0.32.0",
+      "previous": "0.30.0",
+      "queryable_after_publish": false
+    }
+  }
+}

@@ -9,9 +9,11 @@ SPDX-License-Identifier: Apache-2.0
 the pre-cutover packaged tables. Since `#857` moved operation data into the
 pinned `ai-dynamo/aisim-data` dataset, the merged tables do not ship in-tree.
 They are held as a candidate bundle (see
-[Publication handoff](#publication-handoff)); SILICON resolves for
+[Publication handoff](#publication-handoff) and
+[`publish-handoff.json`](publish-handoff.json)). SILICON resolves for
 `Qwen/Qwen3.8-Flash-Next` only after a dataset revision carrying them is merged
-and `op_latency_pin.json` is raised to it.
+and `op_latency_pin.json` is raised to it — and only for a backend whose
+collected version is a queryable slot (SGLang 0.5.21 is; vLLM 0.31.0 is not).
 
 This non-packaged bundle records the C3.5 merge step for
 `Qwen/Qwen3.8-Flash-Next`: merging the accepted C3.3 QSA and C3.4
@@ -81,14 +83,170 @@ The full digests are in `merge-check.json`; for example
 `msa/vllm/0.31.0/msa_context_module_perf.parquet` is
 `b8ca9b641f3d99f5184451879c32844da8006bc855c756d6ae18f45fdc5ff28d`.
 
+## Publication handoff
+
+The merged tables are not shipped from this repository: `#857` moved operation
+data into the pinned `ai-dynamo/aisim-data` dataset, so a default install reads
+`op_latency_pin.json` (`ai-dynamo/aisim-data@c231f32bf3510fcd1addfe613d14619a79a4c24e`).
+Everything below is a **candidate bundle, built and verified locally and never
+uploaded**; `publish-handoff.json` is its machine-readable record.
+
+Publication stops here for four reasons, none of which this change can resolve:
+
+- `ai-dynamo/aisim-data` is NVIDIA-owned and the account preparing this bundle
+  has no write access.
+- A Hugging Face pull request cannot come from a fork: `hf upload
+  --create-pr` pushes a `refs/pr/N` revision into the source repository, so
+  holding a fork is not enough.
+- The dataset license is still pending OSRB (AISIM-2311/AISIM-2312, "do not
+  redistribute until it is set").
+- The public-profile content check fails on the published base revision itself,
+  so promotion has to carry a redaction step first (see below).
+
+### Build and gates
+
+Built with `tools/perf_database/publish_op_latency_tree.py` from a composed
+systems root: the pinned dataset tree (`c231f32b`, 3197 files, no per-leaf
+manifests) plus the pre-cutover `perf_data_reuse_manifest.yaml` extended with the
+five Qwen reuse groups, plus the 18 accepted C3.3/C3.4 files (10 tables and their
+sidecars) from `eb183db59`.
+Feeding the dataset tree itself to `build` fails artifact integrity, because it
+ships its own `manifest.json` files; the composed root is the input.
+
+| gate | result |
+| --- | --- |
+| `build` | 3204 sources → 1188 manifests, 1998 converted tables, 1206 copied, 0 skipped; 239266718 B → 244545037 B; 56 declared-reuse groups resolved |
+| `audit` | `ok: true`, 3204 checked, 0 problems, 0 unmapped sources, 0 unmapped destinations (1996 `arrow-rows`, 1206 `file-bytes`, 2 `embedded-source`) |
+| `check_dataset` | pass — `aisim-dataset-index/v1`, op-latency index re-derived from the built tree |
+| `check_catalog_size` | no findings (0 errors, 0 warnings) |
+| mirror public profile | **fails, and fails on the base revision too** — 3551 errors: 3507 `image-name`, 37 `image-digest`, 4 `patch-reference`, 2 `orphan-file`, 1 `internal-host`; validator fingerprint `b0c8406cb360` |
+| candidate, not promotion | nothing writes the pin, the package or the mirror; `status` in `publish-handoff.json` stays `candidate-built-not-uploaded` |
+
+The public-profile result is dataset-wide, not a property of these rows: the
+pinned `c231f32b` revision fails in every system and family, and this bundle
+fails the same way. Each of the eight cells contributes four `image-name`
+findings from the same `image` / `image_digest` sidecar fields that every other
+cell carries; no new finding code appears. `docs/ci/accuracy.md` marks the
+mirror validator and promotion tool as **planned**, so public disclosure is a
+prerequisite the promotion step must satisfy (redact or `[REDACTED]` the
+withheld fields), not a defect introduced here.
+
+Row accounting, independent of the builder's own checks: all ten tables carry
+the merged row counts in `merge-check.json`, and every `source_sha256` recorded
+in the bundle's `source_map.parquet` equals the SHA-256 of the `eb183db59` blob
+it was converted from. The QSA slices are 11782 context + 740 generation rows on
+SGLang 0.5.21 and 976 + 736 on vLLM 0.31.0.
+
+### Bundle identity
+
+| object | value |
+| --- | --- |
+| bundle | 4411 files (4393 data, 18 catalog), 244545037 B, SHA-256 `e3af85b31631e0bfaeb7bc366ffa67576a3a1ca63d6b330b2b7f02ec37066367` |
+| `catalog/` | SHA-256 `84f82db0571a9241d0a9c77300e6096482fa7467cbe8b1b8d70aa905e576a215` |
+| `catalog/op-latency.json` | 1219223 B, SHA-256 `649bbe23723ebc038a07d74711d659a098085ed24e62b541a5a21549bab9bac9` |
+
+Both tree digests are SHA-256 over sorted `<relative path>\0<sha256(file)>\n`
+lines, so they are reproducible from a checkout. Per-cell digests:
+
+| cell | rows | SHA-256 |
+| --- | ---: | --- |
+| `h200_sxm/gemm/sglang/0.5.21` | 105894 | `47ab482fe6f1bd1888070966d6db5c27d1805bbe9bb17b8e1dc518eded0e8100` |
+| `h200_sxm/gemm/vllm/0.31.0` | 111666 | `27326afad611ed5b1a60d2742bff936ad0bb1a01d4f77f2602d141d719ce2367` |
+| `h200_sxm/moe/sglang/0.5.21` | 115506 | `aa5cf99d61c52dbe7fb7b9b431472d31bad44440421d0dfa1e194bef6c405883` |
+| `h200_sxm/moe/vllm/0.31.0` | 2916 | `771957e1c934cf8c37522462193bf68eb74c915bf96cf479b836b090f7c6ab14` |
+| `h200_sxm/linear_attention/sglang/0.5.21` | 10921 | `f586c3a0ba568801de489252f4835832ff189b0b3a9736c854338c72a24c5b09` |
+| `h200_sxm/linear_attention/vllm/0.31.0` | 984 | `7f4e3a74e17ee3cda0449ea27ccb5d9e5d9b59da0748d82f0f03cd27edbf27f2` |
+| `h200_sxm/msa/sglang/0.5.21` | 2581 | `273f180b04287c8c78340f1538fb12c66bba0bc488592cd986012b08bb584bea` |
+| `h200_sxm/msa/vllm/0.31.0` | 736 | `c5df4ce2e4e569b0d06c9f1a31443c53841cd84ee6e3c751f2e1637b3261744e` |
+
+### Payload, and what the bundle is not
+
+The bundle verifies the merge; it is not the upload payload. `build`
+re-converts every parquet source, so its tables are not byte-identical to the
+published dataset even where the content is unchanged (sampled:
+`h200_sxm/gemm/vllm/0.32.0/gemm_perf.parquet` 515920 → 515774 B). The audit
+proves the content is preserved on its `arrow-rows` basis, but the bytes are a
+new encoding. The composed root is also not a git checkout, so every manifest
+the build regenerates carries `source_commit: null`, where the published
+manifests carry `dbff10b4c32bdcd808356f4110e4b0c5fae134d4`.
+
+Uploading the bundle's category tree as-is would therefore rewrite every table:
+1996 measurement tables (the 1993 carried over plus the 3 new ones) and the two
+lookup tables, plus all 1188 manifests, and drop the commit lineage from every
+manifest. That is not a merge of ten tables. The payload is:
+
+| payload | files | location |
+| --- | ---: | --- |
+| 10 merged tables and 8 sidecars | 18 | `eb183db59:python/aisim/src/aisim_core/systems/data/h200_sxm/…` |
+| five Qwen reuse groups | +25 lines | `perf_data_reuse_manifest.yaml`, reproduced in `publish-handoff.json.sources` |
+
+Five of the 18 files are new (three tables and two sidecars under
+`msa/vllm/0.31.0/` and `linear_attention/vllm/0.31.0/`); the other thirteen
+replace existing cell files. The bundle's own tables are a re-encoding of these,
+not a different measurement.
+
+Publishing them needs the post-cutover flow, which this repository does not
+have: `publish_op_latency_tree build` expects the pre-cutover
+`python/aisim/src/aisim_core/systems/data/` layout and stamps
+`source_commit` from that checkout, and no `main` commit carries the layout
+since `#857`. Two ways out, both maintainer calls:
+
+1. **Apply the payload in a checkout that has the layout**, run `build` so the
+   manifests keep a real `source_commit`, then upload the resulting category
+   tree. `catalog/op-latency.json` and `catalog/op-latency/h200_sxm.parquet`
+   are re-derived by the same run; every other shard stays byte-identical.
+2. **Upload the verified bundle category** (`data/op-latency/`,
+   `catalog/op-latency.json`, `catalog/op-latency/`) as a one-off and accept a
+   broad, row-identical diff with null manifest lineage.
+
+Either way, do **not** upload the bundle's `catalog/dataset.json`: it is a
+single-category index, while the dataset's copy names `e2e`, `fpm` and
+`op-latency`. Set `categories.op-latency.index` in the existing file to the
+uploaded `catalog/op-latency.json` bytes and SHA-256 instead, keeping the other
+two references. `catalog/op-latency-reuse.parquet` and `catalog/systems.parquet`
+are byte-identical to the base, so re-uploading them is a no-op.
+
+`hf upload` only adds or overwrites, so the six system-level files under
+`b200_sxm/` that sit outside the builder's
+`<system>/<family>/<backend>/<version>/` layout (`README.md`, two
+`power_upstream/*.parquet.source`, and the `vllm-0.25.0` report, notes and
+failure bundle) stay in place regardless of channel. The file counts reconcile:
+4389 base system files + 7 new-cell files − 6 unmanaged aux files = 4390, plus 3
+root parquet files = 4393.
+
+After that revision merges, raise `revision` in
+`python/aisim/src/aisim_core/data/op_latency_pin.json` to it. The order cannot be
+reversed: CI downloads the pinned tree, so a pin bump ahead of the merge has
+nothing to fetch. The bump is a maintainer step, not part of this change.
+
+The bump makes the QSA slice resolvable under SILICON only where the collected
+version is a queryable one. The dataset's slots are `sglang 0.5.23/0.5.21` and
+`vllm 0.32.0/0.30.0` (identical in the in-tree `systems/query_versions.yaml`),
+so:
+
+| lane | collected | slot | after publish + pin bump |
+| --- | --- | --- | --- |
+| SGLang | 0.5.21 | `previous` | queryable |
+| vLLM | 0.31.0 | neither | `UnlistedQueryVersionError` unless `AIC_ALLOW_UNLISTED_VERSIONS=1` |
+
+That was probed directly on this tree, not inferred:
+`get_database_view("h200_sxm", "vllm", "0.31.0", database_mode="SILICON")` raises
+while `vllm/0.32.0`, `sglang/0.5.21` and `sglang/0.5.23` return a view. The
+escape hatch is an environment variable; there is no CLI flag. The bundle as
+built leaves the slots untouched, and `decisions` in `publish-handoff.json`
+records the maintainer choice: keep the slots (vLLM lane needs the escape
+hatch), promote 0.31.0 to `previous` (a dataset-wide change affecting every
+vLLM family), or recollect the lane on 0.32.0.
+
 ## Checks
 
 | check | result |
 | --- | --- |
 | `check_collector_data.py` (7 rules: sidecar coverage, reuse validity, comm exclusion, family placement, identity v2 resolution, legacy markers, attested events) | all OK |
-| Rust `perfmodel::operators::msa` tests | 7 passed |
+| Rust `perfmodel::operators::msa` tests (includes the two guard tests) | 9 passed |
+| Rust `cargo test -p aisim-core --lib` (full crate) | 3576 passed, 0 failed, 2 ignored |
 | Rust engine parity (`test_compile_engine_parity.py`, `test_engine_step_parity.py`) | 389 passed |
-| Python `tests/unit/sdk/database` + `tests/unit/sdk/models/test_qwen4_exp.py` | 701 passed, 15 deselected |
+| Python `tests/unit/sdk/database` + `tests/unit/sdk/models/test_qwen4_exp.py` | 737 passed (1 warning) |
 | ruff check / format | clean |
 
 `cargo clippy -D warnings` is red on this checkout's Homebrew rustc 1.99 for
@@ -127,7 +285,11 @@ one 8192-token request (prefill and decode). Results are in
 | SGLang 0.5.21 | 162.708 ms | 5.606 ms |
 
 Both backends resolve from SILICON; no fallback is involved. FP8 fails closed on
-the QSA slice (see below), which is why the table above is BF16 only.
+the QSA slice (see below), which is why the table above is BF16 only. This run
+also predates the data cutover and used the merged in-tree tables, where vLLM
+0.31.0 was the `next` slot; on the current tree it is outside the slots, so the
+vLLM lane needs the published revision plus a slot promotion or
+`AIC_ALLOW_UNLISTED_VERSIONS=1`.
 
 ## Default `aisimulate predict` workflow
 
@@ -146,6 +308,15 @@ serving topology). Both complete with `source=aic` and the pinned data version.
 Artifacts are under `predict-vllm/` and `predict-sglang/`. Power detail is
 unavailable (insufficient energy coverage); this bundle makes no power claim.
 These numbers are a plumbing smoke, not an accuracy result.
+
+Both runs read the merged tables from the repository tree as it stood before
+the data cutover. On the current tree neither config runs, for two independent
+reasons: the model's rows are not in the pinned dataset (the SGLang config fails
+first on the Qwen MoE shape), and vLLM 0.31.0 is no longer a listed query
+version (that config fails during validation, before any data lookup).
+Reproducing them needs the published revision **and**, for vLLM, either a slot
+promotion or `AIC_ALLOW_UNLISTED_VERSIONS=1`; SGLang 0.5.21 needs only the
+published revision.
 
 Reproduce from the repository root:
 

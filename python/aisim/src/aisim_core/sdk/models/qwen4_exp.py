@@ -57,7 +57,9 @@ Modeling caveats that gate accuracy qualification (see
   empirical miss instead of borrowing (``operators/msa.rs``). The Qwen-geometry
   rows are staged in ``benchmarks/evidence/collector/qwen38-c3.5`` and reach
   SILICON only once the ``ai-dynamo/aisim-data`` revision that carries them is
-  published and the pin is raised; until then SILICON and HYBRID raise, and
+  published, the pin is raised, and the collected version is queryable (SGLang
+  0.5.21 is; vLLM 0.31.0 needs a slot promotion or
+  ``AIC_ALLOW_UNLISTED_VERSIONS=1``). Until then SILICON and HYBRID raise, and
   SOL answers analytically. Serving accuracy (8-GPU serve vs replay) is not
   yet qualified.
 * The n-gram table is priced as TP-sharded HBM residency, which is the
