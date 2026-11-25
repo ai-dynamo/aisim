@@ -916,6 +916,45 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
         }
     }
 
+    fn validate_load_back_window(
+        &self,
+        tree_core: &UnifiedTreeCore<K, V>,
+        node_id: NodeIdx_,
+        transfers: &[PoolTransfer<V>],
+    ) -> Result<(), TreeCoreRuntimeError> {
+        let mut node = tree_core.arena.node(node_id);
+        if self.swa_req_ring && !node.has_device_value(SWA) && !node.has_host_value(SWA) {
+            return Ok(()); // Full-only ring restore; the request rebuilds SWA.
+        }
+        let invalid = || TreeCoreRuntimeError::InvalidLoadBackSpec {
+            node_id: tree_core.arena.node(node_id).id,
+        };
+        // The commit hook consumes the first transfer, ordered ancestors first.
+        // Walk its borrowed handles backwards alongside the required window.
+        let mut planned = transfers
+            .first()
+            .and_then(|transfer| transfer.nodes_to_load.as_deref())
+            .unwrap_or_default()
+            .iter()
+            .rev();
+        let mut covered = 0usize;
+        while !node.is_root() && covered < self.sliding_window_size {
+            if node.has_device_value(SWA) {
+                covered += node.device_value_len(SWA);
+            } else {
+                if !node.has_host_value(SWA) || planned.next() != Some(&node.id) {
+                    return Err(invalid());
+                }
+                covered += node.host_value_len(SWA);
+            }
+            node = tree_core.arena.node(node.parent());
+        }
+        if planned.next().is_some() {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
     fn build_hicache_transfers(
         &self,
         tree_core: &UnifiedTreeCore<K, V>,

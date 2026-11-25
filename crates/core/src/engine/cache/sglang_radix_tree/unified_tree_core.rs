@@ -4888,6 +4888,15 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 }
             }
         }
+        if let Some(swa) = &self.components_by_type[SWA.idx()] {
+            // Device-resident spans skipped while planning may have been evicted
+            // independently. Validate them even when no SWA transfer was needed.
+            swa.validate_load_back_window(
+                self,
+                node_id,
+                comp_xfers.get(&SWA).map_or(&[], Vec::as_slice),
+            )?;
+        }
         let mut cache_actions: Vec<CacheAction<V>> = Vec::new();
         kv_xfer.device_indices = Some(device_indices);
         let nodes_to_load = kv_xfer.nodes_to_load.clone();

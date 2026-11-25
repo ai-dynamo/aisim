@@ -370,6 +370,16 @@ pub trait TreeComponent<K: ChildKeyType, V: RadixValue> {
         unimplemented!("release_window_lock is SWA-only")
     }
 
+    /// Recheck dependencies omitted from a staged load-back before any adoption.
+    fn validate_load_back_window(
+        &self,
+        tree_core: &UnifiedTreeCore<K, V>,
+        node_id: NodeIdx_,
+        transfers: &[PoolTransfer<V>],
+    ) -> Result<(), TreeCoreRuntimeError> {
+        Ok(())
+    }
+
     /// Build transfer descriptors for this component in the given phase; None when
     /// the component has nothing to transfer.
     fn build_hicache_transfers(

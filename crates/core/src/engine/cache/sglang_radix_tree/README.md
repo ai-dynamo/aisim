@@ -128,6 +128,13 @@ following local corrections to this pinned revision:
   Reject auxiliary destinations filled since planning. Mark foreign-pin
   deferrals explicitly so they commit as no-ops even for host-only anchors,
   while ordinary empty plans still require device-resident Full KV.
+  Before adopting any rows, recheck that the required SWA window is still
+  device-resident or covered by the staged transfer, including device spans
+  skipped at planning and plans that originally needed no SWA transfer.
+  Reject newly missing spans so the caller can release staging and replan;
+  preserve Full-only ring restores. This borrows handles during one
+  window-bounded ancestor walk, without copying rows or scanning other nodes.
+  Full-only caches skip this validation.
   Refresh each restored node's parent eligibility before another eviction.
   Publish CPU store events only for the matching write-through acknowledgement.
 - Drop failed-backup subtrees in stable NodeId sibling order, descendants first,

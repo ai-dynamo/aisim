@@ -1080,6 +1080,184 @@ fn mamba_load_back_rechecks_an_independently_filled_destination() {
 }
 
 #[test]
+fn swa_load_back_rechecks_device_rows_skipped_by_the_plan() {
+    for write_back in [false, true] {
+        for (restore_full, restore_child_swa) in [(false, false), (false, true), (true, true)] {
+            for evict_parent in [false, true] {
+                let mut tree = Core::new(
+                    CacheInitParams {
+                        enable_hicache: true,
+                        enable_kv_cache_events: true,
+                        is_write_back: write_back,
+                        swa_sliding_window_size: Some(2),
+                        has_swa_host_pool: true,
+                        ..Default::default()
+                    },
+                    vec![FULL, SWA],
+                );
+                let parent = insert(&mut tree, vec![10], &[1]);
+                let key = vec![10, 20];
+                let child = insert(&mut tree, key.clone(), &[1, 2]);
+                tree.attach_swa_window(
+                    &key,
+                    Default::default(),
+                    0,
+                    2,
+                    &PageValue::from_vec(vec![11, 12]),
+                )
+                .unwrap();
+                for (id, full_host, swa_host) in [(parent, 101, 201), (child, 102, 202)] {
+                    tree.commit_backup(
+                        id,
+                        PageValue::from_vec(vec![full_host]),
+                        [(
+                            SWA,
+                            vec![PoolTransfer {
+                                name: PoolName::Swa,
+                                host_indices: Some(PageValue::from_vec(vec![swa_host])),
+                                nodes_to_load: Some(vec![id]),
+                                ..Default::default()
+                            }],
+                        )]
+                        .into_iter()
+                        .collect(),
+                    )
+                    .unwrap();
+                    let pending = tree.mark_write_through_pending(vec![id], id).unwrap();
+                    tree.finish_write_through(pending, id).unwrap();
+                }
+                if restore_child_swa {
+                    // Make the child LRU, then evict only its SWA through the
+                    // normal internal eviction path. Full and parent SWA stay.
+                    tree.match_prefix(&MatchPrefixParams {
+                        key: &vec![10],
+                        namespace: Default::default(),
+                    });
+                    evict_auxiliary(&mut tree, child, SWA);
+                }
+                if restore_full {
+                    tree.demote(child).unwrap();
+                }
+                let (full, mut auxiliary) = tree.build_load_back_spec(child, None).unwrap();
+                assert_eq!(
+                    full.node_row_counts.as_deref().unwrap().len(),
+                    usize::from(restore_full)
+                );
+                if restore_child_swa {
+                    assert_eq!(
+                        auxiliary[&SWA][0].nodes_to_load.as_deref(),
+                        Some(&[child][..])
+                    );
+                    auxiliary.get_mut(&SWA).unwrap()[0].device_indices =
+                        Some(PageValue::from_vec(vec![302]));
+                } else {
+                    assert!(!auxiliary.contains_key(&SWA));
+                }
+                if evict_parent {
+                    evict_auxiliary(&mut tree, parent, SWA);
+                }
+                tree.take_events();
+                let sizes = (
+                    tree.total_size(),
+                    tree.evictable_size(),
+                    tree.protected_size(),
+                );
+                let lru = tree.inspect_get_component_device_lru_node_ids(SWA);
+                let result = tree.commit_load_back(
+                    child,
+                    PageValue::from_vec(if restore_full { vec![3] } else { vec![] }),
+                    full,
+                    auxiliary,
+                );
+                if evict_parent {
+                    assert!(matches!(
+                        result,
+                        Err(TreeCoreRuntimeError::InvalidLoadBackSpec { .. })
+                    ));
+                    assert_eq!(
+                        (
+                            tree.total_size(),
+                            tree.evictable_size(),
+                            tree.protected_size()
+                        ),
+                        sizes
+                    );
+                    assert_eq!(tree.inspect_get_component_device_lru_node_ids(SWA), lru);
+                    assert!(tree.take_events().is_empty());
+                    for id in [parent, child] {
+                        let node = tree.arena.node(tree.arena.resolve(id).unwrap());
+                        assert_eq!(node.load_back_pending_id, None);
+                        assert_eq!(node.has_device_value(FULL), id == parent || !restore_full);
+                        if let Some(value) = node.try_device_value(FULL) {
+                            assert_eq!(value.as_slice(), if id == parent { &[1] } else { &[2] });
+                        }
+                        assert_eq!(
+                            node.host_value(FULL).as_slice(),
+                            if id == parent { &[101] } else { &[102] }
+                        );
+                        assert_eq!(
+                            node.host_value(SWA).as_slice(),
+                            if id == parent { &[201] } else { &[202] }
+                        );
+                        assert_eq!(
+                            node.has_device_value(SWA),
+                            id == child && !restore_child_swa
+                        );
+                    }
+                    tree.try_sanity_check(&[], &[]).unwrap();
+                    // The caller can reclaim the rejected staging rows and
+                    // retry with a fresh plan covering the newly missing span.
+                    let (full, mut auxiliary) = tree.build_load_back_spec(child, None).unwrap();
+                    let expected_nodes = if restore_child_swa {
+                        vec![parent, child]
+                    } else {
+                        vec![parent]
+                    };
+                    assert_eq!(
+                        auxiliary[&SWA][0].nodes_to_load.as_deref(),
+                        Some(expected_nodes.as_slice())
+                    );
+                    auxiliary.get_mut(&SWA).unwrap()[0].device_indices =
+                        Some(PageValue::from_vec(if restore_child_swa {
+                            vec![301, 302]
+                        } else {
+                            vec![301]
+                        }));
+                    tree.commit_load_back(
+                        child,
+                        PageValue::from_vec(if restore_full { vec![3] } else { vec![] }),
+                        full,
+                        auxiliary,
+                    )
+                    .unwrap();
+                } else {
+                    result.unwrap();
+                }
+                tree.finish_load_back(child).unwrap();
+                let matched = tree.match_prefix(&MatchPrefixParams {
+                    key: &key,
+                    namespace: Default::default(),
+                });
+                assert_eq!(matched.last_device_node_id, child);
+                assert_eq!(
+                    matched.device_indices.as_slice(),
+                    if restore_full { &[1, 3] } else { &[1, 2] }
+                );
+                for (id, value) in [
+                    (parent, if evict_parent { 301 } else { 11 }),
+                    (child, if restore_child_swa { 302 } else { 12 }),
+                ] {
+                    let node = tree.arena.node(tree.arena.resolve(id).unwrap());
+                    assert_eq!(node.device_value(SWA).as_slice(), &[value]);
+                    assert_eq!(node.load_back_pending_id, None);
+                }
+                tree.try_sanity_check(&[], &[]).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
 fn swa_load_back_rejects_split_rows_before_any_component_commits() {
     for write_back in [false, true] {
         let mut tree = Core::new(

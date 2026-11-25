@@ -255,6 +255,23 @@ and its LICENSE for provenance, the preserved license, and each local correction
      ) -> MatchResult<V> {
          result
      }
+@@ -368,6 +370,16 @@
+         unimplemented!("release_window_lock is SWA-only")
+     }
+
++    /// Recheck dependencies omitted from a staged load-back before any adoption.
++    fn validate_load_back_window(
++        &self,
++        tree_core: &UnifiedTreeCore<K, V>,
++        node_id: NodeIdx_,
++        transfers: &[PoolTransfer<V>],
++    ) -> Result<(), TreeCoreRuntimeError> {
++        Ok(())
++    }
++
+     /// Build transfer descriptors for this component in the given phase; None when
+     /// the component has nothing to transfer.
+     fn build_hicache_transfers(
 --- a/components/swa.rs
 +++ b/components/swa.rs
 @@ -426,8 +426,9 @@
@@ -293,7 +310,53 @@ and its LICENSE for provenance, the preserved license, and each local correction
              cursor = tree_core
                  .device_lru_list(SWA)
                  .get_lru_no_lock(&tree_core.arena);
-@@ -953,6 +957,12 @@
+@@ -912,6 +916,45 @@
+         }
+     }
+
++    fn validate_load_back_window(
++        &self,
++        tree_core: &UnifiedTreeCore<K, V>,
++        node_id: NodeIdx_,
++        transfers: &[PoolTransfer<V>],
++    ) -> Result<(), TreeCoreRuntimeError> {
++        let mut node = tree_core.arena.node(node_id);
++        if self.swa_req_ring && !node.has_device_value(SWA) && !node.has_host_value(SWA) {
++            return Ok(()); // Full-only ring restore; the request rebuilds SWA.
++        }
++        let invalid = || TreeCoreRuntimeError::InvalidLoadBackSpec {
++            node_id: tree_core.arena.node(node_id).id,
++        };
++        // The commit hook consumes the first transfer, ordered ancestors first.
++        // Walk its borrowed handles backwards alongside the required window.
++        let mut planned = transfers
++            .first()
++            .and_then(|transfer| transfer.nodes_to_load.as_deref())
++            .unwrap_or_default()
++            .iter()
++            .rev();
++        let mut covered = 0usize;
++        while !node.is_root() && covered < self.sliding_window_size {
++            if node.has_device_value(SWA) {
++                covered += node.device_value_len(SWA);
++            } else {
++                if !node.has_host_value(SWA) || planned.next() != Some(&node.id) {
++                    return Err(invalid());
++                }
++                covered += node.host_value_len(SWA);
++            }
++            node = tree_core.arena.node(node.parent());
++        }
++        if planned.next().is_some() {
++            return Err(invalid());
++        }
++        Ok(())
++    }
++
+     fn build_hicache_transfers(
+         &self,
+         tree_core: &UnifiedTreeCore<K, V>,
+@@ -953,6 +996,12 @@
                  }])
              }
              CacheTransferPhase::LoadBack => {
@@ -306,7 +369,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
                  // `node` is best_match_node; the SWA validator guarantees every
                  // ancestor within `sliding_window_size` has value or host_value.
                  let mut n_swa = 0;
-@@ -982,6 +992,7 @@
+@@ -982,6 +1031,7 @@
                  nodes_to_load.reverse();
                  Some(vec![PoolTransfer {
                      name: PoolName::Swa,
@@ -1416,7 +1479,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let loaded_node_indices = kv_xfer
              .nodes_to_load
              .iter()
-@@ -4479,6 +4767,127 @@
+@@ -4479,6 +4767,136 @@
              .map(|&loaded_id| self.arena.resolve(loaded_id))
              .collect::<Result<Vec<_>, _>>()?;
          self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
@@ -1541,10 +1604,19 @@ and its LICENSE for provenance, the preserved license, and each local correction
 +                }
 +            }
 +        }
++        if let Some(swa) = &self.components_by_type[SWA.idx()] {
++            // Device-resident spans skipped while planning may have been evicted
++            // independently. Validate them even when no SWA transfer was needed.
++            swa.validate_load_back_window(
++                self,
++                node_id,
++                comp_xfers.get(&SWA).map_or(&[], Vec::as_slice),
++            )?;
++        }
          let mut cache_actions: Vec<CacheAction<V>> = Vec::new();
          kv_xfer.device_indices = Some(device_indices);
          let nodes_to_load = kv_xfer.nodes_to_load.clone();
-@@ -4547,6 +4956,9 @@
+@@ -4547,6 +4965,9 @@
                  self.arena.node_mut(idx).load_back_pending_id = None;
                  // The pin blocked leaf-set membership; re-evaluate it.
                  self.update_evictable_leaf_sets_(idx);
@@ -1554,7 +1626,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              }
              self.update_full_coexisting_host_tracking_(idx);
              node_id = self.arena.node(idx).try_parent();
-@@ -4709,8 +5121,12 @@
+@@ -4709,8 +5130,12 @@
              if node.write_through_pending_id == Some(ack_id) {
                  node.write_through_pending_id = None;
                  self.update_full_coexisting_host_tracking_(node_idx);
@@ -1569,7 +1641,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          }
          Ok(())
      }
-@@ -4829,6 +5245,11 @@
+@@ -4829,6 +5254,11 @@
          for &(child_id, pos, prefix_len) in &spans {
              if pos + prefix_len <= window_start {
                  continue;
@@ -1581,7 +1653,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              }
              if self.arena.has_device_value(child_id, SWA) {
                  return Err(format!(
-@@ -5601,14 +6022,7 @@
+@@ -5601,14 +6031,7 @@
      /// Whether the node is currently eligible as a Full device leaf.
      pub fn inspect_is_device_leaf(&self, node_id: NodeId) -> Result<bool, NodeAccessError> {
          let node_id = self.arena.resolve(node_id)?;
@@ -1597,7 +1669,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
      }
 
      /// Materialize every live tree node handle.
-@@ -5833,6 +6247,12 @@
+@@ -5833,6 +6256,12 @@
          let last_device_node_idx = self.arena.resolve(result.last_device_node_id)?;
          self.arena.resolve(result.last_host_node_id)?;
          let best_match_node_idx = self.arena.resolve(result.best_match_node_id)?;
@@ -1610,7 +1682,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          Ok(self
              .component_by_type_(component_type)
              .finalize_match_result_in_tree_core(
-@@ -5843,6 +6263,7 @@
+@@ -5843,6 +6272,7 @@
                  params,
                  value_chunks,
                  best_value_len,
