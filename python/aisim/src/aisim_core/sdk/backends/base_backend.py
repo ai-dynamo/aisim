@@ -2660,10 +2660,11 @@ class BaseBackend:
                 per_op_source=dict(encoder_source_dict),
             )
         summary.set_aggregate_energy_breakdown(energy_groups)
-        # Mixed steps carry no FPM energy (AISIM-1973 D10, AISIM-2001), so
-        # their latency stays uncovered. Aggregate FPM watts follow the same
-        # 0.9 coverage gate as static runs; when the watts are withheld, the
-        # energy and coverage stay on the summary for diagnostics.
+        # Schema-v8 FPM mixed steps retain measured prefill energy and add
+        # max(0, E_target - E_KV_floor) for decode only with positive marginal
+        # latency and power on both rows. Unpowered time stays uncovered.
+        # Aggregate FPM watts use the same 0.9 coverage gate as static runs;
+        # withheld watts leave energy and coverage available for diagnostics.
         if self._withholds_fpm_power(model, summary):
             result_dict["power_w"] = None
         summary.set_e2e_power_avg(result_dict["power_w"])  # mirrors the row; None when withheld

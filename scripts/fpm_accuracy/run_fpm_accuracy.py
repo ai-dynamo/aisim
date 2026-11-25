@@ -24,9 +24,23 @@ from scripts.fpm_accuracy.contract import (
 from scripts.fpm_accuracy.dashboard_contract import MAX_FILE, validate_details
 from scripts.fpm_accuracy.evaluate import evaluate_case
 from scripts.fpm_accuracy.hf import HfDataset
+from scripts.fpm_accuracy.hf.dataset import UNIFIED_CATALOG
 from scripts.fpm_accuracy.scenario_contract import validate_scenarios
 from scripts.fpm_accuracy.scenarios import evaluate_scenario_case, scenario_document
 from scripts.release.package_identity import installed_distribution, runtime_module
+
+
+def local_selection(root: Path, selection: dict) -> dict:
+    """The selection a local dataset can apply before loading.
+
+    A legacy snapshot has no catalog to select from, so ``--configuration`` filters after loading (as it always
+    did); ``--model`` and ``--hardware`` need the unified layout and fail rather than being ignored.
+    """
+    if (Path(root) / UNIFIED_CATALOG).is_file() or not any(selection.values()):
+        return selection
+    if selection["models"] or selection["hardware"]:
+        raise ValueError("--model and --hardware need the unified dataset layout")
+    return {**selection, "configuration_paths": None}
 
 
 def evaluate_configuration(case, scenarios: bool, include_comparison: bool):
@@ -70,6 +84,8 @@ def main():
         type=Path,
         help="Separate notification evidence; not a Pages artifact",
     )
+    parser.add_argument("--model", action="append", help="Smoke only: select models (HF IDs) before downloading")
+    parser.add_argument("--hardware", action="append", help="Smoke only: select system IDs before downloading")
     parser.add_argument(
         "--configuration",
         action="append",
@@ -91,10 +107,18 @@ def main():
     wheel_hash = hashlib.sha256(args.wheel.read_bytes()).hexdigest()
     if installed_hash != wheel_hash:
         raise ValueError("installed AISim distribution does not match the supplied wheel")
+    # Select before downloading: only the chosen configurations' evaluation artifacts leave the Hub.
+    smoke = bool(args.configuration or args.model or args.hardware)
+    selection = {"models": args.model, "hardware": args.hardware, "configuration_paths": args.configuration}
     dataset = (
-        HfDataset.from_local(args.local_dataset, revision=args.hf_revision)
+        HfDataset.from_local(
+            args.local_dataset,
+            revision=args.hf_revision,
+            repo_id=HF_REPO,
+            **local_selection(args.local_dataset, selection),
+        )
         if args.local_dataset
-        else HfDataset.from_hub(revision=args.hf_revision)
+        else HfDataset.from_hub(HF_REPO, revision=args.hf_revision, **selection)
     )
     if dataset.revision != args.hf_revision:
         raise ValueError("resolved HF revision differs from the pinned campaign revision")
@@ -102,7 +126,9 @@ def main():
     if args.configuration:
         selected = set(args.configuration)
         configurations = tuple(item for item in configurations if item.configuration_path in selected)
-        if {item.configuration_path for item in configurations} != selected:
+        # A unified dataset validated the paths against its whole catalog while selecting, and --model/--hardware
+        # may legitimately drop some; a legacy snapshot has no catalog, so every path must have loaded.
+        if dataset.layout == "legacy" and {item.configuration_path for item in configurations} != selected:
             raise ValueError("unknown smoke configuration")
     comparison = {} if args.comparison_output else None
     rows = []
@@ -158,7 +184,7 @@ def main():
         if len(scenario_data) > MAX_FILE:
             raise ValueError("scenario artifact exceeds the public asset size limit; campaign cannot qualify")
         (args.output / "scenarios.json").write_bytes(scenario_data)
-    if args.configuration:
+    if smoke:
         (args.output / "SMOKE_ONLY.txt").write_text("Partial dataset smoke; not qualified for publication.\n")
     else:
         qualification = {

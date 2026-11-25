@@ -13,6 +13,27 @@ distributed with those packages.
 Unless otherwise stated, AISim file paths in this document are relative
 to `python/aisim/` in the repository source tree.
 
+## NVIDIA Agent Skills CI request workflow
+
+The repository-root `.github/workflows/request-nvskills-ci.yml` is a modified
+copy of `.github/workflows/request-nvskills-ci.yml` in NVIDIA/skills at immutable
+commit `bdc6bf92f4f76c741f0d499415f75c2ee7ceab6f`.
+
+Upstream source:
+https://github.com/NVIDIA/skills/blob/bdc6bf92f4f76c741f0d499415f75c2ee7ceab6f/.github/workflows/request-nvskills-ci.yml
+
+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+Licensed under Apache-2.0, as specified for source code in the upstream README.
+Upstream license:
+https://github.com/NVIDIA/skills/blob/bdc6bf92f4f76c741f0d499415f75c2ee7ceab6f/LICENSE-APACHE
+
+The full Apache-2.0 license text is included here as `LICENSE`. The pinned
+upstream source has no separate NOTICE file on this workflow's ancestor paths.
+Modified for AISim by adding SPDX/provenance headers and pinning the reusable
+workflow reference to the same immutable commit instead of `main`, and by
+disabling default token permissions while retaining the request job's explicit
+read scopes.
+
 ## SGLang v0.5.22 HiCache residency and merged backups
 
 The merged backup submission in repository-root
@@ -468,9 +489,10 @@ These source files are licensed under the Apache License, Version 2.0; see the
 
 ## vLLM
 
-Selected synchronous MTP scheduling, uniform full-attention KV allocation, and
-host-offload behaviors in the following repository-root paths are adapted and
-modified from vLLM `v0.32.0` at commit
+Selected synchronous MTP scheduling, uniform full-attention KV allocation,
+host-offload behaviors, and the async engine's CPU-tier load polling in the
+following repository-root paths are adapted and modified from vLLM `v0.32.0` at
+commit
 `5df63a7203cdb9328d824a27b682e77c7b9928be`:
 
 - `crates/core/src/engine/cache/vllm_block_pool.rs`
@@ -482,9 +504,10 @@ modified from vLLM `v0.32.0` at commit
 - `crates/core/src/engine/scheduler/vllm/tests.rs`
 - `crates/core/src/engine/scheduler/vllm/mtp_offload_tests.rs`
 - `crates/core/src/engine/scheduler/vllm/native_mtp_tests.rs`
-- `docs/replay/engine/kv-cache.md` (MTP with host offload)
+- `docs/replay/engine/kv-cache.md` (MTP with host offload; CPU-tier loads)
 - `docs/replay/engine/speculation.md` (MTP with host offload)
 - `docs/replay/features.md` (MTP/G2 composition boundaries)
+- `docs/replay/engine/workers.md` (CPU-tier loads)
 
 Upstream source and regression scenarios:
 
@@ -495,6 +518,13 @@ Upstream source and regression scenarios:
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/model_runner.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/kv_connector.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/kv_offload/cpu/gpu_worker.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/simple_kv_offload/copy_backend.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/simple_kv_offload/manager.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/simple_kv_offload/worker.py
 
 Copyright contributors to the vLLM project.
 
@@ -593,6 +623,156 @@ These are modified Rust and Python simulations of the behavior: a retained
 boundary is one whole-state copy, and no upstream source file is vendored.
 
 
+The repository-root files `crates/core/src/engine/kv_manager/grouped_prefix.rs`,
+`crates/core/src/engine/kv_manager/grouped_prefix_tests.rs` (its test module,
+with cases ported from the upstream tests) and
+`crates/core/src/engine/kv_manager/grouped.rs` adapt rules of vLLM v0.31.0,
+immutable commit `db9527a46873454610df6dbedf79a36d6bf1a7f6`, of vLLM
+v0.32.0, immutable commit `5df63a7203cdb9328d824a27b682e77c7b9928be`, and of
+vLLM v0.33.0, immutable commit `4ba787ec9959e566d3b587a796dff07673324da5`.
+From `kv_cache_coordinator.py`, `block_pool.py` and
+`single_type_kv_cache_manager.py`, the block mode of `grouped.rs` adapts the one
+block pool of all groups, the capacity cost of a cached hit block that leaves
+the free queue, the tail-first free order of a request's cached blocks and the
+blocks that a request holds in a state group: the running block, a hit block,
+the previous running block, the copy block of a partial hit and the prefill
+checkpoint block of v0.32.0.
+In `grouped_prefix.rs`, one rule table keyed by the vLLM version holds the three
+rows. The v0.33.0 row follows the rules of v0.32.0, which the listed v0.33.0
+files keep for a cache without speculative decoding.
+From `kv_cache_coordinator.py`, `grouped_prefix.rs` adapts the hybrid cache-hit
+lookup over the spec groups, the hit alignment, the scheduler block, the pinning
+of the hit blocks before an allocation and the release of the groups in group
+order. From `single_type_kv_cache_manager.py`, it adapts the hit rules of each
+group type, the copy of a hit that ends inside a block, the cached partial-tail
+entry, the state retention and the block lifetimes of an allocation, with the
+checkpoint block of v0.32.0. From `kv_cache_manager.py`, it adapts the hit cap,
+the junction of a hit, the whole-prompt block count of an admission and the
+release of the skipped blocks before an allocation. From `sched/scheduler.py`,
+it adapts the align-mode prefill split, with the checkpoint branch of v0.32.0,
+and the release of a copied hit block at the end of its step. From
+`kv_cache_interface.py`, it adapts the admission cap of a sliding-window group
+and the checkpoint block of v0.32.0, with its position and its validity test.
+From `block_pool.py`, it adapts the lookup of one spec group and the free order
+of cached blocks. From `kv_cache_utils.py`, it adapts the rule that the hash
+block divides the block of every prefix-cacheable group. From `engine/core.py`,
+it adapts the block of the align split, which is the smallest block of the
+prefix-cacheable groups. From `config/vllm.py`, it adapts the bound on in-flight
+tokens that the admission cap uses. The test module ports cases from the
+upstream tests listed below.
+From v0.31.0 and v0.32.0, `crates/core/src/engine/kv_manager/vllm_backend.rs`
+adapts, from `kv_cache_manager.py`, the whole-prompt admission cost of
+`allocate_slots`, its test of the first chunk before the hit blocks are
+pinned and the prefill end of a request that resumes after a preemption, and
+`grouped_prefix.rs` counts the blocks of that first chunk.
+`crates/core/src/engine/scheduler/vllm/policy.rs` adapts the whole-prompt test
+of `allocate_slots` and, from `sched/scheduler.py`, the token budget of a prompt
+without chunked prefill and the stop of the waiting loop at a request that does
+not fit, whose hit is searched again at the next step.
+`crates/core/src/engine/scheduler/vllm/core.rs` adapts, from
+`sched/scheduler.py`, the point where the copied hit blocks of a scheduling
+pass are released: after the waiting loop, at the end of the pass.
+`crates/core/src/engine/scheduler/vllm/grouped_tests.rs` holds the scheduler
+tests of these rules.
+`crates/core/src/engine/config.rs` and `grouped_prefix.rs` adapt the startup
+check of `kv_cache_utils.py` that the pool holds one request of `max_model_len`
+tokens, with the size of each group from `kv_cache_interface.py`, summed per
+group.
+In v0.33.0 that check is in `kv_cache_planning.py`. `config.rs` also refuses
+`prefill_schedule_interval` above 1 on the v0.33.0 row, because
+`sched/scheduler.py` of v0.33.0 applies that interval without data parallelism
+and the simulation does not.
+From `sched/scheduler.py` and `kv_cache_interface.py`, `grouped_prefix.rs` also
+adapts the rule that only a rank with a Mamba layer in align mode splits its
+prefill.
+`crates/core/src/engine/scheduler/vllm/core.rs` and `vllm_backend.rs` adapt the
+release of the skipped blocks of a completed source.
+
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_coordinator.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/single_type_kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/sched/scheduler.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/kv_cache_interface.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_utils.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/block_pool.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/engine/core.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/config/vllm.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_coordinator.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/kv_cache_interface.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_utils.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/block_pool.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/vllm.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/tests/v1/core/test_mamba_align_chunk_split.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_coordinator.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_utils.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_planning.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/block_pool.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/engine/core.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/config/vllm.py
+
+Copyright contributors to the vLLM project. Licensed under Apache-2.0:
+https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/LICENSE
+https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/LICENSE
+https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/LICENSE
+
+These are modified Rust simulation adaptations, restricted to no speculative
+decoding, no EAGLE and the default retention only. The identified upstream
+revisions have no root NOTICE file. The
+repository's Apache-2.0 LICENSE supplies the license text; no upstream source
+file is vendored.
+
+
+The repository-root file `crates/core/src/engine/kv_manager/grouped_transfer.rs`
+adapts the P/D transfer rules of vLLM's NIXL connector and KV cache manager
+from vLLM v0.31.0, immutable commit `db9527a46873454610df6dbedf79a36d6bf1a7f6`,
+and from vLLM v0.32.0, immutable commit
+`5df63a7203cdb9328d824a27b682e77c7b9928be`: the block clip of each cache
+group, the whole-block reads of a full-attention group, the in-window block
+count of a decode rank for a sliding-window group, the prefill backoff and
+truncation, the blocks that a decode rank pulls, the state pairing and the
+copy on each TP rank. The rules count the same blocks in both versions and
+take the bytes that the connector reads for one block of each group from the
+profile, so one set of rules covers both.
+`crates/core/src/engine/scheduler/vllm/grouped_tests.rs` holds the scheduler
+tests of these rules.
+
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/tp_mapping.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/single_type_kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/kv_cache_interface.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/tp_mapping.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/utils.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/kv_cache_interface.py
+
+Copyright contributors to the vLLM project. Licensed under Apache-2.0:
+https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/LICENSE
+https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/LICENSE
+
+This is a modified Rust simulation adaptation, restricted to no speculative
+decoding, no HiSparse, no bounded replay window and no `all` Mamba cache mode.
+No upstream method body is copied. The identified upstream revisions have no
+root NOTICE file. The repository's Apache-2.0 LICENSE supplies the license
+text, and no upstream source file is vendored.
+
+
 The inference-mode scope and MSA query-position metadata integration in
 `collector/vllm/collect_mla_module.py` and
 `collector/vllm/collect_msa_module.py` are adapted (modified) from serving
@@ -609,6 +789,21 @@ https://github.com/vllm-project/vllm/tree/dd10e03f95f94edbea1975c67ace3a35ec9a8a
 Copyright contributors to the vLLM project. Licensed under Apache-2.0;
 modifications adapt the serving contracts to synthetic collector batches.
 
+The capture-dependent DSA choices of `_dsa_serving_capture_parity` in
+`collector/vllm/collect_mla_module.py` are adapted (modified) from vLLM
+`v0.32.0` at commit `5df63a7203cdb9328d824a27b682e77c7b9928be`:
+
+- [`vllm/models/deepseek_v32/attention.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/models/deepseek_v32/attention.py)
+  (`_should_prepare_mqa_query`: when the W_UK BMM and the MQA query quantization run).
+- [`vllm/model_executor/layers/sparse_attn_indexer.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/layers/sparse_attn_indexer.py)
+  (the dense-MHA early return of `sparse_attn_indexer`).
+
+Copyright contributors to the vLLM project. Licensed under Apache-2.0:
+https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/LICENSE
+
+Both predicates are modified: the CUDA-stream capture term is replaced by
+whether serving captures a step of that size. No upstream file is vendored.
+
 
 The independently written Rust deferred-queue and post-lookup-touch behavior in
 `crates/core/src/engine/scheduler/vllm/{core,host_offload}.rs`
@@ -620,6 +815,51 @@ The upstream project is copyright contributors to the vLLM project and licensed
 under Apache-2.0. These repository-root-relative files adapt behavioral contracts;
 no upstream method bodies are copied. The Rust implementation and fixtures are
 modified for simulation and do not reproduce native filesystem timing.
+
+The KVCR model in these repository-root files is an independently written,
+modified Rust simulation adaptation of behavioral contracts of vLLM and KVCR:
+
+- `crates/core/src/engine/kvcr.rs`
+- `crates/core/src/engine/scheduler/vllm/kvcr.rs`
+- `crates/core/src/engine/scheduler/vllm/kvcr_g3.rs`
+- the KVCR call sites in `crates/core/src/engine/scheduler/vllm/host_offload.rs`
+- their tests in those files and in `crates/core/tests/kvcr_replay.rs`
+- the KVCR sections of `docs/replay/engine/kv-cache.md`
+
+vLLM at commit `68e478651a20e3d23bf939912c38883d511ac3ee`:
+
+- https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/vllm/v1/kv_offload/tiering/kvcr/manager.py
+- https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/vllm/v1/kv_offload/tiering/manager.py
+- https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/vllm/v1/kv_offload/base.py
+- https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/vllm/v1/kv_offload/cpu/manager.py
+- https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/vllm/v1/kv_offload/cpu/policies/lru.py
+- https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+- https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/vllm/distributed/kv_transfer/kv_connector/v1/offloading/state.py
+
+Copyright contributors to the vLLM project. Licensed under Apache-2.0:
+https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/LICENSE
+
+KVCR at commit `ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71`:
+
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/runtime/core.py
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/runtime/policy_runtime.py
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/policy.py
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/local_dram.py
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/local_dram_pools.py
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/local_disk.py
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/remote_fw_dram.py
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/remote_sources.py
+
+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. Licensed under Apache-2.0:
+https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/LICENSE
+
+No upstream method bodies or test fixtures are copied. The adaptation models
+which blocks a rank pulls from a hinted peer and when the pull starts and
+lands, which blocks KVCR-owned memory stores, evicts and promotes, the order
+its LRU and FIFO policies keep, and how long each operation protects the
+blocks it reads. With `kvcr.g3` it also models which blocks that
+memory writes to KVCR's disk tier and reads back, what a write and a read hold
+meanwhile, and the order the disk tier keeps.
 
 The `offloading_v0_32` and `simple_cpu_v0_32` G2 connector profiles in
 repository-root files `crates/core/src/engine/host_offload/tier.rs` and
@@ -1650,6 +1890,11 @@ model weights or collection implementation are bundled in these directories.
 
 - Source: https://huggingface.co/datasets/nvidia/aisimulate-fpm-dataset/tree/dbfcdd9eb62ea733efbc3f0cbd78277f2960061a
 - Immutable revision: `dbfcdd9eb62ea733efbc3f0cbd78277f2960061a`.
+- Current location: https://huggingface.co/datasets/ai-dynamo/aisim-data. The
+  files moved there byte-identically (same SHA-256) from `data/<rest>` to
+  `data/fpm/<rest>`; each `hf_dataset.json` pins the `ai-dynamo/aisim-data`
+  commit and the `data/fpm/` paths. The source revision above and its old
+  paths remain resolvable in `nvidia/aisimulate-fpm-dataset`.
 - Original paths: configuration `manifest.json` files and `fpm/*.metadata.json`
   under `data/MiniMaxAI--MiniMax-M2.7/`, `data/deepseek-ai--DeepSeek-V4-Pro/`,
   `data/deepseek-ai--DeepSeek-V4-Flash-0731/`, `data/nvidia--GLM-5.2-NVFP4/`,
@@ -2087,89 +2332,20 @@ retain their raw JSONL request values, dependencies, hashes, and timestamps.
 See the adjacent fixture README and `agentx.json` manifest for the source,
 play identities, counts, and content checksum.
 
-## NVIDIA Dynamo CI handoff compatibility
+## NVIDIA Dynamo CI callback contract
 
-The exact-source rewrite in `scripts/performance/build_simulation_dynamo.py`
-is adapted and modified from NVIDIA Dynamo's `lib/mocker/src/common/handoff.rs`
-at commit `def3b79b15c266805540a678dd400aeb6ccada1d`:
-https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/common/handoff.rs
-
-Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-Licensed under Apache-2.0; the full license is reproduced in `LICENSE`.
-Upstream license: https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/LICENSE
-The adaptation adds zero recurrent-state bytes to the legacy token-only DTO
-conversion for CI builds against the newer AISim handoff API. It preserves
-the upstream copyright header and marks the modified conversion in the output.
-
-## NVIDIA Dynamo CI struct-literal compatibility
-
-The exact-source rewrites in `scripts/performance/build_simulation_dynamo.py`
-and their regression fixtures in `tests/test_ci_workflow_contracts.py`
-are adapted and modified from NVIDIA Dynamo's
-`lib/mocker/src/grouped_scheduler/compatibility.rs` and
-`lib/mocker/src/replay/offline/extensions/kv_router/mod.rs`,
-`lib/mocker/src/replay/offline/entrypoints.rs`,
-`lib/mocker/src/replay/offline/extensions/kv_events/mod.rs`, and
-`lib/bindings/python/rust/llm/replay.rs` at commit
-`def3b79b15c266805540a678dd400aeb6ccada1d`:
-https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/grouped_scheduler/compatibility.rs
-https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/replay/offline/extensions/kv_router/mod.rs
-https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/replay/offline/entrypoints.rs
-https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/replay/offline/extensions/kv_events/mod.rs
-https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/bindings/python/rust/llm/replay.rs
-
-Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-Licensed under Apache-2.0; the full license is reproduced in `LICENSE`.
-Upstream license: https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/LICENSE
-The adaptation adds `None` for new optional AISim fields to the native
-request and offline KV-router placement struct literals for CI builds against
-newer AISim APIs. It also sets an empty image list for the pinned text-only
-request when AISim requires `images: Vec<ImageSpec>`, rejecting image inputs
-instead of adding multimodal support to Dynamo's adapter. Both offline replay
-specifications disable the encoder pool; the Python binding's synthetic trace
-explicitly retains text-only traffic with `images: None`. The lifecycle conversion explicitly
-rejects host-loop TTFT milestones, which its legacy DTO cannot represent.
-The Weka import adapter retains the default recorded client when the AISim
-API adds the client selection field.
-It preserves the upstream copyright headers and marks each modification in the output.
-
-The replay compatibility rewrite in the same script adapts
-`lib/mocker/src/engine_adapter.rs` at that same immutable revision:
-https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/engine_adapter.rs
-Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-Licensed under Apache-2.0 as above. The modified adapter explicitly sets prefill
-context parallelism to 1 in four replay descriptors, preserving the pinned
-adapter's topology. It also disables the SGLang host loop and takes the vision
-cache capacity from the canonical SGLang default, preserving text-only behavior.
-Its upstream copyright header is retained and each modified literal is marked
-in the generated output.
-
-## NVIDIA Dynamo CI speculation compatibility
-
-The exact-source rewrite in `scripts/performance/build_simulation_dynamo.py`
-and its regression fixture in `tests/test_ci_workflow_contracts.py` are adapted
-and modified from NVIDIA Dynamo's
-`lib/bindings/python/rust/llm/ais_callback.rs` at commit
-`def3b79b15c266805540a678dd400aeb6ccada1d`:
-https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/bindings/python/rust/llm/ais_callback.rs
+The callback contract harness in `scripts/performance/check_dynamo_callback.py`
+compiles NVIDIA Dynamo's `lib/bindings/python/rust/llm/ais_callback.rs` at commit
+`df666fbc6284e540ea0f5cac613da7f992b1fc7b` with the real AISim core. It does not change the
+callback. It only appends the AISim contract tests to a temporary copy. Its
+minimal trait interfaces are adapted from `lib/mocker/src/common/perf_model.rs`
+and `lib/router/scheduler/src/prefill_load.rs` at the same immutable commit:
+https://github.com/ai-dynamo/dynamo/blob/df666fbc6284e540ea0f5cac613da7f992b1fc7b/lib/mocker/src/common/perf_model.rs
+https://github.com/ai-dynamo/dynamo/blob/df666fbc6284e540ea0f5cac613da7f992b1fc7b/lib/router/scheduler/src/prefill_load.rs
 
 Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 Licensed under Apache-2.0; the full license is reproduced in `LICENSE`.
-Upstream license: https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/LICENSE
-The adaptation reads the serialized Ngram identity instead of the removed
-enum accessor, retaining legacy `nextn`, accepting disabled speculation, and
-rejecting other replay schemes.
-It preserves the upstream copyright header and marks the modified conversion
-in the output.
-
-The callback contract harness in `scripts/performance/check_dynamo_callback.py`
-compiles that entire adapted callback with the real AISim core. Its minimal
-trait interfaces are adapted from `lib/mocker/src/common/perf_model.rs` and
-`lib/kv-router/src/scheduling/prefill_load.rs` at the same immutable commit:
-https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/common/perf_model.rs
-https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/kv-router/src/scheduling/prefill_load.rs
-
-These files carry the same NVIDIA copyright and Apache-2.0 license above.
+Upstream license: https://github.com/ai-dynamo/dynamo/blob/df666fbc6284e540ea0f5cac613da7f992b1fc7b/LICENSE
 The harness modifies their module placement to test the callback independently
 of the Dynamo scheduler; it does not replace callback or estimator behavior.
 
@@ -2503,3 +2679,41 @@ https://github.com/vllm-project/vllm/blob/43b4aaea3e40e20ef53ce2bfecfa1b72060bf2
 
 These are modified Rust simulation adaptations; no upstream source file is
 vendored.
+
+
+## SGLang extra-buffer hybrid prefix checkpoints
+
+Modified checkpoint ownership/tracking contracts in repository-root
+`crates/core/src/engine/cache/radix_cache.rs`, `engine/kv_manager/sglang_backend.rs`,
+`engine/scheduler/sglang/{config,core,decode,prefill,tests}.rs`, and their configuration
+plumbing (`engine/{config,mod}.rs`, `engine/common/protocols.rs`, `engine/scheduler/rank.rs`;
+all abbreviated engine paths are under `crates/core/src/`) derive from SGLang
+commit `94602c9c2b7cbdb8efd5c52802dac6a1c180089e`.
+Original paths under `python/sglang/srt/`: `mem_cache/{mamba_radix_cache,memory_pool}.py`,
+`runtime_context.py`, `managers/{schedule_batch,scheduler}.py`, and
+`managers/scheduler_components/batch_result_processor.py`.
+Source: https://github.com/sgl-project/sglang/tree/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/python/sglang/srt
+Copyright 2023-2024 SGLang Team and contributors; `runtime_context.py` is
+Copyright 2023-2026 SGLang Team. Apache-2.0 (included in `LICENSE`).
+Upstream license: https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/LICENSE
+The simulation adaptation rejects state/KV eviction pressure; no upstream GPU
+allocator, production prompts, or external trace fixtures are included.
+
+## AIConfigurator PR #1613 migration
+
+The following repository-root paths contain modified adaptations of the
+AIConfigurator contribution at immutable commit `d1fe4661bca3af24daab50300f196f6d9ff75d1f`:
+
+- `docs/perf-model/extending.md` from
+  https://github.com/ai-dynamo/aiconfigurator/blob/d1fe4661bca3af24daab50300f196f6d9ff75d1f/docs/add_a_new_model.md
+- `python/aisim/src/aisim_core/sdk/operations/README.md` from
+  https://github.com/ai-dynamo/aiconfigurator/blob/d1fe4661bca3af24daab50300f196f6d9ff75d1f/docs/add_a_new_model.md
+
+Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+The contribution was submitted by xinjun.jiang. Licensed under Apache-2.0;
+the license text is included in the repository and Python distribution.
+Upstream license:
+https://github.com/ai-dynamo/aiconfigurator/blob/d1fe4661bca3af24daab50300f196f6d9ff75d1f/LICENSE
+
+Modified for AISim's current layout and contracts; source links are
+preserved beside the adapted content.

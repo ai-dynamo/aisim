@@ -104,6 +104,27 @@ def test_initialization_has_a_separate_deadline(tmp_path):
     assert result["reason"] == "execution initialization timed out"
 
 
+def test_a_dataset_download_restarts_the_initialization_deadline(tmp_path):
+    from aisim_core.data.default_systems import DOWNLOAD_MARKER_ENV
+
+    result = _run_script(
+        tmp_path,
+        f"""
+import os, time
+from pathlib import Path
+marker = Path(os.environ[{DOWNLOAD_MARKER_ENV!r}])
+marker.touch()
+time.sleep(1.5)
+marker.unlink()
+time.sleep(30)
+""",
+        policy=_policy(initialization_timeout_seconds=1.0),
+    )
+    assert result["status"] == "timed_out"
+    assert result["reason"] == "execution initialization timed out"
+    assert result["wall_seconds"] > 2.0  # 1.5 s of download, then a fresh 1 s deadline
+
+
 def test_child_exit_code_is_preserved(tmp_path):
     result = _run_script(tmp_path, "raise SystemExit(3)")
     assert result["status"] == "resource_limited"
@@ -112,12 +133,16 @@ def test_child_exit_code_is_preserved(tmp_path):
 
 @pytest.mark.parametrize("failure", ["missing", "malformed", "override", "resources"])
 @pytest.mark.parametrize("stack", ["engine", "missing-stack"])
-def test_invalid_cli_input_preserves_outputs_and_stack_error_order(tmp_path, failure, stack):
+@pytest.mark.parametrize("suffix", [".yaml", ".json"])
+def test_invalid_cli_input_preserves_outputs_and_stack_error_order(tmp_path, failure, stack, suffix):
     import subprocess
 
-    config = tmp_path / "config.yaml"
+    config = tmp_path / f"config{suffix}"
     if failure != "missing":
-        config.write_text("[" if failure == "malformed" else "execution:\n  resources:\n    memory_limit_gb: -1\n")
+        serialize = json.dumps if suffix == ".json" else yaml.safe_dump
+        config.write_text(
+            "[" if failure == "malformed" else serialize({"execution": {"resources": {"memory_limit_gb": -1}}})
+        )
     output = tmp_path / "output"
     output.mkdir()
     original = {"prediction.json": '{"old":true}', "resource-runtime.json": '{"old_runtime":true}'}
@@ -145,6 +170,7 @@ def test_invalid_cli_input_preserves_outputs_and_stack_error_order(tmp_path, fai
         assert "missing-stack" in result.stderr
         assert "could not read configuration" not in result.stderr
         assert "malformed YAML" not in result.stderr
+        assert "malformed JSON" not in result.stderr
         assert "invalid --set" not in result.stderr
 
 

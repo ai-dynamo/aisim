@@ -422,7 +422,7 @@ impl PyGemm {
         scale_num_tokens: u32,
         low_precision_input: bool,
         below_grid_sol: bool,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let inner = Op::Gemm(GemmOp {
             name,
             scale_factor,
@@ -434,7 +434,7 @@ impl PyGemm {
             seq_split,
             below_grid_sol,
         });
-        Ok((PyGemm, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyGemm))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -541,7 +541,7 @@ impl PyEmbedding {
         column_size: u32,
         empirical_bw_scaling_factor: f64,
         seq_split: u32,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let _ = empirical_bw_scaling_factor;
         let inner = Op::Embedding(EmbeddingOp {
             name,
@@ -551,7 +551,7 @@ impl PyEmbedding {
             quant_mode: GemmQuantMode::Bfloat16,
             seq_split,
         });
-        Ok((PyEmbedding, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyEmbedding))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -620,7 +620,7 @@ impl PyElementWise {
         empirical_bw_scaling_factor: f64,
         seq_split: u32,
         scale_num_tokens: u32,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let _ = empirical_bw_scaling_factor;
         let inner = Op::Elementwise(ElementwiseOp {
             name,
@@ -634,7 +634,7 @@ impl PyElementWise {
             },
             seq_split,
         });
-        Ok((PyElementWise, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyElementWise))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -703,7 +703,7 @@ impl PyCustomAllReduce {
         h: u32,
         tp_size: u32,
         seq_split: u32,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let inner = Op::CustomAllReduce(CustomAllReduceOp {
             name,
             scale_factor,
@@ -712,7 +712,7 @@ impl PyCustomAllReduce {
             quant: CommQuantMode::Half,
             seq_split,
         });
-        Ok((PyCustomAllReduce, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyCustomAllReduce))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -774,7 +774,7 @@ impl PyNCCL {
         num_gpus: u32,
         comm_quant_mode: &Bound<'_, PyAny>,
         seq_split: u32,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let inner = Op::Nccl(NcclOp {
             name,
             scale_factor,
@@ -784,7 +784,7 @@ impl PyNCCL {
             operation: nccl_op,
             seq_split,
         });
-        Ok((PyNCCL, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyNCCL))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -866,7 +866,7 @@ impl PyP2P {
         seq_split: u32,
         span_gpus: Option<u32>,
         force_scale_out: bool,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let inner = Op::P2P(P2POp {
             name,
             scale_factor,
@@ -876,7 +876,7 @@ impl PyP2P {
             span_gpus,
             force_scale_out,
         });
-        Ok((PyP2P, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyP2P))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -947,7 +947,7 @@ impl PyDeepSeekV4MHCModule {
         quant_mode: &Bound<'_, PyAny>,
         architecture: String,
         seq_split: u32,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         if !matches!(op.as_str(), "pre" | "post" | "both") {
             return Err(PyValueError::new_err(format!(
                 "Unsupported DeepSeek-V4 mHC op: {op}"
@@ -964,7 +964,7 @@ impl PyDeepSeekV4MHCModule {
             quant_mode: gemm_quant(quant_mode)?,
             seq_split,
         });
-        Ok((PyDeepSeekV4MHCModule, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyDeepSeekV4MHCModule))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -1069,7 +1069,7 @@ impl PyContextAttention {
         lane_order: Option<Vec<String>>,
         apply_rope: bool,
         dcp_size: u32,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         if dcp_size == 0 {
             return Err(PyValueError::new_err(
                 "ContextAttention dcp_size must be positive",
@@ -1090,7 +1090,7 @@ impl PyContextAttention {
             apply_rope,
             dcp_size,
         });
-        Ok((PyContextAttention, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyContextAttention))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -1245,7 +1245,7 @@ impl PyGenerationAttention {
         scale_num_tokens: u32,
         verify_query_tokens: u32,
         dcp_size: u32,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         if dcp_size == 0 {
             return Err(PyValueError::new_err(
                 "GenerationAttention dcp_size must be positive",
@@ -1265,7 +1265,7 @@ impl PyGenerationAttention {
             verify_query_tokens,
             dcp_size,
         });
-        Ok((PyGenerationAttention, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyGenerationAttention))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -1407,7 +1407,7 @@ impl PyEncoderAttention {
         head_size: u32,
         fmha_quant_mode: Option<&Bound<'_, PyAny>>,
         partial_rotary_factor: f64,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let fmha = match fmha_quant_mode {
             Some(obj) => fmha_quant(obj)?,
             None => FmhaQuantMode::Bfloat16,
@@ -1431,7 +1431,7 @@ impl PyEncoderAttention {
             fmha_quant_mode: fmha,
             partial_rotary_factor,
         });
-        Ok((PyEncoderAttention, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyEncoderAttention))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -1505,7 +1505,7 @@ impl PyContextMLA {
         fmha_quant_mode: &Bound<'_, PyAny>,
         cp_size: u32,
         dcp_size: u32,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         if dcp_size == 0 {
             return Err(PyValueError::new_err(
                 "ContextMLA dcp_size must be positive",
@@ -1520,7 +1520,7 @@ impl PyContextMLA {
             cp_size,
             dcp_size,
         });
-        Ok((PyContextMLA, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyContextMLA))
     }
 
     /// Decode CP on the same engine (cached-context gather); see
@@ -1620,7 +1620,7 @@ impl PyGenerationMLA {
         num_heads: u32,
         kv_cache_dtype: &Bound<'_, PyAny>,
         dcp_size: u32,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         if dcp_size == 0 {
             return Err(PyValueError::new_err(
                 "GenerationMLA dcp_size must be positive",
@@ -1633,7 +1633,7 @@ impl PyGenerationMLA {
             kv_cache_dtype: kv_quant(kv_cache_dtype)?,
             dcp_size,
         });
-        Ok((PyGenerationMLA, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyGenerationMLA))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -1714,7 +1714,7 @@ impl PyMLAModule {
         gemm_quant_mode: &Bound<'_, PyAny>,
         native_num_heads: Option<u32>,
         dcp_size: u32,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         if dcp_size == 0 {
             return Err(PyValueError::new_err("MLAModule dcp_size must be positive"));
         }
@@ -1733,7 +1733,7 @@ impl PyMLAModule {
         } else {
             Op::MlaModuleGeneration(module)
         };
-        Ok((PyMLAModule, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyMLAModule))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -1853,7 +1853,7 @@ impl PyMLABmm {
         num_heads: u32,
         quant_mode: &Bound<'_, PyAny>,
         if_pre: bool,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let inner = Op::MlaBmm(MlaBmmOp {
             name,
             scale_factor,
@@ -1861,7 +1861,7 @@ impl PyMLABmm {
             quant_mode: gemm_quant(quant_mode)?,
             is_pre: if_pre,
         });
-        Ok((PyMLABmm, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyMLABmm))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -1939,7 +1939,7 @@ impl PyMoE {
         moe_kernel_source: Option<String>,
         enable_eplb: bool,
         seq_split: u32,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         // The retired class was CP-aware but the MoE wire carries no
         // seq_split: models divide the token count at the construction site
         // (attention_dp globalization), so a non-default value here would be
@@ -1968,7 +1968,7 @@ impl PyMoE {
             enable_eplb,
             is_context,
         });
-        Ok((PyMoE, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyMoE))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -2132,7 +2132,7 @@ impl PyMoEDispatch {
         reduce_results: bool,
         attn_cp_size: u32,
         attn_ar_modeled: bool,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         use crate::common::enums::BackendKind;
         use crate::operators::DispatchFlavor;
 
@@ -2182,7 +2182,7 @@ impl PyMoEDispatch {
             sms,
             scale_num_tokens,
         });
-        Ok((PyMoEDispatch, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyMoEDispatch))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -2371,7 +2371,7 @@ impl PyMoEAllToAll {
         attention_tp_size: u32,
         workload_distribution: &str,
         enable_eplb: bool,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let inner = Op::MoeAllToAll(crate::operators::MoeAllToAllOp {
             name,
             scale_factor,
@@ -2388,7 +2388,7 @@ impl PyMoEAllToAll {
             workload_distribution: workload_distribution.to_string(),
             enable_eplb,
         });
-        Ok((PyMoEAllToAll, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyMoEAllToAll))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -2518,7 +2518,7 @@ impl PyMoEExpertCompute {
         kernel_source: Option<String>,
         is_gated: bool,
         enable_eplb: bool,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let inner = Op::MoeExpertCompute(crate::operators::MoeExpertComputeOp {
             name,
             scale_factor,
@@ -2536,7 +2536,7 @@ impl PyMoEExpertCompute {
             is_gated,
             enable_eplb,
         });
-        Ok((PyMoEExpertCompute, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyMoEExpertCompute))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -2677,7 +2677,7 @@ impl PyDeepSeekV4MegaMoEModule {
         num_fused_shared_experts: u32,
         kernel_source: &str,
         kernel_dtype: &str,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let workload_distribution = if workload_distribution == "uniform" {
             "balanced".to_string()
         } else {
@@ -2701,7 +2701,7 @@ impl PyDeepSeekV4MegaMoEModule {
             kernel_source: kernel_source.to_string(),
             kernel_dtype: kernel_dtype.to_string(),
         });
-        Ok((PyDeepSeekV4MegaMoEModule, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyDeepSeekV4MegaMoEModule))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -2856,7 +2856,7 @@ impl PyMamba2Kernel {
         seq_split: u32,
         state_dtype: String,
         token_width: u32,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         cp_audit_gate("Mamba2Kernel", false, seq_split)?;
         let op = crate::operators::Mamba2Op {
             name,
@@ -2880,7 +2880,7 @@ impl PyMamba2Kernel {
             )));
         }
         let inner = Op::Mamba2(op);
-        Ok((PyMamba2Kernel, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyMamba2Kernel))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -2994,7 +2994,7 @@ impl PyGDNKernel {
         d_conv: u32,
         seq_split: u32,
         mamba_ssm_dtype: String,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         cp_audit_gate("GDNKernel", false, seq_split)?;
         let inner = Op::Gdn(crate::operators::GdnOp {
             name,
@@ -3009,7 +3009,7 @@ impl PyGDNKernel {
             head_v_dim,
             mamba_ssm_dtype,
         });
-        Ok((PyGDNKernel, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyGDNKernel))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -3120,7 +3120,7 @@ impl PyKDAKernel {
         d_conv: u32,
         seq_split: u32,
         draft_tokens: i64,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         cp_audit_gate("KDAKernel", false, seq_split)?;
         let inner = Op::Kda(crate::operators::KdaOp {
             name,
@@ -3135,7 +3135,7 @@ impl PyKDAKernel {
             head_v_dim,
             draft_tokens,
         });
-        Ok((PyKDAKernel, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyKDAKernel))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -3259,7 +3259,7 @@ impl PyWideEPContextMLA {
         fmha_quant_mode: &Bound<'_, PyAny>,
         attn_backend: &str,
         cp_size: u32,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         if tp_size == 0 || 128 % tp_size != 0 {
             return Err(PyValueError::new_err(format!(
                 "WideEPContextMLA tp_size must divide 128, got {tp_size}"
@@ -3274,7 +3274,7 @@ impl PyWideEPContextMLA {
             attn_backend: attn_backend.to_string(),
             cp_size,
         });
-        Ok((PyWideEPContextMLA, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyWideEPContextMLA))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -3363,7 +3363,7 @@ impl PyWideEPGenerationMLA {
         fmha_quant_mode: &Bound<'_, PyAny>,
         attn_backend: &str,
         dcp_size: u32,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         if tp_size == 0 || 128 % tp_size != 0 {
             return Err(PyValueError::new_err(format!(
                 "WideEPGenerationMLA tp_size must divide 128, got {tp_size}"
@@ -3383,7 +3383,7 @@ impl PyWideEPGenerationMLA {
             attn_backend: attn_backend.to_string(),
             dcp_size,
         });
-        Ok((PyWideEPGenerationMLA, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyWideEPGenerationMLA))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -3504,7 +3504,7 @@ macro_rules! msa_class {
                 gemm_quant_mode: &Bound<'_, PyAny>,
                 dsa_architecture: &str,
                 dsa_scale_k: f64,
-            ) -> PyResult<(Self, PyOperation)> {
+            ) -> PyResult<PyClassInitializer<Self>> {
                 let module = crate::operators::MsaModuleOp {
                     name,
                     scale_factor,
@@ -3523,7 +3523,7 @@ macro_rules! msa_class {
                     dsa_architecture: dsa_architecture.to_string(),
                     dsa_scale_k,
                 };
-                Ok(($cls, PyOperation { inner: Op::$variant(module) }))
+                Ok(PyClassInitializer::from(PyOperation { inner: Op::$variant(module) }).add_subclass($cls))
             }
 
             fn __getnewargs_ex__<'py>(
@@ -3772,7 +3772,7 @@ impl PyContextDSAModule {
         dsa_full_layer_fraction: Option<f64>,
         attn_projection_quant_modes: Option<&Bound<'_, PyDict>>,
         dcp_size: u32,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         if dcp_size == 0 {
             return Err(PyValueError::new_err(
                 "ContextDSAModule dcp_size must be positive",
@@ -3797,7 +3797,7 @@ impl PyContextDSAModule {
             )?),
             dcp_size,
         });
-        Ok((PyContextDSAModule, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyContextDSAModule))
     }
 
     /// Decode CP on the same engine (cached-context gather); see
@@ -3943,7 +3943,7 @@ impl PyGenerationDSAModule {
         dsa_full_layer_fraction: Option<f64>,
         attn_projection_quant_modes: Option<&Bound<'_, PyDict>>,
         dcp_size: u32,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         if dcp_size == 0 {
             return Err(PyValueError::new_err(
                 "GenerationDSAModule dcp_size must be positive",
@@ -3968,7 +3968,7 @@ impl PyGenerationDSAModule {
             )?),
             dcp_size,
         });
-        Ok((PyGenerationDSAModule, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyGenerationDSAModule))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -4120,7 +4120,7 @@ macro_rules! dsv4_class {
                 gemm_quant_mode: &Bound<'_, PyAny>,
                 architecture: &str,
                 cp_size: u32,
-            ) -> PyResult<(Self, PyOperation)> {
+            ) -> PyResult<PyClassInitializer<Self>> {
                 use crate::perf_database::AttnKind;
 
                 let module = crate::operators::Dsv4ModuleOp {
@@ -4146,7 +4146,7 @@ macro_rules! dsv4_class {
                     index_topk,
                     o_groups: Some(o_groups),
                 };
-                Ok(($cls, PyOperation { inner: Op::$variant(module) }))
+                Ok(PyClassInitializer::from(PyOperation { inner: Op::$variant(module) }).add_subclass($cls))
             }
 
             fn __getnewargs_ex__<'py>(
@@ -4395,7 +4395,7 @@ impl PyOverlapOp {
         group_a: &Bound<'_, PyAny>,
         group_b: &Bound<'_, PyAny>,
         seq_split: u32,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         // seq_split never crossed the wire for composites (children carry
         // their own); accepted for calling-shape compatibility.
         let _ = seq_split;
@@ -4404,7 +4404,7 @@ impl PyOverlapOp {
             group_a: extract_child_ops(group_a)?,
             group_b: extract_child_ops(group_b)?,
         });
-        Ok((PyOverlapOp, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyOverlapOp))
     }
 
     fn __getnewargs_ex__<'py>(
@@ -4453,14 +4453,14 @@ impl PyFallbackOp {
         primary: &Bound<'_, PyAny>,
         fallback: &Bound<'_, PyAny>,
         seq_split: u32,
-    ) -> PyResult<(Self, PyOperation)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let _ = seq_split;
         let inner = Op::Fallback(crate::operators::FallbackOp {
             name,
             primary: Box::new(extract_child_op(primary)?),
             fallback: extract_child_ops(fallback)?,
         });
-        Ok((PyFallbackOp, PyOperation { inner }))
+        Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyFallbackOp))
     }
 
     fn __getnewargs_ex__<'py>(

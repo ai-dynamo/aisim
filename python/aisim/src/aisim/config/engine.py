@@ -157,6 +157,9 @@ class PassLaunchConfig(StrictModel):
 class SchedulerPredictionConfig(StrictModel):
     max_batched_tokens: PositiveInt = 8192
     max_sequences: PositiveInt = 256
+    scheduler_select_time_ms: NonNegativeFloat = Field(
+        default=0.0, description="SGLang only: measured serial batch-selection cost per pass with model work."
+    )
     prefill_schedule_interval: PositiveInt = Field(
         default=1, description="vLLM only: admit prefill once every N attention-DP group passes."
     )
@@ -171,8 +174,8 @@ class SchedulerPredictionConfig(StrictModel):
         default=None,
         description=(
             "vLLM only: model vLLM's --async-scheduling, under which an arrival at a busy engine misses the "
-            "batch vLLM has already queued. Unset uses vLLM's default: on, except with ngram drafts "
-            "or MTP with G2 host offload."
+            "batch vLLM has already queued. Replay defaults to async scheduling unless it uses ngram drafts "
+            "or combines MTP and G2 host offload without a recurrent state cache."
         ),
     )
     load_balance_method: Literal["round_robin", "total_tokens"] = Field(
@@ -186,7 +189,10 @@ class SchedulerPredictionConfig(StrictModel):
         default=None,
         description=(
             "vLLM aggregated workers with async scheduling only: CPU launch costs of vLLM's engine loop. A pass's "
-            "outputs then leave once the next pass is launched, and an arrival joins the first pass decided after it."
+            "outputs then leave once the next pass is launched, and an arrival joins the first pass decided after it. "
+            "With an offloading_v0_32 or simple_cpu_v0_32 CPU tier, a finished load is admitted only after vLLM "
+            "(Model Runner V2) polls the connector. With MTP and G2, launch timing requires a recurrent state cache "
+            "and disable_eagle_block_drop=true."
         ),
     )
 
@@ -279,11 +285,46 @@ class G3OffloadConfig(StrictModel):
     shared_write_bandwidth_gbps: NonNegativeFloat = 80.0
 
 
+class KvcrLocalG2Config(StrictModel):
+    """Host memory KVCR owns on each rank, behind the rank's own G2."""
+
+    num_blocks: PositiveU64
+    policy: Literal["lru", "fifo"] = "lru"
+    copy_bandwidth_gbps: NonNegativeFloat = 6.0
+
+
+class KvcrG3Config(StrictModel):
+    """Local disk KVCR owns on each rank, behind its memory (`local_g2`)."""
+
+    num_blocks: PositiveU64
+    latency_to_first_byte_ms: NonNegativeFloat = 3.0
+    read_bandwidth_gbps: NonNegativeFloat = 5.0
+    write_bandwidth_gbps: NonNegativeFloat = 0.8
+    spill_timeout_ms: PositiveFloat = 1000.0
+
+
 class KvcrConfig(StrictModel):
     """KVCR peer G2 fetch: pull a hinted prefix from another rank's private G2."""
 
     latency_to_first_byte_ms: NonNegativeFloat = 1.0
-    bandwidth_gbps: NonNegativeFloat = 50.0
+    bandwidth_gbps: NonNegativeFloat = 32.0
+    local_g2: KvcrLocalG2Config | None = None
+    g3: KvcrG3Config | None = None
+
+    @model_validator(mode="after")
+    def _g3_needs_local_g2(self) -> KvcrConfig:
+        if self.g3 is not None and self.local_g2 is None:
+            raise ValueError("kvcr.g3 requires kvcr.local_g2")
+        return self
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_tiers(self, handler: Any) -> dict[str, Any]:
+        # Keep the peer-fetch-only descriptor shape unless KVCR owns storage.
+        payload = handler(self)
+        for name in ("local_g2", "g3"):
+            if payload.get(name) is None:
+                payload.pop(name, None)
+        return payload
 
 
 def manual_block_bytes(block_size: int | None, bytes_per_token: int | str) -> int:
@@ -457,11 +498,14 @@ class KvCachePredictionConfig(StrictModel):
     @model_validator(mode="after")
     def _validate_manual_geometry(self) -> KvCachePredictionConfig:
         infer_state = self.state_cache is not None and self.state_cache.bytes_per_request is None
-        if self.prefix_match_unit is not None:
-            if self.state_cache is None:
-                raise ValueError("prefix_match_unit currently requires state_cache")
-            if not infer_state and (self.block_size is None or self.block_size % self.prefix_match_unit):
-                raise ValueError("prefix_match_unit must be a positive divisor of block_size")
+        # Without state_cache, the engine validation checks the unit, because only it sees a grouped FPM profile.
+        if (
+            self.prefix_match_unit is not None
+            and self.state_cache is not None
+            and not infer_state
+            and (self.block_size is None or self.block_size % self.prefix_match_unit)
+        ):
+            raise ValueError("prefix_match_unit must be a positive divisor of block_size")
         if self.state_cache is not None:
             # Inferred geometry checks the unit against the resolved block_size.
             block_size = None if infer_state else self.block_size
@@ -772,6 +816,7 @@ class WorkerPredictionConfig(StrictModel):
     kv_cache: KvCachePredictionConfig = Field(default_factory=KvCachePredictionConfig)
     timing: TimingConfig = Field(default_factory=TimingConfig)
     startup_seconds: float = Field(default=0.0, ge=0.0)
+    wait_power_w: NonNegativeFloat | None = None
 
 
 def _frontend_implies_host_loop(value: Any) -> Any:
@@ -1017,6 +1062,17 @@ class TokenizationConfig(StrictModel):
     per_input_token_us: NonNegativeFloat = 0.0
 
 
+class ExtraCpuOverheadConfig(StrictModel):
+    """Unqueued serving-path CPU time before the engine: HTTP receive and first-chunk work."""
+
+    base_ms: NonNegativeFloat = 0.0
+    per_input_token_us: NonNegativeFloat = 0.0
+
+    @property
+    def active(self) -> bool:
+        return bool(self.base_ms or self.per_input_token_us)
+
+
 class DetokenizationConfig(StrictModel):
     workers: PositiveInt = 1
     base_ms: NonNegativeFloat = 0.0
@@ -1197,6 +1253,7 @@ class EnginePredictionConfig(EstimatorPolicyConfig):
     workers: WorkersPredictionConfig = Field(default_factory=WorkersPredictionConfig)
     kv_transfer: KvTransferConfig | None = None
     tokenization: TokenizationConfig | None = None
+    extra_cpu_overhead: ExtraCpuOverheadConfig | None = None
     detokenization: DetokenizationConfig | None = None
 
     @field_validator("model", "hardware")
@@ -1216,6 +1273,7 @@ class EnginePredictionConfig(EstimatorPolicyConfig):
     @model_validator(mode="after")
     def _validate_roles(self) -> EnginePredictionConfig:
         _validate_fpm_profile(self, {self.mode}, {self.backend})
+        _validate_prediction_prefix_match_unit(self)
         if self.decoder_replay:
             # Keep the pre-supervision configuration path lightweight. Import
             # the canonical model identity only when this runtime feature is
@@ -1227,19 +1285,25 @@ class EnginePredictionConfig(EstimatorPolicyConfig):
         _validate_worker_hardware(modes={self.mode}, workers=self.workers)
         if self.tokenization is not None and (has_afd(self.workers) or self.workers.encoder is not None):
             raise ValueError("engine.tokenization requires token replay; AFD and analytical EPD are unsupported")
+        extra_cpu_overhead_active = self.extra_cpu_overhead is not None and self.extra_cpu_overhead.active
+        if extra_cpu_overhead_active and (has_afd(self.workers) or self.workers.encoder is not None):
+            raise ValueError("engine.extra_cpu_overhead requires token replay; AFD and analytical EPD are unsupported")
         if (
             self.detokenization is not None
             and self.detokenization.active
             and (has_afd(self.workers) or self.workers.encoder is not None)
         ):
             raise ValueError("engine.detokenization requires token replay; AFD and analytical EPD are unsupported")
-        if self.tokenization is not None and any(
+        if (self.tokenization is not None or extra_cpu_overhead_active) and any(
             worker is not None
             and not is_afd_worker(worker)
             and (worker.frontend is not None or worker.host_profile is not None)
             for worker in (self.workers.aggregated, self.workers.prefill)
         ):
-            raise ValueError("engine.tokenization and SGLang frontend stages both price request tokenization; use one")
+            raise ValueError(
+                "engine.tokenization, engine.extra_cpu_overhead and SGLang frontend stages all price "
+                "request-path CPU time; use one"
+            )
         _validate_afd_workers(self)
         _validate_worker_roles(modes={self.mode}, workers=self.workers, has_transfer=self.kv_transfer is not None)
         _validate_decode_radix_cache(
@@ -1629,7 +1693,19 @@ def _validate_fpm_profile(engine, modes: set[str], backends: set[str]) -> None:
                     raise ValueError("grouped FPM cache supports only aggregated vLLM without speculative decoding")
                 cache = worker.kv_cache
                 if cache.prefix_caching:
-                    raise ValueError("grouped FPM cache requires kv_cache.prefix_caching=false for cold replay")
+                    grouped_prefix_caching_requirements(
+                        deployment,
+                        backend_version=backend_version,
+                        architecture=profile.architecture,
+                        prefix_match_unit=cache.prefix_match_unit,
+                        max_batched_tokens=worker.scheduler.max_batched_tokens,
+                    )
+                    # Only a prediction states the interval. The search space and the onboarding plan run with 1.
+                    if backend_version == "0.33.0" and worker.scheduler.prefill_schedule_interval != 1:
+                        raise ValueError(
+                            "grouped prefix caching on vLLM 0.33.0 requires prefill_schedule_interval=1; vLLM 0.33.0 "
+                            "holds prefills at attention DP size 1 too, and replay does not model that"
+                        )
                 if cache.host_offload is not None or cache.g3_offload is not None:
                     raise ValueError("grouped FPM cache supports only HBM; host and G3 offload are unsupported")
                 if cache.capacity.type == "fixed" or cache.bytes_per_token != "auto":
@@ -1642,6 +1718,98 @@ def _validate_fpm_profile(engine, modes: set[str], backends: set[str]) -> None:
             raise ValueError("Mamba FPM cache requires a concrete prediction; recommendation search is unsupported")
         # Recommendation topology domains and the GPU budget are resolved by
         # lowering to SearchSpace, which validates reachable grouped workers.
+
+
+# The vLLM versions whose grouped prefix-caching rules the Rust rule table holds.
+GROUPED_PREFIX_CACHING_VERSIONS = ("0.31.0", "0.32.0", "0.33.0")
+
+
+def grouped_prefix_caching_requirements(
+    deployment,
+    *,
+    backend_version: str | None,
+    architecture: str,
+    prefix_match_unit: int | None,
+    max_batched_tokens: int,
+    field: str = "kv_cache.prefix_caching",
+) -> int:
+    """Check one grouped FPM deployment for prefix caching and return the hash block of its rank.
+
+    The prediction and the sweeper share this rule, and planning turns prefix caching on only when it passes.
+    ``field`` names the setting that turns prefix caching off. The Rust gate also checks the cache group geometry
+    and the pool capacity.
+    """
+    memory = deployment.resources.runtime_memory
+    # The evidence: the runtime memory records prefix caching on and the hash block that replay must follow.
+    if memory is None or memory.enable_prefix_caching is not True or memory.hash_block_size_tokens is None:
+        raise ValueError(f"grouped FPM cache requires {field}=false for cold replay")
+    if backend_version not in GROUPED_PREFIX_CACHING_VERSIONS:
+        raise ValueError("grouped FPM cache prefix caching is modeled for vLLM 0.31.0, 0.32.0 and 0.33.0 only")
+    # Replay applies the grouped rules of the label, so evidence that a runtime of another version recorded is refused.
+    # A profile imported before the field existed passes as before.
+    if memory.runtime_framework_version is not None and memory.runtime_framework_version != backend_version:
+        raise ValueError(
+            "grouped FPM cache prefix caching requires runtime_memory.runtime_framework_version "
+            f"({memory.runtime_framework_version}) to equal the deployment's backend_version ({backend_version})"
+        )
+    groups = deployment.resources.cache_groups
+    if any(group.prefix_cacheable is None for group in groups):
+        raise ValueError(
+            "grouped FPM cache prefix caching requires every cache group to declare prefix_cacheable; "
+            "set prefix_cacheable (true or false) on each cache group of the profile"
+        )
+    # The Rust rule table has no rule for a convolution group.
+    if any(group.kind == "convolution" for group in groups):
+        raise ValueError(
+            "grouped prefix caching does not support convolution cache groups; turn prefix caching off to replay "
+            "them cold"
+        )
+    # The Rust rule table models no sliding-window attention group that opts out of prefix caching, and refuses it
+    # with this text at native startup.
+    if any(
+        group.kind == "attention" and group.sliding_window is not None and group.prefix_cacheable is False
+        for group in groups
+    ):
+        raise ValueError(
+            "kv_cache_groups with enable_prefix_caching=true do not model a sliding-window attention group with "
+            "prefix_cacheable=false; describe a ring buffer as a state group with blocks_per_request: 1 and "
+            "prefix_cacheable: false, and turn prefix caching off for a bounded replay window, which replay does not "
+            "model"
+        )
+    if memory.mamba_cache_mode != "align" and any(group.kind == "state" and group.prefix_cacheable for group in groups):
+        raise ValueError(
+            "grouped FPM cache prefix caching requires mamba_cache_mode=align for a prefix-cacheable state group"
+        )
+    if len({group.page_size_bytes for group in groups}) > 1:
+        raise ValueError("grouped FPM cache prefix caching requires equal page_size_bytes across cache groups")
+    hash_block = memory.hash_block_size_tokens
+    if prefix_match_unit is not None and prefix_match_unit != hash_block:
+        raise ValueError(
+            "kv_cache.prefix_match_unit must equal the profile's hash_block_size_tokens for a grouped FPM cache"
+        )
+    # The GLM indexer keeps one state for every 4 tokens, so hits and chunk starts stay on that grid.
+    if architecture == "Glm5NextForConditionalGeneration" and (hash_block % 4 or max_batched_tokens % 4):
+        raise ValueError(
+            "GLM-5.3-Flash prefix caching requires prefix_match_unit and max_batched_tokens that are multiples of 4"
+        )
+    return hash_block
+
+
+def _validate_prediction_prefix_match_unit(engine: EnginePredictionConfig) -> None:
+    for role in ("aggregated", "prefill", "decode"):
+        worker = getattr(engine.workers, role)
+        # An AFD worker refuses kv_cache.prefix_match_unit in its own validator.
+        if worker is None or is_afd_worker(worker):
+            continue
+        cache = worker.kv_cache
+        if cache.prefix_match_unit is None or cache.state_cache is not None:
+            continue
+        # A grouped FPM cache with prefix caching hashes at the unit without state_cache.
+        deployment = fpm_profile_deployment(engine, worker, role) if engine.fpm_profile is not None else None
+        if deployment is None or deployment.resources.cache_layout != "grouped":
+            raise ValueError("prefix_match_unit currently requires state_cache")
+        if not cache.prefix_caching:
+            raise ValueError("kv_cache.prefix_match_unit on a grouped FPM cache requires kv_cache.prefix_caching=true")
 
 
 def _validate_speculation(engine, *, modes: set[str], backends: set[str]) -> None:
@@ -1724,12 +1892,19 @@ def _validate_prediction_scheduler_backend(engine: EnginePredictionConfig) -> No
         for field, backend, default in (
             ("prefill_schedule_interval", "vllm", 1),
             ("prefill_decode_interval", "sglang", 0),
+            ("scheduler_select_time_ms", "sglang", 0.0),
             ("async_scheduling", "vllm", None),
             ("launch", "vllm", None),
             ("load_balance_method", "sglang", "round_robin"),
         ):
             if engine.backend != backend and getattr(worker.scheduler, field) != default:
                 raise ValueError(f"workers.{role}.scheduler.{field} is supported only for backend={backend}")
+        if (
+            worker.scheduler.scheduler_select_time_ms
+            and isinstance(worker, HostWorkerPredictionConfig)
+            and worker.host_loop
+        ):
+            raise ValueError(f"workers.{role}.scheduler.scheduler_select_time_ms requires host_loop=false")
         if worker.scheduler.load_balance_method != "round_robin" and (
             role != "decode" or engine.mode != "disaggregated"
         ):

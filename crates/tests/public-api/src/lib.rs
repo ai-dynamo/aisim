@@ -244,6 +244,25 @@ mod tests {
     }
 
     #[test]
+    fn traffic_spec_deserializes_and_builds_a_workload() {
+        use aisim_core::replay::{
+            ReplayRuntimeInput, TrafficBuildOptions, TrafficSpec, build_traffic,
+        };
+
+        let spec: TrafficSpec = serde_json::from_value(serde_json::json!({
+            "source_type": "synthetic", "load_type": "concurrency",
+            "isl": 64, "osl": 8, "request_count": 3, "concurrency": 1
+        }))
+        .unwrap();
+        assert_eq!(spec.max_sim_time_ms(), None);
+        assert!(spec.trace_paths().is_empty());
+        let options = TrafficBuildOptions::new(64).with_kv_capacity(Default::default(), 1);
+        let built = build_traffic(spec, &options).unwrap();
+        assert!(matches!(built.input, ReplayRuntimeInput::Workload(_)));
+        assert_eq!(built.max_in_flight, Some(1));
+    }
+
+    #[test]
     fn afd_public_pipeline_layouts_construct_replay_topology() {
         use aisim_core::engine::{AfdAPoolConfig, AfdEngineConfig, AfdFPoolConfig};
         use aisim_core::{AfdPipelineLayout, AfdRoutingLocation};
@@ -394,6 +413,34 @@ mod tests {
             operations: Vec::new(),
             ..rank
         };
+    }
+
+    #[test]
+    fn rank_energy_evidence_is_an_additive_field() {
+        let rank = aisim_core::FpmRankEstimate {
+            rank: 0,
+            latency_ms: 1.0,
+            ..Default::default()
+        };
+        let serialized = serde_json::to_value(&rank).unwrap();
+        assert!(serialized.get("prefill_energy_wms").is_none());
+        assert!(serialized.get("decode_energy_wms").is_none());
+        let restored: aisim_core::FpmRankEstimate = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored.prefill_energy_wms, None);
+        assert_eq!(restored.decode_energy_wms, None);
+
+        let powered = aisim_core::FpmRankEstimate {
+            prefill_energy_wms: Some(500.0),
+            decode_energy_wms: Some(0.0),
+            ..restored
+        };
+        let serialized = serde_json::to_value(&powered).unwrap();
+        assert_eq!(serialized["prefill_energy_wms"], 500.0);
+        assert_eq!(serialized["decode_energy_wms"], 0.0);
+        assert_eq!(
+            serde_json::from_value::<aisim_core::FpmRankEstimate>(serialized).unwrap(),
+            powered
+        );
     }
 
     #[test]

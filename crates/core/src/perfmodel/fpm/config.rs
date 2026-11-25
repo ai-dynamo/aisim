@@ -584,6 +584,16 @@ impl ForwardPassPerfModelConfig {
         candidates
     }
 
+    /// The speculative depth a regression prices: an MTP scheme's depth, else
+    /// legacy `nextn`. An MTP draft is `depth` extra target-shaped layers, the
+    /// same identity as `nextn` (`aisim_core.sdk.speculation.mtp`).
+    pub(crate) fn regression_depth(&self) -> Result<u32, AicError> {
+        match &self.speculation {
+            Some(speculation) if speculation.kind == "mtp" => speculation.replay_depth(),
+            _ => Ok(self.nextn),
+        }
+    }
+
     /// Validate profile metadata and pin interpolation without constructing a
     /// graph or opening performance data. This also serves configuration-only
     /// consumers such as memory planning.
@@ -679,7 +689,17 @@ impl ForwardPassPerfModelConfig {
                 self.kvcache_quant_mode = Some(facts.kvcache_quant_mode);
                 self.comm_quant_mode = Some(facts.comm_quant_mode);
                 self.attention_backend = Some(facts.attention_backend);
-                self.fpm_resources()?;
+                // A draft profile still identifies measured timing rows. vLLM PP1 cache
+                // sizing and replay call fpm_resources themselves and require the missing
+                // block. Other configurations never read it: replay sizes capacity with the
+                // analytical estimate and uses the profile for timing only.
+                if self
+                    .fpm_deployment()?
+                    .is_some_and(|deployment| deployment.get("resources").is_some())
+                    || self.validate_fpm_execution()?.is_some()
+                {
+                    self.fpm_resources()?;
+                }
                 Some(facts.registered)
             }
             #[cfg(not(feature = "python"))]
@@ -1504,6 +1524,23 @@ mod tests {
                     .contains("fpm_learned requires fallback_policy='deny'")
             );
         }
+    }
+
+    #[test]
+    fn learned_normalization_rejects_mtp_before_reading_the_artifact() {
+        let error = config(serde_json::json!({
+            "estimation_mode": "fpm_learned",
+            "speculation": {"kind": "mtp", "params": {"depth": 3}},
+            "estimator_config": {"fpm_learned": {"artifact_path": "missing-seed.json", "adaptation": "frozen"}}
+        }))
+        .normalize()
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("fpm_learned does not support speculative decoding"),
+            "{error}"
+        );
     }
 
     #[test]

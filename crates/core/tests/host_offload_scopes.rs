@@ -278,6 +278,68 @@ fn sliding_window_state_restores_on_another_prefill_worker_through_the_cluster_p
 }
 
 #[test]
+fn launch_polls_recurrent_mtp_and_local_sliding_window_restores() {
+    // The restore is issued beside the busy prefill at 200 ms. Its H2D takes
+    // at most 0.25 ms. Without polling it joins the next pass at 201.
+    // SimpleCPU copies after the 200.25 launch; the 200.5 poll sees it.
+    // Offloading copies after the 201 forward; the 201.25 poll sees it.
+    // Two more decisions put their admissions at 203 and 204 respectively.
+    let requests = trace(&[
+        ("seed", 0.0, 1, 12, 1),
+        ("evict", 20.0, 101, 52, 1),
+        ("busy", 200.0, 201, 8, 24),
+        ("restore", 200.0, 1, 13, 2),
+    ]);
+    let launch = json!({
+        "decode_ms": 0.25, "piecewise_ms": 0.25, "eager_ms": 0.25,
+        "max_cudagraph_capture_size": 64, "eager_queue_fraction": 0.0,
+    });
+    let window = json!({"bytes_per_request": 1_000_000, "sliding_window": {"lookahead_tokens": 0}});
+    let recurrent = json!({"bytes_per_request": 1_000_000});
+    for (connector, state, host_tokens, launch_admit_ms) in [
+        ("offloading_v0_24", &Value::Null, 8, 201.0),
+        ("offloading_v0_24", &window, 12, 204.0),
+        ("offloading_v0_32", &window, 12, 204.0),
+        ("offloading_v0_32", &recurrent, 8, 204.0),
+        ("simple_cpu_v0_32", &recurrent, 8, 203.0),
+    ] {
+        let mut rank = rank(json!({
+            "connector": connector, "num_host_blocks": 64,
+            "d2h_bandwidth_gbps": 0.0, "h2d_bandwidth_gbps": 16.0,
+        }));
+        rank["state_cache"] = state.clone();
+        if state == &recurrent {
+            canonical_mtp(&mut rank, 1);
+            rank["prefix_match_unit"] = json!(4);
+            rank["disable_eagle_block_drop"] = json!(true);
+        }
+        for (setting, admit_ms) in [(&Value::Null, 201.0), (&launch, launch_admit_ms)] {
+            rank["launch"] = setting.clone();
+            let report = run_with(
+                &timed_factory(),
+                aggregated(1),
+                json!({"rank": rank}),
+                requests.clone(),
+            )
+            .unwrap();
+            let restored = report
+                .per_request
+                .iter()
+                .find(|r| r.request_id.as_deref() == Some("restore"))
+                .unwrap();
+            assert_eq!(
+                (
+                    restored.first_admission_host_reused_input_tokens,
+                    restored.first_admit_ms
+                ),
+                (Some(host_tokens), Some(admit_ms)),
+                "{connector} state={state} launch={setting}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_state_restore_is_admitted_with_room_for_both_state_copies() {
     // After its load a request computes on in the restored checkpoint, and G1
     // counts a second copy of it: the window it caches at the boundary.
@@ -1023,4 +1085,34 @@ fn an_engine_joining_a_warm_shared_pool_publishes_its_residency() {
     assert_eq!(host_pinned_blocks, 2);
     assert!(consumer.next_internal_deadline_ms().is_none());
     assert!(consumer.is_drained());
+}
+
+#[test]
+fn v0_32_admits_a_waiter_that_holds_g1_before_one_that_holds_none() {
+    // Six 4-token G1 blocks and enough G2 to keep every prompt; H2D moves a
+    // 1 MB block in 10 ms.
+    let mut rank = rank(json!({
+        "connector": "offloading_v0_32", "num_host_blocks": 16, "h2d_bandwidth_gbps": 0.1,
+    }));
+    rank["num_gpu_blocks"] = json!(6);
+    let requests = trace(&[
+        // G2 keeps a 13-token and a 9-token prompt; the third evicts both
+        // from G1.
+        ("seed", 0.0, 1, 13, 1),
+        ("c_seed", 10.0, 21, 9, 1),
+        ("evict", 20.0, 41, 23, 1),
+        // A loads the 13-token prompt's first two blocks over [100, 120).
+        ("a", 100.0, 1, 9, 1),
+        // B hits the blocks A is loading, so it waits and holds no G1.
+        ("b", 101.0, 1, 13, 1),
+        // C queues behind B and reserves two G1 blocks for its load over
+        // [120, 140). B's four blocks never fit beside them, so in FCFS
+        // order B would hold the queue head forever.
+        ("c", 102.0, 21, 9, 1),
+    ]);
+    let report = run(aggregated(1), json!({"rank": rank}), requests).unwrap();
+    // C runs once its load lands; B then finds A's two blocks in G1 and
+    // loads its third over [141, 151).
+    assert_eq!(terminal_ms(&report, "c"), 141.0);
+    assert_eq!(terminal_ms(&report, "b"), 152.0);
 }

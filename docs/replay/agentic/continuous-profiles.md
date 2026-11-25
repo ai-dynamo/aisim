@@ -61,10 +61,16 @@ plus the recorded delay, never at its authored source offset, so a server that
 answers faster than the recorded API shortens the play. A turn that joins
 children waits for them and for its own recorded delay after its predecessor.
 The first request of a detected chain, which the trace anchors only with a
-replay barrier, starts when that barrier clears. Only play roots and, after a
-snapshot cut, each stream's next request whose predecessor lies before the cut
-keep a source-clock timer. Finite replay without a profile still waits for
-authored offsets.
+replay barrier, starts when that barrier clears. Only play roots keep a
+source-clock timer. After a snapshot cut, rows carrying `recorded_start_ms`
+also keep a timer relative to the cut when their previous or spawning turn
+lies before it. Legacy Agentic Mooncake dependent rows without this field
+gain no such timer: they can dispatch at the cut once dependency delays have
+elapsed. Live joins and replay barriers still gate dispatch.
+With `traffic.source.client: agentx` and `agentic_snapshot`, this snapshot timer
+rule also applies to finite replay without a profile; other AgentX requests
+follow dependency events. With `client: recorded`, finite replay still waits
+for authored offsets.
 
 Idle guards advance pending workload timers after a tree or the whole client
 workload has no outstanding requests for its configured cap. Requests queued
@@ -125,9 +131,11 @@ functional qualification of profile control, not complete AgentX parity or
 hardware performance accuracy. Long profiles retain lifecycle evidence and can
 use more host memory than a finite corpus replay. Resource admission still checks
 the initial trace, but does not use its finite size as a peak-memory estimate for
-the full profile. The CLI and guarded recommendation/Sweeper paths admit one
-profiled candidate at a time under live host-memory supervision. Low-level
-runner/native callers remain responsible for resource supervision. A run can stop
+the full profile. For native Weka profiles, the CLI and guarded `Sweeper` can
+admit parallel candidates when each worker has enough memory for initial trace
+materialization and its baseline plus the array lower bound. Other continuous
+profiles run one candidate at a time. See [host memory admission](../../reference/local-resources.md).
+Low-level runner/native callers remain responsible for resource supervision. A run can stop
 with `resource_limited` if it exhausts the host budget; choosing a duration does
 not reserve enough memory to guarantee completion.
 

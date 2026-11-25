@@ -92,6 +92,12 @@ def _assert_concrete(value: Any, *, path: str = "config") -> None:
             _assert_concrete(child, path=f"{path}[{index}]")
 
 
+def _current_version(hardware: str, backend: str) -> str:
+    from aisim_core.sdk import perf_database
+
+    return perf_database.get_version_slots(hardware, backend)["current"]
+
+
 def _check_documented_candidate_renderer(recommendation_output: Path, tmp_path: Path) -> None:
     guide = (_REPO_ROOT / "docs/sweeper/deployment-generation.md").read_text()
     script = guide.split("```python\n", 1)[1].split("\n```", 1)[0]
@@ -336,6 +342,48 @@ def test_engine_predict_cli_cases(config_path: Path, tmp_path: Path) -> None:
         assert "requested='auto', resolved='absolute'" in result.stderr
 
 
+@pytest.mark.parametrize("suffix", [".yaml", ".json"])
+def test_config_formats_reach_native_recommend_and_predict(tmp_path: Path, suffix: str) -> None:
+    raw = yaml.safe_load((_REPO_ROOT / _CONFIG_ROOT / "recommend/engine/03-preset-off-ttft.yaml").read_text())
+    raw["evaluation"] = {"sla": {"ttft_ms": 1e-7, "itl_ms": 1e-6}}
+    raw["optimization"]["target"] = "throughput"
+    serialize = json.dumps if suffix == ".json" else yaml.safe_dump
+    config = tmp_path / f"input{suffix}"
+    config.write_text(serialize(raw))
+    output = tmp_path / "recommend"
+    result = _run_cli(
+        "recommend",
+        "--config",
+        str(config),
+        "--set",
+        "optimizer.max_trials=1",
+        "--output-dir",
+        str(output),
+        "--format",
+        "json",
+    )
+    assert len(json.loads(result.stdout)) == 1
+    report = json.loads((output / "recommendation.json").read_text())
+    assert len(report["candidates"]) == 1
+    generated = yaml.safe_load((output / "recommendations/0001.yaml").read_text())
+    assert generated["evaluation"]["sla"] == raw["evaluation"]["sla"]
+
+    prediction = tmp_path / f"prediction{suffix}"
+    prediction.write_text(serialize(generated))
+    result = _run_cli(
+        "predict",
+        "--config",
+        str(prediction),
+        "--set",
+        "traffic.stop.requests=2",
+        "--output-dir",
+        str(tmp_path / "predict"),
+        "--format",
+        "json",
+    )
+    assert json.loads(result.stdout)["completed_requests"] == 2
+
+
 @pytest.mark.parametrize("backend", ["vllm", "sglang"])
 @pytest.mark.parametrize("trace", ["weka-two-plays.jsonl", "weka-relative.json"])
 def test_agentx_replay_cli_matches_public_python(backend: str, trace: str, tmp_path: Path) -> None:
@@ -457,7 +505,9 @@ def test_engine_recommend_cli_cases_round_trip(config_path: Path, tmp_path: Path
         if config_path.name == "dynamo-deployment-recommend.yaml":
             assert json.loads(prediction.stdout)["completed_requests"] == 40
             assert raw["engine"]["model"] == "Qwen/Qwen3-32B-FP8"
-            assert raw["engine"]["backend_version"] == "0.24.0"
+            # The example asks for `current`; the recommendation records the version it resolved to.
+            assert requested.engine.backend_version == "current"
+            assert raw["engine"]["backend_version"] == _current_version("h200_sxm", "vllm")
         if config_path.name == "08-heterogeneous-pd.yaml":
             candidate = SweepResult.from_json((output / "recommendation.json").read_text()).selected_candidates[index]
             deployment = prediction_to_replay_spec(concrete).backend_deployment
@@ -479,7 +529,8 @@ def test_engine_recommend_cli_cases_round_trip(config_path: Path, tmp_path: Path
                 assert metrics[key] == pytest.approx(candidate.metrics[key])
         if config_path.name == "07-afd-plus-pd.yaml":
             assert concrete.engine.model == requested.engine.model == "Qwen/Qwen3-30B-A3B"
-            assert concrete.engine.backend_version == requested.engine.backend_version == "0.5.14"
+            assert requested.engine.backend_version == "current"
+            assert concrete.engine.backend_version == _current_version("h200_sxm", "sglang")
             for role in ("prefill", "decode"):
                 assert getattr(concrete.engine.workers, role).type == getattr(requested.engine.workers, role).type
             _assert_native_afd_prediction(

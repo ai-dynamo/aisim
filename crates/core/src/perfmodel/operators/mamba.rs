@@ -733,7 +733,6 @@ impl KdaOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn mamba_recurrent_traffic_accounts_for_state_precision_and_verify_writes() {
@@ -849,9 +848,7 @@ mod tests {
     /// (task-3-report.md Sec. 7, commit 21a4938).
     #[test]
     fn gdn_flashinfer_lane_sol_matches_python_bs128_census_anchor() {
-        let systems_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("python/aisim/src/aisim_core/systems");
+        let systems_root = crate::test_systems::path("");
         let db = PerfDatabase::load(&systems_root, "gb300", "sglang", "0.5.14")
             .expect("gb300/sglang/0.5.14 must load");
         assert_eq!(db.system_spec.gpu.sm_version, Some(103));
@@ -879,9 +876,7 @@ mod tests {
 
     #[test]
     fn gdn_context_and_fla_sol_state_bytes_follow_resolved_dtype() {
-        let systems_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("python/aisim/src/aisim_core/systems");
+        let systems_root = crate::test_systems::path("");
         let db = PerfDatabase::load(&systems_root, "gb300", "sglang", "0.5.14")
             .expect("gb300/sglang/0.5.14 must load");
         let op = |kernel_source: &str, phase: &str, dtype: &str| GdnOp {

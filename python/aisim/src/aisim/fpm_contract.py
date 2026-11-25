@@ -74,9 +74,15 @@ FPM_POWER_WINDOW_FLAG = "--benchmark-power-window-s"
 FPM_POWER_MIN_WINDOW_S = 2.0
 # Relative agreement required between the ranks' measured window lengths.
 FPM_POWER_WINDOW_REL_TOL = 1e-3
-# A decode window may append at most this fraction of the point's
-# total_kv_read_tokens; beyond it the point keeps latency without power.
-FPM_POWER_MAX_KV_DRIFT_FRAC = 0.10
+# Decode power gate (AISIM-2375): on every rank, the median of the window's
+# last FPM_POWER_LATENCY_GATE_EDGE_STEPS step wall times (``step_wall_times_s``)
+# may differ from the median of its first ones by at most this fraction of the
+# first (inclusive), over at least FPM_POWER_LATENCY_GATE_MIN_STEPS steps;
+# otherwise the point keeps latency without power. The window's KV growth
+# (``kv_drift_tokens``) is a diagnostic only.
+FPM_POWER_MAX_LATENCY_DRIFT_FRAC = 0.10
+FPM_POWER_LATENCY_GATE_EDGE_STEPS = 5
+FPM_POWER_LATENCY_GATE_MIN_STEPS = 10
 
 # Artifact names the Generator FPM target emits and the collector stages into
 # every pod's working directory.
