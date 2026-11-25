@@ -94,3 +94,22 @@ fn invalid_ngram_depth_is_rejected() {
         );
     }
 }
+
+#[test]
+fn ngram_depth_outside_core_range_fails_model_construction() {
+    // Dynamo's parser takes any u32 depth. The core then rejects depths outside 1..=5.
+    for depth in [0, 6] {
+        let error = build_model(&config(
+            json!({"kind": "ngram", "params": {"num_speculative_tokens": depth}}),
+            0,
+        ))
+        .err()
+        .unwrap_or_else(|| panic!("ngram depth {depth} must be rejected"))
+        .to_string();
+        assert!(error.contains("AIS model construction failed"), "{error}");
+        assert!(
+            error.contains("ngram num_speculative_tokens must be an integer in 1..=5"),
+            "{error}"
+        );
+    }
+}
