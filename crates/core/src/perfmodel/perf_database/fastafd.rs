@@ -129,6 +129,7 @@ pub(crate) fn validate_config(config: &ForwardPassPerfModelConfig) -> Result<(),
         || config.enable_shared_layer.is_some()
         || config.gemm_quant_mode.is_some()
         || config.fmha_quant_mode.is_some()
+        || config.fpm_fmha_quant_mode.is_some()
         || config.kvcache_quant_mode.is_some()
         || config.comm_quant_mode.is_some()
         || config.attention_backend.is_some()
@@ -557,8 +558,14 @@ impl FastAfdTable {
         let e = &matches[0];
         let c = &e.measurement;
         let s = &self.source;
+        let ffn_ms = e.latency_ms / (f64::from(e.key.moe_layers) * f64::from(e.key.microbatches));
+        if !ffn_ms.is_finite() || ffn_ms <= 0.0 {
+            return Err(invalid(
+                "FastAFD normalized per-unit latency must be finite and positive",
+            ));
+        }
         Ok(FastAfdStageEstimate {
-            ffn_ms: e.latency_ms / (f64::from(e.key.moe_layers) * f64::from(e.key.microbatches)),
+            ffn_ms,
             num_layers: e.key.moe_layers,
             stage: json!({"profile_path":self.path,"profile_sha256":self.sha256,"key":e.key,"latency_ms":e.latency_ms,
                 "provider":"fastafd","schema":"aisimulate.fastafd-moe-stage.v1","repository":s.repository,"source_commit":s.commit,"benchmark":s.benchmark,"boundary":s.boundary,"boundary_components":s.boundary_components,"timed_span":s.timed_span,"microbatch_split":s.microbatch_split,
@@ -661,6 +668,30 @@ mod tests {
         let error = model.tune_with_fpms(&[]).unwrap_err();
         assert!(matches!(error, AicError::InvalidEngineConfig(_)));
         assert!(error.to_string().contains("cannot be tuned"));
+    }
+
+    #[test]
+    fn canonical_stage_rejects_latency_that_normalizes_to_zero() {
+        let (file, config) = fixture();
+        let mut document = fixture_document();
+        document["entries"][0]["latency_ms"] = json!(f64::from_bits(1));
+        std::fs::write(file.path(), parquet_snapshot(&document)).unwrap();
+        let model = ForwardPassPerfModel::best_available(config).unwrap();
+        let error = model.estimate_fastafd_stage(128).unwrap_err().to_string();
+        assert!(error.contains("normalized per-unit latency"), "{error}");
+    }
+
+    #[test]
+    fn canonical_stage_rejects_unused_fpm_attention_selector() {
+        let (_file, mut config) = fixture();
+        config.fpm_fmha_quant_mode = Some("fp8".into());
+        let error = ForwardPassPerfModel::best_available(config)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("no unrelated estimator/graph controls"),
+            "{error}"
+        );
     }
 
     #[test]

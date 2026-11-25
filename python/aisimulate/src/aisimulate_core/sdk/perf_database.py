@@ -91,11 +91,13 @@ _DATABASE_VERSION_METADATA_FILES = {
 }
 
 
-def _normalize_systems_paths(raw_paths: str | Iterable[str] | None) -> list[str]:
+def _normalize_systems_paths(raw_paths: str | os.PathLike | Iterable[str | os.PathLike] | None) -> list[str]:
     default_path = os.fspath(pkg_resources.files("aisimulate_core") / "systems")
     if raw_paths is None:
         return [default_path]
-    if isinstance(raw_paths, str):
+    if isinstance(raw_paths, os.PathLike):
+        entries = [os.fspath(raw_paths)]
+    elif isinstance(raw_paths, str):
         entries = [part.strip() for part in raw_paths.split(",") if part.strip()]
     else:
         entries = [os.fspath(entry) for entry in raw_paths if entry is not None]

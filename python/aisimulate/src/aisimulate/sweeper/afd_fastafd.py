@@ -136,6 +136,7 @@ class FastAFDMoEStagePerformanceModel:
                 num_layers=estimate["num_layers"],
                 decode_attention_samples=decode_samples,
                 provenance={
+                    "isl": request.input_length,
                     "provider": "fastafd",
                     "api_version": AFD_MEASUREMENT_API_VERSION,
                     "units": "milliseconds_per_layer_microbatch",

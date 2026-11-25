@@ -181,6 +181,10 @@ generated profile before it is excluded from input discovery and replaced. A raw
 capture cannot be used as the output, and symlink outputs are rejected before
 discovery. Other unsupported inputs fail. Malformed routing values fail before
 filtering; only nonempty string routing labels can be counted as routing skips.
+`correctness_passed` must be a Boolean or null, even for captures excluded by
+routing or stability. Accepted captures must report nonempty string `torch`
+and `cuda_runtime` versions in rank-zero provenance; the builder preserves
+those reported strings in `method_version`.
 Raw results must include `measurement_boundary_components` with the exact ordered
 components above, in addition to the free-form `measurement_boundary` description.
 They must also include `measurement_timed_span: "all_moe_layers_and_microbatches"`;

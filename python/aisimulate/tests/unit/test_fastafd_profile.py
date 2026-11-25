@@ -178,6 +178,31 @@ def test_parquet_writer_preserves_direct_integer_latency_through_canonical_estim
     assert estimate["ffn_ms"] == 2.0
 
 
+@pytest.mark.parametrize("suffix", ["json", "parquet"])
+def test_canonical_estimator_rejects_latency_underflow(tmp_path, suffix):
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    payload = _payload()
+    payload["entries"][0]["latency_ms"] = float.fromhex("0x0.0000000000001p-1022")
+    path = _write(tmp_path, payload)
+    if suffix == "parquet":
+        profile = FastAFDMoEStageProfile.load(path)
+        path = path.with_suffix(".parquet")
+        profile.write_parquet(path)
+    model = RustForwardPassPerfModel.best_available(_canonical_config(path))
+    with pytest.raises(ValueError, match="normalized per-unit latency must be finite and positive"):
+        model.estimate_fastafd_stage(48)
+
+
+def test_canonical_estimator_rejects_unused_fpm_attention_selector(tmp_path):
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    config = _canonical_config(_write(tmp_path, _payload())).to_dict()
+    config["fpm_fmha_quant_mode"] = "fp8"
+    with pytest.raises(ValueError, match="no unrelated estimator/graph controls"):
+        RustForwardPassPerfModel.best_available(config)
+
+
 def test_entries_cannot_be_replaced_after_exact_index_is_built(tmp_path):
     other = _entry()
     other["key"]["microbatches"] = 3
@@ -444,6 +469,66 @@ def test_inspection_and_canonical_model_agree_on_flat_parquet_schema(tmp_path, n
         FastAFDMoEStageProfile.load(path)
     with pytest.raises(PerfDataNotAvailableError, match="flat parquet schema"):
         RustForwardPassPerfModel.best_available(_canonical_config(path))
+
+
+def test_inspection_and_native_loading_reject_legacy_repeated_primitive(tmp_path):
+    import base64
+    import zlib
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+    from aisimulate_core.sdk.errors import PerfDataNotAvailableError
+
+    # Self-authored synthetic _payload(), written with parquet-rs 59.3.0's
+    # SerializedFileWriter. All 14 profile fields are REQUIRED, plus one unused
+    # REPEATED DOUBLE (one zero value, definition level 1, repetition level 0).
+    # PyArrow writes lists as groups and cannot generate this legacy encoding.
+    # One row, no compression; latency 16.7 ms, counts and provenance as _payload.
+    encoded = (
+        "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"
+    )
+    path = tmp_path / "legacy.parquet"
+    path.write_bytes(zlib.decompress(base64.b64decode(encoded)))
+    schema = pq.ParquetFile(path).schema
+    assert len(schema) == 15
+    assert schema.column(14).path == "unused"
+    assert schema.column(14).max_repetition_level == 1
+    assert pa.types.is_list(pq.read_schema(path).field("unused").type)
+    with pytest.raises(ValueError, match="flat parquet schema"):
+        FastAFDMoEStageProfile.load(path)
+    with pytest.raises(PerfDataNotAvailableError, match="flat parquet schema"):
+        RustForwardPassPerfModel.best_available(_canonical_config(path))
+
+    # The same complete profile with an unused scalar DOUBLE remains valid.
+    profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload()))
+    table = pq.read_table(path).drop(["unused"]).append_column("unused", pa.array([0.0]))
+    pq.write_table(table, path)
+    assert FastAFDMoEStageProfile.load(path).entries == profile.entries
+    estimate = RustForwardPassPerfModel.best_available(_canonical_config(path)).estimate_fastafd_stage(48)
+    assert estimate["stage"]["latency_ms"] == 16.7
 
 
 @pytest.mark.parametrize("span", [None, "one_microbatch", "one_moe_layer", 1])

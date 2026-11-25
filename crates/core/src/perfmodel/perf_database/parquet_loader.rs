@@ -97,17 +97,16 @@ impl<R: ChunkReader + 'static> PerfReader<R> {
     }
 
     /// Positional row access uses top-level fields, whereas `col` indexes leaves.
-    /// Loaders with a flat-table contract must reject groups before resolving columns.
+    /// Loaders with a flat-table contract must reject groups and repeated fields
+    /// before resolving columns.
     pub(crate) fn require_flat_schema(&self) -> Result<(), AicError> {
         let schema = self.file_reader.metadata().file_metadata().schema_descr();
-        if schema
-            .root_schema()
-            .get_fields()
-            .iter()
-            .any(|field| !field.is_primitive())
-        {
+        if schema.root_schema().get_fields().iter().any(|field| {
+            !field.is_primitive()
+                || field.get_basic_info().repetition() == parquet::basic::Repetition::REPEATED
+        }) {
             return Err(AicError::PerfDatabase(format!(
-                "expected a flat parquet schema (no nested fields) at {}",
+                "expected a flat parquet schema (no nested or repeated fields) at {}",
                 self.path.display()
             )));
         }

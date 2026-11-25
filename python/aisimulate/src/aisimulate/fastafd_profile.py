@@ -46,20 +46,15 @@ def build_profile(
     """
 
     excluded = Path(output_path).resolve() if output_path is not None else None
-    files = sorted(Path(results_dir).glob("*.json"))
-    if excluded is not None:
-        inputs = []
-        for path in files:
-            if path.resolve() == excluded:
-                # An output inside the discovery directory is replaceable only
-                # when it is already a validated profile, never a raw capture.
-                try:
-                    FastAFDMoEStageProfile.load(path)
-                except (ValueError, KeyError, TypeError) as exc:
-                    raise ValueError(f"{path.name}: output must be an existing generated profile") from exc
-            else:
-                inputs.append(path)
-        files = inputs
+    results = Path(results_dir).resolve()
+    if excluded is not None and excluded.parent == results and excluded.exists():
+        # Check the destination independently of the raw JSON discovery glob:
+        # Parquet outputs inside the results directory need the same protection.
+        try:
+            FastAFDMoEStageProfile.load(excluded)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ValueError(f"{excluded.name}: output must be an existing generated profile") from exc
+    files = sorted(path for path in results.glob("*.json") if excluded is None or path.resolve() != excluded)
     if not files:
         raise ValueError(f"no benchmark results in {results_dir}")
     summary: Counter[str] = Counter()
@@ -90,13 +85,15 @@ def build_profile(
             raise ValueError(f"{path.name}: stable must be a boolean")
         if not isinstance(workload["routing"], str) or not workload["routing"].strip():
             raise ValueError(f"{path.name}: routing must be a non-empty string")
+        correctness = payload.get("correctness_passed")
+        if correctness is not None and not isinstance(correctness, bool):
+            raise ValueError(f"{path.name}: correctness_passed must be a boolean or null")
         if workload["routing"] != routing:
             summary["skipped_routing"] += 1
             continue
         if payload["stable"] is not True:
             summary["skipped_unstable"] += 1
             continue
-        correctness = payload.get("correctness_passed")
         if correctness is False:
             summary["skipped_correctness"] += 1
             continue
@@ -107,6 +104,9 @@ def build_profile(
         seen[identity] = path.name
         stats = payload["stage_cuda"]
         stack = payload["provenance_by_rank"][0]
+        for field in ("torch", "cuda_runtime"):
+            if not isinstance(stack.get(field), str) or not stack[field].strip():
+                raise ValueError(f"{path.name}: {field} must be a non-empty string")
         entries.append(
             {
                 "key": key,

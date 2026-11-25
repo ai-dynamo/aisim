@@ -151,6 +151,7 @@ def test_builds_split_profile_through_the_command_line(tmp_path, suffix):
         moe_backend="megamoe",
     )
     assert profile.require(key).latency_ms == pytest.approx(11.4)
+    assert profile.require(key).method_version == "torch 2.10.0+cu130; cuda 13.0"
     assert profile.source.benchmark == "fastafd.moe-m2n-model-benchmark.v2"
 
 
@@ -241,9 +242,10 @@ def test_invalid_timing_preserves_existing_profile(tmp_path, suffix):
     assert sorted(path.name for path in tmp_path.iterdir()) == [output.name, "results"]
 
 
-def test_repeated_build_excludes_only_designated_output(tmp_path):
+@pytest.mark.parametrize("suffix", ["json", "parquet"])
+def test_repeated_build_excludes_only_designated_output(tmp_path, suffix):
     _write(tmp_path, "capture.json", _split(64))
-    output = tmp_path / "profile.json"
+    output = tmp_path / f"profile.{suffix}"
     args = [str(tmp_path), "--repository", _REPOSITORY, "--output", str(output)]
     assert main(args) == 0
     original = output.read_bytes()
@@ -256,6 +258,54 @@ def test_repeated_build_excludes_only_designated_output(tmp_path):
     with pytest.raises(ValueError, match="unsupported benchmark schema"):
         main(args)
     assert output.read_bytes() == original
+
+
+def test_output_cannot_replace_unrelated_parquet_in_results(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    _write(tmp_path, "capture.json", _split(64))
+    output = tmp_path / "summary.parquet"
+    pq.write_table(pa.table({"unrelated": [12.0]}), output)
+    original = output.read_bytes()
+
+    with pytest.raises(ValueError, match="summary.parquet: output must be an existing generated profile"):
+        main([str(tmp_path), "--repository", _REPOSITORY, "--output", str(output)])
+
+    assert output.read_bytes() == original
+
+
+@pytest.mark.parametrize("correctness", ["false", "true", 0, 1, [], {}])
+@pytest.mark.parametrize("routing,stable", [("hotset", True), ("balanced", False), ("balanced", True)])
+@pytest.mark.parametrize("suffix", ["json", "parquet"])
+def test_malformed_correctness_prevents_publication_before_filtering(tmp_path, correctness, routing, stable, suffix):
+    results = tmp_path / "results"
+    _write(results, "a-valid.json", _colocated(48))
+    _write(results, "b-malformed.json", _colocated(96, routing=routing, stable=stable, correctness=correctness))
+    output = tmp_path / f"profile.{suffix}"
+    output.write_bytes(b"previous output")
+
+    with pytest.raises(ValueError, match="b-malformed.json: correctness_passed must be a boolean or null"):
+        main([str(results), "--repository", _REPOSITORY, "--output", str(output)])
+
+    assert output.read_bytes() == b"previous output"
+
+
+@pytest.mark.parametrize("field", ["torch", "cuda_runtime"])
+@pytest.mark.parametrize("version", [None, "", "  ", 13, False])
+@pytest.mark.parametrize("suffix", ["json", "parquet"])
+def test_invalid_runtime_provenance_prevents_publication(tmp_path, field, version, suffix):
+    results = tmp_path / "results"
+    payload = _split(64)
+    payload["provenance_by_rank"] = [{**_STACK[0], field: version}]
+    _write(results, "capture.json", payload)
+    output = tmp_path / f"profile.{suffix}"
+    output.write_bytes(b"previous output")
+
+    with pytest.raises(ValueError, match=f"capture.json: {field} must be a non-empty string"):
+        main([str(results), "--repository", _REPOSITORY, "--output", str(output)])
+
+    assert output.read_bytes() == b"previous output"
 
 
 def test_output_cannot_replace_a_raw_capture(tmp_path):

@@ -39,7 +39,8 @@ def test_nvfp4_unchanged_on_blackwell():
 
 
 @pytest.mark.parametrize("pinned_sm,default_sm", [(100, 90), (90, 100), (100, None)])
-def test_nvfp4_classification_uses_explicit_systems_roots(tmp_path, monkeypatch, pinned_sm, default_sm):
+@pytest.mark.parametrize("root_form", ["path", "string", "path_list", "string_list"])
+def test_nvfp4_classification_uses_explicit_systems_roots(tmp_path, monkeypatch, pinned_sm, default_sm, root_form):
     from aisimulate_core.sdk import perf_database
 
     pinned = tmp_path / "pinned"
@@ -50,11 +51,12 @@ def test_nvfp4_classification_uses_explicit_systems_roots(tmp_path, monkeypatch,
     if default_sm is not None:
         (default / "custom_sku.yaml").write_text(f"gpu:\n  sm_version: {default_sm}\n")
     monkeypatch.setattr(perf_database, "_SYSTEMS_PATHS", [str(default)])
-    assert perf_database.is_blackwell_system("custom_sku", systems_paths=[str(pinned)]) is (pinned_sm >= 100)
+    roots = {"path": pinned, "string": str(pinned), "path_list": [pinned], "string_list": [str(pinned)]}[root_form]
+    assert perf_database.is_blackwell_system("custom_sku", systems_paths=roots) is (pinned_sm >= 100)
     assert perf_database.is_blackwell_system("custom_sku") is (default_sm is not None and default_sm >= 100)
 
     mc = _model_config(gemm_quant_mode=common.GEMMQuantMode.nvfp4, moe_quant_mode=common.MoEQuantMode.nvfp4)
-    resolve_nvfp4_for_system(mc, "custom_sku", systems_paths=[str(pinned)])
+    resolve_nvfp4_for_system(mc, "custom_sku", systems_paths=roots)
     suffix = "nvfp4" if pinned_sm >= 100 else "nvfp4_wo"
     assert mc.gemm_quant_mode == common.GEMMQuantMode[suffix]
     assert mc.moe_quant_mode == common.MoEQuantMode[suffix]

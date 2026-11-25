@@ -234,3 +234,109 @@ attestation added for those commits.
 PR-description publication. The live description still lacks the parity commands
 and results. A maintainer with PR-edit permission must copy them there; this
 read-only worker cannot complete that part of the request.
+
+## Scoped validation and input-length provenance repair
+
+Verified on 2026-11-25 against the accompanying corrective source descended
+from `200ca094ee4efc52da7811ab543212cc313e007e`. All eleven selected discussions
+were complete and assessed. Nine actionable threads are fixed:
+`PRRT_kwDOT0t9uc67OJN9`, `PRRT_kwDOT0t9uc67OJOF`,
+`PRRT_kwDOT0t9uc67OJOQ`, `PRRT_kwDOT0t9uc67OJOb`,
+`PRRT_kwDOT0t9uc67OJiB`, `PRRT_kwDOT0t9uc67OrpK`,
+`PRRT_kwDOT0t9uc67OrpP`, `PRRT_kwDOT0t9uc67OrpU`, and
+`PRRT_kwDOT0t9uc67OrpW` (the last and OJiB request the same provenance fix).
+
+The optimized mixed-project wheel was built from `python/aisimulate` using
+`python -m maturin build --profile ci --locked --config
+'profile.ci.inherits="release"' --config 'profile.ci.opt-level=2' --config
+'profile.ci.lto=false' --config 'profile.ci.codegen-units=16' --auditwheel skip
+--out "$REPAIR_SCRATCH/wheel"`. Frozen dev dependencies, the venv, Cargo target,
+UV cache, and temporary data stayed under the repair scratch directory, with
+`CARGO_BUILD_JOBS=2`. The imported native binary SHA-256 was
+`00bfd036b34fc4f20b46a981f1b4d110a361e528681292f24cbd4a9c0d8eec93`.
+All three edited Python production modules matched their installed wheel bytes.
+
+With `$REPAIR_SCRATCH/venv/bin` and `/opt/rust/bin` on PATH and
+`PYTHONDONTWRITEBYTECODE=1`, these commands passed:
+
+```bash
+python -m pytest -q python/aisimulate/tests/unit/test_fastafd_profile.py python/aisimulate/tests/unit/test_fastafd_profile_build.py python/aisimulate/tests/unit/sdk/models/test_nvfp4_fallback.py tests/sweeper/test_afd_fastafd.py tests/sweeper/test_afd_perfmodel.py tests/sweeper/test_afd_engine.py tests/test_afd_runner.py -p no:cacheprovider --timeout=120 --basetemp "$TMPDIR/pytest-targeted-final"
+python -m pytest -q python/aisimulate/tests/unit/test_fastafd_profile.py::test_inspection_and_native_loading_reject_legacy_repeated_primitive -p no:cacheprovider --timeout=120 --basetemp "$TMPDIR/pytest-legacy-repeated-final"
+python -m pytest -q -rx -n 2 -c python/aisimulate/pytest.ini crates/core/parity_tests/perfmodel/test_engine_step_parity.py -p no:cacheprovider --basetemp "$TMPDIR/pytest-engine-parity"
+python -m pytest -q -rx -n 2 -c python/aisimulate/pytest.ini crates/core/parity_tests/perfmodel/test_compile_engine_parity.py -p no:cacheprovider --basetemp "$TMPDIR/pytest-compile-parity"
+```
+
+Results were **820 passed in 26.46s**, **1 passed in 0.19s**,
+**305 passed in 122.05s**, and **85 passed in 38.28s**, without skips.
+Logs under `TMPDIR`: `targeted-final.log`, `legacy-repeated-final.log`,
+`engine-parity.log`, and `compile-parity.log`. The single-test rerun strengthened
+the repeated-field control to preserve the fixture's other columns exactly.
+The final targeted rerun also gives both replay workloads explicit KV capacity
+of 4096 and validates the changed workload through normal configuration parsing,
+isolating stale timing from capacity rejection. The earlier targeted run also
+passed (820 cases, `targeted-initial.log`). No numerical goldens, test assertions,
+or timeouts were weakened or refreshed.
+
+The native FastAFD tests used the same optimized CI profile:
+
+```bash
+cargo test --locked --profile ci --config 'profile.ci.inherits="release"' --config 'profile.ci.opt-level=2' --config 'profile.ci.lto=false' --config 'profile.ci.codegen-units=16' -p aisimulate-core perf_database::fastafd -- --nocapture
+```
+
+Result: **22 passed**, including the latency-underflow and unused-selector
+regressions (`rust-fastafd.log`). Other Rust modules were filtered, not certified.
+
+The self-authored compressed Parquet fixture embedded in the Python regression
+uses parquet-rs 59.3.0's low-level writer, not third-party fixture content.
+Its machine-readable summary is:
+
+```json
+{"rows":1,"columns":15,"keys":{"model_path":"deepseek-ai/DeepSeek-V4-Flash","system":"gb200","stage":"afd","topology":"16A8F","logical_batch_per_source_rank":48,"mtp_nextn":0,"microbatches":2,"moe_layers":43,"routed_topk":6,"moe_precision":"w4a8_mxfp4_mxfp8","moe_backend":"megamoe"},"latency_ms":16.7,"latency_type":"DOUBLE","count_type":"signed INT64","anomalies":["unused REPEATED DOUBLE"],"coverage":"synthetic schema validation only"}
+```
+
+Both inspection and the canonical native constructor reject this legacy list
+encoding. Rewriting only the unused column as a scalar yields the same inspected
+measurement and a successful native estimate. Other new regressions preserve
+unrelated Parquet outputs byte-for-byte, reject malformed correctness before
+routing/stability skips, preserve valid runtime version strings, reject null
+runtime provenance, reject ignored FPM selectors and latency underflow, and
+exercise scalar Path/string/list roots. A generated FastAFD measurement survives
+JSON serialization and profile removal, permits matching replay, and rejects a
+changed ISL before foreground state mutation.
+
+Cost scope: the selector and path checks run at preparation, and the existing
+flat-schema pass remains linear in columns. Builder work remains linear in raw
+captures, plus one validation of an existing in-directory destination. The
+normalization check adds constant arithmetic validation without changing the
+valid-input operation order. Recording ISL adds one scalar per measurement and
+activates an existing fixed-size replay guard; there is no new token/request
+scan, cache, or retained model state. This is a bounded source-level cost
+assessment, not a performance or serving-accuracy benchmark.
+
+Repository-wide Ruff lint/format, Python syntax compilation, Rust formatting,
+SPDX and packaged legal-file checks, seven documentation-link unit tests, local
+Markdown destinations, and whitespace checks passed. The initial wheel setup
+attempt (`wheel-build.log`) could not find Cargo; the optimized build rerun
+with `/opt/rust/bin` on PATH succeeded (`wheel-build-with-rust.log`), followed by
+`wheel-final-build.log` and `wheel-install.log`. No debug wheel was built.
+The last test-setup refinement needed Ruff formatting
+(`ruff-format-before-last.log`); applying Ruff and repeating repository-wide
+lint, formatting, and syntax checks passed (`ruff-final-check.log`,
+`ruff-final-format.log`, `compileall-final.log`).
+
+Two selected requests remain open:
+
+- `PRRT_kwDOT0t9uc66hmrt`: both parity suites pass, but the live PR description
+  still lacks their exact commands and results. A maintainer with PR-edit
+  access must copy this evidence into the description; this worker is read-only.
+- `PRRT_kwDOT0t9uc66tHcg`: the current schema, builder, and native divisor already
+  enforce all layers and all microbatches and pass synthetic regressions. The
+  requested existing multi-microbatch AFD raw capture and its recorded benchmark
+  tree are unavailable in this checkout/discussion. The capture owner must
+  supply them so actual timer coverage can be verified; synthetic declarations
+  are not that evidence.
+
+The live head remained pinned and its base remained `main`. The workflow-runs
+endpoint returned HTTP 403, preventing workflow-log inspection. Current checks
+reported DCO action required for eight older commits by another author; no
+history was rewritten and no sign-off was added for that author's work.

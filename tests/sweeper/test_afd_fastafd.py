@@ -1163,6 +1163,34 @@ def test_serial_decode_evaluates_the_replayed_profile_stage(tmp_path):
     assert report.metrics["completed_requests"] == 32
 
 
+def test_generated_fastafd_measurement_rejects_changed_replay_input_length(tmp_path):
+    profile = _profile(tmp_path)
+    raw = _prediction(profile)
+    # Both workloads fit the configured KV capacity; the only mismatch is the
+    # input length at which the saved attention timing was measured.
+    raw["engine"]["context_length"] = 4096
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw), afd_performance_model=_Attention())
+    raw["traffic"]["source"]["input_tokens"] = 2048
+    CorePredictionConfig.model_validate(raw)
+    deployment = spec.backend_deployment
+    saved = json.loads(json.dumps(deployment.performance_model_metadata))
+    deployment = replace(deployment, performance_model_metadata=saved)
+    spec = replace(spec, backend_deployment=deployment)
+    (measurement,) = _afd_layer_measurements(deployment)
+    assert measurement.provenance["isl"] == 1024
+    Path(profile).unlink()
+    assert EngineReplayRunnerFactory().create(0).run(spec).metrics["completed_requests"] == 32
+
+    changed = replace(spec, workload={**spec.workload, "isl": 2048})
+    with pytest.raises(ValueError, match="recorded at isl=1024, not replay isl=2048"):
+        EngineReplayRunnerFactory().create(0).run(changed)
+
+    engine = AFDForegroundEngine(_afd_topology(deployment), (measurement,))
+    with pytest.raises(AFDInfeasible, match="recorded at isl=1024, not replay isl=2048"):
+        engine.execute_pass(phase="decode", now_ms=0.0, input_length=2048, output_length=128)
+    assert engine.in_flight is None
+
+
 @pytest.mark.parametrize(
     "changes",
     [
