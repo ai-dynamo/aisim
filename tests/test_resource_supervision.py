@@ -142,6 +142,50 @@ def _recover_partial_events(tmp_path, monkeypatch, lines, *, host, budget):
     return caught.value.plan
 
 
+@pytest.mark.parametrize("tail", ["complete", "incomplete", "oversized"])
+def test_partial_event_recovery_preserves_export_truncation(tmp_path, monkeypatch, tail):
+    from aisim import supervision
+    from aisim.config import CoreRecommendationConfig
+    from aisim.resources import ResourceLimitError
+
+    prefix = {"event": "candidate_completed", "value": {"score": 1}}
+    tails = {
+        "complete": "''",
+        "incomplete": "'{\"event\":'",
+        "oversized": "' ' * (_CHECKPOINT_RECORD_BYTES + 1) + '\\n'",
+    }
+    script = tmp_path / "checkpoint_worker.py"
+    script.write_text(
+        "from pathlib import Path\n"
+        "from aisim.supervision import _CHECKPOINT_RECORD_BYTES, checkpoint, runtime_budget\n"
+        "checkpoint('candidate_completed', {'score': 1})\n"
+        "with Path(runtime_budget()['events_path']).open('a', encoding='utf-8') as target:\n"
+        f"    target.write({tails[tail]})\n"
+        "raise SystemExit(3)\n"
+    )
+
+    def run_checkpoint_worker(command, *, policy, events_output):
+        assert command[1:4] == ["-m", "aisim.resource_worker", "recommend"]
+        report = run_process([sys.executable, str(script)], policy=policy, timeout=10, events_output=events_output)
+        assert report["status"] == "resource_limited"
+        assert report["exit_code"] == 3
+        assert report.get("partial_evidence_truncated", False) is (tail != "complete")
+        assert Path(events_output).read_text() == json.dumps(prefix) + "\n"
+        report["budget"] = {**report["budget"], "memory_limit_bytes": 8 * GB}
+        monkeypatch.setattr(supervision, "discover_host", lambda: HostResources(16 * GB, 8 * GB, 4))
+        return report
+
+    monkeypatch.setattr(supervision, "run_process", run_checkpoint_worker)
+    raw = yaml.safe_load(_small_cli_config(tmp_path, "recommend").read_text())
+    raw["execution"] = {"resources": _policy(extra_mib=160).model_dump()}
+    config = CoreRecommendationConfig.model_validate(raw)
+    with pytest.raises(ResourceLimitError) as caught:
+        supervision.supervised_recommendation(config, {})
+    assert caught.value.plan["partial_events"] == [prefix]
+    assert caught.value.plan["termination_complete"] is True
+    assert caught.value.plan.get("partial_evidence_truncated", False) is (tail != "complete")
+
+
 @pytest.mark.parametrize("tail", ["oversized", "incomplete", "total-budget"])
 def test_partial_event_reader_excludes_invalid_tail(tmp_path, monkeypatch, tail):
     from aisim import supervision

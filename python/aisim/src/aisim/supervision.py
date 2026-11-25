@@ -321,6 +321,7 @@ def _run_process(
         reason, status = f"cannot monitor execution resources: {exc}", "resource_limited"
     finally:
         tree.close()
+    events_truncated = False
     if events_output is not None and events_path.exists():
         # Copy only complete records after workers have stopped. A final partial
         # write interrupted by termination must not masquerade as a finished event.
@@ -329,13 +330,14 @@ def _run_process(
         with target_path.open("x", encoding="utf-8") as target, events_path.open(encoding="utf-8") as source:
             while line := source.readline(_CHECKPOINT_RECORD_BYTES + 1):
                 if not line.endswith("\n") or len(line) > _CHECKPOINT_RECORD_BYTES:
+                    events_truncated = True
                     break
                 target.write(line)
     code = process.returncode
     if status == "completed" and code:
         status = "resource_limited" if code == 3 else "failed"
         reason = f"execution process exited with status {code}"
-    return {
+    report = {
         "schema_version": 1,
         "status": status,
         "reason": reason,
@@ -347,6 +349,9 @@ def _run_process(
         "thread_limit_per_runtime": 1,
         "termination_complete": True,
     }
+    if events_truncated:
+        report["partial_evidence_truncated"] = True
+    return report
 
 
 def _save_report(output: str, filename: str, report: dict[str, Any], *, overwrite: bool) -> None:
