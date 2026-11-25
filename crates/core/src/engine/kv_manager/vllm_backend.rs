@@ -1029,28 +1029,30 @@ impl VllmKvManager {
             let peak = |first_budget: usize, checkpoint: Option<usize>| {
                 // Only scheduled stops can force a second working state. In
                 // particular, a non-final chunk uses its block-floored end.
-                let split_rotates = state.align_block_size.is_some_and(|block| {
-                    let plan = StatePrefillConfig {
-                        block_size: block,
-                        unit: self.prefix_match_unit.unwrap_or(block),
-                        token_budget: budget.total,
-                        prefill_checkpoint: state.prefill_checkpoint,
-                        speculative_drop: state.speculative_drop(),
-                    };
-                    let (tokens, _) = plan.plan(
-                        cost.cached_tokens,
-                        prompt_tokens,
-                        known_tokens,
-                        known_tokens
-                            .saturating_sub(cost.cached_tokens)
-                            .min(first_budget),
-                        junction,
-                    );
-                    let first_end = cost.cached_tokens + tokens;
-                    first_end < known_tokens
-                        && first_end.saturating_sub(1) / block
-                            < known_tokens.saturating_sub(1) / block
-                });
+                let (split_rotates, first_checkpoint) =
+                    state.align_block_size.map_or((false, false), |block| {
+                        let plan = StatePrefillConfig {
+                            block_size: block,
+                            unit: self.prefix_match_unit.unwrap_or(block),
+                            token_budget: budget.total,
+                            prefill_checkpoint: state.prefill_checkpoint,
+                            speculative_drop: state.speculative_drop(),
+                        };
+                        let (tokens, checkpoint) = plan.plan(
+                            cost.cached_tokens,
+                            prompt_tokens,
+                            known_tokens,
+                            known_tokens
+                                .saturating_sub(cost.cached_tokens)
+                                .min(first_budget),
+                            junction,
+                        );
+                        let first_end = cost.cached_tokens + tokens;
+                        let rotates = first_end < known_tokens
+                            && first_end.saturating_sub(1) / block
+                                < known_tokens.saturating_sub(1) / block;
+                        (rotates, checkpoint.is_some())
+                    });
                 // A retained sub-block state also needs copy-on-write even
                 // when both chunks target the same physical state slot.
                 let retains_state = state.align_block_size.is_some_and(|block| {
@@ -1072,17 +1074,24 @@ impl VllmKvManager {
                 } else {
                     1
                 };
-                // A resumed checkpoint may be exported one token before the
-                // known end. Its extra state and the final token page need
-                // not coexist; price the maximum of those two real peaks.
-                let token_peak = checkpoint.map_or(token_blocks, |end| {
-                    token_blocks.max(
-                        end.div_ceil(self.block_size)
-                            .saturating_add(state.blocks_per_state),
-                    )
+                let working_peak =
+                    token_blocks.saturating_add(state.blocks_per_state.saturating_mul(copies));
+                // A cold first pass has no previous working state. Its
+                // checkpoint is released before a later pass rotates the
+                // working state, so price those complete footprints apart.
+                // Warm restores and later checkpoint passes still hold their
+                // source state through the checkpoint's forward pass.
+                let checkpoint_peak = checkpoint.map_or(0, |end| {
+                    let working_copies = if first_checkpoint && cost.cached_tokens == 0 {
+                        1
+                    } else {
+                        copies
+                    };
+                    end.div_ceil(self.block_size)
+                        .saturating_add(state.blocks_per_state.saturating_mul(working_copies + 1))
                 });
-                token_peak
-                    .saturating_add(state.blocks_per_state.saturating_mul(copies))
+                working_peak
+                    .max(checkpoint_peak)
                     .saturating_add(state.speculative_blocks)
                     .saturating_add(usize::from(
                         !cost.cached_tokens.is_multiple_of(self.block_size),

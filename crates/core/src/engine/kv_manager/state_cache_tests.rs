@@ -1465,6 +1465,93 @@ fn resumed_admission_reserves_the_first_prefill_checkpoint() {
 }
 
 #[test]
+fn resumed_checkpoint_prices_each_allocation_phase() {
+    for warm in [false, true] {
+        for capacity in [9, 10, 11, 12] {
+            let mut manager = manager(capacity, 64, 3, true);
+            manager.configure_prefix_match_unit(Some(64));
+            manager.state_cache.as_mut().unwrap().prefill_checkpoint = true;
+            let owner = Uuid::from_u128(930);
+            let (mut sequence, mut lease) = request(owner, 65, 64, true, 129);
+            let mut computed = 0;
+            for end in [64, 65] {
+                allocated(manager.allocate_lease(owner, &mut lease, end, 0));
+                manager.finalize_lease_computed_prefix(
+                    owner,
+                    &mut sequence,
+                    &mut lease,
+                    computed,
+                    end,
+                );
+                manager.begin_step();
+                computed = end;
+            }
+            while sequence.len() < 193 {
+                let end = sequence.len();
+                allocated(manager.allocate_lease(owner, &mut lease, end, 0));
+                manager.finalize_lease_computed_prefix(
+                    owner,
+                    &mut sequence,
+                    &mut lease,
+                    computed,
+                    end,
+                );
+                manager.begin_step();
+                computed = end;
+                let (_, opened_partial) = sequence.generate_token();
+                if opened_partial {
+                    lease.append_partial();
+                }
+            }
+            manager.preempt_lease(owner, &mut lease);
+            clear_reclaimable_and_assert_empty(&mut manager);
+
+            if warm {
+                let parent = Uuid::from_u128(931);
+                let (mut seed, mut seed_lease) = request(parent, 65, 64, true, 0);
+                allocated(manager.allocate_lease(parent, &mut seed_lease, 64, 0));
+                manager.finalize_lease_computed_prefix(parent, &mut seed, &mut seed_lease, 0, 64);
+                manager.finish_lease(parent, seed_lease);
+                manager.begin_step();
+            }
+            let cost = manager.get_lease_prefill_cost(&sequence, &lease);
+            let start = if warm { 64 } else { 0 };
+            assert_eq!(cost.cached_tokens, start);
+            // Both plans stop at 192, exporting checkpoint 128. Only the
+            // warm first pass also holds a restored state source (3 blocks).
+            let budget = if warm { 128 } else { 192 };
+            let first_peak = if warm { 12 } else { 9 };
+            let peak = first_peak.max(10); // final token page + two states
+            let requirement =
+                manager.admission_requirement(&lease, &sequence, &cost, 0, budget.into());
+            if capacity < peak {
+                assert_eq!(requirement, AllocationRequirement::Impossible);
+                assert_eq!(lease.allocated_tokens(), 0);
+            } else {
+                assert_eq!(requirement, AllocationRequirement::Blocks(first_peak));
+                lease.set_prefill_checkpoint(Some(128));
+                allocated(manager.allocate_lease(owner, &mut lease, 192, start / 64));
+                assert_eq!(manager.num_active_blocks(), first_peak);
+                manager.finalize_lease_computed_prefix(
+                    owner,
+                    &mut sequence,
+                    &mut lease,
+                    start,
+                    192,
+                );
+                manager.begin_step();
+                lease.set_prefill_checkpoint(None);
+                allocated(manager.allocate_lease(owner, &mut lease, 193, 0));
+                assert_eq!(manager.num_active_blocks(), 10);
+                manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 192, 193);
+            }
+            manager.finish_lease(owner, lease);
+            clear_reclaimable_and_assert_empty(&mut manager);
+        }
+    }
+}
+
+#[test]
 fn kda_partial_restore_accounts_for_source_page_and_private_copy_atomically() {
     let mut manager = manager(5, 6, 1, true);
     manager.configure_prefix_match_unit(Some(2));

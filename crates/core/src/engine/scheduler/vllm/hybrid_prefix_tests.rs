@@ -411,6 +411,79 @@ fn cold_prefill_checkpoint_only_replaces_rotation_in_one_pass() {
 }
 
 #[test]
+fn resumed_cold_checkpoint_does_not_coexist_with_later_rotation() {
+    let mut config = args(true, true);
+    config.block_size = 64;
+    config.prefix_match_unit = Some(64);
+    config.max_num_batched_tokens = Some(256);
+    config.num_gpu_blocks = 11;
+    config.state_cache.as_mut().unwrap().bytes_per_request = 3 * 64 * 16;
+    config.preemption_mode = crate::engine::common::protocols::PreemptionMode::Fifo;
+    validate_state_config(&config);
+    let mut core = VllmCore::new(config);
+    let older = core.receive(DirectRequest {
+        uuid: Some(Uuid::from_u128(930)),
+        tokens: (0..65).collect(),
+        max_output_tokens: 129,
+        output_token_ids: Some((65..194).collect()),
+        ..Default::default()
+    });
+
+    // Real decode history leaves an attention prefix at 192 when FIFO
+    // preempts this request to grow the disjoint request's token allocation.
+    for _ in 0..128 {
+        if core.state.requests[&older].sequence.len() == 192 {
+            break;
+        }
+        step(&mut core);
+    }
+    assert_eq!(core.state.requests[&older].sequence.len(), 192);
+    let newer = submit(&mut core, 931, (1000..1064).collect(), 2);
+    let mut completed = std::collections::HashSet::new();
+    for _ in 0..4 {
+        let pass = step(&mut core);
+        for signal in pass.output_signals {
+            assert!(!signal.rejected);
+            if signal.completed {
+                assert!(completed.insert(signal.uuid));
+            }
+        }
+        if core.state.preemptions_total > 0 {
+            break;
+        }
+    }
+    assert_eq!(core.state.preemptions_total, 1);
+    let request = &core.state.requests[&older];
+    assert_eq!(request.sequence.len(), 193);
+    assert_eq!(request.num_computed_tokens, 0);
+    assert_eq!(request.sequence.lease.allocated_tokens(), 0);
+
+    // Resume with no recurrent state hit. The first pass needs 3 token +
+    // 3 working + 3 checkpoint blocks. The next needs 4 token + 6 working
+    // blocks, after the checkpoint can be reclaimed: max(9, 10), not 12.
+    let resumed = step(&mut core);
+    assert_eq!(reused(&resumed, older), 0);
+    assert!(resumed.output_signals.iter().all(|signal| !signal.rejected));
+    let request = &core.state.requests[&older];
+    assert_eq!(request.sequence.lease.junction(), Some(192));
+    assert_eq!(request.num_computed_tokens, 192);
+    let fpm = resumed.fpm.as_ref().unwrap();
+    assert_eq!(fpm.sum_prefill_tokens, 192);
+    assert_eq!(fpm.sum_prefill_kv_tokens, 0);
+    let last = step(&mut core);
+    for signal in last.output_signals {
+        assert!(!signal.rejected);
+        if signal.completed {
+            assert!(completed.insert(signal.uuid));
+        }
+    }
+    assert_eq!(completed, [older, newer].into_iter().collect());
+    assert!(core.state.requests.is_empty());
+    assert_eq!(core.kv_manager.num_active_blocks(), 0);
+    assert_eq!(core.state.preemptions_total, 1);
+}
+
+#[test]
 fn cold_non_block_multiple_budget_accounts_for_the_final_checkpoint() {
     // A 100-token budget floors non-final chunks to 64 tokens. The chunks
     // start at 0, 64 and 128; the final 65-token chunk exports checkpoint 192.
