@@ -1839,17 +1839,13 @@ def _materialize_engine_role(
             kind == "mtp"
             and backend == "vllm"
             and rank.get("enable_prefix_caching", True) is True
-            and (
-                role != "aggregated"
-                or (isinstance(host_offload, Mapping) and host_offload.get("scope", "dp_rank_local") == "dp_rank_local")
-            )
             and rank.get("g3_offload") is None
             and rank.get("prefix_match_unit") is None
             and not rank.get("kv_cache_groups")
         ):
             raise ValueError(
-                f"{kind} speculation with host_offload supports only vllm MTP with prefix caching, "
-                "scope=dp_rank_local on aggregated workers, and uniform G1/G2 without G3"
+                f"{kind} speculation with host_offload supports only vllm MTP with prefix caching "
+                "and uniform G1/G2 without G3"
             )
     if rank.get("async_scheduling") is not None and not isinstance(rank["async_scheduling"], bool):
         raise ValueError(f"engine provider {role} async_scheduling must be a boolean")

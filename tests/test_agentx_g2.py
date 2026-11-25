@@ -424,12 +424,13 @@ def _mtp_with_drop_off(engine: dict, depth: int) -> dict:
 
 
 @pytest.mark.usefixtures("raw_data_coordinates")
-@pytest.mark.parametrize("window", [False, True])
-def test_agentic_g2_accepts_mtp_for_a_state_cache(window: bool) -> None:
+@pytest.mark.parametrize("window,scope", [(False, "dp_rank_local"), (True, "dp_rank_local"), (True, "cluster_shared")])
+def test_agentic_g2_accepts_mtp_for_a_state_cache(window: bool, scope: str) -> None:
     """Both API boundaries accept MTP with G2: a recurrent state with the block drop off, a sliding window with it."""
     config = _config("agentx-g2-local.yaml")
     kv_cache = _mtp_with_drop_off(config["engine"], 1)["kv_cache"]
     kv_cache["capacity"]["blocks"] = 16
+    kv_cache["host_offload"]["scope"] = scope
     if window:
         del config["engine"]["speculation"]["disable_eagle_block_drop"]
         kv_cache["state_cache"] = {"bytes_per_request": 1_000_000, "sliding_window_lookahead_tokens": 0}
@@ -696,8 +697,11 @@ def test_agentic_canonical_mtp_executes_with_local_g2() -> None:
 
 
 @pytest.mark.usefixtures("raw_data_coordinates")
-@pytest.mark.parametrize("replicas,attention_dp", [(1, 2), (2, 1), (2, 2)])
-def test_agentic_canonical_mtp_executes_on_static_local_g2_fleets(replicas, attention_dp, tmp_path) -> None:
+@pytest.mark.parametrize(
+    "replicas,attention_dp,scope",
+    [(1, 2, "dp_rank_local"), (2, 1, "dp_rank_local"), (2, 2, "dp_rank_local"), (2, 2, "cluster_shared")],
+)
+def test_agentic_canonical_mtp_executes_on_static_g2_fleets(replicas, attention_dp, scope, tmp_path) -> None:
     config = _canonical_mtp(_config("agentx-g2-local.yaml"))
     source = config["traffic"]["source"]
     trace = tmp_path / "trace.jsonl"
@@ -707,6 +711,7 @@ def test_agentic_canonical_mtp_executes_on_static_local_g2_fleets(replicas, atte
     # The last draft burst reserves 9 prompt + 5 emitted + 3 lookahead tokens:
     # ceil(17 / 4) = 5 blocks, even though only one output token remains.
     worker["kv_cache"]["capacity"]["blocks"] = 5
+    worker["kv_cache"]["host_offload"]["scope"] = scope
     worker["parallelism"].update(replicas=replicas, attention_data=attention_dp)
     spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(config))
     lowered = _materialize_engine_execution_spec(spec, trace_block_size=4, record_per_request=True)["spec"]

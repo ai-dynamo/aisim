@@ -503,7 +503,7 @@ def test_native_canonical_speculation_requires_authored_acceptance(accept_rates,
 
 @pytest.mark.parametrize("location", ["rank", "canonical"])
 @pytest.mark.parametrize("scope", ["dp_rank_local", "cluster_shared"])
-def test_runner_canonical_mtp_g2_retains_local_scope_limit(location, scope):
+def test_runner_canonical_mtp_g2_takes_either_scope(location, scope):
     deployment = _canonical_speculation_deployment({"kind": "mtp", "params": {"depth": 2}})
     args = dict(deployment.agg_engine_args)
     args.update(kv_cache_bytes_per_token=250_000, native_host_offload={"num_host_blocks": 16, "scope": scope})
@@ -513,16 +513,14 @@ def test_runner_canonical_mtp_g2_retains_local_scope_limit(location, scope):
         args.update(aic_nextn_accept_rates="1,0.5", aic_mtp_seed=42)
     runtime = RecordingRuntime()
     runner = EngineReplayRunnerFactory(runtime=runtime).create(0)
-    spec = _spec(deployment=replace(deployment, agg_engine_args=args))
-    if scope == "cluster_shared":
-        with pytest.raises(ValueError, match="scope=dp_rank_local"):
-            runner.run(spec)
-        assert runtime.execution_spec is None
-    else:
-        runner.run(spec)
-        rank = runtime.execution_spec["engine"]["rank"]
-        assert rank["native_host_offload"] == args["native_host_offload"]
-        assert rank["timing_model"]["config"]["speculation"] == {"kind": "mtp", "params": {"depth": 2}}
+    runner.run(_spec(deployment=replace(deployment, agg_engine_args=args)))
+    rank = runtime.execution_spec["engine"]["rank"]
+    # The runner names the layout of a shared pool.
+    host_offload = dict(rank["native_host_offload"])
+    assert ("kv_layout_id" in host_offload) == (scope == "cluster_shared")
+    host_offload.pop("kv_layout_id", None)
+    assert host_offload == args["native_host_offload"]
+    assert rank["timing_model"]["config"]["speculation"] == {"kind": "mtp", "params": {"depth": 2}}
 
 
 @pytest.mark.parametrize("field,value", [("g3_offload", {"num_g3_blocks": 16}), ("enable_prefix_caching", False)])

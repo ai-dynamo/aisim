@@ -155,14 +155,46 @@ fn attention_dp_ranks_share_g2_only_in_cluster_scope() {
             }],
         ),
     ] {
-        let engine = json!({"dp_size": 2, "rank": rank(host(scope))});
-        let report = run(aggregated(2), engine, requests(4, "dp_rank")).unwrap();
-        assert_eq!(report.request_counts.completed_requests, 4);
-        assert_eq!(host_reuse(&report), reuse.map(Some), "{scope}");
-        assert_eq!(report.g2_domains, domains, "{scope}");
-        let json = serde_json::to_value(&report).unwrap();
-        assert_eq!(json.get("g2_domains").is_some(), scope == "cluster_shared");
+        // MTP stores and restores the same prompt blocks on these workers.
+        for mtp in [false, true] {
+            let mut rank = rank(host(scope));
+            if mtp {
+                canonical_mtp(&mut rank, 2);
+            }
+            let engine = json!({"dp_size": 2, "rank": rank});
+            let requests = requests(4, "dp_rank");
+            let report = run_with(&timed_factory(), aggregated(2), engine, requests).unwrap();
+            assert_eq!(report.request_counts.completed_requests, 4);
+            assert_eq!(host_reuse(&report), reuse.map(Some), "{scope} mtp={mtp}");
+            assert_eq!(report.g2_domains, domains, "{scope} mtp={mtp}");
+            let json = serde_json::to_value(&report).unwrap();
+            assert_eq!(json.get("g2_domains").is_some(), scope == "cluster_shared");
+        }
     }
+}
+
+#[test]
+fn mtp_on_an_aggregated_shared_pool_completes_when_g1_holds_two_requests() {
+    // Six G1 blocks, MTP depth 1 and a shared pool that stores one block per
+    // second and holds its G1 sources meanwhile. `c` repeats `a`'s prompt, so
+    // it waits at the queue head for `a`'s store, holding no G1, and then
+    // needs more room than the landed loads of `b` and `d` leave. Those two
+    // run first.
+    let pool = json!({
+        "scope": "cluster_shared", "kv_layout_id": "test-tp1", "num_host_blocks": 16,
+        "d2h_bandwidth_gbps": 0.001, "h2d_bandwidth_gbps": 1.0,
+    });
+    let mut rank = small_rank(6, 2, 16, json!({"native_host_offload": pool}));
+    canonical_mtp(&mut rank, 1);
+    let requests = token_ranges(&[
+        ("a", 0.0, 101, 12, 1),
+        ("b", 0.0, 1, 8, 9),
+        ("c", 0.0, 101, 12, 1),
+        ("d", 0.0, 1, 8, 9),
+    ]);
+    let engine = json!({"rank": rank});
+    let report = run_with(&timed_factory(), aggregated(1), engine, requests).unwrap();
+    assert_eq!(report.request_counts.completed_requests, 4);
 }
 
 #[test]

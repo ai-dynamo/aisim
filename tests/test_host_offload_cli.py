@@ -168,10 +168,6 @@ def test_canonical_mtp_host_config_roundtrips_and_preserves_cost_identity(
     [
         ({"scheduler": {"async_scheduling": True}}, "async_scheduling=false"),
         (
-            {"kv_cache": {"host_offload": {"scope": "cluster_shared", "num_host_blocks": 16}}},
-            "dp_rank_local",
-        ),
-        (
             {"kv_cache": {"g3_offload": {"scope": "worker_local", "num_g3_blocks": 16}}},
             "no g3_offload",
         ),
@@ -193,21 +189,25 @@ def test_canonical_mtp_host_config_preserves_composition_limits(change, error) -
 
 
 @pytest.mark.usefixtures("raw_data_coordinates")
-def test_canonical_mtp_host_config_takes_attention_dp() -> None:
+@pytest.mark.parametrize("scope", ["dp_rank_local", "cluster_shared"])
+def test_canonical_mtp_host_config_takes_attention_dp_and_either_scope(scope) -> None:
     engine = _mtp_host_engine()
-    engine["workers"]["aggregated"]["parallelism"]["attention_data"] = 2
+    worker = engine["workers"]["aggregated"]
+    worker["parallelism"]["attention_data"] = 2
+    worker["kv_cache"]["host_offload"]["scope"] = scope
     runtime = _RecordingRuntime()
     config = CorePredictionConfig.model_validate({"engine": engine})
     EngineReplayRunnerFactory(runtime=runtime).create(0).run(prediction_to_replay_spec(config))
     lowered = runtime.execution_spec["spec"]["engine"]
     assert lowered["dp_size"] == 2
     assert lowered["rank"]["aic_nextn"] == 2
+    assert lowered["rank"]["native_host_offload"].get("scope", "dp_rank_local") == scope
 
 
 @pytest.mark.usefixtures("raw_data_coordinates")
 def test_canonical_mtp_host_config_takes_prefill_and_decode_workers_without_kvcr() -> None:
     engine = _mtp_host_engine(mode="disaggregated")
-    # These workers take either pool scope; an aggregated worker only a local pool.
+    # These workers take either pool scope too.
     engine["workers"]["prefill"]["kv_cache"]["host_offload"]["scope"] = "cluster_shared"
     runtime = _RecordingRuntime()
     config = CorePredictionConfig.model_validate({"engine": engine})

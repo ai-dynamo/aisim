@@ -527,9 +527,9 @@ is rejected with SGLang, TensorRT-LLM, ngram speculation, Belady eviction
 and a [grouped FPM cache](#other-cache-modes).
 
 Canonical `engine.speculation.kind: mtp` can combine with G2 on aggregated and
-disaggregated vLLM workers, with any `attention_data`, prefix caching and no
-G3. An aggregated worker needs `scope: dp_rank_local`; prefill and decode
-workers take either scope. Use explicit fixed KV capacity and default timing.
+disaggregated vLLM workers, with any `attention_data`, either
+[scope](#g2-scope), prefix caching and no G3. Use explicit fixed KV capacity
+and default timing.
 Scheduling is synchronous. Separate draft models and grouped caches are
 unsupported. See
 [speculation](speculation.md#registered-schemes) for the complete composition.

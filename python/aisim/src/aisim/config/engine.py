@@ -1843,8 +1843,6 @@ def _validate_speculation(engine, *, modes: set[str], backends: set[str]) -> Non
                 raise ValueError(
                     "mtp speculation with host_offload requires vllm, prefix_caching=true, and no g3_offload"
                 )
-            if role == "aggregated" and cache.host_offload.scope != "dp_rank_local":
-                raise ValueError("mtp speculation with host_offload requires scope=dp_rank_local on workers.aggregated")
             if role != "aggregated" and cache.kvcr is not None:
                 raise ValueError(f"mtp speculation does not support kv_cache.kvcr on workers.{role}")
         if kind == "ngram" and worker.timing.forward_model != "op_level":
