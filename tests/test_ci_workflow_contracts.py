@@ -6874,6 +6874,20 @@ def test_release_output_checks_embedded_identity_and_scripts(tmp_path, monkeypat
             release_artifacts.verify_output(output, version, version)
 
 
+def test_performance_jobs_fetch_each_revisions_pinned_data_before_benchmarking():
+    """The gates run offline or under a worker timeout, so every installed revision fetches its own pin first."""
+    prefetch = '/bin/python" scripts/performance/prefetch_op_latency.py'
+    simulation = _workflow("simulation-performance.yml")["jobs"]
+    for job, consumers, count in (
+        (simulation["build"], "check_dynamo_callback.py source dynamo", 1),
+        (simulation["compare"], "simulation_perf_gate/run.py", 1),  # one loop over both environments
+        (_workflow("performance.yml")["jobs"]["compare"], "forward_perf_gate/run.py", 2),
+    ):
+        commands = _run_commands(job)
+        assert commands.count(prefetch) == count
+        assert commands.rindex(prefetch) < commands.index(consumers)
+
+
 def test_standalone_composition_steps_install_the_download_transport():
     """compose_systems_root.py needs the Hugging Face transport, and these steps never install AISim itself."""
     documents = [yaml.safe_load(path.read_text()) for path in sorted(WORKFLOW_ROOT.glob("*.yml"))]
