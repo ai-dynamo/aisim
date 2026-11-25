@@ -189,22 +189,13 @@ def test_public_docs_keep_availability_separate_from_semantics() -> None:
     migration = (ROOT / "docs" / "aic-backward-compatibility" / "migration.md").read_text(encoding="utf-8")
     core_api = (ROOT / "docs" / "perf-model" / "api" / "python.md").read_text(encoding="utf-8")
 
-    assert "Unified prediction and recommendation preserve and display `power_w` and `power_coverage`" in contract
+    assert "Unified prediction and recommendation display `power_w` and `power_coverage`" in contract
     assert "exactly `0.90` is sufficient; `0.899` is not" in contract
-    assert (
-        "In native Replay and unified prediction, whole-forward FPM, fixed, and polynomial timing remain latency-only."
-    ) in contract
-    assert (
-        "Python static FPM summaries have a separate operation-energy path: with SOL interpolation and powered "
-        "schema-8 rows, `get_context_energy_wms_dict()` and `get_generation_energy_wms_dict()` return nonzero "
-        "FPM energy."
-    ) in contract
-    assert "Direct interpolation stays latency-only." in contract
-    assert "static operation energy does not enable replay or unified `power_w` publication." in contract
-    assert (
-        "SDK and legacy `cli_estimate()` static, aggregated, and disaggregated results apply the 90% coverage "
-        "gate to FPM watts"
-    ) in contract
+    assert "Fixed, polynomial, fitted, and v6/v7 FPM timing do not supply an energy channel." in contract
+    assert "non-speculative schema-v8 FPM component energy" in contract
+    assert "A marginal with zero latency or missing target or floor power contributes zero energy." in contract
+    assert "Mixed-step watts are **unqualified** until the measured mixed-step campaign passes." in contract
+    assert "SDK static, aggregate, and disaggregated results and legacy `cli_estimate()` use the same 90%" in contract
     assert "Below the threshold, JSON output keeps numeric `power_coverage` and sets `power_w` to `null`" in contract
     assert "fixtures/power-contract-v1.json" in contract
     assert "[modeled-power contract](../perf-model/power.md)" in migration

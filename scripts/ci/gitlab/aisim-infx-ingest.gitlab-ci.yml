@@ -1,0 +1,311 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Weekly + manual InferenceX ingestion for the PRIVATE aisim-infx-cache (DEP #435).
+# DEFINITION ONLY: this file is not registered anywhere. Install it per
+# scripts/ci/gitlab/README.md in the internal project `aisim-hf-dataset-ci`.
+#
+# Guarantees (asserted by tests/unit/data/test_infx_job_definition.py):
+#   * runs the library at AISIM_REVIEWED_COMMIT (a full SHA) and nothing else;
+#   * checkout pin, repository URLs and launcher are readonly shell literals in the reviewed definition, git runs
+#     without environment configuration, and a pipeline variable cannot replace the validated job selector;
+#   * inherited Git configuration cannot rewrite those URLs or redirect cache authorization headers;
+#   * only `publish_candidate` and `promote` see the scoped write token, only `staleness` the read token,
+#     and neither reaches dependency setup or the library processes;
+#   * an unchanged refresh makes no commit; a candidate goes to a candidate/* branch, never the default branch;
+#   * no no-op or publication decision survives a move of the default branch during acquisition, and a candidate
+#     is verified from the exact commit that is pushed;
+#   * promotion is manual, needs a named reviewer, the reviewed candidate commit and an unchanged qualified baseline;
+#     failures never touch the last qualified snapshot;
+#   * failures and staleness alert Slack #swdl-dynamo-aisim-daily and the owner (Simone Chen) by email.
+
+spec:
+  inputs:
+    job:
+      description: Which reviewed job to run
+      default: ingest
+      options: [ingest, promote, staleness]
+    candidate-snapshot-id:
+      description: Snapshot to qualify (required for promote)
+      default: ""
+      regex: '^([0-9a-f]{64})?$'
+    candidate-generation:
+      description: Job ID suffix of the candidate branch (empty for legacy branches)
+      default: ""
+      regex: '^[0-9]*$'
+    candidate-commit:
+      description: Full commit SHA of the reviewed candidate branch tip (required for promote)
+      default: ""
+      regex: '^([0-9a-f]{40}|[0-9a-f]{64})?$'
+---
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - when: never
+
+stages: [ingest, promote, staleness, notify]
+
+variables:
+  # Required, set as protected CI/CD variables:
+  #   INFX_CACHE_READ_TOKEN   read-only token on aisim-infx-cache; environment scope infx-cache-reader
+  #                           (masked, protected; never use the default '*' environment scope)
+  #   INFX_CACHE_WRITE_TOKEN  write on aisim-infx-cache ONLY; environment scope infx-cache-writer
+  #                           (masked, protected; never use the default '*' environment scope)
+  #   SLACK_WEBHOOK_URL       incoming webhook for #swdl-dynamo-aisim-daily (masked, protected)
+  #   SMTP_HOST, SMTP_FROM, AISIM_JOB_OWNER_EMAIL   owner email alerts (owner: Simone Chen)
+  GIT_STRATEGY: empty  # a clean build directory for every job, even on a runner that reuses workspaces
+  GIT_TERMINAL_PROMPT: "0"
+  INFX_JOB: $[[ inputs.job ]]
+
+.pinned:
+  before_script:
+    - |
+      set -eu
+      # Pipeline variables outrank this file's `variables:`. Git reads configuration from its environment
+      # (GIT_CONFIG_COUNT/KEY_n/VALUE_n, GIT_CONFIG_PARAMETERS, GIT_CONFIG_GLOBAL/SYSTEM), so a variable could
+      # rewrite the approved URL (url.<base>.insteadOf) and send the token header elsewhere: drop all of it before
+      # any git command. The routing rules read INFX_JOB as a variable too; the validated input is substituted into
+      # this text, so a differing INFX_JOB means a variable replaced it and the job stops before it can use a token.
+      for name in $(env | sed -n 's/^\(GIT_CONFIG[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$name"; done
+      test "${INFX_JOB:-}" = "$[[ inputs.job ]]" || { echo "INFX_JOB differs from the job input; start pipelines with inputs, not variables" >&2; exit 2; }
+    - |
+      set -eu
+      # INSTALL: replace the two placeholders through a reviewed MR before enabling any job.
+      # Shell assignments override even higher-precedence pipeline/manual-job variables.
+      # Do not move these values to YAML/CI variables or inputs. Unconfigured copies fail before git runs.
+      readonly AISIM_REVIEWED_COMMIT='REPLACE_WITH_REVIEWED_40_HEX_AISIM_COMMIT'
+      readonly AISIM_REPO_URL='https://github.com/ai-dynamo/aisim.git'
+      readonly INFX_CACHE_REPO_URL='REPLACE_WITH_APPROVED_HTTPS_CACHE_REPO_URL'
+      readonly JOB_PY='uv run --frozen --project aisim/python/aisim python -m aisim_core.data.infx_job'
+      case "$AISIM_REVIEWED_COMMIT" in
+        *[!0-9a-f]*|"") echo "AISIM_REVIEWED_COMMIT must be a lowercase hex SHA" >&2; exit 2 ;;
+      esac
+      test "${#AISIM_REVIEWED_COMMIT}" -eq 40 || { echo "AISIM_REVIEWED_COMMIT must be 40 hex chars" >&2; exit 2; }
+      case "$INFX_CACHE_REPO_URL" in
+        https://*) ;;
+        *) echo "install the approved HTTPS cache URL in the reviewed definition" >&2; exit 2 ;;
+      esac
+      # Git applies insteadOf before HTTP redirect policy. Ignore caller/runner
+      # configuration for setup and every later clone, fetch and push in this shell.
+      unset GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR \
+        GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+      export GIT_CONFIG_COUNT=0 GIT_CONFIG_NOSYSTEM=1
+      export GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_GLOBAL=/dev/null
+      # Fresh repositories must not acquire local config or hooks from a template.
+      export GIT_TEMPLATE_DIR=
+      rm -rf aisim && mkdir aisim && cd aisim
+      git init -q && git remote add origin "$AISIM_REPO_URL"
+      git fetch -q --depth 1 origin "$AISIM_REVIEWED_COMMIT"
+      git checkout -q --detach FETCH_HEAD
+      test "$(git rev-parse HEAD)" = "$AISIM_REVIEWED_COMMIT"
+      env -u INFX_CACHE_WRITE_TOKEN -u INFX_CACHE_READ_TOKEN uv sync --project python/aisim --frozen
+      cd "$CI_PROJECT_DIR"
+
+# Clone helper: the token is passed as a one-shot header and never written to the clone's config.
+.cache_clone: &cache_clone |
+  git -c http.followRedirects=false -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" clone -q --depth 1 "$INFX_CACHE_REPO_URL" cache-repo
+
+.cache_read_clone: &cache_read_clone |
+  git -c http.followRedirects=false -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_READ_TOKEN}" clone -q --depth 1 "$INFX_CACHE_REPO_URL" cache-repo
+
+publish_candidate:
+  stage: ingest
+  resource_group: infx-cache-candidate-publication
+  extends: .pinned
+  environment:
+    name: infx-cache-writer
+    action: access
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $INFX_JOB == "ingest"'
+    - if: '$CI_PIPELINE_SOURCE == "web" && $INFX_JOB == "ingest"'
+  script:
+    - set -eu
+    - *cache_clone
+    # Acquisition is public and needs no credential; the token is only used by git below.
+    - env -u INFX_CACHE_WRITE_TOKEN $JOB_PY run --no-notify --root cache-repo --cache-dir "$CI_PROJECT_DIR/infx-acquisition" --report run-report.json
+    - |
+      cd cache-repo
+      # Every no-op or publication decision below is only valid against the baseline this checkout was cloned from.
+      BASE=$(git rev-parse HEAD)
+      baseline_unchanged() {
+        TIP=$(git -c http.followRedirects=false -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" ls-remote origin HEAD | cut -f1)
+        if [ "$TIP" != "$BASE" ]; then
+          echo "default branch moved from ${BASE} to ${TIP:-an unknown commit} during acquisition; rerun from the new baseline" >&2
+          exit 4
+        fi
+      }
+      STATUS=$(git status --porcelain) || exit "$?"
+      if [ -z "$STATUS" ]; then baseline_unchanged; echo "unchanged refresh: no commit, no snapshot"; exit 0; fi
+      # Python runs isolated (-I) from here on: its import path must not include this checkout, whose files could
+      # otherwise shadow the standard library or the reviewed AISim installation. Report parsing needs no token.
+      SID=$(env -u INFX_CACHE_WRITE_TOKEN python3 -I -c "import json;print(json.load(open('../run-report.json'))['snapshot_id'])")
+      # A branch is reusable only while this exact snapshot is pending against
+      # the current qualification. Historical reviews stay untouched.
+      git -c http.followRedirects=false -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" ls-remote --heads origin "candidate/${SID}" "candidate/${SID}-*" > ../candidate-refs
+      while read -r REV REF; do
+        git -c http.followRedirects=false -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" fetch -q --depth 1 origin "$REF"
+        git worktree add -q --detach ../remote-candidate FETCH_HEAD
+        RC=0
+        env -u INFX_CACHE_WRITE_TOKEN uv run --frozen --project ../aisim/python/aisim python -I - <<'PY' || RC=$?
+      import sys
+      from pathlib import Path
+
+      from aisim_core.data.e2e import read_snapshot, verify_snapshot_members
+      from aisim_core.data.infx_job import load_state
+
+      NOT_REUSABLE = 3  # the only exit code that allows publishing a replacement
+      remote_root = Path("../remote-candidate")
+      try:
+          current = load_state(Path("."))
+          remote = load_state(remote_root)
+          pending = remote.get("candidate")
+          same = (
+              remote.get("qualified") == current["qualified"]
+              and isinstance(pending, dict)
+              and all(pending.get(k) == current["candidate"][k] for k in ("snapshot_id", "snapshot_path"))
+          )
+          if not same:
+              sys.exit(NOT_REUSABLE)
+          snapshot, members = read_snapshot(remote_root, pending["snapshot_path"])
+          if snapshot.snapshot_id != pending["snapshot_id"] or snapshot.completeness != "complete":
+              sys.exit(NOT_REUSABLE)
+          verify_snapshot_members(remote_root, members)
+      except (OSError, ValueError, RecursionError) as exc:
+          print(f"pending branch is not reusable: {type(exc).__name__}: {exc}", file=sys.stderr)
+          sys.exit(NOT_REUSABLE)
+      PY
+        git worktree remove ../remote-candidate
+        if [ "$RC" -eq 0 ]; then
+          baseline_unchanged
+          echo "${REF#refs/heads/} is pending for this baseline: nothing to push"; exit 0
+        fi
+        # Exit 3 is the verifier's verdict that this branch is not reusable. Any other
+        # failure (launcher, interpreter, crash) says nothing about the branch: stop.
+        if [ "$RC" -ne 3 ]; then echo "candidate verifier failed to run (exit ${RC}); not publishing" >&2; exit "$RC"; fi
+      done < ../candidate-refs
+      # A retried job keeps its pipeline ID but gets a new job ID, so the job ID keeps each attempt's ref unique.
+      case "$CI_JOB_ID" in *[!0-9]*|"") echo "numeric CI_JOB_ID required" >&2; exit 2 ;; esac
+      BRANCH="candidate/${SID}-${CI_JOB_ID}"
+      git checkout -q -b "$BRANCH"
+      git add -A
+      git -c user.name="aisim-infx-ingest" -c user.email="noreply@nvidia.com" commit -q -m "candidate: InferenceX snapshot ${SID} (not qualified)"
+      COMMIT=$(git rev-parse HEAD)
+      # `git add -A` honors ignore rules, so verify the exact commit rather than the checkout before publishing it.
+      git worktree add -q --detach ../pushed "$COMMIT"
+      env -u INFX_CACHE_WRITE_TOKEN uv run --frozen --project ../aisim/python/aisim python -I -m aisim_core.data.infx_job verify --root ../pushed --snapshot-id "$SID"
+      git worktree remove ../pushed
+      baseline_unchanged
+      git -c http.followRedirects=false -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" push -q origin "$BRANCH"
+      echo "Review ${BRANCH} at ${COMMIT}; promote with candidate-snapshot-id=${SID}, candidate-generation=${CI_JOB_ID} and candidate-commit=${COMMIT}"
+  cache:
+    key: infx-acquisition
+    paths: [infx-acquisition/]
+  artifacts:
+    when: always
+    paths: [run-report.json]
+    expire_in: 30 days
+  timeout: 3h
+  retry: 0
+
+promote:
+  stage: promote
+  extends: .pinned
+  environment:
+    name: infx-cache-writer
+    action: access
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" && $INFX_JOB == "promote"'
+      when: manual
+  allow_failure: false
+  script:
+    - set -eu
+    - 'test -n "$[[ inputs.candidate-snapshot-id ]]" || { echo "set the candidate-snapshot-id input" >&2; exit 2; }'
+    - 'test -n "$[[ inputs.candidate-commit ]]" || { echo "set the candidate-commit input to the reviewed tip" >&2; exit 2; }'
+    - |
+      BRANCH="candidate/$[[ inputs.candidate-snapshot-id ]]"
+      GENERATION="$[[ inputs.candidate-generation ]]"
+      if [ -n "$GENERATION" ]; then BRANCH="${BRANCH}-${GENERATION}"; fi
+      git -c http.followRedirects=false -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" clone -q --depth 1 --branch "$BRANCH" "$INFX_CACHE_REPO_URL" cache-repo
+    - |
+      # Qualify exactly the tip the reviewer inspected, and only while the default branch still holds the
+      # qualification the candidate's change report was built against.
+      test "$(git -C cache-repo rev-parse HEAD)" = "$[[ inputs.candidate-commit ]]" || { echo "candidate branch tip is not the reviewed commit; review it again" >&2; exit 2; }
+      git -C cache-repo -c http.followRedirects=false -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" fetch -q --depth 1 origin HEAD
+      git -C cache-repo worktree add -q --detach ../baseline FETCH_HEAD
+    - env -u INFX_CACHE_WRITE_TOKEN $JOB_PY promote --root cache-repo --baseline-root baseline --snapshot-id "$[[ inputs.candidate-snapshot-id ]]" --reviewer "$GITLAB_USER_NAME"
+    - |
+      cd cache-repo
+      git -c user.name="aisim-infx-ingest" -c user.email="noreply@nvidia.com" commit -qam "qualify: $[[ inputs.candidate-snapshot-id ]] (reviewer ${GITLAB_USER_NAME})"
+      git -c http.followRedirects=false -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" push -q origin "HEAD:refs/heads/${BRANCH}"
+    # Merging the candidate branch into the default branch stays a reviewed merge request, not this job.
+
+staleness:
+  stage: staleness
+  extends: .pinned
+  environment:
+    name: infx-cache-reader
+    action: access
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $INFX_JOB == "staleness"'
+  script:
+    - set -eu
+    - *cache_read_clone
+    # Alert only: exit 10 = warn (>= 8 days), 11 = stale (>= 14 days) since the last qualified snapshot.
+    - env -u INFX_CACHE_READ_TOKEN $JOB_PY staleness --root cache-repo
+  allow_failure:
+    exit_codes: [10, 11]
+
+alert_failure:
+  stage: notify
+  when: on_failure
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $INFX_JOB == "ingest"'
+      when: on_failure
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $INFX_JOB == "staleness"'
+      when: on_failure
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: on_failure
+  script:
+    # Standard library only: alerts still run if fetching or installing AISim failed.
+    - |
+      python3 - <<'PY'
+      import json
+      import os
+      import smtplib
+      import sys
+      import urllib.request
+      from email.message import EmailMessage
+
+      text = "pipeline " + os.environ["CI_PIPELINE_URL"] + "; last qualified snapshot retained"
+      try:
+          with open("run-report.json", encoding="utf-8") as handle:
+              report = json.load(handle)
+          if report.get("error"):
+              text += "\nIngestion error: " + str(report["error"])
+      except (OSError, ValueError):
+          pass  # setup failures may happen before a report can be written
+      failures = []
+      try:
+          request = urllib.request.Request(
+              os.environ["SLACK_WEBHOOK_URL"],
+              json.dumps({"channel": "#swdl-dynamo-aisim-daily", "text": text}).encode(),
+              {"Content-Type": "application/json"},
+          )
+          urllib.request.urlopen(request, timeout=30).close()
+      except Exception:
+          failures.append("Slack notification failed")
+      try:
+          message = EmailMessage()
+          message["From"] = os.environ["SMTP_FROM"]
+          message["To"] = os.environ["AISIM_JOB_OWNER_EMAIL"]
+          message["Subject"] = "AISim InferenceX job failed"
+          message.set_content(text)
+          with smtplib.SMTP(os.environ["SMTP_HOST"], timeout=30) as smtp:
+              smtp.send_message(message)
+      except Exception:
+          failures.append("Email notification failed")
+      for failure in failures:
+          print(failure, file=sys.stderr)
+      sys.exit(1 if failures else 0)
+      PY

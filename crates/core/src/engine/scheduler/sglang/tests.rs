@@ -84,6 +84,197 @@ fn direct_request(tokens: Vec<u32>, max_output_tokens: usize) -> DirectRequest {
     }
 }
 
+mod mamba_tests {
+    use super::*;
+    use crate::engine::SglangMambaCacheConfig;
+
+    fn core(host_loop: bool, chunk: usize, max_states: usize) -> SglangCore {
+        let mut args = test_args(4096, 1, chunk);
+        let sglang = args.sglang.as_mut().unwrap();
+        sglang.host_loop = host_loop;
+        sglang.mamba_cache = Some(SglangMambaCacheConfig {
+            prefill_checkpoint_interval: 256,
+            decode_checkpoint_interval: 256,
+            max_states,
+        });
+        SglangCore::new_with_kv_capture(args, 0)
+    }
+
+    fn checkpoint(core: &SglangCore, tokens: &[u32]) -> usize {
+        let hashes = crate::engine::common::hashing::block_hashes_with_salt(tokens, 1, None)
+            .map(crate::engine::common::hashing::LocalBlockHash)
+            .collect::<Vec<_>>();
+        core.kv_manager.cache().mamba_prefix_match(&hashes).0
+    }
+
+    #[rstest::rstest]
+    fn mamba_prefill_publication_and_cold_to_warm_reuse(
+        #[values(false, true)] host_loop: bool,
+        #[values(256, 1024)] chunk: usize,
+        #[values(1, 3)] outputs: usize,
+    ) {
+        let mut core = core(host_loop, chunk, 32);
+        let prompt: Vec<u32> = (0..300).collect();
+        let first = core.receive(direct_request(prompt.clone(), outputs));
+        assert_eq!(checkpoint(&core, &prompt), 0);
+        let mut now = 0.0;
+        let mut published = false;
+        let mut follower = None;
+        let mut warm_admitted = false;
+        let mut completed = std::collections::HashSet::new();
+        for pass_index in 0..32 {
+            let pass = core.execute_hidden_pass(now);
+            now = pass.end_ms;
+            for admission in pass.admissions {
+                if admission.uuid == first {
+                    assert_eq!(admission.reused_input_tokens, 0);
+                } else {
+                    assert_eq!(Some(admission.uuid), follower);
+                    assert_eq!(admission.reused_input_tokens, 256);
+                    warm_admitted = true;
+                }
+            }
+            for signal in pass.output_signals {
+                if signal.completed {
+                    completed.insert(signal.uuid);
+                }
+            }
+            let end = checkpoint(&core, &prompt);
+            assert!(
+                end == 0 || end == 256,
+                "short final chunks cannot publish token 300"
+            );
+            if host_loop {
+                if pass_index == 0 {
+                    assert_eq!(
+                        end, 0,
+                        "a checkpoint waits for its producing forward to be observed"
+                    );
+                } else if pass_index == 1 {
+                    assert_eq!(end, 256, "the second iteration observes the first forward");
+                }
+            }
+            if end == 256 && !published {
+                published = true;
+                follower = Some(core.receive(direct_request(prompt.clone(), 1)));
+            }
+            if core.is_drained() {
+                break;
+            }
+        }
+        assert!(published && warm_admitted && core.is_drained());
+        assert!(completed.contains(&first));
+        assert!(completed.contains(&follower.unwrap()));
+    }
+
+    #[test]
+    fn mamba_observing_a_chunk_preserves_the_next_terminal_checkpoint() {
+        let mut core = core(true, 256, 16);
+        let prompt: Vec<u32> = (0..512).collect();
+        core.receive(direct_request(prompt.clone(), 1));
+        let first = core.execute_hidden_pass(0.0);
+        assert_eq!(checkpoint(&core, &prompt), 0);
+        let second = core.execute_hidden_pass(first.end_ms);
+        assert_eq!(checkpoint(&core, &prompt), 256);
+        let mut now = second.end_ms;
+        for _ in 0..8 {
+            if core.is_drained() {
+                break;
+            }
+            now = core.execute_hidden_pass(now).end_ms;
+        }
+        assert!(core.is_drained());
+        assert_eq!(checkpoint(&core, &prompt), 512);
+        assert_eq!(core.kv_manager.cache().mamba_checkpoint_count(), 2);
+    }
+
+    #[rstest::rstest]
+    fn mamba_one_output_donates_state_without_a_replacement(
+        #[values(false, true)] host_loop: bool,
+    ) {
+        let mut core = core(host_loop, 1024, 4);
+        let seed: Vec<u32> = (1000..1256).collect();
+        core.receive(direct_request(seed, 1));
+        let mut now = 0.0;
+        for _ in 0..8 {
+            now = core.execute_hidden_pass(now).end_ms;
+            if core.is_drained() {
+                break;
+            }
+        }
+        assert!(core.is_drained());
+        let prompt: Vec<u32> = (0..300).collect();
+        core.receive(direct_request(prompt.clone(), 1));
+        for _ in 0..8 {
+            now = core.try_execute_hidden_pass(now).unwrap().end_ms;
+            if core.is_drained() {
+                break;
+            }
+        }
+        assert!(core.is_drained());
+        assert_eq!(checkpoint(&core, &prompt), 256);
+        assert_eq!(core.kv_manager.cache().mamba_checkpoint_count(), 2);
+    }
+
+    #[test]
+    fn mamba_decode_checkpoint_is_donated_at_its_materialized_endpoint() {
+        let mut core = core(false, 1024, 16);
+        core.config
+            .mamba_cache
+            .as_mut()
+            .unwrap()
+            .prefill_checkpoint_interval = 64;
+        core.kv_manager
+            .enable_mamba_cache(core.config.mamba_cache.unwrap());
+        let mut sequence: Vec<u32> = (0..192).collect();
+        let outputs: Vec<u32> = (1000..1065).collect();
+        core.receive(DirectRequest {
+            output_token_ids: Some(outputs.clone()),
+            ..direct_request(sequence.clone(), outputs.len())
+        });
+        let first = core.execute_hidden_pass(0.0);
+        assert_eq!(checkpoint(&core, &sequence), 192);
+        let mut now = first.end_ms;
+        for _ in 0..70 {
+            if core.is_drained() {
+                break;
+            }
+            now = core.execute_hidden_pass(now).end_ms;
+        }
+        sequence.extend(outputs);
+        assert!(core.is_drained());
+        assert_eq!(checkpoint(&core, &sequence), 256);
+        core.receive(direct_request(sequence, 1));
+        assert_eq!(
+            core.execute_hidden_pass(now).admissions[0].reused_input_tokens,
+            256
+        );
+    }
+
+    #[rstest::rstest]
+    fn mamba_state_pressure_returns_an_error_instead_of_an_idle_pass(
+        #[values(false, true)] host_loop: bool,
+    ) {
+        let mut core = core(host_loop, 1024, 4);
+        core.receive(direct_request((0..300).collect(), 3));
+        core.receive(direct_request((1000..1300).collect(), 3));
+        let mut now = 0.0;
+        for _ in 0..4 {
+            match core.try_execute_hidden_pass(now) {
+                Ok(pass) => now = pass.end_ms,
+                Err(error) => {
+                    assert!(
+                        error.to_string().contains("Mamba state pressure"),
+                        "{error}"
+                    );
+                    return;
+                }
+            }
+        }
+        panic!("unsupported state pressure must not leave queued work without a wakeup");
+    }
+}
+
 mod hicache_tests {
     use std::sync::Arc;
 
@@ -397,8 +588,15 @@ mod hicache_tests {
         manager.complete_host_boundary(0.0);
         manager.evict(8);
         let mut waiting = WaitingQueue::from([SglangRequest::new(direct_request(tokens, 1), 4, 0)]);
-        let admitted =
-            get_new_batch_prefill(&mut waiting, &mut manager, &config, 0.7, &[], false, 0);
+        let admitted = get_new_batch_prefill(
+            &mut waiting,
+            &mut manager,
+            &config,
+            0.7,
+            &[],
+            false,
+            Some(0),
+        );
         assert_eq!(admitted.can_run[0].materialized_tokens, 8);
         assert_eq!(admitted.prefill_fpm[0].tokens_computed, 8);
         assert_eq!(admitted.prefill_fpm[0].prefix_tokens, 0);
@@ -534,6 +732,50 @@ mod pd_admission_v0522 {
             handoff_id: HandoffId::from(Uuid::from_u128(id)),
         })
         .unwrap();
+    }
+
+    #[rstest::rstest]
+    #[case::full_chunk_budget(24, 4)]
+    #[case::spare_chunk_budget(32, 8)]
+    fn pending_destination_allows_chunked_prefill_to_finish(
+        #[case] capacity: usize,
+        #[case] chunk: usize,
+    ) {
+        let mut args = test_args(capacity / 4, 4, chunk);
+        args.worker_type = WorkerType::Decode;
+        args.max_num_seqs = Some(2);
+        args.sglang.as_mut().unwrap().num_reserved_decode_tokens = Some(8);
+        let mut core = SglangCore::new(args);
+
+        let chunked = core.receive(direct_request(vec![1; chunk + 4], 1));
+        let first = core.execute_hidden_pass(0.0);
+        assert!(first.output_signals.is_empty());
+        assert_eq!(core.waiting[0].materialized_tokens, chunk);
+        assert!(core.waiting[0].kv_lease.is_active());
+        assert_eq!(core.kv_manager.cache().available_tokens(), capacity - chunk);
+
+        // The destination needs the entire pool including its decode reserve.
+        assert!(!reserve(&mut core, 2, capacity - 8, 1));
+        let fresh = core.receive(direct_request(vec![3; 4], 1));
+
+        let second = core.execute_hidden_pass(first.end_ms);
+        assert!(
+            second.admissions.is_empty(),
+            "fresh requests must not overtake the destination"
+        );
+        assert!(
+            second
+                .output_signals
+                .iter()
+                .any(|signal| { signal.uuid == chunked && signal.completed && !signal.rejected }),
+            "the already admitted chunk must finish and release its KV"
+        );
+        assert_eq!(core.waiting.len(), 1);
+        assert_eq!(core.waiting[0].uuid, fresh);
+
+        core.retry_pending_destinations();
+        let handoff_id = HandoffId::from(Uuid::from_u128(2));
+        assert!(core.destination_is_held(handoff_id));
     }
 
     #[test]
@@ -897,7 +1139,15 @@ mod admission_v0522 {
             SglangRequest::new(direct_request((0..1000).collect(), 16), 16, 0),
             SglangRequest::new(direct_request(shared, 16), 16, 0),
         ]);
-        let result = get_new_batch_prefill(&mut waiting, &mut manager, &config, 0.7, &[], false, 0);
+        let result = get_new_batch_prefill(
+            &mut waiting,
+            &mut manager,
+            &config,
+            0.7,
+            &[],
+            false,
+            Some(0),
+        );
         assert_eq!(result.can_run.len(), 1);
         assert_eq!(waiting.len(), 1);
         assert!(result.batch_is_full);
@@ -924,7 +1174,15 @@ mod admission_v0522 {
             4,
             0,
         )]);
-        let result = get_new_batch_prefill(&mut waiting, &mut manager, &config, 0.7, &[], false, 0);
+        let result = get_new_batch_prefill(
+            &mut waiting,
+            &mut manager,
+            &config,
+            0.7,
+            &[],
+            false,
+            Some(0),
+        );
         assert!(result.can_run.is_empty());
         assert_eq!(manager.cache().available_tokens(), 24);
         assert!(!waiting[0].kv_lease.is_active());
@@ -947,8 +1205,15 @@ mod admission_v0522 {
             4,
             0,
         )]);
-        let mut first =
-            get_new_batch_prefill(&mut waiting, &mut manager, &config, 1.0, &[], false, 0);
+        let mut first = get_new_batch_prefill(
+            &mut waiting,
+            &mut manager,
+            &config,
+            1.0,
+            &[],
+            false,
+            Some(0),
+        );
         let continuation = first.can_run.pop().unwrap();
         assert_eq!(continuation.materialized_tokens, 4);
         waiting.push_back(continuation);
@@ -968,7 +1233,7 @@ mod admission_v0522 {
             ratio,
             &[running],
             true,
-            0,
+            Some(0),
         );
         assert_eq!(second.can_run.len(), 1);
         assert_eq!(second.can_run[0].materialized_tokens, expected_materialized);
@@ -977,6 +1242,41 @@ mod admission_v0522 {
             expected_materialized - 4
         );
         assert!(second.admissions.is_empty());
+    }
+
+    #[test]
+    fn continuation_runs_without_a_fresh_admission_budget() {
+        let config = SglangConfig::from_args(&test_args(8, 4, 8));
+        let mut manager = SglangKvManager::new(32, 4, KvEventPublishers::default(), 0);
+        let mut waiting =
+            WaitingQueue::from([SglangRequest::new(direct_request(vec![1; 12], 1), 4, 0)]);
+        let mut first = get_new_batch_prefill(
+            &mut waiting,
+            &mut manager,
+            &config,
+            0.7,
+            &[],
+            false,
+            Some(0),
+        );
+        let continuation = first.can_run.pop().unwrap();
+        assert_eq!(continuation.materialized_tokens, 8);
+        let continuation_id = continuation.uuid;
+        let fresh = SglangRequest::new(direct_request(vec![2; 4], 1), 4, 0);
+        let fresh_id = fresh.uuid;
+        let mut waiting = WaitingQueue::from([fresh, continuation]);
+
+        let result =
+            get_new_batch_prefill(&mut waiting, &mut manager, &config, 0.7, &[], false, None);
+
+        assert_eq!(result.can_run.len(), 1);
+        assert_eq!(result.can_run[0].uuid, continuation_id);
+        assert_eq!(result.can_run[0].materialized_tokens, 12);
+        assert!(result.admissions.is_empty());
+        assert!(!result.batch_is_full);
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].uuid, fresh_id);
+        assert!(!waiting[0].kv_lease.is_active());
     }
 
     /// LPM orders the continuation first itself; under FIFO it stays queued
@@ -997,15 +1297,30 @@ mod admission_v0522 {
             4,
             0,
         )]);
-        let mut first =
-            get_new_batch_prefill(&mut waiting, &mut manager, &config, 0.7, &[], false, 0);
+        let mut first = get_new_batch_prefill(
+            &mut waiting,
+            &mut manager,
+            &config,
+            0.7,
+            &[],
+            false,
+            Some(0),
+        );
         let continuation = first.can_run.pop().unwrap();
         let id = continuation.uuid;
         waiting.push_back(SglangRequest::new(direct_request(hot, 1), 4, 0));
         waiting.push_back(continuation);
         apply_schedule_policy(&mut waiting, &manager, &config);
         assert_eq!(waiting.front().unwrap().uuid == id, lpm);
-        let next = get_new_batch_prefill(&mut waiting, &mut manager, &config, 0.7, &[], false, 0);
+        let next = get_new_batch_prefill(
+            &mut waiting,
+            &mut manager,
+            &config,
+            0.7,
+            &[],
+            false,
+            Some(0),
+        );
         assert_eq!(next.can_run[0].uuid, id);
         assert!(next.admissions.is_empty());
         assert!(!waiting.has_continuation());
@@ -1830,13 +2145,12 @@ fn zero_output_request_completes_after_prefill() {
 }
 
 #[test]
-fn speculative_decode_commits_each_request_once_in_uuid_order() {
+fn speculative_decode_commits_each_request_once() {
     let mut args = test_args(32, 4, 16);
     args.aic_nextn = Some(2);
     args.aic_nextn_accept_rates = Some("1,1".to_string());
     let mut core = SglangCore::new(args);
     let [a, b, c] = [1, 2, 3].map(Uuid::from_u128);
-    // Running order is the reverse of UUID order.
     for (uuid, first_token) in [(c, 0), (b, 4), (a, 8)] {
         core.receive(DirectRequest {
             uuid: Some(uuid),
@@ -1855,7 +2169,7 @@ fn speculative_decode_commits_each_request_once_in_uuid_order() {
         .map(|signal| signal.uuid)
         .collect::<Vec<_>>();
     assert_eq!(emitted, [c, c, c, b, b, b, a, a, a]);
-    assert_eq!(decode.committed_requests, [a, b, c]);
+    assert_eq!(decode.committed_requests, [c, b, a]);
 }
 
 #[test]
@@ -2098,10 +2412,18 @@ fn fresh_prefill_tracks_cache_owned_prefix_pages_and_pressure_event() {
         images: Vec::new(),
         pending_terminal: false,
     }]);
-    let mut req = get_new_batch_prefill(&mut waiting, &mut kv_manager, &config, 0.7, &[], false, 0)
-        .can_run
-        .pop()
-        .unwrap();
+    let mut req = get_new_batch_prefill(
+        &mut waiting,
+        &mut kv_manager,
+        &config,
+        0.7,
+        &[],
+        false,
+        Some(0),
+    )
+    .can_run
+    .pop()
+    .unwrap();
 
     assert_eq!(req.cached_tokens(), 4);
     assert_eq!(req.kv_pages()[..1], cached_pages[..1]);
@@ -4150,8 +4472,15 @@ mod core_behavior {
             pending_terminal: false,
         }]);
 
-        let admit =
-            get_new_batch_prefill(&mut waiting, &mut kv_manager, &config, 0.7, &[], false, 0);
+        let admit = get_new_batch_prefill(
+            &mut waiting,
+            &mut kv_manager,
+            &config,
+            0.7,
+            &[],
+            false,
+            Some(0),
+        );
         assert!(admit.can_run.is_empty());
         assert_eq!(waiting.len(), 1);
         assert_eq!(kv_manager.cache().available_tokens(), 12);
@@ -5615,6 +5944,74 @@ mod forward_pass_metrics {
             let pass = core.execute_hidden_pass(10.0);
             assert!(pass.fpm.is_some(), "FPM should always be present");
         }
+    }
+    const BLOCK_SIZE: usize = 4;
+
+    #[test]
+    fn second_identical_multichunk_prompt_reuses_cache_beyond_first_chunk() {
+        let mut core = SglangCore::new(fpm_args_with_chunked_prefill(16, 32));
+        let prompt: Vec<u32> = (0..40).collect();
+
+        let prefill_per_pass_until_output =
+            |core: &mut SglangCore, uuid: Uuid, start_ms: f64| -> (Vec<u64>, f64) {
+                let mut collector = crate::engine::trace::TraceCollector::default();
+                let mut prefill_per_pass = Vec::new();
+                let mut now_ms = start_ms;
+                for _ in 0..64 {
+                    let pass = core.execute_pass(&mut collector, now_ms);
+                    prefill_per_pass
+                        .push(pass.fpm.as_ref().map(|f| f.sum_prefill_tokens).unwrap_or(0));
+                    now_ms = pass.end_ms;
+                    if pass.output_signals.iter().any(|s| s.uuid == uuid) {
+                        return (prefill_per_pass, now_ms);
+                    }
+                }
+                panic!("request {uuid} emitted no output within 64 passes");
+            };
+
+        let first = Uuid::from_u128(1);
+        core.receive(DirectRequest {
+            uuid: Some(first),
+            ..direct_request(prompt.clone(), 1)
+        });
+        let (cold_passes, end_ms) = prefill_per_pass_until_output(&mut core, first, 0.0);
+        assert_eq!(
+            cold_passes,
+            [16, 16, 8],
+            "cold request must compute every prompt token in three chunks and emit output only after the last chunk"
+        );
+
+        let second = Uuid::from_u128(2);
+        core.receive(DirectRequest {
+            uuid: Some(second),
+            ..direct_request(prompt.clone(), 1)
+        });
+        let (warm_passes, _) = prefill_per_pass_until_output(&mut core, second, end_ms);
+        let warm_prefill: u64 = warm_passes.iter().sum();
+
+        assert!(
+            (1..=BLOCK_SIZE as u64).contains(&warm_prefill),
+            "warm identical prompt must compute 1 through {BLOCK_SIZE} tokens using the cache across chunks: computed {warm_prefill} tokens"
+        );
+    }
+
+    fn fpm_args_with_chunked_prefill(
+        chunked_prefill_size: usize,
+        num_gpu_blocks: usize,
+    ) -> MockEngineArgs {
+        MockEngineArgs::builder()
+            .engine_type(EngineType::Sglang)
+            .block_size(BLOCK_SIZE)
+            .num_gpu_blocks(num_gpu_blocks)
+            .max_num_seqs(Some(4))
+            .speedup_ratio(0.0)
+            .sglang(Some(SglangArgs {
+                page_size: Some(BLOCK_SIZE),
+                chunked_prefill_size: Some(chunked_prefill_size),
+                ..Default::default()
+            }))
+            .build()
+            .unwrap()
     }
 }
 

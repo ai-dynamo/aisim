@@ -218,6 +218,14 @@
             "diagnostics": {
               "type": "object",
               "properties": {
+                "attention_dp_wait_ms": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "step_power_w": {
+                  "type": ["number", "null"],
+                  "exclusiveMinimum": 0
+                },
                 "power_w": {
                   "type": [
                     "number",
@@ -1481,6 +1489,16 @@
             "number",
             "null"
           ],
+          "minimum": 0
+        },
+        "prefill_energy_wms": {
+          "description": "Native prefill energy before timing correction.",
+          "type": "number",
+          "minimum": 0
+        },
+        "decode_energy_wms": {
+          "description": "Native full or marginal decode energy before timing correction.",
+          "type": "number",
           "minimum": 0
         },
         "queries": {

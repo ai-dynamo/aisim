@@ -1,0 +1,802 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Offline tests for resolve/plan/fetch using a fake transport."""
+
+import hashlib
+import json
+
+import pyarrow as pa
+import pytest
+
+from aisim_core.data import Identity, configuration_id
+from aisim_core.data.fetch import (
+    BudgetExceededError,
+    Cache,
+    IntegrityError,
+    OfflineMissingError,
+    RevisionError,
+    Selection,
+    SelectionError,
+    TransferError,
+    fetch,
+    load_category_index,
+    plan,
+)
+from aisim_core.data.parquet import write_parquet
+
+pytestmark = pytest.mark.unit
+
+REPO = "org/dataset"
+SHA = "a" * 40
+SHA2 = "b" * 40
+
+
+@pytest.mark.parametrize("reader", ["plan", "load_category_index"])
+@pytest.mark.parametrize("corrupt", ["dataset", "category"])
+def test_over_nested_catalog_json_keeps_the_typed_error(tmp_path, reader, corrupt):
+    files = build_repo(tmp_path)
+    ids = tuple(entry["configuration_id"] for entry in json.loads(files["catalog/fpm.json"])["entries"])
+    deep = b"[" * 200_000 + b"]" * 200_000
+    if corrupt == "dataset":
+        files["catalog/dataset.json"] = deep
+    else:
+        files["catalog/fpm.json"] = deep
+        dataset = json.loads(files["catalog/dataset.json"])
+        dataset["categories"]["fpm"]["index"].update(sha256=_sha(deep), bytes=len(deep))
+        files["catalog/dataset.json"] = json.dumps(dataset).encode()
+    kwargs = dict(repo=REPO, revision=SHA, transport=FakeTransport(files), cache=Cache(tmp_path / "cache"))
+    with pytest.raises(IntegrityError, match="invalid"):
+        if reader == "plan":
+            plan(Selection(category="fpm", configuration_ids=ids), **kwargs)
+        else:
+            load_category_index("fpm", **kwargs)
+
+
+def _republish(files, path, document):
+    """Replace one metadata file and re-pin it in the index chain so only the content is inconsistent."""
+    files[path] = json.dumps(document).encode()
+    pin = {"sha256": _sha(files[path]), "bytes": len(files[path])}
+    index = json.loads(files["catalog/fpm.json"])
+    for entry in index["entries"]:
+        if entry["manifest"]["path"] == path:
+            entry["manifest"].update(pin)
+    files["catalog/fpm.json"] = json.dumps(index).encode()
+    dataset = json.loads(files["catalog/dataset.json"])
+    dataset["categories"]["fpm"]["index"].update(
+        sha256=_sha(files["catalog/fpm.json"]), bytes=len(files["catalog/fpm.json"])
+    )
+    files["catalog/dataset.json"] = json.dumps(dataset).encode()
+
+
+@pytest.mark.parametrize(
+    "change,message",
+    [
+        ("identity", "hash mismatch"),  # model B described under model A's ID
+        ("category", "hash mismatch"),
+        ("purpose", "hash mismatch"),
+        ("consistent-other-identity", "differs from the catalog entry"),  # B hashed correctly, A's ID not repeated
+        ("entry-identity", "identity or purpose differs"),  # the catalog entry misdescribes the manifest
+        ("none", None),
+    ],
+)
+def test_manifest_must_describe_the_catalog_entry_it_was_selected_for(tmp_path, change, message):
+    files = build_repo(tmp_path)
+    path = "fpm/m1/manifest.json"
+    manifest = json.loads(files[path])
+    entry_id = manifest["configuration_id"]
+    other = _identity("other-model")
+    if change == "identity":
+        manifest["identity"] = other.model_dump()
+    elif change == "category":
+        manifest["category"] = "op-latency"
+    elif change == "purpose":
+        manifest["purpose"] = "operation-tables"
+    elif change == "consistent-other-identity":
+        manifest["identity"] = other.model_dump()
+        manifest["configuration_id"] = configuration_id("fpm", "execution-profile", other)
+    elif change == "entry-identity":
+        index = json.loads(files["catalog/fpm.json"])
+        next(e for e in index["entries"] if e["configuration_id"] == entry_id)["identity"] = other.model_dump()
+        files["catalog/fpm.json"] = json.dumps(index).encode()
+    _republish(files, path, manifest)
+    transport = FakeTransport(files)
+    selection = Selection(category="fpm", configuration_ids=(entry_id,))
+    kwargs = dict(repo=REPO, revision=SHA, transport=transport, cache=Cache(tmp_path / "cache"))
+    if message is None:
+        assert [f.path for f in plan(selection, **kwargs).files if f.role == "artifact"] == ["fpm/m1/data.parquet"]
+        return
+    with pytest.raises(IntegrityError, match=message):
+        plan(selection, **kwargs)
+    assert "fpm/m1/data.parquet" not in transport.opened
+    assert "fpm/other-model/data.parquet" not in transport.opened
+
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _artifact_json(artifact_id: str, path: str, data: bytes, **extra) -> dict:
+    return {
+        "artifact_id": artifact_id,
+        "path": path,
+        "role": "runtime",
+        "format": extra.pop("format", "parquet"),
+        "schema": extra.pop("schema", "aisim.test/v1"),
+        "sha256": _sha(data),
+        "bytes": len(data),
+        **extra,
+    }
+
+
+def _identity(model: str, hardware: str = "h200") -> Identity:
+    return Identity(
+        hardware=hardware,
+        framework="vllm",
+        framework_version="0.1",
+        operation_family=None,
+        model=model,
+        effective_settings={},
+        unresolved_identity=None,
+    )
+
+
+def build_repo(tmp_path, models=("m1", "m2"), rows=3):
+    """Return {path: bytes} for a small fpm dataset with one manifest per model."""
+    files: dict[str, bytes] = {}
+    entries = []
+    for model in models:
+        table = pa.table({"x": list(range(rows))})
+        pq_path = tmp_path / f"{model}.parquet"
+        write_parquet(table, pq_path, "aisim.test/v1")
+        data = pq_path.read_bytes()
+        art_path = f"fpm/{model}/data.parquet"
+        files[art_path] = data
+        identity = _identity(model)
+        cfg = configuration_id("fpm", "execution-profile", identity)
+        manifest = {
+            "schema_version": "aisim-artifact-manifest/v1",
+            "category": "fpm",
+            "purpose": "execution-profile",
+            "configuration_id": cfg,
+            "identity": identity.model_dump(),
+            "requested_settings": None,
+            "artifacts": [_artifact_json("a", art_path, data, rows=rows)],
+            "provenance": {},
+            "evidence_gaps": [],
+        }
+        mpath = f"fpm/{model}/manifest.json"
+        files[mpath] = json.dumps(manifest).encode()
+        entries.append(
+            {
+                "configuration_id": cfg,
+                "purpose": "execution-profile",
+                "identity": identity.model_dump(),
+                "manifest": _artifact_json(
+                    "m", mpath, files[mpath], format="json", schema="aisim-artifact-manifest/v1"
+                ),
+            }
+        )
+    index = {"schema_version": "aisim-category-index/v1", "category": "fpm", "entries": entries}
+    files["catalog/fpm.json"] = json.dumps(index).encode()
+    dataset = {
+        "schema_version": "aisim-dataset-index/v1",
+        "dataset_id": REPO,
+        "categories": {
+            "fpm": {
+                "root": "fpm",
+                "layout": "category",
+                "index": _artifact_json(
+                    "i", "catalog/fpm.json", files["catalog/fpm.json"], format="json", schema="aisim-category-index/v1"
+                ),
+            }
+        },
+    }
+    files["catalog/dataset.json"] = json.dumps(dataset).encode()
+    return files
+
+
+class FakeTransport:
+    def __init__(self, files, refs=None, fail_after=None):
+        self.files = files
+        self.refs = refs or {"main": SHA}
+        self.fail_after = fail_after  # {path: bytes yielded before raising}
+        self.resolves = 0
+        self.opened: list[str] = []
+
+    def resolve_revision(self, repo, revision):
+        self.resolves += 1
+        return self.refs[revision]
+
+    def open_file(self, repo, sha, path):
+        self.opened.append(path)
+        data = self.files[path]
+        cut = (self.fail_after or {}).get(path)
+        if cut is not None:
+            yield data[:cut]
+            raise ConnectionError("link dropped")
+        for i in range(0, len(data), 7):
+            yield data[i : i + 7]
+
+
+class NoNetwork:
+    def resolve_revision(self, *a):
+        raise AssertionError("network call in offline mode")
+
+    def open_file(self, *a):
+        raise AssertionError("network call in offline mode")
+
+
+SEL = Selection(category="fpm", model="m1", hardware="h200")
+
+
+@pytest.fixture
+def files(tmp_path):
+    return build_repo(tmp_path)
+
+
+def test_fetch_uses_a_pinned_sha_without_resolving_the_symbolic_revision_again(files, tmp_path):
+    transport = FakeTransport(files, refs={"main": SHA2})  # the branch moved after the plan that resolved SHA
+    result = fetch(SEL, repo=REPO, revision="main", pinned_sha=SHA, transport=transport, cache=Cache(tmp_path / "c"))
+    assert transport.resolves == 0 and result.plan.revision == SHA
+    with pytest.raises(RevisionError, match="pinned_sha"):
+        fetch(SEL, repo=REPO, revision="main", pinned_sha="main", transport=transport, cache=Cache(tmp_path / "d"))
+
+
+def test_plan_lists_closure_and_bytes(files, tmp_path):
+    t = FakeTransport(files)
+    p = plan(SEL, repo=REPO, revision="main", transport=t, cache=Cache(tmp_path / "c"))
+    assert p.revision == SHA
+    assert {f.path for f in p.files} == {
+        "catalog/dataset.json",
+        "catalog/fpm.json",
+        "fpm/m1/manifest.json",
+        "fpm/m1/data.parquet",
+    }
+    assert "fpm/m2/data.parquet" not in t.opened  # unrelated model never touched
+    assert p.total_bytes == len(files["fpm/m1/data.parquet"]) + len(files["fpm/m1/manifest.json"]) + len(
+        files["catalog/fpm.json"]
+    )  # dataset.json has no declared size
+    assert p.uncached_bytes == len(files["fpm/m1/data.parquet"])
+    json.dumps(p.to_dict())
+
+
+def test_resolve_once_and_pinned(files, tmp_path):
+    t = FakeTransport(files)
+    r = fetch(SEL, repo=REPO, revision="main", transport=t, cache=Cache(tmp_path / "c"))
+    assert t.resolves == 1
+    assert r.plan.revision == SHA and SHA in str(r.root)
+
+
+def test_full_sha_needs_no_resolution(files, tmp_path):
+    t = FakeTransport(files)
+    fetch(SEL, repo=REPO, revision=SHA, transport=t, cache=Cache(tmp_path / "c"))
+    assert t.resolves == 0
+
+
+def test_cache_keyed_by_commit(files, tmp_path):
+    c = Cache(tmp_path / "c")
+    t = FakeTransport(files, refs={"main": SHA, "next": SHA2})
+    fetch(SEL, repo=REPO, revision="main", transport=t, cache=c)
+    t.opened.clear()
+    fetch(SEL, repo=REPO, revision="next", transport=t, cache=c)
+    assert "fpm/m1/data.parquet" in t.opened  # different commit, separate cache entry
+
+
+def test_idempotent_repeat(files, tmp_path):
+    c = Cache(tmp_path / "c")
+    t = FakeTransport(files)
+    first = fetch(SEL, repo=REPO, revision=SHA, transport=t, cache=c)
+    assert first.downloaded_bytes == len(files["fpm/m1/data.parquet"])
+    t.opened.clear()
+    again = fetch(SEL, repo=REPO, revision=SHA, transport=t, cache=c)
+    assert again.downloaded_bytes == 0 and t.opened == []
+    assert again.plan.uncached_bytes == 0
+    assert again.paths == first.paths
+
+
+def test_interrupted_transfer_leaves_no_partial_and_resumes(files, tmp_path):
+    c = Cache(tmp_path / "c")
+    art = "fpm/m1/data.parquet"
+    t = FakeTransport(files, fail_after={art: 20})
+    with pytest.raises(TransferError):
+        fetch(SEL, repo=REPO, revision=SHA, transport=t, cache=c)
+    target = c.path_for(REPO, SHA, art)
+    assert not target.exists()
+    assert not list(target.parent.glob("*.part"))
+    t.fail_after = None
+    r = fetch(SEL, repo=REPO, revision=SHA, transport=t, cache=c)
+    assert r.paths[art].read_bytes() == files[art]
+
+
+def test_failed_download_keeps_another_readers_verified_file(files, tmp_path, monkeypatch):
+    c = Cache(tmp_path / "c")
+    art = "fpm/m1/data.parquet"
+    valid, stored = Cache.valid, []
+
+    def valid_then_other_reader_stores(self, repo, sha, path, expected):
+        found = valid(self, repo, sha, path, expected)
+        if path == art and not found and not stored:
+            stored.append(self.store(repo, sha, path, [files[art]], expected))  # reader one finishes after our miss
+        return found
+
+    monkeypatch.setattr(Cache, "valid", valid_then_other_reader_stores)
+    with pytest.raises(TransferError):
+        fetch(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files, fail_after={art: 20}), cache=c)
+    assert stored
+    assert c.path_for(REPO, SHA, art).read_bytes() == files[art]
+
+
+def test_corrupt_download_rejected_and_not_cached(files, tmp_path):
+    art = "fpm/m1/data.parquet"
+    bad = dict(files)
+    bad[art] = files[art][:-1] + bytes([files[art][-1] ^ 1])
+    c = Cache(tmp_path / "c")
+    with pytest.raises(IntegrityError, match="SHA-256"):
+        fetch(SEL, repo=REPO, revision=SHA, transport=FakeTransport(bad), cache=c)
+    assert not c.path_for(REPO, SHA, art).exists()
+
+
+def test_schema_mismatch_rejected(tmp_path):
+    files = build_repo(tmp_path)
+    # Rewrite the artifact with a different schema ID but keep digest consistent.
+    other = tmp_path / "other.parquet"
+    write_parquet(pa.table({"x": [0, 1, 2]}), other, "aisim.other/v9")
+    art = "fpm/m1/data.parquet"
+    files[art] = other.read_bytes()
+    manifest = json.loads(files["fpm/m1/manifest.json"])
+    manifest["artifacts"][0].update(sha256=_sha(files[art]), bytes=len(files[art]))
+    files["fpm/m1/manifest.json"] = json.dumps(manifest).encode()
+    index = json.loads(files["catalog/fpm.json"])
+    index["entries"][0]["manifest"].update(
+        sha256=_sha(files["fpm/m1/manifest.json"]), bytes=len(files["fpm/m1/manifest.json"])
+    )
+    files["catalog/fpm.json"] = json.dumps(index).encode()
+    dataset = json.loads(files["catalog/dataset.json"])
+    dataset["categories"]["fpm"]["index"].update(
+        sha256=_sha(files["catalog/fpm.json"]), bytes=len(files["catalog/fpm.json"])
+    )
+    files["catalog/dataset.json"] = json.dumps(dataset).encode()
+    with pytest.raises(IntegrityError, match="schema ID"):
+        fetch(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=Cache(tmp_path / "c"))
+
+
+def test_offline_missing_file_report(files, tmp_path):
+    c = Cache(tmp_path / "c")
+    with pytest.raises(OfflineMissingError) as err:
+        fetch(SEL, repo=REPO, revision=SHA, transport=NoNetwork(), cache=c, offline=True)
+    assert err.value.missing == ["catalog/dataset.json"]
+    assert err.value.to_dict()["error"] == "offline-missing"
+
+    # Warm the metadata and artifact, then remove only the artifact.
+    fetch(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=c)
+    c.discard(REPO, SHA, "fpm/m1/data.parquet")
+    with pytest.raises(OfflineMissingError) as err:
+        fetch(SEL, repo=REPO, revision=SHA, transport=NoNetwork(), cache=c, offline=True)
+    assert err.value.missing == ["fpm/m1/data.parquet"]
+
+
+def test_offline_succeeds_from_cache_with_zero_network(files, tmp_path):
+    c = Cache(tmp_path / "c")
+    fetch(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=c)
+    r = fetch(SEL, repo=REPO, revision=SHA, transport=None, cache=c, offline=True)
+    assert r.downloaded_bytes == 0 and r.plan.missing == []
+
+
+def test_offline_rejects_unresolved_ref(files, tmp_path):
+    with pytest.raises(RevisionError):
+        fetch(SEL, repo=REPO, revision="main", transport=NoNetwork(), cache=Cache(tmp_path / "c"), offline=True)
+
+
+def test_over_budget_refused_before_artifact_transfer(files, tmp_path):
+    t = FakeTransport(files)
+    size = len(files["fpm/m1/data.parquet"])
+    metadata = plan(
+        SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=Cache(tmp_path / "p")
+    ).metadata_bytes
+    assert metadata > 0
+    with pytest.raises(BudgetExceededError) as err:
+        fetch(SEL, repo=REPO, revision=SHA, transport=t, cache=Cache(tmp_path / "c"), max_bytes=size + metadata - 1)
+    assert err.value.plan.uncached_bytes == size
+    assert "fpm/m1/data.parquet" not in t.opened
+    # At the limit, and with explicit opt-in, it proceeds.
+    fetch(SEL, repo=REPO, revision=SHA, transport=t, cache=Cache(tmp_path / "c1"), max_bytes=size + metadata)
+    fetch(SEL, repo=REPO, revision=SHA, transport=t, cache=Cache(tmp_path / "c2"), max_bytes=0, allow_over_budget=True)
+
+
+def test_cached_bytes_do_not_count_against_budget(files, tmp_path):
+    c = Cache(tmp_path / "c")
+    fetch(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=c)
+    fetch(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=c, max_bytes=0)
+
+
+@pytest.mark.parametrize(
+    "selection",
+    [
+        Selection(category="fpm"),
+        Selection(category="fpm", hardware="h200"),  # fpm needs a model
+        Selection(category="fpm", model="m1"),  # needs hardware
+    ],
+)
+def test_selectors_required(selection, files, tmp_path):
+    t = FakeTransport(files)
+    with pytest.raises(SelectionError):
+        fetch(selection, repo=REPO, revision=SHA, transport=t, cache=Cache(tmp_path / "c"))
+    assert t.opened == []
+
+
+def test_empty_match_is_error(files, tmp_path):
+    with pytest.raises(SelectionError, match="no catalog entries"):
+        fetch(
+            Selection(category="fpm", model="nope", hardware="h200"),
+            repo=REPO,
+            revision=SHA,
+            transport=FakeTransport(files),
+            cache=Cache(tmp_path / "c"),
+        )
+
+
+def test_configuration_id_selector(files, tmp_path):
+    cfg = configuration_id("fpm", "execution-profile", _identity("m2"))
+    r = fetch(
+        Selection(category="fpm", configuration_ids=(cfg,)),
+        repo=REPO,
+        revision=SHA,
+        transport=FakeTransport(files),
+        cache=Cache(tmp_path / "c"),
+    )
+    assert "fpm/m2/data.parquet" in r.paths and "fpm/m1/data.parquet" not in r.paths
+
+
+def test_corrupt_cache_entry_is_refetched(files, tmp_path):
+    c = Cache(tmp_path / "c")
+    r = fetch(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=c)
+    r.paths["fpm/m1/data.parquet"].write_bytes(b"junk")
+    again = fetch(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=c)
+    assert again.paths["fpm/m1/data.parquet"].read_bytes() == files["fpm/m1/data.parquet"]
+    with pytest.raises(OfflineMissingError):
+        r.paths["fpm/m1/data.parquet"].write_bytes(b"junk")
+        fetch(SEL, repo=REPO, revision=SHA, transport=None, cache=c, offline=True)
+
+
+def test_exclude_roles_leaves_those_artifacts_out_of_plan_and_download(files, tmp_path):
+    t = FakeTransport(files)
+    selection = Selection(category="fpm", model="m1", hardware="h200", exclude_roles=("runtime",))
+    result = fetch(selection, repo=REPO, revision="main", transport=t, cache=Cache(tmp_path / "c"))
+    assert {f.path for f in result.plan.files} == {"catalog/dataset.json", "catalog/fpm.json", "fpm/m1/manifest.json"}
+    assert "fpm/m1/data.parquet" not in t.opened
+    assert result.downloaded_bytes == 0
+
+
+def test_load_category_index_reads_only_the_indexes(files, tmp_path):
+    t = FakeTransport(files)
+    sha, index, dataset = load_category_index(
+        "fpm", repo=REPO, revision="main", transport=t, cache=Cache(tmp_path / "c")
+    )
+    assert sha == SHA and dataset.dataset_id == REPO
+    assert {e.identity.model for e in index.entries} == {"m1", "m2"}
+    assert sorted(t.opened) == ["catalog/dataset.json", "catalog/fpm.json"]  # no manifest, no artifact
+    with pytest.raises(OfflineMissingError):
+        load_category_index("fpm", repo=REPO, revision=SHA, cache=Cache(tmp_path / "empty"), offline=True)
+    with pytest.raises(SelectionError):
+        load_category_index("e2e", repo=REPO, revision="main", transport=t, cache=Cache(tmp_path / "c"))
+
+
+def test_fpm_layout_rule_round_trips():
+    from aisim_core.data.fpm_layout import logical_path, physical_path
+
+    assert physical_path("data/M--m/h/f/1/tp1/manifest.json") == "data/fpm/M--m/h/f/1/tp1/manifest.json"
+    assert physical_path("data/history/M--m/x") == "data/fpm/history/M--m/x"
+    assert physical_path("data/fpm/M--m/x") == "data/fpm/M--m/x"
+    assert logical_path("data/fpm/history/M--m/x") == "data/history/M--m/x"
+    with pytest.raises(ValueError):
+        physical_path("catalog/dataset.json")
+    with pytest.raises(ValueError):
+        logical_path("data/M--m/x")
+
+
+# ---------------------------------------------------------------- review regressions
+
+
+def _repin(files, path):
+    """Refresh the digest declared for ``path`` by its parent index after the file was edited."""
+    parent = {"catalog/fpm.json": "catalog/dataset.json"}.get(path, "catalog/fpm.json")
+    document = json.loads(files[parent])
+    declarations = (
+        [c["index"] for c in document["categories"].values()]
+        if parent == "catalog/dataset.json"
+        else [e["manifest"] for e in document["entries"]]
+    )
+    for declared in declarations:
+        if declared["path"] == path:
+            declared["sha256"], declared["bytes"] = _sha(files[path]), len(files[path])
+    files[parent] = json.dumps(document).encode()
+    if parent != "catalog/dataset.json":
+        _repin(files, parent)
+
+
+def test_a_malformed_root_catalog_is_not_cached_and_a_healthy_retry_succeeds(files, tmp_path):
+    cache = Cache(tmp_path / "c")
+    broken = {**files, "catalog/dataset.json": b'{"not": "a dataset index"}'}
+    with pytest.raises(IntegrityError):
+        fetch(SEL, repo=REPO, revision=SHA, transport=FakeTransport(broken), cache=cache)
+    assert not cache.path_for(REPO, SHA, "catalog/dataset.json").exists()
+    fetch(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=cache)
+
+
+def test_an_online_fetch_replaces_a_corrupt_cached_root_catalog(files, tmp_path):
+    cache = Cache(tmp_path / "c")
+    fetch(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=cache)
+    cache.path_for(REPO, SHA, "catalog/dataset.json").write_bytes(b"corrupt")
+    transport = FakeTransport(files)
+    fetch(SEL, repo=REPO, revision=SHA, transport=transport, cache=cache)
+    assert "catalog/dataset.json" in transport.opened
+    with pytest.raises(IntegrityError):  # offline there is no healthy copy to fall back to
+        cache.path_for(REPO, SHA, "catalog/dataset.json").write_bytes(b"corrupt")
+        fetch(SEL, repo=REPO, revision=SHA, cache=cache, offline=True)
+
+
+def test_a_category_index_for_another_category_is_rejected(files, tmp_path):
+    index = json.loads(files["catalog/fpm.json"])
+    index["category"] = "e2e"
+    files["catalog/fpm.json"] = json.dumps(index).encode()
+    _repin(files, "catalog/fpm.json")
+    with pytest.raises(IntegrityError, match="category"):
+        plan(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=Cache(tmp_path / "c"))
+    with pytest.raises(IntegrityError, match="category"):
+        load_category_index("fpm", repo=REPO, revision=SHA, transport=FakeTransport(files), cache=Cache(tmp_path / "x"))
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_one_file_declared_with_different_row_counts_is_rejected(tmp_path, reverse):
+    files = build_repo(tmp_path)
+    # m2's manifest declares m1's table with another row count.
+    m2 = json.loads(files["fpm/m2/manifest.json"])
+    m2["artifacts"] = [{**json.loads(files["fpm/m1/manifest.json"])["artifacts"][0], "rows": 99}]
+    files["fpm/m2/manifest.json"] = json.dumps(m2).encode()
+    _repin(files, "fpm/m2/manifest.json")
+    index = json.loads(files["catalog/fpm.json"])
+    selection = Selection(category="fpm", configuration_ids=tuple(e["configuration_id"] for e in index["entries"]))
+    if reverse:
+        index["entries"].reverse()
+        files["catalog/fpm.json"] = json.dumps(index).encode()
+        _repin(files, "catalog/fpm.json")
+    with pytest.raises(IntegrityError, match="conflicting"):
+        plan(selection, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=Cache(tmp_path / "c"))
+
+
+def test_a_cache_miss_without_a_transport_is_a_typed_error_and_a_warm_cache_still_works(files, tmp_path):
+    cache = Cache(tmp_path / "c")
+    with pytest.raises(OfflineMissingError):
+        fetch(SEL, repo=REPO, revision=SHA, transport=None, cache=cache)
+    fetch(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=cache)
+    assert fetch(SEL, repo=REPO, revision=SHA, transport=None, cache=cache).downloaded_bytes == 0
+
+
+def test_planning_metadata_counts_against_the_budget(files, tmp_path):
+    t = FakeTransport(files)
+    with pytest.raises(BudgetExceededError):
+        fetch(SEL, repo=REPO, revision=SHA, transport=t, cache=Cache(tmp_path / "c"), max_bytes=100)
+    assert "fpm/m1/data.parquet" not in t.opened  # the budget stopped planning long before any artifact
+
+
+def test_an_index_stream_longer_than_its_declared_size_is_cut_off(files, tmp_path):
+    class Endless(FakeTransport):
+        def open_file(self, repo, sha, path):
+            self.opened.append(path)
+            if path == "catalog/fpm.json":
+                yield files[path]
+                for _ in range(10_000):  # far more than the declared size; must never be fully consumed
+                    self.consumed = getattr(self, "consumed", 0) + 1
+                    yield b"x" * 1024
+            else:
+                yield from super().open_file(repo, sha, path)
+
+    t = Endless(files)
+    with pytest.raises(IntegrityError, match="exceeds"):
+        plan(SEL, repo=REPO, revision=SHA, transport=t, cache=Cache(tmp_path / "c"))
+    assert t.consumed < 10  # stopped as soon as the declared size was exceeded
+
+
+def test_a_root_catalog_without_a_declared_size_has_an_explicit_cap(files, tmp_path, monkeypatch):
+    from aisim_core.data import fetch as fetch_module
+
+    monkeypatch.setattr(fetch_module, "_METADATA_CAP_BYTES", 10)
+    with pytest.raises(IntegrityError, match="exceeds 10 bytes"):
+        plan(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=Cache(tmp_path / "c"))
+
+
+def test_a_manifest_for_other_hardware_with_a_copied_id_plans_no_artifacts(files, tmp_path):
+    manifest = json.loads(files["fpm/m1/manifest.json"])
+    manifest["identity"]["hardware"] = "b200"  # digest-correct manifest of another hardware, ID copied from the entry
+    files["fpm/m1/manifest.json"] = json.dumps(manifest).encode()
+    _repin(files, "fpm/m1/manifest.json")
+    transport = FakeTransport(files)
+    with pytest.raises(
+        IntegrityError, match="(identity or purpose|category, purpose or identity) differs|identity hash mismatch"
+    ):
+        plan(SEL, repo=REPO, revision=SHA, transport=transport, cache=Cache(tmp_path / "c"))
+    assert "fpm/m1/data.parquet" not in transport.opened
+
+
+@pytest.mark.parametrize("moved", [False, True])
+def test_embedded_fpm_logical_keys_resolve_to_pinned_storage_paths(tmp_path, moved):
+    from aisim_core.data import _verify
+    from aisim_core.data.ensure import pin_from_environment
+    from aisim_core.data.loaders import FpmLoader
+    from aisim_core.data.repos import PUBLIC_REPO, RETIRED_FPM_REPO
+
+    files = build_repo(tmp_path, models=("m1",))
+    manifest = json.loads(files["fpm/m1/manifest.json"])
+    logical_artifact = "data/M--m/h/f/1/tp1/data.parquet"
+    logical_manifest = "data/M--m/h/f/1/tp1/manifest.json"
+    payload = files.pop("fpm/m1/data.parquet")
+    manifest["artifacts"][0]["path"] = logical_artifact
+    manifest_bytes = json.dumps(manifest).encode()
+    files.pop("fpm/m1/manifest.json")
+    physical = lambda p: p.replace("data/", "data/fpm/", 1) if moved else p
+    files[physical(logical_artifact)] = payload
+    files[physical(logical_manifest)] = manifest_bytes
+    index = json.loads(files["catalog/fpm.json"])
+    index["entries"][0]["manifest"] = _artifact_json(
+        "m", logical_manifest, manifest_bytes, format="json", schema="aisim-artifact-manifest/v1"
+    )
+    files["catalog/fpm.json"] = json.dumps(index).encode()
+    dataset = json.loads(files["catalog/dataset.json"])
+    dataset["categories"]["fpm"]["root"] = "data/fpm" if moved else "data"
+    dataset["categories"]["fpm"]["index"] = _artifact_json(
+        "i", "catalog/fpm.json", files["catalog/fpm.json"], format="json", schema="aisim-category-index/v1"
+    )
+    files["catalog/dataset.json"] = json.dumps(dataset).encode()
+    pin = pin_from_environment(
+        {"AISIM_DATASET": f"{RETIRED_FPM_REPO}@{'main' if moved else SHA}", "AISIM_DATA_CATEGORIES": "fpm"}
+    )
+    assert pin.repo == RETIRED_FPM_REPO  # the requested name is kept; the symbolic reference follows the successor
+    stored_repo = PUBLIC_REPO if moved else RETIRED_FPM_REPO
+    transport = FakeTransport(files)
+    cache = Cache(tmp_path / "cache")
+    result = fetch(SEL, repo=pin.repo, revision=pin.revision, transport=transport, cache=cache)
+    loaded = FpmLoader().read_manifest(result.root, logical_manifest)
+    assert loaded.configuration_id == manifest["configuration_id"]
+    assert loaded.artifacts[0].path == logical_artifact
+    assert _verify(result.root, loaded.artifacts[0]).read_bytes() == payload
+    assert physical(logical_artifact) in transport.opened
+    assert physical(logical_manifest) in transport.opened
+    if moved:
+        assert logical_artifact not in transport.opened and logical_manifest not in transport.opened
+    # A warm immutable pin and a direct local loader follow exactly the same layout without transport.
+    warm = fetch(SEL, repo=stored_repo, revision=SHA, offline=True, cache=cache)
+    assert FpmLoader().read_manifest(warm.root, logical_manifest) == loaded
+
+
+@pytest.mark.parametrize("victim", ["catalog/fpm.json", "fpm/m1/manifest.json"])
+def test_dataset_checks_the_verified_declarations_after_replacement(files, tmp_path, monkeypatch, victim):
+    import aisim_core.data as data
+
+    root = tmp_path / "dataset"
+    for path, content in files.items():
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_bytes(content)
+    # The pinned manifest's payload is bad. A schema-valid replacement must not hide that artifact check.
+    (root / "fpm/m1/data.parquet").write_bytes(b"corrupt payload")
+    replacement = json.loads(files[victim])
+    replacement["entries" if victim.startswith("catalog/") else "artifacts"] = []
+    original_verify, original_bytes = data._verify, data._verified_bytes
+    swapped = []
+
+    def swap(artifact):
+        if artifact.path == victim and not swapped:
+            swapped.append(victim)
+            (root / victim).write_text(json.dumps(replacement))
+
+    def verify(root_, artifact):
+        path = original_verify(root_, artifact)
+        swap(artifact)
+        return path
+
+    def verified_bytes(root_, artifact):
+        raw = original_bytes(root_, artifact)
+        swap(artifact)
+        return raw
+
+    monkeypatch.setattr(data, "_verify", verify)
+    monkeypatch.setattr(data, "_verified_bytes", verified_bytes)
+    with pytest.raises(ValueError, match="integrity mismatch"):
+        data.check_dataset(root)
+    assert swapped == [victim]
+
+
+@pytest.mark.parametrize("field,value", [("rows", 100), ("schema", "aisim-wrong/v1")])
+def test_warm_cache_checks_the_current_parquet_declaration(files, tmp_path, field, value):
+    cache = Cache(tmp_path / "cache")
+    fetch(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=cache)
+    manifest = json.loads(files["fpm/m1/manifest.json"])
+    manifest["artifacts"][0][field] = value
+    files["fpm/m1/manifest.json"] = json.dumps(manifest).encode()
+    _repin(files, "fpm/m1/manifest.json")
+    # Refresh only the metadata; the artifact bytes and their digest remain cached and unchanged.
+    for path in ["catalog/dataset.json", "catalog/fpm.json", "fpm/m1/manifest.json"]:
+        cache.path_for(REPO, SHA, path).write_bytes(files[path])
+    with pytest.raises(IntegrityError, match="row count|schema ID"):
+        fetch(SEL, repo=REPO, revision=SHA, transport=NoNetwork(), cache=cache, offline=True)
+
+
+def test_declared_metadata_size_cannot_disable_the_cap(files, tmp_path):
+    from aisim_core.data import fetch as module
+
+    document = json.loads(files["catalog/dataset.json"])
+    document["categories"]["fpm"]["index"]["bytes"] = module._METADATA_CAP_BYTES + 1
+    files["catalog/dataset.json"] = json.dumps(document).encode()
+    transport = FakeTransport(files)
+    with pytest.raises(IntegrityError, match="metadata declaration exceeds"):
+        plan(SEL, repo=REPO, revision=SHA, transport=transport, cache=Cache(tmp_path / "cache"))
+    assert transport.opened == ["catalog/dataset.json"]
+
+
+@pytest.mark.parametrize("kind", ["metadata", "artifact", "support"])
+def test_an_overlapping_failed_fetch_preserves_the_installed_file(files, tmp_path, monkeypatch, kind):
+    from aisim_core.data.fetch import fetch_support
+
+    target = {"metadata": "catalog/fpm.json", "artifact": "fpm/m1/data.parquet", "support": "support.parquet"}[kind]
+    if kind == "support":
+        files[target] = files["fpm/m1/data.parquet"]
+        index = json.loads(files["catalog/fpm.json"])
+        index["support"] = [_artifact_json("support", target, files[target], rows=3)]
+        files["catalog/fpm.json"] = json.dumps(index).encode()
+        _repin(files, "catalog/fpm.json")
+    cache = Cache(tmp_path / "cache")
+    real_store = cache.store
+    installed = []
+
+    def concurrent_store(repo, sha, path, chunks, expected):
+        if path == target:
+            # The first caller completes after this caller's miss, before its eventual transfer failure.
+            if not installed:
+                installed.append(real_store(repo, sha, path, [files[path]], expected)[0])
+
+            def fail():
+                raise ConnectionError("second caller lost its connection")
+                yield
+
+            chunks = fail()
+        return real_store(repo, sha, path, chunks, expected)
+
+    monkeypatch.setattr(cache, "store", concurrent_store)
+    # A pre-install discard would delete the first caller's file before the failed store starts.
+    real_discard = cache.discard
+
+    def concurrent_discard(repo, sha, path):
+        if path == target and not installed:
+            installed.append(real_store(repo, sha, path, [files[path]], None)[0])
+        real_discard(repo, sha, path)
+
+    monkeypatch.setattr(cache, "discard", concurrent_discard)
+    operation = fetch_support if kind == "support" else fetch
+    with pytest.raises(TransferError, match="second caller lost"):
+        operation(
+            "fpm" if kind == "support" else SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=cache
+        )
+    assert installed and installed[0].read_bytes() == files[target]
+
+
+def test_support_discovery_checks_declared_cost_before_transferring(files, tmp_path):
+    from aisim_core.data.fetch import fetch_support
+
+    files["support.parquet"] = files["fpm/m1/data.parquet"]
+    index = json.loads(files["catalog/fpm.json"])
+    index["support"] = [_artifact_json("support", "support.parquet", files["support.parquet"], rows=3)]
+    files["catalog/fpm.json"] = json.dumps(index).encode()
+    _repin(files, "catalog/fpm.json")
+    cache = Cache(tmp_path / "cache")
+    load_category_index("fpm", repo=REPO, revision=SHA, transport=FakeTransport(files), cache=cache)
+    transport = FakeTransport(files)
+    with pytest.raises(BudgetExceededError):
+        fetch_support(
+            "fpm",
+            repo=REPO,
+            revision=SHA,
+            transport=transport,
+            cache=cache,
+            max_bytes=len(files["support.parquet"]) - 1,
+        )
+    assert transport.opened == []

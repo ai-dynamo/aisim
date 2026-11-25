@@ -433,12 +433,14 @@ SMOKE_CASES = [
             system_name="gb200",
             backend_name="sglang",
             backend_version="0.5.14",
+            allow_unlisted_version=True,
             tp_size=16,
             moe_tp_size=16,
             moe_ep_size=1,
         ),
         # Beyond-node TP on a 4-GPU-node system: pins the recorded
-        # multi-node custom-AR fan-out pricing (AIC-1808).
+        # multi-node custom-AR fan-out pricing (AIC-1808). 0.5.14 holds the
+        # multi-node comm curves and is a data coordinate, not a slot.
         id="qwen35-397b-a17b-gb200-sglang-0514-tp16-scan-coverage",
     ),
     # Kimi-K3 (review Blocker 1 anchor): hybrid KDA + MLA LatentMoE. The
@@ -1084,6 +1086,13 @@ def _unlisted_version_scope(case: EngineStepParityCase):
     if not case.allow_unlisted_version:
         yield
         return
+    with _allow_unlisted_versions():
+        yield
+
+
+@contextlib.contextmanager
+def _allow_unlisted_versions():
+    """Lift the queryable-slot gate for a frozen data coordinate."""
     previous = os.environ.get("AIC_ALLOW_UNLISTED_VERSIONS")
     os.environ["AIC_ALLOW_UNLISTED_VERSIONS"] = "1"
     rust_engine_step._engine_handle_cache_clear()
@@ -1990,9 +1999,8 @@ class TestRustTypedErrorsAcrossFfi:
             # data-gap coordinate pinned to the vllm 0.24.0 data: head_dim=192
             # is collected for fp8 KV only there. The model is an fp8
             # checkpoint (kv would infer fp8 and HIT), so bf16 KV is pinned
-            # explicitly to hold the gap. The 2026-10 campaign (0.30.0, the
-            # current slot) fills bf16@192, so the gap is a raw data pin, not
-            # a slot.
+            # explicitly to hold the gap. The collections from 0.30.0 on
+            # fill bf16@192, so the gap is a raw data pin, not a slot.
             model_path="XiaomiMiMo/MiMo-V2-Flash",
             kvcache_quant_mode="bfloat16",
             backend_version="0.24.0",
@@ -2114,14 +2122,14 @@ class TestRustProvenanceCapture:
             database_mode="HYBRID",
             # xop-borrow coordinate pinned to the sglang 0.5.14 data: that
             # drop ships no MSA module tables (they land at 0.5.16), so MSA
-            # borrows DSA's util — the xop tier this test pins. 0.5.21 (the
-            # current slot since the 2026-10 campaign) carries the MSA
-            # tables, so the coordinate is a raw data pin, not a slot.
+            # borrows DSA's util — the xop tier this test pins. The
+            # queryable slots (0.5.21, 0.5.23) carry the MSA tables, so the
+            # coordinate is a raw data pin, not a slot.
             backend_name="sglang",
             backend_version="0.5.14",
             allow_unlisted_version=True,
         )
-        with util_empirical.capture_provenance() as tags:
+        with _unlisted_version_scope(case), util_empirical.capture_provenance() as tags:
             metrics = _static_metrics(case)
         assert not isinstance(metrics["total_ms"], _ErrorSentinel), repr(metrics)
         assert util_empirical.worst_provenance(tags) == "xop", tags
@@ -2289,7 +2297,10 @@ def _fpm_systems(tmp_path_factory, power_w=None):
     perf_database.set_systems_paths(f"{root},default")
     rust_engine_step._engine_handle_cache_clear()
     try:
-        yield root
+        # `_FPM_VERSION` overlays the packaged b200_sxm/vllm tree, whose slots
+        # no longer list it: the synthetic dataset is a raw data coordinate.
+        with _allow_unlisted_versions():
+            yield root
     finally:
         perf_database.set_systems_paths("default")
         rust_engine_step._engine_handle_cache_clear()
@@ -2341,12 +2352,14 @@ _FPM_HYBRID_MIXED_FROZEN = 18.187255859375  # (ctx 1024, gen 1, isl 1024, osl 2)
 # engine at introduction (append-only; there is no Python reference). Each
 # latency equals its schema-6 pin above. Energy is the resolved row's power
 # times its latency: prefill (1, 1024, 0) is row 1 (310 W * 18 ms), decode
-# (4, 4100) is row 12 (420 W * 4.5 ms). The aggregate mixed step reports no
-# FPM energy (D10, AISIM-2001); a generation-only step keeps it.
+# (4, 4100) is row 12 (420 W * 4.5 ms). In the mixed step, prefill at 1028
+# tokens blends rows 1 and 2 with weight 4/1024. Decode at KV 4104 blends
+# rows 12 and 13 with weight 4/(262144 - 4100) and subtracts the batch-4 KV
+# floor (410 W * 4 ms). Their energies sum to the D5 pin below.
 _FPM_V8_POWER_FROZEN = {
     "static_ctx": (18.0, 5580.0),
     "static_gen": (4.5, 1890.0),
-    "mixed": (18.562552704189983, 0.0),
+    "mixed": (18.562552704189983, 5850.103399729668),
     "genonly": (4.5, 1890.0),
 }
 

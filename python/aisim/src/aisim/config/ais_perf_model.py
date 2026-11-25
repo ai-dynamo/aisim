@@ -887,10 +887,12 @@ def _section(kind: str) -> str:
     return sections[kind]
 
 
-def reject_repeated_keys(text: str, kind: str, source: str | os.PathLike[str]) -> None:
+def reject_repeated_keys(
+    text: str, kind: str, source: str | os.PathLike[str], *, json_input: bool | None = None
+) -> None:
     """Fail when the text of a config file writes ``ais_perf_model``, or a key inside it, twice.
 
-    ``text`` is the YAML text of a config file, ``kind`` is ``predict``,
+    ``text`` is the YAML or JSON text of a config file, ``kind`` is ``predict``,
     ``recommend`` or ``search`` and ``source`` is the path of the file, named
     in the error. Call this where the file is read: the YAML reader keeps the
     last value of a repeated key, so the mapping it returns no longer shows
@@ -916,17 +918,26 @@ def reject_repeated_keys(text: str, kind: str, source: str | os.PathLike[str]) -
     value. Text without the key has nothing to check, and text the YAML
     reader cannot parse is left to the code that reads the file.
 
-    A repeat is an ``AisPerfModelError`` that names the key and its lines:
+    JSON uses decoded key identities and reports the repeated key's path.
+    Unless ``json_input`` is supplied, the filename selects the format. A
+    YAML-only caller must pass ``False`` to match its own reader.
+    A YAML repeat is an ``AisPerfModelError`` that names the key and its lines:
     the first and the last writing of the section or of ``ais_perf_model``,
     the first two writings of a key inside the value.
     """
+    if json_input is None:
+        json_input = os.fspath(source).lower().endswith(".json")
+    if json_input:
+        _reject_repeated_json_keys(text, kind, source)
+        return
+
     import yaml
 
     section = _section(kind)
     try:
         root = yaml.compose(text, Loader=yaml.SafeLoader)
         outer = _repeated_key_or_section(root, section)
-        value = None if outer else _kept_node(_kept_node(root, section, set()), KEY, set())
+        value = None if outer else _kept_node(_kept_node(root, section), KEY)
     except (yaml.YAMLError, RecursionError):
         return
     if outer:
@@ -934,6 +945,45 @@ def reject_repeated_keys(text: str, kind: str, source: str | os.PathLike[str]) -
     repeat = _repeat_below(value)
     if repeat:
         raise _written_twice(section, source, *repeat)
+
+
+def _reject_repeated_json_keys(text: str, kind: str, source: str | os.PathLike[str]) -> None:
+    """Apply the same scoped duplicate checks without interpreting JSON strings as YAML."""
+
+    class ObjectPairs(list):
+        """Keep every decoded key and distinguish JSON objects from arrays."""
+
+    root = json.loads(text, object_pairs_hook=ObjectPairs)
+    if not isinstance(root, ObjectPairs):
+        return  # The configuration reader reports non-object documents.
+    section = _section(kind)
+    sections = [value for key, value in root if key == section]
+    entries = [value for obj in sections if isinstance(obj, ObjectPairs) for key, value in obj if key == KEY]
+    if not entries:
+        return
+
+    def repeated(path: str) -> None:
+        raise AisPerfModelError(f"{source}: {path} is written twice")
+
+    if len(sections) > 1:
+        repeated(section)
+    if len(entries) > 1:
+        repeated(f"{section}.{KEY}")
+
+    def visit(value: Any, path: str) -> None:
+        if isinstance(value, ObjectPairs):
+            seen: set[str] = set()
+            for key, child in value:
+                child_path = f"{path}.{key}"
+                if key in seen:
+                    repeated(child_path)
+                seen.add(key)
+                visit(child, child_path)
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                visit(child, f"{path}[{index}]")
+
+    visit(entries[0], f"{section}.{KEY}")
 
 
 def repeated_key_in(text: str) -> tuple[str, int, int] | None:
@@ -1025,37 +1075,51 @@ def _written(node: Any, name: str) -> list[tuple[int, Any]]:
     ]
 
 
-def _kept_node(node: Any, name: str, searched: set[int]) -> Any:
+def _kept_node(node: Any, name: str) -> Any:
     """Return the YAML node that the reader keeps as the value of key ``name`` of a mapping node, or None.
 
-    The reader keeps the last value written for a key. It takes a key from a
-    merge (``<<``) only when the mapping does not write the key itself.
-    ``searched`` holds the mappings already looked at. A mapping can be merged
-    in more than one place, and can merge itself; it has no value to add the
-    second time.
+    The reader keeps the last value written for a key, after it has put the
+    keys that merges (``<<``) bring in before the written ones. Which merged
+    mapping wins differs between PyYAML releases, so the reader's own merge
+    step orders the keys here. It runs on a copy, because it rewrites the
+    mappings it merges and the caller still counts the keys as written. A
+    merge the reader rejects raises the reader's error.
     """
     import yaml
 
-    if not isinstance(node, yaml.MappingNode) or id(node) in searched:
+    if not isinstance(node, yaml.MappingNode):
         return None
-    searched.add(id(node))
-    written, merged = None, []
-    for key_node, value_node in node.value:
-        if not isinstance(key_node, yaml.ScalarNode):
-            continue
-        if key_node.tag == _YAML_MERGE_TAG:
-            merged.append(value_node)
-        elif key_node.tag == _YAML_TEXT_TAG and key_node.value == name:
-            written = value_node
-    if written is not None:
-        return written
-    # Of two merges the reader lets the later one win; in one merge of a list of mappings, the earlier mapping.
-    for merge in reversed(merged):
-        for source in merge.value if isinstance(merge, yaml.SequenceNode) else [merge]:
-            found = _kept_node(source, name, searched)
-            if found is not None:
-                return found
-    return None
+    flat = _merge_copy(node, {})
+    yaml.constructor.SafeConstructor().flatten_mapping(flat)
+    kept = None
+    for key_node, value_node in flat.value:
+        if isinstance(key_node, yaml.ScalarNode) and key_node.tag == _YAML_TEXT_TAG and key_node.value == name:
+            kept = value_node
+    return kept
+
+
+def _merge_copy(node: Any, copies: dict[int, Any]) -> Any:
+    """Return a copy of a YAML node in which the mappings that the reader's merge step rewrites are new.
+
+    Those are the mapping itself and each mapping it merges, directly or in a
+    list. Keys and all other values are the nodes of the original, and a
+    mapping merged in two places is one copy in both, as it is one node for
+    the reader.
+    """
+    import yaml
+
+    if id(node) in copies:
+        return copies[id(node)]
+    if isinstance(node, yaml.MappingNode):
+        copy = copies[id(node)] = yaml.MappingNode(node.tag, [], node.start_mark, node.end_mark)
+        copy.value = [
+            (key, _merge_copy(value, copies) if key.tag == _YAML_MERGE_TAG else value) for key, value in node.value
+        ]
+        return copy
+    if isinstance(node, yaml.SequenceNode):
+        items = [_merge_copy(item, copies) for item in node.value]
+        return yaml.SequenceNode(node.tag, items, node.start_mark, node.end_mark)
+    return node
 
 
 def anchor_paths(raw: Any, base_dir: str | os.PathLike[str], kind: str) -> Any:

@@ -1895,6 +1895,101 @@ def test_run_single_agg_calls_predict_agg_worker_with_fixed_point(monkeypatch):
     assert captured["system_spec"] is loaded_spec
 
 
+@pytest.mark.parametrize("missing_role", ["agg", "prefill", "decode", "both"])
+def test_run_single_epd_withholds_absent_worker_power_and_preserves_latency(monkeypatch, missing_role):
+    from unittest.mock import MagicMock
+
+    from aisim.sdk import predict, sweep
+
+    serving_mode = "agg" if missing_role == "agg" else "disagg"
+    worker = {
+        "model": "m",
+        "isl": 4000,
+        "osl": 500,
+        "prefix": 0,
+        "concurrency": 1,
+        "bs": 1,
+        "global_bs": 1,
+        "tp": 4,
+        "pp": 1,
+        "dp": 1,
+        "moe_tp": 1,
+        "moe_ep": 1,
+        "parallel": "tp4pp1dp1",
+        "ttft": 80.0,
+        "tpot": 0.0,
+        "seq/s": 10.0,
+        "tokens/s/user": 0.0,
+        "gemm": "fp8",
+        "kvcache": "fp8",
+        "fmha": "fp8",
+        "moe": "fp8",
+        "comm": "half",
+        "memory": 12.3,
+        "backend": "trtllm",
+        "version": "1.3.0",
+        "system": "h200_sxm",
+        "power_w": 500.0,
+    }
+    rows = {
+        "agg": dict(
+            worker,
+            tpot=25.0,
+            request_latency=80.0 + 25.0 * 499,
+            **{"tokens/s": 5000.0, "tokens/s/gpu": 1250.0, "num_total_gpus": 4},
+        ),
+        "prefill": dict(worker),
+        "decode": dict(worker, ttft=0.0, tpot=25.0, **{"seq/s": 5.0, "tokens/s/user": 40.0}),
+    }
+
+    def summary(**kwargs):
+        return _build_fake_summary(result_dict=dict(rows[kwargs.get("role", "agg")]))
+
+    monkeypatch.setattr("aisim.sdk.perf_database.get_database_view", lambda *a, **kw: MagicMock())
+    monkeypatch.setattr("aisim.sdk.backends.factory.get_backend", lambda *a, **kw: MagicMock())
+    monkeypatch.setattr("aisim.sdk.models.get_model", lambda *a, **kw: MagicMock())
+    monkeypatch.setattr(predict, "predict_agg_worker", summary)
+    monkeypatch.setattr(predict, "predict_disagg_worker", summary)
+    monkeypatch.setattr(
+        sweep,
+        "_get_encoder_worker_candidates",
+        lambda **kw: [
+            {
+                "encoder_latency": 50.0,
+                "seq/s": 80.0,
+                "num_total_gpus": 1,
+                "tp": 1,
+                "bs": 1,
+                "memory": 1.0,
+                "power_w": 200.0,
+                "power_coverage": 1.0,
+            }
+        ],
+    )
+    identity = {
+        "model_path": "Qwen/Qwen3-VL-8B-Instruct",
+        "system_name": "h200_sxm",
+        "backend_name": "sglang",
+    }
+    if serving_mode == "disagg":
+        identity = {f"{role}_{key}": value for role in ("prefill", "decode") for key, value in identity.items()}
+    task = Task(serving_mode=serving_mode, enable_epd=True, **identity)
+
+    def evaluate():
+        if serving_mode == "agg":
+            return task.run_single_agg(tp=4, batch_size=1, encoder_tp=1)
+        return task.run_single_disagg(prefill_tp=4, decode_tp=2, decode_batch_size=64, encoder_tp=1)
+
+    powered = evaluate()
+    assert powered["power_w"] > 0
+    for role, row in rows.items():
+        if missing_role in (role, "both"):
+            del row["power_w"]
+    withheld = evaluate()
+    assert withheld["power_w"] is None
+    assert {k: v for k, v in powered.items() if k != "power_w"} == {k: v for k, v in withheld.items() if k != "power_w"}
+
+
 def test_run_single_agg_rejects_disagg_task():
     t = Task(
         serving_mode="disagg",
@@ -2360,6 +2455,57 @@ def test_validate_fp8_static_not_transfer_admitted_in_hybrid():
     t.gemm_quant_mode = common.GEMMQuantMode.fp8_static
     with pytest.raises(ValueError, match="Unsupported gemm quant mode 'fp8_static'"):
         t.validate()
+
+
+@pytest.mark.parametrize("quant", [common.GEMMQuantMode.fp8, common.GEMMQuantMode.sq])
+def test_validate_gemm_transfer_gate_never_borrows_from_fp8_static_rows(monkeypatch, quant):
+    """The engine never takes fp8_static rows as a transfer-ladder reference
+    (gemm_table_quants in operators/gemm.rs). A table with its own fp8_static
+    rows and scale_matrix rows lists fp8_static without fp8, so the gate must
+    not count that name as a same-profile (XQUANT) donor for fp8 or sq.
+    Vehicle: the real b200/vllm 0.30.0 database with its gemm listing replaced."""
+    from aisim.sdk.perf_database import get_database
+
+    real = get_database("b200_sxm", "vllm", "0.30.0")
+
+    class GemmListing:
+        """The real database with only its gemm listing replaced."""
+
+        def __init__(self, gemm_modes):
+            self.supported_quant_mode = {**real.supported_quant_mode, "gemm": gemm_modes}
+
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+    def make(gemm_modes, policy, gemm_quant=quant):
+        database = GemmListing(gemm_modes)
+        monkeypatch.setattr(Task, "_try_load_role_database", lambda self, role: database)
+        return Task(
+            serving_mode="agg",
+            model_path="meta-llama/Meta-Llama-3.1-8B",
+            system_name="b200_sxm",
+            backend_name="vllm",
+            backend_version="0.30.0",
+            gemm_quant_mode=gemm_quant,
+            database_mode="HYBRID",
+            transfer_policy=policy,
+        )
+
+    own_rows = ["bfloat16", "fp8_static"]
+    # XQUANT only ("balanced" = xshape + xquant, or "xquant" alone): no donor of the same profile.
+    for policy in ("balanced", "xquant"):
+        with pytest.raises(ValueError, match=f"Unsupported gemm quant mode '{quant.name}'"):
+            make(own_rows, policy).validate()
+    # XPROFILE: bfloat16 is a donor of another profile, so all transfers and XPROFILE alone admit it.
+    make(own_rows, None).validate()
+    make(own_rows, "xprofile").validate()
+    # A table that lists fp8 behaves as before: fp8 directly, sq through XQUANT from fp8.
+    make(["bfloat16", "fp8", "fp8_static"], "balanced").validate()
+    # Nor is fp8_static an XPROFILE donor: with only fp8_static listed, bfloat16 has no
+    # reference of another profile, so XPROFILE and all transfers reject it.
+    for policy in ("xprofile", None):
+        with pytest.raises(ValueError, match="Unsupported gemm quant mode 'bfloat16'"):
+            make(["fp8_static"], policy, common.GEMMQuantMode.bfloat16).validate()
 
 
 def test_validate_gemm_xprofile_requires_listed_level_profile(monkeypatch):

@@ -619,6 +619,8 @@ impl ValidatedTimingPhase {
 #[cfg(any(feature = "python", test))]
 pub(crate) struct TimingEvidenceAccumulator {
     summary: TimingEvidenceSummary,
+    pub(crate) iteration_wait_ms: f64,
+    pub(crate) phase_priced_wait_ms: f64,
     pending: Vec<OperationUpdate>,
     /// Accumulated operation index of each operation of a named update.
     indices: Vec<usize>,
@@ -1415,15 +1417,33 @@ pub trait TimingModel: Send + Sync {
 
     /// Return typed evidence accumulated by this provider so far.
     ///
-    /// Latency-only providers retain the default `None`. In particular, the
-    /// built-in polynomial/fixed models and whole-model FPM timing do not
-    /// fabricate energy or coverage values.
+    /// Latency-only providers, including the built-in polynomial/fixed models,
+    /// retain the default `None`. Supported schema-v8 whole-model FPM timing
+    /// supplies component energy and coverage here; unsupported FPM paths do
+    /// not fabricate energy or coverage values.
     fn evidence_summary(&self) -> Option<TimingEvidenceSummary> {
         None
     }
 
-    /// Latency-only whole-model FPM evidence is separate from energy evidence.
-    /// It must not change the provider's existing power publication contract.
+    /// Operation-energy evidence and uncovered attention-DP wait. Iteration
+    /// wait is in provider time and phase-priced wait includes replay speedups.
+    fn power_evidence_summary(&self) -> Option<(TimingEvidenceSummary, f64, f64)> {
+        self.evidence_summary().map(|summary| (summary, 0.0, 0.0))
+    }
+
+    /// Whether the scheduler should supply wait for phase-priced group passes.
+    fn tracks_attention_dp_wait(&self) -> bool {
+        false
+    }
+
+    /// Record uncovered attention-DP wait in modeled milliseconds.
+    fn record_phase_priced_wait(&self, _wait_ms: f64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Return whole-model FPM query history for time and source diagnostics.
+    /// Power publication uses the component accumulator returned by
+    /// [`Self::evidence_summary`], independently of query-history capture.
     fn fpm_evidence_summary(&self) -> Option<TimingEvidenceSummary> {
         None
     }

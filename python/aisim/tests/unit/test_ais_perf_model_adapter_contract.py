@@ -39,15 +39,15 @@ from typing import Any, NamedTuple
 
 import pytest
 
-import aisim_core.systems
 from aisim.config import CorePredictionConfig, CoreRecommendationConfig
 from aisim.config_adapter import CONFIG_ADAPTER_API_VERSION, validate_config_adapter
-from aisim.predict import _compile_prediction_adapters, _prediction_adapter_context
+from aisim.predict import compile_prediction_adapters
 from aisim.recommend import _run_recommendation
 from aisim.sweeper.config import SearchSpace, SmartSearchConfig
 from aisim.sweeper.forward_pass_estimator import ForwardPassEstimatorResolver
 from aisim.sweeper.provider import AdapterReplaySpec, AdapterSearchPlan
 from aisim.sweeper.replay import ReplayReport, RunnerCapabilities
+from aisim_core.data.default_systems import default_systems_path
 from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 from aisim_core.sdk.perf_database import load_system_spec
 
@@ -69,8 +69,9 @@ SEARCH = {
     "optimization": {"target": "throughput", "constraints": {"max_candidate_gpus": 2}},
     "optimizer": {"algorithm": "random", "max_trials": 1, "parallelism": 1},
 }
-# The packaged data root written as a path: the same data as ``default``, but another authored value.
-PACKAGED_ROOT = str(next(iter(aisim_core.systems.__path__)))
+# The default root written as a path: the same data as ``default``, but another authored value. Operation
+# tables are not packaged, so this is the root composed from the pinned dataset.
+PACKAGED_ROOT = str(default_systems_path())
 # One value for every estimator key a worker type may set.
 SHARED = {
     "estimation_mode": "op_level",
@@ -413,11 +414,11 @@ def _recommend(raw: dict[str, Any]) -> dict[str, Any]:
 def _predict(raw: dict[str, Any]) -> dict[str, Any]:
     """Compile a prediction's adapter sections with the stub adapters and return what they saw and read."""
     adapters = _adapters()
-    replays = _compile_prediction_adapters(
+    replays = compile_prediction_adapters(
+        CorePredictionConfig.model_validate(raw),
         {"router": {}, "planner": {}},
         adapters,
         stack=STACK,
-        context=_prediction_adapter_context(CorePredictionConfig.model_validate(raw)),
     )
     router, planner = adapters.values()
     return {

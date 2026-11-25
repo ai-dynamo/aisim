@@ -1319,11 +1319,9 @@ fn lower_trace(
             // every other request is timed by its dependency edges, so an
             // authored floor would hold it to the recorded wall clock after the
             // replay ran faster or an idle cap compressed a gap.
-            let not_before_ms = if agentx && !dependencies.is_empty() {
-                0.0
-            } else {
-                seconds_to_milliseconds(request.request.t - root_time)
-            };
+            let recorded_start_ms = seconds_to_milliseconds(request.request.t - root_time);
+            let edge_timed = agentx && !dependencies.is_empty();
+            let not_before_ms = if edge_timed { 0.0 } else { recorded_start_ms };
             rows.push(AgenticMooncakeRow {
                 request_id,
                 play_id: play_id.clone(),
@@ -1340,6 +1338,8 @@ fn lower_trace(
                 hash_ids: Some(hash_ids),
                 not_before_ms,
                 recorded_api_time_ms: request.request.api_time.map(seconds_to_milliseconds),
+                // A snapshot still cuts an edge-timed request by its recorded start.
+                recorded_start_ms: edge_timed.then_some(recorded_start_ms),
                 priority: None,
                 strict_priority: None,
                 policy_class: None,
@@ -2613,6 +2613,9 @@ fn normalize_relative_path(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replay::loadgen::{
+        AgenticSnapshotOptions, AgenticSnapshotRequest, AgenticSnapshotSelection,
+    };
     use tempfile::tempdir;
 
     fn request(t: f64, input: usize, output: usize, hashes: &[u64]) -> serde_json::Value {
@@ -4189,6 +4192,10 @@ mod tests {
         let (_, recorded) = load_weka_agentic_rows(&path).unwrap();
         assert_eq!(row(&recorded, "outer:1:inner:0").not_before_ms, 900.0);
         assert_eq!(row(&recorded, "outer:2").not_before_ms, 1_200.0);
+        for request in &recorded {
+            let serialized = serde_json::to_value(request).unwrap();
+            assert!(serialized.get("recorded_start_ms").is_none());
+        }
 
         // AgentX keeps it only on the root; the rest follow their edges.
         let rows = agentx_rows(&path);
@@ -4202,6 +4209,71 @@ mod tests {
             ..Default::default()
         };
         let (graph, _, _) = load_weka_agentic_graph_cached(&path, Some(4), options, false).unwrap();
+        // A snapshot cuts by recorded starts, which edge-timed requests keep:
+        // without them the play's span is zero, so a sampled cut lands on
+        // turn 0 and an imported cut is out of bounds.
+        let prepared = graph
+            .prepare_snapshots(1, AgenticSnapshotOptions::seeded(42))
+            .unwrap();
+        let sampled = &prepared.snapshots()[0];
+        assert_eq!(sampled.recorded_last_start_ms, 1_200.0);
+        assert!((300.0..=900.0).contains(&sampled.t_star_ms));
+        let requests = agentx_cut(&path, 600.0);
+        assert_eq!(requests.iter().filter(|r| r.historical).count(), 1);
+        assert!(requests.iter().any(|r| r.recorded_end_ms == Some(1_100.0)));
+        // Both streams resume at their recorded offsets from the cut, not when
+        // the historical spawning turn returned.
+        assert_eq!(delay_ms(&requests, "outer:1:inner:0"), 300.0);
+        assert_eq!(delay_ms(&requests, "outer:2"), 600.0);
+        // Exercise both sides of max(recorded timer, live join): the cut is
+        // 600 ms, the child starts at 900 - 600 = 300 ms, and the continuation
+        // waits until max(1200 - 600, actual child completion).
+        for (child_completion_ms, continuation_ms) in [(400.0, 600.0), (700.0, 700.0)] {
+            let cut = prepared.context().prepare_play(0, 0, Some(600.0)).unwrap();
+            let snapshots =
+                crate::replay::loadgen::PreparedAgenticSnapshots::from_plays(vec![cut]).unwrap();
+            let mut resumed = crate::replay::loadgen::WorkloadDriver::new_agentic_snapshots(
+                snapshots, 4, true, 1.0,
+            )
+            .unwrap();
+            assert_eq!(resumed.total_turns(), 2);
+            assert_eq!(resumed.next_ready_time_ms(), Some(300.0));
+            assert!(resumed.pop_ready(299.0, usize::MAX).is_empty());
+            let child = resumed.pop_ready(300.0, usize::MAX);
+            assert_eq!(child.len(), 1);
+            assert!(
+                child[0]
+                    .authored_request_id
+                    .as_deref()
+                    .unwrap()
+                    .ends_with("outer:1:inner:0")
+            );
+            if child_completion_ms > 600.0 {
+                assert!(resumed.pop_ready(600.0, usize::MAX).is_empty());
+            }
+            resumed
+                .on_complete(child[0].request_uuid, child_completion_ms)
+                .unwrap();
+            assert_eq!(resumed.next_ready_time_ms(), Some(continuation_ms));
+            assert!(
+                resumed
+                    .pop_ready(continuation_ms - 1.0, usize::MAX)
+                    .is_empty()
+            );
+            let continuation = resumed.pop_ready(continuation_ms, usize::MAX);
+            assert_eq!(continuation.len(), 1);
+            assert!(
+                continuation[0]
+                    .authored_request_id
+                    .as_deref()
+                    .unwrap()
+                    .ends_with("outer:2")
+            );
+            resumed
+                .on_complete(continuation[0].request_uuid, continuation_ms + 50.0)
+                .unwrap();
+            assert!(resumed.is_drained());
+        }
         let mut driver =
             crate::replay::loadgen::WorkloadDriver::new_agentic_trace(graph, 4).unwrap();
         let root = driver.pop_ready(0.0, usize::MAX);
@@ -4256,6 +4328,36 @@ mod tests {
                 .unwrap()
                 .ends_with("outer:1:inner:0")
         );
+    }
+
+    /// The play's snapshot requests at an imported cut, AgentX client.
+    fn agentx_cut(path: &Path, t_star_ms: f64) -> Vec<AgenticSnapshotRequest> {
+        let options = WekaImportOptions {
+            client: WekaClient::Agentx,
+            ..Default::default()
+        };
+        let (graph, _, _) = load_weka_agentic_graph_cached(path, Some(4), options, false).unwrap();
+        let seeded = graph
+            .prepare_snapshots(1, AgenticSnapshotOptions::seeded(42))
+            .unwrap();
+        let cut = AgenticSnapshotOptions {
+            seed: 42,
+            initial_selections: Some(vec![AgenticSnapshotSelection {
+                source_play_id: seeded.snapshots()[0].source_play_id.clone(),
+                t_star_ms,
+            }]),
+            corpus_cursor: Some(1),
+        };
+        let prepared = graph.prepare_snapshots(1, cut).unwrap();
+        prepared.snapshots()[0].requests.clone()
+    }
+
+    fn delay_ms(requests: &[AgenticSnapshotRequest], source: &str) -> f64 {
+        let suffix = format!(":request:{source}");
+        let request = requests
+            .iter()
+            .find(|request| request.source_request_id.ends_with(&suffix));
+        request.unwrap().remaining_delay_ms
     }
 
     fn agentx_rows(path: &Path) -> Vec<AgenticMooncakeRow> {
@@ -4346,6 +4448,11 @@ mod tests {
                 ("outer:1:inner:0".into(), Completion, 0.0, ReplayBarrier),
             ]
         );
+        // Cut at 1200 ms, with m0 as history: a's second chain keeps its
+        // recorded offset although its replay barrier is still live.
+        let requests = agentx_cut(&path, 1_200.0);
+        assert_eq!(delay_ms(&requests, "outer:1:inner:0"), 300.0);
+        assert_eq!(delay_ms(&requests, "outer:1:inner:1"), 600.0);
         // b and c share the group joined by m1, which starts at b's marker.
         assert_eq!(
             edges(&rows, "outer:2:inner:0"),

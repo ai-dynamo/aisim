@@ -395,6 +395,7 @@ fn check_identity(
             .resolve()?
         }
     };
+    let (expected, base) = (mtp_as_nextn(expected), mtp_as_nextn(base));
     if expected != base {
         return Err(identity_mismatch(&expected, &base));
     }
@@ -408,6 +409,28 @@ fn check_identity(
         )));
     }
     Ok(())
+}
+
+/// A regression fitted at `nextn` N also restores for an MTP scheme of depth
+/// N, and one fitted with the scheme for `nextn` N, so identities compare with
+/// the scheme as its depth. Replay's draft-width limit applies when replay
+/// times the role, not here.
+fn mtp_as_nextn(mut config: ForwardPassPerfModelConfig) -> ForwardPassPerfModelConfig {
+    if config.estimation_mode == EstimationMode::FpmRegression
+        && let Some(depth) = config
+            .speculation
+            .as_ref()
+            .filter(|speculation| speculation.kind == "mtp")
+            // The SDK accepts integer-valued JSON floats and preserves their
+            // spelling. All u32 depths are exactly representable as f64.
+            .and_then(|speculation| speculation.params.get("depth")?.as_f64())
+            .filter(|depth| depth.fract() == 0.0 && (1.0..=f64::from(u32::MAX)).contains(depth))
+            .map(|depth| depth as u32)
+    {
+        config.nextn = depth;
+        config.speculation = None;
+    }
+    config
 }
 
 /// First differing JSON path, for actionable identity-mismatch errors.
@@ -515,6 +538,12 @@ impl ForwardPassPerfModel {
         match &self.mode {
             ForwardPassPerfMode::Native { engine, .. } => {
                 let identity = identity.as_mut().expect("native provenance");
+                // Automatic search compiled the op-level engine without an FPM library path, and
+                // a restore rejects one for it. The load-time fingerprint, this save and the
+                // restore must read the same data, so the snapshot identity leaves the path out.
+                if identity.estimation_mode == EstimationMode::OpLevel {
+                    identity.estimator_config.fpm_interpolation.fpm_parquet_path = None;
+                }
                 let root = self
                     .provenance
                     .as_ref()
@@ -1132,7 +1161,7 @@ fn restore_verified(
         // The data matched before this model loaded and only verified tables
         // stayed shared, so later restores of untouched data may share these.
         if let (Some(root), Some(stamp)) = (&native_root, data_stamp) {
-            perf_db::verified(root, &base.system, parquet, engine.database(), stamp);
+            perf_db::verified(root, &base.system, parquet, engine.database(), stamp)?;
         }
     }
     model.install_state(state.state)?;

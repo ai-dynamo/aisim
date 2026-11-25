@@ -39,10 +39,11 @@ from scripts.e2e_accuracy.build_e2e_accuracy_overview import (
 from scripts.e2e_accuracy.fetch_accuracy_measurements import MTP_POLICY, RESOLVED_POLICY, digest, validate_manifest
 from scripts.e2e_accuracy.hf_measurements import MTP_POLICY as HF_MTP_POLICY
 from scripts.e2e_accuracy.hf_measurements import POLICY as HF_POLICY
+from scripts.e2e_accuracy.hf_measurements import check_pinned_dataset, read_dataset
 from scripts.e2e_accuracy.source.cohort import select_points as select_resolved_points
 from scripts.e2e_accuracy.source.recipes.runtime_evidence import prepare_runtime_evidence
 from scripts.pages.build_pages_site import _accuracy_summary
-from scripts.release.package_identity import installed_distribution
+from scripts.release.package_identity import installed_distribution, runtime_module
 
 REPOSITORY = "https://github.com/ai-dynamo/aisim"
 
@@ -252,7 +253,8 @@ def wheel_identity(wheel: Path) -> dict:
 
 
 def replay_spec(request, backend_version: str):
-    from aisim.sweeper.replay import BackendDeploymentSpec, ReplaySpec
+    replay = runtime_module("aisim.sweeper.replay")
+    deployment_type, replay_type = replay.BackendDeploymentSpec, replay.ReplaySpec
 
     def engine(worker, system, role):
         args = {
@@ -313,8 +315,8 @@ def replay_spec(request, backend_version: str):
             num_prefill_workers=topology.prefill.replicas,
             num_decode_workers=topology.decode.replicas,
         )
-    return ReplaySpec(
-        backend_deployment=BackendDeploymentSpec(
+    return replay_type(
+        backend_deployment=deployment_type(
             deployment_mode=topology.kind,
             backend=request.backend.name,
             backend_version=backend_version,
@@ -335,7 +337,7 @@ def replay_spec(request, backend_version: str):
 def predict_point(point: dict) -> dict:
     if "source_row" in point:
         return predict_resolved_point(point)
-    from aisim.runner import EngineReplayRunnerFactory
+    runner_factory_type = runtime_module("aisim.runner").EngineReplayRunnerFactory
 
     api_name, adapter_name = predictor_module_names(installed_distribution().files or ())
     cli_estimate = importlib.import_module(api_name).cli_estimate
@@ -414,7 +416,9 @@ def predict_point(point: dict) -> dict:
             )
         },
     }
-    row.update(measurement_chart_metrics(bench["metrics"], total_gpus))
+    row.update(
+        measurement_chart_metrics(bench["metrics"], total_gpus, decode_gpus=config.get("num_decode_gpu"))
+    )
     row.update(baseline_chart_metrics(baseline, total_gpus))
     row["configuration"] = {
         "backend_version": baseline.backend_version,
@@ -438,7 +442,7 @@ def predict_point(point: dict) -> dict:
     }
     try:
         spec = replay_spec(request, baseline.backend_version)
-        runner = EngineReplayRunnerFactory().create(0)
+        runner = runner_factory_type().create(0)
         try:
             metrics = runner.run(spec).metrics
         finally:
@@ -469,13 +473,19 @@ def optional_positive(value):
     return float(value) if positive(value) else None
 
 
-def measurement_chart_metrics(metrics, total_gpus):
+def measurement_chart_metrics(metrics, total_gpus, decode_gpus=None):
     e2e = optional_positive(metrics.get("mean_e2el"))
     total = metrics.get("tput_per_gpu")
     if not positive(total) and positive(metrics.get("total_token_throughput")):
         total = metrics["total_token_throughput"] / total_gpus
     output = metrics.get("output_tput_per_gpu")
-    if not positive(output) and positive(metrics.get("output_throughput")):
+    if positive(output) and decode_gpus and 0 < decode_gpus < total_gpus:
+        # perf-DB reports per-decode-GPU on disagg rows; re-express per total GPU
+        # so both sides of the accuracy chart share the same denominator. The
+        # fallback below already yields a per-total value, so it must not be
+        # rescaled.
+        output = output * decode_gpus / total_gpus
+    elif not positive(output) and positive(metrics.get("output_throughput")):
         output = metrics["output_throughput"] / total_gpus
     return {
         "silicon_e2e_ms": e2e * 1000 if e2e is not None else None,
@@ -515,8 +525,9 @@ def predict_resolved_point(point):
             "reason": "source_unresolved",
         }
 
-    from aisim.runner import EngineReplayRunnerFactory
-    from aisim.sweeper.replay import BackendDeploymentSpec, ReplaySpec
+    runner_factory_type = runtime_module("aisim.runner").EngineReplayRunnerFactory
+    replay = runtime_module("aisim.sweeper.replay")
+    deployment_type, replay_type = replay.BackendDeploymentSpec, replay.ReplaySpec
     from scripts.e2e_accuracy.source.estimate import estimate_kwargs
     from scripts.e2e_accuracy.source.model_config_snapshot import materialize_model_config
     from scripts.e2e_accuracy.source.replay import replay_spec as resolved_replay_spec
@@ -525,7 +536,7 @@ def predict_resolved_point(point):
     deployment = point["deployment"]
     config, bench = point["config"], point["benchmark"]
     api_name, adapter_name = predictor_module_names(installed_distribution().files or ())
-    namespace = "aiconfigurator" if api_name.startswith("aiconfigurator.") else "aisim"
+    namespace = "aiconfigurator" if api_name.startswith("aiconfigurator.") else api_name.split(".")[0]
     try:
         version = importlib.import_module(namespace + ".sdk.perf_database").get_latest_database_version(
             system=deployment["system"], backend=deployment["backend"]
@@ -584,7 +595,9 @@ def predict_resolved_point(point):
             mtp_acceptance_source=mtp["kind"],
         )
     total_gpus = row["aisimulate_total_gpus"]
-    row.update(measurement_chart_metrics(bench["metrics"], total_gpus))
+    row.update(
+        measurement_chart_metrics(bench["metrics"], total_gpus, decode_gpus=config.get("num_decode_gpu"))
+    )
     try:
         if config["spec_method"] == "mtp":
             row["aic_status"] = "unsupported"
@@ -626,8 +639,8 @@ def predict_resolved_point(point):
     except Exception as error:
         row["aic_error"] = str(error)
     try:
-        spec = resolved_replay_spec(deployment, version, BackendDeploymentSpec, ReplaySpec)
-        runner = EngineReplayRunnerFactory().create(0)
+        spec = resolved_replay_spec(deployment, version, deployment_type, replay_type)
+        runner = runner_factory_type().create(0)
         try:
             metrics = runner.run(spec).metrics
         finally:
@@ -767,6 +780,8 @@ def campaign(args) -> None:
         raise ValueError("invalid shard index/count")
     if shard_count > 1 and args.output.exists() and any(args.output.iterdir()):
         raise ValueError("shard output directory must be empty")
+    dataset = read_dataset(args.tables)
+    check_pinned_dataset(dataset, manifest)
     metadata = {
         "manifest": manifest,
         "identity": identity,
@@ -778,6 +793,7 @@ def campaign(args) -> None:
         "preview": preview,
         "configuration_mode": getattr(args, "configuration_mode", "verified"),
         "point_timeout": args.point_timeout,
+        "dataset": dataset,
         "dataset_sha256": digest(args.manifest),
         "measurement_sha256": digest(args.tables),
         "driver_sha256": driver_digest(),
@@ -852,9 +868,10 @@ def campaign(args) -> None:
 def driver_digest() -> str:
     return sha(
         {
-            str(path.relative_to(Path(__file__).parent)): digest(path)
+            os.path.relpath(path, Path(__file__).parent): digest(path)
             for path in [
                 Path(__file__),
+                Path(__file__).resolve().parents[1] / "release/package_identity.py",
                 Path(__file__).with_name("hf_measurements.py"),
                 *sorted(Path(__file__).with_name("source").rglob("*.py")),
                 *sorted(Path(__file__).with_name("source").rglob("*.json")),
@@ -986,6 +1003,9 @@ def publish_campaign(metadata, results, cohort_sha, started, output, run_attempt
         "status": "complete",
         "advisory": True,
     }
+    if metadata.get("dataset") is not None:
+        # Exact input identity: repository, commit and snapshot; reruns reuse these.
+        campaign_info["dataset"] = metadata["dataset"]
     if resolved:
         campaign_info["configuration"] = {
             "profile": "coverage-experiment/1" if metadata["configuration_mode"] == "estimated" else "verified",

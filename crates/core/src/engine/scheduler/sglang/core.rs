@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-FileCopyrightText: Copyright 2023-2026 SGLang Team
 // SPDX-License-Identifier: Apache-2.0
+// Hybrid checkpoint contract adapted and modified from SGLang (Apache-2.0).
+// Copyright 2023-2024 SGLang Team and contributors.
+// Source: https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+// See THIRD_PARTY_NOTICES.md for the complete source list and modification scope.
 // Modified behavioral adaptation of SGLang v0.5.22 and v0.5.20; see THIRD_PARTY_NOTICES.md.
 // Sources: https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d (admission)
 //          https://github.com/sgl-project/sglang/tree/94602c9c2b7cbdb8efd5c52802dac6a1c180089e (retraction)
@@ -127,6 +131,8 @@ struct UnpricedPass {
     selected_ms: f64,
     /// When the language-model forward starts: after the vision encoder.
     forward_start_ms: f64,
+    /// Already-scaled vision time, retained independently of absolute timestamps.
+    vision_ms: f64,
     prefill: Option<PrefillTotals>,
     decode: Option<DecodeShape>,
     /// When the pass ends regardless of its forward: under the host loop, when
@@ -280,6 +286,9 @@ impl SglangCore {
             enable_prefix_caching,
             args.emit_kv_token_ids,
         );
+        if let Some(mamba) = config.mamba_cache {
+            kv_manager.enable_mamba_cache(mamba);
+        }
         if let Some(hicache) = args.sglang.as_ref().and_then(|sglang| sglang.hicache) {
             let block_bytes = args.block_size
                 * args
@@ -1297,9 +1306,24 @@ impl SglangCore {
             .end_ms(stream_start_ms + pass.forward_start_ms - pass.selected_ms)
             .max(self.kv_manager.host_load_end_ms());
         let forward_ms = forward_end_ms - stream_start_ms;
+        let scheduler_ms = if self.model_work_in_pass {
+            self.config.scheduler_select_time_ms
+        } else {
+            0.0
+        };
+        // The configured interval is serial to the priced work. Keep it out
+        // of forward telemetry and out of repeated pipeline stages.
+        let scheduled_end_ms = forward_end_ms + scheduler_ms;
         let mut result = pass.result;
+        result.forward_time = forward_time;
+        // Vision runs before the language forward and belongs to the same
+        // active prefill evidence. Include its already-scaled time in rank
+        // wait accounting without adding it to the simulated timeline again.
+        if pass.vision_ms > 0.0 {
+            result.forward_time.prefill += modeled_duration(pass.vision_ms, 1.0)?;
+        }
         // When this pass's forward leaves stage 0, and its time per stage.
-        let mut stage0 = Some((forward_end_ms, forward_ms));
+        let mut stage0 = Some((scheduled_end_ms, forward_ms));
         let host_launch = pass.launch.is_some();
         if let Some(launch) = pass.launch {
             let host = self
@@ -1325,7 +1349,10 @@ impl SglangCore {
         } else {
             self.last_forward_ms = Some(forward_ms);
         }
-        result.end_ms = pass.end_ms.unwrap_or(forward_end_ms);
+        result.end_ms = pass.end_ms.unwrap_or(scheduled_end_ms);
+        if scheduler_ms > 0.0 && pass.end_ms.is_none() {
+            result.end_without_selection_ms = Some(forward_end_ms);
+        }
         if self.config.pipeline_fill_passes > 0.0 {
             let ready_ms =
                 stage0.map(|(end_ms, stage_ms)| self.pipeline_ready_ms(end_ms, stage_ms));
@@ -1421,27 +1448,30 @@ impl SglangCore {
         }
 
         let admission = AdmissionInvariant::new(self.pending_destinations.has_pending());
-        let mut admit = match admission.stage_for(materialized_waiting) {
-            AdmissionStage::Materialized | AdmissionStage::PendingDestinationHead => {
-                Default::default()
-            }
-            AdmissionStage::FreshKv
-                if !defer_prefill
-                    && !(self.config.worker_type == WorkerType::Decode
-                        && self.waiting.iter().any(|request| request.retracted)) =>
-            {
-                get_new_batch_prefill(
-                    &mut self.waiting,
-                    &mut self.kv_manager,
-                    &self.config,
-                    self.new_token_ratio,
-                    &self.running,
-                    self.batch_is_full,
-                    self.source_holds.held_len() + self.inflight_source.len(),
-                )
-            }
-            // Gate the entire prefill entry point, including chunk continuation.
-            AdmissionStage::FreshKv => Default::default(),
+        let stage = admission.stage_for(materialized_waiting);
+        let can_prefill = !defer_prefill
+            && match stage {
+                AdmissionStage::Materialized => false,
+                // A chunk already owns KV that the pending destination may need.
+                AdmissionStage::PendingDestinationHead => self.waiting.has_continuation(),
+                AdmissionStage::FreshKv => {
+                    !(self.config.worker_type == WorkerType::Decode
+                        && self.waiting.iter().any(|request| request.retracted))
+                }
+            };
+        let mut admit = if can_prefill {
+            get_new_batch_prefill(
+                &mut self.waiting,
+                &mut self.kv_manager,
+                &self.config,
+                self.new_token_ratio,
+                &self.running,
+                self.batch_is_full,
+                (stage == AdmissionStage::FreshKv)
+                    .then(|| self.source_holds.held_len() + self.inflight_source.len()),
+            )
+        } else {
+            Default::default()
         };
         self.batch_is_full |= admit.batch_is_full;
 
@@ -1529,7 +1559,16 @@ impl SglangCore {
         let mut chunk_commits = Vec::new();
         for mut req in admit.can_run {
             if req.materialized_tokens < req.current_sequence_len() {
-                cache_materialized_prefix(&mut req, &mut self.kv_manager, &self.config);
+                if self.config.mamba_cache.is_some() {
+                    super::decode::commit_materialized_prefix(
+                        &mut req,
+                        &mut self.kv_manager,
+                        &self.config,
+                        &mut chunk_commits,
+                    );
+                } else {
+                    cache_materialized_prefix(&mut req, &mut self.kv_manager, &self.config);
+                }
                 if self.host.is_some() && self.kv_manager.hicache_enabled() {
                     chunk_commits.push((req.uuid, req.materialized_tokens));
                 }
@@ -1579,11 +1618,15 @@ impl SglangCore {
         let scheduled_decode_lens: Vec<u64> = if prefill_pass || skip_decode {
             Vec::new()
         } else {
-            self.running
-                .iter()
-                .filter(|req| req.pending_terminal || req.remaining_output_tokens() > 0)
-                .map(|req| req.current_sequence_len() as u64)
-                .collect()
+            // A filtered iterator has no lower size hint, so reserve the batch up front.
+            let mut lens = Vec::with_capacity(self.running.len());
+            lens.extend(
+                self.running
+                    .iter()
+                    .filter(|req| req.pending_terminal || req.remaining_output_tokens() > 0)
+                    .map(|req| req.current_sequence_len() as u64),
+            );
+            lens
         };
 
         // The prefill forward is priced later. Its first tokens take no time,
@@ -1615,6 +1658,7 @@ impl SglangCore {
         decode.end_ms += after_reclaim_ms - selected_ms;
         let selected_ms = after_reclaim_ms;
         if !prefill_pass {
+            committed_requests.reserve(decode.output_signals.len());
             // The decode step can retract requests before executing the batch.
             for signal in &decode.output_signals {
                 // Speculative bursts emit consecutive tokens for the same request.
@@ -1622,8 +1666,6 @@ impl SglangCore {
                     committed_requests.push(signal.uuid);
                 }
             }
-            committed_requests.sort_unstable();
-            committed_requests.dedup();
         }
         if let Some(host) = &mut self.host {
             // `retract_decode` marks a request before the previous forward's result is
@@ -1712,8 +1754,17 @@ impl SglangCore {
                         if let Some(index) = self.waiting.iter().position(|r| r.uuid == request_id)
                         {
                             let mut request = self.waiting.remove(index).unwrap();
-                            self.kv_manager
-                                .backup_cached_prefix(&mut request.kv_lease, tokens);
+                            if self.config.mamba_cache.is_some() {
+                                cache_prefix_through(
+                                    &mut request,
+                                    &mut self.kv_manager,
+                                    &self.config,
+                                    tokens,
+                                );
+                            } else {
+                                self.kv_manager
+                                    .backup_cached_prefix(&mut request.kv_lease, tokens);
+                            }
                             self.waiting.insert(index, request);
                         }
                         continue;
@@ -1817,6 +1868,8 @@ impl SglangCore {
         } else {
             self.publish_kv_events_if_idle();
         }
+
+        self.kv_manager.validate_mamba_capacity()?;
 
         // Build FPM snapshot now that all state has settled.
         // Radix-cache reuse: admission matches over prompt tokens processed this pass. A chunked
@@ -1925,9 +1978,11 @@ impl SglangCore {
                 .host_deadline_ms()
                 .is_some_and(|deadline| deadline > now_ms);
         let result = EnginePassResult {
+            forward_time: ForwardTime::default(),
             committed_requests,
             // The forward's end is set when it is priced; `now_ms` holds its place.
             end_ms: now_ms,
+            end_without_selection_ms: None,
             same_timestamp_retry: if defer_prefill {
                 crate::engine::generalized::SameTimestampRetry::Countdown {
                     remaining: remaining_after_round,
@@ -1962,6 +2017,7 @@ impl SglangCore {
         self.unpriced = Some(UnpricedPass {
             selected_ms,
             forward_start_ms: decode.end_ms,
+            vision_ms,
             prefill,
             decode: decode_shape,
             end_ms,

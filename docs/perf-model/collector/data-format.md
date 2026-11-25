@@ -28,6 +28,9 @@ outcomes, not reasons to remove intended coverage before collection.
 
 ## Table layout and runtime pins
 
+This is the staging layout of the collector and of the published dataset (`data/op-latency/`); the repository
+does not carry the published tables. See [Default operation data](../../reference/cli.md#default-operation-data).
+
 ```text
 python/aisim/src/aisim_core/systems/data/
   <system>/<family>/<backend>/<version>/
@@ -107,8 +110,8 @@ remain valid observed outcomes. Never infer complete model coverage from a
 failure. Legacy provenance remains explicitly legacy, not newly measured.
 
 Context-attention timing scope follows retained row identity. TRT-LLM
-`1.3.0rc20` and `1.3.0rc29` rows labeled `torch_flow` include RoPE and both
-KV-cache writes; a collector measuring a different boundary must use a distinct
+`1.3.0rc20`, `1.3.0rc29` and `1.4.0rc2` rows labeled `torch_flow` include RoPE
+and both KV-cache writes; a collector measuring a different boundary must use a distinct
 kernel identity. Unknown identities retain legacy accounting. A prepared
 context slice cannot mix retained rows with incompatible timing boundaries.
 Ignored duplicate coordinates still follow first-wins source precedence.

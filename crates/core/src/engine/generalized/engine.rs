@@ -25,6 +25,7 @@ struct PendingGroupPass<P> {
     pass_id: PassId,
     started_at_ms: f64,
     end_ms: f64,
+    idle_telemetry_end_ms: f64,
     by_rank: Vec<PendingRankPass<P>>,
 }
 
@@ -241,6 +242,7 @@ impl<C: RankEngine> GeneralizedMockerEngine<C> {
             .context("generalized engine wave step overflow")?;
 
         let mut end_ms = now_ms;
+        let mut idle_telemetry_end_ms = now_ms;
         let mut same_timestamp_retry = SameTimestampRetry::NotApplicable;
         let mut started = Vec::with_capacity(self.ranks.len());
         let mut pending = Vec::with_capacity(self.ranks.len());
@@ -265,6 +267,15 @@ impl<C: RankEngine> GeneralizedMockerEngine<C> {
         let iteration = self
             .price_group_pass(&mut scheduled)
             .map_err(|error| self.poison(error))?;
+        // Canonical whole-iteration pricing already accounts for rank wait.
+        // For phase pricing, take the forward maximum after phase speedups.
+        let wait_provider = scheduled.first().map(|&(rank, _)| rank).filter(|&rank| {
+            iteration.is_none()
+                && self.ranks.len() > 1
+                && self.ranks[rank].tracks_attention_dp_wait()
+        });
+        let mut max_forward_ns = 0;
+        let mut active_rank_ns = 0;
         for (dp_rank, pass) in scheduled {
             let pass = match pass {
                 ScheduledPass::Priced(pass) => Ok(pass),
@@ -282,6 +293,13 @@ impl<C: RankEngine> GeneralizedMockerEngine<C> {
             });
             let pass = pass.map_err(|error| self.poison(error))?;
             end_ms = end_ms.max(pass.end_ms);
+            idle_telemetry_end_ms = idle_telemetry_end_ms
+                .max(self.ranks[dp_rank].idle_telemetry_end_ms(&pass.pending, pass.end_ms));
+            if wait_provider.is_some() {
+                let forward_ns = self.ranks[dp_rank].phase_priced_forward_ns();
+                max_forward_ns = max_forward_ns.max(forward_ns);
+                active_rank_ns += forward_ns;
+            }
             same_timestamp_retry = match (same_timestamp_retry, pass.same_timestamp_retry) {
                 (
                     SameTimestampRetry::Countdown { remaining: a },
@@ -307,6 +325,15 @@ impl<C: RankEngine> GeneralizedMockerEngine<C> {
             });
         }
 
+        if let Some(rank) = wait_provider {
+            let wait_ns = max_forward_ns * self.ranks.len() as u128 - active_rank_ns;
+            if wait_ns > 0 {
+                self.ranks[rank]
+                    .record_phase_priced_wait(wait_ns as f64 / 1_000_000.0)
+                    .map_err(|error| self.poison(error))?;
+            }
+        }
+
         let any_rank_prefilled = self.ranks.iter().any(RankEngine::prefill_in_pass);
         let any_rank_ran_model = self.ranks.iter().any(RankEngine::model_work_in_pass);
         for rank in &mut self.ranks {
@@ -320,6 +347,7 @@ impl<C: RankEngine> GeneralizedMockerEngine<C> {
             pass_id,
             started_at_ms: now_ms,
             end_ms,
+            idle_telemetry_end_ms,
             by_rank: pending,
         });
         Ok(Some(EnginePassStarted {
@@ -389,9 +417,11 @@ impl<C: RankEngine> GeneralizedMockerEngine<C> {
                 continue;
             }
             let idle_effects = self.ranks[rank_index]
-                // Idle-rank FPM represents the modeled shared barrier, not a
-                // live driver's scheduling delay after that barrier elapsed.
-                .complete_idle_group_pass(pending.started_at_ms, pending.end_ms)
+                .complete_idle_group_pass_with_telemetry(
+                    pending.started_at_ms,
+                    pending.end_ms,
+                    pending.idle_telemetry_end_ms,
+                )
                 .with_context(|| {
                     format!("completing idle attention-DP rank {dp_rank} group barrier")
                 });

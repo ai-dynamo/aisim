@@ -28,7 +28,7 @@ use crate::{
 };
 
 pub(crate) fn systems_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../python/aisim/src/aisim_core/systems")
+    crate::test_systems::path("")
 }
 
 pub(crate) const TEST_MODEL: &str = "MiniMaxAI/MiniMax-M2.5";
@@ -2440,6 +2440,46 @@ fn canonical_detailed_estimate_reports_operation_graph_ranks() {
     let restored: crate::FpmRankEstimate = serde_json::from_value(legacy.clone()).unwrap();
     assert!(restored.operations.is_empty());
     assert_eq!(serde_json::to_value(&restored).unwrap(), legacy);
+}
+
+#[test]
+fn rank_energy_evidence_serde_round_trip() {
+    let legacy = serde_json::json!({
+        "rank": 0, "latency_ms": 1.0, "prefill_ms": 1.0, "decode_ms": null,
+        "decode_baseline_ms": null, "marginal_decode_ms": null, "queries": [],
+    });
+    let restored: crate::FpmRankEstimate = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(restored.prefill_energy_wms, None);
+    assert_eq!(restored.decode_energy_wms, None);
+    assert_eq!(serde_json::to_value(&restored).unwrap(), legacy);
+
+    for (prefill, decode) in [
+        (None, None),
+        (Some(0.0), None),
+        (None, Some(0.0)),
+        (Some(1250.5), Some(62.5)),
+    ] {
+        let rank = crate::FpmRankEstimate {
+            prefill_energy_wms: prefill,
+            decode_energy_wms: decode,
+            ..restored.clone()
+        };
+        let mut expected = legacy.clone();
+        for (field, energy) in [
+            ("prefill_energy_wms", prefill),
+            ("decode_energy_wms", decode),
+        ] {
+            if let Some(energy) = energy {
+                expected[field] = serde_json::json!(energy);
+            }
+        }
+        let serialized = serde_json::to_value(&rank).unwrap();
+        assert_eq!(serialized, expected);
+        assert_eq!(
+            serde_json::from_value::<crate::FpmRankEstimate>(serialized).unwrap(),
+            rank
+        );
+    }
 }
 
 #[test]

@@ -160,7 +160,11 @@ Full CI uploads `license-artifacts` for trusted PR copies and post-merge pushes
 to `main` and `release/*`. It contains `deps.csv` (Python and Rust dependency
 versions and licenses), `deps-diff.csv`, and `evidence.json` with the source and
 comparison commit identities. PR evidence compares with the validated PR base;
-post-merge evidence compares with the push's previous commit. Missing baseline
+`release/*` evidence and superseded `main` commits compare with the push's
+previous commit. Other `main` evidence compares with the last full-scope main
+commit whose prediction and license comparisons completed successfully, with a
+selection failure when no validated ancestor can be established
+([batched main validation](README.md#batched-main-validation)). Missing baseline
 inputs fail CI. Python inventories resolve runtime requirements at collection
 time on amd64/Python 3.12; they are not a wheel payload or a frozen PyPI lock.
 An unchanged Python manifest reuses the same resolution for both commits.
@@ -393,7 +397,21 @@ Set repository variable `WHEEL_STORAGE_URL` to `https://artifactory.nvidia.com/a
 | `pr-wheel-staging` | `sw-dynamo-aisimulate-pr-pypi-local` | Copied-PR CI, PR accuracy previews, and simulation comparisons (including manual comparisons launched from main) |
 | `automated-release` | `sw-dynamo-aisimulate-pypi-local` | Main/release CI, nightly builds, release FPE, and official accuracy/FPE consumers |
 
-Full CI selects the environment from the workflow ref: `main` and `release/*` use `automated-release`, while PR/source refs use `pr-wheel-staging`. Standalone FPE uses the same rule unless an explicit `pr_number` selects PR storage, including a manual dispatch from main. E2E accuracy previews use PR storage; published accuracy campaigns and their cross-run nightly downloads use official storage. The manifest records the producer's storage repository, and downloads reject a repository mismatch before making an authenticated request.
+Full CI selects the environment from the workflow ref: `main` and `release/*` use `automated-release`, while PR/source refs use `pr-wheel-staging`. Standalone FPE uses the same rule unless an explicit `pr_number` selects PR storage, including a manual dispatch from main. E2E accuracy previews use PR storage; published accuracy campaigns and their cross-run nightly downloads use official storage. The manifest records the producer's storage repository, and downloads reject a repository mismatch before making an authenticated request. The release-artifact contract now binds this ref-selected environment explicitly to download the application-test wheel.
+
+The separate Dynamo README job always binds `pr-wheel-staging`, including main
+and release refs, because the pinned RC bundle is a test dependency. Main seeds
+preview scope and verified PR heads use PR scope. Source, development, release,
+and macOS README jobs have no environment binding or storage secret references.
+The reusable README workflow declares and receives only the named
+`ARTIFACTORY_TOKEN`; its Dynamo job uses the selected environment's value and
+checks it before native compilation. These are job-binding changes; environment
+protection settings and credential grants are unchanged.
+
+Its reuse key binds the storage repository as well as build inputs. PR
+consumers can reuse trusted main RC builds with their existing test-storage
+credential; they never read the official release repository. Product/release
+artifacts retain the environment selection described above.
 
 Before enabling transfer jobs:
 
@@ -401,16 +419,20 @@ Before enabling transfer jobs:
 - Preserve branch admission: `automated-release` admits `main` and `release/*`; `pr-wheel-staging` admits trusted `pull-request/*` refs and the main/release refs used to launch manual PR comparisons. A manual PR comparison remains in PR storage even when its workflow is dispatched from main.
 - Retain objects in **both** repositories for at least as long as their Actions manifests (30 days by default; FPE/accuracy handoffs use seven days). Expired objects require a producer rebuild, not a fallback to a different wheel.
 
-The action never forwards credentials to redirects. The existing environment-scoped credential is passed only to the transfer step, and the manifest pins the producer's storage repository before any download. No credential or environment configuration is changed by the workflow code. Rollout should exercise one copied-PR build, a consumer-only rerun, and a main-branch nightly/accuracy reuse before closing infrastructure validation.
+The action never forwards credentials to redirects. The existing environment-scoped credential is referenced only by transfer steps and the Dynamo job's nonempty-credential preflight, and the manifest pins the producer's storage repository before any download. These job bindings do not change credential grants or environment protection settings. Rollout should exercise one copied-PR build, a consumer-only rerun, and a main-branch nightly/accuracy reuse before closing infrastructure validation.
 
 ### Wheel producers and retained outputs
 
 Persistent project and Dynamo wheel handoffs use Artifactory, including companion requirements, crate files, checksums, and build provenance in the same bundle. A wheel built, installed, and discarded within one job does not need a storage handoff or release credentials. Its result artifacts must select report directories rather than its build, dist, workspace, or virtual-environment directories.
 
+Historical release qualification resolves the
+selected checkout's `python/aisim` or `python/aisimulate` project directory and
+keeps its source, locked dependencies, wheel, and inventory unchanged.
+
 | Workflow | Wheel generation or consumption | Retained output / disposition |
 | --- | --- | --- |
-| `ci.yml` | Application test wheel built once; application tests and application verification reuse it; protected final staging reuses that original wheel | Artifactory `application-test-wheel-<arch>`; Actions completion manifest and reports; no duplicate wheel payload |
-| `ci.yml` same-job validation | Rust feature modes, Python compatibility, engine golden regression, and release artifact contract build/install locally | Disposable local wheel/build directories; only test/contract reports are retained |
+| `ci.yml` | Application test wheel built once; application tests, application verification, release-artifact contracts, and protected final staging reuse that original wheel | Artifactory `application-test-wheel-<arch>`; Actions completion manifest and reports; no duplicate wheel payload; release contracts still build the crate and validate both artifacts |
+| `ci.yml` same-job validation | Rust feature modes, Python compatibility, and engine golden regression build/install locally | Disposable local wheel/build directories; only test/contract reports are retained |
 | `validate-platform-wheels.yml` | Docker Linux amd64/arm64 and native macOS invoke `build-platform-wheel` | Disposable local `wheelhouse`; Actions provenance and installed-CLI JSON only |
 | `nightly-ci.yml` | Trusted release builder produces wheel/crate/checksum/provenance bundle; staged wheels are downloaded and smoke-tested | Artifactory `nightly-dist-<arch>`; Actions completion manifest and metadata reports |
 | `fpe-support-matrix.yml` | Standalone exact wheel build or nightly reuse; discovery, matrix shards, and packaging use the qualified wheel | Artifactory `fpe-qualified-wheel`; matrix/web reports remain Actions artifacts |
@@ -424,11 +446,10 @@ Persistent project and Dynamo wheel handoffs use Artifactory, including companio
 | `performance.yml` | Builds base/head wheels into separate temporary dist directories, installs and compares in the same job | Disposable local dist/venv paths; only the separate benchmark results directory is uploaded |
 | `prediction-regression-gate.yml` | Source install can build a local wheel before producing snapshots | Disposable install wheel; Actions gate snapshots and comparison reports only |
 | `collector-check.yml` | Source install can build a local wheel | Disposable install wheel; cross-backend `.md`/`.json` reports only |
-| `readme-checks.yml` | Source/development profiles perform editable installs in isolated workspaces | Disposable build/venv paths; Actions command logs, installation metadata, environment log, and harness reports only |
+| `readme-checks.yml` | Source/development/release/macOS profiles keep isolated workspaces without a storage environment; the separate Dynamo job builds or reuses a verified matching pinned RC wheel set in `pr-wheel-staging` | Artifactory `readme-rc-wheels-<build-input-hash>` for the three RC wheels and build-input record; Actions retains only its completion manifest and command/provenance reports; every README command runs afresh |
 | `accuracy-digest.yml` | No product wheel generation; consumes qualified accuracy data | Actions preview, report, and delivery-state data only |
-| `fast-ci.yml` | No product wheel producer; dependency installs/tests may create temporary fixture wheels | Actions source provenance only; fixtures are disposable |
+| `fast-ci.yml` | No product wheel producer; dependency installs and policy/ownership tests may create temporary fixture wheels | Actions source provenance only; fixtures are disposable |
 | `pages.yml` | No product wheel producer; dependencies/tests and allowlisted site packaging | Pages/site and validation data only |
-| `codeowners.yml` | No wheel generation | No wheel handoff |
 | `slack-review-digest.yml` | No wheel generation | No wheel handoff |
 
 The platform Dockerfile's legacy `aiconfigurator` migration-fixture wheel remains inside the local test build stage. The shared manylinux builder's unrepaired wheel is temporary; only its repaired caller-selected output enters a retained handoff. Simulation transfers include every wheel in the bundle, not just the AISim filename. No exported Actions or BuildKit cache is used as a wheel handoff; ordinary dependency-install caches do not change the producer/consumer storage contract.
