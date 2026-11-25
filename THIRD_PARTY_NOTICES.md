@@ -489,9 +489,10 @@ These source files are licensed under the Apache License, Version 2.0; see the
 
 ## vLLM
 
-Selected synchronous MTP scheduling, uniform full-attention KV allocation, and
-host-offload behaviors in the following repository-root paths are adapted and
-modified from vLLM `v0.32.0` at commit
+Selected synchronous MTP scheduling, uniform full-attention KV allocation,
+host-offload behaviors, and the async engine's CPU-tier load polling in the
+following repository-root paths are adapted and modified from vLLM `v0.32.0` at
+commit
 `5df63a7203cdb9328d824a27b682e77c7b9928be`:
 
 - `crates/core/src/engine/cache/vllm_block_pool.rs`
@@ -503,9 +504,10 @@ modified from vLLM `v0.32.0` at commit
 - `crates/core/src/engine/scheduler/vllm/tests.rs`
 - `crates/core/src/engine/scheduler/vllm/mtp_offload_tests.rs`
 - `crates/core/src/engine/scheduler/vllm/native_mtp_tests.rs`
-- `docs/replay/engine/kv-cache.md` (MTP with host offload)
+- `docs/replay/engine/kv-cache.md` (MTP with host offload; CPU-tier loads)
 - `docs/replay/engine/speculation.md` (MTP with host offload)
 - `docs/replay/features.md` (MTP/G2 composition boundaries)
+- `docs/replay/engine/workers.md` (CPU-tier loads)
 
 Upstream source and regression scenarios:
 
@@ -516,6 +518,13 @@ Upstream source and regression scenarios:
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/model_runner.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/kv_connector.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/kv_offload/cpu/gpu_worker.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/simple_kv_offload/copy_backend.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/simple_kv_offload/manager.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/simple_kv_offload/worker.py
 
 Copyright contributors to the vLLM project.
 
