@@ -136,10 +136,16 @@ def test_cli_rejects_npu_model_ops_before_collection(tmp_path, monkeypatch, ops)
         collect_mod.main()
 
 
-@pytest.mark.parametrize("model_args", [["--model-path", "Qwen/Qwen3-0.6B"], ["--model-cases-full"]])
+@pytest.mark.parametrize(
+    "model_args",
+    [["--model-path", "Qwen/Qwen3-0.6B"], ["--model-cases-full"], ["--model-cases", "model_cases.yaml"]],
+)
 def test_cli_npu_gemm_subset_reaches_only_npu_gemm_collection(tmp_path, monkeypatch, model_args):
     from collector import skips
 
+    (tmp_path / "model_cases.yaml").write_text(
+        "model_path: Qwen/Qwen3-0.6B\ninclude_base: false\nmodel_ops: [gemm, attention_context]\n"
+    )
     monkeypatch.setattr(collect_mod, "_cuda_available", lambda: False)
     monkeypatch.setattr(collect_mod, "_npu_available", lambda: True)
     monkeypatch.setattr(skips, "detect_sm_version", lambda: None)

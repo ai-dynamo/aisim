@@ -210,8 +210,10 @@ def run_gemm(exit_stack, gemm_type, m, n, k, *, perf_filename, device="npu:0"):
 
 
 if __name__ == "__main__":
+    from collector.framework_manifest import require_collector_runtime
     from collector.registry_types import PerfFile
 
+    require_collector_runtime("vllm_npu", vllm_ascend_version, requested_ops={"gemm"})
     test_cases = get_gemm_test_cases()
     for test_case in test_cases[:10]:
         run_gemm(*test_case, perf_filename=PerfFile.GEMM)

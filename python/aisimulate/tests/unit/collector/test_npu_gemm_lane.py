@@ -14,8 +14,9 @@ its declared shape (bf16 only, eager, npu:0, no power), not its timings.
 import functools
 import importlib
 import importlib.metadata
+import runpy
 import sys
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -201,6 +202,59 @@ def test_test_cases_are_all_bfloat16(collect_gemm_npu):
 def test_version_logged_is_the_vllm_ascend_version(collect_gemm_npu):
     """Rows and the parquet <version> directory share the manifest's axis."""
     assert collect_gemm_npu.vllm_ascend_version == "0.30.0rc2"
+
+
+@pytest.mark.parametrize("installed_version", ["0.30.0", "0.30.0rc2"])
+def test_standalone_enforces_runtime_pin_before_measurement(collect_gemm_npu, monkeypatch, installed_version):
+    """Execute the script entry point with fake hardware and the real pin validator."""
+    from collector import helper, op_plans
+
+    real_version = importlib.metadata.version
+    monkeypatch.setattr(
+        importlib.metadata,
+        "version",
+        lambda pkg: installed_version if pkg == "vllm-ascend" else real_version(pkg),
+    )
+    cases = MagicMock(return_value=[("bfloat16", 16, 32, 64)])
+    monkeypatch.setattr(op_plans, "plan_cases", cases)
+    device_module = MagicMock()
+    device_module.mem_get_info.return_value = (15929, 64 * 2**30)
+    monkeypatch.setattr(helper, "get_device_module", lambda device=None: device_module)
+    measurements = []
+
+    @contextmanager
+    def fake_benchmark(**kwargs):
+        measurements.append(kwargs)
+        kwargs["kernel_func"]()
+        yield {"latency_ms": 6.0, "used_cuda_graph": False}
+
+    monkeypatch.setattr(helper, "benchmark_with_power", fake_benchmark)
+    log = MagicMock()
+    monkeypatch.setattr(helper, "log_perf", log)
+
+    def run_standalone():
+        runpy.run_path(collect_gemm_npu.__file__, run_name="__main__")
+
+    if installed_version != "0.30.0rc2":
+        with pytest.raises(RuntimeError, match=r"vllm_npu stock collector requires exactly 0\.30\.0rc2"):
+            run_standalone()
+        cases.assert_not_called()
+        collect_gemm_npu.setup_distributed.assert_not_called()
+        device_module.set_device.assert_not_called()
+        collect_gemm_npu.torch.randn.assert_not_called()
+        collect_gemm_npu.RowParallelLinear.assert_not_called()
+        assert measurements == []
+        log.assert_not_called()
+    else:
+        run_standalone()
+        cases.assert_called_once_with("gemm", "vllm_npu", None)
+        collect_gemm_npu.setup_distributed.assert_called_once_with("npu:0")
+        collect_gemm_npu.torch.randn.assert_called_once()
+        collect_gemm_npu.RowParallelLinear.assert_called_once()
+        assert len(measurements) == 1
+        log.assert_called_once()
+        assert log.call_args.kwargs["version"] == installed_version
+        assert log.call_args.kwargs["perf_filename"] is PerfFile.GEMM
 
 
 def test_run_gemm_defaults_to_npu_0_and_refuses_other_dtypes(collect_gemm_npu):
