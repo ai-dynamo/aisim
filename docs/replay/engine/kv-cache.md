@@ -559,8 +559,10 @@ drafter KV group loads a connector hit without its last block; with
 non-speculative rules. Accepted drafts that take a G1 block a store still
 reads make the forward that writes it wait for that copy, and so does
 preempting a request whose store is in flight; a store prepared in that same
-pass delays the rank's next pass. A preempted request resumes once G1 has room
-for its tokens, its state and its next token; a shared pool, and a rank that
+pass delays the rank's next pass. A preempted request that resumes without a
+G2 load does so once G1 has room for its tokens, its state and its next token;
+one that a load restores is admitted once its restored blocks fit. A shared
+pool, and a rank that
 offloads state checkpoints, keep the G1 blocks they copy until each copy
 completes, so their stores can delay that.
 

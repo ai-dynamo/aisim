@@ -113,7 +113,7 @@ it preempted, which holds no KV while it waits to recompute. vLLM keeps
 requests that received remote KV in a queue it schedules first
 (`skipped_waiting`, `kv_holding_waiting` from v0.31.0). Under speculative
 decoding the preempted request resumes once G1 also has room for its next
-token.
+token; one that a G2 load restores is admitted without that room.
 
 The two roles may use different `attention_data` sizes. A request moves from one
 concrete prefill rank to one concrete decode rank. A trace request's
