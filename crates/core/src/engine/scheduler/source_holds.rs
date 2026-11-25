@@ -173,6 +173,14 @@ impl<T> SourceHolds<T> {
         SourceCompletion::Held { handoff_id }
     }
 
+    /// The payload of a held source.
+    pub(crate) fn held_payload_mut(&mut self, request_id: Uuid) -> Option<&mut T> {
+        let handoff_id = self.held_by_request.get(&request_id)?;
+        self.held_prefills
+            .get_mut(handoff_id)
+            .map(|(_, payload)| payload)
+    }
+
     pub(crate) fn remove(&mut self, handoff_id: HandoffId) -> RemovedSource<T> {
         if let Some((request_id, payload)) = self.held_prefills.remove(&handoff_id) {
             let removed = self.held_by_request.remove(&request_id);

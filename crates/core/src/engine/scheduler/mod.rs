@@ -275,6 +275,7 @@ pub(crate) struct AdmissionEvent {
 
 #[derive(Debug, Clone)]
 pub(crate) struct EnginePassResult {
+    pub(crate) forward_time: ForwardTime,
     pub(crate) committed_requests: Vec<Uuid>,
     pub(crate) end_ms: f64,
     /// Modeled pass boundary with serial batch selection excluded, when charged.
@@ -400,9 +401,10 @@ impl EngineCore {
         &mut self,
         registry: crate::engine::kvcr::SharedKvcrRegistry,
         rank: KvHintSource,
-    ) -> Option<HostTierHandle> {
+        gpus_per_rank: usize,
+    ) -> Option<anyhow::Result<HostTierHandle>> {
         match self {
-            Self::Vllm(core) => Some(core.set_kvcr(registry, rank)),
+            Self::Vllm(core) => Some(core.set_kvcr(registry, rank, gpus_per_rank)),
             Self::Sglang(_) => None,
         }
     }

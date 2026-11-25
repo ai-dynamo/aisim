@@ -53,24 +53,17 @@ jobs:
           set -euo pipefail
           printf 'old=%s\n' "${OLD_REF_INPUT:-main}" >> "${GITHUB_OUTPUT}"
 
-  canary:
-    uses: ./.github/workflows/runner-canary.yml
-
   collect:
     name: Collect prediction snapshot (${{ matrix.side }})
-    needs: [refs, canary]
-    runs-on: prod-aisim-default-amd64-v1
+    needs: refs
+    # Builds from source with no NVIDIA-internal dependency. The two sides may
+    # run on different hosted CPU models; only status regressions block.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
-    env:
-      HOME: /__w/aisim/aisim
     strategy:
       fail-fast: false
       matrix:
         side: [old, new]
-    container:
-      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
-      env:
-        USER: runner
     steps:
       - name: Checkout comparison revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

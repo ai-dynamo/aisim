@@ -17,6 +17,7 @@ from pathlib import Path
 PATH_PATTERNS = (
     ".github/workflows/performance.yml",
     "scripts/performance/select_forward_perf.py",
+    "scripts/performance/prefetch_op_latency.py",
     "Cargo.toml",
     "Cargo.lock",
     "crates/core/Cargo.toml",
@@ -44,6 +45,10 @@ PATH_PATTERNS = (
     "python/aisim/tools/forward_perf_gate/*.py",
     "python/aisim/tools/prediction_regression_gate/grid.py",
 )
+
+# Automatic comparisons benchmark only ready PRs that can merge into a branch
+# Full CI accepts; drafts and stacked PRs keep manual dispatch.
+MERGE_TARGET = re.compile(r"main|release/[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 def matches_path(path: str) -> bool:
@@ -99,10 +104,21 @@ def select_comparison(
         sha = api(f"repos/{repository}/git/ref/heads/pull-request/{pr_number}")[0]["object"]["sha"]
     if not re.fullmatch(r"[0-9a-f]{40}", sha) or sha != pull["head"]["sha"]:
         raise ValueError(f"Trusted copy {sha} does not match PR #{pr_number} head {pull['head']['sha']}")
+    if not isinstance(pull["draft"], bool):
+        raise ValueError(f"Invalid draft state for PR #{pr_number}")
 
     run = True
     if event == "workflow_dispatch":
         reason = "Manual dispatch requests a comparison."
+    elif pull["draft"]:
+        run = False
+        reason = "PR is a draft; automatic comparisons skip drafts. Dispatch manually with pr_number to compare."
+    elif not MERGE_TARGET.fullmatch(pull["base"]["ref"]):
+        run = False
+        reason = (
+            f"PR targets `{pull['base']['ref']}`, not main or release/*; automatic comparisons skip "
+            "stacked PRs. Dispatch manually with pr_number to compare."
+        )
     elif pull["changed_files"] > 3000:
         reason = "PR exceeds the file API limit; run conservatively."
     else:

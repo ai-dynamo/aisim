@@ -175,8 +175,8 @@ class SchedulerPredictionConfig(StrictModel):
         default=None,
         description=(
             "vLLM only: model vLLM's --async-scheduling, under which an arrival at a busy engine misses the "
-            "batch vLLM has already queued. Unset uses vLLM's default: on, except with ngram drafts "
-            "or MTP with G2 host offload."
+            "batch vLLM has already queued. Replay defaults to async scheduling unless it uses ngram drafts "
+            "or combines MTP and G2 host offload without a recurrent state cache."
         ),
     )
     load_balance_method: Literal["round_robin", "total_tokens"] = Field(
@@ -190,7 +190,10 @@ class SchedulerPredictionConfig(StrictModel):
         default=None,
         description=(
             "vLLM aggregated workers with async scheduling only: CPU launch costs of vLLM's engine loop. A pass's "
-            "outputs then leave once the next pass is launched, and an arrival joins the first pass decided after it."
+            "outputs then leave once the next pass is launched, and an arrival joins the first pass decided after it. "
+            "With an offloading_v0_32 or simple_cpu_v0_32 CPU tier, a finished load is admitted only after vLLM "
+            "(Model Runner V2) polls the connector. With MTP and G2, launch timing requires a recurrent state cache "
+            "and disable_eagle_block_drop=true."
         ),
     )
 
@@ -283,11 +286,46 @@ class G3OffloadConfig(StrictModel):
     shared_write_bandwidth_gbps: NonNegativeFloat = 80.0
 
 
+class KvcrLocalG2Config(StrictModel):
+    """Host memory KVCR owns on each rank, behind the rank's own G2."""
+
+    num_blocks: PositiveU64
+    policy: Literal["lru", "fifo"] = "lru"
+    copy_bandwidth_gbps: NonNegativeFloat = 6.0
+
+
+class KvcrG3Config(StrictModel):
+    """Local disk KVCR owns on each rank, behind its memory (`local_g2`)."""
+
+    num_blocks: PositiveU64
+    latency_to_first_byte_ms: NonNegativeFloat = 3.0
+    read_bandwidth_gbps: NonNegativeFloat = 5.0
+    write_bandwidth_gbps: NonNegativeFloat = 0.8
+    spill_timeout_ms: PositiveFloat = 1000.0
+
+
 class KvcrConfig(StrictModel):
     """KVCR peer G2 fetch: pull a hinted prefix from another rank's private G2."""
 
     latency_to_first_byte_ms: NonNegativeFloat = 1.0
-    bandwidth_gbps: NonNegativeFloat = 50.0
+    bandwidth_gbps: NonNegativeFloat = 32.0
+    local_g2: KvcrLocalG2Config | None = None
+    g3: KvcrG3Config | None = None
+
+    @model_validator(mode="after")
+    def _g3_needs_local_g2(self) -> KvcrConfig:
+        if self.g3 is not None and self.local_g2 is None:
+            raise ValueError("kvcr.g3 requires kvcr.local_g2")
+        return self
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_tiers(self, handler: Any) -> dict[str, Any]:
+        # Keep the peer-fetch-only descriptor shape unless KVCR owns storage.
+        payload = handler(self)
+        for name in ("local_g2", "g3"):
+            if payload.get(name) is None:
+                payload.pop(name, None)
+        return payload
 
 
 def manual_block_bytes(block_size: int | None, bytes_per_token: int | str) -> int:
@@ -779,6 +817,7 @@ class WorkerPredictionConfig(StrictModel):
     kv_cache: KvCachePredictionConfig = Field(default_factory=KvCachePredictionConfig)
     timing: TimingConfig = Field(default_factory=TimingConfig)
     startup_seconds: float = Field(default=0.0, ge=0.0)
+    wait_power_w: NonNegativeFloat | None = None
 
 
 def _frontend_implies_host_loop(value: Any) -> Any:
@@ -1024,6 +1063,17 @@ class TokenizationConfig(StrictModel):
     per_input_token_us: NonNegativeFloat = 0.0
 
 
+class ExtraCpuOverheadConfig(StrictModel):
+    """Unqueued serving-path CPU time before the engine: HTTP receive and first-chunk work."""
+
+    base_ms: NonNegativeFloat = 0.0
+    per_input_token_us: NonNegativeFloat = 0.0
+
+    @property
+    def active(self) -> bool:
+        return bool(self.base_ms or self.per_input_token_us)
+
+
 class DetokenizationConfig(StrictModel):
     workers: PositiveInt = 1
     base_ms: NonNegativeFloat = 0.0
@@ -1204,6 +1254,7 @@ class EnginePredictionConfig(EstimatorPolicyConfig):
     workers: WorkersPredictionConfig = Field(default_factory=WorkersPredictionConfig)
     kv_transfer: KvTransferConfig | None = None
     tokenization: TokenizationConfig | None = None
+    extra_cpu_overhead: ExtraCpuOverheadConfig | None = None
     detokenization: DetokenizationConfig | None = None
 
     @field_validator("model", "hardware")
@@ -1235,19 +1286,25 @@ class EnginePredictionConfig(EstimatorPolicyConfig):
         _validate_worker_hardware(modes={self.mode}, workers=self.workers)
         if self.tokenization is not None and (has_afd(self.workers) or self.workers.encoder is not None):
             raise ValueError("engine.tokenization requires token replay; AFD and analytical EPD are unsupported")
+        extra_cpu_overhead_active = self.extra_cpu_overhead is not None and self.extra_cpu_overhead.active
+        if extra_cpu_overhead_active and (has_afd(self.workers) or self.workers.encoder is not None):
+            raise ValueError("engine.extra_cpu_overhead requires token replay; AFD and analytical EPD are unsupported")
         if (
             self.detokenization is not None
             and self.detokenization.active
             and (has_afd(self.workers) or self.workers.encoder is not None)
         ):
             raise ValueError("engine.detokenization requires token replay; AFD and analytical EPD are unsupported")
-        if self.tokenization is not None and any(
+        if (self.tokenization is not None or extra_cpu_overhead_active) and any(
             worker is not None
             and not is_afd_worker(worker)
             and (worker.frontend is not None or worker.host_profile is not None)
             for worker in (self.workers.aggregated, self.workers.prefill)
         ):
-            raise ValueError("engine.tokenization and SGLang frontend stages both price request tokenization; use one")
+            raise ValueError(
+                "engine.tokenization, engine.extra_cpu_overhead and SGLang frontend stages all price "
+                "request-path CPU time; use one"
+            )
         _validate_afd_workers(self)
         _validate_worker_roles(modes={self.mode}, workers=self.workers, has_transfer=self.kv_transfer is not None)
         _validate_decode_radix_cache(
@@ -1658,6 +1715,12 @@ def _validate_fpm_profile(engine, modes: set[str], backends: set[str]) -> None:
                         prefix_match_unit=cache.prefix_match_unit,
                         max_batched_tokens=worker.scheduler.max_batched_tokens,
                     )
+                    # Only a prediction states the interval. The search space and the onboarding plan run with 1.
+                    if backend_version == "0.33.0" and worker.scheduler.prefill_schedule_interval != 1:
+                        raise ValueError(
+                            "grouped prefix caching on vLLM 0.33.0 requires prefill_schedule_interval=1; vLLM 0.33.0 "
+                            "holds prefills at attention DP size 1 too, and replay does not model that"
+                        )
                 if cache.host_offload is not None or cache.g3_offload is not None:
                     raise ValueError("grouped FPM cache supports only HBM; host and G3 offload are unsupported")
                 if cache.capacity.type == "fixed" or cache.bytes_per_token != "auto":
@@ -1673,7 +1736,7 @@ def _validate_fpm_profile(engine, modes: set[str], backends: set[str]) -> None:
 
 
 # The vLLM versions whose grouped prefix-caching rules the Rust rule table holds.
-GROUPED_PREFIX_CACHING_VERSIONS = ("0.31.0", "0.32.0")
+GROUPED_PREFIX_CACHING_VERSIONS = ("0.31.0", "0.32.0", "0.33.0")
 
 
 def grouped_prefix_caching_requirements(
@@ -1696,7 +1759,7 @@ def grouped_prefix_caching_requirements(
     if memory is None or memory.enable_prefix_caching is not True or memory.hash_block_size_tokens is None:
         raise ValueError(f"grouped FPM cache requires {field}=false for cold replay")
     if backend_version not in GROUPED_PREFIX_CACHING_VERSIONS:
-        raise ValueError("grouped FPM cache prefix caching is modeled for vLLM 0.31.0 and 0.32.0 only")
+        raise ValueError("grouped FPM cache prefix caching is modeled for vLLM 0.31.0, 0.32.0 and 0.33.0 only")
     # Replay applies the grouped rules of the label, so evidence that a runtime of another version recorded is refused.
     # A profile imported before the field existed passes as before.
     if memory.runtime_framework_version is not None and memory.runtime_framework_version != backend_version:

@@ -412,7 +412,7 @@ impl AfdForwardPassPerfModel {
         // Architecture gate: reject models whose stages/residency cannot be
         // split across A/F pools before compilation turns them into
         // confusing partition errors.
-        let (architecture, shape) = pyo3::Python::with_gil(|py| {
+        let (architecture, shape) = pyo3::Python::attach(|py| {
             use pyo3::prelude::PyAnyMethods;
             let module = py.import("aisim_core.sdk.models.afd")?;
             let info = module
@@ -1152,7 +1152,7 @@ mod tests {
     /// Repo systems root (committed parquet data), mirroring the readiness
     /// tests' CARGO_MANIFEST_DIR-relative access.
     fn systems_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../python/aisim/src/aisim_core/systems")
+        crate::test_systems::path("")
     }
 
     fn golden_dir() -> PathBuf {

@@ -11,7 +11,8 @@ bytes or a runtime cache allocation. Provenance records how values were obtained
 from __future__ import annotations
 
 import json
-from typing import Annotated, Any, Literal
+from collections.abc import Sequence
+from typing import Annotated, Any, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer, model_validator
 
@@ -25,6 +26,61 @@ _MUTABLE_REFERENCES = {"main", "master", "head", "latest", "current", "unknown",
 
 class _ProfileModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
+
+
+def _cache_group_schema(schema: dict[str, Any]) -> None:
+    # _window checks this for the Rust text; the exported schema must reject the same sidecar.
+    schema.setdefault("allOf", []).append(
+        {
+            "if": {"properties": {"kind": {"const": "state"}}, "required": ["kind"]},
+            "then": {
+                "required": ["blocks_per_request"],
+                "properties": {
+                    "blocks_per_request": {"type": "integer", "exclusiveMinimum": 0},
+                    "sliding_window": {"type": "null"},
+                },
+            },
+            "else": {
+                "properties": {
+                    "blocks_per_request": {"type": "null"},
+                    "prefill_checkpoint_blocks": {"type": "null"},
+                }
+            },
+        }
+    )
+    schema["allOf"].append(
+        {
+            "if": {"properties": {"kind": {"const": "convolution"}}, "required": ["kind"]},
+            "then": {"required": ["sliding_window"], "properties": {"sliding_window": {"type": "integer"}}},
+        }
+    )
+    schema["allOf"].append(
+        {
+            "if": {
+                "properties": {"prefill_checkpoint_alignment": {"type": "integer"}},
+                "required": ["prefill_checkpoint_alignment"],
+            },
+            "then": {
+                "required": ["prefill_checkpoint_blocks"],
+                "properties": {"prefill_checkpoint_blocks": {"const": 1}},
+            },
+        }
+    )
+
+
+def _runtime_or_declared_schema(schema: dict[str, Any]) -> None:
+    # _exact_total rejects runtime_memory beside any declared non-KV byte field, zero included.
+    schema.setdefault("allOf", []).append(
+        {
+            "if": {"properties": {"runtime_memory": {"type": "object"}}, "required": ["runtime_memory"]},
+            "then": {
+                "properties": {
+                    name: {"type": "null"}
+                    for name in ("weights_bytes", "activations_bytes", "runtime_overhead_bytes", "comm_overhead_bytes")
+                }
+            },
+        }
+    )
 
 
 class FpmCacheGroup(_ProfileModel):
@@ -69,6 +125,8 @@ class FpmCacheGroup(_ProfileModel):
     ``prefill_checkpoint_alignment`` (positive, with one checkpoint block) are
     the prefill checkpoint settings of a Mamba spec.
     """
+
+    model_config = ConfigDict(extra="forbid", strict=True, json_schema_extra=_cache_group_schema)
 
     name: _Nonempty
     kind: Literal["attention", "convolution", "state"]
@@ -135,7 +193,7 @@ class FpmRuntimeMemoryProfile(_ProfileModel):
     ran with. Selection and sizing do not read them. Grouped prefix caching
     needs ``enable_prefix_caching`` true and ``hash_block_size_tokens``, and
     replay then hashes prompts in blocks of ``hash_block_size_tokens``. Replay models grouped prefix
-    caching for vLLM 0.31.0 and 0.32.0 only. For a linear profile, the
+    caching for vLLM 0.31.0, 0.32.0 and 0.33.0 only. For a linear profile, the
     simulated deployment decides prefix caching.
     """
 
@@ -149,7 +207,8 @@ class FpmRuntimeMemoryProfile(_ProfileModel):
     hash_block_size_tokens: Annotated[int, Field(le=2**32 - 1)] | None = None
     # The version of the runtime that observed the cache group evidence. It can differ from the deployment's
     # backend_version, which is a dataset label.
-    runtime_framework_version: str | None = None
+    # _prefix_caching owns the validation order and error text shared with Rust; export its nonblank rule too.
+    runtime_framework_version: Annotated[str, Field(json_schema_extra={"minLength": 1, "pattern": r"\S"})] | None = None
 
     @model_validator(mode="after")
     def _prefix_caching(self) -> FpmRuntimeMemoryProfile:
@@ -198,6 +257,48 @@ class FpmMambaCache(_ProfileModel):
         return self
 
 
+def _resource_layout_schema(schema: dict[str, Any]) -> None:
+    """Export the structural layout requirements also enforced by _exact_total."""
+    layouts = {
+        "linear": {
+            "required": ["kv_bytes_per_token"],
+            "properties": {"kv_bytes_per_token": {"type": "integer"}, "cache_groups": {"maxItems": 0}},
+        },
+        "grouped": {
+            "required": ["cache_groups"],
+            "properties": {"cache_groups": {"minItems": 1}, "kv_bytes_per_token": {"type": "null"}},
+        },
+        "unmodeled": {
+            "required": ["runtime_memory"],
+            "properties": {
+                "runtime_memory": {"type": "object"},
+                "kv_bytes_per_token": {"type": "null"},
+                "cache_groups": {"maxItems": 0},
+            },
+        },
+        "mamba_align": {
+            "required": ["runtime_memory", "mamba_cache"],
+            "properties": {
+                "runtime_memory": {"type": "object"},
+                "mamba_cache": {"type": "object"},
+                "kv_bytes_per_token": {"type": "null"},
+                "cache_groups": {"maxItems": 0},
+            },
+        },
+    }
+    for layout, constraints in layouts.items():
+        if layout != "mamba_align":
+            constraints["properties"]["mamba_cache"] = {"type": "null"}
+    schema["allOf"] = [
+        {
+            "if": {"properties": {"cache_layout": {"const": layout}}, "required": ["cache_layout"]},
+            "then": constraints,
+        }
+        for layout, constraints in layouts.items()
+    ]
+    _runtime_or_declared_schema(schema)
+
+
 class FpmResourceProfile(_ProfileModel):
     """Rank-local cache geometry and optional memory evidence.
 
@@ -206,6 +307,8 @@ class FpmResourceProfile(_ProfileModel):
     non-KV bytes establish conservative bounds and exclude separate CUDA graph
     reservations. Runtime capacity instead requires the exact recorded settings.
     """
+
+    model_config = ConfigDict(json_schema_extra=_resource_layout_schema)
 
     weights_bytes: _Bytes | None = None
     activations_bytes: _Bytes | None = None
@@ -216,8 +319,8 @@ class FpmResourceProfile(_ProfileModel):
     cache_layout: Literal["linear", "grouped", "unmodeled", "mamba_align"]
     cache_groups: list[FpmCacheGroup] = Field(default_factory=list)
     mamba_cache: FpmMambaCache | None = None
-    max_num_tokens: _PositiveInt
-    max_batch_size: _PositiveInt
+    max_num_tokens: Annotated[int, Field(gt=0, le=2**32 - 1)]
+    max_batch_size: Annotated[int, Field(gt=0, le=2**32 - 1)]
     provenance: _Nonempty
 
     @model_validator(mode="after")
@@ -334,7 +437,7 @@ class FpmSpeculativeExecutionProfile(_ProfileModel):
         return value
 
 
-class FpmDeploymentProfile(_ProfileModel):
+class _FpmTimingDeploymentProfile(_ProfileModel):
     """One hardware, runtime, topology, precision and optional serving-role identity."""
 
     system: _Nonempty
@@ -360,7 +463,9 @@ class FpmDeploymentProfile(_ProfileModel):
     # Absent in historical shared profiles; never infer role-specific evidence.
     worker_type: Literal["prefill", "decode", "aggregated"] | None = None
     execution_profile: FpmSpeculativeExecutionProfile | None = None
-    resources: FpmResourceProfile
+    # Identity and timing can be validated before cache geometry is collected.
+    resources: FpmResourceProfile | None = None
+    resources_source: Literal["user", "metadata"] = "user"
 
     @model_serializer(mode="wrap")
     def _preserve_legacy_identity(self, handler):
@@ -369,7 +474,20 @@ class FpmDeploymentProfile(_ProfileModel):
             result.pop("worker_type", None)
         if self.execution_profile is None:
             result.pop("execution_profile", None)
+        if self.resources is None:
+            result.pop("resources", None)
+        if self.resources_source == "user":
+            result.pop("resources_source", None)
         return result
+
+    def require_resources(self) -> FpmResourceProfile:
+        """Require cache geometry at the memory/replay boundary, never invent it for timing."""
+        if self.resources is None:
+            raise ValueError(
+                "FPM resources are pending; supply cache_layout, max_num_tokens, max_batch_size, provenance, "
+                "and kv_bytes_per_token (linear) or cache_groups (grouped) before cache sizing or replay"
+            )
+        return self.resources
 
     @field_validator("pp", "cp", mode="before")
     @classmethod
@@ -398,7 +516,7 @@ class FpmDeploymentProfile(_ProfileModel):
         return value
 
     @model_validator(mode="after")
-    def _deployment_identity(self) -> FpmDeploymentProfile:
+    def _deployment_identity(self) -> _FpmTimingDeploymentProfile:
         if self.execution_profile is not None and not (
             self.dp == 1 and self.pp == 1 and self.cp == 1 and self.moe_ep == 1 and self.moe_tp in (1, self.tp)
         ):
@@ -466,6 +584,12 @@ class FpmDeploymentProfile(_ProfileModel):
                     f"FPM profile identity conflict: {name}={supplied!r}, profile={expected!r}; "
                     "use matching measured precision and backend settings"
                 )
+
+
+class FpmDeploymentProfile(_FpmTimingDeploymentProfile):
+    """A complete deployment for resource-dependent configuration consumers."""
+
+    resources: FpmResourceProfile
 
 
 class FpmModelProfile(_ProfileModel):
@@ -541,34 +665,71 @@ class FpmModelProfile(_ProfileModel):
         cp_size: int = 1,
         worker_type: str = "aggregated",
     ) -> FpmDeploymentProfile:
-        if worker_type not in ("prefill", "decode", "aggregated"):
-            raise ValueError("worker_type must be prefill, decode, or aggregated")
-        if model != self.model:
-            raise ValueError(f"FPM profile model identity mismatch: requested {model!r}, profile={self.model!r}")
-        shape = (
-            tp_size,
-            pp_size,
-            attention_dp_size,
-            1 if moe_tp_size is None else moe_tp_size,
-            1 if moe_ep_size is None else moe_ep_size,
-            cp_size,
+        return _select_deployment(
+            self,
+            self.deployments,
+            model=model,
+            system=system,
+            backend=backend,
+            backend_version=backend_version,
+            tp_size=tp_size,
+            pp_size=pp_size,
+            attention_dp_size=attention_dp_size,
+            moe_tp_size=moe_tp_size,
+            moe_ep_size=moe_ep_size,
+            cp_size=cp_size,
+            worker_type=worker_type,
         )
-        if any(type(value) is not int or value <= 0 for value in shape):
-            raise ValueError("FPM deployment dimensions must be positive integers, not booleans")
-        for deployment in self.deployments:
-            if (
-                deployment.system == system
-                and deployment.backend == backend
-                and deployment.backend_version == backend_version
-                and deployment.parallel_tuple == shape
-                and deployment.worker_type in (None, worker_type)
-            ):
-                return deployment
-        raise ValueError(
-            f"no matching FPM deployment profile for {model!r}, {system}/{backend}/{backend_version}, "
-            f"(tp,pp,dp,moe_tp,moe_ep,cp)={shape}, worker_type={worker_type}; "
-            "provide explicit resources and precision for that deployment"
-        )
+
+
+_D = TypeVar("_D", bound=_FpmTimingDeploymentProfile)
+
+
+def _select_deployment(
+    profile: FpmModelProfile,
+    deployments: Sequence[_D],
+    *,
+    model: str,
+    system: str,
+    backend: str,
+    backend_version: str | None,
+    tp_size: int = 1,
+    pp_size: int = 1,
+    attention_dp_size: int = 1,
+    moe_tp_size: int | None = None,
+    moe_ep_size: int | None = None,
+    cp_size: int = 1,
+    worker_type: str = "aggregated",
+) -> _D:
+    """Pick the deployment for one topology and role; the return type follows the deployment type."""
+    if worker_type not in ("prefill", "decode", "aggregated"):
+        raise ValueError("worker_type must be prefill, decode, or aggregated")
+    if model != profile.model:
+        raise ValueError(f"FPM profile model identity mismatch: requested {model!r}, profile={profile.model!r}")
+    shape = (
+        tp_size,
+        pp_size,
+        attention_dp_size,
+        1 if moe_tp_size is None else moe_tp_size,
+        1 if moe_ep_size is None else moe_ep_size,
+        cp_size,
+    )
+    if any(type(value) is not int or value <= 0 for value in shape):
+        raise ValueError("FPM deployment dimensions must be positive integers, not booleans")
+    for deployment in deployments:
+        if (
+            deployment.system == system
+            and deployment.backend == backend
+            and deployment.backend_version == backend_version
+            and deployment.parallel_tuple == shape
+            and deployment.worker_type in (None, worker_type)
+        ):
+            return deployment
+    raise ValueError(
+        f"no matching FPM deployment profile for {model!r}, {system}/{backend}/{backend_version}, "
+        f"(tp,pp,dp,moe_tp,moe_ep,cp)={shape}, worker_type={worker_type}; "
+        "provide explicit resources and precision for that deployment"
+    )
 
 
 def load_fpm_profile(value: dict[str, Any] | str | FpmModelProfile) -> FpmModelProfile:
@@ -577,3 +738,48 @@ def load_fpm_profile(value: dict[str, Any] | str | FpmModelProfile) -> FpmModelP
     if isinstance(value, str):
         value = json.loads(value)
     return FpmModelProfile.model_validate(value)
+
+
+class _FpmTimingModelProfile(FpmModelProfile):
+    """Internal timing admission keeps full identity while allowing pending resources."""
+
+    deployments: Annotated[list[_FpmTimingDeploymentProfile], Field(min_length=1)]
+
+    def select(  # type: ignore[override]  # pending resources: callers must check ``resources``
+        self,
+        *,
+        model: str,
+        system: str,
+        backend: str,
+        backend_version: str | None,
+        tp_size: int = 1,
+        pp_size: int = 1,
+        attention_dp_size: int = 1,
+        moe_tp_size: int | None = None,
+        moe_ep_size: int | None = None,
+        cp_size: int = 1,
+        worker_type: str = "aggregated",
+    ) -> _FpmTimingDeploymentProfile:
+        return _select_deployment(
+            self,
+            self.deployments,
+            model=model,
+            system=system,
+            backend=backend,
+            backend_version=backend_version,
+            tp_size=tp_size,
+            pp_size=pp_size,
+            attention_dp_size=attention_dp_size,
+            moe_tp_size=moe_tp_size,
+            moe_ep_size=moe_ep_size,
+            cp_size=cp_size,
+            worker_type=worker_type,
+        )
+
+
+def _load_fpm_timing_profile(value: dict[str, Any] | str | FpmModelProfile) -> _FpmTimingModelProfile:
+    if isinstance(value, FpmModelProfile):
+        value = value.model_dump(mode="json")
+    if isinstance(value, str):
+        value = json.loads(value)
+    return _FpmTimingModelProfile.model_validate(value)

@@ -1,0 +1,395 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""FPM entry checks for dataset validation (a later ``aisim data validate`` calls these).
+
+Each function returns findings and never raises for a bad entry, so a validator can report them all:
+
+* :func:`check_fpm_entry`: the required roles are present exactly once, and the library and its sidecar match the
+  entry manifest (size, SHA-256, row count, sidecar ``parquet_sha256`` and ``row_count``, optional ``resources``).
+* :func:`check_fpm_identities`: one identity (model, hardware, framework, version, parallelism, precision) maps to
+  at most one entry.
+* :func:`check_fpm_dataset`: both checks over every entry of a local dataset root.
+"""
+
+from __future__ import annotations
+
+import json
+from collections import defaultdict
+from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
+from pydantic import ValidationError
+
+from aisim_core.data import Manifest, _file, _verify, configuration_id
+from aisim_core.data.fpm_library import (
+    EVALUATION_ROLES,
+    LIBRARY_SCHEMA_ID,
+    MAX_WORKLOAD_COORDINATE,
+    NATIVE_REQUIRED_COLUMNS,
+    ROLE_LIBRARY,
+    ROLE_METADATA,
+    FpmContractError,
+    FpmMeasurementManifest,
+    check_effective_measurement_policy,
+    check_library_model,
+    read_library_metadata,
+    recover_reconstructed_metadata,
+)
+
+ROLE_LEGACY_PROFILE = "fpm-profile"
+
+
+@dataclass(frozen=True)
+class FpmFinding:
+    code: str  # stable identifier, e.g. "missing-role"
+    path: str  # manifest path the finding belongs to
+    message: str
+
+    def __str__(self) -> str:
+        return f"{self.path}: [{self.code}] {self.message}"
+
+
+def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: bool = False) -> list[FpmFinding]:
+    """Check one entry manifest against the files under ``root``.
+
+    Prediction-tier files (library and sidecar) are always verified. Evaluation-tier files are verified only with
+    ``include_measurements``; a default fetch does not download them.
+    """
+    root = Path(root)
+    found: list[FpmFinding] = []
+
+    def add(code: str, message: str) -> None:
+        found.append(FpmFinding(code, manifest_path, message))
+
+    try:
+        manifest = Manifest.model_validate_json(_file(root, manifest_path).read_bytes())
+        expected_id = configuration_id(manifest.category, manifest.purpose, manifest.identity)
+    except (OSError, ValueError, ValidationError) as exc:
+        return [FpmFinding("invalid-manifest", manifest_path, str(exc).splitlines()[0])]
+    if manifest.category != "fpm":
+        add("wrong-category", f"expected category fpm, got {manifest.category!r}")
+    if manifest.purpose != "execution-profile":
+        add("wrong-purpose", f"expected purpose execution-profile, got {manifest.purpose!r}")
+    if manifest.configuration_id != expected_id:
+        add("configuration-identity", "configuration_id does not match the manifest identity")
+    for name in ("artifact_id", "path", "runtime_path"):  # the structure the loader requires
+        values = [getattr(a, name) for a in manifest.artifacts if getattr(a, name) is not None]
+        if len(values) != len(set(values)):
+            add("duplicate-artifact", f"duplicate artifact {name}")
+    by_role = defaultdict(list)
+    for artifact in manifest.artifacts:
+        by_role[artifact.role].append(artifact)
+    if not by_role.get(ROLE_LIBRARY) and not by_role.get(ROLE_METADATA) and by_role.get(ROLE_LEGACY_PROFILE):
+        # The older execution-profile bundle, with the same opt-in measurement checks as libraries.
+        if len(by_role[ROLE_LEGACY_PROFILE]) != 1:
+            add("duplicate-role", f"role {ROLE_LEGACY_PROFILE!r} must appear exactly once")
+        for artifact in manifest.artifacts:
+            if not include_measurements and artifact.role in EVALUATION_ROLES:
+                continue
+            try:
+                verified = _verify(root, artifact)
+            except (OSError, ValueError) as exc:
+                add("hash-mismatch", f"{artifact.role}: {exc}")
+                continue
+            if artifact.role == "measurement-manifest":
+                try:
+                    _check_measurement_manifest(verified, artifact.format)
+                except (OSError, ValueError) as exc:
+                    add("invalid-measurement-manifest", str(exc))
+            if artifact.role == ROLE_LEGACY_PROFILE:
+                from aisim_core.fpm_profile import load_fpm_profile
+
+                try:
+                    if artifact.format != "json":
+                        raise ValueError("fpm-profile artifact must be JSON")
+                    load_fpm_profile(verified.read_text())
+                except (OSError, ValueError) as exc:
+                    add("invalid-profile", f"{artifact.role}: {str(exc).splitlines()[0]}")
+        return found
+    for role in (ROLE_LIBRARY, ROLE_METADATA):
+        count = len(by_role.get(role, ()))
+        if count != 1:
+            add(
+                "missing-role" if count == 0 else "duplicate-role",
+                f"role {role!r} must appear exactly once, found {count}",
+            )
+    if by_role.get("measurement-data") and not by_role.get("measurement-manifest"):
+        add("missing-role", "role 'measurement-manifest' is required when 'measurement-data' is present")
+    library = next(iter(by_role.get(ROLE_LIBRARY, [])), None)
+    sidecar = next(iter(by_role.get(ROLE_METADATA, [])), None)
+    if len(by_role.get(ROLE_LIBRARY, [])) != 1 or len(by_role.get(ROLE_METADATA, [])) != 1:
+        return found
+
+    if library.artifact_schema != LIBRARY_SCHEMA_ID:
+        add("library-schema", f"library schema {library.artifact_schema!r}; supported: {LIBRARY_SCHEMA_ID!r}")
+    if library.format != "parquet" or library.rows is None:
+        add("library-declaration", "fpm-library must declare format='parquet' and a row count")
+        return found
+    checked = [library, sidecar]
+    if include_measurements:
+        checked += [a for role in EVALUATION_ROLES for a in by_role.get(role, [])]
+    for artifact in checked:
+        try:
+            verified = _verify(root, artifact)
+        except (OSError, ValueError) as exc:
+            add("hash-mismatch", f"{artifact.role}: {exc}")
+            continue
+        if artifact.role == "measurement-manifest":
+            try:
+                _check_measurement_manifest(verified, artifact.format)
+            except (OSError, ValueError) as exc:
+                add("invalid-measurement-manifest", str(exc))
+    if any(f.code == "hash-mismatch" for f in found):
+        return found
+    try:
+        columns = set(pq.ParquetFile(_file(root, library.path)).schema_arrow.names)
+    except (OSError, ValueError) as exc:
+        add("library-columns", f"cannot read the library columns: {exc}")
+        columns = None
+    if columns is not None and (absent := [c for c in NATIVE_REQUIRED_COLUMNS if c not in columns]):
+        add("library-columns", f"library lacks columns the native loader requires: {', '.join(absent)}")
+    coordinate_minima = {"batch_size": 1, "total_prefill_tokens": 0, "total_kv_read_tokens": 0}
+    if columns is not None and coordinate_minima.keys() <= columns:
+        try:
+            # Publication validation only: stream the coordinate columns with bounded memory.
+            parquet = pq.ParquetFile(_file(root, library.path))
+            for batch in parquet.iter_batches(batch_size=4096, columns=list(coordinate_minima)):
+                for name, minimum in coordinate_minima.items():
+                    values = batch.column(name)
+                    if (
+                        not pa.types.is_integer(values.type)
+                        or values.null_count
+                        or pc.any(pc.less(values, minimum)).as_py()
+                        or pc.any(pc.greater(values, MAX_WORKLOAD_COORDINATE)).as_py()
+                    ):
+                        raise ValueError(f"{name} must contain integers in [{minimum}, {MAX_WORKLOAD_COORDINATE}]")
+        except (OSError, ValueError) as exc:
+            add("library-coordinates", str(exc))
+    if columns is not None and "latency_ms" in columns:
+        try:
+            parquet = pq.ParquetFile(_file(root, library.path))
+            for batch in parquet.iter_batches(batch_size=4096, columns=["latency_ms"]):
+                values = batch.column("latency_ms")
+                if (
+                    not (pa.types.is_integer(values.type) or pa.types.is_floating(values.type))
+                    or values.null_count
+                    or pc.any(pc.invert(pc.and_(pc.is_finite(values), pc.greater(values, 0)))).as_py()
+                ):
+                    raise ValueError("latency_ms must contain finite values greater than 0")
+        except (OSError, ValueError) as exc:
+            add("library-latency", str(exc))
+    try:
+        metadata = read_library_metadata(_file(root, sidecar.path))
+    except (FpmContractError, ValueError) as exc:
+        add("invalid-sidecar", str(exc))
+        return found
+    if metadata.get("parquet_sha256") != library.sha256:
+        add("sidecar-hash", "sidecar parquet_sha256 differs from the library in the manifest")
+    if library.rows is not None and metadata.get("row_count") != library.rows:
+        add("sidecar-rows", f"sidecar row_count {metadata.get('row_count')} differs from library rows {library.rows}")
+    effective = None
+    if not found:
+        try:  # the check staging applies to a historical reconstructed sidecar
+            check_library_model(metadata, _file(root, library.path), manifest.identity.model)
+            effective, _ = recover_reconstructed_metadata(
+                metadata,
+                _file(root, library.path),
+                parquet_sha256=library.sha256,
+                metadata_sha256=sidecar.sha256,
+            )
+            check_effective_measurement_policy(
+                effective,
+                system=manifest.identity.hardware,
+                backend=manifest.identity.framework,
+                backend_version=manifest.identity.framework_version,
+            )
+        except (FpmContractError, OSError, ValueError) as exc:
+            add("invalid-sidecar", str(exc))
+    if not found and effective is not None and columns is not None:
+        try:
+            for code, message in _check_row_declarations(_file(root, library.path), effective, manifest, columns):
+                add(code, message)
+        except (OSError, ValueError, pa.ArrowException) as exc:
+            add("library-rows", f"cannot scan the library rows: {exc}")
+    return found
+
+
+_MEDIAN_ROW_POLICY = {
+    "per_row_single_sample_or_median_of_3": "kvwarm_median_of_3",
+    "per_row_single_sample_or_full_grid_median_v1": "independent_full_grid_median_of_3",
+}
+_SINGLE_SAMPLE_POLICY = "dynamo_native_single_sample_v1"
+
+
+def _check_row_declarations(
+    parquet: Path, metadata: dict, manifest: Manifest, columns: set[str]
+) -> list[tuple[str, str]]:
+    """Bind the rows to what the sidecar and entry declare, as native admission does (bounded scan).
+
+    Returns ``(code, message)`` findings for: a row naming another system, backend or backend version than the
+    entry; a DCP that disagrees with the sidecar selector or is not positive and a divisor of ``tp``; and the
+    per-row measurement policy and repeat columns that a per-row sidecar policy requires.
+    """
+    identity = manifest.identity
+    wanted = ["system", "backend", "backend_version", "tp", "dcp", "measurement_policy", "measurement_repeats"]
+    present = [name for name in wanted if name in columns]
+    runtime: dict[str, set] = {"system": set(), "backend": set(), "backend_version": set()}
+    dcp_pairs: set[tuple] = set()
+    policy_pairs: set[tuple] = set()
+    dcp_nulls = False
+    for batch in pq.ParquetFile(parquet).iter_batches(batch_size=4096, columns=present):
+        table = pa.Table.from_batches([batch])
+        for name in runtime:
+            runtime[name].update(table.column(name).unique().to_pylist())
+        if "dcp" in columns:
+            dcp_nulls = dcp_nulls or table.column("dcp").null_count > 0
+            dcp_pairs.update((row["tp"], row["dcp"]) for row in table.group_by(["tp", "dcp"]).aggregate([]).to_pylist())
+        if {"measurement_policy", "measurement_repeats"} <= columns:
+            policy_pairs.update(
+                (row["measurement_policy"], row["measurement_repeats"])
+                for row in table.group_by(["measurement_policy", "measurement_repeats"]).aggregate([]).to_pylist()
+            )
+    findings: list[tuple[str, str]] = []
+    declared_runtime = {
+        "system": identity.hardware,
+        "backend": identity.framework,
+        "backend_version": identity.framework_version,
+    }
+    for name, expected in declared_runtime.items():
+        if runtime[name] != {expected}:
+            findings.append(
+                (
+                    "library-runtime",
+                    f"library rows name {name} {sorted(map(str, runtime[name]))}; the entry declares {expected!r}",
+                )
+            )
+    selector = metadata.get("configuration_selector")
+    if "dcp" in columns:
+        if dcp_nulls:
+            findings.append(
+                ("library-dcp", "library dcp must not contain nulls; omit the column when DCP is unrecorded")
+            )
+        for tp, dcp in sorted(dcp_pairs, key=str):
+            if type(dcp) is not int or type(tp) is not int or dcp <= 0 or tp <= 0 or tp % dcp:
+                findings.append(("library-dcp", f"library dcp {dcp!r} must be positive and divide tp {tp!r}"))
+    if isinstance(selector, dict):
+        # Unrecorded DCP is not DCP1: a declared selector must equal the rows' recorded value (or its absence).
+        recorded = {dcp for _, dcp in dcp_pairs} if "dcp" in columns else {None}
+        if recorded != {selector.get("dcp")}:
+            findings.append(
+                (
+                    "library-dcp",
+                    f"library rows record dcp {sorted(recorded, key=str)}; the sidecar selector declares "
+                    f"{selector.get('dcp')!r}",
+                )
+            )
+    median = _MEDIAN_ROW_POLICY.get(metadata.get("measurement_policy"))
+    if median is not None:
+        if not {"measurement_policy", "measurement_repeats"} <= columns:
+            findings.append(
+                (
+                    "library-measurement-policy",
+                    f"per-row policy {metadata['measurement_policy']!r} requires the measurement_policy and "
+                    "measurement_repeats columns",
+                )
+            )
+        elif bad := policy_pairs - {(_SINGLE_SAMPLE_POLICY, 1), (median, 3)}:
+            findings.append(
+                (
+                    "library-measurement-policy",
+                    f"library measurement policy/repeats {sorted(bad, key=str)} are inconsistent with "
+                    f"{metadata['measurement_policy']!r}",
+                )
+            )
+    return findings
+
+
+def _check_measurement_manifest(path: Path, fmt: str) -> None:
+    """Apply the strict v5 reader as well as the artifact's byte-level checks."""
+    if fmt != "json":
+        raise ValueError("measurement-manifest artifact must be JSON")
+    FpmMeasurementManifest.model_validate_json(path.read_bytes())
+
+
+def identity_key(manifest: Manifest) -> str:
+    """Stable key for the entry identity (the hash input without the settings that do not identify data)."""
+    identity = manifest.identity
+    return json.dumps(
+        [
+            identity.model,
+            identity.hardware,
+            identity.framework,
+            identity.framework_version,
+            identity.parallelism,
+            identity.precision,
+            identity.dp_attention,
+            identity.multinode,
+            identity.offload_mode,
+        ],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def check_fpm_identities(entries: Iterable[tuple[str, Manifest]]) -> list[FpmFinding]:
+    """Reject two entries with one identity: callers could not choose between their libraries."""
+    seen: dict[str, str] = {}
+    found = []
+    for path, manifest in entries:
+        key = identity_key(manifest)
+        if key in seen:
+            found.append(
+                FpmFinding("duplicate-identity", path, f"same identity as {seen[key]}; merge or remove one entry")
+            )
+        else:
+            seen[key] = path
+    return found
+
+
+def _check_entry_matches_manifest(entry, manifest: Manifest) -> list[FpmFinding]:
+    """Catalog selection reads the entry; loading reads the manifest. They must describe one configuration."""
+    path = entry.manifest.path
+    found = []
+    for name in ("configuration_id", "purpose", "identity"):
+        if getattr(entry, name) != getattr(manifest, name):
+            found.append(FpmFinding("entry-mismatch", path, f"catalog {name} differs from the manifest"))
+    if manifest.category != "fpm":
+        found.append(FpmFinding("entry-mismatch", path, f"catalog category fpm, manifest {manifest.category!r}"))
+    return found
+
+
+def check_fpm_dataset(root: Path, *, include_measurements: bool = False) -> list[FpmFinding]:
+    """Check every FPM entry listed by ``catalog/fpm.json`` (or ``catalog/dataset.json``) of a local root."""
+    from aisim_core.data import CategoryIndex, DatasetIndex
+
+    root = Path(root)
+    try:
+        dataset = DatasetIndex.model_validate_json(_file(root, "catalog/dataset.json").read_bytes())
+        reference = dataset.categories["fpm"]
+        index = CategoryIndex.model_validate_json(_verify(root, reference.index).read_bytes())
+    except (KeyError, OSError, ValueError, ValidationError) as exc:
+        return [FpmFinding("invalid-catalog", "catalog/dataset.json", f"cannot read the fpm category: {exc}")]
+    found: list[FpmFinding] = []
+    manifests = []
+    for entry in index.entries:
+        try:  # the catalog records the manifest's digest; a manifest changed without its reference must not load
+            _verify(root, entry.manifest)
+        except (OSError, ValueError) as exc:
+            found.append(FpmFinding("hash-mismatch", entry.manifest.path, f"indexed manifest: {exc}"))
+            continue
+        entry_findings = check_fpm_entry(root, entry.manifest.path, include_measurements=include_measurements)
+        found += entry_findings
+        if any(f.code == "invalid-manifest" for f in entry_findings):
+            continue  # An unhashable identity is invalid even if the manifest's JSON can be parsed.
+        try:
+            manifest = Manifest.model_validate_json(_file(root, entry.manifest.path).read_bytes())
+        except (OSError, ValueError, ValidationError):
+            continue  # already reported as invalid-manifest
+        found += _check_entry_matches_manifest(entry, manifest)
+        manifests.append((entry.manifest.path, manifest))
+    return found + check_fpm_identities(manifests)

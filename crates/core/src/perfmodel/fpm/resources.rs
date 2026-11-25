@@ -308,7 +308,7 @@ pub enum FpmMambaCacheMode {
 /// ran with. Selection and sizing do not read them. Grouped prefix caching
 /// needs `enable_prefix_caching` true and `hash_block_size_tokens`, and replay
 /// then hashes prompts in blocks of `hash_block_size_tokens`. Replay models grouped prefix caching
-/// for vLLM 0.31.0 and 0.32.0 only. For a linear profile, the simulated
+/// for vLLM 0.31.0, 0.32.0 and 0.33.0 only. For a linear profile, the simulated
 /// deployment decides prefix caching.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -609,7 +609,11 @@ impl ForwardPassPerfModelConfig {
             deployment
                 .get("resources")
                 .cloned()
-                .ok_or_else(|| invalid("FPM deployment requires resources"))?,
+                .ok_or_else(|| {
+                    invalid(
+                        "FPM resources are pending; supply cache_layout, max_num_tokens, max_batch_size, provenance, and kv_bytes_per_token (linear) or cache_groups (grouped) before cache sizing or replay",
+                    )
+                })?,
         )
         .map_err(|error| invalid(format!("FPM resource profile: {error}")))?;
         resources.validate()?;
@@ -677,7 +681,7 @@ impl ForwardPassPerfModelConfig {
         Ok(Some(binding))
     }
 
-    fn fpm_deployment(&self) -> Result<Option<&serde_json::Value>, AicError> {
+    pub(super) fn fpm_deployment(&self) -> Result<Option<&serde_json::Value>, AicError> {
         let Some(profile) = &self.fpm_profile else {
             return Ok(None);
         };
@@ -1778,8 +1782,9 @@ mod tests {
                 .unwrap();
             }
         }
-        // A transfer size above the page of the group is valid: the field
-        // allows bytes beyond the page.
+        // The measured bytes that vLLM 0.32.0 reads for one attention block of
+        // GLM-5.3-Flash at TP 4, against the page of 13,045,120 bytes of the
+        // hand-made vLLM 0.31.0 profile (benchmarks/evidence/nixl-pd-transfer-bytes-20261115/).
         FpmCacheGroup {
             page_size_bytes: 13_045_120,
             transfer_bytes_per_block: Some(21_978_496),

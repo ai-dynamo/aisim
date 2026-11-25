@@ -27,10 +27,11 @@
 //! start with a dot) and non-UTF-8 names (lookups are UTF-8 paths). Other
 //! top-level subtrees, such as other systems' data, are excluded.
 //!
-//! Estimators record the fingerprint when they first load a root in a
-//! process ([`loaded`]); saving recomputes it and fails if the data changed
-//! since. Tables that other engines parsed before the fingerprint stop being
-//! shared then, because the shared table memo is keyed by paths, not content.
+//! Estimators record the fingerprint when they first load a root's managed
+//! staging generation in a process ([`loaded`]); saving recomputes it and fails
+//! if the data changed since. Tables that other engines parsed before the
+//! fingerprint stop being shared then, because the shared table memo does not
+//! detect file changes within a generation.
 //! For the same reason a restore shares only tables an earlier restore loaded
 //! right after verifying the same data, and only while no fingerprinted entry
 //! has been written and no link followed on the way to the data retargeted
@@ -48,7 +49,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{Stage, invalid, io_error, normalized_absolute, sha256_hex};
 use crate::AicError;
-use crate::perfmodel::perf_database::{PerfDatabase, PerfTables, unshare_tables};
+use crate::perfmodel::perf_database::{
+    PerfDatabase, PerfTables, staged_generation, unshare_tables,
+};
 
 pub(crate) const METHOD: &str = "systems_tree_sha256_v1";
 pub(crate) const PACKED_SYSTEMS_DIR: &str = "perf_db/systems";
@@ -468,8 +471,8 @@ fn observe(
 /// The load-time fingerprint shared by a process's estimators.
 pub(crate) type LoadedFingerprint = Arc<Result<PerfDbFingerprint, String>>;
 
-/// The process-wide load-time fingerprint of one root, system and external
-/// parquet, and the shared tables known to hold the data it describes.
+/// The process-wide load-time fingerprint of one root, managed generation,
+/// system and external parquet, and the shared tables known to hold that data.
 #[derive(Default)]
 struct Loaded {
     fingerprint: OnceLock<LoadedFingerprint>,
@@ -482,47 +485,56 @@ struct Loaded {
     verified: Mutex<Vec<(Weak<PerfTables>, DataStamp)>>,
 }
 
-/// The process-wide load-time state for one root, system and external
-/// parquet. Each key has its own cell, so concurrent first loads hash the
-/// data once without holding the map lock while hashing.
-fn loaded_cell(root: &Path, system: &str, fpm_parquet: Option<&Path>) -> Arc<Loaded> {
-    type Key = (PathBuf, String, Option<PathBuf>);
+/// The process-wide load-time state for one root, system, external parquet
+/// and managed staging generation. Each key has its own cell, so concurrent
+/// first loads hash the data once without holding the map lock while hashing.
+fn loaded_cell(
+    root: &Path,
+    system: &str,
+    fpm_parquet: Option<&Path>,
+) -> Result<Arc<Loaded>, AicError> {
+    type Key = (PathBuf, String, Option<PathBuf>, String);
     static LOADED: OnceLock<Mutex<HashMap<Key, Arc<Loaded>>>> = OnceLock::new();
     let normal = |path: &Path| normalized_absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let key = (normal(root), system.to_owned(), fpm_parquet.map(normal));
-    Arc::clone(
+    let key = (
+        normal(root),
+        system.to_owned(),
+        fpm_parquet.map(normal),
+        staged_generation(root)?,
+    );
+    Ok(Arc::clone(
         LOADED
             .get_or_init(Default::default)
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .entry(key)
             .or_default(),
-    )
+    ))
 }
 
-/// Fingerprint `root` the first time this process loads it and reuse that
-/// result afterwards, like the shared table memo reuses loaded tables. Data
-/// that changes later is caught when saving recomputes the fingerprint.
+/// Fingerprint `root` the first time this process loads its managed generation
+/// and reuse that result afterwards, like the shared table memo reuses loaded
+/// tables. Models retain their original fingerprint across restaging. Changes
+/// within a generation are caught when saving recomputes the fingerprint.
 /// Failures are recorded, not returned: they only prevent saving.
 ///
 /// Tables another engine parsed before this fingerprint are no longer shared,
 /// so the estimator loading next reads what was fingerprinted.
 pub(crate) fn loaded(root: &Path, system: &str, fpm_parquet: Option<&Path>) -> LoadedFingerprint {
-    Arc::clone(
-        loaded_cell(root, system, fpm_parquet)
-            .fingerprint
-            .get_or_init(|| {
-                let fingerprint =
-                    fingerprint(root, system, fpm_parquet).map_err(|error| error.to_string());
-                unshare_tables(root, system, &[]);
-                Arc::new(fingerprint)
-            }),
-    )
+    let loaded = match loaded_cell(root, system, fpm_parquet) {
+        Ok(loaded) => loaded,
+        Err(error) => return Arc::new(Err(error.to_string())),
+    };
+    Arc::clone(loaded.fingerprint.get_or_init(|| {
+        let fingerprint = fingerprint(root, system, fpm_parquet).map_err(|error| error.to_string());
+        unshare_tables(root, system, &[]);
+        Arc::new(fingerprint)
+    }))
 }
 
 /// Fingerprint `root` as it is now, before a restore loads it. When this
-/// process has not loaded the root yet, the result is also its load-time
-/// fingerprint, so the load that follows does not hash the same data again.
+/// process has not loaded the root's current generation yet, the result is also
+/// its load-time fingerprint, so the following load does not hash it again.
 ///
 /// Shared tables stop being shared unless a restore already verified them
 /// against this same data and no entry was written since ([`verified`]).
@@ -540,7 +552,7 @@ pub(crate) fn current(
     system: &str,
     fpm_parquet: Option<&Path>,
 ) -> Result<(PerfDbFingerprint, DataStamp), AicError> {
-    let loaded = loaded_cell(root, system, fpm_parquet);
+    let loaded = loaded_cell(root, system, fpm_parquet)?;
     let (current, stamp) = observe(root, system, fpm_parquet)?;
     let unchanged = loaded
         .fingerprint
@@ -575,14 +587,15 @@ pub(crate) fn verified(
     fpm_parquet: Option<&Path>,
     database: &PerfDatabase,
     stamp: DataStamp,
-) {
-    let loaded = loaded_cell(root, system, fpm_parquet);
+) -> Result<(), AicError> {
+    let loaded = loaded_cell(root, system, fpm_parquet)?;
     let mut verified = loaded.verified.lock().unwrap_or_else(|e| e.into_inner());
     let tables = database.tables_arc();
     verified.retain(|(known, _)| {
         known.strong_count() > 0 && !std::ptr::eq(known.as_ptr(), Arc::as_ptr(tables))
     });
     verified.push((Arc::downgrade(tables), stamp));
+    Ok(())
 }
 
 /// Copy the fingerprinted systems inputs into the stage. Returns the packed
@@ -1010,5 +1023,63 @@ mod tests {
             &fingerprint(&root, "h200_sxm", None).unwrap()
         );
         assert!(loaded(&dir.path().join("missing"), "h200_sxm", None).is_err());
+    }
+
+    #[test]
+    fn load_time_fingerprints_follow_managed_generations_without_replacing_old_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("systems");
+        systems(&root);
+        let marker = root.join(".staged.json");
+        let gemm = root.join("data/h200_sxm/vllm/1.0/gemm_perf.parquet");
+        std::fs::write(&marker, b"first").unwrap();
+        let original = fingerprint(&root, "h200_sxm", None).unwrap();
+        let first = loaded(&root, "h200_sxm", None);
+        assert_eq!(first.as_ref(), &Ok(original.clone()));
+        assert!(Arc::ptr_eq(&first, &loaded(&root, "h200_sxm", None)));
+
+        std::fs::write(&gemm, b"second").unwrap();
+        std::fs::write(&marker, b"second").unwrap();
+        let second = loaded(&root, "h200_sxm", None);
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            second.as_ref(),
+            &Ok(fingerprint(&root, "h200_sxm", None).unwrap())
+        );
+        assert_ne!(first.as_ref(), second.as_ref());
+        assert!(Arc::ptr_eq(&second, &loaded(&root, "h200_sxm", None)));
+        assert_eq!(first.as_ref(), &Ok(original));
+
+        // Restore seeds the current generation, retaining earlier loads and
+        // still detecting later changes made without restaging the library.
+        std::fs::write(&gemm, b"third").unwrap();
+        std::fs::write(&marker, b"third").unwrap();
+        let (checked, _) = current(&root, "h200_sxm", None).unwrap();
+        std::fs::write(&gemm, b"unmanaged change").unwrap();
+        let third = loaded(&root, "h200_sxm", None);
+        assert_eq!(third.as_ref(), &Ok(checked));
+        assert_ne!(third.as_ref(), second.as_ref());
+        assert_ne!(
+            third.as_ref(),
+            &Ok(fingerprint(&root, "h200_sxm", None).unwrap())
+        );
+    }
+
+    #[test]
+    fn an_unreadable_managed_marker_never_reuses_a_loaded_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("systems");
+        systems(&root);
+        let marker = root.join(".staged.json");
+        std::fs::write(&marker, b"first").unwrap();
+        let first = loaded(&root, "h200_sxm", None);
+        assert!(first.is_ok());
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        assert!(loaded(&root, "h200_sxm", None).is_err());
+        assert!(current(&root, "h200_sxm", None).is_err());
+        std::fs::remove_dir(&marker).unwrap();
+        std::fs::write(&marker, b"first").unwrap();
+        assert!(Arc::ptr_eq(&first, &loaded(&root, "h200_sxm", None)));
     }
 }
