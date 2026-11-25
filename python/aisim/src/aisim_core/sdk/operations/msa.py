@@ -24,6 +24,13 @@ manual ``dsa_scale_k`` (util_scale hook): ``latency = SOL_msa /
 (util_dsa * k)`` — the pre-silicon behaviour, kept for (backend, version)
 tuples with no MSA tables (measured 15-28x below silicon on SM90; prefer
 versions with collected data).
+
+That transfer is calibrated on ``MiniMaxM3ForCausalLM`` only. An op built with
+another ``architecture`` resolves that architecture's own rows and, when they
+are absent, raises the terminal empirical miss instead of borrowing: the
+borrowed util prices a different kernel, so the substitution is not a level
+shift. Qwen3.8-Flash-Next (``Qwen4ExpForConditionalGeneration``) is the first
+such consumer; SOL mode still answers analytically.
 """
 
 from __future__ import annotations
@@ -41,8 +48,15 @@ logger = logging.getLogger(__name__)
 
 
 class ContextMSAModule(_core.ContextMSAModule, OpShellKit):
-    """Context (prefill) MSA. SILICON raises (no data); HYBRID/EMPIRICAL transfer from DSA."""
+    """Context (prefill) MSA. SILICON raises (no data); HYBRID/EMPIRICAL transfer from DSA.
+
+    The transfer is M3-only: another ``architecture`` without its own rows
+    raises the empirical miss instead of borrowing (see the module docstring).
+    """
 
 
 class GenerationMSAModule(_core.GenerationMSAModule, OpShellKit):
-    """Generation (decode) MSA. s = total kv length."""
+    """Generation (decode) MSA. s = total kv length.
+
+    Same transfer rule as :class:`ContextMSAModule`: M3-only.
+    """

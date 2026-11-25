@@ -426,9 +426,12 @@ def test_sol_prices_both_phases_through_the_rust_engine(model_path, backend):
 def test_qsa_module_ops_read_the_checkpoint_architecture(backend):
     """MSA tables are keyed by architecture, so QSA must not read the M3 slice.
 
-    The C3.3 rows are published under ``Qwen4ExpForConditionalGeneration``; an
-    op that keeps the ``MiniMaxM3ForCausalLM`` default would miss them (and, if
-    the tables shared a slice, interpolate M3 head geometry).
+    The accepted C3.3 rows are keyed by
+    ``Qwen4ExpForConditionalGeneration``; an op that keeps the
+    ``MiniMaxM3ForCausalLM`` default would miss them (and, if the tables shared a
+    slice, interpolate M3 head geometry). The rows reach a default install once
+    an ``ai-dynamo/aisim-data`` revision carries them; this test pins the key,
+    not the publication state.
     """
     model = models.get_model(BF16, _model_config(), backend)
     qsa = [

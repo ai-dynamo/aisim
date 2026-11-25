@@ -51,11 +51,15 @@ Modeling caveats that gate accuracy qualification (see
   graph under-predicts index time; the measured QSA module rows are the anchor
   when the lookup resolves.
 * Without ``msa_context_module_perf`` / ``msa_generation_module_perf`` rows at
-  Qwen4-Exp shapes the op falls back to a DSA cross-op transfer, which the
-  MiniMax-M3 work measured 15-28x below silicon. Those rows are published for
-  the Qwen geometry (``benchmarks/evidence/collector/qwen38-c3.5``), so SILICON
-  resolves on both backends; a missing geometry must still not borrow the
-  transfer, and serving accuracy (8-GPU serve vs replay) is not yet qualified.
+  Qwen4-Exp shapes the op would otherwise fall back to a DSA cross-op transfer,
+  which the MiniMax-M3 work measured 15-28x below silicon. The module op now
+  enforces that: a non-M3 ``architecture`` with no rows raises the terminal
+  empirical miss instead of borrowing (``operators/msa.rs``). The Qwen-geometry
+  rows are staged in ``benchmarks/evidence/collector/qwen38-c3.5`` and reach
+  SILICON only once the ``ai-dynamo/aisim-data`` revision that carries them is
+  published and the pin is raised; until then SILICON and HYBRID raise, and
+  SOL answers analytically. Serving accuracy (8-GPU serve vs replay) is not
+  yet qualified.
 * The n-gram table is priced as TP-sharded HBM residency, which is the
   ``EngramConfig.cpu_offload=False`` case. vLLM 0.31 defaults that flag to
   ``True``, keeping the table in pinned host memory and looking it up through

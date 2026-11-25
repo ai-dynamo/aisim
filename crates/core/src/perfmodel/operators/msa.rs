@@ -19,6 +19,13 @@
 //! the manual `dsa_scale_k` level-alignment hook:
 //! `latency = SOL_msa / (util_dsa * k)`. A policy with XOP disabled raises
 //! the terminal empirical miss when the silicon path also missed.
+//!
+//! The XOP transfer belongs to the architecture it was calibrated against
+//! ([`MSA_ARCHITECTURE`]). An op that selects another architecture reads that
+//! architecture's own rows, and when they are absent it raises a typed miss
+//! instead of borrowing the DSA transfer: the borrowed util prices a different
+//! kernel, and on SM90 it lands 15-28x below the measured module (see
+//! `docs/perf-model/models/qwen38-flash-next.md`). SOL remains available.
 
 use serde::{Deserialize, Serialize};
 
@@ -115,6 +122,27 @@ impl MsaModuleOp {
         }
     }
 
+    /// Whether this op may use the DSA cross-op (XOP) transfer.
+    ///
+    /// The transfer substitutes `SOL_msa / util_dsa` for a measured module and
+    /// is calibrated on M3's kernel. A different `architecture` reads a
+    /// different implementation (Qwen3.8-Flash-Next QSA has a block indexer and
+    /// a fused q+gate that M3 does not), so its util-space value is not a level
+    /// shift of M3's: borrowing measures the wrong op. Without rows for that
+    /// architecture the only correct answer is a typed coverage miss.
+    fn ensure_xop_calibrated(&self, phase: &str) -> Result<(), AicError> {
+        if self.architecture == MSA_ARCHITECTURE {
+            return Ok(());
+        }
+        Err(AicError::EmpiricalNotImplemented(format!(
+            "MSA {phase}: no silicon rows for architecture {} and the DSA cross-op \
+             transfer is calibrated for {MSA_ARCHITECTURE} only; collect \
+             msa_context_module_perf / msa_generation_module_perf rows for {} or run \
+             in SOL mode.",
+            self.architecture, self.architecture
+        )))
+    }
+
     /// The legacy cross-op fallback: `SOL_msa / (util_dsa * k)`, gated by XOP.
     fn xop_context(
         &self,
@@ -124,6 +152,7 @@ impl MsaModuleOp {
         prefix: u32,
         sol: f64,
     ) -> Result<PerformanceResult, AicError> {
+        self.ensure_xop_calibrated("context")?;
         if !db.transfer_policy.contains(TransferKind::XOp) {
             return Err(AicError::EmpiricalNotImplemented(
                 "MSA context: cross-op transfer (xop) is disabled by the transfer policy \
@@ -191,6 +220,7 @@ impl MsaModuleOp {
         s: u32,
         sol: f64,
     ) -> Result<PerformanceResult, AicError> {
+        self.ensure_xop_calibrated("generation")?;
         if !db.transfer_policy.contains(TransferKind::XOp) {
             return Err(AicError::EmpiricalNotImplemented(
                 "MSA generation: cross-op transfer (xop) is disabled by the transfer \
@@ -674,13 +704,92 @@ mod tests {
         }
     }
 
+    /// An architecture other than M3 must NOT borrow the DSA transfer when its
+    /// own rows are absent: the guard raises the terminal empirical miss, in
+    /// both phases and in both modes that reach the transfer (HYBRID after the
+    /// silicon miss, EMPIRICAL directly). sglang/0.5.14 ships no msa tables, so
+    /// this is the same vehicle the M3 oracle test uses.
+    #[test]
+    fn msa_xop_refuses_an_uncalibrated_architecture() {
+        const QSA: &str = "Qwen4ExpForConditionalGeneration";
+        for mode in [DatabaseMode::Hybrid, DatabaseMode::Empirical] {
+            let mut db = db("sglang", "0.5.14");
+            db.database_mode = mode;
+            let op = MsaModuleOp {
+                architecture: QSA.to_string(),
+                ..msa_op()
+            };
+            for (phase, err) in [
+                ("context", op.query_context(&db, 1, 1024, 0).unwrap_err()),
+                ("generation", op.query_generation(&db, 1, 1025).unwrap_err()),
+            ] {
+                match err {
+                    AicError::EmpiricalNotImplemented(msg) => {
+                        assert!(
+                            msg.contains(QSA)
+                                && msg.contains(MSA_ARCHITECTURE)
+                                && msg.contains("calibrated"),
+                            "{phase} {mode:?}: guard message must name both \
+                             architectures, got {msg}"
+                        );
+                    }
+                    other => panic!("{phase} {mode:?}: expected the typed miss, got {other:?}"),
+                }
+            }
+            // Nothing was priced, so the borrowed tier must not be recorded.
+            assert_ne!(
+                db.worst_provenance(),
+                crate::operators::util_empirical::ProvenanceTier::XOp,
+                "{mode:?}: a refused transfer must not claim xop provenance"
+            );
+        }
+    }
+
+    /// The guard is scoped to other architectures: M3 keeps the transfer (the
+    /// oracle test above pins the values), and an op that DOES carry QSA rows
+    /// still resolves them under SILICON.
+    #[test]
+    fn msa_xop_guard_leaves_calibrated_and_collected_paths_intact() {
+        const QSA: &str = "Qwen4ExpForConditionalGeneration";
+        // M3, no tables -> transfer still fires.
+        let m3_db = db("sglang", "0.5.14");
+        assert_eq!(
+            msa_op().query_context(&m3_db, 1, 1024, 0).unwrap().source,
+            Source::Empirical
+        );
+        // QSA with rows -> own slice, under the default SILICON mode.
+        let mut qsa_db = db("vllm", "0.24.0");
+        qsa_db.database_mode = DatabaseMode::Silicon;
+        let (context, generation) = msa_grids(&[(MSA_ARCHITECTURE, 10.0), (QSA, 20.0)]);
+        qsa_db.msa.inject_for_test(context, generation);
+        let op = MsaModuleOp {
+            architecture: QSA.to_string(),
+            ..msa_op()
+        };
+        approx(
+            op.query_context(&qsa_db, 1, 1024, 0).unwrap().latency_ms,
+            20.0,
+        );
+        assert_eq!(
+            op.query_context(&qsa_db, 1, 1024, 0).unwrap().source,
+            Source::Silicon
+        );
+        approx(
+            op.query_generation(&qsa_db, 1, 4097).unwrap().latency_ms,
+            1.0,
+        );
+        assert_eq!(
+            op.query_generation(&qsa_db, 1, 4097).unwrap().source,
+            Source::Silicon
+        );
+    }
+
     // ------------------------------------------------------------------
     // Own silicon tables (msa_context_module / msa_generation_module).
     // No parquet writer in the test deps, so the loaded-grid layer is
     // injected directly (the loader itself is the shared, DSA-tested
     // `load_dsa_parquet`).
     // ------------------------------------------------------------------
-
     use crate::perf_database::dsa::{DsaGrids, DsaHeadGrid, DsaKey};
     use std::collections::BTreeMap;
 
