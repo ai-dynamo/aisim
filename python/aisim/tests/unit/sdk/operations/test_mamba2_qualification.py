@@ -94,28 +94,34 @@ def test_canonical_mtp_prices_resolved_mamba_state_and_width(tmp_path, mtp, back
     # token for its width-four window; it has no recurrent-state term.
     expected_conv = 8 * width * 73_728 * 23 * (52 + nextn) / 52 / 7.7e12 * 1000
     expected_prefill = prefill_bytes * 23 / 7.7e12 * 1000
-    payloads = []
-    for prefill in ({}, {"num_prefill_requests": 2, "sum_prefill_tokens": 17}):
-        payload = [{"scheduled_requests": {**prefill, **scheduled}}]
-        detail = model.estimate_forward_pass_detailed(payload)
+
+    def assert_mamba_rows(estimator, payload):
+        detail = estimator.estimate_forward_pass_detailed(payload)
         detail = json.loads(detail) if isinstance(detail, str) else detail
         rows = {op["name"]: op for op in detail["ranks"][0]["operations"]}
         assert rows["generation_mamba_ssm"]["latency_ms"] == pytest.approx(expected_decode, rel=1e-9)
         assert rows["generation_mamba_ssm"]["source"] == "sol"
         assert rows["generation_mamba_conv1d"]["latency_ms"] == pytest.approx(expected_conv, rel=1e-9)
         assert rows["generation_mamba_conv1d"]["source"] == "sol"
-        if prefill:
+        if payload[0]["scheduled_requests"].get("num_prefill_requests", 0):
             assert rows["context_mamba_ssm"]["latency_ms"] == pytest.approx(expected_prefill, rel=1e-9)
             assert rows["context_mamba_ssm"]["source"] == "sol"
         else:
             assert "context_mamba_ssm" not in rows or rows["context_mamba_ssm"]["latency_ms"] == 0
-        payloads.append(payload)
+
+    payloads = [
+        [{"scheduled_requests": {**prefill, **scheduled}}]
+        for prefill in ({}, {"num_prefill_requests": 2, "sum_prefill_tokens": 17})
+    ]
+    for payload in payloads:
+        assert_mamba_rows(model, payload)
 
     # Restoring the saved canonical configuration must rebuild the qualified
     # graph without constructor patches or an external execution profile.
     pinned = model.save_state_snapshot(tmp_path / "snapshot")
     restored = RustForwardPassPerfModel.best_available(json.loads(json.dumps(pinned)))
     for payload in payloads:
+        assert_mamba_rows(restored, payload)
         assert restored.estimate_forward_pass_time_ms(payload) == model.estimate_forward_pass_time_ms(payload)
 
 

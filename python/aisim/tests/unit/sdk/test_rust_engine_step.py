@@ -564,6 +564,12 @@ def test_mixed_display_alias_preserves_literal_rows(monkeypatch, native, public,
     assert result["per_op_latency_ms"][public] == 2.0
     assert result["per_op_latency_ms"][f"{public} (operation)"] == 5.0
     assert result["per_op_latency_ms"][f"{public} (operation) (operation)"] == 3.0
+    assert result["per_op_energy_wms"][public] == 20.0
+    assert result["per_op_energy_wms"][f"{public} (operation)"] == 50.0
+    assert result["per_op_energy_wms"][f"{public} (operation) (operation)"] == 30.0
+    assert result["per_op_source"][public] == "silicon"
+    assert result["per_op_source"][f"{public} (operation)"] == "silicon"
+    assert result["per_op_source"][f"{public} (operation) (operation)"] == "estimated"
     assert sum(result["per_op_latency_ms"].values()) == result["latency_ms"] == 10.0
     assert sum(result["per_op_energy_wms"].values()) == result["energy_wms"] == 100.0
     component = "decode_attention" if decode else "context_attention"

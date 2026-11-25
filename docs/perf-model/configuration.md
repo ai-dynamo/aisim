@@ -295,7 +295,10 @@ Mamba operations use each group's actual length and cached prefix, preserving
 cold measured rows beside warm SOL scans. Other operations keep their aggregate
 coordinates. Without groups, qualified Mamba distributes new tokens evenly over
 the reported prefill requests and treats all chunks as cached when any prefill
-prefix is present. The groups are part of the pricing cache identity. For example,
+prefix is present. A nonempty totals-only qualified prefill requires at least
+one new token per reported prefill request (`sum_prefill_tokens >=
+num_prefill_requests`); otherwise the even split assigns a request zero tokens
+and pricing fails. The groups are part of the pricing cache identity. For example,
 `[[1, 1000, 0], [1, 500, 64]]` represents two prefills with 1500 new tokens
 and 64 cached tokens. Whole-model FPM and regression keep their existing inputs.
 For a 17-token prompt with a 16-token cache hit, vLLM MTP3 can schedule
