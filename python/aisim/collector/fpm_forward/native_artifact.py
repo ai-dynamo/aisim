@@ -873,6 +873,150 @@ def plan_is_moe(plan: object) -> bool | None:
     return is_moe if isinstance(is_moe, bool) else None
 
 
+# The dtypes of the engine's KV pool that each KV-cache label of an SGLang cell stands for, as the pod records
+# them: the text of a torch dtype. ``_validate_sglang_kv_cache_dtype`` says why each is there and which label
+# has no entry.
+_SGLANG_STORED_KV_DTYPES = {
+    "bfloat16": ("torch.bfloat16", "torch.float16"),
+    "fp8": ("torch.float8_e4m3fn",),
+    "nvfp4": ("torch.float4_e2m1fn_x2",),
+}
+# The argument SGLang must have resolved, for a label whose stored dtype does not say which KV cache it is.
+# SGLang stores its two FP4 recipes, ``nvfp4`` and ``fp4_mx_block16``, in one torch dtype, and the pool of a
+# model without MLA attention takes its recipe from the argument. ``fp8`` has no entry, although SGLang stores
+# its ``mxfp8`` pool in the dtype of ``fp8_e4m3`` as well: ``_validate_sglang_kv_cache_dtype`` says so.
+_SGLANG_KV_CACHE_ARGUMENTS = {"nvfp4": "nvfp4"}
+
+
+def _validate_sglang_kv_cache_dtype(cell: FPMCell, producer: object, path: Path) -> None:
+    """Refuse an SGLang rank artifact whose engine did not store the KV cache its cell is labelled with.
+
+    Every row of a cell carries the cell's ``kv_cache_dtype`` as its KV-cache mode, and AISim's reader matches
+    that label exactly. The cell builder writes the label ``bfloat16`` as ``--kv-cache-dtype auto`` and the
+    label ``fp8`` as ``fp8_e4m3`` (sglang_fpm_builder.py, ``_KV_CACHE_DTYPES``). SGLang makes its own choice
+    of ``auto``, at two moments (read in its source at v0.5.22 and v0.5.23, under ``python/sglang/srt``; the
+    collector README, "KV cache of a bfloat16 cell", names the rules):
+
+    - when it resolves its arguments, where its overrides turn ``auto`` into ``fp8_e4m3`` for some
+      architectures (``arg_groups/overrides.py``). The launcher records what resolution left as
+      ``producer.kv_cache_dtype`` (runtime/sglbench_launcher.py, ``_resolved_settings``);
+    - when the engine is built, in every scheduler process once it has loaded the model: with ``auto`` the
+      pool gets the dtype of the model, or an FP8 dtype when the quantization config of the model asks for an
+      FP8 KV cache (``mem_cache/kv_cache_dtype.py``, ``configure_kv_cache_dtype``). The recorder reads the
+      dtype the pool was built with, ``ModelRunner.kv_cache_dtype`` (``model_executor/model_runner.py``), in
+      every scheduler process, the driver requires all of them to report the same one, and writes its text
+      as ``producer.kv_cache_stored_dtype`` (runtime/sglbench_recorder.py, runtime/sglbench_driver.py).
+
+    A ``bfloat16`` cell of such a checkpoint completes and passes every other rule of this module, and its
+    times, measured with an FP8 KV cache, would be published under the label ``bfloat16``. This rule holds
+    the stored dtype against the label, for every rank file of every SGLang cell, whatever the plan says of
+    expert layers and also for a caller without a plan.
+
+    AISim has four KV-cache labels: the three that ``--fpm-kv-cache-dtypes`` can name (capabilities.py,
+    ``_normalize_kv_dtype``: ``bfloat16``, ``fp8`` and ``int8``), and ``nvfp4``, which it infers for a
+    checkpoint whose quantization config declares an NVFP4 KV cache. A plan made today carries one of the
+    first three. Planning refuses a checkpoint whose own KV cache is NVFP4, unless the option names another
+    dtype for its cells (capabilities.py, ``checkpoint_fmha_quant_mode``, with the text ``unsupported FPM
+    KV-cache dtype 'nvfp4'``). The rule of ``nvfp4`` is there for a caller that hands this function a cell
+    with that label, and for a plan once planning admits it. What each label stands for:
+
+    - ``bfloat16`` stands for ``torch.bfloat16`` and for ``torch.float16``. A float16 pool holds values of
+      the same width, AISim has no KV-cache mode for float16, and SGLang loads many checkpoints in float16:
+      one whose config names float16, and one whose config names float32 or no dtype unless the model is a
+      Gemma (``configs/model_config.py``, ``_get_and_verify_dtype``). Such a checkpoint could not be
+      collected otherwise;
+    - ``fp8`` stands for ``torch.float8_e4m3fn`` only, the dtype SGLang stores for ``fp8_e4m3`` on an NVIDIA
+      GPU. Its other FP8 dtypes are the one of ``fp8_e5m2``, which no cell asks for, and the one of an AMD
+      GPU, which the launcher refuses. SGLang stores ``torch.float8_e4m3fn`` for its argument ``mxfp8`` as
+      well, which builds another pool. No cell asks for that argument and no override of SGLang read at
+      either tag gives it, and the argument of an ``fp8`` cell is not compared: the files of a pod that ran
+      ``mxfp8`` would pass for an ``fp8`` cell;
+    - ``nvfp4`` stands for ``torch.float4_e2m1fn_x2`` together with a resolved argument of ``nvfp4``. The
+      cell builder passes the label on to SGLang under the same name, and SGLang stores that dtype for it
+      (``mem_cache/kv_cache_dtype.py``). It stores the same dtype for its other FP4 recipe, the argument
+      ``fp4_mx_block16``. For a model without MLA attention the pool takes its recipe from the argument:
+      SGLang's resolver of the recipe takes the argument and refuses the dtype, which names no recipe
+      (``layers/quantization/fp4_kv_cache_quant_method.py``, ``resolve_kv_cache_quant``). So for this label
+      ``producer.kv_cache_dtype`` is compared as well, and a block without it is refused. For a model with
+      MLA attention SGLang builds no engine with ``nvfp4``: the argument makes ``trtllm_mha`` the decode
+      backend (``arg_groups/kv_cache_hook.py``), and that backend refuses such a model
+      (``layers/attention/attention_registry.py``);
+    - ``int8``, which only ``--fpm-kv-cache-dtypes`` gives, has no rule. The cell builder refuses such a cell
+      when it is rendered, so no pod writes a file for it.
+
+    A label without a rule is refused, whatever the file records, so that no row is published with a
+    KV-cache mode that nothing compared.
+
+    ``producer.kv_cache_stored_dtype`` must be there as a string: a file without the key, or with another
+    value, is refused. For the labels ``bfloat16`` and ``fp8``, ``producer.kv_cache_dtype`` is named in the
+    refusal and compared with nothing: the resolved argument is not the stored dtype, and a block without it
+    is not refused for that. The launcher writes its key before it builds the engine, and the driver writes
+    the stored dtype once every recorder header was accepted, so the result files of every run that
+    completed hold both. A launcher of an earlier revision wrote neither. Its result files belong to a plan
+    of that source revision, and the revision is part of the plan hash (planner.py, ``aic_revision``), so
+    under a plan made from this source such a file is refused for its plan before this rule
+    (``_validate_collector_provenance``). Where ``FPM_COLLECTOR_SOURCE_REVISION`` holds the revision at one
+    value, such a file reaches this rule and is refused by it for the missing key.
+
+    Not covered: a pool whose dtype is not the model runner's. The unified KV pool of DeepSeek V4, which
+    ``SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton`` selects on an AMD GPU, does not follow
+    ``--kv-cache-dtype`` in either direction: it stores bfloat16, and FP8 under
+    ``SGLANG_DSV4_UNIFIED_KV_FP8`` (``model_executor/pool_configurator.py``, ``DSV4PoolConfigurator``), so
+    the recorded dtype would not be that pool's. The launcher refuses an AMD GPU, and the cells of DeepSeek
+    V4 are refused today, when they are rendered or in the pod. The README section named above says where
+    the two variables take effect. And at v0.5.23 the pool of a MiniMax-M3 checkpoint with NVFP4 packed
+    experts, on a Blackwell GPU, packs its keys and values as NVFP4 while the argument must be ``fp8_e4m3``
+    and the runner holds the FP8 dtype (``mem_cache/minimax_m3_nvfp4_pool.py``, ``MiniMaxM3Nvfp4KVPool``),
+    so an ``fp8`` cell of such a checkpoint would pass over an NVFP4 pool. The cells of MiniMax-M3 are
+    refused when they are rendered.
+
+    What ran: on 2026-11-25 this rule accepted the rank files of five smoke cells of a dense model
+    (``Qwen/Qwen3-0.6B``) that the launcher wrote on H200 GPUs, collected through AISim's collector. With
+    SGLang 0.5.23: a prefill cell on one GPU for each of the labels ``bfloat16`` and ``fp8``, and a
+    ``bfloat16`` prefill cell at a tensor-parallel size of 2. With SGLang 0.5.22: a decode cell on one GPU
+    for each of the two labels. The ``bfloat16`` cells recorded the stored dtype ``torch.bfloat16`` and the
+    resolved argument ``auto``, the ``fp8`` cells ``torch.float8_e4m3fn`` and ``fp8_e4m3``. The files of
+    each cell were then held against every other label, by a call of ``validate_native_collection`` with
+    the label of the cell replaced, and each was refused with a text of this rule (``nvfp4`` had no rule
+    then). The files of the runs are not kept in this repository.
+
+    Not run on an engine: a checkpoint for which SGLang makes an FP8 pool of ``auto``, which is the case
+    this rule is there for; a model that SGLang loads in float16; a cell of a MoE plan and a cell under DP
+    attention with the two keys; a refusal inside a collection; a cell labelled ``nvfp4``. These have run
+    in the tests only, on typed-in files and on the files the launcher writes there with a FAKE in the
+    place of SGLang, whose FAKE scheduler holds a FAKE dtype. The rule of ``nvfp4`` was read in SGLang's
+    source at v0.5.22 and v0.5.23: no model config packaged with AISim gives a cell that label, and SGLang
+    accepts the argument on a Blackwell GPU only (``arg_groups/kv_cache_hook.py``,
+    ``handle_kv4_compatibility``).
+    """
+    label = cell.kv_cache_dtype
+    block = producer if isinstance(producer, dict) else {}
+    resolved = block.get("kv_cache_dtype")
+    if "kv_cache_stored_dtype" in block:
+        stored = block["kv_cache_stored_dtype"]
+        found = repr(stored)
+    else:
+        stored = None
+        found = "no producer.kv_cache_stored_dtype"
+    allowed = _SGLANG_STORED_KV_DTYPES.get(label)
+    if allowed is None:
+        raise ValueError(
+            "native SGLang rank artifact cannot be held against the KV cache of its cell: no rule says which "
+            f"producer.kv_cache_stored_dtype the cell's kv_cache_dtype {label!r} stands for, found {found} "
+            f"(producer.kv_cache_dtype {resolved!r}): {path}"
+        )
+    stands_for = " or ".join(repr(name) for name in allowed)
+    argument = _SGLANG_KV_CACHE_ARGUMENTS.get(label)
+    if argument is not None:
+        stands_for += f" with producer.kv_cache_dtype {argument!r}"
+    if not isinstance(stored, str) or stored not in allowed or (argument is not None and resolved != argument):
+        raise ValueError(
+            "native SGLang rank artifact did not store the KV cache of its cell: the cell's kv_cache_dtype "
+            f"{label!r} stands for producer.kv_cache_stored_dtype {stands_for}, "
+            f"found {found} (producer.kv_cache_dtype {resolved!r}): {path}"
+        )
+
+
 def _validate_sglang_moe_producer(cell: FPMCell, producer: object, path: Path) -> None:
     """Refuse an SGLang rank artifact whose pod did not run a MoE cell the way its plan describes it.
 
@@ -917,8 +1061,10 @@ def _validate_sglang_moe_producer(cell: FPMCell, producer: object, path: Path) -
     key before it ran DP attention. A result file of that time belongs to a plan of that source revision. The
     revision is part of the plan hash (planner.py, ``aic_revision``), so under a plan made from this source such
     a file is refused for its plan before this rule (``_validate_collector_provenance``). Where
-    ``FPM_COLLECTOR_SOURCE_REVISION`` holds the revision at one value, such a file reaches this rule and is
-    refused by it.
+    ``FPM_COLLECTOR_SOURCE_REVISION`` holds the revision at one value, such a file gets past that rule. It
+    holds no ``kv_cache_stored_dtype`` either, so the KV-cache rule, which is made for every rank file before
+    this one, refuses it (``_validate_sglang_kv_cache_dtype``). A block that holds the KV-cache keys and no
+    ``attn_dp_size`` is refused by this rule.
 
     What ran (the collector README, "DEP cells", has the whole account): the mapping was read in SGLang's
     source at v0.5.22 and v0.5.23 (``python/sglang/srt/runtime_context.py``, ``derive_attn_tp_size`` and
@@ -953,6 +1099,88 @@ def _validate_sglang_moe_producer(cell: FPMCell, producer: object, path: Path) -
         )
 
 
+def _validate_sglang_dense_producer(cell: FPMCell, producer: object, path: Path) -> None:
+    """Refuse an SGLang rank artifact whose pod did not run a cell of a dense plan in the layout of the cell.
+
+    The plan of a model without expert layers holds tensor-parallel cells only (planner.py,
+    ``_require_sglang_launcher_cells``): the one-GPU cell and a cell for each larger tensor-parallel size,
+    each with one data-parallel rank. The rows of a cell take the tensor-parallel size from the plan. The
+    launcher is not told it (runtime/sglbench_launcher.py): it records the ``tp_size`` SGLang resolved and
+    has the driver wait for that many scheduler processes (``_resolved_settings``). So a command that reached
+    the pod with another ``--tp-size``, or without one, runs, completes and passes every other rule of this
+    module, and its times would be published under the tensor-parallel size of the cell.
+
+    This rule holds three keys of the producer block against the cell:
+
+    - ``tp_size`` must be the cell's ``tp``;
+    - ``attn_dp_size`` must be 1, for the one data-parallel rank of the cell. The launcher admits DP attention
+      only for a model in which it finds expert layers (``_check_dp_attention``). Such a run writes a rank
+      file for each of its ranks and is refused before this rule for their number, by the ``dp`` block rule
+      of ``validate_native_collection`` (``native DP metadata mismatch``). The size is compared all the same,
+      for the reason ``_validate_sglang_moe_producer`` gives;
+    - ``moe`` must be null or a block whose ``ep_size`` is 1. The launcher's test for expert layers
+      (runtime/sglbench_compat.py, ``EXPERT_KEYS``: a truthy value of one of six config keys) is wider than
+      the plan's (capabilities.py, ``_is_moe``: a count above 1 in one of three of them), so a model the plan
+      takes for dense can be one the launcher takes for a MoE model. For such a model the launcher records a
+      ``moe`` block and accepts two expert-parallel sizes (``_check_expert_parallel``). With 1 every
+      tensor-parallel rank holds a slice of every expert, which is tensor parallelism alone and the layout
+      of the cell, so that block is accepted. With the tensor-parallel size every rank holds whole experts,
+      the TEP layout, which no cell of a dense plan describes, so that block is refused. For a model in
+      which the launcher finds no expert layers it records null and refuses every expert-parallel size but
+      1.
+
+    Each of the two sizes must be there as an int, and a bool is not one; so must the ``ep_size`` of a
+    ``moe`` block. A producer block without the ``moe`` key is refused like a block without one of the two
+    sizes: it is no record of a model without expert layers. The launcher writes all three keys before it
+    builds the engine (``_start_up_checks`` writes ``moe``, ``_resolved_settings`` the two sizes), so the
+    result files of every run that completed hold them. A launcher of an earlier revision wrote no
+    ``attn_dp_size``, and one before it no ``moe`` either. Its files are refused before this rule, for
+    their plan or for the dtype of the KV pool, which they do not hold (``_validate_sglang_moe_producer`` has
+    the account). A block that holds the KV-cache keys and lacks one of the three keys is refused by this
+    rule.
+
+    The content source is not compared. The rows of a dense cell say nothing of the content, and a pod of
+    such a cell sends seeded token ids or dataset text: text when it is asked for by name, and when the
+    launcher finds expert layers in the model (the collector README, "MoE cells").
+
+    What ran: on 2026-11-25 this rule accepted the rank files of five smoke cells of a dense model
+    (``Qwen/Qwen3-0.6B``) that the launcher wrote on H200 GPUs, collected through AISim's collector: with
+    SGLang 0.5.23 two prefill cells on one GPU and a prefill cell at a tensor-parallel size of 2, with SGLang
+    0.5.22 two decode cells on one GPU. Each recorded the ``tp_size`` of its cell, an ``attn_dp_size`` of 1
+    and a null ``moe``. Called by hand on those files, the rule refused the files of the one-GPU cell for
+    the cell of two GPUs and the reverse. The files of the runs are not kept in this repository.
+
+    Not run on an engine: a tensor-parallel size above 2; a model in which the launcher finds expert layers
+    and the plan none, so a ``moe`` block under this rule; a refusal inside a collection. These have run in
+    the tests only, on typed-in files and on the files the launcher writes there with a FAKE in the place
+    of SGLang.
+    """
+    block = producer if isinstance(producer, dict) else {}
+    found = (block.get("tp_size"), block.get("attn_dp_size"))
+    expected = (cell.topology.tp, 1)
+    # ``type`` and not ``isinstance``: True equals 1, and a size is never a bool.
+    if any(type(size) is not int for size in found) or found != expected:
+        raise ValueError(
+            "native SGLang rank artifact of a dense plan did not run the layout of its cell: "
+            f"expected producer.tp_size {expected[0]} and producer.attn_dp_size {expected[1]}, "
+            f"found {found[0]!r} and {found[1]!r}: {path}"
+        )
+    if "moe" not in block:
+        found_moe = "no producer.moe"
+    elif block["moe"] is None:
+        return
+    else:
+        moe = block["moe"]
+        ep_size = moe.get("ep_size") if isinstance(moe, dict) else None
+        if type(ep_size) is int and ep_size == 1:
+            return
+        found_moe = f"producer.moe.ep_size {ep_size!r}"
+    raise ValueError(
+        "native SGLang rank artifact of a dense plan did not run the layout of its cell: "
+        f"expected producer.moe null or producer.moe.ep_size 1, found {found_moe}: {path}"
+    )
+
+
 def validate_native_collection(
     cell: FPMCell,
     raw_root: Path,
@@ -969,9 +1197,13 @@ def validate_native_collection(
 
     ``expected_moe`` says whether the model of that plan has expert layers (``plan_is_moe``). A cell does not
     carry that either: the one-GPU cell of a plan has the strategy ``single`` for a dense and for a MoE model.
-    When it is True and the backend is ``sglang``, the content and the layout the pod recorded are held against
-    the cell (``_validate_sglang_moe_producer``). A caller without a plan passes nothing, and that comparison is
-    then not made.
+    When the backend is ``sglang``, what the pod recorded is held against the cell: for True the content and the
+    layout (``_validate_sglang_moe_producer``), for False the layout (``_validate_sglang_dense_producer``). A
+    caller without a plan passes nothing, and neither comparison is then made.
+
+    Two comparisons are made for every rank file of the backend ``sglang``, with or without a plan: the release
+    the launcher checked against the pod's provenance file, and the dtype of the engine's KV pool against the
+    KV-cache label of the cell (``_validate_sglang_kv_cache_dtype``).
     """
 
     rank_payloads = _rank_artifacts(raw_root)
@@ -1059,6 +1291,9 @@ def validate_native_collection(
                     "native SGLang producer.sglang_version differs from the Collector provenance runtime: "
                     f"expected {backend_version!r}, found {launcher_version!r}: {path}"
                 )
+            # The rows of the cell carry its KV-cache label, and SGLang chooses the dtype of an ``auto`` pool
+            # itself. The pod records the dtype every scheduler process stored.
+            _validate_sglang_kv_cache_dtype(cell, producer, path)
         if input_provenance is None:
             input_provenance = evidence
         elif _without_sidecar_names(evidence) != _without_sidecar_names(input_provenance):
@@ -1256,6 +1491,10 @@ def validate_native_collection(
         # The last rule, so that a file set another rule refuses keeps the refusal it had.
         for path, payload in rank_payloads:
             _validate_sglang_moe_producer(cell, payload.get("producer"), path)
+    if expected_backend == "sglang" and expected_moe is False:
+        # In the place of the rule above, for the plan of a model without expert layers.
+        for path, payload in rank_payloads:
+            _validate_sglang_dense_producer(cell, payload.get("producer"), path)
     if power_statuses:
         skipped = {status: count for status, count in sorted(power_statuses.items()) if status != "measured"}
         logger.info(

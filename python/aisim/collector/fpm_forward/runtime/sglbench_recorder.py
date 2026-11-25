@@ -21,7 +21,8 @@ What it does
     result or exception on unchanged. Around these calls it writes a log:
 
     - one header line, after the stock ``__init__`` has returned: which process this is, the admission limits
-      the scheduler holds, the captured graph sizes, and the settings a reader tests before it trusts a run;
+      the scheduler holds, the captured graph sizes, the dtype of its KV pool, and the settings a reader tests
+      before it trusts a run;
     - one batch line per call of ``process_batch_result``: the forward mode, the request ids, the launch time
       SGLang stamped on the batch, the time at which the output of the batch was on the host, and the token
       counts of all attention-DP ranks in the step, as the batch holds them;
@@ -30,20 +31,29 @@ What it does
     A recorder that cannot open its log leaves a working scheduler and no header. A reader must refuse a run
     in which a scheduler process has no header, and must fail a run on any fault line.
 
-Log format 2
+Log format 3
     Directory: the value of ``AISIM_SGLBENCH_RECORDER_DIR``, which the launcher creates for each run. One file
     per scheduler process, ``sched-<pid>.jsonl``, created new (an existing file is never appended to), UTF-8,
     one compact JSON object per line, flushed after every line. The header is always the first line.
 
     Header::
 
-        {"type": "header", "format": 2, "pid": int, "class": str, "mro": [str, str, str], "sglang_version": str,
+        {"type": "header", "format": 3, "pid": int, "class": str, "mro": [str, str, str], "sglang_version": str,
          "leader": bool, "ranks": {...}, "limits": {...}, "decode_graph_sizes": [int, ...],
-         "prefill_graph_sizes": [int, ...], "enable_overlap": bool, "checks": {...}}
+         "prefill_graph_sizes": [int, ...], "enable_overlap": bool, "kv_cache_stored_dtype": str,
+         "checks": {...}}
 
     ``ranks``, ``limits`` and ``checks`` hold the names listed in ``_RANK_NAMES``, ``_LIMIT_NAMES`` and
     ``_CHECK_NAMES``. A value that could not be read is written as ``{"unreadable": "<repr of the error>"}``.
     It is never left out and never replaced by a default.
+
+    ``kv_cache_stored_dtype`` is the torch dtype the KV pool of this process was built with, as text:
+    ``str(model_runner.kv_cache_dtype)``, for example ``"torch.bfloat16"`` or ``"torch.float8_e4m3fn"``. It is
+    what SGLang made of ``--kv-cache-dtype`` once the model was loaded (srt/model_executor/model_runner.py,
+    ``ModelRunner.configure_kv_cache_dtype``; srt/mem_cache/kv_cache_dtype.py, ``configure_kv_cache_dtype``):
+    with ``auto`` the dtype of the model, or an FP8 dtype for a model whose quantization config asks for an
+    FP8 KV cache. The argument alone does not say which. It is the only key format 3 adds to format 2; every
+    other key and every batch line is unchanged.
 
     Batch line::
 
@@ -99,7 +109,8 @@ v0.5.23 (297e54fd105e974cdf401e5b4d20253a22c16f90) of ``sgl-project/sglang`` (Ap
 under ``python/sglang`` at both tags::
 
     srt/managers/scheduler.py            run_scheduler_process, Scheduler.__init__, Scheduler.init_ipc_channels,
-                                         Scheduler.init_model_worker, Scheduler.init_chunked_prefill,
+                                         Scheduler.init_model_worker, Scheduler.init_tp_model_worker,
+                                         Scheduler.init_chunked_prefill,
                                          Scheduler.init_schedule_policy,
                                          Scheduler.init_watch_dog_memory_saver_input_blocker,
                                          Scheduler.run_batch, Scheduler.process_batch_result,
@@ -122,9 +133,14 @@ under ``python/sglang`` at both tags::
                                          process_batch_result_idle
     srt/managers/scheduler_components/ipc_channels.py  SchedulerIpcChannels.create
     srt/managers/schedule_policy.py      _IS_HIP
-    srt/managers/tp_worker.py            TpModelWorker.model_runner, TpModelWorker.get_worker_info
+    srt/managers/tp_worker.py            TpModelWorker.__init__, TpModelWorker.model_runner,
+                                         TpModelWorker.get_worker_info
     srt/model_executor/forward_batch_info.py  ForwardMode (member names), ForwardBatch.prepare_mlp_sync_batch
-    srt/model_executor/model_runner.py   ModelRunner.init_cuda_graphs
+    srt/model_executor/model_runner.py   ModelRunner.init_cuda_graphs, ModelRunner.__init__,
+                                         ModelRunner.initialize, ModelRunner.configure_kv_cache_dtype,
+                                         ModelRunner.init_kv_cache_configurator, ModelRunner.alloc_memory_pool
+    srt/mem_cache/kv_cache_dtype.py      configure_kv_cache_dtype
+    srt/mem_cache/kv_cache_configurator.py  KVCacheConfigurator.kv_cache_dtype
     srt/model_executor/runner/decode_cuda_graph_runner.py   DecodeCudaGraphRunner.capture_bs
     srt/model_executor/runner/prefill_cuda_graph_runner.py  PrefillCudaGraphRunner.capture_num_tokens
     srt/model_executor/runner/eager_runner.py                EagerRunner
@@ -166,6 +182,18 @@ on the source; more than two ranks (the runs with four ranks used a copy of this
 it); a decode batch that SGLang turned into an extend batch. The files of the runs are not kept in this
 repository.
 
+Format 3 differs from format 2 by the header key ``kv_cache_stored_dtype``, which was read in the source at
+both tags. It ran on engines on 2026-11-25, through sglbench_launcher.py and AISim's collector, on H200 GPUs
+with one dense model (``Qwen/Qwen3-0.6B``): with SGLang 0.5.23 three prefill cells of a smoke grid, on one GPU
+with ``--kv-cache-dtype auto`` and with ``fp8_e4m3`` and on two GPUs at ``--tp-size 2`` with ``auto``, and with
+SGLang 0.5.22 two decode cells of a smoke grid on one GPU, one for each of the two arguments. Every header
+held ``"torch.bfloat16"`` for ``auto`` and ``"torch.float8_e4m3fn"`` for ``fp8_e4m3``, and the two processes
+of the cell on two GPUs held the same text. So the class of a real torch dtype is told by its module and name
+as ``_kv_cache_stored_dtype`` tells it. Not run on an engine with format 3: DP attention, a model with expert
+layers, a model whose ``auto`` pool is not bfloat16, and a value that is marked unreadable; these have run in
+the tests only, where the scheduler and its model runner are FAKE. The files of the runs are not kept in this
+repository.
+
 No upstream function or block of source is copied. What follows SGLang and Dynamo is named in the header of this
 file and recorded in THIRD_PARTY_NOTICES.md. For this module that is SGLang alone.
 """
@@ -182,7 +210,7 @@ import time
 # scheduler processes inherit it.
 ENV_RECORDER_DIR = "AISIM_SGLBENCH_RECORDER_DIR"
 
-RECORD_FORMAT = 2
+RECORD_FORMAT = 3
 
 # The name of the subclass. A reader compares the header's "class" with it. It is the only sign that the hook
 # was applied: SGLang logs a hook that failed to apply and builds the stock class instead
@@ -285,9 +313,10 @@ _CHECK_NAMES = (*_CHECK_VALUE_NAMES, *_CHECK_PRESENCE_NAMES, "pp_max_micro_batch
 #   and ``MODE_IDLE``).
 # Not listed, because only an object of a running scheduler holds them: the attributes that
 # ``Scheduler.__init__`` sets (``_LIMIT_NAMES``, ``_CHECK_VALUE_NAMES``, ``_CHECK_PRESENCE_NAMES``,
-# ``recv_from_tokenizer``, ``enable_overlap``, ``tp_worker`` with its graph runners), the values of
-# ``get_parallel()`` (``_RANK_NAMES``), ``Req.rid`` and ``synchronize`` of the copy event. The header marks a
-# value it cannot read, and a batch that cannot be read gets a fault line.
+# ``recv_from_tokenizer``, ``enable_overlap``, ``tp_worker`` with its model runner, whose graph runners and
+# ``kv_cache_dtype`` exist once the runner has loaded its model), the values of ``get_parallel()``
+# (``_RANK_NAMES``), ``Req.rid`` and ``synchronize`` of the copy event. The header marks a value it cannot
+# read, and a batch that cannot be read gets a fault line.
 SGLANG_SEAM_NAMES = (
     ("sglang", "__version__", "name"),
     ("sglang.srt.managers.scheduler", "Scheduler", "class"),
@@ -468,6 +497,26 @@ def _prefill_graph_sizes(scheduler) -> list:
     return _whole_numbers(runner.capture_num_tokens, "prefill_cuda_graph_runner.capture_num_tokens")
 
 
+def _kv_cache_stored_dtype(scheduler) -> str:
+    # sglang/srt/model_executor/model_runner.py, ModelRunner.configure_kv_cache_dtype sets kv_cache_dtype, a
+    # torch dtype, from sglang/srt/mem_cache/kv_cache_dtype.py, configure_kv_cache_dtype. ModelRunner.__init__
+    # calls ModelRunner.initialize, which calls it once the model is loaded, and no other method of the
+    # runner writes the attribute. The runner is built by TpModelWorker.__init__
+    # (sglang/srt/managers/tp_worker.py), and the worker by Scheduler.init_tp_model_worker inside the stock
+    # Scheduler.__init__, so the attribute is set when the header is written. The KV pool is built with it:
+    # ModelRunner.alloc_memory_pool hands it to the KVCacheConfigurator
+    # (sglang/srt/mem_cache/kv_cache_configurator.py), which passes it to the pool as its dtype.
+    # Not read: model_runner.kv_cache_dtype_str. With the argument "auto" it stays "auto" whatever dtype the
+    # model has, so it does not tell a bfloat16 pool from a float16 one.
+    # torch is not imported here: the class of a torch dtype is torch.dtype, which is tested by its name, and
+    # the text of a dtype is its name after "torch.".
+    dtype = scheduler.tp_worker.model_runner.kv_cache_dtype
+    kind = type(dtype)
+    if (kind.__module__, kind.__name__) != ("torch", "dtype"):
+        raise TypeError(f"model_runner.kv_cache_dtype is a {kind.__module__}.{kind.__name__}, not a torch.dtype")
+    return str(dtype)
+
+
 def _checks(scheduler) -> dict:
     values = _read_each(scheduler, _CHECK_VALUE_NAMES)
     for name in _CHECK_PRESENCE_NAMES:
@@ -495,6 +544,7 @@ def _header(scheduler) -> dict:
         "decode_graph_sizes": _guarded(lambda: _decode_graph_sizes(scheduler)),
         "prefill_graph_sizes": _guarded(lambda: _prefill_graph_sizes(scheduler)),
         "enable_overlap": _guarded(lambda: _enable_overlap(scheduler)),
+        "kv_cache_stored_dtype": _guarded(lambda: _kv_cache_stored_dtype(scheduler)),
         "checks": _checks(scheduler),
     }
 

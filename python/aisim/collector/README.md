@@ -254,8 +254,8 @@ schema versions (2, and 3 with a power window) through the rendered
 and completion in-pod without a Collector-side text patch. It does not inspect
 the power block: the pod preflight rejects an image that does not record window
 step timings, and the Collector's native artifact reader rejects a schema-3
-power block without `step_wall_times_s`. `--fpm-measure-power` (default on; never run by
-`--smoke`) requests the per-point power window and publishes `power_w`; see the
+power block without `step_wall_times_s`. `--fpm-measure-power` (default on, except with
+`--backend sglang`; never run by `--smoke`) requests the per-point power window and publishes `power_w`; see the
 [onboarding guide](../../../docs/perf-model/fpm-self-service/implementation.md#how-the-collection-grid-is-determined)
 for its requirements and publication rules. Formal
 `fpm_forward_perf.parquet` output uses metadata schema 7, or schema 8 once any
@@ -337,13 +337,23 @@ An SGLang plan must give:
 It may not give `--fpm-model-profile`, `--fpm-runtime-instrumentation`,
 `--fpm-runtime-launch`, `--fpm-runtime-configuration`, `--fpm-cudagraph-mode`,
 `--fpm-cudagraph-capture-sizes`, `--fpm-max-cudagraph-capture-size`,
-`--fpm-enforce-eager`, `--fpm-decoder-replay`, or an explicit backend identity
+`--fpm-enforce-eager`, `--fpm-decoder-replay`, `--fpm-measure-power`, or an
+explicit backend identity
 (`--fpm-moe-backend`, `--fpm-attention-backend`, `--fpm-enable-wideep true`,
 `--fpm-enable-eplb true`). Planning also refuses a model with an FPM execution
 identity (DeepSeek V4.1, GLM-5.3-Flash) and, for an MoE model, every cell
 other than the one-GPU cell, the pure TP cells, the TEP cells and the DEP
 cells ([MoE cells](#moe-cells)).
 Repeatability validation and the runtime probe remain vLLM only.
+
+An SGLang plan measures no power. The launcher has no power window, so
+`--fpm-measure-power` is off by default for this backend, where it is on by
+default for vLLM, and is refused when it is given. The rows of an SGLang table
+therefore carry no `power_w`, as those of a vLLM campaign collected with
+`--no-fpm-measure-power`, the saved plan holds no `measure_power`, and the
+table is published with metadata schema 7. The option is refused and not
+ignored so that a saved plan never names a measurement its rows do not hold.
+`--no-fpm-measure-power` is accepted and changes nothing.
 
 An SGLang cell runs on one node. Planning does not know how many GPUs a node
 holds, so a plan whose `--fpm-max-gpus` exceeds one node is admitted and each
@@ -429,14 +439,18 @@ serving deployment, and the last two apply to DEP cells only
   accepts two SGLang releases, and neither is the collector's operator pin
   (`0.5.21` in `framework_manifest.yaml`). The formal FPM path does not consult
   that pin for any backend.
+- Power (`planner.py`, `_require_sglang_launcher_inputs`). A vLLM plan
+  measures the GPU power of each point by default. An SGLang plan measures
+  none, and the option that asks for it is refused.
 - KV cache of a `bfloat16` cell (`sglang_fpm_builder.py`). A cell whose
   KV-cache dtype is `bfloat16` passes `--kv-cache-dtype auto`, as the
   generated serving deployment does, where the vLLM render of the same cell
   passes `bfloat16`. Its rows carry `bfloat16`. For some checkpoints SGLang
-  makes an FP8 KV cache of `auto`, and neither the launcher nor the host
-  compares the type SGLang stored with the label of the rows.
+  makes an FP8 KV cache of `auto`. The pod records the dtype the engine
+  stored, and validation refuses a cell whose label does not stand for it,
+  so such a cell publishes no row.
   [KV cache of a bfloat16 cell](#kv-cache-of-a-bfloat16-cell) names the
-  checkpoints and says what to do today.
+  checkpoints and says what to do when a cell is refused.
 - Static memory of a DEP prefill cell (`sglang_fpm_builder.py`). The cell
   writes the chunk size as the token budget times the number of ranks, so
   that each attention-DP rank gets the whole budget, as a vLLM rank does.
@@ -455,14 +469,122 @@ serving deployment, and the last two apply to DEP cells only
 
 #### KV cache of a bfloat16 cell
 
-This is a known gap, not closed. A plan gives a cell the KV-cache dtype
-`bfloat16` when `--fpm-kv-cache-dtypes` names it, and when the option is
-left out and AISim takes the checkpoint's own KV cache for bfloat16. The
-cell passes `--kv-cache-dtype auto`, and every row of it carries `bfloat16`
-as `kv_cache_dtype`. With `auto` SGLang stores the dtype it loads the model
+A plan gives a cell the KV-cache dtype `bfloat16` when
+`--fpm-kv-cache-dtypes` names it, and when the option is left out and AISim
+takes the checkpoint's own KV cache for bfloat16. The cell passes
+`--kv-cache-dtype auto`, and every row of it carries `bfloat16` as
+`kv_cache_dtype`. With `auto` SGLang stores the dtype it loads the model
 in, unless one of its own rules puts an FP8 KV cache (`fp8_e4m3`) in its
-place. The rules were read in SGLang's source at 0.5.22 and 0.5.23, not
-run:
+place. The pod therefore records what the engine stored, and validation
+holds it against the label of the cell.
+
+The `producer` block of every result file of a run that completed has two
+keys for it:
+
+- `kv_cache_dtype` is the argument after SGLang resolved it: `auto`, or
+  the choice that the command or one of SGLang's overrides named. The
+  launcher reads it before the engine is built.
+- `kv_cache_stored_dtype` is the dtype the engine built its KV pool with,
+  as the text of a torch dtype, for example `torch.bfloat16` or
+  `torch.float8_e4m3fn`. The recorder reads it in every scheduler process,
+  from the model runner (`ModelRunner.kv_cache_dtype` in
+  `srt/model_executor/model_runner.py`), once the model is loaded. A run
+  whose scheduler processes report different dtypes fails in the pod
+  (`rejected: scheduler processes disagree on kv_cache_stored_dtype`).
+
+Validation requires the stored dtype to be one the label of the cell stands
+for, in every rank file of every SGLang cell, of a dense and of an MoE model
+(`_validate_sglang_kv_cache_dtype` in `native_artifact.py`):
+
+| KV-cache dtype of the cell | Stored dtype | Resolved argument |
+|---|---|---|
+| `bfloat16` | `torch.bfloat16` or `torch.float16` | not compared |
+| `fp8` | `torch.float8_e4m3fn` | not compared |
+| `nvfp4` | `torch.float4_e2m1fn_x2` | `nvfp4` |
+
+A float16 pool passes for a `bfloat16` cell: its values are as wide, AISim
+has no KV-cache dtype for float16, and a checkpoint that SGLang loads in
+float16 could not be collected otherwise.
+
+`nvfp4` is the KV-cache dtype AISim infers for a checkpoint whose
+quantization config declares an NVFP4 KV cache. No plan carries it today.
+Planning refuses such a checkpoint with `unsupported FPM KV-cache dtype
+'nvfp4'`, unless `--fpm-kv-cache-dtypes` names another dtype for its cells,
+and the option cannot name `nvfp4`. No packaged model config declares such
+a cache either. The row of the table is there for a caller that hands the
+validator a cell with that dtype, and for a plan once planning admits it;
+the cell builder passes the dtype to SGLang under that name. For that dtype
+the resolved argument is compared as well. SGLang stores its two 4-bit KV
+caches, `nvfp4` and `fp4_mx_block16`, in the same torch dtype, and the pool
+of a model without MLA attention takes its recipe from the argument
+(`resolve_kv_cache_quant` in
+`srt/layers/quantization/fp4_kv_cache_quant_method.py`). SGLang accepts the
+argument on a Blackwell GPU of compute capability 10 or 12 only
+(`handle_kv4_compatibility` in `srt/arg_groups/kv_cache_hook.py`), and it
+builds no engine with it for a model with MLA attention: the argument makes
+`trtllm_mha` the decode backend, which refuses such a model
+(`srt/layers/attention/attention_registry.py`). Which prefill path such a
+cell would measure follows the GPU. At capability 10 prefill reads the
+packed cache as it is, and elsewhere through an FP8 workspace, unless the
+command names `--prefill-kv-cache-dequant-dtype`, which no cell writes. The
+resolved value is in `resolved-config-node0.json` and not in the `producer`
+block.
+
+The resolved argument of an `fp8` cell is not compared. SGLang stores
+`torch.float8_e4m3fn` for its argument `mxfp8` as well, which builds
+another pool. No cell asks for that argument and no override of SGLang read
+at either release gives it, so the files of a pod that ran `mxfp8` would
+pass for an `fp8` cell.
+
+A file without `kv_cache_stored_dtype`, or with a value that is not text, is
+refused. So is every file of a cell whose KV-cache dtype has no row in the
+table, whatever it records: `int8`, whose cells are already refused when
+they are rendered. The refusal names the label, the stored dtype and the
+resolved argument:
+
+```text
+native SGLang rank artifact did not store the KV cache of its cell: the
+cell's kv_cache_dtype 'bfloat16' stands for producer.kv_cache_stored_dtype
+'torch.bfloat16' or 'torch.float16', found 'torch.float8_e4m3fn'
+(producer.kv_cache_dtype 'auto'): <rank file>
+```
+
+The message is one line; it is wrapped here. A cell that is refused in this
+way ran to the end in its pod, because neither the launcher nor the driver
+is told the KV-cache dtype of its cell. It publishes no row.
+
+A rank file of a collection made before the two keys existed holds
+neither. A plan made from this source refuses it for its plan hash first,
+because the collector revision is part of the hash. Where
+`FPM_COLLECTOR_SOURCE_REVISION` holds the revision at one value, the file
+reaches this check and is refused for the missing key.
+
+What the recorder reads was read in SGLang's source at 0.5.22 and 0.5.23.
+On 2026-11-25 the check ran on H200 GPUs with one dense model
+(`Qwen/Qwen3-0.6B`), on five smoke cells collected through the collector:
+with SGLang 0.5.23 a prefill cell on one GPU for each of `bfloat16` and
+`fp8` and a `bfloat16` prefill cell at a tensor-parallel size of 2, and
+with SGLang 0.5.22 a decode cell on one GPU for each of the two. The
+`bfloat16` cells recorded `torch.bfloat16` with the argument `auto`, the
+`fp8` cells `torch.float8_e4m3fn` with `fp8_e4m3`, both scheduler processes
+of the cell on two GPUs recorded the same dtype, and all five cells passed.
+The files of each cell, held against every other KV-cache dtype by a call
+of the validator with the label replaced, were refused with a text of this
+check: the one above for the other of `bfloat16` and `fp8`, and the `no
+rule says` text for `int8` and for `nvfp4`, which had no row of the table
+then. The files of the runs are not kept in this repository.
+
+Not run on an engine: a checkpoint for which SGLang makes an FP8 pool of
+`auto`, the case the check is there for; a model SGLang loads in float16; a
+cell of an MoE plan or under DP attention with the two keys; scheduler
+processes that disagree; a refusal inside a collection; an `nvfp4` cell,
+whose row of the table was read in SGLang's source at both releases. These
+have run in the unit tests only, on typed-in result files and on files the
+launcher writes there against a FAKE of SGLang whose FAKE schedulers hold a
+FAKE dtype.
+
+SGLang's rules say when a `bfloat16` cell stores FP8 and is refused. They
+were read in SGLang's source at 0.5.22 and 0.5.23, not run:
 
 - A DeepSeek sparse-attention model on a GPU of compute capability 10 or
   above, the B200 class (`_dsa_kv_cache_dtype_default` in
@@ -481,7 +603,8 @@ run:
   (`_muse_spark_overrides` in the same file), and a MiniMax-M3 checkpoint
   that declares MXFP8 weights with NVFP4 packed experts. On a Blackwell GPU
   SGLang turns the argument into `fp8_e4m3`
-  (`srt/arg_groups/model_overrides/minimax_m3.py`). On another GPU the
+  (`srt/arg_groups/model_overrides/minimax_m3.py`), and the pool it then
+  builds packs keys and values as NVFP4 (below). On another GPU the
   argument stays `auto`, and a comment in that file says the KV dtype then
   stays the model's. The quantization config SGLang builds for such a
   checkpoint always names FP8 as its KV-cache algorithm, though
@@ -506,12 +629,8 @@ run:
 Where no rule applies, the dtype of the model is not always bfloat16
 either. For a config that names float16 it is float16, and for one that
 names float32 or no dtype it is float16 unless the model is a Gemma
-(`_get_and_verify_dtype` in `srt/configs/model_config.py`).
-
-Neither the launcher nor the host checks any of this today. No result file
-records the type SGLang stored and validation compares none, so a
-`bfloat16` cell of such a checkpoint completes, and its rows, measured with
-an FP8 KV cache, are published under the label `bfloat16`.
+(`_get_and_verify_dtype` in `srt/configs/model_config.py`). Such a cell
+stores float16 and is accepted as a `bfloat16` cell.
 
 The 97 packaged model configs were held against the rules on 2026-11-24:
 the architecture names and config keys above, beside the KV-cache dtype
@@ -526,16 +645,16 @@ a rule are of two kinds:
   GLM-5.3-Flash configs that AISim takes for FP8, and the other checkpoints
   with FP8 or NVFP4 weights whose quantization config names an FP8 KV
   cache. With `--fpm-kv-cache-dtypes bfloat16` their plans hold `bfloat16`
-  cells, and each such cell that renders and runs is measured with an FP8
-  cache where its rule gives one.
+  cells, and each such cell that renders and runs stores an FP8 cache
+  where its rule gives one, and is refused.
 - For four, AISim takes the KV cache for bfloat16 where SGLang's first rule
   does not: `zai-org/GLM-5`, `zai-org/GLM-5.1`, `zai-org/GLM-5.2` and
   `zai-org/GLM-5.3-BF16`. Their plans hold `bfloat16` cells without any
   option, and on a B200-class GPU SGLang would run them with an FP8 cache.
   Their architecture is `GlmMoeDsaForCausalLM`, whose cells are refused
   when they are rendered ([MoE cells](#moe-cells)), so none of them
-  publishes such a row at these releases. No other packaged config that
-  AISim takes for bfloat16 is under a rule.
+  reaches the check at these releases. No other packaged config that AISim
+  takes for bfloat16 is under a rule.
 
 No packaged config has the Muse Spark architecture, and the packaged
 `nvidia/MiniMax-M3-NVFP4` config does not meet the MiniMax-M3 rule: it
@@ -544,30 +663,80 @@ checkpoint that is not packaged falls under the same rules by its own
 config.
 
 The models collected so far, `Qwen/Qwen3-0.6B` and
-`Qwen/Qwen1.5-MoE-A2.7B`, are not affected. Neither architecture is under a
-rule, neither config has a quantization config, and both name bfloat16 as
-their dtype. The resolved arguments kept from their runs at both releases
-hold `auto` as the KV-cache dtype; those files are not in this repository.
+`Qwen/Qwen1.5-MoE-A2.7B`, are under no rule: neither architecture is named
+by one, neither config has a quantization config, and both name bfloat16 as
+their dtype. By the source their `bfloat16` cells store `torch.bfloat16`
+and pass the check; that has not been run. The resolved arguments kept from
+their runs at both releases hold `auto` as the KV-cache dtype; those files
+are not in this repository, and they were written before the stored dtype
+was recorded.
 
-What to do today:
+What to do when a cell is refused:
 
-- **Plan the cells as `fp8`.** For a checkpoint under one of the rules, on
-  a GPU where the rule gives FP8, `--fpm-kv-cache-dtypes fp8` plans `fp8`
-  cells. Such a cell passes `--kv-cache-dtype fp8_e4m3`, and its rows carry
-  `fp8`, the type the cell asks SGLang for. No option of a plan makes an
-  SGLang cell pass `--kv-cache-dtype bfloat16`: `bf16` and `bfloat16` both
-  name the `bfloat16` cell, which passes `auto`.
-- **Check a collected `bfloat16` cell by hand.** The launcher writes
-  SGLang's resolved arguments to
+- **A `bfloat16` cell that stored FP8: plan the cells as `fp8`.** For a
+  checkpoint under one of the rules, on a GPU where the rule gives FP8,
+  `--fpm-kv-cache-dtypes fp8` plans `fp8` cells. Such a cell passes
+  `--kv-cache-dtype fp8_e4m3`, and its rows carry `fp8`, the type the cell
+  asks SGLang for and the type the check then requires. No option of a plan
+  makes an SGLang cell pass `--kv-cache-dtype bfloat16`: `bf16` and
+  `bfloat16` both name the `bfloat16` cell, which passes `auto`. So no
+  `bfloat16` table can be collected from SGLang for such a checkpoint on
+  such a GPU.
+- **Read which rule acted.** The refusal names `producer.kv_cache_dtype`.
+  With `fp8_e4m3` there, one of the first three rules turned the argument
+  when SGLang resolved it. With `auto`, the fourth rule acted: the
+  quantization config of the loaded model asked for FP8. The launcher also
+  writes the resolved arguments to
   `cells/<cell_id>/raw/<pod>/resolved-config-node0.json` before the engine
-  is built. Its `config.server_args.kv_cache_dtype` shows what the first
-  three rules made of `auto`: read in SGLang's source, it is `fp8_e4m3`
-  where one of them gave FP8, and no such file has been seen. The fourth
-  rule acts after the file is written, so the file still shows `auto` where
-  only that rule applies; the MiniMax-M3 checkpoint above on a GPU that is
-  not Blackwell would be such a case. For it, read the `quantization_config`
-  or `compression_config` of the checkpoint's `config.json` and its
-  `hf_quant_config.json`.
+  is built; `config.server_args.kv_cache_dtype` there is the same value.
+- **A stored dtype that no row of the table holds**, for example
+  `torch.float32`, or another dtype than `torch.float8_e4m3fn` for an `fp8`
+  cell. No rule read in SGLang's source gives one for the command of a
+  cell on an NVIDIA GPU, so this is a finding about the engine: keep the
+  files of the cell and do not publish them under another label.
+- **An `nvfp4` cell.** No plan holds one today. The command of such a cell
+  carries `--kv-cache-dtype nvfp4`, so the check wants
+  `torch.float4_e2m1fn_x2` as the stored dtype and `nvfp4` as the resolved
+  argument. A refusal that names another resolved argument, for example
+  `fp4_mx_block16`, says that another command reached the pod or that
+  SGLang's resolution changed the argument. Either is a finding: keep the
+  files of the cell and do not publish them under another label. On a GPU
+  where SGLang does not take the argument the cell ends in the pod with
+  the launcher's rejection, which quotes SGLang's message, and for a model
+  with MLA attention the engine build fails. Neither publishes a row, and
+  neither is a finding.
+
+Two cases are outside the check. For DeepSeek V4, SGLang has a unified KV
+pool whose dtype does not follow `--kv-cache-dtype` in either direction
+(`DSV4PoolConfigurator` in `srt/model_executor/pool_configurator.py`). It
+is selected by `SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton`, stores
+bfloat16, and stores FP8 when `SGLANG_DSV4_UNIFIED_KV_FP8` is set as well.
+The recorder reads the dtype the model runner holds, which follows the
+argument. SGLang makes `fp8_e4m3` of `auto` for this architecture, so the
+runner holds an FP8 dtype over a pool that by default stores bfloat16; and
+with an argument of `bfloat16` it would hold bfloat16 over a pool that
+stores FP8 under the second variable. No cell reaches either case at these
+releases. Both variables take effect on an AMD GPU only
+(`is_unified_kv_triton` and `is_unified_kv_fp8`, in
+`kernels/ops/attention/dsv4/unified_kv_kernels/env_gate.py` at 0.5.22 and
+in `srt/layers/attention/dsv4/unified_kv_gate.py` at 0.5.23), where the
+launcher refuses to run. No cell passes `bfloat16`: a cell of a plan
+passes `auto` or `fp8_e4m3`. And the cells of DeepSeek V4 are refused today,
+some when they are rendered and the others in the pod as hybrid models
+([MoE cells](#moe-cells)). This was read in the source at both releases,
+not run. A change that admits such a pool has to refuse both variables or
+record the dtype of that pool.
+
+The second case is at 0.5.23 only. For a MiniMax-M3 checkpoint with NVFP4
+packed experts on a Blackwell GPU, the pool packs its keys and values as
+NVFP4 (`MiniMaxM3Nvfp4KVPool` in `srt/mem_cache/minimax_m3_nvfp4_pool.py`),
+while the argument must be `fp8_e4m3` and the model runner holds the FP8
+dtype. An `fp8` cell of such a checkpoint would therefore pass over an NVFP4
+pool. No cell reaches it: the cells of MiniMax-M3 are refused when they are
+rendered ([MoE cells](#moe-cells)), and the packaged config does not meet
+SGLang's rule for such a checkpoint. This was read in the source, not run. A
+change that admits those cells has to record the class of the pool or refuse
+that quantization.
 
 #### MoE cells
 
@@ -792,7 +961,9 @@ attention. It wrote no such key before it could run DP attention; a result
 file of that time belongs to a plan of that source revision and is refused
 under a plan made now for its plan hash, before this comparison. Where
 `FPM_COLLECTOR_SOURCE_REVISION` holds the revision at one value, such a
-file reaches this comparison and is refused by it.
+file gets past the plan hash. It holds no `kv_cache_stored_dtype` either, so
+the KV-cache comparison, which is made first, refuses it
+([KV cache of a bfloat16 cell](#kv-cache-of-a-bfloat16-cell)).
 For a pure TP cell of N GPUs the three sizes are N, 1 and 1, and for
 its TEP cell N, N and 1: the expert-parallel size is all that tells a result
 of the one from a result of the other. Two kinds of run
@@ -806,7 +977,36 @@ reaches the pod without the flag, or that of a pure TP cell with it. The cell
 fails with `native SGLang rank artifact of a MoE plan did not send dataset
 text` or `... did not run the layout of its cell`. The comparison is made
 when a cell has run, when a resume looks at the files of a cell again, and
-when rows are built. The plan of a dense model makes no such comparison.
+when rows are built.
+
+The plan of a dense model makes a comparison of its own at the same three
+moments, of the layout alone. Its cells are tensor-parallel cells with one
+data-parallel rank, and the launcher is not told the tensor-parallel size of
+its cell: a command that reaches the pod with another `--tp-size`, or without
+one, runs to the end. So `producer.tp_size` must be the cell's `tp` and
+`producer.attn_dp_size` must be 1, each as an integer. `producer.moe` must be
+`null`, which the launcher writes when it finds no expert key in the model
+config, or a block whose `ep_size` is the integer 1. The launcher finds
+expert layers when one of six config keys (`EXPERT_KEYS`) holds a value other
+than zero, null or empty, where the plan wants a count above 1 in one of
+three of them, so the launcher can find expert layers in a model the plan
+takes for dense. It then records a `producer.moe` block and accepts an
+`--ep-size` equal to the tensor-parallel size, which is the TEP layout: that
+result is refused. With an `ep_size` of 1 every rank holds a slice of every
+expert, which is the tensor parallelism of the cell, and the result is
+accepted. A producer block without one of the three keys is refused, as the
+launcher writes them into every result file of a run that completed. The cell
+fails with `native SGLang rank artifact of a dense plan did not run the
+layout of its cell`. The content source is not compared. On 2026-11-25 this
+comparison accepted the files of five smoke cells of `Qwen/Qwen3-0.6B` on
+H200 GPUs: with SGLang 0.5.23 two prefill cells on one GPU and one at a
+tensor-parallel size of 2, and with SGLang 0.5.22 two decode cells on one
+GPU. Called by hand on those files, it refused the files of the one-GPU
+cell for the cell of two GPUs and the reverse. A tensor-parallel size above
+2, a `producer.moe` block under this comparison and a refusal inside a
+collection have run in the unit tests only: on result files that were typed
+in, and on the files the launcher writes when the tests put a stand-in in
+the place of SGLang.
 
 A cell of a dense model has the same cell id and the same row labels whether
 it sent dataset text or seeded token ids: apart from the measured times, only

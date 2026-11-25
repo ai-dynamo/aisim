@@ -64,7 +64,22 @@ GATE_ACCEPT, GATE_RANK_PENDING, GATE_MERGED_PENDING, GATE_INVALID = 0, 10, 11, 2
 # rank artifact (sglbench_launcher.py, _start_up_checks), and the validator requires the two to agree for an
 # SGLang cell.
 POD_SGLANG_VERSION = "0.5.23"
-LAUNCHER_PRODUCER = {"sglang_version": POD_SGLANG_VERSION}
+# What the FAKE pod of a cell records about its KV cache, by the KV-cache label of the cell: the argument SGLang
+# resolves for the command the cell builder writes (``auto`` for bfloat16, ``fp8_e4m3`` for fp8), which the
+# launcher records, and the text of the torch dtype the engine then builds its KV pool with for a model that
+# loads in bfloat16, which the recorder reports and the driver records. The validator requires the stored
+# dtype to be one the label of the cell stands for. Typed here; no engine wrote these values. The third label
+# is the one AISim infers for a checkpoint with an NVFP4 KV cache of its own, which no plan carries today: the
+# cell builder passes it on under its own name, SGLang stores its FP4 dtype for it, and the validator wants
+# the argument as well.
+POD_KV_CACHE = {
+    "bfloat16": {"kv_cache_dtype": "auto", "kv_cache_stored_dtype": "torch.bfloat16"},
+    "fp8": {"kv_cache_dtype": "fp8_e4m3", "kv_cache_stored_dtype": "torch.float8_e4m3fn"},
+    "nvfp4": {"kv_cache_dtype": "nvfp4", "kv_cache_stored_dtype": "torch.float4_e2m1fn_x2"},
+}
+# The keys of the producer block that the validator asks of every rank artifact of an SGLang cell. The KV
+# cache is that of an fp8 cell, which the stand-in cell of test_fpm_runner.py is.
+LAUNCHER_PRODUCER = {"sglang_version": POD_SGLANG_VERSION, **POD_KV_CACHE["fp8"]}
 
 FAKE_RUN_ID = "fake-run-1"
 FAKE_GRID_DIGEST = "fake-grid-digest"
@@ -304,9 +319,10 @@ def _pod(root: Path, cell, *, sglang_version: str = POD_SGLANG_VERSION) -> Path:
 
 
 def _validate(cell, root: Path):
-    """The validator as the host calls it for a cell of an SGLang plan of a model without expert layers.
+    """The validator as a caller without a plan calls it for an SGLang cell: it says nothing of expert layers.
 
-    For the plan of a MoE model the host also passes ``expected_moe=True`` (test_fpm_sglang_moe.py).
+    With a plan the host also passes ``expected_moe``, True for a MoE model and False for a dense one, and
+    what the pod recorded of its layout is then held against the cell (test_fpm_sglang_moe.py).
     """
     return validate_native_collection(
         cell, root / "raw", expected_plan_sha256="plan-sha", expected_attempt_id="attempt", expected_backend="sglang"

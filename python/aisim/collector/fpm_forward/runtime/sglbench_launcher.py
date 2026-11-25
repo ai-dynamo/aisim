@@ -96,6 +96,7 @@ files under ``python/sglang`` at both tags::
     srt/arg_groups/fields/spec.py            Spec
     srt/arg_groups/fields/disagg.py          Disagg
     srt/arg_groups/fields/device.py          Device
+    srt/arg_groups/fields/model.py           Model (``kv_cache_dtype``)
     srt/arg_groups/parallel_hook.py          handle_context_parallelism, handle_deprecated_dp_attention,
                                              handle_data_parallelism, handle_dwdp, handle_elastic_ep,
                                              handle_eplb_and_dispatch
@@ -1380,7 +1381,8 @@ def _check_expert_parallel(view: object, experts: dict) -> None:
     Both statements above need ``moe_dp_size`` (``Parallel``) to be 1, which ``_RESOLVED_CHECKS`` has tested by
     now. An ``ep_size`` of 1 at a TP size above 1 is the pure TP cell of a model with expert layers, and an
     ``ep_size`` equal to the TP size is its TEP cell. This function is not told which of the two the cell is:
-    the host holds the recorded size against the cell (native_artifact.py, ``_validate_sglang_moe_producer``).
+    the host holds the recorded size against the cell (native_artifact.py, ``_validate_sglang_moe_producer``,
+    and ``_validate_sglang_dense_producer`` for a cell of a plan whose model has no expert layers).
     """
     ep_size, tp_size = _resolved(view, "ep_size"), _resolved(view, "tp_size")
     if _only(1)(ep_size):
@@ -1585,11 +1587,27 @@ def _resolved_settings(view: object, producer: dict) -> dict:
 
     ``dp_size`` of the run is SGLang's resolved ``attn_dp_size``: the number of ranks every stage is sent to
     and the number of rank files (sglbench_driver.py ``RunSettings``). It is also written into the
-    ``producer`` block, with 1 for a run without DP attention, where the host holds it against the cell
-    (native_artifact.py ``_validate_sglang_moe_producer``).
+    ``producer`` block, with 1 for a run without DP attention, where the host holds it against the cell,
+    as it does ``tp_size`` (native_artifact.py ``_validate_sglang_moe_producer``, and
+    ``_validate_sglang_dense_producer`` for a cell of a plan whose model has no expert layers).
 
     The two request caps stay None in SGLang unless the operator sets them (srt/arg_groups/fields/schedule.py
     ``Schedule``); the driver compares them with the largest batch once the grid exists.
+
+    The resolved ``kv_cache_dtype`` is written into the ``producer`` block and decides nothing here: the
+    argument after SGLang's own overrides, one of the choices of the field and ``auto`` unless the command or
+    an override named another (srt/arg_groups/fields/model.py ``Model``; srt/arg_groups/overrides.py turns
+    ``auto`` into ``fp8_e4m3`` for some architectures). It is not the dtype the engine stores. With ``auto``
+    each scheduler process decides that once it has loaded the model, from the dtype of the model and its
+    quantization config. The recorder reports the stored dtype from every scheduler process and the driver
+    writes it beside this key (sglbench_driver.py, ``kv_cache_stored_dtype``). The launcher is not told the
+    KV-cache label of its cell: the host holds the stored dtype against it and names this value when it
+    refuses, and for a cell labelled ``nvfp4`` it requires this value to be ``nvfp4``, because SGLang stores
+    two FP4 recipes in one dtype (native_artifact.py ``_validate_sglang_kv_cache_dtype``). Read in the
+    source at both tags. In five smoke cells of a dense model on H200 GPUs on 2026-11-25, three with SGLang
+    0.5.23 and two with 0.5.22, the key held ``auto`` for the cells that passed ``auto`` and ``fp8_e4m3``
+    for the cells that passed that. Not run on an engine: an argument that an override of SGLang changed,
+    and the argument ``nvfp4``, which no plan writes today.
     """
     tp_size = _resolved(view, "tp_size")
     if type(tp_size) is not int or tp_size < 1:
@@ -1597,8 +1615,12 @@ def _resolved_settings(view: object, producer: dict) -> dict:
     attn_dp_size = _resolved(view, "attn_dp_size")
     if not _positive_int(attn_dp_size):
         raise TypeError(f"SGLang's resolved attn_dp_size is {attn_dp_size!r}, not a positive int")
+    kv_cache_dtype = _resolved(view, "kv_cache_dtype")
+    if type(kv_cache_dtype) is not str or not kv_cache_dtype:
+        raise TypeError(f"SGLang's resolved kv_cache_dtype is {kv_cache_dtype!r}, not the name of a dtype")
     producer["tp_size"] = tp_size
     producer["attn_dp_size"] = attn_dp_size
+    producer["kv_cache_dtype"] = kv_cache_dtype
     return {
         "expected_scheduler_processes": tp_size,
         "dp_size": attn_dp_size,

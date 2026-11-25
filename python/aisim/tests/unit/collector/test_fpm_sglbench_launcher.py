@@ -34,6 +34,14 @@ is named so:
   driver reads it.
 - ``FakeBaseScheduler``, ``FakeBatch``, ``FakeRequest``, ``FakeResult`` and ``FakeCopyDone`` carry the
   attributes the recorder reads from SGLang's objects.
+- The dtype of the KV pool is FAKE. The model runner of a FAKE scheduler holds a FAKE torch dtype
+  (``_fake_torch_dtype``): no torch is involved. Which one follows the KV-cache dtype the FAKE resolution
+  left, by a FAKE of SGLang's rule for an NVIDIA GPU and a FAKE model that loads in bfloat16 without a
+  quantization config (``FAKE_STORED_KV_DTYPES``). A launch passes ``--kv-cache-dtype fp8_e4m3``, as the cell
+  builder writes it for the stand-in cell of these tests, whose KV-cache label is fp8. A test can pass
+  another choice, give the FAKE resolution an override that names one, as SGLang's per-model overrides do, or
+  make the FAKE engine one that stores another dtype than the argument says, as SGLang does for a model
+  whose quantization config asks for an FP8 KV cache.
 - With ``--attn-dp-size`` above 1 the FAKE engine is one with DP attention, modelled on what was read in
   SGLang's source and on what engines showed on 2026-11-18 (the module docstring of ``sglbench_launcher.py``
   says what ran). It starts one FAKE scheduler process for each attention-DP rank through the same entry, with
@@ -212,6 +220,7 @@ LAUNCHER_PRODUCER_KEYS = (
     "enable_nvidia_megakernel",
     "tp_size",
     "attn_dp_size",
+    "kv_cache_dtype",
     "expert_keys",
     "moe",
 )
@@ -227,6 +236,7 @@ DRIVER_PRODUCER_KEYS = (
     "limits",
     "page_size",
     "enable_overlap",
+    "kv_cache_stored_dtype",
     "content",
     "restaged_points",
     "self_test",
@@ -235,10 +245,12 @@ DRIVER_PRODUCER_KEYS = (
 
 # The fields of SGLang's resolved arguments that the launcher reads, with the value a default single-GPU dense
 # setup resolves to. Typed from the field files of SGLang at both tags (srt/arg_groups/fields: parallel.py,
-# schedule.py, memory.py, serving.py, exec_.py, spec.py, disagg.py, device.py); ``device`` and
+# schedule.py, memory.py, serving.py, exec_.py, spec.py, disagg.py, device.py, model.py); ``device`` and
 # ``prefill_decode_interval`` are None there and resolution fills them in. ``enable_nvidia_megakernel`` exists
-# at v0.5.23 only. The seven fields of the expert layers have these defaults for every model (``ep_size``,
-# ``moe_dense_tp_size`` and ``moe_dp_size`` in parallel.py, the other four in exec_.py ``ExecMoe``). The last
+# at v0.5.23 only. ``kv_cache_dtype`` (model.py) is ``auto`` unless the command or an override of SGLang's
+# resolution names another choice. The seven fields of the expert layers have these defaults for every model
+# (``ep_size``, ``moe_dense_tp_size`` and ``moe_dp_size`` in parallel.py, the other four in exec_.py
+# ``ExecMoe``). The last
 # four are read only with ``attn_dp_size`` above 1 (three in parallel.py, ``enable_tokenizer_batch_encode`` in
 # serving.py); ``load_balance_method`` is ``auto`` there and resolution turns it into ``round_robin`` outside
 # disaggregated serving (srt/arg_groups/serving_hook.py).
@@ -297,6 +309,7 @@ FAKE_RESOLVED_ARGUMENTS = {
     "max_queued_requests": None,
     "device": "cuda",
     "enable_nvidia_megakernel": False,
+    "kv_cache_dtype": "auto",
     "load_balance_method": "round_robin",
     "enable_dp_lm_head": False,
     "enable_dp_attention_local_control_broadcast": False,
@@ -829,6 +842,36 @@ class _FakeProcess:
     dp_rank: int = 0
 
 
+def _fake_torch_dtype(name: str) -> object:
+    """A FAKE of a torch dtype: an object of a class ``dtype`` of a module ``torch`` with the text ``torch.<name>``.
+
+    The recorder imports no torch and tells a dtype by the name of its class. No torch is installed for these
+    tests, so what a real dtype looks like to the recorder was not run here.
+    """
+    return type("dtype", (), {"__module__": "torch", "__str__": lambda self: f"torch.{name}"})()
+
+
+# FAKE of what a scheduler process of SGLang builds its KV pool with, by the resolved ``kv_cache_dtype``, on an
+# NVIDIA GPU and for a FAKE model that loads in bfloat16 and has no quantization config: the dtype of the model
+# for ``auto``, the FP8 dtype for ``fp8_e4m3``, and one FP4 dtype for both of SGLang's FP4 recipes, ``nvfp4``
+# and ``fp4_mx_block16``. Typed from SGLang's srt/mem_cache/kv_cache_dtype.py ``configure_kv_cache_dtype`` at
+# both tags; a real torch dtype has these names.
+FAKE_STORED_KV_DTYPES = {
+    "auto": "bfloat16",
+    "bfloat16": "bfloat16",
+    "fp8_e4m3": "float8_e4m3fn",
+    "nvfp4": "float4_e2m1fn_x2",
+    "fp4_mx_block16": "float4_e2m1fn_x2",
+}
+# The flag of SGLang's KV-cache dtype, and the choice a launch of these tests passes with it unless a test says
+# otherwise: what the cell builder writes for a cell whose KV-cache label is fp8 (sglang_fpm_builder.py
+# ``_KV_CACHE_DTYPES``), which the stand-in cell is. The third is the text of the dtype the FAKE scheduler
+# processes of such a launch store.
+KV_CACHE_FLAG = "--kv-cache-dtype"
+FAKE_KV_CACHE_DTYPE = "fp8_e4m3"
+FAKE_KV_STORED_DTYPE = "torch.float8_e4m3fn"
+
+
 def _fake_blocker_variable_is_on() -> bool:
     """FAKE of how SGLang reads the variable of its input blocker: only true and 1 count, in any letter case."""
     return os.environ.get(BLOCKER_ENV, "false").lower() in ("true", "1")
@@ -857,6 +900,10 @@ class FakeBaseScheduler:
             model_runner=types.SimpleNamespace(
                 decode_cuda_graph_runner=types.SimpleNamespace(capture_bs=list(limits.decode_graph_sizes)),
                 prefill_cuda_graph_runner=types.SimpleNamespace(capture_num_tokens=list(limits.prefill_graph_sizes)),
+                # SGLang's runner holds the torch dtype it builds the KV pool with, and beside it a string
+                # that the recorder must not read.
+                kv_cache_dtype=world.fake_kv_pool_dtype(),
+                kv_cache_dtype_str="FAKE: the string SGLang keeps beside the dtype",
             )
         )
         self.enable_overlap = True
@@ -976,6 +1023,7 @@ def _fake_sglang_modules(world: _FakeWorld) -> dict[str, types.ModuleType]:
         parser.add_argument("--enable-tokenizer-batch-encode", action="store_true")
         parser.add_argument("--load-balance-method", default="auto")
         parser.add_argument("--page-size", type=int, default=1)
+        parser.add_argument(KV_CACHE_FLAG, default="auto", choices=sorted(FAKE_STORED_KV_DTYPES))
         parser.add_argument("--stream-interval", type=int, default=1)
         parser.add_argument(STREAMING_FLAG, action="store_true")
         parsed = parser.parse_args(argv)
@@ -984,6 +1032,7 @@ def _fake_sglang_modules(world: _FakeWorld) -> dict[str, types.ModuleType]:
         world.use(parsed.page_size, parsed.tp_size, parsed.attn_dp_size)
         world.resolved["ep_size"] = parsed.ep_size
         world.resolved["moe_dp_size"] = parsed.moe_dp_size
+        world.resolved["kv_cache_dtype"] = parsed.kv_cache_dtype
         world.resolved["enable_dp_attention_local_control_broadcast"] = (
             parsed.enable_dp_attention_local_control_broadcast
         )
@@ -1163,7 +1212,10 @@ class FakeSglangServerArgs:
     def resolve_once(self) -> None:
         self.world.note("resolve_once")
         if not self.resolved:
-            self.declared = {name: self.world.resolved[name] for name in ("device", "prefill_decode_interval")}
+            # FAKE of a per-model override: it declares its fields over the operator's input.
+            self.world.resolved.update(self.world.overrides)
+            declared = ("device", "prefill_decode_interval", *self.world.overrides)
+            self.declared = {name: self.world.resolved[name] for name in declared}
             self.resolved = True
 
     def resolved_dict(self) -> dict:
@@ -1302,6 +1354,9 @@ class _FakeWorld:
         self.version = FAKE_SGLANG_VERSION
         self.resolved = {**FAKE_RESOLVED_ARGUMENTS, "tp_size": tp_size, "attn_dp_size": dp_size}
         self.platform = {"is_cuda": True, "is_hip": False}
+        # FAKE of an override of SGLang's resolution: the fields it declares over the operator's input, as
+        # SGLang's per-model overrides do. The FAKE model of most tests has none.
+        self.overrides: dict = {}
         self.experts: dict = {}
         self.vocabulary = {"size": FAKE_VOCABULARY["size"], "excluded": list(FAKE_VOCABULARY["excluded"])}
         # FAKE resolved dict with values JSON cannot hold, as SGLang's can have.
@@ -1321,6 +1376,9 @@ class _FakeWorld:
         # (benchmark id, stage, attempt) of an engine call -> what the FAKE engine does in it.
         self.call_faults: dict[tuple, str] = {}
         self.scheduler_attributes: dict[str, object] = {}
+        # The dtype every FAKE scheduler process builds its KV pool with. None: the one the FAKE rule gives for
+        # the resolved ``kv_cache_dtype``. A test puts a FAKE dtype here for an engine that stores another one.
+        self.kv_pool_dtype: object | None = None
         self.sglang_takes_sigterm = False
         self.sglang_sigterm_notes: list[int] = []
         # The texts of every batch call of the FAKE tokenizer, a switch that puts all its ids above the ids the
@@ -1375,6 +1433,12 @@ class _FakeWorld:
         self.caches = [PageCacheModel(page_size) for _rank in range(dp_size)]
         self.resolved["tp_size"] = tp_size
         self.resolved["attn_dp_size"] = dp_size
+
+    def fake_kv_pool_dtype(self) -> object:
+        """The FAKE dtype a FAKE scheduler process holds for its KV pool (``FAKE_STORED_KV_DTYPES``)."""
+        if self.kv_pool_dtype is not None:
+            return self.kv_pool_dtype
+        return _fake_torch_dtype(FAKE_STORED_KV_DTYPES[self.resolved["kv_cache_dtype"]])
 
     def fake_eviction(self, ranks: tuple[int, ...] | None = None) -> None:
         """FAKE fault: the engine needed room and dropped every cache entry, on all ranks or on some."""
@@ -1706,14 +1770,19 @@ def _install_fakes(monkeypatch, world: _FakeWorld, *, real_compat: bool = False,
     def parse_server_args(argv):
         step("parse_server_args")
         world.sglang_argv = list(argv)
-        # FAKE parser: the one flag the launcher adds decides the field it stands for.
+        # FAKE parser: the one flag the launcher adds decides the field it stands for, and so does the flag
+        # of the KV-cache dtype, which is ``auto`` without it as in SGLang.
         world.resolved["incremental_streaming_output"] = STREAMING_FLAG in argv
+        if KV_CACHE_FLAG in argv:
+            world.resolved["kv_cache_dtype"] = argv[argv.index(KV_CACHE_FLAG) + 1]
         world.server_args = _FakeServerArgs(world, list(argv))
         return world.server_args
 
     def resolve(server_args):
         assert server_args is world.server_args
         step("resolve")
+        # FAKE of SGLang's resolution: an override decides over the operator's input.
+        world.resolved.update(world.overrides)
         return _FakeView(world.resolved)
 
     def resolved_dict(server_args):
@@ -1922,12 +1991,14 @@ def _launch(
     cap_flags: list | None = None,
     manifest: dict | None = None,
     real_compat: bool = False,
+    kv_cache: str = FAKE_KV_CACHE_DTYPE,
 ) -> _Launch:
     """Lay out a pod, put the fakes in place and call ``launcher.main`` with the flags of a small run.
 
     ``tp_size`` is the number of FAKE scheduler processes and ``dp_size`` the number of attention-DP ranks
     they form. With ``real_compat`` the FAKE engine gets its page size and both sizes from the flags alone,
-    through the FAKE parser of the FAKE ``sglang`` package.
+    through the FAKE parser of the FAKE ``sglang`` package. ``kv_cache`` is the choice the command passes with
+    ``--kv-cache-dtype``: ``fp8_e4m3`` for an fp8 cell, ``auto`` for a bfloat16 cell.
     """
     world = _FakeWorld() if real_compat else _FakeWorld(page_size, tp_size, dp_size)
     cell, pod_dir = _new_pod(tmp_path, mode) if pod is None else pod
@@ -1946,7 +2017,7 @@ def _launch(
         str(FAKE_TIMEOUT_SECONDS),
         *(SMALL_CAP_FLAGS if cap_flags is None else cap_flags),
         *flags,
-        *_fake_sglang_argv(page_size, tp_size, dp_size),
+        *_fake_sglang_argv(page_size, tp_size, dp_size, kv_cache),
     ]
     code = launcher.main(argv)
     return _Launch(code, world, mode, cell, tmp_path, pod_dir, caps, manifest)
@@ -2136,12 +2207,16 @@ def _dep_cell(mode: str, dp_size: int = 2):
     return cell
 
 
-def _fake_sglang_argv(page_size: int = 1, tp_size: int = 1, dp_size: int = 1) -> list[str]:
+def _fake_sglang_argv(
+    page_size: int = 1, tp_size: int = 1, dp_size: int = 1, kv_cache: str = FAKE_KV_CACHE_DTYPE
+) -> list[str]:
     """Flags of SGLang's own parser, which the launcher has to hand on.
 
-    ``--attn-dp-size`` is among them only above 1, as the cell builder writes it.
+    ``--attn-dp-size`` is among them only above 1, as the cell builder writes it. The KV-cache dtype is
+    always among them, as the cell builder writes it: the one of an fp8 cell unless a test names another.
     """
     argv = ["--model-path", "fake/dense-model", "--page-size", str(page_size), "--tp-size", str(tp_size)]
+    argv += [KV_CACHE_FLAG, kv_cache]
     return [*argv, "--attn-dp-size", str(dp_size)] if dp_size > 1 else argv
 
 
@@ -2350,6 +2425,8 @@ def test_end_to_end_run_passes_the_validator_and_the_gate(tmp_path, monkeypatch,
         "tp_size": 1,
         # One attention-DP rank: the size is written all the same, and nothing else about DP attention.
         "attn_dp_size": 1,
+        # What SGLang resolved for the KV cache: the choice the command named.
+        "kv_cache_dtype": "fp8_e4m3",
         # A model without expert layers: no expert key, and no layout of expert layers to record.
         "expert_keys": {},
         "moe": None,
@@ -2361,7 +2438,9 @@ def test_end_to_end_run_passes_the_validator_and_the_gate(tmp_path, monkeypatch,
     # A run with seeded ids writes the content block it always wrote.
     assert set(producer["content"]) == {"source", "seed", "token_range", "issued"}
     assert (producer["content"]["source"], producer["content"]["seed"]) == ("seeded_token_ids", "0")
-    assert (producer["name"], producer["scheduler_processes"], producer["recorder_format"]) == ("aisim_sglbench", 1, 2)
+    assert (producer["name"], producer["scheduler_processes"], producer["recorder_format"]) == ("aisim_sglbench", 1, 3)
+    # The dtype the FAKE scheduler process built its KV pool with, as its header reports it.
+    assert (producer["kv_cache_stored_dtype"], lines[0]["kv_cache_stored_dtype"]) == (FAKE_KV_STORED_DTYPE,) * 2
     assert (producer["limits"], producer["page_size"]) == (world.limits.as_dict(), page_size)
     assert (producer["enable_overlap"], producer["restaged_points"]) == (True, [])
     assert producer["content"]["token_range"] == FAKE_TOKEN_RANGE
@@ -3563,8 +3642,8 @@ def test_every_field_the_launcher_tests_has_a_refused_value_here():
     assert tested == [field for field, _value, _refusal in STAGE_S_REFUSALS]
     assert len(set(tested)) == len(tested) == 47
     # The fields the launcher reads besides: the platform, the three run settings, the recorded field, the
-    # expert-parallel size, which is tested against the TP size and the model, and the runner of the expert
-    # layers, which is recorded for a model that has them.
+    # expert-parallel size, which is tested against the TP size and the model, the runner of the expert
+    # layers, which is recorded for a model that has them, and the KV-cache dtype, which is recorded.
     # Four more are read only in a run with several attention-DP ranks.
     assert set(FAKE_RESOLVED_ARGUMENTS) - set(tested) == {
         "device",
@@ -3574,6 +3653,7 @@ def test_every_field_the_launcher_tests_has_a_refused_value_here():
         "enable_nvidia_megakernel",
         "ep_size",
         "moe_runner_backend",
+        "kv_cache_dtype",
         *DP_ONLY_FIELDS,
     }
 
@@ -4424,7 +4504,7 @@ def test_the_constants_the_modules_share():
     )
     assert launcher.ENV_INPUT_BLOCKER == BLOCKER_ENV == "SGLANG_ENABLE_COLOCATED_BATCH_GEN"
     assert (driver.REASON_DP_PLACEMENT, driver.REASON_DP_STEP) == ("dp_rank_placement_mismatch", "dp_ranks_out_of_step")
-    assert (recorder.RECORD_FORMAT, driver.RECORD_FORMAT) == (2, 2)
+    assert (recorder.RECORD_FORMAT, driver.RECORD_FORMAT) == (3, 3)
 
 
 def test_the_header_and_the_docstring_of_the_module():
@@ -5762,7 +5842,7 @@ def test_the_sizes_of_a_pure_tp_cell_pass_the_layout_checks_with_one_scheduler_p
     producer: dict = {}
     settings = launcher._resolved_settings(view, producer)
     assert (settings["expected_scheduler_processes"], settings["dp_size"]) == (tp_size, 1)
-    assert producer == {"tp_size": tp_size, "attn_dp_size": 1}
+    assert producer == {"tp_size": tp_size, "attn_dp_size": 1, "kv_cache_dtype": "auto"}
 
 
 _EP_WITHOUT_EXPERTS = "expert parallelism needs a model with expert layers (ep_size={})"
@@ -6222,6 +6302,272 @@ def test_end_to_end_the_host_holds_what_the_launcher_recorded_against_the_cell_o
         assert str(refused.value) == refusal + str(launch.rank_path)
 
 
+def _dense_tp_cell(mode: str, tp_size: int = 2):
+    """A cell of a model without expert layers under tensor parallelism: ``tp_size`` GPUs, every other size 1."""
+    cell = _cell(phase=mode, dp=1, strategy="tp")
+    return dataclasses.replace(cell, topology=ParallelTopology(tp=tp_size, pp=1, dp=1, moe_tp=1, moe_ep=1, cp=1))
+
+
+# The braces take the tensor-parallel size the host expects of the cell and then the two sizes it found: SGLang's
+# TP size and its number of attention-DP ranks.
+_HOST_WANTS_THE_DENSE_SIZES = (
+    "native SGLang rank artifact of a dense plan did not run the layout of its cell: "
+    "expected producer.tp_size {} and producer.attn_dp_size 1, found {} and {}: "
+)
+_HOST_WANTS_NO_EXPERT_PARALLELISM = (
+    "native SGLang rank artifact of a dense plan did not run the layout of its cell: "
+    "expected producer.moe null or producer.moe.ep_size 1, found producer.moe.ep_size {}: "
+)
+# Expert keys the launcher looks up and the plan does not count (capabilities.py, ``_is_moe``, reads the three
+# counts ``n_routed_experts``, ``num_local_experts`` and ``num_experts``): a model the plan takes for dense and
+# the launcher for one with expert layers.
+FAKE_EXPERTS_THE_PLAN_DOES_NOT_COUNT = {"moe_num_experts": 8, "num_experts_per_tok": 2}
+# name: (the GPUs of the cell, the --tp-size that reaches the pod, the other size flags that reach it, the
+# expert keys the pod finds, the expert-parallel size the launcher records or None for no moe block, what the
+# host says when it holds the result against the cell of a dense plan; None when it accepts)
+_RUNS_OF_A_DENSE_CELL = {
+    "one-gpu": (1, 1, [], {}, None, None),
+    "tp": (2, 2, [], {}, None, None),
+    # The command of a cell reached the pod with the --tp-size of the other cell. The launcher is not told the
+    # size of its cell and runs the size SGLang resolved to the end; the host finds the size of another cell.
+    "tp-on-one-gpu": (2, 1, [], {}, None, _HOST_WANTS_THE_DENSE_SIZES.format(2, 1, 1)),
+    "one-gpu-on-two": (1, 2, [], {}, None, _HOST_WANTS_THE_DENSE_SIZES.format(1, 2, 1)),
+    # The pod found expert layers. Without --ep-size every rank holds a slice of every expert, which is the
+    # tensor parallelism of the cell.
+    "experts-found": (2, 2, [], FAKE_EXPERTS_THE_PLAN_DOES_NOT_COUNT, 1, None),
+    "experts-found-on-one-gpu": (1, 1, [], FAKE_EXPERTS_THE_PLAN_DOES_NOT_COUNT, 1, None),
+    # With an --ep-size of the tensor-parallel size the launcher runs the TEP layout, which is no cell of a
+    # dense plan.
+    "experts-found-with-ep-size": (
+        2,
+        2,
+        ["--ep-size", "2"],
+        FAKE_EXPERTS_THE_PLAN_DOES_NOT_COUNT,
+        2,
+        _HOST_WANTS_NO_EXPERT_PARALLELISM.format(2),
+    ),
+}
+
+
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+@pytest.mark.parametrize("name", list(_RUNS_OF_A_DENSE_CELL))
+def test_end_to_end_the_host_holds_what_the_launcher_recorded_against_the_cell_of_a_dense_plan(
+    tmp_path, monkeypatch, mode, name
+):
+    gpus, tp_size, size_flags, experts, ep_size, refusal = _RUNS_OF_A_DENSE_CELL[name]
+    # The cells AISim plans for a model without expert layers: the one-GPU cell and the tensor-parallel cells.
+    cell = _cell(phase=mode, dp=1, strategy="single") if gpus == 1 else _dense_tp_cell(mode, gpus)
+    assert (cell.topology.tp, cell.topology.dp, cell.topology.moe_ep) == (gpus, 1, 1)
+    pod_dir = _pod(tmp_path, cell, sglang_version=FAKE_SGLANG_VERSION)
+
+    def prepare(world, _pod_dir):
+        world.experts = experts
+
+    # No content word: the launcher sends seeded ids, or dataset text when it finds expert layers.
+    launch = _launch_text(
+        tmp_path,
+        monkeypatch,
+        mode,
+        word=None,
+        tp_size=tp_size,
+        flags=size_flags,
+        prepare=prepare,
+        pod=(cell, pod_dir),
+        real_compat=True,
+    )
+
+    # Each run is complete: the launcher, the gate and the validator without the plan's answer accept it.
+    _assert_no_module_of_the_benchmark_is_replaced()
+    producer = _assert_accepted(launch)["producer"]
+    # The three keys the host reads are the launcher's own, and the file of each of these runs holds them: the
+    # ``moe`` key is there with null when the launcher found no expert layers.
+    recorded_ep_size = None if producer["moe"] is None else producer["moe"]["ep_size"]
+    assert (producer["tp_size"], producer["attn_dp_size"], recorded_ep_size) == (tp_size, 1, ep_size)
+
+    def held_against_the_cell():
+        """The validator as the host calls it for a cell of an SGLang plan whose model has no expert layers."""
+        return validate_native_collection(
+            cell,
+            launch.root / "raw",
+            expected_plan_sha256="plan-sha",
+            expected_attempt_id="attempt",
+            expected_backend="sglang",
+            expected_moe=False,
+        )
+
+    if refusal is None:
+        assert len(held_against_the_cell().points) == len(launch.planned().points)
+    else:
+        with pytest.raises(ValueError) as refused:
+            held_against_the_cell()
+        assert str(refused.value) == refusal + str(launch.rank_path)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The KV cache: what SGLang resolved, what the engine stored, and the label of the cell
+# ---------------------------------------------------------------------------------------------------------------
+
+# The braces take the KV-cache label of the cell, the stored dtypes the label stands for, the stored dtype the
+# host found and the argument SGLang resolved.
+_HOST_WANTS_THE_KV_CACHE_OF_THE_CELL = (
+    "native SGLang rank artifact did not store the KV cache of its cell: the cell's kv_cache_dtype {!r} stands "
+    "for producer.kv_cache_stored_dtype {}, found {!r} (producer.kv_cache_dtype {!r}): "
+)
+# The braces take the label, the stored dtype the host found and the argument SGLang resolved.
+_HOST_HAS_NO_RULE_FOR_THE_LABEL = (
+    "native SGLang rank artifact cannot be held against the KV cache of its cell: no rule says which "
+    "producer.kv_cache_stored_dtype the cell's kv_cache_dtype {!r} stands for, found {!r} "
+    "(producer.kv_cache_dtype {!r}): "
+)
+# The stored dtypes that each label with a rule stands for, as the host words them. For ``nvfp4`` the host
+# wants the resolved argument as well, because SGLang stores two FP4 recipes in one dtype.
+_STORED_DTYPES_OF_A_LABEL = {
+    "bfloat16": "'torch.bfloat16' or 'torch.float16'",
+    "fp8": "'torch.float8_e4m3fn'",
+    "nvfp4": "'torch.float4_e2m1fn_x2' with producer.kv_cache_dtype 'nvfp4'",
+}
+# The other label an option can name for a cell. The host has no rule for it.
+_LABELS_WITHOUT_A_RULE = ("int8",)
+# name: (the choice the command passes with --kv-cache-dtype, what a FAKE override of SGLang's resolution
+# declares, the name of the FAKE dtype the FAKE scheduler processes store or None for the one the FAKE rule
+# gives, the resolved argument and the stored dtype the result files must record, the labels of a cell the host
+# accepts the files for)
+_RUNS_OF_THE_KV_CACHE = {
+    # The command of an fp8 cell and that of a bfloat16 cell, for a FAKE model that loads in bfloat16.
+    "an-fp8-cell": ("fp8_e4m3", {}, None, "fp8_e4m3", "torch.float8_e4m3fn", ("fp8",)),
+    "a-bfloat16-cell": ("auto", {}, None, "auto", "torch.bfloat16", ("bfloat16",)),
+    # A FAKE engine whose model loads in float16, as SGLang loads a float16 or a float32 checkpoint.
+    "a-bfloat16-cell-of-a-float16-model": ("auto", {}, "float16", "auto", "torch.float16", ("bfloat16",)),
+    # A FAKE engine that stores FP8 for ``auto``, as SGLang does for a model whose quantization config asks for
+    # an FP8 KV cache. The argument still says ``auto``, and the files are those of an fp8 cell: the argument is
+    # compared with nothing.
+    "a-bfloat16-cell-of-a-model-that-asks-for-fp8": (
+        "auto",
+        {},
+        "float8_e4m3fn",
+        "auto",
+        "torch.float8_e4m3fn",
+        ("fp8",),
+    ),
+    # A FAKE override that makes ``fp8_e4m3`` of ``auto``, as SGLang's overrides do for some architectures. The
+    # launcher records what resolution left, not what the command said.
+    "a-bfloat16-cell-of-an-architecture-sglang-overrides": (
+        "auto",
+        {"kv_cache_dtype": "fp8_e4m3"},
+        None,
+        "fp8_e4m3",
+        "torch.float8_e4m3fn",
+        ("fp8",),
+    ),
+    # The command the cell builder writes for the label nvfp4, which it passes on under its own name. No plan
+    # carries that label today.
+    "an-nvfp4-cell": ("nvfp4", {}, None, "nvfp4", "torch.float4_e2m1fn_x2", ("nvfp4",)),
+    # SGLang's other FP4 recipe stores the same dtype. No label stands for it: the argument tells the two apart.
+    "the-other-fp4-recipe": ("fp4_mx_block16", {}, None, "fp4_mx_block16", "torch.float4_e2m1fn_x2", ()),
+    # A FAKE engine that stores the FP4 dtype for ``auto``: the dtype of an nvfp4 cell without its argument.
+    "a-bfloat16-cell-that-stored-fp4": ("auto", {}, "float4_e2m1fn_x2", "auto", "torch.float4_e2m1fn_x2", ()),
+    # Dtypes no label stands for: another FP8 dtype of torch, and a float32 pool.
+    "an-fp8-cell-that-stored-another-fp8-dtype": ("fp8_e4m3", {}, "float8_e5m2", "fp8_e4m3", "torch.float8_e5m2", ()),
+    "a-bfloat16-cell-that-stored-float32": ("auto", {}, "float32", "auto", "torch.float32", ()),
+}
+
+
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+@pytest.mark.parametrize("name", list(_RUNS_OF_THE_KV_CACHE))
+def test_end_to_end_the_host_holds_the_dtype_the_engine_stored_against_the_kv_cache_label_of_the_cell(
+    tmp_path, monkeypatch, mode, name
+):
+    choice, overrides, stored_name, resolved, stored, accepted = _RUNS_OF_THE_KV_CACHE[name]
+    # Two GPUs under tensor parallelism: two FAKE scheduler processes, each with a KV pool of its own.
+    cell = _dense_tp_cell(mode, 2)
+    pod_dir = _pod(tmp_path, cell, sglang_version=FAKE_SGLANG_VERSION)
+
+    def prepare(world, _pod_dir):
+        world.overrides = dict(overrides)
+        if stored_name is not None:
+            world.kv_pool_dtype = _fake_torch_dtype(stored_name)
+
+    launch = _launch(
+        tmp_path, monkeypatch, mode, tp_size=2, kv_cache=choice, prepare=prepare, pod=(cell, pod_dir), real_compat=True
+    )
+
+    # Each run is complete, whatever it stored: neither the launcher nor the driver is told the label of the
+    # cell, and the gate in the pod accepts the files.
+    _assert_no_module_of_the_benchmark_is_replaced()
+    assert launch.code == 0 and launch.world.sglang_argv[-3:-1] == [KV_CACHE_FLAG, choice]
+    on_disk = launch.artifact()
+    assert (on_disk["status"], on_disk["valid"], on_disk["usable"], on_disk["error"]) == ("complete", True, True, None)
+    assert _gate([str(launch.rank_path)], launch.mode).returncode == GATE_ACCEPT
+    # The launcher wrote what SGLang resolved, the driver what both headers of the real recorder report.
+    producer = on_disk["producer"]
+    assert (producer["kv_cache_dtype"], producer["kv_cache_stored_dtype"]) == (resolved, stored)
+    assert [lines[0]["kv_cache_stored_dtype"] for lines in _rank_logs(launch)] == [stored, stored]
+    merged = json.loads(launch.merged_path.read_text(encoding="utf-8"))["producer"]
+    assert (merged["kv_cache_dtype"], merged["kv_cache_stored_dtype"]) == (resolved, stored)
+
+    for label in (*_STORED_DTYPES_OF_A_LABEL, *_LABELS_WITHOUT_A_RULE):
+        labelled = dataclasses.replace(cell, kv_cache_dtype=label)
+        # The validator as a caller without a plan calls it, and as the host calls it for a cell of an SGLang
+        # plan whose model has no expert layers: the rule is the same for both.
+        for expected_moe in (None, False):
+            keywords = {
+                "expected_plan_sha256": "plan-sha",
+                "expected_attempt_id": "attempt",
+                "expected_backend": "sglang",
+                "expected_moe": expected_moe,
+            }
+            if label in accepted:
+                collection = validate_native_collection(labelled, launch.root / "raw", **keywords)
+                assert len(collection.points) == len(launch.planned().points)
+                continue
+            with pytest.raises(ValueError) as refused:
+                validate_native_collection(labelled, launch.root / "raw", **keywords)
+            if label in _LABELS_WITHOUT_A_RULE:
+                text = _HOST_HAS_NO_RULE_FOR_THE_LABEL.format(label, stored, resolved)
+            else:
+                dtypes = _STORED_DTYPES_OF_A_LABEL[label]
+                text = _HOST_WANTS_THE_KV_CACHE_OF_THE_CELL.format(label, dtypes, stored, resolved)
+            assert str(refused.value) == text + str(launch.rank_path)
+
+
+def test_end_to_end_scheduler_processes_that_stored_different_dtypes_fail_the_run(tmp_path, monkeypatch):
+    # FAKE: the two scheduler processes of one engine build their KV pools with different dtypes.
+    def prepare(world, _pod_dir):
+        dtypes = iter([_fake_torch_dtype("float8_e4m3fn"), _fake_torch_dtype("bfloat16")])
+        world.fake_kv_pool_dtype = lambda: next(dtypes)
+
+    launch = _launch(tmp_path, monkeypatch, "prefill", tp_size=2, prepare=prepare, real_compat=True)
+
+    reason = (
+        'rejected: scheduler processes disagree on kv_cache_stored_dtype: ["torch.float8_e4m3fn", "torch.bfloat16"]'
+    )
+    on_disk = _assert_failed_before_the_grid(launch, 64, reason)
+    # The launcher's fact is there, and the driver wrote no stored dtype for a run without one.
+    producer = on_disk["producer"]
+    assert (producer["kv_cache_dtype"], producer["kv_cache_stored_dtype"]) == (FAKE_KV_CACHE_DTYPE, None)
+
+
+@pytest.mark.parametrize(
+    ("held", "error"),
+    [
+        # The string SGLang keeps beside the dtype, the text of a dtype, and a number.
+        ("auto", "TypeError('model_runner.kv_cache_dtype is a builtins.str, not a torch.dtype')"),
+        ("torch.bfloat16", "TypeError('model_runner.kv_cache_dtype is a builtins.str, not a torch.dtype')"),
+        (0, "TypeError('model_runner.kv_cache_dtype is a builtins.int, not a torch.dtype')"),
+    ],
+)
+def test_end_to_end_a_model_runner_that_holds_no_torch_dtype_fails_the_run(tmp_path, monkeypatch, held, error):
+    # FAKE: a model runner whose ``kv_cache_dtype`` is no torch dtype, as a changed SGLang could hold it.
+    launch = _launch(
+        tmp_path, monkeypatch, "prefill", prepare=lambda world, _pod_dir: setattr(world, "kv_pool_dtype", held)
+    )
+
+    log = f"sched-{os.getpid()}.jsonl"
+    reason = f"rejected: the recorder could not read kv_cache_stored_dtype in {log}: {error}"
+    on_disk = _assert_failed_before_the_grid(launch, 64, reason)
+    assert on_disk["producer"]["kv_cache_stored_dtype"] is None
+
+
 def test_the_constants_of_a_text_run():
     assert (launcher.POOL_TOKEN_TARGET, launcher.POOL_ENCODE_BATCH) == (8_000_000, 256)
     assert launcher.DATASET_DOWNLOAD_TIMEOUT_SECONDS == 60
@@ -6418,8 +6764,8 @@ def test_end_to_end_a_dep_launch_passes_the_validator_and_the_gate(tmp_path, mon
     logs = _rank_logs(launch)
     headers = [lines[0] for lines in logs]
     assert [(header["pid"], header["leader"], header["format"]) for header in headers] == [
-        (4100, True, 2),
-        (4101, True, 2),
+        (4100, True, 3),
+        (4101, True, 3),
     ]
     assert [header["ranks"] for header in headers] == [
         {
@@ -6496,7 +6842,7 @@ def test_end_to_end_a_dep_launch_passes_the_validator_and_the_gate(tmp_path, mon
     assert (producer["staging"], producer["scheduler_processes"], producer["recorder_format"]) == (
         "balanced_batch_call",
         2,
-        2,
+        3,
     )
     assert producer["expert_keys"] == FAKE_EXPERTS and producer["restaged_points"] == []
     assert producer["limits"] == world.limits.as_dict()
@@ -7123,7 +7469,12 @@ def test_the_resolved_sizes_reach_the_driver_and_the_producer_block(tp_size, dp_
         "prefill_max_requests": None,
         "max_queued_requests": 64,
     }
-    assert producer == {"sglang_version": "0.5.23", "tp_size": tp_size, "attn_dp_size": dp_size}
+    assert producer == {
+        "sglang_version": "0.5.23",
+        "tp_size": tp_size,
+        "attn_dp_size": dp_size,
+        "kv_cache_dtype": "auto",
+    }
     # They are fields of the driver's settings record, the second with the default of a run with one rank.
     names = {field.name: field.default for field in dataclasses.fields(driver.RunSettings)}
     assert set(settings) <= set(names) and names["dp_size"] == 1
@@ -7135,6 +7486,40 @@ def test_an_attention_dp_size_that_is_not_a_positive_int_is_never_taken_over(dp_
     producer: dict = {}
 
     with pytest.raises(TypeError, match="SGLang's resolved attn_dp_size is .*, not a positive int"):
+        launcher._resolved_settings(_FakeView(fields), producer)
+
+    assert producer == {}
+
+
+@pytest.mark.parametrize("choice", ["auto", "fp8_e4m3", "bfloat16", "bf16"])
+def test_the_resolved_kv_cache_dtype_reaches_the_producer_block_as_sglang_left_it(choice):
+    fields = {**FAKE_RESOLVED_ARGUMENTS, "kv_cache_dtype": choice}
+    producer: dict = {}
+
+    settings = launcher._resolved_settings(_FakeView(fields), producer)
+
+    # It is recorded and decides nothing: no setting of the run follows from it.
+    assert producer == {"tp_size": 1, "attn_dp_size": 1, "kv_cache_dtype": choice}
+    assert "kv_cache_dtype" not in settings
+    assert "kv_cache_dtype" not in [name for name, _accepts, _text in launcher._RESOLVED_CHECKS]
+
+
+@pytest.mark.parametrize("value", [None, "", 8, True, ["auto"]])
+def test_a_resolved_kv_cache_dtype_that_is_no_name_is_an_error_and_nothing_is_written(value):
+    fields = {**FAKE_RESOLVED_ARGUMENTS, "kv_cache_dtype": value}
+    producer: dict = {}
+
+    with pytest.raises(TypeError, match="SGLang's resolved kv_cache_dtype is .*, not the name of a dtype"):
+        launcher._resolved_settings(_FakeView(fields), producer)
+
+    assert producer == {}
+
+
+def test_resolved_arguments_without_the_kv_cache_dtype_are_an_error_that_names_the_field():
+    fields = {name: value for name, value in FAKE_RESOLVED_ARGUMENTS.items() if name != "kv_cache_dtype"}
+    producer: dict = {}
+
+    with pytest.raises(AttributeError, match="SGLang's resolved arguments have no field 'kv_cache_dtype'"):
         launcher._resolved_settings(_FakeView(fields), producer)
 
     assert producer == {}
@@ -7564,30 +7949,37 @@ ONE_RANK_LAUNCHES = {
 # its prefill new-token axis is planned as it was before the axis had a low end: 1 in front of the graph axis
 # and nothing more (``_plan_without_the_low_end``).
 # They were taken once from the launcher and the accessor module as they stood before DP attention, loaded
-# beside the present driver and recorder: the two files of the commit before this change, with ``driver.RANK``,
-# a constant the driver no longer has, typed as 0. The result files are hashed without ``producer.attn_dp_size``,
-# the one key the launcher writes since. A change that is meant to alter what a launch with one rank sends or
-# writes for the points it planned then has to retype them, and the digests of ``ONE_RANK_DIGESTS`` with them.
+# beside the driver and recorder of the change that brought it: the two files of the commit before that change,
+# with ``driver.RANK``, a constant the driver no longer has, typed as 0. The result files are hashed without
+# ``producer.attn_dp_size``, the one key the launcher wrote since then.
+# The digests of the calls are still those. The digests of the result files and of the logs were typed in again
+# when the recorder's header gained the dtype of the KV pool (record format 3). A result file then holds
+# ``producer.kv_cache_dtype``, ``producer.kv_cache_stored_dtype`` and the format number 3, and the header of a
+# log holds the dtype and that number. These digests were taken from the launcher, the driver and the recorder
+# as they stand. Each launch was first hashed with those values taken out again, the two keys gone and the
+# format number 2 in its place, and gave the digests of before; that was done once, by a script that is not
+# kept in this repository. A change that is meant to alter what a launch with one rank sends or writes for the
+# points it planned then has to retype them, and the digests of ``ONE_RANK_DIGESTS`` with them.
 ONE_RANK_DIGESTS_WITHOUT_THE_LOW_END = {
     "seeded-prefill-tp1": {
         "calls": "4481acf436e2e4105a21581e8e6901533e0d4467aafe93e81c6be8f682a3d9fb",
-        "results": "942cdb57d69b1cfed40d5a939b25d7df9bd7a1941ac39546f2fd18fd4447f27e",
-        "logs": "16a81d1c055d1e95a4a617bfbb23c49f9bb54c6710560f08a1b70b3e00958ffe",
+        "results": "98dfd4f34a1baa39e6b88c7a78d321c571c2c8aa4f3bd72ec2bc03ed1c589abd",
+        "logs": "e73a5e8cc56413f2829080870cd83ed730451d3b05af8b11358aead6693d20f2",
     },
     "seeded-agg-tp2": {
         "calls": "177a96a7adf7ba38b0baec5d391abcea06451cc37c22e6ec8ddc456729f07450",
-        "results": "f888c8d33847412ac291f41c815a81d746c41cf6da1089cff971dbb88ab1ab3a",
-        "logs": "5873b775602c63aa554a5965ea35a846dfd3a1ee4a0ae6218bc2fe09ba1b1159",
+        "results": "98e05b99242bdb7865ba725c7a2302d0a2cd1d7454b448ba43e55661683b9215",
+        "logs": "523c35e0e3f209158c849afe50b926fbac746a42edb1f8e3196ee9d6694d5df5",
     },
     "text-prefill-tp1": {
         "calls": "f3e97d41680895354ed4481090e801ee83deaca5171e42fb6276ec895bcc52bb",
-        "results": "a5f7c792463b778305f858175f121abe4082f7d701d6adc1f17548cc9baf3c18",
-        "logs": "a20366f850a55f629096003041bc0aec5f318c043938050fb82eb7edcc3f8f41",
+        "results": "a9dab74e6678cbadb01299daa44662dbb52d1f126b2fe715d8b6f1a9b9f9f852",
+        "logs": "2df2fdfefc18fb68db18e351b118deabc97c89aac13e849a24e112b5e9f47f0f",
     },
     "text-decode-tep2": {
         "calls": "bfcb8e156c7e0039f868abd6e0db62d6ac88a378e2de14e841cb5fc8a5860799",
-        "results": "6ee2f1c5a32cee0012e04808f2056115fc9b4682677c80a1749c0d80317e4434",
-        "logs": "da15318e7d7bc7dc2d232df27affa4281567a1b5b73b715de0fa091c35c0cd39",
+        "results": "64a3fb56548f3b67c27bc16ce9322fc1425f7e0cde7f9ffa7e8e155c8935a9c4",
+        "logs": "e8ee4f06dbe6efa12e86bfa3190cc0a3751ffaea043d514401fd38d7e1f30042",
     },
 }
 
@@ -7618,18 +8010,18 @@ ONE_RANK_LOW_END_POINTS = {
 ONE_RANK_DIGESTS = {
     "seeded-prefill-tp1": {
         "calls": "bd90820b51553944b7d208ba7e22dc7aca457f2586f25ee3437e2d5409c4293a",
-        "results": "dc74faf11f7ab0eb99bc1fb6baff4600e96bd6d58aaf7e3a6ef6a2e414cad887",
-        "logs": "4de8ed3ad318e52d314d892262cb163ea62c86ecff78d5ae8870c045e825e4cc",
+        "results": "d1376b085b296ddba38ca1887152b10d2b693b650ede9c497a5c94dcdfcd2143",
+        "logs": "1e30c05c700432a357efbb3ff12326e749dd9b382e1a7a56ec39de757a35f644",
     },
     "seeded-agg-tp2": {
         "calls": "0a62c219b7196115f933ef84001fe4a5fcf81b441c9722af0c7d6297a737acf3",
-        "results": "39cc9ed0c393e57325f1a2c1b167806a7af10cdfb0efa85775004daa5121ca6d",
-        "logs": "29d35e3056168bf3d26b09fe82e4cdd24839d6bab083a928d60a6e495d97af8d",
+        "results": "4c14a43bfada0c62a01ef63057b0db8f7f6538c37d5fe7855b78154d87e2cd08",
+        "logs": "e1aa5403e6d61ae47b6f7c1906fe2469fa06e6854781048f4c34b1c44e041bd2",
     },
     "text-prefill-tp1": {
         "calls": "66e99d04e6f19cbf68b54779f2a40b4ed0654eec1bd89e5eb68cc066a571bc1f",
-        "results": "91f53ca9e8bda161a8ef91a141e02e4a3470dff048af4eb6a3d4210ca6f25f86",
-        "logs": "f54d519535a3a5b9ac3f687c5a50f30a45c79f24bd5808961bfefbe05ebce77d",
+        "results": "9ac63ab575d8b4adad6b5a3fe67f02ab8ac5b9ead094e93834935dfc98466a15",
+        "logs": "4025602a8fcf8ac614c2804500205aa6a9addafc10c63c9e88370fb468a5469f",
     },
     "text-decode-tep2": ONE_RANK_DIGESTS_WITHOUT_THE_LOW_END["text-decode-tep2"],
 }
@@ -7715,8 +8107,13 @@ def test_a_launch_with_one_rank_and_without_the_low_end_sends_and_writes_what_it
     _assert_no_module_of_the_benchmark_is_replaced()
     on_disk = _assert_accepted(launch)
     assert on_disk["run_id"] == FAKE_FIXED_RUN_ID and len(launch.world.calls) > 20
-    # What the result files have gained is the one key, with the value of a run without DP attention.
+    # What the result files have gained since: the size, with the value of a run without DP attention, and the
+    # two dtypes of the KV cache, which are inside the digest of the result files.
     assert on_disk["producer"]["attn_dp_size"] == 1 and DP_PRODUCER_KEY not in on_disk["producer"]
+    assert (on_disk["producer"]["kv_cache_dtype"], on_disk["producer"]["kv_cache_stored_dtype"]) == (
+        FAKE_KV_CACHE_DTYPE,
+        FAKE_KV_STORED_DTYPE,
+    )
     assert _one_rank_digests(launch) == ONE_RANK_DIGESTS_WITHOUT_THE_LOW_END[name]
 
 

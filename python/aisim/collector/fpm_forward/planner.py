@@ -813,6 +813,22 @@ def _require_sglang_launcher_inputs(
     ):
         if given:
             raise ValueError(f"{flag} is a vLLM engine setting and is not supported with --backend sglang")
+    # Deviation note (no power window).
+    # What differs: a vLLM plan measures the GPU power of each point by default (--fpm-measure-power, Dynamo's
+    # --benchmark-power-window-s). The launcher has no power window, so an SGLang plan measures none: the
+    # option is off by default for this backend (config.py, FPMCollectionOptions.from_args) and refused here
+    # when it is given.
+    # Direction of the error: none in a table. The rows of an SGLang table carry no power, as those of a vLLM
+    # campaign that was collected with --no-fpm-measure-power.
+    # Why refused and not ignored: a plan that held measure_power would say its rows carry power when they
+    # carry none. Refusing keeps the saved plan true to the rows, and the default command needs no option.
+    # How to retire it: give the launcher a power window that writes the power block the host validates
+    # (native_artifact.py, _validate_power), and drop this refusal. The default stays off.
+    if options.measure_power:
+        raise ValueError(
+            "--fpm-measure-power is not supported with --backend sglang: the launcher has no power window, so an "
+            "SGLang plan measures no power and its rows carry no power_w; leave the option out"
+        )
     if options.compilation_config:
         raise ValueError(
             "SGLang FPM collection cannot pass a vLLM compilation config "

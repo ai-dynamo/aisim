@@ -23,7 +23,7 @@ A run (``BenchmarkRun.execute``), in this order:
    attention-DP rank;
 2. refuse engine settings the feasibility rules do not cover (as each scheduler process reports them);
 3. build the limits record from a leader's header, and the grid from it (every process must report the same
-   limits);
+   limits, and the same dtype of its KV pool);
 4. check the two request caps against the largest batch of the grid;
 5. compare the first tokens the run needs with the token range and, in a text run, the tokens of the text
    pool with the longest prompt of the grid; then build the content plan;
@@ -121,6 +121,8 @@ files under ``python/sglang``::
     srt/arg_groups/parallel_hook.py             handle_data_parallelism
     srt/managers/schedule_policy.py             _IS_HIP
     srt/runtime_context.py                      get_parallel
+    srt/model_executor/model_runner.py          ModelRunner.configure_kv_cache_dtype
+    srt/mem_cache/kv_cache_dtype.py             configure_kv_cache_dtype
 
 Batch sequences that running engines showed are kept in
 ``benchmarks/evidence/collector/sglbench-engine-probe-20261113``: one header per scheduler process (check_1),
@@ -152,6 +154,15 @@ broadcast with SGLang 0.5.22; a model other than the one named. These rest on th
 the tests. What this module does about a decode step that runs as an extend batch (``_decode_steps_as_extend``)
 was written after the runs. One more smoke of the two cells with SGLang 0.5.23 passed with it; no decode step
 ran as an extend batch there, so that part has run in the tests only.
+
+The dtype of the KV pool came with record format 3, after every run named above: the driver reads
+``kv_cache_stored_dtype`` from each header, requires every scheduler process to report the same one and
+writes it into the ``producer`` block. It ran on engines on 2026-11-25, through sglbench_launcher.py and
+AISim's collector, on H200 GPUs with one dense model (``Qwen/Qwen3-0.6B``): three prefill cells of a smoke
+grid with SGLang 0.5.23 (one GPU with a bfloat16 and with an FP8 KV cache, and two GPUs at ``--tp-size 2``,
+where both headers held the same dtype) and two decode cells of a smoke grid with SGLang 0.5.22 (one GPU,
+one for each KV cache). All five passed. Headers that disagree, a header without the key and a value the
+recorder marked unreadable have run in the tests only, as has format 3 under DP attention.
 
 A spike of the same day ran stock SGLang at both releases with the same model and layout, without this module:
 a script of its own sent SGLang's public batch call with SGLANG_ENABLE_COLOCATED_BATCH_GEN set and read the logs
@@ -194,7 +205,7 @@ import sglbench_grid as grid
 # What the recorder writes, repeated here because this module may import only the three sibling modules named
 # in its docstring. tests/unit/collector/test_fpm_sglbench_driver.py compares each value with the recorder's
 # and the version list with the one of sglbench_compat.py.
-RECORD_FORMAT = 2
+RECORD_FORMAT = 3
 RECORDER_CLASS_NAME = "SglbenchRecorderScheduler"
 LOG_FILE_PREFIX = "sched-"
 LOG_FILE_SUFFIX = ".jsonl"
@@ -296,6 +307,12 @@ _LIMIT_NAMES = (
 # ``ModelRunner.prefill_cuda_graph_runner.capture_num_tokens`` (srt/model_executor/model_runner.py), as the
 # recorder reads them.
 _GRAPH_NAMES = ("decode_graph_sizes", "prefill_graph_sizes")
+# The dtype of the KV pool as text: ``str(ModelRunner.kv_cache_dtype)``, which
+# ``ModelRunner.configure_kv_cache_dtype`` sets in every scheduler process once it has loaded the model
+# (srt/model_executor/model_runner.py; srt/mem_cache/kv_cache_dtype.py ``configure_kv_cache_dtype``). With
+# ``--kv-cache-dtype auto`` it is the dtype of the model, or an FP8 dtype for a model whose quantization
+# config asks for an FP8 KV cache, so only the scheduler process can tell.
+_KV_STORED_DTYPE_NAME = "kv_cache_stored_dtype"
 
 # Header values that every scheduler process must report alike.
 _AGREED_VALUES = (
@@ -303,6 +320,7 @@ _AGREED_VALUES = (
     *(("limits", name) for name in _LIMIT_NAMES),
     *((name,) for name in _GRAPH_NAMES),
     ("ranks", "tp_size"),
+    (_KV_STORED_DTYPE_NAME,),
 )
 
 # Scheduler facts of the header's ``checks`` block that must be the boolean False, with the text of the
@@ -497,7 +515,7 @@ def ordinary_token_range(size: int, excluded: Iterable[int]) -> tuple[int, int]:
 
 
 class RecorderLogs:
-    """Incremental reader of one recorder directory (record format 2).
+    """Incremental reader of one recorder directory (record format 3).
 
     The directory holds one file per scheduler process, ``sched-<pid>.jsonl``: one JSON object per line, the
     header first, then one line per batch, and a fault line for every recorder step that raised. ``poll``
@@ -789,6 +807,8 @@ class BenchmarkRun:
         self._leaders: list[str] = []
         self._followers: list[str] = []
         self._enable_overlap: bool | None = None
+        # The dtype of the KV pool that every scheduler process reported, None until the headers were checked.
+        self._kv_cache_stored_dtype: str | None = None
         self._measurements: list[dict] = []
         self._restaged: list[int] = []
         self._current_point: dict | None = None
@@ -1089,6 +1109,12 @@ class BenchmarkRun:
                 raise _Failure(
                     f"{REASON_REJECTED}: scheduler processes disagree on {path[-1]}: {json.dumps(values, default=repr)}"
                 )
+        # Every scheduler process holds a KV pool of its own, and all of them have now reported the same
+        # dtype, so the one of the first leader is the dtype of the run. The driver is not told the cell's
+        # KV-cache label: the host holds this value against it (native_artifact.py,
+        # ``_validate_sglang_kv_cache_dtype``).
+        leader = self._leaders[0]
+        self._kv_cache_stored_dtype = _header_value(leader, headers[leader], _KV_STORED_DTYPE_NAME)
 
     def _check_header(self, name: str, header: dict) -> None:
         def read(*path: str) -> object:
@@ -1105,6 +1131,11 @@ class BenchmarkRun:
             read("limits", limit)
         for graph in _GRAPH_NAMES:
             read(graph)
+        # The recorder writes the text of a torch dtype, for example "torch.bfloat16", and marks a value that
+        # is no torch dtype as one it could not read. Which dtypes a cell admits is the host's rule.
+        stored = read(_KV_STORED_DTYPE_NAME)
+        if type(stored) is not str or not stored:
+            raise _Failure(f"{REASON_HEADER}: {name}: {_KV_STORED_DTYPE_NAME} is {stored!r}, expected a string")
         # With overlap scheduling off the result of a batch normally carries no copy event:
         # ``Scheduler.run_batch`` (srt/managers/scheduler.py) records one on its overlap path, and off it only
         # for the auxiliary output of a sampling observer (``Scheduler._copy_auxiliary_output_to_cpu``). The
@@ -2264,16 +2295,21 @@ class BenchmarkRun:
     def _own_producer_facts(self) -> dict:
         """What the driver knows about the run, for the ``producer`` block.
 
-        One of these keys has a reader: for a cell of a plan whose model has expert layers, the host validator
-        requires ``content.source`` to be ``CONTENT_TEXT_CHAINS`` (native_artifact.py,
-        ``_validate_sglang_moe_producer``). The other keys of the block with a reader are the launcher's:
-        ``sglang_version``, which the validator compares with the pod's provenance file
-        (``validate_native_collection``), and for such a cell ``tp_size``, ``moe.ep_size`` and
-        ``attn_dp_size``, which it compares with the sizes of the cell. No AISim reader parses the rest.
+        Two of these keys have a reader, the host validator (native_artifact.py). For every cell of an SGLang
+        plan it requires ``kv_cache_stored_dtype`` to be a dtype the KV-cache label of the cell stands for
+        (``_validate_sglang_kv_cache_dtype``). For a cell of a plan whose model has expert layers it requires
+        ``content.source`` to be ``CONTENT_TEXT_CHAINS`` (``_validate_sglang_moe_producer``). The other keys of
+        the block with a reader are the launcher's: ``sglang_version``, which the validator compares with the
+        pod's provenance file (``validate_native_collection``); ``kv_cache_dtype``, which it names when it
+        refuses a stored dtype and requires to be ``nvfp4`` for a cell with that KV-cache label; and
+        ``tp_size``, ``attn_dp_size`` and the ``moe`` block, which it compares with the sizes of the cell
+        (``_validate_sglang_moe_producer``, ``_validate_sglang_dense_producer``). No AISim reader parses the
+        rest.
 
         The facts are those of the run, not of a rank: every rank file carries the same block. ``limits`` is
-        the one record every rank reported, ``first_token_need`` is the need of one rank, and
-        ``content.issued`` counts the prompts of all ranks.
+        the one record every rank reported, and so is ``kv_cache_stored_dtype``, the text of the torch dtype
+        of the KV pools (None in the failed artifact of a run whose headers were not accepted).
+        ``first_token_need`` is the need of one rank, and ``content.issued`` counts the prompts of all ranks.
         """
         limits, plan, pool = self._limits, self._plan, self._text_pool
         if plan is not None:
@@ -2314,6 +2350,7 @@ class BenchmarkRun:
             "limits": None if limits is None else limits.as_dict(),
             "page_size": None if limits is None else limits.page_size,
             "enable_overlap": self._enable_overlap,
+            "kv_cache_stored_dtype": self._kv_cache_stored_dtype,
             "content": content_facts,
             "restaged_points": list(self._restaged),
             "self_test": list(self._self_test_passed),

@@ -98,6 +98,7 @@ from .test_fpm_runner import _cell
 from .test_fpm_sglbench_artifact import (
     GATE_ACCEPT,
     GATE_INVALID,
+    POD_KV_CACHE,
     POD_SGLANG_VERSION,
     _gate,
     _pod,
@@ -611,6 +612,9 @@ def _simulate_run(
         "engine": "FAKE: a page-cache model, no SGLang",
         # The release of the FAKE pod, which the launcher writes here and the validator compares with the provenance.
         "sglang_version": POD_SGLANG_VERSION,
+        # The KV cache of an fp8 cell, which the stand-in cell of these runs is: what SGLang resolves for its
+        # command and the dtype the engine then stores. The validator holds the second against the cell.
+        **POD_KV_CACHE["fp8"],
         "page_size": page,
         "limits": limits.as_dict(),
         "content": content_record,
@@ -1792,7 +1796,7 @@ def _publish_with_fake_times(
         selected_ops={"attention_context", "attention_generation"},
         has_model_cases=False,
         options=FPMCollectionOptions.from_args(
-            argparse.Namespace(fpm_max_gpus=1, fpm_prefill_cudagraph_policy="runtime")
+            argparse.Namespace(backend=READER_BACKEND, fpm_max_gpus=1, fpm_prefill_cudagraph_policy="runtime")
         ),
         collector_config={"runtime_backend_version": POD_SGLANG_VERSION, "aic_database_version": FAKE_READER_VERSION},
     )
@@ -1853,6 +1857,15 @@ def _publish_with_fake_times(
             producer={
                 "timing_source": "FAKE: typed into test_fpm_sglbench_producer.py, never measured",
                 "sglang_version": POD_SGLANG_VERSION,
+                # What the launcher records of the layout in a pod of this cell: SGLang's TP size, one
+                # attention-DP rank and no block of expert layers. Publication holds the three against the
+                # cell of a dense plan.
+                "tp_size": cell.topology.tp,
+                "attn_dp_size": 1,
+                "moe": None,
+                # What the pod of this cell records about its KV cache. Publication holds the stored dtype
+                # against the KV-cache label of the cell.
+                **POD_KV_CACHE[cell.kv_cache_dtype],
             },
         )
         artifact.write_artifacts(str(pod / "benchmark.json"), [payload])
@@ -2094,6 +2107,9 @@ payload = artifact.build_rank_artifact(
     producer={
         "timing_source": "FAKE",
         "sglang_version": sys.argv[5],
+        # The KV cache of an fp8 cell, which the cell this file is held against is.
+        "kv_cache_dtype": "fp8_e4m3",
+        "kv_cache_stored_dtype": "torch.float8_e4m3fn",
         "limits": limits.as_dict(),
         "content": plan.stats(),
         "content_source": plan.source,

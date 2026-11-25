@@ -163,6 +163,8 @@ def _sglang_plan(tmp_path: Path, monkeypatch, model: str, config: dict, **option
     config_dir.mkdir(exist_ok=True)
     (config_dir / "config.json").write_text(json.dumps(config))
     arguments = {
+        # The backend is among the arguments, as on the command line: the power option is off by default for it.
+        "backend": "sglang",
         "fpm_max_gpus": 2,
         "fpm_kv_cache_dtypes": ["fp8"],
         "fpm_prefill_cudagraph_policy": "runtime",

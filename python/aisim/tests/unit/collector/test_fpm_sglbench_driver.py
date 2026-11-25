@@ -15,7 +15,7 @@ No SGLang and no GPU are involved. Everything that stands in for an engine is FA
 
 - ``_FakeEngine`` answers ``generate`` with cached-token counts from ``PageCacheModel`` (the model of SGLang's
   prefix cache written in ``test_fpm_sglbench_content.py``) and appends the batch lines of each call to FAKE
-  recorder files. It writes those files itself, to record format 2; ``sglbench_recorder.py`` is not used here.
+  recorder files. It writes those files itself, to record format 3; ``sglbench_recorder.py`` is not used here.
   Its batches follow a FAKE scheduler: extend batches filled up to the chunk budget, then one decode batch for
   every further output token.
 - With ``dp_size`` above 1 the fake engine stands in for an engine with DP attention: one FAKE scheduler
@@ -113,7 +113,14 @@ FAKE_PRODUCER = {
     "engine": "FAKE: a page-cache model and hand-written recorder lines, no SGLang",
     # The release the launcher checked. The validator compares it with the provenance file of the pod.
     "sglang_version": POD_SGLANG_VERSION,
+    # What SGLang resolves for the command of an fp8 cell, which the stand-in cell of these tests is. The
+    # validator names it when it refuses a stored dtype.
+    "kv_cache_dtype": "fp8_e4m3",
 }
+# The dtype of the KV pool every FAKE scheduler process reports in its header, as the recorder writes it: the
+# text of the torch dtype SGLang stores for ``fp8_e4m3``. The validator holds it against the KV-cache label of
+# the cell, and the stand-in cell of these tests is labelled fp8.
+FAKE_KV_STORED_DTYPE = "torch.float8_e4m3fn"
 
 # Few values on every axis: most tests need a run, not a dense grid.
 SMALL_CAPS = grid.SampleCaps(
@@ -224,7 +231,7 @@ class _FakeClock:
 def _fake_header(
     pid: int, tp_rank: int, limits: grid.Limits, processes: int, *, dp_size: int = 1, dp_rank: int = 0
 ) -> dict:
-    """A FAKE recorder header of format 2, typed here key by key.
+    """A FAKE recorder header of format 3, typed here key by key.
 
     Without DP attention the process with TP rank 0 is the leader. With ``dp_size`` above 1 the header is that
     of a process of attention-DP rank ``dp_rank`` in an engine with SGLang's input blocker.
@@ -232,7 +239,7 @@ def _fake_header(
     record = limits.as_dict()
     return {
         "type": "header",
-        "format": 2,
+        "format": 3,
         "pid": pid,
         "class": "SglbenchRecorderScheduler",
         "mro": ["SglbenchRecorderScheduler", "Scheduler", "object"],
@@ -259,6 +266,7 @@ def _fake_header(
         "decode_graph_sizes": record["decode_graph_sizes"],
         "prefill_graph_sizes": record["prefill_graph_sizes"],
         "enable_overlap": True,
+        "kv_cache_stored_dtype": FAKE_KV_STORED_DTYPE,
         "checks": {
             "disable_radix_cache": False,
             "is_hybrid_swa": False,
@@ -289,6 +297,20 @@ def _edit(path: str, value, *, process: int | None = None):
             for key in parents:
                 target = target[key]
             target[last] = value
+        return header
+
+    return edit
+
+
+def _drop(path: str):
+    """A header edit: take the key of ``path`` "a.b" out of the header of every process."""
+
+    def edit(_index: int, header: dict) -> dict:
+        *parents, last = path.split(".")
+        target = header
+        for key in parents:
+            target = target[key]
+        del target[last]
         return header
 
     return edit
@@ -1159,11 +1181,12 @@ def test_complete_run_of_the_default_grid_passes_the_validator_and_the_gate(tmp_
         "timing_metric": "scheduler_wall_time",
         "timing_clock": "process_local_monotonic",
         "staging": "one_batch_call",
-        "recorder_format": 2,
+        "recorder_format": 3,
         "scheduler_processes": 1,
         "limits": fake.limits.as_dict(),
         "page_size": page_size,
         "enable_overlap": True,
+        "kv_cache_stored_dtype": FAKE_KV_STORED_DTYPE,
         "content": {
             "source": "seeded_token_ids",
             "seed": "0",
@@ -1878,10 +1901,12 @@ def test_more_headers_than_scheduler_processes_fail_the_run(tmp_path):
     [
         # The stock scheduler was built: the class replacement did not apply.
         (_edit("class", "Scheduler"), "sched-4100.jsonl: class 'Scheduler', expected 'SglbenchRecorderScheduler'"),
-        # A recorder of the format before: its batch lines lack the token counts of the ranks.
-        (_edit("format", 1), "sched-4100.jsonl: format 1, expected 2"),
-        (_edit("format", 3), "sched-4100.jsonl: format 3, expected 2"),
-        (_edit("format", True), "sched-4100.jsonl: format True, expected 2"),
+        # A recorder of the format before: its header lacks the dtype of the KV pool. One of the format before
+        # that: its batch lines lack the token counts of the ranks as well.
+        (_edit("format", 2), "sched-4100.jsonl: format 2, expected 3"),
+        (_edit("format", 1), "sched-4100.jsonl: format 1, expected 3"),
+        (_edit("format", 4), "sched-4100.jsonl: format 4, expected 3"),
+        (_edit("format", True), "sched-4100.jsonl: format True, expected 3"),
         (_edit("leader", False), "0 leader header(s), expected exactly one: []"),
         (_edit("leader", 1), "sched-4100.jsonl: leader is 1, expected true or false"),
         (_edit("checks", {}), "sched-4100.jsonl: the header has no checks.disable_radix_cache"),
@@ -1893,6 +1918,15 @@ def test_more_headers_than_scheduler_processes_fail_the_run(tmp_path):
         (
             _edit("limits.max_running_requests", 9.0),
             "sched-4100.jsonl: limits: max_running_requests must be an int, got float: 9.0",
+        ),
+        # A header without the dtype of the KV pool, and one that holds anything but its text.
+        (_drop("kv_cache_stored_dtype"), "sched-4100.jsonl: the header has no kv_cache_stored_dtype"),
+        (_edit("kv_cache_stored_dtype", None), "sched-4100.jsonl: kv_cache_stored_dtype is None, expected a string"),
+        (_edit("kv_cache_stored_dtype", ""), "sched-4100.jsonl: kv_cache_stored_dtype is '', expected a string"),
+        (_edit("kv_cache_stored_dtype", 16), "sched-4100.jsonl: kv_cache_stored_dtype is 16, expected a string"),
+        (
+            _edit("kv_cache_stored_dtype", ["torch.float8_e4m3fn"]),
+            "sched-4100.jsonl: kv_cache_stored_dtype is ['torch.float8_e4m3fn'], expected a string",
         ),
     ],
 )
@@ -1954,7 +1988,7 @@ STAGE_H_REJECTIONS = [
         "SGLANG_ENABLE_COLOCATED_BATCH_GEN must be unset without DP attention (input_blocker=true)",
     ),
     ("checks.is_hip", True, _AMD.format(v="true")),
-    # Only the boolean false passes: a recorder that wrote another falsy value did not write format 1.
+    # Only the boolean false passes: a recorder that wrote another falsy value did not write format 3.
     ("checks.is_hip", None, _AMD.format(v="null")),
     ("checks.disable_radix_cache", 0, _RADIX_OFF.format(v="0")),
     ("checks.schedule_policy", "lpm", _POLICY.format(name="schedule_policy=lpm")),
@@ -1979,6 +2013,7 @@ STAGE_H_REJECTIONS = [
     _unreadable("sglang_version"),
     _unreadable("decode_graph_sizes"),
     _unreadable("prefill_graph_sizes"),
+    _unreadable("kv_cache_stored_dtype"),
     _unreadable("ranks.tp_size"),
     _unreadable("ranks.pp_size"),
     _unreadable("ranks.attn_dp_size"),
@@ -2002,6 +2037,54 @@ def test_overlap_off_is_recorded_in_the_rejected_artifact(tmp_path):
     assert fake.payload()["producer"]["enable_overlap"] is False
 
 
+@pytest.mark.parametrize("stored", ["torch.bfloat16", "torch.float16", "torch.float8_e4m3fn"])
+@pytest.mark.parametrize("dp_size", [1, 2])
+def test_the_dtype_of_the_kv_pool_goes_from_the_headers_into_the_producer_block_of_every_rank_file(
+    tmp_path, dp_size, stored
+):
+    fake = _start(tmp_path, "decode", dp_size=dp_size, edit_header=_edit("kv_cache_stored_dtype", stored))
+
+    assert (fake.run.status, fake.run.reason) == ("complete", None)
+    blocks = [payload["producer"] for payload in fake.run.payloads()]
+    assert [block["kv_cache_stored_dtype"] for block in blocks] == [stored] * dp_size
+    # The resolved argument beside it is the launcher's fact and is written as the launcher gave it.
+    assert [block["kv_cache_dtype"] for block in blocks] == [FAKE_PRODUCER["kv_cache_dtype"]] * dp_size
+
+
+def test_the_dtype_of_the_kv_pool_is_null_in_the_artifact_of_a_run_whose_headers_were_not_accepted(tmp_path):
+    # The dtype is that of the run only once every header was accepted and all of them reported the same one.
+    refused = _start(tmp_path / "refused", edit_header=_edit("enable_overlap", False))
+    assert refused.run.status == "failed" and refused.payload()["producer"]["kv_cache_stored_dtype"] is None
+
+    edit = _edit("kv_cache_stored_dtype", "torch.bfloat16", process=1)
+    disagree = _start(tmp_path / "disagree", processes=2, edit_header=edit)
+    assert disagree.run.status == "failed" and disagree.payload()["producer"]["kv_cache_stored_dtype"] is None
+
+    # A run that never saw a header has none either.
+    silent = _start(tmp_path / "silent", headers=False)
+    assert silent.run.status == "failed" and silent.payload()["producer"]["kv_cache_stored_dtype"] is None
+
+
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+def test_the_validator_holds_the_recorded_dtype_of_the_kv_pool_against_the_label_of_the_cell(tmp_path, mode):
+    """A complete run whose FAKE engine stored bfloat16, held against the fp8 cell and against a bfloat16 cell."""
+    fake = _start(tmp_path, mode, edit_header=_edit("kv_cache_stored_dtype", "torch.bfloat16"))
+    assert (fake.run.status, fake.run.reason) == ("complete", None)
+    fake.run.write()
+    assert fake.cell.kv_cache_dtype == "fp8"
+
+    with pytest.raises(ValueError) as refusal:
+        _validate(fake.cell, fake.root)
+    assert str(refusal.value) == (
+        "native SGLang rank artifact did not store the KV cache of its cell: the cell's kv_cache_dtype 'fp8' "
+        "stands for producer.kv_cache_stored_dtype 'torch.float8_e4m3fn', found 'torch.bfloat16' "
+        f"(producer.kv_cache_dtype 'fp8_e4m3'): {fake.pod / 'benchmark.json'}"
+    )
+    # The same files are those of a cell that is labelled bfloat16.
+    collection = _validate(dataclasses.replace(fake.cell, kv_cache_dtype="bfloat16"), fake.root)
+    assert [measurement.point for measurement in collection.points] == fake.built.point_dicts()
+
+
 @pytest.mark.parametrize(
     ("path", "value"),
     [
@@ -2015,6 +2098,10 @@ def test_overlap_off_is_recorded_in_the_rejected_artifact(tmp_path):
         ("limits.chunked_prefill_size", None),
         ("decode_graph_sizes", []),
         ("prefill_graph_sizes", []),
+        # The driver is not told the KV-cache label of its cell, so every dtype the processes agree on passes
+        # here. The host holds it against the cell.
+        ("kv_cache_stored_dtype", "torch.bfloat16"),
+        ("kv_cache_stored_dtype", "torch.float32"),
         # Ranks the checks do not use may be unreadable.
         ("ranks.attn_cp_rank", UNREADABLE),
     ],
@@ -2036,6 +2123,12 @@ def test_allowed_header_values_do_not_reject(tmp_path, path, value):
         ("prefill_graph_sizes", [], "prefill_graph_sizes: [[4, 8, 16, 32, 64], []]"),
         ("ranks.tp_size", 1, "tp_size: [2, 1]"),
         ("sglang_version", "0.5.22", 'sglang_version: ["0.5.23", "0.5.22"]'),
+        # Every scheduler process holds a KV pool of its own: a process that stored another dtype fails the run.
+        (
+            "kv_cache_stored_dtype",
+            "torch.bfloat16",
+            'kv_cache_stored_dtype: ["torch.float8_e4m3fn", "torch.bfloat16"]',
+        ),
     ],
 )
 def test_headers_that_disagree_are_rejected(tmp_path, path, value, reason):
@@ -2909,7 +3002,7 @@ def test_recorder_logs_read_only_what_was_appended_and_keep_a_half_written_line_
 
     logs = driver.RecorderLogs(tmp_path)
     path = tmp_path / "sched-1.jsonl"
-    header = {"type": "header", "format": 2}
+    header = {"type": "header", "format": 3}
     first = _line(_batch_line(1))
     path.write_bytes(_line(header) + first[:10])
     (tmp_path / "other.jsonl").write_bytes(b"not a recorder file\n")
@@ -2944,7 +3037,7 @@ def test_recorder_logs_read_only_what_was_appended_and_keep_a_half_written_line_
 def test_recorder_logs_ignore_idle_lines_without_requests_and_keep_the_others(tmp_path):
     logs = driver.RecorderLogs(str(tmp_path))
     lines = [
-        {"type": "header", "format": 2},
+        {"type": "header", "format": 3},
         _batch_line(1, "IDLE", []),
         _batch_line(2, "IDLE", ["a"]),
         _batch_line(3, "EXTEND", []),
@@ -2961,7 +3054,7 @@ def test_recorder_logs_list_fault_lines_and_everything_that_is_not_a_line_of_the
     logs = driver.RecorderLogs(tmp_path)
     good = tmp_path / "sched-1.jsonl"
     good.write_bytes(
-        _line({"type": "header", "format": 2})
+        _line({"type": "header", "format": 3})
         + _line(_batch_line(1))
         + _line({"type": "fault", "where": "run_batch", "error": "FAKE"})
         + b"not json\n"
@@ -2969,7 +3062,7 @@ def test_recorder_logs_list_fault_lines_and_everything_that_is_not_a_line_of_the
         + b"[1, 2]\n"
         + b"\n"
         + _line({"type": "summary"})
-        + _line({"type": "header", "format": 2})
+        + _line({"type": "header", "format": 3})
         + _line(_batch_line(3))  # seq 2 was lost
         + _line(_batch_line(4, mode=None))
         + _line({"type": "batch", "seq": 5, "mode": "EXTEND", "rids": ["a", 7]})
@@ -2982,7 +3075,7 @@ def test_recorder_logs_list_fault_lines_and_everything_that_is_not_a_line_of_the
     logs.poll()
 
     assert list(logs.headers) == ["sched-1.jsonl"]
-    # A line that is not format 1 is not kept.
+    # A line that is not format 3 is not kept.
     assert [line["seq"] for line in logs.batches("sched-1.jsonl")] == [1, 7]
     assert logs.batches("sched-2.jsonl") == []
     assert [(fault["file"], fault["where"]) for fault in logs.faults] == [
@@ -3089,7 +3182,7 @@ def _module_constants(path: Path) -> dict:
 
 def test_the_constants_the_driver_repeats_are_the_ones_of_the_recorder_and_of_compat():
     # Typed here once more, as the recorder log format gives them.
-    assert (driver.RECORD_FORMAT, driver.RECORDER_CLASS_NAME) == (2, "SglbenchRecorderScheduler")
+    assert (driver.RECORD_FORMAT, driver.RECORDER_CLASS_NAME) == (3, "SglbenchRecorderScheduler")
     assert (driver.LOG_FILE_PREFIX, driver.LOG_FILE_SUFFIX) == ("sched-", ".jsonl")
     assert driver.TESTED_SGLANG_VERSIONS == ("0.5.22", "0.5.23")
     assert driver.WARMUP_PROMPT_TOKENS == 256
@@ -3953,7 +4046,7 @@ def test_a_complete_run_with_two_ranks_passes_the_validator_and_the_gate(tmp_pat
     # The producer block says how the stages were sent. Its other keys are those of a run with one rank.
     producer, one_rank = on_disk[0]["producer"], single.payload()["producer"]
     assert producer["staging"] == "balanced_batch_call" and one_rank["staging"] == "one_batch_call"
-    assert (producer["scheduler_processes"], producer["recorder_format"]) == (2, 2)
+    assert (producer["scheduler_processes"], producer["recorder_format"]) == (2, 3)
     assert set(producer) == set(one_rank)
     assert (producer["limits"], producer["self_test"]) == (fake.limits.as_dict(), list(driver.SELF_TEST_CHECKS))
     assert producer["restaged_points"] == []
@@ -5009,32 +5102,37 @@ def _digest(data: bytes) -> str:
 
 # What a run with one rank sends and writes for a grid whose prefill new-token axis has no low end but 1, as
 # SHA-256 digests: of the calls (prompts, request ids and output tokens of every call, as compact JSON) and of
-# the rank file. They were typed in from runs of this file's fake engine against the driver as it stood before
-# it knew attention-DP ranks, with its record format set to 2. The generated grid had that axis then, and
-# ``_plan_without_the_low_end`` plans it again. For that grid a run with one rank therefore sends and writes
-# what it did then, byte for byte, apart from the format number in the producer block. A change that is meant
-# to alter what the driver sends or writes for a given grid retypes them. A change of the generated grid
-# belongs in ``ONE_RANK_DIGESTS``.
+# the rank file. The digests of the calls were typed in from runs of this file's fake engine against the driver
+# as it stood before it knew attention-DP ranks. The generated grid had that axis then, and
+# ``_plan_without_the_low_end`` plans it again. For that grid a run with one rank therefore sends what it did
+# then, byte for byte. It writes what it did then apart from three values of the producer block: the format
+# number of the recorder, the dtype of the KV pool, which the driver writes since record format 3, and the
+# resolved KV-cache dtype among the FAKE facts of the launcher (``FAKE_PRODUCER``). The digests of the rank
+# files were typed in again when format 3 came, from the driver as it stands. Each file was first turned back
+# into the file of the digest before, with the format number 2 and without the two keys, and gave that digest;
+# that was done once, by a script that is not kept in this repository. A change that is meant to alter what
+# the driver sends or writes for a given grid retypes them. A change of the generated grid belongs in
+# ``ONE_RANK_DIGESTS``.
 ONE_RANK_DIGESTS_WITHOUT_LOW_END = {
     ("seeded", "prefill", 1, 1): (
         "6b24b27d78033d00d7e9d62930fbdf0a833ce54364cff0ee55f8b067588583c6",
-        "803b456339f98c20907e8b78864b487a1e614f6796a3046945cc2264f5b44ccb",
+        "a1dc7a64d6a0e6525f5bbeb1d1b9273e51e3a7c5d19c68c09053240012c87ba3",
     ),
     ("seeded", "decode", 64, 1): (
         "434d5f187ff06d2dfb6128094c89f21fcada6ff9c3d13f035040cfdff41639e7",
-        "bf9a4f6f613ab30b379a7dd48661965a287f39ff18057711b3194aa6cde658e9",
+        "bdea0e6e7f5cdca0e2dc3ab457260fe1829c1a4317de4617c7fa43d2d28e4cfe",
     ),
     ("seeded", "agg", 1, 2): (
         "ddea84370f198be561d13bcc0a7290d09ae7f2b5bae6f936c811801cc3ae209f",
-        "4b672309209f788faa074dff6da17c9419e307f22f91f33b390626bb87fd5009",
+        "eda9bf53e4e441ccd471ed1f6308551907ed93628d5f86012ef143e87f66b6eb",
     ),
     ("text", "prefill", 64, 1): (
         "f96a88b7d6a05aeb77faf0227dca5a36f0b6889c35d2e8edab0426f621ec3bf5",
-        "dc5ca38070a83bd47c7579629132e14ac8fd38f2d8ac911b9245b82764e45133",
+        "d4dee32a3c8baaf773123ad74054163840ed00558caabd10e4e9bdcc347d8eb9",
     ),
     ("text", "decode", 1, 2): (
         "4864a00e60a507311f37bb42b4c8c4953b58792c901a571c3067ad595852aa53",
-        "e0b707fe419f81983f38b3073757c09ed1a8e092bec1411c426493b2cfdb12f1",
+        "a8cb3181e679eace10f82c22e00a008e05de33be323690e372ce79eaeba08cfc",
     ),
 }
 
@@ -5051,15 +5149,15 @@ ONE_RANK_DIGESTS = {
     **ONE_RANK_DIGESTS_WITHOUT_LOW_END,
     ("seeded", "prefill", 1, 1): (
         "c43aa4cc13f29e5d9bece7fc7411b83c5c031884e6bb806c4de50338d6220a2c",
-        "7f97c1bc9ce5fc721c925083d3dddde64a0e409c55be3fb67f86845e4f79f714",
+        "6f82e18b5ff5ce58ad542a82135efd1b0e2450dd5af27e83c435b3bdb482f5a4",
     ),
     ("seeded", "agg", 1, 2): (
         "547202b41c0ebecd341c0cd6b8ca1591c9b77f2e66803da03c1bf614ea5a6161",
-        "52908c815cc28b567cf72aa255b199c83fe9bf7fc4dadafa4629bbae5c9ed4d9",
+        "a28ce3e187a7cde23bcca736bd1f0fa9f660496c671c8e18c85acd74f0fa718e",
     ),
     ("text", "prefill", 64, 1): (
         "a5f97e540c5f241af923f2398fe5726f6b98bd5ce3566509b33b49eedffe1325",
-        "366e32ade9c2d0c42cb0ea06eef5cd0c866b5804d720f74b0c338dfc4dc4e4ad",
+        "dc44a5e3e652a7d8afc2daacbb74612e2113df61be7029a916e80528a853a048",
     ),
 }
 

@@ -40,6 +40,7 @@ from aisim_core.sdk.fpm_identity import LEGACY_EXECUTION_IDENTITY
 from .test_fpm_runner import _cell, _native_payload, _plan, _write_provenance
 from .test_fpm_sglbench_artifact import (
     LAUNCHER_PRODUCER,
+    POD_KV_CACHE,
     POD_SGLANG_VERSION,
     _pod,
     _points,
@@ -79,8 +80,10 @@ MOE_CONFIG = {
     "max_position_embeddings": 4096,
 }
 
-# The hash and the cell ids of the plan of _plan_inputs with backend "vllm". They were computed with planner.py
-# as it was before SGLang was admitted (commit e26ff186), so they move only when plan identity itself changes.
+# The hash and the cell ids of the plan of _plan_inputs with backend "vllm". They were computed with a planner
+# that has no SGLang check, so they move only when plan identity itself changes: first with planner.py as it was
+# before SGLang was admitted, and again with the collector of main alone once that had the power option, with
+# the options below (power off, as an SGLang plan has it).
 VLLM_PLAN_SHA256 = "4ce0a4bad64ad2381905bae7a2f416107cd6adacfccdf0c5904d090da85c14ca"
 VLLM_CELL_IDS = ["fpm-f28a6836df315638", "fpm-b80365929b21ac58", "fpm-f3124a62ef358b3e", "fpm-a7b1dd3127d7797a"]
 
@@ -123,7 +126,8 @@ def _hermetic_plans(monkeypatch):
 
 
 def _options(**overrides) -> FPMCollectionOptions:
-    values = {"fpm_max_gpus": 2, "fpm_prefill_cudagraph_policy": "runtime", **overrides}
+    # The backend is among the arguments, as on the command line: the default of the power option depends on it.
+    values = {"backend": "sglang", "fpm_max_gpus": 2, "fpm_prefill_cudagraph_policy": "runtime", **overrides}
     return FPMCollectionOptions.from_args(argparse.Namespace(**values))
 
 
@@ -379,6 +383,42 @@ def test_the_vllm_only_inputs_of_a_plan_are_refused_by_name(tmp_path, inputs, fl
 )
 def test_the_vllm_engine_settings_of_a_plan_are_refused_by_name(tmp_path, options, message):
     _refused(tmp_path, message, options=_options(**options))
+
+
+@pytest.mark.parametrize(
+    ("arguments", "measured"),
+    [
+        ({"backend": "sglang"}, False),
+        ({"backend": "sglang", "fpm_measure_power": None}, False),
+        ({"backend": "sglang", "fpm_measure_power": False}, False),
+        ({"backend": "sglang", "fpm_measure_power": True}, True),
+        ({"backend": "vllm"}, True),
+        ({"backend": "vllm", "fpm_measure_power": False}, False),
+        ({}, True),
+    ],
+    ids=["sglang", "sglang-unset", "sglang-off", "sglang-on", "vllm", "vllm-off", "no-backend"],
+)
+def test_the_power_option_is_off_by_default_for_sglang_alone(arguments, measured):
+    values = {"fpm_max_gpus": 2, "fpm_prefill_cudagraph_policy": "runtime", **arguments}
+
+    assert FPMCollectionOptions.from_args(argparse.Namespace(**values)).measure_power is measured
+
+
+def test_an_sglang_plan_measures_no_power_and_refuses_to_be_asked_for_it(tmp_path):
+    plan = build_collection_plan(**_plan_inputs(tmp_path))
+    # No power in the plan, so no power window in a cell and the plan identity of a plan without the option.
+    assert plan.options.measure_power is False
+    assert "measure_power" not in json.dumps(plan.to_dict())
+    # Switching the option off is accepted and gives the plan of the default command.
+    switched_off = build_collection_plan(**_plan_inputs(tmp_path, options=_options(fpm_measure_power=False)))
+    assert switched_off.sha256 == plan.sha256
+
+    _refused(
+        tmp_path,
+        "^--fpm-measure-power is not supported with --backend sglang: the launcher has no power window, so an "
+        "SGLang plan measures no power and its rows carry no power_w; leave the option out$",
+        options=_options(fpm_measure_power=True),
+    )
 
 
 def test_a_vllm_compilation_config_is_refused_whatever_filled_it(tmp_path, monkeypatch):
@@ -1435,12 +1475,117 @@ VERSION_MISMATCHES = {
 @pytest.mark.parametrize("name", sorted(VERSION_MISMATCHES))
 def test_the_validator_wants_the_launchers_release_to_be_the_installed_one(tmp_path, name):
     installed, edit, refusal = VERSION_MISMATCHES[name]
-    # The unedited artifact carries the release of the FAKE pod.
-    assert LAUNCHER_PRODUCER == {"sglang_version": POD_SGLANG_VERSION} and POD_SGLANG_VERSION == "0.5.23"
+    # The unedited artifact carries the release of the FAKE pod, and the KV cache of the fp8 cell it is held
+    # against, so that only the release is what a case of this test refuses.
+    assert LAUNCHER_PRODUCER == {
+        "sglang_version": POD_SGLANG_VERSION,
+        "kv_cache_dtype": "fp8_e4m3",
+        "kv_cache_stored_dtype": "torch.float8_e4m3fn",
+    }
+    assert POD_SGLANG_VERSION == "0.5.23"
     cell = _collected(tmp_path, installed=installed, edit=edit)
 
     with pytest.raises(ValueError, match=refusal):
         validate_native_collection(cell, tmp_path / "raw", expected_backend="sglang")
+
+
+def _kv_cache_refusal(found: str, resolved: str) -> str:
+    """The refusal of the stored KV-cache dtype for the fp8 cell of ``_collected``."""
+    return re.escape(
+        "native SGLang rank artifact did not store the KV cache of its cell: the cell's kv_cache_dtype 'fp8' "
+        f"stands for producer.kv_cache_stored_dtype 'torch.float8_e4m3fn', found {found} "
+        f"(producer.kv_cache_dtype {resolved}): "
+    )
+
+
+KV_CACHE_MISMATCHES = {
+    # name -> (an edit of the launcher's artifact, the refusal)
+    "the-pool-of-a-bfloat16-cell": (
+        lambda payload: payload["producer"].update(kv_cache_dtype="auto", kv_cache_stored_dtype="torch.bfloat16"),
+        _kv_cache_refusal("'torch.bfloat16'", "'auto'"),
+    ),
+    "a-float16-pool": (
+        lambda payload: payload["producer"].update(kv_cache_stored_dtype="torch.float16"),
+        _kv_cache_refusal("'torch.float16'", "'fp8_e4m3'"),
+    ),
+    "another-fp8-dtype": (
+        lambda payload: payload["producer"].update(kv_cache_stored_dtype="torch.float8_e4m3fnuz"),
+        _kv_cache_refusal("'torch.float8_e4m3fnuz'", "'fp8_e4m3'"),
+    ),
+    "no-stored-dtype-in-the-producer-block": (
+        lambda payload: payload["producer"].pop("kv_cache_stored_dtype"),
+        _kv_cache_refusal("no producer.kv_cache_stored_dtype", "'fp8_e4m3'"),
+    ),
+    "stored-dtype-is-not-a-string": (
+        lambda payload: payload["producer"].update(kv_cache_stored_dtype=8),
+        _kv_cache_refusal("8", "'fp8_e4m3'"),
+    ),
+    "stored-dtype-is-null": (
+        lambda payload: payload["producer"].update(kv_cache_stored_dtype=None),
+        _kv_cache_refusal("None", "'fp8_e4m3'"),
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(KV_CACHE_MISMATCHES))
+def test_the_validator_wants_the_stored_kv_cache_dtype_to_be_one_of_the_label_of_the_cell(tmp_path, name):
+    edit, refusal = KV_CACHE_MISMATCHES[name]
+    cell = _collected(tmp_path, edit=edit)
+    assert cell.kv_cache_dtype == "fp8"
+
+    # Asked of an SGLang collection whatever the caller says of expert layers, and of a caller without a plan.
+    for keywords in ({}, {"expected_moe": None}):
+        with pytest.raises(ValueError, match="^" + refusal):
+            validate_native_collection(cell, tmp_path / "raw", expected_backend="sglang", **keywords)
+
+
+# Config keys by which a checkpoint declares an NVFP4 KV cache of its own, as AISim reads them. Typed in.
+NVFP4_KV_CACHE_DECLARATIONS = {
+    "hf-quant-config": {"hf_quant_config": {"quantization": {"quant_algo": "NVFP4", "kv_cache_quant_algo": "NVFP4"}}},
+    "quantization-config": {"quantization_config": {"kv_cache_quant_algo": "nvfp4"}},
+}
+_NO_NVFP4_IN_A_PLAN = re.escape("unsupported FPM KV-cache dtype 'nvfp4'")
+
+
+@pytest.mark.parametrize("name", sorted(NVFP4_KV_CACHE_DECLARATIONS))
+def test_no_plan_carries_the_kv_cache_dtype_nvfp4_that_the_validator_has_a_rule_for(tmp_path, name):
+    # The validator holds an nvfp4 cell against the FP4 dtype and the argument nvfp4. No plan hands it such a
+    # cell: planning refuses the checkpoint AISim infers the dtype for, and the option cannot name it.
+    document = {**DENSE_CONFIG, **NVFP4_KV_CACHE_DECLARATIONS[name]}
+    # A folder of its own: ``_plan_inputs`` writes the plain config under the same file name.
+    folder = tmp_path / "declares-an-nvfp4-kv-cache"
+    folder.mkdir()
+    inputs = _plan_inputs(tmp_path, model_config_path=_config(folder, document))
+
+    with pytest.raises(ValueError, match=_NO_NVFP4_IN_A_PLAN):
+        build_collection_plan(**inputs)
+    # The plain checkpoint, with the option asked to name the dtype.
+    with pytest.raises(ValueError, match=_NO_NVFP4_IN_A_PLAN):
+        build_collection_plan(**_plan_inputs(tmp_path, options=_options(fpm_kv_cache_dtypes=["nvfp4"])))
+
+    # With a dtype the option can name, the same checkpoint is planned, and its cells carry that dtype.
+    for label in ("bfloat16", "fp8"):
+        plan = build_collection_plan(**{**inputs, "options": _options(fpm_kv_cache_dtypes=[label])})
+        assert plan.capability.dtype.native_kv_cache_dtype == "nvfp4"
+        assert {cell.kv_cache_dtype for cell in plan.cells} == {label}
+
+
+def test_the_release_is_compared_before_the_kv_cache_and_a_matching_file_passes_both(tmp_path):
+    # A file that fails both rules is refused for its release, the rule that comes first.
+    def both(payload: dict) -> None:
+        payload["producer"].update(sglang_version="0.5.22", kv_cache_stored_dtype="torch.bfloat16")
+
+    cell = _collected(tmp_path / "both", edit=both)
+    with pytest.raises(ValueError, match=_differs("0.5.23", "0.5.22")):
+        validate_native_collection(cell, tmp_path / "both" / "raw", expected_backend="sglang")
+
+    # The same file is that of a bfloat16 cell in a pod of the release it names.
+    def bfloat16(payload: dict) -> None:
+        payload["producer"].update(POD_KV_CACHE["bfloat16"])
+
+    cell = dataclasses.replace(_collected(tmp_path / "fits", edit=bfloat16), kv_cache_dtype="bfloat16")
+    collection = validate_native_collection(cell, tmp_path / "fits" / "raw", expected_backend="sglang")
+    assert len(collection.points) == len(_points("prefill"))
 
 
 def test_publication_and_the_collection_summary_validate_with_the_backend_of_the_plan(tmp_path):
@@ -1560,7 +1705,18 @@ def _fake_cluster(plan):
 
         def execute(self, _pods):
             phase = self.cell.workload_kind
-            (payload,) = _rank_artifacts(phase, _points(phase))
+            # What the launcher records of the layout in a pod of a dense cell (sglbench_launcher.py,
+            # _start_up_checks and _resolved_settings): SGLang's TP size, one attention-DP rank and no block of
+            # expert layers. The host holds the three against the cell of a dense plan. It holds the dtype of
+            # the KV pool against the KV-cache label of the cell, so the FAKE pod records the one of its label.
+            producer = {
+                **LAUNCHER_PRODUCER,
+                **POD_KV_CACHE[self.cell.kv_cache_dtype],
+                "tp_size": self.cell.topology.tp,
+                "attn_dp_size": 1,
+                "moe": None,
+            }
+            (payload,) = _rank_artifacts(phase, _points(phase), producer=producer)
             artifact.atomic_write_json(str(self.pod / "benchmark.json"), payload)
 
         def collect(self, _pods, *, require_benchmark=True):

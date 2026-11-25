@@ -778,14 +778,19 @@ def build_rank_artifact(
         ``mode`` is added here and may not be supplied.
     producer
         Free-form evidence: timing metric and clock, staging method, page size, overlap and streaming settings,
-        content source and seed, limits record, SGLang version, run-specific values. Five keys have a reader.
-        For a cell of an SGLang plan, ``validate_native_collection`` (native_artifact.py) requires
+        content source and seed, limits record, SGLang version, run-specific values. Seven keys have a
+        reader. For a cell of an SGLang plan, ``validate_native_collection`` (native_artifact.py) requires
         ``sglang_version`` in every rank artifact and compares it with the installed release in the pod's
-        provenance file. For a cell of such a plan whose model has expert layers it also requires
-        ``content.source`` to name dataset text, and ``tp_size``, ``moe.ep_size`` and ``attn_dp_size`` to be
-        the sizes SGLang resolves for the cell: its tensor-parallel size times its data-parallel size, its
-        expert-parallel size and its data-parallel size (``_validate_sglang_moe_producer``). No reader parses
-        the other keys.
+        provenance file. It also requires ``kv_cache_stored_dtype``, the dtype of the engine's KV pool, to be
+        one the KV-cache label of the cell stands for, and names ``kv_cache_dtype``, the argument SGLang
+        resolved, when it refuses; for a cell labelled ``nvfp4`` that argument must be ``nvfp4`` too
+        (``_validate_sglang_kv_cache_dtype``). For a cell of such a plan whose model has expert layers it
+        also requires ``content.source`` to name dataset text, and ``tp_size``, ``moe.ep_size`` and
+        ``attn_dp_size`` to be the sizes SGLang resolves for the cell: its tensor-parallel size times its
+        data-parallel size, its expert-parallel size and its data-parallel size
+        (``_validate_sglang_moe_producer``). For a cell of a plan whose model has none it requires ``tp_size``
+        to be the tensor-parallel size of the cell, ``attn_dp_size`` to be 1 and ``moe`` to be null or a block
+        whose ``ep_size`` is 1 (``_validate_sglang_dense_producer``). No reader parses the other keys.
     kvwarm_dataset
         ``None`` for a run whose prompts were not dataset text: the ``kvwarm`` block is then the four fixed
         keys. Otherwise the record of the dataset the prompts were made of, a dict with exactly the keys

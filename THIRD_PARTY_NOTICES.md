@@ -2878,7 +2878,8 @@ https://github.com/sgl-project/sglang/tree/297e54fd105e974cdf401e5b4d20253a22c16
 
 What follows SGLang: `sglbench_recorder.py` subclasses SGLang's `Scheduler` at run time,
 wraps `run_batch` and `process_batch_result`, and reads batch, limit and rank attributes
-under SGLang's names. `sglbench_compat.py` imports SGLang inside its functions and calls
+and the KV-cache dtype of the model runner under SGLang's names. `sglbench_compat.py`
+imports SGLang inside its functions and calls
 its argument parser, engine, tokenizer and plugin loader; it follows the layout of the
 streamed response chunks. `sglbench_driver.py` checks the batch sequences SGLang's
 scheduler produces for one call, and `sglbench_launcher.py` tests SGLang's resolved
@@ -2887,7 +2888,11 @@ arguments and environment variables under their upstream names and sets one of t
 SGLang. The tests model those interfaces with fakes. One test of
 `test_fpm_sglbench_launcher.py` also looks up, in a local checkout of each release when
 one is given, the SGLang names of the fields the launcher hides in its dump and of the
-check behind an environment variable it refuses; it holds names only.
+check behind an environment variable it refuses; it holds names only. One test of
+`test_fpm_sglbench_recorder.py` looks up, in the same checkouts, the names by which the
+model runner gets its KV-cache dtype and the scheduler its model runner, and holds the
+return annotation of `configure_kv_cache_dtype` and one return statement of
+`TpModelWorker` as strings.
 
 The collector path that starts the launcher follows the same two revisions.
 `python/aisim/collector/fpm_forward/sglang_fpm_builder.py`, with the test
@@ -2905,28 +2910,34 @@ when the engine shuts down. The tests `python/aisim/tests/unit/collector/test_fp
 and `python/aisim/tests/unit/collector/test_fpm_sglbench_gate.py` model that with a FAKE
 engine that lists and kills its own descendants, and the second repeats the short texts of
 two SGLang log lines.
-`python/aisim/collector/fpm_forward/native_artifact.py` holds the sizes a result file
-records against its cell under SGLang's meaning of `tp_size` and `attn_dp_size`, and
+`python/aisim/collector/fpm_forward/native_artifact.py` holds two things a result file
+records against its cell: the sizes, under SGLang's meaning of `tp_size` and
+`attn_dp_size`, and the dtype of the KV pool, under the names of the torch dtypes SGLang
+stores and, for an NVFP4 KV cache, the name of SGLang's argument.
 `python/aisim/collector/README.md` describes SGLang's input blocker, its rules on the slice
 of an expert that one rank holds, the KV-cache dtype it stores for `auto` and how a failed
-engine build ends; both name SGLang files in prose only, and the README quotes short texts
+engine build ends. Both name SGLang files in prose only, and the README quotes short texts
 of SGLang messages.
 
-Upstream paths, under `python/sglang/`: `__init__.py`, `launch_server.py`, `version.py`
+Upstream paths, under `python/sglang/`: `__init__.py`, `launch_server.py`, `version.py`,
+`kernels/ops/attention/dsv4/unified_kv_kernels/env_gate.py` (v0.5.22 only)
 and, under `srt/`,
 `server_args.py`, `environ.py`, `runtime_context.py`,
 `arg_groups/{arg_utils.py,kv_cache_hook.py,memory_hook.py,model_override_base.py,moe_hook.py,overrides.py,parallel_hook.py,pipeline.py,serving_hook.py,validation_hook.py}`,
 `arg_groups/fields/{device.py,disagg.py,exec_.py,memory.py,model.py,parallel.py,schedule.py,serving.py,spec.py}`,
 `arg_groups/model_overrides/{minimax_m3.py,qwen3_moe.py}`,
 `configs/{glm5_next.py,model_config.py,step3_vl.py}`, `entrypoints/engine.py`, `eplb/expert_location.py`,
+`layers/attention/attention_registry.py`,
+`layers/attention/dsv4/unified_kv_gate.py` (v0.5.23 only),
 `layers/linear.py`, `layers/moe/{ep_moe/layer.py,fused_moe_triton/layer.py}`,
-`layers/quantization/{fp8.py,modelopt_quant.py}`,
+`layers/quantization/{fp4_kv_cache_quant_method.py,fp8.py,modelopt_quant.py}`,
 `layers/quantization/compressed_tensors/compressed_tensors.py`,
 `layers/quantization/minimax_m3_nvfp4.py` (v0.5.23 only),
 `managers/{data_parallel_controller.py,detokenizer_manager.py,io_struct.py,min_free_slots_delayer.py,schedule_batch.py,schedule_policy.py,scheduler.py,scheduler_input_blocker.py,tokenizer_manager.py,tp_worker.py,utils.py}`,
 `managers/async_d2h_copy_worker.py` (v0.5.23 only),
 `managers/scheduler_components/{batch_result_processor.py,dp_attn.py,invariant_checker.py,ipc_channels.py,metrics_reporter.py,output_streamer.py,recv_skipper.py,request_receiver.py}`,
 `mem_cache/{common.py,kv_cache_builder.py,kv_cache_configurator.py,kv_cache_dtype.py,registry.py}`,
+`mem_cache/minimax_m3_nvfp4_pool.py` (v0.5.23 only),
 `mem_cache/storage/seaweedfs/seaweedfs_store.py`,
 `model_executor/{forward_batch_info.py,model_runner.py,pool_configurator.py}`,
 `model_executor/model_runner_components/moe_ep_setup.py`,

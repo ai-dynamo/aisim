@@ -13,6 +13,15 @@ are therefore the ones a user gets. The cells are rendered by the real Generator
 cluster double leaves the files of a launcher run, and the real validator, gate, row builder and table writer
 read them.
 
+The rule that holds the result files of a dense plan against their cells has its tests here too, beside the
+rule of a MoE plan: one packaged dense model is planned the same way, with a one-GPU cell and a TP cell of two
+GPUs, and its result files are typed in like the others.
+
+So has the rule that holds the dtype of the engine's KV pool against the KV-cache label of the cell, which is
+asked of every SGLang rank file: both models are planned with bfloat16 cells, with fp8 cells and with both, and
+the two keys of the producer block are typed in like the rest of it. No engine stored a KV cache for them. For
+the label nvfp4, which no plan carries, a planned cell is relabelled.
+
 No SGLang, no GPU and no cluster are involved, and a fixture counts every attempt to open a network
 connection. Every result file is a FAKE of ``test_fpm_sglbench_artifact.py``: its times were typed in and
 never measured, and the dataset it names was never read. That holds for the two rank files of a DEP cell and
@@ -32,7 +41,7 @@ from pathlib import Path
 
 import pyarrow.parquet as pq
 import pytest
-from collector.fpm_forward import cli, native_artifact, planner, runner
+from collector.fpm_forward import capabilities, cli, native_artifact, planner, runner, sglang_fpm_builder
 from collector.fpm_forward.database import aggregate_cell
 from collector.fpm_forward.entry import resolve_inputs
 from collector.fpm_forward.native_artifact import plan_is_moe, validate_native_collection
@@ -42,12 +51,14 @@ from collector.fpm_forward.runtime_memory import saved_plan_identity
 from collector.fpm_forward.types import KVWARM_STRATEGIES, ParallelTopology
 from collector.model_cases import build_collection_case_plan
 
+from aisim.sdk import common
 from aisim_core.sdk.fpm_identity import LEGACY_EXECUTION_IDENTITY
 
 from .test_fpm_sglbench_artifact import (
     EXPECTED_KVWARM,
     EXPECTED_REGIMES,
     GATE_ACCEPT,
+    POD_KV_CACHE,
     POD_SGLANG_VERSION,
     _gate,
     _points,
@@ -59,10 +70,12 @@ pytestmark = pytest.mark.unit
 MODEL = "Qwen/Qwen3-30B-A3B"
 SYSTEM = "h200_sxm"
 FAKE_IMAGE = "example.invalid/sglang:test"
-# The operator tables of this SGLang version are packaged for the system, so the planner gets a memory estimate
-# for it. A data label without packaged tables, such as a release the launcher accepts, leaves the estimate
-# unavailable and the cells planned.
+# AISim's data holds the operator tables of this SGLang version for the system, so the planner gets a memory
+# estimate for it. A data label without tables leaves the estimate unavailable and the cells planned.
 LABEL_WITH_TABLES = "0.5.21"
+# No table is kept under this label, and no release has it. A release is no such label for good: the data held
+# no tables of the pod's release when these tests were written and holds them now.
+LABEL_WITHOUT_TABLES = "0.0.0"
 
 # What a text run records about its dataset in the kvwarm block of a decode artifact: the four keys of Dynamo's
 # vLLM self-benchmark. Every value is FAKE.
@@ -77,13 +90,15 @@ FAKE_DATASET = {
 def _fake_producer(cell) -> dict:
     """The producer block of a text run of ``cell``, under the names the launcher and the driver write.
 
-    The host reads the release and, for a cell of a MoE plan, the content source and the three sizes
-    (``native_artifact._validate_sglang_moe_producer``). The sizes are the ones SGLang resolves for the cell:
-    its ``tp_size`` counts the ranks of every data-parallel rank. Every other value is FAKE and has no reader.
+    The host reads the release, the dtype of the KV pool and, for a cell of a MoE plan, the content source and
+    the three sizes (``native_artifact._validate_sglang_moe_producer``). The sizes are the ones SGLang resolves
+    for the cell: its ``tp_size`` counts the ranks of every data-parallel rank. The two keys of the KV cache
+    are those of the KV-cache label of the cell (``POD_KV_CACHE``). Every other value is FAKE and has no reader.
     """
     ranks = cell.topology.tp * cell.topology.dp
     producer = {
         "sglang_version": POD_SGLANG_VERSION,
+        **POD_KV_CACHE[cell.kv_cache_dtype],
         "tp_size": ranks,
         "attn_dp_size": cell.topology.dp,
         # One scheduler process per rank of the engine.
@@ -122,7 +137,10 @@ def _older_producer(cell, **sizes: int) -> dict:
     """The producer block of the launcher before it could run DP attention: no ``attn_dp_size``.
 
     Its ``staging`` is ``one_batch_call``, the one value that launcher wrote, and it has no ``dp_attention``.
-    ``sizes`` replace the two sizes such a launcher recorded.
+    ``sizes`` replace the two sizes such a launcher recorded. The block keeps the two keys of the KV cache,
+    which a launcher of that time did not write either: without them the rule of the KV cache refuses the
+    files before any rule that reads the sizes
+    (``test_result_files_written_before_the_pod_recorded_its_kv_cache_are_refused_for_every_caller``).
     """
     producer = _fake_producer(cell)
     for key in ("attn_dp_size", "dp_attention"):
@@ -300,8 +318,8 @@ def test_the_entry_point_freezes_a_moe_plan_with_a_single_and_a_tep_cell(monkeyp
     assert (identity.backend, identity.sha256, len(identity.cells)) == ("sglang", printed["sha256"], 4)
 
 
-def test_a_data_label_without_packaged_tables_leaves_the_estimate_unknown_and_the_cells_planned():
-    plan, _overrides = _resolved(label=POD_SGLANG_VERSION)
+def test_a_data_label_without_tables_leaves_the_estimate_unknown_and_the_cells_planned():
+    plan, _overrides = _resolved(label=LABEL_WITHOUT_TABLES)
 
     assert [(decision.topology.tp, decision.disposition) for decision in plan.topology_memory_admission] == [
         (1, "unknown"),
@@ -720,6 +738,9 @@ def test_result_files_of_a_launcher_without_dp_attention_are_refused_for_every_c
     # A launcher of that time wrote no attention-DP size. Its files belong to a plan of that source revision, and
     # under a plan made now a block without the size is no record of one rank: the launcher writes the size into
     # every result file. The two sizes such a block holds are those of the cell, and it is refused all the same.
+    # The block is typed in with the two keys of the KV cache, which no launcher of that time wrote, so that
+    # this test pins the rule of the sizes alone: a file as that launcher wrote it is refused for its KV cache
+    # first (``_older_producer``).
     plan, _overrides = _resolved(presets=())
     for phase in ("prefill", "decode"):
         for strategy, sizes in (("single", (1, 1)), ("tep", (2, 2))):
@@ -982,11 +1003,10 @@ def test_a_moe_result_that_differs_from_its_cell_is_refused(tmp_path, phase, nam
     with pytest.raises(ValueError, match=refusal):
         runner._runtime_collection_summary(cell, tmp_path / "raw", backend="sglang", is_moe=plan_is_moe(plan))
 
-    # A caller without a plan, and the plan of a model without expert layers, do not make the comparison: every
-    # other rule accepts the files.
-    for expected_moe in (None, False):
-        collection = _validate(plan, cell, tmp_path, expected_moe=expected_moe)
-        assert len(collection.points) == len(_points(phase))
+    # A caller without a plan does not make the comparison: every other rule accepts the files. The plan of a
+    # model without expert layers makes a comparison of its own, which has its tests further down.
+    collection = _validate(plan, cell, tmp_path, expected_moe=None)
+    assert len(collection.points) == len(_points(phase))
     summary = runner._runtime_collection_summary(cell, tmp_path / "raw", backend="sglang")
     assert summary["measured_point_count"] == len(_points(phase))
 
@@ -1101,6 +1121,827 @@ def test_a_plan_says_whether_its_model_has_expert_layers_and_a_stand_in_may_say_
         stand_in(is_moe="no"),
     ):
         assert plan_is_moe(silent) is None
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# What the pod recorded, held against the cell of a dense plan
+# ---------------------------------------------------------------------------------------------------------------
+
+# A packaged model without expert layers. Its plan holds tensor-parallel cells only.
+DENSE_MODEL = "Qwen/Qwen3-0.6B"
+
+
+def _dense_plan():
+    """The plan of the dense model on one and two GPUs: per phase the one-GPU cell and the TP cell of two GPUs.
+
+    The model is given once more after the one of ``_arguments``, and the parser keeps the last. No preset is
+    named: the default preset of a dense model is tensor parallelism.
+    """
+    plan, _overrides = _resolved("--model-path", DENSE_MODEL, presets=())
+    assert (plan.model_path, plan_is_moe(plan)) == (DENSE_MODEL, False)
+    cells = [(cell.workload_kind, cell.parallel_strategy, cell.topology.tp, cell.topology.dp) for cell in plan.cells]
+    assert cells == [
+        (phase, strategy, tp, 1) for phase in ("prefill", "decode") for strategy, tp in (("single", 1), ("tp", 2))
+    ]
+    return plan
+
+
+def _fake_dense_producer(cell) -> dict:
+    """The producer block of a run with seeded ids of ``cell``, under the names the launcher and the driver write.
+
+    For a cell of a dense plan the host reads the release, the dtype of the KV pool and three keys of the
+    launcher (``native_artifact._validate_sglang_dense_producer``): SGLang's ``tp_size``, its ``attn_dp_size``
+    and the ``moe`` block, which is null when the launcher finds no expert key. The two keys of the KV cache
+    are those of the KV-cache label of the cell (``POD_KV_CACHE``). Every other value is FAKE and has no
+    reader.
+    """
+    return {
+        "sglang_version": POD_SGLANG_VERSION,
+        **POD_KV_CACHE[cell.kv_cache_dtype],
+        "tp_size": cell.topology.tp,
+        "attn_dp_size": 1,
+        "scheduler_processes": cell.topology.tp,
+        "staging": "one_batch_call",
+        "expert_keys": {},
+        "moe": None,
+        "content": {"source": "seeded_token_ids", "seed": "0", "token_range": [1000, 2000], "issued": 7},
+    }
+
+
+def _dense_files(cell, change=None) -> list[dict]:
+    """The one rank artifact a launcher run with seeded ids leaves for ``cell``: its kvwarm block names no dataset.
+
+    ``change`` changes the producer block.
+    """
+    producer = _fake_dense_producer(cell)
+    if change is not None:
+        change(producer)
+    return _rank_artifacts(cell.workload_kind, _points(cell.workload_kind), producer=producer)
+
+
+def _expert_layer_files(cell, change=None) -> list[dict]:
+    """The one rank artifact of a pod of ``cell`` whose launcher finds expert layers where the plan finds none.
+
+    The two keys are among the six the launcher looks up (sglbench_compat.py, ``EXPERT_KEYS``) and not among the
+    three counts the plan reads (capabilities.py, ``_is_moe``). Such a pod sends dataset text and records a
+    ``moe`` block with the expert-parallel size SGLang resolved: 1 for the command of a dense cell, which has
+    no ``--ep-size``. ``change`` changes the producer block.
+    """
+    producer = _fake_producer(cell)
+    producer["expert_keys"] = {"moe_num_experts": 8, "num_experts_per_tok": 2}
+    assert (producer["tp_size"], producer["attn_dp_size"], producer["moe"]["ep_size"]) == (cell.topology.tp, 1, 1)
+    if change is not None:
+        change(producer)
+    return _launcher_files(cell, producer)
+
+
+def _tep_on(ranks: int):
+    """The change that records the TEP layout of ``ranks`` GPUs: whole experts on every tensor-parallel rank."""
+
+    def change(producer: dict) -> None:
+        producer["tp_size"] = ranks
+        producer["moe"]["ep_size"] = ranks
+
+    return change
+
+
+def _not_the_dense_sizes(tp: int, found_tp: str, found_dp: str = "1") -> str:
+    """The refusal of the two sizes. ``tp`` is the tensor-parallel size of the cell."""
+    return (
+        "native SGLang rank artifact of a dense plan did not run the layout of its cell: "
+        f"expected producer.tp_size {tp} and producer.attn_dp_size 1, found {found_tp} and {found_dp}: "
+    )
+
+
+def _not_without_expert_parallelism(found: str) -> str:
+    """The refusal of the ``moe`` block. ``found`` is what the refusal says of the block."""
+    return (
+        "native SGLang rank artifact of a dense plan did not run the layout of its cell: "
+        f"expected producer.moe null or producer.moe.ep_size 1, found {found}: "
+    )
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+@pytest.mark.parametrize("strategy", ["single", "tp"])
+def test_the_files_of_a_dense_cell_are_accepted_with_the_sizes_of_the_cell(tmp_path, phase, strategy):
+    plan = _dense_plan()
+    cell = _cell(plan, phase, strategy)
+    payloads = _dense_files(cell)
+    recorded = payloads[0]["producer"]
+    assert (recorded["tp_size"], recorded["attn_dp_size"], recorded["moe"]) == (cell.topology.tp, 1, None)
+    _collected(tmp_path, plan, cell, payloads)
+
+    # ``_validate`` passes what the plan says of the model, which is False here.
+    assert len(_validate(plan, cell, tmp_path).points) == len(_points(phase))
+    # The row builder and the summary the runner keeps make the same comparison, from the plan.
+    rows = aggregate_cell(plan, cell, tmp_path, expected_attempt_id="attempt")
+    assert [(row["parallel_strategy"], row["tp"]) for row in rows] == [(strategy, cell.topology.tp)] * len(rows)
+    summary = runner._runtime_collection_summary(cell, tmp_path / "raw", backend="sglang", is_moe=plan_is_moe(plan))
+    assert summary["measured_point_count"] == len(rows) == len(_points(phase))
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+@pytest.mark.parametrize("strategy", ["single", "tp"])
+def test_a_moe_block_with_the_expert_parallel_size_1_is_the_layout_of_a_dense_cell(tmp_path, phase, strategy):
+    # The launcher took the model for one with expert layers and ran it with SGLang's default: every
+    # tensor-parallel rank holds a slice of every expert. That is tensor parallelism alone, so the files pass.
+    plan = _dense_plan()
+    cell = _cell(plan, phase, strategy)
+    payloads = _expert_layer_files(cell)
+    assert payloads[0]["producer"]["moe"]["ep_size"] == 1
+    _collected(tmp_path, plan, cell, payloads)
+
+    assert len(_validate(plan, cell, tmp_path).points) == len(_points(phase))
+    assert len(aggregate_cell(plan, cell, tmp_path, expected_attempt_id="attempt")) == len(_points(phase))
+
+
+# name: (the strategy of the cell, the files of the pod, the change to their producer block, the refusal)
+DIFFERS_FROM_THE_DENSE_CELL = {
+    # The command reached the pod with another --tp-size, or without one: the launcher runs the size SGLang
+    # resolved to the end, and the times are those of another number of GPUs.
+    "tp-on-one-rank": ("tp", _dense_files, lambda producer: producer.update(tp_size=1), _not_the_dense_sizes(2, "1")),
+    "tp-on-four-ranks": (
+        "tp",
+        _dense_files,
+        lambda producer: producer.update(tp_size=4),
+        _not_the_dense_sizes(2, "4"),
+    ),
+    "single-on-two-ranks": (
+        "single",
+        _dense_files,
+        lambda producer: producer.update(tp_size=2),
+        _not_the_dense_sizes(1, "2"),
+    ),
+    # A block without the key is no record of the size: the launcher writes it into every result file.
+    "no-tensor-parallel-size": (
+        "tp",
+        _dense_files,
+        lambda producer: producer.pop("tp_size"),
+        _not_the_dense_sizes(2, "None"),
+    ),
+    "single-without-a-tensor-parallel-size": (
+        "single",
+        _dense_files,
+        lambda producer: producer.pop("tp_size"),
+        _not_the_dense_sizes(1, "None"),
+    ),
+    # True equals 1 and 2.0 equals 2, and neither is a size; nor is the written form of a number.
+    "a-bool": ("single", _dense_files, lambda producer: producer.update(tp_size=True), _not_the_dense_sizes(1, "True")),
+    "a-float": ("tp", _dense_files, lambda producer: producer.update(tp_size=2.0), _not_the_dense_sizes(2, "2.0")),
+    "a-string": ("tp", _dense_files, lambda producer: producer.update(tp_size="2"), _not_the_dense_sizes(2, "'2'")),
+    # A cell of a dense plan has one data-parallel rank, so the attention-DP size must be 1.
+    "an-attention-dp-size-of-2": (
+        "tp",
+        _dense_files,
+        lambda producer: producer.update(attn_dp_size=2),
+        _not_the_dense_sizes(2, "2", "2"),
+    ),
+    "no-attention-dp-size": (
+        "tp",
+        _dense_files,
+        lambda producer: producer.pop("attn_dp_size"),
+        _not_the_dense_sizes(2, "2", "None"),
+    ),
+    "single-without-an-attention-dp-size": (
+        "single",
+        _dense_files,
+        lambda producer: producer.pop("attn_dp_size"),
+        _not_the_dense_sizes(1, "1", "None"),
+    ),
+    "an-attention-dp-size-that-is-a-bool": (
+        "single",
+        _dense_files,
+        lambda producer: producer.update(attn_dp_size=True),
+        _not_the_dense_sizes(1, "1", "True"),
+    ),
+    "an-attention-dp-size-of-none": (
+        "tp",
+        _dense_files,
+        lambda producer: producer.update(attn_dp_size=None),
+        _not_the_dense_sizes(2, "2", "None"),
+    ),
+    # The launcher found expert layers and the command reached the pod with an --ep-size of the tensor-parallel
+    # size: the TEP layout, which the launcher accepts and no cell of a dense plan describes.
+    "a-tep-run": (
+        "tp",
+        _expert_layer_files,
+        _tep_on(2),
+        _not_without_expert_parallelism("producer.moe.ep_size 2"),
+    ),
+    # The sizes are compared first: a TEP run of another GPU count is refused for its tensor-parallel size.
+    "a-tep-run-on-four-ranks": ("tp", _expert_layer_files, _tep_on(4), _not_the_dense_sizes(2, "4")),
+    # A moe block must hold the size as an int: True equals 1 and 1.0 equals 1, and neither is a size. A block
+    # without one, and a block that is no mapping, say nothing of the layout.
+    "an-expert-parallel-size-that-is-a-bool": (
+        "single",
+        _expert_layer_files,
+        lambda producer: producer["moe"].update(ep_size=True),
+        _not_without_expert_parallelism("producer.moe.ep_size True"),
+    ),
+    "an-expert-parallel-size-that-is-a-float": (
+        "tp",
+        _expert_layer_files,
+        lambda producer: producer["moe"].update(ep_size=1.0),
+        _not_without_expert_parallelism("producer.moe.ep_size 1.0"),
+    ),
+    "a-moe-block-without-the-size": (
+        "tp",
+        _expert_layer_files,
+        lambda producer: producer["moe"].pop("ep_size"),
+        _not_without_expert_parallelism("producer.moe.ep_size None"),
+    ),
+    "a-moe-block-that-is-no-mapping": (
+        "single",
+        _expert_layer_files,
+        lambda producer: producer.update(moe=[1]),
+        _not_without_expert_parallelism("producer.moe.ep_size None"),
+    ),
+    # A block without the key is no record of a model without expert layers: the launcher writes the key into
+    # every result file, with null for such a model.
+    "no-moe-key": (
+        "tp",
+        _dense_files,
+        lambda producer: producer.pop("moe"),
+        _not_without_expert_parallelism("no producer.moe"),
+    ),
+}
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+@pytest.mark.parametrize("name", list(DIFFERS_FROM_THE_DENSE_CELL))
+def test_a_dense_result_that_differs_from_its_cell_is_refused(tmp_path, phase, name):
+    strategy, files, change, message = DIFFERS_FROM_THE_DENSE_CELL[name]
+    plan = _dense_plan()
+    cell = _cell(plan, phase, strategy)
+    # Written past the launcher's own writer, which is not asked whether it would take the block.
+    (path,) = _written_past_the_writer(tmp_path, plan, cell, files(cell, change))
+
+    with pytest.raises(ValueError) as refused:
+        _validate(plan, cell, tmp_path)
+    assert str(refused.value) == message + str(path)
+    # The row builder and the summary the runner keeps make the same comparison, from the plan.
+    with pytest.raises(ValueError, match="^" + re.escape(message)):
+        aggregate_cell(plan, cell, tmp_path, expected_attempt_id="attempt")
+    with pytest.raises(ValueError, match="^" + re.escape(message)):
+        runner._runtime_collection_summary(cell, tmp_path / "raw", backend="sglang", is_moe=plan_is_moe(plan))
+
+    # A caller without a plan does not make the comparison: every other rule accepts the files.
+    assert len(_validate(plan, cell, tmp_path, expected_moe=None).points) == len(_points(phase))
+    summary = runner._runtime_collection_summary(cell, tmp_path / "raw", backend="sglang")
+    assert summary["measured_point_count"] == len(_points(phase))
+
+
+@pytest.mark.parametrize("producer", [None, [], "producer"])
+def test_a_producer_block_that_is_no_mapping_holds_no_size_of_a_dense_cell(tmp_path, producer):
+    # The validator refuses such a block for its release before this rule is reached, so the rule is called alone.
+    cell = _cell(_dense_plan(), "decode", "tp")
+    path = tmp_path / "benchmark.json"
+
+    with pytest.raises(ValueError) as refused:
+        native_artifact._validate_sglang_dense_producer(cell, producer, path)
+
+    assert str(refused.value) == _not_the_dense_sizes(2, "None", "None") + str(path)
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4, 8])
+def test_the_recorded_tensor_parallel_size_tells_the_dense_cells_of_a_plan_apart(tmp_path, tp):
+    # The plan of this suite ends at two GPUs, so the rule is called alone with the cells of a wider plan.
+    template = _cell(_dense_plan(), "prefill", "tp")
+    cells = {
+        size: dataclasses.replace(template, topology=dataclasses.replace(template.topology, tp=size))
+        for size in (1, 2, 4, 8)
+    }
+    path = tmp_path / "benchmark.json"
+
+    # What a pod of each cell records is accepted for its own cell and refused for every other.
+    for size, ran in cells.items():
+        if size == tp:
+            native_artifact._validate_sglang_dense_producer(cells[tp], _fake_dense_producer(ran), path)
+            continue
+        with pytest.raises(ValueError) as refused:
+            native_artifact._validate_sglang_dense_producer(cells[tp], _fake_dense_producer(ran), path)
+        assert str(refused.value) == _not_the_dense_sizes(tp, str(size)) + str(path)
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_each_plan_holds_the_files_against_its_own_rule_and_not_against_the_other(tmp_path, phase):
+    # The TEP cell of the MoE plan gives both file sets: two tensor-parallel ranks with dataset text.
+    plan, _overrides = _resolved()
+    assert plan_is_moe(plan) is True
+    cell = _cell(plan, phase, "tep")
+
+    # As the cell records it, with one expert-parallel rank per tensor-parallel rank. The rule of a MoE plan
+    # accepts the files, so the rule of a dense plan did not run: it refuses them when it is asked.
+    as_recorded = tmp_path / "as-recorded"
+    written = _collected(as_recorded, plan, cell, _launcher_files(cell))
+    assert len(_validate(plan, cell, as_recorded).points) == len(_points(phase))
+    assert len(aggregate_cell(plan, cell, as_recorded, expected_attempt_id="attempt")) == len(_points(phase))
+    with pytest.raises(ValueError) as refused:
+        _validate(plan, cell, as_recorded, expected_moe=False)
+    assert str(refused.value) == _not_without_expert_parallelism("producer.moe.ep_size 2") + written["rank_files"][0]
+
+    # With the expert-parallel size 1, the pure TP layout. The rule of a MoE plan still runs and refuses the
+    # files for the TEP cell; the rule of a dense plan accepts them when it is asked.
+    without_ep = tmp_path / "without-ep"
+    payloads = _launcher_files(cell)
+    payloads[0]["producer"]["moe"]["ep_size"] = 1
+    written = _collected(without_ep, plan, cell, payloads)
+    with pytest.raises(ValueError) as refused:
+        _validate(plan, cell, without_ep)
+    assert str(refused.value) == _not_the_layout(2, 2, "2", "1") + written["rank_files"][0]
+    with pytest.raises(ValueError, match="^" + re.escape(_not_the_layout(2, 2, "2", "1"))):
+        aggregate_cell(plan, cell, without_ep, expected_attempt_id="attempt")
+    assert len(_validate(plan, cell, without_ep, expected_moe=False).points) == len(_points(phase))
+    # A caller without a plan asks for neither rule.
+    for root in (as_recorded, without_ep):
+        assert len(_validate(plan, cell, root, expected_moe=None).points) == len(_points(phase))
+
+
+@pytest.mark.parametrize("faulty_rank", [0, 1])
+def test_every_rank_file_is_held_against_the_cell_of_a_dense_plan(tmp_path, faulty_rank):
+    # No dense plan has a cell with two rank files. The DEP cell of the MoE plan lends its two files here,
+    # validated with the answer of a dense plan: its tensor-parallel size is 1.
+    plan, _overrides = _resolved(presets=())
+    cell = _cell(plan, "prefill", "dep")
+    assert (cell.topology.tp, cell.topology.dp) == (1, 2)
+
+    def files(faulty: int | None) -> list[dict]:
+        payloads = _launcher_files(cell)
+        for rank, payload in enumerate(payloads):
+            payload["producer"] = _fake_dense_producer(cell)
+            if rank == faulty:
+                payload["producer"]["tp_size"] = 2
+        return payloads
+
+    _written_past_the_writer(tmp_path / "both-fit", plan, cell, files(None))
+    assert len(_validate(plan, cell, tmp_path / "both-fit", expected_moe=False).points) == len(_points("prefill"))
+
+    paths = _written_past_the_writer(tmp_path / "one-differs", plan, cell, files(faulty_rank))
+    with pytest.raises(ValueError) as refused:
+        _validate(plan, cell, tmp_path / "one-differs", expected_moe=False)
+    assert str(refused.value) == _not_the_dense_sizes(1, "2") + str(paths[faulty_rank])
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The dtype of the engine's KV pool, held against the KV-cache label of the cell
+# ---------------------------------------------------------------------------------------------------------------
+
+# The stored dtypes that each label with a rule stands for, as the refusal words them, and for ``nvfp4`` the
+# resolved argument it wants beside the dtype. Typed here on their own.
+_STANDS_FOR = {
+    "bfloat16": "'torch.bfloat16' or 'torch.float16'",
+    "fp8": "'torch.float8_e4m3fn'",
+    "nvfp4": "'torch.float4_e2m1fn_x2' with producer.kv_cache_dtype 'nvfp4'",
+}
+
+
+def _not_the_kv_cache(label: str, found: str, resolved: str) -> str:
+    """The refusal of a stored dtype. ``found`` and ``resolved`` are what the refusal says of the two keys."""
+    return (
+        "native SGLang rank artifact did not store the KV cache of its cell: the cell's kv_cache_dtype "
+        f"{label!r} stands for producer.kv_cache_stored_dtype {_STANDS_FOR[label]}, found {found} "
+        f"(producer.kv_cache_dtype {resolved}): "
+    )
+
+
+def _no_rule_for_the_label(label: str, found: str, resolved: str) -> str:
+    """The refusal of a cell whose KV-cache label no rule knows."""
+    return (
+        "native SGLang rank artifact cannot be held against the KV cache of its cell: no rule says which "
+        f"producer.kv_cache_stored_dtype the cell's kv_cache_dtype {label!r} stands for, found {found} "
+        f"(producer.kv_cache_dtype {resolved}): "
+    )
+
+
+def _plan_of(kind: str, *kv_cache_dtypes: str):
+    """The dense plan or the MoE plan of this suite, with ``--fpm-kv-cache-dtypes`` when dtypes are named."""
+    option = ("--fpm-kv-cache-dtypes", *kv_cache_dtypes) if kv_cache_dtypes else ()
+    if kind == "dense":
+        plan, _overrides = _resolved("--model-path", DENSE_MODEL, *option, presets=())
+    else:
+        plan, _overrides = _resolved(*option)
+    assert plan_is_moe(plan) is (kind == "moe")
+    return plan
+
+
+def _two_gpu_cell(plan, phase: str, label: str):
+    """The cell of two GPUs of ``plan`` with this phase and KV-cache label: the TP cell or the TEP cell."""
+    (cell,) = [
+        cell for cell in plan.cells if (cell.workload_kind, cell.topology.tp, cell.kv_cache_dtype) == (phase, 2, label)
+    ]
+    return cell
+
+
+def _files_of(plan, cell, change=None) -> list[dict]:
+    """The files a pod of ``cell`` leaves under ``plan``, typed in; ``change`` changes each producer block."""
+    payloads = _launcher_files(cell) if plan_is_moe(plan) else _dense_files(cell)
+    if change is not None:
+        for payload in payloads:
+            change(payload["producer"])
+    return payloads
+
+
+def test_the_labels_with_a_rule_are_bfloat16_fp8_and_nvfp4_and_the_label_int8_has_none():
+    # The two tables of the rule, typed here on their own: the stored dtypes of each label, and the resolved
+    # argument of the one label whose stored dtype does not say which KV cache it is.
+    assert native_artifact._SGLANG_STORED_KV_DTYPES == {
+        "bfloat16": ("torch.bfloat16", "torch.float16"),
+        "fp8": ("torch.float8_e4m3fn",),
+        "nvfp4": ("torch.float4_e2m1fn_x2",),
+    }
+    assert native_artifact._SGLANG_KV_CACHE_ARGUMENTS == {"nvfp4": "nvfp4"}
+    # AISim's KV-cache labels: what an option value is normalised to, and the KV-cache modes AISim can infer
+    # for a checkpoint. An option cannot name ``nvfp4``, and planning refuses the checkpoint AISim infers it
+    # for (test_fpm_sglang_host.py), so no plan carries that label today.
+    assert set(capabilities._KV_ALIASES.values()) - {"auto"} == {"bfloat16", "fp8", "int8"}
+    labels = {*capabilities._KV_ALIASES.values(), *(mode.name for mode in common.KVCacheQuantMode)} - {"auto"}
+    assert labels == {"bfloat16", "fp8", "int8", "nvfp4"}
+    assert labels - set(native_artifact._SGLANG_STORED_KV_DTYPES) == {"int8"}
+    # A label with a rule is one the cell builder writes a command for, with the argument the FAKE pods of
+    # this suite record for it: two labels by its table, and ``nvfp4`` under its own name.
+    translated = {label: recorded["kv_cache_dtype"] for label, recorded in POD_KV_CACHE.items()}
+    assert translated == {**sglang_fpm_builder._KV_CACHE_DTYPES, "nvfp4": "nvfp4"}
+    assert translated == {
+        label: sglang_fpm_builder._kv_cache_dtype("--kv-cache-dtype", label) for label in POD_KV_CACHE
+    }
+    assert {label: recorded["kv_cache_stored_dtype"] for label, recorded in POD_KV_CACHE.items()} == {
+        label: dtypes[0] for label, dtypes in native_artifact._SGLANG_STORED_KV_DTYPES.items()
+    }
+    # The argument the rule wants for ``nvfp4`` is the one such a pod records.
+    assert native_artifact._SGLANG_KV_CACHE_ARGUMENTS["nvfp4"] == POD_KV_CACHE["nvfp4"]["kv_cache_dtype"]
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+@pytest.mark.parametrize("kind", ["dense", "moe"])
+def test_a_plan_of_both_kv_cache_dtypes_takes_the_files_of_each_cell_for_that_cell_only(tmp_path, kind, phase):
+    plan = _plan_of(kind, "bfloat16", "fp8")
+    cells = {label: _two_gpu_cell(plan, phase, label) for label in ("bfloat16", "fp8")}
+    assert cells["bfloat16"].cell_id != cells["fp8"].cell_id
+
+    for label, cell in cells.items():
+        other = cells["fp8" if label == "bfloat16" else "bfloat16"]
+        recorded = POD_KV_CACHE[label]
+        payloads = _files_of(plan, cell)
+        assert {key: payloads[0]["producer"][key] for key in recorded} == recorded
+
+        # The files of the cell, in the pod of the cell: accepted, and the rows carry the label.
+        own = tmp_path / f"{label}-own"
+        _collected(own, plan, cell, payloads)
+        assert len(_validate(plan, cell, own).points) == len(_points(phase))
+        rows = aggregate_cell(plan, cell, own, expected_attempt_id="attempt")
+        assert {row["kv_cache_dtype"] for row in rows} == {label} and len(rows) == len(_points(phase))
+
+        # The same files in the pod of the cell with the other label: refused, by the plan and without one.
+        swapped = tmp_path / f"{label}-in-the-pod-of-the-other"
+        written = _collected(swapped, plan, other, payloads)
+        found, resolved = repr(recorded["kv_cache_stored_dtype"]), repr(recorded["kv_cache_dtype"])
+        message = _not_the_kv_cache(other.kv_cache_dtype, found, resolved)
+        for keywords in ({}, {"expected_moe": None}):
+            with pytest.raises(ValueError) as refused:
+                _validate(plan, other, swapped, **keywords)
+            assert str(refused.value) == message + written["rank_files"][0]
+        with pytest.raises(ValueError, match="^" + re.escape(message)):
+            aggregate_cell(plan, other, swapped, expected_attempt_id="attempt")
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+@pytest.mark.parametrize("kind", ["dense", "moe"])
+def test_a_float16_pool_is_accepted_for_a_bfloat16_cell_and_for_no_fp8_cell(tmp_path, kind, phase):
+    plan = _plan_of(kind, "bfloat16", "fp8")
+    bfloat16, fp8 = (_two_gpu_cell(plan, phase, label) for label in ("bfloat16", "fp8"))
+
+    def float16(producer: dict) -> None:
+        producer.update(kv_cache_dtype="auto", kv_cache_stored_dtype="torch.float16")
+
+    _collected(tmp_path / "bfloat16", plan, bfloat16, _files_of(plan, bfloat16, float16))
+    assert len(_validate(plan, bfloat16, tmp_path / "bfloat16").points) == len(_points(phase))
+    rows = aggregate_cell(plan, bfloat16, tmp_path / "bfloat16", expected_attempt_id="attempt")
+    assert {row["kv_cache_dtype"] for row in rows} == {"bfloat16"}
+
+    written = _collected(tmp_path / "fp8", plan, fp8, _files_of(plan, fp8, float16))
+    with pytest.raises(ValueError) as refused:
+        _validate(plan, fp8, tmp_path / "fp8")
+    assert str(refused.value) == _not_the_kv_cache("fp8", "'torch.float16'", "'auto'") + written["rank_files"][0]
+
+
+# name: (the change to the producer block of a bfloat16 cell, what the refusal says it found, what it says of
+# the resolved argument)
+NOT_THE_KV_CACHE_OF_A_BFLOAT16_CELL = {
+    # SGLang stored FP8 for ``auto``: the quantization config of the loaded model asked for it.
+    "fp8-stored-for-auto": (
+        lambda producer: producer.update(kv_cache_stored_dtype="torch.float8_e4m3fn"),
+        "'torch.float8_e4m3fn'",
+        "'auto'",
+    ),
+    # SGLang's resolution made ``fp8_e4m3`` of ``auto``, and the engine stored FP8.
+    "resolution-made-fp8": (
+        lambda producer: producer.update(kv_cache_dtype="fp8_e4m3", kv_cache_stored_dtype="torch.float8_e4m3fn"),
+        "'torch.float8_e4m3fn'",
+        "'fp8_e4m3'",
+    ),
+    # Dtypes no label stands for.
+    "float32": (lambda producer: producer.update(kv_cache_stored_dtype="torch.float32"), "'torch.float32'", "'auto'"),
+    "another-fp8-dtype": (
+        lambda producer: producer.update(kv_cache_stored_dtype="torch.float8_e5m2"),
+        "'torch.float8_e5m2'",
+        "'auto'",
+    ),
+    # A block without the key is no record of a dtype: the driver writes it into every complete result file.
+    "no-stored-dtype": (
+        lambda producer: producer.pop("kv_cache_stored_dtype"),
+        "no producer.kv_cache_stored_dtype",
+        "'auto'",
+    ),
+    # A value that is not the text of a dtype: null, as the failed artifact of a run without accepted headers
+    # holds it, a number, a list, the resolved argument, the name without its prefix, another letter case.
+    "null": (lambda producer: producer.update(kv_cache_stored_dtype=None), "None", "'auto'"),
+    "a-number": (lambda producer: producer.update(kv_cache_stored_dtype=16), "16", "'auto'"),
+    "a-list": (
+        lambda producer: producer.update(kv_cache_stored_dtype=["torch.bfloat16"]),
+        "['torch.bfloat16']",
+        "'auto'",
+    ),
+    "the-argument-in-its-place": (lambda producer: producer.update(kv_cache_stored_dtype="auto"), "'auto'", "'auto'"),
+    "the-name-without-torch": (
+        lambda producer: producer.update(kv_cache_stored_dtype="bfloat16"),
+        "'bfloat16'",
+        "'auto'",
+    ),
+    "another-letter-case": (
+        lambda producer: producer.update(kv_cache_stored_dtype="torch.BFloat16"),
+        "'torch.BFloat16'",
+        "'auto'",
+    ),
+    # The refusal names the resolved argument as the block holds it, also when the block holds none.
+    "neither-key": (
+        lambda producer: [producer.pop(key) for key in ("kv_cache_dtype", "kv_cache_stored_dtype")],
+        "no producer.kv_cache_stored_dtype",
+        "None",
+    ),
+}
+
+
+@pytest.mark.parametrize("kind", ["dense", "moe"])
+@pytest.mark.parametrize("name", list(NOT_THE_KV_CACHE_OF_A_BFLOAT16_CELL))
+def test_a_result_whose_engine_did_not_store_the_kv_cache_of_its_label_is_refused(tmp_path, kind, name):
+    change, found, resolved = NOT_THE_KV_CACHE_OF_A_BFLOAT16_CELL[name]
+    # No KV-cache dtype is named: both models of this suite are planned with bfloat16 cells.
+    plan = _plan_of(kind)
+    cell = _two_gpu_cell(plan, "decode", "bfloat16")
+    # Written past the launcher's own writer, which is not asked whether it would take the block.
+    (path,) = _written_past_the_writer(tmp_path, plan, cell, _files_of(plan, cell, change))
+    message = _not_the_kv_cache("bfloat16", found, resolved)
+
+    with pytest.raises(ValueError) as refused:
+        _validate(plan, cell, tmp_path)
+    assert str(refused.value) == message + str(path)
+    # The row builder and the summary the runner keeps make the same comparison.
+    with pytest.raises(ValueError, match="^" + re.escape(message)):
+        aggregate_cell(plan, cell, tmp_path, expected_attempt_id="attempt")
+    with pytest.raises(ValueError, match="^" + re.escape(message)):
+        runner._runtime_collection_summary(cell, tmp_path / "raw", backend="sglang", is_moe=plan_is_moe(plan))
+    # So does a caller without a plan: the rule is asked of every SGLang rank file.
+    with pytest.raises(ValueError) as refused:
+        _validate(plan, cell, tmp_path, expected_moe=None)
+    assert str(refused.value) == message + str(path)
+    with pytest.raises(ValueError, match="^" + re.escape(message)):
+        runner._runtime_collection_summary(cell, tmp_path / "raw", backend="sglang")
+
+
+@pytest.mark.parametrize("kind", ["dense", "moe"])
+def test_the_resolved_argument_of_a_bfloat16_cell_is_compared_with_nothing(tmp_path, kind):
+    plan = _plan_of(kind)
+    cell = _two_gpu_cell(plan, "prefill", "bfloat16")
+    # Without the key, and with the argument of an fp8 cell beside the dtype of a bfloat16 cell.
+    for name, change in (
+        ("no-argument", lambda producer: producer.pop("kv_cache_dtype")),
+        ("another-argument", lambda producer: producer.update(kv_cache_dtype="fp8_e4m3")),
+        ("no-text", lambda producer: producer.update(kv_cache_dtype=None)),
+    ):
+        _written_past_the_writer(tmp_path / name, plan, cell, _files_of(plan, cell, change))
+        assert len(_validate(plan, cell, tmp_path / name).points) == len(_points("prefill"))
+
+
+@pytest.mark.parametrize("faulty_rank", [0, 1])
+def test_every_rank_file_is_held_against_the_kv_cache_label_of_the_cell(tmp_path, faulty_rank):
+    plan, _overrides = _resolved(presets=())
+    cell = _cell(plan, "prefill", "dep")
+    assert (cell.topology.dp, cell.kv_cache_dtype) == (2, "bfloat16")
+    payloads = _launcher_files(cell)
+    payloads[faulty_rank]["producer"]["kv_cache_stored_dtype"] = "torch.float8_e4m3fn"
+    written = _collected(tmp_path, plan, cell, payloads)
+
+    for keywords in ({}, {"expected_moe": None}):
+        with pytest.raises(ValueError) as refused:
+            _validate(plan, cell, tmp_path, **keywords)
+        message = _not_the_kv_cache("bfloat16", "'torch.float8_e4m3fn'", "'auto'")
+        assert str(refused.value) == message + written["rank_files"][faulty_rank]
+
+
+@pytest.mark.parametrize("stored", ["torch.bfloat16", "torch.float8_e4m3fn", "torch.float4_e2m1fn_x2", None])
+@pytest.mark.parametrize("label", ["int8", "float16", "auto", "fp8_e4m3", "fp4_mx_block16", "BFLOAT16", "NVFP4"])
+def test_a_cell_whose_kv_cache_label_has_no_rule_is_refused_whatever_its_files_record(tmp_path, label, stored):
+    # ``int8`` is a label an option can name; the others are no label planning gives, among them SGLang's name
+    # of its other FP4 recipe and other spellings of labels with a rule. No cell of this suite carries one, so
+    # a cell is relabelled.
+    plan = _plan_of("dense")
+    planned = _two_gpu_cell(plan, "decode", "bfloat16")
+    cell = dataclasses.replace(planned, kv_cache_dtype=label)
+    payloads = _files_of(plan, planned, lambda producer: producer.update(kv_cache_stored_dtype=stored))
+    (path,) = _written_past_the_writer(tmp_path, plan, cell, payloads)
+    message = _no_rule_for_the_label(label, repr(stored), "'auto'")
+
+    for keywords in ({}, {"expected_moe": None}):
+        with pytest.raises(ValueError) as refused:
+            _validate(plan, cell, tmp_path, **keywords)
+        assert str(refused.value) == message + str(path)
+    with pytest.raises(ValueError, match="^" + re.escape(message)):
+        aggregate_cell(plan, cell, tmp_path, expected_attempt_id="attempt")
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The label ``nvfp4``: the stored dtype and the resolved argument together
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def _nvfp4_cell(plan, phase: str):
+    """A cell of two GPUs of ``plan`` relabelled ``nvfp4``, and the cell it was planned as.
+
+    No plan carries that label: AISim infers it for a checkpoint whose quantization config declares an NVFP4
+    KV cache, planning refuses such a checkpoint, and no option names the label (test_fpm_sglang_host.py). The
+    validator's rule is for a caller that hands it such a cell.
+    """
+    planned = _two_gpu_cell(plan, phase, "bfloat16")
+    return dataclasses.replace(planned, kv_cache_dtype="nvfp4"), planned
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+@pytest.mark.parametrize("kind", ["dense", "moe"])
+def test_the_files_of_an_nvfp4_cell_are_accepted_with_the_fp4_dtype_and_the_argument_nvfp4(tmp_path, kind, phase):
+    plan = _plan_of(kind)
+    cell, planned = _nvfp4_cell(plan, phase)
+    payloads = _files_of(plan, planned, lambda producer: producer.update(POD_KV_CACHE["nvfp4"]))
+    assert payloads[0]["producer"]["kv_cache_dtype"] == "nvfp4"
+    assert payloads[0]["producer"]["kv_cache_stored_dtype"] == "torch.float4_e2m1fn_x2"
+    _collected(tmp_path, plan, cell, payloads)
+
+    # By the plan and for a caller without one.
+    for keywords in ({}, {"expected_moe": None}):
+        assert len(_validate(plan, cell, tmp_path, **keywords).points) == len(_points(phase))
+    # The row builder takes the files too, and the rows carry the label of the cell.
+    rows = aggregate_cell(plan, cell, tmp_path, expected_attempt_id="attempt")
+    assert {row["kv_cache_dtype"] for row in rows} == {"nvfp4"} and len(rows) == len(_points(phase))
+
+
+# name: (the change to the producer block of an nvfp4 cell, what the refusal says it found, what it says of the
+# resolved argument)
+NOT_THE_KV_CACHE_OF_AN_NVFP4_CELL = {
+    # SGLang's other FP4 recipe is stored in the same dtype: the argument alone tells the two apart.
+    "the-other-fp4-recipe": (
+        lambda producer: producer.update(kv_cache_dtype="fp4_mx_block16"),
+        "'torch.float4_e2m1fn_x2'",
+        "'fp4_mx_block16'",
+    ),
+    "the-argument-auto": (
+        lambda producer: producer.update(kv_cache_dtype="auto"),
+        "'torch.float4_e2m1fn_x2'",
+        "'auto'",
+    ),
+    "another-letter-case": (
+        lambda producer: producer.update(kv_cache_dtype="NVFP4"),
+        "'torch.float4_e2m1fn_x2'",
+        "'NVFP4'",
+    ),
+    # A block without the argument is no record of the recipe: the launcher writes it into every result file of
+    # a run that got as far as building its engine.
+    "no-argument": (lambda producer: producer.pop("kv_cache_dtype"), "'torch.float4_e2m1fn_x2'", "None"),
+    "an-argument-that-is-null": (
+        lambda producer: producer.update(kv_cache_dtype=None),
+        "'torch.float4_e2m1fn_x2'",
+        "None",
+    ),
+    "an-argument-that-is-a-list": (
+        lambda producer: producer.update(kv_cache_dtype=["nvfp4"]),
+        "'torch.float4_e2m1fn_x2'",
+        "['nvfp4']",
+    ),
+    # The right argument beside another stored dtype.
+    "an-fp8-pool": (
+        lambda producer: producer.update(kv_cache_stored_dtype="torch.float8_e4m3fn"),
+        "'torch.float8_e4m3fn'",
+        "'nvfp4'",
+    ),
+    "a-bfloat16-pool": (
+        lambda producer: producer.update(kv_cache_stored_dtype="torch.bfloat16"),
+        "'torch.bfloat16'",
+        "'nvfp4'",
+    ),
+    "the-name-without-torch": (
+        lambda producer: producer.update(kv_cache_stored_dtype="float4_e2m1fn_x2"),
+        "'float4_e2m1fn_x2'",
+        "'nvfp4'",
+    ),
+    "no-stored-dtype": (
+        lambda producer: producer.pop("kv_cache_stored_dtype"),
+        "no producer.kv_cache_stored_dtype",
+        "'nvfp4'",
+    ),
+    # What a bfloat16 cell and an fp8 cell record.
+    "the-files-of-a-bfloat16-cell": (
+        lambda producer: producer.update(POD_KV_CACHE["bfloat16"]),
+        "'torch.bfloat16'",
+        "'auto'",
+    ),
+    "the-files-of-an-fp8-cell": (
+        lambda producer: producer.update(POD_KV_CACHE["fp8"]),
+        "'torch.float8_e4m3fn'",
+        "'fp8_e4m3'",
+    ),
+}
+
+
+@pytest.mark.parametrize("kind", ["dense", "moe"])
+@pytest.mark.parametrize("name", list(NOT_THE_KV_CACHE_OF_AN_NVFP4_CELL))
+def test_an_nvfp4_cell_is_refused_for_another_stored_dtype_and_for_another_resolved_argument(tmp_path, name, kind):
+    change, found, resolved = NOT_THE_KV_CACHE_OF_AN_NVFP4_CELL[name]
+    plan = _plan_of(kind)
+    cell, planned = _nvfp4_cell(plan, "decode")
+
+    def edit(producer: dict) -> None:
+        producer.update(POD_KV_CACHE["nvfp4"])
+        change(producer)
+
+    paths = _written_past_the_writer(tmp_path, plan, cell, _files_of(plan, planned, edit))
+    message = _not_the_kv_cache("nvfp4", found, resolved)
+
+    for keywords in ({}, {"expected_moe": None}):
+        with pytest.raises(ValueError) as refused:
+            _validate(plan, cell, tmp_path, **keywords)
+        assert str(refused.value) == message + str(paths[0])
+    with pytest.raises(ValueError, match="^" + re.escape(message)):
+        aggregate_cell(plan, cell, tmp_path, expected_attempt_id="attempt")
+
+
+@pytest.mark.parametrize("label", ["bfloat16", "fp8"])
+@pytest.mark.parametrize("kind", ["dense", "moe"])
+def test_the_files_of_an_nvfp4_pod_are_no_result_of_a_bfloat16_cell_or_of_an_fp8_cell(tmp_path, kind, label):
+    plan = _plan_of(kind, "bfloat16", "fp8")
+    cell = _two_gpu_cell(plan, "decode", label)
+    payloads = _files_of(plan, cell, lambda producer: producer.update(POD_KV_CACHE["nvfp4"]))
+    written = _collected(tmp_path, plan, cell, payloads)
+
+    with pytest.raises(ValueError) as refused:
+        _validate(plan, cell, tmp_path)
+    message = _not_the_kv_cache(label, "'torch.float4_e2m1fn_x2'", "'nvfp4'")
+    assert str(refused.value) == message + written["rank_files"][0]
+
+
+@pytest.mark.parametrize("producer", [None, [], "producer"])
+def test_a_producer_block_that_is_no_mapping_holds_no_dtype_of_the_kv_pool(tmp_path, producer):
+    # The validator refuses such a block for its release before this rule is reached, so the rule is called alone.
+    cell = _two_gpu_cell(_plan_of("dense"), "decode", "bfloat16")
+    path = tmp_path / "benchmark.json"
+
+    with pytest.raises(ValueError) as refused:
+        native_artifact._validate_sglang_kv_cache_dtype(cell, producer, path)
+
+    assert str(refused.value) == _not_the_kv_cache("bfloat16", "no producer.kv_cache_stored_dtype", "None") + str(path)
+
+
+@pytest.mark.parametrize("kind", ["dense", "moe"])
+def test_result_files_written_before_the_pod_recorded_its_kv_cache_are_refused_for_every_caller(tmp_path, kind):
+    # A launcher of an earlier revision wrote neither key. Its files belong to a plan of that revision.
+    plan = _plan_of(kind)
+    cell = _two_gpu_cell(plan, "decode", "bfloat16")
+
+    def earlier(producer: dict) -> None:
+        for key in ("kv_cache_dtype", "kv_cache_stored_dtype"):
+            del producer[key]
+
+    payloads = _files_of(plan, cell, earlier)
+
+    # Under a plan made from this source the plan hash differs from the one in the pod's provenance file, and
+    # the files are refused for their plan before the rule of the KV cache is reached.
+    older = tmp_path / "plan-of-the-earlier-revision"
+    pod = _pod(older, plan, cell)
+    provenance = json.loads((pod / "collector-provenance.json").read_text())
+    provenance["plan_sha256"] = "FAKE: the hash of the plan of the earlier revision"
+    (pod / "collector-provenance.json").write_text(json.dumps(provenance))
+    artifact.write_artifacts(str(pod / "benchmark.json"), payloads)
+    with pytest.raises(ValueError, match="^Collector provenance plan mismatch: "):
+        _validate(plan, cell, older)
+
+    # Where the collector revision is held at one value the plan hash is the same, the files reach the rule,
+    # and it refuses them for the missing key, with a plan and without one.
+    same = tmp_path / "plan-with-the-revision-held"
+    written = _collected(same, plan, cell, payloads)
+    message = _not_the_kv_cache("bfloat16", "no producer.kv_cache_stored_dtype", "None")
+    for keywords in ({}, {"expected_moe": None}):
+        with pytest.raises(ValueError) as refused:
+            _validate(plan, cell, same, **keywords)
+        assert str(refused.value) == message + written["rank_files"][0]
+    with pytest.raises(ValueError, match="^" + re.escape(message)):
+        aggregate_cell(plan, cell, same, expected_attempt_id="attempt")
 
 
 # ---------------------------------------------------------------------------------------------------------------

@@ -16,6 +16,9 @@ Everything that stands in for SGLang is FAKE and is named so:
   methods it wraps. ``FakeBatch``, ``FakeRequest``, ``FakeResult`` and ``FakeCopyDone`` carry the fields of
   SGLang's batch, request and result objects that the recorder reads. The names and the places that set them
   were read in the SGLang source at both tags; the module under test names the files and symbols.
+- The dtype of the FAKE model runner's KV pool is FAKE (``_fake_torch_dtype``): an object of a class named
+  ``dtype`` in a module named ``torch`` whose text is ``torch.<name>``. No torch is involved, and what a real
+  torch dtype looks like to the recorder was not run here.
 - The loops in the tests call ``run_batch`` and ``process_batch_result`` in the order of SGLang's
   ``Scheduler.event_loop_normal`` and ``Scheduler.event_loop_overlap``. They are test code, not SGLang.
 - Every time value is FAKE. ``FakeClock`` hands out numbers that grow by a fixed step; none was measured.
@@ -81,6 +84,7 @@ HEADER_KEYS = [
     "decode_graph_sizes",
     "prefill_graph_sizes",
     "enable_overlap",
+    "kv_cache_stored_dtype",
     "checks",
 ]
 RANK_KEYS = [
@@ -273,12 +277,34 @@ class FakeFalsyGraphRunner(FakeGraphRunner):
         return False
 
 
-class FakeModelRunner:
-    """FAKE of SGLang's ModelRunner: the two runner attributes."""
+def _fake_torch_dtype(name):
+    """A FAKE of a torch dtype: an object of a class ``dtype`` of a module ``torch`` with the text ``torch.<name>``.
 
-    def __init__(self, decode_runner, prefill_runner):
+    The recorder imports no torch and tells a dtype by the name of its class. A real ``torch.bfloat16`` is an
+    object of ``torch.dtype`` and its text is ``"torch.bfloat16"``; SGLang's own code relies on that text
+    (``str(dtype).removeprefix("torch.")``). Neither was run here: no torch is installed for these tests.
+    """
+    fake_class = type("dtype", (), {"__module__": "torch", "__str__": lambda self: f"torch.{name}"})
+    return fake_class()
+
+
+# The dtype of the FAKE KV pool: bfloat16, what SGLang stores for ``auto`` and a bfloat16 model.
+FAKE_KV_CACHE_DTYPE = _fake_torch_dtype("bfloat16")
+FAKE_KV_CACHE_DTYPE_TEXT = "torch.bfloat16"
+
+
+class FakeModelRunner:
+    """FAKE of SGLang's ModelRunner: the two runner attributes and the two attributes of the KV-cache dtype.
+
+    ``kv_cache_dtype_str`` is there because SGLang's runner has it beside ``kv_cache_dtype``; the recorder
+    must not read it, and its FAKE value would show in the header if it did.
+    """
+
+    def __init__(self, decode_runner, prefill_runner, kv_cache_dtype=FAKE_KV_CACHE_DTYPE):
         self.decode_cuda_graph_runner = decode_runner
         self.prefill_cuda_graph_runner = prefill_runner
+        self.kv_cache_dtype = kv_cache_dtype
+        self.kv_cache_dtype_str = "FAKE: the string SGLang keeps beside the dtype"
 
 
 class FakeTpWorker:
@@ -291,12 +317,13 @@ class FakeTpWorker:
 def _fake_tp_worker(
     decode_runner="default",
     prefill_runner="default",
+    kv_cache_dtype=FAKE_KV_CACHE_DTYPE,
 ):
     if decode_runner == "default":
         decode_runner = FakeGraphRunner(capture_bs=list(FAKE_DECODE_GRAPH_SIZES))
     if prefill_runner == "default":
         prefill_runner = FakeGraphRunner(capture_num_tokens=list(FAKE_PREFILL_GRAPH_SIZES))
-    return FakeTpWorker(FakeModelRunner(decode_runner, prefill_runner))
+    return FakeTpWorker(FakeModelRunner(decode_runner, prefill_runner, kv_cache_dtype))
 
 
 def _fake_scheduler_attributes():
@@ -624,7 +651,7 @@ def _extend_batch(rids=(RID_A, RID_B)):
 def _expected_header():
     return {
         "type": "header",
-        "format": 2,
+        "format": 3,
         "pid": os.getpid(),
         "class": CLASS_NAME,
         "mro": [CLASS_NAME, "Scheduler", "FakeSchedulerBase"],
@@ -635,6 +662,7 @@ def _expected_header():
         "decode_graph_sizes": list(FAKE_DECODE_GRAPH_SIZES),
         "prefill_graph_sizes": list(FAKE_PREFILL_GRAPH_SIZES),
         "enable_overlap": True,
+        "kv_cache_stored_dtype": FAKE_KV_CACHE_DTYPE_TEXT,
         "checks": {
             "disable_radix_cache": False,
             "is_hybrid_swa": False,
@@ -677,7 +705,7 @@ def _fake_time(reading):
 
 def test_public_names_have_the_values_a_reader_of_the_log_expects():
     assert recorder.ENV_RECORDER_DIR == ENV
-    assert recorder.RECORD_FORMAT == 2
+    assert recorder.RECORD_FORMAT == 3
     assert recorder.RECORDER_CLASS_NAME == CLASS_NAME
     assert recorder.LOG_FILE_PREFIX == "sched-"
     assert recorder.LOG_FILE_SUFFIX == ".jsonl"
@@ -716,7 +744,7 @@ def test_module_imports_in_a_bare_interpreter_without_sglang_torch_or_numpy():
     )
     assert done.returncode == 0, done.stderr
     # SGLang is imported only when the entry runs, and without SGLang the entry says so; it does not go on.
-    assert done.stdout.splitlines() == ["entry: blocked for this test: sglang", f"2 {CLASS_NAME}"]
+    assert done.stdout.splitlines() == ["entry: blocked for this test: sglang", f"3 {CLASS_NAME}"]
 
 
 def test_module_source_imports_sglang_only_inside_functions_and_reads_one_variable():
@@ -848,6 +876,97 @@ def test_every_seam_name_is_in_the_sglang_source_at_both_tags():
         module = "sglang.srt.managers.schedule_batch"
         assert seam_rows_not_in_source(((module, "ScheduleBatch.no_such_field", "field"),), python_root)
         assert seam_rows_not_in_source(((module, "ScheduleBatch.reqs", "attribute"),), python_root)
+
+
+def _class_methods(path, name):
+    """The methods of the class statement ``name`` in a parsed SGLang file, by name."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    (statement,) = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name]
+    return {node.name: node for node in statement.body if isinstance(node, ast.FunctionDef)}
+
+
+def _self_attributes_assigned(function):
+    """The names ``x`` of every ``self.x`` that an assignment of ``function`` binds, tuple targets included."""
+    names = set()
+    for node in ast.walk(function):
+        targets = node.targets if isinstance(node, ast.Assign) else [getattr(node, "target", None)]
+        if not isinstance(node, ast.Assign | ast.AnnAssign | ast.AugAssign):
+            continue
+        for target in targets:
+            for leaf in ast.walk(target):
+                if isinstance(leaf, ast.Attribute) and isinstance(leaf.value, ast.Name) and leaf.value.id == "self":
+                    names.add(leaf.attr)
+    return names
+
+
+def _self_calls(function):
+    """The names ``m`` of every call ``self.m(...)`` in ``function``."""
+    return {
+        node.func.attr
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+    }
+
+
+def test_the_kv_cache_dtype_the_header_reads_is_set_by_the_model_runner_at_both_tags():
+    # Skipped where no SGLang source is at hand. ``ModelRunner.kv_cache_dtype`` is no seam row: it is an
+    # attribute of an object, set while the runner is built, and no import shows it. What the recorder relies
+    # on is looked up in the parsed files of both releases; nothing is imported.
+    rows = (
+        ("sglang.srt.managers.scheduler", "Scheduler.init_model_worker", "attribute"),
+        ("sglang.srt.managers.scheduler", "Scheduler.init_tp_model_worker", "attribute"),
+        ("sglang.srt.managers.tp_worker", "TpModelWorker.model_runner", "attribute"),
+        ("sglang.srt.model_executor.model_runner", "ModelRunner.initialize", "attribute"),
+        ("sglang.srt.model_executor.model_runner", "ModelRunner.configure_kv_cache_dtype", "attribute"),
+        ("sglang.srt.mem_cache.kv_cache_dtype", "configure_kv_cache_dtype", "name"),
+    )
+    for version, python_root in sglang_source_roots(SEAM_VERSIONS).items():
+        assert seam_rows_not_in_source(rows, python_root) == [], version
+        srt = python_root / "sglang" / "srt"
+
+        # One method of the runner binds the attribute, under this public name, and the constructor reaches
+        # it: ``__init__`` calls ``initialize``, which calls the method.
+        runner = _class_methods(srt / "model_executor" / "model_runner.py", "ModelRunner")
+        writers = [name for name, method in runner.items() if "kv_cache_dtype" in _self_attributes_assigned(method)]
+        assert writers == ["configure_kv_cache_dtype"], version
+        assert "kv_cache_dtype_str" in _self_attributes_assigned(runner["configure_kv_cache_dtype"]), version
+        assert "initialize" in _self_calls(runner["__init__"]), version
+        assert "configure_kv_cache_dtype" in _self_calls(runner["initialize"]), version
+        # The pool is built with it: the runner hands it to the configurator of the KV cache.
+        handed = [
+            ast.unparse(keyword.value)
+            for node in ast.walk(runner["init_kv_cache_configurator"])
+            if isinstance(node, ast.Call)
+            for keyword in node.keywords
+            if keyword.arg == "kv_cache_dtype"
+        ]
+        assert handed == ["self.kv_cache_dtype"], version
+        assert "init_kv_cache_configurator" in _self_calls(runner["alloc_memory_pool"]), version
+
+        # What is bound is the second value of this function, which it declares as a torch dtype.
+        (function,) = [
+            node
+            for node in ast.parse((srt / "mem_cache" / "kv_cache_dtype.py").read_text(encoding="utf-8")).body
+            if isinstance(node, ast.FunctionDef) and node.name == "configure_kv_cache_dtype"
+        ]
+        assert ast.unparse(function.returns) == "tuple[Optional[str], torch.dtype]", version
+
+        # The worker builds the runner in its constructor and hands it out as the property ``model_runner``.
+        worker = _class_methods(srt / "managers" / "tp_worker.py", "TpModelWorker")
+        assert [ast.unparse(decorator) for decorator in worker["model_runner"].decorator_list] == ["property"], version
+        assert ast.unparse(worker["model_runner"].body[-1]) == "return self._model_runner", version
+        assert "_init_model_runner" in _self_calls(worker["__init__"]), version
+        assert "_model_runner" in _self_attributes_assigned(worker["_init_model_runner"]), version
+
+        # The scheduler builds the worker inside its constructor, so all of this is done when the stock
+        # ``__init__`` returns and the recorder writes its header.
+        scheduler = _class_methods(srt / "managers" / "scheduler.py", "Scheduler")
+        assert "init_model_worker" in _self_calls(scheduler["__init__"]), version
+        assert "init_tp_model_worker" in _self_calls(scheduler["init_model_worker"]), version
+        assert "tp_worker" in _self_attributes_assigned(scheduler["init_tp_model_worker"]), version
 
 
 def test_module_file_has_the_required_header_and_plain_ascii_lines():
@@ -1058,42 +1177,119 @@ def test_graph_sizes_of_both_runners(world, decode_runner, prefill_runner, decod
 
 
 @pytest.mark.parametrize(
-    ("tp_worker", "decode_error", "prefill_error"),
+    ("tp_worker", "decode_error", "prefill_error", "dtype_error"),
     [
-        pytest.param(None, "AttributeError", "AttributeError", id="tp-worker-none"),
-        pytest.param(FakeTpWorker(None), "AttributeError", "AttributeError", id="model-runner-none"),
-        pytest.param(_fake_tp_worker(FakeGraphRunner()), "AttributeError", None, id="decode-runner-without-list"),
-        pytest.param(_fake_tp_worker(FakeGraphRunner(capture_bs=None)), "TypeError", None, id="decode-list-none"),
-        pytest.param(_fake_tp_worker(FakeGraphRunner(capture_bs=[1, True])), "TypeError", None, id="decode-bool"),
-        pytest.param(_fake_tp_worker(FakeGraphRunner(capture_bs=[1, 2.0])), "TypeError", None, id="decode-float"),
+        # Without a worker or a runner nothing behind them can be read: both graph lists and the dtype.
+        pytest.param(None, "AttributeError", "AttributeError", "AttributeError", id="tp-worker-none"),
+        pytest.param(FakeTpWorker(None), "AttributeError", "AttributeError", "AttributeError", id="model-runner-none"),
+        pytest.param(_fake_tp_worker(FakeGraphRunner()), "AttributeError", None, None, id="decode-runner-without-list"),
+        pytest.param(_fake_tp_worker(FakeGraphRunner(capture_bs=None)), "TypeError", None, None, id="decode-list-none"),
+        pytest.param(_fake_tp_worker(FakeGraphRunner(capture_bs=[1, True])), "TypeError", None, None, id="decode-bool"),
+        pytest.param(_fake_tp_worker(FakeGraphRunner(capture_bs=[1, 2.0])), "TypeError", None, None, id="decode-float"),
         pytest.param(
             _fake_tp_worker(prefill_runner=FakeGraphRunner(capture_num_tokens=["16"])),
             None,
             "TypeError",
+            None,
             id="prefill-str",
         ),
         pytest.param(
             _fake_tp_worker(prefill_runner=FakeGraphRunner(capture_num_tokens=8)),
             None,
             "TypeError",
+            None,
             id="prefill-not-a-list",
         ),
     ],
 )
-def test_graph_sizes_that_cannot_be_read_are_marked_and_never_guessed(world, tp_worker, decode_error, prefill_error):
+def test_graph_sizes_that_cannot_be_read_are_marked_and_never_guessed(
+    world, tp_worker, decode_error, prefill_error, dtype_error
+):
     header = _header_of(world, overrides={"tp_worker": tp_worker})
     rest = _expected_header()
-    for key, error in (("decode_graph_sizes", decode_error), ("prefill_graph_sizes", prefill_error)):
+    errors = (
+        ("decode_graph_sizes", decode_error),
+        ("prefill_graph_sizes", prefill_error),
+        ("kv_cache_stored_dtype", dtype_error),
+    )
+    for key, error in errors:
         if error is not None:
             _assert_unreadable(header[key], error)
             del header[key], rest[key]
     assert header == rest
 
 
-def test_missing_tp_worker_marks_both_graph_lists(world):
+def test_missing_tp_worker_marks_both_graph_lists_and_the_kv_cache_dtype(world):
     header = _header_of(world, missing=("tp_worker",))
     _assert_unreadable(header["decode_graph_sizes"], "AttributeError", "tp_worker")
     _assert_unreadable(header["prefill_graph_sizes"], "AttributeError", "tp_worker")
+    _assert_unreadable(header["kv_cache_stored_dtype"], "AttributeError", "tp_worker")
+
+
+@pytest.mark.parametrize("name", ["bfloat16", "float16", "float8_e4m3fn", "float8_e5m2", "float32"])
+def test_header_holds_the_text_of_the_dtype_the_model_runner_built_its_kv_pool_with(world, name):
+    header = _header_of(world, overrides={"tp_worker": _fake_tp_worker(kv_cache_dtype=_fake_torch_dtype(name))})
+    assert header["kv_cache_stored_dtype"] == f"torch.{name}"
+    # Only that key follows the dtype.
+    rest = _expected_header()
+    del header["kv_cache_stored_dtype"], rest["kv_cache_stored_dtype"]
+    assert header == rest
+
+
+def test_the_string_sglang_keeps_beside_the_dtype_is_not_what_the_header_holds(world):
+    # SGLang's runner holds ``kv_cache_dtype_str`` too. With the argument "auto" it stays "auto" whatever
+    # dtype the model has, so it does not tell a bfloat16 pool from a float16 one. The FAKE runner has it
+    # with a FAKE text.
+    runner = _fake_tp_worker().model_runner
+    assert runner.kv_cache_dtype_str.startswith("FAKE")
+    header = _header_of(world)
+    assert header["kv_cache_stored_dtype"] == FAKE_KV_CACHE_DTYPE_TEXT
+    assert not [string for string in _strings(header) if "FAKE" in string]
+
+
+def _fake_object_of(module, name, text):
+    """A FAKE object of a class ``name`` of a module ``module`` whose text is ``text``."""
+    return type(name, (), {"__module__": module, "__str__": lambda self: text})()
+
+
+@pytest.mark.parametrize(
+    ("value", "needle"),
+    [
+        # The text of a dtype, and the string SGLang keeps beside the dtype, are no dtype.
+        pytest.param("torch.bfloat16", "is a builtins.str, not a torch.dtype", id="the-text-of-a-dtype"),
+        pytest.param("auto", "is a builtins.str, not a torch.dtype", id="the-argument"),
+        pytest.param(None, "is a builtins.NoneType, not a torch.dtype", id="none"),
+        pytest.param(16, "is a builtins.int, not a torch.dtype", id="int"),
+        # The class is told by its name and its module together.
+        pytest.param(
+            _fake_object_of("numpy", "dtype", "torch.bfloat16"),
+            "is a numpy.dtype, not a torch.dtype",
+            id="a-numpy-dtype",
+        ),
+        pytest.param(
+            _fake_object_of("torch", "device", "torch.bfloat16"),
+            "is a torch.device, not a torch.dtype",
+            id="a-torch-device",
+        ),
+    ],
+)
+def test_a_kv_cache_dtype_that_is_no_torch_dtype_is_marked_and_never_written_as_text(world, value, needle):
+    header = _header_of(world, overrides={"tp_worker": _fake_tp_worker(kv_cache_dtype=value)})
+    _assert_unreadable(header["kv_cache_stored_dtype"], "TypeError", "model_runner.kv_cache_dtype", needle)
+    rest = _expected_header()
+    del header["kv_cache_stored_dtype"], rest["kv_cache_stored_dtype"]
+    assert header == rest
+
+
+def test_a_model_runner_without_the_kv_cache_dtype_is_marked(world):
+    worker = _fake_tp_worker()
+    del worker.model_runner.kv_cache_dtype
+    header = _header_of(world, overrides={"tp_worker": worker})
+    _assert_unreadable(header["kv_cache_stored_dtype"], "AttributeError", "kv_cache_dtype")
+    # The string beside it is not taken in its place, and the graph lists are still read.
+    rest = _expected_header()
+    del header["kv_cache_stored_dtype"], rest["kv_cache_stored_dtype"]
+    assert header == rest
 
 
 @pytest.mark.parametrize("name", RANK_KEYS)

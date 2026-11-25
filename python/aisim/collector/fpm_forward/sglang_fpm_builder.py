@@ -162,7 +162,8 @@ _MIN_SAMPLE_CAP = 2
 # checkpoint whose quantization config asks for an FP8 KV cache (``python/sglang/srt/mem_cache/kv_cache_dtype.py``
 # ``configure_kv_cache_dtype``), and its per-model overrides turn "auto" into "fp8_e4m3" for some
 # architectures (``python/sglang/srt/arg_groups/overrides.py``). The rows of a bfloat16 cell carry "bfloat16"
-# as their KV-cache mode whatever SGLang stored: nothing compares the stored dtype with the cell's.
+# as their KV-cache mode. So the pod records the dtype that every scheduler process stored, and the host
+# refuses a cell whose label does not stand for it (native_artifact.py ``_validate_sglang_kv_cache_dtype``).
 # "bfloat16" is itself a choice of SGLang and would force BF16, which the serving deployment does not do.
 _KV_CACHE_DTYPES = {"fp8": "fp8_e4m3", "bfloat16": "auto"}
 # The choices of SGLang's ``kv_cache_dtype`` field (``fields/model.py``), the same at both tags.
