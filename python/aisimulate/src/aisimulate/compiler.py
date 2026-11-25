@@ -337,6 +337,9 @@ def _afd_deployment(
     profile_path = topology_fields.pop("fastafd_profile_path")
     profile_backend = topology_fields.pop("fastafd_moe_backend")
     if profile_path is not None:
+        from .sweeper.forward_pass_estimator import resolve_systems_paths
+
+        systems_paths = resolve_systems_paths(engine.systems_paths)
         # The configured provider keeps measuring the attention side; the
         # adapter obtains the complete MoE stage from the canonical Rust
         # best_available estimator, including exact selection and normalization.
@@ -345,6 +348,7 @@ def _afd_deployment(
             moe_backend=profile_backend,
             attention_model=performance_model,
             moe_precision=engine.moe_quant_mode,
+            systems_paths=systems_paths,
         )
     topology = AFDTopology(
         **topology_fields,
@@ -358,7 +362,9 @@ def _afd_deployment(
 
         # Native stage construction requires a literal identity. Resolve public
         # slot aliases before measuring A or building the companion worker.
-        backend_version = resolve_query_version(engine.hardware, engine.backend, backend_version)
+        backend_version = resolve_query_version(
+            engine.hardware, engine.backend, backend_version, systems_paths=list(systems_paths)
+        )
     resolved_engine = engine.model_copy(update={"backend_version": backend_version})
     if profile_path is not None:
         # The precision selector belongs to the measured stage, not the

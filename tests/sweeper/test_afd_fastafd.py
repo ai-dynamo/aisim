@@ -1048,6 +1048,54 @@ def test_prediction_pins_fastafd_alias_for_attention_and_companion(tmp_path, mon
     assert restored["ffn_ms"] == measurement["ffn_ms"]
 
 
+@pytest.mark.parametrize("root_source", ["environment", "sdk"])
+@pytest.mark.parametrize("alias,version", [("current", "0.5.99"), ("previous", "0.5.98")])
+def test_prediction_resolves_fastafd_alias_from_attention_roots(
+    tmp_path, monkeypatch, fastafd_attention_sol, root_source, alias, version
+):
+    from aisimulate_core.sdk import RustForwardPassPerfModel, perf_database
+
+    packaged = files("aisimulate_core") / "systems"
+    root = tmp_path / "attention"
+    root.mkdir()
+    system = yaml.safe_load((packaged / f"{SYSTEM}.yaml").read_text())
+    system["data_dir"] = str(packaged / system["data_dir"])
+    system["gpu"]["mem_bw"] /= 2
+    (root / f"{SYSTEM}.yaml").write_text(yaml.safe_dump(system))
+    (root / "query_versions.yaml").write_text(
+        yaml.safe_dump({"overrides": {SYSTEM: {"sglang": {"current": "0.5.99", "previous": "0.5.98"}}}})
+    )
+    # YAML AFD roots stay at their validated defaults. Environment roots are
+    # supported when SDK roots are default; explicit SDK roots take precedence.
+    monkeypatch.setattr(perf_database, "_SYSTEMS_PATHS", [str(packaged if root_source == "environment" else root)])
+    monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", str(root if root_source == "environment" else packaged))
+    raw = _prediction(_profile(tmp_path))
+    raw["engine"].update(backend_version=alias, context_length=2048)
+    raw["engine"]["workers"]["prefill"]["timing"] = {"type": "default"}
+
+    deployment = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw)).backend_deployment
+
+    assert deployment.backend_version == version
+    assert deployment.prefill_engine_args["aic_backend_version"] == version
+    assert deployment.performance_model_metadata["prefill"]["config"]["backend_version"] == version
+    (measurement,) = deployment.performance_model_metadata["afd"]["measurements"]
+    saved = json.loads(json.dumps(measurement["provenance"]["config"]))
+    assert saved["backend_version"] == version
+    assert saved["systems_paths"] == [str(root)]
+    assert measurement["provenance"]["attention"]["config"] == saved
+    assert measurement["attention_ms"] > 0
+    assert measurement["ffn_ms"] == pytest.approx(STAGE_MS / (LAYERS * 2))
+
+    # Saved canonical construction keeps the same A-side identity after the
+    # process defaults change, including its root-specific version slots.
+    monkeypatch.setattr(perf_database, "_SYSTEMS_PATHS", [str(packaged)])
+    monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", str(packaged))
+    restored = RustForwardPassPerfModel.best_available(saved)
+    attention = restored.estimate_fastafd_attention(isl=1024, osl=128, max_seq_len=2048)
+    assert attention["provenance"]["components"] == measurement["provenance"]["attention"]["components"]
+    assert restored.estimate_fastafd_stage(128)["ffn_ms"] == measurement["ffn_ms"]
+
+
 def test_prediction_rejects_unavailable_fastafd_version_alias_before_measurement(tmp_path, monkeypatch):
     from aisimulate_core.sdk import perf_database
 

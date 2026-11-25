@@ -53,6 +53,7 @@ class FastAFDMoEStagePerformanceModel:
     moe_backend: str
     attention_model: AFDPerformanceModel
     moe_precision: str | None = None
+    systems_paths: tuple[str, ...] = ()
 
     def measure(self, request: AFDMeasurementRequest) -> tuple[AFDLayerTimes, ...]:
         import aisimulate_core
@@ -279,6 +280,7 @@ class FastAFDMoEStagePerformanceModel:
             "system": request.hardware_sku,
             "backend": request.backend,
             "backend_version": request.backend_version,
+            "systems_paths": list(self.systems_paths),
             "worker_type": "decode" if topology.phase is AFDPhase.DECODE else "aggregated",
             "estimation_mode": "fastafd_stage",
             "tp": topology.tp_a,
