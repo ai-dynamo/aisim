@@ -172,13 +172,20 @@ jobs:
           ref: main
           path: trusted
           persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.sha }}
+          path: evaluated-pin
+          persist-credentials: false
+          sparse-checkout: python/aisim/src/aisim_core/data/op_latency_pin.json
+          sparse-checkout-cone-mode: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
       - name: Install the CPU campaign environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ca-certificates libgomp1
+          sudo apt-get install -y --no-install-recommends ca-certificates jq libgomp1
       - name: Install measurement tooling
         run: |
           python -I -m venv "${RUNNER_TEMP}/trusted-venv"
@@ -196,6 +203,26 @@ jobs:
         run: |
           "${RUNNER_TEMP}/trusted-venv/bin/python" trusted/scripts/e2e_accuracy/fetch_accuracy_measurements.py \
             --manifest "${RUNNER_TEMP}/accuracy-dataset/e2e-accuracy-dataset.json" --output "${RUNNER_TEMP}/accuracy-measurements"
+      - name: Download the evaluated revision's op-latency data once
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_READ_AISIM_INFX_CACHE }}
+          HF_HOME: ${{ runner.temp }}/accuracy-hf
+          AISIM_DATA_CACHE: ${{ runner.temp }}/accuracy-op-data
+        run: |
+          pin=evaluated-pin/python/aisim/src/aisim_core/data/op_latency_pin.json
+          if [[ ! -e "${pin}" && ! -L "${pin}" ]]; then
+            echo "The evaluated revision packages its operation tables"
+            exit 0
+          fi
+          if [[ ! -f "${pin}" || -L "${pin}" ]]; then exit 1; fi
+          revision=$(jq -ers '
+            select(length == 1) | .[0] | select(.repo_id == "ai-dynamo/aisim-data")
+            | .revision | select(type == "string" and length == 40 and test("^[0-9a-f]+$"))
+          ' "${pin}") || { echo "::error::Expected a full revision of ai-dynamo/aisim-data in ${pin}"; exit 1; }
+          export AISIM_OP_LATENCY_DATASET="ai-dynamo/aisim-data@${revision}"
+          "${RUNNER_TEMP}/trusted-venv/bin/python" trusted/scripts/ci/op_latency_handoff.py pack \
+            --output "${RUNNER_TEMP}/accuracy-measurements/op-latency-data.tar"
       - name: Encrypt private measurements
         env:
           HF_TOKEN: ${{ secrets.HF_READ_AISIM_INFX_CACHE }}
@@ -205,6 +232,7 @@ jobs:
         with:
           name: e2e-accuracy-measurements-${{ inputs.artifact_key }}
           path: ${{ runner.temp }}/accuracy-measurements-encrypted/
+          compression-level: 0
           overwrite: true
           if-no-files-found: error
           retention-days: 7
@@ -294,6 +322,19 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_READ_AISIM_INFX_CACHE }}
         run: |
           "${RUNNER_TEMP}/trusted-venv/bin/python" trusted/scripts/e2e_accuracy/private_artifacts.py open "${RUNNER_TEMP}/accuracy-measurements-encrypted" "${RUNNER_TEMP}/accuracy-measurements"
+      - name: Verify and prepare the installed wheel's op-latency data offline
+        id: op_latency
+        shell: bash
+        env:
+          AISIM_DATA_CACHE: ${{ runner.temp }}/accuracy-op-data
+          AISIM_DATA_OFFLINE: '1'
+        run: |
+          archive="${RUNNER_TEMP}/accuracy-measurements/op-latency-data.tar"
+          if [[ ! -f "${archive}" ]]; then exit 0; fi
+          "${RUNNER_TEMP}/trusted-venv/bin/python" trusted/scripts/ci/op_latency_handoff.py unpack "${archive}"
+          systems_root=$(python -I scripts/performance/prefetch_op_latency.py)
+          test -d "${systems_root}"
+          echo "systems_root=${systems_root}" >> "${GITHUB_OUTPUT}"
       - name: Run both predictors for this shard
         shell: bash
         env:
@@ -303,6 +344,7 @@ jobs:
           PREVIEW: ${{ inputs.preview }}
           CONFIGURATION_MODE: ${{ inputs.configuration_mode }}
           GH_TOKEN: ${{ github.token }}
+          AISIM_E2E_SYSTEMS_ROOT: ${{ steps.op_latency.outputs.systems_root }}
         run: |
           preview_args=()
           if [[ "${PREVIEW}" == 'true' ]]; then preview_args+=(--preview); fi

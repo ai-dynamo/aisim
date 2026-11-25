@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 import csv
 import hashlib
@@ -30,6 +31,7 @@ import yaml
 from scripts.ci import check_python_licenses as python_licenses
 from scripts.ci import generate_license_evidence as license_evidence
 from scripts.ci import readme_rc_wheels as rc_wheels
+from scripts.ci import select_full_ci as full_ci_selector
 from scripts.ci.check_application_test_inventory import Inventory, assignment
 from scripts.ci.require_fast_ci import REQUIRED_JOBS, GateError, latest_run, require_fast_ci, verify_jobs
 from scripts.ci.select_full_ci import COMPONENTS, select_components
@@ -794,6 +796,43 @@ def test_collected_inventory_reports_unexpected_skips_and_collection_failures():
 def _workflow(name: str) -> dict:
     with (WORKFLOW_ROOT / name).open(encoding="utf-8") as handle:
         return yaml.load(handle, Loader=yaml.BaseLoader)
+
+
+def test_commit_authorship_rechecks_retargeted_history(tmp_path: Path) -> None:
+    workflow = _workflow("commit-authorship.yml")
+    assert set(workflow["on"]["pull_request"]["types"]) == {"opened", "synchronize", "reopened", "edited"}
+    job = workflow["jobs"]["commit-authorship"]
+    assert job["env"]["BASE_SHA"] == (
+        "${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}"
+    )
+    assert job["env"]["HEAD_SHA"] == (
+        "${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}"
+    )
+    command = next(step["run"] for step in job["steps"] if step.get("name") == "Check new commits")
+    checker = tmp_path / ".github" / "commit-policy" / "check.py"
+    checker.parent.mkdir(parents=True)
+    shutil.copyfile(REPOSITORY_ROOT / ".github" / "commit-policy" / "check.py", checker)
+    _git(tmp_path, "init", "--quiet")
+    main = _commit_file(tmp_path, "main.txt", "main\n")
+    _git(tmp_path, "commit", "--quiet", "--allow-empty", "--author=Codex <codex@openai.com>", "-m", "parent PR")
+    parent = _git(tmp_path, "rev-parse", "HEAD").stdout.strip()
+    head = _commit_file(tmp_path, "head.txt", "human child PR\n")
+    # Retarget the same head from the parent PR to main. The parent commit
+    # becomes newly included, so the workflow must run again with the new base.
+    for base, expected in ((parent, 0), (main, 1)):
+        result = subprocess.run(
+            ["bash", "-eo", "pipefail", "-c", command],
+            cwd=tmp_path,
+            env={**os.environ, "BASE_SHA": base, "HEAD_SHA": head},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == expected, result.stdout + result.stderr
+        if expected:
+            assert f"{parent}: forbidden AI attribution: author: Codex <codex@openai.com>" in result.stderr
+        else:
+            assert "Checked 1 commit(s): no known AI authorship found." in result.stdout
 
 
 def test_nvskills_request_events():
@@ -1715,7 +1754,7 @@ def test_release_contract_reuses_the_same_source_architecture_wheel():
     for case in cases["cases"]:
         components = select_components(case["paths"])["components"]
         if components["release_artifact_contract"]:
-            assert components["application_tests"], case
+            assert components["application_test_wheel"], case
 
 
 def test_full_ci_aggregate_checks_every_declared_dependency() -> None:
@@ -2040,8 +2079,13 @@ def _run_comparison_base(
 ) -> tuple[subprocess.CompletedProcess, dict[str, str]]:
     jobs = _workflow("ci.yml")["jobs"]
     assert jobs["verify-target"]["outputs"]["comparison-base"] == "${{ steps.comparison-base.outputs.sha }}"
-    assert "verify-target" in jobs["prediction-regression"]["needs"]
-    assert jobs["prediction-regression"]["with"]["old-ref"] == "${{ needs.verify-target.outputs.comparison-base }}"
+    # The selector passes this base through, except for a full-scope main push,
+    # which compares with the last main commit that ran the full suite.
+    plan_step = next(step for step in jobs["select-full-ci"]["steps"] if step.get("id") == "plan")
+    assert plan_step["env"]["COMPARISON_BASE"] == "${{ needs.verify-target.outputs.comparison-base }}"
+    assert jobs["select-full-ci"]["outputs"]["comparison-base"] == "${{ steps.plan.outputs.comparison_base }}"
+    assert "select-full-ci" in jobs["prediction-regression"]["needs"]
+    assert jobs["prediction-regression"]["with"]["old-ref"] == "${{ needs.select-full-ci.outputs.comparison-base }}"
     step = next(step for step in jobs["verify-target"]["steps"] if step.get("id") == "comparison-base")
     assert step["env"]["PR_BASE_SHA"] == "${{ steps.pr-target.outputs.base }}"
     gh = tmp_path / "gh"
@@ -2111,6 +2155,9 @@ def test_full_ci_manual_source_branches_replace_only_their_branch():
 @pytest.mark.parametrize("event", ["push", "workflow_dispatch"])
 @pytest.mark.parametrize("ref", ["refs/heads/main", "refs/heads/release/0.12.0", "refs/tags/v0.12.0"])
 def test_full_ci_preserves_every_lifecycle_and_tag_run(event, ref):
+    # Main batching narrows a superseded run's scope; it never cancels the run,
+    # which must still stage its own wheel.
+    assert _full_ci_concurrency_group(event, ref, "101") == "full-ci-101"
     assert _full_ci_concurrency_group(event, ref, "101") != _full_ci_concurrency_group(event, ref, "102")
 
 
@@ -2584,11 +2631,11 @@ def test_numerics_jobs_run_on_github_hosted_runners() -> None:
         assert "wheel-storage" not in json.dumps(job)
         assert "WHEEL_STORAGE_URL" not in json.dumps(job)
 
-    # The sentinel check uses the checked-in manifest without fetching a baseline.
+    # Sentinels use checked-in expected values and need no historical commit.
     golden_checkout = next(step for step in golden["steps"] if step.get("uses", "").startswith("actions/checkout@"))
     assert "fetch-depth" not in golden_checkout["with"]
-    assert "check_prediction_numerics.py --output numerical-sentinels.json" in _run_commands(golden)
     assert "--fetch-baseline-only" not in _run_commands(golden)
+    assert "check_prediction_numerics.py --output numerical-sentinels.json" in _run_commands(golden)
     # The old side reads setup helpers from the workflow commit, so it keeps full history.
     collect_checkout = next(step for step in collect["steps"] if step.get("uses", "").startswith("actions/checkout@"))
     assert collect_checkout["with"]["fetch-depth"] == "0"
@@ -2623,12 +2670,31 @@ def test_active_workflows_do_not_call_nested_inert_github_assets() -> None:
         assert "./python/aisim/.github/" not in path.read_text(encoding="utf-8")
 
 
+DATA_READER_JOBS = (
+    "rust",
+    "rust-feature-modes",
+    "public-api-rust",
+    "application-tests",
+    "python-compatibility",
+    "engine-golden-regression",
+    "collector-data",
+    "readme-commands",
+)
+
+
+def _op_latency_data_result(plan: dict[str, str]) -> str:
+    """The data job runs exactly when a job that reads operation tables is selected."""
+    return "success" if any(plan.get(job.replace("-", "_")) == "true" for job in DATA_READER_JOBS) else "skipped"
+
+
 def _run_full_ci_aggregate(
     results: dict[str, str],
     plan: dict[str, str],
+    summary: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     aggregate = _workflow("ci.yml")["jobs"]["readiness"]
     script = aggregate["steps"][0]["run"]
+    results = {"op-latency-data": _op_latency_data_result(plan), **results}
     needs = {name: {"result": result, "outputs": {}} for name, result in results.items()}
     return subprocess.run(
         ["bash", "-c", script],
@@ -2637,6 +2703,7 @@ def _run_full_ci_aggregate(
             **os.environ,
             "NEEDS_JSON": json.dumps(needs),
             "PLAN_JSON": json.dumps(plan),
+            **({"GITHUB_STEP_SUMMARY": str(summary)} if summary else {}),
         },
         capture_output=True,
         text=True,
@@ -2668,6 +2735,15 @@ def test_selective_full_ci_keeps_the_aggregate_fail_closed() -> None:
         job = jobs[component.replace("_", "-")]
         assert "select-full-ci" in job["needs"]
         assert f"needs.select-full-ci.outputs.{component} == 'true'" in job["if"]
+        assert jobs["select-full-ci"]["outputs"][component] == f"${{{{ steps.plan.outputs.{component} }}}}"
+
+    # The wheel build and the test legs are separate components, so a superseded
+    # main commit can build its wheel without running the legs.
+    readiness_script = _run_commands(jobs["readiness"])
+    component_outputs = ast.literal_eval(re.search(r"component_outputs = (\{.*?\})", readiness_script, re.S)[1])
+    assert component_outputs == {component.replace("_", "-"): component for component in COMPONENTS}
+    for consumer in ("application-wheel", "application-tests", "release-artifact-contract"):
+        assert "application-test-wheel" in jobs[consumer]["needs"]
 
     wheel_condition = jobs["application-wheel"]["if"]
     assert "needs.fast-ci.result == 'success'" in wheel_condition
@@ -2796,6 +2872,7 @@ def test_full_ci_scope_resolver_handles_copy_manual_and_race_cases(
 
 def test_full_ci_aggregate_accepts_only_explicit_na_results() -> None:
     plan = dict.fromkeys(COMPONENTS, "false")
+    plan["application_test_wheel"] = "true"
     plan["application_tests"] = "true"
     results = {
         "verify-target": "success",
@@ -2808,7 +2885,6 @@ def test_full_ci_aggregate_accepts_only_explicit_na_results() -> None:
             component.replace("_", "-"): ("success" if plan[component] == "true" else "skipped")
             for component in COMPONENTS
         },
-        "application-test-wheel": "success",
     }
 
     passed = _run_full_ci_aggregate(results, plan)
@@ -2824,6 +2900,58 @@ def test_full_ci_aggregate_accepts_only_explicit_na_results() -> None:
     unexpected_unselected_job = _run_full_ci_aggregate(results, plan)
     assert unexpected_unselected_job.returncode != 0
     assert "rust=success, expected skipped" in unexpected_unselected_job.stdout
+
+
+def test_full_ci_aggregate_requires_the_data_job_exactly_when_a_reader_is_selected() -> None:
+    plan = dict.fromkeys(COMPONENTS, "false")
+    plan["application_test_wheel"] = "true"
+    plan["application_tests"] = "true"
+    results = {
+        "verify-target": "success",
+        "select-full-ci": "success",
+        "fast-ci": "success",
+        "python-compliance": "success",
+        "license-crate-inventory": "success",
+        "license-evidence": "success",
+        **{c.replace("_", "-"): ("success" if plan[c] == "true" else "skipped") for c in COMPONENTS},
+    }
+    assert _run_full_ci_aggregate(results, plan).returncode == 0
+    skipped = _run_full_ci_aggregate({**results, "op-latency-data": "skipped"}, plan)
+    assert skipped.returncode != 0 and "op-latency-data=skipped, expected success" in skipped.stdout
+
+    nothing_selected = dict.fromkeys(COMPONENTS, "false")
+    idle = {**results, "application-tests": "skipped", "application-test-wheel": "skipped"}
+    assert _run_full_ci_aggregate(idle, nothing_selected).returncode == 0
+    unexpected = _run_full_ci_aggregate({**idle, "op-latency-data": "success"}, nothing_selected)
+    assert unexpected.returncode != 0 and "op-latency-data=success, expected skipped" in unexpected.stdout
+
+
+def test_jobs_that_read_operation_data_wait_for_the_single_download() -> None:
+    """Parallel jobs that each download the dataset get rate limited by Hugging Face and time out."""
+    jobs = _workflow("ci.yml")["jobs"]
+    readers = {
+        name
+        for name, job in jobs.items()
+        if "prefetch-op-latency-data" in json.dumps(job) or "compose_systems_root" in json.dumps(job)
+    } | {"collector-data", "readme-commands"}  # reusable workflows that compose the dataset
+    assert readers == set(DATA_READER_JOBS)
+    producer = jobs["op-latency-data"]
+    for name in readers:
+        assert "op-latency-data" in jobs[name]["needs"], name
+        assert f"needs.select-full-ci.outputs.{name.replace('-', '_')} == 'true'" in producer["if"], name
+    assert "op-latency-data" in jobs["readiness"]["needs"]
+
+    # The artifact the consumers restore is the one the producer uploads, under the name and file they expect.
+    (upload,) = [s for s in producer["steps"] if s.get("uses", "").startswith("actions/upload-artifact@")]
+    assert upload["with"]["name"] == "op-latency-data"
+    assert upload["with"]["path"] == "${{ runner.temp }}/op-latency-data.tar"
+    action = yaml.safe_load((ACTION_ROOT / "prefetch-op-latency-data/action.yml").read_text())
+    restore, compose = action["runs"]["steps"]
+    assert restore["uses"].startswith("actions/download-artifact@") and restore["with"]["name"] == "op-latency-data"
+    assert restore["continue-on-error"] is True  # a standalone run falls back to downloading the dataset itself
+    assert "op-latency-data/op-latency-data.tar" in compose["run"]
+    assert "op_latency_handoff.py unpack" in compose["run"] and "compose_systems_root.py" in compose["run"]
+    assert "op_latency_handoff.py pack" in _run_commands(producer)
 
 
 def test_full_ci_aggregate_rejects_missing_selection_output() -> None:
@@ -2876,6 +3004,7 @@ def test_full_ci_selector_maps_python_rust_and_data_boundaries() -> None:
     assert {component for component, selected in python_plan["components"].items() if selected} == {
         "readme_commands",
         "platform_wheels",
+        "application_test_wheel",
         "application_wheel",
         "application_tests",
         "python_compatibility",
@@ -2936,18 +3065,19 @@ def test_full_ci_selector_cli_decodes_paths_and_writes_outputs(tmp_path: Path) -
     )
     output = tmp_path / "github-output"
     summary = tmp_path / "summary.md"
+    command = [
+        "python3",
+        "scripts/ci/select_full_ci.py",
+        "--base64-paths-file",
+        str(encoded),
+        "--github-output",
+        str(output),
+        "--summary",
+        str(summary),
+    ]
 
     result = subprocess.run(
-        [
-            "python3",
-            "scripts/ci/select_full_ci.py",
-            "--base64-paths-file",
-            str(encoded),
-            "--github-output",
-            str(output),
-            "--summary",
-            str(summary),
-        ],
+        [*command, "--comparison-base", "b" * 40],
         cwd=REPOSITORY_ROOT,
         capture_output=True,
         text=True,
@@ -2957,7 +3087,19 @@ def test_full_ci_selector_cli_decodes_paths_and_writes_outputs(tmp_path: Path) -
     assert result.returncode == 0, result.stdout + result.stderr
     assert "run_all=false" in output.read_text(encoding="utf-8")
     assert "application_tests=false" in output.read_text(encoding="utf-8")
+    assert "superseded=false" in output.read_text(encoding="utf-8")
+    assert f"comparison_base={'b' * 40}" in output.read_text(encoding="utf-8")
     assert "Explicitly N/A" in summary.read_text(encoding="utf-8")
+    assert "Main batching" not in summary.read_text(encoding="utf-8")
+
+    # An empty comparison output would make downstream checkouts compare the
+    # target with itself.
+    output.unlink()
+    for base in ([], ["--comparison-base", "main"]):
+        missing = subprocess.run([*command, *base], cwd=REPOSITORY_ROOT, capture_output=True, text=True, check=False)
+        assert missing.returncode != 0
+        assert "comparison base must be a full commit SHA" in missing.stdout + missing.stderr
+        assert not output.exists()
 
 
 def test_python_dependency_changes_run_the_complete_matrix() -> None:
@@ -2984,6 +3126,7 @@ def test_full_ci_selector_matches_the_independent_mapping_oracle() -> None:
         plan = select_components(
             case["paths"],
             force_all=case.get("force_all", False),
+            superseded=case.get("superseded", False),
         )
         actual = {component for component, is_selected in plan["components"].items() if is_selected}
         expected = set(COMPONENTS) if case["run_all"] else set(case["selected"])
@@ -2993,6 +3136,717 @@ def test_full_ci_selector_matches_the_independent_mapping_oracle() -> None:
             observed_components.update(actual)
 
     assert observed_components == set(COMPONENTS)
+
+
+MAIN_TARGET = "a" * 40
+MAIN_PARENT = "b" * 40
+MAIN_NEWER = "e" * 40
+MAIN_COMPARISON_JOBS = (
+    "Prediction Regression / Prediction Regression Gate",
+    "Python Dependency Licenses",
+    "Cargo Dependency Inventories",
+    "License compliance evidence",
+)
+
+
+def _main_run(run_id: int, sha: str, **overrides: object) -> dict:
+    return {
+        "id": run_id,
+        "head_sha": sha,
+        "path": ".github/workflows/ci.yml",
+        "event": "push",
+        "head_branch": "main",
+        **overrides,
+    }
+
+
+def _scope_jobs(marker: str | None = "skipped", *, conclusion: str | None = "success", plan: str = "success") -> dict:
+    """Jobs page of an earlier main run; ``marker=None`` is a run from before main batching."""
+    steps = [{"name": full_ci_selector.PLAN_STEP, "status": "completed", "conclusion": plan}]
+    if marker is not None:
+        steps.append({"name": full_ci_selector.SUPERSEDED_STEP, "status": "completed", "conclusion": marker})
+    return {
+        "jobs": [
+            {"name": "Verify Exact Target", "status": "completed", "conclusion": "success", "steps": []},
+            {
+                "name": full_ci_selector.SCOPE_JOB,
+                "status": "completed" if conclusion else "in_progress",
+                "conclusion": conclusion,
+                "steps": steps,
+            },
+            *[{"name": name, "status": "completed", "conclusion": "success"} for name in MAIN_COMPARISON_JOBS],
+        ]
+    }
+
+
+def _main_batch_api(
+    main_sha: str,
+    *,
+    compare: dict[str, str] | None = None,
+    runs: tuple[dict, ...] = (),
+    successor: dict | Exception | None = None,
+    jobs: dict[int, dict | list[dict]] | None = None,
+    failing: tuple[str, ...] = (),
+) -> tuple[object, list]:
+    calls: list = []
+
+    def api(endpoint: str) -> dict:
+        calls.append(endpoint)
+        path = urlsplit(endpoint).path
+        if any(fragment in path for fragment in failing):
+            raise full_ci_selector.GitHubError("unavailable")
+        if path == "repos/ai-dynamo/aisim/commits/main":
+            return {"sha": main_sha}
+        if path.startswith("repos/ai-dynamo/aisim/compare/"):
+            assert parse_qs(urlsplit(endpoint).query) == {"per_page": ["1"]}
+            return {"status": (compare or {})[path.rsplit("/", 1)[1]]}
+        if path == "repos/ai-dynamo/aisim/actions/workflows/ci.yml/runs":
+            query = parse_qs(urlsplit(endpoint).query)
+            if "head_sha" in query:
+                assert query == {"branch": ["main"], "event": ["push"], "head_sha": [main_sha], "per_page": ["1"]}
+                if isinstance(successor, Exception):
+                    raise successor
+                return {"workflow_runs": [successor] if successor else []}
+            page = int(query.pop("page", ["1"])[0])
+            assert query == {
+                "branch": ["main"],
+                "event": ["push"],
+                "per_page": [str(full_ci_selector.MAIN_RUNS_PER_PAGE)],
+            }
+            start = (page - 1) * full_ci_selector.MAIN_RUNS_PER_PAGE
+            return {"workflow_runs": list(runs[start : start + full_ci_selector.MAIN_RUNS_PER_PAGE])}
+        if path.endswith("/jobs"):
+            query = parse_qs(urlsplit(endpoint).query)
+            page = int(query.pop("page", ["1"])[0])
+            assert query == {"filter": ["latest"], "per_page": ["100"]}
+            response = (jobs or {})[int(path.split("/")[-2])]
+            if isinstance(response, list):
+                return response[page - 1]
+            assert page == 1
+            return response
+        raise AssertionError(endpoint)
+
+    return api, calls
+
+
+@pytest.mark.parametrize(("status", "conclusion"), [("queued", None), ("in_progress", None), ("completed", "success")])
+def test_main_push_waits_then_defers_its_tests_when_main_moved_on(status: str, conclusion: str | None) -> None:
+    api, calls = _main_batch_api(
+        MAIN_NEWER,
+        compare={f"{MAIN_TARGET}...{MAIN_NEWER}": "ahead"},
+        successor=_main_run(201, MAIN_NEWER, status=status, conclusion=conclusion),
+    )
+
+    batch = full_ci_selector.resolve_main_push(
+        "ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, api=api, sleep=lambda seconds: calls.append(seconds)
+    )
+
+    assert full_ci_selector.MAIN_DEBOUNCE_SECONDS == 600
+    # Wait first, then confirm ancestry and an available run for the successor.
+    assert calls == [
+        600,
+        "repos/ai-dynamo/aisim/commits/main",
+        f"repos/ai-dynamo/aisim/compare/{MAIN_TARGET}...{MAIN_NEWER}?per_page=1",
+        f"repos/ai-dynamo/aisim/actions/workflows/ci.yml/runs?branch=main&event=push&head_sha={MAIN_NEWER}&per_page=1",
+    ]
+    assert batch["superseded"] is True
+    assert batch["main_sha"] == MAIN_NEWER
+    assert batch["comparison_base"] == MAIN_PARENT
+    plan = select_components([], force_all=True, superseded=True)
+    assert plan["run_all"] is False
+    assert {name for name, selected in plan["components"].items() if selected} == {
+        "application_test_wheel",
+        "application_wheel",
+    }
+
+
+@pytest.mark.parametrize(
+    "successor",
+    [
+        None,
+        _main_run(201, MAIN_NEWER, status="completed", conclusion="skipped"),
+        _main_run(201, MAIN_NEWER, status="completed", conclusion="cancelled"),
+        _main_run(201, MAIN_NEWER, status="completed", conclusion="failure"),
+        _main_run(201, MAIN_TARGET, status="queued", conclusion=None),
+        full_ci_selector.GitHubError("unavailable"),
+    ],
+)
+def test_main_push_keeps_full_scope_without_an_eligible_successor(successor: dict | Exception | None) -> None:
+    api, _ = _main_batch_api(
+        MAIN_NEWER,
+        compare={f"{MAIN_TARGET}...{MAIN_NEWER}": "ahead", f"{MAIN_PARENT}...{MAIN_TARGET}": "ahead"},
+        successor=successor,
+        runs=(_main_run(199, MAIN_PARENT),),
+        jobs={199: _scope_jobs()},
+    )
+
+    batch = full_ci_selector.resolve_main_push(
+        "ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, api=api, sleep=lambda _: None
+    )
+
+    assert batch["superseded"] is False
+    assert batch["comparison_base"] == MAIN_PARENT
+    assert batch["notes"][0][0] == "warning"
+    assert all(select_components([], force_all=True, superseded=batch["superseded"])["components"].values())
+
+
+def test_main_push_keeps_full_scope_and_compares_with_the_last_full_scope_commit() -> None:
+    deferred, undecided, validated = MAIN_PARENT, "c" * 40, "d" * 40
+    api, calls = _main_batch_api(
+        MAIN_TARGET,
+        compare={f"{validated}...{MAIN_TARGET}": "ahead"},
+        runs=(
+            _main_run(201, MAIN_NEWER),
+            _main_run(200, MAIN_TARGET),
+            _main_run(199, deferred),
+            _main_run(198, undecided),
+            _main_run(197, validated),
+            _main_run(196, "f" * 40),
+        ),
+        jobs={199: _scope_jobs("success"), 198: _scope_jobs(conclusion=None), 197: _scope_jobs("skipped")},
+    )
+
+    batch = full_ci_selector.resolve_main_push(
+        "ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, api=api, sleep=lambda _: None
+    )
+
+    assert batch["superseded"] is False
+    assert batch["comparison_base"] == validated
+    assert [level for level, _ in batch["notes"]] == ["notice", "notice"]
+    # The surviving run names every commit whose test suite it now covers.
+    assert deferred in batch["notes"][1][1] and undecided in batch["notes"][1][1]
+    inspected = [call for call in calls if call.endswith("/jobs?filter=latest&per_page=100")]
+    assert [call.split("/")[-2] for call in inspected] == ["199", "198", "197"]
+
+
+@pytest.mark.parametrize("superseded_count", [29, 59])
+@pytest.mark.parametrize("newer_count", [0, 30])
+def test_main_push_recovers_a_validated_base_beyond_the_first_history_page(
+    superseded_count: int, newer_count: int
+) -> None:
+    validated = "d" * 40
+    newer = [_main_run(230 - index, MAIN_NEWER) for index in range(newer_count)]
+    superseded = [_main_run(199 - index, f"{index + 1:040x}") for index in range(superseded_count)]
+    validated_run_id = 199 - superseded_count
+    api, calls = _main_batch_api(
+        MAIN_TARGET,
+        compare={f"{validated}...{MAIN_TARGET}": "ahead"},
+        runs=(*newer, _main_run(200, MAIN_TARGET), *superseded, _main_run(validated_run_id, validated)),
+        jobs={
+            **{run["id"]: _scope_jobs("success") for run in superseded},
+            validated_run_id: _scope_jobs("skipped"),
+        },
+    )
+
+    batch = full_ci_selector.resolve_main_push(
+        "ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, api=api, sleep=lambda _: None
+    )
+
+    assert batch["superseded"] is False
+    assert batch["comparison_base"] == validated
+    assert all(select_components([], force_all=True, superseded=batch["superseded"])["components"].values())
+    assert all(run["head_sha"] in batch["notes"][1][1] for run in superseded)
+    history_pages = [call for call in calls if "/actions/workflows/ci.yml/runs?" in call]
+    assert len(history_pages) == (newer_count + superseded_count + 1) // 30 + 1
+    assert parse_qs(urlsplit(history_pages[-1]).query)["page"] == [str(len(history_pages))]
+
+
+@pytest.mark.parametrize("marker", ["skipped", None])
+@pytest.mark.parametrize("run_status", ["in_progress", "failure", "success"])
+def test_main_comparison_base_is_the_parent_after_successful_comparisons(marker: str | None, run_status: str) -> None:
+    api, _ = _main_batch_api(
+        MAIN_TARGET,
+        compare={f"{MAIN_PARENT}...{MAIN_TARGET}": "ahead"},
+        runs=(
+            _main_run(
+                199,
+                MAIN_PARENT,
+                status="in_progress" if run_status == "in_progress" else "completed",
+                conclusion=None if run_status == "in_progress" else run_status,
+            ),
+            _main_run(198, "c" * 40),
+        ),
+        jobs={199: _scope_jobs(marker)},
+    )
+
+    base, notes = full_ci_selector.last_full_scope_commit("ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, api=api)
+
+    assert base == MAIN_PARENT
+    assert notes == [
+        (
+            "notice",
+            f"Comparison base `{MAIN_PARENT}`: the last full-scope main commit with successful comparisons (run 199).",
+        )
+    ]
+
+
+@pytest.mark.parametrize("marker", ["skipped", None])
+@pytest.mark.parametrize("job_name", MAIN_COMPARISON_JOBS)
+@pytest.mark.parametrize("result", ["missing", "queued", "in_progress", "cancelled", "failure", "skipped", "duplicate"])
+def test_main_comparison_base_skips_unfinished_or_unsuccessful_comparisons(
+    marker: str | None, job_name: str, result: str
+) -> None:
+    validated = "d" * 40
+    incomplete = _scope_jobs(marker)
+    job = next(job for job in incomplete["jobs"] if job["name"] == job_name)
+    if result == "missing":
+        incomplete["jobs"].remove(job)
+    elif result == "duplicate":
+        incomplete["jobs"].append(dict(job))
+    else:
+        job.update(
+            status=result if result in {"queued", "in_progress"} else "completed",
+            conclusion=None if result in {"queued", "in_progress"} else result,
+        )
+    api, _ = _main_batch_api(
+        MAIN_TARGET,
+        compare={f"{MAIN_PARENT}...{MAIN_TARGET}": "ahead", f"{validated}...{MAIN_TARGET}": "ahead"},
+        runs=(_main_run(199, MAIN_PARENT), _main_run(198, validated)),
+        jobs={199: incomplete, 198: _scope_jobs()},
+    )
+
+    base, _ = full_ci_selector.last_full_scope_commit("ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, api=api)
+
+    assert base == validated
+
+
+@pytest.mark.parametrize("comparison_result", ["success", "failure", "missing"])
+def test_main_comparison_base_reads_all_job_pages(comparison_result: str) -> None:
+    validated = "d" * 40
+    scope_jobs = _scope_jobs()["jobs"]
+    # Scope selection is on the first page; comparison evidence is on the next.
+    first_page = scope_jobs[:2] + [{"name": f"other job {number}"} for number in range(98)]
+    comparisons = scope_jobs[2:]
+    if comparison_result == "missing":
+        comparisons.pop()
+    else:
+        comparisons[-1]["conclusion"] = comparison_result
+    api, calls = _main_batch_api(
+        MAIN_TARGET,
+        compare={f"{MAIN_PARENT}...{MAIN_TARGET}": "ahead", f"{validated}...{MAIN_TARGET}": "ahead"},
+        runs=(_main_run(199, MAIN_PARENT), _main_run(198, validated)),
+        jobs={199: [{"jobs": first_page}, {"jobs": comparisons}], 198: _scope_jobs()},
+    )
+
+    base, _ = full_ci_selector.last_full_scope_commit("ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, api=api)
+
+    assert base == (MAIN_PARENT if comparison_result == "success" else validated)
+    assert "repos/ai-dynamo/aisim/actions/runs/199/jobs?filter=latest&per_page=100&page=2" in calls
+
+
+def test_main_comparison_base_requires_readable_job_pages() -> None:
+    api, _ = _main_batch_api(
+        MAIN_TARGET,
+        runs=(_main_run(199, MAIN_PARENT),),
+        jobs={199: {}},
+    )
+
+    with pytest.raises(full_ci_selector.GitHubError, match="no Full CI jobs"):
+        full_ci_selector.last_full_scope_commit("ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, api=api)
+
+
+def test_main_push_retry_keeps_full_scope_when_main_advances_between_attempts() -> None:
+    history = {
+        "compare": {f"{MAIN_PARENT}...{MAIN_TARGET}": "ahead", f"{MAIN_TARGET}...{MAIN_NEWER}": "ahead"},
+        "runs": (_main_run(199, MAIN_PARENT),),
+        "jobs": {199: _scope_jobs()},
+    }
+    initial_api, _ = _main_batch_api(MAIN_TARGET, **history)
+    retry_api, _ = _main_batch_api(MAIN_NEWER, **history)
+
+    for attempt, api in ((1, initial_api), (2, retry_api)):
+        batch = full_ci_selector.resolve_main_push(
+            "ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, run_attempt=attempt, api=api, sleep=lambda _: None
+        )
+        plan = select_components([], force_all=True, superseded=batch["superseded"])
+        # A failed application test must still be selected on the retry of this
+        # same run and SHA, even though main now contains a newer commit.
+        assert batch["superseded"] is False
+        assert plan["run_all"] is True
+        assert plan["components"]["application_tests"] is True
+        assert all(plan["components"].values())
+
+
+@pytest.mark.parametrize(
+    ("jobs_page", "expected"),
+    [
+        (_scope_jobs("skipped"), "full"),
+        (_scope_jobs(None), "full"),
+        (_scope_jobs("success"), "superseded"),
+        (_scope_jobs("skipped", conclusion="failure"), "undecided"),
+        (_scope_jobs("success", conclusion="cancelled"), "undecided"),
+        (_scope_jobs(None, conclusion=None), "undecided"),
+        (_scope_jobs(None, plan="failure"), "undecided"),
+        ({"jobs": []}, "undecided"),
+        ({"jobs": [{**_scope_jobs()["jobs"][1], "steps": []}]}, "undecided"),
+        ({"jobs": _scope_jobs()["jobs"] + _scope_jobs()["jobs"]}, "undecided"),
+    ],
+)
+def test_main_scope_decision_reads_only_completed_selection_evidence(jobs_page: dict, expected: str) -> None:
+    assert full_ci_selector.main_scope_decision(jobs_page) == expected
+
+
+@pytest.mark.parametrize("parent_evidence", ["absent", "superseded", "undecided", "comparisons failed"])
+def test_main_comparison_base_rejects_an_unvalidated_parent(parent_evidence: str) -> None:
+    other = "c" * 40
+    jobs = _scope_jobs("success" if parent_evidence == "superseded" else "skipped")
+    if parent_evidence == "undecided":
+        jobs = _scope_jobs(conclusion=None)
+    elif parent_evidence == "comparisons failed":
+        jobs["jobs"][-1]["conclusion"] = "failure"
+    no_full_scope, _ = _main_batch_api(
+        MAIN_TARGET,
+        runs=(
+            *(() if parent_evidence == "absent" else (_main_run(199, MAIN_PARENT),)),
+            _main_run(198, other, head_branch="release/0.12.0"),
+            _main_run(197, other, event="workflow_dispatch"),
+            _main_run(196, other, path=".github/workflows/fast-ci.yml"),
+        ),
+        jobs={199: jobs},
+    )
+
+    # In particular, a superseded parent may already contain a regression.
+    # Selecting every test cannot recover it if both comparison snapshots do.
+    with pytest.raises(full_ci_selector.GitHubError, match="No full-scope Full CI run with successful comparisons"):
+        full_ci_selector.resolve_main_push(
+            "ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, api=no_full_scope, sleep=lambda _: None
+        )
+
+
+@pytest.mark.parametrize("status", ["diverged", "behind"])
+def test_main_comparison_base_rejects_a_non_ancestor_instead_of_using_a_superseded_parent(status: str) -> None:
+    other = "c" * 40
+    rewritten, _ = _main_batch_api(
+        MAIN_TARGET,
+        compare={f"{other}...{MAIN_TARGET}": status},
+        runs=(_main_run(199, MAIN_PARENT), _main_run(198, other)),
+        jobs={199: _scope_jobs("success"), 198: _scope_jobs("skipped")},
+    )
+
+    with pytest.raises(full_ci_selector.GitHubError, match="not an ancestor"):
+        full_ci_selector.resolve_main_push(
+            "ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, api=rewritten, sleep=lambda _: None
+        )
+
+
+def test_main_batching_fails_closed_to_full_scope_or_an_error() -> None:
+    history = {
+        "compare": {f"{MAIN_PARENT}...{MAIN_TARGET}": "ahead"},
+        "runs": (_main_run(199, MAIN_PARENT),),
+        "jobs": {199: _scope_jobs("skipped")},
+    }
+    unreadable_main, _ = _main_batch_api(MAIN_NEWER, failing=("/commits/main",), **history)
+    invalid_main, _ = _main_batch_api("main", **history)
+    diverged, _ = _main_batch_api(
+        MAIN_NEWER, **{**history, "compare": {**history["compare"], f"{MAIN_TARGET}...{MAIN_NEWER}": "diverged"}}
+    )
+    uncomparable, _ = _main_batch_api(MAIN_NEWER, failing=(f"/compare/{MAIN_TARGET}",), **history)
+    for api in (unreadable_main, invalid_main, diverged, uncomparable):
+        batch = full_ci_selector.resolve_main_push(
+            "ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, api=api, sleep=lambda _: None
+        )
+        assert batch["superseded"] is False
+        assert batch["comparison_base"] == MAIN_PARENT
+        assert batch["notes"][0][0] == "warning"
+
+    # A full-scope run must not silently narrow its comparison when the run
+    # history cannot be read.
+    no_history, _ = _main_batch_api(MAIN_TARGET, failing=("/actions/",))
+    with pytest.raises(full_ci_selector.GitHubError):
+        full_ci_selector.resolve_main_push(
+            "ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, api=no_history, sleep=lambda _: None
+        )
+    for repository, sha, run_id, parent in (
+        ("ai-dynamo/aisim", MAIN_TARGET, 200, ""),
+        ("ai-dynamo/aisim", "main", 200, MAIN_PARENT),
+        ("ai-dynamo/aisim", MAIN_TARGET, 0, MAIN_PARENT),
+        ("", MAIN_TARGET, 200, MAIN_PARENT),
+    ):
+        with pytest.raises(ValueError):
+            full_ci_selector.resolve_main_push(repository, sha, run_id, parent, api=no_history, sleep=lambda _: None)
+    for attempt in (0, -1):
+        with pytest.raises(ValueError):
+            full_ci_selector.resolve_main_push(
+                "ai-dynamo/aisim",
+                MAIN_TARGET,
+                200,
+                MAIN_PARENT,
+                run_attempt=attempt,
+                api=no_history,
+                sleep=lambda _: None,
+            )
+
+
+@pytest.mark.parametrize(
+    ("main_advanced", "run_attempt", "superseded"),
+    [(True, 1, True), (False, 1, False), (True, 2, False), (True, 3, False)],
+)
+def test_main_batching_cli_writes_scope_and_comparison_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    main_advanced: bool,
+    run_attempt: int,
+    superseded: bool,
+) -> None:
+    validated = "d" * 40
+    api, calls = _main_batch_api(
+        MAIN_NEWER if main_advanced else MAIN_TARGET,
+        compare={f"{MAIN_TARGET}...{MAIN_NEWER}": "ahead", f"{validated}...{MAIN_TARGET}": "ahead"},
+        runs=(_main_run(199, MAIN_PARENT), _main_run(198, validated)),
+        successor=_main_run(201, MAIN_NEWER, status="queued", conclusion=None),
+        jobs={199: _scope_jobs("success"), 198: _scope_jobs("skipped")},
+    )
+    monkeypatch.setattr(full_ci_selector, "github_api", api)
+    monkeypatch.setattr(full_ci_selector.time, "sleep", calls.append)
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", str(run_attempt))
+    output, summary = tmp_path / "github-output", tmp_path / "summary.md"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "select_full_ci.py",
+            "--force-all",
+            "--comparison-base",
+            MAIN_PARENT,
+            "--main-push",
+            "--repository",
+            "ai-dynamo/aisim",
+            "--sha",
+            MAIN_TARGET,
+            "--run-id",
+            "200",
+            "--github-output",
+            str(output),
+            "--summary",
+            str(summary),
+        ],
+    )
+
+    full_ci_selector.main()
+
+    outputs = dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines())
+    selected = {component for component in COMPONENTS if outputs[component] == "true"}
+    assert calls[0] == full_ci_selector.MAIN_DEBOUNCE_SECONDS
+    assert outputs["superseded"] == str(superseded).lower()
+    assert outputs["run_all"] == str(not superseded).lower()
+    assert selected == ({"application_test_wheel", "application_wheel"} if superseded else set(COMPONENTS))
+    assert outputs["comparison_base"] == (MAIN_PARENT if superseded else validated)
+    assert "### Main batching" in summary.read_text(encoding="utf-8")
+    assert ("::notice::main moved to" in capsys.readouterr().out) is superseded
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "api",
+        "empty history",
+        "superseded parent",
+        "non-ancestor",
+        "history exhausted",
+        "history API error",
+        "history malformed",
+        "history non-ancestor",
+    ],
+)
+def test_main_batching_cli_errors_leave_outputs_unwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    other = "c" * 40
+    runs = () if failure in {"api", "empty history"} else (_main_run(199, MAIN_PARENT),)
+    if failure == "non-ancestor":
+        runs += (_main_run(198, other),)
+    if failure.startswith("history "):
+        runs += tuple(_main_run(198 - index, f"{index + 1:040x}") for index in range(29))
+        if failure == "history non-ancestor":
+            runs += (_main_run(169, other),)
+    jobs = {run["id"]: _scope_jobs("success") for run in runs}
+    if failure in {"non-ancestor", "history non-ancestor"}:
+        jobs[runs[-1]["id"]] = _scope_jobs("skipped")
+    api, calls = _main_batch_api(
+        MAIN_TARGET,
+        failing=("/actions/",) if failure == "api" else (),
+        runs=runs,
+        jobs=jobs,
+        compare={f"{other}...{MAIN_TARGET}": "diverged"},
+    )
+
+    def read_history(endpoint: str) -> dict:
+        if "/actions/workflows/ci.yml/runs?" in endpoint and "page=2" in endpoint:
+            if failure == "history API error":
+                calls.append(endpoint)
+                raise full_ci_selector.GitHubError("unavailable history page")
+            if failure == "history malformed":
+                calls.append(endpoint)
+                return {"workflow_runs": None}
+        return api(endpoint)
+
+    monkeypatch.setattr(full_ci_selector, "github_api", read_history)
+    monkeypatch.setattr(full_ci_selector.time, "sleep", lambda _: None)
+    output, summary = tmp_path / "github-output", tmp_path / "summary.md"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "select_full_ci.py",
+            "--force-all",
+            "--comparison-base",
+            MAIN_PARENT,
+            "--main-push",
+            "--repository",
+            "ai-dynamo/aisim",
+            "--sha",
+            MAIN_TARGET,
+            "--run-id",
+            "200",
+            "--github-output",
+            str(output),
+            "--summary",
+            str(summary),
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="::error::"):
+        full_ci_selector.main()
+    assert not output.exists()
+    assert not summary.exists()
+    if failure.startswith("history "):
+        assert any("/actions/workflows/ci.yml/runs?" in call and "page=2" in call for call in calls)
+
+
+def test_main_batching_is_wired_only_into_main_pushes(tmp_path: Path) -> None:
+    jobs = _workflow("ci.yml")["jobs"]
+    selector = jobs["select-full-ci"]
+    assert selector["name"] == full_ci_selector.SCOPE_JOB
+    assert selector["permissions"] == {"contents": "read", "pull-requests": "read", "actions": "read"}
+    assert int(selector["timeout-minutes"]) * 60 >= full_ci_selector.MAIN_DEBOUNCE_SECONDS + 300
+    names = [step.get("name") for step in selector["steps"]]
+    plan_index = names.index(full_ci_selector.PLAN_STEP)
+    plan_step = selector["steps"][plan_index]
+    marker = selector["steps"][plan_index + 1]
+    assert plan_step["id"] == "plan"
+    # Later main runs classify this run from the marker step's conclusion.
+    assert marker["name"] == full_ci_selector.SUPERSEDED_STEP
+    assert marker["if"] == "steps.plan.outputs.superseded == 'true'"
+    assert "continue-on-error" not in marker
+    assert selector["outputs"]["superseded"] == "${{ steps.plan.outputs.superseded }}"
+    assert full_ci_selector.WORKFLOW_PATH == ".github/workflows/ci.yml"
+    prediction_jobs = _workflow("prediction-regression-gate.yml")["jobs"]
+    assert (
+        full_ci_selector.COMPARISON_JOBS
+        == set(MAIN_COMPARISON_JOBS)
+        == {
+            f"{jobs['prediction-regression']['name']} / {prediction_jobs['report']['name']}",
+            jobs["python-compliance"]["name"],
+            jobs["license-crate-inventory"]["name"],
+            jobs["license-evidence"]["name"],
+        }
+    )
+
+    # Only the selector reads the exact-target base; every comparison uses the selected base.
+    workflow_text = (WORKFLOW_ROOT / "ci.yml").read_text(encoding="utf-8")
+    assert workflow_text.count("needs.verify-target.outputs.comparison-base") == 1
+    selected_base = "${{ needs.select-full-ci.outputs.comparison-base }}"
+    assert jobs["prediction-regression"]["with"]["old-ref"] == selected_base
+    for job_name in ("python-compliance", "license-crate-inventory"):
+        baselines = [
+            step["with"]["ref"]
+            for step in jobs[job_name]["steps"]
+            if step.get("with", {}).get("path") == "license-baseline-source"
+        ]
+        assert baselines == [selected_base]
+        assert "select-full-ci" in jobs[job_name]["needs"]
+    evidence = next(step for step in jobs["license-evidence"]["steps"] if "BASE_SHA" in step.get("env", {}))
+    assert evidence["env"]["BASE_SHA"] == selected_base
+    assert "select-full-ci" in jobs["license-evidence"]["needs"]
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python"
+    fake_python.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "${ARGS_FILE}"\n', encoding="utf-8")
+    fake_python.chmod(0o755)
+    args_file = tmp_path / "args"
+    for event, ref, attempt, batched in (
+        ("push", "refs/heads/main", "1", True),
+        ("push", "refs/heads/main", "2", True),
+        ("push", "refs/heads/release/0.12.0", "1", False),
+        ("push", "refs/heads/pull-request/136", "1", False),
+        ("workflow_dispatch", "refs/heads/main", "1", False),
+    ):
+        result = _run_workflow_script(
+            plan_step["run"],
+            {
+                "GITHUB_EVENT_NAME": event,
+                "GITHUB_REF": ref,
+                "GITHUB_SHA": MAIN_TARGET,
+                "GITHUB_RUN_ID": "200",
+                "GITHUB_RUN_ATTEMPT": attempt,
+                "GITHUB_OUTPUT": str(tmp_path / "github-output"),
+                "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"),
+                "FORCE_ALL": "true",
+                "PATHS_FILE": str(tmp_path / "paths.b64"),
+                "COMPARISON_BASE": MAIN_PARENT,
+                "REPOSITORY": "ai-dynamo/aisim",
+                "ARGS_FILE": str(args_file),
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            },
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        args = args_file.read_text(encoding="utf-8").splitlines()
+        assert args[0] == "scripts/ci/select_full_ci.py"
+        assert args[args.index("--comparison-base") + 1] == MAIN_PARENT
+        assert "--force-all" in args
+        if batched:
+            assert args[args.index("--main-push") :] == [
+                "--main-push",
+                "--repository",
+                "ai-dynamo/aisim",
+                "--sha",
+                MAIN_TARGET,
+                "--run-id",
+                "200",
+                "--run-attempt",
+                attempt,
+            ]
+        else:
+            assert "--main-push" not in args
+
+
+def test_full_ci_aggregate_accepts_the_superseded_main_scope(tmp_path: Path) -> None:
+    plan = {
+        component: str(selected).lower()
+        for component, selected in select_components([], force_all=True, superseded=True)["components"].items()
+    }
+    plan["superseded"] = "true"
+    results = {
+        "verify-target": "success",
+        "select-full-ci": "success",
+        "fast-ci": "success",
+        "python-compliance": "success",
+        "license-crate-inventory": "success",
+        "license-evidence": "success",
+        **{
+            component.replace("_", "-"): ("success" if plan[component] == "true" else "skipped")
+            for component in COMPONENTS
+        },
+    }
+    summary = tmp_path / "summary.md"
+
+    passed = _run_full_ci_aggregate(results, plan, summary)
+    assert passed.returncode == 0, passed.stdout + passed.stderr
+    assert "application-tests: skipped (expected skipped)" in passed.stdout
+    assert "application-wheel: success (expected success)" in passed.stdout
+    assert "Superseded main commit" in summary.read_text(encoding="utf-8")
+
+    for job, result in (
+        ("application-test-wheel", "skipped"),
+        ("application-wheel", "failure"),
+        ("application-tests", "success"),
+        ("prediction-regression", "success"),
+        ("license-evidence", "skipped"),
+    ):
+        failed = _run_full_ci_aggregate({**results, job: result}, plan)
+        assert failed.returncode != 0, job
 
 
 def test_parallel_test_matrix_has_no_missing_or_duplicate_partitions():
@@ -3939,13 +4793,19 @@ def test_full_ci_evidence_runs_independently_of_build_scope_and_uses_shared_gene
     assert "--inventory" in head["run"] and "--inventory-only" not in head["run"]
     assert "--inventory-only" in _run_commands(python)
     for job_name in ("python-compliance", "license-crate-inventory"):
-        assert "verify-target" in jobs[job_name]["needs"]
+        assert "select-full-ci" in jobs[job_name]["needs"]
         assert any(
-            step.get("with", {}).get("ref") == "${{ needs.verify-target.outputs.comparison-base }}"
+            step.get("with", {}).get("ref") == "${{ needs.select-full-ci.outputs.comparison-base }}"
             for step in jobs[job_name]["steps"]
         )
     evidence = jobs["license-evidence"]
-    assert set(evidence["needs"]) == {"fast-ci", "verify-target", "python-compliance", "license-crate-inventory"}
+    assert set(evidence["needs"]) == {
+        "fast-ci",
+        "select-full-ci",
+        "verify-target",
+        "python-compliance",
+        "license-crate-inventory",
+    }
     commands = _run_commands(evidence)
     assert "--base-dir" in commands and "--previous-nightly" not in commands
     assert "pip install" not in commands and "cargo " not in commands
@@ -3988,6 +4848,7 @@ def test_missing_license_evidence_blocks_even_documentation_only_full_ci(job):
     for component in COMPONENTS:
         results[component.replace("_", "-")] = "skipped"
     results["application-test-wheel"] = "skipped"
+    results["op-latency-data"] = "skipped"  # no job that reads operation tables is selected
     assert _run_full_ci_aggregate(results, plan).returncode == 0
     results[job] = "skipped"
     failed = _run_full_ci_aggregate(results, plan)
@@ -4932,320 +5793,6 @@ def test_simulation_perf_invocations(tmp_path, self_compare, fail_first, count):
         )
 
 
-_REQUEST_API = (
-    "pub struct RequestId(u64);\n\n"
-    "/// Runtime-neutral request.\n"
-    "#[derive(Debug, Clone)]\n"
-    "pub struct Request {\n"
-    "    /// Stable request identity.\n"
-    "    pub request_id: Uuid,\n"
-    "    pub tokens: Vec<u32>,\n"
-    "    pub max_output_tokens: usize,\n"
-    '    #[serde(default, skip_serializing_if = "Option::is_none")]\n'
-    "    pub output_token_ids: Option<Vec<u32>>,\n"
-    "{extra}}\n\n"
-    "pub enum Command {\n    Submit(Request),\n}\n"
-    "pub enum LifecycleEvent { SourceHeld {}, DestinationReserved {} }\n"
-)
-_PLACEMENT_API = (
-    "pub struct PlacementCacheSample {\n    pub isl_blocks: u32,\n}\n\n"
-    "pub struct Placement {\n"
-    "    pub request_id: Uuid,\n"
-    "    pub scheduler_id: usize,\n"
-    "    pub reported_overlap_tokens: usize,\n"
-    "    pub cache_sample: Option<PlacementCacheSample>,\n"
-    "    /// Placement-policy replica.\n"
-    "    pub placement_replica_id: Option<usize>,\n"
-    "{extra}}\n\n"
-    "pub trait PlacementPolicy<Request> {}\n"
-)
-_LIFECYCLE_LITERAL = (
-    "    pub(super) fn lifecycle_event(&self, event: LifecycleEvent) -> Result<SchedulerLifecycleEvent> {\n"
-    "        Ok(match event {\n"
-    "            LifecycleEvent::SourceHeld { handoff_id, request_id, transfer_timing } => todo!(),\n"
-    "            LifecycleEvent::DestinationReserved { handoff_id, request_id, transferable_prompt_tokens }"
-    " => todo!(),\n"
-    "        })\n"
-    "    }\n"
-)
-_REQUEST_LITERAL = (
-    "    pub(super) fn native_request(&self, request: DirectRequest) -> Request {\n"
-    "        let request_id = request.uuid.unwrap_or_else(Uuid::new_v4);\n"
-    "        Request {\n"
-    "            request_id,\n"
-    "            tokens: request.tokens,\n"
-    "            max_output_tokens: request.max_output_tokens,\n"
-    "            output_token_ids: request.output_token_ids,\n"
-    "        }\n"
-    "    }\n"
-) + _LIFECYCLE_LITERAL
-_PLACEMENT_LITERAL = (
-    "fn other() -> Placement {\n    todo!()\n}\n\n"
-    "    fn placement(&self, admission: WorkerAdmission) -> Placement {\n"
-    "        Placement {\n"
-    "            request_id: admission.uuid,\n"
-    "            scheduler_id: admission.worker_idx,\n"
-    "            placement_replica_id: None,\n"
-    "            reported_overlap_tokens: admission.overlap_blocks as usize\n"
-    "                * self.router.block_size as usize,\n"
-    "            cache_sample: Some(PlacementCacheSample {\n"
-    "                isl_blocks: admission.isl_blocks,\n"
-    "            }),\n"
-    "        }\n"
-    "    }\n"
-)
-_MARKER = "// Modified by AISim CI: Dynamo does not set these optional fields yet.\n"
-
-
-def _literal_fixture(tmp_path, monkeypatch, request_extra="", placement_extra="", request_literal=_REQUEST_LITERAL):
-    from scripts.performance import build_simulation_dynamo as builder
-
-    core, dynamo = tmp_path / "core", tmp_path / "dynamo"
-    sources = {}
-    sites = []
-    for site, api, extra, literal in zip(
-        builder.OPTIONAL_FIELD_LITERALS[:2],
-        (_REQUEST_API, _PLACEMENT_API),
-        (request_extra, placement_extra),
-        (request_literal, _PLACEMENT_LITERAL),
-        strict=True,
-    ):
-        (core / site.api).parent.mkdir(parents=True, exist_ok=True)
-        (core / site.api).write_text(api.replace("{extra}", extra))
-        path = dynamo / site.path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(literal)
-        sources[site.path] = literal
-        sites.append(site._replace(sha256=hashlib.sha256(literal.encode()).hexdigest()))
-    monkeypatch.setattr(builder, "OPTIONAL_FIELD_LITERALS", tuple(sites))
-    return builder, core, dynamo, sources
-
-
-@pytest.mark.parametrize(
-    ("request_extra", "placement_extra", "inserted"),
-    [
-        ("", "", {}),
-        (
-            "    /// Optional session attribution.\n"
-            '    #[serde(default, skip_serializing_if = "Option::is_none")]\n'
-            "    pub session_id: Option<String>,\n",
-            "",
-            {"Request": ["session_id"]},
-        ),
-        (
-            "    pub kv_hint: Option<KvHintSource>,\n    pub session_id: Option<String>,\n",
-            "    /// Receiving-engine hints.\n    pub kv_hints: std::option::Option<HashMap<String, Vec<u32>>>,\n",
-            {"Request": ["kv_hint", "session_id"], "Placement": ["kv_hints"]},
-        ),
-        (
-            '    /// Closes a `}` block; see "}" too.\n    pub session_id: Option<String>,\n',
-            "",
-            {"Request": ["session_id"]},
-        ),
-    ],
-)
-def test_simulation_dynamo_optional_literal_fields(tmp_path, monkeypatch, request_extra, placement_extra, inserted):
-    builder, core, dynamo, sources = _literal_fixture(tmp_path, monkeypatch, request_extra, placement_extra)
-    records = builder.patch_optional_literal_fields(core, dynamo)
-    expected = {
-        "Request": _REQUEST_LITERAL.replace(
-            "            output_token_ids: request.output_token_ids,\n        }\n",
-            "            output_token_ids: request.output_token_ids,\n"
-            + "".join(
-                f"            {line}"
-                for line in [_MARKER] + [f"{name}: None,\n" for name in inserted.get("Request", [])]
-            )
-            + "        }\n",
-        )
-        if "Request" in inserted
-        else _REQUEST_LITERAL,
-        "Placement": _PLACEMENT_LITERAL.replace(
-            "            }),\n        }\n",
-            "            }),\n"
-            + "".join(
-                f"            {line}"
-                for line in [_MARKER] + [f"{name}: None,\n" for name in inserted.get("Placement", [])]
-            )
-            + "        }\n",
-        )
-        if "Placement" in inserted
-        else _PLACEMENT_LITERAL,
-    }
-    assert records == [
-        {
-            "path": site.path,
-            "struct": site.struct,
-            "before_sha256": hashlib.sha256(sources[site.path].encode()).hexdigest(),
-            "inserted_fields": inserted.get(site.struct, []),
-            "after_sha256": hashlib.sha256(expected[site.struct].encode()).hexdigest(),
-        }
-        for site in builder.OPTIONAL_FIELD_LITERALS
-    ]
-    for site in builder.OPTIONAL_FIELD_LITERALS:
-        assert (dynamo / site.path).read_text() == expected[site.struct]
-
-
-_SESSION = "    pub session_id: Option<String>,\n"
-
-
-def test_simulation_dynamo_text_only_request_against_current_api(tmp_path, monkeypatch):
-    builder, _, dynamo, sources = _literal_fixture(tmp_path, monkeypatch)
-
-    records = builder.patch_optional_literal_fields(REPOSITORY_ROOT / "crates/core", dynamo)
-
-    request, placement = builder.OPTIONAL_FIELD_LITERALS
-    expected = sources[request.path].replace(
-        "        }\n",
-        f"            {_MARKER}"
-        "            session_id: None,\n"
-        "            cache_salt: None,\n"
-        "            kv_hint: None,\n"
-        "            // Modified by AISim CI: the pinned Dynamo request is text-only.\n"
-        "            images: {\n"
-        "                assert!(\n"
-        "                    request.images.is_empty(),\n"
-        '                    "pinned Dynamo CI adapter supports text-only requests",\n'
-        "                );\n"
-        "                Vec::new()\n"
-        "            },\n"
-        "        }\n",
-    )
-    expected = expected.replace(
-        "        Ok(match event {\n",
-        "        Ok(match event {\n"
-        "            // Modified by AISim CI: host-loop/frontend events are unsupported.\n"
-        "            LifecycleEvent::TtftMilestone { request_id, stage, at_ms } => {\n"
-        "                return Err(anyhow!(\n"
-        '                    "pinned Dynamo CI adapter does not support TTFT milestone {stage:?}'
-        ' for {request_id} at {at_ms}ms"\n'
-        "                ));\n"
-        "            }\n",
-    )
-    assert (dynamo / request.path).read_text() == expected
-    assert records[0] == {
-        "path": request.path,
-        "struct": "Request",
-        "before_sha256": request.sha256,
-        "inserted_fields": ["session_id", "cache_salt", "images", "kv_hint"],
-        "rejected_lifecycle_events": ["TtftMilestone"],
-        "after_sha256": hashlib.sha256(expected.encode()).hexdigest(),
-    }
-    expected_placement = sources[placement.path].replace(
-        "            }),\n        }\n",
-        "            }),\n" + f"            {_MARKER}" + "            kv_hints: None,\n        }\n",
-    )
-    assert (dynamo / placement.path).read_text() == expected_placement
-    assert records[1]["inserted_fields"] == ["kv_hints"]
-
-
-# Each case would otherwise insert `session_id: None`; no file may be written.
-@pytest.mark.parametrize(
-    ("request_extra", "placement_extra", "request_literal", "bad_sha", "error"),
-    [
-        (_SESSION + "    pub priority: u8,\n", "", _REQUEST_LITERAL, False, r"must set .*\['priority'\]"),
-        (
-            _SESSION + "    pub images: Vec<ImageSpec>,\n    pub priority: u8,\n",
-            "",
-            _REQUEST_LITERAL,
-            False,
-            r"must set .*\['priority'\]",
-        ),
-        (_SESSION + "    pub images: Vec<u32>,\n", "", _REQUEST_LITERAL, False, r"must set .*\['images'\]"),
-        (_SESSION + "    images: Vec<ImageSpec>,\n", "", _REQUEST_LITERAL, False, r"must set .*\['images'\]"),
-        (
-            _SESSION + "    pub(crate) images: Vec<ImageSpec>,\n",
-            "",
-            _REQUEST_LITERAL,
-            False,
-            r"must set .*\['images'\]",
-        ),
-        (_SESSION, "    pub images: Vec<ImageSpec>,\n", _REQUEST_LITERAL, False, r"must set .*\['images'\]"),
-        (_SESSION, "    pub(crate) note: Option<u8>,\n", _REQUEST_LITERAL, False, r"must set .*\['note'\]"),
-        (
-            _SESSION,
-            "",
-            _REQUEST_LITERAL.replace("            request_id,\n", "            request_id,\n            legacy: 0,\n"),
-            False,
-            r"no longer has: \['legacy'\]",
-        ),
-        (_SESSION, "", _REQUEST_LITERAL, True, "kv_router/mod.rs differs from reviewed source"),
-        (
-            _SESSION + "    pub images: Vec<ImageSpec>,\n",
-            "",
-            _REQUEST_LITERAL,
-            True,
-            "kv_router/mod.rs differs from reviewed source",
-        ),
-        (
-            _SESSION + '    #[cfg(target_os = "windows")]\n    pub hint: Option<u8>,\n',
-            "",
-            _REQUEST_LITERAL,
-            False,
-            r"conditional \(`cfg`\) fields",
-        ),
-    ],
-)
-def test_simulation_dynamo_optional_literal_fields_fail_closed(
-    tmp_path, monkeypatch, request_extra, placement_extra, request_literal, bad_sha, error
-):
-    builder, core, dynamo, sources = _literal_fixture(
-        tmp_path, monkeypatch, request_extra, placement_extra, request_literal
-    )
-    if bad_sha:
-        request, placement = builder.OPTIONAL_FIELD_LITERALS
-        monkeypatch.setattr(builder, "OPTIONAL_FIELD_LITERALS", (request, placement._replace(sha256="0" * 64)))
-    with pytest.raises(ValueError, match=error):
-        builder.patch_optional_literal_fields(core, dynamo)
-    for path, text in sources.items():
-        assert (dynamo / path).read_text() == text
-
-
-def test_simulation_dynamo_speculation_depth_patch_records_exact_change(tmp_path, monkeypatch):
-    from scripts.performance import build_simulation_dynamo as builder
-
-    dynamo = tmp_path / "dynamo"
-    path = dynamo / builder.SPECULATION_DEPTH_PATH
-    path.parent.mkdir(parents=True)
-    prefix, suffix = b"// Surrounding adapter code stays unchanged.\n", b"\n// End of adapter.\n"
-    original = prefix + builder.SPECULATION_DEPTH_OLD.encode() + suffix
-    expected = prefix + builder.SPECULATION_DEPTH_NEW.encode() + suffix
-    path.write_bytes(original)
-    monkeypatch.setattr(builder, "SPECULATION_DEPTH_SHA256", hashlib.sha256(original).hexdigest())
-
-    record = builder.patch_speculation_depth(dynamo)
-
-    assert path.read_bytes() == expected
-    assert record == {
-        "path": builder.SPECULATION_DEPTH_PATH,
-        "before_sha256": hashlib.sha256(original).hexdigest(),
-        "after_sha256": hashlib.sha256(expected).hexdigest(),
-    }
-
-
-@pytest.mark.parametrize("fault", ["hash", "missing_anchor", "duplicate_anchor"])
-def test_simulation_dynamo_speculation_depth_patch_fails_without_writing(tmp_path, monkeypatch, fault):
-    from scripts.performance import build_simulation_dynamo as builder
-
-    dynamo = tmp_path / "dynamo"
-    path = dynamo / builder.SPECULATION_DEPTH_PATH
-    path.parent.mkdir(parents=True)
-    anchor_count = {"hash": 1, "missing_anchor": 0, "duplicate_anchor": 2}[fault]
-    original = b"// Fixture adapter.\n" + builder.SPECULATION_DEPTH_OLD.encode() * anchor_count
-    path.write_bytes(original)
-    reviewed_sha = "0" * 64 if fault == "hash" else hashlib.sha256(original).hexdigest()
-    monkeypatch.setattr(builder, "SPECULATION_DEPTH_SHA256", reviewed_sha)
-
-    def unexpected_write(*args, **kwargs):
-        pytest.fail("failed compatibility validation must not write source files")
-
-    monkeypatch.setattr(Path, "write_bytes", unexpected_write)
-    monkeypatch.setattr(Path, "write_text", unexpected_write)
-    error = "reviewed source" if fault == "hash" else "anchor"
-    with pytest.raises(ValueError, match=error):
-        builder.patch_speculation_depth(dynamo)
-    assert path.read_bytes() == original
-
-
 def _write_lock(source, *versions):
     source.mkdir(parents=True, exist_ok=True)
     (source / "Cargo.lock").write_text(
@@ -5268,409 +5815,6 @@ def test_simulation_dynamo_reads_one_locked_pyo3_version(tmp_path, versions, err
         assert builder.locked_pyo3_version(tmp_path / "Cargo.lock") == versions[0]
 
 
-_PYO3_BINDINGS_MANIFEST = (
-    'pyo3 = { version = "0.23.4", default-features = false }\n'
-    'pyo3-async-runtimes = { version = "0.23.0", default-features = false }\n'
-    'pythonize = "0.23"\n'
-)
-_PYO3_LIB = (
-    "//! Fixture bindings.\nuse pyo3::IntoPyObjectExt;\n\n#[pyclass]\n#[derive(Clone)]\npub struct Endpoint {}\n"
-)
-_PYO3_USER = "use pyo3::prelude::*;\n\nfn call(o: PyObject) {\n    Python::with_gil(|py| o.bind(py).len());\n}\n"
-
-
-def _pyo3_fixture(tmp_path, monkeypatch, core_pyo3):
-    from scripts.performance import build_simulation_dynamo as builder
-
-    source, dynamo = tmp_path / "source", tmp_path / "dynamo"
-    _write_lock(source, core_pyo3)
-    bindings = dynamo / builder.PYO3_BINDINGS
-    (bindings / "rust").mkdir(parents=True)
-    files = {
-        bindings / "Cargo.toml": _PYO3_BINDINGS_MANIFEST,
-        bindings / "rust/lib.rs": _PYO3_LIB,
-        bindings / "rust/user.rs": _PYO3_USER,
-    }
-    for path, text in files.items():
-        path.write_text(text)
-    monkeypatch.setattr(builder, "PYO3_030_RENAMES", ((r"Python::with_gil\(", "Python::attach(", 1),))
-    monkeypatch.setattr(builder, "PYO3_030_PYOBJECT_FILES", ("rust/user.rs",))
-    monkeypatch.setattr(builder, "PYO3_030_BY_VALUE_CLASSES", {"rust/lib.rs": ("Endpoint",)})
-    monkeypatch.setattr(builder, "PYO3_030_EDITS", (builder.PYO3_030_EDITS[0],))
-    return builder, source, dynamo, files
-
-
-def test_simulation_dynamo_pyo3_bindings_unchanged_for_matching_core(tmp_path, monkeypatch):
-    builder, source, dynamo, files = _pyo3_fixture(tmp_path, monkeypatch, "0.23.5")
-
-    def unexpected_write(*args, **kwargs):
-        pytest.fail("a core on the bindings' pyo3 must not rewrite Dynamo")
-
-    monkeypatch.setattr(Path, "write_text", unexpected_write)
-    assert builder.patch_pyo3_bindings(source, dynamo) == {"core_pyo3": "0.23.5", "files": []}
-    assert all(path.read_text() == text for path, text in files.items())
-
-
-def test_simulation_dynamo_pyo3_bindings_move_to_core_pyo3(tmp_path, monkeypatch):
-    builder, source, dynamo, files = _pyo3_fixture(tmp_path, monkeypatch, "0.30.1")
-
-    record = builder.patch_pyo3_bindings(source, dynamo)
-
-    bindings = dynamo / builder.PYO3_BINDINGS
-    marker = "Modified by AISim CI: moved from the pyo3 0.23 API to the pyo3 0.30 API."
-    assert (bindings / "Cargo.toml").read_text() == (
-        f"# {marker}\n"
-        'pyo3 = { version = "0.30.1", default-features = false }\n'
-        'pyo3-async-runtimes = { version = "0.30.0", default-features = false }\n'
-        'pythonize = "0.30"\n'
-    )
-    lib = (bindings / "rust/lib.rs").read_text()
-    assert lib.startswith(f"//! Fixture bindings.\n// {marker}\nuse pyo3::IntoPyObjectExt;\n")
-    assert "pub(crate) type PyObject = pyo3::Py<pyo3::PyAny>;" in lib
-    assert "#[pyclass(from_py_object)]\n#[derive(Clone)]\npub struct Endpoint" in lib
-    assert (bindings / "rust/user.rs").read_text() == (
-        f"// {marker}\n"
-        "use crate::PyObject;\nuse pyo3::prelude::*;\n\nfn call(o: PyObject) {\n"
-        "    Python::attach(|py| o.bind(py).len());\n}\n"
-    )
-    assert record["core_pyo3"] == "0.30.1"
-    assert sorted(entry["path"] for entry in record["files"]) == sorted(str(path.relative_to(dynamo)) for path in files)
-    for entry in record["files"]:
-        path = dynamo / entry["path"]
-        assert entry["before_sha256"] == hashlib.sha256(files[path].encode()).hexdigest()
-        assert entry["after_sha256"] == hashlib.sha256(path.read_text().encode()).hexdigest()
-
-
-@pytest.mark.parametrize(
-    "fault", ["unsupported_core", "rename_count", "edit_anchor", "dependency", "class", "pyobject"]
-)
-def test_simulation_dynamo_pyo3_bindings_fail_without_writing(tmp_path, monkeypatch, fault):
-    builder, source, dynamo, files = _pyo3_fixture(
-        tmp_path, monkeypatch, "0.29.0" if fault == "unsupported_core" else "0.30.1"
-    )
-    bindings = dynamo / builder.PYO3_BINDINGS
-    if fault == "rename_count":
-        monkeypatch.setattr(builder, "PYO3_030_RENAMES", ((r"Python::with_gil\(", "Python::attach(", 2),))
-    elif fault == "edit_anchor":
-        (bindings / "rust/lib.rs").write_text(_PYO3_LIB.replace("IntoPyObjectExt", "IntoPyObject"))
-    elif fault == "dependency":
-        (bindings / "Cargo.toml").write_text(_PYO3_BINDINGS_MANIFEST.replace("0.23.4", "0.23.5"))
-    elif fault == "class":
-        monkeypatch.setattr(builder, "PYO3_030_BY_VALUE_CLASSES", {"rust/lib.rs": ("Context",)})
-    elif fault == "pyobject":
-        (bindings / "rust/extra.rs").write_text("use pyo3::prelude::*;\nfn f(o: PyObject) {}\n")
-    before = {path: path.read_text() for path in sorted(bindings.rglob("*")) if path.is_file()}
-
-    def unexpected_write(*args, **kwargs):
-        pytest.fail("failed bindings validation must not write source files")
-
-    monkeypatch.setattr(Path, "write_text", unexpected_write)
-    with pytest.raises(ValueError):
-        builder.patch_pyo3_bindings(source, dynamo)
-    assert {path: path.read_text() for path in sorted(bindings.rglob("*")) if path.is_file()} == before
-
-
-@pytest.mark.parametrize("field_type", [None, "u32", "usize"])
-@pytest.mark.parametrize("drift", [None, "source", "anchors", "role"])
-def test_simulation_dynamo_replay_cp_compatibility(tmp_path, monkeypatch, field_type, drift):
-    from scripts.performance import build_simulation_dynamo as builder
-
-    core, dynamo = tmp_path / "core", tmp_path / "dynamo"
-    api = core / "src/replay/engine.rs"
-    api.parent.mkdir(parents=True)
-    field = f"pub prefill_context_parallel_size: {field_type}," if field_type else ""
-    api.write_text(
-        f"pub struct ReplayEngineConfig {{{field}}}\n"
-        f"pub struct ReplayRoleConfig {{{field if drift != 'role' else 'pub prefill_context_parallel_size: bool,'}}}\n"
-    )
-    config = core / "src/engine/config.rs"
-    config.parent.mkdir(parents=True)
-    config.write_text("pub struct SglangConfig {pub schedule_policy: SglangSchedulePolicy,}")
-    adapter = dynamo / "lib/mocker/src/engine_adapter.rs"
-    adapter.parent.mkdir(parents=True)
-    source = (
-        "// synthetic adapter fixture\n    let sglang = SglangConfig {\n        schedule_policy,\n    };\n"
-    ) + "        num_gpu_blocks_is_explicit: Some(true),\n" * (3 if drift == "anchors" else 4)
-    adapter.write_text(source + ("// changed\n" if drift == "source" else ""))
-    monkeypatch.setattr(builder, "REPLAY_ADAPTER_SHA256", hashlib.sha256(source.encode()).hexdigest())
-    original = adapter.read_bytes()
-    if field_type == "usize" or drift in {"source", "role"} or (field_type and drift == "anchors"):
-        with pytest.raises(ValueError):
-            builder.patch_replay_engine_config(core, dynamo)
-        assert adapter.read_bytes() == original
-    else:
-        record = builder.patch_replay_engine_config(core, dynamo)
-        assert record["api_has_prefill_context_parallel_size"] == bool(field_type)
-        assert adapter.read_text().count("prefill_context_parallel_size: 1,") == (4 if field_type else 0)
-        assert record["after_sha256"] == hashlib.sha256(adapter.read_bytes()).hexdigest()
-        if field_type is None:
-            assert adapter.read_bytes() == original
-
-
-@pytest.mark.parametrize("encoder_type", [None, "Option<EncoderSpec>", "Option<OtherEncoder>", "EncoderSpec"])
-@pytest.mark.parametrize("drift", [None, "source", "new_field"])
-def test_simulation_dynamo_replay_specs_remain_text_only(tmp_path, monkeypatch, encoder_type, drift):
-    from scripts.performance import build_simulation_dynamo as builder
-
-    core, dynamo = tmp_path / "core", tmp_path / "dynamo"
-    api = core / "src/replay/spec.rs"
-    api.parent.mkdir(parents=True)
-    extra = f"pub encoder: {encoder_type}," if encoder_type else ""
-    if drift == "new_field":
-        extra += "pub future_control: Option<bool>,"
-    api.write_text(f"pub struct ReplaySpec {{pub version: u32, {extra}}}")
-    sites, originals = [], {}
-    for site in (site for site in builder.OPTIONAL_FIELD_LITERALS if site.struct == "ReplaySpec"):
-        source = site.anchor + ") -> Result<ReplaySpec> {\n    ReplaySpec {\n        version: 1,\n    }\n}\n"
-        path = dynamo / site.path
-        path.parent.mkdir(parents=True)
-        path.write_text(source)
-        originals[path] = source
-        sites.append(site._replace(sha256=hashlib.sha256(source.encode()).hexdigest()))
-    monkeypatch.setattr(builder, "OPTIONAL_FIELD_LITERALS", tuple(sites))
-    if drift == "source":
-        path.write_text(source + "// changed\n")
-        originals[path] = path.read_text()
-    if encoder_type not in (None, "Option<EncoderSpec>") or drift:
-        with pytest.raises(ValueError):
-            builder.patch_optional_literal_fields(core, dynamo)
-        assert all(path.read_text() == original for path, original in originals.items())
-    else:
-        records = builder.patch_optional_literal_fields(core, dynamo)
-        assert len(records) == 2
-        for record in records:
-            assert record["inserted_fields"] == (["encoder"] if encoder_type else [])
-            patched = (dynamo / record["path"]).read_text()
-            assert ("encoder: None," in patched) == bool(encoder_type)
-            assert record["after_sha256"] == hashlib.sha256(patched.encode()).hexdigest()
-
-
-_SYNTHETIC_TRACE_LITERAL = """fn build_synthetic_workload() -> anyhow::Result<RsTrace> {
-    RsTrace::synthetic(SyntheticTraceSpec {
-        block_size,
-        num_sessions: request_count,
-        turns_per_session,
-        input_tokens: LengthSpec {
-            mean: input_tokens,
-            stddev: 0.0,
-        },
-        output_tokens: LengthSpec {
-            mean: output_tokens,
-            stddev: 0.0,
-        },
-        shared_prefix_ratio,
-        cached_prefix_tokens: 0,
-        num_prefix_groups,
-        first_turn_arrivals,
-        inter_turn_delays: if inter_turn_delay_ms == 0.0 {
-            DelaySpec::None
-        } else {
-            DelaySpec::ConstantMs(inter_turn_delay_ms)
-        },
-        seed: 42,
-        arrival_seed,
-    })
-}
-"""
-
-
-@pytest.mark.parametrize(
-    "image_field",
-    [
-        "",
-        "pub images: Option<SyntheticImages>,",
-        "pub images: Option<OtherImages>,",
-        "images: Option<SyntheticImages>,",
-    ],
-)
-@pytest.mark.parametrize("drift", [None, "source", "new_field"])
-def test_simulation_dynamo_synthetic_trace_remains_text_only(tmp_path, monkeypatch, image_field, drift):
-    from scripts.performance import build_simulation_dynamo as builder
-
-    site = next(site for site in builder.OPTIONAL_FIELD_LITERALS if site.struct == "SyntheticTraceSpec")
-    core, dynamo = tmp_path / "core", tmp_path / "dynamo"
-    api = core / site.api
-    api.parent.mkdir(parents=True)
-    fields = image_field + ("pub future_control: Option<bool>," if drift == "new_field" else "")
-    api.write_text(
-        (REPOSITORY_ROOT / "crates/core" / site.api).read_text().replace("pub images: Option<SyntheticImages>,", fields)
-    )
-    path = dynamo / site.path
-    path.parent.mkdir(parents=True)
-    path.write_text(_SYNTHETIC_TRACE_LITERAL + ("// changed\n" if drift == "source" else ""))
-    original = path.read_text()
-    site = site._replace(sha256=hashlib.sha256(_SYNTHETIC_TRACE_LITERAL.encode()).hexdigest())
-    monkeypatch.setattr(builder, "OPTIONAL_FIELD_LITERALS", (site,))
-    if image_field not in ("", "pub images: Option<SyntheticImages>,") or drift:
-        with pytest.raises(ValueError, match="reviewed source|unreviewed AISim SyntheticTraceSpec"):
-            builder.patch_optional_literal_fields(core, dynamo)
-        assert path.read_text() == original
-    else:
-        [record] = builder.patch_optional_literal_fields(core, dynamo)
-        assert record["inserted_fields"] == (["images"] if image_field else [])
-        expected = (
-            original.replace(
-                "        arrival_seed,\n",
-                "        arrival_seed,\n"
-                "        // Modified by AISim CI: retain the pinned text-only replay configuration.\n"
-                "        images: None,\n",
-            )
-            if image_field
-            else original
-        )
-        assert path.read_text() == expected
-        assert record["after_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-@pytest.mark.parametrize("chat_template", [False, True])
-@pytest.mark.parametrize("client_type", [None, "WekaClient", "OtherClient"])
-def test_simulation_dynamo_weka_client_preserves_default(tmp_path, monkeypatch, client_type, chat_template):
-    from scripts.performance import build_simulation_dynamo as builder
-
-    site = next(site for site in builder.OPTIONAL_FIELD_LITERALS if site.struct == "WekaImportOptions")
-    core, dynamo = tmp_path / "core", tmp_path / "dynamo"
-    api, adapter = core / site.api, dynamo / site.path
-    api.parent.mkdir(parents=True)
-    adapter.parent.mkdir(parents=True)
-    fields = f"pub client: {client_type}," if client_type else ""
-    if chat_template:
-        fields += " pub chat_template: Option<WekaChatTemplate>,"
-    api.write_text(f"pub struct WekaImportOptions {{pub nested_timestamp_basis: WekaNestedTimestampBasis, {fields}}}")
-    source = "fn parse_weka_import_options() {\n    WekaImportOptions {\n        nested_timestamp_basis,\n    }\n}\n"
-    adapter.write_text(source)
-    monkeypatch.setattr(
-        builder, "OPTIONAL_FIELD_LITERALS", (site._replace(sha256=hashlib.sha256(source.encode()).hexdigest()),)
-    )
-    if client_type == "OtherClient":
-        with pytest.raises(ValueError, match="unreviewed AISim WekaImportOptions"):
-            builder.patch_optional_literal_fields(core, dynamo)
-        assert adapter.read_text() == source
-    else:
-        [record] = builder.patch_optional_literal_fields(core, dynamo)
-        inserted = (["client"] if client_type else []) + (["chat_template"] if chat_template else [])
-        assert record["inserted_fields"] == inserted
-        if client_type:
-            assert "client: WekaImportOptions::default().client," in adapter.read_text()
-        if chat_template:
-            assert "chat_template: None," in adapter.read_text()
-        if not inserted:
-            assert adapter.read_text() == source
-
-
-@pytest.mark.parametrize(
-    "fields",
-    [
-        "",
-        "pub host_loop: bool, pub vlm_cache_bytes: u64,",
-        "pub disaggregation_decode_enable_radix_cache: bool, pub num_reserved_decode_tokens: usize, "
-        "pub disaggregation_decode_extra_slots: Option<usize>,",
-    ],
-)
-@pytest.mark.parametrize("drift", [None, "type", "new_field"])
-def test_simulation_dynamo_sglang_config_preserves_text_defaults(tmp_path, monkeypatch, fields, drift):
-    from scripts.performance import build_simulation_dynamo as builder
-
-    core, dynamo = tmp_path / "core", tmp_path / "dynamo"
-    replay_api = core / "src/replay/engine.rs"
-    replay_api.parent.mkdir(parents=True)
-    replay_api.write_text("pub struct ReplayEngineConfig {} pub struct ReplayRoleConfig {}")
-    config = core / "src/engine/config.rs"
-    config.parent.mkdir(parents=True)
-    if drift == "type":
-        fields += "pub vlm_cache_bytes: usize,"
-    elif drift == "new_field":
-        fields += "pub future_control: Option<bool>,"
-    config.write_text(f"pub struct SglangConfig {{pub schedule_policy: SglangSchedulePolicy, {fields}}}")
-    adapter = dynamo / "lib/mocker/src/engine_adapter.rs"
-    adapter.parent.mkdir(parents=True)
-    source = "    let sglang = SglangConfig {\n        schedule_policy,\n    };\n"
-    adapter.write_text(source)
-    monkeypatch.setattr(builder, "REPLAY_ADAPTER_SHA256", hashlib.sha256(source.encode()).hexdigest())
-    if drift:
-        with pytest.raises(ValueError, match="unreviewed AISim SglangConfig"):
-            builder.patch_replay_engine_config(core, dynamo)
-        assert adapter.read_text() == source
-    else:
-        record = builder.patch_replay_engine_config(core, dynamo)
-        assert record["inserted_sglang_fields"] == re.findall(r"pub (\w+):", fields)
-        if "host_loop" in fields:
-            assert "host_loop: false," in adapter.read_text()
-            assert "vlm_cache_bytes: SglangConfig::default().vlm_cache_bytes," in adapter.read_text()
-        if "num_reserved_decode_tokens" in fields:
-            assert "disaggregation_decode_enable_radix_cache: false," in adapter.read_text()
-            assert (
-                "num_reserved_decode_tokens: SglangConfig::default().num_reserved_decode_tokens," in adapter.read_text()
-            )
-            assert "disaggregation_decode_extra_slots: None," in adapter.read_text()
-        if not fields:
-            assert adapter.read_text() == source
-        assert record["after_sha256"] == hashlib.sha256(adapter.read_bytes()).hexdigest()
-
-
-@pytest.mark.parametrize(
-    "mamba_cache", [None, "None", "Some(custom_mamba_cache)"], ids=["omitted", "explicit-none", "custom"]
-)
-def test_simulation_dynamo_sglang_adapter_against_current_api(tmp_path, monkeypatch, mamba_cache):
-    from scripts.performance import build_simulation_dynamo as builder
-
-    dynamo = tmp_path / "dynamo"
-    adapter = dynamo / "lib/mocker/src/engine_adapter.rs"
-    adapter.parent.mkdir(parents=True)
-    source = (
-        "    let sglang = SglangConfig {\n"
-        "        schedule_policy,\n"
-        "        max_prefill_tokens: 16384,\n"
-        "        chunked_prefill_size: 8192,\n"
-        "        clip_max_new_tokens: 4096,\n"
-        "        schedule_conservativeness: 1.0,\n"
-        + (f"        mamba_cache: {mamba_cache},\n" if mamba_cache is not None else "")
-        + "    };\n"
-        + "        num_gpu_blocks_is_explicit: Some(true),\n" * 4
-    )
-    adapter.write_text(source)
-    monkeypatch.setattr(builder, "REPLAY_ADAPTER_SHA256", hashlib.sha256(source.encode()).hexdigest())
-
-    record = builder.patch_replay_engine_config(REPOSITORY_ROOT / "crates/core", dynamo)
-
-    assert "disaggregation_decode_enable_radix_cache: false," in adapter.read_text()
-    assert "num_reserved_decode_tokens: SglangConfig::default().num_reserved_decode_tokens," in adapter.read_text()
-    assert "disaggregation_decode_extra_slots: None," in adapter.read_text()
-    assert "swa_prefix_tails: None," in adapter.read_text()
-    assert f"mamba_cache: {mamba_cache or 'None'}," in adapter.read_text()
-    assert adapter.read_text().count("mamba_cache:") == 1
-    assert ("mamba_cache" in record["inserted_sglang_fields"]) == (mamba_cache is None)
-    assert "scheduler_select_time_ms: SglangConfig::default().scheduler_select_time_ms," in adapter.read_text()
-    assert record["after_sha256"] == hashlib.sha256(adapter.read_bytes()).hexdigest()
-
-
-@pytest.mark.parametrize(
-    "extra",
-    [
-        "",
-        "TtftMilestone { request_id: Uuid, stage: TtftMilestone, at_ms: f64, },",
-        "TtftMilestone { request_id: Uuid, stage: TtftMilestone, at_ms: u64, },",
-        "OtherEvent { request_id: Uuid },",
-    ],
-)
-def test_simulation_dynamo_lifecycle_rejects_unsupported_host_events(extra):
-    from scripts.performance import build_simulation_dynamo as builder
-
-    api = "pub enum LifecycleEvent { SourceHeld {}, DestinationReserved {}, " + extra + "}"
-    if "u64" in extra or "OtherEvent" in extra:
-        with pytest.raises(ValueError, match="unreviewed AISim lifecycle API"):
-            builder._patch_ttft_lifecycle(_LIFECYCLE_LITERAL, api)
-    else:
-        patched, rejected = builder._patch_ttft_lifecycle(_LIFECYCLE_LITERAL, api)
-        assert rejected == (["TtftMilestone"] if extra else [])
-        if extra:
-            assert "LifecycleEvent::TtftMilestone { request_id, stage, at_ms } =>" in patched
-            assert "return Err(anyhow!(" in patched
-            assert "does not support TTFT milestone" in patched
-            assert "_ =>" not in patched
-        else:
-            assert patched == _LIFECYCLE_LITERAL
-
-
 @pytest.mark.parametrize("wrong_core", [False, True])
 @pytest.mark.parametrize("package", ["aisim-core", "aisimulate-core"])
 def test_simulation_dynamo_resolves_then_builds_locked(tmp_path, monkeypatch, wrong_core, package):
@@ -5684,64 +5828,22 @@ def test_simulation_dynamo_resolves_then_builds_locked(tmp_path, monkeypatch, wr
     bindings.mkdir(parents=True)
     output.mkdir()
     for manifest in (dynamo / "Cargo.toml", bindings / "Cargo.toml"):
-        manifest.write_text('[dependencies]\naisimulate-core = "0.13.0"\n')
+        manifest.write_text('[dependencies]\naisim-core = "0.15.0"\n')
     lock = bindings / "Cargo.lock"
     old_lock = b'[[package]]\nname = "parquet"\nversion = "55.2.0"\n'
     resolved_lock = old_lock.replace(b"55.2.0", b"59.0.0")
     lock.write_bytes(old_lock)
     built = []
-    patched = []
-    compatibility = {"api_has_state_bytes": True, "token_only_state_bytes": 0}
-    literal_compatibility = [{"struct": "Request", "inserted_fields": ["session_id"]}]
-    speculation_compatibility = {
-        "path": builder.SPECULATION_DEPTH_PATH,
-        "before_sha256": "a" * 64,
-        "after_sha256": "b" * 64,
-    }
-    pyo3_compatibility = {"core_pyo3": "0.30.1", "files": [{"path": "x.rs", "before_sha256": "c", "after_sha256": "d"}]}
-
-    def patch_handoff_timing(actual_core, actual_dynamo):
-        assert actual_core == core.parent and actual_dynamo == dynamo
-        patched.append(("handoff", actual_core, actual_dynamo))
-        return compatibility
-
-    def patch_optional_literal_fields(actual_core, actual_dynamo):
-        assert actual_core == core.parent and actual_dynamo == dynamo
-        patched.append(("literals", actual_core, actual_dynamo))
-        return literal_compatibility
-
-    def patch_speculation_depth(actual_dynamo):
-        assert actual_dynamo == dynamo
-        patched.append(("speculation", actual_dynamo))
-        return speculation_compatibility
-
-    def patch_replay_engine_config(actual_core, actual_dynamo):
-        assert actual_core == core.parent and actual_dynamo == dynamo
-        patched.append(("replay", actual_core, actual_dynamo))
-        return {"prefill_context_parallel_size": 1}
-
-    def patch_pyo3_bindings(actual_source, actual_dynamo):
-        assert actual_source == source and actual_dynamo == dynamo
-        patched.append(("pyo3", actual_source, actual_dynamo))
-        return pyo3_compatibility
 
     def check_output(args, **kwargs):
         if args[:2] == ["cargo", "metadata"]:
-            assert patched == [
-                ("handoff", core.parent, dynamo),
-                ("literals", core.parent, dynamo),
-                ("speculation", dynamo),
-                ("replay", core.parent, dynamo),
-                ("pyo3", source, dynamo),
-            ]
             assert "--locked" not in args
             assert kwargs["cwd"] == bindings
             assert lock.read_bytes() == old_lock
             for manifest in (dynamo / "Cargo.toml", bindings / "Cargo.toml"):
-                assert tomllib.loads(manifest.read_text())["dependencies"]["aisimulate-core"]["package"] == package
-                assert tomllib.loads(manifest.read_text())["dependencies"]["aisimulate-core"]["path"] == str(
-                    core.parent
-                )
+                dependency = tomllib.loads(manifest.read_text())["dependencies"]["aisim-core"]
+                assert dependency["package"] == package
+                assert dependency["path"] == str(core.parent)
             lock.write_bytes(resolved_lock)
             return json.dumps(
                 {"packages": [{"name": package, "manifest_path": str(core) + (".wrong" if wrong_core else "")}]}
@@ -5766,11 +5868,6 @@ def test_simulation_dynamo_resolves_then_builds_locked(tmp_path, monkeypatch, wr
 
     monkeypatch.setattr(builder.subprocess, "check_output", check_output)
     monkeypatch.setattr(builder.subprocess, "run", run)
-    monkeypatch.setattr(builder, "patch_handoff_timing", patch_handoff_timing)
-    monkeypatch.setattr(builder, "patch_optional_literal_fields", patch_optional_literal_fields)
-    monkeypatch.setattr(builder, "patch_speculation_depth", patch_speculation_depth)
-    monkeypatch.setattr(builder, "patch_replay_engine_config", patch_replay_engine_config)
-    monkeypatch.setattr(builder, "patch_pyo3_bindings", patch_pyo3_bindings)
     if wrong_core:
         with pytest.raises(ValueError, match="different AISim core"):
             builder.build(source, dynamo, output)
@@ -5781,12 +5878,11 @@ def test_simulation_dynamo_resolves_then_builds_locked(tmp_path, monkeypatch, wr
         assert len(built) == 2
         assert (output / "dynamo-Cargo.lock").read_bytes() == resolved_lock
         provenance = json.loads((output / "dynamo-build.json").read_text())
-        assert provenance["aisimulate_sha"] == "a" * 40
-        assert provenance["handoff_compatibility"] == compatibility
-        assert provenance["literal_compatibility"] == literal_compatibility
-        assert provenance["speculation_compatibility"] == speculation_compatibility
-        assert provenance["replay_compatibility"] == {"prefill_context_parallel_size": 1}
-        assert provenance["pyo3_compatibility"] == pyo3_compatibility
+        assert provenance == {
+            "source_sha": builder.DYNAMO_REVISION,
+            "aisimulate_sha": "a" * 40,
+            "features": ["ais-forward-pass"],
+        }
         assert (output / "dynamo-build.patch").read_bytes() == b"dependency patch\n"
 
 
@@ -6011,3 +6107,32 @@ def test_release_output_checks_embedded_identity_and_scripts(tmp_path, monkeypat
     else:
         with pytest.raises(AssertionError):
             release_artifacts.verify_output(output, version, version)
+
+
+def test_performance_jobs_fetch_each_revisions_pinned_data_before_benchmarking():
+    """The gates run offline or under a worker timeout, so every installed revision fetches its own pin first."""
+    prefetch = '/bin/python" scripts/performance/prefetch_op_latency.py'
+    simulation = _workflow("simulation-performance.yml")["jobs"]
+    for job, consumers, count in (
+        (simulation["build"], "check_dynamo_callback.py source dynamo", 1),
+        (simulation["compare"], "simulation_perf_gate/run.py", 1),  # one loop over both environments
+        (_workflow("performance.yml")["jobs"]["compare"], "forward_perf_gate/run.py", 2),
+    ):
+        commands = _run_commands(job)
+        assert commands.count(prefetch) == count
+        assert commands.rindex(prefetch) < commands.index(consumers)
+
+
+def test_standalone_composition_steps_install_the_download_transport():
+    """compose_systems_root.py needs the Hugging Face transport, and these steps never install AISim itself."""
+    documents = [yaml.safe_load(path.read_text()) for path in sorted(WORKFLOW_ROOT.glob("*.yml"))]
+    documents += [yaml.safe_load(path.read_text()) for path in sorted(ACTION_ROOT.glob("*/action.yml"))]
+    steps = [
+        step for document in documents for job in (document.get("jobs") or {}).values() for step in job.get("steps", [])
+    ]
+    steps += [step for document in documents for step in (document.get("runs") or {}).get("steps", [])]
+    composing = [step["run"] for step in steps if "compose_systems_root.py" in step.get("run", "")]
+    assert composing
+    for run in composing:
+        before = run.split("compose_systems_root.py")[0]
+        assert re.search(r"pip install[^\n]*\bhuggingface_hub\b", before), run

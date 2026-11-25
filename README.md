@@ -73,6 +73,60 @@ python3 -m pip install aisim
 aisim --help
 ```
 
+### Operation data is downloaded, not packaged
+
+> **Breaking change in AISim 0.15.0.** The `aisim` wheel no longer contains
+> operation-latency tables (earlier releases still do). AISim now downloads them on
+> first use from the
+> [`ai-dynamo/aisim-data`](https://huggingface.co/datasets/ai-dynamo/aisim-data)
+> Hugging Face dataset at the commit pinned in the release, hash-verifies them, and
+> caches them for later runs. Code that read `aisim_core/systems/data` inside the
+> installed package must use `--systems-paths`, `AICONFIGURATOR_SYSTEMS_PATH` or a
+> composed root instead.
+
+The first prediction downloads about 235 MB and needs network access; later runs
+reuse the cache. Use a [Hugging Face token](#hugging-face-token) to avoid rate
+limits. Choose when the data arrives:
+
+| Command | Effect |
+|---|---|
+| `aisim init` | In a terminal, ask whether to download now or on demand. Scripts and CI have no terminal and must pass one of the flags below. |
+| `aisim init --all` | Download the whole operation-latency database now, without asking. |
+| `aisim init --hardware h200_sxm` | Download one hardware platform now. |
+| `aisim data fetch --dry-run` | Show what would be downloaded, without downloading. |
+| `aisim data status` | Show the pin, cache path and size, saved choice and cached files. |
+| `aisim data clear` | Remove the cache and the saved choice. |
+
+For an offline or air-gapped host, prefetch once while connected, copy the cache
+directory, then run with `AISIM_DATA_OFFLINE=1 AISIM_DATA_CACHE=<copy>`. Roots you
+supply with `--systems-paths` or `AICONFIGURATOR_SYSTEMS_PATH` never download
+anything. The [CLI reference](docs/reference/cli.md#default-operation-data) lists
+every setting, and [Choose how data arrives](docs/reference/cli.md#init-status-clear)
+covers `init`, `status` and `clear`.
+
+### Hugging Face token
+
+AISim downloads from Hugging Face in two places, and a token helps in both:
+
+| Download | Why a token helps |
+|---|---|
+| Operation data and other datasets from `ai-dynamo/aisim-data` | Anonymous downloads are rate limited (HTTP 429). A first download without a token can stall for minutes. |
+| `config.json` (and quantization JSON) of a model AISim does not bundle | AISim fetches it from huggingface.co on first use. A gated model needs a token with access, and anonymous requests can be rate limited. |
+
+AISim uses the first token it finds and falls back to anonymous requests when there
+is none:
+
+1. the `HF_TOKEN` environment variable;
+2. the `HUGGING_FACE_HUB_TOKEN` environment variable;
+3. the login saved by `hf auth login` or by `aisim init` (`~/.cache/huggingface/token`,
+   or `$HF_HOME/token`).
+
+`HF_HUB_DISABLE_IMPLICIT_TOKEN=1` turns this off. Create a free read-only token at
+[huggingface.co/settings/tokens](https://huggingface.co/settings/tokens), then export
+`HF_TOKEN` or run `aisim init` in a terminal, which asks for the token with hidden
+input and saves it through Hugging Face's own login. AISim never writes the token to
+its own config, logs or output.
+
 ### Migrate an existing AISim environment
 
 `aisim` and `aisimulate` are different distribution names but install the same
@@ -378,6 +432,10 @@ APIs:
 
 Open-source whole-forward FPM datasets are hosted on
 [Hugging Face](https://huggingface.co/datasets/ai-dynamo/aisim-data).
+Download the files for one model and hardware platform with
+`aisim data fetch --category fpm --model MiniMaxAI/MiniMax-M2.7 --hardware h200_sxm`;
+add `--dry-run` to preview the download. FPM data is opt-in: it is never part of the
+default download and needs `--model` (or `--configuration`).
 FPM prediction requires a Parquet dataset and its adjacent, same-stem
 `.metadata.json` sidecar. See the
 [core API guide](docs/perf-model/methods/whole-forward.md#external-whole-forward-fpm-data) for

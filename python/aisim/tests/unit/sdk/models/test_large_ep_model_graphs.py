@@ -52,7 +52,8 @@ from aisim_core.sdk.models import attention_op_keys, get_model
 pytestmark = pytest.mark.unit
 
 DSR1 = "deepseek-ai/DeepSeek-R1"
-DSV32 = "deepseek-ai/DeepSeek-V3.2-Exp"
+# Use the bundled release config; the experimental HF ID requires a live download.
+DSV32 = "deepseek-ai/DeepSeek-V3.2"
 KIMIK25 = "nvidia/Kimi-K2.5-NVFP4"
 QWEN3 = "Qwen/Qwen3-235B-A22B"
 

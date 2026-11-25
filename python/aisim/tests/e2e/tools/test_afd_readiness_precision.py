@@ -210,15 +210,19 @@ def test_pool_precision_matches_memory_and_preserves_request(system, expected, m
 @pytest.mark.parametrize("missing_pool", ["A", "F"])
 @pytest.mark.parametrize("missing_kind", ["table", "bucket"])
 def test_missing_communication_rejects_before_memory_or_execution(tmp_path, monkeypatch, missing_pool, missing_kind):
+    from aisim_core.data.default_systems import default_systems_path
+
+    # Operation tables are not packaged: take them from the root composed from the pinned dataset.
+    data_root = Path(default_systems_path())
     missing_system = "h200_sxm" if missing_pool == "A" else "b200_sxm"
     for source in SYSTEMS.iterdir():
         if source.is_file():
             (tmp_path / source.name).symlink_to(source)
     for system in ("h200_sxm", "b200_sxm"):
-        for source in (SYSTEMS / "data" / system).rglob("*"):
+        for source in (data_root / "data" / system).rglob("*"):
             if not source.is_file():
                 continue
-            target = tmp_path / source.relative_to(SYSTEMS)
+            target = tmp_path / source.relative_to(data_root)
             target.parent.mkdir(parents=True, exist_ok=True)
             if system == missing_system and source.name in {"nccl_perf.parquet", "oneccl_perf.parquet"}:
                 if missing_kind == "bucket" and source.name == "nccl_perf.parquet":

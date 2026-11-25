@@ -391,6 +391,10 @@ class EngineReplayRunner:
             if "spec" not in execution_spec:
                 execution_spec = {"spec": execution_spec}
             execution_spec["tokenization"] = dict(spec.backend_deployment.tokenization)
+        if spec.backend_deployment.extra_cpu_overhead is not None:
+            if "spec" not in execution_spec:
+                execution_spec = {"spec": execution_spec}
+            execution_spec["extra_cpu_overhead"] = dict(spec.backend_deployment.extra_cpu_overhead)
         if spec.backend_deployment.detokenization is not None:
             if "spec" not in execution_spec:
                 execution_spec = {"spec": execution_spec}
@@ -963,14 +967,7 @@ def _materialize_engine_execution_spec(
         "requests": requests,
     }
     if use_workload_driver:
-        traffic = {
-            key: value for key, value in spec.workload.items() if key in _RUNTIME_TRAFFIC_FIELDS and value is not None
-        }
-        images = spec.workload.get("images")
-        if images is not None and spec.backend_deployment.encoder is None:
-            traffic.update(_image_traffic_fields(spec.backend_deployment, images))
-        if traffic.get("trace_format") not in {"dynamo", "weka"}:
-            traffic.setdefault("trace_block_size", trace_block_size)
+        traffic = materialize_runtime_traffic(spec, trace_block_size=trace_block_size)
         trace_format = traffic.get("trace_format")
         if trace_format in {"agentic_mooncake", "dynamo", "weka"}:
             requires_agentic_model = trace_format != "dynamo" or traffic.get("agentic_lanes") is not None
@@ -999,6 +996,29 @@ def _materialize_engine_execution_spec(
                 traffic["execution_model"] = execution_model
         return {"spec": execution_spec, "traffic": traffic}
     return execution_spec
+
+
+def materialize_runtime_traffic(spec: ReplaySpec, *, trace_block_size: int) -> dict[str, JSONValue]:
+    """Build the traffic payload the native workload builder deserializes.
+
+    The payload has no ``execution_model``, which agentic input requires. A
+    synthetic concurrency load without its own ``concurrency`` takes
+    ``spec.concurrency``, so the builder makes the closed-loop workload the spec
+    asks for. Rate-driven loads stay open-loop.
+    """
+
+    traffic = {
+        key: value for key, value in spec.workload.items() if key in _RUNTIME_TRAFFIC_FIELDS and value is not None
+    }
+    images = spec.workload.get("images")
+    if images is not None and spec.backend_deployment.encoder is None:
+        traffic.update(_image_traffic_fields(spec.backend_deployment, images))
+    if traffic.get("trace_format") not in {"dynamo", "weka"}:
+        traffic.setdefault("trace_block_size", trace_block_size)
+    closed_loop = traffic.get("source_type") != "trace" and traffic.get("load_type", "concurrency") == "concurrency"
+    if closed_loop and spec.concurrency is not None:
+        traffic.setdefault("concurrency", _positive_int(spec.concurrency, "concurrency"))
+    return traffic
 
 
 def _vision_role_args(deployment: BackendDeploymentSpec) -> Mapping[str, JSONValue] | None:

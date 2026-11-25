@@ -270,10 +270,10 @@ jobs:
       - name: Run Rust unit tests (cargo test)
         # The crate's own oracle/unit tests were previously NOT in any gate,
         # which let "match Python" pins go stale silently (e.g. the b200
-        # mem_bw test survived a YAML correction unnoticed). The py:: binding
-        # tests self-initialize the interpreter (prepare_freethreaded_python),
-        # so plain `cargo test --lib` covers them; PYO3_PYTHON pins the venv
-        # interpreter for linking.
+        # mem_bw test survived a YAML correction unnoticed). This command
+        # builds without the `python` feature, so it does not compile the
+        # py:: binding tests (`perfmodel::py` and `mod python` need that
+        # feature). PYO3_PYTHON has an effect only when that feature is on.
         env:
           PYO3_PYTHON: ${{ github.workspace }}/.venv/bin/python
         run: cargo test --release --lib
