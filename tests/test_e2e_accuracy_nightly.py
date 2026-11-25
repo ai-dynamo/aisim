@@ -1338,6 +1338,60 @@ def test_predictor_layout_rejects_multiple_baseline_apis(adapters):
         campaign.predictor_module_names(files)
 
 
+@pytest.mark.parametrize("systems_root", [None, "", "composed"])
+def test_point_mode_applies_systems_root_before_prediction(tmp_path, monkeypatch, systems_root):
+    pytest.importorskip("aisim_core.sdk.perf_database")
+    original_root = tmp_path / "original"
+    original_root.mkdir()
+    composed_root = tmp_path / "composed"
+    composed_root.mkdir()
+    if systems_root is None:
+        monkeypatch.delenv("AISIM_E2E_SYSTEMS_ROOT", raising=False)
+    else:
+        monkeypatch.setenv("AISIM_E2E_SYSTEMS_ROOT", str(composed_root) if systems_root else "")
+
+    # Point mode redirects native stdout/stderr descriptors. Isolate that in a
+    # child process while exercising the installed database's real path setter.
+    program = """
+import os
+import sys
+from aisim_core.sdk import perf_database
+from scripts.e2e_accuracy import run_e2e_accuracy as campaign
+
+original_root = sys.argv[1]
+systems_root = os.environ.get("AISIM_E2E_SYSTEMS_ROOT")
+perf_database.set_systems_paths([original_root])
+set_paths = perf_database.set_systems_paths
+calls = []
+
+def record_paths(paths):
+    calls.append(paths)
+    set_paths(paths)
+
+def predict(point):
+    assert point == {"id": "test-point"}
+    assert calls == ([[systems_root]] if systems_root else [])
+    assert perf_database.get_systems_paths() == [systems_root or original_root]
+    print("private predictor diagnostics")
+    return {"id": point["id"], "outcome": "success"}
+
+perf_database.set_systems_paths = record_paths
+campaign.predict_point = predict
+sys.argv = ["run_e2e_accuracy.py", "point"]
+campaign.main()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", program, str(original_root)],
+        cwd=ROOT,
+        input=json.dumps({"id": "test-point"}),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout == campaign.encoded({"id": "test-point", "outcome": "success"}).decode()
+    assert result.stderr == ""
+
+
 @pytest.mark.parametrize(
     "api,adapter_name",
     [
