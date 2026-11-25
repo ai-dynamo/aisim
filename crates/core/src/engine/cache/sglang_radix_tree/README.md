@@ -92,10 +92,13 @@ following local corrections to this pinned revision:
 - Validate SWA eviction-boundary alignment before inserting Full KV or events.
 - Reject host insertions with a page-hash count that differs from the key's
   page count before touching recency, splitting edges, or attaching host rows.
-- Reject unaligned host keys, empty page hashes, and host buffers too short for
-  the key before any mutation. Preserve imported parent hashes as chain seeds.
-- Preflight Full and SWA backup spans before any component adopts host rows.
-  Reject plans invalidated by an edge split; the caller releases rejected staged
+- Reject unaligned host keys, page hashes other than 64 ASCII hex characters,
+  and host buffers too short for the key before any mutation. Preserve imported
+  parent hashes as chain seeds.
+- Preflight Full, SWA, and Mamba backup spans before any component adopts host
+  rows. Reject occupied Full host slots, Mamba transfers with other than one
+  checkpoint row, and plans invalidated by an edge split. Empty Full transfers
+  still permit auxiliary-only backups. The caller releases rejected staged
   pool allocations and rebuilds the spec before retrying.
 - Bind Mamba load-back's first tree transfer to the restore anchor, preserving
   subsequent request-owned copies without treating them as tree destinations.
@@ -165,8 +168,10 @@ Verify an existing copy with:
 python3 scripts/sync_sglang_radix_core.py --source-checkout /path/to/sglang --check
 ```
 
-For a deliberate version update, update the script's revision, regenerate without
-`--check`, and update this revision and both canonical notice copies together.
+For a deliberate version update, update the script's `REVISION` and the SGLang
+checkout `ref` in `.github/workflows/fast-ci.yml` to the same immutable commit.
+Regenerate without `--check`, and update this revision and both canonical notice
+copies together.
 Reconcile the local patch against the new revision; remove corrections once
 they are included upstream. After updating either notice copy, run:
 

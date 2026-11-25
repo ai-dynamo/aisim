@@ -38,6 +38,255 @@ fn complete_backup(tree: &mut Core, leaf: NodeId) {
     tree.finish_write_through(nodes, leaf).unwrap();
 }
 
+fn commit_staged_backup(
+    tree: &mut Core,
+    leaf: NodeId,
+    full_rows: Vec<u32>,
+    mut auxiliary: HashMap<ComponentType, Vec<PoolTransfer<PageValue<u32>>>>,
+    generic_entrypoint: bool,
+) -> Result<(), TreeCoreRuntimeError> {
+    if generic_entrypoint {
+        if !full_rows.is_empty() {
+            auxiliary.insert(
+                FULL,
+                vec![PoolTransfer {
+                    host_indices: Some(PageValue::from_vec(full_rows)),
+                    ..Default::default()
+                }],
+            );
+        }
+        tree.commit_hicache_transfers(
+            leaf,
+            CacheTransferPhase::BackupHost,
+            auxiliary,
+            &mut Vec::new(),
+            None,
+            None,
+        )
+    } else {
+        tree.commit_backup(leaf, PageValue::from_vec(full_rows), auxiliary)
+    }
+}
+
+#[test]
+fn scoped_review_full_backup_rejects_an_occupied_host_slot_before_auxiliary_adoption() {
+    for generic_entrypoint in [false, true] {
+        let mut tree = Core::new(
+            CacheInitParams {
+                enable_hicache: true,
+                enable_kv_cache_events: true,
+                mamba_cache_chunk_size: Some(1),
+                ..Default::default()
+            },
+            vec![FULL, MAMBA],
+        );
+        let key = vec![10, 20];
+        let mut p = params(&key, &[1, 2]);
+        p.mamba_value = Some(PageValue::from_vec(vec![11]));
+        let leaf = tree.insert(&p).last_device_node_id.unwrap();
+        let (first, _) = tree.build_backup_spec(leaf).unwrap();
+        let (second, mut auxiliary) = tree.build_backup_spec(leaf).unwrap();
+        assert_eq!(first.as_slice(), second.as_slice());
+        auxiliary.get_mut(&MAMBA).unwrap()[0].host_indices = Some(PageValue::from_vec(vec![201]));
+        tree.commit_backup(leaf, PageValue::from_vec(vec![101, 102]), HashMap::new())
+            .unwrap();
+        tree.take_events();
+        let nodes = tree.inspect_get_all_node_ids();
+        let sizes = (
+            tree.total_size(),
+            tree.evictable_size(),
+            tree.protected_size(),
+        );
+
+        assert!(matches!(
+            commit_staged_backup(
+                &mut tree,
+                leaf,
+                vec![301, 302],
+                auxiliary,
+                generic_entrypoint,
+            ),
+            Err(TreeCoreRuntimeError::InvalidBackupSpec {
+                component_type: FULL,
+                ..
+            })
+        ));
+        let node = tree.arena.node(tree.arena.resolve(leaf).unwrap());
+        assert_eq!(node.host_value(FULL).as_slice(), &[101, 102]);
+        assert!(!node.has_host_value(MAMBA));
+        assert_eq!(tree.inspect_get_all_node_ids(), nodes);
+        assert_eq!(
+            (
+                tree.total_size(),
+                tree.evictable_size(),
+                tree.protected_size()
+            ),
+            sizes
+        );
+        assert!(tree.take_events().is_empty());
+
+        // Replanning skips Full while allowing the auxiliary-only backup.
+        let (full, mut auxiliary) = tree.build_backup_spec(leaf).unwrap();
+        assert!(full.is_empty());
+        auxiliary.get_mut(&MAMBA).unwrap()[0].host_indices = Some(PageValue::from_vec(vec![401]));
+        commit_staged_backup(&mut tree, leaf, vec![], auxiliary, generic_entrypoint).unwrap();
+        let node = tree.arena.node(tree.arena.resolve(leaf).unwrap());
+        assert_eq!(node.host_value(FULL).as_slice(), &[101, 102]);
+        assert_eq!(node.host_value(MAMBA).as_slice(), &[401]);
+        let pending = tree.mark_write_through_pending(vec![leaf], leaf).unwrap();
+        tree.finish_write_through(pending, leaf).unwrap();
+        tree.try_sanity_check(&[], &[]).unwrap();
+    }
+}
+
+#[test]
+fn scoped_review_mamba_backup_validates_slot_count_before_adopting_full_rows() {
+    for generic_entrypoint in [false, true] {
+        for row_count in [0, 1, 2] {
+            let mut tree = Core::new(
+                CacheInitParams {
+                    enable_hicache: true,
+                    enable_kv_cache_events: true,
+                    mamba_cache_chunk_size: Some(1),
+                    ..Default::default()
+                },
+                vec![FULL, MAMBA],
+            );
+            let key = vec![10, 20];
+            let mut p = params(&key, &[1, 2]);
+            p.mamba_value = Some(PageValue::from_vec(vec![11]));
+            let leaf = tree.insert(&p).last_device_node_id.unwrap();
+            let (_, mut auxiliary) = tree.build_backup_spec(leaf).unwrap();
+            auxiliary.get_mut(&MAMBA).unwrap()[0].host_indices =
+                Some(PageValue::from_vec(vec![201; row_count]));
+            tree.take_events();
+            let nodes = tree.inspect_get_all_node_ids();
+            let sizes = (
+                tree.total_size(),
+                tree.evictable_size(),
+                tree.protected_size(),
+            );
+            let result = commit_staged_backup(
+                &mut tree,
+                leaf,
+                vec![101, 102],
+                auxiliary,
+                generic_entrypoint,
+            );
+            if row_count != 1 {
+                assert!(matches!(
+                    result,
+                    Err(TreeCoreRuntimeError::InvalidBackupSpec {
+                        component_type: MAMBA,
+                        ..
+                    })
+                ));
+                let node = tree.arena.node(tree.arena.resolve(leaf).unwrap());
+                assert!(!node.has_host_value(FULL));
+                assert!(!node.has_host_value(MAMBA));
+                assert_eq!(tree.inspect_get_all_node_ids(), nodes);
+                assert_eq!(
+                    (
+                        tree.total_size(),
+                        tree.evictable_size(),
+                        tree.protected_size()
+                    ),
+                    sizes
+                );
+                assert!(tree.take_events().is_empty());
+                backup_components(&mut tree, leaf, MAMBA);
+            } else {
+                result.unwrap();
+                let pending = tree.mark_write_through_pending(vec![leaf], leaf).unwrap();
+                tree.finish_write_through(pending, leaf).unwrap();
+            }
+            let node = tree.arena.node(tree.arena.resolve(leaf).unwrap());
+            assert_eq!(node.host_value(FULL).as_slice(), &[101, 102]);
+            assert_eq!(node.host_value(MAMBA).as_slice(), &[201]);
+            tree.try_sanity_check(&[], &[]).unwrap();
+        }
+    }
+}
+
+#[test]
+fn scoped_review_host_digest_validation_precedes_mutation_and_events() {
+    for events in [false, true] {
+        for namespace in [
+            KeyNamespaceRef::default(),
+            KeyNamespaceRef::new(Some("tenant"), Some("salt")),
+        ] {
+            for digest in [
+                "abc".into(),
+                "a".repeat(63),
+                "a".repeat(65),
+                "g".repeat(64),
+                "é".repeat(32),
+            ] {
+                let mut tree = Core::new(
+                    CacheInitParams {
+                        enable_hicache: true,
+                        enable_kv_cache_events: events,
+                        ..Default::default()
+                    },
+                    vec![FULL],
+                );
+                let root = tree.root_node_handle(None);
+                let nodes = tree.inspect_get_all_node_ids();
+                let tick = tree.inspect_get_node_access_counter(root).unwrap();
+                let result = tree.insert_host_in_namespace(
+                    root,
+                    namespace,
+                    vec![10],
+                    PageValue::from_vec(vec![101]),
+                    vec![digest],
+                );
+                assert!(matches!(
+                    result,
+                    Err(TreeCoreRuntimeError::InsertHostInvalidHash { page_index: 0 })
+                ));
+                assert_eq!(tree.inspect_get_all_node_ids(), nodes);
+                assert_eq!(tree.inspect_get_node_access_counter(root).unwrap(), tick);
+                assert!(tree.take_events().is_empty());
+
+                // Mixed-case ASCII hex remains a valid event hash and chain seed.
+                let digest = "aBcD".repeat(16);
+                let leaf = tree
+                    .insert_host_in_namespace(
+                        root,
+                        namespace,
+                        vec![10],
+                        PageValue::from_vec(vec![201]),
+                        vec![digest.clone()],
+                    )
+                    .unwrap()
+                    .inserted_host_node
+                    .unwrap();
+                let idx = tree.arena.resolve(leaf).unwrap();
+                assert_eq!(tree.arena.node(idx).host_value(FULL).as_slice(), &[201]);
+                assert_eq!(tree.get_hash_values(leaf).unwrap(), vec![digest.clone()]);
+                assert_eq!(!tree.take_events().is_empty(), events);
+                let child = tree
+                    .insert_host_in_namespace(
+                        leaf,
+                        namespace,
+                        vec![20],
+                        PageValue::from_vec(vec![202]),
+                        vec!["11".repeat(32)],
+                    )
+                    .unwrap()
+                    .inserted_host_node
+                    .unwrap();
+                let idx = tree.arena.resolve(child).unwrap();
+                assert_eq!(
+                    tree.arena.compute_node_hash_values(idx, 1),
+                    super::node::get_hash_str::<Vec<i64>>(&vec![20], Some(&digest), 1),
+                );
+                tree.try_sanity_check(&[], &[]).unwrap();
+            }
+        }
+    }
+}
+
 #[test]
 fn scoped_review_full_backup_rejects_a_split_before_any_component_commits() {
     for generic_entrypoint in [false, true] {

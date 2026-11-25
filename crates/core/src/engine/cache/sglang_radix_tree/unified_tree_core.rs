@@ -4013,8 +4013,13 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 page_count,
             });
         }
-        if let Some(page_index) = hash_value.iter().position(String::is_empty) {
-            return Err(TreeCoreRuntimeError::InsertHostEmptyHash { page_index });
+        for (page_index, hash) in hash_value.iter().enumerate() {
+            if hash.is_empty() {
+                return Err(TreeCoreRuntimeError::InsertHostEmptyHash { page_index });
+            }
+            if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(TreeCoreRuntimeError::InsertHostInvalidHash { page_index });
+            }
         }
         if host_value.len() < total_len {
             return Err(TreeCoreRuntimeError::InsertHostValueTooShort {
@@ -4643,7 +4648,12 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 continue;
             };
             if component_type == FULL {
-                if host_indices.len() != self.arena.node(node_id).key.atom_len() {
+                let node = self.arena.node(node_id);
+                if node.has_host_value(FULL) || host_indices.len() != node.key.atom_len() {
+                    return Err(invalid());
+                }
+            } else if component_type == MAMBA {
+                if host_indices.len() != 1 {
                     return Err(invalid());
                 }
             } else if component_type == SWA {
@@ -4682,7 +4692,9 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     ) -> Result<(), TreeCoreRuntimeError> {
         let node_id = self.arena.resolve(node_id)?;
         self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
-        if !host_indices.is_empty() && host_indices.len() != self.arena.node(node_id).key.atom_len()
+        let node = self.arena.node(node_id);
+        if !host_indices.is_empty()
+            && (node.has_host_value(FULL) || host_indices.len() != node.key.atom_len())
         {
             return Err(TreeCoreRuntimeError::InvalidBackupSpec {
                 node_id: self.arena.node(node_id).id,

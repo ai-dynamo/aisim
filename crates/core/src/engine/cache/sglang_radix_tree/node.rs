@@ -820,6 +820,9 @@ pub enum TreeCoreRuntimeError {
     /// An empty digest cannot seed the next page's storage hash chain.
     #[error("host insert page hash at index {page_index} is empty")]
     InsertHostEmptyHash { page_index: usize },
+    /// Storage hashes must be complete SHA-256 digests before they enter the tree.
+    #[error("host insert page hash at index {page_index} must be exactly 64 ASCII hex characters")]
+    InsertHostInvalidHash { page_index: usize },
     #[error("host insert key length {key_len} is not aligned to page size {page_size}")]
     InsertHostKeyNotPageAligned { key_len: usize, page_size: usize },
     #[error("host insert has {value_len} host rows, expected at least {required_len}")]

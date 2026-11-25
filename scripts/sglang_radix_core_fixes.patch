@@ -374,7 +374,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
      /// An arena slot beyond the arena's bounds — never allocated. `size` is the
      /// arena's current slot count, so valid ids are `0..size`.
      #[error("node access out of bounds: id {id} not in [0, {size})")]
-@@ -782,11 +811,30 @@
+@@ -782,11 +811,33 @@
      /// A host insert below a non-root anchor must remain in that anchor's namespace.
      #[error("insert_host namespace does not match non-root anchor {node_id}")]
      InsertHostNamespaceMismatch { node_id: NodeId },
@@ -387,6 +387,9 @@ and its LICENSE for provenance, the preserved license, and each local correction
 +    /// An empty digest cannot seed the next page's storage hash chain.
 +    #[error("host insert page hash at index {page_index} is empty")]
 +    InsertHostEmptyHash { page_index: usize },
++    /// Storage hashes must be complete SHA-256 digests before they enter the tree.
++    #[error("host insert page hash at index {page_index} must be exactly 64 ASCII hex characters")]
++    InsertHostInvalidHash { page_index: usize },
 +    #[error("host insert key length {key_len} is not aligned to page size {page_size}")]
 +    InsertHostKeyNotPageAligned { key_len: usize, page_size: usize },
 +    #[error("host insert has {value_len} host rows, expected at least {required_len}")]
@@ -405,7 +408,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
      /// The retained prefix cannot extend beyond the aligned input key.
      #[error(
          "insert continuation prefix length {prefix_len} exceeds aligned key length {aligned_key_len}"
-@@ -804,6 +852,9 @@
+@@ -804,6 +855,9 @@
          node_prefix_len: usize,
          prefix_len: usize,
      },
@@ -415,7 +418,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
      /// A non-root continuation stays inside the anchor's namespace.
      #[error("insert continuation namespace does not match non-root anchor {node_id}")]
      InsertContinuationNamespaceMismatch { node_id: NodeId },
-@@ -817,6 +868,9 @@
+@@ -817,6 +871,9 @@
          value_len: usize,
          required_len: usize,
      },
@@ -1149,7 +1152,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              return false;
          }
          if node.is_load_back_pending() {
-@@ -3834,6 +4000,28 @@
+@@ -3834,6 +4000,33 @@
          if !anchor.is_root() && anchor.namespace.as_ref() != namespace {
              return Err(TreeCoreRuntimeError::InsertHostNamespaceMismatch { node_id: anchor.id });
          }
@@ -1166,8 +1169,13 @@ and its LICENSE for provenance, the preserved license, and each local correction
 +                page_count,
 +            });
 +        }
-+        if let Some(page_index) = hash_value.iter().position(String::is_empty) {
-+            return Err(TreeCoreRuntimeError::InsertHostEmptyHash { page_index });
++        for (page_index, hash) in hash_value.iter().enumerate() {
++            if hash.is_empty() {
++                return Err(TreeCoreRuntimeError::InsertHostEmptyHash { page_index });
++            }
++            if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
++                return Err(TreeCoreRuntimeError::InsertHostInvalidHash { page_index });
++            }
 +        }
 +        if host_value.len() < total_len {
 +            return Err(TreeCoreRuntimeError::InsertHostValueTooShort {
@@ -1178,7 +1186,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          self.touch_node_(node_id);
          if total_len == 0 {
              return Ok(InsertResult {
-@@ -3846,6 +4034,7 @@
+@@ -3846,6 +4039,7 @@
                  mamba_exist: true,
                  swa_branch_inserted: false,
                  adopted_ranges: None,
@@ -1186,7 +1194,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
                  cache_actions: Vec::new(),
              });
          }
-@@ -3887,6 +4076,7 @@
+@@ -3887,6 +4081,7 @@
              mamba_exist: false,
              swa_branch_inserted: false,
              adopted_ranges: None,
@@ -1194,7 +1202,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              cache_actions,
          };
          if matched_length == total_len {
-@@ -4072,7 +4262,21 @@
+@@ -4072,7 +4267,21 @@
              )
      }
 
@@ -1216,7 +1224,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
      pub fn build_load_back_spec(
          &self,
          node_id: NodeId,
-@@ -4086,6 +4290,7 @@
+@@ -4086,6 +4295,7 @@
      > {
          let anchor_id = node_id;
          let node_id = self.arena.resolve(node_id)?;
@@ -1224,7 +1232,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          // Component hooks take primitives, not Req: extract its fields here.
          let mamba_pool_idx = req.and_then(|r| r.mamba_pool_idx.as_ref());
          let mut kv_transfers = self
-@@ -4147,6 +4352,8 @@
+@@ -4147,6 +4357,8 @@
                  name: PoolName::Kv,
                  host_indices: Some(V::empty()),
                  nodes_to_load: Some(Vec::new()),
@@ -1233,7 +1241,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
                  ..Default::default()
              };
              return Ok((empty_kv, HashMap::new()));
-@@ -4389,9 +4596,14 @@
+@@ -4389,9 +4601,14 @@
          cache_actions: &mut Vec<CacheAction<V>>,
          mut insert_result: Option<&mut InsertResult<V>>,
          pool_storage_result: Option<&PoolTransferResult>,
@@ -1249,7 +1257,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          if let Some(insert_result) = insert_result.as_deref() {
              if let Some(last_device_node_id) = insert_result.last_device_node_id {
                  self.arena.resolve(last_device_node_id)?;
-@@ -4415,15 +4627,71 @@
+@@ -4415,15 +4632,78 @@
          Ok(())
      }
 
@@ -1269,7 +1277,12 @@ and its LICENSE for provenance, the preserved license, and each local correction
 +                continue;
 +            };
 +            if component_type == FULL {
-+                if host_indices.len() != self.arena.node(node_id).key.atom_len() {
++                let node = self.arena.node(node_id);
++                if node.has_host_value(FULL) || host_indices.len() != node.key.atom_len() {
++                    return Err(invalid());
++                }
++            } else if component_type == MAMBA {
++                if host_indices.len() != 1 {
 +                    return Err(invalid());
 +                }
 +            } else if component_type == SWA {
@@ -1309,7 +1322,9 @@ and its LICENSE for provenance, the preserved license, and each local correction
 +    ) -> Result<(), TreeCoreRuntimeError> {
          let node_id = self.arena.resolve(node_id)?;
          self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
-+        if !host_indices.is_empty() && host_indices.len() != self.arena.node(node_id).key.atom_len()
++        let node = self.arena.node(node_id);
++        if !host_indices.is_empty()
++            && (node.has_host_value(FULL) || host_indices.len() != node.key.atom_len())
 +        {
 +            return Err(TreeCoreRuntimeError::InvalidBackupSpec {
 +                node_id: self.arena.node(node_id).id,
@@ -1322,7 +1337,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let mut cache_actions: Vec<CacheAction<V>> = Vec::new();
          if !host_indices.is_empty() {
              let kv_xfer = PoolTransfer {
-@@ -4469,9 +4737,10 @@
+@@ -4469,9 +4749,10 @@
          device_indices: V,
          mut kv_xfer: PoolTransfer<V>,
          comp_xfers: HashMap<ComponentType, Vec<PoolTransfer<V>>>,
@@ -1334,7 +1349,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let loaded_node_indices = kv_xfer
              .nodes_to_load
              .iter()
-@@ -4479,6 +4748,127 @@
+@@ -4479,6 +4760,127 @@
              .map(|&loaded_id| self.arena.resolve(loaded_id))
              .collect::<Result<Vec<_>, _>>()?;
          self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
@@ -1462,7 +1477,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          let mut cache_actions: Vec<CacheAction<V>> = Vec::new();
          kv_xfer.device_indices = Some(device_indices);
          let nodes_to_load = kv_xfer.nodes_to_load.clone();
-@@ -4547,6 +4937,9 @@
+@@ -4547,6 +4949,9 @@
                  self.arena.node_mut(idx).load_back_pending_id = None;
                  // The pin blocked leaf-set membership; re-evaluate it.
                  self.update_evictable_leaf_sets_(idx);
@@ -1472,7 +1487,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              }
              self.update_full_coexisting_host_tracking_(idx);
              node_id = self.arena.node(idx).try_parent();
-@@ -4709,8 +5102,12 @@
+@@ -4709,8 +5114,12 @@
              if node.write_through_pending_id == Some(ack_id) {
                  node.write_through_pending_id = None;
                  self.update_full_coexisting_host_tracking_(node_idx);
@@ -1487,7 +1502,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          }
          Ok(())
      }
-@@ -4829,6 +5226,11 @@
+@@ -4829,6 +5238,11 @@
          for &(child_id, pos, prefix_len) in &spans {
              if pos + prefix_len <= window_start {
                  continue;
@@ -1499,7 +1514,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
              }
              if self.arena.has_device_value(child_id, SWA) {
                  return Err(format!(
-@@ -5601,14 +6003,7 @@
+@@ -5601,14 +6015,7 @@
      /// Whether the node is currently eligible as a Full device leaf.
      pub fn inspect_is_device_leaf(&self, node_id: NodeId) -> Result<bool, NodeAccessError> {
          let node_id = self.arena.resolve(node_id)?;
@@ -1515,7 +1530,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
      }
 
      /// Materialize every live tree node handle.
-@@ -5833,6 +6228,12 @@
+@@ -5833,6 +6240,12 @@
          let last_device_node_idx = self.arena.resolve(result.last_device_node_id)?;
          self.arena.resolve(result.last_host_node_id)?;
          let best_match_node_idx = self.arena.resolve(result.best_match_node_id)?;
@@ -1528,7 +1543,7 @@ and its LICENSE for provenance, the preserved license, and each local correction
          Ok(self
              .component_by_type_(component_type)
              .finalize_match_result_in_tree_core(
-@@ -5843,6 +6244,7 @@
+@@ -5843,6 +6256,7 @@
                  params,
                  value_chunks,
                  best_value_len,
