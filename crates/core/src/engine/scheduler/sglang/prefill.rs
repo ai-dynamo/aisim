@@ -181,6 +181,17 @@ pub(super) fn get_new_batch_prefill(
                     + ceil_to_block(chunk_tokens, config.block_size)
                     + load_reserve
                     + config.block_size;
+                // A load the whole pool cannot hold would wait for ever. Recompute the prefix
+                // instead, as SGLang re-selects without the host hit when a load-back commits
+                // nothing.
+                let pool = kv_manager
+                    .cache()
+                    .total_tokens()
+                    .saturating_sub(matched.device_tokens);
+                if required > pool {
+                    host_tokens = 0;
+                    continue;
+                }
                 match kv_manager.load_host_prefix(
                     &req.kv_lease,
                     &req.sequence_tokens,

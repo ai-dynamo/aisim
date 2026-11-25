@@ -7538,23 +7538,10 @@ mod requested_max_budget {
         assert_eq!(waiting.len(), 1 - admitted);
     }
 
-    /// Loading a retracted request's prompt back from the host cache needs room for what it may
-    /// still generate, not for its whole requested maximum: SGLang's load-back counts
-    /// `min(max_new_tokens - len(output_ids), reserve)`.
-    ///
-    /// A 64-token pool with nothing on the device. The request's 12-token prompt is on the
-    /// host only; it has 8 of 12 planned outputs and was retracted. It loads 12 tokens,
-    /// recomputes its 8 outputs and may generate its requested maximum - 8 more, so the load
-    /// needs 12 + 8 + (maximum - 8) + 4 = maximum + 16 free tokens. Counting the whole maximum
-    /// would need maximum + 24, which no pool state can give once the maximum is above 40, and
-    /// the request would wait at the head of the queue for ever.
-    #[rstest::rstest]
-    #[case::fits_either_way(40)] // 56 <= 64, and 64 <= 64 by the whole maximum
-    #[case::one_more(41)] // 57 <= 64, although the whole maximum would need 65
-    #[case::the_engine_limit(47)] // 64 - 12 - 4 - 1 = 47: 63 <= 64
-    fn a_retracted_request_loads_its_host_prefix_within_its_remaining_budget(
-        #[case] requested_max: usize,
-    ) {
+    /// Re-admits a retracted request on an empty 64-token pool. Its 12-token prompt is on the
+    /// host only and it has `outputs` of 12 planned outputs. Returns the prompt tokens it loads
+    /// from the host and the tokens it recomputes, or `None` when it is left waiting.
+    fn readmit_with_host_prompt(outputs: usize, requested_max: usize) -> Option<(usize, usize)> {
         let config = SglangConfig::from_args(&test_args(64 / PAGE, PAGE, 64));
         let mut manager = SglangKvManager::new(64, PAGE, KvEventPublishers::default(), 0);
         manager.enable_hicache(
@@ -7573,7 +7560,7 @@ mod requested_max_budget {
         assert_eq!(manager.cache().available_tokens(), 64);
 
         let mut request = queued(1, 12, 12, requested_max);
-        generate(&mut request, 8);
+        generate(&mut request, outputs);
         request.retracted = true;
         let mut waiting = WaitingQueue::from([request]);
         let result = get_new_batch_prefill(
@@ -7585,10 +7572,51 @@ mod requested_max_budget {
             false,
             Some(0),
         );
-        assert_eq!(result.can_run.len(), 1);
-        assert!(waiting.is_empty());
-        assert_eq!(result.admissions[0].reused_input_tokens, 12);
-        assert_eq!(result.prefill_fpm[0].tokens_computed, 8);
+        assert_eq!(result.can_run.len() + waiting.len(), 1);
+        let admission = result.admissions.first()?;
+        Some((
+            admission.reused_input_tokens,
+            result.prefill_fpm[0].tokens_computed,
+        ))
+    }
+
+    /// Loading a retracted request's prompt back from the host cache needs room for what it may
+    /// still generate, not for its whole requested maximum: SGLang's load-back counts
+    /// `min(max_new_tokens - len(output_ids), reserve)`.
+    ///
+    /// With 8 outputs the request loads 12 tokens, recomputes its 8 outputs and may generate
+    /// its requested maximum - 8 more, so the load needs 12 + 8 + (maximum - 8) + 4 =
+    /// maximum + 16 free tokens. Counting the whole maximum would need maximum + 24, which no
+    /// pool state can give once the maximum is above 40.
+    #[rstest::rstest]
+    #[case::fits_either_way(40)] // 56 <= 64, and 64 <= 64 by the whole maximum
+    #[case::one_more(41)] // 57 <= 64, although the whole maximum would need 65
+    #[case::the_engine_limit(47)] // 64 - 12 - 4 - 1 = 47: 63 <= 64
+    fn a_retracted_request_loads_its_host_prefix_within_its_remaining_budget(
+        #[case] requested_max: usize,
+    ) {
+        assert_eq!(readmit_with_host_prompt(8, requested_max), Some((12, 8)));
+    }
+
+    /// The load counts the recomputed outputs in whole pages; the admission check does not. At
+    /// the engine limit, a requested maximum of 47, the load needs
+    /// 12 + (outputs rounded up to 4) + (47 - outputs) + 4, which can be more than the whole
+    /// pool. Such a load can never fit, so the request recomputes its prompt instead of
+    /// waiting at the head of the queue for ever, as SGLang re-selects without the host hit
+    /// when a load-back commits nothing.
+    #[rstest::rstest]
+    #[case::one_output(1, 0, 13)] // 12 + 4 + 46 + 4 = 66 > 64: recomputes all 13 tokens
+    #[case::two_outputs(2, 0, 14)] // 12 + 4 + 45 + 4 = 65 > 64: recomputes all 14 tokens
+    #[case::three_outputs(3, 12, 3)] // 12 + 4 + 44 + 4 = 64: loads 12, recomputes 3
+    fn a_host_load_the_pool_can_never_hold_recomputes_the_prefix(
+        #[case] outputs: usize,
+        #[case] loaded: usize,
+        #[case] computed: usize,
+    ) {
+        assert_eq!(
+            readmit_with_host_prompt(outputs, 47),
+            Some((loaded, computed))
+        );
     }
 
     /// `PrefillAdder._update_prefill_budget`: an admitted request reserves its prompt, a page
