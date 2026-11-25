@@ -71,10 +71,16 @@ jobs:
           image_cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
           benchmark_cargo_home="${RUNNER_TEMP}/forward-perf-cargo-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           mkdir -p "${benchmark_cargo_home}"
+          workspace="$(cd "${GITHUB_WORKSPACE}" && pwd -P)"
           # Retain download caches, but never inherit the image or checkout config.
           for cache in registry git; do
             if [[ -d "${image_cargo_home}/${cache}" ]]; then
-              ln -s "${image_cargo_home}/${cache}" "${benchmark_cargo_home}/${cache}"
+              cache_source="$(cd "${image_cargo_home}/${cache}" && pwd -P)"
+              # Checkout cleans workspace-local caches, including symlink targets.
+              case "${cache_source}/" in
+                "${workspace}/"*) continue ;;
+              esac
+              ln -s "${cache_source}" "${benchmark_cargo_home}/${cache}"
             fi
           done
           echo "CARGO_HOME=${benchmark_cargo_home}" >> "${GITHUB_ENV}"

@@ -140,31 +140,48 @@ def test_forward_perf_selects_before_allocating_the_benchmark_runner():
 
 
 @pytest.mark.skipif(shutil.which("cargo") is None, reason="Cargo is required to check configuration isolation")
-@pytest.mark.parametrize("image_cargo_home", [None, "image-cargo"])
-def test_forward_perf_isolates_cargo_config_and_preserves_download_caches(tmp_path, image_cargo_home):
+@pytest.mark.parametrize("image_cargo_home", [None, "image-cargo", "workspace-link", "checkout-sibling"])
+@pytest.mark.parametrize("inherited_rustflags", [False, True])
+def test_forward_perf_isolates_cargo_config_and_preserves_download_caches(
+    tmp_path, monkeypatch, image_cargo_home, inherited_rustflags
+):
     steps = _workflow("performance.yml")["jobs"]["compare"]["steps"]
     isolate = steps[0]
     assert isolate["name"] == "Isolate benchmark Cargo configuration"
     checkout = tmp_path / "checkout"
     source_home = tmp_path / image_cargo_home if image_cargo_home else checkout / ".cargo"
     source_home.mkdir(parents=True)
+    if image_cargo_home == "workspace-link":
+        checkout.mkdir()
+        local_caches = checkout / "downloads"
+        local_caches.mkdir()
     # A global head-only rustflag would invalidate even the base build.
     (source_home / "config.toml").write_text('[build]\nrustflags = ["--cfg", "head_only"]\n')
     for cache in ("registry", "git"):
-        (source_home / cache).mkdir()
+        if image_cargo_home == "workspace-link":
+            (local_caches / cache).mkdir()
+            (source_home / cache).symlink_to(local_caches / cache, target_is_directory=True)
+        else:
+            (source_home / cache).mkdir()
         (source_home / cache / "cached-download").write_text(cache)
+    checkout.mkdir(exist_ok=True)
     runner_temp = tmp_path / "runner-temp"
     output = tmp_path / "github-env"
     # Preserve rustup's toolchain location before HOME points at the checkout.
     rustup_home = os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup"))
+    rustflag_overrides = {"RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS"}
+    if inherited_rustflags:
+        for name in rustflag_overrides:
+            monkeypatch.setenv(name, "-C\x1fdebuginfo=0" if name == "CARGO_ENCODED_RUSTFLAGS" else "-C debuginfo=0")
     env = {
-        **os.environ,
+        **{key: value for key, value in os.environ.items() if key not in rustflag_overrides},
         "HOME": str(checkout),
         "RUSTUP_HOME": rustup_home,
         "RUNNER_TEMP": str(runner_temp),
         "GITHUB_RUN_ID": "123",
         "GITHUB_RUN_ATTEMPT": "1",
         "GITHUB_ENV": str(output),
+        "GITHUB_WORKSPACE": str(checkout),
     }
     env.pop("CARGO_HOME", None)
     if image_cargo_home:
@@ -175,11 +192,19 @@ def test_forward_perf_isolates_cargo_config_and_preserves_download_caches(tmp_pa
     isolated_home = Path(value)
     assert isolated_home.is_relative_to(runner_temp)
     assert not (isolated_home / "config.toml").exists()
+    workspace_caches = image_cargo_home in (None, "workspace-link")
     for cache in ("registry", "git"):
-        assert (isolated_home / cache / "cached-download").read_text() == cache
+        if workspace_caches:
+            assert not (isolated_home / cache).is_symlink()
+            assert not (isolated_home / cache).exists()
+        else:
+            assert (isolated_home / cache).is_symlink()
+            assert (isolated_home / cache / "cached-download").read_text() == cache
 
+    crates = []
     for revision in ("base", "head"):
         crate = runner_temp / revision
+        crates.append(crate)
         (crate / "src").mkdir(parents=True)
         (crate / "Cargo.toml").write_text(f'[package]\nname = "{revision}"\nversion = "0.1.0"\nedition = "2021"\n')
         (crate / "src/main.rs").write_text('#[cfg(head_only)]\ncompile_error!("head config leaked");\nfn main() {}\n')
@@ -193,6 +218,11 @@ def test_forward_perf_isolates_cargo_config_and_preserves_download_caches(tmp_pa
         )
         assert contaminated.returncode != 0
         assert "head config leaked" in contaminated.stderr
+
+    # Model checkout's default git clean after the contamination controls.
+    for child in checkout.iterdir():
+        shutil.rmtree(child)
+    for crate in crates:
         subprocess.run(
             ["cargo", "check", "--offline"],
             cwd=crate,
