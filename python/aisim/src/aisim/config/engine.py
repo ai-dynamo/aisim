@@ -174,8 +174,8 @@ class SchedulerPredictionConfig(StrictModel):
         default=None,
         description=(
             "vLLM only: model vLLM's --async-scheduling, under which an arrival at a busy engine misses the "
-            "batch vLLM has already queued. Unset uses vLLM's default: on, except with ngram drafts "
-            "or MTP with G2 host offload."
+            "batch vLLM has already queued. Replay defaults to async scheduling unless it uses ngram drafts "
+            "or combines MTP and G2 host offload without a recurrent state cache."
         ),
     )
     load_balance_method: Literal["round_robin", "total_tokens"] = Field(
@@ -189,7 +189,10 @@ class SchedulerPredictionConfig(StrictModel):
         default=None,
         description=(
             "vLLM aggregated workers with async scheduling only: CPU launch costs of vLLM's engine loop. A pass's "
-            "outputs then leave once the next pass is launched, and an arrival joins the first pass decided after it."
+            "outputs then leave once the next pass is launched, and an arrival joins the first pass decided after it. "
+            "With an offloading_v0_32 or simple_cpu_v0_32 CPU tier, a finished load is admitted only after vLLM "
+            "(Model Runner V2) polls the connector. With MTP and G2, launch timing requires a recurrent state cache "
+            "and disable_eagle_block_drop=true."
         ),
     )
 
@@ -290,19 +293,37 @@ class KvcrLocalG2Config(StrictModel):
     copy_bandwidth_gbps: NonNegativeFloat = 6.0
 
 
+class KvcrG3Config(StrictModel):
+    """Local disk KVCR owns on each rank, behind its memory (`local_g2`)."""
+
+    num_blocks: PositiveU64
+    latency_to_first_byte_ms: NonNegativeFloat = 3.0
+    read_bandwidth_gbps: NonNegativeFloat = 5.0
+    write_bandwidth_gbps: NonNegativeFloat = 0.8
+    spill_timeout_ms: PositiveFloat = 1000.0
+
+
 class KvcrConfig(StrictModel):
     """KVCR peer G2 fetch: pull a hinted prefix from another rank's private G2."""
 
     latency_to_first_byte_ms: NonNegativeFloat = 1.0
     bandwidth_gbps: NonNegativeFloat = 32.0
     local_g2: KvcrLocalG2Config | None = None
+    g3: KvcrG3Config | None = None
+
+    @model_validator(mode="after")
+    def _g3_needs_local_g2(self) -> KvcrConfig:
+        if self.g3 is not None and self.local_g2 is None:
+            raise ValueError("kvcr.g3 requires kvcr.local_g2")
+        return self
 
     @model_serializer(mode="wrap")
-    def _omit_unset_local_g2(self, handler: Any) -> dict[str, Any]:
-        # Keep the peer-fetch-only descriptor shape unless KVCR owns memory.
+    def _omit_unset_tiers(self, handler: Any) -> dict[str, Any]:
+        # Keep the peer-fetch-only descriptor shape unless KVCR owns storage.
         payload = handler(self)
-        if payload.get("local_g2") is None:
-            payload.pop("local_g2", None)
+        for name in ("local_g2", "g3"):
+            if payload.get(name) is None:
+                payload.pop(name, None)
         return payload
 
 
@@ -795,6 +816,7 @@ class WorkerPredictionConfig(StrictModel):
     kv_cache: KvCachePredictionConfig = Field(default_factory=KvCachePredictionConfig)
     timing: TimingConfig = Field(default_factory=TimingConfig)
     startup_seconds: float = Field(default=0.0, ge=0.0)
+    wait_power_w: NonNegativeFloat | None = None
 
 
 def _frontend_implies_host_loop(value: Any) -> Any:
@@ -1040,6 +1062,17 @@ class TokenizationConfig(StrictModel):
     per_input_token_us: NonNegativeFloat = 0.0
 
 
+class ExtraCpuOverheadConfig(StrictModel):
+    """Unqueued serving-path CPU time before the engine: HTTP receive and first-chunk work."""
+
+    base_ms: NonNegativeFloat = 0.0
+    per_input_token_us: NonNegativeFloat = 0.0
+
+    @property
+    def active(self) -> bool:
+        return bool(self.base_ms or self.per_input_token_us)
+
+
 class DetokenizationConfig(StrictModel):
     workers: PositiveInt = 1
     base_ms: NonNegativeFloat = 0.0
@@ -1220,6 +1253,7 @@ class EnginePredictionConfig(EstimatorPolicyConfig):
     workers: WorkersPredictionConfig = Field(default_factory=WorkersPredictionConfig)
     kv_transfer: KvTransferConfig | None = None
     tokenization: TokenizationConfig | None = None
+    extra_cpu_overhead: ExtraCpuOverheadConfig | None = None
     detokenization: DetokenizationConfig | None = None
 
     @field_validator("model", "hardware")
@@ -1251,19 +1285,25 @@ class EnginePredictionConfig(EstimatorPolicyConfig):
         _validate_worker_hardware(modes={self.mode}, workers=self.workers)
         if self.tokenization is not None and (has_afd(self.workers) or self.workers.encoder is not None):
             raise ValueError("engine.tokenization requires token replay; AFD and analytical EPD are unsupported")
+        extra_cpu_overhead_active = self.extra_cpu_overhead is not None and self.extra_cpu_overhead.active
+        if extra_cpu_overhead_active and (has_afd(self.workers) or self.workers.encoder is not None):
+            raise ValueError("engine.extra_cpu_overhead requires token replay; AFD and analytical EPD are unsupported")
         if (
             self.detokenization is not None
             and self.detokenization.active
             and (has_afd(self.workers) or self.workers.encoder is not None)
         ):
             raise ValueError("engine.detokenization requires token replay; AFD and analytical EPD are unsupported")
-        if self.tokenization is not None and any(
+        if (self.tokenization is not None or extra_cpu_overhead_active) and any(
             worker is not None
             and not is_afd_worker(worker)
             and (worker.frontend is not None or worker.host_profile is not None)
             for worker in (self.workers.aggregated, self.workers.prefill)
         ):
-            raise ValueError("engine.tokenization and SGLang frontend stages both price request tokenization; use one")
+            raise ValueError(
+                "engine.tokenization, engine.extra_cpu_overhead and SGLang frontend stages all price "
+                "request-path CPU time; use one"
+            )
         _validate_afd_workers(self)
         _validate_worker_roles(modes={self.mode}, workers=self.workers, has_transfer=self.kv_transfer is not None)
         _validate_decode_radix_cache(

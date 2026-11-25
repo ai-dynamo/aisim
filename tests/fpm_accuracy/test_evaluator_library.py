@@ -1,0 +1,75 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""The evaluator's dataset library is used even when the wheel under test predates it."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def _clean_environment() -> dict[str, str]:
+    """A minimal environment that still lets an interpreter with a shared libpython start (CI toolcache builds)."""
+    env = {"PYTHONHASHSEED": "0"}
+    if os.environ.get("LD_LIBRARY_PATH"):
+        env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
+    return env
+
+
+def test_data_library_comes_from_the_evaluator_when_the_wheel_lacks_it(tmp_path: Path) -> None:
+    wheel = tmp_path / "site-packages/aisim_core"
+    wheel.mkdir(parents=True)
+    (wheel / "__init__.py").write_text("WHEEL = True\n")  # an old wheel: no aisim_core.data at all
+    (wheel / "sdk.py").write_text("NATIVE = 'from the wheel'\n")
+    script = (
+        "import sys; sys.path.insert(0, sys.argv[1]); sys.path.insert(1, sys.argv[2])\n"
+        "import scripts.fpm_accuracy.evaluator_library\n"
+        "import aisim_core, aisim_core.data.fetch as fetch, aisim_core.sdk as sdk\n"
+        "assert aisim_core.WHEEL and sdk.NATIVE == 'from the wheel'\n"
+        "assert fetch.__file__.startswith(sys.argv[2]), fetch.__file__\n"
+        "print('ok')\n"
+    )
+    # sys.argv[1]: the fake wheel; sys.argv[2]: not a path entry for aisim_core, only the repo root
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(tmp_path / "site-packages"), str(ROOT)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_clean_environment(),
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
+
+
+@pytest.mark.parametrize("namespace", ["aisimulate_core", "aiconfigurator_core"])
+def test_a_historical_wheel_sdk_is_aliased_and_never_replaced_by_the_checkout(tmp_path: Path, namespace: str) -> None:
+    sdk = tmp_path / "site-packages" / namespace / "sdk"
+    sdk.mkdir(parents=True)
+    (sdk.parent / "__init__.py").write_text("HISTORICAL = True\n")
+    (sdk / "__init__.py").write_text("NATIVE = 'from the wheel'\n")
+    script = (
+        "import sys; sys.path.insert(0, sys.argv[1]); sys.path.insert(1, sys.argv[2])\n"
+        "sys.modules['aisim_core'] = None\n"  # the wheel has no aisim_core namespace
+        "import scripts.fpm_accuracy.evaluator_library\n"
+        f"import {namespace}, aisim_core, aisim_core.data.fetch as fetch, aisim_core.sdk as sdk\n"
+        f"assert aisim_core is {namespace} and aisim_core.HISTORICAL\n"
+        f"assert sdk.NATIVE == 'from the wheel' and sdk is sys.modules['{namespace}.sdk']\n"
+        "assert fetch.__file__.startswith(sys.argv[2]), fetch.__file__\n"
+        "print('ok')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(tmp_path / "site-packages"), str(ROOT)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_clean_environment(),
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"

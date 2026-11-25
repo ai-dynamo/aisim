@@ -212,7 +212,25 @@ def test_partial_measurement_snapshot_cannot_pass_public_gate():
         validate_snapshot(snapshot, preview=True)
 
 
-def sglang_replay_inputs(tmp_path, *, depth=3, acceptance=None):
+def acceptance_series(rows, *, duration=10, unit="tokens/forward"):
+    """Silicon reference carrying a profile-phase acceptance gauge of (start, end, value, coverage) rows."""
+    return {
+        "metric_definitions": {"acceptance": {"description": "gauge", "kind": "gauge", "unit": unit}},
+        "phases": {
+            "profile": {
+                "duration_s": duration,
+                "series": {
+                    "acceptance": [
+                        {"start": start, "end": end, "value": value, "coverage": coverage}
+                        for start, end, value, coverage in rows
+                    ]
+                },
+            }
+        },
+    }
+
+
+def sglang_replay_inputs(tmp_path, *, depth=3, acceptance=None, silicon=None):
     run = result()
     run["artifacts"] = {}
     documents = {
@@ -239,7 +257,12 @@ def sglang_replay_inputs(tmp_path, *, depth=3, acceptance=None):
         "source_manifest": {
             "initial_selection": {"seed": 42, "corpus_cursor": 1, "source_play_id": "trace", "t_star_ms": 0}
         },
-        "workload": {"silicon_reference": {"namespace_map": {"trace": "weka:1111111111111111"}}},
+        "workload": {
+            "silicon_reference": {
+                "namespace_map": {"trace": "weka:1111111111111111"},
+                **({"silicon": silicon} if silicon is not None else {}),
+            }
+        },
         "feature_harness_receipt": {
             "input_config": {"phases": [{"duration": 60, "system_idle_gap_cap_seconds": 2, "grace_period": 5}]}
         },
@@ -269,6 +292,56 @@ def test_sglang_replay_uses_only_depth_matched_retained_acceptance(tmp_path, acc
     else:
         with pytest.raises(ValueError, match="acceptance"):
             replay_config(tmp_path, run)
+
+
+GOOD_ACCEPTANCE_ROWS = [(0, 0.5, 0, 1), (0.5, 6, 3.0, 1), (6, 10, 2.0, 1), (10, 11, 2.0, 1)]
+
+
+def test_sglang_replay_measures_acceptance_from_the_profile_series_when_the_receipt_has_none(tmp_path):
+    run = sglang_replay_inputs(tmp_path, silicon=acceptance_series(GOOD_ACCEPTANCE_ROWS))
+    engine = replay_config(tmp_path, run)["engine"]
+    # The zero initialization row and the interval past the phase end are skipped; the bonus token is not accepted.
+    assert engine["nextn"] == 3
+    assert engine["nextn_accepted"] == pytest.approx((5.5 * 3 + 4 * 2) / 9.5 - 1)
+
+
+@pytest.mark.parametrize(
+    "silicon",
+    [
+        pytest.param(None, id="no-silicon-reference"),
+        pytest.param(acceptance_series([(0, 5, 3.0, 1)]), id="profile-mostly-uncovered"),
+        pytest.param(acceptance_series([(0, 10, 0, 1)]), id="only-initialization-rows"),
+        pytest.param(acceptance_series([(0, 10, 4.5, 1)], duration=10), id="exceeds-verification-depth"),
+        pytest.param(acceptance_series(GOOD_ACCEPTANCE_ROWS, unit="count"), id="wrong-unit"),
+        pytest.param(acceptance_series([(0, 10, 0.5, 1)]), id="below-one-token-per-forward"),
+        pytest.param(acceptance_series([(0, 10, float("nan"), 1)]), id="nonfinite-value"),
+        pytest.param(acceptance_series([(0, 10, 3.0, 1.5)]), id="coverage-above-one"),
+    ],
+)
+def test_sglang_replay_rejects_an_unusable_acceptance_series(tmp_path, silicon):
+    run = sglang_replay_inputs(tmp_path, silicon=silicon)
+    with pytest.raises(ValueError, match="acceptance"):
+        replay_config(tmp_path, run)
+
+
+def test_sglang_replay_rejects_a_malformed_acceptance_series_row(tmp_path):
+    silicon = acceptance_series(GOOD_ACCEPTANCE_ROWS)
+    del silicon["phases"]["profile"]["series"]["acceptance"][1]["coverage"]
+    with pytest.raises(ValueError, match="acceptance series"):
+        replay_config(tmp_path, sglang_replay_inputs(tmp_path, silicon=silicon))
+
+
+def test_sglang_replay_never_replaces_an_invalid_receipt_with_the_series(tmp_path):
+    receipt = {"verification_depth": 3, "accepted_draft_tokens": 9}
+    run = sglang_replay_inputs(tmp_path, acceptance=receipt, silicon=acceptance_series(GOOD_ACCEPTANCE_ROWS))
+    with pytest.raises(ValueError, match="acceptance"):
+        replay_config(tmp_path, run)
+
+
+def test_sglang_replay_prefers_a_valid_receipt_over_the_series(tmp_path):
+    receipt = {"verification_depth": 3, "accepted_draft_tokens": 1.25}
+    run = sglang_replay_inputs(tmp_path, acceptance=receipt, silicon=acceptance_series(GOOD_ACCEPTANCE_ROWS))
+    assert replay_config(tmp_path, run)["engine"]["nextn_accepted"] == 1.25
 
 
 def test_non_speculative_replay_validates_without_acceptance(tmp_path):

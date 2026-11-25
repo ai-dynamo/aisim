@@ -34,6 +34,7 @@ from aisim.sweeper import (
 )
 from aisim.sweeper.config import Workload
 from aisim.sweeper.replay import REPLAY_SPEC_API_VERSION, RunnerCapabilities
+from aisim_core.data.default_systems import default_systems_path
 from aisim_core.sdk.deepseek_v41 import MODEL_PATH as DEEPSEEK_V41_MODEL_PATH
 from scripts.e2e_accuracy.source.replay import engine_args
 
@@ -227,6 +228,31 @@ def test_generic_speculation_requires_explicit_runner_capability(location, neste
     capabilities.require_compatible(spec)
     with pytest.raises(ValueError, match="generic speculation; use --stack engine"):
         replace(capabilities, supports_generic_speculation=False).require_compatible(spec)
+
+
+def test_telemetry_capability_keeps_existing_positional_arguments():
+    # RunnerCapabilities is public: an adapter passing the earlier fields positionally keeps their meaning.
+    default = RunnerCapabilities()
+    earlier = [
+        field.name for field in fields(RunnerCapabilities) if not field.kw_only and field.name != "supports_telemetry"
+    ]
+    changed = (
+        "supports_deferred_encoder_overlay",
+        "supports_mtp_host_offload",
+        "supports_agentic_primers_only",
+        "supports_kvcr_g3",
+    )
+    positional = RunnerCapabilities(*(True if name in changed else getattr(default, name) for name in earlier))
+    assert positional == replace(default, **dict.fromkeys(changed, True))
+    assert positional.supports_telemetry is False
+
+
+def test_engine_runner_factory_declares_telemetry_support():
+    telemetry = ReplayOutputRequirements(capture_telemetry=True)
+    capabilities = EngineReplayRunnerFactory().capabilities()
+    capabilities.require_output_support(telemetry)
+    with pytest.raises(ValueError, match="does not support replay telemetry"):
+        replace(capabilities, supports_telemetry=False).require_output_support(telemetry)
 
 
 @pytest.mark.parametrize("location", ["rank", "canonical"])
@@ -456,6 +482,7 @@ def test_native_replay_rejects_malformed_canonical_speculation(speculation, entr
             materialize_engine_launch_config("vllm", "0.24.0", {}, deployment.agg_engine_args, "aggregated")
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("accept_rates", [None, "", "  ", "1,0.5"])
 @pytest.mark.parametrize("explicit_depth", [False, True])
 def test_native_canonical_speculation_requires_authored_acceptance(accept_rates, explicit_depth):
@@ -514,6 +541,7 @@ def test_runner_canonical_mtp_g2_rejects_unsupported_cache_compositions(field, v
         )
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize(
     "backend,speculation",
     [
@@ -558,6 +586,7 @@ def test_public_runner_rejects_generic_trtllm_in_both_representations(location):
     assert runtime.execution_spec is None
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_native_canonical_speculation_rejects_trtllm_without_restricting_legacy():
     from aisim import _runtime
 
@@ -1441,6 +1470,56 @@ def test_runner_preserves_native_host_offload_rank_config():
     assert rank["kv_transfer_bytes_per_token"] == 333
     assert rank["kv_cache_bytes_per_token"] == 131_072
     assert rank["native_host_offload"] == engine_args["native_host_offload"]
+
+
+def _wait_power_prediction(**worker: object) -> dict:
+    return {
+        "engine": {
+            "mode": "aggregated",
+            "model": "Qwen/Qwen3-0.6B",
+            "hardware": "h200_sxm",
+            "backend": "vllm",
+            "context_length": 4096,
+            "workers": {
+                "aggregated": {
+                    **worker,
+                    "kv_cache": {"capacity": {"type": "fixed", "blocks": 128}},
+                    "timing": {"type": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0},
+                }
+            },
+        }
+    }
+
+
+def _native_rank(config: CorePredictionConfig) -> dict:
+    runtime = RecordingRuntime()
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(prediction_to_replay_spec(config))
+    execution = runtime.execution_spec.get("spec", runtime.execution_spec)
+    return execution["engine"]["rank"]
+
+
+def test_prediction_wait_power_reaches_native_role_after_round_trip():
+    config = CorePredictionConfig.model_validate(_wait_power_prediction(wait_power_w=60))
+    restored = CorePredictionConfig.model_validate_json(config.model_dump_json(exclude_unset=True))
+    assert _native_rank(restored)["wait_power_w"] == 60.0
+
+
+def test_unset_wait_power_is_omitted_from_native_role():
+    config = CorePredictionConfig.model_validate(_wait_power_prediction())
+    assert "wait_power_w" not in _native_rank(config)
+
+
+@pytest.mark.parametrize("watts", [-1.0, math.nan, math.inf, "60"])
+def test_wait_power_rejects_negative_non_finite_or_string_watts(watts):
+    with pytest.raises(ValidationError, match="wait_power_w"):
+        CorePredictionConfig.model_validate(_wait_power_prediction(wait_power_w=watts))
+
+
+def test_afd_workers_do_not_accept_wait_power():
+    from aisim.config.engine import AFDWorkerPredictionConfig
+
+    assert "wait_power_w" not in AFDWorkerPredictionConfig.model_fields
+    assert AFDWorkerPredictionConfig.model_config.get("extra") == "forbid"
 
 
 def test_public_host_offload_config_reaches_native_execution_rank():
@@ -3483,16 +3562,19 @@ def test_workload_driver_rejects_length_sampler_before_native_execution(source_t
 
 
 @pytest.mark.parametrize("layout", ["flat", "null_flat", "canonical", "canonical_none", "canonical_fallback", "nested"])
-@pytest.mark.parametrize("version", ["", "next", "literal_next"])
+@pytest.mark.parametrize("version", ["", "alias", "literal"])
 def test_direct_replay_capacity_uses_the_resolved_timing_version(monkeypatch, tmp_path, layout, version):
     from aisim import _runtime
     from aisim_core.sdk import perf_database
 
     slots = perf_database.get_version_slots("h200_sxm", "vllm")
-    expected = slots["next" if version == "literal_next" else version or "current"]
-    if version == "literal_next":
-        version = expected
-    assert slots["next"] != slots["current"]
+    # A slot other than current, so capacity falling back to the default
+    # version is visible: next while the fleet has a development version,
+    # otherwise previous (next then resolves to current).
+    other = "next" if slots["next"] != slots["current"] else "previous"
+    assert slots[other] != slots["current"]
+    expected = slots[other] if version else slots["current"]
+    version = {"": "", "alias": other, "literal": expected}[version]
     phase = "python"
     consumed_versions = {"python": [], "native": []}
     get_database = perf_database.get_database
@@ -3573,7 +3655,7 @@ def test_direct_replay_resolves_aliases_in_the_effective_systems_root(monkeypatc
 
     from aisim_core.sdk import perf_database
 
-    bundled = Path(perf_database.__file__).resolve().parents[1] / "systems"
+    bundled = Path(default_systems_path())
     system = yaml.safe_load((bundled / "h200_sxm.yaml").read_text())
     system["data_dir"] = str(bundled / system["data_dir"])
     (tmp_path / "h200_sxm.yaml").write_text(yaml.safe_dump(system))
@@ -3784,6 +3866,77 @@ def test_prediction_compiler_carries_tokenization(tokenization, expected) -> Non
 
 
 @pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        (None, None),
+        ({}, None),
+        ({"base_ms": 0, "per_input_token_us": 0}, None),
+        ({"base_ms": 30, "per_input_token_us": 0.25}, {"base_ms": 30.0, "per_input_token_ms": 0.00025}),
+        ({"per_input_token_us": 2}, {"base_ms": 0.0, "per_input_token_ms": 0.002}),
+    ],
+)
+def test_prediction_compiler_carries_extra_cpu_overhead(extra, expected) -> None:
+    prediction = _tokenization_prediction(None)
+    if extra is not None:
+        prediction = CorePredictionConfig.model_validate(
+            {"engine": {**prediction.engine.model_dump(mode="json", exclude_none=True), "extra_cpu_overhead": extra}}
+        )
+
+    deployment = prediction_to_replay_spec(prediction).backend_deployment
+
+    assert deployment.extra_cpu_overhead == (pytest.approx(expected) if expected else None)
+    assert deployment.tokenization is None
+
+
+@pytest.mark.parametrize("mode", ["aggregated", "disaggregated"])
+@pytest.mark.parametrize("feature", ["frontend", "host_profile", "afd", "encoder"])
+@pytest.mark.parametrize(
+    ("extra", "rejected"),
+    [
+        (None, False),
+        ({}, False),
+        ({"base_ms": 0, "per_input_token_us": 0}, False),
+        ({"base_ms": 1}, True),
+        ({"per_input_token_us": 1}, True),
+    ],
+)
+def test_prediction_extra_cpu_overhead_exclusions_require_active_cost(mode, feature, extra, rejected) -> None:
+    host_role = "aggregated" if mode == "aggregated" else "prefill"
+    roles = ("aggregated",) if mode == "aggregated" else ("prefill", "decode")
+    workers = {role: {} for role in roles}
+    engine = {"model": "example/model", "hardware": "h200_sxm", "backend": "sglang", "mode": mode, "workers": workers}
+    raw = {"engine": engine}
+    if feature == "frontend":
+        workers[host_role]["frontend"] = {"stages": [{"service_ms": 3.0}]}
+    elif feature == "host_profile":
+        workers[host_role]["host_profile"] = {"path": "unused.json", "frontend": "python"}
+    elif feature == "afd":
+        engine["model"] = "Qwen/Qwen3-30B-A3B"
+        workers[host_role] = {"type": "afd", "afd": {"n_a_nodes": 1, "n_f_nodes": 1, "tp_a": 1, "a_batch_size": 8}}
+    else:
+        engine["model"] = "Qwen/Qwen3-VL-8B-Instruct"
+        workers["encoder"] = {}
+        raw["traffic"] = {
+            "source": {"type": "synthetic", "images": {"height": 448, "width": 448, "count": 1}},
+            "load": {"type": "concurrency", "concurrency": 1},
+            "stop": {"requests": 1},
+        }
+
+    baseline = CorePredictionConfig.model_validate(raw)
+    if extra is not None:
+        engine["extra_cpu_overhead"] = extra
+    if rejected:
+        with pytest.raises(ValidationError, match="engine.extra_cpu_overhead"):
+            CorePredictionConfig.model_validate(raw)
+    else:
+        prediction = CorePredictionConfig.model_validate(raw)
+        assert prediction.model_dump(exclude={"engine": {"extra_cpu_overhead"}}) == baseline.model_dump(
+            exclude={"engine": {"extra_cpu_overhead"}}
+        )
+        assert CorePredictionConfig.model_validate_json(prediction.model_dump_json()) == prediction
+
+
+@pytest.mark.parametrize(
     "tokenization",
     [
         {"workers": 0, "base_ms": 1},
@@ -3879,6 +4032,52 @@ def test_canonical_replay_spec_json_omits_unset_tokenization() -> None:
     tokenization = {"workers": 1, "base_ms": 1.0, "per_input_token_ms": 0.0}
     configured = json.loads(canonical_json(_spec(deployment=_tokenization_deployment(tokenization))))
     assert configured["backend_deployment"]["tokenization"] == tokenization
+
+
+def _extra_overhead_deployment(extra: dict, tokenization: dict | None = None) -> BackendDeploymentSpec:
+    return replace(_tokenization_deployment(tokenization or {}, 1), tokenization=tokenization, extra_cpu_overhead=extra)
+
+
+def test_engine_runner_sends_extra_cpu_overhead_in_the_execution_envelope() -> None:
+    runtime = RecordingRuntime()
+    extra = {"base_ms": 29.5, "per_input_token_ms": 0.000245}
+
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(_spec(deployment=_extra_overhead_deployment(extra)))
+
+    assert runtime.execution_spec["extra_cpu_overhead"] == extra
+    assert "tokenization" not in runtime.execution_spec
+
+
+def test_extra_cpu_overhead_requires_capability_and_offline_replay() -> None:
+    from aisim.sweeper import RunnerCapabilities
+
+    spec = _spec(deployment=_extra_overhead_deployment({"base_ms": 1.0, "per_input_token_ms": 0.0}))
+    with pytest.raises(ValueError, match="does not support engine.extra_cpu_overhead"):
+        RunnerCapabilities(supported_backend_topologies=(("*", "*"),)).require_compatible(spec)
+    engine = EngineReplayRunnerFactory(runtime=RecordingRuntime()).capabilities()
+    engine.require_compatible(spec)
+    with pytest.raises(ValueError, match="offline"):
+        replace(engine, supported_execution_modes=("offline", "online")).require_compatible(
+            replace(spec, execution_mode="online")
+        )
+
+
+def test_native_replay_delays_requests_by_the_extra_cpu_overhead_without_queueing() -> None:
+    report = (
+        EngineReplayRunnerFactory()
+        .create(0)
+        .run(
+            _spec(deployment=_extra_overhead_deployment({"base_ms": 3.0, "per_input_token_ms": 0.5})),
+            output_requirements=ReplayOutputRequirements(include_raw_report=True, capture_per_request=True),
+        )
+    )
+
+    (record,) = report.metadata["native_report"]["per_request"]
+    # 3 ms + 0.5 ms x 8 input tokens, counted from arrival.
+    assert record["arrival_time_ms"] == 0.0
+    assert record["tokenized_ms"] == 7.0
+    assert record["first_admit_ms"] == 7.0
+    assert record["ttft_ms"] > 7.0
 
 
 def _detokenization_prediction(detokenization: dict | None = None) -> CorePredictionConfig:

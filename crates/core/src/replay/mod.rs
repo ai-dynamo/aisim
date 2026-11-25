@@ -34,6 +34,7 @@ pub(crate) mod scaling;
 mod spec;
 pub(crate) mod state;
 mod telemetry;
+mod traffic;
 
 #[derive(Clone)]
 pub(crate) struct OfflineDisaggReplayConfig {
@@ -177,6 +178,7 @@ pub use report::{
     TraceRequestCounts, TraceThroughputStats, TraceTrajectoryStats,
 };
 pub use scaling::{NoScaling, ReplayScalingDecision, ReplayScalingPolicy, ReplayScalingSnapshot};
+pub use traffic::{BuiltTraffic, TrafficBuildOptions, TrafficSpec, build_traffic};
 #[cfg(test)]
 mod snapshot_tests;
 pub use spec::{

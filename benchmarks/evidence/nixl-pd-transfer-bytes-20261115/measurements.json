@@ -1,0 +1,315 @@
+{
+  "schema": "nixl-pd-transfer-bytes/v1",
+  "model": "zai-org/GLM-5.3-Flash",
+  "checkpoint_revision": "04c4e9e",
+  "gpu": "NVIDIA GB300",
+  "tensor_parallel_size": 4,
+  "block_size_tokens": 2176,
+  "bytes": "bytes for one TP rank, the mean of the decode server's 4 transfers of one request",
+  "versions": {
+    "0.31.0": {
+      "image": "vllm/vllm-openai:v0.31.0",
+      "nixl": "1.4.1",
+      "connector_registration": "Hybrid SSM registration: num_blocks=487934, logical_num_blocks=14351, ratio=34, num_regions=22, num_descs=10734548, mamba_ssm_size=(36864, 1048576), block_len_per_layer={32768, 2112}",
+      "regions": 22,
+      "bytes_per_block": {
+        "attention": 13045120,
+        "ring": 13045120,
+        "kda_9_layers": 9768960,
+        "kda_8_layers": 9768960
+      },
+      "bytes_per_block_provenance": {
+        "attention": "measured slope of bytes_per_rank against attention_blocks_moved",
+        "ring": "derived from connector regions; only the sum of ring and four KDA groups is measured",
+        "kda_9_layers": "derived from connector regions; only the sum of ring and four KDA groups is measured",
+        "kda_8_layers": "derived from connector regions; only the sum of ring and four KDA groups is measured"
+      },
+      "region_sums": {
+        "attention_block": "11 * 1,114,112 + 11 * 71,808 = 13,045,120",
+        "ring_block": "all 22 regions = 13,045,120",
+        "kda_block": "9 state regions * (36,864 + 1,048,576) = 9,768,960"
+      },
+      "formula": "13045120 * attention_blocks_moved + 52120960",
+      "rows": [
+        {
+          "prompt_tokens": 1000,
+          "transferred_tokens": 999,
+          "prefill_attention_blocks": 1,
+          "attention_blocks_moved": 1,
+          "bytes_per_rank": 65166080,
+          "descriptors_per_rank": 188,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 1000,
+          "transferred_tokens": 999,
+          "prefill_attention_blocks": 1,
+          "attention_blocks_moved": 1,
+          "bytes_per_rank": 65166080,
+          "descriptors_per_rank": 188,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 2176,
+          "transferred_tokens": 2175,
+          "prefill_attention_blocks": 1,
+          "attention_blocks_moved": 1,
+          "bytes_per_rank": 65166080,
+          "descriptors_per_rank": 188,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 2176,
+          "transferred_tokens": 2175,
+          "prefill_attention_blocks": 1,
+          "attention_blocks_moved": 1,
+          "bytes_per_rank": 65166080,
+          "descriptors_per_rank": 188,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 2177,
+          "transferred_tokens": 2176,
+          "prefill_attention_blocks": 1,
+          "attention_blocks_moved": 1,
+          "bytes_per_rank": 65166080,
+          "descriptors_per_rank": 188,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 2177,
+          "transferred_tokens": 2176,
+          "prefill_attention_blocks": 1,
+          "attention_blocks_moved": 1,
+          "bytes_per_rank": 65166080,
+          "descriptors_per_rank": 188,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 5000,
+          "transferred_tokens": 4999,
+          "prefill_attention_blocks": 3,
+          "attention_blocks_moved": 3,
+          "bytes_per_rank": 91256320,
+          "descriptors_per_rank": 232,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 5000,
+          "transferred_tokens": 4999,
+          "prefill_attention_blocks": 3,
+          "attention_blocks_moved": 3,
+          "bytes_per_rank": 91256320,
+          "descriptors_per_rank": 232,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 5000,
+          "transferred_tokens": 4999,
+          "prefill_attention_blocks": 3,
+          "attention_blocks_moved": 3,
+          "bytes_per_rank": 91256320,
+          "descriptors_per_rank": 232,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 5000,
+          "transferred_tokens": 4999,
+          "prefill_attention_blocks": 3,
+          "attention_blocks_moved": 1,
+          "bytes_per_rank": 65166080,
+          "descriptors_per_rank": 188,
+          "prompt": "the same prompt as the request before"
+        },
+        {
+          "prompt_tokens": 30000,
+          "transferred_tokens": 29999,
+          "prefill_attention_blocks": 14,
+          "attention_blocks_moved": 14,
+          "bytes_per_rank": 234752640,
+          "descriptors_per_rank": 452,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 30000,
+          "transferred_tokens": 29999,
+          "prefill_attention_blocks": 14,
+          "attention_blocks_moved": 14,
+          "bytes_per_rank": 234752640,
+          "descriptors_per_rank": 474,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 130000,
+          "transferred_tokens": 129999,
+          "prefill_attention_blocks": 60,
+          "attention_blocks_moved": 60,
+          "bytes_per_rank": 834828160,
+          "descriptors_per_rank": 1486,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 130000,
+          "transferred_tokens": 129999,
+          "prefill_attention_blocks": 60,
+          "attention_blocks_moved": 60,
+          "bytes_per_rank": 834828160,
+          "descriptors_per_rank": 1486,
+          "prompt": "new random token IDs"
+        }
+      ]
+    },
+    "0.32.0": {
+      "image": "vllm/vllm-openai:v0.32.0",
+      "nixl": "1.5.0",
+      "connector_registration": "Hybrid SSM registration: num_blocks=13888, logical_num_blocks=13888, ratio=1, num_regions=40, num_descs=555520, mamba_ssm_size=(36864, 1048576), block_len_per_layer={71808, 1114112, 2048}",
+      "regions": 40,
+      "bytes_per_block": {
+        "attention": 21978496,
+        "ring": 92288,
+        "kda_9_layers": 9768960,
+        "kda_8_layers": 9768960
+      },
+      "bytes_per_block_provenance": {
+        "attention": "measured slope of bytes_per_rank against attention_blocks_moved",
+        "ring": "derived from connector regions; only the sum of ring and four KDA groups is measured",
+        "kda_9_layers": "derived from connector regions; only the sum of ring and four KDA groups is measured",
+        "kda_8_layers": "derived from connector regions; only the sum of ring and four KDA groups is measured"
+      },
+      "region_sums": {
+        "attention_block": "11 * 71,808 + 19 * 1,114,112 + 10 * 2,048 = 21,978,496",
+        "ring_block": "11 scratch regions: 71,808 + 10 * 2,048 = 92,288",
+        "kda_block": "9 state regions * (36,864 + 1,048,576) = 9,768,960"
+      },
+      "formula": "21978496 * attention_blocks_moved + 39168128",
+      "rows": [
+        {
+          "prompt_tokens": 1000,
+          "transferred_tokens": 999,
+          "prefill_attention_blocks": 1,
+          "attention_blocks_moved": 1,
+          "bytes_per_rank": 61146624,
+          "descriptors_per_rank": 195,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 1000,
+          "transferred_tokens": 999,
+          "prefill_attention_blocks": 1,
+          "attention_blocks_moved": 1,
+          "bytes_per_rank": 61146624,
+          "descriptors_per_rank": 195,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 2176,
+          "transferred_tokens": 2175,
+          "prefill_attention_blocks": 1,
+          "attention_blocks_moved": 1,
+          "bytes_per_rank": 61146624,
+          "descriptors_per_rank": 195,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 2176,
+          "transferred_tokens": 2175,
+          "prefill_attention_blocks": 1,
+          "attention_blocks_moved": 1,
+          "bytes_per_rank": 61146624,
+          "descriptors_per_rank": 195,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 2177,
+          "transferred_tokens": 2176,
+          "prefill_attention_blocks": 1,
+          "attention_blocks_moved": 1,
+          "bytes_per_rank": 61146624,
+          "descriptors_per_rank": 195,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 2177,
+          "transferred_tokens": 2176,
+          "prefill_attention_blocks": 1,
+          "attention_blocks_moved": 1,
+          "bytes_per_rank": 61146624,
+          "descriptors_per_rank": 195,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 5000,
+          "transferred_tokens": 4999,
+          "prefill_attention_blocks": 3,
+          "attention_blocks_moved": 3,
+          "bytes_per_rank": 105103616,
+          "descriptors_per_rank": 275,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 5000,
+          "transferred_tokens": 4999,
+          "prefill_attention_blocks": 3,
+          "attention_blocks_moved": 3,
+          "bytes_per_rank": 105103616,
+          "descriptors_per_rank": 275,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 5000,
+          "transferred_tokens": 4999,
+          "prefill_attention_blocks": 3,
+          "attention_blocks_moved": 3,
+          "bytes_per_rank": 105103616,
+          "descriptors_per_rank": 275,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 5000,
+          "transferred_tokens": 4999,
+          "prefill_attention_blocks": 3,
+          "attention_blocks_moved": 1,
+          "bytes_per_rank": 61146624,
+          "descriptors_per_rank": 195,
+          "prompt": "the same prompt as the request before"
+        },
+        {
+          "prompt_tokens": 30000,
+          "transferred_tokens": 29999,
+          "prefill_attention_blocks": 14,
+          "attention_blocks_moved": 14,
+          "bytes_per_rank": 346867072,
+          "descriptors_per_rank": 715,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 30000,
+          "transferred_tokens": 29999,
+          "prefill_attention_blocks": 14,
+          "attention_blocks_moved": 14,
+          "bytes_per_rank": 346867072,
+          "descriptors_per_rank": 715,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 130000,
+          "transferred_tokens": 129999,
+          "prefill_attention_blocks": 60,
+          "attention_blocks_moved": 60,
+          "bytes_per_rank": 1357877888,
+          "descriptors_per_rank": 2555,
+          "prompt": "new random token IDs"
+        },
+        {
+          "prompt_tokens": 130000,
+          "transferred_tokens": 129999,
+          "prefill_attention_blocks": 60,
+          "attention_blocks_moved": 60,
+          "bytes_per_rank": 1357877888,
+          "descriptors_per_rank": 2555,
+          "prompt": "new random token IDs"
+        }
+      ]
+    }
+  }
+}
