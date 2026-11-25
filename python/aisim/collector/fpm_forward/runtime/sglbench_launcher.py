@@ -54,7 +54,11 @@ Exit codes
     exits 2 for the launcher's own flags. From step 3 on every failure leaves a failed rank artifact at the
     output path and one line ``[sglbench] FAILED: <reason>`` on stderr, unless the artifact cannot be written:
     an output path that names no file, or a directory that cannot be made or written to. The write error is
-    then printed after the reason. An unknown value of ``DYN_BENCHMARK_MODE`` is refused with 64 and no
+    then printed after the reason. When standard error cannot be written to, as with a reader that has gone,
+    the launcher's own lines are lost and the artifact is the same (``_say``). The exit code is the same too,
+    unless the last flush of the Python process fails for another reason, which makes it 120: argparse's own
+    message, bytes left on a standard output that has no reader either, or a null device that cannot be
+    opened (``_give_up_stderr``). An unknown value of ``DYN_BENCHMARK_MODE`` is refused with 64 and no
     artifact, because an artifact needs the mode. The number of rank files is SGLang's resolved
     ``attn_dp_size``, which the launcher takes over at the end of step 5. A run with several attention-DP
     ranks that fails after that leaves a failed rank artifact for every rank; one that fails before it leaves
@@ -104,7 +108,7 @@ files under ``python/sglang`` at both tags::
                                              derive_attn_tp_size, derive_attention_ranks, num_dp_ranks_of
     srt/eplb/expert_location.py              ExpertLocationMetadata._init_common
     srt/layers/moe/fused_moe_triton/layer.py FusedMoE.__init__
-    srt/environ.py                           EnvField.get, EnvBool.parse, EnvInt.parse and eight variables of
+    srt/environ.py                           EnvField.get, EnvBool.parse, EnvInt.parse and nine variables of
                                              Envs
     srt/utils/common.py                      get_bool_env_var, kill_process_tree, require_attn_tp_gather,
                                              require_mlp_sync
@@ -122,9 +126,11 @@ files under ``python/sglang`` at both tags::
                                              init_req_max_new_tokens, init_watch_dog_memory_saver_input_blocker,
                                              maybe_init_scripted_scheduler_hook, update_running_batch,
                                              get_next_batch_to_run, get_num_allocatable_reqs,
-                                             _should_defer_prefill, _dispatch_event_loop_once
+                                             _should_defer_prefill, _dispatch_event_loop_once,
+                                             event_loop_normal, event_loop_overlap
     srt/managers/schedule_policy.py          SchedulePolicy.calc_priority, SchedulePolicy._compute_prefix_matches,
                                              PrefillAdder._kv_shard_reserve_scratch
+    srt/managers/scheduler_components/invariant_checker.py   SchedulerInvariantChecker.self_check_during_busy
     srt/managers/scheduler_components/request_receiver.py   recv_limit_reached
     srt/managers/min_free_slots_delayer.py   resolve_min_free_slots
     srt/managers/scheduler_components/recv_skipper.py   SchedulerRecvSkipper.maybe_create
@@ -138,6 +144,7 @@ files under ``python/sglang`` at both tags::
                                              run_scheduler_process_with_init_pipe
     srt/mem_cache/kv_cache_builder.py        build_kv_cache
     srt/mem_cache/registry.py                create_tree_cache
+    srt/mem_cache/storage/seaweedfs/seaweedfs_store.py   SeaweedFSConfig
 
 Seen on running engines: benchmarks/evidence/collector/sglbench-engine-probe-20261113 (check_1). The probe
 driver kept in that folder parsed with ``prepare_server_args`` and built its engine with another scheduler
@@ -512,8 +519,44 @@ def _rejected(text: str) -> _Failed:
 
 
 def _say(text: str) -> None:
-    """Print one line of the launcher. SGLang resets the logging setup, so this does not go through logging."""
-    print(f"[sglbench] {text}", file=sys.stderr, flush=True)
+    """Print one line of the launcher. SGLang resets the logging setup, so this does not go through logging.
+
+    Raises no ``Exception``. Standard error can stop taking lines, as when its reader has gone
+    (``BrokenPipeError``). A line that cannot be printed must change neither the outcome of the run nor its
+    result files nor the exit code: the result files carry the outcome.
+    """
+    try:
+        print(f"[sglbench] {text}", file=sys.stderr, flush=True)
+    except Exception:
+        _give_up_stderr()
+
+
+def _say_traceback() -> None:
+    """Print the traceback of the exception that is being handled. Raises no ``Exception``, as ``_say``."""
+    try:
+        traceback.print_exc(file=sys.stderr)
+    except Exception:
+        _give_up_stderr()
+
+
+def _give_up_stderr() -> None:
+    """Put a sink in the place of a standard error that a print has failed on. Raises no ``Exception``.
+
+    Catching the error is not enough for the exit code. The stream keeps the bytes of the print that failed,
+    and Python flushes ``sys.stderr`` once more when the process ends; a flush that fails there makes the exit
+    status 120, whatever ``main`` returned (the Python documentation of ``sys.exit``; seen with CPython 3.12
+    and a pipe whose reader was closed). With a sink under that name the last flush succeeds.
+
+    The sink takes every later write to ``sys.stderr`` in this process, not only the launcher's lines: the
+    message of SGLang's argument parser, Python warnings and the traceback of an unexpected error go there as
+    well. The stream is not tried again, so this also holds when the failure was a passing one, as a pipe
+    that was full for a moment; the result files still carry the outcome.
+    """
+    try:
+        # Opened without a ``with``: the sink is the standard error of the process from here to its end.
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
+    except Exception:
+        pass
 
 
 def _shown(value: object) -> str:
@@ -991,7 +1034,7 @@ def _sglang_env_int(environ: Mapping[str, str], name: str) -> int | None:
 
 
 def _check_sglang_environment(environ: Mapping[str, str]) -> None:
-    """Refuse variables of SGLang that change admission, caching or the steps of a run.
+    """Refuse variables of SGLang that change admission, caching, the steps of a run or the time of a step.
 
     Each is read in the scheduler processes, which inherit the launcher's environment, so the launcher can
     test them before it builds anything. The scheduler side of one of them is tested again from the recorder
@@ -1025,6 +1068,20 @@ def _check_sglang_environment(environ: Mapping[str, str]) -> None:
     per_poll = _sglang_env_int(environ, "SGLANG_SCHEDULER_MAX_RECV_PER_POLL")
     if per_poll is not None and per_poll >= 0:
         raise _rejected(f"SGLANG_SCHEDULER_MAX_RECV_PER_POLL must be unset (got {per_poll})")
+    # srt/managers/scheduler.py ``Scheduler.event_loop_normal`` and ``Scheduler.event_loop_overlap`` read it at
+    # the end of every turn of the scheduler loop and, at any integer but 0, check the KV pools there
+    # (srt/managers/scheduler_components/invariant_checker.py
+    # ``SchedulerInvariantChecker.self_check_during_busy``). The check walks the requests that hold rows of
+    # the pool, logs every turn at a value above 1 and ends the scheduler process when it finds a leak. With
+    # overlap scheduling, which every run here has, the turn that launches a batch ends before the result of
+    # that batch is taken. So the check lies inside the time of every prefill batch, and between the outputs
+    # of two decode steps. SGLang's default is 0.
+    strict = _sglang_env_int(environ, "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY")
+    if strict is not None and strict != 0:
+        raise _rejected(
+            f"SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY must be unset or 0 (got {strict}): SGLang would check "
+            "its KV pools inside every timed step"
+        )
 
 
 # SGLang's variable that gives every scheduler process an input blocker.
@@ -1608,9 +1665,23 @@ def _switch_on_input_blocker(view: object, environ: MutableMapping[str, str], pr
 
 # Fields of SGLang's resolved arguments that hold a secret. SGLang itself hides the three watermark fields
 # before it logs the record or serves it (srt/sampling/watermarking/core.py ``redact_watermark_secrets``, used
-# by srt/entrypoints/engine.py ``_server_args_for_logging``); the two keys are in
-# srt/arg_groups/fields/serving.py ``Serving``. The dump is copied to the collector host.
-_SECRET_FIELDS = ("api_key", "admin_api_key", "watermark_key", "watermark_key_b", "watermark_config")
+# by srt/entrypoints/engine.py ``_server_args_for_logging``); the two keys and the password of the TLS key
+# file are in srt/arg_groups/fields/serving.py ``Serving``. The extra config of a storage backend
+# (srt/arg_groups/fields/memory.py ``Memory``) is JSON text that can carry the access key and the secret key
+# of an object store (srt/mem_cache/storage/seaweedfs/seaweedfs_store.py ``SeaweedFSConfig``), so it is
+# hidden whole. The launcher refuses a storage backend, and SGLang takes the field without one. The field
+# ``unified_cache_external_linker_config`` of the same class, which v0.5.23 adds, stays in the dump: no key
+# of a credential was found in what SGLang's own linkers read from it. The dump is copied to the collector
+# host.
+_SECRET_FIELDS = (
+    "api_key",
+    "admin_api_key",
+    "ssl_keyfile_password",
+    "watermark_key",
+    "watermark_key_b",
+    "watermark_config",
+    "hicache_storage_backend_extra_config",
+)
 
 
 def _json_ready(value: object) -> object:
@@ -2277,7 +2348,7 @@ def main(argv: list[str] | None = None) -> int:
         run.record_failure(f"{REASON_STOPPED}: {stop.what}")
     except Exception as error:
         # Not a failure the launcher knows: the traceback goes to stderr for whoever has to find the cause.
-        traceback.print_exc(file=sys.stderr)
+        _say_traceback()
         run.record_failure(f"{driver.REASON_INTERNAL}: {_described(error)}")
     except BaseException as error:
         # SystemExit and KeyboardInterrupt that the launcher did not raise itself: see ``_StopRequested``.

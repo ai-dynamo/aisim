@@ -2480,6 +2480,46 @@ def test_a_deadline_that_passes_after_the_last_point_leaves_the_run_complete(tmp
     assert on_disk["timing"]["benchmark_elapsed_seconds"] >= FAKE_TIMEOUT_SECONDS
 
 
+@pytest.mark.parametrize(
+    ("mode", "reason"),
+    [("decode", "measured_decode_context_mismatch"), ("prefill", "measured_prefill_tokens_mismatch")],
+)
+def test_a_batch_that_is_written_late_for_the_last_call_before_the_deadline_fails_the_run(
+    tmp_path, monkeypatch, mode, reason
+):
+    completed = 4
+    fake = _start(tmp_path, mode, execute=False)
+    real = artifact.build_measurement
+
+    def build_then_late_batch_and_deadline(record, rank_fpms):
+        # FAKE: the scheduler ran one decode batch more for the last call of point 4. Its line reaches the log
+        # when that call has been checked, and the soft deadline passes before the next point.
+        if record["benchmark_id"] == completed:
+            late = {"mode": "DECODE", "rids": fake.engine.calls[-1].rids, "ticks": FAKE_DECODE_BASE_TICKS}
+            fake.engine.logs[0].batch(late, fake.clock.ticks)
+            fake.clock.advance(round(FAKE_TIMEOUT_SECONDS * TICKS_PER_SECOND))
+        return real(record, rank_fpms)
+
+    monkeypatch.setattr(artifact, "build_measurement", build_then_late_batch_and_deadline)
+    fake.execute()
+
+    # Not a partial run: the late batch fails it, and it names no point, as a late batch at the end of a sweep.
+    assert fake.run.status == "failed"
+    assert fake.run.reason.startswith(f"{reason}: a DECODE batch (seq ")
+    assert fake.run.reason.endswith(") holds requests of a call that had already been checked")
+    # Nothing was sent for a point after the deadline.
+    assert fake.sent_benchmark_ids() == set(range(completed + 1))
+    on_disk = _assert_rejected(fake, "failed")
+    # The file keeps both facts and the rows of the points that completed.
+    assert (on_disk["stop_reason"], on_disk["error"], on_disk["usable"]) == ("timeout", fake.run.reason, False)
+    assert on_disk["coverage"] == {
+        "expected_points": len(fake.built.points),
+        "completed_points": completed,
+        "skipped_points": 0,
+    }
+    assert [row["point"] for row in on_disk["results"]] == fake.built.point_dicts()[:completed]
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # record_failure, write, and stops
 # ---------------------------------------------------------------------------------------------------------------

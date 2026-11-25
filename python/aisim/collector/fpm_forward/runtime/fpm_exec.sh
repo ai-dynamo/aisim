@@ -456,6 +456,10 @@ PY
 # The two pipes are in a folder of this script alone on this node. ${workdir}
 # is no place for them: the Slurm transport mounts one folder there for every
 # node of a cell, and each node's script would make and remove the same names.
+# The folder is made under TMPDIR where that works. The variable can come from
+# the shell that started the cell and name a folder this container does not
+# have, so /tmp is tried next. A cell with neither place fails here, before
+# its engine starts.
 #
 # mawk, the awk of Debian and Ubuntu images, fills its buffer from a pipe
 # before it looks for lines, so its two copies run behind the engine and are
@@ -465,7 +469,11 @@ PY
 # it.
 engine_stream_noise='[0-9]+%[|]|[|] *[0-9]+/[0-9]+ [[]'
 engine_stream_filter='{ print > logfile; fflush(logfile); if ($0 !~ noise) { print; fflush() } }'
-engine_stream_dir="$(mktemp -d "${TMPDIR:-/tmp}/fpm-engine-streams.XXXXXX")"
+engine_stream_dir="$(mktemp -d "${TMPDIR:-/tmp}/fpm-engine-streams.XXXXXX" 2>/dev/null)" ||
+  engine_stream_dir="$(mktemp -d /tmp/fpm-engine-streams.XXXXXX)" || {
+    echo "Cannot make a folder for the engine output pipes under TMPDIR (${TMPDIR:-not set}) or under /tmp" >&2
+    exit 1
+  }
 mkfifo "${engine_stream_dir}/stdout" "${engine_stream_dir}/stderr"
 awk -v logfile=/results/engine.stdout.log -v noise="${engine_stream_noise}" \
   "${engine_stream_filter}" < "${engine_stream_dir}/stdout" &

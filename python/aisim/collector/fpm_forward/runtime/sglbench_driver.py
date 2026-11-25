@@ -31,7 +31,8 @@ A run (``BenchmarkRun.execute``), in this order:
 7. run the self-test, then the global warm-up;
 8. stage, check and record every point in grid order. Before each point a recorder fault fails the run and
    the soft deadline ends it as partial;
-9. look for recorder faults once more.
+9. look for recorder faults once more, and for a batch that was written late for the last call. A run the
+   soft deadline ended is looked at for such a batch as well, and fails on one.
 
 The first failure is recorded and ends the run; ``execute`` does not raise for it. ``BenchmarkRun.write``
 writes one rank file for every attention-DP rank and, unless the run failed, the merged file.
@@ -956,6 +957,10 @@ class BenchmarkRun:
             # has started is finished; a deadline that passes after the last point leaves the run complete.
             if self._clock() - self._started_at >= self.settings.timeout_seconds:
                 self._stop_reason = artifact.STOP_REASON_TIMEOUT
+                # No call follows the last one, so the look for a batch that was written late for it is made
+                # here, as at the end of the sweep. The stop reason is set first: a late batch then fails the
+                # run, and the failed artifact still names the deadline and keeps the rows that completed.
+                self._refuse_late_batches()
                 return
             record = point.as_dict()
             self._current_point = record
@@ -1341,6 +1346,9 @@ class BenchmarkRun:
         requests of the last call beyond the lines that call was checked on, or requests of an earlier call.
         Every rank's leader log is looked at with the requests of that rank; a request of the run in the log
         of another rank than its own is found the same way.
+
+        It runs before every call, and once after the last call of a run: at the end of the sweep, and at the
+        soft deadline when that ends the run.
         """
         if self._checked is None:
             return

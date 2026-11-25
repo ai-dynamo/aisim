@@ -716,27 +716,34 @@ def test_a_dep_result_of_two_ranks_is_accepted_and_gives_dep_rows_with_the_sizes
     )
 
 
-def test_result_files_of_a_launcher_without_dp_attention_pass_for_their_cells_and_are_no_dep_result(tmp_path):
-    # A launcher of that time wrote no attention-DP size. Its files are still the results of its cells.
-    plan, _overrides = _resolved()
+def test_result_files_of_a_launcher_without_dp_attention_are_refused_for_every_cell_of_a_plan_made_now(tmp_path):
+    # A launcher of that time wrote no attention-DP size. Its files belong to a plan of that source revision, and
+    # under a plan made now a block without the size is no record of one rank: the launcher writes the size into
+    # every result file. The two sizes such a block holds are those of the cell, and it is refused all the same.
+    plan, _overrides = _resolved(presets=())
     for phase in ("prefill", "decode"):
-        for strategy in ("single", "tep"):
+        for strategy, sizes in (("single", (1, 1)), ("tep", (2, 2))):
             cell = _cell(plan, phase, strategy)
             cell_dir = tmp_path / cell.cell_id
             payloads = _launcher_files(cell, _older_producer(cell))
             assert "attn_dp_size" not in payloads[0]["producer"]
-            _collected(cell_dir, plan, cell, payloads)
+            written = _collected(cell_dir, plan, cell, payloads)
+            refusal = _not_the_layout(*sizes, str(sizes[0]), str(sizes[1]), found_dp="None")
 
-            assert len(_validate(plan, cell, cell_dir).points) == len(_points(phase))
-            rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
-            assert {(row["parallel_strategy"], row["dp"]) for row in rows} == {(strategy, 1)}
+            with pytest.raises(ValueError) as refused:
+                _validate(plan, cell, cell_dir)
 
-    # The DEP cell of the plan with the default preset. Two rank files with such a block are refused whatever
-    # two sizes the block holds: those SGLang resolves for the DEP cell, which are also those of the TEP cell
-    # of the same GPUs; those of the one-GPU cell; and the cell's own tp beside its moe_ep.
-    dep_plan, _overrides = _resolved(presets=())
+            assert str(refused.value) == refusal + written["rank_files"][0]
+            with pytest.raises(ValueError, match="^" + re.escape(refusal)):
+                aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+            # Every other rule accepts the files: only this comparison reads the key.
+            assert len(_validate(plan, cell, cell_dir, expected_moe=None).points) == len(_points(phase))
+
+    # The DEP cell of the same plan. Two rank files with such a block are refused whatever two sizes the block
+    # holds: those SGLang resolves for the DEP cell, which are also those of the TEP cell of the same GPUs;
+    # those of the one-GPU cell; and the cell's own tp beside its moe_ep.
     for phase in ("prefill", "decode"):
-        dep = _cell(dep_plan, phase, "dep")
+        dep = _cell(plan, phase, "dep")
         for name, sizes, found in (
             ("as-recorded", {}, ("2", "2")),
             ("one-rank", {"tp_size": 1, "ep_size": 1}, ("1", "1")),
@@ -744,14 +751,14 @@ def test_result_files_of_a_launcher_without_dp_attention_pass_for_their_cells_an
         ):
             root = tmp_path / f"dep-{phase}-{name}"
             payloads = _launcher_files(dep, _older_producer(dep, **sizes))
-            written = _collected(root, dep_plan, dep, payloads)
+            written = _collected(root, plan, dep, payloads)
 
             with pytest.raises(ValueError) as refused:
-                _validate(dep_plan, dep, root)
+                _validate(plan, dep, root)
 
-            assert str(refused.value) == _dep_refusal(*found, "1") + written["rank_files"][0]
-            with pytest.raises(ValueError, match=re.escape(_dep_refusal(*found, "1"))):
-                aggregate_cell(dep_plan, dep, root, expected_attempt_id="attempt")
+            assert str(refused.value) == _dep_refusal(*found, "None") + written["rank_files"][0]
+            with pytest.raises(ValueError, match=re.escape(_dep_refusal(*found, "None"))):
+                aggregate_cell(plan, dep, root, expected_attempt_id="attempt")
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -865,11 +872,33 @@ DIFFERS_FROM_THE_CELL = {
         lambda producer: producer.update(attn_dp_size=True),
         _not_the_layout(1, 1, "1", "1", found_dp="True"),
     ),
-    # Only a block without the key counts as one rank: a key without a size is no size.
+    # A key without a size is no size, and neither is the written form of the number.
     "an-attention-dp-size-of-none": (
         "tep",
         lambda producer: producer.update(attn_dp_size=None),
         _not_the_layout(2, 2, "2", "2", found_dp="None"),
+    ),
+    "an-attention-dp-size-that-is-a-string": (
+        "single",
+        lambda producer: producer.update(attn_dp_size="1"),
+        _not_the_layout(1, 1, "1", "1", found_dp="'1'"),
+    ),
+    # A block without the key is no record of one rank: the launcher writes the size into every result file,
+    # with 1 for a run without DP attention.
+    "single-without-an-attention-dp-size": (
+        "single",
+        lambda producer: producer.pop("attn_dp_size"),
+        _not_the_layout(1, 1, "1", "1", found_dp="None"),
+    ),
+    "tep-without-an-attention-dp-size": (
+        "tep",
+        lambda producer: producer.pop("attn_dp_size"),
+        _not_the_layout(2, 2, "2", "2", found_dp="None"),
+    ),
+    "pure-tp-without-an-attention-dp-size": (
+        "pure_tp",
+        lambda producer: producer.pop("attn_dp_size"),
+        _not_the_layout(2, 1, "2", "1", found_dp="None"),
     ),
     # The DEP cell of two ranks. SGLang's tp_size counts both ranks, so the sizes of the cell are 2, 2 and 2.
     # The command reached the pod without --attn-dp-size: two tensor-parallel ranks of one scheduler group.
@@ -878,11 +907,11 @@ DIFFERS_FROM_THE_CELL = {
         lambda producer: producer.update(attn_dp_size=1),
         _dep_refusal("2", "2", "1"),
     ),
-    # A block without the key counts as one rank, so it is no result of a DEP cell.
+    # A block without the key holds no attention-DP size, in a DEP cell as in any other.
     "dep-without-an-attention-dp-size": (
         "dep",
         lambda producer: producer.pop("attn_dp_size"),
-        _dep_refusal("2", "2", "1"),
+        _dep_refusal("2", "2", "None"),
     ),
     "dep-without-the-expert-parallel-size": (
         "dep",
@@ -980,7 +1009,7 @@ def test_the_comparison_names_the_file_it_refuses(tmp_path):
 ONE_RANK_DIFFERS = {
     "expert-parallel-size": (lambda producer: producer["moe"].update(ep_size=1), _dep_refusal("2", "1", "2")),
     "attention-dp-size": (lambda producer: producer.update(attn_dp_size=1), _dep_refusal("2", "2", "1")),
-    "no-attention-dp-size": (lambda producer: producer.pop("attn_dp_size"), _dep_refusal("2", "2", "1")),
+    "no-attention-dp-size": (lambda producer: producer.pop("attn_dp_size"), _dep_refusal("2", "2", "None")),
     "tensor-parallel-size": (lambda producer: producer.update(tp_size=1), _dep_refusal("1", "2", "2")),
 }
 

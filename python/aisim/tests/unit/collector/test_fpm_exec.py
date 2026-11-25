@@ -645,7 +645,7 @@ _HOLDING_AWK = """#!/bin/bash
 if [[ "${{1:-}}" == "-W" && "${{2:-}}" == "version" ]]; then
   exec {real_awk} "$@"
 fi
-held=""
+{note_pid}held=""
 while IFS= read -r line; do
   held+="${{line}}"$'\\n'
 done
@@ -654,14 +654,16 @@ printf '%s' "${{held}}" | {real_awk} "$@"
 """
 
 
-def _install_holding_awk(tmp_path: Path, *, pause: float = 0) -> None:
-    """Make the gate's awk one that still holds every engine line when the engine ends."""
+def _install_holding_awk(tmp_path: Path, *, pause: float = 0, pids: Path | None = None) -> None:
+    """Make the gate's awk one that still holds every engine line when the engine ends. With ``pids`` each
+    filter adds its process id to that file when it starts."""
 
     real_awk, sleep = shutil.which("awk"), shutil.which("sleep")
     assert real_awk and sleep
+    note_pid = f'echo "$$" >> {shlex.quote(str(pids))}\n' if pids else ""
     _write_executable(
         tmp_path / "bin" / "awk",
-        _HOLDING_AWK.format(real_awk=shlex.quote(real_awk), sleep=shlex.quote(sleep), pause=pause),
+        _HOLDING_AWK.format(real_awk=shlex.quote(real_awk), sleep=shlex.quote(sleep), pause=pause, note_pid=note_pid),
     )
 
 
@@ -863,6 +865,86 @@ while True:
     ]
 
 
+NO_PLACE_FOR_THE_PIPES = "Cannot make a folder for the engine output pipes under TMPDIR ({tmpdir}) or under /tmp"
+
+
+def _stage_with_a_tmpdir_that_does_not_exist(tmp_path: Path, second_place: Path) -> SimpleNamespace:
+    """One staged pod whose TMPDIR names a folder that does not exist. The second place the gate tries for the
+    folder of its pipes, /tmp in a pod, is ``second_place`` here, so that no test writes to the /tmp of this
+    machine."""
+
+    staged = _stage(tmp_path, run_script="")
+    script = staged.script.read_text()
+    second_attempt = "mktemp -d /tmp/fpm-engine-streams.XXXXXX"
+    assert script.count(second_attempt) == 1
+    staged.script.write_text(
+        script.replace(second_attempt, f"mktemp -d {shlex.quote(str(second_place / 'fpm-engine-streams.XXXXXX'))}")
+    )
+    staged.env["TMPDIR"] = str(tmp_path / "no-such-folder")
+    return staged
+
+
+def test_a_tmpdir_that_does_not_exist_does_not_stop_the_cell(tmp_path):
+    """TMPDIR can come from the shell that started the cell and name a folder that the container does not
+    have. The gate then makes the folder of its two pipes in its second place and the cell runs as any other:
+    both copies of the engine output are written and the folder is gone at the end."""
+
+    second_place = tmp_path / "second-place"
+    second_place.mkdir()
+    staged = _stage_with_a_tmpdir_that_does_not_exist(tmp_path, second_place)
+    seen_path = tmp_path / "second-place-seen.json"
+    files = {str(staged.benchmark_output): _benchmark_result()}
+    engine_body = f"""\
+import json
+import os
+import sys
+
+print("one stdout line of the engine", flush=True)
+print("one stderr line of the engine", file=sys.stderr, flush=True)
+second_place = {str(second_place)!r}
+seen = {{name: sorted(os.listdir(os.path.join(second_place, name))) for name in os.listdir(second_place)}}
+with open({str(seen_path)!r}, "w") as handle:
+    json.dump(seen, handle)
+""" + _writer_engine_body(files)
+    (staged.workdir / "run.sh").write_text(_setsid_run_script(tmp_path, engine_body))
+
+    completed = _run(staged)
+
+    assert completed.returncode == 0, completed.stderr
+    assert not Path(staged.env["TMPDIR"]).exists()
+    # While the engine ran, the second place held one folder of the gate with the two pipes in it.
+    ((folder, pipes),) = json.loads(seen_path.read_text()).items()
+    assert folder.startswith("fpm-engine-streams.") and pipes == ["stderr", "stdout"]
+    assert "one stdout line of the engine" in completed.stdout
+    assert "one stderr line of the engine" in completed.stderr
+    # The first attempt fails without a word: the exec stream of a cell that fell back names neither mktemp
+    # nor the folder that does not exist.
+    assert "mktemp" not in completed.stderr and "no-such-folder" not in completed.stderr
+    assert (staged.results / "engine.stdout.log").read_text().splitlines() == ["one stdout line of the engine"]
+    assert (staged.results / "engine.stderr.log").read_text().splitlines() == ["one stderr line of the engine"]
+    assert list(second_place.iterdir()) == []
+
+
+def test_a_cell_with_no_place_for_its_pipes_fails_before_its_engine_starts(tmp_path):
+    """A gate that can make the folder of its pipes neither under TMPDIR nor in its second place has nothing
+    to start an engine on. It says so and ends as a failed cell."""
+
+    staged = _stage_with_a_tmpdir_that_does_not_exist(tmp_path, tmp_path / "no-second-place")
+    engine_started = tmp_path / "engine-started"
+    files = {str(staged.benchmark_output): _benchmark_result()}
+    engine_body = f"open({str(engine_started)!r}, 'w').close()\n" + _writer_engine_body(files)
+    (staged.workdir / "run.sh").write_text(_setsid_run_script(tmp_path, engine_body))
+
+    completed = _run(staged)
+
+    assert completed.returncode == 1, completed.stderr
+    # The line before it is mktemp's own and says why the second attempt failed.
+    assert completed.stderr.splitlines()[-1] == NO_PLACE_FOR_THE_PIPES.format(tmpdir=staged.env["TMPDIR"])
+    assert not engine_started.exists()
+    assert list(staged.results.glob("engine.*")) == []
+    assert list(staged.results.glob("benchmark*")) == []
+
+
 def test_filters_that_no_engine_ever_wrote_to_are_not_waited_for(tmp_path):
     """A gate that ends between the start of its filters and the start of the engine has two filters that
     still wait for a writer. It ends them at once, without the wait and without the note."""
@@ -888,9 +970,13 @@ def test_filters_that_no_engine_ever_wrote_to_are_not_waited_for(tmp_path):
 
 def test_a_process_that_keeps_the_engine_streams_open_cannot_hold_the_gate(tmp_path):
     """A process that left the engine's process group survives the group kill and keeps both streams open, so
-    the filters never see their end. The gate waits a bounded time, says so and ends with the engine's status."""
+    the filters never see their end. The gate waits a bounded time, says so and ends with the engine's status.
+    The filters here hold every line until their input has ended, as mawk holds a block. A filter that the
+    gate has to kill takes what it holds with it, so the test asks for no line of the engine in either copy:
+    only an awk that passes each line on at once has written one by then."""
 
     staged = _stage(tmp_path, run_script="")
+    _install_holding_awk(tmp_path)
     script = staged.script.read_text()
     assert script.count("engine_stream_drain_seconds=10") == 1
     staged.script.write_text(script.replace("engine_stream_drain_seconds=10", "engine_stream_drain_seconds=2"))
@@ -916,8 +1002,6 @@ sys.exit(23)
         elapsed = time.monotonic() - started
         assert completed.returncode == 23, completed.stderr
         assert completed.stderr.count(DRAIN_NOTE) == 1, completed.stderr
-        assert "the engine wrote this before it ended" in completed.stderr
-        assert "the engine wrote this before it ended" in (staged.results / "engine.stderr.log").read_text()
         assert elapsed < 30, elapsed
         assert _process_is_running(int(stray_pid_path.read_text()))
         assert list(staged.gate_tmp.iterdir()) == []
@@ -927,6 +1011,140 @@ sys.exit(23)
                 os.kill(int(stray_pid_path.read_text()), signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+def _awk_holds_lines_back() -> bool:
+    """Whether the awk of this machine is one that does not look at a line as it arrives. mawk fills a block
+    from a pipe first; what the awk of busybox does was not looked at, so it counts as holding too."""
+
+    awk = shutil.which("awk")
+    return awk is None or Path(awk).resolve().name in ("mawk", "busybox")
+
+
+@pytest.mark.skipif(_awk_holds_lines_back(), reason="the awk of this machine holds lines back")
+def test_a_line_is_in_both_copies_while_its_stream_is_still_open(tmp_path):
+    """The filter program flushes both copies after every line. With an awk that looks at a line as it
+    arrives, a line of the engine is therefore in the exec stream and in the log file before the stream has
+    ended. Here the stream never ends: a process outside the engine's group keeps it open until the gate gives
+    the filters up, and the line is in both copies all the same."""
+
+    staged = _stage(tmp_path, run_script="")
+    script = staged.script.read_text()
+    assert script.count("engine_stream_drain_seconds=10") == 1
+    staged.script.write_text(script.replace("engine_stream_drain_seconds=10", "engine_stream_drain_seconds=2"))
+    stray_pid_path = tmp_path / "stray.pid"
+    engine_body = f"""\
+import pathlib
+import subprocess
+import sys
+
+stray = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(120)"],
+    start_new_session=True,
+)
+pathlib.Path({str(stray_pid_path)!r}).write_text(str(stray.pid))
+print("the engine wrote this before it ended", file=sys.stderr, flush=True)
+sys.exit(23)
+"""
+    (staged.workdir / "run.sh").write_text(_setsid_run_script(tmp_path, engine_body))
+
+    try:
+        completed = _run(staged)
+        assert completed.returncode == 23, completed.stderr
+        assert completed.stderr.count(DRAIN_NOTE) == 1, completed.stderr
+        assert "the engine wrote this before it ended" in completed.stderr
+        assert "the engine wrote this before it ended" in (staged.results / "engine.stderr.log").read_text()
+    finally:
+        if stray_pid_path.exists():
+            try:
+                os.kill(int(stray_pid_path.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.parametrize(
+    "engine_ignores_sigterm", [False, True], ids=["engine-ends-on-sigterm", "engine-ignores-sigterm"]
+)
+def test_a_sigterm_to_the_gate_ends_the_engine_and_keeps_what_it_wrote(tmp_path, engine_ignores_sigterm):
+    """A gate that is told to stop while its engine runs ends the engine, with SIGKILL if the engine ignores
+    SIGTERM, waits for both filters, removes the folder of the pipes and ends with 143. The filters here hold
+    every line until the engine has gone, as mawk holds a block, and write two seconds later, so what the
+    engine wrote before the signal is in both copies only because the gate waited for the filters. The gate's
+    own output goes to files: a pipe to the test would wait for the filters whether the gate does or not."""
+
+    # An engine that ignores SIGTERM is killed after the gate's grace period, which is one second here.
+    staged = _stage(tmp_path, run_script="", engine_grace_seconds=1 if engine_ignores_sigterm else None)
+    on_sigterm = "signal.SIG_IGN" if engine_ignores_sigterm else "lambda *_: sys.exit(0)"
+    filter_pids_path = tmp_path / "filter.pids"
+    _install_holding_awk(tmp_path, pause=2, pids=filter_pids_path)
+    engine_pid_path = tmp_path / "engine.pid"
+    engine_body = f"""\
+import os
+import pathlib
+import signal
+import sys
+import time
+
+signal.signal(signal.SIGTERM, {on_sigterm})
+print("the engine wrote this to stdout before the signal", flush=True)
+print("the engine wrote this to stderr before the signal", file=sys.stderr, flush=True)
+partial = {str(engine_pid_path)!r} + ".tmp"
+pathlib.Path(partial).write_text(str(os.getpid()))
+os.replace(partial, {str(engine_pid_path)!r})
+while True:
+    time.sleep(0.1)
+"""
+    (staged.workdir / "run.sh").write_text(_setsid_run_script(tmp_path, engine_body))
+    exec_stdout, exec_stderr = tmp_path / "exec.stdout", tmp_path / "exec.stderr"
+
+    with exec_stdout.open("w") as out, exec_stderr.open("w") as err:
+        # The gate leads a process group of its own, so that the end of this test can clear what a gate that
+        # fails it has left behind. The signal below goes to the gate's process alone.
+        gate = subprocess.Popen(
+            ["bash", str(staged.script)], stdout=out, stderr=err, env=staged.env, start_new_session=True
+        )
+    try:
+        deadline = time.monotonic() + 30
+        while not engine_pid_path.exists():
+            assert gate.poll() is None and time.monotonic() < deadline, exec_stderr.read_text()
+            time.sleep(0.05)
+        engine_pid = int(engine_pid_path.read_text())
+
+        os.kill(gate.pid, signal.SIGTERM)
+        returncode = gate.wait(timeout=60)
+        # Read at once: what is in the copies at the moment the gate ends is what the collector gets.
+        at_the_end = {
+            path.name: path.read_text() if path.exists() else ""
+            for path in (
+                exec_stdout,
+                exec_stderr,
+                staged.results / "engine.stdout.log",
+                staged.results / "engine.stderr.log",
+            )
+        }
+        engine_is_running = _process_is_running(engine_pid)
+        filter_pids = [int(line) for line in filter_pids_path.read_text().split()] if filter_pids_path.exists() else []
+        filters_running = [pid for pid in filter_pids if _process_is_running(pid)]
+
+        assert returncode == 128 + signal.SIGTERM, at_the_end["exec.stderr"]
+        assert ("sending SIGKILL" in at_the_end["exec.stderr"]) == engine_ignores_sigterm, at_the_end["exec.stderr"]
+        assert DRAIN_NOTE not in at_the_end["exec.stderr"]
+        assert not engine_is_running
+        assert len(filter_pids) == 2 and filters_running == []
+        assert "the engine wrote this to stdout before the signal" in at_the_end["exec.stdout"]
+        assert "the engine wrote this to stderr before the signal" in at_the_end["exec.stderr"]
+        assert at_the_end["engine.stdout.log"].splitlines() == ["the engine wrote this to stdout before the signal"]
+        assert at_the_end["engine.stderr.log"].splitlines() == ["the engine wrote this to stderr before the signal"]
+        assert list(staged.gate_tmp.iterdir()) == []
+    finally:
+        # The engine left the gate's group with its own setsid, so it is cleared by its own group id.
+        groups = [gate.pid] + ([int(engine_pid_path.read_text())] if engine_pid_path.exists() else [])
+        for group in groups:
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        gate.wait(timeout=10)
 
 
 _FAKE_AWK = """#!/bin/bash

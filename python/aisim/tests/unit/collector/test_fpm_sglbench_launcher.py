@@ -59,6 +59,12 @@ is named so:
   temporary directory.
 - Signals are real, sent to the test process with ``signal.raise_signal``, and only while a handler of the
   launcher or ``SIG_IGN`` is in place. A fixture restores the handlers after every test.
+- A standard error whose reader has gone is FAKE (``_FakeGoneStderr``) in every test but one. That one starts
+  the launcher in a process of its own with a real pipe, closes the reading end and reads the exit status;
+  the import of SGLang is refused in that process.
+- One test looks names up in the SGLang source of both tested releases: the fields the dump hides and what
+  the refusal of SGLang's memory check in a busy scheduler rests on. It needs a folder with one checkout per
+  release (``AISIM_SGLBENCH_SGLANG_SOURCES``) and is skipped without it. It parses files and imports nothing.
 - The dataset of a text run is FAKE: ``_fake_dataset_records`` types in records in the layout of the default
   dataset, and a test writes them to a file under pytest's temporary directory. ``_FakeTokenizer`` turns
   every word into one FAKE id; no tokenizer is involved. No test opens a connection: a fixture puts a
@@ -105,9 +111,13 @@ from collector.fpm_forward.types import ParallelTopology
 from .test_fpm_runner import _cell
 from .test_fpm_sglbench_artifact import GATE_ACCEPT, GATE_INVALID, _gate, _pod, _validate
 from .test_fpm_sglbench_content import PageCacheModel
+from .test_fpm_sglbench_preflight import SOURCES_ENV, seam_rows_not_in_source, sglang_source_roots
 
 RUNTIME = Path(__file__).resolve().parents[3] / "collector/fpm_forward/runtime"
 MODULE_PATH = RUNTIME / "sglbench_launcher.py"
+# The folder with one SGLang checkout per tested release, when a developer names one. It is read here because a
+# fixture of this file takes the variable out of the environment of every test.
+SGLANG_SOURCES_AT_IMPORT = os.environ.get(SOURCES_ENV)
 # In the pod the runtime files lie flat in one directory and import each other by bare name. The directory goes
 # to the END of sys.path, so that it shadows nothing.
 if str(RUNTIME) not in sys.path:
@@ -456,6 +466,12 @@ STAGE_S_ACCEPTED = [
 _TOKEN_LIMIT = "SGLANG_MAX_NEW_TOKENS_LIMIT={} is below the 7 output tokens of a decode run"
 _PER_POLL = "SGLANG_SCHEDULER_MAX_RECV_PER_POLL must be unset (got {})"
 _BLOCKER = "SGLANG_ENABLE_COLOCATED_BATCH_GEN must be unset without DP attention"
+# SGLang's scheduler loop tests this integer variable for truth, so every integer but 0 switches the check on,
+# a negative one too (srt/environ.py ``EnvInt``).
+_BUSY_CHECK = (
+    "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY must be unset or 0 (got {}): SGLang would check its KV pools "
+    "inside every timed step"
+)
 SGLANG_ENV_REFUSALS = [
     ("SGLANG_MAX_NEW_TOKENS_LIMIT", "6", _TOKEN_LIMIT.format(6)),
     ("SGLANG_MAX_NEW_TOKENS_LIMIT", "1", _TOKEN_LIMIT.format(1)),
@@ -468,6 +484,10 @@ SGLANG_ENV_REFUSALS = [
     ("SGLANG_TEST_SCRIPTED_RUNTIME", "1", "SGLANG_TEST_SCRIPTED_RUNTIME is a test switch and must be unset"),
     ("SGLANG_SCHEDULER_MAX_RECV_PER_POLL", "0", _PER_POLL.format(0)),
     ("SGLANG_SCHEDULER_MAX_RECV_PER_POLL", "4", _PER_POLL.format(4)),
+    ("SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY", "1", _BUSY_CHECK.format(1)),
+    ("SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY", "2", _BUSY_CHECK.format(2)),
+    ("SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY", " 1 ", _BUSY_CHECK.format(1)),
+    ("SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY", "-1", _BUSY_CHECK.format(-1)),
 ]
 # The variables whose meaning depends on the number of attention-DP ranks, which are tested after resolution:
 # (ranks, name, value, the whole refusal).
@@ -529,6 +549,9 @@ SGLANG_ENV_ACCEPTED = [
     ("SGLANG_TEST_SCRIPTED_RUNTIME", "false"),
     ("SGLANG_SCHEDULER_MAX_RECV_PER_POLL", "-1"),
     ("SGLANG_SCHEDULER_MAX_RECV_PER_POLL", "all"),
+    ("SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY", "0"),
+    ("SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY", "true"),
+    ("SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY", ""),
     ("SGLANG_ENABLE_COLOCATED_BATCH_GEN", "0"),
     ("SGLANG_ENABLE_COLOCATED_BATCH_GEN", "false"),
     ("SGLANG_ENABLE_COLOCATED_BATCH_GEN", "yes"),
@@ -2841,6 +2864,212 @@ def test_a_failed_write_does_not_hide_the_first_reason(tmp_path, monkeypatch, ca
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# A standard error that takes no lines
+# ---------------------------------------------------------------------------------------------------------------
+
+
+class _FakeGoneStderr:
+    """FAKE standard error whose reader goes away: it takes ``good_writes`` writes, and from then on every
+    write fails as on a pipe without a reader, and every flush after such a write."""
+
+    def __init__(self, good_writes: int = 0) -> None:
+        self.good_writes = good_writes
+        self.taken: list[str] = []
+        self.refused: list[str] = []
+
+    def write(self, text: str) -> int:
+        if len(self.taken) < self.good_writes:
+            self.taken.append(text)
+            return len(text)
+        self.refused.append(text)
+        raise BrokenPipeError(32, "FAKE broken pipe")
+
+    def flush(self) -> None:
+        if self.refused:
+            raise BrokenPipeError(32, "FAKE broken pipe")
+
+
+@pytest.fixture
+def lose_stderr(monkeypatch):
+    """Returns a function that puts a ``_FakeGoneStderr`` in the place of ``sys.stderr``.
+
+    pytest puts the stream of before back after the test. The sink the launcher opened is closed here.
+    """
+
+    def lose(good_writes: int = 0) -> _FakeGoneStderr:
+        stream = _FakeGoneStderr(good_writes)
+        monkeypatch.setattr(sys, "stderr", stream)
+        return stream
+
+    yield lose
+    if getattr(sys.stderr, "name", None) == os.devnull:
+        sys.stderr.close()
+
+
+def test_a_line_that_cannot_be_printed_raises_nothing_and_a_sink_takes_the_next_lines(lose_stderr):
+    gone = lose_stderr()
+
+    launcher._say("FAKE first line")
+
+    # The line was tried once, and a sink is in the place of the stream that refused it.
+    assert gone.refused == ["[sglbench] FAKE first line"]
+    sink = sys.stderr
+    assert sink is not gone and sink.name == os.devnull and not sink.closed
+    # What follows goes to the sink, a traceback too: nothing is tried on the old stream again.
+    launcher._say("FAKE second line")
+    try:
+        raise RuntimeError("FAKE failure")
+    except RuntimeError:
+        launcher._say_traceback()
+    assert gone.refused == ["[sglbench] FAKE first line"] and sys.stderr is sink
+
+
+def test_a_traceback_that_cannot_be_printed_raises_nothing_either(lose_stderr):
+    gone = lose_stderr()
+
+    try:
+        raise RuntimeError("FAKE failure")
+    except RuntimeError:
+        launcher._say_traceback()
+
+    assert len(gone.refused) == 1 and gone.refused[0].startswith("Traceback")
+    assert sys.stderr is not gone and sys.stderr.name == os.devnull
+
+
+def test_a_sink_that_cannot_be_opened_does_not_raise(lose_stderr, monkeypatch, tmp_path):
+    gone = lose_stderr()
+    # FAKE: the null device of this machine cannot be opened.
+    monkeypatch.setattr(os, "devnull", str(tmp_path / "FAKE-no-such-directory" / "null"))
+
+    launcher._say("FAKE first line")
+    launcher._say("FAKE second line")
+
+    # The stream stays where it was, and every line is tried on it.
+    assert sys.stderr is gone
+    assert gone.refused == ["[sglbench] FAKE first line", "[sglbench] FAKE second line"]
+
+
+def _fake_shutdown_failure(world, _pod_dir):
+    world.raises["shutdown"] = RuntimeError("FAKE: 2 child processes were not reaped in 60 s")
+
+
+def _fake_deadline_after_the_second_point(world, _pod_dir):
+    world.call_faults[(_planned("decode").points[1].benchmark_id, "run", 0)] = "deadline"
+
+
+def _fake_unexpected_error(world, _pod_dir):
+    world.raises["platform_facts"] = TypeError("FAKE: get_platform().is_cuda is None, not a bool")
+
+
+# What happens in the launch, its mode, and the exit code and the status of the artifact it must end with.
+GONE_STDERR_LAUNCHES = [
+    pytest.param(None, "prefill", 0, "complete", id="a complete run"),
+    pytest.param(_fake_shutdown_failure, "prefill", 0, "complete", id="an engine shutdown that fails"),
+    pytest.param(_fake_deadline_after_the_second_point, "decode", 66, "partial", id="a soft deadline"),
+    pytest.param(_fake_unexpected_error, "prefill", 70, "failed", id="an unexpected error"),
+]
+
+
+# With 0 the reader has gone before the launcher's first line. With 2 it goes right after that line, which is
+# two writes, so that in the launch with an unexpected error the traceback is the first thing that fails.
+@pytest.mark.parametrize("good_writes", [0, 2])
+@pytest.mark.parametrize(("prepare", "mode", "code", "status"), GONE_STDERR_LAUNCHES)
+def test_a_launch_whose_stderr_takes_no_lines_ends_with_the_code_and_the_files_of_its_outcome(
+    tmp_path, monkeypatch, lose_stderr, prepare, mode, code, status, good_writes
+):
+    gone = lose_stderr(good_writes)
+
+    launch = _launch(tmp_path, monkeypatch, mode, prepare=prepare)
+
+    assert launch.code == code
+    on_disk = launch.artifact()
+    assert on_disk["status"] == status
+    if status == "complete":
+        _assert_accepted(launch)
+    else:
+        with pytest.raises(ValueError, match="invalid native terminal result envelope"):
+            _validate(launch.cell, launch.root)
+    if prepare is _fake_shutdown_failure:
+        assert on_disk["producer"]["engine_shutdown_error"].startswith("RuntimeError: FAKE: 2 child processes")
+    if prepare is _fake_unexpected_error:
+        assert on_disk["error"] == "internal_error: TypeError: FAKE: get_platform().is_cuda is None, not a bool"
+    # The files were written and the final wait was kept.
+    assert launch.world.events[-2:] == ["write", "sleep"]
+    # One print failed on the stream and none was tried on it afterwards: the rest went to the sink.
+    assert len(gone.taken) == good_writes and len(gone.refused) == 1
+    assert sys.stderr is not gone and sys.stderr.name == os.devnull
+
+
+# A child process that runs the launcher without SGLang. It waits until the test has closed its standard input,
+# which the test does once the reader of the child's standard error is gone, or kept.
+_LAUNCH_WITHOUT_SGLANG = """
+import sys
+
+sys.stdin.read()
+
+
+class Refuse:
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] == "sglang":
+            raise ImportError("refused in this test: " + name)
+        return None
+
+
+sys.meta_path.insert(0, Refuse())
+sys.path.append(sys.argv[1])
+import sglbench_launcher
+
+# No gate polls the files of this test, so the launcher need not stay alive for it.
+sglbench_launcher.FINAL_WAIT_SECONDS = 0.0
+sys.exit(sglbench_launcher.main(sys.argv[2:]))
+"""
+
+
+@pytest.mark.parametrize(
+    ("flags", "code", "error"),
+    [
+        (["--benchmark-timeout", "0"], 64, "rejected: --benchmark-timeout must be above 0, got 0"),
+        ([], 70, "internal_error: ImportError: refused in this test: sglang"),
+    ],
+    ids=["a refused flag", "a start without SGLang"],
+)
+def test_a_process_whose_stderr_reader_has_gone_exits_with_the_code_of_its_outcome(tmp_path, flags, code, error):
+    """A real process and a real pipe. Python makes the exit status 120 when it cannot flush standard error at
+    the end, whatever ``main`` returned, and only a process of its own shows that."""
+    seen = {}
+    for reader in ("kept", "gone"):
+        output = tmp_path / reader / "benchmark.json"
+        command = [sys.executable, "-I", "-S", "-B", "-c", _LAUNCH_WITHOUT_SGLANG, str(RUNTIME)]
+        command += ["--benchmark-mode", "prefill", "--benchmark-output-path", str(output), *flags]
+        read_end, write_end = os.pipe()
+        try:
+            child = subprocess.Popen(
+                command,
+                cwd=tmp_path,
+                env={"PATH": os.environ.get("PATH", "")},
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=write_end,
+            )
+        finally:
+            os.close(write_end)
+        with os.fdopen(read_end, encoding="utf-8") as stderr:
+            if reader == "gone":
+                stderr.close()
+            # The child starts the launcher now.
+            child.stdin.close()
+            said = "" if stderr.closed else stderr.read()
+        returncode = child.wait(timeout=120)
+        on_disk = json.loads(output.read_text(encoding="utf-8"))
+        seen[reader] = (returncode, on_disk["status"], on_disk["error"])
+        if reader == "kept":
+            assert f"[sglbench] FAILED: {error}\n" in said
+
+    # The same exit code and the same failed artifact, with a reader and without one.
+    assert seen == {"kept": (code, "failed", error), "gone": (code, "failed", error)}
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # Stops
 # ---------------------------------------------------------------------------------------------------------------
 
@@ -4321,10 +4550,18 @@ def test_secrets_of_the_resolved_arguments_are_not_written_to_the_dump(tmp_path,
     secrets_of_sglang = {
         "api_key": "sk-FAKE-secret",
         "admin_api_key": "adm-FAKE-secret",
+        "ssl_keyfile_password": "FAKE-keyfile-password",
         "watermark_key": 123456789,
         "watermark_key_b": 987654321,
         "watermark_config": "/FAKE/watermark.json",
+        # FAKE: the extra config of a storage backend, with the two keys of an object store in it.
+        "hicache_storage_backend_extra_config": (
+            '{"endpoint": "http://storage.fake.invalid:8333", "access_key": "FAKE-access-key", '
+            '"secret_key": "FAKE-secret-key"}'
+        ),
     }
+    # Every field the launcher hides has a FAKE value here.
+    assert set(secrets_of_sglang) == set(launcher._SECRET_FIELDS)
 
     def prepare(world, _pod_dir):
         world.resolved_dict.update(secrets_of_sglang)
@@ -4341,9 +4578,71 @@ def test_secrets_of_the_resolved_arguments_are_not_written_to_the_dump(tmp_path,
     given = {name: value for name, value in secrets_of_sglang.items() if name != "watermark_key_b"}
     assert {name: server_args[name] for name in given} == dict.fromkeys(given, "<redacted>")
     assert not any(str(value) in text for value in secrets_of_sglang.values())
+    # The extra config is hidden whole, so the keys inside it are gone too. They are looked for by themselves:
+    # the dump would write the quotes of that value with a backslash.
+    assert "FAKE-access-key" not in text and "FAKE-secret-key" not in text
     # A field that is unset stays null, and the record the fake handed out is not changed.
     assert server_args["watermark_key_b"] is None
     assert launch.world.resolved_dict["api_key"] == "sk-FAKE-secret"
+
+
+# Where SGLang defines the fields the dump hides, typed here on their own as ``(module, name, kind)``, the form
+# of the seam rows in test_fpm_sglbench_compat.py.
+SGLANG_SECRET_FIELD_ROWS = (
+    ("sglang.srt.arg_groups.fields.serving", "Serving.api_key", "attribute"),
+    ("sglang.srt.arg_groups.fields.serving", "Serving.admin_api_key", "attribute"),
+    ("sglang.srt.arg_groups.fields.serving", "Serving.ssl_keyfile_password", "attribute"),
+    ("sglang.srt.arg_groups.fields.exec_", "ExecFeatures.watermark_key", "attribute"),
+    ("sglang.srt.arg_groups.fields.exec_", "ExecFeatures.watermark_key_b", "attribute"),
+    ("sglang.srt.arg_groups.fields.exec_", "ExecFeatures.watermark_config", "attribute"),
+    ("sglang.srt.arg_groups.fields.memory", "Memory.hicache_storage_backend_extra_config", "attribute"),
+)
+# The two keys an extra config of a storage backend can carry, and what the launcher's refusal of SGLang's
+# memory check in a busy scheduler names: the variable and the check.
+SGLANG_STORE_KEY_AND_BUSY_CHECK_ROWS = (
+    ("sglang.srt.mem_cache.storage.seaweedfs.seaweedfs_store", "SeaweedFSConfig.access_key", "attribute"),
+    ("sglang.srt.mem_cache.storage.seaweedfs.seaweedfs_store", "SeaweedFSConfig.secret_key", "attribute"),
+    ("sglang.srt.environ", "Envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY", "attribute"),
+    (
+        "sglang.srt.managers.scheduler_components.invariant_checker",
+        "SchedulerInvariantChecker.self_check_during_busy",
+        "attribute",
+    ),
+)
+
+
+def _busy_check_ends_a_turn(python_root: Path, method: str) -> bool:
+    """Whether the loop of ``Scheduler.<method>`` in an SGLang checkout ends every turn with the busy check.
+
+    The last statement of the ``while`` loop must be an ``if`` that names the variable and calls the check.
+    The file is parsed, never imported, and only names are looked for.
+    """
+    tree = ast.parse((python_root / "sglang/srt/managers/scheduler.py").read_text(encoding="utf-8"))
+    scheduler = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Scheduler")
+    function = next(node for node in scheduler.body if isinstance(node, ast.FunctionDef) and node.name == method)
+    last = next(node for node in function.body if isinstance(node, ast.While)).body[-1]
+    named = {node.attr for node in ast.walk(last) if isinstance(node, ast.Attribute)}
+    wanted = {"SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY", "self_check_during_busy"}
+    return isinstance(last, ast.If) and wanted <= named
+
+
+def test_the_hidden_fields_and_the_busy_check_are_in_the_sglang_source_at_both_tags(monkeypatch):
+    # Every field the launcher hides has a row.
+    assert {name.partition(".")[2] for _module, name, _kind in SGLANG_SECRET_FIELD_ROWS} == set(launcher._SECRET_FIELDS)
+    # Skipped from here on where no SGLang source is at hand. With it, each row is looked up in the parsed
+    # files of both releases; nothing is imported. ``_process_state`` took the variable that names the source
+    # out of the environment, so it is put back as it was when this file was imported.
+    if SGLANG_SOURCES_AT_IMPORT is not None:
+        monkeypatch.setenv(SOURCES_ENV, SGLANG_SOURCES_AT_IMPORT)
+    rows = SGLANG_SECRET_FIELD_ROWS + SGLANG_STORE_KEY_AND_BUSY_CHECK_ROWS
+    for version, python_root in sglang_source_roots(compat.TESTED_VERSIONS).items():
+        assert seam_rows_not_in_source(rows, python_root) == [], version
+        # The look-up notices a field the source does not have.
+        absent = ("sglang.srt.arg_groups.fields.serving", "Serving.no_such_field", "attribute")
+        assert seam_rows_not_in_source((absent,), python_root)
+        # The check is the last thing in every turn of both scheduler loops, behind the variable.
+        for method in ("event_loop_normal", "event_loop_overlap"):
+            assert _busy_check_ends_a_turn(python_root, method), (version, method)
 
 
 def test_a_signal_while_the_token_range_is_taken_is_recorded_as_a_stop(tmp_path, monkeypatch):

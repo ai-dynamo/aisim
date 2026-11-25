@@ -910,9 +910,15 @@ def _validate_sglang_moe_producer(cell: FPMCell, producer: object, path: Path) -
     every forward-pass record are such labels, a pod that ran two tensor-parallel ranks under the labels of two
     data-parallel ranks would pass every other rule, and ``attn_dp_size`` is what SGLang resolved.
 
-    A producer block without ``attn_dp_size`` counts as one rank: the launcher wrote no such key before it ran
-    DP attention, and a result file of that time is still the result of its one-GPU or TEP cell. For a DEP cell
-    such a file is refused, as it should be.
+    Each of the three sizes must be there as an int, and a bool is not one. A producer block without
+    ``attn_dp_size`` is refused like a block without one of the other two sizes. The launcher writes the key
+    before it builds the engine, with 1 for a run without DP attention (runtime/sglbench_launcher.py,
+    ``_resolved_settings``), so the result files of every run that completed hold it. The launcher wrote no such
+    key before it ran DP attention. A result file of that time belongs to a plan of that source revision. The
+    revision is part of the plan hash (planner.py, ``aic_revision``), so under a plan made from this source such
+    a file is refused for its plan before this rule (``_validate_collector_provenance``). Where
+    ``FPM_COLLECTOR_SOURCE_REVISION`` holds the revision at one value, such a file reaches this rule and is
+    refused by it.
 
     What ran (the collector README, "DEP cells", has the whole account): the mapping was read in SGLang's
     source at v0.5.22 and v0.5.23 (``python/sglang/srt/runtime_context.py``, ``derive_attn_tp_size`` and
@@ -935,7 +941,7 @@ def _validate_sglang_moe_producer(cell: FPMCell, producer: object, path: Path) -
     found = (
         producer.get("tp_size"),
         moe.get("ep_size") if isinstance(moe, dict) else None,
-        producer.get("attn_dp_size", 1),
+        producer.get("attn_dp_size"),
     )
     expected = (cell.topology.tp * cell.topology.dp, cell.topology.moe_ep, cell.topology.dp)
     # ``type`` and not ``isinstance``: True equals 1, and a size is never a bool.

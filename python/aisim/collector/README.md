@@ -429,6 +429,14 @@ serving deployment, and the last two apply to DEP cells only
   accepts two SGLang releases, and neither is the collector's operator pin
   (`0.5.21` in `framework_manifest.yaml`). The formal FPM path does not consult
   that pin for any backend.
+- KV cache of a `bfloat16` cell (`sglang_fpm_builder.py`). A cell whose
+  KV-cache dtype is `bfloat16` passes `--kv-cache-dtype auto`, as the
+  generated serving deployment does, where the vLLM render of the same cell
+  passes `bfloat16`. Its rows carry `bfloat16`. For some checkpoints SGLang
+  makes an FP8 KV cache of `auto`, and neither the launcher nor the host
+  compares the type SGLang stored with the label of the rows.
+  [KV cache of a bfloat16 cell](#kv-cache-of-a-bfloat16-cell) names the
+  checkpoints and says what to do today.
 - Static memory of a DEP prefill cell (`sglang_fpm_builder.py`). The cell
   writes the chunk size as the token budget times the number of ranks, so
   that each attention-DP rank gets the whole budget, as a vLLM rank does.
@@ -444,6 +452,122 @@ serving deployment, and the last two apply to DEP cells only
   over all ranks is inside every measured decode step; a prefill time also
   spans one receive step with the poll, and its effect there was not
   measured.
+
+#### KV cache of a bfloat16 cell
+
+This is a known gap, not closed. A plan gives a cell the KV-cache dtype
+`bfloat16` when `--fpm-kv-cache-dtypes` names it, and when the option is
+left out and AISim takes the checkpoint's own KV cache for bfloat16. The
+cell passes `--kv-cache-dtype auto`, and every row of it carries `bfloat16`
+as `kv_cache_dtype`. With `auto` SGLang stores the dtype it loads the model
+in, unless one of its own rules puts an FP8 KV cache (`fp8_e4m3`) in its
+place. The rules were read in SGLang's source at 0.5.22 and 0.5.23, not
+run:
+
+- A DeepSeek sparse-attention model on a GPU of compute capability 10 or
+  above, the B200 class (`_dsa_kv_cache_dtype_default` in
+  `srt/arg_groups/overrides.py`). SGLang takes a model for one by its
+  architecture name and an `index_topk` in its config (`is_deepseek_dsa` in
+  `srt/configs/model_config.py`); the packaged configs of the architectures
+  `DeepseekV32ForCausalLM`, `GlmMoeDsaForCausalLM` and
+  `Glm5NextForConditionalGeneration` are of this kind. The last keeps its
+  `index_topk` in `text_config`, and SGLang's config class copies it to the
+  top (`srt/configs/glm5_next.py`). A config with `learnable_sink` keeps
+  bfloat16, and so does every such model on a GPU below that capability, an
+  H200 for one.
+- `DeepseekV4ForCausalLM`, on every NVIDIA GPU
+  (`_deepseek_v4_kv_cache_dtype` in the same file).
+- At 0.5.23 only: `MuseSparkForConditionalGeneration`
+  (`_muse_spark_overrides` in the same file), and a MiniMax-M3 checkpoint
+  that declares MXFP8 weights with NVFP4 packed experts. On a Blackwell GPU
+  SGLang turns the argument into `fp8_e4m3`
+  (`srt/arg_groups/model_overrides/minimax_m3.py`). On another GPU the
+  argument stays `auto`, and a comment in that file says the KV dtype then
+  stays the model's. The quantization config SGLang builds for such a
+  checkpoint always names FP8 as its KV-cache algorithm, though
+  (`srt/layers/quantization/minimax_m3_nvfp4.py`), so by the next rule the
+  engine would store FP8 there as well. Which of the two holds on a GPU
+  that is not Blackwell was not run.
+- A checkpoint whose quantization config asks for an FP8 KV cache: a
+  `kv_cache_quant_algo` of `FP8`, for a ModelOpt checkpoint a
+  `kv_cache_scheme` of 8-bit floats
+  (`srt/layers/quantization/modelopt_quant.py`), or for a
+  compressed-tensors checkpoint a static, symmetric `kv_cache_scheme` of
+  8-bit floats for the whole tensor
+  (`srt/layers/quantization/compressed_tensors/compressed_tensors.py`). The
+  first three rules act when SGLang resolves its arguments. This one acts
+  later, in each scheduler process once it has loaded the model
+  (`configure_kv_cache_dtype` in `srt/mem_cache/kv_cache_dtype.py`). It
+  reads the quantization config that the loaded model keeps. Not every
+  model class keeps one, and which of a checkpoint's config files SGLang
+  builds it from depends on the checkpoint, so a key in `config.json` or
+  `hf_quant_config.json` is a strong sign and not the proof.
+
+Where no rule applies, the dtype of the model is not always bfloat16
+either. For a config that names float16 it is float16, and for one that
+names float32 or no dtype it is float16 unless the model is a Gemma
+(`_get_and_verify_dtype` in `srt/configs/model_config.py`).
+
+Neither the launcher nor the host checks any of this today. No result file
+records the type SGLang stored and validation compares none, so a
+`bfloat16` cell of such a checkpoint completes, and its rows, measured with
+an FP8 KV cache, are published under the label `bfloat16`.
+
+The 97 packaged model configs were held against the rules on 2026-11-24:
+the architecture names and config keys above, beside the KV-cache dtype
+AISim itself takes for each checkpoint. No engine ran for it, and whether
+SGLang loads each of these checkpoints was not checked. The configs under
+a rule are of two kinds:
+
+- For most of them AISim takes the checkpoint's KV cache for FP8 as well. A
+  plan without `--fpm-kv-cache-dtypes` then holds `fp8` cells, which pass
+  `--kv-cache-dtype fp8_e4m3`, so the label is the type SGLang is told to
+  store. These are the DeepSeek V3.2 and V4 configs, the GLM-5 and
+  GLM-5.3-Flash configs that AISim takes for FP8, and the other checkpoints
+  with FP8 or NVFP4 weights whose quantization config names an FP8 KV
+  cache. With `--fpm-kv-cache-dtypes bfloat16` their plans hold `bfloat16`
+  cells, and each such cell that renders and runs is measured with an FP8
+  cache where its rule gives one.
+- For four, AISim takes the KV cache for bfloat16 where SGLang's first rule
+  does not: `zai-org/GLM-5`, `zai-org/GLM-5.1`, `zai-org/GLM-5.2` and
+  `zai-org/GLM-5.3-BF16`. Their plans hold `bfloat16` cells without any
+  option, and on a B200-class GPU SGLang would run them with an FP8 cache.
+  Their architecture is `GlmMoeDsaForCausalLM`, whose cells are refused
+  when they are rendered ([MoE cells](#moe-cells)), so none of them
+  publishes such a row at these releases. No other packaged config that
+  AISim takes for bfloat16 is under a rule.
+
+No packaged config has the Muse Spark architecture, and the packaged
+`nvidia/MiniMax-M3-NVFP4` config does not meet the MiniMax-M3 rule: it
+names `modelopt` as its quantization method and no KV-cache algorithm. A
+checkpoint that is not packaged falls under the same rules by its own
+config.
+
+The models collected so far, `Qwen/Qwen3-0.6B` and
+`Qwen/Qwen1.5-MoE-A2.7B`, are not affected. Neither architecture is under a
+rule, neither config has a quantization config, and both name bfloat16 as
+their dtype. The resolved arguments kept from their runs at both releases
+hold `auto` as the KV-cache dtype; those files are not in this repository.
+
+What to do today:
+
+- **Plan the cells as `fp8`.** For a checkpoint under one of the rules, on
+  a GPU where the rule gives FP8, `--fpm-kv-cache-dtypes fp8` plans `fp8`
+  cells. Such a cell passes `--kv-cache-dtype fp8_e4m3`, and its rows carry
+  `fp8`, the type the cell asks SGLang for. No option of a plan makes an
+  SGLang cell pass `--kv-cache-dtype bfloat16`: `bf16` and `bfloat16` both
+  name the `bfloat16` cell, which passes `auto`.
+- **Check a collected `bfloat16` cell by hand.** The launcher writes
+  SGLang's resolved arguments to
+  `cells/<cell_id>/raw/<pod>/resolved-config-node0.json` before the engine
+  is built. Its `config.server_args.kv_cache_dtype` shows what the first
+  three rules made of `auto`: read in SGLang's source, it is `fp8_e4m3`
+  where one of them gave FP8, and no such file has been seen. The fourth
+  rule acts after the file is written, so the file still shows `auto` where
+  only that rule applies; the MiniMax-M3 checkpoint above on a GPU that is
+  not Blackwell would be such a case. For it, read the `quantization_config`
+  or `compression_config` of the checkpoint's `config.json` and its
+  `hf_quant_config.json`.
 
 #### MoE cells
 
@@ -661,10 +785,15 @@ validation holds what the pod recorded against the cell:
 SGLang resolved must be the ones of the cell. SGLang's `tp_size` counts every
 rank of the engine, so `producer.tp_size` must be the cell's `tp` times its
 `dp`, `producer.moe.ep_size` its `moe_ep`, and `producer.attn_dp_size` its
-`dp`. A producer block without `attn_dp_size` counts as 1: the launcher wrote
-no such key before it could run DP attention, and the result files of that
-time still pass for their one-GPU and TEP cells and are refused for a DEP
-cell. For a pure TP cell of N GPUs the three sizes are N, 1 and 1, and for
+`dp`. Each size must be there as an integer. A producer block without
+`attn_dp_size` is refused in every cell: the launcher writes the key into
+every result file of a run that completed, with 1 for a cell without DP
+attention. It wrote no such key before it could run DP attention; a result
+file of that time belongs to a plan of that source revision and is refused
+under a plan made now for its plan hash, before this comparison. Where
+`FPM_COLLECTOR_SOURCE_REVISION` holds the revision at one value, such a
+file reaches this comparison and is refused by it.
+For a pure TP cell of N GPUs the three sizes are N, 1 and 1, and for
 its TEP cell N, N and 1: the expert-parallel size is all that tells a result
 of the one from a result of the other. Two kinds of run
 complete in the pod and are refused by this comparison. A
