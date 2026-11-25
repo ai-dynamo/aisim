@@ -2075,9 +2075,12 @@ fn grouped_destination_counts_the_copy_of_a_state_loaded_to_its_partial_tail() {
     // block are on. A 49-token prompt transfers 48 tokens, the prompt's
     // partial tail. vLLM caches the loaded state there when the load
     // completes (V31 sched:3083-3085, V32 :3155-3157), so the request is a
-    // producer, and what it still needs counts the block of the copy (V31
-    // single:1770-1777 with sched:3003-3017, V32 single:1732-1739 with
-    // sched:3060-3076). Its first step takes that block.
+    // producer, and from then on what it still needs counts the block of the
+    // copy (V31 single:1770-1777 with sched:3003-3017, V32 single:1732-1739
+    // with sched:3060-3076). Its first step takes that block. Replay records
+    // the block at the reservation already, before the load completes, and
+    // also tests the load itself against it. That is a known difference
+    // from vLLM, which counts 0 until the load completes.
     for version in ["0.31.0", "0.32.0"] {
         let mut full = group("full", 32, 100, None);
         full.prefix_cacheable = Some(true);

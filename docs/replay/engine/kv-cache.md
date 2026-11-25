@@ -1415,10 +1415,12 @@ sub-block matching without an explicit full-state scratch count.
   request. Its whole prompt must fit the free capacity. Its transferred blocks
   must also leave free what the first steps of the other transferred requests
   in flight still take. A request is in flight from its reservation until its
-  first step allocates. For multi-token prompts in block mode, replay budgets
-  the copy of a state that activation will publish inside its block in both
-  the load's own capacity check and the space kept free for later transfers.
-  vLLM also keeps free what a local prefill in progress
+  first step allocates. In one count replay keeps free more than vLLM. For a
+  prompt of more than one token in block mode, replay keeps free the block
+  for the copy of a state that the load publishes inside its block, from the
+  reservation on: in the load's own test and for later transfers. vLLM counts
+  that block only after the load has finished (see the differences of a
+  decode worker below). vLLM also keeps free what a local prefill in progress
   still needs, such as the recompute of a preempted request, but replay does
   not. For a sliding-window group, vLLM applies its admission cap to what a
   first step takes, and replay counts every block of that step. The first
@@ -1543,6 +1545,38 @@ sub-block matching without an explicit full-state scratch count.
     before the running requests of the next pass take their new blocks, and
     vLLM tests it after them. Replay can then reserve the load one pass before
     vLLM does and preempt a running request that vLLM keeps.
+  - With a hash block below the block of a prefix-cacheable `state` group, a
+    transferred request of more than one prompt token whose transferred
+    tokens end at the prompt's last hash boundary inside that block takes
+    one more block of that group in its first step, for the copy of the
+    loaded state. vLLM counts that block only after the load has finished,
+    when it caches the loaded state. Until then the block is in neither of
+    vLLM's two tests. See vLLM v0.31.0
+    [`scheduler.py:1194-1204`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/sched/scheduler.py#L1194-L1204),
+    [`:3003-3017`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/sched/scheduler.py#L3003-L3017),
+    [`:3032-3036`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/sched/scheduler.py#L3032-L3036),
+    [`:3083-3085`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/sched/scheduler.py#L3083-L3085)
+    and
+    [`single_type_kv_cache_manager.py:1770-1777`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/single_type_kv_cache_manager.py#L1770-L1777),
+    and vLLM v0.32.0
+    [`scheduler.py:1241-1251`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L1241-L1251),
+    [`:3060-3076`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L3060-L3076),
+    [`:3088-3092`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L3088-L3092),
+    [`:3155-3157`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L3155-L3157)
+    and
+    [`single_type_kv_cache_manager.py:1732-1739`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py#L1732-L1739).
+    Replay keeps the block free from the reservation on, in the request's
+    own test and for later transferred requests. Two results differ. When
+    two such requests arrive together in a pool that their blocks fill, vLLM
+    reserves both, and after the loads neither can take its copy: vLLM
+    0.31.0, 0.32.0 and 0.33.0 wait without end. Replay reserves the second
+    request later and completes both. When such a request arrives beside a
+    running request and the free blocks equal its transferred blocks, vLLM
+    reserves it, and the running request preempts itself to free a block.
+    Replay reserves the transferred request only when a block for the copy
+    is free too, so reservation times and preemption counts differ. A
+    prompt of one token is the exception: there replay counts as vLLM does
+    and stops, as the paragraph on the two tests says.
 
 - **Belady eviction.** The native ReplaySpec field
   `engine.kv_eviction_policy: belady` evicts the block whose next use in the

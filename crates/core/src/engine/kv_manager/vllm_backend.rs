@@ -2126,11 +2126,17 @@ impl VllmKvManager {
     /// load (V32 `vllm/v1/core/kv_cache_manager.py:522-539`, `:561-579`, V31
     /// `:519-536`, `:558-576`). The whole prompt, with the loaded tokens
     /// computed, must fit the free capacity. The loaded tokens must fit the
-    /// free capacity less its activation's state copy and what the first
-    /// passes of the other loads in flight take. Without the second test,
-    /// two loads can take the blocks that
+    /// free capacity less what the first passes of the other loads in flight
+    /// take. Without the second test, two loads can take the blocks that
     /// each first pass needs, and neither request computes its last prompt
-    /// token.
+    /// token. Replay adds one count that vLLM does not have: the copy of a
+    /// state that the activation publishes inside its block. The second
+    /// test also subtracts that copy for this load, and the need of a load
+    /// in flight holds it from the reservation on. vLLM counts that block
+    /// only once the load has finished and the state is cached (V32
+    /// `sched:3155-3157`, `single:1732-1739`, V31 `sched:3083-3085`,
+    /// `single:1770-1777`). So vLLM admits a load where replay makes it
+    /// wait.
     /// Byte mode charges the projected bytes. Block mode pins the local
     /// full-attention hit, when the mode reuses the resident prefix, and takes
     /// fresh blocks for the rest. The state groups take fresh running blocks
@@ -2196,9 +2202,9 @@ impl VllmKvManager {
                 let hit_blocks = rules.unit_block().map_or(0, |block| hit.tokens / block);
                 let mut grouped_lease = GroupedLease::default();
                 // The first pass computes from the tokens that stay computed
-                // to the prompt. Its count equals vLLM's
-                // `_request_remaining_blocks` (V32 `sched:3060-3076`, V31
-                // `:3003-3017`) for full attention, for a ring (0, V32
+                // to the prompt. Without the copy below, its count equals
+                // vLLM's `_request_remaining_blocks` (V32 `sched:3060-3076`,
+                // V31 `:3003-3017`) for full attention, for a ring (0, V32
                 // `single:1190-1201`, V31 `:1214-1225`) and for a Mamba-type
                 // state: 1 block when the last prompt token starts a block,
                 // else 0 (V32 `single:1724-1731`, `:1768-1773`, V31
@@ -2208,8 +2214,11 @@ impl VllmKvManager {
                 // V31 `:216-229`), so replay can count more there. Grouped
                 // replay has no speculative tokens.
                 // Activation publishes a loaded partial state before the
-                // first pass. Budget its copy now, before another load can
-                // consume that block; activation will recount the same need.
+                // first pass, which then takes a block for its copy. vLLM
+                // counts that block only once the load has finished (see
+                // the comment of this function). Replay counts it from the
+                // reservation on, a known difference from vLLM. Activation
+                // counts the same need again.
                 grouped_lease.first_pass_need = (coordinator.allocation_blocks(
                     &block_lease,
                     prompt,
