@@ -12,9 +12,11 @@ available in this checkout; these tables remain historical author-reported
 results, not verification of the current head. No GPU was run, and no
 performance data was added, re-collected, or re-fitted.
 
-The current code head is `0faa4f402e2b3fe6ab302921d08c39572941ac8a`, which
-merges `main` at `29104f537634779690aa6721b93b39c4204d13cb`; later commits
-change only this document. See
+The current code head is `372f2e7c2`, which adds the fallback-layout
+resolution and the FPE generator guard described below on top of
+`0faa4f402e2b3fe6ab302921d08c39572941ac8a`. That commit merges `main` at
+`29104f537634779690aa6721b93b39c4204d13cb`; later commits change only this
+document. See
 [Current head after the main merges](#current-head-after-the-main-merges-2026-11-24)
 for the verification at that SHA. The pre-rebase head was
 `8f3a62e0fde729cf74db0b6b3551608338b367dd`, based on
@@ -140,9 +142,40 @@ pins that a multi-GPU dense request still estimates natively. This changes
 production behavior for callers that passed only one dimension or neither: the
 request now estimates natively instead of failing the width check.
 
+### Fallback MoE layout and the pre-database width gate
+
+`372f2e7c2` shares that resolution with the naive fallback.
+`estimate_kv_cache` used to pass `int(moe_ep_size or 1)` and
+`int(moe_tp_size or 1)` to `NaiveKVCacheEstimator.from_model_path`, which
+shards expert weights by `moe_tp_size * moe_ep_size`. A request whose native
+build resolved `4x1` therefore priced `1x1` whenever the perf database was
+unavailable, so the same request returned two different capacities depending
+on which path ran. Both paths now call `_resolve_moe_dimensions`, which applies
+the rule `ModelConfig.resolve_moe_parallelism` describes, and the fallback runs
+it after the native build fails.
+
+`test_estimate_kv_cache_naive_fallback_prices_an_omitted_moe_pair_like_the_explicit_layout`
+and `test_estimate_kv_cache_naive_fallback_infers_a_single_omitted_moe_dimension`
+force `perf_database.get_database` to fail at `tp_size=4` on the routed
+`deepseek-ai/DeepSeek-V3` checkpoint, then assert the fallback's
+`total_kv_size_tokens` equals the explicit `(4, 1)` and `(2, 2)` layouts. Before
+the fix those comparisons failed (the pair case raised `no KV budget` and the
+single-dimension case returned 1,867,790 versus 5,782,474 tokens).
+
+`from_request` also validates the width invariant for a routed checkpoint after
+building the config and before the perf-database lookup.
+`test_estimate_kv_cache_rejects_a_moe_width_mismatch_before_the_database` pins
+that gate with `perf_database.get_database` and
+`NaiveKVCacheEstimator.from_model_path` made unreachable, and
+`test_estimate_kv_cache_rejects_dense_gemma4_moe_ep_before_the_database` keeps
+the dense Gemma 4 diagnostic ahead of it (the dense rule reads the raw
+`moe_ep_size`, not the resolved pair).
+`test_estimate_kv_cache_keeps_the_naive_fallback_for_a_valid_dense_gemma4_checkpoint`
+keeps a well-formed dense checkpoint fallback-eligible.
+
 ### Verification at the current head
 
-Local run at `0faa4f402` on macOS arm64, Python 3.13.9, with the native
+Local run at `372f2e7c2` on macOS arm64, Python 3.13.18, with the native
 extension rebuilt from this head's tree (`maturin develop --release`, the `pyproject.toml`
 `extension-module,jemalloc` features) so the interpreter and extension agree on
 `ENGINE_SPEC_SCHEMA_VERSION` (30 in this tree and on `main`; an extension built
@@ -152,26 +185,31 @@ suite also needs the composed systems root that #857 introduced:
 `AICONFIGURATOR_SYSTEMS_PATH` must name it, as Full CI's
 `prefetch-op-latency-data` action does. Without that variable the op-latency
 tables are absent and most `perfmodel::` tests fail for missing data rather
-than for a code defect. The Python selection took 12m29s on its first run after
-the merge because that dataset cache was cold; later runs reuse it.
+than for a code defect. The embedded tests also need a `PYTHONPATH` that names
+both this tree's `python/aisim/src` and the venv's `site-packages`; the
+interpreter chosen by `PYO3_PYTHON` does not read an editable install's
+`.pth`. The Python selection took 12m29s on its first run after the merge
+because that dataset cache was cold; later runs reuse it and take under two
+minutes.
 
 | Verification | Tested commit | Result |
 | --- | --- | --- |
-| Targeted pytest selection from the 2026-11-18 command below (includes the three new MoE-dimension tests) | `0faa4f402` | 1,190 passed, 0 failed |
-| `cargo test -p aisim-core --features embed-python --lib perfmodel::` (covers `memory.rs` and the `fpm/model.rs` fallback policy test) | `0faa4f402` | 1,476 passed, 0 failed, 1 ignored |
-| `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1 cargo test -p aisim-core --features embed-python --test perfmodel_dense_gemma4_bridge` | `0faa4f402` | 5 passed; no skips |
-| `cargo fmt --all -- --check` | `0faa4f402` | clean |
+| Targeted pytest selection from the 2026-11-18 command below (includes the three MoE-dimension tests, the fallback-parity and pre-database-gate tests, and the FPE generator guard) | `372f2e7c2` | 1,196 passed, 0 failed |
+| `cargo test -p aisim-core --features embed-python --lib perfmodel::` (covers `memory.rs` and the `fpm/model.rs` fallback policy test) | `372f2e7c2` | 1,476 passed, 0 failed, 1 ignored |
+| `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1 cargo test -p aisim-core --features embed-python --test perfmodel_dense_gemma4_bridge` | `372f2e7c2` | 5 passed; no skips |
+| `cargo fmt --all -- --check` | `372f2e7c2` | clean |
 | `tests/test_ci_workflow_contracts.py` and `scripts/ci/test_op_latency_handoff.py` with Fast CI's invocation | `0faa4f402` | 795 passed, 3 skipped, 5 failed for host-only reasons (see below) |
 
 The 5 workflow-contract failures are environmental, not merge regressions: the
 same five fail identically at `main` in a clean worktree. One needs
 a Linux manylinux Python 3.12 root (`test_manylinux_bootstrap_exports_working_python_or_fails_before_build[None]`),
 and four need the `pip-licenses` distribution that this macOS dev venv does not
-install (`test_real_pip_licenses_enforces_the_policy`). The perf-model lib total
-is higher than the 1,460 recorded at `b761646c0` because main added tests.
-These are local results; the commits after `0faa4f402` change only this
-document. **No Full CI run exists for this head**; admission remains with the
-maintainer.
+install (`test_real_pip_licenses_enforces_the_policy`). That selection was not
+re-run at `372f2e7c2`, which changes no workflow, script or test it covers.
+The perf-model lib total is higher than the 1,460 recorded at `b761646c0`
+because main added tests. These are local results; the commits after
+`372f2e7c2` change only this document. **No Full CI run exists for this head**;
+admission remains with the maintainer.
 
 ### Support-matrix artifacts at the current head
 
@@ -184,6 +222,19 @@ per-model shard can refresh them. Until a maintainer settles the retirement
 contract and runs a same-source FPE campaign, the matrices do **not** agree
 with the classifier for those 113 rows; this PR neither fixes nor worsens
 them.
+
+`372f2e7c2` guards the generator instead of inventing an artifact state.
+`tests/unit/support_matrix/test_fpe_support_matrix_dense_gemma4.py` takes the
+combinations the op-level FPE matrix still enumerates for
+`nvidia/Gemma-4-31B-IT-NVFP4`, asks the generator what it would plan for each,
+and requires no `moe_ep_size > 1` topology and no dense diagnostic. It passes
+today: the three enumerated combinations (`a100_sxm` with `sglang` 0.5.10,
+`trtllm` 1.0.0 and `vllm` 0.14.0) now enumerate 10/4/4 topologies with
+`max moe_ep_size=1` and plan 10/4/4 builds, none of them rejected for being
+dense. The generator therefore agrees with `check_is_moe` even where the
+checked-in rows do not. Those three stale rows, and the ten retired-version CLI
+`FAIL` rows, remain recorded debt rather than regenerated evidence; #1006 owns
+the campaign that replaces them.
 
 ## Exact-head verification at `8f3a62e0` (2026-11-18, historical)
 
@@ -443,6 +494,9 @@ Pinned by
 | `test_estimate_kv_cache_infers_an_omitted_moe_dimension` | `tp_size=4` with `moe_tp_size=2` and no `moe_ep_size` is resolved by the config contract and estimated natively, instead of failing the width check because the estimator filled `1` |
 | `test_estimate_kv_cache_defaults_an_omitted_moe_pair_to_pure_tensor_parallelism` | An omitted `moe_tp_size`/`moe_ep_size` pair at `tp_size=4` resolves to `4x1`, matches the explicit estimate exactly, and stays `native` even with `allow_naive_fallback=True`, instead of raising the width mismatch the historical `1x1` default produced |
 | `test_estimate_kv_cache_accepts_an_omitted_moe_pair_for_a_dense_checkpoint` | A multi-GPU dense Gemma 4 request with the pair omitted still estimates natively, because dense checkpoints do not read the MoE dims |
+| `test_estimate_kv_cache_naive_fallback_prices_an_omitted_moe_pair_like_the_explicit_layout` | With the perf database forced unavailable, the omitted pair at `tp_size=4` returns the same `total_kv_size_tokens` as the explicit `4x1` request, instead of sharding expert weights by `1x1` |
+| `test_estimate_kv_cache_naive_fallback_infers_a_single_omitted_moe_dimension` | The same fallback infers `moe_ep_size=2` from `tp_size=4, moe_tp_size=2` and matches the explicit `2x2` capacity (1,867,790 versus 5,782,474 tokens before the fix) |
+| `test_estimate_kv_cache_rejects_a_moe_width_mismatch_before_the_database` | An invalid routed layout is rejected before both the perf-DB lookup and the naive fallback, neither of which may price it |
 | `test_dense_gemma4_static_estimate_skips_moe_comm_resolution` | Static CLI gate: no `resolve_model_config_moe_comm` call for dense Gemma 4 |
 | `test_dense_gemma4_disagg_estimate_skips_moe_comm_resolution` | Disagg CLI gate: neither role resolves MoE communication for dense Gemma 4 |
 | `test_routed_gemma4_static_estimate_still_resolves_moe_comm` | Routed Gemma 4 keeps the static-path resolution for both required phases |
@@ -456,6 +510,8 @@ Pinned by
 | `test_no_current_cli_matrix_row_records_the_dense_gemma4_rejection` | Generated-artifact guard: no CLI support-matrix row the generator still enumerates records the dense rejection for a checkpoint the classifier calls dense |
 | `test_the_current_cli_matrix_still_covers_a_dense_gemma4_checkpoint` | The same guard cannot pass vacuously: a currently enumerated dense Gemma 4 row must exist |
 | `test_dense_gemma4_coverage_check_ignores_other_dense_families` | Dropping every Gemma 4 row fails the coverage assertion even though other dense families remain in the matrix |
+| `test_fpe_generator_plans_no_expert_parallelism_for_a_dense_gemma4` | Op-level FPE generator guard: for every enumerated dense Gemma 4 combination, no topology offers `moe_ep_size>1` and no probe plan records the dense diagnostic |
+| `test_fpe_dense_gemma4_check_flags_a_planned_expert_parallel_topology` / `test_fpe_dense_gemma4_check_flags_a_recorded_dense_rejection` | The same guard's negative controls: a synthetic `moe_ep=2` plan and a synthetic dense rejection are both reported, so it cannot pass by observing nothing |
 | `dense_gemma4_expert_parallelism_is_not_fallback_safe` (Rust) | The bridge's `InvalidEngineConfig` mapping is not fallback-safe, so `best_available` surfaces the dense rejection instead of using the regression estimator |
 
 ## Support-matrix artifacts
@@ -516,6 +572,13 @@ A per-model shard would also change the per-shard probe and topology counts that
 sibling rows in the same file carry, so patching the affected rows alone would
 produce an internally inconsistent artifact.
 
+Three of the 103 rows are still enumerated by the current matrix
+(`a100_sxm` with `sglang` 0.5.10, `trtllm` 1.0.0 and `vllm` 0.14.0). The other
+100 belong to combinations the generator no longer offers. Both kinds carry the
+same campaign `SourceSHA`, so both need the same re-run; only the three
+enumerated rows are covered by a guard that can be evaluated without a new
+campaign.
+
 Blocking follow-up: rerun the FPE campaign on the fixed sources, rebuild the
 split CSVs, and confirm no Gemma 4 row keeps the dense rejection. Rows that
 still fail for a real reason (`PERF_DATA_MISSING`, `SDK_UNREPRESENTABLE`,
@@ -543,14 +606,16 @@ That work is tracked as
 [issue #1006](https://github.com/ai-dynamo/aisim/issues/1006): settle the
 retirement contract (including the other retired-version rows), run a complete
 same-source FPE campaign, and extend the FPE guard to the regenerated or
-explicitly non-current rows. Adding the guard against these unchanged artifacts
-would fail today on `main` too, and an allowlist or skipped assertion would
-hide the remaining requirement. This PR therefore documents the disagreement
-instead of claiming the matrices are current.
+explicitly non-current rows. A row-level guard over these unchanged artifacts
+would fail today on `main` too, and an allowlist or skipped assertion would hide
+the remaining requirement, so `372f2e7c2` guards the generator's current output
+instead (guard 4 below) and leaves the row-level assertion to the re-run. This
+PR therefore documents the disagreement instead of claiming the matrices are
+current.
 
 ### Guard
 
-Three checks keep the classification and the rejection from regressing.
+Four checks keep the classification and the rejection from regressing.
 
 1. `tests/unit/support_matrix/test_support_matrix_dense_gemma4.py` fails when a
    row the CLI generator still enumerates records the dense rejection for a
@@ -558,12 +623,22 @@ Three checks keep the classification and the rejection from regressing.
    drops out of the matrix entirely (so the first check cannot pass vacuously).
    It reports the ten rows above before the regeneration and passes after it.
 
-2. `dense_gemma4_expert_parallelism_is_not_fallback_safe` in
+2. `tests/unit/support_matrix/test_fpe_support_matrix_dense_gemma4.py` is the
+   op-level counterpart at the generator boundary. For every combination the
+   FPE matrix still enumerates for the dense checkpoint it asserts that
+   `check_is_moe` is `False`, that the generator offers at least one topology,
+   that no enumerated choice has `moe_ep_size > 1`, and that no probe plan
+   carries an expert-parallel topology or records the dense diagnostic. Two
+   negative cases feed it a synthetic `moe_ep_size=2` plan and a synthetic
+   dense rejection so the check cannot pass by inspecting nothing. It runs in
+   about 2.4s and needs no database beyond the bundled systems data.
+
+3. `dense_gemma4_expert_parallelism_is_not_fallback_safe` in
    `crates/core/src/perfmodel/fpm/model.rs` pins that `best_available` does not
    treat the dense rejection as fallback-safe. It builds the `AicError`
    directly, so it covers the predicate but never crosses the Python boundary.
 
-3. `crates/core/tests/perfmodel/dense_gemma4_bridge.rs` (integration test
+4. `crates/core/tests/perfmodel/dense_gemma4_bridge.rs` (integration test
    `perfmodel_dense_gemma4_bridge`) drives the rejection through the embedded
    interpreter, where `py.rs` maps the SDK's
    `InvalidEngineConfigurationError` to `AicError::InvalidEngineConfig`:
