@@ -413,7 +413,9 @@ def main(argv: Sequence[str] | None = None, *, _prepared_config: dict[str, Any] 
 def _main(argv: Sequence[str] | None = None, *, _prepared_config: dict[str, Any] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
-    if args.command == "data":
+    if args.command in ("data", "fetch", "init"):
+        if args.command != "data":
+            args.data_command = args.command
         from .data_cli import run_data_command
 
         try:

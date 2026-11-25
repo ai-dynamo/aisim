@@ -519,7 +519,7 @@
       "title": "Requested Settings"
     },
     "schema_minor": {
-      "default": 1,
+      "default": 3,
       "minimum": 0,
       "title": "Schema Minor",
       "type": "integer"

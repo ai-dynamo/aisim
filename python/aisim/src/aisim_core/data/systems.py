@@ -204,6 +204,22 @@ def publish_system_spec(
         old = read_manifest(manifest_path)
         history = [h.model_dump(exclude_none=True) for h in old.history]
         prior_fields = {k: v.model_dump(exclude_none=True) for k, v in old.fields.items()}
+        if fields is None and any(v.source == "calibrated" for v in old.fields.values()):
+            previous_path = sysdir / copy_filename(system, old.current)
+            previous = _load_mapping(previous_path.read_text(encoding="utf-8"), str(previous_path))
+            if spec_sha256(previous) != old.current:
+                raise SystemSpecError("previous calibrated spec does not match its pinned hash")
+            for name, source in old.fields.items():
+                if source.source != "calibrated":
+                    continue
+                before, after = previous, spec
+                for part in name.split("."):
+                    before = before.get(part) if isinstance(before, Mapping) else None
+                    after = after.get(part) if isinstance(after, Mapping) else None
+                if before != after:
+                    raise SystemSpecError(
+                        f"changed calibrated field {name} requires an explicit fields provenance update"
+                    )
     if not history or history[-1]["spec_sha256"] != digest:
         history = [h for h in history if h["spec_sha256"] != digest]
         entry: dict[str, Any] = {"spec_sha256": digest}

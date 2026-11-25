@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::common::error::AicError;
-use crate::memo::Memo;
+use crate::memo::{Memo, MemoSlot, OnThread};
 use crate::operators::base::PerformanceResult;
 use crate::operators::op::MemoField;
 use crate::operators::{Dsv41StageOp, Op, RuntimeContext};
@@ -35,12 +35,16 @@ pub(crate) enum OpList {
 pub(crate) struct OpMemo {
     /// Each op's field by list and index, computed once from the lists.
     fields: [Box<[Option<MemoField>]>; 2],
+    /// Up to four recent (batch size, token count) shapes, addressed by op index.
+    decode_rows: Memo<(u32, u32), DecodeRow>,
     /// Keyed by list, index and field value ([`Self::key`]).
     results: Memo<u64, PerformanceResult>,
     /// A generation stage's children that read only the token count, in
     /// child order with `None` for the others; keyed like `results`.
     stage_children: Memo<u64, Arc<[Option<PerformanceResult>]>>,
 }
+
+type DecodeRow = Arc<[Option<MemoSlot<PerformanceResult>>]>;
 
 impl OpMemo {
     /// A memo for walks of `context_ops` and `generation_ops`; it starts
@@ -50,9 +54,24 @@ impl OpMemo {
         Self {
             fields: [fields(context_ops), fields(generation_ops)],
             results: Memo::flat(capacity).verifying_hits(),
+            decode_rows: Memo::flat(4),
             // One entry per generation stage and token count, about 1.5 KB each.
             stage_children: Memo::flat(4096).verifying_hits(),
         }
+    }
+
+    fn decode_row(&self, ctx: &RuntimeContext) -> DecodeRow {
+        let fields = &self.fields[OpList::Generation as usize];
+        self.decode_rows
+            .get_or_price(&OnThread, (ctx.batch_size, ctx.num_tokens), || {
+                Ok::<_, std::convert::Infallible>(
+                    fields
+                        .iter()
+                        .map(|field| field.map(|_| MemoSlot::default()))
+                        .collect(),
+                )
+            })
+            .unwrap()
     }
 
     #[cfg(test)]
@@ -566,14 +585,20 @@ pub(crate) fn run_generation_ops_step_planned<'a>(
         0,
         None,
     );
+    // Keep attention-only walks and plans with within-step sharing on their existing path.
+    let row = op_memo
+        .filter(|_| !only_generation_attention && plan.is_some_and(|p| p.query_slots() == 0))
+        .map(|memo| memo.decode_row(&ctx));
     let mut total = 0.0_f64;
     for (index, op) in ops.iter().enumerate() {
         if only_generation_attention && !op.is_generation_attention() {
             continue;
         }
-        let result = memo.query(index, || {
-            shared_query(op_memo, db, OpList::Generation, index, op, &ctx)
-        })?;
+        let price = || shared_query(op_memo, db, OpList::Generation, index, op, &ctx);
+        let result = match row.as_ref().and_then(|row| row[index].as_ref()) {
+            Some(slot) => Cow::Borrowed(slot.get_or_price(db, price)?),
+            None => memo.query(index, price)?,
+        };
         total += result.latency_ms;
         on_op(index, op, result);
     }

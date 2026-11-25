@@ -15,11 +15,11 @@ import shutil
 import struct
 import subprocess
 import sys
-from importlib import resources
 from pathlib import Path
 
 import pytest
 
+from aisim_core.data.default_systems import default_systems_path
 from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
 from .test_external_execution_profile import profile  # noqa: F401
@@ -373,7 +373,7 @@ def test_unknown_identity_and_deployment_limits_pass_through_to_rust_unchanged(t
 
 def _systems_copy(destination: Path, system: str) -> Path:
     """Copy one system's fingerprinted inputs: top-level files and its data dir."""
-    packaged = Path(str(resources.files("aisim_core") / "systems"))
+    packaged = Path(default_systems_path())
     destination.mkdir()
     for entry in packaged.iterdir():
         if entry.is_file():
@@ -1111,13 +1111,16 @@ def test_every_kind_continues_in_another_process_like_the_uninterrupted_model(tm
     assert _bits(cold, queries) != _bits(model, queries)
 
 
-def test_restoring_a_snapshot_ignores_an_environment_dataset_pin(tmp_path, monkeypatch):
+@pytest.mark.parametrize("malformed", [False, True])
+def test_restoring_a_snapshot_ignores_an_environment_dataset_pin(tmp_path, monkeypatch, malformed):
     model = RustForwardPassPerfModel.best_available(_regression_config())
     model.tune_with_fpms(_stream(4, 40))
     pinned = model.save_state_snapshot(tmp_path / "snap")
     queries = _queries()
     # A pin whose dataset is unavailable would raise MissingDataError if it were consulted before restoration.
     monkeypatch.setenv("AISIM_DATA_LOCAL", str(tmp_path / "no-such-dataset"))
+    if malformed:
+        monkeypatch.setenv("AISIM_DATASET", "no-revision")
     for restored in (
         RustForwardPassPerfModel.best_available(state_snapshot=tmp_path / "snap"),
         RustForwardPassPerfModel.best_available(pinned),
@@ -1125,3 +1128,19 @@ def test_restoring_a_snapshot_ignores_an_environment_dataset_pin(tmp_path, monke
     ):
         assert _bits(restored, queries) == _bits(model, queries)
         assert restored.dataset_revisions == {}
+
+
+def test_saved_snapshot_restore_ignores_an_invalid_dataset_environment(tmp_path, monkeypatch):
+    model = RustForwardPassPerfModel.best_available(_regression_config())
+    model.tune_with_fpms(_stream(3, 40))
+    expected = _bits(model, _queries())
+    pinned = model.save_state_snapshot(tmp_path / "snap")
+    monkeypatch.setenv("AISIM_DATASET", "invalid")
+    for restored in (
+        RustForwardPassPerfModel.best_available(state_snapshot=tmp_path / "snap"),
+        RustForwardPassPerfModel.best_available(pinned),
+        RustForwardPassPerfModel.best_available(ForwardPassPerfModelConfig(**pinned)),
+    ):
+        assert _bits(restored, _queries()) == expected
+    with pytest.raises(ValueError, match="AISIM_DATASET must"):
+        RustForwardPassPerfModel.best_available(_regression_config())

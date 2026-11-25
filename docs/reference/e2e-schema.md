@@ -52,7 +52,7 @@ One canonical name per concept; stored data uses only canonical names (`b300_sxm
 | statistic | `mean`, `median`, `p90`, `std` | `p50` is an alias of `median` |
 | phase | `warmup`, `profile` | `preparation` is an alias of `warmup` |
 
-Check a directory before a pull request with [`aisim data check-names`](cli.md#check-canonical-names). A name that
+Check a directory before a pull request with [`aisim data validate`](cli.md#validate-dataset). A name that
 is not canonical is still stored, but it is reported with the canonical spelling to use, and consumers ignore it
 until the data is fixed. External contributors convert to canonical names first; the dataset's `AGENTS.md` and
 `CONTRIBUTING.md` instruct a contributor's agent to do it.
@@ -70,6 +70,12 @@ until the data is fixed. External contributors convert to canonical names first;
 
 One configuration (one `configuration_id`, hashed from identity only) holds many observations, so lanes 1, 4,
 8 of one serving setup sit side by side.
+
+Writers put tables and provenance in immutable `generations/<id>/` directories and atomically replace the
+manifest after publishing its artifacts. Snapshot membership and acquisition tables likewise use distinct
+generation paths before the snapshot document switches. Prior generations remain available to readers holding
+older documents; publication does not garbage-collect them. Output paths must stay within the dataset root,
+including existing parent components. Failed rollback retains its staging directory and reports its recovery path.
 
 ### Manifest body (`aisim-e2e-manifest/v1`)
 
@@ -96,6 +102,22 @@ request counts, `outcome`, `valid_for_submission`, `qualification`, `observer` (
 `time_origin` (what request times count from), raw-artifact references and `attrs` (canonical JSON for scalars
 with no column yet).
 
+| Revision field | Required | Meaning |
+|---|---|---|
+| `record_sha256` | yes | Observation evidence revision, used by snapshot membership |
+| `raw_record_sha256` | no | Minor 2: digest of the raw record or summary when the evidence revision covers additional inputs; when absent, readers use `record_sha256` |
+| `observation_sha256` | no | Minor 3: version of the canonical observation fields (excluding the digest itself) and its persisted request rows in table order |
+
+The AIPerf converter binds the evidence revision to the summary, request records, observation metadata and log
+digest. Correcting a request changes snapshot membership even when the summary is unchanged. Raw-summary
+auditing uses `raw_record_sha256` separately.
+
+When present, `observation_sha256` is also part of snapshot membership (`SnapshotMember.observation_sha256`), and
+`write_snapshot` binds members whose configuration is available locally to the persisted observation. The
+configuration writer refreshes the digest from the rows it publishes, so edited requests change snapshot membership
+even when the raw summary is unchanged. Unversioned legacy observations and members keep their existing behavior
+and snapshot IDs.
+
 ### Metrics (`aisim-e2e-metrics/v1`)
 
 Long table. Required: `observation_id`, `metric`, `statistic`, `unit`, `status`. A valid row has a finite
@@ -103,6 +125,11 @@ Long table. Required: `observation_id`, `metric`, `statistic`, `unit`, `status`.
 `observer` (`client` or `server`, so client and engine TTFT never mix), `normalization`, `device_count`, and the
 source audit fields. Scoring needs `ttft`, `tpot` and `e2el` with `mean`, `median` and `p90`; absent ones are
 explicit `missing` rows.
+
+The evaluator preserves throughput normalization and statistic in its full metrics map. Its per-device summary
+uses statistic `value`, then `mean`, then the sole available statistic. Multiple normalization sources at that
+statistic, or several other statistics with neither `value` nor `mean`, are ambiguous and rejected, so row order
+cannot choose between reported and derived throughput. Duplicate evaluator keys are rejected as well.
 
 ### Requests (`aisim-e2e-requests/v1`)
 
@@ -123,7 +150,7 @@ row with value 0. Replicas of a tensor-parallel group are never summed; `source`
 |---|---|
 | InferenceX model, hardware, framework, precision, parallelism, spec method | manifest identity core, `orchestrator`, `speculation`; spellings in `source_ids` |
 | InferenceX `metrics.*` | metrics rows in canonical units; unmapped keys stay in `unmapped_metrics_json` |
-| AgentX lanes, corpus, boundary, warmup | `workload`, observation `concurrency` and `attrs` |
+| AgentX lanes, corpus, boundary, warmup, seed | Shared facts in manifest `workload`; each observation keeps its workload facts in `attrs.workload` and its lane count in `concurrency` |
 | AgentX per-request observations | requests table |
 | AgentX server-side series | series table |
 | AgentX effective runtime settings | manifest `settings` with `observed` authority, `implementation` |
@@ -133,3 +160,5 @@ row with value 0. Replicas of a tensor-parallel group are never summed; `source`
 
 `aisim_core.data.agentx_convert.agentx_bundles_to_configurations` converts AgentX bundles; the run-level
 statistics it writes are derived from the request rows and say so in `source_name`.
+Bundles of the same origin can merge; mixing official and self-collected bundles with one serving identity is
+rejected because a manifest has only one `origin`.

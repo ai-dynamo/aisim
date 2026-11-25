@@ -36,6 +36,8 @@ from .package_identity import PROGRAM_ENVIRONMENT, program_name
 from .resources import ResourceLimitError, descendants_of, discover_host, resolve_budget
 
 _CONTEXT = "_AISIM_SUPERVISED_BUDGET"
+# Mirrors aisim_core.data.default_systems.DOWNLOAD_MARKER_ENV without importing the data layer here.
+_DOWNLOAD_MARKER = "_AISIM_DOWNLOAD_MARKER"
 _THREAD_VARIABLES = (
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
@@ -280,9 +282,11 @@ def _run_process(
     env[PROGRAM_ENVIRONMENT] = program_name()
     events_path = directory / "events.jsonl"
     ready_path = directory / "ready"
+    download_path = directory / "downloading"
     env[_CONTEXT] = json.dumps(
         {**budget, "supervisor_pid": os.getpid(), "events_path": str(events_path), "ready_path": str(ready_path)}
     )
+    env[_DOWNLOAD_MARKER] = str(download_path)
     pass_fds: tuple[int, ...] = ()
     env.pop(OUTPUT_LOCK_FD_ENVIRONMENT, None)
     if output_lock is not None:
@@ -297,6 +301,7 @@ def _run_process(
     reason = ""
     status = "completed"
     shutdown_started: float | None = None
+    init_started = started
     try:
         while True:
             current = discover_host()
@@ -308,7 +313,10 @@ def _run_process(
             if current.available_memory_bytes < budget["reserved_host_memory_bytes"]:
                 reason, status = "available host memory fell below reserved headroom", "resource_limited"
                 break
-            if not ready_path.exists() and time.monotonic() - started > policy.initialization_timeout_seconds:
+            if download_path.exists():
+                # A first-use dataset download is a transfer, not a hung start: the deadline restarts when it ends.
+                init_started = time.monotonic()
+            if not ready_path.exists() and time.monotonic() - init_started > policy.initialization_timeout_seconds:
                 reason, status = "execution initialization timed out", "timed_out"
                 break
             if ready_path.exists() and ready_path.read_text() == "shutdown":
@@ -431,6 +439,16 @@ def _main(argv: Sequence[str] | None, cleanup: ExitStack) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(arguments)
+    if args.command in ("data", "fetch", "init"):
+        # Dataset commands download for minutes and need no execution supervision.
+        from .data_cli import run_data_command
+
+        if args.command != "data":
+            args.data_command = args.command
+        try:
+            return run_data_command(args)
+        except KeyboardInterrupt:
+            return 130
     if args.command == "onboard":
         from .support.cli import run_support_command
 

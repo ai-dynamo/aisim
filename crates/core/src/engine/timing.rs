@@ -227,6 +227,15 @@ impl TimingOperationEvidence {
             self.energy_wms,
             self.covered_latency_ms,
         )?;
+        self.check_details()?;
+        self.energy_wms = self.energy_wms.filter(|energy| *energy > 0.0);
+        if self.energy_wms.is_none() {
+            self.covered_latency_ms = 0.0;
+        }
+        Ok(self)
+    }
+
+    fn check_details(&self) -> Result<()> {
         if let Some(details) = &self.details {
             ensure!(
                 details.sol.is_some() != details.sol_unavailable_reason.is_some(),
@@ -260,11 +269,7 @@ impl TimingOperationEvidence {
                 );
             }
         }
-        self.energy_wms = self.energy_wms.filter(|energy| *energy > 0.0);
-        if self.energy_wms.is_none() {
-            self.covered_latency_ms = 0.0;
-        }
-        Ok(self)
+        Ok(())
     }
 
     fn accumulate(&mut self, other: Self) -> Result<()> {
@@ -447,16 +452,9 @@ impl ValidatedTimingPhase {
                 .any(|previous| previous.name == operation.name)
         }));
         // Same validation and error order as `try_from_operations`.
-        let operations = operations
-            .into_iter()
-            .map(|operation| {
-                if operation.details.is_some() {
-                    operation.canonicalized()
-                } else {
-                    Ok(operation)
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
+        for operation in &operations {
+            operation.check_details()?;
+        }
         debug_assert!(operations.iter().all(|operation| {
             matches!(operation.clone().canonicalized(), Ok(canonical) if canonical == *operation)
         }));
@@ -629,6 +627,8 @@ pub(crate) struct TimingEvidenceAccumulator {
     prefill_layouts: SlotLayouts,
     /// The same for `summary.decode`.
     decode_layouts: SlotLayouts,
+    /// Per phase, indexed by `usize::from(prefill)`.
+    named_layouts: [NamedLayouts; 2],
 }
 
 /// Slot-name lists whose every name is an accumulated operation without
@@ -684,6 +684,40 @@ impl SlotLayouts {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.0.len()
+    }
+}
+
+/// For each operation order a phase's named updates arrive in, other than its
+/// own: the accumulated index of every incoming operation. Named operations
+/// own their names, so a list is matched by comparing the name at each index,
+/// which also keeps it valid as the phase appends operations.
+#[derive(Default)]
+#[cfg(any(feature = "python", test))]
+struct NamedLayouts(Vec<Box<[usize]>>);
+
+#[cfg(any(feature = "python", test))]
+impl NamedLayouts {
+    /// The list whose every index holds `incoming`'s operation name in `phase`.
+    fn get(&self, phase: &TimingPhaseEvidence, incoming: &TimingPhaseEvidence) -> Option<&[usize]> {
+        self.0.iter().map(|indices| &**indices).find(|indices| {
+            indices.len() == incoming.operations.len()
+                && indices
+                    .iter()
+                    .zip(&incoming.operations)
+                    .all(|(&index, right)| {
+                        phase
+                            .operations
+                            .get(index)
+                            .is_some_and(|left| left.name == right.name)
+                    })
+        })
+    }
+
+    /// Further orders are searched by name on every update.
+    fn learn(&mut self, indices: &[usize]) {
+        if self.0.len() < SlotLayouts::CAPACITY {
+            self.0.push(indices.into());
+        }
     }
 }
 
@@ -753,6 +787,7 @@ impl TimingEvidenceAccumulator {
         } else {
             (&mut self.summary.decode, &mut self.decode_layouts)
         };
+        let named_layouts = &mut self.named_layouts[usize::from(prefill)];
         match &incoming.0 {
             ValidatedEvidence::Slotted(slotted) => {
                 // `phase` holds these slot names without diagnostics, so the
@@ -775,6 +810,7 @@ impl TimingEvidenceAccumulator {
                     phase,
                     &mut self.pending,
                     &mut self.indices,
+                    named_layouts,
                     Cow::Owned(slotted.to_named()),
                 )?;
                 layouts.learn(phase, &slotted.names);
@@ -789,6 +825,7 @@ impl TimingEvidenceAccumulator {
                     phase,
                     &mut self.pending,
                     &mut self.indices,
+                    named_layouts,
                     Cow::Borrowed(incoming),
                 )
             }
@@ -800,6 +837,7 @@ impl TimingEvidenceAccumulator {
         phase: &mut TimingPhaseEvidence,
         pending: &mut Vec<OperationUpdate>,
         indices: &mut Vec<usize>,
+        layouts: &mut NamedLayouts,
         incoming: Cow<'_, TimingPhaseEvidence>,
     ) -> Result<()> {
         // Private provider inputs are empty or built from operations, so stored
@@ -820,7 +858,7 @@ impl TimingEvidenceAccumulator {
         // checked path.
         if phase.operations.is_empty()
             || incoming.operations.is_empty()
-            || !Self::find_named(phase, &incoming, indices)
+            || !Self::find_named(phase, &incoming, indices, layouts)
         {
             return phase.try_accumulate(incoming.into_owned());
         }
@@ -843,33 +881,53 @@ impl TimingEvidenceAccumulator {
         phase: &TimingPhaseEvidence,
         incoming: &TimingPhaseEvidence,
         indices: &mut Vec<usize>,
+        layouts: &mut NamedLayouts,
     ) -> bool {
+        let mergeable = |index: usize, right: &TimingOperationEvidence| match (
+            &phase.operations[index].details,
+            &right.details,
+        ) {
+            (None, None) => true,
+            (Some(_), Some(right)) => right.fpm_estimates.is_empty(),
+            _ => false,
+        };
         indices.clear();
+        let mut reordered = false;
         for (position, right) in incoming.operations.iter().enumerate() {
             // Names are unique on both sides: equal layouts align by position.
-            let index = phase
+            let aligned = phase
                 .operations
                 .get(position)
-                .is_some_and(|left| left.name == right.name)
-                .then_some(position)
-                .or_else(|| {
-                    phase
-                        .operations
+                .is_some_and(|left| left.name == right.name);
+            if !aligned && !reordered {
+                // Accumulated names are unique, so a known layout that names
+                // every incoming operation holds the indices this search finds.
+                if let Some(known) = layouts.get(phase, incoming) {
+                    indices.clear();
+                    indices.extend_from_slice(known);
+                    return indices
                         .iter()
-                        .position(|left| left.name == right.name)
-                });
+                        .zip(&incoming.operations)
+                        .all(|(&index, right)| mergeable(index, right));
+                }
+                reordered = true;
+            }
+            let index = aligned.then_some(position).or_else(|| {
+                phase
+                    .operations
+                    .iter()
+                    .position(|left| left.name == right.name)
+            });
             let Some(index) = index else {
                 return false;
             };
-            let mergeable = match (&phase.operations[index].details, &right.details) {
-                (None, None) => true,
-                (Some(_), Some(right)) => right.fpm_estimates.is_empty(),
-                _ => false,
-            };
-            if !mergeable {
+            if !mergeable(index, right) {
                 return false;
             }
             indices.push(index);
+        }
+        if reordered {
+            layouts.learn(indices);
         }
         true
     }
@@ -2670,6 +2728,7 @@ pub(crate) mod tests {
                     operations.remove(1);
                 }
                 3 => operations.push(op("small", 0.2, None)),
+                4 => operations.swap(0, 1),
                 _ => {}
             }
             let incoming = ValidatedTimingPhase::from_operations(operations).unwrap();
@@ -2696,6 +2755,10 @@ pub(crate) mod tests {
             !fast.pending.is_empty(),
             "the matching-layout path must run"
         );
+        // Each order other than a phase's own is searched by name once.
+        let [decode, prefill] = &fast.named_layouts;
+        assert_eq!(decode.0.concat(), [2, 0, 2, 1, 0, 1, 2, 0]);
+        assert_eq!(prefill.0.concat(), [1, 0, 2, 0, 2, 2, 1, 0]);
         // Optional diagnostics retain the checked accumulator's merge rules.
         for detailed in [true, true, false] {
             let mut op = TimingOperationEvidence::new(

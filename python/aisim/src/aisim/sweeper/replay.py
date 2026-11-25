@@ -213,6 +213,9 @@ class BackendDeploymentSpec:
     # Per-worker tokenization: ``{"workers", "base_ms", "per_input_token_ms"}``.
     # Omitted from canonical JSON when unset, so existing spec identities hold.
     tokenization: dict[str, JSONValue] | None = field(default=None, metadata={OMIT_IF_NONE: True})
+    # Unqueued request-path CPU overhead: ``{"base_ms", "per_input_token_ms"}``.
+    # Omitted from canonical JSON when unset.
+    extra_cpu_overhead: dict[str, JSONValue] | None = field(default=None, metadata={OMIT_IF_NONE: True})
     # Per-worker detokenization: ``{"workers", "base_ms", "per_output_ms"}``.
     # Omitted from canonical JSON when unset.
     detokenization: dict[str, JSONValue] | None = field(default=None, metadata={OMIT_IF_NONE: True})
@@ -479,6 +482,7 @@ class RunnerCapabilities:
     supports_agentic_primers_only: bool = False
     supports_weka_chat_template: bool = False
     supports_kvcr_g3: bool = False
+    supports_telemetry: bool = False
 
     def supports_backend_topology(self, backend: str, topology: str) -> bool:
         """Return whether a backend/topology pair is supported.
@@ -521,6 +525,16 @@ class RunnerCapabilities:
                 f"ReplaySpec API version {api_version} is incompatible with "
                 f"runner version {self.replay_spec_api_version}"
             )
+
+    def require_output_support(self, output_requirements: ReplayOutputRequirements) -> None:
+        """Raise before runner creation when a requested capture is never produced.
+
+        The runner still rejects finer combinations, such as telemetry on paths
+        without native samples.
+        """
+
+        if output_requirements.capture_telemetry and not self.supports_telemetry:
+            raise ValueError("runner does not support replay telemetry; use --stack engine")
 
     def require_agentic_warmup_policy(self, policy: str) -> None:
         """Raise when the runner does not advertise an agentic warmup policy."""
@@ -700,6 +714,11 @@ class RunnerCapabilities:
                 raise ValueError("runner does not support engine.tokenization; use --stack engine")
             if spec.execution_mode != "offline":
                 raise ValueError("engine.tokenization requires offline replay")
+        if deployment.extra_cpu_overhead is not None:
+            if not self.supports_tokenization:
+                raise ValueError("runner does not support engine.extra_cpu_overhead; use --stack engine")
+            if spec.execution_mode != "offline":
+                raise ValueError("engine.extra_cpu_overhead requires offline replay")
         if deployment.detokenization is not None:
             if is_afd:
                 raise ValueError("engine.detokenization is unsupported for AFD")

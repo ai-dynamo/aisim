@@ -22,6 +22,7 @@ from aisim_core.data.names import NameFinding, name_findings
 
 MANIFEST_NAMES = ("manifest.json", "aisim-manifest.json")
 MANIFEST_SCHEMA = "aisim-artifact-manifest/v1"
+_MANIFEST_SCHEMA_FAMILY = MANIFEST_SCHEMA.rpartition("/")[0] + "/"  # every envelope version, supported or not
 
 
 @dataclass(frozen=True)
@@ -34,12 +35,28 @@ class PathFinding:
         return {"path": self.path, "kind": f.kind, "location": f.location, "value": f.value, "canonical": f.canonical}
 
 
+def _is_aisim_envelope(head: Any) -> bool:
+    """Whether a manifest-named file is an AISim envelope, valid or not, so the schema check can report it.
+
+    A string ``schema_version`` decides: any AISim envelope version, and nothing else. A missing or non-string
+    version is still an AISim envelope when the file carries the envelope's identity fields; unrelated manifest
+    formats (bundles, checkpoints, provenance) lack them and are ignored.
+    """
+    if not isinstance(head, dict):
+        return False
+    version = head.get("schema_version")
+    if isinstance(version, str):
+        return version.startswith(_MANIFEST_SCHEMA_FAMILY)
+    return {"configuration_id", "identity", "artifacts"} <= head.keys()
+
+
 def discover_manifests(root: Path) -> tuple[list[Path], list[str]]:
     """``(manifests, errors)`` under ``root``; a file is checked on its own.
 
     A file with a manifest name that cannot be read or parsed is an error, never silently dropped: a truncated
-    manifest in a directory must fail the check as it does when the file is checked directly. A readable JSON
-    document with another schema is simply not ours.
+    manifest in a directory must fail the check as it does when the file is checked directly. A file of another
+    AISim envelope version, or one shaped like an envelope without a usable ``schema_version``, is returned too
+    so the schema check reports it. A readable JSON document of an unrelated format is simply not ours.
     """
     root = Path(root)
     if root.is_file():
@@ -53,7 +70,7 @@ def discover_manifests(root: Path) -> tuple[list[Path], list[str]]:
             except (OSError, ValueError) as exc:
                 errors.append(f"{path.relative_to(root).as_posix()}: {type(exc).__name__}: {exc}")
                 continue
-            if isinstance(head, dict) and head.get("schema_version") == MANIFEST_SCHEMA:
+            if _is_aisim_envelope(head):
                 found.append(path)
     return found, errors
 
@@ -85,13 +102,14 @@ def _dataset_root(path: Path, manifest: Manifest) -> Path:
     raise LoaderError(f"cannot find the dataset root that holds the artifacts of {path}")
 
 
-def check_names(root: Path | str) -> tuple[list[PathFinding], list[str]]:
+def check_names(root: Path | str, base: Path | str | None = None) -> tuple[list[PathFinding], list[str]]:
     """``(findings, errors)`` for every configuration manifest under ``root``.
 
     ``errors`` lists manifests that could not be read or verified; they are not name findings.
+    Paths are relative to ``base`` (the dataset root); by default ``root`` itself, or its folder for a file.
     """
     root = Path(root)
-    base = root if root.is_dir() else root.parent
+    base = Path(base) if base else root if root.is_dir() else root.parent
     findings: list[PathFinding] = []
     errors: list[str] = []
     manifests, discovery_errors = discover_manifests(root)

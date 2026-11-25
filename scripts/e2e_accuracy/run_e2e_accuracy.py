@@ -39,6 +39,7 @@ from scripts.e2e_accuracy.build_e2e_accuracy_overview import (
 from scripts.e2e_accuracy.fetch_accuracy_measurements import MTP_POLICY, RESOLVED_POLICY, digest, validate_manifest
 from scripts.e2e_accuracy.hf_measurements import MTP_POLICY as HF_MTP_POLICY
 from scripts.e2e_accuracy.hf_measurements import POLICY as HF_POLICY
+from scripts.e2e_accuracy.hf_measurements import check_pinned_dataset, read_dataset
 from scripts.e2e_accuracy.source.cohort import select_points as select_resolved_points
 from scripts.e2e_accuracy.source.recipes.runtime_evidence import prepare_runtime_evidence
 from scripts.pages.build_pages_site import _accuracy_summary
@@ -779,6 +780,8 @@ def campaign(args) -> None:
         raise ValueError("invalid shard index/count")
     if shard_count > 1 and args.output.exists() and any(args.output.iterdir()):
         raise ValueError("shard output directory must be empty")
+    dataset = read_dataset(args.tables)
+    check_pinned_dataset(dataset, manifest)
     metadata = {
         "manifest": manifest,
         "identity": identity,
@@ -790,6 +793,7 @@ def campaign(args) -> None:
         "preview": preview,
         "configuration_mode": getattr(args, "configuration_mode", "verified"),
         "point_timeout": args.point_timeout,
+        "dataset": dataset,
         "dataset_sha256": digest(args.manifest),
         "measurement_sha256": digest(args.tables),
         "driver_sha256": driver_digest(),
@@ -999,6 +1003,9 @@ def publish_campaign(metadata, results, cohort_sha, started, output, run_attempt
         "status": "complete",
         "advisory": True,
     }
+    if metadata.get("dataset") is not None:
+        # Exact input identity: repository, commit and snapshot; reruns reuse these.
+        campaign_info["dataset"] = metadata["dataset"]
     if resolved:
         campaign_info["configuration"] = {
             "profile": "coverage-experiment/1" if metadata["configuration_mode"] == "estimated" else "verified",
@@ -1028,6 +1035,8 @@ def main():
             os.dup2(logs.fileno(), 1)
             os.dup2(logs.fileno(), 2)
             with redirect_stdout(logs), redirect_stderr(logs):
+                if systems_root := os.environ.get("AISIM_E2E_SYSTEMS_ROOT"):
+                    importlib.import_module("aisim_core.sdk.perf_database").set_systems_paths([systems_root])
                 result = predict_point(point)
             sys.stdout.flush()
             os.dup2(saved, 1)

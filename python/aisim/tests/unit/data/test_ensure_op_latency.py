@@ -3,6 +3,7 @@
 
 """The op-latency pin composes every operation family with the system specs into one verified root."""
 
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -11,7 +12,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from aisim_core.data.ensure import DataConflictError, DataPin, MissingDataError, ensure_data
+from aisim_core.data.ensure import DataConflictError, DataPin, DataTooLargeError, MissingDataError, ensure_data
 from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR
 from aisim_core.sdk import ForwardPassPerfModelConfig
 from aisim_core.sdk import rust_engine_step as res
@@ -152,6 +153,33 @@ def test_the_best_available_consumer_receives_the_complete_root(native_dataset, 
     assert model.predict_prefill_latency(1, 4) >= 7.0
 
 
+def test_auto_selected_op_level_model_with_a_library_path_saves_and_restores(native_dataset, tmp_path):
+    _, systems, config = native_dataset
+    library = tmp_path / "library.parquet"
+    shutil.copyfile(next((systems / "data").rglob("gemm_perf.parquet")), library)
+    payload = config.to_dict()
+    payload["estimation_mode"] = "auto"
+    payload["estimator_config"] = {
+        "correction": {"enabled": False},
+        "fpm_interpolation": {"fpm_parquet_path": str(library)},
+    }
+    model = res.RustForwardPassPerfModel.best_available(payload)
+    provenance = model.diagnostics()["provenance"]
+    assert provenance["selected_estimation_mode"] == "op_level"
+    # The search keeps the library pin in the canonical configuration; the op-level engine never reads it.
+    assert provenance["config"]["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"] == str(library)
+    # The saved canonical configuration rebuilds the same model without losing the library pin.
+    rebuilt = res.RustForwardPassPerfModel.best_available(provenance["config"])
+    assert rebuilt.predict_prefill_latency(1, 4) == model.predict_prefill_latency(1, 4)
+    assert rebuilt.diagnostics()["provenance"]["config"]["estimator_config"]["fpm_interpolation"][
+        "fpm_parquet_path"
+    ] == str(library)
+    pinned = model.save_state_snapshot(tmp_path / "snap")
+    assert "fpm_parquet_path" not in pinned["estimator_config"].get("fpm_interpolation", {})
+    restored = res.RustForwardPassPerfModel.best_available(state_snapshot=tmp_path / "snap")
+    assert restored.predict_prefill_latency(1, 4) == model.predict_prefill_latency(1, 4)
+
+
 @pytest.mark.parametrize("as_mapping", [False, True])
 @pytest.mark.parametrize("family", ["gemm", "attention"])
 def test_incomplete_pin_cannot_fall_back_to_other_operation_tables(native_dataset, tmp_path, as_mapping, family):
@@ -168,11 +196,92 @@ def test_incomplete_pin_cannot_fall_back_to_other_operation_tables(native_datase
         for e in _matching_entries(published, OpLatencyLoader().select(config.to_dict()))
         if e.identity.operation_family == family
     )
+    # Omit the complementary family from the published index. A configuration ID disambiguates its own
+    # family; it must no longer drop a complementary family that the dataset actually publishes.
+    index_path = published / "catalog/op-latency.json"
+    index = json.loads(index_path.read_bytes())
+    index["entries"] = [e for e in index["entries"] if e["configuration_id"] == entry.configuration_id]
+    _write_op_index(published, index)
     missing_table = "context_attention_perf" if family == "gemm" else "gemm_perf"
     with pytest.raises(PerfDataNotAvailableError, match=missing_table):
         res.RustForwardPassPerfModel.best_available(
             payload, dataset=_pin(published, tmp_path, configuration_id=entry.configuration_id)
         )
+
+
+def _write_op_index(root, index):
+    path = root / "catalog/op-latency.json"
+    path.write_text(json.dumps(index))
+    dataset = root / "catalog/dataset.json"
+    doc = json.loads(dataset.read_bytes())
+    doc["categories"]["op-latency"]["index"].update(
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(), bytes=path.stat().st_size
+    )
+    dataset.write_text(json.dumps(doc))
+
+
+def _duplicate_family(root, family):
+    from aisim_core.data import Identity, configuration_id
+
+    index = json.loads((root / "catalog/op-latency.json").read_bytes())
+    original = next(e for e in index["entries"] if e["identity"]["operation_family"] == family)
+    manifest = json.loads((root / original["manifest"]["path"]).read_bytes())
+    identity = Identity.model_validate({**manifest["identity"], "effective_settings": {"kernel": "alternative"}})
+    cid = configuration_id("op-latency", "operation-tables", identity)
+    manifest.update(identity=identity.model_dump(), configuration_id=cid)
+    path = root / original["manifest"]["path"]
+    path = path.with_name("alternative-manifest.json")
+    path.write_text(json.dumps(manifest))
+    index["entries"].append(
+        {
+            **original,
+            "identity": identity.model_dump(),
+            "configuration_id": cid,
+            "manifest": {
+                **original["manifest"],
+                "path": path.relative_to(root).as_posix(),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "bytes": path.stat().st_size,
+            },
+        }
+    )
+    _write_op_index(root, index)
+    return original["configuration_id"], cid
+
+
+@pytest.mark.parametrize("remote", [False, True])
+def test_disambiguating_gemm_fetches_and_materializes_attention_too(two_families, tmp_path, remote):
+    from tests.unit.data.test_fetch import FakeTransport
+
+    chosen, rejected = _duplicate_family(two_families, "gemm")
+    transport = FakeTransport(
+        {p.relative_to(two_families).as_posix(): p.read_bytes() for p in two_families.rglob("*") if p.is_file()}
+    )
+    pin = (
+        DataPin(
+            repo="org/dataset",
+            revision="a" * 40,
+            categories=("op-latency",),
+            configuration_id=chosen,
+            cache_dir=tmp_path / "cache",
+        )
+        if remote
+        else _pin(two_families, tmp_path, configuration_id=chosen)
+    )
+    out = ensure_data(dict(CONFIG), pin, transport=transport)
+    ids = out.datasets["op-latency"]["configuration_ids"]
+    assert chosen in ids and rejected not in ids and len(ids) == 2
+    root = Path(out.config["systems_paths"][0])
+    assert (root / "data/h200_sxm/attention/vllm/1.0/attention_perf.parquet").is_file()
+    assert (root / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet").is_file()
+    assert not any("alternative-manifest" in p for p in transport.opened)
+
+
+def test_a_gemm_choice_does_not_hide_an_unresolved_attention_conflict(two_families, tmp_path):
+    chosen, _ = _duplicate_family(two_families, "gemm")
+    _duplicate_family(two_families, "attention")
+    with pytest.raises(DataConflictError, match="attention"):
+        ensure_data(dict(CONFIG), _pin(two_families, tmp_path, configuration_id=chosen))
 
 
 def test_second_call_reuses_the_materialized_root(two_families, tmp_path):
@@ -190,13 +299,13 @@ def test_two_entries_for_one_family_are_a_real_conflict(two_families, tmp_path, 
         ensure_data(dict(CONFIG), _pin(two_families, tmp_path))
 
 
-def test_configuration_id_still_selects_one_entry(two_families, tmp_path):
+def test_configuration_id_keeps_complementary_families(two_families, tmp_path):
     from aisim_core.data.ensure import _matching_entries
     from aisim_core.data.loaders import OpLatencyLoader
 
     entries = _matching_entries(two_families, OpLatencyLoader().select(CONFIG))
     out = ensure_data(dict(CONFIG), _pin(two_families, tmp_path, configuration_id=entries[0].configuration_id))
-    assert out.datasets["op-latency"]["configuration_ids"] == [entries[0].configuration_id]
+    assert set(out.datasets["op-latency"]["configuration_ids"]) == {e.configuration_id for e in entries}
 
 
 def test_unpublished_version_has_no_fallback(two_families, tmp_path):
@@ -295,6 +404,41 @@ def test_malformed_reuse_declaration_is_refused(document):
 
 def _tree_files(root):
     return {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
+def test_policy_preselection_obeys_the_whole_pin_budget_and_accounts_for_downloads(two_families, tmp_path):
+    from .test_fetch import FakeTransport
+
+    files = _tree_files(two_families)
+    config = {**CONFIG, "backend_version": None}
+    kwargs = dict(repo="org/dataset", revision="a" * 40, categories=("op-latency",))
+    transport = FakeTransport(files)
+    with pytest.raises(DataTooLargeError):
+        ensure_data(config, DataPin(**kwargs, max_bytes=0, cache_dir=tmp_path / "zero"), transport=transport)
+    assert transport.opened == []
+    out = ensure_data(config, DataPin(**kwargs, cache_dir=tmp_path / "full"), transport=transport)
+    assert out.downloaded_bytes == sum(len(files[p]) for p in transport.opened)
+    assert any(p.endswith("query_versions.parquet") for p in transport.opened)
+    spent = out.downloaded_bytes
+    exact = FakeTransport(files)
+    assert (
+        ensure_data(
+            config, DataPin(**kwargs, max_bytes=spent, cache_dir=tmp_path / "exact"), transport=exact
+        ).downloaded_bytes
+        == spent
+    )
+    warm = FakeTransport(files)
+    assert (
+        ensure_data(
+            config, DataPin(**kwargs, max_bytes=0, cache_dir=tmp_path / "exact"), transport=warm
+        ).downloaded_bytes
+        == 0
+    )
+    assert warm.opened == []
+    with pytest.raises(DataTooLargeError):
+        ensure_data(
+            config, DataPin(**kwargs, max_bytes=spent - 1, cache_dir=tmp_path / "tight"), transport=FakeTransport(files)
+        )
 
 
 def test_a_cold_fetch_brings_the_pinned_lookup_tables(tree, tmp_path):  # noqa: F811
@@ -651,6 +795,122 @@ def test_a_composed_root_edited_in_place_is_rebuilt_from_the_dataset(two_familie
     assert (second / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet").read_bytes() == original
 
 
+@pytest.mark.parametrize(
+    "extra", ["data/h200_sxm/gemm/vllm/1.0/undeclared_perf.parquet", "unexpected.yaml", "profiles/extra.json"]
+)
+def test_unexpected_cached_files_are_removed_before_reuse_and_export(two_families, tmp_path, extra):
+    from aisim_core.data.materialize import materialize_systems_root
+
+    pin = _pin(two_families, tmp_path)
+    first = Path(ensure_data(dict(CONFIG), pin).config["systems_paths"][0])
+    unexpected = first / extra
+    unexpected.parent.mkdir(parents=True, exist_ok=True)
+    unexpected.write_bytes(b"unpublished data")
+    exported = materialize_systems_root(dict(CONFIG), pin, tmp_path / "export")
+    assert not unexpected.exists() and not (exported.root / extra).exists()
+    assert (exported.root / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet").is_file()
+
+
+def test_version_discovery_obeys_the_download_allowance_on_a_cold_and_warm_cache(two_families, tmp_path):
+    from aisim_core.data.ensure import DataTooLargeError
+
+    from .test_fetch import FakeTransport
+
+    transport = FakeTransport(_tree_files(two_families))
+    config = {k: v for k, v in CONFIG.items() if k != "backend_version"}
+    pin = DataPin(
+        repo="org/dataset", revision="a" * 40, categories=("op-latency",), cache_dir=tmp_path / "cache", max_bytes=1
+    )
+    with pytest.raises(DataTooLargeError):
+        ensure_data(config, pin, transport=transport)
+    assert transport.opened == ["catalog/dataset.json"]
+    from dataclasses import replace
+
+    roomy = replace(pin, max_bytes=10_000_000)
+    out = ensure_data(config, roomy, transport=transport)
+    assert out.downloaded_bytes == sum(len(transport.files[p]) for p in transport.opened[1:])
+    warm = FakeTransport(transport.files)
+    assert ensure_data(config, pin, transport=warm).downloaded_bytes == 0
+    assert warm.opened == []
+
+
+def test_configuration_owner_discovery_and_fetch_share_one_allowance(two_families, tmp_path):
+    from aisim_core.data import ensure as mod
+    from aisim_core.data.fetch import Selection
+
+    from .test_fetch import FakeTransport
+
+    entries = json.loads((two_families / "catalog/op-latency.json").read_bytes())["entries"]
+    chosen = entries[0]["configuration_id"]
+    pin = DataPin(
+        repo="org/dataset",
+        revision="a" * 40,
+        categories=("op-latency", "fpm"),
+        configuration_id=chosen,
+        cache_dir=tmp_path / "cache",
+        max_bytes=1,
+    )
+    transport = FakeTransport(_tree_files(two_families))
+    out = mod.EnsuredData(config=dict(CONFIG))
+    with pytest.raises(mod.DataTooLargeError):
+        mod._configuration_owner(pin, transport, out)
+    assert transport.opened == ["catalog/dataset.json"]
+    from dataclasses import replace
+
+    roomy = replace(pin, max_bytes=10_000_000)
+    out = mod.EnsuredData(config=dict(CONFIG))
+    assert mod._configuration_owner(roomy, transport, out) == "op-latency"
+    spent = out.downloaded_bytes
+    assert spent == sum(len(transport.files[p]) for p in transport.opened[1:]) and spent > 0
+    with pytest.raises(mod.DataTooLargeError):
+        mod._fetch_pinned(
+            Selection(category="op-latency", configuration_ids=(chosen,)),
+            replace(pin, max_bytes=spent + 1),
+            transport,
+            out,
+        )
+    warm = FakeTransport(transport.files)
+    assert mod._configuration_owner(pin, warm, mod.EnsuredData(config=dict(CONFIG))) == "op-latency"
+    assert warm.opened == []
+
+
+@pytest.mark.parametrize("policy", ["[]\n", "- malformed\n", "null\n", "42\n"])
+def test_non_mapping_version_policy_is_rejected(tree, tmp_path, policy):  # noqa: F811
+    import hashlib
+
+    published = tmp_path / "published"
+    _build(tree, published)
+    # A hash-consistent external dataset can embed malformed YAML even though our publisher rejects it.
+    # Exercise the consumer's untrusted-input boundary with the original Parquet schema and rows intact.
+    path = published / "data/op-latency/query_versions.parquet"
+    table = pq.read_table(path)
+    metadata = dict(table.schema.metadata)
+    metadata[b"aisim.source_yaml"] = policy.encode()
+    metadata[b"aisim.source_sha256"] = hashlib.sha256(policy.encode()).hexdigest().encode()
+    pq.write_table(table.replace_schema_metadata(metadata), path)
+    dataset_path = published / "catalog/dataset.json"
+    dataset = json.loads(dataset_path.read_text())
+    reference = dataset["categories"]["op-latency"]["index"]
+    index_path = published / reference["path"]
+    index = json.loads(index_path.read_text())
+    artifact = next(a for a in index["support"] if a["path"] == "data/op-latency/query_versions.parquet")
+    artifact.update(sha256=hashlib.sha256(path.read_bytes()).hexdigest(), bytes=path.stat().st_size)
+    index_path.write_text(json.dumps(index))
+    reference.update(sha256=hashlib.sha256(index_path.read_bytes()).hexdigest(), bytes=index_path.stat().st_size)
+    dataset_path.write_text(json.dumps(dataset))
+    config = {k: v for k, v in CONFIG.items() if k != "backend_version"}
+    with pytest.raises(MissingDataError, match="version policy must be a mapping"):
+        ensure_data(config, _pin(published, tmp_path))
+
+
+def test_valid_empty_policy_still_selects_the_latest_held_version(tree, tmp_path):  # noqa: F811
+    (tree / "query_versions.yaml").write_text("schema_version: 1\ndefaults: {}\noverrides: {}\n")
+    published = tmp_path / "published"
+    _build(tree, published)
+    config = {k: v for k, v in CONFIG.items() if k != "backend_version"}
+    assert ensure_data(config, _pin(published, tmp_path)).config["backend_version"] == "2.0"
+
+
 def test_an_exported_root_never_aliases_the_cached_tables(native_dataset, tmp_path):
     from aisim_core.data.materialize import materialize_systems_root
 
@@ -770,3 +1030,83 @@ def test_a_stale_repair_cannot_delete_a_root_another_caller_just_rebuilt(two_fam
     b.join(20)
     assert results["a"] == results["b"]
     assert (results["a"] / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet").read_bytes() == original
+
+
+def test_version_discovery_downloads_are_budgeted_and_warm_cache_is_free(tree, tmp_path):  # noqa: F811
+    from dataclasses import replace
+
+    from aisim_core.data.ensure import DataTooLargeError
+
+    from .test_fetch import FakeTransport, NoNetwork
+
+    published = tmp_path / "published"
+    _build(tree, published)
+    pin = DataPin(repo="org/dataset", revision="a" * 40, categories=("op-latency",), cache_dir=tmp_path / "cache")
+    config = {k: v for k, v in CONFIG.items() if k != "backend_version"}
+    transport = FakeTransport(_tree_files(published))
+    with pytest.raises(DataTooLargeError):
+        ensure_data(config, replace(pin, max_bytes=0), transport=transport)
+    assert transport.opened == []
+    out = ensure_data(config, pin, transport=transport)
+    assert out.downloaded_bytes == sum(len(transport.files[p]) for p in transport.opened)
+    warm = ensure_data(config, replace(pin, max_bytes=0), transport=NoNetwork())
+    assert warm.downloaded_bytes == 0 and warm.config["backend_version"] == out.config["backend_version"]
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        [],
+        None,
+        {"defaults": []},
+        {"overrides": []},
+        {"defaults": {"vllm": []}},
+        {"defaults": {"vllm": {"current": ["1.0"]}}},
+        {"defaults": {"vllm": {"current": ""}}},
+        {"default": {"vllm": {"current": "1.0"}}},
+        {"schema_version": True},
+    ],
+)
+def test_digest_correct_malformed_version_policy_cannot_select_latest(tree, tmp_path, document):  # noqa: F811
+    import hashlib
+
+    import yaml
+
+    published = tmp_path / "published"
+    _build(tree, published)
+    path = published / "data/op-latency/query_versions.parquet"
+    table = pq.read_table(path)
+    text = yaml.safe_dump(document).encode()
+    metadata = {
+        **table.schema.metadata,
+        b"aisim.source_yaml": text,
+        b"aisim.source_sha256": hashlib.sha256(text).hexdigest().encode(),
+    }
+    pq.write_table(table.replace_schema_metadata(metadata), path)
+    files = _tree_files(published)
+    index = json.loads(files["catalog/op-latency.json"])
+    artifact = next(a for a in index["support"] if a["path"] == path.relative_to(published).as_posix())
+    artifact.update(sha256=hashlib.sha256(path.read_bytes()).hexdigest(), bytes=path.stat().st_size)
+    files["catalog/op-latency.json"] = json.dumps(index).encode()
+    dataset = json.loads(files["catalog/dataset.json"])
+    index_bytes = files["catalog/op-latency.json"]
+    dataset["categories"]["op-latency"]["index"].update(
+        sha256=hashlib.sha256(index_bytes).hexdigest(), bytes=len(index_bytes)
+    )
+    files["catalog/dataset.json"] = json.dumps(dataset).encode()
+    for relative, raw in files.items():
+        (published / relative).write_bytes(raw)
+    config = {k: v for k, v in CONFIG.items() if k != "backend_version"}
+    with pytest.raises(MissingDataError, match="version policy"):
+        ensure_data(config, _pin(published, tmp_path))
+
+
+def test_a_valid_policy_without_an_applicable_entry_keeps_the_latest_held_version():
+    from aisim_core.data.ensure import _slot_version, _validate_version_policy
+
+    document = {"schema_version": 1, "defaults": {}, "overrides": {}}
+    _validate_version_policy(document)
+    assert (
+        _slot_version("h200_sxm", "vllm", None, {("h200_sxm", "vllm", "1.0"), ("h200_sxm", "vllm", "2.0")}, document)
+        == "2.0"
+    )

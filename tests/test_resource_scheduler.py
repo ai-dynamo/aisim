@@ -97,6 +97,85 @@ def test_checkpoint_failure_stops_before_workers_without_reclassifying_candidate
     assert factory.admitted == [[0, 1]]
 
 
+@pytest.mark.parametrize(
+    "host_pressure,child_rss", [(False, 21), (True, 20), (True, 21)], ids=["worker", "host", "both"]
+)
+def test_profile_pressure_retries_only_unfinished_work_serially(monkeypatch, host_pressure, child_rss):
+    from concurrent.futures import Future
+    from unittest.mock import Mock
+
+    from aisim import resource_scheduler as scheduler
+    from aisim import resources
+
+    submitted = []
+    terminated = []
+
+    class Factory(_BudgetFactory):
+        def admit_wave(self, specs):
+            plan = super().admit_wave(specs)
+            return plan | ({"profile_worker_rss_limit_bytes": 100} if len(specs) > 1 else {})
+
+        def live_pressure(self):
+            return {"host_available_bytes": 1} if host_pressure else None
+
+    class Pool:
+        def __init__(self, *, max_workers, **kwargs):
+            self.width = max_workers
+            self._processes = {123: object()}
+
+        def submit(self, fn, spec):
+            index = spec["id"]
+            submitted.append((self.width, index))
+            future = Future()
+            if self.width == 1 or index == 0:
+                future.set_result(index)
+            return future
+
+    monkeypatch.setattr(scheduler, "ProcessPoolExecutor", Pool)
+    monkeypatch.setattr(scheduler, "terminate_pool", terminated.append)
+    monkeypatch.setattr(scheduler, "close_pool", lambda pool: None)
+    monkeypatch.setattr(
+        resources.psutil, "Process", lambda pid: SimpleNamespace(memory_info=lambda: SimpleNamespace(rss=80))
+    )
+    monkeypatch.setattr(resources, "_child_memory_bytes", lambda parent: child_rss)
+    interrupt = Mock(wraps=InterruptedEvaluation)
+    monkeypatch.setattr(scheduler, "InterruptedEvaluation", interrupt)
+    factory = Factory(capacity=8)
+    specs = [{"id": i, "cost": 1} for i in range(8)]
+    results = dict(evaluate_waves(specs, factory=factory, initializer=_init, evaluate=_evaluate, workers=8, timeout=10))
+    assert results == {i: i for i in range(8)}
+    assert submitted == [(8, i) for i in range(8)] + [(1, i) for i in range(1, 8)]
+    pressure = (
+        {"worker_pid": 123, "worker_rss_bytes": 101, "worker_rss_limit_bytes": 100}
+        if child_rss > 20
+        else {"host_available_bytes": 1}
+    )
+    interrupt.assert_called_once_with("live memory pressure", True, pressure)
+    assert len(terminated) == 1
+
+
+def test_profile_worker_pressure_counts_a_live_child():
+    import subprocess
+    import sys
+
+    import psutil
+
+    from aisim.resources import profile_worker_pressure
+
+    worker = psutil.Process()
+    with subprocess.Popen(
+        [sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    ) as child:
+        assert child.stdout.readline() == b"ready\n"
+        child_rss = psutil.Process(child.pid).memory_info().rss
+        limit = worker.memory_info().rss + child_rss // 2
+        pressure = profile_worker_pressure([worker.pid], limit)
+        assert pressure["worker_pid"] == worker.pid
+        assert pressure["worker_rss_bytes"] > pressure["worker_rss_limit_bytes"] == limit
+
+
 def test_resource_retries_are_bounded_and_preserve_completed_work():
     factory = _BudgetFactory()
     specs = [{"id": 0, "cost": 1}, {"id": 1, "cost": 1, "refuse": True}]

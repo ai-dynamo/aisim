@@ -152,3 +152,27 @@ def test_a_failed_manifest_write_keeps_the_previous_manifest(tmp_path, monkeypat
         publish_system_spec(changed / "x1.yaml", root)
     assert manifest.read_bytes() == before
     assert not list(manifest.parent.glob(".*.tmp"))
+
+
+def test_changed_calibration_cannot_inherit_old_evidence(tmp_path):
+    pkg = _packaged(tmp_path)
+    path = pkg / "x1.yaml"
+    root = tmp_path / "data"
+    fields = {"gpu.mem_bw": {"source": "calibrated", "evidence": "eval-old"}}
+    publish_system_spec(path, root, fields=fields)
+    before = _tree(root)
+    path.write_text(SPEC.replace("mem_bw: 1", "mem_bw: 2"))
+    with pytest.raises(SystemSpecError, match="changed calibrated field gpu.mem_bw"):
+        publish_system_spec(path, root)
+    assert _tree(root) == before
+    publish_system_spec(path, root, fields={"gpu.mem_bw": {"source": "calibrated", "evidence": "eval-new"}})
+    assert read_manifest(root / "systems/x1/manifest.yaml").fields["gpu.mem_bw"].evidence == "eval-new"
+
+
+def test_unchanged_calibration_retains_evidence_when_other_fields_change(tmp_path):
+    path = _packaged(tmp_path) / "x1.yaml"
+    root = tmp_path / "data"
+    publish_system_spec(path, root, fields={"gpu.mem_bw": {"source": "calibrated", "evidence": "eval-old"}})
+    path.write_text(SPEC.replace("sm_version: 100", "sm_version: 101"))
+    publish_system_spec(path, root)
+    assert read_manifest(root / "systems/x1/manifest.yaml").fields["gpu.mem_bw"].evidence == "eval-old"

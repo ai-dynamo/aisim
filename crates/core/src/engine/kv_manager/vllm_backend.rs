@@ -26,6 +26,7 @@ use super::grouped::{GroupedBlockPool, GroupedKvPool, GroupedLease};
 use super::grouped_prefix::{
     AdmissionLimits, GroupedHit, GroupedPrefixCoordinator, GroupedPrefixRules, StoredGroupedHit,
 };
+use super::grouped_transfer::GroupedTransferRules;
 use super::state_cache_manager::{StateCacheManager, StateRequest};
 use crate::engine::belady::BeladyOracle;
 use crate::engine::cache::vllm_block_pool::{
@@ -203,6 +204,81 @@ struct StateMiss {
     overlap_blocks: usize,
 }
 
+/// Prefix hash units in one span of a [`PrefixHashMemo`].
+const PREFIX_MEMO_SPAN_UNITS: usize = 512;
+/// Spans a [`PrefixHashMemo`] records, marked or kept, before it starts
+/// over: at most 8 MiB of kept hashes. It only helps while the spans of the
+/// prompts still repeating fit.
+const PREFIX_MEMO_SPANS: usize = 2048;
+
+/// Appends the chained hashes of the `unit`-token blocks of `tokens`, which
+/// follow the blocks hashed in `hashes`.
+fn extend_prefix_hashes(hashes: &mut Vec<SequenceHash>, tokens: &[u32], unit: usize) {
+    let mut parent = hashes.last().copied();
+    hashes.extend(block_hashes(tokens, unit).map(|local| {
+        let hash = parent
+            .map(|p| compute_next_sequence_hash(p, local))
+            .unwrap_or(local);
+        parent = Some(hash);
+        hash
+    }));
+}
+
+/// The prefix hashes of the prompt spans one engine has hashed twice, so that
+/// a prompt that repeats a prefix (the next turn of a session, a shared
+/// system prompt) copies those spans instead of hashing the tokens again.
+///
+/// The key of a span is the identity of its last block, which, like the
+/// span's chained hashes, is a function of every token up to the end of the
+/// span. A span is only marked the first time it is hashed, so that a prompt
+/// that never repeats copies nothing.
+pub(crate) struct PrefixHashMemo {
+    unit: usize,
+    span_tokens: usize,
+    span_blocks: usize,
+    max_spans: usize,
+    /// Each recorded span, with its start in `hashes` once it is kept.
+    spans: FxHashMap<SequenceHash, Option<usize>>,
+    hashes: Vec<SequenceHash>,
+}
+
+impl PrefixHashMemo {
+    /// `None` when a span does not end on a block boundary.
+    pub(crate) fn new(unit: usize, block_size: usize) -> Option<Self> {
+        let span_tokens = PREFIX_MEMO_SPAN_UNITS * unit;
+        span_tokens.is_multiple_of(block_size).then(|| Self {
+            unit,
+            span_tokens,
+            span_blocks: span_tokens / block_size,
+            max_spans: PREFIX_MEMO_SPANS,
+            spans: FxHashMap::default(),
+            hashes: Vec::new(),
+        })
+    }
+
+    fn kept(&self, key: SequenceHash) -> Option<&[SequenceHash]> {
+        let start = (*self.spans.get(&key)?)?;
+        Some(&self.hashes[start..start + PREFIX_MEMO_SPAN_UNITS])
+    }
+
+    /// Records that the span under `key` was hashed to `span`: marks it the
+    /// first time and keeps `span` the second.
+    fn record(&mut self, key: SequenceHash, span: &[SequenceHash]) {
+        if let Some(start) = self.spans.get_mut(&key) {
+            if start.is_none() {
+                *start = Some(self.hashes.len());
+                self.hashes.extend_from_slice(span);
+            }
+            return;
+        }
+        if self.spans.len() == self.max_spans {
+            self.spans.clear();
+            self.hashes.clear();
+        }
+        self.spans.insert(key, None);
+    }
+}
+
 /// Move-only native-G1 ownership token attached to one scheduler request.
 #[derive(Debug)]
 #[must_use = "a native block lease must be finished, aborted, retracted, or moved into a hold"]
@@ -283,17 +359,49 @@ impl BlockRequestLease {
     }
 
     pub(crate) fn configure_prefix_hashes(&mut self, tokens: &[u32], unit: usize) {
-        self.prompt_tokens = tokens.len();
-        let mut parent = None;
-        let hashes = block_hashes(tokens, unit)
-            .map(|local| {
-                let hash = parent
-                    .map(|p| compute_next_sequence_hash(p, local))
-                    .unwrap_or(local);
-                parent = Some(hash);
-                hash
-            })
-            .collect();
+        let mut hashes = Vec::with_capacity(tokens.len() / unit);
+        extend_prefix_hashes(&mut hashes, tokens, unit);
+        self.set_prefix_hashes(tokens.len(), unit, hashes);
+    }
+
+    /// [`Self::configure_prefix_hashes`] at the unit of `memo`, for a lease
+    /// whose block identities hash its tokens (prefix caching). The leading
+    /// spans that `memo` keeps are copied from it; the rest of the prompt is
+    /// hashed, and its spans recorded.
+    pub(crate) fn configure_prefix_hashes_memoized(
+        &mut self,
+        tokens: &[u32],
+        memo: &mut PrefixHashMemo,
+    ) {
+        let (unit, span_tokens, span_blocks) = (memo.unit, memo.span_tokens, memo.span_blocks);
+        let entries = &self.entries;
+        let key = |span: usize| {
+            entries
+                .get((span + 1) * span_blocks - 1)?
+                .identity
+                .sequence_hash
+        };
+        let spans = tokens.len() / span_tokens;
+        let mut hashes = Vec::with_capacity(tokens.len() / unit);
+        let mut copied = 0;
+        while copied < spans
+            && let Some(span) = key(copied).and_then(|key| memo.kept(key))
+        {
+            hashes.extend_from_slice(span);
+            copied += 1;
+        }
+        extend_prefix_hashes(&mut hashes, &tokens[copied * span_tokens..], unit);
+        for span in copied..spans {
+            if let Some(key) = key(span) {
+                let start = span * PREFIX_MEMO_SPAN_UNITS;
+                memo.record(key, &hashes[start..start + PREFIX_MEMO_SPAN_UNITS]);
+            }
+        }
+        self.set_prefix_hashes(tokens.len(), unit, hashes);
+    }
+
+    fn set_prefix_hashes(&mut self, prompt_tokens: usize, unit: usize, hashes: Vec<SequenceHash>) {
+        self.prompt_tokens = prompt_tokens;
         self.prefix_hashes = Some((unit, hashes));
         // The hashes are an input of the grouped search.
         if let Some(stored) = &mut self.grouped_hit {
@@ -467,6 +575,10 @@ pub(crate) struct DestinationReservation {
 }
 
 impl DestinationReservation {
+    pub(crate) fn fresh_source_reads(&self) -> impl Iterator<Item = SourceReuseDependency> + '_ {
+        self.pool.fresh_source_reads()
+    }
+
     pub(crate) fn transferable_prompt_tokens(&self, block_size: usize) -> usize {
         self.pool
             .fresh_len()
@@ -576,6 +688,8 @@ pub(crate) struct VllmKvManager {
     grouped: Option<GroupedKvPool>,
     /// The prefix cache rules of a grouped cache in block mode.
     grouped_prefix: Option<GroupedPrefixCoordinator>,
+    /// The P/D transfer rules of a grouped cache on a prefill or decode rank.
+    grouped_transfer: Option<GroupedTransferRules>,
     state_cache: Option<StateCacheManager>,
     prefix_match_unit: Option<usize>,
     /// Present while a host tier takes recurrent-state stores.
@@ -607,6 +721,15 @@ impl VllmKvManager {
         self.grouped_prefix = Some(GroupedPrefixCoordinator::new(rules, limits));
     }
 
+    /// Set the P/D transfer rules of the grouped cache.
+    pub(crate) fn set_grouped_transfer_rules(&mut self, rules: GroupedTransferRules) {
+        assert!(
+            self.grouped.is_some(),
+            "grouped transfer rules need a grouped cache"
+        );
+        self.grouped_transfer = Some(rules);
+    }
+
     pub(crate) fn grouped(&self) -> Option<&GroupedKvPool> {
         self.grouped.as_ref()
     }
@@ -615,6 +738,10 @@ impl VllmKvManager {
         self.grouped_prefix
             .as_ref()
             .map(GroupedPrefixCoordinator::rules)
+    }
+
+    pub(crate) fn grouped_transfer(&self) -> Option<&GroupedTransferRules> {
+        self.grouped_transfer.as_ref()
     }
 
     pub(crate) fn set_belady_oracle(&mut self, oracle: BeladyOracle) {
@@ -647,6 +774,7 @@ impl VllmKvManager {
             next_event_id: 0,
             grouped: None,
             grouped_prefix: None,
+            grouped_transfer: None,
             state_cache: None,
             prefix_match_unit: None,
             state_handoffs: None,
@@ -2050,8 +2178,10 @@ impl VllmKvManager {
     pub(crate) fn satisfy_source_reuse_dependency(
         &mut self,
         dependency: SourceReuseDependency,
+        retain_source_read: bool,
     ) -> bool {
-        self.pool.satisfy_source_reuse_dependency(dependency)
+        self.pool
+            .satisfy_source_reuse_dependency(dependency, retain_source_read)
     }
 
     pub(crate) fn is_source_reuse_dependency_pending(
@@ -2165,6 +2295,55 @@ impl VllmKvManager {
         lease.allocated_tokens = 0;
         // A re-admission searches the hit again. The stamp goes with the hit.
         lease.grouped_hit = None;
+    }
+
+    /// Free the grouped blocks of a completed source that a next query of
+    /// its `computed` tokens would skip. vLLM frees them on the processed-token
+    /// basis before it hands the block table to the connector (V32
+    /// `sched:3023-3031`, V31 `:2966-2974`), when it processes the outputs of
+    /// the pass that completed the source. A window group keeps its blocks
+    /// inside the window, a Mamba-type state group the block of the last
+    /// computed token, and full attention and a ring keep every block. The
+    /// release is the one of a pass, with its publish and LRU rules, but it
+    /// takes no fresh block: a state that the source published inside its
+    /// running block gets no copy, as vLLM copies it only at an allocation
+    /// (V32 `single:1855-1900`, V31 `:1891-1936`).
+    pub(crate) fn release_skipped_blocks(
+        &mut self,
+        owner: Uuid,
+        lease: &mut BlockRequestLease,
+        computed: usize,
+    ) {
+        lease.debug_assert_owner(owner);
+        let Some(grouped) = &mut self.grouped else {
+            return;
+        };
+        match &mut self.grouped_prefix {
+            Some(coordinator) => {
+                if let Some(block_lease) = lease
+                    .grouped
+                    .as_mut()
+                    .and_then(|grouped| grouped.block_lease.as_mut())
+                {
+                    // A finished request runs no next pass, so the previous
+                    // state block that a pass keeps one more step goes too.
+                    let released = coordinator.allocate(
+                        grouped.block_pool_mut().expect("block mode"),
+                        block_lease,
+                        lease.prompt_tokens,
+                        computed,
+                        computed,
+                        self.step + 1,
+                    );
+                    debug_assert!(released, "a release takes no fresh block");
+                }
+            }
+            None if lease.grouped.is_some() => {
+                let released = grouped.allocate(&mut lease.grouped, computed, computed);
+                debug_assert!(released, "a release takes no fresh bytes");
+            }
+            None => {}
+        }
     }
 
     pub(crate) fn finish_lease(&mut self, owner: Uuid, mut lease: BlockRequestLease) {
@@ -3383,7 +3562,7 @@ mod tests {
                 .is_some(),
             "a new store may follow the compute fenced behind the old reader"
         );
-        assert!(manager.satisfy_source_reuse_dependency(dependency));
+        assert!(manager.satisfy_source_reuse_dependency(dependency, false));
         assert!(
             manager
                 .snapshot_store_sources(owner, &lease, &[0])
@@ -3431,7 +3610,7 @@ mod tests {
 
         manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 0, 4);
         manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 4, 8);
-        assert!(manager.satisfy_source_reuse_dependency(dependency));
+        assert!(manager.satisfy_source_reuse_dependency(dependency, false));
         assert!(manager.pool.prefix_hit(9).is_some());
         assert!(manager.pool.prefix_hit(10).is_some());
     }
@@ -3602,7 +3781,7 @@ mod tests {
         );
         manager.finish_lease(owner, lease);
         assert_eq!(manager.num_active_blocks(), 0);
-        assert!(manager.satisfy_source_reuse_dependency(dependency));
+        assert!(manager.satisfy_source_reuse_dependency(dependency, false));
     }
 
     #[test]
@@ -3629,7 +3808,7 @@ mod tests {
         manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 0, 8);
         assert!(manager.pool.prefix_hit(2).is_some());
         manager.finish_lease(owner, lease);
-        assert!(manager.satisfy_source_reuse_dependency(dependency));
+        assert!(manager.satisfy_source_reuse_dependency(dependency, false));
     }
 
     #[test]
@@ -3661,5 +3840,49 @@ mod tests {
         manager.finish_lease(owner, lease);
         assert_eq!(manager.num_active_blocks(), 0);
         assert_eq!(manager.num_inactive_blocks(), 1);
+    }
+
+    #[test]
+    fn memoized_prefix_hashes_equal_the_chain_over_the_prompt() {
+        // 16-token blocks hashed in 4-token units: a span is 2,048 tokens.
+        let owner = Uuid::nil();
+        let lease = |tokens: &[u32]| {
+            let (_, identities) =
+                RequestSequence::new(owner, tokens.into(), 0, 0, 16, true, false, false, None);
+            BlockRequestLease::new(owner, identities)
+        };
+        // A span that does not end on a block boundary has no key.
+        assert!(PrefixHashMemo::new(4, 24).is_none());
+        let mut memo = PrefixHashMemo::new(4, 16).unwrap();
+        // Room for three spans: a fourth starts the memo over.
+        memo.max_spans = 3;
+        // Two spans and a tail.
+        let first: Vec<u32> = (0..5000).collect();
+        // The first span of `first`, then another span and a tail.
+        let second: Vec<u32> = (0..3000).chain(9000..12_000).collect();
+        // One span, unlike the first span of `first` only in its last block.
+        let third: Vec<u32> = (0..2040).chain(30_000..30_060).collect();
+        // Each prompt with the spans the memo has recorded and kept after it.
+        // A span is marked the first time, kept the second and copied from
+        // the third; `second` copies the span it shares with `first`.
+        for (tokens, recorded, kept) in [
+            (&first, 2, 0),
+            (&first, 2, 2),
+            (&first, 2, 2),
+            (&second, 3, 2),
+            (&second, 3, 3),
+            (&second, 3, 3),
+            (&third, 1, 0),
+            (&first, 3, 0),
+        ] {
+            let mut plain = lease(tokens);
+            plain.configure_prefix_hashes(tokens, 4);
+            let mut memoized = lease(tokens);
+            memoized.configure_prefix_hashes_memoized(tokens, &mut memo);
+            assert_eq!(memoized.prefix_hashes, plain.prefix_hashes);
+            assert_eq!(memoized.prompt_tokens, tokens.len());
+            assert_eq!(memo.spans.len(), recorded);
+            assert_eq!(memo.hashes.len(), kept * PREFIX_MEMO_SPAN_UNITS);
+        }
     }
 }

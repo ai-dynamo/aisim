@@ -17,14 +17,17 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
+from aisim_core.data.fpm_layout import OTHER_CATEGORY_PREFIXES, PHYSICAL_PREFIX, storage_path
+
 Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
-Category = Literal["op-latency", "fpm", "e2e", "eval", "systems"]
+Category = Literal["op-latency", "fpm", "e2e", "eval", "systems", "host-cost"]
 Purpose = Literal[
     "operation-tables",
     "execution-profile",
     "e2e-configuration",
     "evaluation-record",
     "system-spec",
+    "host-cost-profile",
 ]
 # Version 1 hashed only the original Identity fields. Version 2 adds the
 # first-class deployment fields below. Version 3 adds the deployment facts that
@@ -206,7 +209,7 @@ def path_component(value: str) -> str:
     return value
 
 
-def _file(root: Path, relative: str) -> Path:
+def _plain_file(root: Path, relative: str) -> Path:
     path = root
     for part in PurePosixPath(_relative(relative)).parts:
         path = path / part
@@ -217,12 +220,35 @@ def _file(root: Path, relative: str) -> Path:
     return path
 
 
+def _file(root: Path, relative: str) -> Path:
+    # Moved FPM manifests retain logical legacy keys. Resolve only storage locations; manifest bytes and
+    # configuration/case/observation identities stay untouched. Canonical category paths need no catalog read.
+    _relative(relative)
+    if (
+        relative.startswith("data/")
+        and not relative.startswith((PHYSICAL_PREFIX, *OTHER_CATEGORY_PREFIXES))
+        and (root / "catalog/dataset.json").exists()
+    ):
+        index = DatasetIndex.model_validate_json(_plain_file(root, "catalog/dataset.json").read_bytes())
+        relative = storage_path(relative, {name: ref.root for name, ref in index.categories.items()})
+    return _plain_file(root, relative)
+
+
 def _verify(root: Path, artifact: Artifact) -> Path:
     path = _file(root, artifact.path)
     with path.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
     if path.stat().st_size != artifact.bytes or digest != artifact.sha256:
         raise ValueError(f"artifact integrity mismatch: {artifact.path}")
+    if artifact.role == "fpm-library":
+        # Native libraries are identified by the manifest declaration alone, so validate it before any branch on
+        # the declared format.
+        from aisim_core.data.fpm_library import LIBRARY_SCHEMA_ID
+
+        if artifact.format != "parquet" or artifact.rows is None:
+            raise ValueError(f"an fpm-library artifact must declare format parquet and rows: {artifact.path}")
+        if artifact.artifact_schema != LIBRARY_SCHEMA_ID:
+            raise ValueError(f"unsupported FPM library schema ID {artifact.artifact_schema!r}: {artifact.path}")
     if artifact.format == "parquet" and (
         artifact.rows is None or pq.ParquetFile(path).metadata.num_rows != artifact.rows
     ):
@@ -249,6 +275,11 @@ def check_manifest(root: Path, path: str) -> Manifest:
     """Check one manifest and all declared inputs without network access."""
     root = Path(root)
     manifest = Manifest.model_validate_json(_file(root, path).read_bytes())
+    return _check_manifest(root, manifest)
+
+
+def _check_manifest(root: Path, manifest: Manifest) -> Manifest:
+    """Validate an already parsed manifest and all its declared inputs."""
     if manifest.configuration_id != configuration_id(manifest.category, manifest.purpose, manifest.identity):
         raise ValueError("configuration identity hash mismatch")
     # fpm manifests are execution-profile bundles (the shared-envelope FPM layout);
@@ -268,13 +299,33 @@ def check_manifest(root: Path, path: str) -> Manifest:
     return manifest
 
 
-def check_dataset(root: Path) -> DatasetIndex:
-    """Verify shared discovery indexes and the manifests they reference."""
+def check_envelope(root: Path, path: str) -> Manifest:
+    """Check a manifest of a category with no offline checker here: its identity hash and every declared artifact.
+
+    The category's own validators check the content; this keeps a missing or altered artifact from passing.
+    """
+    root = Path(root)
+    return _check_envelope(root, Manifest.model_validate_json(_file(root, path).read_bytes()))
+
+
+def _check_envelope(root: Path, manifest: Manifest) -> Manifest:
+    if manifest.configuration_id != configuration_id(manifest.category, manifest.purpose, manifest.identity):
+        raise ValueError("configuration identity hash mismatch")
+    for artifact in manifest.artifacts:
+        _verify(root, artifact)
+    return manifest
+
+
+def check_dataset(root: Path, *, unchecked_categories: tuple[str, ...] = ()) -> DatasetIndex:
+    """Verify shared discovery indexes and the manifests they reference.
+
+    Manifests of ``unchecked_categories`` (categories with no offline checker here) get the envelope checks of
+    :func:`check_envelope` and the catalog identity comparison, but no category-specific checks.
+    """
     root = Path(root)
     index = DatasetIndex.model_validate_json(_file(root, "catalog/dataset.json").read_bytes())
     for category, reference in index.categories.items():
-        path = _verify(root, reference.index)
-        entries = CategoryIndex.model_validate_json(path.read_bytes())
+        entries = CategoryIndex.model_validate_json(_verified_bytes(root, reference.index))
         if entries.category != category:
             raise ValueError("category index identity mismatch")
         for artifact in entries.support:
@@ -284,8 +335,24 @@ def check_dataset(root: Path) -> DatasetIndex:
             if entry.configuration_id in seen:
                 raise ValueError("duplicate configuration ID")
             seen.add(entry.configuration_id)
-            _verify(root, entry.manifest)
-            manifest = check_manifest(root, entry.manifest.path)
+            # Parse the bytes that passed the integrity check, then run the category's checks on that manifest.
+            manifest = Manifest.model_validate_json(_verified_bytes(root, entry.manifest))
+            if category in unchecked_categories:
+                manifest = _check_envelope(root, manifest)
+            elif category == "e2e":
+                # Import lazily: the E2E protocol builds on this shared envelope module.
+                from aisim_core.data.e2e import load_e2e
+
+                loaded = load_e2e(root, entry.manifest.path).manifest
+                if loaded.model_dump_json() != manifest.model_dump_json():
+                    raise ValueError("manifest changed during dataset validation")
+            elif category == "host-cost":
+                from aisim_core.data.host_cost import check_entry
+
+                if check_entry(root, entry.manifest.path).model_dump_json() != manifest.model_dump_json():
+                    raise ValueError("manifest changed during dataset validation")
+            else:
+                manifest = _check_manifest(root, manifest)
             if (manifest.category, manifest.configuration_id, manifest.identity, manifest.purpose) != (
                 category,
                 entry.configuration_id,
@@ -388,3 +455,16 @@ def prepare_execution_profile(root: Path, manifest_path: str, output_dir: Path) 
         shutil.rmtree(output_dir)
         raise
     return config
+
+
+# The FPM library contract (staging, sidecar schema, resource precedence). Defined in a leaf module that does not
+# import this package, so the re-export is safe here.
+from aisim_core.data.fpm_library import (  # noqa: F401
+    FpmContractError,
+    FpmLibraryMetadata,
+    FpmResourcesPendingError,
+    StagedFpmLibrary,
+    complete_fpm_profile,
+    resolve_resources,
+    stage_fpm_library,
+)

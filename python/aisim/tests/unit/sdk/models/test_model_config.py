@@ -2369,8 +2369,12 @@ _RESIDUAL_WIDTH_CONFIGS = {
 
 
 @pytest.mark.parametrize(("model", "width"), sorted(_RESIDUAL_WIDTH_CONFIGS.items()))
-def test_dsa_and_mla_activation_width_is_the_residual_width(model, width):
-    info = get_model_config_from_model_path(model)
+def test_dsa_and_mla_activation_width_is_the_residual_width(tmp_path, model, width):
+    # Check every bundled fixture, including models outside DefaultHFModels,
+    # without resolving an HF ID against the live model repository.
+    fixture = _CONFIGS / f"{model.replace('/', '--')}_config.json"
+    (tmp_path / "config.json").write_bytes(fixture.read_bytes())
+    info = get_model_config_from_model_path(str(tmp_path))
     raw = info["raw_config"]
     assert info["d"] == width
     # An inexact division would put the width below the residual stream.

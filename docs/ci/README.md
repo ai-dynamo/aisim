@@ -312,6 +312,23 @@ manual branch validation, launch standalone Fast CI first, as shown below.
 The gate reads Actions metadata with a read-only token; it does not dispatch
 another workflow or grant new release permissions.
 
+### Operation data
+
+Operation tables are not packaged; they come from the dataset revision pinned in
+`op_latency_pin.json`. Downloading that dataset (thousands of files) in every parallel
+Full CI job gets the runners rate limited by Hugging Face (HTTP 429) and the jobs time out,
+so one `Op-latency data` job downloads it once, with the read token in
+`HF_READ_AISIM_INFX_CACHE` and an anonymous retry, and uploads it as the `op-latency-data`
+artifact. It runs exactly when a job that reads operation tables is selected, and those jobs
+(`rust`, `rust-feature-modes`, `public-api-rust`, `application-tests`,
+`python-compatibility`, `engine-golden-regression`, `collector-data`, `readme-commands`) wait
+for it. The [prefetch action](../../.github/actions/prefetch-op-latency-data/action.yml)
+restores the artifact with
+[`op_latency_handoff.py`](../../scripts/ci/op_latency_handoff.py), then composes its systems
+root from the warm cache, verifying every file's hash; run outside Full CI, with no artifact,
+it downloads the dataset itself. `Full CI Success` requires the data job exactly when one of
+those jobs is selected.
+
 ### Component selection
 
 [The selector](../../scripts/ci/select_full_ci.py) uses the complete changed-file set
@@ -319,7 +336,9 @@ of a trusted PR copy, classifying both paths of a rename. The independent
 [selection cases](../../.github/full-ci-selection-cases.yml) document expected
 components and their consumer rationale; Fast CI checks this contract.
 
-- **Main, release, and manual runs:** every Full CI component.
+- **Release and manual runs:** every Full CI component.
+- **Main pushes:** every Full CI component for the newest commit of a burst of
+  merges; see [batched main validation](#batched-main-validation).
 - **Trusted PR copies:** components affected by the change. Documentation and
   review-policy-only changes can mark every expensive component N/A.
 - **Unknown paths, shared dependency/test configuration, or CI execution
@@ -330,6 +349,60 @@ components and their consumer rationale; Fast CI checks this contract.
 selection outputs, missing dependencies, failures, cancellations, and unexpected
 skips. A skipped component is acceptable only when the selector explicitly
 marked it N/A.
+
+### Batched main validation
+
+Merges often land minutes apart. After a push to `main`, **Select Full CI Scope**
+waits ten minutes (`MAIN_DEBOUNCE_SECONDS` in the selector), then reads `main`
+with the job's read-only token:
+
+| `main` after the wait | Scope | Comparison base |
+| --- | --- | --- |
+| Still this commit | Every component | Last full-scope main commit with successful comparisons |
+| A newer commit that contains this one and has a scheduled or successful Full CI push run | Superseded: build, verify, and stage this commit's wheel | Previous main commit, used only by license evidence |
+| No eligible successor run, unreadable state, or a commit that does not contain this one | Every component | Last full-scope main commit with successful comparisons |
+
+Reruns (`github.run_attempt > 1`) always select every component, even if `main`
+advanced after the first attempt. Retrying a failed full-scope run therefore
+cannot turn its failed tests into explicit N/A components.
+
+A superseded run builds the application test wheel, verifies and smoke-tests it in
+**Application Wheel**, collects license evidence, and stages the wheel through
+`automated-release`. Its application test legs and every other component are
+explicit N/A, and `Full CI Success` reports the commit as superseded.
+**Its staged wheel was built and verified. Its full test suite was deferred to
+the successor Full CI run named in the scope summary.** Check the successor
+result. A later failure can come from any commit in the batch. The successor's
+**Select Full CI Scope** summary lists the commits it covers. Manual Full CI runs only branch heads, so check an individual deferred
+commit locally or through a PR.
+
+The newest run compares old and new revisions from the last full-scope main
+commit whose prediction-regression gate, Python dependency licenses, Cargo
+dependency inventories, and license compliance evidence jobs all completed
+successfully. Selection alone does not advance the baseline: a canceled or
+unfinished comparison must still be covered by a later run. Other full-suite
+jobs may still be running or may have failed without disqualifying that baseline.
+Earlier scopes come from the Actions API: the
+**Defer the test suite to the newer main commit** step
+succeeds in a superseded run and is skipped in a full-scope run. Selections that
+are still running, failed, or superseded are passed over, as are full-scope runs
+with missing, unfinished, or unsuccessful comparison jobs. Runs from before
+batching count as full scope but require the same comparison evidence.
+The selector reads main push history in pages of 30 runs, continuing into older
+pages until it finds comparison-validated evidence or exhausts the available
+Actions history. A burst of superseded pushes therefore does not displace the
+baseline from a fixed lookback window. If no available run has that evidence,
+or the selected commit is not an ancestor, **Select Full CI Scope** fails without
+publishing a plan or comparison base. It never falls back to an unvalidated
+parent: that commit may already contain deferred changes, hiding them from the
+comparison. If `main` cannot be read, the run selects the full scope and still
+requires a validated comparison ancestor. If earlier runs cannot be read,
+selection also fails.
+
+Release branches, trusted PR copies, and manual runs are not batched. Every main
+run starts its expensive jobs ten minutes later. Main runs keep unique
+concurrency groups: batching narrows a superseded run's scope and never cancels
+the run.
 
 ### Validation components
 
@@ -359,7 +432,7 @@ explicit exception and its workflow contract test.
 | Rust workspace and public API | Workspace tests and external Rust consumer tests on amd64 and arm64 |
 | Rust feature modes | Supported feature builds/tests, including embedded Python and replay benchmarks |
 | Cargo Deny | Workspace dependency license and banned-package policy on both architectures |
-| Application wheels and tests | One prebuilt test wheel per architecture, installed into the application shards below; wheel verification and release-artifact contracts reuse it |
+| Application wheels and tests | One prebuilt test wheel per architecture (its own `application_test_wheel` component), installed into the application shards below; wheel verification and release-artifact contracts reuse it |
 | Python compatibility | Cross-package contracts and dependency checks on Python 3.11 and 3.13; application shards use Python 3.12 |
 | Engine Golden Regression | Engine-step and compiled-engine parity suites, plus frozen native numerical checks |
 | Platform Wheels | Build, repair, install, and exercise Linux x86-64/ARM64 and macOS ARM64 wheels |
@@ -373,17 +446,33 @@ explicit exception and its workflow contract test.
 16 frozen queries on B200: eight vLLM 0.24.0 queries for dense Qwen3-32B and
 MoE MiniMax-M2.5, plus four Qwen3-32B queries each for TRT-LLM 1.3.0rc20 and
 SGLang 0.5.14. Every backend covers prefill/decode and short/long sequences.
+These collections are frozen data coordinates outside the queryable version
+slots; the script admits them for its own queries, so promoting a newer
+collection changes neither the expected values nor the query inputs.
 The [manifest](../../.github/prediction-numerical-sentinels.json)
-records a full baseline commit that must resolve in the checkout. Fast CI and
-the numerical-check job explicitly fetch that SHA from `origin` if missing;
-full branch history alone can omit a baseline from a squashed PR. Fetch or
-commit-validation failures remain errors. Fetch-only mode does not load the
-AISim runtime; the subsequent checks validate the complete manifest.
-To prepare a checkout locally, run:
+records each query's inputs and expected value, but no source commit: a commit
+from a squashed PR branch is not on `main`, and a mirror without the PR refs
+cannot fetch it. In a clone with full history,
+`git log -p -- .github/prediction-numerical-sentinels.json` shows each change
+to the expected values and the PR that made it; that PR holds the evidence of
+how its values were produced. The current values come from:
 
-```sh
-python scripts/prediction_regression/check_prediction_numerics.py --fetch-baseline-only
-```
+| PR | Values |
+| --- | --- |
+| #187 | the eight vLLM cases |
+| #244 | the four MiniMax values, changed (see below) |
+| #261 | the four TRT-LLM and four SGLang Qwen3-32B cases, added (see below) |
+| #728 | the two TRT-LLM Qwen3-32B prefill values, changed |
+
+Full CI runs this check (`engine-golden-regression`) on every push to `main`
+and `release/*` and on every manual dispatch, because those runs select all
+components. On a trusted PR copy (`pull-request/*`), it runs only when
+`scripts/ci/select_full_ci.py` selects it: for Rust code, prediction or engine
+code, and collector or performance data, and whenever the selector falls back
+to the full matrix (a CI or shared repository contract change, an unclassified
+path such as this manifest, or more than 3000 changed files). A PR copy that
+changes only documentation skips it. A pass means the values hold within
+tolerance, not that they reproduce exactly.
 
 Tolerances are 2% relative and 0.0001 ms absolute. Missing, duplicate, failed, nonfinite,
 nonpositive, or out-of-tolerance results fail. Intentional modeling changes
@@ -411,12 +500,18 @@ prediction-stability values, not measured whole-model accuracy.
 
 After the PR #244 squash merge, its original baseline commit was no longer
 reachable in fresh CI checkouts. All eight sentinels were revalidated at
-`ba64235a645580a8a1b20a424fffef6514ff0103`; the manifest now references that
-permanent main-branch merge commit, which survives subsequent squash merges.
-Expected values, query inputs, and tolerances are unchanged.
+`ba64235a645580a8a1b20a424fffef6514ff0103`, the PR #244 squash commit on
+`main`, with unchanged expected values, query inputs, and tolerances. On `main`,
+the manifest recorded `a4c77310` (PR #187, a `main` commit), then commits from
+the squashed branches of PR #244 (`af91885d`), PR #261 (`d066e918`) and
+PR #728 (`fc6e26a8`). A fresh checkout reaches those only by fetching the PR's
+commit by SHA, which fails in a mirror without those PR refs, so the manifest
+no longer records a commit.
 
-The 16-case manifest was reproduced from runtime and packaged data at
-`d066e918705b98e2d55eed55743ce8d225f129ea`. The original eight vLLM values
+When PR #261 extended the manifest to 16 cases, the values were reproduced from
+runtime and packaged data at `d066e918705b98e2d55eed55743ce8d225f129ea`, a
+commit on that PR's branch. PR #728 later changed two of them; the other 14
+values are still those of that reproduction. The original eight vLLM values
 were reproduced exactly and retained unchanged. The eight added backend values
 use the same four dense-model query shapes and SILICON mode, without shared
 layer reuse. These operator-level queries complement the engine integration
@@ -430,6 +525,15 @@ harness, the report explicitly contains new-side statistics only. Frozen
 goldens establish numerical stability; hardware accuracy is supported by the
 specific measured configurations in the
 [accuracy evidence](../../README.md#accuracy-evidence).
+
+Engine Golden Regression and both prediction-snapshot collections build AISim
+from source on GitHub-hosted `ubuntu-24.04` runners without the CI job
+container; they use no NVIDIA-internal service. Each job, and each side of the
+comparison, may run on a different CPU model. The compiled engine uses baseline
+x86-64 code generation, the golden and sentinel checks use relative
+tolerances, and the comparison reports drift above a 0.01% relative change
+without blocking on it. Investigate drift on a PR that does not change
+numerical behavior as a runner difference; do not refresh goldens to absorb it.
 
 The macOS platform-wheel and daily README jobs use the ARM64 `macos-15` runner.
 This replaces `macos-14`, which GitHub is
@@ -522,6 +626,7 @@ timeout behavior. Local editable installs do not replace installed-wheel CI.
 | **Require Fast CI** failed or timed out | Open the linked/latest standalone Fast run for the same branch and SHA; resolve its failure or dispatch Fast CI first, then rerun Full CI |
 | `Fast CI Success` failed with missing or skipped substantive jobs | Inspect the required job results and cancellation history; draft status and labels do not skip Fast CI |
 | Full CI job skipped | Read **Select Full CI Scope** and the aggregate summary; only explicit N/A is acceptable |
+| Main run green with only wheel jobs executed | A newer main commit superseded it; the newer commit's run carries the full suite ([batched main validation](#batched-main-validation)) |
 | Full CI canceled after another PR run starts | A newer run replaced validation in the same PR/branch concurrency group; inspect the replacement run's SHA and results |
 | `Full CI Success` green, workflow still `waiting` | Validation finished; main/release wheel staging may be waiting for `automated-release` approval |
 | New nightly pending, earlier nightly waiting | Nightly's single concurrency group includes protected staging; an unapproved run can hold later validation behind it |
@@ -622,7 +727,8 @@ latency target. A manual FPE run does not publish nightly release artifacts.
 
 The Full CI target is **ten minutes from workflow creation to `Full CI Success`**,
 including runner queues, the standalone Fast prerequisite, and cold setup. Release-approval waits and FPE
-qualification are outside that target. Compare exact run SHAs and selected
+qualification are outside that target, as is the ten-minute wait before a main
+push selects its scope. Compare exact run SHAs and selected
 components; a documentation-only run and a complete matrix measure different
 workloads. Use job timestamps rather than the overall workflow completion time
 when staging is waiting.
